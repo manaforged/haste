@@ -617,6 +617,37 @@ pub fn case_reg_arm64_signed_load_icmp(seed: i64) -> i64 {
     se_sum + se_stack_large(seed) + cmp_sum
 }
 
+pub fn case_reg_autoderef_borrow_var(seed: i64) -> i64 {
+    use std::collections::HashSet;
+    let base = (seed.unsigned_abs() as usize) % 7;
+    let items = black_box([base, base + 1, base + 2, base + 3, base + 4]);
+    let mut seen = HashSet::new();
+    seen.insert(base + 1);
+    seen.insert(base + 3);
+    let kept: usize = items.iter().filter(|dep| !seen.contains(dep)).copied().sum();
+    let hit: usize = items.iter().filter(|dep| seen.contains(dep)).copied().sum();
+    (kept as i64) * 100 + (hit as i64)
+}
+
+struct DivErr(i64);
+
+#[inline(never)]
+fn run_diverging_try(x: i64) -> Result<i64, DivErr> {
+    let v = (if x > 0 { Ok(x * 3) } else { return Err(DivErr(-x - 1)); })?;
+    Ok(v + 5)
+}
+
+pub fn case_reg_try_diverging_err(seed: i64) -> i64 {
+    let mut acc = 0_i64;
+    for k in -4..4 {
+        match run_diverging_try(black_box(seed + k)) {
+            Ok(v) => acc += v,
+            Err(DivErr(e)) => acc -= e,
+        }
+    }
+    acc
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -639,4 +670,6 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_boxed_fnonce_tuple", case_reg_boxed_fnonce_tuple),
     ("case_reg_tailrec_escape_helper", case_reg_tailrec_escape_helper),
     ("case_reg_arm64_signed_load_icmp", case_reg_arm64_signed_load_icmp),
+    ("case_reg_autoderef_borrow_var", case_reg_autoderef_borrow_var),
+    ("case_reg_try_diverging_err", case_reg_try_diverging_err),
 ];

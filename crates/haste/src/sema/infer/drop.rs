@@ -27,7 +27,10 @@ impl Infer<'_, '_> {
         let result = self.parts_need_drop(ty);
         self.cx.drop_stack.pop();
         let needs = result?;
-        if self.cx.quiet_mark() == before && !self.has_vars(ty) && (needs || self.cx.drop_stack.is_empty()) {
+        if self.cx.quiet_mark() == before
+            && !self.has_vars(ty)
+            && (needs || (self.cx.drop_stack.is_empty() && !has_uninferred_closure(self.cx, ty)))
+        {
             self.cx.store.lookups.drops.insert(ty, needs);
         }
         Ok(needs)
@@ -63,13 +66,36 @@ impl Infer<'_, '_> {
         env
     }
 
+    fn own_closure_is_copy(&mut self, ty: Ty) -> Result<Option<bool>> {
+        let ty = self.resolve(ty);
+        let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty) else {
+            return Ok(None);
+        };
+        let here = self.instance.as_ref().is_some_and(|(item, args)| item == parent && args == substs);
+        let Some(closure) = here.then(|| self.out.closures.get(&crate::body::ExprId(*at))).flatten() else {
+            return Ok(None);
+        };
+        let captures: Vec<(u32, super::closure::By)> = closure.captures.iter().map(|c| (c.local, c.by)).collect();
+        for (local, by) in captures {
+            let copy = match by {
+                super::closure::By::Ref => true,
+                super::closure::By::Mut => false,
+                super::closure::By::Value => self.is_copy(self.out.locals[local as usize].ty)?,
+            };
+            if !copy {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
     fn closure_is_copy(&mut self, ty: Ty) -> Result<bool> {
         if self.coroutine_output(ty).is_some() {
             return Ok(false);
         }
         match self.closure_env(ty) {
             Some(env) => self.is_copy(env),
-            None => Ok(true),
+            None => Ok(self.own_closure_is_copy(ty)?.unwrap_or(false)),
         }
     }
 
@@ -118,6 +144,24 @@ pub fn glue_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed> 
     Ok(Typed { locals: vec![Local { ty: target }], params: vec![0], ret: Some(unit), shape: Shape::Glue(glue), ..Typed::default() })
 }
 
+fn has_uninferred_closure(cx: &Context<'_>, ty: Ty) -> bool {
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut stack = vec![ty];
+    while let Some(cur) = stack.pop() {
+        if cur == Ty::NONE || !seen.insert(cur) {
+            continue;
+        }
+        if matches!(cx.types.kind(cur), Kind::Closure(..)) {
+            let Some(env) = cx.closure_env(cur) else {
+                return true;
+            };
+            stack.push(env);
+        }
+        stack.extend(cx.types.kind(cur).children(&cx.types));
+    }
+    false
+}
+
 /// The call of the drop glue of `ty`, when dropping a value of `ty` runs code.
 pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
     if let Some(cached) = cx.store.lookups.glues.get(&ty) {
@@ -130,7 +174,10 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
     } else {
         None
     };
-    if cx.quiet_mark() == before && !cx.types.has_params(ty) && (call.is_some() || cx.drop_stack.is_empty()) {
+    if cx.quiet_mark() == before
+        && !cx.types.has_params(ty)
+        && (call.is_some() || (cx.drop_stack.is_empty() && !has_uninferred_closure(cx, ty)))
+    {
         cx.store.lookups.glues.insert(ty, call);
     }
     Ok(call)

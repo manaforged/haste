@@ -176,8 +176,8 @@ impl Infer<'_, '_> {
 
     fn settle_final_passes(&mut self) -> Result<()> {
         self.fall_back_numbers()?;
-        self.fall_back_diverging()?;
         self.fall_back_residuals()?;
+        self.fall_back_diverging()?;
         self.settle_obligations()?;
         self.settle_operators(true)?;
         for _ in 0..crate::RECURSION_LIMIT {

@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{ArgumentPurpose, Signature, Type};
 use rustc_abi::{TagEncoding, Variants};
+use rustc_hash::FxHashSet;
 use rustc_index::Idx;
 
 use crate::names::{ItemRef, Primitive};
@@ -215,7 +216,78 @@ pub(super) fn hash_num_tag(cx: &Context<'_>, mix: &mut HashMix, ty: Ty) {
 }
 
 pub(super) fn hash_ty_facts(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty) -> Result<()> {
-    hash_ty_facts_depth(cx, mix, ty, 0)
+    hash_ty_facts_depth(cx, mix, ty, 0)?;
+    if ty != Ty::NONE && !cx.types.has_params(ty) && matches!(needs_drop(cx, ty), Ok(true)) {
+        hash_nested_drop_facts(cx, mix, ty, 0, &mut FxHashSet::default());
+    }
+    Ok(())
+}
+
+fn hash_nested_drop_facts(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u8, seen: &mut FxHashSet<Ty>) {
+    if depth >= 32 || ty == Ty::NONE || cx.types.has_params(ty) || !seen.insert(ty) {
+        return;
+    }
+    let Ok(nd) = needs_drop(cx, ty) else {
+        mix.byte(0xff);
+        return;
+    };
+    mix.bool(nd);
+    if !nd {
+        return;
+    }
+    let Ok(own_drop) = has_drop_impl(cx, ty) else {
+        mix.byte(0xfe);
+        return;
+    };
+    mix.bool(own_drop);
+    if let Some(inner) = cx.boxed(ty) {
+        mix.byte(0xb1);
+        hash_nested_drop_facts(cx, mix, inner, depth + 1, seen);
+        return;
+    }
+    hash_nested_drop_parts(cx, mix, ty, depth, seen);
+}
+
+fn hash_nested_drop_parts(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u8, seen: &mut FxHashSet<Ty>) {
+    match cx.types.kind(ty).clone() {
+        Kind::Tuple(items) => {
+            for item in cx.types.substs(items).to_vec() {
+                hash_nested_drop_facts(cx, mix, item, depth + 1, seen);
+            }
+        }
+        Kind::Array(elem, _) | Kind::Slice(elem) => {
+            hash_nested_drop_facts(cx, mix, elem, depth + 1, seen);
+        }
+        Kind::Closure(..) => {
+            if let Some(env) = cx.closure_env(ty) {
+                hash_nested_drop_facts(cx, mix, env, depth + 1, seen);
+            }
+        }
+        Kind::Adt(item, args) => {
+            let slice = cx.types.substs(args).to_vec();
+            hash_nested_adt_drop_facts(cx, mix, (item, &slice), depth, seen);
+        }
+        _ => {}
+    }
+}
+
+fn skips_drop_fields(cx: &Context<'_>, item: ItemRef) -> bool {
+    cx.lang(item) == Some("manually_drop") || cx.item(item).1.kind == ItemKind::Union
+}
+
+fn hash_nested_adt_drop_facts(cx: &mut Context<'_>, mix: &mut HashMix, (item, args): (ItemRef, &[Ty]), depth: u8, seen: &mut FxHashSet<Ty>) {
+    if skips_drop_fields(cx, item) {
+        return;
+    }
+    let Ok(variants) = field_types(cx, item, args) else {
+        mix.byte(0xfd);
+        return;
+    };
+    for fields in variants.iter() {
+        for &fty in fields {
+            hash_nested_drop_facts(cx, mix, fty, depth + 1, seen);
+        }
+    }
 }
 
 fn hash_ty_facts_depth(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u8) -> Result<()> {
@@ -573,7 +645,12 @@ pub(super) fn hash_tuple_offsets(cx: &mut Context<'_>, mix: &mut HashMix, tuple:
 }
 
 pub(super) fn hash_drop_tree(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, caller: usize, ty: Ty, depth: u8, cycle_root: &mut usize) -> Result<()> {
-    if depth > 5 || ty == Ty::NONE || !needs_drop(cx, ty)? {
+    let mut seen = FxHashSet::default();
+    hash_drop_tree_seen(cx, (reached, slots), inline, (mix, caller, cycle_root), (ty, depth, &mut seen))
+}
+
+fn hash_drop_tree_seen(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, (mix, caller, cycle_root): (&mut HashMix, usize, &mut usize), (ty, depth, seen): (Ty, u8, &mut FxHashSet<Ty>)) -> Result<()> {
+    if depth > 32 || ty == Ty::NONE || !seen.insert(ty) || !matches!(needs_drop(cx, ty), Ok(true)) {
         return Ok(());
     }
     if let Some(glue) = cx.lang_item("drop_glue") {
@@ -581,33 +658,55 @@ pub(super) fn hash_drop_tree(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         hash_call_edge(cx, (reached, slots), inline, mix, caller, glue, gs, cycle_root)?;
     }
     if let Some(inner) = cx.boxed(ty) {
-        if let Some(Res::Fn(fi, fs)) = drop_fn(cx, ty)? {
+        if let Ok(Some(Res::Fn(fi, fs))) = drop_fn(cx, ty) {
             hash_call_edge(cx, (reached, slots), inline, mix, caller, fi, fs, cycle_root)?;
         }
-        return hash_drop_tree(cx, (reached, slots), inline, mix, caller, inner, depth + 1, cycle_root);
+        return hash_drop_tree_seen(cx, (reached, slots), inline, (mix, caller, cycle_root), (inner, depth + 1, seen));
     }
-    if has_drop_impl(cx, ty)? {
+    if !matches!(has_drop_impl(cx, ty), Ok(false)) {
         return Ok(());
     }
+    hash_drop_variants(cx, (reached, slots), inline, (mix, caller, cycle_root), (ty, depth, seen))
+}
+
+fn hash_drop_variants(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, (mix, caller, cycle_root): (&mut HashMix, usize, &mut usize), (ty, depth, seen): (Ty, u8, &mut FxHashSet<Ty>)) -> Result<()> {
     let variants: Fields = match cx.types.kind(ty).clone() {
         Kind::Tuple(items) => vec![cx.types.substs(items).to_vec()].into(),
-        Kind::Array(elem, _) => {
-            let layout = cx.layout(elem)?;
+        Kind::Array(elem, _) | Kind::Slice(elem) => {
+            let Ok(layout) = cx.layout(elem) else {
+                mix.byte(0xfc);
+                return Ok(());
+            };
             mix.u64(layout.size.bytes());
-            return hash_drop_tree(cx, (reached, slots), inline, mix, caller, elem, depth + 1, cycle_root);
+            return hash_drop_tree_seen(cx, (reached, slots), inline, (mix, caller, cycle_root), (elem, depth + 1, seen));
         }
+        Kind::Adt(adt_item, _) if skips_drop_fields(cx, adt_item) => return Ok(()),
         Kind::Adt(adt_item, adt_args) => {
             let slice = cx.types.substs(adt_args).to_vec();
-            field_types(cx, adt_item, &slice)?
+            let Ok(fields) = field_types(cx, adt_item, &slice) else {
+                mix.byte(0xfd);
+                return Ok(());
+            };
+            fields
         }
         _ => return Ok(()),
     };
-    let layout = cx.layout(ty)?;
+    hash_drop_field_list(cx, (reached, slots), inline, (mix, caller, cycle_root), (ty, &variants, depth, seen))
+}
+
+fn hash_drop_field_list(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, (mix, caller, cycle_root): (&mut HashMix, usize, &mut usize), (ty, variants, depth, seen): (Ty, &Fields, u8, &mut FxHashSet<Ty>)) -> Result<()> {
+    let Ok(layout) = cx.layout(ty) else {
+        mix.byte(0xfc);
+        return Ok(());
+    };
     for (v_idx, fields) in variants.iter().enumerate() {
         for (f_idx, &fty) in fields.iter().enumerate() {
             mix.i32(field_offset(&layout, v_idx as u32, f_idx as u32));
-            hash_repr(cx, mix, fty)?;
-            hash_drop_tree(cx, (reached, slots), inline, mix, caller, fty, depth + 1, cycle_root)?;
+            if hash_repr(cx, mix, fty).is_err() {
+                mix.byte(0xfc);
+                continue;
+            }
+            hash_drop_tree_seen(cx, (reached, slots), inline, (mix, caller, cycle_root), (fty, depth + 1, seen))?;
         }
     }
     Ok(())
