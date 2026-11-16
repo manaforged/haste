@@ -593,10 +593,39 @@ fn fuse_int_binary_ext(
     (alu_op, x, y): (Binary, Value, Value),
 ) -> bool {
     let ty = func.ty(res);
-    matches!(ty, Type::I32 | Type::I64)
-        && matches!(alu_op, Binary::Iadd | Binary::Isub)
-        && ((!plan.elided[x.index()] && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), y))
-            || (alu_op == Binary::Iadd && !plan.elided[y.index()] && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), x)))
+    if !matches!(ty, Type::I32 | Type::I64) || !matches!(alu_op, Binary::Iadd | Binary::Isub) {
+        return false;
+    }
+    if !plan.elided[x.index()] && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), y) {
+        peel_other_uextend(func, plan, info, (b_idx, pos, res), x);
+        if alu_op == Binary::Iadd && !plan.elided[x.index()] {
+            swap_ext_operand(func, plan, info, (b_idx, pos, ty), (x, y));
+        }
+        return true;
+    }
+    alu_op == Binary::Iadd && !plan.elided[y.index()] && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), x)
+}
+
+fn uext_inner(func: &Function, val: Value, def: &dyn Fn(Value) -> Option<Inst>) -> Option<Value> {
+    match func.insts[def(val)?.index()].op {
+        Op::Convert(Convert::Uextend, inner) => Some(inner),
+        _ => None,
+    }
+}
+
+fn swap_parts(func: &Function, plan: &Plan<Reg>, (x, y): (Value, Value), def: &dyn Fn(Value) -> Option<Inst>) -> bool {
+    uext_inner(func, x, def).is_some_and(|a| !zero_ext_loc(plan, a)) && uext_inner(func, y, def).is_some_and(|b| zero_ext_loc(plan, b))
+}
+
+/// Reports whether an add extends `x` in its operand and reads `y` as an already zero-extended register.
+pub(super) fn ext_swapped(func: &Function, plan: &Plan<Reg>, (x, y): (Value, Value), def: &dyn Fn(Value) -> Option<Inst>) -> bool {
+    plan.elided[x.index()] && plan.elided[y.index()] && swap_parts(func, plan, (x, y), def)
+}
+
+fn swap_ext_operand(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, ty): (usize, usize, Type), (x, y): (Value, Value)) {
+    if swap_parts(func, plan, (x, y), &|v| def_inst(pos_of, v)) {
+        try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), x);
+    }
 }
 
 fn fuse_int_binary(
