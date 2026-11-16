@@ -188,7 +188,11 @@ impl Lower<'_, '_> {
         let size = self.size(element)?;
         let data = self.ins().load(Type::I64, slice, 0);
         let bytes = self.ins().imul_imm(index, size);
-        Ok(self.ins().iadd(data, bytes))
+        let address = self.ins().iadd(data, bytes);
+        if substs.first().is_some_and(|&item| matches!(self.cx.types.kind(item), Kind::Ref(..))) {
+            self.ins().assume(address);
+        }
+        Ok(address)
     }
 
     fn size(&mut self, ty: Ty) -> Result<i64> {

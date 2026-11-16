@@ -171,6 +171,7 @@ pub(super) fn swapped(cc: IntCC) -> IntCC {
 pub(crate) struct Ranges<'a> {
     defs: &'a [Option<Inst>],
     table: Vec<(u64, u64)>,
+    raised: Vec<Value>,
 }
 
 struct CfgInfo<'a> {
@@ -223,7 +224,7 @@ impl<'a> Ranges<'a> {
                 }
             }
         }
-        let mut ranges = Self { defs, table };
+        let mut ranges = Self { defs, table, raised: Vec::new() };
         let info = CfgInfo { consts, incoming, complete, single, idom };
         if ranges.propagate(func, &info, order) {
             ranges.propagate(func, &info, order);
@@ -233,11 +234,28 @@ impl<'a> Ranges<'a> {
 
     fn propagate(&mut self, func: &Function, info: &CfgInfo, order: &[Block]) -> bool {
         let mut narrowed = false;
+        let mut falls_through = Vec::new();
         for &block in order {
             narrowed |= self.refine_params(func, info, block);
+            falls_through.clear();
             for inst in &func.blocks[block.index()].insts {
                 let data = &func.insts[inst.index()];
+                match data.op {
+                    Op::Assume(value) => {
+                        let (lo, hi) = &mut self.table[value.index()];
+                        if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through.contains(&value) {
+                            *lo = 1;
+                            if !self.raised.contains(&value) {
+                                self.raised.push(value);
+                            }
+                        }
+                        continue;
+                    }
+                    ref op if !op.is_speculable() => falls_through.clear(),
+                    _ => {}
+                }
                 let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
+                falls_through.push(result);
                 let fact = match info.consts.get(result.index()).copied().flatten() {
                     Some(imm) => Fact::constant(func.ty(result), imm),
                     None => transfer::transfer(func, self, &data.op, func.ty(result), &|value| self.of(value)),
@@ -690,7 +708,8 @@ fn settle_ctrl(
         }
         (&Op::Trapz(raw_cond) | &Op::Assume(raw_cond), _) => {
             let condition = dom.resolve(raw_cond);
-            if truth_of(condition, path) == Some(true) {
+            let self_proved = matches!(data.op, Op::Assume(_)) && ranges.raised.contains(&raw_cond);
+            if !self_proved && truth_of(condition, path) == Some(true) {
                 decided.push((inst, None));
             }
             path.assume(func, ranges, condition, true);
