@@ -11,6 +11,12 @@ const FLOAT_RETURNS: u8 = 2;
 
 pub(super) const SAVED: [Reg; 5] = [Reg::Rbx, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
 
+/// The callee-saved registers of a function that keeps no frame pointer, where rbp holds a value like the rest.
+pub(super) const SAVED_RBP: [Reg; 6] = {
+    let [a, b, c, d, e] = SAVED;
+    [a, b, c, d, e, Reg::Rbp]
+};
+
 pub(super) type Loc = crate::frame::Loc<Reg>;
 pub(super) type Abi = crate::frame::Abi<Reg>;
 

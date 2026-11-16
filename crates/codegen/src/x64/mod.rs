@@ -15,7 +15,7 @@ mod ymm;
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Rm, Shift, Size, Xmm};
 use features::Features;
 pub(crate) use ymm::host_avx2;
-use frame::{Abi, Loc, SAVED, classify};
+use frame::{Abi, Loc, SAVED, SAVED_RBP, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
@@ -53,6 +53,10 @@ const REGS_WIN64: Regs<Reg> = Regs {
     ..REGS
 };
 
+const REGS_RBP: Regs<Reg> = Regs { saved: &SAVED_RBP, ..REGS };
+
+const REGS_WIN64_RBP: Regs<Reg> = Regs { saved: &SAVED_RBP, ..REGS_WIN64 };
+
 const INTAKE_XMM: Xmm = Xmm(15);
 
 /// The registers that frame setup and the probe use, which no shrink-wrapped entry may hold a value in.
@@ -63,7 +67,13 @@ const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let abi_kind = target.abi;
-    let regs = if abi_kind == CallAbi::Win64 { &REGS_WIN64 } else { &REGS };
+    let keeps = keeps_frame_pointer(func);
+    let regs = match (abi_kind, keeps) {
+        (CallAbi::Win64, true) => &REGS_WIN64,
+        (CallAbi::Win64, false) => &REGS_WIN64_RBP,
+        (_, true) => &REGS,
+        (_, false) => &REGS_RBP,
+    };
     let Prepared { order, copied, abi, mut plan, mut frame, mut framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
     let features = Features::host();
     let elided_before = plan.elided.iter().filter(|&&e| e).count();
@@ -72,7 +82,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS);
-    let (base, bias) = if omits_frame_pointer(func, framed) { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
+    let (base, bias) = if framed && !keeps { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -113,11 +123,10 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     drive(emit, &order)
 }
 
-/// Whether a framed function addresses its frame from rsp: it reads no frame pointer, catches no unwind and holds no float or vector, whose lowering moves rsp inside the body.
-fn omits_frame_pointer(func: &Function, framed: bool) -> bool {
-    framed
-        && !func.types.iter().any(|ty| ty.in_float_register())
-        && !func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
+/// Whether a framed function addresses its frame from rbp: it reads the frame pointer, catches an unwind or holds a float or vector, whose lowering moves rsp inside the body.
+fn keeps_frame_pointer(func: &Function) -> bool {
+    func.types.iter().any(|ty| ty.in_float_register())
+        || func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
