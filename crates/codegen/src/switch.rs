@@ -413,6 +413,9 @@ fn match_arm(
             }
             let t_cont = can_follow_into(func, info, ctx, &t_edge).is_some_and(|(tb, _)| peek_chain(func, info, tb, test.val));
             let f_cont = can_follow_into(func, info, ctx, &f_edge).is_some_and(|(fb, _)| peek_chain(func, info, fb, test.val));
+            if t_cont && f_cont {
+                return None;
+            }
             pick_arm_direction(func, info, &test, (t_edge, f_edge, t_cont, f_cont), (preferred_hit, false))
         }
         Op::Jump(target, args) if !is_head && args.len() == 1 && func.blocks[target.index()].params.len() == 1 && func.ty(args[0]) == Type::I8 => {
