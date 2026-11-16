@@ -636,7 +636,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
     let weights = blocks.as_deref().map(|blocks| walk::weights(func, blocks, &sib, &elided));
-    let (partners, back_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref());
+    let (partners, back_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref(), !regs.two_address);
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
     let hints = Hints {
         reuse: &reuse,
