@@ -341,6 +341,26 @@ fn for_each_fn_edge(entry: &AotFn, mut on_edge: impl FnMut(FnEdge<'_>)) {
     }
 }
 
+/// Keys in the order the reach walk first meets them, which follows the call graph and not the scheduling-dependent reached indexes.
+struct FirstSeen<K> {
+    seen: HashSet<K>,
+    list: Vec<K>,
+}
+
+impl<K> Default for FirstSeen<K> {
+    fn default() -> Self {
+        Self { seen: HashSet::default(), list: Vec::new() }
+    }
+}
+
+impl<K: Copy + Eq + Hash> FirstSeen<K> {
+    fn insert(&mut self, key: K) {
+        if self.seen.insert(key) {
+            self.list.push(key);
+        }
+    }
+}
+
 pub(super) struct AotReach {
     fns: Vec<bool>,
     order: Vec<usize>,
@@ -348,10 +368,10 @@ pub(super) struct AotReach {
     rodata_order: Vec<usize>,
     vtables: Vec<bool>,
     vtable_order: Vec<usize>,
-    slots: HashSet<usize>,
-    slot_list: Vec<usize>,
-    statics: HashSet<usize>,
-    promoted: HashSet<(usize, u32)>,
+    slots: FirstSeen<usize>,
+    statics: FirstSeen<usize>,
+    promoted: FirstSeen<(usize, u32)>,
+    thread_slots: FirstSeen<usize>,
     work_fns: Vec<usize>,
     work_rodata: Vec<usize>,
     work_vtables: Vec<usize>,
@@ -374,8 +394,8 @@ impl AotReach {
             fns: vec![false; len], order: Vec::new(),
             rodata: Vec::new(), rodata_order: Vec::new(),
             vtables: Vec::new(), vtable_order: Vec::new(),
-            slots: HashSet::default(), slot_list: Vec::new(),
-            statics: HashSet::default(), promoted: HashSet::default(),
+            slots: FirstSeen::default(), statics: FirstSeen::default(),
+            promoted: FirstSeen::default(), thread_slots: FirstSeen::default(),
             work_fns: Vec::new(), work_rodata: Vec::new(), work_vtables: Vec::new(),
         };
         for root in roots {
@@ -389,7 +409,6 @@ impl AotReach {
         this.rodata.resize(state.rodata.len(), false);
         this.vtables.resize(state.vtables.len(), false);
         this.drain(state, None, vmask);
-        this.slot_list.sort_unstable();
         this
     }
 
@@ -404,9 +423,7 @@ impl AotReach {
     fn mark_sym(&mut self, sym: &SymbolSource) {
         match sym {
             SymbolSource::Slot(idx) => {
-                if self.slots.insert(*idx) {
-                    self.slot_list.push(*idx);
-                }
+                self.slots.insert(*idx);
                 self.mark_fn(*idx);
             }
             SymbolSource::Vtable(id) => mark_id(&mut self.vtables, &mut self.vtable_order, &mut self.work_vtables, id.0 as usize),
@@ -418,7 +435,10 @@ impl AotReach {
             SymbolSource::PromotedCell { owner, seq, .. } => {
                 self.promoted.insert((*owner, *seq));
             }
-            SymbolSource::Host(_) | SymbolSource::Word(_) | SymbolSource::ThreadSlot(_) => {}
+            SymbolSource::ThreadSlot(index) => {
+                self.thread_slots.insert(*index);
+            }
+            SymbolSource::Host(_) | SymbolSource::Word(_) => {}
         }
     }
 
@@ -683,11 +703,10 @@ fn emit_rodata_and_vtables(state: &AotState, live: &AotReach, exe: &mut Executab
 }
 
 fn emit_static_syms(state: &AotState, live: &AotReach, exe: &mut Executable) -> (HashMap<usize, Symbol>, HashMap<(usize, u32), Symbol>) {
-    let mut static_keys: Vec<usize> = state.statics.keys().copied().filter(|idx| live.statics.contains(idx)).collect();
-    static_keys.sort_unstable();
     let mut static_syms = HashMap::default();
-    for index in static_keys {
-        let sym = match &state.statics[&index] {
+    for &index in &live.statics.list {
+        let Some(entry) = state.statics.get(&index) else { continue };
+        let sym = match entry {
             AotStatic::Local(size) => Symbol::Bss(exe.bss(*size + 1, 16)),
             AotStatic::Foreign { weak: false, host: Some(host) } => Symbol::Host(host.clone()),
             AotStatic::Foreign { weak: false, host: None } => Symbol::Data(exe.data(&[0; 8], 8)),
@@ -701,11 +720,10 @@ fn emit_static_syms(state: &AotState, live: &AotReach, exe: &mut Executable) -> 
         };
         static_syms.insert(index, sym);
     }
-    let mut promoted_keys: Vec<_> = state.promoted.iter().copied().filter(|&(key, _)| live.promoted.contains(&key)).collect();
-    promoted_keys.sort_unstable_by_key(|&(key, _)| key);
     let mut promoted_syms = HashMap::default();
-    for ((owner, seq), size) in promoted_keys {
-        promoted_syms.insert((owner, seq), Symbol::Bss(exe.bss(size, 16)));
+    for &key in &live.promoted.list {
+        let Some(&at) = state.promoted_seen.get(&key) else { continue };
+        promoted_syms.insert(key, Symbol::Bss(exe.bss(state.promoted[at].1, 16)));
     }
     (static_syms, promoted_syms)
 }
@@ -753,7 +771,6 @@ impl Image {
     /// Freezes a compiled AOT image into a standalone executable starting at `(lang_start, user_main)`.
     pub(crate) fn to_aot(&self, target: &Target, (lang_start, user_main): (usize, usize), cx: &mut crate::sema::Context<'_>, reached: &crate::sema::reach::Reached) -> Result<Executable> {
         let state = lock(self.aot().context("image has no AOT recording")?);
-        let thread_slots = lock(&self.thread_slots);
         let (live, vmask) = vdce::VtableMask::converge(cx, reached, &state.vtables, |vmask| {
             let live = AotReach::collect(&state, [lang_start, user_main], vmask);
             let counts = (live.order.len(), live.vtable_order.len());
@@ -762,9 +779,10 @@ impl Image {
         });
         let mut exe = Executable::new(target);
         let mut slot_offs = HashMap::default();
-        for &idx in &live.slot_list {
+        for &idx in &live.slots.list {
             slot_offs.insert(idx, exe.rodata(&[0; 8], 8));
         }
+        let thread_slots: HashMap<usize, u64> = live.thread_slots.list.iter().enumerate().map(|(rank, &index)| (index, rank as u64)).collect();
         let (rodata_offs, vtable_offs) = emit_rodata_and_vtables(&state, &live, &mut exe)?;
         let (static_syms, promoted_syms) = emit_static_syms(&state, &live, &mut exe);
         let syms = SymTable {
@@ -774,7 +792,7 @@ impl Image {
         let dict_bodies = emit_dict_bodies(&state, &live.order, &mut exe)?;
         let fn_offs = emit_functions(&state, &live, target, &syms, &dict_bodies, &mut exe)?;
         patch_vtables(&state, &live, &vmask, (&vtable_offs, &fn_offs), &mut exe)?;
-        for &idx in &live.slot_list {
+        for &idx in &live.slots.list {
             exe.pointer(true, slot_offs[&idx], slot_target(&fn_offs, &state.foreign_fns, idx));
         }
         let Some(start_off) = fn_offs.get(lang_start).copied().flatten() else {
