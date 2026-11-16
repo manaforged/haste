@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
@@ -222,6 +223,63 @@ pub fn load(root: &Path, targets: &Targets) -> Result<Workspace> {
     load_with(root, targets, &[])
 }
 
+fn load_package(entry: Locked, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Package, Option<anyhow::Error>)> {
+    match source_dir(&entry, registries, paths) {
+        Ok(dir) => {
+            let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
+            let manifest = manifest::read(&dir, owner.as_ref().map(|(_, ws)| ws))?;
+            Ok((Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false }, None))
+        }
+        Err(err) => {
+            let manifest = manifest::Manifest { name: entry.name.clone(), ..manifest::Manifest::default() };
+            Ok((Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false }, Some(err)))
+        }
+    }
+}
+
+fn load_packages(locked: Vec<Locked>, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Vec<Package>, Vec<Option<anyhow::Error>>)> {
+    let total = locked.len();
+    let workers = crate::jobs().min(total).max(1);
+    let mut results: Vec<Option<Result<(Package, Option<anyhow::Error>)>>> = (0..total).map(|_| None).collect();
+    if workers <= 1 {
+        for (idx, entry) in locked.into_iter().enumerate() {
+            results[idx] = Some(load_package(entry, registries, paths));
+        }
+    } else {
+        let queue = Mutex::new(locked.into_iter().enumerate());
+        let worker = || {
+            let mut out = Vec::new();
+            loop {
+                let next = crate::sync::lock(&queue).next();
+                let Some((idx, entry)) = next else { break };
+                out.push((idx, load_package(entry, registries, paths)));
+            }
+            out
+        };
+        let chunks = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers - 1).map(|_| scope.spawn(&worker)).collect();
+            let mut all = worker();
+            for handle in handles {
+                if let Ok(chunk) = handle.join() {
+                    all.extend(chunk);
+                }
+            }
+            all
+        });
+        for (idx, res) in chunks {
+            results[idx] = Some(res);
+        }
+    }
+    let mut packages = Vec::with_capacity(total);
+    let mut missing = Vec::with_capacity(total);
+    for (idx, slot) in results.into_iter().enumerate() {
+        let (pkg, err) = slot.unwrap_or_else(|| Err(anyhow::anyhow!("graph worker failed for package {idx}")))?;
+        packages.push(pkg);
+        missing.push(err);
+    }
+    Ok((packages, missing))
+}
+
 /// Like [`load`], with `features` enabled on the root package besides its defaults.
 pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Workspace> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
@@ -232,23 +290,7 @@ pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Wo
     let mut registries = registry_dirs()?;
     registries.insert(0, top.join("vendor"));
     let paths = local_paths(root, &top, workspace.as_ref())?;
-    let mut packages = Vec::with_capacity(locked.len());
-    let mut missing: Vec<Option<anyhow::Error>> = Vec::with_capacity(locked.len());
-    for entry in locked {
-        match source_dir(&entry, &registries, &paths) {
-            Ok(dir) => {
-                let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
-                let manifest = manifest::read(&dir, owner.as_ref().map(|(_, ws)| ws))?;
-                packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
-                missing.push(None);
-            }
-            Err(err) => {
-                let manifest = manifest::Manifest { name: entry.name.clone(), ..manifest::Manifest::default() };
-                packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
-                missing.push(Some(err));
-            }
-        }
-    }
+    let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
     resolve_deps(&mut packages);
     let root_names: Vec<String> = if manifest_name(root).is_some() {
         let owner = owning_workspace(root)?;
