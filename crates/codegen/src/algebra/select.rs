@@ -2,39 +2,23 @@ use crate::cse::flip_int_cc;
 use crate::fold::{extend, known_bits, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::icmp::{ADDR_SPAN, before, emit_cond_truth, null_test, offset_bound, three_way_non_zero};
+use super::icmp::{ADDR_SPAN, before, complementary_eq_pair, emit_cond_truth, null_test, offset_bound, three_way_non_zero};
 use super::RewriteCx;
 
 pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Value, t: Value, f: Value) -> Option<Op> {
     let given = (t, f);
-    if t == f {
-        cx.alias(res, t);
-        return None;
-    }
-    if is_non_zero(cx, cond, 0) {
-        cx.alias(res, t);
-        return None;
-    }
+    if t == f { cx.alias(res, t); return None; }
+    if is_non_zero(cx, cond, 0) { cx.alias(res, t); return None; }
     let inner = cx.unwrap_uextend(cond);
-    if let Some(arm) = tested_arm(cx, inner, t, f) {
-        cx.alias(res, arm);
-        return None;
-    }
+    if let Some(arm) = tested_arm(cx, inner, t, f) { cx.alias(res, arm); return None; }
     let (t, f) = (refuted_arm(cx, inner, t, true).unwrap_or(t), refuted_arm(cx, inner, f, false).unwrap_or(f));
-    if t == f {
-        cx.alias(res, t);
-        return None;
-    }
-    if let Some(op) = simplify_unit_bool_select(cx, res, inner, t, f) {
-        return op;
-    }
+    if t == f { cx.alias(res, t); return None; }
+    if let Some(op) = simplify_unit_bool_select(cx, res, inner, t, f) { return op; }
     fold_ord_select_cmp(cx, inner, t, f).or_else(|| (inner != cond || (t, f) != given).then_some(Op::Select(inner, t, f)))
 }
 
 fn simplify_unit_bool_select(cx: &mut RewriteCx, res: Option<Value>, inner: Value, t: Value, f: Value) -> Option<Option<Op>> {
-    if !res.is_some_and(|r| cx.func.ty(r) == Type::I8) || cx.func.ty(inner) != Type::I8 || !cx.is_unit_bool(inner) {
-        return None;
-    }
+    if !res.is_some_and(|r| cx.func.ty(r) == Type::I8) || cx.func.ty(inner) != Type::I8 || !cx.is_unit_bool(inner) { return None; }
     match (cx.uconst(t, Type::I8), cx.uconst(f, Type::I8)) {
         (Some(1), Some(0)) => { cx.alias(res, inner); Some(None) }
         (Some(1), _) if cx.is_unit_bool(f) => Some(Some(Op::Binary(Binary::Bor, inner, f))),
@@ -44,24 +28,48 @@ fn simplify_unit_bool_select(cx: &mut RewriteCx, res: Option<Value>, inner: Valu
     }
 }
 
-fn peel_uext_icmp(cx: &RewriteCx, ty: Type, v: Value) -> Option<(IntCC, Value, Value)> {
-    let target = if ty == Type::I8 { v } else if let Some(&Op::Convert(Convert::Uextend, i)) = cx.op(v) { i } else { return None };
-    if cx.func.ty(target) != Type::I8 { return None; }
-    let &Op::Icmp(cc, a, b) = cx.op(target)? else { return None };
-    cx.func.ty(a).is_small_int().then_some((cc, a, b))
+struct OrdSelectMatch {
+    base: Option<Value>,
+    cc: IntCC,
+    lhs: Value,
+    rhs: Value,
 }
 
-fn peel_base_icmp(cx: &RewriteCx, ty: Type, v: Value) -> Option<(Option<Value>, IntCC, Value, Value)> {
-    if let Some((cc, a, b)) = peel_uext_icmp(cx, ty, v) { return Some((None, cc, a, b)); }
-    let &Op::Binary(Binary::Iadd, lhs, rhs) = cx.op(v)? else { return None };
-    [(lhs, rhs), (rhs, lhs)].into_iter().find_map(|(base, cv)| peel_uext_icmp(cx, ty, cv).map(|(cc, a, b)| (Some(base), cc, a, b)))
+fn peel_uext(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, mut v: Value) -> Value {
+    while let Some(inst) = def_of(v) && let Op::Convert(Convert::Uextend, inner) = func.insts[inst.index()].op { v = inner; }
+    v
 }
 
-fn peel_base_add_01(cx: &RewriteCx, ty: Type, base_opt: Option<Value>, v: Value) -> Option<u64> {
-    let Some(base) = base_opt else { return cx.uconst(v, ty).filter(|&k| k <= 1) };
+fn const_01(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, ty: Type, v: Value) -> Option<u64> {
+    let op = &func.insts[def_of(v)?.index()].op;
+    if let Op::Const(imm) = *op {
+        return if ty.is_small_int() { let u = extend(imm, ty, false) as u64; (u <= 1).then_some(u) } else { (0..=1).contains(&imm).then_some(imm as u64) };
+    }
+    if ty == Type::I128 && let Op::Binary(Binary::Iconcat, lo, hi) = *op {
+        let op_of = |u: Value| def_of(u).map(|i| &func.insts[i.index()].op);
+        if let (Some(&Op::Const(l)), Some(&Op::Const(h))) = (op_of(lo), op_of(hi)) { return (h == 0 && (0..=1).contains(&l)).then_some(l as u64); }
+    }
+    None
+}
+
+fn peel_uext_icmp(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, v: Value) -> Option<(IntCC, Value, Value)> {
+    let target = peel_uext(func, def_of, v);
+    if func.ty(target) != Type::I8 { return None; }
+    let Op::Icmp(cc, a, b) = func.insts[def_of(target)?.index()].op else { return None };
+    (!func.ty(a).in_float_register()).then_some((cc, a, b))
+}
+
+fn peel_base_icmp(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, v: Value) -> Option<(Option<Value>, IntCC, Value, Value)> {
+    if let Some((cc, a, b)) = peel_uext_icmp(func, def_of, v) { return Some((None, cc, a, b)); }
+    let Op::Binary(Binary::Iadd, lhs, rhs) = func.insts[def_of(v)?.index()].op else { return None };
+    [(lhs, rhs), (rhs, lhs)].into_iter().find_map(|(base, cv)| peel_uext_icmp(func, def_of, cv).map(|(cc, a, b)| (Some(base), cc, a, b)))
+}
+
+fn peel_base_add_01(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, ty: Type, base_opt: Option<Value>, v: Value) -> Option<u64> {
+    let Some(base) = base_opt else { return const_01(func, def_of, ty, v) };
     if v == base { return Some(0); }
-    let &Op::Binary(Binary::Iadd, p, q) = cx.op(v)? else { return None };
-    [(p, q), (q, p)].into_iter().find_map(|(b, k)| (b == base).then(|| cx.uconst(k, ty).filter(|&u| u <= 1)).flatten())
+    let Op::Binary(Binary::Iadd, p, q) = func.insts[def_of(v)?.index()].op else { return None };
+    [(p, q), (q, p)].into_iter().find_map(|(b, k)| (b == base).then(|| const_01(func, def_of, ty, k)).flatten())
 }
 
 fn collapse_ord_cc(cc: IntCC, eq_add: u64) -> Option<IntCC> {
@@ -78,20 +86,40 @@ fn collapse_ord_cc(cc: IntCC, eq_add: u64) -> Option<IntCC> {
     }
 }
 
+fn cond_eq_ab(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, cond: Value) -> Option<(bool, Value, Value)> {
+    match func.insts[def_of(peel_uext(func, def_of, cond))?.index()].op {
+        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), x, y) => complementary_eq_pair(func, def_of, x, y)
+            .map(|(a, b)| (cc == IntCC::Equal, a, b))
+            .or_else(|| (!func.ty(x).in_float_register()).then_some((cc == IntCC::Equal, x, y))),
+        Op::Binary(Binary::Isub | Binary::Bxor, p, q) => complementary_eq_pair(func, def_of, p, q).map(|(a, b)| (false, a, b)),
+        _ => None,
+    }
+}
+
+fn match_ord_select(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, (cond, t, f): (Value, Value, Value)) -> Option<OrdSelectMatch> {
+    let ty = func.ty(t);
+    if ty.in_float_register() { return None; }
+    let (eq_on_true, x, y) = cond_eq_ab(func, def_of, cond)?;
+    let (eq_arm, ne_arm) = if eq_on_true { (t, f) } else { (f, t) };
+    let (base, cmp_cc, lhs, rhs) = peel_base_icmp(func, def_of, ne_arm)?;
+    if !((lhs == x && rhs == y) || (lhs == y && rhs == x)) { return None; }
+    let cc = collapse_ord_cc(cmp_cc, peel_base_add_01(func, def_of, ty, base, eq_arm)?)?;
+    Some(OrdSelectMatch { base, cc, lhs, rhs })
+}
+
+fn build_ord_select(ty: Type, m: OrdSelectMatch, emit: &mut dyn FnMut(Type, Op) -> Value) -> Op {
+    let cmp_op = Op::Icmp(m.cc, m.lhs, m.rhs);
+    if m.base.is_none() && ty == Type::I8 { return cmp_op; }
+    let cmp_val = emit(Type::I8, cmp_op);
+    let Some(base) = m.base else { return Op::Convert(Convert::Uextend, cmp_val) };
+    let uext = if ty == Type::I8 { cmp_val } else { emit(ty, Op::Convert(Convert::Uextend, cmp_val)) };
+    Op::Binary(Binary::Iadd, base, uext)
+}
+
 fn fold_ord_select_cmp(cx: &mut RewriteCx, cond: Value, t: Value, f: Value) -> Option<Op> {
     let ty = cx.func.ty(t);
-    let &Op::Icmp(cond_cc @ (IntCC::Equal | IntCC::NotEqual), x, y) = cx.op(cond)? else { return None };
-    if !ty.is_small_int() || !cx.func.ty(x).is_small_int() { return None; }
-    let (eq_arm, ne_arm) = if cond_cc == IntCC::Equal { (t, f) } else { (f, t) };
-    let (base_opt, cmp_cc, cx0, cy0) = peel_base_icmp(cx, ty, ne_arm)?;
-    if !((cx0 == x && cy0 == y) || (cx0 == y && cy0 == x)) { return None; }
-    let new_cc = collapse_ord_cc(cmp_cc, peel_base_add_01(cx, ty, base_opt, eq_arm)?)?;
-    let cmp_op = Op::Icmp(new_cc, cx0, cy0);
-    if base_opt.is_none() && ty == Type::I8 { return Some(cmp_op); }
-    let cmp_val = cx.emit(Type::I8, cmp_op);
-    let Some(base) = base_opt else { return Some(Op::Convert(Convert::Uextend, cmp_val)) };
-    let uext = if ty == Type::I8 { cmp_val } else { cx.emit(ty, Op::Convert(Convert::Uextend, cmp_val)) };
-    Some(Op::Binary(Binary::Iadd, base, uext))
+    let m = match_ord_select(cx.func, &|v| cx.def(v), (cond, t, f))?;
+    Some(build_ord_select(ty, m, &mut |uty, op| cx.emit(uty, op)))
 }
 
 fn opposite(cx: &RewriteCx, a: Value, b: Value) -> bool {
@@ -107,31 +135,18 @@ fn refuted_arm(cx: &RewriteCx, cond: Value, arm: Value, taken: bool) -> Option<V
 pub(super) fn tested_select(cx: &RewriteCx, cond: Value) -> Option<(Value, bool)> {
     let &Op::Select(test, t, f) = cx.op(cx.unwrap_uextend(cond))? else { return None };
     let ty = cx.func.ty(t);
-    if !ty.is_small_int() || !cx.func.ty(test).is_small_int() {
-        return None;
-    }
-    if cx.uconst(f, ty) == Some(0) && is_non_zero_under(cx, t, unwrap_cond_cmp(cx, test, true), 0) {
-        Some((test, true))
-    } else if cx.uconst(t, ty) == Some(0) && is_non_zero_under(cx, f, unwrap_cond_cmp(cx, test, false), 0) {
-        Some((test, false))
-    } else {
-        None
-    }
+    if !ty.is_small_int() || !cx.func.ty(test).is_small_int() { return None; }
+    if cx.uconst(f, ty) == Some(0) && is_non_zero_under(cx, t, unwrap_cond_cmp(cx, test, true), 0) { Some((test, true)) }
+    else if cx.uconst(t, ty) == Some(0) && is_non_zero_under(cx, f, unwrap_cond_cmp(cx, test, false), 0) { Some((test, false)) }
+    else { None }
 }
 
 fn unwrap_cond_cmp(cx: &RewriteCx, mut raw: Value, mut taken: bool) -> Option<(IntCC, Value, Value)> {
     for _ in 0..4 {
         raw = cx.unwrap_uextend(raw);
-        if let Some(&Op::Binary(Binary::Bxor, a, b)) = cx.op(raw)
-            && cx.func.ty(raw).is_small_int()
-        {
-            let next = [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| {
-                (cx.uconst(mask, cx.func.ty(mask)) == Some(1) && cx.is_unit_bool(inner)).then_some(inner)
-            });
-            if let Some(inner) = next {
-                (raw, taken) = (inner, !taken);
-                continue;
-            }
+        if let Some(&Op::Binary(Binary::Bxor, a, b)) = cx.op(raw) && cx.func.ty(raw).is_small_int() {
+            let next = [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| (cx.uconst(mask, cx.func.ty(mask)) == Some(1) && cx.is_unit_bool(inner)).then_some(inner));
+            if let Some(inner) = next { (raw, taken) = (inner, !taken); continue; }
         }
         break;
     }
@@ -140,15 +155,11 @@ fn unwrap_cond_cmp(cx: &RewriteCx, mut raw: Value, mut taken: bool) -> Option<(I
 }
 
 fn cond_upper_bound(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value)) -> Option<(Value, u64)> {
-    let ty = cx.func.ty(a);
-    let (w, sign) = (ty.unsigned_max(), 1_u64 << (ty.bits() - 1));
+    let (ty, sign) = (cx.func.ty(a), 1_u64 << (cx.func.ty(a).bits() - 1));
     let non_neg = |v: Value| (cx.known(v).0 & sign) != 0;
     for (norm, mut var, lim) in [(eff, a, b), (flip_int_cc(eff), b, a)] {
-        if cx.sconst(var).is_some() {
-            continue;
-        }
-        let lim_hi = w & !cx.known(lim).0;
-        let both_nn = non_neg(var) && non_neg(lim);
+        if cx.sconst(var).is_some() { continue; }
+        let (lim_hi, both_nn) = (ty.unsigned_max() & !cx.known(lim).0, non_neg(var) && non_neg(lim));
         let bound = match norm {
             IntCC::UnsignedLessThan => lim_hi.checked_sub(1),
             IntCC::UnsignedLessThanOrEqual | IntCC::Equal => Some(lim_hi),
@@ -157,10 +168,7 @@ fn cond_upper_bound(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value)) -> Optio
             _ => None,
         };
         if let Some(mut hi) = bound {
-            while let Some(&Op::Convert(Convert::Uextend, inner)) = cx.op(var) {
-                if !cx.func.ty(inner).is_small_int() {
-                    break;
-                }
+            while let Some(&Op::Convert(Convert::Uextend, inner)) = cx.op(var) && cx.func.ty(inner).is_small_int() {
                 var = inner;
                 hi = hi.min(cx.func.ty(var).unsigned_max());
             }
@@ -175,10 +183,7 @@ fn cond_proves_nonzero(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value), v: Va
     let sign = 1_u64 << (ty.bits() - 1);
     [(eff, a, b), (flip_int_cc(eff), b, a)].into_iter().any(|(norm, var, lim)| {
         let same = var == v || matches!(cx.op(var), Some(&Op::Convert(Convert::Uextend, inner)) if inner == v);
-        if !same {
-            return false;
-        }
-        match norm {
+        same && match norm {
             IntCC::UnsignedGreaterThan => true,
             IntCC::NotEqual => cx.uconst(lim, ty) == Some(0),
             IntCC::Equal | IntCC::UnsignedGreaterThanOrEqual => cx.known(lim).1 != 0,
@@ -194,8 +199,7 @@ fn peel_const_base(cx: &RewriteCx, mut v: Value) -> (Value, i64) {
         match cx.op(v) {
             Some(&Op::Convert(Convert::Bitcast, a)) if cx.func.ty(a) == cx.func.ty(v) => v = a,
             Some(&Op::Binary(Binary::Iadd, a, b)) => {
-                let step = [(a, b), (b, a)].into_iter().find_map(|(base, k)| Some((base, disp.checked_add(cx.sconst(k)?)?)));
-                let Some((base, next)) = step else { break };
+                let Some((base, next)) = [(a, b), (b, a)].into_iter().find_map(|(base, k)| Some((base, disp.checked_add(cx.sconst(k)?)?))) else { break };
                 (v, disp) = (base, next);
             }
             Some(&Op::Binary(Binary::Isub, a, b)) => {
@@ -209,10 +213,7 @@ fn peel_const_base(cx: &RewriteCx, mut v: Value) -> (Value, i64) {
 }
 
 fn deref_span_covers(cx: &RewriteCx, root: Value, lo_disp: i64, hi_disp: i64) -> bool {
-    if cx.func.ty(root) != Type::I64 {
-        return false;
-    }
-    cx.out.iter().rev().take(64).any(|&inst| {
+    cx.func.ty(root) == Type::I64 && cx.out.iter().rev().take(64).any(|&inst| {
         let data = &cx.func.insts[inst.index()];
         let (addr, off, bytes) = match data.op {
             Op::Load(addr, off) => (addr, off, data.result.map_or(0, |r| cx.func.ty(r).bytes())),
@@ -220,37 +221,25 @@ fn deref_span_covers(cx: &RewriteCx, root: Value, lo_disp: i64, hi_disp: i64) ->
             _ => return false,
         };
         let (aroot, adisp) = peel_const_base(cx, addr);
-        bytes != 0
-            && aroot == root
-            && adisp
-                .checked_add(i64::from(off))
-                .and_then(|lo| Some((lo, lo.checked_add(i64::from(bytes))?)))
-                .is_some_and(|(lo, hi)| lo <= lo_disp && hi_disp < hi)
+        bytes != 0 && aroot == root && adisp.checked_add(i64::from(off)).and_then(|lo| Some((lo, lo.checked_add(i64::from(bytes))?))).is_some_and(|(lo, hi)| lo <= lo_disp && hi_disp < hi)
     })
 }
 
 fn valid_ptr_span(cx: &RewriteCx, root: Value, base_disp: i64, off_max: u64) -> bool {
-    let Ok(off_s) = i64::try_from(off_max) else { return false };
-    let Some(hi_disp) = base_disp.checked_add(off_s) else { return false };
+    let Some(hi_disp) = i64::try_from(off_max).ok().and_then(|o| base_disp.checked_add(o)) else { return false };
     match cx.op(root) {
         Some(Op::StackAddr(..) | Op::SlotAddr(_)) => (-ADDR_SPAN..=ADDR_SPAN).contains(&base_disp) && (-ADDR_SPAN..=ADDR_SPAN).contains(&hi_disp),
         Some(Op::Symbol(_)) => base_disp >= 0 && hi_disp <= ADDR_SPAN,
-        _ => cx.func.ty(root) == Type::I64
-            && ((base_disp >= 0 && (hi_disp as u64) < u64::from(entry_deref_bytes(cx, root)))
-                || deref_span_covers(cx, root, base_disp, hi_disp)),
+        _ => cx.func.ty(root) == Type::I64 && ((base_disp >= 0 && (hi_disp as u64) < u64::from(entry_deref_bytes(cx, root))) || deref_span_covers(cx, root, base_disp, hi_disp)),
     }
 }
 
 fn tested_arm(cx: &RewriteCx, cond: Value, t: Value, f: Value) -> Option<Value> {
     let ty = cx.func.ty(t);
-    if !ty.is_small_int() {
-        return None;
-    }
+    if !ty.is_small_int() { return None; }
     let key = |v: Value| cx.uconst(v, ty).map_or(Ok(v), Err);
     let (pair, differ) = match *cx.op(cond)? {
-        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), a, b) if cx.func.ty(a) == ty => {
-            ([key(a), key(b)], cc == IntCC::NotEqual)
-        }
+        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), a, b) if cx.func.ty(a) == ty => ([key(a), key(b)], cc == IntCC::NotEqual),
         Op::Binary(Binary::Isub | Binary::Bxor, a, b) if cx.func.ty(cond) == ty => ([key(a), key(b)], true),
         Op::Binary(Binary::Iadd, a, b) if cx.func.ty(cond) == ty => {
             let (v, k) = [(a, b), (b, a)].into_iter().find_map(|(v, k)| Some((v, cx.uconst(k, ty)?)))?;
@@ -264,48 +253,30 @@ fn tested_arm(cx: &RewriteCx, cond: Value, t: Value, f: Value) -> Option<Value> 
 
 fn entry_deref_bytes(cx: &RewriteCx, v: Value) -> u32 {
     let Some(entry) = cx.func.entry else { return 0 };
-    cx.func.blocks[entry.index()]
-        .params
-        .iter()
-        .position(|&p| p == v)
-        .and_then(|pos| cx.func.signature.params.get(pos))
-        .map_or(0, |abi| abi.deref_bytes)
+    cx.func.blocks[entry.index()].params.iter().position(|&p| p == v).and_then(|pos| cx.func.signature.params.get(pos)).map_or(0, |abi| abi.deref_bytes)
 }
 
-pub(super) fn is_non_zero(cx: &RewriteCx, v: Value, depth: u8) -> bool {
-    is_non_zero_under(cx, v, None, depth)
-}
+pub(super) fn is_non_zero(cx: &RewriteCx, v: Value, depth: u8) -> bool { is_non_zero_under(cx, v, None, depth) }
 
 fn add_non_zero(cx: &RewriteCx, (a, b): (Value, Value), outer_disp: i64, cmp: Option<(IntCC, Value, Value)>) -> bool {
     let bound = cmp.and_then(|c| cond_upper_bound(cx, c));
     [(a, b), (b, a)].into_iter().any(|(base, off_v)| {
         let (root, base_disp) = peel_const_base(cx, base);
-        base_disp
-            .checked_add(outer_disp)
-            .is_some_and(|disp| valid_ptr_span(cx, root, disp, offset_bound(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), off_v, (bound, 0))))
+        base_disp.checked_add(outer_disp).is_some_and(|disp| valid_ptr_span(cx, root, disp, offset_bound(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), off_v, (bound, 0))))
     })
 }
 
 fn known_non_zero(cx: &RewriteCx, v: Value, cmp: Option<(IntCC, Value, Value)>) -> bool {
     non_null_at(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), before(cx), v)
-        || cx.known(v).1 != 0
-        || entry_deref_bytes(cx, v) > 0
-        || three_way_non_zero(cx, v)
-        || cmp.is_some_and(|c| cond_proves_nonzero(cx, c, v))
+        || cx.known(v).1 != 0 || entry_deref_bytes(cx, v) > 0 || three_way_non_zero(cx, v) || cmp.is_some_and(|c| cond_proves_nonzero(cx, c, v))
 }
 
 fn is_non_zero_under(cx: &RewriteCx, v: Value, cmp: Option<(IntCC, Value, Value)>, depth: u8) -> bool {
     let ty = cx.func.ty(v);
-    if depth >= 4 || !ty.is_small_int() {
-        return false;
-    }
-    if known_non_zero(cx, v, cmp) {
-        return true;
-    }
+    if depth >= 4 || !ty.is_small_int() { return false; }
+    if known_non_zero(cx, v, cmp) { return true; }
     let (core, outer_disp) = peel_const_base(cx, v);
-    if outer_disp != 0 && valid_ptr_span(cx, core, outer_disp, 0) {
-        return true;
-    }
+    if outer_disp != 0 && valid_ptr_span(cx, core, outer_disp, 0) { return true; }
     let Some(inst) = cx.def(core) else { return false };
     match cx.func.insts[inst.index()].op {
         Op::Binary(Binary::Iadd, a, b) => add_non_zero(cx, (a, b), outer_disp, cmp),
@@ -324,14 +295,8 @@ fn simplify_1_bool(cx: &mut RewriteCx, res: Option<Value>, c: Value, b1: bool, b
     match (b1, b2) {
         (true, true) => Some(Op::Const(1)),
         (false, false) => Some(Op::Const(0)),
-        (true, false) => {
-            cx.alias(res, c);
-            None
-        }
-        (false, true) => {
-            let one = cx.emit(Type::I8, Op::Const(1));
-            Some(Op::Binary(Binary::Bxor, c, one))
-        }
+        (true, false) => { cx.alias(res, c); None }
+        (false, true) => { let one = cx.emit(Type::I8, Op::Const(1)); Some(Op::Binary(Binary::Bxor, c, one)) }
     }
 }
 
@@ -384,11 +349,7 @@ fn eval_const_select_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: V
 }
 
 #[derive(Clone, Copy)]
-enum ArmRel {
-    EqK,
-    NeqK,
-    Unknown,
-}
+enum ArmRel { EqK, NeqK, Unknown }
 
 fn cmp_target(cc: IntCC, ty: Type, k_s: i64) -> Option<(u64, bool)> {
     match cc {
@@ -398,34 +359,20 @@ fn cmp_target(cc: IntCC, ty: Type, k_s: i64) -> Option<(u64, bool)> {
 }
 
 fn classify_arm(cx: &RewriteCx, v: Value, ty: Type, k_u: u64, cmp: Option<(IntCC, Value, Value)>) -> ArmRel {
-    if let Some(c) = cx.uconst(v, ty) {
-        return if c == k_u { ArmRel::EqK } else { ArmRel::NeqK };
-    }
+    if let Some(c) = cx.uconst(v, ty) { return if c == k_u { ArmRel::EqK } else { ArmRel::NeqK }; }
     let (zeros, ones) = cx.known(v);
-    if (zeros | ones) == ty.unsigned_max() {
-        return if ones == k_u { ArmRel::EqK } else { ArmRel::NeqK };
-    }
-    if (ones & !k_u) != 0 || (zeros & k_u) != 0 {
-        return ArmRel::NeqK;
-    }
-    if k_u == 0 && is_non_zero_under(cx, v, cmp, 0) {
-        return ArmRel::NeqK;
-    }
+    if (zeros | ones) == ty.unsigned_max() { return if ones == k_u { ArmRel::EqK } else { ArmRel::NeqK }; }
+    if (ones & !k_u) != 0 || (zeros & k_u) != 0 || (k_u == 0 && is_non_zero_under(cx, v, cmp, 0)) { return ArmRel::NeqK; }
     ArmRel::Unknown
 }
 
 pub(super) fn eval_select_zero_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Option<Op>> {
     let ty = cx.func.ty(x);
-    if !ty.is_small_int() || !res.is_some_and(|r| cx.func.ty(r) == Type::I8) {
-        return None;
-    }
-    if let Some(folded) = eval_const_select_cmp(cx, res, cc, x, y) {
-        return Some(folded);
-    }
+    if !ty.is_small_int() || !res.is_some_and(|r| cx.func.ty(r) == Type::I8) { return None; }
+    if let Some(folded) = eval_const_select_cmp(cx, res, cc, x, y) { return Some(folded); }
     for (norm, sel_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
         let Some((k_u, want_match)) = cx.sconst(c_val).and_then(|k_s| cmp_target(norm, ty, k_s)) else { continue };
-        let Some(sel_inst) = cx.def(sel_val) else { continue };
-        let Op::Select(raw_cond, t_val, f_val) = cx.func.insts[sel_inst.index()].op else { continue };
+        let Some(&Op::Select(raw_cond, t_val, f_val)) = cx.op(sel_val) else { continue };
         let t_cmp = (k_u == 0).then(|| unwrap_cond_cmp(cx, raw_cond, true)).flatten();
         let f_cmp = (k_u == 0).then(|| unwrap_cond_cmp(cx, raw_cond, false)).flatten();
         let out = match (classify_arm(cx, t_val, ty, k_u, t_cmp), classify_arm(cx, f_val, ty, k_u, f_cmp)) {
@@ -435,9 +382,7 @@ pub(super) fn eval_select_zero_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: I
             (ArmRel::NeqK, ArmRel::EqK) => emit_cond_truth(cx, res, raw_cond, !want_match),
             _ => None,
         };
-        if let Some(folded) = out {
-            return Some(folded);
-        }
+        if let Some(folded) = out { return Some(folded); }
     }
     None
 }
@@ -562,10 +507,7 @@ fn fold_bxor_select(func: &mut Function, facts: &BoolFacts, out: &mut Vec<Inst>,
     if let Some((x, y)) = facts.xors[inner.index()] {
         if let Some((lhs, _)) = [(x, y), (y, x)].into_iter().find(|&(_, c)| facts.consts[c.index()] == Some(1))
             && let bool_src = facts.unwrap_uext(lhs) && facts.bools[bool_src.index()]
-        {
-            func.insts[inst.index()].op = Op::Select(bool_src, f_val, t_val);
-            return true;
-        }
+        { func.insts[inst.index()].op = Op::Select(bool_src, f_val, t_val); return true; }
         if let Some((a, b)) = xor_ne_pair(func, facts, x, y, false) {
             let cmp_val = func.value(Type::I8);
             out.push(func.add(Op::Icmp(IntCC::NotEqual, a, b), Some(cmp_val)));
@@ -580,9 +522,7 @@ fn fold_bxor_select(func: &mut Function, facts: &BoolFacts, out: &mut Vec<Inst>,
 fn fold_bxor_brif(func: &mut Function, facts: &BoolFacts, out: &mut Vec<Inst>, inst: Inst) -> bool {
     let Op::Brif(cond, ..) = func.insts[inst.index()].op else { return false };
     let inner = facts.unwrap_uext(cond);
-    if let Some((x, y)) = facts.xors[inner.index()]
-        && let Some((a, b)) = xor_ne_pair(func, facts, x, y, true) && func.ty(a) == func.ty(b) && func.ty(a).is_small_int()
-    {
+    if let Some((x, y)) = facts.xors[inner.index()] && let Some((a, b)) = xor_ne_pair(func, facts, x, y, true) && func.ty(a) == func.ty(b) && func.ty(a).is_small_int() {
         let cmp_val = func.value(Type::I8);
         out.push(func.add(Op::Icmp(IntCC::NotEqual, a, b), Some(cmp_val)));
         if let Op::Brif(c_mut, ..) = &mut func.insts[inst.index()].op { *c_mut = cmp_val; }
@@ -596,8 +536,7 @@ fn tag_cond_info(facts: &BoolFacts, func: &Function, param_of: &[Option<(usize, 
     let inner = facts.unwrap_uext(cond);
     if let Some((cc @ (IntCC::Equal | IntCC::NotEqual), x, y)) = facts.compares[inner.index()] {
         return [(x, y), (y, x)].into_iter().find_map(|(p, c)| {
-            let (pb, ti) = param_of.get(p.index()).copied().flatten()?;
-            let imm = facts.consts[c.index()]?;
+            let ((pb, ti), imm) = (param_of.get(p.index()).copied().flatten()?, facts.consts[c.index()]?);
             (pb == b_idx && func.ty(p).is_small_int()).then(|| (ti, p, extend(imm, func.ty(p), false) as u64, cc == IntCC::Equal))
         });
     }
@@ -607,8 +546,7 @@ fn tag_cond_info(facts: &BoolFacts, func: &Function, param_of: &[Option<(usize, 
 
 fn push_edge(edges: &mut Vec<(Value, Value)>, args: &[Value], (tag_idx, val_idx): (usize, usize)) -> bool {
     let (Some(&ta), Some(&va)) = (args.get(tag_idx), args.get(val_idx)) else { return false };
-    edges.push((ta, va));
-    true
+    edges.push((ta, va)); true
 }
 
 fn push_edge_pair(edges: &mut Vec<(Value, Value)>, b_idx: usize, op: &Op, idx: (usize, usize)) -> bool {
@@ -729,68 +667,129 @@ fn difference(func: &Function, defs: &[Option<Inst>], uses: &[u32], v: Value) ->
     }
 }
 
-fn offset_compare(func: &mut Function, defs: &[Option<Inst>], uses: &[u32], out: &mut Vec<Inst>, inst: Inst) -> Option<Inst> {
-    let konst = |func: &Function, v: Value| match defs.get(v.index()).copied().flatten().map(|def| &func.insts[def.index()].op) {
-        Some(&Op::Const(imm)) => Some(imm),
-        _ => None,
-    };
-    let (cc, diff, rhs) = match func.insts[inst.index()].op {
-        Op::Brif(cond, ..) | Op::Select(cond, ..) => (None, cond, 0),
-        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), x, y) => match (konst(func, x), konst(func, y)) {
-            (None, Some(k)) => (Some(cc), x, k),
-            (Some(k), None) => (Some(cc), y, k),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    let (gone, a, b) = difference(func, defs, uses, diff)?;
-    let ty = func.ty(a);
-    let (lhs, bound) = if crate::fold::extend(rhs, ty, false) == 0 {
-        (a, b)
-    } else {
-        let sub = matches!(func.insts[gone.index()].op, Op::Binary(Binary::Isub, ..));
-        let (base, imm) = match (konst(func, a), konst(func, b), sub) {
-            (None, Some(c), true) => (a, c.wrapping_add(rhs)),
-            (Some(c), None, true) => (b, c.wrapping_sub(rhs)),
-            (None, Some(c), false) => (a, c ^ rhs),
-            (Some(c), None, false) => (b, c ^ rhs),
-            _ => return None,
-        };
-        let val = func.value(ty);
-        out.push(func.add(Op::Const(crate::fold::extend(imm, ty, true)), Some(val)));
-        (base, val)
-    };
-    match cc {
-        Some(cc) => func.insts[inst.index()].op = Op::Icmp(cc, lhs, bound),
-        None => {
-            let test = func.value(Type::I8);
-            out.push(func.add(Op::Icmp(IntCC::NotEqual, lhs, bound), Some(test)));
-            if let Op::Brif(cond, ..) | Op::Select(cond, ..) = &mut func.insts[inst.index()].op {
-                *cond = test;
-            }
+struct LateCx { defs: Vec<Option<Inst>>, uses: Vec<u32>, out: Vec<Inst>, dead: Vec<Inst>, work: Vec<Value> }
+
+impl LateCx {
+    fn def(&self, v: Value) -> Option<Inst> { self.defs.get(v.index()).copied().flatten() }
+
+    fn konst(&self, func: &Function, v: Value) -> Option<i64> {
+        match self.def(v).map(|def| &func.insts[def.index()].op) { Some(&Op::Const(imm)) => Some(imm), _ => None }
+    }
+
+    fn bump(&mut self, v: Value, delta: i32) {
+        if let Some(c) = self.uses.get_mut(v.index()) {
+            if delta > 0 { *c += 1; } else if *c > 0 { *c -= 1; if *c == 0 { self.work.push(v); } }
         }
     }
-    Some(gone)
+
+    fn replace_op(&mut self, func: &mut Function, inst: Inst, new_op: Op, start: usize) {
+        func.insts[inst.index()].op.clone().for_operands(|u| self.bump(u, -1));
+        for idx in start..self.out.len() {
+            let ni = self.out[idx];
+            if let Some(r) = func.insts[ni.index()].result {
+                if self.defs.len() <= r.index() { self.defs.resize(r.index() + 1, None); self.uses.resize(r.index() + 1, 0); }
+                self.defs[r.index()] = Some(ni);
+            }
+            func.insts[ni.index()].op.for_operands(|u| self.bump(u, 1));
+        }
+        new_op.for_operands(|u| self.bump(u, 1));
+        func.insts[inst.index()].op = new_op;
+    }
+
+    fn sweep_orphans(&mut self, func: &mut Function) {
+        while let Some(v) = self.work.pop() {
+            let Some(inst) = self.def(v) else { continue };
+            if self.uses.get(v.index()).copied().unwrap_or(1) != 0 || self.dead.contains(&inst) { continue; }
+            let op = &func.insts[inst.index()].op;
+            if !op.is_speculable() { continue; }
+            self.dead.push(inst);
+            op.for_operands(|u| if let Some(c) = self.uses.get_mut(u.index()) && *c > 0 { *c -= 1; if *c == 0 { self.work.push(u); } });
+        }
+    }
+}
+
+fn late_fold_ord(func: &mut Function, lcx: &mut LateCx, inst: Inst) -> bool {
+    let start = lcx.out.len();
+    let def_of = |v: Value| lcx.defs.get(v.index()).copied().flatten();
+    match func.insts[inst.index()].op {
+        Op::Select(cond, t, f) => {
+            let Some(m) = match_ord_select(func, &def_of, (cond, t, f)) else { return false };
+            let new_op = build_ord_select(func.ty(t), m, &mut |uty, op| { let val = func.value(uty); lcx.out.push(func.add(op, Some(val))); val });
+            lcx.replace_op(func, inst, new_op, start);
+            true
+        }
+        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), x, y) => {
+            let Some((a, b)) = complementary_eq_pair(func, &def_of, x, y) else { return false };
+            lcx.replace_op(func, inst, Op::Icmp(cc, a, b), start);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn offset_target(func: &Function, lcx: &LateCx, op: &Op) -> Option<(Option<IntCC>, Value, i64)> {
+    match *op {
+        Op::Brif(cond, ..) | Op::Select(cond, ..) => Some((None, cond, 0)),
+        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), x, y) => match (lcx.konst(func, x), lcx.konst(func, y)) {
+            (None, Some(k)) => Some((Some(cc), x, k)),
+            (Some(k), None) => Some((Some(cc), y, k)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn shift_offset(func: &mut Function, lcx: &mut LateCx, gone: Inst, (a, b, rhs): (Value, Value, i64)) -> Option<(Value, Value)> {
+    let ty = func.ty(a);
+    if crate::fold::extend(rhs, ty, false) == 0 { return Some((a, b)); }
+    let sub = matches!(func.insts[gone.index()].op, Op::Binary(Binary::Isub, ..));
+    let (base, imm) = match (lcx.konst(func, a), lcx.konst(func, b), sub) {
+        (None, Some(c), true) => (a, c.wrapping_add(rhs)),
+        (Some(c), None, true) => (b, c.wrapping_sub(rhs)),
+        (None, Some(c), false) | (Some(c), None, false) => (if lcx.konst(func, a).is_some() { b } else { a }, c ^ rhs),
+        _ => return None,
+    };
+    let val = func.value(ty);
+    lcx.out.push(func.add(Op::Const(crate::fold::extend(imm, ty, true)), Some(val)));
+    Some((base, val))
+}
+
+fn offset_compare(func: &mut Function, lcx: &mut LateCx, inst: Inst) -> bool {
+    let Some((cc, diff, rhs)) = offset_target(func, lcx, &func.insts[inst.index()].op) else { return false };
+    let Some((gone, a, b)) = difference(func, &lcx.defs, &lcx.uses, diff) else { return false };
+    let start = lcx.out.len();
+    let Some((lhs, bound)) = shift_offset(func, lcx, gone, (a, b, rhs)) else { return false };
+    let (lhs, bound) = complementary_eq_pair(func, &|v| lcx.defs.get(v.index()).copied().flatten(), lhs, bound).unwrap_or((lhs, bound));
+    let new_op = match cc {
+        Some(cc) => Op::Icmp(cc, lhs, bound),
+        None => {
+            let test = func.value(Type::I8);
+            lcx.out.push(func.add(Op::Icmp(IntCC::NotEqual, lhs, bound), Some(test)));
+            let mut op = func.insts[inst.index()].op.clone();
+            if let Op::Brif(cond, ..) | Op::Select(cond, ..) = &mut op { *cond = test; }
+            op
+        }
+    };
+    lcx.replace_op(func, inst, new_op, start);
+    if !lcx.dead.contains(&gone) { lcx.dead.push(gone); func.insts[gone.index()].op.for_operands(|u| lcx.bump(u, -1)); }
+    true
 }
 
 /// Rewrites a branch, a select, or an equality with a constant that is the only reader of `a - b` or `a ^ b` as a compare of `a`, and drops the difference; it runs after the passes that read ranges from the difference.
 pub(crate) fn compare_offsets(func: &mut Function) -> bool {
-    let (defs, uses) = (crate::fold::defs(func), func.use_counts());
-    let mut dead = Vec::new();
+    let mut lcx = LateCx { defs: crate::fold::defs(func), uses: func.use_counts(), out: Vec::new(), dead: Vec::new(), work: Vec::new() };
+    let mut changed = false;
     for b in 0..func.blocks.len() {
         let insts = std::mem::take(&mut func.blocks[b].insts);
-        let mut out = Vec::with_capacity(insts.len());
+        lcx.out = Vec::with_capacity(insts.len());
         for inst in insts {
-            dead.extend(offset_compare(func, &defs, &uses, &mut out, inst));
-            out.push(inst);
+            changed |= late_fold_ord(func, &mut lcx, inst) || offset_compare(func, &mut lcx, inst);
+            lcx.out.push(inst);
         }
-        func.blocks[b].insts = out;
+        func.blocks[b].insts = std::mem::take(&mut lcx.out);
     }
-    for block in &mut func.blocks {
-        block.insts.retain(|inst| !dead.contains(inst));
-    }
-    for &inst in &dead {
-        func.insts[inst.index()].op = Op::Trap;
-    }
-    !dead.is_empty()
+    lcx.sweep_orphans(func);
+    for block in &mut func.blocks { block.insts.retain(|inst| !lcx.dead.contains(inst)); }
+    for &inst in &lcx.dead { func.insts[inst.index()].op = Op::Trap; }
+    changed || !lcx.dead.is_empty()
 }
