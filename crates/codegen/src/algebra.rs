@@ -2,6 +2,7 @@ use crate::fold::{extend, holds};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, ShuffleMask, Type, Unary, Value};
 
 mod icmp;
+mod ovf;
 mod select;
 mod vec;
 pub(crate) use icmp::{is_non_null_addr, non_null_cmp};
@@ -691,7 +692,8 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Insert(v, x, lane) => vec::simplify_insert(cx, res, v, x, lane),
         Op::Extract(v, lane) => vec::simplify_extract(cx, res, v, lane),
         Op::Shuffle(a, b, ShuffleMask::Const(m)) => vec::simplify_shuffle(cx, res, a, b, m),
-        Op::Select(cond, t, f) => select::simplify_select(cx, res, cond, t, f),
+        Op::Fits(Binary::Imul, false, x, y) => ovf::simplify_mul_fits(cx, x, y),
+        Op::Select(cond, t, f) => ovf::gated_product(cx, cond, t, f).or_else(|| select::simplify_select(cx, res, cond, t, f)),
         Op::Brif(cond, tb, ta, eb, ea) => match select::tested_select(cx, cond) {
             Some((test, true)) => Some(Op::Brif(test, tb, ta, eb, ea)),
             Some((test, false)) => Some(Op::Brif(test, eb, ea, tb, ta)),
