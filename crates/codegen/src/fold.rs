@@ -12,6 +12,15 @@ pub(crate) fn extend(imm: i64, ty: Type, signed: bool) -> i64 {
     if signed { imm << shift >> shift } else { ((imm as u64) << shift >> shift) as i64 }
 }
 
+/// The base and addend of `op` when it is `base + c`, `c + base` or `base - c` with `c` known to `konst`.
+pub(crate) fn const_offset(op: &Op, konst: impl Fn(Value) -> Option<i64>) -> Option<(Value, i64)> {
+    match *op {
+        Op::Binary(Binary::Iadd, x, y) => [(x, y), (y, x)].into_iter().find_map(|(base, c)| konst(c).map(|c| (base, c))),
+        Op::Binary(Binary::Isub, x, y) => konst(y).map(|c| (x, c.wrapping_neg())),
+        _ => None,
+    }
+}
+
 /// Whether `imm` fits a sign-extended 32-bit immediate.
 pub(crate) fn fits_imm32(imm: i64) -> bool {
     i32::try_from(imm).is_ok()

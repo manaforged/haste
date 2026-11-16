@@ -1,5 +1,5 @@
 use crate::cse::flip_int_cc;
-use crate::fold::{extend, known_bits, non_null_at};
+use crate::fold::{const_offset, extend, known_bits, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
 use super::icmp::{ADDR_SPAN, before, complementary_eq_pair, emit_cond_truth, null_test, offset_bound, three_way_non_zero};
@@ -658,15 +658,15 @@ pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
     changed
 }
 
-fn difference(func: &Function, defs: &[Option<Inst>], uses: &[u32], v: Value) -> Option<(Inst, Value, Value)> {
-    let inst = defs.get(v.index()).copied().flatten().filter(|_| uses.get(v.index()) == Some(&1))?;
-    match func.insts[inst.index()].op {
-        Op::Binary(Binary::Isub | Binary::Bxor, a, b) if func.ty(a).is_small_int() => Some((inst, a, b)),
-        _ => None,
-    }
+fn difference(func: &Function, lcx: &LateCx, v: Value) -> Option<Inst> {
+    let inst = lcx.def(v)?;
+    let Op::Binary(Binary::Isub | Binary::Bxor, a, b) = func.insts[inst.index()].op else { return None };
+    let uses = lcx.uses.get(v.index()).copied()?;
+    let all_tests = func.ty(a) == Type::I8 && lcx.konst(func, a).is_some() != lcx.konst(func, b).is_some() && lcx.tests.get(v.index()) == Some(&uses);
+    (func.ty(a).is_small_int() && (uses == 1 || all_tests)).then_some(inst)
 }
 
-struct LateCx { defs: Vec<Option<Inst>>, uses: Vec<u32>, out: Vec<Inst>, dead: Vec<Inst>, work: Vec<Value> }
+struct LateCx { defs: Vec<Option<Inst>>, uses: Vec<u32>, tests: Vec<u32>, out: Vec<Inst>, dead: Vec<Inst>, work: Vec<Value> }
 
 impl LateCx {
     fn def(&self, v: Value) -> Option<Inst> { self.defs.get(v.index()).copied().flatten() }
@@ -738,26 +738,28 @@ fn offset_target(func: &Function, lcx: &LateCx, op: &Op) -> Option<(Option<IntCC
     }
 }
 
-fn shift_offset(func: &mut Function, lcx: &mut LateCx, gone: Inst, (a, b, rhs): (Value, Value, i64)) -> Option<(Value, Value)> {
+fn shift_offset(func: &mut Function, lcx: &mut LateCx, gone: Inst, rhs: i64) -> Option<(Value, Value)> {
+    let op = func.insts[gone.index()].op.clone();
+    let Op::Binary(bin, a, b) = op else { return None };
     let ty = func.ty(a);
-    if crate::fold::extend(rhs, ty, false) == 0 { return Some((a, b)); }
-    let sub = matches!(func.insts[gone.index()].op, Op::Binary(Binary::Isub, ..));
-    let (base, imm) = match (lcx.konst(func, a), lcx.konst(func, b), sub) {
-        (None, Some(c), true) => (a, c.wrapping_add(rhs)),
-        (Some(c), None, true) => (b, c.wrapping_sub(rhs)),
-        (None, Some(c), false) | (Some(c), None, false) => (if lcx.konst(func, a).is_some() { b } else { a }, c ^ rhs),
+    if extend(rhs, ty, false) == 0 { return Some((a, b)); }
+    let konst = |v: Value| lcx.konst(func, v);
+    let (base, imm) = match (bin, konst(a), konst(b)) {
+        (Binary::Isub, Some(c), None) => (b, c.wrapping_sub(rhs)),
+        (Binary::Isub, ..) => const_offset(&op, konst).map(|(base, delta)| (base, rhs.wrapping_sub(delta)))?,
+        (_, None, Some(c)) | (_, Some(c), None) => (if konst(a).is_some() { b } else { a }, c ^ rhs),
         _ => return None,
     };
     let val = func.value(ty);
-    lcx.out.push(func.add(Op::Const(crate::fold::extend(imm, ty, true)), Some(val)));
+    lcx.out.push(func.add(Op::Const(extend(imm, ty, true)), Some(val)));
     Some((base, val))
 }
 
 fn offset_compare(func: &mut Function, lcx: &mut LateCx, inst: Inst) -> bool {
     let Some((cc, diff, rhs)) = offset_target(func, lcx, &func.insts[inst.index()].op) else { return false };
-    let Some((gone, a, b)) = difference(func, &lcx.defs, &lcx.uses, diff) else { return false };
+    let Some(gone) = difference(func, lcx, diff) else { return false };
     let start = lcx.out.len();
-    let Some((lhs, bound)) = shift_offset(func, lcx, gone, (a, b, rhs)) else { return false };
+    let Some((lhs, bound)) = shift_offset(func, lcx, gone, rhs) else { return false };
     let (lhs, bound) = complementary_eq_pair(func, &|v| lcx.defs.get(v.index()).copied().flatten(), lhs, bound).unwrap_or((lhs, bound));
     let new_op = match cc {
         Some(cc) => Op::Icmp(cc, lhs, bound),
@@ -770,13 +772,18 @@ fn offset_compare(func: &mut Function, lcx: &mut LateCx, inst: Inst) -> bool {
         }
     };
     lcx.replace_op(func, inst, new_op, start);
-    if !lcx.dead.contains(&gone) { lcx.dead.push(gone); func.insts[gone.index()].op.for_operands(|u| lcx.bump(u, -1)); }
+    if lcx.uses.get(diff.index()) == Some(&0) && !lcx.dead.contains(&gone) { lcx.dead.push(gone); func.insts[gone.index()].op.for_operands(|u| lcx.bump(u, -1)); }
     true
 }
 
-/// Rewrites a branch, a select, or an equality with a constant that is the only reader of `a - b` or `a ^ b` as a compare of `a`, and drops the difference; it runs after the passes that read ranges from the difference.
+/// Rewrites a branch, a select, or an equality with a constant that is the only reader of `a - b` or `a ^ b`, or one of several that read a byte offset by a constant, as a compare of `a`, and drops the difference; it runs after the passes that read ranges from the difference.
 pub(crate) fn compare_offsets(func: &mut Function) -> bool {
-    let mut lcx = LateCx { defs: crate::fold::defs(func), uses: func.use_counts(), out: Vec::new(), dead: Vec::new(), work: Vec::new() };
+    let mut lcx = LateCx { defs: crate::fold::defs(func), uses: func.use_counts(), tests: Vec::new(), out: Vec::new(), dead: Vec::new(), work: Vec::new() };
+    let mut tests = vec![0_u32; lcx.uses.len()];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        if let Some((_, v, _)) = offset_target(func, &lcx, &func.insts[inst.index()].op) && let Some(n) = tests.get_mut(v.index()) { *n += 1; }
+    }
+    lcx.tests = tests;
     let mut changed = false;
     for b in 0..func.blocks.len() {
         let insts = std::mem::take(&mut func.blocks[b].insts);
