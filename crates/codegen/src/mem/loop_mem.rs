@@ -328,6 +328,7 @@ impl ParamMask {
 pub(crate) struct LoopMem {
     pub writes: bool,
     pub unknown_mem_writes: bool,
+    pub unique_heap_writes: bool,
     pub calls: bool,
     try_calls: bool,
     pub(crate) atomics: bool,
@@ -355,6 +356,7 @@ impl LoopMem {
         let mut fx = Self {
             writes: false,
             unknown_mem_writes: false,
+            unique_heap_writes: false,
             calls: false,
             try_calls: false,
             atomics: false,
@@ -404,10 +406,10 @@ impl LoopMem {
             Op::Store(val, addr, off) => {
                 let root = prov.loc(addr, i64::from(off), func.ty(val).bytes()).root;
                 self.mark_head_noalias(root);
-                return !matches!(root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_));
+                return !matches!(root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap);
             }
-            Op::Move(dst, _, bytes) => return !matches!(prov.loc(dst, 0, bytes).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_)),
-            Op::Copy(dst, _, _) => return !matches!(prov.loc(dst, 0, u32::MAX).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_)),
+            Op::Move(dst, _, bytes) => return !matches!(prov.loc(dst, 0, bytes).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap),
+            Op::Copy(dst, _, _) => return !matches!(prov.loc(dst, 0, u32::MAX).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap),
             _ => {}
         }
         false
@@ -476,6 +478,7 @@ impl LoopMem {
         match loc.root {
             MemRoot::Slot(s) => self.slot_writes.clobber(s.index()),
             MemRoot::NoAliasParam(p) => self.param_writes.clobber(usize::from(p)),
+            MemRoot::UniqueHeap => self.unique_heap_writes = true,
             _ => self.unknown_mem_writes = true,
         }
     }

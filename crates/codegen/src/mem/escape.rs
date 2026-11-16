@@ -90,7 +90,7 @@ fn is_unknown_mem_op(op: &Op, slots: &[Option<(StackSlot, i32)>], tracked: &[Tra
         slots[v.index()].is_some()
             || matches!(
                 tracked[v.index()],
-                TrackRoot::Set(MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::ReadonlyParam(_))
+                TrackRoot::Set(MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::ReadonlyParam(_) | MemRoot::UniqueHeap)
             )
     };
     match *op {

@@ -48,18 +48,12 @@ impl Type {
 
     /// The lane kind when `self` is a vector type.
     pub const fn lane(self) -> Option<Lane> {
-        match self {
-            Type::Vec { lane, .. } => Some(lane),
-            _ => None,
-        }
+        match self { Type::Vec { lane, .. } => Some(lane), _ => None }
     }
 
     /// The `(lane, count)` shape when `self` is a vector type.
     pub const fn vec_shape(self) -> Option<(Lane, u8)> {
-        match self {
-            Type::Vec { lane, count } => Some((lane, count)),
-            _ => None,
-        }
+        match self { Type::Vec { lane, count } => Some((lane, count)), _ => None }
     }
 
     /// Whether `self` is a valid 8-byte or 16-byte power-of-two vector type.
@@ -88,9 +82,7 @@ macro_rules! ids {
         pub struct $name(pub(crate) u32);
 
         impl $name {
-            pub(crate) fn index(self) -> usize {
-                self.0 as usize
-            }
+            pub(crate) fn index(self) -> usize { self.0 as usize }
         }
     )*};
 }
@@ -572,6 +564,7 @@ pub struct Function {
     pub(crate) self_slots: Vec<u32>,
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
+    pub(crate) unique_ptrs: Vec<bool>,
     pub(crate) cfg_rev: u32,
     pub(crate) cfg_cache: CfgCache,
 }
@@ -579,7 +572,17 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), unique_ptrs: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
+    }
+
+    /// Marks `value` as a pointer loaded from an owned `Box` heap allocation.
+    pub fn mark_unique_ptr(&mut self, value: Value) {
+        if value.index() >= self.unique_ptrs.len() { self.unique_ptrs.resize(value.index() + 1, false); }
+        self.unique_ptrs[value.index()] = true;
+    }
+
+    pub(crate) fn is_unique_ptr(&self, value: Value) -> bool {
+        self.unique_ptrs.get(value.index()).copied().unwrap_or(false)
     }
 
     pub(crate) fn bump_cfg(&mut self) {
@@ -620,9 +623,7 @@ impl Function {
     }
 
     /// Whether this function is an unsplit coroutine body.
-    pub fn is_coroutine(&self) -> bool {
-        self.coroutine.is_some()
-    }
+    pub fn is_coroutine(&self) -> bool { self.coroutine.is_some() }
 
     /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol or slot-addr recorded in `vtable_slots`.
     pub fn devirt_call_sites(&self) -> Vec<(Block, usize, u32)> {
@@ -658,15 +659,10 @@ impl Function {
     }
 
     /// The type of `value`.
-    pub fn ty(&self, value: Value) -> Type {
-        self.types[value.index()]
-    }
+    pub fn ty(&self, value: Value) -> Type { self.types[value.index()] }
 
     /// A new value of type `ty`, for an instruction to define.
-    pub(crate) fn value(&mut self, ty: Type) -> Value {
-        self.types.push(ty);
-        Value(self.types.len() as u32 - 1)
-    }
+    pub(crate) fn value(&mut self, ty: Type) -> Value { self.types.push(ty); Value(self.types.len() as u32 - 1) }
 
     /// A new instruction outside every block that runs `op` and defines `result`.
     pub(crate) fn add(&mut self, op: Op, result: Option<Value>) -> Inst {

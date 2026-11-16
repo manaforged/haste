@@ -648,9 +648,13 @@ pub(crate) fn compact(func: &mut Function) {
     }
     let mut map: Vec<Option<Value>> = vec![None; func.types.len()];
     let mut types = Vec::new();
+    let mut unique_ptrs = Vec::new();
     let mut take = |value: Value| -> Value {
         *map[value.index()].get_or_insert_with(|| {
             types.push(func.types[value.index()]);
+            if !func.unique_ptrs.is_empty() {
+                unique_ptrs.push(func.unique_ptrs.get(value.index()).copied().unwrap_or(false));
+            }
             Value(types.len() as u32 - 1)
         })
     };
@@ -675,6 +679,10 @@ pub(crate) fn compact(func: &mut Function) {
     func.insts = insts;
     types.shrink_to_fit();
     func.types = types;
+    if !unique_ptrs.iter().any(|&u| u) {
+        unique_ptrs.clear();
+    }
+    func.unique_ptrs = unique_ptrs;
     compact_blocks(func);
     compact_sigs(func);
 }

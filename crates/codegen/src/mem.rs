@@ -13,6 +13,7 @@ pub(crate) enum MemRoot {
     NoAliasParam(u16),
     ReadonlyParam(u16),
     Global(u32),
+    UniqueHeap,
     Unknown,
 }
 
@@ -148,7 +149,12 @@ fn is_derived_i64(op: &Op, ty: Type) -> bool {
 fn track_def(func: &Function, inst: Inst, tracked: &mut [TrackRoot]) -> bool {
     let data = &func.insts[inst.index()];
     let Some(res) = data.result else { return false };
-    let next = step_track(&data.op, func.ty(res), tracked);
+    let ty = func.ty(res);
+    let next = if ty == Type::I64 && func.is_unique_ptr(res) {
+        TrackRoot::Set(MemRoot::UniqueHeap)
+    } else {
+        step_track(&data.op, ty, tracked)
+    };
     let changed = next != tracked[res.index()];
     tracked[res.index()] = next;
     changed
@@ -381,7 +387,9 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
         (MemRoot::NoAliasParam(pa), MemRoot::NoAliasParam(pb)) => pa == pb,
         (MemRoot::Global(ga), MemRoot::Global(gb)) => ga == gb,
         (MemRoot::NoAliasParam(_), MemRoot::Slot(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_))
-        | (MemRoot::Slot(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_), MemRoot::NoAliasParam(_)) => false,
+        | (MemRoot::Slot(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_), MemRoot::NoAliasParam(_))
+        | (MemRoot::UniqueHeap, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_))
+        | (MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_), MemRoot::UniqueHeap) => false,
         (MemRoot::NoAliasParam(p), MemRoot::Unknown) | (MemRoot::Unknown, MemRoot::NoAliasParam(p)) => !prov.noalias_unescaped(p),
         (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_unescaped(s),
         _ => true,

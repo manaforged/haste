@@ -89,7 +89,13 @@ impl Lower<'_, '_> {
         match self.cx.types.kind(ty).clone() {
             Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => Ok((value, pointee)),
             _ if let Some(pointee) = self.cx.boxed(ty) => {
-                let pointer = if self.cx.is_unsized(pointee)? { value } else { self.box_data(value) };
+                let pointer = if self.cx.is_unsized(pointee)? {
+                    value
+                } else {
+                    let data = self.box_data(value);
+                    self.b.func.mark_unique_ptr(data);
+                    data
+                };
                 Ok((pointer, pointee))
             }
             other => bail!("dereference of {other:?}"),
@@ -119,7 +125,13 @@ impl Lower<'_, '_> {
     pub(super) fn sized_pointer(&mut self, value: Value, ty: Ty) -> Value {
         match self.cx.types.kind(ty) {
             Kind::Ref(..) | Kind::Ptr(..) => value,
-            _ => self.box_data(value),
+            _ => {
+                let data = self.box_data(value);
+                if self.cx.boxed(ty).is_some() {
+                    self.b.func.mark_unique_ptr(data);
+                }
+                data
+            }
         }
     }
 

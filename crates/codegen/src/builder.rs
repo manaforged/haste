@@ -100,6 +100,7 @@ impl<'f> FunctionBuilder<'f> {
         }
         self.incoming.truncate(mark.blocks);
         func.types.truncate(mark.types);
+        if !func.unique_ptrs.is_empty() { func.unique_ptrs.truncate(mark.types); }
         func.blocks.truncate(mark.blocks);
         func.insts.truncate(mark.insts);
         func.slots.truncate(mark.slots);
@@ -129,6 +130,7 @@ impl<'f> FunctionBuilder<'f> {
 
     fn inline_remap(&mut self, callee: &Function, args: &[Value], sym_base: u32, dict: Option<Value>) -> Vec<Value> {
         let values: Vec<Value> = callee.types.iter().map(|ty| self.func.value(*ty)).collect();
+        if !callee.unique_ptrs.is_empty() { values.iter().enumerate().filter(|&(i, _)| callee.is_unique_ptr(Value(i as u32))).for_each(|(_, &v)| self.func.mark_unique_ptr(v)); }
         let blocks: Vec<Block> = callee.blocks.iter().map(|_| self.create_block()).collect();
         let after = self.create_block();
         let results: Vec<Value> = callee.signature.returns.iter().map(|ret| self.append_block_param(after, ret.value_type)).collect();
