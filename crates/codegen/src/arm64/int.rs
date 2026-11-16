@@ -475,7 +475,7 @@ impl Emit<'_> {
         let ty = self.ty(x);
         let size = if ty.bits() <= 32 { Size::W } else { Size::X };
         let lsl = |asm: &mut super::asm::Asm, d, s, k| {
-            if size == Size::W { asm.lsl32_imm(d, s, k) } else { asm.lsl_imm(d, s, k) }
+            if size == Size::W { asm.shift32_imm(true, d, s, k) } else { asm.lsl_imm(d, s, k) }
         };
         let (value, raw_imm) = match (self.plan.const_of(x), self.plan.const_of(y)) {
             (_, Some(imm)) => (x, Some(imm)),
@@ -563,8 +563,9 @@ impl Emit<'_> {
     fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), bits: u8, dst: Reg) {
         let alu = match op { Binary::Ishl => Alu::Lslv, Binary::Ushr => Alu::Lsrv, _ => Alu::Asrv };
         if let Some(count) = self.plan.const_of(y) {
-            let value = self.shift_src(op, x);
             let count = (count as u8) & (bits - 1);
+            if bits == 32 && op == Binary::Ushr && count != 0 { let value = self.bits(x, A); return self.asm.shift32_imm(false, dst, value, count); }
+            let value = self.shift_src(op, x);
             if count == 0 { self.asm.mov(dst, value); return; }
             match alu { Alu::Lslv => self.asm.lsl_imm(dst, value, count), Alu::Lsrv => self.asm.lsr_imm(dst, value, count), _ => self.asm.asr_imm(dst, value, count) }
             return;

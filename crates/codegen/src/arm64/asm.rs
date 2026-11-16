@@ -531,8 +531,8 @@ impl Asm {
         self.bitfield(false, dst, src, ((64 - shift) % 64, 63 - shift));
     }
 
-    pub fn lsl32_imm(&mut self, dst: Reg, src: Reg, shift: u8) {
-        self.bitfield_word(0x5300_0000, dst, src, ((32 - shift) % 32, 31 - shift));
+    pub fn shift32_imm(&mut self, left: bool, dst: Reg, src: Reg, shift: u8) {
+        self.bitfield_word(0x5300_0000, dst, src, if left { ((32 - shift) % 32, 31 - shift) } else { (shift, 31) });
     }
 
     pub fn lsr_imm(&mut self, dst: Reg, src: Reg, shift: u8) {

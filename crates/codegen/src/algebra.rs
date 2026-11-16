@@ -243,7 +243,7 @@ fn narrow_pair_icmp(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op>
     let (&Op::Convert(k1, a), &Op::Convert(k2, b)) = (&cx.func.insts[cx.def(x)?.index()].op, &cx.func.insts[cx.def(y)?.index()].op) else {
         return None;
     };
-    if k1 != k2 || cx.func.ty(a) != cx.func.ty(b) || !cx.func.ty(a).is_small_int() {
+    if k1 != k2 || cx.func.ty(a) != cx.func.ty(b) || !cx.func.ty(a).is_small_int() || !cx.single_use(x) || !cx.single_use(y) {
         return None;
     }
     let ok = match k1 {
@@ -271,6 +271,7 @@ fn narrow_const_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value
         if kind == Convert::Uextend && !signed {
             let uc = extend(c_imm, ty, false) as u64;
             if uc <= sub_ty.unsigned_max() {
+                if !cx.single_use(ext_v) { continue; }
                 let nc = cx.emit(sub_ty, Op::Const(extend(uc as i64, sub_ty, true)));
                 return Some(Op::Icmp(norm, a, nc));
             }
@@ -279,7 +280,7 @@ fn narrow_const_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value
             }
         } else if kind == Convert::Sextend && (signed || matches!(norm, IntCC::Equal | IntCC::NotEqual)) {
             let (sc, half) = (extend(c_imm, ty, true), 1_i64 << (sub_ty.bits() - 1));
-            if (-half..half).contains(&sc) {
+            if (-half..half).contains(&sc) && cx.single_use(ext_v) {
                 let nc = cx.emit(sub_ty, Op::Const(extend(sc, sub_ty, true)));
                 return Some(Op::Icmp(norm, a, nc));
             }
@@ -297,7 +298,7 @@ fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y:
         return Some(op);
     }
     if cx.func.ty(x).is_small_int()
-        && let Some(op) = narrow_pair_icmp(cx, cc, x, y).or_else(|| narrow_const_icmp(cx, res, cc, x, y))
+        && let Some(op) = narrow_pair_icmp(cx, cc, x, y).or_else(|| narrow_const_icmp(cx, res, cc, x, y)).or_else(|| icmp::strip_const_add(cx, cc, x, y))
     {
         return match op {
             Op::Icmp(ncc, nx, ny) => {

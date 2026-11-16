@@ -529,6 +529,22 @@ fn emit_cmp_const(cx: &mut RewriteCx, cc: IntCC, lhs: Value, c: i64) -> Op {
     Op::Icmp(cc, lhs, rhs)
 }
 
+/// Rewrites an unsigned compare of a single-use `x + c1` against `c2` into `x` against `c2 - c1` when `x + c1` cannot wrap.
+pub(super) fn strip_const_add(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    if cc.is_signed() { return None; }
+    let ty = cx.func.ty(x);
+    for (norm, sum, c_v) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+        let Some(c2) = cx.uconst(c_v, ty) else { continue };
+        let Some(&Op::Binary(Binary::Iadd, p, q)) = cx.op(sum) else { continue };
+        let Some((base, c1)) = [(p, q), (q, p)].into_iter().find_map(|(b, k)| cx.uconst(k, ty).map(|c| (b, c))) else { continue };
+        if c1 == 0 || c2 < c1 || !cx.single_use(sum) { continue; }
+        let hi = offset_bound(cx.func, &|v| cx.def(v), &|v| cx.sconst(v), base, (None, 0));
+        if hi.checked_add(c1).is_none_or(|top| top > ty.unsigned_max()) { continue; }
+        return Some(emit_cmp_const(cx, norm, base, (c2 - c1) as i64));
+    }
+    None
+}
+
 fn emit_sub_cmp(cx: &mut RewriteCx, x: Value, lo: u64, cc: IntCC, bound: u64) -> Op {
     let ty = cx.func.ty(x);
     let lhs = if lo == 0 { x } else {
