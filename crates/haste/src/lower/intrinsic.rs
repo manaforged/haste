@@ -186,19 +186,19 @@ impl Lower<'_, '_> {
         let &[cond, yes, no] = args else { bail!("select_unpredictable takes three arguments") };
         match whole {
             Repr::Zst => Ok(None),
-            Repr::Scalar(_) => Ok(Some(self.ins().select(cond, yes, no))),
+            Repr::Scalar(_) => Ok(Some(self.unpredictable(cond, yes, no))),
             Repr::Mem { parts, .. } => {
                 let Some(slot) = self.slot(whole) else { return Ok(None) };
                 let out = self.ins().stack_addr(Type::I64, slot, 0);
                 let mut pick = |m: Type, at: i32| {
                     let a = self.ins().load(m, yes, at);
                     let b = self.ins().load(m, no, at);
-                    let sel = self.ins().select(cond, a, b);
+                    let sel = self.unpredictable(cond, a, b);
                     self.ins().stack_store(sel, slot, at);
                 };
                 match parts {
                     super::Parts::Bytes => {
-                        let chosen = self.ins().select(cond, yes, no);
+                        let chosen = self.unpredictable(cond, yes, no);
                         self.copy(out, chosen, whole);
                     }
                     other => {
@@ -210,6 +210,12 @@ impl Lower<'_, '_> {
                 Ok(Some(out))
             }
         }
+    }
+
+    fn unpredictable(&mut self, cond: Value, yes: Value, no: Value) -> Value {
+        let chosen = self.ins().select(cond, yes, no);
+        self.b.func.mark_unpredictable(chosen);
+        chosen
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

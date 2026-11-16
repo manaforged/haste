@@ -356,7 +356,7 @@ fn clone_body_consts(
         };
         op.map_operands(|value| remap_val(map, value));
         let new_res = func.insts[orig.index()].result.map(|res| {
-            let fresh = func.value(func.ty(res));
+            let fresh = func.value_like(res);
             map.push((res, fresh));
             fresh
         });

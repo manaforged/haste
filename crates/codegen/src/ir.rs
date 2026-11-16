@@ -1,5 +1,6 @@
 use std::fmt;
 
+mod flags;
 mod vector;
 
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
@@ -564,7 +565,7 @@ pub struct Function {
     pub(crate) self_slots: Vec<u32>,
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
-    pub(crate) unique_ptrs: Vec<bool>,
+    pub(crate) value_flags: Vec<u8>,
     pub(crate) cfg_rev: u32,
     pub(crate) cfg_cache: CfgCache,
 }
@@ -572,17 +573,7 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), unique_ptrs: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
-    }
-
-    /// Marks `value` as a pointer loaded from an owned `Box` heap allocation.
-    pub fn mark_unique_ptr(&mut self, value: Value) {
-        if value.index() >= self.unique_ptrs.len() { self.unique_ptrs.resize(value.index() + 1, false); }
-        self.unique_ptrs[value.index()] = true;
-    }
-
-    pub(crate) fn is_unique_ptr(&self, value: Value) -> bool {
-        self.unique_ptrs.get(value.index()).copied().unwrap_or(false)
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
     }
 
     pub(crate) fn bump_cfg(&mut self) {
@@ -784,6 +775,7 @@ impl fmt::Display for Function {
             for inst in &block.insts {
                 let data = &self.insts[inst.index()];
                 match data.result {
+                    Some(value) if self.is_unpredictable(value) => writeln!(f, "    v{}: {:?} = {:?} unpredictable", value.0, self.ty(value), data.op)?,
                     Some(value) => writeln!(f, "    v{}: {:?} = {:?}", value.0, self.ty(value), data.op)?,
                     None => writeln!(f, "    {:?}", data.op)?,
                 }

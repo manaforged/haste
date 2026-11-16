@@ -49,7 +49,7 @@ fn clone_body(func: &mut Function, src_non_term: &[Inst], dst: Block, map: &mut 
         let mut op = func.insts[orig_inst.index()].op.clone();
         op.map_operands(|v| remap_val(map, v));
         let new_res = func.insts[orig_inst.index()].result.map(|r| {
-            let nr = func.value(func.ty(r));
+            let nr = func.value_like(r);
             map.push((r, nr));
             nr
         });

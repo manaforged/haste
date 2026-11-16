@@ -1,0 +1,68 @@
+use super::{Function, Value};
+
+const UNIQUE_PTR: u8 = 1;
+const UNPREDICTABLE: u8 = 2;
+
+impl Function {
+    /// Marks `value` as a pointer loaded from an owned `Box` heap allocation.
+    pub fn mark_unique_ptr(&mut self, value: Value) {
+        self.set_flags(value, UNIQUE_PTR);
+    }
+
+    /// Marks the `Op::Select` that defines `value` as unpredictable, so no pass turns it into a branch.
+    pub fn mark_unpredictable(&mut self, value: Value) {
+        self.set_flags(value, UNPREDICTABLE);
+    }
+
+    /// Whether `value` is a pointer loaded from an owned `Box` heap allocation.
+    pub(crate) fn is_unique_ptr(&self, value: Value) -> bool {
+        self.flags(value) & UNIQUE_PTR != 0
+    }
+
+    /// Whether `value` is defined by a select that must stay branch-free.
+    pub(crate) fn is_unpredictable(&self, value: Value) -> bool {
+        self.flags(value) & UNPREDICTABLE != 0
+    }
+
+    /// Drops every unpredictable mark, for targets where a branch beats a conditional move.
+    pub(crate) fn forget_unpredictable(&mut self) {
+        self.value_flags.iter_mut().for_each(|bits| *bits &= !UNPREDICTABLE);
+    }
+
+    /// Whether any value carries the unpredictable mark.
+    pub(crate) fn has_unpredictable(&self) -> bool {
+        self.value_flags.iter().any(|&bits| bits & UNPREDICTABLE != 0)
+    }
+
+    /// The marks on `value`.
+    pub(crate) fn flags(&self, value: Value) -> u8 {
+        self.value_flags.get(value.index()).copied().unwrap_or(0)
+    }
+
+    /// Adds the marks `bits` to `value`.
+    pub(crate) fn set_flags(&mut self, value: Value, bits: u8) {
+        if bits == 0 {
+            return;
+        }
+        if value.index() >= self.value_flags.len() {
+            self.value_flags.resize(value.index() + 1, 0);
+        }
+        self.value_flags[value.index()] |= bits;
+    }
+
+    /// A new value with the type and marks of `from`, for a copy of the instruction that defines it.
+    pub(crate) fn value_like(&mut self, from: Value) -> Value {
+        let value = self.value(self.ty(from));
+        self.set_flags(value, self.flags(from));
+        value
+    }
+
+    /// New values for every value of `callee`, with their marks, indexed as in `callee`.
+    pub(crate) fn import_values(&mut self, callee: &Function) -> Vec<Value> {
+        let values: Vec<Value> = callee.types.iter().map(|&ty| self.value(ty)).collect();
+        for (index, &value) in values.iter().enumerate() {
+            self.set_flags(value, callee.flags(Value(index as u32)));
+        }
+        values
+    }
+}

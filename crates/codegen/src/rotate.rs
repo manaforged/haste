@@ -165,7 +165,7 @@ fn clone_guard_into(func: &mut Function, target_blk: Block, plan: &RotatePlan, i
         let mut op = func.insts[orig.index()].op.clone();
         op.map_operands(|v| remap_val(&map, v));
         let res = func.insts[orig.index()].result.map(|r| {
-            let nr = func.value(func.ty(r));
+            let nr = func.value_like(r);
             map.push((r, nr));
             nr
         });

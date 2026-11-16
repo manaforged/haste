@@ -329,7 +329,7 @@ fn clone_pure_insts(
             return false;
         }
         let res = data.result.map(|old| {
-            let fresh = func.value(func.ty(old));
+            let fresh = func.value_like(old);
             map.insert(old, fresh);
             fresh
         });

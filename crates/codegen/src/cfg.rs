@@ -152,7 +152,7 @@ pub(crate) fn dominates(idom: &[Option<Block>], ancestor: Block, mut block: Bloc
     }
 }
 
-fn natural_loop(cfg: &Cfg, head: Block, latches: Vec<Block>) -> Loop {
+pub(crate) fn natural_loop(cfg: &Cfg, head: Block, latches: Vec<Block>) -> Loop {
     let mut body = vec![false; cfg.preds.len()];
     body[head.index()] = true;
     let mut todo = latches.clone();

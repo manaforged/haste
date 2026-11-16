@@ -2,7 +2,7 @@ mod sink;
 
 use std::time::Instant;
 
-use crate::ir::{Binary, Block, Domain, Function, Op};
+use crate::ir::{Binary, Block, Domain, Function, Inst, Op, Type};
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -304,6 +304,12 @@ fn strip_assumes(func: &mut Function) -> bool {
     stripped
 }
 
+fn is_condition(func: &Function, inst: Inst) -> bool {
+    let data = &func.insts[inst.index()];
+    matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))
+        || (matches!(data.op, Op::Binary(Binary::Band | Binary::Bor, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I8))
+}
+
 fn has_sinkable_compare(func: &Function) -> bool {
     func.blocks.iter().any(|block| {
         if block.insts.len() < 3 {
@@ -311,7 +317,7 @@ fn has_sinkable_compare(func: &Function) -> bool {
         }
         let Some(first_cmp) = block.insts[..block.insts.len() - 2]
             .iter()
-            .position(|&inst| matches!(func.insts[inst.index()].op, Op::Icmp(..) | Op::Fcmp(..)))
+            .position(|&inst| is_condition(func, inst))
         else {
             return false;
         };
@@ -321,17 +327,18 @@ fn has_sinkable_compare(func: &Function) -> bool {
     })
 }
 
-/// Moves each single-use compare read by a `Brif` or `Select` of its own block to sit directly before that reader.
+/// Moves each single-use compare, or `I8` and/or of conditions, read by a `Brif` or `Select` of its own block to sit directly before that reader.
 pub(crate) fn sink_compares(func: &mut Function) {
     if !has_sinkable_compare(func) {
         return;
     }
     let uses = func.use_counts();
-    for block in &mut func.blocks {
+    let mut blocks = std::mem::take(&mut func.blocks);
+    for block in &mut blocks {
         let mut at = 0;
         while at < block.insts.len() {
             let data = &func.insts[block.insts[at].index()];
-            let Some(cond) = data.result.filter(|c| uses[c.index()] == 1 && matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))) else {
+            let Some(cond) = data.result.filter(|c| uses[c.index()] == 1 && is_condition(func, block.insts[at])) else {
                 at += 1;
                 continue;
             };
@@ -349,6 +356,7 @@ pub(crate) fn sink_compares(func: &mut Function) {
             }
         }
     }
+    func.blocks = blocks;
 }
 
 pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Target) {

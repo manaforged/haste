@@ -24,8 +24,17 @@ fn simplify_unit_bool_select(cx: &mut RewriteCx, res: Option<Value>, inner: Valu
         (Some(1), _) if cx.is_unit_bool(f) => Some(Some(Op::Binary(Binary::Bor, inner, f))),
         (_, Some(0)) if cx.is_unit_bool(t) => Some(Some(Op::Binary(Binary::Band, inner, t))),
         (Some(0), Some(1)) => Some(Some(Op::Binary(Binary::Bxor, inner, f))),
+        (Some(0), _) if cx.is_unit_bool(f) => band_without(cx, inner, f).map(Some),
         _ => None,
     }
+}
+
+fn band_without(cx: &mut RewriteCx, cond: Value, kept: Value) -> Option<Op> {
+    let &Op::Binary(Binary::Band, x, y) = cx.op(cond)? else { return None };
+    let other = if x == kept { y } else if y == kept { x } else { return None };
+    if cx.func.ty(other) != Type::I8 || !cx.is_unit_bool(other) { return None; }
+    let not = emit_bool_not(cx, other);
+    Some(Op::Binary(Binary::Band, kept, not))
 }
 
 struct OrdSelectMatch {

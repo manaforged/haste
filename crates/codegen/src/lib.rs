@@ -148,13 +148,22 @@ impl Target {
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function, effort: Effort) {
-    schedule::run(func, promote::Moves::Guided, &Target::host().effort(effort));
+    let target = Target::host().effort(effort);
+    keep_honored_marks(func, &target);
+    schedule::run(func, promote::Moves::Guided, &target);
     fold::compact(func);
+}
+
+fn keep_honored_marks(func: &mut Function, target: &Target) {
+    if target.arch == Arch::X64 {
+        func.forget_unpredictable();
+    }
 }
 
 /// Encodes `func` for `target`.
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
+    keep_honored_marks(&mut func, target);
     verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     let tracing = trace::enabled();
     if tracing {

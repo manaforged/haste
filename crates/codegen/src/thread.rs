@@ -310,6 +310,9 @@ fn eval_pair_ok(func: &Function, disp: Block, et: &Eval, ef: &Eval) -> bool {
 }
 
 fn select_arms(func: &Function, defs: &[Option<Inst>], value: Value) -> Option<(Value, Value, Value)> {
+    if func.is_unpredictable(value) {
+        return None;
+    }
     match func.insts[defs.get(value.index()).copied().flatten()?.index()].op {
         Op::Select(cond, then, otherwise) => Some((cond, then, otherwise)),
         _ => None,
@@ -541,6 +544,27 @@ fn threadable(func: &Function, pinned: &[bool]) -> bool {
     (0..func.blocks.len() as u32).map(Block).any(|pred| func.successors(pred).any(|disp| disp != pred && dispatches(func, pinned, disp)))
 }
 
+/// The blocks below the immediate dominator of each block holding an unpredictable select that reach that block, which together decide its condition.
+pub(crate) fn unpredictable_region(func: &Function, cfg: &crate::cfg::Cfg) -> Vec<bool> {
+    let mut region = vec![false; func.blocks.len()];
+    if !func.has_unpredictable() {
+        return region;
+    }
+    for (index, block) in func.blocks.iter().enumerate() {
+        let marked = block.insts.iter().any(|inst| func.insts[inst.index()].result.is_some_and(|res| func.is_unpredictable(res)));
+        if !marked || !cfg.reachable[index] {
+            continue;
+        }
+        let here = Block(index as u32);
+        let wall = cfg.idom[index].unwrap_or(here);
+        let body = crate::cfg::natural_loop(cfg, wall, vec![here]).body;
+        for (at, (inside, hit)) in region.iter_mut().zip(body).enumerate() {
+            *inside |= hit && (at != wall.index() || at == index);
+        }
+    }
+    region
+}
+
 /// Threads correlated constant- and range-condition jump chains through small pure dispatcher blocks.
 pub(crate) fn run(func: &mut Function) -> Domain {
     let Some(entry) = func.entry else {
@@ -556,6 +580,10 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             pinned[normal.index()] = true;
             pinned[handler.index()] = true;
         }
+    }
+    if func.has_unpredictable() {
+        let region = unpredictable_region(func, &func.cfg());
+        pinned.iter_mut().zip(region).for_each(|(pin, inside)| *pin |= inside);
     }
     let mut consts = Vec::new();
     let mut any = false;
@@ -648,12 +676,13 @@ pub(crate) fn compact(func: &mut Function) {
     }
     let mut map: Vec<Option<Value>> = vec![None; func.types.len()];
     let mut types = Vec::new();
-    let mut unique_ptrs = Vec::new();
+    let old_flags = std::mem::take(&mut func.value_flags);
+    let mut flags = Vec::new();
     let mut take = |value: Value| -> Value {
         *map[value.index()].get_or_insert_with(|| {
             types.push(func.types[value.index()]);
-            if !func.unique_ptrs.is_empty() {
-                unique_ptrs.push(func.unique_ptrs.get(value.index()).copied().unwrap_or(false));
+            if !old_flags.is_empty() {
+                flags.push(old_flags.get(value.index()).copied().unwrap_or(0));
             }
             Value(types.len() as u32 - 1)
         })
@@ -679,10 +708,10 @@ pub(crate) fn compact(func: &mut Function) {
     func.insts = insts;
     types.shrink_to_fit();
     func.types = types;
-    if !unique_ptrs.iter().any(|&u| u) {
-        unique_ptrs.clear();
+    if flags.iter().all(|&bits| bits == 0) {
+        flags.clear();
     }
-    func.unique_ptrs = unique_ptrs;
+    func.value_flags = flags;
     compact_blocks(func);
     compact_sigs(func);
 }

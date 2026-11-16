@@ -110,7 +110,7 @@ fn inline_return(func: &mut Function, target: Block, args: &[Value]) -> Option<(
     for (mut op, old_res) in prefix_data {
         op.map_operands(|v| subst(&locals, v));
         let res = old_res.map(|old| {
-            let fresh = func.value(func.ty(old));
+            let fresh = func.value_like(old);
             locals.push((old, fresh));
             fresh
         });
