@@ -63,7 +63,7 @@ impl Bodies {
             return None;
         }
         let (sysroot, item) = layer_item_key(cx.outline, key.item)?;
-        let key = InlineKey { item: item ^ persist.mode, footprint: key.footprint.0, limit: u32::try_from(key.limit).ok()?, low: key.low };
+        let key = InlineKey { item: item ^ persist.mode, footprint: key.footprint.0, limit: u32::try_from(key.limit).ok()?, low: key.low, sole: key.sole };
         let found = cx.store().substrate().and_then(|substrate| substrate.inline_meta(&key));
         tally(Tally::MetaLookup);
         if found.is_none() {

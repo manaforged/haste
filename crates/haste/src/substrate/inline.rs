@@ -9,17 +9,19 @@ const WIRE_LEN: usize = 16;
 const LOW: u8 = 1;
 const PRESENT: u8 = 2;
 const RETURNS: u8 = 4;
+const SOLE: u8 = 8;
 
 /// Whether an inline template returns, its inline height and its instruction count, or `None` when the callee has no template.
 pub type InlineShape = Option<(bool, u8, u16)>;
 
-/// The identity of one inline template: its mode-keyed item hash, footprint, instruction limit and entry placement.
+/// The identity of one inline template: its mode-keyed item hash, footprint, instruction limit, entry placement and whether it has one call site.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InlineKey {
     pub item: u64,
     pub footprint: u128,
     pub limit: u32,
     pub low: bool,
+    pub sole: bool,
 }
 
 impl InlineKey {
@@ -32,7 +34,7 @@ impl InlineKey {
         let mut out = [0u8; WIRE_LEN];
         out[..8].copy_from_slice(&((self.footprint >> 64) as u64).to_le_bytes());
         out[8..12].copy_from_slice(&self.limit.to_le_bytes());
-        out[12] = LOW * u8::from(self.low) | PRESENT * u8::from(shape.is_some()) | RETURNS * u8::from(returns);
+        out[12] = LOW * u8::from(self.low) | SOLE * u8::from(self.sole) | PRESENT * u8::from(shape.is_some()) | RETURNS * u8::from(returns);
         out[13] = height;
         out[14..].copy_from_slice(&size.to_le_bytes());
         out

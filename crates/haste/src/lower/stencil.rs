@@ -482,7 +482,7 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     }
     tally(Tally::Miss);
     let depth = inline.stack.len().saturating_sub(1);
-    let disk = if key.compact || key.sole { None } else { slots.bodies().disk(cx, &key) };
+    let disk = if key.compact { None } else { slots.bodies().disk(cx, &key) };
     let servable = shape_only && fp_cycle > depth;
     if servable && let Some(shape) = disk.as_ref().and_then(persist::Disk::hit) {
         return Ok((shape.map(|(returns, height, size)| (footprint, Found::Shape(returns, height, size))), fp_cycle));
