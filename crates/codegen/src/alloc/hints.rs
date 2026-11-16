@@ -151,8 +151,17 @@ pub(super) fn extend_copies(func: &Function, live: &Live, zero_ext: &[bool], poo
     out
 }
 
+fn reg_reduce<R: PartialEq>(func: &Function, locations: &[Location<R>], res: Value, src: Value) -> bool {
+    matches!(func.types[res.index()], Type::I8 | Type::I16) && matches!((&locations[res.index()], &locations[src.index()]), (Location::Reg(a), Location::Reg(b)) if a != b)
+}
+
+/// Whether some 8- or 16-bit narrowing copies between two different registers, where an extending copy costs no more than a move.
+pub(super) fn has_reg_reduce<R: PartialEq>(func: &Function, locations: &[Location<R>]) -> bool {
+    func.insts.iter().any(|data| matches!((&data.op, data.result), (&Op::Convert(Convert::Ireduce, src), Some(res)) if reg_reduce(func, locations, res, src)))
+}
+
 /// Computes which small integer values already have zero-extended upper bits in 64-bit registers.
-pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &Uses, call_zext: bool) -> Vec<bool> {
+pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>], census: &Uses, call_zext: bool) -> Vec<bool> {
     let count = func.types.len();
     let (mut out, mut incoming) = (vec![false; count], vec![Some(Vec::new()); count]);
     if let Some(entry) = func.entry {
@@ -222,7 +231,8 @@ pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &U
                 Op::Binary(Binary::Band, a, b) => ty == Type::I32 || (matches!(ty, Type::I8 | Type::I16) && (out[a.index()] || out[b.index()] || fits_mask(a, ty_mask(ty)) || fits_mask(b, ty_mask(ty)))),
                 Op::Convert(Convert::Ireduce, shifted) => {
                     let (src_ty, dst_bits) = (func.types[shifted.index()], ty.bits());
-                    clean_bits(&out, shifted).is_some_and(|w| w <= dst_bits)
+                    (call_zext && reg_reduce(func, locations, res, shifted))
+                        || clean_bits(&out, shifted).is_some_and(|w| w <= dst_bits)
                         || (matches!(src_ty, Type::I64 | Type::I32)
                             && census.def_inst[shifted.index()].is_some_and(|def| match func.insts[def.index()].op {
                                 Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => dst_bits >= 8,

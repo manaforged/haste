@@ -24,7 +24,7 @@ pub(crate) struct Regs<R: 'static> {
     pub two_address: bool,
     pub park: bool,
     pub fold_sib: bool,
-    /// The backend zero-extends 8- and 16-bit call results at the call.
+    /// The backend zero-extends 8- and 16-bit call results at the call, and 8- and 16-bit narrowing copies between two registers.
     pub call_zext: bool,
     /// The instructions that store a constant into a frame home.
     pub imm_store: fn(i64) -> u64,
@@ -687,6 +687,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let shared = webs.map_or_else(Vec::new, |webs| crate::color::share(func, &live, &locations, &deferred, &webs));
+    let zero_ext = if regs.call_zext && hints::has_reg_reduce(func, &locations) { hints::zero_ext(func, &locations, &census, true) } else { zero_ext };
     Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext }
 }
 

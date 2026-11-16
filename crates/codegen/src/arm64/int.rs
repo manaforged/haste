@@ -781,6 +781,8 @@ impl Emit<'_> {
                 let dst = self.dst(result);
                 if self.plan.elided[x.index()] && let Some(inst) = self.defs[x.index()] && let Op::Binary(Binary::Ushr, val, amt) = self.func.insts[inst.index()].op {
                     self.shift_by(Binary::Ushr, (val, amt), self.ty(x).bits() as u8, dst);
+                } else if self.plan.zero_ext[result.index()] && self.ty(result).bits() < 32 && !self.is_zext_within(x, self.ty(result).bits(), 4) {
+                    let src = self.bits(x, A); self.asm.extend(false, self.ty(result).bytes(), dst, src);
                 } else { self.raw(dst, x); }
                 self.put(result, dst); Ok(())
             }
