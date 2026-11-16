@@ -390,7 +390,7 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
         crate::algebra::compare_offsets(func);
     }
     if moves != promote::Moves::Guided {
-        sink::run(func);
+        sink::run(func, moves == promote::Moves::Split && target.effort == Effort::Full);
     }
     sink_compares(func);
 }
