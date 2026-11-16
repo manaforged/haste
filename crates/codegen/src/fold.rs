@@ -1,5 +1,6 @@
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, IntCC, Op, Type, Unary, Value};
 
+mod exits;
 mod range;
 mod vector;
 
@@ -312,32 +313,11 @@ impl Fold {
                 if func.ty(condition) == func.ty(x) && self.boolean(func, condition) && self.known(x) == Some(1) && self.known(y) == Some(0) {
                     return Some(condition);
                 }
-                if func.ty(condition) == func.ty(x) && self.find(condition) == self.find(x) && self.known(y).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) {
-                    return Some(x);
-                }
-                if let Some(&Op::Icmp(cc, lhs, rhs)) = self.def(func, condition) {
-                    for (idx, (var, imm_val)) in [(lhs, rhs), (rhs, lhs)].into_iter().enumerate() {
-                        if let Some(c) = self.known(imm_val) {
-                            let ty = func.ty(var);
-                            let imm = extend(c, ty, false);
-                            let norm = match (cc, idx == 1) {
-                                (IntCC::Equal, _) => Some((IntCC::Equal, imm)),
-                                (IntCC::NotEqual, _) => Some((IntCC::NotEqual, imm)),
-                                (IntCC::UnsignedGreaterThan, false) | (IntCC::UnsignedLessThan, true) if imm == 0 => Some((IntCC::NotEqual, 0)),
-                                (IntCC::UnsignedGreaterThanOrEqual, false) | (IntCC::UnsignedLessThanOrEqual, true) if imm == 1 => Some((IntCC::NotEqual, 0)),
-                                (IntCC::UnsignedLessThan, false) | (IntCC::UnsignedGreaterThan, true) if imm == 1 => Some((IntCC::Equal, 0)),
-                                (IntCC::UnsignedLessThanOrEqual, false) | (IntCC::UnsignedGreaterThanOrEqual, true) if imm == 0 => Some((IntCC::Equal, 0)),
-                                _ => None,
-                            };
-                            if let Some((eq_cc, eq_c)) = norm {
-                                let is_c = |v: Value| self.known(v).is_some_and(|v_imm| extend(v_imm, ty, false) == eq_c);
-                                let is_var = |v: Value| self.find(v) == self.find(var);
-                                if (eq_cc == IntCC::Equal && is_c(x) && is_var(y)) || (eq_cc == IntCC::NotEqual && is_var(x) && is_c(y)) { return Some(var); }
-                            }
-                        }
-                    }
-                }
-                None
+                self.equalities(func, condition).find(|&(var, imm, on_true)| {
+                    let is_c = |v: Value| self.known(v).is_some_and(|v_imm| extend(v_imm, func.ty(var), false) == imm);
+                    let is_var = |v: Value| self.find(v) == self.find(var);
+                    if on_true { is_c(x) && is_var(y) } else { is_var(x) && is_c(y) }
+                }).map(|(var, ..)| var)
             }
             Op::Convert(Convert::Bitcast, x) => (func.ty(x) == ty).then_some(x).or_else(|| match *self.def(func, x)? {
                 Op::Convert(Convert::Bitcast, value) if func.ty(value) == ty => Some(value),
@@ -418,7 +398,7 @@ impl Fold {
         }
     }
 
-    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, branches on the condition of a select between zero and a non-zero value, drops traps that cannot fire, rewrites always-firing traps to `Op::Trap`, and truncates after `Op::Trap`.
+    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, branches on the condition of a select between zero and a non-zero value, jumps straight to one of two returns that agree on the edge's equality, drops traps that cannot fire, rewrites always-firing traps to `Op::Trap`, and truncates after `Op::Trap`.
     fn branches(&self, func: &mut Function) -> bool {
         func.bump_cfg();
         let mut changed = false;
@@ -468,7 +448,7 @@ impl Fold {
                 }
                 changed = true;
             }
-            changed |= self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op);
+            changed |= self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op) || self.exits(func, last);
         }
         changed
     }
