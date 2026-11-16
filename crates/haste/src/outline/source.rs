@@ -618,12 +618,25 @@ impl Source {
 
     /// The source text from the start of token `from` to the end of token `to`, inclusive, within the layer of `from`.
     pub fn span(&self, from: u32, to: u32) -> &str {
+        if from > to {
+            return "";
+        }
         let (src, first) = self.layer(from);
-        let last = if src.offset == self.offset { (to - self.offset) as usize } else { (to.min(self.offset - 1)) as usize };
+        let (to_src, to_local) = self.layer(to);
+        let last = if std::ptr::eq(src, to_src) {
+            to_local
+        } else {
+            let clamped = to.min(self.offset.saturating_sub(1)).saturating_sub(src.offset) as usize;
+            clamped.min(src.tokens.len().saturating_sub(1))
+        };
         let (Some(&first), Some(&last)) = (src.tokens.get(first), src.tokens.get(last)) else {
             return "";
         };
-        &src.text[first.start as usize..last.end() as usize]
+        let (start, end) = (first.start as usize, last.end() as usize);
+        if start > end || end > src.text.len() {
+            return "";
+        }
+        &src.text[start..end]
     }
 
     /// The kind of token `at`, or `Eof` past the end.

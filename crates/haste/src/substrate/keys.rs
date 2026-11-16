@@ -1,7 +1,9 @@
 //! Deterministic keys and cache paths for toolchain and dependency substrates.
 
 use std::hash::{Hash as _, Hasher as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use haste_codegen::Target;
 use rustc_hash::FxHasher;
@@ -219,11 +221,30 @@ pub fn layer_item_key(outline: &crate::outline::Outline, item: crate::names::Ite
     Some((is_sysroot, key))
 }
 
-/// Hashes the running compiler binary's path and file stamp into `hasher`.
+fn exe_content_hash() -> Option<u64> {
+    static HASH: OnceLock<Option<u64>> = OnceLock::new();
+    *HASH.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let mut file = std::fs::File::open(exe).ok()?;
+        let mut hasher = FxHasher::default();
+        let mut buf = vec![0_u8; 64 * 1024];
+        let mut total = 0_u64;
+        loop {
+            let read = file.read(&mut buf).ok()?;
+            if read == 0 {
+                break;
+            }
+            hasher.write(&buf[..read]);
+            total += read as u64;
+        }
+        total.hash(&mut hasher);
+        Some(hasher.finish())
+    })
+}
+
+/// Hashes the running compiler binary's contents into `hasher`.
 fn hash_program(hasher: &mut FxHasher) {
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, hasher);
-    }
+    exe_content_hash().hash(hasher);
 }
 
 fn hash_file_meta(path: &Path, hasher: &mut FxHasher) {
@@ -411,7 +432,7 @@ pub fn deps_key(workspace: &crate::graph::Workspace, target: &Target, toolchain_
 
 /// Computes a stable workspace-root key for local workspace member substrates, or `None` when no local units exist.
 pub fn workspace_key(workspace: &crate::graph::Workspace, target: &Target, toolchain_hash: u64) -> Option<u64> {
-    let mut dirs: Vec<&Path> = workspace
+    let dirs: Vec<&Path> = workspace
         .graph
         .units
         .iter()
@@ -421,6 +442,14 @@ pub fn workspace_key(workspace: &crate::graph::Workspace, target: &Target, toolc
     if dirs.is_empty() {
         return None;
     }
+    let root = dirs
+        .iter()
+        .find_map(|dir| crate::graph::workspace_root(dir).ok())
+        .filter(|root| dirs.iter().all(|dir| dir.starts_with(root)));
+    let mut dirs: Vec<&Path> = dirs
+        .into_iter()
+        .map(|dir| root.as_deref().and_then(|r| dir.strip_prefix(r).ok()).unwrap_or(dir))
+        .collect();
     dirs.sort_unstable();
     dirs.dedup();
     let mut hasher = FxHasher::default();
