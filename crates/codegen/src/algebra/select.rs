@@ -378,6 +378,8 @@ pub(super) fn eval_select_zero_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: I
     None
 }
 
+fn fact<T: Copy + Default>(table: &[T], v: Value) -> T { table.get(v.index()).copied().unwrap_or_default() }
+
 struct BoolFacts {
     compares: Vec<Option<(IntCC, Value, Value)>>,
     consts: Vec<Option<i64>>,
@@ -406,50 +408,68 @@ impl BoolFacts {
     }
 
     fn propagate(&mut self, func: &Function) {
-        let is_01 = |v: Value, bools: &[bool], consts: &[Option<i64>]| bools[v.index()] || matches!(consts[v.index()], Some(0 | 1));
         for _ in 0..2 {
             for inst in func.blocks.iter().flat_map(|block| &block.insts) {
                 let d = &func.insts[inst.index()];
                 let Some(r) = d.result else { continue };
-                self.bools[r.index()] |= match d.op {
-                    Op::Binary(Binary::Band, x, y) => matches!(self.consts[x.index()], Some(0 | 1)) || matches!(self.consts[y.index()], Some(0 | 1)) || (is_01(x, &self.bools, &self.consts) && is_01(y, &self.bools, &self.consts)),
-                    Op::Binary(Binary::Bor | Binary::Bxor, x, y) | Op::Select(_, x, y) => is_01(x, &self.bools, &self.consts) && is_01(y, &self.bools, &self.consts),
-                    Op::Convert(Convert::Uextend, inner) => self.bools[inner.index()],
+                let is_bool = match d.op {
+                    Op::Binary(Binary::Band, x, y) => matches!(self.konst(x), Some(0 | 1)) || matches!(self.konst(y), Some(0 | 1)) || (self.is_01(x) && self.is_01(y)),
+                    Op::Binary(Binary::Bor | Binary::Bxor, x, y) | Op::Select(_, x, y) => self.is_01(x) && self.is_01(y),
+                    Op::Convert(Convert::Uextend, inner) => self.is_bool(inner),
                     _ => false,
                 };
+                self.bools[r.index()] |= is_bool;
             }
         }
     }
 
+    fn record_compare(&mut self, r: Value, cmp: (IntCC, Value, Value)) {
+        let n = self.bools.len().max(r.index() + 1);
+        self.compares.resize(n, None);
+        self.bools.resize(n, false);
+        self.compares[r.index()] = Some(cmp);
+        self.bools[r.index()] = true;
+    }
+
+    fn compare(&self, v: Value) -> Option<(IntCC, Value, Value)> { fact(&self.compares, v) }
+
+    fn konst(&self, v: Value) -> Option<i64> { fact(&self.consts, v) }
+
+    fn xor(&self, v: Value) -> Option<(Value, Value)> { fact(&self.xors, v) }
+
+    fn is_bool(&self, v: Value) -> bool { fact(&self.bools, v) }
+
+    fn is_01(&self, v: Value) -> bool { self.is_bool(v) || matches!(self.konst(v), Some(0 | 1)) }
+
     fn unwrap_uext(&self, v: Value) -> Value {
-        peel_uextend(v, |u| self.uextends.get(u.index()).copied().flatten())
+        peel_uextend(v, |u| fact(&self.uextends, u))
     }
 
     fn xor_one_src(&self, x: Value, y: Value) -> Option<Value> {
-        [(x, y), (y, x)].into_iter().find_map(|(v, k)| (self.consts[k.index()] == Some(1) && self.bools[v.index()]).then_some(v))
+        [(x, y), (y, x)].into_iter().find_map(|(v, k)| (self.konst(k) == Some(1) && self.is_bool(v)).then_some(v))
     }
 }
 
 fn negated(op: &Op, facts: &BoolFacts) -> Option<(Value, Option<Value>)> {
-    let is = |v: Value, want: i64| facts.consts[v.index()] == Some(want);
+    let is = |v: Value, want: i64| facts.konst(v) == Some(want);
     match *op {
         Op::Binary(Binary::Bxor, x, y) | Op::Icmp(IntCC::NotEqual, x, y) if is(y, 1) => Some((x, Some(y))),
         Op::Binary(Binary::Bxor, y, x) | Op::Icmp(IntCC::NotEqual, y, x) if is(y, 1) => Some((x, Some(y))),
         Op::Icmp(IntCC::Equal, x, y) if is(y, 0) => Some((x, None)),
         Op::Icmp(IntCC::Equal, y, x) if is(y, 0) => Some((x, None)),
-        Op::Select(c, x, y) if is(x, 0) && is(y, 1) && facts.bools[c.index()] => Some((c, Some(y))),
+        Op::Select(c, x, y) if is(x, 0) && is(y, 1) && facts.is_bool(c) => Some((c, Some(y))),
         _ => None,
     }
 }
 
 fn invert_brif(op: &mut Op, facts: &BoolFacts, types: &[Type]) {
     let Op::Brif(cond, then, then_args, otherwise, else_args) = op else { return };
-    if let Some((x, y)) = facts.xors[cond.index()] && let Some(inner) = facts.xor_one_src(x, y) {
+    if let Some((x, y)) = facts.xor(*cond) && let Some(inner) = facts.xor_one_src(x, y) {
         *cond = inner; std::mem::swap(then, otherwise); std::mem::swap(then_args, else_args); return;
     }
-    let Some((cc, x, y)) = facts.compares[cond.index()] else { return };
-    let (val, flipped) = if facts.consts[y.index()] == Some(0) && types[x.index()].is_small_int() { (x, false) }
-        else if facts.consts[x.index()] == Some(0) && types[y.index()].is_small_int() { (y, true) } else { return };
+    let Some((cc, x, y)) = facts.compare(*cond) else { return };
+    let (val, flipped) = if facts.konst(y) == Some(0) && types[x.index()].is_small_int() { (x, false) }
+        else if facts.konst(x) == Some(0) && types[y.index()].is_small_int() { (y, true) } else { return };
     let invert_arms = matches!((flipped, cc), (_, IntCC::Equal) | (false, IntCC::UnsignedLessThanOrEqual) | (true, IntCC::UnsignedGreaterThanOrEqual));
     if invert_arms || matches!((flipped, cc), (_, IntCC::NotEqual) | (false, IntCC::UnsignedGreaterThan) | (true, IntCC::UnsignedLessThan)) {
         *cond = val;
@@ -460,8 +480,8 @@ fn invert_brif(op: &mut Op, facts: &BoolFacts, types: &[Type]) {
 fn invert_inst(op: &mut Op, res: Option<Value>, facts: &BoolFacts, types: &[Type]) {
     if let (Some(res), Some((inner, opt_one))) = (res, negated(op, facts)) {
         let res_ty = types[res.index()];
-        if res_ty == Type::I8 && let Some((cc, a, b)) = facts.compares[inner.index()] { *op = Op::Icmp(cc.inverse(), a, b); return; }
-        if facts.bools[inner.index()] && let Some(one) = opt_one && types[inner.index()] == res_ty && types[one.index()] == res_ty && !matches!(*op, Op::Binary(Binary::Bxor, ..)) {
+        if res_ty == Type::I8 && let Some((cc, a, b)) = facts.compare(inner) { *op = Op::Icmp(cc.inverse(), a, b); return; }
+        if facts.is_bool(inner) && let Some(one) = opt_one && types[inner.index()] == res_ty && types[one.index()] == res_ty && !matches!(*op, Op::Binary(Binary::Bxor, ..)) {
             *op = Op::Binary(Binary::Bxor, inner, one); return;
         }
     }
@@ -479,26 +499,26 @@ pub(crate) fn invert(func: &mut Function) {
 }
 
 fn xor_ne_pair(func: &Function, facts: &BoolFacts, x: Value, y: Value, allow_const: bool) -> Option<(Value, Value)> {
-    if allow_const && let Some(pair) = [(x, y), (y, x)].into_iter().find(|&(_, c)| facts.consts[c.index()].is_some()) {
+    if allow_const && let Some(pair) = [(x, y), (y, x)].into_iter().find(|&(_, c)| facts.konst(c).is_some()) {
         return Some(pair);
     }
-    if facts.bools[x.index()] && facts.bools[y.index()] {
+    if facts.is_bool(x) && facts.is_bool(y) {
         let (a, b) = (facts.unwrap_uext(x), facts.unwrap_uext(y));
         return (func.ty(a) == func.ty(b) && func.ty(a).is_small_int()).then_some((a, b));
     }
     None
 }
 
-fn fold_bxor_cond(func: &mut Function, facts: &BoolFacts, out: &mut Vec<Inst>, inst: Inst) -> bool {
+fn fold_bxor_cond(func: &mut Function, facts: &mut BoolFacts, out: &mut Vec<Inst>, inst: Inst) -> bool {
     let (cond, is_sel) = match func.insts[inst.index()].op {
         Op::Select(c, ..) => (c, true),
         Op::Brif(c, ..) => (c, false),
         _ => return false,
     };
     let inner = facts.unwrap_uext(cond);
-    let next = facts.xors[inner.index()].and_then(|(x, y)| {
-        if is_sel && let Some((lhs, _)) = [(x, y), (y, x)].into_iter().find(|&(_, c)| facts.consts[c.index()] == Some(1))
-            && let bool_src = facts.unwrap_uext(lhs) && facts.bools[bool_src.index()]
+    let next = facts.xor(inner).and_then(|(x, y)| {
+        if is_sel && let Some((lhs, _)) = [(x, y), (y, x)].into_iter().find(|&(_, c)| facts.konst(c) == Some(1))
+            && let bool_src = facts.unwrap_uext(lhs) && facts.is_bool(bool_src)
         {
             if let Op::Select(c, t, f) = &mut func.insts[inst.index()].op { (*c, *t, *f) = (bool_src, *f, *t); }
             return Some(bool_src);
@@ -506,6 +526,7 @@ fn fold_bxor_cond(func: &mut Function, facts: &BoolFacts, out: &mut Vec<Inst>, i
         let (a, b) = xor_ne_pair(func, facts, x, y, !is_sel).filter(|&(a, b)| is_sel || (func.ty(a) == func.ty(b) && func.ty(a).is_small_int()))?;
         let cmp_val = func.value(Type::I8);
         out.push(func.add(Op::Icmp(IntCC::NotEqual, a, b), Some(cmp_val)));
+        facts.record_compare(cmp_val, (IntCC::NotEqual, a, b));
         if let Op::Select(c, ..) | Op::Brif(c, ..) = &mut func.insts[inst.index()].op { *c = cmp_val; }
         Some(cmp_val)
     });
@@ -516,9 +537,9 @@ fn fold_bxor_cond(func: &mut Function, facts: &BoolFacts, out: &mut Vec<Inst>, i
 
 fn tag_cond_info(facts: &BoolFacts, func: &Function, param_of: &[Option<(usize, usize)>], b_idx: usize, cond: Value) -> Option<(usize, Value, u64, bool)> {
     let inner = facts.unwrap_uext(cond);
-    if let Some((cc @ (IntCC::Equal | IntCC::NotEqual), x, y)) = facts.compares[inner.index()] {
+    if let Some((cc @ (IntCC::Equal | IntCC::NotEqual), x, y)) = facts.compare(inner) {
         return [(x, y), (y, x)].into_iter().find_map(|(p, c)| {
-            let ((pb, ti), imm) = (param_of.get(p.index()).copied().flatten()?, facts.consts[c.index()]?);
+            let ((pb, ti), imm) = (param_of.get(p.index()).copied().flatten()?, facts.konst(c)?);
             (pb == b_idx && func.ty(p).is_small_int()).then(|| (ti, p, extend(imm, func.ty(p), false) as u64, cc == IntCC::Equal))
         });
     }
@@ -547,17 +568,17 @@ fn incoming_pair_edges(func: &Function, b_idx: usize, self_last: Option<Inst>, t
 }
 
 fn edge_matches_correlated(func: &Function, facts: &BoolFacts, defs: &[Option<Inst>], (tag_ty, val_ty, match_u, k_u, val_takes_eq): (Type, Type, u64, u64, bool), (tag_arg, val_arg): (Value, Value)) -> bool {
-    let tag_const = facts.consts[tag_arg.index()].map(|c| extend(c, tag_ty, false) as u64);
+    let tag_const = facts.konst(tag_arg).map(|c| extend(c, tag_ty, false) as u64);
     let proven = if val_takes_eq {
         tag_const == Some(match_u)
     } else {
         tag_const.is_some_and(|u| u != match_u) || {
-            let (kz, ko) = known_bits(func, &|v| defs.get(v.index()).copied().flatten(), &|v| facts.consts.get(v.index()).copied().flatten(), tag_arg, 0);
+            let (kz, ko) = known_bits(func, &|v| defs.get(v.index()).copied().flatten(), &|v| facts.konst(v), tag_arg, 0);
             let mask = tag_ty.unsigned_max() as u64;
             ((ko & mask) & !match_u) != 0 || ((kz & mask) & match_u) != 0
         }
     };
-    proven || (tag_const.is_some_and(|u| (u == match_u) == !val_takes_eq) && facts.consts[val_arg.index()].is_some_and(|vc| extend(vc, val_ty, false) as u64 == k_u))
+    proven || (tag_const.is_some_and(|u| (u == match_u) == !val_takes_eq) && facts.konst(val_arg).is_some_and(|vc| extend(vc, val_ty, false) as u64 == k_u))
 }
 
 fn correlated_select_target(func: &Function, facts: &BoolFacts, param_of: &[Option<(usize, usize)>], defs: &mut Option<Vec<Option<Inst>>>, (b_idx, self_last, cond, t, f): (usize, Option<Inst>, Value, Value, Value)) -> Option<Value> {
@@ -565,12 +586,12 @@ fn correlated_select_target(func: &Function, facts: &BoolFacts, param_of: &[Opti
     let (tag_idx, tag_phi, match_u, eq_means_true) = tag_cond_info(facts, func, param_of, b_idx, cond)?;
     let (val_phi, val_idx, k_val, val_on_true) = [(t, f, true), (f, t, false)].into_iter().find_map(|(v, k, on_t)| {
         let (pb, vi) = param_of.get(v.index()).copied().flatten()?;
-        facts.consts[k.index()]?;
+        facts.konst(k)?;
         (pb == b_idx && vi != tag_idx).then_some((v, vi, k, on_t))
     })?;
     let val_ty = func.ty(val_phi);
     if !val_ty.is_small_int() { return None; }
-    let k_u = extend(facts.consts[k_val.index()]?, val_ty, false) as u64;
+    let k_u = extend(facts.konst(k_val)?, val_ty, false) as u64;
     let edges = incoming_pair_edges(func, b_idx, self_last, tag_idx, val_idx)?;
     let defs_ref = defs.get_or_insert_with(|| crate::fold::defs(func));
     let spec = (func.ty(tag_phi), val_ty, match_u, k_u, val_on_true == eq_means_true);
@@ -592,7 +613,7 @@ fn fold_shifted_select(func: &mut Function, facts: &BoolFacts, seen: &mut Vec<(V
     let Some(res) = func.insts[inst.index()].result else { return false };
     let ty = func.ty(res);
     if !ty.is_small_int() { return false; }
-    let (Some(ca), Some(cb)) = (facts.consts.get(t_val.index()).copied().flatten(), facts.consts.get(f_val.index()).copied().flatten()) else { return false };
+    let (Some(ca), Some(cb)) = (facts.konst(t_val), facts.konst(f_val)) else { return false };
     let (a_u, b_u) = (extend(ca, ty, false) as u64, extend(cb, ty, false) as u64);
     if a_u == b_u { return false; }
     let w = ty.unsigned_max();
@@ -610,7 +631,7 @@ fn fold_shifted_select(func: &mut Function, facts: &BoolFacts, seen: &mut Vec<(V
 
 /// Folds `x ^ 1` / `x ^ y` in `select` and `brif` conditions, eliminates correlated join-param selects, and sinks single-use compares toward their branch.
 pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
-    let facts = BoolFacts::collect(func);
+    let mut facts = BoolFacts::collect(func);
     let mut param_of = vec![None; func.types.len()];
     for (b_idx, block) in func.blocks.iter().enumerate() {
         if Some(b_idx) != func.entry.map(|e| e.index()) { block.params.iter().enumerate().for_each(|(p_idx, &p)| param_of[p.index()] = Some((b_idx, p_idx))); }
@@ -621,7 +642,7 @@ pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
         let self_last = insts.last().copied();
         let (mut out, mut seen_sels) = (Vec::with_capacity(insts.len()), Vec::new());
         for inst in insts {
-            changed |= fold_bxor_cond(func, &facts, &mut out, inst);
+            changed |= fold_bxor_cond(func, &mut facts, &mut out, inst);
             if !fold_correlated_select(func, &facts, &param_of, (&mut defs, &mut subst), (b_idx, self_last, inst)) {
                 changed |= fold_shifted_select(func, &facts, &mut seen_sels, &mut out, inst);
                 out.push(inst);
