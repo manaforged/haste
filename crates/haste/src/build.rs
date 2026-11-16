@@ -281,9 +281,14 @@ fn save_batch_substrate(
 impl Batch {
     /// Infers and compiles every root `kind` finds in `workspace` from nothing.
     fn new(workspace: &graph::Workspace, compilation: &mut Compilation, kind: BatchKind, drop_finals: bool) -> Result<Batch> {
+        let main = (kind == BatchKind::MainAot).then(|| main_item(workspace, &compilation.outline).context("no member binary has a `main`")).transpose()?;
+        Self::rooted(workspace, compilation, (kind, main), drop_finals)
+    }
+
+    /// Infers and compiles from nothing the roots `kind` finds in `workspace`, or the program whose `main` is `main`.
+    fn rooted(workspace: &graph::Workspace, compilation: &mut Compilation, (kind, main): (BatchKind, Option<ItemRef>), drop_finals: bool) -> Result<Batch> {
         let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
-        let main = (kind == BatchKind::MainAot).then(|| main_item(workspace, &compilation.outline).context("no member binary has a `main`")).transpose()?;
         let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, kind) };
         let substrate = open_batch_substrate(workspace);
         let mut cache = Cache::default();
@@ -303,6 +308,18 @@ impl Batch {
             },
             |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, substrate.as_ref(), (cx, reach_clock)),
         )
+    }
+
+    /// Writes this ahead-of-time batch as a standalone executable to `path`, unless a function it reaches failed to compile.
+    fn write_aot(&mut self, compilation: &Compilation, path: &std::path::Path) -> Result<()> {
+        if !self.broken.is_empty() {
+            bail!("{} functions failed to compile", self.broken.len());
+        }
+        let store = self.store.take().context("the binary's inference store is in use")?;
+        let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
+        let exe = self.image.to_aot(&crate::host_target(), (self.roots[0], self.roots[1]), &mut cx, &self.reached);
+        self.store = Some(cx.release().0);
+        exe?.write(path)
     }
 
     fn again(&mut self, compilation: &Compilation, stale: &[(u32, u32)]) -> bool {
@@ -548,18 +565,10 @@ impl Build {
             self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, false)?);
         }
         let bin = self.binary.as_mut().context("the binary is not compiled")?;
-        if !bin.broken.is_empty() {
-            for (idx, err) in &bin.broken {
-                eprintln!("broken [{idx}]: {err}");
-            }
-            bail!("{} functions failed to compile", bin.broken.len());
+        for (idx, err) in &bin.broken {
+            eprintln!("broken [{idx}]: {err}");
         }
-        let target = crate::host_target();
-        let store = bin.store.take().context("the binary's inference store is in use")?;
-        let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
-        let exe = bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]), &mut cx, &bin.reached);
-        bin.store = Some(cx.release().0);
-        exe?.write(path)?;
+        bin.write_aot(&self.compilation, path)?;
         eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
         Ok(0)
     }
@@ -610,6 +619,11 @@ impl Build {
         let program = self.program.insert(program);
         program.run(&mut self.compilation, args)
     }
+}
+
+/// Compiles the program whose `main` is `main` ahead of time and writes it as a standalone executable to `path`.
+pub(crate) fn emit_main(workspace: &graph::Workspace, compilation: &mut Compilation, main: ItemRef, path: &std::path::Path) -> Result<()> {
+    Batch::rooted(workspace, compilation, (BatchKind::MainAot, Some(main)), false)?.write_aot(compilation, path)
 }
 
 /// Runs the binary's `main` with `args` as argv, compiling each function on its first call, and, when prepared code is switched on, under the release profile calling prepped code where it can, racing a prep of what changed since the library was built.

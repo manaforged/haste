@@ -12,6 +12,12 @@ use crate::graph::{Targets, Workspace, store};
 use crate::image::{self, Driver, Ended, Jit, Script};
 use crate::outline::Role;
 
+mod binary;
+
+use binary::{Binaries, Kept};
+
+const OUT: &str = "out";
+
 /// Gives every unit with a build script its output: the stored one while it is current, else from running the script.
 pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
     let mut failed = HashSet::default();
@@ -213,7 +219,7 @@ fn give_up(workspace: &Workspace, targets: &Targets, unit: usize, failure: &Fail
 }
 
 fn report(workspace: &Workspace, unit: usize, error: &str, failed: &mut HashSet<usize>) {
-    eprintln!("build script of {}: {error}", workspace.packages[workspace.graph.units[unit].package].locked.name);
+    eprintln!("build script of {}: {error}", package_name(workspace, unit));
     failed.insert(unit);
 }
 
@@ -248,15 +254,29 @@ fn metadata(workspace: &Workspace, unit: usize, ran: &Ran) -> Vec<(String, Strin
     linked.flat_map(|(links, output)| script::dep_vars(links, output)).collect()
 }
 
+/// The name of the package of `unit`.
+fn package_name(workspace: &Workspace, unit: usize) -> &str {
+    &workspace.packages[workspace.graph.units[unit].package].locked.name
+}
+
 type Ran = rustc_hash::FxHashMap<usize, Arc<Output>>;
 type Outcome = Vec<(usize, Result<Arc<Output>, Failure>)>;
 
-/// Builds and runs the scripts of the units `units` in children that compile each function on its first call.
+/// How a script starts: its declared `lang_start` and `main` in children that compile each function on its first call, or its kept executable.
+enum Start {
+    Jit([usize; 2]),
+    Executable(std::path::PathBuf),
+}
+
+/// Builds and runs the scripts of the units `units`, each from its kept executable while its crates hash the same, else in children that compile each function on its first call, keeping the executable of each script that ran before.
 fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDag, locks: &mut HashMap<usize, store::Lock>, ran: &mut Ran) -> Result<Outcome> {
     let mut compilation = crate::macros::load_eager(workspace, targets, units)?;
     let outline = &compilation.outline;
     let scripts: Vec<(usize, usize)> = outline.roots.iter().enumerate().filter(|(_, root)| root.role == Role::Script).map(|(krate, root)| (root.unit, krate)).collect();
-    let mains: Vec<Option<crate::names::ItemRef>> = scripts.iter().map(|(_, krate)| outline.main(*krate)).collect();
+    let binaries = Binaries::new(workspace, outline, &scripts);
+    let kept: Vec<Kept> = scripts.iter().map(|&(unit, _)| binaries.kept(workspace, unit)).collect();
+    let compiled: Vec<(usize, usize)> = scripts.iter().zip(&kept).filter(|(_, kept)| !matches!(kept, Kept::Executable(_))).map(|(script, _)| *script).collect();
+    let mains: Vec<Option<crate::names::ItemRef>> = compiled.iter().map(|(_, krate)| outline.main(*krate)).collect();
     let owners = outline.roots.iter().map(|root| root.unit).collect();
     let (entries, store) = image::entries(&mut compilation, (crate::sema::Cache::default(), &mains))?;
     let mut demand = Jit::new(store)?;
@@ -265,14 +285,21 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
     for &(unit, _) in &scripts {
         unit_set.insert(unit);
     }
-    let mut entries_map = HashMap::default();
+    let mut entries_map: HashMap<usize, Result<Start, String>> = HashMap::default();
+    for (&(unit, _), entry) in compiled.iter().zip(entries) {
+        entries_map.insert(unit, entry.map(|pair| Start::Jit(pair.map(|root| demand.declare(root)))));
+    }
+    let missing: HashSet<usize> = scripts.iter().zip(&kept).filter(|(_, kept)| matches!(kept, Kept::Missing)).map(|(&(unit, _), _)| unit).collect();
+    for (&(unit, _), kept) in scripts.iter().zip(kept) {
+        if let Kept::Executable(path) = kept {
+            entries_map.insert(unit, Ok(Start::Executable(path)));
+        }
+    }
     let mut ready = VecDeque::new();
     let mut waiting = Vec::new();
     let mut wave_links_rem = HashMap::default();
     let mut active_build_rem = HashMap::default();
-    for (&(unit, _), entry) in scripts.iter().zip(entries) {
-        let declared = entry.map(|pair| pair.map(|root| demand.declare(root)));
-        entries_map.insert(unit, declared);
+    for &(unit, _) in &scripts {
         let lrem = dag.links_rem[unit];
         let brem = dag.build_deps[unit].iter().filter(|dep| unit_set.contains(dep)).count();
         wave_links_rem.insert(unit, lrem);
@@ -297,9 +324,21 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
         running: Vec::new(),
         ran: ran.clone(),
         outcome: Outcome::new(),
+        missing,
+        reran: HashSet::default(),
+        executables: HashSet::default(),
     };
     image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;
-    Ok(driver.outcome)
+    let Runs { outcome, reran, .. } = driver;
+    for &(unit, krate) in &scripts {
+        if reran.contains(&unit)
+            && outcome.iter().any(|(at, result)| *at == unit && result.is_ok())
+            && let Err(error) = binaries.keep(workspace, &mut compilation, unit, krate)
+        {
+            eprintln!("cannot keep the executable of {}'s build script: {error}", package_name(workspace, unit));
+        }
+    }
+    Ok(outcome)
 }
 
 struct Runs<'w, 'l> {
@@ -308,7 +347,7 @@ struct Runs<'w, 'l> {
     owners: Vec<usize>,
     dag: &'w ScriptDag,
     locks: &'l mut HashMap<usize, store::Lock>,
-    entries: HashMap<usize, Result<[usize; 2], String>>,
+    entries: HashMap<usize, Result<Start, String>>,
     ready: VecDeque<usize>,
     waiting: Vec<usize>,
     wave_links_rem: HashMap<usize, usize>,
@@ -316,10 +355,13 @@ struct Runs<'w, 'l> {
     running: Vec<(usize, usize, Script)>,
     ran: Ran,
     outcome: Outcome,
+    missing: HashSet<usize>,
+    reran: HashSet<usize>,
+    executables: HashSet<usize>,
 }
 
 impl Runs<'_, '_> {
-    fn next(&mut self) -> Option<(usize, Result<[usize; 2], String>)> {
+    fn next(&mut self) -> Option<(usize, Result<Start, String>)> {
         let unit = self.ready.pop_front().or_else(|| self.running.is_empty().then(|| (!self.waiting.is_empty()).then(|| self.waiting.remove(0))).flatten())?;
         let entry = self.entries.remove(&unit)?;
         Some((unit, entry))
@@ -358,10 +400,19 @@ impl Driver for Runs<'_, '_> {
             let Some((unit, entry)) = self.next() else {
                 return Ok(());
             };
-            let script = entry.map_err(Failure::from).and_then(|[start, main]| job(self.workspace, self.targets, unit, (start, main), &self.ran));
+            if self.missing.contains(&unit) && binary::ran_before(self.workspace, unit) {
+                self.reran.insert(unit);
+            }
+            let script = entry.map_err(Failure::from).and_then(|start| Ok((job(self.workspace, self.targets, unit, &start, &self.ran)?, start)));
             match script {
-                Ok(script) => {
-                    let id = demand.fork(true, |image, out| out.map_or(101, |out| image.enter_script(&script, out)))?;
+                Ok((script, start)) => {
+                    let id = match &start {
+                        Start::Jit(_) => demand.fork(true, |image, out| out.map_or(101, |out| image.enter_script(&script, out)))?,
+                        Start::Executable(path) => {
+                            self.executables.insert(unit);
+                            demand.fork(true, |_, out| out.map_or(101, |out| binary::exec(path, &script, out)))?
+                        }
+                    };
                     self.running.push((id, unit, script));
                 }
                 Err(failure) => {
@@ -383,6 +434,13 @@ impl Driver for Runs<'_, '_> {
             (_, Some((error, item))) => Err(Failure { error: format!("does not build: {error}"), broken: self.owners.get(item.krate as usize).copied(), interrupted: false }),
             (status, None) => Err(Failure { interrupted: crate::image::interrupted(status), ..Failure::from(format!("exited with status {status}; its errors are in {}", script.log.display())) }),
         };
+        let result = result.map_err(|failure| {
+            if !self.executables.contains(&unit) {
+                return failure;
+            }
+            binary::distrust(self.workspace, unit);
+            Failure { interrupted: true, ..failure }
+        });
         if let Ok(output) = &result {
             self.ran.insert(unit, output.clone());
         }
@@ -395,14 +453,18 @@ impl Driver for Runs<'_, '_> {
 /// The output of a script that exited cleanly, kept in the store for later runs.
 fn finished(workspace: &Workspace, unit: usize, job: &Script, text: &str) -> Arc<Output> {
     if let Err(error) = store::keep(workspace, unit, &job.vars, text) {
-        eprintln!("cannot keep the output of {}'s build script: {error}", workspace.packages[workspace.graph.units[unit].package].locked.name);
+        eprintln!("cannot keep the output of {}'s build script: {error}", package_name(workspace, unit));
     }
     Arc::new(Output::parse(text))
 }
 
-fn job(workspace: &Workspace, targets: &Targets, unit: usize, entry: (usize, usize), ran: &Ran) -> Result<Script, Failure> {
+fn job(workspace: &Workspace, targets: &Targets, unit: usize, start: &Start, ran: &Ran) -> Result<Script, Failure> {
+    let entry = match start {
+        Start::Jit([start, main]) => (*start, *main),
+        Start::Executable(_) => (0, 0),
+    };
     let dir = store::dir(workspace, unit);
-    let made = store::forget(workspace, unit).and_then(|()| std::fs::create_dir_all(dir.join("out")));
+    let made = store::forget(workspace, unit).and_then(|()| std::fs::create_dir_all(dir.join(OUT)));
     made.map_err(|error| Failure::from(format!("cannot make {}: {error}", dir.display())))?;
     let vars = script::script_vars(workspace, targets, unit, &metadata(workspace, unit, ran));
     let package = &workspace.packages[workspace.graph.units[unit].package].manifest;

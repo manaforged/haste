@@ -141,7 +141,8 @@ fn stamp(dir: &Path, vars: &[(String, String)], watched: &Watched) -> io::Result
     write_new(&dir.join(STAMP), &stamp)
 }
 
-fn remove(path: &Path) -> io::Result<()> {
+/// Removes the file at `path` unless it is not there.
+pub(crate) fn remove(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
