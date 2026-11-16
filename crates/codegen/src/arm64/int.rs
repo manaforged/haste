@@ -656,6 +656,7 @@ impl Emit<'_> {
         let bytes = x_ty.bytes();
         if self.cmp_imm((x, y), (bytes, size, cc)) { return Some(cond(cc)); }
         if self.cmp_imm((y, x), (bytes, size, cc)) { return Some(swap_cond(cond(cc))); }
+        if let Some(c) = self.cmp_high_bits(cc, (x, y), size) { return Some(c); }
         if matches!(x_ty, Type::I32 | Type::I64) && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, x, |v| self.defs[v.index()]) {
             let (lhs, rhs) = self.bits_pair(self.peel_uextend(y), inner);
             self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, lhs, rhs);

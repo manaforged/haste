@@ -59,6 +59,35 @@ impl Emit<'_> {
         self.asm.alu(Alu::Ands, size, ZR, left, right);
     }
 
+    pub(super) fn cmp_high_bits(&mut self, cc: IntCC, (x, y): (Value, Value), size: Size) -> Option<Cond> {
+        let (val, raw, c) = match (self.plan.const_of(y), self.plan.const_of(x)) {
+            (Some(raw), _) => (x, raw, cond(cc)),
+            (None, Some(raw)) => (y, raw, swap_cond(cond(cc))),
+            (None, None) => return None,
+        };
+        if self.plan.elided[val.index()] {
+            return None;
+        }
+        let ty = self.ty(val);
+        let ty_mask = ty.unsigned_max();
+        let imm = (raw as u64) & ty_mask;
+        let (low, hit) = match c {
+            Cond::Hi => (imm, Cond::Ne),
+            Cond::Ls => (imm, Cond::Eq),
+            Cond::Hs => (imm.wrapping_sub(1), Cond::Ne),
+            Cond::Lo => (imm.wrapping_sub(1), Cond::Eq),
+            _ => return None,
+        };
+        if low == 0 || low & low.wrapping_add(1) != 0 {
+            return None;
+        }
+        let bitmask = encode_bitmask_imm(!low & ty_mask, size == Size::X)?;
+        let reg = self.cmp_arg(val, A, ty.bytes(), false);
+        self.asm.alu_bitmask(Alu::Ands, size, bitmask, ZR, reg);
+        self.last_cmp = None;
+        Some(hit)
+    }
+
     fn sload_op(&self, val: Value) -> Option<Op> {
         match self.func.insts[self.defs[val.index()]?.index()].op {
             Op::Load(addr, off) => Some(Op::Load(addr, off)),
