@@ -606,54 +606,120 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
     apply(func, &decided, &rewrites) | settled
 }
 
+fn sub_range(func: &Function, (cfg, ranges, env, path, extra, block): (&Cfg, &Ranges, &Env, &Path, &ExtraPath, Block), ty: Type, (hi_v, lo_v): (Value, Value)) -> Option<Fact> {
+    let proves = |cc| path.decide_rel(func, ranges, cc, ty, lo_v, hi_v) == Some(true) || extra.decide(func, (cfg, ranges, env, path, block), cc, lo_v, hi_v) == Some(true);
+    let (f_hi, f_lo) = (path.refined_fact(func, ranges, hi_v, 0), path.refined_fact(func, ranges, lo_v, 0));
+    if proves(IntCC::UnsignedLessThan) {
+        let max_diff = if f_hi.hi > f_lo.lo { f_hi.hi - f_lo.lo } else { ty.unsigned_max() };
+        return Some(Fact::range(1, max_diff));
+    }
+    if proves(IntCC::UnsignedLessThanOrEqual) && f_hi.hi >= f_lo.lo && f_hi.hi - f_lo.lo < ty.unsigned_max() {
+        return Some(Fact::range(0, f_hi.hi - f_lo.lo));
+    }
+    None
+}
+
+fn sub_fact(func: &Function, ctx: (&Cfg, &Ranges, &Env, &Path, &ExtraPath, Block), v: Value) -> Fact {
+    let (_, ranges, _, path, _, _) = ctx;
+    let base = path.refined_fact(func, ranges, v, 0);
+    if base.lo >= 1 || !func.ty(v).is_small_int() {
+        return base;
+    }
+    match ranges.op(func, v) {
+        Some(&Op::Binary(Binary::Isub, hi_v, lo_v)) => match sub_range(func, ctx, func.ty(v), (hi_v, lo_v)) {
+            Some(f) => base.meet(&f),
+            None => base,
+        },
+        _ => base,
+    }
+}
+
+fn sub_cond_truth(func: &Function, ctx: (&Cfg, &Ranges, &Env, &Path, &ExtraPath, Block), cond: Value, depth: u8) -> Option<bool> {
+    if depth > 2 {
+        return None;
+    }
+    let (_, ranges, _, path, _, _) = ctx;
+    match ranges.op(func, cond)? {
+        &Op::Icmp(cc, x, y) if func.ty(x).is_small_int() => decide(cc, func.ty(x), &sub_fact(func, ctx, x), &sub_fact(func, ctx, y)),
+        &Op::Binary(Binary::Isub, ..) => truth(&sub_fact(func, ctx, cond)),
+        &Op::Binary(Binary::Bxor, a, b) => [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| {
+            (path.fact(ranges, mask).exact() == Some(1) && path.fact(ranges, inner).hi <= 1)
+                .then(|| sub_cond_truth(func, ctx, inner, depth + 1).map(|t| !t))
+                .flatten()
+        }),
+        _ => None,
+    }
+}
+
 /// Settles `inst` under `path` and moves the path past it.
 fn settle_one(
     func: &Function,
     (cfg, ranges, env, path, extra, dom, selects, block, seen): (&Cfg, &Ranges, &Env, &mut Path, &mut ExtraPath, &mut DomState, &[SelectRec], Block, &[bool]),
     inst: Inst,
-    (decided, compares, rewrites): (&mut Vec<(Inst, Option<bool>)>, &mut Vec<(Value, bool)>, &mut Vec<(Inst, Value, Value)>),
+    out: (&mut Vec<(Inst, Option<bool>)>, &mut Vec<(Value, bool)>, &mut Vec<(Inst, Value, Value)>),
 ) {
     let data = &func.insts[inst.index()];
     if !dom.aliases.is_empty() {
         data.op.for_operands(|v| {
             let mapped = dom.resolve(v);
             if mapped != v {
-                rewrites.push((inst, v, mapped));
+                out.2.push((inst, v, mapped));
             }
         });
     }
-    match (&data.op, data.result) {
+    if !settle_value(func, (cfg, ranges, env, path, extra, dom, block), data, out.1) {
+        settle_ctrl(func, (cfg, ranges, env, path, extra, dom, selects, block, seen), inst, data, out.0);
+    }
+}
+
+fn settle_value(
+    func: &Function,
+    (cfg, ranges, env, path, extra, dom, block): (&Cfg, &Ranges, &Env, &Path, &ExtraPath, &DomState, Block),
+    data: &crate::ir::InstData,
+    compares: &mut Vec<(Value, bool)>,
+) -> bool {
+    let known = match (&data.op, data.result) {
         (&Op::Icmp(cc, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
             let (x, y) = (dom.resolve(raw_x), dom.resolve(raw_y));
             let ty = func.ty(x);
-            if let Some(known) = decide(cc, ty, &path.refined_fact(func, ranges, x, 0), &path.refined_fact(func, ranges, y, 0))
+            let ctx = (cfg, ranges, env, path, extra, block);
+            decide(cc, ty, &sub_fact(func, ctx, x), &sub_fact(func, ctx, y))
                 .or_else(|| path.decide_rel(func, ranges, cc, ty, x, y))
                 .or_else(|| extra.decide(func, (cfg, ranges, env, path, block), cc, x, y))
-            {
-                compares.push((result, known));
-            }
+                .map(|b| (result, b))
         }
         (&Op::Fits(op, signed, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
-            let (x, y) = (dom.resolve(raw_x), dom.resolve(raw_y));
-            if let Some(known) = fits_truth(func, ranges, path, op, signed, x, y) {
-                compares.push((result, known));
-            }
+            fits_truth(func, ranges, path, op, signed, dom.resolve(raw_x), dom.resolve(raw_y)).map(|b| (result, b))
         }
+        _ => return false,
+    };
+    if let Some((result, b)) = known {
+        compares.push((result, b));
+    }
+    true
+}
+
+fn settle_ctrl(
+    func: &Function,
+    (cfg, ranges, env, path, extra, dom, selects, block, seen): (&Cfg, &Ranges, &Env, &mut Path, &mut ExtraPath, &mut DomState, &[SelectRec], Block, &[bool]),
+    inst: Inst,
+    data: &crate::ir::InstData,
+    decided: &mut Vec<(Inst, Option<bool>)>,
+) {
+    let truth_of = |c, p: &Path| {
+        cond_truth(func, ranges, p, c)
+            .or_else(|| extra.cond_truth(func, (cfg, ranges, env, p, block), c, 0))
+            .or_else(|| sub_cond_truth(func, (cfg, ranges, env, p, extra, block), c, 0))
+    };
+    match (&data.op, data.result) {
         (&Op::Select(raw_cond, raw_t, raw_f), Some(result)) if func.ty(result).is_small_int() => {
-            let cond = dom.resolve(raw_cond);
-            if let Some(taken) = cond_truth(func, ranges, path, cond)
-                .or_else(|| extra.cond_truth(func, (cfg, ranges, env, path, block), cond, 0))
-            {
-                let chosen = dom.resolve(if taken { raw_t } else { raw_f });
-                dom.record_alias(result, chosen);
+            if let Some(taken) = truth_of(dom.resolve(raw_cond), path) {
+                dom.record_alias(result, dom.resolve(if taken { raw_t } else { raw_f }));
             }
         }
         (&Op::Trapz(raw_cond) | &Op::Assume(raw_cond), _) => {
             let condition = dom.resolve(raw_cond);
-            if cond_truth(func, ranges, path, condition)
-                .or_else(|| extra.cond_truth(func, (cfg, ranges, env, path, block), condition, 0))
-                == Some(true)
-            {
+            if truth_of(condition, path) == Some(true) {
                 decided.push((inst, None));
             }
             path.assume(func, ranges, condition, true);
@@ -661,11 +727,7 @@ fn settle_one(
             dom.propagate_selects(func, (cfg, ranges, env, path, extra), selects, block, seen);
         }
         (&Op::Brif(raw_cond, then, _, otherwise, _), _) if ranges.constant(raw_cond).is_none() => {
-            let condition = dom.resolve(raw_cond);
-            if let Some(taken) = cond_truth(func, ranges, path, condition)
-                .or_else(|| extra.cond_truth(func, (cfg, ranges, env, path, block), condition, 0))
-                .or_else(|| avoided(func, ranges, then, otherwise))
-            {
+            if let Some(taken) = truth_of(dom.resolve(raw_cond), path).or_else(|| avoided(func, ranges, then, otherwise)) {
                 decided.push((inst, Some(taken)));
             }
         }
