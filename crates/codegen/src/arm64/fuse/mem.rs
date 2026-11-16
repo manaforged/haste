@@ -474,7 +474,7 @@ fn try_fuse_splat_shuffle(
         return;
     }
     let src = if usize::from(first) < count_u { a } else { b };
-    if uses[src.index()] != 1 || plan.elided[src.index()] {
+    if uses[src.index()] != u32::from(a == src) + u32::from(b == src) || plan.elided[src.index()] {
         return;
     }
     let Some((_, _, ins_inst)) = def_entry(pos_of, src) else { return };
