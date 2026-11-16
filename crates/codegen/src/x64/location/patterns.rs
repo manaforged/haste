@@ -551,6 +551,25 @@ impl FuseCtx<'_> {
         Some((idx, out_disp, out_pos))
     }
 
+    fn local_uext(&self, v: Value, max_pos: usize) -> Option<(Value, usize)> {
+        if self.plan.elided[v.index()] || self.uses[v.index()] != 1 {
+            return None;
+        }
+        let (eb, epos, einst) = self.pos_of[v.index()]?;
+        let inner = self.uext_inner(einst).filter(|_| eb == self.b_idx && epos < max_pos)?;
+        (!self.plan.elided[inner.index()]).then_some((inner, epos))
+    }
+
+    fn unwrap_base_uext(&self, v: Value, max_pos: usize, elide: &mut Vec<(Value, usize)>) -> (Value, usize) {
+        match self.local_uext(v, max_pos) {
+            Some((inner, epos)) if self.plan.zero_ext[inner.index()] && self.plan.reg_of(inner).is_some() => {
+                elide.push((v, epos));
+                (inner, epos)
+            }
+            _ => (v, max_pos),
+        }
+    }
+
     pub(super) fn unwrap_uext_const(
         &self,
         v: Value,
@@ -559,15 +578,9 @@ impl FuseCtx<'_> {
         multi_use: bool,
         elide: &mut Vec<(Value, usize)>,
     ) -> (Value, i64, usize) {
-        if !self.plan.elided[v.index()]
-            && self.uses[v.index()] == 1
-            && let Some((eb, epos, einst)) = self.pos_of[v.index()]
-            && eb == self.b_idx
-            && epos < max_pos
-            && let Some(inner) = self.uext_inner(einst)
+        if let Some((inner, epos)) = self.local_uext(v, max_pos)
             && self.func.ty(inner).is_small_int()
             && self.func.ty(inner).bytes() <= 4
-            && !self.plan.elided[inner.index()]
         {
             let mut tmp = Vec::new();
             if let Some((idx, out_disp, out_pos)) = self.peel_small_chain(inner, epos, (shift, disp), multi_use, &mut tmp) {
@@ -637,6 +650,7 @@ impl FuseCtx<'_> {
         if self.plan.elided[b_core.index()] {
             return None;
         }
+        let (b_core, base_start) = self.unwrap_base_uext(b_core, base_start, &mut pair_elide);
         let (base, frame_off) = match self.plan.location(b_core) {
             Location::Frame(slot, off) => (SibBase::Frame(slot), i64::from(off)),
             Location::Imm(_) => return None,
