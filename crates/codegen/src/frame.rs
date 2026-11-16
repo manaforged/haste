@@ -257,8 +257,33 @@ pub(crate) fn saved<R: Copy>(func: &Function, used: &[R], all: &[R]) -> Vec<R> {
     if handles { all.to_vec() } else { used.to_vec() }
 }
 
+fn needs_frame<R>(func: &Function, frame: &Frame<R>, stack_params: bool, bracketed: bool) -> bool {
+    stack_params
+        || frame.size > 0
+        || !frame.saves.is_empty()
+        || !frame.float_saves.is_empty()
+        || (0..func.blocks.len() as u32).map(Block).any(|block| {
+            let traps = bracketed && matches!(func.last(block), Some(Op::Trap));
+            func.blocks[block.index()].insts.iter().any(|inst| match func.insts[inst.index()].op {
+                Op::Call { .. } => !traps,
+                Op::TryCall { .. } | Op::FramePointer => true,
+                _ => false,
+            })
+        })
+}
+
 pub(crate) fn framed<R>(func: &Function, frame: &Frame<R>, stack_params: bool) -> bool {
-    stack_params || frame.size > 0 || !frame.saves.is_empty() || !frame.float_saves.is_empty() || live_ops(func).any(|op| matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::FramePointer))
+    needs_frame(func, frame, stack_params, false)
+}
+
+/// Whether `func` needs a frame only for calls in blocks that end in a trap, so each of those calls can push its own frame record and the hot path runs frameless.
+pub(crate) fn brackets_calls<R>(func: &Function, frame: &Frame<R>, abi: &Abi<R>) -> bool {
+    let stack_params = stack_params(abi);
+    needs_frame(func, frame, stack_params, false) && !needs_frame(func, frame, stack_params, true)
+}
+
+fn stack_params<R>(abi: &Abi<R>) -> bool {
+    abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)))
 }
 
 fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<u32, String> {
@@ -393,8 +418,7 @@ fn build_frame<R: Copy + PartialEq>(
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<(Frame<R>, bool), String> {
     let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided, &plan.fused), classify)?;
-    let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
-    let framed = framed(func, &frame, stack_params);
+    let framed = framed(func, &frame, stack_params(abi));
     Ok((frame, framed))
 }
 

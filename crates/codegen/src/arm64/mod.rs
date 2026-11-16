@@ -95,7 +95,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, packing))?;
     }
-    framed |= plan.locations.iter().any(|loc| matches!(loc, Location::Reg(LR)));
+    let lr = plan.locations.iter().any(|loc| matches!(loc, Location::Reg(LR)));
+    let bracket = !lr && crate::frame::brackets_calls(func, &frame, &abi);
+    framed = (framed || lr) && !bracket;
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -104,6 +106,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         func,
         frame,
         framed,
+        bracket,
         abi,
         packing,
         asm,
@@ -162,6 +165,7 @@ pub(super) struct Emit<'a> {
     func: &'a Function,
     frame: Frame<Reg>,
     framed: bool,
+    bracket: bool,
     abi: Abi,
     packing: Packing,
     asm: Asm,
@@ -199,8 +203,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         if !self.framed {
             return;
         }
-        self.asm.stp_pre(FP, LR, SP, -16);
-        self.asm.mov_sp(FP, SP);
+        self.push_record();
         let size = self.frame.size;
         if size > PAGE {
             self.probe(size);
@@ -296,7 +299,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
         match &data.op {
             Op::Call { sig, callee, args, results } => {
+                if self.bracket {
+                    self.push_record();
+                }
                 let res = emit_call(self, inst, (*sig, *callee), args, results);
+                if self.bracket {
+                    self.asm.ldp_post(FP, LR, SP, 16);
+                }
                 self.invalidate_spills();
                 res
             }
@@ -376,6 +385,11 @@ impl<'a> Emitter<'a> for Emit<'a> {
 }
 
 impl Emit<'_> {
+    fn push_record(&mut self) {
+        self.asm.stp_pre(FP, LR, SP, -16);
+        self.asm.mov_sp(FP, SP);
+    }
+
     fn ty(&self, value: Value) -> Type {
         self.func.ty(value)
     }
