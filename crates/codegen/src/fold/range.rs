@@ -381,47 +381,68 @@ struct UseSite {
 }
 
 struct GuardCtx {
-    cfg: Cfg,
+    cfg: std::sync::Arc<Cfg>,
     def_blocks: Vec<Option<Block>>,
-    uses: Vec<Vec<UseSite>>,
+    starts: Vec<u32>,
+    sites: Vec<UseSite>,
     has_traps: Vec<bool>,
 }
 
 impl GuardCtx {
     fn new(func: &Function) -> Self {
-        let cfg = Cfg::new(func);
+        let cfg = Some(func.cfg()).filter(|cfg| cfg.matches(func)).unwrap_or_else(|| std::sync::Arc::new(Cfg::new(func)));
         let def_blocks = func.def_blocks();
-        let mut uses = vec![Vec::new(); func.types.len()];
-        let mut has_traps = vec![false; func.blocks.len()];
-        for (b_idx, block_data) in func.blocks.iter().enumerate() {
-            if !cfg.reachable[b_idx] {
-                continue;
-            }
-            let block = Block(b_idx as u32);
-            for (pos, &inst) in block_data.insts.iter().enumerate() {
-                let op = &func.insts[inst.index()].op;
-                if matches!(op, Op::Trapz(_) | Op::Assume(_)) {
-                    has_traps[b_idx] = true;
-                }
-                record_uses(op, block, pos, inst, &mut uses);
-            }
+        let mut starts = vec![0_u32; func.types.len() + 1];
+        let has_traps = func
+            .blocks
+            .iter()
+            .zip(&cfg.reachable)
+            .map(|(block, &live)| live && block.insts.iter().any(|inst| matches!(func.insts[inst.index()].op, Op::Trapz(_) | Op::Assume(_))))
+            .collect();
+        for_reachable_uses(func, &cfg, |value, _| starts[value.index() + 1] += 1);
+        for at in 1..starts.len() {
+            starts[at] += starts[at - 1];
         }
-        Self { cfg, def_blocks, uses, has_traps }
+        let mut fill = starts.clone();
+        let blank = UseSite { block: Block(0), pos: 0, inst: Inst(0), branch_target: None };
+        let mut sites = vec![blank; starts[starts.len() - 1] as usize];
+        for_reachable_uses(func, &cfg, |value, site| {
+            let at = &mut fill[value.index()];
+            sites[*at as usize] = site;
+            *at += 1;
+        });
+        Self { cfg, def_blocks, starts, sites, has_traps }
+    }
+
+    fn uses(&self, value: Value) -> &[UseSite] {
+        &self.sites[self.starts[value.index()] as usize..self.starts[value.index() + 1] as usize]
     }
 }
 
-fn record_uses(op: &Op, block: Block, pos: usize, inst: Inst, uses: &mut [Vec<UseSite>]) {
+fn for_reachable_uses(func: &Function, cfg: &Cfg, mut each: impl FnMut(Value, UseSite)) {
+    for (b_idx, block_data) in func.blocks.iter().enumerate() {
+        if !cfg.reachable[b_idx] {
+            continue;
+        }
+        let block = Block(b_idx as u32);
+        for (pos, &inst) in block_data.insts.iter().enumerate() {
+            record_uses(&func.insts[inst.index()].op, UseSite { block, pos, inst, branch_target: None }, &mut each);
+        }
+    }
+}
+
+fn record_uses(op: &Op, site: UseSite, each: &mut impl FnMut(Value, UseSite)) {
     if let Op::Brif(cond, tb, ta, eb, ea) = op {
-        uses[cond.index()].push(UseSite { block, pos, inst, branch_target: None });
+        each(*cond, site);
         for v in ta {
-            uses[v.index()].push(UseSite { block, pos, inst, branch_target: Some(*tb) });
+            each(*v, UseSite { branch_target: Some(*tb), ..site });
         }
         for v in ea {
-            uses[v.index()].push(UseSite { block, pos, inst, branch_target: Some(*eb) });
+            each(*v, UseSite { branch_target: Some(*eb), ..site });
         }
         return;
     }
-    op.for_operands(|v| uses[v.index()].push(UseSite { block, pos, inst, branch_target: None }));
+    op.for_operands(|v| each(v, site));
 }
 
 fn guard_proves_cmp(cc: IntCC, c_u: u64, sign_bit: u64) -> bool {
@@ -558,7 +579,7 @@ fn can_narrow_guarded(func: &Function, state: &RangeState, ctx: &GuardCtx, (res,
     let Some(def_block) = ctx.def_blocks[res.index()] else {
         return false;
     };
-    ctx.uses[res.index()]
+    ctx.uses(res)
         .iter()
         .all(|&site| is_sign_inv_cmp(func, state, site.inst, res, sign_bit) || is_guarded_use(func, state, ctx, site, (def_block, (res, sign_bit))))
 }

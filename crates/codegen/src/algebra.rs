@@ -677,8 +677,8 @@ fn simplify_binary(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec
     }
 }
 
-fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(Value, Value, Value)>, res: Option<Value>, op: Op) -> Option<Op> {
-    match op {
+fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(Value, Value, Value)>, res: Option<Value>, inst: Inst) -> Option<Op> {
+    match cx.func.insts[inst.index()].op {
         Op::Icmp(cc, x, y) => simplify_icmp(cx, res, cc, x, y),
         Op::Binary(bin, a, b) => {
             if res.is_some_and(|r| cx.func.ty(r).is_vector()) {
@@ -694,11 +694,14 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Shuffle(a, b, ShuffleMask::Const(m)) => vec::simplify_shuffle(cx, res, a, b, m),
         Op::Fits(Binary::Imul, false, x, y) => ovf::simplify_mul_fits(cx, x, y),
         Op::Select(cond, t, f) => ovf::gated_product(cx, cond, t, f).or_else(|| select::simplify_select(cx, res, cond, t, f)),
-        Op::Brif(cond, tb, ta, eb, ea) => match select::tested_select(cx, cond) {
-            Some((test, true)) => Some(Op::Brif(test, tb, ta, eb, ea)),
-            Some((test, false)) => Some(Op::Brif(test, eb, ea, tb, ta)),
-            None => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
-        },
+        Op::Brif(cond, tb, ref ta, eb, ref ea) => {
+            let (ta, ea) = (ta.clone(), ea.clone());
+            match select::tested_select(cx, cond) {
+                Some((test, true)) => Some(Op::Brif(test, tb, ta, eb, ea)),
+                Some((test, false)) => Some(Op::Brif(test, eb, ea, tb, ta)),
+                None => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
+            }
+        }
         Op::Load(addr, off) => {
             let ty = cx.func.ty(res?);
             fold_rodata_load(cx, ty, addr, off).or_else(|| fold_disp(cx, addr, off, ty.bytes()).map(|(base, disp)| Op::Load(base, disp)))
@@ -732,8 +735,8 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
             if !cx.subst.is_empty() {
                 cx.func.insts[inst.index()].op.map_operands(|v| crate::merge::find(&cx.subst, v));
             }
-            let (op, res) = (cx.func.insts[inst.index()].op.clone(), cx.func.insts[inst.index()].result);
-            if let Some(new_op) = simplify_inst(&mut cx, &fits_used, &mut block_udivs, res, op) {
+            let res = cx.func.insts[inst.index()].result;
+            if let Some(new_op) = simplify_inst(&mut cx, &fits_used, &mut block_udivs, res, inst) {
                 if let (Op::Const(imm), Some(r)) = (&new_op, res) {
                     cx.consts.resize(cx.func.types.len(), None);
                     cx.consts[r.index()] = Some(*imm);

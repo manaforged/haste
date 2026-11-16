@@ -24,6 +24,7 @@ pub(super) struct Rel {
 pub(super) const UNSIGNED: (RelKind, RelKind) = (RelKind::Ult, RelKind::Ule);
 const SIGNED: (RelKind, RelKind) = (RelKind::Slt, RelKind::Sle);
 const EQUAL: (RelKind, RelKind) = (RelKind::Eq, RelKind::Eq);
+const WALK_SEEN: usize = 16;
 
 pub(super) fn rel_step(r: Rel, cur: Value, ty: Type, (strict_k, weak_k): (RelKind, RelKind)) -> Option<(Value, bool)> {
     if r.ty != ty {
@@ -236,9 +237,9 @@ impl Path {
     }
 
     pub(super) fn walk(&self, ty: Type, start: Value, kinds: (RelKind, RelKind), mut visit: impl FnMut(Value, bool) -> bool) -> bool {
-        let mut seen: Vec<(Value, bool)> = vec![(start, false)];
+        let (mut seen, mut len) = ([(start, false); WALK_SEEN], 1);
         let mut idx = 0;
-        while idx < seen.len() {
+        while idx < len {
             let (cur, cur_strict) = seen[idx];
             idx += 1;
             for &r in &self.rels {
@@ -249,14 +250,16 @@ impl Path {
                 if visit(next, next_strict) {
                     return true;
                 }
-                if seen.len() < 16 {
-                    if let Some(entry) = seen.iter_mut().find(|(v, _)| *v == next) {
+                if len < WALK_SEEN {
+                    if let Some(entry) = seen[..len].iter_mut().find(|(v, _)| *v == next) {
                         if next_strict && !entry.1 {
                             entry.1 = true;
-                            seen.push((next, true));
+                            seen[len] = (next, true);
+                            len += 1;
                         }
                     } else {
-                        seen.push((next, next_strict));
+                        seen[len] = (next, next_strict);
+                        len += 1;
                     }
                 }
             }

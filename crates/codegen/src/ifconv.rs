@@ -392,7 +392,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let mut any = false;
     loop {
         let cfg = func.cfg();
-        let prov = Provenance::new(func, &cfg);
+        let prov = Provenance::addresses(func, &cfg);
         let mut is_const = vec![false; func.types.len()];
         for block in &func.blocks {
             for &inst in &block.insts {

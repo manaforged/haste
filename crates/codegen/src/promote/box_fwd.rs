@@ -68,6 +68,9 @@ impl Env {
 }
 
 pub(super) fn run(func: &mut Function) -> bool {
+    if !func.slots.iter().any(|s| s.size >= MOVE_INLINE) {
+        return false;
+    }
     let mut changed = false;
     while forward_one(func) {
         changed = true;
@@ -77,16 +80,29 @@ pub(super) fn run(func: &mut Function) -> bool {
 
 fn forward_one(func: &mut Function) -> bool {
     let env = Env::new(func);
-    for idx in 0..func.slots.len() {
-        if func.slots[idx].size < MOVE_INLINE {
-            continue;
-        }
-        let slot = StackSlot(idx as u32);
+    for slot in copied_slots(func, &env) {
         let Some(plan) = find_plan(func, &env, slot) else { continue };
         apply_plan(func, &env, plan);
         return true;
     }
     false
+}
+
+fn copied_slots(func: &Function, env: &Env) -> Vec<StackSlot> {
+    let mut copied = vec![false; func.slots.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            if let Op::Move(_, src, _) | Op::Copy(_, src, _) = func.insts[inst.index()].op
+                && let Some((slot, _)) = env.addrs[src.index()]
+            {
+                copied[slot.index()] = true;
+            }
+        }
+    }
+    (0..func.slots.len())
+        .filter(|&idx| copied[idx] && func.slots[idx].size >= MOVE_INLINE)
+        .map(|idx| StackSlot(idx as u32))
+        .collect()
 }
 
 fn find_plan(func: &Function, env: &Env, slot: StackSlot) -> Option<Plan> {

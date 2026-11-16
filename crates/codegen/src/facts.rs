@@ -1,4 +1,5 @@
 mod backprop;
+mod exits;
 mod live;
 mod loops;
 mod rel;
@@ -530,9 +531,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
         let mut live = live::Live::default();
         let loops = cfg.loops();
         let mut env = Env::default();
-        let mut exits: Vec<Option<Path>> = vec![None; func.blocks.len()];
-        let mut extra_exits: Vec<Option<ExtraPath>> = vec![None; func.blocks.len()];
-        let mut dom_exits: Vec<Option<DomState>> = vec![None; func.blocks.len()];
+        let mut exits = exits::Exits::new(func, &cfg, (&single, entry), (loops, &incoming));
         let mut seen = vec![false; func.types.len()];
         for &block in &cfg.rpo {
             for &param in &func.blocks[block.index()].params {
@@ -541,41 +540,15 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
             live.enter(&cfg, &selects, block);
             for each in &loops.list {
                 if each.head == block {
-                    env.collect_loop(func, (&cfg, &ranges, &incoming, &complete, &exits, &def_blocks), each);
+                    env.collect_loop(func, (&cfg, &ranges, &incoming, &complete, exits.paths(), &def_blocks), each);
                 }
             }
-            let follow_pred = single[block.index()].or_else(|| {
-                (block != entry)
-                    .then(|| {
-                        let mut outside = cfg.preds_of(block).iter().copied().filter(|&p| cfg.reachable[p.index()] && !cfg.dominates(block, p));
-                        let first = outside.next()?;
-                        (outside.next().is_none() && cfg.idom[block.index()] == Some(first)).then_some(first)
-                    })
-                    .flatten()
-            });
-            let (mut path, mut extra, mut dom) = match follow_pred.and_then(|pred| {
-                exits[pred.index()].as_ref().map(|exit| {
-                    (
-                        pred,
-                        exit.clone(),
-                        extra_exits[pred.index()].clone().unwrap_or_default(),
-                        dom_exits[pred.index()].clone().unwrap_or_default(),
-                    )
-                })
-            }) {
-                Some((pred, mut path, mut extra, mut dom)) => {
-                    path.follow(func, &ranges, pred, block);
-                    extra.follow(func, (&cfg, &ranges, &env, &path), pred, block);
-                    dom.propagate_selects(func, (&cfg, &ranges, &env, &mut path, &extra), &live.recs, block, &seen);
-                    (path, extra, dom)
-                }
-                None if block != entry => (
-                    cfg.idom[block.index()].and_then(|d| exits[d.index()].clone()).unwrap_or_default(),
-                    cfg.idom[block.index()].and_then(|d| extra_exits[d.index()].clone()).unwrap_or_default(),
-                    cfg.idom[block.index()].and_then(|d| dom_exits[d.index()].clone()).unwrap_or_default(),
-                ),
-                None => (Path::default(), ExtraPath::default(), DomState::default()),
-            };
+            let (follow, mut path, mut extra, mut dom) = exits.start(&cfg, block, entry);
+            if let Some(pred) = follow {
+                path.follow(func, &ranges, pred, block);
+                extra.follow(func, (&cfg, &ranges, &env, &path), pred, block);
+                dom.propagate_selects(func, (&cfg, &ranges, &env, &mut path, &extra), &live.recs, block, &seen);
+            }
             for inv in &env.rel_invs {
                 if inv.head == block {
                     let kind = if inv.strict { RelKind::Ult } else { RelKind::Ule };
@@ -594,9 +567,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                     }
                 }
             }
-            exits[block.index()] = Some(path);
-            extra_exits[block.index()] = Some(extra);
-            dom_exits[block.index()] = Some(dom);
+            exits.store(block, (path, extra, dom));
         }
     }
     let settled = !compares.is_empty();

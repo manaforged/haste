@@ -267,9 +267,18 @@ pub(crate) fn compute_affine(func: &Function) -> Vec<(Value, i64)> {
 
 impl Provenance {
     fn build(func: &Function, cfg: &Cfg, is_spill: Option<&[bool]>, affine: Option<Vec<(Value, i64)>>) -> Self {
-        let slot_offsets = slot_addresses(func);
         let tracked = compute_tracked_roots(func, cfg);
-        let esc = escape::classify_uses(func, cfg, &slot_offsets, &tracked, is_spill);
+        let mut prov = Self::from_roots(func, cfg, &tracked, affine);
+        let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, is_spill);
+        prov.unescaped_slots = esc.unescaped;
+        prov.call_readonly_slots = esc.call_readonly;
+        prov.noalias_escaped = esc.noalias;
+        prov.spans = loop_mem::compute_spans(func, cfg, &prov.slot_offsets, &prov.symbol_defs);
+        prov
+    }
+
+    fn from_roots(func: &Function, cfg: &Cfg, tracked: &[TrackRoot], affine: Option<Vec<(Value, i64)>>) -> Self {
+        let slot_offsets = slot_addresses(func);
         let mut param_roots = vec![MemRoot::Unknown; func.types.len()];
         for (i, t) in tracked.iter().enumerate() {
             if let TrackRoot::Set(root) = *t {
@@ -290,18 +299,12 @@ impl Provenance {
             }
         }
         let affine = affine.unwrap_or_else(|| compute_affine(func));
-        let spans = loop_mem::compute_spans(func, cfg, &slot_offsets, &symbol_defs);
-        Self {
-            slot_offsets,
-            unescaped_slots: esc.unescaped,
-            call_readonly_slots: esc.call_readonly,
-            noalias_escaped: esc.noalias,
-            param_roots,
-            symbol_defs,
-            ro_bytes,
-            affine,
-            spans,
-        }
+        Self { slot_offsets, param_roots, symbol_defs, ro_bytes, affine, ..Self::default() }
+    }
+
+    /// The address facts alone, for `loc` and `ro_bytes`: no escape classification and no loop spans.
+    pub(crate) fn addresses(func: &Function, cfg: &Cfg) -> Self {
+        Self::from_roots(func, cfg, &compute_tracked_roots(func, cfg), None)
     }
 
     pub(crate) fn new(func: &Function, cfg: &Cfg) -> Self {

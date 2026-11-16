@@ -1,10 +1,15 @@
+use std::cell::RefCell;
+
 use crate::ir::{Binary, Convert, Function, Op, Type, Value};
 
 use super::rel::{Path, RelKind, UNSIGNED};
 use super::transfer::{transfer, unwrapped, valid};
-use super::{Fact, Ranges};
+use super::{Fact, MAX_RELS, Ranges};
 
 const CHAIN_STEPS: usize = 4;
+const OPERAND_MEMO: usize = 4;
+
+type Chain = ([(Value, Value, u64, u64); CHAIN_STEPS], usize);
 
 impl Path {
     pub(super) fn is_no_wrap_pair(&self, ranges: &Ranges, ty: Type, base: Value, c: Value, k: u64) -> bool {
@@ -100,7 +105,17 @@ impl Path {
         let fact = self.fact(ranges, value);
         let ty = func.ty(value);
         let Some(op) = ranges.op(func, value).filter(|_| depth < 3 && ty.is_small_int()) else { return fact };
-        let operand = |inner: Value| Some(self.refined_fact(func, ranges, inner, depth + 1)).filter(|known| known.lo <= known.hi).unwrap_or_else(|| ranges.of(inner));
+        let memo: RefCell<[Option<(Value, Fact)>; OPERAND_MEMO]> = RefCell::new(std::array::from_fn(|_| None));
+        let operand = |inner: Value| {
+            if let Some((_, known)) = memo.borrow().iter().flatten().find(|(at, _)| *at == inner) {
+                return known.clone();
+            }
+            let known = Some(self.refined_fact(func, ranges, inner, depth + 1)).filter(|known| known.lo <= known.hi).unwrap_or_else(|| ranges.of(inner));
+            if let Some(slot) = memo.borrow_mut().iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some((inner, known.clone()));
+            }
+            known
+        };
         let fact = fact.meet(&transfer(func, ranges, op, ty, &operand));
         let sum = match *op {
             Op::Binary(Binary::Iadd, a, b) if self.has_no_wrap_add(a, b) => unwrapped(Binary::Iadd, ty, &operand(a), &operand(b)),
@@ -112,30 +127,12 @@ impl Path {
         }
     }
 
-    fn add_const_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> ([(Value, u64); CHAIN_STEPS + 1], usize) {
+    fn iadd_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> Chain {
         let max = ty.unsigned_max();
-        let mut out = [(val, 0_u64); CHAIN_STEPS + 1];
-        let mut len = 1;
+        let mut out = [(val, val, 0_u64, 0_u64); CHAIN_STEPS];
+        let mut len = 0;
         let (mut cur, mut acc) = (val, 0_u64);
-        for _ in 0..CHAIN_STEPS {
-            let Some(&Op::Binary(Binary::Iadd, p, q)) = ranges.op(func, cur) else { break };
-            let Some((base, k)) = [(p, q), (q, p)].into_iter().find_map(|(b, c)| self.fact(ranges, c).exact().map(|k| (b, k))) else {
-                break;
-            };
-            let Some(next_acc) = acc.checked_add(k).filter(|&s| s <= max) else { break };
-            out[len] = (base, next_acc);
-            len += 1;
-            cur = base;
-            acc = next_acc;
-        }
-        (out, len)
-    }
-
-    fn non_wrap_iadd_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> Vec<(Value, u64)> {
-        let max = ty.unsigned_max();
-        let mut out = Vec::new();
-        let (mut cur, mut acc, mut all_steps) = (val, 0_u64, true);
-        for step in 0..CHAIN_STEPS {
+        while len < CHAIN_STEPS {
             let Some(&Op::Binary(Binary::Iadd, p, q)) = ranges.op(func, cur) else { break };
             let Some((base, c_val, k)) = [(p, q), (q, p)]
                 .into_iter()
@@ -144,6 +141,29 @@ impl Path {
                 break;
             };
             let Some(next_acc) = acc.checked_add(k).filter(|&s| s <= max) else { break };
+            out[len] = (base, c_val, k, next_acc);
+            len += 1;
+            cur = base;
+            acc = next_acc;
+        }
+        (out, len)
+    }
+
+    fn add_const_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> ([(Value, u64); CHAIN_STEPS + 1], usize) {
+        let (steps, len) = self.iadd_chain(func, ranges, val, ty);
+        let mut out = [(val, 0_u64); CHAIN_STEPS + 1];
+        for (slot, &(base, _, _, acc)) in out[1..].iter_mut().zip(&steps[..len]) {
+            *slot = (base, acc);
+        }
+        (out, len + 1)
+    }
+
+    fn non_wrap_iadd_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> impl Iterator<Item = (Value, u64)> {
+        let max = ty.unsigned_max();
+        let (steps, len) = self.iadd_chain(func, ranges, val, ty);
+        let mut out = [(val, 0_u64); CHAIN_STEPS];
+        let (mut kept, mut all_steps) = (0, true);
+        for (step, &(base, c_val, k, next_acc)) in steps[..len].iter().enumerate() {
             let step_ok = self.is_no_wrap_add(ranges, ty, base, c_val, k);
             all_steps &= step_ok;
             let total_ok = if step == 0 {
@@ -152,12 +172,11 @@ impl Path {
                 all_steps || max.checked_sub(next_acc).is_some_and(|limit| self.reaches_upper_at_most(ranges, ty, base, limit))
             };
             if total_ok {
-                out.push((base, next_acc));
+                out[kept] = (base, next_acc);
+                kept += 1;
             }
-            cur = base;
-            acc = next_acc;
         }
-        out
+        out.into_iter().take(kept)
     }
 
     fn min_reachable_hi(&self, ranges: &Ranges, ty: Type, start: Value) -> u64 {
@@ -242,9 +261,14 @@ impl Path {
             RelKind::Eq => [Some(r.lhs), Some(r.rhs)],
             _ => [None, None],
         });
-        for (i, s) in candidates.clone().flatten().enumerate() {
-            if (!into_b && s != b) || candidates.clone().flatten().take(i).any(|seen| seen == s) {
+        let (mut seen, mut seen_len) = ([b; 2 * MAX_RELS], 0);
+        for s in candidates.flatten() {
+            if (!into_b && s != b) || seen[..seen_len].contains(&s) {
                 continue;
+            }
+            if let Some(slot) = seen.get_mut(seen_len) {
+                *slot = s;
+                seen_len += 1;
             }
             if a_forms.len() > 1 {
                 upper_terms.push((s, s, 0));
