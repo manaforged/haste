@@ -5,7 +5,7 @@ mod walk;
 use crate::cfg::{Cfg, Loops};
 use crate::fold::{constant, fits_imm32, holds};
 use crate::frame::{Abi, Loc};
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, Op, Signature, StackSlot, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, InstData, Op, Signature, StackSlot, Type, Value};
 use crate::live::{Live, Sib, SibBase, live, results};
 use crate::park::{Class, Hints, ParkReg, allocate};
 
@@ -31,6 +31,21 @@ pub(crate) struct Regs<R: 'static> {
 }
 
 const FOLD_LIMIT: i64 = 1 << 24;
+
+/// Reports whether `data` reads or makes a 128-bit integer.
+pub(crate) fn touches_i128(func: &Function, data: &InstData) -> bool {
+    let mut wide = data.result.is_some_and(|r| func.ty(r) == Type::I128);
+    data.op.for_operands(|v| wide |= func.ty(v) == Type::I128);
+    wide
+}
+
+impl<R: PartialEq + 'static> Regs<R> {
+    /// Reports whether emitting `data` may overwrite `reg` as a wide or op scratch register.
+    pub(crate) fn scratches(&self, func: &Function, data: &InstData, reg: R) -> bool {
+        let wide = touches_i128(func, data);
+        (wide && self.wide_scratch.contains(&reg)) || ((wide || (self.uses_scratch)(func, &data.op)) && self.op_scratch.contains(&reg))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Location<R> {

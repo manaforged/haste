@@ -7,7 +7,7 @@ use crate::live::{Live, Range, overlaps};
 mod choose;
 mod place;
 mod recolor;
-use choose::choose_free;
+use choose::{choose_free, place_reuse_chain};
 pub(crate) use place::scratch_clobbers;
 use place::{apply_demote, evict_slot, find_demote_free, find_relocate, leaf_park_cost, slot_accepts, victim_slot_unweighted};
 
@@ -45,6 +45,7 @@ pub(super) struct Pool<F> {
 }
 
 impl<F: PartialEq> Pool<F> {
+    /// The pool slot that holds `reg`, if any.
     pub(super) fn slot_of(&self, reg: F) -> Option<usize> {
         self.regs.iter().position(|r| *r == reg)
     }
@@ -367,7 +368,7 @@ fn try_place_weighted<'a, F: Copy + PartialEq>(
     (back_partners, reverse_reuse, back_index): (&[Vec<usize>], &[Option<Value>], &BackIndex),
     (slots, homes): (&mut SlotSet, &mut [Option<F>]),
     (reserved, scratch_holders, query_ranges): (&mut Vec<F>, &mut Vec<Vec<usize>>, &mut Vec<(usize, &'a [Range])>),
-    value: usize,
+    (value, want): (usize, Option<usize>),
 ) -> (bool, Vec<usize>) {
     let Some((start, end)) = live.bounds(value) else { return (false, Vec::new()) };
     let ranges = live.ranges_of(value);
@@ -392,6 +393,9 @@ fn try_place_weighted<'a, F: Copy + PartialEq>(
         |s| !slots.is_empty(s),
         (value, start, end, wide_val, needs_saved, can_park, has_free_saved),
     );
+    if want.is_some_and(|s| chosen != Some(s)) {
+        return (false, Vec::new());
+    }
     let mut dropped = Vec::new();
     if chosen.is_none()
         && let Some(demote) = find_relocate(func, pool, slots, homes, live, hints, &back_partners[value], reserved, weights, (ranges, start, value), (needs_saved, can_park, wide_val))
@@ -452,7 +456,7 @@ fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &P
             (&back_partners, &reverse_reuse, &back_index),
             (&mut slots, &mut homes),
             (&mut reserved, &mut scratch_holders, &mut query_ranges),
-            value,
+            (value, None),
         );
         for eh in dropped {
             if requeues[eh] < MAX_REQUEUE
@@ -466,6 +470,16 @@ fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &P
         }
         if !placed && !std::mem::replace(&mut in_spilled[value], true) {
             spilled.push(value);
+        }
+        if placed && hints.two_address {
+            place_reuse_chain(
+                (func, live, pool),
+                (hints, weights),
+                (&back_partners, &reverse_reuse, &back_index),
+                (&mut slots, &mut homes),
+                (&mut reserved, &mut scratch_holders, &mut query_ranges),
+                (pooled, value),
+            );
         }
     }
     while !spilled.is_empty() {
@@ -482,7 +496,7 @@ fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &P
                 (&back_partners, &reverse_reuse, &back_index),
                 (&mut slots, &mut homes),
                 (&mut reserved, &mut scratch_holders, &mut query_ranges),
-                value,
+                (value, None),
             );
             for eh in dropped {
                 if requeues[eh] < MAX_REQUEUE + 2 && !std::mem::replace(&mut in_spilled[eh], true) {

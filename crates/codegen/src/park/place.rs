@@ -1,4 +1,4 @@
-use crate::ir::{Block, Function, Op, Type};
+use crate::ir::{Block, Function, Op};
 use crate::live::{Live, Range, overlaps};
 
 use super::{Hints, Pool, SlotSet, crosses_call, crosses_ranges};
@@ -34,8 +34,7 @@ pub(crate) fn scratch_clobbers<R>(
     }
     let (mut wide, mut op) = (Vec::new(), Vec::new());
     let mut record = |data: &crate::ir::InstData, at_use: u32, at_def: u32| {
-        let mut touches_i128 = data.result.is_some_and(|result| func.ty(result) == Type::I128);
-        data.op.for_operands(|v| touches_i128 |= func.ty(v) == Type::I128);
+        let touches_i128 = crate::alloc::touches_i128(func, data);
         if !wide_scratch.is_empty() && touches_i128 {
             push_span(&mut wide, at_use, at_def);
         }

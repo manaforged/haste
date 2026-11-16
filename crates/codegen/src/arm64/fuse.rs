@@ -242,6 +242,7 @@ pub(super) fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, sta
             continue;
         }
         if (reg.is_some() && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
+            || reg.is_some_and(|reg| super::REGS.scratches(func, data, reg))
             || data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(clobbers)
             || crate::live::results(data).any(clobbers)
         {

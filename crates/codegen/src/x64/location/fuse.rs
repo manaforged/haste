@@ -4,10 +4,8 @@ use super::patterns::{
 use super::sib::{apply_sib_groups, find_cand_sib, idx_source, sib_ok};
 use super::super::{FRAME_REGS, REGS};
 use super::super::asm::Reg;
-use super::super::atomic::uses_scratch;
 use super::super::features::Features;
 use super::super::frame::SAVED;
-use super::super::wide::WIDE_SCRATCH;
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Op, Type, Unary, Value};
 use crate::live::{Sib, SibBase};
@@ -19,12 +17,6 @@ pub(super) struct FuseCtx<'a> {
     pub(super) pos_of: &'a [Option<(usize, usize, Inst)>],
     pub(super) defs: &'a [Option<Inst>],
     pub(super) b_idx: usize,
-}
-
-fn scratches(func: &Function, data: &InstData, reg: Reg) -> bool {
-    let mut wide = data.result.is_some_and(|r| func.ty(r) == Type::I128);
-    data.op.for_operands(|v| wide |= func.ty(v) == Type::I128);
-    (wide && WIDE_SCRATCH.contains(&reg)) || ((wide || uses_scratch(func, &data.op)) && REGS.op_scratch.contains(&reg))
 }
 
 pub(super) fn preserved(func: &Function, plan: &Plan<Reg>, b_idx: usize, start: usize, end: usize, skip: &[usize], val: Value) -> bool {
@@ -58,7 +50,7 @@ pub(super) fn preserved(func: &Function, plan: &Plan<Reg>, b_idx: usize, start: 
             continue;
         }
         if (reg.is_some() && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
-            || reg.is_some_and(|reg| scratches(func, data, reg))
+            || reg.is_some_and(|reg| REGS.scratches(func, data, reg))
             || data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(clobbers)
             || crate::live::results(data).any(clobbers)
         {
