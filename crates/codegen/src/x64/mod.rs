@@ -40,7 +40,13 @@ const REGS: Regs<Reg> = Regs {
     two_address: true,
     park: true,
     fold_sib: true,
+    imm_store,
 };
+
+/// One `mov` stores a sign-extended 32-bit immediate; a wider one goes through a register.
+fn imm_store(imm: i64) -> u64 {
+    if i32::try_from(imm).is_ok() { 1 } else { 2 }
+}
 
 const REGS_WIN64: Regs<Reg> = Regs {
     leaf: &[Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],

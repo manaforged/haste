@@ -1,3 +1,4 @@
+mod demote;
 mod hints;
 
 use crate::cfg::{Cfg, Loops};
@@ -22,6 +23,8 @@ pub(crate) struct Regs<R: 'static> {
     pub two_address: bool,
     pub park: bool,
     pub fold_sib: bool,
+    /// The instructions that store a constant into a frame home.
+    pub imm_store: fn(i64) -> u64,
 }
 
 const FOLD_LIMIT: i64 = 1 << 24;
@@ -718,11 +721,12 @@ pub(crate) fn plan<R: Copy + PartialEq>(
             locations[res.index()] = Location::Imm(0);
         }
     }
+    let (pairs, deferred) = pairs(func, &locations, &elided);
+    let webs = blocks.as_deref().zip(partners.as_deref()).map(|edges| demote::webs(func, &live, edges, (&sib, &elided, &deferred), regs.imm_store, &mut locations));
     let parked = if park.is_some() { parked(func, &live, &locations, (regs.saved, regs.saved_float), classify) } else { Vec::new() };
     let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
-    let (pairs, deferred) = pairs(func, &locations, &elided);
-    let shared = if weighed { crate::color::share(func, &live, &locations, &deferred) } else { Vec::new() };
+    let shared = webs.map_or_else(Vec::new, |webs| crate::color::share(func, &live, &locations, &deferred, &webs));
     Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext }
 }
 

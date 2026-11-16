@@ -60,7 +60,13 @@ const REGS: Regs<Reg> = Regs {
     two_address: false,
     park: true,
     fold_sib: true,
+    imm_store,
 };
+
+/// Zero stores from `xzr`; any other constant goes into a register first.
+fn imm_store(imm: i64) -> u64 {
+    if imm == 0 { 1 } else { 2 }
+}
 
 fn emit_save_pairs<T: Copy>(asm: &mut Asm, regs: &[T], base: usize, mut step: impl FnMut(&mut Asm, i32, T, Option<T>)) {
     let mut i = 0;
