@@ -13,7 +13,7 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 use crate::outline::Outline;
 use crate::sema::evaluate::Evaluate;
-use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
+use crate::sema::reach::{Instance, Reached, calls, infer_declared, infer_quiet, main_roots};
 use crate::sema::{Answer, Cache, Context, Edited};
 
 use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, host_symbol, stub, wait};
@@ -55,7 +55,10 @@ pub trait Driver {
     fn ended(&mut self, id: usize, ended: Ended) -> Result<()>;
 }
 
-/// The functions declared so far, the inference store whose types their instances name, the image that holds their stubs and code, and the children that run it.
+/// The most functions that one ask compiles ahead of their first call.
+const AHEAD_FUNCTIONS: usize = 4096;
+
+/// The functions declared so far, the inference store whose types their instances name, the image that holds their stubs and code, the children that run it, whether an ask compiles the functions it reaches ahead, and the functions that compiling ahead left to their first call.
 pub struct Jit {
     reached: Reached,
     store: Cache,
@@ -66,6 +69,8 @@ pub struct Jit {
     pending: std::collections::VecDeque<(usize, usize)>,
     strict: bool,
     expanded: HashSet<usize>,
+    ahead: bool,
+    tried: HashSet<usize>,
 }
 
 /// A binary kept between runs: its `main`, and each function it called, compiled on that first call.
@@ -258,7 +263,9 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
 
 impl Jit {
     pub fn new(store: Cache) -> Result<Jit> {
-        Self::create(store, (SHARED_BYTES, STATE_BYTES, CODE_BYTES, TABLE_SLOTS))
+        let mut jit = Self::create(store, (SHARED_BYTES, STATE_BYTES, CODE_BYTES, TABLE_SLOTS))?;
+        jit.ahead = true;
+        Ok(jit)
     }
 
     fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
@@ -267,7 +274,7 @@ impl Jit {
         image.backend = super::ImageBackend::LazyJit { fast: false };
         image.stubs.reserve(table_slots * stub::STUB_BYTES)?;
         image.pass.memory.reserve(code_bytes)?;
-        Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), pending: std::collections::VecDeque::new(), strict: true, expanded: HashSet::default() })
+        Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), pending: std::collections::VecDeque::new(), strict: true, expanded: HashSet::default(), ahead: false, tried: HashSet::default() })
     }
 
     fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
@@ -282,6 +289,7 @@ impl Jit {
         }
         self.image.link();
         self.expanded.clear();
+        self.tried.clear();
     }
 
     /// The index of `instance`, whose slot holds its stub when it is new.
@@ -476,9 +484,82 @@ impl Jit {
         if matches!(answer, Err(Stop::Asked)) {
             journal.iter().for_each(|&at| self.reached.forget(at));
             self.expanded.clear();
+            self.tried.clear();
             self.image.bodies.clear_transient();
+        } else if answer.is_ok() {
+            self.compile_ahead(cx, index);
         }
         answer
+    }
+
+    /// Compiles ahead, on every core, the functions without code that function `index` reaches through calls, up to `AHEAD_FUNCTIONS` of them, but those a prepped library binds; one whose inference or compile asks for more, defers, or fails keeps its stub, so it compiles, or fails, on its first call as it would have.
+    fn compile_ahead(&mut self, cx: &mut Context<'_>, index: usize) {
+        if !self.ahead {
+            return;
+        }
+        let members = self.frontier(cx, index);
+        let (foreign, mut work): (Vec<usize>, Vec<usize>) = members.into_iter().filter(|&at| self.callees_typed(cx, at)).partition(|&at| cx.foreign(self.reached.list[at].0.0));
+        for at in foreign {
+            match host_symbol(cx, self.reached.list[at].0.0) {
+                Ok(code) => {
+                    self.publish(at, code);
+                }
+                Err(_) => {
+                    self.tried.insert(at);
+                }
+            }
+        }
+        work.retain(|&at| crate::prep::bind(cx, &self.reached, at).is_none());
+        if work.is_empty() {
+            return;
+        }
+        let compiled = self.image.compile_batch(cx, &self.reached, &work);
+        for &(at, code) in &compiled {
+            super::perf::note(cx, &self.reached, (at, code), super::perf::Origin::Haste);
+            self.publish(at, code);
+        }
+        self.tried.extend(work.into_iter().filter(|at| !self.compiled.contains(at)));
+    }
+
+    /// The inferred functions without code that function `index` reaches through calls, level by level until `AHEAD_FUNCTIONS` or no new one, each declared and inferred on every core; one whose inference asked for more or failed is left to its first call, with what it calls.
+    fn frontier(&mut self, cx: &mut Context<'_>, index: usize) -> Vec<usize> {
+        let mut seen = HashSet::default();
+        seen.insert(index);
+        let mut members = Vec::new();
+        let mut level = self.fresh_callees(cx, index, &mut seen);
+        while !level.is_empty() && members.len() < AHEAD_FUNCTIONS {
+            level.truncate(AHEAD_FUNCTIONS - members.len());
+            let inferred = infer_quiet(cx, &mut self.reached, &level);
+            self.image.bind_foreign_statics(cx, &self.reached, &inferred);
+            let (typed, left): (Vec<usize>, Vec<usize>) = level.into_iter().partition(|&at| self.reached.list[at].1.is_ok());
+            self.tried.extend(left);
+            level = typed;
+            let mut next = Vec::new();
+            for &at in &level {
+                next.extend(self.fresh_callees(cx, at, &mut seen));
+            }
+            members.append(&mut level);
+            level = next;
+        }
+        members
+    }
+
+    /// The functions that function `at` calls, declared, that have no code, were not left to their first call, and are not in `seen`, which takes them.
+    fn fresh_callees(&mut self, cx: &Context<'_>, at: usize, seen: &mut HashSet<usize>) -> Vec<usize> {
+        let callees: Vec<Instance> = calls(cx, &self.reached.list[at].1).collect();
+        let mut fresh = Vec::new();
+        for callee in callees {
+            let callee = self.declare(callee);
+            if !self.compiled.contains(&callee) && !self.tried.contains(&callee) && seen.insert(callee) {
+                fresh.push(callee);
+            }
+        }
+        fresh
+    }
+
+    /// Whether every function that function `at` calls is inferred, so lowering it reaches no function without a body.
+    fn callees_typed(&self, cx: &Context<'_>, at: usize) -> bool {
+        calls(cx, &self.reached.list[at].1).all(|callee| self.reached.index.get(&callee).is_some_and(|&callee| !self.reached.is_untyped(callee)))
     }
 
     /// Infers, lowers and encodes function `index` unless it has code, and returns its code.

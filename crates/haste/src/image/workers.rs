@@ -30,11 +30,13 @@ type WorkerOutput = (Pass, Vec<(usize, String)>, Vec<usize>, Vec<(Instance, u32)
 /// How a pass compiles its buckets: the dictionary configuration, and whether a bucket of one function compiles alone.
 type Plan = (DictConfig, bool);
 
-fn bucket_work(reached: &Reached, work: &[usize]) -> Vec<Vec<usize>> {
+/// The functions of `work` grouped by item, in the order each item first appears.
+pub(super) fn bucket_work(reached: &Reached, work: &[usize]) -> Vec<Vec<usize>> {
     bucket_by_item(work, |index| reached.list[index].0.0)
 }
 
-fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
+/// The chunks of `buckets` dealt into at most `jobs` shards of about equal function counts.
+pub(super) fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
     let chunks = lpt_chunks(buckets, MAX_BUCKET);
     let count = jobs.min(chunks.len());
     let mut loads = vec![0usize; count];
@@ -138,7 +140,7 @@ impl Image {
         let mut deferred = Vec::new();
         for wave in 0..MAX_PARALLEL_WAVES {
             let forks: Vec<Context<'_>> = current_shards.iter().map(|_| cx.fork()).collect();
-            let outputs = self.run_workers(forks, reached, &current_shards, plan);
+            let outputs = self.run_shards(forks, &current_shards, |fork, shard| self.worker_loop(fork, reached, shard, plan));
             deferred.clear();
             let mut eval_requests = Vec::new();
             for (shard, output) in current_shards.iter().zip(outputs) {
@@ -183,9 +185,11 @@ impl Image {
         lost.collect()
     }
 
-    fn run_workers<'a>(&self, forks: Vec<Context<'a>>, reached: &Reached, shards: &[Vec<Vec<usize>>], plan: Plan) -> Vec<Option<WorkerOutput>> {
+    /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, and gives what each thread returned, or `None` for one that panicked.
+    pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Option<T>> {
+        let work = &work;
         std::thread::scope(|scope| {
-            let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || self.worker_loop(fork, reached, shard, plan))).collect();
+            let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || work(fork, shard))).collect();
             handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
         })
     }
@@ -445,7 +449,7 @@ impl Image {
                             continue;
                         }
                     };
-                    let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+                    let symbols = self.symbols(&relocs);
                     if let Some(hit) = self.reuse_cached((item, footprint), index, &symbols, self.backend.is_aot().then_some(&relocs), pass)
                         && cfg.verify
                     {
@@ -708,7 +712,7 @@ impl Image {
             let inst = DistinctInst { leader: index, followers: Vec::new(), symbols: Vec::new(), relocs: Some(relocs.clone()) };
             (InstanceKey::Relocs(relocs), inst)
         } else {
-            let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+            let symbols = self.symbols(&relocs);
             let key = InstanceKey::Syms(symbols.clone());
             let inst = DistinctInst { leader: index, followers: Vec::new(), symbols, relocs: self.backend.is_aot().then_some(relocs) };
             (key, inst)

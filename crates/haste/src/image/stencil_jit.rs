@@ -4,16 +4,109 @@ use std::sync::atomic::Ordering;
 use anyhow::{Result, bail};
 use haste_codegen::{Code, DictTierUp, Site};
 
-use crate::lower::{self, FootprintId, Slots};
+use crate::lower::{self, FootprintId, RelocPlan, RelocVec, Slots, SymbolSource};
 use crate::names::ItemRef;
 use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
 use super::stencil::{DictConfig, FirstJit, FirstJitState, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
+use super::workers::{bucket_work, lpt_shards};
 use super::{Image, Pass, stub};
 
+/// What a worker made ahead for one function of a lazy batch, each part only when its making asked for nothing: its footprint, its encoded stencil, and its relocations under the plan they follow.
+pub(super) struct Ready {
+    footprint: Option<FootprintId>,
+    code: Option<Arc<Code>>,
+    relocs: Option<(Arc<RelocPlan>, RelocVec)>,
+}
+
+/// A function's encoded stencil, its relocations, and their plan.
+type Lowered = (Arc<Code>, RelocVec, Arc<RelocPlan>);
+
 impl Image {
+    /// Compiles the inferred functions `work` of a lazy image, lowering and encoding them on every core first, and gives the code of each that compiled; one that did not keeps its stub and its slot.
+    pub(super) fn compile_batch(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize]) -> Vec<(usize, usize)> {
+        let mut work = work.to_vec();
+        work.sort_unstable();
+        let shards = lpt_shards(bucket_work(reached, &work), crate::jobs());
+        let forks = shards.iter().map(|_| cx.fork()).collect();
+        let made = self.run_shards(forks, &shards, |mut fork, shard| shard.iter().flat_map(|bucket| self.ready_bucket(&mut fork, reached, bucket)).collect::<Vec<_>>());
+        self.pass.ready = made.into_iter().flatten().flatten().collect();
+        work.retain(|index| self.pass.ready.contains_key(index));
+        let compiled = work.into_iter().filter_map(|index| self.compile_one(cx, reached, index).ok().map(|code| (index, code))).collect();
+        self.pass.ready.clear();
+        self.take_wanted();
+        compiled
+    }
+
+    /// What a worker makes ahead for the functions `bucket` of one item: relocations under a plan that a template or an earlier function of the bucket already has, else a lowered and encoded stencil.
+    fn ready_bucket(&self, cx: &mut Context<'_>, reached: &Reached, bucket: &[usize]) -> Vec<(usize, Ready)> {
+        let mut plans: rustc_hash::FxHashMap<FootprintId, Arc<RelocPlan>> = rustc_hash::FxHashMap::default();
+        let mut made = Vec::new();
+        for &index in bucket {
+            let item = reached.list[index].0.0;
+            let footprint = self.quietly(cx, |cx| lower::eval_footprint(cx, reached, self, index).ok());
+            let plan = footprint.and_then(|fp| self.pass.stencils.jit_templates.get(&(item, fp)).map(|template| Arc::clone(&template.reloc_plan)).or_else(|| plans.get(&fp).cloned()));
+            let ready = match plan {
+                Some(plan) => Ready { footprint, code: None, relocs: self.quietly(cx, |cx| lower::eval_relocs(cx, reached, self, &plan, index).ok()).map(|relocs| (plan, relocs)) },
+                None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target()).ok()?, out.relocs, out.reloc_plan))) {
+                    Some((code, relocs, plan)) => {
+                        if let Some(fp) = footprint {
+                            plans.insert(fp, Arc::clone(&plan));
+                        }
+                        Ready { footprint, code: Some(Arc::new(code)), relocs: Some((plan, relocs)) }
+                    }
+                    None => continue,
+                },
+            };
+            if ready.relocs.is_some() {
+                made.push((index, ready));
+            }
+        }
+        self.bodies.trim_transient();
+        made
+    }
+
+    /// What `run` gives on `cx`, when it noted no unreached function, asked for nothing and deferred no constant evaluation.
+    fn quietly<'a, T>(&self, cx: &mut Context<'a>, run: impl FnOnce(&mut Context<'a>) -> Option<T>) -> Option<T> {
+        let mark = (self.wanted_len(), cx.quiet_mark());
+        run(cx).filter(|_| (self.wanted_len(), cx.quiet_mark()) == mark)
+    }
+
+    /// The values of the relocations `relocs` in this image.
+    pub(super) fn symbols(&self, relocs: &[SymbolSource]) -> Vec<u64> {
+        relocs.iter().map(|sym| self.symbol_value(sym)).collect()
+    }
+
+    /// The footprint of function `index`: the one a worker made ahead, or a fresh one.
+    fn footprint(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &Pass) -> Result<FootprintId> {
+        match pass.ready.get(&index).and_then(|ready| ready.footprint) {
+            Some(footprint) => Ok(footprint),
+            None => lower::eval_footprint(cx, reached, self, index),
+        }
+    }
+
+    /// The relocations of function `index` under `plan`: the ones a worker made ahead under that same plan, or fresh ones.
+    fn relocs(&self, cx: &mut Context<'_>, reached: &Reached, plan: &Arc<RelocPlan>, index: usize, pass: &Pass) -> Result<RelocVec> {
+        match pass.ready.get(&index).and_then(|ready| ready.relocs.as_ref()).filter(|(made, _)| Arc::ptr_eq(made, plan)) {
+            Some((_, relocs)) => Ok(relocs.clone()),
+            None => lower::eval_relocs(cx, reached, self, plan, index),
+        }
+    }
+
+    /// Function `index` lowered and encoded: what a worker made ahead, or a fresh lowering that fails when it noted an unreached function since `wanted0`.
+    fn lowered(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, wanted0: usize, pass: &Pass) -> Result<Lowered> {
+        if let Some(Ready { code: Some(code), relocs: Some((plan, relocs)), .. }) = pass.ready.get(&index) {
+            return Ok((Arc::clone(code), relocs.clone(), Arc::clone(plan)));
+        }
+        let out = lower::lower_stencil(cx, reached, self, index)?;
+        if self.wanted_len() > wanted0 {
+            bail!("unreached inline callee");
+        }
+        Ok((Arc::new(haste_codegen::compile(out.func, &self.compile_target())?), out.relocs, out.reloc_plan))
+    }
+
     pub(super) fn compile_jit_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<usize> {
         let cfg = pass.stencils.cfg;
         let item = reached.list[index].0.0;
@@ -30,18 +123,14 @@ impl Image {
     fn try_first_jit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, pass: &mut Pass) -> Result<Option<usize>> {
         match pass.stencils.first_jit.get(&item).cloned() {
             None => {
-                let out = lower::lower_stencil(cx, reached, self, index)?;
-                if self.wanted_len() > wanted0 {
-                    bail!("unreached inline callee");
-                }
-                let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-                let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target())?);
+                let (code, relocs, reloc_plan) = self.lowered(cx, reached, index, wanted0, pass)?;
+                let symbols = self.symbols(&relocs);
                 let exec = pass.memory.write_patched(&code, &symbols)?;
-                pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan: out.reloc_plan }));
+                pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan }));
                 Ok(Some(exec))
             }
             Some(FirstJitState::First(first)) => {
-                let fp1 = lower::eval_footprint(cx, reached, self, first.index)?;
+                let fp1 = self.footprint(cx, reached, first.index, pass)?;
                 if self.wanted_len() > wanted0 {
                     bail!("unreached inline callee");
                 }
@@ -55,26 +144,22 @@ impl Image {
     }
 
     fn compile_jit_cached(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, cfg: DictConfig, pass: &mut Pass) -> Result<usize> {
-        let footprint = lower::eval_footprint(cx, reached, self, index)?;
+        let footprint = self.footprint(cx, reached, index, pass)?;
         if self.wanted_len() > wanted0 {
             bail!("unreached inline callee");
         }
         let existing_plan = pass.stencils.jit_templates.get(&(item, footprint)).map(|jt| Arc::clone(&jt.reloc_plan));
         let (symbols, prelowered) = match existing_plan {
             Some(plan) => {
-                let relocs = lower::eval_relocs(cx, reached, self, &plan, index)?;
+                let relocs = self.relocs(cx, reached, &plan, index, pass)?;
                 if self.wanted_len() > wanted0 {
                     bail!("unreached inline callee");
                 }
-                (relocs.iter().map(|sym| self.symbol_value(sym)).collect::<Vec<u64>>(), None)
+                (self.symbols(&relocs), None)
             }
             None => {
-                let out = lower::lower_stencil(cx, reached, self, index)?;
-                if self.wanted_len() > wanted0 {
-                    bail!("unreached inline callee");
-                }
-                let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-                (symbols, Some(out))
+                let (code, relocs, plan) = self.lowered(cx, reached, index, wanted0, pass)?;
+                (self.symbols(&relocs), Some((code, plan)))
             }
         };
         let alias_key = (item, footprint, symbols.clone());
@@ -104,17 +189,19 @@ impl Image {
         Ok(exec)
     }
 
-    fn ensure_jit_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, key: (ItemRef, FootprintId), prelowered: Option<lower::StencilOutput>, pass: &mut Pass) -> Result<Arc<Code>> {
+    fn ensure_jit_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, key: (ItemRef, FootprintId), prelowered: Option<(Arc<Code>, Arc<RelocPlan>)>, pass: &mut Pass) -> Result<Arc<Code>> {
         if let Some(entry) = pass.stencils.jit_templates.get_mut(&key) {
             entry.fanout += 1;
             return Ok(entry.stencil.clone());
         }
-        let out = match prelowered {
-            Some(out) => out,
-            None => lower::lower_stencil(cx, reached, self, index)?,
+        let (stencil, reloc_plan) = match prelowered {
+            Some(pair) => pair,
+            None => {
+                let (code, _, plan) = self.lowered(cx, reached, index, usize::MAX, pass)?;
+                (code, plan)
+            }
         };
-        let stencil = Arc::new(haste_codegen::compile(out.func, &self.compile_target())?);
-        pass.stencils.jit_templates.insert(key, JitTemplate { stencil: stencil.clone(), dict: None, fanout: 1, reloc_plan: out.reloc_plan });
+        pass.stencils.jit_templates.insert(key, JitTemplate { stencil: stencil.clone(), dict: None, fanout: 1, reloc_plan });
         Ok(stencil)
     }
 

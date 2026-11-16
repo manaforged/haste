@@ -11,6 +11,9 @@ use super::Context;
 use super::infer::{LazyTables, Res, Shape, Typed, infer, register};
 use super::substs::Substs;
 mod filter;
+mod wave;
+
+pub use wave::infer_quiet;
 
 use filter::{ReachFilter, collect_filtered_callees, commit_filter_caller, pre_collect_callees};
 use super::ty::{Kind, Ty};
@@ -528,10 +531,8 @@ fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
 }
 
 fn run_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], check_undeclared: bool, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
-    let jobs = crate::jobs().max(1);
-    let batch = (wave.len() / jobs).clamp(1, MAX_WORKER_BATCH);
-    let workers = jobs.min(wave.len().div_ceil(batch));
-    if workers <= 1 || wave.len() < MIN_PARALLEL_WAVE {
+    let workers = wave::wave_workers(wave.len());
+    if workers <= 1 {
         return serial_wave(cx, reached, wave, check_undeclared, force_commit);
     }
     parallel_wave(cx, reached, wave, workers, check_undeclared, force_commit)
@@ -644,7 +645,7 @@ fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reach
 }
 
 fn worker_loop(cx: &mut Context<'_>, reached: &Reached, wave: &[usize], next: &AtomicUsize, check_undeclared: bool) -> Vec<WaveItem> {
-    let batch = (wave.len() / crate::jobs().max(1)).clamp(1, MAX_WORKER_BATCH);
+    let batch = wave::wave_batch(wave.len());
     let mut items = Vec::new();
     loop {
         let start = next.fetch_add(batch, Ordering::Relaxed);
