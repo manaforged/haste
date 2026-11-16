@@ -335,6 +335,11 @@ fn simplify_1_bool(cx: &mut RewriteCx, res: Option<Value>, c: Value, b1: bool, b
     }
 }
 
+fn emit_bool_not(cx: &mut RewriteCx, v: Value) -> Value {
+    let one = cx.emit(Type::I8, Op::Const(1));
+    cx.emit(Type::I8, Op::Binary(Binary::Bxor, v, one))
+}
+
 fn eval_const_select_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Option<Op>> {
     let ty = cx.func.ty(x);
     for (norm, sel_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
@@ -351,27 +356,13 @@ fn eval_const_select_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: V
             && let (Some(k2), Some(k3)) = (cx.sconst(t2), cx.sconst(f2))
         {
             let (b1, b2, b3) = (eval(k1), eval(k2), eval(k3));
-            if b2 == b3 {
-                return Some(simplify_1_bool(cx, res, c1, b1, b2));
-            }
+            if b2 == b3 { return Some(simplify_1_bool(cx, res, c1, b1, b2)); }
             let Some(c2) = bool_cond(cx, raw_c2) else { continue };
             return Some(Some(match (b1, b2, b3) {
-                (false, false, true) => {
-                    let or = cx.emit(Type::I8, Op::Binary(Binary::Bor, c1, c2));
-                    let one = cx.emit(Type::I8, Op::Const(1));
-                    Op::Binary(Binary::Bxor, or, one)
-                }
+                (false, false, true) => { let or = cx.emit(Type::I8, Op::Binary(Binary::Bor, c1, c2)); let one = cx.emit(Type::I8, Op::Const(1)); Op::Binary(Binary::Bxor, or, one) }
                 (true, true, false) => Op::Binary(Binary::Bor, c1, c2),
-                (false, true, false) => {
-                    let one = cx.emit(Type::I8, Op::Const(1));
-                    let nc1 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c1, one));
-                    Op::Binary(Binary::Band, nc1, c2)
-                }
-                _ => {
-                    let one = cx.emit(Type::I8, Op::Const(1));
-                    let nc2 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c2, one));
-                    Op::Binary(Binary::Bor, c1, nc2)
-                }
+                (false, true, false) => { let nc1 = emit_bool_not(cx, c1); Op::Binary(Binary::Band, nc1, c2) }
+                _ => { let nc2 = emit_bool_not(cx, c2); Op::Binary(Binary::Bor, c1, nc2) }
             }));
         }
         if let (Some(t_inst), Some(k3)) = (cx.def(t1), cx.sconst(f1))
@@ -379,27 +370,13 @@ fn eval_const_select_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: V
             && let (Some(k1), Some(k2)) = (cx.sconst(t2), cx.sconst(f2))
         {
             let (b1, b2, b3) = (eval(k1), eval(k2), eval(k3));
-            if b1 == b2 {
-                return Some(simplify_1_bool(cx, res, c1, b1, b3));
-            }
+            if b1 == b2 { return Some(simplify_1_bool(cx, res, c1, b1, b3)); }
             let Some(c2) = bool_cond(cx, raw_c2) else { continue };
             return Some(Some(match (b1, b2, b3) {
                 (true, false, false) => Op::Binary(Binary::Band, c1, c2),
-                (false, true, false) => {
-                    let one = cx.emit(Type::I8, Op::Const(1));
-                    let nc2 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c2, one));
-                    Op::Binary(Binary::Band, c1, nc2)
-                }
-                (true, false, true) => {
-                    let one = cx.emit(Type::I8, Op::Const(1));
-                    let nc1 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c1, one));
-                    Op::Binary(Binary::Bor, nc1, c2)
-                }
-                _ => {
-                    let and = cx.emit(Type::I8, Op::Binary(Binary::Band, c1, c2));
-                    let one = cx.emit(Type::I8, Op::Const(1));
-                    Op::Binary(Binary::Bxor, and, one)
-                }
+                (false, true, false) => { let nc2 = emit_bool_not(cx, c2); Op::Binary(Binary::Band, c1, nc2) }
+                (true, false, true) => { let nc1 = emit_bool_not(cx, c1); Op::Binary(Binary::Bor, nc1, c2) }
+                _ => { let and = cx.emit(Type::I8, Op::Binary(Binary::Band, c1, c2)); let one = cx.emit(Type::I8, Op::Const(1)); Op::Binary(Binary::Bxor, and, one) }
             }));
         }
     }
@@ -694,6 +671,27 @@ fn fold_correlated_select(func: &Function, facts: &BoolFacts, param_of: &[Option
     true
 }
 
+fn fold_shifted_select(func: &mut Function, facts: &BoolFacts, seen: &mut Vec<(Value, Type, Value, u64, u64)>, out: &mut Vec<Inst>, inst: Inst) -> bool {
+    let Op::Select(cond, t_val, f_val) = func.insts[inst.index()].op else { return false };
+    let Some(res) = func.insts[inst.index()].result else { return false };
+    let ty = func.ty(res);
+    if !ty.is_small_int() { return false; }
+    let (Some(ca), Some(cb)) = (facts.consts.get(t_val.index()).copied().flatten(), facts.consts.get(f_val.index()).copied().flatten()) else { return false };
+    let (a_u, b_u) = (extend(ca, ty, false) as u64, extend(cb, ty, false) as u64);
+    if a_u == b_u { return false; }
+    let w = ty.unsigned_max();
+    if let Some((base_sel, shift)) = seen.iter().find_map(|&(c, st, r1, a1, b1)| {
+        (c == cond && st == ty).then(|| (1_u32..=4).find(|&k| ((a1 << k) & w) == a_u && ((b1 << k) & w) == b_u).map(|k| (r1, k))).flatten()
+    }) {
+        let shift_val = func.value(ty);
+        out.push(func.add(Op::Const(i64::from(shift)), Some(shift_val)));
+        func.insts[inst.index()].op = Op::Binary(Binary::Ishl, base_sel, shift_val);
+        return true;
+    }
+    seen.push((cond, ty, res, a_u, b_u));
+    false
+}
+
 /// Folds `x ^ 1` / `x ^ y` in `select` and `brif` conditions, eliminates correlated join-param selects, and sinks single-use compares toward their branch.
 pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
     let facts = BoolFacts::collect(func);
@@ -705,10 +703,13 @@ pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
     for b_idx in 0..func.blocks.len() {
         let insts = std::mem::take(&mut func.blocks[b_idx].insts);
         let self_last = insts.last().copied();
-        let mut out = Vec::with_capacity(insts.len());
+        let (mut out, mut seen_sels) = (Vec::with_capacity(insts.len()), Vec::new());
         for inst in insts {
             changed |= fold_bxor_select(func, &facts, &mut out, inst) || fold_bxor_brif(func, &facts, &mut out, inst);
-            if !fold_correlated_select(func, &facts, &param_of, (&mut defs, &mut subst), (b_idx, self_last, inst)) { out.push(inst); }
+            if !fold_correlated_select(func, &facts, &param_of, (&mut defs, &mut subst), (b_idx, self_last, inst)) {
+                changed |= fold_shifted_select(func, &facts, &mut seen_sels, &mut out, inst);
+                out.push(inst);
+            }
         }
         func.blocks[b_idx].insts = out;
     }
