@@ -40,6 +40,9 @@ pub struct Reached {
     /// The bodies whose types have no layout yet, which lowering would fail on.
     pub unlaid: Vec<String>,
     calls: Vec<Vec<usize>>,
+    indirect: Vec<Vec<usize>>,
+    call_sites: Vec<u8>,
+    pinned: Vec<bool>,
     states: Vec<ReachedEntry>,
     untyped_count: usize,
     filter: ReachFilter,
@@ -125,53 +128,42 @@ impl Reached {
         self.calls.get(index).map(Vec::as_slice)
     }
 
+    /// Whether reached function `index` has exactly one static direct call site and no indirect or root entry.
+    pub(crate) fn is_sole_called(&self, index: usize) -> bool {
+        self.call_sites.get(index).copied() == Some(1)
+    }
+
+    fn pin_roots(&mut self, roots: &[Instance]) {
+        self.pinned.resize(self.list.len(), false);
+        for inst in roots {
+            if let Some(&id) = self.index.get(inst) { self.pinned[id] = true; }
+        }
+    }
+
     fn link(&mut self, indices: &[usize]) {
         self.calls.resize(self.list.len(), Vec::new());
+        self.indirect.resize(self.list.len(), Vec::new());
         let workers = crate::jobs().min(indices.len() / 256);
+        let edges = |at: usize| self.list[at].1.as_ref().map(|t| t.collect_link_edges(&self.index)).unwrap_or_default();
         if workers <= 1 {
-            for &at in indices {
-                self.calls[at] = self.list[at].1.as_ref().map(|typed| collect_link_callees(typed, &self.index)).unwrap_or_default();
-            }
-            return;
-        }
-        let next = AtomicUsize::new(0);
-        let worker = || {
-            let mut local = Vec::new();
-            loop {
-                let start = next.fetch_add(256, Ordering::Relaxed);
-                let Some(slice) = indices.get(start..) else { return local };
-                for &at in &slice[..slice.len().min(256)] {
-                    local.push((at, self.list[at].1.as_ref().map(|t| collect_link_callees(t, &self.index)).unwrap_or_default()));
+            for &at in indices { (self.calls[at], self.indirect[at]) = edges(at); }
+        } else {
+            let next = AtomicUsize::new(0);
+            let worker = || {
+                let mut local = Vec::new();
+                while let Some(slice) = indices.get(next.fetch_add(256, Ordering::Relaxed)..) {
+                    for &at in &slice[..slice.len().min(256)] { local.push((at, edges(at))); }
                 }
-            }
-        };
-        let (own, joined) = std::thread::scope(|scope| {
-            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker)).collect();
-            let own = worker();
-            let joined: Vec<_> = handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect();
-            (own, joined)
-        });
-        for (at, callees) in own.into_iter().chain(joined) {
-            self.calls[at] = callees;
+                local
+            };
+            let (own, joined) = std::thread::scope(|scope| {
+                let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker)).collect();
+                (worker(), handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect::<Vec<_>>())
+            });
+            for (at, (c, i)) in own.into_iter().chain(joined) { (self.calls[at], self.indirect[at]) = (c, i); }
         }
+        super::infer::recount_call_sites(self.list.len(), |at| self.states[at] == ReachedEntry::Settled, &self.calls, &self.indirect, &self.pinned, &mut self.call_sites);
     }
-}
-
-fn collect_link_callees(typed: &Typed, index: &HashMap<Instance, usize>) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut push = |inst: Instance| if let Some(&id) = index.get(&inst) { out.push(id); };
-    match &typed.tables {
-        LazyTables::CheckOnly(check) => {
-            check.calls().for_each(&mut push);
-            push_tail_calls(typed, &mut push);
-        }
-        LazyTables::Poly(poly) => {
-            poly.calls().for_each(&mut push);
-            push_tail_calls(typed, &mut push);
-        }
-        LazyTables::Eager(_) => typed.calls().for_each(push),
-    }
-    out
 }
 
 pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
@@ -194,6 +186,7 @@ pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
 pub fn reach_wave(cx: &mut Context<'_>, reached: &mut Reached, roots: &[Instance], force_commit: bool) {
     let mut initial = reached.take_blocked();
     initial.extend(enqueue(reached, roots.to_vec()));
+    reached.pin_roots(roots);
     let settled = drain_wave(cx, reached, initial, force_commit);
     reached.link(&settled);
 }
@@ -265,6 +258,7 @@ pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], r
     }
     reached.link(dead);
     let found = drain(cx, reached, roots.to_vec());
+    reached.pin_roots(roots);
     reached.link(&found);
     found
 }

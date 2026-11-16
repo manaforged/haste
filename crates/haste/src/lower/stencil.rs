@@ -119,6 +119,7 @@ struct TemplateKey {
     limit: usize,
     low: bool,
     compact: bool,
+    sole: bool,
 }
 
 struct InlineTemplate {
@@ -295,6 +296,7 @@ fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slot
     inline.stack.push(index);
     let saved = std::mem::take(&mut inline.host);
     inline.host.compact = compact;
+    inline.host.sole = reached.is_sole_called(index);
     let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, shape_only, &quiet));
     inline.host = saved;
     inline.pop(depth);
@@ -465,14 +467,14 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let fp_h = std::mem::replace(&mut inline.max_callee_height, 0);
     let fp_sz = std::mem::replace(&mut inline.max_callee_size, 0);
     let Some((footprint, fp_cycle)) = quiet.lowered(slots, fp_res)? else { return Ok((None, usize::MAX)) };
-    let key = TemplateKey { item, footprint, limit, low: slots.low_entries(), compact: inline.host.compact };
+    let key = TemplateKey { item, footprint, limit, low: slots.low_entries(), compact: inline.host.compact, sole: reached.is_sole_called(index) };
     if let Some(template) = slots.bodies().templates.get(&key) {
         tally(Tally::Hit);
         return Ok((template.map(|t| (footprint, Found::Body(t, None))), fp_cycle));
     }
     tally(Tally::Miss);
     let depth = inline.stack.len().saturating_sub(1);
-    let disk = if key.compact { None } else { slots.bodies().disk(cx, &key) };
+    let disk = if key.compact || key.sole { None } else { slots.bodies().disk(cx, &key) };
     let servable = shape_only && fp_cycle > depth;
     if servable && let Some(shape) = disk.as_ref().and_then(persist::Disk::hit) {
         return Ok((shape.map(|(returns, height, size)| (footprint, Found::Shape(returns, height, size))), fp_cycle));

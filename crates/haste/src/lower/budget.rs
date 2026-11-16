@@ -33,6 +33,10 @@ const RELEASE_BUDGET: Budget = Budget { insts: 500, inline_insts: 900, always: 1
 
 const CYCLE_BUDGET: usize = 12;
 
+const SOLE_INLINE_INSTS: usize = 1600;
+
+const SOLE_OUTLINE: usize = 64;
+
 /// The budget of the build profile.
 fn budget() -> &'static Budget {
     match crate::profile() {
@@ -184,11 +188,15 @@ fn body_item(reached: &Reached, index: usize) -> Option<ItemRef> {
     }
 }
 
+fn callee_hint(cx: &Context<'_>, reached: &Reached, index: usize) -> Option<Hint> {
+    body_item(reached, index).map(|item| hint(cx, item))
+}
+
 /// The limit the compact form of reached function `index` is measured against, when `limit` is the release budget of an `#[inline]` body.
 pub(super) fn compact_limit(cx: &Context<'_>, reached: &Reached, index: usize, limit: usize) -> Option<usize> {
     let budget = budget();
     let hinted = release() && limit == budget.inline_insts && body_item(reached, index).is_some_and(|item| hint(cx, item) == Hint::Inline);
-    hinted.then_some(budget.always)
+    hinted.then(|| if reached.is_sole_called(index) { SOLE_INLINE_INSTS } else { budget.always })
 }
 
 /// The form of reached function `index` before its callees count: a loop when its source body holds one.
@@ -197,29 +205,48 @@ pub(super) fn own_form(cx: &mut Context<'_>, reached: &Reached, index: usize) ->
     if loops { Form::Loop } else { Form::Lean }
 }
 
-fn bulky(cx: &Context<'_>, reached: &Reached, index: usize, callee: &InlinedCallee) -> bool {
-    callee.form != Form::Lean && usize::from(callee.size) > budget().outline && body_item(reached, index).is_some_and(|item| hint(cx, item) == Hint::Default)
+fn callee_bulky(cx: &Context<'_>, reached: &Reached, index: usize, callee: &InlinedCallee, sole: bool) -> (bool, Option<Hint>) {
+    let hint = callee_hint(cx, reached, index);
+    if !sole {
+        let bulky = callee.form != Form::Lean && usize::from(callee.size) > budget().outline && hint == Some(Hint::Default);
+        return (bulky, hint);
+    }
+    let outline = budget().outline.min(SOLE_OUTLINE);
+    let bulky = callee.form != Form::Lean && usize::from(callee.size) > outline && matches!(hint, Some(Hint::Default | Hint::Inline));
+    (bulky, hint)
 }
 
-/// What the inline body being lowered copies: whether it is the compact form, the densest form among its callees, whether a compact form is worth lowering, and its bulky callees.
+/// What the inline body being lowered copies: whether it is the compact form, whether the host has one caller, the densest form among its callees, whether a compact form is worth lowering, and its bulky callees.
 #[derive(Default)]
 pub struct Copies {
     pub compact: bool,
+    pub sole: bool,
     pub seen: Form,
     pub retry: bool,
     bulky: Vec<usize>,
 }
 
 impl Copies {
-    /// Records the copy `callee` of reached function `index` and returns whether the body takes it: a compact body leaves a bulky callee out of line.
+    fn repeated(&self, index: usize) -> bool {
+        self.bulky.iter().filter(|&&at| at == index).count() >= budget().copies
+    }
+
+    fn compact_drop(&self, index: usize, hint: Option<Hint>) -> bool {
+        if !self.sole {
+            return true;
+        }
+        hint == Some(Hint::Default) || (!self.bulky.is_empty() && self.repeated(index))
+    }
+
+    /// Records the copy `callee` of reached function `index` and returns whether the body takes it: a compact body leaves bulky callees out of line.
     pub(super) fn takes(&mut self, cx: &Context<'_>, reached: &Reached, index: usize, callee: &InlinedCallee) -> bool {
-        let bulky = bulky(cx, reached, index, callee);
-        if bulky && self.compact {
+        let (bulky, hint) = callee_bulky(cx, reached, index, callee, self.sole);
+        if bulky && self.compact && self.compact_drop(index, hint) {
             return false;
         }
-        if bulky {
+        if bulky && !self.compact {
             self.bulky.push(index);
-            self.retry |= self.bulky.iter().filter(|&&at| at == index).count() >= budget().copies;
+            self.retry |= self.repeated(index);
         }
         self.retry |= callee.form == Form::Compact;
         self.seen = self.seen.max(if bulky { Form::Dense } else { callee.form });
