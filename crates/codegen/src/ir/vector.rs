@@ -173,6 +173,14 @@ pub enum TargetOpId {
     X64ClmulLowHigh,
     /// `pclmulqdq` with immediate 0x11: the carry-less product of the high quadwords of both operands.
     X64ClmulHighHigh,
+    /// `adc` of two `I64`s after an `I8` carry in: the `I64` sum.
+    X64AddCarry,
+    /// `adc` of two `I64`s after an `I8` carry in: the `I8` carry out.
+    X64AddCarryOut,
+    /// `sbb` of two `I64`s after an `I8` borrow in: the `I64` difference.
+    X64SubBorrow,
+    /// `sbb` of two `I64`s after an `I8` borrow in: the `I8` borrow out.
+    X64SubBorrowOut,
 }
 
 impl IntCC {

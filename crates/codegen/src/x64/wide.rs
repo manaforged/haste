@@ -1,6 +1,7 @@
 use super::Emit;
+use crate::frame::Ext;
 use super::asm::{Alu, Cond, Count, Group3, Reg, Shift, Size};
-use crate::ir::{Binary, IntCC, Unary, Value};
+use crate::ir::{Binary, IntCC, TargetOpId, Unary, Value};
 use crate::wide::half_score;
 
 /// The registers 128-bit rotates use as scratch besides rax, rcx and rdx.
@@ -28,6 +29,34 @@ fn icmp_order(cc: IntCC) -> (bool, Cond) {
 }
 
 impl Emit<'_> {
+    /// Adds or subtracts `a` and `b` after the carry in `args[0]` by `adc` or `sbb` into `result`: the sum, or the carry out, which reads the flags of a sum of the same operands emitted just before.
+    pub(super) fn carry_chain(&mut self, id: TargetOpId, args: [Value; 3], result: Value) {
+        let add = matches!(id, TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut);
+        let out = matches!(id, TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrowOut);
+        if !(out && self.carry_flags == Some((add, args))) {
+            let [carry, a, b] = args;
+            self.get(Reg::Rdx, carry, Ext::Zero);
+            self.get(Reg::Rax, a, Ext::Zero);
+            let source = self.reg_of(b).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)).unwrap_or_else(|| {
+                self.get(Reg::Rcx, b, Ext::Zero);
+                Reg::Rcx
+            });
+            self.asm.alu_imm_sized(Size::B, Alu::Add, Reg::Rdx, -1);
+            self.asm.alu(if add { Alu::Adc } else { Alu::Sbb }, Reg::Rax, source);
+            self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
+        }
+        self.flags = None;
+        if !out {
+            self.carry_flags = Some((add, args));
+            self.put(result, Reg::Rax);
+            return;
+        }
+        let dst = self.dst(result);
+        self.asm.setcc(Cond::B, dst);
+        self.asm.load(Size::B, dst, dst);
+        self.put(result, dst);
+    }
+
     fn const_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
         crate::wide::const_halves(self.func, &self.plan, &self.defs, v)
     }

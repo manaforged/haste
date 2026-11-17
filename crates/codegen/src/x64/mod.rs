@@ -19,7 +19,7 @@ use frame::{Abi, Loc, SAVED, SAVED_RBP, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, TargetOpId, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{CallAbi, Target};
@@ -120,6 +120,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         in_shrink_entry: false,
         in_fast_ret: false,
         low_product: None,
+        carry_flags: None,
         tails: Tails::new(),
     };
     drive(emit, &order)
@@ -188,6 +189,7 @@ pub(super) struct Emit<'a> {
     in_shrink_entry: bool,
     in_fast_ret: bool,
     low_product: Option<(Value, Value)>,
+    carry_flags: Option<(bool, [Value; 3])>,
     tails: Tails<'a, Label>,
 }
 
@@ -275,6 +277,10 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let data = &func.insts[inst.index()];
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
+        let carry_flags = self.carry_flags.take();
+        if matches!(data.op, Op::TargetOp(TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrowOut, _)) {
+            self.carry_flags = carry_flags;
+        }
         if let (Some(low), &Op::Binary(Binary::Imul, x, y), Some(result)) = (self.low_product.take(), &data.op, result)
             && (low == (x, y) || low == (y, x))
             && !(self.is_static(result) || self.plan.deferred[result.index()] || self.plan.elided[result.index()])

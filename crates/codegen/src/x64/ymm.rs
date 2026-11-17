@@ -246,6 +246,10 @@ impl Emit<'_> {
     }
 
     fn wide_target(&mut self, id: TargetOpId, args: &[Value], result: Value) -> Option<Result<(), String>> {
+        if let (TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut, &[carry, a, b]) = (id, args) {
+            self.carry_chain(id, [carry, a, b], result);
+            return Some(Ok(()));
+        }
         if let (TargetOpId::X64Pmovmskb256, &[v]) = (id, args) {
             let dst = self.dst(result);
             let src = self.fin(v, X0);
