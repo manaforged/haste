@@ -10,6 +10,10 @@ fn imm_score((lo, hi): (Option<i64>, Option<i64>), zero_only: bool) -> u8 {
     half_score((lo, hi), zero_only) * 2 + u8::from(lo.is_some()) + u8::from(hi.is_some())
 }
 
+fn half((lo, hi): (Option<i64>, Option<i64>), high: bool) -> Option<i64> {
+    if high { hi } else { lo }
+}
+
 fn icmp_order(cc: IntCC) -> (bool, Cond) {
     match cc {
         IntCC::SignedLessThan => (false, Cond::L),
@@ -221,17 +225,17 @@ impl Emit<'_> {
 
     fn wide_bitwise(&mut self, op: Binary, x: Value, y: Value) {
         let (cx, cy) = (self.known_halves(x), self.known_halves(y));
-        let ((lhs, rhs), (rhs_lo, rhs_hi)) = if imm_score(cx, false) > imm_score(cy, false) {
-            ((y, x), cx)
-        } else {
-            ((x, y), cy)
-        };
-        self.wide_bitwise_half((op, false), (lhs, rhs, rhs_lo), Reg::Rax);
-        self.wide_bitwise_half((op, true), (lhs, rhs, rhs_hi), Reg::Rdx);
+        for (high, reg) in [(false, Reg::Rax), (true, Reg::Rdx)] {
+            let (hx, hy) = (half(cx, high), half(cy, high));
+            let (lhs, rhs, rhs_c) = if imm_score((hx, None), false) > imm_score((hy, None), false) { (y, x, hx) } else { (x, y, hy) };
+            self.wide_bitwise_half((op, high), (lhs, rhs, rhs_c), reg);
+        }
     }
 
     fn alu_rhs_half(&mut self, alu: Alu, (high, reg): (bool, Reg), (rhs, rhs_c): (Value, Option<i64>)) {
-        if let Some(imm) = rhs_c.and_then(|v| i32::try_from(v).ok()) {
+        if matches!(alu, Alu::Cmp) && rhs_c == Some(0) {
+            self.asm.test(reg, reg);
+        } else if let Some(imm) = rhs_c.and_then(|v| i32::try_from(v).ok()) {
             self.asm.alu_imm(alu, reg, imm);
         } else if let Some(imm) = rhs_c {
             self.asm.mov_imm(Reg::Rcx, imm);
@@ -482,15 +486,23 @@ impl Emit<'_> {
             self.alu_rhs_half(Alu::Cmp, (true, Reg::Rdx), (rhs, rc.1));
             return cond;
         }
-        self.halves(lhs);
         if matches!(rc, (Some(-1), Some(-1))) {
-            self.asm.alu(Alu::And, Reg::Rax, Reg::Rdx);
+            self.load_half(false, Reg::Rax, lhs);
+            self.alu_rhs_half(Alu::And, (true, Reg::Rax), (lhs, lc.1));
             self.asm.alu_imm(Alu::Cmp, Reg::Rax, -1);
             return cond;
         }
-        self.xor_icmp_half(false, Reg::Rax, (rhs, rc.0));
-        self.xor_icmp_half(true, Reg::Rdx, (rhs, rc.1));
-        self.asm.alu(Alu::Or, Reg::Rax, Reg::Rdx);
+        let high = rc.0 == Some(0) && rc.1 != Some(0);
+        let (reg, spare) = if high { (Reg::Rdx, Reg::Rax) } else { (Reg::Rax, Reg::Rdx) };
+        self.load_half(high, reg, lhs);
+        self.xor_icmp_half(high, reg, (rhs, half(rc, high)));
+        if half(rc, !high) == Some(0) {
+            self.alu_rhs_half(Alu::Or, (!high, reg), (lhs, half(lc, !high)));
+        } else {
+            self.load_half(!high, spare, lhs);
+            self.xor_icmp_half(!high, spare, (rhs, half(rc, !high)));
+            self.asm.alu(Alu::Or, reg, spare);
+        }
         cond
     }
 
@@ -501,6 +513,10 @@ impl Emit<'_> {
         let (swap, cond) = icmp_order(cc);
         let (a, b) = if swap { (y, x) } else { (x, y) };
         let (ca, cb) = (self.known_halves(a), self.known_halves(b));
+        if ca == (Some(0), Some(0)) && matches!(cond, Cond::B | Cond::Ae) {
+            let eq = if cond == Cond::B { IntCC::NotEqual } else { IntCC::Equal };
+            return self.wide_icmp_eq(eq, b, a);
+        }
         if ca.1 == Some(0) && cb.1 == Some(0) {
             self.load_half(false, Reg::Rax, a);
             self.alu_rhs_half(Alu::Cmp, (false, Reg::Rax), (b, cb.0));
