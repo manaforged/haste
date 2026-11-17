@@ -89,6 +89,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let slow_thunk = asm.label();
     let defs = crate::fold::defs(func);
+    let overflow_read = wide::overflow_reads(func, &defs);
     let last_block = order.last().copied();
     let emit = Emit {
         func,
@@ -120,6 +121,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         in_shrink_entry: false,
         in_fast_ret: false,
         low_product: None,
+        overflow_read,
         carry_flags: None,
         tails: Tails::new(),
     };
@@ -189,6 +191,7 @@ pub(super) struct Emit<'a> {
     in_shrink_entry: bool,
     in_fast_ret: bool,
     low_product: Option<(Value, Value)>,
+    overflow_read: Vec<bool>,
     carry_flags: Option<(bool, [Value; 3])>,
     tails: Tails<'a, Label>,
 }

@@ -215,8 +215,14 @@ impl Emit<'_> {
         }
         if let Some((_, _, left, other, right, invert)) = super::location::adc_plan(self.func, &self.plan, ty, op, (x, y), |v| self.plan.elided[v.index()], |v| self.defs[v.index()]) {
             let cmp_size = Size::of(self.ty(left).bytes());
-            self.emit_cmp_pair(cmp_size, left, right, false);
+            let held = right.is_some_and(|right| self.overflow_held(left, right)) && !self.plan.elided[other.index()] && matches!(self.location(other), Location::Reg(_) | Location::Slot | Location::Imm(_));
+            if !held {
+                self.emit_cmp_pair(cmp_size, left, right, false);
+            }
             self.raw(dst, other);
+            if held && self.asm.held_carry() != Some(super::wide::overflow_tag(left)) {
+                return Err("the carry flag was overwritten before an adc that reads it".to_owned());
+            }
             let (alu_op, imm) = match (op == Binary::Iadd, invert) {
                 (true, false) => (Alu::Adc, 0),
                 (false, false) => (Alu::Sbb, 0),
@@ -289,7 +295,7 @@ impl Emit<'_> {
             if matches!(size, Size::D | Size::Q)
                 && matches!(alu, Alu::Add | Alu::Sub)
                 && !self.plan.fused[result.index()]
-                && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x)).filter(|&rx| rx != dst && rx != Reg::Rsp)
+                && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x)).filter(|&rx| (rx != dst || self.asm.held_carry().is_some()) && rx != Reg::Rsp)
             {
                 let disp = match alu {
                     Alu::Add => self.imm_sized(y, size),
@@ -323,6 +329,9 @@ impl Emit<'_> {
                         self.asm.alu_sized(size, alu, dst, source);
                     }
                 }
+            }
+            if matches!(alu, Alu::Add) && matches!(ty, Type::I32 | Type::I64) && self.overflow_read[result.index()] {
+                self.asm.hold_carry(super::wide::overflow_tag(result));
             }
             if self.plan.fused[result.index()] {
                 self.flags = Some((result, Cond::Ne));

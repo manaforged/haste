@@ -75,6 +75,11 @@ impl Asm {
     }
 
     fn push_zero(&mut self, zero: Zero) {
+        let marks = self.marks();
+        if self.tail.is_some_and(|tail| tail.end == zero.start && tail.marks == marks && matches!(tail.kind, Kind::Carry { .. })) {
+            self.flags_kept(zero.start);
+            return;
+        }
         if let Some(Tail { end, kind: Kind::Zeros { movs, len }, .. }) = self.zeros_at(zero.start)
             && *len < PENDING_ZEROS
         {

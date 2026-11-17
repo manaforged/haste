@@ -1,7 +1,7 @@
 use super::Emit;
 use crate::frame::Ext;
 use super::asm::{Alu, Cond, Count, Group3, Reg, Shift, Size};
-use crate::ir::{Binary, IntCC, TargetOpId, Unary, Value};
+use crate::ir::{Binary, Function, Inst, IntCC, Op, TargetOpId, Type, Unary, Value};
 use crate::wide::half_score;
 
 /// The registers 128-bit rotates use as scratch besides rax, rcx and rdx.
@@ -13,6 +13,35 @@ fn imm_score((lo, hi): (Option<i64>, Option<i64>), zero_only: bool) -> u8 {
 
 fn half((lo, hi): (Option<i64>, Option<i64>), high: bool) -> Option<i64> {
     if high { hi } else { lo }
+}
+
+/// The held-carry tag that says the carry flag equals the 0-or-1 value `v`.
+pub(super) fn carry_tag(v: Value) -> usize {
+    2 * v.index()
+}
+
+/// The held-carry tag that says the carry flag is the unsigned overflow of the add that produced `sum`.
+pub(super) fn overflow_tag(sum: Value) -> usize {
+    2 * sum.index() + 1
+}
+
+/// Marks each 32- or 64-bit sum that an integer compare tests against one of its own operands, which reads the add's carry.
+pub(super) fn overflow_reads(func: &Function, defs: &[Option<Inst>]) -> Vec<bool> {
+    let mut read = vec![false; func.types.len()];
+    let sum_of = |sum: Value, operand: Value| {
+        defs[sum.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Binary(Binary::Iadd, a, b) if a == operand || b == operand))
+            && matches!(func.ty(sum), Type::I32 | Type::I64)
+    };
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if let Op::Icmp(_, x, y) = func.insts[inst.index()].op {
+            for (sum, operand) in [(x, y), (y, x)] {
+                if sum_of(sum, operand) {
+                    read[sum.index()] = true;
+                }
+            }
+        }
+    }
+    read
 }
 
 fn icmp_order(cc: IntCC) -> (bool, Cond) {
@@ -35,7 +64,7 @@ impl Emit<'_> {
         let out = matches!(id, TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrowOut);
         if !(out && self.carry_flags == Some((add, args))) {
             let [carry, a, b] = args;
-            let held = |emit: &Self| emit.asm.held_carry() == Some(carry.index());
+            let held = |emit: &Self| emit.asm.held_carry() == Some(carry_tag(carry));
             let kept = held(self);
             if !kept {
                 self.get(Reg::Rdx, carry, Ext::Zero);
@@ -63,8 +92,14 @@ impl Emit<'_> {
         let dst = self.dst(result);
         self.asm.setcc(Cond::B, dst);
         self.asm.load(Size::B, dst, dst);
-        self.asm.hold_carry(result.index());
+        self.asm.hold_carry(carry_tag(result));
         self.put(result, dst);
+    }
+
+    /// Whether the carry flag still holds `left <u right` from the add that produced `left` from `right` and another operand.
+    pub(super) fn overflow_held(&self, left: Value, right: Value) -> bool {
+        self.asm.held_carry() == Some(overflow_tag(left))
+            && self.defs[left.index()].is_some_and(|inst| matches!(self.func.insts[inst.index()].op, Op::Binary(Binary::Iadd, a, b) if a == right || b == right))
     }
 
     fn const_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
