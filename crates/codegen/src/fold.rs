@@ -605,7 +605,7 @@ impl Fold {
         changed
     }
 
-    /// Replaces each parameter that every edge `edges` lists gives the value of an earlier parameter of its block, or the pair of the two themselves, by that earlier parameter.
+    /// Replaces each parameter that every edge `edges` lists gives the value of an earlier parameter of its block, the pair of the two themselves, or one binary op of that pair with a shared operand, by that earlier parameter.
     fn twins(&mut self, func: &Function, params: &[Value], edges: &[&[Value]]) -> bool {
         let mut changed = false;
         for later in 1..params.len() {
@@ -614,13 +614,20 @@ impl Fold {
             let same = |at: usize| {
                 let first = params[at];
                 self.subst[first.index()] == first && func.ty(first) == func.ty(twin) && edges.iter().all(|args| match (args.get(at), args.get(later)) {
-                    (Some(x), Some(y)) => { let pair = (self.find(*x), self.find(*y)); pair.0 == pair.1 || pair == (first, twin) }
+                    (Some(x), Some(y)) => { let pair = (self.find(*x), self.find(*y)); pair.0 == pair.1 || pair == (first, twin) || self.stepped(func, pair, (first, twin)) }
                     _ => false,
                 })
             };
             if let Some(at) = (0..later).find(|&at| same(at)) { self.subst[twin.index()] = params[at]; changed = true; }
         }
         changed
+    }
+
+    /// Whether `x` and `y` are one binary op applied to `first` and `twin` with the same other operand.
+    fn stepped(&self, func: &Function, (x, y): (Value, Value), (first, twin): (Value, Value)) -> bool {
+        let (Some(&Op::Binary(op, a, c)), Some(&Op::Binary(op2, b, d))) = (self.def(func, x), self.def(func, y)) else { return false };
+        let (a, b, c, d) = (self.find(a), self.find(b), self.find(c), self.find(d));
+        op == op2 && ((a, b) == (first, twin) && c == d || (c, d) == (first, twin) && a == b)
     }
 }
 
