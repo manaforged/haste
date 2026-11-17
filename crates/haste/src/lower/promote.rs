@@ -339,7 +339,7 @@ impl Lower<'_, '_> {
                 return Ok(Some(self.emit_rodata_blob(&bytes, &relocs)));
             }
         }
-        if !self.lent_mutably(expr) && self.cx.types.substs(self.reached.list[self.index].0.1).is_empty() {
+        if !self.lent_mutably(expr) && self.cx.types.substs(self.reached.list[self.index].0.1).is_empty() && !self.holds_uninit(expr)? {
             let ty = self.ty_of(expr);
             let (body, src, typed) = (self.body, self.src, self.typed);
             if let Some((bytes, relocs)) = self.literal_blob(Scope { body, src, typed, in_const: true }, (expr, ty), 0) {

@@ -623,6 +623,11 @@ impl Pass {
                 func.insts[inst.index()].op.map_operands(|value| crate::merge::find_compress(&mut self.subst, value));
             }
         }
+        let unwritten: Vec<Value> = self.fresh.zeros.iter().map(|&(_, value)| value).collect();
+        let insts = &func.insts;
+        for block in &mut func.blocks {
+            block.insts.retain(|inst| !matches!(insts[inst.index()].op, Op::Store(value, ..) | Op::StackStore(value, ..) if unwritten.contains(&value)));
+        }
     }
 }
 
