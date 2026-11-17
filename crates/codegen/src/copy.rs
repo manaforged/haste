@@ -1,4 +1,4 @@
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, Lane, Op, StackSlot, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Convert, Function, Inst, Lane, Op, StackSlot, Type, Value};
 
 /// The most bytes a move is emitted inline with; a larger one calls `memmove`.
 pub(crate) const MOVE_INLINE: u32 = 64;
@@ -152,8 +152,19 @@ fn forward_sret_slots(func: &mut Function, entry: Block, sret_ptr: Value, bytes:
     changed
 }
 
-/// The blocks that only copy their one parameter to `sret_ptr` and return, each with the blocks that jump to it and the slot address each passes.
-fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) -> Vec<(Block, Vec<(Block, Value)>)> {
+/// The edge of a block's last instruction that leads to a copy-and-return block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    /// The target of a jump.
+    Jump,
+    /// The taken target of a branch.
+    Then,
+    /// The fall-through target of a branch.
+    Else,
+}
+
+/// The blocks that only copy their one parameter to `sret_ptr` and return, each with the edges that reach it and the slot address each passes.
+fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) -> Vec<(Block, Vec<(Block, Edge, Value)>)> {
     let info = collect_sret_info(func, entry);
     let mut splits = Vec::new();
     for &(join, pos, copy) in &info.uses_by_val[sret_ptr.index()] {
@@ -162,37 +173,75 @@ fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32)
         if !matches!(func.insts[ret.index()].op, Op::Return(ref values) if values.is_empty()) || move_to_sret_src(func, &info.defs, copy, sret_ptr, bytes) != Some(*param) {
             continue;
         }
-        let preds = &info.preds[join.index()];
-        let jumps: Option<Vec<(Block, Value)>> = preds.iter().map(|&pred| match func.last(pred) {
-            Some(Op::Jump(target, args)) if *target == join && args.len() == 1 && resolve_slot(func, &info.defs, args[0]).is_some() => Some((pred, args[0])),
+        let slot_arg = |args: &[Value]| match args {
+            [arg] if resolve_slot(func, &info.defs, *arg).is_some() => Some(*arg),
             _ => None,
-        }).collect();
-        if let Some(jumps) = jumps.filter(|jumps| !jumps.is_empty()) {
-            splits.push((join, jumps));
+        };
+        let mut edges = Vec::new();
+        let mut all = true;
+        for &pred in &info.preds[join.index()] {
+            let found: Vec<(Edge, Option<Value>)> = match func.last(pred) {
+                Some(Op::Jump(target, args)) if *target == join => vec![(Edge::Jump, slot_arg(args))],
+                Some(Op::Brif(_, then, then_args, other, other_args)) => {
+                    let mut found = Vec::new();
+                    if *then == join {
+                        found.push((Edge::Then, slot_arg(then_args)));
+                    }
+                    if *other == join {
+                        found.push((Edge::Else, slot_arg(other_args)));
+                    }
+                    found
+                }
+                _ => vec![(Edge::Jump, None)],
+            };
+            for (edge, addr) in found {
+                match addr {
+                    Some(addr) if !edges.iter().any(|&(seen, kind, _)| seen == pred && kind == edge) => edges.push((pred, edge, addr)),
+                    Some(_) => {}
+                    None => all = false,
+                }
+            }
+        }
+        if all && !edges.is_empty() && !splits.iter().any(|(seen, _)| *seen == join) {
+            splits.push((join, edges));
         }
     }
     splits
 }
 
-/// One block that `split_returns` gave its own copy to the return memory: the block, its copy and return, the join it jumped to and the address it passed.
+/// One edge that `split_returns` gave its own copy to the return memory: the block it leaves, which of its edges, the new block with the copy and return, the copy, the join it reached and the address it passed.
 struct SplitReturn {
     block: Block,
+    pred: Block,
+    edge: Edge,
     copy: Inst,
-    ret: Inst,
     join: Block,
     addr: Value,
 }
 
-/// Gives each block of `joins` that jumps to a copy-and-return block its own copy to `sret_ptr` and return, so each slot has its own copy-out.
-fn split_returns(func: &mut Function, sret_ptr: Value, bytes: u32, joins: &[(Block, Vec<(Block, Value)>)]) -> Vec<SplitReturn> {
+/// Points edge `edge` of the last instruction of `pred` at `target` with `args`.
+fn retarget_edge(func: &mut Function, pred: Block, edge: Edge, target: Block, args: Vec<Value>) {
+    let Some(&last) = func.blocks[pred.index()].insts.last() else { return };
+    match (&mut func.insts[last.index()].op, edge) {
+        (Op::Jump(to, to_args), Edge::Jump) | (Op::Brif(_, to, to_args, ..), Edge::Then) | (Op::Brif(_, _, _, to, to_args), Edge::Else) => {
+            *to = target;
+            *to_args = args;
+        }
+        _ => {}
+    }
+}
+
+/// Sends each edge of `joins` that reaches a copy-and-return block to a new block with its own copy to `sret_ptr` and return, so each slot has its own copy-out.
+fn split_returns(func: &mut Function, sret_ptr: Value, bytes: u32, joins: &[(Block, Vec<(Block, Edge, Value)>)]) -> Vec<SplitReturn> {
     let mut split = Vec::new();
-    for &(join, ref jumps) in joins {
-        for &(block, addr) in jumps {
-            let Some(&copy) = func.blocks[block.index()].insts.last() else { continue };
-            func.insts[copy.index()].op = Op::Move(sret_ptr, addr, bytes);
+    for &(join, ref edges) in joins {
+        for &(pred, edge, addr) in edges {
+            let copy = func.add(Op::Move(sret_ptr, addr, bytes), None);
             let ret = func.add(Op::Return(Vec::new()), None);
-            func.blocks[block.index()].insts.push(ret);
-            split.push(SplitReturn { block, copy, ret, join, addr });
+            let block = Block(func.blocks.len() as u32);
+            func.blocks.push(BlockData { params: Vec::new(), insts: vec![copy, ret] });
+            retarget_edge(func, pred, edge, block, Vec::new());
+            split.push(SplitReturn { block, pred, edge, copy, join, addr });
         }
     }
     if !split.is_empty() {
@@ -201,14 +250,13 @@ fn split_returns(func: &mut Function, sret_ptr: Value, bytes: u32, joins: &[(Blo
     split
 }
 
-/// Points each block of `split` whose copy still stands back at its join, so only forwarded slots keep their own return; returns whether any block kept its own return.
+/// Points each edge of `split` whose copy still stands back at its join, so only forwarded slots keep their own return; returns whether any edge kept its own return.
 fn rejoin_returns(func: &mut Function, split: &[SplitReturn]) -> bool {
     let mut kept = false;
     for one in split {
         if matches!(func.insts[one.copy.index()].op, Op::Move(..)) {
-            func.insts[one.copy.index()].op = Op::Jump(one.join, vec![one.addr]);
-            func.insts[one.ret.index()].op = Op::Trap;
-            func.blocks[one.block.index()].insts.retain(|&inst| inst != one.ret);
+            retarget_edge(func, one.pred, one.edge, one.join, vec![one.addr]);
+            func.blocks[one.block.index()].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
         } else {
             kept = true;
         }
@@ -231,7 +279,7 @@ fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) ->
         }
     }
     let copied: Vec<(Block, Inst)> = copies.iter().map(|&(_, block, _, inst)| (block, inst)).collect();
-    let writes = writes_at(func, &info, vec![sret_ptr], &copied)?;
+    let writes = accesses_at(func, &info, vec![sret_ptr], &copied, Access::Write)?;
     let mut tried = Vec::new();
     for &(slot, ..) in &copies {
         if tried.contains(&slot) {
@@ -244,7 +292,7 @@ fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) ->
         }
         let moves: Vec<(Block, Inst)> = copies.iter().filter(|copy| copy.0 == slot).map(|&(_, block, _, inst)| (block, inst)).collect();
         let spots: Vec<(Block, usize)> = copies.iter().filter(|copy| copy.0 == slot).map(|&(_, block, pos, _)| (block, pos)).collect();
-        let Some(accesses) = written_only(func, &info, slot, &moves) else { continue };
+        let Some(accesses) = slot_accesses(func, &info, slot, &moves) else { continue };
         let others = copies.iter().filter(|copy| copy.0 != slot).map(|&(_, block, pos, _)| (block, pos)).chain(writes.iter().copied());
         if others.clone().all(|other| !accesses.iter().chain(&spots).any(|&access| access == other || runs_after(func, other, access))) {
             return Some((slot, moves));
@@ -519,14 +567,13 @@ fn exclusive_slot_insts(
     (saw_call && saw_move).then_some(dead_insts)
 }
 
-/// Where code writes slot `slot` when it only writes it, through stores, move and copy targets and call arguments at its addresses, besides the `moves` that copy it out.
-fn written_only(func: &Function, info: &SretUseInfo, slot: StackSlot, moves: &[(Block, Inst)]) -> Option<Vec<(Block, usize)>> {
+/// Where code reads or writes slot `slot` through loads, stores, moves, copies and call arguments at its addresses, besides the `moves` that copy it out, or none when its address escapes some other way.
+fn slot_accesses(func: &Function, info: &SretUseInfo, slot: StackSlot, moves: &[(Block, Inst)]) -> Option<Vec<(Block, usize)>> {
     let mut writes: Vec<(Block, usize)> = Vec::new();
     for (at, block) in func.blocks.iter().enumerate() {
         for (pos, inst) in block.insts.iter().enumerate() {
             match func.insts[inst.index()].op {
-                Op::StackLoad(found, _) if found == slot => return None,
-                Op::StackStore(_, found, _) if found == slot => writes.push((Block(at as u32), pos)),
+                Op::StackLoad(found, _) | Op::StackStore(_, found, _) if found == slot => writes.push((Block(at as u32), pos)),
                 _ => {}
             }
         }
@@ -536,12 +583,21 @@ fn written_only(func: &Function, info: &SretUseInfo, slot: StackSlot, moves: &[(
         Op::StackAddr(found, offset) if found == slot && offset != 0 => data.result,
         _ => None,
     }));
-    writes.extend(writes_at(func, info, roots, moves)?);
+    writes.extend(accesses_at(func, info, roots, moves, Access::ReadWrite)?);
     Some(writes)
 }
 
-/// Where code writes through `roots` and the addresses derived from them by adds, bitcasts and block arguments, skipping the instructions of `skip`, or none when any other use reads them.
-fn writes_at(func: &Function, info: &SretUseInfo, mut addrs: Vec<Value>, skip: &[(Block, Inst)]) -> Option<Vec<(Block, usize)>> {
+/// Which memory accesses a walk over derived addresses accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Only writes.
+    Write,
+    /// Reads and writes.
+    ReadWrite,
+}
+
+/// Where code accesses memory through `roots` and the addresses derived from them by adds, bitcasts and block arguments, skipping the instructions of `skip`, or none when an address escapes or `access` does not allow a read.
+fn accesses_at(func: &Function, info: &SretUseInfo, mut addrs: Vec<Value>, skip: &[(Block, Inst)], access: Access) -> Option<Vec<(Block, usize)>> {
     let mut writes = Vec::new();
     let mut at = 0;
     while let Some(&addr) = addrs.get(at) {
@@ -561,7 +617,7 @@ fn writes_at(func: &Function, info: &SretUseInfo, mut addrs: Vec<Value>, skip: &
                     addrs.extend(edge_params(func, then, then_args, addr));
                     addrs.extend(edge_params(func, other, other_args, addr));
                 }
-                ref op if writes_through(op, addr) => writes.push((block, pos)),
+                ref op if writes_through(op, addr) || (access == Access::ReadWrite && reads_through(op, addr)) => writes.push((block, pos)),
                 _ => return None,
             }
         }
@@ -576,6 +632,16 @@ fn writes_through(op: &Op, ptr: Value) -> bool {
         Op::Move(to, from, _) => to == ptr && from != ptr,
         Op::Copy(to, from, len) => to == ptr && from != ptr && len != ptr,
         Op::Call { callee, .. } | Op::TryCall { callee, .. } => callee != ptr,
+        _ => false,
+    }
+}
+
+/// Whether `op` only reads memory at `ptr`: a load from it, or a move or copy out of it.
+fn reads_through(op: &Op, ptr: Value) -> bool {
+    match *op {
+        Op::Load(from, _) => from == ptr,
+        Op::Move(to, from, _) => from == ptr && to != ptr,
+        Op::Copy(to, from, len) => from == ptr && to != ptr && len != ptr,
         _ => false,
     }
 }
