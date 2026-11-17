@@ -189,10 +189,31 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
     }
 }
 
+/// Gives each unique pointer that a call returns and the function stores into an entry parameter's object that parameter as its owner, since the object predates the allocation.
+fn seed_fresh_owners(func: &Function, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
+    let mut called = vec![false; func.types.len()];
+    for data in &func.insts {
+        if let Op::Call { results, .. } = &data.op {
+            results.iter().for_each(|result| called[result.index()] = true);
+        }
+    }
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if let Op::Store(value, addr, _) = func.insts[inst.index()].op
+            && called[value.index()]
+            && func.is_unique_ptr(value)
+            && let Some(&(owner, _)) = affine.get(addr.index())
+            && entry.contains(&owner)
+        {
+            tracked[value.index()] = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner)));
+        }
+    }
+}
+
 fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> Vec<TrackRoot> {
     let mut tracked = vec![TrackRoot::Unset; func.types.len()];
     seed_entry_roots(func, cfg, &mut tracked);
     let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
+    seed_fresh_owners(func, entry, affine, &mut tracked);
     let mut steps = Vec::new();
     let mut changed = false;
     for &b in &cfg.rpo {
