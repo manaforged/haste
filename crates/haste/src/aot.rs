@@ -236,17 +236,21 @@ impl Buf {
     }
 }
 
-fn classify_math(math: MathSymbol) -> Result<&'static str> {
+/// The libm function that each math intrinsic calls.
+const MATH: &[(MathSymbol, &str)] = {
     use MathSymbol::*;
-    const TABLE: &[(MathSymbol, &str)] = &[
+    &[
         (Sinf32, "sinf"), (Sinf64, "sin"), (Cosf32, "cosf"), (Cosf64, "cos"),
         (Expf32, "expf"), (Expf64, "exp"), (Exp2f32, "exp2f"), (Exp2f64, "exp2"),
         (Logf32, "logf"), (Logf64, "log"), (Log2f32, "log2f"), (Log2f64, "log2"),
         (Log10f32, "log10f"), (Log10f64, "log10"), (Powf32, "powf"), (Powf64, "pow"),
         (Fmaf32, "fmaf"), (Fmuladdf32, "fmaf"), (Fmaf64, "fma"), (Fmuladdf64, "fma"),
         (RoundTiesEvenF32, "rintf"), (RoundTiesEvenF64, "rint"), (Fmodf32, "fmodf"), (Fmodf64, "fmod"),
-    ];
-    TABLE.iter().find(|&&(k, _)| k == math).map(|&(_, n)| n).with_context(|| format!("{} requires a self-contained powi shim", math.link_name()))
+    ]
+};
+
+fn classify_math(math: MathSymbol) -> Result<&'static str> {
+    MATH.iter().find(|&&(k, _)| k == math).map(|&(_, n)| n).with_context(|| format!("{} requires a self-contained powi shim", math.link_name()))
 }
 
 fn dynamic_lib(name: &str) -> Option<&'static str> {
@@ -258,7 +262,7 @@ fn dynamic_lib(name: &str) -> Option<&'static str> {
         "cbrt", "cbrtf", "cosh", "coshf", "erf", "erff", "erfc", "erfcf", "expm1", "expm1f", "fdim", "fdimf", "hypot", "hypotf",
         "ldexp", "ldexpf", "lgamma_r", "lgammaf_r", "log1p", "log1pf", "nextafter", "nextafterf", "sinh", "sinhf", "tan", "tanf", "tanh", "tanhf", "tgamma", "tgammaf",
     ];
-    LIBM.contains(&name).then_some("libm.so.6")
+    (LIBM.contains(&name) || MATH.iter().any(|&(_, math)| math == name)).then_some("libm.so.6")
 }
 
 fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
