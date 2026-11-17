@@ -191,6 +191,8 @@ pub enum TargetOpId {
     X64Pmaddubsw256,
     /// `vpmaddwd` on two 32-byte vectors: each doubleword the sum of two products of signed words.
     X64Pmaddwd256,
+    /// `psadbw` on two 16-byte vectors: each quadword the sum of the absolute differences of its eight unsigned bytes.
+    X64Psadbw,
 }
 
 impl IntCC {

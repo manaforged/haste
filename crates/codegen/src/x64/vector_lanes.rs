@@ -35,6 +35,7 @@ const X64_TARGET_OPS: &[TargetOpSpec] = &[
     TargetOpSpec { id: TargetOpId::X64AesDec, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDE] },
     TargetOpSpec { id: TargetOpId::X64AesDecLast, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDF] },
     TargetOpSpec { id: TargetOpId::X64AesImc, form: TargetOpForm::Unary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDB] },
+    TargetOpSpec { id: TargetOpId::X64Psadbw, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0xF6] },
     TargetOpSpec { id: TargetOpId::X64ClmulLowLow, form: TargetOpForm::BinaryImm(0x00), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
     TargetOpSpec { id: TargetOpId::X64ClmulHighLow, form: TargetOpForm::BinaryImm(0x01), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
     TargetOpSpec { id: TargetOpId::X64ClmulLowHigh, form: TargetOpForm::BinaryImm(0x10), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },

@@ -7,6 +7,7 @@ mod vector;
 use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Type, Value};
+use crate::{Arch, Target};
 use count::{Counted, counted, head_defs, outside_preds, stride_const};
 
 const MAX_FULL_TRIPS: usize = 64;
@@ -653,7 +654,8 @@ fn collect_global_consts(func: &Function, cfg: &Cfg, eval: Eval) -> Vec<Option<i
 }
 
 /// Unrolls clean 1-block and straight-line inner loops with constant or dynamic trip counts, and constant-trip loops whose bodies branch or leave early.
-pub(crate) fn run(func: &mut Function) -> Domain {
+pub(crate) fn run(func: &mut Function, target: &Target) -> Domain {
+    let sad = target.arch == Arch::X64;
     if func.coroutine.is_some() {
         return Domain::NONE;
     }
@@ -691,11 +693,11 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 let (cond, t_blk, t_args, f_blk, f_args) = (*cond, *t_blk, t_args.clone(), *f_blk, f_args.clone());
                 if t_blk == head {
                     memset::run(func, b, (cond, true), &t_args, (f_blk, &f_args), &global_consts)
-                        || vector::run(func, b, (cond, true), &t_args, (f_blk, &f_args), &global_consts)
+                        || vector::run(func, b, (cond, true), &t_args, (f_blk, &f_args), (&global_consts, sad))
                         || unroll_self(func, &cfg, b, cond, true, t_args, f_blk, f_args, &global_consts)
                 } else if f_blk == head {
                     memset::run(func, b, (cond, false), &f_args, (t_blk, &t_args), &global_consts)
-                        || vector::run(func, b, (cond, false), &f_args, (t_blk, &t_args), &global_consts)
+                        || vector::run(func, b, (cond, false), &f_args, (t_blk, &t_args), (&global_consts, sad))
                         || unroll_self(func, &cfg, b, cond, false, f_args, t_blk, t_args, &global_consts)
                 } else {
                     false
@@ -704,7 +706,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 false
             }
         } else if each.size >= 2 && each.latches[0] != head {
-            vector::flatten(func, each, &global_consts) || unroll_chain(func, &cfg, each, &global_consts) || region::unroll(func, &cfg, each)
+            vector::flatten(func, each, (&global_consts, sad)) || unroll_chain(func, &cfg, each, &global_consts) || region::unroll(func, &cfg, each)
         } else {
             false
         };

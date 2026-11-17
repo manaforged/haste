@@ -1,7 +1,7 @@
 use super::count::{counted, head_defs, outside_preds};
 use super::memset::{Emit, outside_uses, steps};
 use crate::cfg::Loop;
-use crate::ir::{Binary, Block, BlockData, Convert, Function, Inst, IntCC, Lane, Op, ReduceOp, ShuffleMask, Type, Unary, Value};
+use crate::ir::{Binary, Block, BlockData, Convert, Function, Inst, IntCC, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Type, Unary, Value};
 
 /// Bytes, and so byte lanes, that one vector iteration covers.
 const LANES: i64 = 16;
@@ -259,6 +259,14 @@ fn byte_sum(e: &mut Emit<'_>, bytes: Value) -> Value {
 }
 
 /// Shifts every byte lane by `by`: a 16-bit lane shift, then a mask that clears the bits that crossed between bytes.
+/// The `I64` sum of the sixteen unsigned bytes of `bytes`: `psadbw` against zero, then one add of its two quadwords.
+fn sad_sum(e: &mut Emit<'_>, bytes: Value) -> Value {
+    const QUADS: Type = Type::Vec { lane: Lane::I64, count: 2 };
+    let zero = e.op(Op::Const(0), VEC);
+    let halves = e.op(Op::TargetOp(TargetOpId::X64Psadbw, TinyArgs::two(bytes, zero)), QUADS);
+    e.op(Op::Reduce(ReduceOp::Add, halves), Type::I64)
+}
+
 fn byte_shift(e: &mut Emit<'_>, op: Binary, x: Value, by: i64) -> Value {
     let words = e.op(Op::Convert(Convert::Bitcast, x), WORDS);
     let amount = e.konst(by, Type::I16);
@@ -385,12 +393,16 @@ fn lane_body(e: &mut Emit<'_>, shape: &Shape, (q, splats): (&[Value], &[(Value, 
     map
 }
 
-fn add_sums(e: &mut Emit<'_>, shape: &Shape, (q, map): (&[Value], &[(Value, Value)]), next: &mut [Value]) {
+fn add_sums(e: &mut Emit<'_>, shape: &Shape, (q, map): (&[Value], &[(Value, Value)]), next: &mut [Value], sad: bool) {
     for sum in &shape.sums {
         let bytes = map.iter().rev().find(|&&(s, _)| s == sum.lane).map(|&(_, d)| d).expect("summed lane mapped");
-        let total = byte_sum(e, bytes);
+        let total = if sad { sad_sum(e, bytes) } else { byte_sum(e, bytes) };
         let ty = e.func.ty(q[sum.idx]);
-        let wide = e.op(Op::Convert(Convert::Uextend, total), ty);
+        let wide = match e.func.ty(total).bytes().cmp(&ty.bytes()) {
+            std::cmp::Ordering::Less => e.op(Op::Convert(Convert::Uextend, total), ty),
+            std::cmp::Ordering::Equal => total,
+            std::cmp::Ordering::Greater => e.op(Op::Convert(Convert::Ireduce, total), ty),
+        };
         next[sum.idx] = e.op(Op::Binary(Binary::Iadd, q[sum.idx], wide), ty);
     }
 }
@@ -496,7 +508,7 @@ pub(super) fn run(
     exit_test: (Value, bool),
     back_args: &[Value],
     (exit_blk, exit_args): (Block, &[Value]),
-    global_consts: &[Option<i64>],
+    (global_consts, sad): (&[Option<i64>], bool),
 ) -> bool {
     let insts = &func.blocks[b].insts;
     let preds = outside_preds(func, b);
@@ -549,7 +561,7 @@ pub(super) fn run(
     let pre_insts = std::mem::take(&mut e.out);
     let map = lane_body(&mut e, &shape, (&q, &splats));
     let mut next = advance(&mut e, &q, &strides);
-    add_sums(&mut e, &shape, (&q, &map), &mut next);
+    add_sums(&mut e, &shape, (&q, &map), &mut next, sad);
     let more = room(&mut e, &shape, &lp, &next);
     let body_insts = std::mem::take(&mut e.out);
     let done = e.op(Op::Icmp(IntCC::Equal, r[lp.iv], lp.limit), Type::I8);
@@ -592,7 +604,7 @@ fn lane_blocks(func: &Function, each: &Loop) -> bool {
 }
 
 /// Vectorizes the byte loop `each` after turning its inner branches into selects, keeping that conversion only when the loop then vectorizes.
-pub(super) fn flatten(func: &mut Function, each: &Loop, global_consts: &[Option<i64>]) -> bool {
+pub(super) fn flatten(func: &mut Function, each: &Loop, (global_consts, sad): (&[Option<i64>], bool)) -> bool {
     if each.size > MAX_BLOCKS || !lane_blocks(func, each) {
         return false;
     }
@@ -605,9 +617,9 @@ pub(super) fn flatten(func: &mut Function, each: &Loop, global_consts: &[Option<
     let mut consts = global_consts.to_vec();
     consts.resize(trial.types.len(), None);
     let did = if t_blk == head && f_blk != head {
-        run(&mut trial, head.index(), (cond, true), &t_args, (f_blk, &f_args), &consts)
+        run(&mut trial, head.index(), (cond, true), &t_args, (f_blk, &f_args), (&consts, sad))
     } else if f_blk == head && t_blk != head {
-        run(&mut trial, head.index(), (cond, false), &f_args, (t_blk, &t_args), &consts)
+        run(&mut trial, head.index(), (cond, false), &f_args, (t_blk, &t_args), (&consts, sad))
     } else {
         false
     };

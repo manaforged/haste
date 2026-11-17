@@ -121,7 +121,7 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Thread => thread::run(func),
         Pass::IfConv => ifconv::run(func),
         Pass::Rotate => rotate::run(func),
-        Pass::Unroll => unroll::run(func),
+        Pass::Unroll => unroll::run(func, target),
         Pass::Licm => licm::run(func),
         Pass::Lsr => lsr::run(func),
         Pass::Switch => switch::run(func, target),
