@@ -15,6 +15,7 @@ pub(crate) struct Tail {
 enum Kind {
     Zeros { movs: [Zero; PENDING_ZEROS], len: usize },
     ZeroRun { start: u32, run: Mem, len: i32, last: Last },
+    Carry { tag: usize },
 }
 
 /// A `mov r32, 0` at `start..end` that becomes `xor r32, r32` once the flags are dead.
@@ -51,12 +52,26 @@ impl Asm {
         self.tail.as_mut().filter(|tail| tail.end == at && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. }))
     }
 
-    /// Carries pending zero movs past the one instruction emitted since `start`, which neither reads nor writes the flags.
+    /// Carries pending zero movs, or a held carry, past the one instruction emitted since `start`, which neither reads nor writes the flags.
     pub(super) fn flags_kept(&mut self, start: u32) {
         let end = self.pos();
-        if let Some(tail) = self.zeros_at(start) {
+        let marks = self.marks();
+        if let Some(tail) = self.tail.as_mut().filter(|tail| tail.end == start && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. } | Kind::Carry { .. })) {
             tail.end = end;
         }
+    }
+
+    /// Notes that the carry flag holds the carry named `tag` here, until an instruction that may write the flags.
+    pub fn hold_carry(&mut self, tag: usize) {
+        self.set_tail(Kind::Carry { tag });
+    }
+
+    /// The carry the carry flag still holds here, if only flag-neutral instructions followed `hold_carry`.
+    pub fn held_carry(&self) -> Option<usize> {
+        self.tail.filter(|tail| tail.end == self.pos() && tail.marks == self.marks()).and_then(|tail| match tail.kind {
+            Kind::Carry { tag } => Some(tag),
+            _ => None,
+        })
     }
 
     fn push_zero(&mut self, zero: Zero) {
