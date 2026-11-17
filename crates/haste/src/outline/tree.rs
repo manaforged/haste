@@ -64,7 +64,7 @@ pub struct Index {
     pub imports: HashMap<Box<str>, Vec<u32>>,
     /// The glob imports.
     pub globs: Vec<u32>,
-    /// The functions and modules whose tokens hold each import.
+    /// The functions and modules that hold each import through its chain of parents.
     pub holders: Vec<Box<[u32]>>,
 }
 

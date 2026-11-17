@@ -174,7 +174,7 @@ impl<'a> Infer<'_, 'a> {
             return Vec::new();
         };
         let hidden = self.closed_uses(root);
-        let here = self.reader().map(|item| self.cx.item(item).1.start);
+        let here = self.reader().and_then(ItemRef::outer).map(|(_, at)| at);
         if let Some(found) = self.imports.get(&(root, word, here, hidden.clone())) {
             return found.clone();
         }

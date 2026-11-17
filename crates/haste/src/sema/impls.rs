@@ -310,7 +310,7 @@ impl<'a> Context<'a> {
             Some(BodyPath::Def(def)) => Some(def),
             Some(BodyPath::Variant(_)) => None,
             Some(BodyPath::Outside(skip)) => paths.resolve(&outside(path, skip), home),
-            None => anchor.and_then(|(root, _)| self.body_use_path((root, home), path, at.map(|at| self.item(at).1.start))).or_else(|| paths.resolve(path, home)),
+            None => anchor.and_then(|(root, _)| self.body_use_path((root, home), path, at.and_then(ItemRef::outer).map(|(_, at)| at))).or_else(|| paths.resolve(path, home)),
         }
     }
 
