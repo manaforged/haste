@@ -118,50 +118,144 @@ fn sret_param(func: &Function) -> Option<(Block, Value, u32)> {
 }
 
 /// Forwards a function's incoming `StructReturn` pointer directly into a non-aliased callee `StructReturn` temporary slot when the slot is copied out intact.
-fn forward_sret_calls(func: &mut Function) {
+fn forward_sret_calls(func: &mut Function) -> bool {
     let Some((entry, sret_ptr, bytes)) = sret_param(func) else {
-        return;
+        return false;
     };
-    while forward_one_sret_call(func, entry, sret_ptr, bytes) {}
+    let mut changed = false;
+    while forward_one_sret_call(func, entry, sret_ptr, bytes) {
+        changed = true;
+    }
+    changed
 }
 
-/// Builds the return value in the incoming `StructReturn` memory when the function fills one slot and only ever copies that slot out whole right before it returns.
+/// Builds the return value in the incoming `StructReturn` memory, first for call results copied out intact, then for each slot that the function only writes and copies out whole right before it returns; returns whether it changed the body.
 pub(crate) fn forward_sret_slot(func: &mut Function) -> bool {
     let Some((entry, sret_ptr, bytes)) = sret_param(func) else {
         return false;
     };
+    let calls = forward_sret_calls(func);
+    let joins = slot_return_joins(func, entry, sret_ptr, bytes);
+    let split = split_returns(func, sret_ptr, bytes, &joins);
+    let forwarded = forward_sret_slots(func, entry, sret_ptr, bytes);
+    let kept = rejoin_returns(func, &split);
+    calls || forwarded || kept
+}
+
+/// Builds in the `StructReturn` memory at `sret_ptr` each slot that `sret_slot_plan` finds, one at a time; returns whether it built any.
+fn forward_sret_slots(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u32) -> bool {
+    let mut changed = false;
+    while let Some((slot, moves)) = sret_slot_plan(func, entry, sret_ptr, bytes) {
+        retarget_slot(func, slot, sret_ptr, &moves);
+        changed = true;
+    }
+    changed
+}
+
+/// The blocks that only copy their one parameter to `sret_ptr` and return, each with the blocks that jump to it and the slot address each passes.
+fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) -> Vec<(Block, Vec<(Block, Value)>)> {
     let info = collect_sret_info(func, entry);
-    let mut slot = None;
-    let mut moves = Vec::new();
-    let mut others = Vec::new();
+    let mut splits = Vec::new();
+    for &(join, pos, copy) in &info.uses_by_val[sret_ptr.index()] {
+        let data = &func.blocks[join.index()];
+        let ([param], [_, ret], 0) = (&data.params[..], &data.insts[..], pos) else { continue };
+        if !matches!(func.insts[ret.index()].op, Op::Return(ref values) if values.is_empty()) || move_to_sret_src(func, &info.defs, copy, sret_ptr, bytes) != Some(*param) {
+            continue;
+        }
+        let preds = &info.preds[join.index()];
+        let jumps: Option<Vec<(Block, Value)>> = preds.iter().map(|&pred| match func.last(pred) {
+            Some(Op::Jump(target, args)) if *target == join && args.len() == 1 && resolve_slot(func, &info.defs, args[0]).is_some() => Some((pred, args[0])),
+            _ => None,
+        }).collect();
+        if let Some(jumps) = jumps.filter(|jumps| !jumps.is_empty()) {
+            splits.push((join, jumps));
+        }
+    }
+    splits
+}
+
+/// One block that `split_returns` gave its own copy to the return memory: the block, its copy and return, the join it jumped to and the address it passed.
+struct SplitReturn {
+    block: Block,
+    copy: Inst,
+    ret: Inst,
+    join: Block,
+    addr: Value,
+}
+
+/// Gives each block of `joins` that jumps to a copy-and-return block its own copy to `sret_ptr` and return, so each slot has its own copy-out.
+fn split_returns(func: &mut Function, sret_ptr: Value, bytes: u32, joins: &[(Block, Vec<(Block, Value)>)]) -> Vec<SplitReturn> {
+    let mut split = Vec::new();
+    for &(join, ref jumps) in joins {
+        for &(block, addr) in jumps {
+            let Some(&copy) = func.blocks[block.index()].insts.last() else { continue };
+            func.insts[copy.index()].op = Op::Move(sret_ptr, addr, bytes);
+            let ret = func.add(Op::Return(Vec::new()), None);
+            func.blocks[block.index()].insts.push(ret);
+            split.push(SplitReturn { block, copy, ret, join, addr });
+        }
+    }
+    if !split.is_empty() {
+        func.bump_cfg();
+    }
+    split
+}
+
+/// Points each block of `split` whose copy still stands back at its join, so only forwarded slots keep their own return; returns whether any block kept its own return.
+fn rejoin_returns(func: &mut Function, split: &[SplitReturn]) -> bool {
+    let mut kept = false;
+    for one in split {
+        if matches!(func.insts[one.copy.index()].op, Op::Move(..)) {
+            func.insts[one.copy.index()].op = Op::Jump(one.join, vec![one.addr]);
+            func.insts[one.ret.index()].op = Op::Trap;
+            func.blocks[one.block.index()].insts.retain(|&inst| inst != one.ret);
+        } else {
+            kept = true;
+        }
+    }
+    if !split.is_empty() {
+        func.bump_cfg();
+    }
+    kept
+}
+
+/// A slot that can live in the `StructReturn` memory at `sret_ptr`, with the moves that copy it out: every copy of it returns next, nothing reads it, and no access or copy of it can run after another write of the return memory.
+fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) -> Option<(StackSlot, Vec<(Block, Inst)>)> {
+    let info = collect_sret_info(func, entry);
     let mut copies = Vec::new();
     for &(block, pos, inst) in &info.uses_by_val[sret_ptr.index()] {
         let insts = &func.blocks[block.index()].insts;
         let returns_next = pos + 2 == insts.len() && matches!(func.insts[insts[pos + 1].index()].op, Op::Return(_));
-        match move_to_sret_src(func, &info.defs, inst, sret_ptr, bytes).and_then(|src| resolve_slot(func, &info.defs, src)) {
-            Some(found) if returns_next && slot.is_none_or(|slot| slot == found) => {
-                slot = Some(found);
-                moves.push((block, inst));
-                copies.push((block, pos));
-            }
-            _ if writes_through(&func.insts[inst.index()].op, sret_ptr) => others.push((block, pos)),
-            _ => return false,
+        if let Some(slot) = move_to_sret_src(func, &info.defs, inst, sret_ptr, bytes).and_then(|src| resolve_slot(func, &info.defs, src)).filter(|_| returns_next) {
+            copies.push((slot, block, pos, inst));
         }
     }
-    let Some(slot) = slot else {
-        return false;
-    };
-    let index = slot.index() as u32;
-    if func.slots[slot.index()].size > bytes || func.self_slots.contains(&index) || func.vtable_slots.iter().any(|&(at, ..)| at == index) {
-        return false;
+    let copied: Vec<(Block, Inst)> = copies.iter().map(|&(_, block, _, inst)| (block, inst)).collect();
+    let writes = writes_at(func, &info, vec![sret_ptr], &copied)?;
+    let mut tried = Vec::new();
+    for &(slot, ..) in &copies {
+        if tried.contains(&slot) {
+            continue;
+        }
+        tried.push(slot);
+        let index = slot.index() as u32;
+        if func.slots[slot.index()].size > bytes || func.self_slots.contains(&index) || func.vtable_slots.iter().any(|&(at, ..)| at == index) {
+            continue;
+        }
+        let moves: Vec<(Block, Inst)> = copies.iter().filter(|copy| copy.0 == slot).map(|&(_, block, _, inst)| (block, inst)).collect();
+        let spots: Vec<(Block, usize)> = copies.iter().filter(|copy| copy.0 == slot).map(|&(_, block, pos, _)| (block, pos)).collect();
+        let Some(accesses) = written_only(func, &info, slot, &moves) else { continue };
+        let others = copies.iter().filter(|copy| copy.0 != slot).map(|&(_, block, pos, _)| (block, pos)).chain(writes.iter().copied());
+        if others.clone().all(|other| !accesses.iter().chain(&spots).any(|&access| access == other || runs_after(func, other, access))) {
+            return Some((slot, moves));
+        }
     }
-    let Some(accesses) = written_only(func, &info, slot, &moves) else {
-        return false;
-    };
-    if others.iter().any(|&other| accesses.iter().chain(&copies).any(|&access| access == other || runs_after(func, other, access))) {
-        return false;
-    }
-    for (block, inst) in moves {
+    None
+}
+
+/// Points every access of `slot` at the `StructReturn` memory at `sret_ptr` and deletes the `moves` that copied it out.
+fn retarget_slot(func: &mut Function, slot: StackSlot, sret_ptr: Value, moves: &[(Block, Inst)]) {
+    for &(block, inst) in moves {
         remove_inst_in_block(func, block, inst);
         func.insts[inst.index()].op = Op::Trap;
     }
@@ -194,7 +288,6 @@ pub(crate) fn forward_sret_slot(func: &mut Function) -> bool {
         }
     }
     crate::merge::rename(func, &subst);
-    true
 }
 
 struct SretUseInfo {
@@ -426,19 +519,30 @@ fn exclusive_slot_insts(
     (saw_call && saw_move).then_some(dead_insts)
 }
 
-/// Where code accesses slot `slot` when it only writes it, through stores, move and copy targets and call arguments at its addresses, besides the `moves` that copy it out.
+/// Where code writes slot `slot` when it only writes it, through stores, move and copy targets and call arguments at its addresses, besides the `moves` that copy it out.
 fn written_only(func: &Function, info: &SretUseInfo, slot: StackSlot, moves: &[(Block, Inst)]) -> Option<Vec<(Block, usize)>> {
-    if info.bad_slots[slot.index()] && func.insts.iter().any(|data| matches!(data.op, Op::StackLoad(found, _) if found == slot)) {
-        return None;
+    let mut writes: Vec<(Block, usize)> = Vec::new();
+    for (at, block) in func.blocks.iter().enumerate() {
+        for (pos, inst) in block.insts.iter().enumerate() {
+            match func.insts[inst.index()].op {
+                Op::StackLoad(found, _) if found == slot => return None,
+                Op::StackStore(_, found, _) if found == slot => writes.push((Block(at as u32), pos)),
+                _ => {}
+            }
+        }
     }
-    let mut accesses: Vec<(Block, usize)> = func.blocks.iter().enumerate().flat_map(|(at, block)| {
-        block.insts.iter().enumerate().filter(|&(_, inst)| matches!(func.insts[inst.index()].op, Op::StackStore(_, found, _) if found == slot)).map(move |(pos, _)| (Block(at as u32), pos))
-    }).collect();
-    let mut addrs: Vec<Value> = info.slot_addrs[slot.index()].iter().map(|&(_, _, value)| value).collect();
-    addrs.extend(func.insts.iter().filter_map(|data| match data.op {
+    let mut roots: Vec<Value> = info.slot_addrs[slot.index()].iter().map(|&(_, _, value)| value).collect();
+    roots.extend(func.insts.iter().filter_map(|data| match data.op {
         Op::StackAddr(found, offset) if found == slot && offset != 0 => data.result,
         _ => None,
     }));
+    writes.extend(writes_at(func, info, roots, moves)?);
+    Some(writes)
+}
+
+/// Where code writes through `roots` and the addresses derived from them by adds, bitcasts and block arguments, skipping the instructions of `skip`, or none when any other use reads them.
+fn writes_at(func: &Function, info: &SretUseInfo, mut addrs: Vec<Value>, skip: &[(Block, Inst)]) -> Option<Vec<(Block, usize)>> {
+    let mut writes = Vec::new();
     let mut at = 0;
     while let Some(&addr) = addrs.get(at) {
         at += 1;
@@ -446,33 +550,23 @@ fn written_only(func: &Function, info: &SretUseInfo, slot: StackSlot, moves: &[(
             continue;
         }
         for &(block, pos, user) in &info.uses_by_val[addr.index()] {
-            if moves.iter().any(|&(_, inst)| inst == user) {
+            if skip.iter().any(|&(_, inst)| inst == user) {
                 continue;
             }
             let data = &func.insts[user.index()];
-            let fine = match data.op {
-                Op::Binary(Binary::Iadd, ..) | Op::Convert(Convert::Bitcast, _) => {
-                    addrs.extend(data.result);
-                    true
-                }
-                Op::Jump(target, ref args) => {
-                    addrs.extend(edge_params(func, target, args, addr));
-                    true
-                }
-                Op::Brif(cond, then, ref then_args, other, ref other_args) => {
+            match data.op {
+                Op::Binary(Binary::Iadd, ..) | Op::Convert(Convert::Bitcast, _) => addrs.extend(data.result),
+                Op::Jump(target, ref args) => addrs.extend(edge_params(func, target, args, addr)),
+                Op::Brif(cond, then, ref then_args, other, ref other_args) if cond != addr => {
                     addrs.extend(edge_params(func, then, then_args, addr));
                     addrs.extend(edge_params(func, other, other_args, addr));
-                    cond != addr
                 }
-                ref op => writes_through(op, addr),
-            };
-            if !fine {
-                return None;
+                ref op if writes_through(op, addr) => writes.push((block, pos)),
+                _ => return None,
             }
-            accesses.push((block, pos));
         }
     }
-    Some(accesses)
+    Some(writes)
 }
 
 /// Whether `op` only writes memory at `ptr`: a store to it, a move or copy into it, or a call that takes it as an argument.

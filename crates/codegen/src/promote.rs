@@ -675,16 +675,16 @@ pub(crate) enum Moves {
 }
 
 fn pre_split(func: &mut Function, moves: Moves) -> bool {
-    let returned = crate::copy::forward_sret_slot(func);
     let joined = moves != Moves::Words && join_slots::run(func);
     let forwarded = moves == Moves::Split && box_fwd::run(func);
-    returned || joined || forwarded
+    joined || forwarded
 }
 
 pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return Domain::NONE;
     };
+    let returned = crate::copy::forward_sret_slot(func);
     let join_changed = pre_split(func, moves);
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
@@ -735,7 +735,8 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     let changed = (scan.any_promotable() && promote(func, entry, scan)) || join_changed || split_changed || dropped_zero;
     crate::copy::rejoin(func, &splits);
     let all_copies_rejoined = subword::rejoin_copies(func, &copy_splits);
-    if changed || !all_copies_rejoined { Domain::MEM | Domain::VALUES } else { Domain::NONE }
+    let cfg = if returned { Domain::CFG } else { Domain::NONE };
+    if changed || returned || !all_copies_rejoined { Domain::MEM | Domain::VALUES | cfg } else { Domain::NONE }
 }
 
 /// Promotes every promotable variable `scan` found.
