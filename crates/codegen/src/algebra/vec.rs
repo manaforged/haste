@@ -41,6 +41,28 @@ pub(super) fn simplify_movemask(cx: &RewriteCx, op: &Op) -> Option<Op> {
     }
 }
 
+fn movemask_of(cx: &RewriteCx, v: Value) -> Option<(bool, Value)> {
+    match *cx.op(v)? {
+        Op::Reduce(crate::ir::ReduceOp::Movemask, x) => Some((false, x)),
+        Op::TargetOp(TargetOpId::X64Pmovmskb256, args) => match *args.as_slice() {
+            [x] => Some((true, x)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Or-s two masks of lane sign bits as one mask of the or of their vectors, which a mask of that or elsewhere then shares.
+pub(super) fn merge_movemasks(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
+    let ((wide, x), (other, y)) = (movemask_of(cx, a)?, movemask_of(cx, b)?);
+    let ty = cx.func.ty(x);
+    if wide != other || ty != cx.func.ty(y) || cx.func.ty(a) != cx.func.ty(b) {
+        return None;
+    }
+    let both = cx.emit(ty, Op::Binary(Binary::Bor, x, y));
+    Some(if wide { Op::TargetOp(TargetOpId::X64Pmovmskb256, TinyArgs::one(both)) } else { Op::Reduce(crate::ir::ReduceOp::Movemask, both) })
+}
+
 /// Moves a bitwise op of two vectors bitcast from one type into that type, so the bitcasts cancel with their neighbours.
 fn sink_bitcast(cx: &mut RewriteCx, res_v: Value, bin: Binary, (a, b): (Value, Value)) -> Option<Op> {
     let (Some(&Op::Convert(Convert::Bitcast, x)), Some(&Op::Convert(Convert::Bitcast, y))) = (cx.op(a), cx.op(b)) else { return None };
