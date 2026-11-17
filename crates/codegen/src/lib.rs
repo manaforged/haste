@@ -24,6 +24,7 @@ mod lsr;
 pub(crate) mod mem;
 mod merge;
 mod native;
+mod pairs;
 mod park;
 mod promote;
 mod reloc;
