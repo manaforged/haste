@@ -766,3 +766,14 @@ pub(super) fn mid_preserves_flags(
         _ => false,
     }
 }
+
+/// The signedness and factors of the 64-bit product whose high and low halves are `x` and `y` in either order.
+pub(in super::super) fn product_halves(func: &Function, def: &dyn Fn(Value) -> Option<Inst>, (x, y): (Value, Value)) -> Option<(bool, Value, Value)> {
+    let op = |v: Value| def(v).map(|inst| &func.insts[inst.index()].op);
+    let ((Some(&Op::Binary(high @ (Binary::Umulhi | Binary::Smulhi), a, b)), Some(&Op::Binary(Binary::Imul, c, d)))
+    | (Some(&Op::Binary(Binary::Imul, c, d)), Some(&Op::Binary(high @ (Binary::Umulhi | Binary::Smulhi), a, b)))) = (op(x), op(y))
+    else {
+        return None;
+    };
+    (func.ty(x) == Type::I64 && func.ty(y) == Type::I64 && ((a, b) == (c, d) || (a, b) == (d, c))).then_some((high == Binary::Smulhi, a, b))
+}

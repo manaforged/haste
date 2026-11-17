@@ -699,6 +699,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             }
         }
     }
+    fold_products(func, plan, &uses, &defs);
     for (low, operands) in paired {
         if plan.is_static(low) || plan.deferred[low.index()] {
             for value in operands.into_iter().filter(|&value| is_load(func, &defs, value)) {
@@ -707,6 +708,28 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         }
     }
     roots
+}
+
+/// Elides the high and low halves of each 64-bit product whose only use is the add, or, or xor right after them, which then multiplies in place.
+fn fold_products(func: &Function, plan: &mut Plan<Reg>, uses: &[u32], defs: &[Option<Inst>]) {
+    for block in &func.blocks {
+        for pos in 2..block.insts.len() {
+            let data = &func.insts[block.insts[pos].index()];
+            let (Op::Binary(Binary::Bxor | Binary::Bor | Binary::Iadd, x, y), Some(result)) = (&data.op, data.result) else { continue };
+            let halves = [block.insts[pos - 2], block.insts[pos - 1]].map(|inst| func.insts[inst.index()].result);
+            if low_of_pair(func, block, pos - 1).is_none()
+                || !halves.iter().all(|half| half.is_some_and(|half| [*x, *y].contains(&half) && uses[half.index()] == 1))
+                || plan.elided[result.index()]
+                || plan.sib[result.index()].is_some()
+                || super::patterns::product_halves(func, &|v| defs[v.index()], (*x, *y)).is_none()
+            {
+                continue;
+            }
+            for half in halves.into_iter().flatten() {
+                plan.elided[half.index()] = true;
+            }
+        }
+    }
 }
 
 fn is_load(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {

@@ -186,6 +186,9 @@ impl Emit<'_> {
             self.asm.lea(dst, mem);
             return Ok(dst);
         }
+        if let Some(reg) = self.folded_product(op, (x, y), result) {
+            return Ok(reg);
+        }
         if matches!(op, Binary::Bor | Binary::Bxor | Binary::Iadd)
             && self.plan.elided[x.index()]
             && self.plan.elided[y.index()]
@@ -489,7 +492,7 @@ impl Emit<'_> {
     }
 
     /// Computes the high half of `x * y` and returns its register; a 64-bit product leaves its low half in rax for the `Imul` that follows.
-    fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) -> Reg {
+    pub(super) fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) -> Reg {
         let ext = Ext::of(signed);
         self.get(Reg::Rax, x, ext);
         if bits == 64 {

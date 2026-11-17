@@ -154,6 +154,26 @@ impl Emit<'_> {
         Ok(())
     }
 
+    /// Multiplies in place for an add, or, or xor of the two elided halves of one 64-bit product, and returns rax, which holds the result.
+    pub(super) fn folded_product(&mut self, op: Binary, (x, y): (Value, Value), result: Value) -> Option<Reg> {
+        let alu = match op {
+            Binary::Bxor => Alu::Xor,
+            Binary::Bor => Alu::Or,
+            Binary::Iadd => Alu::Add,
+            _ => return None,
+        };
+        if !(self.plan.elided[x.index()] && self.plan.elided[y.index()]) {
+            return None;
+        }
+        let (signed, a, b) = super::location::product_halves(self.func, &|v| self.defs[v.index()], (x, y))?;
+        self.multiply_high(signed, a, b, 64);
+        self.low_product = None;
+        self.asm.alu(alu, Reg::Rax, Reg::Rdx);
+        self.clobber_regs(&[Reg::Rax, Reg::Rdx]);
+        self.flags = self.plan.fused[result.index()].then_some((result, Cond::Ne));
+        Some(Reg::Rax)
+    }
+
     /// Whether the carry flag still holds `left <u right` from the add that produced `left` from `right` and another operand.
     pub(super) fn overflow_held(&self, left: Value, right: Value) -> bool {
         self.asm.held_carry() == Some(overflow_tag(left))
