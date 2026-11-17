@@ -82,6 +82,13 @@ pub(crate) enum Rm {
     Mem(Mem),
 }
 
+impl Rm {
+    /// True when a byte access to this operand names spl, bpl, sil or dil, which needs a REX prefix.
+    fn byte_rex(self) -> bool {
+        matches!(self, Rm::Reg(4..=7))
+    }
+}
+
 impl From<Reg> for Rm {
     fn from(reg: Reg) -> Self {
         Rm::Reg(reg as u8)
@@ -280,7 +287,7 @@ impl Asm {
             (false, false) => &[],
         };
         let opcode = if size == Size::B { byte } else { wide };
-        self.encode(prefix, size == Size::Q, opcode, r, rm, size == Size::B);
+        self.encode(prefix, size == Size::Q, opcode, r, rm, size == Size::B && (Rm::Reg(r).byte_rex() || rm.byte_rex()));
     }
 
     pub fn load(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) {
@@ -290,8 +297,8 @@ impl Asm {
             Size::D => (false, &[0x8B]),
             Size::Q => (true, &[0x8B]),
         };
-        let start = self.pos();
-        self.encode(&[], w, opcode, dst as u8, src.into(), size == Size::B);
+        let (start, src) = (self.pos(), src.into());
+        self.encode(&[], w, opcode, dst as u8, src, size == Size::B && src.byte_rex());
         self.flags_kept(start);
     }
 
@@ -303,7 +310,7 @@ impl Asm {
             Size::Q => &[0x8B],
         };
         let start = self.pos();
-        self.encode(&[], true, opcode, dst as u8, src.into(), size == Size::B);
+        self.encode(&[], true, opcode, dst as u8, src.into(), false);
         self.flags_kept(start);
     }
 
@@ -386,7 +393,7 @@ impl Asm {
         self.alu_flags(op);
         match size {
             Size::B => {
-                self.encode(&[], false, &[0x80], op as u8, dst, matches!(dst, Rm::Reg(_)));
+                self.encode(&[], false, &[0x80], op as u8, dst, dst.byte_rex());
                 self.code.push(imm as u8);
             }
             Size::W => match i8::try_from(imm as i16) {
@@ -417,7 +424,7 @@ impl Asm {
 
     pub fn test_imm8(&mut self, reg: Reg, imm: u8) {
         self.flags_overwritten();
-        self.encode(&[], false, &[0xF6], 0, reg.into(), true);
+        self.encode(&[], false, &[0xF6], 0, reg.into(), Rm::from(reg).byte_rex());
         self.code.push(imm);
     }
 
@@ -503,7 +510,7 @@ impl Asm {
     }
 
     pub fn setcc(&mut self, cond: Cond, reg: Reg) {
-        self.encode(&[], false, &[0x0F, 0x90 + cond as u8], 0, reg.into(), true);
+        self.encode(&[], false, &[0x0F, 0x90 + cond as u8], 0, reg.into(), Rm::from(reg).byte_rex());
     }
 
     pub fn cmov(&mut self, cond: Cond, dst: Reg, src: impl Into<Rm>) {
