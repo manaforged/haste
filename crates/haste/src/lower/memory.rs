@@ -217,10 +217,21 @@ impl Lower<'_, '_> {
     }
 
     fn offset_from(&mut self, ty: Ty, signed: bool, to: Value, from: Value) -> Result<Value> {
-        let size = self.size(ty)?;
+        let size = self.size(ty)?.max(1) as u64;
         let bytes = self.ins().isub(to, from);
-        let size = self.ins().iconst(Type::I64, size.max(1));
-        Ok(if signed { self.ins().sdiv(bytes, size) } else { self.ins().udiv(bytes, size) })
+        let shift = size.trailing_zeros();
+        let odd = size >> shift;
+        let mut count = bytes;
+        if shift != 0 {
+            let by = self.ins().iconst(Type::I64, i64::from(shift));
+            count = if signed { self.ins().sshr(count, by) } else { self.ins().ushr(count, by) };
+        }
+        if odd != 1 {
+            let inverse = (0..5).fold(odd, |x, _| x.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(x))));
+            let inverse = self.ins().iconst(Type::I64, inverse as i64);
+            count = self.ins().imul(count, inverse);
+        }
+        Ok(count)
     }
 
     fn read_at(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {
