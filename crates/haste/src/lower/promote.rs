@@ -144,6 +144,15 @@ impl Lower<'_, '_> {
         if self.cx.layout(ty)?.align.bytes() > 16 {
             return Ok(None);
         }
+        if !self.blob_statics.insert((item, substs)) {
+            return Ok(None);
+        }
+        let found = self.static_blob(item, substs, ty);
+        self.blob_statics.remove(&(item, substs));
+        found
+    }
+
+    fn static_blob(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
         let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
         let typed = typed.scoped(&self.cx.types);
         let static_ty = typed.ret_ty();

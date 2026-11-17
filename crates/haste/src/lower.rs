@@ -283,6 +283,8 @@ pub struct Lower<'l, 'a> {
     resume: Option<coroutine::Resume>,
     overflow_checks: bool,
     child_rodata: Vec<(RodataId, Option<Vec<u8>>)>,
+    /// The statics whose read-only bytes are being built now, which a cycle of statics that point to each other reaches again.
+    blob_statics: rustc_hash::FxHashSet<(ItemRef, crate::sema::substs::Substs)>,
 }
 
 /// Whether `item` is a static, whose reached instance writes its value into the static's cell.
@@ -330,6 +332,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             resume: None,
             overflow_checks,
             child_rodata: Vec::new(),
+            blob_statics: rustc_hash::FxHashSet::default(),
         }
     }
 
