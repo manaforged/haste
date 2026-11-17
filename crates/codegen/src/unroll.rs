@@ -1,6 +1,7 @@
 mod count;
 mod memset;
 mod region;
+mod vector;
 
 use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
@@ -686,9 +687,11 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 let (cond, t_blk, t_args, f_blk, f_args) = (*cond, *t_blk, t_args.clone(), *f_blk, f_args.clone());
                 if t_blk == head {
                     memset::run(func, b, (cond, true), &t_args, (f_blk, &f_args), &global_consts)
+                        || vector::run(func, b, (cond, true), &t_args, (f_blk, &f_args), &global_consts)
                         || unroll_self(func, &cfg, b, cond, true, t_args, f_blk, f_args, &global_consts)
                 } else if f_blk == head {
                     memset::run(func, b, (cond, false), &f_args, (t_blk, &t_args), &global_consts)
+                        || vector::run(func, b, (cond, false), &f_args, (t_blk, &t_args), &global_consts)
                         || unroll_self(func, &cfg, b, cond, false, f_args, t_blk, t_args, &global_consts)
                 } else {
                     false
@@ -697,7 +700,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 false
             }
         } else if each.size >= 2 && each.latches[0] != head {
-            unroll_chain(func, &cfg, each, &global_consts) || region::unroll(func, &cfg, each, &global_consts)
+            vector::flatten(func, each, &global_consts) || unroll_chain(func, &cfg, each, &global_consts) || region::unroll(func, &cfg, each, &global_consts)
         } else {
             false
         };

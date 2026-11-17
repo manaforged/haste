@@ -15,20 +15,23 @@ struct Fill {
     width: i64,
 }
 
-struct Emit<'f> {
-    func: &'f mut Function,
-    out: Vec<Inst>,
+/// Instructions appended in order to `out`, each with a fresh result in `func`.
+pub(super) struct Emit<'f> {
+    pub(super) func: &'f mut Function,
+    pub(super) out: Vec<Inst>,
 }
 
 impl Emit<'_> {
-    fn op(&mut self, op: Op, ty: Type) -> Value {
+    /// Appends `op` with a fresh result of type `ty`.
+    pub(super) fn op(&mut self, op: Op, ty: Type) -> Value {
         let value = self.func.value(ty);
         let inst = self.func.add(op, Some(value));
         self.out.push(inst);
         value
     }
 
-    fn konst(&mut self, imm: i64, ty: Type) -> Value {
+    /// Appends the constant `imm` of type `ty`.
+    pub(super) fn konst(&mut self, imm: i64, ty: Type) -> Value {
         self.op(Op::Const(imm), ty)
     }
 
@@ -62,7 +65,8 @@ fn fill_store(func: &Function, body: &[Inst], params: &[Value], defs: &[bool], g
     Some(Fill { value, byte, addr_idx, off, width: i64::from(ty.bytes()) })
 }
 
-fn steps(func: &Function, body: &[Inst], params: &[Value], back_args: &[Value], global_consts: &[Option<i64>]) -> Option<Vec<i64>> {
+/// The constant step of each loop parameter, zero when it passes through unchanged, or `None` when it does not step by a constant.
+pub(super) fn steps(func: &Function, body: &[Inst], params: &[Value], back_args: &[Value], global_consts: &[Option<i64>]) -> Vec<Option<i64>> {
     let step = |param: Value, next: Value| -> Option<i64> {
         if next == param {
             return Some(0);
@@ -75,7 +79,8 @@ fn steps(func: &Function, body: &[Inst], params: &[Value], back_args: &[Value], 
     params.iter().zip(back_args).map(|(&param, &next)| step(param, next)).collect()
 }
 
-fn outside_uses(func: &Function, b: usize, defs: &[bool], (params, back_args): (&[Value], &[Value]), exit_args: &[Value]) -> Option<Vec<bool>> {
+/// For each value of loop `b`, whether another block or the exit edge reads it, when every such read is a parameter or a back-edge value.
+pub(super) fn outside_uses(func: &Function, b: usize, defs: &[bool], (params, back_args): (&[Value], &[Value]), exit_args: &[Value]) -> Option<Vec<bool>> {
     let mut wanted = vec![false; func.types.len()];
     let mut fine = true;
     let mut see = |v: Value| {
@@ -180,7 +185,7 @@ pub(super) fn run(
     if count.cmp_cc != IntCC::UnsignedLessThan || count.is_ne || global_consts[count.stride.index()] != Some(1) {
         return false;
     }
-    let Some(steps) = steps(func, &body, &params, back_args, global_consts) else { return false };
+    let Some(steps) = steps(func, &body, &params, back_args, global_consts).into_iter().collect::<Option<Vec<i64>>>() else { return false };
     let Some(fill) = fill_store(func, &body, &params, &defs, global_consts) else { return false };
     if steps[fill.addr_idx] != fill.width {
         return false;

@@ -386,6 +386,15 @@ fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, (is_const, region
 
 /// Converts pure diamond and triangle conditional branches into branchless `Op::Select`.
 pub(crate) fn run(func: &mut Function) -> Domain {
+    convert(func, None)
+}
+
+/// Converts every branch headed inside `blocks` that `run` can convert, treating each as unpredictable.
+pub(crate) fn flatten(func: &mut Function, blocks: &[bool]) -> bool {
+    !convert(func, Some(blocks)).is_empty()
+}
+
+fn convert(func: &mut Function, only: Option<&[bool]>) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
         return Domain::NONE;
     }
@@ -404,11 +413,15 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 }
             }
         }
-        let region = crate::thread::unpredictable_region(func, &cfg);
+        let inside = |block: Block| only.is_none_or(|mask| mask.get(block.index()).copied().unwrap_or(false));
+        let region = match only {
+            Some(_) => (0..func.blocks.len()).map(|b| inside(Block(b as u32))).collect(),
+            None => crate::thread::unpredictable_region(func, &cfg),
+        };
         let mut cleared = vec![false; func.blocks.len()];
         let mut changed = false;
         for &block in cfg.rpo.iter().rev() {
-            if !cleared[block.index()] {
+            if !cleared[block.index()] && inside(block) {
                 changed |= try_head(func, &cfg, &prov, (&is_const, &region), block, &mut cleared);
             }
         }
