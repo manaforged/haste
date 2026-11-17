@@ -9,14 +9,32 @@ use super::{Infer, Res};
 impl Infer<'_, '_> {
     /// Infers the array expression `[items]`, coercing each item to the element type of an expected array or slice.
     pub fn array_expr(&mut self, items: List, expected: Option<Ty>) -> Result<Ty> {
+        let items = self.body.list(items).to_vec();
         let element = match expected.map(|ty| self.cx.types.kind(self.resolve(ty)).clone()) {
             Some(Kind::Array(element, _) | Kind::Slice(element)) => element,
-            _ => self.fresh(Kind::Var),
+            _ => return self.merged_array(&items),
         };
-        let items = self.body.list(items).to_vec();
         for &item in &items {
             let found = self.expr(ExprId(item), Some(element))?;
             self.coerce_expr(ExprId(item), found, element)?;
+        }
+        Ok(self.cx.types.array(element, items.len() as u64))
+    }
+
+    /// Infers an array of `items` with no expected element, whose element is the common type of its items, as for the arms of a `match`.
+    fn merged_array(&mut self, items: &[u32]) -> Result<Ty> {
+        let var = self.fresh(Kind::Var);
+        let (mut hint, mut found) = (None, Vec::with_capacity(items.len()));
+        for &item in items {
+            let ty = self.expr(ExprId(item), Some(hint.unwrap_or(var)))?;
+            if !self.is_never(ty) {
+                hint = Some(self.next_arm_hint(hint, ty)?);
+            }
+            found.push((ExprId(item), ty));
+        }
+        let element = self.merge_arms(&found, Some(var))?;
+        for &(item, ty) in &found {
+            self.coerce_expr(item, ty, element)?;
         }
         Ok(self.cx.types.array(element, items.len() as u64))
     }
