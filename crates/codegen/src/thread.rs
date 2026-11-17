@@ -1,5 +1,6 @@
 mod carry;
 mod eval;
+mod ret;
 mod sink;
 mod widen;
 
@@ -586,6 +587,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         pinned.iter_mut().zip(region).for_each(|(pin, inside)| *pin |= inside);
     }
     let mut consts = Vec::new();
+    let opened = ret::open_returns(func, &pinned);
     let mut any = false;
     for round in 0..16 {
         let mut defs = vec![None; func.types.len()];
@@ -658,6 +660,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         func.bump_cfg();
         any = true;
     }
+    any |= ret::close_returns(func, &opened) | !opened.is_empty();
     let widened = widen::run(func);
     let mut dirty = if any || widened {
         crate::fold::prune(func, entry);
