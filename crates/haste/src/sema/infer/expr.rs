@@ -363,6 +363,19 @@ impl Infer<'_, '_> {
         Ok(!self.probe(|infer| infer.select_or_assume(of, left, &[right]).unwrap_or(false)))
     }
 
+    /// Falls back the number right operand of each pending operator whose left operand is known and types those operators, so their results reach the numbers that use them before those fall back, as with `b >> bit & 1` for `b: u64` and `bit: &{integer}`.
+    pub(super) fn fall_back_operands(&mut self) -> Result<()> {
+        loop {
+            let rights: Vec<Ty> = self.operands.iter().filter(|(_, _, (left, right), _)| !self.unknown_operand(*left) && self.is_num_var(*right)).map(|(_, _, (_, right), _)| *right).collect();
+            if rights.is_empty() {
+                return Ok(());
+            }
+            self.fall_back_in(rights)?;
+            self.settle_operators(false)?;
+            self.settle_projection_loop()?;
+        }
+    }
+
     fn unknown_operand(&self, ty: Ty) -> bool {
         match self.cx.types.kind(self.resolve(ty)) {
             Kind::Var(_) => true,

@@ -139,7 +139,7 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn settle_projection_loop(&mut self) -> Result<()> {
+    pub(super) fn settle_projection_loop(&mut self) -> Result<()> {
         for _ in 0..crate::RECURSION_LIMIT {
             let before = (self.projections.len(), self.obligations.len(), self.bound_vars());
             self.settle_projections()?;
@@ -190,6 +190,7 @@ impl Infer<'_, '_> {
     fn settle_final_passes(&mut self) -> Result<()> {
         self.fall_back_residuals()?;
         self.settle_projection_loop()?;
+        self.fall_back_operands()?;
         self.fall_back_numbers()?;
         self.fall_back_diverging()?;
         self.settle_obligations()?;
@@ -230,7 +231,12 @@ impl Infer<'_, '_> {
 
     fn fall_back_numbers(&mut self) -> Result<()> {
         let exprs = self.out.exprs.iter().copied().filter(|ty| *ty != Ty::NONE);
-        let mut stack: Vec<Ty> = exprs.chain(self.out.locals.iter().map(|local| local.ty)).collect();
+        let roots: Vec<Ty> = exprs.chain(self.out.locals.iter().map(|local| local.ty)).collect();
+        self.fall_back_in(roots)
+    }
+
+    /// Gives each integer and float variable inside `stack` its fallback type, `i32` or `f64`.
+    pub(super) fn fall_back_in(&mut self, mut stack: Vec<Ty>) -> Result<()> {
         let mut seen = HashSet::default();
         while let Some(ty) = stack.pop() {
             let ty = self.resolve(ty);
