@@ -751,12 +751,14 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
         let heap = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
         b.func.blocks[init.index()].insts = insts;
         b.ins().store(heap, object, spec.header.1);
+        b.func.mark_unique_ptr(heap);
         heap
     };
     b.ins().stack_store(init_fp, anchor, 0);
     b.ins().jump(old_entry, &params);
     b.switch_to_block(dispatch);
     let disp_fp = b.ins().load(Type::I64, object, spec.header.1);
+    b.func.mark_unique_ptr(disp_fp);
     b.ins().stack_store(disp_fp, anchor, 0);
     if spec.resumes.len() >= 2 {
         let idx = b.ins().iadd_imm(state, -CoroutineState::FirstSuspend.code());

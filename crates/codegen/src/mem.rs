@@ -75,9 +75,9 @@ impl TrackRoot {
         }
     }
 
-    fn across_edge(self) -> Self {
+    fn across_edge(self, entry: &[Value]) -> Self {
         match self {
-            Self::Set(MemRoot::UniqueHeap(Some(_))) => Self::Set(MemRoot::UniqueHeap(None)),
+            Self::Set(MemRoot::UniqueHeap(Some(owner))) if !entry.contains(&owner) => Self::Set(MemRoot::UniqueHeap(None)),
             other => other,
         }
     }
@@ -128,11 +128,11 @@ fn step_track(op: &Op, ty: Type, tracked: &[TrackRoot]) -> TrackRoot {
     }
 }
 
-fn join_track_args(tracked: &mut [TrackRoot], blocks: &[BlockData], target: Block, args: &[Value]) -> bool {
+fn join_track_args(tracked: &mut [TrackRoot], (blocks, entry): (&[BlockData], &[Value]), target: Block, args: &[Value]) -> bool {
     let mut changed = false;
     for (&param, &arg) in blocks[target.index()].params.iter().zip(args) {
         if arg != param {
-            let next = tracked[param.index()].join(tracked[arg.index()].across_edge());
+            let next = tracked[param.index()].join(tracked[arg.index()].across_edge(entry));
             if next != tracked[param.index()] {
                 tracked[param.index()] = next;
                 changed = true;
@@ -180,10 +180,11 @@ fn track_def(func: &Function, inst: Inst, tracked: &mut [TrackRoot], affine: &[(
     changed
 }
 
-fn track_edges(func: &Function, inst: Inst, tracked: &mut [TrackRoot]) -> bool {
+fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [TrackRoot]) -> bool {
+    let blocks = (func.blocks.as_slice(), entry);
     match &func.insts[inst.index()].op {
-        Op::Jump(t, args) => join_track_args(tracked, &func.blocks, *t, args),
-        Op::Brif(_, t, ta, f, fa) => join_track_args(tracked, &func.blocks, *t, ta) | join_track_args(tracked, &func.blocks, *f, fa),
+        Op::Jump(t, args) => join_track_args(tracked, blocks, *t, args),
+        Op::Brif(_, t, ta, f, fa) => join_track_args(tracked, blocks, *t, ta) | join_track_args(tracked, blocks, *f, fa),
         _ => false,
     }
 }
@@ -191,6 +192,7 @@ fn track_edges(func: &Function, inst: Inst, tracked: &mut [TrackRoot]) -> bool {
 fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> Vec<TrackRoot> {
     let mut tracked = vec![TrackRoot::Unset; func.types.len()];
     seed_entry_roots(func, cfg, &mut tracked);
+    let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
     let mut steps = Vec::new();
     let mut changed = false;
     for &b in &cfg.rpo {
@@ -205,7 +207,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
         if let Some(&last) = insts.last()
             && matches!(func.insts[last.index()].op, Op::Jump(..) | Op::Brif(..))
         {
-            changed |= track_edges(func, last, &mut tracked);
+            changed |= track_edges(func, entry, last, &mut tracked);
             steps.push((last, true));
         }
     }
@@ -213,7 +215,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
     while changed && rounds < 64 {
         changed = false;
         for &(inst, edges) in &steps {
-            changed |= if edges { track_edges(func, inst, &mut tracked) } else { track_def(func, inst, &mut tracked, affine) };
+            changed |= if edges { track_edges(func, entry, inst, &mut tracked) } else { track_def(func, inst, &mut tracked, affine) };
         }
         rounds += 1;
     }
