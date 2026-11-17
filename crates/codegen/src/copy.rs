@@ -209,21 +209,21 @@ fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32)
     splits
 }
 
-/// One edge that `split_returns` gave its own copy to the return memory: the block it leaves, which of its edges, the new block with the copy and return, the copy, the join it reached and the address it passed.
+/// One edge that `split_returns` gave its own copy to the return memory: the block holding the copy and its return, the branch edge sent to that block when it is new, the join it reached and the address it passed.
 struct SplitReturn {
     block: Block,
-    pred: Block,
-    edge: Edge,
     copy: Inst,
+    ret: Inst,
+    branch: Option<(Block, Edge)>,
     join: Block,
     addr: Value,
 }
 
-/// Points edge `edge` of the last instruction of `pred` at `target` with `args`.
+/// Points branch edge `edge` of the last instruction of `pred` at `target` with `args`.
 fn retarget_edge(func: &mut Function, pred: Block, edge: Edge, target: Block, args: Vec<Value>) {
     let Some(&last) = func.blocks[pred.index()].insts.last() else { return };
     match (&mut func.insts[last.index()].op, edge) {
-        (Op::Jump(to, to_args), Edge::Jump) | (Op::Brif(_, to, to_args, ..), Edge::Then) | (Op::Brif(_, _, _, to, to_args), Edge::Else) => {
+        (Op::Brif(_, to, to_args, ..), Edge::Then) | (Op::Brif(_, _, _, to, to_args), Edge::Else) => {
             *to = target;
             *to_args = args;
         }
@@ -231,17 +231,25 @@ fn retarget_edge(func: &mut Function, pred: Block, edge: Edge, target: Block, ar
     }
 }
 
-/// Sends each edge of `joins` that reaches a copy-and-return block to a new block with its own copy to `sret_ptr` and return, so each slot has its own copy-out.
+/// Gives each edge of `joins` that reaches a copy-and-return block its own copy to `sret_ptr` and return, in place of a jump or in a new block for a branch edge, so each slot has its own copy-out.
 fn split_returns(func: &mut Function, sret_ptr: Value, bytes: u32, joins: &[(Block, Vec<(Block, Edge, Value)>)]) -> Vec<SplitReturn> {
     let mut split = Vec::new();
     for &(join, ref edges) in joins {
         for &(pred, edge, addr) in edges {
-            let copy = func.add(Op::Move(sret_ptr, addr, bytes), None);
             let ret = func.add(Op::Return(Vec::new()), None);
-            let block = Block(func.blocks.len() as u32);
-            func.blocks.push(BlockData { params: Vec::new(), insts: vec![copy, ret] });
-            retarget_edge(func, pred, edge, block, Vec::new());
-            split.push(SplitReturn { block, pred, edge, copy, join, addr });
+            let (block, copy, branch) = if edge == Edge::Jump {
+                let Some(&copy) = func.blocks[pred.index()].insts.last() else { continue };
+                func.insts[copy.index()].op = Op::Move(sret_ptr, addr, bytes);
+                func.blocks[pred.index()].insts.push(ret);
+                (pred, copy, None)
+            } else {
+                let copy = func.add(Op::Move(sret_ptr, addr, bytes), None);
+                let block = Block(func.blocks.len() as u32);
+                func.blocks.push(BlockData { params: Vec::new(), insts: vec![copy, ret] });
+                retarget_edge(func, pred, edge, block, Vec::new());
+                (block, copy, Some((pred, edge)))
+            };
+            split.push(SplitReturn { block, copy, ret, branch, join, addr });
         }
     }
     if !split.is_empty() {
@@ -254,11 +262,20 @@ fn split_returns(func: &mut Function, sret_ptr: Value, bytes: u32, joins: &[(Blo
 fn rejoin_returns(func: &mut Function, split: &[SplitReturn]) -> bool {
     let mut kept = false;
     for one in split {
-        if matches!(func.insts[one.copy.index()].op, Op::Move(..)) {
-            retarget_edge(func, one.pred, one.edge, one.join, vec![one.addr]);
-            func.blocks[one.block.index()].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
-        } else {
+        if !matches!(func.insts[one.copy.index()].op, Op::Move(..)) {
             kept = true;
+            continue;
+        }
+        match one.branch {
+            None => {
+                func.insts[one.copy.index()].op = Op::Jump(one.join, vec![one.addr]);
+                func.insts[one.ret.index()].op = Op::Trap;
+                func.blocks[one.block.index()].insts.retain(|&inst| inst != one.ret);
+            }
+            Some((pred, edge)) => {
+                retarget_edge(func, pred, edge, one.join, vec![one.addr]);
+                func.blocks[one.block.index()].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
+            }
         }
     }
     if !split.is_empty() {
