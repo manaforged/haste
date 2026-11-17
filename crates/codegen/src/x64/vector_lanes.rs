@@ -1,7 +1,8 @@
-use super::asm::{Alu, Cond, Group3, Mem, Reg, Shift, Size, Xmm};
+use super::asm::{Alu, Cond, Group3, Mem, Reg, Shift, Size, Vl, Xmm};
 use super::float::{X0, X1, X2};
 use super::int::cond;
 use super::vector::{vec_alu_opcode, vec_prefix};
+use super::ymm::broadcast;
 use super::Emit;
 use crate::alloc::Location;
 use crate::frame::Ext;
@@ -137,6 +138,11 @@ impl Emit<'_> {
         if all_a || all_b {
             let src_val = if all_a { a } else { b };
             let off = if all_a { 0 } else { count };
+            if self.features.avx2 && indices[..c].iter().all(|&i| i == off) {
+                let src = self.fin(src_val, X0);
+                self.asm.vex(Vl::X, broadcast(lane), (dst, Xmm(0)), src);
+                return;
+            }
             if (0..c).all(|l| usize::from(indices[l] - off) == l) {
                 let src = self.fin(src_val, dst);
                 if src != dst {

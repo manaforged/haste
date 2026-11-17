@@ -64,7 +64,8 @@ pub(crate) fn host_avx2() -> bool {
     Features::host().avx2
 }
 
-fn broadcast(lane: Lane) -> VexOp {
+/// The AVX2 op that copies the lowest lane of a register to every lane.
+pub(super) fn broadcast(lane: Lane) -> VexOp {
     let op = match lane {
         Lane::I8 => 0x78,
         Lane::I16 => 0x79,
