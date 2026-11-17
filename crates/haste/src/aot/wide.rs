@@ -78,6 +78,19 @@ fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: bool) -> V
     b.ins().jump(done, &[z_res]);
 
     b.switch_to_block(pre);
+    let c64 = b.ins().iconst(Type::I64, 64);
+    let y_hi128 = b.ins().ushr(y, c64);
+    let y_hi = b.ins().ireduce(Type::I64, y_hi128);
+    let narrow = b.ins().icmp_imm(IntCC::Equal, y_hi, 0);
+    let narrow_blk = b.create_block();
+    let loop_blk = b.create_block();
+    b.ins().brif(narrow, narrow_blk, &[], loop_blk, &[]);
+
+    b.switch_to_block(narrow_blk);
+    let narrow_res = udivrem_by_u64(b, x, y, want_rem);
+    b.ins().jump(done, &[narrow_res]);
+
+    b.switch_to_block(loop_blk);
     let sh0 = b.ins().iconst(Type::I64, 127);
     b.ins().jump(hdr, &[zero, zero, sh0]);
 
@@ -105,6 +118,69 @@ fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: bool) -> V
 
     b.switch_to_block(done);
     out
+}
+
+fn udivrem_by_u64(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: bool) -> Value {
+    let c64 = b.ins().iconst(Type::I64, 64);
+    let x_hi128 = b.ins().ushr(x, c64);
+    let x_hi = b.ins().ireduce(Type::I64, x_hi128);
+    let x_lo = b.ins().ireduce(Type::I64, x);
+    let v = b.ins().ireduce(Type::I64, y);
+    let q_hi = b.ins().udiv(x_hi, v);
+    let q_hi_v = b.ins().imul(q_hi, v);
+    let r_hi = b.ins().isub(x_hi, q_hi_v);
+    let (q_lo, r) = divlu(b, (r_hi, x_lo), v);
+    if want_rem { b.ins().uextend(Type::I128, r) } else { b.ins().iconcat(q_lo, q_hi) }
+}
+
+fn divlu(b: &mut FunctionBuilder<'_>, (u1, u0): (Value, Value), v: Value) -> (Value, Value) {
+    let s = b.ins().clz(v);
+    let vn = b.ins().ishl(v, s);
+    let c32 = b.ins().iconst(Type::I64, 32);
+    let mask = b.ins().iconst(Type::I64, 0xffff_ffff);
+    let vn1 = b.ins().ushr(vn, c32);
+    let vn0 = b.ins().band(vn, mask);
+    let c1 = b.ins().iconst(Type::I64, 1);
+    let c63 = b.ins().iconst(Type::I64, 63);
+    let back = b.ins().isub(c63, s);
+    let u0_half = b.ins().ushr(u0, c1);
+    let carry = b.ins().ushr(u0_half, back);
+    let u1_shl = b.ins().ishl(u1, s);
+    let un32 = b.ins().bor(u1_shl, carry);
+    let un10 = b.ins().ishl(u0, s);
+    let un1 = b.ins().ushr(un10, c32);
+    let un0 = b.ins().band(un10, mask);
+    let (q1, un21) = divlu_digit(b, (un32, un1), (vn, vn1, vn0));
+    let (q0, rn) = divlu_digit(b, (un21, un0), (vn, vn1, vn0));
+    let q1_shl = b.ins().ishl(q1, c32);
+    let q = b.ins().bor(q1_shl, q0);
+    (q, b.ins().ushr(rn, s))
+}
+
+fn divlu_digit(b: &mut FunctionBuilder<'_>, (num, next): (Value, Value), (vn, vn1, vn0): (Value, Value, Value)) -> (Value, Value) {
+    let c32 = b.ins().iconst(Type::I64, 32);
+    let zero = b.ins().iconst(Type::I64, 0);
+    let mut q = b.ins().udiv(num, vn1);
+    let q_vn1 = b.ins().imul(q, vn1);
+    let mut rhat = b.ins().isub(num, q_vn1);
+    for _ in 0..2 {
+        let big = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, q, 1 << 32);
+        let rhat_small = b.ins().icmp_imm(IntCC::UnsignedLessThan, rhat, 1 << 32);
+        let q_vn0 = b.ins().imul(q, vn0);
+        let rhat_shl = b.ins().ishl(rhat, c32);
+        let rhat_next = b.ins().bor(rhat_shl, next);
+        let over = b.ins().icmp(IntCC::UnsignedGreaterThan, q_vn0, rhat_next);
+        let wrong = b.ins().bor(big, over);
+        let fix = b.ins().band(rhat_small, wrong);
+        let fix64 = b.ins().uextend(Type::I64, fix);
+        q = b.ins().isub(q, fix64);
+        let bump = b.ins().select(fix, vn1, zero);
+        rhat = b.ins().iadd(rhat, bump);
+    }
+    let num_shl = b.ins().ishl(num, c32);
+    let joined = b.ins().bor(num_shl, next);
+    let q_vn = b.ins().imul(q, vn);
+    (q, b.ins().isub(joined, q_vn))
 }
 
 fn build_divrem(signed: bool, want_rem: bool) -> Function {
