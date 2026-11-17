@@ -115,8 +115,10 @@ impl Emit<'_> {
             if !kept {
                 self.get(Reg::Rdx, carry, Ext::Zero);
             }
-            self.get(Reg::Rax, a, Ext::Zero);
-            let source = self.reg_of(b).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)).unwrap_or_else(|| {
+            let busy = [self.reg_of(b), self.reg_of(carry)];
+            let target = Some(self.dst(result)).filter(|&reg| !out && !matches!(reg, Reg::Rdx | Reg::Rcx | Reg::Rsp) && !busy.contains(&Some(reg))).unwrap_or(Reg::Rax);
+            self.get(target, a, Ext::Zero);
+            let source = self.reg_of(b).filter(|&reg| !matches!(reg, Reg::Rdx | Reg::Rsp) && reg != target).unwrap_or_else(|| {
                 self.get(Reg::Rcx, b, Ext::Zero);
                 Reg::Rcx
             });
@@ -129,13 +131,15 @@ impl Emit<'_> {
                 }
                 self.asm.alu_imm_sized(Size::B, Alu::Add, Reg::Rdx, -1);
             }
-            self.asm.alu(if add { Alu::Adc } else { Alu::Sbb }, Reg::Rax, source);
-            self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
+            self.asm.alu(if add { Alu::Adc } else { Alu::Sbb }, target, source);
+            self.clobber_regs(&[target, Reg::Rax, Reg::Rcx, Reg::Rdx]);
+            if !out {
+                self.carry_flags = Some((add, args));
+                self.put(result, target);
+            }
         }
         self.flags = None;
         if !out {
-            self.carry_flags = Some((add, args));
-            self.put(result, Reg::Rax);
             return Ok(());
         }
         if self.flag_carry[result.index()] {
