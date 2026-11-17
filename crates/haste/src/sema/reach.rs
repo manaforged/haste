@@ -10,6 +10,7 @@ use crate::names::path::Requests;
 use super::Context;
 use super::infer::{LazyTables, Res, Shape, Typed, infer, register};
 use super::substs::Substs;
+use super::summary::thaw;
 mod filter;
 mod wave;
 
@@ -737,16 +738,22 @@ pub(crate) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut
         register(cx, *instance, &typed);
         return Ok(typed);
     }
+    if let Some(result) = thaw::thawed(cx, instance, unlaid) {
+        return result;
+    }
+    let typed = typed_fresh(cx, instance, unlaid)?;
+    thaw::note_fresh(cx, *instance, &typed);
+    Ok(typed)
+}
+
+fn typed_fresh(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     let _guard = InferGuard::enter(*instance);
     if let Some(result) = super::summary::typed_once_poly(cx, instance, unlaid) {
         return result;
     }
     let before = cx.quiet_mark();
     let typed = Arc::new(infer(cx, instance.0, instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
-    let laid = lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
-    if laid.is_ok() && cx.quiet_mark() == before {
-        cx.store.finals.insert(*instance, Arc::clone(&typed));
-    }
+    thaw::keep_laid(cx, *instance, &typed, unlaid, before);
     Ok(typed)
 }
 

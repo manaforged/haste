@@ -98,6 +98,7 @@ pub(super) struct Lookups {
     pub(super) trait_calls: Table<(ItemRef, super::substs::Substs), infer::Res>,
     pub(super) assoc_types: Table<(ItemRef, ty::Ty, super::substs::Substs, ItemRef, super::substs::Substs), ty::Ty>,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
+    pub(super) verdicts: Table<ItemRef, ()>,
     pub(super) has_new_sysroot_summaries: Arc<AtomicBool>,
     pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
@@ -142,6 +143,7 @@ impl Lookups {
                 selections,
                 projections,
                 summaries: std::mem::take(&mut self.summaries),
+                verdicts: std::mem::take(&mut self.verdicts),
                 has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
                 has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
                 substrate: self.substrate.clone(),
@@ -249,9 +251,8 @@ impl Cache {
             }
             let target_builder = if outline.is_sysroot(item.krate) { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
             if let Some(builder) = target_builder
-                && let summary::SummaryKind::Poly(summary) = kind
                 && let Some(key) = crate::substrate::sysroot_item_key(outline, item)
-                && let Ok(Some(bytes)) = summary::codec::encode_summary(outline, &self.types, summary, crate::substrate::sysroot_item_key)
+                && let Some(bytes) = summary::thaw::encode_kind(outline, &self.types, (item, kind), &self.lookups.verdicts)
                 && let Err(e) = builder.add_summary(key, &bytes)
             {
                 err = Some(e);
@@ -260,7 +261,7 @@ impl Cache {
         if let Some(e) = err {
             return Err(e);
         }
-        summary::frozen::export_sysroot_instances(outline, &self.types, &self.finals, toolchain, deps)
+        summary::frozen::export_sysroot_instances((outline, &self.types), (&self.finals, &self.lookups.summaries), toolchain, deps)
     }
 
     /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
