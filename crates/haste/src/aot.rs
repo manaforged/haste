@@ -61,6 +61,7 @@ pub(crate) struct Executable {
     pub(super) relocs: Vec<CodeReloc>,
     pub(super) pointers: Vec<PtrReloc>,
     pub(super) symbols: Vec<(u32, String)>,
+    pub(super) thread_slots: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +86,7 @@ impl Executable {
             relocs: Vec::new(),
             pointers: Vec::new(),
             symbols: Vec::new(),
+            thread_slots: 0,
         }
     }
 
@@ -296,8 +298,8 @@ fn classify_runtime(rt: RuntimeSymbol) -> Result<Binding<'static>> {
         Memmove => Binding::Import("memmove", None),
         Memset => Binding::Import("memset", None),
         Memcmp => Binding::Import("memcmp", None),
-        Malloc => Binding::Import("malloc", None),
-        Free => Binding::Import("free", None),
+        Malloc => Binding::Shim(Shim::FrameAlloc),
+        Free => Binding::Shim(Shim::FrameFree),
         other => Binding::Shim(Shim::Wide(WideShim::Runtime(other))),
     })
 }
@@ -310,6 +312,10 @@ pub(super) struct SectionAddrs {
     pub(super) bss: u64,
     pub(super) dso_handle: u64,
     pub(super) thread_key: u64,
+    /// How far below the thread pointer the executable's static TLS block starts, on x86-64 ELF.
+    pub(super) thread_tls: u64,
+    /// How far below the thread pointer the coroutine frame cache starts, on x86-64 ELF.
+    pub(super) frame_tls: u64,
 }
 
 fn classify<'a>(sym: &'a Symbol, addrs: SectionAddrs) -> Result<Binding<'a>> {

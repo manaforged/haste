@@ -128,6 +128,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         bss: bss_va,
         dso_handle: MACH_BASE + dso_off as u64,
         thread_key: bss_va + u64::from(key_off),
+        thread_tls: 0,
+        frame_tls: 0,
     };
     let stub_va = |name: &str| Ok(MACH_BASE + (stubs_off + plan.import_idx(name)? * stub_size) as u64);
     let got_va = |idx: usize| MACH_BASE + (data_seg_off + idx * 8) as u64;

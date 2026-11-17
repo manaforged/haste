@@ -783,6 +783,7 @@ impl Image {
             slot_offs.insert(idx, exe.rodata(&[0; 8], 8));
         }
         let thread_slots: HashMap<usize, u64> = live.thread_slots.list.iter().enumerate().map(|(rank, &index)| (index, rank as u64)).collect();
+        exe.thread_slots = live.thread_slots.list.len() as u32;
         let (rodata_offs, vtable_offs) = emit_rodata_and_vtables(&state, &live, &mut exe)?;
         let (static_syms, promoted_syms) = emit_static_syms(&state, &live, &mut exe);
         let syms = SymTable {

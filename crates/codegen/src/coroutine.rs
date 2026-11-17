@@ -73,6 +73,10 @@ struct Frame {
 }
 
 impl Frame {
+    const fn bytes(&self) -> u32 {
+        if self.size < 8 { 8 } else { self.size }
+    }
+
     fn place(&mut self, size: u32, align: u32) -> u32 {
         let at = self.size.next_multiple_of(align.max(1));
         self.size = at + size;
@@ -153,7 +157,7 @@ pub(crate) fn split(func: &mut Function) {
     func.slots = stack;
     let anchor = StackSlot(0);
     let orig_blocks = func.blocks.len();
-    let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), frame.size);
+    let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), frame.bytes());
     func.bump_cfg();
     let split_cfg = func.cfg();
     let mut active_fp: Vec<Option<Value>> = vec![None; func.blocks.len()];
@@ -687,7 +691,8 @@ fn rewrite(
             op => op,
         };
         if data.op.is_terminator() && free {
-            call(func, &mut insts, RuntimeSymbol::Free, &[fp.expect("free requires frame pointer")], false);
+            let bytes = push(func, &mut insts, Op::Const(i64::from(frame.bytes())), Some(Type::I64)).expect("a constant has a result");
+            call(func, &mut insts, RuntimeSymbol::Free, &[fp.expect("free requires frame pointer"), bytes], false);
         }
         let spilled: Vec<(Value, i32)> = results(&data)
             .filter_map(|value| {
@@ -730,7 +735,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     b.ins().brif(fresh, init, &[], dispatch, &[]);
     b.switch_to_block(init);
     let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
-    let bytes = push(b.func, &mut insts, Op::Const(i64::from(size.max(8))), Some(Type::I64)).expect("a constant has a result");
+    let bytes = push(b.func, &mut insts, Op::Const(i64::from(size)), Some(Type::I64)).expect("a constant has a result");
     let init_fp = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
     b.func.blocks[init.index()].insts = insts;
     b.ins().store(init_fp, object, spec.header.1);

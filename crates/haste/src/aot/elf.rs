@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Arch, Os};
 
-use super::shims::{emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
+use super::shims::{Shim, emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
 use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym};
 
 const SECTION_NAMES: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
@@ -83,6 +83,9 @@ fn write_symbols(out: &mut Buf, exe: &Executable, text: (u64, usize), symtab_off
     write_shdr(out, [23, 3, 0, 0], [0, 0, names_off as u64, SECTION_NAMES.len() as u64, 1, 0]);
 }
 
+/// The bytes of the coroutine frame cache in the static TLS block: a head and a count for each 16-byte size class below 1024 bytes.
+const FRAME_CACHE_BYTES: u64 = 1024;
+
 pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Result<Vec<u8>> {
     let arch = exe.target.arch;
     let plan = Plan::collect(exe, &["__libc_start_main"])?;
@@ -95,7 +98,11 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let tables = build_tables(&plan);
     let nsyms = 1 + plan.imports.len();
 
-    let interp_off = 64 + 5 * 56;
+    let slots_tls = if arch == Arch::X64 && plan.has_shim(Shim::ThreadCell) { u64::from(exe.thread_slots.max(1)) * 8 } else { 0 };
+    let cache_tls = if arch == Arch::X64 && plan.has_shim(Shim::FrameAlloc) { FRAME_CACHE_BYTES } else { 0 };
+    let tls = (cache_tls + slots_tls).next_multiple_of(16);
+    let phnum = if tls == 0 { 5 } else { 6 };
+    let interp_off = 64 + phnum * 56;
     let hash_off = (interp_off + interp.len()).next_multiple_of(8);
     let dynsym_off = (hash_off + (2 + tables.buckets.len() + nsyms) * 4).next_multiple_of(8);
     let dynstr_off = dynsym_off + nsyms * 24;
@@ -133,6 +140,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         bss: bss_va,
         dso_handle: ELF_BASE + dso_off as u64,
         thread_key: bss_va + u64::from(key_off),
+        thread_tls: tls - cache_tls,
+        frame_tls: tls,
     };
     let stub_va = |name: &str| Ok(ELF_BASE + (stubs_off + plan.import_idx(name)? * stub_size) as u64);
     let got_va = |idx: usize| rw_va + ((got_off - rw_off) + idx * 8) as u64;
@@ -145,12 +154,15 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     out.u32(1);
     out.u64s(&[ELF_BASE + start_off as u64, 64, shdr_off as u64]);
     out.u32(0);
-    [64_u16, 56, 5, 64, 5, 4].into_iter().for_each(|v| out.u16(v));
-    write_phdr(&mut out, 6, 4, 64, ELF_BASE + 64, 5 * 56, 5 * 56, 8);
+    [64_u16, 56, phnum as u16, 64, 5, 4].into_iter().for_each(|v| out.u16(v));
+    write_phdr(&mut out, 6, 4, 64, ELF_BASE + 64, phnum * 56, phnum * 56, 8);
     write_phdr(&mut out, 3, 4, interp_off, ELF_BASE + interp_off as u64, interp.len(), interp.len(), 1);
     write_phdr(&mut out, 1, 5, 0, ELF_BASE, rx_end, rx_end, page);
     write_phdr(&mut out, 1, 6, rw_off, rw_va, rw_filesz, bss_in_rw + bss_total as usize, page);
     write_phdr(&mut out, 2, 6, dyn_off, rw_va + (dyn_off - rw_off) as u64, dyn_size, dyn_size, 8);
+    if tls != 0 {
+        write_phdr(&mut out, 7, 4, rw_off + bss_in_rw, bss_va, 0, tls as usize, 16);
+    }
 
     out.bytes(interp);
     out.align(8);
