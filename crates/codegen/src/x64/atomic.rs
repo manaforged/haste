@@ -286,13 +286,13 @@ impl Emit<'_> {
         let size = Size::of(ty.bytes());
         match op {
             Op::AtomicLoad(addr) => {
-                self.raw(Reg::Rcx, *addr);
-                self.read(result()?, Mem::new(Reg::Rcx, 0));
+                let target = self.atomic_target(*addr, Reg::Rcx, &[]);
+                self.read(result()?, target);
             }
             Op::AtomicStore(value, addr) => {
-                self.raw(Reg::Rcx, *addr);
+                let target = self.atomic_target(*addr, Reg::Rcx, &[Reg::Rax]);
                 self.raw(Reg::Rax, *value);
-                self.asm.xchg(size, Mem::new(Reg::Rcx, 0), Reg::Rax);
+                self.asm.xchg(size, target, Reg::Rax);
                 self.clobber_reg(Reg::Rax);
             }
             Op::AtomicRmw(rmw, addr, value) => {
@@ -301,10 +301,10 @@ impl Emit<'_> {
                 self.put(result()?, Reg::Rax);
             }
             Op::AtomicCas(addr, expected, replacement) => {
-                self.raw(Reg::Rsi, *addr);
+                let target = self.atomic_target(*addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx]);
                 self.raw(Reg::Rax, *expected);
                 self.raw(Reg::Rcx, *replacement);
-                self.asm.cmpxchg(size, Mem::new(Reg::Rsi, 0), Reg::Rcx);
+                self.asm.cmpxchg(size, target, Reg::Rcx);
                 self.clobber_reg(Reg::Rax);
                 self.put(result()?, Reg::Rax);
             }
@@ -659,12 +659,20 @@ impl Emit<'_> {
         self.asm.load(Size::B, dst, dst);
     }
 
+    /// The memory at `addr`: in the register that holds it unless the operation writes that register, else through `scratch`.
+    fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
+        if let Some(reg) = self.reg_of(addr).filter(|reg| !written.contains(reg) && *reg != Reg::Rsp) {
+            return Mem::new(reg, 0);
+        }
+        self.raw(scratch, addr);
+        Mem::new(scratch, 0)
+    }
+
     /// Leaves the old contents in rax.
     fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
-        let target = Mem::new(Reg::Rcx, 0);
         match op {
             AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub => {
-                self.raw(Reg::Rcx, addr);
+                let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
                 self.raw(Reg::Rax, value);
                 if op == AtomicRmwOp::Xchg {
                     self.asm.xchg(size, target, Reg::Rax);
@@ -681,8 +689,7 @@ impl Emit<'_> {
 
     fn rmw_loop(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
-        let target = Mem::new(Reg::Rsi, 0);
-        self.raw(Reg::Rsi, addr);
+        let target = self.atomic_target(addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx, Reg::Rdx]);
         self.get(Reg::Rdx, value, Ext::of(signed));
         self.asm.load(size, Reg::Rax, target);
         let again = self.asm.label();
