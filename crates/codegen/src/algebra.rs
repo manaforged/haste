@@ -700,7 +700,7 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Extract(v, lane) => vec::simplify_extract(cx, res, v, lane),
         Op::Shuffle(a, b, ShuffleMask::Const(m)) => vec::simplify_shuffle(cx, res, a, b, m),
         Op::Fits(Binary::Imul, false, x, y) => ovf::simplify_mul_fits(cx, x, y),
-        Op::Select(cond, t, f) => ovf::gated_product(cx, cond, t, f).or_else(|| select::simplify_select(cx, res, cond, t, f)),
+        Op::Select(cond, t, f) => ovf::gated_product(cx, cond, t, f).or_else(|| vec::byte_abs(cx, cond, t, f)).or_else(|| select::simplify_select(cx, res, cond, t, f)),
         Op::Brif(cond, tb, ref ta, eb, ref ea) => {
             let (ta, ea) = (ta.clone(), ea.clone());
             match select::tested_select(cx, cond) {

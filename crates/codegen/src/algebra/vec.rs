@@ -29,6 +29,13 @@ fn sign_source(cx: &RewriteCx, v: Value) -> Option<Value> {
     }
 }
 
+/// `select(x < 0, -x, x)` on sixteen bytes as `umin(x, -x)`, the same unsigned magnitude in one byte minimum.
+pub(super) fn byte_abs(cx: &RewriteCx, cond: Value, t: Value, f: Value) -> Option<Op> {
+    let bytes = Type::Vec { lane: Lane::I8, count: 16 };
+    let negated = matches!(cx.op(t)?, &Op::Unary(Unary::Ineg, x) if x == f);
+    (cx.func.ty(f) == bytes && negated && sign_source(cx, cond) == Some(f)).then_some(Op::Binary(Binary::Umin, f, t))
+}
+
 /// Reads the lane sign bits of a compare against zero from the compared vector itself.
 pub(super) fn simplify_movemask(cx: &RewriteCx, op: &Op) -> Option<Op> {
     match *op {
