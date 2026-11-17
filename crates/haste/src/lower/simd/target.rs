@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Arch, IntCC, Lane, ReduceOp, StackSlot, Target, TargetOpId, Type, Value};
 
-use crate::body::BinOp;
 use crate::host::{HostSymbol, X86Symbol};
 use crate::names::Primitive;
 
@@ -165,13 +164,21 @@ impl Lower<'_, '_> {
         let f64x2 = Type::Vec { lane: Lane::F64, count: 2 };
         match (x86, args) {
             (X86Symbol::Addcarry64 | X86Symbol::Subborrow64, &[carry, a, b]) => {
-                let op = if x86 == X86Symbol::Addcarry64 { BinOp::Add } else { BinOp::Sub };
-                let (first, first_fits) = self.overflowing(op, (Type::I64, false), a, b)?;
                 let set = self.ins().icmp_imm(IntCC::NotEqual, carry, 0);
-                let incoming = self.ins().uextend(Type::I64, set);
-                let (result, second_fits) = self.overflowing(op, (Type::I64, false), first, incoming)?;
-                let fits = self.ins().band(first_fits, second_fits);
-                let out = self.ins().icmp_imm(IntCC::Equal, fits, 0);
+                let incoming = self.ins().uextend(Type::I128, set);
+                let (wide_a, wide_b) = (self.ins().uextend(Type::I128, a), self.ins().uextend(Type::I128, b));
+                let sum = if x86 == X86Symbol::Addcarry64 {
+                    let partial = self.ins().iadd(wide_a, wide_b);
+                    self.ins().iadd(partial, incoming)
+                } else {
+                    let partial = self.ins().isub(wide_a, wide_b);
+                    self.ins().isub(partial, incoming)
+                };
+                let result = self.ins().ireduce(Type::I64, sum);
+                let c64 = self.ins().iconst(Type::I64, 64);
+                let high = self.ins().ushr(sum, c64);
+                let high = self.ins().ireduce(Type::I64, high);
+                let out = self.ins().icmp_imm(IntCC::NotEqual, high, 0);
                 let (byte, quad) = (self.cx.types.prim(Primitive::U8), self.cx.types.prim(Primitive::U64));
                 Ok(Some(self.pair([byte, quad], [out, result])?))
             }
