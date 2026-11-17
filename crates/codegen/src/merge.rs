@@ -28,19 +28,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         func.bump_cfg();
         changed = true;
     }
-    let cfg = func.cfg();
-    let mut subst = identity(func.types.len());
-    let mut merged = false;
-    for block in 0..func.blocks.len() {
-        while let Some(next) = single_jump(func, &cfg, block) {
-            absorb(func, block, next, &mut subst);
-            merged = true;
-        }
-    }
-    if merged {
-        rename(func, &subst);
-        changed = true;
-    }
+    changed |= join_jumps(func, &[]);
     if changed {
         func.bump_cfg();
         Domain::CFG | Domain::VALUES
@@ -735,6 +723,23 @@ pub(crate) fn fold_short_circuit_compares(func: &mut Function) -> bool {
 /// Builds an identity replacement table mapping each of `count` values to itself.
 pub(crate) fn identity(count: usize) -> Vec<Value> {
     (0..count as u32).map(Value).collect()
+}
+
+/// Folds every block that only one jump enters into the block that jumps, except the blocks in `keep`.
+pub(crate) fn join_jumps(func: &mut Function, keep: &[Block]) -> bool {
+    let cfg = func.cfg();
+    let mut subst = identity(func.types.len());
+    let mut merged = false;
+    for block in 0..func.blocks.len() {
+        while let Some(next) = single_jump(func, &cfg, block).filter(|&next| !keep.contains(&Block(next as u32))) {
+            absorb(func, block, next, &mut subst);
+            merged = true;
+        }
+    }
+    if merged {
+        rename(func, &subst);
+    }
+    merged
 }
 
 fn single_jump(func: &Function, cfg: &Cfg, block: usize) -> Option<usize> {

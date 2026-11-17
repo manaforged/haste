@@ -1,5 +1,7 @@
+mod chain;
 mod param;
 
+pub(crate) use chain::build_in_place;
 pub(crate) use param::forward_param_slots;
 
 use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Convert, Function, Inst, Lane, Op, StackSlot, Type, Value};

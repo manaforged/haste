@@ -164,6 +164,7 @@ fn keep_honored_marks(func: &mut Function, target: &Target) {
 
 /// Encodes `func` for `target`.
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
+    copy::build_in_place(&mut func);
     coroutine::split(&mut func);
     keep_honored_marks(&mut func, target);
     verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, message))?;
