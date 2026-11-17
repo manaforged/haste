@@ -675,9 +675,10 @@ pub(crate) enum Moves {
 }
 
 fn pre_split(func: &mut Function, moves: Moves) -> bool {
+    let returned = crate::copy::forward_sret_slot(func);
     let joined = moves != Moves::Words && join_slots::run(func);
     let forwarded = moves == Moves::Split && box_fwd::run(func);
-    joined || forwarded
+    returned || joined || forwarded
 }
 
 pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
