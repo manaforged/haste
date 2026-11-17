@@ -712,6 +712,7 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
             fold_rodata_load(cx, ty, addr, off).or_else(|| fold_disp(cx, addr, off, ty.bytes()).map(|(base, disp)| Op::Load(base, disp)))
         }
         Op::Store(value, addr, off) => fold_disp(cx, addr, off, cx.func.ty(value).bytes()).map(|(base, disp)| Op::Store(value, base, disp)),
+        ref op @ (Op::Reduce(..) | Op::TargetOp(..)) => vec::simplify_movemask(cx, &op.clone()),
         _ => None,
     }
 }
