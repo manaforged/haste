@@ -116,7 +116,7 @@ fn eval_ord_node(cx: &RewriteCx, ty: Type, v: Value, key: (Value, Value, bool), 
     if let Some(m) = cmp_mask(cx, v, key) {
         return Some([i64::from((m & 1) != 0), i64::from((m & 2) != 0), i64::from((m & 4) != 0)]);
     }
-    if depth < 2
+    if depth < 3
         && let Some(inst) = cx.def(v)
         && let Op::Select(c, t, f) = cx.func.insts[inst.index()].op
     {
