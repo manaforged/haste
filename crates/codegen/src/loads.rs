@@ -2,6 +2,7 @@
 
 mod coalesce;
 mod dom;
+mod elide;
 mod join;
 mod pack;
 mod remat;
@@ -783,5 +784,8 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     }
     changed |= remat::split_long_loads(func, &prov);
     changed |= sink::sink_loads(func, &prov);
+    if post_inline {
+        changed |= elide::elide_moves(func, &prov);
+    }
     domain(changed)
 }
