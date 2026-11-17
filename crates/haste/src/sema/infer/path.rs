@@ -174,19 +174,25 @@ impl<'a> Infer<'_, 'a> {
             return Vec::new();
         };
         let hidden = self.closed_uses(root);
-        if let Some(found) = self.imports.get(&(root, word, hidden.clone())) {
+        let here = self.reader().map(|item| self.cx.item(item).1.start);
+        if let Some(found) = self.imports.get(&(root, word, here, hidden.clone())) {
             return found.clone();
         }
         let Ok(home) = self.cx.module_of(root) else {
             return Vec::new();
         };
-        let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
         let before = self.cx.asks.mark();
         let found = self.cx.body_imports((root, home), word, (here, &hidden));
         if self.cx.asks.mark() == before {
-            self.imports.insert((root, word, hidden), found.clone());
+            self.imports.insert((root, word, here, hidden), found.clone());
         }
         found
+    }
+
+    /// The body-declared item whose text names are read in now: the frame's item when the body declares it, as for another item's header, otherwise the instance being inferred.
+    fn reader(&self) -> Option<ItemRef> {
+        let frame = self.frame_item.filter(|item| item.declaring_body().is_some() && item.declaring_body() == self.root);
+        frame.or_else(|| self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()))
     }
 
     /// The `use` items of this body's expansion that a block of the body declares and that no block open now holds, which code here does not see.

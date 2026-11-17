@@ -143,7 +143,7 @@ pub struct Infer<'c, 'a> {
     frames: usize,
     evaluating: Vec<ItemRef>,
     proved: rustc_hash::FxHashSet<(ItemRef, Substs)>,
-    imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
+    imports: HashMap<(ItemRef, Option<crate::names::Sym>, Option<u32>, Vec<u32>), Vec<crate::names::PerNs>>,
     method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
