@@ -1,3 +1,4 @@
+mod products;
 mod sink;
 
 use std::time::Instant;
@@ -407,4 +408,7 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
         sink::run(func, moves == promote::Moves::Split && target.effort == Effort::Full);
     }
     sink_compares(func);
+    if target.arch == crate::Arch::X64 && effort == Effort::Full {
+        products::adjoin(func);
+    }
 }

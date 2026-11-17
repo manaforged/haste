@@ -336,7 +336,7 @@ impl Emit<'_> {
             }
             Binary::Udiv | Binary::Urem if self.divide_by_power(op, (x, y), dst) => return Ok(dst),
             Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => self.divide(op, x, y),
-            Binary::Umulhi | Binary::Smulhi => self.multiply_high(op == Binary::Smulhi, x, y, ty.bits() as u8),
+            Binary::Umulhi | Binary::Smulhi => return Ok(self.multiply_high(op == Binary::Smulhi, x, y, ty.bits() as u8)),
             Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => {
                 let signed = matches!(op, Binary::Smin | Binary::Smax);
                 self.get(Reg::Rax, x, Ext::of(signed));
@@ -468,19 +468,26 @@ impl Emit<'_> {
         self.clobber_regs(&[Reg::Rax, Reg::Rdx]);
     }
 
-    fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) {
+    /// Computes the high half of `x * y` and returns its register; a 64-bit product leaves its low half in rax for the `Imul` that follows.
+    fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) -> Reg {
         let ext = Ext::of(signed);
         self.get(Reg::Rax, x, ext);
-        self.get(Reg::Rcx, y, ext);
         if bits == 64 {
-            self.asm.group3(if signed { Group3::Imul } else { Group3::Mul }, Reg::Rcx);
-            self.asm.mov(Reg::Rax, Reg::Rdx);
+            let source = self.reg_of(y).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)).unwrap_or_else(|| {
+                self.get(Reg::Rcx, y, ext);
+                Reg::Rcx
+            });
+            self.clobber_reg(Reg::Rax);
+            self.asm.group3(if signed { Group3::Imul } else { Group3::Mul }, source);
             self.clobber_reg(Reg::Rdx);
-        } else {
-            self.asm.imul(Reg::Rax, Reg::Rcx);
-            self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
+            self.low_product = Some((x, y));
+            return Reg::Rdx;
         }
+        self.get(Reg::Rcx, y, ext);
         self.clobber_reg(Reg::Rax);
+        self.asm.imul(Reg::Rax, Reg::Rcx);
+        self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
+        Reg::Rax
     }
 
     /// Shifts or rotates `x` by `y`: into `dst` with BMI2 or an immediate `y`, else into rax by cl; returns the register that holds the result.

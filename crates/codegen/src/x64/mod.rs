@@ -119,6 +119,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         slow_thunk,
         in_shrink_entry: false,
         in_fast_ret: false,
+        low_product: None,
         tails: Tails::new(),
     };
     drive(emit, &order)
@@ -186,6 +187,7 @@ pub(super) struct Emit<'a> {
     slow_thunk: Label,
     in_shrink_entry: bool,
     in_fast_ret: bool,
+    low_product: Option<(Value, Value)>,
     tails: Tails<'a, Label>,
 }
 
@@ -273,6 +275,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let data = &func.insts[inst.index()];
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
+        if let (Some(low), &Op::Binary(Binary::Imul, x, y), Some(result)) = (self.low_product.take(), &data.op, result)
+            && (low == (x, y) || low == (y, x))
+            && !(self.is_static(result) || self.plan.deferred[result.index()] || self.plan.elided[result.index()])
+        {
+            self.flags = None;
+            self.put(result, Reg::Rax);
+            return Ok(());
+        }
         match &data.op {
             Op::Call { sig, callee, args, results } => {
                 let res = emit_call(self, inst, (*sig, *callee), args, results);
