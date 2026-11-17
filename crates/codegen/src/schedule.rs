@@ -387,6 +387,10 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     let merge_init = run_step(func, &plan, &mut state, INIT[2]);
     state.fold_clean = fold_init.is_empty() && merge_init.is_empty();
     state.merge_clean = merge_init.is_empty();
+    if moves == promote::Moves::Split && effort == Effort::Full && crate::loads::elide_early(func) {
+        state.fold_clean = false;
+        state.merge_clean = false;
+    }
     run_fixpoint(func, &plan, &mut state);
     if moves != promote::Moves::Guided && strip_assumes(func) {
         state.fold_clean = false;

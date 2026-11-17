@@ -736,6 +736,15 @@ fn collect_scan_meta(
     accesses.then_some((defs, consts, selects))
 }
 
+/// Elides whole-slot moves once, before promotion splits the slots into values.
+pub(crate) fn elide_early(func: &mut Function) -> bool {
+    if func.entry.is_none() || func.coroutine.is_some() || !func.insts.iter().any(|data| matches!(data.op, Op::Move(..))) {
+        return false;
+    }
+    let cfg = func.cfg();
+    elide::elide_moves(func, &Provenance::new(func, &cfg))
+}
+
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns the effect domains modified.
 pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {

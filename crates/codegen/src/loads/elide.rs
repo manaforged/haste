@@ -24,10 +24,10 @@ pub(super) fn elide_moves(func: &mut Function, prov: &Provenance) -> bool {
     }
     let mut owner: Vec<StackSlot> = (0..slots).map(|slot| StackSlot(slot as u32)).collect();
     let mut sealed = sealed_slots(func, prov);
-    let mut dead: Vec<Site> = Vec::new();
+    let mut dead: Vec<Site> = undefined_moves(func, &cfg, prov, &sealed);
     for (site, to, from) in moves {
         let (to, from) = (find(&owner, to), find(&owner, from));
-        if to == from || !sealed[from.index()] || !elidable(func, &cfg, site, &refs[from.index()], &refs[to.index()]) {
+        if dead.contains(&site) || to == from || !sealed[from.index()] || !elidable(func, &cfg, site, &refs[from.index()], &refs[to.index()]) {
             continue;
         }
         owner[to.index()] = from;
@@ -53,6 +53,26 @@ pub(super) fn elide_moves(func: &mut Function, prov: &Provenance) -> bool {
         block.insts.retain(|inst| !gone.contains(inst));
     }
     true
+}
+
+/// The entry-block moves whose sealed source slot nothing touched before them, so they copy undefined bytes.
+fn undefined_moves(func: &Function, cfg: &Cfg, prov: &Provenance, sealed: &[bool]) -> Vec<Site> {
+    let Some(entry) = cfg.entry.filter(|&entry| cfg.preds_of(entry).is_empty()) else { return Vec::new() };
+    let mut touched = vec![false; func.slots.len()];
+    let mut out = Vec::new();
+    for (pos, &inst) in func.blocks[entry.index()].insts.iter().enumerate() {
+        if let Op::Move(_, from, bytes) = func.insts[inst.index()].op
+            && let MemRoot::Slot(slot) = prov.loc(from, 0, bytes).root
+            && sealed[slot.index()]
+            && !touched[slot.index()]
+        {
+            out.push((entry, pos));
+        }
+        for slot in touched_slots(func, prov, inst) {
+            touched[slot.index()] = true;
+        }
+    }
+    out
 }
 
 fn find(owner: &[StackSlot], mut slot: StackSlot) -> StackSlot {
