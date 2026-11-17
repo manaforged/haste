@@ -237,11 +237,11 @@ impl Lower<'_, '_> {
         self.store_vec(whole, wide.bytes())
     }
 
-    /// `vpshufb` on the 32-byte vectors at `table` and `index` in one register, when the host has one.
-    pub(in crate::lower) fn wide_byte_permute(&mut self, table: Value, index: Value) -> Option<Value> {
+    /// The 32-byte target op `id` on the vectors at `a` and `b` in one register, when the host has one.
+    pub(in crate::lower) fn wide_binary(&mut self, id: TargetOpId, a: Value, b: Value) -> Option<Value> {
         let wide = wide_quads()?;
-        let (bytes, picks) = (self.ins().load(wide, table, 0), self.ins().load(wide, index, 0));
-        let out = self.ins().target_op(TargetOpId::X64Pshufb256, wide, &[bytes, picks]);
+        let (x, y) = (self.ins().load(wide, a, 0), self.ins().load(wide, b, 0));
+        let out = self.ins().target_op(id, wide, &[x, y]);
         Some(self.store_vec(out, wide.bytes()))
     }
 }

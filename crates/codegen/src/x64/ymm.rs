@@ -25,6 +25,9 @@ const PSHUFB: VexOp = VexOp::new(MAP_0F38, PP_66, 0x00);
 const PCMPEQB: VexOp = VexOp::new(MAP_0F, PP_66, 0x74);
 const PCMPGTB: VexOp = VexOp::new(MAP_0F, PP_66, 0x64);
 const PMOVMSKB: VexOp = VexOp::new(MAP_0F, PP_66, 0xD7);
+const PSADBW: VexOp = VexOp::new(MAP_0F, PP_66, 0xF6);
+const PMADDUBSW: VexOp = VexOp::new(MAP_0F38, PP_66, 0x04);
+const PMADDWD: VexOp = VexOp::new(MAP_0F, PP_66, 0xF5);
 const PSLLVD: VexOp = VexOp::new(MAP_0F38, PP_66, 0x47);
 const PSLLVQ: VexOp = VexOp::wide(MAP_0F38, PP_66, 0x47);
 const PSRLVD: VexOp = VexOp::new(MAP_0F38, PP_66, 0x45);
@@ -91,6 +94,9 @@ fn byte_op(id: TargetOpId) -> Option<VexOp> {
         TargetOpId::X64Pshufb256 => Some(PSHUFB),
         TargetOpId::X64Pcmpeqb256 => Some(PCMPEQB),
         TargetOpId::X64Pcmpgtb256 => Some(PCMPGTB),
+        TargetOpId::X64Psadbw256 => Some(PSADBW),
+        TargetOpId::X64Pmaddubsw256 => Some(PMADDUBSW),
+        TargetOpId::X64Pmaddwd256 => Some(PMADDWD),
         _ => None,
     }
 }

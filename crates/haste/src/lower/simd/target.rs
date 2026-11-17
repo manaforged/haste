@@ -46,7 +46,7 @@ impl Lower<'_, '_> {
 
     pub(in crate::lower) fn byte_permute_32(&mut self, args: &[Value]) -> Result<Value> {
         let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
-        if let Some(value) = self.wide_byte_permute(table, index) {
+        if let Some(value) = self.wide_binary(TargetOpId::X64Pshufb256, table, index) {
             return Ok(value);
         }
         let slot = self.b.create_stack_slot(32, 5);
@@ -239,18 +239,21 @@ impl Lower<'_, '_> {
                 let v = self.pmaddwd_128(a, b, 0);
                 Ok(Some(self.store_vec(v, 16)))
             }
-            (X86Symbol::Pmaddwd256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.pmaddwd_128(a, b, off)))),
+            (X86Symbol::Pmaddwd256, &[a, b]) => Ok(Some(self.wide_binary(TargetOpId::X64Pmaddwd256, a, b).unwrap_or_else(|| self.emit_256(|lower, off| lower.pmaddwd_128(a, b, off))))),
             (X86Symbol::Pmaddubsw128, &[a, b]) => {
                 let v = self.pmaddubsw_128(a, b, 0);
                 Ok(Some(self.store_vec(v, 16)))
             }
-            (X86Symbol::Pmaddubsw256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.pmaddubsw_128(a, b, off)))),
+            (X86Symbol::Pmaddubsw256, &[a, b]) => Ok(Some(self.wide_binary(TargetOpId::X64Pmaddubsw256, a, b).unwrap_or_else(|| self.emit_256(|lower, off| lower.pmaddubsw_128(a, b, off))))),
             (X86Symbol::Psadbw, &[a, b]) => {
                 let slot = self.b.create_stack_slot(16, 4);
                 self.psadbw_128((a, b), (slot, 0));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
             }
             (X86Symbol::Psadbw256, &[a, b]) => {
+                if let Some(v) = self.wide_binary(TargetOpId::X64Psadbw256, a, b) {
+                    return Ok(Some(v));
+                }
                 let slot = self.b.create_stack_slot(32, 5);
                 self.psadbw_128((a, b), (slot, 0));
                 self.psadbw_128((a, b), (slot, 16));

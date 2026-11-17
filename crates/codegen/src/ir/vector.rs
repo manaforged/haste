@@ -185,6 +185,12 @@ pub enum TargetOpId {
     X64DivWide,
     /// `div` of the 128-bit dividend whose high `I64` is the first operand and low `I64` the second by the third, which must exceed the high half: the `I64` remainder.
     X64RemWide,
+    /// `vpsadbw` on two 32-byte vectors: each quadword the sum of the absolute differences of its eight unsigned bytes.
+    X64Psadbw256,
+    /// `vpmaddubsw` on two 32-byte vectors: each word the saturated sum of two products of an unsigned byte of the first operand and a signed byte of the second.
+    X64Pmaddubsw256,
+    /// `vpmaddwd` on two 32-byte vectors: each doubleword the sum of two products of signed words.
+    X64Pmaddwd256,
 }
 
 impl IntCC {
