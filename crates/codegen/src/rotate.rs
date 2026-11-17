@@ -21,18 +21,16 @@ struct RotatePlan {
     need_exit: Vec<Value>,
 }
 
-fn find_plan(func: &Function, cfg: &Cfg, each: &Loop) -> Option<RotatePlan> {
+fn find_plan(func: &Function, cfg: &Cfg, each: &Loop, inner: bool) -> Option<RotatePlan> {
     let head = each.head;
     if Some(head) == func.entry || each.latches.is_empty() || each.latches.contains(&head) {
         return None;
     }
     let inside = |block: Block| each.body.get(block.index()).copied().unwrap_or(false);
-    if each.latches.iter().any(|&latch| matches!(func.last(latch), Some(&Op::Brif(_, t, _, f, _)) if inside(t) != inside(f))) {
-        return None;
-    }
     let head_insts = &func.blocks[head.index()].insts;
     let (&last, head_body) = head_insts.split_last()?;
-    if head_body.len() > 32 {
+    let exiting = each.latches.iter().any(|&latch| matches!(func.last(latch), Some(&Op::Brif(_, t, _, f, _)) if inside(t) != inside(f)));
+    if head_body.len() > if exiting { 1 } else { 32 } || exiting && (each.size <= 2 || !inner) {
         return None;
     }
     let Op::Brif(cond, t_blk, ref t_args, f_blk, ref f_args) = func.insts[last.index()].op else {
@@ -198,8 +196,8 @@ fn split_latch_edge(func: &mut Function, plan: &RotatePlan, target: &mut Block, 
     args.clear();
 }
 
-fn rotate_one(func: &mut Function, cfg: &Cfg, each: &Loop) -> bool {
-    let Some(plan) = find_plan(func, cfg, each) else {
+fn rotate_one(func: &mut Function, cfg: &Cfg, each: &Loop, inner: bool) -> bool {
+    let Some(plan) = find_plan(func, cfg, each, inner) else {
         return false;
     };
     let Some(pre) = cfg::preheader(func, cfg, each) else {
@@ -408,7 +406,8 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         let loops = cfg.loops();
         let mut step = false;
         for each in &loops.list {
-            if rotate_one(func, &cfg, each) {
+            let inner = !loops.list.iter().any(|other| other.head != each.head && each.body[other.head.index()]);
+            if rotate_one(func, &cfg, each, inner) {
                 step = true;
                 break;
             }
