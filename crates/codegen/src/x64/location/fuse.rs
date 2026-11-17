@@ -330,6 +330,7 @@ fn load_binop_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
                 && (!ctx.plan.elided[other.index()] || bnot_elided_ok(ctx, features, op, other))
                 && !load_dst_clobber(ctx, linst, load_res, (udata.result, op), (a, b))
         }
+        Binary::Umulhi | Binary::Smulhi => udata.result.is_some_and(|r| ctx.func.ty(r) == Type::I64),
         Binary::Rotl | Binary::Rotr => {
             features.bmi2 && a == load_res && ctx.plan.const_of(b).is_some_and(|c| (c & i64::from(ty.bits() - 1)) != 0)
         }
@@ -368,6 +369,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
     let defs = crate::fold::defs(func);
     let (mut uses, mut pos_of, mut ls_uses, mut use_of) = (vec![0_u32; n], vec![None; n], vec![Vec::new(); n], vec![None; n]);
     let (mut last_flag_use, mut non_flag_use, mut const_kids) = (vec![None; n], vec![false; n], vec![Vec::new(); n]);
+    let mut paired = Vec::new();
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for (pos, &inst) in block.insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
@@ -375,7 +377,12 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                 Op::Select(c, ..) | Op::Brif(c, ..) | Op::Trapz(c) => Some(*c),
                 _ => None,
             };
+            let pair = low_of_pair(func, block, pos);
+            paired.extend(pair);
             data.op.for_operands(|v| {
+                if pair.is_some() && is_load(func, &defs, v) {
+                    return;
+                }
                 uses[v.index()] += 1;
                 use_of[v.index()] = Some((b_idx, pos, inst));
                 if flag_cond == Some(v) && !non_flag_use[v.index()] {
@@ -692,5 +699,26 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             }
         }
     }
+    for (low, operands) in paired {
+        if plan.is_static(low) || plan.deferred[low.index()] {
+            for value in operands.into_iter().filter(|&value| is_load(func, &defs, value)) {
+                plan.elided[value.index()] = false;
+            }
+        }
+    }
     roots
+}
+
+fn is_load(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
+    defs[value.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..)))
+}
+
+/// The low product and operands of the `Imul` at `pos` when it follows the 64-bit `Umulhi` of the same operands, which leaves that product in rax so the `Imul` reads nothing.
+fn low_of_pair(func: &Function, block: &crate::ir::BlockData, pos: usize) -> Option<(Value, [Value; 2])> {
+    let data = &func.insts[block.insts[pos].index()];
+    let (Op::Binary(Binary::Imul, x, y), Some(low)) = (&data.op, data.result) else { return None };
+    let before = &func.insts[block.insts[pos.checked_sub(1)?].index()];
+    let (Op::Binary(Binary::Umulhi | Binary::Smulhi, a, b), Some(high)) = (&before.op, before.result) else { return None };
+    ((a, b) == (x, y) || (a, b) == (y, x)).then_some(()).filter(|()| func.ty(low) == Type::I64 && func.ty(high) == Type::I64)?;
+    Some((low, [*x, *y]))
 }
