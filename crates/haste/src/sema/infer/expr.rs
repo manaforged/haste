@@ -389,11 +389,18 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with the trait arguments `args`.
+    /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with the trait arguments `args`, or may apply once their inference variables are known, as rustc defers it.
     pub(super) fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
-        Ok(self.select_or_prove(of, left, args)?.then_some((of, method)))
+        let open = self.has_vars(left) || args.iter().any(|&arg| self.has_vars(arg));
+        if !(self.select_or_prove(of, left, args)? || open && self.may_implement(of, left, args)?) {
+            return Ok(None);
+        }
+        if open {
+            self.obligations.push((of, std::iter::once(left).chain(args.iter().copied()).collect()));
+        }
+        Ok(Some((of, method)))
     }
 
     fn logical(&mut self, lhs: ExprId, rhs: ExprId) -> Result<Ty> {

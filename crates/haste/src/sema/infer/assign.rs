@@ -69,10 +69,7 @@ impl Infer<'_, '_> {
     /// Types `place op= value` through the impl of the operator's assign trait for `place` and `value`.
     fn assign_impl(&mut self, expr: ExprId, op: BinOp, (place, value): (Ty, Ty)) -> Result<()> {
         let (lang, name) = assign_trait(op)?;
-        let Some((of, method)) = self.operator_impl((&lang, &name), place, &[value])? else { bail!("unsupported compound assignment on {}", self.show(place)) };
-        if self.has_vars(value) {
-            self.obligations.push((of, vec![place, value]));
-        }
+        let Some((_, method)) = self.operator_impl((&lang, &name), place, &[value])? else { bail!("unsupported compound assignment on {}", self.show(place)) };
         self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[place, value]));
         Ok(())
     }
