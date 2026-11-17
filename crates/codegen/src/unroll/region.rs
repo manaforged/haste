@@ -1,4 +1,5 @@
-use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
+use super::symbolic::{evaluate, tagged};
+use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, collect_global_consts, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
 use crate::cfg::{Cfg, Loop};
 use crate::ir::{Block, BlockData, Function, Op, Value};
 
@@ -110,7 +111,7 @@ fn record_block_consts(func: &Function, block: Block, step: &mut Step, at: usize
     let mut row = Vec::with_capacity(body.len());
     for &inst in body {
         let data = &func.insts[inst.index()];
-        let imm = data.result.and_then(|res| env[res.index()]);
+        let imm = data.result.and_then(|res| env[res.index()]).filter(|&imm| !tagged(imm));
         if imm.is_none() && !matches!(data.op, Op::Const(_)) {
             step.residual += 1;
         }
@@ -165,7 +166,7 @@ fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Opt
         let Some(given) = incoming[at].take() else { continue };
         let given = if region.open[at] { vec![None; func.blocks[block.index()].params.len()] } else { given };
         out.reached[at] = true;
-        eval_block(func, block.index(), &given, env);
+        eval_block(func, block.index(), &given, env, evaluate);
         record_block_consts(func, block, &mut out, at, env);
         let (decided, next) = step_edges(func, region, at, env, &mut incoming);
         out.decided[at] = decided;
@@ -332,7 +333,7 @@ fn repairable(func: &Function, cfg: &Cfg, each: &Loop, out: &LiveOut) -> bool {
 
 fn pin(func: &mut Function, head: Block, params: &[Value], known: &[Option<i64>], map: &mut Vec<(Value, Value)>) {
     for (&param, known) in params.iter().zip(known) {
-        let Some(imm) = *known else { continue };
+        let Some(imm) = known.filter(|&imm| !tagged(imm)) else { continue };
         let value = func.value(func.ty(param));
         let inst = func.add(Op::Const(imm), Some(value));
         func.blocks[head.index()].insts.push(inst);
@@ -558,9 +559,10 @@ fn rebind(func: &mut Function, after: &Cfg, rounds: &Rounds<'_>, live: &[LiveOut
     }
 }
 
-pub(super) fn unroll(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Option<i64>]) -> bool {
+pub(super) fn unroll(func: &mut Function, cfg: &Cfg, each: &Loop) -> bool {
     let Some(entry) = func.entry else { return false };
     let Some(region) = shape(func, cfg, each) else { return false };
+    let global_consts = &collect_global_consts(func, cfg, evaluate);
     let Some(init) = outside_const_params(func, cfg, each.head, &each.latches, global_consts) else { return false };
     let Some(proof) = prove(func, &region, init, global_consts) else { return false };
     let backs = proof.heads.len() - 1;

@@ -1,6 +1,7 @@
 mod count;
 mod memset;
 mod region;
+mod symbolic;
 mod vector;
 
 use crate::cfg::{Cfg, Loop};
@@ -14,6 +15,9 @@ const MAX_CHAIN_BLOCKS: usize = 8;
 const MAX_CHAIN_TRIPS: usize = 64;
 const MAX_CHAIN_UNROLLED_INSTS: usize = 384;
 
+/// Evaluates one operation from the known values of its operands.
+type Eval = fn(&Function, &Op, Type, &dyn Fn(Value) -> Option<i64>) -> Option<i64>;
+
 /// The value the latest entry of `map` renames `v` to, or `v` when none does.
 pub(crate) fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
     map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
@@ -26,7 +30,7 @@ fn has_bad_non_term(func: &Function, block_idx: usize) -> bool {
         .any(|&i| matches!(func.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. } | Op::BrTable(..) | Op::Jump(..) | Op::Brif(..)))
 }
 
-fn eval_block(func: &Function, block_idx: usize, params: &[Option<i64>], env: &mut [Option<i64>]) {
+fn eval_block(func: &Function, block_idx: usize, params: &[Option<i64>], env: &mut [Option<i64>], eval: Eval) {
     let block = &func.blocks[block_idx];
     for (p, val) in block.params.iter().zip(params) {
         env[p.index()] = *val;
@@ -40,7 +44,7 @@ fn eval_block(func: &Function, block_idx: usize, params: &[Option<i64>], env: &m
                 let chosen = if cv != 0 { x } else { y };
                 env[chosen.index()].map(|imm| extend(imm, ty, true))
             }),
-            _ => evaluate_wrapped(func, &data.op, ty, &|v| env[v.index()]),
+            _ => eval(func, &data.op, ty, &|v| env[v.index()]),
         };
     }
 }
@@ -160,7 +164,7 @@ fn unroll_self(
     let mut proven = None;
     for step in 0..=MAX_FULL_TRIPS {
         let mut env = global_consts.to_vec();
-        eval_block(func, b, &cur_params, &mut env);
+        eval_block(func, b, &cur_params, &mut env, evaluate_wrapped);
         let Some(cond_val) = env[cond.index()] else { break };
         if (cond_val != 0) == back_on_true {
             cur_params = back_args.iter().map(|v| env[v.index()]).collect();
@@ -499,7 +503,7 @@ fn eval_chain(
         } => {
             for step in 0..=max_trips {
                 let mut env = global_consts.to_vec();
-                eval_block(func, chain.segs[0].blk.index(), &cur_head_params, &mut env);
+                eval_block(func, chain.segs[0].blk.index(), &cur_head_params, &mut env, evaluate_wrapped);
                 let cond_val = env[cond.index()]?;
                 if (cond_val != 0) != *body_on_true {
                     return Some(step);
@@ -509,7 +513,7 @@ fn eval_chain(
                 }
                 let mut cur_args: Vec<Option<i64>> = chain.segs[0].edge_args.iter().map(|v| env[v.index()]).collect();
                 for seg in &chain.segs[1..] {
-                    eval_block(func, seg.blk.index(), &cur_args, &mut env);
+                    eval_block(func, seg.blk.index(), &cur_args, &mut env, evaluate_wrapped);
                     cur_args = seg.edge_args.iter().map(|v| env[v.index()]).collect();
                 }
                 cur_head_params = cur_args;
@@ -523,7 +527,7 @@ fn eval_chain(
                 let mut env = global_consts.to_vec();
                 let mut cur_args = cur_head_params;
                 for seg in &chain.segs {
-                    eval_block(func, seg.blk.index(), &cur_args, &mut env);
+                    eval_block(func, seg.blk.index(), &cur_args, &mut env, evaluate_wrapped);
                     cur_args = seg.edge_args.iter().map(|v| env[v.index()]).collect();
                 }
                 let cond_val = env[cond.index()]?;
@@ -634,13 +638,13 @@ fn unroll_chain(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Op
     }
 }
 
-fn collect_global_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
+fn collect_global_consts(func: &Function, cfg: &Cfg, eval: Eval) -> Vec<Option<i64>> {
     let mut global_consts = vec![None; func.types.len()];
     for &blk in &cfg.rpo {
         for &inst in &func.blocks[blk.index()].insts {
             let data = &func.insts[inst.index()];
             let Some(res) = data.result else { continue };
-            if let Some(imm) = evaluate_wrapped(func, &data.op, func.ty(res), &|v| global_consts[v.index()]) {
+            if let Some(imm) = eval(func, &data.op, func.ty(res), &|v| global_consts[v.index()]) {
                 global_consts[res.index()] = Some(imm);
             }
         }
@@ -657,7 +661,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let initial = func.cfg();
     let loops = initial.loops();
     let mut cfg = std::sync::Arc::clone(&initial);
-    let mut global_consts = collect_global_consts(func, &cfg);
+    let mut global_consts = collect_global_consts(func, &cfg, evaluate_wrapped);
     let mut changed = false;
     let mut dirty = false;
     for each in &loops.list {
@@ -676,7 +680,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         }
         global_consts.resize(func.types.len(), None);
         let did = if each.latches.len() != 1 {
-            region::unroll(func, &cfg, each, &global_consts)
+            region::unroll(func, &cfg, each)
         } else if each.size == 1 && each.latches[0] == head {
             if has_bad_non_term(func, b) {
                 false
@@ -700,7 +704,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 false
             }
         } else if each.size >= 2 && each.latches[0] != head {
-            vector::flatten(func, each, &global_consts) || unroll_chain(func, &cfg, each, &global_consts) || region::unroll(func, &cfg, each, &global_consts)
+            vector::flatten(func, each, &global_consts) || unroll_chain(func, &cfg, each, &global_consts) || region::unroll(func, &cfg, each)
         } else {
             false
         };
