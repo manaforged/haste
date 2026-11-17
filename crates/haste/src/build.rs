@@ -172,7 +172,7 @@ fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
 
 fn finish_batch(
     (kind, main): (BatchKind, Option<ItemRef>),
-    (cases, reached): (&[ItemRef], Reached),
+    (cases, mut reached): (&[ItemRef], Reached),
     drop_finals: bool,
     substrate: Option<&SubstrateSlot>,
     (mut cx, reach_clock): (sema::Context<'_>, sema::census::Clock),
@@ -186,10 +186,12 @@ fn finish_batch(
         BatchKind::MainCheck => cases.to_vec(),
         BatchKind::MainAot => Vec::new(),
     };
-    let roots: Vec<usize> = match main {
-        Some(main) => sema::reach::main_roots(&mut cx, main)?.into_iter().map(|inst| reached.index[&inst]).collect(),
-        None => valid.iter().map(|item| reached.index[&(*item, sema::substs::Substs::EMPTY)]).collect(),
+    let root_instances: Vec<sema::reach::Instance> = match main {
+        Some(main) => sema::reach::main_roots(&mut cx, main)?.to_vec(),
+        None => valid.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect(),
     };
+    reached.canonicalize(&cx, &root_instances);
+    let roots: Vec<usize> = root_instances.iter().map(|inst| reached.index[inst]).collect();
     if drop_finals {
         cx.compact_for_oneshot_codegen();
     }

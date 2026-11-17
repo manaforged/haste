@@ -12,6 +12,7 @@ use super::infer::{LazyTables, Res, Shape, Typed, infer, register};
 use super::substs::Substs;
 use super::summary::thaw;
 mod filter;
+mod order;
 mod wave;
 
 pub use wave::infer_quiet;
