@@ -8,6 +8,8 @@ use crate::ir::{AbiParam, Binary, Block, CallConv, Function, Inst, InstData, Int
 use crate::live::results;
 use crate::reloc::RuntimeSymbol;
 
+mod lazy;
+
 /// The lifecycle state stored in word 0 of a coroutine object.
 #[repr(i64)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,10 +156,11 @@ pub(crate) fn split(func: &mut Function) {
         let at = frame.place(bytes, bytes);
         frame.spills.insert(value, at as i32);
     }
+    let lazy = lazy::plan(func, &frame, &mut stack);
     func.slots = stack;
     let anchor = StackSlot(0);
     let orig_blocks = func.blocks.len();
-    let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), frame.bytes());
+    let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), (frame.bytes(), lazy));
     func.bump_cfg();
     let split_cfg = func.cfg();
     let mut active_fp: Vec<Option<Value>> = vec![None; func.blocks.len()];
@@ -169,7 +172,7 @@ pub(crate) fn split(func: &mut Function) {
             active_fp[idx] = split_cfg.idom[idx].and_then(|dom| active_fp[dom.index()]);
         }
         if idx < orig_blocks {
-            let done = spec.done.contains(&block);
+            let done = lazy.is_none() && spec.done.contains(&block);
             let inherited = active_fp[idx];
             let chosen = rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (inherited, done));
             if active_fp[idx].is_none() {
@@ -180,9 +183,12 @@ pub(crate) fn split(func: &mut Function) {
     for idx in 0..orig_blocks {
         if !split_cfg.reachable[idx] {
             let block = Block(idx as u32);
-            let done = spec.done.contains(&block);
+            let done = lazy.is_none() && spec.done.contains(&block);
             rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (None, done));
         }
+    }
+    if let Some(lazy) = lazy {
+        lazy::settle(func, &spec, anchor, lazy, orig_blocks);
     }
     func.bump_cfg();
 }
@@ -727,18 +733,25 @@ fn call(func: &mut Function, insts: &mut Vec<Inst>, symbol: RuntimeSymbol, args:
     result
 }
 
-fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, StackSlot), size: u32) -> (Block, Value, Block, Value) {
+fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, StackSlot), (size, lazy): (u32, Option<lazy::Lazy>)) -> (Block, Value, Block, Value) {
     let mut b = FunctionBuilder::new(func);
     let (params, state, fresh) = check_unresumed(&mut b, spec);
     let object = params[spec.object];
     let (init, dispatch) = (b.create_block(), b.create_block());
     b.ins().brif(fresh, init, &[], dispatch, &[]);
     b.switch_to_block(init);
-    let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
-    let bytes = push(b.func, &mut insts, Op::Const(i64::from(size)), Some(Type::I64)).expect("a constant has a result");
-    let init_fp = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
-    b.func.blocks[init.index()].insts = insts;
-    b.ins().store(init_fp, object, spec.header.1);
+    let init_fp = if let Some(lazy) = lazy {
+        let buf = b.ins().stack_addr(Type::I64, lazy.buf, 0);
+        b.ins().stack_store(object, anchor, 8);
+        buf
+    } else {
+        let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
+        let bytes = push(b.func, &mut insts, Op::Const(i64::from(size)), Some(Type::I64)).expect("a constant has a result");
+        let heap = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
+        b.func.blocks[init.index()].insts = insts;
+        b.ins().store(heap, object, spec.header.1);
+        heap
+    };
     b.ins().stack_store(init_fp, anchor, 0);
     b.ins().jump(old_entry, &params);
     b.switch_to_block(dispatch);
