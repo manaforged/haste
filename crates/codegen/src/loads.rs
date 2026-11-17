@@ -785,7 +785,13 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     changed |= remat::split_long_loads(func, &prov);
     changed |= sink::sink_loads(func, &prov);
     if post_inline {
-        changed |= elide::elide_moves(func, &prov);
+        if elide::elide_moves(func, &prov) {
+            changed = true;
+            let cfg = func.cfg();
+            changed |= elide::forward_moves(func, &Provenance::new(func, &cfg));
+        } else {
+            changed |= elide::forward_moves(func, &prov);
+        }
     }
     domain(changed)
 }
