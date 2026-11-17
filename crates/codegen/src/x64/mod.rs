@@ -37,6 +37,7 @@ const REGS: Regs<Reg> = Regs {
     float_branches: &float::BRANCHES,
     vectors: true,
     absolute_calls: true,
+    runtime_calls: true,
     two_address: true,
     park: true,
     fold_sib: true,
@@ -634,6 +635,15 @@ impl Emit<'_> {
             Some(CallTarget::Slot(sym)) => {
                 let at = self.asm.call_slot_reloc();
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
+            }
+            Some(CallTarget::Runtime(rt)) if self.direct_calls => {
+                let at = self.asm.call_pcrel32();
+                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::PcRel32));
+            }
+            Some(CallTarget::Runtime(rt)) => {
+                let at = self.asm.mov_abs64(Reg::R11);
+                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::Abs64));
+                self.asm.call(Reg::R11);
             }
             None => self.asm.call(held.unwrap_or(Reg::R11)),
         }

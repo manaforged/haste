@@ -21,6 +21,8 @@ pub(crate) struct Regs<R: 'static> {
     pub float_branches: &'static [FloatCC],
     pub vectors: bool,
     pub absolute_calls: bool,
+    /// The backend calls a runtime helper in place instead of loading its address first.
+    pub runtime_calls: bool,
     pub two_address: bool,
     pub park: bool,
     pub fold_sib: bool,
@@ -68,6 +70,7 @@ impl<R> Location<R> {
 pub(crate) enum CallTarget {
     Abs(i32),
     Slot(u32),
+    Runtime(crate::reloc::RuntimeSymbol),
 }
 
 pub(crate) struct Plan<R> {
@@ -310,18 +313,21 @@ fn pairs<R>(func: &Function, locations: &[Location<R>], elided: &[bool]) -> (Vec
     (pairs, deferred)
 }
 
-fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided: &mut [bool]) -> Vec<Option<CallTarget>> {
+fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided: &mut [bool], runtime: bool) -> Vec<Option<CallTarget>> {
     let mut through = vec![None; func.types.len()];
     let mut loads = vec![None; func.types.len()];
     for data in &func.insts {
-        if let (Op::Load(addr, 0), Some(result)) = (&data.op, data.result) {
-            loads[result.index()] = match locations[addr.index()] {
+        let Some(result) = data.result else { continue };
+        loads[result.index()] = match data.op {
+            Op::Load(addr, 0) => match locations[addr.index()] {
                 Location::Imm(at) => i32::try_from(at).ok().filter(|at| *at > 0).map(CallTarget::Abs),
                 Location::SlotAddr(sym) => Some(CallTarget::Slot(sym)),
                 _ => None,
             }
-            .map(|target| (target, *addr));
-        }
+            .map(|target| (target, Some(addr))),
+            Op::Runtime(rt) if runtime => Some((CallTarget::Runtime(rt), None)),
+            _ => None,
+        };
     }
     let mut left = census.uses.clone();
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
@@ -332,8 +338,10 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided:
         {
             through[callee.index()] = Some(target);
             elided[callee.index()] = true;
-            left[addr.index()] = left[addr.index()].saturating_sub(1);
-            elided[addr.index()] |= left[addr.index()] == 0;
+            if let Some(addr) = addr {
+                left[addr.index()] = left[addr.index()].saturating_sub(1);
+                elided[addr.index()] |= left[addr.index()] == 0;
+            }
         }
     }
     through
@@ -657,7 +665,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let census = census(func);
     let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
-    let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
+    let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.runtime_calls) } else { vec![None; count] };
     const_pairs(func, &census, &mut elided);
     let cfg = weighed.then(|| func.cfg());
     let loops = cfg.as_ref().map(|cfg| cfg.loops());

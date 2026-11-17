@@ -167,6 +167,7 @@ impl Emit<'_> {
                     self.put(result, dst);
                 }
             }
+            Op::Runtime(_) if self.plan.through[result()?.index()].is_some() => {}
             Op::Runtime(rt) => {
                 let result = result()?;
                 let dst = self.dst(result);
