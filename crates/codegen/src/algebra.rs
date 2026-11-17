@@ -1,6 +1,7 @@
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, ShuffleMask, Type, Unary, Value};
 
+mod bits;
 mod icmp;
 mod ovf;
 mod select;
@@ -292,6 +293,9 @@ fn narrow_const_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value
 }
 
 fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    if let Some(op) = bits::narrow_bit_test(cx, cc, x, y) {
+        return Some(op);
+    }
     if matches!(cc, IntCC::Equal | IntCC::NotEqual)
         && let Some(op) = [(x, y), (y, x)].into_iter().find_map(|(m, z)| {
             (cx.sconst(z) == Some(0)).then(|| match_swar_msb_broadcast(cx, m)).flatten().map(|w| Op::Icmp(cc, w, z))
