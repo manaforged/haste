@@ -31,6 +31,8 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
     let loops = cfg.loops();
     let cold = cold(func);
     let is_cold = |block: Block| cold[block.index()];
+    let mut is_latch = vec![false; func.blocks.len()];
+    loops.list.iter().flat_map(|each| &each.latches).for_each(|latch| is_latch[latch.index()] = true);
     let mut visited = vec![false; func.blocks.len()];
     let mut post = Vec::with_capacity(func.blocks.len());
     let mut stack = vec![(entry, false)];
@@ -44,7 +46,7 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
         }
         stack.push((block, true));
         let mut succs: Vec<Block> = func.successors(block).filter(|succ| !visited[succ.index()]).collect();
-        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), loops.depth_of(succ))));
+        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), is_latch[succ.index()], loops.depth_of(succ))));
         for succ in succs {
             stack.push((succ, false));
         }

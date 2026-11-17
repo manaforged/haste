@@ -161,6 +161,11 @@ fn falls<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &E, block
     emit.next_block().is_some_and(|next| next == block || next == emit.func().jump_target(block))
 }
 
+/// Whether `block` closes a loop by branching back to its header.
+fn is_latch(func: &Function, block: Block) -> bool {
+    func.cfg().loops().list.iter().any(|each| each.latches.contains(&block))
+}
+
 fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
@@ -217,6 +222,14 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     let then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
     let else_moves = emit.plan().moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
     if set_aside(emit, condition, (then, then_moves), (otherwise, else_moves))? {
+        return Ok(());
+    }
+    if then_moves && !else_moves && !emit.in_shrink_entry() && falls(emit, otherwise.0) && is_latch(emit.func(), otherwise.0) {
+        let label = emit.new_label();
+        emit.branch_cond(condition, false, label);
+        emit.tails().stubs.push(Stub { label, block: then.0, args: then.1 });
+        emit.edge(otherwise.0, otherwise.1)?;
+        goto_branch(emit, otherwise.0, true);
         return Ok(());
     }
     if !else_moves && (then_moves || falls(emit, then.0)) {
