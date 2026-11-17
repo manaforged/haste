@@ -1,3 +1,5 @@
+use haste_codegen::Value;
+
 use crate::body::literal::{byte_value, char_value, string_bytes};
 use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Lit, UnOp};
 use crate::names::{ItemRef, Primitive};
@@ -9,7 +11,7 @@ use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty, int_info, mask};
 
 use super::super::Lower;
-use super::super::stencil::{RodataReloc, RodataTarget};
+use super::super::stencil::{RodataId, RodataReloc, RodataTarget, SymbolSource};
 
 /// The most bytes of a constant that lowering lays out from its literals.
 pub(super) const LITERAL_BYTES: usize = 1 << 21;
@@ -26,6 +28,29 @@ pub(super) struct Scope<'s> {
 
 impl Lower<'_, '_> {
     /// Returns the bytes and intra-rodata relocations of `expr` when it evaluates from literals and pure constants within `LITERAL_BYTES`.
+    /// Interns the pointee blob of a literal reference, keeping its bytes for `emit_child_rodata` when it holds no pointers.
+    fn child_rodata(&mut self, bytes: &[u8], relocs: &[RodataReloc]) -> RodataId {
+        let id = self.slots.rodata(bytes, relocs);
+        let known = relocs.is_empty().then(|| bytes.to_vec());
+        match self.child_rodata.iter_mut().find(|(seen, _)| *seen == id) {
+            Some((_, kept)) if *kept != known => *kept = None,
+            Some(_) => {}
+            None => self.child_rodata.push((id, known)),
+        }
+        id
+    }
+
+    /// The address of interned literal blob `id`, with its bytes visible to constant folding when `child_rodata` kept them.
+    pub(super) fn emit_child_rodata(&mut self, id: RodataId) -> Value {
+        match self.child_rodata.iter().find(|(seen, _)| *seen == id) {
+            Some((_, Some(bytes))) => {
+                let bytes = bytes.clone();
+                self.emit_rodata_id(id, &bytes)
+            }
+            _ => self.emit_symbol(SymbolSource::Rodata(id)),
+        }
+    }
+
     pub(super) fn literal_blob(&mut self, scope: Scope<'_>, (expr, ty): (ExprId, Ty), depth: u32) -> Option<(Vec<u8>, Vec<RodataReloc>)> {
         if depth > MAX_CONST_DEPTH || ty == Ty::NONE || self.cx.types.has_params(ty) {
             return None;
@@ -97,7 +122,7 @@ impl Lower<'_, '_> {
         match (*scope.body.expr(expr), kind) {
             (Expr::Lit(Lit::Str, span), Kind::Ref(Mut::Not, pointee)) if *self.cx.types.kind(pointee) == Kind::Prim(Primitive::Str) => {
                 let bytes = string_bytes(scope.src.text(span)).ok()?;
-                let child_id = self.slots.rodata(&bytes, &[]);
+                let child_id = self.child_rodata(&bytes, &[]);
                 out.get_mut(at..at + 16)?[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
                 relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
                 Some(())
@@ -111,7 +136,7 @@ impl Lower<'_, '_> {
                 if self.cx.types.len(len_ty)? != bytes.len() as u64 {
                     return None;
                 }
-                let child_id = self.slots.rodata(&bytes, &[]);
+                let child_id = self.child_rodata(&bytes, &[]);
                 out.get_mut(at..at + 8)?;
                 relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
                 Some(())
@@ -122,7 +147,7 @@ impl Lower<'_, '_> {
                     return None;
                 }
                 let (child_bytes, child_relocs) = self.literal_blob(scope, (inner, inner_ty), depth + 1)?;
-                let child_id = self.slots.rodata(&child_bytes, &child_relocs);
+                let child_id = self.child_rodata(&child_bytes, &child_relocs);
                 match (self.cx.types.kind(pointee).clone(), self.cx.types.kind(inner_ty).clone()) {
                     _ if pointee == inner_ty => {
                         out.get_mut(at..at + 8)?;

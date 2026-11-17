@@ -734,7 +734,7 @@ impl Lower<'_, '_> {
         self.emit_rodata_id(id, bytes)
     }
 
-    fn emit_rodata_id(&mut self, id: RodataId, bytes: &[u8]) -> Value {
+    pub(super) fn emit_rodata_id(&mut self, id: RodataId, bytes: &[u8]) -> Value {
         let idx = self.relocs.len() as u32;
         let val = self.emit_symbol(SymbolSource::Rodata(id));
         if matches!(self.mode, LowerMode::Stencil) && bytes.len() <= 1024 {

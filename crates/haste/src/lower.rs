@@ -282,6 +282,7 @@ pub struct Lower<'l, 'a> {
     index: usize,
     resume: Option<coroutine::Resume>,
     overflow_checks: bool,
+    child_rodata: Vec<(RodataId, Option<Vec<u8>>)>,
 }
 
 /// Whether `item` is a static, whose reached instance writes its value into the static's cell.
@@ -328,6 +329,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             index,
             resume: None,
             overflow_checks,
+            child_rodata: Vec::new(),
         }
     }
 

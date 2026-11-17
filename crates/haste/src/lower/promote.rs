@@ -281,14 +281,14 @@ impl Lower<'_, '_> {
             }
             Repr::Scalar(Type::I64) if bytes.len() == 8 => {
                 if let [RodataReloc { offset: 0, target: RodataTarget::Rodata(child_id) }] = relocs.as_slice() {
-                    Ok(Some(self.emit_symbol(SymbolSource::Rodata(*child_id))))
+                    Ok(Some(self.emit_child_rodata(*child_id)))
                 } else {
                     Ok(None)
                 }
             }
             Repr::Mem { .. } if bytes.len() == 16 && matches!(relocs.as_slice(), [RodataReloc { offset: 0, .. }]) && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) => {
                 let RodataTarget::Rodata(child_id) = relocs[0].target;
-                let data = self.emit_symbol(SymbolSource::Rodata(child_id));
+                let data = self.emit_child_rodata(child_id);
                 let len = u64::from_le_bytes(bytes[8..].try_into()?);
                 Ok(Some(self.wide_pointer(data, len as i64)))
             }
