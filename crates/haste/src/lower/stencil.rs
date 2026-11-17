@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use haste_codegen::{AbiParam, ArgumentPurpose, Function, FunctionBuilder, Type, Value};
 use rustc_hash::FxHashMap;
 
@@ -583,8 +583,8 @@ fn simplify_inline(mut func: Function, limit: usize) -> std::result::Result<(Arc
 }
 
 fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, RelocVec, Arc<RelocPlan>, usize)> {
-    let ((item, _), typed) = &reached.list[index];
-    let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
+    let item = &reached.list[index].0.0;
+    let typed = reached.typed(index, cx.name(*item))?;
     let typed = typed.scoped(&cx.types);
     let typed: &Typed = &typed;
     let source = match &typed.shape {

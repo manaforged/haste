@@ -417,7 +417,7 @@ impl Lower<'_, '_> {
             return self.intrinsic(&origin, which, &slice, &values);
         }
         let index = self.reached_index(item, substs)?;
-        let Ok(callee) = &self.reached.list[index].1 else { bail!("{} did not type-check", self.cx.name(item)) };
+        let callee = self.reached.typed(index, self.cx.name(item))?;
         let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
         if self.cx.foreign(item) {
             let code = self.code_of(index, origin);

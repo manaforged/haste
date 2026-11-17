@@ -54,6 +54,11 @@ pub struct Reached {
 }
 
 impl Reached {
+    /// The typed body of function `index`, or an error naming `name` and why its body did not type-check.
+    pub fn typed(&self, index: usize, name: &str) -> anyhow::Result<&Arc<Typed>> {
+        self.list[index].1.as_ref().map_err(|why| anyhow::anyhow!("{name} did not type-check: {why}"))
+    }
+
     /// `roots` and every function they reach through the bodies that type-checked, each once and after every function it reaches.
     pub fn closure(&self, roots: &[usize]) -> Vec<usize> {
         let mut seen = vec![false; self.list.len()];

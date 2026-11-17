@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use haste_codegen::{ArgumentPurpose, Signature, Type};
 use rustc_abi::{TagEncoding, Variants};
 use rustc_hash::FxHashSet;
@@ -551,7 +551,7 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     if is_const && substs.is_empty() {
         mix.item(cx.outline, item);
     }
-    let Ok(callee) = &reached.list[callee_idx].1 else { bail!("{} did not type-check", cx.name(item)) };
+    let callee = reached.typed(callee_idx, cx.name(item))?;
     let sig = signature(cx, callee)?;
     hash_sig(mix, &sig);
     mix.bool(callee.ret.is_some_and(|r| matches!(cx.types.kind(r), Kind::Never)));
