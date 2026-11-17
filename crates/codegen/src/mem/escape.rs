@@ -1,5 +1,5 @@
 use crate::cfg::Cfg;
-use crate::ir::{AbiParam, Binary, Block, Convert, Function, InstData, Op, StackSlot, Value};
+use crate::ir::{AbiParam, ArgumentPurpose, Binary, Block, Convert, Function, InstData, Op, StackSlot, Value};
 
 use super::{MemRoot, TrackRoot};
 
@@ -7,11 +7,13 @@ struct UseCounts {
     total: Vec<u32>,
     safe: Vec<u32>,
     ro_calls: Vec<u32>,
+    returns: Vec<u32>,
 }
 
 pub(super) struct SlotEscapes {
     pub(super) unescaped: Vec<bool>,
     pub(super) call_readonly: Vec<bool>,
+    pub(super) return_only: Vec<bool>,
     pub(super) noalias: Vec<bool>,
 }
 
@@ -20,6 +22,7 @@ impl SlotEscapes {
         Self {
             unescaped: vec![true; func.slots.len()],
             call_readonly: vec![true; func.slots.len()],
+            return_only: vec![true; func.slots.len()],
             noalias: vec![false; func.signature.params.len()],
         }
     }
@@ -45,6 +48,9 @@ fn finish_slot_escape(
             }
             if spilled || counts.safe[v] + counts.ro_calls[v] != counts.total[v] {
                 esc.call_readonly[s.index()] = false;
+            }
+            if spilled || counts.safe[v] + counts.returns[v] != counts.total[v] {
+                esc.return_only[s.index()] = false;
             }
         }
         if let TrackRoot::Set(MemRoot::NoAliasParam(p)) = tracked[v]
@@ -202,6 +208,9 @@ fn classify_call(
         if params.get(i).is_some_and(|p| p.readonly) {
             counts.ro_calls[arg.index()] += 1;
         }
+        if params.get(i).is_some_and(|p| p.purpose == ArgumentPurpose::StructReturn) {
+            counts.returns[arg.index()] += 1;
+        }
         if post_safe
             && cx.slots[arg.index()].is_none()
             && matches!(cx.tracked[arg.index()], TrackRoot::Set(MemRoot::NoAliasParam(_)))
@@ -258,7 +267,7 @@ pub(super) fn classify_uses(
     }
     let (in_loop, danger, unknown_end) = compute_block_danger(func, cfg, slots, tracked);
     let cx = EscapeCx { func, slots: &slots, tracked: &tracked, is_const: &is_const, in_loop: &in_loop, danger: &danger, unknown_end: &unknown_end };
-    let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n] };
+    let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n], returns: vec![0_u32; n] };
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];

@@ -5,6 +5,7 @@ mod dom;
 mod join;
 mod pack;
 mod remat;
+mod sink;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, invalidate_preserving, record_base, write_preserving};
@@ -781,5 +782,6 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         changed |= pack::coalesce_vec_rescan(func, &cfg, target);
     }
     changed |= remat::split_long_loads(func, &prov);
+    changed |= sink::sink_loads(func, &prov);
     domain(changed)
 }

@@ -88,6 +88,7 @@ pub(crate) struct Provenance {
     pub slot_offsets: Vec<Option<(StackSlot, i32)>>,
     pub unescaped_slots: Vec<bool>,
     pub call_readonly_slots: Vec<bool>,
+    pub return_only_slots: Vec<bool>,
     pub noalias_escaped: Vec<bool>,
     pub param_roots: Vec<MemRoot>,
     pub symbol_defs: Vec<Option<u32>>,
@@ -285,6 +286,7 @@ impl Provenance {
         let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, is_spill);
         prov.unescaped_slots = esc.unescaped;
         prov.call_readonly_slots = esc.call_readonly;
+        prov.return_only_slots = esc.return_only;
         prov.noalias_escaped = esc.noalias;
         prov.spans = loop_mem::compute_spans(func, cfg, &prov.slot_offsets, &prov.symbol_defs);
         prov
@@ -383,6 +385,11 @@ impl Provenance {
         self.unescaped_slots.iter().map(|&u| !u).collect()
     }
 
+    /// Whether every call that takes `slot`'s address takes it as the memory for its result, so only those calls write it.
+    pub(crate) fn slot_return_only(&self, slot: StackSlot) -> bool {
+        self.return_only_slots.get(slot.index()).copied().unwrap_or(false)
+    }
+
     pub(crate) fn slot_call_readonly(&self, slot: StackSlot) -> bool {
         self.call_readonly_slots.get(slot.index()).copied().unwrap_or(false)
     }
@@ -417,7 +424,7 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
         (MemRoot::UniqueHeap(Some(owner)), _) if b.base == MemBase::Addr(owner) => false,
         (_, MemRoot::UniqueHeap(Some(owner))) if a.base == MemBase::Addr(owner) => false,
         (MemRoot::NoAliasParam(p), MemRoot::Unknown) | (MemRoot::Unknown, MemRoot::NoAliasParam(p)) => !prov.noalias_unescaped(p),
-        (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_unescaped(s),
+        (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_unescaped(s) && !prov.slot_return_only(s),
         _ => true,
     }
 }
@@ -476,7 +483,9 @@ pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance)
             w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
         }
         Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
-            MemRoot::Slot(s) => !prov.slot_unescaped(s) && !prov.slot_call_readonly(s),
+            MemRoot::Slot(s) => {
+                !prov.slot_unescaped(s) && !prov.slot_call_readonly(s) && (!prov.slot_return_only(s) || args.iter().any(|&arg| prov.loc(arg, 0, 1).root == MemRoot::Slot(s)))
+            }
             MemRoot::NoAliasParam(p) => {
                 !prov.noalias_unescaped(p) || call_writes_noalias(&func.sigs[sig.index()].params, args, prov, p)
             }
