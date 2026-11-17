@@ -90,7 +90,26 @@ pub fn collect_module(tree: &Tree, index: usize, files: &[(u32, Option<u32>)], c
         }
         bind_item(tree, (file, at), index, context, scopes);
     }
+    if index == 0 {
+        bind_injected_crate(tree, context, &mut scopes[0]);
+    }
     pending
+}
+
+/// Binds in the root scope the crate that rustc's prelude injection declares there, `extern crate std` or under `#![no_std]` `extern crate core`, unless the root binds that name itself.
+fn bind_injected_crate(tree: &Tree, context: &Context<'_>, root: &mut Scope) {
+    let Some(file) = tree.modules.first().and_then(|module| tree.files.get(module.file)) else { return };
+    let attrs = &file.items.inner;
+    if attrs.iter().any(|attr| matches!(attr, Attr::NoCore)) {
+        return;
+    }
+    let named = if attrs.iter().any(|attr| matches!(attr, Attr::NoStd)) { "core" } else { "std" };
+    let Some(found) = extern_crate_root(named, context.krate, context.deps) else { return };
+    let name = context.symbols.intern(named);
+    if root.names.get(&name).is_some_and(|entry| entry.types.is_some()) {
+        return;
+    }
+    root.bind(name, Ns::Types, Binding { def: Def::Module(found), vis: Vis::Private, origin: Origin::Item });
 }
 
 /// An import's path, whether it starts at the crate root, the `$crate` it starts from, and the name it binds, or none for a glob.
