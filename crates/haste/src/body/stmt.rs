@@ -73,6 +73,9 @@ impl Cursor<'_> {
         if self.expansion != Some(expr) {
             return None;
         }
+        if let Some(stmt) = self.expansion_stmt {
+            return Some((vec![stmt], None));
+        }
         match self.body.exprs[expr.0 as usize] {
             super::Expr::Block { stmts, tail, label: None, kind: super::BlockKind::Expansion } => Some((self.body.list(stmts).to_vec(), tail)),
             _ => None,
