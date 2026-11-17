@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use rustc_lexer::TokenKind;
 
-use super::source::{Source, opens};
+use super::source::{Mark, Source, opens};
 
 /// How often a repetition may match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,13 +58,13 @@ pub enum Meta {
     Concat(Vec<(Option<u32>, u32)>),
 }
 
-/// One element of a matcher or transcriber, as token positions in the definition's file; a metavariable also carries its slot in the rule, and a repetition the slots of every metavariable inside it.
+/// One element of a matcher or transcriber, as token positions in the definition's file; a metavariable also carries its slot in the rule, a repetition the slots of every metavariable inside it, and `$crate` the crate an earlier expansion already gave it.
 #[derive(Clone, Debug)]
 pub enum Piece {
     Token(u32),
     Group(u32, Vec<Piece>),
     Var(u32, Option<Frag>, Option<u32>),
-    Crate,
+    Crate(Option<u32>),
     CratePath,
     Meta(Meta),
     Repeat(Vec<Piece>, Option<(u32, u32)>, Op, Box<[u32]>),
@@ -103,7 +103,7 @@ fn slots(pieces: &[Piece], into: &mut Vec<u32>) {
             Piece::Var(_, _, slot) | Piece::Meta(Meta::Ignore(slot) | Meta::Count(slot)) => into.extend(*slot),
             Piece::Group(_, inner) => slots(inner, into),
             Piece::Repeat(.., names) => into.extend_from_slice(names),
-            Piece::Token(_) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => {}
+            Piece::Token(_) | Piece::Crate(_) | Piece::CratePath | Piece::Meta(_) => {}
         }
     }
 }
@@ -160,7 +160,11 @@ impl<'a> Parser<'a> {
             return Ok(next);
         }
         if !self.matcher && self.src.text(next) == "crate" {
-            out.push(Piece::Crate);
+            let fixed = match self.src.mark(next - 1) {
+                Some(Mark::Crate(krate)) => Some(krate),
+                _ => None,
+            };
+            out.push(Piece::Crate(fixed));
             return Ok(next + 1);
         }
         if self.matcher && self.src.kind(next + 1) == TokenKind::Colon && is_name(self.src.kind(next + 2)) {
