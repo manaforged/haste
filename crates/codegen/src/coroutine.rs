@@ -445,7 +445,7 @@ fn framed(func: &Function, cfg: &Cfg, resumes: &[Block], is_spill: &[bool]) -> (
     let value_uses = collect_value_uses(func);
     let (taken, analysis) = slot_effects(func, &value_uses, is_spill);
     let (live_in, live_out) = live_in(func, &analysis);
-    let kept: Vec<bool> = (0..slots).map(|at| taken[at] || resumes.iter().any(|resume| live_in[resume.index()][at])).collect();
+    let kept: Vec<bool> = (0..slots).map(|at| (taken[at] && analysis.escaped[at]) || resumes.iter().any(|resume| live_in[resume.index()][at])).collect();
     let before = written_before(func, resumes, &analysis, &live_in);
     let mut conflicts = vec![vec![false; slots]; slots];
     for s in 0..slots {
