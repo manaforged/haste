@@ -1,3 +1,4 @@
+mod copies;
 mod products;
 mod sink;
 
@@ -414,5 +415,6 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     sink_compares(func);
     if target.arch == crate::Arch::X64 && effort == Effort::Full {
         products::adjoin(func);
+        copies::pair(func);
     }
 }
