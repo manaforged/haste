@@ -34,7 +34,7 @@ table!(REDUCE: ReduceOp = [Add, Smin, Smax, Umin, Umax, Fmin, Fmax, And, Or, Xor
 table!(TARGET_OPS: TargetOpId = [
     Arm64Sha256H, Arm64Sha256H2, Arm64Sha256Su0, Arm64Sha256Su1, Arm64AesE, Arm64AesD, Arm64AesMc, Arm64AesImc, X64Sha1NextE, X64Sha1Msg1, X64Sha1Msg2,
     X64Sha256Rnds2, X64Sha256Msg1, X64Sha256Msg2, X64AesEnc, X64AesEncLast, X64AesDec, X64AesDecLast, X64AesImc, X64Low128, X64High128, X64Concat128,
-    X64Pshufb256, X64Pcmpeqb256, X64Pcmpgtb256, X64Pmovmskb256,
+    X64Pshufb256, X64Pcmpeqb256, X64Pcmpgtb256, X64Pmovmskb256, X64ClmulLowLow, X64ClmulHighLow, X64ClmulLowHigh, X64ClmulHighHigh,
 ]);
 table!(LANES: Lane = [I8, I16, I32, I64, F32, F64]);
 table!(CONVS: CallConv = [Internal, Native]);

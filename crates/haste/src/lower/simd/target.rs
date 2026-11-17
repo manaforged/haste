@@ -175,6 +175,20 @@ impl Lower<'_, '_> {
                 let (byte, quad) = (self.cx.types.prim(Primitive::U8), self.cx.types.prim(Primitive::U64));
                 Ok(Some(self.pair([byte, quad], [out, result])?))
             }
+            (X86Symbol::Pclmulqdq | X86Symbol::Pclmulqdq256 | X86Symbol::Pclmulqdq512, &[a, b, imm]) if Target::host().arch == Arch::X64 && self.b.const_int(imm).is_some() => {
+                let id = match self.b.const_int(imm).unwrap_or_default() & 0x11 {
+                    0x00 => TargetOpId::X64ClmulLowLow,
+                    0x01 => TargetOpId::X64ClmulHighLow,
+                    0x10 => TargetOpId::X64ClmulLowHigh,
+                    _ => TargetOpId::X64ClmulHighHigh,
+                };
+                let i64x2 = Type::Vec { lane: Lane::I64, count: 2 };
+                let product = |lower: &mut Self, off: i32| {
+                    let (x, y) = (lower.ins().load(i64x2, a, off), lower.ins().load(i64x2, b, off));
+                    lower.ins().target_op(id, i64x2, &[x, y])
+                };
+                Ok(Some(self.emit_chunks(x86.out_bytes(), product)))
+            }
             (X86Symbol::Lddqu, &[at]) => {
                 let v = self.ins().load(i8x16, at, 0);
                 Ok(Some(self.store_vec(v, 16)))
@@ -354,12 +368,18 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn emit_256(&mut self, mut half: impl FnMut(&mut Self, i32) -> Value) -> Value {
-        let slot = self.b.create_stack_slot(32, 5);
-        let lo = half(self, 0);
-        let hi = half(self, 16);
-        self.ins().stack_store(lo, slot, 0);
-        self.ins().stack_store(hi, slot, 16);
+    fn emit_256(&mut self, half: impl FnMut(&mut Self, i32) -> Value) -> Value {
+        self.emit_chunks(32, half)
+    }
+
+    /// The address of a new `bytes`-byte frame slot that holds each 16-byte chunk `chunk` gives for its offset.
+    fn emit_chunks(&mut self, bytes: u32, mut chunk: impl FnMut(&mut Self, i32) -> Value) -> Value {
+        let slot = self.b.create_stack_slot(bytes, 5);
+        let offsets: Vec<i32> = (0..bytes as i32).step_by(16).collect();
+        let values: Vec<Value> = offsets.iter().map(|&off| chunk(self, off)).collect();
+        for (off, value) in offsets.into_iter().zip(values) {
+            self.ins().stack_store(value, slot, off);
+        }
         self.ins().stack_addr(Type::I64, slot, 0)
     }
 

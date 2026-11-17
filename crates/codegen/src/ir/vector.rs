@@ -165,6 +165,14 @@ pub enum TargetOpId {
     X64Pcmpgtb256,
     /// `vpmovmskb` of a 32-byte vector: an `I32` of the top bit of each byte.
     X64Pmovmskb256,
+    /// `pclmulqdq` with immediate 0x00: the carry-less product of the low quadwords of both operands.
+    X64ClmulLowLow,
+    /// `pclmulqdq` with immediate 0x01: the carry-less product of the first operand's high quadword and the second's low quadword.
+    X64ClmulHighLow,
+    /// `pclmulqdq` with immediate 0x10: the carry-less product of the first operand's low quadword and the second's high quadword.
+    X64ClmulLowHigh,
+    /// `pclmulqdq` with immediate 0x11: the carry-less product of the high quadwords of both operands.
+    X64ClmulHighHigh,
 }
 
 impl IntCC {

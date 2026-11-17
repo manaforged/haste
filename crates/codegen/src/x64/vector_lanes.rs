@@ -11,6 +11,7 @@ use crate::ir::{Binary, IntCC, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, Type
 enum TargetOpForm {
     Unary,
     Binary,
+    BinaryImm(u8),
     Sha256Rnds2,
 }
 
@@ -33,6 +34,10 @@ const X64_TARGET_OPS: &[TargetOpSpec] = &[
     TargetOpSpec { id: TargetOpId::X64AesDec, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDE] },
     TargetOpSpec { id: TargetOpId::X64AesDecLast, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDF] },
     TargetOpSpec { id: TargetOpId::X64AesImc, form: TargetOpForm::Unary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDB] },
+    TargetOpSpec { id: TargetOpId::X64ClmulLowLow, form: TargetOpForm::BinaryImm(0x00), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
+    TargetOpSpec { id: TargetOpId::X64ClmulHighLow, form: TargetOpForm::BinaryImm(0x01), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
+    TargetOpSpec { id: TargetOpId::X64ClmulLowHigh, form: TargetOpForm::BinaryImm(0x10), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
+    TargetOpSpec { id: TargetOpId::X64ClmulHighHigh, form: TargetOpForm::BinaryImm(0x11), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
 ];
 
 impl Emit<'_> {
@@ -640,7 +645,7 @@ impl Emit<'_> {
         self.last_fspill.and_then(|(d, r, t)| (d == disp && t == ty).then_some(r))
     }
 
-    fn emit_target_binary(&mut self, spec: &TargetOpSpec, a: Value, b: Value, k: Option<Value>, result: Value) {
+    fn emit_target_binary(&mut self, spec: &TargetOpSpec, (a, b, k): (Value, Value, Option<Value>), imm: Option<u8>, result: Value) {
         let dst = if k.is_some() { self.xmm_of(result).unwrap_or(X2) } else { self.fdst(result) };
         let mut got_k = k.is_none();
         let mut got_a = false;
@@ -662,7 +667,10 @@ impl Emit<'_> {
         }
         if let Some(kv) = k && !got_k { self.fget(X0, kv); }
         if !got_a { self.fget(dst, a); }
-        self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b);
+        match imm {
+            Some(imm) => self.asm.sse_imm(spec.prefix, spec.opcode, dst.0, src_b, imm),
+            None => self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b),
+        }
         self.clobber_xmm(dst);
         self.fput(result, dst);
     }
@@ -678,13 +686,14 @@ impl Emit<'_> {
                 self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
-            TargetOpForm::Binary => {
+            TargetOpForm::Binary | TargetOpForm::BinaryImm(_) => {
                 let [x, y] = *args else { return Err(format!("{id:?} expects 2 args")); };
-                self.emit_target_binary(spec, x, y, None, result);
+                let imm = if let TargetOpForm::BinaryImm(imm) = spec.form { Some(imm) } else { None };
+                self.emit_target_binary(spec, (x, y, None), imm, result);
             }
             TargetOpForm::Sha256Rnds2 => {
                 let [a, b, k] = *args else { return Err(format!("{id:?} expects 3 args")); };
-                self.emit_target_binary(spec, a, b, Some(k), result);
+                self.emit_target_binary(spec, (a, b, Some(k)), None, result);
             }
         }
         Ok(())
