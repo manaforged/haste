@@ -160,7 +160,7 @@ impl Emit<'_> {
             }
             Op::Symbol(sym) => {
                 let result = result()?;
-                if !self.is_static(result) {
+                if !self.is_static(result) && self.plan.through[result.index()].is_none() {
                     let dst = self.dst(result);
                     let at = self.asm.mov_abs64(dst);
                     self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs64));

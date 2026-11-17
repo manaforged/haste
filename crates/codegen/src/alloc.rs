@@ -21,8 +21,8 @@ pub(crate) struct Regs<R: 'static> {
     pub float_branches: &'static [FloatCC],
     pub vectors: bool,
     pub absolute_calls: bool,
-    /// The backend calls a runtime helper in place instead of loading its address first.
-    pub runtime_calls: bool,
+    /// The backend calls a runtime helper or a symbol in place instead of loading its address first.
+    pub constant_calls: bool,
     pub two_address: bool,
     pub park: bool,
     pub fold_sib: bool,
@@ -71,6 +71,7 @@ pub(crate) enum CallTarget {
     Abs(i32),
     Slot(u32),
     Runtime(crate::reloc::RuntimeSymbol),
+    Symbol(u32),
 }
 
 pub(crate) struct Plan<R> {
@@ -326,6 +327,7 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided:
             }
             .map(|target| (target, Some(addr))),
             Op::Runtime(rt) if runtime => Some((CallTarget::Runtime(rt), None)),
+            Op::Symbol(sym) if runtime && matches!(locations[result.index()], Location::Symbol(_)) => Some((CallTarget::Symbol(sym), None)),
             _ => None,
         };
     }
@@ -665,7 +667,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let census = census(func);
     let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
-    let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.runtime_calls) } else { vec![None; count] };
+    let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.constant_calls) } else { vec![None; count] };
     const_pairs(func, &census, &mut elided);
     let cfg = weighed.then(|| func.cfg());
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
