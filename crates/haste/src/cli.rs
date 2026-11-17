@@ -485,17 +485,18 @@ fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets
 fn report_failures(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let mut build = crate::build::Build::load(workspace, targets)?;
     build.compile_binary(workspace)?;
-    let mut groups: Vec<(String, Vec<String>)> = build.failures()?.into_iter().collect();
-    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-    for (kind, errors) in &groups {
-        println!("{} {kind}", errors.len());
-        for error in errors {
-            println!("    {error}");
-        }
-    }
-    eprintln!("{} functions failed in {} groups", groups.iter().map(|(_, errors)| errors.len()).sum::<usize>(), groups.len());
+    let failures = build.failures()?;
+    failure_lines(&failures).iter().for_each(|line| println!("{line}"));
+    eprintln!("{} functions failed in {} groups", failures.values().map(Vec::len).sum::<usize>(), failures.len());
     std::mem::forget(build);
     Ok(())
+}
+
+/// Each group of `failures`, largest first, as a count and kind line followed by one indented line per error.
+pub(crate) fn failure_lines(failures: &Failures) -> Vec<String> {
+    let mut groups: Vec<(&String, &Vec<String>)> = failures.iter().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    groups.into_iter().flat_map(|(kind, errors)| std::iter::once(format!("{} {kind}", errors.len())).chain(errors.iter().map(|error| format!("    {error}")))).collect()
 }
 
 fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {

@@ -566,10 +566,10 @@ impl Build {
         if self.binary.is_none() {
             self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, false)?);
         }
-        let bin = self.binary.as_mut().context("the binary is not compiled")?;
-        for (idx, err) in &bin.broken {
-            eprintln!("broken [{idx}]: {err}");
+        if !self.binary.as_ref().context("the binary is not compiled")?.broken.is_empty() {
+            crate::cli::failure_lines(&self.failures()?).iter().for_each(|line| eprintln!("{line}"));
         }
+        let bin = self.binary.as_mut().context("the binary is not compiled")?;
         bin.write_aot(&self.compilation, path)?;
         eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
         Ok(0)
