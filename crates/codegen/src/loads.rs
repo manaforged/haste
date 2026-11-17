@@ -368,6 +368,7 @@ fn scan(
                 }
                 _ => {}
             }
+            changed |= remat::drop_freed_stores(func, state, (&mut bufs, &mut guard), inst);
         }
         match effect(func, state, inst) {
             Effect::Read(loc, ty, result) => {

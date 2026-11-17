@@ -411,6 +411,18 @@ pub(super) fn drop_stores_if(
     changed
 }
 
+/// Drops the pending stores into the allocation that `inst` frees with the runtime `free`, since no later read can see them.
+pub(super) fn drop_freed_stores(func: &mut Function, state: &super::State<'_>, (bufs, guard): (&mut ScanBuf, &mut FarCseGuard), inst: Inst) -> bool {
+    let Op::Call { callee, ref args, .. } = func.insts[inst.index()].op else { return false };
+    let Some(&freed) = args.first() else { return false };
+    let Some(def) = state.defs.get(callee.index()).copied().flatten() else { return false };
+    if !matches!(func.insts[def.index()].op, Op::Runtime(crate::reloc::RuntimeSymbol::Free)) {
+        return false;
+    }
+    let base = super::addr_loc(state.prov, state.subst, freed, 0, 1).base;
+    drop_stores_if(func, bufs, guard, |ploc| ploc.base == base)
+}
+
 fn merge_interval(cov: &mut Vec<(i128, i128)>, mut lo: i128, mut hi: i128) {
     cov.retain(|&(ilo, ihi)| {
         if ihi < lo || hi < ilo {
