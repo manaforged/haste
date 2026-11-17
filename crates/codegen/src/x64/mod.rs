@@ -241,6 +241,11 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.bind(self.blocks[block.index()]);
     }
 
+    fn bind_entry(&mut self, block: Block) {
+        self.at_end = self.last_block == Some(block);
+        self.asm.bind(self.blocks[block.index()]);
+    }
+
     fn deferred_prologue(&self) -> bool {
         self.shrink.is_some()
     }
