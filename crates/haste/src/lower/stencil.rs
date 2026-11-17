@@ -146,7 +146,7 @@ impl InlineTemplate {
 
 const TRANSIENT_CAP: usize = 32_768;
 const TRIM_SHARDS: usize = 8;
-const MAX_INLINE_HEIGHT: u8 = 10;
+const MAX_INLINE_HEIGHT: u8 = 12;
 
 pub(super) type InlineMeta = (ItemRef, FootprintId, bool, u8, u16);
 
