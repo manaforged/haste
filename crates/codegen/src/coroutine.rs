@@ -75,8 +75,9 @@ struct Frame {
 }
 
 impl Frame {
+    /// The heap size of the frame: a multiple of 16 bytes, so the frame cache picks a size class without rounding.
     const fn bytes(&self) -> u32 {
-        if self.size < 8 { 8 } else { self.size }
+        if self.size < 16 { 16 } else { self.size.next_multiple_of(16) }
     }
 
     fn place(&mut self, size: u32, align: u32) -> u32 {

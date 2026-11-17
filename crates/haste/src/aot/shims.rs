@@ -268,18 +268,15 @@ fn emit_x64_tls_cell(va: u64, tls: u64, stub_va: &dyn Fn(&str) -> Result<u64>, o
     Ok(())
 }
 
-/// The x86-64 ELF coroutine frame cache: per thread, one free list of up to 64 frames for each 16-byte size class below 1024 bytes, `tls` bytes below the thread pointer; other sizes and misses go to `malloc` and `free`.
+/// The x86-64 ELF coroutine frame cache: per thread, one free list of up to 64 frames for each 16-byte size class below 1024 bytes, `tls` bytes below the thread pointer, indexed by the size the caller passes as a 16-byte multiple; other sizes and misses go to `malloc` and `free`.
 fn emit_x64_frame_cache(alloc: bool, va: u64, tls: u64, stub_va: &dyn Fn(&str) -> Result<u64>, out: &mut Buf) -> Result<()> {
     let base = out.pos();
     let at = |out: &Buf| va + (out.pos() - base) as u64;
     let disp = (tls as i64).wrapping_neg() as i32 as u32;
-    out.bytes(if alloc { &[0x48, 0x8D, 0x47, 0x0F] } else { &[0x48, 0x8D, 0x46, 0x0F] });
-    out.bytes(&[0x48, 0x83, 0xE0, 0xF0, 0x48, 0x3D, 0x00, 0x04, 0x00, 0x00]);
+    let (size_reg, sib) = if alloc { (0xFF, 0x3A) } else { (0xFE, 0x32) };
+    out.bytes(&[0x48, 0x81, size_reg, 0x00, 0x04, 0x00, 0x00]);
     let big = x64_fwd(0x73, out);
-    if alloc {
-        out.bytes(&[0x48, 0x89, 0xC7]);
-    }
-    out.bytes(&[0x64, 0x48, 0x8B, 0x14, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x94, 0x02]);
+    out.bytes(&[0x64, 0x48, 0x8B, 0x14, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x94, sib]);
     out.u32(disp);
     let miss = if alloc {
         out.bytes(&[0x48, 0x8B, 0x02, 0x48, 0x85, 0xC0]);
