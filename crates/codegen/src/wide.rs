@@ -1,5 +1,19 @@
 use crate::alloc::Plan;
-use crate::ir::{Binary, Convert, Function, Inst, Op, Value};
+use crate::ir::{Binary, Convert, Function, Inst, Op, Type, Value};
+
+/// Reports whether both backends read each 128-bit operand of `op` only through `known_halves` when that operand is a constant pair.
+pub(crate) fn reads_halves(func: &Function, op: &Op) -> bool {
+    match *op {
+        Op::Unary(_, x)
+        | Op::Icmp(_, x, _)
+        | Op::Binary(
+            Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor | Binary::Imul | Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr,
+            x,
+            _,
+        ) => func.ty(x) == Type::I128,
+        _ => false,
+    }
+}
 
 pub(crate) fn half_score((lo, hi): (Option<i64>, Option<i64>), zero_only: bool) -> u8 {
     let hit = |v: Option<i64>| matches!(v, Some(0)) || (!zero_only && matches!(v, Some(-1)));

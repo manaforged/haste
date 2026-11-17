@@ -339,6 +339,28 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided:
     through
 }
 
+/// Elides each `Iconcat` of two constants whose every use reads its halves as immediates.
+fn const_pairs(func: &Function, census: &Uses, elided: &mut [bool]) {
+    let mut kept = vec![false; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let op = &func.insts[inst.index()].op;
+        if !crate::wide::reads_halves(func, op) {
+            op.for_operands(|value| kept[value.index()] = true);
+        }
+    }
+    let constant = |value: Value| census.def_inst[value.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Const(_)));
+    for (value, def) in census.def_inst.iter().enumerate() {
+        if let Some(inst) = def
+            && let Op::Binary(Binary::Iconcat, lo, hi) = func.insts[inst.index()].op
+            && !kept[value]
+            && constant(lo)
+            && constant(hi)
+        {
+            elided[value] = true;
+        }
+    }
+}
+
 fn eligible(live: &Live, wanted: &[bool], value: usize) -> bool {
     wanted[value] && !live.ranges_of(value).is_empty() && !crate::park::crosses_ranges(&live.unwinds, live.ranges_of(value))
 }
@@ -636,6 +658,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
+    const_pairs(func, &census, &mut elided);
     let cfg = weighed.then(|| func.cfg());
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
     let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
