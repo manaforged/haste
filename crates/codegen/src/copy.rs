@@ -1,3 +1,7 @@
+mod param;
+
+pub(crate) use param::forward_param_slots;
+
 use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Convert, Function, Inst, Lane, Op, StackSlot, Type, Value};
 
 /// The most bytes a move is emitted inline with; a larger one calls `memmove`.
@@ -611,6 +615,8 @@ enum Access {
     Write,
     /// Reads and writes.
     ReadWrite,
+    /// Only writes, letting reads and read-only call arguments pass.
+    Written,
 }
 
 /// Where code accesses memory through `roots` and the addresses derived from them by adds, bitcasts and block arguments, skipping the instructions of `skip`, or none when an address escapes or `access` does not allow a read.
@@ -634,6 +640,7 @@ fn accesses_at(func: &Function, info: &SretUseInfo, mut addrs: Vec<Value>, skip:
                     addrs.extend(edge_params(func, then, then_args, addr));
                     addrs.extend(edge_params(func, other, other_args, addr));
                 }
+                ref op if access == Access::Written && (reads_through(op, addr) || reads_through_call(func, op, addr)) => {}
                 ref op if writes_through(op, addr) || (access == Access::ReadWrite && reads_through(op, addr)) => writes.push((block, pos)),
                 _ => return None,
             }
@@ -651,6 +658,13 @@ fn writes_through(op: &Op, ptr: Value) -> bool {
         Op::Call { callee, .. } | Op::TryCall { callee, .. } => callee != ptr,
         _ => false,
     }
+}
+
+/// Whether `op` is a call that passes `ptr` only as arguments its callee marks read-only.
+fn reads_through_call(func: &Function, op: &Op, ptr: Value) -> bool {
+    let (Op::Call { sig, callee, ref args, .. } | Op::TryCall { sig, callee, ref args, .. }) = *op else { return false };
+    let params = &func.sigs[sig.index()].params;
+    callee != ptr && args.iter().enumerate().all(|(at, &arg)| arg != ptr || params.get(at).is_some_and(|abi| abi.readonly))
 }
 
 /// Whether `op` only reads memory at `ptr`: a load from it, or a move or copy out of it.

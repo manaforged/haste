@@ -684,6 +684,7 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return Domain::NONE;
     };
+    let params = crate::copy::forward_param_slots(func);
     let returned = crate::copy::forward_sret_slot(func);
     let join_changed = pre_split(func, moves);
     let mut scan = Scan::new(func);
@@ -736,7 +737,7 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     crate::copy::rejoin(func, &splits);
     let all_copies_rejoined = subword::rejoin_copies(func, &copy_splits);
     let cfg = if returned { Domain::CFG } else { Domain::NONE };
-    if changed || returned || !all_copies_rejoined { Domain::MEM | Domain::VALUES | cfg } else { Domain::NONE }
+    if changed || returned || params || !all_copies_rejoined { Domain::MEM | Domain::VALUES | cfg } else { Domain::NONE }
 }
 
 /// Promotes every promotable variable `scan` found.
