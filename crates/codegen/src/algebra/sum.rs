@@ -84,3 +84,18 @@ pub(super) fn cancel_terms(cx: &mut RewriteCx, fits_used: &[bool], res: Option<V
     if pending.is_none() { cx.alias(res, acc?); }
     pending
 }
+
+/// Rewrites `(v + c) * k` with a single-use sum as `v * k + c * k`, so the constant can join an address offset.
+pub(super) fn scale_sum(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
+    let (x, scale) = [(a, b), (b, a)].into_iter().find(|&(_, k)| cx.sconst(k).is_some())?;
+    let k = cx.sconst(scale)?;
+    let ty = cx.func.ty(x);
+    if !ty.is_small_int() || !cx.single_use(x) {
+        return None;
+    }
+    let &Op::Binary(Binary::Iadd, p, q) = cx.op(x)? else { return None };
+    let (v, c) = super::const_addend(cx, p, q)?;
+    let scaled = cx.emit(ty, Op::Binary(Binary::Imul, v, scale));
+    let addend = cx.emit(ty, Op::Const(extend(c.wrapping_mul(k), ty, true)));
+    Some(Op::Binary(Binary::Iadd, scaled, addend))
+}
