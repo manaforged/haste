@@ -153,12 +153,18 @@ impl Lower<'_, '_> {
     /// The address of a `(ty, bool)` pair in a new frame slot that holds `value` and `flag`.
     pub(super) fn flagged(&mut self, ty: Ty, value: Value, flag: Value) -> Result<Value> {
         let bool_ty = self.cx.types.prim(Primitive::Bool);
-        let tuple = self.cx.types.tuple(&[ty, bool_ty]);
+        self.pair([ty, bool_ty], [value, flag])
+    }
+
+    /// The address of a stack tuple of types `tys` that holds `values`.
+    pub(super) fn pair(&mut self, tys: [Ty; 2], values: [Value; 2]) -> Result<Value> {
+        let tuple = self.cx.types.tuple(&tys);
         let tuple_repr = repr(self.cx, tuple)?;
-        let Some(slot) = self.slot(tuple_repr) else { bail!("a flagged pair takes no bytes") };
-        let (first, second) = (self.field_offset(tuple, 0)?, self.field_offset(tuple, 1)?);
-        self.ins().stack_store(value, slot, first);
-        self.ins().stack_store(flag, slot, second);
+        let Some(slot) = self.slot(tuple_repr) else { bail!("a pair takes no bytes") };
+        for (index, value) in (0..).zip(values) {
+            let at = self.field_offset(tuple, index)?;
+            self.ins().stack_store(value, slot, at);
+        }
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
