@@ -639,8 +639,7 @@ fn collect_const_remaps(steps: &[RelocStep], self_slots: &[u32], offset: &mut us
                 }
             }
             RelocStep::SiteInline { plan, .. } => collect_const_remaps(&plan.steps, self_slots, offset, canon, pairs),
-            RelocStep::TypeName(_) => *offset += 2,
-            RelocStep::Promoted { .. } | RelocStep::VtableAt(_) | RelocStep::VtableSlot { .. } | RelocStep::SiteSlot(_) | RelocStep::TypeId(_) => *offset += 1,
+            other => *offset += other.symbols(),
         }
     }
 }

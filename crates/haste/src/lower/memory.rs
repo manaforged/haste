@@ -27,15 +27,7 @@ impl Lower<'_, '_> {
                 let id = self.slots.rodata(name.as_bytes(), &[]);
                 let step = RelocStep::TypeName(TyOrigin::SiteSubst(Box::new(origin.clone()), 0));
                 let data = self.emit_symbol_with(SymbolSource::Rodata(id), step);
-                let idx = self.relocs.len() as u32;
-                self.relocs.push(SymbolSource::Word(name.len() as u64));
-                let len = match self.mode {
-                    super::stencil::LowerMode::Dict => {
-                        let dict = self.dict_param.expect("dictionary parameter is set");
-                        self.ins().load(Type::I64, dict, (idx * 8) as i32)
-                    }
-                    super::stencil::LowerMode::Stencil => self.ins().symbol(idx),
-                };
+                let len = self.next_symbol(SymbolSource::Word(name.len() as u64));
                 Ok(Some(self.wide(data, len)))
             }
             (NoOp, _, _) => Ok(None),
@@ -121,11 +113,25 @@ impl Lower<'_, '_> {
     fn type_id(&mut self, origin: &SiteOrigin, ty: Ty) -> Value {
         let slot = self.b.create_stack_slot(16, 3);
         let step = RelocStep::TypeId(TyOrigin::SiteSubst(Box::new(origin.clone()), 0));
-        let id = self.emit_symbol_with(SymbolSource::Word(u64::from(ty.0)), step);
-        let zero = self.emit_symbol(SymbolSource::Word(0));
-        self.ins().stack_store(id, slot, 0);
-        self.ins().stack_store(zero, slot, 8);
+        let [lo, hi] = super::reloc::type_id_words(self.cx, ty);
+        let lo = self.emit_symbol_with(lo, step);
+        let hi = self.next_symbol(hi);
+        self.ins().stack_store(lo, slot, 0);
+        self.ins().stack_store(hi, slot, 8);
         self.ins().stack_addr(Type::I64, slot, 0)
+    }
+
+    /// The value of `src`, a symbol the reloc step emitted just before it also produces.
+    fn next_symbol(&mut self, src: SymbolSource) -> Value {
+        let idx = self.relocs.len() as u32;
+        self.relocs.push(src);
+        match self.mode {
+            super::stencil::LowerMode::Dict => {
+                let dict = self.dict_param.expect("dictionary parameter is set");
+                self.ins().load(Type::I64, dict, (idx * 8) as i32)
+            }
+            super::stencil::LowerMode::Stencil => self.ins().symbol(idx),
+        }
     }
 
     fn layout_const(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {

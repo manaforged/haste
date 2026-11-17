@@ -82,6 +82,17 @@ pub(crate) enum RelocStep {
     TypeName(TyOrigin),
 }
 
+impl RelocStep {
+    /// How many symbols this step produces.
+    pub(crate) fn symbols(&self) -> usize {
+        match self {
+            RelocStep::TypeName(_) | RelocStep::TypeId(_) => 2,
+            RelocStep::SiteInline { plan, .. } => plan.reloc_len(),
+            _ => 1,
+        }
+    }
+}
+
 /// Parametric relocation plan recorded on a stencil leader and evaluated in `O(|relocs|)` per follower.
 #[derive(Clone, Debug, Default)]
 pub struct RelocPlan {
@@ -94,14 +105,7 @@ impl RelocPlan {
     }
 
     pub(crate) fn reloc_len(&self) -> usize {
-        self.steps
-            .iter()
-            .map(|step| match step {
-                RelocStep::TypeName(_) => 2,
-                RelocStep::SiteInline { plan, .. } => plan.reloc_len(),
-                _ => 1,
-            })
-            .sum()
+        self.steps.iter().map(RelocStep::symbols).sum()
     }
 
     pub(super) fn vtable_slot_at(&self, target_sym: usize) -> Option<(ExprId, u16)> {
@@ -109,9 +113,7 @@ impl RelocPlan {
         for step in &self.steps {
             let len = match step {
                 RelocStep::VtableSlot { expr, slot } if offset == target_sym => return Some((*expr, *slot)),
-                RelocStep::TypeName(_) => 2,
-                RelocStep::SiteInline { plan, .. } => plan.reloc_len(),
-                _ => 1,
+                other => other.symbols(),
             };
             if target_sym < offset + len {
                 return None;
@@ -173,7 +175,7 @@ fn eval_into(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, plan: &
             }
             RelocStep::TypeId(origin) => {
                 let ty = eval_ty(cx, reached, typed, substs, origin)?;
-                out.push(SymbolSource::Word(u64::from(ty.0)));
+                out.extend(type_id_words(cx, ty));
             }
             RelocStep::TypeName(origin) => {
                 let ty = eval_ty(cx, reached, typed, substs, origin)?;
@@ -348,4 +350,10 @@ fn step_ty(cx: &mut Context<'_>, parent: Ty, variant: u32, field: u32) -> Result
         }
         other => bail!("cannot step into {:?}", other),
     }
+}
+
+/// The two words a `TypeId` of `ty` holds: the low and high halves of its key, each small enough for any target's word reloc.
+pub(super) fn type_id_words(cx: &Context<'_>, ty: Ty) -> [SymbolSource; 2] {
+    let key = crate::sema::summary::codec::type_id_key(cx.outline, &cx.types, ty);
+    [SymbolSource::Word(key & u64::from(u32::MAX)), SymbolSource::Word(key >> 32)]
 }
