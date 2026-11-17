@@ -290,7 +290,9 @@ impl Asm {
             Size::D => (false, &[0x8B]),
             Size::Q => (true, &[0x8B]),
         };
+        let start = self.pos();
         self.encode(&[], w, opcode, dst as u8, src.into(), size == Size::B);
+        self.flags_kept(start);
     }
 
     pub fn load_signed(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) {
@@ -300,11 +302,15 @@ impl Asm {
             Size::D => &[0x63],
             Size::Q => &[0x8B],
         };
+        let start = self.pos();
         self.encode(&[], true, opcode, dst as u8, src.into(), size == Size::B);
+        self.flags_kept(start);
     }
 
     pub fn store(&mut self, size: Size, dst: Mem, src: Reg) {
+        let start = self.pos();
         self.sized(false, size, (&[0x88], &[0x89]), src as u8, dst.into());
+        self.flags_kept(start);
     }
 
     pub fn store_slot_reloc(&mut self, dst: Mem) -> u32 {
@@ -315,7 +321,9 @@ impl Asm {
     }
 
     pub fn mov(&mut self, dst: Reg, src: Reg) {
+        let start = self.pos();
         self.encode(&[], true, &[0x8B], dst as u8, src.into(), false);
+        self.flags_kept(start);
     }
 
     pub fn mov_slot_reloc(&mut self, dst: Reg) -> u32 {
@@ -522,7 +530,9 @@ impl Asm {
     }
 
     pub fn lea_sized(&mut self, size: Size, dst: Reg, src: Mem) {
+        let start = self.pos();
         self.encode(&[], size == Size::Q, &[0x8D], dst as u8, src.into(), false);
+        self.flags_kept(start);
     }
 
     pub fn xchg(&mut self, size: Size, dst: Mem, src: Reg) {

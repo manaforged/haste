@@ -508,6 +508,7 @@ impl Emit<'_> {
             self.raw(Reg::Rax, pointer);
         }
         self.leave_wide(&func.signature.returns);
+        self.asm.flags_overwritten();
         if self.in_fast_ret {
             self.asm.bytes(&[0xC3]);
         } else {
@@ -604,6 +605,7 @@ impl Emit<'_> {
         if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
         }
+        self.asm.flags_overwritten();
         match direct {
             Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
             Some(CallTarget::Slot(sym)) if self.direct_calls => {
@@ -723,6 +725,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn jump_label(&mut self, label: Label) {
         self.invalidate_spills();
+        self.asm.flags_overwritten();
         self.asm.jmp(label);
     }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {

@@ -1,9 +1,11 @@
 use super::asm::{Alu, Asm, Mem, Reg, Rm, Size, Xmm};
 
-/// The last instruction a later one may rewrite in place, valid while nothing was emitted, bound or recorded after it.
+/// The most zero movs a tail holds before the oldest stay movs.
+const PENDING_ZEROS: usize = 8;
+
+/// The trailing instructions a later one may rewrite in place, valid while nothing was emitted, bound or recorded after them.
 #[derive(Clone, Copy)]
 pub(crate) struct Tail {
-    start: u32,
     end: u32,
     marks: [usize; 2],
     kind: Kind,
@@ -11,8 +13,16 @@ pub(crate) struct Tail {
 
 #[derive(Clone, Copy)]
 enum Kind {
-    ZeroReg(Reg),
-    ZeroRun { run: Mem, len: i32, last: Last },
+    Zeros { movs: [Zero; PENDING_ZEROS], len: usize },
+    ZeroRun { start: u32, run: Mem, len: i32, last: Last },
+}
+
+/// A `mov r32, 0` at `start..end` that becomes `xor r32, r32` once the flags are dead.
+#[derive(Clone, Copy)]
+struct Zero {
+    start: u32,
+    end: u32,
+    reg: Reg,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,21 +42,48 @@ impl Asm {
         (tail.end == self.pos() && tail.marks == self.marks()).then_some(tail)
     }
 
-    fn set_tail(&mut self, start: u32, kind: Kind) {
-        self.tail = Some(Tail { start, end: self.pos(), marks: self.marks(), kind });
+    fn set_tail(&mut self, kind: Kind) {
+        self.tail = Some(Tail { end: self.pos(), marks: self.marks(), kind });
+    }
+
+    fn zeros_at(&mut self, at: u32) -> Option<&mut Tail> {
+        let marks = self.marks();
+        self.tail.as_mut().filter(|tail| tail.end == at && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. }))
+    }
+
+    /// Carries pending zero movs past the one instruction emitted since `start`, which neither reads nor writes the flags.
+    pub(super) fn flags_kept(&mut self, start: u32) {
+        let end = self.pos();
+        if let Some(tail) = self.zeros_at(start) {
+            tail.end = end;
+        }
+    }
+
+    fn push_zero(&mut self, zero: Zero) {
+        if let Some(Tail { end, kind: Kind::Zeros { movs, len }, .. }) = self.zeros_at(zero.start)
+            && *len < PENDING_ZEROS
+        {
+            movs[*len] = zero;
+            *len += 1;
+            *end = zero.end;
+            return;
+        }
+        self.set_tail(Kind::Zeros { movs: [zero; PENDING_ZEROS], len: 1 });
     }
 
     /// Stores the low `size` bytes of `imm` to `dst`; a quadword takes `imm` sign-extended.
     pub fn store_imm_sized(&mut self, size: Size, dst: Mem, imm: i32) {
+        let start = self.pos();
         self.sized(false, size, (&[0xC6], &[0xC7]), 0, dst.into());
         match size {
             Size::B => self.code.push(imm as u8),
             Size::W => self.code.extend((imm as i16).to_le_bytes()),
             _ => self.code.extend(imm.to_le_bytes()),
         }
+        self.flags_kept(start);
     }
 
-    /// Loads `imm` into `dst` without touching the flags; a zero becomes `xor` once the next instruction overwrites them.
+    /// Loads `imm` into `dst` without touching the flags; a zero becomes `xor` once the flags are known dead before any read.
     pub fn mov_imm(&mut self, dst: Reg, imm: i64) {
         let start = self.pos();
         let reg = dst as u8;
@@ -63,15 +100,21 @@ impl Asm {
             self.code.extend(imm.to_le_bytes());
         }
         if imm == 0 {
-            self.set_tail(start, Kind::ZeroReg(dst));
+            self.push_zero(Zero { start, end: self.pos(), reg: dst });
+        } else {
+            self.flags_kept(start);
         }
     }
 
-    /// Marks that the next instruction writes every status flag and reads none, so a `mov r32, 0` just before it becomes `xor r32, r32`.
+    /// Marks the status flags dead here, read by nothing before their next write, so each pending `mov r32, 0` becomes `xor r32, r32`.
     pub fn flags_overwritten(&mut self) {
-        if let Some(Tail { start, kind: Kind::ZeroReg(reg), .. }) = self.take_tail() {
-            self.code.truncate(start as usize);
-            self.encode(&[], false, &[0x33], reg as u8, reg.into(), false);
+        let Some(Tail { kind: Kind::Zeros { movs, len }, .. }) = self.take_tail() else { return };
+        for zero in movs[..len].iter().rev() {
+            let at = self.pos();
+            self.alu32(Alu::Xor, zero.reg, zero.reg);
+            let xor = (self.pos() - at) as usize;
+            self.code[zero.start as usize..].rotate_right(xor);
+            self.code.drain(zero.start as usize + xor..zero.end as usize + xor);
         }
     }
 
@@ -94,16 +137,16 @@ impl Asm {
     pub fn store_zero(&mut self, dst: Mem, scratch: Xmm) -> bool {
         let start = self.pos();
         let joined = self.take_tail().and_then(|tail| match tail.kind {
-            Kind::ZeroRun { run, len, last }
+            Kind::ZeroRun { start, run, len, last }
                 if run.base == dst.base && run.index == dst.index && run.disp.checked_add(len) == Some(dst.disp) =>
             {
-                Some((tail.start, run, len, last))
+                Some((start, run, len, last))
             }
             _ => None,
         });
         let Some((last_start, run, len, last)) = joined else {
             self.store_imm_sized(Size::Q, dst, 0);
-            self.set_tail(start, Kind::ZeroRun { run: dst, len: 8, last: Last::Imm });
+            self.set_tail(Kind::ZeroRun { start, run: dst, len: 8, last: Last::Imm });
             return false;
         };
         if last != Last::Movups {
@@ -120,7 +163,7 @@ impl Asm {
             self.xmm_op(0, 0x11, (scratch, Xmm(0)), dst.offset(-8));
             Last::Movups
         };
-        self.set_tail(at, Kind::ZeroRun { run, len: len + 8, last: next });
+        self.set_tail(Kind::ZeroRun { start: at, run, len: len + 8, last: next });
         last == Last::Imm
     }
 }
