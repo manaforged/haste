@@ -477,6 +477,17 @@ impl Emit<'_> {
         self.clobber_regs(&[Reg::Rax, Reg::Rdx]);
     }
 
+    /// Divides the 128-bit value `high:low` by `by` with one `div`, putting the quotient, or the remainder when `rem` is set, in `result`.
+    pub(super) fn divide_wide(&mut self, rem: bool, [high, low, by]: [Value; 3], result: Value) {
+        self.get(Reg::Rdx, high, Ext::Zero);
+        self.get(Reg::Rax, low, Ext::Zero);
+        self.get(Reg::Rcx, by, Ext::Zero);
+        self.asm.group3(Group3::Div, Reg::Rcx);
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
+        self.flags = None;
+        self.put(result, if rem { Reg::Rdx } else { Reg::Rax });
+    }
+
     /// Computes the high half of `x * y` and returns its register; a 64-bit product leaves its low half in rax for the `Imul` that follows.
     fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) -> Reg {
         let ext = Ext::of(signed);

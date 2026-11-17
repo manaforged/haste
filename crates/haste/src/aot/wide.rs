@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, anyhow};
-use haste_codegen::{AbiParam, Arch, CallConv, Effort, FloatCC, Function, FunctionBuilder, IntCC, Os, RuntimeSymbol, Signature, TARGETS, Type, Value};
+use haste_codegen::{AbiParam, Arch, CallConv, Effort, FloatCC, Function, FunctionBuilder, IntCC, Os, RuntimeSymbol, Signature, TARGETS, TargetOpId, Type, Value};
 
 use super::Buf;
 
@@ -12,10 +12,10 @@ pub(in crate::aot) enum WideShim {
 pub(super) fn emit(arch: Arch, os: Os, kind: WideShim, out: &mut Buf) -> Result<()> {
     let target = TARGETS.iter().find(|t| t.arch == arch && t.os == os).copied().context("missing codegen target for AOT shim")?.effort(Effort::Full);
     let func = match kind {
-        WideShim::Runtime(RuntimeSymbol::I128Udiv) => build_divrem(false, false),
-        WideShim::Runtime(RuntimeSymbol::I128Urem) => build_divrem(false, true),
-        WideShim::Runtime(RuntimeSymbol::I128Sdiv) => build_divrem(true, false),
-        WideShim::Runtime(RuntimeSymbol::I128Srem) => build_divrem(true, true),
+        WideShim::Runtime(RuntimeSymbol::I128Udiv) => build_divrem(false, false, arch),
+        WideShim::Runtime(RuntimeSymbol::I128Urem) => build_divrem(false, true, arch),
+        WideShim::Runtime(RuntimeSymbol::I128Sdiv) => build_divrem(true, false, arch),
+        WideShim::Runtime(RuntimeSymbol::I128Srem) => build_divrem(true, true, arch),
         WideShim::Runtime(RuntimeSymbol::U128ToF32) => build_int_to_float(false, Type::F32),
         WideShim::Runtime(RuntimeSymbol::U128ToF64) => build_int_to_float(false, Type::F64),
         WideShim::Runtime(RuntimeSymbol::I128ToF32) => build_int_to_float(true, Type::F32),
@@ -60,7 +60,7 @@ fn apply_sign128(b: &mut FunctionBuilder<'_>, u: Value, sign: Value) -> Value {
     b.ins().isub(xored, sign)
 }
 
-fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: bool) -> Value {
+fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, arch): (bool, Arch)) -> Value {
     let zero = const128(b, 0, 0);
     let is_zero = b.ins().icmp(IntCC::Equal, y, zero);
     let z_blk = b.create_block();
@@ -87,7 +87,7 @@ fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: bool) -> V
     b.ins().brif(narrow, narrow_blk, &[], loop_blk, &[]);
 
     b.switch_to_block(narrow_blk);
-    let narrow_res = udivrem_by_u64(b, x, y, want_rem);
+    let narrow_res = udivrem_by_u64(b, x, y, (want_rem, arch));
     b.ins().jump(done, &[narrow_res]);
 
     b.switch_to_block(loop_blk);
@@ -120,7 +120,7 @@ fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: bool) -> V
     out
 }
 
-fn udivrem_by_u64(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: bool) -> Value {
+fn udivrem_by_u64(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, arch): (bool, Arch)) -> Value {
     let c64 = b.ins().iconst(Type::I64, 64);
     let x_hi128 = b.ins().ushr(x, c64);
     let x_hi = b.ins().ireduce(Type::I64, x_hi128);
@@ -129,6 +129,11 @@ fn udivrem_by_u64(b: &mut FunctionBuilder<'_>, x: Value, y: Value, want_rem: boo
     let q_hi = b.ins().udiv(x_hi, v);
     let q_hi_v = b.ins().imul(q_hi, v);
     let r_hi = b.ins().isub(x_hi, q_hi_v);
+    if arch == Arch::X64 {
+        let id = if want_rem { TargetOpId::X64RemWide } else { TargetOpId::X64DivWide };
+        let part = b.ins().target_op(id, Type::I64, &[r_hi, x_lo, v]);
+        return if want_rem { b.ins().uextend(Type::I128, part) } else { b.ins().iconcat(part, q_hi) };
+    }
     let (q_lo, r) = divlu(b, (r_hi, x_lo), v);
     if want_rem { b.ins().uextend(Type::I128, r) } else { b.ins().iconcat(q_lo, q_hi) }
 }
@@ -183,7 +188,7 @@ fn divlu_digit(b: &mut FunctionBuilder<'_>, (num, next): (Value, Value), (vn, vn
     (q, b.ins().isub(joined, q_vn))
 }
 
-fn build_divrem(signed: bool, want_rem: bool) -> Function {
+fn build_divrem(signed: bool, want_rem: bool, arch: Arch) -> Function {
     let mut func = new_fn(&[Type::I128, Type::I128], Type::I128);
     let mut b = FunctionBuilder::new(&mut func);
     let entry = b.create_block();
@@ -194,11 +199,11 @@ fn build_divrem(signed: bool, want_rem: bool) -> Function {
     let res = if signed {
         let (ax, sx) = abs128(&mut b, x);
         let (ay, sy) = abs128(&mut b, y);
-        let u = udivrem(&mut b, ax, ay, want_rem);
+        let u = udivrem(&mut b, ax, ay, (want_rem, arch));
         let sign = if want_rem { sx } else { b.ins().bxor(sx, sy) };
         apply_sign128(&mut b, u, sign)
     } else {
-        udivrem(&mut b, x, y, want_rem)
+        udivrem(&mut b, x, y, (want_rem, arch))
     };
     b.ins().return_(&[res]);
     func

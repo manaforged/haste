@@ -250,6 +250,10 @@ impl Emit<'_> {
             self.carry_chain(id, [carry, a, b], result);
             return Some(Ok(()));
         }
+        if let (TargetOpId::X64DivWide | TargetOpId::X64RemWide, &[high, low, by]) = (id, args) {
+            self.divide_wide(id == TargetOpId::X64RemWide, [high, low, by], result);
+            return Some(Ok(()));
+        }
         if let (TargetOpId::X64Pmovmskb256, &[v]) = (id, args) {
             let dst = self.dst(result);
             let src = self.fin(v, X0);

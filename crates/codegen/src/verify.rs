@@ -115,7 +115,7 @@ fn select_check(func: &Function, cond: Value, x: Value, y: Value, result: Option
 fn target_arity(id: TargetOpId) -> usize {
     match id {
         TargetOpId::Arm64AesMc | TargetOpId::Arm64AesImc | TargetOpId::X64AesImc | TargetOpId::X64Low128 | TargetOpId::X64High128 | TargetOpId::X64Pmovmskb256 => 1,
-        TargetOpId::Arm64Sha256H | TargetOpId::Arm64Sha256H2 | TargetOpId::Arm64Sha256Su1 | TargetOpId::X64Sha256Rnds2 | TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut => 3,
+        TargetOpId::Arm64Sha256H | TargetOpId::Arm64Sha256H2 | TargetOpId::Arm64Sha256Su1 | TargetOpId::X64Sha256Rnds2 | TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut | TargetOpId::X64DivWide | TargetOpId::X64RemWide => 3,
         _ => 2,
     }
 }

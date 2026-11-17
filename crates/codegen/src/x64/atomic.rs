@@ -22,7 +22,7 @@ const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
 pub(super) fn uses_scratch(func: &Function, op: &Op) -> bool {
     match op {
         Op::Copy(..) | Op::Move(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Fits(Binary::Imul, ..) => true,
-        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut, _) => true,
+        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut | TargetOpId::X64DivWide | TargetOpId::X64RemWide, _) => true,
         Op::Unary(Unary::Popcnt | Unary::Bitrev, _) => true,
         Op::Unary(Unary::Floor | Unary::Ceil | Unary::Trunc, x) if func.ty(*x).is_float() => true,
         Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) if func.ty(*x) == Type::I128 => true,

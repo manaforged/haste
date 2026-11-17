@@ -181,6 +181,10 @@ pub enum TargetOpId {
     X64SubBorrow,
     /// `sbb` of two `I64`s after an `I8` borrow in: the `I8` borrow out.
     X64SubBorrowOut,
+    /// `div` of the 128-bit dividend whose high `I64` is the first operand and low `I64` the second by the third, which must exceed the high half: the `I64` quotient.
+    X64DivWide,
+    /// `div` of the 128-bit dividend whose high `I64` is the first operand and low `I64` the second by the third, which must exceed the high half: the `I64` remainder.
+    X64RemWide,
 }
 
 impl IntCC {
