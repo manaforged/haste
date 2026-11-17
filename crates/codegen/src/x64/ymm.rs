@@ -248,8 +248,7 @@ impl Emit<'_> {
 
     fn wide_target(&mut self, id: TargetOpId, args: &[Value], result: Value) -> Option<Result<(), String>> {
         if let (TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut, &[carry, a, b]) = (id, args) {
-            self.carry_chain(id, [carry, a, b], result);
-            return Some(Ok(()));
+            return Some(self.carry_chain(id, [carry, a, b], result));
         }
         if let (TargetOpId::X64DivWide | TargetOpId::X64RemWide, &[high, low, by]) = (id, args) {
             self.divide_wide(id == TargetOpId::X64RemWide, [high, low, by], result);

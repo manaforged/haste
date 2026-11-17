@@ -25,6 +25,52 @@ pub(super) fn overflow_tag(sum: Value) -> usize {
     2 * sum.index() + 1
 }
 
+fn carry_op(op: &Op) -> Option<(TargetOpId, &[Value])> {
+    match op {
+        Op::TargetOp(id @ (TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut), args) if args.as_slice().len() == 3 => Some((*id, args.as_slice())),
+        _ => None,
+    }
+}
+
+/// Marks each carry out whose every use is the carry operand of the next carry pair in its block, with only register loads and stores between, so the carry flag hands it over and no register needs it.
+pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>) -> Vec<bool> {
+    let mut uses = vec![0_u32; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        func.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
+    }
+    let held = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_));
+    let moved = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_) | crate::alloc::Location::Slot);
+    let mut flag = vec![false; func.types.len()];
+    for block in &func.blocks {
+        for (at, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let (Some((TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrowOut, _)), Some(out)) = (carry_op(&data.op), data.result) else { continue };
+            let mut consumers = 0;
+            for &next in &block.insts[at + 1..] {
+                let op = &func.insts[next.index()].op;
+                if let Some((_, &[carry, a, b])) = carry_op(op)
+                    && carry == out
+                    && moved(a)
+                    && moved(b)
+                {
+                    consumers += 1;
+                    continue;
+                }
+                let safe = match *op {
+                    Op::Load(addr, _) => held(addr) && func.insts[next.index()].result.is_some_and(moved),
+                    Op::Store(value, addr, _) => held(addr) && held(value),
+                    _ => false,
+                };
+                if consumers > 0 || !safe {
+                    break;
+                }
+            }
+            flag[out.index()] = consumers > 0 && uses[out.index()] == consumers;
+        }
+    }
+    flag
+}
+
 /// Marks each 32- or 64-bit sum that an integer compare tests against one of its own operands, which reads the add's carry.
 pub(super) fn overflow_reads(func: &Function, defs: &[Option<Inst>]) -> Vec<bool> {
     let mut read = vec![false; func.types.len()];
@@ -59,7 +105,7 @@ fn icmp_order(cc: IntCC) -> (bool, Cond) {
 
 impl Emit<'_> {
     /// Adds or subtracts `a` and `b` after the carry in `args[0]` by `adc` or `sbb` into `result`: the sum, or the carry out, which reads the flags of a sum of the same operands emitted just before.
-    pub(super) fn carry_chain(&mut self, id: TargetOpId, args: [Value; 3], result: Value) {
+    pub(super) fn carry_chain(&mut self, id: TargetOpId, args: [Value; 3], result: Value) -> Result<(), String> {
         let add = matches!(id, TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut);
         let out = matches!(id, TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrowOut);
         if !(out && self.carry_flags == Some((add, args))) {
@@ -75,6 +121,9 @@ impl Emit<'_> {
                 Reg::Rcx
             });
             if !(kept && held(self)) {
+                if self.flag_carry[carry.index()] {
+                    return Err(format!("the carry flag lost the elided carry {carry:?}"));
+                }
                 if kept {
                     self.get(Reg::Rdx, carry, Ext::Zero);
                 }
@@ -87,13 +136,18 @@ impl Emit<'_> {
         if !out {
             self.carry_flags = Some((add, args));
             self.put(result, Reg::Rax);
-            return;
+            return Ok(());
+        }
+        if self.flag_carry[result.index()] {
+            self.asm.hold_carry(carry_tag(result));
+            return Ok(());
         }
         let dst = self.dst(result);
         self.asm.setcc(Cond::B, dst);
         self.asm.load(Size::B, dst, dst);
         self.asm.hold_carry(carry_tag(result));
         self.put(result, dst);
+        Ok(())
     }
 
     /// Whether the carry flag still holds `left <u right` from the add that produced `left` from `right` and another operand.
