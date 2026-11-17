@@ -9,6 +9,7 @@ mod stencil;
 mod stencil_jit;
 pub(crate) use stencil::{DICT_MIN_BYTES, DICT_MIN_FANOUT, verify_stencil};
 mod stub;
+pub mod watch;
 mod workers;
 
 pub use expand::{Job, run_macros};

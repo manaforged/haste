@@ -260,7 +260,7 @@ fn usage() -> String {
     let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] {} PATH [--] [ARGS...]\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} PATH [--] [ARGS...]\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -358,6 +358,10 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter:
                 args.next();
                 crate::image::perf::enable();
             }
+            "--watch" => {
+                args.next();
+                crate::image::watch::enable();
+            }
             "--stats-json" => {
                 args.next();
                 let value = args.next().context("--stats-json takes a file path")?;
@@ -406,12 +410,16 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         return Ok(Err(meta));
     }
     let command = parse(&mut args)?;
-    if matches!(command, Command::Request(Request::Build)) {
-        if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
-            return Ok(Err(meta));
-        }
-    } else if stats_json.is_some() || out.is_some() {
+    if matches!(command, Command::Request(Request::Build | Request::Run))
+        && let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)?
+    {
+        return Ok(Err(meta));
+    }
+    if !matches!(command, Command::Request(Request::Build)) && (stats_json.is_some() || out.is_some()) {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
+    }
+    if crate::image::watch::enabled() && !matches!(command, Command::Request(Request::Run)) {
+        anyhow::bail!("--watch is only supported with `haste run`");
     }
     let path = PathBuf::from(args.next().with_context(usage)?);
     let rest = args
@@ -451,6 +459,7 @@ pub fn main() -> Result<()> {
     let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
     if stats_json.is_none()
         && out.is_none()
+        && !crate::image::watch::enabled()
         && crate::profile() == outline::tree::Profile::Debug
         && let Command::Request(request) = command
         && let Some(status) = crate::serve::ask(&root, request, &argv)?

@@ -83,6 +83,11 @@ fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<Watch
     sources.into_iter().map(|path| (path, None)).chain(included).map(|(path, by)| Watch { stamp: stamp(&path), path, by }).collect()
 }
 
+/// The path of each file of `stamps`.
+fn paths(stamps: &[Watch]) -> Vec<PathBuf> {
+    stamps.iter().map(|watch| watch.path.clone()).collect()
+}
+
 fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, kind: BatchKind) -> (Vec<ItemRef>, Vec<Instance>) {
     let items = kind.pick(workspace, outline);
     let roots = items.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect();
@@ -472,30 +477,14 @@ impl Build {
 
     /// Local source and included file paths watched by this build.
     pub(crate) fn watch_paths(&self) -> Vec<PathBuf> {
-        self.stamps.iter().map(|watch| watch.path.clone()).collect()
+        paths(&self.stamps)
     }
 
     /// Brings the build up to date with the local files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
     pub fn refresh(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-        let (mut stale, mut crates) = (Vec::new(), Vec::new());
-        for watch in &mut self.stamps {
-            let now = stamp(&watch.path);
-            if now == watch.stamp {
-                continue;
-            }
-            watch.stamp = now;
-            let edit = match &watch.by {
-                Some(by) => self.compilation.outline.reexpand(by),
-                None => self.compilation.outline.reread(&watch.path),
-            };
-            match edit {
-                Ok(Edit::Same) => {}
-                Ok(Edit::Bodies(slots)) if slots.iter().any(|&(krate, _)| expands(workspace, &self.compilation.outline, krate)) => crates.extend(slots.iter().map(|&(krate, _)| krate)),
-                Ok(Edit::Bodies(slots)) => stale.extend(slots),
-                Ok(Edit::Items(edited)) => crates.extend(edited),
-                Err(_) => return self.rebuild(workspace, targets),
-            }
-        }
+        let Ok((stale, crates)) = edits(workspace, &mut self.stamps, &mut self.compilation.outline) else {
+            return self.rebuild(workspace, targets);
+        };
         let done = match (stale.is_empty(), crates.is_empty()) {
             (true, true) => return Ok(()),
             (_, false) => self.reload(workspace, crates.into_iter().chain(stale.iter().map(|&(krate, _)| krate)).collect()),
@@ -628,6 +617,43 @@ pub(crate) fn emit_main(workspace: &graph::Workspace, compilation: &mut Compilat
     Batch::rooted(workspace, compilation, (BatchKind::MainAot, Some(main)), false)?.write_aot(compilation, path)
 }
 
+/// What changed in the files of `stamps` since their last stamps: the `(crate, file)` slots whose function bodies changed, which `outline` now holds, and the crates to read again; fails when a file does not read.
+fn edits(workspace: &graph::Workspace, stamps: &mut [Watch], outline: &mut outline::Outline) -> Result<(Vec<(u32, u32)>, Vec<u32>)> {
+    let (mut stale, mut crates) = (Vec::new(), Vec::new());
+    for watch in stamps {
+        let now = stamp(&watch.path);
+        if now == watch.stamp {
+            continue;
+        }
+        watch.stamp = now;
+        let edit = match &watch.by {
+            Some(by) => outline.reexpand(by)?,
+            None => outline.reread(&watch.path)?,
+        };
+        match edit {
+            Edit::Same => {}
+            Edit::Bodies(slots) if slots.iter().any(|&(krate, _)| expands(workspace, outline, krate)) => crates.extend(slots.iter().map(|&(krate, _)| krate)),
+            Edit::Bodies(slots) => stale.extend(slots),
+            Edit::Items(edited) => crates.extend(edited),
+        }
+    }
+    Ok((stale, crates))
+}
+
+/// The `(crate, file)` slots whose function bodies changed in the files of `stamps`, which `outline` now holds, or why the edit needs a restart.
+fn body_edits(workspace: &graph::Workspace, stamps: &mut [Watch], outline: &mut outline::Outline) -> Result<Vec<(u32, u32)>, String> {
+    match edits(workspace, stamps, outline) {
+        Ok((stale, crates)) if crates.is_empty() => Ok(stale),
+        Ok((_, mut crates)) => {
+            crates.sort_unstable();
+            crates.dedup();
+            let names: Vec<&str> = crates.iter().map(|&krate| outline.roots[krate as usize].name.as_str()).collect();
+            Err(format!("more than function bodies changed in {}", names.join(", ")))
+        }
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
 /// Runs the binary's `main` with `args` as argv, compiling each function on its first call, and, when prepared code is switched on, under the release profile calling prepped code where it can, racing a prep of what changed since the library was built.
 pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
     let mut ahead = if crate::profile() == Profile::Release && crate::prep::prepared() { crate::prep::ahead(workspace, targets) } else { None };
@@ -646,8 +672,22 @@ fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], 
     if crate::profile() == Profile::Release && crate::prep::prepared() {
         bind_prepped(workspace, &mut compilation, args, ahead);
     }
-    let status = crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args);
+    let status = match crate::image::watch::enabled() {
+        true => run_watched(workspace, &mut compilation, main, args),
+        false => crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args),
+    };
     std::mem::forget(compilation);
+    status
+}
+
+/// Runs the binary's `main` with `args` as argv like `run_on_demand`, while it watches the local source files and swaps in the function bodies an edit changes.
+fn run_watched(workspace: &graph::Workspace, compilation: &mut Compilation, main: ItemRef, args: &[String]) -> Result<i32> {
+    let mut watched = stamps(workspace, &compilation.outline);
+    let files = paths(&watched);
+    let mut reread = |compilation: &mut Compilation| body_edits(workspace, &mut watched, &mut compilation.outline);
+    let mut program = Program::new(compilation, Cache::default(), main)?;
+    let status = program.run_watched(compilation, args, (files, &mut reread));
+    std::mem::forget(program);
     status
 }
 
