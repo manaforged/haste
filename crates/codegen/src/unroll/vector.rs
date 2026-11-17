@@ -434,21 +434,24 @@ fn advance(e: &mut Emit<'_>, q: &[Value], strides: &[Option<Value>]) -> Vec<Valu
 }
 
 /// Whether `at` through `at + LANES - 1` all stay below `bound`.
-fn fits(e: &mut Emit<'_>, at: Value, bound: Value) -> Value {
+fn fits(e: &mut Emit<'_>, at: Value, bound: Value, within: bool) -> Value {
     let ty = e.func.ty(at);
-    let below = e.op(Op::Icmp(IntCC::UnsignedLessThan, at, bound), Type::I8);
     let left = e.op(Op::Binary(Binary::Isub, bound, at), ty);
     let lanes = e.konst(LANES, ty);
     let wide = e.op(Op::Icmp(IntCC::UnsignedGreaterThanOrEqual, left, lanes), Type::I8);
+    if within {
+        return wide;
+    }
+    let below = e.op(Op::Icmp(IntCC::UnsignedLessThan, at, bound), Type::I8);
     e.op(Op::Binary(Binary::Band, below, wide), Type::I8)
 }
 
-/// Whether one more vector iteration from `at` stays inside the trip count and every bounds check.
-fn room(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, at: &[Value]) -> Value {
-    let mut ok = fits(e, at[lp.iv], lp.limit);
+/// Whether one more vector iteration from `at` stays inside the trip count and every bounds check; `within` when `at` is known not to pass any bound.
+fn room(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, at: &[Value], within: bool) -> Value {
+    let mut ok = fits(e, at[lp.iv], lp.limit, within);
     for &(idx, bound) in &shape.bounds {
         if (idx, bound) != (lp.iv, lp.limit) {
-            let inside = fits(e, at[idx], bound);
+            let inside = fits(e, at[idx], bound, within);
             ok = e.op(Op::Binary(Binary::Band, ok, inside), Type::I8);
         }
     }
@@ -456,7 +459,7 @@ fn room(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, at: &[Value]) -> Value 
 }
 
 fn guard(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, p: &[Value]) -> Value {
-    let mut ok = room(e, shape, lp, p);
+    let mut ok = room(e, shape, lp, p, false);
     let Some(store) = shape.store else { return ok };
     for &load in &shape.loads {
         if static_safe(load, store).is_some() {
@@ -562,7 +565,7 @@ pub(super) fn run(
     let map = lane_body(&mut e, &shape, (&q, &splats));
     let mut next = advance(&mut e, &q, &strides);
     add_sums(&mut e, &shape, (&q, &map), &mut next, sad);
-    let more = room(&mut e, &shape, &lp, &next);
+    let more = room(&mut e, &shape, &lp, &next, true);
     let body_insts = std::mem::take(&mut e.out);
     let done = e.op(Op::Icmp(IntCC::Equal, r[lp.iv], lp.limit), Type::I8);
     let leave = exit_values(&mut e, &lp, &r, exit_args);
