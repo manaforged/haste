@@ -1,4 +1,4 @@
-//! Zero-overhead-when-disabled IR pass tracing (`HASTE_TRACE`) and missed-optimization counters (`HASTE_MISSED`).
+//! Zero-overhead-when-disabled IR pass tracing (`HASTE_TRACE`, with `HASTE_TRACE_IR=1` for final IR or `=passes` for IR after each changing pass) and missed-optimization counters (`HASTE_MISSED`).
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -12,6 +12,7 @@ use crate::schedule::Pass;
 struct Config {
     trace: Option<String>,
     trace_ir: bool,
+    trace_passes: bool,
     missed: bool,
 }
 
@@ -21,8 +22,9 @@ fn config() -> &'static Config {
     CONFIG.get_or_init(|| {
         let trace = std::env::var("HASTE_TRACE").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty() && s != "0");
         let trace_ir = std::env::var("HASTE_TRACE_IR").ok().is_some_and(|s| !s.is_empty() && s != "0");
+        let trace_passes = std::env::var("HASTE_TRACE_IR").ok().is_some_and(|s| s == "passes");
         let missed = std::env::var("HASTE_MISSED").ok().is_some_and(|s| !s.is_empty() && s != "0");
-        Config { trace, trace_ir, missed }
+        Config { trace, trace_ir, trace_passes, missed }
     })
 }
 
@@ -183,6 +185,9 @@ pub(crate) fn after_pass(pass: Pass, before_blocks: usize, before_insts: usize, 
             func.size(),
             func.slots.len()
         );
+        if cfg.trace_passes {
+            eprintln!("{func}");
+        }
     }
 }
 
