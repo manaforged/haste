@@ -459,7 +459,11 @@ impl<'a> Infer<'_, 'a> {
         if self.object_holds(of, ty, &args) == Some(true) {
             return Ok(true);
         }
-        self.impl_holds((arena, home, path), (of, ty, &args), depth)
+        let held = self.impl_holds((arena, home, path), (of, ty, &args), depth)?;
+        if held && self.is_callable_trait(of) {
+            return self.callable_bound_holds((arena, home, bound), (of, path, ty), depth);
+        }
+        Ok(held)
     }
 
     /// Whether the compiler, not an impl, decides that `ty` implements trait `of`: for its marker and auto traits, except `Copy` and `Clone` of a struct, enum or union, which derives and std write impls for.
