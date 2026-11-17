@@ -1,6 +1,8 @@
 use crate::cfg::Cfg;
 use crate::ir::{AbiParam, ArgumentPurpose, Binary, Block, Convert, Function, InstData, Op, StackSlot, Value};
 
+const FRONTIER_WORDS: usize = 1 << 20;
+
 use super::{MemRoot, TrackRoot};
 
 struct UseCounts {
@@ -15,6 +17,21 @@ pub(super) struct SlotEscapes {
     pub(super) call_readonly: Vec<bool>,
     pub(super) return_only: Vec<bool>,
     pub(super) noalias: Vec<bool>,
+    pub(super) spilled: Vec<bool>,
+    pub(super) points: Vec<Vec<(u32, u32)>>,
+}
+
+/// Where an escaped slot's address leaves the function: blocks entered after an escape, and the escaping instructions.
+pub(crate) struct Frontier {
+    seen: Vec<u64>,
+    points: Vec<(u32, u32)>,
+}
+
+impl Frontier {
+    /// Whether the slot may have escaped by the instruction at `pos` in `block`, counting that instruction.
+    pub(crate) fn reached(&self, (block, pos): (u32, u32)) -> bool {
+        self.seen[block as usize / 64] >> (block % 64) & 1 == 1 || self.points.iter().any(|&(b, p)| b == block && p <= pos)
+    }
 }
 
 impl SlotEscapes {
@@ -24,8 +41,17 @@ impl SlotEscapes {
             call_readonly: vec![true; func.slots.len()],
             return_only: vec![true; func.slots.len()],
             noalias: vec![false; func.signature.params.len()],
+            spilled: vec![false; func.slots.len()],
+            points: vec![Vec::new(); func.slots.len()],
         }
     }
+}
+
+fn slot_root(v: Value, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot]) -> Option<StackSlot> {
+    slots[v.index()].map(|(s, _)| s).or(match tracked[v.index()] {
+        TrackRoot::Set(MemRoot::Slot(s)) => Some(s),
+        _ => None,
+    })
 }
 
 fn finish_slot_escape(
@@ -36,13 +62,10 @@ fn finish_slot_escape(
     is_spill: Option<&[bool]>,
 ) -> SlotEscapes {
     let mut esc = SlotEscapes::new(func);
-    for (v, slot) in slots.iter().enumerate() {
-        let resolved = slot.map(|(s, _)| s).or(match tracked[v] {
-            TrackRoot::Set(MemRoot::Slot(s)) => Some(s),
-            _ => None,
-        });
-        if let Some(s) = resolved {
+    for v in 0..slots.len() {
+        if let Some(s) = slot_root(Value(v as u32), slots, tracked) {
             let spilled = is_spill.is_some_and(|sp| sp.get(v).copied().unwrap_or(false));
+            esc.spilled[s.index()] |= spilled;
             if spilled || counts.safe[v] != counts.total[v] {
                 esc.unescaped[s.index()] = false;
             }
@@ -268,12 +291,57 @@ pub(super) fn classify_uses(
     let (in_loop, danger, unknown_end) = compute_block_danger(func, cfg, slots, tracked);
     let cx = EscapeCx { func, slots: &slots, tracked: &tracked, is_const: &is_const, in_loop: &in_loop, danger: &danger, unknown_end: &unknown_end };
     let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n], returns: vec![0_u32; n] };
+    let mut points: Vec<Vec<(u32, u32)>> = vec![Vec::new(); func.slots.len()];
+    let mut used = Vec::new();
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
-            data.op.for_operands(|v| counts.total[v.index()] += 1);
+            used.clear();
+            data.op.for_operands(|v| {
+                counts.total[v.index()] += 1;
+                used.push((v, counts.safe[v.index()]));
+            });
             classify_inst(&cx, &mut counts, b, pos, data);
+            for (i, &(v, before)) in used.iter().enumerate() {
+                let Some(s) = slot_root(v, slots, tracked) else { continue };
+                let uses = used.iter().filter(|&&(u, _)| u == v).count() as u32;
+                if !used[..i].iter().any(|&(u, _)| u == v) && counts.safe[v.index()] - before < uses {
+                    points[s.index()].push((b.index() as u32, pos as u32));
+                }
+            }
         }
     }
-    finish_slot_escape(func, slots, tracked, &counts, is_spill)
+    let mut esc = finish_slot_escape(func, slots, tracked, &counts, is_spill);
+    esc.points = points;
+    esc
+}
+
+/// The escape frontier of every escaped, unspilled slot, or `None` where any call may already see it.
+pub(super) fn frontiers(func: &Function, esc: &SlotEscapes) -> Vec<Option<Frontier>> {
+    let words = func.blocks.len().div_ceil(64);
+    let wanted = |s: usize| !esc.unescaped[s] && !esc.spilled[s] && !esc.points[s].is_empty();
+    if (0..func.slots.len()).filter(|&s| wanted(s)).count() * words > FRONTIER_WORDS {
+        return (0..func.slots.len()).map(|_| None).collect();
+    }
+    let mut queue = Vec::new();
+    (0..func.slots.len())
+        .map(|s| {
+            if !wanted(s) {
+                return None;
+            }
+            let mut seen = vec![0_u64; words];
+            queue.extend(esc.points[s].iter().map(|&(b, _)| Block(b)));
+            while let Some(b) = queue.pop() {
+                let Some(&term) = func.blocks[b.index()].insts.last() else { continue };
+                for t in func.insts[term.index()].op.targets() {
+                    let (w, bit) = (t.index() / 64, 1_u64 << (t.index() % 64));
+                    if seen[w] & bit == 0 {
+                        seen[w] |= bit;
+                        queue.push(t);
+                    }
+                }
+            }
+            Some(Frontier { seen, points: esc.points[s].clone() })
+        })
+        .collect()
 }

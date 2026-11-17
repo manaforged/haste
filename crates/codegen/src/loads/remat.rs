@@ -202,7 +202,7 @@ fn has_clobber_between(ctx: &ScanCtx<'_>, raw: &RawCand, end_pos: usize) -> bool
     let read_loc = ctx.prov.loc(raw.ptr, i64::from(raw.off), raw.ty.bytes());
     ctx.scan.writes[w_lo..w_hi]
         .iter()
-        .any(|&w| clobbers_loc(ctx.func, &ctx.func.insts[ctx.insts[w].index()].op, read_loc, ctx.prov))
+        .any(|&w| clobbers_loc(ctx.func, (&ctx.func.insts[ctx.insts[w].index()].op, Some(ctx.insts[w])), read_loc, ctx.prov))
 }
 
 fn ptr_live_at_or_past(ctx: &ScanCtx<'_>, ptr: Value, pos: usize) -> bool {
@@ -568,7 +568,7 @@ impl SubwordSlices {
     }
 
     pub(super) fn on_unknown(&mut self, func: &Function, op: &Op, prov: &Provenance) {
-        self.0.retain(|s| !clobbers_loc(func, op, s.loc, prov));
+        self.0.retain(|s| !clobbers_loc(func, (op, None), s.loc, prov));
     }
 
     pub(super) fn find(&self, loc: MemLoc, ty: Type) -> Option<SubwordSlice> {

@@ -229,7 +229,7 @@ fn has_clobber(func: &Function, prov: &Provenance, chain: &[Block], leaves: &[Le
     let last_chain = chain.len() - 1;
     let check_inst = |inst: Inst| {
         let op = &func.insts[inst.index()].op;
-        super::dom::clobbers_loc(func, op, wide_loc, prov) || leaves.iter().any(|l| super::dom::clobbers_loc(func, op, l.loc, prov))
+        super::dom::clobbers_loc(func, (op, None), wide_loc, prov) || leaves.iter().any(|l| super::dom::clobbers_loc(func, (op, None), l.loc, prov))
     };
     for ci in min_leaf.blk_idx..=last_chain {
         let insts = &func.blocks[chain[ci].index()].insts;

@@ -538,7 +538,7 @@ fn scan(
                 if state.post_inline {
                     slices.on_unknown(func, clobber_op, state.prov);
                 }
-                invalidate_preserving(func, known, bases, clobber_op, state.prov);
+                invalidate_preserving(func, known, bases, (clobber_op, Some(inst)), state.prov);
                 if let Some((bytes, dst_loc, _)) = canon_move {
                     if state.post_inline && bytes > 0 {
                         changed |= drop_covered_stores(func, &mut bufs, &mut guard, (dst_loc, true));
@@ -560,7 +560,7 @@ fn scan(
                     MemRoot::NoAliasParam(p) => {
                         let cop = canon_move.as_ref().map_or(&func.insts[inst.index()].op, |(_, _, m)| m);
                         !call_passes_noalias(cop, state.prov, p)
-                            && !dom::clobbers_loc(func, cop, ploc, state.prov)
+                            && !dom::clobbers_loc(func, (cop, Some(inst)), ploc, state.prov)
                             && state.prov.noalias_unescaped(p)
                     }
                     _ => false,

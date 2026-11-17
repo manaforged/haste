@@ -335,7 +335,7 @@ fn join_clobbered(func: &Function, prov: &crate::mem::Provenance, loc: MemLoc, c
                 w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
             }
         }
-        BlockClobber::Op(c_inst) => clobbers_loc(func, &func.insts[c_inst.index()].op, loc, prov),
+        BlockClobber::Op(c_inst) => clobbers_loc(func, (&func.insts[c_inst.index()].op, Some(c_inst)), loc, prov),
     })
 }
 

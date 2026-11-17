@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, is_atomic_barrier, is_rodata, may_alias};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_op, is_atomic_barrier, is_rodata, may_alias};
 use crate::merge::find;
 
 const MAX_MERGE_WALK: usize = 32;
@@ -49,7 +49,7 @@ pub(super) fn loc_immutable(func: &Function, loc: MemLoc) -> bool {
 }
 
 /// Whether `op` may overwrite `loc`, treating immutable `.rodata` and non-atomic `ReadonlyParam` accesses as un-clobbered by calls or alien stores.
-pub(super) fn clobbers_loc(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
+pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
     if is_rodata(func, loc) {
         return false;
     }
@@ -67,7 +67,7 @@ pub(super) fn clobbers_loc(func: &Function, op: &Op, loc: MemLoc, prov: &Provena
             _ => is_atomic_barrier(op),
         };
     }
-    clobbers(func, op, loc, prov)
+    clobbers_op(func, (op, at), loc, prov)
 }
 
 fn save_immutable_entries(
@@ -91,7 +91,7 @@ fn save_immutable_entries(
     saved
 }
 
-pub(super) fn invalidate_preserving(func: &Function, known: &mut KnownLoads, bases: &[(MemBase, MemRoot)], op: &Op, prov: &Provenance) {
+pub(super) fn invalidate_preserving(func: &Function, known: &mut KnownLoads, bases: &[(MemBase, MemRoot)], op: (&Op, Option<Inst>), prov: &Provenance) {
     let saved = save_immutable_entries(func, known, bases, |loc| !clobbers_loc(func, op, loc, prov));
     known.invalidate(func, op, prov);
     for (loc, ty, val) in saved {
@@ -243,7 +243,7 @@ impl<'a> BlockWrites<'a> {
             for &w in &self.writes[m.index()] {
                 let raw_op = &func.insts[w.index()].op;
                 let canon = canonical_write(raw_op, subst);
-                invalidate_preserving(func, &mut known, dom_bases, canon.as_ref().unwrap_or(raw_op), self.prov);
+                invalidate_preserving(func, &mut known, dom_bases, (canon.as_ref().unwrap_or(raw_op), Some(w)), self.prov);
                 if known.is_empty() {
                     return (known, Vec::new());
                 }

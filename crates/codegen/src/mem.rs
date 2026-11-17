@@ -95,6 +95,8 @@ pub(crate) struct Provenance {
     pub ro_bytes: Vec<u32>,
     pub affine: Vec<(Value, i64)>,
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
+    frontiers: Vec<Option<escape::Frontier>>,
+    inst_at: Vec<(u32, u32)>,
 }
 
 fn slot_addresses(func: &Function) -> Vec<Option<(StackSlot, i32)>> {
@@ -307,10 +309,19 @@ impl Provenance {
         let tracked = compute_tracked_roots(func, cfg, &affine);
         let mut prov = Self::from_roots(func, cfg, &tracked, affine);
         let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, is_spill);
+        prov.frontiers = escape::frontiers(func, &esc);
         prov.unescaped_slots = esc.unescaped;
         prov.call_readonly_slots = esc.call_readonly;
         prov.return_only_slots = esc.return_only;
         prov.noalias_escaped = esc.noalias;
+        if prov.frontiers.iter().any(Option::is_some) {
+            prov.inst_at = vec![(u32::MAX, 0); func.insts.len()];
+            for &b in &cfg.rpo {
+                for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
+                    prov.inst_at[inst.index()] = (b.index() as u32, pos as u32);
+                }
+            }
+        }
         prov.spans = loop_mem::compute_spans(func, cfg, &prov.slot_offsets, &prov.symbol_defs);
         prov
     }
@@ -398,6 +409,15 @@ impl Provenance {
             return (base, i128::from(blo) + off, i128::from(bhi) + off + size);
         }
         (loc.base, off, off + size)
+    }
+
+    /// Whether `slot`'s address may have left the function by the time `at` runs; `None` means anywhere.
+    pub(crate) fn slot_escaped_at(&self, slot: StackSlot, at: Option<Inst>) -> bool {
+        let (Some(inst), Some(Some(frontier))) = (at, self.frontiers.get(slot.index())) else { return true };
+        match self.inst_at.get(inst.index()) {
+            Some(&(block, pos)) if block != u32::MAX => frontier.reached((block, pos)),
+            _ => true,
+        }
     }
 
     pub(crate) fn slot_unescaped(&self, slot: StackSlot) -> bool {
@@ -497,6 +517,11 @@ fn stack_store_clobbers(func: &Function, op: &Op, (val, slot, off): (Value, Stac
 }
 
 pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
+    clobbers_op(func, (op, None), loc, prov)
+}
+
+/// Whether `op`, run as instruction `at` when known, may overwrite `loc`; `at` rules out slots whose address leaves only later.
+pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
     match *op {
         Op::StackStore(val, slot, off) => stack_store_clobbers(func, op, (val, slot, off), loc, prov),
         Op::Store(val, addr, off) => may_alias(prov.loc(addr, i64::from(off), func.ty(val).bytes()), loc, prov),
@@ -507,7 +532,7 @@ pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance)
         }
         Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
             MemRoot::Slot(s) => {
-                !prov.slot_unescaped(s) && !prov.slot_call_readonly(s) && (!prov.slot_return_only(s) || args.iter().any(|&arg| prov.loc(arg, 0, 1).root == MemRoot::Slot(s)))
+                !prov.slot_unescaped(s) && prov.slot_escaped_at(s, at) && !prov.slot_call_readonly(s) && (!prov.slot_return_only(s) || args.iter().any(|&arg| prov.loc(arg, 0, 1).root == MemRoot::Slot(s)))
             }
             MemRoot::NoAliasParam(p) => {
                 !prov.noalias_unescaped(p) || call_writes_noalias(&func.sigs[sig.index()].params, args, prov, p)
@@ -557,9 +582,9 @@ impl KnownLoads {
         self.remember(loc, ty, value);
     }
 
-    pub(crate) fn invalidate(&mut self, func: &Function, op: &Op, prov: &Provenance) {
+    pub(crate) fn invalidate(&mut self, func: &Function, op: (&Op, Option<Inst>), prov: &Provenance) {
         self.by_base.retain(|&base, (root, entries)| {
-            entries.retain(|&(off, t, _)| !clobbers(func, op, MemLoc::new(*root, base, off, t.bytes()), prov));
+            entries.retain(|&(off, t, _)| !clobbers_op(func, op, MemLoc::new(*root, base, off, t.bytes()), prov));
             !entries.is_empty()
         });
     }
