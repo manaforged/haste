@@ -379,6 +379,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             self.ud2();
         }
         emit_stubs(&mut self)?;
+        self.relocs.extend(self.asm.rips.drain(..).map(|(at, sym)| StencilReloc::symbol(at, sym, RelocKind::PcRel32)));
         self.asm.relax().apply(starts, &mut self.sites, &mut self.relocs);
         Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new() })
     }

@@ -121,7 +121,7 @@ impl Emit<'_> {
 
     /// The displacement of `mem` from where rbp would point when it is a plain frame address.
     pub(super) fn frame_disp(&self, mem: Mem) -> Option<i32> {
-        (mem.base == self.base && mem.index.is_none()).then(|| mem.disp - self.bias)
+        (mem.base == self.base && mem.index.is_none() && mem.rip.is_none()).then(|| mem.disp - self.bias)
     }
 
     /// The memory at `addr + offset`: relative to the frame base for a frame address, to the location register of `addr`, or through rcx.
@@ -239,6 +239,12 @@ impl Emit<'_> {
         }
         if let Some(reg) = self.reg_of(addr) {
             return Mem::new(reg, offset);
+        }
+        if let Location::Symbol(sym) = self.location(addr)
+            && self.direct_calls
+            && self.func.is_image_addr(addr)
+        {
+            return Mem::rip(sym, offset);
         }
         if let Location::Frame(slot, base) = self.location(addr)
             && let Some(disp) = self.frame.slots[slot.index()].checked_add(base).and_then(|disp| disp.checked_add(offset))

@@ -2,6 +2,7 @@ use super::{Function, Value};
 
 const UNIQUE_PTR: u8 = 1;
 const UNPREDICTABLE: u8 = 2;
+const IMAGE_ADDR: u8 = 4;
 
 impl Function {
     /// Marks `value` as a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
@@ -12,6 +13,16 @@ impl Function {
     /// Marks the `Op::Select` that defines `value` as unpredictable, so no pass turns it into a branch.
     pub fn mark_unpredictable(&mut self, value: Value) {
         self.set_flags(value, UNPREDICTABLE);
+    }
+
+    /// Marks `value` as the address of data that the output image holds, so code may reach it relative to the program counter.
+    pub fn mark_image_addr(&mut self, value: Value) {
+        self.set_flags(value, IMAGE_ADDR);
+    }
+
+    /// Whether `value` is the address of data that the output image holds.
+    pub(crate) fn is_image_addr(&self, value: Value) -> bool {
+        self.flags(value) & IMAGE_ADDR != 0
     }
 
     /// Whether `value` is a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.

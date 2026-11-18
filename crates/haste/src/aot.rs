@@ -652,7 +652,8 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             }
             RelocKind::PcRel32 => {
                 let next_ip = text_va + u64::from(reloc.offset) + 4;
-                let delta = i32::try_from(value as i64 - next_ip as i64).context("PcRel32 target out of range")?;
+                let addend = i64::from(i32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]));
+                let delta = i32::try_from(value as i64 + addend - next_ip as i64).context("PcRel32 target out of range")?;
                 out[at..at + 4].copy_from_slice(&delta.to_le_bytes());
             }
             kind => patch_reloc(kind, value, &mut out[at..])?,

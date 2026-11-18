@@ -7,7 +7,7 @@ const PENDING_ZEROS: usize = 8;
 #[derive(Clone, Copy)]
 pub(crate) struct Tail {
     end: u32,
-    marks: [usize; 2],
+    marks: [usize; 3],
     kind: Kind,
 }
 
@@ -34,8 +34,29 @@ enum Last {
 }
 
 impl Asm {
-    fn marks(&self) -> [usize; 2] {
-        [self.fixups.len(), self.table_fixups.len()]
+    fn marks(&self) -> [usize; 3] {
+        [self.fixups.len(), self.table_fixups.len(), self.rips.len()]
+    }
+
+    /// Appends the immediate `bytes` of the instruction just encoded, moving a `rip` displacement that ends here to count from the instruction's end.
+    pub(super) fn imm(&mut self, bytes: &[u8]) {
+        if let Some(&(at, _)) = self.rips.last()
+            && at + 4 == self.pos()
+        {
+            let field = &mut self.code[at as usize..at as usize + 4];
+            let addend = i32::from_le_bytes([field[0], field[1], field[2], field[3]]) - bytes.len() as i32;
+            field.copy_from_slice(&addend.to_le_bytes());
+        }
+        self.code.extend_from_slice(bytes);
+    }
+
+    /// Appends `imm` cut to `size`, a quadword taking 32 bits sign-extended.
+    pub(super) fn imm_sized(&mut self, size: Size, imm: i32) {
+        match size {
+            Size::B => self.imm(&[imm as u8]),
+            Size::W => self.imm(&(imm as i16).to_le_bytes()),
+            _ => self.imm(&imm.to_le_bytes()),
+        }
     }
 
     fn take_tail(&mut self) -> Option<Tail> {
@@ -95,11 +116,7 @@ impl Asm {
     pub fn store_imm_sized(&mut self, size: Size, dst: Mem, imm: i32) {
         let start = self.pos();
         self.sized(false, size, (&[0xC6], &[0xC7]), 0, dst.into());
-        match size {
-            Size::B => self.code.push(imm as u8),
-            Size::W => self.code.extend((imm as i16).to_le_bytes()),
-            _ => self.code.extend(imm.to_le_bytes()),
-        }
+        self.imm_sized(size, imm);
         self.flags_kept(start);
     }
 
@@ -155,6 +172,10 @@ impl Asm {
 
     /// Stores eight zero bytes to `dst`, joining adjacent zero stores into `movups` of `scratch` zeroed once by `xorps`; returns whether it wrote `scratch`.
     pub fn store_zero(&mut self, dst: Mem, scratch: Xmm) -> bool {
+        if dst.rip.is_some() {
+            self.store_imm_sized(Size::Q, dst, 0);
+            return false;
+        }
         let start = self.pos();
         let joined = self.take_tail().and_then(|tail| match tail.kind {
             Kind::ZeroRun { start, run, len, last }

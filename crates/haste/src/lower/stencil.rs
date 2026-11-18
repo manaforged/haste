@@ -753,6 +753,11 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn emit_reloc(&mut self, src: SymbolSource, step: RelocStep, self_call: bool, low_slot: bool) -> Value {
+        let image = match src {
+            SymbolSource::Vtable(_) | SymbolSource::Rodata(_) | SymbolSource::PromotedCell { .. } => true,
+            SymbolSource::StaticCell { index, .. } => !self.cx.foreign(self.reached.list[index].0.0),
+            _ => false,
+        };
         let idx = self.push_reloc(src, step);
         if self_call {
             self.b.func.add_self_slot(idx);
@@ -763,7 +768,13 @@ impl Lower<'_, '_> {
                 self.ins().load(Type::I64, dict, (idx * 8) as i32)
             }
             LowerMode::Stencil if low_slot => self.ins().slot_addr(idx),
-            LowerMode::Stencil => self.ins().symbol(idx),
+            LowerMode::Stencil => {
+                let addr = self.ins().symbol(idx);
+                if image {
+                    self.b.func.mark_image_addr(addr);
+                }
+                addr
+            }
         }
     }
 }
