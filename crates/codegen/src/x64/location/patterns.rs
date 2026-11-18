@@ -386,7 +386,7 @@ impl FuseCtx<'_> {
         }
     }
 
-    fn peel_const(&self, mut val: Value, mut max_pos: usize, mut peel_cur: bool, elide: &mut Vec<(Value, usize)>) -> Option<(Value, i64, usize)> {
+    pub(super) fn peel_const(&self, mut val: Value, mut max_pos: usize, mut peel_cur: bool, elide: &mut Vec<(Value, usize)>) -> Option<(Value, i64, usize)> {
         let (mut disp, mut last_pos) = (0_i64, max_pos);
         loop {
             if self.plan.elided[val.index()] || self.func.ty(val) != Type::I64 {
@@ -560,7 +560,7 @@ impl FuseCtx<'_> {
         (!self.plan.elided[inner.index()]).then_some((inner, epos))
     }
 
-    fn unwrap_base_uext(&self, v: Value, max_pos: usize, elide: &mut Vec<(Value, usize)>) -> (Value, usize) {
+    pub(super) fn unwrap_base_uext(&self, v: Value, max_pos: usize, elide: &mut Vec<(Value, usize)>) -> (Value, usize) {
         match self.local_uext(v, max_pos) {
             Some((inner, epos)) if self.plan.zero_ext[inner.index()] && self.plan.reg_of(inner).is_some() => {
                 elide.push((v, epos));

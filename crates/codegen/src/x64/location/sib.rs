@@ -1,7 +1,7 @@
 use super::fuse::{FuseCtx, preserved};
 use super::patterns::{FOLD_LIMIT, SibMatch, odd_scale_source, scaled_op};
 use super::super::asm::Reg;
-use crate::alloc::Plan;
+use crate::alloc::{Location, Plan};
 use crate::ir::{Convert, Function, Inst, Op, Type, Value};
 use crate::live::{Sib, SibBase};
 
@@ -231,4 +231,22 @@ pub(super) fn apply_sib_groups(
             }
         }
     }
+}
+
+/// `x * 2 + c` as the address form `c(x,x)`, when `root` adds a constant to a doubling of its own block that nothing else reads.
+pub(super) fn double(ctx: &FuseCtx<'_>, root: Value, root_pos: usize) -> Option<SibMatch> {
+    if ctx.plan.elided[root.index()] || ctx.plan.is_static(root) || ctx.func.ty(root) != Type::I64 {
+        return None;
+    }
+    let mut elide = Vec::new();
+    let (node, disp, _) = ctx.peel_const(root, root_pos, false, &mut elide)?;
+    let (block, pos, inst) = ctx.pos_of[node.index()]?;
+    if node == root || block != ctx.b_idx || ctx.plan.elided[node.index()] || ctx.uses[node.index()] != 1 || pos >= root_pos {
+        return None;
+    }
+    let (x, 1, None) = scaled_op(ctx.func, ctx.plan, inst)? else { return None };
+    elide.push((node, pos));
+    let (x, start) = ctx.unwrap_base_uext(x, pos, &mut elide);
+    let base = !ctx.plan.elided[x.index()] && !matches!(ctx.plan.location(x), Location::Frame(..) | Location::Imm(..));
+    base.then_some(SibMatch { sib: Sib { base: SibBase::Value(x), index: x, shift: 0, disp: i32::try_from(disp).ok()? }, elide, base_start: start, idx_start: start })
 }

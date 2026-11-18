@@ -1,7 +1,7 @@
 use super::patterns::{
     Root, adc_parts, bextr_parts, flag_cmp, is_zero_const, mid_preserves_flags, parked, shld_parts,
 };
-use super::sib::{apply_sib_groups, find_cand_sib, idx_source, sib_ok};
+use super::sib::{apply_sib_groups, double, find_cand_sib, idx_source, sib_ok};
 use super::super::{FRAME_REGS, REGS};
 use super::super::asm::Reg;
 use super::super::features::Features;
@@ -567,7 +567,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             continue;
         }
         let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
-        let Some(m) = ctx.sib_matches(res, pos, false).find(|m| (!m.elide.is_empty() || matches!(m.sib.base, SibBase::Frame(_))) && sib_ok(&ctx, m, &[], pos)) else { continue };
+        let Some(m) = ctx.sib_matches(res, pos, false).find(|m| (!m.elide.is_empty() || matches!(m.sib.base, SibBase::Frame(_))) && sib_ok(&ctx, m, &[], pos)).or_else(|| double(&ctx, res, pos).filter(|m| sib_ok(&ctx, m, &[], pos))) else { continue };
         plan.sib[res.index()] = Some(m.sib);
         for (v, _) in m.elide {
             plan.elided[v.index()] = true;
