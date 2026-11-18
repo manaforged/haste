@@ -393,6 +393,13 @@ fn simplify_ireduce(cx: &mut RewriteCx, res: Option<Value>, dst: Type, x: Value)
                 if ity.is_small_int() { return Some(Op::Convert(if ity.bits() < dst.bits() { k } else { Convert::Ireduce }, inner)); }
             }
             Op::Convert(Convert::Ireduce, inner) if cx.func.ty(inner).is_small_int() => return Some(Op::Convert(Convert::Ireduce, inner)),
+            Op::Select(cond, t, f) if cx.single_use(cur) => {
+                if let (Some(t), Some(f)) = (select::narrow_arm(cx, dst, t), select::narrow_arm(cx, dst, f)) {
+                    let t = t.unwrap_or_else(|c| cx.emit(dst, Op::Const(c)));
+                    let f = f.unwrap_or_else(|c| cx.emit(dst, Op::Const(c)));
+                    return Some(Op::Select(cond, t, f));
+                }
+            }
             _ => {}
         }
     }

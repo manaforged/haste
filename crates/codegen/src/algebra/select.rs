@@ -5,6 +5,16 @@ use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 use super::icmp::{ADDR_SPAN, before, complementary_eq_pair, emit_cond_truth, null_test, offset_bound, three_way_non_zero};
 use super::{RewriteCx, const_u128, op_of, peel_uext, peel_uextend};
 
+/// `v` narrowed to `dst` for free: the `dst` value it extends, or the constant it holds at that width.
+pub(super) fn narrow_arm(cx: &RewriteCx, dst: Type, v: Value) -> Option<Result<Value, i64>> {
+    if let Some(&Op::Convert(Convert::Uextend | Convert::Sextend, inner)) = cx.op(v)
+        && cx.func.ty(inner) == dst
+    {
+        return Some(Ok(inner));
+    }
+    cx.sconst(v).map(|c| Err(extend(c, dst, true)))
+}
+
 pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Value, t: Value, f: Value) -> Option<Op> {
     let given = (t, f);
     if t == f { cx.alias(res, t); return None; }
