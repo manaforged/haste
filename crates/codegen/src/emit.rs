@@ -1,4 +1,4 @@
-use crate::alloc::{Location, Plan};
+use crate::alloc::{Location, Plan, Regs};
 use crate::frame::{Abi, Emitter, Frame, Loc, ShrinkWrap};
 use crate::ir::{Block, Function, Op, SigRef, Value};
 use crate::park::ParkReg;
@@ -302,4 +302,43 @@ pub(crate) fn emit_try_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, 
     let frame_offset = emit.frame().size;
     emit.push_site(Site { ret, handler: pad, frame_offset });
     Ok(())
+}
+
+/// Whether `val` keeps its register or shared slot across instructions `start + 1..end` of block `b_idx` that `skip` does not pass over, so a fused use at `end` can still read it; false when the span exceeds `max_span`.
+pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, regs): (&Plan<R>, &Regs<R>), (b_idx, start, end, max_span): (usize, usize, usize, usize), skip: impl Fn(usize) -> bool, val: Value) -> bool {
+    if plan.elided[val.index()] {
+        return false;
+    }
+    if start + 1 >= end || plan.location(val).is_static() {
+        return true;
+    }
+    if end - start > max_span {
+        return false;
+    }
+    let (reg, slot_id) = match plan.location(val) {
+        Location::Reg(reg) => (Some(reg), None),
+        Location::Slot => {
+            let Some(id) = plan.shared.get(val.index()).copied().flatten() else { return true };
+            (None, Some(id))
+        }
+        _ => return false,
+    };
+    let clobbers = |r: Value| {
+        reg.is_some_and(|reg| plan.reg_of(r) == Some(reg))
+            || slot_id.is_some_and(|id| matches!(plan.location(r), Location::Slot) && plan.shared.get(r.index()).copied().flatten() == Some(id))
+    };
+    for pos in (start + 1..end).filter(|&pos| !skip(pos)) {
+        let data = &func.insts[func.blocks[b_idx].insts[pos].index()];
+        if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
+            continue;
+        }
+        if (reg.is_some() && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
+            || reg.is_some_and(|reg| regs.scratches(func, data, reg))
+            || data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(clobbers)
+            || crate::live::results(data).any(clobbers)
+        {
+            return false;
+        }
+    }
+    true
 }

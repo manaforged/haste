@@ -214,43 +214,7 @@ pub(super) fn zero_cmp_band(
 }
 
 pub(super) fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, start: usize, end: usize, skip_pos: Option<usize>, val: Value) -> bool {
-    if plan.elided[val.index()] {
-        return false;
-    }
-    if start + 1 >= end || plan.location(val).is_static() {
-        return true;
-    }
-    let (reg, slot_id) = match plan.location(val) {
-        Location::Reg(reg) => (Some(reg), None),
-        Location::Slot => {
-            let Some(slot_id) = plan.shared.get(val.index()).copied().flatten() else {
-                return true;
-            };
-            (None, Some(slot_id))
-        }
-        _ => return false,
-    };
-    let clobbers = |r: Value| {
-        reg.is_some_and(|reg| plan.reg_of(r) == Some(reg))
-            || slot_id.is_some_and(|id| matches!(plan.location(r), Location::Slot) && plan.shared.get(r.index()).copied().flatten() == Some(id))
-    };
-    for pos in start + 1..end {
-        if skip_pos == Some(pos) {
-            continue;
-        }
-        let data = &func.insts[func.blocks[block_idx].insts[pos].index()];
-        if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
-            continue;
-        }
-        if (reg.is_some() && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
-            || reg.is_some_and(|reg| super::REGS.scratches(func, data, reg))
-            || data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(clobbers)
-            || crate::live::results(data).any(clobbers)
-        {
-            return false;
-        }
-    }
-    true
+    crate::emit::preserved(func, (plan, &super::REGS), (block_idx, start, end, usize::MAX), |pos| skip_pos == Some(pos), val)
 }
 
 fn fuse_ireduce_ushr(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, res): (usize, usize, Value), shr: Value) {
