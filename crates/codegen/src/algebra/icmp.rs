@@ -529,6 +529,21 @@ fn emit_cmp_const(cx: &mut RewriteCx, cc: IntCC, lhs: Value, c: i64) -> Op {
     Op::Icmp(cc, lhs, rhs)
 }
 
+/// Folds an equality compare of `x + c` or `x - c` against `x` for a nonzero constant `c`, which never holds even when the add wraps.
+pub(super) fn offset_self(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) { return None; }
+    let ty = cx.func.ty(x);
+    [(x, y), (y, x)].into_iter().find_map(|(moved, base)| {
+        let step = match *cx.op(moved)? {
+            Op::Binary(Binary::Iadd, p, q) if p == base => q,
+            Op::Binary(Binary::Iadd, p, q) if q == base => p,
+            Op::Binary(Binary::Isub, p, q) if p == base => q,
+            _ => return None,
+        };
+        cx.uconst(step, ty).filter(|&c| c != 0).map(|_| Op::Const(i64::from(cc == IntCC::NotEqual)))
+    })
+}
+
 /// Rewrites an unsigned compare of a single-use `x + c1` against `c2` into `x` against `c2 - c1` when `x + c1` cannot wrap.
 pub(super) fn strip_const_add(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     if cc.is_signed() { return None; }
