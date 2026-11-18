@@ -91,6 +91,8 @@ pub(crate) struct Plan<R> {
     pub elided: Vec<bool>,
     pub zero_ext: Vec<bool>,
     pub density: Vec<u64>,
+    /// The summed block-weighted accesses of the register candidates left in stack slots.
+    pub spill_cost: u64,
 }
 
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
@@ -680,7 +682,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
-    let weights = blocks.as_deref().map(|blocks| walk::inherit(walk::weights(func, blocks, &sib, &elided), &live, split));
+    let natural = blocks.as_deref().map(|blocks| walk::weights(func, blocks, &sib, &elided));
+    let weights = natural.clone().map(|natural| walk::inherit(natural, &live, split));
     let (partners, back_args, edge_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref(), !regs.two_address);
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
     let copies = if regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
@@ -718,7 +721,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
             crate::trace::on_edge_copies(func, &live, blocks, |value| if let Location::Reg(reg) = locations[value] { Some(reg) } else { None });
         }
     }
-    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density }
+    let spill_cost = natural.map_or(0, |natural| (0..count).filter(|&v| (ints[v] || floats[v]) && matches!(locations[v], Location::Slot)).map(|v| natural[v]).sum());
+    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density, spill_cost }
 }
 
 impl<R: Copy> Plan<R> {

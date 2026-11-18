@@ -440,7 +440,7 @@ pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
     Ok(())
 }
 
-/// Prepares `func`; when a loop reads a value that spilled, splits it at that loop's header, keeps the splits whose parameter then gets a register, and returns the split copy with its preparation.
+/// Prepares `func`; when a loop reads a value that spilled, splits it at that loop's header, keeps the splits whose parameter then gets a register, and returns the split copy with its preparation when it leaves less weighted spill traffic than the unsplit one.
 pub(crate) fn prepare_split<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
@@ -464,7 +464,7 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
         crate::trace::on_split(&made, &kept);
     }
     if kept.len() == made.len() {
-        return Ok((Some(split), second));
+        return Ok(if second.plan.spill_cost < first.plan.spill_cost { (Some(split), second) } else { (None, first) });
     }
     if kept.is_empty() {
         return Ok((None, first));
@@ -472,7 +472,7 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
     let mut pruned = func.clone();
     let made = crate::loopargs::run(&mut pruned, |head, v| kept.contains(&(head, v)));
     let third = prepare(&pruned, regs, weighed, &classify, &carried(&made))?;
-    Ok((Some(pruned), third))
+    Ok(if third.plan.spill_cost < first.plan.spill_cost { (Some(pruned), third) } else { (None, first) })
 }
 
 pub(crate) fn prepare<R: Copy + PartialEq>(
