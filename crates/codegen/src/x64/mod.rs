@@ -657,6 +657,10 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
+        let cell = match direct {
+            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot)).map(|hit| (lookup, hit)),
+            _ => None,
+        };
         let held = self.reg_of(callee).filter(|reg| SAVED.contains(reg));
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {
@@ -670,7 +674,14 @@ impl Emit<'_> {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
         }
         self.asm.flags_overwritten();
-        if self.inline_call(direct, callee, args) {
+        if let Some((lookup, hit)) = cell {
+            let at = self.asm.call_pcrel32();
+            self.relocs.push(StencilReloc::symbol(at, lookup, crate::reloc::RelocKind::PcRel32));
+            self.asm.bind(hit);
+            self.invalidate_spills();
+            return Ok(abi);
+        }
+        if self.inline_call(direct, args) {
             self.invalidate_spills();
             return Ok(abi);
         }

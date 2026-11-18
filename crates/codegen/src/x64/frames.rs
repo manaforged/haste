@@ -1,5 +1,5 @@
 use super::Emit;
-use super::asm::{Asm, Cond, Mem, Reg, Size};
+use super::asm::{Asm, Cond, Label, Mem, Reg, Size};
 use crate::alloc::CallTarget;
 use crate::ir::{Op, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
@@ -17,13 +17,12 @@ impl Asm {
 
 impl Emit<'_> {
     /// Emits the fast path of a runtime call the target can serve inline, with the call itself out of line; false when it has none.
-    pub(super) fn inline_call(&mut self, direct: Option<CallTarget>, callee: Value, args: &[Value]) -> bool {
+    pub(super) fn inline_call(&mut self, direct: Option<CallTarget>, args: &[Value]) -> bool {
         match direct {
             Some(CallTarget::Runtime(rt)) => {
                 let bytes = args.last().and_then(|&bytes| self.const_of(bytes));
                 self.cached_frame(rt, bytes)
             }
-            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().is_some_and(|&slot| self.cached_thread_cell(lookup, slot)),
             _ => false,
         }
     }
@@ -56,21 +55,18 @@ impl Emit<'_> {
         true
     }
 
-    /// Reads the calling thread's cell of thread slot `slot` from the static TLS slot table inline, calling `lookup` only when the cell is not made yet; false when the table does not apply.
-    pub(super) fn cached_thread_cell(&mut self, lookup: u32, slot: Value) -> bool {
-        let Some(Op::Symbol(slot_sym)) = self.defs[slot.index()].map(|inst| &self.func.insts[inst.index()].op) else { return false };
-        let slot_sym = *slot_sym;
+    /// Reads the calling thread's cell of thread slot `slot` from the static TLS slot table into rax and jumps to the returned label when the cell is made, so only a miss runs the call that follows; `None` when the table does not apply.
+    pub(super) fn thread_cell_hit(&mut self, slot: Value) -> Option<Label> {
+        let Some(&Op::Symbol(slot_sym)) = self.defs[slot.index()].map(|inst| &self.func.insts[inst.index()].op) else { return None };
         if !self.frame_cache {
-            return false;
+            return None;
         }
-        let (cold, back) = (self.asm.label(), self.asm.label());
+        let hit = self.asm.label();
         let at = self.asm.fs_quad(0x8B, Reg::Rax as u8, 0, None);
         self.relocs.push(StencilReloc::symbol(at, slot_sym, RelocKind::ThreadOff32));
         self.asm.test(Reg::Rax, Reg::Rax);
-        self.asm.jcc(Cond::E, cold);
-        self.asm.bind(back);
-        self.cold_calls.push((cold, back, StencilReloc::symbol(0, lookup, RelocKind::PcRel32)));
-        true
+        self.asm.jcc(Cond::Ne, hit);
+        Some(hit)
     }
 
     fn thread_reloc(&mut self, rt: RuntimeSymbol, encode: impl FnOnce(&mut Asm) -> u32) {
