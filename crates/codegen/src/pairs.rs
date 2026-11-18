@@ -11,6 +11,8 @@ struct Splitter<'f> {
     defs: Vec<Option<Inst>>,
     halves: HashMap<Value, Pair>,
     alias: HashMap<Value, Value>,
+    offsets: HashMap<Value, i128>,
+    chained: Vec<bool>,
     split_at: Vec<Vec<bool>>,
     insts: Vec<Inst>,
 }
@@ -25,7 +27,8 @@ pub(crate) fn split(func: &mut Function) -> bool {
         return false;
     }
     let rpo = cfg.rpo.clone();
-    let mut splitter = Splitter { defs: defs(func), func, halves: HashMap::default(), alias: HashMap::default(), split_at: Vec::new(), insts: Vec::new() };
+    let chained = chained(func);
+    let mut splitter = Splitter { defs: defs(func), func, halves: HashMap::default(), alias: HashMap::default(), offsets: HashMap::default(), chained, split_at: Vec::new(), insts: Vec::new() };
     splitter.split_params();
     for block in rpo {
         splitter.block(block);
@@ -41,6 +44,22 @@ fn defs(func: &Function) -> Vec<Option<Inst>> {
         }
     }
     defs
+}
+
+/// Which 128-bit values feed only one 128-bit add or subtract in their own block, so a constant they carry can wait for it.
+fn chained(func: &Function) -> Vec<bool> {
+    let uses = func.use_counts();
+    let mut ok = vec![false; func.types.len()];
+    for block in &func.blocks {
+        let local: Vec<Value> = block.insts.iter().filter_map(|&inst| func.insts[inst.index()].result).collect();
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            if matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I128) {
+                data.op.for_operands(|v| ok[v.index()] = uses[v.index()] == 1 && local.contains(&v));
+            }
+        }
+    }
+    ok
 }
 
 /// Blocks whose parameters a split may widen: every jump into them names its arguments.
@@ -62,6 +81,8 @@ impl Splitter<'_> {
         let result = self.func.value(ty);
         let inst = self.func.add(op, Some(result));
         self.insts.push(inst);
+        self.defs.resize(self.func.types.len(), None);
+        self.defs[result.index()] = Some(inst);
         result
     }
 
@@ -75,7 +96,19 @@ impl Splitter<'_> {
     }
 
     fn bin(&mut self, op: Binary, x: Value, y: Value) -> Value {
-        self.emit(Op::Binary(op, x, y), Type::I64)
+        match (op, self.word(x), self.word(y)) {
+            (Binary::Iadd | Binary::Bor | Binary::Bxor, Some(0), _) | (Binary::Imul, _, Some(0)) => y,
+            (Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor, _, Some(0)) | (Binary::Imul, Some(0), _) => x,
+            _ => self.emit(Op::Binary(op, x, y), Type::I64),
+        }
+    }
+
+    /// The value of 64-bit `v` when it is a constant.
+    fn word(&self, v: Value) -> Option<i64> {
+        match self.func.insts[self.defs.get(v.index()).copied().flatten()?.index()].op {
+            Op::Const(imm) if self.func.ty(v) == Type::I64 => Some(imm),
+            _ => None,
+        }
     }
 
     fn bin_imm(&mut self, op: Binary, x: Value, imm: i64) -> Value {
@@ -241,8 +274,15 @@ impl Splitter<'_> {
                 let ((al, ah), (bl, bh)) = (self.pair(a), self.pair(b));
                 (self.bin(op, al, bl), self.bin(op, ah, bh))
             }
-            Op::Binary(Binary::Iadd, a, b) => self.add(a, b),
-            Op::Binary(Binary::Isub, a, b) => self.sub(a, b),
+            Op::Binary(op @ (Binary::Iadd | Binary::Isub), a, b) => {
+                let ((a, ka), (b, kb)) = (self.terms(a), self.terms(b));
+                let (pair, k) = if op == Binary::Iadd { (self.add(a, b), ka.wrapping_add(kb)) } else { (self.sub(a, b), ka.wrapping_sub(kb)) };
+                if k != 0 && self.chained.get(result.index()).copied().unwrap_or(false) {
+                    self.offsets.insert(result, k);
+                    return pair;
+                }
+                self.settle(pair, k)
+            }
             Op::Binary(Binary::Imul, a, b) => self.mul(a, b),
             Op::Binary(op @ (Binary::Ushr | Binary::Sshr | Binary::Ishl), a, k) if self.const_low(k).is_some() => {
                 let shift = (self.const_low(k).unwrap_or(0) & 127) as u32;
@@ -266,21 +306,49 @@ impl Splitter<'_> {
         self.emit(Op::Convert(if signed { Convert::Sextend } else { Convert::Uextend }, x), Type::I64)
     }
 
-    fn add(&mut self, a: Value, b: Value) -> Pair {
-        let ((al, ah), (bl, bh)) = (self.pair(a), self.pair(b));
+    /// The halves of `v` with its constant halves taken out, and the 128-bit constant that still has to be added to them.
+    fn terms(&mut self, v: Value) -> (Pair, i128) {
+        let mut k = self.offsets.remove(&v).unwrap_or(0);
+        let (mut lo, mut hi) = self.halves.get(&v).copied().unwrap_or_else(|| self.extract(v));
+        if let Some(c) = self.word(lo).filter(|&c| c != 0) {
+            k = k.wrapping_add(i128::from(c as u64));
+            lo = self.konst(0);
+        }
+        if let Some(c) = self.word(hi).filter(|&c| c != 0) {
+            k = k.wrapping_add(i128::from(c) << 64);
+            hi = self.konst(0);
+        }
+        ((lo, hi), k)
+    }
+
+    /// The halves of `pair` plus the 128-bit constant `k`.
+    fn settle(&mut self, pair: Pair, k: i128) -> Pair {
+        if k == 0 {
+            return pair;
+        }
+        let c = (self.konst(k as i64), self.konst((k >> 64) as i64));
+        self.add(pair, c)
+    }
+
+    fn add(&mut self, (al, ah): Pair, (bl, bh): Pair) -> Pair {
         let lo = self.bin(Binary::Iadd, al, bl);
+        let high = self.bin(Binary::Iadd, ah, bh);
+        if self.word(al) == Some(0) || self.word(bl) == Some(0) {
+            return (lo, high);
+        }
         let carry = self.emit(Op::Icmp(IntCC::UnsignedLessThan, lo, al), Type::I8);
         let carry = self.widen(carry);
-        let high = self.bin(Binary::Iadd, ah, bh);
         (lo, self.bin(Binary::Iadd, high, carry))
     }
 
-    fn sub(&mut self, a: Value, b: Value) -> Pair {
-        let ((al, ah), (bl, bh)) = (self.pair(a), self.pair(b));
+    fn sub(&mut self, (al, ah): Pair, (bl, bh): Pair) -> Pair {
         let lo = self.bin(Binary::Isub, al, bl);
+        let high = self.bin(Binary::Isub, ah, bh);
+        if self.word(bl) == Some(0) {
+            return (lo, high);
+        }
         let borrow = self.emit(Op::Icmp(IntCC::UnsignedLessThan, al, bl), Type::I8);
         let borrow = self.widen(borrow);
-        let high = self.bin(Binary::Isub, ah, bh);
         (lo, self.bin(Binary::Isub, high, borrow))
     }
 
