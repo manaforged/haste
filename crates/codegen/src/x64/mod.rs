@@ -256,6 +256,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn bind_entry(&mut self, block: Block) {
+        self.carry = (Some(block), None);
         self.at_end = self.last_block == Some(block);
         self.asm.bind(self.blocks[block.index()]);
     }
