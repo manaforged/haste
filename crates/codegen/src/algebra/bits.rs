@@ -51,3 +51,20 @@ pub(super) fn narrow_bit_test(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value)
     let zero = cx.emit(Type::I64, Op::Const(0));
     Some(Op::Icmp(cc, hit, zero))
 }
+
+/// Keeps the low bits of `x` directly: `x - ((x >> k) << k)` and `x - (x >> k) * 2^k` become `x & (2^k - 1)`.
+pub(super) fn low_bits(cx: &mut RewriteCx, x: Value, y: Value) -> Option<Op> {
+    let ty = cx.func.ty(x);
+    let bits = ty.bytes() * 8;
+    let (q, k) = match cx.func.insts[cx.def(y)?.index()].op {
+        Op::Binary(Binary::Ishl, q, k) => (q, cx.uconst(k, ty)?),
+        Op::Binary(Binary::Imul, q, m) => (q, cx.uconst(m, ty).filter(|m| m.is_power_of_two())?.trailing_zeros().into()),
+        _ => return None,
+    };
+    let Op::Binary(Binary::Ushr, inner, shift) = cx.func.insts[cx.def(q)?.index()].op else { return None };
+    if inner != x || cx.uconst(shift, ty)? != k || k == 0 || k >= u64::from(bits) {
+        return None;
+    }
+    let mask = cx.emit(ty, Op::Const(((1_u64 << k) - 1) as i64));
+    Some(Op::Binary(Binary::Band, x, mask))
+}
