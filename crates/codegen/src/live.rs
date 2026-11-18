@@ -150,6 +150,7 @@ pub(crate) struct Live {
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
     pub sites: Vec<(Inst, Block)>,
+    pub spans: Vec<(u32, u32)>,
 }
 
 impl Live {
@@ -325,6 +326,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
     let mut defs = vec![0; count];
     let (mut unwinds, mut calls, mut sites) = (Vec::new(), Vec::new(), Vec::new());
     let mut at = 0_u32;
+    let mut spans = vec![(0, 0); func.blocks.len()];
     for &block in order {
         let index = block.index();
         let b_start = at;
@@ -430,6 +432,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
         }
         at += 1;
         let b_end = at;
+        spans[index] = (b_start, b_end);
         let exit_block = copied_head.unwrap_or(Block(index as u32));
         for next in func.successors(exit_block) {
             for member in live_in.members(next.index()) {
@@ -458,7 +461,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
         ranges.extend(list);
         slice.push((off, len));
     }
-    Live { ranges, slice, defs, unwinds, calls, sites }
+    Live { ranges, slice, defs, unwinds, calls, sites, spans }
 }
 
 pub(crate) fn results(data: &InstData) -> impl Iterator<Item = Value> + '_ {

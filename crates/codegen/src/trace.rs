@@ -141,6 +141,106 @@ pub(crate) fn on_compile_start(func: &Function) {
     }
 }
 
+/// Reports each integer register candidate of a traced function that register allocation left in a stack slot, and each that holds a register across a call: its uses, its live length, and how many calls its live range crosses.
+pub(crate) fn on_alloc(func: &Function, live: &crate::live::Live, values: impl Iterator<Item = (usize, bool)>) {
+    let label = current_label();
+    if !should_trace(label.as_deref()) {
+        return;
+    }
+    let mut uses = vec![0_u32; func.types.len()];
+    func.blocks.iter().flat_map(|block| &block.insts).for_each(|inst| func.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1));
+    let mut lines = String::new();
+    let (mut count, mut crossing) = (0, 0);
+    for (value, in_slot) in values {
+        let ranges = live.ranges_of(value);
+        let length: u32 = ranges.iter().map(|range| range.end - range.start).sum();
+        let calls: usize = ranges.iter().map(|range| live.calls.partition_point(|&at| at < range.end).saturating_sub(live.calls.partition_point(|&at| at <= range.start))).sum();
+        if !in_slot && calls == 0 {
+            continue;
+        }
+        count += usize::from(in_slot);
+        crossing += usize::from(in_slot && calls > 0);
+        let _ = writeln!(lines, "  {} v{value} uses={} length={length} calls_crossed={calls}", if in_slot { "slot" } else { "reg " }, uses[value]);
+    }
+    eprintln!("[haste-trace] fn={} spilled={count} crossing_calls={crossing}\n{lines}", label.as_deref().unwrap_or("<anon>"));
+}
+
+/// Prints, for the traced function's hottest loops, the registers held by values live into the header but unused in the loop, and the spilled values the loop reads with their weighted uses there.
+pub(crate) fn on_loops(func: &Function, live: &crate::live::Live, (loops, blocks): (&crate::cfg::Loops, &[u64]), ints: &[bool], in_slot: impl Fn(usize) -> bool) {
+    let label = current_label();
+    if !should_trace(label.as_deref()) {
+        return;
+    }
+    let mut lines = String::new();
+    let mut order: Vec<&crate::cfg::Loop> = loops.list.iter().collect();
+    order.sort_by_key(|each| std::cmp::Reverse(blocks.get(each.head.index()).copied().unwrap_or(0)));
+    for each in order.into_iter().take(30) {
+        let mut used = vec![0_u64; func.types.len()];
+        let mut defined = vec![false; func.types.len()];
+        for (at, data) in func.blocks.iter().enumerate().filter(|&(at, _)| each.body.get(at).copied().unwrap_or(false)) {
+            for (slot, p) in data.params.iter().enumerate() {
+                defined[p.index()] = at != each.head.index() || !each.latches.iter().all(|&latch| latch_arg(func, latch, each.head, slot) == Some(*p));
+            }
+            for inst in &data.insts {
+                let inst = &func.insts[inst.index()];
+                inst.op.for_operands(|v| used[v.index()] += blocks.get(at).copied().unwrap_or(1));
+                if let Some(r) = inst.result {
+                    defined[r.index()] = true;
+                }
+            }
+        }
+        let head = live.spans.get(each.head.index()).map_or(0, |span| span.0);
+        let through = |v: usize| live.ranges_of(v).iter().any(|r| r.start < head && r.end > head);
+        let idle = (0..func.types.len()).filter(|&v| ints[v] && !in_slot(v) && used[v] == 0 && through(v)).count();
+        let any_slot = (0..func.types.len()).filter(|&v| in_slot(v) && used[v] > 0).count();
+        let mut reads: Vec<(u64, usize)> = (0..func.types.len()).filter(|&v| ints[v] && in_slot(v) && !defined[v] && used[v] > 0).map(|v| (used[v], v)).collect();
+        reads.sort_unstable_by(|a, b| b.cmp(a));
+        let weight: u64 = reads.iter().map(|r| r.0).sum();
+        let _ = writeln!(lines, "  loop b{} depth={} weight={} idle_regs={idle} any_slot={any_slot} slot_reads={} slot_weight={weight} top={:?}", each.head.index(), each.depth, blocks.get(each.head.index()).copied().unwrap_or(0), reads.len(), &reads[..reads.len().min(6)]);
+    }
+    eprintln!("[haste-trace] fn={} loops\n{lines}", label.as_deref().unwrap_or("<anon>"));
+}
+
+fn latch_arg(func: &Function, latch: crate::ir::Block, head: crate::ir::Block, slot: usize) -> Option<crate::ir::Value> {
+    match func.last(latch)? {
+        crate::ir::Op::Jump(target, args) if *target == head => args.get(slot).copied(),
+        crate::ir::Op::Brif(_, then, then_args, _, _) if *then == head => then_args.get(slot).copied(),
+        crate::ir::Op::Brif(_, _, _, otherwise, else_args) if *otherwise == head => else_args.get(slot).copied(),
+        _ => None,
+    }
+}
+
+/// Prints each loop-header split of a spilled value in the traced function and whether its loop copy got a register.
+pub(crate) fn on_split(made: &[(crate::ir::Value, crate::ir::Value, crate::ir::Block)], kept: &[(crate::ir::Block, crate::ir::Value)]) {
+    let label = current_label();
+    if !should_trace(label.as_deref()) {
+        return;
+    }
+    let mut lines = String::new();
+    for &(_, origin, head) in made {
+        let _ = writeln!(lines, "  split v{} at b{} {}", origin.index(), head.index(), if kept.contains(&(head, origin)) { "kept" } else { "dropped" });
+    }
+    eprintln!("[haste-trace] fn={} splits made={} kept={}\n{lines}", label.as_deref().unwrap_or("<anon>"), made.len(), kept.len());
+}
+
+/// Prints the frame-relative displacement bands of value homes and of addressed stack slots, and the frame size, for the traced function.
+pub(crate) fn on_frame(func: &Function, (values, slots): (&[i32], &[i32]), size: u32) {
+    let label = current_label();
+    if !should_trace(label.as_deref()) {
+        return;
+    }
+    let band = |spans: &mut dyn Iterator<Item = (i32, u32)>| {
+        spans.filter(|&(disp, _)| disp != 0).fold(None, |acc: Option<(i32, i32)>, (disp, bytes)| {
+            let (lo, hi) = (disp, disp + bytes.max(1) as i32);
+            Some(acc.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))))
+        })
+    };
+    let homes = band(&mut values.iter().zip(&func.types).map(|(&disp, ty)| (disp, ty.bytes())));
+    let addressed = band(&mut slots.iter().zip(&func.slots).map(|(&disp, slot)| (disp, slot.size)));
+    let show = |span: Option<(i32, i32)>| span.map_or_else(|| "-".to_owned(), |(lo, hi)| format!("{lo}..{hi}"));
+    eprintln!("[haste-trace] fn={} frame size={size} homes={} slots={}", label.as_deref().unwrap_or("<anon>"), show(homes), show(addressed));
+}
+
 pub(crate) fn on_compile_end(func: &Function) {
     if config().missed {
         COUNTERS.insts_after.fetch_add(func.size(), Ordering::Relaxed);

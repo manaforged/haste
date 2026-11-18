@@ -399,6 +399,9 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     cursor = round(cursor + scratch, 16);
     let scratch = -(cursor as i32);
     let size = round(cursor + outgoing, 16);
+    if crate::trace::enabled() {
+        crate::trace::on_frame(func, (&values, &slots), size);
+    }
     Ok(Frame { values, slots, scratch, size, saves, float_saves, wide })
 }
 
@@ -457,6 +460,9 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
     }
     let second = prepare(&split, regs, weighed, &classify, &carried(&made))?;
     let kept: Vec<(Block, Value)> = made.iter().filter(|&&(param, _, _)| matches!(second.plan.location(param), Location::Reg(_) | Location::Float(_))).map(|&(_, origin, head)| (head, origin)).collect();
+    if crate::trace::enabled() {
+        crate::trace::on_split(&made, &kept);
+    }
     if kept.len() == made.len() {
         return Ok((Some(split), second));
     }

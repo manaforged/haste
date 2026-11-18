@@ -689,6 +689,12 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let shared = webs.map_or_else(Vec::new, |webs| crate::color::share(func, &live, &locations, &deferred, &webs));
     let zero_ext = if regs.call_zext && hints::has_reg_reduce(func, &locations) { hints::zero_ext(func, &locations, &census, true) } else { zero_ext };
     let density = weights.as_deref().map_or_else(Vec::new, |weights| walk::densities(weights, &live));
+    if crate::trace::enabled() {
+        crate::trace::on_alloc(func, &live, (0..count).filter(|&value| ints[value]).map(|value| (value, matches!(locations[value], Location::Slot))));
+        if let (Some(loops), Some(blocks)) = (loops, blocks.as_deref()) {
+            crate::trace::on_loops(func, &live, (loops, blocks), &ints, |value| matches!(locations[value], Location::Slot));
+        }
+    }
     Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density }
 }
 
