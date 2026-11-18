@@ -351,7 +351,6 @@ impl<'a> Emitter<'a> for Emit<'a> {
             }
             Op::Trapz(condition) => {
                 self.trapz(*condition);
-                self.invalidate_spills();
                 Ok(())
             }
             op => {
