@@ -583,6 +583,18 @@ impl Emit<'_> {
         }
     }
 
+    /// Reserves `bytes` of scratch below rsp, keeping frame addresses right.
+    pub(super) fn reserve_scratch(&mut self, bytes: i32) {
+        self.asm.alu_imm(Alu::Sub, Reg::Rsp, bytes);
+        self.shift_base(bytes);
+    }
+
+    /// Releases scratch that `reserve_scratch` took.
+    pub(super) fn release_scratch(&mut self, bytes: i32) {
+        self.asm.alu_imm(Alu::Add, Reg::Rsp, bytes);
+        self.shift_base(-bytes);
+    }
+
     fn store_reg_home(&mut self, to: Mem, reg: Reg, bytes: u32) {
         self.asm.store(Size::Q, to, reg);
         if let Some(disp) = self.frame_disp(to) {

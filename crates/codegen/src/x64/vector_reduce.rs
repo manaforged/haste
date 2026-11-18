@@ -101,13 +101,13 @@ impl Emit<'_> {
                 if let Some(bytes) = self.iminmax_opc(bin, lane) {
                     self.asm.sse(&[0x66], bytes, X0.0, X1);
                 } else {
-                    self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
+                    self.reserve_scratch(32);
                     self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
                     self.asm.sse(&[0xF3], &[0x0F, 0x7F], X1.0, Mem::new(Reg::Rsp, 16));
                     self.emit_icmp_regs(cc, lane, X0, X1, X2);
                     self.asm.sse(&[0xF3], &[0x0F, 0x6F], X0.0, Mem::new(Reg::Rsp, 0));
                     self.asm.sse(&[0xF3], &[0x0F, 0x6F], X1.0, Mem::new(Reg::Rsp, 16));
-                    self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+                    self.release_scratch(32);
                     self.blend_regs(X2, X0, X1, X0);
                 }
             }

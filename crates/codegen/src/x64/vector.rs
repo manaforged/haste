@@ -258,7 +258,7 @@ impl Emit<'_> {
         let fl_ty = lane.to_type();
         let stride = lane.bytes() as i32;
         self.fget(X0, x);
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+        self.reserve_scratch(16);
         self.xmm_store(Type::Vec { lane, count }, Mem::new(Reg::Rsp, 0), X0);
         for i in 0..count {
             let slot = Mem::new(Reg::Rsp, i32::from(i) * stride);
@@ -267,7 +267,7 @@ impl Emit<'_> {
             self.xmm_store(fl_ty, slot, X0);
         }
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
+        self.release_scratch(16);
     }
 
     pub(super) fn vector_binary(&mut self, op: Binary, (x, y): (Value, Value), result: Value) -> Result<(), String> {
@@ -706,7 +706,7 @@ impl Emit<'_> {
 
     fn scalarize_convert(&mut self, op: Convert, (fl, tl, count): (Lane, Lane, u8), (from_ty, to_ty): (Type, Type), x: Value, dst: Xmm) -> Result<(), String> {
         self.fget(X0, x);
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
+        self.reserve_scratch(32);
         self.xmm_store(from_ty, Mem::new(Reg::Rsp, 16), X0);
         for i in 0..count {
             let src_slot = Mem::new(Reg::Rsp, 16 + i32::from(i) * fl.bytes() as i32);
@@ -756,13 +756,13 @@ impl Emit<'_> {
                     self.asm.store(Size::of(tl.bytes()), dst_slot, Reg::Rax);
                 }
                 _ => {
-                    self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+                    self.release_scratch(32);
                     return Err(format!("unsupported vector convert {op:?} {fl:?}->{tl:?}"));
                 }
             }
         }
         self.xmm_load(to_ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+        self.release_scratch(32);
         Ok(())
     }
 }

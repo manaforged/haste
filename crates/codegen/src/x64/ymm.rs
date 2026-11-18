@@ -143,12 +143,12 @@ impl Emit<'_> {
         match step {
             ArgStep::Move(src, dst) => self.fmov(whole, Xmm(dst), Xmm(src)),
             ArgStep::Save(src) => {
-                self.asm.alu_imm(Alu::Sub, Reg::Rsp, whole.bytes() as i32);
+                self.reserve_scratch(whole.bytes() as i32);
                 self.xmm_store(whole, top, Xmm(src));
             }
             ArgStep::Restore(dst) => {
                 self.xmm_load(whole, Xmm(dst), top);
-                self.asm.alu_imm(Alu::Add, Reg::Rsp, whole.bytes() as i32);
+                self.release_scratch(whole.bytes() as i32);
             }
             ArgStep::Load(value, dst) => self.fget(Xmm(dst), value),
         }

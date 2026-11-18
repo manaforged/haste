@@ -139,10 +139,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     drive(emit, &order)
 }
 
-/// Whether a framed function addresses its frame from rbp: it reads the frame pointer, catches an unwind or holds a float or vector, whose lowering moves rsp inside the body.
+/// Whether a framed function addresses its frame from rbp: it reads the frame pointer or catches an unwind.
 fn keeps_frame_pointer(func: &Function) -> bool {
-    func.types.iter().any(|ty| ty.in_float_register())
-        || func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
+    func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {

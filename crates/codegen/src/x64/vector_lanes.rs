@@ -265,7 +265,7 @@ impl Emit<'_> {
         }
         let bytes = lane.bytes() as i32;
         let size = Size::of(lane.bytes());
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 48);
+        self.reserve_scratch(48);
         self.fget(X0, a);
         self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
         self.fget(X0, b);
@@ -282,7 +282,7 @@ impl Emit<'_> {
             self.asm.store(size, Mem::new(Reg::Rsp, 32 + l as i32 * bytes), Reg::Rax);
         }
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 32));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 48);
+        self.release_scratch(48);
     }
 
     fn emit_two_vec_imm(&mut self, op: u8, dst: Xmm, stay: Value, src_val: Value, imm: u8) {
@@ -356,7 +356,7 @@ impl Emit<'_> {
         self.clobber_xmm(X0);
         let save_stack = dst == X2 || self.lives(dst, &[mask_v, b]);
         if save_stack {
-            self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+            self.reserve_scratch(16);
             self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
         } else {
             self.asm.movaps(dst, X0);
@@ -373,7 +373,7 @@ impl Emit<'_> {
         self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], X1.0, X2);
         if save_stack {
             self.asm.sse(&[0xF3], &[0x0F, 0x6F], X0.0, Mem::new(Reg::Rsp, 0));
-            self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
+            self.release_scratch(16);
             self.asm.sse(&[0x66], &[0x0F, 0xEB], X0.0, X1);
             self.asm.movaps(dst, X0);
         } else {
@@ -383,7 +383,7 @@ impl Emit<'_> {
     }
 
     fn vector_shuffle_dyn_baseline(&mut self, lane: Lane, count: u8, a: Value, b: Value, mask_v: Value, dst: Xmm) {
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 64);
+        self.reserve_scratch(64);
         self.fget(X0, a);
         self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
         self.fget(X0, b);
@@ -411,7 +411,7 @@ impl Emit<'_> {
         self.asm.alu_imm32(Alu::Cmp, Reg::Rcx, i32::from(count));
         self.asm.jcc(Cond::B, head);
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 48));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 64);
+        self.release_scratch(64);
     }
 
     fn vector_extract(&mut self, v: Value, idx: u8, result: Value) -> Result<(), String> {
@@ -525,11 +525,11 @@ impl Emit<'_> {
     }
 
     fn insert_stack(&mut self, lane: Lane, count: u8, dst: Xmm, idx: u8) {
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+        self.reserve_scratch(16);
         self.asm.sse(&[0xF3], &[0x0F, 0x7F], dst.0, Mem::new(Reg::Rsp, 0));
         self.asm.store(Size::of(lane.bytes()), Mem::new(Reg::Rsp, i32::from(idx) * lane.bytes() as i32), Reg::Rax);
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
+        self.release_scratch(16);
     }
 
     fn cached_fspill(&self, value: Value) -> Option<Xmm> {
@@ -596,7 +596,7 @@ impl Emit<'_> {
     }
 
     fn spill_vec_pair(&mut self, ty: Type, x: Value, y: Value) {
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
+        self.reserve_scratch(32);
         self.fget(X0, x);
         self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
         self.fget(X0, y);
@@ -646,7 +646,7 @@ impl Emit<'_> {
             self.asm.store(size, sx, Reg::Rax);
         }
         self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+        self.release_scratch(32);
     }
 
     pub(super) fn scalarize_int_clz(&mut self, lane: Lane, count: u8, x: Value, dst: Xmm) {
@@ -654,7 +654,7 @@ impl Emit<'_> {
         let stride = lane.bytes() as i32;
         let size = Size::of(lane.bytes());
         self.fget(X0, x);
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+        self.reserve_scratch(16);
         self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
         for i in 0..i32::from(count) {
             let slot = Mem::new(Reg::Rsp, i * stride);
@@ -668,7 +668,7 @@ impl Emit<'_> {
             self.asm.store(size, slot, Reg::Rax);
         }
         self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
+        self.release_scratch(16);
     }
 
     pub(super) fn scalarize_int_icmp(&mut self, cc: IntCC, lane: Lane, count: u8, x: Value, y: Value, dst: Xmm) {
@@ -687,6 +687,6 @@ impl Emit<'_> {
             self.asm.store(Size::Q, sx, Reg::Rax);
         }
         self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+        self.release_scratch(32);
     }
 }
