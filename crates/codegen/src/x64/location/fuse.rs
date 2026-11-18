@@ -382,7 +382,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             };
             let pair = low_of_pair(func, block, pos);
             paired.extend(pair);
-            let reads_nothing = pair.is_some() || carry_out_of_pair(func, block, pos);
+            let reads_nothing = pair.is_some() || crate::live::carry_out_of_pair(func, &block.insts, pos);
             data.op.for_operands(|v| {
                 if reads_nothing && is_load(func, &defs, v) {
                     return;
@@ -748,16 +748,6 @@ fn carry_load_ok(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (args, result)
             ![Reg::Rax, Reg::Rcx, Reg::Rdx].into_iter().chain(result_reg).any(|reg| addr_reads(ctx.func, ctx.plan, ctx.defs, addr, reg))
         }
         Op::StackLoad(..) => true,
-        _ => false,
-    }
-}
-
-/// Whether the instruction at `pos` takes the carry out of the `adc` or `sbb` just before it on the same operands, so it reads only the flags.
-fn carry_out_of_pair(func: &Function, block: &crate::ir::BlockData, pos: usize) -> bool {
-    let Some(prev) = pos.checked_sub(1) else { return false };
-    match (&func.insts[block.insts[prev].index()].op, &func.insts[block.insts[pos].index()].op) {
-        (Op::TargetOp(TargetOpId::X64AddCarry, sum), Op::TargetOp(TargetOpId::X64AddCarryOut, out))
-        | (Op::TargetOp(TargetOpId::X64SubBorrow, sum), Op::TargetOp(TargetOpId::X64SubBorrowOut, out)) => sum.as_slice() == out.as_slice(),
         _ => false,
     }
 }

@@ -1,4 +1,4 @@
-use crate::ir::{Binary, Block, Convert, Function, Op, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Op, TargetOpId, Type, Unary, Value};
 use crate::live::{Live, covers, overlaps};
 use crate::park::crosses_ranges;
 
@@ -85,6 +85,10 @@ fn reuse_binary<R: 'static>(ctx: &ReuseCtx<'_, R>, reuse: &[Option<Value>], (blo
 fn reuse_candidate<R: 'static>(ctx: &ReuseCtx<'_, R>, reuse: &[Option<Value>], (block_idx, at, result): (usize, usize, Value), end_at: u32) -> Option<Value> {
     let data = &ctx.func.insts[ctx.func.blocks[block_idx].insts[at].index()];
     match data.op {
+        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64SubBorrow, ref args) => match *args.as_slice() {
+            [carry, a, b] if a != b && a != carry && reuse_dies(ctx, result, a, end_at) => Some(a),
+            _ => None,
+        },
         Op::Binary(op, x, y) => reuse_binary(ctx, reuse, (block_idx, at, result), (op, x, y), end_at),
         Op::Convert(Convert::Uextend | Convert::Sextend | Convert::Ireduce | Convert::Bitcast, x)
             if reuse_dies(ctx, result, x, end_at) => Some(x),

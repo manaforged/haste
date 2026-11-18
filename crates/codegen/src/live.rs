@@ -1,5 +1,15 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
+use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, TargetOpId, Value};
+
+/// Whether the instruction at `pos` of `insts` takes the carry out of the `adc` or `sbb` just before it on the same operands, so it reads only the flags.
+pub(crate) fn carry_out_of_pair(func: &Function, insts: &[Inst], pos: usize) -> bool {
+    let Some(prev) = pos.checked_sub(1) else { return false };
+    match (&func.insts[insts[prev].index()].op, &func.insts[insts[pos].index()].op) {
+        (Op::TargetOp(TargetOpId::X64AddCarry, sum), Op::TargetOp(TargetOpId::X64AddCarryOut, out))
+        | (Op::TargetOp(TargetOpId::X64SubBorrow, sum), Op::TargetOp(TargetOpId::X64SubBorrowOut, out)) => sum.as_slice() == out.as_slice(),
+        _ => false,
+    }
+}
 
 pub(crate) fn cold(func: &Function) -> Vec<bool> {
     let cfg = func.cfg();
@@ -411,7 +421,10 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                 continue;
             }
             at += 1;
-            for_effective_operands(data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+            let flags_only = carry_out_of_pair(func, insts, place) && func.insts[insts[place - 1].index()].result.is_some_and(|sum| elided.get(sum.index()) != Some(&true));
+            if !flags_only {
+                for_effective_operands(data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+            }
             at += 1;
             results(data).for_each(|r| def_val(r, at, true, &mut defs, &mut open, &mut touched, &mut per_val));
         }
