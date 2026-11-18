@@ -348,6 +348,10 @@ fn step_ty(cx: &mut Context<'_>, parent: Ty, variant: u32, field: u32) -> Result
             let variants = field_types(cx, item, &slice)?;
             variants.get(variant as usize).and_then(|v| v.get(field as usize)).copied().ok_or_else(|| anyhow::anyhow!("adt step ({}, {}) out of bounds", variant, field))
         }
+        Kind::Closure(..) => match cx.closure_env(parent) {
+            Some(env) => step_ty(cx, env, variant, field),
+            None => bail!("cannot step into a closure whose defining body was not inferred"),
+        },
         other => bail!("cannot step into {:?}", other),
     }
 }
