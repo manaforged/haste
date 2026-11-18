@@ -157,7 +157,7 @@ pub(crate) fn split(func: &mut Function) {
         let at = frame.place(bytes, bytes);
         frame.spills.insert(value, at as i32);
     }
-    let lazy = lazy::plan(func, &frame, &mut stack);
+    let lazy = lazy::plan(func, &frame, &is_spill, &mut stack);
     func.slots = stack;
     let anchor = StackSlot(0);
     let orig_blocks = func.blocks.len();

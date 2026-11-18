@@ -1,5 +1,5 @@
 use crate::builder::FunctionBuilder;
-use crate::ir::{Block, Function, IntCC, Op, SlotData, StackSlot, Type};
+use crate::ir::{Binary, Block, Function, IntCC, Op, SlotData, StackSlot, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 use super::{Coroutine, Frame, Home, call, push};
@@ -14,16 +14,15 @@ pub(super) struct Lazy {
     pub(super) bytes: u32,
 }
 
-/// Adds the stack buffer when no framed slot has its address taken, so a byte copy can move the frame; the anchor slot grows to hold the object address at offset 8.
-pub(super) fn plan(func: &Function, frame: &Frame, stack: &mut Vec<SlotData>) -> Option<Lazy> {
+/// Adds the stack buffer when no address into the frame leaves the function or crosses a suspension, so a byte copy can move the frame; the anchor slot grows to hold the object address at offset 8.
+pub(super) fn plan(func: &Function, frame: &Frame, is_spill: &[bool], stack: &mut Vec<SlotData>) -> Option<Lazy> {
     let bytes = frame.bytes();
     if bytes > MAX_STACK_FRAME {
         return None;
     }
-    let addressed = func.blocks.iter().flat_map(|block| &block.insts).any(|inst| {
-        matches!(func.insts[inst.index()].op, Op::StackAddr(slot, _) if matches!(frame.slots[slot.index()], Home::Frame(_)))
-    });
-    if addressed {
+    let framed = |slot: StackSlot| matches!(frame.slots[slot.index()], Home::Frame(_));
+    let addressed = func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::StackAddr(slot, _) if framed(slot)));
+    if addressed && frame_escapes(func, &framed, is_spill) {
         return None;
     }
     stack[0].size = 16;
@@ -68,4 +67,58 @@ pub(super) fn settle(func: &mut Function, spec: &Coroutine, anchor: StackSlot, l
         b.ins().jump(tail, &[]);
         b.func.blocks[tail.index()].insts.push(term);
     }
+}
+
+/// Whether an address into a framed slot, followed through local slots that hold it, reaches anything but a load, a store address, a copy or a local slot, or lives across a suspension.
+fn frame_escapes(func: &Function, framed: &dyn Fn(StackSlot) -> bool, is_spill: &[bool]) -> bool {
+    let (addrs, _) = func.slot_offsets(|_| None);
+    let slot_of = |v: Value| addrs.get(v.index()).copied().flatten().map(|(slot, _)| slot);
+    let mut tainted: Vec<bool> = (0..func.types.len()).map(|v| slot_of(Value(v as u32)).is_some_and(framed)).collect();
+    let mut holders = vec![false; func.slots.len()];
+    let insts: Vec<_> = func.blocks.iter().flat_map(|block| &block.insts).map(|inst| &func.insts[inst.index()]).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for data in &insts {
+            let held = match data.op {
+                Op::StackStore(value, slot, _) if tainted[value.index()] => Some(slot),
+                Op::Store(value, addr, _) if tainted[value.index()] => slot_of(addr),
+                _ => None,
+            };
+            if let Some(slot) = held.filter(|&slot| !framed(slot) && !holders[slot.index()]) {
+                holders[slot.index()] = true;
+                changed = true;
+            }
+            let from = match data.op {
+                Op::StackLoad(slot, _) => holders[slot.index()],
+                Op::Load(addr, _) => slot_of(addr).is_some_and(|slot| holders[slot.index()]),
+                Op::Binary(Binary::Iadd | Binary::Isub, a, _) => tainted[a.index()],
+                _ => false,
+            };
+            if let Some(result) = data.result.filter(|r| from && !tainted[r.index()]) {
+                tainted[result.index()] = true;
+                changed = true;
+            }
+        }
+    }
+    let local = |v: Value| slot_of(v).is_some_and(|slot| !framed(slot));
+    insts.iter().any(|data| {
+        let mut bad = false;
+        data.op.for_operands(|v| {
+            let holder_addr = slot_of(v).is_some_and(|slot| holders[slot.index()]);
+            if !tainted[v.index()] && !holder_addr {
+                return;
+            }
+            bad |= match &data.op {
+                Op::Load(..) => false,
+                Op::Move(..) => holder_addr,
+                Op::Copy(_, _, len) => holder_addr || *len == v,
+                Op::Store(value, addr, _) => *value == v && (holder_addr || !local(*addr)),
+                Op::StackStore(_, slot, _) => holder_addr || framed(*slot),
+                Op::Binary(Binary::Iadd | Binary::Isub, a, b) => *a != v || tainted[b.index()] || (holder_addr && data.result.and_then(|r| slot_of(r)).is_none()),
+                _ => true,
+            };
+        });
+        bad || data.result.is_some_and(|r| tainted[r.index()] && is_spill.get(r.index()).copied().unwrap_or(false))
+    })
 }
