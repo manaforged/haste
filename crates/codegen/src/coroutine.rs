@@ -86,7 +86,7 @@ impl Frame {
         at
     }
 
-    fn place_colored(&mut self, slots: &[(usize, u32, u32)], conflicts: &[Vec<bool>]) -> Vec<u32> {
+    fn place_colored(&mut self, start: u32, slots: &[(usize, u32, u32)], conflicts: &[Vec<bool>]) -> Vec<u32> {
         let mut order: Vec<usize> = (0..slots.len()).collect();
         order.sort_by_key(|&idx| std::cmp::Reverse((slots[idx].1, slots[idx].2)));
         let mut placed = vec![0_u32; slots.len()];
@@ -102,7 +102,7 @@ impl Frame {
                 }
             }
             used.sort_unstable();
-            let mut at = 0_u32.next_multiple_of(align);
+            let mut at = start.next_multiple_of(align);
             for &(start, end) in &used {
                 if at + size <= start {
                     break;
@@ -135,27 +135,33 @@ pub(crate) fn split(func: &mut Function) {
     for &value in &spills {
         is_spill[value.index()] = true;
     }
-    let (kept, conflicts) = framed(func, &cfg, &spec.resumes, &is_spill);
+    let (kept, conflicts, escaped) = framed(func, &cfg, &spec.resumes, &is_spill);
     let mut frame = Frame { size: 0, slots: vec![Home::Stack(StackSlot(0)); func.slots.len()], spills: HashMap::default() };
     let mut stack = vec![SlotData { size: 8, align_shift: 3 }];
-    let mut framed_slots = Vec::new();
+    let (mut private, mut shared) = (Vec::new(), Vec::new());
     for (slot, &in_frame) in kept.iter().enumerate() {
         if in_frame {
             let data = &func.slots[slot];
-            framed_slots.push((slot, data.size, 1_u32 << data.align_shift));
+            let placed = if escaped[slot] { &mut shared } else { &mut private };
+            placed.push((slot, data.size, 1_u32 << data.align_shift));
         } else {
             stack.push(func.slots[slot].clone());
             frame.slots[slot] = Home::Stack(StackSlot(stack.len() as u32 - 1));
         }
     }
-    let offsets = frame.place_colored(&framed_slots, &conflicts);
-    for (&(slot, _, _), offset) in framed_slots.iter().zip(offsets) {
+    let offsets = frame.place_colored(0, &private, &conflicts);
+    for (&(slot, _, _), offset) in private.iter().zip(offsets) {
         frame.slots[slot] = Home::Frame(offset);
     }
     for value in spills {
         let bytes = func.types[value.index()].bytes();
         let at = frame.place(bytes, bytes);
         frame.spills.insert(value, at as i32);
+    }
+    func.frame_private = frame.size;
+    let offsets = frame.place_colored(frame.size, &shared, &conflicts);
+    for (&(slot, _, _), offset) in shared.iter().zip(offsets) {
+        frame.slots[slot] = Home::Frame(offset);
     }
     let lazy = lazy::plan(func, &frame, &is_spill, &mut stack);
     func.slots = stack;
@@ -447,7 +453,7 @@ fn written_before(func: &Function, resumes: &[Block], analysis: &SlotAnalysis, l
     before
 }
 
-fn framed(func: &Function, cfg: &Cfg, resumes: &[Block], is_spill: &[bool]) -> (Vec<bool>, Vec<Vec<bool>>) {
+fn framed(func: &Function, cfg: &Cfg, resumes: &[Block], is_spill: &[bool]) -> (Vec<bool>, Vec<Vec<bool>>, Vec<bool>) {
     let slots = func.slots.len();
     let value_uses = collect_value_uses(func);
     let (taken, analysis) = slot_effects(func, &value_uses, is_spill);
@@ -532,7 +538,7 @@ fn framed(func: &Function, cfg: &Cfg, resumes: &[Block], is_spill: &[bool]) -> (
             }
         }
     }
-    (kept, conflicts)
+    (kept, conflicts, analysis.escaped)
 }
 
 fn live_across_suspend(func: &Function, cfg: &Cfg, resumes: &[Block], defs: &[Option<Block>]) -> Vec<Value> {
@@ -648,7 +654,11 @@ fn rewrite(
     let fp = if needs_fp {
         Some(match inherited_fp {
             Some(fp) => fp,
-            None => push(func, &mut insts, Op::StackLoad(anchor, 0), Some(Type::I64)).expect("a load has a result"),
+            None => {
+                let fp = push(func, &mut insts, Op::StackLoad(anchor, 0), Some(Type::I64)).expect("a load has a result");
+                func.mark_frame_ptr(fp);
+                fp
+            }
         })
     } else {
         None
@@ -743,6 +753,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     b.switch_to_block(init);
     let init_fp = if let Some(lazy) = lazy {
         let buf = b.ins().stack_addr(Type::I64, lazy.buf, 0);
+        b.func.mark_frame_ptr(buf);
         b.ins().stack_store(object, anchor, 8);
         buf
     } else {
@@ -752,6 +763,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
         b.func.blocks[init.index()].insts = insts;
         b.ins().store(heap, object, spec.header.1);
         b.func.mark_unique_ptr(heap);
+        b.func.mark_frame_ptr(heap);
         heap
     };
     b.ins().stack_store(init_fp, anchor, 0);
@@ -759,6 +771,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     b.switch_to_block(dispatch);
     let disp_fp = b.ins().load(Type::I64, object, spec.header.1);
     b.func.mark_unique_ptr(disp_fp);
+    b.func.mark_frame_ptr(disp_fp);
     b.ins().stack_store(disp_fp, anchor, 0);
     if spec.resumes.len() >= 2 {
         let idx = b.ins().iadd_imm(state, -CoroutineState::FirstSuspend.code());

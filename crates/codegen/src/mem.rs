@@ -1,4 +1,5 @@
 mod escape;
+mod frame;
 mod loop_mem;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -99,6 +100,7 @@ pub(crate) struct Provenance {
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
     frontiers: Vec<Option<escape::Frontier>>,
     inst_at: Vec<(u32, u32)>,
+    frame: frame::FrameFacts,
 }
 
 fn slot_addresses(func: &Function) -> Vec<Option<(StackSlot, i32)>> {
@@ -359,7 +361,7 @@ impl Provenance {
                 ro_bytes[param.index()] = abi.deref_bytes;
             }
         }
-        Self { slot_offsets, param_roots, symbol_defs, frame_runtime, ro_bytes, affine, ..Self::default() }
+        Self { slot_offsets, param_roots, symbol_defs, frame_runtime, ro_bytes, affine, frame: frame::FrameFacts::new(func, cfg), ..Self::default() }
     }
 
     /// The address facts alone, for `loc` and `ro_bytes`: no escape classification and no loop spans.
@@ -461,6 +463,9 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
     if a.base == b.base {
         return a.overlaps(b);
     }
+    if let Some(alias) = prov.frame_alias(a, b) {
+        return alias;
+    }
     if a.size != u32::MAX && b.size != u32::MAX {
         let (ba, alo, ahi) = prov.loc_span(a);
         let (bb, blo, bhi) = prov.loc_span(b);
@@ -555,9 +560,9 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
             MemRoot::NoAliasParam(p) => {
                 !prov.noalias_unescaped(p) || call_writes_noalias(&func.sigs[sig.index()].params, args, prov, p)
             }
-            _ => true,
+            _ => !prov.private_frame(loc),
         },
-        _ => is_atomic_barrier(op),
+        _ => is_atomic_barrier(op) && !(prov.private_frame(loc) && !prov.touches_frame(op)),
     }
 }
 

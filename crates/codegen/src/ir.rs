@@ -1,6 +1,7 @@
 use std::fmt;
 
 mod consts;
+mod edges;
 mod flags;
 mod rodata;
 mod vector;
@@ -432,38 +433,6 @@ impl Op {
         self.is_speculable() || matches!(self, Op::Binary(..) | Op::Runtime(_) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
     }
 
-    /// Every block this instruction can go to.
-    pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + '_ {
-        let (first, second, slice) = match self {
-            Op::Jump(block, _) => (Some(*block), None, &[][..]),
-            Op::Brif(_, then, _, otherwise, _) => (Some(*then), Some(*otherwise), &[][..]),
-            Op::BrTable(_, default, targets) => (Some(*default), None, &targets[..]),
-            Op::TryCall { normal, handler, .. } => (Some(*normal), Some(*handler), &[][..]),
-            _ => (None, None, &[][..]),
-        };
-        first.into_iter().chain(second).chain(slice.iter().copied())
-    }
-
-    /// Replaces every block this instruction can go to with `f` of it.
-    pub(crate) fn map_targets(&mut self, mut f: impl FnMut(Block) -> Block) {
-        match self {
-            Op::Jump(block, _) => *block = f(*block),
-            Op::Brif(_, then, _, otherwise, _) => {
-                *then = f(*then);
-                *otherwise = f(*otherwise);
-            }
-            Op::BrTable(_, default, targets) => {
-                *default = f(*default);
-                targets.iter_mut().for_each(|target| *target = f(*target));
-            }
-            Op::TryCall { normal, handler, .. } => {
-                *normal = f(*normal);
-                *handler = f(*handler);
-            }
-            _ => {}
-        }
-    }
-
     /// Calls `f` with every value this instruction reads, once per read.
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
@@ -581,6 +550,8 @@ pub struct Function {
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
     pub(crate) value_flags: Vec<u8>,
+    /// The bytes at the start of this coroutine's own frame that no code outside the frame can address.
+    pub(crate) frame_private: u32,
     pub(crate) cfg_rev: u32,
     pub(crate) cfg_cache: CfgCache,
 }
@@ -588,7 +559,7 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
     }
 
     pub(crate) fn bump_cfg(&mut self) {

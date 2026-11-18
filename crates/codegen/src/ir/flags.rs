@@ -4,6 +4,7 @@ const UNIQUE_PTR: u8 = 1;
 const UNPREDICTABLE: u8 = 2;
 const IMAGE_ADDR: u8 = 4;
 const THREAD_CELL: u8 = 8;
+const FRAME_PTR: u8 = 16;
 
 impl Function {
     /// Marks `value` as a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
@@ -24,6 +25,16 @@ impl Function {
     /// Marks `value` as the runtime's thread-cell lookup, `(slot, size) -> cell`, whose fast path a target may inline.
     pub fn mark_thread_cell(&mut self, value: Value) {
         self.set_flags(value, THREAD_CELL);
+    }
+
+    /// Marks `value` as the start of this coroutine's own frame, whose first `frame_private` bytes no other code can address.
+    pub(crate) fn mark_frame_ptr(&mut self, value: Value) {
+        self.set_flags(value, FRAME_PTR);
+    }
+
+    /// Whether `value` is the start of this coroutine's own frame.
+    pub(crate) fn is_frame_ptr(&self, value: Value) -> bool {
+        self.flags(value) & FRAME_PTR != 0
     }
 
     /// Whether `value` is the runtime's thread-cell lookup.
@@ -88,7 +99,7 @@ impl Function {
     pub(crate) fn import_values(&mut self, callee: &Function) -> Vec<Value> {
         let values: Vec<Value> = callee.types.iter().map(|&ty| self.value(ty)).collect();
         for (index, &value) in values.iter().enumerate() {
-            self.set_flags(value, callee.flags(Value(index as u32)));
+            self.set_flags(value, callee.flags(Value(index as u32)) & !FRAME_PTR);
         }
         values
     }

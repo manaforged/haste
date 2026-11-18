@@ -46,6 +46,8 @@ pub(super) fn settle(func: &mut Function, spec: &Coroutine, anchor: StackSlot, l
         b.switch_to_block(block);
         let fp = b.ins().stack_load(Type::I64, anchor, 0);
         let buf = b.ins().stack_addr(Type::I64, lazy.buf, 0);
+        b.func.mark_frame_ptr(fp);
+        b.func.mark_frame_ptr(buf);
         let on_stack = b.ins().icmp(IntCC::Equal, fp, buf);
         if done {
             b.ins().brif(on_stack, tail, &[], cold, &[]);
