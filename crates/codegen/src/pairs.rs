@@ -289,6 +289,11 @@ impl Splitter<'_> {
                 let pair = self.pair(a);
                 self.shift(op, pair, shift)
             }
+            Op::Binary(op @ (Binary::Ushr | Binary::Sshr | Binary::Ishl), a, k) => {
+                let amount = if self.func.ty(k) == Type::I128 { self.pair(k).0 } else { self.to_word(k, false) };
+                let pair = self.pair(a);
+                self.shift_by(op, pair, amount)
+            }
             Op::Select(c, a, b) => {
                 let ((al, ah), (bl, bh)) = (self.pair(a), self.pair(b));
                 (self.emit(Op::Select(c, al, bl), Type::I64), self.emit(Op::Select(c, ah, bh), Type::I64))
@@ -360,6 +365,31 @@ impl Splitter<'_> {
         let cross_b = self.bin(Binary::Imul, ah, bl);
         let cross = self.bin(Binary::Iadd, cross_a, cross_b);
         (lo, self.bin(Binary::Iadd, carry, cross))
+    }
+
+    /// The halves of `(lo, hi)` shifted by the low seven bits of the variable `amount`, with no 64-bit shift by 64 or more.
+    fn shift_by(&mut self, op: Binary, (lo, hi): Pair, amount: Value) -> Pair {
+        let small = self.bin_imm(Binary::Band, amount, 63);
+        let wide = self.bin_imm(Binary::Band, amount, 64);
+        let zero = self.konst(0);
+        let big = self.emit(Op::Icmp(IntCC::NotEqual, wide, zero), Type::I8);
+        let back = self.konst(63);
+        let back = self.bin(Binary::Isub, back, small);
+        if op == Binary::Ishl {
+            let low = self.bin(Binary::Ishl, lo, small);
+            let carried = self.bin_imm(Binary::Ushr, lo, 1);
+            let carried = self.bin(Binary::Ushr, carried, back);
+            let high = self.bin(Binary::Ishl, hi, small);
+            let high = self.bin(Binary::Bor, high, carried);
+            return (self.emit(Op::Select(big, zero, low), Type::I64), self.emit(Op::Select(big, low, high), Type::I64));
+        }
+        let high = self.bin(op, hi, small);
+        let carried = self.bin_imm(Binary::Ishl, hi, 1);
+        let carried = self.bin(Binary::Ishl, carried, back);
+        let low = self.bin(Binary::Ushr, lo, small);
+        let low = self.bin(Binary::Bor, low, carried);
+        let fill = if op == Binary::Sshr { self.bin_imm(Binary::Sshr, hi, 63) } else { zero };
+        (self.emit(Op::Select(big, high, low), Type::I64), self.emit(Op::Select(big, fill, high), Type::I64))
     }
 
     fn shift(&mut self, op: Binary, (lo, hi): Pair, shift: u32) -> Pair {
