@@ -279,7 +279,7 @@ fn apply_add_plan(func: &mut Function, plan: AddPlan, root: Inst, ty: Type) -> (
     (prefix, final_op, new_const)
 }
 
-fn try_reassociate_inst(st: &mut ReassocState<'_>, blk: Block, inst: Inst, removed: &mut [bool]) -> Option<Vec<Inst>> {
+fn try_reassociate_inst(st: &mut ReassocState<'_>, blk: Block, inst: Inst, removed: &mut Vec<bool>) -> Option<Vec<Inst>> {
     let res = st.func.insts[inst.index()].result?;
     let ty = st.func.ty(res);
     if !ty.is_small_int() {
@@ -299,6 +299,9 @@ fn try_reassociate_inst(st: &mut ReassocState<'_>, blk: Block, inst: Inst, remov
     let chain = flatten_add(&ctx, &st.defs, blk, ty, inst)?;
     let plan = plan_add_rewrite(&ctx, chain, blk, ty, inst)?;
     for &dead in &plan.chain.absorbed {
+        if removed.len() <= dead.index() {
+            removed.resize(dead.index() + 1, false);
+        }
         removed[dead.index()] = true;
     }
     let (prefix, final_op, new_const) = apply_add_plan(st.func, plan, inst, ty);
@@ -319,29 +322,50 @@ fn try_reassociate_inst(st: &mut ReassocState<'_>, blk: Block, inst: Inst, remov
 
 fn reassociate_block_adds(st: &mut ReassocState<'_>, blk: Block) -> bool {
     let old_insts = st.func.blocks[blk.index()].insts.clone();
-    let orig_len = st.func.insts.len();
-    let mut removed = vec![false; orig_len];
-    let mut before_root: Vec<Vec<Inst>> = vec![Vec::new(); orig_len];
-    let mut changed = false;
+    let mut removed: Vec<bool> = Vec::new();
+    let mut before_root: Vec<(Inst, Vec<Inst>)> = Vec::new();
     for &inst in old_insts.iter().rev() {
-        if !removed[inst.index()]
+        if !removed.get(inst.index()).copied().unwrap_or(false)
             && let Some(prefix) = try_reassociate_inst(st, blk, inst, &mut removed)
         {
-            before_root[inst.index()] = prefix;
-            changed = true;
+            before_root.push((inst, prefix));
         }
     }
-    if changed {
-        let mut rebuilt = Vec::with_capacity(old_insts.len());
-        for inst in old_insts {
-            if !removed[inst.index()] {
-                rebuilt.extend(before_root[inst.index()].iter().copied());
-                rebuilt.push(inst);
+    if before_root.is_empty() {
+        return false;
+    }
+    let mut rebuilt = Vec::with_capacity(old_insts.len());
+    for inst in old_insts {
+        if !removed.get(inst.index()).copied().unwrap_or(false) {
+            if let Some((_, prefix)) = before_root.iter().find(|(root, _)| *root == inst) {
+                rebuilt.extend(prefix.iter().copied());
             }
+            rebuilt.push(inst);
         }
-        st.func.blocks[blk.index()].insts = rebuilt;
     }
-    changed
+    st.func.blocks[blk.index()].insts = rebuilt;
+    true
+}
+
+/// Whether some small-int add or sub in `blk` reads a value homed in `blk` that is not plainly defined there by a non-add instruction, the only shape `flatten_add` can absorb.
+fn may_chain(func: &Function, blk: Block, home: &[Option<Block>]) -> bool {
+    let is_add = |op: &Op| matches!(op, Op::Binary(Binary::Iadd | Binary::Isub, ..));
+    let mut other: Vec<Value> = Vec::new();
+    for inst in &func.blocks[blk.index()].insts {
+        let data = &func.insts[inst.index()];
+        if let Some(res) = data.result
+            && !is_add(&data.op)
+        {
+            other.push(res);
+        }
+    }
+    other.sort_unstable();
+    func.blocks[blk.index()].insts.iter().any(|inst| match func.insts[inst.index()].op {
+        Op::Binary(Binary::Iadd | Binary::Isub, a, b) => {
+            [a, b].into_iter().any(|v| home.get(v.index()).copied().flatten() == Some(blk) && other.binary_search(&v).is_err())
+        }
+        _ => false,
+    })
 }
 
 pub(super) fn reassociate_loop_adds(
@@ -351,6 +375,9 @@ pub(super) fn reassociate_loop_adds(
     home: &mut Vec<Option<Block>>,
     is_const: &mut Vec<bool>,
 ) -> bool {
+    if !cfg.rpo.iter().any(|&blk| each.body.get(blk.index()).copied().unwrap_or(false) && may_chain(func, blk, home)) {
+        return false;
+    }
     let uses = func.use_counts();
     let defs = crate::fold::defs(func);
     let mut consts = vec![None; func.types.len()];
