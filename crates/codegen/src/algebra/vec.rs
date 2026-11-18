@@ -1,20 +1,8 @@
 use super::RewriteCx;
 use crate::ir::{Binary, Convert, IntCC, Lane, Op, ShuffleMask, TargetOpId, TinyArgs, Type, Unary, Value};
 
-fn is_zero_vec(cx: &RewriteCx, mut v: Value) -> bool {
-    for _ in 0..4 {
-        if cx.sconst(v) == Some(0) {
-            return true;
-        }
-        let Some(inst) = cx.def(v) else { return false };
-        match cx.func.insts[inst.index()].op {
-            Op::Const(0) => return true,
-            Op::Convert(Convert::Bitcast, inner) => v = inner,
-            Op::TargetOp(TargetOpId::X64Concat128, args) => return args.as_slice().iter().all(|&half| is_zero_vec(cx, half)),
-            _ => return false,
-        }
-    }
-    false
+fn is_zero_vec(cx: &RewriteCx, v: Value) -> bool {
+    cx.sconst(v) == Some(0) || cx.func.is_zero_vec(&|value| cx.def(value), v)
 }
 
 /// The vector whose lane sign bits equal those of `v`, when `v` only spreads each sign bit of it across its lane.

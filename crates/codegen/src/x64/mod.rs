@@ -8,6 +8,7 @@ mod int;
 mod location;
 mod vector;
 mod vector_lanes;
+mod vector_reduce;
 mod vector_narrow;
 mod wide;
 mod ymm;

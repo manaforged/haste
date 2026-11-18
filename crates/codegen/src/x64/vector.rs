@@ -65,16 +65,8 @@ impl Emit<'_> {
         }
     }
 
-    pub(super) fn is_zero_vec(&self, mut v: Value) -> bool {
-        for _ in 0..4 {
-            let Some(inst) = self.defs.get(v.index()).copied().flatten() else { return false };
-            match self.func.insts[inst.index()].op {
-                Op::Const(0) => return true,
-                Op::Convert(Convert::Bitcast, inner) => v = inner,
-                _ => return false,
-            }
-        }
-        false
+    pub(super) fn is_zero_vec(&self, v: Value) -> bool {
+        self.func.is_zero_vec(&|value| self.defs.get(value.index()).copied().flatten(), v)
     }
 
     pub(super) fn packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm) {
