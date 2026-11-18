@@ -293,7 +293,7 @@ fn narrow_const_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value
 }
 
 fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Op> {
-    if let Some(op) = bits::narrow_bit_test(cx, cc, x, y) {
+    if let Some(op) = bits::narrow_bit_test(cx, cc, x, y).or_else(|| bits::shifted_bit_test(cx, cc, x, y)) {
         return Some(op);
     }
     if matches!(cc, IntCC::Equal | IntCC::NotEqual)

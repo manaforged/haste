@@ -68,3 +68,19 @@ pub(super) fn low_bits(cx: &mut RewriteCx, x: Value, y: Value) -> Option<Op> {
     let mask = cx.emit(ty, Op::Const(((1_u64 << k) - 1) as i64));
     Some(Op::Binary(Binary::Band, x, mask))
 }
+
+/// Tests a variable bit `k` by shifting the word instead of building a mask: `w & (1 << k) != 0` becomes `(w >> k) & 1 != 0`.
+pub(super) fn shifted_bit_test(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    let ty = cx.func.ty(x);
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) || !ty.is_small_int() || cx.uconst(y, ty) != Some(0) || !cx.single_use(x) {
+        return None;
+    }
+    let Some(&Op::Binary(Binary::Band, a, b)) = cx.op(x) else { return None };
+    let is_bit = |m: Value| matches!(cx.op(m), Some(&Op::Binary(Binary::Ishl, one, k)) if cx.uconst(one, ty) == Some(1) && cx.sconst(k).is_none());
+    let (word, mask) = [(a, b), (b, a)].into_iter().find(|&(_, m)| is_bit(m) && cx.single_use(m))?;
+    let Some(&Op::Binary(Binary::Ishl, _, k)) = cx.op(mask) else { return None };
+    let shifted = cx.emit(ty, Op::Binary(Binary::Ushr, word, k));
+    let one = cx.emit(ty, Op::Const(1));
+    let hit = cx.emit(ty, Op::Binary(Binary::Band, shifted, one));
+    Some(Op::Icmp(cc, hit, y))
+}
