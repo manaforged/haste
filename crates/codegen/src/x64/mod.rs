@@ -528,13 +528,24 @@ impl Emit<'_> {
             emit_goto(self, default, true);
             return;
         }
-        self.get(Reg::Rax, index, Ext::Zero);
-        self.asm.mov_imm(Reg::Rcx, targets.len() as i64);
-        self.asm.alu(Alu::Cmp, Reg::Rax, Reg::Rcx);
+        let slot = match self.reg_of(index) {
+            Some(reg) if self.ty(index) == Type::I64 && !matches!(reg, Reg::Rcx | Reg::Rsp) => reg,
+            _ => {
+                self.get(Reg::Rax, index, Ext::Zero);
+                Reg::Rax
+            }
+        };
+        match i32::try_from(targets.len()) {
+            Ok(len) => self.asm.alu_imm(Alu::Cmp, slot, len),
+            Err(_) => {
+                self.asm.mov_imm(Reg::Rcx, targets.len() as i64);
+                self.asm.alu(Alu::Cmp, slot, Reg::Rcx);
+            }
+        }
         self.asm.jcc(Cond::Ae, self.blocks[self.func.jump_target(default).index()]);
         let table = self.asm.label();
         self.asm.lea_rip(Reg::Rcx, table);
-        self.asm.load_signed(Size::D, Reg::Rax, Mem::sib(Reg::Rcx, Reg::Rax, 2, 0));
+        self.asm.load_signed(Size::D, Reg::Rax, Mem::sib(Reg::Rcx, slot, 2, 0));
         self.asm.alu(Alu::Add, Reg::Rcx, Reg::Rax);
         self.asm.jmp_reg(Reg::Rcx);
         while self.asm.pos() & 3 != 0 {
