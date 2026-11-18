@@ -29,16 +29,43 @@ impl<F: Copy + PartialEq> Join<'_, F> {
     }
 
     fn rehome(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), value: usize, partner: usize) -> bool {
-        let (Some(from_reg), Some(to_reg)) = (homes[value], homes[partner]) else { return false };
-        let (Some(from), Some(to), Some((start, _))) = (self.pool.slot_of(from_reg), self.pool.slot_of(to_reg), self.live.bounds(value)) else { return false };
+        let Some(to) = homes[partner].and_then(|reg| self.pool.slot_of(reg)) else { return false };
+        self.move_to((slots, homes), value, to, partner)
+    }
+
+    /// Moves `value` into register slot `to` when it fits there and leaves no copy with a partner other than `partner` behind.
+    fn move_to(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), value: usize, to: usize, partner: usize) -> bool {
+        let Some(from_reg) = homes[value] else { return false };
+        let (Some(from), Some((start, _))) = (self.pool.slot_of(from_reg), self.live.bounds(value)) else { return false };
         let ranges = self.live.ranges_of(value);
-        if self.pool.kept[value].is_some() || self.keeps_copy(homes, value, partner, from_reg) || !self.suits(value, from, to) || !slots.free(self.pool, to, ranges, start, None) {
+        if from == to || self.pool.kept[value].is_some() || self.keeps_copy(homes, value, partner, from_reg) || !self.suits(value, from, to) || !slots.free(self.pool, to, ranges, start, None) {
             return false;
         }
         slots.remove(from, ranges, value);
         slots.insert(to, ranges, value);
-        homes[value] = Some(to_reg);
+        homes[value] = Some(self.pool.regs[to]);
         true
+    }
+
+    /// Moves the one value that holds `partner`'s register during `value` to another free register, then `value` into that register; undoes the first move when the second fails.
+    fn evict(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), value: usize, partner: usize) -> bool {
+        let Some(to) = homes[partner].and_then(|reg| self.pool.slot_of(reg)) else { return false };
+        let mut blockers = Vec::new();
+        slots.collect_overlaps(to, self.live.ranges_of(value), &mut blockers);
+        blockers.dedup();
+        let [blocker] = blockers[..] else { return false };
+        if blocker == partner || blocker == value {
+            return false;
+        }
+        let Some(old) = (0..self.pool.regs.len()).find(|&other| other != to && homes[value] != Some(self.pool.regs[other]) && self.move_to((&mut *slots, &mut *homes), blocker, other, usize::MAX)) else { return false };
+        if self.move_to((&mut *slots, &mut *homes), value, to, partner) {
+            return true;
+        }
+        let ranges = self.live.ranges_of(blocker);
+        slots.remove(old, ranges, blocker);
+        slots.insert(to, ranges, blocker);
+        homes[blocker] = Some(self.pool.regs[to]);
+        false
     }
 
     /// Gives each edge argument of `args` and its parameter one register when one of them can take the other's without losing another copy, in list order.
@@ -47,9 +74,10 @@ impl<F: Copy + PartialEq> Join<'_, F> {
             if param == arg || homes[param].is_none() || homes[param] == homes[arg] {
                 continue;
             }
-            if !self.rehome((&mut *slots, &mut *homes), arg, param) {
-                self.rehome((&mut *slots, &mut *homes), param, arg);
-            }
+            let _ = self.rehome((&mut *slots, &mut *homes), arg, param)
+                || self.rehome((&mut *slots, &mut *homes), param, arg)
+                || self.evict((&mut *slots, &mut *homes), arg, param)
+                || self.evict((&mut *slots, &mut *homes), param, arg);
         }
     }
 
