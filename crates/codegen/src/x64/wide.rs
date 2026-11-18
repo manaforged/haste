@@ -1,6 +1,6 @@
 use super::Emit;
 use crate::frame::Ext;
-use super::asm::{Alu, Cond, Count, Group3, Reg, Shift, Size};
+use super::asm::{Alu, Cond, Count, Group3, Reg, Rm, Shift, Size};
 use crate::ir::{Binary, Function, Inst, IntCC, Op, TargetOpId, Type, Unary, Value};
 use crate::wide::half_score;
 
@@ -40,6 +40,15 @@ pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>) -> V
     }
     let held = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_));
     let moved = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_) | crate::alloc::Location::Slot);
+    let defs = crate::fold::defs(func);
+    let in_memory = |value: Value| {
+        plan.elided[value.index()]
+            && defs[value.index()].is_some_and(|inst| match func.insts[inst.index()].op {
+                Op::Load(addr, _) => held(addr),
+                Op::StackLoad(..) => true,
+                _ => false,
+            })
+    };
     let mut flag = vec![false; func.types.len()];
     for block in &func.blocks {
         for (at, &inst) in block.insts.iter().enumerate() {
@@ -51,13 +60,13 @@ pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>) -> V
                 if let Some((_, &[carry, a, b])) = carry_op(op)
                     && carry == out
                     && moved(a)
-                    && moved(b)
+                    && (moved(b) || in_memory(b))
                 {
                     consumers += 1;
                     continue;
                 }
                 let safe = match *op {
-                    Op::Load(addr, _) => held(addr) && func.insts[next.index()].result.is_some_and(moved),
+                    Op::Load(addr, _) => held(addr) && func.insts[next.index()].result.is_some_and(|r| moved(r) || in_memory(r)),
                     Op::Store(value, addr, _) => held(addr) && held(value),
                     _ => false,
                 };
@@ -118,10 +127,17 @@ impl Emit<'_> {
             let busy = [self.reg_of(b), self.reg_of(carry)];
             let target = Some(self.dst(result)).filter(|&reg| !out && !matches!(reg, Reg::Rdx | Reg::Rcx | Reg::Rsp) && !busy.contains(&Some(reg))).unwrap_or(Reg::Rax);
             self.get(target, a, Ext::Zero);
-            let source = self.reg_of(b).filter(|&reg| !matches!(reg, Reg::Rdx | Reg::Rsp) && reg != target).unwrap_or_else(|| {
-                self.get(Reg::Rcx, b, Ext::Zero);
-                Reg::Rcx
-            });
+            let source: Rm = match self.elided_mem(b) {
+                Some(mem) => mem.into(),
+                None => self
+                    .reg_of(b)
+                    .filter(|&reg| !matches!(reg, Reg::Rdx | Reg::Rsp) && reg != target)
+                    .unwrap_or_else(|| {
+                        self.get(Reg::Rcx, b, Ext::Zero);
+                        Reg::Rcx
+                    })
+                    .into(),
+            };
             if !(kept && held(self)) {
                 if self.flag_carry[carry.index()] {
                     return Err(format!("the carry flag lost the elided carry {carry:?}"));

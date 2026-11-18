@@ -7,7 +7,7 @@ use super::super::asm::Reg;
 use super::super::features::Features;
 use super::super::frame::SAVED;
 use crate::alloc::{Location, Plan};
-use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Op, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Op, TargetOpId, Type, Unary, Value};
 use crate::live::{Sib, SibBase};
 
 pub(super) struct FuseCtx<'a> {
@@ -347,6 +347,9 @@ fn load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
         Op::Convert(Convert::Uextend | Convert::Sextend, _) => ty.bytes() <= 4 && non_wide,
         Op::Convert(Convert::Ireduce, _) => ty.bytes() <= 8 && non_wide,
         Op::Binary(..) => load_binop_ok(ctx, features, linst, load_res, udata),
+        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut, ref args) => {
+            carry_load_ok(ctx, linst, load_res, (args.as_slice(), udata.result))
+        }
         Op::Unary(Unary::Clz, _) => matches!(ty, Type::I32 | Type::I64) && features.lzcnt,
         Op::Unary(Unary::Ctz, _) => matches!(ty, Type::I32 | Type::I64) && features.bmi1,
         Op::Unary(Unary::Popcnt, _) => matches!(ty, Type::I32 | Type::I64) && features.popcnt,
@@ -379,8 +382,9 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             };
             let pair = low_of_pair(func, block, pos);
             paired.extend(pair);
+            let reads_nothing = pair.is_some() || carry_out_of_pair(func, block, pos);
             data.op.for_operands(|v| {
-                if pair.is_some() && is_load(func, &defs, v) {
+                if reads_nothing && is_load(func, &defs, v) {
                     return;
                 }
                 uses[v.index()] += 1;
@@ -729,6 +733,32 @@ fn fold_products(func: &Function, plan: &mut Plan<Reg>, uses: &[u32], defs: &[Op
                 plan.elided[half.index()] = true;
             }
         }
+    }
+}
+
+/// Whether an `adc` or `sbb` may read `load_res` from memory as its added operand: the address survives the writes to rax, rcx, rdx and the result register that come first.
+fn carry_load_ok(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (args, result): (&[Value], Option<Value>)) -> bool {
+    let &[carry, a, b] = args else { return false };
+    if b != load_res || a == b || carry == b || ctx.func.ty(load_res) != Type::I64 {
+        return false;
+    }
+    match ctx.func.insts[linst.index()].op {
+        Op::Load(addr, _) => {
+            let result_reg = result.and_then(|r| ctx.plan.reg_of(r));
+            ![Reg::Rax, Reg::Rcx, Reg::Rdx].into_iter().chain(result_reg).any(|reg| addr_reads(ctx.func, ctx.plan, ctx.defs, addr, reg))
+        }
+        Op::StackLoad(..) => true,
+        _ => false,
+    }
+}
+
+/// Whether the instruction at `pos` takes the carry out of the `adc` or `sbb` just before it on the same operands, so it reads only the flags.
+fn carry_out_of_pair(func: &Function, block: &crate::ir::BlockData, pos: usize) -> bool {
+    let Some(prev) = pos.checked_sub(1) else { return false };
+    match (&func.insts[block.insts[prev].index()].op, &func.insts[block.insts[pos].index()].op) {
+        (Op::TargetOp(TargetOpId::X64AddCarry, sum), Op::TargetOp(TargetOpId::X64AddCarryOut, out))
+        | (Op::TargetOp(TargetOpId::X64SubBorrow, sum), Op::TargetOp(TargetOpId::X64SubBorrowOut, out)) => sum.as_slice() == out.as_slice(),
+        _ => false,
     }
 }
 
