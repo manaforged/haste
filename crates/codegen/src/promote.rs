@@ -8,6 +8,8 @@ mod join_slots;
 mod vec_slot;
 #[path = "promote/box_fwd.rs"]
 mod box_fwd;
+#[path = "promote/cold_copy.rs"]
+mod cold_copy;
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, InstData, Op, StackSlot, Type, Value};
 use crate::split::{End, Layouts};
@@ -686,7 +688,7 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     };
     let params = crate::copy::forward_param_slots(func);
     let returned = crate::copy::forward_sret_slot(func);
-    let join_changed = pre_split(func, moves);
+    let join_changed = pre_split(func, moves) | cold_copy::run(func);
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
     let mut copy_splits = Vec::new();
