@@ -334,12 +334,18 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided:
             _ => None,
         };
     }
+    let mut called = vec![0u32; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if let Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } = &func.insts[inst.index()].op && !args.contains(callee) {
+            called[callee.index()] += 1;
+        }
+    }
     let mut left = census.uses.clone();
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } = &func.insts[inst.index()].op
-            && census.uses[callee.index()] == 1
             && !args.contains(callee)
             && let Some((target, addr)) = loads[callee.index()]
+            && (census.uses[callee.index()] == 1 || (addr.is_none() && census.uses[callee.index()] == called[callee.index()]))
         {
             through[callee.index()] = Some(target);
             elided[callee.index()] = true;
