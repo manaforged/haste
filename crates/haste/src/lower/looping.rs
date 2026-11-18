@@ -202,6 +202,9 @@ impl Lower<'_, '_> {
         let Some(tried) = self.typed.tries.get(&expr).cloned() else { bail!("`?` has no `Try` calls") };
         let (Res::Fn(branch, branch_substs), Res::Fn(from, from_substs)) = (tried.branch, tried.from_residual) else { bail!("`?` calls are not functions") };
         let value = self.expr(inner)?;
+        if let Some(output) = self.plain_try(expr, inner, value, &tried)? {
+            return Ok(output);
+        }
         let flow = self.invoke(SiteOrigin::Table(SiteKey::TryBranch(expr)), branch, branch_substs, value.into_iter().collect())?;
         let Some(flow) = self.spill(flow, tried.flow)? else { return self.zero_sized_try(expr, &tried, (from, from_substs)) };
         let Some(stopped) = self.is_variant(Some(flow), tried.flow, tried.stop)? else { return self.always_stop(expr, Some(flow), &tried, (from, from_substs)) };
@@ -212,6 +215,46 @@ impl Lower<'_, '_> {
         self.enter(proceed);
         let output = self.variant_field(flow, tried.flow, (tried.proceed, 0))?;
         Ok(self.read(output))
+    }
+
+    /// Lowers `?` on a `Result` or `Option` of core too large for a register pair by testing its tag where it lies and reading the `Ok` or `Some` payload in place, building the residual itself on the way out, or `None` when `inner` is no such enum.
+    fn plain_try(&mut self, expr: ExprId, inner: ExprId, value: Option<Value>, tried: &Tried) -> Result<Option<Option<Value>>> {
+        let (Res::Fn(branch, _), Res::Fn(from, from_substs)) = (tried.branch, tried.from_residual) else { return Ok(None) };
+        let Some(block) = self.cx.owner_impl(branch) else { return Ok(None) };
+        let names = match self.cx.impl_self_name(block).as_deref() {
+            Some("Result") => ("Ok", "Err"),
+            Some("Option") => ("Some", "None"),
+            _ => return Ok(None),
+        };
+        if self.cx.outline.roots[branch.krate as usize].name != "core" {
+            return Ok(None);
+        }
+        let ty = self.ty_of(inner);
+        let (proceed, stop) = (self.variant_index(ty, names.0)?, self.variant_index(ty, names.1)?);
+        let whole @ Repr::Mem { size: 17.., .. } = repr(self.cx, ty)? else { return Ok(None) };
+        let place = match value {
+            Some(address) if matches!(self.body.expr(inner), Expr::Call(..) | Expr::Method { .. }) => Some(Place { base: super::place::Base::Addr(address), offset: 0, repr: whole }),
+            _ => self.spill(value, ty)?,
+        };
+        let Some(proceeds) = self.is_variant(place, ty, proceed)? else { return Ok(None) };
+        let Some(place) = place else { return Ok(None) };
+        let (leave, onward) = (self.b.create_block(), self.b.create_block());
+        self.brif(proceeds, (onward, &[]), (leave, &[]));
+        self.enter(leave);
+        let Kind::Adt(_, flow_args) = *self.cx.types.kind(tried.flow) else { bail!("`?` flows through no `ControlFlow`") };
+        let residual_ty = self.cx.types.substs(flow_args)[0];
+        let payload = match names.1 {
+            "Err" => {
+                let error = self.variant_field(place, ty, (stop, 0))?;
+                vec![(0, self.read(error))]
+            }
+            _ => Vec::new(),
+        };
+        let residual = self.construct(residual_ty, stop, payload, None)?;
+        self.leave_residual(expr, tried, (from, from_substs), residual.into_iter().collect())?;
+        self.enter(onward);
+        let output = self.variant_field(place, ty, (proceed, 0))?;
+        Ok(Some(self.read(output)))
     }
 
     /// Lowers `?` on a zero-sized `ControlFlow`, whose one inhabited variant says at compile time whether it proceeds or stops.

@@ -80,12 +80,13 @@ impl Lower<'_, '_> {
         self.construct(poll, index, payload.map(|value| (0, Some(value))).into_iter().collect(), None)
     }
 
-    fn variant_index(&mut self, ty: Ty, name: &str) -> Result<u32> {
-        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else { bail!("`Poll` is not an enum") };
+    /// The index of the variant called `name` of the enum `ty`.
+    pub(super) fn variant_index(&mut self, ty: Ty, name: &str) -> Result<u32> {
+        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else { bail!("`{name}` names a variant of no enum") };
         let def = self.cx.adt_def(item)?;
         let src = self.cx.item(item).0;
         let found = def.variants.iter().find(|variant| crate::names::plain(src.text(variant.name)) == name);
-        found.map(|variant| variant.index).ok_or_else(|| anyhow::anyhow!("`Poll` has no `{name}`"))
+        found.map(|variant| variant.index).ok_or_else(|| anyhow::anyhow!("the enum has no variant `{name}`"))
     }
 
     fn return_poll(&mut self, value: Option<Value>, done: bool) -> Result<()> {
