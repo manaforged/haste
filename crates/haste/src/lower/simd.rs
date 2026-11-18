@@ -13,6 +13,9 @@ use super::ops::{Num, compare, parse_float};
 use super::reloc::SiteOrigin;
 use super::{Lower, host_is_x64_or_arm64, machine, repr};
 
+/// The alignment shift of the frame slots that SIMD lowering keeps vectors in: the frame's own, since their loads and stores do not need more.
+pub(super) const SCRATCH_ALIGN: u8 = 4;
+
 mod fallback;
 mod lanes;
 mod scalar;
@@ -37,13 +40,7 @@ impl Lanes {
     }
 
     pub(super) fn align_shift(self) -> u8 {
-        if self.bytes() >= 32 {
-            5
-        } else if self.bytes() >= 16 {
-            4
-        } else {
-            3
-        }
+        if self.bytes() >= 16 { SCRATCH_ALIGN } else { 3 }
     }
 
     pub(super) fn widened(self) -> Option<(Self, Type)> {

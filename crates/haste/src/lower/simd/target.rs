@@ -5,6 +5,7 @@ use crate::host::{HostSymbol, X86Symbol};
 use crate::names::Primitive;
 
 use super::super::Lower;
+use super::SCRATCH_ALIGN;
 use super::wide::wide_quads;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,7 +50,7 @@ impl Lower<'_, '_> {
         if let Some(value) = self.wide_binary(TargetOpId::X64Pshufb256, table, index) {
             return Ok(value);
         }
-        let slot = self.b.create_stack_slot(32, 5);
+        let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
         let lo = self.shuffle_dyn_16(table, index, false, 0);
         let hi = self.shuffle_dyn_16(table, index, false, 16);
         self.ins().stack_store(lo, slot, 0);
@@ -143,7 +144,7 @@ impl Lower<'_, '_> {
         if x86.host_addr().is_none() {
             bail!("{} has no host function on this machine", x86.link_name());
         }
-        let slot = self.b.create_stack_slot(x86.out_bytes(), 5);
+        let slot = self.b.create_stack_slot(x86.out_bytes(), SCRATCH_ALIGN);
         let out = self.ins().stack_addr(Type::I64, slot, 0);
         let values: Vec<Value> = std::iter::once(out).chain(args.iter().copied()).collect();
         self.call_host(HostSymbol::X86(x86), &values, None);
@@ -204,7 +205,7 @@ impl Lower<'_, '_> {
                 Ok(Some(self.emit_chunks(x86.out_bytes(), product)))
             }
             (X86Symbol::Permd, &[a, index]) => {
-                let slot = self.b.create_stack_slot(32, 5);
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
                 for lane in 0..8 {
                     let at = self.ins().load(Type::I32, index, lane * 4);
                     let seven = self.ins().iconst(Type::I32, 7);
@@ -232,7 +233,7 @@ impl Lower<'_, '_> {
             }
             (X86Symbol::Packsswb256 | X86Symbol::Packuswb256, &[a, b]) => {
                 let signed = x86 == X86Symbol::Packsswb256;
-                let slot = self.b.create_stack_slot(32, 5);
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
                 self.pack_sat_half(i16x8, i8x8, signed, (a, b), (slot, 0));
                 self.pack_sat_half(i16x8, i8x8, signed, (a, b), (slot, 16));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
@@ -244,7 +245,7 @@ impl Lower<'_, '_> {
             }
             (X86Symbol::Packssdw256 | X86Symbol::Packusdw256, &[a, b]) => {
                 let signed = x86 == X86Symbol::Packssdw256;
-                let slot = self.b.create_stack_slot(32, 5);
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
                 self.pack_sat_half(i32x4, i16x4, signed, (a, b), (slot, 0));
                 self.pack_sat_half(i32x4, i16x4, signed, (a, b), (slot, 16));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
@@ -268,7 +269,7 @@ impl Lower<'_, '_> {
                 if let Some(v) = self.wide_binary(TargetOpId::X64Psadbw256, a, b) {
                     return Ok(Some(v));
                 }
-                let slot = self.b.create_stack_slot(32, 5);
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
                 self.psadbw_128((a, b), (slot, 0));
                 self.psadbw_128((a, b), (slot, 16));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
@@ -388,7 +389,7 @@ impl Lower<'_, '_> {
             }
             (X86Symbol::Pmulhrsw128 | X86Symbol::Pmulhrsw256, &[a, b]) => {
                 let wide = x86 == X86Symbol::Pmulhrsw256;
-                let slot = self.b.create_stack_slot(if wide { 32 } else { 16 }, if wide { 5 } else { 4 });
+                let slot = self.b.create_stack_slot(if wide { 32 } else { 16 }, SCRATCH_ALIGN);
                 self.pmulhrsw_128(a, b, slot, 0);
                 if wide {
                     self.pmulhrsw_128(a, b, slot, 16);
@@ -405,7 +406,7 @@ impl Lower<'_, '_> {
 
     /// The address of a new `bytes`-byte frame slot that holds each 16-byte chunk `chunk` gives for its offset.
     fn emit_chunks(&mut self, bytes: u32, mut chunk: impl FnMut(&mut Self, i32) -> Value) -> Value {
-        let slot = self.b.create_stack_slot(bytes, 5);
+        let slot = self.b.create_stack_slot(bytes, SCRATCH_ALIGN);
         let offsets: Vec<i32> = (0..bytes as i32).step_by(16).collect();
         let values: Vec<Value> = offsets.iter().map(|&off| chunk(self, off)).collect();
         for (off, value) in offsets.into_iter().zip(values) {

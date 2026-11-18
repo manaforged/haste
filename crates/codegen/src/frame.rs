@@ -2,7 +2,8 @@ use crate::alloc::{Location, Plan, Regs};
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, Signature, Type, Value};
 
 pub(crate) const WORD: u32 = 8;
-const MAX_ALIGN_SHIFT: u8 = 4;
+/// The most alignment, as a shift, that the frame gives a slot.
+pub(crate) const MAX_ALIGN_SHIFT: u8 = 4;
 pub(crate) const PAGE: u32 = 4096;
 pub(crate) const INCOMING: i32 = 16;
 const EDGE_SLOT: u32 = 16;

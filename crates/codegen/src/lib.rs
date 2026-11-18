@@ -25,6 +25,7 @@ mod lsr;
 pub(crate) mod mem;
 mod merge;
 mod native;
+mod overalign;
 mod pairs;
 mod park;
 mod promote;
@@ -181,6 +182,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }
     native::lower(&mut func);
+    overalign::lower(&mut func);
     verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
         Arch::X64 => x64::compile(&func, target),
