@@ -331,7 +331,8 @@ impl Splitter<'_> {
         if self.word(al) == Some(0) || self.word(bl) == Some(0) {
             return (lo, high);
         }
-        let carry = self.emit(Op::Icmp(IntCC::UnsignedLessThan, lo, al), Type::I8);
+        let base = if self.word(bl).is_some() { bl } else { al };
+        let carry = self.emit(Op::Icmp(IntCC::UnsignedLessThan, lo, base), Type::I8);
         let carry = self.widen(carry);
         (lo, self.bin(Binary::Iadd, high, carry))
     }

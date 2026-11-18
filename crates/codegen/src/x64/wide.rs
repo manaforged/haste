@@ -101,6 +101,30 @@ pub(super) fn overflow_reads(func: &Function) -> Vec<bool> {
     read
 }
 
+/// Marks each sum whose carry compare an `adc` or `sbb` absorbed, directly or through an absorbed widen, so the sum must set the carry flag.
+pub(super) fn adc_sums(func: &Function, plan: &crate::alloc::Plan<Reg>, defs: &[Option<crate::ir::Inst>]) -> Vec<bool> {
+    let mut marked = vec![false; func.types.len()];
+    let op_of = |v: Value| defs[v.index()].map(|inst| &func.insts[inst.index()].op);
+    let sum_of = |sum: Value, operand: Value| matches!(op_of(sum), Some(&Op::Binary(Binary::Iadd, a, b)) if a == operand || b == operand);
+    for data in func.blocks.iter().flat_map(|block| &block.insts).map(|inst| &func.insts[inst.index()]) {
+        let Op::Binary(Binary::Iadd | Binary::Isub, x, y) = data.op else { continue };
+        for operand in [x, y].into_iter().filter(|v| plan.elided[v.index()]) {
+            let compare = match op_of(operand) {
+                Some(&Op::Convert(crate::ir::Convert::Uextend, inner)) if plan.elided[inner.index()] => inner,
+                _ => operand,
+            };
+            if let Some(&Op::Icmp(_, a, b)) = op_of(compare) {
+                for (sum, other) in [(a, b), (b, a)] {
+                    if sum_of(sum, other) {
+                        marked[sum.index()] = true;
+                    }
+                }
+            }
+        }
+    }
+    marked
+}
+
 fn icmp_order(cc: IntCC) -> (bool, Cond) {
     match cc {
         IntCC::SignedLessThan => (false, Cond::L),

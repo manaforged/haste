@@ -94,6 +94,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let slow_thunk = asm.label();
     let defs = crate::fold::defs(func);
     let overflow_read = wide::overflow_reads(func);
+    let adc_sum = wide::adc_sums(func, &plan, &defs);
     let flag_carry = wide::flag_carries(func, &plan);
     let last_block = order.last().copied();
     let emit = Emit {
@@ -132,6 +133,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         in_fast_ret: false,
         low_product: None,
         overflow_read,
+        adc_sum,
         flag_carry,
         carry_flags: None,
         tails: Tails::new(),
@@ -207,6 +209,8 @@ pub(super) struct Emit<'a> {
     in_fast_ret: bool,
     low_product: Option<(Value, Value)>,
     overflow_read: Vec<bool>,
+    /// The sums whose carry an adc or sbb reads through a compare it absorbed.
+    adc_sum: Vec<bool>,
     /// The carry outs that the carry flag alone hands to their only consumers.
     flag_carry: Vec<bool>,
     carry_flags: Option<(bool, [Value; 3])>,

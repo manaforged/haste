@@ -298,6 +298,7 @@ impl Emit<'_> {
             if matches!(size, Size::D | Size::Q)
                 && matches!(alu, Alu::Add | Alu::Sub)
                 && !self.plan.fused[result.index()]
+                && !(self.adc_sum[result.index()] && self.asm.held_carry().is_none())
                 && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x)).filter(|&rx| (rx != dst || self.asm.held_carry().is_some()) && rx != Reg::Rsp)
             {
                 if let Some(imm) = disp {
@@ -328,7 +329,7 @@ impl Emit<'_> {
                     }
                 }
             }
-            if matches!(alu, Alu::Add | Alu::Sub) && matches!(ty, Type::I32 | Type::I64) && self.overflow_read[result.index()] {
+            if matches!(alu, Alu::Add | Alu::Sub) && matches!(ty, Type::I32 | Type::I64) && (self.overflow_read[result.index()] || self.adc_sum[result.index()]) {
                 self.asm.hold_carry(super::wide::overflow_tag(result));
             }
             if self.plan.fused[result.index()] {
