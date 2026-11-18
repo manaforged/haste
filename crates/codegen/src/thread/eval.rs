@@ -294,12 +294,13 @@ pub(super) fn eval_cond_truth(func: &Function, cx: &ThreadCx<'_>, state: &EvalSt
     state.edge_cmps.iter().find_map(|&(v, v_ty, cc1, imm1)| (v == cond_val).then(|| cmp_implies(v_ty, cc1, imm1, IntCC::NotEqual, 0)).flatten())
 }
 
-pub(super) fn is_bool_val(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> bool {
+/// Whether `v` is 0 or 1 because a compare, a widen or narrow of one, or an and with 1 defines it.
+pub(crate) fn is_bool_val(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> bool {
     let Some(inst) = defs.get(v.index()).copied().flatten() else { return false };
     let is_one = |u: Value| consts.get(u.index()).copied().flatten() == Some(1);
     match func.insts[inst.index()].op {
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => true,
-        Op::Convert(Convert::Uextend, inner) => is_bool_val(func, defs, consts, inner),
+        Op::Convert(Convert::Uextend | Convert::Ireduce, inner) => is_bool_val(func, defs, consts, inner),
         Op::Binary(Binary::Band, a, b) => is_one(a) || is_one(b) || is_bool_val(func, defs, consts, a) || is_bool_val(func, defs, consts, b),
         Op::Binary(Binary::Bxor, a, b) => (is_one(b) && is_bool_val(func, defs, consts, a)) || (is_one(a) && is_bool_val(func, defs, consts, b)),
         _ => false,

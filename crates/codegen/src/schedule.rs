@@ -1,3 +1,4 @@
+mod branches;
 mod copies;
 mod products;
 mod sink;
@@ -416,6 +417,9 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     }
     if moves != promote::Moves::Guided {
         sink::run(func, moves == promote::Moves::Split && target.effort == Effort::Full);
+    }
+    if target.arch == crate::Arch::X64 && effort == Effort::Full {
+        branches::split_conditions(func);
     }
     sink_compares(func);
     if target.arch == crate::Arch::X64 && effort == Effort::Full {

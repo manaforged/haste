@@ -8,8 +8,9 @@ mod widen;
 use crate::fold::extend;
 use crate::ir::{Block, Domain, Function, Inst, InstData, IntCC, Op, SigRef, Value};
 
+pub(crate) use self::eval::is_bool_val;
 use self::eval::{
-    EdgeSeed, EvalState, ThreadCx, bind, cmp_implies, eval_cond_truth, eval_op, fact_of, is_bool_val, lookup, lookup_const, seed_edge,
+    EdgeSeed, EvalState, ThreadCx, bind, cmp_implies, eval_cond_truth, eval_op, fact_of, lookup, lookup_const, seed_edge,
     step_inst,
 };
 

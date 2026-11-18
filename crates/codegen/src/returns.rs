@@ -346,7 +346,8 @@ struct JumpGroupKey {
     const_outs: Vec<Option<i64>>,
 }
 
-fn collect_consts(func: &Function) -> Vec<Option<i64>> {
+/// The constant each value holds when a `Const` in a block defines it.
+pub(crate) fn collect_consts(func: &Function) -> Vec<Option<i64>> {
     let mut consts = vec![None; func.types.len()];
     for block in &func.blocks {
         for &inst in &block.insts {
