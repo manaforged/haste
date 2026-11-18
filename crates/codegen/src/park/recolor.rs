@@ -13,9 +13,12 @@ pub(super) struct Join<'a, F> {
     pub(super) reverse_reuse: &'a [Option<Value>],
 }
 
+/// The most values `chain` gathers into one group move.
+const CHAIN: usize = 8;
+
 impl<F: Copy + PartialEq> Join<'_, F> {
-    fn keeps_copy(&self, homes: &[Option<F>], value: usize, partner: usize, reg: F) -> bool {
-        let at = |q: usize| q != partner && homes.get(q).copied().flatten() == Some(reg);
+    fn keeps_copy(&self, homes: &[Option<F>], value: usize, except: &[usize], reg: F) -> bool {
+        let at = |q: usize| !except.contains(&q) && homes.get(q).copied().flatten() == Some(reg);
         let reuse = [self.hints.reuse[value], self.reverse_reuse.get(value).copied().flatten()];
         self.back_partners[value].iter().any(|&q| at(q))
             || self.hints.partners.is_some_and(|m| m[value].iter().any(|q| at(q.index())))
@@ -30,20 +33,51 @@ impl<F: Copy + PartialEq> Join<'_, F> {
 
     fn rehome(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), value: usize, partner: usize) -> bool {
         let Some(to) = homes[partner].and_then(|reg| self.pool.slot_of(reg)) else { return false };
-        self.move_to((slots, homes), value, to, partner)
+        let chain = self.chain(homes, value);
+        self.move_group((slots, homes), &chain, to, partner)
+    }
+
+    /// `value` and the values that reuse its register in place or whose register it reuses, transitively, while they share its register.
+    fn chain(&self, homes: &[Option<F>], value: usize) -> Vec<usize> {
+        let mut chain = vec![value];
+        let mut at = 0;
+        while self.hints.two_address && at < chain.len() && chain.len() < CHAIN {
+            let next = chain[at];
+            at += 1;
+            for q in [self.hints.reuse[next], self.reverse_reuse.get(next).copied().flatten()].into_iter().flatten().map(|q| q.index()) {
+                if !chain.contains(&q) && homes.get(q).copied().flatten().is_some() && homes[q] == homes[value] {
+                    chain.push(q);
+                }
+            }
+        }
+        chain
     }
 
     /// Moves `value` into register slot `to` when it fits there and leaves no copy with a partner other than `partner` behind.
-    fn move_to(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), value: usize, to: usize, partner: usize) -> bool {
-        let Some(from_reg) = homes[value] else { return false };
-        let (Some(from), Some((start, _))) = (self.pool.slot_of(from_reg), self.live.bounds(value)) else { return false };
-        let ranges = self.live.ranges_of(value);
-        if from == to || self.pool.kept[value].is_some() || self.keeps_copy(homes, value, partner, from_reg) || !self.suits(value, from, to) || !slots.free(self.pool, to, ranges, start, None) {
+    fn move_to(&self, homes: (&mut SlotSet, &mut [Option<F>]), value: usize, to: usize, partner: usize) -> bool {
+        self.move_group(homes, &[value], to, partner)
+    }
+
+    /// Moves every value of `group`, which share one register, into register slot `to` when each fits there and none leaves a copy behind with a value outside the group other than `partner`.
+    fn move_group(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), group: &[usize], to: usize, partner: usize) -> bool {
+        let Some(from_reg) = homes[group[0]] else { return false };
+        let Some(from) = self.pool.slot_of(from_reg) else { return false };
+        let except: Vec<usize> = group.iter().copied().chain([partner]).collect();
+        let fits = |value: usize| {
+            self.live.bounds(value).is_some_and(|(start, _)| slots.free(self.pool, to, self.live.ranges_of(value), start, None))
+                && self.pool.kept[value].is_none()
+                && !self.keeps_copy(homes, value, &except, from_reg)
+                && self.suits(value, from, to)
+        };
+        if from == to || !group.iter().all(|&value| fits(value)) {
             return false;
         }
-        slots.remove(from, ranges, value);
-        slots.insert(to, ranges, value);
-        homes[value] = Some(self.pool.regs[to]);
+        for &value in group {
+            let ranges = self.live.ranges_of(value);
+            slots.remove(from, ranges, value);
+            slots.insert(to, ranges, value);
+            homes[value] = Some(self.pool.regs[to]);
+        }
         true
     }
 
