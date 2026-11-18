@@ -16,7 +16,10 @@ pub(super) fn debug_line(text_va: u64, text_len: u32, lines: &[(u32, u64)], path
     let mut index: FxHashMap<u32, u32> = FxHashMap::default();
     let mut rows = Vec::with_capacity(lines.len());
     for &(at, place) in lines {
-        let Some(&path) = by_key.get(&((place >> 32) as u32)) else { continue };
+        let Some(&path) = by_key.get(&((place >> 32) as u32)) else {
+            rows.push((at, 0, 0));
+            continue;
+        };
         let file = *index.entry((place >> 32) as u32).or_insert_with(|| {
             files.push((path, line_starts(path)));
             files.len() as u32
@@ -24,7 +27,7 @@ pub(super) fn debug_line(text_va: u64, text_len: u32, lines: &[(u32, u64)], path
         let line = files[file as usize - 1].1.partition_point(|&start| start <= place as u32);
         rows.push((at, file, line as i64));
     }
-    if rows.is_empty() {
+    if files.is_empty() {
         return Vec::new();
     }
     rows.sort_by_key(|&(at, ..)| at);
@@ -32,7 +35,7 @@ pub(super) fn debug_line(text_va: u64, text_len: u32, lines: &[(u32, u64)], path
     let (mut file, mut line) = (1, 1);
     for (at, row_file, row_line) in rows {
         set_address(&mut program, text_va + u64::from(at));
-        if row_file != file {
+        if row_file != 0 && row_file != file {
             program.push(4);
             uleb(&mut program, u64::from(row_file));
             file = row_file;

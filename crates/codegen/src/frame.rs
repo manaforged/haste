@@ -638,26 +638,34 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
     emit.clear_flags();
     let func = emit.func();
     let insts = &func.blocks[block.index()].insts;
-    for &inst in insts {
+    let (mut ahead, mut loc) = (0, 0);
+    for (k, &inst) in insts.iter().enumerate() {
         let data = &func.insts[inst.index()];
         if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
             continue;
         }
-        if data.loc != 0 {
-            let at = emit.pos();
-            let lines = emit.lines();
-            match lines.last_mut() {
-                Some(last) if last.1 == data.loc => {}
-                Some(last) if last.0 == at => last.1 = data.loc,
-                _ => lines.push((at, data.loc)),
-            }
+        if ahead <= k {
+            ahead = insts[k..].iter().position(|i| func.insts[i.index()].loc != 0).map_or(insts.len(), |at| k + at);
+            loc = insts.get(ahead).map_or(loc, |i| func.insts[i.index()].loc);
         }
+        mark_line(emit, loc);
         emit.inst(inst)?;
     }
     if !insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator()) {
         emit.trap();
     }
     Ok(())
+}
+
+/// Starts a line-table row for `loc` at the current offset unless the open row already has it; 0 marks code with no source.
+fn mark_line<'a, E: Emitter<'a>>(emit: &mut E, loc: u64) {
+    let at = emit.pos();
+    let lines = emit.lines();
+    match lines.last_mut() {
+        Some(last) if last.1 == loc => {}
+        Some(last) if last.0 == at => last.1 = loc,
+        _ => lines.push((at, loc)),
+    }
 }
 
 fn entry_has_preds(func: &Function, order: &[Block], entry: Block) -> bool {
@@ -668,6 +676,7 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
     let func = emit.func();
     let entry = func.entry.ok_or("the function has no entry block")?;
     let mut starts = Vec::with_capacity(order.len() + 1);
+    mark_line(&mut emit, 0);
     if !emit.deferred_prologue() {
         emit.prologue();
     }
