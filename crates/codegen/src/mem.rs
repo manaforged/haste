@@ -304,12 +304,14 @@ pub(crate) fn compute_affine(func: &Function) -> Vec<(Value, i64)> {
 }
 
 impl Provenance {
-    fn build(func: &Function, cfg: &Cfg, is_spill: Option<&[bool]>, affine: Option<Vec<(Value, i64)>>) -> Self {
+    fn build(func: &Function, cfg: &Cfg, (is_spill, positions): (Option<&[bool]>, bool), affine: Option<Vec<(Value, i64)>>) -> Self {
         let affine = affine.unwrap_or_else(|| compute_affine(func));
         let tracked = compute_tracked_roots(func, cfg, &affine);
         let mut prov = Self::from_roots(func, cfg, &tracked, affine);
         let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, is_spill);
-        prov.frontiers = escape::frontiers(func, &esc);
+        if positions {
+            prov.frontiers = escape::frontiers(func, &esc);
+        }
         prov.unescaped_slots = esc.unescaped;
         prov.call_readonly_slots = esc.call_readonly;
         prov.return_only_slots = esc.return_only;
@@ -358,22 +360,22 @@ impl Provenance {
     }
 
     pub(crate) fn new(func: &Function, cfg: &Cfg) -> Self {
-        Self::build(func, cfg, None, None)
+        Self::build(func, cfg, (None, false), None)
     }
 
-    /// Like `new`, taking `affine` when the caller already holds `compute_affine` of this exact function.
+    /// Like `new`, taking `affine` when the caller already holds `compute_affine` of this exact function, and also finding where each slot escapes so a call before that point may skip it.
     pub(crate) fn with_affine(func: &Function, cfg: &Cfg, affine: Option<Vec<(Value, i64)>>) -> Self {
-        Self::build(func, cfg, None, affine)
+        Self::build(func, cfg, (None, true), affine)
     }
 
     pub(crate) fn compute(func: &Function) -> Self {
         let cfg = func.cfg();
-        Self::build(func, &cfg, None, None)
+        Self::build(func, &cfg, (None, false), None)
     }
 
     pub(crate) fn compute_with_spills(func: &Function, is_spill: Option<&[bool]>) -> Self {
         let cfg = func.cfg();
-        Self::build(func, &cfg, is_spill, None)
+        Self::build(func, &cfg, (is_spill, false), None)
     }
 
     pub(crate) fn loc(&self, addr: Value, offset: i64, size: u32) -> MemLoc {
