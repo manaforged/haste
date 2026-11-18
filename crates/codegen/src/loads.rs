@@ -5,6 +5,7 @@ mod dom;
 mod elide;
 mod join;
 mod pack;
+mod regroup;
 mod remat;
 mod sink;
 
@@ -803,5 +804,6 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
             changed |= elide::forward_moves(func, &prov);
         }
     }
+    changed |= regroup::run(func);
     domain(changed)
 }

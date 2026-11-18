@@ -117,7 +117,7 @@ fn canonical_addr(func: &Function, prov: &Provenance, consts: &[Option<i64>], de
     Some((merge_canon_terms(terms)?, const_off))
 }
 
-fn pred_chain(cfg: &Cfg, blk: Block) -> Vec<Block> {
+pub(super) fn pred_chain(cfg: &Cfg, blk: Block) -> Vec<Block> {
     let mut chain = vec![blk];
     let mut cur = blk;
     while chain.len() < MAX_PRED_CHAIN

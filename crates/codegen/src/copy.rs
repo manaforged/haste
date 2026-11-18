@@ -7,7 +7,7 @@ pub(crate) use param::forward_param_slots;
 use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Convert, Function, Inst, Lane, Op, StackSlot, Type, Value};
 
 /// The most bytes a move is emitted inline with; a larger one calls `memmove`.
-pub(crate) const MOVE_INLINE: u32 = 64;
+pub(crate) const MOVE_INLINE: u32 = 128;
 
 /// The most chunks a copy of a constant size is emitted inline with, one scratch register each.
 const CHUNKS: usize = 4;
