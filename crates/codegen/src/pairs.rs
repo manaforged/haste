@@ -28,22 +28,12 @@ pub(crate) fn split(func: &mut Function) -> bool {
     }
     let rpo = cfg.rpo.clone();
     let chained = chained(func);
-    let mut splitter = Splitter { defs: defs(func), func, halves: HashMap::default(), alias: HashMap::default(), offsets: HashMap::default(), chained, split_at: Vec::new(), insts: Vec::new() };
+    let mut splitter = Splitter { defs: crate::fold::defs(func), func, halves: HashMap::default(), alias: HashMap::default(), offsets: HashMap::default(), chained, split_at: Vec::new(), insts: Vec::new() };
     splitter.split_params();
     for block in rpo {
         splitter.block(block);
     }
     true
-}
-
-fn defs(func: &Function) -> Vec<Option<Inst>> {
-    let mut defs = vec![None; func.types.len()];
-    for &inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        if let Some(result) = func.insts[inst.index()].result {
-            defs[result.index()] = Some(inst);
-        }
-    }
-    defs
 }
 
 /// Which 128-bit values feed only one 128-bit add or subtract in their own block, so a constant they carry can wait for it.

@@ -39,10 +39,10 @@ fn worth(func: &Function, defs: &[Option<Inst>]) -> bool {
 
 fn defs(func: &Function) -> Vec<Option<Inst>> {
     let uses = func.use_counts();
-    let mut defs = vec![None; func.types.len()];
-    for inst in func.blocks.iter().flat_map(|block| block.insts.iter()) {
-        if let Some(value) = func.insts[inst.index()].result.filter(|value| uses.get(value.index()) == Some(&1)) {
-            defs[value.index()] = Some(*inst);
+    let mut defs = crate::fold::defs(func);
+    for (value, def) in defs.iter_mut().enumerate() {
+        if uses.get(value) != Some(&1) {
+            *def = None;
         }
     }
     defs
