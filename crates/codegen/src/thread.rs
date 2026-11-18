@@ -310,6 +310,35 @@ fn eval_pair_ok(func: &Function, disp: Block, et: &Eval, ef: &Eval) -> bool {
     }
 }
 
+/// Splits each branch on a select with one constant arm into a branch on the select's condition, whose constant side goes straight to its target, and a new block that branches on the other arm when that arm is a comparison.
+fn split_select_branches(func: &mut Function) -> bool {
+    let uses = func.use_counts();
+    let defs = crate::fold::defs(func);
+    let konst = |v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
+    let compare = |v: Value| defs[v.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Icmp(..)));
+    let mut splits = Vec::new();
+    for block in &func.blocks {
+        let Some(&term) = block.insts.last() else { continue };
+        let Op::Brif(sel, ..) = func.insts[term.index()].op else { continue };
+        let Some((cond, then, otherwise)) = select_arms(func, &defs, sel).filter(|_| uses[sel.index()] == 1) else { continue };
+        match (konst(then), konst(otherwise)) {
+            (Some(k), None) if compare(otherwise) => splits.push((term, cond, k != 0, otherwise, true)),
+            (None, Some(k)) if compare(then) => splits.push((term, cond, k != 0, then, false)),
+            _ => {}
+        }
+    }
+    for &(term, cond, fixed, other, on_true) in &splits {
+        let Op::Brif(_, then, then_args, otherwise, else_args) = func.insts[term.index()].op.clone() else { continue };
+        let direct = if fixed { (then, then_args.clone()) } else { (otherwise, else_args.clone()) };
+        let inner = func.add(Op::Brif(other, then, then_args, otherwise, else_args), None);
+        let rest = Block(func.blocks.len() as u32);
+        func.blocks.push(crate::ir::BlockData { params: Vec::new(), insts: vec![inner] });
+        func.insts[term.index()].op = if on_true { Op::Brif(cond, direct.0, direct.1, rest, Vec::new()) } else { Op::Brif(cond, rest, Vec::new(), direct.0, direct.1) };
+    }
+    if !splits.is_empty() { func.bump_cfg(); }
+    !splits.is_empty()
+}
+
 fn select_arms(func: &Function, defs: &[Option<Inst>], value: Value) -> Option<(Value, Value, Value)> {
     if func.is_unpredictable(value) {
         return None;
@@ -574,6 +603,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
     }
+    let split = split_select_branches(func);
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
     for data in &func.insts {
@@ -588,7 +618,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     }
     let mut consts = Vec::new();
     let opened = ret::open_returns(func, &pinned);
-    let mut any = false;
+    let mut any = split;
     for round in 0..16 {
         let mut defs = vec![None; func.types.len()];
         for block in &func.blocks {
