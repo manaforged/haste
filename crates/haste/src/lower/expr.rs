@@ -431,6 +431,9 @@ impl Lower<'_, '_> {
         let callee = self.reached.typed(index, self.cx.name(item))?;
         let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
         if self.cx.foreign(item) {
+            if callee.ret.map_or(Ok(true), |ret| repr(self.cx, ret).map(|r| r == Repr::Zst))? && self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve) == Some(crate::host::HostSymbol::Noop) {
+                return Ok(None);
+            }
             let code = self.code_of(index, origin);
             return self.native_call(code, (params, callee.ret), values);
         }
