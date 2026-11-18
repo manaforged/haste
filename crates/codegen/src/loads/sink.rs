@@ -5,6 +5,9 @@ use crate::mem::{MemLoc, Provenance, clobbers};
 /// The most blocks one group of loads may sink through.
 const MAX_REGION: usize = 1024;
 
+/// The fewest loads from one address that sink without a call on the path, since holding that many words at once spills them.
+const WIDE_GROUP: usize = 8;
+
 /// A load that may move: its position in its block, its address, offset and result.
 #[derive(Clone, Copy)]
 struct Candidate {
@@ -14,7 +17,7 @@ struct Candidate {
     result: Value,
 }
 
-/// Moves each load whose every use is in later blocks into those blocks when no path between them may write the loaded bytes and some path passes a call, so the value no longer lives across that call.
+/// Moves each load whose every use is in later blocks into those blocks when no path between them may write the loaded bytes and some path passes a call or the load is one of a wide group from one address, so the value no longer lives across that call or beside the rest of the group.
 pub(super) fn sink_loads(func: &mut Function, prov: &Provenance) -> bool {
     let cfg = func.cfg().clone();
     let users = user_blocks(func);
@@ -71,13 +74,14 @@ fn sink_block(func: &mut Function, (cfg, rank): (&Cfg, &[usize]), prov: &Provena
         }
         let region = clean_region(func, cfg, prov, block, loc);
         let depth = cfg.loops().depth_of(block);
+        let wide = group.len() >= WIDE_GROUP;
         for load in group {
             let targets = &users[load.result.index()];
             let fits = targets.iter().all(|&target| {
                 region[target.index()].is_some_and(|first_write| {
                     cfg.loops().depth_of(target) <= depth && first_use(func, target, load.result).is_some_and(|pos| pos < first_write)
                 })
-            }) && crosses_call(func, cfg, (block, load.pos), &region, (targets, load.result));
+            }) && (wide || crosses_call(func, cfg, (block, load.pos), &region, (targets, load.result)));
             if fits {
                 moved.push(func.blocks[block.index()].insts[load.pos]);
                 let mut ordered = targets.clone();
