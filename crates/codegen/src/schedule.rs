@@ -398,7 +398,7 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
         state.merge_clean = false;
         run_fixpoint(func, &plan, &mut state);
     }
-    if effort == Effort::Full && moves != promote::Moves::Guided && crate::pairs::split(func) {
+    if effort == Effort::Full && moves != promote::Moves::Guided && ((target.arch == crate::Arch::X64 && crate::native::divide_by_word(func)) | crate::pairs::split(func)) {
         state.fold_clean = false;
         state.merge_clean = false;
         run_fixpoint(func, &plan, &mut state);

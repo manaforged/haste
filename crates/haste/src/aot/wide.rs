@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, anyhow};
-use haste_codegen::{AbiParam, Arch, CallConv, Effort, FloatCC, Function, FunctionBuilder, IntCC, Os, RuntimeSymbol, Signature, TARGETS, TargetOpId, Type, Value};
+use haste_codegen::{AbiParam, Arch, CallConv, Effort, FloatCC, Function, FunctionBuilder, IntCC, Os, RuntimeSymbol, Signature, TARGETS, Type, Value};
 
 use super::Buf;
 
@@ -121,19 +121,18 @@ fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, arch): (b
 }
 
 fn udivrem_by_u64(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, arch): (bool, Arch)) -> Value {
+    let v = b.ins().ireduce(Type::I64, y);
+    if arch == Arch::X64 {
+        let word = b.ins().uextend(Type::I128, v);
+        return if want_rem { b.ins().urem(x, word) } else { b.ins().udiv(x, word) };
+    }
     let c64 = b.ins().iconst(Type::I64, 64);
     let x_hi128 = b.ins().ushr(x, c64);
     let x_hi = b.ins().ireduce(Type::I64, x_hi128);
     let x_lo = b.ins().ireduce(Type::I64, x);
-    let v = b.ins().ireduce(Type::I64, y);
     let q_hi = b.ins().udiv(x_hi, v);
     let q_hi_v = b.ins().imul(q_hi, v);
     let r_hi = b.ins().isub(x_hi, q_hi_v);
-    if arch == Arch::X64 {
-        let id = if want_rem { TargetOpId::X64RemWide } else { TargetOpId::X64DivWide };
-        let part = b.ins().target_op(id, Type::I64, &[r_hi, x_lo, v]);
-        return if want_rem { b.ins().uextend(Type::I128, part) } else { b.ins().iconcat(part, q_hi) };
-    }
     let (q_lo, r) = divlu(b, (r_hi, x_lo), v);
     if want_rem { b.ins().uextend(Type::I128, r) } else { b.ins().iconcat(q_lo, q_hi) }
 }

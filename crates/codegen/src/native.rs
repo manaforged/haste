@@ -1,4 +1,4 @@
-use crate::ir::{AbiParam, Binary, CallConv, Convert, Function, InstData, Op, SigRef, Signature, Type, Value};
+use crate::ir::{AbiParam, Binary, CallConv, Convert, Function, Inst, InstData, Op, SigRef, Signature, TargetOpId, TinyArgs, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 /// A helper compiled into haste that one instruction becomes a call to.
@@ -88,4 +88,54 @@ fn convert(op: Convert, from: Type, to: Type) -> Option<RuntimeSymbol> {
         (Convert::FromUint, Type::I128, Type::F64) => Some(RuntimeSymbol::U128ToF64),
         _ => None,
     }
+}
+
+/// Expands each 128-bit unsigned division or remainder by a zero-extended word into a word division of the high half and one x64 `div` of its remainder and the low half, in place of a helper call.
+pub(crate) fn divide_by_word(func: &mut Function) -> bool {
+    let mut defs: Vec<Option<Inst>> = vec![None; func.types.len()];
+    for (index, data) in func.insts.iter().enumerate() {
+        if let Some(result) = data.result {
+            defs[result.index()] = Some(Inst(index as u32));
+        }
+    }
+    let mut changed = false;
+    for block in 0..func.blocks.len() {
+        let mut at = 0;
+        while at < func.blocks[block].insts.len() {
+            let inst = func.blocks[block].insts[at];
+            let (Op::Binary(op @ (Binary::Udiv | Binary::Urem), x, y), Some(_)) = (&func.insts[inst.index()].op, func.insts[inst.index()].result) else {
+                at += 1;
+                continue;
+            };
+            let (op, x, y) = (*op, *x, *y);
+            let word = match defs[y.index()].map(|def| &func.insts[def.index()].op) {
+                Some(&Op::Convert(Convert::Uextend, inner)) if func.ty(inner) == Type::I64 => Some(inner),
+                _ => None,
+            };
+            let Some(by) = word.filter(|_| func.ty(x) == Type::I128) else {
+                at += 1;
+                continue;
+            };
+            let mut emit = |func: &mut Function, op: Op, ty: Type| {
+                let value = func.value(ty);
+                let added = func.add(op, Some(value));
+                func.blocks[block].insts.insert(at, added);
+                at += 1;
+                value
+            };
+            let shift = emit(func, Op::Const(64), Type::I64);
+            let wide_high = emit(func, Op::Binary(Binary::Ushr, x, shift), Type::I128);
+            let high = emit(func, Op::Convert(Convert::Ireduce, wide_high), Type::I64);
+            let low = emit(func, Op::Convert(Convert::Ireduce, x), Type::I64);
+            let quotient = emit(func, Op::Binary(Binary::Udiv, high, by), Type::I64);
+            let product = emit(func, Op::Binary(Binary::Imul, quotient, by), Type::I64);
+            let rest = emit(func, Op::Binary(Binary::Isub, high, product), Type::I64);
+            let id = if op == Binary::Urem { TargetOpId::X64RemWide } else { TargetOpId::X64DivWide };
+            let part = emit(func, Op::TargetOp(id, TinyArgs::three(rest, low, by)), Type::I64);
+            func.insts[inst.index()].op = if op == Binary::Urem { Op::Convert(Convert::Uextend, part) } else { Op::Binary(Binary::Iconcat, part, quotient) };
+            changed = true;
+            at += 1;
+        }
+    }
+    changed
 }
