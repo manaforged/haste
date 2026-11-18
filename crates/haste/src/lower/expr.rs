@@ -64,8 +64,18 @@ pub(super) fn const_bool(body: &Body, expr: ExprId) -> Option<bool> {
 }
 
 impl Lower<'_, '_> {
-    /// Lowers `expr` and returns its value, or none for `()`, `!` and code after a jump.
+    /// Lowers `expr` and returns its value, or none for `()`, `!` and code after a jump; its instructions carry its source place.
     pub fn expr(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let outer = self.b.loc();
+        if let Some(&end) = self.body.expr_ends.get(expr.0 as usize) {
+            self.b.set_loc(self.src.place(end.saturating_sub(1)));
+        }
+        let value = self.expr_placed(expr);
+        self.b.set_loc(outer);
+        value
+    }
+
+    fn expr_placed(&mut self, expr: ExprId) -> Result<Option<Value>> {
         if !self.open {
             return Ok(None);
         }

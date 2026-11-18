@@ -4,7 +4,7 @@ use crate::ir::{
 };
 use crate::reloc::RuntimeSymbol;
 
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 2;
 
 macro_rules! table {
     ($name:ident: $ty:ident = [$($variant:ident),* $(,)?]) => {
@@ -89,6 +89,7 @@ impl Function {
         for data in &self.insts {
             w.op(&data.op);
             w.u32(data.result.map_or(0, |value| value.0 + 1));
+            w.u64(data.loc);
         }
         for block in &self.blocks {
             w.values(&block.params);
@@ -131,7 +132,7 @@ impl Function {
         let blocks = r.len()?;
         let insts = r.len()?;
         (r.values, r.blocks, r.insts, r.slots, r.sigs) = (types as u32, blocks as u32, insts as u32, slots as u32, sigs as u32);
-        func.insts = (0..insts).map(|_| Some(InstData { op: r.op()?, result: r.opt_value()? })).collect::<Option<_>>()?;
+        func.insts = (0..insts).map(|_| Some(InstData { op: r.op()?, result: r.opt_value()?, loc: r.u64()? })).collect::<Option<_>>()?;
         func.blocks = (0..blocks).map(|_| r.block_data()).collect::<Option<_>>()?;
         func.entry = match r.u32()? {
             0 => None,

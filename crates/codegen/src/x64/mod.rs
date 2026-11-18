@@ -118,6 +118,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_block,
         at_end: false,
         trap_label: None,
+        lines: Vec::new(),
         features,
         copied,
         direct_calls: target.direct_calls,
@@ -189,6 +190,7 @@ pub(super) struct Emit<'a> {
     last_block: Option<Block>,
     at_end: bool,
     trap_label: Option<Label>,
+    lines: Vec<(u32, u64)>,
     features: Features,
     copied: Vec<bool>,
     direct_calls: bool,
@@ -361,6 +363,8 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn pos(&self) -> u32 { self.asm.pos() }
 
+    fn lines(&mut self) -> &mut Vec<(u32, u64)> { &mut self.lines }
+
     fn finish(mut self, starts: &mut [u32]) -> Result<Code, String> {
         if let Some(label) = self.trap_label {
             self.asm.bind(label);
@@ -368,7 +372,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         }
         emit_stubs(&mut self)?;
         self.asm.relax().apply(starts, &mut self.sites, &mut self.relocs);
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new() })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new() })
     }
 }
 

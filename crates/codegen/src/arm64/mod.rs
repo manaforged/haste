@@ -129,6 +129,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         shrink,
         slow_thunk,
         trap_label: None,
+        lines: Vec::new(),
         in_shrink_entry: false,
         in_fast_ret: false,
         tails: Tails::new(),
@@ -188,6 +189,7 @@ pub(super) struct Emit<'a> {
     shrink: Option<ShrinkWrap>,
     slow_thunk: Label,
     trap_label: Option<Label>,
+    lines: Vec<(u32, u64)>,
     in_shrink_entry: bool,
     in_fast_ret: bool,
     tails: Tails<'a, Label>,
@@ -376,6 +378,8 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn pos(&self) -> u32 { self.asm.pos() }
 
+    fn lines(&mut self) -> &mut Vec<(u32, u64)> { &mut self.lines }
+
     fn finish(mut self, _starts: &mut [u32]) -> Result<Code, String> {
         self.asm.maybe_island()?;
         if let Some(label) = self.trap_label.take() {
@@ -383,7 +387,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             self.asm.brk();
         }
         emit_stubs(&mut self)?;
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new() })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new() })
     }
 }
 

@@ -94,12 +94,13 @@ pub struct Code {
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
     loops: Vec<Range<u32>>,
+    lines: Vec<(u32, u64)>,
 }
 
 impl Code {
     /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, relocations, and small loop ranges.
     pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>, loops: Vec<Range<u32>>) -> Self {
-        Self { bytes, sites, relocs, loops }
+        Self { bytes, sites, relocs, loops, lines: Vec::new() }
     }
 
     /// The machine code.
@@ -120,6 +121,11 @@ impl Code {
     /// The byte ranges of the small innermost loops, which run slower when they cross a page boundary.
     pub fn loops(&self) -> &[Range<u32>] {
         &self.loops
+    }
+
+    /// The offsets in `bytes` where a new source place starts, with that place as `FunctionBuilder::set_loc` took it.
+    pub fn lines(&self) -> &[(u32, u64)] {
+        &self.lines
     }
 
     /// Copies `bytes` into `out` and patches every relocation against `symbols`.

@@ -4,7 +4,7 @@ use haste_codegen::{Arch, Os};
 use super::shims::{Shim, emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
 use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym};
 
-const SECTION_NAMES: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+const SECTION_NAMES: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0.debug_line\0";
 const LOCAL_FUNC_IN_TEXT: u32 = 0x0001_0002;
 
 struct ElfTables {
@@ -61,7 +61,7 @@ fn write_shdr(out: &mut Buf, [name, kind, link, info]: [u32; 4], [flags, addr, o
     out.u64s(&[align, entsize]);
 }
 
-fn write_symbols(out: &mut Buf, exe: &Executable, text: (u64, usize), symtab_off: usize, (strtab, fn_strx): (&[u8], &[u32])) {
+fn write_symbols(out: &mut Buf, exe: &Executable, text: (u64, usize), symtab_off: usize, (strtab, fn_strx, lines): (&[u8], &[u32], &[u8])) {
     let (text_va, text_off) = text;
     let nsyms = 1 + fn_strx.len();
     out.0.resize(symtab_off, 0);
@@ -75,12 +75,15 @@ fn write_symbols(out: &mut Buf, exe: &Executable, text: (u64, usize), symtab_off
     out.bytes(strtab);
     let names_off = out.pos();
     out.bytes(SECTION_NAMES);
+    let lines_off = out.pos();
+    out.bytes(lines);
     out.align(8);
     out.bytes(&[0; 64]);
     write_shdr(out, [1, 1, 0, 0], [6, text_va, text_off as u64, exe.text.len() as u64, 16, 0]);
     write_shdr(out, [7, 2, 3, nsyms as u32], [0, 0, symtab_off as u64, (nsyms * 24) as u64, 8, 24]);
     write_shdr(out, [15, 3, 0, 0], [0, 0, strtab_off as u64, strtab.len() as u64, 1, 0]);
     write_shdr(out, [23, 3, 0, 0], [0, 0, names_off as u64, SECTION_NAMES.len() as u64, 1, 0]);
+    write_shdr(out, [33, 1, 0, 0], [0, 0, lines_off as u64, lines.len() as u64, 1, 0]);
 }
 
 /// The bytes of the coroutine frame cache in the static TLS block: a head and a count for each 16-byte size class below 1024 bytes.
@@ -130,7 +133,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let mut strtab = vec![0u8];
     let fn_strx = exe.symbol_names("", &mut strtab);
     let symtab_off = (dyn_off + dyn_size).next_multiple_of(8);
-    let shdr_off = (symtab_off + (1 + fn_strx.len()) * 24 + strtab.len() + SECTION_NAMES.len()).next_multiple_of(8);
+    let lines = super::dwarf::debug_line(ELF_BASE + text_off as u64, exe.text.len() as u32, &exe.lines, &exe.sources);
+    let shdr_off = (symtab_off + (1 + fn_strx.len()) * 24 + strtab.len() + SECTION_NAMES.len() + lines.len()).next_multiple_of(8);
 
     let bss_va = rw_va + bss_in_rw as u64;
     let addrs = SectionAddrs {
@@ -154,7 +158,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     out.u32(1);
     out.u64s(&[ELF_BASE + start_off as u64, 64, shdr_off as u64]);
     out.u32(0);
-    [64_u16, 56, phnum as u16, 64, 5, 4].into_iter().for_each(|v| out.u16(v));
+    [64_u16, 56, phnum as u16, 64, 6, 4].into_iter().for_each(|v| out.u16(v));
     write_phdr(&mut out, 6, 4, 64, ELF_BASE + 64, phnum * 56, phnum * 56, 8);
     write_phdr(&mut out, 3, 4, interp_off, ELF_BASE + interp_off as u64, interp.len(), interp.len(), 1);
     write_phdr(&mut out, 1, 5, 0, ELF_BASE, rx_end, rx_end, page);
@@ -210,6 +214,6 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         out.i64(tag);
         out.u64(val);
     }
-    write_symbols(&mut out, exe, (addrs.text, text_off), symtab_off, (&strtab, &fn_strx));
+    write_symbols(&mut out, exe, (addrs.text, text_off), symtab_off, (&strtab, &fn_strx, &lines));
     Ok(out.0)
 }

@@ -179,6 +179,7 @@ impl<'a> Cursor<'a> {
 
     pub fn push_expr(&mut self, expr: super::Expr) -> ExprId {
         self.body.exprs.push(expr);
+        self.body.expr_ends.push(self.at);
         ExprId(self.body.exprs.len() as u32 - 1)
     }
 

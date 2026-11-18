@@ -549,6 +549,8 @@ impl Op {
 pub(crate) struct InstData {
     pub op: Op,
     pub result: Option<Value>,
+    /// The source place this instruction came from: file key in the high 32 bits, byte offset in the low 32; 0 when unknown.
+    pub loc: u64,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -670,7 +672,7 @@ impl Function {
 
     /// A new instruction outside every block that runs `op` and defines `result`.
     pub(crate) fn add(&mut self, op: Op, result: Option<Value>) -> Inst {
-        self.insts.push(InstData { op, result });
+        self.insts.push(InstData { op, result, loc: 0 });
         Inst(self.insts.len() as u32 - 1)
     }
 

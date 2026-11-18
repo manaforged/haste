@@ -603,7 +603,7 @@ fn live_across_suspend(func: &Function, cfg: &Cfg, resumes: &[Block], defs: &[Op
 
 fn push(func: &mut Function, insts: &mut Vec<Inst>, op: Op, ty: Option<Type>) -> Option<Value> {
     let result = ty.map(|ty| func.value(ty));
-    func.insts.push(InstData { op, result });
+    func.insts.push(InstData { op, result, loc: 0 });
     insts.push(Inst(func.insts.len() as u32 - 1));
     result
 }

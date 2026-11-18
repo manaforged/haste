@@ -8,6 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::host::{HostSymbol, MathSymbol};
 
+mod dwarf;
 mod elf;
 mod macho;
 mod shims;
@@ -62,6 +63,8 @@ pub(crate) struct Executable {
     pub(super) pointers: Vec<PtrReloc>,
     pub(super) symbols: Vec<(u32, String)>,
     pub(super) thread_slots: u32,
+    pub(super) lines: Vec<(u32, u64)>,
+    pub(super) sources: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +90,8 @@ impl Executable {
             pointers: Vec::new(),
             symbols: Vec::new(),
             thread_slots: 0,
+            lines: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
@@ -115,12 +120,19 @@ impl Executable {
     }
 
     /// Appends a function to `.text` at `align` bytes, shifted until the fewest of its `loops` cross a 4 KiB address, and returns its section offset.
-    pub(crate) fn function(&mut self, bytes: &[u8], align: u32, loops: &[Range<u32>]) -> u32 {
+    pub(crate) fn function(&mut self, bytes: &[u8], align: u32, loops: &[Range<u32>], lines: &[(u32, u64)]) -> u32 {
         let base = (self.text.len() as u32).next_multiple_of(align);
         let split = |at: u32| loops.iter().filter(|each| each.end > each.start && (at + each.start) / LOOP_PAGE != (at + each.end - 1) / LOOP_PAGE).count();
         let at = (0..=LOOP_SHIFT / align).map(|step| base + step * align).min_by_key(|&at| split(at)).unwrap_or(base);
         self.text.resize(at as usize, 0);
-        append_aligned(&mut self.text, bytes, align)
+        let placed = append_aligned(&mut self.text, bytes, align);
+        self.lines.extend(lines.iter().map(|&(offset, place)| (placed + offset, place)));
+        placed
+    }
+
+    /// Names the source files whose `Source::place` keys the debug line table resolves.
+    pub(crate) fn sources(&mut self, paths: Vec<std::path::PathBuf>) {
+        self.sources = paths;
     }
 
     /// Appends `align`-byte-aligned constant bytes to `.rodata` and returns its section offset.

@@ -217,7 +217,7 @@ fn resolve_emit_val(
     func.types.push(func.ty(val));
     consts.push(Some(imm));
     let c_inst = Inst(func.insts.len() as u32);
-    func.insts.push(InstData { op: Op::Const(imm), result: Some(c_val) });
+    func.insts.push(InstData { op: Op::Const(imm), result: Some(c_val), loc: 0 });
     inserted.push(c_inst);
     emit_map.push((val, c_val));
     c_val
@@ -242,7 +242,7 @@ fn emit_needed(func: &mut Function, pred: Block, (consts, uses): (&mut Vec<Optio
         func.types.push(ty);
         consts.push(imm_opt);
         let new_inst = Inst(func.insts.len() as u32);
-        func.insts.push(InstData { op: new_op, result: Some(new_val) });
+        func.insts.push(InstData { op: new_op, result: Some(new_val), loc: 0 });
         inserted.push(new_inst);
         emit_map.push((res, new_val));
     }
@@ -734,7 +734,7 @@ pub(crate) fn compact(func: &mut Function) {
         block.params.iter_mut().for_each(|param| *param = take(*param));
         for inst in &mut block.insts {
             let slot = &mut func.insts[inst.index()];
-            let mut data = InstData { op: std::mem::replace(&mut slot.op, Op::Trap), result: slot.result };
+            let mut data = InstData { op: std::mem::replace(&mut slot.op, Op::Trap), result: slot.result, loc: slot.loc };
             data.result = data.result.map(&mut take);
             if let Op::Call { results, .. } = &mut data.op {
                 results.iter_mut().for_each(|result| *result = take(*result));

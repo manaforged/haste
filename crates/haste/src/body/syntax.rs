@@ -260,6 +260,8 @@ pub enum Node {
 #[derive(Debug, Default)]
 pub struct Body {
     pub exprs: Vec<Expr>,
+    /// The token just past each expression, by `ExprId`, from which `Source::origin` finds its place on disk.
+    pub expr_ends: Vec<u32>,
     pub pats: Vec<Pat>,
     pub tys: Vec<Ty>,
     pub paths: Vec<Path>,

@@ -27,7 +27,7 @@ fn fn_align_override() -> Option<u32> {
 
 fn place(exe: &mut Executable, code: &AotCode) -> u32 {
     let align = fn_align_override().unwrap_or(if code.loops().is_empty() { 16 } else { FN_ALIGN });
-    exe.function(code.bytes(), align, code.loops())
+    exe.function(code.bytes(), align, code.loops(), code.lines())
 }
 
 #[derive(Clone)]
@@ -35,14 +35,16 @@ pub(super) struct AotCode {
     bytes: Vec<u8>,
     relocs: Vec<StencilReloc>,
     loops: Vec<std::ops::Range<u32>>,
+    lines: Vec<(u32, u64)>,
 }
 
 impl AotCode {
     pub(super) fn from_code(code: &Code) -> Arc<Self> {
-        Arc::new(Self { bytes: code.bytes().to_vec(), relocs: code.relocs().to_vec(), loops: code.loops().to_vec() })
+        Arc::new(Self { bytes: code.bytes().to_vec(), relocs: code.relocs().to_vec(), loops: code.loops().to_vec(), lines: code.lines().to_vec() })
     }
 
     pub(super) fn loops(&self) -> &[std::ops::Range<u32>] { &self.loops }
+    pub(super) fn lines(&self) -> &[(u32, u64)] { &self.lines }
     pub(super) fn bytes(&self) -> &[u8] { &self.bytes }
     pub(super) fn relocs(&self) -> &[StencilReloc] { &self.relocs }
 }
@@ -809,6 +811,7 @@ impl Image {
                 named.entry(off).or_insert(index);
             }
         }
+        exe.sources(cx.outline.crates.iter().flat_map(|krate| krate.files.iter().map(|file| file.source.path.clone())).collect());
         exe.symbols(named.into_iter().map(|(off, index)| (off, reached.list.get(index).map_or_else(|| format!("fn{index}"), |((item, _), _)| cx.qualified(*item)))).collect());
         Ok(exe)
     }

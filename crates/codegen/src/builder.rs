@@ -14,12 +14,13 @@ pub struct FunctionBuilder<'f> {
     pub func: &'f mut Function,
     current: Option<Block>,
     incoming: Vec<u32>,
+    loc: u64,
 }
 
 impl<'f> FunctionBuilder<'f> {
     /// A builder that appends to `func`.
     pub fn new(func: &'f mut Function) -> Self {
-        Self { incoming: vec![0; func.blocks.len()], func, current: None }
+        Self { incoming: vec![0; func.blocks.len()], func, current: None, loc: 0 }
     }
 
     /// Adds an empty block.
@@ -173,7 +174,17 @@ impl<'f> FunctionBuilder<'f> {
     /// Appends one instruction to the current block.
     pub fn ins(&mut self) -> Ins<'_> {
         let block = self.current.expect("a block is selected");
-        Ins { func: self.func, block, incoming: &mut self.incoming }
+        Ins { func: self.func, block, incoming: &mut self.incoming, loc: self.loc }
+    }
+
+    /// The source place that instructions built from now on carry.
+    pub fn loc(&self) -> u64 {
+        self.loc
+    }
+
+    /// Sets the source place that instructions built from now on carry: file key in the high 32 bits, byte offset in the low 32.
+    pub fn set_loc(&mut self, loc: u64) {
+        self.loc = loc;
     }
 }
 
@@ -266,7 +277,7 @@ impl Remap {
             Op::Return(values) => op = Op::Jump(self.after, std::mem::take(values)),
             _ => {}
         }
-        InstData { op, result: data.result.map(|value| self.values[value.index()]) }
+        InstData { op, result: data.result.map(|value| self.values[value.index()]), loc: data.loc }
     }
 }
 
@@ -276,12 +287,13 @@ pub struct Ins<'b> {
     func: &'b mut Function,
     block: Block,
     incoming: &'b mut Vec<u32>,
+    loc: u64,
 }
 
 impl Ins<'_> {
     fn push(&mut self, op: Op, ty: Option<Type>) -> (Inst, Option<Value>) {
         let result = ty.map(|ty| self.func.value(ty));
-        self.func.insts.push(InstData { op, result });
+        self.func.insts.push(InstData { op, result, loc: self.loc });
         let inst = Inst(self.func.insts.len() as u32 - 1);
         self.func.blocks[self.block.index()].insts.push(inst);
         (inst, result)

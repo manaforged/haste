@@ -608,6 +608,8 @@ pub(crate) trait Emitter<'a>: Sized {
     fn inst(&mut self, inst: Inst) -> Result<(), String>;
     fn trap(&mut self);
     fn pos(&self) -> u32;
+    /// The code offsets where a new source place starts, with that place, in emission order.
+    fn lines(&mut self) -> &mut Vec<(u32, u64)>;
     /// Finishes the code and moves `starts`, offsets taken while emitting, to where they land in it.
     fn finish(self, starts: &mut [u32]) -> Result<crate::Code, String>;
 
@@ -640,6 +642,15 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
         let data = &func.insts[inst.index()];
         if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
             continue;
+        }
+        if data.loc != 0 {
+            let at = emit.pos();
+            let lines = emit.lines();
+            match lines.last_mut() {
+                Some(last) if last.1 == data.loc => {}
+                Some(last) if last.0 == at => last.1 = data.loc,
+                _ => lines.push((at, data.loc)),
+            }
         }
         emit.inst(inst)?;
     }
@@ -676,7 +687,12 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
         emit_body(&mut emit, block)?;
     }
     starts.push(emit.pos());
+    let blocks = starts.len();
+    let lines = std::mem::take(emit.lines());
+    starts.extend(lines.iter().map(|&(at, _)| at));
     let mut code = emit.finish(&mut starts)?;
+    code.lines = lines.iter().zip(&starts[blocks..]).map(|(&(_, loc), &at)| (at, loc)).collect();
+    starts.truncate(blocks);
     code.loops = crate::emit::loop_spans(func, order, &starts);
     Ok(code)
 }

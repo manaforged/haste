@@ -252,6 +252,14 @@ fn is_trivia(kind: TokenKind) -> bool {
 }
 
 /// Whether `kind` opens a delimited group: `(`, `[` or `{`.
+/// The stable 32-bit key of a source file path, the high half of `Source::place`; never 0.
+pub fn file_key(path: &Path) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    path.hash(&mut hasher);
+    (hasher.finish() as u32).max(1)
+}
+
 pub fn opens(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::OpenParen | TokenKind::OpenBrace | TokenKind::OpenBracket)
 }
@@ -744,6 +752,11 @@ impl Source {
             Origins::Read => src.tokens.get(local).map(|token| token.start),
             Origins::Copied(copied) => copied.binary_search_by_key(&(local as u32), |&(token, _)| token).ok().map(|found| copied[found].1),
         }
+    }
+
+    /// The source place of token `at` for debug line tables: `file_key(path)` in the high 32 bits and the disk byte offset in the low 32, or 0 when the token lies nowhere on disk.
+    pub fn place(&self, at: u32) -> u64 {
+        self.origin(at).map_or(0, |byte| u64::from(file_key(&self.path)) << 32 | u64::from(byte))
     }
 
     /// The byte offset of token `at` in the text of its layer.
