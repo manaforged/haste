@@ -1,6 +1,6 @@
 mod demote;
 mod hints;
-mod walk;
+pub(crate) mod walk;
 
 use crate::cfg::{Cfg, Loops};
 use crate::fold::{constant, fits_imm32, holds};
@@ -723,6 +723,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         crate::trace::on_alloc(func, &live, (0..count).filter(|&value| ints[value]).map(|value| (value, matches!(locations[value], Location::Slot))));
         if let (Some(loops), Some(blocks)) = (loops, blocks.as_deref()) {
             crate::trace::on_loops(func, &live, (loops, blocks), &ints, |value| matches!(locations[value], Location::Slot));
+            crate::trace::on_edge_copies(func, &live, blocks, |value| if let Location::Reg(reg) = locations[value] { Some(reg) } else { None });
         }
     }
     Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density }

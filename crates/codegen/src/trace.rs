@@ -320,3 +320,29 @@ pub fn missed_report() -> String {
     }
     out
 }
+
+/// Prints the traced function's register-to-register edge copies, weighted by block weight: forced when argument and parameter overlap, blocked when another value holds the parameter's register during the argument, open otherwise.
+pub(crate) fn on_edge_copies<R: PartialEq + Copy>(func: &Function, live: &crate::live::Live, blocks: &[u64], reg: impl Fn(usize) -> Option<R>) {
+    let label = current_label();
+    if !should_trace(label.as_deref()) {
+        return;
+    }
+    let (mut forced, mut blocked, mut open, mut lines) = (0_u64, 0_u64, 0_u64, String::new());
+    crate::alloc::walk::for_edge_copies(func, |src, target, param, arg| {
+        let (Some(p), Some(a)) = (reg(param.index()), reg(arg.index())) else { return };
+        if p == a {
+            return;
+        }
+        let weight = blocks[src.index()];
+        let arg_ranges = live.ranges_of(arg.index());
+        if crate::live::overlaps(live.ranges_of(param.index()), arg_ranges) {
+            forced += weight;
+        } else if (0..func.types.len()).any(|other| other != param.index() && other != arg.index() && reg(other) == Some(p) && crate::live::overlaps(live.ranges_of(other), arg_ranges)) {
+            blocked += weight;
+        } else {
+            open += weight;
+            let _ = writeln!(lines, "  open b{}->b{} v{} <- v{} weight={weight}", src.index(), target.index(), param.index(), arg.index());
+        }
+    });
+    eprintln!("[haste-trace] fn={} edgecopies forced={forced} blocked={blocked} open={open}\n{lines}", label.as_deref().unwrap_or("<anon>"));
+}

@@ -94,3 +94,8 @@ const DENSITY_SHIFT: u32 = 16;
 pub(super) fn densities(weights: &[u64], live: &Live) -> Vec<u64> {
     weights.iter().enumerate().map(|(v, &w)| u64::try_from((u128::from(w) << DENSITY_SHIFT) / u128::from(live.total_len(v).max(4))).unwrap_or(u64::MAX)).collect()
 }
+
+/// Calls `visit` with the source, target, parameter and argument of every block-edge copy whose parameter and argument differ.
+pub(crate) fn for_edge_copies(func: &Function, mut visit: impl FnMut(Block, Block, Value, Value)) {
+    edge_copies(func, None, |src, _, target, copies| copies.filter(|(param, arg)| param != arg).for_each(|(&param, &arg)| visit(src, target, param, arg)));
+}
