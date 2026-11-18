@@ -12,12 +12,14 @@ pub(super) struct Hoist {
 pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u32) -> Vec<Hoist> {
     let info = collect_sret_info(func, entry);
     let mut plans: Vec<(Block, Inst, Vec<(Block, Edge, Option<Value>)>)> = Vec::new();
+    let mut reads = Vec::new();
     for &(join, pos, copy) in &info.uses_by_val[sret_ptr.index()] {
         let Some(param) = move_to_sret_src(func, &info.defs, copy, sret_ptr, bytes) else { continue };
         let block = &func.blocks[join.index()];
-        if join == entry || !block.params.contains(&param) || info.uses_by_val[param.index()].len() != 1 || !block.insts[..pos].iter().all(|&inst| pure(&func.insts[inst.index()].op)) {
+        if join == entry || !block.params.contains(&param) || !block.insts[..pos].iter().all(|&inst| pure(&func.insts[inst.index()].op)) {
             continue;
         }
+        let Some(loads) = later_loads(func, &info, (join, pos), param, copy) else { continue };
         let at = block.params.iter().position(|&p| p == param).unwrap_or(usize::MAX);
         let mut edges = Vec::new();
         for &pred in &info.preds[join.index()] {
@@ -41,6 +43,12 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
         }
         if !edges.is_empty() && edges.iter().all(|&(.., addr)| addr.is_some()) && !plans.iter().any(|&(seen, ..)| seen == join) {
             plans.push((join, copy, edges));
+            reads.extend(loads);
+        }
+    }
+    for load in reads {
+        if let Op::Load(from, _) = &mut func.insts[load.index()].op {
+            *from = sret_ptr;
         }
     }
     let hoisted: Vec<Hoist> = plans.into_iter().map(|(join, copy, edges)| hoist_one(func, sret_ptr, bytes, join, copy, &edges)).collect();
@@ -48,6 +56,23 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
         func.bump_cfg();
     }
     hoisted
+}
+
+/// The loads of `param` in `join` after its copy at `pos`, when they are its only other uses and nothing between the copy and them writes memory, so each can read the copy's target instead.
+fn later_loads(func: &Function, info: &super::SretUseInfo, (join, pos): (Block, usize), param: Value, copy: Inst) -> Option<Vec<Inst>> {
+    let insts = &func.blocks[join.index()].insts;
+    let mut loads = Vec::new();
+    for &(block, at, user) in &info.uses_by_val[param.index()] {
+        if user == copy {
+            continue;
+        }
+        let quiet = |inst: &Inst| pure(&func.insts[inst.index()].op) || matches!(func.insts[inst.index()].op, Op::Load(..));
+        if block != join || at <= pos || !matches!(func.insts[user.index()].op, Op::Load(from, _) if from == param) || !insts[pos + 1..at].iter().all(quiet) {
+            return None;
+        }
+        loads.push(user);
+    }
+    Some(loads)
 }
 
 /// Whether `op` neither touches memory nor branches.

@@ -313,7 +313,8 @@ fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) ->
         }
     }
     let copied: Vec<(Block, Inst)> = copies.iter().map(|&(_, block, _, inst)| (block, inst)).collect();
-    let writes = accesses_at(func, &info, vec![sret_ptr], &copied, Access::Write)?;
+    let stops: Vec<(Block, usize)> = copies.iter().map(|&(_, block, pos, _)| (block, pos)).collect();
+    let writes = accesses_at(func, &info, vec![sret_ptr], &copied, Access::ReadWrite)?;
     let mut tried = Vec::new();
     for &(slot, ..) in &copies {
         if tried.contains(&slot) {
@@ -330,10 +331,16 @@ fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) ->
         if spots.iter().any(|&spot| accesses.iter().chain(&spots).any(|&access| runs_after(func, spot, access))) {
             continue;
         }
-        let others = copies.iter().filter(|copy| copy.0 != slot).map(|&(_, block, pos, _)| (block, pos)).chain(writes.iter().copied());
-        if others.clone().all(|other| !accesses.iter().chain(&spots).any(|&access| access == other || runs_after(func, other, access))) {
-            return Some((slot, moves));
+        let others: Vec<(Block, usize)> = copies.iter().filter(|copy| copy.0 != slot).map(|&(_, block, pos, _)| (block, pos)).chain(writes.iter().copied()).collect();
+        let live: Vec<(Block, usize)> = accesses.iter().chain(&spots).copied().collect();
+        let before = |other: (Block, usize)| live.iter().any(|&access| runs_after(func, other, access));
+        if others.iter().any(|&other| live.contains(&other) || (before(other) && live.iter().any(|&access| runs_after(func, access, other)))) {
+            continue;
         }
+        if others.iter().any(|&other| before(other)) && accesses.iter().any(|&access| escapes(func, access, &stops, &others)) {
+            continue;
+        }
+        return Some((slot, moves));
     }
     None
 }
@@ -708,6 +715,27 @@ fn runs_after(func: &Function, (first, first_pos): (Block, usize), (later, later
             return true;
         }
         work.extend(func.successors(block));
+    }
+    false
+}
+
+/// Whether a path from the instruction at `from` reaches a return or one of `bad` before it passes one of `stops`.
+fn escapes(func: &Function, (block, pos): (Block, usize), stops: &[(Block, usize)], bad: &[(Block, usize)]) -> bool {
+    let mut seen = vec![false; func.blocks.len()];
+    let mut work = vec![(block, pos + 1)];
+    while let Some((block, start)) = work.pop() {
+        let count = func.blocks[block.index()].insts.len();
+        match (start..count).find(|&at| stops.contains(&(block, at)) || bad.contains(&(block, at))) {
+            Some(at) if stops.contains(&(block, at)) => continue,
+            Some(_) => return true,
+            None if matches!(func.last(block), Some(Op::Return(_))) => return true,
+            None => {}
+        }
+        for next in func.successors(block) {
+            if !std::mem::replace(&mut seen[next.index()], true) {
+                work.push((next, 0));
+            }
+        }
     }
     false
 }
