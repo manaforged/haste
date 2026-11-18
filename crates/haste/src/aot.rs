@@ -102,16 +102,7 @@ impl Executable {
     }
 
     fn symbol_names(&self, prefix: &str, strtab: &mut Vec<u8>) -> Vec<u32> {
-        self.symbols
-            .iter()
-            .map(|(_, name)| {
-                let at = strtab.len() as u32;
-                strtab.extend_from_slice(prefix.as_bytes());
-                strtab.extend_from_slice(name.as_bytes());
-                strtab.push(0);
-                at
-            })
-            .collect()
+        self.symbols.iter().map(|(_, name)| push_name(strtab, &[prefix, name])).collect()
     }
 
     /// Appends 16-byte-aligned machine code to `.text` and returns its section offset.
@@ -454,6 +445,14 @@ impl<'a> Plan<'a> {
         let key_off = bss.next_multiple_of(16);
         (key_off, key_off + 16)
     }
+}
+
+/// Appends the concatenation of `parts` and a NUL to `strtab` and returns where it starts.
+pub(super) fn push_name(strtab: &mut Vec<u8>, parts: &[&str]) -> u32 {
+    let at = strtab.len() as u32;
+    parts.iter().for_each(|part| strtab.extend_from_slice(part.as_bytes()));
+    strtab.push(0);
+    at
 }
 
 fn resolve_binding(sym: &Symbol, addrs: SectionAddrs, base_va: u64, shim_offs: &[usize], plan: &Plan<'_>, import_va: &dyn Fn(&str) -> Result<u64>) -> Result<(bool, u64)> {

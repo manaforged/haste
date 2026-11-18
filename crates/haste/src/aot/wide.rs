@@ -3,7 +3,7 @@ use haste_codegen::{AbiParam, Arch, CallConv, Effort, FloatCC, Function, Functio
 
 use super::Buf;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::aot) enum WideShim {
     Runtime(RuntimeSymbol),
     Powi { f64: bool },

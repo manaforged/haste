@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{Arch, Os};
 
 use super::shims::{Shim, emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
-use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym};
+use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, push_name, resolve_sym};
 
 const SECTION_NAMES: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0.debug_line\0";
 const LOCAL_FUNC_IN_TEXT: u32 = 0x0001_0002;
@@ -61,11 +61,15 @@ fn write_shdr(out: &mut Buf, [name, kind, link, info]: [u32; 4], [flags, addr, o
     out.u64s(&[align, entsize]);
 }
 
-fn write_symbols(out: &mut Buf, exe: &Executable, text: (u64, usize), symtab_off: usize, (strtab, fn_strx, lines): (&[u8], &[u32], &[u8])) {
-    let (text_va, text_off) = text;
-    let nsyms = 1 + fn_strx.len();
+/// Writes the symbol table, the section names, the line table and the section headers; `prelude` holds (offset, size, name) of the code before `.text`, and `exec` the file range of all executable code.
+fn write_symbols(out: &mut Buf, exe: &Executable, text_va: u64, symtab_off: usize, (strtab, fn_strx, prelude, lines): (&[u8], &[u32], &[(usize, usize, u32)], &[u8]), exec: (usize, usize)) {
+    let nsyms = 1 + fn_strx.len() + prelude.len();
     out.0.resize(symtab_off, 0);
     out.bytes(&[0; 24]);
+    for &(off, size, strx) in prelude {
+        out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
+        out.u64s(&[ELF_BASE + off as u64, size as u64]);
+    }
     for (at, (&strx, (off, _))) in fn_strx.iter().zip(&exe.symbols).enumerate() {
         let end = exe.symbols.get(at + 1).map_or(exe.text.len() as u32, |(next, _)| *next);
         out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
@@ -79,7 +83,7 @@ fn write_symbols(out: &mut Buf, exe: &Executable, text: (u64, usize), symtab_off
     out.bytes(lines);
     out.align(8);
     out.bytes(&[0; 64]);
-    write_shdr(out, [1, 1, 0, 0], [6, text_va, text_off as u64, exe.text.len() as u64, 16, 0]);
+    write_shdr(out, [1, 1, 0, 0], [6, ELF_BASE + exec.0 as u64, exec.0 as u64, (exec.1 - exec.0) as u64, 16, 0]);
     write_shdr(out, [7, 2, 3, nsyms as u32], [0, 0, symtab_off as u64, (nsyms * 24) as u64, 8, 24]);
     write_shdr(out, [15, 3, 0, 0], [0, 0, strtab_off as u64, strtab.len() as u64, 1, 0]);
     write_shdr(out, [23, 3, 0, 0], [0, 0, names_off as u64, SECTION_NAMES.len() as u64, 1, 0]);
@@ -132,9 +136,16 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let (key_off, bss_total) = plan.bss_layout(exe.bss);
     let mut strtab = vec![0u8];
     let fn_strx = exe.symbol_names("", &mut strtab);
+    let mut prelude: Vec<(usize, usize, u32)> = plan.imports.iter().enumerate().map(|(i, name)| (stubs_off + i * stub_size, stub_size, push_name(&mut strtab, &[name, "@plt"]))).collect();
+    prelude.push((start_off, start_size, push_name(&mut strtab, &["_start"])));
+    prelude.push((tramp_off, tramp_size, push_name(&mut strtab, &["haste_main_trampoline"])));
+    for (i, (shim, &off)) in plan.shims.iter().zip(&shim_offs).enumerate() {
+        let end = shim_offs.get(i + 1).copied().unwrap_or(head_off);
+        prelude.push((off, end - off, push_name(&mut strtab, &["haste_", &format!("{shim:?}")])));
+    }
     let symtab_off = (dyn_off + dyn_size).next_multiple_of(8);
     let lines = super::dwarf::debug_line(ELF_BASE + text_off as u64, exe.text.len() as u32, &exe.lines, &exe.sources);
-    let shdr_off = (symtab_off + (1 + fn_strx.len()) * 24 + strtab.len() + SECTION_NAMES.len() + lines.len()).next_multiple_of(8);
+    let shdr_off = (symtab_off + (1 + fn_strx.len() + prelude.len()) * 24 + strtab.len() + SECTION_NAMES.len() + lines.len()).next_multiple_of(8);
 
     let bss_va = rw_va + bss_in_rw as u64;
     let addrs = SectionAddrs {
@@ -214,6 +225,6 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         out.i64(tag);
         out.u64(val);
     }
-    write_symbols(&mut out, exe, (addrs.text, text_off), symtab_off, (&strtab, &fn_strx, &lines));
+    write_symbols(&mut out, exe, addrs.text, symtab_off, (&strtab, &fn_strx, &prelude, &lines), (stubs_off, rx_end));
     Ok(out.0)
 }

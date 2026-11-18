@@ -5,7 +5,7 @@ use super::wide::WideShim;
 use super::{Buf, Plan, SectionAddrs};
 use crate::host::cpu::HIDDEN;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::aot) enum Shim {
     Noop,
     Barrier,
