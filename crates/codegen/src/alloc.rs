@@ -681,18 +681,10 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
     let weights = blocks.as_deref().map(|blocks| walk::inherit(walk::weights(func, blocks, &sib, &elided), &live, split));
-    let (partners, back_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref(), !regs.two_address);
+    let (partners, back_args, edge_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref(), !regs.two_address);
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
     let copies = if regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
-    let hints = Hints {
-        reuse: &reuse,
-        weights: weights.as_deref(),
-        partners: partners.as_deref(),
-        back_args: &back_args,
-        park: park.as_deref(),
-        two_address: regs.two_address,
-        copies: &copies,
-    };
+    let hints = Hints { reuse: &reuse, weights: weights.as_deref(), partners: partners.as_deref(), back_args: &back_args, edge_args: &edge_args, park: park.as_deref(), two_address: regs.two_address, copies: &copies };
     let (passed_ints, passed_floats) = hints::passed(func, classify, regs.high_product);
     let (homes, used) = allocate(func, &live, &int_class(func, regs, (order, copied, &elided), params, passed_ints), &ints, &hints);
     place(&mut locations, homes, Location::Reg);

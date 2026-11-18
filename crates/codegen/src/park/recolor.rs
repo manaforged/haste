@@ -41,9 +41,9 @@ impl<F: Copy + PartialEq> Join<'_, F> {
         true
     }
 
-    /// Gives each back-edge argument and its parameter one register when one of them can take the other's without losing another copy, hottest edges first.
-    pub(super) fn join_back_args(&self, slots: &mut SlotSet, homes: &mut [Option<F>]) {
-        for &(param, arg) in self.hints.back_args {
+    /// Gives each edge argument of `args` and its parameter one register when one of them can take the other's without losing another copy, in list order.
+    pub(super) fn join_args(&self, args: &[(usize, usize)], slots: &mut SlotSet, homes: &mut [Option<F>]) {
+        for &(param, arg) in args {
             if param == arg || homes[param].is_none() || homes[param] == homes[arg] {
                 continue;
             }

@@ -30,6 +30,7 @@ pub(crate) struct Hints<'a> {
     pub weights: Option<&'a [u64]>,
     pub partners: Option<&'a [Vec<Value>]>,
     pub back_args: &'a [(usize, usize)],
+    pub edge_args: &'a [(usize, usize)],
     pub park: Option<&'a [u64]>,
     pub two_address: bool,
     pub copies: &'a [(usize, usize)],
@@ -508,7 +509,8 @@ fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &P
         }
     }
     let join = recolor::Join { func, live, pool, hints, back_partners: &back_partners, reverse_reuse: &reverse_reuse };
-    join.join_back_args(&mut slots, &mut homes);
+    join.join_args(hints.back_args, &mut slots, &mut homes);
+    join.join_args(hints.edge_args, &mut slots, &mut homes);
     join.share_copies(&mut slots, &mut homes);
     let used = (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !slots.is_empty(s)).map(|s| pool.regs[s]).collect();
     (homes, used)
