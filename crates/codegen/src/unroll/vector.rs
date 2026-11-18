@@ -434,32 +434,46 @@ fn advance(e: &mut Emit<'_>, q: &[Value], strides: &[Option<Value>]) -> Vec<Valu
 }
 
 /// Whether `at` through `at + LANES - 1` all stay below `bound`.
-fn fits(e: &mut Emit<'_>, at: Value, bound: Value, within: bool) -> Value {
+fn fits(e: &mut Emit<'_>, at: Value, bound: Value) -> Value {
     let ty = e.func.ty(at);
     let left = e.op(Op::Binary(Binary::Isub, bound, at), ty);
     let lanes = e.konst(LANES, ty);
     let wide = e.op(Op::Icmp(IntCC::UnsignedGreaterThanOrEqual, left, lanes), Type::I8);
-    if within {
-        return wide;
-    }
     let below = e.op(Op::Icmp(IntCC::UnsignedLessThan, at, bound), Type::I8);
     e.op(Op::Binary(Binary::Band, below, wide), Type::I8)
 }
 
-/// Whether one more vector iteration from `at` stays inside the trip count and every bounds check; `within` when `at` is known not to pass any bound.
-fn room(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, at: &[Value], within: bool) -> Value {
-    let mut ok = fits(e, at[lp.iv], lp.limit, within);
-    for &(idx, bound) in &shape.bounds {
-        if (idx, bound) != (lp.iv, lp.limit) {
-            let inside = fits(e, at[idx], bound, within);
-            ok = e.op(Op::Binary(Binary::Band, ok, inside), Type::I8);
-        }
+/// The trip count and every bounds check of the loop, as `(index, bound)` pairs without repeats.
+fn limits(shape: &Shape, lp: &Loopy<'_>) -> Vec<(usize, Value)> {
+    std::iter::once((lp.iv, lp.limit)).chain(shape.bounds.iter().copied().filter(|&pair| pair != (lp.iv, lp.limit))).collect()
+}
+
+/// Whether one vector iteration from `at` stays inside the trip count and every bounds check.
+fn room(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, at: &[Value]) -> Value {
+    let mut ok = None;
+    for (idx, bound) in limits(shape, lp) {
+        let inside = fits(e, at[idx], bound);
+        ok = Some(ok.map_or(inside, |acc| e.op(Op::Binary(Binary::Band, acc, inside), Type::I8)));
     }
-    ok
+    ok.expect("the trip count is always a limit")
+}
+
+/// The number of whole vector iterations from `at` that every limit admits, once `room` holds there.
+fn trips(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, at: &[Value]) -> Value {
+    let mut n = None;
+    for (idx, bound) in limits(shape, lp) {
+        let ty = e.func.ty(at[idx]);
+        let left = e.op(Op::Binary(Binary::Isub, bound, at[idx]), ty);
+        let left = if ty == Type::I64 { left } else { e.op(Op::Convert(Convert::Uextend, left), Type::I64) };
+        let shift = e.konst(LANES.trailing_zeros().into(), Type::I64);
+        let whole = e.op(Op::Binary(Binary::Ushr, left, shift), Type::I64);
+        n = Some(n.map_or(whole, |acc| e.op(Op::Binary(Binary::Umin, acc, whole), Type::I64)));
+    }
+    n.expect("the trip count is always a limit")
 }
 
 fn guard(e: &mut Emit<'_>, shape: &Shape, lp: &Loopy<'_>, p: &[Value]) -> Value {
-    let mut ok = room(e, shape, lp, p, false);
+    let mut ok = room(e, shape, lp, p);
     let Some(store) = shape.store else { return ok };
     for &load in &shape.loads {
         if static_safe(load, store).is_some() {
@@ -547,6 +561,7 @@ pub(super) fn run(
     let r = fresh(func, &params);
     let mut e = Emit { func, out: Vec::new() };
     let ok = guard(&mut e, &shape, &lp, &p);
+    let n = trips(&mut e, &shape, &lp, &p);
     let mut splats = Vec::new();
     for &v in &shape.splats {
         let source = match e.func.insts.iter().find(|d| d.result == Some(v)).map(|d| d.op.clone()) {
@@ -562,21 +577,25 @@ pub(super) fn run(
         .map(|(&v, &s)| s.filter(|&s| s != 0).map(|s| { let ty = e.func.ty(v); e.konst(s * LANES, ty) }))
         .collect();
     let pre_insts = std::mem::take(&mut e.out);
+    let left = e.func.value(Type::I64);
     let map = lane_body(&mut e, &shape, (&q, &splats));
     let mut next = advance(&mut e, &q, &strides);
     add_sums(&mut e, &shape, (&q, &map), &mut next, sad);
-    let more = room(&mut e, &shape, &lp, &next, true);
+    let one = e.konst(1, Type::I64);
+    let rest = e.op(Op::Binary(Binary::Isub, left, one), Type::I64);
+    let zero = e.konst(0, Type::I64);
+    let more = e.op(Op::Icmp(IntCC::NotEqual, rest, zero), Type::I8);
     let body_insts = std::mem::take(&mut e.out);
     let done = e.op(Op::Icmp(IntCC::Equal, r[lp.iv], lp.limit), Type::I8);
     let leave = exit_values(&mut e, &lp, &r, exit_args);
     let tail_insts = std::mem::take(&mut e.out);
     let Emit { func, .. } = e;
     let pre = new_block(func, p.clone(), pre_insts);
-    let vbody = new_block(func, q, body_insts);
+    let vbody = new_block(func, q.into_iter().chain([left]).collect(), body_insts);
     let tail = new_block(func, r.clone(), tail_insts);
-    let enter = func.add(Op::Brif(ok, vbody, p.clone(), head, p), None);
+    let enter = func.add(Op::Brif(ok, vbody, p.iter().copied().chain([n]).collect(), head, p), None);
     func.blocks[pre.index()].insts.push(enter);
-    let back = func.add(Op::Brif(more, vbody, next.clone(), tail, next), None);
+    let back = func.add(Op::Brif(more, vbody, next.iter().copied().chain([rest]).collect(), tail, next), None);
     func.blocks[vbody.index()].insts.push(back);
     let finish = func.add(Op::Brif(done, exit_blk, leave, head, r), None);
     func.blocks[tail.index()].insts.push(finish);
