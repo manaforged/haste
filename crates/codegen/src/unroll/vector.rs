@@ -239,7 +239,7 @@ fn splat(e: &mut Emit<'_>, scalar: Value) -> Value {
     splat_in(e, VEC, scalar)
 }
 
-fn splat_in(e: &mut Emit<'_>, ty: Type, scalar: Value) -> Value {
+pub(crate) fn splat_in(e: &mut Emit<'_>, ty: Type, scalar: Value) -> Value {
     let zero = e.op(Op::Const(0), ty);
     let first = e.op(Op::Insert(zero, scalar, 0), ty);
     e.op(Op::Shuffle(first, first, ShuffleMask::Const([0; 16])), ty)

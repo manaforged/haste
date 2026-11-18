@@ -8,6 +8,8 @@ use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Type, Value};
 use crate::{Arch, Target};
+pub(crate) use memset::Emit;
+pub(crate) use vector::splat_in;
 use count::{Counted, counted, head_defs, outside_preds, stride_const};
 
 const MAX_FULL_TRIPS: usize = 64;

@@ -11,7 +11,8 @@ mod sink;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, invalidate_preserving, record_base, write_preserving};
-use join::{BlockClobber, JoinCtx, const_eq_for_ty, eligible_join_preds, for_edge_args, for_edge_args_mut, resolve_select_load, rodata_const, try_join_phi_forward};
+pub(crate) use join::for_edge_args_mut;
+use join::{BlockClobber, JoinCtx, const_eq_for_ty, eligible_join_preds, for_edge_args, resolve_select_load, rodata_const, try_join_phi_forward};
 use remat::{FarCseGuard, SubwordAction, SubwordSlices, drop_covered_stores, drop_stores_if, resolve_subword_plan, sink_terminator_defs};
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, TargetOpId, TinyArgs, Type, Value};

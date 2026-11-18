@@ -223,7 +223,7 @@ pub(super) fn eligible_join_preds(func: &Function, cfg: &Cfg, visited: &[bool], 
     (2..=8).contains(&unique.len()).then_some(unique)
 }
 
-pub(super) fn for_edge_args_mut(func: &mut Function, pred: Block, target: Block, mut f: impl FnMut(&mut Vec<Value>)) {
+pub(crate) fn for_edge_args_mut(func: &mut Function, pred: Block, target: Block, mut f: impl FnMut(&mut Vec<Value>)) {
     let Some(&last) = func.blocks[pred.index()].insts.last() else { return };
     match &mut func.insts[last.index()].op {
         Op::Jump(b, args) if *b == target => f(args),

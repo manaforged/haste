@@ -16,14 +16,14 @@ struct Fill {
 }
 
 /// Instructions appended in order to `out`, each with a fresh result in `func`.
-pub(super) struct Emit<'f> {
-    pub(super) func: &'f mut Function,
-    pub(super) out: Vec<Inst>,
+pub(crate) struct Emit<'f> {
+    pub(crate) func: &'f mut Function,
+    pub(crate) out: Vec<Inst>,
 }
 
 impl Emit<'_> {
     /// Appends `op` with a fresh result of type `ty`.
-    pub(super) fn op(&mut self, op: Op, ty: Type) -> Value {
+    pub(crate) fn op(&mut self, op: Op, ty: Type) -> Value {
         let value = self.func.value(ty);
         let inst = self.func.add(op, Some(value));
         self.out.push(inst);

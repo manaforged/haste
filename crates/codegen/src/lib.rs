@@ -33,6 +33,7 @@ mod reloc;
 mod returns;
 mod rotate;
 mod schedule;
+mod slp;
 mod split;
 mod spills;
 mod switch;
