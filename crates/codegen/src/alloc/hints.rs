@@ -1,4 +1,5 @@
-use crate::ir::{Binary, Block, Convert, Function, Op, TargetOpId, Type, Unary, Value};
+use crate::frame::{Abi, Loc};
+use crate::ir::{Binary, Block, Convert, Function, Op, Signature, TargetOpId, Type, Unary, Value};
 use crate::live::{Live, covers, overlaps};
 use crate::park::crosses_ranges;
 
@@ -259,4 +260,49 @@ pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>],
         }
     }
     out
+}
+
+/// The register each value is passed or returned in at a call or return, and the register a high product lands in.
+pub(super) fn passed<R: Copy>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>, high_product: Option<R>) -> (Vec<Option<(R, bool)>>, Vec<Option<(u8, bool)>>) {
+    let (mut ints, mut floats) = (vec![None; func.types.len()], vec![None; func.types.len()]);
+    let mark = |vals: &[Value], locs: &[Loc<R>], arg: bool, ints: &mut [Option<(R, bool)>], floats: &mut [Option<(u8, bool)>]| {
+        for (val, loc) in vals.iter().zip(locs) {
+            match *loc {
+                Loc::Int(reg) if arg || ints[val.index()].is_none() => ints[val.index()] = Some((reg, arg)),
+                Loc::Float(reg) if arg || floats[val.index()].is_none() => floats[val.index()] = Some((reg, arg)),
+                _ => {}
+            }
+        }
+    };
+    let ret_abi = classify(&func.signature).ok();
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        match &func.insts[inst.index()].op {
+            Op::Call { sig, args, results, .. } => {
+                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
+                    mark(args, &abi.params, true, &mut ints, &mut floats);
+                    mark(results, &abi.returns, false, &mut ints, &mut floats);
+                }
+            }
+            Op::TryCall { sig, args, .. } => {
+                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
+                    mark(args, &abi.params, true, &mut ints, &mut floats);
+                }
+            }
+            Op::Binary(Binary::Umulhi | Binary::Smulhi, ..) => {
+                if let (Some(reg), Some(res)) = (high_product, func.insts[inst.index()].result)
+                    && func.ty(res) == Type::I64
+                    && ints[res.index()].is_none()
+                {
+                    ints[res.index()] = Some((reg, false));
+                }
+            }
+            Op::Return(vals) => {
+                if let Some(abi) = &ret_abi {
+                    mark(vals, &abi.returns, false, &mut ints, &mut floats);
+                }
+            }
+            _ => {}
+        }
+    }
+    (ints, floats)
 }

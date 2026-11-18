@@ -63,6 +63,7 @@ const REGS: Regs<Reg> = Regs {
     fold_sib: true,
     call_zext: true,
     imm_store,
+    high_product: None,
 };
 
 /// Zero stores from `xzr`; any other constant goes into a register first.

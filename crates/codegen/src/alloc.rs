@@ -30,6 +30,8 @@ pub(crate) struct Regs<R: 'static> {
     pub call_zext: bool,
     /// The instructions that store a constant into a frame home.
     pub imm_store: fn(i64) -> u64,
+    /// The register a 64-bit high product lands in, which the product keeps as its home when nothing else needs it.
+    pub high_product: Option<R>,
 }
 
 const FOLD_LIMIT: i64 = 1 << 24;
@@ -376,42 +378,6 @@ fn eligible(live: &Live, wanted: &[bool], value: usize) -> bool {
     wanted[value] && !live.ranges_of(value).is_empty() && !crate::park::crosses_ranges(&live.unwinds, live.ranges_of(value))
 }
 
-fn passed<R: Copy>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> (Vec<Option<(R, bool)>>, Vec<Option<(u8, bool)>>) {
-    let (mut ints, mut floats) = (vec![None; func.types.len()], vec![None; func.types.len()]);
-    let mark = |vals: &[Value], locs: &[Loc<R>], arg: bool, ints: &mut [Option<(R, bool)>], floats: &mut [Option<(u8, bool)>]| {
-        for (val, loc) in vals.iter().zip(locs) {
-            match *loc {
-                Loc::Int(reg) if arg || ints[val.index()].is_none() => ints[val.index()] = Some((reg, arg)),
-                Loc::Float(reg) if arg || floats[val.index()].is_none() => floats[val.index()] = Some((reg, arg)),
-                _ => {}
-            }
-        }
-    };
-    let ret_abi = classify(&func.signature).ok();
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        match &func.insts[inst.index()].op {
-            Op::Call { sig, args, results, .. } => {
-                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
-                    mark(args, &abi.params, true, &mut ints, &mut floats);
-                    mark(results, &abi.returns, false, &mut ints, &mut floats);
-                }
-            }
-            Op::TryCall { sig, args, .. } => {
-                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
-                    mark(args, &abi.params, true, &mut ints, &mut floats);
-                }
-            }
-            Op::Return(vals) => {
-                if let Some(abi) = &ret_abi {
-                    mark(vals, &abi.returns, false, &mut ints, &mut floats);
-                }
-            }
-            _ => {}
-        }
-    }
-    (ints, floats)
-}
-
 fn int_class<'a, R: Copy + PartialEq>(
     func: &Function,
     regs: &'a Regs<R>,
@@ -697,7 +663,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         two_address: regs.two_address,
         copies: &copies,
     };
-    let (passed_ints, passed_floats) = passed(func, classify);
+    let (passed_ints, passed_floats) = hints::passed(func, classify, regs.high_product);
     let (homes, used) = allocate(func, &live, &int_class(func, regs, (order, copied, &elided), params, passed_ints), &ints, &hints);
     place(&mut locations, homes, Location::Reg);
     for (v, loc) in promoted_consts.into_iter().map(|(v, i)| (v, Location::Imm(i))).chain(promoted_syms) {

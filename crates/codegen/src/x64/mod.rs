@@ -44,6 +44,7 @@ const REGS: Regs<Reg> = Regs {
     fold_sib: true,
     call_zext: false,
     imm_store,
+    high_product: Some(Reg::Rdx),
 };
 
 /// One `mov` stores a sign-extended 32-bit immediate; a wider one goes through a register.
