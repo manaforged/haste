@@ -203,6 +203,20 @@ impl Lower<'_, '_> {
                 };
                 Ok(Some(self.emit_chunks(x86.out_bytes(), product)))
             }
+            (X86Symbol::Permd, &[a, index]) => {
+                let slot = self.b.create_stack_slot(32, 5);
+                for lane in 0..8 {
+                    let at = self.ins().load(Type::I32, index, lane * 4);
+                    let seven = self.ins().iconst(Type::I32, 7);
+                    let at = self.ins().band(at, seven);
+                    let at = self.ins().uextend(Type::I64, at);
+                    let at = self.ins().imul_imm(at, 4);
+                    let from = self.ins().iadd(a, at);
+                    let word = self.ins().load(Type::I32, from, 0);
+                    self.ins().stack_store(word, slot, lane * 4);
+                }
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
             (X86Symbol::Lddqu, &[at]) => {
                 let v = self.ins().load(i8x16, at, 0);
                 Ok(Some(self.store_vec(v, 16)))
