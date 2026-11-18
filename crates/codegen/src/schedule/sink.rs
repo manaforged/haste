@@ -6,6 +6,7 @@ use crate::ir::{Binary, Block, Convert, Function, Inst, Op, Type, Unary, Value};
 use crate::live::results;
 
 mod addr;
+mod reuse;
 
 struct DistMatch {
     op: Binary,
@@ -781,5 +782,6 @@ pub(crate) fn run(func: &mut Function, balance: bool) {
     for bi in 0..func.blocks.len() {
         sink_pure_block(func, &live_defs, &uses, bi);
     }
+    reuse::after_last_read(func, &uses, &live_defs);
     addr::split_address_sums(func);
 }
