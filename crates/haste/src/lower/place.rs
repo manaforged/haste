@@ -380,6 +380,15 @@ impl Lower<'_, '_> {
         Ok(Some(if matches!(repr, Repr::Mem { .. }) { self.snapshot_repr(repr, addr) } else { addr }))
     }
 
+    /// Whether `expr` names a whole local whose type needs drop, so reading it by value moves it and nothing reads it again before it is reinitialized.
+    fn moved_local(&mut self, expr: ExprId) -> Result<bool> {
+        if let Some(inner) = self.transparent(expr) {
+            return self.moved_local(inner);
+        }
+        let local = matches!(self.body.expr(expr), Expr::Path(_)) && matches!(self.typed.res.get(&expr), Some(Res::Local(_)));
+        Ok(local && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))?)
+    }
+
     /// Records a move out of `expr`'s place when its type needs drop.
     pub(super) fn move_from_expr(&mut self, expr: ExprId) -> Result<()> {
         if !self.open || !crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
@@ -393,6 +402,12 @@ impl Lower<'_, '_> {
 
     /// Evaluates `expr` by value, records its move, and snapshots a `Repr::Mem` place expression into a fresh frame slot.
     pub(super) fn eval_operand(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        self.operand(expr, false)
+    }
+
+    /// Evaluates `expr` as `eval_operand` does, but passes a moved local in place when `last` says no later operand of the same call can reinitialize it.
+    pub(super) fn operand(&mut self, expr: ExprId, last: bool) -> Result<Option<Value>> {
+        let in_place = last && self.moved_local(expr)?;
         let value = self.expr(expr)?;
         self.move_from_expr(expr)?;
         let Some(addr) = value else {
@@ -400,7 +415,7 @@ impl Lower<'_, '_> {
         };
         let coerced = self.typed.coercions.get(&expr);
         let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_)));
-        if !self.open || !self.may_alias_place(expr) || fresh_coercion {
+        if !self.open || !self.may_alias_place(expr) || fresh_coercion || (in_place && coerced.is_none()) {
             return Ok(Some(addr));
         }
         let repr = self.coerced_repr(expr, coerced)?;

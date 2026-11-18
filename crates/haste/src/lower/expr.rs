@@ -399,10 +399,11 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
-        for arg in self.body.list(args).to_vec() {
+        let list = self.body.list(args).to_vec();
+        for (index, &arg) in list.iter().enumerate() {
             let expr = ExprId(arg);
             if !self.typed.const_args.contains(&expr) {
-                values.extend(self.eval_operand(expr)?);
+                values.extend(self.operand(expr, index + 1 == list.len())?);
             }
         }
         Ok(values)
