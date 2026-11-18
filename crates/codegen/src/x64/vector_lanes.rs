@@ -48,6 +48,7 @@ impl Emit<'_> {
             return done;
         }
         match op {
+            Op::Shuffle(a, ..) if self.splat_insert(*a, result) => Ok(()),
             Op::Shuffle(a, b, mask) => self.vector_shuffle(*a, *b, mask, result),
             Op::Extract(v, lane) => self.vector_extract(*v, *lane, result),
             Op::Insert(v, x, lane) => self.vector_insert(*v, *x, *lane, result),

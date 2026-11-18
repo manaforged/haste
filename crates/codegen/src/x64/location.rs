@@ -9,10 +9,10 @@ use patterns::odd_scale_source;
 use super::asm::{Alu, Asm, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::float::{X2, scalar};
 use super::Emit;
-use crate::alloc::Location;
+use crate::alloc::{Location, Plan};
 use crate::fold::fits_imm32;
 use crate::frame::{ArgStep, Emitter, Ext};
-use crate::ir::{Op, Type, Value};
+use crate::ir::{Function, Inst, Op, ShuffleMask, Type, Value};
 use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -644,6 +644,44 @@ impl Emit<'_> {
             if ty.bytes() == 16 {
                 self.invalidate_disp(disp + 8);
             }
+        }
+    }
+}
+
+impl Emit<'_> {
+    /// Broadcasts lane 0 of `v` into `result` straight from the scalar register when fuse elided `v` as an insert into zero; returns whether it did.
+    pub(super) fn splat_insert(&mut self, v: Value, result: Value) -> bool {
+        let Some(Op::Insert(_, scalar, 0)) = self.defs[v.index()].filter(|_| self.plan.elided[v.index()]).map(|inst| self.func.insts[inst.index()].op.clone()) else { return false };
+        let Some((lane, _)) = self.ty(v).vec_shape() else { return false };
+        let dst = self.xmm_of(result).unwrap_or(X2);
+        let reg = self.reg_of(scalar).unwrap_or_else(|| {
+            self.get(Reg::Rax, scalar, Ext::Zero);
+            Reg::Rax
+        });
+        self.clobber_reg(Reg::Rax);
+        self.emit_mov_xmm_gpr(dst, reg, lane == crate::ir::Lane::I64);
+        self.asm.vex(super::asm::Vl::X, super::ymm::broadcast(lane), (dst, Xmm(0)), dst);
+        self.fput(result, dst);
+        true
+    }
+}
+
+type Site = Option<(usize, usize, Inst)>;
+
+/// Elides each integer lane-0 insert into a zero vector whose every use is one later lane-0 broadcast in its block, which then moves the scalar in from its own register.
+pub(super) fn elide_broadcast_inserts(func: &Function, plan: &mut Plan<Reg>, defs: &[Option<Inst>], (uses, pos_of, use_of): (&[u32], &[Site], &[Site])) {
+    let zero = |v: Value| defs[v.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Const(0)));
+    for (v, def) in pos_of.iter().enumerate() {
+        let Some((block, start, inst)) = *def else { continue };
+        let Op::Insert(base, scalar, 0) = func.insts[inst.index()].op else { continue };
+        let Some((lane, count)) = func.ty(base).vec_shape() else { continue };
+        if base == scalar || !lane.is_int() || func.ty(base).bytes() != 16 || !zero(base) || plan.elided[v] { continue; }
+        let Some((used_in, end, user)) = use_of[v] else { continue };
+        let Op::Shuffle(a, b, ShuffleMask::Const(mask)) = func.insts[user.index()].op else { continue };
+        let reads = u32::from(a.index() == v) + u32::from(b.index() == v);
+        if used_in != block || a.index() != v || uses[v] != reads || mask[..usize::from(count)].iter().any(|&at| at != 0) { continue; }
+        if fuse::preserved(func, plan, block, start, end, &[], scalar) {
+            plan.elided[v] = true;
         }
     }
 }
