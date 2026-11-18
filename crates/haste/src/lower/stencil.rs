@@ -611,7 +611,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
     };
     let cycle = if mode == LowerMode::Stencil
         && slots.allow_inline()
-        && func.has_vtable_slots()
+        && (func.has_vtable_slots() || RelocPlan::has_fn_pointers(&reloc_plan))
         && !func.is_coroutine()
     {
         splice_devirt_vtable_calls(cx, (reached, slots), inline, (&mut func, &mut relocs, &mut reloc_plan), cycle)?
@@ -659,6 +659,7 @@ fn canonicalize_const_symbols(func: &mut Function, steps: &[RelocStep]) {
     });
 }
 
+/// Inlines calls whose callee simplification resolved to a static vtable slot or to a function item coerced to a pointer.
 fn splice_devirt_vtable_calls(
     cx: &mut Context<'_>,
     (reached, slots): (&Reached, &dyn Slots),
@@ -672,9 +673,13 @@ fn splice_devirt_vtable_calls(
         any = false;
         let current_plan = RelocPlan { steps: reloc_plan.clone().into_boxed_slice() };
         let mut spliced = false;
-        for (block, pos, callee_sym) in func.devirt_call_sites() {
+        for (block, pos, callee_sym) in func.symbol_call_sites() {
             let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(callee_sym as usize) else { continue };
-            let Some((expr, slot)) = current_plan.vtable_slot_at(callee_sym as usize) else { continue };
+            let origin = match current_plan.vtable_slot_at(callee_sym as usize) {
+                Some((expr, slot)) => SiteOrigin::VtableMethod { expr, slot },
+                None if current_plan.step_at(callee_sym as usize).is_some_and(RelocStep::is_reify) => SiteOrigin::Symbol(callee_sym),
+                None => continue,
+            };
             let Some(limit) = super::budget::inline_limit(cx, reached, callee_idx) else { continue };
             let (hit, cycle) = resolve_inline(cx, (reached, slots), inline, callee_idx, (limit, false))?;
             cycle_root = cycle_root.min(cycle);
@@ -684,7 +689,7 @@ fn splice_devirt_vtable_calls(
             }
             let sym_base = relocs.len() as u32;
             relocs.extend(inlined.relocs.iter().cloned());
-            reloc_plan.push(RelocStep::SiteInline { origin: SiteOrigin::VtableMethod { expr, slot }, plan: Arc::clone(&inlined.reloc_plan) });
+            reloc_plan.push(RelocStep::SiteInline { origin, plan: Arc::clone(&inlined.reloc_plan) });
             func.splice_call(block, pos, &inlined.body, sym_base);
             spliced = true;
             any = true;

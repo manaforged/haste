@@ -68,6 +68,8 @@ pub(crate) enum SiteOrigin {
     ShapeClone(u16),
     VtableMethod { expr: ExprId, slot: u16 },
     Known(ItemRef, Substs),
+    /// The function that symbol `n` of the same plan names, counted from the plan's first symbol.
+    Symbol(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,11 @@ pub(crate) enum RelocStep {
 }
 
 impl RelocStep {
+    /// Whether this step names a function reified to a pointer, whose calls are calls of that function.
+    pub(crate) fn is_reify(&self) -> bool {
+        matches!(self, RelocStep::SiteSlot(SiteOrigin::Table(SiteKey::CoercionReify(_))))
+    }
+
     /// How many symbols this step produces.
     pub(crate) fn symbols(&self) -> usize {
         match self {
@@ -106,6 +113,29 @@ impl RelocPlan {
 
     pub(crate) fn reloc_len(&self) -> usize {
         self.steps.iter().map(RelocStep::symbols).sum()
+    }
+
+    /// The step that produces symbol `target_sym`, looking inside inlined plans.
+    pub(super) fn step_at(&self, mut target_sym: usize) -> Option<&RelocStep> {
+        for step in &self.steps {
+            let len = step.symbols();
+            if target_sym < len {
+                return match step {
+                    RelocStep::SiteInline { plan, .. } => plan.step_at(target_sym),
+                    other => Some(other),
+                };
+            }
+            target_sym -= len;
+        }
+        None
+    }
+
+    /// Whether any of `steps`, inside inlined plans too, names a function reified to a pointer.
+    pub(super) fn has_fn_pointers(steps: &[RelocStep]) -> bool {
+        steps.iter().any(|step| match step {
+            RelocStep::SiteInline { plan, .. } => Self::has_fn_pointers(&plan.steps),
+            other => other.is_reify(),
+        })
     }
 
     pub(super) fn vtable_slot_at(&self, target_sym: usize) -> Option<(ExprId, u16)> {
@@ -137,7 +167,7 @@ fn eval_into(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, plan: &
         Ok(typed) => typed.as_ref(),
         Err(err) => bail!("{}: {err}", cx.name(*item)),
     };
-    let substs = *substs;
+    let (substs, base) = (*substs, out.len());
     for step in &plan.steps {
         match step {
             RelocStep::Const(src) => out.push(src.clone()),
@@ -166,6 +196,10 @@ fn eval_into(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, plan: &
                     Some(super::stencil::VtableEntry::Word(super::Word::Code(idx))) => *idx,
                     other => bail!("vtable slot {} is not code: {:?}", slot, other),
                 };
+                eval_into(cx, reached, slots, sub_plan, callee_idx, out)?;
+            }
+            RelocStep::SiteInline { origin: SiteOrigin::Symbol(at), plan: sub_plan } => {
+                let Some(&SymbolSource::Slot(callee_idx)) = out.get(base + *at as usize) else { bail!("symbol {at} names no function") };
                 eval_into(cx, reached, slots, sub_plan, callee_idx, out)?;
             }
             RelocStep::SiteInline { origin, plan: sub_plan } => {
@@ -278,6 +312,7 @@ fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Sub
         },
         SiteOrigin::VtableMethod { slot, .. } => bail!("unexpected eval_site for vtable method slot {slot}"),
         SiteOrigin::Known(item, call_substs) => Ok((*item, *call_substs)),
+        SiteOrigin::Symbol(at) => bail!("unexpected eval_site for symbol {at}"),
     }
 }
 

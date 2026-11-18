@@ -446,6 +446,7 @@ where
             SiteOrigin::ShapeClone(idx) => { out.push(8); write_u16(out, *idx); }
             SiteOrigin::VtableMethod { expr, slot } => { out.push(9); write_u32(out, expr.0); write_u16(out, *slot); }
             SiteOrigin::Known(item, substs) => { out.push(10); write_u32(out, self.item_id(*item)?); write_u32s(out, &self.substs_ids(*substs)?); }
+            SiteOrigin::Symbol(at) => { out.push(11); write_u32(out, *at); }
         }
         Some(())
     }
@@ -594,6 +595,7 @@ impl<'a> Decoder<'a> {
             8 => SiteOrigin::ShapeClone(cur.u16()?),
             9 => SiteOrigin::VtableMethod { expr: ExprId(cur.u32()?), slot: cur.u16()? },
             10 => SiteOrigin::Known(self.item_at(cur.u32()?)?, read_substs(cur, self.types, self.tys)?),
+            11 => SiteOrigin::Symbol(cur.u32()?),
             _ => bail!("invalid site origin tag"),
         })
     }

@@ -631,21 +631,18 @@ impl Function {
     /// Whether this function is an unsplit coroutine body.
     pub fn is_coroutine(&self) -> bool { self.coroutine.is_some() }
 
-    /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol or slot-addr recorded in `vtable_slots`.
-    pub fn devirt_call_sites(&self) -> Vec<(Block, usize, u32)> {
-        if self.vtable_slots.is_empty() {
-            return Vec::new();
-        }
-        let mut slot_syms = vec![None; self.types.len()];
+    /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol, a slot address, or a load from either.
+    pub fn symbol_call_sites(&self) -> Vec<(Block, usize, u32)> {
+        let mut syms = vec![None; self.types.len()];
         for data in &self.insts {
             if let (Op::Symbol(sym) | Op::SlotAddr(sym), Some(res)) = (&data.op, data.result) {
-                slot_syms[res.index()] = Some(*sym);
+                syms[res.index()] = Some(*sym);
             }
         }
-        let mut syms = slot_syms.clone();
+        let named = syms.clone();
         for data in &self.insts {
             if let (Op::Load(addr, 0), Some(res)) = (&data.op, data.result)
-                && let Some(sym) = slot_syms[addr.index()]
+                && let Some(sym) = named[addr.index()]
             {
                 syms[res.index()] = Some(sym);
             }
@@ -655,7 +652,6 @@ impl Function {
             for (pos, &inst) in block.insts.iter().enumerate() {
                 if let Op::Call { callee, .. } = self.insts[inst.index()].op
                     && let Some(sym) = syms[callee.index()]
-                    && self.vtable_slots.iter().any(|&(_, _, s, _)| s == sym)
                 {
                     out.push((Block(b_idx as u32), pos, sym));
                 }
