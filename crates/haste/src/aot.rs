@@ -616,6 +616,20 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             out[at..at + 4].copy_from_slice(&delta.to_le_bytes());
             continue;
         }
+        if reloc.kind == RelocKind::Abs64 && at >= 2 && out[at - 2] & 0xF8 == 0x48 && out[at - 1] & 0xF8 == 0xB8 {
+            let (load_got, slot) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, got_vas)?;
+            if load_got {
+                let next_ip = text_va + u64::from(reloc.offset) + 5;
+                let delta = i32::try_from(slot as i64 - next_ip as i64).context("Abs64 import GOT slot out of range")?;
+                let reg = out[at - 1] & 7;
+                out[at - 2] = 0x48 | ((out[at - 2] & 1) << 2);
+                out[at - 1] = 0x8B;
+                out[at] = 0x05 | (reg << 3);
+                out[at + 1..at + 5].copy_from_slice(&delta.to_le_bytes());
+                out[at + 5..at + 8].copy_from_slice(&[0x0F, 0x1F, 0x00]);
+                continue;
+            }
+        }
         let (_, value) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, stub_vas)?;
         match reloc.kind {
             RelocKind::Arm64Call26 => {
