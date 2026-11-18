@@ -189,9 +189,10 @@ impl<'a> Infer<'_, 'a> {
         found
     }
 
-    /// The body-declared item whose text names are read in now: the frame's item when the body declares it, as for another item's header, otherwise the instance being inferred.
+    /// The body-declared item whose text names are read in now: the frame's item or the impl block being read when the body declares it, as for another item's header, otherwise the instance being inferred.
     fn reader(&self) -> Option<ItemRef> {
-        let frame = self.frame_item.filter(|item| item.declaring_body().is_some() && item.declaring_body() == self.root);
+        let declared = |item: &ItemRef| item.declaring_body().is_some() && item.declaring_body() == self.root;
+        let frame = self.frame_item.or_else(|| self.block.and_then(ImplRef::item)).filter(declared);
         frame.or_else(|| self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()))
     }
 
