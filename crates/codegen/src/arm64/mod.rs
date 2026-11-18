@@ -13,7 +13,7 @@ use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
-use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
+use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, IntCC, Lane, Op, ReduceOp, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
@@ -88,7 +88,8 @@ fn emit_save_pairs<T: Copy>(asm: &mut Asm, regs: &[T], base: usize, mut step: im
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let Prepared { order, copied, abi, mut plan, mut frame, mut framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let func = split.as_ref().unwrap_or(func);
     let defs = crate::fold::defs(func);
     let dropped = |plan: &crate::alloc::Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
     let dropped_before = dropped(&plan);

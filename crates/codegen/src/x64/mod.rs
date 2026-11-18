@@ -18,7 +18,7 @@ pub(crate) use ymm::host_avx2;
 use frame::{Abi, Loc, SAVED, SAVED_RBP, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
-use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
+use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, TargetOpId, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
@@ -76,7 +76,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         (_, true) => &REGS,
         (_, false) => &REGS_RBP,
     };
-    let Prepared { order, copied, abi, mut plan, mut frame, mut framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let func = split.as_ref().unwrap_or(func);
     let features = Features::host();
     let elided_before = plan.elided.iter().filter(|&&e| e).count();
     let roots = location::fuse(func, &mut plan, &features);

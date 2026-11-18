@@ -19,6 +19,7 @@ mod frame;
 mod ifconv;
 mod licm;
 mod live;
+mod loopargs;
 mod loads;
 mod lsr;
 pub(crate) mod mem;

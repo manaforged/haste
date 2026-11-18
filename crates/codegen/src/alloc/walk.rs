@@ -4,7 +4,7 @@ use std::slice::Iter;
 use crate::cfg::Cfg;
 use crate::frame::terminator_edges;
 use crate::ir::{Block, Function, InstData, Op, Value};
-use crate::live::{Sib, for_effective_operands, results};
+use crate::live::{Live, Sib, for_effective_operands, results};
 
 /// The (parameter, argument) copies one block edge makes.
 pub(super) type Copies<'f> = Zip<Iter<'f, Value>, Iter<'f, Value>>;
@@ -77,4 +77,20 @@ pub(super) fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], bl
         }
     }
     (out, back_args)
+}
+
+/// Gives each split parameter the weight that makes its density the given density of the value it carries before the split, so it fills only registers that value could have had.
+pub(super) fn inherit(mut weights: Vec<u64>, live: &Live, split: &[(Value, u64)]) -> Vec<u64> {
+    for &(param, density) in split {
+        let weight = (u128::from(density) * u128::from(live.total_len(param.index()).max(4))) >> DENSITY_SHIFT;
+        weights[param.index()] = u64::try_from(weight).unwrap_or(u64::MAX);
+    }
+    weights
+}
+
+const DENSITY_SHIFT: u32 = 16;
+
+/// Each value's weight per unit of its live length, scaled by `2^DENSITY_SHIFT`.
+pub(super) fn densities(weights: &[u64], live: &Live) -> Vec<u64> {
+    weights.iter().enumerate().map(|(v, &w)| u64::try_from((u128::from(w) << DENSITY_SHIFT) / u128::from(live.total_len(v).max(4))).unwrap_or(u64::MAX)).collect()
 }

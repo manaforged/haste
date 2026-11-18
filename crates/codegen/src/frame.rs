@@ -436,16 +436,49 @@ pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
     Ok(())
 }
 
+/// Prepares `func`; when a loop reads a value that spilled, splits it at that loop's header, keeps the splits whose parameter then gets a register, and returns the split copy with its preparation.
+pub(crate) fn prepare_split<R: Copy + PartialEq>(
+    func: &Function,
+    regs: &Regs<R>,
+    weighed: bool,
+    classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<(Option<Function>, Prepared<R>), String> {
+    let first = prepare(func, regs, weighed, &classify, &[])?;
+    if !weighed {
+        return Ok((None, first));
+    }
+    let plan = &first.plan;
+    let carried = |made: &[(Value, Value, Block)]| -> Vec<(Value, u64)> { made.iter().map(|&(param, origin, _)| (param, plan.density.get(origin.index()).copied().unwrap_or(0))).collect() };
+    let mut split = func.clone();
+    let made = crate::loopargs::run(&mut split, |_, v| v.index() < plan.locations.len() && matches!(plan.location(v), Location::Slot) && !plan.elided[v.index()] && !plan.fused[v.index()]);
+    if made.is_empty() {
+        return Ok((None, first));
+    }
+    let second = prepare(&split, regs, weighed, &classify, &carried(&made))?;
+    let kept: Vec<(Block, Value)> = made.iter().filter(|&&(param, _, _)| matches!(second.plan.location(param), Location::Reg(_) | Location::Float(_))).map(|&(_, origin, head)| (head, origin)).collect();
+    if kept.len() == made.len() {
+        return Ok((Some(split), second));
+    }
+    if kept.is_empty() {
+        return Ok((None, first));
+    }
+    let mut pruned = func.clone();
+    let made = crate::loopargs::run(&mut pruned, |head, v| kept.contains(&(head, v)));
+    let third = prepare(&pruned, regs, weighed, &classify, &carried(&made))?;
+    Ok((Some(pruned), third))
+}
+
 pub(crate) fn prepare<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
     weighed: bool,
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
+    split: &[(Value, u64)],
 ) -> Result<Prepared<R>, String> {
     let order = crate::live::order(func);
     let copied = crate::live::copied_tests(func, &order);
     let abi = classify(&func.signature)?;
-    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), &abi.params, &classify);
+    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), (&abi.params, split), &classify);
     let saves = saved(func, &plan.used, regs.saved);
     let float_saves = saved(func, &plan.used_floats, regs.saved_float);
     let (frame, framed) = build_frame(func, (saves, float_saves), &plan, &abi, &classify)?;

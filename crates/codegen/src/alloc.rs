@@ -88,6 +88,7 @@ pub(crate) struct Plan<R> {
     pub sib: Vec<Option<Sib>>,
     pub elided: Vec<bool>,
     pub zero_ext: Vec<bool>,
+    pub density: Vec<u64>,
 }
 
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
@@ -657,7 +658,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
     (order, copied, weighed): (&[Block], &[bool], bool),
-    params: &[Loc<R>],
+    (params, split): (&[Loc<R>], &[(Value, u64)]),
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Plan<R> {
     let count = func.types.len();
@@ -683,7 +684,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
-    let weights = blocks.as_deref().map(|blocks| walk::weights(func, blocks, &sib, &elided));
+    let weights = blocks.as_deref().map(|blocks| walk::inherit(walk::weights(func, blocks, &sib, &elided), &live, split));
     let (partners, back_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref(), !regs.two_address);
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
     let copies = if regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
@@ -721,7 +722,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let shared = webs.map_or_else(Vec::new, |webs| crate::color::share(func, &live, &locations, &deferred, &webs));
     let zero_ext = if regs.call_zext && hints::has_reg_reduce(func, &locations) { hints::zero_ext(func, &locations, &census, true) } else { zero_ext };
-    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext }
+    let density = weights.as_deref().map_or_else(Vec::new, |weights| walk::densities(weights, &live));
+    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density }
 }
 
 impl<R: Copy> Plan<R> {
