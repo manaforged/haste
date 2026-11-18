@@ -48,16 +48,12 @@ pub(super) fn uses_scratch(func: &Function, op: &Op) -> bool {
 
 impl Emit<'_> {
     pub(super) fn invalidate_spills(&mut self) {
-        self.last_spill = [None; 4];
+        self.last_spill.clear();
         self.last_fspill = None;
     }
 
     pub(super) fn clobber_reg(&mut self, reg: Reg) {
-        for slot in &mut self.last_spill {
-            if slot.is_some_and(|(_, r)| r == reg) {
-                *slot = None;
-            }
-        }
+        self.last_spill.clobber(reg);
     }
 
     pub(super) fn clobber_regs(&mut self, regs: &[Reg]) {
@@ -79,11 +75,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn invalidate_disp(&mut self, disp: i32) {
-        for slot in &mut self.last_spill {
-            if slot.is_some_and(|(d, _)| d == disp) {
-                *slot = None;
-            }
-        }
+        self.last_spill.invalidate(disp);
         if self.last_fspill.is_some_and(|(d, _, _)| d == disp) {
             self.last_fspill = None;
         }
@@ -110,15 +102,7 @@ impl Emit<'_> {
             return;
         }
         self.clobber_reg(reg);
-        let mut out = [Some((disp, reg)), None, None, None];
-        let mut i = 1;
-        for entry in self.last_spill.into_iter().flatten() {
-            if entry != (disp, reg) && i < 4 {
-                out[i] = Some(entry);
-                i += 1;
-            }
-        }
-        self.last_spill = out;
+        self.last_spill.record(disp, reg);
     }
 
     pub(super) fn write_spill(&mut self, disp: i32, reg: Reg) {
@@ -127,18 +111,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn cached_spill_for(&self, disp: i32, preferred: Reg) -> Option<Reg> {
-        let mut fallback = None;
-        for (d, r) in self.last_spill.into_iter().flatten() {
-            if d == disp {
-                if r == preferred {
-                    return Some(r);
-                }
-                if fallback.is_none() {
-                    fallback = Some(r);
-                }
-            }
-        }
-        fallback
+        self.last_spill.holders(disp).find(|&r| r == preferred).or_else(|| self.last_spill.holders(disp).next())
     }
 
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
