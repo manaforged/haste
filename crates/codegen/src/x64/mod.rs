@@ -114,6 +114,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         flags: None,
         last_spill: [None; 4],
         last_fspill: None,
+        carry: (None, None),
+        sole_pred: atomic::sole_preds(func, &copied),
         next: None,
         last_block,
         at_end: false,
@@ -186,6 +188,8 @@ pub(super) struct Emit<'a> {
     flags: Option<(Value, Cond)>,
     last_spill: [Option<(i32, Reg)>; 4],
     last_fspill: Option<(i32, Xmm, Type)>,
+    carry: (Option<Block>, Option<[Option<(i32, Reg)>; 4]>),
+    sole_pred: Vec<Option<Block>>,
     next: Option<Block>,
     last_block: Option<Block>,
     at_end: bool,
@@ -246,6 +250,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn bind_block(&mut self, block: Block) {
         self.invalidate_spills();
+        self.resume_spills(block);
         self.at_end = self.last_block == Some(block);
         self.asm.bind(self.blocks[block.index()]);
     }
@@ -324,12 +329,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
+                self.carry_spills(args.is_empty());
                 self.invalidate_spills();
                 emit_goto(self, *block, true);
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
+                self.carry_spills(then_args.is_empty() && else_args.is_empty());
                 self.invalidate_spills();
                 res
             }

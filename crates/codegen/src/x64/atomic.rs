@@ -4,7 +4,7 @@ use super::location::LEAF;
 use super::{Emit, int};
 use crate::alloc::Location;
 use crate::frame::{Emitter, Ext};
-use crate::ir::{AtomicRmwOp, Binary, Function, IntCC, Op, ShuffleMask, StackSlot, TargetOpId, Type, Unary, Value};
+use crate::ir::{AtomicRmwOp, Binary, Block, Function, IntCC, Op, ShuffleMask, StackSlot, TargetOpId, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
@@ -87,6 +87,22 @@ impl Emit<'_> {
         if self.last_fspill.is_some_and(|(d, _, _)| d == disp) {
             self.last_fspill = None;
         }
+    }
+
+    /// Keeps the reload cache for the block bound next when the current block ends with a branch that moves no edge arguments.
+    pub(super) fn carry_spills(&mut self, plain: bool) {
+        self.carry.1 = (plain && !self.in_shrink_entry && !self.in_fast_ret).then_some(self.last_spill);
+    }
+
+    /// Restores the carried reload cache when `block`'s only predecessor is the block that carried it, and marks `block` as the current block.
+    pub(super) fn resume_spills(&mut self, block: Block) {
+        if let (Some(from), Some(cache)) = self.carry
+            && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
+            && self.func.blocks[block.index()].params.is_empty()
+        {
+            self.last_spill = cache;
+        }
+        self.carry = (Some(block), None);
     }
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
@@ -724,4 +740,27 @@ impl Emit<'_> {
         self.asm.cmpxchg(size, target, Reg::Rcx);
         self.asm.jcc(Cond::Ne, again);
     }
+}
+
+/// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
+pub(super) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
+    let mut cloned = vec![false; func.blocks.len()];
+    for data in &func.blocks {
+        if let Some(&last) = data.insts.last()
+            && copied.get(last.index()) == Some(&true)
+            && let Op::Jump(head, _) = &func.insts[last.index()].op
+        {
+            cloned[head.index()] = true;
+        }
+    }
+    let mut preds: Vec<(u32, Option<Block>)> = vec![(0, None); func.blocks.len()];
+    for at in 0..func.blocks.len() {
+        let from = Block(at as u32);
+        for next in func.successors(from) {
+            let entry = &mut preds[next.index()];
+            entry.0 += 1;
+            entry.1 = Some(from);
+        }
+    }
+    preds.into_iter().map(|(count, from)| from.filter(|from| count == 1 && !cloned[from.index()])).collect()
 }
