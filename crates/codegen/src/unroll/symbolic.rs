@@ -26,6 +26,13 @@ pub(super) fn evaluate(func: &Function, op: &Op, ty: Type, known: &dyn Fn(Value)
     }
     let mut pointer = false;
     op.for_operands(|value| pointer |= known(value).is_some_and(tagged));
+    if let Op::Load(addr, off) = *op
+        && pointer
+        && ty.is_small_int()
+    {
+        let (sym, at) = split(known(addr)?);
+        return func.rodata_read(sym as u32, at.checked_add(i64::from(off))?, ty);
+    }
     if pointer {
         return if ty == Type::I64 || matches!(op, Op::Icmp(..)) { address(op, known) } else { None };
     }

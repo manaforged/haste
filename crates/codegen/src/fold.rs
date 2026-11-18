@@ -250,13 +250,7 @@ impl Fold {
         let mut total = i64::from(off);
         for _ in 0..4 {
             match *self.def(func, addr)? {
-                Op::Symbol(sym) => {
-                    let (start, size) = (usize::try_from(total).ok()?, usize::try_from(ty.bytes()).ok()?);
-                    let (_, bytes) = func.rodata_bytes.iter().find(|&&(s, _)| s == sym)?;
-                    let mut raw = [0_u8; 8];
-                    raw[..size].copy_from_slice(bytes.get(start..start.checked_add(size)?)?);
-                    return Some(extend(u64::from_le_bytes(raw) as i64, ty, true));
-                }
+                Op::Symbol(sym) => return func.rodata_read(sym, total, ty),
                 Op::Binary(Binary::Iadd, a, b) => {
                     let (base, c) = if let Some(k) = self.known(b) { (a, k) } else { (b, self.known(a)?) };
                     (total, addr) = (total.checked_add(c)?, base);

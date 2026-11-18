@@ -461,19 +461,12 @@ fn simplify_shift(cx: &mut RewriteCx, res: Option<Value>, op: Binary, x: Value, 
 }
 
 fn fold_rodata_load(cx: &RewriteCx, ty: Type, addr: Value, off: i32) -> Option<Op> {
-    if off < 0 { return None; }
-    let size = if ty.is_vector() { ty.bytes() as usize } else { match ty { Type::I8 => 1, Type::I16 => 2, Type::I32 | Type::F32 => 4, Type::I64 | Type::F64 => 8, _ => return None } };
     let Op::Symbol(sym) = cx.func.insts[cx.def(addr)?.index()].op else { return None };
-    let start = off as usize;
-    let (_, bytes) = cx.func.rodata_bytes.iter().find(|&&(s, _)| s == sym)?;
-    let slice = bytes.get(start..start.checked_add(size)?)?;
     if ty.is_vector() {
+        let slice = cx.func.rodata_slice(sym, i64::from(off), usize::try_from(ty.bytes()).ok()?)?;
         return slice.iter().all(|&b| b == 0).then_some(Op::Const(0));
     }
-    let mut raw = [0_u8; 8];
-    raw[..size].copy_from_slice(slice);
-    let u = u64::from_le_bytes(raw);
-    Some(Op::Const(if ty.is_small_int() { extend(u as i64, ty, true) } else { u as i64 }))
+    cx.func.rodata_read(sym, i64::from(off), ty).map(Op::Const)
 }
 
 fn const_addend(cx: &RewriteCx, x: Value, y: Value) -> Option<(Value, i64)> {

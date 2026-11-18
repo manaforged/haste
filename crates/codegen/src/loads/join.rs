@@ -166,16 +166,7 @@ pub(super) fn find_subword_source(known: &KnownLoads, loc: MemLoc, ty: Type) -> 
 
 pub(super) fn rodata_const(func: &Function, loc: MemLoc, ty: Type) -> Option<i64> {
     let MemBase::Global(sym) = loc.base else { return None };
-    if !(ty.is_small_int() || matches!(ty, Type::F32 | Type::F64)) {
-        return None;
-    }
-    let start = usize::try_from(loc.offset).ok()?;
-    let size = usize::try_from(ty.bytes()).ok()?;
-    let (_, bytes) = func.rodata_bytes.iter().find(|&&(s, _)| s == sym)?;
-    let mut raw = [0_u8; 8];
-    raw[..size].copy_from_slice(bytes.get(start..start.checked_add(size)?)?);
-    let bits = u64::from_le_bytes(raw) as i64;
-    Some(if ty.is_small_int() { crate::fold::extend(bits, ty, true) } else { bits })
+    func.rodata_read(sym, loc.offset, ty)
 }
 
 pub(super) fn const_bits_eq(ty: Type, ca: i64, cb: i64) -> bool {
