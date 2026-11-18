@@ -12,7 +12,7 @@ use crate::ir::{Block, Domain, Function, Inst, InstData, IntCC, Op, SigRef, Valu
 
 pub(crate) use self::eval::is_bool_val;
 use self::eval::{
-    EdgeSeed, EvalState, ThreadCx, bind, cmp_implies, eval_cond_truth, eval_op, fact_of, lookup, lookup_const, seed_edge,
+    EdgeSeed, EvalState, ThreadCx, bind, cmp_implies, eval_cond_truth, eval_op, fact_of, lookup, lookup_const,
     step_inst,
 };
 
@@ -131,11 +131,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>],
         return None;
     }
     let mut state = EvalState::default();
-    match seed {
-        EdgeSeed::None => {}
-        EdgeSeed::Brif(cond, taken) => seed_edge(func, cx, cond, taken, 0, (&mut state.local_consts, &mut state.edge_cmps)),
-        EdgeSeed::Const(val, imm) => state.local_consts.push((val, imm)),
-    }
+    state.seed(func, cx, disp, seed);
     let seeded = state.seeded();
     if redefines(func, disp, &seeded) {
         return None;
@@ -462,14 +458,17 @@ fn brif_arm(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Blo
     if target != disp {
         return None;
     }
-    let eval = eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Brif(*cond, taken))?;
-    if eval.chosen_target == target
-        || non_const_needed(&eval) > MAX_BRIF_SPEC_OPS
-        || (!eval.resolved_branch && non_const_needed(&eval) > 0)
-        || (!eval.carry.values.is_empty() && func.successors(pred).any(|s| s == eval.chosen_target))
-    {
-        return None;
-    }
+    let ok = |eval: &Eval, strict: bool| {
+        let needed = non_const_needed(eval);
+        eval.chosen_target != target
+            && needed <= MAX_BRIF_SPEC_OPS
+            && (eval.resolved_branch || needed == 0)
+            && (eval.carry.values.is_empty() || !func.successors(pred).any(|s| s == eval.chosen_target))
+            && (!strict || (eval.resolved_branch && needed == 0 && eval.carry.values.is_empty()))
+    };
+    let eval = eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Brif(*cond, taken))
+        .filter(|eval| ok(eval, false))
+        .or_else(|| eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Equal(*cond, taken)).filter(|eval| ok(eval, true)))?;
     Some(carry::commit(func, cx, single, pred, eval))
 }
 

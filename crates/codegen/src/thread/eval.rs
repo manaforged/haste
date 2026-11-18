@@ -7,6 +7,7 @@ use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 pub(super) enum EdgeSeed {
     None,
     Brif(Value, bool),
+    Equal(Value, bool),
     Const(Value, i64),
 }
 
@@ -32,6 +33,21 @@ pub(super) struct EvalState {
 impl EvalState {
     pub(super) fn seeded(&self) -> Vec<Value> {
         self.local_consts.iter().map(|&(value, _)| value).chain(self.edge_cmps.iter().map(|&(value, ..)| value)).collect()
+    }
+
+    /// Records what the edge `seed` into `disp` proves: the branch condition, the values an equal compare makes one value, or a constant.
+    pub(super) fn seed(&mut self, func: &Function, cx: &ThreadCx<'_>, disp: Block, seed: EdgeSeed) {
+        match seed {
+            EdgeSeed::None => {}
+            EdgeSeed::Brif(cond, taken) => seed_edge(func, cx, cond, taken, 0, (&mut self.local_consts, &mut self.edge_cmps)),
+            EdgeSeed::Equal(cond, taken) => {
+                seed_edge(func, cx, cond, taken, 0, (&mut self.local_consts, &mut self.edge_cmps));
+                if let Some((x, y)) = edge_equal(func, cx, disp, cond, taken) {
+                    self.rename(cx, y, x);
+                }
+            }
+            EdgeSeed::Const(val, imm) => self.local_consts.push((val, imm)),
+        }
     }
 
     fn rename(&mut self, cx: &ThreadCx<'_>, from: Value, to: Value) {
@@ -194,6 +210,16 @@ pub(super) fn record_edge_cmp(
             local_consts.push((lhs, extend(lo as i64, ty, true)));
         }
     }
+}
+
+/// The two sides of the integer compare `cond` that the edge taken as `taken` proves equal, when `disp` neither defines nor binds either side.
+fn edge_equal(func: &Function, cx: &ThreadCx<'_>, disp: Block, cond: Value, taken: bool) -> Option<(Value, Value)> {
+    let inst = cx.defs.get(cond.index()).copied().flatten()?;
+    let Op::Icmp(cc, x, y) = func.insts[inst.index()].op else { return None };
+    let equal = matches!((cc, taken), (IntCC::Equal, true) | (IntCC::NotEqual, false));
+    let data = &func.blocks[disp.index()];
+    let outside = |v: Value| !data.params.contains(&v) && cx.defs.get(v.index()).copied().flatten().is_none_or(|def| !data.insts.contains(&def));
+    (equal && x != y && func.ty(x).is_small_int() && outside(x) && outside(y)).then_some((x, y))
 }
 
 pub(super) fn seed_edge(
