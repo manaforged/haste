@@ -666,7 +666,7 @@ impl Jit {
                 Err(error) => {
                     let wanted = self.image.take_wanted();
                     if wanted.is_empty() {
-                        return Err(Stop::Failed(self.failure(cx, index, &callees, &error), item));
+                        return Err(self.stop(cx, self.failure(cx, index, &callees, &error), item));
                     }
                     callees.extend(self.reach(cx, wanted, journal)?);
                 }
