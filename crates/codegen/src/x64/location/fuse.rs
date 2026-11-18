@@ -7,7 +7,7 @@ use super::super::asm::Reg;
 use super::super::features::Features;
 use super::super::frame::SAVED;
 use crate::alloc::{Location, Plan};
-use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Op, TargetOpId, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Lane, Op, TargetOpId, Type, Unary, Value};
 use crate::live::{Sib, SibBase};
 
 pub(super) struct FuseCtx<'a> {
@@ -704,6 +704,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         }
     }
     fold_products(func, plan, &uses, &defs);
+    elide_zero_bases(func, plan, &defs);
     for (low, operands) in paired {
         if plan.is_static(low) || plan.deferred[low.index()] {
             for value in operands.into_iter().filter(|&value| is_load(func, &defs, value)) {
@@ -712,6 +713,24 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         }
     }
     roots
+}
+
+/// Elides each zero vector read only as the base of integer lane-0 inserts, which write their scalar into a zeroed register without reading the base.
+fn elide_zero_bases(func: &Function, plan: &mut Plan<Reg>, defs: &[Option<Inst>]) {
+    let mut read = vec![false; func.types.len()];
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let op = &func.insts[inst.index()].op;
+        let base = match *op {
+            Op::Insert(base, scalar, 0) if base != scalar && func.ty(base).lane().is_some_and(Lane::is_int) => Some(base),
+            _ => None,
+        };
+        op.for_operands(|v| read[v.index()] |= Some(v) != base);
+    }
+    for (v, def) in defs.iter().enumerate() {
+        if !read[v] && func.types[v].is_vector() && def.is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Const(0))) {
+            plan.elided[v] = true;
+        }
+    }
 }
 
 /// Elides the high and low halves of each 64-bit product whose only use is the add, or, or xor right after them, which then multiplies in place.
