@@ -31,13 +31,15 @@ struct Budget {
     outline: usize,
     /// The fewest copies of one bulky callee in an inline body for lowering it again in compact form.
     copies: usize,
+    /// The most instructions a body may have for a call inside a loop of its caller to copy it inline.
+    looped: usize,
 }
 
 /// The budget of the dev profile.
-const DEBUG_BUDGET: Budget = Budget { insts: 30, inline_insts: 30, always: 100, exprs: 20, outline: 30, copies: 2 };
+const DEBUG_BUDGET: Budget = Budget { insts: 30, inline_insts: 30, always: 100, exprs: 20, outline: 30, copies: 2, looped: 30 };
 
 /// The budget of the release profile.
-const RELEASE_BUDGET: Budget = Budget { insts: 500, inline_insts: 900, always: 1200, exprs: 500, outline: 96, copies: 2 };
+const RELEASE_BUDGET: Budget = Budget { insts: 500, inline_insts: 900, always: 1200, exprs: 500, outline: 96, copies: 2, looped: 1200 };
 
 const CYCLE_BUDGET: usize = 12;
 
@@ -189,6 +191,11 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
     let body = cx.body(*item).ok()?;
     let sole_leaf = is_sole_leaf(reached, index, &body, hint);
     allowed_cold(cx, reached, typed, &body, hint).then(|| body_budget(cx, *item, &body, (hint, sole_leaf))).flatten()
+}
+
+/// The limit `limit` of reached function `index` for a call that runs inside a loop of its caller: the looped budget when its own body loops too.
+pub(super) fn looped_limit(cx: &mut Context<'_>, reached: &Reached, index: usize, limit: usize) -> usize {
+    if own_form(cx, reached, index) == Form::Loop { limit.max(budget().looped) } else { limit }
 }
 
 pub(super) fn cycle_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {

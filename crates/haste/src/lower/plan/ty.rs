@@ -18,7 +18,7 @@ use super::super::abi::{copied_parts, parts};
 use super::super::adt::tag_bits;
 use super::super::expr::inline_limit;
 use super::super::reloc::reached_index_of;
-use super::super::stencil::{FootprintId, item_bits, resolve_inline_meta};
+use super::super::stencil::{FootprintId, Form, item_bits, resolve_inline_meta};
 use super::super::{Inline, Parts, Repr, Slots, is_static, passed_parts, repr, signature, signature_of};
 
 #[derive(Clone, Copy)]
@@ -572,20 +572,29 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         }
         return Ok(());
     }
-    if slots.allow_inline() && let Some(limit) = inline_limit(cx, reached, callee_idx) {
-        let (meta, cyc) = resolve_inline_meta(cx, (reached, slots), inline, callee_idx, limit)?;
-        *cycle_root = (*cycle_root).min(cyc);
-        match meta {
-            Some((inl_item, inl_fp, returns)) => {
-                mix.byte(1);
-                mix.item(cx.outline, inl_item);
-                mix.footprint(inl_fp);
-                mix.bool(returns);
-            }
-            None => mix.byte(0),
-        }
-    } else {
+    let Some(limit) = inline_limit(cx, reached, callee_idx).filter(|_| slots.allow_inline()) else {
         mix.byte(0);
+        return Ok(());
+    };
+    hash_inline_meta(cx, (reached, slots), inline, mix, (callee_idx, limit), cycle_root)?;
+    let looped = super::super::budget::looped_limit(cx, reached, callee_idx, limit);
+    if looped > limit && super::super::budget::own_form(cx, reached, caller) == Form::Loop {
+        hash_inline_meta(cx, (reached, slots), inline, mix, (callee_idx, looped), cycle_root)?;
+    }
+    Ok(())
+}
+
+fn hash_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, (callee_idx, limit): (usize, usize), cycle_root: &mut usize) -> Result<()> {
+    let (meta, cyc) = resolve_inline_meta(cx, (reached, slots), inline, callee_idx, limit)?;
+    *cycle_root = (*cycle_root).min(cyc);
+    match meta {
+        Some((inl_item, inl_fp, returns)) => {
+            mix.byte(1);
+            mix.item(cx.outline, inl_item);
+            mix.footprint(inl_fp);
+            mix.bool(returns);
+        }
+        None => mix.byte(0),
     }
     Ok(())
 }
