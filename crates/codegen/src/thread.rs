@@ -310,12 +310,18 @@ fn eval_pair_ok(func: &Function, disp: Block, et: &Eval, ef: &Eval) -> bool {
     }
 }
 
-/// Splits each branch on a select with one constant arm into a branch on the select's condition, whose constant side goes straight to its target, and a new block that branches on the other arm when that arm is a comparison, a load or a block parameter.
+/// Splits each branch on a select with one constant arm into a branch on the select's condition, whose constant side goes straight to its target, and a new block that branches on the other arm when that arm is a comparison, a load, a block parameter or a logic op on flags.
 fn split_select_branches(func: &mut Function) -> bool {
     let uses = func.use_counts();
     let defs = crate::fold::defs(func);
     let konst = |v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
-    let compare = |v: Value| defs[v.index()].is_none_or(|inst| matches!(func.insts[inst.index()].op, Op::Icmp(..) | Op::Load(..)));
+    let compare = |v: Value| {
+        defs[v.index()].is_none_or(|inst| match func.insts[inst.index()].op {
+            Op::Icmp(..) | Op::Load(..) => true,
+            Op::Binary(crate::ir::Binary::Band | crate::ir::Binary::Bor | crate::ir::Binary::Bxor, ..) => func.ty(v) == crate::ir::Type::I8,
+            _ => false,
+        })
+    };
     let mut splits = Vec::new();
     for block in &func.blocks {
         let Some(&term) = block.insts.last() else { continue };
