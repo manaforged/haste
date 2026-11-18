@@ -146,6 +146,9 @@ impl Lower<'_, '_> {
         self.enter(pending);
         self.suspend(head)?;
         self.enter(done);
+        if self.cx.ensure_closure(awaited.future).is_some_and(|info| info.closure.coroutine) {
+            self.moved_out(Root::Held(expr), &[])?;
+        }
         let Some(polled) = polled else {
             return Ok(None);
         };
