@@ -326,7 +326,7 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
         match (which, args) {
             (Intrinsic::WrappingAdd | Intrinsic::WrappingSub | Intrinsic::WrappingMul, [x, y]) => self.eval_wrapping_intrinsic(which, (bits, size), x, y),
             (Intrinsic::RotateLeft | Intrinsic::RotateRight, [x, by]) => self.eval_rotate_intrinsic(which == Intrinsic::RotateLeft, (bits, size), x, by),
-            (Intrinsic::Ctpop | Intrinsic::Ctlz | Intrinsic::Cttz, [x]) => self.eval_bitcount_intrinsic(which, bits, x),
+            (Intrinsic::Ctpop | Intrinsic::Ctlz | Intrinsic::Cttz | Intrinsic::CttzNonzero, [x]) => self.eval_bitcount_intrinsic(which, bits, x),
             (Intrinsic::Unchecked(op), [x, y]) => apply_int_binary(op, prim, x.as_u128()?, y.as_u128()?).map(|v| Val::scalar(size, v)),
             (Intrinsic::WithOverflow(op), [x, y]) => self.eval_overflow_intrinsic((op, prim, bits), (x.as_u128()?, y.as_u128()?), size),
             _ => None,
@@ -362,7 +362,7 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
         let count = match which {
             Intrinsic::Ctpop => v.count_ones(),
             Intrinsic::Ctlz => v.leading_zeros() - (128 - bits),
-            Intrinsic::Cttz => if v == 0 { bits } else { v.trailing_zeros() },
+            Intrinsic::Cttz | Intrinsic::CttzNonzero => if v == 0 { bits } else { v.trailing_zeros() },
             _ => return None,
         };
         Some(Val::scalar(4, u128::from(count)))

@@ -270,6 +270,11 @@ impl Lower<'_, '_> {
             (Ctpop, &[x]) => self.count(num.0, |lower| lower.ins().popcnt(x)),
             (Ctlz, &[x]) => self.count(num.0, |lower| lower.ins().clz(x)),
             (Cttz, &[x]) => self.count(num.0, |lower| lower.ins().ctz(x)),
+            (CttzNonzero, &[x]) if num.0.bits() < 32 => {
+                let word = self.ins().uextend(Type::I32, x);
+                self.ins().ctz(word)
+            }
+            (CttzNonzero, &[x]) => self.count(num.0, |lower| lower.ins().ctz(x)),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         })
     }
