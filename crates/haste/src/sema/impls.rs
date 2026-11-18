@@ -124,6 +124,14 @@ impl Index {
 }
 
 impl<'a> Context<'a> {
+    /// The last path segment of the self type of impl `block`, or `None` when it is no path.
+    pub fn impl_self_name(&mut self, block: ImplRef) -> Option<String> {
+        let header = self.impl_header(block).ok()?;
+        let syntax::Ty::Path(path) = *header.body.ty(header.self_ty) else { return None };
+        let &last = header.body.list(header.body.path(path).segments).last()?;
+        Some(self.impl_file(block).source.text(header.body.segments[last as usize].name).to_owned())
+    }
+
     /// The parsed header of impl `block`.
     pub fn impl_header(&mut self, block: ImplRef) -> Result<Arc<ImplHeader>> {
         if let Some(found) = self.store.headers.get(&block) {

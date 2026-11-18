@@ -812,7 +812,7 @@ impl Image {
             }
         }
         exe.sources(cx.outline.crates.iter().flat_map(|krate| krate.files.iter().map(|file| file.source.path.clone())).collect());
-        exe.symbols(named.into_iter().map(|(off, index)| (off, reached.list.get(index).map_or_else(|| format!("fn{index}"), |((item, _), _)| cx.qualified(*item)))).collect());
+        exe.symbols(named.into_iter().map(|(off, index)| (off, reached.list.get(index).map_or_else(|| format!("fn{index}"), |(instance, _)| cx.symbol_text(*instance)))).collect());
         Ok(exe)
     }
 }

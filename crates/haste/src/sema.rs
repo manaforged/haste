@@ -388,6 +388,16 @@ impl<'a> Context<'a> {
         format!("{}::{}", self.module_text(item), self.name(item))
     }
 
+    /// The name of `instance` the way a symbolizer spells it: an impl method under its self type, and a closure or async body as `{closure}` under the function that holds it.
+    pub fn symbol_text(&mut self, (item, substs): reach::Instance) -> String {
+        let types = self.types.substs(substs).to_vec();
+        if let Some(&ty::Kind::Closure(parent, args, _)) = types.first().map(|&ty| self.types.kind(ty)) {
+            return format!("{}::{{closure}}", self.symbol_text((parent, args)));
+        }
+        let Some(name) = self.owner_impl(item).and_then(|block| self.impl_self_name(block)) else { return self.qualified(item) };
+        format!("{}::{name}::{}", self.module_text(item), self.name(item))
+    }
+
     /// The module that holds `item`, through any impl, trait or extern block around it.
     pub fn module_of(&mut self, item: ItemRef) -> Result<ModRef> {
         if let Some((outer, _)) = item.outer() {
