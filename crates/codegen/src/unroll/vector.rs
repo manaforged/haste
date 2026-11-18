@@ -259,12 +259,23 @@ fn byte_sum(e: &mut Emit<'_>, bytes: Value) -> Value {
 }
 
 /// Shifts every byte lane by `by`: a 16-bit lane shift, then a mask that clears the bits that crossed between bytes.
-/// The `I64` sum of the sixteen unsigned bytes of `bytes`: `psadbw` against zero, then one add of its two quadwords.
-fn sad_sum(e: &mut Emit<'_>, bytes: Value) -> Value {
-    const QUADS: Type = Type::Vec { lane: Lane::I64, count: 2 };
+const QUADS: Type = Type::Vec { lane: Lane::I64, count: 2 };
+
+/// The two `I64` partial sums of the sixteen unsigned bytes of `bytes`: `psadbw` against zero.
+fn sad_halves(e: &mut Emit<'_>, bytes: Value) -> Value {
     let zero = e.op(Op::Const(0), VEC);
-    let halves = e.op(Op::TargetOp(TargetOpId::X64Psadbw, TinyArgs::two(bytes, zero)), QUADS);
-    e.op(Op::Reduce(ReduceOp::Add, halves), Type::I64)
+    e.op(Op::TargetOp(TargetOpId::X64Psadbw, TinyArgs::two(bytes, zero)), QUADS)
+}
+
+/// Converts `total` to `ty` and adds it to `into`, wrapping.
+fn add_resized(e: &mut Emit<'_>, into: Value, total: Value) -> Value {
+    let ty = e.func.ty(into);
+    let wide = match e.func.ty(total).bytes().cmp(&ty.bytes()) {
+        std::cmp::Ordering::Less => e.op(Op::Convert(Convert::Uextend, total), ty),
+        std::cmp::Ordering::Equal => total,
+        std::cmp::Ordering::Greater => e.op(Op::Convert(Convert::Ireduce, total), ty),
+    };
+    e.op(Op::Binary(Binary::Iadd, into, wide), ty)
 }
 
 fn byte_shift(e: &mut Emit<'_>, op: Binary, x: Value, by: i64) -> Value {
@@ -393,18 +404,23 @@ fn lane_body(e: &mut Emit<'_>, shape: &Shape, (q, splats): (&[Value], &[(Value, 
     map
 }
 
-fn add_sums(e: &mut Emit<'_>, shape: &Shape, (q, map): (&[Value], &[(Value, Value)]), next: &mut [Value], sad: bool) {
-    for sum in &shape.sums {
+/// Adds each summed byte vector into its sum; with `psadbw` (`accs` given) into a vector accumulator per sum, returning the next accumulators, else into the scalar sum.
+fn add_sums(e: &mut Emit<'_>, shape: &Shape, (q, map): (&[Value], &[(Value, Value)]), next: &mut [Value], accs: Option<&[Value]>) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (i, sum) in shape.sums.iter().enumerate() {
         let bytes = map.iter().rev().find(|&&(s, _)| s == sum.lane).map(|&(_, d)| d).expect("summed lane mapped");
-        let total = if sad { sad_sum(e, bytes) } else { byte_sum(e, bytes) };
-        let ty = e.func.ty(q[sum.idx]);
-        let wide = match e.func.ty(total).bytes().cmp(&ty.bytes()) {
-            std::cmp::Ordering::Less => e.op(Op::Convert(Convert::Uextend, total), ty),
-            std::cmp::Ordering::Equal => total,
-            std::cmp::Ordering::Greater => e.op(Op::Convert(Convert::Ireduce, total), ty),
-        };
-        next[sum.idx] = e.op(Op::Binary(Binary::Iadd, q[sum.idx], wide), ty);
+        match accs {
+            Some(accs) => {
+                let halves = sad_halves(e, bytes);
+                out.push(e.op(Op::Binary(Binary::Iadd, accs[i], halves), QUADS));
+            }
+            None => {
+                let total = byte_sum(e, bytes);
+                next[sum.idx] = add_resized(e, q[sum.idx], total);
+            }
+        }
     }
+    out
 }
 
 fn address(e: &mut Emit<'_>, shape: &Shape, inst: Inst, at: &[Value]) -> (Value, i32) {
@@ -576,28 +592,36 @@ pub(super) fn run(
         .zip(&steps)
         .map(|(&v, &s)| s.filter(|&s| s != 0).map(|s| { let ty = e.func.ty(v); e.konst(s * LANES, ty) }))
         .collect();
+    let zeros: Vec<Value> = if sad { shape.sums.iter().map(|_| e.op(Op::Const(0), QUADS)).collect() } else { Vec::new() };
     let pre_insts = std::mem::take(&mut e.out);
     let left = e.func.value(Type::I64);
+    let accs: Vec<Value> = zeros.iter().map(|_| e.func.value(QUADS)).collect();
+    let ends: Vec<Value> = zeros.iter().map(|_| e.func.value(QUADS)).collect();
     let map = lane_body(&mut e, &shape, (&q, &splats));
     let mut next = advance(&mut e, &q, &strides);
-    add_sums(&mut e, &shape, (&q, &map), &mut next, sad);
+    let accs_next = add_sums(&mut e, &shape, (&q, &map), &mut next, sad.then_some(&accs[..]));
     let one = e.konst(1, Type::I64);
     let rest = e.op(Op::Binary(Binary::Isub, left, one), Type::I64);
     let zero = e.konst(0, Type::I64);
     let more = e.op(Op::Icmp(IntCC::NotEqual, rest, zero), Type::I8);
     let body_insts = std::mem::take(&mut e.out);
-    let done = e.op(Op::Icmp(IntCC::Equal, r[lp.iv], lp.limit), Type::I8);
-    let leave = exit_values(&mut e, &lp, &r, exit_args);
+    let mut r_sum = r.clone();
+    for (sum, &end) in shape.sums.iter().zip(&ends) {
+        let total = e.op(Op::Reduce(ReduceOp::Add, end), Type::I64);
+        r_sum[sum.idx] = add_resized(&mut e, r[sum.idx], total);
+    }
+    let done = e.op(Op::Icmp(IntCC::Equal, r_sum[lp.iv], lp.limit), Type::I8);
+    let leave = exit_values(&mut e, &lp, &r_sum, exit_args);
     let tail_insts = std::mem::take(&mut e.out);
     let Emit { func, .. } = e;
     let pre = new_block(func, p.clone(), pre_insts);
-    let vbody = new_block(func, q.into_iter().chain([left]).collect(), body_insts);
-    let tail = new_block(func, r.clone(), tail_insts);
-    let enter = func.add(Op::Brif(ok, vbody, p.iter().copied().chain([n]).collect(), head, p), None);
+    let vbody = new_block(func, q.into_iter().chain([left]).chain(accs).collect(), body_insts);
+    let tail = new_block(func, r.iter().copied().chain(ends).collect(), tail_insts);
+    let enter = func.add(Op::Brif(ok, vbody, p.iter().copied().chain([n]).chain(zeros).collect(), head, p), None);
     func.blocks[pre.index()].insts.push(enter);
-    let back = func.add(Op::Brif(more, vbody, next.iter().copied().chain([rest]).collect(), tail, next), None);
+    let back = func.add(Op::Brif(more, vbody, next.iter().copied().chain([rest]).chain(accs_next.iter().copied()).collect(), tail, next.iter().copied().chain(accs_next).collect()), None);
     func.blocks[vbody.index()].insts.push(back);
-    let finish = func.add(Op::Brif(done, exit_blk, leave, head, r), None);
+    let finish = func.add(Op::Brif(done, exit_blk, leave, head, r_sum), None);
     func.blocks[tail.index()].insts.push(finish);
     let from = preds[0];
     if let Some(&last) = func.blocks[from].insts.last() {
