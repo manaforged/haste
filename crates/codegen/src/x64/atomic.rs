@@ -413,6 +413,8 @@ impl Emit<'_> {
         {
             self.emit_test_band(a, b);
             int::cond(cc)
+        } else if let Some(cond) = self.held_compare(cc, x, y) {
+            cond
         } else {
             let size = Size::of(self.ty(x).bytes());
             let (cc, x, y) = if self.reg_of(x).is_none() && (self.reg_of(y).is_some() || self.imm_sized(x, size).is_some()) {

@@ -217,22 +217,7 @@ impl Emit<'_> {
             return Ok(dst);
         }
         if let Some((_, _, left, other, right, invert)) = super::location::adc_plan(self.func, &self.plan, ty, op, (x, y), |v| self.plan.elided[v.index()], |v| self.defs[v.index()]) {
-            let cmp_size = Size::of(self.ty(left).bytes());
-            let held = right.is_some_and(|right| self.overflow_held(left, right)) && !self.plan.elided[other.index()] && matches!(self.location(other), Location::Reg(_) | Location::Slot | Location::Imm(_));
-            if !held {
-                self.emit_cmp_pair(cmp_size, left, right, false);
-            }
-            self.raw(dst, other);
-            if held && self.asm.held_carry() != Some(super::wide::overflow_tag(left)) {
-                return Err("the carry flag was overwritten before an adc that reads it".to_owned());
-            }
-            let (alu_op, imm) = match (op == Binary::Iadd, invert) {
-                (true, false) => (Alu::Adc, 0),
-                (false, false) => (Alu::Sbb, 0),
-                (true, true) => (Alu::Sbb, -1),
-                (false, true) => (Alu::Adc, -1),
-            };
-            self.asm.alu_imm_sized(if ty == Type::I32 { Size::D } else { Size::Q }, alu_op, dst, imm);
+            self.carry_add(op, ty, dst, (left, other, right, invert))?;
             return Ok(dst);
         }
         if self.features.bmi1
@@ -343,7 +328,7 @@ impl Emit<'_> {
                     }
                 }
             }
-            if matches!(alu, Alu::Add) && matches!(ty, Type::I32 | Type::I64) && self.overflow_read[result.index()] {
+            if matches!(alu, Alu::Add | Alu::Sub) && matches!(ty, Type::I32 | Type::I64) && self.overflow_read[result.index()] {
                 self.asm.hold_carry(super::wide::overflow_tag(result));
             }
             if self.plan.fused[result.index()] {

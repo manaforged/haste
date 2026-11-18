@@ -258,7 +258,13 @@ pub(in super::super) fn adc_plan(
     def: impl Fn(Value) -> Option<Inst>,
 ) -> Option<(Value, Option<Value>, Value, Value, Option<Value>, bool)> {
     let (cand, inner, cc, a, b) = adc_parts(func, plan, ty, op, (x, y), child_ok, def)?;
-    let (invert, left, right) = match cc {
+    let (invert, left, right) = adc_sides(func, plan, cc, a, b)?;
+    Some((cand, inner, left, if cand == y { x } else { y }, right, invert))
+}
+
+/// Whether the carry `a cc b` enters an `adc` or `sbb` inverted, and the compare it reads as `left <u right`, or as `left != 0` with no `right`.
+pub(super) fn adc_sides(func: &Function, plan: &Plan<Reg>, cc: IntCC, a: Value, b: Value) -> Option<(bool, Value, Option<Value>)> {
+    Some(match cc {
         IntCC::UnsignedLessThan => (false, a, Some(b)),
         IntCC::UnsignedGreaterThan if is_zero_const(func, plan, b) => (true, a, None),
         IntCC::UnsignedGreaterThan => (false, b, Some(a)),
@@ -267,8 +273,15 @@ pub(in super::super) fn adc_plan(
         IntCC::Equal => (false, if is_zero_const(func, plan, b) { a } else { b }, None),
         IntCC::NotEqual => (true, if is_zero_const(func, plan, b) { a } else { b }, None),
         _ => return None,
-    };
-    Some((cand, inner, left, if cand == y { x } else { y }, right, invert))
+    })
+}
+
+/// The operands of `other` when it is the add or subtract of the same kind as `op` that an `adc` or `sbb` adding an uninverted carry can compute in the same instruction.
+pub(in super::super) fn adc_fold(func: &Function, op: Binary, invert: bool, other: Value, def: impl Fn(Value) -> Option<Inst>) -> Option<(Value, Value)> {
+    match func.insts[def(other)?.index()].op {
+        Op::Binary(inner, p, q) if !invert && inner == op => Some((p, q)),
+        _ => None,
+    }
 }
 
 pub(in super::super) fn unwrap_shift_mask(func: &Function, plan: &Plan<Reg>, defs: &[Option<Inst>], y: Value, shift_res: Value, bits: u32) -> Value {

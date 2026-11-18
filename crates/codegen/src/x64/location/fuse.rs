@@ -1,5 +1,5 @@
 use super::patterns::{
-    Root, adc_parts, bextr_parts, flag_cmp, is_zero_const, mid_preserves_flags, parked, shld_parts,
+    Root, adc_fold, adc_parts, adc_sides, bextr_parts, flag_cmp, is_zero_const, mid_preserves_flags, parked, shld_parts,
 };
 use super::sib::{apply_sib_groups, double, find_cand_sib, idx_source, sib_ok};
 use super::super::{FRAME_REGS, REGS};
@@ -518,7 +518,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         if plan.elided[res.index()] || plan.sib[res.index()].is_some() || plan.elided[x.index()] || plan.elided[y.index()] {
             continue;
         }
-        let Some((cand, inner, _, a, b)) = adc_parts(func, plan, func.ty(res), op, (x, y), |v| uses[v.index()] == 1 && !plan.elided[v.index()], def_inst) else { continue };
+        let Some((cand, inner, cc, a, b)) = adc_parts(func, plan, func.ty(res), op, (x, y), |v| uses[v.index()] == 1 && !plan.elided[v.index()], def_inst) else { continue };
         let Some((cb, cpos, _)) = pos_of[cand.index()] else { continue };
         if cb != b_idx || cpos >= pos {
             continue;
@@ -536,6 +536,19 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                 plan.elided[iv.index()] = true;
             }
             skip_flags[res.index()] = true;
+            let other = if cand == y { x } else { y };
+            let quiet = [cmp_pos, cpos];
+            if uses[other.index()] == 1
+                && !plan.elided[other.index()]
+                && let Some((invert, ..)) = adc_sides(func, plan, cc, a, b)
+                && let Some((p, q)) = adc_fold(func, op, invert, other, def_inst)
+                && let Some((ob, opos, _)) = pos_of[other.index()]
+                && ob == b_idx
+                && opos < pos
+                && [p, q].into_iter().all(|v| !plan.elided[v.index()] && preserved(func, plan, b_idx, opos, pos, &quiet, v))
+            {
+                plan.elided[other.index()] = true;
+            }
         }
     }
     for (b_idx, pos, res, op, x, y) in cand_bextr {

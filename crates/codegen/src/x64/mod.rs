@@ -93,7 +93,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let slow_thunk = asm.label();
     let defs = crate::fold::defs(func);
-    let overflow_read = wide::overflow_reads(func, &defs);
+    let overflow_read = wide::overflow_reads(func);
     let flag_carry = wide::flag_carries(func, &plan);
     let last_block = order.last().copied();
     let emit = Emit {

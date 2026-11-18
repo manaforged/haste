@@ -1,7 +1,7 @@
 use super::Emit;
 use crate::frame::Ext;
 use super::asm::{Alu, Cond, Count, Group3, Reg, Rm, Shift, Size};
-use crate::ir::{Binary, Function, Inst, IntCC, Op, TargetOpId, Type, Unary, Value};
+use crate::ir::{Binary, Function, IntCC, Op, TargetOpId, Type, Unary, Value};
 use crate::wide::half_score;
 
 /// The registers 128-bit rotates use as scratch besides rax, rcx and rdx.
@@ -80,20 +80,22 @@ pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>) -> V
     flag
 }
 
-/// Marks each 32- or 64-bit sum that an integer compare tests against one of its own operands, which reads the add's carry.
-pub(super) fn overflow_reads(func: &Function, defs: &[Option<Inst>]) -> Vec<bool> {
+/// Marks each 32- or 64-bit sum that the next instruction compares against one of its own operands, and each difference whose operands a compare in its block tests, which read the carry or borrow of the add or subtract.
+pub(super) fn overflow_reads(func: &Function) -> Vec<bool> {
     let mut read = vec![false; func.types.len()];
-    let sum_of = |sum: Value, operand: Value| {
-        defs[sum.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Binary(Binary::Iadd, a, b) if a == operand || b == operand))
-            && matches!(func.ty(sum), Type::I32 | Type::I64)
-    };
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        if let Op::Icmp(_, x, y) = func.insts[inst.index()].op {
-            for (sum, operand) in [(x, y), (y, x)] {
-                if sum_of(sum, operand) {
-                    read[sum.index()] = true;
-                }
+    let mut compared = std::collections::HashSet::new();
+    for block in &func.blocks {
+        compared.clear();
+        for inst in &block.insts {
+            if let Op::Icmp(_, x, y) = func.insts[inst.index()].op {
+                compared.extend([(x, y), (y, x)]);
             }
+        }
+        for (at, data) in block.insts.iter().map(|inst| &func.insts[inst.index()]).enumerate() {
+            let (Op::Binary(op @ (Binary::Iadd | Binary::Isub), a, b), Some(result)) = (&data.op, data.result) else { continue };
+            let next = block.insts.get(at + 1).map(|inst| &func.insts[inst.index()].op);
+            let sum_read = matches!(next, Some(&Op::Icmp(_, x, y)) if (x == result && (y == *a || y == *b)) || (y == result && (x == *a || x == *b)));
+            read[result.index()] = matches!(func.ty(result), Type::I32 | Type::I64) && if *op == Binary::Iadd { sum_read } else { compared.contains(&(*a, *b)) };
         }
     }
     read
@@ -190,10 +192,69 @@ impl Emit<'_> {
         Some(Reg::Rax)
     }
 
-    /// Whether the carry flag still holds `left <u right` from the add that produced `left` from `right` and another operand.
+    /// Adds or subtracts the carry `left <u right` (or `left != 0`), inverted when `invert`, to `other` by `adc` or `sbb`, which also computes `other` when it is a folded add or subtract.
+    pub(super) fn carry_add(&mut self, op: Binary, ty: Type, dst: Reg, (left, other, right, invert): (Value, Value, Option<Value>, bool)) -> Result<(), String> {
+        let size = if ty == Type::I32 { Size::D } else { Size::Q };
+        let fold = if self.plan.elided[other.index()] { super::location::adc_fold(self.func, op, invert, other, |v| self.defs[v.index()]) } else { None };
+        let ready = |emit: &Self, v: Value| !emit.plan.elided[v.index()] && matches!(emit.location(v), crate::alloc::Location::Reg(_) | crate::alloc::Location::Slot | crate::alloc::Location::Imm(_));
+        let operands_ready = fold.map_or_else(|| ready(self, other), |(p, q)| ready(self, p) && ready(self, q));
+        let held = operands_ready && right.is_some_and(|right| self.overflow_held(left, right));
+        if !held {
+            self.emit_cmp_pair(Size::of(self.ty(left).bytes()), left, right, false);
+        }
+        let (alu, imm) = match (op == Binary::Iadd, invert) {
+            (true, false) => (Alu::Adc, 0),
+            (false, false) => (Alu::Sbb, 0),
+            (true, true) => (Alu::Sbb, -1),
+            (false, true) => (Alu::Adc, -1),
+        };
+        let source = match fold {
+            Some((p, q)) if p != q && self.reg_of(q) == Some(dst) => {
+                self.asm.mov(Reg::Rax, dst);
+                self.clobber_reg(Reg::Rax);
+                self.raw(dst, p);
+                Some(Rm::from(Reg::Rax))
+            }
+            Some((p, q)) => {
+                self.raw(dst, p);
+                self.imm_sized(q, size).is_none().then(|| self.operand(q))
+            }
+            None => {
+                self.raw(dst, other);
+                None
+            }
+        };
+        if held && !right.is_some_and(|right| self.overflow_held(left, right)) {
+            return Err("the carry flag was overwritten before an adc that reads it".to_owned());
+        }
+        match (source, fold) {
+            (Some(source), _) => self.asm.alu_sized(size, alu, dst, source),
+            (None, Some((_, q))) => self.asm.alu_imm_sized(size, alu, dst, self.imm_sized(q, size).unwrap_or_default()),
+            (None, None) => self.asm.alu_imm_sized(size, alu, dst, imm),
+        }
+        Ok(())
+    }
+
+    /// Whether the carry flag still holds `left <u right`, from the add that produced `left` from `right` or the subtract of `right` from `left`.
     pub(super) fn overflow_held(&self, left: Value, right: Value) -> bool {
-        self.asm.held_carry() == Some(overflow_tag(left))
-            && self.defs[left.index()].is_some_and(|inst| matches!(self.func.insts[inst.index()].op, Op::Binary(Binary::Iadd, a, b) if a == right || b == right))
+        let Some(source) = self.asm.held_carry().filter(|tag| tag % 2 == 1).map(|tag| Value((tag / 2) as u32)) else { return false };
+        self.defs[source.index()].is_some_and(|inst| match self.func.insts[inst.index()].op {
+            Op::Binary(Binary::Iadd, a, b) => source == left && (a == right || b == right),
+            Op::Binary(Binary::Isub, a, b) => a == left && b == right,
+            _ => false,
+        })
+    }
+
+    /// The condition that reads the unsigned compare `x cc y` from a carry or borrow the carry flag still holds for these operands.
+    pub(super) fn held_compare(&self, cc: IntCC, x: Value, y: Value) -> Option<Cond> {
+        let (left, right, cond) = match cc {
+            IntCC::UnsignedLessThan => (x, y, Cond::B),
+            IntCC::UnsignedGreaterThan => (y, x, Cond::B),
+            IntCC::UnsignedGreaterThanOrEqual => (x, y, Cond::Ae),
+            IntCC::UnsignedLessThanOrEqual => (y, x, Cond::Ae),
+            _ => return None,
+        };
+        self.overflow_held(left, right).then_some(cond)
     }
 
     fn const_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
