@@ -138,7 +138,19 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn static_rodata_blob(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
-        if self.cx.foreign(item) || self.cx.thread_local(item) || self.is_mutable_static(item) || !super::is_freeze_ty(self.cx, ty, 0) {
+        if self.is_mutable_static(item) || !super::is_freeze_ty(self.cx, ty, 0) {
+            return Ok(None);
+        }
+        self.static_literal(item, substs, ty)
+    }
+
+    /// Whether the static `item` starts as all zero bytes, which its zeroed cell already holds before any fill.
+    fn zero_static(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<bool> {
+        Ok(self.static_literal(item, substs, ty)?.is_some_and(|(bytes, relocs)| relocs.is_empty() && bytes.iter().all(|&b| b == 0)))
+    }
+
+    fn static_literal(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
+        if self.cx.foreign(item) || self.cx.thread_local(item) {
             return Ok(None);
         }
         if self.cx.layout(ty)?.align.bytes() > 16 {
@@ -182,7 +194,7 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// The place of the static `item` at `substs`, of type `ty`: the prepped library's copy when Haste shares it, immutable literal bytes in read-only data when eligible, else its cell, which the static's initializer fills on the first use that finds it empty.
+    /// The place of the static `item` at `substs`, of type `ty`: the prepped library's copy when Haste shares it, immutable literal bytes in read-only data when eligible, else its cell, which the static's initializer fills on the first use that finds it empty unless it starts as zero bytes.
     pub fn static_place(&mut self, (item, substs): (ItemRef, Substs), ty: Ty) -> Result<Place> {
         if let Some(address) = crate::prep::static_address(self.cx, item) {
             let base = self.emit_symbol(SymbolSource::Word(address as u64));
@@ -194,7 +206,7 @@ impl Lower<'_, '_> {
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
         let (address, size) = self.static_cell(index, ty)?;
-        if !self.cx.foreign(item) && index != self.index {
+        if !self.cx.foreign(item) && index != self.index && !self.zero_static(item, substs, ty)? {
             let flag = self.ins().iadd_imm(address, i64::from(size));
             let state = self.ins().atomic_load(Type::I8, flag);
             let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
