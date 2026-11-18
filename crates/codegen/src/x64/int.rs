@@ -295,16 +295,26 @@ impl Emit<'_> {
                 self.asm.load(narrow, dst, source);
                 return Ok(dst);
             }
+            let disp = match alu {
+                Alu::Add => self.imm_sized(y, size),
+                Alu::Sub if size == Size::D => self.const_of(y).map(|c| (c as i32).wrapping_neg()),
+                Alu::Sub => self.const_of(y).and_then(|c| c.checked_neg()).and_then(|c| i32::try_from(c).ok()),
+                _ => None,
+            };
+            if size == Size::Q
+                && !self.plan.fused[result.index()]
+                && let Some(sym) = self.image_sym(x)
+                && let Some(imm) = self.const_of(y).and_then(|c| if matches!(alu, Alu::Add) { Some(c) } else { c.checked_neg() }).and_then(|c| i32::try_from(c).ok())
+            {
+                self.flags = saved_flags;
+                self.asm.lea(dst, Mem::rip(sym, imm));
+                return Ok(dst);
+            }
             if matches!(size, Size::D | Size::Q)
                 && matches!(alu, Alu::Add | Alu::Sub)
                 && !self.plan.fused[result.index()]
                 && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x)).filter(|&rx| (rx != dst || self.asm.held_carry().is_some()) && rx != Reg::Rsp)
             {
-                let disp = match alu {
-                    Alu::Add => self.imm_sized(y, size),
-                    _ if size == Size::D => self.const_of(y).map(|c| (c as i32).wrapping_neg()),
-                    _ => self.const_of(y).and_then(|c| c.checked_neg()).and_then(|c| i32::try_from(c).ok()),
-                };
                 if let Some(imm) = disp {
                     self.flags = saved_flags;
                     self.asm.lea_sized(size, dst, Mem::new(rx, imm));

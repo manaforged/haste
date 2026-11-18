@@ -607,10 +607,12 @@ fn promote_loop_syms<R: Copy>(func: &Function, census: &Uses, depths: Option<&[u
             }
         }
     }
+    let folds = addressed_images(func);
     let mut promoted = Vec::new();
     for (v, loc) in locations.iter_mut().enumerate() {
         if matches!(*loc, Location::SlotAddr(_) | Location::Symbol(_))
             && !elided[v]
+            && !folds[v]
             && (census.uses[v] >= 2 || in_loop[v] || depths.is_some_and(|d| census.def[v].is_some_and(|(db, _)| d[db] > 0)))
         {
             promoted.push((v, *loc));
@@ -618,6 +620,28 @@ fn promote_loop_syms<R: Copy>(func: &Function, census: &Uses, depths: Option<&[u
         }
     }
     promoted
+}
+
+/// Which image addresses are used only as the address of plain loads and stores or plus a 32-bit constant, which reach them relative to the program counter.
+fn addressed_images(func: &Function) -> Vec<bool> {
+    let mut folds: Vec<bool> = (0..func.types.len()).map(|v| func.is_image_addr(Value(v as u32))).collect();
+    let mut small = vec![false; func.types.len()];
+    for data in &func.insts {
+        if let (Op::Const(k), Some(result)) = (&data.op, data.result) {
+            small[result.index()] = i32::try_from(*k).is_ok();
+        }
+    }
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            match func.insts[inst.index()].op {
+                Op::Load(..) => {}
+                Op::Store(value, ..) => folds[value.index()] = false,
+                Op::Binary(Binary::Iadd | Binary::Isub, _, k) if small[k.index()] => {}
+                ref op => op.for_operands(|v| folds[v.index()] = false),
+            }
+        }
+    }
+    folds
 }
 
 pub(crate) fn plan<R: Copy + PartialEq>(

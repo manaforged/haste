@@ -124,6 +124,14 @@ impl Emit<'_> {
         (mem.base == self.base && mem.index.is_none() && mem.rip.is_none()).then(|| mem.disp - self.bias)
     }
 
+    /// The symbol of `value` when it is an image address that code reaches relative to `rip`.
+    pub(super) fn image_sym(&self, value: Value) -> Option<u32> {
+        match self.location(value) {
+            Location::Symbol(sym) if self.direct_calls && self.func.is_image_addr(value) => Some(sym),
+            _ => None,
+        }
+    }
+
     /// The memory at `addr + offset`: relative to the frame base for a frame address, to the location register of `addr`, or through rcx.
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
         self.address_in(addr, offset, Reg::Rcx, None)
@@ -240,10 +248,7 @@ impl Emit<'_> {
         if let Some(reg) = self.reg_of(addr) {
             return Mem::new(reg, offset);
         }
-        if let Location::Symbol(sym) = self.location(addr)
-            && self.direct_calls
-            && self.func.is_image_addr(addr)
-        {
+        if let Some(sym) = self.image_sym(addr) {
             return Mem::rip(sym, offset);
         }
         if let Location::Frame(slot, base) = self.location(addr)

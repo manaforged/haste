@@ -175,6 +175,9 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     copy::build_in_place(&mut func);
     coroutine::split(&mut func);
     keep_honored_marks(&mut func, target);
+    if !(target.direct_calls && target.arch == Arch::X64) {
+        func.forget_image_addrs();
+    }
     verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     let tracing = trace::enabled();
     if tracing {

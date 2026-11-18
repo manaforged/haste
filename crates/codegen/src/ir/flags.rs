@@ -25,6 +25,11 @@ impl Function {
         self.flags(value) & IMAGE_ADDR != 0
     }
 
+    /// Drops every image-address mark, for targets that cannot reach data relative to the program counter.
+    pub(crate) fn forget_image_addrs(&mut self) {
+        self.value_flags.iter_mut().for_each(|bits| *bits &= !IMAGE_ADDR);
+    }
+
     /// Whether `value` is a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
     pub(crate) fn is_unique_ptr(&self, value: Value) -> bool {
         self.flags(value) & UNIQUE_PTR != 0
