@@ -1,4 +1,5 @@
 mod chain;
+mod join;
 mod param;
 
 pub(crate) use chain::build_in_place;
@@ -143,8 +144,20 @@ pub(crate) fn forward_sret_slot(func: &mut Function) -> bool {
     let calls = forward_sret_calls(func);
     let joins = slot_return_joins(func, entry, sret_ptr, bytes);
     let split = split_returns(func, sret_ptr, bytes, &joins);
-    let forwarded = forward_sret_slots(func, entry, sret_ptr, bytes);
+    let mut forwarded = forward_sret_slots(func, entry, sret_ptr, bytes);
     let kept = rejoin_returns(func, &split);
+    loop {
+        let hoisted = join::hoist(func, entry, sret_ptr, bytes);
+        if hoisted.is_empty() {
+            break;
+        }
+        let more = forward_sret_slots(func, entry, sret_ptr, bytes);
+        join::settle(func, hoisted);
+        if !more {
+            break;
+        }
+        forwarded = true;
+    }
     calls || forwarded || kept
 }
 
@@ -290,14 +303,12 @@ fn rejoin_returns(func: &mut Function, split: &[SplitReturn]) -> bool {
     kept
 }
 
-/// A slot that can live in the `StructReturn` memory at `sret_ptr`, with the moves that copy it out: every copy of it returns next, nothing reads it, and no access or copy of it can run after another write of the return memory.
+/// A slot that can live in the `StructReturn` memory at `sret_ptr`, with the moves that copy it out: no access or copy of it can run after one of its copies or after another write of the return memory.
 fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) -> Option<(StackSlot, Vec<(Block, Inst)>)> {
     let info = collect_sret_info(func, entry);
     let mut copies = Vec::new();
     for &(block, pos, inst) in &info.uses_by_val[sret_ptr.index()] {
-        let insts = &func.blocks[block.index()].insts;
-        let returns_next = pos + 2 == insts.len() && matches!(func.insts[insts[pos + 1].index()].op, Op::Return(_));
-        if let Some(slot) = move_to_sret_src(func, &info.defs, inst, sret_ptr, bytes).and_then(|src| resolve_slot(func, &info.defs, src)).filter(|_| returns_next) {
+        if let Some(slot) = move_to_sret_src(func, &info.defs, inst, sret_ptr, bytes).and_then(|src| resolve_slot(func, &info.defs, src)) {
             copies.push((slot, block, pos, inst));
         }
     }
@@ -316,6 +327,9 @@ fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) ->
         let moves: Vec<(Block, Inst)> = copies.iter().filter(|copy| copy.0 == slot).map(|&(_, block, _, inst)| (block, inst)).collect();
         let spots: Vec<(Block, usize)> = copies.iter().filter(|copy| copy.0 == slot).map(|&(_, block, pos, _)| (block, pos)).collect();
         let Some(accesses) = slot_accesses(func, &info, slot, &moves) else { continue };
+        if spots.iter().any(|&spot| accesses.iter().chain(&spots).any(|&access| runs_after(func, spot, access))) {
+            continue;
+        }
         let others = copies.iter().filter(|copy| copy.0 != slot).map(|&(_, block, pos, _)| (block, pos)).chain(writes.iter().copied());
         if others.clone().all(|other| !accesses.iter().chain(&spots).any(|&access| access == other || runs_after(func, other, access))) {
             return Some((slot, moves));
