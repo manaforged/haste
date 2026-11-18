@@ -1,6 +1,7 @@
 use std::fmt;
 
 mod flags;
+mod rodata;
 mod vector;
 
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
@@ -43,6 +44,17 @@ impl Type {
 
     /// Whether a value of the type lives in a float register when it has one.
     pub const fn in_float_register(self) -> bool { self.is_float() || self.is_vector() }
+
+    /// The integer type `bytes` wide: 1, 2, 4 or 8.
+    pub const fn int_of_bytes(bytes: i64) -> Option<Type> {
+        match bytes {
+            1 => Some(Type::I8),
+            2 => Some(Type::I16),
+            4 => Some(Type::I32),
+            8 => Some(Type::I64),
+            _ => None,
+        }
+    }
 
     /// Whether the type holds an integer that fits in one general-purpose register.
     pub const fn is_small_int(self) -> bool { matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64) }
@@ -594,25 +606,6 @@ impl Function {
     /// Associates symbol index `sym` with known read-only constant bytes for load folding.
     pub fn add_rodata_bytes(&mut self, sym: u32, bytes: Vec<u8>) {
         self.rodata_bytes.push((sym, bytes));
-    }
-
-    /// The `size` known read-only bytes of symbol `sym` at byte `start`.
-    pub(crate) fn rodata_slice(&self, sym: u32, start: i64, size: usize) -> Option<&[u8]> {
-        let start = usize::try_from(start).ok()?;
-        let (_, bytes) = self.rodata_bytes.iter().find(|&&(s, _)| s == sym)?;
-        bytes.get(start..start.checked_add(size)?)
-    }
-
-    /// The scalar of type `ty` that the known read-only bytes of symbol `sym` hold at byte `start`: sign-extended for an integer, raw bits for a float.
-    pub(crate) fn rodata_read(&self, sym: u32, start: i64, ty: Type) -> Option<i64> {
-        if !(ty.is_small_int() || matches!(ty, Type::F32 | Type::F64)) {
-            return None;
-        }
-        let size = usize::try_from(ty.bytes()).ok()?;
-        let mut raw = [0_u8; 8];
-        raw.get_mut(..size)?.copy_from_slice(self.rodata_slice(sym, start, size)?);
-        let bits = u64::from_le_bytes(raw) as i64;
-        Some(if ty.is_small_int() { crate::fold::extend(bits, ty, true) } else { bits })
     }
 
     /// Marks relocation slot `sym` as a direct self-recursive target of this function.

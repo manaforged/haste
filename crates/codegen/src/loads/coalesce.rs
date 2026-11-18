@@ -80,11 +80,7 @@ fn find_coalesce_slice(const_stores: &[ConstStore], target_idx: usize) -> Option
     let contig = &same[l..=r];
     let t_rel = pos - l;
     for target_w in [8_i64, 4, 2] {
-        let wide_ty = match target_w {
-            8 => Type::I64,
-            4 => Type::I32,
-            _ => Type::I16,
-        };
+        let Some(wide_ty) = Type::int_of_bytes(target_w) else { continue };
         for a in 0..=t_rel {
             let lo = contig[a].1;
             if i32::try_from(lo).is_err() {
