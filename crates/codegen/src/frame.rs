@@ -653,6 +653,9 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
         if ahead <= k {
             ahead = insts[k..].iter().position(|i| func.insts[i.index()].loc != 0).map_or(insts.len(), |at| k + at);
             loc = insts.get(ahead).map_or(loc, |i| func.insts[i.index()].loc);
+            if loc == 0 {
+                loc = func.home_loc();
+            }
         }
         mark_line(emit, loc);
         emit.inst(inst)?;
@@ -682,7 +685,7 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
     let func = emit.func();
     let entry = func.entry.ok_or("the function has no entry block")?;
     let mut starts = Vec::with_capacity(order.len() + 1);
-    mark_line(&mut emit, 0);
+    mark_line(&mut emit, func.home_loc());
     if !emit.deferred_prologue() {
         emit.prologue();
     }

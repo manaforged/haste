@@ -666,6 +666,11 @@ impl Function {
         block
     }
 
+    /// The source location of the first located instruction, which code with no location of its own reports.
+    pub(crate) fn home_loc(&self) -> u64 {
+        self.blocks.iter().flat_map(|block| &block.insts).map(|inst| self.insts[inst.index()].loc).find(|&loc| loc != 0).unwrap_or(0)
+    }
+
     /// The number of instructions in the body.
     pub fn size(&self) -> usize {
         self.blocks.iter().map(|block| block.insts.len()).sum()
