@@ -170,10 +170,15 @@ fn keep_honored_marks(func: &mut Function, target: &Target) {
     }
 }
 
+/// Splits `func` into its state machine when it is a coroutine's resume function, leaving a plain function a caller can inline.
+pub fn split_coroutine(func: &mut Function) {
+    copy::build_in_place(func);
+    coroutine::split(func);
+}
+
 /// Encodes `func` for `target`.
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
-    copy::build_in_place(&mut func);
-    coroutine::split(&mut func);
+    split_coroutine(&mut func);
     keep_honored_marks(&mut func, target);
     if !(target.direct_calls && target.arch == Arch::X64) {
         func.forget_image_addrs();

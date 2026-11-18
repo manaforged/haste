@@ -194,6 +194,9 @@ fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'
         info.self_loop |= !matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
         return;
     }
+    if own_glue(cx, reached, (u, v)) {
+        return;
+    }
     if cyclic.is_done(v) {
         return;
     }
@@ -206,4 +209,12 @@ fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'
         return;
     }
     edges.push(v);
+}
+
+/// Whether `v` is glue of closure `u`'s own type, which `u` can name but never reach while it runs.
+fn own_glue(cx: &Context<'_>, reached: &Reached, (u, v): (usize, usize)) -> bool {
+    let closure = matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
+    let glue = matches!(&reached.list[v].1, Ok(typed) if matches!(typed.shape, Shape::Glue(_)));
+    let own = |index: usize| cx.types.substs(reached.list[index].0.1).first().copied();
+    closure && glue && own(u).is_some() && own(u) == own(v)
 }

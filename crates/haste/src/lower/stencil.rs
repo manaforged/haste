@@ -568,9 +568,10 @@ fn lower_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
 }
 
 fn simplify_inline(mut func: Function, limit: usize) -> std::result::Result<(Arc<Function>, bool), Miss> {
-    if func.is_coroutine() || func.size() > limit.saturating_mul(6).max(1600) {
+    if func.size() > limit.saturating_mul(6).max(1600) {
         return Err(Miss::Shape);
     }
+    haste_codegen::split_coroutine(&mut func);
     simplify_tallied(&mut func, Tally::Built);
     if !func.can_inline() {
         return Err(Miss::Shape);
