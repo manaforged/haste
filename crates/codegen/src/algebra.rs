@@ -322,28 +322,6 @@ fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y:
     zero_compare(cx, cc, x, y)
 }
 
-fn negated_shift_add(cx: &RewriteCx, ty: Type, a: Value, b: Value) -> Option<(Value, Value, i64)> {
-    for (base, rhs) in [(a, b), (b, a)] {
-        let Some(shl_inst) = cx.def(rhs) else { continue };
-        let (neg, shift) = match cx.func.insts[shl_inst.index()].op {
-            Op::Binary(Binary::Ishl, neg, k) => (neg, cx.sconst(k)?),
-            Op::Binary(Binary::Imul, m1, m2) => {
-                [(m1, m2), (m2, m1)]
-                    .into_iter()
-                    .find_map(|(v, cv)| cx.uconst(cv, ty).filter(|&m| m > 1 && m.is_power_of_two()).map(|m| (v, i64::from(m.trailing_zeros()))))?
-            }
-            _ => continue,
-        };
-        let Some(neg_inst) = cx.def(neg) else { continue };
-        match cx.func.insts[neg_inst.index()].op {
-            Op::Binary(Binary::Isub, zero, idx) if cx.uconst(zero, ty) == Some(0) => return Some((base, idx, shift)),
-            Op::Unary(Unary::Ineg, idx) => return Some((base, idx, shift)),
-            _ => {}
-        }
-    }
-    None
-}
-
 fn simplify_band(cx: &mut RewriteCx, res: Option<Value>, a: Value, b: Value) -> Option<Op> {
     let ty = cx.func.ty(a);
     if !ty.is_small_int() { return None; }
@@ -667,11 +645,11 @@ fn simplify_rotate(cx: &mut RewriteCx, bin: Binary, a: Value, b: Value) -> Optio
 
 fn simplify_binary(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(Value, Value, Value)>, res: Option<Value>, (bin, a, b): (Binary, Value, Value)) -> Option<Op> {
     match bin {
-        Binary::Iadd => negated_shift_add(cx, cx.func.ty(a), a, b).map(|(base, idx, shift)| {
+        Binary::Iadd => sum::negated_shift_add(cx, cx.func.ty(a), a, b).map(|(base, idx, shift)| {
             let ty = cx.func.ty(base);
             let k = cx.emit(ty, Op::Const(shift));
             Op::Binary(Binary::Isub, base, cx.emit(ty, Op::Binary(Binary::Ishl, idx, k)))
-        }).or_else(|| reassociate_add(cx, fits_used, a, b)).or_else(|| simplify_rotate(cx, bin, a, b)).or_else(|| sum::cancel_terms(cx, fits_used, res, (bin, a, b))),
+        }).or_else(|| sum::negated_offset_add(cx, cx.func.ty(a), a, b)).or_else(|| reassociate_add(cx, fits_used, a, b)).or_else(|| simplify_rotate(cx, bin, a, b)).or_else(|| sum::cancel_terms(cx, fits_used, res, (bin, a, b))),
         Binary::Isub => bits::low_bits(cx, a, b).or_else(|| reassociate_sub(cx, fits_used, a, b)).or_else(|| sum::cancel_terms(cx, fits_used, res, (bin, a, b))),
         Binary::Band => simplify_band(cx, res, a, b),
         Binary::Bor => simplify_rotate(cx, bin, a, b).or_else(|| icmp::fuse_cmp_ops(cx, res, false, a, b)).or_else(|| merge_fields(cx, res, a, b)),

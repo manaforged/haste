@@ -1,6 +1,6 @@
 use super::RewriteCx;
 use crate::fold::extend;
-use crate::ir::{Binary, Op, Unary, Value};
+use crate::ir::{Binary, Op, Type, Unary, Value};
 
 const DEPTH: u8 = 2;
 
@@ -98,4 +98,47 @@ pub(super) fn scale_sum(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
     let scaled = cx.emit(ty, Op::Binary(Binary::Imul, v, scale));
     let addend = cx.emit(ty, Op::Const(extend(c.wrapping_mul(k), ty, true)));
     Some(Op::Binary(Binary::Iadd, scaled, addend))
+}
+
+/// The value `v` scales and the power of two it scales by, as a left shift amount, when `v` is a shift left by a constant or a multiply by a power of two.
+fn scaled(cx: &RewriteCx, ty: Type, v: Value) -> Option<(Value, i64)> {
+    match cx.func.insts[cx.def(v)?.index()].op {
+        Op::Binary(Binary::Ishl, x, k) => Some((x, cx.sconst(k)?)),
+        Op::Binary(Binary::Imul, m1, m2) => {
+            [(m1, m2), (m2, m1)].into_iter().find_map(|(x, cv)| cx.uconst(cv, ty).filter(|&m| m > 1 && m.is_power_of_two()).map(|m| (x, i64::from(m.trailing_zeros()))))
+        }
+        _ => None,
+    }
+}
+
+/// `base + -((idx << k) + c)` as `(base - (idx << k)) + -c`, so the scaled difference matches the same address computed without the offset.
+pub(super) fn negated_offset_add(cx: &mut RewriteCx, ty: Type, a: Value, b: Value) -> Option<Op> {
+    if !ty.is_small_int() {
+        return None;
+    }
+    for (base, rhs) in [(a, b), (b, a)] {
+        let Some(Op::Unary(Unary::Ineg, sum)) = cx.def(rhs).map(|inst| cx.func.insts[inst.index()].op.clone()) else { continue };
+        let Some(Op::Binary(Binary::Iadd, p, q)) = cx.def(sum).map(|inst| cx.func.insts[inst.index()].op.clone()) else { continue };
+        let Some((term, c)) = super::const_addend(cx, p, q) else { continue };
+        let Some((idx, shift)) = scaled(cx, ty, term) else { continue };
+        let k = cx.emit(ty, Op::Const(shift));
+        let shifted = cx.emit(ty, Op::Binary(Binary::Ishl, idx, k));
+        let diff = cx.emit(ty, Op::Binary(Binary::Isub, base, shifted));
+        let offset = cx.emit(ty, Op::Const(extend(c.wrapping_neg(), ty, true)));
+        return Some(Op::Binary(Binary::Iadd, diff, offset));
+    }
+    None
+}
+
+pub(super) fn negated_shift_add(cx: &RewriteCx, ty: Type, a: Value, b: Value) -> Option<(Value, Value, i64)> {
+    for (base, rhs) in [(a, b), (b, a)] {
+        let Some((neg, shift)) = scaled(cx, ty, rhs) else { continue };
+        let Some(neg_inst) = cx.def(neg) else { continue };
+        match cx.func.insts[neg_inst.index()].op {
+            Op::Binary(Binary::Isub, zero, idx) if cx.uconst(zero, ty) == Some(0) => return Some((base, idx, shift)),
+            Op::Unary(Unary::Ineg, idx) => return Some((base, idx, shift)),
+            _ => {}
+        }
+    }
+    None
 }
