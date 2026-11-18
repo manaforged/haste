@@ -74,7 +74,7 @@ pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
 pub use reloc::{DictTierUp, FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
-pub use trace::{missed_report, with_label as with_trace_label};
+pub use trace::{enabled as trace_enabled, missed_report, with_label as with_trace_label};
 
 use std::ops::Range;
 

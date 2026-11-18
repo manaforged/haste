@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
 use crate::ir::{AbiParam, Binary, Block, BlockData, Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::reloc::RuntimeSymbol;
 pub(crate) use loop_mem::{LoopMem, PromoteBase, PromoteCand};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -92,6 +93,7 @@ pub(crate) struct Provenance {
     pub noalias_escaped: Vec<bool>,
     pub param_roots: Vec<MemRoot>,
     pub symbol_defs: Vec<Option<u32>>,
+    frame_runtime: Vec<Option<RuntimeSymbol>>,
     pub ro_bytes: Vec<u32>,
     pub affine: Vec<(Value, i64)>,
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
@@ -304,6 +306,11 @@ pub(crate) fn compute_affine(func: &Function) -> Vec<(Value, i64)> {
 }
 
 impl Provenance {
+    /// The coroutine frame runtime that `callee` names, if any: `Malloc` writes no memory the function can read, and `Free` writes only the block it frees.
+    pub(crate) fn frame_runtime(&self, callee: Value) -> Option<RuntimeSymbol> {
+        self.frame_runtime.get(callee.index()).copied().flatten()
+    }
+
     fn build(func: &Function, cfg: &Cfg, (is_spill, positions): (Option<&[bool]>, bool), affine: Option<Vec<(Value, i64)>>) -> Self {
         let affine = affine.unwrap_or_else(|| compute_affine(func));
         let tracked = compute_tracked_roots(func, cfg, &affine);
@@ -337,10 +344,13 @@ impl Provenance {
             }
         }
         let mut symbol_defs = vec![None; func.types.len()];
+        let mut frame_runtime = vec![None; func.types.len()];
         for inst in func.blocks.iter().flat_map(|b| &b.insts) {
             let data = &func.insts[inst.index()];
-            if let (Op::Symbol(sym) | Op::SlotAddr(sym), Some(res)) = (&data.op, data.result) {
-                symbol_defs[res.index()] = Some(*sym);
+            match (&data.op, data.result) {
+                (Op::Symbol(sym) | Op::SlotAddr(sym), Some(res)) => symbol_defs[res.index()] = Some(*sym),
+                (&Op::Runtime(rt @ (RuntimeSymbol::Malloc | RuntimeSymbol::Free)), Some(res)) => frame_runtime[res.index()] = Some(rt),
+                _ => {}
             }
         }
         let mut ro_bytes = vec![0_u32; func.types.len()];
@@ -349,7 +359,7 @@ impl Provenance {
                 ro_bytes[param.index()] = abi.deref_bytes;
             }
         }
-        Self { slot_offsets, param_roots, symbol_defs, ro_bytes, affine, ..Self::default() }
+        Self { slot_offsets, param_roots, symbol_defs, frame_runtime, ro_bytes, affine, ..Self::default() }
     }
 
     /// The address facts alone, for `loc` and `ro_bytes`: no escape classification and no loop spans.
@@ -522,15 +532,21 @@ pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance)
     clobbers_op(func, (op, None), loc, prov)
 }
 
+/// Whether a write of unknown length at `addr` may overwrite `loc`.
+fn block_clobbers(addr: Value, loc: MemLoc, prov: &Provenance) -> bool {
+    let w = prov.loc(addr, 0, u32::MAX);
+    w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
+}
+
 /// Whether `op`, run as instruction `at` when known, may overwrite `loc`; `at` rules out slots whose address leaves only later.
 pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
     match *op {
         Op::StackStore(val, slot, off) => stack_store_clobbers(func, op, (val, slot, off), loc, prov),
         Op::Store(val, addr, off) => may_alias(prov.loc(addr, i64::from(off), func.ty(val).bytes()), loc, prov),
         Op::Move(dst, _, bytes) => may_alias(prov.loc(dst, 0, bytes), loc, prov),
-        Op::Copy(dst, _, _) => {
-            let w = prov.loc(dst, 0, u32::MAX);
-            w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
+        Op::Copy(dst, _, _) => block_clobbers(dst, loc, prov),
+        Op::Call { callee, ref args, .. } if let Some(rt) = prov.frame_runtime(callee) => {
+            rt == RuntimeSymbol::Free && args.first().is_none_or(|&freed| block_clobbers(freed, loc, prov))
         }
         Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
             MemRoot::Slot(s) => {

@@ -17,6 +17,7 @@ use remat::{FarCseGuard, SubwordAction, SubwordSlices, drop_covered_stores, drop
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, TargetOpId, TinyArgs, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, compute_affine, may_alias};
 use crate::merge::{find, identity, rename};
+use crate::reloc::RuntimeSymbol;
 
 enum Assembled {
     Int(i64),
@@ -108,22 +109,9 @@ fn effect(func: &Function, state: &State<'_>, inst: Inst) -> Effect {
             let ty = func.ty(value);
             Effect::Write(MemLoc::slot(to, i64::from(offset), ty.bytes()), ty, find(state.subst, value))
         }
-        (op, _)
-            if matches!(
-                op,
-                Op::AtomicLoad(_)
-                    | Op::AtomicStore(..)
-                    | Op::AtomicRmw(..)
-                    | Op::AtomicCas(..)
-                    | Op::Fence
-                    | Op::Copy(..)
-                    | Op::Move(..)
-                    | Op::Call { .. }
-                    | Op::TryCall { .. }
-            ) =>
-        {
-            Effect::Unknown
-        }
+        (&Op::Call { callee, .. }, _) if state.prov.frame_runtime(callee) == Some(RuntimeSymbol::Malloc) => Effect::None,
+        (op, _) if matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence) => Effect::Unknown,
+        (op, _) if matches!(op, Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. }) => Effect::Unknown,
         _ => Effect::None,
     }
 }

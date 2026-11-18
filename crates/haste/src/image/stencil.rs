@@ -476,7 +476,7 @@ impl Image {
             return Ok(());
         }
         let reloc_plan = out.reloc_plan;
-        let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
+        let code = Arc::new(compile_traced(cx, reached, index, out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
         if let Some(fp) = footprint
             && aot_relocs_valid(&code, out.relocs.len())
             && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)
@@ -625,7 +625,7 @@ impl Image {
             return Ok(());
         }
         let reloc_plan = out.reloc_plan;
-        let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target()).map_err(|e| item_err(cx, group.item, e))?);
+        let code = Arc::new(compile_traced(cx, reached, rep, out.func, &self.compile_target()).map_err(|e| item_err(cx, group.item, e))?);
         if code.bytes().len() > cfg.min_bytes && group.distinct.len() >= cfg.min_fanout {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
@@ -768,4 +768,13 @@ pub(super) fn mode_dict_key(direct_key: u64) -> u64 {
 
 pub(super) fn mode_stencil_key(mode: ImageMode, item_key: u64) -> u64 {
     if mode == ImageMode::Aot { item_key ^ 0xA070_A070_A070_A070 } else { item_key }
+}
+
+/// Compiles `func`, the stencil of reached function `index`, under its symbol name as the trace label when tracing is on.
+fn compile_traced(cx: &mut Context<'_>, reached: &Reached, index: usize, func: haste_codegen::Function, target: &haste_codegen::Target) -> std::result::Result<haste_codegen::Code, haste_codegen::Error> {
+    if !haste_codegen::trace_enabled() {
+        return haste_codegen::compile(func, target);
+    }
+    let label = cx.symbol_text(reached.list[index].0);
+    haste_codegen::with_trace_label(&label, || haste_codegen::compile(func, target))
 }

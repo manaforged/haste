@@ -65,7 +65,7 @@ fn table(cx: &mut Context<'_>, reached: &Reached) -> Result<String> {
 
 fn compile(cx: &mut Context<'_>, reached: &Reached, image: &Image, index: usize) -> Result<(Vec<u8>, String)> {
     let out = crate::lower::lower_stencil(cx, reached, image, index)?;
-    let name = cx.name(reached.list[index].0.0);
+    let name = cx.symbol_text(reached.list[index].0);
     let code = haste_codegen::with_trace_label(&name, || haste_codegen::compile(out.func, &crate::host_target()))?;
     let mut relocations = String::new();
     for reloc in code.relocs() {
