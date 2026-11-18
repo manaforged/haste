@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use haste_codegen::{Arch, Format, Os, RelocKind, RuntimeSymbol, Target, patch_reloc};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -579,7 +579,7 @@ fn reloc_span(kind: RelocKind, offset: u32) -> (usize, usize) {
     let off = offset as usize;
     match kind {
         RelocKind::X64RipRel32 => (off.saturating_sub(3), off + 4),
-        RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 => (off, off + 4),
+        RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 | RelocKind::ThreadOff32 => (off, off + 4),
         RelocKind::Abs64 | RelocKind::Arm64AdrpAdd => (off, off + 8),
         RelocKind::Arm64Movw64 => (off, off + 16),
     }
@@ -607,6 +607,13 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             let pc_va = text_va + u64::from(reloc.offset);
             let (load_got, target_va) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, got_vas)?;
             shims::patch_arm64_pie(&mut out[at..at + 16], pc_va, load_got, target_va)?;
+            continue;
+        }
+        if reloc.kind == RelocKind::ThreadOff32 {
+            ensure!(addrs.frame_tls != 0, "ThreadOff32 without a thread-local frame cache");
+            let addend = i64::from(i32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]));
+            let off = i32::try_from(addend - addrs.frame_tls as i64).context("ThreadOff32 offset out of range")?;
+            out[at..at + 4].copy_from_slice(&off.to_le_bytes());
             continue;
         }
         if reloc.kind == RelocKind::X64RipRel32 {

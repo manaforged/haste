@@ -3,6 +3,7 @@ mod atomic;
 mod features;
 mod float;
 mod frame;
+mod frames;
 mod imm;
 mod int;
 mod location;
@@ -124,6 +125,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         features,
         copied,
         direct_calls: target.direct_calls,
+        frame_cache: target.direct_calls && target.os == crate::target::Os::Linux,
+        cold_calls: Vec::new(),
         shrink,
         slow_thunk,
         in_shrink_entry: false,
@@ -198,6 +201,8 @@ pub(super) struct Emit<'a> {
     features: Features,
     copied: Vec<bool>,
     direct_calls: bool,
+    frame_cache: bool,
+    cold_calls: Vec<(Label, Label, crate::reloc::RuntimeSymbol)>,
     shrink: Option<ShrinkWrap>,
     slow_thunk: Label,
     in_shrink_entry: bool,
@@ -378,6 +383,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             self.asm.bind(label);
             self.ud2();
         }
+        self.emit_cold_calls();
         emit_stubs(&mut self)?;
         self.relocs.extend(self.asm.rips.drain(..).map(|(at, sym)| StencilReloc::symbol(at, sym, RelocKind::PcRel32)));
         self.asm.relax().apply(starts, &mut self.sites, &mut self.relocs);
@@ -651,6 +657,12 @@ impl Emit<'_> {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
         }
         self.asm.flags_overwritten();
+        if let Some(CallTarget::Runtime(rt)) = direct
+            && self.cached_frame(rt, args.last().and_then(|&bytes| self.const_of(bytes)))
+        {
+            self.invalidate_spills();
+            return Ok(abi);
+        }
         match direct {
             Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
             Some(CallTarget::Slot(sym)) if self.direct_calls => {

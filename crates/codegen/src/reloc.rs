@@ -1,5 +1,10 @@
 const RUNTIME_TAG: u32 = 0x8000_0000;
 
+/// The size bound, exclusive, of coroutine frames the per-thread frame cache holds, in bytes.
+pub const FRAME_CACHE_LIMIT: u32 = 0x400;
+/// The most frames one size class of the frame cache keeps.
+pub const FRAME_CACHE_DEPTH: u8 = 64;
+
 /// How a relocation patches an immediate in machine code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RelocKind {
@@ -10,6 +15,8 @@ pub enum RelocKind {
     X64RipRel32,
     Arm64Call26,
     Arm64AdrpAdd,
+    /// The 32-bit offset from the thread pointer to the runtime symbol's thread-local block, plus the addend in the field.
+    ThreadOff32,
 }
 
 /// A runtime helper linked into generated code.
@@ -169,7 +176,7 @@ pub fn patch_reloc(kind: RelocKind, value: u64, out: &mut [u8]) -> Result<(), cr
         }
         RelocKind::Abs64 => out[..8].copy_from_slice(&value.to_le_bytes()),
         RelocKind::Arm64Movw64 => patch_arm64_movw64(&mut out[..16], value),
-        RelocKind::PcRel32 | RelocKind::X64RipRel32 | RelocKind::Arm64Call26 | RelocKind::Arm64AdrpAdd => {
+        RelocKind::PcRel32 | RelocKind::X64RipRel32 | RelocKind::Arm64Call26 | RelocKind::Arm64AdrpAdd | RelocKind::ThreadOff32 => {
             return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("{kind:?} requires AOT PC-relative patching")));
         }
     }

@@ -72,7 +72,7 @@ pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, F
 pub use coroutine::Coroutine;
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
-pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
+pub use reloc::{DictTierUp, FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
 pub use trace::{missed_report, with_label as with_trace_label};
 
