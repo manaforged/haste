@@ -15,7 +15,7 @@ pub enum RelocKind {
     X64RipRel32,
     Arm64Call26,
     Arm64AdrpAdd,
-    /// The 32-bit offset from the thread pointer to the runtime symbol's thread-local block, plus the addend in the field.
+    /// The 32-bit offset from the thread pointer to a thread-local word, plus the addend in the field: the frame cache for a runtime symbol, the slot table entry for a slot word.
     ThreadOff32,
 }
 

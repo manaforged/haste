@@ -201,7 +201,7 @@ pub(super) struct Emit<'a> {
     copied: Vec<bool>,
     direct_calls: bool,
     frame_cache: bool,
-    cold_calls: Vec<(Label, Label, crate::reloc::RuntimeSymbol)>,
+    cold_calls: Vec<(Label, Label, StencilReloc)>,
     shrink: Option<ShrinkWrap>,
     slow_thunk: Label,
     in_shrink_entry: bool,
@@ -656,9 +656,7 @@ impl Emit<'_> {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
         }
         self.asm.flags_overwritten();
-        if let Some(CallTarget::Runtime(rt)) = direct
-            && self.cached_frame(rt, args.last().and_then(|&bytes| self.const_of(bytes)))
-        {
+        if self.inline_call(direct, callee, args) {
             self.invalidate_spills();
             return Ok(abi);
         }

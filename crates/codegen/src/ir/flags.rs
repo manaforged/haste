@@ -3,6 +3,7 @@ use super::{Function, Value};
 const UNIQUE_PTR: u8 = 1;
 const UNPREDICTABLE: u8 = 2;
 const IMAGE_ADDR: u8 = 4;
+const THREAD_CELL: u8 = 8;
 
 impl Function {
     /// Marks `value` as a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
@@ -18,6 +19,16 @@ impl Function {
     /// Marks `value` as the address of data that the output image holds, so code may reach it relative to the program counter.
     pub fn mark_image_addr(&mut self, value: Value) {
         self.set_flags(value, IMAGE_ADDR);
+    }
+
+    /// Marks `value` as the runtime's thread-cell lookup, `(slot, size) -> cell`, whose fast path a target may inline.
+    pub fn mark_thread_cell(&mut self, value: Value) {
+        self.set_flags(value, THREAD_CELL);
+    }
+
+    /// Whether `value` is the runtime's thread-cell lookup.
+    pub(crate) fn is_thread_cell(&self, value: Value) -> bool {
+        self.flags(value) & THREAD_CELL != 0
     }
 
     /// Whether `value` is the address of data that the output image holds.
