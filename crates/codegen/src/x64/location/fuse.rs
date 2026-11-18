@@ -535,6 +535,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             if let Some(iv) = inner {
                 plan.elided[iv.index()] = true;
             }
+            tst_end[inner.unwrap_or(cand).index()] = Some(pos);
             skip_flags[res.index()] = true;
             let other = if cand == y { x } else { y };
             let quiet = [cmp_pos, cpos];
