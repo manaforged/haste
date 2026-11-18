@@ -350,7 +350,7 @@ fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, (is_const, region
         selects += 1;
         selects <= MAX_SELECTS && scalar_select(func.ty(*p))
     });
-    if !ok {
+    if !ok || branches_on_selected(func, m.join, (&m.t_args, &m.e_args)) {
         return false;
     }
     let param_tys: Vec<Type> = join_params.iter().map(|p| func.ty(*p)).collect();
@@ -382,6 +382,14 @@ fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, (is_const, region
     let jump = func.add(Op::Jump(m.join, selected), None);
     func.blocks[head.index()].insts.push(jump);
     true
+}
+
+/// Whether `join` only branches on a parameter its arms pass different values for, which threading the arms turns into plain branches with no select.
+fn branches_on_selected(func: &Function, join: Block, (t_args, e_args): (&[Value], &[Value])) -> bool {
+    let data = &func.blocks[join.index()];
+    let [term] = data.insts[..] else { return false };
+    let Op::Brif(cond, ..) = func.insts[term.index()].op else { return false };
+    data.params.iter().zip(t_args.iter().zip(e_args)).any(|(param, (t, e))| *param == cond && t != e)
 }
 
 /// Converts pure diamond and triangle conditional branches into branchless `Op::Select`.
