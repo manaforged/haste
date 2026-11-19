@@ -283,8 +283,13 @@ pub fn lower_dict(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, in
     Ok((func, relocs, reloc_plan))
 }
 
+/// Whether a template under construction must keep a callee of height `height` as a call, so that its own height stays within `MAX_INLINE_HEIGHT`.
+fn at_height_cap(inline: &Inline, height: u8) -> bool {
+    !inline.stack.is_empty() && height >= MAX_INLINE_HEIGHT
+}
+
 fn record_meta_height(inline: &mut Inline, meta: Option<(ItemRef, FootprintId, bool, u8, u16)>) -> Option<(ItemRef, FootprintId, bool)> {
-    meta.map(|(item, fp, returns, h, sz)| {
+    meta.filter(|meta| !at_height_cap(inline, meta.3)).map(|(item, fp, returns, h, sz)| {
         inline.max_callee_height = inline.max_callee_height.max(h);
         inline.max_callee_size = inline.max_callee_size.max(sz);
         (item, fp, returns)
@@ -292,6 +297,7 @@ fn record_meta_height(inline: &mut Inline, meta: Option<(ItemRef, FootprintId, b
 }
 
 fn record_callee_height(inline: &mut Inline, callee: Option<Arc<InlinedCallee>>) -> Option<Arc<InlinedCallee>> {
+    let callee = callee.filter(|c| !at_height_cap(inline, c.height));
     if let Some(c) = &callee {
         inline.max_callee_height = inline.max_callee_height.max(c.height);
         inline.max_callee_size = inline.max_callee_size.max(c.size);
