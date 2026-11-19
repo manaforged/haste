@@ -96,6 +96,8 @@ pub(crate) struct Provenance {
     pub symbol_defs: Vec<Option<u32>>,
     frame_runtime: Vec<Option<RuntimeSymbol>>,
     pub ro_bytes: Vec<u32>,
+    /// Values that are parameters of an entry block with no predecessors: addresses the caller made before this frame existed.
+    pub incoming: Vec<bool>,
     pub affine: Vec<(Value, i64)>,
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
     frontiers: Vec<Option<escape::Frontier>>,
@@ -356,12 +358,15 @@ impl Provenance {
             }
         }
         let mut ro_bytes = vec![0_u32; func.types.len()];
+        let mut incoming = vec![false; func.types.len()];
         if let Some(entry) = cfg.entry {
+            let fresh = cfg.pred_count(entry) == 0;
             for (&param, abi) in func.blocks[entry.index()].params.iter().zip(&func.signature.params) {
                 ro_bytes[param.index()] = abi.deref_bytes;
+                incoming[param.index()] = fresh;
             }
         }
-        Self { slot_offsets, param_roots, symbol_defs, frame_runtime, ro_bytes, affine, frame: frame::FrameFacts::new(func, cfg), ..Self::default() }
+        Self { slot_offsets, param_roots, symbol_defs, frame_runtime, ro_bytes, incoming, affine, frame: frame::FrameFacts::new(func, cfg), ..Self::default() }
     }
 
     /// The address facts alone, for `loc` and `ro_bytes`: no escape classification and no loop spans.
@@ -434,6 +439,11 @@ impl Provenance {
         }
     }
 
+    /// Whether `base` is an address the caller passed in, which cannot point into this frame's slots.
+    pub(crate) fn is_incoming(&self, base: MemBase) -> bool {
+        matches!(base, MemBase::Addr(v) if self.incoming.get(v.index()).copied().unwrap_or(false))
+    }
+
     pub(crate) fn slot_unescaped(&self, slot: StackSlot) -> bool {
         self.unescaped_slots.get(slot.index()).copied().unwrap_or(false)
     }
@@ -484,6 +494,8 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
         (MemRoot::UniqueHeap(Some(owner)), _) if b.base == MemBase::Addr(owner) => false,
         (_, MemRoot::UniqueHeap(Some(owner))) if a.base == MemBase::Addr(owner) => false,
         (MemRoot::NoAliasParam(p), MemRoot::Unknown) | (MemRoot::Unknown, MemRoot::NoAliasParam(p)) => !prov.noalias_unescaped(p),
+        (MemRoot::Slot(_), _) if prov.is_incoming(b.base) => false,
+        (_, MemRoot::Slot(_)) if prov.is_incoming(a.base) => false,
         (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_unescaped(s) && !prov.slot_return_only(s),
         _ => true,
     }
