@@ -682,6 +682,53 @@ fn pre_split(func: &mut Function, moves: Moves) -> bool {
     joined || forwarded
 }
 
+fn open_move_pieces(
+    scan: &Scan,
+    layouts: Option<&Layouts>,
+    moves: Moves,
+    (to, from, bytes): (Value, Value, u32),
+) -> Option<Vec<(Type, u32)>> {
+    let (to_open, from_open) = (scan.open(to), scan.open(from));
+    if !to_open && !from_open {
+        return None;
+    }
+    let both_open = to_open && from_open;
+    let (max_b, max_p) = if both_open {
+        (subword::PROMOTE_BOTH_BYTES, subword::PROMOTE_BOTH_PIECES)
+    } else {
+        (crate::copy::MOVE_INLINE * 2, subword::PROMOTE_ONE_PIECES)
+    };
+    if bytes > max_b {
+        return None;
+    }
+    let word_limit = if both_open { max_p } else { crate::copy::EXPAND_WORDS };
+    let (found, limit) = match layouts.and_then(|l| l.pieces(scan.end(to), scan.end(from), bytes)) {
+        None if moves != Moves::Guided => (Some(crate::copy::vec_words(bytes)), word_limit),
+        guided => (guided, max_p),
+    };
+    found.filter(|p| p.len() <= limit)
+}
+
+fn has_open_move(func: &Function, scan: &Scan) -> bool {
+    crate::schedule::has_live_op(func, |op| match *op {
+        Op::Move(to, from, _) => scan.open(to) || scan.open(from),
+        Op::Copy(to, from, len) => scan.copy_bytes(to, from, len).is_some() && (scan.open(to) || scan.open(from)),
+        _ => false,
+    })
+}
+
+fn run_slot_splits(func: &mut Function, scan: &mut Scan, moves: Moves) -> bool {
+    let mut split_changed = moves == Moves::Split && subword::split(func, scan);
+    if split_changed {
+        *scan = Scan::new(func);
+    }
+    if moves != Moves::Words && vec_slot::split(func, scan) {
+        split_changed = true;
+        *scan = Scan::new(func);
+    }
+    split_changed
+}
+
 pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return Domain::NONE;
@@ -690,51 +737,15 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     let returned = crate::copy::forward_sret_slot(func);
     let join_changed = pre_split(func, moves) | cold_copy::run(func);
     let mut scan = Scan::new(func);
-    let mut splits = Vec::new();
-    let mut copy_splits = Vec::new();
-    let mut dropped_zero = false;
-    let has_open_move = func.insts.iter().any(|data| match data.op {
-        Op::Move(to, from, _) => scan.open(to) || scan.open(from),
-        Op::Copy(to, from, len) => scan.copy_bytes(to, from, len).is_some() && (scan.open(to) || scan.open(from)),
-        _ => false,
-    });
-    if has_open_move {
+    let (mut splits, mut copy_splits, mut dropped_zero) = (Vec::new(), Vec::new(), false);
+    if has_open_move(func, &scan) {
         let layouts = (moves != Moves::Words).then(|| scan.layouts(func));
-        let pieces = |to: Value, from: Value, bytes: u32| {
-            let both_open = scan.open(to) && scan.open(from);
-            if !(both_open || scan.open(to) || scan.open(from)) {
-                return None;
-            }
-            let (max_b, max_p) = if both_open {
-                (subword::PROMOTE_BOTH_BYTES, subword::PROMOTE_BOTH_PIECES)
-            } else {
-                (crate::copy::MOVE_INLINE * 2, subword::PROMOTE_ONE_PIECES)
-            };
-            if bytes > max_b {
-                return None;
-            }
-            let word_limit = if both_open { max_p } else { crate::copy::EXPAND_WORDS };
-            let (found, limit) = match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
-                None if moves != Moves::Guided => (Some(crate::copy::vec_words(bytes)), word_limit),
-                guided => (guided, max_p),
-            };
-            found.filter(|p| p.len() <= limit)
-        };
+        let pieces = |to, from, bytes| open_move_pieces(&scan, layouts.as_ref(), moves, (to, from, bytes));
         splits = crate::copy::expand(func, pieces);
-        (copy_splits, dropped_zero) = subword::expand_copies(func, |to, from, len| {
-            let bytes = scan.copy_bytes(to, from, len)?;
-            pieces(to, from, bytes)
-        });
+        (copy_splits, dropped_zero) = subword::expand_copies(func, |to, from, len| pieces(to, from, scan.copy_bytes(to, from, len)?));
         scan = Scan::new(func);
     }
-    let mut split_changed = moves == Moves::Split && subword::split(func, &scan);
-    if split_changed {
-        scan = Scan::new(func);
-    }
-    if moves != Moves::Words && vec_slot::split(func, &scan) {
-        split_changed = true;
-        scan = Scan::new(func);
-    }
+    let split_changed = run_slot_splits(func, &mut scan, moves);
     let changed = (scan.any_promotable() && promote(func, entry, scan)) || join_changed || split_changed || dropped_zero;
     crate::copy::rejoin(func, &splits);
     let all_copies_rejoined = subword::rejoin_copies(func, &copy_splits);

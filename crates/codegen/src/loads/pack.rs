@@ -595,9 +595,12 @@ fn sweep_dead(func: &mut Function, blk_idx: usize, dead_pool: &[bool], uses: &mu
 }
 
 pub(super) fn has_vec_pack_cand(func: &Function) -> bool {
-    func.insts.iter().any(|data| {
-        data.result.is_some_and(|r| func.ty(r).is_vector())
-            && matches!(data.op, Op::Insert(..) | Op::TargetOp(TargetOpId::X64Concat128, _))
+    func.blocks.iter().any(|block| {
+        block.insts.iter().any(|&inst| {
+            let data = &func.insts[inst.index()];
+            data.result.is_some_and(|r| func.ty(r).is_vector())
+                && matches!(data.op, Op::Insert(..) | Op::TargetOp(TargetOpId::X64Concat128, _))
+        })
     })
 }
 

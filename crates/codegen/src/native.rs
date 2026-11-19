@@ -1,4 +1,4 @@
-use crate::ir::{AbiParam, Binary, CallConv, Convert, Function, Inst, InstData, Op, SigRef, Signature, TargetOpId, TinyArgs, Type, Value};
+use crate::ir::{AbiParam, Binary, CallConv, Convert, Function, InstData, Op, SigRef, Signature, TargetOpId, TinyArgs, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 /// A helper compiled into haste that one instruction becomes a call to.
@@ -11,7 +11,8 @@ struct Helper {
 /// Turns each instruction the encoder has no inline form for into a call to a native helper: copies of a size `copy::chunks` does not cover, moves above `copy::MOVE_INLINE` bytes, and 128-bit division and float conversions.
 pub(crate) fn lower(func: &mut Function) {
     let mut consts = vec![None; func.types.len()];
-    for data in &func.insts {
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let data = &func.insts[inst.index()];
         if let (Op::Const(imm), Some(result)) = (&data.op, data.result) {
             consts[result.index()] = Some(*imm);
         }
@@ -92,12 +93,7 @@ fn convert(op: Convert, from: Type, to: Type) -> Option<RuntimeSymbol> {
 
 /// Expands each 128-bit unsigned division or remainder by a zero-extended word into a word division of the high half and one x64 `div` of its remainder and the low half, in place of a helper call.
 pub(crate) fn divide_by_word(func: &mut Function) -> bool {
-    let mut defs: Vec<Option<Inst>> = vec![None; func.types.len()];
-    for (index, data) in func.insts.iter().enumerate() {
-        if let Some(result) = data.result {
-            defs[result.index()] = Some(Inst(index as u32));
-        }
-    }
+    let defs = crate::fold::defs(func);
     let mut changed = false;
     for block in 0..func.blocks.len() {
         let mut at = 0;

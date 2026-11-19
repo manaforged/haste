@@ -2,13 +2,14 @@ use crate::fold::{extend, holds};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, ShuffleMask, Type, Unary, Value};
 
 mod bits;
+mod cond;
 mod icmp;
 mod ovf;
 mod select;
 mod sum;
 mod vec;
+pub(crate) use cond::{compare_offsets, fold_bxor_conds, invert};
 pub(crate) use icmp::{is_non_null_addr, non_null_cmp};
-pub(crate) use select::{compare_offsets, fold_bxor_conds, invert};
 
 struct RewriteCx<'a> {
     func: &'a mut Function,
@@ -17,6 +18,7 @@ struct RewriteCx<'a> {
     uses: Vec<u32>,
     out: Vec<Inst>,
     subst: Vec<Value>,
+    changed: bool,
 }
 
 impl<'a> RewriteCx<'a> {
@@ -36,6 +38,7 @@ impl<'a> RewriteCx<'a> {
         self.defs.resize(self.func.types.len(), None);
         self.defs[val.index()] = Some(inst);
         self.out.push(inst);
+        self.changed = true;
         val
     }
 
@@ -43,7 +46,9 @@ impl<'a> RewriteCx<'a> {
         if let Some(r) = res {
             let len = self.func.types.len();
             self.subst.extend((self.subst.len()..len).map(|i| Value(i as u32)));
-            self.subst[r.index()] = crate::merge::find(&self.subst, target);
+            let mapped = crate::merge::find(&self.subst, target);
+            self.changed |= mapped != r;
+            self.subst[r.index()] = mapped;
         }
     }
 
@@ -698,8 +703,8 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
     }
 }
 
-/// Rewrites constant unsigned divisions/remainders, unsigned zero compares, negated shift-adds, converts, shifts, selects, and bitwise/SWAR masks.
-pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
+/// Rewrites constant unsigned divisions/remainders, unsigned zero compares, negated shift-adds, converts, shifts, selects, and bitwise/SWAR masks, returning whether anything changed.
+pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) -> bool {
     let len = func.types.len();
     let (mut consts, mut fits_used) = (vec![None; len], vec![false; len]);
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
@@ -713,14 +718,18 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
         }
     }
     let uses = func.use_counts();
-    let mut cx = RewriteCx { func, defs: initial_defs.to_vec(), consts, uses, out: Vec::new(), subst: Vec::new() };
+    let mut cx = RewriteCx { func, defs: initial_defs.to_vec(), consts, uses, out: Vec::new(), subst: Vec::new(), changed: false };
     for b in 0..cx.func.blocks.len() {
         let old = std::mem::take(&mut cx.func.blocks[b].insts);
         cx.out = Vec::with_capacity(old.len());
         let mut block_udivs = Vec::new();
         for inst in old {
             if !cx.subst.is_empty() {
-                cx.func.insts[inst.index()].op.map_operands(|v| crate::merge::find(&cx.subst, v));
+                cx.func.insts[inst.index()].op.map_operands(|v| {
+                    let n = crate::merge::find(&cx.subst, v);
+                    cx.changed |= n != v;
+                    n
+                });
             }
             let res = cx.func.insts[inst.index()].result;
             if let Some(new_op) = simplify_inst(&mut cx, &fits_used, &mut block_udivs, res, inst) {
@@ -728,6 +737,7 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
                     cx.consts.resize(cx.func.types.len(), None);
                     cx.consts[r.index()] = Some(*imm);
                 }
+                cx.changed |= cx.func.insts[inst.index()].op != new_op;
                 cx.func.insts[inst.index()].op = new_op;
             }
             cx.out.push(inst);
@@ -736,9 +746,14 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
     }
     if !cx.subst.is_empty() {
         for inst in cx.func.blocks.iter().flat_map(|b| &b.insts) {
-            cx.func.insts[inst.index()].op.map_operands(|v| crate::merge::find(&cx.subst, v));
+            cx.func.insts[inst.index()].op.map_operands(|v| {
+                let n = crate::merge::find(&cx.subst, v);
+                cx.changed |= n != v;
+                n
+            });
         }
     }
+    cx.changed
 }
 
 /// Devirtualizes loads of static vtable slots into direct slot/symbol loads.

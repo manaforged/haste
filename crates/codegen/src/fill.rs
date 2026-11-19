@@ -255,7 +255,7 @@ fn expand_copy(
 
 /// Replaces each `memset` of a constant byte and small constant size by stores, each small constant-size `memcmp` by loads and compares, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
 pub(crate) fn run(func: &mut Function) -> Domain {
-    if !func.insts.iter().any(|data| matches!(data.op, Op::Runtime(RuntimeSymbol::Memset | RuntimeSymbol::Memcmp) | Op::Copy(..))) {
+    if !crate::schedule::has_live_op(func, |op| matches!(op, Op::Runtime(RuntimeSymbol::Memset | RuntimeSymbol::Memcmp) | Op::Copy(..))) {
         return Domain::NONE;
     }
     let defs = defs(func);

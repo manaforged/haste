@@ -684,44 +684,75 @@ pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     defs
 }
 
-fn prune_changed(func: &mut Function, entry: Block, cached: bool) -> (Vec<bool>, bool) {
-    let reachable = if cached && Some(entry) == func.entry { func.cfg().reachable.clone() } else { crate::cfg::reverse_postorder(func, entry).1 };
+pub(crate) use unused::prune;
+
+fn fold_select_op(func: &Function, fold: &Fold, c: Value, x: Value, y: Value) -> Option<Op> {
+    match (fold.def(func, x), fold.def(func, y)) {
+        (_, Some(&Op::Select(c2, _, z))) if fold.find(c2) == c => Some(Op::Select(c, x, fold.find(z))),
+        (Some(&Op::Select(c2, x2, _)), _) if fold.find(c2) == c => Some(Op::Select(c, fold.find(x2), y)),
+        _ if func.ty(c) == Type::I8
+            && fold.boolean(func, c)
+            && func.ty(x).is_small_int()
+            && func.ty(x) != Type::I8
+            && fold.known(x).is_some_and(|v| extend(v, func.ty(x), false) == 1)
+            && fold.known(y).is_some_and(|v| extend(v, func.ty(x), false) == 0) =>
+        {
+            Some(Op::Convert(Convert::Uextend, c))
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_folded_inst(func: &mut Function, fold: &Fold, inst: Inst) -> bool {
     let mut changed = false;
-    for (block, live) in func.blocks.iter_mut().zip(&reachable) {
-        if !live && !block.insts.is_empty() {
-            block.insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
-            changed = true;
+    func.insts[inst.index()].op.map_operands(|v| {
+        let n = fold.find(v);
+        changed |= n != v;
+        n
+    });
+    let replacement = match func.insts[inst.index()].op {
+        Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
+        Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
+        Op::Binary(Binary::Isub, x, y) if func.ty(x).is_small_int() && fold.known(x).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) => {
+            Some(Op::Unary(Unary::Ineg, y))
         }
+        Op::Select(c, x, y) => fold_select_op(func, fold, c, x, y),
+        _ => vector::vec_zero_fold(func, fold, &func.insts[inst.index()].op, func.insts[inst.index()].result)
+            .or_else(|| func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const)),
+    };
+    if let Some(op) = replacement
+        && func.insts[inst.index()].op != op
+    {
+        func.insts[inst.index()].op = op;
+        changed = true;
     }
-    if changed { func.bump_cfg(); }
-    (reachable, changed)
+    changed
 }
 
-/// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
-pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
-    prune_changed(func, entry, true).0
-}
-
-/// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
-fn dead(func: &mut Function) -> bool {
-    let mut uses = func.use_counts();
-    let mut keep = Vec::new();
-    let mut dropped = false;
-    for block in func.blocks.iter_mut().rev() {
-        keep.clear();
-        keep.resize(block.insts.len(), true);
-        for (at, inst) in block.insts.iter().enumerate().rev() {
-            let data = &func.insts[inst.index()];
-            if data.op.is_removable() && data.result.is_some_and(|result| uses[result.index()] == 0) {
-                keep[at] = false;
-                dropped = true;
-                data.op.for_operands(|value| uses[value.index()] -= 1);
+fn settle_cfg_and_params(func: &mut Function, fold: &mut Fold, entry: Block, effort: crate::Effort, pinned: &[bool]) -> (bool, bool) {
+    let (mut reachable, mut changed, mut cfg_changed) = (Vec::new(), false, false);
+    loop {
+        fold.constants(func);
+        let settled = effort == crate::Effort::Full && reachable.is_empty() && crate::facts::settle(func, &fold.defs, &mut fold.consts);
+        let branched = settled | fold.branches(func) | fold.thread(func, pinned);
+        if branched {
+            func.bump_cfg();
+        }
+        if branched || reachable.is_empty() {
+            let (r, pruned) = unused::prune_changed(func, entry, !branched);
+            if pruned {
+                func.bump_cfg();
             }
+            reachable = r;
+            cfg_changed |= branched | pruned;
+            changed |= pruned;
         }
-        let mut at = 0;
-        block.insts.retain(|_| { at += 1; keep[at - 1] });
+        let replaced = fold.params(func, &reachable, pinned);
+        changed |= branched | replaced;
+        if !branched && !replaced {
+            return (changed, cfg_changed);
+        }
     }
-    dropped
 }
 
 /// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump; returns the invalidated IR domain.
@@ -731,59 +762,26 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let defs = defs(func);
     let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: vec![None; count], mixed: vec![false; count], defs };
     let pinned = pinned(func, entry);
-    let (mut reachable, mut changed, mut cfg_changed) = (Vec::new(), false, false);
-    loop {
-        fold.constants(func);
-        let settled = effort == crate::Effort::Full && reachable.is_empty() && crate::facts::settle(func, &fold.defs, &mut fold.consts);
-        let branched = settled | fold.branches(func) | fold.thread(func, &pinned);
-        if branched { func.bump_cfg(); }
-        if branched || reachable.is_empty() {
-            let (r, pruned) = prune_changed(func, entry, !branched);
-            if pruned { func.bump_cfg(); }
-            reachable = r;
-            cfg_changed |= branched | pruned;
-            changed |= pruned;
-        }
-        let replaced = fold.params(func, &reachable, &pinned);
-        changed |= branched | replaced;
-        if !branched && !replaced { break; }
-    }
+    let (mut changed, mut cfg_changed) = settle_cfg_and_params(func, &mut fold, entry, effort, &pinned);
     drop_params(func, &fold);
-    for block in &func.blocks {
-        for inst in &block.insts {
-            func.insts[inst.index()].op.map_operands(|v| { let n = fold.find(v); changed |= n != v; n });
-            let replacement = match func.insts[inst.index()].op {
-                Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
-                Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
-                Op::Binary(Binary::Isub, x, y) if func.ty(x).is_small_int() && fold.known(x).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) => Some(Op::Unary(Unary::Ineg, y)),
-                Op::Select(c, x, y) => match (fold.def(func, x), fold.def(func, y)) {
-                    (_, Some(&Op::Select(c2, _, z))) if fold.find(c2) == c => Some(Op::Select(c, x, fold.find(z))),
-                    (Some(&Op::Select(c2, x2, _)), _) if fold.find(c2) == c => Some(Op::Select(c, fold.find(x2), y)),
-                    _ if func.ty(c) == Type::I8 && fold.boolean(func, c) && func.ty(x).is_small_int() && func.ty(x) != Type::I8
-                        && fold.known(x).is_some_and(|v| extend(v, func.ty(x), false) == 1)
-                        && fold.known(y).is_some_and(|v| extend(v, func.ty(x), false) == 0) => Some(Op::Convert(Convert::Uextend, c)),
-                    _ => None,
-                },
-                _ => vector::vec_zero_fold(func, &fold, &func.insts[inst.index()].op, func.insts[inst.index()].result)
-                    .or_else(|| func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const)),
-            };
-            if let Some(op) = replacement && func.insts[inst.index()].op != op { func.insts[inst.index()].op = op; changed = true; }
+    for b in 0..func.blocks.len() {
+        for idx in 0..func.blocks[b].insts.len() {
+            let inst = func.blocks[b].insts[idx];
+            changed |= rewrite_folded_inst(func, &fold, inst);
         }
     }
-    let snap = (!changed).then(|| (func.insts.len(), func.blocks.iter().map(|b| b.insts.len()).collect::<Vec<_>>(), func.blocks.iter().flat_map(|b| &b.insts).map(|inst| (*inst, func.insts[inst.index()].op.clone())).collect::<Vec<_>>()));
-    crate::algebra::rewrite(func, &fold.defs);
-    crate::algebra::invert(func);
-    if let Some((count, lens, ops)) = snap {
-        changed = count != func.insts.len() || lens.iter().zip(&func.blocks).any(|(len, b)| *len != b.insts.len()) || ops.iter().zip(func.blocks.iter().flat_map(|b| &b.insts)).any(|((inst, op), now)| inst != now || *op != func.insts[now.index()].op);
-    }
-    changed |= vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | dead(func);
+    changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func);
+    changed |= vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | unused::dead(func);
     if fold.thread(func, &pinned) | fold.branches(func) {
         func.bump_cfg();
-        prune_changed(func, entry, false);
-        dead(func);
+        unused::prune_changed(func, entry, false);
+        unused::dead(func);
         (changed, cfg_changed) = (true, true);
     }
-    if crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func) { dead(func); changed = true; }
+    if crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func) {
+        unused::dead(func);
+        changed = true;
+    }
     if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }
 }
 

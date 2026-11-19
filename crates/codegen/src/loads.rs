@@ -713,9 +713,10 @@ fn collect_scan_meta(
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];
     let mut accesses = false;
-    for (idx, data) in func.insts.iter().enumerate() {
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let data = &func.insts[inst.index()];
         if let Some(result) = data.result {
-            defs[result.index()] = Some(Inst(idx as u32));
+            defs[result.index()] = Some(inst);
         }
         match (&data.op, data.result) {
             (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
@@ -729,7 +730,7 @@ fn collect_scan_meta(
 
 /// Elides whole-slot moves once, before promotion splits the slots into values.
 pub(crate) fn elide_early(func: &mut Function) -> bool {
-    if func.entry.is_none() || func.coroutine.is_some() || !func.insts.iter().any(|data| matches!(data.op, Op::Move(..))) {
+    if func.entry.is_none() || func.coroutine.is_some() || !crate::schedule::has_live_op(func, |op| matches!(op, Op::Move(..))) {
         return false;
     }
     let cfg = func.cfg();
@@ -743,7 +744,7 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     }
     let domain = |changed: bool| if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE };
     let (mut changed, affine) = eliminate_affine_block_params(func);
-    if !func.insts.iter().any(|d| matches!(d.op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..))) {
+    if !crate::schedule::has_live_op(func, |op| matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..))) {
         changed |= sink_terminator_defs(func);
         return domain(changed);
     }
