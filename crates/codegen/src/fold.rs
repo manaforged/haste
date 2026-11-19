@@ -2,6 +2,7 @@ use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, IntCC, Op, Type,
 
 mod exits;
 mod range;
+mod unused;
 mod vector;
 
 /// `imm` of type `ty` extended to 64 bits, by its sign when `signed`.
@@ -775,7 +776,7 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     if let Some((count, lens, ops)) = snap {
         changed = count != func.insts.len() || lens.iter().zip(&func.blocks).any(|(len, b)| *len != b.insts.len()) || ops.iter().zip(func.blocks.iter().flat_map(|b| &b.insts)).any(|((inst, op), now)| inst != now || *op != func.insts[now.index()].op);
     }
-    changed |= vector::fold_bitcast_loads(func) | dead(func);
+    changed |= vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | dead(func);
     if fold.thread(func, &pinned) | fold.branches(func) {
         func.bump_cfg();
         prune_changed(func, entry, false);
