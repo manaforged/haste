@@ -13,6 +13,7 @@ use crate::lower::{FootprintId, RelocPlan, RodataId, RodataReloc, RodataTarget, 
 use crate::names::ItemRef;
 use crate::sync::lock;
 
+mod icf;
 mod vdce;
 
 use super::Image;
@@ -20,14 +21,18 @@ use super::Image;
 const FN_ALIGN: u32 = 64;
 const FN_ALIGN_ENV: &str = "HASTE_FN_ALIGN";
 
+fn want_debug_info() -> bool {
+    crate::profile() != crate::outline::tree::Profile::Release || std::env::var_os("HASTE_DEBUG_INFO").is_some()
+}
+
 fn fn_align_override() -> Option<u32> {
     static ALIGN: OnceLock<Option<u32>> = OnceLock::new();
     *ALIGN.get_or_init(|| std::env::var(FN_ALIGN_ENV).ok().and_then(|v| v.parse().ok()).filter(|a: &u32| a.is_power_of_two() && *a >= 16))
 }
 
-fn place(exe: &mut Executable, code: &AotCode) -> u32 {
+fn place(exe: &mut Executable, code: &AotCode, debug_info: bool) -> u32 {
     let align = fn_align_override().unwrap_or(if code.loops().is_empty() { 16 } else { FN_ALIGN });
-    exe.function(code.bytes(), align, code.loops(), code.lines())
+    exe.function(code.bytes(), align, code.loops(), if debug_info { code.lines() } else { &[] })
 }
 
 #[derive(Clone)]
@@ -522,7 +527,7 @@ impl SymTable<'_> {
     }
 }
 
-fn emit_dict_bodies(state: &AotState, order: &[usize], exe: &mut Executable) -> Result<HashMap<usize, u32>> {
+fn emit_dict_bodies(state: &AotState, order: &[usize], debug_info: bool, exe: &mut Executable) -> Result<HashMap<usize, u32>> {
     let mut dict_bodies: HashMap<usize, u32> = HashMap::default();
     for &idx in order {
         let Some(AotFn::Dict { body, .. }) = &state.functions[idx] else { continue };
@@ -530,7 +535,7 @@ fn emit_dict_bodies(state: &AotState, order: &[usize], exe: &mut Executable) -> 
         if dict_bodies.contains_key(&key) {
             continue;
         }
-        let off = place(exe, body);
+        let off = place(exe, body, debug_info);
         for reloc in body.relocs() {
             let rt = reloc.as_runtime().context("dict body contains non-runtime relocation")?;
             exe.patch(off + reloc.offset, reloc.kind, Symbol::Runtime(rt));
@@ -543,89 +548,9 @@ fn emit_dict_bodies(state: &AotState, order: &[usize], exe: &mut Executable) -> 
 fn slot_target(fn_offs: &[Option<u32>], foreign_fns: &HashMap<usize, HostSymbol>, idx: usize) -> Symbol {
     if let Some(off) = fn_offs.get(idx).copied().flatten() {
         Symbol::Text(off)
-    } else if let Some(host) = foreign_fns.get(&idx) {
-        Symbol::Host(host.clone())
     } else {
-        Symbol::Host(HostSymbol::Abort)
+        icf::foreign_sym(foreign_fns, idx)
     }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum RelocTargetKey {
-    SelfCall,
-    Fn(usize),
-    Sym(Symbol),
-}
-
-type IcfKey<'a> = (&'a [u8], Vec<(u32, RelocKind, RelocTargetKey)>);
-
-fn alias_roots(functions: &[Option<AotFn>]) -> Vec<usize> {
-    (0..functions.len())
-        .map(|mut cur| {
-            for _ in 0..functions.len() {
-                match functions.get(cur).and_then(Option::as_ref) {
-                    Some(AotFn::Alias(next)) if *next < functions.len() => cur = *next,
-                    _ => break,
-                }
-            }
-            cur
-        })
-        .collect()
-}
-
-fn foreign_sym(foreign_fns: &HashMap<usize, HostSymbol>, idx: usize) -> Symbol {
-    foreign_fns.get(&idx).map_or(Symbol::Host(HostSymbol::Abort), |host| Symbol::Host(host.clone()))
-}
-
-fn icf_call_target(self_idx: usize, callee: usize, state: &AotState, roots: &[usize], canon: &[usize]) -> RelocTargetKey {
-    let root = roots.get(callee).copied().unwrap_or(callee);
-    if state.functions.get(root).and_then(Option::as_ref).is_some() {
-        if root == self_idx { RelocTargetKey::SelfCall } else { RelocTargetKey::Fn(canon[root]) }
-    } else {
-        RelocTargetKey::Sym(foreign_sym(&state.foreign_fns, callee))
-    }
-}
-
-fn icf_key<'a>(self_idx: usize, code: &'a AotCode, relocs: &[SymbolSource], state: &AotState, syms: &SymTable<'_>, roots: &[usize], canon: &[usize]) -> Result<IcfKey<'a>> {
-    let mut sig = Vec::with_capacity(code.relocs().len());
-    for reloc in code.relocs() {
-        let target = if let Some(rt) = reloc.as_runtime() {
-            RelocTargetKey::Sym(Symbol::Runtime(rt))
-        } else if matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32)
-            && let SymbolSource::Slot(callee) = relocs[reloc.symbol as usize]
-        {
-            icf_call_target(self_idx, callee, state, roots, canon)
-        } else {
-            RelocTargetKey::Sym(syms.translate(&relocs[reloc.symbol as usize])?)
-        };
-        sig.push((reloc.offset, reloc.kind, target));
-    }
-    Ok((code.bytes(), sig))
-}
-
-fn fold_direct_functions(state: &AotState, live_fns: &[bool], syms: &SymTable<'_>, roots: &[usize]) -> Result<Vec<usize>> {
-    let mut canon = roots.to_vec();
-    for _ in 0..4 {
-        let mut seen: HashMap<IcfKey<'_>, usize> = HashMap::default();
-        let mut changed = false;
-        let prev = canon.clone();
-        for idx in 0..state.functions.len() {
-            if !live_fns[idx] || roots[idx] != idx {
-                continue;
-            }
-            let Some(AotFn::Direct { code, relocs }) = &state.functions[idx] else { continue };
-            let key = icf_key(idx, code, relocs, state, syms, roots, &prev)?;
-            let leader = *seen.entry(key).or_insert(idx);
-            if canon[idx] != leader {
-                canon[idx] = leader;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    Ok(canon)
 }
 
 fn place_dict_fn(target: &Target, syms: &SymTable<'_>, dict_bodies: &HashMap<usize, u32>, (body, relocs): (&Arc<AotCode>, &[SymbolSource]), exe: &mut Executable) -> Result<u32> {
@@ -660,9 +585,14 @@ fn patch_pending_relocs(state: &AotState, syms: &SymTable<'_>, fn_offs: &[Option
     Ok(())
 }
 
-fn emit_functions(state: &AotState, live: &AotReach, target: &Target, syms: &SymTable<'_>, dict_bodies: &HashMap<usize, u32>, exe: &mut Executable) -> Result<Vec<Option<u32>>> {
-    let roots = alias_roots(&state.functions);
-    let canon = fold_direct_functions(state, &live.fns, syms, &roots)?;
+fn emit_functions(
+    state: &AotState,
+    live: &AotReach,
+    (target, debug_info): (&Target, bool),
+    (syms, dict_bodies): (&SymTable<'_>, &HashMap<usize, u32>),
+    (roots, canon): (&[usize], &[usize]),
+    exe: &mut Executable,
+) -> Result<Vec<Option<u32>>> {
     let mut fn_offs = vec![None; state.functions.len()];
     let mut pending = Vec::new();
     for &idx in &live.order {
@@ -670,7 +600,7 @@ fn emit_functions(state: &AotState, live: &AotReach, target: &Target, syms: &Sym
         if fn_offs[leader].is_none() {
             fn_offs[leader] = match &state.functions[leader] {
                 Some(AotFn::Direct { code, relocs }) => {
-                    let off = place(exe, code);
+                    let off = place(exe, code, debug_info);
                     pending.push((off, code, relocs.as_slice()));
                     Some(off)
                 }
@@ -682,26 +612,6 @@ fn emit_functions(state: &AotState, live: &AotReach, target: &Target, syms: &Sym
     }
     patch_pending_relocs(state, syms, &fn_offs, pending, exe)?;
     Ok(fn_offs)
-}
-
-fn emit_rodata_and_vtables(state: &AotState, live: &AotReach, exe: &mut Executable) -> Result<(Vec<Option<u32>>, Vec<Option<u32>>)> {
-    let mut rodata_offs = vec![None; state.rodata.len()];
-    for &id in &live.rodata_order {
-        rodata_offs[id] = Some(exe.rodata(&state.rodata[id].0, 16));
-    }
-    for &id in &live.rodata_order {
-        let Some(base) = rodata_offs[id] else { continue };
-        for reloc in &state.rodata[id].1 {
-            let RodataTarget::Rodata(target) = reloc.target;
-            let target_off = rodata_offs.get(target.0 as usize).copied().flatten().context("missing rodata target")?;
-            exe.pointer(true, base + reloc.offset, Symbol::Rodata(target_off));
-        }
-    }
-    let mut vtable_offs = vec![None; state.vtables.len()];
-    for &id in &live.vtable_order {
-        vtable_offs[id] = Some(exe.rodata(&vec![0u8; state.vtables[id].len() * 8], 8));
-    }
-    Ok((rodata_offs, vtable_offs))
 }
 
 fn emit_static_syms(state: &AotState, live: &AotReach, exe: &mut Executable) -> (HashMap<usize, Symbol>, HashMap<(usize, u32), Symbol>) {
@@ -730,9 +640,8 @@ fn emit_static_syms(state: &AotState, live: &AotReach, exe: &mut Executable) -> 
     (static_syms, promoted_syms)
 }
 
-fn patch_vtables(state: &AotState, live: &AotReach, vmask: &vdce::VtableMask, (vtable_offs, fn_offs): (&[Option<u32>], &[Option<u32>]), exe: &mut Executable) -> Result<()> {
-    for &id in &live.vtable_order {
-        let Some(base) = vtable_offs[id] else { continue };
+fn patch_vtables(state: &AotState, vmask: &vdce::VtableMask, (vtable_offs, fn_offs): (&[Option<u32>], &[Option<u32>]), unique: &[(u32, usize)], exe: &mut Executable) -> Result<()> {
+    for &(base, id) in unique {
         for (i, entry) in state.vtables[id].iter().enumerate() {
             if !vmask.slot_live(id, i) {
                 exe.pointer(true, base + (i * 8) as u32, Symbol::Word(0));
@@ -773,6 +682,7 @@ impl Image {
     /// Freezes a compiled AOT image into a standalone executable starting at `(lang_start, user_main)`.
     pub(crate) fn to_aot(&self, target: &Target, (lang_start, user_main): (usize, usize), cx: &mut crate::sema::Context<'_>, reached: &crate::sema::reach::Reached) -> Result<Executable> {
         let state = lock(self.aot().context("image has no AOT recording")?);
+        let debug_info = want_debug_info();
         let (live, vmask) = vdce::VtableMask::converge(cx, reached, &state.vtables, |vmask| {
             let live = AotReach::collect(&state, [lang_start, user_main], vmask);
             let counts = (live.order.len(), live.vtable_order.len());
@@ -780,23 +690,24 @@ impl Image {
             (live, fns, counts)
         });
         let mut exe = Executable::new(target);
-        let mut slot_offs = HashMap::default();
-        for &idx in &live.slots.list {
-            slot_offs.insert(idx, exe.rodata(&[0; 8], 8));
-        }
         let thread_slots: HashMap<usize, u64> = live.thread_slots.list.iter().enumerate().map(|(rank, &index)| (index, rank as u64)).collect();
         exe.thread_slots = live.thread_slots.list.len() as u32;
-        let (rodata_offs, vtable_offs) = emit_rodata_and_vtables(&state, &live, &mut exe)?;
+        let rodata_offs = icf::emit_rodata(&state, &live, &mut exe)?;
         let (static_syms, promoted_syms) = emit_static_syms(&state, &live, &mut exe);
+        let pre = icf::PreSyms { rodata_offs: &rodata_offs, static_syms: &static_syms, promoted_syms: &promoted_syms, thread_slots: &thread_slots };
+        let roots = icf::alias_roots(&state.functions);
+        let canon = icf::fold_functions(&state, &live.fns, &pre, &roots)?;
+        let (slot_offs, unique_slots) = icf::alloc_slots(&state, &live.slots.list, (&roots, &canon), &mut exe);
+        let (vtable_offs, unique_vtables) = icf::alloc_vtables(&state, &live.vtable_order, &vmask, (&roots, &canon), &mut exe)?;
         let syms = SymTable {
             slot_offs: &slot_offs, rodata_offs: &rodata_offs, vtable_offs: &vtable_offs,
             static_syms: &static_syms, promoted_syms: &promoted_syms, thread_slots: &thread_slots,
         };
-        let dict_bodies = emit_dict_bodies(&state, &live.order, &mut exe)?;
-        let fn_offs = emit_functions(&state, &live, target, &syms, &dict_bodies, &mut exe)?;
-        patch_vtables(&state, &live, &vmask, (&vtable_offs, &fn_offs), &mut exe)?;
-        for &idx in &live.slots.list {
-            exe.pointer(true, slot_offs[&idx], slot_target(&fn_offs, &state.foreign_fns, idx));
+        let dict_bodies = emit_dict_bodies(&state, &live.order, debug_info, &mut exe)?;
+        let fn_offs = emit_functions(&state, &live, (target, debug_info), (&syms, &dict_bodies), (&roots, &canon), &mut exe)?;
+        patch_vtables(&state, &vmask, (&vtable_offs, &fn_offs), &unique_vtables, &mut exe)?;
+        for (slot_off, target_idx) in unique_slots {
+            exe.pointer(true, slot_off, slot_target(&fn_offs, &state.foreign_fns, target_idx));
         }
         let Some(start_off) = fn_offs.get(lang_start).copied().flatten() else {
             bail!("`std::rt::lang_start` failed to compile");
@@ -811,7 +722,9 @@ impl Image {
                 named.entry(off).or_insert(index);
             }
         }
-        exe.sources(cx.outline.crates.iter().flat_map(|krate| krate.files.iter().map(|file| file.source.path.clone())).collect());
+        if debug_info {
+            exe.sources(cx.outline.crates.iter().flat_map(|krate| krate.files.iter().map(|file| file.source.path.clone())).collect());
+        }
         exe.symbols(named.into_iter().map(|(off, index)| (off, reached.list.get(index).map_or_else(|| format!("fn{index}"), |(instance, _)| cx.symbol_text(*instance)))).collect());
         Ok(exe)
     }

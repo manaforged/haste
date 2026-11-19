@@ -41,7 +41,7 @@ fn set_jobs(count: usize) {
 static PROFILE: OnceLock<outline::tree::Profile> = OnceLock::new();
 
 /// The build profile: the one `--release` set, else the debug profile.
-fn profile() -> outline::tree::Profile {
+pub(crate) fn profile() -> outline::tree::Profile {
     *PROFILE.get_or_init(outline::tree::Profile::default)
 }
 
