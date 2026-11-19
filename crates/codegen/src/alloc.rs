@@ -1,5 +1,6 @@
 mod demote;
 mod hints;
+pub(crate) mod hoist;
 pub(crate) mod walk;
 
 use crate::cfg::{Cfg, Loops};
@@ -93,6 +94,7 @@ pub(crate) struct Plan<R> {
     pub density: Vec<u64>,
     /// The summed block-weighted accesses of the register candidates left in stack slots.
     pub spill_cost: u64,
+    pub hoist: hoist::Hoist<R>,
 }
 
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
@@ -722,7 +724,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         }
     }
     let spill_cost = natural.map_or(0, |natural| (0..count).filter(|&v| (ints[v] || floats[v]) && matches!(locations[v], Location::Slot)).map(|v| natural[v]).sum());
-    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density, spill_cost }
+    let hoist = hoist::Hoist::new(func, &live, &locations);
+    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density, spill_cost, hoist }
 }
 
 impl<R: Copy> Plan<R> {

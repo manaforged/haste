@@ -206,6 +206,44 @@ pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>
     Ok(())
 }
 
+/// Runs the moves of a back edge to loop head `moved` whose other edge leaves that loop ahead of the branch, when each copies a register or stack home into a register that neither `plain` nor the condition reads, so the branch reaches `moved` without a jump of its own.
+fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    (moved, to_then): ((Block, &'a [Value]), bool),
+    plain: Block,
+) -> Result<bool, String> {
+    if emit.in_shrink_entry() || falls(emit, moved.0) {
+        return Ok(false);
+    }
+    let closes = emit.func().cfg().loops().list.iter().any(|each| each.head == moved.0 && !each.body.get(plain.index()).copied().unwrap_or(true));
+    if !closes {
+        return Ok(false);
+    }
+    let (func, plan, frame) = (emit.func(), emit.plan(), emit.frame());
+    let flag = |list: &[bool], v: Value| list.get(v.index()).copied().unwrap_or(true);
+    let simple = |v: Value| {
+        !flag(&plan.elided, v) && !flag(&plan.deferred, v) && !flag(&plan.fused, v) && plan.pairs.get(v.index()).is_some_and(Option::is_none) && (func.ty(v).is_small_int() || func.ty(v).is_float())
+    };
+    let params = &func.blocks[moved.0.index()].params;
+    let hoistable = moved.1.iter().zip(params).all(|(&arg, &param)| {
+        plan.same_home(frame, arg, param)
+            || (simple(arg)
+                && simple(param)
+                && matches!(plan.locations[arg.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
+                && matches!(plan.locations[param.index()], Location::Reg(_) | Location::Float(_))
+                && plan.hoist.free(plan.locations[param.index()], plain, condition))
+    });
+    if !hoistable {
+        return Ok(false);
+    }
+    emit.edge(moved.0, moved.1)?;
+    let target = target_label(emit, moved.0);
+    emit.branch_cond(condition, !to_then, target);
+    goto_branch(emit, plain, true);
+    Ok(true)
+}
+
 pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
@@ -230,6 +268,12 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         emit.tails().stubs.push(Stub { label, block: then.0, args: then.1 });
         emit.edge(otherwise.0, otherwise.1)?;
         goto_branch(emit, otherwise.0, true);
+        return Ok(());
+    }
+    if then_moves && !else_moves && hoist_moves(emit, condition, (then, true), otherwise.0)? {
+        return Ok(());
+    }
+    if else_moves && !then_moves && hoist_moves(emit, condition, (otherwise, false), then.0)? {
         return Ok(());
     }
     if !else_moves && (then_moves || falls(emit, then.0)) {
