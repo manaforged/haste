@@ -248,32 +248,68 @@ fn load_packages(locked: Vec<Locked>, registries: &[PathBuf], paths: &BTreeMap<S
     Ok((packages, missing))
 }
 
+fn root_package_names(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Result<Vec<String>> {
+    if manifest_name(root).is_none() && root == top && workspace.is_some() {
+        let mut dirs = member_dirs(top, workspace, "default-members");
+        if dirs.is_empty() {
+            dirs = member_dirs(top, workspace, "members");
+        }
+        return Ok(dirs.into_iter().filter_map(|dir| manifest_name(&dir)).collect());
+    }
+    let owner = owning_workspace(root)?;
+    Ok(vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name])
+}
+
+fn mark_reachable_deps(locked: &[Locked], by_name: &BTreeMap<&str, Vec<usize>>, idx: usize, keep: &mut [bool], stack: &mut Vec<usize>) {
+    for dep in locked[idx].deps() {
+        let Some(cands) = by_name.get(dep.name) else { continue };
+        for &cand in cands {
+            if !keep[cand] && dep.version.as_ref().is_none_or(|v| *v == locked[cand].version) {
+                keep[cand] = true;
+                stack.push(cand);
+            }
+        }
+    }
+}
+
+fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String]) -> Vec<Locked> {
+    let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (idx, entry) in locked.iter().enumerate() {
+        by_name.entry(entry.name.as_str()).or_default().push(idx);
+    }
+    let mut keep = vec![false; locked.len()];
+    let mut stack = Vec::new();
+    for (idx, entry) in locked.iter().enumerate() {
+        if !entry.is_registry() && root_names.contains(&entry.name) {
+            keep[idx] = true;
+            stack.push(idx);
+        }
+    }
+    while let Some(idx) = stack.pop() {
+        mark_reachable_deps(&locked, &by_name, idx, &mut keep, &mut stack);
+    }
+    locked.into_iter().enumerate().filter_map(|(idx, entry)| keep[idx].then_some(entry)).collect()
+}
+
 /// Like [`load`], with `features` enabled on the root package besides its defaults.
 pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Workspace> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
     let root = canonical.as_path();
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
-    let locked = lock::read(&top.join("Cargo.lock"))?;
+    let root_names = root_package_names(root, &top, workspace.as_ref())?;
+    let locked = prune_unreachable_locked(lock::read(&top.join("Cargo.lock"))?, &root_names);
     let mut registries = registry_dirs()?;
     registries.insert(0, top.join("vendor"));
     let paths = local_paths(root, &top, workspace.as_ref())?;
     let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
     resolve_deps(&mut packages);
-    let root_names: Vec<String> = if manifest_name(root).is_some() {
-        let owner = owning_workspace(root)?;
-        vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name]
-    } else if root == top && workspace.is_some() {
-        let mut dirs = member_dirs(&top, workspace.as_ref(), "default-members");
-        if dirs.is_empty() {
-            dirs = member_dirs(&top, workspace.as_ref(), "members");
-        }
-        dirs.into_iter().filter_map(|dir| manifest_name(&dir)).collect()
-    } else {
-        let owner = owning_workspace(root)?;
-        vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name]
-    };
-    let members: Vec<usize> = packages.iter().enumerate().filter(|(_, package)| !package.locked.is_registry() && root_names.contains(&package.locked.name)).map(|(at, _)| at).collect();
+    let members: Vec<usize> = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| !package.locked.is_registry() && root_names.contains(&package.locked.name))
+        .map(|(at, _)| at)
+        .collect();
     if members.is_empty() {
         bail!("{} is not in Cargo.lock", root.display());
     }

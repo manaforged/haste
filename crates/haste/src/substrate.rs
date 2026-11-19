@@ -338,10 +338,10 @@ impl Substrate {
         Some(StencilSlice { code: blob(code)?, sites: blob(sites)?, relocs: blob(relocs)?, plan: blob(plan)?, loops: blob(loops)? })
     }
 
-    /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its parent.
+    /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its ancestors.
     pub fn instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
-        self.local_instance_candidates(item_hash, substs_hash)
-            .chain(self.parent.as_deref().into_iter().flat_map(move |p| p.local_instance_candidates(item_hash, substs_hash)))
+        std::iter::successors(Some(self), |s| s.parent.as_deref())
+            .flat_map(move |s| s.local_instance_candidates(item_hash, substs_hash))
     }
 
     fn local_instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {

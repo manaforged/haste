@@ -411,87 +411,96 @@ impl Image {
         errors
     }
 
+    fn try_aot_singleton_hit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, slice: &crate::substrate::StencilSlice<'_>, pass: &mut Pass) -> Result<bool, String> {
+        let Ok(code) = slice.to_code().map(Arc::new) else { return Ok(false) };
+        let item = reached.list[index].0.0;
+        let relocs = if code.relocs().iter().any(|r| r.symbol_index().is_some()) {
+            if let Some(plan) = self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, false, slice.plan())
+                && let Ok(r) = lower::eval_relocs(cx, reached, self, &plan, index)
+                && cx.deferred_evals.is_empty()
+            {
+                self.register_aot_relocs(&r);
+                r
+            } else if !cx.deferred_evals.is_empty() {
+                return Ok(true);
+            } else {
+                let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
+                self.register_aot_relocs(&out.relocs);
+                out.relocs
+            }
+        } else {
+            Vec::new()
+        };
+        if !aot_relocs_valid(&code, relocs.len()) {
+            return Ok(false);
+        }
+        pass.record_size(index, code.bytes().len() as u32, 0);
+        self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs }, &[]);
+        Ok(true)
+    }
+
+    fn try_singleton_substrate(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, fp: FootprintId, pass: &mut Pass) -> Result<bool, String> {
+        let Some((_, stencil_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp) else { return Ok(false) };
+        let Some(substrate) = cx.store().substrate().cloned() else { return Ok(false) };
+        let Some(slice) = substrate.stencil(stencil_key, fp_bits) else { return Ok(false) };
+        if self.backend.is_check() {
+            pass.record_size(index, slice.code().len() as u32, 0);
+            return Ok(true);
+        }
+        if self.backend.is_aot() && self.try_aot_singleton_hit(cx, reached, index, &slice, pass)? {
+            return Ok(true);
+        }
+        let item = reached.list[index].0.0;
+        let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) {
+            Vec::new()
+        } else {
+            let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
+            out.relocs.iter().map(|sym| self.symbol_value(sym)).collect()
+        };
+        let Ok(patched) = crate::substrate::patch_stencil(&slice, &symbols) else { return Ok(false) };
+        let exec = pass.memory.write(&patched).map_err(|e| item_err(cx, item, e))?;
+        self.publish(index, exec);
+        pass.record_size(index, patched.len() as u32, 0);
+        Ok(true)
+    }
+
+    fn emit_singleton_code(&self, cx: &Context<'_>, item: ItemRef, index: usize, code: Arc<Code>, relocs: Vec<SymbolSource>, pass: &mut Pass) -> Result<(), String> {
+        if self.backend.is_jit() {
+            let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+            let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
+            self.publish(index, exec);
+        } else {
+            self.register_aot_relocs(&relocs);
+            self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs }, &[]);
+        }
+        Ok(())
+    }
+
+    fn eval_singleton_fp(&self, cx: &mut Context<'_>, reached: &Reached, item: ItemRef, index: usize) -> Result<Option<FootprintId>, String> {
+        if self.backend.is_lazy_jit() || !cx.outline.is_fixed(item.krate) {
+            return Ok(None);
+        }
+        lower::eval_footprint(cx, reached, self, index).map(Some).map_err(|e| item_err(cx, item, e))
+    }
+
     fn compile_singleton(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<(), String> {
         let started = std::time::Instant::now();
         let item = reached.list[index].0.0;
-        let footprint = if !self.backend.is_lazy_jit() && cx.outline.is_fixed(item.krate) {
-            Some(lower::eval_footprint(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?)
-        } else {
-            None
-        };
-        let substrate = cx.store().substrate().cloned();
-        if !pass.stencils.cfg.verify
-            && let Some(fp) = footprint
-            && let Some((is_sysroot, stencil_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp)
-            && let Some(substrate) = substrate.as_ref()
-            && let Some(slice) = substrate.stencil(stencil_key, fp_bits)
-        {
-            if self.backend.is_check() {
-                pass.record_size(index, slice.code().len() as u32, 0);
-                return Ok(());
-            }
-            if self.backend.is_aot()
-                && let Ok(code) = slice.to_code().map(Arc::new)
-            {
-                let relocs = if code.relocs().iter().any(|r| r.symbol_index().is_some()) {
-                    if let Some(plan) = self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan())
-                        && let Ok(r) = lower::eval_relocs(cx, reached, self, &plan, index)
-                        && cx.deferred_evals.is_empty()
-                    {
-                        self.register_aot_relocs(&r);
-                        r
-                    } else if !cx.deferred_evals.is_empty() {
-                        return Ok(());
-                    } else {
-                        let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
-                        self.register_aot_relocs(&out.relocs);
-                        out.relocs
-                    }
-                } else {
-                    Vec::new()
-                };
-                if aot_relocs_valid(&code, relocs.len()) {
-                    let code_len = code.bytes().len() as u32;
-                    self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs }, &[]);
-                    pass.record_size(index, code_len, 0);
-                    return Ok(());
-                }
-            }
-            let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) {
-                Vec::new()
-            } else {
-                let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
-                out.relocs.iter().map(|sym| self.symbol_value(sym)).collect()
-            };
-            if let Ok(patched) = crate::substrate::patch_stencil(&slice, &symbols) {
-                let exec = pass.memory.write(&patched).map_err(|e| item_err(cx, item, e))?;
-                self.publish(index, exec);
-                pass.record_size(index, patched.len() as u32, 0);
-                return Ok(());
-            }
+        let footprint = self.eval_singleton_fp(cx, reached, item, index)?;
+        if !pass.stencils.cfg.verify && match footprint { Some(fp) => self.try_singleton_substrate(cx, reached, index, fp, pass)?, None => false } {
+            return Ok(());
         }
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
         if self.backend.is_check() && !pass.stencils.cfg.verify {
             pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
             return Ok(());
         }
-        let reloc_plan = out.reloc_plan;
         let code = Arc::new(compile_traced(cx, reached, index, out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
-        if let Some(fp) = footprint
-            && aot_relocs_valid(&code, out.relocs.len())
-            && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)
-        {
-            self.freeze_stencil(cx, reached, index, fp, false, &code, Some(&reloc_plan), pass);
-        }
-        if self.backend.is_jit() {
-            let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-            let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
-            self.publish(index, exec);
-        } else {
-            self.register_aot_relocs(&out.relocs);
-            self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs: out.relocs }, &[]);
+        if let Some(fp) = footprint.filter(|&fp| aot_relocs_valid(&code, out.relocs.len()) && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)) {
+            self.freeze_stencil(cx, reached, index, fp, false, &code, Some(&out.reloc_plan), pass);
         }
         let code_len = code.bytes().len() as u32;
+        self.emit_singleton_code(cx, item, index, code, out.relocs, pass)?;
         pass.record_size(index, code_len, started.elapsed().as_nanos() as u64);
         Ok(())
     }
