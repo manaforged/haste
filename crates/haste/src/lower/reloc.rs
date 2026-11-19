@@ -98,30 +98,64 @@ impl RelocStep {
             _ => 1,
         }
     }
+
+    fn step_has_calls(&self) -> bool {
+        match self {
+            RelocStep::SiteSlot(_)
+            | RelocStep::VtableSlot { .. }
+            | RelocStep::Const(SymbolSource::Slot(_) | SymbolSource::Host(_)) => true,
+            RelocStep::SiteInline { plan, .. } => plan.has_calls(),
+            _ => false,
+        }
+    }
+
+    fn step_has_fn_ptrs(&self) -> bool {
+        match self {
+            RelocStep::SiteInline { plan, .. } => plan.has_fn_ptrs(),
+            other => other.is_reify(),
+        }
+    }
 }
 
 /// Parametric relocation plan recorded on a stencil leader and evaluated in `O(|relocs|)` per follower.
 #[derive(Clone, Debug, Default)]
 pub struct RelocPlan {
     pub(crate) steps: Box<[RelocStep]>,
+    symbol_count: u32,
+    has_calls: bool,
+    has_fn_ptrs: bool,
 }
 
 impl RelocPlan {
     pub(crate) fn from_vec(steps: Vec<RelocStep>) -> Self {
-        Self { steps: steps.into_boxed_slice() }
+        let symbol_count = steps.iter().map(RelocStep::symbols).sum::<usize>() as u32;
+        let has_calls = steps.iter().any(RelocStep::step_has_calls);
+        let has_fn_ptrs = steps.iter().any(RelocStep::step_has_fn_ptrs);
+        Self { steps: steps.into_boxed_slice(), symbol_count, has_calls, has_fn_ptrs }
     }
 
+    #[inline]
     pub(crate) fn reloc_len(&self) -> usize {
-        self.steps.iter().map(RelocStep::symbols).sum()
+        self.symbol_count as usize
+    }
+
+    #[inline]
+    pub(crate) fn has_calls(&self) -> bool {
+        self.has_calls
+    }
+
+    #[inline]
+    pub(crate) fn has_fn_ptrs(&self) -> bool {
+        self.has_fn_ptrs
     }
 
     /// The step that produces symbol `target_sym`, looking inside inlined plans.
-    pub(super) fn step_at(&self, mut target_sym: usize) -> Option<&RelocStep> {
-        for step in &self.steps {
+    pub(super) fn step_at_slice(steps: &[RelocStep], mut target_sym: usize) -> Option<&RelocStep> {
+        for step in steps {
             let len = step.symbols();
             if target_sym < len {
                 return match step {
-                    RelocStep::SiteInline { plan, .. } => plan.step_at(target_sym),
+                    RelocStep::SiteInline { plan, .. } => Self::step_at_slice(&plan.steps, target_sym),
                     other => Some(other),
                 };
             }
@@ -131,16 +165,13 @@ impl RelocPlan {
     }
 
     /// Whether any of `steps`, inside inlined plans too, names a function reified to a pointer.
-    pub(super) fn has_fn_pointers(steps: &[RelocStep]) -> bool {
-        steps.iter().any(|step| match step {
-            RelocStep::SiteInline { plan, .. } => Self::has_fn_pointers(&plan.steps),
-            other => other.is_reify(),
-        })
+    pub(super) fn steps_have_fn_ptrs(steps: &[RelocStep]) -> bool {
+        steps.iter().any(RelocStep::step_has_fn_ptrs)
     }
 
-    pub(super) fn vtable_slot_at(&self, target_sym: usize) -> Option<(ExprId, u16)> {
+    pub(super) fn vtable_slot_at_slice(steps: &[RelocStep], target_sym: usize) -> Option<(ExprId, u16)> {
         let mut offset = 0usize;
-        for step in &self.steps {
+        for step in steps {
             let len = match step {
                 RelocStep::VtableSlot { expr, slot } if offset == target_sym => return Some((*expr, *slot)),
                 other => other.symbols(),

@@ -555,20 +555,10 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     Ok((template.map(|t| (footprint, Found::Body(t, Some(relocs)))), cycle))
 }
 
-fn plan_has_calls(plan: &RelocPlan) -> bool {
-    plan.steps.iter().any(|step| match step {
-        RelocStep::SiteSlot(_)
-        | RelocStep::VtableSlot { .. }
-        | RelocStep::Const(SymbolSource::Slot(_) | SymbolSource::Host(_)) => true,
-        RelocStep::SiteInline { plan, .. } => plan_has_calls(plan),
-        _ => false,
-    })
-}
-
 fn lower_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<Option<Lowered>> {
     let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
     Ok(quiet.lowered(slots, lowered)?.map(|(func, relocs, plan, cycle)| {
-        let limit = if plan_has_calls(&plan) { limit } else { super::budget::leaf_limit(cx, reached, index, limit) };
+        let limit = if plan.has_calls() { limit } else { super::budget::leaf_limit(cx, reached, index, limit) };
         (simplify_inline(func, limit), relocs, plan, cycle)
     }))
 }
@@ -589,6 +579,21 @@ fn simplify_inline(mut func: Function, limit: usize) -> std::result::Result<(Arc
     Ok((Arc::new(func), returns))
 }
 
+fn body_arena(cx: &mut Context<'_>, source: ItemRef, shape: &Shape) -> Result<Arena> {
+    match shape {
+        Shape::Body | Shape::Closure(_) => Ok(Arena::Body(cx.body(source)?)),
+        Shape::Anon(anon) => Ok(anon.arena.clone()),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Ok(Arena::Body(Arc::default())),
+    }
+}
+
+fn should_splice_devirt(slots: &dyn Slots, func: &Function, mode: LowerMode, reloc_plan: &[RelocStep]) -> bool {
+    mode == LowerMode::Stencil
+        && slots.allow_inline()
+        && !func.is_coroutine()
+        && (func.has_vtable_slots() || RelocPlan::steps_have_fn_ptrs(reloc_plan))
+}
+
 fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, RelocVec, Arc<RelocPlan>, usize)> {
     let item = &reached.list[index].0.0;
     let typed = reached.typed(index, cx.name(*item))?;
@@ -598,33 +603,22 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         Shape::Closure(closure) => closure.parent,
         _ => *item,
     };
-    let arena = match &typed.shape {
-        Shape::Body | Shape::Closure(_) => Arena::Body(cx.body(source)?),
-        Shape::Anon(anon) => anon.arena.clone(),
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Arena::Body(Arc::default()),
-    };
+    let arena = body_arena(cx, source, &typed.shape)?;
     let mut sig = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
     if mode == LowerMode::Dict {
         sig.params.push(AbiParam::special(Type::I64, ArgumentPurpose::Dict));
     }
     let mut func = Function::new(sig);
     let b = FunctionBuilder::new(&mut func);
-    let mut relocs = Vec::new();
-    let mut reloc_plan = Vec::new();
-    let cycle = {
+    let (mut relocs, mut reloc_plan) = (Vec::new(), Vec::new());
+    let mut cycle = {
         let mut lower = Lower::new(cx, (reached, slots, inline), (index, source, arena.body(), typed), (b, mode), (&mut relocs, &mut reloc_plan));
         lower.run()?;
         lower.cycle_root
     };
-    let cycle = if mode == LowerMode::Stencil
-        && slots.allow_inline()
-        && (func.has_vtable_slots() || RelocPlan::has_fn_pointers(&reloc_plan))
-        && !func.is_coroutine()
-    {
-        splice_devirt_vtable_calls(cx, (reached, slots), inline, (&mut func, &mut relocs, &mut reloc_plan), cycle)?
-    } else {
-        cycle
-    };
+    if should_splice_devirt(slots, &func, mode, &reloc_plan) {
+        cycle = splice_devirt_vtable_calls(cx, (reached, slots), inline, (&mut func, &mut relocs, &mut reloc_plan), cycle)?;
+    }
     if mode == LowerMode::Stencil {
         canonicalize_const_symbols(&mut func, &reloc_plan);
     }
@@ -678,13 +672,12 @@ fn splice_devirt_vtable_calls(
     for _ in 0..8 {
         simplify_tallied(func, Tally::Devirt);
         any = false;
-        let current_plan = RelocPlan { steps: reloc_plan.clone().into_boxed_slice() };
         let mut spliced = false;
         for (block, pos, callee_sym) in func.symbol_call_sites() {
             let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(callee_sym as usize) else { continue };
-            let origin = match current_plan.vtable_slot_at(callee_sym as usize) {
+            let origin = match RelocPlan::vtable_slot_at_slice(reloc_plan, callee_sym as usize) {
                 Some((expr, slot)) => SiteOrigin::VtableMethod { expr, slot },
-                None if current_plan.step_at(callee_sym as usize).is_some_and(RelocStep::is_reify) => SiteOrigin::Symbol(callee_sym),
+                None if RelocPlan::step_at_slice(reloc_plan, callee_sym as usize).is_some_and(RelocStep::is_reify) => SiteOrigin::Symbol(callee_sym),
                 None => continue,
             };
             let Some(limit) = super::budget::inline_limit(cx, reached, callee_idx) else { continue };
