@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 
 use crate::cfg::{Cfg, Loop, Loops};
 use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Convert, Domain, Function, Inst, Op, Type, Value};
-use crate::live::results;
+use crate::live::{BitMatrix, results, set_bits, solve_backward_liveness};
 
 enum TailCase {
     Pure { args: Vec<Value>, callee: Value },
@@ -610,72 +610,49 @@ fn for_loop_operands(op: &Op, body: &[bool], mut f: impl FnMut(Value)) {
     }
 }
 
-fn fill_live_out(func: &Function, live_in: &[u64], words: usize, block: Block, out: &mut [u64]) {
-    out.fill(0);
-    for succ in func.successors(block) {
-        let s = succ.index() * words;
-        out.iter_mut().zip(&live_in[s..s + words]).for_each(|(w, &bit)| *w |= bit);
-    }
-}
-
-fn local_live_sets(func: &Function, dense: &[Option<usize>], words: usize) -> (Vec<u64>, Vec<u64>) {
-    let (mut uses, mut defs) = (vec![0_u64; func.blocks.len() * words], vec![0_u64; func.blocks.len() * words]);
+fn local_live_sets(func: &Function, dense: &[Option<usize>], count: usize) -> (BitMatrix, BitMatrix) {
+    let blocks = func.blocks.len();
+    let (mut uses, mut defs) = (BitMatrix::new(blocks, count), BitMatrix::new(blocks, count));
     for (b, block) in func.blocks.iter().enumerate() {
-        let base = b * words;
-        block.params.iter().for_each(|&p| if let Some(d) = dense[p.index()] { defs[base + d / 64] |= 1_u64 << (d % 64); });
+        block.params.iter().for_each(|&p| if let Some(d) = dense[p.index()] { defs.set(b, d); });
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            data.op.for_operands(|v| if let Some(d) = dense[v.index()] && (defs[base + d / 64] >> (d % 64)) & 1 == 0 { uses[base + d / 64] |= 1_u64 << (d % 64); });
-            results(data).for_each(|r| if let Some(d) = dense[r.index()] { defs[base + d / 64] |= 1_u64 << (d % 64); });
+            data.op.for_operands(|v| if let Some(d) = dense[v.index()] && !defs.get(b, d) { uses.set(b, d); });
+            results(data).for_each(|r| if let Some(d) = dense[r.index()] { defs.set(b, d); });
         }
     }
     (uses, defs)
 }
 
-fn compute_live_in(func: &Function, cfg: &Cfg, dense: &[Option<usize>], count: usize) -> (Vec<u64>, usize) {
-    let words = count.div_ceil(64);
-    if words == 0 { return (Vec::new(), 0); }
-    let (uses, defs) = local_live_sets(func, dense, words);
-    let (mut live, mut out, mut changed) = (vec![0_u64; func.blocks.len() * words], vec![0_u64; words], true);
-    while changed {
-        changed = false;
-        for &block in cfg.rpo.iter().rev() {
-            fill_live_out(func, &live, words, block, &mut out);
-            let base = block.index() * words;
-            for w in 0..words {
-                let next = uses[base + w] | (out[w] & !defs[base + w]);
-                if live[base + w] != next {
-                    live[base + w] = next;
-                    changed = true;
-                }
-            }
-        }
-    }
-    (live, words)
+fn compute_live_in(func: &Function, cfg: &Cfg, dense: &[Option<usize>], count: usize) -> BitMatrix {
+    if count == 0 { return BitMatrix::new(func.blocks.len(), 0); }
+    let (uses, defs) = local_live_sets(func, dense, count);
+    solve_backward_liveness(func, cfg.rpo.iter().copied(), &uses, &defs)
 }
 
-fn find_crosses_call(func: &Function, cfg: &Cfg, candidates: &[usize]) -> (Vec<bool>, Vec<u64>, Vec<Option<usize>>, usize) {
+fn find_crosses_call(func: &Function, cfg: &Cfg, candidates: &[usize]) -> (Vec<bool>, BitMatrix, Vec<Option<usize>>) {
     let mut dense = vec![None; func.types.len()];
     candidates.iter().enumerate().for_each(|(i, &v)| dense[v] = Some(i));
-    let (live_in, words) = compute_live_in(func, cfg, &dense, candidates.len());
+    let live_in = compute_live_in(func, cfg, &dense, candidates.len());
     let mut crosses = vec![false; func.types.len()];
-    if words == 0 { return (crosses, live_in, dense, 0); }
+    let words = live_in.words();
+    if words == 0 { return (crosses, live_in, dense); }
     let mut cur = vec![0_u64; words];
     for &block in &cfg.rpo {
-        fill_live_out(func, &live_in, words, block, &mut cur);
+        live_in.fill_succ_union(func, block, &mut cur);
         let insts = &func.blocks[block.index()].insts;
         for idx in (0..insts.len()).rev() {
             let data = &func.insts[insts[idx].index()];
-            results(data).for_each(|r| if let Some(d) = dense[r.index()] { cur[d / 64] &= !(1_u64 << (d % 64)); });
+            results(data).for_each(|r| if let Some(d) = dense[r.index()] { cur[d >> 6] &= !(1_u64 << (d & 63)); });
             if is_call_site(func, insts, idx) {
-                for (i, &v) in candidates.iter().enumerate() {
-                    if (cur[i / 64] >> (i % 64)) & 1 == 1 { crosses[v] = true; }
+                for i in set_bits(&cur) {
+                    crosses[candidates[i]] = true;
                 }
             }
-            data.op.for_operands(|v| if let Some(d) = dense[v.index()] { cur[d / 64] |= 1_u64 << (d % 64); });
+            data.op.for_operands(|v| if let Some(d) = dense[v.index()] { cur[d >> 6] |= 1_u64 << (d & 63); });
         }
     }
-    (crosses, live_in, dense, words)
+    (crosses, live_in, dense)
 }
 
 fn collect_loop_uses(func: &Function, cfg: &Cfg, each: &Loop, def_blocks: &[Option<Block>], static_vals: &[bool]) -> Vec<(usize, u32)> {
@@ -697,25 +674,22 @@ fn collect_loop_uses(func: &Function, cfg: &Cfg, each: &Loop, def_blocks: &[Opti
     uses_in_l.into_iter().collect()
 }
 
-fn block_peak_gprs(func: &Function, (live_in, words): (&[u64], usize), dense: &[Option<usize>], block: Block, cur: &mut [u64]) -> usize {
-    fill_live_out(func, live_in, words, block, cur);
+fn block_peak_gprs(func: &Function, live_in: &BitMatrix, dense: &[Option<usize>], block: Block, cur: &mut [u64]) -> usize {
+    live_in.fill_succ_union(func, block, cur);
     let mut peak: usize = cur.iter().map(|w| w.count_ones() as usize).sum();
     for &inst in func.blocks[block.index()].insts.iter().rev() {
         let data = &func.insts[inst.index()];
-        results(data).for_each(|r| if let Some(d) = dense[r.index()] { cur[d / 64] &= !(1_u64 << (d % 64)); });
-        data.op.for_operands(|v| if let Some(d) = dense[v.index()] { cur[d / 64] |= 1_u64 << (d % 64); });
+        results(data).for_each(|r| if let Some(d) = dense[r.index()] { cur[d >> 6] &= !(1_u64 << (d & 63)); });
+        data.op.for_operands(|v| if let Some(d) = dense[v.index()] { cur[d >> 6] |= 1_u64 << (d & 63); });
         peak = peak.max(cur.iter().map(|w| w.count_ones() as usize).sum());
     }
     peak
 }
 
-fn loop_peak_gprs(func: &Function, cfg: &Cfg, each: &Loop, loop_budget: usize, (def_blocks, excluded, crosses): (&[Option<Block>], &[bool], &[bool])) -> usize {
-    let head_params = func.blocks[each.head.index()].params.iter().filter(|&&p| func.ty(p).is_small_int() && !excluded[p.index()]).count();
-    if head_params >= loop_budget { return head_params; }
+fn loop_dense_gprs(func: &Function, each: &Loop, (def_blocks, excluded, crosses): (&[Option<Block>], &[bool], &[bool])) -> (Vec<Option<usize>>, usize) {
     let (mut dense, mut count) = (vec![None; func.types.len()], 0_usize);
     let mut add = |v: usize| if func.types[v].is_small_int() && !excluded[v] && dense[v].is_none() { dense[v] = Some(count); count += 1; };
-    for (b, block) in func.blocks.iter().enumerate() {
-        if !each.body[b] { continue; }
+    for block in func.blocks.iter().enumerate().filter_map(|(b, blk)| each.body[b].then_some(blk)) {
         block.params.iter().for_each(|p| add(p.index()));
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
@@ -723,11 +697,20 @@ fn loop_peak_gprs(func: &Function, cfg: &Cfg, each: &Loop, loop_budget: usize, (
             data.op.for_operands(|v| if let Some(db) = def_blocks[v.index()] && !each.body[db.index()] && !crosses[v.index()] { add(v.index()); });
         }
     }
-    let (live_in, words) = compute_live_in(func, cfg, &dense, count);
+    (dense, count)
+}
+
+fn loop_peak_gprs(func: &Function, cfg: &Cfg, each: &Loop, loop_budget: usize, ctx: (&[Option<Block>], &[bool], &[bool])) -> usize {
+    let excluded = ctx.1;
+    let head_params = func.blocks[each.head.index()].params.iter().filter(|&&p| func.ty(p).is_small_int() && !excluded[p.index()]).count();
+    if head_params >= loop_budget { return head_params; }
+    let (dense, count) = loop_dense_gprs(func, each, ctx);
+    let live_in = compute_live_in(func, cfg, &dense, count);
+    let words = live_in.words();
     if words == 0 { return head_params; }
     let (mut cur, mut peak) = (vec![0_u64; words], head_params);
     for (b, &inside) in each.body.iter().enumerate() {
-        if inside { peak = peak.max(block_peak_gprs(func, (&live_in, words), &dense, Block(b as u32), &mut cur)); }
+        if inside { peak = peak.max(block_peak_gprs(func, &live_in, &dense, Block(b as u32), &mut cur)); }
     }
     peak
 }
@@ -756,6 +739,27 @@ fn apply_loop_split(func: &mut Function, each: &Loop, preds: &[Block], chosen: &
     }
 }
 
+fn plan_loop_split(
+    (func, cfg): (&Function, &Cfg),
+    (each, preds, mut cands): (Loop, Vec<Block>, Vec<(usize, u32)>),
+    (saved_floor, loop_budget): (usize, usize),
+    (all_gprs, live_in, dense): (&[usize], &BitMatrix, &[Option<usize>]),
+    ctx: (&[Option<Block>], &[bool], &[bool]),
+) -> Option<(Loop, Vec<Block>, Vec<usize>)> {
+    let crosses = ctx.2;
+    let hrow = each.head.index();
+    let live_crosses = all_gprs.iter().filter(|&&v| crosses[v] && dense[v].is_some_and(|d| live_in.get(hrow, d))).count();
+    let overflow = live_crosses.saturating_sub(saved_floor);
+    if overflow == 0 { return None; }
+    let out_preds = preds.iter().filter(|&&p| !each.body[p.index()]).count();
+    cands.retain(|&(v, c)| crosses[v] && (c >= 2 || (c >= 1 && each.depth >= 2 && out_preds == 1)));
+    if cands.is_empty() { return None; }
+    let budget = loop_budget.saturating_sub(loop_peak_gprs(func, cfg, &each, loop_budget, ctx)).min(MAX_SPLIT).min(overflow);
+    if budget == 0 { return None; }
+    cands.sort_unstable_by_key(|&(v, count)| (Reverse(count), v));
+    Some((each, preds, cands.into_iter().take(budget).map(|(v, _)| v).collect()))
+}
+
 fn split_innermost_loops(func: &mut Function, target: &crate::Target) -> Domain {
     let (saved_floor, loop_budget) = reg_budgets(target.arch);
     if loop_budget == 0 { return Domain::NONE; }
@@ -766,27 +770,16 @@ fn split_innermost_loops(func: &mut Function, target: &crate::Target) -> Domain 
     let plans: Vec<(Loop, Vec<Block>, Vec<usize>)> = {
         let cfg = func.cfg();
         let loops = cfg.loops();
-        let mut eligible = Vec::new();
-        for each in &loops.list {
-            let Some(preds) = eligible_loop(func, &cfg, loops, each) else { continue };
+        let eligible: Vec<_> = loops.list.iter().filter_map(|each| {
+            let preds = eligible_loop(func, &cfg, loops, each)?;
             let cands = collect_loop_uses(func, &cfg, each, &def_blocks, &static_vals);
-            if !cands.is_empty() { eligible.push((each.clone(), preds, cands)); }
-        }
+            (!cands.is_empty()).then(|| (each.clone(), preds, cands))
+        }).collect();
         if eligible.is_empty() { return Domain::NONE; }
         let all_gprs: Vec<usize> = (0..func.types.len()).filter(|&v| func.types[v].is_small_int() && !excluded[v]).collect();
-        let (crosses, live_in, dense, words) = find_crosses_call(func, &cfg, &all_gprs);
-        eligible.into_iter().filter_map(|(each, preds, mut cands)| {
-            let hbase = each.head.index() * words;
-            let live_crosses = all_gprs.iter().filter(|&&v| crosses[v] && dense[v].is_some_and(|d| (live_in[hbase + d / 64] >> (d % 64)) & 1 == 1)).count();
-            let overflow = live_crosses.saturating_sub(saved_floor);
-            if overflow == 0 { return None; }
-            let out_preds = preds.iter().filter(|&&p| !each.body[p.index()]).count();
-            cands.retain(|&(v, c)| crosses[v] && (c >= 2 || (c >= 1 && each.depth >= 2 && out_preds == 1)));
-            if cands.is_empty() { return None; }
-            let budget = loop_budget.saturating_sub(loop_peak_gprs(func, &cfg, &each, loop_budget, (&def_blocks, &excluded, &crosses))).min(MAX_SPLIT).min(overflow);
-            if budget == 0 { return None; }
-            cands.sort_unstable_by_key(|&(v, count)| (Reverse(count), v));
-            Some((each, preds, cands.into_iter().take(budget).map(|(v, _)| v).collect()))
+        let (crosses, live_in, dense) = find_crosses_call(func, &cfg, &all_gprs);
+        eligible.into_iter().filter_map(|item| {
+            plan_loop_split((func, &cfg), item, (saved_floor, loop_budget), (&all_gprs, &live_in, &dense), (&def_blocks, &excluded, &crosses))
         }).collect()
     };
     if plans.is_empty() { return Domain::NONE; }

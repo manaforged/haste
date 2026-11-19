@@ -199,32 +199,126 @@ pub(crate) fn covers(outer: &[Range], inner: &[Range]) -> bool {
     })
 }
 
-struct Sets {
+/// A dense row-major boolean matrix packed into 64-bit words.
+pub(crate) struct BitMatrix {
     words: usize,
     bits: Vec<u64>,
 }
 
-impl Sets {
-    fn new(blocks: usize, values: usize) -> Sets {
-        let words = values.div_ceil(64);
-        Sets { words, bits: vec![0; blocks * words] }
+impl BitMatrix {
+    /// Allocates an all-zero matrix with `rows` rows and `cols` columns.
+    pub(crate) fn new(rows: usize, cols: usize) -> Self {
+        let words = cols.div_ceil(64);
+        Self { words, bits: vec![0; rows * words] }
     }
 
-    fn row(&self, block: usize) -> &[u64] {
-        &self.bits[block * self.words..(block + 1) * self.words]
+    /// Returns the number of 64-bit words per row.
+    pub(crate) const fn words(&self) -> usize {
+        self.words
     }
 
-    fn has(&self, block: usize, dense: usize) -> bool {
-        self.bits[block * self.words + dense / 64] >> (dense % 64) & 1 == 1
+    /// Returns whether bit `(row, col)` is set.
+    pub(crate) fn get(&self, row: usize, col: usize) -> bool {
+        (self.bits[row * self.words + (col >> 6)] >> (col & 63)) & 1 != 0
     }
 
-    fn insert(&mut self, block: usize, dense: usize) {
-        self.bits[block * self.words + dense / 64] |= 1 << (dense % 64);
+    /// Sets bit `(row, col)`.
+    pub(crate) fn set(&mut self, row: usize, col: usize) {
+        self.bits[row * self.words + (col >> 6)] |= 1_u64 << (col & 63);
     }
 
-    fn members(&self, block: usize) -> impl Iterator<Item = usize> + '_ {
-        self.row(block).iter().enumerate().flat_map(|(word, bits)| (0..64).filter(move |bit| bits >> bit & 1 == 1).map(move |bit| word * 64 + bit))
+    /// Returns the packed words of `row`.
+    pub(crate) fn row(&self, row: usize) -> &[u64] {
+        let start = row * self.words;
+        &self.bits[start..start + self.words]
     }
+
+    /// Returns a mutable slice of the packed words of `row`.
+    pub(crate) fn row_mut(&mut self, row: usize) -> &mut [u64] {
+        let start = row * self.words;
+        &mut self.bits[start..start + self.words]
+    }
+
+    /// Unions `mask` into `row`.
+    pub(crate) fn or_row(&mut self, row: usize, mask: &[u64]) {
+        for (dst, &src) in self.row_mut(row).iter_mut().zip(mask) {
+            *dst |= src;
+        }
+    }
+
+    /// Writes the union of `func`'s successors of `block` into `out`.
+    pub(crate) fn fill_succ_union(&self, func: &Function, block: Block, out: &mut [u64]) {
+        out.fill(0);
+        for succ in func.successors(block) {
+            for (dst, &src) in out.iter_mut().zip(self.row(succ.index())) {
+                *dst |= src;
+            }
+        }
+    }
+
+    /// Iterates over each set column index in `row`.
+    #[inline]
+    pub(crate) fn members(&self, row: usize) -> SetBits<'_> {
+        set_bits(self.row(row))
+    }
+}
+
+/// An iterator over the set bit indices of a `u64` word slice.
+pub(crate) struct SetBits<'a> {
+    rest: &'a [u64],
+    base: usize,
+    cur: u64,
+}
+
+impl Iterator for SetBits<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        while self.cur == 0 {
+            let (&word, tail) = self.rest.split_first()?;
+            self.rest = tail;
+            self.base += 64;
+            self.cur = word;
+        }
+        let bit = self.cur.trailing_zeros() as usize;
+        self.cur &= self.cur - 1;
+        Some(self.base + bit)
+    }
+}
+
+/// Returns an iterator over the set bit indices in `words`.
+#[inline]
+pub(crate) fn set_bits(words: &[u64]) -> SetBits<'_> {
+    match words.split_first() {
+        Some((&cur, rest)) => SetBits { rest, base: 0, cur },
+        None => SetBits { rest: &[], base: 0, cur: 0 },
+    }
+}
+
+/// Solves backward block liveness `in[b] = gen_sets[b] | (union_succ(in) & !kill_sets[b])` to a fixpoint.
+pub(crate) fn solve_backward_liveness<I>(func: &Function, blocks: I, gen_sets: &BitMatrix, kill_sets: &BitMatrix) -> BitMatrix
+where
+    I: Clone + DoubleEndedIterator<Item = Block>,
+{
+    let words = gen_sets.words();
+    let mut live = BitMatrix { words, bits: vec![0; func.blocks.len() * words] };
+    let mut out = vec![0_u64; words];
+    let mut changed = words > 0;
+    while changed {
+        changed = false;
+        for block in blocks.clone().rev() {
+            let idx = block.index();
+            live.fill_succ_union(func, block, &mut out);
+            let (gen_row, kill_row) = (gen_sets.row(idx), kill_sets.row(idx));
+            for ((dst, &g), (&o, &k)) in live.row_mut(idx).iter_mut().zip(gen_row).zip(out.iter().zip(kill_row)) {
+                let next = g | (o & !k);
+                changed |= *dst != next;
+                *dst = next;
+            }
+        }
+    }
+    live
 }
 
 fn crossing(func: &Function, wanted: &[bool], sib: &[Option<Sib>], elided: &[bool]) -> (Vec<Option<usize>>, Vec<Value>) {
@@ -253,12 +347,12 @@ fn crossing(func: &Function, wanted: &[bool], sib: &[Option<Sib>], elided: &[boo
     (dense, values)
 }
 
-fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> (Sets, Sets) {
+fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> (BitMatrix, BitMatrix) {
     let blocks = func.blocks.len();
-    let (mut uses, mut defs) = (Sets::new(blocks, count), Sets::new(blocks, count));
+    let (mut uses, mut defs) = (BitMatrix::new(blocks, count), BitMatrix::new(blocks, count));
     for (block, data) in func.blocks.iter().enumerate() {
         for param in data.params.iter().filter_map(|param| dense[param.index()]) {
-            defs.insert(block, param);
+            defs.set(block, param);
         }
         for inst in &data.insts {
             let inst = &func.insts[inst.index()];
@@ -267,43 +361,22 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Opt
             }
             for_effective_operands(inst, sib, elided, |value| {
                 if let Some(value) = dense[value.index()]
-                    && !defs.has(block, value)
+                    && !defs.get(block, value)
                 {
-                    uses.insert(block, value);
+                    uses.set(block, value);
                 }
             });
             for result in results(inst).filter_map(|result| dense[result.index()]) {
-                defs.insert(block, result);
+                defs.set(block, result);
             }
         }
     }
     (uses, defs)
 }
 
-fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> Sets {
+fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> BitMatrix {
     let (uses, defs) = local_sets(func, dense, count, sib, elided);
-    let mut live = Sets::new(func.blocks.len(), count);
-    let words = live.words;
-    let mut out = vec![0_u64; words];
-    let mut changed = words > 0;
-    while changed {
-        changed = false;
-        for block in order.iter().rev().map(|block| block.index()) {
-            out.iter_mut().for_each(|word| *word = 0);
-            for next in func.successors(Block(block as u32)) {
-                out.iter_mut().zip(live.row(next.index())).for_each(|(word, bits)| *word |= bits);
-            }
-            for word in 0..words {
-                let new = uses.row(block)[word] | (out[word] & !defs.row(block)[word]);
-                let at = block * words + word;
-                if live.bits[at] != new {
-                    live.bits[at] = new;
-                    changed = true;
-                }
-            }
-        }
-    }
-    live
+    solve_backward_liveness(func, order.iter().copied(), &uses, &defs)
 }
 
 fn push_range(out: &mut [Vec<Range>], value: usize, start: u32, end: u32) {
