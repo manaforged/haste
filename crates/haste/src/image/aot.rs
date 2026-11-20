@@ -663,6 +663,31 @@ fn patch_vtables(state: &AotState, vmask: &vdce::VtableMask, (vtable_offs, fn_of
 }
 
 impl Image {
+    /// Drops cached inline bodies, stencil passes, and file indices before writing a one-shot AOT executable.
+    pub(crate) fn compact_for_oneshot_aot(&mut self) {
+        self.bodies = crate::lower::Bodies::default();
+        self.pass = Default::default();
+        self.file_index = OnceLock::new();
+    }
+
+    /// Returns live AOT-reachable non-foreign function indices from `roots` not yet compiled into `AotState`.
+    pub(crate) fn missing_aot_targets(&self, roots: [usize; 2], reached: &crate::sema::reach::Reached) -> Vec<usize> {
+        let Some(aot) = self.aot() else { return Vec::new() };
+        let mut state = lock(aot);
+        state.ensure_len(reached.list.len());
+        let mask = vdce::VtableMask::all_live();
+        let live = AotReach::collect(&state, roots, &mask);
+        live.order
+            .into_iter()
+            .filter(|&idx| {
+                state.functions.get(idx).and_then(Option::as_ref).is_none()
+                    && !state.foreign_fns.contains_key(&idx)
+                    && !state.statics.contains_key(&idx)
+                    && reached.list.get(idx).is_some_and(|(_, r)| r.is_ok())
+            })
+            .collect()
+    }
+
     pub(super) fn record_aot(&self, index: usize, entry: AotFn, followers: &[usize]) {
         if let Some(aot) = self.aot() {
             let mut state = lock(aot);

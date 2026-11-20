@@ -5,7 +5,7 @@ use crate::names::ItemRef;
 use crate::outline::Outline;
 
 use super::super::Context;
-use super::super::infer::{LazyTables, Shape, Typed, register};
+use super::super::infer::{ Shape, Typed, register};
 use super::super::reach::{Instance, lay_out};
 use super::super::table::Table;
 use super::super::ty::Types;
@@ -14,9 +14,9 @@ use super::{SummaryKind, codec, frozen};
 /// The persisted typed body of fixed `instance`, registered and laid out as a fresh inference leaves it.
 pub(in crate::sema) fn thawed(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Option<Result<Arc<Typed>, String>> {
     let typed = frozen::instance_bytes(cx, *instance, |index, bytes| codec::decode_typed(cx.outline, index, &cx.types, instance.1, bytes).ok().flatten())?;
-    let (before, param_count) = (cx.quiet_mark(), cx.types.substs(instance.1).len());
+    let before = cx.quiet_mark();
     if matches!(typed.shape, Shape::Body)
-        && let Err(err) = warm_body(cx, instance.0, param_count, before)
+        && let Err(err) = warm_body(cx, instance.0, before)
     {
         return Some(Err(err));
     }
@@ -43,16 +43,14 @@ fn body_may_expand(cx: &Context<'_>, item: ItemRef) -> bool {
     (from..to).any(|at| matches!(src.kind(at), rustc_lexer::TokenKind::Bang | rustc_lexer::TokenKind::Pound))
 }
 
-/// Parses the body of fixed `item` while the pass can still answer what its macros ask, failing when it asked and did not parse.
-pub(in crate::sema) fn warm_body(cx: &mut Context<'_>, item: ItemRef, param_count: usize, before: (usize, usize)) -> Result<(), String> {
+/// Parses the body of fixed non-sysroot `item` while the pass can still answer what its macros ask, failing when it asked and did not parse.
+pub(in crate::sema) fn warm_body(cx: &mut Context<'_>, item: ItemRef, before: (usize, usize)) -> Result<(), String> {
     if cx.outline.is_fixed(item.krate)
+        && !cx.outline.is_sysroot(item.krate)
         && !cx.store.lookups.skip_warm_sysroot_bodies
         && cx.store.bodies.get(&item).is_none()
         && cx.store.lookups.substrate.is_some()
         && body_may_expand(cx, item)
-        && !(cx.outline.is_sysroot(item.krate)
-            && param_count == 0
-            && (cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never")))
         && let Err(err) = cx.body(item)
         && cx.quiet_mark() != before
     {
@@ -61,21 +59,35 @@ pub(in crate::sema) fn warm_body(cx: &mut Context<'_>, item: ItemRef, param_coun
     Ok(())
 }
 
-/// Flags a fresh eager body of a fixed `instance` that the substrate can keep, so the batch saves it.
+/// Encodes and records a newly inferred fixed `instance` when it is absent from the substrate, so the batch saves it.
 pub(in crate::sema) fn note_fresh(cx: &Context<'_>, instance: Instance, typed: &Typed) {
     let lookups = &cx.store.lookups;
-    let LazyTables::Eager(tables) = &typed.tables else { return };
-    if lookups.has_new_sysroot_instances.load(Ordering::Relaxed)
-        || frozen::instance_keys(cx.outline, &cx.types, instance).is_none()
-        || frozen::is_template(&lookups.summaries, instance.0, tables)
-        || !cx.store.finals.contains_key(&instance)
-    {
+    if !cx.store.finals.contains_key(&instance) {
         return;
     }
-    let (_, key_fn) = frozen::layer_key_fn(cx.outline, &cx.types, instance);
-    if matches!(codec::encode_typed(cx.outline, &cx.types, instance.1, typed, key_fn), Ok(Some(_))) {
-        lookups.has_new_sysroot_instances.store(true, Ordering::Relaxed);
+    let Some((pure_sysroot, item_key, substs_key, bytes)) = frozen::encode_fresh_instance((cx.outline, &cx.types), &lookups.summaries, instance, typed) else {
+        return;
+    };
+    if lookups.substrate.as_ref().is_some_and(|sub| sub.instance_candidates(item_key, substs_key).any(|b| b == bytes.as_ref())) {
+        return;
     }
+    lookups.fresh_instances.insert(instance, (pure_sysroot, item_key, substs_key, bytes));
+    lookups.has_new_sysroot_instances.store(true, Ordering::Relaxed);
+}
+
+/// Encodes and records a newly built fixed `PolySummary` or settled verdict when absent from the substrate.
+pub(in crate::sema) fn note_fresh_summary(cx: &Context<'_>, item: ItemRef, kind: &SummaryKind) {
+    if !cx.outline.is_fixed(item.krate) {
+        return;
+    }
+    let lookups = &cx.store.lookups;
+    let Some(key) = crate::substrate::sysroot_item_key(cx.outline, item) else { return };
+    let Some(bytes) = encode_kind(cx.outline, &cx.types, (item, kind), &lookups.verdicts) else { return };
+    if lookups.substrate.as_ref().is_some_and(|sub| sub.summary(key) == Some(bytes.as_slice())) {
+        return;
+    }
+    lookups.fresh_summaries.insert(item, (cx.outline.is_sysroot(item.krate), key, bytes.into_boxed_slice()));
+    lookups.has_new_sysroot_summaries.store(true, Ordering::Relaxed);
 }
 
 /// The persisted non-polymorphic verdict of fixed `item`.
@@ -84,10 +96,10 @@ pub(in crate::sema) fn frozen_verdict(cx: &Context<'_>, item: ItemRef) -> Option
 }
 
 /// Records the non-polymorphic verdict just built for fixed `item` as persistable when nothing was asked since `before`.
-pub(in crate::sema) fn settle_verdict(cx: &Context<'_>, item: ItemRef, before: (usize, usize)) {
+pub(in crate::sema) fn settle_verdict(cx: &Context<'_>, item: ItemRef, before: (usize, usize), kind: &SummaryKind) {
     if cx.outline.is_fixed(item.krate) && cx.quiet_mark() == before {
         cx.store.lookups.verdicts.insert(item, ());
-        cx.store.lookups.has_new_sysroot_summaries.store(true, Ordering::Relaxed);
+        note_fresh_summary(cx, item, kind);
     }
 }
 

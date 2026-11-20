@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
@@ -89,54 +90,55 @@ pub(super) fn frozen_instance(
     Some((inst, locals, ret, layouts, decoded.drops))
 }
 
-fn try_add_instance(
+pub(super) fn encode_fresh_instance(
     (outline, types): (&Outline, &Types),
+    summaries: &Flight<ItemRef, SummaryKind>,
     (item, substs): Instance,
-    key_fn: KeyFn,
-    encode: impl FnOnce() -> Result<Option<Vec<u8>>>,
-    builder: &mut crate::substrate::SubstrateBuilder,
-) -> Result<()> {
-    if let Some(item_key) = key_fn(outline, item)
-        && let Some(substs_key) = codec::substs_key(outline, types, substs, key_fn)
-        && let Ok(Some(bytes)) = encode()
-    {
-        builder.add_instance(item_key, substs_key, &bytes)?;
+    typed: &Typed,
+) -> Option<(bool, u64, u64, Box<[u8]>)> {
+    if !outline.is_fixed(item.krate) {
+        return None;
     }
-    Ok(())
+    let (pure_sysroot, key_fn) = layer_key_fn(outline, types, (item, substs));
+    let item_key = key_fn(outline, item)?;
+    let substs_key = codec::substs_key(outline, types, substs, key_fn)?;
+    let bytes = match &typed.tables {
+        LazyTables::Poly(inst) if !substs.is_empty() && closure_free(&inst.summary) => {
+            codec::encode_instance(outline, types, substs, inst, &typed.drops, key_fn).ok().flatten()?
+        }
+        LazyTables::Eager(tables) if !is_template(summaries, item, tables) => {
+            codec::encode_typed(outline, types, substs, typed, key_fn).ok().flatten()?
+        }
+        _ => return None,
+    };
+    Some((pure_sysroot, item_key, substs_key, bytes.into_boxed_slice()))
 }
 
 pub(in crate::sema) fn export_sysroot_instances(
-    (outline, types): (&Outline, &Types),
-    (finals, summaries): (&Table<Instance, Arc<Typed>>, &Flight<ItemRef, SummaryKind>),
+    fresh: &Table<Instance, (bool, u64, u64, Box<[u8]>)>,
+    flag: &AtomicBool,
     mut toolchain: Option<&mut crate::substrate::SubstrateBuilder>,
     mut deps: Option<&mut crate::substrate::SubstrateBuilder>,
 ) -> Result<()> {
     let mut err = None;
-    finals.retain(|&(item, substs), typed| {
-        if err.is_some() || !outline.is_fixed(item.krate) {
+    fresh.retain(|_, (pure_sysroot, item_key, substs_key, bytes)| {
+        if err.is_some() {
             return true;
         }
-        let (pure_sysroot, key_fn) = layer_key_fn(outline, types, (item, substs));
-        let target_builder = if pure_sysroot { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
-        let Some(builder) = target_builder else { return true };
-        let added = match &typed.tables {
-            LazyTables::Poly(inst) if !substs.is_empty() && closure_free(&inst.summary) => {
-                try_add_instance((outline, types), (item, substs), key_fn, || codec::encode_instance(outline, types, substs, inst, &typed.drops, key_fn), builder)
-            }
-            LazyTables::Eager(tables) if !is_template(summaries, item, tables) => {
-                try_add_instance((outline, types), (item, substs), key_fn, || codec::encode_typed(outline, types, substs, &**typed, key_fn), builder)
-            }
-            _ => Ok(()),
-        };
-        if let Err(e) = added {
+        let target = if *pure_sysroot { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
+        if let Some(builder) = target
+            && let Err(e) = builder.add_instance(*item_key, *substs_key, bytes)
+        {
             err = Some(e);
+            return true;
         }
-        true
+        false
     });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(()),
+    if let Some(e) = err {
+        return Err(e);
     }
+    flag.store(false, Ordering::Relaxed);
+    Ok(())
 }
 
 struct FrozenFolder<'a, 'c> {

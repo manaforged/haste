@@ -152,9 +152,9 @@ fn report_cases(
     let started = Instant::now();
     let mut build = crate::build::Build::load(workspace, targets)?;
     let result = match (request, out) {
-        (Request::Build, Some(path)) => build.emit_executable(workspace, path),
+        (Request::Build, Some(path)) => build.emit_executable(workspace, path, stats.is_none()),
         (Request::Build, None) if stats.is_none() => build.compile_binary_oneshot(workspace).and_then(|()| build.check(started.elapsed())),
-        _ => crate::serve::finish(&mut build, workspace, (request, args), started),
+        _ => crate::serve::finish(&mut build, workspace, (request, out, args), started),
     };
     if let Some((path, graph_span)) = stats {
         build.write_stats(workspace, graph_span, path)?;
@@ -417,6 +417,16 @@ fn print_meta(meta: Meta) {
     }
 }
 
+fn try_serve(command: Command, root: &std::path::Path, stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>, argv: &[String]) -> Result<Option<i32>> {
+    if stats_json.is_some() || crate::image::watch::enabled() {
+        return Ok(None);
+    }
+    match command {
+        Command::Request(request) => crate::serve::ask(root, request, out, argv),
+        _ => Ok(None),
+    }
+}
+
 /// Runs the haste command line.
 pub fn main() -> Result<()> {
     if let Some(meta) = std::env::args_os().nth(1).and_then(|a| a.to_str().and_then(Meta::from_flag)) {
@@ -433,17 +443,12 @@ pub fn main() -> Result<()> {
         _ => {}
     }
     let root = std::path::absolute(path)?;
+    let abs_out = out.as_deref().map(std::path::absolute).transpose()?;
     let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
-    if stats_json.is_none()
-        && out.is_none()
-        && !crate::image::watch::enabled()
-        && crate::profile() == outline::tree::Profile::Debug
-        && let Command::Request(request) = command
-        && let Some(status) = crate::serve::ask(&root, request, &argv)?
-    {
+    if let Some(status) = try_serve(command, &root, stats_json.as_deref(), abs_out.as_deref(), &argv)? {
         std::process::exit(status);
     }
-    match report(command, &root, &argv, stats_json.as_deref(), out.as_deref())? {
+    match report(command, &root, &argv, stats_json.as_deref(), abs_out.as_deref())? {
         0 => Ok(()),
         status => std::process::exit(status),
     }

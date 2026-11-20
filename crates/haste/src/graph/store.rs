@@ -201,19 +201,24 @@ fn replace_with(path: &Path, stage: impl FnOnce(&Path) -> io::Result<()>) -> io:
     }
     let tmp = fresh(path);
     if let Err(err) = stage(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
+        drop(std::fs::remove_file(&tmp));
         return Err(err);
     }
     std::fs::rename(&tmp, path).inspect_err(|_| drop(std::fs::remove_file(&tmp)))
 }
 
+/// Atomically streams output written by `write` to `path` via a unique sibling temporary file and rename.
+pub fn write_new_with(path: &Path, write: impl FnOnce(&mut io::BufWriter<File>) -> io::Result<()>) -> io::Result<()> {
+    replace_with(path, |tmp| {
+        let mut writer = io::BufWriter::with_capacity(256 * 1024, File::create(tmp)?);
+        write(&mut writer)?;
+        writer.flush()
+    })
+}
+
 /// Atomically writes `bytes` to `path` via a unique sibling temporary file and rename.
 pub fn write_new_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    replace_with(path, |tmp| {
-        let mut file = File::create(tmp)?;
-        file.write_all(bytes)?;
-        Ok(())
-    })
+    write_new_with(path, |writer| writer.write_all(bytes))
 }
 
 /// Atomically writes `bytes` to `path` via a unique sibling temporary file and rename.

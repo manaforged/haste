@@ -104,7 +104,7 @@ fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<I
     main_item(workspace, outline).into_iter().collect()
 }
 
-fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize]) {
+fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize], roots: &[usize]) {
     let mut expanded = fresh.to_vec();
     if crate::profile() == outline::tree::Profile::Release && !fresh.is_empty() && fresh.len() < reached.list.len() {
         let mut dirty = vec![false; reached.list.len()];
@@ -126,6 +126,16 @@ fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reache
     }
     expanded.iter().for_each(|at| drop(broken.remove(at)));
     broken.extend(image.compile(cx, reached, &expanded));
+    if let &[start, main] = roots {
+        let mut tried: rustc_hash::FxHashSet<usize> = expanded.into_iter().collect();
+        loop {
+            let missing: Vec<usize> = image.missing_aot_targets([start, main], reached).into_iter().filter(|idx| !broken.contains_key(idx) && tried.insert(*idx)).collect();
+            if missing.is_empty() {
+                break;
+            }
+            broken.extend(image.compile(cx, reached, &missing));
+        }
+    }
 }
 
 struct SubstrateSlot {
@@ -142,6 +152,18 @@ struct PreBuilders {
     toolchain: crate::substrate::SubstrateBuilder,
     deps: Option<crate::substrate::SubstrateBuilder>,
     workspace: Option<crate::substrate::SubstrateBuilder>,
+}
+
+impl PreBuilders {
+    fn shrink_blobs(&mut self) {
+        self.toolchain.shrink_blob();
+        if let Some(deps) = &mut self.deps {
+            deps.shrink_blob();
+        }
+        if let Some(ws) = &mut self.workspace {
+            ws.shrink_blob();
+        }
+    }
 }
 
 fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
@@ -179,13 +201,13 @@ fn finish_batch(
     (kind, main): (BatchKind, Option<ItemRef>),
     (cases, mut reached): (&[ItemRef], Reached),
     drop_finals: bool,
-    substrate: Option<&SubstrateSlot>,
+    substrate: Option<SubstrateSlot>,
     (mut cx, reach_clock): (sema::Context<'_>, sema::census::Clock),
 ) -> Result<Batch> {
     let mode = kind.mode();
     let reach_span = reach_clock.elapsed();
     let codegen_clock = sema::census::Clock::now();
-    let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate);
+    let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.as_ref());
     let valid: Vec<ItemRef> = match kind {
         BatchKind::Cases => cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect(),
         BatchKind::MainCheck => cases.to_vec(),
@@ -200,15 +222,17 @@ fn finish_batch(
     if drop_finals {
         cx.compact_for_oneshot_codegen();
     }
-    let (image, broken) = if mode == crate::image::ImageMode::Aot && roots.len() == 2 {
+    let (mut image, broken) = if mode == crate::image::ImageMode::Aot && roots.len() == 2 {
         Image::build_aot(&mut cx, &reached, [roots[0], roots[1]])?
     } else {
         Image::build(&mut cx, &reached, mode)?
     };
     let codegen_span = codegen_clock.elapsed();
-    save_batch_substrate(&cx, &image, (drop_finals, kind), substrate, pre_builder);
     let labels = valid.iter().map(|item| cx.name(*item).to_owned()).collect();
-    Ok(Batch { kind, store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
+    let outline = cx.outline;
+    let mut store = cx.release().0;
+    save_batch_substrate((outline, &mut store), &mut image, (drop_finals, kind), substrate, pre_builder);
+    Ok(Batch { kind, store: Some(store), labels, roots, reached, image, broken, reach_span, codegen_span })
 }
 
 fn make_builders(slot: &SubstrateSlot) -> PreBuilders {
@@ -227,60 +251,74 @@ fn export_pre_summaries(cx: &mut sema::Context<'_>, drop_finals: bool, slot: Opt
         eprintln!("haste: cannot export sysroot summaries: {error:#}");
         return None;
     }
+    builders.shrink_blobs();
     Some(builders)
 }
 
 fn save_substrate_layer(
     builder: crate::substrate::SubstrateBuilder,
     (workspace, kind): (u64, BatchKind),
-    existing: Option<&crate::substrate::Substrate>,
-    save: impl FnOnce(&crate::substrate::Substrate) -> Result<PathBuf>,
+    existing: Option<std::sync::Arc<crate::substrate::Substrate>>,
+    save: fn(crate::substrate::SubstrateBuilder) -> Result<Option<PathBuf>>,
 ) -> Result<()> {
     if builder.is_empty() {
         return Ok(());
     }
     let mut builder = builder.consumer(workspace, kind as u32);
     if let Some(ex) = existing {
-        builder.merge_from(ex)?;
+        builder.merge_from(&ex)?;
+        drop(ex);
     }
-    let sub = builder.build()?;
-    if sub.has_entries() {
-        save(&sub)?;
-    }
+    save(builder)?;
     Ok(())
 }
 
-fn save_batch_substrate(
-    cx: &sema::Context<'_>,
-    image: &Image,
+fn finish_oneshot_compact(drop_finals: bool, store: &mut Cache, image: &mut Image) {
+    if drop_finals {
+        store.set_substrate(None);
+        image.compact_for_oneshot_aot();
+    }
+}
+
+fn export_and_save_layers(
+    (outline, store): (&outline::Outline, &mut Cache),
+    image: &mut Image,
     (drop_finals, kind): (bool, BatchKind),
-    slot: Option<&SubstrateSlot>,
+    mut slot: SubstrateSlot,
+    mut builders: PreBuilders,
+) -> Result<()> {
+    if !drop_finals {
+        store.export_sysroot_summaries(outline, Some(&mut builders.toolchain), builders.deps.as_mut())?;
+    }
+    if image.has_new_frozen_stencils() {
+        image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())?;
+    }
+    image.export_inline_meta(Some(&mut builders.toolchain), builders.deps.as_mut())?;
+    finish_oneshot_compact(drop_finals, store, image);
+    let workspace = slot.workspace_key.or(slot.deps_key).unwrap_or(slot.toolchain_key);
+    if let Some(ws_builder) = builders.workspace {
+        save_substrate_layer(ws_builder, (workspace, kind), slot.workspace.take(), crate::substrate::SubstrateBuilder::save_workspace)?;
+    }
+    if let Some(deps_builder) = builders.deps {
+        save_substrate_layer(deps_builder, (workspace, kind), slot.deps.take(), crate::substrate::SubstrateBuilder::save_deps)?;
+    }
+    save_substrate_layer(builders.toolchain, (workspace, kind), slot.toolchain.take(), crate::substrate::SubstrateBuilder::save_toolchain)
+}
+
+fn save_batch_substrate(
+    (outline, store): (&outline::Outline, &mut Cache),
+    image: &mut Image,
+    (drop_finals, kind): (bool, BatchKind),
+    slot: Option<SubstrateSlot>,
     pre_builder: Option<PreBuilders>,
 ) {
-    let Some(slot) = slot else { return };
-    if !image.has_new_frozen_stencils() && !image.has_new_inline_meta() && pre_builder.is_none() && (drop_finals || !cx.store().has_new_sysroot_summaries()) {
+    let has_new = image.has_new_frozen_stencils() || image.has_new_inline_meta() || pre_builder.is_some() || (!drop_finals && store.has_new_sysroot_summaries());
+    let Some(slot) = slot.filter(|_| has_new) else {
+        finish_oneshot_compact(drop_finals, store, image);
         return;
-    }
-    let mut builders = pre_builder.unwrap_or_else(|| make_builders(slot));
-    let save_res = (|| -> Result<()> {
-        if !drop_finals {
-            cx.store().export_sysroot_summaries(cx.outline, Some(&mut builders.toolchain), builders.deps.as_mut())?;
-        }
-        if image.has_new_frozen_stencils() {
-            image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())?;
-        }
-        image.export_inline_meta(Some(&mut builders.toolchain), builders.deps.as_mut())?;
-        let workspace = slot.workspace_key.or(slot.deps_key).unwrap_or(slot.toolchain_key);
-        save_substrate_layer(builders.toolchain, (workspace, kind), slot.toolchain.as_deref(), crate::substrate::Substrate::save_toolchain)?;
-        if let Some(deps_builder) = builders.deps {
-            save_substrate_layer(deps_builder, (workspace, kind), slot.deps.as_deref(), crate::substrate::Substrate::save_deps)?;
-        }
-        if let Some(ws_builder) = builders.workspace {
-            save_substrate_layer(ws_builder, (workspace, kind), slot.workspace.as_deref(), crate::substrate::Substrate::save_workspace)?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = save_res {
+    };
+    let builders = pre_builder.unwrap_or_else(|| make_builders(&slot));
+    if let Err(error) = export_and_save_layers((outline, store), image, (drop_finals, kind), slot, builders) {
         eprintln!("haste: cannot save substrate: {error:#}");
     }
 }
@@ -297,7 +335,7 @@ impl Batch {
         let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
         let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, kind) };
-        let substrate = open_batch_substrate(workspace);
+        let mut substrate = open_batch_substrate(workspace);
         let mut cache = Cache::default();
         cache.set_warm_sysroot_bodies(mode != crate::image::ImageMode::Check);
         if let Some(slot) = &substrate
@@ -305,7 +343,7 @@ impl Batch {
         {
             cache.set_substrate(Some(std::sync::Arc::clone(sub)));
         }
-        crate::macros::reach_resolved_with_cache(
+        let batch = crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
             |cx| match (kind, main) {
@@ -313,8 +351,10 @@ impl Batch {
                 (BatchKind::Cases, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
                 _ => root_insts.clone(),
             },
-            |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, substrate.as_ref(), (cx, reach_clock)),
-        )
+            |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, substrate.take(), (cx, reach_clock)),
+        )?;
+        crate::substrate::save_fixed_files(workspace, crate::host_target().triple, &compilation.outline);
+        Ok(batch)
     }
 
     /// Writes this ahead-of-time batch as a standalone executable to `path`, unless a function it reaches failed to compile.
@@ -339,7 +379,7 @@ impl Batch {
         if !cx.resolved() {
             return false;
         }
-        recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh);
+        recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh, &self.roots);
         self.store = Some(cx.release().0);
         true
     }
@@ -351,17 +391,26 @@ impl Batch {
         let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
         let (mut cases, mut roots) = batch_roots(workspace, &compilation.outline, self.kind);
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
-        if self.kind == BatchKind::Cases {
-            cases.retain(|&item| sema::infer::is_case_sig(&mut cx, item));
-            roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
+        match self.kind {
+            BatchKind::Cases => {
+                cases.retain(|&item| sema::infer::is_case_sig(&mut cx, item));
+                roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
+            }
+            BatchKind::MainAot => {
+                let Some(&main) = cases.first() else { return false };
+                let Ok(pair) = sema::reach::main_roots(&mut cx, main) else { return false };
+                cases.clear();
+                roots = pair.to_vec();
+            }
+            BatchKind::MainCheck => {}
         }
         let fresh = reach_anew(&mut cx, &mut self.reached, &touched, &roots);
         if !cx.resolved() {
             return false;
         }
-        recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh);
         self.labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
         self.roots = roots.iter().map(|root| self.reached.index[root]).collect();
+        recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh, &self.roots);
         self.store = Some(cx.release().0);
         true
     }
@@ -550,10 +599,10 @@ impl Build {
     }
 
     /// Compiles `main` and `std::rt::lang_start` into an AOT `Image` and writes a standalone executable to `path`.
-    pub(crate) fn emit_executable(&mut self, workspace: &graph::Workspace, path: &std::path::Path) -> Result<i32> {
+    pub(crate) fn emit_executable(&mut self, workspace: &graph::Workspace, path: &std::path::Path, drop_finals: bool) -> Result<i32> {
         let started = Instant::now();
-        if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, false)?);
+        if self.binary.as_ref().is_none_or(|bin| bin.kind != BatchKind::MainAot) {
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, drop_finals)?);
         }
         if !self.binary.as_ref().context("the binary is not compiled")?.broken.is_empty() {
             crate::cli::failure_lines(&self.failures()?).iter().for_each(|line| eprintln!("{line}"));
@@ -614,7 +663,7 @@ impl Build {
 
 /// Compiles the program whose `main` is `main` ahead of time and writes it as a standalone executable to `path`.
 pub(crate) fn emit_main(workspace: &graph::Workspace, compilation: &mut Compilation, main: ItemRef, path: &std::path::Path) -> Result<()> {
-    Batch::rooted(workspace, compilation, (BatchKind::MainAot, Some(main)), false)?.write_aot(compilation, path)
+    Batch::rooted(workspace, compilation, (BatchKind::MainAot, Some(main)), true)?.write_aot(compilation, path)
 }
 
 /// What changed in the files of `stamps` since their last stamps: the `(crate, file)` slots whose function bodies changed, which `outline` now holds, and the crates to read again; fails when a file does not read.

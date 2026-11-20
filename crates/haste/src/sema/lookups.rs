@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -99,6 +99,8 @@ pub(super) struct Lookups {
     pub(super) assoc_types: Table<(ItemRef, ty::Ty, super::substs::Substs, ItemRef, super::substs::Substs), ty::Ty>,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
     pub(super) verdicts: Table<ItemRef, ()>,
+    pub(super) fresh_summaries: Table<ItemRef, (bool, u64, Box<[u8]>)>,
+    pub(super) fresh_instances: Table<reach::Instance, (bool, u64, u64, Box<[u8]>)>,
     pub(super) has_new_sysroot_summaries: Arc<AtomicBool>,
     pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
@@ -119,38 +121,44 @@ impl Lookups {
         self.reconcile(outline, None);
     }
 
+    fn reset_after_names(&mut self, outline: &Outline) {
+        let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
+        let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
+        let projections = self.projections.retained(|_, found| found.is_some());
+        *self = Lookups {
+            modules: std::mem::take(&mut self.modules),
+            heads,
+            owners: std::mem::take(&mut self.owners),
+            trait_defs: std::mem::take(&mut self.trait_defs),
+            discriminants: std::mem::take(&mut self.discriminants),
+            state: Arc::clone(&self.state),
+            drops: std::mem::take(&mut self.drops),
+            unpins: std::mem::take(&mut self.unpins),
+            freezes: std::mem::take(&mut self.freezes),
+            glues: std::mem::take(&mut self.glues),
+            fields: std::mem::take(&mut self.fields),
+            forms: self.forms.retained(|_, found| found.is_some()),
+            futures: std::mem::take(&mut self.futures),
+            scope_traits: self.scope_traits.retained(|home, _| outline.is_fixed(home.krate)),
+            impl_traits: std::mem::take(&mut self.impl_traits),
+            selections,
+            projections,
+            summaries: std::mem::take(&mut self.summaries),
+            verdicts: std::mem::take(&mut self.verdicts),
+            fresh_summaries: std::mem::take(&mut self.fresh_summaries),
+            fresh_instances: std::mem::take(&mut self.fresh_instances),
+            has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
+            has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
+            substrate: self.substrate.clone(),
+            file_index: Arc::clone(&self.file_index),
+            skip_warm_sysroot_bodies: self.skip_warm_sysroot_bodies,
+            ..Lookups::default()
+        };
+    }
+
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
         if matches!(answer, Some(Answer::Names)) {
-            let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
-            let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
-            let projections = self.projections.retained(|_, found| found.is_some());
-            *self = Lookups {
-                modules: std::mem::take(&mut self.modules),
-                heads,
-                owners: std::mem::take(&mut self.owners),
-                trait_defs: std::mem::take(&mut self.trait_defs),
-                discriminants: std::mem::take(&mut self.discriminants),
-                state: Arc::clone(&self.state),
-                drops: std::mem::take(&mut self.drops),
-                unpins: std::mem::take(&mut self.unpins),
-                freezes: std::mem::take(&mut self.freezes),
-                glues: std::mem::take(&mut self.glues),
-                fields: std::mem::take(&mut self.fields),
-                forms: self.forms.retained(|_, found| found.is_some()),
-                futures: std::mem::take(&mut self.futures),
-                scope_traits: self.scope_traits.retained(|home, _| outline.is_fixed(home.krate)),
-                impl_traits: std::mem::take(&mut self.impl_traits),
-                selections,
-                projections,
-                summaries: std::mem::take(&mut self.summaries),
-                verdicts: std::mem::take(&mut self.verdicts),
-                has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
-                has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
-                substrate: self.substrate.clone(),
-                file_index: Arc::clone(&self.file_index),
-                skip_warm_sysroot_bodies: self.skip_warm_sysroot_bodies,
-                ..Lookups::default()
-            };
+            self.reset_after_names(outline);
         }
         let loaded: Vec<crate::outline::tree::CrateExtent> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
         let mut guard = write_lock(&self.state.loaded);
@@ -196,6 +204,10 @@ impl Lookups {
         }
         if reset_fixed {
             self.file_index = Arc::new(std::sync::OnceLock::new());
+            self.fresh_summaries.clear();
+            self.fresh_instances.clear();
+            self.has_new_sysroot_summaries.store(false, Ordering::Relaxed);
+            self.has_new_sysroot_instances.store(false, Ordering::Relaxed);
         }
         self.trait_calls.clear();
         self.assoc_types.clear();
@@ -218,8 +230,8 @@ impl Cache {
 
     /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
     pub fn has_new_sysroot_summaries(&self) -> bool {
-        self.lookups.has_new_sysroot_summaries.load(std::sync::atomic::Ordering::Relaxed)
-            || self.lookups.has_new_sysroot_instances.load(std::sync::atomic::Ordering::Relaxed)
+        self.lookups.has_new_sysroot_summaries.load(Ordering::Relaxed)
+            || self.lookups.has_new_sysroot_instances.load(Ordering::Relaxed)
     }
 
     /// Whether each type is structurally `Unpin`, with the depth its answer looked below it.
@@ -237,31 +249,32 @@ impl Cache {
         self.lookups.substrate.as_ref()
     }
 
-    /// Encodes all settled fixed `PolySummary` and concrete instance entries into `toolchain` and `deps` builders.
+    /// Drains newly built fixed `PolySummary` and concrete instance entries into `toolchain` and `deps` builders.
     pub fn export_sysroot_summaries(
         &self,
-        outline: &Outline,
+        _outline: &Outline,
         mut toolchain: Option<&mut crate::substrate::SubstrateBuilder>,
         mut deps: Option<&mut crate::substrate::SubstrateBuilder>,
     ) -> Result<()> {
         let mut err = None;
-        self.lookups.summaries.for_each_ready(|&item, kind| {
-            if err.is_some() || !outline.is_fixed(item.krate) {
-                return;
+        self.lookups.fresh_summaries.retain(|_, (is_sysroot, key, bytes)| {
+            if err.is_some() {
+                return true;
             }
-            let target_builder = if outline.is_sysroot(item.krate) { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
-            if let Some(builder) = target_builder
-                && let Some(key) = crate::substrate::sysroot_item_key(outline, item)
-                && let Some(bytes) = summary::thaw::encode_kind(outline, &self.types, (item, kind), &self.lookups.verdicts)
-                && let Err(e) = builder.add_summary(key, &bytes)
+            let target = if *is_sysroot { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
+            if let Some(builder) = target
+                && let Err(e) = builder.add_summary(*key, bytes)
             {
                 err = Some(e);
+                return true;
             }
+            false
         });
         if let Some(e) = err {
             return Err(e);
         }
-        summary::frozen::export_sysroot_instances((outline, &self.types), (&self.finals, &self.lookups.summaries), toolchain, deps)
+        self.lookups.has_new_sysroot_summaries.store(false, Ordering::Relaxed);
+        summary::frozen::export_sysroot_instances(&self.lookups.fresh_instances, &self.lookups.has_new_sysroot_instances, toolchain, deps)
     }
 
     /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.

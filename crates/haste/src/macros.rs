@@ -76,6 +76,7 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
 /// Loads the member crates' roots, resolves their names and expands their procedural macro calls, reading of other crates only what those lookups reach, then drops the macro expander.
 pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, &[]);
+    crate::substrate::preload_fixed_files(workspace, &targets.target.triple, &outline);
     let selected: Vec<bool> = (0..outline.crates.len())
         .map(|krate| outline.package(workspace, krate).sysroot || workspace.graph.members.contains(&workspace.graph.units[outline.roots[krate].unit].package))
         .collect();

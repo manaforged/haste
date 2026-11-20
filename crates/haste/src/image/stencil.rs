@@ -343,6 +343,9 @@ impl Image {
     pub(super) fn reset_caches(&mut self) {
         self.bodies.clear();
         self.pass.stencils.clear();
+        if let Some(aot) = self.aot() {
+            lock(aot).stencils.clear();
+        }
     }
 
     pub(super) fn cached_aot_template(&self, item: ItemRef, fp: FootprintId) -> Option<CachedAotTemplate> {
