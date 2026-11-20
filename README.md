@@ -15,20 +15,20 @@ cargo build --release -p haste
 ./target/release/haste --release build -o ./hello examples/hello
 ```
 
-If a workspace has no `Cargo.lock`, run `cargo generate-lockfile` in it first.
-Build scripts (`build.rs`), declarative and procedural macros, `const fn`,
-`async`/`await`, generics, trait objects, SIMD, and C FFI all run inside haste.
-Unchanged build script outputs, macro expansions, standard library summaries,
-and compiled workspace stencils stay in `~/.cache/haste`, keyed by their
-inputs, so repeated builds rebuild only edited items and skip unchanged
-workspaces.
+If a workspace has no `Cargo.lock`, haste runs `cargo generate-lockfile`
+automatically on first use. Build scripts (`build.rs`), declarative and
+procedural macros, `const fn`, `async`/`await`, generics, trait objects, SIMD,
+and C FFI all run inside haste. Unchanged build script outputs, macro
+expansions, standard library summaries, and compiled workspace stencils stay in
+`~/.cache/haste`, keyed by their inputs, so repeated builds rebuild only edited
+items and skip unchanged workspaces.
 
 haste is experimental. There is no tagged release yet, and the command line can change.
 
 ## Commands
 
 ```text
-haste [-p PKG] [--bin NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] build|test|run|serve|prep [PATH] [--] [ARGS...]
+haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] build|test|run|serve|prep [PATH] [--] [ARGS...]
 haste clean
 haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]
 haste [--release] debug code PATH DIR
@@ -39,8 +39,8 @@ haste -V|--version | -h|--help
 
 | Command | Does |
 | --- | --- |
-| `run [PATH] [--] [ARGS...]` | Runs the workspace binary's `main` with `ARGS`. |
-| `test [PATH] [--] [FILTER...]` | Runs `#[test]` functions (with `#[cfg(test)]`, `[dev-dependencies]`, `#[ignore]`, and `#[should_panic]`), or `fn(i64) -> i64` `case_*` harness functions when no `#[test]` functions are present. |
+| `run [PATH] [--] [ARGS...]` | Runs the workspace binary or `--example` `main` with `ARGS`. |
+| `test [PATH] [--] [FILTER...]` | Runs unit and integration (`tests/*.rs`) `#[test]` functions (with `#[cfg(test)]`, `[dev-dependencies]`, `#[ignore]`, and `#[should_panic]`), or `fn(i64) -> i64` `case_*` harness functions when no `#[test]` functions are present. |
 | `build [-o PATH] [PATH]` | Type-checks the workspace and lowers reached code, or writes a standalone executable when `-o PATH` is given. |
 | `serve [PATH]` | Keeps the workspace loaded in memory and answers `build`, `test`, and `run` requests for `PATH`, rebuilding only what edited files affect. |
 | `prep [PATH]` | Pre-compiles dependencies that `main` reaches into the prepared library cache for `--prepared` (**x86-64 Linux only**). |
@@ -52,7 +52,8 @@ haste -V|--version | -h|--help
 - `-V`, `--version`: Prints the compiler version and exits.
 - `-h`, `--help`: Prints command usage and exits.
 - `-p PKG`, `--package PKG`: Selects a specific workspace package to build or run.
-- `--bin NAME`: Selects which binary target to build or run when a package defines multiple binaries.
+- `--bin NAME`: Selects which binary target (`src/main.rs`, `src/bin/*.rs`, or `[[bin]]`) to build or run.
+- `--example NAME`: Selects which example target (`examples/*.rs` or `[[example]]`) to build or run (with `[dev-dependencies]`).
 - `-F FEATURES`, `--features FEATURES`: Comma- or space-separated list of Cargo features to enable (repeatable).
 - `--all-features`: Enables all features on the selected workspace packages.
 - `--no-default-features`: Disables the `default` feature on the selected workspace packages.

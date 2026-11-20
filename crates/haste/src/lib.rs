@@ -63,6 +63,7 @@ fn set_profile(profile: outline::tree::Profile) {
 pub(crate) struct Selection {
     pub package: Option<String>,
     pub bin: Option<String>,
+    pub example: Option<String>,
     pub features: Vec<String>,
     pub all_features: bool,
     pub no_default_features: bool,

@@ -341,7 +341,7 @@ fn usage() -> String {
     let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().filter(|(cmd, _)| !matches!(cmd, Command::Clean)).map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [-p PKG] [--bin NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -431,6 +431,10 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
             "--bin" => {
                 args.next();
                 selection.bin = Some(next_str(args).context("--bin takes a binary name")?);
+            }
+            "--example" => {
+                args.next();
+                selection.example = Some(next_str(args).context("--example takes an example name")?);
             }
             "-F" | "--features" => {
                 args.next();

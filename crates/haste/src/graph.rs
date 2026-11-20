@@ -169,8 +169,21 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
 }
 
 pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
-    let found = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file());
-    found.map(Path::to_owned).with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
+    if let Some(found) = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file()) {
+        return Ok(found.to_owned());
+    }
+    let manifest_dir = root.ancestors().find(|dir| dir.join(MANIFEST_FILE).is_file()).with_context(|| format!("no {LOCK_FILE} or {MANIFEST_FILE} at or above {}", root.display()))?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
+    let out = std::process::Command::new(cargo)
+        .args(["generate-lockfile", "--quiet", "--manifest-path"])
+        .arg(manifest_dir.join(MANIFEST_FILE))
+        .output()
+        .with_context(|| format!("no {LOCK_FILE} at or above {} and failed to run `cargo generate-lockfile`", root.display()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("`cargo generate-lockfile` failed: {}", stderr.trim());
+    }
+    root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file()).map(Path::to_owned).with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
 }
 
 /// The lock file, workspace manifest, root manifest, and every local package's manifest and build script.

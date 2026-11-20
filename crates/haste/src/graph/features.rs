@@ -46,7 +46,7 @@ impl Resolver<'_> {
         let Unit { package, side, .. } = self.units[unit];
         let target = self.targets.of(side);
         let manifest = &self.packages[package].manifest;
-        let dev = crate::test_mode() && self.members.contains(&package);
+        let dev = (crate::test_mode() || crate::selection().example.is_some()) && self.members.contains(&package);
         let used = move |dep: &&Dep| match dep.kind {
             Kind::Normal => true,
             Kind::Build => manifest.build.is_some(),

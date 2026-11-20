@@ -97,10 +97,14 @@ fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, kind: B
     (items, roots)
 }
 
-/// The `main` of the selected member binary (or the first member binary when `--bin` is unset).
+/// The `main` of the selected member binary or example (or the first member binary when neither `--bin` nor `--example` is set).
 pub(crate) fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
-    let wanted = crate::selection().bin.as_deref();
-    let krate = outline.members(workspace).find(|&krate| outline.roots[krate].role == outline::Role::Bin && wanted.is_none_or(|name| outline.roots[krate].name == name))?;
+    let sel = crate::selection();
+    let (role, wanted) = match &sel.example {
+        Some(name) => (outline::Role::Example, Some(name.as_str())),
+        None => (outline::Role::Bin, sel.bin.as_deref()),
+    };
+    let krate = outline.members(workspace).find(|&krate| outline.roots[krate].role == role && wanted.is_none_or(|name| outline.roots[krate].name == name))?;
     outline.main(krate)
 }
 

@@ -40,6 +40,8 @@ pub struct Manifest {
     pub lib_name: Option<String>,
     pub proc_macro: bool,
     pub bins: Vec<(String, PathBuf)>,
+    pub examples: Vec<(String, PathBuf)>,
+    pub tests: Vec<(String, PathBuf)>,
     pub features: BTreeMap<String, Vec<String>>,
     pub deps: Vec<Dep>,
 }
@@ -160,19 +162,48 @@ fn lib_of(dir: &Path, root: &Table) -> (Option<PathBuf>, bool) {
     (path, proc_macro)
 }
 
-fn bins_of(dir: &Path, name: &str, root: &Table, package: &Table) -> Vec<(String, PathBuf)> {
-    let listed = root.get("bin").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_table);
-    let mut bins: Vec<(String, PathBuf)> = listed
-        .filter_map(|bin| {
-            let bin_name = text(bin, "name")?.to_owned();
-            let path = text(bin, "path").map_or_else(|| dir.join(format!("src/bin/{bin_name}.rs")), |path| dir.join(path));
-            Some((bin_name, path))
+fn targets_of(dir: &Path, root: &Table, package: &Table, (table_key, auto_key, folder): (&str, &str, &str)) -> Vec<(String, PathBuf)> {
+    let listed = root.get(table_key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_table);
+    let mut found: Vec<(String, PathBuf)> = listed
+        .filter_map(|entry| {
+            let target_name = text(entry, "name")?.to_owned();
+            let path = text(entry, "path").map_or_else(|| dir.join(format!("{folder}/{target_name}.rs")), |path| dir.join(path));
+            Some((target_name, path))
         })
         .collect();
+    if !flag(package, &[auto_key]).unwrap_or(true) {
+        return found;
+    }
+    let Ok(entries) = std::fs::read_dir(dir.join(folder)) else {
+        return found;
+    };
+    let mut auto: Vec<(String, PathBuf)> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter_map(|path| {
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                Some((path.file_stem()?.to_str()?.to_owned(), path))
+            } else if path.is_dir() && path.join("main.rs").is_file() {
+                Some((path.file_name()?.to_str()?.to_owned(), path.join("main.rs")))
+            } else {
+                None
+            }
+        })
+        .collect();
+    auto.sort();
+    for (name, path) in auto {
+        if !found.iter().any(|(_, existing)| *existing == path) {
+            found.push((name, path));
+        }
+    }
+    found
+}
+
+fn bins_of(dir: &Path, name: &str, root: &Table, package: &Table) -> Vec<(String, PathBuf)> {
+    let mut bins = targets_of(dir, root, package, ("bin", "autobins", "src/bin"));
     let auto = flag(package, &["autobins"]).unwrap_or(true);
     let main = dir.join("src/main.rs");
     if auto && main.is_file() && !bins.iter().any(|(_, path)| *path == main) {
-        bins.push((name.to_owned(), main));
+        bins.insert(0, (name.to_owned(), main));
     }
     bins
 }
@@ -224,6 +255,8 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
         lib_name: root.get("lib").and_then(Value::as_table).and_then(|lib| text(lib, "name")).map(str::to_owned),
         proc_macro,
         bins: bins_of(dir, &name, root, package),
+        examples: targets_of(dir, root, package, ("example", "autoexamples", "examples")),
+        tests: targets_of(dir, root, package, ("test", "autotests", "tests")),
         features: features_of(root),
         deps: all_deps(&scope, root)?,
         name,
