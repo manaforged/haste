@@ -95,17 +95,28 @@ haste -V|--version | -h|--help
 
 ## Benchmarks
 
-Run `bash scripts/bench.sh` to reproduce these numbers on your machine (comparing `haste` against `cargo` / `rustc` on identical outputs).
+Run `bash scripts/bench.sh` to reproduce these numbers on your machine. Every
+workload verifies bit-identical output against `rustc -C opt-level=3` before
+timing.
 
 Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
 
-| Benchmark | haste | cargo / rustc |
+### Build speed (`tests/diff`, 124 functions)
+
+| Benchmark | haste | cargo |
 | --- | ---: | ---: |
-| `tests/diff` (124 fns) single-line edit rebuild | 311 ms | 673 ms |
-| `tests/diff` unchanged no-op build | 24 ms | 37 ms |
-| `tests/diff` cold debug build | 318 ms | 175 ms |
-| `tests/diff` `--release` AOT build | 3510 ms | 972 ms |
-| `tests/diff` `--release` binary runtime (identical output) | 26 ms | 26 ms |
+| Single-line edit rebuild | 300 ms | 496 ms |
+| Unchanged no-op build | 21 ms | 32 ms |
+| Cold debug build | 296 ms | 224 ms |
+
+### AOT codegen runtime (`haste --release` vs `rustc -C opt-level=3`, median of 5)
+
+| Workload | haste --release | rustc -O3 | Ratio | Output |
+| --- | ---: | ---: | ---: | --- |
+| `sha256` (250k blocks) | 75 ms | 85 ms | 0.88x | exact match (`7333157476866902348`) |
+| `sort` (500k quicksort + bsearch) | 53 ms | 53 ms | 1.00x | exact match (`8647866321337317866`) |
+| `sieve` (4M primes) | 37 ms | 32 ms | 1.16x | exact match (`544501644261`) |
+| `scan` (JSON-like byte scanner) | 35 ms | 27 ms | 1.30x | exact match (`80005120000`) |
 
 ## Check against rustc
 
