@@ -376,11 +376,45 @@ fn unroll_self_dynamic(
     let unrolled_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
     func.blocks.push(BlockData { params: guard_params.clone(), insts: Vec::new() });
     func.blocks.push(BlockData { params: unrolled_params.clone(), insts: Vec::new() });
+    let iv_param = func.blocks[b].params[counted_info.iv_idx];
+    let iv_back = back_args[counted_info.iv_idx];
+    let parallel_strides = (const_stride.is_none()
+        && body_insts.iter().any(|&i| {
+            let data = &func.insts[i.index()];
+            data.result == Some(iv_back)
+                && matches!(data.op, Op::Binary(Binary::Iadd, a, b) if (a == iv_param && b == counted_info.stride) || (a == counted_info.stride && b == iv_param))
+        }))
+    .then(|| {
+        let mut strides = vec![counted_info.stride];
+        for k in 2..=(factor as usize) {
+            let prev = strides[k - 2];
+            let next = func.value(counted_info.iv_ty);
+            let add = func.add(Op::Binary(Binary::Iadd, prev, counted_info.stride), Some(next));
+            func.blocks[guard.index()].insts.push(add);
+            strides.push(next);
+        }
+        strides
+    });
     let safe_limit = emit_dynamic_guard(func, guard, &counted_info, (const_stride, factor), (head, unrolled, guard_params));
+    let iv_base = unrolled_params[counted_info.iv_idx];
     let mut cur_args = unrolled_params;
-    for _ in 0..factor {
+    for step in 0..(factor as usize) {
         let mut map: Vec<(Value, Value)> = func.blocks[b].params.iter().copied().zip(cur_args.iter().copied()).collect();
-        clone_body(func, &body_insts, unrolled, &mut map);
+        if let Some(strides) = &parallel_strides {
+            for &orig_inst in &body_insts {
+                let data = &func.insts[orig_inst.index()];
+                if data.result == Some(iv_back) {
+                    let nr = func.value_like(iv_back);
+                    map.push((iv_back, nr));
+                    let ni = func.add(Op::Binary(Binary::Iadd, iv_base, strides[step]), Some(nr));
+                    func.blocks[unrolled.index()].insts.push(ni);
+                } else {
+                    clone_body(func, &[orig_inst], unrolled, &mut map);
+                }
+            }
+        } else {
+            clone_body(func, &body_insts, unrolled, &mut map);
+        }
         cur_args = back_args.iter().map(|&v| remap_val(&map, v)).collect();
     }
     let loop_cond = func.value(Type::I8);

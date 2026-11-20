@@ -279,10 +279,10 @@ fn bitmask_layout(plan: BitmaskPlan) -> TableLayout {
 fn emit_bit(func: &mut Function, (word, diff): (Value, Value), insts: &mut Vec<Inst>) -> Value {
     let shifted = func.value(Type::I64);
     insts.push(func.add(Op::Binary(Binary::Ushr, word, diff), Some(shifted)));
-    let (one, bit, bit8) = (func.value(Type::I64), func.value(Type::I64), func.value(Type::I8));
-    insts.push(func.add(Op::Const(1), Some(one)));
-    insts.push(func.add(Op::Binary(Binary::Band, shifted, one), Some(bit)));
-    insts.push(func.add(Op::Convert(Convert::Ireduce, bit), Some(bit8)));
+    let (shifted8, one8, bit8) = (func.value(Type::I8), func.value(Type::I8), func.value(Type::I8));
+    insts.push(func.add(Op::Convert(Convert::Ireduce, shifted), Some(shifted8)));
+    insts.push(func.add(Op::Const(1), Some(one8)));
+    insts.push(func.add(Op::Binary(Binary::Band, shifted8, one8), Some(bit8)));
     bit8
 }
 
