@@ -70,7 +70,7 @@ haste -V|--version | -h|--help
 
 ## Requirements and environment
 
-- Linux on x86-64 (`x86_64-unknown-linux-gnu`) or macOS on Apple Silicon (`aarch64-apple-darwin`).
+- Linux on x86-64 (`x86_64-unknown-linux-gnu`), Linux on ARM64 (`aarch64-unknown-linux-gnu`), or macOS on Apple Silicon (`aarch64-apple-darwin`).
 - Rust 1.88 or newer with the `rust-src` component installed (`rustup component add rust-src`).
 - On macOS, `codesign` (included with macOS / Xcode Command Line Tools) for ad-hoc signing standalone AOT executables.
 - A C compiler (`$CC`, defaulting to `cc`) when building workspaces that link native C libraries.
@@ -110,7 +110,7 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 
 ## Limits
 
-- haste compiles only for the host (`x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`). Windows and cross-compilation are not supported.
+- haste compiles only for the host (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, or `aarch64-apple-darwin`). Windows and cross-compilation are not supported yet.
 - haste performs name resolution, type inference, trait selection, and move/drop tracking, but does not run a borrow checker yet. Use `cargo check` or `rustc` in CI to verify lifetime and aliasing rules.
 - `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` (`Termination`) `#[test]` functions (not `#[tokio::test]` macro suites that depend on custom harnesses).
 - `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
