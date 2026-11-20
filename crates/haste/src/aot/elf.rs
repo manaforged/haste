@@ -75,20 +75,24 @@ struct ElfSections {
 
 /// Writes the symbol table, string tables, optional DWARF line table, and ELF section headers.
 fn write_symbols(out: &mut Buf, exe: &Executable, sec: &ElfSections, (strtab, fn_strx, prelude, lines): (&[u8], &[u32], &[(usize, usize, u32)], &[u8])) {
-    let nsyms = 1 + fn_strx.len() + prelude.len();
+    let has_syms = !exe.symbols.is_empty();
+    let nsyms = if has_syms { 1 + fn_strx.len() + prelude.len() } else { 0 };
     out.0.resize(sec.symtab_off, 0);
-    out.bytes(&[0; 24]);
-    for &(off, size, strx) in prelude {
-        out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
-        out.u64s(&[sec.rx_base + off as u64, size as u64]);
+    let mut strtab_off = sec.symtab_off;
+    if has_syms {
+        out.bytes(&[0; 24]);
+        for &(off, size, strx) in prelude {
+            out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
+            out.u64s(&[sec.rx_base + off as u64, size as u64]);
+        }
+        for (at, (&strx, (off, _))) in fn_strx.iter().zip(&exe.symbols).enumerate() {
+            let end = exe.symbols.get(at + 1).map_or(exe.text.len() as u32, |(next, _)| *next);
+            out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
+            out.u64s(&[sec.text_va + u64::from(*off), u64::from(end - off)]);
+        }
+        strtab_off = out.pos();
+        out.bytes(strtab);
     }
-    for (at, (&strx, (off, _))) in fn_strx.iter().zip(&exe.symbols).enumerate() {
-        let end = exe.symbols.get(at + 1).map_or(exe.text.len() as u32, |(next, _)| *next);
-        out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
-        out.u64s(&[sec.text_va + u64::from(*off), u64::from(end - off)]);
-    }
-    let strtab_off = out.pos();
-    out.bytes(strtab);
     let names_off = out.pos();
     out.bytes(SECTION_NAMES);
     let lines_off = out.pos();
@@ -96,14 +100,17 @@ fn write_symbols(out: &mut Buf, exe: &Executable, sec: &ElfSections, (strtab, fn
     out.align(8);
     out.bytes(&[0; 64]);
     write_shdr(out, [1, 1, 0, 0], [6, sec.rx_base + sec.exec.0 as u64, sec.exec.0 as u64, (sec.exec.1 - sec.exec.0) as u64, 16, 0]);
-    write_shdr(out, [7, 2, 3, nsyms as u32], [0, 0, sec.symtab_off as u64, (nsyms * 24) as u64, 8, 24]);
-    write_shdr(out, [15, 3, 0, 0], [0, 0, strtab_off as u64, strtab.len() as u64, 1, 0]);
+    if has_syms {
+        write_shdr(out, [7, 2, 3, nsyms as u32], [0, 0, sec.symtab_off as u64, (nsyms * 24) as u64, 8, 24]);
+        write_shdr(out, [15, 3, 0, 0], [0, 0, strtab_off as u64, strtab.len() as u64, 1, 0]);
+    }
     write_shdr(out, [23, 3, 0, 0], [0, 0, names_off as u64, SECTION_NAMES.len() as u64, 1, 0]);
     write_shdr(out, [33, 1, 0, 0], [2, ELF_BASE + sec.ro.0 as u64, sec.ro.0 as u64, sec.ro.1 as u64, 16, 0]);
     write_shdr(out, [41, 1, 0, 0], [3, sec.rw.0, sec.rw.1 as u64, sec.rw.2 as u64, 8, 0]);
     write_shdr(out, [47, 8, 0, 0], [3, sec.bss.0, sec.bss.1 as u64, sec.bss.2 as u64, 16, 0]);
     write_shdr(out, [52, 3, 0, 0], [2, ELF_BASE + sec.dynstr.0 as u64, sec.dynstr.0 as u64, sec.dynstr.1 as u64, 1, 0]);
-    write_shdr(out, [60, 6, 8, 0], [3, sec.dynamic.0, sec.dynamic.1 as u64, sec.dynamic.2 as u64, 8, 16]);
+    let dyn_link = if has_syms { 8 } else { 6 };
+    write_shdr(out, [60, 6, dyn_link, 0], [3, sec.dynamic.0, sec.dynamic.1 as u64, sec.dynamic.2 as u64, 8, 16]);
     if !lines.is_empty() {
         write_shdr(out, [69, 1, 0, 0], [0, 0, lines_off as u64, lines.len() as u64, 1, 0]);
     }
@@ -154,6 +161,7 @@ struct HeaderSpec<'a> {
     machine: u16,
     page: usize,
     phnum: usize,
+    shstrndx: u16,
     shnum: u16,
     shdr_off: usize,
     entry_va: u64,
@@ -174,7 +182,7 @@ fn write_ro_prefix(out: &mut Buf, spec: &HeaderSpec<'_>, got_va: impl Fn(usize) 
     out.u32(1);
     out.u64s(&[spec.entry_va, 64, spec.shdr_off as u64]);
     out.u32(0);
-    [64_u16, 56, spec.phnum as u16, 64, spec.shnum, 4].into_iter().for_each(|v| out.u16(v));
+    [64_u16, 56, spec.phnum as u16, 64, spec.shnum, spec.shstrndx].into_iter().for_each(|v| out.u16(v));
     write_phdr(out, 6, 4, 64, ELF_BASE + 64, spec.phnum * 56, spec.phnum * 56, 8);
     write_phdr(out, 3, 4, spec.interp_off, ELF_BASE + spec.interp_off as u64, spec.interp.len(), spec.interp.len(), 1);
     write_phdr(out, 1, 4, 0, ELF_BASE, spec.ro_end, spec.ro_end, spec.page);
@@ -256,13 +264,33 @@ fn write_rx_and_rw(out: &mut Buf, exe: &Executable, body: &EmitBody<'_>) -> Resu
     Ok(())
 }
 
+type OptionalSyms = (Vec<u8>, Vec<u32>, Vec<(usize, usize, u32)>, Vec<u8>, usize, u16, u16);
+
+fn build_optional_syms(exe: &Executable, plan: &Plan, shim_offs: &[usize], offs: [usize; 7], (symtab_off, text_va): (usize, u64)) -> OptionalSyms {
+    let has_syms = !exe.symbols.is_empty();
+    let mut strtab = Vec::new();
+    let (fn_strx, prelude) = if has_syms {
+        strtab.push(0);
+        let fn_strx = exe.symbol_names("", &mut strtab);
+        let prelude = build_prelude(plan, shim_offs, offs, &mut strtab);
+        (fn_strx, prelude)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let want_lines = !exe.sources.is_empty() || !exe.lines.is_empty();
+    let lines = if want_lines { super::dwarf::debug_line(text_va, exe.text.len() as u32, &exe.lines, &exe.sources) } else { Vec::new() };
+    let sym_bytes = if has_syms { (1 + fn_strx.len() + prelude.len()) * 24 + strtab.len() } else { 0 };
+    let shdr_off = (symtab_off + sym_bytes + SECTION_NAMES.len() + lines.len()).next_multiple_of(8);
+    let shstrndx: u16 = if has_syms { 4 } else { 2 };
+    let shnum: u16 = if has_syms { 10 } else { 8 } + u16::from(!lines.is_empty());
+    (strtab, fn_strx, prelude, lines, shdr_off, shstrndx, shnum)
+}
+
 pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Result<Vec<u8>> {
     let arch = exe.target.arch;
     let plan = Plan::collect(exe, &["__libc_start_main"])?;
     let ArchLayout { interp, page, stub_size, start_size, tramp_size, machine } = arch_layout(arch)?;
-    let rx_base = ELF_BASE + page as u64;
-    let tables = build_tables(&plan);
-    let nsyms = 1 + plan.imports.len();
+    let (rx_base, tables, nsyms) = (ELF_BASE + page as u64, build_tables(&plan), 1 + plan.imports.len());
     let (cache_tls, tls) = tls_sizes(arch, &plan, exe.thread_slots);
     let phnum = if tls == 0 { 6 } else { 7 };
     let interp_off = 64 + phnum * 56;
@@ -271,8 +299,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let dynstr_off = dynsym_off + nsyms * 24;
     let rela_off = (dynstr_off + tables.dynstr.len()).next_multiple_of(8);
     let rodata_off = (rela_off + plan.imports.len() * 24).next_multiple_of(16);
-    let dso_off = rodata_off + exe.rodata.len();
-    let ro_end = dso_off + 8;
+    let (dso_off, ro_end) = (rodata_off + exe.rodata.len(), rodata_off + exe.rodata.len() + 8);
     let stubs_off = ro_end.next_multiple_of(16);
     let start_off = (stubs_off + plan.imports.len() * stub_size).next_multiple_of(16);
     let tramp_off = (start_off + start_size).next_multiple_of(16);
@@ -280,32 +307,24 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let (shim_offs, head_off) = plan_shims(arch, Os::Linux, &plan, rx_base, shims_off)?;
     let veneers = plan_veneers(exe, &plan, rx_base, head_off, &shim_offs, |_, _| stubs_off)?;
     let text_off = head_off + veneers.pre_len;
-    let rx_end = (text_off + exe.text.len().next_multiple_of(16) + veneers.post_len).next_multiple_of(16);
-    let rw_off = rx_end;
+    let rw_off = (text_off + exe.text.len().next_multiple_of(16) + veneers.post_len).next_multiple_of(16);
     let rw_va = ELF_BASE + (rw_off + 2 * page) as u64;
     let got_off = (rw_off + exe.data.len()).next_multiple_of(8);
-    let dyn_off = got_off + plan.imports.len() * 8;
-    let dyn_size = (tables.needed.len() + 10) * 16;
-    let rw_filesz = (dyn_off + dyn_size) - rw_off;
-    let bss_in_rw = rw_filesz.next_multiple_of(16);
-    let (key_off, bss_total) = plan.bss_layout(exe.bss);
-    let mut strtab = vec![0u8];
-    let fn_strx = exe.symbol_names("", &mut strtab);
-    let prelude = build_prelude(&plan, &shim_offs, [stubs_off, stub_size, start_off, start_size, tramp_off, tramp_size, head_off], &mut strtab);
-    let symtab_off = (dyn_off + dyn_size).next_multiple_of(8);
-    let want_lines = !exe.sources.is_empty() || !exe.lines.is_empty();
-    let lines = if want_lines { super::dwarf::debug_line(rx_base + text_off as u64, exe.text.len() as u32, &exe.lines, &exe.sources) } else { Vec::new() };
-    let shdr_off = (symtab_off + (1 + fn_strx.len() + prelude.len()) * 24 + strtab.len() + SECTION_NAMES.len() + lines.len()).next_multiple_of(8);
-    let shnum: u16 = 10 + u16::from(!lines.is_empty());
+    let (dyn_off, dyn_size) = (got_off + plan.imports.len() * 8, (tables.needed.len() + 10) * 16);
+    let (rw_filesz, symtab_off) = ((dyn_off + dyn_size) - rw_off, (dyn_off + dyn_size).next_multiple_of(8));
+    let (bss_in_rw, (key_off, bss_total)) = (rw_filesz.next_multiple_of(16), plan.bss_layout(exe.bss));
+    let prelude_offs = [stubs_off, stub_size, start_off, start_size, tramp_off, tramp_size, head_off];
+    let (strtab, fn_strx, prelude, lines, shdr_off, shstrndx, shnum) =
+        build_optional_syms(exe, &plan, &shim_offs, prelude_offs, (symtab_off, rx_base + text_off as u64));
     let bss_va = rw_va + bss_in_rw as u64;
     let addrs = SectionAddrs { text: rx_base + text_off as u64, rodata: ELF_BASE + rodata_off as u64, data: rw_va, bss: bss_va, dso_handle: ELF_BASE + dso_off as u64, thread_key: bss_va + u64::from(key_off), thread_tls: tls - cache_tls, frame_tls: tls };
     let mut out = Buf::new();
-    let hdr = HeaderSpec { arch, machine, page, phnum, shnum, shdr_off, entry_va: rx_base + start_off as u64, interp, interp_off, ro_end, rx: (rx_base, stubs_off, rx_end), rw: (rw_va, rw_off, rw_filesz, bss_in_rw + bss_total as usize), dyn_seg: (dyn_off, dyn_size), tls_seg: (bss_va, rw_off + bss_in_rw, tls), tables: &tables };
+    let hdr = HeaderSpec { arch, machine, page, phnum, shstrndx, shnum, shdr_off, entry_va: rx_base + start_off as u64, interp, interp_off, ro_end, rx: (rx_base, stubs_off, rw_off), rw: (rw_va, rw_off, rw_filesz, bss_in_rw + bss_total as usize), dyn_seg: (dyn_off, dyn_size), tls_seg: (bss_va, rw_off + bss_in_rw, tls), tables: &tables };
     write_ro_prefix(&mut out, &hdr, |idx| rw_va + ((got_off - rw_off) + idx * 8) as u64);
     let body = EmitBody { arch, rx_base, stub_size, offs: [rodata_off, stubs_off, start_off, tramp_off, text_off, rw_off], entry: (lang_start, user_main), addrs, shim_offs: &shim_offs, plan: &plan, veneers: &veneers, tables: &tables, dyn_meta: [got_off as u64, dyn_off as u64, ELF_BASE + hash_off as u64, ELF_BASE + dynstr_off as u64, ELF_BASE + dynsym_off as u64] };
     write_rx_and_rw(&mut out, exe, &body)?;
     let sec = ElfSections {
-        rx_base, text_va: addrs.text, symtab_off, exec: (stubs_off, rx_end), ro: (rodata_off, exe.rodata.len()),
+        rx_base, text_va: addrs.text, symtab_off, exec: (stubs_off, rw_off), ro: (rodata_off, exe.rodata.len()),
         rw: (rw_va, rw_off, rw_filesz), bss: (bss_va, rw_off + bss_in_rw, bss_total as usize),
         dynstr: (dynstr_off, tables.dynstr.len()), dynamic: (rw_va + (dyn_off - rw_off) as u64, dyn_off, dyn_size),
     };

@@ -378,28 +378,6 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter:
     Ok(None)
 }
 
-/// The glibc malloc settings haste runs with: transparent huge pages for the heap, and freed memory kept for reuse instead of returned to the kernel and faulted in again.
-const TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=4294967296:glibc.malloc.trim_threshold=4294967296:glibc.malloc.top_pad=268435456";
-
-/// Starts haste again with `TUNABLES` when its environment sets no tunables, since glibc reads them only at startup; the started process takes them out of its environment, so the programs it runs do not see them.
-fn tune_malloc() {
-    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
-        return;
-    }
-    match std::env::var_os("GLIBC_TUNABLES") {
-        // SAFETY: no other thread runs yet, so nothing reads the environment while it changes.
-        Some(set) if set == TUNABLES => unsafe { std::env::remove_var("GLIBC_TUNABLES") },
-        Some(_) => {}
-        None => {
-            use std::os::unix::process::CommandExt;
-            let mut args = std::env::args_os();
-            let arg0 = args.next().unwrap_or_default();
-            let error = std::process::Command::new("/proc/self/exe").arg0(arg0).args(args).env("GLIBC_TUNABLES", TUNABLES).exec();
-            eprintln!("haste: running without malloc tunables: {error}");
-        }
-    }
-}
-
 type ParsedInvocation = (Command, PathBuf, Vec<String>, Option<PathBuf>, Option<PathBuf>);
 
 fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
@@ -444,7 +422,6 @@ pub fn main() -> Result<()> {
     if let Some(meta) = std::env::args_os().nth(1).and_then(|a| a.to_str().and_then(Meta::from_flag)) {
         return Ok(print_meta(meta));
     }
-    tune_malloc();
     crate::sema::evaluate::install(crate::image::evaluator);
     let (command, path, rest, stats_json, out) = match parse_invocation()? {
         Ok(parsed) => parsed,

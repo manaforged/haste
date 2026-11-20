@@ -50,9 +50,6 @@ impl VtableMask {
     pub(super) fn build_from_live(cx: &mut Context<'_>, reached: &Reached, vtables: &[Vec<VtableEntry>], live_fns: &[bool]) -> Self {
         let mut rta = RtaCollector::new(cx, reached, live_fns);
         rta.run();
-        if rta.demand.fallback_all {
-            return Self::all_live();
-        }
         rta.scan_vtable_impls(vtables);
         rta.close_layouts();
         let mut matcher = Matcher {
@@ -83,14 +80,20 @@ struct Demand {
     vcalls: HashSet<(ItemRef, u32)>,
     upcasts: HashSet<(ItemRef, u32)>,
     wild_methods: HashSet<ItemRef>,
+    wild_slots: HashSet<u32>,
     wild_upcasts: HashSet<u32>,
     cands: HashSet<ItemRef>,
     seen_tys: HashSet<Ty>,
-    fallback_all: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum MethodExpect {
+    Item(ItemRef),
+    Name(String),
 }
 
 struct TraitLayout {
-    methods: Vec<Option<ItemRef>>,
+    methods: Vec<Option<MethodExpect>>,
     supers: Vec<ItemRef>,
     callable: bool,
 }
@@ -177,8 +180,8 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
             if self.demand.wild_methods.insert(method) {
                 self.wake_wild_method(method);
             }
-        } else {
-            self.demand.fallback_all = true;
+        } else if self.demand.wild_slots.insert(slot) {
+            self.wake_wild_slot(slot);
         }
     }
 
@@ -211,7 +214,7 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
             self.enqueue_all_vtable(vt);
             return;
         };
-        if !self.ensure_layout(of) {
+        if !self.ensure_layout_for_vtable(of, vt) {
             self.enqueue_all_vtable(vt);
             return;
         }
@@ -229,7 +232,8 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
             let Some(Res::Fn(item, substs)) = method_res else { continue };
             let Some(&fn_idx) = self.reached.index.get(&(*item, *substs)) else { continue };
             let slot = (VTABLE_HEADER + k) as u32;
-            let wild = self.layouts[&of].methods[k].is_some_and(|m| self.demand.wild_methods.contains(&m));
+            let wild = self.demand.wild_slots.contains(&slot)
+                || self.layouts[&of].methods[k].as_ref().is_some_and(|m| method_is_wild(self.cx, &self.demand.wild_methods, m));
             if wild || self.demand.vcalls.contains(&(of, slot)) {
                 enqueue_idx(&mut self.visited, &mut self.work, fn_idx);
             } else {
@@ -256,15 +260,30 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
     }
 
     fn wake_wild_method(&mut self, method: ItemRef) {
+        let plain = self.cx.plain_name(method);
         let ready: Vec<(ItemRef, u32)> = self
             .waiting_vcalls
             .keys()
             .copied()
             .filter(|&(of, slot)| {
                 slot as usize >= VTABLE_HEADER
-                    && self.layouts.get(&of).and_then(|l| l.methods.get(slot as usize - VTABLE_HEADER)) == Some(&Some(method))
+                    && self
+                        .layouts
+                        .get(&of)
+                        .and_then(|l| l.methods.get(slot as usize - VTABLE_HEADER))
+                        .and_then(Option::as_ref)
+                        .is_some_and(|m| expect_matches_wild(method, plain, m))
             })
             .collect();
+        for key in ready {
+            if let Some(pending) = self.waiting_vcalls.remove(&key) {
+                pending.into_iter().for_each(|idx| enqueue_idx(&mut self.visited, &mut self.work, idx));
+            }
+        }
+    }
+
+    fn wake_wild_slot(&mut self, slot: u32) {
+        let ready: Vec<(ItemRef, u32)> = self.waiting_vcalls.keys().copied().filter(|&(_, s)| s == slot).collect();
         for key in ready {
             if let Some(pending) = self.waiting_vcalls.remove(&key) {
                 pending.into_iter().for_each(|idx| enqueue_idx(&mut self.visited, &mut self.work, idx));
@@ -297,13 +316,60 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
         if self.layouts.contains_key(&tr) {
             return true;
         }
+        let before = self.cx.quiet_mark();
         let (Ok(methods), Ok(supers)) = (self.cx.vtable_methods(tr), self.cx.vtable_supers(tr)) else {
             return false;
         };
+        if self.cx.quiet_mark() != before {
+            return false;
+        }
         let callable = self.cx.lang(tr).is_some_and(is_callable_lang);
         self.demand.cands.extend(supers.iter().copied());
+        let methods = methods.into_iter().map(|m| m.map(MethodExpect::Item)).collect();
         self.layouts.insert(tr, TraitLayout { methods, supers, callable });
         self.cand_list.push(tr);
+        true
+    }
+
+    fn ensure_layout_for_vtable(&mut self, of: ItemRef, vt: &'a Vtable) -> bool {
+        if self.ensure_layout(of) {
+            let layout = &self.layouts[&of];
+            if layout.callable || (vt.methods.len() == layout.methods.len() && vt.supers.len() == layout.supers.len()) {
+                return true;
+            }
+            self.layouts.remove(&of);
+        }
+        self.learn_layout_from_vtable(of, vt)
+    }
+
+    fn learn_layout_from_vtable(&mut self, of: ItemRef, vt: &'a Vtable) -> bool {
+        let callable = self.cx.lang(of).is_some_and(is_callable_lang);
+        let mut supers = Vec::with_capacity(vt.supers.len());
+        for sup in &vt.supers {
+            let Some(sup_tr) = dyn_trait_in(&self.cx.types, sup.object, 1) else { return false };
+            if !self.ensure_layout_for_vtable(sup_tr, sup) {
+                return false;
+            }
+            supers.push(sup_tr);
+        }
+        let mut methods = Vec::with_capacity(vt.methods.len());
+        for slot in &vt.methods {
+            let exp = match slot {
+                None => None,
+                Some(Res::Fn(item, _)) => Some(match trait_method_of(self.cx, &mut self.fn_methods, *item) {
+                    Some(tm) => MethodExpect::Item(tm),
+                    None => MethodExpect::Name(self.cx.plain_name(*item).to_owned()),
+                }),
+                Some(_) => return false,
+            };
+            methods.push(exp);
+        }
+        self.demand.cands.insert(of);
+        self.demand.cands.extend(supers.iter().copied());
+        if !self.cand_list.contains(&of) {
+            self.cand_list.push(of);
+        }
+        self.layouts.insert(of, TraitLayout { methods, supers, callable });
         true
     }
 
@@ -355,7 +421,11 @@ impl Matcher<'_, '_> {
         let m_len = layout.methods.len();
         for (k, method) in layout.methods.iter().enumerate() {
             let slot = VTABLE_HEADER + k;
-            if self.demand.vcalls.contains(&(of, slot as u32)) || method.is_some_and(|m| self.demand.wild_methods.contains(&m)) {
+            let s32 = slot as u32;
+            if self.demand.vcalls.contains(&(of, s32))
+                || self.demand.wild_slots.contains(&s32)
+                || method.as_ref().is_some_and(|m| method_is_wild(self.cx, &self.demand.wild_methods, m))
+            {
                 live[slot] = true;
             }
         }
@@ -386,18 +456,45 @@ impl Matcher<'_, '_> {
         ok
     }
 
-    fn methods_match(&mut self, slots: &[VtableEntry], methods: &[Option<ItemRef>]) -> bool {
-        slots.iter().zip(methods).all(|(entry, expected)| match (*entry, *expected) {
+    fn fn_matches_method(&mut self, fn_idx: usize, expected: &MethodExpect) -> bool {
+        let Some(((item, _), _)) = self.reached.list.get(fn_idx) else { return false };
+        match expected {
+            MethodExpect::Item(exp) => match trait_method_of(self.cx, self.fn_methods, *item) {
+                Some(found) => found == *exp,
+                None => is_assoc_fn(self.cx, *item) && self.cx.plain_name(*item) == self.cx.plain_name(*exp),
+            },
+            MethodExpect::Name(name) => is_assoc_fn(self.cx, *item) && self.cx.plain_name(*item) == name.as_str(),
+        }
+    }
+
+    fn methods_match(&mut self, slots: &[VtableEntry], methods: &[Option<MethodExpect>]) -> bool {
+        slots.iter().zip(methods).all(|(entry, expected)| match (*entry, expected.as_ref()) {
             (VtableEntry::Word(Word::Int(0)), None) => true,
-            (VtableEntry::Word(Word::Code(fn_idx)), Some(m)) => {
-                self.reached.list.get(fn_idx).and_then(|((item, _), _)| trait_method_of(self.cx, self.fn_methods, *item)) == Some(m)
-            }
+            (VtableEntry::Word(Word::Code(fn_idx)), Some(m)) => self.fn_matches_method(fn_idx, m),
             _ => false,
         })
     }
 
     fn supers_match(&mut self, slots: &[VtableEntry], supers: &[ItemRef]) -> bool {
         slots.iter().zip(supers).all(|(entry, &sup)| matches!(*entry, VtableEntry::Super(sub_id) if self.matches_trait(sub_id.0 as usize, sup)))
+    }
+}
+
+fn is_assoc_fn(cx: &mut Context<'_>, item: ItemRef) -> bool {
+    cx.owner_impl(item).is_some() || cx.owner_trait(item).is_some()
+}
+
+fn expect_matches_wild(wild: ItemRef, wild_plain: &str, exp: &MethodExpect) -> bool {
+    match exp {
+        MethodExpect::Item(m) => *m == wild,
+        MethodExpect::Name(name) => name == wild_plain,
+    }
+}
+
+fn method_is_wild(cx: &Context<'_>, wilds: &HashSet<ItemRef>, exp: &MethodExpect) -> bool {
+    match exp {
+        MethodExpect::Item(m) => wilds.contains(m),
+        MethodExpect::Name(name) => wilds.iter().any(|&w| cx.plain_name(w) == name.as_str()),
     }
 }
 

@@ -34,12 +34,22 @@ pub(in crate::sema) fn keep_laid(cx: &mut Context<'_>, instance: Instance, typed
     }
 }
 
+fn body_may_expand(cx: &Context<'_>, item: ItemRef) -> bool {
+    let (src, entry) = cx.item(item);
+    let (from, to) = match entry.body {
+        Some(open) => (open + 1, src.pair(open)),
+        None => (entry.start, entry.end),
+    };
+    (from..to).any(|at| matches!(src.kind(at), rustc_lexer::TokenKind::Bang | rustc_lexer::TokenKind::Pound))
+}
+
 /// Parses the body of fixed `item` while the pass can still answer what its macros ask, failing when it asked and did not parse.
 pub(in crate::sema) fn warm_body(cx: &mut Context<'_>, item: ItemRef, param_count: usize, before: (usize, usize)) -> Result<(), String> {
     if cx.outline.is_fixed(item.krate)
         && !cx.store.lookups.skip_warm_sysroot_bodies
         && cx.store.bodies.get(&item).is_none()
         && cx.store.lookups.substrate.is_some()
+        && body_may_expand(cx, item)
         && !(cx.outline.is_sysroot(item.krate)
             && param_count == 0
             && (cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never")))

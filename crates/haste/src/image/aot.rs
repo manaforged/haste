@@ -25,6 +25,10 @@ fn want_debug_info() -> bool {
     crate::profile() != crate::outline::tree::Profile::Release || std::env::var_os("HASTE_DEBUG_INFO").is_some()
 }
 
+fn want_symbols() -> bool {
+    want_debug_info() || std::env::var_os("HASTE_SYMBOLS").is_some_and(|v| v != "0" && !v.is_empty())
+}
+
 fn fn_align_override() -> Option<u32> {
     static ALIGN: OnceLock<Option<u32>> = OnceLock::new();
     *ALIGN.get_or_init(|| std::env::var(FN_ALIGN_ENV).ok().and_then(|v| v.parse().ok()).filter(|a: &u32| a.is_power_of_two() && *a >= 16))
@@ -716,16 +720,18 @@ impl Image {
             bail!("`main` failed to compile");
         };
         exe.entry(start_off, main_off);
-        let mut named: HashMap<u32, usize> = HashMap::default();
-        for &index in &live.order {
-            if let Some(off) = fn_offs[index] {
-                named.entry(off).or_insert(index);
-            }
-        }
         if debug_info {
             exe.sources(cx.outline.crates.iter().flat_map(|krate| krate.files.iter().map(|file| file.source.path.clone())).collect());
         }
-        exe.symbols(named.into_iter().map(|(off, index)| (off, reached.list.get(index).map_or_else(|| format!("fn{index}"), |(instance, _)| cx.symbol_text(*instance)))).collect());
+        if want_symbols() {
+            let mut named: HashMap<u32, usize> = HashMap::default();
+            for &index in &live.order {
+                if let Some(off) = fn_offs[index] {
+                    named.entry(off).or_insert(index);
+                }
+            }
+            exe.symbols(named.into_iter().map(|(off, index)| (off, reached.list.get(index).map_or_else(|| format!("fn{index}"), |(instance, _)| cx.symbol_text(*instance)))).collect());
+        }
         Ok(exe)
     }
 }
