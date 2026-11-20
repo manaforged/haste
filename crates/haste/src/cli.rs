@@ -168,6 +168,21 @@ pub(crate) fn print_test_report(
     if failed == 0 { 0 } else { 101 }
 }
 
+pub(crate) fn lib_fn_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
+    let mut found = Vec::new();
+    for krate in outline.members(workspace) {
+        let tree = &outline.crates[krate];
+        for (file_at, file) in tree.files.iter().enumerate() {
+            for (at, item) in file.items.items.iter().enumerate() {
+                if item.kind == outline::item::ItemKind::Fn && item.body.is_some() {
+                    found.push(ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 });
+                }
+            }
+        }
+    }
+    found
+}
+
 pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
     let mut found = Vec::new();
     for krate in outline.members(workspace) {

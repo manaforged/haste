@@ -13,7 +13,7 @@ use crate::sema::{self, Cache, Edited};
 use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::cli::{Failures, TestItem, case_items, error_kind, print_failures, print_test_report, test_items};
+use crate::cli::{Failures, TestItem, case_items, error_kind, lib_fn_items, print_failures, print_test_report, test_items};
 
 include!("../../../tests/case_inputs.rs");
 
@@ -38,6 +38,7 @@ struct Watch {
 enum BatchKind {
     Cases,
     Tests,
+    LibCheck,
     MainCheck,
     MainAot,
 }
@@ -46,7 +47,7 @@ impl BatchKind {
     fn mode(self) -> crate::image::ImageMode {
         match self {
             BatchKind::Cases | BatchKind::Tests => crate::image::ImageMode::Jit,
-            BatchKind::MainCheck => crate::image::ImageMode::Check,
+            BatchKind::LibCheck | BatchKind::MainCheck => crate::image::ImageMode::Check,
             BatchKind::MainAot => crate::image::ImageMode::Aot,
         }
     }
@@ -55,6 +56,7 @@ impl BatchKind {
         match self {
             BatchKind::Cases => case_items(workspace, outline),
             BatchKind::Tests => test_items(workspace, outline).into_iter().map(|t| t.item).collect(),
+            BatchKind::LibCheck => lib_fn_items(workspace, outline),
             BatchKind::MainCheck | BatchKind::MainAot => main_items(workspace, outline),
         }
     }
@@ -66,7 +68,7 @@ struct Batch {
     store: Option<Cache>,
     labels: Vec<String>,
     roots: Vec<usize>,
-    tests: Vec<TestItem>,
+    tests: Vec<(TestItem, Option<usize>)>,
     reached: Reached,
     image: Image,
     broken: HashMap<usize, String>,
@@ -216,18 +218,33 @@ fn finish_batch(
     let reach_span = reach_clock.elapsed();
     let codegen_clock = sema::census::Clock::now();
     let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.as_ref());
+    let mut test_starts: Vec<Option<sema::reach::Instance>> = Vec::new();
     let valid: Vec<ItemRef> = match kind {
         BatchKind::Cases => cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect(),
-        BatchKind::Tests => cases.iter().copied().filter(|&item| sema::infer::is_test_sig(&mut cx, item)).collect(),
+        BatchKind::Tests => cases
+            .iter()
+            .copied()
+            .filter_map(|item| {
+                let unit = sema::infer::test_sig(&mut cx, item)?;
+                let start = if unit { None } else { sema::reach::main_roots(&mut cx, item).ok().map(|[s, _]| s) };
+                test_starts.push(start);
+                Some(item)
+            })
+            .collect(),
+        BatchKind::LibCheck => cases.iter().copied().filter(|&item| sema::infer::is_concrete_fn(&mut cx, item)).collect(),
         BatchKind::MainCheck => cases.to_vec(),
         BatchKind::MainAot => Vec::new(),
     };
-    let root_instances: Vec<sema::reach::Instance> = match main {
+    let mut root_instances: Vec<sema::reach::Instance> = match main {
         Some(main) => sema::reach::main_roots(&mut cx, main)?.to_vec(),
         None => valid.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect(),
     };
+    let extra_starts: Vec<sema::reach::Instance> = test_starts.iter().flatten().copied().collect();
+    let primary_len = root_instances.len();
+    root_instances.extend(extra_starts);
     reached.canonicalize(&cx, &root_instances);
-    let roots: Vec<usize> = root_instances.iter().map(|inst| reached.index[inst]).collect();
+    let roots: Vec<usize> = root_instances[..primary_len].iter().map(|inst| reached.index[inst]).collect();
+    let start_indices: Vec<Option<usize>> = test_starts.iter().map(|opt| opt.and_then(|inst| reached.index.get(&inst).copied())).collect();
     if drop_finals {
         cx.compact_for_oneshot_codegen();
     }
@@ -241,7 +258,8 @@ fn finish_batch(
     let outline = cx.outline;
     let mut store = cx.release().0;
     save_batch_substrate((outline, &mut store), &mut image, (drop_finals, kind), substrate, pre_builder);
-    Ok(Batch { kind, store: Some(store), labels, roots, tests: Vec::new(), reached, image, broken, reach_span, codegen_span })
+    let tests = start_indices.into_iter().map(|start| (TestItem { item: ItemRef { krate: 0, file: 0, item: 0 }, ignored: false, should_panic: false }, start)).collect();
+    Ok(Batch { kind, store: Some(store), labels, roots, tests, reached, image, broken, reach_span, codegen_span })
 }
 
 fn make_builders(slot: &SubstrateSlot) -> PreBuilders {
@@ -335,7 +353,9 @@ fn save_batch_substrate(
 impl Batch {
     /// Infers and compiles every root `kind` finds in `workspace` from nothing.
     fn new(workspace: &graph::Workspace, compilation: &mut Compilation, kind: BatchKind, drop_finals: bool) -> Result<Batch> {
-        let main = (kind == BatchKind::MainAot).then(|| main_item(workspace, &compilation.outline).context("no member binary has a `main`")).transpose()?;
+        let main = (kind == BatchKind::MainAot)
+            .then(|| main_item(workspace, &compilation.outline).context("no binary or example target to emit (pass --bin NAME or --example NAME)"))
+            .transpose()?;
         Self::rooted(workspace, compilation, (kind, main), drop_finals)
     }
 
@@ -358,7 +378,21 @@ impl Batch {
             |cx| match (kind, main) {
                 (BatchKind::MainAot, Some(main_ref)) => sema::reach::main_roots(cx, main_ref).map_or_else(|_| vec![(main_ref, sema::substs::Substs::EMPTY)], Into::into),
                 (BatchKind::Cases, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
-                (BatchKind::Tests, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_test_sig(cx, item)).collect(),
+                (BatchKind::Tests, _) => {
+                    let mut out = Vec::new();
+                    for &(item, substs) in &root_insts {
+                        if let Some(unit) = sema::infer::test_sig(cx, item) {
+                            if !unit
+                                && let Ok([start, _]) = sema::reach::main_roots(cx, item)
+                            {
+                                out.push(start);
+                            }
+                            out.push((item, substs));
+                        }
+                    }
+                    out
+                }
+                (BatchKind::LibCheck, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item)).collect(),
                 _ => root_insts.clone(),
             },
             |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, substrate.take(), (cx, reach_clock)),
@@ -401,13 +435,30 @@ impl Batch {
         let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
         let (mut cases, mut roots) = batch_roots(workspace, &compilation.outline, self.kind);
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
+        let mut test_starts = Vec::new();
         match self.kind {
             BatchKind::Cases => {
                 cases.retain(|&item| sema::infer::is_case_sig(&mut cx, item));
                 roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
             }
             BatchKind::Tests => {
-                cases.retain(|&item| sema::infer::is_test_sig(&mut cx, item));
+                let mut valid = Vec::new();
+                roots.clear();
+                for item in cases {
+                    if let Some(unit) = sema::infer::test_sig(&mut cx, item) {
+                        let start = if unit { None } else { sema::reach::main_roots(&mut cx, item).ok().map(|[s, _]| s) };
+                        if let Some(s) = start {
+                            roots.push(s);
+                        }
+                        roots.push((item, sema::substs::Substs::EMPTY));
+                        test_starts.push(start);
+                        valid.push(item);
+                    }
+                }
+                cases = valid;
+            }
+            BatchKind::LibCheck => {
+                cases.retain(|&item| sema::infer::is_concrete_fn(&mut cx, item));
                 roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
             }
             BatchKind::MainAot => {
@@ -423,9 +474,13 @@ impl Batch {
             return false;
         }
         self.labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
-        self.roots = roots.iter().map(|root| self.reached.index[root]).collect();
+        self.roots = match self.kind {
+            BatchKind::Tests => cases.iter().map(|&item| self.reached.index[&(item, sema::substs::Substs::EMPTY)]).collect(),
+            _ => roots.iter().map(|root| self.reached.index[root]).collect(),
+        };
         if self.kind == BatchKind::Tests {
-            self.tests = map_tests(&self.roots, &self.reached, test_items(workspace, &compilation.outline));
+            let starts: Vec<Option<usize>> = test_starts.into_iter().map(|opt| opt.and_then(|s| self.reached.index.get(&s).copied())).collect();
+            self.tests = map_tests(&self.roots, &self.reached, &starts, test_items(workspace, &compilation.outline));
         }
         recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh, &self.roots);
         self.store = Some(cx.release().0);
@@ -433,14 +488,17 @@ impl Batch {
     }
 
     /// Sorts the roots into the failures of those that reach a function that did not infer or compile, and the rest by index and name.
-    fn sort(&self) -> (Failures, Vec<(usize, &str)>) {
+    fn sort(&self, outline: Option<&outline::Outline>) -> (Failures, Vec<(usize, &str)>) {
         let mut failures = Failures::new();
         let mut runnable = Vec::new();
         for (&root, name) in self.roots.iter().zip(&self.labels) {
             let closure = self.reached.closure(&[root]);
-            let failure = closure.iter().rev().find_map(|at| self.reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().rev().find_map(|at| self.broken.get(at)));
-            match failure {
-                Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),
+            let found = closure.iter().rev().find_map(|&at| self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)).map(|err| (at, err)));
+            match found {
+                Some((at, error)) => {
+                    let loc = outline.map(|o| item_loc(o, self.reached.list[at].0.0)).unwrap_or_default();
+                    failures.entry(error_kind(error)).or_default().push(format!("{loc}{name}: {error}"));
+                }
                 None => runnable.push((root, name.as_str())),
             }
         }
@@ -462,19 +520,19 @@ impl Batch {
     }
 
     /// Prints what failed to build and how long building took, and returns 1 when anything failed.
-    fn check(&self, built: Duration) -> i32 {
-        let (failures, _) = self.sort();
+    fn check(&self, outline: &outline::Outline, built: Duration) -> i32 {
+        let (failures, _) = self.sort(Some(outline));
         print_failures(&failures);
         eprintln!("{} functions reached, {} failed, built in {:.1} ms", self.reached.list.len(), failures.values().map(Vec::len).sum::<usize>(), built.as_secs_f64() * 1e3);
         i32::from(!failures.is_empty())
     }
 
     /// Runs every case or `#[test]` whose functions all compiled and returns 0 when all pass, else 101.
-    fn report(&self, started: Instant, built: Duration, filters: &[String]) -> Result<i32> {
+    fn report(&self, outline: &outline::Outline, started: Instant, built: Duration, filters: &[String]) -> Result<i32> {
         if self.kind == BatchKind::Tests {
-            return self.report_tests(started, filters);
+            return self.report_tests(outline, started, filters);
         }
-        let (mut failures, runnable) = self.sort();
+        let (mut failures, runnable) = self.sort(Some(outline));
         let statuses = self.image.run_cases(&runnable, &CASE_INPUTS)?;
         for ((_, name), status) in runnable.iter().zip(statuses).filter(|(_, status)| *status != 0) {
             failures.entry(format!("crashed with status {status}")).or_default().push((*name).to_owned());
@@ -485,32 +543,52 @@ impl Batch {
         Ok(0)
     }
 
-    fn report_tests(&self, started: Instant, filters: &[String]) -> Result<i32> {
+    fn report_tests(&self, outline: &outline::Outline, started: Instant, filters: &[String]) -> Result<i32> {
         let mut to_run = Vec::new();
-        let mut entries = Vec::new();
-        for ((&root, name), &meta) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
+        let mut errs: Vec<String> = Vec::new();
+        let mut raw: Vec<(&str, TestItem, Option<Result<i32, usize>>)> = Vec::new();
+        for ((&root, name), &(meta, start)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
             if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
                 continue;
             }
+            let check_roots: Vec<usize> = start.into_iter().chain(std::iter::once(root)).collect();
             let outcome = if meta.ignored {
                 None
-            } else if let Some(err) = self.reached.closure(&[root]).iter().rev().find_map(|at| self.reached.list[*at].1.as_ref().err().or_else(|| self.broken.get(at))) {
-                Some(Err(err.as_str()))
+            } else if let Some((at, err)) = self.reached.closure(&check_roots).iter().rev().find_map(|&at| self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)).map(|e| (at, e))) {
+                let idx = errs.len();
+                errs.push(format!("{}{err}", item_loc(outline, self.reached.list[at].0.0)));
+                Some(Err(idx))
             } else {
-                to_run.push((root, name.as_str()));
+                to_run.push((root, start, name.as_str()));
                 Some(Ok(0))
             };
-            entries.push((name.as_str(), meta, outcome));
+            raw.push((name.as_str(), meta, outcome));
         }
         let mut ran = self.image.run_tests(&to_run)?.into_iter();
-        entries.iter_mut().filter(|e| !e.1.ignored && matches!(e.2, Some(Ok(_)))).for_each(|e| e.2 = ran.next().map(Ok));
+        let entries: Vec<(&str, TestItem, Option<Result<i32, &str>>)> = raw
+            .into_iter()
+            .map(|(name, meta, outcome)| {
+                let outcome = match outcome {
+                    None => None,
+                    Some(Err(idx)) => Some(Err(errs[idx].as_str())),
+                    Some(Ok(_)) => ran.next().map(Ok),
+                };
+                (name, meta, outcome)
+            })
+            .collect();
         Ok(print_test_report(&entries, started.elapsed()))
     }
 }
 
-fn map_tests(roots: &[usize], reached: &Reached, items: Vec<TestItem>) -> Vec<TestItem> {
+fn item_loc(outline: &outline::Outline, item: ItemRef) -> String {
+    let file = &outline.crates[item.krate as usize].files[item.file as usize];
+    let line = file.source.line(file.items.items[item.item as usize].start);
+    format!("{}:{line} ", file.source.path.display())
+}
+
+fn map_tests(roots: &[usize], reached: &Reached, starts: &[Option<usize>], items: Vec<TestItem>) -> Vec<(TestItem, Option<usize>)> {
     let by_item: HashMap<ItemRef, TestItem> = items.into_iter().map(|t| (t.item, t)).collect();
-    roots.iter().map(|&idx| by_item[&reached.list[idx].0.0]).collect()
+    roots.iter().zip(starts).map(|(&idx, &start)| (by_item[&reached.list[idx].0.0], start)).collect()
 }
 
 impl Build {
@@ -523,29 +601,35 @@ impl Build {
         Ok(Build { compilation, cases: None, binary: None, program: None, stamps, outline_span })
     }
 
-    /// Infers and compiles the `case_` functions unless that is done.
+    fn load_members(&mut self, workspace: &graph::Workspace) -> Result<()> {
+        let members: Vec<usize> = self.compilation.outline.members(workspace).collect();
+        let mut loaded_more = false;
+        for member in members {
+            if self.compilation.outline.crates[member].partial() {
+                self.compilation.outline.load_crate(member)?;
+                loaded_more = true;
+            }
+        }
+        if loaded_more {
+            crate::macros::resolve(&mut self.compilation)?;
+            let errors = self.compilation.outline.local_errors(workspace);
+            if !errors.is_empty() {
+                anyhow::bail!("{}", errors.join("\n"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Infers and compiles the `#[test]` or `case_` functions unless that is done.
     pub fn compile_cases(&mut self, workspace: &graph::Workspace) -> Result<()> {
         if self.cases.is_none() {
-            let members: Vec<usize> = self.compilation.outline.members(workspace).collect();
-            let mut loaded_more = false;
-            for member in members {
-                if self.compilation.outline.crates[member].partial() {
-                    self.compilation.outline.load_crate(member)?;
-                    loaded_more = true;
-                }
-            }
-            if loaded_more {
-                crate::macros::resolve(&mut self.compilation)?;
-                let errors = self.compilation.outline.local_errors(workspace);
-                if !errors.is_empty() {
-                    anyhow::bail!("{}", errors.join("\n"));
-                }
-            }
+            self.load_members(workspace)?;
             let discovered = test_items(workspace, &self.compilation.outline);
             let kind = if discovered.is_empty() { BatchKind::Cases } else { BatchKind::Tests };
             let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
             if kind == BatchKind::Tests {
-                batch.tests = map_tests(&batch.roots, &batch.reached, discovered);
+                let starts: Vec<Option<usize>> = batch.tests.iter().map(|&(_, s)| s).collect();
+                batch.tests = map_tests(&batch.roots, &batch.reached, &starts, discovered);
             }
             self.cases = Some(batch);
         }
@@ -563,11 +647,14 @@ impl Build {
     }
 
     fn compile_binary_with(&mut self, workspace: &graph::Workspace, drop_finals: bool) -> Result<()> {
-        if main_item(workspace, &self.compilation.outline).is_none() {
-            bail!("no member binary has a `main`");
-        }
         if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainCheck, drop_finals)?);
+            let kind = if main_item(workspace, &self.compilation.outline).is_some() {
+                BatchKind::MainCheck
+            } else {
+                self.load_members(workspace)?;
+                BatchKind::LibCheck
+            };
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, kind, drop_finals)?);
         }
         Ok(())
     }
@@ -669,13 +756,13 @@ impl Build {
     /// Runs every case or `#[test]` whose functions all compiled and returns 0 when all pass, else 101.
     pub fn report(&self, started: Instant, built: Duration, filters: &[String]) -> Result<i32> {
         let Some(cases) = &self.cases else { bail!("the cases are not compiled") };
-        cases.report(started, built, filters)
+        cases.report(&self.compilation.outline, started, built, filters)
     }
 
     /// Prints what failed to build in the binary's reach and how long building took, and returns 1 when anything failed.
     pub fn check(&self, built: Duration) -> Result<i32> {
         let Some(binary) = &self.binary else { bail!("the binary is not compiled") };
-        Ok(binary.check(built))
+        Ok(binary.check(&self.compilation.outline, built))
     }
 
     /// Why each function the binary's `main` reaches did not type-check or compile, at the file and line of its item, keyed by the kind of error.

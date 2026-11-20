@@ -110,7 +110,7 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 
 - haste compiles only for the host (`x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`). Windows and cross-compilation are not supported.
 - haste performs name resolution, type inference, trait selection, and move/drop tracking, but does not run a borrow checker yet. Use `cargo check` or `rustc` in CI to verify lifetime and aliasing rules.
-- `haste test` currently runs synchronous `fn()` `#[test]` functions (not `Result`-returning or `#[tokio::test]` functions yet).
+- `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` (`Termination`) `#[test]` functions (not `#[tokio::test]` macro suites that depend on custom harnesses).
 - `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
 - On macOS, JIT execution uses dual-mapped `mach_vm_remap` pages (writable + executable aliases), which may be blocked inside a Hardened Runtime or App Sandbox.
 - Some Rust features do not compile yet. If any reached function fails to compile, `haste build` exits non-zero.

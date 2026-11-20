@@ -741,7 +741,7 @@ pub fn discriminants(cx: &mut Context<'_>, item: ItemRef, primitive: Primitive) 
     detached(cx, item, |infer| infer.discriminants(item, primitive))
 }
 
-pub use zonk::{is_case_sig, is_test_sig};
+pub use zonk::{is_case_sig, is_concrete_fn, test_sig};
 
 /// The return type of the non-generic function `item`.
 pub fn return_type(cx: &mut Context<'_>, item: ItemRef) -> Result<Ty> {

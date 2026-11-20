@@ -539,7 +539,7 @@ impl Image {
 
     /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.
     pub fn run_cases(&self, cases: &[(usize, &str)], inputs: &[i64]) -> Result<Vec<i32>> {
-        self.run_batch(cases, |address, name| {
+        self.run_batch(cases, |_, address, name| {
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             // SAFETY: address is code that the encoder wrote for a native fn(i64) -> i64 signature, checked to be set before the fork.
@@ -552,24 +552,36 @@ impl Image {
         })
     }
 
-    /// Runs each `#[test]` function `(index, name)`, a reached `fn()`, in a forked child and returns each test's exit status (0 for return, non-zero for panic/crash).
-    pub fn run_tests(&self, tests: &[(usize, &str)]) -> Result<Vec<i32>> {
-        self.run_batch(tests, |address, _| {
-            // SAFETY: address is code that the encoder wrote for a native fn() signature, checked to be set before the fork.
-            let test_fn: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
-            test_fn();
+    /// Runs each `#[test]` function `(index, start_index, name)` in a forked child and returns each test's exit status (0 for pass, non-zero for panic/Err).
+    pub fn run_tests(&self, tests: &[(usize, Option<usize>, &str)]) -> Result<Vec<i32>> {
+        let pairs: Vec<(usize, &str)> = tests.iter().map(|&(idx, _, name)| (idx, name)).collect();
+        if let Some((_, Some(start), name)) = tests.iter().find(|(_, start, _)| start.is_some_and(|s| self.slot(s).load(Ordering::Acquire) == 0)) {
+            bail!("{name} has no start wrapper (slot {start})");
+        }
+        let starts: Vec<Option<usize>> = tests.iter().map(|&(_, start, _)| start).collect();
+        self.run_batch(&pairs, |pos, address, name| {
+            if let Some(start) = starts[pos] {
+                let status = self.enter_main((start, pairs[pos].0), &[name.to_owned()]);
+                if status != 0 {
+                    std::process::exit(status);
+                }
+            } else {
+                // SAFETY: address is code that the encoder wrote for a native fn() signature, checked to be set before the fork.
+                let test_fn: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
+                test_fn();
+            }
             Ok(())
         })
     }
 
-    fn run_batch(&self, items: &[(usize, &str)], invoke: impl Fn(usize, &str) -> std::io::Result<()>) -> Result<Vec<i32>> {
+    fn run_batch(&self, items: &[(usize, &str)], invoke: impl Fn(usize, usize, &str) -> std::io::Result<()>) -> Result<Vec<i32>> {
         if let Some((_, name)) = items.iter().find(|(index, _)| self.slot(*index).load(Ordering::Acquire) == 0) {
             bail!("{name} has no code");
         }
         let mut statuses = vec![0; items.len()];
         let mut from = 0;
         while from < items.len() {
-            let (done, status) = self.run_from(&items[from..], &invoke)?;
+            let (done, status) = self.run_from(from, &items[from..], &invoke)?;
             if status == 0 {
                 break;
             }
@@ -580,18 +592,18 @@ impl Image {
         Ok(statuses)
     }
 
-    fn run_from(&self, items: &[(usize, &str)], invoke: &impl Fn(usize, &str) -> std::io::Result<()>) -> Result<(usize, i32)> {
-        let (pid, mut progress) = fork_piped(|progress| self.run_in_child(items, invoke, progress))?;
+    fn run_from(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>) -> Result<(usize, i32)> {
+        let (pid, mut progress) = fork_piped(|progress| self.run_in_child(offset, items, invoke, progress))?;
         let mut done = Vec::new();
         std::io::Read::read_to_end(&mut progress, &mut done)?;
         Ok((done.len(), wait(pid)))
     }
 
-    fn run_in_child(&self, items: &[(usize, &str)], invoke: &impl Fn(usize, &str) -> std::io::Result<()>, mut progress: std::fs::File) -> std::io::Result<()> {
+    fn run_in_child(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>, mut progress: std::fs::File) -> std::io::Result<()> {
         use std::io::Write;
-        for &(index, name) in items {
+        for (i, &(index, name)) in items.iter().enumerate() {
             let address = self.slot(index).load(Ordering::Acquire);
-            invoke(address, name)?;
+            invoke(offset + i, address, name)?;
             progress.write_all(&[1])?;
         }
         Ok(())
