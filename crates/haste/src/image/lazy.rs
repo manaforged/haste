@@ -16,7 +16,8 @@ use crate::sema::evaluate::Evaluate;
 use crate::sema::reach::{Instance, Reached, calls, infer_declared, infer_quiet, main_roots};
 use crate::sema::{Answer, Cache, Context, Edited};
 
-use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, host_symbol, stub, wait};
+use super::global_asm::Foreign;
+use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, stub, wait};
 
 /// What answers what a pass of inference asked for, and says what it added.
 pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<Answer>;
@@ -582,8 +583,9 @@ impl Jit {
         let members = self.frontier(cx, index);
         let (foreign, mut work): (Vec<usize>, Vec<usize>) = members.into_iter().filter(|&at| self.callees_typed(cx, at)).partition(|&at| cx.foreign(self.reached.list[at].0.0));
         for at in foreign {
-            match host_symbol(cx, self.reached.list[at].0.0) {
-                Ok(code) => {
+            let reached = &self.reached;
+            match self.image.with_pass(|image, pass| image.bind_foreign(cx, reached, at, Some(&mut pass.memory))) {
+                Ok(Foreign::Asm(code) | Foreign::Host(_, code)) => {
                     self.publish(at, code);
                 }
                 Err(_) => {
@@ -648,8 +650,7 @@ impl Jit {
     fn code(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Result<usize, Stop> {
         let item = self.reached.list[index].0.0;
         if cx.foreign(item) {
-            let code = host_symbol(cx, item).map_err(|error| Stop::Failed(error, item))?;
-            return Ok(self.publish(index, code));
+            return self.foreign_code(cx, index, journal);
         }
         if let Some(code) = self.prepped(cx, index, journal) {
             let origin = if crate::prep::bind(cx, &self.reached, index) == Some(code) { super::perf::Origin::Rustc } else { super::perf::Origin::Adapter };
@@ -673,6 +674,20 @@ impl Jit {
             }
         }
         Ok(self.image.slot(index).load(Ordering::Acquire))
+    }
+
+    /// Binds the foreign function `index` once the functions its `global_asm!` block calls are reached, publishes its code and returns it.
+    fn foreign_code(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Result<usize, Stop> {
+        let item = self.reached.list[index].0.0;
+        let wanted: Vec<Instance> = calls(cx, &self.reached.list[index].1).collect();
+        if !wanted.is_empty() {
+            self.reach(cx, wanted, journal)?;
+        }
+        let reached = &self.reached;
+        let bound = self.image.with_pass(|image, pass| image.bind_foreign(cx, reached, index, Some(&mut pass.memory)));
+        match bound.map_err(|error| Stop::Failed(error, item))? {
+            Foreign::Asm(code) | Foreign::Host(_, code) => Ok(self.publish(index, code)),
+        }
     }
 
     /// Publishes `code` as function `index`'s code, in its slot and every table that names it, marks it compiled and returns it.

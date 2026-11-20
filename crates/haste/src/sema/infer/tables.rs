@@ -266,11 +266,12 @@ fn visit_summary_edges(summary: &PolySummary, resolved: &[(SiteKey, ItemRef, Sub
     }
 }
 
-fn shape_calls(shape: &Shape) -> Box<dyn Iterator<Item = &Res> + '_> {
+/// The calls that the shape of an instance makes beside its body.
+pub(in crate::sema) fn shape_calls(shape: &Shape) -> Box<dyn Iterator<Item = &Res> + '_> {
     match shape {
         Shape::Glue(glue) => Box::new(glue.drop.iter().chain(&glue.parts).chain(&glue.resume)),
         Shape::Untuple(res) => Box::new(std::iter::once(res)),
-        Shape::Clone(calls) => Box::new(calls.iter()),
+        Shape::Clone(calls) | Shape::Asm(calls) => Box::new(calls.iter()),
         _ => Box::new(std::iter::empty()),
     }
 }

@@ -429,6 +429,9 @@ impl Loader<'_> {
         if name == "include" {
             return self.include(file, module, open);
         }
+        if name == "global_asm" {
+            self.out.global_asm.push(self.waiting(file, module, at));
+        }
         if BUILTIN.contains(&name) {
             return Ok(());
         }

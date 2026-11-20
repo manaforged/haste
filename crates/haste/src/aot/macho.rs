@@ -65,7 +65,7 @@ fn build_dyld_info(exe: &Executable, plan: &Plan<'_>, data_in_seg: u64, rodata_i
         bind.u8(0x51);
         for (i, name) in plan.imports.iter().enumerate() {
             bind.u8(0x40);
-            bind.u8(b'_');
+            bind.bytes(exe.target.symbol_prefix.as_bytes());
             bind.bytes(name.as_bytes());
             bind.u8(0);
             bind.u8(0x72);
@@ -137,8 +137,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
 
     let (rebase, bind) = build_dyld_info(exe, &plan, (data_off - data_seg_off) as u64, (rodata_off - data_seg_off) as u64, libs.len() == 1);
     let mut strtab = vec![0u8];
-    let sym_offs: Vec<u32> = plan.imports.iter().map(|n| { let o = strtab.len() as u32; strtab.push(b'_'); strtab.extend_from_slice(n.as_bytes()); strtab.push(0); o }).collect();
-    let fn_strx = exe.symbol_names("_", &mut strtab);
+    let sym_offs: Vec<u32> = plan.imports.iter().map(|n| { let o = strtab.len() as u32; strtab.extend_from_slice(exe.target.symbol_prefix.as_bytes()); strtab.extend_from_slice(n.as_bytes()); strtab.push(0); o }).collect();
+    let fn_strx = exe.symbol_names(exe.target.symbol_prefix, &mut strtab);
     let nlocals = fn_strx.len();
     let linkedit_off = data_seg_off + data_seg_filesz;
     let linkedit_va = data_seg_va + data_seg_vmsz as u64;

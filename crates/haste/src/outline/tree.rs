@@ -243,6 +243,8 @@ pub struct Crate {
     pub members: Vec<(MemberBlock, Waiting)>,
     pub fallback: Vec<usize>,
     pub foreign: Vec<Waiting>,
+    /// The module-level `global_asm!` calls, in the order they were read.
+    pub global_asm: Vec<Waiting>,
     pub derived: Vec<Held>,
     pub attributed: Vec<Held>,
     pub consumed: rustc_hash::FxHashSet<(u32, u32)>,

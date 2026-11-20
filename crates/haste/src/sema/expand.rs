@@ -148,6 +148,10 @@ fn body_range(file: &File, item: u32) -> Option<(u32, u32)> {
 }
 
 impl Writer {
+    fn new(home: ModRef, offset: u32) -> Self {
+        Writer { out: Tokens::default(), calls: HashMap::default(), offset, home, locals: Vec::new(), uses: Vec::new(), globs: Vec::new(), externs: Vec::new() }
+    }
+
     fn scan(&mut self, cx: &mut Context<'_>, run: Run<'_>, to: u32) -> Result<()> {
         let mut at = run.from;
         while at < to {
@@ -588,7 +592,7 @@ impl<'a> Context<'a> {
         let Some(builtin) = self.builtin(item) else {
             return Ok(None);
         };
-        let writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: 0, home, locals: Vec::new(), uses: Vec::new(), globs: Vec::new(), externs: Vec::new() };
+        let writer = Writer::new(home, 0);
         let start = open.checked_sub(1).and_then(|bang| call_path(src, bang, 0)).map_or(open, |(start, _)| start);
         let run = Run { src, from: 0, shift: 0, depth: 0, call: (src, start) };
         let mut out = Tokens::default();
@@ -596,6 +600,11 @@ impl<'a> Context<'a> {
             return Ok(None);
         }
         src.outputs.keep(key, out.finish(src.path.clone())?).map(Some)
+    }
+
+    /// The text of the template string, or string-writing macro call, at `range` of `src`, with macro calls expanded from module `home`; none when it is neither.
+    pub(super) fn template_text(&mut self, home: ModRef, src: &Source, range: (u32, u32)) -> Result<Option<String>> {
+        Writer::new(home, 0).literal(self, Run { src, from: 0, shift: 0, depth: 0, call: (src, range.0) }, range)
     }
 
     /// Parses the header of the function, constant or static `item`, with the macro expansions of any body that declares it.
@@ -645,7 +654,7 @@ impl<'a> Context<'a> {
         };
         let home = self.module_of(item)?;
         let before = self.asks.count();
-        let mut writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: file.source.len(), home, locals: Vec::new(), uses: Vec::new(), globs: Vec::new(), externs: Vec::new() };
+        let mut writer = Writer::new(home, file.source.len());
         writer.scan(self, Run { src: &file.source, from, shift: 0, depth: 0, call: (&file.source, from) }, to)?;
         if self.asks.count() > before {
             bail!("the macros that {} calls are not resolved yet", self.name(item));

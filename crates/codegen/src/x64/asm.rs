@@ -1,5 +1,6 @@
 mod relax;
 
+use crate::reloc::{RelocKind, StencilReloc};
 use relax::{Disp, Fixup};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -704,6 +705,16 @@ impl Asm {
     pub fn pop(&mut self, reg: Reg) {
         self.rex(false, 0, 0, reg as u8, false);
         self.code.push(0x58 + (reg as u8 & 7));
+    }
+
+    /// `call` to relocation symbol `sym`: PC-relative when `direct`, else through its call table slot at a 32-bit absolute address.
+    pub fn call_symbol(&mut self, sym: u32, direct: bool) -> StencilReloc {
+        if direct {
+            let at = self.call_pcrel32();
+            return StencilReloc::symbol(at, sym, RelocKind::PcRel32);
+        }
+        let at = self.call_slot_reloc();
+        StencilReloc::symbol(at, sym, RelocKind::Abs32)
     }
 
     /// `call` through the eight bytes at the 32-bit absolute address `at`.

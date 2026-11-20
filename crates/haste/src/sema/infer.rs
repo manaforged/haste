@@ -46,7 +46,7 @@ pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
 pub use select::header_bound_traits;
 pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
-pub(super) use tables::{CallSites, recount_call_sites};
+pub(super) use tables::{CallSites, recount_call_sites, shape_calls};
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -95,6 +95,7 @@ pub enum Shape {
     Ctor(u32),
     Clone(Vec<Res>),
     Anon(Anon),
+    Asm(Vec<Res>),
 }
 
 pub(super) type Name<'a> = (&'a str, u32);
@@ -199,6 +200,9 @@ pub(super) fn infer_with_hints(
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
     infer.run(foreign)?;
     let mut typed = infer.finish()?;
+    if foreign {
+        super::global_asm::bind(cx, item, &mut typed);
+    }
     if let Some(slot) = slot {
         typed.shape = Shape::Virtual(slot);
     }

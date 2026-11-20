@@ -12,10 +12,11 @@ use crate::sema::Context;
 use crate::sema::reach::{Instance, Reached};
 use crate::substrate::tally::{Tally, clock, tally};
 use crate::sync::lock;
-use haste_codegen::Code;
+use haste_codegen::{Code, Memory};
 
 use super::aot::{self, AotCode, AotFn, AotQueue, CachedAotTemplate, bucket_by_item, lpt_chunks};
 use super::stencil::{DictConfig, DistinctInst, GroupWork, aot_relocs_valid, item_err, mode_dict_key, mode_stencil_key};
+use super::global_asm::Foreign;
 use super::{Image, ImageMode, Pass, resolve_host_symbol, weak};
 
 const MIN_PARALLEL: usize = 64;
@@ -230,7 +231,7 @@ impl Image {
         let (claimed, seed) = seed_aot_roots(reached, roots);
         let mut broken = FxHashMap::default();
         let mut init_errors = Vec::new();
-        let work = image.prepare_work(cx, reached, &seed, &mut init_errors);
+        let work = image.prepare_work(cx, reached, &seed, (&mut init_errors, None));
         for (idx, err) in init_errors {
             broken.insert(idx, err);
         }
@@ -298,7 +299,7 @@ impl Image {
             }
             batch.sort_unstable();
             let mut batch_errors = Vec::new();
-            let work = self.prepare_work(cx, reached, &batch, &mut batch_errors);
+            let work = self.prepare_work(cx, reached, &batch, (&mut batch_errors, None));
             for (idx, err) in batch_errors {
                 broken.insert(idx, err);
             }
@@ -324,7 +325,7 @@ impl Image {
         let (mut errors, mut deferred, mut eval_requests) = (Vec::new(), Vec::new(), Vec::new());
         while let Some((batch, _guard)) = queue.pop() {
             let mut batch_errors = Vec::new();
-            let work = self.prepare_work(&mut cx, reached, &batch, &mut batch_errors);
+            let work = self.prepare_work(&mut cx, reached, &batch, (&mut batch_errors, None));
             errors.extend(batch_errors);
             if !work.is_empty() {
                 self.compile_worker_bucket(&mut cx, reached, &work, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
@@ -333,7 +334,7 @@ impl Image {
         (pass, errors, deferred, eval_requests)
     }
 
-    pub(super) fn prepare_work(&self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize], errors: &mut Vec<(usize, String)>) -> Vec<usize> {
+    pub(super) fn prepare_work(&self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize], (errors, mut memory): (&mut Vec<(usize, String)>, Option<&mut Memory>)) -> Vec<usize> {
         self.bind_foreign_statics(cx, reached, indices);
         let mut work = Vec::new();
         let mut foreign_fns = Vec::new();
@@ -346,8 +347,8 @@ impl Image {
                 work.push(index);
                 continue;
             }
-            match resolve_host_symbol(cx, item) {
-                Ok((sym, address)) if !lower::is_static(cx, item) => {
+            match self.bind_foreign(cx, reached, index, memory.as_deref_mut()) {
+                Ok(Foreign::Host(sym, address)) if !lower::is_static(cx, item) => {
                     if self.backend.is_jit() {
                         self.slot(index).store(address, Ordering::Release);
                     }

@@ -395,6 +395,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             Shape::Untuple(res) => self.untuple_call(res.clone()),
             &Shape::Ctor(variant) => self.ctor_body(variant),
             Shape::Clone(calls) => self.clone_body(calls.clone()),
+            Shape::Asm(_) => bail!("global_asm function is assembled directly"),
             Shape::Anon(anon) => self.expr(anon.root),
             Shape::Closure(closure) if closure.closure.coroutine => self.resume_root(closure.closure.body),
             Shape::Closure(closure) => {

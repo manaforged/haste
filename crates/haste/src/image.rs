@@ -2,6 +2,7 @@
 
 mod aot;
 mod expand;
+mod global_asm;
 mod lazy;
 pub mod perf;
 mod script;
@@ -358,10 +359,6 @@ pub(super) fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef)
     resolved.ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
 }
 
-fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, String> {
-    resolve_host_symbol(cx, item).map(|(_, addr)| addr)
-}
-
 /// Whether the foreign item `item` links weakly, so a missing symbol reads as null.
 pub(super) fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
     cx.attr_value(item, "linkage") == Some("extern_weak")
@@ -506,7 +503,7 @@ impl Image {
             self.reset_caches();
         }
         let mut errors = Vec::new();
-        let work = self.prepare_work(cx, reached, indices, &mut errors);
+        let work = self.with_pass(|image, pass| image.prepare_work(cx, reached, indices, (&mut errors, Some(&mut pass.memory))));
         errors.extend(self.compile_all(cx, reached, &work));
         self.apply_records();
         self.link();
