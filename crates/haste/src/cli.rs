@@ -95,27 +95,44 @@ pub(crate) struct TestItem {
     pub should_panic: bool,
 }
 
-pub(crate) fn test_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<TestItem> {
-    let mut found = Vec::new();
-    for krate in outline.members(workspace) {
-        let tree = &outline.crates[krate];
-        for (file_at, file) in tree.files.iter().enumerate() {
-            for (at, item) in file.items.items.iter().enumerate() {
-                if item.kind != outline::item::ItemKind::Fn {
-                    continue;
-                }
-                if !outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test") {
-                    continue;
-                }
-                found.push(TestItem {
-                    item: ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 },
-                    ignored: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "ignore"),
-                    should_panic: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic"),
-                });
-            }
+fn item_enabled(tree: &outline::tree::Crate, file_at: usize, mut at: usize) -> bool {
+    let items = &tree.files[file_at].items.items;
+    let mut cur = Some(at);
+    while let Some(idx) = cur {
+        let item = &items[idx];
+        if !tree.env.enabled(&item.attrs) {
+            return false;
         }
+        if idx != at && !matches!(item.kind, outline::item::ItemKind::Mod) {
+            return false;
+        }
+        cur = item.parent.map(|p| p as usize);
     }
-    found
+    let _ = &mut at;
+    true
+}
+
+fn member_fns<'a>(workspace: &'a graph::Workspace, outline: &'a outline::Outline) -> impl Iterator<Item = (ItemRef, &'a outline::tree::Crate, &'a outline::tree::File, &'a outline::item::Item)> + 'a {
+    outline.members(workspace).flat_map(move |krate| {
+        let tree = &outline.crates[krate];
+        tree.files.iter().enumerate().flat_map(move |(file_at, file)| {
+            file.items.items.iter().enumerate().filter_map(move |(at, item)| {
+                (item.kind == outline::item::ItemKind::Fn && item.body.is_some() && item_enabled(tree, file_at, at))
+                    .then_some((ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 }, tree, file.as_ref(), item))
+            })
+        })
+    })
+}
+
+pub(crate) fn test_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<TestItem> {
+    member_fns(workspace, outline)
+        .filter(|(_, tree, file, item)| outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test"))
+        .map(|(item_ref, tree, file, item)| TestItem {
+            item: item_ref,
+            ignored: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "ignore"),
+            should_panic: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic"),
+        })
+        .collect()
 }
 
 /// Formats and prints standard Rust test output and returns 0 when all tests pass, else 101.
@@ -169,34 +186,14 @@ pub(crate) fn print_test_report(
 }
 
 pub(crate) fn lib_fn_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
-    let mut found = Vec::new();
-    for krate in outline.members(workspace) {
-        let tree = &outline.crates[krate];
-        for (file_at, file) in tree.files.iter().enumerate() {
-            for (at, item) in file.items.items.iter().enumerate() {
-                if item.kind == outline::item::ItemKind::Fn && item.body.is_some() {
-                    found.push(ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 });
-                }
-            }
-        }
-    }
-    found
+    member_fns(workspace, outline).map(|(item_ref, _, _, _)| item_ref).collect()
 }
 
 pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
-    let mut found = Vec::new();
-    for krate in outline.members(workspace) {
-        let tree = &outline.crates[krate];
-        for (file_at, file) in tree.files.iter().enumerate() {
-            for (at, item) in file.items.items.iter().enumerate() {
-                let named = item.name.is_some_and(|name| file.source.text(name).starts_with("case_"));
-                if named && item.kind == outline::item::ItemKind::Fn {
-                    found.push(ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 });
-                }
-            }
-        }
-    }
-    found
+    member_fns(workspace, outline)
+        .filter(|(_, _, file, item)| item.name.is_some_and(|name| file.source.text(name).starts_with("case_")))
+        .map(|(item_ref, _, _, _)| item_ref)
+        .collect()
 }
 
 pub(crate) type Failures = std::collections::BTreeMap<String, Vec<String>>;

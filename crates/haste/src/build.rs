@@ -497,7 +497,8 @@ impl Batch {
             match found {
                 Some((at, error)) => {
                     let loc = outline.map(|o| item_loc(o, self.reached.list[at].0.0)).unwrap_or_default();
-                    failures.entry(error_kind(error)).or_default().push(format!("{loc}{name}: {error}"));
+                    let msg = if error.starts_with(name.as_str()) { format!("{loc}{error}") } else { format!("{loc}{name}: {error}") };
+                    failures.entry(error_kind(error)).or_default().push(msg);
                 }
                 None => runnable.push((root, name.as_str())),
             }

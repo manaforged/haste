@@ -124,9 +124,11 @@ impl Program {
         let served = serve(compilation, &crate::macros::load, &mut self.jit, &mut run);
         compilation.settle();
         served?;
-        eprintln!("compiled {} of {} functions declared", self.jit.compiled.len(), self.jit.reached.list.len());
-        if let Some(counts) = crate::prep::decided() {
-            eprintln!("prep {counts}");
+        if haste_codegen::trace_enabled() {
+            eprintln!("compiled {} of {} functions declared", self.jit.compiled.len(), self.jit.reached.list.len());
+            if let Some(counts) = crate::prep::decided() {
+                eprintln!("prep {counts}");
+            }
         }
         run.status.ok_or_else(|| anyhow!("the program did not start"))
     }
