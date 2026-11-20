@@ -4,8 +4,9 @@
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "macos"),
+    all(target_arch = "x86_64", target_os = "macos"),
 )))]
-compile_error!("haste currently supports x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, and aarch64-apple-darwin hosts");
+compile_error!("haste currently supports x86_64/aarch64 Linux and macOS hosts");
 
 mod aot;
 mod body;

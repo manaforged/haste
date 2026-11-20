@@ -184,7 +184,7 @@ impl Driver for Run<'_, '_> {
 }
 
 /// The CPU time, in seconds, that running one constant item may take before its child is stopped.
-const EVALUATION_SECONDS: libc::time_t = 10;
+const EVALUATION_SECONDS: i64 = 10;
 
 /// The one child that runs a constant item, and how it ended.
 struct Once(Option<Ended>);
@@ -242,7 +242,7 @@ impl Image {
     /// Runs the constant item at slot `entry` in this forked child under a CPU time limit and writes its value, 128 bits wide when `wide`, to `out`; returns the exit status.
     fn evaluate_in_child(&self, entry: usize, wide: bool, out: Option<std::fs::File>) -> i32 {
         let Some(mut out) = out else { return 1 };
-        let limit = libc::itimerval { it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, it_value: libc::timeval { tv_sec: EVALUATION_SECONDS, tv_usec: 0 } };
+        let limit = libc::itimerval { it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, it_value: libc::timeval { tv_sec: EVALUATION_SECONDS as _, tv_usec: 0 } };
         // SAFETY: setitimer arms only this child's virtual timer, from a live itimerval.
         unsafe { libc::setitimer(libc::ITIMER_VIRTUAL, &limit, std::ptr::null_mut()) };
         let address = self.slot(entry).load(Ordering::Acquire);
