@@ -552,6 +552,38 @@ impl Image {
         })
     }
 
+    /// Runs a single `#[test]` function in a forked child with stderr captured, returning `(exit_status, stderr)`.
+    pub fn run_test_captured(&self, index: usize, start: Option<usize>, name: &str) -> Result<(i32, String)> {
+        let address = self.slot(index).load(Ordering::Acquire);
+        if address == 0 {
+            bail!("{name} has no code");
+        }
+        if let Some(s) = start
+            && self.slot(s).load(Ordering::Acquire) == 0
+        {
+            bail!("{name} has no start wrapper (slot {s})");
+        }
+        let (pid, mut stderr_pipe) = fork_piped(|writer| {
+            // SAFETY: writer is a live pipe write fd; dup2 redirects child stderr to it before running the test.
+            unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&writer), libc::STDERR_FILENO) };
+            drop(writer);
+            if let Some(start) = start {
+                let status = self.enter_main((start, index), &[name.to_owned()]);
+                if status != 0 {
+                    std::process::exit(status);
+                }
+            } else {
+                // SAFETY: address is code that the encoder wrote for a native fn() signature, checked to be set before the fork.
+                let test_fn: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
+                test_fn();
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
+        let mut stderr = Vec::new();
+        std::io::Read::read_to_end(&mut stderr_pipe, &mut stderr)?;
+        Ok((wait(pid), String::from_utf8_lossy(&stderr).into_owned()))
+    }
+
     /// Runs each `#[test]` function `(index, start_index, name)` in a forked child and returns each test's exit status (0 for pass, non-zero for panic/Err).
     pub fn run_tests(&self, tests: &[(usize, Option<usize>, &str)]) -> Result<Vec<i32>> {
         let pairs: Vec<(usize, &str)> = tests.iter().map(|&(idx, _, name)| (idx, name)).collect();

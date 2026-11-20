@@ -9,35 +9,35 @@ use super::cargo::{self, Toolchain};
 use super::files;
 
 macro_rules! sources {
-    ($($path:literal),* $(,)?) => {
-        [$(($path, include_str!(concat!("../../../prep-driver/", $path)))),*]
+    ($($out:literal => $src:literal),* $(,)?) => {
+        [$(($out, include_str!(concat!("../../prep-driver/", $src)))),*]
     };
 }
 
 /// The source of the prep driver, which Haste builds once per toolchain into its store.
 const SOURCES: [(&str, &str); 22] = sources!(
-    "Cargo.toml",
-    "Cargo.lock",
-    "build.rs",
-    "src/main.rs",
-    "src/abi.rs",
-    "src/args.rs",
-    "src/delta.rs",
-    "src/elf.rs",
-    "src/error.rs",
-    "src/export.rs",
-    "src/files.rs",
-    "src/form.rs",
-    "src/key.rs",
-    "src/layout.rs",
-    "src/link.rs",
-    "src/object.rs",
-    "src/print.rs",
-    "src/record.rs",
-    "src/source.rs",
-    "src/statics.rs",
-    "src/uses.rs",
-    "src/wrap.rs",
+    "Cargo.toml" => "Cargo.toml.in",
+    "Cargo.lock" => "Cargo.lock",
+    "build.rs" => "build.rs",
+    "src/main.rs" => "src/main.rs",
+    "src/abi.rs" => "src/abi.rs",
+    "src/args.rs" => "src/args.rs",
+    "src/delta.rs" => "src/delta.rs",
+    "src/elf.rs" => "src/elf.rs",
+    "src/error.rs" => "src/error.rs",
+    "src/export.rs" => "src/export.rs",
+    "src/files.rs" => "src/files.rs",
+    "src/form.rs" => "src/form.rs",
+    "src/key.rs" => "src/key.rs",
+    "src/layout.rs" => "src/layout.rs",
+    "src/link.rs" => "src/link.rs",
+    "src/object.rs" => "src/object.rs",
+    "src/print.rs" => "src/print.rs",
+    "src/record.rs" => "src/record.rs",
+    "src/source.rs" => "src/source.rs",
+    "src/statics.rs" => "src/statics.rs",
+    "src/uses.rs" => "src/uses.rs",
+    "src/wrap.rs" => "src/wrap.rs",
 );
 
 const DRIVER: &str = "driver";

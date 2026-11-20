@@ -29,6 +29,38 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
     parts
 }
 
+/// Returns the `expected` string of `#[should_panic(expected = "...")]` or `#[should_panic = "..."]`, if present.
+pub fn should_panic_expected(src: &Source, attrs: &[Attr], env: &Env) -> Option<String> {
+    for attr in attrs {
+        match attr {
+            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => {
+                if let Some(found) = should_panic_expected(src, inner, env) {
+                    return Some(found);
+                }
+            }
+            &Attr::Other(at) if attr_is_named(src, at, "should_panic") => {
+                let mut end = at;
+                while matches!(src.kind(end), TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon) {
+                    end += 1;
+                }
+                if src.kind(end) == TokenKind::Eq {
+                    return Some(unquote(src.text(end + 1)));
+                }
+                if src.kind(end) == TokenKind::OpenParen {
+                    let close = src.pair(end);
+                    for (from, to) in split_commas(src, end + 1, close) {
+                        if from + 2 < to && src.text(from) == "expected" && src.kind(from + 1) == TokenKind::Eq {
+                            return Some(unquote(src.text(from + 2)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Whether `attrs` contains an attribute named `wanted` (bare or under a standard prelude path), directly or via an active `cfg_attr`.
 pub fn has_attr(src: &Source, attrs: &[Attr], env: &Env, wanted: &str) -> bool {
     attrs.iter().any(|attr| match attr {

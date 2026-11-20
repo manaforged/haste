@@ -13,13 +13,13 @@ mod race;
 mod record;
 mod sources;
 mod statics;
-#[path = "../../prep-driver/src/files.rs"]
+#[path = "../prep-driver/src/files.rs"]
 mod files;
-#[path = "../../prep-driver/src/form.rs"]
+#[path = "../prep-driver/src/form.rs"]
 mod form;
-#[path = "../../prep-driver/src/print.rs"]
+#[path = "../prep-driver/src/print.rs"]
 mod print;
-#[path = "../../prep-driver/src/source.rs"]
+#[path = "../prep-driver/src/source.rs"]
 mod source;
 
 use std::ffi::{CStr, CString};

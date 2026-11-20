@@ -57,6 +57,8 @@ haste -V|--version | -h|--help
 - `-F FEATURES`, `--features FEATURES`: Comma- or space-separated list of Cargo features to enable (repeatable).
 - `--all-features`: Enables all features on the selected workspace packages.
 - `--no-default-features`: Disables the `default` feature on the selected workspace packages.
+- `--ignored`: Runs only `#[ignore]` tests (`haste test` only).
+- `--include-ignored`: Runs both normal and `#[ignore]` tests (`haste test` only).
 - `--jobs N`: Sets the worker thread or process count. Defaults to the cores available to the process.
 - `--release`: Enables full codegen optimization and release `cfg` settings.
 - `-o PATH`, `--output PATH`: Writes a standalone native executable (`haste build` only).

@@ -67,6 +67,8 @@ pub(crate) struct Selection {
     pub features: Vec<String>,
     pub all_features: bool,
     pub no_default_features: bool,
+    pub ignored_only: bool,
+    pub include_ignored: bool,
 }
 
 static SELECTION: OnceLock<Selection> = OnceLock::new();

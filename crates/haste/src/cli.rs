@@ -88,11 +88,12 @@ fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
 }
 
 /// Metadata for a discovered `#[test]` function.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct TestItem {
     pub item: ItemRef,
     pub ignored: bool,
     pub should_panic: bool,
+    pub expected: Option<String>,
 }
 
 fn item_enabled(tree: &outline::tree::Crate, file_at: usize, mut at: usize) -> bool {
@@ -127,49 +128,60 @@ fn member_fns<'a>(workspace: &'a graph::Workspace, outline: &'a outline::Outline
 pub(crate) fn test_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<TestItem> {
     member_fns(workspace, outline)
         .filter(|(_, tree, file, item)| outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test"))
-        .map(|(item_ref, tree, file, item)| TestItem {
-            item: item_ref,
-            ignored: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "ignore"),
-            should_panic: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic"),
+        .map(|(item_ref, tree, file, item)| {
+            let should_panic = outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic");
+            let expected = should_panic.then(|| outline::attr::should_panic_expected(&file.source, &item.attrs, &tree.env)).flatten();
+            TestItem {
+                item: item_ref,
+                ignored: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "ignore"),
+                should_panic,
+                expected,
+            }
         })
         .collect()
 }
 
 /// Formats and prints standard Rust test output and returns 0 when all tests pass, else 101.
 pub(crate) fn print_test_report(
-    entries: &[(&str, TestItem, Option<Result<i32, &str>>)],
+    entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
     elapsed: std::time::Duration,
 ) -> i32 {
     println!("\nrunning {} test{}", entries.len(), if entries.len() == 1 { "" } else { "s" });
     let (mut passed, mut failed, mut ignored) = (0usize, 0usize, 0usize);
     let mut details: Vec<(&str, String)> = Vec::new();
     for &(name, meta, ref outcome) in entries {
-        if meta.ignored {
+        let Some(outcome) = outcome else {
             println!("test {name} ... ignored");
             ignored += 1;
             continue;
-        }
+        };
         match outcome {
-            Some(Ok(status)) => {
-                let ok = if meta.should_panic { *status != 0 } else { *status == 0 };
+            Ok((status, stderr)) => {
+                let expected_ok = match (&meta.expected, stderr) {
+                    (Some(exp), Some(err)) => err.contains(exp.as_str()),
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+                let ok = if meta.should_panic { *status != 0 && expected_ok } else { *status == 0 };
                 if ok {
                     println!("test {name} ... ok");
                     passed += 1;
                 } else {
-                    let msg = if meta.should_panic { "note: test did not panic as expected".to_owned() } else { format!("exited with status {status}") };
+                    let msg = if meta.should_panic && *status == 0 {
+                        "note: test did not panic as expected".to_owned()
+                    } else if let Some(exp) = &meta.expected {
+                        format!("note: panic did not contain expected string `{exp}`\n{}", stderr.as_deref().unwrap_or("").trim())
+                    } else {
+                        format!("exited with status {status}")
+                    };
                     println!("test {name} ... FAILED");
                     details.push((name, msg));
                     failed += 1;
                 }
             }
-            Some(Err(err)) => {
+            Err(err) => {
                 println!("test {name} ... FAILED");
                 details.push((name, (*err).to_owned()));
-                failed += 1;
-            }
-            None => {
-                println!("test {name} ... FAILED");
-                details.push((name, "test did not compile".to_owned()));
                 failed += 1;
             }
         }
@@ -460,6 +472,14 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
             "--no-default-features" => {
                 args.next();
                 selection.no_default_features = true;
+            }
+            "--ignored" => {
+                args.next();
+                selection.ignored_only = true;
+            }
+            "--include-ignored" => {
+                args.next();
+                selection.include_ignored = true;
             }
             "--jobs" => {
                 args.next();

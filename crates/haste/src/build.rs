@@ -258,7 +258,10 @@ fn finish_batch(
     let outline = cx.outline;
     let mut store = cx.release().0;
     save_batch_substrate((outline, &mut store), &mut image, (drop_finals, kind), substrate, pre_builder);
-    let tests = start_indices.into_iter().map(|start| (TestItem { item: ItemRef { krate: 0, file: 0, item: 0 }, ignored: false, should_panic: false }, start)).collect();
+    let tests = start_indices
+        .into_iter()
+        .map(|start| (TestItem { item: ItemRef { krate: 0, file: 0, item: 0 }, ignored: false, should_panic: false, expected: None }, start))
+        .collect();
     Ok(Batch { kind, store: Some(store), labels, roots, tests, reached, image, broken, reach_span, codegen_span })
 }
 
@@ -545,38 +548,47 @@ impl Batch {
     }
 
     fn report_tests(&self, outline: &outline::Outline, started: Instant, filters: &[String]) -> Result<i32> {
+        let sel = crate::selection();
         let mut to_run = Vec::new();
         let mut errs: Vec<String> = Vec::new();
-        let mut raw: Vec<(&str, TestItem, Option<Result<i32, usize>>)> = Vec::new();
-        for ((&root, name), &(meta, start)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
+        let mut raw: Vec<(&str, &TestItem, Option<Result<(usize, Option<usize>), usize>>)> = Vec::new();
+        for ((&root, name), (meta, start)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
             if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
                 continue;
             }
-            let check_roots: Vec<usize> = start.into_iter().chain(std::iter::once(root)).collect();
-            let outcome = if meta.ignored {
+            if sel.ignored_only && !meta.ignored {
+                continue;
+            }
+            let skip = meta.ignored && !sel.ignored_only && !sel.include_ignored;
+            let check_roots: Vec<usize> = (*start).into_iter().chain(std::iter::once(root)).collect();
+            let outcome = if skip {
                 None
             } else if let Some((at, err)) = self.reached.closure(&check_roots).iter().rev().find_map(|&at| self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)).map(|e| (at, e))) {
                 let idx = errs.len();
                 errs.push(format!("{}{err}", item_loc(outline, self.reached.list[at].0.0)));
                 Some(Err(idx))
             } else {
-                to_run.push((root, start, name.as_str()));
-                Some(Ok(0))
+                if meta.expected.is_none() {
+                    to_run.push((root, *start, name.as_str()));
+                }
+                Some(Ok((root, *start)))
             };
             raw.push((name.as_str(), meta, outcome));
         }
         let mut ran = self.image.run_tests(&to_run)?.into_iter();
-        let entries: Vec<(&str, TestItem, Option<Result<i32, &str>>)> = raw
-            .into_iter()
-            .map(|(name, meta, outcome)| {
-                let outcome = match outcome {
-                    None => None,
-                    Some(Err(idx)) => Some(Err(errs[idx].as_str())),
-                    Some(Ok(_)) => ran.next().map(Ok),
-                };
-                (name, meta, outcome)
-            })
-            .collect();
+        let mut entries: Vec<(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)> = Vec::with_capacity(raw.len());
+        for (name, meta, outcome) in raw {
+            let resolved = match outcome {
+                None => None,
+                Some(Err(idx)) => Some(Err(errs[idx].as_str())),
+                Some(Ok((root, start))) if meta.expected.is_some() => {
+                    let (status, stderr) = self.image.run_test_captured(root, start, name)?;
+                    Some(Ok((status, Some(stderr))))
+                }
+                Some(Ok(_)) => ran.next().map(|s| Ok((s, None))),
+            };
+            entries.push((name, meta, resolved));
+        }
         Ok(print_test_report(&entries, started.elapsed()))
     }
 }
@@ -589,7 +601,7 @@ fn item_loc(outline: &outline::Outline, item: ItemRef) -> String {
 
 fn map_tests(roots: &[usize], reached: &Reached, starts: &[Option<usize>], items: Vec<TestItem>) -> Vec<(TestItem, Option<usize>)> {
     let by_item: HashMap<ItemRef, TestItem> = items.into_iter().map(|t| (t.item, t)).collect();
-    roots.iter().zip(starts).map(|(&idx, &start)| (by_item[&reached.list[idx].0.0], start)).collect()
+    roots.iter().zip(starts).map(|(&idx, &start)| (by_item[&reached.list[idx].0.0].clone(), start)).collect()
 }
 
 impl Build {
@@ -629,7 +641,7 @@ impl Build {
             let kind = if discovered.is_empty() { BatchKind::Cases } else { BatchKind::Tests };
             let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
             if kind == BatchKind::Tests {
-                let starts: Vec<Option<usize>> = batch.tests.iter().map(|&(_, s)| s).collect();
+                let starts: Vec<Option<usize>> = batch.tests.iter().map(|(_, s)| *s).collect();
                 batch.tests = map_tests(&batch.roots, &batch.reached, &starts, discovered);
             }
             self.cases = Some(batch);
