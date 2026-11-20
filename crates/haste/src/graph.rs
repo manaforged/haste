@@ -384,6 +384,25 @@ pub fn library() -> Result<PathBuf> {
         let dir = root.join("lib/rustlib/src/rust/library");
         dir.join("sysroot").is_dir().then_some(dir)
     };
+    let home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|home| PathBuf::from(home).join(".rustup")));
+    if std::env::var_os("RUSTC").is_none()
+        && let Some(ref rustup_home) = home
+    {
+        let active = std::env::var("RUSTUP_TOOLCHAIN").ok().or_else(|| {
+            let text = std::fs::read_to_string(rustup_home.join("settings.toml")).ok()?;
+            text.lines().find_map(|line| {
+                let rest = line.trim().strip_prefix("default_toolchain")?.trim().strip_prefix('=')?.trim();
+                Some(rest.trim_matches('"').to_owned())
+            })
+        });
+        if let Some(tc) = active
+            && let Some(dir) = sysroot_library(&rustup_home.join("toolchains").join(tc))
+        {
+            return Ok(dir);
+        }
+    }
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
     if let Ok(output) = std::process::Command::new(rustc).args(["--print", "sysroot"]).output()
         && output.status.success()
@@ -392,7 +411,6 @@ pub fn library() -> Result<PathBuf> {
     {
         return Ok(dir);
     }
-    let home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
     if let Some(toolchains) = home.map(|home| home.join("toolchains"))
         && let Ok(entries) = std::fs::read_dir(&toolchains)
     {
