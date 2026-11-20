@@ -2,6 +2,7 @@
 
 pub mod adt;
 mod body_scope;
+mod borrow;
 mod builtin;
 pub mod census;
 pub mod evaluate;

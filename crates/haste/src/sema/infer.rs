@@ -206,6 +206,9 @@ pub(super) fn infer_with_hints(
     if let Some(slot) = slot {
         typed.shape = Shape::Virtual(slot);
     }
+    if !foreign && !cx.outline.crates[item.krate as usize].env.fixed && matches!(typed.shape, Shape::Body) {
+        super::borrow::check(cx, item, (&body, &sig), src, &typed)?;
+    }
     settle(cx, (item, substs), typed)
 }
 
@@ -741,7 +744,7 @@ pub fn discriminants(cx: &mut Context<'_>, item: ItemRef, primitive: Primitive) 
     detached(cx, item, |infer| infer.discriminants(item, primitive))
 }
 
-pub use zonk::{is_case_sig, is_concrete_fn, test_sig};
+pub use zonk::{is_case_sig, is_concrete_fn, is_copy, test_sig};
 
 /// The return type of the non-generic function `item`.
 pub fn return_type(cx: &mut Context<'_>, item: ItemRef) -> Result<Ty> {

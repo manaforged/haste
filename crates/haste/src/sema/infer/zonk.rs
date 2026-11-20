@@ -573,6 +573,11 @@ impl Infer<'_, '_> {
     }
 }
 
+/// Whether `ty` implements `Copy` in the context of `item`.
+pub fn is_copy(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<bool> {
+    detached(cx, item, |infer| infer.is_copy(ty))
+}
+
 /// Whether `item` is a non-generic synchronous `fn(i64) -> i64` suitable as a JIT test case.
 pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
     let Ok(sig) = cx.signature(item) else { return false };
