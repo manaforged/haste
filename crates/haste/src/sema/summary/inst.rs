@@ -246,7 +246,9 @@ impl PolyInst {
             let (_, item, substs) = self.resolved_calls[idx];
             return Some((item, substs));
         }
-        if matches!(key, SiteKey::Operator(_)) {
+        if let SiteKey::Operator(expr) = key
+            && self.builtin_ops.binary_search(&expr).is_ok()
+        {
             return None;
         }
         if let SiteKey::ExprRes(expr) = key

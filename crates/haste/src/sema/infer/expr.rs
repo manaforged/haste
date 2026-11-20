@@ -323,6 +323,9 @@ impl Infer<'_, '_> {
             let mut at = 0;
             while at < self.operands.len() {
                 let (expr, op, operands, out) = self.operands[at];
+                if matches!(op, BinOp::Shl | BinOp::Shr) {
+                    self.hint_scalar_var(operands.0, Some(out))?;
+                }
                 let compound = matches!(self.body.expr(expr), Expr::AssignOp(..));
                 if if compound { self.unknown_operand(operands.0) } else { self.pending(op, operands)? } {
                     at += 1;

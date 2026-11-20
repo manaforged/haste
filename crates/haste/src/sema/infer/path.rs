@@ -230,7 +230,11 @@ impl<'a> Infer<'_, 'a> {
         let entry = body.path(path);
         let single = entry.qself.is_none() && !entry.global && entry.segments.len == 1;
         let first = body.segments[body.list(entry.segments)[0] as usize].name;
-        if single && let Some(found) = self.bound_value(crate::names::plain(self.src.text(first)), self.src.scope(first))? {
+        let mut scope = self.src.scope(first);
+        if single && scope == (0, 0) && self.src.mark(first).is_none() {
+            scope = self.proc_call_scope(first);
+        }
+        if single && let Some(found) = self.bound_value(crate::names::plain(self.src.text(first)), scope)? {
             return Ok(found);
         }
         if let Some(ctor) = self.ctor(body, path, true)? {
@@ -264,6 +268,31 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The local that `name` written in hygiene scope `(id, parent)` finds: one its own expansion bound, else one of the scope its macro was defined in, else one the program bound; or a const parameter.
+    fn proc_call_scope(&self, token: u32) -> (u32, u32) {
+        let Some(root) = self.root else { return (0, 0) };
+        let Some(raw) = self.cx.outline.crates.get(root.krate as usize).and_then(|c| c.files.get(root.file as usize)) else { return (0, 0) };
+        if token < raw.source.len() {
+            return (0, 0);
+        }
+        let Some(exp) = raw.expansion(root.krate, root.item) else { return (0, 0) };
+        let enclosing = |pos: u32| {
+            exp.calls
+                .iter()
+                .filter_map(|(&co, &bo)| (pos > bo && pos < self.src.pair(bo)).then_some((co, bo)))
+                .max_by_key(|&(_, bo)| bo)
+        };
+        let Some((mut call_open, _)) = enclosing(token) else { return (0, 0) };
+        for _ in 0..8 {
+            let scope = self.src.scope(call_open.saturating_sub(2));
+            if scope != (0, 0) {
+                return scope;
+            }
+            let Some((outer, _)) = enclosing(call_open) else { break };
+            call_open = outer;
+        }
+        (0, 0)
+    }
+
     fn bound_value(&mut self, name: &str, (id, parent): (u32, u32)) -> Result<Option<(Ty, Res)>> {
         let found = [id, parent, 0].into_iter().find_map(|scope| self.scopes.iter().rev().find(|(bound, _)| *bound == (name, scope)));
         if let Some(&(_, local)) = found {

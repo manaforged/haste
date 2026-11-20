@@ -336,10 +336,11 @@ impl<'a> Infer<'_, 'a> {
             return Ok(types);
         }
         let frame = self.frame(item, substs)?;
-        let foreign = sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item);
         let (types, opaque) = self.with_frame(frame, |infer| {
+            let hidden_len = infer.hidden.len();
             let types = infer.sig_types(&sig)?;
-            let opaque = if foreign { Some(infer.foreign_opaque(item, substs, &sig, types.1)?) } else { None };
+            infer.hidden.truncate(hidden_len);
+            let opaque = if sig.opaque { Some(infer.foreign_opaque(item, substs, &sig, types.1)?) } else { None };
             Ok((types, opaque))
         })?;
         if let Some(opaque) = opaque {

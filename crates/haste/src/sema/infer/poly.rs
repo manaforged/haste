@@ -49,7 +49,7 @@ pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, p
     let (Ok(sig), Ok(body), Ok(home)) = (cx.signature(item), cx.body(item), cx.module_of(item)) else {
         return SummaryKind::MonomorphicFallback;
     };
-    if sig.is_async {
+    if sig.is_async || (param_count == 0 && sig.body.tys.iter().any(|ty| matches!(ty, crate::body::Ty::ImplTrait(..)))) {
         return SummaryKind::MonomorphicFallback;
     }
     let args: Vec<Ty> = (0..param_count).map(|idx| cx.types.intern(Kind::Param(idx))).collect();

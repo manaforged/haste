@@ -59,7 +59,7 @@ impl Names {
             let Some(entry) = self.crates.get_mut(at.krate as usize) else {
                 continue;
             };
-            if entry.whole.insert(at.module) {
+            if !entry.eager && entry.whole.insert(at.module) {
                 new = true;
                 entry.pending.iter_mut().filter(|pending| pending.module == at.module).for_each(|pending| pending.active = true);
             }
@@ -70,14 +70,21 @@ impl Names {
                     _ => None,
                 })
                 .collect();
-            modules.extend(targets.into_iter().filter(|target| self.crates.get(target.krate as usize).is_some_and(|other| !other.whole.contains(&target.module))));
+            modules.extend(targets.into_iter().filter(|target| self.crates.get(target.krate as usize).is_some_and(|other| !other.resolves_all(target.module))));
         }
         new
     }
 
     pub(super) fn spread_whole(&mut self) -> bool {
-        let modules = self.crates.iter().enumerate().flat_map(|(krate, entry)| entry.whole.iter().map(move |&module| ModRef { krate: krate as u32, module }));
-        let modules: Vec<ModRef> = modules.collect();
+        let modules: Vec<ModRef> = self
+            .crates
+            .iter()
+            .enumerate()
+            .flat_map(|(krate, entry)| {
+                let eager = entry.eager.then(|| entry.globs.keys().copied()).into_iter().flatten();
+                eager.chain(entry.whole.iter().copied()).map(move |module| ModRef { krate: krate as u32, module })
+            })
+            .collect();
         self.want_whole(modules)
     }
 

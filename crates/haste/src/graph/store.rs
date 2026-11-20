@@ -38,11 +38,11 @@ pub struct Expansion {
 }
 
 impl Expansion {
-    /// The call of procedural macro `name` of the pinned crate `pin` on `texts`, by this program.
-    pub fn new(pin: u64, name: &str, texts: &[String]) -> Expansion {
+    /// The call of procedural macro `name` of the pinned crate `pins.0` from `pins.1` on `texts`, by this program.
+    pub fn new((pin, caller): (u64, u64), name: &str, texts: &[String]) -> Expansion {
         let program = program();
-        let key = rustc_hash::FxBuildHasher.hash_one((pin, name, texts, program));
-        let inputs = format!("{pin:016x} {program:?} {name}\0{}", texts.join("\0"));
+        let key = rustc_hash::FxBuildHasher.hash_one((pin, caller, name, texts, program));
+        let inputs = format!("{pin:016x}:{caller:016x} {program:?} {name}\0{}", texts.join("\0"));
         Expansion { path: home().join("macros").join(format!("{key:016x}")), inputs }
     }
 

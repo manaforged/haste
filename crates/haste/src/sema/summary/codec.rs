@@ -23,8 +23,8 @@ pub use mono::{decode_typed, decode_verdict, encode_typed, encode_verdict};
 pub(crate) use files::ItemRecord;
 use files::{read_items, write_items};
 
-const CODEC_MAGIC: [u8; 4] = *b"HPS1";
-const INST_MAGIC: [u8; 4] = *b"HFI1";
+const CODEC_MAGIC: [u8; 4] = *b"HPS2";
+const INST_MAGIC: [u8; 4] = *b"HFI2";
 
 /// Encodes `summary` into a workspace-invariant byte vector, or `None` if it references non-sysroot items.
 pub fn encode_summary(outline: &Outline, types: &Types, summary: &PolySummary, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Result<Option<Vec<u8>>> {

@@ -562,7 +562,9 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                 }
             }
             let (follow, mut path, mut extra, mut dom) = exits.start(&cfg, block, entry);
-            if let Some(pred) = follow {
+            if let Some(pred) = follow
+                && matches!(func.last(pred), Some(&Op::Brif(_, then, _, otherwise, _)) if then != otherwise)
+            {
                 path.follow(func, &ranges, pred, block);
                 extra.follow(func, (&cfg, &ranges, &env, &path), pred, block);
                 dom.propagate_selects(func, (&cfg, &ranges, &env, &mut path, &extra), &live.recs, block, &seen);

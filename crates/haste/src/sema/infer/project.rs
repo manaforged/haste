@@ -35,6 +35,7 @@ impl Infer<'_, '_> {
         });
         if param == "Self"
             && let Some(of) = owner_trait
+            && self.reaches_assoc_ty(of, name)?
         {
             let count = type_params(&self.cx.trait_generics(of)?.1.params).count();
             let args: Vec<Ty> = self.generics.iter().take(count).map(|&(_, ty)| ty).collect();
@@ -59,6 +60,9 @@ impl Infer<'_, '_> {
         let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else {
             return Ok(None);
         };
+        if !self.reaches_assoc_ty(of, name)? {
+            return Ok(None);
+        }
         let count = self.impl_params(block)?;
         let args = if self.generics.len() >= count {
             let impl_args: Vec<Ty> = self.generics[..count].iter().map(|&(_, ty)| ty).collect();
@@ -286,15 +290,19 @@ impl Infer<'_, '_> {
     }
 
     fn reaches_assoc_ty(&mut self, of: ItemRef, name: &str) -> Result<bool> {
-        self.reaches(of, name, Self::has_assoc_ty, 0)
+        self.reaches(of, name, Self::has_assoc_ty, 0, &mut Vec::new())
     }
 
     /// Whether trait `of` or one of its supertraits has a member `name`.
     pub(super) fn reaches_member(&mut self, of: ItemRef, name: &str) -> Result<bool> {
-        self.reaches(of, name, |infer, of, name| infer.cx.trait_member(of, name).is_some(), 0)
+        self.reaches(of, name, |infer, of, name| infer.cx.trait_member(of, name).is_some(), 0, &mut Vec::new())
     }
 
-    fn reaches(&mut self, of: ItemRef, name: &str, owns: fn(&Self, ItemRef, &str) -> bool, depth: u32) -> Result<bool> {
+    fn reaches(&mut self, of: ItemRef, name: &str, owns: fn(&Self, ItemRef, &str) -> bool, depth: u32, seen: &mut Vec<ItemRef>) -> Result<bool> {
+        if seen.contains(&of) {
+            return Ok(false);
+        }
+        seen.push(of);
         if owns(self, of, name) {
             return Ok(true);
         }
@@ -302,7 +310,7 @@ impl Infer<'_, '_> {
             return Ok(false);
         }
         for parent in self.parent_traits(of)? {
-            if self.reaches(parent, name, owns, depth + 1)? {
+            if self.reaches(parent, name, owns, depth + 1, seen)? {
                 return Ok(true);
             }
         }
@@ -610,7 +618,9 @@ impl Infer<'_, '_> {
                 let Some((of, path)) = infer.bound_trait_at(&def.0, bound, home) else {
                     continue;
                 };
-                found.push((of, infer.bound_args(of, &def.0, path, ty)?));
+                if infer.reaches(of, name, Self::has_assoc_ty, depth + 1, &mut Vec::new())? {
+                    found.push((of, infer.bound_args(of, &def.0, path, ty)?));
+                }
             }
             Ok(found)
         })?;

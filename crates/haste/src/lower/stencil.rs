@@ -145,7 +145,7 @@ impl InlineTemplate {
     }
 }
 
-const TRANSIENT_CAP: usize = 32_768;
+const TRANSIENT_CAP: usize = 4_096;
 const TRIM_SHARDS: usize = 8;
 const MAX_INLINE_HEIGHT: u8 = 12;
 
@@ -237,6 +237,7 @@ impl Bodies {
             removed += self.inlined.clear_shard(shard);
             removed += self.partial.clear_shard(shard);
             removed += self.inline_meta.clear_shard(shard);
+            removed += self.templates.clear_shard(shard);
         }
         self.plans.clear_shard((start / TRIM_SHARDS) % crate::sema::table::SHARDS);
         if removed > 0 {

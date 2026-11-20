@@ -350,7 +350,14 @@ type Call = (ItemRef, ProcKind, usize);
 /// The output of each call `bound` on its `inputs`, or why it failed: the result the store kept for a macro of a pinned crate, else from running it, kept when it ran.
 fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
     let outline = &compilation.outline;
-    let keys: Vec<Option<store::Expansion>> = bound.iter().zip(inputs).map(|(&(call, ..), texts)| Some(store::Expansion::new(outline.pins[call.krate as usize]?, &macro_name(outline, call), texts))).collect();
+    let keys: Vec<Option<store::Expansion>> = bound
+        .iter()
+        .zip(inputs)
+        .map(|(&(call, _, caller), texts)| {
+            let caller_pin = if caller == usize::MAX { Some(0) } else { outline.pins[caller] };
+            Some(store::Expansion::new((outline.pins[call.krate as usize]?, caller_pin?), &macro_name(outline, call), texts))
+        })
+        .collect();
     let mut results: Vec<Option<Result<String, String>>> = vec![None; keys.len()];
     let mut checks: Vec<(usize, &store::Expansion)> = Vec::new();
     for (at, key) in keys.iter().enumerate() {
@@ -377,6 +384,18 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
     Ok(results.into_iter().map(|result| result.unwrap_or_else(|| Err("no output".to_owned()))).collect())
 }
 
+fn caller_vars(outline: &Outline, caller: usize) -> Vec<(String, String)> {
+    let Some(tree) = outline.crates.get(caller) else { return Vec::new() };
+    let env = &tree.env;
+    let mut vars = Vec::with_capacity(env.vars.len() + 2);
+    vars.push(("CARGO_CRATE_NAME".to_owned(), outline.roots[caller].name.clone()));
+    vars.extend(env.vars.iter().cloned());
+    if let Some(script) = &env.script {
+        vars.extend(script.vars.iter().cloned());
+    }
+    vars
+}
+
 /// Runs each call `bound` on its `inputs` in children that compile each function on its first call; `None` for a call that did not run. The macro expander keeps its code and inference while its macro crate graph is unchanged.
 fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Option<Result<String, String>>>> {
     let pair = entries(&mut compilation.outline)?;
@@ -384,6 +403,10 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
         Some(kept) if kept.matches(&compilation.outline) => (kept.jit, kept.roots),
         _ => (Jit::new(Cache::default())?, Vec::new()),
     };
+    let mut env_by_caller: HashMap<usize, Vec<(String, String)>> = HashMap::default();
+    for &(_, _, caller) in bound {
+        env_by_caller.entry(caller).or_insert_with(|| caller_vars(&compilation.outline, caller));
+    }
     let entry = pair.map(|item| demand.declare((item, crate::sema::substs::Substs::EMPTY)));
     let jobs: Vec<Job<'_>> = bound
         .iter()
@@ -392,6 +415,7 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
             entry: entry[usize::from(kind == ProcKind::Attribute)],
             run: demand.declare((call, crate::sema::substs::Substs::EMPTY)),
             texts: texts.iter().map(|text| text.as_bytes()).collect(),
+            vars: env_by_caller.get(&caller).map_or(&[], Vec::as_slice),
             group: (caller, call.krate),
         })
         .collect();

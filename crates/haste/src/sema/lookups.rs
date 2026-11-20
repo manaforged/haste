@@ -89,6 +89,7 @@ pub(super) struct Lookups {
     pub(super) fields: Table<ty::Ty, infer::Fields>,
     pub(super) forms: Table<(infer::Form, usize), Option<infer::Fields>>,
     pub(super) reveals: table::Flight<reach::Instance, ty::Ty>,
+    pub(super) provisional_rets: Table<reach::Instance, ty::Ty>,
     pub(super) futures: Table<ty::Ty, ty::Ty>,
     pub(super) scope_traits: Table<ModRef, Arc<[ItemRef]>>,
     pub(super) type_defs: Table<(TypeScope, SegKey), crate::names::Def>,
@@ -345,6 +346,7 @@ impl Lookups {
             own && found.iter().flat_map(|types| types.iter().flatten()).all(|&ty| !naming.names(ty))
         });
         self.reveals.retain(|instance| !naming.touches(instance));
+        self.provisional_rets.retain(|instance, _| !naming.touches(instance));
         self.futures.retain(|ty, _| !naming.names(*ty));
         self.impl_traits.retain(|block, _| block_kept(block));
         self.heads.retain(|holder, _| match *holder {

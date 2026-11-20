@@ -233,7 +233,7 @@ fn prepare_summary(cx: &mut Context<'_>, item: ItemRef, summary: &mut PolySummar
     extract_call_holes(cx, summary);
     if !summary.template.operators.is_empty() {
         let body = cx.body(item)?;
-        summary.op_holes = extract_op_holes(&cx.types, &body, &summary.template);
+        summary.op_holes = extract_op_holes(cx, &body, &summary.template);
     }
     extract_drops_and_tys(cx, summary)
 }
@@ -266,6 +266,11 @@ fn extract_call_holes(cx: &Context<'_>, summary: &mut PolySummary) {
     }
     tpl.pat_res.as_slice().iter().for_each(|&(id, r)| push(SiteKey::PatRes(id), r));
     tpl.derefs.as_slice().iter().for_each(|&((id, step), r)| push(SiteKey::Deref(id, step), r));
+    for &(id, r) in tpl.operators.as_slice() {
+        if !matches!(r, Res::Fn(i, s) if types.substs_have_params(s) && cx.owner_trait(i).is_some()) {
+            push(SiteKey::Operator(id), r);
+        }
+    }
     tpl.try_blocks.as_slice().iter().for_each(|&(id, r)| push(SiteKey::TryBlock(id), r));
     for &(id, r) in tpl.box_frees.as_slice() {
         if !call_obs.contains(&id) {
@@ -309,10 +314,12 @@ fn extract_call_holes(cx: &Context<'_>, summary: &mut PolySummary) {
     summary.call_holes = holes.into_boxed_slice();
 }
 
-fn extract_op_holes(types: &Types, body: &Body, tpl: &BodyTables) -> Box<[(ExprId, OpCheck, Res)]> {
+fn extract_op_holes(cx: &Context<'_>, body: &Body, tpl: &BodyTables) -> Box<[(ExprId, OpCheck, Res)]> {
+    let types = &cx.types;
     tpl.operators
         .as_slice()
         .iter()
+        .filter(|&&(_, r)| matches!(r, Res::Fn(i, s) if types.substs_have_params(s) && cx.owner_trait(i).is_some()))
         .map(|&(expr, r)| {
             let check = match *body.expr(expr) {
                 Expr::Unary(op, operand) if op != UnOp::Deref => OpCheck::Unary(tpl.exprs[operand.0 as usize]),
