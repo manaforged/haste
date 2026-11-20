@@ -100,7 +100,7 @@ pub(crate) struct Provenance {
     pub incoming: Vec<bool>,
     pub affine: Vec<(Value, i64)>,
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
-    frontiers: Vec<Option<escape::Frontier>>,
+    frontiers: HashMap<u32, escape::Frontier>,
     inst_at: Vec<(u32, u32)>,
     frame: frame::FrameFacts,
 }
@@ -327,7 +327,7 @@ impl Provenance {
         prov.call_readonly_slots = esc.call_readonly;
         prov.return_only_slots = esc.return_only;
         prov.noalias_escaped = esc.noalias;
-        if prov.frontiers.iter().any(Option::is_some) {
+        if !prov.frontiers.is_empty() {
             prov.inst_at = vec![(u32::MAX, 0); func.insts.len()];
             for &b in &cfg.rpo {
                 for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
@@ -432,7 +432,7 @@ impl Provenance {
 
     /// Whether `slot`'s address may have left the function by the time `at` runs; `None` means anywhere.
     pub(crate) fn slot_escaped_at(&self, slot: StackSlot, at: Option<Inst>) -> bool {
-        let (Some(inst), Some(Some(frontier))) = (at, self.frontiers.get(slot.index())) else { return true };
+        let (Some(inst), Some(frontier)) = (at, self.frontiers.get(&slot.0)) else { return true };
         match self.inst_at.get(inst.index()) {
             Some(&(block, pos)) if block != u32::MAX => frontier.reached((block, pos)),
             _ => true,

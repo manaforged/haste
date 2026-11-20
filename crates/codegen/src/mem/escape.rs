@@ -1,3 +1,5 @@
+use rustc_hash::FxHashMap as HashMap;
+
 use crate::cfg::Cfg;
 use crate::ir::{AbiParam, ArgumentPurpose, Binary, Block, Convert, Function, InstData, Op, StackSlot, Value};
 
@@ -18,7 +20,7 @@ pub(super) struct SlotEscapes {
     pub(super) return_only: Vec<bool>,
     pub(super) noalias: Vec<bool>,
     pub(super) spilled: Vec<bool>,
-    pub(super) points: Vec<Vec<(u32, u32)>>,
+    pub(super) points: HashMap<u32, Vec<(u32, u32)>>,
 }
 
 /// Where an escaped slot's address leaves the function: blocks entered after an escape, and the escaping instructions.
@@ -42,7 +44,7 @@ impl SlotEscapes {
             return_only: vec![true; func.slots.len()],
             noalias: vec![false; func.signature.params.len()],
             spilled: vec![false; func.slots.len()],
-            points: vec![Vec::new(); func.slots.len()],
+            points: HashMap::default(),
         }
     }
 }
@@ -291,7 +293,7 @@ pub(super) fn classify_uses(
     let (in_loop, danger, unknown_end) = compute_block_danger(func, cfg, slots, tracked);
     let cx = EscapeCx { func, slots: &slots, tracked: &tracked, is_const: &is_const, in_loop: &in_loop, danger: &danger, unknown_end: &unknown_end };
     let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n], returns: vec![0_u32; n] };
-    let mut points: Vec<Vec<(u32, u32)>> = vec![Vec::new(); func.slots.len()];
+    let mut points: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
     let mut used = Vec::new();
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
@@ -306,7 +308,7 @@ pub(super) fn classify_uses(
                 let Some(s) = slot_root(v, slots, tracked) else { continue };
                 let uses = used.iter().filter(|&&(u, _)| u == v).count() as u32;
                 if !used[..i].iter().any(|&(u, _)| u == v) && counts.safe[v.index()] - before < uses {
-                    points[s.index()].push((b.index() as u32, pos as u32));
+                    points.entry(s.0).or_default().push((b.index() as u32, pos as u32));
                 }
             }
         }
@@ -316,32 +318,36 @@ pub(super) fn classify_uses(
     esc
 }
 
-/// The escape frontier of every escaped, unspilled slot, or `None` where any call may already see it.
-pub(super) fn frontiers(func: &Function, esc: &SlotEscapes) -> Vec<Option<Frontier>> {
+/// The escape frontier of every escaped, unspilled slot, omitted when any call may already see it.
+pub(super) fn frontiers(func: &Function, esc: &SlotEscapes) -> HashMap<u32, Frontier> {
     let words = func.blocks.len().div_ceil(64);
-    let wanted = |s: usize| !esc.unescaped[s] && !esc.spilled[s] && !esc.points[s].is_empty();
-    if (0..func.slots.len()).filter(|&s| wanted(s)).count() * words > FRONTIER_WORDS {
-        return (0..func.slots.len()).map(|_| None).collect();
+    let wanted = |s: u32, pts: &Vec<(u32, u32)>| {
+        let idx = s as usize;
+        !esc.unescaped[idx] && !esc.spilled[idx] && !pts.is_empty()
+    };
+    let active_count = esc.points.iter().filter(|&(&s, pts)| wanted(s, pts)).count();
+    if active_count == 0 || active_count * words > FRONTIER_WORDS {
+        return HashMap::default();
     }
     let mut queue = Vec::new();
-    (0..func.slots.len())
-        .map(|s| {
-            if !wanted(s) {
-                return None;
-            }
-            let mut seen = vec![0_u64; words];
-            queue.extend(esc.points[s].iter().map(|&(b, _)| Block(b)));
-            while let Some(b) = queue.pop() {
-                let Some(&term) = func.blocks[b.index()].insts.last() else { continue };
-                for t in func.insts[term.index()].op.targets() {
-                    let (w, bit) = (t.index() / 64, 1_u64 << (t.index() % 64));
-                    if seen[w] & bit == 0 {
-                        seen[w] |= bit;
-                        queue.push(t);
-                    }
+    let mut out = HashMap::default();
+    for (&s, pts) in &esc.points {
+        if !wanted(s, pts) {
+            continue;
+        }
+        let mut seen = vec![0_u64; words];
+        queue.extend(pts.iter().map(|&(b, _)| Block(b)));
+        while let Some(b) = queue.pop() {
+            let Some(&term) = func.blocks[b.index()].insts.last() else { continue };
+            for t in func.insts[term.index()].op.targets() {
+                let (w, bit) = (t.index() / 64, 1_u64 << (t.index() % 64));
+                if seen[w] & bit == 0 {
+                    seen[w] |= bit;
+                    queue.push(t);
                 }
             }
-            Some(Frontier { seen, points: esc.points[s].clone() })
-        })
-        .collect()
+        }
+        out.insert(s, Frontier { seen, points: pts.clone() });
+    }
+    out
 }

@@ -121,22 +121,22 @@ impl Frame {
 }
 
 fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Value>, is_spill: &[bool]) -> (Frame, Vec<SlotData>) {
-    let (kept, conflicts, escaped) = slots::framed(func, cfg, resumes, is_spill);
+    let framed = slots::framed(func, cfg, resumes, is_spill);
     let mut frame = Frame { size: 0, slots: vec![Home::Stack(StackSlot(0)); func.slots.len()], spills: HashMap::default() };
     let mut stack = vec![SlotData { size: 8, align_shift: 3 }];
     let (mut private, mut shared) = (Vec::new(), Vec::new());
-    for (slot, &in_frame) in kept.iter().enumerate() {
-        if in_frame {
-            let data = &func.slots[slot];
-            let placed = if escaped[slot] { &mut shared } else { &mut private };
-            placed.push((slot, data.size, 1_u32 << data.align_shift));
+    for (d, &raw_slot) in framed.raw_of.iter().enumerate() {
+        if framed.kept[d] {
+            let data = &func.slots[raw_slot];
+            let placed = if framed.escaped[d] { &mut shared } else { &mut private };
+            placed.push((d, data.size, 1_u32 << data.align_shift));
         } else {
-            stack.push(func.slots[slot].clone());
-            frame.slots[slot] = Home::Stack(StackSlot(stack.len() as u32 - 1));
+            stack.push(func.slots[raw_slot].clone());
+            frame.slots[raw_slot] = Home::Stack(StackSlot(stack.len() as u32 - 1));
         }
     }
-    for (&(slot, _, _), offset) in private.iter().zip(frame.place_colored(0, &private, &conflicts)) {
-        frame.slots[slot] = Home::Frame(offset);
+    for (&(d, _, _), offset) in private.iter().zip(frame.place_colored(0, &private, &framed.conflicts)) {
+        frame.slots[framed.raw_of[d]] = Home::Frame(offset);
     }
     for value in spills {
         let bytes = func.types[value.index()].bytes();
@@ -144,8 +144,8 @@ fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Va
         frame.spills.insert(value, at as i32);
     }
     func.frame_private = frame.size;
-    for (&(slot, _, _), offset) in shared.iter().zip(frame.place_colored(frame.size, &shared, &conflicts)) {
-        frame.slots[slot] = Home::Frame(offset);
+    for (&(d, _, _), offset) in shared.iter().zip(frame.place_colored(frame.size, &shared, &framed.conflicts)) {
+        frame.slots[framed.raw_of[d]] = Home::Frame(offset);
     }
     (frame, stack)
 }
