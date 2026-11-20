@@ -18,6 +18,7 @@ mod const_ops;
 mod const_pat;
 mod const_val;
 mod literal;
+pub(super) use literal::{eval_lit_bits, neg_float_bits};
 use literal::Scope;
 
 impl Lower<'_, '_> {
@@ -194,6 +195,28 @@ impl Lower<'_, '_> {
         }
     }
 
+    fn non_zero_static_rodata(&mut self, index: usize, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<Value>> {
+        let Some((bytes, relocs)) = self.static_rodata_blob(item, substs, ty)? else { return Ok(None) };
+        if relocs.is_empty() && bytes.len() >= 64 && bytes.iter().all(|&b| b == 0) {
+            return Ok(None);
+        }
+        Ok(Some(self.emit_static_rodata_blob(index, &bytes, &relocs)))
+    }
+
+    fn ensure_static_filled(&mut self, index: usize, address: Value, size: i32) -> Result<()> {
+        let flag = self.ins().iadd_imm(address, i64::from(size));
+        let state = self.ins().atomic_load(Type::I8, flag);
+        let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
+        self.unless(filled, |lower| {
+            let usize_ty = lower.cx.types.prim(Primitive::Usize);
+            let table = lower.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
+            let code = lower.ins().load(Type::I64, table, 0);
+            let once = lower.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
+            lower.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
+            Ok(())
+        })
+    }
+
     /// The place of the static `item` at `substs`, of type `ty`: the prepped library's copy when Haste shares it, immutable literal bytes in read-only data when eligible, else its cell, which the static's initializer fills on the first use that finds it empty unless it starts as zero bytes.
     pub fn static_place(&mut self, (item, substs): (ItemRef, Substs), ty: Ty) -> Result<Place> {
         if let Some(address) = crate::prep::static_address(self.cx, item) {
@@ -201,23 +224,12 @@ impl Lower<'_, '_> {
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
         let index = self.reached_index(item, substs)?;
-        if let Some((bytes, relocs)) = self.static_rodata_blob(item, substs, ty)? {
-            let base = self.emit_static_rodata_blob(index, &bytes, &relocs);
+        if let Some(base) = self.non_zero_static_rodata(index, item, substs, ty)? {
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
         let (address, size) = self.static_cell(index, ty)?;
         if !self.cx.foreign(item) && index != self.index && !self.zero_static(item, substs, ty)? {
-            let flag = self.ins().iadd_imm(address, i64::from(size));
-            let state = self.ins().atomic_load(Type::I8, flag);
-            let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
-            self.unless(filled, |lower| {
-                let usize_ty = lower.cx.types.prim(Primitive::Usize);
-                let table = lower.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
-                let code = lower.ins().load(Type::I64, table, 0);
-                let once = lower.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
-                lower.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
-                Ok(())
-            })?;
+            self.ensure_static_filled(index, address, size)?;
         }
         Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
     }
@@ -294,6 +306,22 @@ impl Lower<'_, '_> {
         self.materialize_blob(expr, ty, blob)
     }
 
+    fn materialize_mem_blob(&mut self, expr: ExprId, ty: Ty, bytes: &[u8], relocs: &[RodataReloc]) -> Result<Option<Value>> {
+        if bytes.len() == 16 && matches!(relocs, [RodataReloc { offset: 0, .. }]) && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) {
+            let RodataTarget::Rodata(child_id) = relocs[0].target;
+            let data = self.emit_child_rodata(child_id);
+            let len = u64::from_le_bytes(bytes[8..].try_into()?);
+            return Ok(Some(self.wide_pointer(data, len as i64)));
+        }
+        if self.lent_mutably(expr) {
+            return Ok(None);
+        }
+        if relocs.is_empty() {
+            return self.materialize_value_rodata(ty, bytes);
+        }
+        Ok(Some(self.emit_rodata_blob(bytes, relocs)))
+    }
+
     fn materialize_blob(&mut self, expr: ExprId, ty: Ty, (bytes, relocs): (Vec<u8>, Vec<RodataReloc>)) -> Result<Option<Value>> {
         match repr(self.cx, ty)? {
             Repr::Scalar(machine) if relocs.is_empty() => {
@@ -301,20 +329,11 @@ impl Lower<'_, '_> {
                 word[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
                 Ok(Some(self.int_const(machine, u128::from_le_bytes(word))))
             }
-            Repr::Scalar(Type::I64) if bytes.len() == 8 => {
-                if let [RodataReloc { offset: 0, target: RodataTarget::Rodata(child_id) }] = relocs.as_slice() {
-                    Ok(Some(self.emit_child_rodata(*child_id)))
-                } else {
-                    Ok(None)
-                }
-            }
-            Repr::Mem { .. } if bytes.len() == 16 && matches!(relocs.as_slice(), [RodataReloc { offset: 0, .. }]) && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) => {
-                let RodataTarget::Rodata(child_id) = relocs[0].target;
-                let data = self.emit_child_rodata(child_id);
-                let len = u64::from_le_bytes(bytes[8..].try_into()?);
-                Ok(Some(self.wide_pointer(data, len as i64)))
-            }
-            Repr::Mem { .. } if !self.lent_mutably(expr) => Ok(Some(self.emit_rodata_blob(&bytes, &relocs))),
+            Repr::Scalar(Type::I64) if bytes.len() == 8 => match relocs.as_slice() {
+                [RodataReloc { offset: 0, target: RodataTarget::Rodata(child_id) }] => Ok(Some(self.emit_child_rodata(*child_id))),
+                _ => Ok(None),
+            },
+            Repr::Mem { .. } => self.materialize_mem_blob(expr, ty, &bytes, &relocs),
             _ => Ok(None),
         }
     }

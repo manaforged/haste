@@ -441,10 +441,10 @@ impl Lower<'_, '_> {
     }
 
     fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
-        let Some(limit) = inline_limit(self.cx, self.reached, index) else {
+        let in_loop = self.loops.iter().any(|frame| !frame.block);
+        let Some(limit) = super::budget::caller_inline_limit(self.cx, self.reached, (self.index, index), in_loop) else {
             return Ok(None);
         };
-        let limit = if self.loops.iter().any(|frame| !frame.block) { super::budget::looped_limit(self.cx, self.reached, index, limit) } else { limit };
         let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, false))?;
         self.cycle_root = self.cycle_root.min(cycle);
         let Some(found) = callee.filter(|found| self.inline.host.takes(self.cx, self.reached, index, found)) else { return Ok(None) };

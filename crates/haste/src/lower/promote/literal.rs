@@ -1,4 +1,4 @@
-use haste_codegen::Value;
+use haste_codegen::{Type, Value};
 
 use crate::body::literal::{byte_value, char_value, string_bytes};
 use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Lit, UnOp};
@@ -11,7 +11,47 @@ use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty, int_info, mask};
 
 use super::super::Lower;
+use super::super::ops::parse_float;
 use super::super::stencil::{RodataId, RodataReloc, RodataTarget, SymbolSource};
+
+pub(in crate::lower) fn eval_lit_bits(src: &Source, lit: Lit, at: u32, primitive: Primitive) -> Option<(usize, u128)> {
+    match lit {
+        Lit::Bool(value) if primitive == Primitive::Bool => Some((1, u128::from(value))),
+        Lit::Char if primitive == Primitive::Char => Some((4, u128::from(u32::from(char_value(src.text(at)).ok()?)))),
+        Lit::Byte if primitive == Primitive::U8 => Some((1, u128::from(byte_value(src.text(at)).ok()?))),
+        Lit::Int => {
+            let (bits, _) = int_info(primitive)?;
+            Some((bits as usize / 8, parse_int(src.text(at)).ok()?.0 & mask(bits)))
+        }
+        Lit::Float => float_lit_bits(primitive, src.text(at)),
+        _ => None,
+    }
+}
+
+pub(in crate::lower) fn float_lit_bits(primitive: Primitive, text: &str) -> Option<(usize, u128)> {
+    match primitive {
+        Primitive::F32 => Some((4, parse_float(Type::F32, text).ok()? as u64 as u128)),
+        Primitive::F64 => Some((8, parse_float(Type::F64, text).ok()? as u64 as u128)),
+        _ => None,
+    }
+}
+
+pub(in crate::lower) fn neg_float_bits(primitive: Primitive, bits: u128) -> Option<(usize, u128)> {
+    match primitive {
+        Primitive::F32 => Some((4, (bits ^ (1u128 << 31)) & 0xFFFF_FFFF)),
+        Primitive::F64 => Some((8, (bits ^ (1u128 << 63)) & 0xFFFF_FFFF_FFFF_FFFF)),
+        _ => None,
+    }
+}
+
+fn prim_scalar_bytes(primitive: Primitive) -> Option<usize> {
+    match primitive {
+        Primitive::Bool => Some(1),
+        Primitive::Char | Primitive::F32 => Some(4),
+        Primitive::F64 => Some(8),
+        _ => Some(int_info(primitive)?.0 as usize / 8),
+    }
+}
 
 /// The most bytes of a constant that lowering lays out from its literals.
 pub(super) const LITERAL_BYTES: usize = 1 << 21;
@@ -100,108 +140,118 @@ impl Lower<'_, '_> {
         Some(())
     }
 
-    fn write_uncoerced(&mut self, scope: Scope<'_>, (expr, ty): (ExprId, Ty), at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>), depth: u32) -> Option<()> {
-        if depth > MAX_CONST_DEPTH {
+    fn peel_step(body: &Body, expr: ExprId) -> Option<ExprId> {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => Some(inner),
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } if body.list(stmts).is_empty() => Some(tail),
+            _ => None,
+        }
+    }
+
+    fn peel_uncoerced<'b>(scope: Scope<'b>, mut expr: ExprId) -> ExprId {
+        while let Some(inner) = Self::peel_step(scope.body, expr).filter(|i| !scope.typed.coercions.contains_key(i)) {
+            expr = inner;
+        }
+        expr
+    }
+
+    fn write_str_or_bytes(&mut self, scope: Scope<'_>, (lit, span): (Lit, u32), pointee: Ty, at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>)) -> Option<()> {
+        let bytes = string_bytes(scope.src.text(span)).ok()?;
+        if lit == Lit::Str && *self.cx.types.kind(pointee) == Kind::Prim(Primitive::Str) {
+            let child_id = self.child_rodata(&bytes, &[]);
+            out.get_mut(at..at + 16)?[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+            relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
+            return Some(());
+        }
+        let Kind::Array(elem, len_ty) = *self.cx.types.kind(pointee) else { return None };
+        if lit != Lit::ByteStr || *self.cx.types.kind(elem) != Kind::Prim(Primitive::U8) || self.cx.types.len(len_ty)? != bytes.len() as u64 {
             return None;
         }
-        match *scope.body.expr(expr) {
-            Expr::Paren(inner) => return self.write_blob(scope, (inner, ty), at, (out, relocs), depth),
-            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } if scope.body.list(stmts).is_empty() => {
-                return self.write_blob(scope, (tail, ty), at, (out, relocs), depth);
-            }
-            Expr::Path(_) => {
-                if let Some(&Res::Fn(item, substs)) = scope.typed.res.get(&expr)
-                    && self.cx.item(item).1.kind == ItemKind::Const
-                {
-                    return self.write_const_item(item, substs, ty, at, (out, relocs), depth);
-                }
-            }
-            _ => {}
+        let child_id = self.child_rodata(&bytes, &[]);
+        out.get_mut(at..at + 8)?;
+        relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
+        Some(())
+    }
+
+    fn write_ref_blob(&mut self, scope: Scope<'_>, (inner, pointee): (ExprId, Ty), at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>), depth: u32) -> Option<()> {
+        let inner_ty = scope.typed.expr_ty(&self.cx.types, inner);
+        if !super::super::is_freeze_ty(self.cx, inner_ty, 0) {
+            return None;
         }
-        let kind = self.cx.types.kind(ty).clone();
-        match (*scope.body.expr(expr), kind) {
-            (Expr::Lit(Lit::Str, span), Kind::Ref(Mut::Not, pointee)) if *self.cx.types.kind(pointee) == Kind::Prim(Primitive::Str) => {
-                let bytes = string_bytes(scope.src.text(span)).ok()?;
-                let child_id = self.child_rodata(&bytes, &[]);
-                out.get_mut(at..at + 16)?[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
-                relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
-                Some(())
-            }
-            (Expr::Lit(Lit::ByteStr, span), Kind::Ref(Mut::Not, pointee)) => {
-                let Kind::Array(elem, len_ty) = *self.cx.types.kind(pointee) else { return None };
-                if *self.cx.types.kind(elem) != Kind::Prim(Primitive::U8) {
-                    return None;
-                }
-                let bytes = string_bytes(scope.src.text(span)).ok()?;
-                if self.cx.types.len(len_ty)? != bytes.len() as u64 {
-                    return None;
-                }
-                let child_id = self.child_rodata(&bytes, &[]);
+        let (child_bytes, child_relocs) = self.literal_blob(scope, (inner, inner_ty), depth + 1)?;
+        let child_id = self.child_rodata(&child_bytes, &child_relocs);
+        match (self.cx.types.kind(pointee).clone(), self.cx.types.kind(inner_ty).clone()) {
+            _ if pointee == inner_ty => {
                 out.get_mut(at..at + 8)?;
-                relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
-                Some(())
             }
-            (Expr::Ref { mutable: false, raw: false, expr: inner }, Kind::Ref(Mut::Not, pointee)) => {
-                let inner_ty = scope.typed.expr_ty(&self.cx.types, inner);
-                if !super::super::is_freeze_ty(self.cx, inner_ty, 0) {
-                    return None;
-                }
-                let (child_bytes, child_relocs) = self.literal_blob(scope, (inner, inner_ty), depth + 1)?;
-                let child_id = self.child_rodata(&child_bytes, &child_relocs);
-                match (self.cx.types.kind(pointee).clone(), self.cx.types.kind(inner_ty).clone()) {
-                    _ if pointee == inner_ty => {
-                        out.get_mut(at..at + 8)?;
-                    }
-                    (Kind::Slice(_), Kind::Array(_, len_ty)) => {
-                        let len = self.cx.types.len(len_ty)?;
-                        out.get_mut(at..at + 16)?[8..16].copy_from_slice(&len.to_le_bytes());
-                    }
-                    _ => return None,
-                }
-                relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
-                Some(())
+            (Kind::Slice(_), Kind::Array(_, len_ty)) => {
+                let len = self.cx.types.len(len_ty)?;
+                out.get_mut(at..at + 16)?[8..16].copy_from_slice(&len.to_le_bytes());
             }
+            _ => return None,
+        }
+        relocs.push(RodataReloc { offset: at as u32, target: RodataTarget::Rodata(child_id) });
+        Some(())
+    }
+
+    fn write_repeat_blob(&mut self, scope: Scope<'_>, (item, elem, count): (ExprId, Ty, Ty), at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>), depth: u32) -> Option<()> {
+        let stride = self.cx.layout(elem).ok()?.size.bytes() as usize;
+        let count = usize::try_from(self.cx.types.len(count)?).ok()?;
+        if count == 0 {
+            return Some(());
+        }
+        let reloc_start = relocs.len();
+        self.write_blob(scope, (item, elem), at, (out, relocs), depth)?;
+        let item_relocs: Vec<RodataReloc> = relocs[reloc_start..].to_vec();
+        for index in 1..count {
+            let dst = at + index * stride;
+            out.copy_within(at..at + stride, dst);
+            for reloc in &item_relocs {
+                relocs.push(RodataReloc { offset: (reloc.offset as usize - at + dst) as u32, target: reloc.target });
+            }
+        }
+        Some(())
+    }
+
+    fn write_seq_blob(&mut self, scope: Scope<'_>, (expr, ty): (ExprId, Ty), at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>), depth: u32) -> Option<()> {
+        match (*scope.body.expr(expr), self.cx.types.kind(ty).clone()) {
             (Expr::Array(list), Kind::Array(elem, _)) => {
                 let stride = self.cx.layout(elem).ok()?.size.bytes() as usize;
                 let items: Vec<ExprId> = scope.body.list(list).iter().map(|&item| ExprId(item)).collect();
-                items.into_iter().enumerate().try_for_each(|(index, item)| self.write_blob(scope, (item, elem), at + index * stride, (out, relocs), depth))
+                items.into_iter().enumerate().try_for_each(|(i, item)| self.write_blob(scope, (item, elem), at + i * stride, (out, relocs), depth))
             }
-            (Expr::Repeat(item, _), Kind::Array(elem, count)) => {
-                let stride = self.cx.layout(elem).ok()?.size.bytes() as usize;
-                let count = usize::try_from(self.cx.types.len(count)?).ok()?;
-                if count == 0 {
-                    return Some(());
-                }
-                let reloc_start = relocs.len();
-                self.write_blob(scope, (item, elem), at, (out, relocs), depth)?;
-                let item_relocs: Vec<RodataReloc> = relocs[reloc_start..].to_vec();
-                for index in 1..count {
-                    let dst = at + index * stride;
-                    out.copy_within(at..at + stride, dst);
-                    for reloc in &item_relocs {
-                        relocs.push(RodataReloc { offset: (reloc.offset as usize - at + dst) as u32, target: reloc.target });
-                    }
-                }
-                Some(())
-            }
+            (Expr::Repeat(item, _), Kind::Array(elem, count)) => self.write_repeat_blob(scope, (item, elem, count), at, (out, relocs), depth),
             (Expr::Tuple(list), Kind::Tuple(items)) => {
                 let layout = self.cx.layout(ty).ok()?;
                 let items = self.cx.types.substs(items).to_vec();
-                let fields: Vec<(u32, ExprId)> = scope.body.list(list).iter().enumerate().map(|(index, &item)| (index as u32, ExprId(item))).collect();
-                fields.into_iter().try_for_each(|(index, item)| {
-                    self.write_blob(scope, (item, *items.get(index as usize)?), at + field_offset(&layout, 0, index) as usize, (out, relocs), depth)
-                })
+                let fields: Vec<(u32, ExprId)> = scope.body.list(list).iter().enumerate().map(|(i, &item)| (i as u32, ExprId(item))).collect();
+                fields.into_iter().try_for_each(|(i, item)| self.write_blob(scope, (item, *items.get(i as usize)?), at + field_offset(&layout, 0, i) as usize, (out, relocs), depth))
             }
-            (_, Kind::Adt(item, args)) => self
-                .construct_blob(scope, (expr, ty), (item, args), at, (out, relocs), depth)
-                .or_else(|| self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth)),
+            _ => None,
+        }
+    }
+
+    fn write_uncoerced(&mut self, scope: Scope<'_>, (expr, ty): (ExprId, Ty), at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>), depth: u32) -> Option<()> {
+        let expr = Self::peel_uncoerced(scope, expr);
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        if let Some(inner) = Self::peel_step(scope.body, expr) {
+            return self.write_blob(scope, (inner, ty), at, (out, relocs), depth);
+        }
+        if let Expr::Path(_) = *scope.body.expr(expr)
+            && let Some(&Res::Fn(item, substs)) = scope.typed.res.get(&expr)
+            && self.cx.item(item).1.kind == ItemKind::Const
+        {
+            return self.write_const_item(item, substs, ty, at, (out, relocs), depth);
+        }
+        match (*scope.body.expr(expr), self.cx.types.kind(ty).clone()) {
+            (Expr::Lit(lit @ (Lit::Str | Lit::ByteStr), span), Kind::Ref(Mut::Not, pointee)) => self.write_str_or_bytes(scope, (lit, span), pointee, at, (out, relocs)),
+            (Expr::Ref { mutable: false, raw: false, expr: inner }, Kind::Ref(Mut::Not, pointee)) => self.write_ref_blob(scope, (inner, pointee), at, (out, relocs), depth),
+            (Expr::Array(_) | Expr::Repeat(..) | Expr::Tuple(_), _) => self.write_seq_blob(scope, (expr, ty), at, (out, relocs), depth),
+            (_, Kind::Adt(item, args)) => self.construct_blob(scope, (expr, ty), (item, args), at, (out, relocs), depth).or_else(|| self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth)),
             (_, Kind::Prim(primitive)) => {
-                let size = match primitive {
-                    Primitive::Bool => 1,
-                    Primitive::Char => 4,
-                    _ => int_info(primitive)?.0 as usize / 8,
-                };
-                let bits = self.eval_scalar(scope, expr, primitive, depth)?;
+                let (size, bits) = (prim_scalar_bytes(primitive)?, self.eval_scalar(scope, expr, primitive, depth)?);
                 out.get_mut(at..at + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
                 Some(())
             }
@@ -240,48 +290,49 @@ impl Lower<'_, '_> {
         Some(())
     }
 
+    fn eval_path_scalar(&mut self, scope: Scope<'_>, expr: ExprId, primitive: Primitive, depth: u32) -> Option<u128> {
+        match scope.typed.res.get(&expr) {
+            Some(&Res::Const(val_ty)) => match *self.cx.types.kind(val_ty) {
+                Kind::Value(bits) => Some(bits),
+                _ => None,
+            },
+            Some(&Res::Fn(item, substs)) if depth < MAX_CONST_DEPTH && self.cx.item(item).1.kind == ItemKind::Const => {
+                let (source, typed) = self.literal_source(item, substs).ok()??;
+                let const_typed = typed.scoped(&self.cx.types);
+                if *self.cx.types.kind(const_typed.ret_ty()) != Kind::Prim(primitive) {
+                    return None;
+                }
+                let body = self.cx.body(source).ok()?;
+                let (root, src) = (body.root?, self.cx.body_src(source));
+                self.eval_scalar(Scope { body: &body, src, typed: &const_typed, in_const: true }, root, primitive, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_unary_scalar(&mut self, scope: Scope<'_>, (op, inner): (UnOp, ExprId), primitive: Primitive, depth: u32) -> Option<u128> {
+        let inner_val = self.eval_scalar(scope, inner, primitive, depth)?;
+        match op {
+            UnOp::Neg if matches!(primitive, Primitive::F32 | Primitive::F64) => Some(neg_float_bits(primitive, inner_val)?.1),
+            UnOp::Neg if int_info(primitive).is_some_and(|(_, signed)| signed) => Some(inner_val.wrapping_neg()),
+            UnOp::Not if primitive == Primitive::Bool => Some(u128::from(inner_val == 0)),
+            UnOp::Not if int_info(primitive).is_some() => Some(!inner_val),
+            _ => None,
+        }
+    }
+
     fn eval_scalar(&mut self, scope: Scope<'_>, expr: ExprId, primitive: Primitive, depth: u32) -> Option<u128> {
+        let expr = Self::peel_uncoerced(scope, expr);
         if depth > MAX_CONST_DEPTH || scope.typed.coercions.contains_key(&expr) {
             return None;
         }
         let value = match *scope.body.expr(expr) {
-            Expr::Paren(inner) => return self.eval_scalar(scope, inner, primitive, depth),
-            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } if scope.body.list(stmts).is_empty() => {
-                return self.eval_scalar(scope, tail, primitive, depth);
-            }
-            Expr::Lit(Lit::Bool(value), _) if primitive == Primitive::Bool => u128::from(value),
-            Expr::Lit(Lit::Int, at) if int_info(primitive).is_some() => parse_int(scope.src.text(at)).ok()?.0,
-            Expr::Lit(Lit::Byte, at) if primitive == Primitive::U8 => u128::from(byte_value(scope.src.text(at)).ok()?),
-            Expr::Lit(Lit::Char, at) if primitive == Primitive::Char => u128::from(u32::from(char_value(scope.src.text(at)).ok()?)),
-            Expr::Path(_) => match scope.typed.res.get(&expr) {
-                Some(&Res::Const(val_ty)) => match *self.cx.types.kind(val_ty) {
-                    Kind::Value(bits) => bits,
-                    _ => return None,
-                },
-                Some(&Res::Fn(item, substs)) if depth < MAX_CONST_DEPTH && self.cx.item(item).1.kind == ItemKind::Const => {
-                    let (source, typed) = self.literal_source(item, substs).ok()??;
-                    let const_typed = typed.scoped(&self.cx.types);
-                    let Kind::Prim(ret_prim) = *self.cx.types.kind(const_typed.ret_ty()) else { return None };
-                    if ret_prim != primitive {
-                        return None;
-                    }
-                    let body = self.cx.body(source).ok()?;
-                    let root = body.root?;
-                    let src = self.cx.body_src(source);
-                    return self.eval_scalar(Scope { body: &body, src, typed: &const_typed, in_const: true }, root, primitive, depth + 1);
-                }
-                _ => return None,
-            },
-            Expr::Unary(op, inner) if !scope.typed.operators.contains_key(&expr) => match op {
-                UnOp::Neg if int_info(primitive).is_some_and(|(_, signed)| signed) => self.eval_scalar(scope, inner, primitive, depth)?.wrapping_neg(),
-                UnOp::Not if primitive == Primitive::Bool => u128::from(self.eval_scalar(scope, inner, Primitive::Bool, depth)? == 0),
-                UnOp::Not if int_info(primitive).is_some() => !self.eval_scalar(scope, inner, primitive, depth)?,
-                _ => return None,
-            },
+            Expr::Lit(lit, at) => eval_lit_bits(scope.src, lit, at, primitive)?.1,
+            Expr::Path(_) => self.eval_path_scalar(scope, expr, primitive, depth)?,
+            Expr::Unary(op, inner) if !scope.typed.operators.contains_key(&expr) => self.eval_unary_scalar(scope, (op, inner), primitive, depth)?,
             Expr::Cast(inner, _) => {
                 let Kind::Prim(src_prim) = *self.cx.types.kind(scope.typed.expr_ty(&self.cx.types, inner)) else { return None };
-                let src_val = self.eval_scalar(scope, inner, src_prim, depth)?;
-                return cast_scalar(src_val, src_prim, primitive);
+                return cast_scalar(self.eval_scalar(scope, inner, src_prim, depth)?, src_prim, primitive);
             }
             Expr::Binary(op, lhs, rhs) if !scope.typed.operators.contains_key(&expr) => return self.eval_binary(scope, op, lhs, rhs, primitive, depth),
             _ => return self.eval_const_scalar_fn(scope, expr, primitive, depth),

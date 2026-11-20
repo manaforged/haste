@@ -7,7 +7,7 @@ use rustc_index::Idx;
 use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{Fields, Res, by_reference, drop_fn, field_types, has_drop_impl, needs_drop, virtual_slot};
+use crate::sema::infer::{Fields, Res, Typed, by_reference, drop_fn, field_types, has_drop_impl, needs_drop, virtual_slot};
 use crate::sema::intrinsic::Intrinsic;
 use crate::sema::layout::field_offset;
 use crate::sema::reach::Reached;
@@ -16,7 +16,6 @@ use crate::sema::ty::{Kind, Mut, Ty, float_bits, int_info};
 
 use super::super::abi::{copied_parts, parts};
 use super::super::adt::tag_bits;
-use super::super::expr::inline_limit;
 use super::super::reloc::reached_index_of;
 use super::super::stencil::{FootprintId, Form, item_bits, resolve_inline_meta};
 use super::super::{Inline, Parts, Repr, Slots, is_static, passed_parts, repr, signature, signature_of};
@@ -506,47 +505,87 @@ fn hash_enum_encoding(cx: &mut Context<'_>, mix: &mut HashMix, item: ItemRef, la
     Ok(())
 }
 
-pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, caller: usize, item: ItemRef, substs: Substs, cycle_root: &mut usize) -> Result<()> {
-    if let Some(which) = cx.intrinsic(item) {
-        return hash_intrinsic_edge(cx, (reached, slots), inline, mix, caller, item, which, substs, cycle_root);
-    }
-    let callee_idx = reached_index_of(cx, reached, slots, (item, substs))?;
+fn hash_fn_trait_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, (caller, item, substs): (usize, ItemRef, Substs), cycle_root: &mut usize) -> Result<()> {
     let is_once = cx.call_once() == Some(item);
     let by_ref = by_reference(cx, item);
     mix.bool(is_once);
     mix.byte(by_ref.map_or(0, |m| 1 + m as u8));
     let vslot = virtual_slot(cx, item, substs)?;
     mix.u32(vslot.unwrap_or(u32::MAX));
-    if is_once || by_ref.is_some() {
-        if let Some(&first) = cx.types.substs(substs).first() {
-            hash_ty_facts(cx, mix, first)?;
-            if let Some(boxed_inner) = cx.boxed(first)
-                && cx.closure_consumes(boxed_inner)
-                && let Some(Res::Fn(fi, fs)) = drop_fn(cx, first)?
-            {
-                hash_call_edge(cx, (reached, slots), inline, mix, caller, fi, fs, cycle_root)?;
-            }
-        }
-        if let Some(&tuple) = cx.types.substs(substs).get(1) {
-            hash_tuple_offsets(cx, mix, tuple)?;
+    if !is_once && by_ref.is_none() {
+        return Ok(());
+    }
+    if let Some(&first) = cx.types.substs(substs).first() {
+        hash_ty_facts(cx, mix, first)?;
+        if let Some(boxed_inner) = cx.boxed(first)
+            && cx.closure_consumes(boxed_inner)
+            && let Some(Res::Fn(fi, fs)) = drop_fn(cx, first)?
+        {
+            hash_call_edge(cx, (reached, slots), inline, mix, caller, fi, fs, cycle_root)?;
         }
     }
-    let foreign = cx.foreign(item);
-    let stat = is_static(cx, item);
-    let is_const = matches!(cx.item(item).1.kind, ItemKind::Const);
+    if let Some(&tuple) = cx.types.substs(substs).get(1) {
+        hash_tuple_offsets(cx, mix, tuple)?;
+    }
+    Ok(())
+}
+
+fn hash_static_edge(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, item: ItemRef, (caller, callee_idx): (usize, usize)) -> Result<()> {
+    mix.bool(caller == callee_idx);
+    mix.bool(cx.thread_local(item));
+    mix.bool(crate::prep::static_address(cx, item).is_some());
+    if let Ok(t) = &reached.list[callee_idx].1
+        && let Some(r) = t.ret
+    {
+        hash_ty_facts(cx, mix, r)?;
+    }
+    Ok(())
+}
+
+fn hash_foreign_callee(cx: &mut Context<'_>, mix: &mut HashMix, callee: &Typed) -> Result<()> {
+    for &p in &callee.params {
+        let pty = callee.locals[p as usize].ty;
+        hash_repr(cx, mix, pty)?;
+        if matches!(repr(cx, pty)?, Repr::Mem { .. }) {
+            hash_parts(mix, parts(&*cx.layout(pty)?)?);
+        }
+    }
+    if let Some(r) = callee.ret {
+        hash_repr(cx, mix, r)?;
+        if matches!(repr(cx, r)?, Repr::Mem { .. }) {
+            hash_parts(mix, parts(&*cx.layout(r)?)?);
+        }
+    }
+    Ok(())
+}
+
+fn hash_callee_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, (caller, callee_idx): (usize, usize), cycle_root: &mut usize) -> Result<()> {
+    let Some(limit) = super::super::budget::caller_inline_limit(cx, reached, (caller, callee_idx), false).filter(|_| slots.allow_inline()) else {
+        mix.byte(0);
+        return Ok(());
+    };
+    hash_inline_meta(cx, (reached, slots), inline, mix, (callee_idx, limit), cycle_root)?;
+    if super::super::budget::own_form(cx, reached, caller) == Form::Loop
+        && let Some(looped) = super::super::budget::caller_inline_limit(cx, reached, (caller, callee_idx), true)
+        && looped != limit
+    {
+        hash_inline_meta(cx, (reached, slots), inline, mix, (callee_idx, looped), cycle_root)?;
+    }
+    Ok(())
+}
+
+pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, caller: usize, item: ItemRef, substs: Substs, cycle_root: &mut usize) -> Result<()> {
+    if let Some(which) = cx.intrinsic(item) {
+        return hash_intrinsic_edge(cx, (reached, slots), inline, mix, caller, item, which, substs, cycle_root);
+    }
+    let callee_idx = reached_index_of(cx, reached, slots, (item, substs))?;
+    hash_fn_trait_edge(cx, (reached, slots), inline, mix, (caller, item, substs), cycle_root)?;
+    let (foreign, stat, is_const) = (cx.foreign(item), is_static(cx, item), matches!(cx.item(item).1.kind, ItemKind::Const));
     mix.bool(foreign);
     mix.bool(stat);
     mix.bool(is_const);
     if stat {
-        mix.bool(caller == callee_idx);
-        mix.bool(cx.thread_local(item));
-        mix.bool(crate::prep::static_address(cx, item).is_some());
-        if let Ok(t) = &reached.list[callee_idx].1
-            && let Some(r) = t.ret
-        {
-            hash_ty_facts(cx, mix, r)?;
-        }
-        return Ok(());
+        return hash_static_edge(cx, reached, mix, item, (caller, callee_idx));
     }
     if is_const && substs.is_empty() {
         mix.item(cx.outline, item);
@@ -557,31 +596,9 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     mix.bool(callee.ret.is_some_and(|r| matches!(cx.types.kind(r), Kind::Never)));
     mix.bool(callee_idx == caller);
     if foreign {
-        for &p in &callee.params {
-            let pty = callee.locals[p as usize].ty;
-            hash_repr(cx, mix, pty)?;
-            if matches!(repr(cx, pty)?, Repr::Mem { .. }) {
-                hash_parts(mix, parts(&*cx.layout(pty)?)?);
-            }
-        }
-        if let Some(r) = callee.ret {
-            hash_repr(cx, mix, r)?;
-            if matches!(repr(cx, r)?, Repr::Mem { .. }) {
-                hash_parts(mix, parts(&*cx.layout(r)?)?);
-            }
-        }
-        return Ok(());
+        return hash_foreign_callee(cx, mix, callee);
     }
-    let Some(limit) = inline_limit(cx, reached, callee_idx).filter(|_| slots.allow_inline()) else {
-        mix.byte(0);
-        return Ok(());
-    };
-    hash_inline_meta(cx, (reached, slots), inline, mix, (callee_idx, limit), cycle_root)?;
-    let looped = super::super::budget::looped_limit(cx, reached, callee_idx, limit);
-    if looped > limit && super::super::budget::own_form(cx, reached, caller) == Form::Loop {
-        hash_inline_meta(cx, (reached, slots), inline, mix, (callee_idx, looped), cycle_root)?;
-    }
-    Ok(())
+    hash_callee_inline(cx, (reached, slots), inline, mix, (caller, callee_idx), cycle_root)
 }
 
 fn hash_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, (callee_idx, limit): (usize, usize), cycle_root: &mut usize) -> Result<()> {
