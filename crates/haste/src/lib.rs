@@ -1,5 +1,8 @@
 //! Haste: the build graph, name resolution, type inference, lowering, and the JIT that runs the program.
 
+#[cfg(not(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "aarch64", target_os = "macos"))))]
+compile_error!("haste currently supports only x86_64-unknown-linux-gnu and aarch64-apple-darwin hosts");
+
 mod aot;
 mod body;
 mod build;

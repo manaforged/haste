@@ -36,16 +36,7 @@ fn zero_cmp_band(
     lhs: Value,
     rhs: Value,
 ) -> Option<(Value, usize, Value, Value)> {
-    let masked = is_zero_const(func, plan, rhs).then_some(lhs).or_else(|| is_zero_const(func, plan, lhs).then_some(rhs))?;
-    if uses[masked.index()] != 1 || plan.elided[masked.index()] {
-        return None;
-    }
-    let (mb, mpos, minst) = pos_of[masked.index()]?;
-    if mb != b_idx {
-        return None;
-    }
-    let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op else { return None };
-    Some((masked, mpos, x, y))
+    crate::emit::zero_cmp_band(func, plan, (uses, pos_of), b_idx, (lhs, rhs), |v| is_zero_const(func, plan, v))
 }
 
 fn may_barrier_mem(op: &Op) -> bool {

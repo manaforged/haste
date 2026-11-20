@@ -199,18 +199,7 @@ pub(super) fn zero_cmp_band(
     lhs: Value,
     rhs: Value,
 ) -> Option<(Value, usize, Value, Value)> {
-    let masked = (plan.const_of(rhs) == Some(0)).then_some(lhs).or_else(|| (plan.const_of(lhs) == Some(0)).then_some(rhs))?;
-    if uses[masked.index()] != 1 || plan.elided[masked.index()] {
-        return None;
-    }
-    let (mb, mpos, minst) = def_entry(pos_of, masked)?;
-    if mb != b_idx {
-        return None;
-    }
-    let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op else {
-        return None;
-    };
-    Some((masked, mpos, x, y))
+    crate::emit::zero_cmp_band(func, plan, (uses, pos_of), b_idx, (lhs, rhs), |v| plan.const_of(v) == Some(0))
 }
 
 pub(super) fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, start: usize, end: usize, skip_pos: Option<usize>, val: Value) -> bool {

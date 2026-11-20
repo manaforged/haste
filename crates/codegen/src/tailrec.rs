@@ -499,7 +499,7 @@ fn peel_entry_guard(
 }
 
 const MAX_SPLIT: usize = 4;
-pub(crate) const FOLD_LIMIT: i64 = 1 << 24;
+pub(crate) use crate::alloc::FOLD_LIMIT;
 
 fn reg_budgets(arch: crate::target::Arch) -> (usize, usize) {
     match arch {

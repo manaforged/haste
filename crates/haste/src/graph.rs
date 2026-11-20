@@ -116,14 +116,17 @@ fn find_package(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
+pub(crate) const LOCK_FILE: &str = "Cargo.lock";
+
 fn manifest_name(dir: &Path) -> Option<String> {
-    let table: toml::Table = toml::from_str(&std::fs::read_to_string(dir.join("Cargo.toml")).ok()?).ok()?;
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?).ok()?;
     Some(table.get("package")?.get("name")?.as_str()?.to_owned())
 }
 
 /// The root directory and `[workspace]` table of the nearest manifest at or above `dir` that has one, which a local or git package inherits from.
 fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
-    for at in dir.ancestors().filter(|at| at.join("Cargo.toml").is_file()) {
+    for at in dir.ancestors().filter(|at| at.join(MANIFEST_FILE).is_file()) {
         if let Some(workspace) = manifest::workspace_of(at)? {
             return Ok(Some((at.to_owned(), workspace)));
         }
@@ -132,7 +135,7 @@ fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
 }
 
 fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = patches_in(&dir.join("Cargo.toml"), dir)?;
+    let mut paths = patches_in(&dir.join(MANIFEST_FILE), dir)?;
     for at in dir.ancestors() {
         let config = [".cargo/config.toml", ".cargo/config"].map(|leaf| at.join(leaf)).into_iter().find(|path| path.is_file());
         if let Some(config) = config {
@@ -159,15 +162,26 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
     let listed = workspace.and_then(|ws| ws.get(key)).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str);
     listed
         .flat_map(|member| match member.strip_suffix("/*") {
-            Some(parent) => subdirs(&top.join(parent)).unwrap_or_default().into_iter().filter(|dir| dir.join("Cargo.toml").is_file()).collect(),
+            Some(parent) => subdirs(&top.join(parent)).unwrap_or_default().into_iter().filter(|dir| dir.join(MANIFEST_FILE).is_file()).collect(),
             None => vec![top.join(member)],
         })
         .collect()
 }
 
 pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
-    let found = root.ancestors().find(|dir| dir.join("Cargo.lock").is_file());
-    found.map(Path::to_owned).with_context(|| format!("no Cargo.lock at or above {}", root.display()))
+    let found = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file());
+    found.map(Path::to_owned).with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
+}
+
+/// The lock file, workspace manifest, root manifest, and every local package's manifest and build script.
+pub(crate) fn manifest_paths(workspace: &Workspace, root: &Path) -> Vec<PathBuf> {
+    let top = workspace_root(root).unwrap_or_else(|_| root.to_owned());
+    let head = [top.join(LOCK_FILE), top.join(MANIFEST_FILE), root.join(MANIFEST_FILE)];
+    let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| std::iter::once(package.manifest.dir.join(MANIFEST_FILE)).chain(package.manifest.build.clone()));
+    let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>, wanted: &BTreeSet<String>) -> Result<BTreeMap<String, PathBuf>> {
@@ -339,17 +353,36 @@ fn load_filtered(root: &Path, targets: &Targets, features: &[&str], omit_root_de
     Ok(Workspace { packages, graph })
 }
 
-/// The standard library sources of the toolchain: `HASTE_LIBRARY`, or rust-src of the first stable toolchain.
+/// The standard library sources of the toolchain: `HASTE_LIBRARY`, the active `rustc` sysroot's `rust-src`, or the newest rustup toolchain with `rust-src` (preferring `stable-*`).
 pub fn library() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("HASTE_LIBRARY") {
         return Ok(PathBuf::from(dir));
     }
+    let sysroot_library = |root: &Path| {
+        let dir = root.join("lib/rustlib/src/rust/library");
+        dir.join("sysroot").is_dir().then_some(dir)
+    };
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
+    if let Ok(output) = std::process::Command::new(rustc).args(["--print", "sysroot"]).output()
+        && output.status.success()
+        && let Ok(text) = std::str::from_utf8(&output.stdout)
+        && let Some(dir) = sysroot_library(Path::new(text.trim()))
+    {
+        return Ok(dir);
+    }
     let home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
-    let toolchains = home.context("no RUSTUP_HOME or HOME")?.join("toolchains");
-    let mut found: Vec<PathBuf> = std::fs::read_dir(&toolchains)?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
-    found.sort();
-    let library = found.iter().filter(|dir| dir.file_name().is_some_and(|name| name.to_string_lossy().starts_with("stable-"))).map(|dir| dir.join("lib/rustlib/src/rust/library"));
-    library.into_iter().find(|dir| dir.join("sysroot").is_dir()).context("no rust-src in a stable toolchain; set HASTE_LIBRARY")
+    if let Some(toolchains) = home.map(|home| home.join("toolchains"))
+        && let Ok(entries) = std::fs::read_dir(&toolchains)
+    {
+        let mut found: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
+        found.sort();
+        found.reverse();
+        let stable = found.iter().filter(|dir| dir.file_name().is_some_and(|name| name.to_string_lossy().starts_with("stable-")));
+        if let Some(dir) = stable.chain(found.iter()).find_map(|dir| sysroot_library(dir)) {
+            return Ok(dir);
+        }
+    }
+    anyhow::bail!("no rust-src found; run `rustup component add rust-src` or set HASTE_LIBRARY")
 }
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.

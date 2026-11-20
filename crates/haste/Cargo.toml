@@ -1,10 +1,16 @@
 [package]
 name = "haste"
+description = "A Rust compiler and execution engine for running, testing, and building workspaces without a target/ directory"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 anyhow = "1"

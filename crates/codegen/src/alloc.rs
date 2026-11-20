@@ -35,7 +35,7 @@ pub(crate) struct Regs<R: 'static> {
     pub high_product: Option<R>,
 }
 
-const FOLD_LIMIT: i64 = 1 << 24;
+pub(crate) const FOLD_LIMIT: i64 = 1 << 24;
 
 /// Reports whether `data` reads or makes a 128-bit integer.
 pub(crate) fn touches_i128(func: &Function, data: &InstData) -> bool {

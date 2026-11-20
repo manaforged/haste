@@ -155,14 +155,7 @@ pub fn record(root: &Path, workspace: &crate::graph::Workspace, build_paths: &[P
     }
     let croot = canonical_root(root);
     let aout = abs_out(out);
-    let top = crate::graph::workspace_root(&croot).unwrap_or_else(|_| croot.clone());
-    let mut paths = vec![top.join("Cargo.lock"), top.join("Cargo.toml"), croot.join("Cargo.toml")];
-    for package in workspace.packages.iter().filter(|pkg| pkg.local()) {
-        paths.push(package.manifest.dir.join("Cargo.toml"));
-        if let Some(build) = &package.manifest.build {
-            paths.push(build.clone());
-        }
-    }
+    let mut paths = crate::graph::manifest_paths(workspace, &croot);
     paths.extend(build_paths.iter().cloned());
     let (watched_files, watched_vars) = crate::graph::store::watched_stamps(workspace);
     paths.extend(watched_files.into_iter().map(|(path, _, _)| path));

@@ -23,13 +23,7 @@ struct Served<'a> {
 
 impl Served<'_> {
     fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
-        let top = graph::workspace_root(root).unwrap_or_else(|_| root.to_owned());
-        let head = [top.join("Cargo.lock"), top.join("Cargo.toml"), root.join("Cargo.toml")];
-        let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| std::iter::once(package.manifest.dir.join("Cargo.toml")).chain(package.manifest.build.clone()));
-        let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
-        paths.sort();
-        paths.dedup();
-        paths
+        graph::manifest_paths(workspace, root)
             .into_iter()
             .map(|path| {
                 let now = file_stamp(&path);
@@ -85,6 +79,8 @@ fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
     let mut hasher = rustc_hash::FxHasher::default();
     root.hash(&mut hasher);
     (crate::profile() == Profile::Release).hash(&mut hasher);
+    crate::prep::prepared().hash(&mut hasher);
+    std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
     let abstract_name = cfg!(target_os = "linux");
     let name = match abstract_name {
         true => format!("haste/{:016x}", hasher.finish()),
@@ -216,9 +212,18 @@ fn same_user(fd: RawFd) -> bool {
     rc == 0 && len as usize == std::mem::size_of::<libc::ucred>() && cred.uid == unsafe { libc::geteuid() }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn same_user(fd: RawFd) -> bool {
+    let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
+    // SAFETY: fd is an accepted AF_UNIX socket, and uid/gid point to live storage.
+    let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
+    // SAFETY: geteuid takes no pointers and reads the process's effective user id.
+    rc == 0 && uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn same_user(_fd: RawFd) -> bool {
-    true
+    false
 }
 
 fn listen(root: &std::path::Path) -> Result<RawFd> {
@@ -230,7 +235,15 @@ fn listen(root: &std::path::Path) -> Result<RawFd> {
         unsafe { libc::unlink(addr.sun_path.as_ptr()) };
     }
     // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
-    if unsafe { libc::bind(fd, (&raw const addr).cast(), len) } != 0 || unsafe { libc::listen(fd, 16) } != 0 {
+    if unsafe { libc::bind(fd, (&raw const addr).cast(), len) } != 0 {
+        bail!("a build server for {} runs already: {}", root.display(), std::io::Error::last_os_error());
+    }
+    if !cfg!(target_os = "linux") {
+        // SAFETY: sun_path is NUL-terminated and was just bound above.
+        unsafe { libc::chmod(addr.sun_path.as_ptr(), 0o600) };
+    }
+    // SAFETY: fd is a bound AF_UNIX socket.
+    if unsafe { libc::listen(fd, 16) } != 0 {
         bail!("a build server for {} runs already: {}", root.display(), std::io::Error::last_os_error());
     }
     Ok(fd)
@@ -249,6 +262,10 @@ fn write_payload(conn: &mut std::fs::File, out: Option<&Path>, args: &[String]) 
     Ok(conn.write_all(&bytes)?)
 }
 
+const MAX_PATH_BYTES: usize = 64 * 1024;
+const MAX_ARGS: u32 = 4096;
+const MAX_ARG_BYTES: usize = 1024 * 1024;
+
 fn read_payload(conn: &mut std::fs::File) -> Result<(Option<PathBuf>, Vec<String>)> {
     use std::os::unix::ffi::OsStringExt as _;
     let mut word = [0; 4];
@@ -257,6 +274,9 @@ fn read_payload(conn: &mut std::fs::File) -> Result<(Option<PathBuf>, Vec<String
         Ok(u32::from_le_bytes(word))
     };
     let out_len = next(conn)? as usize;
+    if out_len > MAX_PATH_BYTES {
+        bail!("output path exceeds limit");
+    }
     let out = if out_len == 0 {
         None
     } else {
@@ -265,9 +285,16 @@ fn read_payload(conn: &mut std::fs::File) -> Result<(Option<PathBuf>, Vec<String
         Some(PathBuf::from(std::ffi::OsString::from_vec(raw)))
     };
     let count = next(conn)?;
-    let mut args = Vec::new();
+    if count > MAX_ARGS {
+        bail!("argument count exceeds limit");
+    }
+    let mut args = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let mut arg = vec![0; next(conn)? as usize];
+        let arg_len = next(conn)? as usize;
+        if arg_len > MAX_ARG_BYTES {
+            bail!("argument exceeds limit");
+        }
+        let mut arg = vec![0; arg_len];
         conn.read_exact(&mut arg)?;
         args.push(String::from_utf8(arg)?);
     }
@@ -317,10 +344,7 @@ pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, out, ar
     match request {
         Request::Test => build.report(started, built).map(|()| 0),
         Request::Build => build.check(built),
-        Request::Run => {
-            eprintln!("built in {:.1} ms", built.as_secs_f64() * 1e3);
-            build.run(workspace, args)
-        }
+        Request::Run => build.run(workspace, args),
     }
 }
 

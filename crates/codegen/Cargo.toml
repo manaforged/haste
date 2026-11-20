@@ -1,10 +1,13 @@
 [package]
 name = "haste-codegen"
+description = "SSA IR, optimizer, and native x86-64/arm64 code generator for haste"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 libc = "0.2"

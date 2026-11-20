@@ -1,6 +1,6 @@
 use crate::alloc::{Location, Plan, Regs};
 use crate::frame::{Abi, Emitter, Frame, Loc, ShrinkWrap};
-use crate::ir::{Block, Function, Op, SigRef, Value};
+use crate::ir::{Binary, Block, Function, Inst, Op, SigRef, Value};
 use crate::park::ParkReg;
 use crate::Site;
 use std::ops::Range;
@@ -385,4 +385,27 @@ pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, r
         }
     }
     true
+}
+
+/// Finds a single-use, non-elided `Band(x, y)` in block `b_idx` compared against zero via `is_zero`.
+pub(crate) fn zero_cmp_band<R>(
+    func: &Function,
+    plan: &Plan<R>,
+    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    b_idx: usize,
+    (lhs, rhs): (Value, Value),
+    is_zero: impl Fn(Value) -> bool,
+) -> Option<(Value, usize, Value, Value)> {
+    let masked = is_zero(rhs).then_some(lhs).or_else(|| is_zero(lhs).then_some(rhs))?;
+    if uses[masked.index()] != 1 || plan.elided[masked.index()] {
+        return None;
+    }
+    let (mb, mpos, minst) = pos_of.get(masked.index()).copied().flatten()?;
+    if mb != b_idx {
+        return None;
+    }
+    let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op else {
+        return None;
+    };
+    Some((masked, mpos, x, y))
 }

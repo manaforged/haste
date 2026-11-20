@@ -254,13 +254,13 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const TOP_COMMANDS: [(Command, &str); 2] = [(Command::Serve, "serve"), (Command::Prep, "prep")];
+const TOP_COMMANDS: [(Command, &str); 3] = [(Command::Serve, "serve"), (Command::Prep, "prep"), (Command::Clean, "clean")];
 
 fn usage() -> String {
-    let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().map(|(_, name)| name)).collect();
+    let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().filter(|(cmd, _)| !matches!(cmd, Command::Clean)).map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} PATH [--] [ARGS...]\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -275,6 +275,8 @@ enum Command {
     Serve,
     /// Prepare the code the binary reaches for the prepped library.
     Prep,
+    /// Remove the haste cache directory.
+    Clean,
     /// Print what one stage found.
     Debug(Query),
 }
@@ -388,7 +390,24 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         return Ok(Err(meta));
     }
     let command = parse(&mut args)?;
-    if matches!(command, Command::Request(Request::Build | Request::Run))
+    if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+        return Ok(Err(meta));
+    }
+    if matches!(command, Command::Clean) {
+        if args.peek().is_some() {
+            anyhow::bail!("{}", usage());
+        }
+        return Ok(Ok((command, PathBuf::new(), Vec::new(), None, None)));
+    }
+    let path = if matches!(command, Command::Request(_) | Command::Serve | Command::Prep) {
+        match args.peek().and_then(|raw| raw.to_str()) {
+            None | Some("--") => PathBuf::from("."),
+            Some(_) => PathBuf::from(args.next().with_context(usage)?),
+        }
+    } else {
+        PathBuf::from(args.next().with_context(usage)?)
+    };
+    if !matches!(command, Command::Request(Request::Run) | Command::Debug(_))
         && let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)?
     {
         return Ok(Err(meta));
@@ -399,7 +418,6 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
     if crate::image::watch::enabled() && !matches!(command, Command::Request(Request::Run)) {
         anyhow::bail!("--watch is only supported with `haste run`");
     }
-    let path = PathBuf::from(args.next().with_context(usage)?);
     let rest = args
         .map(|raw| raw.into_string().map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy())))
         .collect::<Result<Vec<String>>>()?;
@@ -408,6 +426,16 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         _ => rest,
     };
     Ok(Ok((command, path, rest, stats_json, out)))
+}
+
+fn clean_cache() -> Result<()> {
+    let home = crate::graph::store::home();
+    match std::fs::remove_dir_all(&home) {
+        Ok(()) => eprintln!("removed {}", home.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => eprintln!("cache {} is already empty", home.display()),
+        Err(err) => return Err(err).with_context(|| format!("removing {}", home.display())),
+    }
+    Ok(())
 }
 
 fn print_meta(meta: Meta) {
@@ -438,6 +466,7 @@ pub fn main() -> Result<()> {
         Err(meta) => return Ok(print_meta(meta)),
     };
     match command {
+        Command::Clean => return clean_cache(),
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),
         _ => {}
@@ -534,8 +563,11 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
         Command::Request(request) => report_cases(root, &workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)), out)?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
+        Command::Clean => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
-    eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
+    if !matches!(command, Command::Request(Request::Run)) {
+        eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
+    }
     Ok(status)
 }
