@@ -44,6 +44,7 @@ fn compute_stamp(root: &Path, out: Option<&Path>, paths: &[PathBuf], env_names: 
     super::enabled().hash(&mut hasher);
     crate::prep::prepared().hash(&mut hasher);
     crate::selection().hash(&mut hasher);
+    crate::test_mode().hash(&mut hasher);
     std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
     std::env::var_os("CARGO_HOME").hash(&mut hasher);
     root.hash(&mut hasher);

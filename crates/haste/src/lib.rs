@@ -79,3 +79,15 @@ pub(crate) fn selection() -> &'static Selection {
 fn set_selection(selection: Selection) {
     _ = SELECTION.set(selection);
 }
+
+static TEST_MODE: OnceLock<bool> = OnceLock::new();
+
+/// Whether this invocation is running `haste test` (enabling `#[cfg(test)]` and member dev-dependencies).
+pub(crate) fn test_mode() -> bool {
+    *TEST_MODE.get_or_init(|| false)
+}
+
+/// Enables test mode once, before any workspace or outline loads.
+fn set_test_mode() {
+    _ = TEST_MODE.set(true);
+}

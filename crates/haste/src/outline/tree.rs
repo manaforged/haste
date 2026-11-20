@@ -396,6 +396,9 @@ impl Env {
     }
 
     fn name(&self, name: &str) -> Truth {
+        if name == "test" {
+            return if crate::test_mode() && !self.fixed { Truth::Yes } else { Truth::No };
+        }
         if self.target.has_name(name) || self.profile().contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
             Truth::Yes
         } else if self.known || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {

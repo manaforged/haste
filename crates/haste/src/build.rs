@@ -13,7 +13,7 @@ use crate::sema::{self, Cache, Edited};
 use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::cli::{Failures, case_items, error_kind, print_failures};
+use crate::cli::{Failures, TestItem, case_items, error_kind, print_failures, print_test_report, test_items};
 
 include!("../../../tests/case_inputs.rs");
 
@@ -37,6 +37,7 @@ struct Watch {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchKind {
     Cases,
+    Tests,
     MainCheck,
     MainAot,
 }
@@ -44,7 +45,7 @@ enum BatchKind {
 impl BatchKind {
     fn mode(self) -> crate::image::ImageMode {
         match self {
-            BatchKind::Cases => crate::image::ImageMode::Jit,
+            BatchKind::Cases | BatchKind::Tests => crate::image::ImageMode::Jit,
             BatchKind::MainCheck => crate::image::ImageMode::Check,
             BatchKind::MainAot => crate::image::ImageMode::Aot,
         }
@@ -53,6 +54,7 @@ impl BatchKind {
     fn pick(self, workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
         match self {
             BatchKind::Cases => case_items(workspace, outline),
+            BatchKind::Tests => test_items(workspace, outline).into_iter().map(|t| t.item).collect(),
             BatchKind::MainCheck | BatchKind::MainAot => main_items(workspace, outline),
         }
     }
@@ -64,6 +66,7 @@ struct Batch {
     store: Option<Cache>,
     labels: Vec<String>,
     roots: Vec<usize>,
+    tests: Vec<TestItem>,
     reached: Reached,
     image: Image,
     broken: HashMap<usize, String>,
@@ -211,6 +214,7 @@ fn finish_batch(
     let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.as_ref());
     let valid: Vec<ItemRef> = match kind {
         BatchKind::Cases => cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect(),
+        BatchKind::Tests => cases.iter().copied().filter(|&item| sema::infer::is_test_sig(&mut cx, item)).collect(),
         BatchKind::MainCheck => cases.to_vec(),
         BatchKind::MainAot => Vec::new(),
     };
@@ -233,7 +237,7 @@ fn finish_batch(
     let outline = cx.outline;
     let mut store = cx.release().0;
     save_batch_substrate((outline, &mut store), &mut image, (drop_finals, kind), substrate, pre_builder);
-    Ok(Batch { kind, store: Some(store), labels, roots, reached, image, broken, reach_span, codegen_span })
+    Ok(Batch { kind, store: Some(store), labels, roots, tests: Vec::new(), reached, image, broken, reach_span, codegen_span })
 }
 
 fn make_builders(slot: &SubstrateSlot) -> PreBuilders {
@@ -350,6 +354,7 @@ impl Batch {
             |cx| match (kind, main) {
                 (BatchKind::MainAot, Some(main_ref)) => sema::reach::main_roots(cx, main_ref).map_or_else(|_| vec![(main_ref, sema::substs::Substs::EMPTY)], Into::into),
                 (BatchKind::Cases, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
+                (BatchKind::Tests, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_test_sig(cx, item)).collect(),
                 _ => root_insts.clone(),
             },
             |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, substrate.take(), (cx, reach_clock)),
@@ -397,6 +402,10 @@ impl Batch {
                 cases.retain(|&item| sema::infer::is_case_sig(&mut cx, item));
                 roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
             }
+            BatchKind::Tests => {
+                cases.retain(|&item| sema::infer::is_test_sig(&mut cx, item));
+                roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
+            }
             BatchKind::MainAot => {
                 let Some(&main) = cases.first() else { return false };
                 let Ok(pair) = sema::reach::main_roots(&mut cx, main) else { return false };
@@ -411,6 +420,9 @@ impl Batch {
         }
         self.labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
         self.roots = roots.iter().map(|root| self.reached.index[root]).collect();
+        if self.kind == BatchKind::Tests {
+            self.tests = map_tests(&self.roots, &self.reached, test_items(workspace, &compilation.outline));
+        }
         recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh, &self.roots);
         self.store = Some(cx.release().0);
         true
@@ -453,8 +465,11 @@ impl Batch {
         i32::from(!failures.is_empty())
     }
 
-    /// Runs every case whose functions all compiled and prints what failed and how long building took.
-    fn report(&self, started: Instant, built: Duration) -> Result<()> {
+    /// Runs every case or `#[test]` whose functions all compiled and returns 0 when all pass, else 101.
+    fn report(&self, started: Instant, built: Duration, filters: &[String]) -> Result<i32> {
+        if self.kind == BatchKind::Tests {
+            return self.report_tests(started, filters);
+        }
         let (mut failures, runnable) = self.sort();
         let statuses = self.image.run_cases(&runnable, &CASE_INPUTS)?;
         for ((_, name), status) in runnable.iter().zip(statuses).filter(|(_, status)| *status != 0) {
@@ -463,8 +478,35 @@ impl Batch {
         print_failures(&failures);
         let ms = |at: Duration| at.as_secs_f64() * 1e3;
         eprintln!("cases {} found, {} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", self.labels.len(), runnable.len(), self.reached.list.len(), ms(built), ms(started.elapsed()));
-        Ok(())
+        Ok(0)
     }
+
+    fn report_tests(&self, started: Instant, filters: &[String]) -> Result<i32> {
+        let mut to_run = Vec::new();
+        let mut entries = Vec::new();
+        for ((&root, name), &meta) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
+            if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
+                continue;
+            }
+            let outcome = if meta.ignored {
+                None
+            } else if let Some(err) = self.reached.closure(&[root]).iter().rev().find_map(|at| self.reached.list[*at].1.as_ref().err().or_else(|| self.broken.get(at))) {
+                Some(Err(err.as_str()))
+            } else {
+                to_run.push((root, name.as_str()));
+                Some(Ok(0))
+            };
+            entries.push((name.as_str(), meta, outcome));
+        }
+        let mut ran = self.image.run_tests(&to_run)?.into_iter();
+        entries.iter_mut().filter(|e| !e.1.ignored && matches!(e.2, Some(Ok(_)))).for_each(|e| e.2 = ran.next().map(Ok));
+        Ok(print_test_report(&entries, started.elapsed()))
+    }
+}
+
+fn map_tests(roots: &[usize], reached: &Reached, items: Vec<TestItem>) -> Vec<TestItem> {
+    let by_item: HashMap<ItemRef, TestItem> = items.into_iter().map(|t| (t.item, t)).collect();
+    roots.iter().map(|&idx| by_item[&reached.list[idx].0.0]).collect()
 }
 
 impl Build {
@@ -495,7 +537,13 @@ impl Build {
                     anyhow::bail!("{}", errors.join("\n"));
                 }
             }
-            self.cases = Some(Batch::new(workspace, &mut self.compilation, BatchKind::Cases, false)?);
+            let discovered = test_items(workspace, &self.compilation.outline);
+            let kind = if discovered.is_empty() { BatchKind::Cases } else { BatchKind::Tests };
+            let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
+            if kind == BatchKind::Tests {
+                batch.tests = map_tests(&batch.roots, &batch.reached, discovered);
+            }
+            self.cases = Some(batch);
         }
         Ok(())
     }
@@ -614,10 +662,10 @@ impl Build {
         Ok(0)
     }
 
-    /// Runs every case whose functions all compiled and prints what failed and how long building took.
-    pub fn report(&self, started: Instant, built: Duration) -> Result<()> {
+    /// Runs every case or `#[test]` whose functions all compiled and returns 0 when all pass, else 101.
+    pub fn report(&self, started: Instant, built: Duration, filters: &[String]) -> Result<i32> {
         let Some(cases) = &self.cases else { bail!("the cases are not compiled") };
-        cases.report(started, built)
+        cases.report(started, built, filters)
     }
 
     /// Prints what failed to build in the binary's reach and how long building took, and returns 1 when anything failed.

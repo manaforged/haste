@@ -588,3 +588,19 @@ pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
         Ok(true)
     )
 }
+
+/// Whether `item` is a non-generic synchronous `fn() -> ()` suitable as a `#[test]` function.
+pub fn is_test_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
+    let Ok(sig) = cx.signature(item) else { return false };
+    if !sig.params.is_empty() || sig.receiver.is_some() || sig.is_async || sig.variadic || sig.opaque || scope::type_params(&sig.generics).next().is_some() {
+        return false;
+    }
+    let unit = cx.types.unit();
+    matches!(
+        detached(cx, item, |infer| {
+            let (params, ret) = infer.fn_types(item, &[])?;
+            Ok(params.is_empty() && infer.resolve(ret) == unit)
+        }),
+        Ok(true)
+    )
+}

@@ -40,7 +40,7 @@ haste -V|--version | -h|--help
 | Command | Does |
 | --- | --- |
 | `run [PATH] [--] [ARGS...]` | Runs the workspace binary's `main` with `ARGS`. |
-| `test [PATH]` | Runs each `fn(i64) -> i64` `case_*` harness function in the workspace members (does not run `#[test]` functions). |
+| `test [PATH] [--] [FILTER...]` | Runs `#[test]` functions (with `#[cfg(test)]`, `[dev-dependencies]`, `#[ignore]`, and `#[should_panic]`), or `fn(i64) -> i64` `case_*` harness functions when no `#[test]` functions are present. |
 | `build [-o PATH] [PATH]` | Type-checks the workspace and lowers reached code, or writes a standalone executable when `-o PATH` is given. |
 | `serve [PATH]` | Keeps the workspace loaded in memory and answers `build`, `test`, and `run` requests for `PATH`, rebuilding only what edited files affect. |
 | `prep [PATH]` | Pre-compiles dependencies that `main` reaches into the prepared library cache for `--prepared` (**x86-64 Linux only**). |
@@ -109,7 +109,7 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 
 - haste compiles only for the host (`x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`). Windows and cross-compilation are not supported.
 - haste performs name resolution, type inference, trait selection, and move/drop tracking, but does not run a borrow checker yet. Use `cargo check` or `rustc` in CI to verify lifetime and aliasing rules.
-- `haste test` runs `fn case_*(i64) -> i64` harness functions rather than standard `#[test]` functions (`#[cfg(test)]` is currently disabled).
+- `haste test` currently runs synchronous `fn()` `#[test]` functions (not `Result`-returning or `#[tokio::test]` functions yet).
 - `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
 - On macOS, JIT execution uses dual-mapped `mach_vm_remap` pages (writable + executable aliases), which may be blocked inside a Hardened Runtime or App Sandbox.
 - Some Rust features do not compile yet. If any reached function fails to compile, `haste build` exits non-zero.

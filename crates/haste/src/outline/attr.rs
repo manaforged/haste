@@ -29,6 +29,31 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
     parts
 }
 
+/// Whether `attrs` contains an attribute named `wanted` (bare or under a standard prelude path), directly or via an active `cfg_attr`.
+pub fn has_attr(src: &Source, attrs: &[Attr], env: &Env, wanted: &str) -> bool {
+    attrs.iter().any(|attr| match attr {
+        Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => has_attr(src, inner, env, wanted),
+        &Attr::Other(at) => attr_is_named(src, at, wanted),
+        _ => false,
+    })
+}
+
+fn attr_is_named(src: &Source, from: u32, wanted: &str) -> bool {
+    let mut end = from;
+    while matches!(src.kind(end), TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon) {
+        end += 1;
+    }
+    let mut at = from;
+    if end - at >= 2 && src.kind(at) == TokenKind::Colon && src.kind(at + 1) == TokenKind::Colon {
+        at += 2;
+    }
+    match end - at {
+        1 => src.text(at) == wanted,
+        10 => matches!(src.text(at), "core" | "std") && src.text(at + 3) == "prelude" && matches!(src.text(at + 6), "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024") && src.text(at + 9) == wanted,
+        _ => false,
+    }
+}
+
 /// The first token of each word of every `#[repr(..)]` among `attrs`, written directly or through a `cfg_attr` that holds under `env`.
 pub fn repr_words(src: &Source, attrs: &[Attr], env: &Env) -> Vec<u32> {
     let mut words = Vec::new();

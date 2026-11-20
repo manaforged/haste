@@ -87,6 +87,87 @@ fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     Ok(())
 }
 
+/// Metadata for a discovered `#[test]` function.
+#[derive(Clone, Copy)]
+pub(crate) struct TestItem {
+    pub item: ItemRef,
+    pub ignored: bool,
+    pub should_panic: bool,
+}
+
+pub(crate) fn test_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<TestItem> {
+    let mut found = Vec::new();
+    for krate in outline.members(workspace) {
+        let tree = &outline.crates[krate];
+        for (file_at, file) in tree.files.iter().enumerate() {
+            for (at, item) in file.items.items.iter().enumerate() {
+                if item.kind != outline::item::ItemKind::Fn {
+                    continue;
+                }
+                if !outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test") {
+                    continue;
+                }
+                found.push(TestItem {
+                    item: ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 },
+                    ignored: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "ignore"),
+                    should_panic: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic"),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Formats and prints standard Rust test output and returns 0 when all tests pass, else 101.
+pub(crate) fn print_test_report(
+    entries: &[(&str, TestItem, Option<Result<i32, &str>>)],
+    elapsed: std::time::Duration,
+) -> i32 {
+    println!("\nrunning {} test{}", entries.len(), if entries.len() == 1 { "" } else { "s" });
+    let (mut passed, mut failed, mut ignored) = (0usize, 0usize, 0usize);
+    let mut details: Vec<(&str, String)> = Vec::new();
+    for &(name, meta, ref outcome) in entries {
+        if meta.ignored {
+            println!("test {name} ... ignored");
+            ignored += 1;
+            continue;
+        }
+        match outcome {
+            Some(Ok(status)) => {
+                let ok = if meta.should_panic { *status != 0 } else { *status == 0 };
+                if ok {
+                    println!("test {name} ... ok");
+                    passed += 1;
+                } else {
+                    let msg = if meta.should_panic { "note: test did not panic as expected".to_owned() } else { format!("exited with status {status}") };
+                    println!("test {name} ... FAILED");
+                    details.push((name, msg));
+                    failed += 1;
+                }
+            }
+            Some(Err(err)) => {
+                println!("test {name} ... FAILED");
+                details.push((name, (*err).to_owned()));
+                failed += 1;
+            }
+            None => {
+                println!("test {name} ... FAILED");
+                details.push((name, "test did not compile".to_owned()));
+                failed += 1;
+            }
+        }
+    }
+    if !details.is_empty() {
+        println!("\nfailures:\n");
+        for (name, msg) in &details {
+            println!("---- {name} ----\n{msg}\n");
+        }
+    }
+    let verdict = if failed == 0 { "ok" } else { "FAILED" };
+    println!("\ntest result: {verdict}. {passed} passed; {failed} failed; {ignored} ignored; finished in {:.2}s\n", elapsed.as_secs_f64());
+    if failed == 0 { 0 } else { 101 }
+}
+
 pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
     let mut found = Vec::new();
     for krate in outline.members(workspace) {
@@ -440,6 +521,9 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         return Ok(Err(meta));
     }
     crate::set_selection(selection);
+    if matches!(command, Command::Request(Request::Test)) {
+        crate::set_test_mode();
+    }
     if !matches!(command, Command::Request(Request::Build)) && (stats_json.is_some() || out.is_some()) {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
     }

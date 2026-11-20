@@ -81,6 +81,7 @@ fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
     (crate::profile() == Profile::Release).hash(&mut hasher);
     crate::prep::prepared().hash(&mut hasher);
     crate::selection().hash(&mut hasher);
+    crate::test_mode().hash(&mut hasher);
     std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
     let abstract_name = cfg!(target_os = "linux");
     let name = match abstract_name {
@@ -343,7 +344,7 @@ pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, out, ar
     }
     let built = started.elapsed();
     match request {
-        Request::Test => build.report(started, built).map(|()| 0),
+        Request::Test => build.report(started, built, args.get(1..).unwrap_or(&[])),
         Request::Build => build.check(built),
         Request::Run => build.run(workspace, args),
     }
