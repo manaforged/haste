@@ -1,12 +1,16 @@
 //! Haste: the build graph, name resolution, type inference, lowering, and the JIT that runs the program.
 
+#![cfg_attr(not(unix), allow(dead_code))]
+
 #[cfg(not(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "macos"),
     all(target_arch = "x86_64", target_os = "macos"),
+    all(target_arch = "x86_64", target_os = "windows"),
+    all(target_arch = "aarch64", target_os = "windows"),
 )))]
-compile_error!("haste currently supports x86_64/aarch64 Linux and macOS hosts");
+compile_error!("haste currently supports x86_64/aarch64 Linux, macOS, and Windows hosts");
 
 mod aot;
 mod body;

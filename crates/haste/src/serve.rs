@@ -1,18 +1,25 @@
 //! A resident build of one workspace that answers `build`, `test` and `run` requests over a Unix socket: an abstract one on Linux, which leaves no file behind, else one in the temporary directory.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::graph::{self, Targets};
 use anyhow::{Result, bail};
 
 use crate::build::Build;
+#[cfg(unix)]
 use crate::graph::store::{FileStamp, file_stamp, watched_stamps};
+#[cfg(unix)]
 use crate::outline::tree::Profile;
 
 /// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests, build scripts and watched inputs it was loaded from.
+#[cfg(unix)]
 struct Served<'a> {
     root: &'a Path,
     targets: &'a Targets,
@@ -21,6 +28,7 @@ struct Served<'a> {
     watched: (Vec<(PathBuf, u64, i128)>, Vec<(String, Option<std::ffi::OsString>)>),
 }
 
+#[cfg(unix)]
 impl Served<'_> {
     fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
         graph::manifest_paths(workspace, root)
@@ -60,6 +68,7 @@ pub enum Request {
 pub const MODES: [(Request, &str); 3] = [(Request::Build, "build"), (Request::Test, "test"), (Request::Run, "run")];
 
 impl Request {
+    #[cfg(unix)]
     fn byte(self) -> u8 {
         self as u8
     }
@@ -69,10 +78,48 @@ impl Request {
         MODES.into_iter().find(|(_, name)| *name == mode).map(|(request, _)| request)
     }
 
+    #[cfg(unix)]
     fn parse(byte: u8) -> Option<Request> {
         MODES.into_iter().find(|(request, _)| request.byte() == byte).map(|(request, _)| request)
     }
 }
+
+/// Builds what `request` needs, prints how long that took since `started`, then prints what failed for `build`, runs every case for `test` or `main` with `args` for `run`, and returns the exit status.
+pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, out, args): (Request, Option<&Path>, &[String]), started: Instant) -> Result<i32> {
+    if let (Request::Build, Some(path)) = (request, out) {
+        return build.emit_executable(workspace, path, false);
+    }
+    match request {
+        Request::Test => build.compile_cases(workspace)?,
+        Request::Build => build.compile_binary(workspace)?,
+        Request::Run => {}
+    }
+    let built = started.elapsed();
+    match request {
+        Request::Test => build.report(started, built, args.get(1..).unwrap_or(&[])),
+        Request::Build => build.check(built),
+        Request::Run => build.run(workspace, args),
+    }
+}
+
+#[cfg(not(unix))]
+/// Sends `request`, optional `out` path, and `args` to the server of `root`, or returns `Ok(None)` when no server runs.
+pub fn ask(_root: &std::path::Path, _request: Request, _out: Option<&Path>, _args: &[String]) -> Result<Option<i32>> {
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+/// Loads `workspace` once, then answers requests until the process is killed.
+pub fn serve(_workspace: &mut graph::Workspace, _targets: &Targets, _root: &std::path::Path) -> Result<()> {
+    bail!("haste serve requires Unix domain sockets")
+}
+
+#[cfg(unix)]
+pub use unix_ipc::{ask, serve};
+
+#[cfg(unix)]
+mod unix_ipc {
+use super::*;
 
 fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
     use std::hash::{Hash, Hasher};
@@ -332,24 +379,6 @@ fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(R
     done.unwrap_or(1)
 }
 
-/// Builds what `request` needs, prints how long that took since `started`, then prints what failed for `build`, runs every case for `test` or `main` with `args` for `run`, and returns the exit status.
-pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, out, args): (Request, Option<&Path>, &[String]), started: Instant) -> Result<i32> {
-    if let (Request::Build, Some(path)) = (request, out) {
-        return build.emit_executable(workspace, path, false);
-    }
-    match request {
-        Request::Test => build.compile_cases(workspace)?,
-        Request::Build => build.compile_binary(workspace)?,
-        Request::Run => {}
-    }
-    let built = started.elapsed();
-    match request {
-        Request::Test => build.report(started, built, args.get(1..).unwrap_or(&[])),
-        Request::Build => build.check(built),
-        Request::Run => build.run(workspace, args),
-    }
-}
-
 fn redirect(client: [RawFd; 3]) -> [RawFd; 3] {
     // SAFETY: fcntl and dup2 take descriptors this process holds; 0, 1 and 2 stay open throughout.
     STDIO.map(|own| unsafe {
@@ -442,4 +471,5 @@ fn receive(fd: RawFd) -> Result<(u8, Vec<RawFd>)> {
     }
     fds.iter().try_for_each(|&fd| crate::image::close_on_exec(fd).map(drop))?;
     Ok((data[0], fds))
+}
 }

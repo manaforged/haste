@@ -1,5 +1,6 @@
 //! The source files that `run --watch` reloads on: one descriptor that turns readable when any of them changes, from kqueue vnode events on macOS and inotify on Linux.
 
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,9 +11,11 @@ use anyhow::{Result, bail};
 static WANTED: AtomicBool = AtomicBool::new(false);
 
 /// How long, in milliseconds, the files must stay quiet after a change before it counts, so an editor's write and rename count once.
+#[cfg(unix)]
 const QUIET_MS: libc::c_int = 30;
 
 /// The most events one read takes from the queue while it drains.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const DRAIN_EVENTS: usize = 64;
 
 /// Makes `run` watch the workspace's source files and reload the function bodies an edit changes in the running program.
@@ -26,6 +29,7 @@ pub fn enabled() -> bool {
 }
 
 /// A queue of change events for a list of files.
+#[cfg(unix)]
 pub struct Watcher {
     /// The paths watched, opened again after each change.
     paths: Vec<PathBuf>,
@@ -35,6 +39,7 @@ pub struct Watcher {
     files: Vec<OwnedFd>,
 }
 
+#[cfg(unix)]
 impl Watcher {
     /// Watches each file of `paths` that exists now.
     pub fn new(paths: Vec<PathBuf>) -> Result<Watcher> {
@@ -65,7 +70,25 @@ impl Watcher {
     }
 }
 
+/// A queue of change events for a list of files.
+#[cfg(not(unix))]
+pub struct Watcher;
+
+#[cfg(not(unix))]
+impl Watcher {
+    /// Watches each file of `paths` that exists now.
+    pub fn new(_paths: Vec<PathBuf>) -> Result<Watcher> {
+        bail!("--watch needs macOS or Linux")
+    }
+
+    /// Waits until the files stay quiet before reloading.
+    pub fn settle(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// The path as a C string, or none when it holds a NUL byte.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn c_path(path: &std::path::Path) -> Option<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(path.as_os_str().as_bytes()).ok()
@@ -148,11 +171,11 @@ fn drain(queue: &OwnedFd) {
 }
 
 /// No file watching on this system.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn open(_: &[PathBuf]) -> Result<(OwnedFd, Vec<OwnedFd>)> {
     bail!("--watch needs macOS or Linux")
 }
 
 /// No file watching on this system.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn drain(_: &OwnedFd) {}

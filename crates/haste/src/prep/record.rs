@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
@@ -216,6 +217,18 @@ pub(super) enum Class {
     Other,
 }
 
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        (meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, 0)
+    }
+}
+
 /// A manifest read before it was needed: the device and inode of its file, and what it holds.
 pub(super) struct Parsed {
     file: (u64, u64),
@@ -230,7 +243,7 @@ impl Parsed {
         let mut text = String::new();
         std::io::Read::read_to_string(&mut opened, &mut text).with_context(|| format!("reading {}", path.display()))?;
         let library = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(Parsed { file: (meta.dev(), meta.ino()), library })
+        Ok(Parsed { file: file_identity(&meta), library })
     }
 }
 
@@ -245,7 +258,7 @@ impl Library {
         let path = dir.join(files::manifest(files::LIBRARY));
         let file = std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
         let mut library = match ahead {
-            Some(parsed) if parsed.file == (file.dev(), file.ino()) => parsed.library,
+            Some(parsed) if parsed.file == file_identity(&file) => parsed.library,
             _ => Library::read(&path)?,
         };
         let delta = dir.join(files::manifest(files::DELTA));

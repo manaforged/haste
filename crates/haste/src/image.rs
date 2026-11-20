@@ -17,6 +17,7 @@ pub use expand::{Job, run_macros};
 pub use lazy::{Driver, Ended, Jit, Program, entries, evaluator, run_on_demand, serve};
 pub use script::Script;
 
+#[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -553,6 +554,7 @@ impl Image {
     }
 
     /// Runs a single `#[test]` function in a forked child with stderr captured, returning `(exit_status, stderr)`.
+    #[cfg(unix)]
     pub fn run_test_captured(&self, index: usize, start: Option<usize>, name: &str) -> Result<(i32, String)> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
@@ -582,6 +584,29 @@ impl Image {
         let mut stderr = Vec::new();
         std::io::Read::read_to_end(&mut stderr_pipe, &mut stderr)?;
         Ok((wait(pid), String::from_utf8_lossy(&stderr).into_owned()))
+    }
+
+    /// Runs a single `#[test]` function in-process on non-Unix platforms, returning `(exit_status, stderr)`.
+    #[cfg(not(unix))]
+    pub fn run_test_captured(&self, index: usize, start: Option<usize>, name: &str) -> Result<(i32, String)> {
+        let address = self.slot(index).load(Ordering::Acquire);
+        if address == 0 {
+            bail!("{name} has no code");
+        }
+        if let Some(s) = start {
+            if self.slot(s).load(Ordering::Acquire) == 0 {
+                bail!("{name} has no start wrapper (slot {s})");
+            }
+            return Ok((self.enter_main((s, index), &[name.to_owned()]), String::new()));
+        }
+        extern "C" fn run_fn(ptr: *mut u8) {
+            // SAFETY: ptr is the native fn() code address checked non-zero above.
+            let test_fn: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(ptr as usize) };
+            test_fn();
+        }
+        extern "C" fn caught(_data: *mut u8, _payload: *mut u8) {}
+        let panicked = crate::host::unwind::catch_unwind(run_fn, address as *mut u8, caught) != 0;
+        Ok((if panicked { 101 } else { 0 }, String::new()))
     }
 
     /// Runs each `#[test]` function `(index, start_index, name)` in a forked child and returns each test's exit status (0 for pass, non-zero for panic/Err).
@@ -624,6 +649,7 @@ impl Image {
         Ok(statuses)
     }
 
+    #[cfg(unix)]
     fn run_from(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>) -> Result<(usize, i32)> {
         let (pid, mut progress) = fork_piped(|progress| self.run_in_child(offset, items, invoke, progress))?;
         let mut done = Vec::new();
@@ -631,6 +657,18 @@ impl Image {
         Ok((done.len(), wait(pid)))
     }
 
+    #[cfg(not(unix))]
+    fn run_from(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>) -> Result<(usize, i32)> {
+        for (i, &(index, name)) in items.iter().enumerate() {
+            let address = self.slot(index).load(Ordering::Acquire);
+            if invoke(offset + i, address, name).is_err() {
+                return Ok((i, 101));
+            }
+        }
+        Ok((items.len(), 0))
+    }
+
+    #[cfg(unix)]
     fn run_in_child(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>, mut progress: std::fs::File) -> std::io::Result<()> {
         use std::io::Write;
         for (i, &(index, name)) in items.iter().enumerate() {
@@ -666,6 +704,7 @@ fn patch(addresses: &[usize], code: usize) {
 }
 
 /// Waits for child `pid` and gives its exit status, or 128 plus the signal that ended it.
+#[cfg(unix)]
 pub(crate) fn wait(pid: libc::pid_t) -> i32 {
     let mut status = 0;
     // SAFETY: pid is a child of this process, and status is a live local.
@@ -674,8 +713,15 @@ pub(crate) fn wait(pid: libc::pid_t) -> i32 {
 }
 
 /// Whether a child that ended with `status` was stopped from outside, by a hangup, an interrupt, a kill or a termination request, so its failure says nothing about its input.
+#[cfg(unix)]
 pub(crate) fn interrupted(status: i32) -> bool {
     [libc::SIGHUP, libc::SIGINT, libc::SIGKILL, libc::SIGTERM].iter().any(|&signal| status == 128 + signal)
+}
+
+/// Whether a child that ended with `status` was stopped from outside.
+#[cfg(not(unix))]
+pub(crate) fn interrupted(_status: i32) -> bool {
+    false
 }
 
 #[repr(u8)]
@@ -774,6 +820,7 @@ fn new_cell(state: &mut ThreadState, slot: usize, size: usize) -> usize {
 }
 
 /// Forks a child that dumps no core when a signal ends it, runs `child` and exits with the status it returns; returns the child's pid.
+#[cfg(unix)]
 pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
     std::io::Write::flush(&mut std::io::stdout())?;
     // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
@@ -795,6 +842,7 @@ pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
 }
 
 /// A new pipe whose ends close when the program executes another one.
+#[cfg(unix)]
 pub(crate) fn pipe() -> Result<[i32; 2]> {
     use std::os::fd::IntoRawFd;
     let (read, write) = std::io::pipe()?;
@@ -802,6 +850,7 @@ pub(crate) fn pipe() -> Result<[i32; 2]> {
 }
 
 /// Marks `fd` to close when the program executes another one.
+#[cfg(unix)]
 pub(crate) fn close_on_exec(fd: i32) -> Result<i32> {
     // SAFETY: fcntl with F_SETFD only changes the flags of a descriptor this process holds.
     if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
@@ -811,6 +860,7 @@ pub(crate) fn close_on_exec(fd: i32) -> Result<i32> {
 }
 
 /// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.
+#[cfg(unix)]
 pub(crate) fn fork_piped<E>(child: impl FnOnce(std::fs::File) -> Result<(), E>) -> Result<(libc::pid_t, std::fs::File)> {
     let [read, write] = pipe()?;
     let pid = fork_child(|| {

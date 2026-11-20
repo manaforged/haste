@@ -1,7 +1,10 @@
 //! Stubs that compile a function on its first call: each call table slot starts at a stub that asks the compiler process for its function's code and jumps to it.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::mem::ManuallyDrop;
+#[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -161,6 +164,7 @@ fn compiled(index: usize) -> Option<usize> {
 }
 
 /// Requests the compiler for the code of slot `index`: writes the index and reads the code address, which is zero when the function has none.
+#[cfg(unix)]
 fn ask(index: usize) -> std::io::Result<usize> {
     // SAFETY: ASK and ANSWER are pipe ends this process holds for the life of the program; ManuallyDrop keeps them open.
     let (mut ask, mut answer) = unsafe { (ManuallyDrop::new(std::fs::File::from_raw_fd(ASK.load(Ordering::Acquire))), ManuallyDrop::new(std::fs::File::from_raw_fd(ANSWER.load(Ordering::Acquire)))) };
@@ -168,6 +172,11 @@ fn ask(index: usize) -> std::io::Result<usize> {
     let mut code = [0; 8];
     answer.read_exact(&mut code)?;
     Ok(u64::from_le_bytes(code) as usize)
+}
+
+#[cfg(not(unix))]
+fn ask(_index: usize) -> std::io::Result<usize> {
+    Err(std::io::Error::other("lazy JIT stubs require Unix"))
 }
 
 extern "C" fn resolve(index: usize) -> usize {
@@ -181,7 +190,10 @@ extern "C" fn resolve(index: usize) -> usize {
     }
     match ask(index) {
         Ok(code) if code != 0 => code,
+        #[cfg(unix)]
         // SAFETY: _exit ends the program at once; the compiler printed why this function has no code.
         _ => unsafe { libc::_exit(101) },
+        #[cfg(not(unix))]
+        _ => std::process::exit(101),
     }
 }

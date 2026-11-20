@@ -24,11 +24,25 @@ thread_local! {
     static CURRENT_FRAME: Cell<*mut UnwindFrame> = const { Cell::new(std::ptr::null_mut()) };
 }
 
+#[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "_setjmp"]
     fn setjmp(env: *mut JmpBuf) -> libc::c_int;
     #[link_name = "_longjmp"]
     fn longjmp(env: *mut JmpBuf, val: libc::c_int) -> !;
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    #[link_name = "_setjmp"]
+    fn win_setjmp(env: *mut JmpBuf, frame: *mut core::ffi::c_void) -> libc::c_int;
+    fn longjmp(env: *mut JmpBuf, val: libc::c_int) -> !;
+}
+
+#[cfg(windows)]
+unsafe fn setjmp(env: *mut JmpBuf) -> libc::c_int {
+    // SAFETY: env is a live 16-aligned jmp_buf; passing null frame disables SEH stack unwind in _setjmp.
+    unsafe { win_setjmp(env, std::ptr::null_mut()) }
 }
 
 /// Runs `try_fn(data)` inside a thread-local unwind frame; on panic, runs `catch_fn(data, payload)` and returns `1`, else returns `0`.
@@ -55,8 +69,7 @@ pub extern "C" fn catch_unwind(
 pub extern "C" fn start_panic(payload_data: usize, payload_vtable: usize) -> u32 {
     let frame = CURRENT_FRAME.get();
     if frame.is_null() {
-        // SAFETY: uncaught panic terminates the process cleanly via abort.
-        unsafe { libc::abort() };
+        std::process::abort();
     }
     // SAFETY: frame points to a live UnwindFrame on an enclosing catch_unwind stack frame on this thread.
     unsafe {

@@ -1,6 +1,8 @@
 //! Running build scripts: each script's `main` in a forked child, in the package directory with Cargo's variables set, with its standard output on the child's output pipe.
 
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
@@ -16,6 +18,7 @@ pub struct Script {
 
 impl Image {
     /// Runs `script` in this forked child with `out` as its standard output, and returns its exit status.
+    #[cfg(unix)]
     pub fn enter_script(&self, script: &Script, out: std::fs::File) -> i32 {
         let vars: Result<Vec<(CString, CString)>, std::ffi::NulError> = script.vars.iter().map(|(key, value)| Ok((CString::new(key.as_str())?, CString::new(value.as_str())?))).collect();
         let (Ok(vars), Ok(dir), Ok(log)) = (vars, CString::new(script.dir.as_os_str().as_encoded_bytes()), std::fs::File::create(&script.log)) else {
@@ -30,5 +33,12 @@ impl Image {
         }
         drop((out, log));
         self.enter_main(script.entry, &["build-script-build".to_owned()])
+    }
+
+    /// Runs `script` with `out` as its standard output, and returns its exit status.
+    #[cfg(not(unix))]
+    pub fn enter_script(&self, script: &Script, _out: std::fs::File) -> i32 {
+        let _ = script;
+        101
     }
 }

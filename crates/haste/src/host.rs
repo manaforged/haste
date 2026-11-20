@@ -4,7 +4,7 @@ pub(crate) mod cpu;
 mod math;
 pub mod native;
 mod syscall;
-mod unwind;
+pub(crate) mod unwind;
 mod x86;
 
 pub use math::{MathSymbol, symbol as intrinsic};
@@ -128,9 +128,32 @@ fn dynamic(name: &str) -> Option<usize> {
         return Some(address);
     }
     let name = CString::new(name).ok()?;
-    // SAFETY: name is a NUL-terminated string that lives across the call.
-    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    (!address.is_null()).then_some(address as usize)
+    #[cfg(unix)]
+    {
+        // SAFETY: name is a NUL-terminated string that lives across the call.
+        let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        (!address.is_null()).then_some(address as usize)
+    }
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetModuleHandleA(module_name: *const i8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(module: *mut core::ffi::c_void, proc_name: *const i8) -> *const core::ffi::c_void;
+        }
+        for module_name in [std::ptr::null(), c"ucrtbase.dll".as_ptr(), c"kernel32.dll".as_ptr(), c"msvcrt.dll".as_ptr()] {
+            // SAFETY: module_name is null or a static NUL-terminated DLL name; name is a live NUL-terminated CString.
+            let module = unsafe { GetModuleHandleA(module_name) };
+            if module.is_null() {
+                continue;
+            }
+            // SAFETY: module is a live loaded module handle and name is NUL-terminated.
+            let address = unsafe { GetProcAddress(module, name.as_ptr()) };
+            if !address.is_null() {
+                return Some(address as usize);
+            }
+        }
+        None
+    }
 }
 
 /// Writes the four registers that `cpuid` leaf `leaf`, subleaf `sub_leaf` gives compiled code to `out`.

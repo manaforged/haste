@@ -90,6 +90,7 @@ pub(super) fn spawn(dir: &Path, workspace: &Workspace) -> Result<Option<Child>> 
     let log = std::fs::File::create(dir.join(LOG))?;
     let mut command = Command::new(std::env::current_exe()?);
     command.args(PREP_ARGS).arg(super::root(workspace)?).stdin(lock).stdout(Stdio::null()).stderr(log);
+    #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     Ok(Some(command.spawn().context("starting a background prep")?))
 }

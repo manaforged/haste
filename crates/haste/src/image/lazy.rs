@@ -1,6 +1,8 @@
 //! Programs that compile each function on its first call: each runs in a forked child whose call table starts at stubs, and this process infers, lowers and encodes each function a stub asks for.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::Ordering;
 
@@ -17,7 +19,9 @@ use crate::sema::reach::{Instance, Reached, calls, infer_declared, infer_quiet, 
 use crate::sema::{Answer, Cache, Context, Edited};
 
 use super::global_asm::Foreign;
-use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, stub, wait};
+#[cfg(unix)]
+use super::wait;
+use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, stub};
 
 /// What answers what a pass of inference asked for, and says what it added.
 pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<Answer>;
@@ -41,11 +45,18 @@ enum Stop {
 type Journal = Vec<usize>;
 
 /// A running child: its pid, the pipe ends that carry its asks and the answers, its output pipe, what it wrote there, and why the function it last asked for has no code.
+#[cfg(unix)]
 struct Child {
     pid: libc::pid_t,
     asks: Option<std::fs::File>,
     answers: std::fs::File,
     out: Option<std::fs::File>,
+    bytes: Vec<u8>,
+    failure: Option<(String, ItemRef)>,
+}
+
+#[cfg(not(unix))]
+struct Child {
     bytes: Vec<u8>,
     failure: Option<(String, ItemRef)>,
 }
@@ -230,6 +241,7 @@ fn value_of(ended: Option<Ended>) -> Result<u128> {
     match ended {
         Some(Ended { failure: Some((error, _)), .. }) => bail!("{error}"),
         Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|bytes| anyhow!("it gave no value: {} bytes, not 16", bytes.len()))?)),
+        #[cfg(unix)]
         Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => {
             bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time")
         }
@@ -240,6 +252,7 @@ fn value_of(ended: Option<Ended>) -> Result<u128> {
 
 impl Image {
     /// Runs the constant item at slot `entry` in this forked child under a CPU time limit and writes its value, 128 bits wide when `wide`, to `out`; returns the exit status.
+    #[cfg(unix)]
     fn evaluate_in_child(&self, entry: usize, wide: bool, out: Option<std::fs::File>) -> i32 {
         let Some(mut out) = out else { return 1 };
         let limit = libc::itimerval { it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, it_value: libc::timeval { tv_sec: EVALUATION_SECONDS as _, tv_usec: 0 } };
@@ -254,6 +267,11 @@ impl Image {
             }
         };
         i32::from(out.write_all(&value.to_le_bytes()).is_err())
+    }
+
+    #[cfg(not(unix))]
+    fn evaluate_in_child(&self, _entry: usize, _wide: bool, _out: Option<std::fs::File>) -> i32 {
+        1
     }
 }
 
@@ -383,6 +401,7 @@ impl Jit {
     }
 
     /// Forks a child that runs `body` on the image, with an output pipe when `piped`, and exits with the status `body` returns; returns the child's id.
+    #[cfg(unix)]
     pub fn fork(&mut self, piped: bool, body: impl FnOnce(&Image, Option<std::fs::File>) -> i32) -> Result<usize> {
         let Some(stubs) = self.image.stubs.span() else { bail!("no stub memory") };
         let (ask, answer) = (super::pipe()?, super::pipe()?);
@@ -415,17 +434,26 @@ impl Jit {
         Ok(self.children.len() - 1)
     }
 
+    #[cfg(not(unix))]
+    pub fn fork(&mut self, _piped: bool, _body: impl FnOnce(&Image, Option<std::fs::File>) -> i32) -> Result<usize> {
+        bail!("lazy forked JIT execution requires Unix; use `haste build -o` on Windows")
+    }
+
     /// Kills and reaps every child still running, as a run that stopped on an error leaves them waiting for answers.
     fn kill_children(&mut self) {
         self.pending.clear();
+        #[cfg(unix)]
         for child in self.children.drain(..).flatten() {
             // SAFETY: pid is a child this process forked and has not reaped, so the signal reaches only that child.
             unsafe { libc::kill(child.pid, libc::SIGKILL) };
             wait(child.pid);
         }
+        #[cfg(not(unix))]
+        self.children.clear();
     }
 
     /// The children with something to read: `(id, true)` for an ask, `(id, false)` for output; notes when a watched file changed.
+    #[cfg(unix)]
     fn ready(&mut self) -> Result<Vec<(usize, bool)>> {
         let mut polled = Vec::new();
         let mut fds = Vec::new();
@@ -452,6 +480,12 @@ impl Jit {
         Ok(polled.into_iter().zip(fds).filter(|(_, fd)| fd.revents != 0).map(|(ready, _)| ready).collect())
     }
 
+    #[cfg(not(unix))]
+    fn ready(&mut self) -> Result<Vec<(usize, bool)>> {
+        Ok(Vec::new())
+    }
+
+    #[cfg(unix)]
     fn drain(&mut self, id: usize) {
         let Some(child) = self.children[id].as_mut() else {
             return;
@@ -463,6 +497,10 @@ impl Jit {
         }
     }
 
+    #[cfg(not(unix))]
+    fn drain(&mut self, _id: usize) {}
+
+    #[cfg(unix)]
     fn read_ask(&mut self, id: usize) -> Option<usize> {
         let child = self.children[id].as_mut()?;
         let mut index = [0; 8];
@@ -475,6 +513,12 @@ impl Jit {
         }
     }
 
+    #[cfg(not(unix))]
+    fn read_ask(&mut self, _id: usize) -> Option<usize> {
+        None
+    }
+
+    #[cfg(unix)]
     fn reply(&mut self, id: usize, code: usize) {
         let Some(child) = self.children[id].as_mut() else {
             return;
@@ -484,7 +528,11 @@ impl Jit {
         }
     }
 
+    #[cfg(not(unix))]
+    fn reply(&mut self, _id: usize, _code: usize) {}
+
     /// The children whose pipes closed, waited for, with how each ended.
+    #[cfg(unix)]
     fn reap(&mut self) -> Vec<(usize, Ended)> {
         let mut ended = Vec::new();
         for (id, slot) in self.children.iter_mut().enumerate() {
@@ -494,6 +542,11 @@ impl Jit {
             }
         }
         ended
+    }
+
+    #[cfg(not(unix))]
+    fn reap(&mut self) -> Vec<(usize, Ended)> {
+        Vec::new()
     }
 
     /// Answers with `cx` the asks of the children `driver` forked, the ask `pending` first, until no child is left, an answer needs what inference asked for, which returns that child and the function it asked for, or a watched file changed.
