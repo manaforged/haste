@@ -47,8 +47,8 @@ const DIRECT: &[HostSymbol] = &[
 ];
 
 impl HostSymbol {
-    /// Classifies `name` into a typed host symbol when the host links to it.
-    pub fn resolve(name: &str) -> Option<Self> {
+    /// Classifies `name` into a typed host symbol when the host links to it (or unconditionally as a dynamic import when `aot` is true).
+    pub fn resolve_for(name: &str, aot: bool) -> Option<Self> {
         if let Some(found) = DIRECT.iter().find(|sym| sym.link_name() == name) {
             return Some(found.clone());
         }
@@ -63,10 +63,18 @@ impl HostSymbol {
                 if let Some(math) = MathSymbol::from_name(name) {
                     return Some(Self::Math(math));
                 }
+                if aot {
+                    return Some(Self::Dynamic(name.into()));
+                }
                 return dynamic(name).map(|_| Self::Dynamic(name.into()));
             }
         };
         Some(built_in)
+    }
+
+    /// Classifies `name` into a typed host symbol when the host links to it.
+    pub fn resolve(name: &str) -> Option<Self> {
+        Self::resolve_for(name, false)
     }
 
     /// The external linker symbol name for this host helper.

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, IntCC, RuntimeSymbol, Target, Type, Value};
+use haste_codegen::{Arch, IntCC, RuntimeSymbol, Type, Value};
 
 use crate::body::{BlockKind, Body, Expr, ExprId, List};
 use crate::outline::item::ItemKind;
@@ -136,7 +136,7 @@ impl Lower<'_, '_> {
     fn try_splat_repeat(&mut self, base: Place, part: Repr, (n, stride, total_bytes): (i64, i32, i64), val: Value) -> bool {
         let Repr::Scalar(elem_ty) = part else { return false };
         let Some(mul) = splat_multiplier(elem_ty) else { return false };
-        if !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) || stride != elem_ty.bytes() as i32 || total_bytes < 2 || total_bytes > 32 {
+        if !matches!(crate::compile_target().arch, Arch::X64 | Arch::Arm64) || stride != elem_ty.bytes() as i32 || total_bytes < 2 || total_bytes > 32 {
             return false;
         }
         let total = total_bytes as usize;

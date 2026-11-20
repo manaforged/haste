@@ -354,9 +354,15 @@ impl Slots for Image {
     }
 }
 
-pub(super) fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<(HostSymbol, usize), String> {
+pub(super) fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef, aot: bool) -> Result<(HostSymbol, usize), String> {
     let name = cx.symbol_name(item);
-    let resolved = name.as_deref().and_then(HostSymbol::resolve).and_then(|sym| sym.host_addr().map(|addr| (sym, addr)));
+    let resolved = name.as_deref().and_then(|n| HostSymbol::resolve_for(n, aot)).and_then(|sym| {
+        if aot {
+            Some((sym, 0))
+        } else {
+            sym.host_addr().map(|addr| (sym, addr))
+        }
+    });
     resolved.ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
 }
 

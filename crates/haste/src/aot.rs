@@ -11,6 +11,7 @@ use crate::host::{HostSymbol, MathSymbol};
 mod dwarf;
 mod elf;
 mod macho;
+mod pe;
 mod shims;
 mod wide;
 
@@ -167,6 +168,7 @@ impl Executable {
         match (self.target.format, self.target.arch) {
             (Format::Elf, Arch::X64 | Arch::Arm64) => elf::emit(self, (lang_start, user_main)),
             (Format::MachO, Arch::X64 | Arch::Arm64) => macho::emit(self, (lang_start, user_main)),
+            (Format::Pe, Arch::X64 | Arch::Arm64) => pe::emit(self, (lang_start, user_main)),
             (format, arch) => bail!("AOT emission does not support {format:?} on {arch:?}"),
         }
     }

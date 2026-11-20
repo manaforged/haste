@@ -223,16 +223,18 @@ pub fn evaluator() -> Result<Box<dyn Evaluate>> {
 
 impl Evaluate for Jit {
     fn evaluate(&mut self, cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128> {
-        let (entry, wide) = (self.declare(*instance), bits > 64);
-        let mut once = Once(None);
-        self.strict = false;
-        let ran = self.fork(true, |image, out| image.evaluate_in_child(entry, wide, out)).and_then(|_| self.pump(cx, &mut once, None));
-        self.strict = true;
-        self.kill_children();
-        if ran?.is_some() {
-            bail!("running it needs names that are not loaded yet");
-        }
-        value_of(once.0)
+        crate::with_host_target(|| {
+            let (entry, wide) = (self.declare(*instance), bits > 64);
+            let mut once = Once(None);
+            self.strict = false;
+            let ran = self.fork(true, |image, out| image.evaluate_in_child(entry, wide, out)).and_then(|_| self.pump(cx, &mut once, None));
+            self.strict = true;
+            self.kill_children();
+            if ran?.is_some() {
+                bail!("running it needs names that are not loaded yet");
+            }
+            value_of(once.0)
+        })
     }
 }
 

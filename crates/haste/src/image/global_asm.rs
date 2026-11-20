@@ -24,7 +24,7 @@ impl Image {
     pub(super) fn bind_foreign(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, memory: Option<&mut Memory>) -> Result<Foreign, String> {
         let item = reached.list[index].0.0;
         let Some(block) = cx.global_asm(item) else {
-            return resolve_host_symbol(cx, item).map(|(sym, address)| Foreign::Host(sym, address)).map_err(|error| unread(cx, error));
+            return resolve_host_symbol(cx, item, self.backend.is_aot()).map(|(sym, address)| Foreign::Host(sym, address)).map_err(|error| unread(cx, error));
         };
         let (code, relocs) = assemble(cx, reached, &self.compile_target(), item, &block)?;
         if self.backend.is_aot() {

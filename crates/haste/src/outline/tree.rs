@@ -401,7 +401,7 @@ impl Env {
         }
         if self.target.has_name(name) || self.profile().contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
             Truth::Yes
-        } else if self.known || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {
+        } else if self.known || matches!(name, "unix" | "windows") || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {
             Truth::No
         } else {
             Truth::Unknown

@@ -365,7 +365,7 @@ fn usage() -> String {
     let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().filter(|(cmd, _)| !matches!(cmd, Command::Clean)).map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -512,6 +512,15 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
                 let value = args.next().context("--stats-json takes a file path")?;
                 *stats = Some(PathBuf::from(value));
             }
+            "--target" => {
+                args.next();
+                let triple = next_str(args)?;
+                let target = haste_codegen::Target::find(&triple).with_context(|| {
+                    let known: Vec<&str> = haste_codegen::TARGETS.iter().map(|t| t.triple).collect();
+                    format!("unknown target `{triple}`; supported targets: {}", known.join(", "))
+                })?;
+                crate::set_target(target);
+            }
             "-o" | "--output" => {
                 args.next();
                 let value = args.next().context("-o takes a file path")?;
@@ -594,7 +603,7 @@ fn print_meta(meta: Meta) {
 }
 
 fn try_serve(command: Command, root: &std::path::Path, stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>, argv: &[String]) -> Result<Option<i32>> {
-    if stats_json.is_some() || crate::image::watch::enabled() {
+    if stats_json.is_some() || crate::image::watch::enabled() || crate::compile_target().triple != haste_codegen::Target::host().triple {
         return Ok(None);
     }
     match command {
@@ -699,7 +708,7 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
         }
         return Ok(0);
     }
-    let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
+    let targets = Targets { target: cfg::Target::of(crate::compile_target()), host: cfg::Target::host() };
     let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
         Command::Debug(Query::Graph) => graph::load(root, &targets, crate::selection())?,

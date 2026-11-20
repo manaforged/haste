@@ -57,9 +57,38 @@ pub(crate) fn profile() -> outline::tree::Profile {
     *PROFILE.get_or_init(outline::tree::Profile::default)
 }
 
-/// The host target with the code generator's effort set by the build profile.
+static TARGET: OnceLock<&'static haste_codegen::Target> = OnceLock::new();
+static HOST_SCOPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The target being compiled for: the host target inside a host build-script/proc-macro scope, else the `--target` override, else the host target.
+pub(crate) fn compile_target() -> &'static haste_codegen::Target {
+    if HOST_SCOPE.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        return haste_codegen::Target::host();
+    }
+    *TARGET.get_or_init(haste_codegen::Target::host)
+}
+
+/// Runs `f` with `compile_target()` pinned to the host target (for build scripts and proc macros).
+pub(crate) fn with_host_target<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOST_SCOPE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+    HOST_SCOPE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _guard = Guard;
+    f()
+}
+
+/// Sets the compilation target once, before any work reads it.
+fn set_target(target: &'static haste_codegen::Target) {
+    _ = TARGET.set(target);
+}
+
+/// The compilation target with the code generator's effort set by the build profile.
 pub(crate) fn host_target() -> haste_codegen::Target {
-    haste_codegen::Target::host().effort(profile().into())
+    compile_target().effort(profile().into())
 }
 
 /// Sets the build profile once, before any work reads it.

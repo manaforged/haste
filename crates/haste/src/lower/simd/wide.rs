@@ -1,5 +1,5 @@
 use anyhow::Result;
-use haste_codegen::{Lane, Target, TargetOpId, Type, Value};
+use haste_codegen::{Lane, TargetOpId, Type, Value};
 
 use crate::body::BinOp;
 use crate::sema::intrinsic::Simd;
@@ -41,12 +41,12 @@ pub(in crate::lower) fn wide_type(lanes: &Lanes) -> Option<Type> {
     if lanes.bytes() != WIDE_BYTES {
         return None;
     }
-    vec_type(&lanes.half())?.double_vec().filter(|ty| ty.is_register_vec(Target::host()))
+    vec_type(&lanes.half())?.double_vec().filter(|ty| ty.is_register_vec(crate::compile_target()))
 }
 
-/// The 32-byte register type of four `I64` lanes, when the host has one.
+/// The 32-byte register type of four `I64` lanes, when the target has one.
 pub(in crate::lower) fn wide_quads() -> Option<Type> {
-    QUADS.is_register_vec(Target::host()).then_some(QUADS)
+    QUADS.is_register_vec(crate::compile_target()).then_some(QUADS)
 }
 
 fn lane_type(lanes: &Lanes) -> Option<Type> {

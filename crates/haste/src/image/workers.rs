@@ -381,7 +381,7 @@ impl Image {
             if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
                 continue;
             }
-            let resolved = resolve_host_symbol(cx, *item);
+            let resolved = resolve_host_symbol(cx, *item, self.backend.is_aot());
             let is_weak = weak(cx, *item);
             let host = match (&resolved, is_weak) {
                 (Ok((host, _)), _) => Some(host.clone()),
