@@ -116,7 +116,7 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 - `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
 - On macOS, JIT execution uses dual-mapped `mach_vm_remap` pages (writable + executable aliases), which may be blocked inside a Hardened Runtime or App Sandbox.
 - Some Rust features do not compile yet. If any reached function fails to compile, `haste build` exits non-zero.
-- Panics print their message and abort instead of unwinding the stack.
+- In JIT mode, `std::panic::catch_unwind` and panicking threads recover via thread-local unwind frames (without running `Drop` destructors on unwound frames); uncaught panics and standalone AOT panics print their message and abort.
 
 ## Contributing
 

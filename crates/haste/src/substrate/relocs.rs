@@ -683,6 +683,9 @@ fn write_host(out: &mut Vec<u8>, host: &HostSymbol) -> Option<()> {
         HostSymbol::Math(m) => { out.push(13); write_str(out, m.link_name())?; }
         HostSymbol::X86(x) => { out.push(14); write_str(out, x.link_name())?; }
         HostSymbol::Dynamic(s) => { out.push(15); write_str(out, s)?; }
+        HostSymbol::CatchUnwind => out.push(16),
+        HostSymbol::StartPanic => out.push(17),
+        HostSymbol::PanicCleanup => out.push(18),
     }
     Some(())
 }
@@ -705,6 +708,9 @@ fn read_host(cur: &mut Cursor<'_>) -> Result<HostSymbol> {
         13 => HostSymbol::Math(MathSymbol::from_name(read_str(cur)?).context("unknown math symbol")?),
         14 => HostSymbol::X86(X86Symbol::from_link(read_str(cur)?).context("unknown x86 symbol")?),
         15 => HostSymbol::Dynamic(read_str(cur)?.into()),
+        16 => HostSymbol::CatchUnwind,
+        17 => HostSymbol::StartPanic,
+        18 => HostSymbol::PanicCleanup,
         _ => bail!("invalid host symbol tag"),
     })
 }

@@ -106,12 +106,8 @@ impl Lower<'_, '_> {
     }
 
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {
-        let &[try_fn, data, _] = args else { bail!("catch_unwind takes three arguments") };
-        let byte = self.cx.types.prim(Primitive::U8);
-        let pointer = self.cx.types.intern(Kind::Ptr(crate::sema::ty::Mut::Mut, byte));
-        let unit = self.cx.types.unit();
-        self.call_code(try_fn, (vec![pointer], Some(unit)), vec![data])?;
-        Ok(self.ins().iconst(Type::I32, 0))
+        let &[try_fn, data, catch_fn] = args else { bail!("catch_unwind takes three arguments") };
+        Ok(self.call_host(HostSymbol::CatchUnwind, &[try_fn, data, catch_fn], Some(Type::I32)).expect("catch_unwind returns i32"))
     }
 
     fn cpuid(&mut self, args: &[Value]) -> Result<Value> {

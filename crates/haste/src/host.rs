@@ -4,6 +4,7 @@ pub(crate) mod cpu;
 mod math;
 pub mod native;
 mod syscall;
+mod unwind;
 mod x86;
 
 pub use math::{MathSymbol, symbol as intrinsic};
@@ -28,6 +29,9 @@ pub enum HostSymbol {
     FillOnce,
     ThreadCell,
     Syscall,
+    CatchUnwind,
+    StartPanic,
+    PanicCleanup,
     Math(MathSymbol),
     X86(X86Symbol),
     Dynamic(Box<str>),
@@ -52,7 +56,9 @@ impl HostSymbol {
             "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.x86.avx.vzeroupper" | "llvm.aarch64.hint" => Self::Noop,
             "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => Self::Barrier,
             "llvm.x86.xgetbv" => Self::ExtendedState,
-            "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => Self::Abort,
+            "__rust_alloc_error_handler" => Self::Abort,
+            "__rust_start_panic" => Self::StartPanic,
+            "__rust_panic_cleanup" => Self::PanicCleanup,
             _ => {
                 if let Some(math) = MathSymbol::from_name(name) {
                     return Some(Self::Math(math));
@@ -79,6 +85,9 @@ impl HostSymbol {
             Self::FillOnce => "__haste_fill_once",
             Self::ThreadCell => "__haste_thread_cell",
             Self::Syscall => "__haste_syscall",
+            Self::CatchUnwind => "__haste_catch_unwind",
+            Self::StartPanic => "__rust_start_panic",
+            Self::PanicCleanup => "__rust_panic_cleanup",
             Self::Math(math) => math.link_name(),
             Self::X86(x86) => x86.link_name(),
             Self::Dynamic(name) => name,
@@ -101,6 +110,9 @@ impl HostSymbol {
             Self::FillOnce => crate::image::fill_once as *const () as usize,
             Self::ThreadCell => crate::image::thread_cell as *const () as usize,
             Self::Syscall => syscall::run as *const () as usize,
+            Self::CatchUnwind => unwind::catch_unwind as *const () as usize,
+            Self::StartPanic => unwind::start_panic as *const () as usize,
+            Self::PanicCleanup => unwind::panic_cleanup as *const () as usize,
             Self::Math(math) => math.host_addr(),
             Self::X86(x86) => return x86.host_addr(),
             Self::Dynamic(_) => return dynamic(self.link_name()),
