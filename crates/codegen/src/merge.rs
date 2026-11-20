@@ -1,3 +1,5 @@
+mod trap;
+
 use crate::cfg::Cfg;
 use crate::fold::extend;
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, IntCC, Op, Type, Value};
@@ -16,7 +18,7 @@ enum BinaryPlan {
 
 /// Folds every block that only one jump enters into the block that jumps, so its values stay block-local.
 pub(crate) fn run(func: &mut Function) -> Domain {
-    let mut changed = merge_leaves(func);
+    let mut changed = trap::merge_leaves(func) | trap::merge_trap_calls(func);
     if changed {
         func.bump_cfg();
     }
@@ -441,92 +443,6 @@ fn forward_trampolines(func: &mut Function) -> bool {
         }
     }
     true
-}
-
-#[derive(Clone, Copy)]
-enum LeafKind {
-    Trap = 0,
-    EmptyReturn = 1,
-}
-
-fn leaf_kind(func: &Function, block: usize) -> Option<LeafKind> {
-    let data = &func.blocks[block];
-    if !data.params.is_empty() {
-        return None;
-    }
-    let [inst] = data.insts[..] else { return None };
-    match &func.insts[inst.index()].op {
-        Op::Trap => Some(LeafKind::Trap),
-        Op::Return(vals) if vals.is_empty() => Some(LeafKind::EmptyReturn),
-        _ => None,
-    }
-}
-
-fn redirect_leaf_target(target: &mut Block, empty_args: bool, dup_canon: &[Option<Block>], kept_dup: &mut [bool]) -> bool {
-    let idx = target.index();
-    let Some(canon) = dup_canon[idx] else { return false };
-    if empty_args {
-        *target = canon;
-        return true;
-    }
-    kept_dup[idx] = true;
-    false
-}
-
-fn redirect_leaf_op(op: &mut Op, dup_canon: &[Option<Block>], kept_dup: &mut [bool]) -> bool {
-    match op {
-        Op::Jump(target, args) => redirect_leaf_target(target, args.is_empty(), dup_canon, kept_dup),
-        Op::Brif(_, then, then_args, otherwise, else_args) => {
-            let a = redirect_leaf_target(then, then_args.is_empty(), dup_canon, kept_dup);
-            let b = redirect_leaf_target(otherwise, else_args.is_empty(), dup_canon, kept_dup);
-            a || b
-        }
-        Op::BrTable(_, default, targets) => {
-            let mut did = redirect_leaf_target(default, true, dup_canon, kept_dup);
-            for target in targets {
-                did |= redirect_leaf_target(target, true, dup_canon, kept_dup);
-            }
-            did
-        }
-        Op::TryCall { normal, .. } => redirect_leaf_target(normal, true, dup_canon, kept_dup),
-        _ => false,
-    }
-}
-
-fn merge_leaves(func: &mut Function) -> bool {
-    let entry = func.entry.map(Block::index);
-    let mut canonical = [None; 2];
-    let mut dup_canon = vec![None; func.blocks.len()];
-    let mut has_dup = false;
-    for block in 0..func.blocks.len() {
-        if Some(block) != entry
-            && let Some(kind) = leaf_kind(func, block)
-        {
-            let slot = &mut canonical[kind as usize];
-            match *slot {
-                None => *slot = Some(Block(block as u32)),
-                Some(canon) => {
-                    dup_canon[block] = Some(canon);
-                    has_dup = true;
-                }
-            }
-        }
-    }
-    if !has_dup {
-        return false;
-    }
-    let mut changed = false;
-    let mut kept_dup = vec![false; func.blocks.len()];
-    for inst in &mut func.insts {
-        changed |= redirect_leaf_op(&mut inst.op, &dup_canon, &mut kept_dup);
-    }
-    for (block, canon) in dup_canon.into_iter().enumerate() {
-        if canon.is_some() && !kept_dup[block] {
-            func.blocks[block].insts.clear();
-            changed = true;
-        }
-    }
-    changed
 }
 
 #[derive(Clone, Copy)]

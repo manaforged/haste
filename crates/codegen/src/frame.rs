@@ -335,6 +335,96 @@ pub(crate) fn terminator_edges<'a>(op: &'a Op, mut f: impl FnMut(Block, &'a [Val
     }
 }
 
+#[derive(Clone, Copy)]
+enum HomeTarget {
+    Value(usize),
+    Shared(usize),
+}
+
+fn place_slots(func: &Function, addressed: &[bool], descending: bool, cursor: &mut u32) -> Vec<i32> {
+    let mut slots = vec![0; func.slots.len()];
+    let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
+    if descending {
+        order.sort_by_key(|&slot| (std::cmp::Reverse(func.slots[slot].size), slot));
+    } else {
+        order.sort_by_key(|&slot| (func.slots[slot].size, slot));
+    }
+    for slot in order {
+        let data = &func.slots[slot];
+        let min_align = if data.size >= 8 { 8 } else if data.size >= 4 { 4 } else if data.size >= 2 { 2 } else { 1 };
+        let align = (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align);
+        *cursor = round(*cursor + data.size, align);
+        slots[slot] = -(*cursor as i32);
+    }
+    slots
+}
+
+fn collect_value_homes<R: Copy + PartialEq>(
+    func: &Function,
+    present: &[bool],
+    (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
+) -> (Vec<(HomeTarget, u32, u32)>, usize, Vec<(usize, usize)>) {
+    let mut order: Vec<usize> = (0..func.types.len()).collect();
+    order.sort_by_key(|&v| (
+        !matches!((homed.get(v), locations[v]), (Some(&true), Location::Reg(_))),
+        !matches!((homed.get(v), locations[v], func.types[v].bytes()), (Some(&true), Location::Float(_), 8)),
+        v,
+    ));
+    let mut items: Vec<(HomeTarget, u32, u32)> = Vec::new();
+    let mut home_pos: Vec<Option<usize>> = Vec::new();
+    let mut shared_vals: Vec<(usize, usize)> = Vec::new();
+    for v in order {
+        let reg_unhomed = matches!(locations[v], Location::Reg(_) | Location::Float(_)) && homed.get(v) != Some(&true);
+        if !present[v] || elided.get(v) == Some(&true) || locations[v].is_static() || reg_unhomed {
+            continue;
+        }
+        let bytes = func.types[v].bytes();
+        let align = if bytes >= 16 { 16 } else { WORD };
+        let Some(home) = shared.get(v).copied().flatten().map(|h| h as usize) else {
+            items.push((HomeTarget::Value(v), bytes, align));
+            continue;
+        };
+        if home_pos.len() <= home {
+            home_pos.resize(home + 1, None);
+        }
+        if let Some(at) = home_pos[home] {
+            items[at] = (items[at].0, items[at].1.max(bytes), items[at].2.max(align));
+        } else {
+            home_pos[home] = Some(items.len());
+            items.push((HomeTarget::Shared(home), bytes, align));
+        }
+        shared_vals.push((v, home));
+    }
+    (items, home_pos.len(), shared_vals)
+}
+
+fn place_values<R: Copy + PartialEq>(
+    func: &Function,
+    present: &[bool],
+    (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
+    sp_near: bool,
+    cursor: &mut u32,
+) -> Vec<i32> {
+    let (mut items, home_len, shared_vals) = collect_value_homes(func, present, (locations, shared, homed, elided));
+    if sp_near {
+        items.reverse();
+    }
+    let mut values = vec![0; func.types.len()];
+    let mut homes = vec![0; home_len];
+    for (target, bytes, align) in items {
+        *cursor = round(*cursor, align) + round(bytes, align);
+        let disp = -(*cursor as i32);
+        match target {
+            HomeTarget::Value(v) => values[v] = disp,
+            HomeTarget::Shared(h) => homes[h] = disp,
+        }
+    }
+    for (v, h) in shared_vals {
+        values[v] = homes[h];
+    }
+    values
+}
+
 pub(crate) fn layout<R: Copy + PartialEq>(
     func: &Function,
     (saves, float_saves): (Vec<R>, Vec<u8>),
@@ -343,36 +433,17 @@ pub(crate) fn layout<R: Copy + PartialEq>(
 ) -> Result<Frame<R>, String> {
     let outgoing = needs(func, classify)?;
     let (present, addressed) = present(func, fused);
+    let sp_near = !live_ops(func).any(|op| matches!(op, Op::TryCall { .. } | Op::FramePointer));
     let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
-    let mut values = vec![0; func.types.len()];
-    let mut homes: Vec<i32> = Vec::new();
-    let mut value_order: Vec<usize> = (0..func.types.len()).collect();
-    value_order.sort_by_key(|&v| (
-        !matches!((homed.get(v), locations[v]), (Some(&true), Location::Reg(_))),
-        !matches!((homed.get(v), locations[v], func.types[v].bytes()), (Some(&true), Location::Float(_), 8)),
-        v,
-    ));
-    for value in value_order {
-        let ty = func.types[value];
-        let static_loc = locations[value].is_static();
-        let reg_unhomed = matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true);
-        if !present[value] || elided.get(value) == Some(&true) || static_loc || reg_unhomed {
-            continue;
-        }
-        let Some(home) = shared.get(value).copied().flatten().map(|home| home as usize) else {
-            cursor += round(ty.bytes(), WORD);
-            values[value] = -(cursor as i32);
-            continue;
-        };
-        if homes.len() <= home {
-            homes.resize(home + 1, 0);
-        }
-        if homes[home] == 0 {
-            cursor += round(ty.bytes(), WORD);
-            homes[home] = -(cursor as i32);
-        }
-        values[value] = homes[home];
-    }
+    let (slots, values) = if sp_near {
+        let s = place_slots(func, &addressed, true, &mut cursor);
+        let v = place_values(func, &present, (locations, shared, homed, elided), true, &mut cursor);
+        (s, v)
+    } else {
+        let v = place_values(func, &present, (locations, shared, homed, elided), false, &mut cursor);
+        let s = place_slots(func, &addressed, false, &mut cursor);
+        (s, v)
+    };
     let mut max_saved = 0_usize;
     let mut check_edge = |block: Block, args: &[Value]| {
         for step in edge_steps(func, locations, &values, args, &func.blocks[block.index()].params) {
@@ -386,16 +457,6 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     }
     let wide = func.types.iter().any(|ty| ty.is_wide_vec());
     let scratch = max_saved as u32 * edge_bytes(wide);
-    let mut slots = vec![0; func.slots.len()];
-    let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
-    order.sort_by_key(|&slot| (func.slots[slot].size, slot));
-    for slot in order {
-        let data = &func.slots[slot];
-        let min_align = if data.size >= 8 { 8 } else if data.size >= 4 { 4 } else if data.size >= 2 { 2 } else { 1 };
-        let align = (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align);
-        cursor = round(cursor + data.size, align);
-        slots[slot] = -(cursor as i32);
-    }
     cursor = round(cursor + scratch, 16);
     let scratch = -(cursor as i32);
     let size = round(cursor + outgoing, 16);

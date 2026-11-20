@@ -1,5 +1,5 @@
 use super::symbolic::{evaluate, tagged};
-use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, collect_global_consts, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
+use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, MAX_FP_FULL_INSTS, MAX_FP_FULL_TRIPS, MAX_VEC_FULL_TRIPS, block_has_float, block_has_libcall_mem, block_has_vec, collect_global_consts, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
 use crate::cfg::{Cfg, Loop};
 use crate::ir::{Block, BlockData, Function, Op, Value};
 
@@ -178,15 +178,20 @@ fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Opt
 }
 
 fn prove(func: &Function, region: &Region, init: Vec<Option<i64>>, global_consts: &[Option<i64>]) -> Option<Proof> {
+    let has_mem = region.blocks.iter().any(|&b| block_has_libcall_mem(func, b.index()));
+    let has_fp = region.blocks.iter().any(|&b| block_has_float(func, b.index()));
+    let has_vec = region.blocks.iter().any(|&b| block_has_vec(func, b.index()));
+    let max_trips = if has_mem { 4 } else if has_fp { MAX_FP_FULL_TRIPS } else if has_vec { MAX_VEC_FULL_TRIPS } else { MAX_CHAIN_TRIPS };
+    let max_insts = if has_fp { MAX_FP_FULL_INSTS } else { MAX_CHAIN_UNROLLED_INSTS };
     let mut heads = vec![init];
     let mut steps = Vec::new();
     let mut total_residual = 0_usize;
-    while heads.len() <= MAX_CHAIN_TRIPS {
+    while heads.len() <= max_trips {
         let mut env = global_consts.to_vec();
         let params = heads.last()?;
         let cur = step(func, region, params, &mut env);
         total_residual += cur.residual;
-        if total_residual > MAX_CHAIN_UNROLLED_INSTS {
+        if total_residual > max_insts {
             return None;
         }
         let next = cur.next.clone();

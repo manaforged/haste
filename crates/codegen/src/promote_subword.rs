@@ -62,6 +62,86 @@ pub(super) fn copy_bytes_limit(consts: &[Option<i64>], len: Value, limit: u32) -
     consts.get(len.index()).copied().flatten().and_then(|n| u32::try_from(n).ok()).filter(|&n| n <= limit)
 }
 
+fn close_addr(open: &mut [bool], addrs: &[Option<(StackSlot, i64)>], param_roots: &[crate::mem::MemRoot], v: Value) {
+    if let Some((s, _)) = addrs[v.index()] {
+        open[s.index()] = false;
+    } else if let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(v.index()) {
+        open[s.index()] = false;
+    }
+}
+
+fn close_param_root(open: &mut [bool], addrs: &[Option<(StackSlot, i64)>], param_roots: &[crate::mem::MemRoot], v: Value) {
+    if addrs[v.index()].is_none()
+        && let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(v.index())
+    {
+        open[s.index()] = false;
+    }
+}
+
+pub(super) const fn both_copy_bounds(blocks: usize) -> (u32, usize) {
+    if blocks <= 220 {
+        (PROMOTE_BOTH_BYTES, PROMOTE_BOTH_PIECES)
+    } else {
+        (MAX_COPY_BYTES, 64)
+    }
+}
+
+fn check_copy_open(
+    open: &mut [bool],
+    (addrs, consts, param_roots): (&[Option<(StackSlot, i64)>], &[Option<i64>], &[crate::mem::MemRoot]),
+    (to, from, len): (Value, Value, Value),
+    both_limit: u32,
+) {
+    if let Some((s, _)) = addrs[len.index()] {
+        open[s.index()] = false;
+    }
+    let limit = if addrs[to.index()].is_some() && addrs[from.index()].is_some() {
+        both_limit
+    } else {
+        MAX_COPY_BYTES
+    };
+    if copy_bytes_limit(consts, len, limit).is_some() {
+        close_param_root(open, addrs, param_roots, to);
+        close_param_root(open, addrs, param_roots, from);
+    } else {
+        close_addr(open, addrs, param_roots, to);
+        close_addr(open, addrs, param_roots, from);
+    }
+}
+
+fn update_open_for_inst(
+    open: &mut [bool],
+    (addrs, consts, param_roots): (&[Option<(StackSlot, i64)>], &[Option<i64>], &[crate::mem::MemRoot]),
+    data: &crate::ir::InstData,
+    both_limit: u32,
+) {
+    match data.op {
+        Op::Load(addr, _) => close_param_root(open, addrs, param_roots, addr),
+        Op::Store(val, addr, _) => {
+            close_addr(open, addrs, param_roots, val);
+            close_param_root(open, addrs, param_roots, addr);
+        }
+        Op::Move(to, from, _) => {
+            close_param_root(open, addrs, param_roots, to);
+            close_param_root(open, addrs, param_roots, from);
+        }
+        Op::Copy(to, from, len) => check_copy_open(open, (addrs, consts, param_roots), (to, from, len), both_limit),
+        Op::Binary(Binary::Iadd | Binary::Isub, a, b) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {
+            if addrs[a.index()].is_some() && addrs[b.index()].is_some() {
+                close_addr(open, addrs, param_roots, a);
+                close_addr(open, addrs, param_roots, b);
+            }
+        }
+        Op::Convert(Convert::Bitcast, _) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {}
+        Op::Select(c, ..) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => close_addr(open, addrs, param_roots, c),
+        _ => data.op.for_operands(|v| {
+            if let Some((s, _)) = addrs[v.index()] {
+                open[s.index()] = false;
+            }
+        }),
+    }
+}
+
 pub(super) fn copy_open_slots(
     func: &Function,
     addrs: &[Option<(StackSlot, i64)>],
@@ -69,76 +149,9 @@ pub(super) fn copy_open_slots(
     param_roots: &[crate::mem::MemRoot],
 ) -> Vec<bool> {
     let mut open = vec![true; func.slots.len()];
-    let close_addr = |open: &mut [bool], v: Value| {
-        if let Some((s, _)) = addrs[v.index()] {
-            open[s.index()] = false;
-        } else if let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(v.index()) {
-            open[s.index()] = false;
-        }
-    };
+    let both_limit = both_copy_bounds(func.blocks.len()).0;
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &func.insts[inst.index()];
-        match data.op {
-            Op::Load(addr, _) => {
-                if addrs[addr.index()].is_none()
-                    && let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(addr.index())
-                {
-                    open[s.index()] = false;
-                }
-            }
-            Op::Store(val, addr, _) => {
-                close_addr(&mut open, val);
-                if addrs[addr.index()].is_none()
-                    && let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(addr.index())
-                {
-                    open[s.index()] = false;
-                }
-            }
-            Op::Move(to, from, _) => {
-                for v in [to, from] {
-                    if addrs[v.index()].is_none()
-                        && let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(v.index())
-                    {
-                        open[s.index()] = false;
-                    }
-                }
-            }
-            Op::Copy(to, from, len) => {
-                if let Some((s, _)) = addrs[len.index()] {
-                    open[s.index()] = false;
-                }
-                let limit = if addrs[to.index()].is_some() && addrs[from.index()].is_some() {
-                    PROMOTE_BOTH_BYTES
-                } else {
-                    MAX_COPY_BYTES
-                };
-                if copy_bytes_limit(consts, len, limit).is_some() {
-                    for v in [to, from] {
-                        if addrs[v.index()].is_none()
-                            && let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(v.index())
-                        {
-                            open[s.index()] = false;
-                        }
-                    }
-                } else {
-                    close_addr(&mut open, to);
-                    close_addr(&mut open, from);
-                }
-            }
-            Op::Binary(Binary::Iadd | Binary::Isub, a, b) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {
-                if addrs[a.index()].is_some() && addrs[b.index()].is_some() {
-                    close_addr(&mut open, a);
-                    close_addr(&mut open, b);
-                }
-            }
-            Op::Convert(Convert::Bitcast, _) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {}
-            Op::Select(c, ..) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => close_addr(&mut open, c),
-            _ => data.op.for_operands(|v| {
-                if let Some((s, _)) = addrs[v.index()] {
-                    open[s.index()] = false;
-                }
-            }),
-        }
+        update_open_for_inst(&mut open, (addrs, consts, param_roots), &func.insts[inst.index()], both_limit);
     }
     open
 }

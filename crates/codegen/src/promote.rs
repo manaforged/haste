@@ -130,6 +130,7 @@ struct Touch {
 
 #[derive(Default)]
 struct Scan {
+    blocks: usize,
     consts: Vec<Option<i64>>,
     addrs: Vec<Option<(StackSlot, i64)>>,
     addr_insts: Vec<(Inst, StackSlot)>,
@@ -148,6 +149,7 @@ impl Scan {
         let consts = subword::eval_consts(func);
         let escaped = prov.escaped_slots();
         let mut scan = Scan {
+            blocks: func.blocks.len(),
             consts,
             addrs: vec![None; func.types.len()],
             escaped,
@@ -235,7 +237,7 @@ impl Scan {
 
     fn copy_bytes(&self, to: Value, from: Value, len: Value) -> Option<u32> {
         let limit = if self.addrs[to.index()].is_some() && self.addrs[from.index()].is_some() {
-            subword::PROMOTE_BOTH_BYTES
+            subword::both_copy_bounds(self.blocks).0
         } else {
             subword::MAX_COPY_BYTES
         };
@@ -694,7 +696,7 @@ fn open_move_pieces(
     }
     let both_open = to_open && from_open;
     let (max_b, max_p) = if both_open {
-        (subword::PROMOTE_BOTH_BYTES, subword::PROMOTE_BOTH_PIECES)
+        subword::both_copy_bounds(scan.blocks)
     } else {
         (crate::copy::MOVE_INLINE * 2, subword::PROMOTE_ONE_PIECES)
     };

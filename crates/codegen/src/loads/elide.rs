@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, Op, StackSlot, Value};
-use crate::mem::{MemLoc, MemRoot, Provenance, clobbers};
+use crate::mem::{MemLoc, MemRoot, Provenance, clobbers, may_alias};
 
 /// A place in the function: a block and a position in it.
 type Site = (Block, usize);
@@ -158,7 +158,29 @@ fn sealed_slots(func: &Function, prov: &Provenance) -> Vec<bool> {
     sealed
 }
 
-/// Points each load of a move's target that follows the move in its block, before anything may write either range, at the same bytes of the source.
+fn try_forward_move_chain(func: &mut Function, later: Inst, (target, source, from, bytes): (MemLoc, MemLoc, Value, u32), prov: &Provenance) -> bool {
+    let Op::Move(dst2, src2, bytes2) = func.insts[later.index()].op else { return false };
+    if bytes2 > bytes || src2 == from {
+        return false;
+    }
+    let (read_loc, dst2_loc) = (prov.loc(src2, 0, bytes2), prov.loc(dst2, 0, bytes2));
+    if read_loc.base != target.base || read_loc.offset != target.offset || may_alias(dst2_loc, source, prov) || may_alias(dst2_loc, target, prov) {
+        return false;
+    }
+    func.insts[later.index()].op = Op::Move(dst2, from, bytes2);
+    true
+}
+
+fn read_loc_at(func: &Function, data: &crate::ir::InstData, prov: &Provenance) -> Option<MemLoc> {
+    let result = data.result?;
+    match data.op {
+        Op::Load(addr, offset) => Some(prov.loc(addr, i64::from(offset), func.ty(result).bytes())),
+        Op::StackLoad(slot, offset) => Some(MemLoc::slot(slot, i64::from(offset), func.ty(result).bytes())),
+        _ => None,
+    }
+}
+
+/// Points each load or chained move of a move's target that follows the move in its block, before anything may write either range, at the same bytes of the source.
 fn forward_moved_loads(func: &mut Function, prov: &Provenance) -> bool {
     let mut changed = false;
     for block in 0..func.blocks.len() {
@@ -170,13 +192,12 @@ fn forward_moved_loads(func: &mut Function, prov: &Provenance) -> bool {
                 continue;
             }
             for &later in &insts[pos + 1..] {
+                if try_forward_move_chain(func, later, (target, source, from, bytes), prov) {
+                    changed = true;
+                    continue;
+                }
                 let data = &func.insts[later.index()];
-                let read = match (&data.op, data.result) {
-                    (&Op::Load(addr, offset), Some(result)) => Some(prov.loc(addr, i64::from(offset), func.ty(result).bytes())),
-                    (&Op::StackLoad(slot, offset), Some(result)) => Some(MemLoc::slot(slot, i64::from(offset), func.ty(result).bytes())),
-                    _ => None,
-                };
-                if let Some(read) = read {
+                if let Some(read) = read_loc_at(func, data, prov) {
                     let delta = read.offset - target.offset;
                     if read.base == target.base && delta >= 0 && delta + i64::from(read.size) <= i64::from(bytes)
                         && let Ok(delta) = i32::try_from(delta)
