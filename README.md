@@ -93,6 +93,20 @@ haste -V|--version | -h|--help
 | `HASTE_TRACE_IR` | Unset (`0`) | Set to `1` with `HASTE_TRACE` to dump IR after each codegen pass, or `passes` for pass-by-pass summaries. |
 | `HASTE_MISSED` | Unset (`0`) | Set to `1` to print aggregated codegen pass timings and stencil cache counters. |
 
+## Benchmarks
+
+Run `bash scripts/bench.sh` to reproduce these numbers on your machine (comparing `haste` against `cargo` / `rustc` on identical outputs).
+
+Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
+
+| Benchmark | haste | cargo / rustc |
+| --- | ---: | ---: |
+| `tests/diff` (124 fns) single-line edit rebuild | 311 ms | 673 ms |
+| `tests/diff` unchanged no-op build | 24 ms | 37 ms |
+| `tests/diff` cold debug build | 318 ms | 175 ms |
+| `tests/diff` `--release` AOT build | 3510 ms | 972 ms |
+| `tests/diff` `--release` binary runtime (identical output) | 26 ms | 26 ms |
+
 ## Check against rustc
 
 `tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites, and
