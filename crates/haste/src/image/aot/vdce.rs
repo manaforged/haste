@@ -31,6 +31,9 @@ impl VtableMask {
     ) -> (T, Self) {
         let mut vmask = Self::all_live();
         let (mut live, mut fns, mut counts) = step(&vmask);
+        if vtables.is_empty() {
+            return (live, vmask);
+        }
         for _ in 0..4 {
             let next_mask = Self::build_from_live(cx, reached, vtables, &fns);
             let (next_live, next_fns, next_counts) = step(&next_mask);

@@ -54,6 +54,13 @@ impl Binaries {
         if scripts.is_empty() {
             return Ok(());
         }
+        if cfg!(target_os = "macos") {
+            locks.clear();
+            for &(unit, krate) in scripts {
+                drop(self.keep(workspace, compilation, unit, krate));
+            }
+            return Ok(());
+        }
         let child = crate::image::fork_child(|| {
             locks.clear();
             let keeper = crate::image::fork_child(|| {
@@ -104,9 +111,10 @@ fn detach() {
             unsafe { libc::close(fd) };
         }
     }
-    // SAFETY: setsid, open and dup2 take only the static NUL-terminated path and descriptors of this process; 0, 1 and 2 then point at /dev/null.
+    // SAFETY: setsid, alarm, open and dup2 take only the static NUL-terminated path and descriptors of this process; 0, 1 and 2 then point at /dev/null.
     unsafe {
         libc::setsid();
+        libc::alarm(60);
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if null >= 0 {
             for fd in 0..3 {

@@ -219,6 +219,22 @@ pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<Item
     }
 }
 
+type CrateSweep = (usize, Vec<(usize, usize, Found, Option<(Def, u32)>)>, Vec<Unresolved>);
+
+fn sweep_crate_imports(names: &Names, outline: &Outline, krate: usize, asks: &Requests) -> CrateSweep {
+    let paths = paths_of(names, outline, krate, asks);
+    let mut local_found = Vec::new();
+    let mut local_unresolved = Vec::new();
+    for (index, pending) in names.crates[krate].pending.iter().enumerate().filter(|(_, pending)| pending.active) {
+        match import(&paths, pending) {
+            Outcome::Bound(bindings, stamp) => local_found.push((krate, index, bindings, stamp)),
+            Outcome::Unchanged => {}
+            Outcome::Missing => local_unresolved.push(Unresolved { file: pending.file, import: pending.import }),
+        }
+    }
+    (krate, local_found, local_unresolved)
+}
+
 pub(super) fn paths_of<'a>(names: &'a Names, outline: &'a Outline, krate: usize, demands: &'a Requests) -> Paths<'a> {
     Paths { demands: Some(demands), ..names.paths(outline, krate as u32) }
 }
@@ -316,7 +332,7 @@ impl Names {
                 let own = seen.is_none().then_some((module.file as u32, module.item));
                 let parts = module.parts[seen.unwrap_or(0)..].iter().map(|&part| (part as u32, None));
                 let files: Vec<(u32, Option<u32>)> = own.into_iter().chain(parts).collect();
-                let found = collect::collect_module(tree, index, &files, &context, &mut entry.scopes);
+                let found = collect::collect_module(tree, index, &files, &context, entry);
                 entry.add_pending(found);
                 entry.collected[index] = Some(module.parts.len());
                 changed = true;
@@ -333,16 +349,25 @@ impl Names {
 
     /// Resolves again the active imports of the crates that `sweep` marks and returns the crates whose scopes changed.
     fn pass(&mut self, outline: &Outline, demands: &Requests, sweep: &[bool]) -> Vec<bool> {
-        let mut found: Vec<(usize, usize, Found, Option<(Def, u32)>)> = Vec::new();
+        let swept: Vec<usize> = (0..self.crates.len()).filter(|&krate| sweep[krate]).collect();
+        let mut found = Vec::new();
         let mut unresolved = vec![Vec::new(); self.crates.len()];
-        for (krate, entry) in self.crates.iter().enumerate().filter(|(krate, _)| sweep[*krate]) {
-            let paths = paths_of(self, outline, krate, demands);
-            for (index, pending) in entry.pending.iter().enumerate().filter(|(_, pending)| pending.active) {
-                match import(&paths, pending) {
-                    Outcome::Bound(bindings, stamp) => found.push((krate, index, bindings, stamp)),
-                    Outcome::Unchanged => {}
-                    Outcome::Missing => unresolved[krate].push(Unresolved { file: pending.file, import: pending.import }),
-                }
+        if swept.len() >= 4 && crate::jobs() > 1 {
+            let results = crate::sync::parallel_map(swept, |krate| {
+                let local_asks = Requests::default();
+                let out = sweep_crate_imports(self, outline, krate, &local_asks);
+                (out, local_asks.into_parts())
+            });
+            for ((krate, local_found, local_unresolved), parts) in results {
+                demands.extend_parts(parts);
+                found.extend(local_found);
+                unresolved[krate] = local_unresolved;
+            }
+        } else {
+            for krate in swept {
+                let (_, local_found, local_unresolved) = sweep_crate_imports(self, outline, krate, demands);
+                found.extend(local_found);
+                unresolved[krate] = local_unresolved;
             }
         }
         let mut changed = vec![false; self.crates.len()];

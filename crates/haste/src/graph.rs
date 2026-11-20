@@ -170,7 +170,7 @@ pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
     found.map(Path::to_owned).with_context(|| format!("no Cargo.lock at or above {}", root.display()))
 }
 
-fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Result<BTreeMap<String, PathBuf>> {
+fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>, wanted: &BTreeSet<String>) -> Result<BTreeMap<String, PathBuf>> {
     let mut paths = BTreeMap::new();
     let mut seen_ws = BTreeSet::from([top.to_owned()]);
     let mut stack = vec![root.to_owned()];
@@ -178,7 +178,10 @@ fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Resu
     stack.extend(member_dirs(top, workspace, "members"));
     while let Some(dir) = stack.pop() {
         let dir = manifest::normalize(&dir);
-        if manifest_name(&dir).is_none() {
+        let Some(name) = manifest_name(&dir) else {
+            continue;
+        };
+        if !wanted.contains(&name) {
             continue;
         }
         let owner = owning_workspace(&dir)?;
@@ -260,8 +263,11 @@ fn root_package_names(root: &Path, top: &Path, workspace: Option<&toml::Table>) 
     Ok(vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name])
 }
 
-fn mark_reachable_deps(locked: &[Locked], by_name: &BTreeMap<&str, Vec<usize>>, idx: usize, keep: &mut [bool], stack: &mut Vec<usize>) {
+fn mark_reachable_deps(locked: &[Locked], by_name: &BTreeMap<&str, Vec<usize>>, (idx, omit): (usize, &[&str]), keep: &mut [bool], stack: &mut Vec<usize>) {
     for dep in locked[idx].deps() {
+        if omit.contains(&dep.name) {
+            continue;
+        }
         let Some(cands) = by_name.get(dep.name) else { continue };
         for &cand in cands {
             if !keep[cand] && dep.version.as_ref().is_none_or(|v| *v == locked[cand].version) {
@@ -272,7 +278,7 @@ fn mark_reachable_deps(locked: &[Locked], by_name: &BTreeMap<&str, Vec<usize>>, 
     }
 }
 
-fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String]) -> Vec<Locked> {
+fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String], omit_root_deps: &[&str]) -> Vec<Locked> {
     let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (idx, entry) in locked.iter().enumerate() {
         by_name.entry(entry.name.as_str()).or_default().push(idx);
@@ -286,23 +292,34 @@ fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String]) -> Vec<L
         }
     }
     while let Some(idx) = stack.pop() {
-        mark_reachable_deps(&locked, &by_name, idx, &mut keep, &mut stack);
+        let omit = if !locked[idx].is_registry() && root_names.contains(&locked[idx].name) { omit_root_deps } else { &[] };
+        mark_reachable_deps(&locked, &by_name, (idx, omit), &mut keep, &mut stack);
     }
     locked.into_iter().enumerate().filter_map(|(idx, entry)| keep[idx].then_some(entry)).collect()
 }
 
 /// Like [`load`], with `features` enabled on the root package besides its defaults.
 pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Workspace> {
+    load_filtered(root, targets, features, &[])
+}
+
+fn load_filtered(root: &Path, targets: &Targets, features: &[&str], omit_root_deps: &[&str]) -> Result<Workspace> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
     let root = canonical.as_path();
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
     let root_names = root_package_names(root, &top, workspace.as_ref())?;
-    let locked = prune_unreachable_locked(lock::read(&top.join("Cargo.lock"))?, &root_names);
+    let locked = prune_unreachable_locked(lock::read(&top.join("Cargo.lock"))?, &root_names, omit_root_deps);
+    let wanted_local: BTreeSet<String> = locked.iter().filter(|e| !e.is_registry()).map(|e| e.name.clone()).collect();
     let mut registries = registry_dirs()?;
     registries.insert(0, top.join("vendor"));
-    let paths = local_paths(root, &top, workspace.as_ref())?;
+    let paths = local_paths(root, &top, workspace.as_ref(), &wanted_local)?;
     let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
+    if !omit_root_deps.is_empty() {
+        for pkg in packages.iter_mut().filter(|p| !p.locked.is_registry() && root_names.contains(&p.locked.name)) {
+            pkg.manifest.deps.retain(|dep| !omit_root_deps.contains(&dep.package.as_str()));
+        }
+    }
     resolve_deps(&mut packages);
     let members: Vec<usize> = packages
         .iter()
@@ -337,7 +354,7 @@ pub fn library() -> Result<PathBuf> {
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.
 pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
-    let mut sysroot = load_with(&library.join("sysroot"), targets, &[])?;
+    let mut sysroot = load_filtered(&library.join("sysroot"), targets, &[], &["test"])?;
     sysroot.packages.iter_mut().for_each(|package| package.sysroot = true);
     Ok(sysroot)
 }

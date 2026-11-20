@@ -280,6 +280,7 @@ pub struct Crate {
     pub edition: String,
     pub collected: Vec<Option<usize>>,
     pub pending: Vec<collect::Pending>,
+    pub enums: FxHashMap<(u32, u32), Box<[Sym]>>,
     pub eager: bool,
     wanted: FxHashMap<u32, rustc_hash::FxHashSet<Sym>>,
     whole: rustc_hash::FxHashSet<u32>,
