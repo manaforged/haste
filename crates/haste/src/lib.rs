@@ -57,3 +57,25 @@ pub(crate) fn host_target() -> haste_codegen::Target {
 fn set_profile(profile: outline::tree::Profile) {
     _ = PROFILE.set(profile);
 }
+
+/// Package, binary, and feature selection from the command line.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub package: Option<String>,
+    pub bin: Option<String>,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+}
+
+static SELECTION: OnceLock<Selection> = OnceLock::new();
+
+/// The package, binary, and feature selection for this run.
+pub(crate) fn selection() -> &'static Selection {
+    SELECTION.get_or_init(Selection::default)
+}
+
+/// Sets the package, binary, and feature selection once, before any work reads it.
+fn set_selection(selection: Selection) {
+    _ = SELECTION.set(selection);
+}

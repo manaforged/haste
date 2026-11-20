@@ -270,7 +270,7 @@ impl Lower<'_, '_> {
     }
 
     fn boxed_once_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Substs), args: List) -> Result<Option<Value>> {
-        let Some((root, path)) = self.scrutinee_path(callee) else { bail!("calling a temporary `Box<dyn FnOnce>` is not supported yet") };
+        let moved = self.scrutinee_path(callee);
         let Some(&Res::Fn(free, free_substs)) = self.typed.box_frees.get(&expr) else { bail!("a `Box<dyn FnOnce>` call with no box to free") };
         let Some(boxed) = self.place_or_temp(callee)? else { return Ok(None) };
         let Some((place, _)) = self.deref_step((expr, 0), Some(boxed), self.ty_of(callee))? else { return Ok(None) };
@@ -285,7 +285,10 @@ impl Lower<'_, '_> {
         let unit = self.cx.types.unit();
         let pointer = self.cx.types.intern(Kind::Ptr(Mut::Mut, unit));
         let result = self.call_code(code, (vec![pointer, tuple], Some(ret)), std::iter::once(data).chain(packed).collect())?;
-        self.moved_out(root, &path)?;
+        match moved {
+            Some((root, path)) => self.moved_out(root, &path)?,
+            None => self.moved_out(super::moves::Root::Temp(callee), &[])?,
+        }
         let target = self.address(boxed);
         self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::BoxFree(expr)), free, free_substs, vec![target])?;
         Ok(result)
@@ -293,7 +296,7 @@ impl Lower<'_, '_> {
 
     /// Lowers the call of a `Box` of a closure that consumes itself: the closure runs on its captures inside the box, and then the box frees its memory and counts as moved.
     fn boxed_closure_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Substs), args: List) -> Result<Option<Value>> {
-        let Some((root, path)) = self.scrutinee_path(callee) else { bail!("calling a `Box` of a closure that no local owns is not supported yet") };
+        let moved = self.scrutinee_path(callee);
         let boxed = self.ty_of(callee);
         let Some(Res::Fn(free, free_substs)) = crate::sema::infer::drop_fn(self.cx, boxed)? else { bail!("`Box` has no `Drop` impl") };
         let Some(owner) = self.place_or_temp(callee)? else { return Ok(None) };
@@ -303,7 +306,10 @@ impl Lower<'_, '_> {
         let result = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)?;
         let target = self.address(owner);
         self.invoke(super::reloc::SiteOrigin::DropFn(super::reloc::TyOrigin::Expr(callee)), free, free_substs, vec![target])?;
-        self.moved_out(root, &path)?;
+        match moved {
+            Some((root, path)) => self.moved_out(root, &path)?,
+            None => self.moved_out(super::moves::Root::Temp(callee), &[])?,
+        }
         Ok(result)
     }
 

@@ -260,7 +260,7 @@ fn usage() -> String {
     let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().filter(|(cmd, _)| !matches!(cmd, Command::Clean)).map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--bin NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -331,13 +331,39 @@ impl Meta {
     }
 }
 
-fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>, out: &mut Option<PathBuf>) -> Result<Option<Meta>> {
+fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
+    args: &mut std::iter::Peekable<I>,
+    selection: &mut crate::Selection,
+    stats: &mut Option<PathBuf>,
+    out: &mut Option<PathBuf>,
+) -> Result<Option<Meta>> {
     while let Some(flag) = args.peek().and_then(|raw| raw.to_str()) {
         if let Some(meta) = Meta::from_flag(flag) {
             args.next();
             return Ok(Some(meta));
         }
         match flag {
+            "-p" | "--package" => {
+                args.next();
+                selection.package = Some(next_str(args).context("--package takes a package name")?);
+            }
+            "--bin" => {
+                args.next();
+                selection.bin = Some(next_str(args).context("--bin takes a binary name")?);
+            }
+            "-F" | "--features" => {
+                args.next();
+                let list = next_str(args).context("--features takes a feature list")?;
+                selection.features.extend(list.split([',', ' ']).filter(|s| !s.is_empty()).map(str::to_owned));
+            }
+            "--all-features" => {
+                args.next();
+                selection.all_features = true;
+            }
+            "--no-default-features" => {
+                args.next();
+                selection.no_default_features = true;
+            }
             "--jobs" => {
                 args.next();
                 let count: usize = next_str(args)?.parse().context("--jobs takes a positive number")?;
@@ -384,13 +410,14 @@ type ParsedInvocation = (Command, PathBuf, Vec<String>, Option<PathBuf>, Option<
 
 fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
     let mut args = std::env::args_os().skip(1).peekable();
+    let mut selection = crate::Selection::default();
     let mut stats_json = None;
     let mut out = None;
-    if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
         return Ok(Err(meta));
     }
     let command = parse(&mut args)?;
-    if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
         return Ok(Err(meta));
     }
     if matches!(command, Command::Clean) {
@@ -408,10 +435,11 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         PathBuf::from(args.next().with_context(usage)?)
     };
     if !matches!(command, Command::Request(Request::Run) | Command::Debug(_))
-        && let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)?
+        && let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)?
     {
         return Ok(Err(meta));
     }
+    crate::set_selection(selection);
     if !matches!(command, Command::Request(Request::Build)) && (stats_json.is_some() || out.is_some()) {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
     }
@@ -532,7 +560,7 @@ fn program_name(root: &std::path::Path) -> String {
 
 /// Loads the workspace at `root` with the standard library merged in and the output of every build script settled.
 pub(crate) fn load_workspace(root: &std::path::Path, targets: &Targets) -> Result<graph::Workspace> {
-    let mut workspace = graph::load(root, targets)?;
+    let mut workspace = graph::load(root, targets, crate::selection())?;
     workspace.merge(graph::load_sysroot(&graph::library()?, targets)?);
     crate::scripts::settle(&mut workspace, targets)?;
     Ok(workspace)
@@ -554,7 +582,7 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
     let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
     let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
-        Command::Debug(Query::Graph) => graph::load(root, &targets)?,
+        Command::Debug(Query::Graph) => graph::load(root, &targets, crate::selection())?,
         _ => load_workspace(root, &targets)?,
     };
     let graph_span = graph_clock.elapsed();

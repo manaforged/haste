@@ -80,6 +80,7 @@ fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
     root.hash(&mut hasher);
     (crate::profile() == Profile::Release).hash(&mut hasher);
     crate::prep::prepared().hash(&mut hasher);
+    crate::selection().hash(&mut hasher);
     std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
     let abstract_name = cfg!(target_os = "linux");
     let name = match abstract_name {

@@ -337,11 +337,14 @@ impl Lower<'_, '_> {
             (true, IntCC::SignedLessThan) => IntCC::SignedLessThanOrEqual,
             (true, _) => IntCC::UnsignedLessThanOrEqual,
         };
-        for (end, cc) in [(from, low), (to, high)] {
+        for (end, cc, fcc) in [
+            (from, low, haste_codegen::FloatCC::GreaterThanOrEqual),
+            (to, high, if inclusive { haste_codegen::FloatCC::LessThanOrEqual } else { haste_codegen::FloatCC::LessThan }),
+        ] {
             let Some(end) = end else { continue };
             let Some(bound) = self.expr(end)? else { bail!("range end with no value") };
             let ok = match num {
-                Num::Float(_) => bail!("float range patterns are not supported yet"),
+                Num::Float(_) => self.ins().fcmp(fcc, value, bound),
                 _ => self.ins().icmp(cc, value, bound),
             };
             self.pass(ok, fail);

@@ -1,12 +1,12 @@
 # haste
 
-haste is a Rust compiler and execution engine for running, testing, and
-building workspaces without a `target/` build directory.
+haste is a clean-room Rust compiler and execution engine with its own frontend,
+SSA optimizer, and native x86-64 and Apple Silicon arm64 code generator.
 
-You run a crate directly from source, or emit a standalone native executable
-when you want a binary on disk. haste reads `Cargo.lock`, resolves names and
-types itself, and compiles reached functions to x86-64 or Apple Silicon arm64
-machine code.
+It reads `Cargo.lock`, resolves names and types directly from source, and
+either JIT-compiles reached functions on first execution (`haste run`) or emits
+a standalone native executable (`haste --release build -o`) without LLVM or a
+`target/` directory.
 
 ```bash
 cargo build --release -p haste
@@ -16,18 +16,19 @@ cargo build --release -p haste
 ```
 
 If a workspace has no `Cargo.lock`, run `cargo generate-lockfile` in it first.
-`haste run` compiles functions the first time execution reaches them, and build
-scripts and procedural macros run inside haste. Unchanged build script outputs,
-macro expansions, standard library summaries, and compiled workspace stencils
-stay in `~/.cache/haste`, keyed by their inputs, so repeated builds rebuild
-only edited items and skip unchanged workspaces.
+Build scripts (`build.rs`), declarative and procedural macros, `const fn`,
+`async`/`await`, generics, trait objects, SIMD, and C FFI all run inside haste.
+Unchanged build script outputs, macro expansions, standard library summaries,
+and compiled workspace stencils stay in `~/.cache/haste`, keyed by their
+inputs, so repeated builds rebuild only edited items and skip unchanged
+workspaces.
 
 haste is experimental. There is no tagged release yet, and the command line can change.
 
 ## Commands
 
 ```text
-haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] build|test|run|serve|prep [PATH] [--] [ARGS...]
+haste [-p PKG] [--bin NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] build|test|run|serve|prep [PATH] [--] [ARGS...]
 haste clean
 haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]
 haste [--release] debug code PATH DIR
@@ -50,6 +51,11 @@ haste -V|--version | -h|--help
 
 - `-V`, `--version`: Prints the compiler version and exits.
 - `-h`, `--help`: Prints command usage and exits.
+- `-p PKG`, `--package PKG`: Selects a specific workspace package to build or run.
+- `--bin NAME`: Selects which binary target to build or run when a package defines multiple binaries.
+- `-F FEATURES`, `--features FEATURES`: Comma- or space-separated list of Cargo features to enable (repeatable).
+- `--all-features`: Enables all features on the selected workspace packages.
+- `--no-default-features`: Disables the `default` feature on the selected workspace packages.
 - `--jobs N`: Sets the worker thread or process count. Defaults to the cores available to the process.
 - `--release`: Enables full codegen optimization and release `cfg` settings.
 - `-o PATH`, `--output PATH`: Writes a standalone native executable (`haste build` only).
@@ -102,6 +108,7 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 ## Limits
 
 - haste compiles only for the host (`x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`). Windows and cross-compilation are not supported.
+- haste performs name resolution, type inference, trait selection, and move/drop tracking, but does not run a borrow checker yet. Use `cargo check` or `rustc` in CI to verify lifetime and aliasing rules.
 - `haste test` runs `fn case_*(i64) -> i64` harness functions rather than standard `#[test]` functions (`#[cfg(test)]` is currently disabled).
 - `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
 - On macOS, JIT execution uses dual-mapped `mach_vm_remap` pages (writable + executable aliases), which may be blocked inside a Hardened Runtime or App Sandbox.

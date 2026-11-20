@@ -234,9 +234,10 @@ fn resolve_deps(packages: &mut [Package]) {
     }
 }
 
-/// Reads the package at `root` from its workspace's `Cargo.lock` and manifests and resolves its graph for `targets`.
-pub fn load(root: &Path, targets: &Targets) -> Result<Workspace> {
-    load_with(root, targets, &[])
+/// Reads the package at `root` from its workspace's `Cargo.lock` and manifests and resolves its graph for `targets` using `selection`.
+pub(crate) fn load(root: &Path, targets: &Targets, selection: &crate::Selection) -> Result<Workspace> {
+    let features: Vec<&str> = selection.features.iter().map(String::as_str).collect();
+    load_filtered(root, targets, selection.package.as_deref(), &features, (!selection.no_default_features, selection.all_features), &[])
 }
 
 fn load_package(entry: Locked, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Package, Option<anyhow::Error>)> {
@@ -312,18 +313,23 @@ fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String], omit_roo
     locked.into_iter().enumerate().filter_map(|(idx, entry)| keep[idx].then_some(entry)).collect()
 }
 
-/// Like [`load`], with `features` enabled on the root package besides its defaults.
-pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Workspace> {
-    load_filtered(root, targets, features, &[])
-}
-
-fn load_filtered(root: &Path, targets: &Targets, features: &[&str], omit_root_deps: &[&str]) -> Result<Workspace> {
+fn load_filtered(
+    root: &Path,
+    targets: &Targets,
+    package: Option<&str>,
+    features: &[&str],
+    (default_features, all_features): (bool, bool),
+    omit_root_deps: &[&str],
+) -> Result<Workspace> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
     let root = canonical.as_path();
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
-    let root_names = root_package_names(root, &top, workspace.as_ref())?;
-    let locked = prune_unreachable_locked(lock::read(&top.join("Cargo.lock"))?, &root_names, omit_root_deps);
+    let root_names = match package {
+        Some(name) => vec![name.to_owned()],
+        None => root_package_names(root, &top, workspace.as_ref())?,
+    };
+    let locked = prune_unreachable_locked(lock::read(&top.join(LOCK_FILE))?, &root_names, omit_root_deps);
     let wanted_local: BTreeSet<String> = locked.iter().filter(|e| !e.is_registry()).map(|e| e.name.clone()).collect();
     let mut registries = registry_dirs()?;
     registries.insert(0, top.join("vendor"));
@@ -342,9 +348,12 @@ fn load_filtered(root: &Path, targets: &Targets, features: &[&str], omit_root_de
         .map(|(at, _)| at)
         .collect();
     if members.is_empty() {
-        bail!("{} is not in Cargo.lock", root.display());
+        match package {
+            Some(name) => bail!("package `{name}` is not in {LOCK_FILE}"),
+            None => bail!("{} is not in {LOCK_FILE}", root.display()),
+        }
     }
-    let graph = features::resolve(&packages, targets, &members, features);
+    let graph = features::resolve(&packages, targets, &members, features, default_features, all_features);
     for unit in &graph.units {
         if let Some(err) = missing[unit.package].take() {
             return Err(err);
@@ -387,7 +396,7 @@ pub fn library() -> Result<PathBuf> {
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.
 pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
-    let mut sysroot = load_filtered(&library.join("sysroot"), targets, &[], &["test"])?;
+    let mut sysroot = load_filtered(&library.join("sysroot"), targets, None, &[], (true, false), &["test"])?;
     sysroot.packages.iter_mut().for_each(|package| package.sysroot = true);
     Ok(sysroot)
 }

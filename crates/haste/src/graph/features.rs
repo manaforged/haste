@@ -130,12 +130,21 @@ impl Resolver<'_> {
     }
 }
 
-/// Resolves the features of every unit reachable from `members`, with their default features, as Cargo's resolver 2 does for `normal` and `build` edges.
-pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str]) -> Graph {
+/// Resolves the features of every unit reachable from `members`, as Cargo's resolver 2 does for `normal` and `build` edges.
+pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str], default_features: bool, all_features: bool) -> Graph {
     let mut resolver = Resolver { packages, targets, units: Vec::new(), by_key: BTreeMap::new(), enabled: Vec::new(), want: Vec::new(), queue: VecDeque::new() };
     for member in members {
         let unit = resolver.unit(*member, Side::Target);
-        resolver.queue.push_back((unit, Step::Feature("default".to_owned())));
+        if default_features {
+            resolver.queue.push_back((unit, Step::Feature("default".to_owned())));
+        }
+        if all_features {
+            let package = &packages[*member];
+            resolver.queue.extend(package.manifest.features.keys().cloned().map(|name| (unit, Step::Feature(name))));
+            resolver.queue.extend(
+                package.manifest.deps.iter().filter(|dep| implicit(package, &dep.key)).map(|dep| (unit, Step::Feature(dep.key.clone()))),
+            );
+        }
         resolver.queue.extend(features.iter().map(|feature| (unit, Step::Feature((*feature).to_owned()))));
     }
     resolver.run();
