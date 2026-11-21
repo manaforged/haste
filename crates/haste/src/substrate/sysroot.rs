@@ -12,9 +12,9 @@ use crate::macros::Compilation;
 use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::{Outline, Role};
 
-pub(crate) const SYSROOT_VERSION: u32 = 1;
+pub(crate) const SYSROOT_VERSION: u32 = 2;
 const SYSROOT_MAGIC: [u8; 8] = *b"HSTSYS01";
-const HEADER_LEN: usize = 24;
+const HEADER_LEN: usize = 32;
 const KEPT_SYSROOTS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

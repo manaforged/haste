@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::names::{Binding, Crate as NamesCrate, Def, ItemRef, ModRef, Ns, Origin, PRIMITIVES, PerNs, Scope, Sym, Unresolved, collect::Pending};
 use crate::sema::summary::codec::{Cursor, write_u32};
 
-use super::tokens::{read_opt_u32, read_str, read_vis, write_opt_u32, write_str, write_usize, write_vis};
+use super::tokens::{read_opt_u32, read_str, read_u32s_map, read_vis, u32_le, write_opt_u32, write_str, write_usize, write_vis};
 use super::wire::Tables;
 
 const ORIGIN_KINDS: [Origin; 3] = [Origin::Item, Origin::Import, Origin::Glob];
@@ -139,11 +139,7 @@ pub(super) fn read_names_crate(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Na
             let macros = if mask & 4 != 0 { Some(read_binding(cur, remap)?) } else { None };
             names.insert(sym, PerNs { types, values, macros });
         }
-        let log_len = cur.count()?;
-        let mut log = Vec::with_capacity(log_len);
-        for _ in 0..log_len {
-            log.push(Sym(cur.u32()?));
-        }
+        let log = read_u32s_map(cur, Sym)?;
         scopes.push(Scope { names, log });
     }
     let prelude = if cur.u8()? != 0 {
@@ -153,40 +149,31 @@ pub(super) fn read_names_crate(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Na
         None
     };
     let unres_len = cur.count()?;
-    let mut unresolved = Vec::with_capacity(unres_len);
-    for _ in 0..unres_len {
-        unresolved.push(Unresolved { file: cur.u32()?, import: cur.u32()? });
-    }
+    let unres_bytes = cur.take(unres_len.checked_mul(8).context("unresolved overflow")?)?;
+    let unresolved = unres_bytes.chunks_exact(8).map(|c| Unresolved { file: u32_le(c, 0), import: u32_le(c, 4) }).collect();
     let ext_len = cur.count()?;
     let mut externs = Vec::with_capacity(ext_len);
     for _ in 0..ext_len {
         externs.push((Sym(cur.u32()?), read_def(cur, remap)?));
     }
     let dep_len = cur.count()?;
+    let dep_bytes = cur.take(dep_len.checked_mul(8).context("names deps overflow")?)?;
     let mut deps = Vec::with_capacity(dep_len);
-    for _ in 0..dep_len {
-        let sym = Sym(cur.u32()?);
-        let dep = *remap.get(cur.u32()? as usize).context("names dep crate out of bounds")? as usize;
+    for c in dep_bytes.chunks_exact(8) {
+        let sym = Sym(u32_le(c, 0));
+        let dep = *remap.get(u32_le(c, 4) as usize).context("names dep crate out of bounds")? as usize;
         deps.push((sym, dep));
     }
     let edition_2015 = cur.u8()? != 0;
     let edition = read_str(cur)?.to_owned();
-    let coll_len = cur.count()?;
-    let mut collected = Vec::with_capacity(coll_len);
-    for _ in 0..coll_len {
-        collected.push(read_opt_u32(cur)?.map(|v| v as usize));
-    }
+    let collected = read_u32s_map(cur, |v| (v != u32::MAX).then_some(v as usize))?;
     let pend_len = cur.count()?;
     let mut pending = Vec::with_capacity(pend_len);
     for _ in 0..pend_len {
         let module = cur.u32()?;
         let file = cur.u32()?;
         let import = cur.u32()?;
-        let seg_len = cur.count()?;
-        let mut segments = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            segments.push(Sym(cur.u32()?));
-        }
+        let segments = read_u32s_map(cur, Sym)?.into_boxed_slice();
         let absolute = cur.u8()? != 0;
         let dollar = match read_opt_u32(cur)? {
             Some(d) => Some(*remap.get(d as usize).context("pending dollar crate out of bounds")?),
@@ -196,18 +183,14 @@ pub(super) fn read_names_crate(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Na
         let vis = read_vis(cur)?;
         let stamp = if cur.u8()? != 0 { Some((read_def(cur, remap)?, cur.u32()?)) } else { None };
         let active = cur.u8()? != 0;
-        pending.push(Pending { module, file, import, segments: segments.into_boxed_slice(), absolute, dollar, name, vis, stamp, active });
+        pending.push(Pending { module, file, import, segments, absolute, dollar, name, vis, stamp, active });
     }
     let enum_len = cur.count()?;
     let mut enums = HashMap::with_capacity_and_hasher(enum_len, Default::default());
     for _ in 0..enum_len {
         let key = (cur.u32()?, cur.u32()?);
-        let v_len = cur.count()?;
-        let mut variants = Vec::with_capacity(v_len);
-        for _ in 0..v_len {
-            variants.push(Sym(cur.u32()?));
-        }
-        enums.insert(key, variants.into_boxed_slice());
+        let variants = read_u32s_map(cur, Sym)?.into_boxed_slice();
+        enums.insert(key, variants);
     }
     let eager = cur.u8()? != 0;
     let mut out = NamesCrate::default();

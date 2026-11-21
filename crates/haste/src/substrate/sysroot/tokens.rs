@@ -6,7 +6,7 @@ use rustc_lexer::{Base, DocStyle, LiteralKind, TokenKind};
 use crate::graph::cfg::Cfg;
 use crate::outline::item::{Attr, Import, Item, ItemKind, Items, Leaf, Vis};
 use crate::outline::rules::{Frag, Meta, Op, Piece, Rule};
-use crate::outline::source::{Mark, Origins, Token, opens};
+use crate::outline::source::{Mark, Origins, Token};
 use crate::sema::summary::codec::{Cursor, write_u32, write_u32s};
 use crate::substrate::{bytes_to_path, path_to_bytes};
 
@@ -21,15 +21,45 @@ const ITEM_KINDS: [ItemKind; 17] = [
     ItemKind::Union, ItemKind::Trait, ItemKind::TraitAlias, ItemKind::Impl, ItemKind::Type, ItemKind::Const,
     ItemKind::Static, ItemKind::MacroRules, ItemKind::Macro, ItemKind::MacroCall, ItemKind::ExternBlock,
 ];
+const SIMPLE_NON_DELIM_COUNT: usize = 32;
 const SIMPLE_TOKENS: [TokenKind; 38] = [
     TokenKind::Whitespace, TokenKind::Ident, TokenKind::InvalidIdent, TokenKind::RawIdent, TokenKind::ForcedKeywordIdent,
     TokenKind::UnknownPrefix, TokenKind::UnknownPrefixLifetime, TokenKind::RawLifetime, TokenKind::GuardedStrPrefix,
-    TokenKind::Semi, TokenKind::Comma, TokenKind::Dot, TokenKind::OpenParen, TokenKind::CloseParen,
-    TokenKind::OpenBrace, TokenKind::CloseBrace, TokenKind::OpenBracket, TokenKind::CloseBracket,
+    TokenKind::Semi, TokenKind::Comma, TokenKind::Dot,
     TokenKind::At, TokenKind::Pound, TokenKind::Tilde, TokenKind::Question, TokenKind::Colon, TokenKind::Dollar,
     TokenKind::Eq, TokenKind::Bang, TokenKind::Lt, TokenKind::Gt, TokenKind::Minus, TokenKind::And, TokenKind::Or,
     TokenKind::Plus, TokenKind::Star, TokenKind::Slash, TokenKind::Caret, TokenKind::Percent, TokenKind::Unknown, TokenKind::Eof,
+    TokenKind::OpenParen, TokenKind::CloseParen, TokenKind::OpenBrace, TokenKind::CloseBrace, TokenKind::OpenBracket, TokenKind::CloseBracket,
 ];
+
+#[inline]
+pub(super) fn u32_le(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+pub(super) fn read_u32s_map<T>(cur: &mut Cursor<'_>, mut f: impl FnMut(u32) -> T) -> Result<Vec<T>> {
+    let count = cur.count()?;
+    let byte_len = count.checked_mul(4).context("u32 slice overflow")?;
+    let bytes = cur.take(byte_len)?;
+    Ok(bytes.chunks_exact(4).map(|c| f(u32_le(c, 0))).collect())
+}
+
+pub(super) fn read_paths(cur: &mut Cursor<'_>) -> Result<Vec<PathBuf>> {
+    let count = cur.count()?;
+    let mut paths = Vec::with_capacity(count);
+    for _ in 0..count {
+        paths.push(read_path(cur)?);
+    }
+    Ok(paths)
+}
+
+pub(super) fn write_paths(out: &mut Vec<u8>, paths: &[PathBuf]) -> Option<()> {
+    write_usize(out, paths.len())?;
+    for path in paths {
+        write_path(out, path)?;
+    }
+    Some(())
+}
 
 pub(super) fn write_str(out: &mut Vec<u8>, s: &str) -> Option<()> {
     write_u32(out, u32::try_from(s.len()).ok()?);
@@ -135,63 +165,100 @@ fn read_literal_kind(cur: &mut Cursor<'_>) -> Result<LiteralKind> {
     })
 }
 
-pub(super) fn write_token(out: &mut Vec<u8>, token: Token) {
-    if let Some(pos) = SIMPLE_TOKENS.iter().position(|&k| k == token.kind) {
-        out.push(pos as u8);
-    } else {
-        match token.kind {
-            TokenKind::LineComment { doc_style } => { out.push(38); write_opt_doc(out, doc_style); }
-            TokenKind::BlockComment { doc_style, terminated } => { out.push(39); write_opt_doc(out, doc_style); out.push(u8::from(terminated)); }
-            TokenKind::Frontmatter { has_invalid_preceding_whitespace, invalid_infostring } => {
-                out.push(40);
-                out.push(u8::from(has_invalid_preceding_whitespace) | (u8::from(invalid_infostring) << 1));
+pub(super) fn write_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Option<()> {
+    write_usize(out, tokens.len())?;
+    let len_at = out.len();
+    write_u32(out, 0);
+    let body_start = out.len();
+    out.reserve(tokens.len() * 10);
+    for &token in tokens {
+        let (len, pair) = token.raw();
+        let has_pair = if let Some(pos) = SIMPLE_TOKENS.iter().position(|&k| k == token.kind) {
+            out.push(pos as u8);
+            pos >= SIMPLE_NON_DELIM_COUNT
+        } else {
+            match token.kind {
+                TokenKind::LineComment { doc_style } => { out.push(38); write_opt_doc(out, doc_style); }
+                TokenKind::BlockComment { doc_style, terminated } => { out.push(39); write_opt_doc(out, doc_style); out.push(u8::from(terminated)); }
+                TokenKind::Frontmatter { has_invalid_preceding_whitespace, invalid_infostring } => {
+                    out.push(40);
+                    out.push(u8::from(has_invalid_preceding_whitespace) | (u8::from(invalid_infostring) << 1));
+                }
+                TokenKind::Lifetime { starts_with_number } => { out.push(41); out.push(u8::from(starts_with_number)); }
+                TokenKind::Literal { kind, suffix_start } => { out.push(42); write_literal_kind(out, kind); write_u32(out, suffix_start); }
+                _ => return None,
             }
-            TokenKind::Lifetime { starts_with_number } => { out.push(41); out.push(u8::from(starts_with_number)); }
-            TokenKind::Literal { kind, suffix_start } => { out.push(42); write_literal_kind(out, kind); write_u32(out, suffix_start); }
-            _ => {}
+            false
+        };
+        write_u32(out, token.start);
+        write_u32(out, len);
+        if has_pair {
+            write_u32(out, pair);
         }
     }
-    let (len, pair) = token.raw();
-    write_u32(out, token.start);
-    write_u32(out, len);
-    if opens(token.kind) || closes(token.kind) {
-        write_u32(out, pair);
+    let byte_len = u32::try_from(out.len() - body_start).ok()?;
+    out[len_at..len_at + 4].copy_from_slice(&byte_len.to_le_bytes());
+    Some(())
+}
+
+pub(super) fn read_tokens(cur: &mut Cursor<'_>) -> Result<Vec<Token>> {
+    let count = cur.count()?;
+    let byte_len = cur.count()?;
+    let data = cur.take(byte_len)?;
+    if count.saturating_mul(9) > data.len() {
+        bail!("token count exceeds byte length");
     }
-}
-
-fn closes(kind: TokenKind) -> bool {
-    matches!(kind, TokenKind::CloseParen | TokenKind::CloseBrace | TokenKind::CloseBracket)
-}
-
-pub(super) fn read_token(cur: &mut Cursor<'_>) -> Result<Token> {
-    let tag = cur.u8()?;
-    let kind = if let Some(&simple) = SIMPLE_TOKENS.get(tag as usize) {
-        simple
-    } else {
-        match tag {
-            38 => TokenKind::LineComment { doc_style: read_opt_doc(cur)? },
-            39 => TokenKind::BlockComment { doc_style: read_opt_doc(cur)?, terminated: cur.u8()? != 0 },
-            40 => {
-                let flags = cur.u8()?;
-                TokenKind::Frontmatter { has_invalid_preceding_whitespace: flags & 1 != 0, invalid_infostring: flags & 2 != 0 }
-            }
-            41 => TokenKind::Lifetime { starts_with_number: cur.u8()? != 0 },
-            42 => TokenKind::Literal { kind: read_literal_kind(cur)?, suffix_start: cur.u32()? },
-            _ => bail!("invalid token kind tag"),
+    let mut tokens = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for _ in 0..count {
+        let tag = *data.get(pos).context("unexpected eof")?;
+        if (tag as usize) < SIMPLE_NON_DELIM_COUNT {
+            let b = data.get(pos..pos + 9).context("unexpected eof")?;
+            pos += 9;
+            tokens.push(Token::from_raw(SIMPLE_TOKENS[tag as usize], u32_le(b, 1), u32_le(b, 5), u32::MAX));
+        } else if (tag as usize) < SIMPLE_TOKENS.len() {
+            let b = data.get(pos..pos + 13).context("unexpected eof")?;
+            pos += 13;
+            tokens.push(Token::from_raw(SIMPLE_TOKENS[tag as usize], u32_le(b, 1), u32_le(b, 5), u32_le(b, 9)));
+        } else {
+            let mut sub = Cursor::new(&data[pos + 1..]);
+            let kind = match tag {
+                38 => TokenKind::LineComment { doc_style: read_opt_doc(&mut sub)? },
+                39 => TokenKind::BlockComment { doc_style: read_opt_doc(&mut sub)?, terminated: sub.u8()? != 0 },
+                40 => {
+                    let flags = sub.u8()?;
+                    TokenKind::Frontmatter { has_invalid_preceding_whitespace: flags & 1 != 0, invalid_infostring: flags & 2 != 0 }
+                }
+                41 => TokenKind::Lifetime { starts_with_number: sub.u8()? != 0 },
+                42 => TokenKind::Literal { kind: read_literal_kind(&mut sub)?, suffix_start: sub.u32()? },
+                _ => bail!("invalid token kind tag"),
+            };
+            let start = sub.u32()?;
+            let len = sub.u32()?;
+            pos += 1 + sub.pos;
+            tokens.push(Token::from_raw(kind, start, len, u32::MAX));
         }
-    };
-    let start = cur.u32()?;
-    let len = cur.u32()?;
-    let pair = if opens(kind) || closes(kind) { cur.u32()? } else { u32::MAX };
-    Ok(Token::from_raw(kind, start, len, pair))
+    }
+    if pos != data.len() {
+        bail!("trailing bytes in token stream");
+    }
+    Ok(tokens)
+}
+
+pub(super) fn frag_tag(frag: Frag) -> u8 {
+    FRAG_KINDS.iter().position(|&f| f == frag).unwrap_or(0) as u8
+}
+
+pub(super) fn frag_from_tag(tag: u8) -> Result<Frag> {
+    FRAG_KINDS.get(tag as usize).copied().context("invalid fragment tag")
 }
 
 pub(super) fn write_frag(out: &mut Vec<u8>, frag: Frag) {
-    out.push(FRAG_KINDS.iter().position(|&f| f == frag).unwrap_or(0) as u8);
+    out.push(frag_tag(frag));
 }
 
-pub(super) fn read_frag(cur: &mut Cursor<'_>) -> Result<Frag> {
-    FRAG_KINDS.get(cur.u8()? as usize).copied().context("invalid fragment tag")
+fn read_frag(cur: &mut Cursor<'_>) -> Result<Frag> {
+    frag_from_tag(cur.u8()?)
 }
 
 pub(super) fn write_mark(out: &mut Vec<u8>, mark: Mark, to_local: &[Option<u32>]) -> Option<()> {
@@ -240,9 +307,8 @@ pub(super) fn read_origins(cur: &mut Cursor<'_>) -> Result<Origins> {
         0 => Origins::Read,
         1 => {
             let count = cur.count()?;
-            let mut pairs = Vec::with_capacity(count);
-            for _ in 0..count { pairs.push((cur.u32()?, cur.u32()?)); }
-            Origins::Copied(pairs)
+            let bytes = cur.take(count.checked_mul(8).context("origins overflow")?)?;
+            Origins::Copied(bytes.chunks_exact(8).map(|c| (u32_le(c, 0), u32_le(c, 4))).collect())
         }
         _ => bail!("invalid origins tag"),
     })
@@ -357,13 +423,13 @@ pub(super) fn write_items(out: &mut Vec<u8>, items: &Items) -> Option<()> {
     for item in &items.items {
         out.push(ITEM_KINDS.iter().position(|&k| k == item.kind)? as u8);
         write_opt_u32(out, item.name);
-        write_vis(out, item.vis);
-        write_attrs(out, &item.attrs)?;
         write_u32(out, item.lead);
         write_u32(out, item.start);
         write_u32(out, item.end);
         write_opt_u32(out, item.body);
         write_opt_u32(out, item.parent);
+        write_vis(out, item.vis);
+        write_attrs(out, &item.attrs)?;
     }
     write_usize(out, items.imports.len())?;
     for import in &items.imports {
@@ -388,18 +454,23 @@ pub(super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
     let inner = read_attrs(cur)?;
     let item_count = cur.count()?;
     let mut items = Vec::with_capacity(item_count);
+    let opt_at = |b: &[u8], at: usize| {
+        let v = u32_le(b, at);
+        (v != u32::MAX).then_some(v)
+    };
     for _ in 0..item_count {
-        let kind = ITEM_KINDS.get(cur.u8()? as usize).copied().context("invalid item kind tag")?;
+        let b = cur.take(25)?;
+        let kind = ITEM_KINDS.get(b[0] as usize).copied().context("invalid item kind tag")?;
         items.push(Item {
             kind,
-            name: read_opt_u32(cur)?,
+            name: opt_at(b, 1),
             vis: read_vis(cur)?,
             attrs: read_attrs(cur)?,
-            lead: cur.u32()?,
-            start: cur.u32()?,
-            end: cur.u32()?,
-            body: read_opt_u32(cur)?,
-            parent: read_opt_u32(cur)?,
+            lead: u32_le(b, 5),
+            start: u32_le(b, 9),
+            end: u32_le(b, 13),
+            body: opt_at(b, 17),
+            parent: opt_at(b, 21),
         });
     }
     let import_count = cur.count()?;
@@ -407,7 +478,7 @@ pub(super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
     for _ in 0..import_count {
         let item = cur.u32()?;
         let absolute = cur.u8()? != 0;
-        let path = cur.u32s()?;
+        let path = read_u32s_map(cur, |v| v)?;
         let leaf = match cur.u8()? {
             0 => Leaf::Name(read_opt_u32(cur)?),
             1 => Leaf::Underscore,
@@ -417,10 +488,8 @@ pub(super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
         imports.push(Import { item, absolute, path, leaf });
     }
     let mark_count = cur.count()?;
-    let mut marks = Vec::with_capacity(mark_count);
-    for _ in 0..mark_count {
-        marks.push((cur.u32()?, cur.u8()?));
-    }
+    let mark_bytes = cur.take(mark_count.checked_mul(5).context("item marks overflow")?)?;
+    let marks = mark_bytes.chunks_exact(5).map(|c| (u32_le(c, 0), c[4])).collect();
     Ok(Items { inner, items, imports, marks })
 }
 
@@ -507,7 +576,7 @@ fn read_pieces(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Piece>> {
                 let inner = read_pieces(cur, remap)?;
                 let sep = if cur.u8()? != 0 { Some((cur.u32()?, cur.u32()?)) } else { None };
                 let op = OP_KINDS.get(cur.u8()? as usize).copied().context("invalid repeat op")?;
-                let slots = cur.u32s()?.into_boxed_slice();
+                let slots = read_u32s_map(cur, |v| v)?.into_boxed_slice();
                 Piece::Repeat(inner, sep, op, slots)
             }
             _ => bail!("invalid piece tag"),
