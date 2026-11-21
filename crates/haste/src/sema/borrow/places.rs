@@ -13,6 +13,17 @@ pub(super) enum FieldKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PlaceStep {
     Field(FieldKey),
+    SliceElem {
+        offset: u64,
+        min_len: u64,
+        from_end: bool,
+        array_len: Option<u64>,
+    },
+    SliceSub {
+        from: u64,
+        to: u64,
+        array_len: Option<u64>,
+    },
     Deref,
     Opaque,
 }
@@ -23,11 +34,79 @@ pub(super) struct Place {
     pub(super) through_ref: bool,
     pub(super) mut_ref_root: bool,
     pub(super) reborrows_shared_field: bool,
+    pub(super) raw_ptr_prefix: Option<usize>,
     pub(super) steps: Vec<PlaceStep>,
 }
 
 pub(super) fn steps_conflict(a: &[PlaceStep], b: &[PlaceStep]) -> bool {
-    a.iter().zip(b).all(|(x, y)| x == y)
+    a.iter().zip(b).all(|(x, y)| step_conflict(x, y))
+}
+
+fn step_conflict(a: &PlaceStep, b: &PlaceStep) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (PlaceStep::Opaque, PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. })
+        | (PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. }, PlaceStep::Opaque) => true,
+        (
+            PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. },
+            PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. },
+        ) => slice_steps_conflict(a, b),
+        _ => false,
+    }
+}
+
+fn slice_array_len(step: &PlaceStep) -> Option<u64> {
+    match *step {
+        PlaceStep::SliceElem { array_len, .. } | PlaceStep::SliceSub { array_len, .. } => array_len,
+        _ => None,
+    }
+}
+
+fn slice_range(step: &PlaceStep, len: u64) -> (u64, u64) {
+    match *step {
+        PlaceStep::SliceElem { offset, from_end: false, .. } => {
+            let start = offset.min(len);
+            (start, (start + 1).min(len))
+        }
+        PlaceStep::SliceElem { offset, from_end: true, .. } => {
+            let start = len.saturating_sub(offset);
+            (start, (start + 1).min(len))
+        }
+        PlaceStep::SliceSub { from, to, .. } => (from.min(len), len.saturating_sub(to)),
+        _ => (0, len),
+    }
+}
+
+fn slice_steps_conflict(a: &PlaceStep, b: &PlaceStep) -> bool {
+    if let Some(len) = slice_array_len(a).or_else(|| slice_array_len(b)) {
+        let (a1, a2) = slice_range(a, len);
+        let (b1, b2) = slice_range(b, len);
+        return a1 < b2 && b1 < a2;
+    }
+    match (a, b) {
+        (
+            PlaceStep::SliceElem { offset: o1, min_len: m1, from_end: e1, .. },
+            PlaceStep::SliceElem { offset: o2, min_len: m2, from_end: e2, .. },
+        ) => {
+            if e1 == e2 {
+                o1 == o2
+            } else {
+                o1 + o2 >= (*m1).max(*m2)
+            }
+        }
+        (PlaceStep::SliceElem { offset, from_end, .. }, PlaceStep::SliceSub { from, to, .. })
+        | (PlaceStep::SliceSub { from, to, .. }, PlaceStep::SliceElem { offset, from_end, .. }) => {
+            if *from_end {
+                offset > to
+            } else {
+                offset >= from
+            }
+        }
+        (PlaceStep::SliceSub { .. }, PlaceStep::SliceSub { .. }) => true,
+        _ => true,
+    }
 }
 
 pub(super) fn push_step(steps: &mut Vec<PlaceStep>, step: PlaceStep) {
@@ -76,6 +155,12 @@ impl Checker<'_, '_> {
     }
 
     fn deref_ref_step(&self, ty: Ty, p: &mut Place) -> bool {
+        if ty != Ty::NONE
+            && matches!(self.cx.types.kind(ty), Kind::Ptr(..))
+            && p.raw_ptr_prefix.is_none()
+        {
+            p.raw_ptr_prefix = Some(p.steps.len());
+        }
         if self.is_mut_ref_or_ptr(ty) {
             p.mut_ref_root = true;
             p.through_ref = true;
@@ -131,6 +216,7 @@ impl Checker<'_, '_> {
                     through_ref: false,
                     mut_ref_root: false,
                     reborrows_shared_field: false,
+                    raw_ptr_prefix: None,
                     steps: Vec::new(),
                 }),
                 _ => None,
@@ -180,17 +266,37 @@ impl Checker<'_, '_> {
     }
 
     pub(super) fn place_behind_shared_ref(&self, expr: ExprId) -> bool {
+        self.place_behind_ref(expr, true)
+    }
+
+    pub(super) fn place_behind_ref(&self, expr: ExprId, shared_only: bool) -> bool {
         match *self.body.expr(expr) {
-            Expr::Paren(inner) => self.place_behind_shared_ref(inner),
+            Expr::Paren(inner) => self.place_behind_ref(inner, shared_only),
             Expr::Unary(UnOp::Deref, inner) => {
                 let ty = self.expr_ty(inner);
-                (ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)))
-                    || self.place_behind_shared_ref(inner)
+                if ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ptr(..)) {
+                    return false;
+                }
+                let is_ref = ty != Ty::NONE
+                    && if shared_only {
+                        matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _))
+                    } else {
+                        matches!(self.cx.types.kind(ty), Kind::Ref(..))
+                    };
+                is_ref || self.place_behind_ref(inner, shared_only)
             }
             Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _) => {
                 let ty = self.expr_ty(base);
-                let base_shared = ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _));
-                base_shared || self.place_behind_shared_ref(base)
+                if ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ptr(..)) {
+                    return false;
+                }
+                let base_ref = ty != Ty::NONE
+                    && if shared_only {
+                        matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _))
+                    } else {
+                        matches!(self.cx.types.kind(ty), Kind::Ref(..))
+                    };
+                base_ref || self.place_behind_ref(base, shared_only)
             }
             _ => false,
         }
@@ -223,7 +329,7 @@ fn first_field_prefix(steps: &[PlaceStep]) -> Option<Vec<PlaceStep>> {
         match step {
             PlaceStep::Deref => {}
             PlaceStep::Field(_) => return Some(steps[..=idx].to_vec()),
-            PlaceStep::Opaque => return None,
+            PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. } | PlaceStep::Opaque => return None,
         }
     }
     None

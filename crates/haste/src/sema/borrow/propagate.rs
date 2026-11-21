@@ -397,7 +397,10 @@ impl Checker<'_, '_> {
         self.place_to_sources(&p, mutable, state)
     }
 
-    fn place_to_sources(&self, p: &super::places::Place, mutable: bool, state: &State) -> Vec<BorrowSource> {
+    pub(super) fn place_to_sources(&self, p: &super::places::Place, mutable: bool, state: &State) -> Vec<BorrowSource> {
+        if p.raw_ptr_prefix.is_some() {
+            return Vec::new();
+        }
         let local = p.local;
         let existing: Vec<_> = state.loans.iter().filter(|l| l.holder == Some(local)).collect();
         if p.reborrows_shared_field {
@@ -583,7 +586,7 @@ impl Checker<'_, '_> {
             }
             return self.finish_sig_sources(expr, out);
         }
-        let allow_elided_param = !matches!(sig.receiver, Some((SelfKind::Ref | SelfKind::RefMut, _)));
+        let allow_elided_param = !recv_is_by_ref(&sig);
         for (idx, &arg) in arg_ids.iter().enumerate() {
             let Some(&(_, param_ty)) = sig.params.get(idx) else { continue };
             let pairs: Vec<(TyId, ExprId)> = match (sig.body.ty(param_ty), *self.body.expr(ExprId(arg))) {
@@ -604,7 +607,8 @@ impl Checker<'_, '_> {
                     || (!matches!(sig.body.ty(pt), AstTy::Ref { .. })
                         && ty_shares_name(&sig.body, sig_src, pt, &ret_lts.names));
                 if matched {
-                    let mut arg_sources = self.expr_borrow_sources(ae, state);
+                    let inner_only = !ret_lts.has_elided && matches!(sig.body.ty(pt), AstTy::Ref { lifetime: None, .. });
+                    let mut arg_sources = self.expr_borrow_sources_inner(ae, state, !inner_only);
                     if matches!(sig.body.ty(pt), AstTy::Ref { mutable: false, .. }) {
                         for s in &mut arg_sources {
                             s.mutable = false;

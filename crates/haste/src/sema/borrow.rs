@@ -9,7 +9,7 @@ mod propagate;
 use anyhow::{Result, bail};
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Pat, PatId, UnOp, jumps_to};
+use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, List, Pat, PatId, UnOp, jumps_to};
 use crate::names::ItemRef;
 use crate::outline::source::Source;
 
@@ -17,7 +17,7 @@ use super::Context;
 use super::infer::{Res, Typed};
 use super::ty::{Kind, Ty};
 
-use places::{PlaceStep, steps_conflict};
+use places::{FieldKey, PlaceStep, push_step, steps_conflict};
 use propagate::BorrowSource;
 
 const TEMP_HOLDER_BASE: u32 = u32::MAX - 65_536;
@@ -428,7 +428,11 @@ impl Checker<'_, '_> {
                     bail!("cannot borrow data in a `&` reference as mutable");
                 }
                 if !raw && let Some(p) = self.root_place(inner) {
-                    self.check_borrow(p.local, p.through_ref, p.mut_ref_root, &p.steps, mutable, state)?;
+                    if let Some(prefix_len) = p.raw_ptr_prefix {
+                        self.check_can_read(p.local, &p.steps[..prefix_len], state)?;
+                    } else {
+                        self.check_borrow(p.local, p.through_ref, p.mut_ref_root, &p.steps, mutable, state)?;
+                    }
                 }
                 self.check_expr(inner, state, true, outer_live, false, depth)?;
             }
@@ -521,17 +525,7 @@ impl Checker<'_, '_> {
                 self.check_arg_list(&ids, None, None, state, outer_live, depth)?;
             }
             Expr::Struct { fields, base, .. } => {
-                let val_ids: Vec<u32> = self
-                    .body
-                    .list(fields)
-                    .iter()
-                    .map(|&f| self.body.fields[f as usize].value.0)
-                    .collect();
-                self.check_arg_list(&val_ids, None, None, state, outer_live, depth)?;
-                if let Some(b) = base {
-                    let deref_base = matches!(*self.body.expr(b), Expr::Unary(UnOp::Deref, _));
-                    self.check_expr(b, state, deref_base, outer_live, true, depth)?;
-                }
+                self.check_struct_expr(expr, fields, base, state, outer_live, depth)?;
             }
             Expr::Range { from, to, .. } => {
                 if let Some(f) = from {
@@ -577,6 +571,133 @@ impl Checker<'_, '_> {
             Expr::Lit(..) | Expr::Macro { .. } | Expr::Underscore | Expr::FormatArgs(_) | Expr::OffsetOf { .. } => {}
         }
         Ok(())
+    }
+
+    fn check_struct_expr(
+        &mut self,
+        expr: ExprId,
+        fields: List,
+        base: Option<ExprId>,
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        let val_ids: Vec<u32> = self
+            .body
+            .list(fields)
+            .iter()
+            .map(|&f| self.body.fields[f as usize].value.0)
+            .collect();
+        self.check_arg_list(&val_ids, None, None, state, outer_live, depth)?;
+        if let Some(b) = base {
+            self.check_fru_base(expr, fields, b, state, outer_live, depth)?;
+        }
+        Ok(())
+    }
+
+    fn check_fru_base(
+        &mut self,
+        expr: ExprId,
+        fields: List,
+        b: ExprId,
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        let deref_base = matches!(*self.body.expr(b), Expr::Unary(UnOp::Deref, _));
+        let Some(p) = self.root_place(b) else {
+            return self.check_expr(b, state, deref_base, outer_live, true, depth);
+        };
+        let Some((adt_item, variant, args)) = self.struct_adt(expr) else {
+            return self.check_expr(b, state, deref_base, outer_live, true, depth);
+        };
+        let args_vec = self.cx.types.substs(args).to_vec();
+        let Ok(field_tys) = super::infer::detached(self.cx, self.item, |infer| infer.adt_fields(adt_item, &args_vec)) else {
+            return self.check_expr(b, state, deref_base, outer_live, true, depth);
+        };
+        let pending_fields: Vec<(FieldKey, Ty)> = {
+            let Ok(def) = self.cx.adt_def(adt_item) else {
+                return self.check_expr(b, state, deref_base, outer_live, true, depth);
+            };
+            let Some(var) = def.variants.get(variant) else {
+                return self.check_expr(b, state, deref_base, outer_live, true, depth);
+            };
+            let overridden: HashSet<&str> = self
+                .body
+                .list(fields)
+                .iter()
+                .map(|&id| self.src.text(self.body.fields[id as usize].name))
+                .collect();
+            let adt_src = &self.cx.file(adt_item).source;
+            var.fields
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, fdef)| {
+                    let (fname, key) = match fdef.name {
+                        Some(n) => {
+                            let s = adt_src.text(n);
+                            (s.to_owned(), FieldKey::Named(s.to_owned()))
+                        }
+                        None => (idx.to_string(), FieldKey::Tuple(idx as u32)),
+                    };
+                    if overridden.contains(fname.as_str()) {
+                        return None;
+                    }
+                    let fty = field_tys.get(variant).and_then(|fs| fs.get(idx)).copied().unwrap_or(Ty::NONE);
+                    Some((key, fty))
+                })
+                .collect()
+        };
+        self.check_place_subexprs(b, state, outer_live, depth)?;
+        let behind_ref = self.place_behind_ref(b, false);
+        for (key, fty) in pending_fields {
+            let mut steps = p.steps.clone();
+            push_step(&mut steps, PlaceStep::Field(key));
+            if self.ty_is_copy(fty) {
+                self.check_can_read(p.local, &steps, state)?;
+            } else {
+                if behind_ref {
+                    bail!("cannot move out of a shared or mutable reference");
+                }
+                self.check_can_move(p.local, &steps, state)?;
+                if !p.through_ref {
+                    let pm = PartialMove { local: p.local, steps };
+                    if !state.partial_moves.contains(&pm) {
+                        state.partial_moves.push(pm);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn struct_adt(&self, expr: ExprId) -> Option<(ItemRef, usize, super::substs::Substs)> {
+        match self.typed.res.get(&expr).copied() {
+            Some(Res::Ctor(item, v, args)) => Some((item, v as usize, args)),
+            _ => match *self.cx.types.kind(self.expr_ty(expr)) {
+                Kind::Adt(item, args) => Some((item, 0, args)),
+                _ => None,
+            },
+        }
+    }
+
+    fn check_place_subexprs(
+        &mut self,
+        expr: ExprId,
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Unary(_, inner) => {
+                self.check_place_subexprs(inner, state, outer_live, depth)
+            }
+            Expr::Index(base, idx) => {
+                self.check_place_subexprs(base, state, outer_live, depth)?;
+                self.check_expr(idx, state, false, outer_live, true, depth)
+            }
+            _ => Ok(()),
+        }
     }
 }
 

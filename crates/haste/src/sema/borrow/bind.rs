@@ -5,7 +5,7 @@ use rustc_hash::FxHashSet as HashSet;
 use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
-use crate::body::{Expr, ExprId, List, Pat, PatId};
+use crate::body::{BlockKind, Expr, ExprId, List, Pat, PatId};
 use crate::sema::infer::{By, Res};
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -53,6 +53,9 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         let (init_val, move_on_val, scope_depth) = options;
         let unwrapped_init = init.map(|e| self.unwrap_parens(e));
+        let (adjusted_place, adjusted_steps) = self.apply_pat_derefs(pat, unwrapped_init, scrut_place, pat_steps);
+        let scrut_place = adjusted_place.as_ref();
+        let pat_steps = adjusted_steps.as_slice();
         match *self.body.pat(pat) {
             Pat::Bind { sub, .. } => {
                 if let Some(&local) = self.typed.binds.get(&pat)
@@ -64,7 +67,8 @@ impl Checker<'_, '_> {
                     state.partial_moves.retain(|m| m.local != local);
                     clear_rebound_loans(local, state);
                     if init_val {
-                        self.bind_local_init(pat, local, unwrapped_init, scrut_place, pat_steps, fallback_sources, state, (move_on_val, sub.is_none()))?;
+                        let is_leaf = sub.is_none_or(|s| matches!(*self.body.pat(s), Pat::Rest));
+                        self.bind_local_init(pat, local, unwrapped_init, scrut_place, pat_steps, fallback_sources, state, (move_on_val, is_leaf))?;
                     }
                 }
                 if let Some(sub) = sub {
@@ -74,7 +78,7 @@ impl Checker<'_, '_> {
             Pat::Paren(inner) | Pat::Box(inner) => {
                 self.bind_pat(inner, unwrapped_init, scrut_place, pat_steps, fallback_sources, state, options)?;
             }
-            Pat::Ref { pat: inner, .. } => {
+            Pat::Ref { mutable, pat: inner } => {
                 let inner_init = unwrapped_init.and_then(|e| match *self.body.expr(e) {
                     Expr::Ref { expr: inner_e, .. } => Some(inner_e),
                     _ => None,
@@ -88,9 +92,25 @@ impl Checker<'_, '_> {
                 } else {
                     Vec::new()
                 };
+                let next_place = if let Some(inner_e) = inner_init {
+                    self.root_place(inner_e)
+                } else {
+                    scrut_place.cloned().map(|mut p| {
+                        if !mutable && !p.reborrows_shared_field {
+                            p.reborrows_shared_field = true;
+                            p.mut_ref_root = false;
+                        } else if mutable && !p.reborrows_shared_field {
+                            p.mut_ref_root = true;
+                        }
+                        p.through_ref = true;
+                        p
+                    })
+                };
                 let mut next_steps = pat_steps.to_vec();
-                push_step(&mut next_steps, PlaceStep::Deref);
-                self.bind_pat(inner, inner_init, scrut_place, &next_steps, &next_fallback, state, options)?;
+                if inner_init.is_none() {
+                    push_step(&mut next_steps, PlaceStep::Deref);
+                }
+                self.bind_pat(inner, inner_init, next_place.as_ref(), &next_steps, &next_fallback, state, options)?;
             }
             Pat::Tuple(list) => {
                 let pat_ids: Vec<u32> = self.body.list(list).to_vec();
@@ -118,10 +138,35 @@ impl Checker<'_, '_> {
             }
             Pat::Slice(list) => {
                 let pat_ids: Vec<u32> = self.body.list(list).to_vec();
+                let rest_pos = pat_ids.iter().position(|&id| self.is_rest_pat(PatId(id)));
+                let min_len = (pat_ids.len() - usize::from(rest_pos.is_some())) as u64;
+                let array_len = self.typed.pats.get(&pat).and_then(|&ty| match *self.cx.types.kind(ty) {
+                    Kind::Array(_, len) => self.cx.types.len(len),
+                    _ => None,
+                });
                 let next_fallback = self.fallback_or_empty(true, unwrapped_init, fallback_sources, state);
-                let mut next_steps = pat_steps.to_vec();
-                push_step(&mut next_steps, PlaceStep::Opaque);
-                for id in pat_ids {
+                for (idx, &id) in pat_ids.iter().enumerate() {
+                    let step = match rest_pos {
+                        Some(r) if idx == r => PlaceStep::SliceSub {
+                            from: r as u64,
+                            to: (pat_ids.len() - r - 1) as u64,
+                            array_len,
+                        },
+                        Some(r) if idx > r => PlaceStep::SliceElem {
+                            offset: (pat_ids.len() - idx) as u64,
+                            min_len,
+                            from_end: true,
+                            array_len,
+                        },
+                        _ => PlaceStep::SliceElem {
+                            offset: idx as u64,
+                            min_len,
+                            from_end: false,
+                            array_len,
+                        },
+                    };
+                    let mut next_steps = pat_steps.to_vec();
+                    push_step(&mut next_steps, step);
                     self.bind_pat(PatId(id), None, scrut_place, &next_steps, &next_fallback, state, options)?;
                 }
             }
@@ -166,6 +211,59 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
+    fn apply_pat_derefs(
+        &self,
+        pat: PatId,
+        unwrapped_init: Option<ExprId>,
+        scrut_place: Option<&Place>,
+        pat_steps: &[PlaceStep],
+    ) -> (Option<Place>, Vec<PlaceStep>) {
+        let derefs = self.typed.pat_derefs(pat);
+        let mut adjusted_place = scrut_place.cloned();
+        let mut adjusted_steps = pat_steps.to_vec();
+        if derefs == 0 {
+            return (adjusted_place, adjusted_steps);
+        }
+        if let Some(ref mut place) = adjusted_place {
+            if let Some(e) = unwrapped_init {
+                if self.place_behind_shared_ref(e) {
+                    place.reborrows_shared_field = true;
+                    place.mut_ref_root = false;
+                }
+                let mut cur = self.expr_ty(e);
+                for _ in 0..derefs {
+                    if cur != Ty::NONE && matches!(self.cx.types.kind(cur), Kind::Ref(Mut::Not, _)) {
+                        place.reborrows_shared_field = true;
+                        place.mut_ref_root = false;
+                    } else if cur != Ty::NONE && matches!(self.cx.types.kind(cur), Kind::Ref(Mut::Mut, _)) {
+                        if !place.reborrows_shared_field {
+                            place.mut_ref_root = true;
+                        }
+                    }
+                    cur = match *self.cx.types.kind(cur) {
+                        Kind::Ref(_, inner) => inner,
+                        _ => Ty::NONE,
+                    };
+                }
+            } else if !place.reborrows_shared_field {
+                place.mut_ref_root = true;
+            }
+            place.through_ref = true;
+        }
+        for _ in 0..derefs {
+            push_step(&mut adjusted_steps, PlaceStep::Deref);
+        }
+        (adjusted_place, adjusted_steps)
+    }
+
+    fn is_rest_pat(&self, pat: PatId) -> bool {
+        match *self.body.pat(pat) {
+            Pat::Rest => true,
+            Pat::Bind { sub: Some(sub), .. } => matches!(*self.body.pat(sub), Pat::Rest),
+            _ => false,
+        }
+    }
+
     fn fallback_or_empty(
         &mut self,
         needed: bool,
@@ -194,37 +292,36 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         if let Some(&ref_mut) = self.typed.ref_binds.get(&pat) {
             let is_mut = ref_mut == Mut::Mut;
-            let mut sources = match unwrapped_init {
-                Some(e) => self.expr_borrow_sources(e, state),
-                None => fallback_sources.to_vec(),
-            };
-            if sources.is_empty()
-                && let Some(place) = scrut_place
-            {
-                let mut full_steps = place.steps.clone();
+            let sources = if let Some(place) = scrut_place {
+                let mut full_place = place.clone();
                 for s in pat_steps {
-                    push_step(&mut full_steps, s.clone());
+                    push_step(&mut full_place.steps, s.clone());
                 }
-                self.check_borrow(
-                    place.local,
-                    place.through_ref,
-                    place.mut_ref_root,
-                    &full_steps,
-                    is_mut,
-                    state,
-                )?;
-                sources.push(BorrowSource {
-                    target: place.local,
-                    steps: full_steps,
-                    mutable: is_mut,
-                    through_ref: place.through_ref,
-                    env_only: false,
-                });
-            } else if is_mut {
-                for s in &mut sources {
-                    s.mutable = true;
+                if let Some(prefix_len) = full_place.raw_ptr_prefix {
+                    self.check_can_read(full_place.local, &full_place.steps[..prefix_len], state)?;
+                } else {
+                    self.check_borrow(
+                        full_place.local,
+                        full_place.through_ref,
+                        full_place.mut_ref_root,
+                        &full_place.steps,
+                        is_mut,
+                        state,
+                    )?;
                 }
-            }
+                self.place_to_sources(&full_place, is_mut, state)
+            } else {
+                let mut sources = match unwrapped_init {
+                    Some(e) => self.expr_borrow_sources(e, state),
+                    None => fallback_sources.to_vec(),
+                };
+                if is_mut {
+                    for s in &mut sources {
+                        s.mutable = true;
+                    }
+                }
+                sources
+            };
             self.push_sources_for_local(local, &sources, state);
             return Ok(());
         }
@@ -460,30 +557,33 @@ impl Checker<'_, '_> {
                 if derefs > 0 {
                     self.apply_deref_steps(expr, self.expr_ty(receiver), derefs, &mut p);
                 }
-                if mutability == Mut::Mut {
-                    self.check_can_read_inner(p.local, &p.steps, state, true)?;
-                    deferred_recv = Some((p.local, p.through_ref, p.mut_ref_root || self.is_mut_ref_ty(self.expr_ty(receiver)), p.steps.clone()));
-                } else {
-                    self.check_borrow(p.local, p.through_ref, p.mut_ref_root, &p.steps, false, state)?;
-                }
-                if !(deferred_recv.is_some() && self.expr_plain_local(receiver).is_some()) {
+                if let Some(prefix_len) = p.raw_ptr_prefix {
+                    self.check_can_read(p.local, &p.steps[..prefix_len], state)?;
                     self.check_expr(receiver, state, true, outer_live, false, depth)?;
-                }
-                if mutability == Mut::Mut && (!p.through_ref || self.is_mut_ref_ty(self.local_ty(p.local))) {
-                    state.loans.push(Loan {
-                        target: p.local,
-                        steps: p.steps,
-                        holder: Some(temp_id),
-                        mutable: true,
-                        through_ref: p.through_ref,
-                        two_phase: true,
-                        env_only: false,
-                    });
+                } else {
+                    if mutability == Mut::Mut {
+                        self.check_can_read_inner(p.local, &p.steps, state, true)?;
+                        deferred_recv = Some((p.local, p.through_ref, p.mut_ref_root || self.is_mut_ref_ty(self.expr_ty(receiver)), p.steps.clone()));
+                    } else {
+                        self.check_borrow(p.local, p.through_ref, p.mut_ref_root, &p.steps, false, state)?;
+                    }
+                    if !(deferred_recv.is_some() && self.expr_plain_local(receiver).is_some()) {
+                        self.check_expr(receiver, state, true, outer_live, false, depth)?;
+                    }
+                    if mutability == Mut::Mut && (!p.through_ref || self.is_mut_ref_ty(self.local_ty(p.local))) {
+                        state.loans.push(Loan {
+                            target: p.local,
+                            steps: p.steps,
+                            holder: Some(temp_id),
+                            mutable: true,
+                            through_ref: p.through_ref,
+                            two_phase: true,
+                            env_only: false,
+                        });
+                    }
                 }
             } else {
-                if !(deferred_recv.is_some() && self.expr_plain_local(receiver).is_some()) {
-                    self.check_expr(receiver, state, true, outer_live, false, depth)?;
-                }
+                self.check_expr(receiver, state, true, outer_live, false, depth)?;
             }
         } else {
             self.check_expr(receiver, state, false, outer_live, true, depth)?;
@@ -637,7 +737,13 @@ impl Checker<'_, '_> {
         self.returns_borrow = self.ty_holds_borrow(closure.ret);
         self.return_min_depth = closure_depth;
         let empty = HashSet::default();
-        self.check_expr(body, &mut body_state, false, &empty, true, closure_depth)?;
+        if let Expr::Block { kind, stmts, tail, label } = *self.body.expr(body)
+            && matches!(kind, BlockKind::Async | BlockKind::AsyncMove)
+        {
+            self.check_block(kind, stmts, tail, label, &mut body_state, (false, true), &empty, depth)?;
+        } else {
+            self.check_expr(body, &mut body_state, false, &empty, true, closure_depth)?;
+        }
         if self.returns_borrow && !body_state.diverged {
             self.check_return_escape(body, &body_state)?;
         }
