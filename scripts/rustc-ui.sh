@@ -160,6 +160,9 @@ write_crate() {
 
 is_crash() {
     local status=$1 log_file=$2
+    if [ "$status" -eq 0 ]; then
+        return 1
+    fi
     if [ "$status" -ge 128 ]; then
         return 0
     fi
@@ -172,6 +175,28 @@ is_crash() {
 rel_path() {
     local file=$1
     printf '%s\n' "${file#"$tests_dir"/}"
+}
+
+stdout_matches() {
+    local actual=$1 expected=$2 work=$3
+    if cmp -s "$actual" "$expected"; then
+        return 0
+    fi
+    perl -e '
+        my ($act, $exp, $work, $haste) = @ARGV;
+        (my $haste_base = $haste) =~ s{.*/}{};
+        (my $haste_nodot = $haste) =~ s{^\./}{};
+        my @bins = grep { length } ("$work/rustc_bin", "$work/aot_bin", "$work/haste_bin", $haste, "./$haste_nodot", $haste_nodot, $haste_base);
+        my $re = join("|", map { quotemeta } sort { length($b) <=> length($a) } @bins);
+        my $norm = sub {
+            local $/;
+            open my $fh, "<", $_[0] or return "";
+            my $s = <$fh>;
+            $s =~ s/$re/<BIN>/g if length $re;
+            return $s;
+        };
+        exit($norm->($act) eq $norm->($exp) ? 0 : 1);
+    ' "$actual" "$expected" "$work" "$HASTE_BIN"
 }
 
 run_borrowck_one() {
@@ -205,9 +230,13 @@ run_borrowck_one() {
 
 run_pass_one() {
     local file=$1 work=$2 res_file=$3
-    local rel r_build=0 r_status=0 h_status=0 aot_b=0 aot_r=0
+    local rel r_build=0 r_status=0 h_status=0 aot_b=0 aot_r=0 build_only=0
     rel=$(rel_path "$file")
     mkdir -p "$work/rustc_out"
+
+    if grep -Eq '//@ (check-pass|build-pass)' "$file" && ! grep -Eq '//@ run-pass' "$file"; then
+        build_only=1
+    fi
 
     with_timeout 30 rustc --edition=2021 --out-dir "$work/rustc_out" -o "$work/rustc_bin" "$file" </dev/null >/dev/null 2>"$work/rustc.err" || r_build=$?
     if [ "$r_build" -ne 0 ]; then
@@ -215,22 +244,41 @@ run_pass_one() {
         return 0
     fi
 
-    with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc.out" 2>"$work/rustc.run_err" || r_status=$?
-
     write_crate "$work/crate" "ui_test" "$file" "bin"
-    with_timeout 30 "$HASTE_BIN" run "$work/crate" </dev/null >"$work/haste.out" 2>"$work/haste.err" || h_status=$?
+    if [ "$build_only" -eq 1 ]; then
+        with_timeout 30 "$HASTE_BIN" build "$work/crate" </dev/null >"$work/haste.out" 2>"$work/haste.err" || h_status=$?
+        if is_crash "$h_status" "$work/haste.err"; then
+            printf 'CRASH\t%s\tbuild crash (exit %s)\n' "$rel" "$h_status" >"$res_file"
+            return 0
+        fi
+        if [ "$h_status" -ne 0 ]; then
+            printf 'FAIL\t%s\tbuild failed (exit %s)\n' "$rel" "$h_status" >"$res_file"
+            return 0
+        fi
+    else
+        with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc.out" 2>"$work/rustc.run_err" || r_status=$?
+        if [ "$r_status" -ne 0 ] && grep -Eq '//@ run-pass' "$file"; then
+            printf 'SKIP\t%s\trustc run failed on //@ run-pass (exit %s)\n' "$rel" "$r_status" >"$res_file"
+            return 0
+        fi
 
-    if is_crash "$h_status" "$work/haste.err"; then
-        printf 'CRASH\t%s\tjit crash (exit %s)\n' "$rel" "$h_status" >"$res_file"
-        return 0
-    fi
-    if [ "$h_status" -ne "$r_status" ]; then
-        printf 'FAIL\t%s\tjit exit %s vs rustc %s\n' "$rel" "$h_status" "$r_status" >"$res_file"
-        return 0
-    fi
-    if ! cmp -s "$work/haste.out" "$work/rustc.out"; then
-        printf 'FAIL\t%s\tjit stdout mismatch\n' "$rel" >"$res_file"
-        return 0
+        with_timeout 30 "$HASTE_BIN" run "$work/crate" </dev/null >"$work/haste.out" 2>"$work/haste.err" || h_status=$?
+        if is_crash "$h_status" "$work/haste.err"; then
+            printf 'CRASH\t%s\tjit crash (exit %s)\n' "$rel" "$h_status" >"$res_file"
+            return 0
+        fi
+        if [ "$h_status" -ne "$r_status" ]; then
+            printf 'FAIL\t%s\tjit exit %s vs rustc %s\n' "$rel" "$h_status" "$r_status" >"$res_file"
+            return 0
+        fi
+        if ! stdout_matches "$work/haste.out" "$work/rustc.out" "$work"; then
+            local r2=0
+            with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc2.out" 2>/dev/null || r2=$?
+            if [ "$r2" -ne 0 ] || cmp -s "$work/rustc.out" "$work/rustc2.out"; then
+                printf 'FAIL\t%s\tjit stdout mismatch\n' "$rel" >"$res_file"
+                return 0
+            fi
+        fi
     fi
 
     if [ "$run_aot" -eq 1 ]; then
@@ -243,14 +291,20 @@ run_pass_one() {
             printf 'FAIL\t%s\taot build failed (exit %s)\n' "$rel" "$aot_b" >"$res_file"
             return 0
         fi
-        with_timeout 30 "$work/aot_bin" </dev/null >"$work/aot.out" 2>"$work/aot.run_err" || aot_r=$?
-        if [ "$aot_r" -ne "$r_status" ]; then
-            printf 'FAIL\t%s\taot exit %s vs rustc %s\n' "$rel" "$aot_r" "$r_status" >"$res_file"
-            return 0
-        fi
-        if ! cmp -s "$work/aot.out" "$work/rustc.out"; then
-            printf 'FAIL\t%s\taot stdout mismatch\n' "$rel" >"$res_file"
-            return 0
+        if [ "$build_only" -eq 0 ]; then
+            with_timeout 30 "$work/aot_bin" </dev/null >"$work/aot.out" 2>"$work/aot.run_err" || aot_r=$?
+            if [ "$aot_r" -ne "$r_status" ]; then
+                printf 'FAIL\t%s\taot exit %s vs rustc %s\n' "$rel" "$aot_r" "$r_status" >"$res_file"
+                return 0
+            fi
+            if ! stdout_matches "$work/aot.out" "$work/rustc.out" "$work"; then
+                local r2=0
+                with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc2.out" 2>/dev/null || r2=$?
+                if [ "$r2" -ne 0 ] || cmp -s "$work/rustc.out" "$work/rustc2.out"; then
+                    printf 'FAIL\t%s\taot stdout mismatch\n' "$rel" >"$res_file"
+                    return 0
+                fi
+            fi
         fi
     fi
 

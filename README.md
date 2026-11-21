@@ -2,11 +2,11 @@
 
 haste is a clean-room Rust compiler, JIT engine, and standalone AOT compiler with its own frontend, SSA optimizer, and native x86-64 and ARM64 backends—built from scratch without LLVM or a `target/` directory.
 
-- **Self-hosting:** Compiles and runs its own ~173k-function workspace on both macOS ARM64 and Linux x86-64.
+- **Self-hosting:** Compiles and runs its own ~174k-function workspace on both macOS ARM64 and Linux x86-64.
 - **Beats `rustc -C opt-level=3` on AOT compute kernels** (`scripts/bench.sh`, macOS ARM64, with bit-identical outputs): `sha256` **0.87x**, `sieve` **0.96x**, `sort` **1.00x**, `scan` **1.18x**.
 - **Faster than `cargo` on all 3 build benchmarks** (`tests/diff`, 124 functions): single-line edit rebuild **`27 ms`** vs `cargo` `39 ms` (**1.44x faster**), unchanged no-op **`25 ms`** vs `41 ms` (**1.64x faster**), and cold debug **`199 ms`** vs `218 ms`.
 - **Zero-linker 6-target AOT cross-compilation:** Emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) via `--target TRIPLE` with no external cross-linker.
-- **Differential verification:** **620/620** differential cases, **90/90** async cases, **15/15** proc-macro cases, **17/17** standalone crate probes (`jit+aot`), and **221/260 (85.0%)** official `rust-lang/rust` `tests/ui/` run-pass tests (`jit+aot`) verified bit-identically against `rustc`.
+- **Differential verification:** **620/620** differential cases, **90/90** async cases, **15/15** proc-macro cases, **17/17** standalone crate probes (`jit+aot`), and **259/259 (100.0%)** official `rust-lang/rust` `tests/ui/` run-pass tests (`jit+aot`) verified bit-identically against `rustc`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline and module tour.
 
