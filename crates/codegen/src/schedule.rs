@@ -5,7 +5,7 @@ mod sink;
 
 use std::time::Instant;
 
-use crate::ir::{Binary, Block, Domain, Function, Inst, Op, Type};
+use crate::ir::{Binary, Block, Domain, Function, Inst, IntCC, Op, Type, Value};
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -414,6 +414,54 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
     }
 }
 
+fn invert_unlikely_branches(func: &mut Function) {
+    let cfg = func.cfg().clone();
+    let loops = cfg.loops();
+    if loops.list.is_empty() {
+        return;
+    }
+    let cold = crate::live::cold(func);
+    let mut is_latch = vec![false; func.blocks.len()];
+    loops.list.iter().flat_map(|each| &each.latches).for_each(|l| is_latch[l.index()] = true);
+    let uses = func.use_counts();
+    let defs = crate::fold::defs(func);
+    let const_val = |func: &Function, v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
+    let mut changed = false;
+    for b in 0..func.blocks.len() {
+        let block = Block(b as u32);
+        let depth = loops.depth_of(block);
+        if depth == 0 {
+            continue;
+        }
+        let Some(&term) = func.blocks[b].insts.last() else { continue };
+        let Op::Brif(cond, then_b, _, else_b, _) = func.insts[term.index()].op else { continue };
+        if then_b == else_b
+            || cold[then_b.index()]
+            || cold[else_b.index()]
+            || is_latch[then_b.index()] != is_latch[else_b.index()]
+            || loops.depth_of(then_b) != loops.depth_of(else_b)
+            || loops.depth_of(then_b) < depth
+            || uses[cond.index()] != 1
+        {
+            continue;
+        }
+        let Some(cmp_inst) = defs[cond.index()] else { continue };
+        let Op::Icmp(IntCC::Equal, x, y) = func.insts[cmp_inst.index()].op else { continue };
+        if !matches!((const_val(func, x), const_val(func, y)), (Some(k), None) | (None, Some(k)) if k != 0 && k != 1) {
+            continue;
+        }
+        func.insts[cmp_inst.index()].op = Op::Icmp(IntCC::NotEqual, x, y);
+        if let Op::Brif(_, ref mut t, ref mut ta, ref mut e, ref mut ea) = func.insts[term.index()].op {
+            std::mem::swap(t, e);
+            std::mem::swap(ta, ea);
+        }
+        changed = true;
+    }
+    if changed {
+        func.bump_cfg();
+    }
+}
+
 fn run_backend_prep(func: &mut Function, plan: &Plan) {
     if plan.moves != promote::Moves::Guided {
         if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
@@ -426,6 +474,9 @@ fn run_backend_prep(func: &mut Function, plan: &Plan) {
         branches::split_conditions(func);
     }
     sink_compares(func);
+    if plan.effort == Effort::Full {
+        invert_unlikely_branches(func);
+    }
     if x64_full {
         products::adjoin(func);
         copies::pair(func);

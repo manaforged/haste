@@ -256,19 +256,28 @@ fn latch_guards(func: &Function, cfg: &Cfg, ranges: &Ranges, env: &Env, each: &L
     let mut extra = ExtraPath::default();
     let mut prev: Option<Block> = None;
     for blk in std::iter::once(each.head).chain(chain.into_iter().rev()) {
-        if let Some(p) = prev && cfg.single_pred(blk) == Some(p) && !func.blocks[blk.index()].params.is_empty() {
-            let edge_args = match func.last(p) {
-                Some(Op::Jump(t, a)) if *t == blk => Some(a.as_slice()),
-                Some(Op::Brif(_, t, ta, f, fa)) if *t != *f && ((*t == blk) ^ (*f == blk)) => Some(if *t == blk { ta.as_slice() } else { fa.as_slice() }),
-                _ => None,
-            };
-            if let Some(args) = edge_args {
-                for (&param, &arg) in func.blocks[blk.index()].params.iter().zip(args) {
-                    if func.ty(param).is_small_int() && param != arg { path.push_rel_kind(RelKind::Eq, param, arg, func.ty(param)); }
+        if let Some(p) = prev {
+            if cfg.single_pred(blk) == Some(p) && !func.blocks[blk.index()].params.is_empty() {
+                let edge_args = match func.last(p) {
+                    Some(Op::Jump(t, a)) if *t == blk => Some(a.as_slice()),
+                    Some(Op::Brif(_, t, ta, f, fa)) if *t != *f && ((*t == blk) ^ (*f == blk)) => Some(if *t == blk { ta.as_slice() } else { fa.as_slice() }),
+                    _ => None,
+                };
+                if let Some(args) = edge_args {
+                    for (&param, &arg) in func.blocks[blk.index()].params.iter().zip(args) {
+                        if func.ty(param).is_small_int() && param != arg { path.push_rel_kind(RelKind::Eq, param, arg, func.ty(param)); }
+                    }
                 }
+            } else if blk != each.head && !func.blocks[blk.index()].params.is_empty() {
+                assume_inner_loop_rels(func, cfg, ranges, &mut path, each, (p, blk));
             }
         }
         prev = Some(blk);
+        for inv in &env.rel_invs {
+            if inv.head == blk {
+                path.push_rel_kind(inv.kind, inv.param, inv.bound, inv.ty);
+            }
+        }
         for &inst in &func.blocks[blk.index()].insts {
             if let Op::Trapz(cond) | Op::Assume(cond) = func.insts[inst.index()].op {
                 path.assume(func, ranges, cond, true);
@@ -291,6 +300,50 @@ fn latch_guards(func: &Function, cfg: &Cfg, ranges: &Ranges, env: &Env, each: &L
     (path, extra)
 }
 
+fn assume_inner_loop_rels(func: &Function, cfg: &Cfg, ranges: &Ranges, path: &mut Path, each: &Loop, (prev, blk): (Block, Block)) {
+    let Some(inner) = cfg.loops().list.iter().find(|other| other.head == blk && each.body[blk.index()]) else { return };
+    let outside: Vec<Block> = cfg.preds_of(blk).iter().copied().filter(|&p| cfg.reachable[p.index()] && !inner.body[p.index()]).collect();
+    if outside != [prev] { return; }
+    let (init_args, edge_cond) = match func.last(prev) {
+        Some(Op::Jump(t, a)) if *t == blk => (a.as_slice(), None),
+        Some(Op::Brif(c, t, ta, e, ea)) if *t != *e && ((*t == blk) ^ (*e == blk)) => (if *t == blk { ta.as_slice() } else { ea.as_slice() }, Some((*c, *t == blk))),
+        _ => return,
+    };
+    let mut entry = path.clone();
+    if let Some((cond, taken)) = edge_cond { entry.assume(func, ranges, cond, taken); }
+    let mut latches = Vec::new();
+    for &p in cfg.preds_of(blk) {
+        if cfg.reachable[p.index()] && inner.body[p.index()] {
+            let Some(item) = (match func.last(p) {
+                Some(Op::Brif(c, t, ta, e, ea)) if *t != *e && ((*t == blk) ^ (*e == blk)) => Some((*c, *t == blk, if *t == blk { ta.as_slice() } else { ea.as_slice() })),
+                _ => None,
+            }) else { return };
+            latches.push(item);
+        }
+    }
+    if latches.is_empty() { return; }
+    let params = &func.blocks[blk.index()].params;
+    let rels: Vec<_> = entry.rels().to_vec();
+    for (k, &q) in params.iter().enumerate() {
+        let ty = func.ty(q);
+        let Some(&init_q) = init_args.get(k).filter(|_| ty.is_small_int()) else { continue };
+        for r in &rels {
+            let bound = r.rhs;
+            if r.ty != ty || !matches!(r.kind, RelKind::Ult | RelKind::Ule) || bound == q || params.contains(&bound) { continue; }
+            if entry.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, init_q, bound) == Some(true)
+                && latches.iter().all(|&(c, taken, args)| args.get(k).is_some_and(|&a| {
+                    let mut lp = entry.clone();
+                    lp.assume(func, ranges, c, taken);
+                    lp.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, a, bound) == Some(true)
+                        || cond_proves_rel(func, ranges, c, taken, IntCC::UnsignedLessThan, a, bound, 0)
+                }))
+            {
+                path.push_rel_kind(RelKind::Ult, q, bound, ty);
+            }
+        }
+    }
+}
+
 fn cond_proves_rel(func: &Function, ranges: &Ranges, cond: Value, taken: bool, cc: IntCC, lhs: Value, rhs: Value, depth: u8) -> bool {
     if depth > 4 { return false; }
     match ranges.op(func, cond) {
@@ -310,16 +363,19 @@ fn cond_proves_rel(func: &Function, ranges: &Ranges, cond: Value, taken: bool, c
     }
 }
 
-fn jump_latch_proves(func: &Function, cfg: &Cfg, ranges: &Ranges, each: &Loop, (latch, arg, cc, bound): (Block, Value, IntCC, Value)) -> bool {
-    if !matches!(func.last(latch), Some(Op::Jump(t, _)) if *t == each.head) { return false; }
+fn jump_latch_proves(func: &Function, cfg: &Cfg, ranges: &Ranges, each: &Loop, (latch, arg, cc, bound, depth): (Block, Value, IntCC, Value, u8)) -> bool {
+    if depth > 3 || !matches!(func.last(latch), Some(Op::Jump(t, _)) if depth > 0 || *t == each.head) { return false; }
     let Some(p_idx) = func.blocks[latch.index()].params.iter().position(|&v| v == arg) else { return false };
     let preds = cfg.preds_of(latch);
     !preds.is_empty() && preds.iter().all(|&p| {
-        each.body.get(p.index()).copied().unwrap_or(false)
-            && matches!(func.last(p), Some(&Op::Brif(cond, t, ref ta, f, ref fa)) if t != f && ((t == latch) ^ (f == latch)) && {
+        each.body.get(p.index()).copied().unwrap_or(false) && match func.last(p) {
+            Some(&Op::Brif(cond, t, ref ta, f, ref fa)) if t != f && ((t == latch) ^ (f == latch)) => {
                 let (taken, a) = if t == latch { (true, ta.get(p_idx).copied()) } else { (false, fa.get(p_idx).copied()) };
                 a.is_some_and(|v| cond_proves_rel(func, ranges, cond, taken, cc, v, bound, 0))
-            })
+            }
+            Some(Op::Jump(t, ja)) if *t == latch => ja.get(p_idx).is_some_and(|&v| jump_latch_proves(func, cfg, ranges, each, (p, v, cc, bound, depth + 1))),
+            _ => false,
+        }
     })
 }
 
@@ -403,6 +459,14 @@ impl Env {
                 push_inv(y, &mut rel_bounds);
             }
         }
+        for &inst in &func.blocks[each.head.index()].insts {
+            if let Op::Trapz(cond) | Op::Assume(cond) = func.insts[inst.index()].op
+                && let Some(&Op::Icmp(_, x, y)) = ranges.op(func, cond)
+            {
+                push_inv(x, &mut rel_bounds);
+                push_inv(y, &mut rel_bounds);
+            }
+        }
         for path in inside.iter().map(|(_, gp, _, _)| gp).chain(outside.iter().map(|(p, _)| p)) {
             for r in path.rels().iter().rev() { push_inv(r.lhs, &mut rel_bounds); push_inv(r.rhs, &mut rel_bounds); }
         }
@@ -454,7 +518,7 @@ impl Env {
                     if base_ok && inside.iter().all(|&(latch, ref gp, _, args)| {
                         let check_bnd = |b| gp.decide_rel(func, ranges, cc, ty, args[k], b) == Some(true)
                             || super::decide(cc, ty, &gp.fact(ranges, args[k]), &gp.fact(ranges, b)) == Some(true)
-                            || jump_latch_proves(func, cfg, ranges, each, (latch, args[k], cc, b));
+                            || jump_latch_proves(func, cfg, ranges, each, (latch, args[k], cc, b, 0));
                         check_bnd(bound) || in_alt.is_some_and(check_bnd) || {
                             arms.clear();
                             expand_arms(func, ranges, args[k], bound, 0, &mut arms);
@@ -505,17 +569,13 @@ impl Env {
 
 impl ExtraPath {
     pub(super) fn follow(&mut self, func: &Function, ctx: (&Cfg, &Ranges, &Env, &Path), from: Block, into: Block) {
-        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(from)
-            && then != otherwise
-        {
+        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(from) && then != otherwise {
             self.assume(func, (ctx.0, ctx.1, ctx.2, ctx.3, into), cond, then == into, 0);
         }
     }
 
     pub(super) fn assume(&mut self, func: &Function, (cfg, ranges, env, path, block): (&Cfg, &Ranges, &Env, &Path, Block), cond: Value, taken: bool, depth: u8) {
-        if depth > 4 {
-            return;
-        }
+        if depth > 4 { return; }
         match ranges.op(func, cond) {
             Some(&Op::Binary(Binary::Band, a, b)) if taken => {
                 self.assume(func, (cfg, ranges, env, path, block), a, true, depth + 1);
@@ -527,19 +587,13 @@ impl ExtraPath {
             }
             Some(&Op::Icmp(cc, a, b)) if func.ty(a).is_small_int() => {
                 let eff = if taken { cc } else { cc.inverse() };
-                if eff.is_signed() {
-                    return;
-                }
+                if eff.is_signed() { return; }
                 let (kind, x, y) = rel_of(eff, a, b);
                 let ty = func.ty(a);
                 let record = |this: &mut Self, diff: Value, min_diff: u64| {
-                    if min_diff == 0 {
-                        return;
-                    }
+                    if min_diff == 0 { return; }
                     if let Some(&Op::Binary(Binary::Isub, end, cur)) = ranges.op(func, diff) {
-                        if !this.diffs.iter().any(|&(e, c, m)| e == end && c == cur && m >= min_diff) {
-                            this.diffs.push((end, cur, min_diff));
-                        }
+                        if !this.diffs.iter().any(|&(e, c, m)| e == end && c == cur && m >= min_diff) { this.diffs.push((end, cur, min_diff)); }
                         if this.proves_ule(func, (cfg, ranges, env, path, block), ty, cur, end, 0)
                             && !this.subs.iter().any(|sb| sb.idx == cur && sb.end == end && sb.min_diff >= min_diff)
                         {
@@ -548,25 +602,12 @@ impl ExtraPath {
                     }
                 };
                 match kind {
-                    RelKind::Ule => {
-                        let lo = path.fact(ranges, x).lo;
-                        record(self, y, lo);
-                    }
-                    RelKind::Ult => {
-                        if let Some(lo) = path.fact(ranges, x).lo.checked_add(1) {
-                            record(self, y, lo);
-                        }
-                    }
-                    RelKind::Eq => {
-                        record(self, x, path.fact(ranges, y).lo);
-                        record(self, y, path.fact(ranges, x).lo);
-                    }
+                    RelKind::Ule => record(self, y, path.fact(ranges, x).lo),
+                    RelKind::Ult => if let Some(lo) = path.fact(ranges, x).lo.checked_add(1) { record(self, y, lo); }
+                    RelKind::Eq => { record(self, x, path.fact(ranges, y).lo); record(self, y, path.fact(ranges, x).lo); }
                     RelKind::Ne => {
-                        if path.fact(ranges, y).exact() == Some(0) {
-                            record(self, x, 1);
-                        } else if path.fact(ranges, x).exact() == Some(0) {
-                            record(self, y, 1);
-                        }
+                        if path.fact(ranges, y).exact() == Some(0) { record(self, x, 1); }
+                        else if path.fact(ranges, x).exact() == Some(0) { record(self, y, 1); }
                     }
                     _ => {}
                 }
@@ -576,12 +617,8 @@ impl ExtraPath {
     }
 
     fn proves_ule(&self, func: &Function, (cfg, ranges, env, path, block): (&Cfg, &Ranges, &Env, &Path, Block), ty: Type, a: Value, b: Value, depth: u8) -> bool {
-        if edge_ule(func, ranges, path, ty, a, b) {
-            return true;
-        }
-        if depth > 2 {
-            return false;
-        }
+        if edge_ule(func, ranges, path, ty, a, b) { return true; }
+        if depth > 2 { return false; }
         self.proves_ult(func, (cfg, ranges, env, path, block), ty, a, b, depth + 1)
             || env.sums.iter().any(|s| s.ty == ty && (a == s.p || a == s.q) && cfg.dominates(s.head, block) && edge_ule(func, ranges, path, ty, s.bound, b))
             || env.orders.iter().any(|o| {
@@ -595,68 +632,39 @@ impl ExtraPath {
     }
 
     fn proves_ult(&self, func: &Function, (cfg, ranges, env, path, block): (&Cfg, &Ranges, &Env, &Path, Block), ty: Type, a: Value, b: Value, depth: u8) -> bool {
-        if path.fact(ranges, a).hi < path.fact(ranges, b).lo
-            || path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, a, b) == Some(true)
-        {
-            return true;
-        }
-        if depth > 2 {
-            return false;
-        }
+        if path.fact(ranges, a).hi < path.fact(ranges, b).lo || path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, a, b) == Some(true) { return true; }
+        if depth > 2 { return false; }
         for r in &env.rel_invs {
-            if r.ty == ty
-                && a == r.param
-                && cfg.dominates(r.head, block)
-                && if r.kind == RelKind::Ult {
-                    self.proves_ule(func, (cfg, ranges, env, path, block), ty, r.bound, b, depth + 1)
-                } else {
-                    self.proves_ult(func, (cfg, ranges, env, path, block), ty, r.bound, b, depth + 1)
-                }
-            {
+            if r.ty == ty && a == r.param && cfg.dominates(r.head, block) && if r.kind == RelKind::Ult {
+                self.proves_ule(func, (cfg, ranges, env, path, block), ty, r.bound, b, depth + 1)
+            } else {
+                self.proves_ult(func, (cfg, ranges, env, path, block), ty, r.bound, b, depth + 1)
+            } {
                 return true;
             }
         }
         for s in &env.sums {
-            if s.ty != ty || !cfg.dominates(s.head, block) || !self.proves_ule(func, (cfg, ranges, env, path, block), ty, s.bound, b, depth + 1) {
-                continue;
-            }
+            if s.ty != ty || !cfg.dominates(s.head, block) || !self.proves_ule(func, (cfg, ranges, env, path, block), ty, s.bound, b, depth + 1) { continue; }
             for (p, other) in [(s.p, s.q), (s.q, s.p)] {
                 let other_lo = edge_min_lo(ranges, env, cfg, path, block, other);
-                if a == p && other_lo >= 1 {
+                if a == p && other_lo >= 1 { return true; }
+                if let Some((delta, 0)) = add_delta_of(func, ranges, a, p)
+                    && (path.fact(ranges, delta).hi < other_lo || path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, delta, other) == Some(true) || (other_lo >= 1 && is_nonzero_ushr_of(func, ranges, ty, delta, other)))
+                {
                     return true;
-                }
-                if let Some((delta, 0)) = add_delta_of(func, ranges, a, p) {
-                    let lt_other = path.fact(ranges, delta).hi < other_lo
-                        || path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, delta, other) == Some(true)
-                        || (other_lo >= 1 && is_nonzero_ushr_of(func, ranges, ty, delta, other));
-                    if lt_other {
-                        return true;
-                    }
                 }
             }
         }
         for o in &env.orders {
-            if o.ty != ty || !cfg.dominates(o.head, block) {
-                continue;
-            }
-            if !self.proves_ule(func, (cfg, ranges, env, path, block), ty, o.hi, b, depth + 1) {
-                continue;
-            }
-            let lt_lh = path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, o.lo, o.hi) == Some(true);
-            if lt_lh && (a == o.lo || is_halved_mid(func, ranges, ty, a, o.lo, o.hi)) {
+            if o.ty != ty || !cfg.dominates(o.head, block) || !self.proves_ule(func, (cfg, ranges, env, path, block), ty, o.hi, b, depth + 1) { continue; }
+            if path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, o.lo, o.hi) == Some(true) && (a == o.lo || is_halved_mid(func, ranges, ty, a, o.lo, o.hi)) {
                 return true;
             }
         }
         for sb in &self.subs {
-            if sb.ty != ty || sb.min_diff == 0 || !self.proves_ule(func, (cfg, ranges, env, path, block), ty, sb.end, b, depth + 1) {
-                continue;
-            }
-            if a == sb.idx {
-                return true;
-            }
-            if let Some((c_val, extra)) = add_delta_of(func, ranges, a, sb.idx)
-                && path.fact(ranges, c_val).hi.checked_add(extra).is_some_and(|total| total < sb.min_diff)
-            {
+            if sb.ty != ty || sb.min_diff == 0 || !self.proves_ule(func, (cfg, ranges, env, path, block), ty, sb.end, b, depth + 1) { continue; }
+            if a == sb.idx { return true; }
+            if let Some((c_val, extra)) = add_delta_of(func, ranges, a, sb.idx) && path.fact(ranges, c_val).hi.checked_add(extra).is_some_and(|total| total < sb.min_diff) {
                 return true;
             }
         }
