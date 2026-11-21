@@ -126,6 +126,7 @@ const SYSCALL_CLOBBERS: [&str; 2] = ["rcx", "r11"];
 enum Instruction<'a> {
     Barrier,
     Fence,
+    Trap,
     Syscall,
     LockNot(u32),
     Divide(u32),
@@ -138,6 +139,10 @@ pub fn asm(src: &Source, templates: &[String], operands: &[(u32, u32)], out: &mu
     match instruction(&text) {
         Some(Instruction::Barrier) => asm_barrier(src, operands, out),
         Some(Instruction::Fence) => asm_fence(src, operands, out),
+        Some(Instruction::Trap) => {
+            out.lexed("{ core::intrinsics::abort() }");
+            Ok(())
+        }
         Some(Instruction::Syscall) => asm_syscall(src, operands, out),
         Some(Instruction::LockNot(bits)) => asm_lock_not(src, operands, bits, out),
         Some(Instruction::Divide(bits)) => asm_divide(src, operands, bits, out),
@@ -153,6 +158,7 @@ fn instruction(text: &str) -> Option<Instruction<'_>> {
     match words.as_slice() {
         all if all.iter().all(|word| placeholder(word)) => Some(Instruction::Barrier),
         ["dsb", "sy", "isb"] | ["dmb" | "dsb", _] | ["isb"] => Some(Instruction::Fence),
+        ["brk", _] | ["udf", _] | ["ud2"] | ["int", _] => Some(Instruction::Trap),
         ["syscall"] => Some(Instruction::Syscall),
         ["lock", "not", width, "ptr", "[{0}]"] => Some(Instruction::LockNot(memory_bits(width)?)),
         ["div", "{0:r}"] => Some(Instruction::Divide(64)),

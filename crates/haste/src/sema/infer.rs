@@ -46,7 +46,7 @@ pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
 pub use select::header_bound_traits;
 pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
-pub(super) use tables::{CallSites, recount_call_sites};
+pub(super) use tables::{CallSites, recount_call_sites, shape_calls};
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -95,6 +95,7 @@ pub enum Shape {
     Ctor(u32),
     Clone(Vec<Res>),
     Anon(Anon),
+    Asm(Vec<Res>),
 }
 
 pub(super) type Name<'a> = (&'a str, u32);
@@ -199,8 +200,14 @@ pub(super) fn infer_with_hints(
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
     infer.run(foreign)?;
     let mut typed = infer.finish()?;
+    if foreign {
+        super::global_asm::bind(cx, item, &mut typed);
+    }
     if let Some(slot) = slot {
         typed.shape = Shape::Virtual(slot);
+    }
+    if !foreign && !cx.outline.crates[item.krate as usize].env.fixed && matches!(typed.shape, Shape::Body) {
+        super::borrow::check(cx, item, (&body, &sig), src, &typed)?;
     }
     settle(cx, (item, substs), typed)
 }
@@ -737,7 +744,7 @@ pub fn discriminants(cx: &mut Context<'_>, item: ItemRef, primitive: Primitive) 
     detached(cx, item, |infer| infer.discriminants(item, primitive))
 }
 
-pub use zonk::is_case_sig;
+pub use zonk::{is_case_sig, is_concrete_fn, is_copy, test_sig};
 
 /// The return type of the non-generic function `item`.
 pub fn return_type(cx: &mut Context<'_>, item: ItemRef) -> Result<Ty> {

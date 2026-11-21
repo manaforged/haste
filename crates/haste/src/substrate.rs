@@ -20,8 +20,10 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::ops::Range;
+#[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 use std::path::Path;
+#[cfg(unix)]
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -98,16 +100,20 @@ fn decode_table<T>(bytes: &[u8], width: usize, name: &str, entry: impl FnMut(usi
     (0..bytes.len()).step_by(width).map(entry).collect()
 }
 
+#[cfg(unix)]
 struct Backing {
     ptr: NonNull<u8>,
     len: usize,
 }
 
+#[cfg(unix)]
 // SAFETY: `Backing` points to a read-only immutable mapping owned exclusively by `Backing`.
 unsafe impl Send for Backing {}
+#[cfg(unix)]
 // SAFETY: `Backing` is immutable for its entire lifetime and safe to read concurrently.
 unsafe impl Sync for Backing {}
 
+#[cfg(unix)]
 impl Drop for Backing {
     fn drop(&mut self) {
         // SAFETY: `ptr` and `len` were returned by a successful `libc::mmap` call in `Substrate::open`.
@@ -117,10 +123,21 @@ impl Drop for Backing {
     }
 }
 
+#[cfg(unix)]
 impl Backing {
     fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` is valid for `len` bytes for the lifetime of `&self` and never mutated.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+#[cfg(not(unix))]
+struct Backing(Box<[u8]>);
+
+#[cfg(not(unix))]
+impl Backing {
+    fn as_slice(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -209,20 +226,31 @@ fn encode_loops(loops: &[Range<u32>], out: &mut Vec<u8>) {
 impl Substrate {
     /// Opens and memory-maps a substrate file from `path`, validating its header and section bounds.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
-        let len_u64 = meta.len();
-        if len_u64 < HEADER_LEN as u64 {
-            bail!("substrate file smaller than header");
+        #[cfg(unix)]
+        {
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
+            let len_u64 = meta.len();
+            if len_u64 < HEADER_LEN as u64 {
+                bail!("substrate file smaller than header");
+            }
+            let len = usize::try_from(len_u64).context("substrate file exceeds address space")?;
+            // SAFETY: `file` is open for reading and `len > 0`; `MAP_SHARED` creates a read-only mapping owned by `Backing`.
+            let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+            if raw == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error()).with_context(|| format!("mmap {}", path.display()));
+            }
+            let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
+            Self::from_backing(Backing { ptr, len })
         }
-        let len = usize::try_from(len_u64).context("substrate file exceeds address space")?;
-        // SAFETY: `file` is open for reading and `len > 0`; `MAP_SHARED` creates a read-only mapping owned by `Backing`.
-        let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
-        if raw == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error()).with_context(|| format!("mmap {}", path.display()));
+        #[cfg(not(unix))]
+        {
+            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            if bytes.len() < HEADER_LEN {
+                bail!("substrate file smaller than header");
+            }
+            Self::from_backing(Backing(bytes.into_boxed_slice()))
         }
-        let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
-        Self::from_backing(Backing { ptr, len })
     }
 
     /// Opens the substrate for `toolchain_hash` from the toolchain cache directory.

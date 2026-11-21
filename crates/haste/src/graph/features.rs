@@ -12,6 +12,7 @@ enum Step {
 struct Resolver<'a> {
     packages: &'a [Package],
     targets: &'a super::Targets,
+    members: &'a [usize],
     units: Vec<Unit>,
     by_key: BTreeMap<(usize, Side), usize>,
     enabled: Vec<BTreeSet<String>>,
@@ -45,12 +46,19 @@ impl Resolver<'_> {
         let Unit { package, side, .. } = self.units[unit];
         let target = self.targets.of(side);
         let manifest = &self.packages[package].manifest;
+        let dev = (crate::test_mode() || crate::selection().example.is_some()) && self.members.contains(&package);
         let used = move |dep: &&Dep| match dep.kind {
             Kind::Normal => true,
             Kind::Build => manifest.build.is_some(),
-            Kind::Dev => false,
+            Kind::Dev => dev,
         };
-        manifest.deps.iter().filter(used).filter(move |dep| dep.platform.as_deref().is_none_or(|key| target.matches_key(key).unwrap_or(false)))
+        let host_target = &self.targets.host;
+        let is_std = manifest.name == "std";
+        manifest.deps.iter().filter(used).filter(move |dep| {
+            dep.platform
+                .as_deref()
+                .is_none_or(|key| target.matches_key(key).unwrap_or(false) || (is_std && host_target.matches_key(key).unwrap_or(false)))
+        })
     }
 
     fn feature(&mut self, unit: usize, name: String) {
@@ -130,12 +138,21 @@ impl Resolver<'_> {
     }
 }
 
-/// Resolves the features of every unit reachable from `members`, with their default features, as Cargo's resolver 2 does for `normal` and `build` edges.
-pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str]) -> Graph {
-    let mut resolver = Resolver { packages, targets, units: Vec::new(), by_key: BTreeMap::new(), enabled: Vec::new(), want: Vec::new(), queue: VecDeque::new() };
+/// Resolves the features of every unit reachable from `members`, as Cargo's resolver 2 does for `normal` and `build` edges.
+pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str], default_features: bool, all_features: bool) -> Graph {
+    let mut resolver = Resolver { packages, targets, members, units: Vec::new(), by_key: BTreeMap::new(), enabled: Vec::new(), want: Vec::new(), queue: VecDeque::new() };
     for member in members {
         let unit = resolver.unit(*member, Side::Target);
-        resolver.queue.push_back((unit, Step::Feature("default".to_owned())));
+        if default_features {
+            resolver.queue.push_back((unit, Step::Feature("default".to_owned())));
+        }
+        if all_features {
+            let package = &packages[*member];
+            resolver.queue.extend(package.manifest.features.keys().cloned().map(|name| (unit, Step::Feature(name))));
+            resolver.queue.extend(
+                package.manifest.deps.iter().filter(|dep| implicit(package, &dep.key)).map(|dep| (unit, Step::Feature(dep.key.clone()))),
+            );
+        }
         resolver.queue.extend(features.iter().map(|feature| (unit, Step::Feature((*feature).to_owned()))));
     }
     resolver.run();

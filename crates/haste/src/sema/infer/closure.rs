@@ -678,11 +678,6 @@ impl<'a> Context<'a> {
         self.ensure_closure_res(ty, false).ok()
     }
 
-    /// Returns the finished closure info for `ty` with complete body tables, inferring its defining body if only a signature stub is present.
-    pub fn ensure_full_closure(&mut self, ty: Ty) -> Option<Arc<ClosureInfo>> {
-        self.ensure_closure_res(ty, true).ok()
-    }
-
     pub(in crate::sema) fn ensure_closure_env(&mut self, ty: Ty) -> Result<Ty> {
         if let Some(info) = self.closure_ready(ty, false) {
             return Ok(info.env);

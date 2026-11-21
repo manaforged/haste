@@ -573,6 +573,11 @@ impl Infer<'_, '_> {
     }
 }
 
+/// Whether `ty` implements `Copy` in the context of `item`.
+pub fn is_copy(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<bool> {
+    detached(cx, item, |infer| infer.is_copy(ty))
+}
+
 /// Whether `item` is a non-generic synchronous `fn(i64) -> i64` suitable as a JIT test case.
 pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
     let Ok(sig) = cx.signature(item) else { return false };
@@ -587,4 +592,25 @@ pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
         }),
         Ok(true)
     )
+}
+
+/// Whether `item` is a non-generic synchronous zero-argument `#[test]` function (`fn()` or `fn() -> T`), returning `Some(returns_unit)`.
+pub fn test_sig(cx: &mut Context<'_>, item: ItemRef) -> Option<bool> {
+    let sig = cx.signature(item).ok()?;
+    if !sig.params.is_empty() || sig.receiver.is_some() || sig.is_async || sig.variadic || sig.opaque || scope::type_params(&sig.generics).next().is_some() {
+        return None;
+    }
+    let unit = cx.types.unit();
+    detached(cx, item, |infer| {
+        let (params, ret) = infer.fn_types(item, &[])?;
+        Ok((params.is_empty()).then_some(infer.resolve(ret) == unit))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Whether `item` is a non-generic free function suitable as a root for library `haste build`.
+pub fn is_concrete_fn(cx: &mut Context<'_>, item: ItemRef) -> bool {
+    let Ok(sig) = cx.signature(item) else { return false };
+    sig.receiver.is_none() && !sig.variadic && !sig.opaque && scope::type_params(&sig.generics).next().is_none()
 }

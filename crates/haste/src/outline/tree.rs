@@ -243,6 +243,8 @@ pub struct Crate {
     pub members: Vec<(MemberBlock, Waiting)>,
     pub fallback: Vec<usize>,
     pub foreign: Vec<Waiting>,
+    /// The module-level `global_asm!` calls, in the order they were read.
+    pub global_asm: Vec<Waiting>,
     pub derived: Vec<Held>,
     pub attributed: Vec<Held>,
     pub consumed: rustc_hash::FxHashSet<(u32, u32)>,
@@ -394,9 +396,12 @@ impl Env {
     }
 
     fn name(&self, name: &str) -> Truth {
+        if name == "test" {
+            return if crate::test_mode() && !self.fixed { Truth::Yes } else { Truth::No };
+        }
         if self.target.has_name(name) || self.profile().contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
             Truth::Yes
-        } else if self.known || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {
+        } else if self.known || matches!(name, "unix" | "windows") || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {
             Truth::No
         } else {
             Truth::Unknown

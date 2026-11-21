@@ -13,17 +13,19 @@ mod race;
 mod record;
 mod sources;
 mod statics;
-#[path = "../../prep-driver/src/files.rs"]
+#[path = "../prep-driver/src/files.rs"]
 mod files;
-#[path = "../../prep-driver/src/form.rs"]
+#[path = "../prep-driver/src/form.rs"]
 mod form;
-#[path = "../../prep-driver/src/print.rs"]
+#[path = "../prep-driver/src/print.rs"]
 mod print;
-#[path = "../../prep-driver/src/source.rs"]
+#[path = "../prep-driver/src/source.rs"]
 mod source;
 
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::hash::BuildHasher as _;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -315,6 +317,7 @@ pub fn refresh(outline: &Outline, workspace: &Workspace) -> Result<()> {
 }
 
 /// The lock that one prep of the build in `dir` holds while it runs, waiting for it when `wait` is set, or none when another process holds it and `wait` is not set.
+#[cfg(unix)]
 fn lock(dir: &Path, wait: bool) -> Result<Option<std::fs::File>> {
     let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(LOCK))?;
     let mode = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
@@ -323,7 +326,13 @@ fn lock(dir: &Path, wait: bool) -> Result<Option<std::fs::File>> {
     Ok(held.then_some(file))
 }
 
+#[cfg(not(unix))]
+fn lock(_dir: &Path, _wait: bool) -> Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
 /// The prep lock of the build in `dir` when the run that started this process holds it and handed it over on standard input.
+#[cfg(unix)]
 fn handed(dir: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::MetadataExt as _;
     let input = std::fs::File::from(std::os::fd::AsFd::as_fd(&std::io::stdin()).try_clone_to_owned()?);
@@ -332,7 +341,13 @@ fn handed(dir: &Path) -> Result<Option<std::fs::File>> {
     Ok(same.then_some(input))
 }
 
+#[cfg(not(unix))]
+fn handed(_dir: &Path) -> Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
 /// Loads the library at `path` into this process with its symbols global, so the dynamic linker finds every symbol it exports.
+#[cfg(unix)]
 fn open(path: &Path) -> Result<()> {
     let text = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: text is a NUL-terminated string that lives across the call; the library holds only rustc output whose initializers are the standard library's.
@@ -345,6 +360,12 @@ fn open(path: &Path) -> Result<()> {
     // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
     let reason = if reason.is_null() { String::new() } else { unsafe { CStr::from_ptr(reason) }.to_string_lossy().into_owned() };
     bail!("loading {}: {reason}", path.display())
+}
+
+#[cfg(not(unix))]
+fn open(path: &Path) -> Result<()> {
+    let _ = crate::host::native::open(path, 0)?;
+    Ok(())
 }
 
 fn signature(typed: &Typed) -> (Vec<Ty>, Option<Ty>) {

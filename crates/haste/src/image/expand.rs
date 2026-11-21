@@ -23,6 +23,10 @@ type Two = extern "C" fn(usize, *const u8, usize, *const u8, usize, *mut usize);
 
 /// Runs the jobs in children forked on `demand`, one child per group and at most one per core, answering what inference asks with `ask`, and gives each job's output text or why it has none, or `None` when it did not run; the jobs after a crash run in a new child.
 pub fn run_macros(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
+    crate::with_host_target(|| run_macros_inner(compilation, demand, jobs, ask))
+}
+
+fn run_macros_inner(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
     let mut parts: Vec<Vec<usize>> = Vec::new();
     let mut groups = rustc_hash::FxHashMap::default();
     for (at, job) in jobs.iter().enumerate() {

@@ -2,8 +2,32 @@
 
 use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
+
+fn path_to_bytes(path: &Path) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        Some(path.as_os_str().as_bytes().to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_str().map(|s| s.as_bytes().to_vec())
+    }
+}
+
+fn bytes_to_path(bytes: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = OsString::new();
+        std::str::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
 
 use rustc_hash::FxHasher;
 
@@ -43,6 +67,8 @@ fn compute_stamp(root: &Path, out: Option<&Path>, paths: &[PathBuf], env_names: 
     (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
     super::enabled().hash(&mut hasher);
     crate::prep::prepared().hash(&mut hasher);
+    crate::selection().hash(&mut hasher);
+    crate::test_mode().hash(&mut hasher);
     std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
     std::env::var_os("CARGO_HOME").hash(&mut hasher);
     root.hash(&mut hasher);
@@ -98,7 +124,7 @@ fn decode_stamp_file(data: &[u8]) -> Option<(u64, usize, Vec<PathBuf>, Vec<Strin
     for _ in 0..path_count {
         let len = read_len_u32(data, &mut pos)?;
         let bytes = read_bytes(data, &mut pos, len)?;
-        paths.push(PathBuf::from(OsString::from_vec(bytes.to_vec())));
+        paths.push(bytes_to_path(bytes)?);
     }
     let mut envs = Vec::with_capacity(env_count.min(1024));
     for _ in 0..env_count {
@@ -119,10 +145,10 @@ fn encode_stamp_file(stamp: u64, reached: usize, paths: &[PathBuf], envs: &[Stri
     out.extend_from_slice(&path_count.to_le_bytes());
     out.extend_from_slice(&env_count.to_le_bytes());
     for path in paths {
-        let bytes = path.as_os_str().as_bytes();
+        let bytes = path_to_bytes(path)?;
         let len = u32::try_from(bytes.len()).ok()?;
         out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(bytes);
+        out.extend_from_slice(&bytes);
     }
     for env in envs {
         let bytes = env.as_bytes();

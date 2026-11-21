@@ -20,6 +20,10 @@ const OUT: &str = "out";
 
 /// Gives every unit with a build script its output: the stored one while it is current, else from running the script.
 pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
+    crate::with_host_target(|| settle_inner(workspace, targets))
+}
+
+fn settle_inner(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
     let mut failed = HashSet::default();
     let mut dag = ScriptDag::new(workspace);
     let mut ran = known(workspace);
@@ -270,7 +274,8 @@ enum Start {
 
 /// Builds and runs the scripts of the units `units`, each from its kept executable while its crates hash the same, else in children that compile each function on its first call, keeping the executable of each script that ran before.
 fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDag, locks: &mut HashMap<usize, store::Lock>, ran: &mut Ran) -> Result<Outcome> {
-    let mut compilation = crate::macros::load_eager(workspace, targets, units)?;
+    let host_targets = Targets { target: targets.host.clone(), host: targets.host.clone() };
+    let mut compilation = crate::macros::load_eager(workspace, &host_targets, units)?;
     let outline = &compilation.outline;
     let scripts: Vec<(usize, usize)> = outline.roots.iter().enumerate().filter(|(_, root)| root.role == Role::Script).map(|(krate, root)| (root.unit, krate)).collect();
     let binaries = Binaries::new(workspace, outline, &scripts);

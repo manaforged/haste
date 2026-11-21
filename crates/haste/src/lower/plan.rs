@@ -105,7 +105,7 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
             hash_closure_header(cx, &mut mix, typed, cb)?;
             eval_body_footprint(cx, (reached, slots), inline, &mut mix, index, (cb.parent, Some(cb.closure.body)), typed, &mut cycle_root)?;
         }
-        Shape::Anon(_) => mix.local_index(index),
+        Shape::Anon(_) | Shape::Asm(_) => mix.local_index(index),
     }
     Ok((mix.finish(), cycle_root))
 }
@@ -187,6 +187,7 @@ fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, (low, allow_inl
         Shape::Ctor(_) => 5,
         Shape::Clone(_) => 6,
         Shape::Anon(_) => 7,
+        Shape::Asm(_) => 8,
     };
     mix.byte(shape_tag);
     let sig = signature(cx, typed)?;

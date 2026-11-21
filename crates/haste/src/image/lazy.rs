@@ -1,6 +1,8 @@
 //! Programs that compile each function on its first call: each runs in a forked child whose call table starts at stubs, and this process infers, lowers and encodes each function a stub asks for.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::Ordering;
 
@@ -16,7 +18,10 @@ use crate::sema::evaluate::Evaluate;
 use crate::sema::reach::{Instance, Reached, calls, infer_declared, infer_quiet, main_roots};
 use crate::sema::{Answer, Cache, Context, Edited};
 
-use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, host_symbol, stub, wait};
+use super::global_asm::Foreign;
+#[cfg(unix)]
+use super::wait;
+use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, stub};
 
 /// What answers what a pass of inference asked for, and says what it added.
 pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<Answer>;
@@ -40,11 +45,18 @@ enum Stop {
 type Journal = Vec<usize>;
 
 /// A running child: its pid, the pipe ends that carry its asks and the answers, its output pipe, what it wrote there, and why the function it last asked for has no code.
+#[cfg(unix)]
 struct Child {
     pid: libc::pid_t,
     asks: Option<std::fs::File>,
     answers: std::fs::File,
     out: Option<std::fs::File>,
+    bytes: Vec<u8>,
+    failure: Option<(String, ItemRef)>,
+}
+
+#[cfg(not(unix))]
+struct Child {
     bytes: Vec<u8>,
     failure: Option<(String, ItemRef)>,
 }
@@ -123,9 +135,11 @@ impl Program {
         let served = serve(compilation, &crate::macros::load, &mut self.jit, &mut run);
         compilation.settle();
         served?;
-        eprintln!("compiled {} of {} functions declared", self.jit.compiled.len(), self.jit.reached.list.len());
-        if let Some(counts) = crate::prep::decided() {
-            eprintln!("prep {counts}");
+        if haste_codegen::trace_enabled() {
+            eprintln!("compiled {} of {} functions declared", self.jit.compiled.len(), self.jit.reached.list.len());
+            if let Some(counts) = crate::prep::decided() {
+                eprintln!("prep {counts}");
+            }
         }
         run.status.ok_or_else(|| anyhow!("the program did not start"))
     }
@@ -181,7 +195,7 @@ impl Driver for Run<'_, '_> {
 }
 
 /// The CPU time, in seconds, that running one constant item may take before its child is stopped.
-const EVALUATION_SECONDS: libc::time_t = 10;
+const EVALUATION_SECONDS: i64 = 10;
 
 /// The one child that runs a constant item, and how it ended.
 struct Once(Option<Ended>);
@@ -209,16 +223,18 @@ pub fn evaluator() -> Result<Box<dyn Evaluate>> {
 
 impl Evaluate for Jit {
     fn evaluate(&mut self, cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128> {
-        let (entry, wide) = (self.declare(*instance), bits > 64);
-        let mut once = Once(None);
-        self.strict = false;
-        let ran = self.fork(true, |image, out| image.evaluate_in_child(entry, wide, out)).and_then(|_| self.pump(cx, &mut once, None));
-        self.strict = true;
-        self.kill_children();
-        if ran?.is_some() {
-            bail!("running it needs names that are not loaded yet");
-        }
-        value_of(once.0)
+        crate::with_host_target(|| {
+            let (entry, wide) = (self.declare(*instance), bits > 64);
+            let mut once = Once(None);
+            self.strict = false;
+            let ran = self.fork(true, |image, out| image.evaluate_in_child(entry, wide, out)).and_then(|_| self.pump(cx, &mut once, None));
+            self.strict = true;
+            self.kill_children();
+            if ran?.is_some() {
+                bail!("running it needs names that are not loaded yet");
+            }
+            value_of(once.0)
+        })
     }
 }
 
@@ -227,6 +243,7 @@ fn value_of(ended: Option<Ended>) -> Result<u128> {
     match ended {
         Some(Ended { failure: Some((error, _)), .. }) => bail!("{error}"),
         Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|bytes| anyhow!("it gave no value: {} bytes, not 16", bytes.len()))?)),
+        #[cfg(unix)]
         Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => {
             bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time")
         }
@@ -237,9 +254,10 @@ fn value_of(ended: Option<Ended>) -> Result<u128> {
 
 impl Image {
     /// Runs the constant item at slot `entry` in this forked child under a CPU time limit and writes its value, 128 bits wide when `wide`, to `out`; returns the exit status.
+    #[cfg(unix)]
     fn evaluate_in_child(&self, entry: usize, wide: bool, out: Option<std::fs::File>) -> i32 {
         let Some(mut out) = out else { return 1 };
-        let limit = libc::itimerval { it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, it_value: libc::timeval { tv_sec: EVALUATION_SECONDS, tv_usec: 0 } };
+        let limit = libc::itimerval { it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, it_value: libc::timeval { tv_sec: EVALUATION_SECONDS as _, tv_usec: 0 } };
         // SAFETY: setitimer arms only this child's virtual timer, from a live itimerval.
         unsafe { libc::setitimer(libc::ITIMER_VIRTUAL, &limit, std::ptr::null_mut()) };
         let address = self.slot(entry).load(Ordering::Acquire);
@@ -251,6 +269,11 @@ impl Image {
             }
         };
         i32::from(out.write_all(&value.to_le_bytes()).is_err())
+    }
+
+    #[cfg(not(unix))]
+    fn evaluate_in_child(&self, _entry: usize, _wide: bool, _out: Option<std::fs::File>) -> i32 {
+        1
     }
 }
 
@@ -380,6 +403,7 @@ impl Jit {
     }
 
     /// Forks a child that runs `body` on the image, with an output pipe when `piped`, and exits with the status `body` returns; returns the child's id.
+    #[cfg(unix)]
     pub fn fork(&mut self, piped: bool, body: impl FnOnce(&Image, Option<std::fs::File>) -> i32) -> Result<usize> {
         let Some(stubs) = self.image.stubs.span() else { bail!("no stub memory") };
         let (ask, answer) = (super::pipe()?, super::pipe()?);
@@ -412,17 +436,26 @@ impl Jit {
         Ok(self.children.len() - 1)
     }
 
+    #[cfg(not(unix))]
+    pub fn fork(&mut self, _piped: bool, _body: impl FnOnce(&Image, Option<std::fs::File>) -> i32) -> Result<usize> {
+        bail!("lazy forked JIT execution requires Unix; use `haste build -o` on Windows")
+    }
+
     /// Kills and reaps every child still running, as a run that stopped on an error leaves them waiting for answers.
     fn kill_children(&mut self) {
         self.pending.clear();
+        #[cfg(unix)]
         for child in self.children.drain(..).flatten() {
             // SAFETY: pid is a child this process forked and has not reaped, so the signal reaches only that child.
             unsafe { libc::kill(child.pid, libc::SIGKILL) };
             wait(child.pid);
         }
+        #[cfg(not(unix))]
+        self.children.clear();
     }
 
     /// The children with something to read: `(id, true)` for an ask, `(id, false)` for output; notes when a watched file changed.
+    #[cfg(unix)]
     fn ready(&mut self) -> Result<Vec<(usize, bool)>> {
         let mut polled = Vec::new();
         let mut fds = Vec::new();
@@ -449,6 +482,12 @@ impl Jit {
         Ok(polled.into_iter().zip(fds).filter(|(_, fd)| fd.revents != 0).map(|(ready, _)| ready).collect())
     }
 
+    #[cfg(not(unix))]
+    fn ready(&mut self) -> Result<Vec<(usize, bool)>> {
+        Ok(Vec::new())
+    }
+
+    #[cfg(unix)]
     fn drain(&mut self, id: usize) {
         let Some(child) = self.children[id].as_mut() else {
             return;
@@ -460,6 +499,10 @@ impl Jit {
         }
     }
 
+    #[cfg(not(unix))]
+    fn drain(&mut self, _id: usize) {}
+
+    #[cfg(unix)]
     fn read_ask(&mut self, id: usize) -> Option<usize> {
         let child = self.children[id].as_mut()?;
         let mut index = [0; 8];
@@ -472,6 +515,12 @@ impl Jit {
         }
     }
 
+    #[cfg(not(unix))]
+    fn read_ask(&mut self, _id: usize) -> Option<usize> {
+        None
+    }
+
+    #[cfg(unix)]
     fn reply(&mut self, id: usize, code: usize) {
         let Some(child) = self.children[id].as_mut() else {
             return;
@@ -481,7 +530,11 @@ impl Jit {
         }
     }
 
+    #[cfg(not(unix))]
+    fn reply(&mut self, _id: usize, _code: usize) {}
+
     /// The children whose pipes closed, waited for, with how each ended.
+    #[cfg(unix)]
     fn reap(&mut self) -> Vec<(usize, Ended)> {
         let mut ended = Vec::new();
         for (id, slot) in self.children.iter_mut().enumerate() {
@@ -491,6 +544,11 @@ impl Jit {
             }
         }
         ended
+    }
+
+    #[cfg(not(unix))]
+    fn reap(&mut self) -> Vec<(usize, Ended)> {
+        Vec::new()
     }
 
     /// Answers with `cx` the asks of the children `driver` forked, the ask `pending` first, until no child is left, an answer needs what inference asked for, which returns that child and the function it asked for, or a watched file changed.
@@ -582,8 +640,9 @@ impl Jit {
         let members = self.frontier(cx, index);
         let (foreign, mut work): (Vec<usize>, Vec<usize>) = members.into_iter().filter(|&at| self.callees_typed(cx, at)).partition(|&at| cx.foreign(self.reached.list[at].0.0));
         for at in foreign {
-            match host_symbol(cx, self.reached.list[at].0.0) {
-                Ok(code) => {
+            let reached = &self.reached;
+            match self.image.with_pass(|image, pass| image.bind_foreign(cx, reached, at, Some(&mut pass.memory))) {
+                Ok(Foreign::Asm(code) | Foreign::Host(_, code)) => {
                     self.publish(at, code);
                 }
                 Err(_) => {
@@ -648,8 +707,7 @@ impl Jit {
     fn code(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Result<usize, Stop> {
         let item = self.reached.list[index].0.0;
         if cx.foreign(item) {
-            let code = host_symbol(cx, item).map_err(|error| Stop::Failed(error, item))?;
-            return Ok(self.publish(index, code));
+            return self.foreign_code(cx, index, journal);
         }
         if let Some(code) = self.prepped(cx, index, journal) {
             let origin = if crate::prep::bind(cx, &self.reached, index) == Some(code) { super::perf::Origin::Rustc } else { super::perf::Origin::Adapter };
@@ -673,6 +731,20 @@ impl Jit {
             }
         }
         Ok(self.image.slot(index).load(Ordering::Acquire))
+    }
+
+    /// Binds the foreign function `index` once the functions its `global_asm!` block calls are reached, publishes its code and returns it.
+    fn foreign_code(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Result<usize, Stop> {
+        let item = self.reached.list[index].0.0;
+        let wanted: Vec<Instance> = calls(cx, &self.reached.list[index].1).collect();
+        if !wanted.is_empty() {
+            self.reach(cx, wanted, journal)?;
+        }
+        let reached = &self.reached;
+        let bound = self.image.with_pass(|image, pass| image.bind_foreign(cx, reached, index, Some(&mut pass.memory)));
+        match bound.map_err(|error| Stop::Failed(error, item))? {
+            Foreign::Asm(code) | Foreign::Host(_, code) => Ok(self.publish(index, code)),
+        }
     }
 
     /// Publishes `code` as function `index`'s code, in its slot and every table that names it, marks it compiled and returns it.

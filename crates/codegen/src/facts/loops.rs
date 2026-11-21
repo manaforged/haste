@@ -455,17 +455,20 @@ impl Env {
                     continue;
                 }
                 for (strict, cc) in [(true, IntCC::UnsignedLessThan), (false, IntCC::UnsignedLessThanOrEqual)] {
-                    let base_ok = outside
-                        .iter()
-                        .all(|(path, args)| path.decide_rel(func, ranges, cc, ty, args[k], bound) == Some(true));
+                    let base_ok = outside.iter().all(|(path, args)| {
+                        path.decide_rel(func, ranges, cc, ty, args[k], bound) == Some(true)
+                            || super::decide(cc, ty, &path.fact(ranges, args[k]), &path.fact(ranges, bound)) == Some(true)
+                    });
                     let step_ok = base_ok
                         && inside.iter().all(|&(_, ref gp, _, args)| {
-                            arms.clear();
-                            expand_arms(func, ranges, args[k], bound, 0, &mut arms);
-                            arms.iter().all(|&(arm, bnd)| {
-                                gp.decide_rel(func, ranges, cc, ty, arm, bnd) == Some(true)
-                                    || is_shrunk(func, ranges, gp, ty, arm, p)
-                            })
+                            gp.decide_rel(func, ranges, cc, ty, args[k], bound) == Some(true) || {
+                                arms.clear();
+                                expand_arms(func, ranges, args[k], bound, 0, &mut arms);
+                                arms.iter().all(|&(arm, bnd)| {
+                                    gp.decide_rel(func, ranges, cc, ty, arm, bnd) == Some(true)
+                                        || is_shrunk(func, ranges, gp, ty, arm, p)
+                                })
+                            }
                         });
                     if step_ok {
                         self.rel_invs.push(RelInv { head: each.head, param: p, bound, ty, strict });

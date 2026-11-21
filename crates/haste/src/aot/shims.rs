@@ -20,6 +20,7 @@ pub(in crate::aot) enum Shim {
     ThreadCell,
     FrameAlloc,
     FrameFree,
+    CatchUnwind,
     Wide(WideShim),
 }
 
@@ -434,6 +435,7 @@ fn emit_shim_x64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &dyn
         Shim::FrameAlloc | Shim::FrameFree if os == Os::Linux => emit_x64_frame_cache(shim == Shim::FrameAlloc, va, addrs.frame_tls, stub_va, out)?,
         Shim::FrameAlloc => emit_rel_branch(Arch::X64, false, va, stub_va("malloc")?, out),
         Shim::FrameFree => emit_rel_branch(Arch::X64, false, va, stub_va("free")?, out),
+        Shim::CatchUnwind => out.bytes(&[0x48, 0x83, 0xEC, 0x08, 0x48, 0x89, 0xF8, 0x48, 0x89, 0xF7, 0xFF, 0xD0, 0x31, 0xC0, 0x48, 0x83, 0xC4, 0x08, 0xC3]),
         Shim::Wide(wide) => super::wide::emit(Arch::X64, os, wide, out)?,
     }
     Ok(())
@@ -486,6 +488,7 @@ fn emit_shim_arm64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &d
             out.words(&[0x1400_0000 | (back & 0x03FF_FFFF), 0xA941_53F3, 0xA8C2_7BFD, 0xD65F_03C0]);
         }
         Shim::ThreadCell => emit_arm64_thread_cell(va, addrs.thread_key, stub_va, out)?,
+        Shim::CatchUnwind => out.words(&[0xA9BF_7BFD, 0xAA00_03E9, 0xAA01_03E0, 0xD63F_0120, 0x5280_0000, 0xA8C1_7BFD, 0xD65F_03C0]),
         Shim::Wide(wide) => super::wide::emit(Arch::Arm64, os, wide, out)?,
     }
     Ok(())

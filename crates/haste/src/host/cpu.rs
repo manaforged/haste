@@ -1,6 +1,7 @@
 //! The `cpuid` and `xgetbv` answers that compiled code sees: the host's own, with the families in [`UNENCODED`] reported absent, as a hypervisor hides extensions from a guest.
 
 /// A family of x86 extensions that `cpuid` can report absent, with the families that need it.
+#[allow(dead_code, reason = "full x86 CPUID family table")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
     /// AVX and every VEX- or EVEX-encoded vector extension, with the YMM state.

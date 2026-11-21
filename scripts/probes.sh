@@ -69,6 +69,49 @@ check_malformed() {
         return 1
     fi
 }
+check_catch_unwind() {
+    local out_msg=$1 dir="$tmp/unwind_ok" c_out h_out c_status=0 h_status=0
+    write_scratch_crate "$dir" "unwind_ok" 'fn main() {
+    let ok = std::panic::catch_unwind(|| 21 + 21).unwrap();
+    let msg = std::panic::catch_unwind(|| -> i32 { panic!("boom") }).unwrap_err();
+    let s = msg.downcast_ref::<&str>().copied().unwrap_or("");
+    let t = std::thread::spawn(|| panic!("tboom")).join().is_err();
+    println!("{ok} {s} {t}");
+}'
+    c_out=$(run_manifest "$dir" </dev/null 2>/dev/null) || c_status=$?
+    h_out=$(run_haste run "$dir" </dev/null 2>/dev/null) || h_status=$?
+    if [ "$c_status" -ne 0 ] || [ "$h_status" -ne 0 ] || [ "$c_out" != "$h_out" ]; then
+        echo "catch_unwind DIFF: cargo=($c_status,$c_out) haste=($h_status,$h_out)" >"$out_msg"
+        return 1
+    fi
+}
+check_unit_tests() {
+    local out_msg=$1 dir="$tmp/unit_tests" c_status=0 h_status=0
+    mkdir -p "$dir/src"
+    printf '[package]\nname = "unit_tests"\nversion = "0.1.0"\nedition = "2021"\n' >"$dir/Cargo.toml"
+    printf 'version = 4\n\n[[package]]\nname = "unit_tests"\nversion = "0.1.0"\n' >"$dir/Cargo.lock"
+    cat >"$dir/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_ok() { assert_eq!(2 + 2, 4); }
+    #[test]
+    fn res_ok() -> Result<(), &'static str> { Ok(()) }
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn panic_ok() { panic!("got boom"); }
+    #[test]
+    #[ignore]
+    fn skip_me() { panic!("should not run"); }
+}
+EOF
+    run_cargo test --quiet --locked --manifest-path "$dir/Cargo.toml" </dev/null >/dev/null 2>&1 || c_status=$?
+    run_haste test "$dir" </dev/null >"$dir/haste.out" 2>&1 || h_status=$?
+    if [ "$c_status" -ne 0 ] || [ "$h_status" -ne 0 ] || ! grep -q 'test result: ok. 3 passed; 0 failed; 1 ignored;' "$dir/haste.out"; then
+        echo "unit_tests DIFF: cargo=$c_status haste=$h_status: $(tail -3 "$dir/haste.out")" >"$out_msg"
+        return 1
+    fi
+}
 pre_pids=()
 pre_msgs=()
 pre_launch() {
@@ -81,8 +124,17 @@ for build_target in examples/hello tests/diff tests/probes/cl; do
     pre_launch check_build_target "$build_target"
 done
 pre_launch check_accept_ok
+pre_launch check_catch_unwind
+pre_launch check_unit_tests
 pre_launch check_reject unsatisfied_bound 'trait Marker {} fn needs<T: Marker>(_: T) {} fn main() { needs(1u8); }'
 pre_launch check_reject unconstrained_var 'fn main() { let _v = Vec::new(); }'
+pre_launch check_reject use_after_move 'fn main() { let s = String::from("hi"); drop(s); println!("{s}"); }'
+pre_launch check_reject loop_move 'fn main() { let s = String::from("hi"); for _ in 0..2 { drop(s); } }'
+pre_launch check_reject assign_immut 'fn main() { let x = 1; x = 2; println!("{x}"); }'
+pre_launch check_reject mut_ref_immut 'fn main() { let x = 1; let r = &mut x; *r = 2; }'
+pre_launch check_reject conflict_mut_imm 'fn main() { let mut x = 1; let r1 = &x; let r2 = &mut x; *r2 = 2; println!("{r1}"); }'
+pre_launch check_reject mutate_borrowed 'fn main() { let mut x = 1; let r = &x; x = 2; println!("{r}"); }'
+pre_launch check_reject return_local_ref 'fn bad() -> &'\''static i32 { let x = 1; &x } fn main() { let _ = bad(); }'
 pre_launch check_malformed
 pre_fail=0
 for idx in "${!pre_pids[@]}"; do

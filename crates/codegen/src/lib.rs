@@ -2,6 +2,7 @@
 
 mod algebra;
 mod alloc;
+mod asm_text;
 mod builder;
 pub(crate) mod cfg;
 mod color;
@@ -69,6 +70,7 @@ macro_rules! value_op {
 mod arm64;
 mod x64;
 
+pub use asm_text::{Assembly, assemble};
 pub use builder::{FunctionBuilder, Ins, Mark};
 pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type, Value};
 pub use coroutine::Coroutine;

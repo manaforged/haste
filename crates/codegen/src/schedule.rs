@@ -447,7 +447,10 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     run_fixpoint(func, &plan, &mut state);
     run_late_lowering(func, &plan, &mut state);
     for &pass in plan.finish {
-        run_step(func, &plan, &mut state, pass);
+        let changed = run_step(func, &plan, &mut state, pass);
+        if pass == Pass::Switch && !changed.is_empty() && plan.effort == Effort::Full && state.has_loops(func) {
+            run_step(func, &plan, &mut state, Pass::Licm);
+        }
     }
     run_backend_prep(func, &plan);
 }

@@ -87,20 +87,125 @@ fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
-    let mut found = Vec::new();
-    for krate in outline.members(workspace) {
+/// Metadata for a discovered `#[test]` function.
+#[derive(Clone)]
+pub(crate) struct TestItem {
+    pub item: ItemRef,
+    pub ignored: bool,
+    pub should_panic: bool,
+    pub expected: Option<String>,
+}
+
+fn item_enabled(tree: &outline::tree::Crate, file_at: usize, mut at: usize) -> bool {
+    let items = &tree.files[file_at].items.items;
+    let mut cur = Some(at);
+    while let Some(idx) = cur {
+        let item = &items[idx];
+        if !tree.env.enabled(&item.attrs) {
+            return false;
+        }
+        if idx != at && !matches!(item.kind, outline::item::ItemKind::Mod) {
+            return false;
+        }
+        cur = item.parent.map(|p| p as usize);
+    }
+    let _ = &mut at;
+    true
+}
+
+fn member_fns<'a>(workspace: &'a graph::Workspace, outline: &'a outline::Outline) -> impl Iterator<Item = (ItemRef, &'a outline::tree::Crate, &'a outline::tree::File, &'a outline::item::Item)> + 'a {
+    outline.members(workspace).flat_map(move |krate| {
         let tree = &outline.crates[krate];
-        for (file_at, file) in tree.files.iter().enumerate() {
-            for (at, item) in file.items.items.iter().enumerate() {
-                let named = item.name.is_some_and(|name| file.source.text(name).starts_with("case_"));
-                if named && item.kind == outline::item::ItemKind::Fn {
-                    found.push(ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 });
+        tree.files.iter().enumerate().flat_map(move |(file_at, file)| {
+            file.items.items.iter().enumerate().filter_map(move |(at, item)| {
+                (item.kind == outline::item::ItemKind::Fn && item.body.is_some() && item_enabled(tree, file_at, at))
+                    .then_some((ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 }, tree, file.as_ref(), item))
+            })
+        })
+    })
+}
+
+pub(crate) fn test_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<TestItem> {
+    member_fns(workspace, outline)
+        .filter(|(_, tree, file, item)| outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test"))
+        .map(|(item_ref, tree, file, item)| {
+            let should_panic = outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic");
+            let expected = should_panic.then(|| outline::attr::should_panic_expected(&file.source, &item.attrs, &tree.env)).flatten();
+            TestItem {
+                item: item_ref,
+                ignored: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "ignore"),
+                should_panic,
+                expected,
+            }
+        })
+        .collect()
+}
+
+/// Formats and prints standard Rust test output and returns 0 when all tests pass, else 101.
+pub(crate) fn print_test_report(
+    entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
+    elapsed: std::time::Duration,
+) -> i32 {
+    println!("\nrunning {} test{}", entries.len(), if entries.len() == 1 { "" } else { "s" });
+    let (mut passed, mut failed, mut ignored) = (0usize, 0usize, 0usize);
+    let mut details: Vec<(&str, String)> = Vec::new();
+    for &(name, meta, ref outcome) in entries {
+        let Some(outcome) = outcome else {
+            println!("test {name} ... ignored");
+            ignored += 1;
+            continue;
+        };
+        match outcome {
+            Ok((status, stderr)) => {
+                let expected_ok = match (&meta.expected, stderr) {
+                    (Some(exp), Some(err)) => err.contains(exp.as_str()),
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+                let ok = if meta.should_panic { *status != 0 && expected_ok } else { *status == 0 };
+                if ok {
+                    println!("test {name} ... ok");
+                    passed += 1;
+                } else {
+                    let msg = if meta.should_panic && *status == 0 {
+                        "note: test did not panic as expected".to_owned()
+                    } else if let Some(exp) = &meta.expected {
+                        format!("note: panic did not contain expected string `{exp}`\n{}", stderr.as_deref().unwrap_or("").trim())
+                    } else {
+                        format!("exited with status {status}")
+                    };
+                    println!("test {name} ... FAILED");
+                    details.push((name, msg));
+                    failed += 1;
                 }
+            }
+            Err(err) => {
+                println!("test {name} ... FAILED");
+                details.push((name, (*err).to_owned()));
+                failed += 1;
             }
         }
     }
-    found
+    if !details.is_empty() {
+        println!("\nfailures:\n");
+        for (name, msg) in &details {
+            println!("---- {name} ----\n{msg}\n");
+        }
+    }
+    let verdict = if failed == 0 { "ok" } else { "FAILED" };
+    println!("\ntest result: {verdict}. {passed} passed; {failed} failed; {ignored} ignored; finished in {:.2}s\n", elapsed.as_secs_f64());
+    if failed == 0 { 0 } else { 101 }
+}
+
+pub(crate) fn lib_fn_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
+    member_fns(workspace, outline).map(|(item_ref, _, _, _)| item_ref).collect()
+}
+
+pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
+    member_fns(workspace, outline)
+        .filter(|(_, _, file, item)| item.name.is_some_and(|name| file.source.text(name).starts_with("case_")))
+        .map(|(item_ref, _, _, _)| item_ref)
+        .collect()
 }
 
 pub(crate) type Failures = std::collections::BTreeMap<String, Vec<String>>;
@@ -260,7 +365,7 @@ fn usage() -> String {
     let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().filter(|(cmd, _)| !matches!(cmd, Command::Clean)).map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -331,13 +436,51 @@ impl Meta {
     }
 }
 
-fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>, out: &mut Option<PathBuf>) -> Result<Option<Meta>> {
+fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
+    args: &mut std::iter::Peekable<I>,
+    selection: &mut crate::Selection,
+    stats: &mut Option<PathBuf>,
+    out: &mut Option<PathBuf>,
+) -> Result<Option<Meta>> {
     while let Some(flag) = args.peek().and_then(|raw| raw.to_str()) {
         if let Some(meta) = Meta::from_flag(flag) {
             args.next();
             return Ok(Some(meta));
         }
         match flag {
+            "-p" | "--package" => {
+                args.next();
+                selection.package = Some(next_str(args).context("--package takes a package name")?);
+            }
+            "--bin" => {
+                args.next();
+                selection.bin = Some(next_str(args).context("--bin takes a binary name")?);
+            }
+            "--example" => {
+                args.next();
+                selection.example = Some(next_str(args).context("--example takes an example name")?);
+            }
+            "-F" | "--features" => {
+                args.next();
+                let list = next_str(args).context("--features takes a feature list")?;
+                selection.features.extend(list.split([',', ' ']).filter(|s| !s.is_empty()).map(str::to_owned));
+            }
+            "--all-features" => {
+                args.next();
+                selection.all_features = true;
+            }
+            "--no-default-features" => {
+                args.next();
+                selection.no_default_features = true;
+            }
+            "--ignored" => {
+                args.next();
+                selection.ignored_only = true;
+            }
+            "--include-ignored" => {
+                args.next();
+                selection.include_ignored = true;
+            }
             "--jobs" => {
                 args.next();
                 let count: usize = next_str(args)?.parse().context("--jobs takes a positive number")?;
@@ -369,6 +512,15 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter:
                 let value = args.next().context("--stats-json takes a file path")?;
                 *stats = Some(PathBuf::from(value));
             }
+            "--target" => {
+                args.next();
+                let triple = next_str(args)?;
+                let target = haste_codegen::Target::find(&triple).with_context(|| {
+                    let known: Vec<&str> = haste_codegen::TARGETS.iter().map(|t| t.triple).collect();
+                    format!("unknown target `{triple}`; supported targets: {}", known.join(", "))
+                })?;
+                crate::set_target(target);
+            }
             "-o" | "--output" => {
                 args.next();
                 let value = args.next().context("-o takes a file path")?;
@@ -384,13 +536,14 @@ type ParsedInvocation = (Command, PathBuf, Vec<String>, Option<PathBuf>, Option<
 
 fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
     let mut args = std::env::args_os().skip(1).peekable();
+    let mut selection = crate::Selection::default();
     let mut stats_json = None;
     let mut out = None;
-    if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
         return Ok(Err(meta));
     }
     let command = parse(&mut args)?;
-    if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
         return Ok(Err(meta));
     }
     if matches!(command, Command::Clean) {
@@ -408,9 +561,13 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         PathBuf::from(args.next().with_context(usage)?)
     };
     if !matches!(command, Command::Request(Request::Run) | Command::Debug(_))
-        && let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)?
+        && let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)?
     {
         return Ok(Err(meta));
+    }
+    crate::set_selection(selection);
+    if matches!(command, Command::Request(Request::Test)) {
+        crate::set_test_mode();
     }
     if !matches!(command, Command::Request(Request::Build)) && (stats_json.is_some() || out.is_some()) {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
@@ -446,7 +603,7 @@ fn print_meta(meta: Meta) {
 }
 
 fn try_serve(command: Command, root: &std::path::Path, stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>, argv: &[String]) -> Result<Option<i32>> {
-    if stats_json.is_some() || crate::image::watch::enabled() {
+    if stats_json.is_some() || crate::image::watch::enabled() || crate::compile_target().triple != haste_codegen::Target::host().triple {
         return Ok(None);
     }
     match command {
@@ -532,7 +689,7 @@ fn program_name(root: &std::path::Path) -> String {
 
 /// Loads the workspace at `root` with the standard library merged in and the output of every build script settled.
 pub(crate) fn load_workspace(root: &std::path::Path, targets: &Targets) -> Result<graph::Workspace> {
-    let mut workspace = graph::load(root, targets)?;
+    let mut workspace = graph::load(root, targets, crate::selection())?;
     workspace.merge(graph::load_sysroot(&graph::library()?, targets)?);
     crate::scripts::settle(&mut workspace, targets)?;
     Ok(workspace)
@@ -551,10 +708,10 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
         }
         return Ok(0);
     }
-    let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
+    let targets = Targets { target: cfg::Target::of(crate::compile_target()), host: cfg::Target::host() };
     let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
-        Command::Debug(Query::Graph) => graph::load(root, &targets)?,
+        Command::Debug(Query::Graph) => graph::load(root, &targets, crate::selection())?,
         _ => load_workspace(root, &targets)?,
     };
     let graph_span = graph_clock.elapsed();

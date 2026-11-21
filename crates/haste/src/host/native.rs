@@ -3,6 +3,7 @@
 use std::ffi::{CStr, CString, c_void};
 use std::hash::BuildHasher as _;
 use std::io::Read as _;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -126,7 +127,14 @@ fn open_libraries(libraries: &Libraries) -> Result<HashMap<Box<str>, usize>> {
     if !path.is_file() {
         link(libraries, &path)?;
     }
-    let handle = open(&path, libc::RTLD_LAZY)?;
+    #[cfg(unix)]
+    let handle = match open(&path, libc::RTLD_LAZY) {
+        Ok(handle) => handle,
+        Err(err) if err.to_string().contains("static TLS block") => return Ok(HashMap::default()),
+        Err(err) => return Err(err),
+    };
+    #[cfg(not(unix))]
+    let handle = open(&path, 0)?;
     table(handle)
 }
 
@@ -226,27 +234,53 @@ fn index(path: &Path) -> Result<Vec<String>> {
 
 /// Opens the library at `path` with its symbols global and its references bound by `mode`, `RTLD_LAZY` or `RTLD_NOW`, so it serves every foreign symbol it exports, and returns its handle.
 pub fn open(path: &Path, mode: libc::c_int) -> Result<*mut c_void> {
-    let text = CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: text is a NUL-terminated string that lives across the call; haste opens only libraries it built, whose initializers are those a cargo build of the same code would run.
-    let handle = unsafe { libc::dlopen(text.as_ptr(), mode | libc::RTLD_GLOBAL) };
-    if !handle.is_null() {
-        return Ok(handle);
+    #[cfg(unix)]
+    {
+        let text = CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: text is a NUL-terminated string that lives across the call; haste opens only libraries it built, whose initializers are those a cargo build of the same code would run.
+        let handle = unsafe { libc::dlopen(text.as_ptr(), mode | libc::RTLD_GLOBAL) };
+        if !handle.is_null() {
+            return Ok(handle);
+        }
+        // SAFETY: dlerror takes no arguments and returns null or a message that stays valid until the next dynamic linker call on this thread.
+        let reason = unsafe { libc::dlerror() };
+        // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
+        let reason = if reason.is_null() { String::new() } else { unsafe { CStr::from_ptr(reason) }.to_string_lossy().into_owned() };
+        bail!("loading {}: {reason}", path.display())
     }
-    // SAFETY: dlerror takes no arguments and returns null or a message that stays valid until the next dynamic linker call on this thread.
-    let reason = unsafe { libc::dlerror() };
-    // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
-    let reason = if reason.is_null() { String::new() } else { unsafe { CStr::from_ptr(reason) }.to_string_lossy().into_owned() };
-    bail!("loading {}: {reason}", path.display())
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        unsafe extern "system" {
+            fn LoadLibraryA(path: *const i8) -> *mut c_void;
+        }
+        let text = CString::new(path.to_string_lossy().as_bytes())?;
+        // SAFETY: text is a NUL-terminated path string living across the call.
+        let handle = unsafe { LoadLibraryA(text.as_ptr()) };
+        if !handle.is_null() {
+            return Ok(handle);
+        }
+        bail!("loading {}: {}", path.display(), std::io::Error::last_os_error())
+    }
 }
 
 fn find(handle: *mut c_void, name: &str) -> Result<*const c_void> {
     let text = CString::new(name)?;
+    #[cfg(unix)]
     // SAFETY: handle came from dlopen and stays open for the process; text is NUL-terminated and lives across the call.
-    let address = unsafe { libc::dlsym(handle, text.as_ptr()) };
+    let address = unsafe { libc::dlsym(handle, text.as_ptr()) }.cast_const();
+    #[cfg(windows)]
+    let address = {
+        unsafe extern "system" {
+            fn GetProcAddress(module: *mut c_void, proc_name: *const i8) -> *const c_void;
+        }
+        // SAFETY: handle came from LoadLibraryA and text is NUL-terminated.
+        unsafe { GetProcAddress(handle, text.as_ptr()) }
+    };
     if address.is_null() {
         bail!("the native library exports no {name}");
     }
-    Ok(address.cast_const())
+    Ok(address)
 }
 
 /// The name and address of each static symbol in the table of the library `handle`.

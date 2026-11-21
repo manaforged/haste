@@ -4,6 +4,7 @@ pub(crate) mod cpu;
 mod math;
 pub mod native;
 mod syscall;
+pub(crate) mod unwind;
 mod x86;
 
 pub use math::{MathSymbol, symbol as intrinsic};
@@ -28,6 +29,9 @@ pub enum HostSymbol {
     FillOnce,
     ThreadCell,
     Syscall,
+    CatchUnwind,
+    StartPanic,
+    PanicCleanup,
     Math(MathSymbol),
     X86(X86Symbol),
     Dynamic(Box<str>),
@@ -43,8 +47,8 @@ const DIRECT: &[HostSymbol] = &[
 ];
 
 impl HostSymbol {
-    /// Classifies `name` into a typed host symbol when the host links to it.
-    pub fn resolve(name: &str) -> Option<Self> {
+    /// Classifies `name` into a typed host symbol when the host links to it (or unconditionally as a dynamic import when `aot` is true).
+    pub fn resolve_for(name: &str, aot: bool) -> Option<Self> {
         if let Some(found) = DIRECT.iter().find(|sym| sym.link_name() == name) {
             return Some(found.clone());
         }
@@ -52,15 +56,25 @@ impl HostSymbol {
             "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.x86.avx.vzeroupper" | "llvm.aarch64.hint" => Self::Noop,
             "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => Self::Barrier,
             "llvm.x86.xgetbv" => Self::ExtendedState,
-            "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => Self::Abort,
+            "__rust_alloc_error_handler" => Self::Abort,
+            "__rust_start_panic" => Self::StartPanic,
+            "__rust_panic_cleanup" => Self::PanicCleanup,
             _ => {
                 if let Some(math) = MathSymbol::from_name(name) {
                     return Some(Self::Math(math));
+                }
+                if aot {
+                    return Some(Self::Dynamic(name.into()));
                 }
                 return dynamic(name).map(|_| Self::Dynamic(name.into()));
             }
         };
         Some(built_in)
+    }
+
+    /// Classifies `name` into a typed host symbol when the host links to it.
+    pub fn resolve(name: &str) -> Option<Self> {
+        Self::resolve_for(name, false)
     }
 
     /// The external linker symbol name for this host helper.
@@ -79,6 +93,9 @@ impl HostSymbol {
             Self::FillOnce => "__haste_fill_once",
             Self::ThreadCell => "__haste_thread_cell",
             Self::Syscall => "__haste_syscall",
+            Self::CatchUnwind => "__haste_catch_unwind",
+            Self::StartPanic => "__rust_start_panic",
+            Self::PanicCleanup => "__rust_panic_cleanup",
             Self::Math(math) => math.link_name(),
             Self::X86(x86) => x86.link_name(),
             Self::Dynamic(name) => name,
@@ -101,6 +118,9 @@ impl HostSymbol {
             Self::FillOnce => crate::image::fill_once as *const () as usize,
             Self::ThreadCell => crate::image::thread_cell as *const () as usize,
             Self::Syscall => syscall::run as *const () as usize,
+            Self::CatchUnwind => unwind::catch_unwind as *const () as usize,
+            Self::StartPanic => unwind::start_panic as *const () as usize,
+            Self::PanicCleanup => unwind::panic_cleanup as *const () as usize,
             Self::Math(math) => math.host_addr(),
             Self::X86(x86) => return x86.host_addr(),
             Self::Dynamic(_) => return dynamic(self.link_name()),
@@ -116,9 +136,32 @@ fn dynamic(name: &str) -> Option<usize> {
         return Some(address);
     }
     let name = CString::new(name).ok()?;
-    // SAFETY: name is a NUL-terminated string that lives across the call.
-    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    (!address.is_null()).then_some(address as usize)
+    #[cfg(unix)]
+    {
+        // SAFETY: name is a NUL-terminated string that lives across the call.
+        let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        (!address.is_null()).then_some(address as usize)
+    }
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetModuleHandleA(module_name: *const i8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(module: *mut core::ffi::c_void, proc_name: *const i8) -> *const core::ffi::c_void;
+        }
+        for module_name in [std::ptr::null(), c"ucrtbase.dll".as_ptr(), c"kernel32.dll".as_ptr(), c"msvcrt.dll".as_ptr()] {
+            // SAFETY: module_name is null or a static NUL-terminated DLL name; name is a live NUL-terminated CString.
+            let module = unsafe { GetModuleHandleA(module_name) };
+            if module.is_null() {
+                continue;
+            }
+            // SAFETY: module is a live loaded module handle and name is NUL-terminated.
+            let address = unsafe { GetProcAddress(module, name.as_ptr()) };
+            if !address.is_null() {
+                return Some(address as usize);
+            }
+        }
+        None
+    }
 }
 
 /// Writes the four registers that `cpuid` leaf `leaf`, subleaf `sub_leaf` gives compiled code to `out`.

@@ -169,8 +169,21 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
 }
 
 pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
-    let found = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file());
-    found.map(Path::to_owned).with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
+    if let Some(found) = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file()) {
+        return Ok(found.to_owned());
+    }
+    let manifest_dir = root.ancestors().find(|dir| dir.join(MANIFEST_FILE).is_file()).with_context(|| format!("no {LOCK_FILE} or {MANIFEST_FILE} at or above {}", root.display()))?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
+    let out = std::process::Command::new(cargo)
+        .args(["generate-lockfile", "--quiet", "--manifest-path"])
+        .arg(manifest_dir.join(MANIFEST_FILE))
+        .output()
+        .with_context(|| format!("no {LOCK_FILE} at or above {} and failed to run `cargo generate-lockfile`", root.display()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("`cargo generate-lockfile` failed: {}", stderr.trim());
+    }
+    root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file()).map(Path::to_owned).with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
 }
 
 /// The lock file, workspace manifest, root manifest, and every local package's manifest and build script.
@@ -234,9 +247,10 @@ fn resolve_deps(packages: &mut [Package]) {
     }
 }
 
-/// Reads the package at `root` from its workspace's `Cargo.lock` and manifests and resolves its graph for `targets`.
-pub fn load(root: &Path, targets: &Targets) -> Result<Workspace> {
-    load_with(root, targets, &[])
+/// Reads the package at `root` from its workspace's `Cargo.lock` and manifests and resolves its graph for `targets` using `selection`.
+pub(crate) fn load(root: &Path, targets: &Targets, selection: &crate::Selection) -> Result<Workspace> {
+    let features: Vec<&str> = selection.features.iter().map(String::as_str).collect();
+    load_filtered(root, targets, selection.package.as_deref(), &features, (!selection.no_default_features, selection.all_features), &[])
 }
 
 fn load_package(entry: Locked, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Package, Option<anyhow::Error>)> {
@@ -312,18 +326,23 @@ fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String], omit_roo
     locked.into_iter().enumerate().filter_map(|(idx, entry)| keep[idx].then_some(entry)).collect()
 }
 
-/// Like [`load`], with `features` enabled on the root package besides its defaults.
-pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Workspace> {
-    load_filtered(root, targets, features, &[])
-}
-
-fn load_filtered(root: &Path, targets: &Targets, features: &[&str], omit_root_deps: &[&str]) -> Result<Workspace> {
+fn load_filtered(
+    root: &Path,
+    targets: &Targets,
+    package: Option<&str>,
+    features: &[&str],
+    (default_features, all_features): (bool, bool),
+    omit_root_deps: &[&str],
+) -> Result<Workspace> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
     let root = canonical.as_path();
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
-    let root_names = root_package_names(root, &top, workspace.as_ref())?;
-    let locked = prune_unreachable_locked(lock::read(&top.join("Cargo.lock"))?, &root_names, omit_root_deps);
+    let root_names = match package {
+        Some(name) => vec![name.to_owned()],
+        None => root_package_names(root, &top, workspace.as_ref())?,
+    };
+    let locked = prune_unreachable_locked(lock::read(&top.join(LOCK_FILE))?, &root_names, omit_root_deps);
     let wanted_local: BTreeSet<String> = locked.iter().filter(|e| !e.is_registry()).map(|e| e.name.clone()).collect();
     let mut registries = registry_dirs()?;
     registries.insert(0, top.join("vendor"));
@@ -342,9 +361,12 @@ fn load_filtered(root: &Path, targets: &Targets, features: &[&str], omit_root_de
         .map(|(at, _)| at)
         .collect();
     if members.is_empty() {
-        bail!("{} is not in Cargo.lock", root.display());
+        match package {
+            Some(name) => bail!("package `{name}` is not in {LOCK_FILE}"),
+            None => bail!("{} is not in {LOCK_FILE}", root.display()),
+        }
     }
-    let graph = features::resolve(&packages, targets, &members, features);
+    let graph = features::resolve(&packages, targets, &members, features, default_features, all_features);
     for unit in &graph.units {
         if let Some(err) = missing[unit.package].take() {
             return Err(err);
@@ -362,6 +384,25 @@ pub fn library() -> Result<PathBuf> {
         let dir = root.join("lib/rustlib/src/rust/library");
         dir.join("sysroot").is_dir().then_some(dir)
     };
+    let home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|home| PathBuf::from(home).join(".rustup")));
+    if std::env::var_os("RUSTC").is_none()
+        && let Some(ref rustup_home) = home
+    {
+        let active = std::env::var("RUSTUP_TOOLCHAIN").ok().or_else(|| {
+            let text = std::fs::read_to_string(rustup_home.join("settings.toml")).ok()?;
+            text.lines().find_map(|line| {
+                let rest = line.trim().strip_prefix("default_toolchain")?.trim().strip_prefix('=')?.trim();
+                Some(rest.trim_matches('"').to_owned())
+            })
+        });
+        if let Some(tc) = active
+            && let Some(dir) = sysroot_library(&rustup_home.join("toolchains").join(tc))
+        {
+            return Ok(dir);
+        }
+    }
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
     if let Ok(output) = std::process::Command::new(rustc).args(["--print", "sysroot"]).output()
         && output.status.success()
@@ -370,7 +411,6 @@ pub fn library() -> Result<PathBuf> {
     {
         return Ok(dir);
     }
-    let home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
     if let Some(toolchains) = home.map(|home| home.join("toolchains"))
         && let Ok(entries) = std::fs::read_dir(&toolchains)
     {
@@ -387,7 +427,7 @@ pub fn library() -> Result<PathBuf> {
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.
 pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
-    let mut sysroot = load_filtered(&library.join("sysroot"), targets, &[], &["test"])?;
+    let mut sysroot = load_filtered(&library.join("sysroot"), targets, None, &[], (true, false), &["test"])?;
     sysroot.packages.iter_mut().for_each(|package| package.sysroot = true);
     Ok(sysroot)
 }

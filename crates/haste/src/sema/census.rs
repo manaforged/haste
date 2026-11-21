@@ -187,6 +187,7 @@ pub fn write_stats(cx: &mut Context<'_>, input: CensusInput<'_>, path: &Path) ->
     Ok(())
 }
 
+#[cfg(unix)]
 fn process_cpu_ns() -> u64 {
     let mut total = 0u64;
     for who in [libc::RUSAGE_SELF, libc::RUSAGE_CHILDREN] {
@@ -202,6 +203,11 @@ fn process_cpu_ns() -> u64 {
         }
     }
     total
+}
+
+#[cfg(not(unix))]
+fn process_cpu_ns() -> u64 {
+    0
 }
 
 fn crate_origins(cx: &Context<'_>, workspace: &Workspace) -> Vec<Origin> {

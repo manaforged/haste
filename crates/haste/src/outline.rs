@@ -28,6 +28,8 @@ use tree::{Crate, Decl, Env, Files, Macro, Module, State};
 pub enum Role {
     Lib,
     Bin,
+    Example,
+    Test,
     Script,
 }
 
@@ -67,6 +69,14 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
         if needed.is_none() && workspace.graph.members.contains(&entry.package) {
             let bins = manifest.bins.iter().map(|(name, path)| Root { unit, name: name.clone(), path: path.clone(), role: Role::Bin });
             roots.extend(bins);
+            if let Some(wanted) = crate::selection().example.as_deref() {
+                let examples = manifest.examples.iter().filter(|(name, _)| name == wanted).map(|(name, path)| Root { unit, name: name.clone(), path: path.clone(), role: Role::Example });
+                roots.extend(examples);
+            }
+            if crate::test_mode() {
+                let tests = manifest.tests.iter().map(|(name, path)| Root { unit, name: name.clone(), path: path.clone(), role: Role::Test });
+                roots.extend(tests);
+            }
         }
         if let Some(path) = manifest.build.as_ref().filter(|_| scripts.contains(&unit)) {
             roots.push(Root { unit, name: "build_script_build".to_owned(), path: path.clone(), role: Role::Script });
@@ -119,14 +129,20 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
         .map(|root| {
             let unit = &workspace.graph.units[root.unit];
             let package = &workspace.packages[unit.package];
-            let wanted = if root.role == Role::Script { Kind::Build } else { Kind::Normal };
-            let normal = unit.deps.iter().filter(|(_, _, kind)| *kind == wanted);
+            let include_dev = (crate::test_mode() && workspace.graph.members.contains(&unit.package)) || matches!(root.role, Role::Example | Role::Test);
+            let normal = unit.deps.iter().filter(|(_, _, kind)| {
+                if root.role == Role::Script {
+                    *kind == Kind::Build
+                } else {
+                    *kind == Kind::Normal || (include_dev && *kind == Kind::Dev)
+                }
+            });
             let extern_name = |key: &str, dep: usize, lib: usize| {
                 let renamed = workspace.packages[workspace.graph.units[dep].package].manifest.name != key;
                 if renamed { key.replace('-', "_") } else { roots[lib].name.clone() }
             };
             let mut deps: Vec<(String, usize)> = normal.filter_map(|(key, dep, _)| libs.get(dep).map(|&lib| (extern_name(key, *dep, lib), lib))).collect();
-            if root.role == Role::Bin
+            if matches!(root.role, Role::Bin | Role::Example | Role::Test)
                 && let Some(&lib) = libs.get(&root.unit)
             {
                 deps.push((roots[lib].name.clone(), lib));

@@ -3,7 +3,9 @@
 use std::fs::File;
 use std::hash::BuildHasher as _;
 use std::io::{self, Write as _};
+#[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,10 +21,13 @@ const FAILED: &str = "failed";
 const OK_MARK: &str = "+";
 const FAILED_MARK: &str = "-";
 
-/// The directory of the store: `$HASTE_HOME`, else `$XDG_CACHE_HOME/haste`, else `$HOME/.cache/haste`.
+/// The directory of the store: `$HASTE_HOME`, else `$XDG_CACHE_HOME/haste`, else `$HOME/.cache/haste` (or `%LOCALAPPDATA%\haste` on Windows).
 pub(crate) fn home() -> PathBuf {
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
-    let home = var("HASTE_HOME").or_else(|| var("XDG_CACHE_HOME").map(|cache| cache.join("haste"))).or_else(|| var("HOME").map(|home| home.join(".cache/haste")));
+    let home = var("HASTE_HOME")
+        .or_else(|| var("XDG_CACHE_HOME").map(|cache| cache.join("haste")))
+        .or_else(|| var("LOCALAPPDATA").map(|cache| cache.join("haste")))
+        .or_else(|| var("HOME").or_else(|| var("USERPROFILE")).map(|home| home.join(".cache/haste")));
     home.unwrap_or_else(|| std::env::temp_dir().join("haste"))
 }
 
@@ -78,7 +83,10 @@ pub(crate) type FileStamp = Option<(u64, i128)>;
 
 /// Extracts the byte size and nanosecond modification timestamp from file metadata `meta`.
 pub(crate) fn meta_stamp(meta: &std::fs::Metadata) -> (u64, i128) {
+    #[cfg(unix)]
     let nanos = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    #[cfg(not(unix))]
+    let nanos = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i128);
     (meta.len(), nanos)
 }
 
@@ -155,6 +163,7 @@ fn make_writable(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+    #[cfg(unix)]
     if meta.is_dir() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() | 0o700))?;
         for entry in std::fs::read_dir(path)? {
@@ -162,6 +171,19 @@ fn make_writable(path: &Path) -> io::Result<()> {
         }
     } else if !meta.file_type().is_symlink() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() | 0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            std::fs::set_permissions(path, perms)?;
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                make_writable(&entry?.path())?;
+            }
+        }
     }
     Ok(())
 }
@@ -188,9 +210,31 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
     let dir = dir(workspace, unit);
     std::fs::create_dir_all(&dir)?;
     let file = File::options().create(true).truncate(false).write(true).open(dir.join("lock"))?;
+    #[cfg(unix)]
     // SAFETY: the descriptor belongs to `file`, which stays open for the call; flock only reads it.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            event: *mut core::ffi::c_void,
+        }
+        unsafe extern "system" {
+            fn LockFileEx(file: *mut core::ffi::c_void, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32;
+        }
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
+        let mut overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() };
+        // SAFETY: file.as_raw_handle() is a live open file handle and overlapped is a live zeroed struct.
+        if unsafe { LockFileEx(file.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK, 0, u32::MAX, u32::MAX, &raw mut overlapped) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(Lock { _file: file })
 }
@@ -227,8 +271,15 @@ pub(crate) fn write_new(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> 
 }
 
 /// Atomically replaces symlink `path` with a link pointing to `target`.
+#[cfg(unix)]
 pub(crate) fn replace_symlink(target: &std::ffi::OsStr, path: &Path) -> io::Result<()> {
     replace_with(path, |tmp| std::os::unix::fs::symlink(target, tmp))
+}
+
+/// Atomically replaces symlink `path` with a link pointing to `target`.
+#[cfg(not(unix))]
+pub(crate) fn replace_symlink(_target: &std::ffi::OsStr, _path: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "symlinks require Unix"))
 }
 
 /// The path this process writes `path` at before it renames the file into place, so no reader sees it half written.

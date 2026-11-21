@@ -8,6 +8,7 @@ mod frames;
 mod imm;
 mod int;
 mod location;
+pub(crate) mod text;
 mod vector;
 mod vector_lanes;
 mod vector_reduce;
@@ -686,13 +687,9 @@ impl Emit<'_> {
         }
         match direct {
             Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
-            Some(CallTarget::Slot(sym)) if self.direct_calls => {
-                let at = self.asm.call_pcrel32();
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::PcRel32));
-            }
             Some(CallTarget::Slot(sym)) => {
-                let at = self.asm.call_slot_reloc();
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
+                let reloc = self.asm.call_symbol(sym, self.direct_calls);
+                self.relocs.push(reloc);
             }
             Some(CallTarget::Runtime(rt)) if self.direct_calls => {
                 let at = self.asm.call_pcrel32();

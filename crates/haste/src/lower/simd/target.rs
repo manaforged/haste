@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, IntCC, Lane, ReduceOp, StackSlot, Target, TargetOpId, Type, Value};
+use haste_codegen::{Arch, IntCC, Lane, ReduceOp, StackSlot, TargetOpId, Type, Value};
 
 use crate::host::{HostSymbol, X86Symbol};
 use crate::names::Primitive;
@@ -25,7 +25,7 @@ impl Lower<'_, '_> {
     fn shuffle_dyn_16(&mut self, table: Value, index: Value, tbl: bool, off: i32) -> Value {
         let ty = Type::Vec { lane: Lane::I8, count: 16 };
         let (t, idx) = (self.ins().load(ty, table, off), self.ins().load(ty, index, off));
-        let arch = Target::host().arch;
+        let arch = crate::compile_target().arch;
         if (tbl && arch == Arch::Arm64) || (!tbl && arch == Arch::X64) {
             return self.ins().shuffle_dyn(t, t, idx);
         }
@@ -111,7 +111,7 @@ impl Lower<'_, '_> {
     }
 
     pub(in crate::lower) fn target_vector(&mut self, id: TargetOpId, ty: Type, args: &[Value]) -> Result<Value> {
-        let arch = Target::host().arch;
+        let arch = crate::compile_target().arch;
         if is_arm64_target_op(id) && arch != Arch::Arm64 {
             bail!("ARM64 vector intrinsic {id:?} is only supported on Arm64");
         }
@@ -133,7 +133,7 @@ impl Lower<'_, '_> {
                 None => value,
             });
         }
-        if Target::host().arch == Arch::X64
+        if crate::compile_target().arch == Arch::X64
             && let Some((id, ty)) = x86_target_op(x86)
             && (1..=3).contains(&args.len())
         {
@@ -164,7 +164,7 @@ impl Lower<'_, '_> {
         let f32x4 = Type::Vec { lane: Lane::F32, count: 4 };
         let f64x2 = Type::Vec { lane: Lane::F64, count: 2 };
         match (x86, args) {
-            (X86Symbol::Addcarry64 | X86Symbol::Subborrow64, &[carry, a, b]) if Target::host().arch == Arch::X64 => {
+            (X86Symbol::Addcarry64 | X86Symbol::Subborrow64, &[carry, a, b]) if crate::compile_target().arch == Arch::X64 => {
                 let (sum, carried) = if x86 == X86Symbol::Addcarry64 { (TargetOpId::X64AddCarry, TargetOpId::X64AddCarryOut) } else { (TargetOpId::X64SubBorrow, TargetOpId::X64SubBorrowOut) };
                 let result = self.ins().target_op(sum, Type::I64, &[carry, a, b]);
                 let out = self.ins().target_op(carried, Type::I8, &[carry, a, b]);
@@ -190,7 +190,7 @@ impl Lower<'_, '_> {
                 let (byte, quad) = (self.cx.types.prim(Primitive::U8), self.cx.types.prim(Primitive::U64));
                 Ok(Some(self.pair([byte, quad], [out, result])?))
             }
-            (X86Symbol::Pclmulqdq | X86Symbol::Pclmulqdq256 | X86Symbol::Pclmulqdq512, &[a, b, imm]) if Target::host().arch == Arch::X64 && self.b.const_int(imm).is_some() => {
+            (X86Symbol::Pclmulqdq | X86Symbol::Pclmulqdq256 | X86Symbol::Pclmulqdq512, &[a, b, imm]) if crate::compile_target().arch == Arch::X64 && self.b.const_int(imm).is_some() => {
                 let id = match self.b.const_int(imm).unwrap_or_default() & 0x11 {
                     0x00 => TargetOpId::X64ClmulLowLow,
                     0x01 => TargetOpId::X64ClmulHighLow,

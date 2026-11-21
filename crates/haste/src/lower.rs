@@ -38,16 +38,16 @@ pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTa
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, ArgumentPurpose, Block, FunctionBuilder, Ins, Signature, StackSlot, Target, Type, Value};
+use haste_codegen::{Arch, ArgumentPurpose, Block, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
 
 /// Whether `arch` is x86-64 or AArch64.
 pub(crate) fn arch_is_x64_or_arm64(arch: Arch) -> bool {
     matches!(arch, Arch::X64 | Arch::Arm64)
 }
 
-/// Whether the host target architecture is x86-64 or AArch64.
+/// Whether the compilation target architecture is x86-64 or AArch64.
 pub(crate) fn host_is_x64_or_arm64() -> bool {
-    arch_is_x64_or_arm64(Target::host().arch)
+    arch_is_x64_or_arm64(crate::compile_target().arch)
 }
 
 use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
@@ -395,6 +395,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             Shape::Untuple(res) => self.untuple_call(res.clone()),
             &Shape::Ctor(variant) => self.ctor_body(variant),
             Shape::Clone(calls) => self.clone_body(calls.clone()),
+            Shape::Asm(_) => bail!("global_asm function is assembled directly"),
             Shape::Anon(anon) => self.expr(anon.root),
             Shape::Closure(closure) if closure.closure.coroutine => self.resume_root(closure.closure.body),
             Shape::Closure(closure) => {

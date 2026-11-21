@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, Arch, ArgumentPurpose, CallConv, Lane, Signature, Target, Type, Value};
+use haste_codegen::{AbiParam, Arch, ArgumentPurpose, CallConv, Lane, Signature, Type, Value};
 use rustc_abi::{BackendLaneCount, BackendRepr, FieldsShape, Float, Primitive, Scalar, TargetDataLayout, Variants};
 use rustc_index::Idx;
 
@@ -449,7 +449,7 @@ fn simd_parts(element: &Scalar, count: BackendLaneCount, size: u64) -> Parts {
         (Some(ty), _) => Parts::One(ty),
         (None, 8) => Parts::One(Type::I64),
         (None, 16) => Parts::Pair(Type::I64, Type::I64, 8),
-        (None, 32) => half().map_or(Parts::Bytes, |half| match half.double_vec().filter(|wide| wide.is_register_vec(Target::host())) {
+        (None, 32) => half().map_or(Parts::Bytes, |half| match half.double_vec().filter(|wide| wide.is_register_vec(crate::compile_target())) {
             Some(wide) => Parts::One(wide),
             None => Parts::Pair(half, half, 16),
         }),
@@ -600,7 +600,7 @@ impl Lower<'_, '_> {
             Repr::Mem { size, .. } => size,
         };
         let layout = self.cx.layout(ty)?;
-        let arch = Target::host().arch;
+        let arch = crate::compile_target().arch;
         if let BackendRepr::SimdVector { element, count } = &layout.backend_repr {
             return Ok(NativePass::Direct(vec![(simd_native_type(element, *count, size, arch)?, 0)]));
         }

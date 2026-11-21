@@ -91,7 +91,13 @@ fn find_plan(func: &Function, cfg: &Cfg, each: &Loop, inner: bool) -> Option<Rot
     }
     let (mut need_body, mut need_exit) = (Vec::new(), Vec::new());
     let mut exit_uses_ok = true;
-    let exit_single_pred = cfg.preds_of(exit) == [head];
+    let exit_preds = cfg.preds_of(exit);
+    let exit_all_in_loop = !exit_preds.is_empty()
+        && exit_preds.iter().all(|&p| {
+            each.body.get(p.index()).copied().unwrap_or(false)
+                && (p == head || matches!(func.last(p), Some(Op::Jump(..) | Op::Brif(..))))
+        });
+    let multi_exit_pred = exit_preds != [head];
     for (b_idx, block) in func.blocks.iter().enumerate() {
         if !cfg.reachable[b_idx] || b_idx == head.index() {
             continue;
@@ -107,11 +113,14 @@ fn find_plan(func: &Function, cfg: &Cfg, each: &Loop, inner: bool) -> Option<Rot
                         need_body.push(v);
                     }
                 } else {
-                    if !exit_single_pred || !cfg.dominates(exit, Block(b_idx as u32)) {
+                    if !exit_all_in_loop || !cfg.dominates(exit, Block(b_idx as u32)) {
                         exit_uses_ok = false;
                     }
                     if !need_exit.contains(&v) {
                         need_exit.push(v);
+                    }
+                    if multi_exit_pred && !need_body.contains(&v) {
+                        need_body.push(v);
                     }
                 }
             });
@@ -222,6 +231,27 @@ fn rotate_one(func: &mut Function, cfg: &Cfg, each: &Loop, inner: bool) -> bool 
         exit_remap.push((v, np));
     }
     rewrite_blocks(func, each, plan.head, &body_remap, &exit_remap);
+    if !plan.need_exit.is_empty() {
+        let extra: Vec<Value> = plan.need_exit.iter().map(|&v| remap_val(&body_remap, v)).collect();
+        for &pred in cfg.preds_of(plan.exit) {
+            if pred == plan.head {
+                continue;
+            }
+            let Some(&last) = func.blocks[pred.index()].insts.last() else { continue };
+            match &mut func.insts[last.index()].op {
+                Op::Jump(t, args) if *t == plan.exit => args.extend_from_slice(&extra),
+                Op::Brif(_, t, ta, f, fa) => {
+                    if *t == plan.exit {
+                        ta.extend_from_slice(&extra);
+                    }
+                    if *f == plan.exit {
+                        fa.extend_from_slice(&extra);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     clone_guard_into(func, pre, &plan, &pre_args);
     for &latch in &each.latches {
         match func.last(latch).cloned() {

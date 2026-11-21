@@ -58,14 +58,27 @@ pub struct Memory {
     sealed: bool,
 }
 
+#[cfg(unix)]
 fn page() -> usize {
     // SAFETY: sysconf only reads a system constant.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
+#[cfg(target_os = "windows")]
+fn page() -> usize {
+    4096
+}
+
+#[cfg(unix)]
 fn this_process() -> i32 {
     // SAFETY: getpid has no preconditions.
     unsafe { libc::getpid() }
+}
+
+#[cfg(target_os = "windows")]
+fn this_process() -> i32 {
+    // SAFETY: GetCurrentProcessId has no preconditions.
+    unsafe { win::GetCurrentProcessId() as i32 }
 }
 
 fn memory_error(message: String) -> Error {
@@ -160,7 +173,9 @@ impl Drop for Memory {
     fn drop(&mut self) {
         for chunk in &self.chunks {
             unmap(chunk.write, chunk.len);
-            unmap(chunk.exec, chunk.len);
+            if chunk.exec != chunk.write {
+                unmap(chunk.exec, chunk.len);
+            }
         }
     }
 }
@@ -255,17 +270,25 @@ impl Drop for Arena {
 /// Addresses `Arena::low` tries in turn, each well above the null page and the start of a non-relocated program.
 const LOW_HINTS: [usize; 6] = [0x1000_0000, 0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 0x6000_0000];
 
+#[cfg(unix)]
 fn unmap(base: usize, size: usize) {
     // SAFETY: base and size name a mapping this process made and still owns, and its owner is being dropped, so nothing reads it after this.
     unsafe { libc::munmap(base as *mut libc::c_void, size) };
 }
 
+#[cfg(target_os = "windows")]
+fn unmap(base: usize, _size: usize) {
+    // SAFETY: base is a region returned by VirtualAlloc that this process owns and is dropping.
+    unsafe { win::VirtualFree(base as *mut std::ffi::c_void, 0, win::MEM_RELEASE) };
+}
+
 /// Asks the kernel to fail rather than move the mapping when the hint is taken, where it can.
 #[cfg(target_os = "linux")]
 const NO_REPLACE: i32 = libc::MAP_FIXED_NOREPLACE;
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const NO_REPLACE: i32 = 0;
 
+#[cfg(unix)]
 fn map_low(size: usize, hint: usize) -> Option<usize> {
     let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | NO_REPLACE;
     // SAFETY: without MAP_FIXED the kernel never replaces an existing mapping, so the new mapping touches no existing memory.
@@ -279,6 +302,20 @@ fn map_low(size: usize, hint: usize) -> Option<usize> {
     None
 }
 
+#[cfg(target_os = "windows")]
+fn map_low(size: usize, hint: usize) -> Option<usize> {
+    // SAFETY: VirtualAlloc with a hint returns a fresh region or null without replacing existing memory.
+    let base = unsafe { win::VirtualAlloc(hint as *mut std::ffi::c_void, size, win::MEM_COMMIT | win::MEM_RESERVE, win::PAGE_READWRITE) };
+    if base as usize == hint && hint + size <= 1 << 31 {
+        return Some(hint);
+    }
+    if !base.is_null() {
+        unmap(base as usize, size);
+    }
+    None
+}
+
+#[cfg(unix)]
 fn map_data(size: usize, sharing: Sharing) -> Result<usize, Error> {
     let flags = if sharing == Sharing::Private { libc::MAP_PRIVATE } else { libc::MAP_SHARED } | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
     // SAFETY: a new anonymous mapping touches no existing memory.
@@ -287,6 +324,43 @@ fn map_data(size: usize, sharing: Sharing) -> Result<usize, Error> {
         return Err(memory_error(format!("mmap: {}", std::io::Error::last_os_error())));
     }
     Ok(base as usize)
+}
+
+#[cfg(target_os = "windows")]
+fn map_data(size: usize, _sharing: Sharing) -> Result<usize, Error> {
+    // SAFETY: VirtualAlloc with a null address allocates fresh private read/write memory.
+    let base = unsafe { win::VirtualAlloc(std::ptr::null_mut(), size, win::MEM_COMMIT | win::MEM_RESERVE, win::PAGE_READWRITE) };
+    if base.is_null() {
+        return Err(memory_error(format!("VirtualAlloc: {}", std::io::Error::last_os_error())));
+    }
+    Ok(base as usize)
+}
+
+#[cfg(target_os = "windows")]
+fn views(size: usize) -> Result<(usize, usize), Error> {
+    // SAFETY: VirtualAlloc with a null address allocates fresh executable read/write memory for JIT code.
+    let base = unsafe { win::VirtualAlloc(std::ptr::null_mut(), size, win::MEM_COMMIT | win::MEM_RESERVE, win::PAGE_EXECUTE_READWRITE) };
+    if base.is_null() {
+        return Err(memory_error(format!("VirtualAlloc: {}", std::io::Error::last_os_error())));
+    }
+    Ok((base as usize, base as usize))
+}
+
+#[cfg(target_os = "windows")]
+mod win {
+    pub const MEM_COMMIT: u32 = 0x1000;
+    pub const MEM_RESERVE: u32 = 0x2000;
+    pub const MEM_RELEASE: u32 = 0x8000;
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn VirtualAlloc(addr: *mut std::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut std::ffi::c_void;
+        pub fn VirtualFree(addr: *mut std::ffi::c_void, size: usize, kind: u32) -> i32;
+        pub fn GetCurrentProcessId() -> u32;
+        pub fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        pub fn FlushInstructionCache(process: *mut std::ffi::c_void, base: *const std::ffi::c_void, size: usize) -> i32;
+    }
 }
 
 /// Maps a chunk of `size` bytes as two views of the same pages, each shared with forked processes.
@@ -372,6 +446,11 @@ fn flush(exec: usize, len: usize) {
         }
         // SAFETY: exec..exec + len is code memory this process maps.
         unsafe { __clear_cache(exec as *mut u8, (exec + len) as *mut u8) };
+    }
+    #[cfg(target_os = "windows")]
+    // SAFETY: exec..exec + len is code memory this process maps.
+    unsafe {
+        win::FlushInstructionCache(win::GetCurrentProcess(), exec as *const std::ffi::c_void, len);
     }
     let _ = (exec, len);
 }

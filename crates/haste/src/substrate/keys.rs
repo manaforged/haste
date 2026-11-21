@@ -241,12 +241,15 @@ fn compute_exe_content_hash(exe: &Path) -> Option<u64> {
 }
 
 fn exe_meta_key(exe: &Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(exe).ok()?;
     let mut hasher = FxHasher::default();
     exe.hash(&mut hasher);
     crate::graph::store::meta_stamp(&meta).hash(&mut hasher);
-    meta.ino().hash(&mut hasher);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        meta.ino().hash(&mut hasher);
+    }
     Some(hasher.finish())
 }
 

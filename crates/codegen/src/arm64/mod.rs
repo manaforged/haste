@@ -1,10 +1,12 @@
 mod asm;
 mod atomic;
+mod call;
 mod float;
 mod frame;
 mod fuse;
 pub(crate) mod int;
 mod location;
+pub(crate) mod text;
 mod vector;
 mod vector_ops;
 mod wide;
@@ -16,7 +18,7 @@ use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_pro
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, IntCC, Lane, Op, ReduceOp, SigRef, Type, Value};
 use crate::park::ParkReg;
-use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
+use crate::reloc::{DictTierUp, StencilReloc};
 use crate::target::{Os, Target};
 use crate::{Code, Site};
 
@@ -700,15 +702,9 @@ impl Emit<'_> {
         };
         self.move_locs(args, &abi.params, extra);
         match direct {
-            Some(CallTarget::Slot(sym)) if self.direct_calls => {
-                let at = self.asm.bl_reloc();
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64Call26));
-            }
             Some(CallTarget::Slot(sym)) => {
-                let at = self.asm.mov_symbol(T);
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64Movw64));
-                self.asm.load(Size::X, false, T, Mem::new(T, 0));
-                self.asm.blr(T);
+                let reloc = self.asm.call_symbol(sym, self.direct_calls, T);
+                self.relocs.push(reloc);
             }
             Some(CallTarget::Abs(at)) => {
                 self.asm.mov_imm(T, i64::from(at));

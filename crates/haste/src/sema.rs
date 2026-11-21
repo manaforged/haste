@@ -2,10 +2,12 @@
 
 pub mod adt;
 mod body_scope;
+mod borrow;
 mod builtin;
 pub mod census;
 pub mod evaluate;
 mod expand;
+pub mod global_asm;
 pub(crate) mod format;
 pub mod impls;
 pub mod infer;
@@ -59,6 +61,7 @@ pub struct Context<'a> {
     pub(super) eval_stack: Vec<reach::Instance>,
     pub(super) drop_stack: Vec<ty::Ty>,
     pub(super) form_stack: Vec<(infer::Form, usize)>,
+    global_asm: Option<Arc<global_asm::Table>>,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
@@ -122,6 +125,7 @@ impl<'a> Context<'a> {
             eval_stack: Vec::new(),
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
+            global_asm: None,
         }
     }
 
@@ -143,6 +147,7 @@ impl<'a> Context<'a> {
             eval_stack: Vec::new(),
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
+            global_asm: self.global_asm.clone(),
         }
     }
 

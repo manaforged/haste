@@ -470,8 +470,8 @@ impl Lower<'_, '_> {
                 Ok(())
             }
             _ => {
-                let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
                 let Some(value) = value else { return Ok(()) };
+                let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
                 if !self.replace(lhs, place, value)? {
                     self.write(place, value);
                 }

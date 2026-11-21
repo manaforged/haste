@@ -1,6 +1,7 @@
 //! Build scripts kept as executables between runs, as Cargo keeps them: a script that runs again starts its executable while its crate and every crate it builds from hash the same, and one that ran before is compiled ahead of time once it runs again.
 
 use std::hash::BuildHasher as _;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
@@ -54,25 +55,29 @@ impl Binaries {
         if scripts.is_empty() {
             return Ok(());
         }
-        if cfg!(target_os = "macos") {
+        #[cfg(not(target_os = "linux"))]
+        {
             locks.clear();
             for &(unit, krate) in scripts {
                 drop(self.keep(workspace, compilation, unit, krate));
             }
             return Ok(());
         }
-        let child = crate::image::fork_child(|| {
-            locks.clear();
-            let keeper = crate::image::fork_child(|| {
-                detach();
-                let kept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scripts.iter().filter(|&&(unit, krate)| self.keep(workspace, compilation, unit, krate).is_err()).count()));
-                i32::from(!matches!(kept, Ok(0)))
-            });
-            i32::from(keeper.is_err())
-        })?;
-        match crate::image::wait(child) {
-            0 => Ok(()),
-            status => anyhow::bail!("the keeper did not start: status {status}"),
+        #[cfg(target_os = "linux")]
+        {
+            let child = crate::image::fork_child(|| {
+                locks.clear();
+                let keeper = crate::image::fork_child(|| {
+                    detach();
+                    let kept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scripts.iter().filter(|&&(unit, krate)| self.keep(workspace, compilation, unit, krate).is_err()).count()));
+                    i32::from(!matches!(kept, Ok(0)))
+                });
+                i32::from(keeper.is_err())
+            })?;
+            match crate::image::wait(child) {
+                0 => Ok(()),
+                status => anyhow::bail!("the keeper did not start: status {status}"),
+            }
         }
     }
 
@@ -95,6 +100,7 @@ impl Binaries {
 }
 
 /// Detaches this forked keeper from the session and from every pipe and socket it shares with its parent, so neither a terminal signal nor a reader waiting for end of file ties the two together.
+#[cfg(target_os = "linux")]
 fn detach() {
     let shared: Vec<i32> = std::fs::read_dir("/dev/fd").map(|dir| dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok()).collect()).unwrap_or_default();
     for fd in shared.into_iter().filter(|&fd| fd > 2) {
@@ -139,12 +145,27 @@ pub(super) fn ran_before(workspace: &Workspace, unit: usize) -> bool {
     store::dir(workspace, unit).join(super::OUT).is_dir()
 }
 
-/// Runs `script` from `executable` in this forked child with `out` as its standard output, as the image runs a script's `main`; returns the exit status when it cannot start.
+/// Runs `script` from `executable` with `out` as its standard output, as the image runs a script's `main`; returns the exit status when it cannot start.
 pub(super) fn exec(executable: &Path, script: &Script, out: std::fs::File) -> i32 {
     let Ok(log) = std::fs::File::create(&script.log) else { return 101 };
-    let error = std::process::Command::new(executable).arg0("build-script-build").current_dir(&script.dir).envs(script.vars.iter().map(|(key, value)| (key, value))).stdout(out).stderr(log).exec();
-    eprintln!("cannot start {}: {error}", executable.display());
-    127
+    let mut cmd = std::process::Command::new(executable);
+    cmd.current_dir(&script.dir).envs(script.vars.iter().map(|(key, value)| (key, value))).stdout(out).stderr(log);
+    #[cfg(unix)]
+    {
+        let error = cmd.arg0("build-script-build").exec();
+        eprintln!("cannot start {}: {error}", executable.display());
+        127
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.status() {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(error) => {
+                eprintln!("cannot start {}: {error}", executable.display());
+                127
+            }
+        }
+    }
 }
 
 /// The hash of crate `krate` and of every crate it reaches in `outline`, since a fixed crate's hash leaves out its build dependencies.

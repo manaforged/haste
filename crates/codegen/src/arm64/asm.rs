@@ -734,7 +734,7 @@ impl Asm {
         }
     }
 
-    fn pair_offset(&mut self, base: u32, step: i32, a: u8, b: u8, addr: Reg, offset: i32) {
+    pub(in crate::arm64) fn pair_offset(&mut self, base: u32, step: i32, a: u8, b: u8, addr: Reg, offset: i32) {
         self.word(base | (((offset / step) as u32) & 0x7F) << 15 | u32::from(b) << 10 | u32::from(addr.0) << 5 | u32::from(a));
     }
 

@@ -48,15 +48,17 @@ pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
     }
 }
 
-/// The data layout of the machine the compiled code runs on.
+/// The data layout of the target being compiled for.
 pub fn target() -> Result<&'static TargetDataLayout> {
-    static TARGET: OnceLock<TargetDataLayout> = OnceLock::new();
-    if let Some(dl) = TARGET.get() {
+    static CACHE: [OnceLock<TargetDataLayout>; haste_codegen::TARGETS.len()] = [const { OnceLock::new() }; haste_codegen::TARGETS.len()];
+    let current = crate::compile_target();
+    let idx = haste_codegen::TARGETS.iter().position(|t| t.triple == current.triple).unwrap_or(0);
+    if let Some(dl) = CACHE[idx].get() {
         return Ok(dl);
     }
-    let spec = haste_codegen::Target::host().data_layout;
+    let spec = current.data_layout;
     let Ok(parsed) = TargetDataLayout::parse_from_llvm_datalayout_string(spec, AddressSpace::ZERO) else { bail!("bad data layout: {spec}") };
-    Ok(TARGET.get_or_init(|| parsed))
+    Ok(CACHE[idx].get_or_init(|| parsed))
 }
 
 fn scalar(dl: &TargetDataLayout, value: Abi, valid: Option<(u128, u128)>) -> Layout {

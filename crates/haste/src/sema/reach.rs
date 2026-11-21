@@ -8,7 +8,7 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 
 use super::Context;
-use super::infer::{LazyTables, Res, Shape, Typed, infer, register};
+use super::infer::{LazyTables, Res, Typed, infer, register};
 use super::substs::Substs;
 use super::summary::thaw;
 mod filter;
@@ -178,18 +178,8 @@ impl Reached {
 }
 
 pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
-    for r in &typed.drops {
+    for r in typed.drops.iter().chain(super::infer::shape_calls(&typed.shape)) {
         if let Res::Fn(item, substs) = *r { push((item, substs)); }
-    }
-    match &typed.shape {
-        Shape::Glue(g) => for r in g.drop.iter().chain(&g.parts).chain(&g.resume) {
-            if let Res::Fn(item, substs) = *r { push((item, substs)); }
-        },
-        Shape::Untuple(r) => if let Res::Fn(item, substs) = *r { push((item, substs)); },
-        Shape::Clone(calls) => for r in calls {
-            if let Res::Fn(item, substs) = *r { push((item, substs)); }
-        },
-        _ => {}
     }
 }
 
