@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 
 use crate::build::Build;
 use crate::graph::store::{FileStamp, file_stamp, watched_stamps};
+use crate::outline::tree::Profile;
 
 /// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests, build scripts and watched inputs it was loaded from.
 struct Served<'a> {
@@ -22,13 +23,7 @@ struct Served<'a> {
 
 impl Served<'_> {
     fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
-        let top = graph::workspace_root(root).unwrap_or_else(|_| root.to_owned());
-        let head = [top.join("Cargo.lock"), top.join("Cargo.toml"), root.join("Cargo.toml")];
-        let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| std::iter::once(package.manifest.dir.join("Cargo.toml")).chain(package.manifest.build.clone()));
-        let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
-        paths.sort();
-        paths.dedup();
-        paths
+        graph::manifest_paths(workspace, root)
             .into_iter()
             .map(|path| {
                 let now = file_stamp(&path);
@@ -83,6 +78,9 @@ fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     root.hash(&mut hasher);
+    (crate::profile() == Profile::Release).hash(&mut hasher);
+    crate::prep::prepared().hash(&mut hasher);
+    std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
     let abstract_name = cfg!(target_os = "linux");
     let name = match abstract_name {
         true => format!("haste/{:016x}", hasher.finish()),
@@ -154,8 +152,8 @@ fn connect(root: &std::path::Path) -> Result<Option<RawFd>> {
     Ok(Some(fd))
 }
 
-/// Sends `request` and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
-pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<Option<i32>> {
+/// Sends `request`, optional `out` path, and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
+pub fn ask(root: &std::path::Path, request: Request, out: Option<&Path>, args: &[String]) -> Result<Option<i32>> {
     let Some(fd) = connect(root)? else {
         return Ok(None);
     };
@@ -166,7 +164,7 @@ pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<
     let sent = send(fd, request.byte(), &stdio);
     close_all(&opened);
     sent?;
-    write_args(&mut conn, args)?;
+    write_payload(&mut conn, out, args)?;
     let mut status = [0; 4];
     conn.read_exact(&mut status)?;
     Ok(Some(i32::from_le_bytes(status)))
@@ -193,8 +191,8 @@ pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::pa
             continue;
         }
         let status = match receive(fd) {
-            Ok((byte, fds)) => match read_args(&mut conn) {
-                Ok(args) => answer(&mut build, &mut served, Request::parse(byte).map(|request| (request, args)), &fds),
+            Ok((byte, fds)) => match read_payload(&mut conn) {
+                Ok((out, args)) => answer(&mut build, &mut served, Request::parse(byte).map(|request| (request, out, args)), &fds),
                 Err(_) => 1,
             },
             Err(_) => 1,
@@ -214,9 +212,18 @@ fn same_user(fd: RawFd) -> bool {
     rc == 0 && len as usize == std::mem::size_of::<libc::ucred>() && cred.uid == unsafe { libc::geteuid() }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn same_user(fd: RawFd) -> bool {
+    let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
+    // SAFETY: fd is an accepted AF_UNIX socket, and uid/gid point to live storage.
+    let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
+    // SAFETY: geteuid takes no pointers and reads the process's effective user id.
+    rc == 0 && uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn same_user(_fd: RawFd) -> bool {
-    true
+    false
 }
 
 fn listen(root: &std::path::Path) -> Result<RawFd> {
@@ -228,14 +235,26 @@ fn listen(root: &std::path::Path) -> Result<RawFd> {
         unsafe { libc::unlink(addr.sun_path.as_ptr()) };
     }
     // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
-    if unsafe { libc::bind(fd, (&raw const addr).cast(), len) } != 0 || unsafe { libc::listen(fd, 16) } != 0 {
+    if unsafe { libc::bind(fd, (&raw const addr).cast(), len) } != 0 {
+        bail!("a build server for {} runs already: {}", root.display(), std::io::Error::last_os_error());
+    }
+    if !cfg!(target_os = "linux") {
+        // SAFETY: sun_path is NUL-terminated and was just bound above.
+        unsafe { libc::chmod(addr.sun_path.as_ptr(), 0o600) };
+    }
+    // SAFETY: fd is a bound AF_UNIX socket.
+    if unsafe { libc::listen(fd, 16) } != 0 {
         bail!("a build server for {} runs already: {}", root.display(), std::io::Error::last_os_error());
     }
     Ok(fd)
 }
 
-fn write_args(conn: &mut std::fs::File, args: &[String]) -> Result<()> {
-    let mut bytes = (args.len() as u32).to_le_bytes().to_vec();
+fn write_payload(conn: &mut std::fs::File, out: Option<&Path>, args: &[String]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let out_bytes = out.map_or(&[][..], |p| p.as_os_str().as_bytes());
+    let mut bytes = (out_bytes.len() as u32).to_le_bytes().to_vec();
+    bytes.extend_from_slice(out_bytes);
+    bytes.extend((args.len() as u32).to_le_bytes());
     for arg in args {
         bytes.extend((arg.len() as u32).to_le_bytes());
         bytes.extend(arg.as_bytes());
@@ -243,26 +262,49 @@ fn write_args(conn: &mut std::fs::File, args: &[String]) -> Result<()> {
     Ok(conn.write_all(&bytes)?)
 }
 
-fn read_args(conn: &mut std::fs::File) -> Result<Vec<String>> {
+const MAX_PATH_BYTES: usize = 64 * 1024;
+const MAX_ARGS: u32 = 4096;
+const MAX_ARG_BYTES: usize = 1024 * 1024;
+
+fn read_payload(conn: &mut std::fs::File) -> Result<(Option<PathBuf>, Vec<String>)> {
+    use std::os::unix::ffi::OsStringExt as _;
     let mut word = [0; 4];
     let mut next = |conn: &mut std::fs::File| -> Result<u32> {
         conn.read_exact(&mut word)?;
         Ok(u32::from_le_bytes(word))
     };
+    let out_len = next(conn)? as usize;
+    if out_len > MAX_PATH_BYTES {
+        bail!("output path exceeds limit");
+    }
+    let out = if out_len == 0 {
+        None
+    } else {
+        let mut raw = vec![0; out_len];
+        conn.read_exact(&mut raw)?;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(raw)))
+    };
     let count = next(conn)?;
-    let mut args = Vec::new();
+    if count > MAX_ARGS {
+        bail!("argument count exceeds limit");
+    }
+    let mut args = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let mut arg = vec![0; next(conn)? as usize];
+        let arg_len = next(conn)? as usize;
+        if arg_len > MAX_ARG_BYTES {
+            bail!("argument exceeds limit");
+        }
+        let mut arg = vec![0; arg_len];
         conn.read_exact(&mut arg)?;
         args.push(String::from_utf8(arg)?);
     }
-    Ok(args)
+    Ok((out, args))
 }
 
 /// The standard input, output and error that a client hands the server for the program it runs.
 const STDIO: [RawFd; 3] = [0, 1, 2];
 
-fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(Request, Vec<String>)>, fds: &[RawFd]) -> i32 {
+fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(Request, Option<PathBuf>, Vec<String>)>, fds: &[RawFd]) -> i32 {
     let Ok(&client) = <&[RawFd; 3]>::try_from(fds) else {
         close_all(fds);
         return 1;
@@ -270,10 +312,10 @@ fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(R
     let saved = redirect(client);
     let started = Instant::now();
     let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
-        Some((request, args)) => served.reload().and_then(|reloaded| {
+        Some((request, out, args)) => served.reload().and_then(|reloaded| {
             let kept = build.take().filter(|_| !reloaded);
             let (workspace, targets) = (&*served.workspace, served.targets);
-            current(kept, workspace, targets).and_then(|fresh| finish(build.insert(fresh), workspace, (request, &args), started))
+            current(kept, workspace, targets).and_then(|fresh| finish(build.insert(fresh), workspace, (request, out.as_deref(), &args), started))
         }),
         None => Err(anyhow::anyhow!("unknown request")),
     }));
@@ -289,7 +331,10 @@ fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(R
 }
 
 /// Builds what `request` needs, prints how long that took since `started`, then prints what failed for `build`, runs every case for `test` or `main` with `args` for `run`, and returns the exit status.
-pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, args): (Request, &[String]), started: Instant) -> Result<i32> {
+pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, out, args): (Request, Option<&Path>, &[String]), started: Instant) -> Result<i32> {
+    if let (Request::Build, Some(path)) = (request, out) {
+        return build.emit_executable(workspace, path, false);
+    }
     match request {
         Request::Test => build.compile_cases(workspace)?,
         Request::Build => build.compile_binary(workspace)?,
@@ -299,10 +344,7 @@ pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, args): 
     match request {
         Request::Test => build.report(started, built).map(|()| 0),
         Request::Build => build.check(built),
-        Request::Run => {
-            eprintln!("built in {:.1} ms", built.as_secs_f64() * 1e3);
-            build.run(workspace, args)
-        }
+        Request::Run => build.run(workspace, args),
     }
 }
 

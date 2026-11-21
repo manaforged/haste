@@ -347,14 +347,18 @@ pub fn case_reg_vec_self_ops(n: i64) -> i64 {
 fn peeled_sextend_zero(flag: bool, y: i8) -> i64 {
     let t = ((y | 1) as i64).wrapping_add(1);
     let sel = if flag { t } else { 0 };
-    if sel != 0 { 100 } else { 200 }
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3))
 }
 
 #[inline(never)]
 fn peeled_uextend_zero(flag: bool, y: u8) -> i64 {
     let t = ((y | 1) as u64).wrapping_sub(1);
     let sel = if flag { t } else { 0 };
-    if sel != 0 { 30 } else { 40 }
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3) as i64)
 }
 
 #[inline(never)]
@@ -362,15 +366,19 @@ fn peeled_select_zero(flag: bool, inner: bool, a: i64, b: i64) -> i64 {
     let nz = if inner { a | 1 } else { b | 2 };
     let shifted = nz.wrapping_sub(1);
     let sel = if flag { shifted } else { 0 };
-    if sel != 0 { 5 } else { 9 }
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3))
 }
 
 #[inline(never)]
-fn peeled_bitcast_zero(flag: bool, bits: u32) -> i64 {
-    let f = f32::from_bits(bits | 1);
-    let back = (f.to_bits() as i32).wrapping_sub(1);
-    let sel = if flag { back } else { 0 };
-    if sel != 0 { 1 } else { 2 }
+fn peeled_sextend_select_zero(flag: bool, inner: bool, a: i8, b: i8) -> i64 {
+    let picked = if inner { a | 1 } else { b | 2 };
+    let t = (picked as i64).wrapping_add(1);
+    let sel = if flag { t } else { 0 };
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3))
 }
 
 pub fn case_reg_peeled_nonzero_offset(n: i64) -> i64 {
@@ -378,8 +386,9 @@ pub fn case_reg_peeled_nonzero_offset(n: i64) -> i64 {
     let b = peeled_sextend_zero(black_box(true), black_box(n as i8));
     let c = peeled_uextend_zero(black_box(true), black_box(0_u8));
     let d = peeled_select_zero(black_box(true), black_box(true), black_box(0), black_box(n));
-    let e = peeled_bitcast_zero(black_box(true), black_box(0_u32));
-    a + b + c + d + e
+    let e = peeled_sextend_select_zero(black_box(true), black_box(true), black_box(-1_i8), black_box(n as i8));
+    let f = peeled_sextend_select_zero(black_box(false), black_box(true), black_box(-1_i8), black_box(n as i8));
+    a.wrapping_add(b).wrapping_add(c).wrapping_add(d).wrapping_add(e).wrapping_add(f)
 }
 
 struct CountDrop<'a>(&'a mut i64, i64);
@@ -449,6 +458,311 @@ pub fn case_reg_boxed_fnonce_tuple(n: i64) -> i64 {
     out * 1000 + drops
 }
 
+static TAILREC_PTRS: [core::sync::atomic::AtomicUsize; 3] = [
+    core::sync::atomic::AtomicUsize::new(0),
+    core::sync::atomic::AtomicUsize::new(0),
+    core::sync::atomic::AtomicUsize::new(0),
+];
+
+#[inline(never)]
+fn stash_frame_slot(depth: usize, slot: &i64) {
+    if depth < 3 {
+        TAILREC_PTRS[depth].store(core::ptr::from_ref(slot) as usize, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[inline(never)]
+fn tailrec_escape_walk(depth: usize, seed: i64) -> i64 {
+    let local = match depth {
+        0 => seed + 3,
+        1 => seed + 7,
+        _ => seed + 10,
+    };
+    stash_frame_slot(depth, &local);
+    if depth == 2 {
+        let p0 = TAILREC_PTRS[0].load(core::sync::atomic::Ordering::SeqCst) as *const i64;
+        let p1 = TAILREC_PTRS[1].load(core::sync::atomic::Ordering::SeqCst) as *const i64;
+        let p2 = TAILREC_PTRS[2].load(core::sync::atomic::Ordering::SeqCst) as *const i64;
+        // SAFETY: `p0`, `p1`, and `p2` point to live `local` stack slots in frames 0, 1, and 2 unless tail-call loopification illegally reused a single slot.
+        unsafe { (*p0) * 100 + (*p1) * 10 + (*p2) }
+    } else {
+        tailrec_escape_walk(depth + 1, seed)
+    }
+}
+
+pub fn case_reg_tailrec_escape_helper(n: i64) -> i64 {
+    tailrec_escape_walk(0, black_box(n % 5))
+}
+
+#[inline(never)]
+fn se_i8_ptr(p: *const i8) -> i64 {
+    // SAFETY: caller passes a pointer at least 3 bytes into a >= 20-byte i8 array.
+    unsafe { (*p as i64) * 3 + (*p.add(16) as i64) * 5 + (*p.offset(-3) as i64) * 7 }
+}
+
+#[inline(never)]
+fn se_i16_ptr(p: *const i16) -> i64 {
+    // SAFETY: caller passes a pointer at least 3 elements into a >= 12-element i16 array.
+    unsafe { (*p as i64) * 3 + (*p.add(8) as i64) * 5 + (*p.offset(-3) as i64) * 7 }
+}
+
+#[inline(never)]
+fn se_i32_ptr(p: *const i32) -> i64 {
+    // SAFETY: caller passes a pointer at least 3 elements into a >= 8-element i32 array.
+    unsafe { (*p as i64) * 3 + (*p.add(4) as i64) * 5 + (*p.offset(-3) as i64) * 7 }
+}
+
+#[inline(never)]
+fn se_stack_large(seed: i64) -> i64 {
+    let mut a8 = [0i8; 640];
+    let mut a16 = [0i16; 320];
+    let mut a32 = [0i32; 160];
+    a8[0] = -128;
+    a8[300] = -1;
+    a8[600] = if (seed & 1) == 0 { -5 } else { 4 };
+    a16[0] = -32768;
+    a16[150] = -1;
+    a16[300] = if (seed & 2) == 0 { -5 } else { 7 };
+    a32[0] = i32::MIN + 7;
+    a32[75] = -1;
+    a32[150] = -128;
+    black_box(&mut a8);
+    black_box(&mut a16);
+    black_box(&mut a32);
+    (a8[0] as i64)
+        + (a8[300] as i64) * 2
+        + (a8[600] as i64) * 3
+        + (a16[0] as i64) * 5
+        + (a16[150] as i64) * 7
+        + (a16[300] as i64) * 11
+        + (a32[0] as i64)
+        + (a32[75] as i64) * 13
+        + (a32[150] as i64) * 17
+}
+
+#[inline(never)]
+fn cmp_sload_i8(a: &[i8; 24], idx: usize, x: i64, y: i64) -> i64 {
+    let b1 = if a[idx] < 0 { x + 11 } else { y + 23 };
+    let b2 = if a[idx + 1] >= -5 { x + 31 } else { y + 43 };
+    let mut acc = b1 + b2;
+    if a[idx + 2] == -1i8 {
+        acc += black_box(53);
+    } else {
+        acc += black_box(67);
+    }
+    if a[idx + 3] < 0 {
+        acc += black_box(79);
+    } else {
+        acc += black_box(89);
+    }
+    acc
+}
+
+#[inline(never)]
+fn cmp_sload_i16(a: &[i16; 16], idx: usize, x: i64, y: i64) -> i64 {
+    let b1 = if a[idx] < 0 { x + 13 } else { y + 29 };
+    let b2 = if a[idx + 1] >= -5 { x + 37 } else { y + 47 };
+    let mut acc = b1 + b2;
+    if a[idx + 2] == -1i16 {
+        acc += black_box(59);
+    } else {
+        acc += black_box(71);
+    }
+    if a[idx + 3] >= -5 {
+        acc += black_box(83);
+    } else {
+        acc += black_box(97);
+    }
+    acc
+}
+
+/// Exercises ARM64 signed narrow loads and signed icmp fusion.
+pub fn case_reg_arm64_signed_load_icmp(seed: i64) -> i64 {
+    let mut a8 = [
+        -128i8, -5, -1, 12, -1, -128, -6, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -128, -5, 4,
+        127,
+    ];
+    let mut a16 = [
+        -32768i16, -6, -1, 17, -1, -32768, -5, 0, 1, 2, 3, -1, -32768, -5, -6, 32767,
+    ];
+    let mut a32 = [
+        i32::MIN + 7,
+        -1,
+        -128,
+        -32768,
+        -1,
+        0,
+        1,
+        i32::MIN + 7,
+    ];
+    if (seed & 1) != 0 {
+        a8[3] = -1;
+        a8[6] = -5;
+        a16[3] = -5;
+        a16[6] = -6;
+    }
+    let a8 = black_box(a8);
+    let a16 = black_box(a16);
+    let a32 = black_box(a32);
+    // SAFETY: indices 3, 3, and 3 are within bounds with +16 bytes and -3 elements headroom.
+    let se_sum = unsafe {
+        se_i8_ptr(a8.as_ptr().add(3))
+            + se_i16_ptr(a16.as_ptr().add(3))
+            + se_i32_ptr(a32.as_ptr().add(3))
+    };
+    let idx8 = ((seed.unsigned_abs() as usize) % 2) * 3;
+    let idx16 = ((seed.unsigned_abs() as usize) % 2) * 3;
+    let cmp_sum = cmp_sload_i8(&a8, idx8, seed, seed + 10)
+        + cmp_sload_i16(&a16, idx16, seed + 20, seed + 30);
+    se_sum + se_stack_large(seed) + cmp_sum
+}
+
+pub fn case_reg_autoderef_borrow_var(seed: i64) -> i64 {
+    use std::collections::HashSet;
+    let base = (seed.unsigned_abs() as usize) % 7;
+    let items = black_box([base, base + 1, base + 2, base + 3, base + 4]);
+    let mut seen = HashSet::new();
+    seen.insert(base + 1);
+    seen.insert(base + 3);
+    let kept: usize = items.iter().filter(|dep| !seen.contains(dep)).copied().sum();
+    let hit: usize = items.iter().filter(|dep| seen.contains(dep)).copied().sum();
+    (kept as i64) * 100 + (hit as i64)
+}
+
+struct DivErr(i64);
+
+#[inline(never)]
+fn run_diverging_try(x: i64) -> Result<i64, DivErr> {
+    let v = (if x > 0 { Ok(x * 3) } else { return Err(DivErr(-x - 1)); })?;
+    Ok(v + 5)
+}
+
+pub fn case_reg_try_diverging_err(seed: i64) -> i64 {
+    let mut acc = 0_i64;
+    for k in -4..4 {
+        match run_diverging_try(black_box(seed + k)) {
+            Ok(v) => acc += v,
+            Err(DivErr(e)) => acc -= e,
+        }
+    }
+    acc
+}
+
+#[inline(never)]
+fn run_try_tuple_intvar(x: i64) -> Result<i64, (u8, usize)> {
+    let v = (x >= 0).then_some(x * 3 + 1).ok_or((0, 0))?;
+    Ok(v)
+}
+
+pub fn case_reg_try_tuple_intvar_err(seed: i64) -> i64 {
+    let mut acc = 0_i64;
+    for k in -4..4 {
+        match run_try_tuple_intvar(black_box(seed + k)) {
+            Ok(v) => acc += v,
+            Err((a, b)) => acc -= (a as i64) + (b as i64) + 10,
+        }
+    }
+    acc
+}
+
+#[inline(never)]
+fn ishl_range_overflow(c: bool, y: u64) -> i64 {
+    let x = if c { 1_u64 << 63 } else { y & 0x7FFF_FFFF };
+    ((x << 1) as i32) as i64
+}
+
+pub fn case_reg_ishl_range_overflow(seed: i64) -> i64 {
+    let base = 0x7FFF_FFFF_u64.wrapping_sub((seed.unsigned_abs() % 3) as u64);
+    ishl_range_overflow(false, black_box(base)) * 10 + ishl_range_overflow(true, black_box(base))
+}
+
+static NOALIAS_STASH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline(never)]
+fn stash_noalias_mut(p: &mut i32) {
+    NOALIAS_STASH.store(core::ptr::from_mut(p) as usize, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[inline(never)]
+fn bump_noalias_stashed() {
+    let raw = NOALIAS_STASH.load(core::sync::atomic::Ordering::SeqCst) as *mut i32;
+    if !raw.is_null() {
+        // SAFETY: `raw` points to the caller's live `val` stack slot for the duration of `case_reg_noalias_call_stash`.
+        unsafe { *raw += 1; }
+    }
+}
+
+#[inline(never)]
+fn noalias_stash_straight(p: &mut i32) -> i32 {
+    stash_noalias_mut(p);
+    let a = *p;
+    bump_noalias_stashed();
+    let b = *p;
+    b - a
+}
+
+#[inline(never)]
+fn noalias_stash_loop(p: &mut i32, n: usize) -> i32 {
+    let mut s = 0_i32;
+    for _ in 0..n {
+        stash_noalias_mut(p);
+        let a = *p;
+        bump_noalias_stashed();
+        let b = *p;
+        s += b - a;
+    }
+    s
+}
+
+pub fn case_reg_noalias_call_stash(seed: i64) -> i64 {
+    let mut val = (seed as i32).wrapping_mul(3);
+    let d1 = noalias_stash_straight(&mut val);
+    let d2 = noalias_stash_loop(&mut val, 3);
+    NOALIAS_STASH.store(0, core::sync::atomic::Ordering::SeqCst);
+    i64::from(d1 * 100 + d2 * 10 + val)
+}
+
+static PROMOTED_SLICE: &[i64] = &[11, 23, 37, 53];
+const CONST_SLICE: &[i64] = &[19, 29, 41, 61];
+
+const fn const_slice_at(idx: usize) -> i64 {
+    CONST_SLICE[idx]
+}
+
+#[repr(C)]
+struct InnerOffset(u16, u64);
+
+#[repr(C)]
+struct OuterOffset {
+    flag: u8,
+    pair: InnerOffset,
+}
+
+#[derive(Clone, Copy)]
+struct FieldWrap<T> {
+    head: u8,
+    val: T,
+}
+
+#[inline(never)]
+fn read_field_wrap<T: Copy>(w: FieldWrap<T>) -> T {
+    w.val
+}
+
+pub fn case_reg_const_slice_and_field_layout(seed: i64) -> i64 {
+    let idx = (seed.unsigned_abs() as usize) % PROMOTED_SLICE.len();
+    let compiled = const { const_slice_at(1) + (&[5_i64, 9, 14])[2] };
+    let runtime_static = PROMOTED_SLICE[black_box(idx)] + (&[4_i64, 8, 12, 16])[black_box(idx)];
+    let mono = FieldWrap { head: 3, val: seed + const_slice_at(idx) };
+    let generic = FieldWrap { head: 5, val: mono.val * 2 };
+    let off = core::mem::offset_of!(OuterOffset, pair.1) as i64;
+    let mut opt_some = black_box(Some((7_u32, seed)));
+    let opt_none = black_box(None::<(u32, i64)>);
+    let mut none_mut = black_box(None::<(u32, i64)>);
+    let slice_sum = opt_some.as_slice().first().map_or(0, |p| i64::from(p.0) + p.1) + opt_none.as_slice().len() as i64 + opt_some.as_mut_slice().len() as i64 + none_mut.as_mut_slice().len() as i64;
+    compiled + runtime_static + i64::from(mono.head) + read_field_wrap(generic) + off + slice_sum
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -469,4 +783,12 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_pin_cond_drop", case_reg_pin_cond_drop),
     ("case_reg_closure_scalar_env", case_reg_closure_scalar_env),
     ("case_reg_boxed_fnonce_tuple", case_reg_boxed_fnonce_tuple),
+    ("case_reg_tailrec_escape_helper", case_reg_tailrec_escape_helper),
+    ("case_reg_arm64_signed_load_icmp", case_reg_arm64_signed_load_icmp),
+    ("case_reg_autoderef_borrow_var", case_reg_autoderef_borrow_var),
+    ("case_reg_try_diverging_err", case_reg_try_diverging_err),
+    ("case_reg_try_tuple_intvar_err", case_reg_try_tuple_intvar_err),
+    ("case_reg_ishl_range_overflow", case_reg_ishl_range_overflow),
+    ("case_reg_noalias_call_stash", case_reg_noalias_call_stash),
+    ("case_reg_const_slice_and_field_layout", case_reg_const_slice_and_field_layout),
 ];

@@ -5,8 +5,11 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::builder::FunctionBuilder;
 use crate::cfg::Cfg;
 use crate::ir::{AbiParam, Binary, Block, CallConv, Function, Inst, InstData, IntCC, Op, SlotData, StackSlot, Type, Value};
-use crate::live::results;
+use crate::live::{BitMatrix, results};
 use crate::reloc::RuntimeSymbol;
+
+mod lazy;
+mod slots;
 
 /// The lifecycle state stored in word 0 of a coroutine object.
 #[repr(i64)]
@@ -73,13 +76,18 @@ struct Frame {
 }
 
 impl Frame {
+    /// The heap size of the frame: a multiple of 16 bytes, so the frame cache picks a size class without rounding.
+    const fn bytes(&self) -> u32 {
+        if self.size < 16 { 16 } else { self.size.next_multiple_of(16) }
+    }
+
     fn place(&mut self, size: u32, align: u32) -> u32 {
         let at = self.size.next_multiple_of(align.max(1));
         self.size = at + size;
         at
     }
 
-    fn place_colored(&mut self, slots: &[(usize, u32, u32)], conflicts: &[Vec<bool>]) -> Vec<u32> {
+    fn place_colored(&mut self, start: u32, slots: &[(usize, u32, u32)], conflicts: &BitMatrix) -> Vec<u32> {
         let mut order: Vec<usize> = (0..slots.len()).collect();
         order.sort_by_key(|&idx| std::cmp::Reverse((slots[idx].1, slots[idx].2)));
         let mut placed = vec![0_u32; slots.len()];
@@ -90,12 +98,12 @@ impl Frame {
             let align = align.max(1);
             used.clear();
             for other in 0..slots.len() {
-                if assigned[other] && conflicts[slot][slots[other].0] && slots[other].1 > 0 {
+                if assigned[other] && conflicts.get(slot, slots[other].0) && slots[other].1 > 0 {
                     used.push((placed[other], placed[other] + slots[other].1));
                 }
             }
             used.sort_unstable();
-            let mut at = 0_u32.next_multiple_of(align);
+            let mut at = start.next_multiple_of(align);
             for &(start, end) in &used {
                 if at + size <= start {
                     break;
@@ -112,6 +120,36 @@ impl Frame {
     }
 }
 
+fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Value>, is_spill: &[bool]) -> (Frame, Vec<SlotData>) {
+    let framed = slots::framed(func, cfg, resumes, is_spill);
+    let mut frame = Frame { size: 0, slots: vec![Home::Stack(StackSlot(0)); func.slots.len()], spills: HashMap::default() };
+    let mut stack = vec![SlotData { size: 8, align_shift: 3 }];
+    let (mut private, mut shared) = (Vec::new(), Vec::new());
+    for (d, &raw_slot) in framed.raw_of.iter().enumerate() {
+        if framed.kept[d] {
+            let data = &func.slots[raw_slot];
+            let placed = if framed.escaped[d] { &mut shared } else { &mut private };
+            placed.push((d, data.size, 1_u32 << data.align_shift));
+        } else {
+            stack.push(func.slots[raw_slot].clone());
+            frame.slots[raw_slot] = Home::Stack(StackSlot(stack.len() as u32 - 1));
+        }
+    }
+    for (&(d, _, _), offset) in private.iter().zip(frame.place_colored(0, &private, &framed.conflicts)) {
+        frame.slots[framed.raw_of[d]] = Home::Frame(offset);
+    }
+    for value in spills {
+        let bytes = func.types[value.index()].bytes();
+        let at = frame.place(bytes, bytes);
+        frame.spills.insert(value, at as i32);
+    }
+    func.frame_private = frame.size;
+    for (&(d, _, _), offset) in shared.iter().zip(frame.place_colored(frame.size, &shared, &framed.conflicts)) {
+        frame.slots[framed.raw_of[d]] = Home::Frame(offset);
+    }
+    (frame, stack)
+}
+
 /// Splits `func` when it is a coroutine's resume function.
 pub(crate) fn split(func: &mut Function) {
     let Some(spec) = func.coroutine.take() else { return };
@@ -125,35 +163,12 @@ pub(crate) fn split(func: &mut Function) {
     let cfg = func.cfg();
     let spills = live_across_suspend(func, &cfg, &spec.resumes, &defs);
     let mut is_spill = vec![false; func.types.len()];
-    for &value in &spills {
-        is_spill[value.index()] = true;
-    }
-    let (kept, conflicts) = framed(func, &cfg, &spec.resumes, &is_spill);
-    let mut frame = Frame { size: 0, slots: vec![Home::Stack(StackSlot(0)); func.slots.len()], spills: HashMap::default() };
-    let mut stack = vec![SlotData { size: 8, align_shift: 3 }];
-    let mut framed_slots = Vec::new();
-    for (slot, &in_frame) in kept.iter().enumerate() {
-        if in_frame {
-            let data = &func.slots[slot];
-            framed_slots.push((slot, data.size, 1_u32 << data.align_shift));
-        } else {
-            stack.push(func.slots[slot].clone());
-            frame.slots[slot] = Home::Stack(StackSlot(stack.len() as u32 - 1));
-        }
-    }
-    let offsets = frame.place_colored(&framed_slots, &conflicts);
-    for (&(slot, _, _), offset) in framed_slots.iter().zip(offsets) {
-        frame.slots[slot] = Home::Frame(offset);
-    }
-    for value in spills {
-        let bytes = func.types[value.index()].bytes();
-        let at = frame.place(bytes, bytes);
-        frame.spills.insert(value, at as i32);
-    }
+    spills.iter().for_each(|v| is_spill[v.index()] = true);
+    let (frame, mut stack) = build_frame(func, &cfg, &spec.resumes, spills, &is_spill);
+    let lazy = lazy::plan(func, &frame, &is_spill, &mut stack);
     func.slots = stack;
-    let anchor = StackSlot(0);
-    let orig_blocks = func.blocks.len();
-    let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), frame.size);
+    let (anchor, orig_blocks) = (StackSlot(0), func.blocks.len());
+    let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), (frame.bytes(), lazy));
     func.bump_cfg();
     let split_cfg = func.cfg();
     let mut active_fp: Vec<Option<Value>> = vec![None; func.blocks.len()];
@@ -165,20 +180,20 @@ pub(crate) fn split(func: &mut Function) {
             active_fp[idx] = split_cfg.idom[idx].and_then(|dom| active_fp[dom.index()]);
         }
         if idx < orig_blocks {
-            let done = spec.done.contains(&block);
-            let inherited = active_fp[idx];
-            let chosen = rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (inherited, done));
-            if active_fp[idx].is_none() {
-                active_fp[idx] = chosen;
-            }
+            let done = lazy.is_none() && spec.done.contains(&block);
+            let chosen = rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (active_fp[idx], done));
+            active_fp[idx] = active_fp[idx].or(chosen);
         }
     }
     for idx in 0..orig_blocks {
         if !split_cfg.reachable[idx] {
             let block = Block(idx as u32);
-            let done = spec.done.contains(&block);
+            let done = lazy.is_none() && spec.done.contains(&block);
             rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (None, done));
         }
+    }
+    if let Some(lazy) = lazy {
+        lazy::settle(func, &spec, anchor, lazy, orig_blocks);
     }
     func.bump_cfg();
 }
@@ -201,327 +216,6 @@ fn ready_entry(func: &mut Function, spec: &Coroutine, old_entry: Block) {
     b.ins().brif(fresh, old_entry, &params, trap, &[]);
     b.switch_to_block(trap);
     b.ins().trap();
-}
-
-struct SlotAnalysis {
-    escaped: Vec<bool>,
-    reads: Vec<Vec<bool>>,
-    writes: Vec<Vec<bool>>,
-    touches: Vec<Vec<bool>>,
-    inst_touches: Vec<Vec<Vec<usize>>>,
-}
-
-fn collect_value_uses(func: &Function) -> Vec<Vec<(Block, Inst)>> {
-    let mut uses = vec![Vec::new(); func.types.len()];
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        let block_id = Block(b_idx as u32);
-        for &inst in &block.insts {
-            func.insts[inst.index()].op.for_operands(|value| uses[value.index()].push((block_id, inst)));
-        }
-    }
-    uses
-}
-
-fn push_target_params(
-    func: &Function,
-    val: Value,
-    (target, args): (Block, &[Value]),
-    stamp: u32,
-    queued: &mut [u32],
-    work: &mut Vec<Value>,
-) {
-    for (pos, &arg) in args.iter().enumerate() {
-        if arg == val
-            && let Some(&param) = func.blocks[target.index()].params.get(pos)
-            && std::mem::replace(&mut queued[param.index()], stamp) != stamp
-        {
-            work.push(param);
-        }
-    }
-}
-
-fn propagate_alias_uses(func: &Function, slot_alias: &[Vec<usize>], extra_uses: &mut [Vec<(Block, Inst)>]) {
-    for (dst, srcs) in slot_alias.iter().enumerate() {
-        if srcs.is_empty() {
-            continue;
-        }
-        for (b_idx, block) in func.blocks.iter().enumerate() {
-            let block_id = Block(b_idx as u32);
-            for &inst in &block.insts {
-                match func.insts[inst.index()].op {
-                    Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) if s.index() == dst => {
-                        for &src in srcs {
-                            extra_uses[src].push((block_id, inst));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let dst_extra = extra_uses[dst].clone();
-        for &src in srcs {
-            extra_uses[src].extend(dst_extra.iter().copied());
-        }
-    }
-}
-
-fn trace_stack_addrs(func: &Function, value_uses: &[Vec<(Block, Inst)>], is_spill: &[bool]) -> (Vec<bool>, Vec<bool>, Vec<Vec<(Block, Inst)>>) {
-    let slots = func.slots.len();
-    let escaped = crate::mem::Provenance::compute_with_spills(func, Some(is_spill)).escaped_slots();
-    let mut taken = vec![false; slots];
-    let mut extra_uses = vec![Vec::new(); slots];
-    let mut addr_roots: Vec<Vec<usize>> = vec![Vec::new(); slots];
-    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &func.insts[inst.index()];
-        if let Op::StackAddr(slot, _) = data.op {
-            taken[slot.index()] = true;
-            if let Some(res) = data.result {
-                addr_roots[slot.index()].push(res.index());
-            }
-        }
-    }
-    let mut slot_alias: Vec<Vec<usize>> = vec![Vec::new(); slots];
-    let mut queued = vec![0_u32; func.types.len()];
-    let mut work = Vec::new();
-    for (slot, roots) in addr_roots.iter().enumerate() {
-        if roots.is_empty() {
-            continue;
-        }
-        let stamp = (slot + 1) as u32;
-        work.clear();
-        for &root in roots {
-            queued[root] = stamp;
-            work.push(Value(root as u32));
-        }
-        while let Some(val) = work.pop() {
-            for &(block, inst) in &value_uses[val.index()] {
-                extra_uses[slot].push((block, inst));
-                let data = &func.insts[inst.index()];
-                match &data.op {
-                    Op::Binary(Binary::Iadd | Binary::Isub, ..) | Op::Select(..) => {
-                        if let Some(res) = data.result
-                            && std::mem::replace(&mut queued[res.index()], stamp) != stamp
-                        {
-                            work.push(res);
-                        }
-                    }
-                    Op::StackStore(stored, dst, _) if *stored == val && !slot_alias[dst.index()].contains(&slot) => {
-                        slot_alias[dst.index()].push(slot);
-                    }
-                    Op::Jump(target, args) => push_target_params(func, val, (*target, args), stamp, &mut queued, &mut work),
-                    Op::Brif(_, t, t_args, f, f_args) => {
-                        push_target_params(func, val, (*t, t_args), stamp, &mut queued, &mut work);
-                        push_target_params(func, val, (*f, f_args), stamp, &mut queued, &mut work);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    propagate_alias_uses(func, &slot_alias, &mut extra_uses);
-    (taken, escaped, extra_uses)
-}
-
-fn slot_effects(func: &Function, value_uses: &[Vec<(Block, Inst)>], is_spill: &[bool]) -> (Vec<bool>, SlotAnalysis) {
-    let slots = func.slots.len();
-    let blocks = func.blocks.len();
-    let (taken, escaped, extra_uses) = trace_stack_addrs(func, value_uses, is_spill);
-    let mut reads = vec![vec![false; slots]; blocks];
-    let mut writes = vec![vec![false; slots]; blocks];
-    let mut touches = vec![vec![false; slots]; blocks];
-    let mut inst_pos: HashMap<(usize, usize), usize> = HashMap::default();
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        for (pos, &inst) in block.insts.iter().enumerate() {
-            inst_pos.insert((b_idx, inst.index()), pos);
-        }
-    }
-    let mut inst_touches = vec![Vec::new(); blocks];
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        inst_touches[b_idx] = vec![Vec::new(); block.insts.len()];
-        for (pos, &inst) in block.insts.iter().enumerate() {
-            match func.insts[inst.index()].op {
-                Op::StackAddr(slot, _) => {
-                    let s = slot.index();
-                    reads[b_idx][s] |= !writes[b_idx][s];
-                    touches[b_idx][s] = true;
-                    inst_touches[b_idx][pos].push(s);
-                }
-                Op::StackLoad(slot, _) => {
-                    let s = slot.index();
-                    reads[b_idx][s] |= !writes[b_idx][s];
-                    touches[b_idx][s] = true;
-                    inst_touches[b_idx][pos].push(s);
-                }
-                Op::StackStore(value, slot, off) => {
-                    let s = slot.index();
-                    let whole = off == 0 && func.types[value.index()].bytes() >= func.slots[s].size;
-                    if whole {
-                        writes[b_idx][s] = true;
-                    } else {
-                        reads[b_idx][s] |= !writes[b_idx][s];
-                    }
-                    touches[b_idx][s] = true;
-                    inst_touches[b_idx][pos].push(s);
-                }
-                _ => {}
-            }
-        }
-    }
-    for (slot, list) in extra_uses.iter().enumerate() {
-        for &(block, inst) in list {
-            let b_idx = block.index();
-            reads[b_idx][slot] |= !writes[b_idx][slot];
-            touches[b_idx][slot] = true;
-            if let Some(&pos) = inst_pos.get(&(b_idx, inst.index()))
-                && !inst_touches[b_idx][pos].contains(&slot)
-            {
-                inst_touches[b_idx][pos].push(slot);
-            }
-        }
-    }
-    (taken, SlotAnalysis { escaped, reads, writes, touches, inst_touches })
-}
-
-fn live_in(func: &Function, analysis: &SlotAnalysis) -> (Vec<Vec<bool>>, Vec<Vec<bool>>) {
-    let slots = func.slots.len();
-    let blocks = func.blocks.len();
-    let mut live_in = vec![vec![false; slots]; blocks];
-    let mut live_out = vec![vec![false; slots]; blocks];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in (0..blocks).rev() {
-            let mut out = vec![false; slots];
-            for next in func.successors(Block(block as u32)) {
-                out.iter_mut().zip(&live_in[next.index()]).for_each(|(o, &l)| *o |= l);
-            }
-            live_out[block] = out.clone();
-            let reads = &analysis.reads[block];
-            let writes = &analysis.writes[block];
-            let fresh: Vec<bool> = (0..slots).map(|at| reads[at] || (out[at] && !writes[at])).collect();
-            changed |= fresh != live_in[block];
-            live_in[block] = fresh;
-        }
-    }
-    (live_in, live_out)
-}
-
-fn written_before(func: &Function, resumes: &[Block], analysis: &SlotAnalysis, live_in: &[Vec<bool>]) -> Vec<Vec<bool>> {
-    let slots = func.slots.len();
-    let blocks = func.blocks.len();
-    let mut before = vec![vec![false; slots]; blocks];
-    for &resume in resumes {
-        let r = resume.index();
-        for slot in 0..slots {
-            before[r][slot] |= live_in[r][slot];
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in 0..blocks {
-            let block = Block(b as u32);
-            for next in func.successors(block) {
-                let n = next.index();
-                for slot in 0..slots {
-                    let reached = before[b][slot] || analysis.touches[b][slot];
-                    if reached && !before[n][slot] {
-                        before[n][slot] = true;
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-    before
-}
-
-fn framed(func: &Function, cfg: &Cfg, resumes: &[Block], is_spill: &[bool]) -> (Vec<bool>, Vec<Vec<bool>>) {
-    let slots = func.slots.len();
-    let value_uses = collect_value_uses(func);
-    let (taken, analysis) = slot_effects(func, &value_uses, is_spill);
-    let (live_in, live_out) = live_in(func, &analysis);
-    let kept: Vec<bool> = (0..slots).map(|at| taken[at] || resumes.iter().any(|resume| live_in[resume.index()][at])).collect();
-    let before = written_before(func, resumes, &analysis, &live_in);
-    let mut conflicts = vec![vec![false; slots]; slots];
-    for s in 0..slots {
-        if kept[s] && analysis.escaped[s] {
-            for t in 0..slots {
-                if s != t && kept[t] {
-                    conflicts[s][t] = true;
-                    conflicts[t][s] = true;
-                }
-            }
-        }
-    }
-    let blocks = func.blocks.len();
-    let mut active_blocks = vec![false; blocks];
-    for &b in &cfg.rpo {
-        active_blocks[b.index()] = true;
-    }
-    let mut stack: Vec<Block> = resumes.to_vec();
-    while let Some(b) = stack.pop() {
-        if !std::mem::replace(&mut active_blocks[b.index()], true) {
-            for next in func.successors(b) {
-                stack.push(next);
-            }
-        }
-    }
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        if !active_blocks[b_idx] {
-            continue;
-        }
-        let mut first_touch = vec![usize::MAX; slots];
-        for (pos, touched) in analysis.inst_touches[b_idx].iter().enumerate() {
-            for &s in touched {
-                if first_touch[s] == usize::MAX {
-                    first_touch[s] = pos;
-                }
-            }
-        }
-        let mut live: Vec<bool> = (0..slots).map(|s| kept[s] && live_out[b_idx][s] && (before[b_idx][s] || analysis.touches[b_idx][s])).collect();
-        for s in 0..slots {
-            if !live[s] {
-                continue;
-            }
-            for t in (s + 1)..slots {
-                if live[t] {
-                    conflicts[s][t] = true;
-                    conflicts[t][s] = true;
-                }
-            }
-        }
-        for (pos, &inst) in block.insts.iter().enumerate().rev() {
-            for &s in &analysis.inst_touches[b_idx][pos] {
-                if !kept[s] {
-                    continue;
-                }
-                for t in 0..slots {
-                    if s != t && live[t] {
-                        conflicts[s][t] = true;
-                        conflicts[t][s] = true;
-                    }
-                }
-                let whole_kill = matches!(func.insts[inst.index()].op, Op::StackStore(v, slot, 0) if slot.index() == s && func.types[v.index()].bytes() >= func.slots[s].size);
-                if whole_kill || (first_touch[s] == pos && !before[b_idx][s]) {
-                    live[s] = false;
-                } else {
-                    live[s] = true;
-                }
-            }
-        }
-        for s in 0..slots {
-            if live[s] && before[b_idx][s] {
-                for t in (s + 1)..slots {
-                    if live[t] && before[b_idx][t] {
-                        conflicts[s][t] = true;
-                        conflicts[t][s] = true;
-                    }
-                }
-            }
-        }
-    }
-    (kept, conflicts)
 }
 
 fn live_across_suspend(func: &Function, cfg: &Cfg, resumes: &[Block], defs: &[Option<Block>]) -> Vec<Value> {
@@ -592,7 +286,7 @@ fn live_across_suspend(func: &Function, cfg: &Cfg, resumes: &[Block], defs: &[Op
 
 fn push(func: &mut Function, insts: &mut Vec<Inst>, op: Op, ty: Option<Type>) -> Option<Value> {
     let result = ty.map(|ty| func.value(ty));
-    func.insts.push(InstData { op, result });
+    func.insts.push(InstData { op, result, loc: 0 });
     insts.push(Inst(func.insts.len() as u32 - 1));
     result
 }
@@ -637,7 +331,11 @@ fn rewrite(
     let fp = if needs_fp {
         Some(match inherited_fp {
             Some(fp) => fp,
-            None => push(func, &mut insts, Op::StackLoad(anchor, 0), Some(Type::I64)).expect("a load has a result"),
+            None => {
+                let fp = push(func, &mut insts, Op::StackLoad(anchor, 0), Some(Type::I64)).expect("a load has a result");
+                func.mark_frame_ptr(fp);
+                fp
+            }
         })
     } else {
         None
@@ -687,7 +385,8 @@ fn rewrite(
             op => op,
         };
         if data.op.is_terminator() && free {
-            call(func, &mut insts, RuntimeSymbol::Free, &[fp.expect("free requires frame pointer")], false);
+            let bytes = push(func, &mut insts, Op::Const(i64::from(frame.bytes())), Some(Type::I64)).expect("a constant has a result");
+            call(func, &mut insts, RuntimeSymbol::Free, &[fp.expect("free requires frame pointer"), bytes], false);
         }
         let spilled: Vec<(Value, i32)> = results(&data)
             .filter_map(|value| {
@@ -722,22 +421,34 @@ fn call(func: &mut Function, insts: &mut Vec<Inst>, symbol: RuntimeSymbol, args:
     result
 }
 
-fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, StackSlot), size: u32) -> (Block, Value, Block, Value) {
+fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, StackSlot), (size, lazy): (u32, Option<lazy::Lazy>)) -> (Block, Value, Block, Value) {
     let mut b = FunctionBuilder::new(func);
     let (params, state, fresh) = check_unresumed(&mut b, spec);
     let object = params[spec.object];
     let (init, dispatch) = (b.create_block(), b.create_block());
     b.ins().brif(fresh, init, &[], dispatch, &[]);
     b.switch_to_block(init);
-    let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
-    let bytes = push(b.func, &mut insts, Op::Const(i64::from(size.max(8))), Some(Type::I64)).expect("a constant has a result");
-    let init_fp = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
-    b.func.blocks[init.index()].insts = insts;
-    b.ins().store(init_fp, object, spec.header.1);
+    let init_fp = if let Some(lazy) = lazy {
+        let buf = b.ins().stack_addr(Type::I64, lazy.buf, 0);
+        b.func.mark_frame_ptr(buf);
+        b.ins().stack_store(object, anchor, 8);
+        buf
+    } else {
+        let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
+        let bytes = push(b.func, &mut insts, Op::Const(i64::from(size)), Some(Type::I64)).expect("a constant has a result");
+        let heap = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
+        b.func.blocks[init.index()].insts = insts;
+        b.ins().store(heap, object, spec.header.1);
+        b.func.mark_unique_ptr(heap);
+        b.func.mark_frame_ptr(heap);
+        heap
+    };
     b.ins().stack_store(init_fp, anchor, 0);
     b.ins().jump(old_entry, &params);
     b.switch_to_block(dispatch);
     let disp_fp = b.ins().load(Type::I64, object, spec.header.1);
+    b.func.mark_unique_ptr(disp_fp);
+    b.func.mark_frame_ptr(disp_fp);
     b.ins().stack_store(disp_fp, anchor, 0);
     if spec.resumes.len() >= 2 {
         let idx = b.ins().iadd_imm(state, -CoroutineState::FirstSuspend.code());

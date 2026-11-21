@@ -531,8 +531,8 @@ impl Asm {
         self.bitfield(false, dst, src, ((64 - shift) % 64, 63 - shift));
     }
 
-    pub fn lsl32_imm(&mut self, dst: Reg, src: Reg, shift: u8) {
-        self.bitfield_word(0x5300_0000, dst, src, ((32 - shift) % 32, 31 - shift));
+    pub fn shift32_imm(&mut self, left: bool, dst: Reg, src: Reg, shift: u8) {
+        self.bitfield_word(0x5300_0000, dst, src, if left { ((32 - shift) % 32, 31 - shift) } else { (shift, 31) });
     }
 
     pub fn lsr_imm(&mut self, dst: Reg, src: Reg, shift: u8) {
@@ -556,6 +556,7 @@ impl Asm {
         self.emit_gp(dst, sized(base, size) | u32::from(b.0) << 16 | (cond as u32) << 12 | u32::from(a.0) << 5 | u32::from(dst.0));
     }
 
+    pub(crate) fn ccmp(&mut self, neg: bool, size: Size, imm: bool, (cond, rn, op2, nzcv): (Cond, Reg, u8, u8)) { self.word(sized(if neg { 0xBA40_0000 } else { 0xFA40_0000 }, size) | u32::from(imm) << 11 | u32::from(op2 & 0x1F) << 16 | (cond as u32) << 12 | u32::from(rn.0) << 5 | u32::from(nzcv & 0xF)); }
     pub fn csel(&mut self, cond: Cond, dst: Reg, a: Reg, b: Reg) { self.cond_select(0x9A80_0000, Size::X, cond, dst, a, b); }
 
     pub fn csinc(&mut self, size: Size, cond: Cond, dst: Reg, a: Reg, b: Reg) { self.cond_select(0x9A80_0400, size, cond, dst, a, b); }
@@ -573,8 +574,7 @@ impl Asm {
     }
 
     fn load_base(size: Size, signed: bool) -> u32 {
-        if size == Size::X { return 0xF840_0000; }
-        [0x3840_0000, 0x7840_0000, 0xB840_0000][size as usize] | (u32::from(signed) << 22)
+        Self::store_base(size) | if signed && size != Size::X { 0x80_0000 } else { 0x40_0000 }
     }
 
     fn store_base(size: Size) -> u32 {

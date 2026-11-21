@@ -133,6 +133,7 @@ fn out_dir(workspace: &Workspace, unit: usize) -> String {
 /// The variables `env!` reads in the crates of `unit`: Cargo's package variables and, when the package has a build script, its `OUT_DIR`.
 pub fn crate_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
     let mut vars = package_vars(workspace, unit);
+    vars.push(("CARGO".to_owned(), tool("CARGO")));
     if workspace.packages[workspace.graph.units[unit].package].manifest.build.is_some() {
         vars.push(("OUT_DIR".to_owned(), out_dir(workspace, unit)));
     }

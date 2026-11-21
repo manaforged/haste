@@ -1,9 +1,12 @@
 use anyhow::{Result, bail};
 
+use crate::RECURSION_LIMIT;
+use crate::names::ItemRef;
+
 use super::super::ty::{Kind, Mut, Ty};
 use super::object::Vtable;
+use super::poly::PolyPhase;
 use super::{Infer, Res};
-use crate::RECURSION_LIMIT;
 
 /// How the value of an expression changes as it coerces to the type that it is used at.
 #[derive(Clone, Debug)]
@@ -100,11 +103,15 @@ impl Infer<'_, '_> {
         let (mut ty, to) = (self.resolve(from), self.resolve(to));
         let mut steps = Vec::new();
         while steps.len() < RECURSION_LIMIT {
-            if self.same_head(ty, to) && (ty == to || self.trial_unify(ty, to)) {
-                return Ok((!steps.is_empty()).then_some(Coercion::Deref(steps, to)));
+            if self.same_head(ty, to) && self.deref_step_fits(ty, to) {
+                if steps.is_empty() {
+                    return Ok(None);
+                }
+                self.unify(ty, to)?;
+                return Ok(Some(Coercion::Deref(steps, self.resolve(to))));
             }
             let next = match self.cx.types.kind(ty).clone() {
-                Kind::Ref(_, inner) => Some((inner, None)),
+                Kind::Ref(m, inner) if mutability == Mut::Not || m == Mut::Mut => Some((inner, None)),
                 Kind::Adt(..) if self.cx.boxed(ty).is_some() => self.cx.boxed(ty).map(|inner| (inner, None)),
                 Kind::Adt(..) => self.overloaded_deref(ty, mutability)?.map(|(res, target)| (target, Some(res))),
                 Kind::Param(_) | Kind::Proj(_) => {
@@ -120,6 +127,86 @@ impl Infer<'_, '_> {
             ty = self.resolve(inner);
         }
         Ok(None)
+    }
+}
+
+pub(super) type DeferredSnap = (
+    Vec<(ItemRef, Vec<Ty>)>,
+    Vec<super::project::Projection>,
+    Option<(PolyPhase, usize)>,
+);
+
+impl Infer<'_, '_> {
+    pub(super) fn save_deferred(&self) -> DeferredSnap {
+        (
+            self.obligations.clone(),
+            self.projections.clone(),
+            self.poly.as_ref().map(|p| (p.phase, p.obligations.len())),
+        )
+    }
+
+    pub(super) fn restore_deferred(&mut self, (obligations, projections, poly): DeferredSnap) {
+        self.obligations = obligations;
+        self.projections = projections;
+        if let (Some(state), Some((phase, len))) = (&mut self.poly, poly) {
+            state.phase = phase;
+            state.obligations.truncate(len);
+        }
+    }
+
+    fn deref_step_fits(&mut self, ty: Ty, to: Ty) -> bool {
+        if ty == to {
+            return true;
+        }
+        if !self.has_vars(to) || self.obligations.is_empty() {
+            return self.trial_unify(ty, to);
+        }
+        let saved = self.save_deferred();
+        let saved_poly = saved.2;
+        let stuck_before = self.stuck_obligations();
+        let ok = self.probe(|infer| {
+            if !infer.unifies(ty, to) {
+                return false;
+            }
+            if infer.settle_projections().is_err() || infer.settle_obligations().is_err() {
+                return false;
+            }
+            let hit_fallback = saved_poly.is_some_and(|(was, _)| {
+                was != PolyPhase::Fallback && infer.poly.as_ref().is_some_and(|p| p.phase == PolyPhase::Fallback)
+            });
+            !hit_fallback && infer.stuck_obligations() <= stuck_before
+        });
+        self.restore_deferred(saved);
+        ok
+    }
+
+    fn stuck_obligations(&mut self) -> usize {
+        let mut stuck = 0;
+        for i in 0..self.obligations.len() {
+            let (of, substs) = self.obligations[i].clone();
+            if self.obligation_stuck(of, &substs) {
+                stuck += 1;
+            }
+        }
+        stuck
+    }
+
+    fn obligation_stuck(&mut self, of: ItemRef, substs: &[Ty]) -> bool {
+        if !substs.iter().any(|&t| self.has_vars(t)) {
+            return true;
+        }
+        let self_ty = self.resolve(substs[0]);
+        if self.has_vars(self_ty)
+            || self.is_callable_trait(of)
+            || matches!(self.cx.lang(of), Some("discriminant_kind" | "bikeshed_guaranteed_no_drop"))
+        {
+            return false;
+        }
+        let args = &substs[1..];
+        let known_holds = self.compiler_decides(of, self_ty)
+            || self.compiler_impl(of, self_ty)
+            || self.object_holds(of, self_ty, args) == Some(true);
+        !known_holds && self.probe(|infer| infer.may_implement(of, self_ty, args).ok() == Some(false))
     }
 
     fn same_head(&self, a: Ty, b: Ty) -> bool {

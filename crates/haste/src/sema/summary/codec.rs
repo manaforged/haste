@@ -16,35 +16,52 @@ use crate::sema::ty::{Kind, Mut, Ty, Types};
 use super::{CallOverride, ConstHole, OpCheck, PolyInst, PolyObligation, PolySummary};
 
 mod files;
+mod mono;
 
 pub use files::FileIndex;
+pub use mono::{decode_typed, decode_verdict, encode_typed, encode_verdict};
 pub(crate) use files::ItemRecord;
 use files::{read_items, write_items};
 
-const CODEC_MAGIC: [u8; 4] = *b"HPS1";
-const INST_MAGIC: [u8; 4] = *b"HFI1";
+const CODEC_MAGIC: [u8; 4] = *b"HPS2";
+const INST_MAGIC: [u8; 4] = *b"HFI2";
 
 /// Encodes `summary` into a workspace-invariant byte vector, or `None` if it references non-sysroot items.
 pub fn encode_summary(outline: &Outline, types: &Types, summary: &PolySummary, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Result<Option<Vec<u8>>> {
-    let mut enc = Encoder { outline, types, key_of: &mut key_of, item_map: HashMap::default(), items: Vec::new(), ty_map: HashMap::default(), ty_count: 0, ty_buf: Vec::new() };
-    let mut body = Vec::new();
-    if enc.write_summary(&mut body, summary).is_none() {
-        return Ok(None);
-    }
-    let mut out = Vec::with_capacity(16 + enc.items.len() * ItemRecord::LEN + enc.ty_buf.len() + body.len());
-    out.extend_from_slice(&CODEC_MAGIC);
-    write_items(&mut out, &enc.items);
-    write_u32(&mut out, enc.ty_count);
-    out.extend_from_slice(&enc.ty_buf);
-    out.extend_from_slice(&body);
-    Ok(Some(out))
+    Ok(framed((outline, types, &mut key_of), CODEC_MAGIC, |enc, body| enc.write_summary(body, summary)))
 }
 
 /// Decodes a frozen `PolySummary` from `bytes` into `types`, or `None` if any sysroot item is absent.
 pub fn decode_summary(outline: &Outline, index: &FileIndex, types: &Types, bytes: &[u8]) -> Result<Option<PolySummary>> {
+    unframed((outline, index, types), CODEC_MAGIC, bytes, |dec, cur| dec.read_summary(cur).map(Some))
+}
+
+fn framed<F: FnMut(&Outline, ItemRef) -> Option<u64>>(
+    (outline, types, key_of): (&Outline, &Types, &mut F),
+    magic: [u8; 4],
+    write: impl FnOnce(&mut Encoder<'_, F>, &mut Vec<u8>) -> Option<()>,
+) -> Option<Vec<u8>> {
+    let mut enc = Encoder { outline, types, key_of, item_map: HashMap::default(), items: Vec::new(), ty_map: HashMap::default(), ty_count: 0, ty_buf: Vec::new() };
+    let mut body = Vec::new();
+    write(&mut enc, &mut body)?;
+    let mut out = Vec::with_capacity(16 + enc.items.len() * ItemRecord::LEN + enc.ty_buf.len() + body.len());
+    out.extend_from_slice(&magic);
+    write_items(&mut out, &enc.items);
+    write_u32(&mut out, enc.ty_count);
+    out.extend_from_slice(&enc.ty_buf);
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
+fn unframed<T>(
+    (outline, index, types): (&Outline, &FileIndex, &Types),
+    magic: [u8; 4],
+    bytes: &[u8],
+    read: impl FnOnce(&Decoder<'_>, &mut Cursor<'_>) -> Result<Option<T>>,
+) -> Result<Option<T>> {
     let mut cur = Cursor { data: bytes, pos: 0 };
-    if cur.take(4)? != CODEC_MAGIC {
-        bail!("invalid poly summary magic");
+    if cur.take(4)? != magic {
+        bail!("invalid substrate entry magic");
     }
     let Some(items) = read_items(&mut cur, outline, index)? else { return Ok(None) };
     let ty_count = cur.u32()? as usize;
@@ -52,8 +69,7 @@ pub fn decode_summary(outline: &Outline, index: &FileIndex, types: &Types, bytes
     for _ in 0..ty_count {
         tys.push(read_ty(&mut cur, types, &items, &tys)?);
     }
-    let dec = Decoder { types, items: &items, tys: &tys };
-    Ok(Some(dec.read_summary(&mut cur)?))
+    read(&Decoder { types, items: &items, tys: &tys }, &mut cur)
 }
 
 /// Decoded concrete sysroot instance resolution data from a substrate.
@@ -69,20 +85,34 @@ pub struct FrozenInst {
 /// Computes a workspace-invariant 64-bit hash of concrete sysroot `substs`, or `None` if non-sysroot or non-concrete.
 pub fn substs_key(outline: &Outline, types: &Types, substs: Substs, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Option<u64> {
     let mut hasher = FxHasher::default();
-    hash_substs(outline, types, substs, &mut key_of, &mut hasher)?;
+    hash_substs(outline, types, substs, &mut key_of, &mut hasher, false)?;
     Some(hasher.finish())
 }
 
-fn hash_substs(outline: &Outline, types: &Types, substs: Substs, key_of: &mut impl FnMut(&Outline, ItemRef) -> Option<u64>, hasher: &mut FxHasher) -> Option<()> {
+/// The `TypeId` of concrete `ty`: a hash of its structure and item identities, independent of interning order.
+pub fn type_id_key(outline: &Outline, types: &Types, ty: Ty) -> u64 {
+    let mut hasher = FxHasher::default();
+    let mut key_of = |_: &Outline, item: ItemRef| {
+        let mut h = FxHasher::default();
+        item.hash(&mut h);
+        Some(h.finish())
+    };
+    match hash_ty(outline, types, ty, &mut key_of, &mut hasher, true) {
+        Some(()) => hasher.finish(),
+        None => u64::from(ty.0),
+    }
+}
+
+fn hash_substs(outline: &Outline, types: &Types, substs: Substs, key_of: &mut impl FnMut(&Outline, ItemRef) -> Option<u64>, hasher: &mut FxHasher, closures: bool) -> Option<()> {
     let slice = types.substs(substs);
     slice.len().hash(hasher);
     for &ty in slice {
-        hash_ty(outline, types, ty, key_of, hasher)?;
+        hash_ty(outline, types, ty, key_of, hasher, closures)?;
     }
     Some(())
 }
 
-fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Outline, ItemRef) -> Option<u64>, hasher: &mut FxHasher) -> Option<()> {
+fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Outline, ItemRef) -> Option<u64>, hasher: &mut FxHasher, closures: bool) -> Option<()> {
     if ty == Ty::NONE {
         0u8.hash(hasher);
         return Some(());
@@ -90,25 +120,26 @@ fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Ou
     match types.kind(ty).clone() {
         Kind::Prim(p) => { 1u8.hash(hasher); (p as u8).hash(hasher); }
         Kind::Never => { 2u8.hash(hasher); }
-        Kind::Tuple(s) => { 3u8.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
-        Kind::Ref(m, i) => { 4u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher)?; }
-        Kind::Ptr(m, i) => { 5u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher)?; }
-        Kind::Array(e, l) => { 6u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher)?; hash_ty(outline, types, l, key_of, hasher)?; }
-        Kind::Slice(e) => { 7u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher)?; }
-        Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
-        Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
-        Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, p, key_of, hasher)?; hash_ty(outline, types, r, key_of, hasher)?; }
+        Kind::Tuple(s) => { 3u8.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
+        Kind::Ref(m, i) => { 4u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher, closures)?; }
+        Kind::Ptr(m, i) => { 5u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher, closures)?; }
+        Kind::Array(e, l) => { 6u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher, closures)?; hash_ty(outline, types, l, key_of, hasher, closures)?; }
+        Kind::Slice(e) => { 7u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher, closures)?; }
+        Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
+        Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
+        Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, p, key_of, hasher, closures)?; hash_ty(outline, types, r, key_of, hasher, closures)?; }
         Kind::Dyn(o, s, m, a) => {
             12u8.hash(hasher);
             key_of(outline, o)?.hash(hasher);
-            hash_substs(outline, types, s, key_of, hasher)?;
+            hash_substs(outline, types, s, key_of, hasher, closures)?;
             m.len().hash(hasher);
             for x in m { key_of(outline, x)?.hash(hasher); }
             a.len().hash(hasher);
             for x in a { key_of(outline, x)?.hash(hasher); }
         }
-        Kind::Pat(b, lo, hi) => { 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, b, key_of, hasher)?; }
+        Kind::Pat(b, lo, hi) => { 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, b, key_of, hasher, closures)?; }
         Kind::Value(v) => { 14u8.hash(hasher); v.hash(hasher); }
+        Kind::Closure(parent, s, at) if closures => { 11u8.hash(hasher); key_of(outline, parent)?.hash(hasher); at.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
         Kind::Closure(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
     }
     Some(())
@@ -123,34 +154,12 @@ pub fn encode_instance(
     drops: &[Res],
     mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>,
 ) -> Result<Option<Vec<u8>>> {
-    let mut enc = Encoder { outline, types, key_of: &mut key_of, item_map: HashMap::default(), items: Vec::new(), ty_map: HashMap::default(), ty_count: 0, ty_buf: Vec::new() };
-    let mut body = Vec::new();
-    if enc.write_instance(&mut body, substs, inst, drops).is_none() {
-        return Ok(None);
-    }
-    let mut out = Vec::with_capacity(16 + enc.items.len() * ItemRecord::LEN + enc.ty_buf.len() + body.len());
-    out.extend_from_slice(&INST_MAGIC);
-    write_items(&mut out, &enc.items);
-    write_u32(&mut out, enc.ty_count);
-    out.extend_from_slice(&enc.ty_buf);
-    out.extend_from_slice(&body);
-    Ok(Some(out))
+    Ok(framed((outline, types, &mut key_of), INST_MAGIC, |enc, body| enc.write_instance(body, substs, inst, drops)))
 }
 
 /// Decodes a frozen concrete sysroot instance from `bytes`, returning `None` if `expected_substs` or any item mismatches.
 pub fn decode_instance(outline: &Outline, index: &FileIndex, types: &Types, expected_substs: Substs, bytes: &[u8]) -> Result<Option<FrozenInst>> {
-    let mut cur = Cursor { data: bytes, pos: 0 };
-    if cur.take(4)? != INST_MAGIC {
-        bail!("invalid frozen instance magic");
-    }
-    let Some(items) = read_items(&mut cur, outline, index)? else { return Ok(None) };
-    let ty_count = cur.u32()? as usize;
-    let mut tys = Vec::with_capacity(ty_count);
-    for _ in 0..ty_count {
-        tys.push(read_ty(&mut cur, types, &items, &tys)?);
-    }
-    let dec = Decoder { types, items: &items, tys: &tys };
-    dec.read_instance(&mut cur, expected_substs)
+    unframed((outline, index, types), INST_MAGIC, bytes, |dec, cur| dec.read_instance(cur, expected_substs))
 }
 
 struct Encoder<'a, F> {
@@ -190,7 +199,7 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
             Kind::Adt(i, s) => { rec.push(7); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); }
             Kind::FnDef(i, s) => { rec.push(8); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); }
             Kind::FnPtr(p, r) => { rec.push(9); write_u32s(&mut rec, &self.substs_ids(p)?); write_u32(&mut rec, self.ty_id(r)?); }
-            Kind::Closure(..) => return None,
+            Kind::Closure(p, s, at) => { rec.push(10); write_u32(&mut rec, self.item_id(p)?); write_u32s(&mut rec, &self.substs_ids(s)?); write_u32(&mut rec, at); }
             Kind::Dyn(o, s, m, a) => {
                 rec.push(11); write_u32(&mut rec, self.item_id(o)?); write_u32s(&mut rec, &self.substs_ids(s)?);
                 let ms = m.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
@@ -236,9 +245,6 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
     }
 
     fn write_summary(&mut self, out: &mut Vec<u8>, s: &PolySummary) -> Option<()> {
-        if !s.template.closures.is_empty() {
-            return None;
-        }
         write_u16(out, s.param_count);
         write_opt(out, s.ret.as_ref(), |out, t| { write_u32(out, self.ty_id(*t)?); Some(()) })?;
         write_u32(out, s.locals.len() as u32);

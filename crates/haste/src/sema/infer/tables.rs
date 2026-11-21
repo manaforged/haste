@@ -1,9 +1,11 @@
 use std::sync::{Arc, OnceLock};
 
+use rustc_hash::FxHashMap as HashMap;
+
 use crate::body::{ExprId, PatId};
 use crate::names::ItemRef;
 use crate::sema::substs::{PackedMap, PackedSet, Substs};
-use crate::sema::summary::{PolyCheck, PolyInst};
+use crate::sema::summary::{PolyCheck, PolyInst, PolySummary};
 use crate::sema::ty::{Mut, Ty, Types};
 
 use super::{Adjust, Awaited, Closure, Coercion, For, Local, Res, Shape, Tried};
@@ -104,21 +106,28 @@ impl BodyTables {
         Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
     }
 
-    /// Every expression and desugared `for`/`await` temporary type that lowering may own and drop.
+    /// Every expression, pattern, and desugared `for`/`?`/`await` temporary type that lowering may own and drop.
     pub fn owned_tys(&self) -> impl Iterator<Item = Ty> + '_ {
-        self.exprs
-            .iter()
+        self.pats
+            .values()
             .copied()
-            .chain(self.fors.values().map(|f| f.iter))
-            .chain(self.awaits.values().map(|a| a.future))
+            .chain(self.exprs.iter().copied())
+            .chain(self.fors.values().flat_map(|f| [f.iter, f.option]))
+            .chain(self.tries.values().map(|t| t.flow))
+            .chain(self.awaits.values().flat_map(|a| [a.future, a.polled]))
     }
 
-    /// Expression and desugared `for`/`await` temporary types owned at `expr`.
+    /// Expression and desugared `for`/`?`/`await` temporary types owned at `expr`.
     pub fn expr_owned_tys(&self, expr: ExprId) -> impl Iterator<Item = Ty> + '_ {
+        let f = self.fors.get(&expr);
+        let a = self.awaits.get(&expr);
         [
             Some(self.exprs[expr.0 as usize]),
-            self.fors.get(&expr).map(|f| f.iter),
-            self.awaits.get(&expr).map(|a| a.future),
+            f.map(|f| f.iter),
+            f.map(|f| f.option),
+            self.tries.get(&expr).map(|t| t.flow),
+            a.map(|a| a.future),
+            a.map(|a| a.polled),
         ]
         .into_iter()
         .flatten()
@@ -224,13 +233,37 @@ fn coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
     }
 }
 
-fn body_calls(t: &BodyTables, include_vtable: bool) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+fn direct_body_calls(t: &BodyTables) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
     let loops = t.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
     let tries = t.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
     let awaits = t.awaits.values().flat_map(|each| [&each.into_future, &each.poll]);
-    let coerced = t.coercions.values().flat_map(if include_vtable { coercion_calls } else { non_vtable_coercion_calls });
     let direct = t.res.values().chain(t.pat_res.values()).chain(t.derefs.values()).chain(t.operators.values()).chain(t.try_blocks.values()).chain(t.box_frees.values());
-    direct.chain(loops).chain(tries).chain(awaits).chain(coerced).filter_map(res_fn)
+    direct.chain(loops).chain(tries).chain(awaits).filter_map(res_fn)
+}
+
+fn body_calls(t: &BodyTables, include_vtable: bool) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+    let coerced = t.coercions.values().flat_map(if include_vtable { coercion_calls } else { non_vtable_coercion_calls }).filter_map(res_fn);
+    direct_body_calls(t).chain(coerced)
+}
+
+fn visit_eager_edges(t: &BodyTables, on_edge: &mut impl FnMut(ItemRef, Substs, bool)) {
+    direct_body_calls(t).for_each(|(item, substs)| on_edge(item, substs, false));
+    for coercion in t.coercions.values() {
+        let ind = matches!(coercion, Coercion::Reify(_) | Coercion::Vtable(_));
+        coercion_calls(coercion).filter_map(res_fn).for_each(|(item, substs)| on_edge(item, substs, ind));
+    }
+}
+
+fn visit_summary_edges(summary: &PolySummary, resolved: &[(SiteKey, ItemRef, Substs)], on_edge: &mut impl FnMut(ItemRef, Substs, bool)) {
+    let has_vtable = summary.template.coercions.values().any(|c| matches!(c, Coercion::Vtable(_)));
+    let has_reify = !has_vtable && summary.template.coercions.values().any(|c| matches!(c, Coercion::Reify(_)));
+    for &(item, substs) in &summary.fixed_calls {
+        let ind = has_vtable || (has_reify && summary.template.coercions.values().any(|c| matches!(c, Coercion::Reify(Res::Fn(ci, cs)) if (*ci, *cs) == (item, substs))));
+        on_edge(item, substs, ind);
+    }
+    for &(key, item, substs) in resolved {
+        on_edge(item, substs, has_vtable || matches!(key, SiteKey::CoercionReify(_)));
+    }
 }
 
 fn shape_calls(shape: &Shape) -> Box<dyn Iterator<Item = &Res> + '_> {
@@ -439,4 +472,82 @@ impl Typed {
             LazyTables::CheckOnly(check) => check.calls().for_each(|(i, s)| on_callee(i, s)),
         }
     }
+
+    /// Collects all reached callee indices and indirect (`Vtable` / `Reify`) target indices for `Reached::link`.
+    pub fn collect_link_edges(&self, index: &HashMap<(ItemRef, Substs), usize>) -> (Vec<usize>, Vec<usize>) {
+        let (mut calls, mut indirect) = (Vec::new(), Vec::new());
+        let mut push = |item: ItemRef, substs: Substs, ind: bool| {
+            if let Some(&id) = index.get(&(item, substs)) {
+                calls.push(id);
+                if ind {
+                    indirect.push(id);
+                }
+            }
+        };
+        match &self.tables {
+            LazyTables::Eager(t) => {
+                self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn).for_each(|(i, s)| push(i, s, false));
+                visit_eager_edges(t, &mut push);
+            }
+            LazyTables::Poly(poly) => {
+                self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn).for_each(|(i, s)| push(i, s, false));
+                visit_summary_edges(&poly.summary, &poly.resolved_calls, &mut push);
+            }
+            LazyTables::CheckOnly(check) => {
+                self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn).for_each(|(i, s)| push(i, s, false));
+                visit_summary_edges(&check.summary, &check.resolved_calls, &mut push);
+            }
+        }
+        (calls, indirect)
+    }
+}
+
+/// Exact direct and indirect call-site counts per reached index, kept in step with the settled entries and read as saturating `0 / 1 / >=2` sites.
+#[derive(Default)]
+pub struct CallSites {
+    direct: Vec<u32>,
+    indirect: Vec<u32>,
+    counted: Vec<bool>,
+    sites: Vec<u8>,
+}
+
+impl CallSites {
+    /// The saturating call-site count of reached index `index`, `2` for pinned roots and indirect targets.
+    pub fn get(&self, index: usize) -> Option<u8> {
+        self.sites.get(index).copied()
+    }
+
+    /// Withdraws the counted edges of `indices`, whose `calls` and `indirect` lists the caller is about to overwrite.
+    pub fn retract(&mut self, indices: &[usize], calls: &[Vec<usize>], indirect: &[Vec<usize>]) {
+        for &at in indices {
+            if self.counted.get(at) == Some(&true) {
+                self.shift(at, (calls, indirect), false);
+            }
+        }
+    }
+
+    fn shift(&mut self, at: usize, (calls, indirect): (&[Vec<usize>], &[Vec<usize>]), add: bool) {
+        for &c in &calls[at] {
+            self.direct[c] = if add { self.direct[c] + 1 } else { self.direct[c] - 1 };
+        }
+        for &c in &indirect[at] {
+            self.indirect[c] = if add { self.indirect[c] + 1 } else { self.indirect[c] - 1 };
+        }
+        self.counted[at] = add;
+    }
+}
+
+/// Brings `out` to the saturating (`0 / 1 / >=2`) direct call-site counts of the settled entries, clamping pinned roots and indirect targets to `2`, recounting only entries whose settled state changed.
+pub fn recount_call_sites(len: usize, settled: impl Fn(usize) -> bool, calls: &[Vec<usize>], indirect: &[Vec<usize>], pinned: &[bool], out: &mut CallSites) {
+    out.direct.resize(len, 0);
+    out.indirect.resize(len, 0);
+    out.counted.resize(len, false);
+    for at in 0..len {
+        let now = settled(at);
+        if out.counted[at] != now {
+            out.shift(at, (calls, indirect), now);
+        }
+    }
+    out.sites.clear();
+    out.sites.extend((0..len).map(|c| if pinned.get(c) == Some(&true) || out.indirect[c] > 0 { 2 } else { out.direct[c].min(2) as u8 }));
 }

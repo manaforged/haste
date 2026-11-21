@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{Arch, IntCC, RuntimeSymbol, Target, Type, Value};
 
 use crate::body::{BlockKind, Body, Expr, ExprId, List};
+use crate::outline::item::ItemKind;
 use crate::sema::Context;
 use crate::sema::infer::{Res, SiteKey, Typed};
 use crate::sema::ty::{Kind, Ty};
@@ -75,10 +76,11 @@ impl Lower<'_, '_> {
         let (stride, part) = (self.cx.layout(element)?.size.bytes() as i32, repr(self.cx, element)?);
         let n = self.len(count)?;
         let total_bytes = n * i64::from(stride);
-        if n > 16 && part != Repr::Scalar(Type::I8) && total_bytes >= 32 && self.literal_is_zero(value)? {
+        let uninit = self.uninit_value(value)?;
+        if !uninit && n > 16 && part != Repr::Scalar(Type::I8) && total_bytes >= 32 && self.literal_is_zero(value)? {
             return self.zero_repeat(whole, total_bytes);
         }
-        let value = if self.uninit_call(value) { None } else { self.expr(value)? };
+        let value = if uninit { None } else { self.expr(value)? };
         let Some(slot) = self.slot(whole) else {
             return Ok(None);
         };
@@ -174,6 +176,44 @@ impl Lower<'_, '_> {
     /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat or binding of it need not store them.
     pub(super) fn uninit_call(&self, expr: ExprId) -> bool {
         uninit_call_site(self.body, expr).is_some_and(|(e, callee)| is_maybe_uninit_fn(self.cx, self.typed, e, callee))
+    }
+
+    /// Whether the aggregate `expr` holds bytes from `MaybeUninit::uninit()`, which a literal blob would pin to zero.
+    pub(super) fn holds_uninit(&mut self, expr: ExprId) -> Result<bool> {
+        if self.uninit_value(expr)? {
+            return Ok(true);
+        }
+        let parts: Vec<ExprId> = match *self.body.expr(expr) {
+            Expr::Paren(inner) | Expr::Repeat(inner, _) | Expr::Block { tail: Some(inner), .. } => vec![inner],
+            Expr::Array(items) | Expr::Tuple(items) => self.body.list(items).iter().map(|&item| ExprId(item)).collect(),
+            Expr::Struct { fields, .. } => self.body.list(fields).iter().map(|&at| self.body.fields[at as usize].value).collect(),
+            _ => Vec::new(),
+        };
+        for part in parts {
+            if self.holds_uninit(part)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `expr` is `MaybeUninit::uninit()` or names a constant whose body is, so a repeat of it need not store its bytes.
+    fn uninit_value(&mut self, expr: ExprId) -> Result<bool> {
+        if self.uninit_call(expr) {
+            return Ok(true);
+        }
+        let (Expr::Path(_), Some(&Res::Fn(item, substs))) = (self.body.expr(expr), self.typed.res.get(&expr)) else {
+            return Ok(false);
+        };
+        if self.cx.item(item).1.kind != ItemKind::Const {
+            return Ok(false);
+        }
+        let Some((source, typed)) = self.literal_source(item, substs)? else {
+            return Ok(false);
+        };
+        let typed = typed.scoped(&self.cx.types);
+        let body = self.cx.body(source)?;
+        Ok(body.root.and_then(|root| uninit_call_site(&body, root)).is_some_and(|(e, callee)| is_maybe_uninit_fn(self.cx, &typed, e, callee)))
     }
 
     /// The place that `base[index]` names after the autoderef steps of `base`: an element of an array or slice after a bounds check, or the target of `Index::index`.

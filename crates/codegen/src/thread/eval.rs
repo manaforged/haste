@@ -7,6 +7,7 @@ use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 pub(super) enum EdgeSeed {
     None,
     Brif(Value, bool),
+    Equal(Value, bool),
     Const(Value, i64),
 }
 
@@ -32,6 +33,21 @@ pub(super) struct EvalState {
 impl EvalState {
     pub(super) fn seeded(&self) -> Vec<Value> {
         self.local_consts.iter().map(|&(value, _)| value).chain(self.edge_cmps.iter().map(|&(value, ..)| value)).collect()
+    }
+
+    /// Records what the edge `seed` into `disp` proves: the branch condition, the values an equal compare makes one value, or a constant.
+    pub(super) fn seed(&mut self, func: &Function, cx: &ThreadCx<'_>, disp: Block, seed: EdgeSeed) {
+        match seed {
+            EdgeSeed::None => {}
+            EdgeSeed::Brif(cond, taken) => seed_edge(func, cx, cond, taken, 0, (&mut self.local_consts, &mut self.edge_cmps)),
+            EdgeSeed::Equal(cond, taken) => {
+                seed_edge(func, cx, cond, taken, 0, (&mut self.local_consts, &mut self.edge_cmps));
+                if let Some((x, y)) = edge_equal(func, cx, disp, cond, taken) {
+                    self.rename(cx, y, x);
+                }
+            }
+            EdgeSeed::Const(val, imm) => self.local_consts.push((val, imm)),
+        }
     }
 
     fn rename(&mut self, cx: &ThreadCx<'_>, from: Value, to: Value) {
@@ -196,6 +212,16 @@ pub(super) fn record_edge_cmp(
     }
 }
 
+/// The two sides of the integer compare `cond` that the edge taken as `taken` proves equal, when `disp` neither defines nor binds either side.
+fn edge_equal(func: &Function, cx: &ThreadCx<'_>, disp: Block, cond: Value, taken: bool) -> Option<(Value, Value)> {
+    let inst = cx.defs.get(cond.index()).copied().flatten()?;
+    let Op::Icmp(cc, x, y) = func.insts[inst.index()].op else { return None };
+    let equal = matches!((cc, taken), (IntCC::Equal, true) | (IntCC::NotEqual, false));
+    let data = &func.blocks[disp.index()];
+    let outside = |v: Value| !data.params.contains(&v) && cx.defs.get(v.index()).copied().flatten().is_none_or(|def| !data.insts.contains(&def));
+    (equal && x != y && func.ty(x).is_small_int() && outside(x) && outside(y)).then_some((x, y))
+}
+
 pub(super) fn seed_edge(
     func: &Function,
     cx: &ThreadCx<'_>,
@@ -294,12 +320,13 @@ pub(super) fn eval_cond_truth(func: &Function, cx: &ThreadCx<'_>, state: &EvalSt
     state.edge_cmps.iter().find_map(|&(v, v_ty, cc1, imm1)| (v == cond_val).then(|| cmp_implies(v_ty, cc1, imm1, IntCC::NotEqual, 0)).flatten())
 }
 
-pub(super) fn is_bool_val(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> bool {
+/// Whether `v` is 0 or 1 because a compare, a widen or narrow of one, or an and with 1 defines it.
+pub(crate) fn is_bool_val(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> bool {
     let Some(inst) = defs.get(v.index()).copied().flatten() else { return false };
     let is_one = |u: Value| consts.get(u.index()).copied().flatten() == Some(1);
     match func.insts[inst.index()].op {
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => true,
-        Op::Convert(Convert::Uextend, inner) => is_bool_val(func, defs, consts, inner),
+        Op::Convert(Convert::Uextend | Convert::Ireduce, inner) => is_bool_val(func, defs, consts, inner),
         Op::Binary(Binary::Band, a, b) => is_one(a) || is_one(b) || is_bool_val(func, defs, consts, a) || is_bool_val(func, defs, consts, b),
         Op::Binary(Binary::Bxor, a, b) => (is_one(b) && is_bool_val(func, defs, consts, a)) || (is_one(a) && is_bool_val(func, defs, consts, b)),
         _ => false,

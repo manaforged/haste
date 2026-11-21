@@ -387,13 +387,13 @@ impl Env {
         }
         let mut rel_bounds: Vec<Value> = Vec::new();
         for (_, gp, _, _) in &inside {
-            for r in gp.rels.iter().rev() {
+            for r in gp.rels().iter().rev() {
                 push_inv(r.lhs, &mut rel_bounds);
                 push_inv(r.rhs, &mut rel_bounds);
             }
         }
         for (path, _) in &outside {
-            for r in path.rels.iter().rev() {
+            for r in path.rels().iter().rev() {
                 push_inv(r.lhs, &mut rel_bounds);
                 push_inv(r.rhs, &mut rel_bounds);
             }

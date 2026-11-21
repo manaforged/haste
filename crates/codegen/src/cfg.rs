@@ -152,7 +152,7 @@ pub(crate) fn dominates(idom: &[Option<Block>], ancestor: Block, mut block: Bloc
     }
 }
 
-fn natural_loop(cfg: &Cfg, head: Block, latches: Vec<Block>) -> Loop {
+pub(crate) fn natural_loop(cfg: &Cfg, head: Block, latches: Vec<Block>) -> Loop {
     let mut body = vec![false; cfg.preds.len()];
     body[head.index()] = true;
     let mut todo = latches.clone();
@@ -257,19 +257,37 @@ impl Cfg {
     }
 }
 
-pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<Block> {
-    if Some(each.head) == func.entry {
-        return None;
-    }
+fn outside_preds(cfg: &Cfg, each: &Loop) -> Vec<Block> {
     let mut outside = Vec::new();
     for &pred in cfg.preds_of(each.head) {
         if !each.body.get(pred.index()).copied().unwrap_or(false) && !outside.contains(&pred) {
             outside.push(pred);
         }
     }
-    if let [single] = outside[..]
-        && matches!(func.last(single), Some(Op::Jump(target, _)) if *target == each.head)
-    {
+    outside
+}
+
+fn sole_entry(func: &Function, each: &Loop, outside: &[Block]) -> Option<Block> {
+    match outside {
+        [single] if matches!(func.last(*single), Some(Op::Jump(target, _)) if *target == each.head) => Some(*single),
+        _ => None,
+    }
+}
+
+/// The block outside `each` whose jump is the loop's only entry, when one already exists.
+pub(crate) fn existing_preheader(func: &Function, cfg: &Cfg, each: &Loop) -> Option<Block> {
+    if Some(each.head) == func.entry {
+        return None;
+    }
+    sole_entry(func, each, &outside_preds(cfg, each))
+}
+
+pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<Block> {
+    if Some(each.head) == func.entry {
+        return None;
+    }
+    let outside = outside_preds(cfg, each);
+    if let Some(single) = sole_entry(func, each, &outside) {
         return Some(single);
     }
     if outside.is_empty() || !outside.iter().all(|&pred| matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..)))) {
@@ -297,4 +315,31 @@ pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<B
     }
     func.bump_cfg();
     Some(pre)
+}
+
+/// Undoes each `(preheader, head)` that `preheader` made and that still only jumps on to its head with its own parameters, and returns whether any made one stays.
+pub(crate) fn drop_bare_preheaders(func: &mut Function, made: &[(Block, Block)]) -> bool {
+    let bare: Vec<(Block, Block)> = made
+        .iter()
+        .copied()
+        .filter(|&(pre, head)| {
+            let data = &func.blocks[pre.index()];
+            matches!(data.insts[..], [jump] if matches!(&func.insts[jump.index()].op, Op::Jump(target, args) if *target == head && *args == data.params))
+        })
+        .collect();
+    if bare.is_empty() {
+        return !made.is_empty();
+    }
+    for block in 0..func.blocks.len() {
+        let Some(&last) = func.blocks[block].insts.last() else { continue };
+        func.insts[last.index()].op.map_targets(|target| bare.iter().find(|&&(pre, _)| pre == target).map_or(target, |&(_, head)| head));
+    }
+    for &(pre, _) in bare.iter().rev() {
+        func.blocks[pre.index()].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
+        if pre.index() + 1 == func.blocks.len() {
+            func.blocks.pop();
+        }
+    }
+    func.bump_cfg();
+    bare.len() < made.len()
 }

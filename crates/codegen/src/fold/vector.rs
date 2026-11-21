@@ -559,7 +559,7 @@ fn choose_plan(vec_ty: Type, bytes: &[u8; 16], is_shift_rhs: bool) -> (Type, Vec
 }
 
 fn is_zero_vec(func: &Function, defs: &[Option<Inst>], val: Value) -> bool {
-    defs.get(val.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(0)))
+    func.is_zero_vec(&|value| defs.get(value.index()).copied().flatten(), val)
 }
 
 fn const_matches(func: &Function, defs: &[Option<Inst>], val: Value, ty: Type, want: u64) -> bool {

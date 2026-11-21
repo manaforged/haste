@@ -596,29 +596,28 @@ pub(in crate::arm64) fn single_bit_raw(func: &Function, plan: &Plan<Reg>, x: Val
     None
 }
 
-pub(in crate::arm64) fn single_bit_mask(func: &Function, plan: &Plan<Reg>, x: Value, y: Value) -> Option<(Value, u8)> {
-    let (mut val, mut bit) = single_bit_raw(func, plan, x, y)?;
-    let def = |v: Value| find_def(func, v);
+pub(super) fn peel_elided(func: &Function, plan: &Plan<Reg>, (mut val, mut bit): (Value, u8), def: &dyn Fn(Value) -> Option<Inst>) -> Option<(Value, u8)> {
     while plan.elided[val.index()] {
-        (val, bit) = peel_bit_op(func, plan, val, bit, &def)?;
+        (val, bit) = peel_bit_op(func, plan, val, bit, def)?;
     }
     Some((val, bit))
 }
 
-pub(super) fn can_elide_band_bit(
+pub(in crate::arm64) fn single_bit_mask(func: &Function, plan: &Plan<Reg>, x: Value, y: Value) -> Option<(Value, u8)> {
+    peel_elided(func, plan, single_bit_raw(func, plan, x, y)?, &|v: Value| find_def(func, v))
+}
+
+fn can_elide_bit(
     func: &Function,
     plan: &Plan<Reg>,
     info @ (_, pos_of): UseInfo<'_>,
     (b_idx, mpos, end_pos, skip_pos): (usize, usize, usize, Option<usize>),
-    (x, y): (Value, Value),
+    (val, bit): (Value, u8),
 ) -> Option<Option<Value>> {
-    let (mut val, mut bit) = single_bit_raw(func, plan, x, y)?;
     let def = |v| def_inst(pos_of, v);
     if plan.elided[val.index()] {
-        while plan.elided[val.index()] {
-            (val, bit) = peel_bit_op(func, plan, val, bit, &def)?;
-        }
-        return preserved(func, plan, b_idx, mpos, end_pos, skip_pos, val).then_some(None);
+        let (root, _) = peel_elided(func, plan, (val, bit), &def)?;
+        return preserved(func, plan, b_idx, mpos, end_pos, skip_pos, root).then_some(None);
     }
     if let Some((spos, _)) = local_single(plan, info, b_idx, mpos, val)
         && let Some((inner, _)) = peel_bit_op(func, plan, val, bit, &def)
@@ -712,7 +711,7 @@ fn check_branch_tst(
     }
     match func.insts[cinst.index()].op {
         Op::Binary(Binary::Band, x, y) => {
-            if let Some(extra) = can_elide_band_bit(func, plan, info, (b_idx, cpos, pos, None), (x, y)) {
+            if let Some(extra) = single_bit_raw(func, plan, x, y).and_then(|b| can_elide_bit(func, plan, info, (b_idx, cpos, pos, None), b)) {
                 return Some((cond_val, None, extra));
             }
             can_elide_tst_band(func, plan, pos_of, (b_idx, cpos, pos, None), (x, y)).then_some((cond_val, None, None))
@@ -722,10 +721,14 @@ fn check_branch_tst(
             if mpos >= cpos || (func.size() > 2000 && pos - mpos > 64) {
                 return None;
             }
-            if let Some(extra) = can_elide_band_bit(func, plan, info, (b_idx, mpos, pos, Some(cpos)), (x, y)) {
+            if let Some(extra) = single_bit_raw(func, plan, x, y).and_then(|b| can_elide_bit(func, plan, info, (b_idx, mpos, pos, Some(cpos)), b)) {
                 return Some((cond_val, Some(m), extra));
             }
             can_elide_tst_band(func, plan, pos_of, (b_idx, mpos, pos, Some(cpos)), (x, y)).then_some((cond_val, Some(m), None))
+        }
+        Op::Icmp(cc, lhs, rhs) => {
+            let (val, bit, _) = super::sign::sign_bit_raw(func, plan, (cc, lhs, rhs), &|v: Value| def_inst(pos_of, v))?;
+            can_elide_bit(func, plan, info, (b_idx, cpos, pos, None), (val, bit)).map(|extra| (cond_val, None, extra))
         }
         _ => None,
     }

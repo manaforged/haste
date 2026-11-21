@@ -16,7 +16,8 @@ use super::{Infer, Res};
 /// The interned segments of `path` in `arena`, whether it starts with `::`, and the crate a leading `$crate` names.
 pub fn segments(symbols: &Symbols, src: &Source, arena: &Body, path: PathId) -> (Vec<Sym>, bool, Option<u32>) {
     let path = arena.path(path);
-    let segments: Vec<Sym> = arena.list(path.segments).iter().map(|&at| symbols.intern(plain(src.text(arena.segments[at as usize].name)))).collect();
+    let syms = arena.syms(symbols, src);
+    let segments: Vec<Sym> = arena.list(path.segments).iter().map(|&at| syms[at as usize]).collect();
     let first = arena.list(path.segments).first().map(|&at| arena.segments[at as usize].name).unwrap_or(0);
     let dollar = first.checked_sub(1).and_then(|at| src.dollar(at));
     (segments, path.global, dollar)
@@ -173,19 +174,26 @@ impl<'a> Infer<'_, 'a> {
             return Vec::new();
         };
         let hidden = self.closed_uses(root);
-        if let Some(found) = self.imports.get(&(root, word, hidden.clone())) {
+        let here = self.reader().and_then(ItemRef::outer).map(|(_, at)| at);
+        if let Some(found) = self.imports.get(&(root, word, here, hidden.clone())) {
             return found.clone();
         }
         let Ok(home) = self.cx.module_of(root) else {
             return Vec::new();
         };
-        let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
         let before = self.cx.asks.mark();
         let found = self.cx.body_imports((root, home), word, (here, &hidden));
         if self.cx.asks.mark() == before {
-            self.imports.insert((root, word, hidden), found.clone());
+            self.imports.insert((root, word, here, hidden), found.clone());
         }
         found
+    }
+
+    /// The body-declared item whose text names are read in now: the frame's item or the impl block being read when the body declares it, as for another item's header, otherwise the instance being inferred.
+    fn reader(&self) -> Option<ItemRef> {
+        let declared = |item: &ItemRef| item.declaring_body().is_some() && item.declaring_body() == self.root;
+        let frame = self.frame_item.or_else(|| self.block.and_then(ImplRef::item)).filter(declared);
+        frame.or_else(|| self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()))
     }
 
     /// The `use` items of this body's expansion that a block of the body declares and that no block open now holds, which code here does not see.
@@ -222,7 +230,11 @@ impl<'a> Infer<'_, 'a> {
         let entry = body.path(path);
         let single = entry.qself.is_none() && !entry.global && entry.segments.len == 1;
         let first = body.segments[body.list(entry.segments)[0] as usize].name;
-        if single && let Some(found) = self.bound_value(crate::names::plain(self.src.text(first)), self.src.scope(first))? {
+        let mut scope = self.src.scope(first);
+        if single && scope == (0, 0) && self.src.mark(first).is_none() {
+            scope = self.proc_call_scope(first);
+        }
+        if single && let Some(found) = self.bound_value(crate::names::plain(self.src.text(first)), scope)? {
             return Ok(found);
         }
         if let Some(ctor) = self.ctor(body, path, true)? {
@@ -256,6 +268,31 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The local that `name` written in hygiene scope `(id, parent)` finds: one its own expansion bound, else one of the scope its macro was defined in, else one the program bound; or a const parameter.
+    fn proc_call_scope(&self, token: u32) -> (u32, u32) {
+        let Some(root) = self.root else { return (0, 0) };
+        let Some(raw) = self.cx.outline.crates.get(root.krate as usize).and_then(|c| c.files.get(root.file as usize)) else { return (0, 0) };
+        if token < raw.source.len() {
+            return (0, 0);
+        }
+        let Some(exp) = raw.expansion(root.krate, root.item) else { return (0, 0) };
+        let enclosing = |pos: u32| {
+            exp.calls
+                .iter()
+                .filter_map(|(&co, &bo)| (pos > bo && pos < self.src.pair(bo)).then_some((co, bo)))
+                .max_by_key(|&(_, bo)| bo)
+        };
+        let Some((mut call_open, _)) = enclosing(token) else { return (0, 0) };
+        for _ in 0..8 {
+            let scope = self.src.scope(call_open.saturating_sub(2));
+            if scope != (0, 0) {
+                return scope;
+            }
+            let Some((outer, _)) = enclosing(call_open) else { break };
+            call_open = outer;
+        }
+        (0, 0)
+    }
+
     fn bound_value(&mut self, name: &str, (id, parent): (u32, u32)) -> Result<Option<(Ty, Res)>> {
         let found = [id, parent, 0].into_iter().find_map(|scope| self.scopes.iter().rev().find(|(bound, _)| *bound == (name, scope)));
         if let Some(&(_, local)) = found {
@@ -473,10 +510,11 @@ impl<'a> Infer<'_, 'a> {
             return Ok(None);
         }
         let alias = self.cx.alias_def(member)?;
+        let home = self.cx.module_of(member)?;
         let src = &self.cx.file(member).source;
         let outer = self.generics.len();
         self.generics.extend(alias.params.iter().map(|param| src.text(param.name)).zip(own.iter().copied()));
-        let found = self.in_source(src, |infer| infer.lower_ty(&alias.arena, alias.ty));
+        let found = self.in_source_home(src, home, |infer| infer.lower_ty(&alias.arena, alias.ty));
         self.generics.truncate(outer);
         found.map(Some)
     }

@@ -280,6 +280,13 @@ impl<'a> Infer<'_, 'a> {
         let (Err(error), &crate::body::Ty::Path(path)) = (&lowered, arena.ty(ty)) else {
             return lowered;
         };
+        let entry = arena.path(path);
+        let [seg] = arena.list(entry.segments) else {
+            return lowered;
+        };
+        if entry.qself.is_some() || entry.global || arena.segments[*seg as usize].args.is_some() {
+            return lowered;
+        }
         match self.const_path(arena, path) {
             Ok((value, (bits, _))) => Ok(self.cx.types.intern(Kind::Value(value & mask(bits)))),
             Err(reason) => bail!("{error:#}; as a constant: {reason:#}"),

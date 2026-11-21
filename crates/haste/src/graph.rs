@@ -116,14 +116,17 @@ fn find_package(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
+pub(crate) const LOCK_FILE: &str = "Cargo.lock";
+
 fn manifest_name(dir: &Path) -> Option<String> {
-    let table: toml::Table = toml::from_str(&std::fs::read_to_string(dir.join("Cargo.toml")).ok()?).ok()?;
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?).ok()?;
     Some(table.get("package")?.get("name")?.as_str()?.to_owned())
 }
 
 /// The root directory and `[workspace]` table of the nearest manifest at or above `dir` that has one, which a local or git package inherits from.
 fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
-    for at in dir.ancestors().filter(|at| at.join("Cargo.toml").is_file()) {
+    for at in dir.ancestors().filter(|at| at.join(MANIFEST_FILE).is_file()) {
         if let Some(workspace) = manifest::workspace_of(at)? {
             return Ok(Some((at.to_owned(), workspace)));
         }
@@ -132,7 +135,7 @@ fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
 }
 
 fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = patches_in(&dir.join("Cargo.toml"), dir)?;
+    let mut paths = patches_in(&dir.join(MANIFEST_FILE), dir)?;
     for at in dir.ancestors() {
         let config = [".cargo/config.toml", ".cargo/config"].map(|leaf| at.join(leaf)).into_iter().find(|path| path.is_file());
         if let Some(config) = config {
@@ -159,18 +162,29 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
     let listed = workspace.and_then(|ws| ws.get(key)).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str);
     listed
         .flat_map(|member| match member.strip_suffix("/*") {
-            Some(parent) => subdirs(&top.join(parent)).unwrap_or_default().into_iter().filter(|dir| dir.join("Cargo.toml").is_file()).collect(),
+            Some(parent) => subdirs(&top.join(parent)).unwrap_or_default().into_iter().filter(|dir| dir.join(MANIFEST_FILE).is_file()).collect(),
             None => vec![top.join(member)],
         })
         .collect()
 }
 
 pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
-    let found = root.ancestors().find(|dir| dir.join("Cargo.lock").is_file());
-    found.map(Path::to_owned).with_context(|| format!("no Cargo.lock at or above {}", root.display()))
+    let found = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file());
+    found.map(Path::to_owned).with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
 }
 
-fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Result<BTreeMap<String, PathBuf>> {
+/// The lock file, workspace manifest, root manifest, and every local package's manifest and build script.
+pub(crate) fn manifest_paths(workspace: &Workspace, root: &Path) -> Vec<PathBuf> {
+    let top = workspace_root(root).unwrap_or_else(|_| root.to_owned());
+    let head = [top.join(LOCK_FILE), top.join(MANIFEST_FILE), root.join(MANIFEST_FILE)];
+    let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| std::iter::once(package.manifest.dir.join(MANIFEST_FILE)).chain(package.manifest.build.clone()));
+    let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>, wanted: &BTreeSet<String>) -> Result<BTreeMap<String, PathBuf>> {
     let mut paths = BTreeMap::new();
     let mut seen_ws = BTreeSet::from([top.to_owned()]);
     let mut stack = vec![root.to_owned()];
@@ -178,7 +192,10 @@ fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Resu
     stack.extend(member_dirs(top, workspace, "members"));
     while let Some(dir) = stack.pop() {
         let dir = manifest::normalize(&dir);
-        if manifest_name(&dir).is_none() {
+        let Some(name) = manifest_name(&dir) else {
+            continue;
+        };
+        if !wanted.contains(&name) {
             continue;
         }
         let owner = owning_workspace(&dir)?;
@@ -222,48 +239,108 @@ pub fn load(root: &Path, targets: &Targets) -> Result<Workspace> {
     load_with(root, targets, &[])
 }
 
+fn load_package(entry: Locked, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Package, Option<anyhow::Error>)> {
+    match source_dir(&entry, registries, paths) {
+        Ok(dir) => {
+            let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
+            let manifest = manifest::read(&dir, owner.as_ref().map(|(_, ws)| ws))?;
+            Ok((Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false }, None))
+        }
+        Err(err) => {
+            let manifest = manifest::Manifest { name: entry.name.clone(), ..manifest::Manifest::default() };
+            Ok((Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false }, Some(err)))
+        }
+    }
+}
+
+fn load_packages(locked: Vec<Locked>, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Vec<Package>, Vec<Option<anyhow::Error>>)> {
+    let results = crate::sync::parallel_map(locked, |entry| load_package(entry, registries, paths));
+    let mut packages = Vec::with_capacity(results.len());
+    let mut missing = Vec::with_capacity(results.len());
+    for res in results {
+        let (pkg, err) = res?;
+        packages.push(pkg);
+        missing.push(err);
+    }
+    Ok((packages, missing))
+}
+
+fn root_package_names(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Result<Vec<String>> {
+    if manifest_name(root).is_none() && root == top && workspace.is_some() {
+        let mut dirs = member_dirs(top, workspace, "default-members");
+        if dirs.is_empty() {
+            dirs = member_dirs(top, workspace, "members");
+        }
+        return Ok(dirs.into_iter().filter_map(|dir| manifest_name(&dir)).collect());
+    }
+    let owner = owning_workspace(root)?;
+    Ok(vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name])
+}
+
+fn mark_reachable_deps(locked: &[Locked], by_name: &BTreeMap<&str, Vec<usize>>, (idx, omit): (usize, &[&str]), keep: &mut [bool], stack: &mut Vec<usize>) {
+    for dep in locked[idx].deps() {
+        if omit.contains(&dep.name) {
+            continue;
+        }
+        let Some(cands) = by_name.get(dep.name) else { continue };
+        for &cand in cands {
+            if !keep[cand] && dep.version.as_ref().is_none_or(|v| *v == locked[cand].version) {
+                keep[cand] = true;
+                stack.push(cand);
+            }
+        }
+    }
+}
+
+fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String], omit_root_deps: &[&str]) -> Vec<Locked> {
+    let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (idx, entry) in locked.iter().enumerate() {
+        by_name.entry(entry.name.as_str()).or_default().push(idx);
+    }
+    let mut keep = vec![false; locked.len()];
+    let mut stack = Vec::new();
+    for (idx, entry) in locked.iter().enumerate() {
+        if !entry.is_registry() && root_names.contains(&entry.name) {
+            keep[idx] = true;
+            stack.push(idx);
+        }
+    }
+    while let Some(idx) = stack.pop() {
+        let omit = if !locked[idx].is_registry() && root_names.contains(&locked[idx].name) { omit_root_deps } else { &[] };
+        mark_reachable_deps(&locked, &by_name, (idx, omit), &mut keep, &mut stack);
+    }
+    locked.into_iter().enumerate().filter_map(|(idx, entry)| keep[idx].then_some(entry)).collect()
+}
+
 /// Like [`load`], with `features` enabled on the root package besides its defaults.
 pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Workspace> {
+    load_filtered(root, targets, features, &[])
+}
+
+fn load_filtered(root: &Path, targets: &Targets, features: &[&str], omit_root_deps: &[&str]) -> Result<Workspace> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
     let root = canonical.as_path();
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
-    let locked = lock::read(&top.join("Cargo.lock"))?;
+    let root_names = root_package_names(root, &top, workspace.as_ref())?;
+    let locked = prune_unreachable_locked(lock::read(&top.join("Cargo.lock"))?, &root_names, omit_root_deps);
+    let wanted_local: BTreeSet<String> = locked.iter().filter(|e| !e.is_registry()).map(|e| e.name.clone()).collect();
     let mut registries = registry_dirs()?;
     registries.insert(0, top.join("vendor"));
-    let paths = local_paths(root, &top, workspace.as_ref())?;
-    let mut packages = Vec::with_capacity(locked.len());
-    let mut missing: Vec<Option<anyhow::Error>> = Vec::with_capacity(locked.len());
-    for entry in locked {
-        match source_dir(&entry, &registries, &paths) {
-            Ok(dir) => {
-                let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
-                let manifest = manifest::read(&dir, owner.as_ref().map(|(_, ws)| ws))?;
-                packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
-                missing.push(None);
-            }
-            Err(err) => {
-                let manifest = manifest::Manifest { name: entry.name.clone(), ..manifest::Manifest::default() };
-                packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
-                missing.push(Some(err));
-            }
+    let paths = local_paths(root, &top, workspace.as_ref(), &wanted_local)?;
+    let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
+    if !omit_root_deps.is_empty() {
+        for pkg in packages.iter_mut().filter(|p| !p.locked.is_registry() && root_names.contains(&p.locked.name)) {
+            pkg.manifest.deps.retain(|dep| !omit_root_deps.contains(&dep.package.as_str()));
         }
     }
     resolve_deps(&mut packages);
-    let root_names: Vec<String> = if manifest_name(root).is_some() {
-        let owner = owning_workspace(root)?;
-        vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name]
-    } else if root == top && workspace.is_some() {
-        let mut dirs = member_dirs(&top, workspace.as_ref(), "default-members");
-        if dirs.is_empty() {
-            dirs = member_dirs(&top, workspace.as_ref(), "members");
-        }
-        dirs.into_iter().filter_map(|dir| manifest_name(&dir)).collect()
-    } else {
-        let owner = owning_workspace(root)?;
-        vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name]
-    };
-    let members: Vec<usize> = packages.iter().enumerate().filter(|(_, package)| !package.locked.is_registry() && root_names.contains(&package.locked.name)).map(|(at, _)| at).collect();
+    let members: Vec<usize> = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| !package.locked.is_registry() && root_names.contains(&package.locked.name))
+        .map(|(at, _)| at)
+        .collect();
     if members.is_empty() {
         bail!("{} is not in Cargo.lock", root.display());
     }
@@ -276,22 +353,41 @@ pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Wo
     Ok(Workspace { packages, graph })
 }
 
-/// The standard library sources of the toolchain: `HASTE_LIBRARY`, or rust-src of the first stable toolchain.
+/// The standard library sources of the toolchain: `HASTE_LIBRARY`, the active `rustc` sysroot's `rust-src`, or the newest rustup toolchain with `rust-src` (preferring `stable-*`).
 pub fn library() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("HASTE_LIBRARY") {
         return Ok(PathBuf::from(dir));
     }
+    let sysroot_library = |root: &Path| {
+        let dir = root.join("lib/rustlib/src/rust/library");
+        dir.join("sysroot").is_dir().then_some(dir)
+    };
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
+    if let Ok(output) = std::process::Command::new(rustc).args(["--print", "sysroot"]).output()
+        && output.status.success()
+        && let Ok(text) = std::str::from_utf8(&output.stdout)
+        && let Some(dir) = sysroot_library(Path::new(text.trim()))
+    {
+        return Ok(dir);
+    }
     let home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
-    let toolchains = home.context("no RUSTUP_HOME or HOME")?.join("toolchains");
-    let mut found: Vec<PathBuf> = std::fs::read_dir(&toolchains)?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
-    found.sort();
-    let library = found.iter().filter(|dir| dir.file_name().is_some_and(|name| name.to_string_lossy().starts_with("stable-"))).map(|dir| dir.join("lib/rustlib/src/rust/library"));
-    library.into_iter().find(|dir| dir.join("sysroot").is_dir()).context("no rust-src in a stable toolchain; set HASTE_LIBRARY")
+    if let Some(toolchains) = home.map(|home| home.join("toolchains"))
+        && let Ok(entries) = std::fs::read_dir(&toolchains)
+    {
+        let mut found: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
+        found.sort();
+        found.reverse();
+        let stable = found.iter().filter(|dir| dir.file_name().is_some_and(|name| name.to_string_lossy().starts_with("stable-")));
+        if let Some(dir) = stable.chain(found.iter()).find_map(|dir| sysroot_library(dir)) {
+            return Ok(dir);
+        }
+    }
+    anyhow::bail!("no rust-src found; run `rustup component add rust-src` or set HASTE_LIBRARY")
 }
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.
 pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
-    let mut sysroot = load_with(&library.join("sysroot"), targets, &[])?;
+    let mut sysroot = load_filtered(&library.join("sysroot"), targets, &[], &["test"])?;
     sysroot.packages.iter_mut().for_each(|package| package.sysroot = true);
     Ok(sysroot)
 }

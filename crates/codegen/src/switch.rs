@@ -1,6 +1,7 @@
 mod bitmask;
 mod emit;
 mod lut;
+mod member;
 mod select;
 mod tree;
 
@@ -8,7 +9,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
 use crate::cse::flip_int_cc;
-use crate::fold::extend;
+use crate::fold::{const_offset, extend};
 use crate::ir::{Binary, Block, Domain, Function, Inst, IntCC, Op, Type, Value};
 use bitmask::{build_runs, can_bitmask_runs, try_rewrite_expr};
 use emit::{can_br_table, emit_node, emit_sub_range, forward_cached, try_signed_br_table};
@@ -24,7 +25,7 @@ pub(super) struct Info {
 #[derive(Clone, Copy)]
 pub(super) enum TestKind {
     Cmp(IntCC, i64),
-    SubCmp { lo: u64, cc: IntCC, bound: u64 },
+    SubCmp { lo: u64, cc: IntCC, imm: i64 },
 }
 
 pub(super) struct BlockTest {
@@ -111,18 +112,12 @@ fn make_signed_range(ty: Type, s_lo: i64, s_hi: i64) -> Range {
     Range { lo: extend(s_lo, ty, false) as u64, hi: extend(s_hi, ty, false) as u64, s_lo, s_hi, signed_ok: true }
 }
 
-fn match_sub_offset(func: &Function, info: &Info, val: Value, expected_block: Option<usize>) -> Option<(Value, u64, Inst)> {
+fn match_sub_offset(func: &Function, info: &Info, val: Value, expected_block: Option<usize>) -> Option<(Value, u64, Option<Inst>)> {
     let inst = info.def_inst.get(val.index()).copied().flatten()?;
-    if expected_block.is_some_and(|b| info.def_block[val.index()] != Some(b) || info.uses.get(val.index()).copied() != Some(1)) {
-        return None;
-    }
-    let (src, lo_raw) = match func.insts[inst.index()].op {
-        Op::Binary(Binary::Isub, src, c) => (src, info.consts.get(c.index()).copied().flatten()?),
-        Op::Binary(Binary::Iadd, src, c) => (src, info.consts.get(c.index()).copied().flatten()?.wrapping_neg()),
-        _ => return None,
-    };
+    let (src, delta) = const_offset(&func.insts[inst.index()].op, |c| info.consts.get(c.index()).copied().flatten())?;
+    let owned = expected_block.is_none_or(|b| info.def_block[val.index()] == Some(b) && info.uses.get(val.index()).copied() == Some(1));
     let ty = func.ty(src);
-    ty.is_small_int().then(|| (src, extend(lo_raw, ty, false) as u64, inst))
+    ty.is_small_int().then(|| (src, extend(delta.wrapping_neg(), ty, false) as u64, owned.then_some(inst)))
 }
 
 pub(super) fn match_test(func: &Function, info: &Info, cond: Value, expected_val: Option<Value>, expected_block: Option<usize>) -> Option<BlockTest> {
@@ -154,13 +149,11 @@ pub(super) fn match_test(func: &Function, info: &Info, cond: Value, expected_val
         Some(xi) => [Some(xi), Some(cmp_inst), diff],
         None => [Some(cmp_inst), diff, None],
     };
-    if !cc.is_signed()
-        && !matches!(cc, IntCC::Equal | IntCC::NotEqual)
-        && let Some((src, lo, diff_inst)) = match_sub_offset(func, info, lhs, expected_block)
+    if let Some((src, lo, diff_inst)) = match_sub_offset(func, info, lhs, expected_block)
         && expected_val.is_none_or(|ev| ev == src)
     {
-        let bound = extend(imm, func.ty(src), false) as u64;
-        return Some(BlockTest { val: src, kind: TestKind::SubCmp { lo, cc, bound }, used: used_with(Some(diff_inst)) });
+        let kind = if matches!(cc, IntCC::Equal | IntCC::NotEqual) { TestKind::Cmp(cc, imm.wrapping_add(lo as i64)) } else { TestKind::SubCmp { lo, cc, imm } };
+        return Some(BlockTest { val: src, kind, used: used_with(diff_inst) });
     }
     if func.ty(lhs).is_small_int() && expected_val.is_none_or(|ev| ev == lhs) {
         return Some(BlockTest { val: lhs, kind: TestKind::Cmp(cc, imm), used: used_with(None) });
@@ -171,13 +164,9 @@ pub(super) fn match_test(func: &Function, info: &Info, cond: Value, expected_val
 pub(super) fn range_of_test(ty: Type, kind: TestKind, want_true: bool) -> Option<Range> {
     let u_max = ty.unsigned_max();
     match kind {
-        TestKind::SubCmp { lo, cc, bound } => {
-            let span = match if want_true { cc } else { cc.inverse() } {
-                IntCC::UnsignedLessThanOrEqual => bound,
-                IntCC::UnsignedLessThan if bound > 0 => bound - 1,
-                _ => return None,
-            };
-            (span < u_max && u128::from(lo) + u128::from(span) <= u128::from(u_max)).then(|| make_range(ty, lo, lo + span))
+        TestKind::SubCmp { lo, cc, imm } => {
+            let r = range_of_test(ty, TestKind::Cmp(cc, imm), want_true)?;
+            Some(make_range(ty, r.lo.wrapping_add(lo) & u_max, r.hi.wrapping_add(lo) & u_max))
         }
         TestKind::Cmp(cc, imm) => match if want_true { cc } else { cc.inverse() } {
             IntCC::Equal => {
@@ -413,6 +402,9 @@ fn match_arm(
             }
             let t_cont = can_follow_into(func, info, ctx, &t_edge).is_some_and(|(tb, _)| peek_chain(func, info, tb, test.val));
             let f_cont = can_follow_into(func, info, ctx, &f_edge).is_some_and(|(fb, _)| peek_chain(func, info, fb, test.val));
+            if t_cont && f_cont {
+                return None;
+            }
             pick_arm_direction(func, info, &test, (t_edge, f_edge, t_cont, f_cont), (preferred_hit, false))
         }
         Op::Jump(target, args) if !is_head && args.len() == 1 && func.blocks[target.index()].params.len() == 1 && func.ty(args[0]) == Type::I8 => {
@@ -529,7 +521,7 @@ fn clear_blocks(func: &mut Function, blocks: &[usize], hoisted: &[Inst], cleared
     }
 }
 
-fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), mut ch: Chain, cleared: &mut [bool]) -> bool {
+fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), mut ch: Chain, (cleared, flag_chain): (&mut [bool], bool)) -> bool {
     let ty = func.ty(ch.val);
     let single_mod = ch.arms.len() == 1 && ch.two_block_arms == 1 && ch.arms[0].range.lo > ch.arms[0].range.hi;
     let mut runs = if single_mod { Vec::new() } else { build_runs(func, info, ty, &ch.arms) };
@@ -541,8 +533,9 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
         cleared[b0] = true;
         return true;
     }
-    if !single_mod {
-        let covered: u64 = runs.iter().map(|r| r.hi.saturating_sub(r.lo).saturating_add(1)).sum();
+    let covered: u64 = runs.iter().map(|r| r.hi.saturating_sub(r.lo).saturating_add(1)).sum();
+    let members = (flag_chain && !single_mod).then(|| member::member_values(func, info, ty, (&runs, covered))).flatten();
+    if !single_mod && members.is_none() {
         if covered < 4 && ch.two_block_arms == 0 && runs.len() >= ch.arms.len() && !can_bitmask_runs(func, info, ty, &runs) {
             return false;
         }
@@ -559,6 +552,8 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
     if single_mod {
         let r = ch.arms[0].range;
         emit_sub_range(func, Some((b0, last0)), (ch.val, ty), (r.s_lo, r.s_hi.abs_diff(r.s_lo)), (&ch.arms[0].hit, default_blk));
+    } else if let Some((&head, rest)) = members.as_deref().and_then(<[u64]>::split_first) {
+        member::emit_member(func, (b0, last0), (ch.val, ty), (head, rest), (&runs[0].hit, default_blk));
     } else if !try_signed_br_table(func, (b0, last0), (ch.val, ty), &ch.arms, (default_blk, &mut cache)) {
         emit_node(func, info, Some((b0, last0)), (ch.val, ty), &runs, (default_blk, &mut cache));
     }
@@ -605,12 +600,13 @@ fn try_rewrite_br_table(func: &mut Function, info: &Info, (b0, last0): (usize, I
     true
 }
 
-pub(crate) fn run(func: &mut Function) -> Domain {
+pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     if func.coroutine.is_some() { return Domain::NONE; }
     let mut info = analyze(func);
     let initial_blocks = func.blocks.len();
     let mut cleared = vec![false; initial_blocks];
     let mut changed = false;
+    let flag_chain = target.arch == crate::target::Arch::Arm64;
     for b0 in 0..initial_blocks {
         changed |= select::try_rewrite_select_trees(func, &info, b0);
     }
@@ -629,7 +625,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             continue;
         }
         if let Some(ch) = collect_chain(func, &info, b0, &cleared)
-            && rewrite_chain(func, &info, (b0, last0), ch, &mut cleared)
+            && rewrite_chain(func, &info, (b0, last0), ch, (&mut cleared, flag_chain))
         {
             changed = true;
             continue;

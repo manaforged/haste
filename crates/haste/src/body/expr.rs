@@ -367,6 +367,16 @@ impl Cursor<'_> {
         let expr = self.block_expr(None, BlockKind::Expansion);
         (self.at, self.end) = (at, end);
         self.expansion = expr.as_ref().ok().copied();
+        self.expansion_stmt = None;
+        if let Ok(block) = expr
+            && let Expr::Block { stmts, tail: None, .. } = self.body.exprs[block.0 as usize]
+            && let &[stmt] = self.body.list(stmts)
+            && let super::Stmt::Expr(value, true) = self.body.stmts[stmt as usize]
+        {
+            let none = self.list(&[]);
+            self.body.exprs[block.0 as usize] = Expr::Block { stmts: none, tail: Some(value), label: None, kind: BlockKind::Expansion };
+            self.expansion_stmt = Some(stmt);
+        }
         expr
     }
 

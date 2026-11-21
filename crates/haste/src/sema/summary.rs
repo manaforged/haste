@@ -1,6 +1,7 @@
 pub mod codec;
 pub(super) mod frozen;
 mod inst;
+pub(super) mod thaw;
 
 pub use inst::{PolyCheck, PolyInst};
 
@@ -99,7 +100,6 @@ impl<'a> SubState<'a> {
 pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Option<Result<Arc<Typed>, String>> {
     let before = cx.quiet_mark();
     let (item, substs) = *instance;
-    let is_fixed = cx.outline.is_fixed(item.krate);
     if !eligible(cx, item, substs) {
         return None;
     }
@@ -122,25 +122,13 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
                 Ok(typed) => Arc::new(typed),
                 Err(error) => return Some(Err(format!("{}: {error:#}", cx.name(instance.0)))),
             };
-            let laid = super::reach::lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
-            if laid.is_ok() && cx.quiet_mark() == m_before {
-                cx.store.finals.insert(*instance, Arc::clone(&typed));
-            }
+            thaw::keep_laid(cx, *instance, &typed, unlaid, m_before);
             return Some(Ok(typed));
         }
         _ => return None,
     };
-    if is_fixed
-        && !cx.store.lookups.skip_warm_sysroot_bodies
-        && cx.store.bodies.get(&item).is_none()
-        && cx.store.lookups.substrate.is_some()
-        && !(cx.outline.is_sysroot(item.krate)
-            && summary.param_count == 0
-            && (cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never")))
-        && let Err(err) = cx.body(item)
-        && cx.quiet_mark() != before
-    {
-        return Some(Err(format!("{}: {err:#}", cx.name(item))));
+    if let Err(err) = thaw::warm_body(cx, item, before) {
+        return Some(Err(err));
     }
     instantiate_summary(cx, *instance, &summary, unlaid, before)
 }
@@ -211,24 +199,27 @@ fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
 }
 
 fn load_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
-    let Some(summary) = frozen::frozen_summary(cx, item) else { return build_summary(cx, item, param_count) };
+    let Some(summary) = frozen::frozen_summary(cx, item) else { return thaw::frozen_verdict(cx, item).unwrap_or_else(|| build_summary(cx, item, param_count)) };
     lay_out_fixed(cx, &summary);
     SummaryKind::Poly(summary)
 }
 
 fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
+    let before = cx.quiet_mark();
     let built = super::infer::poly::build_poly_summary(cx, item, param_count);
     let SummaryKind::Poly(mut arc) = built else {
+        thaw::settle_verdict(cx, item, before, &built);
         return built;
     };
-    if cx.outline.is_fixed(item.krate) {
-        cx.store.lookups.has_new_sysroot_summaries.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
     let Some(summary) = Arc::get_mut(&mut arc) else { return SummaryKind::MonomorphicFallback };
     if prepare_summary(cx, item, summary).is_err() {
-        return SummaryKind::MonomorphicFallback;
+        let fallback = SummaryKind::MonomorphicFallback;
+        thaw::settle_verdict(cx, item, before, &fallback);
+        return fallback;
     }
-    SummaryKind::Poly(arc)
+    let kind = SummaryKind::Poly(arc);
+    thaw::note_fresh_summary(cx, item, &kind);
+    kind
 }
 
 fn prepare_summary(cx: &mut Context<'_>, item: ItemRef, summary: &mut PolySummary) -> Result<()> {
@@ -242,7 +233,7 @@ fn prepare_summary(cx: &mut Context<'_>, item: ItemRef, summary: &mut PolySummar
     extract_call_holes(cx, summary);
     if !summary.template.operators.is_empty() {
         let body = cx.body(item)?;
-        summary.op_holes = extract_op_holes(&cx.types, &body, &summary.template);
+        summary.op_holes = extract_op_holes(cx, &body, &summary.template);
     }
     extract_drops_and_tys(cx, summary)
 }
@@ -275,6 +266,11 @@ fn extract_call_holes(cx: &Context<'_>, summary: &mut PolySummary) {
     }
     tpl.pat_res.as_slice().iter().for_each(|&(id, r)| push(SiteKey::PatRes(id), r));
     tpl.derefs.as_slice().iter().for_each(|&((id, step), r)| push(SiteKey::Deref(id, step), r));
+    for &(id, r) in tpl.operators.as_slice() {
+        if !matches!(r, Res::Fn(i, s) if types.substs_have_params(s) && cx.owner_trait(i).is_some()) {
+            push(SiteKey::Operator(id), r);
+        }
+    }
     tpl.try_blocks.as_slice().iter().for_each(|&(id, r)| push(SiteKey::TryBlock(id), r));
     for &(id, r) in tpl.box_frees.as_slice() {
         if !call_obs.contains(&id) {
@@ -318,10 +314,12 @@ fn extract_call_holes(cx: &Context<'_>, summary: &mut PolySummary) {
     summary.call_holes = holes.into_boxed_slice();
 }
 
-fn extract_op_holes(types: &Types, body: &Body, tpl: &BodyTables) -> Box<[(ExprId, OpCheck, Res)]> {
+fn extract_op_holes(cx: &Context<'_>, body: &Body, tpl: &BodyTables) -> Box<[(ExprId, OpCheck, Res)]> {
+    let types = &cx.types;
     tpl.operators
         .as_slice()
         .iter()
+        .filter(|&&(_, r)| matches!(r, Res::Fn(i, s) if types.substs_have_params(s) && cx.owner_trait(i).is_some()))
         .map(|&(expr, r)| {
             let check = match *body.expr(expr) {
                 Expr::Unary(op, operand) if op != UnOp::Deref => OpCheck::Unary(tpl.exprs[operand.0 as usize]),
@@ -345,52 +343,43 @@ fn is_aggregate(cx: &Context<'_>, ty: Ty) -> bool {
     ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..))
 }
 
+fn has_closure(types: &Types, ty: Ty) -> bool {
+    let kind = types.kind(ty);
+    matches!(kind, Kind::Closure(..)) || kind.children(types).any(|child| has_closure(types, child))
+}
+
 fn owned_tys(summary: &PolySummary) -> impl Iterator<Item = Ty> + '_ {
-    summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys())
+    summary.locals.iter().map(|l| l.ty).chain(summary.ret).chain(summary.template.owned_tys())
 }
 
 fn lay_out_fixed(cx: &mut Context<'_>, summary: &PolySummary) {
-    let fixed = summary.template.closures.is_empty().then(|| owned_tys(summary));
+    let fixed = frozen::closure_free(summary).then(|| owned_tys(summary));
     for ty in fixed.into_iter().flatten() {
-        if is_aggregate(cx, ty) && !cx.types.has_params(ty) {
-            drop(cx.layout(ty));
-        }
+        if is_aggregate(cx, ty) && !cx.types.has_params(ty) && !cx.types.has_var_flag(ty) { cx.layout(ty).ok(); }
     }
 }
 
+fn record_drop_ty(cx: &mut Context<'_>, ty: Ty, fixed_drops: &mut Vec<Res>, drop_tys: &mut Vec<Ty>) -> Result<()> {
+    if cx.types.has_var_flag(ty) || has_closure(&cx.types, ty) { return Ok(()); }
+    if !cx.types.has_params(ty) {
+        if is_aggregate(cx, ty) { cx.layout(ty).ok(); }
+        fixed_drops.extend(super::infer::glue_call(cx, ty)?);
+    } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
+        drop_tys.push(ty);
+    }
+    Ok(())
+}
+
 fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Result<()> {
-    if summary.template.closures.is_empty() {
-        let mut seen_drop = HashSet::default();
-        let mut fixed_drops = Vec::new();
-        let mut drop_tys = Vec::new();
-        for ty in owned_tys(summary) {
-            if ty == Ty::NONE || !seen_drop.insert(ty) {
-                continue;
-            }
-            if !cx.types.has_params(ty) {
-                if is_aggregate(cx, ty) {
-                    drop(cx.layout(ty));
-                }
-                if let Some(call) = super::infer::glue_call(cx, ty)? {
-                    fixed_drops.push(call);
-                }
-            } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
-                drop_tys.push(ty);
-            }
-        }
-        summary.fixed_drops = fixed_drops.into_boxed_slice();
-        summary.drop_tys = drop_tys.into_boxed_slice();
+    let mut seen = HashSet::default();
+    let (mut fixed_drops, mut drop_tys, mut parametric_tys) = (Vec::new(), Vec::new(), Vec::new());
+    for ty in owned_tys(summary) {
+        if ty == Ty::NONE || !seen.insert(ty) { continue; }
+        record_drop_ty(cx, ty, &mut fixed_drops, &mut drop_tys)?;
+        if cx.types.has_params(ty) { parametric_tys.push(ty); }
     }
-    let mut seen_param = HashSet::default();
-    let mut parametric_tys = Vec::new();
-    let tpl = &summary.template;
-    let flow_tys = tpl.fors.values().flat_map(|f| [f.iter, f.option]).chain(tpl.tries.values().map(|t| t.flow)).chain(tpl.awaits.values().flat_map(|a| [a.future, a.polled]));
-    let all_tys = summary.locals.iter().map(|l| l.ty).chain(summary.ret).chain(tpl.pats.values().copied()).chain(tpl.exprs.iter().copied()).chain(flow_tys);
-    for ty in all_tys {
-        if ty != Ty::NONE && cx.types.has_params(ty) && seen_param.insert(ty) {
-            parametric_tys.push(ty);
-        }
-    }
+    summary.fixed_drops = fixed_drops.into_boxed_slice();
+    summary.drop_tys = drop_tys.into_boxed_slice();
     summary.parametric_tys = parametric_tys.into_boxed_slice();
     Ok(())
 }
@@ -404,26 +393,60 @@ fn record_instantiated(cx: &mut Context<'_>, instance: Instance, layouts: &[Ty],
     clean
 }
 
+fn is_pure_summary(summary: &PolySummary) -> bool {
+    summary.projections.is_empty() && summary.obligations.is_empty() && summary.call_holes.is_empty() && summary.op_holes.is_empty() && summary.const_holes.is_empty() && frozen::closure_free(summary)
+}
+
+fn is_zero_hole_mono(summary: &PolySummary) -> bool {
+    summary.param_count == 0 && summary.direct_calls.is_empty() && summary.drop_tys.is_empty() && summary.parametric_tys.is_empty() && is_pure_summary(summary)
+}
+
+fn detached_outcome(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, concrete_args: &[Ty], check_only: bool) -> Option<InstOutcome> {
+    super::infer::detached_summary(cx, instance.0, |infer| {
+        let mut sub = SubState::new(concrete_args);
+        eval_projections(infer, &mut sub, &summary.projections)?;
+        let call_overrides = check_obligations(infer, &mut sub, &summary.obligations)?;
+        let offset_overrides = if check_only { Vec::new() } else { eval_offset_holes(infer, &mut sub, &summary.const_holes)? };
+        check_const_holes(infer, &mut sub, &summary.const_holes)?;
+        let (resolved_calls, builtin_ops) = resolve_instance_calls(infer, &mut sub, summary, &call_overrides, check_only)?;
+        let ret = summary.ret.map(|ty| sub_ty(infer, &mut sub, ty)).transpose()?;
+        let layouts = summary.layout_tys.iter().map(|&ty| sub_ty(infer, &mut sub, ty)).collect::<Result<Vec<_>>>()?;
+        let drop_tys = summary.drop_tys.iter().map(|&ty| sub_ty(infer, &mut sub, ty)).collect::<Result<Vec<_>>>()?;
+        if check_only {
+            return Ok(InstOutcome::CheckOnly(PolyCheck { summary: Arc::clone(summary), resolved_calls }, ret, layouts, drop_tys));
+        }
+        let locals = summary.locals.iter().map(|local| Ok(Local { ty: sub_ty(infer, &mut sub, local.ty)? })).collect::<Result<Vec<_>>>()?;
+        let mut projs: Vec<_> = sub.projs.into_iter().collect();
+        projs.sort_unstable_by_key(|&(id, _)| id.0);
+        let inst = PolyInst {
+            args: instance.1, summary: Arc::clone(summary), projs: projs.into_boxed_slice(), resolved_calls,
+            builtin_ops, call_overrides: call_overrides.into_boxed_slice(), offset_overrides: offset_overrides.into_boxed_slice(), materialized: OnceLock::new(),
+        };
+        Ok(InstOutcome::Full(inst, locals, ret, layouts, drop_tys))
+    })
+    .ok()
+}
+
+fn settle_outcome(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, outcome: InstOutcome) -> Option<(Arc<Typed>, Vec<Ty>)> {
+    match outcome {
+        InstOutcome::CheckOnly(check, ret, layouts, drop_tys) => {
+            let drops = instantiate_drops(cx, &summary.fixed_drops, &drop_tys).ok()?;
+            Some((Arc::new(Typed { tables: LazyTables::CheckOnly(Box::new(check)), locals: Vec::new(), params: Vec::new(), ret, drops, shape: Shape::Body }), layouts))
+        }
+        InstOutcome::Full(poly_inst, locals, ret, layouts, _) if !frozen::closure_free(summary) => {
+            let raw = Typed { tables: LazyTables::Eager(Arc::new(poly_inst.materialize(&cx.types))), locals, params: summary.params.to_vec(), ret, drops: Vec::new(), shape: Shape::Body };
+            Some((Arc::new(super::infer::settle(cx, instance, raw).ok()?), layouts))
+        }
+        InstOutcome::Full(poly_inst, locals, ret, layouts, drop_tys) => {
+            let drops = instantiate_drops(cx, &summary.fixed_drops, &drop_tys).ok()?;
+            Some((Arc::new(Typed { tables: LazyTables::Poly(Box::new(poly_inst)), locals, params: summary.params.to_vec(), ret, drops, shape: Shape::Body }), layouts))
+        }
+    }
+}
+
 fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, unlaid: &mut Vec<String>, before: (usize, usize)) -> Option<Result<Arc<Typed>, String>> {
-    if summary.param_count == 0
-        && summary.projections.is_empty()
-        && summary.obligations.is_empty()
-        && summary.direct_calls.is_empty()
-        && summary.call_holes.is_empty()
-        && summary.op_holes.is_empty()
-        && summary.const_holes.is_empty()
-        && summary.drop_tys.is_empty()
-        && summary.parametric_tys.is_empty()
-        && summary.template.closures.is_empty()
-    {
-        let typed = Arc::new(Typed {
-            tables: LazyTables::Eager(Arc::clone(&summary.template)),
-            locals: summary.locals.to_vec(),
-            params: summary.params.to_vec(),
-            ret: summary.ret,
-            drops: summary.fixed_drops.to_vec(),
-            shape: Shape::Body,
-        });
+    if is_zero_hole_mono(summary) {
+        let typed = Arc::new(Typed { tables: LazyTables::Eager(Arc::clone(&summary.template)), locals: summary.locals.to_vec(), params: summary.params.to_vec(), ret: summary.ret, drops: summary.fixed_drops.to_vec(), shape: Shape::Body });
         record_instantiated(cx, instance, &summary.layout_tys, &typed, unlaid, before);
         return Some(Ok(typed));
     }
@@ -436,70 +459,15 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
         record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before);
         return Some(Ok(typed));
     }
-    let check_only = cx.store.lookups.skip_warm_sysroot_bodies && cx.outline.is_fixed(instance.0.krate) && summary.template.closures.is_empty();
-    let pure = summary.projections.is_empty() && summary.obligations.is_empty() && summary.call_holes.is_empty()
-        && summary.op_holes.is_empty() && summary.const_holes.is_empty() && summary.template.closures.is_empty();
-    let outcome = if pure {
+    let check_only = cx.store.lookups.skip_warm_sysroot_bodies && cx.outline.is_fixed(instance.0.krate) && frozen::closure_free(summary);
+    let outcome = if is_pure_summary(summary) {
         instantiate_pure(&cx.types, instance.1, summary, check_only)
-    } else if let Some(cached) = frozen::try_cached_instantiate(cx, instance, summary, check_only) {
-        cached
     } else {
-        let Ok(built) = super::infer::detached_summary(cx, instance.0, |infer| {
-            let mut sub = SubState::new(&concrete_args);
-            eval_projections(infer, &mut sub, &summary.projections)?;
-            let call_overrides = check_obligations(infer, &mut sub, &summary.obligations)?;
-            let offset_overrides = if check_only { Vec::new() } else { eval_offset_holes(infer, &mut sub, &summary.const_holes)? };
-            check_const_holes(infer, &mut sub, &summary.const_holes)?;
-            let (resolved_calls, builtin_ops) = resolve_instance_calls(infer, &mut sub, summary, &call_overrides, check_only)?;
-            let ret = summary.ret.map(|ty| sub_ty(infer, &mut sub, ty)).transpose()?;
-            let layouts = summary.layout_tys.iter().map(|&ty| sub_ty(infer, &mut sub, ty)).collect::<Result<Vec<_>>>()?;
-            let drop_tys = summary.drop_tys.iter().map(|&ty| sub_ty(infer, &mut sub, ty)).collect::<Result<Vec<_>>>()?;
-            if check_only {
-                return Ok(InstOutcome::CheckOnly(PolyCheck { summary: Arc::clone(summary), resolved_calls }, ret, layouts, drop_tys));
-            }
-            let locals = summary.locals.iter().map(|local| Ok(Local { ty: sub_ty(infer, &mut sub, local.ty)? })).collect::<Result<Vec<_>>>()?;
-            let mut projs: Vec<_> = sub.projs.into_iter().collect();
-            projs.sort_unstable_by_key(|&(id, _)| id.0);
-            let inst = PolyInst {
-                args: instance.1,
-                summary: Arc::clone(summary),
-                projs: projs.into_boxed_slice(),
-                resolved_calls,
-                builtin_ops,
-                call_overrides: call_overrides.into_boxed_slice(),
-                offset_overrides: offset_overrides.into_boxed_slice(),
-                materialized: OnceLock::new(),
-            };
-            Ok(InstOutcome::Full(inst, locals, ret, layouts, drop_tys))
-        }) else {
-            return None;
-        };
-        built
+        frozen::try_cached_instantiate(cx, instance, summary, check_only).or_else(|| detached_outcome(cx, instance, summary, &concrete_args, check_only))?
     };
-    let (typed, concrete_layouts) = match outcome {
-        InstOutcome::CheckOnly(check, ret, concrete_layouts, concrete_drop_tys) => {
-            let Ok(drops) = instantiate_drops(cx, &summary.fixed_drops, &concrete_drop_tys) else { return None };
-            let typed = Arc::new(Typed { tables: LazyTables::CheckOnly(Box::new(check)), locals: Vec::new(), params: Vec::new(), ret, drops, shape: Shape::Body });
-            (typed, concrete_layouts)
-        }
-        InstOutcome::Full(poly_inst, locals, ret, concrete_layouts, concrete_drop_tys) => {
-            let typed = if !summary.template.closures.is_empty() {
-                let tables = Arc::new(poly_inst.materialize(&cx.types));
-                let raw = Typed { tables: LazyTables::Eager(tables), locals, params: summary.params.to_vec(), ret, drops: Vec::new(), shape: Shape::Body };
-                let Ok(settled) = super::infer::settle(cx, instance, raw) else { return None };
-                Arc::new(settled)
-            } else {
-                let Ok(drops) = instantiate_drops(cx, &summary.fixed_drops, &concrete_drop_tys) else { return None };
-                Arc::new(Typed { tables: LazyTables::Poly(Box::new(poly_inst)), locals, params: summary.params.to_vec(), ret, drops, shape: Shape::Body })
-            };
-            (typed, concrete_layouts)
-        }
-    };
-    if record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before)
-        && matches!(&typed.tables, LazyTables::Poly(inst) if inst.summary.template.closures.is_empty())
-        && cx.outline.is_fixed(instance.0.krate)
-    {
-        cx.store.lookups.has_new_sysroot_instances.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (typed, concrete_layouts) = settle_outcome(cx, instance, summary, outcome)?;
+    if record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before) {
+        thaw::note_fresh(cx, instance, &typed);
     }
     Some(Ok(typed))
 }

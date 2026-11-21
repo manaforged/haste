@@ -7,7 +7,7 @@ use crate::names::{ItemRef, Primitive};
 
 use super::super::Context;
 use super::super::impls::head;
-use super::super::infer::{LazyTables, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized, type_params};
+use super::super::infer::{LazyTables, Shape, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized, type_params};
 use super::super::intrinsic::Intrinsic;
 use super::super::substs::Substs;
 use super::super::summary::{ConstHole, PolyObligation, PolySummary, poly_summary};
@@ -356,7 +356,8 @@ pub(super) fn pre_collect_callees(
     let Ok(typed) = typed else { return };
     let check_only = cx.store.lookups.skip_warm_sysroot_bodies;
     let caller_is_fixed = cx.outline.is_fixed(caller.0.krate);
-    let mut push = |item: ItemRef, substs: Substs| push_filtered_callee(cx, filter, check_only && caller_is_fixed, (item, substs), out);
+    let prune_fixed = check_only && caller_is_fixed && !matches!(typed.shape, Shape::Glue(_));
+    let mut push = |item: ItemRef, substs: Substs| push_filtered_callee(cx, filter, prune_fixed, (item, substs), out);
     match &typed.tables {
         LazyTables::Poly(poly) => push_poly_callees(typed, poly.calls(), poly.dynamic_calls(), include_fixed, &mut push),
         LazyTables::CheckOnly(check) => push_poly_callees(typed, check.calls(), check.dynamic_calls(), include_fixed, &mut push),

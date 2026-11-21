@@ -2,7 +2,8 @@ use crate::alloc::{Location, Plan, Regs};
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, Signature, Type, Value};
 
 pub(crate) const WORD: u32 = 8;
-const MAX_ALIGN_SHIFT: u8 = 4;
+/// The most alignment, as a shift, that the frame gives a slot.
+pub(crate) const MAX_ALIGN_SHIFT: u8 = 4;
 pub(crate) const PAGE: u32 = 4096;
 pub(crate) const INCOMING: i32 = 16;
 const EDGE_SLOT: u32 = 16;
@@ -257,8 +258,33 @@ pub(crate) fn saved<R: Copy>(func: &Function, used: &[R], all: &[R]) -> Vec<R> {
     if handles { all.to_vec() } else { used.to_vec() }
 }
 
+fn needs_frame<R>(func: &Function, frame: &Frame<R>, stack_params: bool, bracketed: bool) -> bool {
+    stack_params
+        || frame.size > 0
+        || !frame.saves.is_empty()
+        || !frame.float_saves.is_empty()
+        || (0..func.blocks.len() as u32).map(Block).any(|block| {
+            let traps = bracketed && matches!(func.last(block), Some(Op::Trap));
+            func.blocks[block.index()].insts.iter().any(|inst| match func.insts[inst.index()].op {
+                Op::Call { .. } => !traps,
+                Op::TryCall { .. } | Op::FramePointer => true,
+                _ => false,
+            })
+        })
+}
+
 pub(crate) fn framed<R>(func: &Function, frame: &Frame<R>, stack_params: bool) -> bool {
-    stack_params || frame.size > 0 || !frame.saves.is_empty() || !frame.float_saves.is_empty() || live_ops(func).any(|op| matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::FramePointer))
+    needs_frame(func, frame, stack_params, false)
+}
+
+/// Whether `func` needs a frame only for calls in blocks that end in a trap, so each of those calls can push its own frame record and the hot path runs frameless.
+pub(crate) fn brackets_calls<R>(func: &Function, frame: &Frame<R>, abi: &Abi<R>) -> bool {
+    let stack_params = stack_params(abi);
+    needs_frame(func, frame, stack_params, false) && !needs_frame(func, frame, stack_params, true)
+}
+
+fn stack_params<R>(abi: &Abi<R>) -> bool {
+    abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)))
 }
 
 fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<u32, String> {
@@ -271,10 +297,15 @@ fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, St
     Ok(outgoing)
 }
 
-fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
+fn present(func: &Function, fused: &[bool]) -> (Vec<bool>, Vec<bool>) {
     let (mut values, mut slots) = (vec![false; func.types.len()], vec![false; func.slots.len()]);
-    for block in &func.blocks {
-        block.params.iter().for_each(|param| values[param.index()] = true);
+    let mut flags = Vec::new();
+    let cfg = func.cfg();
+    for (at, block) in func.blocks.iter().enumerate() {
+        let entered = func.entry == Some(Block(at as u32)) || cfg.pred_count(Block(at as u32)) != 0;
+        if entered {
+            block.params.iter().for_each(|param| values[param.index()] = true);
+        }
         for inst in &block.insts {
             let data = &func.insts[inst.index()];
             data.op.for_operands(|value| values[value.index()] = true);
@@ -282,8 +313,14 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
             if let Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) = data.op {
                 slots[slot.index()] = true;
             }
+            if let (Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..), Some(result)) = (&data.op, data.result)
+                && fused.get(result.index()) == Some(&true)
+            {
+                flags.push(result);
+            }
         }
     }
+    flags.into_iter().for_each(|value| values[value.index()] = false);
     (values, slots)
 }
 
@@ -298,44 +335,115 @@ pub(crate) fn terminator_edges<'a>(op: &'a Op, mut f: impl FnMut(Block, &'a [Val
     }
 }
 
-pub(crate) fn layout<R: Copy + PartialEq>(
+#[derive(Clone, Copy)]
+enum HomeTarget {
+    Value(usize),
+    Shared(usize),
+}
+
+fn place_slots(func: &Function, addressed: &[bool], descending: bool, cursor: &mut u32) -> Vec<i32> {
+    let mut slots = vec![0; func.slots.len()];
+    let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
+    if descending {
+        order.sort_by_key(|&slot| (std::cmp::Reverse(func.slots[slot].size), slot));
+    } else {
+        order.sort_by_key(|&slot| (func.slots[slot].size, slot));
+    }
+    for slot in order {
+        let data = &func.slots[slot];
+        let min_align = if data.size >= 8 { 8 } else if data.size >= 4 { 4 } else if data.size >= 2 { 2 } else { 1 };
+        let align = (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align);
+        *cursor = round(*cursor + data.size, align);
+        slots[slot] = -(*cursor as i32);
+    }
+    slots
+}
+
+fn collect_value_homes<R: Copy + PartialEq>(
     func: &Function,
-    (saves, float_saves): (Vec<R>, Vec<u8>),
+    present: &[bool],
     (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
-    classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
-) -> Result<Frame<R>, String> {
-    let outgoing = needs(func, classify)?;
-    let (present, addressed) = present(func);
-    let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
-    let mut values = vec![0; func.types.len()];
-    let mut homes: Vec<i32> = Vec::new();
-    let mut value_order: Vec<usize> = (0..func.types.len()).collect();
-    value_order.sort_by_key(|&v| (
+) -> (Vec<(HomeTarget, u32, u32)>, usize, Vec<(usize, usize)>) {
+    let mut order: Vec<usize> = (0..func.types.len()).collect();
+    order.sort_by_key(|&v| (
         !matches!((homed.get(v), locations[v]), (Some(&true), Location::Reg(_))),
         !matches!((homed.get(v), locations[v], func.types[v].bytes()), (Some(&true), Location::Float(_), 8)),
         v,
     ));
-    for value in value_order {
-        let ty = func.types[value];
-        let static_loc = locations[value].is_static();
-        let reg_unhomed = matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true);
-        if !present[value] || elided.get(value) == Some(&true) || static_loc || reg_unhomed {
+    let mut items: Vec<(HomeTarget, u32, u32)> = Vec::new();
+    let mut home_pos: Vec<Option<usize>> = Vec::new();
+    let mut shared_vals: Vec<(usize, usize)> = Vec::new();
+    for v in order {
+        let reg_unhomed = matches!(locations[v], Location::Reg(_) | Location::Float(_)) && homed.get(v) != Some(&true);
+        if !present[v] || elided.get(v) == Some(&true) || locations[v].is_static() || reg_unhomed {
             continue;
         }
-        let Some(home) = shared.get(value).copied().flatten().map(|home| home as usize) else {
-            cursor += round(ty.bytes(), WORD);
-            values[value] = -(cursor as i32);
+        let bytes = func.types[v].bytes();
+        let align = if bytes >= 16 { 16 } else { WORD };
+        let Some(home) = shared.get(v).copied().flatten().map(|h| h as usize) else {
+            items.push((HomeTarget::Value(v), bytes, align));
             continue;
         };
-        if homes.len() <= home {
-            homes.resize(home + 1, 0);
+        if home_pos.len() <= home {
+            home_pos.resize(home + 1, None);
         }
-        if homes[home] == 0 {
-            cursor += round(ty.bytes(), WORD);
-            homes[home] = -(cursor as i32);
+        if let Some(at) = home_pos[home] {
+            items[at] = (items[at].0, items[at].1.max(bytes), items[at].2.max(align));
+        } else {
+            home_pos[home] = Some(items.len());
+            items.push((HomeTarget::Shared(home), bytes, align));
         }
-        values[value] = homes[home];
+        shared_vals.push((v, home));
     }
+    (items, home_pos.len(), shared_vals)
+}
+
+fn place_values<R: Copy + PartialEq>(
+    func: &Function,
+    present: &[bool],
+    (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
+    sp_near: bool,
+    cursor: &mut u32,
+) -> Vec<i32> {
+    let (mut items, home_len, shared_vals) = collect_value_homes(func, present, (locations, shared, homed, elided));
+    if sp_near {
+        items.reverse();
+    }
+    let mut values = vec![0; func.types.len()];
+    let mut homes = vec![0; home_len];
+    for (target, bytes, align) in items {
+        *cursor = round(*cursor, align) + round(bytes, align);
+        let disp = -(*cursor as i32);
+        match target {
+            HomeTarget::Value(v) => values[v] = disp,
+            HomeTarget::Shared(h) => homes[h] = disp,
+        }
+    }
+    for (v, h) in shared_vals {
+        values[v] = homes[h];
+    }
+    values
+}
+
+pub(crate) fn layout<R: Copy + PartialEq>(
+    func: &Function,
+    (saves, float_saves): (Vec<R>, Vec<u8>),
+    (locations, shared, homed, elided, fused): (&[Location<R>], &[Option<u32>], &[bool], &[bool], &[bool]),
+    classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<Frame<R>, String> {
+    let outgoing = needs(func, classify)?;
+    let (present, addressed) = present(func, fused);
+    let sp_near = !live_ops(func).any(|op| matches!(op, Op::TryCall { .. } | Op::FramePointer));
+    let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
+    let (slots, values) = if sp_near {
+        let s = place_slots(func, &addressed, true, &mut cursor);
+        let v = place_values(func, &present, (locations, shared, homed, elided), true, &mut cursor);
+        (s, v)
+    } else {
+        let v = place_values(func, &present, (locations, shared, homed, elided), false, &mut cursor);
+        let s = place_slots(func, &addressed, false, &mut cursor);
+        (s, v)
+    };
     let mut max_saved = 0_usize;
     let mut check_edge = |block: Block, args: &[Value]| {
         for step in edge_steps(func, locations, &values, args, &func.blocks[block.index()].params) {
@@ -349,19 +457,12 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     }
     let wide = func.types.iter().any(|ty| ty.is_wide_vec());
     let scratch = max_saved as u32 * edge_bytes(wide);
-    let mut slots = vec![0; func.slots.len()];
-    let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
-    order.sort_by_key(|&slot| (func.slots[slot].size, slot));
-    for slot in order {
-        let data = &func.slots[slot];
-        let min_align = if data.size >= 8 { 8 } else if data.size >= 4 { 4 } else if data.size >= 2 { 2 } else { 1 };
-        let align = (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align);
-        cursor = round(cursor + data.size, align);
-        slots[slot] = -(cursor as i32);
-    }
     cursor = round(cursor + scratch, 16);
     let scratch = -(cursor as i32);
     let size = round(cursor + outgoing, 16);
+    if crate::trace::enabled() {
+        crate::trace::on_frame(func, (&values, &slots), size);
+    }
     Ok(Frame { values, slots, scratch, size, saves, float_saves, wide })
 }
 
@@ -381,9 +482,8 @@ fn build_frame<R: Copy + PartialEq>(
     abi: &Abi<R>,
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<(Frame<R>, bool), String> {
-    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided), classify)?;
-    let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
-    let framed = framed(func, &frame, stack_params);
+    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided, &plan.fused), classify)?;
+    let framed = framed(func, &frame, stack_params(abi));
     Ok((frame, framed))
 }
 
@@ -401,16 +501,52 @@ pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
     Ok(())
 }
 
+/// Prepares `func`; when a loop reads a value that spilled, splits it at that loop's header, keeps the splits whose parameter then gets a register, and returns the split copy with its preparation when it leaves less weighted spill traffic than the unsplit one.
+pub(crate) fn prepare_split<R: Copy + PartialEq>(
+    func: &Function,
+    regs: &Regs<R>,
+    weighed: bool,
+    classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<(Option<Function>, Prepared<R>), String> {
+    let first = prepare(func, regs, weighed, &classify, &[])?;
+    if !weighed {
+        return Ok((None, first));
+    }
+    let plan = &first.plan;
+    let carried = |made: &[(Value, Value, Block)]| -> Vec<(Value, u64)> { made.iter().map(|&(param, origin, _)| (param, plan.density.get(origin.index()).copied().unwrap_or(0))).collect() };
+    let mut split = func.clone();
+    let made = crate::loopargs::run(&mut split, |_, v| v.index() < plan.locations.len() && matches!(plan.location(v), Location::Slot) && !plan.elided[v.index()] && !plan.fused[v.index()]);
+    if made.is_empty() {
+        return Ok((None, first));
+    }
+    let second = prepare(&split, regs, weighed, &classify, &carried(&made))?;
+    let kept: Vec<(Block, Value)> = made.iter().filter(|&&(param, _, _)| matches!(second.plan.location(param), Location::Reg(_) | Location::Float(_))).map(|&(_, origin, head)| (head, origin)).collect();
+    if crate::trace::enabled() {
+        crate::trace::on_split(&made, &kept);
+    }
+    if kept.len() == made.len() {
+        return Ok(if second.plan.spill_cost < first.plan.spill_cost { (Some(split), second) } else { (None, first) });
+    }
+    if kept.is_empty() {
+        return Ok((None, first));
+    }
+    let mut pruned = func.clone();
+    let made = crate::loopargs::run(&mut pruned, |head, v| kept.contains(&(head, v)));
+    let third = prepare(&pruned, regs, weighed, &classify, &carried(&made))?;
+    Ok(if third.plan.spill_cost < first.plan.spill_cost { (Some(pruned), third) } else { (None, first) })
+}
+
 pub(crate) fn prepare<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
     weighed: bool,
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
+    split: &[(Value, u64)],
 ) -> Result<Prepared<R>, String> {
     let order = crate::live::order(func);
     let copied = crate::live::copied_tests(func, &order);
     let abi = classify(&func.signature)?;
-    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), &abi.params, &classify);
+    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), (&abi.params, split), &classify);
     let saves = saved(func, &plan.used, regs.saved);
     let float_saves = saved(func, &plan.used_floats, regs.saved_float);
     let (frame, framed) = build_frame(func, (saves, float_saves), &plan, &abi, &classify)?;
@@ -539,7 +675,14 @@ pub(crate) trait Emitter<'a>: Sized {
     fn inst(&mut self, inst: Inst) -> Result<(), String>;
     fn trap(&mut self);
     fn pos(&self) -> u32;
-    fn finish(self) -> Result<crate::Code, String>;
+    /// The code offsets where a new source place starts, with that place, in emission order.
+    fn lines(&mut self) -> &mut Vec<(u32, u64)>;
+    /// Finishes the code and moves `starts`, offsets taken while emitting, to where they land in it.
+    fn finish(self, starts: &mut [u32]) -> Result<crate::Code, String>;
+
+    fn bind_entry(&mut self, block: Block) {
+        self.bind_block(block);
+    }
 
     fn deferred_prologue(&self) -> bool {
         false
@@ -562,11 +705,20 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
     emit.clear_flags();
     let func = emit.func();
     let insts = &func.blocks[block.index()].insts;
-    for &inst in insts {
+    let (mut ahead, mut loc) = (0, 0);
+    for (k, &inst) in insts.iter().enumerate() {
         let data = &func.insts[inst.index()];
         if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
             continue;
         }
+        if ahead <= k {
+            ahead = insts[k..].iter().position(|i| func.insts[i.index()].loc != 0).map_or(insts.len(), |at| k + at);
+            loc = insts.get(ahead).map_or(loc, |i| func.insts[i.index()].loc);
+            if loc == 0 {
+                loc = func.home_loc();
+            }
+        }
+        mark_line(emit, loc);
         emit.inst(inst)?;
     }
     if !insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator()) {
@@ -575,25 +727,51 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
     Ok(())
 }
 
+/// Starts a line-table row for `loc` at the current offset unless the open row already has it; 0 marks code with no source.
+fn mark_line<'a, E: Emitter<'a>>(emit: &mut E, loc: u64) {
+    let at = emit.pos();
+    let lines = emit.lines();
+    match lines.last_mut() {
+        Some(last) if last.1 == loc => {}
+        Some(last) if last.0 == at => last.1 = loc,
+        _ => lines.push((at, loc)),
+    }
+}
+
+fn entry_has_preds(func: &Function, order: &[Block], entry: Block) -> bool {
+    order.iter().any(|&b| func.successors(b).any(|s| func.jump_target(s) == entry))
+}
+
 pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<crate::Code, String> {
     let func = emit.func();
     let entry = func.entry.ok_or("the function has no entry block")?;
     let mut starts = Vec::with_capacity(order.len() + 1);
+    mark_line(&mut emit, func.home_loc());
     if !emit.deferred_prologue() {
         emit.prologue();
     }
     emit.intake(entry)?;
+    let fallthrough_entry = !entry_has_preds(func, order, entry);
     for (index, &block) in order.iter().enumerate() {
         let next_blk = order.get(index + 1).copied().filter(|&nb| !emit.blocks_fallthrough_to(nb));
         emit.set_next(next_blk);
         emit.before_block_bind(block)?;
         starts.push(emit.pos());
-        emit.bind_block(block);
+        if index == 0 && block == entry && fallthrough_entry {
+            emit.bind_entry(block);
+        } else {
+            emit.bind_block(block);
+        }
         emit.on_block_bound(block)?;
         emit_body(&mut emit, block)?;
     }
     starts.push(emit.pos());
-    let mut code = emit.finish()?;
+    let blocks = starts.len();
+    let lines = std::mem::take(emit.lines());
+    starts.extend(lines.iter().map(|&(at, _)| at));
+    let mut code = emit.finish(&mut starts)?;
+    code.lines = lines.iter().zip(&starts[blocks..]).map(|(&(_, loc), &at)| (at, loc)).collect();
+    starts.truncate(blocks);
     code.loops = crate::emit::loop_spans(func, order, &starts);
     Ok(code)
 }

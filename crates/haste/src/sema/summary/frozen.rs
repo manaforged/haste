@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
@@ -6,28 +7,62 @@ use crate::names::ItemRef;
 use crate::outline::Outline;
 
 use super::super::Context;
-use super::super::infer::{LazyTables, Local, Res, Typed};
+use super::super::infer::{BodyTables, LazyTables, Local, Res, Typed};
 use super::super::reach::Instance;
 use super::super::substs::{ProjId, Substs};
-use super::super::table::Table;
+use super::super::table::{Flight, Table};
 use super::super::ty::{Kind, Ty, Types};
 use super::inst::{TyFolder, fold_substs, fold_ty};
-use super::{InstOutcome, PolyInst, PolyObligation, PolySummary, codec};
+use super::{InstOutcome, PolyInst, PolyObligation, PolySummary, SummaryKind, codec};
+
+type KeyFn = fn(&Outline, ItemRef) -> Option<u64>;
 
 pub(in crate::sema) fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
-    let tree = cx.outline.crates.get(item.krate as usize)?;
-    if !tree.env.fixed {
+    thaw_summary(cx, item, codec::decode_summary).map(Arc::new)
+}
+
+pub(super) fn thaw_summary<T>(cx: &Context<'_>, item: ItemRef, decode: fn(&Outline, &codec::FileIndex, &Types, &[u8]) -> Result<Option<T>>) -> Option<T> {
+    if !cx.outline.is_fixed(item.krate) {
         return None;
     }
     let substrate = cx.store.lookups.substrate.clone()?;
     let key = crate::substrate::sysroot_item_key(cx.outline, item)?;
     let bytes = substrate.summary(key)?;
-    let index = file_index(cx);
-    codec::decode_summary(cx.outline, index, &cx.types, bytes).ok().flatten().map(Arc::new)
+    decode(cx.outline, file_index(cx), &cx.types, bytes).ok().flatten()
 }
 
-fn file_index<'a>(cx: &'a Context<'_>) -> &'a codec::FileIndex {
+pub(super) fn file_index<'a>(cx: &'a Context<'_>) -> &'a codec::FileIndex {
     cx.store.lookups.file_index.get_or_init(|| Arc::new(codec::FileIndex::build(cx.outline)))
+}
+
+pub(super) fn closure_free(summary: &PolySummary) -> bool {
+    summary.template.closures.is_empty()
+}
+
+pub(super) fn instance_keys(outline: &Outline, types: &Types, (item, substs): Instance) -> Option<(u64, u64)> {
+    if !outline.is_fixed(item.krate) {
+        return None;
+    }
+    let item_key = crate::substrate::sysroot_item_key(outline, item)?;
+    Some((item_key, codec::substs_key(outline, types, substs, crate::substrate::sysroot_item_key)?))
+}
+
+pub(super) fn instance_bytes<T>(cx: &Context<'_>, instance: Instance, mut decode: impl FnMut(&codec::FileIndex, &[u8]) -> Option<T>) -> Option<T> {
+    let (item_key, substs_key) = instance_keys(cx.outline, &cx.types, instance)?;
+    let substrate = cx.store.lookups.substrate.clone()?;
+    let index = file_index(cx);
+    substrate.instance_candidates(item_key, substs_key).find_map(|bytes| decode(index, bytes))
+}
+
+pub(super) fn layer_key_fn(outline: &Outline, types: &Types, (item, substs): Instance) -> (bool, KeyFn) {
+    let pure_sysroot = outline.is_sysroot(item.krate)
+        && crate::substrate::sysroot_only_item_key(outline, item).is_some()
+        && codec::substs_key(outline, types, substs, crate::substrate::sysroot_only_item_key).is_some();
+    if pure_sysroot { (true, crate::substrate::sysroot_only_item_key) } else { (false, crate::substrate::sysroot_item_key) }
+}
+
+pub(super) fn is_template(summaries: &Flight<ItemRef, SummaryKind>, item: ItemRef, tables: &Arc<BodyTables>) -> bool {
+    matches!(summaries.get_ready(&item), Some(SummaryKind::Poly(summary)) if Arc::ptr_eq(&summary.template, tables))
 }
 
 pub(super) fn frozen_instance(
@@ -35,90 +70,75 @@ pub(super) fn frozen_instance(
     instance: Instance,
     summary: &Arc<PolySummary>,
 ) -> Option<(PolyInst, Vec<Local>, Option<Ty>, Vec<Ty>, Vec<Res>)> {
-    if !summary.template.closures.is_empty() {
+    if !closure_free(summary) {
         return None;
     }
-    let tree = cx.outline.crates.get(instance.0.krate as usize)?;
-    if !tree.env.fixed {
-        return None;
-    }
-    let substrate = cx.store.lookups.substrate.clone()?;
-    let item_key = crate::substrate::sysroot_item_key(cx.outline, instance.0)?;
-    let substs_key = codec::substs_key(cx.outline, &cx.types, instance.1, crate::substrate::sysroot_item_key)?;
-    let index = file_index(cx);
-    for bytes in substrate.instance_candidates(item_key, substs_key) {
-        if let Ok(Some(decoded)) = codec::decode_instance(cx.outline, index, &cx.types, instance.1, bytes) {
-            let inst = PolyInst {
-                args: instance.1,
-                summary: Arc::clone(summary),
-                projs: decoded.projs,
-                resolved_calls: decoded.resolved_calls,
-                builtin_ops: decoded.builtin_ops,
-                call_overrides: decoded.call_overrides,
-                offset_overrides: decoded.offset_overrides,
-                materialized: OnceLock::new(),
-            };
-            let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
-            let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
-            let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
-            return Some((inst, locals, ret, layouts, decoded.drops));
-        }
-    }
-    None
+    let decoded = instance_bytes(cx, instance, |index, bytes| codec::decode_instance(cx.outline, index, &cx.types, instance.1, bytes).ok().flatten())?;
+    let inst = PolyInst {
+        args: instance.1,
+        summary: Arc::clone(summary),
+        projs: decoded.projs,
+        resolved_calls: decoded.resolved_calls,
+        builtin_ops: decoded.builtin_ops,
+        call_overrides: decoded.call_overrides,
+        offset_overrides: decoded.offset_overrides,
+        materialized: OnceLock::new(),
+    };
+    let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
+    let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
+    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
+    Some((inst, locals, ret, layouts, decoded.drops))
 }
 
-fn try_add_instance(
-    outline: &Outline,
-    types: &Types,
+pub(super) fn encode_fresh_instance(
+    (outline, types): (&Outline, &Types),
+    summaries: &Flight<ItemRef, SummaryKind>,
     (item, substs): Instance,
-    inst: &PolyInst,
-    drops: &[Res],
-    key_fn: fn(&Outline, ItemRef) -> Option<u64>,
-    builder: &mut crate::substrate::SubstrateBuilder,
-) -> Result<()> {
-    if let Some(item_key) = key_fn(outline, item)
-        && let Some(substs_key) = codec::substs_key(outline, types, substs, key_fn)
-        && let Ok(Some(bytes)) = codec::encode_instance(outline, types, substs, inst, drops, key_fn)
-    {
-        builder.add_instance(item_key, substs_key, &bytes)?;
+    typed: &Typed,
+) -> Option<(bool, u64, u64, Box<[u8]>)> {
+    if !outline.is_fixed(item.krate) {
+        return None;
     }
-    Ok(())
+    let (pure_sysroot, key_fn) = layer_key_fn(outline, types, (item, substs));
+    let item_key = key_fn(outline, item)?;
+    let substs_key = codec::substs_key(outline, types, substs, key_fn)?;
+    let bytes = match &typed.tables {
+        LazyTables::Poly(inst) if !substs.is_empty() && closure_free(&inst.summary) => {
+            codec::encode_instance(outline, types, substs, inst, &typed.drops, key_fn).ok().flatten()?
+        }
+        LazyTables::Eager(tables) if !is_template(summaries, item, tables) => {
+            codec::encode_typed(outline, types, substs, typed, key_fn).ok().flatten()?
+        }
+        _ => return None,
+    };
+    Some((pure_sysroot, item_key, substs_key, bytes.into_boxed_slice()))
 }
 
 pub(in crate::sema) fn export_sysroot_instances(
-    outline: &Outline,
-    types: &Types,
-    finals: &Table<Instance, Arc<Typed>>,
+    fresh: &Table<Instance, (bool, u64, u64, Box<[u8]>)>,
+    flag: &AtomicBool,
     mut toolchain: Option<&mut crate::substrate::SubstrateBuilder>,
     mut deps: Option<&mut crate::substrate::SubstrateBuilder>,
 ) -> Result<()> {
     let mut err = None;
-    finals.retain(|&(item, substs), typed| {
+    fresh.retain(|_, (pure_sysroot, item_key, substs_key, bytes)| {
         if err.is_some() {
             return true;
         }
-        let tree = &outline.crates[item.krate as usize];
-        if !tree.env.fixed || substs.is_empty() {
+        let target = if *pure_sysroot { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
+        if let Some(builder) = target
+            && let Err(e) = builder.add_instance(*item_key, *substs_key, bytes)
+        {
+            err = Some(e);
             return true;
         }
-        if let LazyTables::Poly(inst) = &typed.tables && inst.summary.template.closures.is_empty() {
-            let pure_sysroot = tree.env.release
-                && crate::substrate::sysroot_only_item_key(outline, item).is_some()
-                && codec::substs_key(outline, types, substs, crate::substrate::sysroot_only_item_key).is_some();
-            let (target_builder, key_fn): (Option<&mut crate::substrate::SubstrateBuilder>, fn(&Outline, ItemRef) -> Option<u64>) =
-                if pure_sysroot { (toolchain.as_deref_mut(), crate::substrate::sysroot_only_item_key) } else { (deps.as_deref_mut(), crate::substrate::sysroot_item_key) };
-            if let Some(builder) = target_builder
-                && let Err(e) = try_add_instance(outline, types, (item, substs), inst, &typed.drops, key_fn, builder)
-            {
-                err = Some(e);
-            }
-        }
-        true
+        false
     });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(()),
+    if let Some(e) = err {
+        return Err(e);
     }
+    flag.store(false, Ordering::Relaxed);
+    Ok(())
 }
 
 struct FrozenFolder<'a, 'c> {
@@ -175,7 +195,7 @@ pub(super) fn try_cached_instantiate(
 ) -> Option<InstOutcome> {
     if !summary.op_holes.is_empty()
         || !summary.const_holes.is_empty()
-        || !summary.template.closures.is_empty()
+        || !closure_free(summary)
         || summary.obligations.iter().any(|ob| matches!(ob, PolyObligation::Call { .. }))
     {
         return None;
@@ -192,7 +212,7 @@ pub(super) fn try_cached_instantiate(
                 resolve_proj_substs(cx, &args, &mut projs, ob_args, 0)?;
             }
         }
-        for &ty in summary.layout_tys.iter().chain(&summary.drop_tys).chain(summary.ret.as_slice()) {
+        for &ty in summary.layout_tys.iter().chain(&summary.drop_tys).chain(summary.ret.iter()) {
             resolve_proj_ty(cx, &args, &mut projs, ty, 0)?;
         }
     } else {

@@ -5,10 +5,15 @@ use crate::fold::{defs, evaluate_wrapped};
 use crate::ir::{Binary, Block, Domain, Function, Inst, IntCC, Op, Type, Value};
 use crate::merge::{find, identity, rename};
 
+mod lftr;
+
+use lftr::{LftrMatch, collect_lftr_matches, dead_iv_chain, retire_counter};
+
 const MAX_PHIS_PER_LOOP: usize = 4;
 
+/// Outgoing control-flow arm on a predecessor edge.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EdgeArm {
+pub(crate) enum EdgeArm {
     Jump,
     Then,
     Else,
@@ -19,14 +24,6 @@ struct IvInfo {
     iv_idx: usize,
     init_edges: Vec<(Block, EdgeArm, Value)>,
     back_steps: Vec<(Block, EdgeArm, i64)>,
-}
-
-struct LftrMatch {
-    blk: Block,
-    inst: Inst,
-    new_cc: IntCC,
-    use_next: bool,
-    len: Value,
 }
 
 struct Occ {
@@ -99,8 +96,7 @@ impl<'a> State<'a> {
     }
 
     fn norm_cmp(&self, cc: IntCC, a: Value, b: Value, lhs: Value) -> Option<(IntCC, Value)> {
-        let (va, vb) = (self.value_of(a), self.value_of(b));
-        if va == lhs { Some((cc, vb)) } else if vb == lhs { Some((crate::cse::flip_int_cc(cc), va)) } else { None }
+        norm_cmp(cc, self.value_of(a), self.value_of(b), lhs)
     }
 
     fn grow_tables(&mut self, v: Value, inst: Option<Inst>, block: Option<Block>, imm: Option<i64>) {
@@ -148,7 +144,13 @@ impl<'a> State<'a> {
     }
 }
 
-fn edge_arg(func: &Function, pred: Block, arm: EdgeArm, idx: usize) -> Option<Value> {
+/// Reorients an integer comparison so `lhs` appears on the left-hand side when present.
+pub(crate) fn norm_cmp(cc: IntCC, a: Value, b: Value, lhs: Value) -> Option<(IntCC, Value)> {
+    if a == lhs { Some((cc, b)) } else if b == lhs { Some((crate::cse::flip_int_cc(cc), a)) } else { None }
+}
+
+/// Returns the `idx`-th edge argument passed along `arm` of `pred`'s terminator.
+pub(crate) fn edge_arg(func: &Function, pred: Block, arm: EdgeArm, idx: usize) -> Option<Value> {
     let last = *func.blocks[pred.index()].insts.last()?;
     let args = match (&func.insts[last.index()].op, arm) {
         (Op::Jump(_, args), EdgeArm::Jump) => args,
@@ -159,13 +161,19 @@ fn edge_arg(func: &Function, pred: Block, arm: EdgeArm, idx: usize) -> Option<Va
     args.get(idx).copied()
 }
 
-fn push_edge_arg(func: &mut Function, pred: Block, arm: EdgeArm, val: Value) {
-    let Some(&last) = func.blocks[pred.index()].insts.last() else { return };
+fn edge_args_mut(func: &mut Function, pred: Block, arm: EdgeArm) -> Option<&mut Vec<Value>> {
+    let &last = func.blocks[pred.index()].insts.last()?;
     match (&mut func.insts[last.index()].op, arm) {
-        (Op::Jump(_, args), EdgeArm::Jump) => args.push(val),
-        (Op::Brif(_, _, t_args, _, _), EdgeArm::Then) => t_args.push(val),
-        (Op::Brif(_, _, _, _, e_args), EdgeArm::Else) => e_args.push(val),
-        _ => {}
+        (Op::Jump(_, args), EdgeArm::Jump) => Some(args),
+        (Op::Brif(_, _, t_args, _, _), EdgeArm::Then) => Some(t_args),
+        (Op::Brif(_, _, _, _, e_args), EdgeArm::Else) => Some(e_args),
+        _ => None,
+    }
+}
+
+fn push_edge_arg(func: &mut Function, pred: Block, arm: EdgeArm, val: Value) {
+    if let Some(args) = edge_args_mut(func, pred, arm) {
+        args.push(val);
     }
 }
 
@@ -193,7 +201,7 @@ fn collect_head_edges(state: &State<'_>, each: &Loop) -> Option<Vec<(Block, Edge
         if !state.cfg.reachable.get(pred.index()).copied().unwrap_or(false) {
             return None;
         }
-        let inside = each.body.get(pred.index()).copied().unwrap_or(false);
+        let inside = is_in_loop(each, pred);
         match state.func.last(pred) {
             Some(Op::Jump(target, args)) if *target == each.head => {
                 if args.len() != param_len {
@@ -223,7 +231,8 @@ fn collect_head_edges(state: &State<'_>, each: &Loop) -> Option<Vec<(Block, Edge
     (has_outside && has_inside).then_some(edges)
 }
 
-fn is_in_loop(each: &Loop, blk: Block) -> bool {
+/// Whether block `blk` belongs to `each`'s loop body.
+pub(crate) fn is_in_loop(each: &Loop, blk: Block) -> bool {
     each.body.get(blk.index()).copied().unwrap_or(false)
 }
 
@@ -294,7 +303,7 @@ fn loop_addr_uses(state: &State<'_>, each: &Loop) -> Vec<u32> {
         }
     };
     for b in 0..state.func.blocks.len() {
-        if !each.body.get(b).copied().unwrap_or(false) {
+        if !is_in_loop(each, Block(b as u32)) {
             continue;
         }
         for &inst in &state.func.blocks[b].insts {
@@ -372,7 +381,7 @@ fn match_affine(state: &State<'_>, each: &Loop, ivs: &[IvInfo], raw: Value, dept
 
 fn is_outside_dom(state: &State<'_>, each: &Loop, val: Value) -> bool {
     let Some(def_blk) = state.def_blocks.get(val.index()).copied().flatten() else { return false };
-    !each.body.get(def_blk.index()).copied().unwrap_or(false) && state.cfg.dominates(def_blk, each.head)
+    !is_in_loop(each, def_blk) && state.cfg.dominates(def_blk, each.head)
 }
 
 fn is_invariant_base(state: &State<'_>, each: &Loop, base: Value) -> bool {
@@ -402,164 +411,6 @@ fn unwrap_base(state: &State<'_>, each: &Loop, raw: Value) -> Option<(Value, i64
     is_invariant_base(state, each, cur).then_some((cur, extra))
 }
 
-fn prove_len_bound(state: &State<'_>, init_pred: Block, init_arm: EdgeArm, len: Value) -> (bool, bool) {
-    if let Some(c) = state.const_i64(len) {
-        return (c != 0, c >= 0);
-    }
-    let target_len = state.value_of(len);
-    let check_brif = |blk: Block, taken_then: bool| -> Option<(bool, bool)> {
-        let &term = state.func.blocks[blk.index()].insts.last()?;
-        let Op::Brif(cond, t_blk, _, e_blk, _) = state.func.insts[term.index()].op else { return None };
-        let c_inst = (t_blk != e_blk).then(|| state.defs.get(state.value_of(cond).index()).copied().flatten()).flatten()?;
-        let Op::Icmp(cc, a, b) = state.func.insts[c_inst.index()].op else { return None };
-        let (cc, other) = state.norm_cmp(cc, a, b, target_len)?;
-        let eff_cc = if taken_then { cc } else { cc.inverse() };
-        let c = state.const_i64(other)?;
-        match eff_cc {
-            IntCC::NotEqual if c == 0 => Some((true, false)),
-            IntCC::UnsignedGreaterThan => Some((true, false)),
-            IntCC::UnsignedGreaterThanOrEqual if c as u64 >= 1 => Some((true, false)),
-            IntCC::SignedGreaterThan if c >= 0 => Some((true, true)),
-            IntCC::SignedGreaterThanOrEqual if c >= 1 => Some((true, true)),
-            _ => None,
-        }
-    };
-    if !matches!(init_arm, EdgeArm::Jump)
-        && let Some(b) = check_brif(init_pred, matches!(init_arm, EdgeArm::Then))
-    {
-        return b;
-    }
-    let mut cur = init_pred;
-    for _ in 0..3 {
-        let preds = state.cfg.preds_of(cur);
-        if preds.len() != 1 {
-            break;
-        }
-        let parent = preds[0];
-        match state.func.last(parent) {
-            Some(Op::Brif(_, t_blk, _, e_blk, _)) if *t_blk != *e_blk && (*t_blk == cur || *e_blk == cur) => {
-                return check_brif(parent, *t_blk == cur).unwrap_or((false, false));
-            }
-            Some(Op::Jump(target, _)) if *target == cur => cur = parent,
-            _ => break,
-        }
-    }
-    (false, false)
-}
-
-fn collect_lftr_matches(state: &State<'_>, each: &Loop, iv_info: &IvInfo, stride: i64) -> Vec<LftrMatch> {
-    if iv_info.init_edges.len() != 1 || iv_info.back_steps.is_empty() {
-        return Vec::new();
-    }
-    let (pre, pre_arm, init_val) = iv_info.init_edges[0];
-    let step = iv_info.back_steps[0].2;
-    if step == 0 || !iv_info.back_steps.iter().all(|&(_, _, s)| s == step) {
-        return Vec::new();
-    }
-    let init_const = state.const_i64(init_val);
-    let single_latch = (iv_info.back_steps.len() == 1 && step == 1).then_some(iv_info.back_steps[0]);
-    let iv_next = single_latch.and_then(|(pred, arm, _)| edge_arg(state.func, pred, arm, iv_info.iv_idx)).map(|v| state.value_of(v));
-    let mut matches = Vec::new();
-    for &blk in state.cfg.rpo.iter().filter(|&&b| is_in_loop(each, b)) {
-        for &inst in &state.func.blocks[blk.index()].insts {
-            let data = &state.func.insts[inst.index()];
-            let Some(cmp_res) = data.result.filter(|&r| state.value_of(r) == r) else { continue };
-            let Op::Icmp(cc, a, b) = data.op else { continue };
-            let Some((use_next, cc_norm, len)) = state
-                .norm_cmp(cc, a, b, iv_info.iv)
-                .map(|(c, o)| (false, c, o))
-                .or_else(|| iv_next.and_then(|n| state.norm_cmp(cc, a, b, n).map(|(c, o)| (true, c, o))))
-            else {
-                continue;
-            };
-            let len_dom = state.const_i64(len).is_some()
-                || state.def_blocks.get(len.index()).copied().flatten().is_some_and(|d| state.cfg.dominates(d, pre));
-            let stride_ok = (stride & 1) != 0
-                || (init_const == Some(0)
-                    && step == 1
-                    && state.const_i64(len).is_some_and(|c| c >= 0 && (c as u64).checked_mul(stride.unsigned_abs()).is_some()));
-            if len == iv_info.iv || Some(len) == iv_next || state.func.ty(len) != Type::I64 || !len_dom || !stride_ok {
-                continue;
-            }
-            let new_cc = match cc_norm {
-                IntCC::Equal | IntCC::NotEqual if !use_next || single_latch.is_some_and(|(lb, _, _)| lb == blk) => cc_norm,
-                IntCC::UnsignedLessThan | IntCC::UnsignedGreaterThanOrEqual | IntCC::SignedLessThan | IntCC::SignedGreaterThanOrEqual => {
-                    if init_const != Some(0) || step != 1 {
-                        continue;
-                    }
-                    let (nonzero, nonneg) = prove_len_bound(state, pre, pre_arm, len);
-                    if matches!(cc_norm, IntCC::SignedLessThan | IntCC::SignedGreaterThanOrEqual) && !nonneg {
-                        continue;
-                    }
-                    let Some(Op::Brif(cond, t_blk, _, e_blk, _)) = state.func.last(blk) else { continue };
-                    if state.value_of(*cond) != cmp_res {
-                        continue;
-                    }
-                    let exit_on_false = matches!(cc_norm, IntCC::UnsignedLessThan | IntCC::SignedLessThan);
-                    let exit_blk = if exit_on_false { *e_blk } else { *t_blk };
-                    let want_arm = if exit_on_false { EdgeArm::Then } else { EdgeArm::Else };
-                    let arm_ok = if use_next {
-                        single_latch.is_some_and(|(lb, la, _)| nonzero && blk == lb && la == want_arm)
-                    } else {
-                        blk == each.head
-                    };
-                    if !arm_ok || is_in_loop(each, exit_blk) {
-                        continue;
-                    }
-                    if exit_on_false { IntCC::NotEqual } else { IntCC::Equal }
-                }
-                _ => continue,
-            };
-            matches.push(LftrMatch { blk, inst, new_cc, use_next, len });
-        }
-    }
-    matches
-}
-
-fn would_iv_die(state: &State<'_>, each: &Loop, iv_info: &IvInfo, groups: &[&Group], lftr: &[LftrMatch]) -> bool {
-    let mut rem_uses = vec![0_u32; state.func.types.len()];
-    let mut retired = vec![false; state.func.insts.len()];
-    for &inst in state.func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &state.func.insts[inst.index()];
-        if data.result.is_some_and(|r| state.value_of(r) != r) {
-            retired[inst.index()] = true;
-        } else {
-            data.op.for_operands(|v| rem_uses[state.value_of(v).index()] += 1);
-        }
-    }
-    let dec = |rem: &mut [u32], v: Value| {
-        let i = state.value_of(v).index();
-        rem[i] = rem[i].saturating_sub(1);
-    };
-    for &(pred, arm, _) in &iv_info.back_steps {
-        if let Some(arg) = edge_arg(state.func, pred, arm, iv_info.iv_idx) {
-            dec(&mut rem_uses, arg);
-        }
-    }
-    for inst in groups.iter().flat_map(|g| g.occs.iter().map(|o| o.inst)).chain(lftr.iter().map(|m| m.inst)) {
-        if !std::mem::replace(&mut retired[inst.index()], true) {
-            state.func.insts[inst.index()].op.for_operands(|v| dec(&mut rem_uses, v));
-        }
-    }
-    loop {
-        let mut progressed = false;
-        for &blk in state.cfg.rpo.iter().rev().filter(|&&b| is_in_loop(each, b)) {
-            for &inst in state.func.blocks[blk.index()].insts.iter().rev() {
-                let data = &state.func.insts[inst.index()];
-                if !retired[inst.index()] && data.op.is_speculable() && data.result.is_some_and(|r| rem_uses[r.index()] == 0) {
-                    retired[inst.index()] = true;
-                    progressed = true;
-                    data.op.for_operands(|v| dec(&mut rem_uses, v));
-                }
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    rem_uses[iv_info.iv.index()] == 0
-}
-
 fn standard_group_ok(state: &State<'_>, each: &Loop, g: &Group) -> bool {
     let off_or_nondom = g.occs.iter().any(|o| o.byte_offset != 0) || !is_outside_dom(state, each, g.key.base);
     g.occs.len() >= 2 || off_or_nondom || (g.key.stride != 1 && (g.has_mul || g.key.stride <= 0 || g.key.stride > 8 || g.total_uses >= 2))
@@ -571,7 +422,7 @@ fn plan_lftr_for_iv(state: &State<'_>, each: &Loop, iv_info: &IvInfo, iv_groups:
         (g.key.stride != 1, (g.key.stride & 1) == 0, std::cmp::Reverse(g.total_uses), i)
     })?;
     let lftr = collect_lftr_matches(state, each, iv_info, iv_groups[local_idx].key.stride);
-    (!lftr.is_empty() && would_iv_die(state, each, iv_info, iv_groups, &lftr)).then_some((local_idx, lftr))
+    (!lftr.is_empty() && dead_iv_chain(state, each, iv_info, iv_groups, &lftr).is_some()).then_some((local_idx, lftr))
 }
 
 fn collect_groups(state: &State<'_>, each: &Loop, ivs: &[IvInfo]) -> Vec<Group> {
@@ -667,6 +518,15 @@ fn emit_init_ptr(state: &mut State<'_>, pred: Block, base: Value, init_val: Valu
     }
 }
 
+fn cached_end(state: &mut State<'_>, ends: &mut Vec<(Value, Value)>, len: Value, make: impl FnOnce(&mut State<'_>) -> Value) -> Value {
+    if let Some(&(_, end)) = ends.iter().find(|&&(k, _)| k == len) {
+        return end;
+    }
+    let end = make(state);
+    ends.push((len, end));
+    end
+}
+
 fn emit_step_ptr(state: &mut State<'_>, pred: Block, before: Option<Inst>, ptr_phi: Value, step: i64, stride: i64) -> Value {
     let delta = step.wrapping_mul(stride);
     if delta == 0 {
@@ -682,13 +542,17 @@ fn emit_step_ptr(state: &mut State<'_>, pred: Block, before: Option<Inst>, ptr_p
 
 fn rewrite_loop(state: &mut State<'_>, each: &Loop) -> bool {
     let Some(edges) = collect_head_edges(state, each) else { return false };
-    let ivs = collect_ivs(state, each, &edges);
+    let mut ivs = collect_ivs(state, each, &edges);
+    let retired = retire_counter(state, each, &edges, &ivs);
+    if retired {
+        ivs = collect_ivs(state, each, &edges);
+    }
     if ivs.is_empty() {
-        return false;
+        return retired;
     }
     let groups = collect_groups(state, each, &ivs);
     if groups.is_empty() {
-        return false;
+        return retired;
     }
     let driver_for_iv: Vec<_> = ivs
         .iter()
@@ -742,13 +606,7 @@ fn rewrite_loop(state: &mut State<'_>, each: &Loop) -> bool {
             let mut end_ptrs: Vec<(Value, Value)> = Vec::new();
             for m in matches {
                 let len = state.value_of(m.len);
-                let end_ptr = if let Some(&(_, cached)) = end_ptrs.iter().find(|&&(k, _)| k == len) {
-                    cached
-                } else {
-                    let p = emit_init_ptr(state, pre, group.key.base, len, group.key.stride, anchor);
-                    end_ptrs.push((len, p));
-                    p
-                };
+                let end_ptr = cached_end(state, &mut end_ptrs, len, |s| emit_init_ptr(s, pre, group.key.base, len, group.key.stride, anchor));
                 let Some(lhs) = (if m.use_next { latch_next_ptr } else { Some(ptr_phi) }) else { continue };
                 state.func.insts[m.inst.index()].op = Op::Icmp(m.new_cc, lhs, end_ptr);
             }

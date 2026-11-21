@@ -1,6 +1,6 @@
-use crate::alloc::{Location, Plan};
+use crate::alloc::{Location, Plan, Regs};
 use crate::frame::{Abi, Emitter, Frame, Loc, ShrinkWrap};
-use crate::ir::{Block, Function, Op, SigRef, Value};
+use crate::ir::{Binary, Block, Function, Inst, Op, SigRef, Value};
 use crate::park::ParkReg;
 use crate::Site;
 use std::ops::Range;
@@ -161,6 +161,11 @@ fn falls<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &E, block
     emit.next_block().is_some_and(|next| next == block || next == emit.func().jump_target(block))
 }
 
+/// Whether `block` closes a loop by branching back to its header.
+fn is_latch(func: &Function, block: Block) -> bool {
+    func.cfg().loops().list.iter().any(|each| each.latches.contains(&block))
+}
+
 fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
@@ -201,6 +206,44 @@ pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>
     Ok(())
 }
 
+/// Runs the moves of a back edge to loop head `moved` whose other edge leaves that loop ahead of the branch, when each copies a register or stack home into a register that neither `plain` nor the condition reads, so the branch reaches `moved` without a jump of its own.
+fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    (moved, to_then): ((Block, &'a [Value]), bool),
+    plain: Block,
+) -> Result<bool, String> {
+    if emit.in_shrink_entry() || falls(emit, moved.0) {
+        return Ok(false);
+    }
+    let closes = emit.func().cfg().loops().list.iter().any(|each| each.head == moved.0 && !each.body.get(plain.index()).copied().unwrap_or(true));
+    if !closes {
+        return Ok(false);
+    }
+    let (func, plan, frame) = (emit.func(), emit.plan(), emit.frame());
+    let flag = |list: &[bool], v: Value| list.get(v.index()).copied().unwrap_or(true);
+    let simple = |v: Value| {
+        !flag(&plan.elided, v) && !flag(&plan.deferred, v) && !flag(&plan.fused, v) && plan.pairs.get(v.index()).is_some_and(Option::is_none) && (func.ty(v).is_small_int() || func.ty(v).is_float())
+    };
+    let params = &func.blocks[moved.0.index()].params;
+    let hoistable = moved.1.iter().zip(params).all(|(&arg, &param)| {
+        plan.same_home(frame, arg, param)
+            || (simple(arg)
+                && simple(param)
+                && matches!(plan.locations[arg.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
+                && matches!(plan.locations[param.index()], Location::Reg(_) | Location::Float(_))
+                && plan.hoist.free(plan.locations[param.index()], plain, condition))
+    });
+    if !hoistable {
+        return Ok(false);
+    }
+    emit.edge(moved.0, moved.1)?;
+    let target = target_label(emit, moved.0);
+    emit.branch_cond(condition, !to_then, target);
+    goto_branch(emit, plain, true);
+    Ok(true)
+}
+
 pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
@@ -217,6 +260,20 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     let then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
     let else_moves = emit.plan().moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
     if set_aside(emit, condition, (then, then_moves), (otherwise, else_moves))? {
+        return Ok(());
+    }
+    if then_moves && !else_moves && !emit.in_shrink_entry() && falls(emit, otherwise.0) && is_latch(emit.func(), otherwise.0) {
+        let label = emit.new_label();
+        emit.branch_cond(condition, false, label);
+        emit.tails().stubs.push(Stub { label, block: then.0, args: then.1 });
+        emit.edge(otherwise.0, otherwise.1)?;
+        goto_branch(emit, otherwise.0, true);
+        return Ok(());
+    }
+    if then_moves && !else_moves && hoist_moves(emit, condition, (then, true), otherwise.0)? {
+        return Ok(());
+    }
+    if else_moves && !then_moves && hoist_moves(emit, condition, (otherwise, false), then.0)? {
         return Ok(());
     }
     if !else_moves && (then_moves || falls(emit, then.0)) {
@@ -250,7 +307,7 @@ pub(crate) fn emit_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     args: &[Value],
     results: &[Value],
 ) -> Result<(), String> {
-    let parked = emit.plan().parked_at(inst).to_vec();
+    let parked: Vec<_> = emit.plan().parked_at(inst).iter().filter(|(value, _, _)| !emit.plan().elided[value.index()]).copied().collect();
     for &(value, reg, _) in &parked {
         emit.park_spill(value, reg);
         emit.plan_mut().locations[value.index()] = Location::Slot;
@@ -289,4 +346,66 @@ pub(crate) fn emit_try_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, 
     let frame_offset = emit.frame().size;
     emit.push_site(Site { ret, handler: pad, frame_offset });
     Ok(())
+}
+
+/// Whether `val` keeps its register or shared slot across instructions `start + 1..end` of block `b_idx` that `skip` does not pass over, so a fused use at `end` can still read it; false when the span exceeds `max_span`.
+pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, regs): (&Plan<R>, &Regs<R>), (b_idx, start, end, max_span): (usize, usize, usize, usize), skip: impl Fn(usize) -> bool, val: Value) -> bool {
+    if plan.elided[val.index()] {
+        return false;
+    }
+    if start + 1 >= end || plan.location(val).is_static() {
+        return true;
+    }
+    if end - start > max_span {
+        return false;
+    }
+    let (reg, slot_id) = match plan.location(val) {
+        Location::Reg(reg) => (Some(reg), None),
+        Location::Slot => {
+            let Some(id) = plan.shared.get(val.index()).copied().flatten() else { return true };
+            (None, Some(id))
+        }
+        _ => return false,
+    };
+    let clobbers = |r: Value| {
+        reg.is_some_and(|reg| plan.reg_of(r) == Some(reg))
+            || slot_id.is_some_and(|id| matches!(plan.location(r), Location::Slot) && plan.shared.get(r.index()).copied().flatten() == Some(id))
+    };
+    for pos in (start + 1..end).filter(|&pos| !skip(pos)) {
+        let data = &func.insts[func.blocks[b_idx].insts[pos].index()];
+        if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
+            continue;
+        }
+        if (reg.is_some() && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
+            || reg.is_some_and(|reg| regs.scratches(func, data, reg))
+            || data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(clobbers)
+            || crate::live::results(data).any(clobbers)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Finds a single-use, non-elided `Band(x, y)` in block `b_idx` compared against zero via `is_zero`.
+pub(crate) fn zero_cmp_band<R>(
+    func: &Function,
+    plan: &Plan<R>,
+    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    b_idx: usize,
+    (lhs, rhs): (Value, Value),
+    is_zero: impl Fn(Value) -> bool,
+) -> Option<(Value, usize, Value, Value)> {
+    let masked = is_zero(rhs).then_some(lhs).or_else(|| is_zero(lhs).then_some(rhs))?;
+    if uses[masked.index()] != 1 || plan.elided[masked.index()] {
+        return None;
+    }
+    let (mb, mpos, minst) = pos_of.get(masked.index()).copied().flatten()?;
+    if mb != b_idx {
+        return None;
+    }
+    let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op else {
+        return None;
+    };
+    Some((masked, mpos, x, y))
 }

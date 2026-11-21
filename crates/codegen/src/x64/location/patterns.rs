@@ -4,7 +4,7 @@ use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 use crate::live::{Sib, SibBase};
 
-pub(super) const FOLD_LIMIT: i64 = 1 << 24;
+pub(super) use crate::tailrec::FOLD_LIMIT;
 
 pub(super) struct SibMatch {
     pub(super) sib: Sib,
@@ -43,7 +43,7 @@ pub(super) fn odd_scale_source(
     let mut x = raw;
     if plan.elided[raw.index()]
         && let Some(einst) = def(raw)
-        && let Op::Convert(Convert::Uextend, inner) = func.insts[einst.index()].op
+        && let Op::Convert(Convert::Uextend | Convert::Sextend, inner) = func.insts[einst.index()].op
     {
         x = inner;
     }
@@ -258,7 +258,13 @@ pub(in super::super) fn adc_plan(
     def: impl Fn(Value) -> Option<Inst>,
 ) -> Option<(Value, Option<Value>, Value, Value, Option<Value>, bool)> {
     let (cand, inner, cc, a, b) = adc_parts(func, plan, ty, op, (x, y), child_ok, def)?;
-    let (invert, left, right) = match cc {
+    let (invert, left, right) = adc_sides(func, plan, cc, a, b)?;
+    Some((cand, inner, left, if cand == y { x } else { y }, right, invert))
+}
+
+/// Whether the carry `a cc b` enters an `adc` or `sbb` inverted, and the compare it reads as `left <u right`, or as `left != 0` with no `right`.
+pub(super) fn adc_sides(func: &Function, plan: &Plan<Reg>, cc: IntCC, a: Value, b: Value) -> Option<(bool, Value, Option<Value>)> {
+    Some(match cc {
         IntCC::UnsignedLessThan => (false, a, Some(b)),
         IntCC::UnsignedGreaterThan if is_zero_const(func, plan, b) => (true, a, None),
         IntCC::UnsignedGreaterThan => (false, b, Some(a)),
@@ -267,8 +273,15 @@ pub(in super::super) fn adc_plan(
         IntCC::Equal => (false, if is_zero_const(func, plan, b) { a } else { b }, None),
         IntCC::NotEqual => (true, if is_zero_const(func, plan, b) { a } else { b }, None),
         _ => return None,
-    };
-    Some((cand, inner, left, if cand == y { x } else { y }, right, invert))
+    })
+}
+
+/// The operands of `other` when it is the add or subtract of the same kind as `op` that an `adc` or `sbb` adding an uninverted carry can compute in the same instruction.
+pub(in super::super) fn adc_fold(func: &Function, op: Binary, invert: bool, other: Value, def: impl Fn(Value) -> Option<Inst>) -> Option<(Value, Value)> {
+    match func.insts[def(other)?.index()].op {
+        Op::Binary(inner, p, q) if !invert && inner == op => Some((p, q)),
+        _ => None,
+    }
 }
 
 pub(in super::super) fn unwrap_shift_mask(func: &Function, plan: &Plan<Reg>, defs: &[Option<Inst>], y: Value, shift_res: Value, bits: u32) -> Value {
@@ -386,7 +399,7 @@ impl FuseCtx<'_> {
         }
     }
 
-    fn peel_const(&self, mut val: Value, mut max_pos: usize, mut peel_cur: bool, elide: &mut Vec<(Value, usize)>) -> Option<(Value, i64, usize)> {
+    pub(super) fn peel_const(&self, mut val: Value, mut max_pos: usize, mut peel_cur: bool, elide: &mut Vec<(Value, usize)>) -> Option<(Value, i64, usize)> {
         let (mut disp, mut last_pos) = (0_i64, max_pos);
         loop {
             if self.plan.elided[val.index()] || self.func.ty(val) != Type::I64 {
@@ -410,26 +423,207 @@ impl FuseCtx<'_> {
         Some((val, disp, last_pos))
     }
 
-    pub(super) fn unwrap_uext(&self, v: Value, max_pos: usize, multi_use: bool, elide: &mut Vec<(Value, usize)>) -> (Value, usize) {
-        if !self.plan.elided[v.index()]
-            && self.uses[v.index()] == 1
-            && let Some((eb, epos, einst)) = self.pos_of[v.index()]
-            && eb == self.b_idx
-            && epos < max_pos
-            && let Op::Convert(Convert::Uextend, inner) = self.func.insts[einst.index()].op
+    fn small_op_bounds(&self, v: Value, depth: u8, (bmin, bmax): (u64, u64)) -> (u64, u64) {
+        let ty = self.func.ty(v);
+        let w = ty.unsigned_max();
+        let Some(inst) = self.defs[v.index()] else { return (bmin, bmax) };
+        let sub = |u: Value| self.small_bounds(u, depth + 1);
+        match self.func.insts[inst.index()].op {
+            Op::Convert(Convert::Uextend, a) if self.func.ty(a).is_small_int() => {
+                let (l, h) = sub(a);
+                let aw = self.func.ty(a).unsigned_max();
+                (l.min(aw).max(bmin), h.min(aw).min(bmax))
+            }
+            Op::Convert(Convert::Sextend, a) if self.func.ty(a).is_small_int() => {
+                let sm = (1_u64 << (self.func.ty(a).bits() - 1)) - 1;
+                let (l, h) = sub(a);
+                if h <= sm { (l.max(bmin), h.min(bmax)) } else { (bmin, bmax) }
+            }
+            Op::Convert(Convert::Ireduce, a) if self.func.ty(a).is_small_int() => {
+                let (l, h) = sub(a);
+                if h <= w { (l.max(bmin), h.min(bmax)) } else { (bmin, bmax) }
+            }
+            Op::Binary(Binary::Iadd, a, b) => {
+                let ((l1, h1), (l2, h2)) = (sub(a), sub(b));
+                h1.checked_add(h2).filter(|&h| h <= w).map_or((bmin, bmax), |h| ((l1 + l2).max(bmin), h.min(bmax)))
+            }
+            Op::Binary(Binary::Isub, a, b) => {
+                let ((l1, h1), (l2, h2)) = (sub(a), sub(b));
+                if l1 >= h2 { ((l1 - h2).max(bmin), (h1 - l2).min(bmax)) } else { (bmin, bmax) }
+            }
+            Op::Binary(Binary::Umin, a, b) => {
+                let ((l1, h1), (l2, h2)) = (sub(a), sub(b));
+                (l1.min(l2).max(bmin), h1.min(h2).min(bmax))
+            }
+            Op::Binary(Binary::Ushr, a, b) => {
+                let (l, h) = sub(a);
+                self.plan.const_of(b).map_or((bmin, h.min(bmax)), |c| {
+                    let k = (c as u32) & (ty.bits() - 1);
+                    ((l >> k).max(bmin), (h >> k).min(bmax))
+                })
+            }
+            Op::Select(_, a, b) => {
+                let ((l1, h1), (l2, h2)) = (sub(a), sub(b));
+                (l1.min(l2).max(bmin), h1.max(h2).min(bmax))
+            }
+            _ => (bmin, bmax),
+        }
+    }
+
+    fn small_bounds(&self, v: Value, depth: u8) -> (u64, u64) {
+        let ty = self.func.ty(v);
+        let w = ty.unsigned_max();
+        if !ty.is_small_int() {
+            return (0, w);
+        }
+        let (z, o) = crate::fold::known_bits(self.func, &|u| self.defs[u.index()], &|u| self.plan.const_of(u), v, depth);
+        let (bmin, bmax) = (o & w, !z & w);
+        if depth >= 6 || bmin == bmax {
+            return (bmin, bmax);
+        }
+        self.small_op_bounds(v, depth, (bmin, bmax))
+    }
+
+    pub(super) fn nonneg_small(&self, v: Value) -> bool {
+        let ty = self.func.ty(v);
+        ty.is_small_int() && ty.bytes() <= 4 && self.small_bounds(v, 0).1 <= (1_u64 << (ty.bits() - 1)) - 1
+    }
+
+    fn uext_inner(&self, inst: Inst) -> Option<Value> {
+        match self.func.insts[inst.index()].op {
+            Op::Convert(Convert::Uextend, inner) => Some(inner),
+            Op::Convert(Convert::Sextend, inner) if self.nonneg_small(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    fn small_const_step(&self, vinst: Inst, ty: Type) -> Option<(Value, i64)> {
+        let w = ty.unsigned_max();
+        match self.func.insts[vinst.index()].op {
+            Op::Binary(Binary::Iadd, a, b) => [(a, b), (b, a)].into_iter().find_map(|(x, c)| {
+                let imm = self.plan.const_of(c)?;
+                let (xmin, xmax) = self.small_bounds(x, 0);
+                let u = crate::fold::extend(imm, ty, false) as u64;
+                if xmax.checked_add(u).is_some_and(|m| m <= w) {
+                    return Some((x, u as i64));
+                }
+                let s = crate::fold::extend(imm, ty, true);
+                (s < 0 && xmin >= s.unsigned_abs()).then_some((x, s))
+            }),
+            Op::Binary(Binary::Isub, a, b) => {
+                let u = crate::fold::extend(self.plan.const_of(b)?, ty, false) as u64;
+                (self.small_bounds(a, 0).0 >= u).then_some((a, -(u as i64)))
+            }
+            _ => None,
+        }
+    }
+
+    fn uext_target_ok(&self, v: Value, multi_use: bool) -> bool {
+        self.index_ok(v) && (!multi_use || self.plan.zero_ext[v.index()] || self.plan.reg_of(v).is_none())
+    }
+
+    fn peel_small_step(&self, cur: Value, cur_pos: usize, (shift, cur_disp): (u8, i64)) -> Option<(Value, usize, i64)> {
+        let cur_ty = self.func.ty(cur);
+        if !cur_ty.is_small_int() || cur_ty.bytes() > 4 || self.plan.elided[cur.index()] || self.uses[cur.index()] != 1 {
+            return None;
+        }
+        let (vb, vpos, vinst) = self.pos_of[cur.index()]?;
+        if vb != self.b_idx || vpos >= cur_pos {
+            return None;
+        }
+        if let Some(inner) = self.uext_inner(vinst) {
+            let inner_ty = self.func.ty(inner);
+            return (inner_ty.is_small_int() && inner_ty.bytes() <= 4 && !self.plan.elided[inner.index()]).then_some((inner, vpos, cur_disp));
+        }
+        let (next, delta) = self.small_const_step(vinst, cur_ty)?;
+        let next_disp = delta.checked_mul(1_i64 << shift).and_then(|d| cur_disp.checked_add(d))?;
+        ((-FOLD_LIMIT..=FOLD_LIMIT).contains(&next_disp) && !self.plan.elided[next.index()]).then_some((next, vpos, next_disp))
+    }
+
+    pub(super) fn peel_small_chain(
+        &self,
+        inner: Value,
+        start_pos: usize,
+        (shift, disp): (u8, i64),
+        multi_use: bool,
+        elide: &mut Vec<(Value, usize)>,
+    ) -> Option<(Value, i64, usize)> {
+        let (mut cur, mut cur_disp, mut cur_pos) = (inner, disp, start_pos);
+        let mut tmp = Vec::new();
+        let mut best = self.uext_target_ok(cur, multi_use).then_some((cur, cur_disp, cur_pos, 0_usize));
+        while tmp.len() < 16 {
+            let Some((next, vpos, next_disp)) = self.peel_small_step(cur, cur_pos, (shift, cur_disp)) else { break };
+            tmp.push((cur, vpos));
+            (cur, cur_disp, cur_pos) = (next, next_disp, vpos);
+            if self.uext_target_ok(cur, multi_use) {
+                best = Some((cur, cur_disp, cur_pos, tmp.len()));
+            }
+        }
+        let (idx, out_disp, out_pos, len) = best?;
+        elide.extend_from_slice(&tmp[..len]);
+        Some((idx, out_disp, out_pos))
+    }
+
+    fn local_uext(&self, v: Value, max_pos: usize) -> Option<(Value, usize)> {
+        if self.plan.elided[v.index()] || self.uses[v.index()] != 1 {
+            return None;
+        }
+        let (eb, epos, einst) = self.pos_of[v.index()]?;
+        let inner = self.uext_inner(einst).filter(|_| eb == self.b_idx && epos < max_pos)?;
+        (!self.plan.elided[inner.index()]).then_some((inner, epos))
+    }
+
+    pub(super) fn unwrap_base_uext(&self, v: Value, max_pos: usize, elide: &mut Vec<(Value, usize)>) -> (Value, usize) {
+        match self.local_uext(v, max_pos) {
+            Some((inner, epos)) if self.plan.zero_ext[inner.index()] && self.plan.reg_of(inner).is_some() => {
+                elide.push((v, epos));
+                (inner, epos)
+            }
+            _ => (v, max_pos),
+        }
+    }
+
+    pub(super) fn unwrap_uext_const(
+        &self,
+        v: Value,
+        max_pos: usize,
+        (shift, disp): (u8, i64),
+        multi_use: bool,
+        elide: &mut Vec<(Value, usize)>,
+    ) -> (Value, i64, usize) {
+        if let Some((inner, epos)) = self.local_uext(v, max_pos)
             && self.func.ty(inner).is_small_int()
             && self.func.ty(inner).bytes() <= 4
-            && !self.plan.elided[inner.index()]
-            && (!multi_use || self.plan.zero_ext[inner.index()] || self.plan.reg_of(inner).is_none())
         {
-            elide.push((v, epos));
-            return (inner, epos);
+            let mut tmp = Vec::new();
+            if let Some((idx, out_disp, out_pos)) = self.peel_small_chain(inner, epos, (shift, disp), multi_use, &mut tmp) {
+                elide.push((v, epos));
+                elide.extend(tmp);
+                return (idx, out_disp, out_pos);
+            }
         }
-        (v, max_pos)
+        (v, disp, max_pos)
+    }
+
+    pub(super) fn unwrap_uext(&self, v: Value, max_pos: usize, multi_use: bool, elide: &mut Vec<(Value, usize)>) -> (Value, usize) {
+        let (idx, _, start) = self.unwrap_uext_const(v, max_pos, (0, 0), multi_use, elide);
+        (idx, start)
     }
 
     pub(super) fn index_ok(&self, idx: Value) -> bool {
         !self.plan.elided[idx.index()] && !matches!(self.plan.location(idx), Location::Frame(..) | Location::Imm(..))
+    }
+
+    fn peel_scaled(&self, raw_idx: Value, spos: usize, shift: u8, disp: i64) -> (Value, i64, usize, Vec<(Value, usize)>) {
+        let mut elide = Vec::new();
+        if let Some((core, off, pos)) = self.peel_const(raw_idx, spos, true, &mut elide)
+            && off != 0
+            && let Some(total) = off.checked_mul(1_i64 << shift).and_then(|d| disp.checked_add(d))
+            && (-FOLD_LIMIT..=FOLD_LIMIT).contains(&total)
+        {
+            return (core, total, pos, elide);
+        }
+        (raw_idx, disp, spos, Vec::new())
     }
 
     fn parse_index(&self, v: Value, sum_pos: usize, scaled_only: bool, multi_use: bool) -> Option<(Value, u8, i64, usize, Vec<(Value, usize)>)> {
@@ -444,14 +638,16 @@ impl FuseCtx<'_> {
             && let Some((raw_idx, shift, None)) = scaled_op(self.func, self.plan, sinst)
         {
             elide.push((core, spos));
-            let (idx, idx_start) = self.unwrap_uext(raw_idx, spos, multi_use, &mut elide);
-            return self.index_ok(idx).then_some((idx, shift, disp, idx_start, elide));
+            let (idx_core, total_disp, idx_use_pos, scaled_elide) = self.peel_scaled(raw_idx, spos, shift, disp);
+            elide.extend(scaled_elide);
+            let (idx, total_disp, idx_start) = self.unwrap_uext_const(idx_core, idx_use_pos, (shift, total_disp), multi_use, &mut elide);
+            return self.index_ok(idx).then_some((idx, shift, total_disp, idx_start, elide));
         }
         if scaled_only {
             return None;
         }
-        let (idx, idx_start) = self.unwrap_uext(core, use_pos, multi_use, &mut elide);
-        self.index_ok(idx).then_some((idx, 0, disp, idx_start, elide))
+        let (idx, total_disp, idx_start) = self.unwrap_uext_const(core, use_pos, (0, disp), multi_use, &mut elide);
+        self.index_ok(idx).then_some((idx, 0, total_disp, idx_start, elide))
     }
 
     fn try_sib_pair(
@@ -467,6 +663,7 @@ impl FuseCtx<'_> {
         if self.plan.elided[b_core.index()] {
             return None;
         }
+        let (b_core, base_start) = self.unwrap_base_uext(b_core, base_start, &mut pair_elide);
         let (base, frame_off) = match self.plan.location(b_core) {
             Location::Frame(slot, off) => (SibBase::Frame(slot), i64::from(off)),
             Location::Imm(_) => return None,
@@ -483,7 +680,7 @@ impl FuseCtx<'_> {
         })
     }
 
-    pub(super) fn match_sib(&self, root: Value, root_pos: usize, multi_use: bool) -> Option<SibMatch> {
+    fn sib_sum(&self, root: Value, root_pos: usize) -> Option<(Vec<(Value, usize)>, usize, i64, Value, Value)> {
         if self.plan.elided[root.index()] || self.plan.is_static(root) || self.func.ty(root) != Type::I64 {
             return None;
         }
@@ -500,10 +697,21 @@ impl FuseCtx<'_> {
             elide.push((sum_node, sum_pos));
         }
         let Op::Binary(Binary::Iadd, left, right) = self.func.insts[sinst.index()].op else { return None };
-        [(left, right), (right, left)]
-            .into_iter()
-            .find_map(|pair| self.try_sib_pair(&elide, (sum_pos, outer_disp), pair, true, multi_use))
-            .or_else(|| [(left, right), (right, left)].into_iter().find_map(|pair| self.try_sib_pair(&elide, (sum_pos, outer_disp), pair, false, multi_use)))
+        Some((elide, sum_pos, outer_disp, left, right))
+    }
+
+    /// Each base-plus-index form of `root`, scaled-index forms first, in both operand orders.
+    pub(super) fn sib_matches(&self, root: Value, root_pos: usize, multi_use: bool) -> impl Iterator<Item = SibMatch> + '_ {
+        self.sib_sum(root, root_pos).into_iter().flat_map(move |(elide, sum_pos, outer_disp, left, right)| {
+            [true, false]
+                .into_iter()
+                .flat_map(move |scaled_only| [(left, right), (right, left)].into_iter().map(move |pair| (scaled_only, pair)))
+                .filter_map(move |(scaled_only, pair)| self.try_sib_pair(&elide, (sum_pos, outer_disp), pair, scaled_only, multi_use))
+        })
+    }
+
+    pub(super) fn match_sib(&self, root: Value, root_pos: usize, multi_use: bool) -> Option<SibMatch> {
+        self.sib_matches(root, root_pos, multi_use).next()
     }
 }
 
@@ -570,4 +778,15 @@ pub(super) fn mid_preserves_flags(
         }
         _ => false,
     }
+}
+
+/// The signedness and factors of the 64-bit product whose high and low halves are `x` and `y` in either order.
+pub(in super::super) fn product_halves(func: &Function, def: &dyn Fn(Value) -> Option<Inst>, (x, y): (Value, Value)) -> Option<(bool, Value, Value)> {
+    let op = |v: Value| def(v).map(|inst| &func.insts[inst.index()].op);
+    let ((Some(&Op::Binary(high @ (Binary::Umulhi | Binary::Smulhi), a, b)), Some(&Op::Binary(Binary::Imul, c, d)))
+    | (Some(&Op::Binary(Binary::Imul, c, d)), Some(&Op::Binary(high @ (Binary::Umulhi | Binary::Smulhi), a, b)))) = (op(x), op(y))
+    else {
+        return None;
+    };
+    (func.ty(x) == Type::I64 && func.ty(y) == Type::I64 && ((a, b) == (c, d) || (a, b) == (d, c))).then_some((high == Binary::Smulhi, a, b))
 }

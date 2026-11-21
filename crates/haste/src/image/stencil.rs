@@ -45,24 +45,21 @@ impl DictConfig {
         let tier_up = env_usize("HASTE_JIT_TIER_UP").map_or(DEFAULT_TIER_UP, |v| v as u32);
         Self { min_bytes, min_fanout, tier_up, verify: verify_stencil() }
     }
-}
 
-pub(super) fn target() -> Target {
-    crate::host_target()
-}
-
-impl From<Profile> for Effort {
-    fn from(profile: Profile) -> Effort {
-        match profile {
-            Profile::Debug => Effort::Quick,
-            Profile::Release => Effort::Full,
-        }
+    pub(super) fn shares_dict(self, bytes: usize, fanout: usize) -> bool {
+        bytes > self.min_bytes && fanout >= self.min_fanout
     }
 }
 
-fn env_usize(key: &str) -> Option<usize> {
-    std::env::var(key).ok()?.parse().ok()
+pub(super) fn target() -> Target { crate::host_target() }
+
+impl From<Profile> for Effort {
+    fn from(profile: Profile) -> Effort {
+        match profile { Profile::Debug => Effort::Quick, Profile::Release => Effort::Full }
+    }
 }
+
+fn env_usize(key: &str) -> Option<usize> { std::env::var(key).ok()?.parse().ok() }
 
 #[derive(Clone)]
 pub(super) enum CachedTemplate {
@@ -304,15 +301,9 @@ impl Image {
     pub(super) fn register_aot_relocs(&self, relocs: &[SymbolSource]) {
         for sym in relocs {
             match *sym {
-                SymbolSource::StaticCell { index, size } => {
-                    self.cell(index, size);
-                }
-                SymbolSource::PromotedCell { owner, seq, size } => {
-                    self.promoted_cell(owner, seq, size);
-                }
-                SymbolSource::ThreadSlot(index) => {
-                    self.thread_slot(index);
-                }
+                SymbolSource::StaticCell { index, size } => drop(self.cell(index, size)),
+                SymbolSource::PromotedCell { owner, seq, size } => drop(self.promoted_cell(owner, seq, size)),
+                SymbolSource::ThreadSlot(index) => drop(self.thread_slot(index)),
                 _ => {}
             }
         }
@@ -352,6 +343,9 @@ impl Image {
     pub(super) fn reset_caches(&mut self) {
         self.bodies.clear();
         self.pass.stencils.clear();
+        if let Some(aot) = self.aot() {
+            lock(aot).stencils.clear();
+        }
     }
 
     pub(super) fn cached_aot_template(&self, item: ItemRef, fp: FootprintId) -> Option<CachedAotTemplate> {
@@ -411,87 +405,96 @@ impl Image {
         errors
     }
 
+    fn try_aot_singleton_hit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, slice: &crate::substrate::StencilSlice<'_>, pass: &mut Pass) -> Result<bool, String> {
+        let Ok(code) = slice.to_code().map(Arc::new) else { return Ok(false) };
+        let item = reached.list[index].0.0;
+        let relocs = if code.relocs().iter().any(|r| r.symbol_index().is_some()) {
+            if let Some(plan) = self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, false, slice.plan())
+                && let Ok(r) = lower::eval_relocs(cx, reached, self, &plan, index)
+                && cx.deferred_evals.is_empty()
+            {
+                self.register_aot_relocs(&r);
+                r
+            } else if !cx.deferred_evals.is_empty() {
+                return Ok(true);
+            } else {
+                let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
+                self.register_aot_relocs(&out.relocs);
+                out.relocs
+            }
+        } else {
+            Vec::new()
+        };
+        if !aot_relocs_valid(&code, relocs.len()) {
+            return Ok(false);
+        }
+        pass.record_size(index, code.bytes().len() as u32, 0);
+        self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs }, &[]);
+        Ok(true)
+    }
+
+    fn try_singleton_substrate(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, fp: FootprintId, pass: &mut Pass) -> Result<bool, String> {
+        let Some((_, stencil_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp) else { return Ok(false) };
+        let Some(substrate) = cx.store().substrate().cloned() else { return Ok(false) };
+        let Some(slice) = substrate.stencil(stencil_key, fp_bits) else { return Ok(false) };
+        if self.backend.is_check() {
+            pass.record_size(index, slice.code().len() as u32, 0);
+            return Ok(true);
+        }
+        if self.backend.is_aot() && self.try_aot_singleton_hit(cx, reached, index, &slice, pass)? {
+            return Ok(true);
+        }
+        let item = reached.list[index].0.0;
+        let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) {
+            Vec::new()
+        } else {
+            let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
+            out.relocs.iter().map(|sym| self.symbol_value(sym)).collect()
+        };
+        let Ok(patched) = crate::substrate::patch_stencil(&slice, &symbols) else { return Ok(false) };
+        let exec = pass.memory.write(&patched).map_err(|e| item_err(cx, item, e))?;
+        self.publish(index, exec);
+        pass.record_size(index, patched.len() as u32, 0);
+        Ok(true)
+    }
+
+    fn emit_singleton_code(&self, cx: &Context<'_>, item: ItemRef, index: usize, code: Arc<Code>, relocs: Vec<SymbolSource>, pass: &mut Pass) -> Result<(), String> {
+        if self.backend.is_jit() {
+            let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+            let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
+            self.publish(index, exec);
+        } else {
+            self.register_aot_relocs(&relocs);
+            self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs }, &[]);
+        }
+        Ok(())
+    }
+
+    fn eval_singleton_fp(&self, cx: &mut Context<'_>, reached: &Reached, item: ItemRef, index: usize) -> Result<Option<FootprintId>, String> {
+        if self.backend.is_lazy_jit() || !cx.outline.is_fixed(item.krate) {
+            return Ok(None);
+        }
+        lower::eval_footprint(cx, reached, self, index).map(Some).map_err(|e| item_err(cx, item, e))
+    }
+
     fn compile_singleton(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<(), String> {
         let started = std::time::Instant::now();
         let item = reached.list[index].0.0;
-        let footprint = if !self.backend.is_lazy_jit() && cx.outline.is_fixed(item.krate) {
-            Some(lower::eval_footprint(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?)
-        } else {
-            None
-        };
-        let substrate = cx.store().substrate().cloned();
-        if !pass.stencils.cfg.verify
-            && let Some(fp) = footprint
-            && let Some((is_sysroot, stencil_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp)
-            && let Some(substrate) = substrate.as_ref()
-            && let Some(slice) = substrate.stencil(stencil_key, fp_bits)
-        {
-            if self.backend.is_check() {
-                pass.record_size(index, slice.code().len() as u32, 0);
-                return Ok(());
-            }
-            if self.backend.is_aot()
-                && let Ok(code) = slice.to_code().map(Arc::new)
-            {
-                let relocs = if code.relocs().iter().any(|r| r.symbol_index().is_some()) {
-                    if let Some(plan) = self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan())
-                        && let Ok(r) = lower::eval_relocs(cx, reached, self, &plan, index)
-                        && cx.deferred_evals.is_empty()
-                    {
-                        self.register_aot_relocs(&r);
-                        r
-                    } else if !cx.deferred_evals.is_empty() {
-                        return Ok(());
-                    } else {
-                        let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
-                        self.register_aot_relocs(&out.relocs);
-                        out.relocs
-                    }
-                } else {
-                    Vec::new()
-                };
-                if aot_relocs_valid(&code, relocs.len()) {
-                    let code_len = code.bytes().len() as u32;
-                    self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs }, &[]);
-                    pass.record_size(index, code_len, 0);
-                    return Ok(());
-                }
-            }
-            let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) {
-                Vec::new()
-            } else {
-                let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
-                out.relocs.iter().map(|sym| self.symbol_value(sym)).collect()
-            };
-            if let Ok(patched) = crate::substrate::patch_stencil(&slice, &symbols) {
-                let exec = pass.memory.write(&patched).map_err(|e| item_err(cx, item, e))?;
-                self.publish(index, exec);
-                pass.record_size(index, patched.len() as u32, 0);
-                return Ok(());
-            }
+        let footprint = self.eval_singleton_fp(cx, reached, item, index)?;
+        if !pass.stencils.cfg.verify && match footprint { Some(fp) => self.try_singleton_substrate(cx, reached, index, fp, pass)?, None => false } {
+            return Ok(());
         }
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
         if self.backend.is_check() && !pass.stencils.cfg.verify {
             pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
             return Ok(());
         }
-        let reloc_plan = out.reloc_plan;
-        let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
-        if let Some(fp) = footprint
-            && aot_relocs_valid(&code, out.relocs.len())
-            && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)
-        {
-            self.freeze_stencil(cx, reached, index, fp, false, &code, Some(&reloc_plan), pass);
-        }
-        if self.backend.is_jit() {
-            let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-            let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
-            self.publish(index, exec);
-        } else {
-            self.register_aot_relocs(&out.relocs);
-            self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs: out.relocs }, &[]);
+        let code = Arc::new(compile_traced(cx, reached, index, out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
+        if let Some(fp) = footprint.filter(|&fp| aot_relocs_valid(&code, out.relocs.len()) && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)) {
+            self.freeze_stencil(cx, reached, index, fp, false, &code, Some(&out.reloc_plan), pass);
         }
         let code_len = code.bytes().len() as u32;
+        self.emit_singleton_code(cx, item, index, code, out.relocs, pass)?;
         pass.record_size(index, code_len, started.elapsed().as_nanos() as u64);
         Ok(())
     }
@@ -549,40 +552,42 @@ impl Image {
         }
     }
 
+    fn apply_frozen_aot_group(&self, (cx, reached): (&mut Context<'_>, &Reached), group: &GroupWork, rep: usize, slice: &crate::substrate::StencilSlice<'_>, pass: &mut Pass) -> Option<Result<(), String>> {
+        let code = Arc::new(slice.to_code().ok()?);
+        if !group.distinct.iter().all(|inst| inst.relocs.as_ref().is_some_and(|r| aot_relocs_valid(&code, r.len()))) {
+            return None;
+        }
+        let aot_code = AotCode::from_code(&code);
+        if let Some(out) = &group.leader_out {
+            self.cache_aot_template(cx, reached, (group.item, group.footprint, rep), CachedAotTemplate::Direct { code: Arc::clone(&aot_code), reloc_plan: Arc::clone(&out.reloc_plan) });
+        }
+        let code_len = code.bytes().len() as u32;
+        for inst in &group.distinct {
+            if let Some(relocs) = &inst.relocs {
+                self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(&aot_code), relocs: relocs.clone() }, &inst.followers);
+            }
+            pass.record_size(inst.leader, code_len, 0);
+        }
+        tally(Tally::HitLowered);
+        Some(Ok(()))
+    }
+
     fn try_frozen_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, cfg: DictConfig, pass: &mut Pass) -> Option<Result<(), String>> {
         if cfg.verify {
             return None;
         }
         let rep = group.representative();
         let (_, stencil_key, fp_bits) = self.frozen_stencil_key(cx, reached, rep, group.footprint)?;
-        let substrate = cx.store().substrate()?;
-        let slice = substrate.stencil(stencil_key, fp_bits)?;
+        let substrate = cx.store().substrate().cloned()?;
+        let Some(slice) = substrate.stencil(stencil_key, fp_bits) else {
+            return (self.backend.is_aot() && group.distinct.len() >= cfg.min_fanout).then(|| self.try_frozen_dict_group(cx, reached, group, pass)).flatten();
+        };
         if self.backend.is_aot() {
-            let code = Arc::new(slice.to_code().ok()?);
-            if !group.distinct.iter().all(|inst| inst.relocs.as_ref().is_some_and(|r| aot_relocs_valid(&code, r.len()))) {
-                return None;
+            if cfg.shares_dict(slice.code().len(), group.distinct.len()) {
+                return self.try_frozen_dict_group(cx, reached, group, pass);
             }
-            let aot_code = AotCode::from_code(&code);
-            if let Some(out) = &group.leader_out {
-                self.cache_aot_template(
-                    cx,
-                    reached,
-                    (group.item, group.footprint, rep),
-                    CachedAotTemplate::Direct { code: Arc::clone(&aot_code), reloc_plan: Arc::clone(&out.reloc_plan) },
-                );
-            }
-            let code_len = code.bytes().len() as u32;
-            for inst in &group.distinct {
-                if let Some(relocs) = &inst.relocs {
-                    self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(&aot_code), relocs: relocs.clone() }, &inst.followers);
-                }
-                pass.record_size(inst.leader, code_len, 0);
-            }
-            tally(Tally::HitLowered);
-            return Some(Ok(()));
+            return self.apply_frozen_aot_group((cx, reached), group, rep, &slice, pass);
         }
-        let sites = cfg.verify.then(|| slice.decode_sites()).transpose().ok()?;
-        let mut records = Vec::new();
         for inst in &group.distinct {
             if self.backend.is_check() {
                 pass.record_size(inst.leader, slice.code().len() as u32, 0);
@@ -592,14 +597,53 @@ impl Image {
             let exec = match pass.memory.write(&patched) { Ok(exec) => exec, Err(e) => return Some(Err(item_err(cx, group.item, e))) };
             self.store_instance(inst, exec);
             pass.record_size(inst.leader, patched.len() as u32, 0);
-            if let Some(sites) = &sites {
-                for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
-                    records.push((idx, VerifyRecord::Patched { exec, len: slice.code().len(), sites: sites.clone() }));
-                }
-            }
         }
         tally(Tally::HitLowered);
-        Some(self.finish_verify(cx, reached, &records))
+        Some(Ok(()))
+    }
+
+    fn emit_direct_inst(&self, (cx, group, inst): (&Context<'_>, &GroupWork, &DistinctInst), (code, aot_code): (&Arc<Code>, &Option<Arc<AotCode>>), (record_cache, verify): (bool, bool), (pass, records): (&mut Pass, &mut Vec<(usize, VerifyRecord)>)) -> Result<(), String> {
+        let exec = if !self.backend.is_jit() { 0 } else { let e = pass.memory.write_patched(code, &inst.symbols).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); e };
+        if let (Some(aot_code), Some(relocs)) = (aot_code, &inst.relocs) {
+            self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(aot_code), relocs: relocs.clone() }, &inst.followers);
+        }
+        pass.record_size(inst.leader, code.bytes().len() as u32, 0);
+        if record_cache && !self.backend.is_check() {
+            let stored = if inst.relocs.is_some() { inst.leader } else { exec };
+            pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (stored, false));
+        }
+        if verify {
+            for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
+                let rec = if self.backend.is_jit() {
+                    VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() }
+                } else {
+                    VerifyRecord::Compiled { code: Arc::clone(code), symbols: inst.symbols.clone() }
+                };
+                records.push((idx, rec));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_direct_group(&self, (cx, reached): (&mut Context<'_>, &Reached), group: &GroupWork, (code, reloc_plan): (Arc<Code>, Arc<RelocPlan>), (record_cache, verify, elapsed): (bool, bool, u64), pass: &mut Pass) -> Result<(), String> {
+        let rep = group.representative();
+        if group.distinct.first().is_some_and(|inst| aot_relocs_valid(&code, inst.reloc_count()))
+            && lower::eval_footprint(cx, reached, self, rep).ok() == Some(group.footprint)
+        {
+            self.freeze_stencil(cx, reached, rep, group.footprint, false, &code, Some(&reloc_plan), pass);
+        }
+        let aot_code = self.backend.is_aot().then(|| AotCode::from_code(&code));
+        let mut records = Vec::new();
+        for inst in &group.distinct {
+            self.emit_direct_inst((cx, group, inst), (&code, &aot_code), (record_cache, verify), (pass, &mut records))?;
+        }
+        pass.record_size(rep, 0, elapsed);
+        if record_cache {
+            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Stencil { code, reloc_plan });
+        } else if !verify && let Some(code) = aot_code {
+            self.cache_aot_template(cx, reached, (group.item, group.footprint, rep), CachedAotTemplate::Direct { code, reloc_plan });
+        }
+        self.finish_verify(cx, reached, &records)
     }
 
     pub(super) fn compile_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &mut GroupWork, cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Result<(), String> {
@@ -618,53 +662,17 @@ impl Image {
             None => lower::lower_stencil(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?,
         };
         if self.backend.is_check() && !cfg.verify {
-            for inst in &group.distinct {
-                pass.record_size(inst.leader, 0, 0);
-            }
+            group.distinct.iter().for_each(|inst| pass.record_size(inst.leader, 0, 0));
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
             return Ok(());
         }
         let reloc_plan = out.reloc_plan;
-        let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target()).map_err(|e| item_err(cx, group.item, e))?);
-        if code.bytes().len() > cfg.min_bytes && group.distinct.len() >= cfg.min_fanout {
+        let code = Arc::new(compile_traced(cx, reached, rep, out.func, &self.compile_target()).map_err(|e| item_err(cx, group.item, e))?);
+        if cfg.shares_dict(code.bytes().len(), group.distinct.len()) {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
         }
-        if group.distinct.first().is_some_and(|inst| aot_relocs_valid(&code, inst.reloc_count()))
-            && lower::eval_footprint(cx, reached, self, rep).ok() == Some(group.footprint)
-        {
-            self.freeze_stencil(cx, reached, rep, group.footprint, false, &code, Some(&reloc_plan), pass);
-        }
-        let aot_code = self.backend.is_aot().then(|| AotCode::from_code(&code));
-        let mut records = Vec::new();
-        for inst in &group.distinct {
-            let exec = if !self.backend.is_jit() { 0 } else { let e = pass.memory.write_patched(&code, &inst.symbols).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); e };
-            if let (Some(aot_code), Some(relocs)) = (&aot_code, &inst.relocs) {
-                self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(aot_code), relocs: relocs.clone() }, &inst.followers);
-            }
-            pass.record_size(inst.leader, code.bytes().len() as u32, 0);
-            if record_cache && !self.backend.is_check() {
-                let stored = if inst.relocs.is_some() { inst.leader } else { exec };
-                pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (stored, false));
-            }
-            if cfg.verify {
-                for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
-                    let rec = if self.backend.is_jit() {
-                        VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() }
-                    } else {
-                        VerifyRecord::Compiled { code: Arc::clone(&code), symbols: inst.symbols.clone() }
-                    };
-                    records.push((idx, rec));
-                }
-            }
-        }
-        pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
-        if record_cache {
-            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Stencil { code, reloc_plan });
-        } else if !cfg.verify && let Some(code) = aot_code {
-            self.cache_aot_template(cx, reached, (group.item, group.footprint, rep), CachedAotTemplate::Direct { code, reloc_plan });
-        }
-        self.finish_verify(cx, reached, &records)
+        self.finish_direct_group((cx, reached), group, (code, reloc_plan), (record_cache, cfg.verify, started.elapsed().as_nanos() as u64), pass)
     }
 
     pub(super) fn write_dict_body(&self, code: &Code, pass: &mut Pass) -> Result<usize> {
@@ -674,9 +682,36 @@ impl Image {
         pass.memory.write_patched(code, &[]).map_err(|err| anyhow::anyhow!("{err}"))
     }
 
+    fn emit_dict_inst(&self, (cx, reached): (&mut Context<'_>, &Reached), (group, inst, reloc_plan): (&GroupWork, &DistinctInst, &RelocPlan), (body_exec, code, aot_code, record_cache, verify): (usize, &Arc<Code>, &Option<Arc<AotCode>>, bool, bool), (pass, records): (&mut Pass, &mut Vec<(usize, VerifyRecord)>)) -> Result<(), String> {
+        let relocs = lower::eval_relocs(cx, reached, self, reloc_plan, inst.leader).map_err(|e| item_err(cx, group.item, e))?;
+        let syms = if self.backend.is_jit() || record_cache { self.symbols(&relocs) } else { Vec::new() };
+        let (stub_exec, stub_bytes) = if !self.backend.is_jit() { (0, Vec::new()) } else { let (e, b) = self.emit_dict_stub(body_exec, &syms, pass).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); (e, b) };
+        if let Some(aot_code) = aot_code {
+            self.register_aot_relocs(&relocs);
+            self.record_aot(inst.leader, AotFn::Dict { body: Arc::clone(aot_code), relocs }, &inst.followers);
+        }
+        pass.record_size(inst.leader, stub_bytes.len() as u32, 0);
+        if record_cache && !self.backend.is_check() {
+            pass.stencils.aliases.insert((group.item, group.footprint, syms), (if aot_code.is_some() { inst.leader } else { stub_exec }, true));
+        }
+        if verify {
+            for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
+                records.push((idx, VerifyRecord::Dict { body_exec, stub_exec, stub_bytes: stub_bytes.clone(), code: Arc::clone(code) }));
+            }
+        }
+        Ok(())
+    }
+
+    fn store_dict_template(&self, (cx, reached): (&Context<'_>, &Reached), (group, rep, verify, record_cache): (&GroupWork, usize, bool, bool), (body_exec, code, aot_code, reloc_plan): (usize, Arc<Code>, Option<Arc<AotCode>>, Arc<RelocPlan>), pass: &mut Pass) {
+        if record_cache {
+            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Dict { body_exec, code, reloc_plan });
+        } else if !verify && let Some(body) = aot_code {
+            self.cache_aot_template(cx, reached, (group.item, group.footprint, rep), CachedAotTemplate::Dict { body, reloc_plan });
+        }
+    }
+
     fn compile_dict_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Result<(), String> {
-        let rep = group.representative();
-        let started = std::time::Instant::now();
+        let (rep, started) = (group.representative(), std::time::Instant::now());
         if !cfg.verify && self.backend.is_aot() && let Some(ok) = self.try_frozen_dict_group(cx, reached, group, pass) {
             return ok;
         }
@@ -686,30 +721,12 @@ impl Image {
             self.freeze_stencil(cx, reached, rep, group.footprint, true, &code, Some(&reloc_plan), pass);
         }
         let body_exec = if !self.backend.is_jit() { 0 } else { self.write_dict_body(&code, pass).map_err(|e| item_err(cx, group.item, e))? };
-        let aot_code = self.backend.is_aot().then(|| AotCode::from_code(&code));
-        let mut records = Vec::new();
+        let (aot_code, mut records) = (self.backend.is_aot().then(|| AotCode::from_code(&code)), Vec::new());
         for inst in &group.distinct {
-            let (stub_exec, stub_bytes) = if !self.backend.is_jit() { (0, Vec::new()) } else { let (e, b) = self.emit_dict_stub(body_exec, &inst.symbols, pass).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); (e, b) };
-            if let (Some(aot_code), Some(relocs)) = (&aot_code, &inst.relocs) {
-                self.record_aot(inst.leader, AotFn::Dict { body: Arc::clone(aot_code), relocs: relocs.clone() }, &inst.followers);
-            }
-            pass.record_size(inst.leader, stub_bytes.len() as u32, 0);
-            if record_cache && !self.backend.is_check() {
-                let stored = if inst.relocs.is_some() { inst.leader } else { stub_exec };
-                pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (stored, true));
-            }
-            if cfg.verify {
-                for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
-                    records.push((idx, VerifyRecord::Dict { body_exec, stub_exec, stub_bytes: stub_bytes.clone(), code: code.clone() }));
-                }
-            }
+            self.emit_dict_inst((cx, reached), (group, inst, &reloc_plan), (body_exec, &code, &aot_code, record_cache, cfg.verify), (pass, &mut records))?;
         }
         pass.record_size(rep, code.bytes().len() as u32, started.elapsed().as_nanos() as u64);
-        if record_cache {
-            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Dict { body_exec, code, reloc_plan });
-        } else if !cfg.verify && let Some(body) = aot_code {
-            self.cache_aot_template(cx, reached, (group.item, group.footprint, rep), CachedAotTemplate::Dict { body, reloc_plan });
-        }
+        self.store_dict_template((cx, reached), (group, rep, cfg.verify, record_cache), (body_exec, code, aot_code, reloc_plan), pass);
         self.finish_verify(cx, reached, &records)
     }
 
@@ -721,21 +738,15 @@ impl Image {
     }
 
     fn alloc_dict(&self, symbols: &[u64]) -> usize {
-        if symbols.is_empty() {
-            return 0;
-        }
+        if symbols.is_empty() { return 0; }
         let bytes: Vec<u8> = symbols.iter().flat_map(|word| word.to_le_bytes()).collect();
         self.data(&bytes) as usize
     }
 
     pub(super) fn frozen_stencil_key(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId) -> Option<(bool, u64, u128)> {
-        if self.backend.is_lazy_jit() || !fp.is_portable() {
-            return None;
-        }
+        if self.backend.is_lazy_jit() || !fp.is_portable() { return None; }
         let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
-        if matches!(typed.shape, crate::sema::infer::Shape::Anon(_)) || typed.has_awaits() {
-            return None;
-        }
+        if matches!(typed.shape, crate::sema::infer::Shape::Anon(_)) || typed.has_awaits() { return None; }
         let (is_sysroot, item_key) = crate::substrate::layer_item_key(cx.outline, *item)?;
         Some((is_sysroot, mode_stencil_key(self.backend.mode(), item_key), fp.0))
     }
@@ -768,4 +779,13 @@ pub(super) fn mode_dict_key(direct_key: u64) -> u64 {
 
 pub(super) fn mode_stencil_key(mode: ImageMode, item_key: u64) -> u64 {
     if mode == ImageMode::Aot { item_key ^ 0xA070_A070_A070_A070 } else { item_key }
+}
+
+/// Compiles `func`, the stencil of reached function `index`, under its symbol name as the trace label when tracing is on.
+fn compile_traced(cx: &mut Context<'_>, reached: &Reached, index: usize, func: haste_codegen::Function, target: &haste_codegen::Target) -> std::result::Result<haste_codegen::Code, haste_codegen::Error> {
+    if !haste_codegen::trace_enabled() {
+        return haste_codegen::compile(func, target);
+    }
+    let label = cx.symbol_text(reached.list[index].0);
+    haste_codegen::with_trace_label(&label, || haste_codegen::compile(func, target))
 }

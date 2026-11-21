@@ -165,6 +165,34 @@ pub enum TargetOpId {
     X64Pcmpgtb256,
     /// `vpmovmskb` of a 32-byte vector: an `I32` of the top bit of each byte.
     X64Pmovmskb256,
+    /// `pclmulqdq` with immediate 0x00: the carry-less product of the low quadwords of both operands.
+    X64ClmulLowLow,
+    /// `pclmulqdq` with immediate 0x01: the carry-less product of the first operand's high quadword and the second's low quadword.
+    X64ClmulHighLow,
+    /// `pclmulqdq` with immediate 0x10: the carry-less product of the first operand's low quadword and the second's high quadword.
+    X64ClmulLowHigh,
+    /// `pclmulqdq` with immediate 0x11: the carry-less product of the high quadwords of both operands.
+    X64ClmulHighHigh,
+    /// `adc` of two `I64`s after an `I8` carry in: the `I64` sum.
+    X64AddCarry,
+    /// `adc` of two `I64`s after an `I8` carry in: the `I8` carry out.
+    X64AddCarryOut,
+    /// `sbb` of two `I64`s after an `I8` borrow in: the `I64` difference.
+    X64SubBorrow,
+    /// `sbb` of two `I64`s after an `I8` borrow in: the `I8` borrow out.
+    X64SubBorrowOut,
+    /// `div` of the 128-bit dividend whose high `I64` is the first operand and low `I64` the second by the third, which must exceed the high half: the `I64` quotient.
+    X64DivWide,
+    /// `div` of the 128-bit dividend whose high `I64` is the first operand and low `I64` the second by the third, which must exceed the high half: the `I64` remainder.
+    X64RemWide,
+    /// `vpsadbw` on two 32-byte vectors: each quadword the sum of the absolute differences of its eight unsigned bytes.
+    X64Psadbw256,
+    /// `vpmaddubsw` on two 32-byte vectors: each word the saturated sum of two products of an unsigned byte of the first operand and a signed byte of the second.
+    X64Pmaddubsw256,
+    /// `vpmaddwd` on two 32-byte vectors: each doubleword the sum of two products of signed words.
+    X64Pmaddwd256,
+    /// `psadbw` on two 16-byte vectors: each quadword the sum of the absolute differences of its eight unsigned bytes.
+    X64Psadbw,
 }
 
 impl IntCC {

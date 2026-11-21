@@ -57,7 +57,7 @@ impl Symbols {
 
     /// The symbol of `name`, adding it when it is new.
     pub fn intern(&self, name: &str) -> Sym {
-        Sym(self.inner.intern(name, |text| Box::leak(text.into())))
+        Sym(self.inner.intern(name, |text, _| Box::leak(text.into())))
     }
 
     /// The text of `sym`.
@@ -280,6 +280,7 @@ pub struct Crate {
     pub edition: String,
     pub collected: Vec<Option<usize>>,
     pub pending: Vec<collect::Pending>,
+    pub enums: FxHashMap<(u32, u32), Box<[Sym]>>,
     pub eager: bool,
     wanted: FxHashMap<u32, rustc_hash::FxHashSet<Sym>>,
     whole: rustc_hash::FxHashSet<u32>,

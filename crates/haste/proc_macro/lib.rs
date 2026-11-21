@@ -3,14 +3,32 @@
 mod lex;
 mod literal;
 
+use std::cell::Cell;
 use std::fmt;
 use std::str::FromStr;
 
 pub use literal::Literal;
 
-/// Whether the running code is a procedural macro, which is always so in the image.
+thread_local! {
+    static EXPANDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is running a procedural macro for the host, as with rustc's bridge.
 pub fn is_available() -> bool {
-    true
+    EXPANDING.with(Cell::get)
+}
+
+struct Expanding(bool);
+
+impl Drop for Expanding {
+    fn drop(&mut self) {
+        EXPANDING.with(|flag| flag.set(self.0));
+    }
+}
+
+fn expanding<T>(run: impl FnOnce() -> T) -> T {
+    let _restore = Expanding(EXPANDING.with(|flag| flag.replace(true)));
+    run()
 }
 
 /// A sequence of token trees.
@@ -497,7 +515,7 @@ fn hand_back(stream: TokenStream, out: *mut usize) {
 pub fn __haste_expand1(run: fn(TokenStream) -> TokenStream, input: *const u8, len: usize, out: *mut usize) {
     // SAFETY: the host passes `len` readable bytes at `input`.
     let input = parsed(unsafe { std::slice::from_raw_parts(input, len) });
-    hand_back(run(input), out);
+    hand_back(expanding(|| run(input)), out);
 }
 
 /// Runs the attribute macro `run` on the attribute text and the item text, and writes the address and length of its output text to `out`.
@@ -505,5 +523,5 @@ pub fn __haste_expand1(run: fn(TokenStream) -> TokenStream, input: *const u8, le
 pub fn __haste_expand2(run: fn(TokenStream, TokenStream) -> TokenStream, attr: *const u8, attr_len: usize, item: *const u8, item_len: usize, out: *mut usize) {
     // SAFETY: the host passes the given number of readable bytes at each address.
     let (attr, item) = unsafe { (parsed(std::slice::from_raw_parts(attr, attr_len)), parsed(std::slice::from_raw_parts(item, item_len))) };
-    hand_back(run(attr, item), out);
+    hand_back(expanding(|| run(attr, item)), out);
 }

@@ -1,16 +1,17 @@
-use super::asm::{Alu, Cond, Group3, Mem, Reg, Shift, Size, Xmm};
+use super::asm::{Alu, Cond, Group3, Mem, Reg, Shift, Size, Vl, Xmm};
 use super::float::{X0, X1, X2};
 use super::int::cond;
-use super::vector::{vec_alu_opcode, vec_prefix};
+use super::ymm::broadcast;
 use super::Emit;
 use crate::alloc::Location;
 use crate::frame::Ext;
-use crate::ir::{Binary, IntCC, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, Type, Value};
+use crate::ir::{Binary, IntCC, Lane, Op, ShuffleMask, TargetOpId, Type, Value};
 
 #[derive(Clone, Copy)]
 enum TargetOpForm {
     Unary,
     Binary,
+    BinaryImm(u8),
     Sha256Rnds2,
 }
 
@@ -33,6 +34,11 @@ const X64_TARGET_OPS: &[TargetOpSpec] = &[
     TargetOpSpec { id: TargetOpId::X64AesDec, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDE] },
     TargetOpSpec { id: TargetOpId::X64AesDecLast, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDF] },
     TargetOpSpec { id: TargetOpId::X64AesImc, form: TargetOpForm::Unary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDB] },
+    TargetOpSpec { id: TargetOpId::X64Psadbw, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0xF6] },
+    TargetOpSpec { id: TargetOpId::X64ClmulLowLow, form: TargetOpForm::BinaryImm(0x00), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
+    TargetOpSpec { id: TargetOpId::X64ClmulHighLow, form: TargetOpForm::BinaryImm(0x01), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
+    TargetOpSpec { id: TargetOpId::X64ClmulLowHigh, form: TargetOpForm::BinaryImm(0x10), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
+    TargetOpSpec { id: TargetOpId::X64ClmulHighHigh, form: TargetOpForm::BinaryImm(0x11), prefix: &[0x66], opcode: &[0x0F, 0x3A, 0x44] },
 ];
 
 impl Emit<'_> {
@@ -41,6 +47,7 @@ impl Emit<'_> {
             return done;
         }
         match op {
+            Op::Shuffle(a, ..) if self.splat_insert(*a, result) => Ok(()),
             Op::Shuffle(a, b, mask) => self.vector_shuffle(*a, *b, mask, result),
             Op::Extract(v, lane) => self.vector_extract(*v, *lane, result),
             Op::Insert(v, x, lane) => self.vector_insert(*v, *x, *lane, result),
@@ -132,6 +139,11 @@ impl Emit<'_> {
         if all_a || all_b {
             let src_val = if all_a { a } else { b };
             let off = if all_a { 0 } else { count };
+            if self.features.avx2 && indices[..c].iter().all(|&i| i == off) {
+                let src = self.fin(src_val, X0);
+                self.asm.vex(Vl::X, broadcast(lane), (dst, Xmm(0)), src);
+                return;
+            }
             if (0..c).all(|l| usize::from(indices[l] - off) == l) {
                 let src = self.fin(src_val, dst);
                 if src != dst {
@@ -253,7 +265,7 @@ impl Emit<'_> {
         }
         let bytes = lane.bytes() as i32;
         let size = Size::of(lane.bytes());
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 48);
+        self.reserve_scratch(48);
         self.fget(X0, a);
         self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
         self.fget(X0, b);
@@ -270,7 +282,7 @@ impl Emit<'_> {
             self.asm.store(size, Mem::new(Reg::Rsp, 32 + l as i32 * bytes), Reg::Rax);
         }
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 32));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 48);
+        self.release_scratch(48);
     }
 
     fn emit_two_vec_imm(&mut self, op: u8, dst: Xmm, stay: Value, src_val: Value, imm: u8) {
@@ -344,7 +356,7 @@ impl Emit<'_> {
         self.clobber_xmm(X0);
         let save_stack = dst == X2 || self.lives(dst, &[mask_v, b]);
         if save_stack {
-            self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+            self.reserve_scratch(16);
             self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
         } else {
             self.asm.movaps(dst, X0);
@@ -361,7 +373,7 @@ impl Emit<'_> {
         self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], X1.0, X2);
         if save_stack {
             self.asm.sse(&[0xF3], &[0x0F, 0x6F], X0.0, Mem::new(Reg::Rsp, 0));
-            self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
+            self.release_scratch(16);
             self.asm.sse(&[0x66], &[0x0F, 0xEB], X0.0, X1);
             self.asm.movaps(dst, X0);
         } else {
@@ -371,7 +383,7 @@ impl Emit<'_> {
     }
 
     fn vector_shuffle_dyn_baseline(&mut self, lane: Lane, count: u8, a: Value, b: Value, mask_v: Value, dst: Xmm) {
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 64);
+        self.reserve_scratch(64);
         self.fget(X0, a);
         self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
         self.fget(X0, b);
@@ -399,7 +411,7 @@ impl Emit<'_> {
         self.asm.alu_imm32(Alu::Cmp, Reg::Rcx, i32::from(count));
         self.asm.jcc(Cond::B, head);
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 48));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 64);
+        self.release_scratch(64);
     }
 
     fn vector_extract(&mut self, v: Value, idx: u8, result: Value) -> Result<(), String> {
@@ -513,122 +525,11 @@ impl Emit<'_> {
     }
 
     fn insert_stack(&mut self, lane: Lane, count: u8, dst: Xmm, idx: u8) {
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+        self.reserve_scratch(16);
         self.asm.sse(&[0xF3], &[0x0F, 0x7F], dst.0, Mem::new(Reg::Rsp, 0));
         self.asm.store(Size::of(lane.bytes()), Mem::new(Reg::Rsp, i32::from(idx) * lane.bytes() as i32), Reg::Rax);
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
-    }
-
-    fn vector_reduce(&mut self, op: ReduceOp, v: Value, result: Value) -> Result<(), String> {
-        let Some((lane, count)) = self.ty(v).vec_shape() else {
-            return Err(format!("non-vector type {:?} in reduce", self.ty(v)));
-        };
-        if op == ReduceOp::Movemask {
-            let dst = self.dst(result);
-            let src = self.fin(v, X0);
-            let full = match lane {
-                Lane::I8 => { self.asm.sse(&[0x66], &[0x0F, 0xD7], dst as u8, src); 16 }
-                Lane::I16 => {
-                    self.asm.movaps(X0, src);
-                    self.asm.sse(&[0x66], &[0x0F, 0x63], X0.0, X0);
-                    self.asm.sse(&[0x66], &[0x0F, 0xD7], dst as u8, X0);
-                    0
-                }
-                Lane::I32 | Lane::F32 => { self.asm.sse(&[], &[0x0F, 0x50], dst as u8, src); 4 }
-                Lane::I64 | Lane::F64 => { self.asm.sse(&[0x66], &[0x0F, 0x50], dst as u8, src); 2 }
-            };
-            if count < full || full == 0 {
-                self.asm.alu_imm32(Alu::And, dst, (1_i32 << count) - 1);
-            }
-            self.put(result, dst);
-            return Ok(());
-        }
-        self.fget(X0, v);
-        if lane == Lane::I64 && matches!(op, ReduceOp::Smin | ReduceOp::Smax | ReduceOp::Umin | ReduceOp::Umax) {
-            let dst = self.dst(result);
-            self.asm.movaps(X1, X0);
-            self.asm.pshift_imm(3, 8, X1, 8);
-            self.asm.movq_out(dst, X0);
-            self.asm.movq_out(Reg::Rcx, X1);
-            self.asm.alu(Alu::Cmp, dst, Reg::Rcx);
-            let cc = match op {
-                ReduceOp::Smin => Cond::G,
-                ReduceOp::Smax => Cond::L,
-                ReduceOp::Umin => Cond::A,
-                _ => Cond::B,
-            };
-            self.asm.cmov(cc, dst, Reg::Rcx);
-            self.put(result, dst);
-            return Ok(());
-        }
-        let mut active = count;
-        while active > 1 {
-            let half = active / 2;
-            let shift_bytes = half * lane.bytes() as u8;
-            self.asm.movaps(X1, X0);
-            self.asm.pshift_imm(3, 8, X1, shift_bytes);
-            self.reduce_step(op, lane)?;
-            active = half;
-        }
-        if lane.is_float() {
-            let dst = self.fdst(result);
-            if dst != X0 { self.asm.movaps(dst, X0); }
-            self.fput(result, dst);
-        } else {
-            let dst = self.dst(result);
-            match lane {
-                Lane::I8 | Lane::I16 => {
-                    self.asm.movd_out(dst, X0);
-                    self.asm.load(Size::of(lane.bytes()), dst, dst);
-                }
-                Lane::I32 => self.asm.movd_out(dst, X0),
-                Lane::I64 => self.asm.movq_out(dst, X0),
-                _ => {}
-            }
-            self.put(result, dst);
-        }
-        Ok(())
-    }
-
-    fn reduce_step(&mut self, op: ReduceOp, lane: Lane) -> Result<(), String> {
-        match op {
-            ReduceOp::Add if lane.is_float() => self.asm.sse(vec_prefix(lane), &[0x0F, 0x58], X0.0, X1),
-            ReduceOp::Add => {
-                let opc = vec_alu_opcode(Binary::Iadd, lane).ok_or_else(|| format!("reduce add {lane:?}"))?;
-                self.asm.sse(&[0x66], &[0x0F, opc], X0.0, X1);
-            }
-            ReduceOp::And => self.asm.sse(&[0x66], &[0x0F, 0xDB], X0.0, X1),
-            ReduceOp::Or => self.asm.sse(&[0x66], &[0x0F, 0xEB], X0.0, X1),
-            ReduceOp::Xor => self.asm.sse(&[0x66], &[0x0F, 0xEF], X0.0, X1),
-            ReduceOp::Fmin | ReduceOp::Fmax => {
-                let bin = if op == ReduceOp::Fmin { Binary::Fmin } else { Binary::Fmax };
-                self.fminmax_regs(bin, lane, X2);
-                self.asm.movaps(X0, X2);
-            }
-            ReduceOp::Smin | ReduceOp::Smax | ReduceOp::Umin | ReduceOp::Umax => {
-                let (bin, cc) = match op {
-                    ReduceOp::Smin => (Binary::Smin, IntCC::SignedLessThan),
-                    ReduceOp::Smax => (Binary::Smax, IntCC::SignedGreaterThan),
-                    ReduceOp::Umin => (Binary::Umin, IntCC::UnsignedLessThan),
-                    _ => (Binary::Umax, IntCC::UnsignedGreaterThan),
-                };
-                if let Some(bytes) = self.iminmax_opc(bin, lane) {
-                    self.asm.sse(&[0x66], bytes, X0.0, X1);
-                } else {
-                    self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
-                    self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
-                    self.asm.sse(&[0xF3], &[0x0F, 0x7F], X1.0, Mem::new(Reg::Rsp, 16));
-                    self.emit_icmp_regs(cc, lane, X0, X1, X2);
-                    self.asm.sse(&[0xF3], &[0x0F, 0x6F], X0.0, Mem::new(Reg::Rsp, 0));
-                    self.asm.sse(&[0xF3], &[0x0F, 0x6F], X1.0, Mem::new(Reg::Rsp, 16));
-                    self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
-                    self.blend_regs(X2, X0, X1, X0);
-                }
-            }
-            ReduceOp::Movemask => {}
-        }
-        Ok(())
+        self.release_scratch(16);
     }
 
     fn cached_fspill(&self, value: Value) -> Option<Xmm> {
@@ -640,7 +541,7 @@ impl Emit<'_> {
         self.last_fspill.and_then(|(d, r, t)| (d == disp && t == ty).then_some(r))
     }
 
-    fn emit_target_binary(&mut self, spec: &TargetOpSpec, a: Value, b: Value, k: Option<Value>, result: Value) {
+    fn emit_target_binary(&mut self, spec: &TargetOpSpec, (a, b, k): (Value, Value, Option<Value>), imm: Option<u8>, result: Value) {
         let dst = if k.is_some() { self.xmm_of(result).unwrap_or(X2) } else { self.fdst(result) };
         let mut got_k = k.is_none();
         let mut got_a = false;
@@ -662,7 +563,10 @@ impl Emit<'_> {
         }
         if let Some(kv) = k && !got_k { self.fget(X0, kv); }
         if !got_a { self.fget(dst, a); }
-        self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b);
+        match imm {
+            Some(imm) => self.asm.sse_imm(spec.prefix, spec.opcode, dst.0, src_b, imm),
+            None => self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b),
+        }
         self.clobber_xmm(dst);
         self.fput(result, dst);
     }
@@ -678,20 +582,21 @@ impl Emit<'_> {
                 self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
-            TargetOpForm::Binary => {
+            TargetOpForm::Binary | TargetOpForm::BinaryImm(_) => {
                 let [x, y] = *args else { return Err(format!("{id:?} expects 2 args")); };
-                self.emit_target_binary(spec, x, y, None, result);
+                let imm = if let TargetOpForm::BinaryImm(imm) = spec.form { Some(imm) } else { None };
+                self.emit_target_binary(spec, (x, y, None), imm, result);
             }
             TargetOpForm::Sha256Rnds2 => {
                 let [a, b, k] = *args else { return Err(format!("{id:?} expects 3 args")); };
-                self.emit_target_binary(spec, a, b, Some(k), result);
+                self.emit_target_binary(spec, (a, b, Some(k)), None, result);
             }
         }
         Ok(())
     }
 
     fn spill_vec_pair(&mut self, ty: Type, x: Value, y: Value) {
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
+        self.reserve_scratch(32);
         self.fget(X0, x);
         self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
         self.fget(X0, y);
@@ -741,7 +646,7 @@ impl Emit<'_> {
             self.asm.store(size, sx, Reg::Rax);
         }
         self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+        self.release_scratch(32);
     }
 
     pub(super) fn scalarize_int_clz(&mut self, lane: Lane, count: u8, x: Value, dst: Xmm) {
@@ -749,7 +654,7 @@ impl Emit<'_> {
         let stride = lane.bytes() as i32;
         let size = Size::of(lane.bytes());
         self.fget(X0, x);
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+        self.reserve_scratch(16);
         self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
         for i in 0..i32::from(count) {
             let slot = Mem::new(Reg::Rsp, i * stride);
@@ -763,7 +668,7 @@ impl Emit<'_> {
             self.asm.store(size, slot, Reg::Rax);
         }
         self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
+        self.release_scratch(16);
     }
 
     pub(super) fn scalarize_int_icmp(&mut self, cc: IntCC, lane: Lane, count: u8, x: Value, y: Value, dst: Xmm) {
@@ -782,6 +687,6 @@ impl Emit<'_> {
             self.asm.store(Size::Q, sx, Reg::Rax);
         }
         self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+        self.release_scratch(32);
     }
 }

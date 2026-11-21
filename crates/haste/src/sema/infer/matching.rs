@@ -74,12 +74,12 @@ impl Infer<'_, '_> {
         Ok((found_arms, all_diverge))
     }
 
-    fn next_arm_hint(&mut self, hint: Option<Ty>, found: Ty) -> Result<Ty> {
+    pub(super) fn next_arm_hint(&mut self, hint: Option<Ty>, found: Ty) -> Result<Ty> {
         let Some(prev) = hint else { return Ok(found) };
         Ok(self.branch_target(prev, found)?.or_else(|| self.probe(|infer| infer.join(prev, found).ok())).unwrap_or(prev))
     }
 
-    fn merge_arms(&mut self, found_arms: &[(ExprId, Ty)], expected: Option<Ty>) -> Result<Ty> {
+    pub(super) fn merge_arms(&mut self, found_arms: &[(ExprId, Ty)], expected: Option<Ty>) -> Result<Ty> {
         let mut target = None;
         for &(_, found) in found_arms {
             if !self.is_never(found) {

@@ -2,12 +2,13 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use haste_codegen::{Arch, Format, Os, RelocKind, RuntimeSymbol, Target, patch_reloc};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::host::{HostSymbol, MathSymbol};
 
+mod dwarf;
 mod elf;
 mod macho;
 mod shims;
@@ -61,6 +62,9 @@ pub(crate) struct Executable {
     pub(super) relocs: Vec<CodeReloc>,
     pub(super) pointers: Vec<PtrReloc>,
     pub(super) symbols: Vec<(u32, String)>,
+    pub(super) thread_slots: u32,
+    pub(super) lines: Vec<(u32, u64)>,
+    pub(super) sources: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +89,9 @@ impl Executable {
             relocs: Vec::new(),
             pointers: Vec::new(),
             symbols: Vec::new(),
+            thread_slots: 0,
+            lines: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
@@ -95,16 +102,7 @@ impl Executable {
     }
 
     fn symbol_names(&self, prefix: &str, strtab: &mut Vec<u8>) -> Vec<u32> {
-        self.symbols
-            .iter()
-            .map(|(_, name)| {
-                let at = strtab.len() as u32;
-                strtab.extend_from_slice(prefix.as_bytes());
-                strtab.extend_from_slice(name.as_bytes());
-                strtab.push(0);
-                at
-            })
-            .collect()
+        self.symbols.iter().map(|(_, name)| push_name(strtab, &[prefix, name])).collect()
     }
 
     /// Appends 16-byte-aligned machine code to `.text` and returns its section offset.
@@ -113,12 +111,19 @@ impl Executable {
     }
 
     /// Appends a function to `.text` at `align` bytes, shifted until the fewest of its `loops` cross a 4 KiB address, and returns its section offset.
-    pub(crate) fn function(&mut self, bytes: &[u8], align: u32, loops: &[Range<u32>]) -> u32 {
+    pub(crate) fn function(&mut self, bytes: &[u8], align: u32, loops: &[Range<u32>], lines: &[(u32, u64)]) -> u32 {
         let base = (self.text.len() as u32).next_multiple_of(align);
         let split = |at: u32| loops.iter().filter(|each| each.end > each.start && (at + each.start) / LOOP_PAGE != (at + each.end - 1) / LOOP_PAGE).count();
         let at = (0..=LOOP_SHIFT / align).map(|step| base + step * align).min_by_key(|&at| split(at)).unwrap_or(base);
         self.text.resize(at as usize, 0);
-        append_aligned(&mut self.text, bytes, align)
+        let placed = append_aligned(&mut self.text, bytes, align);
+        self.lines.extend(lines.iter().map(|&(offset, place)| (placed + offset, place)));
+        placed
+    }
+
+    /// Names the source files whose `Source::place` keys the debug line table resolves.
+    pub(crate) fn sources(&mut self, paths: Vec<std::path::PathBuf>) {
+        self.sources = paths;
     }
 
     /// Appends `align`-byte-aligned constant bytes to `.rodata` and returns its section offset.
@@ -236,17 +241,21 @@ impl Buf {
     }
 }
 
-fn classify_math(math: MathSymbol) -> Result<&'static str> {
+/// The libm function that each math intrinsic calls.
+const MATH: &[(MathSymbol, &str)] = {
     use MathSymbol::*;
-    const TABLE: &[(MathSymbol, &str)] = &[
+    &[
         (Sinf32, "sinf"), (Sinf64, "sin"), (Cosf32, "cosf"), (Cosf64, "cos"),
         (Expf32, "expf"), (Expf64, "exp"), (Exp2f32, "exp2f"), (Exp2f64, "exp2"),
         (Logf32, "logf"), (Logf64, "log"), (Log2f32, "log2f"), (Log2f64, "log2"),
         (Log10f32, "log10f"), (Log10f64, "log10"), (Powf32, "powf"), (Powf64, "pow"),
         (Fmaf32, "fmaf"), (Fmuladdf32, "fmaf"), (Fmaf64, "fma"), (Fmuladdf64, "fma"),
         (RoundTiesEvenF32, "rintf"), (RoundTiesEvenF64, "rint"), (Fmodf32, "fmodf"), (Fmodf64, "fmod"),
-    ];
-    TABLE.iter().find(|&&(k, _)| k == math).map(|&(_, n)| n).with_context(|| format!("{} requires a self-contained powi shim", math.link_name()))
+    ]
+};
+
+fn classify_math(math: MathSymbol) -> Result<&'static str> {
+    MATH.iter().find(|&&(k, _)| k == math).map(|&(_, n)| n).with_context(|| format!("{} requires a self-contained powi shim", math.link_name()))
 }
 
 fn dynamic_lib(name: &str) -> Option<&'static str> {
@@ -258,7 +267,7 @@ fn dynamic_lib(name: &str) -> Option<&'static str> {
         "cbrt", "cbrtf", "cosh", "coshf", "erf", "erff", "erfc", "erfcf", "expm1", "expm1f", "fdim", "fdimf", "hypot", "hypotf",
         "ldexp", "ldexpf", "lgamma_r", "lgammaf_r", "log1p", "log1pf", "nextafter", "nextafterf", "sinh", "sinhf", "tan", "tanf", "tanh", "tanhf", "tgamma", "tgammaf",
     ];
-    LIBM.contains(&name).then_some("libm.so.6")
+    (LIBM.contains(&name) || MATH.iter().any(|&(_, math)| math == name)).then_some("libm.so.6")
 }
 
 fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
@@ -292,8 +301,8 @@ fn classify_runtime(rt: RuntimeSymbol) -> Result<Binding<'static>> {
         Memmove => Binding::Import("memmove", None),
         Memset => Binding::Import("memset", None),
         Memcmp => Binding::Import("memcmp", None),
-        Malloc => Binding::Import("malloc", None),
-        Free => Binding::Import("free", None),
+        Malloc => Binding::Shim(Shim::FrameAlloc),
+        Free => Binding::Shim(Shim::FrameFree),
         other => Binding::Shim(Shim::Wide(WideShim::Runtime(other))),
     })
 }
@@ -306,6 +315,10 @@ pub(super) struct SectionAddrs {
     pub(super) bss: u64,
     pub(super) dso_handle: u64,
     pub(super) thread_key: u64,
+    /// How far below the thread pointer the executable's static TLS block starts, on x86-64 ELF.
+    pub(super) thread_tls: u64,
+    /// How far below the thread pointer the coroutine frame cache starts, on x86-64 ELF.
+    pub(super) frame_tls: u64,
 }
 
 fn classify<'a>(sym: &'a Symbol, addrs: SectionAddrs) -> Result<Binding<'a>> {
@@ -434,6 +447,14 @@ impl<'a> Plan<'a> {
     }
 }
 
+/// Appends the concatenation of `parts` and a NUL to `strtab` and returns where it starts.
+pub(super) fn push_name(strtab: &mut Vec<u8>, parts: &[&str]) -> u32 {
+    let at = strtab.len() as u32;
+    parts.iter().for_each(|part| strtab.extend_from_slice(part.as_bytes()));
+    strtab.push(0);
+    at
+}
+
 fn resolve_binding(sym: &Symbol, addrs: SectionAddrs, base_va: u64, shim_offs: &[usize], plan: &Plan<'_>, import_va: &dyn Fn(&str) -> Result<u64>) -> Result<(bool, u64)> {
     Ok(match classify(sym, addrs)? {
         Binding::Static(val) => (false, val),
@@ -558,7 +579,7 @@ fn reloc_span(kind: RelocKind, offset: u32) -> (usize, usize) {
     let off = offset as usize;
     match kind {
         RelocKind::X64RipRel32 => (off.saturating_sub(3), off + 4),
-        RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 => (off, off + 4),
+        RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 | RelocKind::ThreadOff32 => (off, off + 4),
         RelocKind::Abs64 | RelocKind::Arm64AdrpAdd => (off, off + 8),
         RelocKind::Arm64Movw64 => (off, off + 16),
     }
@@ -588,6 +609,18 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             shims::patch_arm64_pie(&mut out[at..at + 16], pc_va, load_got, target_va)?;
             continue;
         }
+        if reloc.kind == RelocKind::ThreadOff32 {
+            ensure!(addrs.frame_tls != 0, "ThreadOff32 without a static TLS block");
+            let addend = i64::from(i32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]));
+            let word = match reloc.symbol {
+                Symbol::Runtime(_) => -(addrs.frame_tls as i64),
+                Symbol::Word(slot) => slot as i64 * 8 - addrs.thread_tls as i64,
+                ref other => bail!("ThreadOff32 to {other:?}"),
+            };
+            let off = i32::try_from(addend + word).context("ThreadOff32 offset out of range")?;
+            out[at..at + 4].copy_from_slice(&off.to_le_bytes());
+            continue;
+        }
         if reloc.kind == RelocKind::X64RipRel32 {
             if let Symbol::Word(val) = reloc.symbol {
                 let val32 = u32::try_from(val).context("X64RipRel32 word exceeds u32")?;
@@ -606,6 +639,20 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             out[at..at + 4].copy_from_slice(&delta.to_le_bytes());
             continue;
         }
+        if reloc.kind == RelocKind::Abs64 && at >= 2 && out[at - 2] & 0xF8 == 0x48 && out[at - 1] & 0xF8 == 0xB8 {
+            let (load_got, slot) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, got_vas)?;
+            if load_got {
+                let next_ip = text_va + u64::from(reloc.offset) + 5;
+                let delta = i32::try_from(slot as i64 - next_ip as i64).context("Abs64 import GOT slot out of range")?;
+                let reg = out[at - 1] & 7;
+                out[at - 2] = 0x48 | ((out[at - 2] & 1) << 2);
+                out[at - 1] = 0x8B;
+                out[at] = 0x05 | (reg << 3);
+                out[at + 1..at + 5].copy_from_slice(&delta.to_le_bytes());
+                out[at + 5..at + 8].copy_from_slice(&[0x0F, 0x1F, 0x00]);
+                continue;
+            }
+        }
         let (_, value) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, stub_vas)?;
         match reloc.kind {
             RelocKind::Arm64Call26 => {
@@ -617,7 +664,8 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             }
             RelocKind::PcRel32 => {
                 let next_ip = text_va + u64::from(reloc.offset) + 4;
-                let delta = i32::try_from(value as i64 - next_ip as i64).context("PcRel32 target out of range")?;
+                let addend = i64::from(i32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]));
+                let delta = i32::try_from(value as i64 + addend - next_ip as i64).context("PcRel32 target out of range")?;
                 out[at..at + 4].copy_from_slice(&delta.to_le_bytes());
             }
             kind => patch_reloc(kind, value, &mut out[at..])?,

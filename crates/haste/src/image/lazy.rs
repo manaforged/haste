@@ -13,13 +13,22 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 use crate::outline::Outline;
 use crate::sema::evaluate::Evaluate;
-use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
+use crate::sema::reach::{Instance, Reached, calls, infer_declared, infer_quiet, main_roots};
 use crate::sema::{Answer, Cache, Context, Edited};
 
 use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, host_symbol, stub, wait};
 
 /// What answers what a pass of inference asked for, and says what it added.
 pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<Answer>;
+
+/// What reads the watched files again after they change: the `(crate, file)` slots whose function bodies changed, or why the change needs a restart.
+pub type Reread<'r> = &'r mut dyn FnMut(&mut Compilation) -> Result<Vec<(u32, u32)>, String>;
+
+/// Why answering the children paused: a child asked for a function whose answer needs what inference asked for, or a watched file changed.
+enum Pause {
+    Asked(usize, usize),
+    Edited,
+}
 
 /// Why a function has no code yet: inference asked for names or macro output not loaded, or it did not compile.
 enum Stop {
@@ -53,9 +62,16 @@ pub trait Driver {
     fn start(&mut self, demand: &mut Jit) -> Result<()>;
     /// Takes the end of child `id`.
     fn ended(&mut self, id: usize, ended: Ended) -> Result<()>;
+    /// Reads the watched files again after a change, and gives the `(crate, file)` slots whose function bodies changed, or why the change needs a restart.
+    fn edited(&mut self, _: &mut Compilation) -> Result<Vec<(u32, u32)>, String> {
+        Ok(Vec::new())
+    }
 }
 
-/// The functions declared so far, the inference store whose types their instances name, the image that holds their stubs and code, and the children that run it.
+/// The most functions that one ask compiles ahead of their first call.
+const AHEAD_FUNCTIONS: usize = 4096;
+
+/// The functions declared so far, the inference store whose types their instances name, the image that holds their stubs and code, the children that run it, whether an ask compiles the functions it reaches ahead, the functions that compiling ahead left to their first call, and the watched source files with whether they changed.
 pub struct Jit {
     reached: Reached,
     store: Cache,
@@ -66,6 +82,10 @@ pub struct Jit {
     pending: std::collections::VecDeque<(usize, usize)>,
     strict: bool,
     expanded: HashSet<usize>,
+    ahead: bool,
+    tried: HashSet<usize>,
+    watcher: Option<super::watch::Watcher>,
+    edited: bool,
 }
 
 /// A binary kept between runs: its `main`, and each function it called, compiled on that first call.
@@ -86,7 +106,20 @@ impl Program {
 
     /// Runs `main` with `args` as argv in a forked child, compiling each function it calls that has no code yet, and returns its exit status.
     pub fn run(&mut self, compilation: &mut Compilation, args: &[String]) -> Result<i32> {
-        let mut run = Run { entry: self.entry, args, status: None };
+        self.run_with(compilation, args, None)
+    }
+
+    /// Runs `main` like `run` while it watches the files at `paths`, and on each change points the functions whose bodies `reread` finds changed back at their stubs, so the running child compiles each again on its next call.
+    pub fn run_watched(&mut self, compilation: &mut Compilation, args: &[String], (paths, reread): (Vec<std::path::PathBuf>, Reread<'_>)) -> Result<i32> {
+        self.jit.watcher = Some(super::watch::Watcher::new(paths)?);
+        let status = self.run_with(compilation, args, Some(reread));
+        self.jit.watcher = None;
+        status
+    }
+
+    /// Runs `main` with `args` as argv, asking `reread` what changed when a watched file changes.
+    fn run_with(&mut self, compilation: &mut Compilation, args: &[String], reread: Option<Reread<'_>>) -> Result<i32> {
+        let mut run = Run { entry: self.entry, args, reread, status: None };
         let served = serve(compilation, &crate::macros::load, &mut self.jit, &mut run);
         compilation.settle();
         served?;
@@ -117,14 +150,15 @@ pub fn run_on_demand(compilation: &mut Compilation, (store, main): (Cache, ItemR
     status
 }
 
-/// One run of a program's `main`, and its exit status once it ends.
-struct Run<'a> {
+/// One run of a program's `main`, what reads its watched files again when it is watched, and its exit status once it ends.
+struct Run<'a, 'r> {
     entry: (usize, usize),
     args: &'a [String],
+    reread: Option<Reread<'r>>,
     status: Option<i32>,
 }
 
-impl Driver for Run<'_> {
+impl Driver for Run<'_, '_> {
     fn start(&mut self, demand: &mut Jit) -> Result<()> {
         if self.status.is_none() && demand.children.is_empty() {
             let (entry, args) = (self.entry, self.args);
@@ -139,6 +173,10 @@ impl Driver for Run<'_> {
         }
         self.status = Some(ended.status);
         Ok(())
+    }
+
+    fn edited(&mut self, compilation: &mut Compilation) -> Result<Vec<(u32, u32)>, String> {
+        self.reread.as_mut().map_or(Ok(Vec::new()), |reread| reread(compilation))
     }
 }
 
@@ -238,7 +276,13 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
         let mut pending = None;
         loop {
             let asked = match demand.pump(&mut cx, driver, pending.take()) {
-                Ok(Some(asked)) => asked,
+                Ok(Some(Pause::Asked(id, index))) => (id, index),
+                Ok(Some(Pause::Edited)) => {
+                    let (store, _) = cx.release();
+                    let store = demand.reload(compilation, driver, store);
+                    cx = Context::new(&compilation.outline, &compilation.names, store);
+                    continue;
+                }
                 done => break 'run done.map(drop),
             };
             let (kept, answer) = crate::macros::answer(compilation, ask, cx.release());
@@ -258,7 +302,9 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
 
 impl Jit {
     pub fn new(store: Cache) -> Result<Jit> {
-        Self::create(store, (SHARED_BYTES, STATE_BYTES, CODE_BYTES, TABLE_SLOTS))
+        let mut jit = Self::create(store, (SHARED_BYTES, STATE_BYTES, CODE_BYTES, TABLE_SLOTS))?;
+        jit.ahead = true;
+        Ok(jit)
     }
 
     fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
@@ -267,7 +313,21 @@ impl Jit {
         image.backend = super::ImageBackend::LazyJit { fast: false };
         image.stubs.reserve(table_slots * stub::STUB_BYTES)?;
         image.pass.memory.reserve(code_bytes)?;
-        Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), pending: std::collections::VecDeque::new(), strict: true, expanded: HashSet::default() })
+        Ok(Jit {
+            reached,
+            store,
+            image,
+            stubs: Vec::new(),
+            compiled: HashSet::default(),
+            children: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            strict: true,
+            expanded: HashSet::default(),
+            ahead: false,
+            tried: HashSet::default(),
+            watcher: None,
+            edited: false,
+        })
     }
 
     fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
@@ -282,6 +342,29 @@ impl Jit {
         }
         self.image.link();
         self.expanded.clear();
+        self.tried.clear();
+    }
+
+    /// Waits for the watched files to settle, then takes back the code of the functions whose bodies `driver` finds changed, so the child asks for each again on its next call and gets it compiled from the new text; keeps the old code when the edit needs a restart. Takes and gives back the inference store.
+    fn reload(&mut self, compilation: &mut Compilation, driver: &mut dyn Driver, store: Cache) -> Cache {
+        if let Some(watcher) = &mut self.watcher
+            && let Err(error) = watcher.settle()
+        {
+            eprintln!("hot reload: stopped watching: {error:#}");
+            self.watcher = None;
+        }
+        let started = std::time::Instant::now();
+        self.store = store;
+        match driver.edited(compilation) {
+            Ok(stale) if stale.is_empty() => {}
+            Ok(stale) => {
+                let had = self.compiled.len();
+                self.forget(&compilation.outline, Edited::Files(&stale));
+                eprintln!("hot reload: {} functions in {:.1} ms", had - self.compiled.len(), started.elapsed().as_secs_f64() * 1e3);
+            }
+            Err(why) => eprintln!("hot reload: the edit needs a restart, the old code keeps running: {why}"),
+        }
+        std::mem::take(&mut self.store)
     }
 
     /// The index of `instance`, whose slot holds its stub when it is new.
@@ -339,8 +422,8 @@ impl Jit {
         }
     }
 
-    /// The children with something to read: `(id, true)` for an ask, `(id, false)` for output.
-    fn ready(&self) -> Result<Vec<(usize, bool)>> {
+    /// The children with something to read: `(id, true)` for an ask, `(id, false)` for output; notes when a watched file changed.
+    fn ready(&mut self) -> Result<Vec<(usize, bool)>> {
         let mut polled = Vec::new();
         let mut fds = Vec::new();
         for (id, child) in self.children.iter().enumerate().filter_map(|(id, child)| Some((id, child.as_ref()?))) {
@@ -351,6 +434,9 @@ impl Jit {
                 }
             }
         }
+        if let Some(watcher) = &self.watcher {
+            fds.push(libc::pollfd { fd: watcher.fd(), events: libc::POLLIN, revents: 0 });
+        }
         // SAFETY: fds is a live array of fds.len() pollfd entries.
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
             let error = std::io::Error::last_os_error();
@@ -359,6 +445,7 @@ impl Jit {
             }
             bail!("poll failed: {error}");
         }
+        self.edited |= self.watcher.is_some() && fds.last().is_some_and(|fd| fd.revents != 0);
         Ok(polled.into_iter().zip(fds).filter(|(_, fd)| fd.revents != 0).map(|(ready, _)| ready).collect())
     }
 
@@ -406,8 +493,8 @@ impl Jit {
         ended
     }
 
-    /// Answers with `cx` the asks of the children `driver` forked, the ask `pending` first, until no child is left or an answer needs what inference asked for: then returns that child and the function it asked for.
-    fn pump(&mut self, cx: &mut Context<'_>, driver: &mut dyn Driver, mut pending: Option<(usize, usize)>) -> Result<Option<(usize, usize)>> {
+    /// Answers with `cx` the asks of the children `driver` forked, the ask `pending` first, until no child is left, an answer needs what inference asked for, which returns that child and the function it asked for, or a watched file changed.
+    fn pump(&mut self, cx: &mut Context<'_>, driver: &mut dyn Driver, mut pending: Option<(usize, usize)>) -> Result<Option<Pause>> {
         while self.children.iter().any(Option::is_some) {
             let asked = match pending.take() {
                 Some((id, index)) if self.respond(cx, id, index) => {
@@ -417,13 +504,16 @@ impl Jit {
                 Some(asked) => Some(asked),
                 None => self.round(cx)?,
             };
-            if asked.is_some() {
-                return Ok(asked);
+            if let Some((id, index)) = asked {
+                return Ok(Some(Pause::Asked(id, index)));
             }
             for (id, ended) in self.reap() {
                 driver.ended(id, ended)?;
             }
             driver.start(self)?;
+            if std::mem::take(&mut self.edited) {
+                return Ok(Some(Pause::Edited));
+            }
         }
         Ok(None)
     }
@@ -476,9 +566,82 @@ impl Jit {
         if matches!(answer, Err(Stop::Asked)) {
             journal.iter().for_each(|&at| self.reached.forget(at));
             self.expanded.clear();
+            self.tried.clear();
             self.image.bodies.clear_transient();
+        } else if answer.is_ok() {
+            self.compile_ahead(cx, index);
         }
         answer
+    }
+
+    /// Compiles ahead, on every core, the functions without code that function `index` reaches through calls, up to `AHEAD_FUNCTIONS` of them, but those a prepped library binds; one whose inference or compile asks for more, defers, or fails keeps its stub, so it compiles, or fails, on its first call as it would have.
+    fn compile_ahead(&mut self, cx: &mut Context<'_>, index: usize) {
+        if !self.ahead {
+            return;
+        }
+        let members = self.frontier(cx, index);
+        let (foreign, mut work): (Vec<usize>, Vec<usize>) = members.into_iter().filter(|&at| self.callees_typed(cx, at)).partition(|&at| cx.foreign(self.reached.list[at].0.0));
+        for at in foreign {
+            match host_symbol(cx, self.reached.list[at].0.0) {
+                Ok(code) => {
+                    self.publish(at, code);
+                }
+                Err(_) => {
+                    self.tried.insert(at);
+                }
+            }
+        }
+        work.retain(|&at| crate::prep::bind(cx, &self.reached, at).is_none());
+        if work.is_empty() {
+            return;
+        }
+        let compiled = self.image.compile_batch(cx, &self.reached, &work);
+        for &(at, code) in &compiled {
+            super::perf::note(cx, &self.reached, (at, code), super::perf::Origin::Haste);
+            self.publish(at, code);
+        }
+        self.tried.extend(work.into_iter().filter(|at| !self.compiled.contains(at)));
+    }
+
+    /// The inferred functions without code that function `index` reaches through calls, level by level until `AHEAD_FUNCTIONS` or no new one, each declared and inferred on every core; one whose inference asked for more or failed is left to its first call, with what it calls.
+    fn frontier(&mut self, cx: &mut Context<'_>, index: usize) -> Vec<usize> {
+        let mut seen = HashSet::default();
+        seen.insert(index);
+        let mut members = Vec::new();
+        let mut level = self.fresh_callees(cx, index, &mut seen);
+        while !level.is_empty() && members.len() < AHEAD_FUNCTIONS {
+            level.truncate(AHEAD_FUNCTIONS - members.len());
+            let inferred = infer_quiet(cx, &mut self.reached, &level);
+            self.image.bind_foreign_statics(cx, &self.reached, &inferred);
+            let (typed, left): (Vec<usize>, Vec<usize>) = level.into_iter().partition(|&at| self.reached.list[at].1.is_ok());
+            self.tried.extend(left);
+            level = typed;
+            let mut next = Vec::new();
+            for &at in &level {
+                next.extend(self.fresh_callees(cx, at, &mut seen));
+            }
+            members.append(&mut level);
+            level = next;
+        }
+        members
+    }
+
+    /// The functions that function `at` calls, declared, that have no code, were not left to their first call, and are not in `seen`, which takes them.
+    fn fresh_callees(&mut self, cx: &Context<'_>, at: usize, seen: &mut HashSet<usize>) -> Vec<usize> {
+        let callees: Vec<Instance> = calls(cx, &self.reached.list[at].1).collect();
+        let mut fresh = Vec::new();
+        for callee in callees {
+            let callee = self.declare(callee);
+            if !self.compiled.contains(&callee) && !self.tried.contains(&callee) && seen.insert(callee) {
+                fresh.push(callee);
+            }
+        }
+        fresh
+    }
+
+    /// Whether every function that function `at` calls is inferred, so lowering it reaches no function without a body.
+    fn callees_typed(&self, cx: &Context<'_>, at: usize) -> bool {
+        calls(cx, &self.reached.list[at].1).all(|callee| self.reached.index.get(&callee).is_some_and(|&callee| !self.reached.is_untyped(callee)))
     }
 
     /// Infers, lowers and encodes function `index` unless it has code, and returns its code.
@@ -503,7 +666,7 @@ impl Jit {
                 Err(error) => {
                     let wanted = self.image.take_wanted();
                     if wanted.is_empty() {
-                        return Err(Stop::Failed(self.failure(cx, index, &callees, &error), item));
+                        return Err(self.stop(cx, self.failure(cx, index, &callees, &error), item));
                     }
                     callees.extend(self.reach(cx, wanted, journal)?);
                 }

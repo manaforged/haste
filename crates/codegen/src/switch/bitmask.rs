@@ -1,6 +1,6 @@
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::emit::{can_br_table, emit_node, push_node};
+use super::emit::{Cache, can_br_table, emit_node, push_node};
 use super::{Arm, Edge, Info, Range, Run, intersect_ranges, match_test, range_fits, range_of_test, same_edge};
 
 #[derive(Clone, Copy)]
@@ -264,6 +264,28 @@ pub(super) fn emit_table_word(
     (diff, in_range, word)
 }
 
+fn bitmask_layout(plan: BitmaskPlan) -> TableLayout {
+    TableLayout {
+        base: plan.base,
+        span: plan.span,
+        words: plan.words,
+        two_words: plan.two_words,
+        signed: plan.signed,
+        per_word: 64,
+        bounds_elide_max: if plan.two_words { 127 } else { 63 },
+    }
+}
+
+fn emit_bit(func: &mut Function, (word, diff): (Value, Value), insts: &mut Vec<Inst>) -> Value {
+    let shifted = func.value(Type::I64);
+    insts.push(func.add(Op::Binary(Binary::Ushr, word, diff), Some(shifted)));
+    let (one, bit, bit8) = (func.value(Type::I64), func.value(Type::I64), func.value(Type::I8));
+    insts.push(func.add(Op::Const(1), Some(one)));
+    insts.push(func.add(Op::Binary(Binary::Band, shifted, one), Some(bit)));
+    insts.push(func.add(Op::Convert(Convert::Ireduce, bit), Some(bit8)));
+    bit8
+}
+
 pub(super) fn emit_bitmask_test(
     func: &mut Function,
     (v, ty): (Value, Type),
@@ -272,30 +294,34 @@ pub(super) fn emit_bitmask_test(
     need_bounds: bool,
     insts: &mut Vec<Inst>,
 ) -> Value {
-    let bounds_elide_max = if plan.two_words { 127 } else { 63 };
-    let layout = TableLayout {
-        base: plan.base,
-        span: plan.span,
-        words: plan.words,
-        two_words: plan.two_words,
-        signed: plan.signed,
-        per_word: 64,
-        bounds_elide_max,
+    let (diff, in_range, word) = emit_table_word(func, (v, ty), bitmask_layout(plan), known_u_max, need_bounds, insts);
+    let bit8 = emit_bit(func, (word, diff), insts);
+    let Some(in_range) = in_range else { return bit8 };
+    let cond = func.value(Type::I8);
+    insts.push(func.add(Op::Binary(Binary::Band, in_range, bit8), Some(cond)));
+    cond
+}
+
+fn emit_bitmask_branch(
+    func: &mut Function,
+    (v, ty): (Value, Type),
+    (plan, known_u_max): (BitmaskPlan, u64),
+    (hit, miss): ((Block, Vec<Value>), (Block, Vec<Value>)),
+) -> Vec<Inst> {
+    let mut insts = Vec::with_capacity(14);
+    let (diff, in_range, word) = emit_table_word(func, (v, ty), bitmask_layout(plan), known_u_max, true, &mut insts);
+    let Some(in_range) = in_range else {
+        let bit8 = emit_bit(func, (word, diff), &mut insts);
+        insts.push(func.add(Op::Brif(bit8, hit.0, hit.1, miss.0, miss.1), None));
+        return insts;
     };
-    let (diff, in_range, word) = emit_table_word(func, (v, ty), layout, known_u_max, need_bounds, insts);
-    let shifted = func.value(Type::I64);
-    insts.push(func.add(Op::Binary(Binary::Ushr, word, diff), Some(shifted)));
-    let (one, bit, bit8) = (func.value(Type::I64), func.value(Type::I64), func.value(Type::I8));
-    insts.push(func.add(Op::Const(1), Some(one)));
-    insts.push(func.add(Op::Binary(Binary::Band, shifted, one), Some(bit)));
-    insts.push(func.add(Op::Convert(Convert::Ireduce, bit), Some(bit8)));
-    if let Some(in_range) = in_range {
-        let cond = func.value(Type::I8);
-        insts.push(func.add(Op::Binary(Binary::Band, in_range, bit8), Some(cond)));
-        cond
-    } else {
-        bit8
-    }
+    let guard_end = insts.iter().position(|&inst| func.insts[inst.index()].result == Some(in_range)).map_or(insts.len(), |at| at + 1);
+    let mut test = insts.split_off(guard_end);
+    let bit8 = emit_bit(func, (word, diff), &mut test);
+    test.push(func.add(Op::Brif(bit8, hit.0, hit.1, miss.0, miss.1.clone()), None));
+    let test_blk = push_node(func, None, test);
+    insts.push(func.add(Op::Brif(in_range, test_blk, Vec::new(), miss.0, miss.1), None));
+    insts
 }
 
 pub(super) fn try_emit_bitmask_runs(
@@ -304,7 +330,7 @@ pub(super) fn try_emit_bitmask_runs(
     at: Option<(usize, Inst)>,
     (v, ty): (Value, Type),
     runs: &[Run],
-    (default_blk, cache): (Block, &mut Vec<((Block, Vec<Value>), Block)>),
+    (default_blk, cache): (Block, &mut Cache),
 ) -> Option<Block> {
     let (plan, hit, rest) = find_bitmask_target(func, info, ty, runs)?;
     let otherwise = if rest.is_empty() {
@@ -313,9 +339,7 @@ pub(super) fn try_emit_bitmask_runs(
         emit_node(func, info, None, (v, ty), &rest, (default_blk, cache))
     };
     let known_u_max = known_upper_bound(func, info, v);
-    let mut insts = Vec::with_capacity(14);
-    let cond = emit_bitmask_test(func, (v, ty), plan, known_u_max, true, &mut insts);
-    insts.push(func.add(Op::Brif(cond, hit.block, hit.args, otherwise, Vec::new()), None));
+    let insts = emit_bitmask_branch(func, (v, ty), (plan, known_u_max), ((hit.block, hit.args), (otherwise, Vec::new())));
     Some(push_node(func, at, insts))
 }
 
@@ -418,10 +442,8 @@ pub(super) fn try_rewrite_expr(func: &mut Function, info: &Info, (b0, last0): (u
             func.insts[inst.index()].op = Op::Trap;
         }
         let known_u_max = known_upper_bound(func, info, v);
-        let mut insts = Vec::with_capacity(14);
-        let new_cond = emit_bitmask_test(func, (v, ty), plan, known_u_max, true, &mut insts);
-        let (hit_b, hit_a, miss_b, miss_a) = if want_or { (t_blk, t_args, f_blk, f_args) } else { (f_blk, f_args, t_blk, t_args) };
-        insts.push(func.add(Op::Brif(new_cond, hit_b, hit_a, miss_b, miss_a), None));
+        let edges = if want_or { ((t_blk, t_args), (f_blk, f_args)) } else { ((f_blk, f_args), (t_blk, t_args)) };
+        let insts = emit_bitmask_branch(func, (v, ty), (plan, known_u_max), edges);
         push_node(func, Some((b0, last0)), insts);
         cleared[b0] = true;
         return true;

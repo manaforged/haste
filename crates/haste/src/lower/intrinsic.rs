@@ -153,12 +153,18 @@ impl Lower<'_, '_> {
     /// The address of a `(ty, bool)` pair in a new frame slot that holds `value` and `flag`.
     pub(super) fn flagged(&mut self, ty: Ty, value: Value, flag: Value) -> Result<Value> {
         let bool_ty = self.cx.types.prim(Primitive::Bool);
-        let tuple = self.cx.types.tuple(&[ty, bool_ty]);
+        self.pair([ty, bool_ty], [value, flag])
+    }
+
+    /// The address of a stack tuple of types `tys` that holds `values`.
+    pub(super) fn pair(&mut self, tys: [Ty; 2], values: [Value; 2]) -> Result<Value> {
+        let tuple = self.cx.types.tuple(&tys);
         let tuple_repr = repr(self.cx, tuple)?;
-        let Some(slot) = self.slot(tuple_repr) else { bail!("a flagged pair takes no bytes") };
-        let (first, second) = (self.field_offset(tuple, 0)?, self.field_offset(tuple, 1)?);
-        self.ins().stack_store(value, slot, first);
-        self.ins().stack_store(flag, slot, second);
+        let Some(slot) = self.slot(tuple_repr) else { bail!("a pair takes no bytes") };
+        for (index, value) in (0..).zip(values) {
+            let at = self.field_offset(tuple, index)?;
+            self.ins().stack_store(value, slot, at);
+        }
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
@@ -186,19 +192,19 @@ impl Lower<'_, '_> {
         let &[cond, yes, no] = args else { bail!("select_unpredictable takes three arguments") };
         match whole {
             Repr::Zst => Ok(None),
-            Repr::Scalar(_) => Ok(Some(self.ins().select(cond, yes, no))),
+            Repr::Scalar(_) => Ok(Some(self.unpredictable(cond, yes, no))),
             Repr::Mem { parts, .. } => {
                 let Some(slot) = self.slot(whole) else { return Ok(None) };
                 let out = self.ins().stack_addr(Type::I64, slot, 0);
                 let mut pick = |m: Type, at: i32| {
                     let a = self.ins().load(m, yes, at);
                     let b = self.ins().load(m, no, at);
-                    let sel = self.ins().select(cond, a, b);
+                    let sel = self.unpredictable(cond, a, b);
                     self.ins().stack_store(sel, slot, at);
                 };
                 match parts {
                     super::Parts::Bytes => {
-                        let chosen = self.ins().select(cond, yes, no);
+                        let chosen = self.unpredictable(cond, yes, no);
                         self.copy(out, chosen, whole);
                     }
                     other => {
@@ -210,6 +216,12 @@ impl Lower<'_, '_> {
                 Ok(Some(out))
             }
         }
+    }
+
+    fn unpredictable(&mut self, cond: Value, yes: Value, no: Value) -> Value {
+        let chosen = self.ins().select(cond, yes, no);
+        self.b.func.mark_unpredictable(chosen);
+        chosen
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
@@ -258,6 +270,11 @@ impl Lower<'_, '_> {
             (Ctpop, &[x]) => self.count(num.0, |lower| lower.ins().popcnt(x)),
             (Ctlz, &[x]) => self.count(num.0, |lower| lower.ins().clz(x)),
             (Cttz, &[x]) => self.count(num.0, |lower| lower.ins().ctz(x)),
+            (CttzNonzero, &[x]) if num.0.bits() < 32 => {
+                let word = self.ins().uextend(Type::I32, x);
+                self.ins().ctz(word)
+            }
+            (CttzNonzero, &[x]) => self.count(num.0, |lower| lower.ins().ctz(x)),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         })
     }

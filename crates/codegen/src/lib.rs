@@ -19,18 +19,23 @@ mod frame;
 mod ifconv;
 mod licm;
 mod live;
+mod loopargs;
 mod loads;
 mod lsr;
 pub(crate) mod mem;
 mod merge;
 mod native;
+mod overalign;
+mod pairs;
 mod park;
 mod promote;
 mod reloc;
 mod returns;
 mod rotate;
 mod schedule;
+mod slp;
 mod split;
+mod spills;
 mod switch;
 mod tailrec;
 mod target;
@@ -39,6 +44,7 @@ pub mod trace;
 mod unroll;
 mod verify;
 mod wide;
+mod wire;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
 macro_rules! value_op {
     () => {
@@ -68,9 +74,9 @@ pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, F
 pub use coroutine::Coroutine;
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
-pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
+pub use reloc::{DictTierUp, FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
-pub use trace::{missed_report, with_label as with_trace_label};
+pub use trace::{enabled as trace_enabled, missed_report, with_label as with_trace_label};
 
 use std::ops::Range;
 
@@ -90,12 +96,13 @@ pub struct Code {
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
     loops: Vec<Range<u32>>,
+    lines: Vec<(u32, u64)>,
 }
 
 impl Code {
     /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, relocations, and small loop ranges.
     pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>, loops: Vec<Range<u32>>) -> Self {
-        Self { bytes, sites, relocs, loops }
+        Self { bytes, sites, relocs, loops, lines: Vec::new() }
     }
 
     /// The machine code.
@@ -116,6 +123,11 @@ impl Code {
     /// The byte ranges of the small innermost loops, which run slower when they cross a page boundary.
     pub fn loops(&self) -> &[Range<u32>] {
         &self.loops
+    }
+
+    /// The offsets in `bytes` where a new source place starts, with that place as `FunctionBuilder::set_loc` took it.
+    pub fn lines(&self) -> &[(u32, u64)] {
+        &self.lines
     }
 
     /// Copies `bytes` into `out` and patches every relocation against `symbols`.
@@ -148,13 +160,31 @@ impl Target {
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function, effort: Effort) {
-    schedule::run(func, promote::Moves::Guided, &Target::host().effort(effort));
+    let target = Target::host().effort(effort);
+    keep_honored_marks(func, &target);
+    schedule::run(func, promote::Moves::Guided, &target);
     fold::compact(func);
+}
+
+fn keep_honored_marks(func: &mut Function, target: &Target) {
+    if target.arch == Arch::X64 {
+        func.forget_unpredictable();
+    }
+}
+
+/// Splits `func` into its state machine when it is a coroutine's resume function, leaving a plain function a caller can inline.
+pub fn split_coroutine(func: &mut Function) {
+    copy::build_in_place(func);
+    coroutine::split(func);
 }
 
 /// Encodes `func` for `target`.
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
-    coroutine::split(&mut func);
+    split_coroutine(&mut func);
+    keep_honored_marks(&mut func, target);
+    if !(target.direct_calls && target.arch == Arch::X64) {
+        func.forget_image_addrs();
+    }
     verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     let tracing = trace::enabled();
     if tracing {
@@ -168,6 +198,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }
     native::lower(&mut func);
+    overalign::lower(&mut func);
     verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
         Arch::X64 => x64::compile(&func, target),

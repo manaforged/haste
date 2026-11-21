@@ -117,7 +117,7 @@ fn canonical_addr(func: &Function, prov: &Provenance, consts: &[Option<i64>], de
     Some((merge_canon_terms(terms)?, const_off))
 }
 
-fn pred_chain(cfg: &Cfg, blk: Block) -> Vec<Block> {
+pub(super) fn pred_chain(cfg: &Cfg, blk: Block) -> Vec<Block> {
     let mut chain = vec![blk];
     let mut cur = blk;
     while chain.len() < MAX_PRED_CHAIN
@@ -229,7 +229,7 @@ fn has_clobber(func: &Function, prov: &Provenance, chain: &[Block], leaves: &[Le
     let last_chain = chain.len() - 1;
     let check_inst = |inst: Inst| {
         let op = &func.insts[inst.index()].op;
-        super::dom::clobbers_loc(func, op, wide_loc, prov) || leaves.iter().any(|l| super::dom::clobbers_loc(func, op, l.loc, prov))
+        super::dom::clobbers_loc(func, (op, None), wide_loc, prov) || leaves.iter().any(|l| super::dom::clobbers_loc(func, (op, None), l.loc, prov))
     };
     for ci in min_leaf.blk_idx..=last_chain {
         let insts = &func.blocks[chain[ci].index()].insts;
@@ -595,9 +595,12 @@ fn sweep_dead(func: &mut Function, blk_idx: usize, dead_pool: &[bool], uses: &mu
 }
 
 pub(super) fn has_vec_pack_cand(func: &Function) -> bool {
-    func.insts.iter().any(|data| {
-        data.result.is_some_and(|r| func.ty(r).is_vector())
-            && matches!(data.op, Op::Insert(..) | Op::TargetOp(TargetOpId::X64Concat128, _))
+    func.blocks.iter().any(|block| {
+        block.insts.iter().any(|&inst| {
+            let data = &func.insts[inst.index()];
+            data.result.is_some_and(|r| func.ty(r).is_vector())
+                && matches!(data.op, Op::Insert(..) | Op::TargetOp(TargetOpId::X64Concat128, _))
+        })
     })
 }
 

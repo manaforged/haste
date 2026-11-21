@@ -11,8 +11,8 @@ mod trim;
 
 pub use inline::{InlineKey, InlineShape};
 pub use keys::{
-    deps_key, deps_path, enabled, file_key, layer_item_key, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
-    toolchain_path, workspace_key, workspace_path,
+    CrateHashes, deps_key, deps_path, enabled, file_key, layer_item_key, preload_fixed_files, save_fixed_files, sysroot_item_key,
+    sysroot_only_item_key, target_hash, toolchain_key, toolchain_path, workspace_key, workspace_path,
 };
 
 use std::cmp::Ordering;
@@ -21,7 +21,7 @@ use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -29,10 +29,10 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use anyhow::{Context as _, Result, anyhow, bail};
 use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 
-use consumers::{CONSUMER_REC_LEN, Consumer, KEPT_WORKSPACES};
+use consumers::{CONSUMER_REC_LEN, Consumer};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 23;
+const VERSION: u32 = 24;
 const HEADER_LEN: usize = 72;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 72;
@@ -98,34 +98,29 @@ fn decode_table<T>(bytes: &[u8], width: usize, name: &str, entry: impl FnMut(usi
     (0..bytes.len()).step_by(width).map(entry).collect()
 }
 
-enum Backing {
-    Owned(Vec<u8>),
-    Mmap { ptr: NonNull<u8>, len: usize },
+struct Backing {
+    ptr: NonNull<u8>,
+    len: usize,
 }
 
-// SAFETY: `Backing::Mmap` points to a read-only immutable mapping owned exclusively by `Backing`.
+// SAFETY: `Backing` points to a read-only immutable mapping owned exclusively by `Backing`.
 unsafe impl Send for Backing {}
-// SAFETY: `Backing::Mmap` is immutable for its entire lifetime and safe to read concurrently.
+// SAFETY: `Backing` is immutable for its entire lifetime and safe to read concurrently.
 unsafe impl Sync for Backing {}
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        if let Backing::Mmap { ptr, len } = *self {
-            // SAFETY: `ptr` and `len` were returned by a successful `libc::mmap` call in `Substrate::open`.
-            unsafe {
-                if libc::munmap(ptr.as_ptr().cast(), len) != 0 {}
-            }
+        // SAFETY: `ptr` and `len` were returned by a successful `libc::mmap` call in `Substrate::open`.
+        unsafe {
+            if libc::munmap(self.ptr.as_ptr().cast(), self.len) != 0 {}
         }
     }
 }
 
 impl Backing {
     fn as_slice(&self) -> &[u8] {
-        match self {
-            Backing::Owned(buf) => buf.as_slice(),
-            // SAFETY: `ptr` is valid for `len` bytes for the lifetime of `&self` and never mutated.
-            Backing::Mmap { ptr, len } => unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *len) },
-        }
+        // SAFETY: `ptr` is valid for `len` bytes for the lifetime of `&self` and never mutated.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
@@ -227,7 +222,7 @@ impl Substrate {
             return Err(io::Error::last_os_error()).with_context(|| format!("mmap {}", path.display()));
         }
         let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
-        Self::from_backing(Backing::Mmap { ptr, len })
+        Self::from_backing(Backing { ptr, len })
     }
 
     /// Opens the substrate for `toolchain_hash` from the toolchain cache directory.
@@ -263,11 +258,6 @@ impl Substrate {
         self
     }
 
-    /// Constructs a substrate from an in-memory byte buffer.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        Self::from_backing(Backing::Owned(bytes))
-    }
-
     fn from_backing(backing: Backing) -> Result<Self> {
         let header = parse_and_validate(backing.as_slice())?;
         let used = (0..header.stencil_count).map(|_| AtomicBool::new(false)).collect();
@@ -287,11 +277,6 @@ impl Substrate {
     /// Target triple fingerprint this substrate was compiled for.
     pub fn target_hash(&self) -> u64 {
         self.header.target_hash
-    }
-
-    /// Returns whether this substrate layer holds any summaries, stencils, or concrete instances.
-    pub fn has_entries(&self) -> bool {
-        self.header.summary_count > 0 || self.header.stencil_count > 0 || self.header.instance_count > 0
     }
 
     /// Looks up a frozen `PolySummary` payload by `item_hash` in `O(log N)`.
@@ -338,10 +323,10 @@ impl Substrate {
         Some(StencilSlice { code: blob(code)?, sites: blob(sites)?, relocs: blob(relocs)?, plan: blob(plan)?, loops: blob(loops)? })
     }
 
-    /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its parent.
+    /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its ancestors.
     pub fn instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
-        self.local_instance_candidates(item_hash, substs_hash)
-            .chain(self.parent.as_deref().into_iter().flat_map(move |p| p.local_instance_candidates(item_hash, substs_hash)))
+        std::iter::successors(Some(self), |s| s.parent.as_deref())
+            .flat_map(move |s| s.local_instance_candidates(item_hash, substs_hash))
     }
 
     fn local_instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
@@ -356,37 +341,6 @@ impl Substrate {
             .map(move |i| base + i * INSTANCE_REC_LEN)
             .take_while(move |&rec| read_u64(data, rec) == item_hash && read_u64(data, rec + 8) == substs_hash)
             .filter_map(move |rec| self.blob_slice(read_u32(data, rec + 16) as usize, read_u32(data, rec + 20) as usize))
-    }
-
-    /// Atomically writes the substrate to `path` via a sibling temporary file and rename.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        crate::graph::store::write_new_bytes(path, self.backing.as_slice()).with_context(|| format!("writing {}", path.display()))
-    }
-
-    /// Atomically saves the substrate into the toolchain cache directory and prunes superseded toolchain/deps substrates.
-    pub fn save_toolchain(&self) -> Result<PathBuf> {
-        let path = toolchain_path(self.header.toolchain_hash);
-        self.save(&path)?;
-        prune_superseded(self.header.toolchain_hash);
-        Ok(path)
-    }
-
-    /// Atomically saves the substrate into the dependency cache directory.
-    pub fn save_deps(&self) -> Result<PathBuf> {
-        self.save_scoped(deps_path(self.header.toolchain_hash), 16)
-    }
-
-    /// Atomically saves the substrate into the workspace cache directory (bounded LRU of `KEPT_WORKSPACES`).
-    pub fn save_workspace(&self) -> Result<PathBuf> {
-        self.save_scoped(workspace_path(self.header.toolchain_hash), KEPT_WORKSPACES - 1)
-    }
-
-    fn save_scoped(&self, path: PathBuf, keep_others: usize) -> Result<PathBuf> {
-        self.save(&path)?;
-        if let Some(dir) = path.parent() {
-            prune_stale_substrates(dir, &path, keep_others);
-        }
-        Ok(path)
     }
 
     fn blob_slice(&self, off: usize, len: usize) -> Option<&[u8]> {
@@ -500,16 +454,6 @@ impl SubstrateBuilder {
         Ok(())
     }
 
-    /// Appends a pre-compiled `Effort::Full` stencil entry.
-    pub fn add_stencil(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8]) -> Result<()> {
-        self.add_stencil_with_plan(item_hash, footprint, code, sites, relocs, &[])
-    }
-
-    /// Appends a pre-compiled stencil entry with an optional serialized portable `RelocPlan`.
-    pub fn add_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8], plan: &[u8]) -> Result<()> {
-        self.push_stencil(item_hash, footprint, StencilSlice { code, sites, relocs, plan, loops: &[] }, None)
-    }
-
     fn push_stencil(&mut self, item_hash: u64, footprint: u128, slice: StencilSlice<'_>, last_used: Option<u32>) -> Result<()> {
         let (code_off, code_len) = self.push_blob(slice.code)?;
         let (sites_off, sites_len) = self.push_blob(slice.sites)?;
@@ -535,11 +479,6 @@ impl SubstrateBuilder {
         Ok(())
     }
 
-    /// Appends a compiled `haste_codegen::Code` stencil by encoding its bytes, sites, and relocations.
-    pub fn add_code_stencil(&mut self, item_hash: u64, footprint: u128, code: &Code) -> Result<()> {
-        self.add_code_stencil_with_plan(item_hash, footprint, code, &[])
-    }
-
     /// Appends a compiled `haste_codegen::Code` stencil together with serialized portable `RelocPlan` bytes.
     pub fn add_code_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &Code, plan: &[u8]) -> Result<()> {
         tally::tally(tally::Tally::Offered);
@@ -552,82 +491,13 @@ impl SubstrateBuilder {
         self.push_stencil(item_hash, footprint, StencilSlice { code: code.bytes(), sites: &sites, relocs: &relocs, plan, loops: &loops }, None)
     }
 
-    fn push_blob(&mut self, bytes: &[u8]) -> Result<(u32, u32)> {
-        push_aligned_blob(&mut self.blob, bytes)
+    /// Shrinks the builder's backing payload buffer to fit its current length.
+    pub fn shrink_blob(&mut self) {
+        self.blob.shrink_to_fit();
     }
 
-    /// Sorts all index tables, evicts stencils no live consumer needs, and returns a validated `Substrate`.
-    pub fn build(mut self) -> Result<Substrate> {
-        self.summaries.sort_by_key(|entry| entry.item_hash);
-        self.summaries.dedup_by_key(|entry| entry.item_hash);
-        self.stencils.sort_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
-        self.stencils.dedup_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
-        self.instances.sort_by(|a, b| {
-            (a.item_hash, a.substs_hash)
-                .cmp(&(b.item_hash, b.substs_hash))
-                .then_with(|| {
-                    let ab = &self.blob[a.off as usize..a.off as usize + a.len as usize];
-                    let bb = &self.blob[b.off as usize..b.off as usize + b.len as usize];
-                    ab.cmp(bb)
-                })
-        });
-        self.instances.dedup_by(|a, b| {
-            a.item_hash == b.item_hash
-                && a.substs_hash == b.substs_hash
-                && self.blob[a.off as usize..a.off as usize + a.len as usize] == self.blob[b.off as usize..b.off as usize + b.len as usize]
-        });
-        self.evict_unneeded_stencils()?;
-
-        let summaries_off = HEADER_LEN;
-        let stencils_off = summaries_off + self.summaries.len() * SUMMARY_REC_LEN;
-        let instances_off = stencils_off + self.stencils.len() * STENCIL_REC_LEN;
-        let consumers_off = instances_off + self.instances.len() * INSTANCE_REC_LEN;
-        let blob_off = consumers_off + self.consumers.len() * CONSUMER_REC_LEN;
-        let total = blob_off + self.blob.len();
-
-        let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&self.generation.to_le_bytes());
-        out.extend_from_slice(&self.toolchain_hash.to_le_bytes());
-        out.extend_from_slice(&self.target_hash.to_le_bytes());
-        out.extend_from_slice(&(self.summaries.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(self.stencils.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(self.instances.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(self.blob.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(self.consumers.len() as u64).to_le_bytes());
-
-        for entry in &self.summaries {
-            out.extend_from_slice(&entry.item_hash.to_le_bytes());
-            out.extend_from_slice(&entry.off.to_le_bytes());
-            out.extend_from_slice(&entry.len.to_le_bytes());
-        }
-        for entry in &self.stencils {
-            out.extend_from_slice(&entry.item_hash.to_le_bytes());
-            out.extend_from_slice(&entry.fp_lo.to_le_bytes());
-            out.extend_from_slice(&entry.fp_hi.to_le_bytes());
-            out.extend_from_slice(&entry.code_off.to_le_bytes());
-            out.extend_from_slice(&entry.code_len.to_le_bytes());
-            out.extend_from_slice(&entry.sites_off.to_le_bytes());
-            out.extend_from_slice(&entry.sites_len.to_le_bytes());
-            out.extend_from_slice(&entry.relocs_off.to_le_bytes());
-            out.extend_from_slice(&entry.relocs_len.to_le_bytes());
-            out.extend_from_slice(&entry.plan_off.to_le_bytes());
-            out.extend_from_slice(&entry.plan_len.to_le_bytes());
-            out.extend_from_slice(&entry.loops_off.to_le_bytes());
-            out.extend_from_slice(&entry.loops_len.to_le_bytes());
-            out.extend_from_slice(&entry.last_used.unwrap_or(self.generation).to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
-        for entry in &self.instances {
-            out.extend_from_slice(&entry.item_hash.to_le_bytes());
-            out.extend_from_slice(&entry.substs_hash.to_le_bytes());
-            out.extend_from_slice(&entry.off.to_le_bytes());
-            out.extend_from_slice(&entry.len.to_le_bytes());
-        }
-        self.consumers.iter().for_each(|c| c.write(&mut out));
-        out.extend_from_slice(&self.blob);
-        Substrate::from_bytes(out)
+    fn push_blob(&mut self, bytes: &[u8]) -> Result<(u32, u32)> {
+        push_aligned_blob(&mut self.blob, bytes)
     }
 }
 
@@ -719,10 +589,10 @@ pub(super) fn read_u64(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-const RELOC_KINDS: [RelocKind; 7] = [RelocKind::Abs32, RelocKind::Abs64, RelocKind::Arm64Movw64, RelocKind::PcRel32, RelocKind::Arm64Call26, RelocKind::Arm64AdrpAdd, RelocKind::X64RipRel32];
+const RELOC_KINDS: [RelocKind; 8] = [RelocKind::Abs32, RelocKind::Abs64, RelocKind::Arm64Movw64, RelocKind::PcRel32, RelocKind::Arm64Call26, RelocKind::Arm64AdrpAdd, RelocKind::X64RipRel32, RelocKind::ThreadOff32];
 
 fn encode_reloc_kind(kind: RelocKind) -> u8 {
-    match kind { RelocKind::Abs32 => 0, RelocKind::Abs64 => 1, RelocKind::Arm64Movw64 => 2, RelocKind::PcRel32 => 3, RelocKind::Arm64Call26 => 4, RelocKind::Arm64AdrpAdd => 5, RelocKind::X64RipRel32 => 6 }
+    match kind { RelocKind::Abs32 => 0, RelocKind::Abs64 => 1, RelocKind::Arm64Movw64 => 2, RelocKind::PcRel32 => 3, RelocKind::Arm64Call26 => 4, RelocKind::Arm64AdrpAdd => 5, RelocKind::X64RipRel32 => 6, RelocKind::ThreadOff32 => 7 }
 }
 
 fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {

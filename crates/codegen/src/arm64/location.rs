@@ -1,4 +1,4 @@
-use super::asm::{Alu, ExtOp, FP, Mem, Reg, Size, Vreg, decode_sib};
+use super::asm::{Alu, Asm, ExtOp, FP, Mem, Reg, Size, Vreg, decode_sib};
 use super::{A, C, Emit, IP, V0};
 use crate::alloc::Location;
 use crate::frame::Ext;
@@ -41,7 +41,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn invalidate_spills(&mut self) {
-        self.last_spill = [None; 4];
+        self.last_spill.clear();
         self.last_fspill = None;
         self.asm.clear_anchor();
     }
@@ -51,11 +51,7 @@ impl Emit<'_> {
             return;
         }
         self.asm.clobber_anchor(reg);
-        for slot in &mut self.last_spill {
-            if slot.is_some_and(|(_, r)| r == reg) {
-                *slot = None;
-            }
-        }
+        self.last_spill.clobber(reg);
     }
 
     pub(super) fn clobber_regs(&mut self, regs: &[Reg]) {
@@ -71,11 +67,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn invalidate_disp(&mut self, disp: i32) {
-        for slot in &mut self.last_spill {
-            if slot.is_some_and(|(d, _)| d == disp) {
-                *slot = None;
-            }
-        }
+        self.last_spill.invalidate(disp);
         if self.last_fspill.is_some_and(|(d, _, _)| d == disp) {
             self.last_fspill = None;
         }
@@ -83,15 +75,7 @@ impl Emit<'_> {
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
         self.clobber_reg(reg);
-        let mut out = [Some((disp, reg)), None, None, None];
-        let mut i = 1;
-        for entry in self.last_spill.into_iter().flatten() {
-            if entry != (disp, reg) && i < 4 {
-                out[i] = Some(entry);
-                i += 1;
-            }
-        }
-        self.last_spill = out;
+        self.last_spill.record(disp, reg);
     }
 
     pub(super) fn write_spill(&mut self, disp: i32, reg: Reg) {
@@ -101,14 +85,12 @@ impl Emit<'_> {
 
     fn cached_spill_for(&self, disp: i32, preferred: Reg) -> Option<Reg> {
         let mut fallback = None;
-        for (d, r) in self.last_spill.into_iter().flatten() {
-            if d == disp {
-                if r == preferred {
-                    return Some(r);
-                }
-                if r != super::ZR || fallback.is_none() {
-                    fallback = Some(r);
-                }
+        for r in self.last_spill.holders(disp) {
+            if r == preferred {
+                return Some(r);
+            }
+            if r != super::ZR || fallback.is_none() {
+                fallback = Some(r);
             }
         }
         fallback
@@ -144,20 +126,26 @@ impl Emit<'_> {
 
     pub(super) fn sib_indexed(&mut self, addr: Value, offset: i32, bytes: u32) -> Option<(Reg, Reg, u8)> {
         let mode = self.plan.sib[addr.index()]?;
-        let total_disp = match mode.base {
-            SibBase::Frame(slot) => i64::from(self.frame.slots[slot.index()]) + i64::from(mode.disp) + i64::from(offset),
-            SibBase::Value(_) => i64::from(mode.disp) + i64::from(offset),
-        };
         let (_, shift) = decode_sib(mode.shift);
-        if total_disp != 0 || (shift != 0 && (1u32 << shift) != bytes) {
+        if shift != 0 && (1u32 << shift) != bytes {
             return None;
         }
+        let disp = i64::from(mode.disp) + i64::from(offset);
         let base_reg = match mode.base {
-            SibBase::Frame(_) => FP,
-            SibBase::Value(base) => self.bits(base, C),
+            SibBase::Frame(slot) => self.frame_base(disp + i64::from(self.frame.slots[slot.index()])),
+            SibBase::Value(base) if disp == 0 => self.bits(base, C),
+            SibBase::Value(_) => return None,
         };
         let idx_reg = self.bits(mode.index, IP);
         Some((base_reg, idx_reg, mode.shift))
+    }
+
+    fn frame_base(&mut self, fp_disp: i64) -> Reg {
+        if fp_disp == 0 {
+            return FP;
+        }
+        self.add_const(C, FP, fp_disp);
+        C
     }
 
     pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg) -> Mem {
@@ -223,6 +211,9 @@ impl Emit<'_> {
                         self.asm.mov(reg, cached_reg);
                         self.record_spill(disp, reg);
                     }
+                } else if let Some(imm) = self.const_bits(value).filter(|&imm| imm == 0 || Asm::mov_imm_is_single(imm)) {
+                    self.asm.mov_imm(reg, imm);
+                    self.record_spill(disp, reg);
                 } else {
                     let at = self.frame_mem(disp);
                     self.asm.load(Size::X, false, reg, at);
@@ -271,7 +262,7 @@ impl Emit<'_> {
                 self.clobber_reg(reg);
             }
             Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => self.raw(reg, value),
-            Location::Reg(from) if !signed && self.plan.zero_ext[value.index()] => {
+            Location::Reg(from) if full => {
                 if reg != from {
                     self.asm.mov(reg, from);
                     self.clobber_reg(reg);
@@ -283,7 +274,9 @@ impl Emit<'_> {
             }
             Location::Float(from) => {
                 self.asm.fmov_out(ty.bytes() == 8, reg, Vreg(from));
-                self.asm.extend(signed, bytes, reg, reg);
+                if bytes < 4 || (bytes == 4 && signed) {
+                    self.asm.extend(signed, bytes, reg, reg);
+                }
                 self.clobber_reg(reg);
             }
             Location::Slot => self.get_slot(reg, value, (bytes, signed, full)),
@@ -308,8 +301,8 @@ impl Emit<'_> {
         };
         let disp = self.frame.values[value.index()];
         let mut fallback = None;
-        for (d, r) in self.last_spill.into_iter().flatten() {
-            if d == disp && Self::borrowable(r, scratch) {
+        for r in self.last_spill.holders(disp) {
+            if Self::borrowable(r, scratch) {
                 if r == scratch {
                     return Some(r);
                 }
@@ -415,49 +408,63 @@ impl Emit<'_> {
         }
     }
 
+    fn fget_raw(&mut self, reg: Vreg, value: Value, ty: Type) {
+        self.raw(IP, value);
+        self.asm.fmov_in(ty.bytes() == 8, reg, IP);
+        self.clobber_vreg(reg);
+    }
+
+    fn fget_slot(&mut self, reg: Vreg, value: Value, ty: Type) {
+        let disp = self.frame.values[value.index()];
+        debug_assert_ne!(disp, 0, "unhomed value {value:?} in fget()");
+        if let Some((cached_disp, cached_reg, cached_ty)) = self.last_fspill
+            && cached_disp == disp
+            && cached_ty == ty
+        {
+            self.asm.vmov(reg, cached_reg);
+            if cached_reg != reg {
+                self.clobber_vreg(reg);
+            }
+            return;
+        }
+        if self.const_bits(value).is_some_and(|imm| self.try_emit_float_imm_bits(ty, imm, reg)) {
+            self.last_fspill = Some((disp, reg, ty));
+            return;
+        }
+        if !ty.is_vector()
+            && matches!(ty.bytes(), 4 | 8)
+            && let Some(cached) = self.cached_spill_for(disp, super::ZR)
+        {
+            self.asm.fmov_in(ty.bytes() == 8, reg, cached);
+            self.clobber_vreg(reg);
+            self.last_fspill = Some((disp, reg, ty));
+            return;
+        }
+        let at = self.frame_mem(disp);
+        self.asm.vload(ty.bytes(), reg, at);
+        self.clobber_vreg(reg);
+        self.last_fspill = Some((disp, reg, ty));
+    }
+
     pub(super) fn fget(&mut self, reg: Vreg, value: Value) {
         let ty = self.ty(value);
         match self.plan.location(value) {
             Location::Float(from) if Vreg(from) == reg => {}
-            Location::Float(from) if ty.is_vector() => {
+            Location::Float(from) => {
                 self.asm.vmov(reg, Vreg(from));
                 self.clobber_vreg(reg);
             }
-            Location::Float(from) => {
-                self.asm.fmov_reg(ty == Type::F64, reg, Vreg(from));
+            Location::Reg(from) => {
+                self.asm.fmov_in(ty.bytes() == 8, reg, from);
                 self.clobber_vreg(reg);
             }
-            Location::Imm(0) if ty.is_vector() => {
-                self.asm.veor_zero(reg);
-                self.clobber_vreg(reg);
-            }
-            Location::Slot => {
-                let disp = self.frame.values[value.index()];
-                debug_assert_ne!(disp, 0, "unhomed value {value:?} in fget()");
-                if let Some((cached_disp, cached_reg, cached_ty)) = self.last_fspill
-                    && cached_disp == disp
-                    && cached_ty == ty
-                {
-                    if cached_reg != reg {
-                        if ty.is_vector() {
-                            self.asm.vmov(reg, cached_reg);
-                        } else {
-                            self.asm.fmov_reg(ty == Type::F64, reg, cached_reg);
-                        }
-                        self.clobber_vreg(reg);
-                    }
-                } else {
-                    let at = self.frame_mem(disp);
-                    self.asm.vload(ty.bytes(), reg, at);
-                    self.clobber_vreg(reg);
-                    self.last_fspill = Some((disp, reg, ty));
+            Location::Imm(imm) => {
+                if !self.try_emit_float_imm_bits(ty, imm, reg) {
+                    self.fget_raw(reg, value, ty);
                 }
             }
-            _ => {
-                self.raw(IP, value);
-                self.asm.fmov_in(ty.bytes() == 8, reg, IP);
-                self.clobber_vreg(reg);
-            }
+            Location::Slot => self.fget_slot(reg, value, ty),
+            _ => self.fget_raw(reg, value, ty),
         }
     }
 
@@ -465,13 +472,7 @@ impl Emit<'_> {
         let ty = self.ty(value);
         match self.plan.location(value) {
             Location::Float(to) => {
-                if Vreg(to) != reg {
-                    if ty.is_vector() {
-                        self.asm.vmov(Vreg(to), reg);
-                    } else {
-                        self.asm.fmov_reg(ty == Type::F64, Vreg(to), reg);
-                    }
-                }
+                self.asm.vmov(Vreg(to), reg);
                 self.clobber_vreg(Vreg(to));
             }
             _ => {
@@ -517,11 +518,7 @@ impl Emit<'_> {
             _ => {
                 let disp = self.frame.values[value.index()];
                 self.copy_to(self.at(value), from, ty);
-                if ty.bytes() <= 8 {
-                    self.write_spill(disp, IP);
-                } else {
-                    self.invalidate_disp(disp);
-                }
+                self.finish_slot_store(Some(disp), ty, IP);
             }
         }
     }
@@ -540,42 +537,72 @@ impl Emit<'_> {
         self.move_to_slot(to, None, value);
     }
 
+    fn finish_slot_store(&mut self, slot_disp: Option<i32>, ty: Type, reg: Reg) {
+        if let Some(d) = slot_disp {
+            if ty.bytes() <= 8 {
+                self.write_spill(d, reg);
+            } else {
+                self.invalidate_disp(d);
+            }
+        }
+    }
+
+    pub(super) fn pair_disp_ok(disp: i32) -> bool {
+        disp % 8 == 0 && (-512..=504).contains(&disp)
+    }
+
+    fn store_zero(&mut self, to: Mem, slot_disp: Option<i32>, ty: Type) {
+        if ty.bytes() == 16 {
+            if Self::pair_disp_ok(to.disp) {
+                self.asm.stp_offset(super::ZR, super::ZR, to.base, to.disp);
+            } else {
+                self.asm.store(Size::X, to, super::ZR);
+                self.asm.store(Size::X, to.offset(8), super::ZR);
+            }
+        } else {
+            self.asm.store(Size::X, to, super::ZR);
+        }
+        self.finish_slot_store(slot_disp, ty, super::ZR);
+    }
+
+    fn move_slot_to_slot(&mut self, to: Mem, slot_disp: Option<i32>, value: Value, ty: Type) {
+        let src_disp = self.frame.values[value.index()];
+        if ty.bytes() <= 8
+            && let Some(cached) = self.cached_spill_for(src_disp, super::ZR)
+        {
+            self.asm.store(Size::X, to, cached);
+            if let Some(d) = slot_disp {
+                self.write_spill(d, cached);
+            }
+        } else if let Some((cd, cr, ct)) = self.last_fspill
+            && cd == src_disp
+            && ct == ty
+        {
+            self.asm.vstore(ty.bytes(), to, cr);
+            if let Some(d) = slot_disp {
+                self.invalidate_disp(d);
+                self.last_fspill = Some((d, cr, ct));
+            }
+        } else if self.const_bits(value) == Some(0) {
+            self.store_zero(to, slot_disp, ty);
+        } else {
+            self.copy_to(to, self.at(value), ty);
+            self.finish_slot_store(slot_disp, ty, IP);
+        }
+    }
+
     pub(super) fn move_to_slot(&mut self, to: Mem, slot_disp: Option<i32>, value: Value) {
         let ty = self.ty(value);
         match self.plan.location(value) {
-            Location::Imm(0) if ty.bytes() == 16 => {
-                self.asm.store(Size::X, to, super::ZR);
-                self.asm.store(Size::X, to.offset(8), super::ZR);
-                if let Some(d) = slot_disp {
-                    self.invalidate_disp(d);
-                }
-            }
-            Location::Imm(0) => {
-                self.asm.store(Size::X, to, super::ZR);
-                if let Some(d) = slot_disp {
-                    self.write_spill(d, super::ZR);
-                }
-            }
+            Location::Imm(0) => self.store_zero(to, slot_disp, ty),
             Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => {
                 self.raw(IP, value);
                 self.asm.store(Size::X, to, IP);
-                if let Some(d) = slot_disp {
-                    if ty.bytes() <= 8 {
-                        self.write_spill(d, IP);
-                    } else {
-                        self.invalidate_disp(d);
-                    }
-                }
+                self.finish_slot_store(slot_disp, ty, IP);
             }
             Location::Reg(reg) => {
                 self.asm.store(Size::X, to, reg);
-                if let Some(d) = slot_disp {
-                    if ty.bytes() <= 8 {
-                        self.write_spill(d, reg);
-                    } else {
-                        self.invalidate_disp(d);
-                    }
-                }
+                self.finish_slot_store(slot_disp, ty, reg);
             }
             Location::Float(v) => {
                 self.asm.vstore(ty.bytes(), to, Vreg(v));
@@ -584,33 +611,7 @@ impl Emit<'_> {
                     self.last_fspill = Some((d, Vreg(v), ty));
                 }
             }
-            Location::Slot => {
-                let src_disp = self.frame.values[value.index()];
-                if ty.bytes() <= 8 && let Some(cached) = self.cached_spill_for(src_disp, super::ZR) {
-                    self.asm.store(Size::X, to, cached);
-                    if let Some(d) = slot_disp {
-                        self.write_spill(d, cached);
-                    }
-                } else if let Some((cd, cr, ct)) = self.last_fspill
-                    && cd == src_disp
-                    && ct == ty
-                {
-                    self.asm.vstore(ty.bytes(), to, cr);
-                    if let Some(d) = slot_disp {
-                        self.invalidate_disp(d);
-                        self.last_fspill = Some((d, cr, ct));
-                    }
-                } else {
-                    self.copy_to(to, self.at(value), ty);
-                    if let Some(d) = slot_disp {
-                        if ty.bytes() <= 8 {
-                            self.write_spill(d, IP);
-                        } else {
-                            self.invalidate_disp(d);
-                        }
-                    }
-                }
-            }
+            Location::Slot => self.move_slot_to_slot(to, slot_disp, value, ty),
         }
     }
 }

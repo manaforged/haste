@@ -1,7 +1,25 @@
-use super::asm::{Alu, Cond, Reg, Shift, Size, Vreg, ZR};
+use super::asm::{Alu, Asm, Bits, Cond, Reg, Shift, Size, Vreg, ZR};
 use super::vector::{V2, V3, VecSpec};
 use super::{A, C, D, Emit, IP, V0, V1};
-use crate::ir::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Value};
+use crate::ir::{Binary, Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Value};
+
+pub(super) const NEON_EXT: u32 = 0x2E00_0000;
+pub(super) const NEON_AND: u32 = 0x0E20_1C00;
+pub(super) const NEON_ORR: u32 = 0x0EA0_1C00;
+pub(super) const NEON_EOR: u32 = 0x2E20_1C00;
+pub(super) const NEON_BSL: u32 = 0x2E60_1C00;
+pub(super) const NEON_DUP_GPR_2D: u32 = 0x4E08_0C00;
+pub(super) const NEON_SMAX: u32 = 0x0E20_6400;
+pub(super) const NEON_SMIN: u32 = 0x0E20_6C00;
+pub(super) const NEON_UMAX: u32 = 0x2E20_6400;
+pub(super) const NEON_UMIN: u32 = 0x2E20_6C00;
+pub(super) const NEON_REV64: u32 = 0x0E20_0800;
+pub(super) const NEON_REV32: u32 = 0x2E20_0800;
+pub(super) const NEON_REV16: u32 = 0x0E20_1800;
+pub(super) const NEON_SUB: u32 = 0x2E20_8400;
+pub(super) const NEON_SUB_1D: u32 = 0x7EE0_8400;
+pub(super) const NEON_USHL: u32 = 0x2E20_4400;
+pub(super) const NEON_USHL_1D: u32 = 0x7EE0_4400;
 
 #[derive(Clone, Copy)]
 enum TargetKind {
@@ -112,39 +130,30 @@ impl Emit<'_> {
         if !has_zero && self.shuffle_single_fast((spec, eb, total), src_val, &ridx, result) {
             return;
         }
-        self.load_bytes_v2(&ridx, total == 16);
         let dst = self.fdst(result);
         let src = self.fin(src_val, V0);
+        self.load_bytes_v2(&ridx, total == 16);
         self.asm.vbit(0x0E00_0000 | (spec.q << 30), dst, src, V2);
         self.fput(result, dst);
     }
 
     fn shuffle_two_sources(&mut self, (spec, eb, total): (VecSpec, usize, usize), (a, b): (Value, Value), has_zero: bool, (bidx, result): (&[u8; 16], Value)) {
+        if !has_zero && self.shuffle_two_fast((spec, eb, total), (a, b), bidx, result) {
+            return;
+        }
+        if let Some((full, lo, hi)) = self.eval_vec_full(result)
+            && full
+            && ((lo == hi && Asm::mov_imm_is_single(lo as i64)) || can_emit_ext_pair_imm(lo, hi))
+        {
+            let dst = self.fdst(result);
+            if !self.emit_neon_imm_only(dst, true, lo, hi) && !self.emit_ext_pair_imm(dst, V2, lo, hi) {
+                self.emit_dup_i64(dst, lo);
+            }
+            self.fput(result, dst);
+            return;
+        }
         let va = self.fin(a, V0);
         let vb = self.fin(b, V1);
-        if !has_zero {
-            let s = usize::from(bidx[0]);
-            let ext_pair = if s < total && (0..total).all(|j| usize::from(bidx[j]) == s + j) {
-                Some((va, vb, s))
-            } else if (total..2 * total).contains(&s) && (0..total).all(|j| usize::from(bidx[j]) == (s + j) % (2 * total)) {
-                Some((vb, va, s - total))
-            } else {
-                None
-            };
-            if let Some((vn, vm, byte_off)) = ext_pair {
-                let dst = self.fdst(result);
-                self.asm.vbit(0x2E00_0000 | (spec.q << 30) | ((byte_off as u32) << 11), dst, vn, vm);
-                self.fput(result, dst);
-                return;
-            }
-            if let Some((base, size, swap)) = match_permute(total, eb, bidx, false) {
-                let dst = self.fdst(result);
-                let (vn, vm) = if swap { (vb, va) } else { (va, vb) };
-                self.asm.vbit(base | (spec.q << 30) | (size << 22), dst, vn, vm);
-                self.fput(result, dst);
-                return;
-            }
-        }
         self.load_bytes_v2(bidx, total == 16);
         self.asm.vmov(V0, va);
         let out = self.vreg_of(result).unwrap_or(V3);
@@ -156,6 +165,52 @@ impl Emit<'_> {
             self.asm.vbit(0x4E00_2000, out, V0, V2);
         }
         self.fput(result, out);
+    }
+
+    fn shuffle_two_fast(&mut self, (spec, eb, total): (VecSpec, usize, usize), (a, b): (Value, Value), bidx: &[u8; 16], result: Value) -> bool {
+        let s = usize::from(bidx[0]);
+        let ext_pair = if s < total && (0..total).all(|j| usize::from(bidx[j]) == s + j) {
+            Some((false, s))
+        } else if (total..2 * total).contains(&s) && (0..total).all(|j| usize::from(bidx[j]) == (s + j) % (2 * total)) {
+            Some((true, s - total))
+        } else {
+            None
+        };
+        if let Some((swap, byte_off)) = ext_pair {
+            let va = self.fin(a, V0);
+            let vb = self.fin(b, V1);
+            let (vn, vm) = if swap { (vb, va) } else { (va, vb) };
+            let dst = self.fdst(result);
+            self.asm.vbit(NEON_EXT | (spec.q << 30) | ((byte_off as u32) << 11), dst, vn, vm);
+            self.fput(result, dst);
+            return true;
+        }
+        if let Some((base, size, swap)) = match_permute(total, eb, bidx, false) {
+            let va = self.fin(a, V0);
+            let vb = self.fin(b, V1);
+            let (vn, vm) = if swap { (vb, va) } else { (va, vb) };
+            let dst = self.fdst(result);
+            self.asm.vbit(base | (spec.q << 30) | (size << 22), dst, vn, vm);
+            self.fput(result, dst);
+            return true;
+        }
+        let (src, off) = if self.is_vec_zero(b) {
+            (a, 0)
+        } else if self.is_vec_zero(a) {
+            (b, total as u8)
+        } else {
+            return false;
+        };
+        let mut z_bidx = [0x80_u8; 16];
+        let lo = usize::from(off);
+        for j in 0..total {
+            let idx = usize::from(bidx[j]);
+            if idx >= lo && idx < lo + total {
+                z_bidx[j] = bidx[j];
+            }
+        }
+        self.shuffle_single_source((spec, eb, total), (src, off), true, (&z_bidx, result));
+        true
     }
 
     fn shuffle_single_fast(&mut self, (spec, eb, total): (VecSpec, usize, usize), src_val: Value, ridx: &[u8; 16], result: Value) -> bool {
@@ -170,7 +225,7 @@ impl Emit<'_> {
         if r < total && (0..total).all(|j| usize::from(ridx[j]) == (r + j) % total) {
             let dst = self.fdst(result);
             let src = self.fin(src_val, V0);
-            self.asm.vbit(0x2E00_0000 | (spec.q << 30) | ((r as u32) << 11), dst, src, src);
+            self.asm.vbit(NEON_EXT | (spec.q << 30) | ((r as u32) << 11), dst, src, src);
             self.fput(result, dst);
             return true;
         }
@@ -199,8 +254,8 @@ impl Emit<'_> {
             }
         }
         const REVS: &[(usize, usize, u32)] = &[
-            (8, 4, 0x0EA0_0800), (8, 2, 0x0E60_0800), (8, 1, 0x0E20_0800),
-            (4, 2, 0x2E60_0800), (4, 1, 0x2E20_0800), (2, 1, 0x0E20_1800),
+            (8, 4, 0x0EA0_0800), (8, 2, 0x0E60_0800), (8, 1, NEON_REV64),
+            (4, 2, 0x2E60_0800), (4, 1, NEON_REV32), (2, 1, NEON_REV16),
         ];
         for &(container, elem, base) in REVS {
             if elem >= eb && container <= total && (0..total).all(|j| usize::from(ridx[j]) == rev_byte(container, elem, j)) {
@@ -214,8 +269,8 @@ impl Emit<'_> {
         if total == 16 && let Some(elem) = [4_usize, 2, 1].into_iter().find(|&e| e >= eb && (0..16).all(|j| usize::from(ridx[j]) == rev_byte(16, e, j))) {
             let dst = self.fdst(result);
             let src = self.fin(src_val, V0);
-            self.v_two(0x0E20_0800 | (elem.trailing_zeros() << 22) | (spec.q << 30), dst, src);
-            self.asm.vbit(0x6E00_0000 | (8 << 11), dst, dst, dst);
+            self.v_two(NEON_REV64 | (elem.trailing_zeros() << 22) | (spec.q << 30), dst, src);
+            self.asm.vbit(NEON_EXT | (1 << 30) | (8 << 11), dst, dst, dst);
             self.fput(result, dst);
             return true;
         }
@@ -223,27 +278,50 @@ impl Emit<'_> {
     }
 
     fn load_bytes_v2(&mut self, bytes: &[u8; 16], full: bool) {
+        self.clobber_vreg(V2);
         let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = *bytes;
         let lo = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         let hi = u64::from_le_bytes([b8, b9, b10, b11, b12, b13, b14, b15]);
-        if (!full || lo == hi) && let Some(word) = super::fuse::encode_neon_movi(u32::from(full), lo) {
-            self.asm.word(word | u32::from(V2.0));
+        if self.emit_neon_imm_only(V2, full, lo, hi) {
             return;
         }
         if full && lo == hi {
-            self.asm.mov_imm(A, lo as i64);
-            self.asm.word(0x4E08_0C00 | u32::from(A.0) << 5 | u32::from(V2.0));
+            self.emit_dup_i64(V2, lo);
             return;
         }
-        if lo == 0 {
-            self.asm.veor_zero(V2);
-        } else {
+        if full && self.emit_ext_pair_imm(V2, V3, lo, hi) {
+            return;
+        }
+        if !self.emit_neon_imm_only(V2, false, lo, 0) {
             self.asm.mov_imm(A, lo as i64);
+            self.clobber_reg(A);
             self.asm.fmov_in(true, V2, A);
         }
         if full && hi != 0 {
             self.asm.mov_imm(C, hi as i64);
+            self.clobber_reg(C);
             self.ins_gpr(V2, 3, 1, C);
+        }
+    }
+
+    pub(super) fn vec_clz_or_ctz_i64(&mut self, spec: VecSpec, ctz: bool, dst: Vreg, src: Vreg) {
+        self.asm.fmov_out(true, A, src);
+        self.clobber_reg(A);
+        if ctz {
+            self.asm.bits(Bits::Rbit, A, A);
+        }
+        self.asm.bits(Bits::Clz, A, A);
+        if spec.count == 2 {
+            self.asm.umov_d1(C, src);
+            self.clobber_reg(C);
+            if ctz {
+                self.asm.bits(Bits::Rbit, C, C);
+            }
+            self.asm.bits(Bits::Clz, C, C);
+        }
+        self.asm.fmov_in(true, dst, A);
+        if spec.count == 2 {
+            self.ins_gpr(dst, 3, 1, C);
         }
     }
 
@@ -271,13 +349,19 @@ impl Emit<'_> {
         let dst = self.fdst(result);
         let src = self.fin(vec, dst);
         if spec.lane.is_float() {
-            let mut s = self.fin(val, V1);
-            if s == dst && src != dst {
-                self.asm.vmov(V1, s);
-                s = V1;
+            if self.const_bits(val) == Some(0) {
+                self.asm.vmov(dst, src);
+                self.ins_gpr(dst, spec.size, idx, ZR);
+            } else {
+                let mut s = self.fin(val, V1);
+                if s == dst && src != dst {
+                    self.asm.vmov(V1, s);
+                    self.clobber_vreg(V1);
+                    s = V1;
+                }
+                self.asm.vmov(dst, src);
+                self.ins_elem(dst, spec.size, idx, s, 0);
             }
-            self.asm.vmov(dst, src);
-            self.ins_elem(dst, spec.size, idx, s, 0);
         } else {
             let s = if self.plan.const_of(val) == Some(0) { ZR } else { self.bits(val, A) };
             self.asm.vmov(dst, src);
@@ -352,14 +436,14 @@ impl Emit<'_> {
 
     fn vec_reduce_bitwise(&mut self, op: ReduceOp, spec: VecSpec, src: Vreg, result: Value) {
         let bit_op = match op {
-            ReduceOp::And => 0x0E20_1C00,
-            ReduceOp::Or => 0x0EA0_1C00,
-            _ => 0x2E20_1C00,
+            ReduceOp::And => NEON_AND,
+            ReduceOp::Or => NEON_ORR,
+            _ => NEON_EOR,
         } | (spec.q << 30);
         let mut cur = src;
         let mut stride = spec.lane.bytes() * u32::from(spec.count) / 2;
         while stride >= spec.lane.bytes() {
-            self.asm.vbit(0x2E00_0000 | (spec.q << 30) | (stride << 11), V3, cur, cur);
+            self.asm.vbit(NEON_EXT | (spec.q << 30) | (stride << 11), V3, cur, cur);
             self.asm.vbit(bit_op, V2, cur, V3);
             cur = V2;
             stride /= 2;
@@ -387,10 +471,10 @@ impl Emit<'_> {
         }
         self.dup_scalar_elem(spec.size, 1, V2, src);
         let base = match op {
-            ReduceOp::Smax => 0x0E20_6400,
-            ReduceOp::Smin => 0x0E20_6C00,
-            ReduceOp::Umax => 0x2E20_6400,
-            _ => 0x2E20_6C00,
+            ReduceOp::Smax => NEON_SMAX,
+            ReduceOp::Smin => NEON_SMIN,
+            ReduceOp::Umax => NEON_UMAX,
+            _ => NEON_UMIN,
         };
         self.asm.vbit(base | (spec.size << 22), V2, src, V2);
         let dst = self.dst(result);
@@ -478,6 +562,7 @@ impl Emit<'_> {
                 let mut b = self.fin(args[1], V1);
                 if b == dst && a != dst {
                     self.asm.vmov(V1, b);
+                    self.clobber_vreg(V1);
                     b = V1;
                 }
                 self.asm.vmov(dst, a);
@@ -490,10 +575,12 @@ impl Emit<'_> {
                 if dst != a {
                     if b == dst {
                         self.asm.vmov(V1, b);
+                        self.clobber_vreg(V1);
                         b = V1;
                     }
                     if c == dst {
                         self.asm.vmov(V2, c);
+                        self.clobber_vreg(V2);
                         c = V2;
                     }
                     self.asm.vmov(dst, a);
@@ -504,6 +591,107 @@ impl Emit<'_> {
         self.fput(result, dst);
         Ok(())
     }
+
+    pub(super) fn emit_neon_imm_only(&mut self, dst: Vreg, full: bool, lo: u64, hi: u64) -> bool {
+        if lo == 0 && (!full || hi == 0) { self.asm.veor_zero(dst); return true; }
+        if (!full || lo == hi) && let Some(word) = encode_neon_imm(u32::from(full), lo) { self.clobber_vreg(dst); self.asm.word(word | u32::from(dst.0)); return true; }
+        if full && hi == 0 && let Some(word) = encode_neon_imm(0, lo) { self.clobber_vreg(dst); self.asm.word(word | u32::from(dst.0)); return true; }
+        false
+    }
+
+    fn emit_ext_pair_imm(&mut self, dst: Vreg, tmp: Vreg, lo: u64, hi: u64) -> bool {
+        let Some(w_hi) = (dst != tmp && can_emit_ext_pair_imm(lo, hi)).then(|| encode_neon_imm(0, hi)).flatten() else { return false };
+        if lo == 0 { self.asm.veor_zero(dst); } else if let Some(w_lo) = encode_neon_imm(1, lo) { self.asm.word(w_lo | u32::from(dst.0)); }
+        self.clobber_vreg(tmp);
+        self.asm.word(w_hi | u32::from(tmp.0));
+        self.asm.vbit(NEON_EXT | (1 << 30) | (8 << 11), dst, dst, tmp);
+        true
+    }
+
+    fn emit_dup_i64(&mut self, dst: Vreg, lo: u64) {
+        self.asm.mov_imm(A, lo as i64);
+        self.clobber_reg(A);
+        self.asm.word(NEON_DUP_GPR_2D | u32::from(A.0) << 5 | u32::from(dst.0));
+    }
+
+    pub(super) fn try_emit_const_vec_imm(&mut self, result: Value) -> bool {
+        let Some((full, lo, hi)) = self.eval_vec_full(result) else { return false };
+        let dst = self.fdst(result);
+        self.emit_neon_imm_only(dst, full, lo, hi).then(|| self.fput(result, dst)).is_some()
+    }
+
+    pub(super) fn emit_insert_i64_pair(&mut self, dst: Vreg, lo: Value, hi: Value) {
+        if let (Some(c_lo), Some(c_hi)) = (self.const_bits(lo), self.const_bits(hi)) {
+            let (u_lo, u_hi) = (c_lo as u64, c_hi as u64);
+            if self.emit_neon_imm_only(dst, true, u_lo, u_hi) || self.emit_ext_pair_imm(dst, V2, u_lo, u_hi) { return; }
+            if u_lo == u_hi { let s = self.bits(lo, A); self.asm.word(NEON_DUP_GPR_2D | u32::from(s.0) << 5 | u32::from(dst.0)); return; }
+        }
+        if !self.const_bits(lo).is_some_and(|c| self.emit_neon_imm_only(dst, false, c as u64, 0)) {
+            let s_lo = self.bits(lo, A);
+            self.asm.fmov_in(true, dst, s_lo);
+        }
+        if self.const_bits(hi) != Some(0) { let s_hi = self.bits(hi, C); self.ins_gpr(dst, 3, 1, s_hi); }
+    }
+
+    pub(super) fn try_vec_insert_const(&mut self, vec: Value, val: Value, idx: u8, spec: VecSpec, result: Value) -> bool {
+        if self.try_emit_const_vec_imm(result) { return true; }
+        if idx != 0 || !self.is_vec_zero(vec) { return false; }
+        if matches!(spec.lane, Lane::I32 | Lane::I64) {
+            let (dst, s) = (self.fdst(result), self.bits(val, A));
+            self.asm.fmov_in(spec.lane == Lane::I64, dst, s);
+            self.fput(result, dst);
+            return true;
+        }
+        if matches!(spec.lane, Lane::I8 | Lane::I16) && let Some(imm) = self.const_bits(val) {
+            let dst = self.fdst(result);
+            self.asm.mov_imm(A, imm & if spec.lane == Lane::I8 { 0xFF } else { 0xFFFF });
+            self.clobber_reg(A);
+            self.asm.fmov_in(false, dst, A);
+            self.fput(result, dst);
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn emit_vec_from_i64(&mut self, dst: Vreg, x: Value) {
+        if !self.const_bits(x).is_some_and(|imm| self.emit_neon_imm_only(dst, false, imm as u64, 0)) {
+            let src = self.bits(x, A);
+            self.asm.fmov_in(true, dst, src);
+        }
+    }
+
+    pub(super) fn vec_fcopysign(&mut self, spec: VecSpec, dst: Vreg, a: Vreg, b: Vreg) {
+        self.clobber_vreg(V2);
+        self.asm.word((if spec.lane == Lane::F64 { 0x0F00_E420 } else { 0x0F04_6400 }) | (spec.q << 30) | u32::from(V2.0));
+        if spec.lane == Lane::F64 { self.vec_shift_imm(spec, Binary::Ishl, 63, V2, V2); }
+        let out = if dst == b { self.clobber_vreg(V3); V3 } else { dst };
+        self.asm.vmov(out, a);
+        self.asm.vbit(0x2EA0_1C00 | (spec.q << 30), out, b, V2);
+        self.asm.vmov(dst, out);
+    }
+}
+
+fn can_emit_ext_pair_imm(lo: u64, hi: u64) -> bool {
+    (lo == 0 || encode_neon_imm(1, lo).is_some()) && encode_neon_imm(0, hi).is_some()
+}
+
+fn neon_fmov_imm8(bits: u64, is_f64: bool) -> Option<u8> {
+    let (low_mask, mant_shift, exp_bits, total) = if is_f64 { ((1_u64 << 48) - 1, 48, 8, 64) } else { ((1_u64 << 19) - 1, 19, 5, 32) };
+    let (exp_mask, b) = ((1_u64 << exp_bits) - 1, ((bits >> (total - 2)) & 1) ^ 1);
+    if (bits & low_mask) != 0 || ((bits >> (mant_shift + 6)) & exp_mask) != if b == 1 { exp_mask } else { 0 } { return None; }
+    Some((((bits >> (total - 1)) & 1) << 7 | (b << 6) | ((bits >> mant_shift) & 0x3F)) as u8)
+}
+
+pub(super) fn encode_neon_imm(q: u32, pattern: u64) -> Option<u32> {
+    if let Some(word) = super::fuse::encode_neon_movi(q, pattern) { return Some(word); }
+    let v32 = pattern as u32;
+    if v32 == (pattern >> 32) as u32 && let Some(i) = neon_fmov_imm8(u64::from(v32), false).map(u32::from) {
+        return Some(0x0F00_F400 | (q << 30) | ((i >> 5) << 16) | ((i & 0x1F) << 5));
+    }
+    if let Some(i) = neon_fmov_imm8(pattern, true).map(u32::from) {
+        return Some(if q == 1 { 0x6F00_F400 | ((i >> 5) << 16) | ((i & 0x1F) << 5) } else { 0x1E60_1000 | (i << 13) });
+    }
+    (q == 0 && (pattern >> 32) == 0).then(|| neon_fmov_imm8(pattern, false).map(|i| 0x1E20_1000 | (u32::from(i) << 13))).flatten()
 }
 
 fn rev_byte(container: usize, elem: usize, j: usize) -> usize {

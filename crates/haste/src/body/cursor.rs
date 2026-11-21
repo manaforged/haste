@@ -15,6 +15,8 @@ pub struct Cursor<'a> {
     pub config: super::Config<'a>,
     /// The block that the last macro expansion parsed to, which a statement macro splices into its enclosing block.
     pub expansion: Option<ExprId>,
+    /// The `expr;` statement that the last expansion held alone, which an expression takes as its value and a statement macro splices with its semicolon.
+    pub expansion_stmt: Option<u32>,
 }
 
 /// Whether `kind` is an identifier.
@@ -32,7 +34,7 @@ pub const PATH_KEYWORDS: [&str; 4] = ["crate", "self", "Self", "super"];
 
 impl<'a> Cursor<'a> {
     pub fn new(src: &'a Source, at: u32, end: u32) -> Cursor<'a> {
-        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, config: super::Config::default(), expansion: None }
+        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, config: super::Config::default(), expansion: None, expansion_stmt: None }
     }
 
     /// Whether the outer attributes at `attrs` hold a `#[cfg]` that the environment turns off.
@@ -177,6 +179,7 @@ impl<'a> Cursor<'a> {
 
     pub fn push_expr(&mut self, expr: super::Expr) -> ExprId {
         self.body.exprs.push(expr);
+        self.body.expr_ends.push(self.at);
         ExprId(self.body.exprs.len() as u32 - 1)
     }
 

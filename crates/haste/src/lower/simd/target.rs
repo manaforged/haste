@@ -2,8 +2,10 @@ use anyhow::{Result, bail};
 use haste_codegen::{Arch, IntCC, Lane, ReduceOp, StackSlot, Target, TargetOpId, Type, Value};
 
 use crate::host::{HostSymbol, X86Symbol};
+use crate::names::Primitive;
 
 use super::super::Lower;
+use super::SCRATCH_ALIGN;
 use super::wide::wide_quads;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,10 +47,10 @@ impl Lower<'_, '_> {
 
     pub(in crate::lower) fn byte_permute_32(&mut self, args: &[Value]) -> Result<Value> {
         let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
-        if let Some(value) = self.wide_byte_permute(table, index) {
+        if let Some(value) = self.wide_binary(TargetOpId::X64Pshufb256, table, index) {
             return Ok(value);
         }
-        let slot = self.b.create_stack_slot(32, 5);
+        let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
         let lo = self.shuffle_dyn_16(table, index, false, 0);
         let hi = self.shuffle_dyn_16(table, index, false, 16);
         self.ins().stack_store(lo, slot, 0);
@@ -142,7 +144,7 @@ impl Lower<'_, '_> {
         if x86.host_addr().is_none() {
             bail!("{} has no host function on this machine", x86.link_name());
         }
-        let slot = self.b.create_stack_slot(x86.out_bytes(), 5);
+        let slot = self.b.create_stack_slot(x86.out_bytes(), SCRATCH_ALIGN);
         let out = self.ins().stack_addr(Type::I64, slot, 0);
         let values: Vec<Value> = std::iter::once(out).chain(args.iter().copied()).collect();
         self.call_host(HostSymbol::X86(x86), &values, None);
@@ -162,6 +164,60 @@ impl Lower<'_, '_> {
         let f32x4 = Type::Vec { lane: Lane::F32, count: 4 };
         let f64x2 = Type::Vec { lane: Lane::F64, count: 2 };
         match (x86, args) {
+            (X86Symbol::Addcarry64 | X86Symbol::Subborrow64, &[carry, a, b]) if Target::host().arch == Arch::X64 => {
+                let (sum, carried) = if x86 == X86Symbol::Addcarry64 { (TargetOpId::X64AddCarry, TargetOpId::X64AddCarryOut) } else { (TargetOpId::X64SubBorrow, TargetOpId::X64SubBorrowOut) };
+                let result = self.ins().target_op(sum, Type::I64, &[carry, a, b]);
+                let out = self.ins().target_op(carried, Type::I8, &[carry, a, b]);
+                let (byte, quad) = (self.cx.types.prim(Primitive::U8), self.cx.types.prim(Primitive::U64));
+                Ok(Some(self.pair([byte, quad], [out, result])?))
+            }
+            (X86Symbol::Addcarry64 | X86Symbol::Subborrow64, &[carry, a, b]) => {
+                let set = self.ins().icmp_imm(IntCC::NotEqual, carry, 0);
+                let incoming = self.ins().uextend(Type::I128, set);
+                let (wide_a, wide_b) = (self.ins().uextend(Type::I128, a), self.ins().uextend(Type::I128, b));
+                let sum = if x86 == X86Symbol::Addcarry64 {
+                    let partial = self.ins().iadd(wide_a, wide_b);
+                    self.ins().iadd(partial, incoming)
+                } else {
+                    let partial = self.ins().isub(wide_a, wide_b);
+                    self.ins().isub(partial, incoming)
+                };
+                let result = self.ins().ireduce(Type::I64, sum);
+                let c64 = self.ins().iconst(Type::I64, 64);
+                let high = self.ins().ushr(sum, c64);
+                let high = self.ins().ireduce(Type::I64, high);
+                let out = self.ins().icmp_imm(IntCC::NotEqual, high, 0);
+                let (byte, quad) = (self.cx.types.prim(Primitive::U8), self.cx.types.prim(Primitive::U64));
+                Ok(Some(self.pair([byte, quad], [out, result])?))
+            }
+            (X86Symbol::Pclmulqdq | X86Symbol::Pclmulqdq256 | X86Symbol::Pclmulqdq512, &[a, b, imm]) if Target::host().arch == Arch::X64 && self.b.const_int(imm).is_some() => {
+                let id = match self.b.const_int(imm).unwrap_or_default() & 0x11 {
+                    0x00 => TargetOpId::X64ClmulLowLow,
+                    0x01 => TargetOpId::X64ClmulHighLow,
+                    0x10 => TargetOpId::X64ClmulLowHigh,
+                    _ => TargetOpId::X64ClmulHighHigh,
+                };
+                let i64x2 = Type::Vec { lane: Lane::I64, count: 2 };
+                let product = |lower: &mut Self, off: i32| {
+                    let (x, y) = (lower.ins().load(i64x2, a, off), lower.ins().load(i64x2, b, off));
+                    lower.ins().target_op(id, i64x2, &[x, y])
+                };
+                Ok(Some(self.emit_chunks(x86.out_bytes(), product)))
+            }
+            (X86Symbol::Permd, &[a, index]) => {
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
+                for lane in 0..8 {
+                    let at = self.ins().load(Type::I32, index, lane * 4);
+                    let seven = self.ins().iconst(Type::I32, 7);
+                    let at = self.ins().band(at, seven);
+                    let at = self.ins().uextend(Type::I64, at);
+                    let at = self.ins().imul_imm(at, 4);
+                    let from = self.ins().iadd(a, at);
+                    let word = self.ins().load(Type::I32, from, 0);
+                    self.ins().stack_store(word, slot, lane * 4);
+                }
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
             (X86Symbol::Lddqu, &[at]) => {
                 let v = self.ins().load(i8x16, at, 0);
                 Ok(Some(self.store_vec(v, 16)))
@@ -177,7 +233,7 @@ impl Lower<'_, '_> {
             }
             (X86Symbol::Packsswb256 | X86Symbol::Packuswb256, &[a, b]) => {
                 let signed = x86 == X86Symbol::Packsswb256;
-                let slot = self.b.create_stack_slot(32, 5);
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
                 self.pack_sat_half(i16x8, i8x8, signed, (a, b), (slot, 0));
                 self.pack_sat_half(i16x8, i8x8, signed, (a, b), (slot, 16));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
@@ -189,7 +245,7 @@ impl Lower<'_, '_> {
             }
             (X86Symbol::Packssdw256 | X86Symbol::Packusdw256, &[a, b]) => {
                 let signed = x86 == X86Symbol::Packssdw256;
-                let slot = self.b.create_stack_slot(32, 5);
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
                 self.pack_sat_half(i32x4, i16x4, signed, (a, b), (slot, 0));
                 self.pack_sat_half(i32x4, i16x4, signed, (a, b), (slot, 16));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
@@ -198,19 +254,22 @@ impl Lower<'_, '_> {
                 let v = self.pmaddwd_128(a, b, 0);
                 Ok(Some(self.store_vec(v, 16)))
             }
-            (X86Symbol::Pmaddwd256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.pmaddwd_128(a, b, off)))),
+            (X86Symbol::Pmaddwd256, &[a, b]) => Ok(Some(self.wide_binary(TargetOpId::X64Pmaddwd256, a, b).unwrap_or_else(|| self.emit_256(|lower, off| lower.pmaddwd_128(a, b, off))))),
             (X86Symbol::Pmaddubsw128, &[a, b]) => {
                 let v = self.pmaddubsw_128(a, b, 0);
                 Ok(Some(self.store_vec(v, 16)))
             }
-            (X86Symbol::Pmaddubsw256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.pmaddubsw_128(a, b, off)))),
+            (X86Symbol::Pmaddubsw256, &[a, b]) => Ok(Some(self.wide_binary(TargetOpId::X64Pmaddubsw256, a, b).unwrap_or_else(|| self.emit_256(|lower, off| lower.pmaddubsw_128(a, b, off))))),
             (X86Symbol::Psadbw, &[a, b]) => {
                 let slot = self.b.create_stack_slot(16, 4);
                 self.psadbw_128((a, b), (slot, 0));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
             }
             (X86Symbol::Psadbw256, &[a, b]) => {
-                let slot = self.b.create_stack_slot(32, 5);
+                if let Some(v) = self.wide_binary(TargetOpId::X64Psadbw256, a, b) {
+                    return Ok(Some(v));
+                }
+                let slot = self.b.create_stack_slot(32, SCRATCH_ALIGN);
                 self.psadbw_128((a, b), (slot, 0));
                 self.psadbw_128((a, b), (slot, 16));
                 Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
@@ -330,7 +389,7 @@ impl Lower<'_, '_> {
             }
             (X86Symbol::Pmulhrsw128 | X86Symbol::Pmulhrsw256, &[a, b]) => {
                 let wide = x86 == X86Symbol::Pmulhrsw256;
-                let slot = self.b.create_stack_slot(if wide { 32 } else { 16 }, if wide { 5 } else { 4 });
+                let slot = self.b.create_stack_slot(if wide { 32 } else { 16 }, SCRATCH_ALIGN);
                 self.pmulhrsw_128(a, b, slot, 0);
                 if wide {
                     self.pmulhrsw_128(a, b, slot, 16);
@@ -341,12 +400,18 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn emit_256(&mut self, mut half: impl FnMut(&mut Self, i32) -> Value) -> Value {
-        let slot = self.b.create_stack_slot(32, 5);
-        let lo = half(self, 0);
-        let hi = half(self, 16);
-        self.ins().stack_store(lo, slot, 0);
-        self.ins().stack_store(hi, slot, 16);
+    fn emit_256(&mut self, half: impl FnMut(&mut Self, i32) -> Value) -> Value {
+        self.emit_chunks(32, half)
+    }
+
+    /// The address of a new `bytes`-byte frame slot that holds each 16-byte chunk `chunk` gives for its offset.
+    fn emit_chunks(&mut self, bytes: u32, mut chunk: impl FnMut(&mut Self, i32) -> Value) -> Value {
+        let slot = self.b.create_stack_slot(bytes, SCRATCH_ALIGN);
+        let offsets: Vec<i32> = (0..bytes as i32).step_by(16).collect();
+        let values: Vec<Value> = offsets.iter().map(|&off| chunk(self, off)).collect();
+        for (off, value) in offsets.into_iter().zip(values) {
+            self.ins().stack_store(value, slot, off);
+        }
         self.ins().stack_addr(Type::I64, slot, 0)
     }
 

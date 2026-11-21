@@ -179,7 +179,7 @@ fn bins_of(dir: &Path, name: &str, root: &Table, package: &Table) -> Vec<(String
 
 /// Reads the manifest at `dir/Cargo.toml`, inheriting from `workspace` (the root's `[workspace]` table).
 pub fn read(dir: &Path, workspace: Option<&Table>) -> Result<Manifest> {
-    let path = dir.join("Cargo.toml");
+    let path = dir.join(super::MANIFEST_FILE);
     let text_of = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let root: Table = toml::from_str(&text_of).with_context(|| format!("parsing {}", path.display()))?;
     manifest_of(dir, &root, workspace)
@@ -187,7 +187,7 @@ pub fn read(dir: &Path, workspace: Option<&Table>) -> Result<Manifest> {
 
 /// Reads the `[workspace]` table of the manifest at `dir/Cargo.toml`, if it has one, with its dependency paths made absolute.
 pub fn workspace_of(dir: &Path) -> Result<Option<Table>> {
-    let path = dir.join("Cargo.toml");
+    let path = dir.join(super::MANIFEST_FILE);
     let root: Table = toml::from_str(&std::fs::read_to_string(&path)?).with_context(|| format!("parsing {}", path.display()))?;
     let Some(mut workspace) = root.get("workspace").and_then(Value::as_table).cloned() else {
         return Ok(None);

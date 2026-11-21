@@ -14,6 +14,7 @@ mod ty;
 use anyhow::Result;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::names::{Sym, Symbols, plain};
 use crate::outline::source::Source;
 
 use cursor::Cursor;
@@ -55,6 +56,18 @@ impl Body {
     pub fn list(&self, list: List) -> &[u32] {
         &self.ids[list.start as usize..(list.start + list.len) as usize]
     }
+
+    /// The interned name of each segment of this body, parsed from `src`, interned once per body.
+    pub fn syms(&self, symbols: &Symbols, src: &Source) -> &[Sym] {
+        self.syms.get_or_init(|| self.segments.iter().map(|segment| symbols.intern(plain(src.text(segment.name)))).collect())
+    }
+}
+
+impl BlockKind {
+    /// Whether this block introduces a plain value scope rather than a `try`, `async`, `gen`, or `const` boundary.
+    pub fn is_plain_scope(self) -> bool {
+        matches!(self, Self::Plain | Self::Expansion | Self::Unsafe)
+    }
 }
 
 /// What a body is parsed with besides its tokens: the block each macro call became, and the environment that `#[cfg]` attributes read.
@@ -82,7 +95,8 @@ pub fn parse(src: &Source, open: u32, config: Config<'_>) -> Result<Body> {
 }
 
 /// Adds to `body` the parameter patterns that start at tokens `starts` of `src`.
-pub fn parse_params(src: &Source, body: Body, starts: &[u32]) -> Result<Body> {
+pub fn parse_params(src: &Source, mut body: Body, starts: &[u32]) -> Result<Body> {
+    body.syms.take();
     let mut cursor = Cursor::new(src, 0, src.len());
     cursor.body = body;
     for &start in starts {

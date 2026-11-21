@@ -21,6 +21,7 @@ fn const_int_at(func: &Function, value: Value, depth: u8) -> Option<i64> {
     match *op {
         Op::Const(imm) => Some(imm),
         Op::Binary(Binary::Imul, a, b) => const_int_at(func, a, depth + 1)?.checked_mul(const_int_at(func, b, depth + 1)?),
+        Op::Convert(Convert::Ireduce, inner) => Some(const_int_at(func, inner, depth + 1)? & func.ty(value).unsigned_max() as i64),
         _ => None,
     }
 }

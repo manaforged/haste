@@ -30,11 +30,13 @@ type WorkerOutput = (Pass, Vec<(usize, String)>, Vec<usize>, Vec<(Instance, u32)
 /// How a pass compiles its buckets: the dictionary configuration, and whether a bucket of one function compiles alone.
 type Plan = (DictConfig, bool);
 
-fn bucket_work(reached: &Reached, work: &[usize]) -> Vec<Vec<usize>> {
+/// The functions of `work` grouped by item, in the order each item first appears.
+pub(super) fn bucket_work(reached: &Reached, work: &[usize]) -> Vec<Vec<usize>> {
     bucket_by_item(work, |index| reached.list[index].0.0)
 }
 
-fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
+/// The chunks of `buckets` dealt into at most `jobs` shards of about equal function counts.
+pub(super) fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
     let chunks = lpt_chunks(buckets, MAX_BUCKET);
     let count = jobs.min(chunks.len());
     let mut loads = vec![0usize; count];
@@ -138,7 +140,7 @@ impl Image {
         let mut deferred = Vec::new();
         for wave in 0..MAX_PARALLEL_WAVES {
             let forks: Vec<Context<'_>> = current_shards.iter().map(|_| cx.fork()).collect();
-            let outputs = self.run_workers(forks, reached, &current_shards, plan);
+            let outputs = self.run_shards(forks, &current_shards, |fork, shard| self.worker_loop(fork, reached, shard, plan));
             deferred.clear();
             let mut eval_requests = Vec::new();
             for (shard, output) in current_shards.iter().zip(outputs) {
@@ -183,9 +185,11 @@ impl Image {
         lost.collect()
     }
 
-    fn run_workers<'a>(&self, forks: Vec<Context<'a>>, reached: &Reached, shards: &[Vec<Vec<usize>>], plan: Plan) -> Vec<Option<WorkerOutput>> {
+    /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, and gives what each thread returned, or `None` for one that panicked.
+    pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Option<T>> {
+        let work = &work;
         std::thread::scope(|scope| {
-            let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || self.worker_loop(fork, reached, shard, plan))).collect();
+            let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || work(fork, shard))).collect();
             handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
         })
     }
@@ -445,7 +449,7 @@ impl Image {
                             continue;
                         }
                     };
-                    let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+                    let symbols = self.symbols(&relocs);
                     if let Some(hit) = self.reuse_cached((item, footprint), index, &symbols, self.backend.is_aot().then_some(&relocs), pass)
                         && cfg.verify
                     {
@@ -504,12 +508,74 @@ impl Image {
         self.commit_aot_groups(&evaluated, cached, 0, pass);
     }
 
+    fn try_direct_frozen_slice(
+        &self,
+        cx: &mut Context<'_>,
+        reached: &Reached,
+        (item, footprint, rep): (ItemRef, FootprintId, usize),
+        (rest, indices): (&[usize], &[usize]),
+        slice: &crate::substrate::StencilSlice<'_>,
+        pass: &mut Pass,
+    ) -> Result<(), Tally> {
+        if self.backend.is_check() {
+            let len = slice.code().len() as u32;
+            for &idx in indices {
+                pass.record_size(idx, len, 0);
+            }
+            return Ok(());
+        }
+        if !self.backend.is_aot() {
+            return Err(Tally::MissOther);
+        }
+        let Ok(code) = slice.to_code().map(Arc::new) else { return Err(Tally::MissOther) };
+        if code.relocs().iter().all(|r| r.symbol_index().is_none()) {
+            let len = code.bytes().len() as u32;
+            let aot_code = AotCode::from_code(&code);
+            self.cache_aot_template(cx, reached, (item, footprint, rep), CachedAotTemplate::Direct { code: Arc::clone(&aot_code), reloc_plan: Arc::default() });
+            self.record_aot(rep, AotFn::Direct { code: aot_code, relocs: Vec::new() }, rest);
+            for &idx in indices {
+                pass.record_size(idx, len, 0);
+            }
+            return Ok(());
+        }
+        let Some(reloc_plan) = self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, false, slice.plan()).map(Arc::new) else {
+            return Err(Tally::MissPlan);
+        };
+        if aot_relocs_valid(&code, reloc_plan.reloc_len())
+            && self.try_commit_frozen_template(cx, reached, (item, footprint, rep), indices, CachedAotTemplate::Direct { code: AotCode::from_code(&code), reloc_plan }, 0, pass)
+        {
+            return Ok(());
+        }
+        Err(Tally::MissOther)
+    }
+
+    fn try_dict_frozen_slice(
+        &self,
+        cx: &mut Context<'_>,
+        reached: &Reached,
+        (item, footprint, rep): (ItemRef, FootprintId, usize),
+        indices: &[usize],
+        slice: &crate::substrate::StencilSlice<'_>,
+        pass: &mut Pass,
+    ) -> Result<(), Tally> {
+        let Ok(code) = slice.to_code().map(Arc::new) else { return Err(Tally::MissOther) };
+        let Some(reloc_plan) = self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, false, slice.plan()).map(Arc::new) else {
+            return Err(Tally::MissPlan);
+        };
+        let dict_len = code.bytes().len() as u32;
+        if self.try_commit_frozen_template(cx, reached, (item, footprint, rep), indices, CachedAotTemplate::Dict { body: AotCode::from_code(&code), reloc_plan }, dict_len, pass) {
+            Ok(())
+        } else {
+            Err(Tally::MissOther)
+        }
+    }
+
     fn try_frozen_partitioned(&self, cx: &mut Context<'_>, reached: &Reached, item: ItemRef, footprint: FootprintId, rep: usize, rest: &[usize], indices: &[usize], cfg: DictConfig, pass: &mut Pass) -> bool {
         if cfg.verify {
             return false;
         }
         tally(Tally::Lookup);
-        let Some((is_sysroot, direct_key, fp_bits)) = self.frozen_stencil_key(cx, reached, rep, footprint) else {
+        let Some((_, direct_key, fp_bits)) = self.frozen_stencil_key(cx, reached, rep, footprint) else {
             tally(if footprint.is_portable() { Tally::MissUnkeyed } else { Tally::MissUnportable });
             return false;
         };
@@ -517,57 +583,22 @@ impl Image {
             tally(Tally::MissOther);
             return false;
         };
-        let mut reason = Tally::MissAbsent;
         let prefer_dict = self.backend.is_aot() && cfg.min_bytes == 0 && indices.len() >= cfg.min_fanout;
-        if !prefer_dict && let Some(slice) = substrate.stencil(direct_key, fp_bits) {
-            if self.backend.is_check() {
-                let len = slice.code().len() as u32;
-                for &idx in indices {
-                    pass.record_size(idx, len, 0);
-                }
-                tally(Tally::Hit);
-                return true;
-            }
-            reason = Tally::MissOther;
-            if self.backend.is_aot() && let Ok(code) = slice.to_code().map(Arc::new) {
-                if code.relocs().iter().all(|r| r.symbol_index().is_none()) {
-                    let len = code.bytes().len() as u32;
-                    let aot_code = AotCode::from_code(&code);
-                    self.cache_aot_template(cx, reached, (item, footprint, rep), CachedAotTemplate::Direct { code: Arc::clone(&aot_code), reloc_plan: Arc::default() });
-                    self.record_aot(rep, AotFn::Direct { code: aot_code, relocs: Vec::new() }, rest);
-                    for &idx in indices {
-                        pass.record_size(idx, len, 0);
-                    }
-                    tally(Tally::Hit);
-                    return true;
-                }
-                match self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan()).map(Arc::new) {
-                    Some(reloc_plan) => {
-                        if aot_relocs_valid(&code, reloc_plan.reloc_len())
-                            && self.try_commit_frozen_template(cx, reached, (item, footprint, rep), indices, CachedAotTemplate::Direct { code: AotCode::from_code(&code), reloc_plan }, 0, pass)
-                        {
-                            tally(Tally::Hit);
-                            return true;
-                        }
-                    }
-                    None => reason = Tally::MissPlan,
-                }
+        let mut reason = Tally::MissAbsent;
+        if let Some(slice) = (!prefer_dict).then(|| substrate.stencil(direct_key, fp_bits)).flatten() {
+            match self.try_direct_frozen_slice(cx, reached, (item, footprint, rep), (rest, indices), &slice, pass) {
+                Ok(()) => return { tally(Tally::Hit); true },
+                Err(why) => reason = why,
             }
         }
-        if self.backend.is_aot()
-            && indices.len() >= cfg.min_fanout
-            && let Some(slice) = substrate.stencil(mode_dict_key(direct_key), fp_bits)
-            && (prefer_dict || slice.code().len() > cfg.min_bytes)
-            && let Ok(code) = slice.to_code().map(Arc::new)
-        {
-            match self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan()).map(Arc::new) {
-                Some(reloc_plan) => {
-                    let dict_len = code.bytes().len() as u32;
-                    let done = self.try_commit_frozen_template(cx, reached, (item, footprint, rep), indices, CachedAotTemplate::Dict { body: AotCode::from_code(&code), reloc_plan }, dict_len, pass);
-                    tally(if done { Tally::Hit } else { Tally::MissOther });
-                    return done;
-                }
-                None => reason = Tally::MissPlan,
+        let dict_slice = (self.backend.is_aot() && indices.len() >= cfg.min_fanout)
+            .then(|| substrate.stencil(mode_dict_key(direct_key), fp_bits))
+            .flatten()
+            .filter(|slice| prefer_dict || slice.code().len() > cfg.min_bytes);
+        if let Some(slice) = dict_slice {
+            match self.try_dict_frozen_slice(cx, reached, (item, footprint, rep), indices, &slice, pass) {
+                Ok(()) => return { tally(Tally::Hit); true },
+                Err(why) => reason = why,
             }
         }
         tally(reason);
@@ -619,10 +650,10 @@ impl Image {
 
     pub(super) fn try_frozen_dict_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, pass: &mut Pass) -> Option<Result<(), String>> {
         let rep = group.representative();
-        let (is_sysroot, direct_key, fp_bits) = self.frozen_stencil_key(cx, reached, rep, group.footprint)?;
+        let (_, direct_key, fp_bits) = self.frozen_stencil_key(cx, reached, rep, group.footprint)?;
         let slice = cx.store().substrate()?.stencil(mode_dict_key(direct_key), fp_bits)?;
         let code = Arc::new(slice.to_code().ok()?);
-        let reloc_plan = Arc::new(self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan())?);
+        let reloc_plan = Arc::new(self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, false, slice.plan())?);
         let mut evaluated = Vec::with_capacity(group.distinct.len());
         for inst in &group.distinct {
             let relocs = lower::eval_relocs(cx, reached, self, &reloc_plan, inst.leader).ok()?;
@@ -643,6 +674,17 @@ impl Image {
         Some(Ok(()))
     }
 
+    fn encode_frozen_plan(&self, cx: &Context<'_>, reached: &Reached, is_sysroot: bool, plan: Option<&RelocPlan>) -> Option<(bool, Vec<u8>)> {
+        let p = plan?;
+        if let Some(bytes) = self.encode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, p) {
+            return Some((is_sysroot, bytes));
+        }
+        is_sysroot
+            .then(|| self.encode_aot_reloc_plan(cx.outline, &cx.types, reached, false, p))
+            .flatten()
+            .map(|bytes| (false, bytes))
+    }
+
     pub(super) fn freeze_stencil(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId, is_dict: bool, code: &Arc<Code>, plan: Option<&RelocPlan>, pass: &mut Pass) {
         let valid_relocs = if is_dict {
             code.relocs().iter().all(|r| r.as_runtime().is_some())
@@ -650,31 +692,22 @@ impl Image {
             code.relocs().iter().all(|r| r.symbol_index().is_some() || (self.backend.is_aot() && r.as_runtime().is_some()))
         };
         if !cx.deferred_evals.is_empty() {
-            tally(Tally::FreezeDeferred);
-        } else if valid_relocs
-            && let Some((is_sysroot, direct_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp)
-        {
-            let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some());
-            let plan_bytes = if self.backend.is_aot() && needs_plan {
-                match plan.and_then(|p| self.encode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, p)) {
-                    Some(bytes) => bytes,
-                    None if is_dict => {
-                        tally(Tally::FreezeSkipped);
-                        return;
-                    }
-                    None => {
-                        tally(Tally::FreezePlanless);
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            let key = if is_dict { mode_dict_key(direct_key) } else { direct_key };
-            pass.frozen_stencils.push(super::FrozenStencil { is_sysroot, key, fp: fp_bits, code: Arc::clone(code), plan: plan_bytes });
-        } else {
-            tally(Tally::FreezeSkipped);
+            return tally(Tally::FreezeDeferred);
         }
+        let Some((is_sysroot, direct_key, fp_bits)) = valid_relocs.then(|| self.frozen_stencil_key(cx, reached, index, fp)).flatten() else {
+            return tally(Tally::FreezeSkipped);
+        };
+        let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some());
+        let (store_sysroot, plan_bytes) = if self.backend.is_aot() && needs_plan {
+            let Some(pair) = self.encode_frozen_plan(cx, reached, is_sysroot, plan) else {
+                return tally(if is_dict { Tally::FreezeSkipped } else { Tally::FreezePlanless });
+            };
+            pair
+        } else {
+            (is_sysroot, Vec::new())
+        };
+        let key = if is_dict { mode_dict_key(direct_key) } else { direct_key };
+        pass.frozen_stencils.push(super::FrozenStencil { is_sysroot: store_sysroot, key, fp: fp_bits, code: Arc::clone(code), plan: plan_bytes });
     }
 
     fn group_instances(&self, cx: &mut Context<'_>, reached: &Reached, item: ItemRef, out: &lower::StencilOutput, rep: usize, rest: &[usize], aot_fast: bool, errors: &mut Vec<(usize, String)>) -> Vec<DistinctInst> {
@@ -708,7 +741,7 @@ impl Image {
             let inst = DistinctInst { leader: index, followers: Vec::new(), symbols: Vec::new(), relocs: Some(relocs.clone()) };
             (InstanceKey::Relocs(relocs), inst)
         } else {
-            let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+            let symbols = self.symbols(&relocs);
             let key = InstanceKey::Syms(symbols.clone());
             let inst = DistinctInst { leader: index, followers: Vec::new(), symbols, relocs: self.backend.is_aot().then_some(relocs) };
             (key, inst)

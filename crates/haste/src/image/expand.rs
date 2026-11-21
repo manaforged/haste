@@ -14,6 +14,7 @@ pub struct Job<'a> {
     pub entry: usize,
     pub run: usize,
     pub texts: Vec<&'a [u8]>,
+    pub vars: &'a [(String, String)],
     pub group: (usize, u32),
 }
 
@@ -95,6 +96,12 @@ impl Driver for Shares<'_, '_> {
 
 impl Image {
     fn macros_in_child(&self, jobs: &[&Job<'_>], mut out: std::fs::File) -> std::io::Result<()> {
+        if let Some(first) = jobs.first() {
+            for (key, value) in first.vars {
+                // SAFETY: single-threaded forked child process before invoking procedural macro code.
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
         for job in jobs {
             let (entry, run) = (self.slot(job.entry).load(Ordering::Acquire), self.slot(job.run).load(Ordering::Acquire));
             let mut result = [0usize; 2];

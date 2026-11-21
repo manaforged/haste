@@ -187,7 +187,7 @@ impl<'a> Context<'a> {
         Some(BodyPath::Def(def))
     }
 
-    /// The bindings that the `use` declarations of the body `root` in module `home` give `word`, or every name they import when none, as code at token `here` sees them: named imports first, then globs.
+    /// The bindings that the `use` declarations of the body `root` in module `home` give `word`, or every name they import when none, as the body item `here` sees them: named imports first, then globs.
     pub(super) fn body_imports(&self, (root, home): (ItemRef, ModRef), word: Option<Sym>, (here, hidden): (Option<u32>, &[u32])) -> Vec<PerNs> {
         let Some(found) = self.expansion(root) else {
             return Vec::new();
@@ -287,7 +287,7 @@ impl<'a> Context<'a> {
         Some(Def::Variant(item, index as u32))
     }
 
-    /// Resolves `path` in the type namespace through the `use` declarations of the body `root` in module `home`, as code at token `here` sees them, when one binds its first segment.
+    /// Resolves `path` in the type namespace through the `use` declarations of the body `root` in module `home`, as the body item `here` sees them, when one binds its first segment.
     pub(super) fn body_use_path(&self, (root, home): (ItemRef, ModRef), path: &NamePath<'_>, here: Option<u32>) -> Option<Def> {
         let (first, rest) = path.segments.split_first().filter(|_| !path.absolute)?;
         let binding = self.body_imports((root, home), Some(*first), (here, &[])).into_iter().find_map(|entry| entry.types)?;
@@ -295,14 +295,14 @@ impl<'a> Context<'a> {
     }
 }
 
-/// Whether the `use` declaration `import` of a body's expansion `file` is in scope at token `here`, or in the body itself when `here` is none: it is unless a function or module declared in the body holds it and not `here`.
+/// Whether the `use` declaration `import` of a body's expansion `file` is in scope for the body item `here`, or in the body itself when `here` is none: it is unless a function or module declared in the body holds it and does not hold `here`.
 fn import_visible(file: &File, index: &Index, import: u32, here: Option<u32>) -> bool {
-    index.holders[import as usize].iter().all(|&at| here.is_some_and(|here| holds(&file.items.items[at as usize], here)))
+    index.holders[import as usize].iter().all(|&at| here.is_some_and(|here| encloses(&file.items.items, at, here)))
 }
 
-/// Whether the tokens of `entry` hold token `token`.
-fn holds(entry: &Item, token: u32) -> bool {
-    entry.start <= token && token < entry.end
+/// Whether item `at` is item `from` or holds it through the chain of parents, which follows macro expansions laid after the body.
+fn encloses(items: &[Item], at: u32, from: u32) -> bool {
+    std::iter::successors(Some(from), |&now| items[now as usize].parent).any(|now| now == at)
 }
 
 /// The name index of a body's expansion `file`: its items by holder and plain name, its imports by the name `symbols` spells for them, and the functions around each import.
@@ -316,14 +316,13 @@ fn index_of(file: &File, symbols: &Symbols) -> Index {
             index.items.entry(level).or_default().entry(plain(src.text(name)).into()).or_default().push(at as u32);
         }
     }
-    let scopes: Vec<u32> = (0..items.len() as u32).filter(|&at| matches!(items[at as usize].kind, ItemKind::Fn | ItemKind::Mod)).collect();
     for import in 0..file.items.imports.len() as u32 {
         match import_parts(file, import, symbols).3 {
             Some(name) => index.imports.entry(symbols.text(name).into()).or_default().push(import),
             None => index.globs.push(import),
         }
-        let start = items[file.items.imports[import as usize].item as usize].start;
-        index.holders.push(scopes.iter().copied().filter(|&at| holds(&items[at as usize], start)).collect());
+        let parent = items[file.items.imports[import as usize].item as usize].parent;
+        index.holders.push(std::iter::successors(parent, |&at| items[at as usize].parent).filter(|&at| matches!(items[at as usize].kind, ItemKind::Fn | ItemKind::Mod)).collect());
     }
     index
 }

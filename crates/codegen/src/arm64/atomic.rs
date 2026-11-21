@@ -1,7 +1,6 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, S, T};
-use crate::frame::Ext;
-use crate::ir::{AtomicRmwOp, Binary, Op, Type, Unary, Value};
+use crate::ir::{AtomicRmwOp, Binary, Convert, IntCC, Op, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
@@ -84,20 +83,50 @@ impl Emit<'_> {
         Ok(())
     }
 
+    fn load_gp(&mut self, dst: Reg, ty: Type, signed: bool, op: &Op) {
+        let size = Size::of(ty.bytes());
+        match *op {
+            Op::Load(addr, off) => {
+                if let Some((base, index, shift)) = self.sib_indexed(addr, off, ty.bytes()) {
+                    self.asm.load_indexed(size, signed, dst, base, index, shift);
+                } else {
+                    let from = self.address(addr, off);
+                    self.asm.load(size, signed, dst, from);
+                }
+            }
+            Op::StackLoad(slot, off) => self.asm.load(size, signed, dst, self.slot(slot, off)),
+            _ => {}
+        }
+    }
+
+    pub(super) fn load_signed(&mut self, result: Value, src_ty: Type, op: &Op) {
+        let dst = self.dst(result);
+        self.load_gp(dst, src_ty, true, op);
+        self.put(result, dst);
+    }
+
+    pub(super) fn load_signed_reg(&mut self, dst: Reg, src_ty: Type, op: &Op) {
+        self.load_gp(dst, src_ty, true, op);
+        self.clobber_reg(dst);
+    }
+
     fn load_at(&mut self, result: Value, addr: Value, offset: i32) {
+        if self.plan.is_static(result) {
+            return;
+        }
         let ty = self.ty(result);
+        if ty != Type::I128 && !ty.in_float_register() {
+            let dst = self.dst(result);
+            self.load_gp(dst, ty, false, &Op::Load(addr, offset));
+            self.put(result, dst);
+            return;
+        }
         if ty != Type::I128
             && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
         {
-            if ty.in_float_register() {
-                let dst = self.fdst(result);
-                self.asm.vload_indexed(ty.bytes(), dst, base, index, shift);
-                self.fput(result, dst);
-            } else {
-                let dst = self.dst(result);
-                self.asm.load_indexed(Size::of(ty.bytes()), false, dst, base, index, shift);
-                self.put(result, dst);
-            }
+            let dst = self.fdst(result);
+            self.asm.vload_indexed(ty.bytes(), dst, base, index, shift);
+            self.fput(result, dst);
             return;
         }
         let from = self.address(addr, offset);
@@ -159,6 +188,9 @@ impl Emit<'_> {
     }
 
     fn read(&mut self, result: Value, from: Mem) {
+        if self.plan.is_static(result) {
+            return;
+        }
         let ty = self.ty(result);
         if ty.in_float_register() {
             let dst = self.fdst(result);
@@ -168,8 +200,12 @@ impl Emit<'_> {
         }
         if ty == Type::I128 {
             let hi = if from.base == C { super::IP } else { C };
-            self.asm.load(Size::X, false, A, from);
-            self.asm.load(Size::X, false, hi, from.offset(8));
+            if Self::pair_disp_ok(from.disp) {
+                self.asm.ldp_offset(A, hi, from.base, from.disp);
+            } else {
+                self.asm.load(Size::X, false, hi, from.offset(8));
+                self.asm.load(Size::X, false, A, from);
+            }
             self.clobber_regs(&[A, hi]);
             self.put(result, A);
             self.put_high(result, hi);
@@ -191,11 +227,20 @@ impl Emit<'_> {
             return;
         }
         if ty == Type::I128 {
-            let hi = if to.base == C { super::IP } else { C };
-            self.raw(A, value);
-            self.high(hi, value);
-            self.asm.store(Size::X, to, A);
-            self.asm.store(Size::X, to.offset(8), hi);
+            let (lo, hi) = if self.plan.const_of(value) == Some(0) {
+                (ZR, ZR)
+            } else {
+                let hi = if to.base == C { super::IP } else { C };
+                self.raw(A, value);
+                self.high(hi, value);
+                (A, hi)
+            };
+            if Self::pair_disp_ok(to.disp) {
+                self.asm.stp_offset(lo, hi, to.base, to.disp);
+            } else {
+                self.asm.store(Size::X, to, lo);
+                self.asm.store(Size::X, to.offset(8), hi);
+            }
             return;
         }
         let source = self.store_src(value);
@@ -205,7 +250,10 @@ impl Emit<'_> {
     fn store_src(&mut self, value: Value) -> Reg {
         match self.plan.const_of(value) {
             Some(0) => ZR,
-            _ => self.bits(value, A),
+            _ => {
+                let source = super::fuse::store_source(self.func, &self.plan, value, |v| self.defs[v.index()]);
+                self.bits(source, A)
+            }
         }
     }
 
@@ -232,24 +280,39 @@ impl Emit<'_> {
         }
     }
 
+    fn elided_icmp_of(&self, condition: Value) -> Option<(IntCC, Value, Value)> {
+        if !self.plan.elided[condition.index()] {
+            return None;
+        }
+        match self.func.insts[self.defs[condition.index()]?.index()].op {
+            Op::Icmp(cc, a, b) => Some((cc, a, b)),
+            Op::Convert(Convert::Uextend, inner) if self.plan.elided[inner.index()] => {
+                match self.func.insts[self.defs[inner.index()]?.index()].op {
+                    Op::Icmp(cc, a, b) => Some((cc, a, b)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn select_cond(&mut self, condition: Value) -> Cond {
         if let Some((val, c)) = self.flags
             && val == condition
         {
             return c;
         }
-        if self.plan.elided[condition.index()]
-            && let Some(inst) = self.defs[condition.index()]
-            && let Op::Icmp(cc, a, b) = self.func.insts[inst.index()].op
-        {
+        if let Some((cc, a, b)) = self.elided_icmp_of(condition) {
             let c = self.compare(cc, a, b);
             self.flags = Some((condition, c));
             return c;
         }
         self.flags = None;
         self.last_cmp = None;
-        let flag = self.src(condition, C, Ext::Zero);
-        self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+        if !self.tst_small_zero(condition) {
+            let flag = self.zext_src(condition, C);
+            self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+        }
         Cond::Ne
     }
 
@@ -266,6 +329,12 @@ impl Emit<'_> {
     fn select_const_pair(&mut self, cond: Cond, size: Size, dst: Reg, (x, y): (Value, Value), (kx, ky): (i64, i64)) {
         let (ux, uy) = (kx as u64, ky as u64);
         let mask = if size == Size::W { u32::MAX as u64 } else { u64::MAX };
+        if ux == 0 || uy == 0 {
+            self.select_csel(cond, dst, (x, y), (ux == 0, uy == 0));
+            return;
+        }
+        let prefer_y = self.plan.reg_of(x).is_none() && (self.plan.reg_of(y).is_some() || super::asm::Asm::mov_imm_is_single(ky));
+        let pick = |this: &mut Self| if prefer_y { (this.bits(y, C), cond.invert()) } else { (this.bits(x, A), cond) };
         if ((ux.wrapping_add(1)) & mask) == uy {
             let reg = self.bits(x, A);
             self.asm.csinc(size, cond, dst, reg, reg);
@@ -273,13 +342,13 @@ impl Emit<'_> {
             let reg = self.bits(y, C);
             self.asm.csinc(size, cond.invert(), dst, reg, reg);
         } else if (!ux & mask) == uy {
-            let reg = self.bits(x, A);
-            self.asm.csinv(size, cond, dst, reg, reg);
+            let (reg, c) = pick(self);
+            self.asm.csinv(size, c, dst, reg, reg);
         } else if (ux.wrapping_neg() & mask) == uy {
-            let reg = self.bits(x, A);
-            self.asm.csneg(size, cond, dst, reg, reg);
+            let (reg, c) = pick(self);
+            self.asm.csneg(size, c, dst, reg, reg);
         } else {
-            self.select_csel(cond, dst, (x, y), (kx == 0, ky == 0));
+            self.select_csel(cond, dst, (x, y), (false, false));
         }
     }
 
@@ -406,7 +475,7 @@ impl Emit<'_> {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        self.get(D, value, Ext::of(signed));
+        self.get_opt(D, value, signed);
         let again = self.asm.label();
         self.asm.bind(again);
         self.asm.load_acquire(true, size, A, S);
@@ -446,7 +515,7 @@ impl Emit<'_> {
     fn cas(&mut self, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        self.get(D, expected, Ext::Zero);
+        self.zext_get(D, expected);
         self.raw(C, replacement);
         let (again, done) = (self.asm.label(), self.asm.label());
         self.asm.bind(again);

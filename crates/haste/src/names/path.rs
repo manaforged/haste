@@ -48,7 +48,21 @@ impl Requests {
         self.scopes.borrow_mut().extend(other.scopes.borrow().iter().copied());
         self.procs.borrow_mut().extend(other.procs.borrow().iter().cloned());
     }
+
+    pub(super) fn into_parts(self) -> RequestParts {
+        (self.modules.into_inner(), self.names.into_inner(), self.crates.into_inner(), self.scopes.into_inner(), self.procs.into_inner())
+    }
+
+    pub(super) fn extend_parts(&self, (modules, names, crates, scopes, procs): RequestParts) {
+        self.modules.borrow_mut().extend(modules);
+        self.names.borrow_mut().extend(names);
+        self.crates.borrow_mut().extend(crates);
+        self.scopes.borrow_mut().extend(scopes);
+        self.procs.borrow_mut().extend(procs);
+    }
 }
+
+pub(super) type RequestParts = (Vec<ModRef>, Vec<(ModRef, Sym)>, Vec<u32>, Vec<ModRef>, Vec<(ItemRef, String)>);
 
 /// What path resolution in one crate can see.
 pub struct Paths<'a> {
@@ -118,6 +132,10 @@ impl<'a> Paths<'a> {
         Some(module(*root as u32, 0))
     }
 
+    fn cached_variants(&self, item: ItemRef) -> Option<&[Sym]> {
+        item.outer().is_none().then(|| self.done.get(item.krate as usize)?.enums.get(&(item.file, item.item)).map(Box::as_ref)).flatten()
+    }
+
     fn variants(&self, item: ItemRef) -> Vec<(&'a str, u32)> {
         let Some(file) = self.trees.get(item.krate as usize).and_then(|tree| tree.files.get(item.file as usize)) else {
             return Vec::new();
@@ -154,9 +172,14 @@ impl<'a> Paths<'a> {
                 found.unwrap_or_default()
             }
             Def::Item(item) if self.item_kind(item) == Some(ItemKind::Enum) => {
-                let text = self.symbols.text(name);
-                let found = self.variants(item).into_iter().find(|(variant, _)| *variant == text);
-                let binding = found.map(|(_, index)| Binding { def: Def::Variant(item, index), vis: Vis::Pub, origin: Origin::Item });
+                let index = match self.cached_variants(item) {
+                    Some(variants) => variants.iter().position(|&v| v == name).map(|idx| idx as u32),
+                    None => {
+                        let text = self.symbols.text(name);
+                        self.variants(item).into_iter().find(|(variant, _)| *variant == text).map(|(_, idx)| idx)
+                    }
+                };
+                let binding = index.map(|idx| Binding { def: Def::Variant(item, idx), vis: Vis::Pub, origin: Origin::Item });
                 PerNs { types: binding, values: binding, macros: None }
             }
             _ => PerNs::default(),
@@ -196,6 +219,9 @@ impl<'a> Paths<'a> {
 
     /// Every variant of the enum `item`, as bindings.
     pub fn all_variants(&self, item: ItemRef) -> Vec<(Sym, Binding)> {
+        if let Some(variants) = self.cached_variants(item) {
+            return variants.iter().enumerate().map(|(idx, &sym)| (sym, Binding { def: Def::Variant(item, idx as u32), vis: Vis::Pub, origin: Origin::Glob })).collect();
+        }
         let variants = self.variants(item).into_iter();
         variants.map(|(name, index)| (self.symbols.intern(name), Binding { def: Def::Variant(item, index), vis: Vis::Pub, origin: Origin::Glob })).collect()
     }

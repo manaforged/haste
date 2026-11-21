@@ -110,6 +110,42 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
     Ok((mix.finish(), cycle_root))
 }
 
+fn mix_instance_flags(cx: &Context<'_>, slots: &dyn Slots, mix: &mut HashMix, krate: u32) {
+    mix.bool(slots.low_entries());
+    mix.bool(slots.allow_inline());
+    mix.bool(cx.outline.crates[krate as usize].env.overflow_checks());
+}
+
+fn try_unique_closure_footprint(
+    cx: &Context<'_>,
+    slots: &dyn Slots,
+    item: ItemRef,
+    substs: crate::sema::substs::Substs,
+    cb: &crate::sema::infer::ClosureBody,
+    index: usize,
+) -> Option<FootprintId> {
+    if cb.closure.coroutine {
+        let mut mix = HashMix::new(0x51a7_1c03);
+        mix.local_index(index);
+        return Some(mix.finish());
+    }
+    let first = *cx.types.substs(substs).first()?;
+    let Kind::Closure(c_def, p_substs, closure_idx) = *cx.types.kind(first) else { return None };
+    if !p_substs.is_empty() {
+        return None;
+    }
+    let mut mix = HashMix::new(0x51a7_1c04);
+    if cx.outline.is_fixed(c_def.krate) {
+        mix.item(cx.outline, item);
+        mix.item(cx.outline, c_def);
+        mix.u32(closure_idx);
+        mix_instance_flags(cx, slots, &mut mix, c_def.krate);
+    } else {
+        mix.local_index(index);
+    }
+    Some(mix.finish())
+}
+
 fn try_unique_footprint(cx: &Context<'_>, slots: &dyn Slots, item: ItemRef, substs: crate::sema::substs::Substs, typed: &Typed, index: usize) -> Option<FootprintId> {
     if cx.foreign(item) {
         let mut mix = HashMix::new(0xff);
@@ -122,34 +158,18 @@ fn try_unique_footprint(cx: &Context<'_>, slots: &dyn Slots, item: ItemRef, subs
         mix.local_index(index);
         return Some(mix.finish());
     }
-    if substs.is_empty() && matches!(typed.shape, Shape::Body) {
-        let mut mix = HashMix::new(0x51a7_1c01);
-        mix.item(cx.outline, item);
-        mix.bool(slots.low_entries());
-        mix.bool(slots.allow_inline());
-        mix.bool(cx.outline.crates[item.krate as usize].env.overflow_checks());
-        return Some(mix.finish());
-    }
     if substs.is_empty() && !matches!(typed.shape, Shape::Closure(_)) {
         let mut mix = HashMix::new(0x51a7_1c01);
         mix.item(cx.outline, item);
-        mix.local_index(index);
+        if matches!(typed.shape, Shape::Body) || cx.outline.is_fixed(item.krate) {
+            mix_instance_flags(cx, slots, &mut mix, item.krate);
+        } else {
+            mix.local_index(index);
+        }
         return Some(mix.finish());
     }
     if let Shape::Closure(cb) = &typed.shape {
-        if cb.closure.coroutine {
-            let mut mix = HashMix::new(0x51a7_1c03);
-            mix.local_index(index);
-            return Some(mix.finish());
-        }
-        if let Some(&first) = cx.types.substs(substs).first()
-            && let Kind::Closure(_, p_substs, _) = *cx.types.kind(first)
-            && p_substs.is_empty()
-        {
-            let mut mix = HashMix::new(0x51a7_1c04);
-            mix.local_index(index);
-            return Some(mix.finish());
-        }
+        return try_unique_closure_footprint(cx, slots, item, substs, cb, index);
     }
     None
 }

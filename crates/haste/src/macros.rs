@@ -76,6 +76,7 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
 /// Loads the member crates' roots, resolves their names and expands their procedural macro calls, reading of other crates only what those lookups reach, then drops the macro expander.
 pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, &[]);
+    crate::substrate::preload_fixed_files(workspace, &targets.target.triple, &outline);
     let selected: Vec<bool> = (0..outline.crates.len())
         .map(|krate| outline.package(workspace, krate).sysroot || workspace.graph.members.contains(&workspace.graph.units[outline.roots[krate].unit].package))
         .collect();
@@ -209,7 +210,7 @@ fn apply(compilation: &mut Compilation, bound: &[Bound], outputs: Vec<Result<Str
     let Compilation { outline, names, .. } = compilation;
     let to_parse: Vec<(std::path::PathBuf, Result<String, String>)> =
         bound.iter().zip(outputs).map(|(call, output)| (site_path(&call.site), output)).collect();
-    let parsed = parallel_map(to_parse, |(path, output)| output.and_then(|text| Source::parse(path, text).map_err(|error| format!("{error:#}"))));
+    let parsed = crate::sync::parallel_map(to_parse, |(path, output)| output.and_then(|text| Source::parse(path, text).map_err(|error| format!("{error:#}"))));
     let mut by_crate: HashMap<usize, Vec<(usize, Source, String)>> = HashMap::default();
     let mut stale = Vec::new();
     for (call, parsed) in bound.iter().zip(parsed) {
@@ -349,7 +350,14 @@ type Call = (ItemRef, ProcKind, usize);
 /// The output of each call `bound` on its `inputs`, or why it failed: the result the store kept for a macro of a pinned crate, else from running it, kept when it ran.
 fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
     let outline = &compilation.outline;
-    let keys: Vec<Option<store::Expansion>> = bound.iter().zip(inputs).map(|(&(call, ..), texts)| Some(store::Expansion::new(outline.pins[call.krate as usize]?, &macro_name(outline, call), texts))).collect();
+    let keys: Vec<Option<store::Expansion>> = bound
+        .iter()
+        .zip(inputs)
+        .map(|(&(call, _, caller), texts)| {
+            let caller_pin = if caller == usize::MAX { Some(0) } else { outline.pins[caller] };
+            Some(store::Expansion::new((outline.pins[call.krate as usize]?, caller_pin?), &macro_name(outline, call), texts))
+        })
+        .collect();
     let mut results: Vec<Option<Result<String, String>>> = vec![None; keys.len()];
     let mut checks: Vec<(usize, &store::Expansion)> = Vec::new();
     for (at, key) in keys.iter().enumerate() {
@@ -357,7 +365,7 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
             checks.push((at, key));
         }
     }
-    for (at, kept) in parallel_map(checks, |(at, key)| (at, key.kept())) {
+    for (at, kept) in crate::sync::parallel_map(checks, |(at, key)| (at, key.kept())) {
         results[at] = kept;
     }
     let missing: Vec<usize> = (0..bound.len()).filter(|&at| results[at].is_none()).collect();
@@ -376,6 +384,18 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
     Ok(results.into_iter().map(|result| result.unwrap_or_else(|| Err("no output".to_owned()))).collect())
 }
 
+fn caller_vars(outline: &Outline, caller: usize) -> Vec<(String, String)> {
+    let Some(tree) = outline.crates.get(caller) else { return Vec::new() };
+    let env = &tree.env;
+    let mut vars = Vec::with_capacity(env.vars.len() + 2);
+    vars.push(("CARGO_CRATE_NAME".to_owned(), outline.roots[caller].name.clone()));
+    vars.extend(env.vars.iter().cloned());
+    if let Some(script) = &env.script {
+        vars.extend(script.vars.iter().cloned());
+    }
+    vars
+}
+
 /// Runs each call `bound` on its `inputs` in children that compile each function on its first call; `None` for a call that did not run. The macro expander keeps its code and inference while its macro crate graph is unchanged.
 fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Option<Result<String, String>>>> {
     let pair = entries(&mut compilation.outline)?;
@@ -383,6 +403,10 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
         Some(kept) if kept.matches(&compilation.outline) => (kept.jit, kept.roots),
         _ => (Jit::new(Cache::default())?, Vec::new()),
     };
+    let mut env_by_caller: HashMap<usize, Vec<(String, String)>> = HashMap::default();
+    for &(_, _, caller) in bound {
+        env_by_caller.entry(caller).or_insert_with(|| caller_vars(&compilation.outline, caller));
+    }
     let entry = pair.map(|item| demand.declare((item, crate::sema::substs::Substs::EMPTY)));
     let jobs: Vec<Job<'_>> = bound
         .iter()
@@ -391,6 +415,7 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
             entry: entry[usize::from(kind == ProcKind::Attribute)],
             run: demand.declare((call, crate::sema::substs::Substs::EMPTY)),
             texts: texts.iter().map(|text| text.as_bytes()).collect(),
+            vars: env_by_caller.get(&caller).map_or(&[], Vec::as_slice),
             group: (caller, call.krate),
         })
         .collect();
@@ -440,29 +465,4 @@ fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {
         }
     }
     hasher.finish()
-}
-
-fn parallel_map<T: Send, R: Send>(mut items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
-    let workers = crate::jobs().min(items.len());
-    if items.len() < 4 || workers <= 1 {
-        return items.into_iter().map(work).collect();
-    }
-    let chunk = items.len().div_ceil(workers);
-    let mut batches = Vec::with_capacity(workers);
-    while !items.is_empty() {
-        batches.push(items.split_off(items.len().saturating_sub(chunk)));
-    }
-    batches.reverse();
-    let mut slots: Vec<Vec<R>> = (0..batches.len()).map(|_| Vec::new()).collect();
-    if let Some((first_batch, rest_batches)) = batches.split_first_mut()
-        && let Some((first_slot, rest_slots)) = slots.split_first_mut()
-    {
-        std::thread::scope(|scope| {
-            for (batch, slot) in rest_batches.iter_mut().zip(rest_slots.iter_mut()) {
-                scope.spawn(|| *slot = std::mem::take(batch).into_iter().map(&work).collect());
-            }
-            *first_slot = std::mem::take(first_batch).into_iter().map(&work).collect();
-        });
-    }
-    slots.into_iter().flatten().collect()
 }

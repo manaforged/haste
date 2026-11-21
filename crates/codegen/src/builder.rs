@@ -14,12 +14,13 @@ pub struct FunctionBuilder<'f> {
     pub func: &'f mut Function,
     current: Option<Block>,
     incoming: Vec<u32>,
+    loc: u64,
 }
 
 impl<'f> FunctionBuilder<'f> {
     /// A builder that appends to `func`.
     pub fn new(func: &'f mut Function) -> Self {
-        Self { incoming: vec![0; func.blocks.len()], func, current: None }
+        Self { incoming: vec![0; func.blocks.len()], func, current: None, loc: 0 }
     }
 
     /// Adds an empty block.
@@ -100,6 +101,7 @@ impl<'f> FunctionBuilder<'f> {
         }
         self.incoming.truncate(mark.blocks);
         func.types.truncate(mark.types);
+        func.value_flags.truncate(mark.types);
         func.blocks.truncate(mark.blocks);
         func.insts.truncate(mark.insts);
         func.slots.truncate(mark.slots);
@@ -128,7 +130,7 @@ impl<'f> FunctionBuilder<'f> {
     }
 
     fn inline_remap(&mut self, callee: &Function, args: &[Value], sym_base: u32, dict: Option<Value>) -> Vec<Value> {
-        let values: Vec<Value> = callee.types.iter().map(|ty| self.func.value(*ty)).collect();
+        let values: Vec<Value> = self.func.import_values(callee);
         let blocks: Vec<Block> = callee.blocks.iter().map(|_| self.create_block()).collect();
         let after = self.create_block();
         let results: Vec<Value> = callee.signature.returns.iter().map(|ret| self.append_block_param(after, ret.value_type)).collect();
@@ -172,7 +174,17 @@ impl<'f> FunctionBuilder<'f> {
     /// Appends one instruction to the current block.
     pub fn ins(&mut self) -> Ins<'_> {
         let block = self.current.expect("a block is selected");
-        Ins { func: self.func, block, incoming: &mut self.incoming }
+        Ins { func: self.func, block, incoming: &mut self.incoming, loc: self.loc }
+    }
+
+    /// The source place that instructions built from now on carry.
+    pub fn loc(&self) -> u64 {
+        self.loc
+    }
+
+    /// Sets the source place that instructions built from now on carry: file key in the high 32 bits, byte offset in the low 32.
+    pub fn set_loc(&mut self, loc: u64) {
+        self.loc = loc;
     }
 }
 
@@ -185,7 +197,7 @@ impl Function {
         };
         self.bump_cfg();
         self.insts[old_inst.index()].result = None;
-        let values: Vec<Value> = callee.types.iter().map(|ty| self.value(*ty)).collect();
+        let values: Vec<Value> = self.import_values(callee);
         let base_block = self.blocks.len() as u32;
         let blocks: Vec<Block> = (0..callee.blocks.len() as u32).map(|i| Block(base_block + i)).collect();
         self.blocks.resize_with(self.blocks.len() + callee.blocks.len(), BlockData::default);
@@ -265,7 +277,7 @@ impl Remap {
             Op::Return(values) => op = Op::Jump(self.after, std::mem::take(values)),
             _ => {}
         }
-        InstData { op, result: data.result.map(|value| self.values[value.index()]) }
+        InstData { op, result: data.result.map(|value| self.values[value.index()]), loc: data.loc }
     }
 }
 
@@ -275,12 +287,13 @@ pub struct Ins<'b> {
     func: &'b mut Function,
     block: Block,
     incoming: &'b mut Vec<u32>,
+    loc: u64,
 }
 
 impl Ins<'_> {
     fn push(&mut self, op: Op, ty: Option<Type>) -> (Inst, Option<Value>) {
         let result = ty.map(|ty| self.func.value(ty));
-        self.func.insts.push(InstData { op, result });
+        self.func.insts.push(InstData { op, result, loc: self.loc });
         let inst = Inst(self.func.insts.len() as u32 - 1);
         self.func.blocks[self.block.index()].insts.push(inst);
         (inst, result)

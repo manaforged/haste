@@ -260,6 +260,10 @@ fn key(op: &Op, consts: &[Option<i64>], bool_neg: &[Option<Value>], types: &[Typ
     })
 }
 
+fn block_tag(block: Block) -> u32 {
+    block.0 + 1
+}
+
 /// The values the dominating blocks computed, by key, and the keys to forget on leaving each block.
 #[derive(Default)]
 struct Table {
@@ -268,7 +272,7 @@ struct Table {
     consts: Vec<Option<i64>>,
     bool_neg: Vec<Option<Value>>,
     icmp_def: Vec<Option<(IntCC, Type, Value, Value)>>,
-    def_block: Vec<Block>,
+    def_block: Vec<u32>,
     local_flag_only: Vec<bool>,
     bool_val: Vec<bool>,
     affine: Vec<(Value, i64)>,
@@ -554,7 +558,7 @@ impl Table {
                     }
                 };
                 if let Some(&earlier) = self.known.get(&key) {
-                    if self.local_flag_only[result.index()] && self.def_block[earlier.index()] != block {
+                    if self.local_flag_only[result.index()] && self.def_block[earlier.index()] != block_tag(block) {
                         return true;
                     }
                     subst[result.index()] = earlier;
@@ -614,7 +618,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let mut bool_val = vec![false; func.types.len()];
     let mut bool_neg = vec![None; func.types.len()];
     let mut icmp_def = vec![None; func.types.len()];
-    let mut def_block = vec![Block(u32::MAX); func.types.len()];
+    let mut def_block = vec![0_u32; func.types.len()];
     let mut local_flag_only = vec![false; func.types.len()];
     let uses = func.use_counts();
     for &b in &cfg.rpo {
@@ -623,7 +627,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             let data = &func.insts[inst.index()];
             if let Some(res) = data.result {
                 let ri = res.index();
-                def_block[ri] = b;
+                def_block[ri] = block_tag(b);
                 match data.op {
                     Op::Const(imm) => {
                         let ty = func.ty(res);
@@ -666,7 +670,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             }
             if let Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) = data.op
                 && uses[c.index()] == 1
-                && def_block[c.index()] == b
+                && def_block[c.index()] == block_tag(b)
                 && let Some(c_def) = blk.insts.iter().find(|&&i| func.insts[i.index()].result == Some(c))
                 && matches!(func.insts[c_def.index()].op, Op::Icmp(..))
             {

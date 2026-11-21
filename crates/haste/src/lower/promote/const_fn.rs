@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 
 use crate::body::{BlockKind, Expr, ExprId, List, Pat, PatId, Stmt, UnOp};
 use crate::names::{ItemRef, Primitive};
-use crate::sema::infer::{Res, Shape};
+use crate::sema::infer::{LazyTables, Res, Shape, Typed};
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Ty, int_info, mask};
 
@@ -11,25 +13,38 @@ use super::super::stencil::RodataReloc;
 use super::const_val::{ConstEnv, Flow, Frame, Val};
 use super::literal::{MAX_CONST_DEPTH, Scope};
 
+fn is_readable_const_body(cx: &crate::sema::Context<'_>, owner: ItemRef, source: ItemRef, typed: &Typed) -> bool {
+    let env = &cx.outline.crates[source.krate as usize].env;
+    matches!(typed.shape, Shape::Body)
+        && !cx.foreign(source)
+        && !matches!(typed.tables, LazyTables::CheckOnly(_))
+        && (env.release || env.fixed || source.krate == owner.krate)
+}
+
 impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
     /// Looks up a concrete, readable `Shape::Body` function or const item without side effects.
-    pub(super) fn const_body_source(&self, item: ItemRef, substs: Substs) -> Option<(ItemRef, std::sync::Arc<crate::sema::infer::Typed>)> {
+    pub(super) fn const_body_source(&mut self, item: ItemRef, substs: Substs) -> Option<(ItemRef, Arc<Typed>)> {
         if self.lower.cx.types.substs_have_params(substs) {
             return None;
         }
-        let &index = self.lower.reached.index.get(&(item, substs))?;
-        if self.lower.reached.is_untyped(index) {
-            return None;
-        }
-        let ((source, _), Ok(typed)) = &self.lower.reached.list[index] else {
-            return None;
-        };
-        if !matches!(typed.shape, Shape::Body) || self.lower.cx.foreign(*source) {
-            return None;
-        }
         let owner = self.lower.reached.list[self.lower.index].0.0;
-        let env = &self.lower.cx.outline.crates[source.krate as usize].env;
-        (env.release || env.fixed || source.krate == owner.krate).then(|| (*source, typed.clone()))
+        if let Some(&index) = self.lower.reached.index.get(&(item, substs)) {
+            if self.lower.reached.is_untyped(index) {
+                return None;
+            }
+            let ((source, _), Ok(typed)) = &self.lower.reached.list[index] else {
+                return None;
+            };
+            return is_readable_const_body(self.lower.cx, owner, *source, typed).then(|| (*source, typed.clone()));
+        }
+        let env = &self.lower.cx.outline.crates[item.krate as usize].env;
+        if self.lower.cx.foreign(item) || !(env.release || env.fixed || item.krate == owner.krate) {
+            return None;
+        }
+        let (before, mut unlaid) = (self.lower.cx.quiet_mark(), Vec::new());
+        let typed = crate::sema::reach::typed_once(self.lower.cx, &(item, substs), &mut unlaid).ok()?;
+        (unlaid.is_empty() && self.lower.cx.quiet_mark() == before && is_readable_const_body(self.lower.cx, owner, item, &typed))
+            .then_some((item, typed))
     }
 
     /// Resolves and caches an immutable static item inside the interpreter arena.

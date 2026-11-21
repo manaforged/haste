@@ -1,5 +1,8 @@
 //! Haste: the build graph, name resolution, type inference, lowering, and the JIT that runs the program.
 
+#[cfg(not(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "aarch64", target_os = "macos"))))]
+compile_error!("haste currently supports only x86_64-unknown-linux-gnu and aarch64-apple-darwin hosts");
+
 mod aot;
 mod body;
 mod build;
@@ -41,7 +44,7 @@ fn set_jobs(count: usize) {
 static PROFILE: OnceLock<outline::tree::Profile> = OnceLock::new();
 
 /// The build profile: the one `--release` set, else the debug profile.
-fn profile() -> outline::tree::Profile {
+pub(crate) fn profile() -> outline::tree::Profile {
     *PROFILE.get_or_init(outline::tree::Profile::default)
 }
 

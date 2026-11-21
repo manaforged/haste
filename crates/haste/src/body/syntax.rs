@@ -260,6 +260,8 @@ pub enum Node {
 #[derive(Debug, Default)]
 pub struct Body {
     pub exprs: Vec<Expr>,
+    /// The token just past each expression, by `ExprId`, from which `Source::origin` finds its place on disk.
+    pub expr_ends: Vec<u32>,
     pub pats: Vec<Pat>,
     pub tys: Vec<Ty>,
     pub paths: Vec<Path>,
@@ -276,4 +278,6 @@ pub struct Body {
     pub root: Option<ExprId>,
     /// The function's parameter patterns, parsed into this arena when one of them is more than a name.
     pub fn_params: Vec<PatId>,
+    /// The interned name of each segment, filled on the first call to `Body::syms`.
+    pub(super) syms: std::sync::OnceLock<Box<[crate::names::Sym]>>,
 }

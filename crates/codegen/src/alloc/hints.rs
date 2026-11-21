@@ -1,5 +1,7 @@
-use crate::ir::{Binary, Block, Convert, Function, Op, Type, Unary, Value};
-use crate::live::{Live, overlaps};
+use crate::frame::{Abi, Loc};
+use crate::ir::{Binary, Block, Convert, Function, Op, Signature, TargetOpId, Type, Unary, Value};
+use crate::live::{Live, covers, overlaps};
+use crate::park::crosses_ranges;
 
 use super::{Location, Regs, Uses, registered};
 
@@ -84,6 +86,10 @@ fn reuse_binary<R: 'static>(ctx: &ReuseCtx<'_, R>, reuse: &[Option<Value>], (blo
 fn reuse_candidate<R: 'static>(ctx: &ReuseCtx<'_, R>, reuse: &[Option<Value>], (block_idx, at, result): (usize, usize, Value), end_at: u32) -> Option<Value> {
     let data = &ctx.func.insts[ctx.func.blocks[block_idx].insts[at].index()];
     match data.op {
+        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64SubBorrow, ref args) => match *args.as_slice() {
+            [carry, a, b] if a != b && a != carry && reuse_dies(ctx, result, a, end_at) => Some(a),
+            _ => None,
+        },
         Op::Binary(op, x, y) => reuse_binary(ctx, reuse, (block_idx, at, result), (op, x, y), end_at),
         Op::Convert(Convert::Uextend | Convert::Sextend | Convert::Ireduce | Convert::Bitcast, x)
             if reuse_dies(ctx, result, x, end_at) => Some(x),
@@ -128,8 +134,39 @@ pub(super) fn reusable<R: 'static>(func: &Function, regs: &Regs<R>, locations: &
     reuse
 }
 
+/// Each zero-extension of a value with clean upper bits that stays live through it and no call, as (copy, source): the two hold the same register bits.
+pub(super) fn extend_copies(func: &Function, live: &Live, zero_ext: &[bool], pooled: &[bool]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let data = &func.insts[inst.index()];
+        let (Op::Convert(Convert::Uextend, source), Some(copy)) = (&data.op, data.result) else { continue };
+        let (copy, source) = (copy.index(), source.index());
+        let ranges = live.ranges_of(copy);
+        if pooled[copy]
+            && pooled[source]
+            && zero_ext[source]
+            && func.types[copy].bytes() <= 8
+            && !ranges.is_empty()
+            && !crosses_ranges(&live.calls, ranges)
+            && covers(live.ranges_of(source), ranges)
+        {
+            out.push((copy, source));
+        }
+    }
+    out
+}
+
+fn reg_reduce<R: PartialEq>(func: &Function, locations: &[Location<R>], res: Value, src: Value) -> bool {
+    matches!(func.types[res.index()], Type::I8 | Type::I16) && matches!((&locations[res.index()], &locations[src.index()]), (Location::Reg(a), Location::Reg(b)) if a != b)
+}
+
+/// Whether some 8- or 16-bit narrowing copies between two different registers, where an extending copy costs no more than a move.
+pub(super) fn has_reg_reduce<R: PartialEq>(func: &Function, locations: &[Location<R>]) -> bool {
+    func.insts.iter().any(|data| matches!((&data.op, data.result), (&Op::Convert(Convert::Ireduce, src), Some(res)) if reg_reduce(func, locations, res, src)))
+}
+
 /// Computes which small integer values already have zero-extended upper bits in 64-bit registers.
-pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<bool> {
+pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>], census: &Uses, call_zext: bool) -> Vec<bool> {
     let count = func.types.len();
     let (mut out, mut incoming) = (vec![false; count], vec![Some(Vec::new()); count]);
     if let Some(entry) = func.entry {
@@ -150,7 +187,8 @@ pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &U
     }
     for (v, ty) in func.types.iter().enumerate() {
         let single_def = census.def_inst[v].is_some_and(|d| func.insts[d.index()].result == Some(Value(v as u32)));
-        out[v] = ty.is_small_int() && (single_def || incoming[v].as_ref().is_some_and(|l| !l.is_empty()));
+        let narrow_call = call_zext && matches!(ty, Type::I8 | Type::I16) && census.def_inst[v].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Call { .. }));
+        out[v] = ty.is_small_int() && (single_def || narrow_call || incoming[v].as_ref().is_some_and(|l| !l.is_empty()));
     }
     let const_val = |v: Value| match locations[v.index()] {
         Location::Imm(imm) => Some(imm),
@@ -198,7 +236,8 @@ pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &U
                 Op::Binary(Binary::Band, a, b) => ty == Type::I32 || (matches!(ty, Type::I8 | Type::I16) && (out[a.index()] || out[b.index()] || fits_mask(a, ty_mask(ty)) || fits_mask(b, ty_mask(ty)))),
                 Op::Convert(Convert::Ireduce, shifted) => {
                     let (src_ty, dst_bits) = (func.types[shifted.index()], ty.bits());
-                    clean_bits(&out, shifted).is_some_and(|w| w <= dst_bits)
+                    (call_zext && reg_reduce(func, locations, res, shifted))
+                        || clean_bits(&out, shifted).is_some_and(|w| w <= dst_bits)
                         || (matches!(src_ty, Type::I64 | Type::I32)
                             && census.def_inst[shifted.index()].is_some_and(|def| match func.insts[def.index()].op {
                                 Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => dst_bits >= 8,
@@ -221,4 +260,49 @@ pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &U
         }
     }
     out
+}
+
+/// The register each value is passed or returned in at a call or return, and the register a high product lands in.
+pub(super) fn passed<R: Copy>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>, high_product: Option<R>) -> (Vec<Option<(R, bool)>>, Vec<Option<(u8, bool)>>) {
+    let (mut ints, mut floats) = (vec![None; func.types.len()], vec![None; func.types.len()]);
+    let mark = |vals: &[Value], locs: &[Loc<R>], arg: bool, ints: &mut [Option<(R, bool)>], floats: &mut [Option<(u8, bool)>]| {
+        for (val, loc) in vals.iter().zip(locs) {
+            match *loc {
+                Loc::Int(reg) if arg || ints[val.index()].is_none() => ints[val.index()] = Some((reg, arg)),
+                Loc::Float(reg) if arg || floats[val.index()].is_none() => floats[val.index()] = Some((reg, arg)),
+                _ => {}
+            }
+        }
+    };
+    let ret_abi = classify(&func.signature).ok();
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        match &func.insts[inst.index()].op {
+            Op::Call { sig, args, results, .. } => {
+                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
+                    mark(args, &abi.params, true, &mut ints, &mut floats);
+                    mark(results, &abi.returns, false, &mut ints, &mut floats);
+                }
+            }
+            Op::TryCall { sig, args, .. } => {
+                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
+                    mark(args, &abi.params, true, &mut ints, &mut floats);
+                }
+            }
+            Op::Binary(Binary::Umulhi | Binary::Smulhi, ..) => {
+                if let (Some(reg), Some(res)) = (high_product, func.insts[inst.index()].result)
+                    && func.ty(res) == Type::I64
+                    && ints[res.index()].is_none()
+                {
+                    ints[res.index()] = Some((reg, false));
+                }
+            }
+            Op::Return(vals) => {
+                if let Some(abi) = &ret_abi {
+                    mark(vals, &abi.returns, false, &mut ints, &mut floats);
+                }
+            }
+            _ => {}
+        }
+    }
+    (ints, floats)
 }

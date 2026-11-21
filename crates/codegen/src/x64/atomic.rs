@@ -1,10 +1,10 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
-use super::float::X1;
+use super::float::{X0, X1};
 use super::location::LEAF;
 use super::{Emit, int};
 use crate::alloc::Location;
 use crate::frame::{Emitter, Ext};
-use crate::ir::{AtomicRmwOp, Binary, Function, IntCC, Op, StackSlot, Type, Unary, Value};
+use crate::ir::{AtomicRmwOp, Binary, Block, Function, IntCC, Op, ShuffleMask, StackSlot, TargetOpId, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
@@ -18,10 +18,11 @@ const VECTOR: u32 = 16;
 /// The opcodes of `movups` from memory into an xmm register, and from an xmm register into memory.
 const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
 
-/// Whether `op` of `func` uses rsi or rdx as scratch.
+/// Whether `op` of `func` uses rsi, rdx or r11 as scratch.
 pub(super) fn uses_scratch(func: &Function, op: &Op) -> bool {
     match op {
-        Op::Copy(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Fits(Binary::Imul, ..) => true,
+        Op::Copy(..) | Op::Move(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Fits(Binary::Imul, ..) => true,
+        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut | TargetOpId::X64DivWide | TargetOpId::X64RemWide, _) => true,
         Op::Unary(Unary::Popcnt | Unary::Bitrev, _) => true,
         Op::Unary(Unary::Floor | Unary::Ceil | Unary::Trunc, x) if func.ty(*x).is_float() => true,
         Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) if func.ty(*x) == Type::I128 => true,
@@ -47,16 +48,12 @@ pub(super) fn uses_scratch(func: &Function, op: &Op) -> bool {
 
 impl Emit<'_> {
     pub(super) fn invalidate_spills(&mut self) {
-        self.last_spill = [None; 4];
+        self.last_spill.clear();
         self.last_fspill = None;
     }
 
     pub(super) fn clobber_reg(&mut self, reg: Reg) {
-        for slot in &mut self.last_spill {
-            if slot.is_some_and(|(_, r)| r == reg) {
-                *slot = None;
-            }
-        }
+        self.last_spill.clobber(reg);
     }
 
     pub(super) fn clobber_regs(&mut self, regs: &[Reg]) {
@@ -78,14 +75,26 @@ impl Emit<'_> {
     }
 
     pub(super) fn invalidate_disp(&mut self, disp: i32) {
-        for slot in &mut self.last_spill {
-            if slot.is_some_and(|(d, _)| d == disp) {
-                *slot = None;
-            }
-        }
+        self.last_spill.invalidate(disp);
         if self.last_fspill.is_some_and(|(d, _, _)| d == disp) {
             self.last_fspill = None;
         }
+    }
+
+    /// Keeps the reload cache for the block bound next when the current block ends with a branch that moves no edge arguments.
+    pub(super) fn carry_spills(&mut self, plain: bool) {
+        self.carry.1 = (plain && !self.in_shrink_entry && !self.in_fast_ret).then_some(self.last_spill);
+    }
+
+    /// Restores the carried reload cache when `block`'s only predecessor is the block that carried it, and marks `block` as the current block.
+    pub(super) fn resume_spills(&mut self, block: Block) {
+        if let (Some(from), Some(cache)) = self.carry
+            && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
+            && self.func.blocks[block.index()].params.is_empty()
+        {
+            self.last_spill = cache;
+        }
+        self.carry = (Some(block), None);
     }
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
@@ -93,15 +102,7 @@ impl Emit<'_> {
             return;
         }
         self.clobber_reg(reg);
-        let mut out = [Some((disp, reg)), None, None, None];
-        let mut i = 1;
-        for entry in self.last_spill.into_iter().flatten() {
-            if entry != (disp, reg) && i < 4 {
-                out[i] = Some(entry);
-                i += 1;
-            }
-        }
-        self.last_spill = out;
+        self.last_spill.record(disp, reg);
     }
 
     pub(super) fn write_spill(&mut self, disp: i32, reg: Reg) {
@@ -110,27 +111,19 @@ impl Emit<'_> {
     }
 
     pub(super) fn cached_spill_for(&self, disp: i32, preferred: Reg) -> Option<Reg> {
-        let mut fallback = None;
-        for (d, r) in self.last_spill.into_iter().flatten() {
-            if d == disp {
-                if r == preferred {
-                    return Some(r);
-                }
-                if fallback.is_none() {
-                    fallback = Some(r);
-                }
-            }
-        }
-        fallback
+        self.last_spill.holders(disp).find(|&r| r == preferred).or_else(|| self.last_spill.holders(disp).next())
     }
 
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
-            Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => {
+            Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => self.vector_zero(result()?),
+            Op::Const(0) if result().is_ok_and(|result| self.ty(result).is_float()) => {
                 let result = result()?;
-                self.invalidate_spills();
-                self.vector_zero(result);
-                self.invalidate_spills();
+                if !self.is_static(result) {
+                    let dst = self.fdst(result);
+                    self.zero_xmm(dst);
+                    self.fput(result, dst);
+                }
             }
             Op::Const(imm) => {
                 let result = result()?;
@@ -156,13 +149,14 @@ impl Emit<'_> {
             }
             Op::Symbol(sym) => {
                 let result = result()?;
-                if !self.is_static(result) {
+                if !self.is_static(result) && self.plan.through[result.index()].is_none() {
                     let dst = self.dst(result);
                     let at = self.asm.mov_abs64(dst);
                     self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs64));
                     self.put(result, dst);
                 }
             }
+            Op::Runtime(_) if self.plan.through[result()?.index()].is_some() => {}
             Op::Runtime(rt) => {
                 let result = result()?;
                 let dst = self.dst(result);
@@ -172,15 +166,35 @@ impl Emit<'_> {
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
             Op::Shuffle(..) | Op::Extract(..) | Op::Insert(..) | Op::Reduce(..) | Op::TargetOp(..) => {
-                self.clear_flags();
-                let result = result()?;
-                self.invalidate_spills();
-                self.vector_op(op, result)?;
-                self.invalidate_spills();
+                self.emit_vector_op(op, result()?)?;
             }
             _ => return self.access(op, result),
         }
         Ok(())
+    }
+
+    fn emit_vector_op(&mut self, op: &Op, result: Value) -> Result<(), String> {
+        self.clear_flags();
+        self.last_fspill = None;
+        match op {
+            Op::TargetOp(..) | Op::Extract(..) => self.vector_op(op, result),
+            Op::Insert(..) => {
+                self.vector_op(op, result)?;
+                self.clobber_reg(Reg::Rax);
+                Ok(())
+            }
+            Op::Shuffle(a, _, ShuffleMask::Const(_)) if self.ty(*a).is_wide_vec() || self.features.ssse3 => {
+                self.vector_op(op, result)?;
+                self.clobber_reg(Reg::Rax);
+                Ok(())
+            }
+            _ => {
+                self.invalidate_spills();
+                self.vector_op(op, result)?;
+                self.invalidate_spills();
+                Ok(())
+            }
+        }
     }
 
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
@@ -234,8 +248,8 @@ impl Emit<'_> {
 
     /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax; r11 and rcx hold addresses.
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
-        let source = self.address_in(from, 0, Reg::R11, Reg::Rax);
-        let target = self.address_in(to, 0, Reg::Rcx, Reg::Rax);
+        let source = self.address_in(from, 0, Reg::R11, Some(Reg::Rax));
+        let target = self.address_in(to, 0, Reg::Rcx, Some(Reg::Rax));
         let whole = bytes / VECTOR * VECTOR;
         for at in (0..whole).step_by(VECTOR as usize) {
             self.asm.sse(&[], &MOVUPS.0, X1.0, source.offset(at as i32));
@@ -262,13 +276,13 @@ impl Emit<'_> {
         let size = Size::of(ty.bytes());
         match op {
             Op::AtomicLoad(addr) => {
-                self.raw(Reg::Rcx, *addr);
-                self.read(result()?, Mem::new(Reg::Rcx, 0));
+                let target = self.atomic_target(*addr, Reg::Rcx, &[]);
+                self.read(result()?, target);
             }
             Op::AtomicStore(value, addr) => {
-                self.raw(Reg::Rcx, *addr);
+                let target = self.atomic_target(*addr, Reg::Rcx, &[Reg::Rax]);
                 self.raw(Reg::Rax, *value);
-                self.asm.xchg(size, Mem::new(Reg::Rcx, 0), Reg::Rax);
+                self.asm.xchg(size, target, Reg::Rax);
                 self.clobber_reg(Reg::Rax);
             }
             Op::AtomicRmw(rmw, addr, value) => {
@@ -277,10 +291,10 @@ impl Emit<'_> {
                 self.put(result()?, Reg::Rax);
             }
             Op::AtomicCas(addr, expected, replacement) => {
-                self.raw(Reg::Rsi, *addr);
+                let target = self.atomic_target(*addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx]);
                 self.raw(Reg::Rax, *expected);
                 self.raw(Reg::Rcx, *replacement);
-                self.asm.cmpxchg(size, Mem::new(Reg::Rsi, 0), Reg::Rcx);
+                self.asm.cmpxchg(size, target, Reg::Rcx);
                 self.clobber_reg(Reg::Rax);
                 self.put(result()?, Reg::Rax);
             }
@@ -399,6 +413,8 @@ impl Emit<'_> {
         {
             self.emit_test_band(a, b);
             int::cond(cc)
+        } else if let Some(cond) = self.held_compare(cc, x, y) {
+            cond
         } else {
             let size = Size::of(self.ty(x).bytes());
             let (cc, x, y) = if self.reg_of(x).is_none() && (self.reg_of(y).is_some() || self.imm_sized(x, size).is_some()) {
@@ -476,9 +492,12 @@ impl Emit<'_> {
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
         let live_flags = self.flags.take();
         if self.ty(condition).is_vector() {
-            self.invalidate_spills();
+            self.flags = live_flags;
+            self.last_fspill = None;
             self.vector_select(condition, x, y, result);
-            self.invalidate_spills();
+            if !self.features.avx {
+                self.clobber_xmms(&[X0, X1]);
+            }
             return;
         }
         if x == y {
@@ -530,15 +549,7 @@ impl Emit<'_> {
             return;
         }
         let dst = self.dst(result);
-        let val_of = |v| self.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
-        if let (Some(xv), Some(yv)) = (val_of(x), val_of(y))
-            && ((xv == 1 && yv == 0) || (xv == 0 && yv == 1))
-        {
-            self.asm.setcc(if xv == 1 { cond } else { cond.invert() }, dst);
-            self.asm.load(Size::B, dst, dst);
-            self.clobber_reg(dst);
-            self.put(result, dst);
-            self.flags = Some((condition, orig_cond));
+        if self.select_const_pair((condition, orig_cond), cond, (x, y), (ty, dst, result)) {
             return;
         }
         let (mut x, mut y) = (x, y);
@@ -554,12 +565,106 @@ impl Emit<'_> {
         self.put(result, dst);
     }
 
+    fn select_const_pair(
+        &mut self,
+        root: (Value, Cond),
+        cond: Cond,
+        values: (Value, Value),
+        target: (Type, Reg, Value),
+    ) -> bool {
+        let (x, y) = values;
+        let (ty, dst, result) = target;
+        let (Some(xv), Some(yv)) = (self.const_of(x), self.const_of(y)) else {
+            return false;
+        };
+        if !matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64) {
+            return false;
+        }
+        let xu = crate::fold::extend(xv, ty, false) as u64;
+        let yu = crate::fold::extend(yv, ty, false) as u64;
+        if (xu == 1 && yu == 0) || (xu == 0 && yu == 1) {
+            self.emit_setcc_byte(if xu == 1 { cond } else { cond.invert() }, dst);
+        } else if !self.select_const_lea(cond, (xu, yu), target) {
+            return false;
+        }
+        self.flags = Some(root);
+        self.clobber_reg(dst);
+        self.put(result, dst);
+        true
+    }
+
+    fn select_const_lea(
+        &mut self,
+        cond: Cond,
+        pair: (u64, u64),
+        target: (Type, Reg, Value),
+    ) -> bool {
+        let (xu, yu) = pair;
+        let (ty, dst, result) = target;
+        if dst == Reg::Rsp {
+            return false;
+        }
+        let mask = u64::MAX >> (64 - ty.bits());
+        let subword_zext = matches!(ty, Type::I8 | Type::I16) && self.plan.zero_ext[result.index()];
+        let Some((branch_cond, imm32, step)) = Self::match_select_lea(cond, (xu, yu), (ty, mask, subword_zext)) else {
+            return false;
+        };
+        let size = if ty == Type::I64 { Size::Q } else { Size::D };
+        let mem = match step {
+            1 => Mem::new(dst, imm32),
+            2 => Mem::sib(dst, dst, 0, imm32),
+            3 => Mem::sib(dst, dst, 1, imm32),
+            5 => Mem::sib(dst, dst, 2, imm32),
+            _ => Mem::sib(dst, dst, 3, imm32),
+        };
+        self.emit_setcc_byte(branch_cond, dst);
+        self.asm.lea_sized(size, dst, mem);
+        true
+    }
+
+    fn match_select_lea(
+        cond: Cond,
+        pair: (u64, u64),
+        info: (Type, u64, bool),
+    ) -> Option<(Cond, i32, u64)> {
+        let (xu, yu) = pair;
+        let (ty, mask, subword_zext) = info;
+        for step in [1_u64, 2, 3, 5, 9] {
+            for (branch_cond, small, hi) in [(cond, yu, xu), (cond.invert(), xu, yu)] {
+                if hi != (small.wrapping_add(step) & mask) {
+                    continue;
+                }
+                if subword_zext && small.checked_add(step).is_none_or(|top| top > mask) {
+                    continue;
+                }
+                let small_signed = if subword_zext { small as i64 } else { crate::fold::extend(small as i64, ty, true) };
+                if let Ok(imm32) = i32::try_from(small_signed) {
+                    return Some((branch_cond, imm32, step));
+                }
+            }
+        }
+        None
+    }
+
+    fn emit_setcc_byte(&mut self, cond: Cond, dst: Reg) {
+        self.asm.setcc(cond, dst);
+        self.asm.load(Size::B, dst, dst);
+    }
+
+    /// The memory at `addr`: in the register that holds it unless the operation writes that register, else through `scratch`.
+    fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
+        if let Some(reg) = self.reg_of(addr).filter(|reg| !written.contains(reg) && *reg != Reg::Rsp) {
+            return Mem::new(reg, 0);
+        }
+        self.raw(scratch, addr);
+        Mem::new(scratch, 0)
+    }
+
     /// Leaves the old contents in rax.
     fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
-        let target = Mem::new(Reg::Rcx, 0);
         match op {
             AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub => {
-                self.raw(Reg::Rcx, addr);
+                let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
                 self.raw(Reg::Rax, value);
                 if op == AtomicRmwOp::Xchg {
                     self.asm.xchg(size, target, Reg::Rax);
@@ -576,8 +681,7 @@ impl Emit<'_> {
 
     fn rmw_loop(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
-        let target = Mem::new(Reg::Rsi, 0);
-        self.raw(Reg::Rsi, addr);
+        let target = self.atomic_target(addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx, Reg::Rdx]);
         self.get(Reg::Rdx, value, Ext::of(signed));
         self.asm.load(size, Reg::Rax, target);
         let again = self.asm.label();
@@ -611,4 +715,27 @@ impl Emit<'_> {
         self.asm.cmpxchg(size, target, Reg::Rcx);
         self.asm.jcc(Cond::Ne, again);
     }
+}
+
+/// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
+pub(super) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
+    let mut cloned = vec![false; func.blocks.len()];
+    for data in &func.blocks {
+        if let Some(&last) = data.insts.last()
+            && copied.get(last.index()) == Some(&true)
+            && let Op::Jump(head, _) = &func.insts[last.index()].op
+        {
+            cloned[head.index()] = true;
+        }
+    }
+    let mut preds: Vec<(u32, Option<Block>)> = vec![(0, None); func.blocks.len()];
+    for at in 0..func.blocks.len() {
+        let from = Block(at as u32);
+        for next in func.successors(from) {
+            let entry = &mut preds[next.index()];
+            entry.0 += 1;
+            entry.1 = Some(from);
+        }
+    }
+    preds.into_iter().map(|(count, from)| from.filter(|from| count == 1 && !cloned[from.index()])).collect()
 }

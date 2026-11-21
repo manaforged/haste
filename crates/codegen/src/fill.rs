@@ -1,5 +1,5 @@
 use crate::fold::{constant, defs, extend};
-use crate::ir::{Convert, Domain, Function, Inst, Op, StackSlot, Type, Value};
+use crate::ir::{Binary, Convert, Domain, Function, Inst, IntCC, Op, StackSlot, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 /// The most bytes a `memset` of a constant size is stored inline with.
@@ -33,6 +33,68 @@ fn fill(func: &Function, defs: &[Option<Inst>], inst: Inst) -> Option<(Value, i6
     }
     let size = known(func, defs, bytes, DEPTH).filter(|size| (0..=FILL_INLINE).contains(size))?;
     Some((to, known(func, defs, byte, DEPTH)? & 0xFF, size as u32))
+}
+
+/// The most bytes a `memcmp` of a constant size is compared inline with.
+const COMPARE_INLINE: i64 = 8;
+
+/// Whether every read of `res` only tests it against zero: a branch condition or an equality compare with constant zero.
+fn zero_tested(func: &Function, defs: &[Option<Inst>], res: Value) -> bool {
+    let zero = |v: Value| known(func, defs, v, 1) == Some(0);
+    func.blocks.iter().flat_map(|b| &b.insts).all(|&inst| {
+        let op = &func.insts[inst.index()].op;
+        let mut reads = false;
+        op.for_operands(|v| reads |= v == res);
+        !reads
+            || match *op {
+                Op::Brif(cond, ..) => cond == res && !matches!(op, Op::Brif(_, _, a, _, b) if a.contains(&res) || b.contains(&res)),
+                Op::Icmp(IntCC::Equal | IntCC::NotEqual, x, y) => (x == res && zero(y)) || (y == res && zero(x)),
+                _ => false,
+            }
+    })
+}
+
+/// The operands, size and result of `inst` when it calls `memcmp` over a small constant size whose result the code can compute inline.
+fn compare(func: &Function, defs: &[Option<Inst>], inst: Inst) -> Option<(Value, Value, i64, Value)> {
+    let Op::Call { callee, args, results, .. } = &func.insts[inst.index()].op else { return None };
+    let (&[x, y, bytes], &[res]) = (&args[..], &results[..]) else { return None };
+    if !matches!(func.insts[defs[callee.index()]?.index()].op, Op::Runtime(RuntimeSymbol::Memcmp)) {
+        return None;
+    }
+    let size = known(func, defs, bytes, DEPTH).filter(|size| (1..=COMPARE_INLINE).contains(size))?;
+    (size == 1 || zero_tested(func, defs, res)).then_some((x, y, size, res))
+}
+
+fn push(func: &mut Function, op: Op, ty: Type, out: &mut Vec<Inst>) -> Value {
+    let val = func.value(ty);
+    out.push(func.add(op, Some(val)));
+    val
+}
+
+/// Emits the `memcmp` that `compare` found: the byte difference for one byte, else a nonzero value exactly when two overlapping wide reads differ.
+fn compare_inline(func: &mut Function, (x, y, size, res): (Value, Value, i64, Value), out: &mut Vec<Inst>) {
+    let ty = func.ty(res);
+    if size == 1 {
+        let (a, b) = (push(func, Op::Load(x, 0), Type::I8, out), push(func, Op::Load(y, 0), Type::I8, out));
+        let (a, b) = (push(func, Op::Convert(Convert::Uextend, a), ty, out), push(func, Op::Convert(Convert::Uextend, b), ty, out));
+        out.push(func.add(Op::Binary(Binary::Isub, a, b), Some(res)));
+        return;
+    }
+    let wide = [8, 4, 2].into_iter().find(|&w| w <= size).expect("invariant: size is at least two");
+    let word = Type::int_of_bytes(wide).expect("invariant: wide is 2, 4 or 8");
+    let last = i32::try_from(size - wide).expect("invariant: size is at most eight");
+    let mut diff = None;
+    for at in if last == 0 { vec![0] } else { vec![0, last] } {
+        let (a, b) = (push(func, Op::Load(x, at), word, out), push(func, Op::Load(y, at), word, out));
+        let d = push(func, Op::Binary(Binary::Bxor, a, b), word, out);
+        diff = Some(match diff {
+            Some(prev) => push(func, Op::Binary(Binary::Bor, prev, d), word, out),
+            None => d,
+        });
+    }
+    let zero = push(func, Op::Const(0), word, out);
+    let ne = push(func, Op::Icmp(IntCC::NotEqual, diff.expect("invariant: one read at least"), zero), Type::I8, out);
+    out.push(func.add(Op::Convert(Convert::Uextend, ne), Some(res)));
 }
 
 fn resolve_slot(slots: &[Option<(StackSlot, i64)>], ptr: Value, off: i32) -> Option<(StackSlot, i32)> {
@@ -191,9 +253,9 @@ fn expand_copy(
     true
 }
 
-/// Replaces each `memset` of a constant byte and small constant size by stores, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
+/// Replaces each `memset` of a constant byte and small constant size by stores, each small constant-size `memcmp` by loads and compares, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
 pub(crate) fn run(func: &mut Function) -> Domain {
-    if !func.insts.iter().any(|data| matches!(data.op, Op::Runtime(RuntimeSymbol::Memset) | Op::Copy(..))) {
+    if !crate::schedule::has_live_op(func, |op| matches!(op, Op::Runtime(RuntimeSymbol::Memset | RuntimeSymbol::Memcmp) | Op::Copy(..))) {
         return Domain::NONE;
     }
     let defs = defs(func);
@@ -206,6 +268,9 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         for inst in insts {
             if let Some(found) = fill(func, &defs, inst) {
                 stores(func, &slots, &vec_chunks, found, &mut out);
+                changed = true;
+            } else if let Some(found) = compare(func, &defs, inst) {
+                compare_inline(func, found, &mut out);
                 changed = true;
             } else if expand_copy(func, &defs, &slots, &vec_chunks, inst, &mut out) {
                 changed = true;

@@ -1,4 +1,4 @@
-use crate::ir::{Block, Function, Op, Type};
+use crate::ir::{Block, Function, Op};
 use crate::live::{Live, Range, overlaps};
 
 use super::{Hints, Pool, SlotSet, crosses_call, crosses_ranges};
@@ -24,6 +24,11 @@ fn push_span(list: &mut Vec<Range>, start: u32, end: u32) {
 }
 
 /// Computes instruction-level clobber spans for `wide_scratch` and `op_scratch` using `live` numbering.
+/// Whether `data` is a 64-bit high product, whose emitter reads its scratch registers before it writes the result, so the result may live in one of them.
+fn writes_last(func: &Function, data: &crate::ir::InstData) -> bool {
+    matches!(data.op, crate::ir::Op::Binary(crate::ir::Binary::Umulhi | crate::ir::Binary::Smulhi, ..)) && data.result.is_some_and(|res| func.ty(res) == crate::ir::Type::I64)
+}
+
 pub(crate) fn scratch_clobbers<R>(
     func: &Function,
     (wide_scratch, op_scratch, uses_scratch): (&'static [R], &'static [R], fn(&Function, &Op) -> bool),
@@ -34,13 +39,12 @@ pub(crate) fn scratch_clobbers<R>(
     }
     let (mut wide, mut op) = (Vec::new(), Vec::new());
     let mut record = |data: &crate::ir::InstData, at_use: u32, at_def: u32| {
-        let mut touches_i128 = data.result.is_some_and(|result| func.ty(result) == Type::I128);
-        data.op.for_operands(|v| touches_i128 |= func.ty(v) == Type::I128);
+        let touches_i128 = crate::alloc::touches_i128(func, data);
         if !wide_scratch.is_empty() && touches_i128 {
             push_span(&mut wide, at_use, at_def);
         }
         if !op_scratch.is_empty() && (touches_i128 || uses_scratch(func, &data.op)) {
-            push_span(&mut op, at_use, at_def);
+            push_span(&mut op, at_use, if writes_last(func, data) { at_use } else { at_def });
         }
     };
     let mut at = 0_u32;

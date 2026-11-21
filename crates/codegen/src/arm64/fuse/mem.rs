@@ -1,7 +1,7 @@
 use super::super::asm::{ExtOp, Reg, encode_sib};
 use super::{const_of, def_entry, def_inst, local_single, preserved, shift_parts, zero_ext_loc};
 use crate::alloc::{Location, Plan};
-use crate::ir::{Binary, Convert, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Lane, Op, ShuffleMask, StackSlot, Type, Value};
 use crate::live::{Sib, SibBase};
 
 struct SibCand {
@@ -384,7 +384,7 @@ fn byte_bitmask64(v: u64) -> Option<u8> {
     Some(mask)
 }
 
-pub(in super::super) fn splat_pattern64(lane: Lane, imm: i64) -> u64 {
+fn splat_pattern64(lane: Lane, imm: i64) -> u64 {
     let raw = imm as u64;
     match lane {
         Lane::I8 => u64::from(raw as u8) * 0x0101_0101_0101_0101,
@@ -459,29 +459,30 @@ struct PairHalf {
     addr_elide: Option<Value>,
 }
 
+pub(super) fn const_splat(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], res: Value) -> Option<(Value, i64)> {
+    let Op::Shuffle(a, b, ShuffleMask::Const(m)) = func.insts[def_inst(pos_of, res)?.index()].op else { return None };
+    let Type::Vec { lane, count } = func.ty(res) else { return None };
+    let (count, first) = (usize::from(count), usize::from(m[0]));
+    if !matches!(lane.bytes() as usize * count, 8 | 16) || first >= 2 * count || !m[..count].iter().all(|&x| usize::from(x) == first) {
+        return None;
+    }
+    let src = if first < count { a } else { b };
+    let Op::Insert(_, scalar, idx) = func.insts[def_inst(pos_of, src)?.index()].op else { return None };
+    (usize::from(idx) == first % count).then(|| const_of(func, plan, scalar, |v| def_inst(pos_of, v)).map(|imm| (src, imm))).flatten()
+}
+
 fn try_fuse_splat_shuffle(
     func: &Function,
     plan: &mut Plan<Reg>,
     (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
     res: Value,
-    (a, b, m): (Value, Value, [u8; 16]),
+    (a, b): (Value, Value),
 ) {
     let Type::Vec { lane, count } = func.ty(res) else { return };
-    let bytes = lane.bytes() * u32::from(count);
-    let count_u = usize::from(count);
-    let first = m[0];
-    if !matches!(bytes, 8 | 16) || usize::from(first) >= 2 * count_u || !m[..count_u].iter().all(|&x| x == first) {
-        return;
-    }
-    let src = if usize::from(first) < count_u { a } else { b };
-    if uses[src.index()] != 1 || plan.elided[src.index()] {
-        return;
-    }
-    let Some((_, _, ins_inst)) = def_entry(pos_of, src) else { return };
-    if let Op::Insert(_, scalar, idx) = func.insts[ins_inst.index()].op
-        && usize::from(idx) == usize::from(first) % count_u
-        && let Some(imm) = plan.const_of(scalar)
-        && encode_neon_movi(u32::from(bytes == 16), splat_pattern64(lane, imm)).is_some()
+    let Some((src, imm)) = const_splat(func, plan, pos_of, res) else { return };
+    if uses[src.index()] == u32::from(a == src) + u32::from(b == src)
+        && !plan.elided[src.index()]
+        && encode_neon_movi(u32::from(lane.bytes() * u32::from(count) == 16), splat_pattern64(lane, imm)).is_some()
     {
         plan.elided[src.index()] = true;
     }
@@ -637,9 +638,127 @@ pub(super) fn try_fuse_vec_op(
     op: &Op,
 ) -> bool {
     match *op {
-        Op::Shuffle(a, b, ShuffleMask::Const(m)) => try_fuse_splat_shuffle(func, plan, ctx, res, (a, b, m)),
+        Op::Shuffle(a, b, ShuffleMask::Const(_)) => try_fuse_splat_shuffle(func, plan, ctx, res, (a, b)),
         Op::Insert(vec, val, idx) => try_fuse_vec_insert(func, plan, ctx, (b_idx, pos, res), (vec, val, idx)),
         _ => return false,
     }
     true
+}
+
+fn is_sload_barrier(op: &Op) -> bool {
+    is_mem_barrier(op) || matches!(op, Op::Binary(Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem, ..))
+}
+
+fn sload_addr_preserved(func: &Function, plan: &Plan<Reg>, (b_idx, lpos, cpos): (usize, usize, usize), op: &Op) -> bool {
+    let Op::Load(addr, _) = *op else { return matches!(op, Op::StackLoad(..)) };
+    let Some(sib) = plan.sib[addr.index()] else {
+        return !plan.elided[addr.index()] && preserved(func, plan, b_idx, lpos, cpos, None, addr);
+    };
+    let base_ok = match sib.base {
+        SibBase::Frame(_) => true,
+        SibBase::Value(b) => preserved(func, plan, b_idx, lpos, cpos, None, b),
+    };
+    base_ok && preserved(func, plan, b_idx, lpos, cpos, None, sib.index)
+}
+
+fn can_elide_sload(
+    func: &Function,
+    plan: &Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, cpos): (usize, usize),
+    val: Value,
+) -> bool {
+    if !matches!(plan.location(val), Location::Reg(_) | Location::Slot) {
+        return false;
+    }
+    let Some((lpos, linst)) = local_single(plan, info, b_idx, cpos, val) else {
+        return false;
+    };
+    let op = &func.insts[linst.index()].op;
+    sload_addr_preserved(func, plan, (b_idx, lpos, cpos), op)
+        && !func.blocks[b_idx].insts[lpos + 1..cpos].iter().any(|&i| is_sload_barrier(&func.insts[i.index()].op))
+}
+
+pub(super) fn try_fuse_sload_extend(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, res): (usize, usize, Value),
+    x: Value,
+) {
+    if matches!(func.ty(x), Type::I8 | Type::I16 | Type::I32)
+        && matches!(func.ty(res), Type::I16 | Type::I32 | Type::I64)
+        && can_elide_sload(func, plan, info, (b_idx, pos), x)
+    {
+        plan.elided[x.index()] = true;
+    }
+}
+
+fn icmp_sload_other_ok(plan: &Plan<Reg>, ty: Type, other: Value) -> bool {
+    if plan.elided[other.index()] {
+        return false;
+    }
+    if let Some(imm) = plan.const_of(other) {
+        return super::super::int::add_imm_parts(true, crate::fold::extend(imm, ty, true)).is_some();
+    }
+    matches!(plan.location(other), Location::Reg(r) if !matches!(r.0, 9 | 10 | 16 | 17 | 31))
+}
+
+pub(super) fn try_fuse_icmp_sload(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos): (usize, usize),
+    (cc, a, b): (IntCC, Value, Value),
+) {
+    let ty = func.ty(a);
+    if !cc.is_signed() || !matches!(ty, Type::I8 | Type::I16) {
+        return;
+    }
+    for (load, other) in [(a, b), (b, a)] {
+        if icmp_sload_other_ok(plan, ty, other) && can_elide_sload(func, plan, info, (b_idx, pos), load) {
+            plan.elided[load.index()] = true;
+            return;
+        }
+    }
+}
+
+fn narrow_store_ok(func: &Function, plan: &Plan<Reg>, uses: &[u32], (b_idx, pos, res): (usize, usize, Value), inner: Value) -> bool {
+    if uses[res.index()] != 1
+        || plan.elided[res.index()]
+        || plan.deferred[res.index()]
+        || !func.ty(res).is_small_int()
+        || !func.ty(inner).is_small_int()
+        || !matches!(plan.location(inner), Location::Reg(_) | Location::Slot)
+    {
+        return false;
+    }
+    let insts = &func.blocks[b_idx].insts;
+    let store = insts
+        .iter()
+        .enumerate()
+        .skip(pos + 1)
+        .find_map(|(at, &inst)| matches!(func.insts[inst.index()].op, Op::Store(val, addr, _) if val == res && addr != res).then_some(at));
+    store.is_some_and(|at| super::elided_use_end(func, plan, insts, at, inner).is_some() && preserved(func, plan, b_idx, pos, at, None, inner))
+}
+
+pub(super) fn fuse_store_ireduce(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            if let (&Op::Convert(Convert::Ireduce, inner), Some(res)) = (&data.op, data.result)
+                && narrow_store_ok(func, plan, uses, (b_idx, pos, res), inner)
+            {
+                plan.elided[res.index()] = true;
+            }
+        }
+    }
+}
+
+/// The value whose register a store of `val` reads: the source of an elided `Ireduce`, else `val`.
+pub(in super::super) fn store_source(func: &Function, plan: &Plan<Reg>, val: Value, def: impl Fn(Value) -> Option<Inst>) -> Value {
+    match def(val).map(|inst| &func.insts[inst.index()].op) {
+        Some(&Op::Convert(Convert::Ireduce, inner)) if plan.elided[val.index()] => inner,
+        _ => val,
+    }
 }

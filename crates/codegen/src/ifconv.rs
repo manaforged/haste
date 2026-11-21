@@ -1,10 +1,11 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Domain, Function, Inst, Op, Type, Value};
+use crate::ir::{Binary, Block, Domain, Function, Inst, Op, Type, Value};
 use crate::mem::{MemBase, MemRoot, Provenance};
 
 const MAX_ARM_OPS: usize = 6;
 const MAX_ARM_INSTS: usize = 24;
 const MAX_SELECTS: usize = 4;
+const MAX_MID_BODY: usize = 3;
 
 fn scalar_select(ty: Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64)
@@ -189,6 +190,12 @@ fn extract_const_leaf(
     is_const[val.index()].then_some((Some(leaf), val))
 }
 
+fn retire_terminator(func: &mut Function, block: Block) {
+    if let Some(term) = func.blocks[block.index()].insts.pop() {
+        func.insts[term.index()].op = Op::Trap;
+    }
+}
+
 fn hoist_block_body(
     func: &mut Function,
     head: Block,
@@ -197,10 +204,8 @@ fn hoist_block_body(
     cleared: &mut [bool],
 ) -> (Vec<Value>, Vec<Value>) {
     let params = std::mem::take(&mut func.blocks[block.index()].params);
-    let mut moved = std::mem::take(&mut func.blocks[block.index()].insts);
-    if let Some(old_term) = moved.pop() {
-        func.insts[old_term.index()].op = Op::Trap;
-    }
+    retire_terminator(func, block);
+    let moved = std::mem::take(&mut func.blocks[block.index()].insts);
     if !params.is_empty() {
         for &inst in &moved {
             func.insts[inst.index()].op.map_operands(|v| remap_val(&params, in_args, v));
@@ -209,6 +214,25 @@ fn hoist_block_body(
     func.blocks[head.index()].insts.extend(moved);
     cleared[block.index()] = true;
     (params, in_args.to_vec())
+}
+
+type BranchParts = (Value, Block, Vec<Value>, Block, Vec<Value>);
+
+fn branch_block(func: &Function, cfg: &Cfg, (block, in_args): (Block, &[Value]), max_body: usize, keep: impl Fn(&Op) -> bool) -> Option<BranchParts> {
+    let data = &func.blocks[block.index()];
+    if cfg.pred_count(block) != 1 || func.entry == Some(block) || data.params.len() != in_args.len() {
+        return None;
+    }
+    let (&last, body) = data.insts.split_last()?;
+    if body.len() > max_body || !body.iter().all(|&inst| keep(&func.insts[inst.index()].op)) {
+        return None;
+    }
+    let Op::Brif(cond, then_b, then_args, else_b, else_args) = func.insts[last.index()].op.clone() else { return None };
+    Some((cond, then_b, then_args, else_b, else_args))
+}
+
+fn compare_only(op: &Op) -> bool {
+    matches!(op, Op::Const(_) | Op::Icmp(..) | Op::Fcmp(..))
 }
 
 fn try_nested_classifier(
@@ -229,22 +253,7 @@ fn try_nested_classifier(
         (true, then_b, &then_args, else_b, &else_args),
         (false, else_b, &else_args, then_b, &then_args),
     ] {
-        if cfg.pred_count(mid) != 1 || func.entry == Some(mid) {
-            continue;
-        }
-        let mid_data = &func.blocks[mid.index()];
-        if mid_data.params.len() != mid_in.len() {
-            continue;
-        }
-        let Some((&mid_last, mid_body)) = mid_data.insts.split_last() else { continue };
-        if mid_body.len() > 3
-            || !mid_body
-                .iter()
-                .all(|&i| matches!(func.insts[i.index()].op, Op::Const(_) | Op::Icmp(..) | Op::Fcmp(..)))
-        {
-            continue;
-        }
-        let Op::Brif(c2, mt, mt_args, me, me_args) = func.insts[mid_last.index()].op.clone() else {
+        let Some((c2, mt, mt_args, me, me_args)) = branch_block(func, cfg, (mid, mid_in), MAX_MID_BODY, compare_only) else {
             continue;
         };
         if !func.ty(c2).is_small_int() || mt == me || mt == head || mt == mid || me == head || me == mid {
@@ -278,9 +287,7 @@ fn try_nested_classifier(
         let Some((me_leaf, me_val)) = extract_const_leaf(func, cfg, is_const, me, &me_args, join) else {
             continue;
         };
-        if let Some(old_brif) = func.blocks[head.index()].insts.pop() {
-            func.insts[old_brif.index()].op = Op::Trap;
-        }
+        retire_terminator(func, head);
         for (leaf_opt, leaf_in) in [(other_leaf, other_in.as_slice()), (mt_leaf, mt_args.as_slice()), (me_leaf, me_args.as_slice())] {
             if let Some(leaf) = leaf_opt {
                 hoist_block_body(func, head, leaf, leaf_in, cleared);
@@ -298,9 +305,38 @@ fn try_nested_classifier(
     false
 }
 
-fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, is_const: &[bool], head: Block, cleared: &mut [bool]) -> bool {
+fn defines_compare(func: &Function, block: Block, value: Value) -> bool {
+    func.blocks[block.index()].insts.iter().any(|&inst| func.insts[inst.index()].result == Some(value) && matches!(func.insts[inst.index()].op, Op::Icmp(..) | Op::Fcmp(..)))
+}
+
+fn try_shared_target(func: &mut Function, cfg: &Cfg, region: &[bool], head: Block, cleared: &mut [bool]) -> bool {
+    let Some(Op::Brif(c1, t1, ta1, e1, ea1)) = func.last(head).cloned() else { return false };
+    if t1 == e1 || !defines_compare(func, head, c1) {
+        return false;
+    }
+    for (mid, mid_in, both) in [(t1, &ta1, true), (e1, &ea1, false)] {
+        if !region[mid.index()] || !mid_in.is_empty() || mid == head {
+            continue;
+        }
+        let Some((c2, t2, ta2, e2, ea2)) = branch_block(func, cfg, (mid, mid_in), MAX_MID_BODY, compare_only) else { continue };
+        let shared = if both { e2 == e1 && ea2 == ea1 } else { t2 == t1 && ta2 == ta1 };
+        if !shared || t2 == e2 || t2 == mid || e2 == mid || func.ty(c1) != func.ty(c2) || !defines_compare(func, mid, c2) {
+            continue;
+        }
+        retire_terminator(func, head);
+        hoist_block_body(func, head, mid, mid_in, cleared);
+        let cond = func.value(func.ty(c1));
+        let joined = func.add(Op::Binary(if both { Binary::Band } else { Binary::Bor }, c1, c2), Some(cond));
+        let term = func.add(Op::Brif(cond, t2, ta2, e2, ea2), None);
+        func.blocks[head.index()].insts.extend([joined, term]);
+        return true;
+    }
+    false
+}
+
+fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, (is_const, region): (&[bool], &[bool]), head: Block, cleared: &mut [bool]) -> bool {
     let Some((cond, m)) = match_arms(func, cfg, prov, head) else {
-        return try_nested_classifier(func, cfg, is_const, head, cleared);
+        return try_nested_classifier(func, cfg, is_const, head, cleared) || try_shared_target(func, cfg, region, head, cleared);
     };
     let join_params = &func.blocks[m.join.index()].params;
     if m.t_args.len() != join_params.len() || m.e_args.len() != join_params.len() {
@@ -314,19 +350,15 @@ fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, is_const: &[bool]
         selects += 1;
         selects <= MAX_SELECTS && scalar_select(func.ty(*p))
     });
-    if !ok {
+    if !ok || branches_on_selected(func, m.join, (&m.t_args, &m.e_args)) {
         return false;
     }
     let param_tys: Vec<Type> = join_params.iter().map(|p| func.ty(*p)).collect();
-    if let Some(old_brif) = func.blocks[head.index()].insts.pop() {
-        func.insts[old_brif.index()].op = Op::Trap;
-    }
+    retire_terminator(func, head);
     for (side, in_args) in m.arms {
         let params = std::mem::take(&mut func.blocks[side.index()].params);
-        let mut moved = std::mem::take(&mut func.blocks[side.index()].insts);
-        if let Some(old_jump) = moved.pop() {
-            func.insts[old_jump.index()].op = Op::Trap;
-        }
+        retire_terminator(func, side);
+        let moved = std::mem::take(&mut func.blocks[side.index()].insts);
         if param_tys.is_empty() {
             for inst in moved {
                 func.insts[inst.index()].op = Op::Trap;
@@ -352,15 +384,32 @@ fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, is_const: &[bool]
     true
 }
 
+/// Whether `join` only branches on a parameter its arms pass different values for, which threading the arms turns into plain branches with no select.
+fn branches_on_selected(func: &Function, join: Block, (t_args, e_args): (&[Value], &[Value])) -> bool {
+    let data = &func.blocks[join.index()];
+    let [term] = data.insts[..] else { return false };
+    let Op::Brif(cond, ..) = func.insts[term.index()].op else { return false };
+    data.params.iter().zip(t_args.iter().zip(e_args)).any(|(param, (t, e))| *param == cond && t != e)
+}
+
 /// Converts pure diamond and triangle conditional branches into branchless `Op::Select`.
 pub(crate) fn run(func: &mut Function) -> Domain {
+    convert(func, None)
+}
+
+/// Converts every branch headed inside `blocks` that `run` can convert, treating each as unpredictable.
+pub(crate) fn flatten(func: &mut Function, blocks: &[bool]) -> bool {
+    !convert(func, Some(blocks)).is_empty()
+}
+
+fn convert(func: &mut Function, only: Option<&[bool]>) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
         return Domain::NONE;
     }
     let mut any = false;
     loop {
         let cfg = func.cfg();
-        let prov = Provenance::new(func, &cfg);
+        let prov = Provenance::addresses(func, &cfg);
         let mut is_const = vec![false; func.types.len()];
         for block in &func.blocks {
             for &inst in &block.insts {
@@ -372,11 +421,16 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 }
             }
         }
+        let inside = |block: Block| only.is_none_or(|mask| mask.get(block.index()).copied().unwrap_or(false));
+        let region = match only {
+            Some(_) => (0..func.blocks.len()).map(|b| inside(Block(b as u32))).collect(),
+            None => crate::thread::unpredictable_region(func, &cfg),
+        };
         let mut cleared = vec![false; func.blocks.len()];
         let mut changed = false;
         for &block in cfg.rpo.iter().rev() {
-            if !cleared[block.index()] {
-                changed |= try_head(func, &cfg, &prov, &is_const, block, &mut cleared);
+            if !cleared[block.index()] && inside(block) {
+                changed |= try_head(func, &cfg, &prov, (&is_const, &region), block, &mut cleared);
             }
         }
         if !changed {

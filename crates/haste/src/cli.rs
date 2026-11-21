@@ -152,9 +152,9 @@ fn report_cases(
     let started = Instant::now();
     let mut build = crate::build::Build::load(workspace, targets)?;
     let result = match (request, out) {
-        (Request::Build, Some(path)) => build.emit_executable(workspace, path),
+        (Request::Build, Some(path)) => build.emit_executable(workspace, path, stats.is_none()),
         (Request::Build, None) if stats.is_none() => build.compile_binary_oneshot(workspace).and_then(|()| build.check(started.elapsed())),
-        _ => crate::serve::finish(&mut build, workspace, (request, args), started),
+        _ => crate::serve::finish(&mut build, workspace, (request, out, args), started),
     };
     if let Some((path, graph_span)) = stats {
         build.write_stats(workspace, graph_span, path)?;
@@ -254,13 +254,13 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const TOP_COMMANDS: [(Command, &str); 2] = [(Command::Serve, "serve"), (Command::Prep, "prep")];
+const TOP_COMMANDS: [(Command, &str); 3] = [(Command::Serve, "serve"), (Command::Prep, "prep"), (Command::Clean, "clean")];
 
 fn usage() -> String {
-    let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().map(|(_, name)| name)).collect();
+    let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().filter(|(cmd, _)| !matches!(cmd, Command::Clean)).map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] {} PATH [--] [ARGS...]\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -275,6 +275,8 @@ enum Command {
     Serve,
     /// Prepare the code the binary reaches for the prepped library.
     Prep,
+    /// Remove the haste cache directory.
+    Clean,
     /// Print what one stage found.
     Debug(Query),
 }
@@ -358,6 +360,10 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter:
                 args.next();
                 crate::image::perf::enable();
             }
+            "--watch" => {
+                args.next();
+                crate::image::watch::enable();
+            }
             "--stats-json" => {
                 args.next();
                 let value = args.next().context("--stats-json takes a file path")?;
@@ -374,28 +380,6 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter:
     Ok(None)
 }
 
-/// The glibc malloc settings haste runs with: transparent huge pages for the heap, and freed memory kept for reuse instead of returned to the kernel and faulted in again.
-const TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=4294967296:glibc.malloc.trim_threshold=4294967296:glibc.malloc.top_pad=268435456";
-
-/// Starts haste again with `TUNABLES` when its environment sets no tunables, since glibc reads them only at startup; the started process takes them out of its environment, so the programs it runs do not see them.
-fn tune_malloc() {
-    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
-        return;
-    }
-    match std::env::var_os("GLIBC_TUNABLES") {
-        // SAFETY: no other thread runs yet, so nothing reads the environment while it changes.
-        Some(set) if set == TUNABLES => unsafe { std::env::remove_var("GLIBC_TUNABLES") },
-        Some(_) => {}
-        None => {
-            use std::os::unix::process::CommandExt;
-            let mut args = std::env::args_os();
-            let arg0 = args.next().unwrap_or_default();
-            let error = std::process::Command::new("/proc/self/exe").arg0(arg0).args(args).env("GLIBC_TUNABLES", TUNABLES).exec();
-            eprintln!("haste: running without malloc tunables: {error}");
-        }
-    }
-}
-
 type ParsedInvocation = (Command, PathBuf, Vec<String>, Option<PathBuf>, Option<PathBuf>);
 
 fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
@@ -406,14 +390,34 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         return Ok(Err(meta));
     }
     let command = parse(&mut args)?;
-    if matches!(command, Command::Request(Request::Build)) {
-        if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
-            return Ok(Err(meta));
+    if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+        return Ok(Err(meta));
+    }
+    if matches!(command, Command::Clean) {
+        if args.peek().is_some() {
+            anyhow::bail!("{}", usage());
         }
-    } else if stats_json.is_some() || out.is_some() {
+        return Ok(Ok((command, PathBuf::new(), Vec::new(), None, None)));
+    }
+    let path = if matches!(command, Command::Request(_) | Command::Serve | Command::Prep) {
+        match args.peek().and_then(|raw| raw.to_str()) {
+            None | Some("--") => PathBuf::from("."),
+            Some(_) => PathBuf::from(args.next().with_context(usage)?),
+        }
+    } else {
+        PathBuf::from(args.next().with_context(usage)?)
+    };
+    if !matches!(command, Command::Request(Request::Run) | Command::Debug(_))
+        && let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)?
+    {
+        return Ok(Err(meta));
+    }
+    if !matches!(command, Command::Request(Request::Build)) && (stats_json.is_some() || out.is_some()) {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
     }
-    let path = PathBuf::from(args.next().with_context(usage)?);
+    if crate::image::watch::enabled() && !matches!(command, Command::Request(Request::Run)) {
+        anyhow::bail!("--watch is only supported with `haste run`");
+    }
     let rest = args
         .map(|raw| raw.into_string().map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy())))
         .collect::<Result<Vec<String>>>()?;
@@ -424,10 +428,30 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
     Ok(Ok((command, path, rest, stats_json, out)))
 }
 
+fn clean_cache() -> Result<()> {
+    let home = crate::graph::store::home();
+    match std::fs::remove_dir_all(&home) {
+        Ok(()) => eprintln!("removed {}", home.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => eprintln!("cache {} is already empty", home.display()),
+        Err(err) => return Err(err).with_context(|| format!("removing {}", home.display())),
+    }
+    Ok(())
+}
+
 fn print_meta(meta: Meta) {
     match meta {
         Meta::Version => println!("haste {}", env!("CARGO_PKG_VERSION")),
         Meta::Help => println!("{}", usage()),
+    }
+}
+
+fn try_serve(command: Command, root: &std::path::Path, stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>, argv: &[String]) -> Result<Option<i32>> {
+    if stats_json.is_some() || crate::image::watch::enabled() {
+        return Ok(None);
+    }
+    match command {
+        Command::Request(request) => crate::serve::ask(root, request, out, argv),
+        _ => Ok(None),
     }
 }
 
@@ -436,28 +460,24 @@ pub fn main() -> Result<()> {
     if let Some(meta) = std::env::args_os().nth(1).and_then(|a| a.to_str().and_then(Meta::from_flag)) {
         return Ok(print_meta(meta));
     }
-    tune_malloc();
     crate::sema::evaluate::install(crate::image::evaluator);
     let (command, path, rest, stats_json, out) = match parse_invocation()? {
         Ok(parsed) => parsed,
         Err(meta) => return Ok(print_meta(meta)),
     };
     match command {
+        Command::Clean => return clean_cache(),
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),
         _ => {}
     }
     let root = std::path::absolute(path)?;
+    let abs_out = out.as_deref().map(std::path::absolute).transpose()?;
     let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
-    if stats_json.is_none()
-        && out.is_none()
-        && crate::profile() == outline::tree::Profile::Debug
-        && let Command::Request(request) = command
-        && let Some(status) = crate::serve::ask(&root, request, &argv)?
-    {
+    if let Some(status) = try_serve(command, &root, stats_json.as_deref(), abs_out.as_deref(), &argv)? {
         std::process::exit(status);
     }
-    match report(command, &root, &argv, stats_json.as_deref(), out.as_deref())? {
+    match report(command, &root, &argv, stats_json.as_deref(), abs_out.as_deref())? {
         0 => Ok(()),
         status => std::process::exit(status),
     }
@@ -485,17 +505,18 @@ fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets
 fn report_failures(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let mut build = crate::build::Build::load(workspace, targets)?;
     build.compile_binary(workspace)?;
-    let mut groups: Vec<(String, Vec<String>)> = build.failures()?.into_iter().collect();
-    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-    for (kind, errors) in &groups {
-        println!("{} {kind}", errors.len());
-        for error in errors {
-            println!("    {error}");
-        }
-    }
-    eprintln!("{} functions failed in {} groups", groups.iter().map(|(_, errors)| errors.len()).sum::<usize>(), groups.len());
+    let failures = build.failures()?;
+    failure_lines(&failures).iter().for_each(|line| println!("{line}"));
+    eprintln!("{} functions failed in {} groups", failures.values().map(Vec::len).sum::<usize>(), failures.len());
     std::mem::forget(build);
     Ok(())
+}
+
+/// Each group of `failures`, largest first, as a count and kind line followed by one indented line per error.
+pub(crate) fn failure_lines(failures: &Failures) -> Vec<String> {
+    let mut groups: Vec<(&String, &Vec<String>)> = failures.iter().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    groups.into_iter().flat_map(|(kind, errors)| std::iter::once(format!("{} {kind}", errors.len())).chain(errors.iter().map(|error| format!("    {error}")))).collect()
 }
 
 fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
@@ -542,8 +563,11 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
         Command::Request(request) => report_cases(root, &workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)), out)?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
+        Command::Clean => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
-    eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
+    if !matches!(command, Command::Request(Request::Run)) {
+        eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
+    }
     Ok(status)
 }

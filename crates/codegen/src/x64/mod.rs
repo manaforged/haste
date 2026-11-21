@@ -1,25 +1,28 @@
 mod asm;
 mod atomic;
+mod bits;
 mod features;
 mod float;
 mod frame;
+mod frames;
 mod imm;
 mod int;
 mod location;
 mod vector;
 mod vector_lanes;
+mod vector_reduce;
 mod vector_narrow;
 mod wide;
 mod ymm;
 
-use asm::{Alu, Asm, Cond, Label, Mem, Reg, Rm, Shift, Size, Xmm};
+use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 pub(crate) use ymm::host_avx2;
-use frame::{Abi, Loc, SAVED, classify};
+use frame::{Abi, Loc, SAVED, SAVED_RBP, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
-use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
+use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, TargetOpId, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{CallAbi, Target};
@@ -28,37 +31,55 @@ use crate::{Code, Site};
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
     saved_float: &[],
-    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],
+    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx, Reg::R11],
     wide_scratch: &wide::WIDE_SCRATCH,
-    op_scratch: &[Reg::Rsi, Reg::Rdx],
+    op_scratch: &[Reg::Rsi, Reg::Rdx, Reg::R11],
     uses_scratch: atomic::uses_scratch,
     dict: Some(Reg::R10),
     float: &float::POOL,
     float_branches: &float::BRANCHES,
     vectors: true,
     absolute_calls: true,
+    constant_calls: true,
     two_address: true,
     park: true,
     fold_sib: true,
+    call_zext: false,
+    imm_store,
+    high_product: Some(Reg::Rdx),
 };
 
+/// One `mov` stores a sign-extended 32-bit immediate; a wider one goes through a register.
+fn imm_store(imm: i64) -> u64 {
+    if i32::try_from(imm).is_ok() { 1 } else { 2 }
+}
+
 const REGS_WIN64: Regs<Reg> = Regs {
-    leaf: &[Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],
+    leaf: &[Reg::R9, Reg::R8, Reg::R10, Reg::Rdx, Reg::R11],
     ..REGS
 };
+
+const REGS_RBP: Regs<Reg> = Regs { saved: &SAVED_RBP, ..REGS };
+
+const REGS_WIN64_RBP: Regs<Reg> = Regs { saved: &SAVED_RBP, ..REGS_WIN64 };
 
 const INTAKE_XMM: Xmm = Xmm(15);
 
 /// The registers that frame setup and the probe use, which no shrink-wrapped entry may hold a value in.
 const FRAME_REGS: [Reg; 3] = [Reg::Rbp, Reg::Rsp, Reg::R11];
 
-/// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
-const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let abi_kind = target.abi;
-    let regs = if abi_kind == CallAbi::Win64 { &REGS_WIN64 } else { &REGS };
-    let Prepared { order, copied, abi, mut plan, mut frame, mut framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let keeps = keeps_frame_pointer(func);
+    let regs = match (abi_kind, keeps) {
+        (CallAbi::Win64, true) => &REGS_WIN64,
+        (CallAbi::Win64, false) => &REGS_WIN64_RBP,
+        (_, true) => &REGS,
+        (_, false) => &REGS_RBP,
+    };
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let func = split.as_ref().unwrap_or(func);
     let features = Features::host();
     let elided_before = plan.elided.iter().filter(|&&e| e).count();
     let roots = location::fuse(func, &mut plan, &features);
@@ -66,12 +87,15 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS);
-    let (base, bias) = if omits_frame_pointer(func, framed) { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
+    let (base, bias) = if framed && !keeps { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let slow_thunk = asm.label();
     let defs = crate::fold::defs(func);
+    let overflow_read = wide::overflow_reads(func);
+    let adc_sum = wide::adc_sums(func, &plan, &defs);
+    let flag_carry = wide::flag_carries(func, &plan);
     let last_block = order.last().copied();
     let emit = Emit {
         func,
@@ -89,29 +113,37 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         defs,
         roots,
         flags: None,
-        last_spill: [None; 4],
+        last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
+        carry: (None, None),
+        sole_pred: atomic::sole_preds(func, &copied),
         next: None,
         last_block,
         at_end: false,
         trap_label: None,
+        lines: Vec::new(),
         features,
         copied,
         direct_calls: target.direct_calls,
+        frame_cache: target.direct_calls && target.os == crate::target::Os::Linux,
+        cold_calls: Vec::new(),
         shrink,
         slow_thunk,
         in_shrink_entry: false,
         in_fast_ret: false,
+        low_product: None,
+        overflow_read,
+        adc_sum,
+        flag_carry,
+        carry_flags: None,
         tails: Tails::new(),
     };
     drive(emit, &order)
 }
 
-/// Whether a framed function addresses its frame from rsp: it reads no frame pointer, catches no unwind and holds no float or vector, whose lowering moves rsp inside the body.
-fn omits_frame_pointer(func: &Function, framed: bool) -> bool {
-    framed
-        && !func.types.iter().any(|ty| ty.in_float_register())
-        && !func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
+/// Whether a framed function addresses its frame from rbp: it reads the frame pointer or catches an unwind.
+fn keeps_frame_pointer(func: &Function) -> bool {
+    func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -157,19 +189,31 @@ pub(super) struct Emit<'a> {
     defs: Vec<Option<Inst>>,
     roots: Vec<Option<location::Root>>,
     flags: Option<(Value, Cond)>,
-    last_spill: [Option<(i32, Reg)>; 4],
+    last_spill: crate::spills::SpillCache<Reg>,
     last_fspill: Option<(i32, Xmm, Type)>,
+    carry: (Option<Block>, Option<crate::spills::SpillCache<Reg>>),
+    sole_pred: Vec<Option<Block>>,
     next: Option<Block>,
     last_block: Option<Block>,
     at_end: bool,
     trap_label: Option<Label>,
+    lines: Vec<(u32, u64)>,
     features: Features,
     copied: Vec<bool>,
     direct_calls: bool,
+    frame_cache: bool,
+    cold_calls: Vec<(Label, Label, StencilReloc)>,
     shrink: Option<ShrinkWrap>,
     slow_thunk: Label,
     in_shrink_entry: bool,
     in_fast_ret: bool,
+    low_product: Option<(Value, Value)>,
+    overflow_read: Vec<bool>,
+    /// The sums whose carry an adc or sbb reads through a compare it absorbed.
+    adc_sum: Vec<bool>,
+    /// The carry outs that the carry flag alone hands to their only consumers.
+    flag_carry: Vec<bool>,
+    carry_flags: Option<(bool, [Value; 3])>,
     tails: Tails<'a, Label>,
 }
 
@@ -213,6 +257,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn bind_block(&mut self, block: Block) {
         self.invalidate_spills();
+        self.resume_spills(block);
+        self.at_end = self.last_block == Some(block);
+        self.asm.bind(self.blocks[block.index()]);
+    }
+
+    fn bind_entry(&mut self, block: Block) {
+        self.carry = (Some(block), None);
         self.at_end = self.last_block == Some(block);
         self.asm.bind(self.blocks[block.index()]);
     }
@@ -257,6 +308,18 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let data = &func.insts[inst.index()];
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
+        let carry_flags = self.carry_flags.take();
+        if matches!(data.op, Op::TargetOp(TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrowOut, _)) {
+            self.carry_flags = carry_flags;
+        }
+        if let (Some(low), &Op::Binary(Binary::Imul, x, y), Some(result)) = (self.low_product.take(), &data.op, result)
+            && (low == (x, y) || low == (y, x))
+            && !(self.is_static(result) || self.plan.deferred[result.index()] || self.plan.elided[result.index()])
+        {
+            self.flags = None;
+            self.put(result, Reg::Rax);
+            return Ok(());
+        }
         match &data.op {
             Op::Call { sig, callee, args, results } => {
                 let res = emit_call(self, inst, (*sig, *callee), args, results);
@@ -274,12 +337,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
+                self.carry_spills(args.is_empty());
                 self.invalidate_spills();
                 emit_goto(self, *block, true);
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
+                self.carry_spills(then_args.is_empty() && else_args.is_empty());
                 self.invalidate_spills();
                 res
             }
@@ -300,7 +365,6 @@ impl<'a> Emitter<'a> for Emit<'a> {
             }
             Op::Trapz(condition) => {
                 self.trapz(*condition);
-                self.invalidate_spills();
                 Ok(())
             }
             op => self.value_op(op, value),
@@ -313,13 +377,18 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn pos(&self) -> u32 { self.asm.pos() }
 
-    fn finish(mut self) -> Result<Code, String> {
+    fn lines(&mut self) -> &mut Vec<(u32, u64)> { &mut self.lines }
+
+    fn finish(mut self, starts: &mut [u32]) -> Result<Code, String> {
         if let Some(label) = self.trap_label {
             self.asm.bind(label);
             self.ud2();
         }
+        self.emit_cold_calls();
         emit_stubs(&mut self)?;
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new() })
+        self.relocs.extend(self.asm.rips.drain(..).map(|(at, sym)| StencilReloc::symbol(at, sym, RelocKind::PcRel32)));
+        self.asm.relax().apply(starts, &mut self.sites, &mut self.relocs);
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new() })
     }
 }
 
@@ -442,13 +511,12 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        let int_scratch = [Reg::R11, Reg::Rcx];
         let float_scratch = [Xmm(0), Xmm(1)];
         for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, args, &self.func.blocks[block.index()].params) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
-                Step::Save(arg, EdgeScratch::Int(i)) => self.raw(int_scratch[i], arg),
-                Step::Restore(EdgeScratch::Int(i), param) => self.put(param, int_scratch[i]),
+                Step::Save(arg, EdgeScratch::Int(i)) => self.save_edge(i, arg),
+                Step::Restore(EdgeScratch::Int(i), param) => self.restore_edge(i, param),
                 Step::Save(arg, EdgeScratch::Float(i)) => self.fget(float_scratch[i], arg),
                 Step::Restore(EdgeScratch::Float(i), param) => self.fput(param, float_scratch[i]),
                 Step::Save(arg, EdgeScratch::Stack(i)) => self.move_to(self.frame_mem(self.frame.edge_slot(i)), arg),
@@ -463,14 +531,25 @@ impl Emit<'_> {
             emit_goto(self, default, true);
             return;
         }
-        self.get(Reg::Rax, index, Ext::Zero);
-        self.asm.mov_imm(Reg::Rcx, targets.len() as i64);
-        self.asm.alu(Alu::Cmp, Reg::Rax, Reg::Rcx);
+        let slot = match self.reg_of(index) {
+            Some(reg) if self.ty(index) == Type::I64 && !matches!(reg, Reg::Rcx | Reg::Rsp) => reg,
+            _ => {
+                self.get(Reg::Rax, index, Ext::Zero);
+                Reg::Rax
+            }
+        };
+        match i32::try_from(targets.len()) {
+            Ok(len) => self.asm.alu_imm(Alu::Cmp, slot, len),
+            Err(_) => {
+                self.asm.mov_imm(Reg::Rcx, targets.len() as i64);
+                self.asm.alu(Alu::Cmp, slot, Reg::Rcx);
+            }
+        }
         self.asm.jcc(Cond::Ae, self.blocks[self.func.jump_target(default).index()]);
         let table = self.asm.label();
         self.asm.lea_rip(Reg::Rcx, table);
-        self.asm.load_signed(Size::D, Reg::R11, Mem::sib(Reg::Rcx, Reg::Rax, 2, 0));
-        self.asm.alu(Alu::Add, Reg::Rcx, Reg::R11);
+        self.asm.load_signed(Size::D, Reg::Rax, Mem::sib(Reg::Rcx, slot, 2, 0));
+        self.asm.alu(Alu::Add, Reg::Rcx, Reg::Rax);
         self.asm.jmp_reg(Reg::Rcx);
         while self.asm.pos() & 3 != 0 {
             self.asm.bytes(&[0xCC]);
@@ -483,7 +562,7 @@ impl Emit<'_> {
 
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {
         let returns = self.abi.returns.clone();
-        self.move_locs(values, &returns, Reg::R11);
+        self.move_locs(values, &returns, None);
         let func = self.func;
         let entry = func.entry.map(|block| &func.blocks[block.index()].params);
         let sret = self.func.signature.params.iter().position(|param| param.purpose == ArgumentPurpose::StructReturn);
@@ -492,6 +571,7 @@ impl Emit<'_> {
             self.raw(Reg::Rax, pointer);
         }
         self.leave_wide(&func.signature.returns);
+        self.asm.flags_overwritten();
         if self.in_fast_ret {
             self.asm.bytes(&[0xC3]);
         } else {
@@ -500,7 +580,7 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn move_locs(&mut self, values: &[Value], locs: &[Loc], scratch: Reg) -> usize {
+    fn move_locs(&mut self, values: &[Value], locs: &[Loc], scratch: Option<Reg>) -> usize {
         let float_targets: Vec<(Value, u8)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Float(xmm) = loc { Some((val, xmm)) } else { None }).collect();
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
             self.float_step(step);
@@ -510,17 +590,7 @@ impl Emit<'_> {
         }
         let int_targets: Vec<(Value, Reg)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Int(reg) = loc { Some((val, reg)) } else { None }).collect();
         for step in arg_steps(&int_targets, |v| self.reg_of(v)) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
-                ArgStep::Save(src) => self.asm.mov(scratch, src),
-                ArgStep::Restore(dst) => self.asm.mov(dst, scratch),
-                ArgStep::Load(val, dst) => self.raw(dst, val),
-            }
-            match step {
-                ArgStep::Move(_, reg) | ArgStep::Restore(reg) => self.clobber_reg(reg),
-                ArgStep::Save(_) => self.clobber_reg(scratch),
-                ArgStep::Load(..) => {}
-            }
+            self.int_step(step, scratch);
         }
         for (&val, &loc) in values.iter().zip(locs) {
             if let Loc::Pair(low, high) = loc {
@@ -546,12 +616,7 @@ impl Emit<'_> {
             self.float_step(step);
         }
         for step in reg_steps(int_pairs) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
-                ArgStep::Save(src) => self.asm.mov(Reg::R11, src),
-                ArgStep::Restore(dst) => self.asm.mov(dst, Reg::R11),
-                ArgStep::Load(..) => {}
-            }
+            self.int_step(step, None);
         }
     }
 
@@ -591,22 +656,33 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
-        let target = if direct.is_none() {
-            match self.reg_of(callee).filter(|reg| SAVED.contains(reg)) {
-                Some(reg) => reg,
-                None => {
-                    self.raw(Reg::R11, callee);
-                    Reg::R11
-                }
-            }
-        } else {
-            Reg::R11
+        let cell = match direct {
+            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot)).map(|hit| (lookup, hit)),
+            _ => None,
         };
-        let float_count = self.move_locs(args, &abi.params, Reg::Rax);
+        let held = self.reg_of(callee).filter(|reg| SAVED.contains(reg));
+        let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
+        if direct.is_none() && held.is_none() {
+            values.push(callee);
+            locs.push(Loc::Int(Reg::R11));
+        }
+        let float_count = self.move_locs(&values, &locs, Some(Reg::Rax));
         let func = self.func;
         self.leave_wide(&func.sigs[sig.index()].params);
         if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
+        }
+        self.asm.flags_overwritten();
+        if let Some((lookup, hit)) = cell {
+            let at = self.asm.call_pcrel32();
+            self.relocs.push(StencilReloc::symbol(at, lookup, crate::reloc::RelocKind::PcRel32));
+            self.asm.bind(hit);
+            self.invalidate_spills();
+            return Ok(abi);
+        }
+        if self.inline_call(direct, args) {
+            self.invalidate_spills();
+            return Ok(abi);
         }
         match direct {
             Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
@@ -618,94 +694,28 @@ impl Emit<'_> {
                 let at = self.asm.call_slot_reloc();
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
-            None => self.asm.call(target),
+            Some(CallTarget::Runtime(rt)) if self.direct_calls => {
+                let at = self.asm.call_pcrel32();
+                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::PcRel32));
+            }
+            Some(CallTarget::Runtime(rt)) => {
+                let at = self.asm.mov_abs64(Reg::R11);
+                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::Abs64));
+                self.asm.call(Reg::R11);
+            }
+            Some(CallTarget::Symbol(sym)) if self.direct_calls => {
+                let at = self.asm.call_pcrel32();
+                self.relocs.push(StencilReloc::symbol(at, sym, crate::reloc::RelocKind::PcRel32));
+            }
+            Some(CallTarget::Symbol(sym)) => {
+                let at = self.asm.mov_abs64(Reg::R11);
+                self.relocs.push(StencilReloc::symbol(at, sym, crate::reloc::RelocKind::Abs64));
+                self.asm.call(Reg::R11);
+            }
+            None => self.asm.call(held.unwrap_or(Reg::R11)),
         }
         self.invalidate_spills();
         Ok(abi)
-    }
-
-    pub(super) fn emit_sat_op(&mut self, op: Binary, size: Size, dst: Reg, src: Reg) {
-        let (umax, smin, smax) = match size {
-            Size::B => (0xFF_i64, 0x80_i64, 0x7F_i64),
-            Size::W => (0xFFFF_i64, 0x8000_i64, 0x7FFF_i64),
-            Size::D => (0xFFFF_FFFF_i64, 0x8000_0000_i64, 0x7FFF_FFFF_i64),
-            Size::Q => (-1_i64, i64::MIN, i64::MAX),
-        };
-        match op {
-            Binary::UaddSat => {
-                self.asm.alu_sized(size, Alu::Add, dst, src);
-                self.asm.mov_imm(Reg::Rdx, umax);
-                self.asm.cmov(Cond::B, dst, Reg::Rdx);
-            }
-            Binary::UsubSat => {
-                self.asm.alu32(Alu::Xor, Reg::Rdx, Reg::Rdx);
-                self.asm.alu_sized(size, Alu::Sub, dst, src);
-                self.asm.cmov(Cond::B, dst, Reg::Rdx);
-            }
-            Binary::SaddSat | Binary::SsubSat => {
-                let alu = if op == Binary::SaddSat { Alu::Add } else { Alu::Sub };
-                self.asm.alu_sized(size, alu, dst, src);
-                self.asm.mov_imm(Reg::Rdx, smin);
-                self.asm.mov_imm(Reg::R11, smax);
-                self.asm.cmov(Cond::S, Reg::Rdx, Reg::R11);
-                self.asm.cmov(Cond::O, dst, Reg::Rdx);
-            }
-            _ => {}
-        }
-        self.clobber_regs(&[dst, Reg::Rdx, Reg::R11]);
-    }
-
-    pub(super) fn popcount(&mut self, dst: Reg, src: Rm) {
-        let (part, mask) = (Reg::R11, Reg::Rsi);
-        match src {
-            Rm::Reg(r) if r == dst as u8 => {}
-            _ => self.asm.load(Size::Q, dst, src),
-        }
-        for (bits, shift) in BIT_STEPS {
-            self.asm.mov_imm(mask, bits as i64);
-            self.asm.mov(part, dst);
-            self.asm.shift_imm(Size::Q, Shift::Shr, part, shift);
-            self.asm.alu(Alu::And, part, mask);
-            self.asm.alu(Alu::And, dst, mask);
-            self.asm.alu(Alu::Add, dst, part);
-        }
-        self.asm.mov_imm(mask, 0x0101_0101_0101_0101);
-        self.asm.imul(dst, mask);
-        self.asm.shift_imm(Size::Q, Shift::Shr, dst, 56);
-        self.clobber_regs(&[dst, Reg::R11, Reg::Rsi]);
-    }
-
-    pub(super) fn reverse_bits(&mut self) {
-        for (mask, shift) in BIT_STEPS {
-            self.asm.mov_imm(Reg::Rcx, mask as i64);
-            self.asm.mov(Reg::Rdx, Reg::Rax);
-            self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rdx, shift);
-            self.asm.alu(Alu::And, Reg::Rdx, Reg::Rcx);
-            self.asm.alu(Alu::And, Reg::Rax, Reg::Rcx);
-            self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift);
-            self.asm.alu(Alu::Or, Reg::Rax, Reg::Rdx);
-        }
-        self.asm.bswap(Size::Q, Reg::Rax);
-        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
-    }
-
-    pub(super) fn clamp_signed(&mut self, reg: Reg, to: Type, signed: bool) {
-        let bits = to.bits();
-        if bits >= 64 {
-            return;
-        }
-        let (lo, hi) = if signed {
-            (-(1_i64 << (bits - 1)), (1_i64 << (bits - 1)) - 1)
-        } else {
-            (0, (1_i64 << bits) - 1)
-        };
-        self.asm.mov_imm(Reg::Rcx, lo);
-        self.asm.alu(Alu::Cmp, reg, Reg::Rcx);
-        self.asm.cmov(Cond::L, reg, Reg::Rcx);
-        self.asm.mov_imm(Reg::Rcx, hi);
-        self.asm.alu(Alu::Cmp, reg, Reg::Rcx);
-        self.asm.cmov(Cond::G, reg, Reg::Rcx);
-        self.clobber_regs(&[reg, Reg::Rcx]);
     }
 }
 
@@ -727,6 +737,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn jump_label(&mut self, label: Label) {
         self.invalidate_spills();
+        self.asm.flags_overwritten();
         self.asm.jmp(label);
     }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {

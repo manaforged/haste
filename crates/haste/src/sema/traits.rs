@@ -1,7 +1,25 @@
+use std::cell::Cell;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rustc_hash::FxHashMap as HashMap;
+
+#[derive(Clone, Copy)]
+struct MemberSlot {
+    file_ptr: usize,
+    of: ItemRef,
+    len: u8,
+    bytes: [u8; 23],
+    found: Option<ItemRef>,
+}
+
+impl MemberSlot {
+    const EMPTY: Self = Self { file_ptr: 0, of: ItemRef { krate: 0, file: 0, item: 0 }, len: 0, bytes: [0; 23], found: None };
+}
+
+thread_local! {
+    static TRAIT_MEMBER_L1: [Cell<MemberSlot>; 64] = [const { Cell::new(MemberSlot::EMPTY) }; 64];
+}
 
 use crate::body::Body;
 use crate::body::sig::{self, Generics};
@@ -46,6 +64,18 @@ impl<'a> Context<'a> {
 
     /// The member of trait `of` named `name`.
     pub fn trait_member(&self, of: ItemRef, name: &str) -> Option<ItemRef> {
+        let nb = name.as_bytes();
+        let file_ptr = self.outline.crates.get(of.krate as usize).and_then(|c| c.files.get(of.file as usize)).map_or(0, |f| Arc::as_ptr(f) as usize);
+        let idx = ((of.krate as usize).wrapping_mul(31) ^ (of.file as usize).wrapping_mul(17) ^ (of.item as usize) ^ usize::from(nb.first().copied().unwrap_or(0)).wrapping_shl(3) ^ nb.len()) & 63;
+        if file_ptr != 0 && nb.len() <= 23 {
+            let hit = TRAIT_MEMBER_L1.with(|tls| {
+                let slot = tls[idx].get();
+                (slot.file_ptr == file_ptr && slot.of == of && usize::from(slot.len) == nb.len() && &slot.bytes[..nb.len()] == nb).then_some(slot.found)
+            });
+            if let Some(found) = hit {
+                return found;
+            }
+        }
         let members = self.trait_members.get_or_insert_with(of, || {
             let mut map = HashMap::default();
             for member in self.children(of) {
@@ -53,7 +83,15 @@ impl<'a> Context<'a> {
             }
             Arc::new(map)
         });
-        members.get(name).copied()
+        let found = members.get(name).copied();
+        if file_ptr != 0 && nb.len() <= 23 {
+            TRAIT_MEMBER_L1.with(|tls| {
+                let mut bytes = [0u8; 23];
+                bytes[..nb.len()].copy_from_slice(nb);
+                tls[idx].set(MemberSlot { file_ptr, of, len: nb.len() as u8, bytes, found });
+            });
+        }
+        found
     }
 
     /// The methods of trait `of` and then of its supertraits in vtable order: each one that takes `self`, has no type parameters of its own and no `Self: Sized` bound, and none for the rest or for an unfixed generic supertrait.

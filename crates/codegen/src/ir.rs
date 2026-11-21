@@ -1,5 +1,9 @@
 use std::fmt;
 
+mod consts;
+mod edges;
+mod flags;
+mod rodata;
 mod vector;
 
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
@@ -43,23 +47,28 @@ impl Type {
     /// Whether a value of the type lives in a float register when it has one.
     pub const fn in_float_register(self) -> bool { self.is_float() || self.is_vector() }
 
+    /// The integer type `bytes` wide: 1, 2, 4 or 8.
+    pub const fn int_of_bytes(bytes: i64) -> Option<Type> {
+        match bytes {
+            1 => Some(Type::I8),
+            2 => Some(Type::I16),
+            4 => Some(Type::I32),
+            8 => Some(Type::I64),
+            _ => None,
+        }
+    }
+
     /// Whether the type holds an integer that fits in one general-purpose register.
     pub const fn is_small_int(self) -> bool { matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64) }
 
     /// The lane kind when `self` is a vector type.
     pub const fn lane(self) -> Option<Lane> {
-        match self {
-            Type::Vec { lane, .. } => Some(lane),
-            _ => None,
-        }
+        match self { Type::Vec { lane, .. } => Some(lane), _ => None }
     }
 
     /// The `(lane, count)` shape when `self` is a vector type.
     pub const fn vec_shape(self) -> Option<(Lane, u8)> {
-        match self {
-            Type::Vec { lane, count } => Some((lane, count)),
-            _ => None,
-        }
+        match self { Type::Vec { lane, count } => Some((lane, count)), _ => None }
     }
 
     /// Whether `self` is a valid 8-byte or 16-byte power-of-two vector type.
@@ -88,9 +97,7 @@ macro_rules! ids {
         pub struct $name(pub(crate) u32);
 
         impl $name {
-            pub(crate) fn index(self) -> usize {
-                self.0 as usize
-            }
+            pub(crate) fn index(self) -> usize { self.0 as usize }
         }
     )*};
 }
@@ -426,38 +433,6 @@ impl Op {
         self.is_speculable() || matches!(self, Op::Binary(..) | Op::Runtime(_) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
     }
 
-    /// Every block this instruction can go to.
-    pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + '_ {
-        let (first, second, slice) = match self {
-            Op::Jump(block, _) => (Some(*block), None, &[][..]),
-            Op::Brif(_, then, _, otherwise, _) => (Some(*then), Some(*otherwise), &[][..]),
-            Op::BrTable(_, default, targets) => (Some(*default), None, &targets[..]),
-            Op::TryCall { normal, handler, .. } => (Some(*normal), Some(*handler), &[][..]),
-            _ => (None, None, &[][..]),
-        };
-        first.into_iter().chain(second).chain(slice.iter().copied())
-    }
-
-    /// Replaces every block this instruction can go to with `f` of it.
-    pub(crate) fn map_targets(&mut self, mut f: impl FnMut(Block) -> Block) {
-        match self {
-            Op::Jump(block, _) => *block = f(*block),
-            Op::Brif(_, then, _, otherwise, _) => {
-                *then = f(*then);
-                *otherwise = f(*otherwise);
-            }
-            Op::BrTable(_, default, targets) => {
-                *default = f(*default);
-                targets.iter_mut().for_each(|target| *target = f(*target));
-            }
-            Op::TryCall { normal, handler, .. } => {
-                *normal = f(*normal);
-                *handler = f(*handler);
-            }
-            _ => {}
-        }
-    }
-
     /// Calls `f` with every value this instruction reads, once per read.
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
@@ -543,6 +518,8 @@ impl Op {
 pub(crate) struct InstData {
     pub op: Op,
     pub result: Option<Value>,
+    /// The source place this instruction came from: file key in the high 32 bits, byte offset in the low 32; 0 when unknown.
+    pub loc: u64,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -572,6 +549,9 @@ pub struct Function {
     pub(crate) self_slots: Vec<u32>,
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
+    pub(crate) value_flags: Vec<u8>,
+    /// The bytes at the start of this coroutine's own frame that no code outside the frame can address.
+    pub(crate) frame_private: u32,
     pub(crate) cfg_rev: u32,
     pub(crate) cfg_cache: CfgCache,
 }
@@ -579,7 +559,7 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
     }
 
     pub(crate) fn bump_cfg(&mut self) {
@@ -620,25 +600,20 @@ impl Function {
     }
 
     /// Whether this function is an unsplit coroutine body.
-    pub fn is_coroutine(&self) -> bool {
-        self.coroutine.is_some()
-    }
+    pub fn is_coroutine(&self) -> bool { self.coroutine.is_some() }
 
-    /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol or slot-addr recorded in `vtable_slots`.
-    pub fn devirt_call_sites(&self) -> Vec<(Block, usize, u32)> {
-        if self.vtable_slots.is_empty() {
-            return Vec::new();
-        }
-        let mut slot_syms = vec![None; self.types.len()];
+    /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol, a slot address, or a load from either.
+    pub fn symbol_call_sites(&self) -> Vec<(Block, usize, u32)> {
+        let mut syms = vec![None; self.types.len()];
         for data in &self.insts {
             if let (Op::Symbol(sym) | Op::SlotAddr(sym), Some(res)) = (&data.op, data.result) {
-                slot_syms[res.index()] = Some(*sym);
+                syms[res.index()] = Some(*sym);
             }
         }
-        let mut syms = slot_syms.clone();
+        let named = syms.clone();
         for data in &self.insts {
             if let (Op::Load(addr, 0), Some(res)) = (&data.op, data.result)
-                && let Some(sym) = slot_syms[addr.index()]
+                && let Some(sym) = named[addr.index()]
             {
                 syms[res.index()] = Some(sym);
             }
@@ -648,7 +623,6 @@ impl Function {
             for (pos, &inst) in block.insts.iter().enumerate() {
                 if let Op::Call { callee, .. } = self.insts[inst.index()].op
                     && let Some(sym) = syms[callee.index()]
-                    && self.vtable_slots.iter().any(|&(_, _, s, _)| s == sym)
                 {
                     out.push((Block(b_idx as u32), pos, sym));
                 }
@@ -658,19 +632,14 @@ impl Function {
     }
 
     /// The type of `value`.
-    pub fn ty(&self, value: Value) -> Type {
-        self.types[value.index()]
-    }
+    pub fn ty(&self, value: Value) -> Type { self.types[value.index()] }
 
     /// A new value of type `ty`, for an instruction to define.
-    pub(crate) fn value(&mut self, ty: Type) -> Value {
-        self.types.push(ty);
-        Value(self.types.len() as u32 - 1)
-    }
+    pub(crate) fn value(&mut self, ty: Type) -> Value { self.types.push(ty); Value(self.types.len() as u32 - 1) }
 
     /// A new instruction outside every block that runs `op` and defines `result`.
     pub(crate) fn add(&mut self, op: Op, result: Option<Value>) -> Inst {
-        self.insts.push(InstData { op, result });
+        self.insts.push(InstData { op, result, loc: 0 });
         Inst(self.insts.len() as u32 - 1)
     }
 
@@ -695,6 +664,11 @@ impl Function {
             }
         }
         block
+    }
+
+    /// The source location of the first located instruction, which code with no location of its own reports.
+    pub(crate) fn home_loc(&self) -> u64 {
+        self.blocks.iter().flat_map(|block| &block.insts).map(|inst| self.insts[inst.index()].loc).find(|&loc| loc != 0).unwrap_or(0)
     }
 
     /// The number of instructions in the body.
@@ -788,6 +762,7 @@ impl fmt::Display for Function {
             for inst in &block.insts {
                 let data = &self.insts[inst.index()];
                 match data.result {
+                    Some(value) if self.is_unpredictable(value) => writeln!(f, "    v{}: {:?} = {:?} unpredictable", value.0, self.ty(value), data.op)?,
                     Some(value) => writeln!(f, "    v{}: {:?} = {:?}", value.0, self.ty(value), data.op)?,
                     None => writeln!(f, "    {:?}", data.op)?,
                 }

@@ -252,6 +252,14 @@ fn is_trivia(kind: TokenKind) -> bool {
 }
 
 /// Whether `kind` opens a delimited group: `(`, `[` or `{`.
+/// The stable 32-bit key of a source file path, the high half of `Source::place`; never 0.
+pub fn file_key(path: &Path) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    path.hash(&mut hasher);
+    (hasher.finish() as u32).max(1)
+}
+
 pub fn opens(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::OpenParen | TokenKind::OpenBrace | TokenKind::OpenBracket)
 }
@@ -618,12 +626,25 @@ impl Source {
 
     /// The source text from the start of token `from` to the end of token `to`, inclusive, within the layer of `from`.
     pub fn span(&self, from: u32, to: u32) -> &str {
+        if from > to {
+            return "";
+        }
         let (src, first) = self.layer(from);
-        let last = if src.offset == self.offset { (to - self.offset) as usize } else { (to.min(self.offset - 1)) as usize };
+        let (to_src, to_local) = self.layer(to);
+        let last = if std::ptr::eq(src, to_src) {
+            to_local
+        } else {
+            let clamped = to.min(self.offset.saturating_sub(1)).saturating_sub(src.offset) as usize;
+            clamped.min(src.tokens.len().saturating_sub(1))
+        };
         let (Some(&first), Some(&last)) = (src.tokens.get(first), src.tokens.get(last)) else {
             return "";
         };
-        &src.text[first.start as usize..last.end() as usize]
+        let (start, end) = (first.start as usize, last.end() as usize);
+        if start > end || end > src.text.len() {
+            return "";
+        }
+        &src.text[start..end]
     }
 
     /// The kind of token `at`, or `Eof` past the end.
@@ -731,6 +752,11 @@ impl Source {
             Origins::Read => src.tokens.get(local).map(|token| token.start),
             Origins::Copied(copied) => copied.binary_search_by_key(&(local as u32), |&(token, _)| token).ok().map(|found| copied[found].1),
         }
+    }
+
+    /// The source place of token `at` for debug line tables: `file_key(path)` in the high 32 bits and the disk byte offset in the low 32, or 0 when the token lies nowhere on disk.
+    pub fn place(&self, at: u32) -> u64 {
+        self.origin(at).map_or(0, |byte| u64::from(file_key(&self.path)) << 32 | u64::from(byte))
     }
 
     /// The byte offset of token `at` in the text of its layer.

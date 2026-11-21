@@ -27,15 +27,7 @@ impl Lower<'_, '_> {
                 let id = self.slots.rodata(name.as_bytes(), &[]);
                 let step = RelocStep::TypeName(TyOrigin::SiteSubst(Box::new(origin.clone()), 0));
                 let data = self.emit_symbol_with(SymbolSource::Rodata(id), step);
-                let idx = self.relocs.len() as u32;
-                self.relocs.push(SymbolSource::Word(name.len() as u64));
-                let len = match self.mode {
-                    super::stencil::LowerMode::Dict => {
-                        let dict = self.dict_param.expect("dictionary parameter is set");
-                        self.ins().load(Type::I64, dict, (idx * 8) as i32)
-                    }
-                    super::stencil::LowerMode::Stencil => self.ins().symbol(idx),
-                };
+                let len = self.next_symbol(SymbolSource::Word(name.len() as u64));
                 Ok(Some(self.wide(data, len)))
             }
             (NoOp, _, _) => Ok(None),
@@ -121,11 +113,25 @@ impl Lower<'_, '_> {
     fn type_id(&mut self, origin: &SiteOrigin, ty: Ty) -> Value {
         let slot = self.b.create_stack_slot(16, 3);
         let step = RelocStep::TypeId(TyOrigin::SiteSubst(Box::new(origin.clone()), 0));
-        let id = self.emit_symbol_with(SymbolSource::Word(u64::from(ty.0)), step);
-        let zero = self.emit_symbol(SymbolSource::Word(0));
-        self.ins().stack_store(id, slot, 0);
-        self.ins().stack_store(zero, slot, 8);
+        let [lo, hi] = super::reloc::type_id_words(self.cx, ty);
+        let lo = self.emit_symbol_with(lo, step);
+        let hi = self.next_symbol(hi);
+        self.ins().stack_store(lo, slot, 0);
+        self.ins().stack_store(hi, slot, 8);
         self.ins().stack_addr(Type::I64, slot, 0)
+    }
+
+    /// The value of `src`, a symbol the reloc step emitted just before it also produces.
+    fn next_symbol(&mut self, src: SymbolSource) -> Value {
+        let idx = self.relocs.len() as u32;
+        self.relocs.push(src);
+        match self.mode {
+            super::stencil::LowerMode::Dict => {
+                let dict = self.dict_param.expect("dictionary parameter is set");
+                self.ins().load(Type::I64, dict, (idx * 8) as i32)
+            }
+            super::stencil::LowerMode::Stencil => self.ins().symbol(idx),
+        }
     }
 
     fn layout_const(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {
@@ -188,7 +194,11 @@ impl Lower<'_, '_> {
         let size = self.size(element)?;
         let data = self.ins().load(Type::I64, slice, 0);
         let bytes = self.ins().imul_imm(index, size);
-        Ok(self.ins().iadd(data, bytes))
+        let address = self.ins().iadd(data, bytes);
+        if substs.first().is_some_and(|&item| matches!(self.cx.types.kind(item), Kind::Ref(..))) {
+            self.ins().assume(address);
+        }
+        Ok(address)
     }
 
     fn size(&mut self, ty: Ty) -> Result<i64> {
@@ -207,10 +217,21 @@ impl Lower<'_, '_> {
     }
 
     fn offset_from(&mut self, ty: Ty, signed: bool, to: Value, from: Value) -> Result<Value> {
-        let size = self.size(ty)?;
+        let size = self.size(ty)?.max(1) as u64;
         let bytes = self.ins().isub(to, from);
-        let size = self.ins().iconst(Type::I64, size.max(1));
-        Ok(if signed { self.ins().sdiv(bytes, size) } else { self.ins().udiv(bytes, size) })
+        let shift = size.trailing_zeros();
+        let odd = size >> shift;
+        let mut count = bytes;
+        if shift != 0 {
+            let by = self.ins().iconst(Type::I64, i64::from(shift));
+            count = if signed { self.ins().sshr(count, by) } else { self.ins().ushr(count, by) };
+        }
+        if odd != 1 {
+            let inverse = (0..5).fold(odd, |x, _| x.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(x))));
+            let inverse = self.ins().iconst(Type::I64, inverse as i64);
+            count = self.ins().imul(count, inverse);
+        }
+        Ok(count)
     }
 
     fn read_at(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {

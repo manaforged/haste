@@ -5,7 +5,7 @@ use super::wide::WideShim;
 use super::{Buf, Plan, SectionAddrs};
 use crate::host::cpu::HIDDEN;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::aot) enum Shim {
     Noop,
     Barrier,
@@ -18,6 +18,8 @@ pub(in crate::aot) enum Shim {
     Realloc,
     FillOnce,
     ThreadCell,
+    FrameAlloc,
+    FrameFree,
     Wide(WideShim),
 }
 
@@ -25,7 +27,8 @@ pub(super) fn deps(shim: Shim) -> &'static [&'static str] {
     match shim {
         Shim::Alloc => &["malloc", "posix_memalign"],
         Shim::AllocZeroed => &["calloc", "posix_memalign", "memset"],
-        Shim::Dealloc => &["free"],
+        Shim::Dealloc | Shim::FrameFree => &["free"],
+        Shim::FrameAlloc => &["malloc"],
         Shim::Realloc => &["realloc", "malloc", "posix_memalign", "memcpy", "free"],
         Shim::FillOnce => &["sched_yield"],
         Shim::ThreadCell => &["pthread_key_create", "pthread_getspecific", "pthread_setspecific", "calloc", "memcpy", "free", "posix_memalign", "memset", "sched_yield"],
@@ -237,6 +240,62 @@ fn emit_x64_thread_cell(va: u64, key_va: u64, stub_va: &dyn Fn(&str) -> Result<u
     Ok(())
 }
 
+/// The x86-64 ELF thread cell: the cell pointer of slot `rdi` sits in the executable's static TLS block `tls` bytes below the thread pointer; a null slot gets `rsi` zeroed bytes aligned to 64.
+fn emit_x64_tls_cell(va: u64, tls: u64, stub_va: &dyn Fn(&str) -> Result<u64>, out: &mut Buf) -> Result<()> {
+    let base = out.pos();
+    let at = |out: &Buf| va + (out.pos() - base) as u64;
+    let disp = (tls as i64).wrapping_neg() as i32 as u32;
+    out.bytes(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x8C, 0xF8]);
+    out.u32(disp);
+    out.bytes(&[0x48, 0x85, 0xC9]);
+    let slow = x64_fwd(0x74, out);
+    out.bytes(&[0x48, 0x89, 0xC8, 0xC3]);
+    x64_patch8(slow, out);
+    out.bytes(&[0x53, 0x41, 0x54, 0x48, 0x83, 0xEC, 0x08, 0x48, 0x8D, 0x9C, 0xF8]);
+    out.u32(disp);
+    out.bytes(&[0x49, 0x89, 0xF4, 0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xE7, 0xBE, 0x40, 0x00, 0x00, 0x00, 0x4C, 0x89, 0xE2]);
+    emit_rel_branch(Arch::X64, true, at(out), stub_va("posix_memalign")?, out);
+    out.bytes(&[0x85, 0xC0]);
+    let fail = x64_fwd(0x75, out);
+    out.bytes(&[0x48, 0x8B, 0x3C, 0x24, 0x31, 0xF6, 0x4C, 0x89, 0xE2]);
+    emit_rel_branch(Arch::X64, true, at(out), stub_va("memset")?, out);
+    out.bytes(&[0x48, 0x89, 0x03]);
+    let done = x64_fwd(0xEB, out);
+    x64_patch8(fail, out);
+    out.bytes(&[0x31, 0xC0]);
+    x64_patch8(done, out);
+    out.bytes(&[0x48, 0x83, 0xC4, 0x08, 0x41, 0x5C, 0x5B, 0xC3]);
+    Ok(())
+}
+
+/// The x86-64 ELF coroutine frame cache: per thread, one free list of up to 64 frames for each 16-byte size class below 1024 bytes, `tls` bytes below the thread pointer, indexed by the size the caller passes as a 16-byte multiple; other sizes and misses go to `malloc` and `free`.
+fn emit_x64_frame_cache(alloc: bool, va: u64, tls: u64, stub_va: &dyn Fn(&str) -> Result<u64>, out: &mut Buf) -> Result<()> {
+    let base = out.pos();
+    let at = |out: &Buf| va + (out.pos() - base) as u64;
+    let disp = (tls as i64).wrapping_neg() as i32 as u32;
+    let (size_reg, sib) = if alloc { (0xFF, 0x3A) } else { (0xFE, 0x32) };
+    out.bytes(&[0x48, 0x81, size_reg]);
+    out.u32(haste_codegen::FRAME_CACHE_LIMIT);
+    let big = x64_fwd(0x73, out);
+    out.bytes(&[0x64, 0x48, 0x8B, 0x14, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x94, sib]);
+    out.u32(disp);
+    let miss = if alloc {
+        out.bytes(&[0x48, 0x8B, 0x02, 0x48, 0x85, 0xC0]);
+        let miss = x64_fwd(0x74, out);
+        out.bytes(&[0x48, 0x8B, 0x08, 0x48, 0x89, 0x0A, 0x48, 0xFF, 0x4A, 0x08, 0xC3]);
+        miss
+    } else {
+        out.bytes(&[0x48, 0x83, 0x7A, 0x08, haste_codegen::FRAME_CACHE_DEPTH]);
+        let full = x64_fwd(0x73, out);
+        out.bytes(&[0x48, 0x8B, 0x0A, 0x48, 0x89, 0x0F, 0x48, 0x89, 0x3A, 0x48, 0xFF, 0x42, 0x08, 0xC3]);
+        full
+    };
+    x64_patch8(big, out);
+    x64_patch8(miss, out);
+    emit_rel_branch(Arch::X64, false, at(out), stub_va(if alloc { "malloc" } else { "free" })?, out);
+    Ok(())
+}
+
 fn emit_arm64_thread_cell(va: u64, key_va: u64, stub_va: &dyn Fn(&str) -> Result<u64>, out: &mut Buf) -> Result<()> {
     let base = out.pos();
     let at = |out: &Buf| va + (out.pos() - base) as u64;
@@ -370,7 +429,11 @@ fn emit_shim_x64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &dyn
             emit_rel_branch(Arch::X64, true, at(out), stub_va("sched_yield")?, out);
             out.bytes(&[0xEB, 0xEB, 0x41, 0xFF, 0xD4, 0xC6, 0x03, 0x01, 0x41, 0x5C, 0x5B, 0xC3]);
         }
+        Shim::ThreadCell if os == Os::Linux => emit_x64_tls_cell(va, addrs.thread_tls, stub_va, out)?,
         Shim::ThreadCell => emit_x64_thread_cell(va, addrs.thread_key, stub_va, out)?,
+        Shim::FrameAlloc | Shim::FrameFree if os == Os::Linux => emit_x64_frame_cache(shim == Shim::FrameAlloc, va, addrs.frame_tls, stub_va, out)?,
+        Shim::FrameAlloc => emit_rel_branch(Arch::X64, false, va, stub_va("malloc")?, out),
+        Shim::FrameFree => emit_rel_branch(Arch::X64, false, va, stub_va("free")?, out),
         Shim::Wide(wide) => super::wide::emit(Arch::X64, os, wide, out)?,
     }
     Ok(())
@@ -385,7 +448,8 @@ fn emit_shim_arm64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &d
         Shim::Syscall => out.words(&[if os == Os::Darwin { 0x9280_09A0 } else { 0x9280_04A0 }, 0xD65F_03C0]),
         Shim::Cpuid => out.words(&[0xA900_7C1F, 0xD65F_03C0]),
         Shim::ExtendedState => out.words(&[0xD280_0000, 0xD65F_03C0]),
-        Shim::Dealloc => emit_rel_branch(Arch::Arm64, false, va, stub_va("free")?, out),
+        Shim::Dealloc | Shim::FrameFree => emit_rel_branch(Arch::Arm64, false, va, stub_va("free")?, out),
+        Shim::FrameAlloc => emit_rel_branch(Arch::Arm64, false, va, stub_va("malloc")?, out),
         Shim::Alloc => {
             out.words(&[0xF100_001F, 0xD280_0029, 0x9A89_1000, 0xF100_403F, 0x5400_0048]);
             emit_rel_branch(Arch::Arm64, false, at(out), stub_va("malloc")?, out);

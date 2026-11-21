@@ -1,4 +1,10 @@
+use std::cell::Cell;
+
 use anyhow::{Result, anyhow};
+
+thread_local! {
+    static OPAQUE_CYCLED: Cell<bool> = const { Cell::new(false) };
+}
 
 use crate::body::sig::Signature;
 use crate::body::{Args, Body, PathId};
@@ -35,6 +41,11 @@ impl<'a> Infer<'_, 'a> {
         self.settle_opaques(false)
     }
 
+    pub(super) fn is_pending_opaque(&self, ty: Ty) -> bool {
+        let ty = self.resolve(ty);
+        self.opaques.iter().any(|opaque| self.resolve(opaque.ret) == ty)
+    }
+
     /// The trait bounds of the pending `impl Trait` return value `ty` and the supertrait bounds they imply, each with `Self` first.
     pub(super) fn opaque_bounds(&mut self, ty: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let bounds = self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).map(|opaque| opaque.bounds.clone()).unwrap_or_default();
@@ -56,9 +67,24 @@ impl<'a> Infer<'_, 'a> {
         Ok(bounds)
     }
 
+    fn into_iter_blanket_trait(&mut self, of: ItemRef) -> Option<ItemRef> {
+        let into_iter = self.cx.lang_item("into_iter")?;
+        if self.cx.owner_trait(into_iter) != Some(of) {
+            return None;
+        }
+        let next = self.cx.lang_item("next")?;
+        self.cx.owner_trait(next)
+    }
+
     /// Ties `substs` of trait `of`, whose `Self` is a pending `impl Trait` value, to the one bound of it of that trait: whether they unify, or none when it has no one such bound.
     pub(super) fn opaque_holds(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Option<bool>> {
         let held: Vec<Vec<Ty>> = self.opaque_bounds(self.resolve(substs[0]))?.into_iter().filter(|(bound, _)| *bound == of).map(|(_, types)| types).collect();
+        if held.is_empty()
+            && substs.len() == 1
+            && let Some(iter_trait) = self.into_iter_blanket_trait(of)
+        {
+            return self.opaque_holds(iter_trait, substs);
+        }
         let [types] = &held[..] else { return Ok(None) };
         let tied = self.trial(|infer| Ok(substs.iter().zip(types).all(|(&a, &b)| infer.unifies(a, b)).then_some(())))?;
         Ok(Some(tied.is_some()))
@@ -66,6 +92,9 @@ impl<'a> Infer<'_, 'a> {
 
     /// Reveals each `impl Trait` return type whose type arguments are known, or every one when `force` is set.
     pub(super) fn settle_opaques(&mut self, force: bool) -> Result<()> {
+        if force {
+            self.publish_provisional_ret();
+        }
         let mut at = 0;
         while at < self.opaques.len() {
             let Opaque { item, substs, ret, output, .. } = self.opaques[at].clone();
@@ -73,15 +102,33 @@ impl<'a> Infer<'_, 'a> {
                 at += 1;
                 continue;
             }
-            self.opaques.swap_remove(at);
-            let substs: Vec<Ty> = substs.into_iter().map(|ty| self.zonk(ty)).collect();
-            if self.poly.is_some() && self.any_has_params(&substs) {
+            let zonked_substs: Vec<Ty> = substs.into_iter().map(|ty| self.zonk(ty)).collect();
+            if self.poly.is_some() && self.any_has_params(&zonked_substs) {
+                self.opaques.swap_remove(at);
                 self.poly_fallback();
                 return Ok(());
             }
-            self.share_closures(&substs);
-            let interned = self.cx.types.intern_substs(&substs);
-            let found = revealed(self.cx, item, interned)?;
+            self.share_closures(&zonked_substs);
+            let interned = self.cx.types.intern_substs(&zonked_substs);
+            let (target, target_substs) = match self.trait_call(item, interned)? {
+                super::Res::Fn(resolved, resolved_substs) => (resolved, resolved_substs),
+                _ => (item, interned),
+            };
+            if !force {
+                OPAQUE_CYCLED.set(false);
+            }
+            let found = match revealed(self.cx, target, target_substs) {
+                Ok(found) => found,
+                Err(_) if !force && OPAQUE_CYCLED.get() => {
+                    at += 1;
+                    continue;
+                }
+                Err(err) => {
+                    self.opaques.swap_remove(at);
+                    return Err(err);
+                }
+            };
+            self.opaques.swap_remove(at);
             if let Some(output) = output.filter(|_| !self.cx.has_closure(found)) {
                 let output = self.zonk(output);
                 self.cx.store.lookups.futures.insert(found, output);
@@ -91,24 +138,48 @@ impl<'a> Infer<'_, 'a> {
         Ok(())
     }
 
-    /// Registers the closures of this body once their types are known, when `substs` hold one, so the body that reveals an `impl Trait` return can call them before this body finishes.
-    fn share_closures(&mut self, substs: &[Ty]) {
-        let Some((item, args)) = self.instance else { return };
-        if !substs.iter().any(|&ty| holds_closure(self.cx, ty, (item, args))) {
+    fn publish_provisional_ret(&mut self) {
+        if self.poly.is_some() {
             return;
         }
+        let (Some(own), Some(own_ret)) = (self.instance, self.out.ret) else { return };
+        if matches!(self.cx.types.kind(self.resolve(own_ret)), Kind::Var(_)) {
+            return;
+        }
+        let zonked = self.zonk(own_ret);
+        if self.has_vars(zonked) || self.has_params(zonked) {
+            return;
+        }
+        self.share_ready_closures(own);
+        self.cx.store.lookups.provisional_rets.insert(own, zonked);
+    }
+
+    /// Registers the closures of this body once their types are known, when `substs` hold one, so the body that reveals an `impl Trait` return can call them before this body finishes.
+    fn share_closures(&mut self, substs: &[Ty]) {
+        if self.poly.is_some() {
+            return;
+        }
+        let Some(own) = self.instance else { return };
+        if !substs.iter().any(|&ty| holds_closure(self.cx, ty, own)) {
+            return;
+        }
+        self.share_ready_closures(own);
+    }
+
+    fn share_ready_closures(&mut self, own: (ItemRef, Substs)) {
         let locals: Vec<Local> = self.out.locals.clone().into_iter().map(|local| Local { ty: self.zonk(local.ty) }).collect();
         let mut closures = self.out.closures.clone();
         closures.values_mut().for_each(|closure| closure.ret = self.zonk(closure.ret));
-        let typed = |closure: &Closure| {
+        let ready = |closure: &Closure| {
             let held = closure.params.iter().copied().chain(closure.captures.iter().map(|capture| capture.local));
-            held.map(|local| locals[local as usize].ty).chain([closure.ret]).collect::<Vec<Ty>>()
+            !held.map(|local| locals[local as usize].ty).chain([closure.ret]).any(|ty| self.has_vars(ty))
         };
-        if closures.values().flat_map(typed).any(|ty| self.has_vars(ty)) {
+        closures.retain(|_, closure| ready(closure));
+        if closures.is_empty() {
             return;
         }
         let tables = super::LazyTables::Eager(std::sync::Arc::new(BodyTables { closures: PackedMap::pack(closures), ..BodyTables::default() }));
-        super::closure::register(self.cx, (item, args), &Typed { tables, locals, ..Typed::default() });
+        super::closure::register(self.cx, own, &Typed { tables, locals, ..Typed::default() });
     }
 
     /// Holds the hidden type of each `impl Trait` in this function's return type to its bounds, tying the associated types they name, as `Output = T`, and their trait arguments, which rustc reads to infer the body.
@@ -171,6 +242,14 @@ impl<'a> Infer<'_, 'a> {
                 return Ok(Some(out));
             }
         }
+        if let Some(iter_trait) = self.into_iter_blanket_trait(of) {
+            if name == "Item" {
+                return self.opaque_binding(iter_trait, ty, "Item");
+            }
+            if name == "IntoIter" && self.opaque_holds(iter_trait, &[ty])? == Some(true) {
+                return Ok(Some(ty));
+            }
+        }
         Ok(None)
     }
 
@@ -222,11 +301,11 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The callable trait and function pointer type that a callable bound on the outer parameter `name` spells in a header of the frame.
-    pub(super) fn header_callable_bound(&mut self, name: &str, home: ModRef) -> Result<Option<(ItemRef, Ty)>> {
-        for (header, src) in self.headers()? {
+    pub(super) fn header_callable_bound(&mut self, name: &str, _home: ModRef) -> Result<Option<(ItemRef, Ty)>> {
+        for (header, src, home) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
             for bound in super::scope::named_bounds(arena, src, (generics, predicates), name) {
-                if let Some(hint) = self.in_source(src, |infer| infer.callable_bound(arena, home, bound))? {
+                if let Some(hint) = self.in_source_home(src, home, |infer| infer.callable_bound(arena, home, bound))? {
                     return Ok(Some(hint));
                 }
             }
@@ -342,10 +421,22 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> R
         (item, substs),
         |cx| {
             let mut unlaid = Vec::new();
-            let typed = crate::sema::reach::typed_once(cx, &(item, substs), &mut unlaid).map_err(|msg| anyhow!("{msg}"))?;
+            let typed = crate::sema::reach::typed_once(cx, &(item, substs), &mut unlaid);
+            cx.store.lookups.provisional_rets.remove(&(item, substs));
+            let typed = typed.map_err(|msg| anyhow!("{msg}"))?;
+            super::closure::register(cx, (item, substs), &typed);
             typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))
         },
-        |cx| async_future(cx, item, substs)?.ok_or_else(|| anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item))),
+        |cx| {
+            if let Some(future) = async_future(cx, item, substs)? {
+                return Ok(future);
+            }
+            if let Some(found) = cx.store.lookups.provisional_rets.get(&(item, substs)) {
+                return Ok(found);
+            }
+            OPAQUE_CYCLED.set(true);
+            Err(anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item)))
+        },
     )
 }
 

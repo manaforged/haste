@@ -323,8 +323,11 @@ impl Infer<'_, '_> {
             let mut at = 0;
             while at < self.operands.len() {
                 let (expr, op, operands, out) = self.operands[at];
+                if matches!(op, BinOp::Shl | BinOp::Shr) {
+                    self.hint_scalar_var(operands.0, Some(out))?;
+                }
                 let compound = matches!(self.body.expr(expr), Expr::AssignOp(..));
-                if if compound { self.unknown_left(operands.0) } else { self.pending(op, operands)? } {
+                if if compound { self.unknown_operand(operands.0) } else { self.pending(op, operands)? } {
                     at += 1;
                     continue;
                 }
@@ -347,15 +350,15 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// Whether operator `op` on `left` and `right` must wait to pick its impl: the left operand is a variable or a reference to one, or several impls fit only because an operand is an untyped number.
     fn pending(&mut self, op: BinOp, (left, right): (Ty, Ty)) -> Result<bool> {
-        if self.unknown_left(left) {
+        if self.unknown_operand(left) {
             return Ok(true);
         }
-        let left_num_var = matches!(self.cx.types.kind(self.resolve(left)), Kind::IntVar(_) | Kind::FloatVar(_));
+        let left_num_var = self.is_num_var(left);
+        let right_num_var = self.is_num_var(right);
+        let right_unknown = !self.builtin_left(op, left) && self.unknown_operand(right);
         let right_adt_or_ref = matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..));
-        let right_num_var = matches!(self.cx.types.kind(self.resolve(right)), Kind::IntVar(_) | Kind::FloatVar(_));
-        if (self.builtin_left(op, left) && !right_adt_or_ref) || (!left_num_var && !right_num_var) {
+        if (self.builtin_left(op, left) && !right_adt_or_ref) || (!left_num_var && !right_num_var && !right_unknown) {
             return Ok(false);
         }
         let Some((lang, _)) = operator_trait(op) else { return Ok(false) };
@@ -363,11 +366,31 @@ impl Infer<'_, '_> {
         Ok(!self.probe(|infer| infer.select_or_assume(of, left, &[right]).unwrap_or(false)))
     }
 
-    /// Whether the left operand `left` is a variable or a reference to one, so no operator impl can be picked for it yet.
-    fn unknown_left(&self, left: Ty) -> bool {
-        match self.cx.types.kind(self.resolve(left)) {
+    /// Falls back the number right operand of each pending operator whose left operand is known and types those operators, so their results reach the numbers that use them before those fall back, as with `b >> bit & 1` for `b: u64` and `bit: &{integer}`.
+    pub(super) fn fall_back_operands(&mut self) -> Result<()> {
+        loop {
+            let rights: Vec<Ty> = self.operands.iter().filter(|(_, _, (left, right), _)| !self.unknown_operand(*left) && self.is_num_var(*right)).map(|(_, _, (_, right), _)| *right).collect();
+            if rights.is_empty() {
+                return Ok(());
+            }
+            self.fall_back_in(rights)?;
+            self.settle_operators(false)?;
+            self.settle_projection_loop()?;
+        }
+    }
+
+    fn unknown_operand(&self, ty: Ty) -> bool {
+        match self.cx.types.kind(self.resolve(ty)) {
             Kind::Var(_) => true,
-            Kind::Ref(_, inner) => matches!(self.cx.types.kind(self.resolve(*inner)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)),
+            Kind::Ref(_, inner) => self.unknown_operand(*inner) || self.is_num_var(*inner),
+            _ => false,
+        }
+    }
+
+    fn is_num_var(&self, ty: Ty) -> bool {
+        match self.cx.types.kind(self.resolve(ty)) {
+            Kind::IntVar(_) | Kind::FloatVar(_) => true,
+            Kind::Ref(_, inner) => self.is_num_var(*inner),
             _ => false,
         }
     }
@@ -382,11 +405,18 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with the trait arguments `args`.
+    /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with the trait arguments `args`, or may apply once their inference variables are known, as rustc defers it.
     pub(super) fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
-        Ok(self.select_or_prove(of, left, args)?.then_some((of, method)))
+        let open = self.has_vars(left) || args.iter().any(|&arg| self.has_vars(arg));
+        if !(self.select_or_prove(of, left, args)? || open && self.may_implement(of, left, args)?) {
+            return Ok(None);
+        }
+        if open {
+            self.obligations.push((of, std::iter::once(left).chain(args.iter().copied()).collect()));
+        }
+        Ok(Some((of, method)))
     }
 
     fn logical(&mut self, lhs: ExprId, rhs: ExprId) -> Result<Ty> {

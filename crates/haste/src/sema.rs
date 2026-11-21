@@ -297,6 +297,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Whether `ty` is `core::ptr::Unique`, the owning pointer inside `Box` and `Vec`.
+    pub fn is_unique(&mut self, ty: ty::Ty) -> bool {
+        let ty::Kind::Adt(item, _) = *self.types.kind(ty) else { return false };
+        self.name(item) == "Unique" && self.qualified(item) == "core::ptr::unique::Unique"
+    }
+
     /// Whether a call of the closure type `ty` consumes the closure, because its body moves a captured value out.
     pub fn closure_consumes(&self, ty: ty::Ty) -> bool {
         self.store.closures.get(&ty).is_some_and(|info| info.closure.consumes)
@@ -380,6 +386,16 @@ impl<'a> Context<'a> {
     /// The name of `item` under the path of the module that holds it.
     pub fn qualified(&mut self, item: ItemRef) -> String {
         format!("{}::{}", self.module_text(item), self.name(item))
+    }
+
+    /// The name of `instance` the way a symbolizer spells it: an impl method under its self type, and a closure or async body as `{closure}` under the function that holds it.
+    pub fn symbol_text(&mut self, (item, substs): reach::Instance) -> String {
+        let types = self.types.substs(substs).to_vec();
+        if let Some(&ty::Kind::Closure(parent, args, _)) = types.first().map(|&ty| self.types.kind(ty)) {
+            return format!("{}::{{closure}}", self.symbol_text((parent, args)));
+        }
+        let Some(name) = self.owner_impl(item).and_then(|block| self.impl_self_name(block)) else { return self.qualified(item) };
+        format!("{}::{name}::{}", self.module_text(item), self.name(item))
     }
 
     /// The module that holds `item`, through any impl, trait or extern block around it.

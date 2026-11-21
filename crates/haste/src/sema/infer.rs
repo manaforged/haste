@@ -46,13 +46,14 @@ pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
 pub use select::header_bound_traits;
 pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
+pub(super) use tables::{CallSites, recount_call_sites};
 
 use rustc_hash::FxHashMap as HashMap;
 
 use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
-use crate::body::{BlockKind, Body, Expr, ExprId, PatId};
+use crate::body::{Body, Expr, ExprId, PatId};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
@@ -142,7 +143,7 @@ pub struct Infer<'c, 'a> {
     frames: usize,
     evaluating: Vec<ItemRef>,
     proved: rustc_hash::FxHashSet<(ItemRef, Substs)>,
-    imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
+    imports: HashMap<(ItemRef, Option<crate::names::Sym>, Option<u32>, Vec<u32>), Vec<crate::names::PerNs>>,
     method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
@@ -253,53 +254,15 @@ pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs)
 impl<'c, 'a> Infer<'c, 'a> {
     pub(super) fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        let out = zonk::take_out();
         Infer {
-            cx,
-            body,
-            sig,
-            src,
-            root: None,
-            instance: None,
-            home,
-            generics,
-            self_ty: None,
-            block: None,
-            frame_item: None,
-            vars,
-            var_diverges: Vec::new(),
-            var_trail: Vec::new(),
-            diverge_trail: Vec::new(),
-            trail_depth: 0,
-            metadata,
-            obligations,
-            projections,
-            opaques,
-            operands,
-            casts: Vec::new(),
-            param_origins: Vec::new(),
-            receiver_param: None,
-            try_blocks,
-            awaits: Vec::new(),
-            ret_sig: None,
-            out,
-            scopes,
-            items,
-            block_uses: Vec::new(),
-            loops,
-            uses,
-            unsure: Vec::new(),
-            diverges: false,
-            hidden: Vec::new(),
-            const_args: Vec::new(),
-            selecting: Vec::new(),
-            cycle_hits: 0,
-            frames: 0,
-            evaluating: Vec::new(),
-            proved: rustc_hash::FxHashSet::default(),
-            imports: HashMap::default(),
-            method_hints: None,
-            poly: None,
+            cx, body, sig, src, home, root: None, instance: None, generics, self_ty: None, block: None, frame_item: None,
+            vars, var_diverges: Vec::new(), var_trail: Vec::new(), diverge_trail: Vec::new(), trail_depth: 0,
+            metadata, obligations, projections, opaques, operands, casts: Vec::new(), param_origins: Vec::new(),
+            receiver_param: None, try_blocks, awaits: Vec::new(), ret_sig: None, out: zonk::take_out(),
+            scopes, items, block_uses: Vec::new(), loops, uses, unsure: Vec::new(), diverges: false,
+            hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), cycle_hits: 0, frames: 0,
+            evaluating: Vec::new(), proved: rustc_hash::FxHashSet::default(), imports: HashMap::default(),
+            method_hints: None, poly: None,
         }
     }
 }
@@ -451,6 +414,33 @@ impl Infer<'_, '_> {
         self.trail_depth -= 1;
         if self.trail_depth == 0 {
             self.var_trail.truncate(trail_len);
+        }
+    }
+
+    pub(super) fn capture_var_delta(&self, (vars_len, trail_len): (usize, usize)) -> (Vec<(u32, Option<Ty>)>, Vec<Option<Ty>>, Vec<u32>) {
+        let mut updates: Vec<(u32, Option<Ty>)> = self.var_trail[trail_len..]
+            .iter()
+            .filter_map(|&(i, _)| ((i as usize) < vars_len).then_some((i, None)))
+            .collect();
+        updates.sort_unstable_by_key(|&(i, _)| i);
+        updates.dedup_by_key(|&mut (i, _)| i);
+        for (i, val) in &mut updates {
+            *val = self.vars[*i as usize];
+        }
+        let diverges = self.diverge_trail.iter().rev().take_while(|&&(d, _)| d >= self.trail_depth).map(|&(_, i)| i).collect();
+        (updates, self.vars[vars_len..].to_vec(), diverges)
+    }
+
+    pub(super) fn apply_var_delta(&mut self, base_len: usize, updates: &[(u32, Option<Ty>)], added: &[Option<Ty>], diverges: &[u32]) {
+        for &(index, value) in updates {
+            self.set_var(index as usize, value);
+        }
+        self.vars.truncate(base_len);
+        self.var_diverges.truncate(base_len);
+        self.vars.extend_from_slice(added);
+        self.var_diverges.resize(self.vars.len(), false);
+        for &index in diverges {
+            self.set_diverging(index as usize);
         }
     }
 
@@ -652,7 +642,7 @@ impl Infer<'_, '_> {
         match self.coercion(found, expected)? {
             Some(coercion) => {
                 self.out.coercions.insert(expr, coercion);
-                Ok(())
+                self.settle_pending()
             }
             None => self.coerce(found, expected),
         }
@@ -661,7 +651,7 @@ impl Infer<'_, '_> {
     fn branch_ends(&self, expr: ExprId) -> Option<Vec<ExprId>> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => Some(vec![inner]),
-            Expr::Block { tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe, .. } => Some(vec![tail]),
+            Expr::Block { tail: Some(tail), label: None, kind, .. } if kind.is_plain_scope() => Some(vec![tail]),
             Expr::If(_, then, Some(otherwise)) => Some(vec![then, otherwise]),
             Expr::Match(_, arms) => Some(self.body.list(arms).iter().map(|&at| self.body.arms[at as usize].body).collect()),
             _ => None,
@@ -769,15 +759,8 @@ pub(super) fn detached_summary<T>(cx: &mut Context<'_>, item: ItemRef, run: impl
     let body = EMPTY_BODY.get_or_init(Body::default);
     let sig = EMPTY_SIG.get_or_init(Signature::default);
     let src = EMPTY_SRC.get_or_init(|| crate::outline::source::Source {
-        path: std::path::PathBuf::new(),
-        text: String::new(),
-        tokens: Vec::new(),
-        marks: Vec::new(),
-        opaque: Vec::new(),
-        base: None,
-        offset: 0,
-        outputs: Default::default(),
-        origins: crate::outline::source::Origins::Read,
+        path: std::path::PathBuf::new(), text: String::new(), tokens: Vec::new(), marks: Vec::new(), opaque: Vec::new(),
+        base: None, offset: 0, outputs: Default::default(), origins: crate::outline::source::Origins::Read,
     });
     let home = cx.module_of(item).unwrap_or(ModRef { krate: item.krate, module: 0 });
     let mut infer = Infer::start(cx, (body, sig, src), home);

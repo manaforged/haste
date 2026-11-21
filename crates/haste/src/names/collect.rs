@@ -1,7 +1,8 @@
 use crate::outline::item::{Attr, Item, ItemKind, Leaf, PROC_MACROS, ProcKind, Vis};
 use crate::outline::tree::{Crate as Tree, Env};
 
-use super::{Binding, Def, ItemRef, ModRef, Ns, Origin, SELF, Scope, Sym, Symbols, UNDERSCORE, plain};
+use super::path::variant_names;
+use super::{Binding, Crate, Def, ItemRef, ModRef, Ns, Origin, SELF, Scope, Sym, Symbols, UNDERSCORE, plain};
 
 /// One `use` waiting to resolve: where it is, its interned path, the name it binds (none for a glob) and the source it last read.
 #[derive(Clone, Debug)]
@@ -69,13 +70,13 @@ pub struct Context<'a> {
 }
 
 /// Collects the items of module `index` from the files `files` (its own file and expansion parts), binds its child modules, and lists its imports.
-pub fn collect_module(tree: &Tree, index: usize, files: &[(u32, Option<u32>)], context: &Context<'_>, scopes: &mut [Scope]) -> Vec<Pending> {
+pub fn collect_module(tree: &Tree, index: usize, files: &[(u32, Option<u32>)], context: &Context<'_>, krate_out: &mut Crate) -> Vec<Pending> {
     let krate = context.krate;
     let mut pending = Vec::new();
     for &child in &context.children[index] {
         let module = &tree.modules[child];
         let binding = Binding { def: Def::Module(ModRef { krate, module: child as u32 }), vis: module.vis, origin: Origin::Item };
-        scopes[index].bind(context.symbols.intern(plain(&module.name)), Ns::Types, binding);
+        krate_out.scopes[index].bind(context.symbols.intern(plain(&module.name)), Ns::Types, binding);
     }
     for (file, at) in items_in(tree, files) {
         let source = &tree.files[file as usize];
@@ -88,9 +89,34 @@ pub fn collect_module(tree: &Tree, index: usize, files: &[(u32, Option<u32>)], c
             pending.extend(imports.map(|(import, _)| pending_import(source, (file, import as u32), index, context.symbols)));
             continue;
         }
-        bind_item(tree, (file, at), index, context, scopes);
+        if item.kind == ItemKind::Enum
+            && let Some(open) = item.body
+        {
+            let syms: Box<[Sym]> = variant_names(&source.source, open).into_iter().map(|v| context.symbols.intern(v)).collect();
+            krate_out.enums.insert((file, at), syms);
+        }
+        bind_item(tree, (file, at), index, context, &mut krate_out.scopes);
+    }
+    if index == 0 {
+        bind_injected_crate(tree, context, &mut krate_out.scopes[0]);
     }
     pending
+}
+
+/// Binds in the root scope the crate that rustc's prelude injection declares there, `extern crate std` or under `#![no_std]` `extern crate core`, unless the root binds that name itself.
+fn bind_injected_crate(tree: &Tree, context: &Context<'_>, root: &mut Scope) {
+    let Some(file) = tree.modules.first().and_then(|module| tree.files.get(module.file)) else { return };
+    let attrs = &file.items.inner;
+    if attrs.iter().any(|attr| matches!(attr, Attr::NoCore)) {
+        return;
+    }
+    let named = if attrs.iter().any(|attr| matches!(attr, Attr::NoStd)) { "core" } else { "std" };
+    let Some(found) = extern_crate_root(named, context.krate, context.deps) else { return };
+    let name = context.symbols.intern(named);
+    if root.names.get(&name).is_some_and(|entry| entry.types.is_some()) {
+        return;
+    }
+    root.bind(name, Ns::Types, Binding { def: Def::Module(found), vis: Vis::Private, origin: Origin::Item });
 }
 
 /// An import's path, whether it starts at the crate root, the `$crate` it starts from, and the name it binds, or none for a glob.

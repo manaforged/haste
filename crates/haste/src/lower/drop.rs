@@ -9,6 +9,11 @@ use super::moves::{BOX_STEP, MovePath, Root};
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
 
+fn skips_fields(cx: &crate::sema::Context<'_>, item: crate::names::ItemRef) -> bool {
+    cx.lang(item) == Some("manually_drop")
+        || cx.item(item).1.kind == crate::outline::item::ItemKind::Union
+}
+
 /// A value that the body owns and drops when its scope ends: where it lives, and the flags that say which of it is still there.
 #[derive(Clone, Debug)]
 pub struct Owned {
@@ -277,6 +282,7 @@ impl Lower<'_, '_> {
         let variants: Fields = match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
             Kind::Array(element, len) => vec![vec![element; self.len(len)? as usize]].into(),
+            Kind::Adt(item, _) if skips_fields(self.cx, item) => return Ok(()),
             Kind::Adt(item, args) => {
                 let slice = self.cx.types.substs(args).to_vec();
                 field_types(self.cx, item, &slice)?
@@ -414,7 +420,7 @@ impl Lower<'_, '_> {
     pub(super) fn drop_fields(&mut self, ty: Ty, place: Place, origin: super::reloc::TyOrigin) -> Result<()> {
         let variants: Fields = match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
-            Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == crate::outline::item::ItemKind::Union => return Ok(()),
+            Kind::Adt(item, _) if skips_fields(self.cx, item) => return Ok(()),
             Kind::Adt(item, args) => {
                 let slice = self.cx.types.substs(args).to_vec();
                 field_types(self.cx, item, &slice)?

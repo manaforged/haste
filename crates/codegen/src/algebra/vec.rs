@@ -1,19 +1,72 @@
 use super::RewriteCx;
-use crate::ir::{Binary, Convert, Lane, Op, ShuffleMask, Type, Unary, Value};
+use crate::ir::{Binary, Convert, IntCC, Lane, Op, ShuffleMask, TargetOpId, TinyArgs, Type, Unary, Value};
 
-fn is_zero_vec(cx: &RewriteCx, mut v: Value) -> bool {
-    for _ in 0..4 {
-        if cx.sconst(v) == Some(0) {
-            return true;
-        }
-        let Some(inst) = cx.def(v) else { return false };
-        match cx.func.insts[inst.index()].op {
-            Op::Const(0) => return true,
-            Op::Convert(Convert::Bitcast, inner) => v = inner,
-            _ => return false,
-        }
+fn is_zero_vec(cx: &RewriteCx, v: Value) -> bool {
+    cx.sconst(v) == Some(0) || cx.func.is_zero_vec(&|value| cx.def(value), v)
+}
+
+/// The vector whose lane sign bits equal those of `v`, when `v` only spreads each sign bit of it across its lane.
+fn sign_source(cx: &RewriteCx, v: Value) -> Option<Value> {
+    match *cx.op(v)? {
+        Op::Icmp(IntCC::SignedLessThan, x, zero) if cx.func.ty(x).lane().is_some_and(Lane::is_int) && is_zero_vec(cx, zero) => Some(x),
+        Op::TargetOp(TargetOpId::X64Pcmpgtb256, args) => match *args.as_slice() {
+            [zero, x] if is_zero_vec(cx, zero) => Some(x),
+            _ => None,
+        },
+        _ => None,
     }
-    false
+}
+
+/// `select(x < 0, -x, x)` on sixteen bytes as `umin(x, -x)`, the same unsigned magnitude in one byte minimum.
+pub(super) fn byte_abs(cx: &RewriteCx, cond: Value, t: Value, f: Value) -> Option<Op> {
+    let bytes = Type::Vec { lane: Lane::I8, count: 16 };
+    let negated = matches!(cx.op(t)?, &Op::Unary(Unary::Ineg, x) if x == f);
+    (cx.func.ty(f) == bytes && negated && sign_source(cx, cond) == Some(f)).then_some(Op::Binary(Binary::Umin, f, t))
+}
+
+/// Reads the lane sign bits of a compare against zero from the compared vector itself.
+pub(super) fn simplify_movemask(cx: &RewriteCx, op: &Op) -> Option<Op> {
+    match *op {
+        Op::Reduce(crate::ir::ReduceOp::Movemask, v) => sign_source(cx, v).map(|x| Op::Reduce(crate::ir::ReduceOp::Movemask, x)),
+        Op::TargetOp(TargetOpId::X64Pmovmskb256, args) => match *args.as_slice() {
+            [v] => sign_source(cx, v).map(|x| Op::TargetOp(TargetOpId::X64Pmovmskb256, TinyArgs::one(x))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn movemask_of(cx: &RewriteCx, v: Value) -> Option<(bool, Value)> {
+    match *cx.op(v)? {
+        Op::Reduce(crate::ir::ReduceOp::Movemask, x) => Some((false, x)),
+        Op::TargetOp(TargetOpId::X64Pmovmskb256, args) => match *args.as_slice() {
+            [x] => Some((true, x)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Or-s two masks of lane sign bits as one mask of the or of their vectors, which a mask of that or elsewhere then shares.
+pub(super) fn merge_movemasks(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
+    let ((wide, x), (other, y)) = (movemask_of(cx, a)?, movemask_of(cx, b)?);
+    let ty = cx.func.ty(x);
+    if wide != other || ty != cx.func.ty(y) || cx.func.ty(a) != cx.func.ty(b) {
+        return None;
+    }
+    let both = cx.emit(ty, Op::Binary(Binary::Bor, x, y));
+    Some(if wide { Op::TargetOp(TargetOpId::X64Pmovmskb256, TinyArgs::one(both)) } else { Op::Reduce(crate::ir::ReduceOp::Movemask, both) })
+}
+
+/// Moves a bitwise op of two vectors bitcast from one type into that type, so the bitcasts cancel with their neighbours.
+fn sink_bitcast(cx: &mut RewriteCx, res_v: Value, bin: Binary, (a, b): (Value, Value)) -> Option<Op> {
+    let (Some(&Op::Convert(Convert::Bitcast, x)), Some(&Op::Convert(Convert::Bitcast, y))) = (cx.op(a), cx.op(b)) else { return None };
+    let ty = cx.func.ty(x);
+    if ty != cx.func.ty(y) || !ty.lane().is_some_and(Lane::is_int) || ty.bytes() != cx.func.ty(res_v).bytes() {
+        return None;
+    }
+    let inner = cx.emit(ty, Op::Binary(bin, x, y));
+    Some(Op::Convert(Convert::Bitcast, inner))
 }
 
 fn splat_scalar(cx: &RewriteCx, v: Value, count: usize) -> Option<Value> {
@@ -555,6 +608,7 @@ pub(super) fn simplify_vec_binary(cx: &mut RewriteCx, res: Option<Value>, bin: B
         return None;
     }
     match bin {
+        Binary::Band | Binary::Bor | Binary::Bxor if a != b && let Some(op) = sink_bitcast(cx, res_v, bin, (a, b)) => Some(op),
         Binary::Band | Binary::Bor => simplify_vec_band_bor(cx, res, res_v, bin == Binary::Band, (a, b)),
         Binary::Bxor => simplify_vec_bxor(cx, res, res_v, a, b),
         Binary::Iadd | Binary::Isub => simplify_vec_add_sub(cx, res, res_v, bin, (a, b)),

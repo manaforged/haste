@@ -1,5 +1,15 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
+use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, TargetOpId, Value};
+
+/// Whether the instruction at `pos` of `insts` takes the carry out of the `adc` or `sbb` just before it on the same operands, so it reads only the flags.
+pub(crate) fn carry_out_of_pair(func: &Function, insts: &[Inst], pos: usize) -> bool {
+    let Some(prev) = pos.checked_sub(1) else { return false };
+    match (&func.insts[insts[prev].index()].op, &func.insts[insts[pos].index()].op) {
+        (Op::TargetOp(TargetOpId::X64AddCarry, sum), Op::TargetOp(TargetOpId::X64AddCarryOut, out))
+        | (Op::TargetOp(TargetOpId::X64SubBorrow, sum), Op::TargetOp(TargetOpId::X64SubBorrowOut, out)) => sum.as_slice() == out.as_slice(),
+        _ => false,
+    }
+}
 
 pub(crate) fn cold(func: &Function) -> Vec<bool> {
     let cfg = func.cfg();
@@ -31,6 +41,8 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
     let loops = cfg.loops();
     let cold = cold(func);
     let is_cold = |block: Block| cold[block.index()];
+    let mut is_latch = vec![false; func.blocks.len()];
+    loops.list.iter().flat_map(|each| &each.latches).for_each(|latch| is_latch[latch.index()] = true);
     let mut visited = vec![false; func.blocks.len()];
     let mut post = Vec::with_capacity(func.blocks.len());
     let mut stack = vec![(entry, false)];
@@ -44,7 +56,7 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
         }
         stack.push((block, true));
         let mut succs: Vec<Block> = func.successors(block).filter(|succ| !visited[succ.index()]).collect();
-        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), loops.depth_of(succ))));
+        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), is_latch[succ.index()], loops.depth_of(succ))));
         for succ in succs {
             stack.push((succ, false));
         }
@@ -138,6 +150,7 @@ pub(crate) struct Live {
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
     pub sites: Vec<(Inst, Block)>,
+    pub spans: Vec<(u32, u32)>,
 }
 
 impl Live {
@@ -178,32 +191,134 @@ pub(crate) fn overlaps(a: &[Range], b: &[Range]) -> bool {
     false
 }
 
-struct Sets {
+/// Whether each range of `inner` lies inside one range of `outer`.
+pub(crate) fn covers(outer: &[Range], inner: &[Range]) -> bool {
+    inner.iter().all(|r| {
+        let at = outer.partition_point(|o| o.end < r.start);
+        outer.get(at).is_some_and(|o| o.start <= r.start && r.end <= o.end)
+    })
+}
+
+/// A dense row-major boolean matrix packed into 64-bit words.
+pub(crate) struct BitMatrix {
     words: usize,
     bits: Vec<u64>,
 }
 
-impl Sets {
-    fn new(blocks: usize, values: usize) -> Sets {
-        let words = values.div_ceil(64);
-        Sets { words, bits: vec![0; blocks * words] }
+impl BitMatrix {
+    /// Allocates an all-zero matrix with `rows` rows and `cols` columns.
+    pub(crate) fn new(rows: usize, cols: usize) -> Self {
+        let words = cols.div_ceil(64);
+        Self { words, bits: vec![0; rows * words] }
     }
 
-    fn row(&self, block: usize) -> &[u64] {
-        &self.bits[block * self.words..(block + 1) * self.words]
+    /// Returns the number of 64-bit words per row.
+    pub(crate) const fn words(&self) -> usize {
+        self.words
     }
 
-    fn has(&self, block: usize, dense: usize) -> bool {
-        self.bits[block * self.words + dense / 64] >> (dense % 64) & 1 == 1
+    /// Returns whether bit `(row, col)` is set.
+    pub(crate) fn get(&self, row: usize, col: usize) -> bool {
+        (self.bits[row * self.words + (col >> 6)] >> (col & 63)) & 1 != 0
     }
 
-    fn insert(&mut self, block: usize, dense: usize) {
-        self.bits[block * self.words + dense / 64] |= 1 << (dense % 64);
+    /// Sets bit `(row, col)`.
+    pub(crate) fn set(&mut self, row: usize, col: usize) {
+        self.bits[row * self.words + (col >> 6)] |= 1_u64 << (col & 63);
     }
 
-    fn members(&self, block: usize) -> impl Iterator<Item = usize> + '_ {
-        self.row(block).iter().enumerate().flat_map(|(word, bits)| (0..64).filter(move |bit| bits >> bit & 1 == 1).map(move |bit| word * 64 + bit))
+    /// Returns the packed words of `row`.
+    pub(crate) fn row(&self, row: usize) -> &[u64] {
+        let start = row * self.words;
+        &self.bits[start..start + self.words]
     }
+
+    /// Returns a mutable slice of the packed words of `row`.
+    pub(crate) fn row_mut(&mut self, row: usize) -> &mut [u64] {
+        let start = row * self.words;
+        &mut self.bits[start..start + self.words]
+    }
+
+    /// Unions `mask` into `row`.
+    pub(crate) fn or_row(&mut self, row: usize, mask: &[u64]) {
+        for (dst, &src) in self.row_mut(row).iter_mut().zip(mask) {
+            *dst |= src;
+        }
+    }
+
+    /// Writes the union of `func`'s successors of `block` into `out`.
+    pub(crate) fn fill_succ_union(&self, func: &Function, block: Block, out: &mut [u64]) {
+        out.fill(0);
+        for succ in func.successors(block) {
+            for (dst, &src) in out.iter_mut().zip(self.row(succ.index())) {
+                *dst |= src;
+            }
+        }
+    }
+
+    /// Iterates over each set column index in `row`.
+    #[inline]
+    pub(crate) fn members(&self, row: usize) -> SetBits<'_> {
+        set_bits(self.row(row))
+    }
+}
+
+/// An iterator over the set bit indices of a `u64` word slice.
+pub(crate) struct SetBits<'a> {
+    rest: &'a [u64],
+    base: usize,
+    cur: u64,
+}
+
+impl Iterator for SetBits<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        while self.cur == 0 {
+            let (&word, tail) = self.rest.split_first()?;
+            self.rest = tail;
+            self.base += 64;
+            self.cur = word;
+        }
+        let bit = self.cur.trailing_zeros() as usize;
+        self.cur &= self.cur - 1;
+        Some(self.base + bit)
+    }
+}
+
+/// Returns an iterator over the set bit indices in `words`.
+#[inline]
+pub(crate) fn set_bits(words: &[u64]) -> SetBits<'_> {
+    match words.split_first() {
+        Some((&cur, rest)) => SetBits { rest, base: 0, cur },
+        None => SetBits { rest: &[], base: 0, cur: 0 },
+    }
+}
+
+/// Solves backward block liveness `in[b] = gen_sets[b] | (union_succ(in) & !kill_sets[b])` to a fixpoint.
+pub(crate) fn solve_backward_liveness<I>(func: &Function, blocks: I, gen_sets: &BitMatrix, kill_sets: &BitMatrix) -> BitMatrix
+where
+    I: Clone + DoubleEndedIterator<Item = Block>,
+{
+    let words = gen_sets.words();
+    let mut live = BitMatrix { words, bits: vec![0; func.blocks.len() * words] };
+    let mut out = vec![0_u64; words];
+    let mut changed = words > 0;
+    while changed {
+        changed = false;
+        for block in blocks.clone().rev() {
+            let idx = block.index();
+            live.fill_succ_union(func, block, &mut out);
+            let (gen_row, kill_row) = (gen_sets.row(idx), kill_sets.row(idx));
+            for ((dst, &g), (&o, &k)) in live.row_mut(idx).iter_mut().zip(gen_row).zip(out.iter().zip(kill_row)) {
+                let next = g | (o & !k);
+                changed |= *dst != next;
+                *dst = next;
+            }
+        }
+    }
+    live
 }
 
 fn crossing(func: &Function, wanted: &[bool], sib: &[Option<Sib>], elided: &[bool]) -> (Vec<Option<usize>>, Vec<Value>) {
@@ -232,12 +347,12 @@ fn crossing(func: &Function, wanted: &[bool], sib: &[Option<Sib>], elided: &[boo
     (dense, values)
 }
 
-fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> (Sets, Sets) {
+fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> (BitMatrix, BitMatrix) {
     let blocks = func.blocks.len();
-    let (mut uses, mut defs) = (Sets::new(blocks, count), Sets::new(blocks, count));
+    let (mut uses, mut defs) = (BitMatrix::new(blocks, count), BitMatrix::new(blocks, count));
     for (block, data) in func.blocks.iter().enumerate() {
         for param in data.params.iter().filter_map(|param| dense[param.index()]) {
-            defs.insert(block, param);
+            defs.set(block, param);
         }
         for inst in &data.insts {
             let inst = &func.insts[inst.index()];
@@ -246,43 +361,22 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Opt
             }
             for_effective_operands(inst, sib, elided, |value| {
                 if let Some(value) = dense[value.index()]
-                    && !defs.has(block, value)
+                    && !defs.get(block, value)
                 {
-                    uses.insert(block, value);
+                    uses.set(block, value);
                 }
             });
             for result in results(inst).filter_map(|result| dense[result.index()]) {
-                defs.insert(block, result);
+                defs.set(block, result);
             }
         }
     }
     (uses, defs)
 }
 
-fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> Sets {
+fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> BitMatrix {
     let (uses, defs) = local_sets(func, dense, count, sib, elided);
-    let mut live = Sets::new(func.blocks.len(), count);
-    let words = live.words;
-    let mut out = vec![0_u64; words];
-    let mut changed = words > 0;
-    while changed {
-        changed = false;
-        for block in order.iter().rev().map(|block| block.index()) {
-            out.iter_mut().for_each(|word| *word = 0);
-            for next in func.successors(Block(block as u32)) {
-                out.iter_mut().zip(live.row(next.index())).for_each(|(word, bits)| *word |= bits);
-            }
-            for word in 0..words {
-                let new = uses.row(block)[word] | (out[word] & !defs.row(block)[word]);
-                let at = block * words + word;
-                if live.bits[at] != new {
-                    live.bits[at] = new;
-                    changed = true;
-                }
-            }
-        }
-    }
-    live
+    solve_backward_liveness(func, order.iter().copied(), &uses, &defs)
 }
 
 fn push_range(out: &mut [Vec<Range>], value: usize, start: u32, end: u32) {
@@ -305,6 +399,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
     let mut defs = vec![0; count];
     let (mut unwinds, mut calls, mut sites) = (Vec::new(), Vec::new(), Vec::new());
     let mut at = 0_u32;
+    let mut spans = vec![(0, 0); func.blocks.len()];
     for &block in order {
         let index = block.index();
         let b_start = at;
@@ -401,12 +496,16 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                 continue;
             }
             at += 1;
-            for_effective_operands(data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+            let flags_only = carry_out_of_pair(func, insts, place) && func.insts[insts[place - 1].index()].result.is_some_and(|sum| elided.get(sum.index()) != Some(&true));
+            if !flags_only {
+                for_effective_operands(data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+            }
             at += 1;
             results(data).for_each(|r| def_val(r, at, true, &mut defs, &mut open, &mut touched, &mut per_val));
         }
         at += 1;
         let b_end = at;
+        spans[index] = (b_start, b_end);
         let exit_block = copied_head.unwrap_or(Block(index as u32));
         for next in func.successors(exit_block) {
             for member in live_in.members(next.index()) {
@@ -435,7 +534,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
         ranges.extend(list);
         slice.push((off, len));
     }
-    Live { ranges, slice, defs, unwinds, calls, sites }
+    Live { ranges, slice, defs, unwinds, calls, sites, spans }
 }
 
 pub(crate) fn results(data: &InstData) -> impl Iterator<Item = Value> + '_ {

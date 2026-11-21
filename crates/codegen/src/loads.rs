@@ -2,18 +2,23 @@
 
 mod coalesce;
 mod dom;
+mod elide;
 mod join;
 mod pack;
+mod regroup;
 mod remat;
+mod sink;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, invalidate_preserving, record_base, write_preserving};
-use join::{BlockClobber, JoinCtx, const_eq_for_ty, eligible_join_preds, for_edge_args, for_edge_args_mut, resolve_select_load, rodata_const, try_join_phi_forward};
+pub(crate) use join::for_edge_args_mut;
+use join::{BlockClobber, JoinCtx, const_eq_for_ty, eligible_join_preds, for_edge_args, resolve_select_load, rodata_const, try_join_phi_forward};
 use remat::{FarCseGuard, SubwordAction, SubwordSlices, drop_covered_stores, drop_stores_if, resolve_subword_plan, sink_terminator_defs};
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, TargetOpId, TinyArgs, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, compute_affine, may_alias};
 use crate::merge::{find, identity, rename};
+use crate::reloc::RuntimeSymbol;
 
 enum Assembled {
     Int(i64),
@@ -105,22 +110,9 @@ fn effect(func: &Function, state: &State<'_>, inst: Inst) -> Effect {
             let ty = func.ty(value);
             Effect::Write(MemLoc::slot(to, i64::from(offset), ty.bytes()), ty, find(state.subst, value))
         }
-        (op, _)
-            if matches!(
-                op,
-                Op::AtomicLoad(_)
-                    | Op::AtomicStore(..)
-                    | Op::AtomicRmw(..)
-                    | Op::AtomicCas(..)
-                    | Op::Fence
-                    | Op::Copy(..)
-                    | Op::Move(..)
-                    | Op::Call { .. }
-                    | Op::TryCall { .. }
-            ) =>
-        {
-            Effect::Unknown
-        }
+        (&Op::Call { callee, .. }, _) if state.prov.frame_runtime(callee) == Some(RuntimeSymbol::Malloc) => Effect::None,
+        (op, _) if matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence) => Effect::Unknown,
+        (op, _) if matches!(op, Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. }) => Effect::Unknown,
         _ => Effect::None,
     }
 }
@@ -309,6 +301,15 @@ fn is_silent_store(known: &KnownLoads, loc: MemLoc, ty: Type, value: Value, cons
     }
 }
 
+fn call_passes_noalias(op: &Op, prov: &Provenance, p: u16) -> bool {
+    match *op {
+        Op::Call { ref args, .. } | Op::TryCall { ref args, .. } => args
+            .iter()
+            .any(|arg| prov.param_roots.get(arg.index()).copied() == Some(MemRoot::NoAliasParam(p))),
+        _ => false,
+    }
+}
+
 /// Drops from `block` each load whose bytes `known` holds, recording its replacement in `subst`, eliminates dead overwritten stores, and leaves in `known` what memory holds at the block's end; returns `(changed, renamed)`.
 fn scan(
     func: &mut Function,
@@ -357,6 +358,7 @@ fn scan(
                 }
                 _ => {}
             }
+            changed |= remat::drop_freed_stores(func, state, (&mut bufs, &mut guard), inst);
         }
         match effect(func, state, inst) {
             Effect::Read(loc, ty, result) => {
@@ -526,7 +528,7 @@ fn scan(
                 if state.post_inline {
                     slices.on_unknown(func, clobber_op, state.prov);
                 }
-                invalidate_preserving(func, known, bases, clobber_op, state.prov);
+                invalidate_preserving(func, known, bases, (clobber_op, Some(inst)), state.prov);
                 if let Some((bytes, dst_loc, _)) = canon_move {
                     if state.post_inline && bytes > 0 {
                         changed |= drop_covered_stores(func, &mut bufs, &mut guard, (dst_loc, true));
@@ -547,7 +549,9 @@ fn scan(
                     MemRoot::Slot(s) => state.prov.slot_unescaped(s),
                     MemRoot::NoAliasParam(p) => {
                         let cop = canon_move.as_ref().map_or(&func.insts[inst.index()].op, |(_, _, m)| m);
-                        !dom::clobbers_loc(func, cop, ploc, state.prov) && state.prov.noalias_unescaped(p)
+                        !call_passes_noalias(cop, state.prov, p)
+                            && !dom::clobbers_loc(func, (cop, Some(inst)), ploc, state.prov)
+                            && state.prov.noalias_unescaped(p)
                     }
                     _ => false,
                 };
@@ -709,9 +713,10 @@ fn collect_scan_meta(
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];
     let mut accesses = false;
-    for (idx, data) in func.insts.iter().enumerate() {
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let data = &func.insts[inst.index()];
         if let Some(result) = data.result {
-            defs[result.index()] = Some(Inst(idx as u32));
+            defs[result.index()] = Some(inst);
         }
         match (&data.op, data.result) {
             (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
@@ -723,6 +728,15 @@ fn collect_scan_meta(
     accesses.then_some((defs, consts, selects))
 }
 
+/// Elides whole-slot moves once, before promotion splits the slots into values.
+pub(crate) fn elide_early(func: &mut Function) -> bool {
+    if func.entry.is_none() || func.coroutine.is_some() || !crate::schedule::has_live_op(func, |op| matches!(op, Op::Move(..))) {
+        return false;
+    }
+    let cfg = func.cfg();
+    elide::elide_moves(func, &Provenance::new(func, &cfg))
+}
+
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns the effect domains modified.
 pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
@@ -730,7 +744,7 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     }
     let domain = |changed: bool| if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE };
     let (mut changed, affine) = eliminate_affine_block_params(func);
-    if !func.insts.iter().any(|d| matches!(d.op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..))) {
+    if !crate::schedule::has_live_op(func, |op| matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..))) {
         changed |= sink_terminator_defs(func);
         return domain(changed);
     }
@@ -770,5 +784,16 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         changed |= pack::coalesce_vec_rescan(func, &cfg, target);
     }
     changed |= remat::split_long_loads(func, &prov);
+    changed |= sink::sink_loads(func, &prov);
+    if post_inline {
+        if elide::elide_moves(func, &prov) {
+            changed = true;
+            let cfg = func.cfg();
+            changed |= elide::forward_moves(func, &Provenance::new(func, &cfg));
+        } else {
+            changed |= elide::forward_moves(func, &prov);
+        }
+    }
+    changed |= regroup::run(func);
     domain(changed)
 }

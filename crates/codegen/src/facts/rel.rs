@@ -1,6 +1,7 @@
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Function, IntCC, Op, Type, Value};
 
+use super::backprop::Uppers;
 use super::{Fact, MAX_FACTS, MAX_RELS, Ranges, compared_range, decide, swapped, truth, unsigned_order};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,8 @@ pub(super) struct Rel {
 pub(super) const UNSIGNED: (RelKind, RelKind) = (RelKind::Ult, RelKind::Ule);
 const SIGNED: (RelKind, RelKind) = (RelKind::Slt, RelKind::Sle);
 const EQUAL: (RelKind, RelKind) = (RelKind::Eq, RelKind::Eq);
+const WALK_SEEN: usize = 16;
+const _: () = assert!(2 * MAX_RELS <= u128::BITS as usize);
 
 pub(super) fn rel_step(r: Rel, cur: Value, ty: Type, (strict_k, weak_k): (RelKind, RelKind)) -> Option<(Value, bool)> {
     if r.ty != ty {
@@ -60,12 +63,25 @@ pub(super) fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
 /// The conditions known to hold at one point of a function: facts on values that the branches taken to get there give.
 #[derive(Clone, Default)]
 pub(super) struct Path {
-    pub(super) facts: Vec<(Value, Fact)>,
-    pub(super) rels: Vec<Rel>,
-    pub(super) no_wrap_adds: Vec<(Value, Value)>,
+    facts: Vec<(Value, Fact)>,
+    rels: Vec<Rel>,
+    no_wrap_adds: Vec<(Value, Value)>,
+    pub(super) uppers: Uppers,
+}
+
+/// The values one walk over a path's relations steps to from `start`, as a mask over relation ends.
+#[derive(Clone, Copy)]
+pub(super) struct Reached {
+    start: Value,
+    ends: u128,
 }
 
 impl Path {
+    /// The symbolic relations known here, oldest first.
+    pub(super) fn rels(&self) -> &[Rel] {
+        &self.rels
+    }
+
     fn get(&self, value: Value) -> Option<&Fact> {
         self.facts.iter().rev().find(|(at, _)| *at == value).map(|(_, fact)| fact)
     }
@@ -88,6 +104,7 @@ impl Path {
             self.facts.remove(0);
         }
         self.facts.push((value, merged));
+        self.uppers.clear();
     }
 
     fn push_rel(&mut self, rel: Rel) {
@@ -96,6 +113,7 @@ impl Path {
                 self.rels.remove(0);
             }
             self.rels.push(rel);
+            self.uppers.clear();
         }
     }
 
@@ -153,6 +171,7 @@ impl Path {
                             self.no_wrap_adds.remove(0);
                         }
                         self.no_wrap_adds.push(pair);
+                        self.uppers.clear();
                     }
                     if let Some(k) = self.fact(ranges, y).exact() {
                         self.add_with_backprop(func, ranges, x, Fact::range(0, op_ty.unsigned_max() - k), 0);
@@ -231,32 +250,61 @@ impl Path {
         if found { Some(true) } else { hit }
     }
 
-    pub(super) fn linked_reach(&self, ty: Type, linked: bool, start: Value, target: Value, kinds: (RelKind, RelKind)) -> bool {
-        start == target || (linked && self.steps_into(ty, target, kinds) && self.walk(ty, start, kinds, |next, _| next == target))
+    /// Walks once from `start` and keeps every value it steps to.
+    pub(super) fn reached(&self, ty: Type, start: Value, kinds: (RelKind, RelKind)) -> Reached {
+        let mut ends = 0_u128;
+        self.walk_rels(ty, start, kinds, |idx, next, _| {
+            ends |= 1_u128 << (2 * idx + usize::from(next != self.rels[idx].rhs));
+            false
+        });
+        Reached { start, ends }
+    }
+
+    /// Whether `target` is the start of `from` or a value its walk stepped to.
+    pub(super) fn reaches_in(&self, from: Reached, target: Value) -> bool {
+        if from.start == target {
+            return true;
+        }
+        let mut ends = from.ends;
+        while ends != 0 {
+            let bit = ends.trailing_zeros() as usize;
+            let r = self.rels[bit / 2];
+            if (if bit % 2 == 0 { r.rhs } else { r.lhs }) == target {
+                return true;
+            }
+            ends &= ends - 1;
+        }
+        false
     }
 
     pub(super) fn walk(&self, ty: Type, start: Value, kinds: (RelKind, RelKind), mut visit: impl FnMut(Value, bool) -> bool) -> bool {
-        let mut seen: Vec<(Value, bool)> = vec![(start, false)];
+        self.walk_rels(ty, start, kinds, |_, next, next_strict| visit(next, next_strict))
+    }
+
+    fn walk_rels(&self, ty: Type, start: Value, kinds: (RelKind, RelKind), mut visit: impl FnMut(usize, Value, bool) -> bool) -> bool {
+        let (mut seen, mut len) = ([(start, false); WALK_SEEN], 1);
         let mut idx = 0;
-        while idx < seen.len() {
+        while idx < len {
             let (cur, cur_strict) = seen[idx];
             idx += 1;
-            for &r in &self.rels {
+            for (pos, &r) in self.rels.iter().enumerate() {
                 let Some((next, step_strict)) = rel_step(r, cur, ty, kinds) else {
                     continue;
                 };
                 let next_strict = cur_strict || step_strict;
-                if visit(next, next_strict) {
+                if visit(pos, next, next_strict) {
                     return true;
                 }
-                if seen.len() < 16 {
-                    if let Some(entry) = seen.iter_mut().find(|(v, _)| *v == next) {
+                if len < WALK_SEEN {
+                    if let Some(entry) = seen[..len].iter_mut().find(|(v, _)| *v == next) {
                         if next_strict && !entry.1 {
                             entry.1 = true;
-                            seen.push((next, true));
+                            seen[len] = (next, true);
+                            len += 1;
                         }
                     } else {
-                        seen.push((next, next_strict));
+                        seen[len] = (next, next_strict);
+                        len += 1;
                     }
                 }
             }
@@ -291,11 +339,11 @@ impl Path {
     }
 
     fn known_ne(&self, ty: Type, a: Value, b: Value) -> bool {
-        let mut linked = None;
+        let (mut from_a, mut from_b) = (None, None);
         self.rels.iter().filter(|r| r.kind == RelKind::Ne && r.ty == ty).any(|r| {
-            let (from_a, from_b) = *linked.get_or_insert_with(|| (self.steps_from(ty, a, EQUAL), self.steps_from(ty, b, EQUAL)));
-            (self.linked_reach(ty, from_a, a, r.lhs, EQUAL) && self.linked_reach(ty, from_b, b, r.rhs, EQUAL))
-                || (self.linked_reach(ty, from_a, a, r.rhs, EQUAL) && self.linked_reach(ty, from_b, b, r.lhs, EQUAL))
+            let at_a = *from_a.get_or_insert_with(|| self.reached(ty, a, EQUAL));
+            let mut at_b = |target| self.reaches_in(*from_b.get_or_insert_with(|| self.reached(ty, b, EQUAL)), target);
+            (self.reaches_in(at_a, r.lhs) && at_b(r.rhs)) || (self.reaches_in(at_a, r.rhs) && at_b(r.lhs))
         })
     }
 

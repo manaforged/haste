@@ -1,10 +1,14 @@
 //! Deterministic keys and cache paths for toolchain and dependency substrates.
 
 use std::hash::{Hash as _, Hasher as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use haste_codegen::Target;
 use rustc_hash::FxHasher;
+
+use crate::outline::tree::Profile;
 
 type Stamp = (u64, i128);
 
@@ -78,7 +82,7 @@ fn hash_crate_rec(
     let mut hasher = FxHasher::default();
     toolchain_hash.hash(&mut hasher);
     target_hash.hash(&mut hasher);
-    (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
+    (crate::profile() == Profile::Release).hash(&mut hasher);
     if let (Some(krate), Some(root)) = (outline.crates.get(idx), outline.roots.get(idx)) {
         krate.env.fixed.hash(&mut hasher);
         krate.env.release.hash(&mut hasher);
@@ -182,7 +186,7 @@ fn hash_file(outline: &crate::outline::Outline, idx: u32, file: &crate::outline:
     let mut hasher = FxHasher::default();
     krate.env.release.hash(&mut hasher);
     krate.env.overflow_checks().hash(&mut hasher);
-    (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
+    (crate::profile() == Profile::Release).hash(&mut hasher);
     if !krate.env.fixed {
         crate_hashes?.get(idx as usize)?.hash(&mut hasher);
     } else if !krate.env.release {
@@ -219,11 +223,57 @@ pub fn layer_item_key(outline: &crate::outline::Outline, item: crate::names::Ite
     Some((is_sysroot, key))
 }
 
-/// Hashes the running compiler binary's path and file stamp into `hasher`.
-fn hash_program(hasher: &mut FxHasher) {
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, hasher);
+fn compute_exe_content_hash(exe: &Path) -> Option<u64> {
+    let mut file = std::fs::File::open(exe).ok()?;
+    let mut hasher = FxHasher::default();
+    let mut buf = vec![0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.write(&buf[..read]);
+        total += read as u64;
     }
+    total.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn exe_meta_key(exe: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(exe).ok()?;
+    let mut hasher = FxHasher::default();
+    exe.hash(&mut hasher);
+    crate::graph::store::meta_stamp(&meta).hash(&mut hasher);
+    meta.ino().hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn exe_content_hash() -> Option<u64> {
+    static HASH: OnceLock<Option<u64>> = OnceLock::new();
+    *HASH.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let meta_key = exe_meta_key(&exe)?;
+        let cache_path = crate::graph::store::home().join("exe_hash.bin");
+        if let Ok(bytes) = std::fs::read(&cache_path)
+            && bytes.len() == 16
+            && super::read_u64(&bytes, 0) == meta_key
+        {
+            return Some(super::read_u64(&bytes, 8));
+        }
+        let digest = compute_exe_content_hash(&exe)?;
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&meta_key.to_le_bytes());
+        out.extend_from_slice(&digest.to_le_bytes());
+        drop(crate::graph::store::write_new_bytes(&cache_path, &out));
+        Some(digest)
+    })
+}
+
+/// Hashes the running compiler binary's contents into `hasher`.
+fn hash_program(hasher: &mut FxHasher) {
+    exe_content_hash().hash(hasher);
 }
 
 fn hash_file_meta(path: &Path, hasher: &mut FxHasher) {
@@ -295,24 +345,13 @@ fn hash_sysroot_roots(roots: Vec<PathBuf>, hasher: &mut FxHasher) {
             }
         }
     }
-    let dirs: Vec<_> = work.iter().enumerate().filter(|(_, (_, s))| s.is_none()).map(|(i, (p, _))| (i, p.as_path())).collect();
-    let (workers, next) = (crate::jobs().min(dirs.len()), std::sync::atomic::AtomicUsize::new(0));
+    let dirs: Vec<(usize, &Path)> = work.iter().enumerate().filter(|(_, (_, s))| s.is_none()).map(|(i, (p, _))| (i, p.as_path())).collect();
     let mut chunks = vec![Vec::new(); work.len()];
-    let drain = || {
-        let mut local = Vec::new();
-        while let Some(&(slot, dir)) = dirs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-            let mut items = Vec::new();
-            walk_sysroot_dir(dir, &mut items);
-            local.push((slot, items));
-        }
-        local
-    };
-    let done = if workers > 1 {
-        std::thread::scope(|s| (0..workers).map(|_| s.spawn(drain)).collect::<Vec<_>>().into_iter().flat_map(|h| h.join().unwrap_or_default()).collect())
-    } else {
-        drain()
-    };
-    for (slot, items) in done {
+    for (slot, items) in crate::sync::parallel_map(dirs, |(slot, dir)| {
+        let mut items = Vec::new();
+        walk_sysroot_dir(dir, &mut items);
+        (slot, items)
+    }) {
         chunks[slot] = items;
     }
     for (i, (path, stamp)) in work.into_iter().enumerate() {
@@ -362,8 +401,7 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
     hasher.finish()
 }
 
-/// Computes a workspace-scoped key for non-local, non-sysroot fixed units, or `None` when none exist.
-pub fn deps_key(workspace: &crate::graph::Workspace, target: &Target, toolchain_hash: u64) -> Option<u64> {
+fn hash_deps_units(workspace: &crate::graph::Workspace, hasher: &mut FxHasher) -> bool {
     let mut units: Vec<usize> = workspace
         .graph
         .units
@@ -376,42 +414,103 @@ pub fn deps_key(workspace: &crate::graph::Workspace, target: &Target, toolchain_
         .map(|(idx, _)| idx)
         .collect();
     if units.is_empty() {
-        return None;
+        return false;
     }
     units.sort_unstable_by(|&a, &b| {
-        let ua = &workspace.graph.units[a];
-        let ub = &workspace.graph.units[b];
-        let pa = &workspace.packages[ua.package];
-        let pb = &workspace.packages[ub.package];
+        let (ua, ub) = (&workspace.graph.units[a], &workspace.graph.units[b]);
+        let (pa, pb) = (&workspace.packages[ua.package], &workspace.packages[ub.package]);
         (&pa.locked.name, &pa.locked.version, &pa.locked.source, ua.side, &ua.features, &pa.manifest.dir)
             .cmp(&(&pb.locked.name, &pb.locked.version, &pb.locked.source, ub.side, &ub.features, &pb.manifest.dir))
     });
-    let mut hasher = FxHasher::default();
-    super::MAGIC.hash(&mut hasher);
-    super::VERSION.hash(&mut hasher);
-    toolchain_hash.hash(&mut hasher);
-    target_hash(target).hash(&mut hasher);
-    (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
     for idx in units {
         let unit = &workspace.graph.units[idx];
         let pkg = &workspace.packages[unit.package];
         let locked = &pkg.locked;
-        locked.name.hash(&mut hasher);
-        locked.version.to_string().hash(&mut hasher);
-        locked.source.hash(&mut hasher);
-        matches!(unit.side, crate::graph::Side::Host).hash(&mut hasher);
-        pkg.manifest.dir.hash(&mut hasher);
-        unit.features.hash(&mut hasher);
+        (&locked.name, locked.version.to_string(), &locked.source).hash(hasher);
+        (matches!(unit.side, crate::graph::Side::Host), &pkg.manifest.dir, &unit.features).hash(hasher);
         if let Some(script) = &unit.script {
-            (&script.names, &script.pairs, &script.vars).hash(&mut hasher);
+            (&script.names, &script.pairs, &script.vars).hash(hasher);
         }
     }
-    Some(hasher.finish())
+    true
+}
+
+/// Computes a workspace-scoped key for non-local, non-sysroot fixed units, or `None` when none exist.
+pub fn deps_key(workspace: &crate::graph::Workspace, target: &Target, toolchain_hash: u64) -> Option<u64> {
+    let mut hasher = FxHasher::default();
+    (super::MAGIC, super::VERSION, toolchain_hash, target_hash(target), crate::profile() == Profile::Release).hash(&mut hasher);
+    hash_deps_units(workspace, &mut hasher).then(|| hasher.finish())
+}
+
+fn fixed_files_paths(workspace: &crate::graph::Workspace, triple: &str) -> (PathBuf, Option<PathBuf>) {
+    let home = crate::graph::store::home();
+    let mut sys_hasher = FxHasher::default();
+    (super::MAGIC, super::VERSION, triple, crate::profile() == Profile::Release, crate::graph::store::program()).hash(&mut sys_hasher);
+    for unit in workspace.graph.units.iter().filter(|u| workspace.packages[u.package].sysroot) {
+        let pkg = &workspace.packages[unit.package];
+        (&pkg.locked.name, &pkg.manifest.dir, &unit.features).hash(&mut sys_hasher);
+    }
+    let sys_key = sys_hasher.finish();
+    let sys_path = home.join("toolchain").join(format!("{sys_key:016x}.files"));
+    let mut dep_hasher = FxHasher::default();
+    sys_key.hash(&mut dep_hasher);
+    let dep_path = hash_deps_units(workspace, &mut dep_hasher).then(|| home.join("deps").join(format!("{:016x}.files", dep_hasher.finish())));
+    (sys_path, dep_path)
+}
+
+/// Pre-reads and scans cached sysroot and fixed-dependency `.rs` files in parallel into `outline.cache`.
+pub fn preload_fixed_files(workspace: &crate::graph::Workspace, triple: &str, outline: &crate::outline::Outline) {
+    if !enabled() {
+        return;
+    }
+    let (sys_path, dep_path) = fixed_files_paths(workspace, triple);
+    let mut paths = Vec::new();
+    for path in std::iter::once(sys_path).chain(dep_path) {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            paths.extend(text.lines().filter(|l| !l.is_empty()).map(PathBuf::from));
+        }
+    }
+    if !paths.is_empty() {
+        outline.cache.read_all(&paths);
+    }
+}
+
+fn collect_fixed_file_list(outline: &crate::outline::Outline, want_sysroot: bool) -> String {
+    let mut list: Vec<&str> = outline
+        .crates
+        .iter()
+        .enumerate()
+        .filter(|&(k, _)| outline.is_fixed(k as u32) && (outline.is_sysroot(k as u32) == want_sysroot))
+        .flat_map(|(_, tree)| tree.files.iter().filter(|f| !f.expanded).filter_map(|f| f.source.path.to_str()))
+        .collect();
+    list.sort_unstable();
+    list.dedup();
+    list.join("\n")
+}
+
+/// Saves non-expanded sysroot and fixed-dependency `.rs` file lists so later runs scan them in one parallel batch.
+pub fn save_fixed_files(workspace: &crate::graph::Workspace, triple: &str, outline: &crate::outline::Outline) {
+    if !enabled() {
+        return;
+    }
+    let (sys_path, dep_path) = fixed_files_paths(workspace, triple);
+    if !sys_path.exists() {
+        let sys_list = collect_fixed_file_list(outline, true);
+        if !sys_list.is_empty() {
+            drop(crate::graph::store::write_new_bytes(&sys_path, sys_list.as_bytes()));
+        }
+    }
+    if let Some(dep_file) = dep_path {
+        let dep_list = collect_fixed_file_list(outline, false);
+        if !dep_list.is_empty() && std::fs::read(&dep_file).ok().as_deref() != Some(dep_list.as_bytes()) {
+            drop(crate::graph::store::write_new_bytes(&dep_file, dep_list.as_bytes()));
+        }
+    }
 }
 
 /// Computes a stable workspace-root key for local workspace member substrates, or `None` when no local units exist.
 pub fn workspace_key(workspace: &crate::graph::Workspace, target: &Target, toolchain_hash: u64) -> Option<u64> {
-    let mut dirs: Vec<&Path> = workspace
+    let dirs: Vec<&Path> = workspace
         .graph
         .units
         .iter()
@@ -421,6 +520,14 @@ pub fn workspace_key(workspace: &crate::graph::Workspace, target: &Target, toolc
     if dirs.is_empty() {
         return None;
     }
+    let root = dirs
+        .iter()
+        .find_map(|dir| crate::graph::workspace_root(dir).ok())
+        .filter(|root| dirs.iter().all(|dir| dir.starts_with(root)));
+    let mut dirs: Vec<&Path> = dirs
+        .into_iter()
+        .map(|dir| root.as_deref().and_then(|r| dir.strip_prefix(r).ok()).unwrap_or(dir))
+        .collect();
     dirs.sort_unstable();
     dirs.dedup();
     let mut hasher = FxHasher::default();
@@ -428,7 +535,7 @@ pub fn workspace_key(workspace: &crate::graph::Workspace, target: &Target, toolc
     super::VERSION.hash(&mut hasher);
     toolchain_hash.hash(&mut hasher);
     target_hash(target).hash(&mut hasher);
-    (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
+    (crate::profile() == Profile::Release).hash(&mut hasher);
     dirs.hash(&mut hasher);
     Some(hasher.finish())
 }

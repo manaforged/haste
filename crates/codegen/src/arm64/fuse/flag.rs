@@ -1,12 +1,13 @@
 use super::super::asm::Reg;
+use super::super::int::add_imm_parts;
 use super::super::Location;
 use super::bits::can_elide_tst_band;
 use super::{
-    alu_shift, cmn_parts, cmn_sum_parts, const_of, consumes_flag_only, def_entry, def_inst, ext_parts, local_single, preserves_flags, preserved, shift_parts,
-    unwrap_elided_tst, zero_cmp_band,
+    alu_shift, cmn_parts, cmn_sum_parts, const_of, def_entry, def_inst, ext_band_of, ext_parts, local_single, preserved,
+    shift_parts, unwrap_elided_tst, zero_cmp_band,
 };
 use crate::alloc::Plan;
-use crate::ir::{Convert, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 fn peel_uext(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], val: Value) -> Value {
     if plan.elided[val.index()]
@@ -95,7 +96,7 @@ fn cmp_band_tst(
     ok.then_some(m)
 }
 
-fn try_cmp_preserved(
+pub(super) fn try_cmp_preserved(
     func: &Function,
     plan: &Plan<Reg>,
     info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
@@ -163,38 +164,221 @@ pub(super) fn try_fuse_flag_operand(
     }
 }
 
-pub(super) fn try_fuse_icmp_select(
+fn flag_ok(plan: &Plan<Reg>, val: Value) -> bool {
+    !plan.elided[val.index()] && !plan.fused[val.index()] && !plan.is_static(val)
+}
+
+fn icmp_select_root(
+    func: &Function,
+    plan: &Plan<Reg>,
+    uses: &[u32],
+    (b_idx, ipos, icmp_res): (usize, usize, Value),
+) -> Option<(Value, usize, Option<usize>)> {
+    if !flag_ok(plan, icmp_res) {
+        return None;
+    }
+    if uses[icmp_res.index()] != 1 {
+        return Some((icmp_res, ipos, None));
+    }
+    for (u_pos, &ni) in func.blocks[b_idx].insts.iter().enumerate().skip(ipos + 1) {
+        let ud = &func.insts[ni.index()];
+        if let Op::Convert(Convert::Uextend, inner) = ud.op
+            && inner == icmp_res
+            && let Some(uext) = ud.result
+            && flag_ok(plan, uext)
+            && func.ty(uext).is_small_int()
+        {
+            return Some((uext, u_pos, Some(u_pos)));
+        }
+        if matches!(ud.op, Op::Select(c, ..) if c == icmp_res) {
+            return Some((icmp_res, ipos, None));
+        }
+    }
+    None
+}
+
+fn find_select_consumers(
+    func: &Function,
+    (b_idx, start_pos): (usize, usize),
+    flag_val: Value,
+    total_uses: u32,
+) -> Option<(u32, usize, bool)> {
+    let insts = &func.blocks[b_idx].insts;
+    let (mut sels, mut brif, mut last_sel) = (0_u32, None, start_pos);
+    for (s_pos, &ni) in insts.iter().enumerate().skip(start_pos + 1) {
+        match &func.insts[ni.index()].op {
+            Op::Select(c, x, y) if *c == flag_val && *x != flag_val && *y != flag_val => {
+                sels += 1;
+                last_sel = s_pos;
+                if sels == total_uses {
+                    return Some((sels, last_sel, false));
+                }
+            }
+            Op::Brif(c, _, ta, _, ea)
+                if sels == 1 && total_uses == 2 && *c == flag_val && !ta.contains(&flag_val) && !ea.contains(&flag_val) =>
+            {
+                brif = Some(s_pos);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let b_pos = brif?;
+    insts[last_sel + 1..b_pos]
+        .iter()
+        .all(|&ni| preserves_flags(&func.insts[ni.index()].op))
+        .then_some((1, last_sel, true))
+}
+
+fn brif_band_conflict(plan: &Plan<Reg>, cc: IntCC, (a, b): (Value, Value)) -> bool {
+    matches!(cc, IntCC::Equal | IntCC::NotEqual)
+        && ((plan.const_of(b) == Some(0) && plan.elided[a.index()]) || (plan.const_of(a) == Some(0) && plan.elided[b.index()]))
+}
+
+fn root_preserved_around(
+    func: &Function,
+    plan: &Plan<Reg>,
+    (b_idx, upos, pos, last_sel, skip_pos): (usize, usize, usize, usize, Option<usize>),
+    val: Value,
+) -> bool {
+    preserved(func, plan, b_idx, upos, pos, None, val) && preserved(func, plan, b_idx, pos, last_sel, skip_pos, val)
+}
+
+fn shift_root_preserved(
+    func: &Function,
+    plan: &Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    span @ (b_idx, upos, pos, last_sel, skip_pos): (usize, usize, usize, usize, Option<usize>),
+    (ty, op): (Type, &Op),
+) -> bool {
+    let Some((sop, mid, imm)) = shift_parts(op, plan) else { return false };
+    if alu_shift(false, ty, sop, imm).is_none() {
+        return false;
+    }
+    if root_preserved_around(func, plan, span, mid) {
+        return true;
+    }
+    let Some((mpos, minst)) = local_single(plan, info, b_idx, upos, mid) else { return false };
+    let Op::Convert(Convert::Uextend, inner) = func.insts[minst.index()].op else { return false };
+    let ty_bits = ty.bits();
+    let amt = (imm as u32) & (ty_bits - 1);
+    let uext_ok = func.ty(inner).is_small_int()
+        && (super::zero_ext_loc(plan, inner)
+            || (sop == Binary::Ishl && (amt >= ty_bits - func.ty(inner).bits() || amt <= 4)));
+    uext_ok
+        && preserved(func, plan, b_idx, mpos, pos, Some(upos), inner)
+        && preserved(func, plan, b_idx, pos, last_sel, skip_pos, inner)
+}
+
+fn sum_fusible_to_select(
+    func: &Function,
+    plan: &Plan<Reg>,
+    info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, last_sel, skip_pos): (usize, usize, usize, Option<usize>),
+    (a, b): (Value, Value),
+) -> bool {
+    let def = |v| def_inst(pos_of, v);
+    let Some(sum) = (const_of(func, plan, b, &def) == Some(0))
+        .then_some(a)
+        .or_else(|| (const_of(func, plan, a, &def) == Some(0)).then_some(b))
+    else {
+        return false;
+    };
+    let Some((spos, sinst)) = local_single(plan, info, b_idx, pos, sum) else { return false };
+    let Op::Binary(Binary::Iadd, sa, sb) = func.insts[sinst.index()].op else { return false };
+    let span = (b_idx, spos, pos, last_sel, skip_pos);
+    root_preserved_around(func, plan, span, sa) && root_preserved_around(func, plan, span, sb)
+}
+
+fn cand_fusible_to_select(
+    func: &Function,
+    plan: &Plan<Reg>,
+    info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, last_sel, skip_pos): (usize, usize, usize, Option<usize>),
+    (ty, cc, cand): (Type, IntCC, Value),
+) -> bool {
+    let Some((cpos, cinst)) = local_single(plan, info, b_idx, pos, cand) else { return false };
+    let op = &func.insts[cinst.index()].op;
+    let span = (b_idx, cpos, pos, last_sel, skip_pos);
+    if shift_root_preserved(func, plan, info, span, (ty, op)) {
+        return true;
+    }
+    let def = |v| def_inst(pos_of, v);
+    let ext_root = match *op {
+        Op::Convert(Convert::Uextend | Convert::Sextend, inner) if func.ty(inner).bits() < ty.bits() => Some(inner),
+        Op::Binary(Binary::Band, a, b) => ext_band_of(func, plan, ty, (a, b), &def).map(|(_, inner)| inner),
+        Op::Unary(Unary::Ineg, inner) if matches!(cc, IntCC::Equal | IntCC::NotEqual) => Some(inner),
+        _ => None,
+    };
+    ext_root.is_some_and(|root| !plan.elided[root.index()] && root_preserved_around(func, plan, span, root))
+}
+
+fn should_defer_icmp_select(
+    func: &Function,
+    plan: &Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    span @ (b_idx, pos, last_sel, skip_pos): (usize, usize, usize, Option<usize>),
+    (cc, a, b): (IntCC, Value, Value),
+) -> bool {
+    let ty = func.ty(a);
+    if !matches!(ty, Type::I32 | Type::I64) || plan.elided[a.index()] || plan.elided[b.index()] {
+        return false;
+    }
+    if matches!(cc, IntCC::Equal | IntCC::NotEqual) && sum_fusible_to_select(func, plan, info, span, (a, b)) {
+        return true;
+    }
+    let has_imm = |v: Value| plan.const_of(v).and_then(|imm| add_imm_parts(true, crate::fold::extend(imm, ty, cc.is_signed()))).is_some();
+    !has_imm(a)
+        && !has_imm(b)
+        && (cand_fusible_to_select(func, plan, info, (b_idx, pos, last_sel, skip_pos), (ty, cc, b))
+            || cand_fusible_to_select(func, plan, info, (b_idx, pos, last_sel, skip_pos), (ty, cc, a)))
+}
+
+fn try_fuse_icmp_select_with(
     func: &Function,
     plan: &mut Plan<Reg>,
     info @ (uses, _): (&[u32], &[Option<(usize, usize, Inst)>]),
     (b_idx, pos, res): (usize, usize, Value),
-    (a, b): (Value, Value),
+    (a, b, allow_defer): (Value, Value, bool),
 ) {
-    let cmp_uses = uses[res.index()];
-    if !(1..=2).contains(&cmp_uses) {
+    let Some((flag_val, search_pos, skip_pos)) = icmp_select_root(func, plan, uses, (b_idx, pos, res)) else {
+        return;
+    };
+    let flag_uses = uses[flag_val.index()];
+    if !(1..=2).contains(&flag_uses) {
         return;
     }
     let Op::Icmp(cc, _, _) = func.insts[func.blocks[b_idx].insts[pos].index()].op else {
         return;
     };
-    let (mut found, mut last_sel) = (0_u32, pos);
-    for (s_pos, &ni) in func.blocks[b_idx].insts.iter().enumerate().skip(pos + 1) {
-        if matches!(func.insts[ni.index()].op, Op::Select(c, x, y) if c == res && x != res && y != res) {
-            found += 1;
-            last_sel = s_pos;
-            if found == cmp_uses {
-                break;
-            }
-        }
+    let Some((cmp_count, last_sel, has_brif)) = find_select_consumers(func, (b_idx, search_pos), flag_val, flag_uses) else {
+        return;
+    };
+    if allow_defer && should_defer_icmp_select(func, plan, info, (b_idx, pos, last_sel, skip_pos), (cc, a, b)) {
+        return;
     }
-    if found == cmp_uses
-        && let Some(band) = try_cmp_preserved(func, plan, info, (b_idx, pos, last_sel, None), (cc, a, b, cmp_uses))
+    if has_brif && skip_pos.is_none() && brif_band_conflict(plan, cc, (a, b)) {
+        return;
+    }
+    if let Some(band) = try_cmp_preserved(func, plan, info, (b_idx, pos, last_sel, skip_pos), (cc, a, b, cmp_count))
+        && (!has_brif || skip_pos.is_some() || band.is_none())
     {
         plan.elided[res.index()] = true;
+        plan.elided[flag_val.index()] = true;
         if let Some(m) = band {
             plan.elided[m.index()] = true;
         }
     }
+}
+
+pub(super) fn try_fuse_icmp_select(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, res): (usize, usize, Value),
+    (a, b): (Value, Value),
+) {
+    try_fuse_icmp_select_with(func, plan, info, (b_idx, pos, res), (a, b, true));
 }
 
 pub(super) fn fuse_icmp_selects(func: &Function, plan: &mut Plan<Reg>, info: (&[u32], &[Option<(usize, usize, Inst)>])) {
@@ -206,7 +390,7 @@ pub(super) fn fuse_icmp_selects(func: &Function, plan: &mut Plan<Reg>, info: (&[
                 && let Op::Icmp(_, a, b) = data.op
                 && func.ty(a).is_small_int()
             {
-                try_fuse_icmp_select(func, plan, info, (b_idx, pos, res), (a, b));
+                try_fuse_icmp_select_with(func, plan, info, (b_idx, pos, res), (a, b, false));
             }
         }
     }
@@ -240,6 +424,51 @@ pub(super) fn fuse_fits(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
                 && matches!(plan.location(res), Location::Reg(_) | Location::Slot)
                 && func.ty(a).is_small_int()
                 && fits_consumer(func, plan, &block.insts[pos + 1..], res)
+            {
+                plan.fused[res.index()] = true;
+            }
+        }
+    }
+}
+
+pub(super) fn consumes_flag_only(op: &Op, res: Value) -> bool {
+    match op {
+        Op::Select(c, x, y) => *c == res && *x != res && *y != res,
+        Op::Brif(c, _, ta, _, ea) => *c == res && !ta.contains(&res) && !ea.contains(&res),
+        Op::Trapz(c) => *c == res,
+        _ => false,
+    }
+}
+
+pub(super) fn preserves_flags(op: &Op) -> bool {
+    matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..))
+}
+
+pub(super) fn icmp_consumer(func: &Function, tail: &[Inst], res: Value) -> bool {
+    for &ni in tail {
+        let nd = &func.insts[ni.index()];
+        if consumes_flag_only(&nd.op, res) {
+            return true;
+        }
+        if !preserves_flags(&nd.op) {
+            return false;
+        }
+    }
+    false
+}
+
+pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
+    for block in &func.blocks {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            let Op::Icmp(_, a, _) = data.op else { continue };
+            if uses[res.index()] == 1
+                && !plan.elided[res.index()]
+                && !plan.fused[res.index()]
+                && !plan.is_static(res)
+                && !func.ty(a).is_vector()
+                && icmp_consumer(func, &block.insts[pos + 1..], res)
             {
                 plan.fused[res.index()] = true;
             }

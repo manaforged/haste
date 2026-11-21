@@ -1,4 +1,5 @@
-use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
+use super::symbolic::{evaluate, tagged};
+use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, MAX_FP_FULL_INSTS, MAX_FP_FULL_TRIPS, MAX_VEC_FULL_TRIPS, block_has_float, block_has_libcall_mem, block_has_vec, collect_global_consts, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
 use crate::cfg::{Cfg, Loop};
 use crate::ir::{Block, BlockData, Function, Op, Value};
 
@@ -110,7 +111,7 @@ fn record_block_consts(func: &Function, block: Block, step: &mut Step, at: usize
     let mut row = Vec::with_capacity(body.len());
     for &inst in body {
         let data = &func.insts[inst.index()];
-        let imm = data.result.and_then(|res| env[res.index()]);
+        let imm = data.result.and_then(|res| env[res.index()]).filter(|&imm| !tagged(imm));
         if imm.is_none() && !matches!(data.op, Op::Const(_)) {
             step.residual += 1;
         }
@@ -165,7 +166,7 @@ fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Opt
         let Some(given) = incoming[at].take() else { continue };
         let given = if region.open[at] { vec![None; func.blocks[block.index()].params.len()] } else { given };
         out.reached[at] = true;
-        eval_block(func, block.index(), &given, env);
+        eval_block(func, block.index(), &given, env, evaluate);
         record_block_consts(func, block, &mut out, at, env);
         let (decided, next) = step_edges(func, region, at, env, &mut incoming);
         out.decided[at] = decided;
@@ -177,15 +178,20 @@ fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Opt
 }
 
 fn prove(func: &Function, region: &Region, init: Vec<Option<i64>>, global_consts: &[Option<i64>]) -> Option<Proof> {
+    let has_mem = region.blocks.iter().any(|&b| block_has_libcall_mem(func, b.index()));
+    let has_fp = region.blocks.iter().any(|&b| block_has_float(func, b.index()));
+    let has_vec = region.blocks.iter().any(|&b| block_has_vec(func, b.index()));
+    let max_trips = if has_mem { 4 } else if has_fp { MAX_FP_FULL_TRIPS } else if has_vec { MAX_VEC_FULL_TRIPS } else { MAX_CHAIN_TRIPS };
+    let max_insts = if has_fp { MAX_FP_FULL_INSTS } else { MAX_CHAIN_UNROLLED_INSTS };
     let mut heads = vec![init];
     let mut steps = Vec::new();
     let mut total_residual = 0_usize;
-    while heads.len() <= MAX_CHAIN_TRIPS {
+    while heads.len() <= max_trips {
         let mut env = global_consts.to_vec();
         let params = heads.last()?;
         let cur = step(func, region, params, &mut env);
         total_residual += cur.residual;
-        if total_residual > MAX_CHAIN_UNROLLED_INSTS {
+        if total_residual > max_insts {
             return None;
         }
         let next = cur.next.clone();
@@ -332,7 +338,7 @@ fn repairable(func: &Function, cfg: &Cfg, each: &Loop, out: &LiveOut) -> bool {
 
 fn pin(func: &mut Function, head: Block, params: &[Value], known: &[Option<i64>], map: &mut Vec<(Value, Value)>) {
     for (&param, known) in params.iter().zip(known) {
-        let Some(imm) = *known else { continue };
+        let Some(imm) = known.filter(|&imm| !tagged(imm)) else { continue };
         let value = func.value(func.ty(param));
         let inst = func.add(Op::Const(imm), Some(value));
         func.blocks[head.index()].insts.push(inst);
@@ -356,7 +362,7 @@ fn clone_body_consts(
         };
         op.map_operands(|value| remap_val(map, value));
         let new_res = func.insts[orig.index()].result.map(|res| {
-            let fresh = func.value(func.ty(res));
+            let fresh = func.value_like(res);
             map.push((res, fresh));
             fresh
         });
@@ -558,9 +564,10 @@ fn rebind(func: &mut Function, after: &Cfg, rounds: &Rounds<'_>, live: &[LiveOut
     }
 }
 
-pub(super) fn unroll(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Option<i64>]) -> bool {
+pub(super) fn unroll(func: &mut Function, cfg: &Cfg, each: &Loop) -> bool {
     let Some(entry) = func.entry else { return false };
     let Some(region) = shape(func, cfg, each) else { return false };
+    let global_consts = &collect_global_consts(func, cfg, evaluate);
     let Some(init) = outside_const_params(func, cfg, each.head, &each.latches, global_consts) else { return false };
     let Some(proof) = prove(func, &region, init, global_consts) else { return false };
     let backs = proof.heads.len() - 1;

@@ -1,10 +1,13 @@
+mod demote;
 mod hints;
+pub(crate) mod hoist;
+pub(crate) mod walk;
 
 use crate::cfg::{Cfg, Loops};
-use crate::fold::{constant, holds};
+use crate::fold::{constant, fits_imm32, holds};
 use crate::frame::{Abi, Loc};
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, Op, Signature, StackSlot, Type, Value};
-use crate::live::{Live, Sib, SibBase, for_effective_operands, live, results};
+use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, InstData, Op, Signature, StackSlot, Type, Value};
+use crate::live::{Live, Sib, SibBase, live, results};
 use crate::park::{Class, Hints, ParkReg, allocate};
 
 pub(crate) struct Regs<R: 'static> {
@@ -19,12 +22,35 @@ pub(crate) struct Regs<R: 'static> {
     pub float_branches: &'static [FloatCC],
     pub vectors: bool,
     pub absolute_calls: bool,
+    /// The backend calls a runtime helper or a symbol in place instead of loading its address first.
+    pub constant_calls: bool,
     pub two_address: bool,
     pub park: bool,
     pub fold_sib: bool,
+    /// The backend zero-extends 8- and 16-bit call results at the call, and 8- and 16-bit narrowing copies between two registers.
+    pub call_zext: bool,
+    /// The instructions that store a constant into a frame home.
+    pub imm_store: fn(i64) -> u64,
+    /// The register a 64-bit high product lands in, which the product keeps as its home when nothing else needs it.
+    pub high_product: Option<R>,
 }
 
-const FOLD_LIMIT: i64 = 1 << 24;
+pub(crate) const FOLD_LIMIT: i64 = 1 << 24;
+
+/// Reports whether `data` reads or makes a 128-bit integer.
+pub(crate) fn touches_i128(func: &Function, data: &InstData) -> bool {
+    let mut wide = data.result.is_some_and(|r| func.ty(r) == Type::I128);
+    data.op.for_operands(|v| wide |= func.ty(v) == Type::I128);
+    wide
+}
+
+impl<R: PartialEq + 'static> Regs<R> {
+    /// Reports whether emitting `data` may overwrite `reg` as a wide or op scratch register.
+    pub(crate) fn scratches(&self, func: &Function, data: &InstData, reg: R) -> bool {
+        let wide = touches_i128(func, data);
+        (wide && self.wide_scratch.contains(&reg)) || ((wide || (self.uses_scratch)(func, &data.op)) && self.op_scratch.contains(&reg))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Location<R> {
@@ -47,6 +73,8 @@ impl<R> Location<R> {
 pub(crate) enum CallTarget {
     Abs(i32),
     Slot(u32),
+    Runtime(crate::reloc::RuntimeSymbol),
+    Symbol(u32),
 }
 
 pub(crate) struct Plan<R> {
@@ -63,6 +91,10 @@ pub(crate) struct Plan<R> {
     pub sib: Vec<Option<Sib>>,
     pub elided: Vec<bool>,
     pub zero_ext: Vec<bool>,
+    pub density: Vec<u64>,
+    /// The summed block-weighted accesses of the register candidates left in stack slots.
+    pub spill_cost: u64,
+    pub hoist: hoist::Hoist<R>,
 }
 
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
@@ -289,69 +321,71 @@ fn pairs<R>(func: &Function, locations: &[Location<R>], elided: &[bool]) -> (Vec
     (pairs, deferred)
 }
 
-fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided: &mut [bool]) -> Vec<Option<CallTarget>> {
+fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided: &mut [bool], runtime: bool) -> Vec<Option<CallTarget>> {
     let mut through = vec![None; func.types.len()];
     let mut loads = vec![None; func.types.len()];
     for data in &func.insts {
-        if let (Op::Load(addr, 0), Some(result)) = (&data.op, data.result) {
-            loads[result.index()] = match locations[addr.index()] {
+        let Some(result) = data.result else { continue };
+        loads[result.index()] = match data.op {
+            Op::Load(addr, 0) => match locations[addr.index()] {
                 Location::Imm(at) => i32::try_from(at).ok().filter(|at| *at > 0).map(CallTarget::Abs),
                 Location::SlotAddr(sym) => Some(CallTarget::Slot(sym)),
                 _ => None,
-            };
+            }
+            .map(|target| (target, Some(addr))),
+            Op::Runtime(rt) if runtime => Some((CallTarget::Runtime(rt), None)),
+            Op::Symbol(sym) if runtime && matches!(locations[result.index()], Location::Symbol(_)) => Some((CallTarget::Symbol(sym), None)),
+            _ => None,
+        };
+    }
+    let mut called = vec![0u32; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if let Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } = &func.insts[inst.index()].op && !args.contains(callee) {
+            called[callee.index()] += 1;
         }
     }
+    let mut left = census.uses.clone();
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } = &func.insts[inst.index()].op
-            && census.uses[callee.index()] == 1
             && !args.contains(callee)
-            && let Some(target) = loads[callee.index()]
+            && let Some((target, addr)) = loads[callee.index()]
+            && (census.uses[callee.index()] == 1 || (addr.is_none() && census.uses[callee.index()] == called[callee.index()]))
         {
             through[callee.index()] = Some(target);
             elided[callee.index()] = true;
+            if let Some(addr) = addr {
+                left[addr.index()] = left[addr.index()].saturating_sub(1);
+                elided[addr.index()] |= left[addr.index()] == 0;
+            }
         }
     }
     through
 }
 
-fn eligible(live: &Live, wanted: &[bool], value: usize) -> bool {
-    wanted[value] && !live.ranges_of(value).is_empty() && !crate::park::crosses_ranges(&live.unwinds, live.ranges_of(value))
-}
-
-fn passed<R: Copy>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> (Vec<Option<(R, bool)>>, Vec<Option<(u8, bool)>>) {
-    let (mut ints, mut floats) = (vec![None; func.types.len()], vec![None; func.types.len()]);
-    let mark = |vals: &[Value], locs: &[Loc<R>], arg: bool, ints: &mut [Option<(R, bool)>], floats: &mut [Option<(u8, bool)>]| {
-        for (val, loc) in vals.iter().zip(locs) {
-            match *loc {
-                Loc::Int(reg) if arg || ints[val.index()].is_none() => ints[val.index()] = Some((reg, arg)),
-                Loc::Float(reg) if arg || floats[val.index()].is_none() => floats[val.index()] = Some((reg, arg)),
-                _ => {}
-            }
-        }
-    };
-    let ret_abi = classify(&func.signature).ok();
+/// Elides each `Iconcat` of two constants whose every use reads its halves as immediates.
+fn const_pairs(func: &Function, census: &Uses, elided: &mut [bool]) {
+    let mut kept = vec![false; func.types.len()];
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        match &func.insts[inst.index()].op {
-            Op::Call { sig, args, results, .. } => {
-                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
-                    mark(args, &abi.params, true, &mut ints, &mut floats);
-                    mark(results, &abi.returns, false, &mut ints, &mut floats);
-                }
-            }
-            Op::TryCall { sig, args, .. } => {
-                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
-                    mark(args, &abi.params, true, &mut ints, &mut floats);
-                }
-            }
-            Op::Return(vals) => {
-                if let Some(abi) = &ret_abi {
-                    mark(vals, &abi.returns, false, &mut ints, &mut floats);
-                }
-            }
-            _ => {}
+        let op = &func.insts[inst.index()].op;
+        if !crate::wide::reads_halves(func, op) {
+            op.for_operands(|value| kept[value.index()] = true);
         }
     }
-    (ints, floats)
+    let constant = |value: Value| census.def_inst[value.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Const(_)));
+    for (value, def) in census.def_inst.iter().enumerate() {
+        if let Some(inst) = def
+            && let Op::Binary(Binary::Iconcat, lo, hi) = func.insts[inst.index()].op
+            && !kept[value]
+            && constant(lo)
+            && constant(hi)
+        {
+            elided[value] = true;
+        }
+    }
+}
+
+fn eligible(live: &Live, wanted: &[bool], value: usize) -> bool {
+    wanted[value] && !live.ranges_of(value).is_empty() && !crate::park::crosses_ranges(&live.unwinds, live.ranges_of(value))
 }
 
 fn int_class<'a, R: Copy + PartialEq>(
@@ -423,66 +457,6 @@ fn block_weights(depths: &[u32], slow: &[bool]) -> Vec<u64> {
     depths.iter().zip(slow).map(|(&depth, &slow)| (LOOP_WEIGHT.pow(depth.min(MAX_DEPTH)) / if slow { SLOW_SHARE } else { 1 }).max(1)).collect()
 }
 
-fn weights(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elided: &[bool]) -> Vec<u64> {
-    let mut weight = vec![0_u64; func.types.len()];
-    for (block, data) in func.blocks.iter().enumerate() {
-        let each = blocks[block];
-        for inst in &data.insts {
-            let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|res| elided[res.index()]) {
-                continue;
-            }
-            for_effective_operands(data, sib, elided, |value| weight[value.index()] += each);
-            results(data).for_each(|value| weight[value.index()] += each);
-        }
-    }
-    weight
-}
-
-fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], blocks: Option<&[u64]>) -> (Option<Vec<Vec<Value>>>, Vec<(usize, usize)>) {
-    let rank = cfg.is_none().then(|| Cfg::ranks(order, func.blocks.len()));
-    let is_back = |src: Block, target: Block| match (cfg, rank.as_deref()) {
-        (Some(cfg), _) => cfg.reachable[src.index()] && cfg.dominates(target, src),
-        (None, Some(rank)) => rank[src.index()] != usize::MAX && rank[target.index()] <= rank[src.index()],
-        (None, None) => target.index() <= src.index(),
-    };
-    let mut incoming = vec![0_u32; func.types.len()];
-    if let Some(entry) = func.entry {
-        func.blocks[entry.index()].params.iter().for_each(|p| incoming[p.index()] += 1);
-    }
-    let mut edges: Vec<(bool, u64, usize, usize)> = Vec::new();
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        let (src, weight) = (Block(b_idx as u32), blocks.map_or(1, |w| w[b_idx]));
-        for inst in &block.insts {
-            let op = &func.insts[inst.index()].op;
-            if let Op::TryCall { handler, .. } = *op {
-                func.blocks[handler.index()].params.iter().for_each(|p| incoming[p.index()] += 1);
-            }
-            crate::frame::terminator_edges(op, &mut |target: Block, args: &[Value]| {
-                let back = is_back(src, target);
-                for (&param, &arg) in func.blocks[target.index()].params.iter().zip(args) {
-                    incoming[param.index()] += 1;
-                    if (cfg.is_some() || back) && param != arg {
-                        edges.push((back, weight, param.index(), arg.index()));
-                    }
-                }
-            });
-        }
-    }
-    edges.sort_unstable_by_key(|&(back, weight, p, a)| (std::cmp::Reverse((back, weight)), p, a));
-    let mut back_args = Vec::new();
-    let mut out = cfg.is_some().then(|| vec![Vec::new(); func.types.len()]);
-    for (back, _, p, a) in edges {
-        if (back || incoming[p] == 1) && !back_args.contains(&(p, a)) { back_args.push((p, a)); }
-        if let Some(partners) = out.as_mut() {
-            let (pv, av) = (Value(p as u32), Value(a as u32));
-            if !partners[p].contains(&av) { partners[p].push(av); }
-            if !partners[a].contains(&pv) { partners[a].push(pv); }
-        }
-    }
-    (out, back_args)
-}
-
 fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl Fn(F) -> Location<R>) {
     for (location, home) in locations.iter_mut().zip(homes) {
         if let Some(reg) = home {
@@ -491,23 +465,28 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
     }
 }
 
-fn expensive_i64_const(imm: i64) -> bool {
+const MAX_ARM64_LOOP_GP: usize = 18;
+
+fn expensive_i64_const(imm: i64, two_address: bool) -> bool {
     let u = imm as u64;
-    if (u >> 32) == (u & 0xffff_ffff) {
+    if two_address && (u >> 32) == (u & 0xffff_ffff) {
         return false;
     }
     let non_zero = (0..4).filter(|&s| ((u >> (s * 16)) & 0xffff) != 0).count();
     let non_ones = (0..4).filter(|&s| ((u >> (s * 16)) & 0xffff) != 0xffff).count();
-    non_zero >= 3 && non_ones >= 3
+    if non_zero < 3 || non_ones < 3 {
+        return false;
+    }
+    two_address || (crate::arm64::int::encode_bitmask_imm(u, true).is_none() && !((u >> 32) == 0 && crate::arm64::int::encode_bitmask_imm(u, false).is_some()))
 }
 
 fn x64_alu_imm(ty: Type, imm: i64) -> bool {
-    ty == Type::I32 || i32::try_from(imm).is_ok()
+    ty == Type::I32 || fits_imm32(imm)
 }
 
 fn x64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
     match op {
-        Op::Icmp(..) => ty != Type::I64 || i32::try_from(imm).is_ok(),
+        Op::Icmp(..) => ty != Type::I64 || fits_imm32(imm),
         Op::Binary(Binary::Iadd | Binary::Bor | Binary::Bxor, ..) => x64_alu_imm(ty, imm),
         Op::Binary(Binary::Band, ..) => x64_alu_imm(ty, imm) || (rhs && imm == 0xFFFF_FFFF),
         Op::Binary(Binary::Isub, ..) => rhs && x64_alu_imm(ty, imm),
@@ -524,73 +503,100 @@ fn arm64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
     }
 }
 
-fn promote_loop_consts<R>(func: &Function, census: &Uses, depths: &[u32], elided: &[bool], two_address: bool, locations: &mut [Location<R>]) -> Vec<(usize, i64)> {
+fn loop_gp_pressure<R>(func: &Function, loops: &Loops, elided: &[bool], locations: &[Location<R>]) -> Vec<usize> {
+    let mut block_gp = vec![0_usize; func.blocks.len()];
+    let mut seen = vec![0_u32; func.types.len()];
+    for (idx, each) in loops.list.iter().enumerate() {
+        let tag = (idx + 1) as u32;
+        let mut gp = 0_usize;
+        let mut count_val = |v: Value| {
+            let vi = v.index();
+            if seen[vi] != tag && !elided[vi] && func.types[vi].is_small_int() && matches!(locations[vi], Location::Slot) {
+                seen[vi] = tag;
+                gp += 1;
+            }
+        };
+        func.blocks[each.head.index()].params.iter().copied().for_each(&mut count_val);
+        for (b, &in_l) in each.body.iter().enumerate() {
+            if !in_l { continue; }
+            for &inst in &func.blocks[b].insts { func.insts[inst.index()].op.for_operands(&mut count_val); }
+        }
+        for (b, &in_l) in each.body.iter().enumerate() {
+            if in_l { block_gp[b] = block_gp[b].max(gp); }
+        }
+    }
+    block_gp
+}
+
+fn scan_const_op<R>(
+    func: &Function,
+    op: &Op,
+    locations: &[Location<R>],
+    (two_address, in_loop, outer): (bool, bool, &dyn Fn(Value) -> bool),
+    (must_stay_imm, loop_mat): (&mut [bool], &mut [u32]),
+) {
+    match *op {
+        Op::Copy(_, _, bytes) => must_stay_imm[bytes.index()] = true,
+        Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, _, rhs) => must_stay_imm[rhs.index()] = true,
+        Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem | Binary::Sdiv | Binary::Srem, x, y) => {
+            let pow2_ok = matches!(op, Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem, ..));
+            let mul_imm = matches!(op, Op::Binary(Binary::Imul, ..)) && two_address;
+            for v in [x, y] {
+                if let Location::Imm(imm) = locations[v.index()] {
+                    if pow2_ok && ((imm > 0 && imm.count_ones() == 1) || (mul_imm && fits_imm32(imm))) { must_stay_imm[v.index()] = true; }
+                    else if two_address && in_loop && outer(v) { loop_mat[v.index()] += 1; }
+                }
+            }
+        }
+        Op::Binary(Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor, x, y) | Op::Icmp(_, x, y) if in_loop => {
+            let ty = func.ty(x);
+            for (rhs, v) in [(false, x), (true, y)] {
+                let Location::Imm(imm) = locations[v.index()] else { continue };
+                let inline = if two_address { x64_inline_imm(op, ty, rhs, imm) } else { arm64_inline_imm(op, ty, rhs, imm) };
+                if inline { must_stay_imm[v.index()] = true; } else if two_address && outer(v) { loop_mat[v.index()] += 1; }
+            }
+        }
+        Op::Store(val, ..) | Op::StackStore(val, ..) if in_loop => {
+            if let Location::Imm(imm) = locations[val.index()] {
+                if two_address && (func.ty(val).bytes() < 8 || fits_imm32(imm)) { must_stay_imm[val.index()] = true; }
+                else if two_address && imm != 0 && outer(val) { loop_mat[val.index()] += 1; }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn promote_loop_consts<R>(func: &Function, census: &Uses, loops: &Loops, elided: &[bool], two_address: bool, locations: &mut [Location<R>]) -> Vec<(usize, i64)> {
     let count = func.types.len();
-    let mut must_stay_imm = vec![false; count];
-    let mut loop_mat = vec![0_u32; count];
-    let outer = |v: Value, depth: u32| census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth);
+    let (mut must_stay_imm, mut loop_mat, mut max_gp) = (vec![false; count], vec![0_u32; count], vec![0_usize; count]);
+    let depths = &loops.depths;
+    let block_gp = (!two_address).then(|| loop_gp_pressure(func, loops, elided, locations));
     for (b, block) in func.blocks.iter().enumerate() {
         let depth = depths[b];
+        let outer = |v: Value| census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth);
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|r| elided[r.index()]) {
-                continue;
-            }
-            match data.op {
-                Op::Copy(_, _, bytes) => must_stay_imm[bytes.index()] = true,
-                Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, _, rhs) => must_stay_imm[rhs.index()] = true,
-                Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem | Binary::Sdiv | Binary::Srem, x, y) => {
-                    let pow2_ok = matches!(data.op, Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem, ..));
-                    let mul_imm = matches!(data.op, Op::Binary(Binary::Imul, ..)) && two_address;
-                    for v in [x, y] {
-                        if let Location::Imm(imm) = locations[v.index()] {
-                            if pow2_ok && ((imm > 0 && imm.count_ones() == 1) || (mul_imm && i32::try_from(imm).is_ok())) {
-                                must_stay_imm[v.index()] = true;
-                            } else if depth > 0 && outer(v, depth) {
-                                loop_mat[v.index()] += 1;
-                            }
-                        }
-                    }
-                }
-                Op::Binary(Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor, x, y) | Op::Icmp(_, x, y) if depth > 0 => {
-                    let ty = func.ty(x);
-                    for (rhs, v) in [(false, x), (true, y)] {
-                        let Location::Imm(imm) = locations[v.index()] else { continue };
-                        let inline = if two_address { x64_inline_imm(&data.op, ty, rhs, imm) } else { arm64_inline_imm(&data.op, ty, rhs, imm) };
-                        if inline { must_stay_imm[v.index()] = true; } else if outer(v, depth) { loop_mat[v.index()] += 1; }
-                    }
-                }
-                Op::Store(val, ..) | Op::StackStore(val, ..) if depth > 0 => {
-                    if let Location::Imm(imm) = locations[val.index()] {
-                        if two_address && (func.ty(val).bytes() < 8 || i32::try_from(imm).is_ok()) {
-                            must_stay_imm[val.index()] = true;
-                        } else if imm != 0 && outer(val, depth) {
-                            loop_mat[val.index()] += 1;
-                        }
-                    }
-                }
-                _ => {}
-            }
+            if data.result.is_some_and(|r| elided[r.index()]) { continue; }
+            scan_const_op(func, &data.op, locations, (two_address, depth > 0, &outer), (&mut must_stay_imm, &mut loop_mat));
             data.op.for_operands(|v| {
-                if let Location::Imm(imm) = locations[v.index()]
+                let vi = v.index();
+                if let Location::Imm(imm) = locations[vi]
                     && func.ty(v) == Type::I64
-                    && expensive_i64_const(imm)
-                    && ((depth > 0 && outer(v, depth)) || census.uses[v.index()] >= 4)
+                    && expensive_i64_const(imm, two_address)
+                    && ((depth > 0 && (outer(v) || (!two_address && census.uses[vi] >= 2))) || census.uses[vi] >= 4)
                 {
-                    loop_mat[v.index()] += 1;
+                    loop_mat[vi] += 1;
+                    if let Some(bgp) = block_gp.as_deref().filter(|_| depth > 0) { max_gp[vi] = max_gp[vi].max(bgp[b]); }
                 }
             });
         }
     }
-    let mut promoted = Vec::new();
-    for v in 0..count {
-        if let Location::Imm(imm) = locations[v]
-            && imm != 0
-            && !elided[v]
-            && !must_stay_imm[v]
-            && loop_mat[v] > 0
-        {
-            locations[v] = Location::Slot;
+    let (mut added, mut promoted) = (0_usize, Vec::new());
+    for (v, loc) in locations.iter_mut().enumerate() {
+        if let Location::Imm(imm) = *loc && imm != 0 && !elided[v] && !must_stay_imm[v] && loop_mat[v] > 0 {
+            if !two_address && max_gp[v] > 0 && max_gp[v] + added >= MAX_ARM64_LOOP_GP { continue; }
+            if !two_address && max_gp[v] > 0 { added += 1; }
+            *loc = Location::Slot;
             promoted.push((v, imm));
         }
     }
@@ -611,10 +617,12 @@ fn promote_loop_syms<R: Copy>(func: &Function, census: &Uses, depths: Option<&[u
             }
         }
     }
+    let folds = addressed_images(func);
     let mut promoted = Vec::new();
     for (v, loc) in locations.iter_mut().enumerate() {
         if matches!(*loc, Location::SlotAddr(_) | Location::Symbol(_))
             && !elided[v]
+            && !folds[v]
             && (census.uses[v] >= 2 || in_loop[v] || depths.is_some_and(|d| census.def[v].is_some_and(|(db, _)| d[db] > 0)))
         {
             promoted.push((v, *loc));
@@ -624,11 +632,33 @@ fn promote_loop_syms<R: Copy>(func: &Function, census: &Uses, depths: Option<&[u
     promoted
 }
 
+/// Which image addresses are used only as the address of plain loads and stores or plus a 32-bit constant, which reach them relative to the program counter.
+fn addressed_images(func: &Function) -> Vec<bool> {
+    let mut folds: Vec<bool> = (0..func.types.len()).map(|v| func.is_image_addr(Value(v as u32))).collect();
+    let mut small = vec![false; func.types.len()];
+    for data in &func.insts {
+        if let (Op::Const(k), Some(result)) = (&data.op, data.result) {
+            small[result.index()] = i32::try_from(*k).is_ok();
+        }
+    }
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            match func.insts[inst.index()].op {
+                Op::Load(..) => {}
+                Op::Store(value, ..) => folds[value.index()] = false,
+                Op::Binary(Binary::Iadd | Binary::Isub, _, k) if small[k.index()] => {}
+                ref op => op.for_operands(|v| folds[v.index()] = false),
+            }
+        }
+    }
+    folds
+}
+
 pub(crate) fn plan<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
     (order, copied, weighed): (&[Block], &[bool], bool),
-    params: &[Loc<R>],
+    (params, split): (&[Loc<R>], &[(Value, u64)]),
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Plan<R> {
     let count = func.types.len();
@@ -636,13 +666,14 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     consts(func, regs.absolute_calls, &mut locations);
     statics(func, &mut locations);
     let census = census(func);
-    let zero_ext = hints::zero_ext(func, &locations, &census);
+    let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
-    let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
+    let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.constant_calls) } else { vec![None; count] };
+    const_pairs(func, &census, &mut elided);
     let cfg = weighed.then(|| func.cfg());
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
     let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
-    let promoted_consts = loop_depths.map(|depths| promote_loop_consts(func, &census, depths, &elided, regs.two_address, &mut locations)).unwrap_or_default();
+    let promoted_consts = loops.as_deref().map(|loops| promote_loop_consts(func, &census, loops, &elided, regs.two_address, &mut locations)).unwrap_or_default();
     let promoted_syms = regs.absolute_calls.then(|| promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
@@ -653,18 +684,13 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
-    let weights = blocks.as_deref().map(|blocks| weights(func, blocks, &sib, &elided));
-    let (partners, back_args) = edge_hints(func, cfg.as_deref(), order, blocks.as_deref());
+    let natural = blocks.as_deref().map(|blocks| walk::weights(func, blocks, &sib, &elided));
+    let weights = natural.clone().map(|natural| walk::inherit(natural, &live, split));
+    let (partners, back_args, edge_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref(), !regs.two_address);
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
-    let hints = Hints {
-        reuse: &reuse,
-        weights: weights.as_deref(),
-        partners: partners.as_deref(),
-        back_args: &back_args,
-        park: park.as_deref(),
-        two_address: regs.two_address,
-    };
-    let (passed_ints, passed_floats) = passed(func, classify);
+    let copies = if regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
+    let hints = Hints { reuse: &reuse, weights: weights.as_deref(), partners: partners.as_deref(), back_args: &back_args, edge_args: &edge_args, park: park.as_deref(), two_address: regs.two_address, copies: &copies };
+    let (passed_ints, passed_floats) = hints::passed(func, classify, regs.high_product);
     let (homes, used) = allocate(func, &live, &int_class(func, regs, (order, copied, &elided), params, passed_ints), &ints, &hints);
     place(&mut locations, homes, Location::Reg);
     for (v, loc) in promoted_consts.into_iter().map(|(v, i)| (v, Location::Imm(i))).chain(promoted_syms) {
@@ -682,12 +708,24 @@ pub(crate) fn plan<R: Copy + PartialEq>(
             locations[res.index()] = Location::Imm(0);
         }
     }
+    let (pairs, deferred) = pairs(func, &locations, &elided);
+    let webs = blocks.as_deref().zip(partners.as_deref()).map(|edges| demote::webs(func, &live, edges, (&sib, &elided, &deferred), regs.imm_store, &mut locations));
     let parked = if park.is_some() { parked(func, &live, &locations, (regs.saved, regs.saved_float), classify) } else { Vec::new() };
     let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
-    let (pairs, deferred) = pairs(func, &locations, &elided);
-    let shared = if weighed { crate::color::share(func, &live, &locations, &deferred) } else { Vec::new() };
-    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext }
+    let shared = webs.map_or_else(Vec::new, |webs| crate::color::share(func, &live, &locations, &deferred, &webs));
+    let zero_ext = if regs.call_zext && hints::has_reg_reduce(func, &locations) { hints::zero_ext(func, &locations, &census, true) } else { zero_ext };
+    let density = weights.as_deref().map_or_else(Vec::new, |weights| walk::densities(weights, &live));
+    if crate::trace::enabled() {
+        crate::trace::on_alloc(func, &live, (0..count).filter(|&value| ints[value]).map(|value| (value, matches!(locations[value], Location::Slot))));
+        if let (Some(loops), Some(blocks)) = (loops, blocks.as_deref()) {
+            crate::trace::on_loops(func, &live, (loops, blocks), &ints, |value| matches!(locations[value], Location::Slot));
+            crate::trace::on_edge_copies(func, &live, blocks, |value| if let Location::Reg(reg) = locations[value] { Some(reg) } else { None });
+        }
+    }
+    let spill_cost = natural.map_or(0, |natural| (0..count).filter(|&v| (ints[v] || floats[v]) && matches!(locations[v], Location::Slot)).map(|v| natural[v]).sum());
+    let hoist = hoist::Hoist::new(func, &live, &locations);
+    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density, spill_cost, hoist }
 }
 
 impl<R: Copy> Plan<R> {

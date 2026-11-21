@@ -45,6 +45,18 @@ impl Lower<'_, '_> {
         }
     }
 
+    /// Reads `place` of type `ty`; a sized `Unique` comes back in a fresh frame slot, its pointer marked as owning a heap allocation.
+    pub fn read_typed(&mut self, place: Place, ty: Ty) -> Option<Value> {
+        if !matches!(place.repr, Repr::Mem { size: 8, parts: Parts::One(Type::I64), .. }) || !self.cx.is_unique(ty) {
+            return self.read(place);
+        }
+        let pointer = self.read(place.at(0, Repr::Scalar(Type::I64)))?;
+        self.b.func.mark_unique_ptr(pointer);
+        let slot = self.slot(place.repr)?;
+        self.write(Place::slot(slot, Repr::Scalar(Type::I64)), pointer);
+        Some(self.address(Place::slot(slot, place.repr)))
+    }
+
     /// Stores `value` into `place`, copying the bytes of a memory value.
     pub fn write(&mut self, place: Place, value: Value) {
         match (place.repr, place.base) {
@@ -89,7 +101,13 @@ impl Lower<'_, '_> {
         match self.cx.types.kind(ty).clone() {
             Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => Ok((value, pointee)),
             _ if let Some(pointee) = self.cx.boxed(ty) => {
-                let pointer = if self.cx.is_unsized(pointee)? { value } else { self.box_data(value) };
+                let pointer = if self.cx.is_unsized(pointee)? {
+                    value
+                } else {
+                    let data = self.box_data(value);
+                    self.b.func.mark_unique_ptr(data);
+                    data
+                };
                 Ok((pointer, pointee))
             }
             other => bail!("dereference of {other:?}"),
@@ -119,7 +137,13 @@ impl Lower<'_, '_> {
     pub(super) fn sized_pointer(&mut self, value: Value, ty: Ty) -> Value {
         match self.cx.types.kind(ty) {
             Kind::Ref(..) | Kind::Ptr(..) => value,
-            _ => self.box_data(value),
+            _ => {
+                let data = self.box_data(value);
+                if self.cx.boxed(ty).is_some() {
+                    self.b.func.mark_unique_ptr(data);
+                }
+                data
+            }
         }
     }
 
@@ -356,6 +380,15 @@ impl Lower<'_, '_> {
         Ok(Some(if matches!(repr, Repr::Mem { .. }) { self.snapshot_repr(repr, addr) } else { addr }))
     }
 
+    /// Whether `expr` names a whole local whose type needs drop, so reading it by value moves it and nothing reads it again before it is reinitialized.
+    fn moved_local(&mut self, expr: ExprId) -> Result<bool> {
+        if let Some(inner) = self.transparent(expr) {
+            return self.moved_local(inner);
+        }
+        let local = matches!(self.body.expr(expr), Expr::Path(_)) && matches!(self.typed.res.get(&expr), Some(Res::Local(_)));
+        Ok(local && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))?)
+    }
+
     /// Records a move out of `expr`'s place when its type needs drop.
     pub(super) fn move_from_expr(&mut self, expr: ExprId) -> Result<()> {
         if !self.open || !crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
@@ -369,6 +402,12 @@ impl Lower<'_, '_> {
 
     /// Evaluates `expr` by value, records its move, and snapshots a `Repr::Mem` place expression into a fresh frame slot.
     pub(super) fn eval_operand(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        self.operand(expr, false)
+    }
+
+    /// Evaluates `expr` as `eval_operand` does, but passes a moved local in place when `last` says no later operand of the same call can reinitialize it.
+    pub(super) fn operand(&mut self, expr: ExprId, last: bool) -> Result<Option<Value>> {
+        let in_place = last && self.moved_local(expr)?;
         let value = self.expr(expr)?;
         self.move_from_expr(expr)?;
         let Some(addr) = value else {
@@ -376,7 +415,7 @@ impl Lower<'_, '_> {
         };
         let coerced = self.typed.coercions.get(&expr);
         let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_)));
-        if !self.open || !self.may_alias_place(expr) || fresh_coercion {
+        if !self.open || !self.may_alias_place(expr) || fresh_coercion || (in_place && coerced.is_none()) {
             return Ok(Some(addr));
         }
         let repr = self.coerced_repr(expr, coerced)?;

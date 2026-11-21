@@ -1,5 +1,5 @@
-use crate::ir::{Binary, Block, Convert, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, may_alias};
+use crate::ir::{Block, Convert, Function, Inst, Op, Type, Value};
+use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, is_hard_barrier, may_alias};
 use crate::merge::find;
 
 use super::coalesce::ScanBuf;
@@ -97,23 +97,6 @@ impl FarCseGuard {
 
 fn is_scalar_remat_ty(ty: Type) -> bool {
     ty.is_small_int() || ty.is_float()
-}
-
-fn is_hard_barrier(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Call { .. }
-            | Op::TryCall { .. }
-            | Op::AtomicLoad(_)
-            | Op::AtomicStore(..)
-            | Op::AtomicRmw(..)
-            | Op::AtomicCas(..)
-            | Op::Fence
-            | Op::Trap
-            | Op::Trapz(_)
-            | Op::Assume(_)
-            | Op::Binary(Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem, ..)
-    )
 }
 
 fn is_mem_write(op: &Op) -> bool {
@@ -219,7 +202,7 @@ fn has_clobber_between(ctx: &ScanCtx<'_>, raw: &RawCand, end_pos: usize) -> bool
     let read_loc = ctx.prov.loc(raw.ptr, i64::from(raw.off), raw.ty.bytes());
     ctx.scan.writes[w_lo..w_hi]
         .iter()
-        .any(|&w| clobbers_loc(ctx.func, &ctx.func.insts[ctx.insts[w].index()].op, read_loc, ctx.prov))
+        .any(|&w| clobbers_loc(ctx.func, (&ctx.func.insts[ctx.insts[w].index()].op, Some(ctx.insts[w])), read_loc, ctx.prov))
 }
 
 fn ptr_live_at_or_past(ctx: &ScanCtx<'_>, ptr: Value, pos: usize) -> bool {
@@ -245,7 +228,7 @@ fn validate_cand(ctx: &ScanCtx<'_>, raw: &RawCand, uses: &[usize]) -> Option<Pla
     if ctx.scan.hard_barriers[first_far_use] != ctx.scan.hard_barriers[raw.def_pos + 1] {
         return None;
     }
-    if has_clobber_between(ctx, raw, first_far_use) || !ptr_live_at_or_past(ctx, raw.ptr, first_far_use) {
+    if has_clobber_between(ctx, raw, first_far_use) {
         return None;
     }
     Some(Plan { def_pos: raw.def_pos, orig_val: raw.val, ptr: raw.ptr, off: raw.off, ty: raw.ty, last_near_use, first_far_use })
@@ -332,29 +315,45 @@ fn apply_insertions(func: &mut Function, block: Block, insertions: Vec<Insertion
     func.blocks[block.index()].insts = out;
 }
 
+fn plan_survives(ctx: &ScanCtx<'_>, plans: &[Plan], i: usize) -> bool {
+    let plan = &plans[i];
+    if ptr_live_at_or_past(ctx, plan.ptr, plan.first_far_use) {
+        return true;
+    }
+    plans.iter().enumerate().any(|(j, other)| {
+        j != i
+            && other.orig_val != plan.orig_val
+            && other.ptr == plan.ptr
+            && plan.last_near_use.max(other.last_near_use) < plan.first_far_use.min(other.first_far_use)
+    })
+}
+
 fn plan_block(func: &Function, prov: &Provenance, all_uses: &[u32], insts: &[Inst]) -> Vec<Insertion> {
     let scan = scan_block(func, insts);
     if scan.raw_cands.is_empty() {
         return Vec::new();
     }
     let ctx = ScanCtx { func, prov, insts, all_uses, scan: &scan };
-    let plans: Vec<Plan> = scan
+    let mut plans: Vec<Plan> = scan
         .raw_cands
         .iter()
         .zip(&scan.cand_uses)
         .filter_map(|(raw, uses)| validate_cand(&ctx, raw, uses))
         .collect();
+    let keep: Vec<bool> = (0..plans.len()).map(|i| plan_survives(&ctx, &plans, i)).collect();
+    let mut idx = 0_usize;
+    plans.retain(|_| {
+        let ok = keep[idx];
+        idx += 1;
+        ok
+    });
     if plans.is_empty() {
         return Vec::new();
     }
     group_insertions(plans, &scan.def_prefix)
 }
 
-/// Splits long same-block scalar load live ranges across barrier-free instruction chasms by rematerializing before distant uses.
-pub(super) fn split_long_loads(func: &mut Function, prov: &Provenance) -> bool {
-    if !func.blocks.iter().any(|b| b.insts.len() >= MIN_BLOCK_INSTS) {
-        return false;
-    }
+fn split_long_loads_round(func: &mut Function, prov: &Provenance) -> bool {
     let all_uses = func.use_counts();
     let mut changed = false;
     for b_idx in 0..func.blocks.len() {
@@ -366,6 +365,22 @@ pub(super) fn split_long_loads(func: &mut Function, prov: &Provenance) -> bool {
             apply_insertions(func, Block(b_idx as u32), insertions);
             changed = true;
         }
+    }
+    changed
+}
+
+/// Splits long same-block scalar load live ranges across barrier-free instruction chasms by rematerializing before distant uses.
+pub(super) fn split_long_loads(func: &mut Function, prov: &Provenance) -> bool {
+    const MAX_SPLIT_ROUNDS: usize = 4;
+    if !func.blocks.iter().any(|b| b.insts.len() >= MIN_BLOCK_INSTS) {
+        return false;
+    }
+    let mut changed = false;
+    for _ in 0..MAX_SPLIT_ROUNDS {
+        if !split_long_loads_round(func, prov) {
+            break;
+        }
+        changed = true;
     }
     changed
 }
@@ -394,6 +409,18 @@ pub(super) fn drop_stores_if(
         false
     });
     changed
+}
+
+/// Drops the pending stores into the allocation that `inst` frees with the runtime `free`, since no later read can see them.
+pub(super) fn drop_freed_stores(func: &mut Function, state: &super::State<'_>, (bufs, guard): (&mut ScanBuf, &mut FarCseGuard), inst: Inst) -> bool {
+    let Op::Call { callee, ref args, .. } = func.insts[inst.index()].op else { return false };
+    let Some(&freed) = args.first() else { return false };
+    let Some(def) = state.defs.get(callee.index()).copied().flatten() else { return false };
+    if !matches!(func.insts[def.index()].op, Op::Runtime(crate::reloc::RuntimeSymbol::Free)) {
+        return false;
+    }
+    let base = super::addr_loc(state.prov, state.subst, freed, 0, 1).base;
+    drop_stores_if(func, bufs, guard, |ploc| ploc.base == base)
 }
 
 fn merge_interval(cov: &mut Vec<(i128, i128)>, mut lo: i128, mut hi: i128) {
@@ -541,7 +568,7 @@ impl SubwordSlices {
     }
 
     pub(super) fn on_unknown(&mut self, func: &Function, op: &Op, prov: &Provenance) {
-        self.0.retain(|s| !clobbers_loc(func, op, s.loc, prov));
+        self.0.retain(|s| !clobbers_loc(func, (op, None), s.loc, prov));
     }
 
     pub(super) fn find(&self, loc: MemLoc, ty: Type) -> Option<SubwordSlice> {
@@ -652,13 +679,20 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
         if !for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] += 1) {
             continue;
         }
+        let cond = match func.insts[last.index()].op {
+            Op::Brif(c, ..) if uses[c.index()] == 1 => Some(c),
+            _ => None,
+        };
         let insts = std::mem::take(&mut func.blocks[b].insts);
         let len = insts.len();
         let mut kept = Vec::with_capacity(len);
         let mut sunk = Vec::new();
+        let mut tail = None;
         for &inst in &insts[..len - 1] {
             let data = &func.insts[inst.index()];
-            if let Some(res) = data.result
+            if data.result.is_some() && data.result == cond && crate::schedule::is_condition(func, inst) {
+                tail = Some(inst);
+            } else if let Some(res) = data.result
                 && data.op.is_speculable()
                 && !fits_used[res.index()]
                 && term_uses[res.index()] > 0
@@ -669,11 +703,10 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
                 kept.push(inst);
             }
         }
-        if !sunk.is_empty() && sunk.iter().enumerate().any(|(idx, &inst)| insts[len - 1 - sunk.len() + idx] != inst) {
-            changed = true;
-        }
         kept.extend(sunk);
+        kept.extend(tail);
         kept.push(last);
+        changed |= kept != insts;
         func.blocks[b].insts = kept;
         for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0);
     }

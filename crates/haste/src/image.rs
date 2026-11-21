@@ -9,6 +9,7 @@ mod stencil;
 mod stencil_jit;
 pub(crate) use stencil::{DICT_MIN_BYTES, DICT_MIN_FANOUT, verify_stencil};
 mod stub;
+pub mod watch;
 mod workers;
 
 pub use expand::{Job, run_macros};
@@ -133,7 +134,7 @@ pub struct Image {
     vtable_entries: Mutex<Vec<Vec<lower::VtableEntry>>>,
     promoted_cells: Mutex<HashMap<(usize, u32), u64>>,
     thread_slots: Mutex<HashMap<usize, u64>>,
-    wanted: Mutex<Vec<Instance>>,
+    wanted: Mutex<Vec<(std::thread::ThreadId, Instance)>>,
     bodies: lower::Bodies,
     backend: ImageBackend,
     file_index: std::sync::OnceLock<crate::sema::summary::codec::FileIndex>,
@@ -147,13 +148,14 @@ pub(super) struct FrozenStencil {
     pub plan: Vec<u8>,
 }
 
-/// What one compile pass writes: its code memory, its stencil cache, and sparse `(index, size, ns)` records.
+/// What one compile pass writes: its code memory, its stencil cache, sparse `(index, size, ns)` records, and what workers made ahead for a lazy batch, by index.
 #[derive(Default)]
 pub(super) struct Pass {
     memory: Memory,
     stencils: stencil::StencilState,
     records: Vec<(usize, u32, u64)>,
     frozen_stencils: Vec<FrozenStencil>,
+    ready: HashMap<usize, stencil_jit::Ready>,
 }
 
 impl Pass {
@@ -275,12 +277,13 @@ impl Slots for Image {
 
     fn want(&self, instance: Instance) {
         if self.backend.is_lazy_jit() {
-            lock(&self.wanted).push(instance);
+            lock(&self.wanted).push((std::thread::current().id(), instance));
         }
     }
 
     fn wanted_len(&self) -> usize {
-        lock(&self.wanted).len()
+        let me = std::thread::current().id();
+        lock(&self.wanted).iter().filter(|(thread, _)| *thread == me).count()
     }
 
     fn bodies(&self) -> &lower::Bodies {
@@ -338,6 +341,14 @@ impl Slots for Image {
 
     fn resolve_symbol(&self, sym: &lower::SymbolSource) -> u64 {
         self.symbol_value(sym)
+    }
+
+    fn encode_plan(&self, cx: &Context<'_>, reached: &Reached, is_sysroot: bool, plan: &lower::RelocPlan) -> Option<Vec<u8>> {
+        self.encode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, plan)
+    }
+
+    fn decode_plan(&self, cx: &Context<'_>, reached: &Reached, is_sysroot: bool, bytes: &[u8]) -> Option<lower::RelocPlan> {
+        self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, bytes)
     }
 }
 
@@ -434,8 +445,10 @@ impl Image {
         }
     }
 
+    /// Takes every unreached instance that lowering noted, and gives those this thread noted.
     pub(super) fn take_wanted(&self) -> Vec<Instance> {
-        std::mem::take(&mut *lock(&self.wanted))
+        let me = std::thread::current().id();
+        std::mem::take(&mut *lock(&self.wanted)).into_iter().filter(|(thread, _)| *thread == me).map(|(_, instance)| instance).collect()
     }
 
     /// Runs `run` with this image's pass taken out, so that `run` lowers through the shared image while it writes into the pass.

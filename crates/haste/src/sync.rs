@@ -32,6 +32,39 @@ pub(crate) fn shard_index<Q: Hash + ?Sized, const SHARDS: usize>(key: &Q) -> usi
     (((hash >> 58) ^ (hash >> 29) ^ hash) as usize) & (SHARDS - 1)
 }
 
+/// Evaluates `work` over `items` on worker threads, returning outputs in input order.
+pub(crate) fn parallel_map<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let total = items.len();
+    let workers = crate::jobs().min(total);
+    if total < 2 || workers <= 1 {
+        return items.into_iter().map(work).collect();
+    }
+    let queue = Mutex::new(items.into_iter().enumerate());
+    let worker = || {
+        let mut local = Vec::new();
+        while let Some((idx, item)) = lock(&queue).next() {
+            local.push((idx, work(item)));
+        }
+        local
+    };
+    let chunks = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers - 1).map(|_| scope.spawn(&worker)).collect();
+        let mut all = worker();
+        for handle in handles {
+            match handle.join() {
+                Ok(chunk) => all.extend(chunk),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        all
+    });
+    let mut slots: Vec<Option<R>> = (0..total).map(|_| None).collect();
+    for (idx, res) in chunks {
+        slots[idx] = Some(res);
+    }
+    slots.into_iter().flatten().collect()
+}
+
 pub(crate) struct Slab<T, const SLAB: usize, const SLABS: usize> {
     slabs: Box<[OnceLock<Box<[OnceLock<T>]>>]>,
 }
@@ -67,7 +100,8 @@ impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default for 
 }
 
 impl<K: Eq + Hash + Clone, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Interner<K, SHARDS, SLAB, SLABS> {
-    pub(crate) fn intern<Q>(&self, key: &Q, make: impl FnOnce(&Q) -> K) -> u32
+    /// The id of `key`, calling `make` with the new id under the shard's write lock, before the id is visible, when `key` is new.
+    pub(crate) fn intern<Q>(&self, key: &Q, make: impl FnOnce(&Q, u32) -> K) -> u32
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -81,7 +115,7 @@ impl<K: Eq + Hash + Clone, const SHARDS: usize, const SLAB: usize, const SLABS: 
             return id;
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let owned = make(key);
+        let owned = make(key, id);
         self.slabs.set(id as usize, owned.clone());
         write.insert(owned, id);
         id

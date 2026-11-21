@@ -65,16 +65,8 @@ impl Emit<'_> {
         }
     }
 
-    pub(super) fn is_zero_vec(&self, mut v: Value) -> bool {
-        for _ in 0..4 {
-            let Some(inst) = self.defs.get(v.index()).copied().flatten() else { return false };
-            match self.func.insts[inst.index()].op {
-                Op::Const(0) => return true,
-                Op::Convert(Convert::Bitcast, inner) => v = inner,
-                _ => return false,
-            }
-        }
-        false
+    pub(super) fn is_zero_vec(&self, v: Value) -> bool {
+        self.func.is_zero_vec(&|value| self.defs.get(value.index()).copied().flatten(), v)
     }
 
     pub(super) fn packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm) {
@@ -154,8 +146,14 @@ impl Emit<'_> {
             self.sse_or_vex(&[0x66], &[0x0F, 0x76], (dst, dst, dst));
             return;
         }
-        self.asm.mov_imm(Reg::Rax, imm);
-        self.splat_scalar(lane, dst, Reg::Rax);
+        let (packed, emit_lane) = match lane {
+            Lane::I8 => (i64::from((imm as u8 as u32) * 0x0101_0101), Lane::I32),
+            Lane::I16 => (i64::from((imm as u16 as u32) * 0x0001_0001), Lane::I32),
+            Lane::I32 | Lane::F32 => (i64::from(imm as u32), Lane::I32),
+            Lane::I64 | Lane::F64 => (imm, Lane::I64),
+        };
+        self.asm.mov_imm(Reg::Rax, packed);
+        self.splat_scalar(emit_lane, dst, Reg::Rax);
     }
 
     pub(super) fn vector_unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
@@ -260,7 +258,7 @@ impl Emit<'_> {
         let fl_ty = lane.to_type();
         let stride = lane.bytes() as i32;
         self.fget(X0, x);
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+        self.reserve_scratch(16);
         self.xmm_store(Type::Vec { lane, count }, Mem::new(Reg::Rsp, 0), X0);
         for i in 0..count {
             let slot = Mem::new(Reg::Rsp, i32::from(i) * stride);
@@ -269,7 +267,7 @@ impl Emit<'_> {
             self.xmm_store(fl_ty, slot, X0);
         }
         self.xmm_load(Type::Vec { lane, count }, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
+        self.release_scratch(16);
     }
 
     pub(super) fn vector_binary(&mut self, op: Binary, (x, y): (Value, Value), result: Value) -> Result<(), String> {
@@ -708,7 +706,7 @@ impl Emit<'_> {
 
     fn scalarize_convert(&mut self, op: Convert, (fl, tl, count): (Lane, Lane, u8), (from_ty, to_ty): (Type, Type), x: Value, dst: Xmm) -> Result<(), String> {
         self.fget(X0, x);
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
+        self.reserve_scratch(32);
         self.xmm_store(from_ty, Mem::new(Reg::Rsp, 16), X0);
         for i in 0..count {
             let src_slot = Mem::new(Reg::Rsp, 16 + i32::from(i) * fl.bytes() as i32);
@@ -758,13 +756,13 @@ impl Emit<'_> {
                     self.asm.store(Size::of(tl.bytes()), dst_slot, Reg::Rax);
                 }
                 _ => {
-                    self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+                    self.release_scratch(32);
                     return Err(format!("unsupported vector convert {op:?} {fl:?}->{tl:?}"));
                 }
             }
         }
         self.xmm_load(to_ty, dst, Mem::new(Reg::Rsp, 0));
-        self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+        self.release_scratch(32);
         Ok(())
     }
 }

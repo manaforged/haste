@@ -25,6 +25,9 @@ const PSHUFB: VexOp = VexOp::new(MAP_0F38, PP_66, 0x00);
 const PCMPEQB: VexOp = VexOp::new(MAP_0F, PP_66, 0x74);
 const PCMPGTB: VexOp = VexOp::new(MAP_0F, PP_66, 0x64);
 const PMOVMSKB: VexOp = VexOp::new(MAP_0F, PP_66, 0xD7);
+const PSADBW: VexOp = VexOp::new(MAP_0F, PP_66, 0xF6);
+const PMADDUBSW: VexOp = VexOp::new(MAP_0F38, PP_66, 0x04);
+const PMADDWD: VexOp = VexOp::new(MAP_0F, PP_66, 0xF5);
 const PSLLVD: VexOp = VexOp::new(MAP_0F38, PP_66, 0x47);
 const PSLLVQ: VexOp = VexOp::wide(MAP_0F38, PP_66, 0x47);
 const PSRLVD: VexOp = VexOp::new(MAP_0F38, PP_66, 0x45);
@@ -64,7 +67,8 @@ pub(crate) fn host_avx2() -> bool {
     Features::host().avx2
 }
 
-fn broadcast(lane: Lane) -> VexOp {
+/// The AVX2 op that copies the lowest lane of a register to every lane.
+pub(super) fn broadcast(lane: Lane) -> VexOp {
     let op = match lane {
         Lane::I8 => 0x78,
         Lane::I16 => 0x79,
@@ -90,6 +94,9 @@ fn byte_op(id: TargetOpId) -> Option<VexOp> {
         TargetOpId::X64Pshufb256 => Some(PSHUFB),
         TargetOpId::X64Pcmpeqb256 => Some(PCMPEQB),
         TargetOpId::X64Pcmpgtb256 => Some(PCMPGTB),
+        TargetOpId::X64Psadbw256 => Some(PSADBW),
+        TargetOpId::X64Pmaddubsw256 => Some(PMADDUBSW),
+        TargetOpId::X64Pmaddwd256 => Some(PMADDWD),
         _ => None,
     }
 }
@@ -136,12 +143,12 @@ impl Emit<'_> {
         match step {
             ArgStep::Move(src, dst) => self.fmov(whole, Xmm(dst), Xmm(src)),
             ArgStep::Save(src) => {
-                self.asm.alu_imm(Alu::Sub, Reg::Rsp, whole.bytes() as i32);
+                self.reserve_scratch(whole.bytes() as i32);
                 self.xmm_store(whole, top, Xmm(src));
             }
             ArgStep::Restore(dst) => {
                 self.xmm_load(whole, Xmm(dst), top);
-                self.asm.alu_imm(Alu::Add, Reg::Rsp, whole.bytes() as i32);
+                self.release_scratch(whole.bytes() as i32);
             }
             ArgStep::Load(value, dst) => self.fget(Xmm(dst), value),
         }
@@ -246,6 +253,13 @@ impl Emit<'_> {
     }
 
     fn wide_target(&mut self, id: TargetOpId, args: &[Value], result: Value) -> Option<Result<(), String>> {
+        if let (TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut, &[carry, a, b]) = (id, args) {
+            return Some(self.carry_chain(id, [carry, a, b], result));
+        }
+        if let (TargetOpId::X64DivWide | TargetOpId::X64RemWide, &[high, low, by]) = (id, args) {
+            self.divide_wide(id == TargetOpId::X64RemWide, [high, low, by], result);
+            return Some(Ok(()));
+        }
         if let (TargetOpId::X64Pmovmskb256, &[v]) = (id, args) {
             let dst = self.dst(result);
             let src = self.fin(v, X0);

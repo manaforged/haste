@@ -112,7 +112,7 @@ impl Matcher<'_> {
                 bind(slots, *slot, Bind::One(at, to, *frag));
                 Some(to)
             }
-            Piece::Var(_, None, _) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => None,
+            Piece::Var(_, None, _) | Piece::Crate(_) | Piece::CratePath | Piece::Meta(_) => None,
             Piece::Repeat(inner, sep, op, names) => self.repeat((inner, names), (*sep, *op), (at, end), slots),
         }
     }
@@ -199,7 +199,7 @@ impl Writer<'_> {
                     self.emit(inner, rounds)?;
                     self.out.copy(self.def, self.def.pair(*open));
                 }
-                Piece::Crate => self.out.dollar_crate(self.krate),
+                Piece::Crate(fixed) => self.out.dollar_crate(fixed.unwrap_or(self.krate)),
                 Piece::CratePath => {
                     self.out.dollar_crate(self.krate);
                     self.out.lexed("::");

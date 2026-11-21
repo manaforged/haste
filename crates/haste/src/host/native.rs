@@ -15,6 +15,8 @@ use crate::graph::script::{LinkKind, tool};
 use crate::graph::store;
 use crate::outline::Outline;
 
+mod elf;
+
 const NAMES: &str = "haste_native_names";
 const ADDRESSES: &str = "haste_native_addresses";
 const COUNT: &str = "haste_native_count";
@@ -135,7 +137,13 @@ fn link(libraries: &Libraries, path: &Path) -> Result<()> {
     for archive in &libraries.archives {
         names.extend(index(archive).with_context(|| format!("reading the symbol index of {}", archive.display()))?);
     }
-    names.retain(|name| is_identifier(name));
+    let mut thread_locals = rustc_hash::FxHashSet::default();
+    if !cfg!(target_vendor = "apple") {
+        for archive in &libraries.archives {
+            thread_locals.extend(elf::thread_locals(archive).with_context(|| format!("reading the members of {}", archive.display()))?);
+        }
+    }
+    names.retain(|name| is_identifier(name) && !thread_locals.contains(name));
     names.sort();
     names.dedup();
     let source = path.with_extension("c");
@@ -153,14 +161,14 @@ fn link(libraries: &Libraries, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The linker arguments that take every member of each of `archives`, used or not, since compiled code asks for symbols only as it runs.
+/// The linker arguments that take every member of each of `archives`, used or not, since compiled code asks for symbols only as it runs; on ELF the first of two members that define one symbol wins, as linking only the members a program uses would pick one.
 fn whole(archives: &[PathBuf]) -> Vec<String> {
     if cfg!(target_vendor = "apple") {
         let mut args: Vec<String> = archives.iter().map(|archive| format!("-Wl,-force_load,{}", archive.display())).collect();
         args.extend(["-undefined".to_owned(), "dynamic_lookup".to_owned()]);
         return args;
     }
-    let mut args = vec!["-Wl,--whole-archive".to_owned()];
+    let mut args = vec!["-Wl,--allow-multiple-definition".to_owned(), "-Wl,--whole-archive".to_owned()];
     args.extend(archives.iter().map(|archive| archive.display().to_string()));
     args.push("-Wl,--no-whole-archive".to_owned());
     args

@@ -16,10 +16,13 @@ use super::scope::{Frame, named_args, type_params};
 /// An impl that a trait obligation picked, with its type arguments.
 pub type Picked = (ImplRef, Vec<Ty>);
 
-/// What trying one impl left: its variable bindings, and the projections and obligations it deferred.
+/// What trying one impl left: sparse variable updates, appended variables, diverging marks, and deferred work.
 #[derive(Clone)]
 pub(super) struct Vars {
-    bound: Vec<Option<Ty>>,
+    base_len: usize,
+    updates: Vec<(u32, Option<Ty>)>,
+    added: Vec<Option<Ty>>,
+    diverges: Vec<u32>,
     projections: Vec<super::project::Projection>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
 }
@@ -96,6 +99,13 @@ impl<'a> Infer<'_, 'a> {
         let found = self.applicable(of, self_ty, args, depth);
         self.selecting.pop();
         let Ok([(picked, vars)]) = <[_; 1]>::try_from(found?) else { return Ok(None) };
+        let mark = self.mark_vars();
+        self.apply_var_delta(vars.base_len, &vars.updates, &vars.added, &vars.diverges);
+        let open_arg = args.iter().any(|&a| matches!(self.cx.types.kind(self.resolve(a)), Kind::Var(_)));
+        self.rollback_vars(mark);
+        if open_arg && of.krate != self.home.krate && head(self.cx.types.kind(self.resolve(self_ty))).is_some() && self.blanket(picked.0)? {
+            return Ok(None);
+        }
         self.adopt(vars);
         Ok(Some(picked))
     }
@@ -107,7 +117,7 @@ impl<'a> Infer<'_, 'a> {
 
     pub(super) fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
         let self_ty = self.resolve(self_ty);
-        if depth as usize > crate::RECURSION_LIMIT || matches!(self.cx.types.kind(self_ty), Kind::Var(_)) {
+        if depth as usize > crate::RECURSION_LIMIT || (matches!(self.cx.types.kind(self_ty), Kind::Var(_)) && !self.is_pending_opaque(self_ty)) {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;
@@ -131,20 +141,23 @@ impl<'a> Infer<'_, 'a> {
     fn impl_candidates(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
         let holders = self.holders(of, self_ty, args);
         let blocks = self.cx.trait_impls(of, head(self.cx.types.kind(self_ty)), &holders);
+        let opaque_var = matches!(self.cx.types.kind(self_ty), Kind::Var(_));
         let mut found = Vec::new();
         let blocks: Vec<ImplRef> = blocks.into_iter().filter(|&block| !self.cx.reserved(block)).collect();
         for block in blocks {
+            if opaque_var && !self.blanket(block)? { continue; }
             let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());
             let applies = self.impl_applies(block, self_ty, args, depth);
             let projections = self.projections.split_off(mark.1.min(self.projections.len()));
             let obligations = self.obligations.split_off(mark.2.min(self.obligations.len()));
             match applies {
-                Ok(Some(impl_args)) => {
-                    let bound = self.vars.clone();
+                Ok(Some(impl_args)) if !opaque_var || obligations.is_empty() => {
+                    let base_len = mark.0.0;
+                    let (updates, added, diverges) = self.capture_var_delta(mark.0);
                     self.rollback_vars(mark.0);
-                    found.push(((block, impl_args), Vars { bound, projections, obligations }));
+                    found.push(((block, impl_args), Vars { base_len, updates, added, diverges, projections, obligations }));
                 }
-                Ok(None) => self.rollback_vars(mark.0),
+                Ok(Some(_)) | Ok(None) => self.rollback_vars(mark.0),
                 Err(err) => {
                     self.rollback_vars(mark.0);
                     return Err(err);
@@ -156,15 +169,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// Takes on the bindings and deferred work of the impl trial `vars`.
     pub(super) fn adopt(&mut self, vars: Vars) {
-        if self.trail_depth > 0 {
-            let shared = self.vars.len().min(vars.bound.len());
-            for i in 0..shared {
-                if self.vars[i] != vars.bound[i] {
-                    self.var_trail.push((i as u32, self.vars[i]));
-                }
-            }
-        }
-        self.vars = vars.bound;
+        self.apply_var_delta(vars.base_len, &vars.updates, &vars.added, &vars.diverges);
         self.projections.extend(vars.projections);
         self.obligations.extend(vars.obligations);
     }
@@ -197,15 +202,19 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether every impl in `found` sets the trait arguments `args` alike, so that specialization, not inference, picks among them.
     fn same_trait_args(&mut self, found: &[(Picked, Vars)], args: &[Ty]) -> bool {
-        let saved = self.vars.clone();
-        let mut each = found.iter().map(|(_, vars)| {
-            self.vars = vars.bound.clone();
-            args.iter().map(|&arg| self.substitute(arg)).collect::<Vec<Ty>>()
-        });
-        let first = each.next();
-        let same = each.all(|other| Some(&other) == first.as_ref());
-        self.vars = saved;
-        same
+        let mut first: Option<Vec<Ty>> = None;
+        for (_, vars) in found {
+            let mark = self.mark_vars();
+            self.apply_var_delta(vars.base_len, &vars.updates, &vars.added, &vars.diverges);
+            let sub: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
+            self.rollback_vars(mark);
+            match &first {
+                None => first = Some(sub),
+                Some(prev) if *prev != sub => return false,
+                _ => {}
+            }
+        }
+        true
     }
 
     fn most_specialized(&mut self, found: Vec<(Picked, Vars)>) -> Result<Vec<(Picked, Vars)>> {
@@ -285,8 +294,10 @@ impl<'a> Infer<'_, 'a> {
         Ok(found)
     }
     fn blanket(&mut self, block: ImplRef) -> Result<bool> {
-        let (args, self_ty) = self.fresh_impl(block)?;
-        Ok(args.contains(&self_ty))
+        self.probe(|infer| {
+            let (args, self_ty) = infer.fresh_impl(block)?;
+            Ok(args.contains(&self_ty))
+        })
     }
 
     /// The crates whose impls of `of` may apply to `self_ty` at `args`: the trait's, each named type's, and the body's own while a type is still unknown, since an impl there may name the type it becomes.
@@ -457,7 +468,11 @@ impl<'a> Infer<'_, 'a> {
         if self.object_holds(of, ty, &args) == Some(true) {
             return Ok(true);
         }
-        self.impl_holds((arena, home, path), (of, ty, &args), depth)
+        let held = self.impl_holds((arena, home, path), (of, ty, &args), depth)?;
+        if held && self.is_callable_trait(of) {
+            return self.callable_bound_holds((arena, home, bound), (of, path, ty), depth);
+        }
+        Ok(held)
     }
 
     /// Whether the compiler, not an impl, decides that `ty` implements trait `of`: for its marker and auto traits, except `Copy` and `Clone` of a struct, enum or union, which derives and std write impls for.
@@ -494,6 +509,9 @@ impl<'a> Infer<'_, 'a> {
                 let held = !found.is_empty();
                 if !held && let Some(key) = key {
                     self.cache_selection(key, None, state);
+                }
+                if held && self.obligation_open(ty, args) {
+                    self.obligations.push((of, std::iter::once(ty).chain(args.iter().copied()).collect()));
                 }
                 Ok(held)
             }
@@ -747,19 +765,12 @@ impl<'a> Infer<'_, 'a> {
         self.frame_item = Some(item);
         self.block = self.cx.owner_impl(item);
         let mut direct = Vec::new();
-        if let Some(of) = self.cx.owner_trait(item) {
-            direct.push(of);
-        }
-        if let Some(block) = self.block
-            && let Some(of) = self.cx.impl_trait(block)
-        {
-            direct.push(of);
-        }
-        let home = self.home;
-        for (header, src) in self.headers()? {
+        direct.extend(self.cx.owner_trait(item));
+        direct.extend(self.block.and_then(|block| self.cx.impl_trait(block)));
+        for (header, src, home) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
             let bounds: Vec<u32> = type_params(generics).flat_map(|g| arena.list(g.bounds).iter().copied()).chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied())).collect();
-            let found = self.in_source(src, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
+            let found = self.in_source_home(src, home, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
             direct.extend(found);
         }
         self.implied_traits(direct)

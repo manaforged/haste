@@ -1,13 +1,18 @@
 mod carry;
+mod decided;
 mod eval;
+mod ret;
 mod sink;
+mod stored;
+mod tail;
 mod widen;
 
 use crate::fold::extend;
 use crate::ir::{Block, Domain, Function, Inst, InstData, IntCC, Op, SigRef, Value};
 
+pub(crate) use self::eval::is_bool_val;
 use self::eval::{
-    EdgeSeed, EvalState, ThreadCx, bind, cmp_implies, eval_cond_truth, eval_op, fact_of, is_bool_val, lookup, lookup_const, seed_edge,
+    EdgeSeed, EvalState, ThreadCx, bind, cmp_implies, eval_cond_truth, eval_op, fact_of, lookup, lookup_const,
     step_inst,
 };
 
@@ -126,11 +131,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>],
         return None;
     }
     let mut state = EvalState::default();
-    match seed {
-        EdgeSeed::None => {}
-        EdgeSeed::Brif(cond, taken) => seed_edge(func, cx, cond, taken, 0, (&mut state.local_consts, &mut state.edge_cmps)),
-        EdgeSeed::Const(val, imm) => state.local_consts.push((val, imm)),
-    }
+    state.seed(func, cx, disp, seed);
     let seeded = state.seeded();
     if redefines(func, disp, &seeded) {
         return None;
@@ -215,7 +216,7 @@ fn resolve_emit_val(
     func.types.push(func.ty(val));
     consts.push(Some(imm));
     let c_inst = Inst(func.insts.len() as u32);
-    func.insts.push(InstData { op: Op::Const(imm), result: Some(c_val) });
+    func.insts.push(InstData { op: Op::Const(imm), result: Some(c_val), loc: 0 });
     inserted.push(c_inst);
     emit_map.push((val, c_val));
     c_val
@@ -240,7 +241,7 @@ fn emit_needed(func: &mut Function, pred: Block, (consts, uses): (&mut Vec<Optio
         func.types.push(ty);
         consts.push(imm_opt);
         let new_inst = Inst(func.insts.len() as u32);
-        func.insts.push(InstData { op: new_op, result: Some(new_val) });
+        func.insts.push(InstData { op: new_op, result: Some(new_val), loc: 0 });
         inserted.push(new_inst);
         emit_map.push((res, new_val));
     }
@@ -309,7 +310,45 @@ fn eval_pair_ok(func: &Function, disp: Block, et: &Eval, ef: &Eval) -> bool {
     }
 }
 
+/// Splits each branch on a select with one constant arm into a branch on the select's condition, whose constant side goes straight to its target, and a new block that branches on the other arm when that arm is a comparison, a load, a block parameter or a logic op on flags.
+fn split_select_branches(func: &mut Function) -> bool {
+    let uses = func.use_counts();
+    let defs = crate::fold::defs(func);
+    let konst = |v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
+    let compare = |v: Value| {
+        defs[v.index()].is_none_or(|inst| match func.insts[inst.index()].op {
+            Op::Icmp(..) | Op::Load(..) => true,
+            Op::Binary(crate::ir::Binary::Band | crate::ir::Binary::Bor | crate::ir::Binary::Bxor, ..) => func.ty(v) == crate::ir::Type::I8,
+            _ => false,
+        })
+    };
+    let mut splits = Vec::new();
+    for block in &func.blocks {
+        let Some(&term) = block.insts.last() else { continue };
+        let Op::Brif(sel, ..) = func.insts[term.index()].op else { continue };
+        let Some((cond, then, otherwise)) = select_arms(func, &defs, sel).filter(|_| uses[sel.index()] == 1) else { continue };
+        match (konst(then), konst(otherwise)) {
+            (Some(k), None) if compare(otherwise) => splits.push((term, cond, k != 0, otherwise, true)),
+            (None, Some(k)) if compare(then) => splits.push((term, cond, k != 0, then, false)),
+            _ => {}
+        }
+    }
+    for &(term, cond, fixed, other, on_true) in &splits {
+        let Op::Brif(_, then, then_args, otherwise, else_args) = func.insts[term.index()].op.clone() else { continue };
+        let direct = if fixed { (then, then_args.clone()) } else { (otherwise, else_args.clone()) };
+        let inner = func.add(Op::Brif(other, then, then_args, otherwise, else_args), None);
+        let rest = Block(func.blocks.len() as u32);
+        func.blocks.push(crate::ir::BlockData { params: Vec::new(), insts: vec![inner] });
+        func.insts[term.index()].op = if on_true { Op::Brif(cond, direct.0, direct.1, rest, Vec::new()) } else { Op::Brif(cond, rest, Vec::new(), direct.0, direct.1) };
+    }
+    if !splits.is_empty() { func.bump_cfg(); }
+    !splits.is_empty()
+}
+
 fn select_arms(func: &Function, defs: &[Option<Inst>], value: Value) -> Option<(Value, Value, Value)> {
+    if func.is_unpredictable(value) {
+        return None;
+    }
     match func.insts[defs.get(value.index()).copied().flatten()?.index()].op {
         Op::Select(cond, then, otherwise) => Some((cond, then, otherwise)),
         _ => None,
@@ -419,14 +458,17 @@ fn brif_arm(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Blo
     if target != disp {
         return None;
     }
-    let eval = eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Brif(*cond, taken))?;
-    if eval.chosen_target == target
-        || non_const_needed(&eval) > MAX_BRIF_SPEC_OPS
-        || (!eval.resolved_branch && non_const_needed(&eval) > 0)
-        || (!eval.carry.values.is_empty() && func.successors(pred).any(|s| s == eval.chosen_target))
-    {
-        return None;
-    }
+    let ok = |eval: &Eval, strict: bool| {
+        let needed = non_const_needed(eval);
+        eval.chosen_target != target
+            && needed <= MAX_BRIF_SPEC_OPS
+            && (eval.resolved_branch || needed == 0)
+            && (eval.carry.values.is_empty() || !func.successors(pred).any(|s| s == eval.chosen_target))
+            && (!strict || (eval.resolved_branch && needed == 0 && eval.carry.values.is_empty()))
+    };
+    let eval = eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Brif(*cond, taken))
+        .filter(|eval| ok(eval, false))
+        .or_else(|| eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Equal(*cond, taken)).filter(|eval| ok(eval, true)))?;
     Some(carry::commit(func, cx, single, pred, eval))
 }
 
@@ -541,6 +583,27 @@ fn threadable(func: &Function, pinned: &[bool]) -> bool {
     (0..func.blocks.len() as u32).map(Block).any(|pred| func.successors(pred).any(|disp| disp != pred && dispatches(func, pinned, disp)))
 }
 
+/// The blocks below the immediate dominator of each block holding an unpredictable select that reach that block, which together decide its condition.
+pub(crate) fn unpredictable_region(func: &Function, cfg: &crate::cfg::Cfg) -> Vec<bool> {
+    let mut region = vec![false; func.blocks.len()];
+    if !func.has_unpredictable() {
+        return region;
+    }
+    for (index, block) in func.blocks.iter().enumerate() {
+        let marked = block.insts.iter().any(|inst| func.insts[inst.index()].result.is_some_and(|res| func.is_unpredictable(res)));
+        if !marked || !cfg.reachable[index] {
+            continue;
+        }
+        let here = Block(index as u32);
+        let wall = cfg.idom[index].unwrap_or(here);
+        let body = crate::cfg::natural_loop(cfg, wall, vec![here]).body;
+        for (at, (inside, hit)) in region.iter_mut().zip(body).enumerate() {
+            *inside |= hit && (at != wall.index() || at == index);
+        }
+    }
+    region
+}
+
 /// Threads correlated constant- and range-condition jump chains through small pure dispatcher blocks.
 pub(crate) fn run(func: &mut Function) -> Domain {
     let Some(entry) = func.entry else {
@@ -549,6 +612,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
     }
+    let split = split_select_branches(func) | decided::run(func) | stored::run(func) | tail::run(func);
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
     for data in &func.insts {
@@ -557,8 +621,13 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             pinned[handler.index()] = true;
         }
     }
+    if func.has_unpredictable() {
+        let region = unpredictable_region(func, &func.cfg());
+        pinned.iter_mut().zip(region).for_each(|(pin, inside)| *pin |= inside);
+    }
     let mut consts = Vec::new();
-    let mut any = false;
+    let opened = ret::open_returns(func, &pinned);
+    let mut any = split;
     for round in 0..16 {
         let mut defs = vec![None; func.types.len()];
         for block in &func.blocks {
@@ -630,6 +699,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         func.bump_cfg();
         any = true;
     }
+    any |= ret::close_returns(func, &opened) | !opened.is_empty();
     let widened = widen::run(func);
     let mut dirty = if any || widened {
         crate::fold::prune(func, entry);
@@ -648,9 +718,14 @@ pub(crate) fn compact(func: &mut Function) {
     }
     let mut map: Vec<Option<Value>> = vec![None; func.types.len()];
     let mut types = Vec::new();
+    let old_flags = std::mem::take(&mut func.value_flags);
+    let mut flags = Vec::new();
     let mut take = |value: Value| -> Value {
         *map[value.index()].get_or_insert_with(|| {
             types.push(func.types[value.index()]);
+            if !old_flags.is_empty() {
+                flags.push(old_flags.get(value.index()).copied().unwrap_or(0));
+            }
             Value(types.len() as u32 - 1)
         })
     };
@@ -661,7 +736,7 @@ pub(crate) fn compact(func: &mut Function) {
         block.params.iter_mut().for_each(|param| *param = take(*param));
         for inst in &mut block.insts {
             let slot = &mut func.insts[inst.index()];
-            let mut data = InstData { op: std::mem::replace(&mut slot.op, Op::Trap), result: slot.result };
+            let mut data = InstData { op: std::mem::replace(&mut slot.op, Op::Trap), result: slot.result, loc: slot.loc };
             data.result = data.result.map(&mut take);
             if let Op::Call { results, .. } = &mut data.op {
                 results.iter_mut().for_each(|result| *result = take(*result));
@@ -675,6 +750,10 @@ pub(crate) fn compact(func: &mut Function) {
     func.insts = insts;
     types.shrink_to_fit();
     func.types = types;
+    if flags.iter().all(|&bits| bits == 0) {
+        flags.clear();
+    }
+    func.value_flags = flags;
     compact_blocks(func);
     compact_sigs(func);
 }

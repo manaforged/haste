@@ -104,6 +104,14 @@ pub trait Slots {
     fn vtable_entries(&self, _id: VtableId) -> Option<Vec<VtableEntry>> {
         None
     }
+    /// Encodes `plan` into substrate bytes, toolchain items only when `is_sysroot`, or `None` when this image keeps no plans across builds.
+    fn encode_plan(&self, _cx: &Context<'_>, _reached: &Reached, _is_sysroot: bool, _plan: &RelocPlan) -> Option<Vec<u8>> {
+        None
+    }
+    /// Decodes plan bytes that `encode_plan` wrote, or `None` when they do not resolve in this image.
+    fn decode_plan(&self, _cx: &Context<'_>, _reached: &Reached, _is_sysroot: bool, _bytes: &[u8]) -> Option<RelocPlan> {
+        None
+    }
     /// Resolves a symbolic relocation entry to its concrete 64-bit value in this image.
     fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
         match *sym {
@@ -274,6 +282,9 @@ pub struct Lower<'l, 'a> {
     index: usize,
     resume: Option<coroutine::Resume>,
     overflow_checks: bool,
+    child_rodata: Vec<(RodataId, Option<Vec<u8>>)>,
+    /// The statics whose read-only bytes are being built now, which a cycle of statics that point to each other reaches again.
+    blob_statics: rustc_hash::FxHashSet<(ItemRef, crate::sema::substs::Substs)>,
 }
 
 /// Whether `item` is a static, whose reached instance writes its value into the static's cell.
@@ -281,12 +292,56 @@ pub fn is_static(cx: &Context<'_>, item: ItemRef) -> bool {
     cx.item(item).1.kind == ItemKind::Static
 }
 
-impl Lower<'_, '_> {
-    fn run(&mut self) -> Result<()> {
+impl<'l, 'a> Lower<'l, 'a> {
+    fn new(
+        cx: &'l mut Context<'a>,
+        (reached, slots, inline): (&'l Reached, &'l dyn Slots, &'l mut Inline),
+        (index, source, body, typed): (usize, ItemRef, &'l Body, &'l Typed),
+        (b, mode): (FunctionBuilder<'l>, stencil::LowerMode),
+        (relocs, reloc_plan): (&'l mut RelocVec, &'l mut Vec<reloc::RelocStep>),
+    ) -> Self {
+        let src = cx.body_src(source);
+        let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
+        Self {
+            cx,
+            reached,
+            slots,
+            inline,
+            body,
+            src,
+            typed,
+            b,
+            locals: vec![None; typed.locals.len()],
+            loops: Vec::new(),
+            try_exits: Vec::new(),
+            open: true,
+            dead: None,
+            sret: None,
+            dict_param: None,
+            mode,
+            relocs,
+            reloc_plan,
+            promoted_seq: 0,
+            cycle_root: usize::MAX,
+            owned: Vec::new(),
+            flags: Vec::new(),
+            moved: Default::default(),
+            extended: Default::default(),
+            pending: Vec::new(),
+            index,
+            resume: None,
+            overflow_checks,
+            child_rodata: Vec::new(),
+            blob_statics: rustc_hash::FxHashSet::default(),
+        }
+    }
+
+    fn begin_entry(&mut self) -> Result<(Block, Block, Vec<Value>)> {
         let entry = self.b.create_block();
         self.b.append_block_params_for_function_params(entry);
+        let entry_params = self.b.block_params(entry).to_vec();
         if self.mode == stencil::LowerMode::Dict {
-            self.dict_param = self.b.block_params(entry).last().copied();
+            self.dict_param = entry_params.last().copied();
         }
         self.b.switch_to_block(entry);
         let (prologue, start) = (self.b.create_block(), self.b.create_block());
@@ -294,12 +349,10 @@ impl Lower<'_, '_> {
         self.b.switch_to_block(start);
         self.moved = self.moved_paths()?;
         self.declare_params(entry)?;
-        let filling = is_static(self.cx, self.reached.list[self.index].0.0);
-        let value = self.root_value()?;
-        match filling {
-            true => self.fill_static(value)?,
-            false => self.finish(value)?,
-        }
+        Ok((prologue, start, entry_params))
+    }
+
+    fn finish_prologue(&mut self, prologue: Block, start: Block) {
         self.enter(prologue);
         for slot in std::mem::take(&mut self.flags) {
             let zero = self.ins().iconst(Type::I8, 0);
@@ -308,6 +361,17 @@ impl Lower<'_, '_> {
         self.jump(start, &[]);
         self.close();
         self.seal();
+    }
+
+    fn run(&mut self) -> Result<()> {
+        let (prologue, start, _) = self.begin_entry()?;
+        let filling = is_static(self.cx, self.reached.list[self.index].0.0);
+        let value = self.root_value()?;
+        match filling {
+            true => self.fill_static(value)?,
+            false => self.finish(value)?,
+        }
+        self.finish_prologue(prologue, start);
         self.finish_resume()
     }
 

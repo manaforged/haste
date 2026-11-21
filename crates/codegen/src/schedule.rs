@@ -1,8 +1,11 @@
+mod branches;
+mod copies;
+mod products;
 mod sink;
 
 use std::time::Instant;
 
-use crate::ir::{Binary, Block, Domain, Function, Op};
+use crate::ir::{Binary, Block, Domain, Function, Inst, Op, Type};
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,13 +123,13 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Thread => thread::run(func),
         Pass::IfConv => ifconv::run(func),
         Pass::Rotate => rotate::run(func),
-        Pass::Unroll => unroll::run(func),
+        Pass::Unroll => unroll::run(func, target),
         Pass::Licm => licm::run(func),
         Pass::Lsr => lsr::run(func),
-        Pass::Switch => switch::run(func),
+        Pass::Switch => switch::run(func, target),
         Pass::Returns => returns::run(func),
         Pass::TailRec => {
-            let did = tailrec::run(func);
+            let did = tailrec::run(func, target);
             if !did.is_empty() {
                 fold::compact(func);
             }
@@ -175,7 +178,8 @@ impl PassState {
     }
 }
 
-fn has_live_op(func: &Function, mut pred: impl FnMut(&Op) -> bool) -> bool {
+/// Returns whether any live instruction in `func.blocks` satisfies `pred`.
+pub(crate) fn has_live_op(func: &Function, mut pred: impl FnMut(&Op) -> bool) -> bool {
     func.blocks.iter().any(|block| block.insts.iter().any(|&inst| pred(&func.insts[inst.index()].op)))
 }
 
@@ -234,7 +238,8 @@ fn should_run(func: &Function, pass: Pass, state: &mut PassState) -> bool {
         Pass::Thread | Pass::IfConv | Pass::Returns => multi,
         Pass::Switch => has_live_op(func, |op| matches!(op, Op::Select(..) | Op::Brif(..) | Op::BrTable(..))),
         Pass::Rotate | Pass::Unroll | Pass::Licm | Pass::Lsr => state.has_loops(func),
-        Pass::Fill | Pass::Promote | Pass::Cse | Pass::Loads | Pass::TailRec => true,
+        Pass::Promote => !func.slots.is_empty(),
+        Pass::Fill | Pass::Cse | Pass::Loads | Pass::TailRec => true,
     }
 }
 
@@ -304,6 +309,13 @@ fn strip_assumes(func: &mut Function) -> bool {
     stripped
 }
 
+/// Whether `inst` computes a branch condition: a compare, or an `I8` and/or of conditions.
+pub(crate) fn is_condition(func: &Function, inst: Inst) -> bool {
+    let data = &func.insts[inst.index()];
+    matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))
+        || (matches!(data.op, Op::Binary(Binary::Band | Binary::Bor, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I8))
+}
+
 fn has_sinkable_compare(func: &Function) -> bool {
     func.blocks.iter().any(|block| {
         if block.insts.len() < 3 {
@@ -311,7 +323,7 @@ fn has_sinkable_compare(func: &Function) -> bool {
         }
         let Some(first_cmp) = block.insts[..block.insts.len() - 2]
             .iter()
-            .position(|&inst| matches!(func.insts[inst.index()].op, Op::Icmp(..) | Op::Fcmp(..)))
+            .position(|&inst| is_condition(func, inst))
         else {
             return false;
         };
@@ -321,17 +333,19 @@ fn has_sinkable_compare(func: &Function) -> bool {
     })
 }
 
-/// Moves each single-use compare read by a `Brif` or `Select` of its own block to sit directly before that reader.
-pub(crate) fn sink_compares(func: &mut Function) {
+/// Moves each single-use compare, or `I8` and/or of conditions, read by a `Brif` or `Select` of its own block to sit directly before that reader.
+pub(crate) fn sink_compares(func: &mut Function) -> bool {
     if !has_sinkable_compare(func) {
-        return;
+        return false;
     }
     let uses = func.use_counts();
-    for block in &mut func.blocks {
+    let mut moved = false;
+    let mut blocks = std::mem::take(&mut func.blocks);
+    for block in &mut blocks {
         let mut at = 0;
         while at < block.insts.len() {
             let data = &func.insts[block.insts[at].index()];
-            let Some(cond) = data.result.filter(|c| uses[c.index()] == 1 && matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))) else {
+            let Some(cond) = data.result.filter(|c| uses[c.index()] == 1 && is_condition(func, block.insts[at])) else {
                 at += 1;
                 continue;
             };
@@ -344,16 +358,19 @@ pub(crate) fn sink_compares(func: &mut Function) {
                 Some(gap) if gap > 0 && matches!(func.insts[block.insts[at + 1 + gap].index()].op, Op::Brif(c, ..) | Op::Select(c, ..) if c == cond) => {
                     let inst = block.insts.remove(at);
                     block.insts.insert(at + gap, inst);
+                    moved = true;
                 }
                 _ => at += 1,
             }
         }
     }
+    func.blocks = blocks;
+    moved
 }
 
-pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Target) {
+fn build_plan<'t>(moves: promote::Moves, target: &'t crate::Target) -> Plan<'t> {
     let effort = target.effort;
-    let plan = match effort {
+    match effort {
         Effort::Quick => Plan {
             moves: promote::Moves::Words,
             effort,
@@ -370,27 +387,67 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
             budget: 32,
             finish: FULL_FINISH,
         },
-    };
+    }
+}
+
+fn rerun_after_rewrite(func: &mut Function, plan: &Plan, state: &mut PassState) {
+    state.fold_clean = false;
+    state.merge_clean = false;
+    run_fixpoint(func, plan, state);
+}
+
+fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
+    if plan.moves == promote::Moves::Guided {
+        return;
+    }
+    if strip_assumes(func) {
+        rerun_after_rewrite(func, plan, state);
+    }
+    if plan.effort == Effort::Full {
+        let wide_changed = (plan.target.arch == crate::Arch::X64 && crate::native::divide_by_word(func)) | crate::pairs::split(func);
+        if wide_changed {
+            rerun_after_rewrite(func, plan, state);
+        }
+        if crate::slp::run(func) {
+            rerun_after_rewrite(func, plan, state);
+        }
+    }
+}
+
+fn run_backend_prep(func: &mut Function, plan: &Plan) {
+    if plan.moves != promote::Moves::Guided {
+        if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
+            crate::algebra::compare_offsets(func);
+        }
+        sink::run(func, plan.moves == promote::Moves::Split && plan.effort == Effort::Full);
+    }
+    let x64_full = plan.target.arch == crate::Arch::X64 && plan.effort == Effort::Full;
+    if x64_full {
+        branches::split_conditions(func);
+    }
+    sink_compares(func);
+    if x64_full {
+        products::adjoin(func);
+        copies::pair(func);
+    }
+}
+
+pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Target) {
+    let plan = build_plan(moves, target);
     let mut state = PassState::new();
     run_step(func, &plan, &mut state, INIT[0]);
     let fold_init = run_step(func, &plan, &mut state, INIT[1]);
     let merge_init = run_step(func, &plan, &mut state, INIT[2]);
     state.fold_clean = fold_init.is_empty() && merge_init.is_empty();
     state.merge_clean = merge_init.is_empty();
-    run_fixpoint(func, &plan, &mut state);
-    if moves != promote::Moves::Guided && strip_assumes(func) {
+    if moves == promote::Moves::Split && plan.effort == Effort::Full && crate::loads::elide_early(func) {
         state.fold_clean = false;
         state.merge_clean = false;
-        run_fixpoint(func, &plan, &mut state);
     }
+    run_fixpoint(func, &plan, &mut state);
+    run_late_lowering(func, &plan, &mut state);
     for &pass in plan.finish {
         run_step(func, &plan, &mut state, pass);
     }
-    if moves != promote::Moves::Guided && has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
-        crate::algebra::compare_offsets(func);
-    }
-    if moves != promote::Moves::Guided {
-        sink::run(func);
-    }
-    sink_compares(func);
+    run_backend_prep(func, &plan);
 }

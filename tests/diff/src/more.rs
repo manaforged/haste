@@ -406,6 +406,25 @@ pub fn case_diverging_closure(n: i64) -> i64 {
     Some(n).unwrap_or_else(|| panic!("never")) + 1
 }
 
+pub fn case_reg_trial_sum_obligation(seed: i64) -> i64 {
+    let vals = [seed as u32 & 7, 1, 2, 4, (seed.unsigned_abs() as u32) % 5];
+    let flag = (seed & 1) != 0;
+    let total: u32 = vals
+        .iter()
+        .map(|&x| {
+            let mut n = 0;
+            for shift in 0..3 {
+                if ((x >> shift) & 1) != 0 {
+                    n += 1;
+                }
+            }
+            n
+        })
+        .sum::<u32>()
+        + u32::from(flag);
+    i64::from(total)
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_lazy_table", case_lazy_table),
     ("case_wide_float", case_wide_float),
@@ -434,4 +453,5 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_self_static", case_self_static),
     ("case_const_compound_types", case_const_compound_types),
     ("case_macro_opaque_forward", case_macro_opaque_forward),
+    ("case_reg_trial_sum_obligation", case_reg_trial_sum_obligation),
 ];

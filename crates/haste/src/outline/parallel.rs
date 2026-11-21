@@ -147,7 +147,9 @@ fn level(shared: &Shared, krate: usize, holder: &mut Crate, seen: &[Option<Arc<V
     shared.cache.read_all(&paths);
     let deps = &shared.deps[krate];
     for module in modules {
-        Loader::new(krate, shared.cache, Others::Views(seen), deps, holder).load_module(module)?;
+        let others = Others::Views(seen);
+        Loader::new(krate, shared.cache, others, deps, holder).load_module(module)?;
+        super::resolve_macro_includes(krate, shared.cache, others, deps, holder, module)?;
     }
     Ok(())
 }

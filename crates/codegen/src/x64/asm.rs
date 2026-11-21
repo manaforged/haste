@@ -1,3 +1,7 @@
+mod relax;
+
+use relax::{Disp, Fixup};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub(crate) enum Reg {
@@ -55,20 +59,27 @@ pub(crate) struct Mem {
     pub base: Reg,
     pub index: Option<(Reg, u8)>,
     pub disp: i32,
+    /// The symbol this address is relative to, through `rip`, in place of `base`.
+    pub rip: Option<u32>,
 }
 
 impl Mem {
     pub fn new(base: Reg, disp: i32) -> Self {
-        Self { base, index: None, disp }
+        Self { base, index: None, disp, rip: None }
+    }
+
+    /// The address `disp` bytes past symbol `sym`, reached relative to `rip`.
+    pub fn rip(sym: u32, disp: i32) -> Self {
+        Self { base: Reg::Rbp, index: None, disp, rip: Some(sym) }
     }
 
     pub fn sib(base: Reg, index: Reg, shift: u8, disp: i32) -> Self {
         debug_assert!(index != Reg::Rsp && shift <= 3);
-        Self { base, index: Some((index, shift)), disp }
+        Self { base, index: Some((index, shift)), disp, rip: None }
     }
 
     pub fn offset(self, by: i32) -> Self {
-        Self { base: self.base, index: self.index, disp: self.disp + by }
+        Self { disp: self.disp + by, ..self }
     }
 }
 
@@ -76,6 +87,13 @@ impl Mem {
 pub(crate) enum Rm {
     Reg(u8),
     Mem(Mem),
+}
+
+impl Rm {
+    /// True when a byte access to this operand names spl, bpl, sil or dil, which needs a REX prefix.
+    fn byte_rex(self) -> bool {
+        matches!(self, Rm::Reg(4..=7))
+    }
 }
 
 impl From<Reg> for Rm {
@@ -208,9 +226,11 @@ pub(crate) struct Asm {
     pub code: Vec<u8>,
     pub avx: bool,
     labels: Vec<Option<u32>>,
-    pub(super) fixups: Vec<(u32, Label)>,
+    pub(super) fixups: Vec<Fixup>,
     pub(super) table_fixups: Vec<(u32, Label, Label)>,
     pub(super) tail: Option<super::imm::Tail>,
+    /// The offset and symbol of each `rip`-relative displacement, holding its addend.
+    pub(super) rips: Vec<(u32, u32)>,
 }
 
 impl Asm {
@@ -230,6 +250,11 @@ impl Asm {
             Rm::Reg(reg) => return self.code.push(0xC0 | (r & 7) << 3 | (reg & 7)),
             Rm::Mem(mem) => mem,
         };
+        if let Some(sym) = mem.rip {
+            self.code.push((r & 7) << 3 | 5);
+            self.rips.push((self.pos(), sym));
+            return self.code.extend(mem.disp.to_le_bytes());
+        }
         let base = mem.base as u8;
         let mode = if mem.disp == 0 && base & 7 != 5 {
             0
@@ -276,7 +301,7 @@ impl Asm {
             (false, false) => &[],
         };
         let opcode = if size == Size::B { byte } else { wide };
-        self.encode(prefix, size == Size::Q, opcode, r, rm, size == Size::B);
+        self.encode(prefix, size == Size::Q, opcode, r, rm, size == Size::B && (Rm::Reg(r).byte_rex() || rm.byte_rex()));
     }
 
     pub fn load(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) {
@@ -286,7 +311,9 @@ impl Asm {
             Size::D => (false, &[0x8B]),
             Size::Q => (true, &[0x8B]),
         };
-        self.encode(&[], w, opcode, dst as u8, src.into(), size == Size::B);
+        let (start, src) = (self.pos(), src.into());
+        self.encode(&[], w, opcode, dst as u8, src, size == Size::B && src.byte_rex());
+        self.flags_kept(start);
     }
 
     pub fn load_signed(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) {
@@ -296,11 +323,15 @@ impl Asm {
             Size::D => &[0x63],
             Size::Q => &[0x8B],
         };
-        self.encode(&[], true, opcode, dst as u8, src.into(), size == Size::B);
+        let start = self.pos();
+        self.encode(&[], true, opcode, dst as u8, src.into(), false);
+        self.flags_kept(start);
     }
 
     pub fn store(&mut self, size: Size, dst: Mem, src: Reg) {
+        let start = self.pos();
         self.sized(false, size, (&[0x88], &[0x89]), src as u8, dst.into());
+        self.flags_kept(start);
     }
 
     pub fn store_slot_reloc(&mut self, dst: Mem) -> u32 {
@@ -311,7 +342,9 @@ impl Asm {
     }
 
     pub fn mov(&mut self, dst: Reg, src: Reg) {
+        let start = self.pos();
         self.encode(&[], true, &[0x8B], dst as u8, src.into(), false);
+        self.flags_kept(start);
     }
 
     pub fn mov_slot_reloc(&mut self, dst: Reg) -> u32 {
@@ -353,10 +386,10 @@ impl Asm {
         self.alu_flags(op);
         if let Ok(small) = i8::try_from(imm) {
             self.encode(&[], w, &[0x83], op as u8, dst, false);
-            self.code.push(small as u8);
+            self.imm(&[small as u8]);
         } else {
             self.encode(&[], w, &[0x81], op as u8, dst, false);
-            self.code.extend(imm.to_le_bytes());
+            self.imm(&imm.to_le_bytes());
         }
     }
 
@@ -374,17 +407,17 @@ impl Asm {
         self.alu_flags(op);
         match size {
             Size::B => {
-                self.encode(&[], false, &[0x80], op as u8, dst, matches!(dst, Rm::Reg(_)));
-                self.code.push(imm as u8);
+                self.encode(&[], false, &[0x80], op as u8, dst, dst.byte_rex());
+                self.imm(&[imm as u8]);
             }
             Size::W => match i8::try_from(imm as i16) {
                 Ok(small) => {
                     self.encode(&[0x66], false, &[0x83], op as u8, dst, false);
-                    self.code.push(small as u8);
+                    self.imm(&[small as u8]);
                 }
                 Err(_) => {
                     self.encode(&[0x66], false, &[0x81], op as u8, dst, false);
-                    self.code.extend((imm as u16).to_le_bytes());
+                    self.imm(&(imm as u16).to_le_bytes());
                 }
             },
             Size::D => self.alu_imm32(op, dst, imm),
@@ -405,7 +438,7 @@ impl Asm {
 
     pub fn test_imm8(&mut self, reg: Reg, imm: u8) {
         self.flags_overwritten();
-        self.encode(&[], false, &[0xF6], 0, reg.into(), true);
+        self.encode(&[], false, &[0xF6], 0, reg.into(), Rm::from(reg).byte_rex());
         self.code.push(imm);
     }
 
@@ -413,11 +446,7 @@ impl Asm {
     pub fn test_imm_sized(&mut self, size: Size, rm: impl Into<Rm>, imm: i32) {
         self.flags_overwritten();
         self.sized(false, size, (&[0xF6], &[0xF7]), 0, rm.into());
-        match size {
-            Size::B => self.code.push(imm as u8),
-            Size::W => self.code.extend((imm as i16).to_le_bytes()),
-            _ => self.code.extend(imm.to_le_bytes()),
-        }
+        self.imm_sized(size, imm);
     }
 
     pub fn imul_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) {
@@ -431,7 +460,7 @@ impl Asm {
     /// `dst = src * imm`.
     pub fn imul_imm_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, imm: i32) {
         self.encode(&[], size == Size::Q, &[0x69], dst as u8, src.into(), false);
-        self.code.extend(imm.to_le_bytes());
+        self.imm(&imm.to_le_bytes());
     }
 
     /// `dst = src * imm`.
@@ -473,7 +502,7 @@ impl Asm {
 
     pub fn shld_imm(&mut self, size: Size, dst: impl Into<Rm>, src: Reg, imm: u8) {
         self.encode(&[], size == Size::Q, &[0x0F, 0xA4], src as u8, dst.into(), false);
-        self.code.push(imm);
+        self.imm(&[imm]);
     }
 
     pub fn shrd(&mut self, dst: Reg, src: Reg) {
@@ -482,7 +511,7 @@ impl Asm {
 
     pub fn shrd_imm(&mut self, size: Size, dst: impl Into<Rm>, src: Reg, imm: u8) {
         self.encode(&[], size == Size::Q, &[0x0F, 0xAC], src as u8, dst.into(), false);
-        self.code.push(imm);
+        self.imm(&[imm]);
     }
 
     pub fn bts(&mut self, reg: Reg, bit: u8) {
@@ -491,7 +520,7 @@ impl Asm {
     }
 
     pub fn setcc(&mut self, cond: Cond, reg: Reg) {
-        self.encode(&[], false, &[0x0F, 0x90 + cond as u8], 0, reg.into(), true);
+        self.encode(&[], false, &[0x0F, 0x90 + cond as u8], 0, reg.into(), Rm::from(reg).byte_rex());
     }
 
     pub fn cmov(&mut self, cond: Cond, dst: Reg, src: impl Into<Rm>) {
@@ -518,7 +547,9 @@ impl Asm {
     }
 
     pub fn lea_sized(&mut self, size: Size, dst: Reg, src: Mem) {
+        let start = self.pos();
         self.encode(&[], size == Size::Q, &[0x8D], dst as u8, src.into(), false);
+        self.flags_kept(start);
     }
 
     pub fn xchg(&mut self, size: Size, dst: Mem, src: Reg) {
@@ -543,12 +574,12 @@ impl Asm {
 
     pub fn sse_imm(&mut self, prefix: &[u8], opcode: &[u8], r: u8, rm: impl Into<Rm>, imm: u8) {
         self.encode(prefix, false, opcode, r, rm.into(), false);
-        self.code.push(imm);
+        self.imm(&[imm]);
     }
 
     pub fn sse_wide_imm(&mut self, prefix: &[u8], opcode: &[u8], r: u8, rm: impl Into<Rm>, imm: u8) {
         self.encode(prefix, true, opcode, r, rm.into(), false);
-        self.code.push(imm);
+        self.imm(&[imm]);
     }
 
     fn pshift_opc(lane_bytes: u32) -> u8 {
@@ -601,7 +632,7 @@ impl Asm {
     /// The three-operand VEX immediate form `dst = src op rm, imm` of `op` at vector length `vl`.
     pub fn vex_imm(&mut self, vl: Vl, op: VexOp, regs: (Xmm, Xmm), rm: impl Into<Rm>, imm: u8) {
         self.vex(vl, op, regs, rm);
-        self.code.push(imm);
+        self.imm(&[imm]);
     }
 
     /// The three-operand VEX.128 form `dst = src op rm` with opcode map `map` and prefix class `pp`.
@@ -633,7 +664,7 @@ impl Asm {
     /// `rorx`: non-destructive 3-operand rotate right `dst = ror(src, imm)`.
     pub fn rorx(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, imm: u8) {
         self.vex3(0b00011, size == Size::Q, 0b11, 0xF0, (dst as u8, 0), src.into());
-        self.code.push(imm);
+        self.imm(&[imm]);
     }
 
     /// `andn`: non-destructive 3-operand `dst = !not_src & src`.
@@ -668,6 +699,11 @@ impl Asm {
     pub fn push(&mut self, reg: Reg) {
         self.rex(false, 0, 0, reg as u8, false);
         self.code.push(0x50 + (reg as u8 & 7));
+    }
+
+    pub fn pop(&mut self, reg: Reg) {
+        self.rex(false, 0, 0, reg as u8, false);
+        self.code.push(0x58 + (reg as u8 & 7));
     }
 
     /// `call` through the eight bytes at the 32-bit absolute address `at`.
@@ -712,19 +748,19 @@ impl Asm {
         self.labels[label.0 as usize] = Some(self.pos());
     }
 
-    fn fixup(&mut self, label: Label) {
-        self.fixups.push((self.pos(), label));
+    fn fixup(&mut self, label: Label, disp: Disp) {
+        self.fixups.push(Fixup { at: self.pos(), label, disp });
         self.code.extend([0; 4]);
     }
 
     pub fn jmp(&mut self, label: Label) {
         self.code.push(0xE9);
-        self.fixup(label);
+        self.fixup(label, Disp::Jmp);
     }
 
     pub fn jcc(&mut self, cond: Cond, label: Label) {
         self.code.extend([0x0F, 0x80 + cond as u8]);
-        self.fixup(label);
+        self.fixup(label, Disp::Jcc);
     }
 
     fn lea_rip_head(&mut self, dst: Reg) -> u32 {
@@ -736,7 +772,7 @@ impl Asm {
 
     pub fn lea_rip(&mut self, dst: Reg, label: Label) {
         self.lea_rip_head(dst);
-        self.fixup(label);
+        self.fixup(label, Disp::Rip);
     }
 
     pub fn lea_rip_reloc(&mut self, dst: Reg) -> u32 {
@@ -748,22 +784,5 @@ impl Asm {
     pub fn table_entry(&mut self, base: Label, target: Label) {
         self.table_fixups.push((self.pos(), base, target));
         self.code.extend([0; 4]);
-    }
-
-    pub fn finish(mut self) -> Result<Vec<u8>, String> {
-        for (at, label) in std::mem::take(&mut self.fixups) {
-            let target = self.labels[label.0 as usize].ok_or("a jump to a label that was never placed")?;
-            let relative = target as i64 - (at as i64 + 4);
-            let at = at as usize;
-            self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
-        }
-        for (at, base, target) in std::mem::take(&mut self.table_fixups) {
-            let base = self.labels[base.0 as usize].ok_or("a jump table without a base label")?;
-            let target = self.labels[target.0 as usize].ok_or("a jump to a label that was never placed")?;
-            let relative = target as i64 - base as i64;
-            let at = at as usize;
-            self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
-        }
-        Ok(self.code)
     }
 }

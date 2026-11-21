@@ -10,7 +10,12 @@ use crate::names::path::Requests;
 use super::Context;
 use super::infer::{LazyTables, Res, Shape, Typed, infer, register};
 use super::substs::Substs;
+use super::summary::thaw;
 mod filter;
+mod order;
+mod wave;
+
+pub use wave::infer_quiet;
 
 use filter::{ReachFilter, collect_filtered_callees, commit_filter_caller, pre_collect_callees};
 use super::ty::{Kind, Ty};
@@ -40,12 +45,20 @@ pub struct Reached {
     /// The bodies whose types have no layout yet, which lowering would fail on.
     pub unlaid: Vec<String>,
     calls: Vec<Vec<usize>>,
+    indirect: Vec<Vec<usize>>,
+    call_sites: super::infer::CallSites,
+    pinned: Vec<bool>,
     states: Vec<ReachedEntry>,
     untyped_count: usize,
     filter: ReachFilter,
 }
 
 impl Reached {
+    /// The typed body of function `index`, or an error naming `name` and why its body did not type-check.
+    pub fn typed(&self, index: usize, name: &str) -> anyhow::Result<&Arc<Typed>> {
+        self.list[index].1.as_ref().map_err(|why| anyhow::anyhow!("{name} did not type-check: {why}"))
+    }
+
     /// `roots` and every function they reach through the bodies that type-checked, each once and after every function it reaches.
     pub fn closure(&self, roots: &[usize]) -> Vec<usize> {
         let mut seen = vec![false; self.list.len()];
@@ -125,53 +138,43 @@ impl Reached {
         self.calls.get(index).map(Vec::as_slice)
     }
 
+    /// Whether reached function `index` has exactly one static direct call site and no indirect or root entry.
+    pub(crate) fn is_sole_called(&self, index: usize) -> bool {
+        self.call_sites.get(index) == Some(1)
+    }
+
+    fn pin_roots(&mut self, roots: &[Instance]) {
+        self.pinned.resize(self.list.len(), false);
+        for inst in roots {
+            if let Some(&id) = self.index.get(inst) { self.pinned[id] = true; }
+        }
+    }
+
     fn link(&mut self, indices: &[usize]) {
         self.calls.resize(self.list.len(), Vec::new());
+        self.indirect.resize(self.list.len(), Vec::new());
+        self.call_sites.retract(indices, &self.calls, &self.indirect);
         let workers = crate::jobs().min(indices.len() / 256);
+        let edges = |at: usize| self.list[at].1.as_ref().map(|t| t.collect_link_edges(&self.index)).unwrap_or_default();
         if workers <= 1 {
-            for &at in indices {
-                self.calls[at] = self.list[at].1.as_ref().map(|typed| collect_link_callees(typed, &self.index)).unwrap_or_default();
-            }
-            return;
-        }
-        let next = AtomicUsize::new(0);
-        let worker = || {
-            let mut local = Vec::new();
-            loop {
-                let start = next.fetch_add(256, Ordering::Relaxed);
-                let Some(slice) = indices.get(start..) else { return local };
-                for &at in &slice[..slice.len().min(256)] {
-                    local.push((at, self.list[at].1.as_ref().map(|t| collect_link_callees(t, &self.index)).unwrap_or_default()));
+            for &at in indices { (self.calls[at], self.indirect[at]) = edges(at); }
+        } else {
+            let next = AtomicUsize::new(0);
+            let worker = || {
+                let mut local = Vec::new();
+                while let Some(slice) = indices.get(next.fetch_add(256, Ordering::Relaxed)..) {
+                    for &at in &slice[..slice.len().min(256)] { local.push((at, edges(at))); }
                 }
-            }
-        };
-        let (own, joined) = std::thread::scope(|scope| {
-            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker)).collect();
-            let own = worker();
-            let joined: Vec<_> = handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect();
-            (own, joined)
-        });
-        for (at, callees) in own.into_iter().chain(joined) {
-            self.calls[at] = callees;
+                local
+            };
+            let (own, joined) = std::thread::scope(|scope| {
+                let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker)).collect();
+                (worker(), handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect::<Vec<_>>())
+            });
+            for (at, (c, i)) in own.into_iter().chain(joined) { (self.calls[at], self.indirect[at]) = (c, i); }
         }
+        super::infer::recount_call_sites(self.list.len(), |at| self.states[at] == ReachedEntry::Settled, &self.calls, &self.indirect, &self.pinned, &mut self.call_sites);
     }
-}
-
-fn collect_link_callees(typed: &Typed, index: &HashMap<Instance, usize>) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut push = |inst: Instance| if let Some(&id) = index.get(&inst) { out.push(id); };
-    match &typed.tables {
-        LazyTables::CheckOnly(check) => {
-            check.calls().for_each(&mut push);
-            push_tail_calls(typed, &mut push);
-        }
-        LazyTables::Poly(poly) => {
-            poly.calls().for_each(&mut push);
-            push_tail_calls(typed, &mut push);
-        }
-        LazyTables::Eager(_) => typed.calls().for_each(push),
-    }
-    out
 }
 
 pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
@@ -194,6 +197,7 @@ pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
 pub fn reach_wave(cx: &mut Context<'_>, reached: &mut Reached, roots: &[Instance], force_commit: bool) {
     let mut initial = reached.take_blocked();
     initial.extend(enqueue(reached, roots.to_vec()));
+    reached.pin_roots(roots);
     let settled = drain_wave(cx, reached, initial, force_commit);
     reached.link(&settled);
 }
@@ -265,6 +269,7 @@ pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], r
     }
     reached.link(dead);
     let found = drain(cx, reached, roots.to_vec());
+    reached.pin_roots(roots);
     reached.link(&found);
     found
 }
@@ -534,10 +539,8 @@ fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
 }
 
 fn run_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], check_undeclared: bool, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
-    let jobs = crate::jobs().max(1);
-    let batch = (wave.len() / jobs).clamp(1, MAX_WORKER_BATCH);
-    let workers = jobs.min(wave.len().div_ceil(batch));
-    if workers <= 1 || wave.len() < MIN_PARALLEL_WAVE {
+    let workers = wave::wave_workers(wave.len());
+    if workers <= 1 {
         return serial_wave(cx, reached, wave, check_undeclared, force_commit);
     }
     parallel_wave(cx, reached, wave, workers, check_undeclared, force_commit)
@@ -650,7 +653,7 @@ fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reach
 }
 
 fn worker_loop(cx: &mut Context<'_>, reached: &Reached, wave: &[usize], next: &AtomicUsize, check_undeclared: bool) -> Vec<WaveItem> {
-    let batch = (wave.len() / crate::jobs().max(1)).clamp(1, MAX_WORKER_BATCH);
+    let batch = wave::wave_batch(wave.len());
     let mut items = Vec::new();
     loop {
         let start = next.fetch_add(batch, Ordering::Relaxed);
@@ -736,21 +739,27 @@ pub(super) fn is_inferring(instance: Instance) -> bool {
 }
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
-pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
+pub(crate) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     if let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::CheckOnly(_))) {
         register(cx, *instance, &typed);
         return Ok(typed);
     }
+    if let Some(result) = thaw::thawed(cx, instance, unlaid) {
+        return result;
+    }
+    let typed = typed_fresh(cx, instance, unlaid)?;
+    thaw::note_fresh(cx, *instance, &typed);
+    Ok(typed)
+}
+
+fn typed_fresh(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     let _guard = InferGuard::enter(*instance);
     if let Some(result) = super::summary::typed_once_poly(cx, instance, unlaid) {
         return result;
     }
     let before = cx.quiet_mark();
     let typed = Arc::new(infer(cx, instance.0, instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
-    let laid = lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
-    if laid.is_ok() && cx.quiet_mark() == before {
-        cx.store.finals.insert(*instance, Arc::clone(&typed));
-    }
+    thaw::keep_laid(cx, *instance, &typed, unlaid, before);
     Ok(typed)
 }
 

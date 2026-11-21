@@ -239,13 +239,14 @@ fn hash_intrinsic_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key
         Intrinsic::TypeId => {
             bins.k.byte(1);
             if let Some(&ty) = substs.first() {
+                let id = crate::sema::summary::codec::type_id_key(cx.outline, &cx.types, ty);
                 bins.d.byte(20);
                 bins.d.u64(key);
-                bins.d.u32(ty.0);
+                bins.d.u64(id);
                 bins.d_slots = bins.d_slots.saturating_add(1);
                 bins.reflection.byte(20);
                 bins.reflection.u64(key);
-                bins.reflection.u32(ty.0);
+                bins.reflection.u64(id);
             }
         }
         Intrinsic::TypeName => {
