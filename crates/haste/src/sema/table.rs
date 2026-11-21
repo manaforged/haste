@@ -6,13 +6,13 @@ use std::thread::ThreadId;
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 
-use crate::sync::{lock, read_lock, shard_index, write_lock};
+use crate::sync::{CachePadded, lock, read_lock, shard_index, write_lock};
 
-pub(crate) const SHARDS: usize = 32;
+pub(crate) const SHARDS: usize = 128;
 
 /// A sharded concurrent hash map shared across worker contexts by `Arc`.
 pub struct Table<K, V> {
-    shards: Arc<[RwLock<FxHashMap<K, V>>; SHARDS]>,
+    shards: Arc<[CachePadded<RwLock<FxHashMap<K, V>>>]>,
 }
 
 impl<K, V> Clone for Table<K, V> {
@@ -23,11 +23,15 @@ impl<K, V> Clone for Table<K, V> {
 
 impl<K, V> Default for Table<K, V> {
     fn default() -> Self {
-        Self { shards: Arc::new(std::array::from_fn(|_| RwLock::new(FxHashMap::default()))) }
+        Self { shards: (0..SHARDS).map(|_| CachePadded::default()).collect() }
     }
 }
 
 impl<K, V> Table<K, V> {
+    fn shard<Q: Hash + ?Sized>(&self, key: &Q) -> &RwLock<FxHashMap<K, V>> {
+        &self.shards[shard_index::<_, SHARDS>(key)].0
+    }
+
     /// A clone of the value stored under `key`.
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
@@ -35,7 +39,7 @@ impl<K, V> Table<K, V> {
         Q: Eq + Hash + ?Sized,
         V: Clone,
     {
-        read_lock(&self.shards[shard_index::<_, SHARDS>(key)]).get(key).cloned()
+        read_lock(self.shard(key)).get(key).cloned()
     }
 
     /// Whether `key` holds a value in the table.
@@ -44,7 +48,7 @@ impl<K, V> Table<K, V> {
         K: Borrow<Q> + Eq + Hash,
         Q: Eq + Hash + ?Sized,
     {
-        read_lock(&self.shards[shard_index::<_, SHARDS>(key)]).contains_key(key)
+        read_lock(self.shard(key)).contains_key(key)
     }
 
     /// Stores `value` under `key`, replacing any earlier entry.
@@ -52,7 +56,7 @@ impl<K, V> Table<K, V> {
     where
         K: Eq + Hash,
     {
-        write_lock(&self.shards[shard_index::<_, SHARDS>(&key)]).insert(key, value);
+        write_lock(self.shard(&key)).insert(key, value);
     }
 
     /// A clone of the value stored under `key`, inserting `make()` when absent.
@@ -61,12 +65,12 @@ impl<K, V> Table<K, V> {
         K: Eq + Hash,
         V: Clone,
     {
-        let shard = shard_index::<_, SHARDS>(&key);
-        if let Some(found) = read_lock(&self.shards[shard]).get(&key).cloned() {
+        let shard = self.shard(&key);
+        if let Some(found) = read_lock(shard).get(&key).cloned() {
             return found;
         }
         let made = make();
-        write_lock(&self.shards[shard]).entry(key).or_insert(made).clone()
+        write_lock(shard).entry(key).or_insert(made).clone()
     }
 
     /// Removes and returns the value stored under `key`.
@@ -75,19 +79,19 @@ impl<K, V> Table<K, V> {
         K: Borrow<Q> + Eq + Hash,
         Q: Eq + Hash + ?Sized,
     {
-        write_lock(&self.shards[shard_index::<_, SHARDS>(key)]).remove(key)
+        write_lock(self.shard(key)).remove(key)
     }
 
     /// Empties every shard of the table.
     pub fn clear(&self) {
         for shard in self.shards.iter() {
-            write_lock(shard).clear();
+            write_lock(&shard.0).clear();
         }
     }
 
     /// Empties one shard of the table and returns the number of removed entries.
     pub fn clear_shard(&self, shard: usize) -> usize {
-        let mut map = write_lock(&self.shards[shard % SHARDS]);
+        let mut map = write_lock(&self.shards[shard % SHARDS].0);
         let count = map.len();
         map.clear();
         count
@@ -96,7 +100,7 @@ impl<K, V> Table<K, V> {
     /// Keeps only the entries for which `keep` holds.
     pub fn retain(&self, mut keep: impl FnMut(&K, &mut V) -> bool) {
         for shard in self.shards.iter() {
-            write_lock(shard).retain(&mut keep);
+            write_lock(&shard.0).retain(&mut keep);
         }
     }
 
@@ -108,8 +112,8 @@ impl<K, V> Table<K, V> {
     {
         let out = Self::default();
         for (index, shard) in self.shards.iter().enumerate() {
-            let guard = read_lock(shard);
-            let mut target = write_lock(&out.shards[index]);
+            let guard = read_lock(&shard.0);
+            let mut target = write_lock(&out.shards[index].0);
             for (key, value) in guard.iter() {
                 if keep(key, value) {
                     target.insert(key.clone(), value.clone());

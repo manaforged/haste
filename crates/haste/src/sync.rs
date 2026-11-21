@@ -25,7 +25,17 @@ pub(crate) fn write_lock<T>(rw: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     rw.write().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[repr(align(128))]
+pub(crate) struct CachePadded<T>(pub(crate) T);
+
+impl<T: Default> Default for CachePadded<T> {
+    fn default() -> Self {
+        Self(T::default())
+    }
+}
+
 pub(crate) fn shard_index<Q: Hash + ?Sized, const SHARDS: usize>(key: &Q) -> usize {
+    const { assert!(SHARDS.is_power_of_two()) };
     let mut hasher = FxHasher::default();
     key.hash(&mut hasher);
     let hash = hasher.finish();
@@ -88,14 +98,14 @@ impl<T, const SLAB: usize, const SLABS: usize> Slab<T, SLAB, SLABS> {
 }
 
 pub(crate) struct Interner<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> {
-    shards: [RwLock<FxHashMap<K, u32>>; SHARDS],
+    shards: Box<[CachePadded<RwLock<FxHashMap<K, u32>>>]>,
     slabs: Slab<K, SLAB, SLABS>,
     next: AtomicU32,
 }
 
 impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default for Interner<K, SHARDS, SLAB, SLABS> {
     fn default() -> Self {
-        Self { shards: std::array::from_fn(|_| RwLock::new(FxHashMap::default())), slabs: Slab::default(), next: AtomicU32::new(0) }
+        Self { shards: (0..SHARDS).map(|_| CachePadded::default()).collect(), slabs: Slab::default(), next: AtomicU32::new(0) }
     }
 }
 
@@ -106,7 +116,7 @@ impl<K: Eq + Hash + Clone, const SHARDS: usize, const SLAB: usize, const SLABS: 
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let shard = &self.shards[shard_index::<_, SHARDS>(key)];
+        let shard = &self.shards[shard_index::<_, SHARDS>(key)].0;
         if let Some(&id) = read_lock(shard).get(key) {
             return id;
         }

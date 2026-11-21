@@ -145,6 +145,8 @@ pub struct Infer<'c, 'a> {
     evaluating: Vec<ItemRef>,
     proved: rustc_hash::FxHashSet<(ItemRef, Substs)>,
     imports: HashMap<(ItemRef, Option<crate::names::Sym>, Option<u32>, Vec<u32>), Vec<crate::names::PerNs>>,
+    local_selections: HashMap<(ItemRef, Ty, Substs), Option<(super::impls::ImplRef, Substs)>>,
+    local_projections: HashMap<(ItemRef, Ty, Substs, crate::names::Sym, Substs), Option<Ty>>,
     method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
@@ -269,6 +271,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             scopes, items, block_uses: Vec::new(), loops, uses, unsure: Vec::new(), diverges: false,
             hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), cycle_hits: 0, frames: 0,
             evaluating: Vec::new(), proved: rustc_hash::FxHashSet::default(), imports: HashMap::default(),
+            local_selections: HashMap::default(), local_projections: HashMap::default(),
             method_hints: None, poly: None,
         }
     }
@@ -766,7 +769,7 @@ pub(super) fn detached_summary<T>(cx: &mut Context<'_>, item: ItemRef, run: impl
     let body = EMPTY_BODY.get_or_init(Body::default);
     let sig = EMPTY_SIG.get_or_init(Signature::default);
     let src = EMPTY_SRC.get_or_init(|| crate::outline::source::Source {
-        path: std::path::PathBuf::new(), text: String::new(), tokens: Vec::new(), marks: Vec::new(), opaque: Vec::new(),
+        path: std::path::PathBuf::new(), text: Default::default(), tokens: Default::default(), marks: Vec::new(), opaque: Vec::new(),
         base: None, offset: 0, outputs: Default::default(), origins: crate::outline::source::Origins::Read,
     });
     let home = cx.module_of(item).unwrap_or(ModRef { krate: item.krate, module: 0 });

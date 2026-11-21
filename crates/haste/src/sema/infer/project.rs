@@ -14,6 +14,7 @@ use super::scope::{named_bounds, one_name, type_params};
 
 /// An associated type whose `Self` is not known yet: trait, `Self`, trait arguments, name, and the variable that stands for it.
 pub(super) type Projection = (ItemRef, Ty, Vec<Ty>, String, Ty);
+type ProjectionKey = (ItemRef, Ty, Substs, crate::names::Sym, Substs);
 
 const SUPER_DEPTH: u32 = 8;
 const MAX_ASSUMPTIONS: usize = 256;
@@ -348,14 +349,21 @@ impl Infer<'_, '_> {
         Ok(result)
     }
 
-    fn closed_projection_key(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Option<(ItemRef, Ty, Substs, crate::names::Sym, Substs)> {
-        if !self.closed(ty) {
+    fn projection_key(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty]), ok: fn(&Self, Ty) -> bool) -> Option<ProjectionKey> {
+        if !ok(self, ty) {
             return None;
         }
-        let args = self.closed_substs(args)?;
-        let own = self.closed_substs(own)?;
+        let args = self.substs_if(args, ok)?;
+        let own = self.substs_if(own, ok)?;
         let sym = self.cx.names.symbols.intern(name);
         Some((of, self.substitute(ty), args, sym, own))
+    }
+
+    fn projection_keys(&mut self, of: ItemRef, ty: Ty, args: &[Ty], own: (&str, &[Ty])) -> (Option<ProjectionKey>, Option<ProjectionKey>) {
+        if let Some(key) = self.projection_key(of, ty, args, own, Self::closed) {
+            return (Some(key), None);
+        }
+        (None, self.projection_key(of, ty, args, own, Self::locally_closed))
     }
 
     pub(in crate::sema) fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
@@ -365,18 +373,20 @@ impl Infer<'_, '_> {
                 false => Ok(None),
             };
         }
-        let key = self.closed_projection_key(of, ty, args, (name, own));
-        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.projections.get(key)) {
+        let (key, local_key) = self.projection_keys(of, ty, args, (name, own));
+        if let Some(found) = key.as_ref().and_then(|k| self.cx.store.lookups.projections.get(k)).or_else(|| local_key.as_ref().and_then(|k| self.local_projections.get(k).copied())) {
             return Ok(found);
         }
         let state = self.cache_state();
         let res = self.picked_alias_uncached(of, ty, args, (name, own))?;
-        if let Some(key) = key
-            && self.cache_state() == state
-            && res.is_none_or(|t| self.closed(t))
-        {
-            let cached = res.map(|t| self.substitute(t));
-            self.cx.store.lookups.projections.insert(key, cached);
+        if self.cache_state() == state {
+            if let Some(key) = key && res.is_none_or(|t| self.closed(t)) {
+                let cached = res.map(|t| self.substitute(t));
+                self.cx.store.lookups.projections.insert(key, cached);
+            } else if let Some(key) = local_key && res.is_none_or(|t| self.locally_closed(t)) {
+                let cached = res.map(|t| self.substitute(t));
+                self.local_projections.insert(key, cached);
+            }
         }
         Ok(res)
     }

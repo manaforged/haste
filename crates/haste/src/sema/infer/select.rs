@@ -2,7 +2,7 @@ use std::hash::{Hash, Hasher};
 
 use anyhow::{Result, bail};
 
-use crate::body::{Body, Bound, PathId, Ty as SyntaxTy};
+use crate::body::{Body, Bound, ExprId, PathId, Ty as SyntaxTy};
 use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, ModRef};
 use crate::outline::item::ItemKind;
@@ -35,58 +35,67 @@ const WEAKER_THAN_SIZED: [&str; 2] = ["meta_sized", "pointee_sized"];
 /// The compiler traits that no unsized type implements.
 const SIZED_ONLY: [&str; 3] = ["sized", "copy", "clone"];
 
+type SelectionKey = (ItemRef, Ty, Substs);
+
 impl<'a> Infer<'_, 'a> {
     /// The one impl of trait `of` at trait arguments `args` for `self_ty`, or none when no impl or several apply.
     pub fn select(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Picked>> {
-        let key = self.selection_key(of, self_ty, args);
-        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
+        let (key, local_key) = self.selection_keys(of, self_ty, args);
+        if let Some(found) = self.cached_selection(key.as_ref(), local_key.as_ref()) {
             return Ok(found.map(|(block, impl_args)| (block, self.cx.types.substs(impl_args).to_vec())));
         }
         let state = self.cache_state();
         let picked = self.select_at(of, self_ty, args, 0)?;
-        if let Some(key) = key {
-            self.cache_selection(key, picked.as_ref(), state);
-        }
+        self.store_selection(key, local_key, picked.as_ref(), state);
         Ok(picked)
     }
 
-    fn cache_selection(&mut self, key: (ItemRef, Ty, Substs), picked: Option<&Picked>, state: (((usize, usize), usize, usize), u32)) {
-        if self.cache_state() != state {
-            return;
-        }
-        let kept = match picked {
-            None => Some(None),
-            Some((block, impl_args)) => self.closed_substs(impl_args).map(|args| Some((*block, args))),
-        };
-        if let Some(kept) = kept {
-            self.cx.store.lookups.selections.insert(key, kept);
-        }
+    fn cached_selection(&self, key: Option<&SelectionKey>, local_key: Option<&SelectionKey>) -> Option<Option<(ImplRef, Substs)>> {
+        key.and_then(|k| self.cx.store.lookups.selections.get(k)).or_else(|| local_key.and_then(|k| self.local_selections.get(k).copied()))
     }
 
-    pub(super) fn closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> {
-        if !tys.iter().all(|&ty| self.closed(ty)) {
-            return None;
-        }
-        let substituted: Vec<Ty> = tys.iter().map(|&ty| self.substitute(ty)).collect();
-        Some(self.cx.types.intern_substs(&substituted))
+    fn store_selection(&mut self, key: Option<SelectionKey>, local_key: Option<SelectionKey>, picked: Option<&Picked>, state: (((usize, usize), usize, usize), u32)) {
+        if self.cache_state() != state { return; }
+        let Some((k, local)) = key.map(|k| (k, false)).or_else(|| local_key.map(|k| (k, true))) else { return; };
+        let Some(kept) = (match picked { None => Some(None), Some((b, a)) => (if local { self.locally_closed_substs(a) } else { self.closed_substs(a) }).map(|a| Some((*b, a))) }) else { return; };
+        if local { self.local_selections.insert(k, kept); } else { self.cx.store.lookups.selections.insert(k, kept); }
     }
 
-    /// The key that caches selecting `of<args>` for `self_ty` across bodies: the query with its variables filled in, when every type in it is known and holds no closure.
-    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Substs)> {
-        if !self.closed(self_ty) {
-            return None;
-        }
-        Some((of, self.substitute(self_ty), self.closed_substs(args)?))
+    pub(super) fn substs_if(&mut self, tys: &[Ty], ok: fn(&Self, Ty) -> bool) -> Option<Substs> {
+        tys.iter().all(|&ty| ok(self, ty)).then(|| { let sub: Vec<Ty> = tys.iter().map(|&ty| self.substitute(ty)).collect(); self.cx.types.intern_substs(&sub) })
+    }
+    pub(super) fn closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> { self.substs_if(tys, Self::closed) }
+    pub(super) fn locally_closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> { self.substs_if(tys, Self::locally_closed) }
+
+    fn selection_keys(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> (Option<SelectionKey>, Option<SelectionKey>) {
+        let build = |this: &mut Self, ok: fn(&Self, Ty) -> bool| ok(this, self_ty).then(|| this.substs_if(args, ok)).flatten().map(|a| (of, this.substitute(self_ty), a));
+        if let Some(k) = build(self, Self::closed) { (Some(k), None) } else { (None, build(self, Self::locally_closed)) }
     }
 
     /// Whether `ty` holds no inference variable and no closure, whose signature may still hold one, so selecting with it gives the same answer in every body.
-    pub(super) fn closed(&self, ty: Ty) -> bool {
-        let ty = self.resolve(ty);
-        if self.has_params(ty) {
-            return false;
+    pub(super) fn closed(&self, ty: Ty) -> bool { self.closed_at(ty, 0, false, false) }
+    pub(super) fn locally_closed(&self, ty: Ty) -> bool { self.closed_at(ty, 0, true, false) }
+
+    fn closed_at(&self, mut ty: Ty, depth: u32, local: bool, check_trail: bool) -> bool {
+        if depth > 24 || ty == Ty::NONE { return false; }
+        while let Some(index) = self.var_of(ty) {
+            let Some(bound) = self.vars.get(index as usize).copied().flatten() else { break };
+            if check_trail && self.trail_depth > 0 && self.var_trail.iter().any(|&(i, _)| i == index) { return false; }
+            ty = bound;
         }
+        if self.has_params(ty) { return false; }
         let kind = self.cx.types.kind(ty);
-        !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)) && kind.children(&self.cx.types).all(|item| self.closed(item))
+        if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || (!local && matches!(kind, Kind::Closure(..))) { return false; }
+        if !kind.children(&self.cx.types).all(|item| self.closed_at(item, depth + 1, local, check_trail)) { return false; }
+        let Kind::Closure(parent, args, at) = kind else { return true; };
+        if self.instance == Some((*parent, *args)) {
+            let check = check_trail || self.trail_depth > 0;
+            return self.out.closures.get(&ExprId(*at)).is_some_and(|c| self.closure_closed(c, &self.out.locals, depth + 1, check));
+        }
+        self.cx.closure(ty).is_some_and(|info| !info.typed.exprs.is_empty() && self.closure_closed(&info.closure, &info.typed.locals, depth + 1, check_trail))
+    }
+    fn closure_closed(&self, c: &super::closure::Closure, locals: &[super::Local], depth: u32, check_trail: bool) -> bool {
+        self.closed_at(c.ret, depth, true, check_trail) && c.params.iter().all(|&p| self.closed_at(locals[p as usize].ty, depth, true, check_trail))
     }
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
@@ -488,8 +497,8 @@ impl<'a> Infer<'_, 'a> {
             self.cycle_hits += 1;
             return Ok(self.obligation_open(ty, args));
         }
-        let key = (!super::project::has_assoc_bounds(arena, path)).then(|| self.selection_key(of, ty, args)).flatten();
-        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
+        let (key, local_key) = if super::project::has_assoc_bounds(arena, path) { (None, None) } else { self.selection_keys(of, ty, args) };
+        if let Some(found) = self.cached_selection(key.as_ref(), local_key.as_ref()) {
             return Ok(found.is_some());
         }
         let state = self.cache_state();
@@ -500,16 +509,12 @@ impl<'a> Infer<'_, 'a> {
             Ok([(picked, vars)]) => {
                 self.adopt(vars);
                 let holds = self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth)?;
-                if holds && let Some(key) = key {
-                    self.cache_selection(key, Some(&picked), state);
-                }
+                if holds { self.store_selection(key, local_key, Some(&picked), state); }
                 Ok(holds)
             }
             Err(found) => {
                 let held = !found.is_empty();
-                if !held && let Some(key) = key {
-                    self.cache_selection(key, None, state);
-                }
+                if !held { self.store_selection(key, local_key, None, state); }
                 if held && self.obligation_open(ty, args) {
                     self.obligations.push((of, std::iter::once(ty).chain(args.iter().copied()).collect()));
                 }

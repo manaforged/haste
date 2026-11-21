@@ -105,11 +105,18 @@ impl Asked {
     }
 }
 
+#[derive(Default)]
+struct TraitBucket {
+    all: Vec<ImplRef>,
+    blanket: Vec<ImplRef>,
+    by_head: HashMap<Head, Vec<ImplRef>>,
+}
+
 /// The impls of one crate: inherent ones by the head of their self type, trait ones by their trait.
 #[derive(Default)]
 pub struct Index {
     inherent: HashMap<Head, Vec<ImplRef>>,
-    traits: HashMap<ItemRef, Vec<(ImplRef, Option<Head>)>>,
+    traits: HashMap<ItemRef, TraitBucket>,
     negative: HashMap<ItemRef, Vec<Head>>,
     asked: Asked,
 }
@@ -246,41 +253,73 @@ impl<'a> Context<'a> {
             _ => &standard,
         };
         let mut found = Vec::new();
-        for holder in self.holders_with_body(holders, (Some(head), None)) {
-            found.extend(self.index_of(holder).inherent.get(&head).into_iter().flatten().copied());
-        }
+        self.any_holder(holders, Some(head), None, |cx, holder| {
+            found.extend(cx.index_of(holder).inherent.get(&head).into_iter().flatten().copied());
+            false
+        });
         found
     }
 
-    fn holders_with_body(&self, crates: &[u32], (head, of): (Option<Head>, Option<ItemRef>)) -> Vec<Holder> {
-        let mut holders: Vec<Holder> = crates.iter().map(|&krate| Holder::Crate(krate)).collect();
+    fn extra_body_holders(&self, crates: &[u32], head: Option<Head>, of: Option<ItemRef>) -> [Option<ItemRef>; 2] {
         let local_self = match head {
             Some(Head::Adt(item)) => item.declaring_body(),
             _ => None,
         };
-        for root in [local_self, of.and_then(ItemRef::declaring_body)].into_iter().flatten() {
-            let in_crate_index = crates.contains(&root.krate) && self.outline.crates[root.krate as usize].impl_bodies.iter().any(|&(file, item)| file as u32 == root.file && item == root.item);
-            if !in_crate_index && !holders.contains(&Holder::Body(root)) {
-                holders.push(Holder::Body(root));
+        let local_trait = of.and_then(ItemRef::declaring_body);
+        if local_self.is_none() && local_trait.is_none() {
+            return [None, None];
+        }
+        let mut out = [None, None];
+        let mut len = 0;
+        for root in [local_self, local_trait].into_iter().flatten() {
+            let in_crate_index = crates.contains(&root.krate)
+                && self.outline.crates[root.krate as usize].impl_bodies.iter().any(|&(file, item)| file as u32 == root.file && item == root.item);
+            if !in_crate_index && !out[..len].contains(&Some(root)) {
+                out[len] = Some(root);
+                len += 1;
             }
         }
-        holders
+        out
+    }
+
+    fn any_holder(&mut self, crates: &[u32], head: Option<Head>, of: Option<ItemRef>, mut visit: impl FnMut(&mut Self, Holder) -> bool) -> bool {
+        for &krate in crates {
+            if visit(self, Holder::Crate(krate)) {
+                return true;
+            }
+        }
+        for root in self.extra_body_holders(crates, head, of).into_iter().flatten() {
+            if visit(self, Holder::Body(root)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The impls of trait `of` in crates `holders` whose self type may have head `head`.
     pub fn trait_impls(&mut self, of: ItemRef, head: Option<Head>, holders: &[u32]) -> Vec<ImplRef> {
         let mut found = Vec::new();
-        for holder in self.holders_with_body(holders, (head, Some(of))) {
-            let index = self.index_of(holder);
-            let blocks = index.traits.get(&of).into_iter().flatten();
-            found.extend(blocks.filter(|(_, own)| own.is_none() || head.is_none() || *own == head).map(|(block, _)| *block));
-        }
+        self.any_holder(holders, head, Some(of), |cx, holder| {
+            let index = cx.index_of(holder);
+            if let Some(bucket) = index.traits.get(&of) {
+                match head {
+                    None => found.extend_from_slice(&bucket.all),
+                    Some(head) => {
+                        if let Some(matching) = bucket.by_head.get(&head) {
+                            found.extend_from_slice(matching);
+                        }
+                        found.extend_from_slice(&bucket.blanket);
+                    }
+                }
+            }
+            false
+        });
         found
     }
 
     /// Whether crates `holders` write a negative impl of trait `of` for a self type with head `head`.
     pub fn negative_impl(&mut self, of: ItemRef, head: Head, holders: &[u32]) -> bool {
-        self.holders_with_body(holders, (Some(head), Some(of))).into_iter().any(|holder| self.index_of(holder).negative.get(&of).is_some_and(|heads| heads.contains(&head)))
+        self.any_holder(holders, Some(head), Some(of), |cx, holder| cx.index_of(holder).negative.get(&of).is_some_and(|heads| heads.contains(&head)))
     }
 
     /// The trait that impl `block` implements, or none for an inherent impl.
@@ -405,7 +444,12 @@ impl<'a> Context<'a> {
             (false, None) => {}
             (true, _) => {
                 if let Some(of) = self.impl_trait(block) {
-                    index.traits.entry(of).or_default().push((block, head));
+                    let bucket = index.traits.entry(of).or_default();
+                    bucket.all.push(block);
+                    match head {
+                        Some(head) => bucket.by_head.entry(head).or_default().push(block),
+                        None => bucket.blanket.push(block),
+                    }
                 }
             }
         }
