@@ -49,7 +49,7 @@ const DIRECT: &[HostSymbol] = &[
 ];
 
 impl HostSymbol {
-    /// Classifies `name` into a typed host symbol when the host links to it (or unconditionally as a dynamic import when `aot` is true).
+    /// Classifies `name` into a typed host symbol when the host links to it (or as a dynamic import when cross-compiling with `aot` true).
     pub fn resolve_for(name: &str, aot: bool) -> Option<Self> {
         if let Some(found) = DIRECT.iter().find(|sym| sym.link_name() == name) {
             return Some(found.clone());
@@ -65,7 +65,7 @@ impl HostSymbol {
                 if let Some(math) = MathSymbol::from_name(name) {
                     return Some(Self::Math(math));
                 }
-                if aot {
+                if aot && crate::compile_target().triple != haste_codegen::Target::host().triple {
                     return Some(Self::Dynamic(name.into()));
                 }
                 return dynamic(name).map(|_| Self::Dynamic(name.into()));

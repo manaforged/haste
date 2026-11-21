@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use anyhow::{Result, bail};
+
 use super::manifest::{Dep, Kind};
 use super::{Graph, Package, Side, Unit};
 
@@ -25,6 +27,41 @@ fn implicit(package: &Package, key: &str) -> bool {
     let optional = manifest.deps.iter().any(|dep| dep.optional && dep.key == key);
     let explicit = manifest.features.values().flatten().any(|value| value.strip_prefix("dep:") == Some(key));
     optional && !explicit
+}
+
+fn has_feature(package: &Package, name: &str) -> bool {
+    package.manifest.features.contains_key(name) || implicit(package, name)
+}
+
+fn unknown_feature(packages: &[Package], members: &[usize], feature: &str) -> anyhow::Error {
+    if members.len() == 1 {
+        anyhow::anyhow!("package `{}` does not have feature `{feature}`", packages[members[0]].manifest.name)
+    } else {
+        anyhow::anyhow!("none of the selected packages have feature `{feature}`")
+    }
+}
+
+fn validate_features(packages: &[Package], members: &[usize], features: &[&str]) -> Result<()> {
+    for &feature in features {
+        if let Some((pkg_or_dep, sub)) = feature.split_once('/') {
+            if let Some(&member) = members.iter().find(|&&m| packages[m].manifest.name == pkg_or_dep) {
+                if !has_feature(&packages[member], sub) {
+                    bail!("package `{}` does not have feature `{sub}`", packages[member].manifest.name);
+                }
+                continue;
+            }
+            let targets: Vec<usize> = members.iter().filter_map(|&m| packages[m].resolved.get(pkg_or_dep).copied()).collect();
+            if targets.is_empty() {
+                return Err(unknown_feature(packages, members, feature));
+            }
+            if !targets.iter().any(|&target| has_feature(&packages[target], sub)) {
+                bail!("package `{}` does not have feature `{sub}`", packages[targets[0]].manifest.name);
+            }
+        } else if !members.iter().any(|&m| has_feature(&packages[m], feature)) {
+            return Err(unknown_feature(packages, members, feature));
+        }
+    }
+    Ok(())
 }
 
 impl Resolver<'_> {
@@ -139,22 +176,33 @@ impl Resolver<'_> {
 }
 
 /// Resolves the features of every unit reachable from `members`, as Cargo's resolver 2 does for `normal` and `build` edges.
-pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str], default_features: bool, all_features: bool) -> Graph {
+pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str], default_features: bool, all_features: bool) -> Result<Graph> {
+    validate_features(packages, members, features)?;
     let mut resolver = Resolver { packages, targets, members, units: Vec::new(), by_key: BTreeMap::new(), enabled: Vec::new(), want: Vec::new(), queue: VecDeque::new() };
     for member in members {
         let unit = resolver.unit(*member, Side::Target);
         if default_features {
             resolver.queue.push_back((unit, Step::Feature("default".to_owned())));
         }
+        let package = &packages[*member];
         if all_features {
-            let package = &packages[*member];
             resolver.queue.extend(package.manifest.features.keys().cloned().map(|name| (unit, Step::Feature(name))));
             resolver.queue.extend(
                 package.manifest.deps.iter().filter(|dep| implicit(package, &dep.key)).map(|dep| (unit, Step::Feature(dep.key.clone()))),
             );
         }
-        resolver.queue.extend(features.iter().map(|feature| (unit, Step::Feature((*feature).to_owned()))));
+        for &feature in features {
+            if let Some((pkg_or_dep, sub)) = feature.split_once('/') {
+                if package.manifest.name == pkg_or_dep {
+                    resolver.queue.push_back((unit, Step::Feature(sub.to_owned())));
+                } else if package.manifest.deps.iter().any(|dep| dep.key == pkg_or_dep) {
+                    resolver.value(unit, feature.to_owned());
+                }
+            } else {
+                resolver.queue.push_back((unit, Step::Feature(feature.to_owned())));
+            }
+        }
     }
     resolver.run();
-    Graph { units: resolver.units, members: members.to_vec() }
+    Ok(Graph { units: resolver.units, members: members.to_vec() })
 }

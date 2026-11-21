@@ -366,7 +366,7 @@ fn load_filtered(
             None => bail!("{} is not in {LOCK_FILE}", root.display()),
         }
     }
-    let graph = features::resolve(&packages, targets, &members, features, default_features, all_features);
+    let graph = features::resolve(&packages, targets, &members, features, default_features, all_features)?;
     for unit in &graph.units {
         if let Some(err) = missing[unit.package].take() {
             return Err(err);

@@ -110,6 +110,64 @@ pub(crate) fn main_item(workspace: &graph::Workspace, outline: &outline::Outline
     outline.main(krate)
 }
 
+fn missing_target_error() -> anyhow::Error {
+    let sel = crate::selection();
+    if let Some(name) = &sel.example {
+        anyhow::anyhow!("no example target named '{name}'")
+    } else if let Some(name) = &sel.bin {
+        anyhow::anyhow!("no bin target named '{name}'")
+    } else {
+        anyhow::anyhow!("no member binary has a `main`")
+    }
+}
+
+fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Result<ItemRef> {
+    main_item(workspace, outline).ok_or_else(missing_target_error)
+}
+
+fn select_test_roots(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> (Vec<ItemRef>, Vec<Option<Instance>>, Vec<Instance>) {
+    let mut valid = Vec::new();
+    let mut starts = Vec::new();
+    let mut roots = Vec::new();
+    for &item in items {
+        let Some(unit) = sema::infer::test_sig(cx, item) else {
+            continue;
+        };
+        let start = if unit { None } else { sema::reach::main_roots(cx, item).ok().map(|[s, _]| s) };
+        if let Some(s) = start {
+            roots.push(s);
+        }
+        roots.push((item, sema::substs::Substs::EMPTY));
+        starts.push(start);
+        valid.push(item);
+    }
+    (valid, starts, roots)
+}
+
+fn test_label(cx: &mut sema::Context<'_>, item: ItemRef) -> String {
+    let fn_name = cx.name(item).to_owned();
+    let Ok(mod_ref) = cx.module_of(item) else {
+        return fn_name;
+    };
+    let modules = &cx.outline.crates[mod_ref.krate as usize].modules;
+    let mut parts = Vec::new();
+    let mut current = Some(mod_ref.module as usize);
+    while let Some(module) = current.filter(|&m| m != 0) {
+        parts.push(modules[module].name.as_str());
+        current = modules[module].parent;
+    }
+    if parts.is_empty() {
+        return fn_name;
+    }
+    parts.reverse();
+    parts.push(&fn_name);
+    parts.join("::")
+}
+
+fn batch_labels(cx: &mut sema::Context<'_>, kind: BatchKind, items: &[ItemRef]) -> Vec<String> {
+    items.iter().map(|&item| if kind == BatchKind::Tests { test_label(cx, item) } else { cx.name(item).to_owned() }).collect()
+}
+
 fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
     main_item(workspace, outline).into_iter().collect()
 }
@@ -221,16 +279,11 @@ fn finish_batch(
     let mut test_starts: Vec<Option<sema::reach::Instance>> = Vec::new();
     let valid: Vec<ItemRef> = match kind {
         BatchKind::Cases => cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect(),
-        BatchKind::Tests => cases
-            .iter()
-            .copied()
-            .filter_map(|item| {
-                let unit = sema::infer::test_sig(&mut cx, item)?;
-                let start = if unit { None } else { sema::reach::main_roots(&mut cx, item).ok().map(|[s, _]| s) };
-                test_starts.push(start);
-                Some(item)
-            })
-            .collect(),
+        BatchKind::Tests => {
+            let (valid, starts, _) = select_test_roots(&mut cx, cases);
+            test_starts = starts;
+            valid
+        }
         BatchKind::LibCheck => cases.iter().copied().filter(|&item| sema::infer::is_concrete_fn(&mut cx, item)).collect(),
         BatchKind::MainCheck => cases.to_vec(),
         BatchKind::MainAot => Vec::new(),
@@ -254,7 +307,7 @@ fn finish_batch(
         Image::build(&mut cx, &reached, mode)?
     };
     let codegen_span = codegen_clock.elapsed();
-    let labels = valid.iter().map(|item| cx.name(*item).to_owned()).collect();
+    let labels = batch_labels(&mut cx, kind, &valid);
     let outline = cx.outline;
     let mut store = cx.release().0;
     save_batch_substrate((outline, &mut store), &mut image, (drop_finals, kind), substrate, pre_builder);
@@ -357,7 +410,14 @@ impl Batch {
     /// Infers and compiles every root `kind` finds in `workspace` from nothing.
     fn new(workspace: &graph::Workspace, compilation: &mut Compilation, kind: BatchKind, drop_finals: bool) -> Result<Batch> {
         let main = (kind == BatchKind::MainAot)
-            .then(|| main_item(workspace, &compilation.outline).context("no binary or example target to emit (pass --bin NAME or --example NAME)"))
+            .then(|| {
+                let sel = crate::selection();
+                if sel.bin.is_some() || sel.example.is_some() {
+                    require_main(workspace, &compilation.outline)
+                } else {
+                    main_item(workspace, &compilation.outline).context("no binary or example target to emit (pass --bin NAME or --example NAME)")
+                }
+            })
             .transpose()?;
         Self::rooted(workspace, compilation, (kind, main), drop_finals)
     }
@@ -381,20 +441,7 @@ impl Batch {
             |cx| match (kind, main) {
                 (BatchKind::MainAot, Some(main_ref)) => sema::reach::main_roots(cx, main_ref).map_or_else(|_| vec![(main_ref, sema::substs::Substs::EMPTY)], Into::into),
                 (BatchKind::Cases, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
-                (BatchKind::Tests, _) => {
-                    let mut out = Vec::new();
-                    for &(item, substs) in &root_insts {
-                        if let Some(unit) = sema::infer::test_sig(cx, item) {
-                            if !unit
-                                && let Ok([start, _]) = sema::reach::main_roots(cx, item)
-                            {
-                                out.push(start);
-                            }
-                            out.push((item, substs));
-                        }
-                    }
-                    out
-                }
+                (BatchKind::Tests, _) => select_test_roots(cx, &cases).2,
                 (BatchKind::LibCheck, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item)).collect(),
                 _ => root_insts.clone(),
             },
@@ -445,20 +492,10 @@ impl Batch {
                 roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
             }
             BatchKind::Tests => {
-                let mut valid = Vec::new();
-                roots.clear();
-                for item in cases {
-                    if let Some(unit) = sema::infer::test_sig(&mut cx, item) {
-                        let start = if unit { None } else { sema::reach::main_roots(&mut cx, item).ok().map(|[s, _]| s) };
-                        if let Some(s) = start {
-                            roots.push(s);
-                        }
-                        roots.push((item, sema::substs::Substs::EMPTY));
-                        test_starts.push(start);
-                        valid.push(item);
-                    }
-                }
+                let (valid, starts, test_roots) = select_test_roots(&mut cx, &cases);
                 cases = valid;
+                test_starts = starts;
+                roots = test_roots;
             }
             BatchKind::LibCheck => {
                 cases.retain(|&item| sema::infer::is_concrete_fn(&mut cx, item));
@@ -476,7 +513,7 @@ impl Batch {
         if !cx.resolved() {
             return false;
         }
-        self.labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
+        self.labels = batch_labels(&mut cx, self.kind, &cases);
         self.roots = match self.kind {
             BatchKind::Tests => cases.iter().map(|&item| self.reached.index[&(item, sema::substs::Substs::EMPTY)]).collect(),
             _ => roots.iter().map(|root| self.reached.index[root]).collect(),
@@ -544,22 +581,26 @@ impl Batch {
         print_failures(&failures);
         let ms = |at: Duration| at.as_secs_f64() * 1e3;
         eprintln!("cases {} found, {} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", self.labels.len(), runnable.len(), self.reached.list.len(), ms(built), ms(started.elapsed()));
-        Ok(0)
+        Ok(if failures.is_empty() { 0 } else { 101 })
     }
 
     fn report_tests(&self, outline: &outline::Outline, started: Instant, filters: &[String]) -> Result<i32> {
         let sel = crate::selection();
+        let args = parse_test_args(filters);
+        let ignored_only = sel.ignored_only || args.ignored_only;
+        let include_ignored = sel.include_ignored || args.include_ignored;
+        let matches = |name: &str, pat: &str| if args.exact { name == pat } else { name.contains(pat) };
         let mut to_run = Vec::new();
         let mut errs: Vec<String> = Vec::new();
         let mut raw: Vec<(&str, &TestItem, Option<Result<(usize, Option<usize>), usize>>)> = Vec::new();
         for ((&root, name), (meta, start)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
-            if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
+            if (!args.filters.is_empty() && !args.filters.iter().any(|f| matches(name, f))) || args.skips.iter().any(|s| matches(name, s)) {
                 continue;
             }
-            if sel.ignored_only && !meta.ignored {
+            if ignored_only && !meta.ignored {
                 continue;
             }
-            let skip = meta.ignored && !sel.ignored_only && !sel.include_ignored;
+            let skip = meta.ignored && !ignored_only && !include_ignored;
             let check_roots: Vec<usize> = (*start).into_iter().chain(std::iter::once(root)).collect();
             let outcome = if skip {
                 None
@@ -591,6 +632,44 @@ impl Batch {
         }
         Ok(print_test_report(&entries, started.elapsed()))
     }
+}
+
+struct TestArgs<'a> {
+    filters: Vec<&'a str>,
+    skips: Vec<&'a str>,
+    exact: bool,
+    ignored_only: bool,
+    include_ignored: bool,
+}
+
+fn parse_test_args(args: &[String]) -> TestArgs<'_> {
+    let mut parsed = TestArgs { filters: Vec::new(), skips: Vec::new(), exact: false, ignored_only: false, include_ignored: false };
+    let mut iter = args.iter().map(String::as_str);
+    let mut literal = false;
+    while let Some(arg) = iter.next() {
+        if literal {
+            parsed.filters.push(arg);
+        } else if arg == "--" {
+            literal = true;
+        } else if arg == "--exact" {
+            parsed.exact = true;
+        } else if arg == "--ignored" {
+            parsed.ignored_only = true;
+        } else if arg == "--include-ignored" {
+            parsed.include_ignored = true;
+        } else if let Some(val) = arg.strip_prefix("--skip=") {
+            parsed.skips.push(val);
+        } else if arg == "--skip" {
+            if let Some(val) = iter.next() {
+                parsed.skips.push(val);
+            }
+        } else if matches!(arg, "--test-threads" | "--color" | "--format" | "--logfile" | "--shuffle-seed" | "-Z") {
+            let _ = iter.next();
+        } else if !arg.starts_with('-') {
+            parsed.filters.push(arg);
+        }
+    }
+    parsed
 }
 
 fn item_loc(outline: &outline::Outline, item: ItemRef) -> String {
@@ -661,8 +740,11 @@ impl Build {
 
     fn compile_binary_with(&mut self, workspace: &graph::Workspace, drop_finals: bool) -> Result<()> {
         if self.binary.is_none() {
+            let sel = crate::selection();
             let kind = if main_item(workspace, &self.compilation.outline).is_some() {
                 BatchKind::MainCheck
+            } else if sel.bin.is_some() || sel.example.is_some() {
+                return Err(missing_target_error());
             } else {
                 self.load_members(workspace)?;
                 BatchKind::LibCheck
@@ -805,7 +887,7 @@ impl Build {
         let program = match self.program.take() {
             Some(program) => program,
             None => {
-                let Some(main) = main_item(workspace, &self.compilation.outline) else { bail!("no member binary has a `main`") };
+                let main = require_main(workspace, &self.compilation.outline)?;
                 Program::new(&mut self.compilation, Cache::default(), main)?
             }
         };
@@ -870,7 +952,7 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
 
 fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], ahead: Option<&mut crate::prep::Ahead>) -> Result<i32> {
     let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
-    let Some(main) = main_item(workspace, &compilation.outline) else { bail!("no member binary has a `main`") };
+    let main = require_main(workspace, &compilation.outline)?;
     if crate::profile() == Profile::Release && crate::prep::prepared() {
         bind_prepped(workspace, &mut compilation, args, ahead);
     }
