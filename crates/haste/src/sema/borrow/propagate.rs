@@ -276,17 +276,17 @@ impl Checker<'_, '_> {
         for cap in &closure.captures {
             match cap.by {
                 By::Ref | By::Mut => {
-                    let is_ref = self.is_ref_ty(self.local_ty(cap.local));
-                    let (paths, is_mut) = self.closure_capture_info(expr, cap.by, cap.local);
-                    for steps in paths {
-                        let through_ref = steps.first() == Some(&PlaceStep::Deref) && is_ref;
-                        out.push(BorrowSource {
-                            target: cap.local,
-                            steps,
-                            mutable: is_mut,
-                            through_ref,
-                            env_only: capture_env_only(cap.local),
-                        });
+                    let cap_steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(super::places::FieldKey::Tuple(f))).collect();
+                    for (steps, is_mut, through_ref, _) in self.closure_capture_info(expr, cap.by, cap.local) {
+                        if steps.starts_with(&cap_steps) {
+                            out.push(BorrowSource {
+                                target: cap.local,
+                                steps,
+                                mutable: is_mut,
+                                through_ref,
+                                env_only: capture_env_only(cap.local),
+                            });
+                        }
                     }
                     for l in state.loans.iter().filter(|l| l.holder == Some(cap.local)) {
                         out.push(BorrowSource {

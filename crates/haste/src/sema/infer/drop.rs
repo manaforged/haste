@@ -75,12 +75,14 @@ impl Infer<'_, '_> {
         let Some(closure) = here.then(|| self.out.closures.get(&crate::body::ExprId(*at))).flatten() else {
             return Ok(None);
         };
-        let captures: Vec<(u32, super::closure::By)> = closure.captures.iter().map(|c| (c.local, c.by)).collect();
-        for (local, by) in captures {
-            let copy = match by {
+        let captures: Vec<_> = closure.captures.clone();
+        for cap in captures {
+            let local_ty = self.out.locals[cap.local as usize].ty;
+            let cap_ty = cap.ty(self.cx, local_ty).unwrap_or(local_ty);
+            let copy = match cap.by {
                 super::closure::By::Ref => true,
                 super::closure::By::Mut => false,
-                super::closure::By::Value => self.is_copy(self.out.locals[local as usize].ty)?,
+                super::closure::By::Value => self.is_copy(cap_ty)?,
             };
             if !copy {
                 return Ok(Some(false));

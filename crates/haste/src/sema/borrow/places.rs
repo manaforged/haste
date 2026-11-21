@@ -1,4 +1,4 @@
-use crate::body::{BlockKind, Expr, ExprId, List, Stmt, UnOp};
+use crate::body::{BlockKind, Expr, ExprId, List, Pat, PatId, Stmt, UnOp};
 use crate::sema::infer::{By, Res};
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -302,48 +302,103 @@ impl Checker<'_, '_> {
         }
     }
 
-    pub(super) fn closure_capture_info(&self, closure_expr: ExprId, by: By, target: u32) -> (Vec<Vec<PlaceStep>>, bool) {
+    pub(super) fn slice_pat_steps(&self, pat: PatId, list: List) -> Vec<(PatId, PlaceStep)> {
+        let pat_ids = self.body.list(list);
+        let rest_pos = pat_ids.iter().position(|&id| self.is_rest_pat(PatId(id)));
+        let min_len = (pat_ids.len() - usize::from(rest_pos.is_some())) as u64;
+        let array_len = self.typed.pats.get(&pat).and_then(|&ty| match *self.cx.types.kind(ty) {
+            Kind::Array(_, len) => self.cx.types.len(len),
+            _ => None,
+        });
+        pat_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &id)| {
+                let step = match rest_pos {
+                    Some(r) if idx == r => PlaceStep::SliceSub {
+                        from: r as u64,
+                        to: (pat_ids.len() - r - 1) as u64,
+                        array_len,
+                    },
+                    Some(r) if idx > r => PlaceStep::SliceElem {
+                        offset: (pat_ids.len() - idx) as u64,
+                        min_len,
+                        from_end: true,
+                        array_len,
+                    },
+                    _ => PlaceStep::SliceElem {
+                        offset: idx as u64,
+                        min_len,
+                        from_end: false,
+                        array_len,
+                    },
+                };
+                (PatId(id), step)
+            })
+            .collect()
+    }
+
+    pub(super) fn closure_capture_info(&mut self, closure_expr: ExprId, by: By, target: u32) -> Vec<(Vec<PlaceStep>, bool, bool, bool)> {
+        let root_expr = match *self.body.expr(closure_expr) {
+            Expr::Closure { body, .. } => body,
+            _ => closure_expr,
+        };
         let mut walk = CapturePathWalk {
             checker: self,
             target,
             paths: Vec::new(),
-            whole: false,
-            mutates: false,
         };
-        if let Expr::Closure { body, .. } = *self.body.expr(closure_expr) {
-            walk.walk_expr(body);
-        } else {
-            walk.walk_expr(closure_expr);
+        walk.walk_expr(root_expr);
+        if walk.paths.is_empty() {
+            return vec![(Vec::new(), by == By::Mut, false, false)];
         }
-        let paths = if walk.whole || walk.paths.is_empty() {
-            vec![Vec::new()]
-        } else {
-            walk.paths
-        };
-        (paths, by == By::Mut && walk.mutates)
+        if by != By::Mut {
+            for entry in &mut walk.paths {
+                entry.1 = false;
+            }
+        }
+        walk.paths
     }
 }
 
-fn first_field_prefix(steps: &[PlaceStep]) -> Option<Vec<PlaceStep>> {
-    for (idx, step) in steps.iter().enumerate() {
-        match step {
-            PlaceStep::Deref => {}
-            PlaceStep::Field(_) => return Some(steps[..=idx].to_vec()),
-            PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. } | PlaceStep::Opaque => return None,
+fn capture_prefix(p: &Place) -> Vec<PlaceStep> {
+    let limit = p.raw_ptr_prefix.unwrap_or(p.steps.len());
+    let mut out = Vec::new();
+    for step in &p.steps[..limit] {
+        if matches!(step, PlaceStep::Opaque) {
+            break;
         }
+        out.push(step.clone());
     }
-    None
+    out
 }
 
 struct CapturePathWalk<'a, 'c, 'x> {
-    checker: &'a Checker<'c, 'x>,
+    checker: &'a mut Checker<'c, 'x>,
     target: u32,
-    paths: Vec<Vec<PlaceStep>>,
-    whole: bool,
-    mutates: bool,
+    paths: Vec<(Vec<PlaceStep>, bool, bool, bool)>,
 }
 
 impl CapturePathWalk<'_, '_, '_> {
+    fn record_path(&mut self, steps: Vec<PlaceStep>, mutated: bool, through_ref: bool, mut_ref_root: bool) {
+        if let Some(existing) = self.paths.iter_mut().find(|(s, ..)| *s == steps) {
+            existing.1 |= mutated;
+            existing.2 |= through_ref;
+            existing.3 |= mut_ref_root;
+        } else {
+            self.paths.push((steps, mutated, through_ref, mut_ref_root));
+        }
+    }
+
+    fn record_place(&mut self, p: &Place, mutated: bool) {
+        let (through_ref, mut_ref_root) = if p.raw_ptr_prefix.is_some() {
+            (false, false)
+        } else {
+            (p.through_ref, p.mut_ref_root && !p.reborrows_shared_field)
+        };
+        self.record_path(capture_prefix(p), mutated && p.raw_ptr_prefix.is_none(), through_ref, mut_ref_root);
+    }
+
     fn walk_list(&mut self, list: List) {
         for &id in self.checker.body.list(list) {
             self.walk_expr(ExprId(id));
@@ -364,32 +419,185 @@ impl CapturePathWalk<'_, '_, '_> {
     }
 
     fn check_nested_capture(&mut self, closure_expr: ExprId) -> bool {
-        if let Some(c) = self.checker.typed.closures.get(&closure_expr)
-            && let Some(cap) = c.captures.iter().find(|cap| cap.local == self.target)
-        {
-            let is_copy = self.checker.is_copy.get(self.target as usize).copied().unwrap_or(true);
-            let is_mut_ref = self.checker.is_mut_ref_ty(self.checker.local_ty(self.target));
-            if cap.by == By::Value && (!is_copy || is_mut_ref) {
-                self.whole = true;
-                self.mutates = true;
+        if let Some(c) = self.checker.typed.closures.get(&closure_expr) {
+            let caps: Vec<_> = c.captures.iter().filter(|cap| cap.local == self.target).cloned().collect();
+            if !caps.is_empty() {
+                for cap in caps {
+                    let cap_ty = cap.ty(self.checker.cx, self.checker.local_ty(self.target)).unwrap_or_else(|_| self.checker.local_ty(self.target));
+                    let is_copy = self.checker.ty_is_copy(cap_ty);
+                    let is_mut_ref = self.checker.is_mut_ref_ty(cap_ty);
+                    let steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(FieldKey::Tuple(f))).collect();
+                    if cap.by == By::Value && (!is_copy || is_mut_ref) {
+                        self.record_path(steps, true, false, false);
+                    } else if cap.path.is_empty() {
+                        return true;
+                    } else {
+                        self.record_path(steps, cap.by == By::Mut, false, false);
+                    }
+                }
                 return false;
             }
-            return true;
         }
         false
     }
 
-    fn walk_expr(&mut self, expr: ExprId) {
-        if self.whole && self.mutates {
-            return;
+    fn pat_res_inspects(&mut self, pat: PatId) -> bool {
+        match self.checker.typed.pat_res.get(&pat).copied() {
+            Some(Res::Ctor(item, _, _)) => self.checker.cx.adt_def(item).is_ok_and(|def| def.variants.len() > 1),
+            Some(Res::Fn(..)) => true,
+            _ => false,
         }
+    }
+
+    fn walk_scrutinee_pat(&mut self, scrut: ExprId, pats: &[PatId]) {
+        if let Some(p) = self.checker.root_place(scrut)
+            && p.local == self.target
+        {
+            self.walk_place_indices(scrut);
+            if p.raw_ptr_prefix.is_some() {
+                self.record_place(&p, false);
+                return;
+            }
+            let prefix = capture_prefix(&p);
+            let mut_ref_root = p.mut_ref_root && !p.reborrows_shared_field;
+            for &pat in pats {
+                self.walk_pat(pat, &prefix, (p.through_ref, mut_ref_root, p.reborrows_shared_field));
+            }
+        } else {
+            self.walk_expr(scrut);
+        }
+    }
+
+    fn walk_pat(&mut self, pat: PatId, steps: &[PlaceStep], (mut through_ref, mut mut_ref_root, mut shared): (bool, bool, bool)) {
+        let derefs = self.checker.typed.pat_derefs(pat);
+        let mut cur_steps = steps.to_vec();
+        if derefs > 0 {
+            through_ref = true;
+            if !shared && self.pat_has_mut_ref_bind(pat) {
+                mut_ref_root = true;
+            }
+            for _ in 0..derefs {
+                push_step(&mut cur_steps, PlaceStep::Deref);
+            }
+        }
+        match *self.checker.body.pat(pat) {
+            Pat::Wild | Pat::Rest => {}
+            Pat::Paren(inner) | Pat::Box(inner) => {
+                self.walk_pat(inner, &cur_steps, (through_ref, mut_ref_root, shared));
+            }
+            Pat::Ref { mutable, pat: inner } => {
+                through_ref = true;
+                if !mutable {
+                    shared = true;
+                    mut_ref_root = false;
+                } else if !shared {
+                    mut_ref_root = true;
+                }
+                push_step(&mut cur_steps, PlaceStep::Deref);
+                self.walk_pat(inner, &cur_steps, (through_ref, mut_ref_root, shared));
+            }
+            Pat::Bind { sub, .. } => {
+                if self.checker.typed.pat_res.contains_key(&pat) {
+                    if self.pat_res_inspects(pat) {
+                        self.record_path(cur_steps, false, through_ref, mut_ref_root && !shared);
+                    }
+                    return;
+                }
+                let is_leaf = sub.is_none_or(|s| matches!(*self.checker.body.pat(s), Pat::Rest | Pat::Wild));
+                if let Some(&mutability) = self.checker.typed.ref_binds.get(&pat) {
+                    self.record_path(cur_steps.clone(), mutability == Mut::Mut, through_ref, mut_ref_root && !shared);
+                } else if is_leaf {
+                    self.record_path(cur_steps.clone(), false, through_ref, mut_ref_root && !shared);
+                }
+                if let Some(sub) = sub {
+                    self.walk_pat(sub, &cur_steps, (through_ref, mut_ref_root, shared));
+                }
+            }
+            Pat::Lit(_) | Pat::Range { .. } | Pat::Path(_) | Pat::Never | Pat::Macro { .. } => {
+                self.record_path(cur_steps, false, through_ref, mut_ref_root && !shared);
+            }
+            Pat::Tuple(list) | Pat::TupleStruct(_, list) => {
+                if matches!(*self.checker.body.pat(pat), Pat::TupleStruct(..)) && self.pat_res_inspects(pat) {
+                    self.record_path(cur_steps.clone(), false, through_ref, mut_ref_root && !shared);
+                }
+                let mut saw_rest = false;
+                for (idx, &id) in self.checker.body.list(list).iter().enumerate() {
+                    let sub = PatId(id);
+                    if matches!(self.checker.body.pat(sub), Pat::Rest) {
+                        saw_rest = true;
+                        continue;
+                    }
+                    if saw_rest {
+                        self.record_path(cur_steps.clone(), false, through_ref, mut_ref_root && !shared);
+                    } else {
+                        let mut next_steps = cur_steps.clone();
+                        push_step(&mut next_steps, PlaceStep::Field(FieldKey::Tuple(idx as u32)));
+                        self.walk_pat(sub, &next_steps, (through_ref, mut_ref_root, shared));
+                    }
+                }
+            }
+            Pat::Struct { fields, .. } => {
+                if self.pat_res_inspects(pat) {
+                    self.record_path(cur_steps.clone(), false, through_ref, mut_ref_root && !shared);
+                }
+                for &fp_id in self.checker.body.list(fields) {
+                    let fp = self.checker.body.field_pats[fp_id as usize];
+                    let mut next_steps = cur_steps.clone();
+                    push_step(&mut next_steps, PlaceStep::Field(FieldKey::Named(self.checker.src.text(fp.name).to_owned())));
+                    self.walk_pat(fp.pat, &next_steps, (through_ref, mut_ref_root, shared));
+                }
+            }
+            Pat::Slice(list) => {
+                if self.checker.typed.pats.get(&pat).is_some_and(|&ty| matches!(self.checker.cx.types.kind(ty), Kind::Slice(_))) {
+                    self.record_path(cur_steps.clone(), false, through_ref, mut_ref_root && !shared);
+                }
+                for (sub, step) in self.checker.slice_pat_steps(pat, list) {
+                    let mut next_steps = cur_steps.clone();
+                    push_step(&mut next_steps, step);
+                    self.walk_pat(sub, &next_steps, (through_ref, mut_ref_root, shared));
+                }
+            }
+            Pat::Or(list) => {
+                for &alt in self.checker.body.list(list) {
+                    self.walk_pat(PatId(alt), &cur_steps, (through_ref, mut_ref_root, shared));
+                }
+            }
+            Pat::Deref(inner) => {
+                self.record_path(cur_steps.clone(), false, through_ref, mut_ref_root && !shared);
+                self.walk_pat(inner, &cur_steps, (through_ref, mut_ref_root, shared));
+            }
+        }
+    }
+
+    fn pat_has_mut_ref_bind(&self, pat: PatId) -> bool {
+        match *self.checker.body.pat(pat) {
+            Pat::Bind { sub, .. } => {
+                self.checker.typed.ref_binds.get(&pat) == Some(&Mut::Mut)
+                    || sub.is_some_and(|s| self.pat_has_mut_ref_bind(s))
+            }
+            Pat::Paren(inner) | Pat::Box(inner) | Pat::Deref(inner) => self.pat_has_mut_ref_bind(inner),
+            Pat::Tuple(list) | Pat::TupleStruct(_, list) | Pat::Slice(list) | Pat::Or(list) => {
+                self.checker.body.list(list).iter().any(|&id| self.pat_has_mut_ref_bind(PatId(id)))
+            }
+            Pat::Struct { fields, .. } => self
+                .checker
+                .body
+                .list(fields)
+                .iter()
+                .any(|&id| self.pat_has_mut_ref_bind(self.checker.body.field_pats[id as usize].pat)),
+            _ => false,
+        }
+    }
+
+    fn walk_expr(&mut self, expr: ExprId) {
         match *self.checker.body.expr(expr) {
             Expr::Ref { mutable, raw, expr: inner } => {
-                if !raw
-                    && mutable
-                    && self.checker.root_place(inner).is_some_and(|p| p.local == self.target)
+                if let Some(p) = self.checker.root_place(inner)
+                    && p.local == self.target
                 {
-                    self.mutates = true;
+                    self.record_place(&p, !raw && mutable);
+                    self.walk_place_indices(inner);
+                    return;
                 }
                 self.walk_expr(inner);
             }
@@ -402,14 +610,8 @@ impl CapturePathWalk<'_, '_, '_> {
                 if let Some(p) = self.checker.root_place(expr)
                     && p.local == self.target
                 {
-                    if let Some(prefix) = first_field_prefix(&p.steps) {
-                        if !self.paths.contains(&prefix) {
-                            self.paths.push(prefix);
-                        }
-                        self.walk_place_indices(expr);
-                    } else {
-                        self.whole = true;
-                    }
+                    self.record_place(&p, false);
+                    self.walk_place_indices(expr);
                     return;
                 }
                 match *self.checker.body.expr(expr) {
@@ -424,14 +626,18 @@ impl CapturePathWalk<'_, '_, '_> {
             Expr::Unary(_, inner) => self.walk_expr(inner),
             Expr::Path(_) => {
                 if self.checker.typed.res.get(&expr) == Some(&Res::Local(self.target)) {
-                    self.whole = true;
+                    self.record_path(Vec::new(), false, false, false);
                 }
             }
             Expr::Assign(lhs, rhs) | Expr::AssignOp(_, lhs, rhs) => {
-                if self.checker.root_place(lhs).is_some_and(|p| p.local == self.target) {
-                    self.mutates = true;
+                if let Some(p) = self.checker.root_place(lhs)
+                    && p.local == self.target
+                {
+                    self.record_place(&p, true);
+                    self.walk_place_indices(lhs);
+                } else {
+                    self.walk_expr(lhs);
                 }
-                self.walk_expr(lhs);
                 self.walk_expr(rhs);
             }
             Expr::Binary(_, a, b) | Expr::Repeat(a, b) => {
@@ -443,15 +649,17 @@ impl CapturePathWalk<'_, '_, '_> {
                 self.walk_list(args);
             }
             Expr::Method { receiver, params, .. } => {
-                if self.checker.root_place(receiver).is_some_and(|p| p.local == self.target) {
+                if let Some(p) = self.checker.root_place(receiver)
+                    && p.local == self.target
+                {
                     let autoref = self.checker.typed.adjusts.get(&expr).and_then(|a| a.autoref);
-                    if autoref == Some(Mut::Mut)
-                        || (autoref.is_none() && self.checker.is_mut_ref_ty(self.checker.expr_ty(receiver)))
-                    {
-                        self.mutates = true;
-                    }
+                    let is_mut = autoref == Some(Mut::Mut)
+                        || (autoref.is_none() && self.checker.is_mut_ref_ty(self.checker.expr_ty(receiver)));
+                    self.record_place(&p, is_mut);
+                    self.walk_place_indices(receiver);
+                } else {
+                    self.walk_expr(receiver);
                 }
-                self.walk_expr(receiver);
                 self.walk_list(params);
             }
             Expr::Block { kind, stmts, tail, .. } => {
@@ -460,9 +668,9 @@ impl CapturePathWalk<'_, '_, '_> {
                 }
                 for &id in self.checker.body.list(stmts) {
                     match self.checker.body.stmts[id as usize] {
-                        Stmt::Let { init, otherwise, .. } => {
+                        Stmt::Let { pat, init, otherwise, .. } => {
                             if let Some(e) = init {
-                                self.walk_expr(e);
+                                self.walk_scrutinee_pat(e, &[pat]);
                             }
                             if let Some(e) = otherwise {
                                 self.walk_expr(e);
@@ -483,7 +691,7 @@ impl CapturePathWalk<'_, '_, '_> {
                     self.walk_expr(alt);
                 }
             }
-            Expr::Let(_, init) => self.walk_expr(init),
+            Expr::Let(pat, init) => self.walk_scrutinee_pat(init, &[pat]),
             Expr::While { cond, body, .. } => {
                 self.walk_expr(cond);
                 self.walk_expr(body);
@@ -494,8 +702,10 @@ impl CapturePathWalk<'_, '_, '_> {
                 self.walk_expr(body);
             }
             Expr::Match(scrut, arms) => {
-                self.walk_expr(scrut);
-                for &id in self.checker.body.list(arms) {
+                let arm_ids = self.checker.body.list(arms);
+                let pats: Vec<PatId> = arm_ids.iter().map(|&id| self.checker.body.arms[id as usize].pat).collect();
+                self.walk_scrutinee_pat(scrut, &pats);
+                for &id in arm_ids {
                     let arm = self.checker.body.arms[id as usize];
                     if let Some(g) = arm.guard {
                         self.walk_expr(g);

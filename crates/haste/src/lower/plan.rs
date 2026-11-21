@@ -94,6 +94,7 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
     mix.item(cx.outline, item);
     let mut cycle_root = usize::MAX;
     hash_instance_header(cx, &mut mix, (slots.low_entries(), slots.allow_inline()), item, typed)?;
+    mix.bool(reached.has_catch_unwind(cx));
     match &typed.shape {
         Shape::Glue(glue) => hash_glue_shape(cx, (reached, slots), inline, &mut mix, index, substs, glue, &mut cycle_root)?,
         Shape::Untuple(target) => hash_untuple_shape(cx, (reached, slots), inline, &mut mix, index, typed, *target, &mut cycle_root)?,
@@ -407,7 +408,13 @@ fn hash_closure_header(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, c
     mix.usize(cb.closure.captures.len());
     for cap in &cb.closure.captures {
         mix.byte(cap.by as u8);
-        hash_ty_facts(cx, mix, typed.locals[cap.local as usize].ty)?;
+        mix.usize(cap.path.len());
+        for &(variant, index) in &cap.path {
+            mix.u32(variant);
+            mix.u32(index);
+        }
+        let cap_ty = cap.ty(cx, typed.locals[cap.local as usize].ty)?;
+        hash_ty_facts(cx, mix, cap_ty)?;
     }
     Ok(())
 }

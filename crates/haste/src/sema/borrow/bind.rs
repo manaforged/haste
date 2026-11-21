@@ -137,37 +137,12 @@ impl Checker<'_, '_> {
                 self.bind_positional_pat(&pat_ids, elem_exprs.as_deref(), scrut_place, pat_steps, &next_fallback, state, options)?;
             }
             Pat::Slice(list) => {
-                let pat_ids: Vec<u32> = self.body.list(list).to_vec();
-                let rest_pos = pat_ids.iter().position(|&id| self.is_rest_pat(PatId(id)));
-                let min_len = (pat_ids.len() - usize::from(rest_pos.is_some())) as u64;
-                let array_len = self.typed.pats.get(&pat).and_then(|&ty| match *self.cx.types.kind(ty) {
-                    Kind::Array(_, len) => self.cx.types.len(len),
-                    _ => None,
-                });
+                let steps = self.slice_pat_steps(pat, list);
                 let next_fallback = self.fallback_or_empty(true, unwrapped_init, fallback_sources, state);
-                for (idx, &id) in pat_ids.iter().enumerate() {
-                    let step = match rest_pos {
-                        Some(r) if idx == r => PlaceStep::SliceSub {
-                            from: r as u64,
-                            to: (pat_ids.len() - r - 1) as u64,
-                            array_len,
-                        },
-                        Some(r) if idx > r => PlaceStep::SliceElem {
-                            offset: (pat_ids.len() - idx) as u64,
-                            min_len,
-                            from_end: true,
-                            array_len,
-                        },
-                        _ => PlaceStep::SliceElem {
-                            offset: idx as u64,
-                            min_len,
-                            from_end: false,
-                            array_len,
-                        },
-                    };
+                for (id, step) in steps {
                     let mut next_steps = pat_steps.to_vec();
                     push_step(&mut next_steps, step);
-                    self.bind_pat(PatId(id), None, scrut_place, &next_steps, &next_fallback, state, options)?;
+                    self.bind_pat(id, None, scrut_place, &next_steps, &next_fallback, state, options)?;
                 }
             }
             Pat::Struct { fields, .. } => {
@@ -256,7 +231,7 @@ impl Checker<'_, '_> {
         (adjusted_place, adjusted_steps)
     }
 
-    fn is_rest_pat(&self, pat: PatId) -> bool {
+    pub(super) fn is_rest_pat(&self, pat: PatId) -> bool {
         match *self.body.pat(pat) {
             Pat::Rest => true,
             Pat::Bind { sub: Some(sub), .. } => matches!(*self.body.pat(sub), Pat::Rest),
@@ -466,7 +441,7 @@ impl Checker<'_, '_> {
                         self.check_can_move(c_local, &[], state)?;
                         state.moved[c_local as usize] = true;
                     } else if parent == self.item
-                        && c.captures.iter().any(|cap| cap.by == By::Mut && self.closure_capture_info(ExprId(at), cap.by, cap.local).1)
+                        && c.captures.iter().any(|cap| cap.by == By::Mut && self.closure_capture_info(ExprId(at), cap.by, cap.local).iter().any(|(_, m, ..)| *m))
                     {
                         self.check_borrow(c_local, false, false, &[], true, state)?;
                     }
@@ -681,28 +656,42 @@ impl Checker<'_, '_> {
             loans: Vec::new(),
             diverged: false,
         };
+        let mut seen_whole = Vec::new();
         for cap in &closure.captures {
             let local = cap.local;
             if (local as usize) >= self.is_copy.len() {
                 continue;
             }
+            if cap.path.is_empty() {
+                if seen_whole.contains(&local) {
+                    continue;
+                }
+                seen_whole.push(local);
+            }
+            let cap_steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(super::places::FieldKey::Tuple(f))).collect();
+            let cap_copy = if cap.path.is_empty() {
+                self.is_copy[local as usize]
+            } else {
+                let root_ty = self.local_ty(local);
+                let cap_ty = cap.ty(self.cx, root_ty).unwrap_or(root_ty);
+                self.ty_is_copy(cap_ty)
+            };
             match cap.by {
                 By::Ref | By::Mut => {
-                    let is_ref = self.is_ref_ty(self.local_ty(local));
                     let is_mut_ref = self.is_mut_ref_ty(self.local_ty(local));
-                    let (paths, is_mut) = self.closure_capture_info(expr, cap.by, local);
-                    for steps in paths {
-                        let through_ref = steps.first() == Some(&PlaceStep::Deref) && is_ref;
-                        self.check_borrow(local, through_ref, is_mut && is_mut_ref, &steps, is_mut, state)?;
+                    for (steps, is_mut, through_ref, mut_ref_root) in self.closure_capture_info(expr, cap.by, local) {
+                        if steps.starts_with(&cap_steps) {
+                            self.check_borrow(local, through_ref || is_mut_ref, (is_mut && mut_ref_root) || is_mut_ref, &steps, is_mut, state)?;
+                        }
                     }
                 }
                 By::Value => {
-                    if self.is_copy[local as usize] {
-                        self.check_can_read(local, &[], state)?;
-                    } else {
-                        let (paths, _) = self.closure_capture_info(expr, cap.by, local);
-                        if !paths.is_empty() && paths.iter().all(|s| !s.is_empty() && s.first() != Some(&PlaceStep::Deref)) {
-                            for steps in paths {
+                    if cap_copy {
+                        self.check_can_read(local, &cap_steps, state)?;
+                    } else if cap_steps.is_empty() {
+                        let paths = self.closure_capture_info(expr, cap.by, local);
+                        if !paths.is_empty() && paths.iter().all(|(s, ..)| !s.is_empty() && s.first() != Some(&PlaceStep::Deref)) {
+                            for (steps, ..) in paths {
                                 self.check_can_move(local, &steps, state)?;
                                 let pm = PartialMove { local, steps };
                                 if !state.partial_moves.contains(&pm) {
@@ -713,6 +702,12 @@ impl Checker<'_, '_> {
                             self.check_can_move(local, &[], state)?;
                             state.moved[local as usize] = true;
                             state.partial_moves.retain(|m| m.local != local);
+                        }
+                    } else {
+                        self.check_can_move(local, &cap_steps, state)?;
+                        let pm = PartialMove { local, steps: cap_steps };
+                        if !state.partial_moves.contains(&pm) {
+                            state.partial_moves.push(pm);
                         }
                     }
                 }

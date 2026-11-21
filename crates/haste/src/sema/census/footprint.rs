@@ -357,6 +357,11 @@ fn hash_shape_kind(cx: &mut Context<'_>, typed: &Typed, bins: &mut HashBins) {
             bins.k.usize(cb.closure.captures.len());
             for cap in &cb.closure.captures {
                 bins.k.byte(cap.by as u8);
+                bins.k.usize(cap.path.len());
+                for &(variant, index) in &cap.path {
+                    bins.k.u32(variant);
+                    bins.k.u32(index);
+                }
             }
             if let Some(env_local) = cb.env {
                 hash_closure_env_offsets(cx, typed.locals[env_local as usize].ty, bins);

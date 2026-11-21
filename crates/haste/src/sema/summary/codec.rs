@@ -395,6 +395,11 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
             for cap in &v.captures {
                 write_u32(out, cap.local);
                 out.push(match cap.by { By::Ref => 0, By::Mut => 1, By::Value => 2 });
+                write_u32(out, cap.path.len() as u32);
+                for &(variant, index) in &cap.path {
+                    write_u32(out, variant);
+                    write_u32(out, index);
+                }
             }
             out.push(u8::from(v.consumes)); out.push(u8::from(v.coroutine)); Some(())
         })?;
@@ -571,7 +576,14 @@ impl Decoder<'_> {
         let awaits = read_map(cur, |c| Ok((ExprId(c.u32()?), Awaited { into_future: self.res(c)?, future: self.ty(c.u32()?)?, poll: self.res(c)?, polled: self.ty(c.u32()?)? })))?;
         let closures = read_map(cur, |c| {
             let (k, params, ret, body) = (ExprId(c.u32()?), c.u32s()?, self.ty(c.u32()?)?, ExprId(c.u32()?));
-            let captures = (0..c.u32()?).map(|_| Ok(Capture { local: c.u32()?, by: match c.u8()? { 0 => By::Ref, 1 => By::Mut, 2 => By::Value, _ => bail!("invalid capture by") } })).collect::<Result<Vec<_>>>()?;
+            let captures = (0..c.u32()?)
+                .map(|_| {
+                    let local = c.u32()?;
+                    let by = match c.u8()? { 0 => By::Ref, 1 => By::Mut, 2 => By::Value, _ => bail!("invalid capture by") };
+                    let path = (0..c.u32()?).map(|_| Ok((c.u32()?, c.u32()?))).collect::<Result<Vec<_>>>()?;
+                    Ok(Capture { local, by, path })
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok((k, Closure { params, ret, body, captures, consumes: c.u8()? != 0, coroutine: c.u8()? != 0 }))
         })?;
         let try_blocks = read_map(cur, |c| Ok((ExprId(c.u32()?), self.res(c)?)))?;

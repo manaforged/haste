@@ -47,19 +47,80 @@ impl Lower<'_, '_> {
         Ok((object.at(offset, repr(self.cx, inner)?), inner))
     }
 
+    fn capture_source_place(&mut self, capture: &Capture) -> Result<(u32, Vec<(u32, u32)>, Option<Place>, Ty)> {
+        let (root_local, rel_path, mut place, mut ty) = if self.locals[capture.local as usize].is_none()
+            && let Some((slot_local, place, k)) = (1..=capture.path.len()).rev().find_map(|k| {
+                self.capture_by_path(capture.local, &capture.path[..k]).map(|(s, p)| (s, p, k))
+            })
+        {
+            (slot_local, capture.path[k..].to_vec(), place, self.typed.locals[slot_local as usize].ty)
+        } else {
+            (capture.local, capture.path.clone(), self.locals[capture.local as usize], self.typed.locals[capture.local as usize].ty)
+        };
+        for &step in &rel_path {
+            place = place.map(|p| self.part_place(p, ty, step)).transpose()?;
+            ty = Capture::step_ty(self.cx, ty, step)?;
+        }
+        Ok((root_local, rel_path, place, ty))
+    }
+
     fn capture_value(&mut self, capture: &Capture) -> Result<Option<Value>> {
-        let held = self.locals[capture.local as usize];
-        let local_ty = self.typed.locals[capture.local as usize].ty;
+        let (root_local, rel_path, held, cap_ty) = self.capture_source_place(capture)?;
         Ok(match capture.by {
             By::Value => {
                 let value = held.and_then(|place| self.read(place));
-                if needs_drop(self.cx, local_ty)? {
-                    self.moved_out(Root::Local(capture.local), &[])?;
+                if needs_drop(self.cx, cap_ty)? {
+                    self.moved_out(Root::Local(root_local), &rel_path)?;
                 }
                 value
             }
-            By::Ref | By::Mut => Some(self.address_or_dangling(held, local_ty)?),
+            By::Ref | By::Mut => Some(self.address_or_dangling(held, cap_ty)?),
         })
+    }
+
+    fn projected_capture_local(closure: &crate::sema::infer::Closure, env_local: u32, index: usize) -> u32 {
+        let ordinal = closure.captures[..index].iter().filter(|c| !c.path.is_empty()).count() as u32;
+        env_local + 1 + u32::from(closure.coroutine) + ordinal
+    }
+
+    pub(super) fn capture_local_by_path(&self, local: u32, path: &[(u32, u32)]) -> Option<u32> {
+        if path.is_empty() {
+            return None;
+        }
+        let Shape::Closure(ClosureBody { env: Some(env_local), closure, .. }) = &self.typed.shape else {
+            return None;
+        };
+        let index = closure.captures.iter().position(|c| c.local == local && c.path == path)?;
+        Some(Self::projected_capture_local(closure, *env_local, index))
+    }
+
+    pub(super) fn capture_by_path(&self, local: u32, path: &[(u32, u32)]) -> Option<(u32, Option<Place>)> {
+        let cap_local = self.capture_local_by_path(local, path)?;
+        Some((cap_local, self.locals[cap_local as usize]))
+    }
+
+    pub(super) fn expr_capture_path(&self, mut expr: ExprId) -> Option<(u32, Vec<(u32, u32)>)> {
+        while let Some(inner) = self.transparent(expr) {
+            expr = inner;
+        }
+        match *self.body.expr(expr) {
+            Expr::Path(_) => match self.typed.res.get(&expr) {
+                Some(&Res::Local(local)) => Some((local, Vec::new())),
+                _ => None,
+            },
+            Expr::TupleField(base, index) if !self.typed.autoderefs.contains_key(&expr) => {
+                let (local, mut path) = self.expr_capture_path(base)?;
+                path.push((0, index));
+                Some((local, path))
+            }
+            Expr::Field(base, _) if !self.typed.autoderefs.contains_key(&expr) => {
+                let index = *self.typed.fields.get(&expr)?;
+                let (local, mut path) = self.expr_capture_path(base)?;
+                path.push((0, index));
+                Some((local, path))
+            }
+            _ => None,
+        }
     }
 
     /// Points each local that the closure being lowered captures at its place in the environment.
@@ -70,15 +131,16 @@ impl Lower<'_, '_> {
         let (whole, env) = self.env_place(local, closure.coroutine)?;
         for (index, capture) in closure.captures.iter().enumerate() {
             let part = self.part_place(whole, env, (0, index as u32))?;
-            let local_ty = self.typed.locals[capture.local as usize].ty;
+            let cap_ty = capture.ty(self.cx, self.typed.locals[capture.local as usize].ty)?;
+            let slot_local = if capture.path.is_empty() { capture.local } else { Self::projected_capture_local(&closure, local, index) };
             if closure.consumes && capture.by == By::Value {
-                self.own(Root::Local(capture.local), local_ty, Some(part), true)?;
+                self.own(Root::Local(slot_local), cap_ty, Some(part), true)?;
             }
-            self.locals[capture.local as usize] = Some(match capture.by {
+            self.locals[slot_local as usize] = Some(match capture.by {
                 By::Value => part,
                 By::Ref | By::Mut => {
                     let Some(address) = self.read(part) else { bail!("a captured reference with no value") };
-                    Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, local_ty)? }
+                    Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, cap_ty)? }
                 }
             });
         }
