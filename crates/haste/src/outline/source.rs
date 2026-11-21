@@ -40,6 +40,14 @@ impl Token {
     fn set_joint(&mut self, joint: bool) {
         self.len = (self.len & !JOINT) | (u32::from(joint) * JOINT);
     }
+
+    pub(crate) fn from_raw(kind: TokenKind, start: u32, len: u32, pair: u32) -> Token {
+        Token { kind, start, len, pair }
+    }
+
+    pub(crate) fn raw(self) -> (u32, u32) {
+        (self.len, self.pair)
+    }
 }
 
 /// Whether `kind` is a doc comment, and whether it documents the enclosing item.

@@ -10,10 +10,7 @@ impl Crate {
     pub fn add_pending(&mut self, found: Vec<Pending>) {
         for mut pending in found {
             let index = self.pending.len();
-            match pending.name {
-                Some(name) => self.named.entry((pending.module, name)).or_default().push(index),
-                None => self.globs.entry(pending.module).or_default().push(index),
-            }
+            self.index_pending(index, &pending);
             let asked = self.wanted.get(&pending.module).is_some_and(|names| pending.name.is_none_or(|name| names.contains(&name)));
             pending.active = asked || self.resolves_all(pending.module);
             self.pending.push(pending);
@@ -81,7 +78,7 @@ impl Names {
             .iter()
             .enumerate()
             .flat_map(|(krate, entry)| {
-                let eager = entry.eager.then(|| entry.globs.keys().copied()).into_iter().flatten();
+                let eager = (entry.eager && !entry.settled).then(|| entry.globs.keys().copied()).into_iter().flatten();
                 eager.chain(entry.whole.iter().copied()).map(move |module| ModRef { krate: krate as u32, module })
             })
             .collect();
