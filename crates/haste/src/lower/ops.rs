@@ -481,7 +481,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {
-        if self.is_wide(self.ty_of(expr))? || self.typed.coercions.contains_key(&inner) {
+        if self.ty_of(expr) == self.ty_of(inner) || self.is_wide(self.ty_of(expr))? || self.typed.coercions.contains_key(&inner) {
             return self.expr(inner);
         }
         let to = self.num(self.ty_of(expr))?;

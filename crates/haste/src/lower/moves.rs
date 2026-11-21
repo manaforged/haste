@@ -48,6 +48,11 @@ impl Lower<'_, '_> {
             ty = owned;
         }
         path.push((0, index));
+        if let Root::Local(local) = root
+            && let Some(cap_local) = self.capture_local_by_path(local, &path)
+        {
+            return Some((Root::Local(cap_local), Vec::new()));
+        }
         Some((root, path))
     }
 
@@ -55,6 +60,14 @@ impl Lower<'_, '_> {
     pub fn scrutinee_path(&self, scrutinee: ExprId) -> Option<(Root, MovePath)> {
         if self.typed.coercions.contains_key(&scrutinee) {
             return Some((Root::Temp(scrutinee), Vec::new()));
+        }
+        if let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(scrutinee)
+            && let Some(inner) = self.cx.boxed(self.ty_of(operand))
+            && matches!(self.cx.types.kind(inner), Kind::Array(..))
+        {
+            let (root, mut path) = self.move_path(operand)?;
+            path.push(BOX_STEP);
+            return Some((root, path));
         }
         self.move_path(scrutinee).or_else(|| (!self.is_place(scrutinee)).then(|| (Root::Temp(scrutinee), Vec::new())))
     }
@@ -118,6 +131,20 @@ impl Lower<'_, '_> {
                     }
                 }
                 Expr::Let(pat, init) => self.pattern_paths(pat, self.scrutinee_path(init), &mut found)?,
+                Expr::Closure { .. } if let Some(closure) = self.typed.closures.get(&expr).cloned() => {
+                    for cap in &closure.captures {
+                        if cap.by == crate::sema::infer::By::Value && !cap.path.is_empty() {
+                            let cap_ty = cap.ty(self.cx, self.typed.locals[cap.local as usize].ty)?;
+                            if needs_drop(self.cx, cap_ty)? {
+                                let entry = (1..=cap.path.len()).rev().find_map(|k| {
+                                    self.capture_local_by_path(cap.local, &cap.path[..k])
+                                        .map(|slot| (Root::Local(slot), cap.path[k..].to_vec()))
+                                }).unwrap_or_else(|| (Root::Local(cap.local), cap.path.clone()));
+                                self.add_path(&mut found, Some(entry));
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -166,7 +193,21 @@ impl Lower<'_, '_> {
                 for (sub, step) in self.part_indices(pat)? {
                     let mut path = at.1.clone();
                     path.push(step);
-                    self.pattern_paths(sub, Some((at.0, path)), found)?;
+                    let next = if let Root::Local(local) = at.0
+                        && let Some(cap_local) = self.capture_local_by_path(local, &path)
+                    {
+                        (Root::Local(cap_local), Vec::new())
+                    } else {
+                        (at.0, path)
+                    };
+                    self.pattern_paths(sub, Some(next), found)?;
+                }
+                if let Some((rest_sub, range)) = self.slice_rest_range(pat)? {
+                    for index in range {
+                        let mut path = at.1.clone();
+                        path.push((0, index));
+                        self.pattern_paths(rest_sub, Some((at.0, path)), found)?;
+                    }
                 }
                 Ok(())
             }

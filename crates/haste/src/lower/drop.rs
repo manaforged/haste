@@ -94,16 +94,25 @@ impl Lower<'_, '_> {
         Ok(parts)
     }
 
+    fn adt_variants(&mut self, ty: Ty) -> Result<Option<Fields>> {
+        match *self.cx.types.kind(ty) {
+            Kind::Adt(item, _) if skips_fields(self.cx, item) => Ok(None),
+            Kind::Adt(item, args) => {
+                let slice = self.cx.types.substs(args).to_vec();
+                Ok(Some(field_types(self.cx, item, &slice)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn single_variant_fields(&mut self, ty: Ty) -> Result<Option<Vec<Ty>>> {
         Ok(match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => Some(self.cx.types.substs(items).to_vec()),
             Kind::Array(element, len) => Some(vec![element; self.len(len)? as usize]),
-            Kind::Adt(item, _) if skips_fields(self.cx, item) => Some(Vec::new()),
-            Kind::Adt(item, args) => {
-                let slice = self.cx.types.substs(args).to_vec();
-                let variants = field_types(self.cx, item, &slice)?;
-                (variants.len() == 1).then(|| variants[0].clone())
-            }
+            Kind::Adt(..) => match self.adt_variants(ty)? {
+                Some(variants) => (variants.len() == 1).then(|| variants[0].clone()),
+                None => Some(Vec::new()),
+            },
             _ => None,
         })
     }
@@ -171,10 +180,14 @@ impl Lower<'_, '_> {
     }
 
     fn push_unwind(&mut self, root: Root, ty: Ty, place: Option<Place>, init: bool) -> Result<StackSlot> {
+        let origin = super::reloc::TyOrigin::from_root(root, self.typed);
+        self.push_unwind_origin(origin, ty, place, init)
+    }
+
+    fn push_unwind_origin(&mut self, origin: super::reloc::TyOrigin, ty: Ty, place: Option<Place>, init: bool) -> Result<StackSlot> {
         let Some(glue) = self.cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
         let substs = self.cx.types.intern_substs(&[ty]);
         let glue_index = self.reached_index(glue, substs)?;
-        let origin = super::reloc::TyOrigin::from_root(root, self.typed);
         let drop_fn = self.code_of(glue_index, super::reloc::SiteOrigin::DropGlue(origin));
         let addr = self.address_or_dangling(place, ty)?;
         let slot = self.b.create_stack_slot(40, 3);
@@ -468,31 +481,29 @@ impl Lower<'_, '_> {
     }
 
     fn open_drop(&mut self, at: usize, path: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {
-        let Some(place) = place else { bail!("a partly moved value with no bytes") };
         let variants: Fields = match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
             Kind::Array(element, len) => vec![vec![element; self.len(len)? as usize]].into(),
-            Kind::Adt(item, _) if skips_fields(self.cx, item) => return Ok(()),
-            Kind::Adt(item, args) => {
-                let slice = self.cx.types.substs(args).to_vec();
-                field_types(self.cx, item, &slice)?
-            }
+            Kind::Adt(..) => match self.adt_variants(ty)? {
+                Some(variants) => variants,
+                None => return Ok(()),
+            },
             ref other => bail!("a partly moved {other:?}"),
         };
         self.each_field((ty, place), &variants, &mut |lower, field, field_ty, part| {
             let mut sub = path.to_vec();
             sub.push(field);
-            lower.drop_path(at, &sub, field_ty, Some(part))
+            lower.drop_path(at, &sub, field_ty, part)
         })
     }
 
-    fn each_field(&mut self, (ty, place): (Ty, Place), variants: &[Vec<Ty>], visit: &mut dyn FnMut(&mut Self, (u32, u32), Ty, Place) -> Result<()>) -> Result<()> {
+    fn each_field(&mut self, (ty, place): (Ty, Option<Place>), variants: &[Vec<Ty>], visit: &mut dyn FnMut(&mut Self, (u32, u32), Ty, Option<Place>) -> Result<()>) -> Result<()> {
         let enumerated = variants.len() > 1;
         for (variant, fields) in variants.iter().enumerate() {
             let variant = variant as u32;
             let mut each = |lower: &mut Self| -> Result<()> {
                 for (index, &field) in fields.iter().enumerate() {
-                    let part = lower.part_place(place, ty, (variant, index as u32))?;
+                    let part = place.map(|place| lower.part_place(place, ty, (variant, index as u32))).transpose()?;
                     visit(lower, (variant, index as u32), field, part)?;
                 }
                 Ok(())
@@ -505,8 +516,8 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn when_variant(&mut self, place: Place, ty: Ty, variant: u32, run: &mut dyn FnMut(&mut Self) -> Result<()>) -> Result<()> {
-        match self.is_variant(Some(place), ty, variant)? {
+    fn when_variant(&mut self, place: Option<Place>, ty: Ty, variant: u32, run: &mut dyn FnMut(&mut Self) -> Result<()>) -> Result<()> {
+        match self.is_variant(place, ty, variant)? {
             Some(test) => self.when(test, run),
             None => run(self),
         }
@@ -546,9 +557,74 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         if let Some((item, substs)) = drop_fn {
-            self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;
+            return self.drop_with_parts(ty, target, origin, (item, substs));
         }
         self.drop_parts(ty, target, origin)
+    }
+
+    fn glue_place(&mut self, ty: Ty, target: Value) -> Result<Place> {
+        let repr = if self.cx.is_unsized(ty)? { super::ops::WIDE } else { repr(self.cx, ty)? };
+        Ok(Place { base: Base::Addr(target), offset: 0, repr })
+    }
+
+    fn push_variant_unwind(&mut self, origin: &super::reloc::TyOrigin, variant: u32, fields: &[(u32, Ty, Place)], slots: &mut Vec<StackSlot>) -> Result<()> {
+        for &(field, field_ty, part) in fields.iter().rev() {
+            slots.push(self.push_unwind_origin(origin.clone().step(variant, field), field_ty, Some(part), true)?);
+        }
+        Ok(())
+    }
+
+    fn drop_with_parts(&mut self, ty: Ty, target: Value, origin: super::reloc::TyOrigin, (item, substs): (crate::names::ItemRef, crate::sema::substs::Substs)) -> Result<()> {
+        let want_unwind = self.open && self.reached.has_catch_unwind(self.cx);
+        let variants = if want_unwind { self.adt_variants(ty)? } else { None };
+        let Some(variants) = variants else {
+            self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;
+            return self.drop_parts(ty, target, origin);
+        };
+        let place = self.glue_place(ty, target)?;
+        let mut per_variant: Vec<(u32, Vec<(u32, Ty, Place)>)> = Vec::new();
+        for (variant, fields) in variants.iter().enumerate() {
+            let mut droppable = Vec::new();
+            for (field, &field_ty) in fields.iter().enumerate() {
+                if needs_drop(self.cx, field_ty)? {
+                    let part = self.part_place(place, ty, (variant as u32, field as u32))?;
+                    droppable.push((field as u32, field_ty, part));
+                }
+            }
+            if !droppable.is_empty() {
+                per_variant.push((variant as u32, droppable));
+            }
+        }
+        if per_variant.is_empty() {
+            self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;
+            return Ok(());
+        }
+        let mut slots = Vec::new();
+        if variants.len() == 1
+            && let Some((_, fields)) = per_variant.pop()
+        {
+            self.push_variant_unwind(&origin, 0, &fields, &mut slots)?;
+            self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;
+            if !self.open {
+                return Ok(());
+            }
+            for ((field, field_ty, part), slot) in fields.into_iter().zip(slots.into_iter().rev()) {
+                self.pop_unwind(slot);
+                self.glue(field_ty, Some(part), origin.clone().step(0, field))?;
+            }
+            return Ok(());
+        }
+        for (variant, fields) in per_variant {
+            self.when_variant(Some(place), ty, variant, &mut |lower| lower.push_variant_unwind(&origin, variant, &fields, &mut slots))?;
+        }
+        self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;
+        if !self.open {
+            return Ok(());
+        }
+        for slot in slots {
+            self.pop_unwind(slot);
+        }
+        self.drop_fields(ty, place, origin)
     }
 
     fn box_contents(&mut self, inner: Ty, target: Value, origin: super::reloc::TyOrigin) -> Result<()> {
@@ -585,8 +661,7 @@ impl Lower<'_, '_> {
                 self.drop_elements(inner, data, len, origin.step(0, 0))
             }
             Kind::Tuple(_) | Kind::Adt(..) => {
-                let repr = if self.cx.is_unsized(ty)? { super::ops::WIDE } else { repr(self.cx, ty)? };
-                let place = Place { base: Base::Addr(target), offset: 0, repr };
+                let place = self.glue_place(ty, target)?;
                 self.drop_fields(ty, place, origin)
             }
             Kind::Closure(..) => match self.cx.closure_env(ty) {
@@ -610,14 +685,13 @@ impl Lower<'_, '_> {
     pub(super) fn drop_fields(&mut self, ty: Ty, place: Place, origin: super::reloc::TyOrigin) -> Result<()> {
         let variants: Fields = match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
-            Kind::Adt(item, _) if skips_fields(self.cx, item) => return Ok(()),
-            Kind::Adt(item, args) => {
-                let slice = self.cx.types.substs(args).to_vec();
-                field_types(self.cx, item, &slice)?
-            }
+            Kind::Adt(..) => match self.adt_variants(ty)? {
+                Some(variants) => variants,
+                None => return Ok(()),
+            },
             _ => return Ok(()),
         };
-        self.each_field((ty, place), &variants, &mut |lower, (variant, field), field_ty, part| lower.glue(field_ty, Some(part), origin.clone().step(variant, field)))
+        self.each_field((ty, Some(place)), &variants, &mut |lower, (variant, field), field_ty, part| lower.glue(field_ty, part, origin.clone().step(variant, field)))
     }
 
     fn drop_elements(&mut self, inner: Ty, data: Value, count: Value, origin: super::reloc::TyOrigin) -> Result<()> {

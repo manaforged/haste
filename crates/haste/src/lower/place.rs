@@ -235,22 +235,30 @@ impl Lower<'_, '_> {
         self.temp(expr)
     }
 
+    fn is_uncaptured_local(&self, mut expr: ExprId) -> bool {
+        while let Some(inner) = self.transparent(expr) {
+            expr = inner;
+        }
+        matches!(self.body.expr(expr), Expr::Path(_))
+            && matches!(self.typed.res.get(&expr), Some(&Res::Local(local)) if self.locals[local as usize].is_none())
+    }
+
     /// The value of `expr` in a new temporary that the statement owns.
     pub fn temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
         let coerced = self.typed.coercions.get(&expr);
         let repr = self.coerced_repr(expr, coerced)?;
         let value = self.expr(expr)?;
+        let copy_mem = matches!(self.cx.types.kind(self.ty_of(expr)), Kind::Ref(..));
         let place = match (repr, value) {
-            (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr }),
-            (Repr::Scalar(_), Some(value)) => {
-                let slot = self.slot(repr).expect("a scalar has a slot");
+            (Repr::Mem { .. }, Some(addr)) if !copy_mem => Some(Place { base: Base::Addr(addr), offset: 0, repr }),
+            (_, Some(value)) => self.slot(repr).map(|slot| {
                 let place = Place::slot(slot, repr);
                 self.write(place, value);
-                Some(place)
-            }
+                place
+            }),
             _ => None,
         };
-        if self.open {
+        if self.open && (place.is_some() || (repr == Repr::Zst && !self.is_uncaptured_local(expr))) {
             self.own(super::moves::Root::Temp(expr), self.ty_of(expr), place, true)?;
         }
         Ok(place)
@@ -262,6 +270,11 @@ impl Lower<'_, '_> {
     }
 
     fn field_place(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Option<Place>> {
+        if let Some((local, path)) = self.expr_capture_path(expr)
+            && let Some((_, place)) = self.capture_by_path(local, &path)
+        {
+            return Ok(place);
+        }
         let Some((place, ty)) = self.autoderef_place(expr, base)? else {
             return Ok(None);
         };

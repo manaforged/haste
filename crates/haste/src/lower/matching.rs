@@ -56,7 +56,7 @@ impl Lower<'_, '_> {
             }
             let arm = self.body.arms[at as usize];
             let next = self.b.create_block();
-            self.test_with(arm.pat, place, hoisted, next)?;
+            self.test_with_at(arm.pat, place, from.clone(), hoisted, next)?;
             let mark = self.owned.len();
             self.bind_matched(arm.pat, place, from.clone())?;
             if let Some(guard) = arm.guard {
@@ -81,10 +81,11 @@ impl Lower<'_, '_> {
     /// Lowers the condition `let pat = init` to whether it matched, binding its names on the way that did.
     pub fn let_expr(&mut self, pat: PatId, init: ExprId) -> Result<Option<Value>> {
         let place = self.place_or_temp(init)?;
+        let from = self.scrutinee_path(init);
         let (fail, done) = (self.b.create_block(), self.b.create_block());
         let matched = self.b.append_block_param(done, Type::I8);
-        self.test(pat, place, fail)?;
-        self.bind_matched(pat, place, self.scrutinee_path(init))?;
+        self.test_at(pat, place, from.clone(), fail)?;
+        self.bind_matched(pat, place, from)?;
         self.commit_moves()?;
         let yes = self.ins().iconst(Type::I8, 1);
         self.jump(done, &[yes]);
@@ -98,11 +99,12 @@ impl Lower<'_, '_> {
     /// Lowers `let pat = init else { otherwise };`: binds the names when `pat` matches, and runs the diverging `otherwise` when it does not.
     pub fn let_else(&mut self, pat: PatId, init: ExprId, otherwise: ExprId) -> Result<()> {
         let place = self.place_or_temp(init)?;
+        let from = self.scrutinee_path(init);
         if !self.open {
             return Ok(());
         }
         let (fail, matched) = (self.b.create_block(), self.b.create_block());
-        self.test(pat, place, fail)?;
+        self.test_at(pat, place, from.clone(), fail)?;
         self.jump(matched, &[]);
         self.enter(fail);
         self.expr(otherwise)?;
@@ -111,7 +113,7 @@ impl Lower<'_, '_> {
             self.close();
         }
         self.enter(matched);
-        self.bind_matched(pat, place, self.scrutinee_path(init))?;
+        self.bind_matched(pat, place, from)?;
         self.commit_moves()
     }
 
@@ -189,7 +191,11 @@ impl Lower<'_, '_> {
 
     /// Branches to `fail` unless the value at `place` matches `pat`.
     fn test(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
-        self.test_with(pat, place, None, fail)
+        self.test_with_at(pat, place, None, None, fail)
+    }
+
+    fn test_at(&mut self, pat: PatId, place: Option<Place>, at: Option<(Root, MovePath)>, fail: Block) -> Result<()> {
+        self.test_with_at(pat, place, at, None, fail)
     }
 
     fn or_same_derefs(&self, list: List, derefs: u32) -> bool {
@@ -211,7 +217,8 @@ impl Lower<'_, '_> {
         })
     }
 
-    fn test_with(&mut self, pat: PatId, place: Option<Place>, hoisted: Option<Hoisted>, fail: Block) -> Result<()> {
+    fn test_with_at(&mut self, pat: PatId, place: Option<Place>, at: Option<(Root, MovePath)>, hoisted: Option<Hoisted>, fail: Block) -> Result<()> {
+        let at = at.filter(|_| self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) == 0);
         let h = self.hoisted_for(pat, hoisted);
         let place = match h {
             Some(h) => h.peeled,
@@ -231,18 +238,18 @@ impl Lower<'_, '_> {
         }
         self.test_const(pat, place, None, fail)?;
         match *self.body.pat(pat) {
-            Pat::Bind { sub: Some(sub), .. } => self.test(sub, place, fail),
-            Pat::Paren(inner) => self.test(inner, place, fail),
+            Pat::Bind { sub: Some(sub), .. } => self.test_at(sub, place, at, fail),
+            Pat::Paren(inner) => self.test_at(inner, place, at, fail),
             Pat::Lit(lit) => self.test_lit(pat, lit, place, None, fail),
             Pat::Range { from, to, inclusive } => self.test_range(pat, (from, to, inclusive), place, fail),
             Pat::Ref { pat: inner, .. } => {
                 let pointee = self.ref_target(pat, place)?;
                 self.test(inner, Some(pointee), fail)
             }
-            Pat::Or(list) => self.test_or(list, place, hoisted, fail),
+            Pat::Or(list) => self.test_or(list, place, at, hoisted, fail),
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
-                for (sub, sub_place, _) in self.subpatterns(pat, place, Some(fail))? {
-                    self.test(sub, sub_place, fail)?;
+                for (sub, sub_place, sub_at, _) in self.subpatterns_at(pat, place, at, Some(fail))? {
+                    self.test_at(sub, sub_place, sub_at, fail)?;
                 }
                 Ok(())
             }
@@ -283,13 +290,13 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn test_or(&mut self, list: List, place: Option<Place>, hoisted: Option<Hoisted>, fail: Block) -> Result<()> {
+    fn test_or(&mut self, list: List, place: Option<Place>, at: Option<(Root, MovePath)>, hoisted: Option<Hoisted>, fail: Block) -> Result<()> {
         let matched = self.b.create_block();
         let alts: Vec<PatId> = self.body.list(list).iter().map(|&at| PatId(at)).collect();
-        for (at, &alt) in alts.iter().enumerate() {
-            let next = if at + 1 == alts.len() { fail } else { self.b.create_block() };
+        for (idx, &alt) in alts.iter().enumerate() {
+            let next = if idx + 1 == alts.len() { fail } else { self.b.create_block() };
             if !self.try_leaf_or(alt, place, hoisted, matched, next)? {
-                self.test_with(alt, place, hoisted, next)?;
+                self.test_with_at(alt, place, at.clone(), hoisted, next)?;
                 self.jump(matched, &[]);
             }
             if next != fail {
@@ -352,21 +359,76 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    /// The sub-patterns of a tuple, tuple-struct, struct or slice pattern `pat`, each with its place and the field it matches; a slice tests its length against `fail` first.
-    fn subpatterns(&mut self, pat: PatId, place: Option<Place>, fail: Option<Block>) -> Result<Vec<(PatId, Option<Place>, Option<(u32, u32)>)>> {
+    pub(super) fn slice_rest_range(&self, pat: PatId) -> Result<Option<(PatId, std::ops::Range<u32>)>> {
+        let Pat::Slice(list) = *self.body.pat(pat) else {
+            return Ok(None);
+        };
+        let Kind::Array(_, len_ty) = *self.cx.types.kind(self.pat_ty(pat)?) else {
+            return Ok(None);
+        };
+        let count = self.len(len_ty)? as usize;
+        let (pats, Some(split)) = rest_split(self.body, list)? else {
+            return Ok(None);
+        };
+        let rest_pat = pats[split];
+        if matches!(self.body.pat(rest_pat), Pat::Rest) {
+            return Ok(None);
+        }
+        let after = pats.len() - 1 - split;
+        Ok(Some((rest_pat, split as u32..(count - after) as u32)))
+    }
+
+    fn moves_sub_array(&mut self, mut pat: PatId) -> Result<bool> {
+        while let Pat::Paren(inner) = *self.body.pat(pat) {
+            pat = inner;
+        }
+        Ok(matches!(*self.body.pat(pat), Pat::Bind { by_ref: false, .. })
+            && !self.typed.pat_res.contains_key(&pat)
+            && !self.typed.ref_binds.contains_key(&pat)
+            && crate::sema::infer::needs_drop(self.cx, self.pat_ty(pat)?)?)
+    }
+
+    /// The sub-patterns of a tuple, tuple-struct, struct or slice pattern `pat`, each with its place, tracking root/path, and step; a slice tests its length against `fail` first.
+    fn subpatterns_at(&mut self, pat: PatId, place: Option<Place>, at: Option<(Root, MovePath)>, fail: Option<Block>) -> Result<Vec<(PatId, Option<Place>, Option<(Root, MovePath)>, Option<SubStep>)>> {
         if let Pat::Slice(list) = *self.body.pat(pat) {
             let steps = self.part_indices(pat)?;
-            let step = |sub: PatId| steps.iter().find(|(part, _)| *part == sub).map(|&(_, step)| step);
-            return Ok(self.slice_parts((pat, list), place, fail)?.into_iter().map(|(sub, at)| (sub, at, step(sub))).collect());
+            let rest = self.slice_rest_range(pat)?;
+            let step = |sub: PatId| {
+                if let Some((rest_sub, range)) = &rest
+                    && *rest_sub == sub
+                {
+                    return Some(SubStep::Range(range.clone()));
+                }
+                steps.iter().find(|(part, _)| *part == sub).map(|&(_, step)| SubStep::Field(step))
+            };
+            let mut out = Vec::new();
+            for (sub, sub_place) in self.slice_parts((pat, list), place, fail)? {
+                let s = step(sub);
+                let sub_at = match &s {
+                    Some(SubStep::Field(_)) => self.sub_at(at.clone(), s.clone(), sub)?,
+                    _ => None,
+                };
+                out.push((sub, sub_place, sub_at, s));
+            }
+            return Ok(out);
         }
         let ty = self.pat_ty(pat)?;
         let mut found = Vec::new();
         for (sub, (variant, index)) in self.part_indices(pat)? {
-            let sub_place = match place {
+            let mut sub_place = match place {
                 Some(place) => Some(self.part_place(place, ty, (variant, index))?),
                 None => None,
             };
-            found.push((sub, sub_place, Some((variant, index))));
+            let step = Some(SubStep::Field((variant, index)));
+            let mut sub_at = self.sub_at(at.clone(), step.clone(), sub)?;
+            if sub_place.is_none()
+                && let Some((Root::Local(local), ref path)) = sub_at
+                && let Some((cap_local, cap_place)) = self.capture_by_path(local, path)
+            {
+                sub_place = cap_place;
+                sub_at = Some((Root::Local(cap_local), Vec::new()));
+            }
+            found.push((sub, sub_place, sub_at, step));
         }
         Ok(found)
     }
@@ -418,9 +480,24 @@ impl Lower<'_, '_> {
                 self.bind_matched(inner, Some(pointee), None)
             }
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
-                for (sub, sub_place, step) in self.subpatterns(pat, place, None)? {
-                    let sub_at = self.sub_at(at.clone(), step, sub)?;
-                    self.bind_matched(sub, sub_place, sub_at)?;
+                for (sub, sub_place, sub_at, step) in self.subpatterns_at(pat, place, at.clone(), None)? {
+                    match step {
+                        Some(SubStep::Range(range)) => {
+                            self.bind_matched(sub, sub_place, None)?;
+                            if let Some((root, base)) = &at
+                                && self.moves_sub_array(sub)?
+                            {
+                                for index in range {
+                                    let mut path = base.clone();
+                                    path.push((0, index));
+                                    self.pending.push(Pending { root: *root, path, when: Vec::new() });
+                                }
+                            }
+                        }
+                        _ => {
+                            self.bind_matched(sub, sub_place, sub_at)?;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -450,9 +527,9 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn sub_at(&mut self, at: Option<(Root, MovePath)>, step: Option<(u32, u32)>, sub: PatId) -> Result<Option<(Root, MovePath)>> {
+    fn sub_at(&mut self, at: Option<(Root, MovePath)>, step: Option<SubStep>, sub: PatId) -> Result<Option<(Root, MovePath)>> {
         match (at, step) {
-            (Some((root, mut path)), Some(step)) => {
+            (Some((root, mut path)), Some(SubStep::Field(step))) => {
                 path.push(step);
                 Ok(Some((root, path)))
             }
@@ -480,4 +557,10 @@ impl Lower<'_, '_> {
         }
         Ok(())
     }
+}
+
+#[derive(Clone)]
+enum SubStep {
+    Field((u32, u32)),
+    Range(std::ops::Range<u32>),
 }
