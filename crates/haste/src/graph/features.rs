@@ -52,7 +52,13 @@ impl Resolver<'_> {
             Kind::Build => manifest.build.is_some(),
             Kind::Dev => dev,
         };
-        manifest.deps.iter().filter(used).filter(move |dep| dep.platform.as_deref().is_none_or(|key| target.matches_key(key).unwrap_or(false)))
+        let host_target = &self.targets.host;
+        let is_std = manifest.name == "std";
+        manifest.deps.iter().filter(used).filter(move |dep| {
+            dep.platform
+                .as_deref()
+                .is_none_or(|key| target.matches_key(key).unwrap_or(false) || (is_std && host_target.matches_key(key).unwrap_or(false)))
+        })
     }
 
     fn feature(&mut self, unit: usize, name: String) {

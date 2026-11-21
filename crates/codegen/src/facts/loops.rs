@@ -455,9 +455,10 @@ impl Env {
                     continue;
                 }
                 for (strict, cc) in [(true, IntCC::UnsignedLessThan), (false, IntCC::UnsignedLessThanOrEqual)] {
-                    let base_ok = outside
-                        .iter()
-                        .all(|(path, args)| path.decide_rel(func, ranges, cc, ty, args[k], bound) == Some(true));
+                    let base_ok = outside.iter().all(|(path, args)| {
+                        path.decide_rel(func, ranges, cc, ty, args[k], bound) == Some(true)
+                            || super::decide(cc, ty, &path.fact(ranges, args[k]), &path.fact(ranges, bound)) == Some(true)
+                    });
                     let step_ok = base_ok
                         && inside.iter().all(|&(_, ref gp, _, args)| {
                             gp.decide_rel(func, ranges, cc, ty, args[k], bound) == Some(true) || {
