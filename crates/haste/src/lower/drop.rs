@@ -1,8 +1,10 @@
 use anyhow::{Result, bail};
 use haste_codegen::{IntCC, StackSlot, Type, Value};
 
-use crate::body::ExprId;
+use crate::body::{Expr, ExprId};
+use crate::host::HostSymbol;
 use crate::sema::infer::{Fields, Res, Shape, drop_fn, field_types, has_drop_impl, needs_drop};
+use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
 
 use super::moves::{BOX_STEP, MovePath, Root};
@@ -21,6 +23,7 @@ pub struct Owned {
     ty: Ty,
     place: Option<Place>,
     flag: StackSlot,
+    unwind: bool,
     parts: Vec<(MovePath, StackSlot)>,
     life: Life,
 }
@@ -50,16 +53,74 @@ impl Lower<'_, '_> {
         if !needs_drop(self.cx, ty)? {
             return Ok(());
         }
-        let flag = self.flag(init);
         let paths = self.moved.get(&root).cloned().unwrap_or_default();
+        let unwind = self.open && self.resume.is_none() && paths.is_empty() && self.reached.has_catch_unwind(self.cx) && self.body_may_unwind()?;
+        let flag = if unwind { self.push_unwind(root, ty, place, init)? } else { self.flag(init) };
         let parts = paths.into_iter().map(|path| (path, self.flag(init))).collect();
         let life = match root {
             Root::Local(_) => Life::Scope,
             Root::Temp(expr) if self.extended.contains(&expr) => Life::Extended,
             Root::Temp(_) | Root::Held(_) => Life::Statement,
         };
-        self.owned.push(Owned { root, ty, place, flag, parts, life });
+        self.owned.push(Owned { root, ty, place, flag, unwind, parts, life });
         Ok(())
+    }
+
+    fn body_may_unwind(&self) -> Result<bool> {
+        if !self.open {
+            return Ok(false);
+        }
+        for (item, _) in self.typed.calls() {
+            if let Some(intr) = self.cx.intrinsic(item) {
+                if matches!(intr, Intrinsic::ConstEvalSelect | Intrinsic::CatchUnwind) {
+                    return Ok(true);
+                }
+                continue;
+            }
+            if self.cx.foreign(item) {
+                let host = self.cx.symbol_name(item).as_deref().and_then(|name| HostSymbol::resolve_for(name, true));
+                if matches!(host, None | Some(HostSymbol::StartPanic | HostSymbol::CatchUnwind | HostSymbol::Dynamic(_))) {
+                    return Ok(true);
+                }
+                continue;
+            }
+            return Ok(true);
+        }
+        for (idx, expr) in self.body.exprs.iter().enumerate() {
+            match expr {
+                Expr::FormatArgs(_) => return Ok(true),
+                Expr::Call(callee, _)
+                    if !matches!(self.typed.res.get(&ExprId(idx as u32)), Some(Res::Fn(..) | Res::Ctor(..)))
+                        && !matches!(self.typed.res.get(callee), Some(Res::Fn(..) | Res::Ctor(..))) =>
+                {
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    fn push_unwind(&mut self, root: Root, ty: Ty, place: Option<Place>, init: bool) -> Result<StackSlot> {
+        let Some(glue) = self.cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
+        let substs = self.cx.types.intern_substs(&[ty]);
+        let glue_index = self.reached_index(glue, substs)?;
+        let origin = super::reloc::TyOrigin::from_root(root, self.typed);
+        let drop_fn = self.code_of(glue_index, super::reloc::SiteOrigin::DropGlue(origin));
+        let addr = self.address_or_dangling(place, ty)?;
+        let slot = self.b.create_stack_slot(40, 3);
+        self.flags.push(slot);
+        self.set(slot, init);
+        self.ins().stack_store(drop_fn, slot, 24);
+        self.ins().stack_store(addr, slot, 32);
+        let node = self.ins().stack_addr(Type::I64, slot, 0);
+        self.call_host(HostSymbol::DropPush, &[node], None);
+        Ok(slot)
+    }
+
+    fn pop_unwind(&mut self, slot: StackSlot) {
+        let node = self.ins().stack_addr(Type::I64, slot, 0);
+        self.call_host(HostSymbol::DropPop, &[node], None);
     }
 
     fn flag(&mut self, init: bool) -> StackSlot {
@@ -74,26 +135,41 @@ impl Lower<'_, '_> {
         self.ins().stack_store(value, slot, 0);
     }
 
+    fn set_active(&mut self, slot: StackSlot, unwind: bool, value: bool) {
+        if !unwind {
+            return self.set(slot, value);
+        }
+        let cur = self.ins().stack_load(Type::I8, slot, 0);
+        let next = if value {
+            let bit = self.ins().iconst(Type::I8, 1);
+            self.ins().bor(cur, bit)
+        } else {
+            let mask = self.ins().iconst(Type::I8, 0xFE);
+            self.ins().band(cur, mask)
+        };
+        self.ins().stack_store(next, slot, 0);
+    }
+
     fn owner(&self, root: Root) -> Option<usize> {
         self.owned.iter().rposition(|owned| owned.root == root)
     }
 
     /// Marks the part `path` of `root` as moved out, so that its scope does not drop it.
     pub fn moved_out(&mut self, root: Root, path: &[(u32, u32)]) -> Result<()> {
-        if let Some(slot) = self.move_flag(root, path)? {
-            self.set(slot, false);
+        if let Some((slot, unwind)) = self.move_flag(root, path)? {
+            self.set_active(slot, unwind, false);
         }
         Ok(())
     }
 
-    fn move_flag(&self, root: Root, path: &[(u32, u32)]) -> Result<Option<StackSlot>> {
+    fn move_flag(&self, root: Root, path: &[(u32, u32)]) -> Result<Option<(StackSlot, bool)>> {
         let Some(at) = self.owner(root) else {
             return Ok(None);
         };
         Ok(Some(match path {
-            [] => self.owned[at].flag,
+            [] => (self.owned[at].flag, self.owned[at].unwind),
             _ => match self.owned[at].parts.iter().find(|(part, _)| part == path) {
-                Some(&(_, slot)) => slot,
+                Some(&(_, slot)) => (slot, false),
                 None => {
                     bail!("a move out of {root:?} at {path:?} that the move analysis did not find")
                 }
@@ -103,7 +179,7 @@ impl Lower<'_, '_> {
 
     /// Marks the part `path` of `root` as moved out when every `(which, alternative)` of `when` holds.
     fn moved_out_when(&mut self, root: Root, path: &[(u32, u32)], when: &[(Value, i64)]) -> Result<()> {
-        let Some(slot) = self.move_flag(root, path)? else {
+        let Some((slot, unwind)) = self.move_flag(root, path)? else {
             return Ok(());
         };
         let mut taken = self.ins().iconst(Type::I8, 1);
@@ -112,8 +188,13 @@ impl Lower<'_, '_> {
             taken = self.ins().band(taken, holds);
         }
         let present = self.ins().stack_load(Type::I8, slot, 0);
-        let zero = self.ins().iconst(Type::I8, 0);
-        let kept = self.ins().select(taken, zero, present);
+        let cleared = if unwind {
+            let mask = self.ins().iconst(Type::I8, 0xFE);
+            self.ins().band(present, mask)
+        } else {
+            self.ins().iconst(Type::I8, 0)
+        };
+        let kept = self.ins().select(taken, cleared, present);
         self.ins().stack_store(kept, slot, 0);
         Ok(())
     }
@@ -121,20 +202,23 @@ impl Lower<'_, '_> {
     /// Marks the part `path` of `root` and everything below it as present again, after an assignment.
     pub fn reinit(&mut self, root: Root, path: &[(u32, u32)]) {
         let Some(at) = self.owner(root) else { return };
-        let mut slots: Vec<StackSlot> = self.owned[at].parts.iter().filter(|(part, _)| part.starts_with(path)).map(|&(_, slot)| slot).collect();
+        let mut slots: Vec<(StackSlot, bool)> = self.owned[at].parts.iter().filter(|(part, _)| part.starts_with(path)).map(|&(_, slot)| (slot, false)).collect();
         if path.is_empty() {
-            slots.push(self.owned[at].flag);
+            slots.push((self.owned[at].flag, self.owned[at].unwind));
         }
-        for slot in slots {
-            self.set(slot, true);
+        for (slot, unwind) in slots {
+            self.set_active(slot, unwind, true);
         }
     }
 
     /// Marks every owned value from index `mark` on as absent, on a path where their bindings did not happen.
     pub fn forget_from(&mut self, mark: usize) {
-        let slots: Vec<StackSlot> = self.owned[mark..].iter().map(|owned| owned.flag).collect();
-        for slot in slots {
-            self.set(slot, false);
+        let slots: Vec<(StackSlot, bool)> = self.owned[mark..].iter().map(|owned| (owned.flag, owned.unwind)).collect();
+        for (slot, unwind) in slots {
+            self.set_active(slot, unwind, false);
+            if unwind {
+                self.pop_unwind(slot);
+            }
         }
     }
 
@@ -163,8 +247,11 @@ impl Lower<'_, '_> {
         let Some(at) = self.owner(root) else {
             return Ok(false);
         };
-        let flag = self.owned[at].flag;
-        self.guarded(flag, |lower| lower.drop_path(at, path, ty, Some(place)))?;
+        let (flag, unwind) = (self.owned[at].flag, self.owned[at].unwind);
+        self.guarded_slot(flag, unwind, |lower| {
+            lower.set_active(flag, unwind, false);
+            lower.drop_path(at, path, ty, Some(place))
+        })?;
         Ok(true)
     }
 
@@ -224,16 +311,28 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(());
         }
-        let Owned { ty, place, flag, .. } = self.owned[at].clone();
-        self.guarded(flag, |lower| {
-            lower.drop_path(at, &[], ty, place)?;
-            lower.set(flag, false);
-            Ok(())
+        let Owned { ty, place, flag, unwind, .. } = self.owned[at].clone();
+        if unwind {
+            self.pop_unwind(flag);
+        }
+        self.guarded_slot(flag, unwind, |lower| {
+            lower.set_active(flag, unwind, false);
+            lower.drop_path(at, &[], ty, place)
         })
     }
 
     fn guarded(&mut self, flag: StackSlot, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        let present = self.ins().stack_load(Type::I8, flag, 0);
+        self.guarded_slot(flag, false, run)
+    }
+
+    fn guarded_slot(&mut self, flag: StackSlot, unwind: bool, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let raw = self.ins().stack_load(Type::I8, flag, 0);
+        let present = if unwind {
+            let mask = self.ins().iconst(Type::I8, 1);
+            self.ins().band(raw, mask)
+        } else {
+            raw
+        };
         self.when(present, run)
     }
 

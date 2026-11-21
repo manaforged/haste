@@ -686,6 +686,8 @@ fn write_host(out: &mut Vec<u8>, host: &HostSymbol) -> Option<()> {
         HostSymbol::CatchUnwind => out.push(16),
         HostSymbol::StartPanic => out.push(17),
         HostSymbol::PanicCleanup => out.push(18),
+        HostSymbol::DropPush => out.push(19),
+        HostSymbol::DropPop => out.push(20),
     }
     Some(())
 }
@@ -711,6 +713,8 @@ fn read_host(cur: &mut Cursor<'_>) -> Result<HostSymbol> {
         16 => HostSymbol::CatchUnwind,
         17 => HostSymbol::StartPanic,
         18 => HostSymbol::PanicCleanup,
+        19 => HostSymbol::DropPush,
+        20 => HostSymbol::DropPop,
         _ => bail!("invalid host symbol tag"),
     })
 }
