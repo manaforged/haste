@@ -157,13 +157,24 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
 
 /// Creates the outline of every root, with the build scripts of the units `scripts`, with only the root modules declared; `load` reads modules as lookups need them.
 pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outline {
-    let roots = roots(workspace, scripts);
-    let deps = dependencies(workspace, &roots);
+    let mut roots = roots(workspace, scripts);
+    let mut deps = dependencies(workspace, &roots);
     let mut is_test_dep = vec![false; roots.len()];
     if crate::test_mode() {
         let adj: Vec<Vec<usize>> = deps.iter().map(|list| list.iter().map(|&(_, dep)| dep).collect()).collect();
         let test_roots = roots.iter().enumerate().filter(|(_, root)| root.role == Role::Test).map(|(at, _)| at);
         dependents_of(&adj, &mut is_test_dep, test_roots);
+        let extra: Vec<(Root, Vec<(String, usize)>)> = roots
+            .iter()
+            .enumerate()
+            .filter(|&(at, root)| is_test_dep[at] && root.role == Role::Lib && workspace.graph.members.contains(&workspace.graph.units[root.unit].package))
+            .map(|(at, root)| (Root { unit: root.unit, name: root.name.clone(), path: root.path.clone(), role: Role::Test }, deps[at].clone()))
+            .collect();
+        for (root, root_deps) in extra {
+            roots.push(root);
+            deps.push(root_deps);
+            is_test_dep.push(false);
+        }
     }
     let crates = roots
         .iter()

@@ -645,12 +645,9 @@ struct TestArgs<'a> {
 fn parse_test_args(args: &[String]) -> TestArgs<'_> {
     let mut parsed = TestArgs { filters: Vec::new(), skips: Vec::new(), exact: false, ignored_only: false, include_ignored: false };
     let mut iter = args.iter().map(String::as_str);
-    let mut literal = false;
     while let Some(arg) = iter.next() {
-        if literal {
-            parsed.filters.push(arg);
-        } else if arg == "--" {
-            literal = true;
+        if arg == "--" {
+            continue;
         } else if arg == "--exact" {
             parsed.exact = true;
         } else if arg == "--ignored" {
