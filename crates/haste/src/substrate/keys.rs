@@ -17,6 +17,11 @@ pub fn toolchain_path(toolchain_hash: u64) -> PathBuf {
     crate::graph::store::home().join("toolchain").join(format!("{toolchain_hash:016x}.substrate"))
 }
 
+/// Returns the sysroot outline and name-resolution cache path under `$HASTE_HOME` / `$XDG_CACHE_HOME/haste` / `$HOME/.cache/haste`.
+pub fn sysroot_cache_path(sysroot_hash: u64) -> PathBuf {
+    crate::graph::store::home().join("toolchain").join(format!("sysroot-{sysroot_hash:016x}.bin"))
+}
+
 /// Returns the dependency-scoped substrate path under `$HASTE_HOME` / `$XDG_CACHE_HOME/haste` / `$HOME/.cache/haste`.
 pub fn deps_path(deps_hash: u64) -> PathBuf {
     crate::graph::store::home().join("deps").join(format!("{deps_hash:016x}.substrate"))
@@ -365,8 +370,33 @@ fn hash_sysroot_roots(roots: Vec<PathBuf>, hasher: &mut FxHasher) {
     }
 }
 
-/// Computes a workspace-invariant toolchain key from sysroot packages, target, and compiler binary.
-pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u64 {
+fn hash_fast_sysroot_roots(roots: Vec<PathBuf>, hasher: &mut FxHasher) {
+    if let Some(rustc) = std::env::var_os("RUSTC") {
+        let path = PathBuf::from(rustc);
+        hash_file_meta(&path, hasher);
+    }
+    for root in roots {
+        hash_file_meta(&root, hasher);
+        if root.ends_with("lib/rustlib/src/rust/library")
+            && let Some(toolchain) = root.ancestors().nth(5)
+        {
+            let rustc_name = if cfg!(windows) { "bin/rustc.exe" } else { "bin/rustc" };
+            hash_file_meta(&toolchain.join(rustc_name), hasher);
+        }
+        hash_file_meta(&root.join("Cargo.lock"), hasher);
+        hash_file_meta(&root.join("sysroot/Cargo.lock"), hasher);
+        for (entry, stamp) in scan_sysroot_dir(&root) {
+            (entry.as_path(), stamp).hash(hasher);
+            if stamp.is_none() {
+                hash_file_meta(&entry, hasher);
+                hash_file_meta(&entry.join("Cargo.toml"), hasher);
+                hash_file_meta(&entry.join("src"), hasher);
+            }
+        }
+    }
+}
+
+fn sorted_sysroot_units(workspace: &crate::graph::Workspace) -> Vec<usize> {
     let mut sysroot_units: Vec<(&str, crate::graph::Side, usize)> = workspace
         .graph
         .units
@@ -376,16 +406,19 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
         .map(|(idx, unit)| (workspace.packages[unit.package].locked.name.as_str(), unit.side, idx))
         .collect();
     sysroot_units.sort_unstable_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    sysroot_units.into_iter().map(|(_, _, idx)| idx).collect()
+}
+
+fn toolchain_key_for(workspace: &crate::graph::Workspace, triple: &str, effort: haste_codegen::Effort) -> u64 {
+    let unit_indices = sorted_sysroot_units(workspace);
     let mut hasher = FxHasher::default();
-    target.triple.hash(&mut hasher);
-    target.effort.hash(&mut hasher);
+    triple.hash(&mut hasher);
+    effort.hash(&mut hasher);
     crate::graph::store::program().hash(&mut hasher);
     hash_program(&mut hasher);
     super::MAGIC.hash(&mut hasher);
     super::VERSION.hash(&mut hasher);
-    let mut unit_indices = Vec::with_capacity(sysroot_units.len());
-    for (_, _, idx) in sysroot_units {
-        unit_indices.push(idx);
+    for &idx in &unit_indices {
         let unit = &workspace.graph.units[idx];
         let pkg = &workspace.packages[unit.package];
         let locked = &pkg.locked;
@@ -400,7 +433,50 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
             feat.hash(&mut hasher);
         }
     }
-    hash_sysroot_roots(sysroot_library_roots(workspace, &unit_indices), &mut hasher);
+    let roots = sysroot_library_roots(workspace, &unit_indices);
+    if std::env::var_os("HASTE_LIBRARY").is_some() {
+        hash_sysroot_roots(roots, &mut hasher);
+    } else {
+        hash_fast_sysroot_roots(roots, &mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Computes a workspace-invariant toolchain key from sysroot packages, target, and compiler binary.
+pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u64 {
+    toolchain_key_for(workspace, target.triple, target.effort)
+}
+
+/// Computes a cache key for the settled sysroot outline and resolved names for `targets`.
+pub fn sysroot_key(workspace: &crate::graph::Workspace, targets: &crate::graph::Targets) -> u64 {
+    let mut hasher = FxHasher::default();
+    super::MAGIC.hash(&mut hasher);
+    super::VERSION.hash(&mut hasher);
+    super::sysroot::SYSROOT_VERSION.hash(&mut hasher);
+    toolchain_key_for(workspace, &targets.target.triple, crate::profile().into()).hash(&mut hasher);
+    (crate::profile() == Profile::Release).hash(&mut hasher);
+    (&targets.target.triple, &targets.target.names, &targets.target.pairs, &targets.target.internal).hash(&mut hasher);
+    (&targets.host.triple, &targets.host.names, &targets.host.pairs, &targets.host.internal).hash(&mut hasher);
+    crate::graph::script::tool("CARGO").hash(&mut hasher);
+    for idx in sorted_sysroot_units(workspace) {
+        let unit = &workspace.graph.units[idx];
+        let pkg = &workspace.packages[unit.package];
+        (&pkg.manifest.edition, &pkg.manifest.lib_name, &pkg.manifest.dir, pkg.manifest.build.is_some()).hash(&mut hasher);
+        if let Some(script) = &unit.script {
+            (&script.names, &script.pairs, &script.vars).hash(&mut hasher);
+        }
+        let mut deps: Vec<(&str, &str, bool)> = unit
+            .deps
+            .iter()
+            .map(|(key, dep_idx, _)| {
+                let dep_unit = &workspace.graph.units[*dep_idx];
+                let dep_pkg = &workspace.packages[dep_unit.package];
+                (key.as_str(), dep_pkg.locked.name.as_str(), matches!(dep_unit.side, crate::graph::Side::Host))
+            })
+            .collect();
+        deps.sort_unstable();
+        deps.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -449,6 +525,7 @@ fn fixed_files_paths(workspace: &crate::graph::Workspace, triple: &str) -> (Path
     let home = crate::graph::store::home();
     let mut sys_hasher = FxHasher::default();
     (super::MAGIC, super::VERSION, triple, crate::profile() == Profile::Release, crate::graph::store::program()).hash(&mut sys_hasher);
+    hash_program(&mut sys_hasher);
     for unit in workspace.graph.units.iter().filter(|u| workspace.packages[u.package].sysroot) {
         let pkg = &workspace.packages[unit.package];
         (&pkg.locked.name, &pkg.manifest.dir, &unit.features).hash(&mut sys_hasher);
@@ -461,14 +538,9 @@ fn fixed_files_paths(workspace: &crate::graph::Workspace, triple: &str) -> (Path
     (sys_path, dep_path)
 }
 
-/// Pre-reads and scans cached sysroot and fixed-dependency `.rs` files in parallel into `outline.cache`.
-pub fn preload_fixed_files(workspace: &crate::graph::Workspace, triple: &str, outline: &crate::outline::Outline) {
-    if !enabled() {
-        return;
-    }
-    let (sys_path, dep_path) = fixed_files_paths(workspace, triple);
+fn preload_paths(outline: &crate::outline::Outline, list_paths: impl Iterator<Item = PathBuf>) {
     let mut paths = Vec::new();
-    for path in std::iter::once(sys_path).chain(dep_path) {
+    for path in list_paths {
         if let Ok(text) = std::fs::read_to_string(path) {
             paths.extend(text.lines().filter(|l| !l.is_empty()).map(PathBuf::from));
         }
@@ -476,6 +548,24 @@ pub fn preload_fixed_files(workspace: &crate::graph::Workspace, triple: &str, ou
     if !paths.is_empty() {
         outline.cache.read_all(&paths);
     }
+}
+
+/// Pre-reads and scans cached sysroot and fixed-dependency `.rs` files in parallel into `outline.cache`.
+pub fn preload_fixed_files(workspace: &crate::graph::Workspace, triple: &str, outline: &crate::outline::Outline) {
+    if !enabled() {
+        return;
+    }
+    let (sys_path, dep_path) = fixed_files_paths(workspace, triple);
+    preload_paths(outline, std::iter::once(sys_path).chain(dep_path));
+}
+
+/// Pre-reads and scans cached fixed-dependency `.rs` files in parallel into `outline.cache`, skipping sysroot.
+pub fn preload_dep_files(workspace: &crate::graph::Workspace, triple: &str, outline: &crate::outline::Outline) {
+    if !enabled() {
+        return;
+    }
+    let (_, dep_path) = fixed_files_paths(workspace, triple);
+    preload_paths(outline, dep_path.into_iter());
 }
 
 fn collect_fixed_file_list(outline: &crate::outline::Outline, want_sysroot: bool) -> String {

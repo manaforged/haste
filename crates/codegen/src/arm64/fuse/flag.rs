@@ -444,32 +444,86 @@ pub(super) fn preserves_flags(op: &Op) -> bool {
     matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..))
 }
 
-pub(super) fn icmp_consumer(func: &Function, tail: &[Inst], res: Value) -> bool {
-    for &ni in tail {
-        let nd = &func.insts[ni.index()];
-        if consumes_flag_only(&nd.op, res) {
-            return true;
+fn flag_consumer(func: &Function, tail: &[Inst], res: Value, allow_clobber_branch: bool) -> Option<(usize, bool, bool)> {
+    let mut flags_ok = true;
+    let capped = func.size() > 2000;
+    for (off, &ni) in tail.iter().enumerate() {
+        let op = &func.insts[ni.index()].op;
+        if consumes_flag_only(op, res) {
+            let is_branch = !matches!(op, Op::Select(..));
+            return (flags_ok || (allow_clobber_branch && is_branch)).then_some((off, is_branch, flags_ok));
         }
-        if !preserves_flags(&nd.op) {
-            return false;
+        if !preserves_flags(op) {
+            if !allow_clobber_branch {
+                return None;
+            }
+            flags_ok = false;
+        }
+        if !flags_ok && capped && off >= 64 {
+            return None;
         }
     }
-    false
+    None
+}
+
+pub(super) fn icmp_consumer(func: &Function, tail: &[Inst], res: Value) -> bool {
+    flag_consumer(func, tail, res, false).is_some()
+}
+
+pub(in super::super) fn zero_cmp_operand(plan: &Plan<Reg>, ty: Type, a: Value, b: Value) -> Option<Value> {
+    if !ty.is_small_int() {
+        return None;
+    }
+    let is_zero = |v: Value| plan.const_of(v).is_some_and(|imm| crate::fold::extend(imm, ty, false) == 0);
+    let val = if is_zero(b) { a } else if is_zero(a) { b } else { return None };
+    (!plan.elided[val.index()] && plan.const_of(val).is_none()).then_some(val)
+}
+
+fn can_elide_cbz(
+    func: &Function,
+    plan: &Plan<Reg>,
+    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, c_pos): (usize, usize, usize),
+    val: Value,
+) -> bool {
+    if !preserved(func, plan, b_idx, pos, c_pos, None, val) {
+        return false;
+    }
+    if uses[val.index()] == 1
+        && let Some((vb, vpos, vinst)) = def_entry(pos_of, val)
+        && vb == b_idx
+        && let Op::Binary(Binary::Band, bx, by) = func.insts[vinst.index()].op
+        && (super::bits::single_bit_raw(func, plan, bx, by).is_some()
+            || can_elide_tst_band(func, plan, pos_of, (b_idx, vpos, c_pos, Some(pos)), (bx, by)))
+    {
+        return false;
+    }
+    true
 }
 
 pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
-    for block in &func.blocks {
+    let mut pos_of = vec![None; func.types.len()];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
         for (pos, &inst) in block.insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             let Some(res) = data.result else { continue };
-            let Op::Icmp(_, a, _) = data.op else { continue };
-            if uses[res.index()] == 1
-                && !plan.elided[res.index()]
-                && !plan.fused[res.index()]
-                && !plan.is_static(res)
-                && !func.ty(a).is_vector()
-                && icmp_consumer(func, &block.insts[pos + 1..], res)
+            pos_of[res.index()] = Some((b_idx, pos, inst));
+            let Op::Icmp(cc, a, b) = data.op else { continue };
+            if uses[res.index()] != 1 || plan.elided[res.index()] || plan.fused[res.index()] || plan.is_static(res) || func.ty(a).is_vector() {
+                continue;
+            }
+            let zero_val = matches!(cc, IntCC::Equal | IntCC::NotEqual)
+                .then(|| zero_cmp_operand(plan, func.ty(a), a, b))
+                .flatten();
+            let Some((off, is_branch, flags_ok)) = flag_consumer(func, &block.insts[pos + 1..], res, zero_val.is_some()) else {
+                continue;
+            };
+            if is_branch
+                && let Some(val) = zero_val
+                && can_elide_cbz(func, plan, (uses, &pos_of), (b_idx, pos, pos + 1 + off), val)
             {
+                plan.elided[res.index()] = true;
+            } else if flags_ok {
                 plan.fused[res.index()] = true;
             }
         }

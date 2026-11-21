@@ -1,25 +1,33 @@
 use crate::cfg::Loop;
 use crate::ir::{Block, Function, Op, Value};
 
-/// Passes each register-sized value that `wanted` names for a loop header into each loop whose own blocks read it but do not define it as a header parameter, outermost loop first, so its range inside the loop is its own and can keep a register there; returns each new parameter with the value it carries and its loop header.
+/// Passes each register-sized value that `wanted` names for a loop header into each loop whose own blocks read it but do not define it as a header parameter, outermost loop first, so its range inside the loop is its own and can keep a register there; returns each new parameter with the root value it carries and its loop header.
 pub(crate) fn run(func: &mut Function, wanted: impl Fn(Block, Value) -> bool) -> Vec<(Value, Value, Block)> {
     let mut made = Vec::new();
+    let mut origin: Vec<Value> = (0..func.types.len() as u32).map(Value).collect();
     let cfg = func.cfg();
     let depths = &cfg.loops().depths;
     let mut loops: Vec<&Loop> = cfg.loops().list.iter().collect();
     loops.sort_by_key(|each| (each.depth, each.head.index()));
     loops.dedup_by_key(|each| each.head);
     for each in loops {
-        if Some(each.head) == func.entry || !cfg.preds_of(each.head).iter().all(|&pred| matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..)))) {
+        if Some(each.head) == func.entry
+            || !cfg.preds_of(each.head).iter().all(|&pred| matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..))))
+            || !each.body.iter().enumerate().all(|(b, &in_b)| !in_b || cfg.dominates(each.head, Block(b as u32)))
+        {
             continue;
         }
-        let outside_preds: Vec<Block> = cfg.preds_of(each.head).iter().copied().filter(|pred| !inside(each, *pred)).collect();
-        for value in reads(func, (each, depths), &|v| wanted(each.head, v)) {
+        let mut outside_preds: Vec<Block> = cfg.preds_of(each.head).iter().copied().filter(|pred| !inside(each, *pred)).collect();
+        outside_preds.sort_unstable();
+        outside_preds.dedup();
+        for value in reads(func, (each, depths), &|v| wanted(each.head, origin[v.index()])) {
+            let root = origin[value.index()];
             let param = func.value(func.ty(value));
-            made.push((param, value, each.head));
+            origin.push(root);
+            made.push((param, root, each.head));
             func.blocks[each.head.index()].params.push(param);
             for (at, _) in each.body.iter().enumerate().filter(|(_, is)| **is) {
-                for inst in func.blocks[at].insts.clone() {
+                for &inst in &func.blocks[at].insts {
                     func.insts[inst.index()].op.map_operands(|v| if v == value { param } else { v });
                 }
             }
@@ -61,7 +69,7 @@ fn reads(func: &Function, (each, depths): (&Loop, &[u32]), wanted: &impl Fn(Valu
         for inst in &data.insts {
             func.insts[inst.index()].op.for_operands(|v| {
                 let ty = func.ty(v);
-                if outside_def[v.index()] && !defined_inside[v.index()] && (ty.is_small_int() || ty.is_float()) && wanted(v) {
+                if outside_def[v.index()] && !defined_inside[v.index()] && (ty.is_small_int() || ty.in_float_register()) && wanted(v) {
                     found.push(v);
                 }
             });

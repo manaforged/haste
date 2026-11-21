@@ -1,33 +1,9 @@
 //! Workspace no-op build fingerprint for skipping unchanged one-shot `haste build` runs.
 
-use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
-#[cfg(unix)]
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
-fn path_to_bytes(path: &Path) -> Option<Vec<u8>> {
-    #[cfg(unix)]
-    {
-        Some(path.as_os_str().as_bytes().to_vec())
-    }
-    #[cfg(not(unix))]
-    {
-        path.to_str().map(|s| s.as_bytes().to_vec())
-    }
-}
-
-fn bytes_to_path(bytes: &[u8]) -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        Some(PathBuf::from(OsString::from_vec(bytes.to_vec())))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = OsString::new();
-        std::str::from_utf8(bytes).ok().map(PathBuf::from)
-    }
-}
+use super::{bytes_to_path, path_to_bytes, read_u32, read_u64};
 
 use rustc_hash::FxHasher;
 
@@ -101,34 +77,27 @@ fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8
     Some(slice)
 }
 
-fn read_len_u32(data: &[u8], pos: &mut usize) -> Option<usize> {
-    let slice = read_bytes(data, pos, 4)?;
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(slice);
-    Some(u32::from_le_bytes(buf) as usize)
-}
-
 fn decode_stamp_file(data: &[u8]) -> Option<(u64, usize, Vec<PathBuf>, Vec<String>)> {
     if data.len() < HEADER_LEN || data[0..8] != NOOP_MAGIC {
         return None;
     }
-    let stamp = super::read_u64(data, 8);
-    let reached = usize::try_from(super::read_u64(data, 16)).ok()?;
+    let stamp = read_u64(data, 8);
+    let reached = usize::try_from(read_u64(data, 16)).ok()?;
     if reached == 0 {
         return None;
     }
-    let path_count = super::read_u32(data, 24) as usize;
-    let env_count = super::read_u32(data, 28) as usize;
+    let path_count = read_u32(data, 24) as usize;
+    let env_count = read_u32(data, 28) as usize;
     let mut pos = HEADER_LEN;
     let mut paths = Vec::with_capacity(path_count.min(4096));
     for _ in 0..path_count {
-        let len = read_len_u32(data, &mut pos)?;
+        let len = read_u32(read_bytes(data, &mut pos, 4)?, 0) as usize;
         let bytes = read_bytes(data, &mut pos, len)?;
         paths.push(bytes_to_path(bytes)?);
     }
     let mut envs = Vec::with_capacity(env_count.min(1024));
     for _ in 0..env_count {
-        let len = read_len_u32(data, &mut pos)?;
+        let len = read_u32(read_bytes(data, &mut pos, 4)?, 0) as usize;
         let bytes = read_bytes(data, &mut pos, len)?;
         envs.push(String::from_utf8(bytes.to_vec()).ok()?);
     }

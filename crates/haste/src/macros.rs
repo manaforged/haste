@@ -45,11 +45,6 @@ impl Expander {
 }
 
 impl Compilation {
-    fn new(workspace: &Workspace, outline: Outline) -> Compilation {
-        let names = Names::new(workspace, &outline);
-        Compilation { outline, names, expander: None }
-    }
-
     /// Drops the macro expander only when the macro crate graph changed, keeping compiled macro code across settle phases.
     pub fn settle(&mut self) {
         if self.expander.as_ref().is_some_and(|kept| !kept.matches(&self.outline)) {
@@ -58,13 +53,39 @@ impl Compilation {
     }
 }
 
-/// Loads every module of every crate, with the build scripts of the units `scripts`, resolves every import and expands every procedural macro call, then drops the macro expander.
-pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Result<Compilation> {
+fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize], eager_all: bool) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, scripts);
-    outline.load_all()?;
-    let mut compilation = Compilation::new(workspace, outline);
-    compilation.names.crates.iter_mut().for_each(|krate| krate.eager = true);
+    let cached = crate::substrate::sysroot::try_load(workspace, targets, &mut outline);
+    let was_miss = cached.is_none();
+    if !eager_all {
+        if was_miss {
+            crate::substrate::preload_fixed_files(workspace, &targets.target.triple, &outline);
+        } else {
+            crate::substrate::preload_dep_files(workspace, &targets.target.triple, &outline);
+        }
+    }
+    let selected: Vec<bool> = (0..outline.crates.len())
+        .map(|krate| {
+            let sysroot = outline.is_sysroot(krate as u32);
+            if eager_all {
+                !sysroot || was_miss
+            } else {
+                (was_miss && sysroot) || workspace.graph.members.contains(&workspace.graph.units[outline.roots[krate].unit].package)
+            }
+        })
+        .collect();
+    outline.load_selected(&selected)?;
+    let names = Names::new_with(workspace, &outline, cached);
+    let mut compilation = Compilation { outline, names, expander: None };
+    for (krate, &on) in selected.iter().enumerate() {
+        if on {
+            compilation.names.crates[krate].eager = true;
+        }
+    }
     resolve(&mut compilation)?;
+    if was_miss {
+        crate::substrate::sysroot::save(workspace, targets, &compilation);
+    }
     let errors = compilation.outline.local_errors(workspace);
     if !errors.is_empty() {
         anyhow::bail!("{}", errors.join("\n"));
@@ -73,27 +94,14 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
     Ok(compilation)
 }
 
+/// Loads every module of every crate, with the build scripts of the units `scripts`, resolves every import and expands every procedural macro call, then drops the macro expander.
+pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Result<Compilation> {
+    load_with_sysroot(workspace, targets, scripts, true)
+}
+
 /// Loads the member crates' roots, resolves their names and expands their procedural macro calls, reading of other crates only what those lookups reach, then drops the macro expander.
 pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation> {
-    let mut outline = crate::outline::new(workspace, targets, &[]);
-    crate::substrate::preload_fixed_files(workspace, &targets.target.triple, &outline);
-    let selected: Vec<bool> = (0..outline.crates.len())
-        .map(|krate| outline.package(workspace, krate).sysroot || workspace.graph.members.contains(&workspace.graph.units[outline.roots[krate].unit].package))
-        .collect();
-    outline.load_selected(&selected)?;
-    let mut compilation = Compilation::new(workspace, outline);
-    for (krate, &on) in selected.iter().enumerate() {
-        if on {
-            compilation.names.crates[krate].eager = true;
-        }
-    }
-    resolve(&mut compilation)?;
-    let errors = compilation.outline.local_errors(workspace);
-    if !errors.is_empty() {
-        anyhow::bail!("{}", errors.join("\n"));
-    }
-    crate::host::native::load(&compilation.outline)?;
-    Ok(compilation)
+    load_with_sysroot(workspace, targets, &[], false)
 }
 
 /// Reaches from the instances `roots` gives, answering what each pass asks for until a pass settles or nothing new can load, then hands that pass's context and what it reached to `finish`.

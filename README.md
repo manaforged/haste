@@ -107,18 +107,18 @@ Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
 
 | Benchmark | haste | cargo |
 | --- | ---: | ---: |
-| Single-line edit rebuild | 300 ms | 496 ms |
-| Unchanged no-op build | 21 ms | 32 ms |
-| Cold debug build | 296 ms | 224 ms |
+| Single-line edit rebuild | 159 ms | 35 ms |
+| Unchanged no-op build | 25 ms | 38 ms |
+| Cold debug build | 170 ms | 229 ms |
 
 ### AOT codegen runtime (`haste --release` vs `rustc -C opt-level=3`, median of 5)
 
 | Workload | haste --release | rustc -O3 | Ratio | Output |
 | --- | ---: | ---: | ---: | --- |
-| `sha256` (250k blocks) | 75 ms | 90 ms | 0.83x | exact match (`7333157476866902348`) |
-| `sort` (500k quicksort + bsearch) | 47 ms | 48 ms | 0.98x | exact match (`8647866321337317866`) |
-| `sieve` (4M primes) | 27 ms | 26 ms | 1.04x | exact match (`544501644261`) |
-| `scan` (JSON-like byte scanner) | 35 ms | 31 ms | 1.13x | exact match (`80005120000`) |
+| `sha256` (250k blocks) | 76 ms | 90 ms | 0.84x | exact match (`7333157476866902348`) |
+| `scan` (JSON-like byte scanner) | 31 ms | 32 ms | 0.97x | exact match (`80005120000`) |
+| `sort` (500k quicksort + bsearch) | 48 ms | 48 ms | 1.00x | exact match (`8647866321337317866`) |
+| `sieve` (4M primes) | 27 ms | 25 ms | 1.08x | exact match (`544501644261`) |
 
 ## Check against rustc
 
@@ -137,7 +137,7 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 
 ## Limits
 
-- haste compiles only for the host (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, or `aarch64-apple-darwin`). Windows and cross-compilation are not supported yet.
+- Windows host runtime execution and PE32+ binaries built via `--target x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` are experimental, and `serve`/`--watch` require Unix.
 - haste checks ownership, use-after-move (including across branches and loops), binding mutability, NLL-style borrow aliasing, and dangling local reference returns on workspace crates, though full Polonius/higher-ranked lifetime inference is not yet implemented; run `cargo check` or `rustc` in CI for complete lifetime verification.
 - `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` (`Termination`) `#[test]` functions (not `#[tokio::test]` macro suites that depend on custom harnesses).
 - `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.

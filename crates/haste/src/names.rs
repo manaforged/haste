@@ -141,7 +141,7 @@ pub enum Primitive {
     F128,
 }
 
-const PRIMITIVES: [(&str, Primitive); 19] = [
+pub(crate) const PRIMITIVES: [(&str, Primitive); 19] = [
     ("bool", Primitive::Bool),
     ("char", Primitive::Char),
     ("str", Primitive::Str),
@@ -282,6 +282,7 @@ pub struct Crate {
     pub pending: Vec<collect::Pending>,
     pub enums: FxHashMap<(u32, u32), Box<[Sym]>>,
     pub eager: bool,
+    pub(crate) settled: bool,
     wanted: FxHashMap<u32, rustc_hash::FxHashSet<Sym>>,
     whole: rustc_hash::FxHashSet<u32>,
     named: FxHashMap<(u32, Sym), Vec<usize>>,
@@ -297,6 +298,24 @@ impl Crate {
     /// Whether every import of `module` resolves: in an eager crate, or once a lookup asked for its whole scope.
     pub fn resolves_all(&self, module: u32) -> bool {
         self.eager || self.whole.contains(&module)
+    }
+
+    pub(crate) fn index_pending(&mut self, index: usize, pending: &collect::Pending) {
+        match pending.name {
+            Some(name) => self.named.entry((pending.module, name)).or_default().push(index),
+            None => self.globs.entry(pending.module).or_default().push(index),
+        }
+    }
+
+    pub(crate) fn rebuild_indices(&mut self) {
+        self.named.clear();
+        self.globs.clear();
+        for index in 0..self.pending.len() {
+            match self.pending[index].name {
+                Some(name) => self.named.entry((self.pending[index].module, name)).or_default().push(index),
+                None => self.globs.entry(self.pending[index].module).or_default().push(index),
+            }
+        }
     }
 }
 

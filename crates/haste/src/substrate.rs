@@ -6,23 +6,27 @@ mod keys;
 mod merge;
 pub mod noop;
 pub mod relocs;
+pub(crate) mod sysroot;
 pub(crate) mod tally;
 mod trim;
 
 pub use inline::{InlineKey, InlineShape};
 pub use keys::{
-    CrateHashes, deps_key, deps_path, enabled, file_key, layer_item_key, preload_fixed_files, save_fixed_files, sysroot_item_key,
-    sysroot_only_item_key, target_hash, toolchain_key, toolchain_path, workspace_key, workspace_path,
+    CrateHashes, deps_key, deps_path, enabled, file_key, layer_item_key, preload_dep_files, preload_fixed_files, save_fixed_files, sysroot_cache_path, sysroot_item_key,
+    sysroot_key, sysroot_only_item_key, target_hash, toolchain_key, toolchain_path, workspace_key, workspace_path,
 };
 
 use std::cmp::Ordering;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io;
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -101,7 +105,7 @@ fn decode_table<T>(bytes: &[u8], width: usize, name: &str, entry: impl FnMut(usi
 }
 
 #[cfg(unix)]
-struct Backing {
+pub(super) struct Backing {
     ptr: NonNull<u8>,
     len: usize,
 }
@@ -116,7 +120,7 @@ unsafe impl Sync for Backing {}
 #[cfg(unix)]
 impl Drop for Backing {
     fn drop(&mut self) {
-        // SAFETY: `ptr` and `len` were returned by a successful `libc::mmap` call in `Substrate::open`.
+        // SAFETY: `ptr` and `len` were returned by a successful `libc::mmap` call in `Backing::open`.
         unsafe {
             if libc::munmap(self.ptr.as_ptr().cast(), self.len) != 0 {}
         }
@@ -125,19 +129,67 @@ impl Drop for Backing {
 
 #[cfg(unix)]
 impl Backing {
-    fn as_slice(&self) -> &[u8] {
+    pub(super) fn open(path: &Path, min_len: usize) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
+        let len_u64 = meta.len();
+        if len_u64 < min_len as u64 {
+            bail!("backing file smaller than header");
+        }
+        let len = usize::try_from(len_u64).context("backing file exceeds address space")?;
+        // SAFETY: `file` is open for reading and `len > 0`; `MAP_SHARED` creates a read-only mapping owned by `Backing`.
+        let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error()).with_context(|| format!("mmap {}", path.display()));
+        }
+        let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
+        Ok(Backing { ptr, len })
+    }
+
+    pub(super) fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` is valid for `len` bytes for the lifetime of `&self` and never mutated.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
 #[cfg(not(unix))]
-struct Backing(Box<[u8]>);
+pub(super) struct Backing(Box<[u8]>);
 
 #[cfg(not(unix))]
 impl Backing {
-    fn as_slice(&self) -> &[u8] {
+    pub(super) fn open(path: &Path, min_len: usize) -> Result<Self> {
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        if bytes.len() < min_len {
+            bail!("backing file smaller than header");
+        }
+        Ok(Backing(bytes.into_boxed_slice()))
+    }
+
+    pub(super) fn as_slice(&self) -> &[u8] {
         &self.0
+    }
+}
+
+pub(super) fn path_to_bytes(path: &Path) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        Some(path.as_os_str().as_bytes().to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_str().map(|s| s.as_bytes().to_vec())
+    }
+}
+
+pub(super) fn bytes_to_path(bytes: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = OsString::new();
+        std::str::from_utf8(bytes).ok().map(PathBuf::from)
     }
 }
 
@@ -226,31 +278,7 @@ fn encode_loops(loops: &[Range<u32>], out: &mut Vec<u8>) {
 impl Substrate {
     /// Opens and memory-maps a substrate file from `path`, validating its header and section bounds.
     pub fn open(path: &Path) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
-            let len_u64 = meta.len();
-            if len_u64 < HEADER_LEN as u64 {
-                bail!("substrate file smaller than header");
-            }
-            let len = usize::try_from(len_u64).context("substrate file exceeds address space")?;
-            // SAFETY: `file` is open for reading and `len > 0`; `MAP_SHARED` creates a read-only mapping owned by `Backing`.
-            let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
-            if raw == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error()).with_context(|| format!("mmap {}", path.display()));
-            }
-            let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
-            Self::from_backing(Backing { ptr, len })
-        }
-        #[cfg(not(unix))]
-        {
-            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            if bytes.len() < HEADER_LEN {
-                bail!("substrate file smaller than header");
-            }
-            Self::from_backing(Backing(bytes.into_boxed_slice()))
-        }
+        Self::from_backing(Backing::open(path, HEADER_LEN)?)
     }
 
     /// Opens the substrate for `toolchain_hash` from the toolchain cache directory.
@@ -652,13 +680,13 @@ fn prune_superseded(toolchain_hash: u64) {
     }
 }
 
-fn prune_stale_substrates(dir: &Path, keep: &Path, keep_others: usize) {
+pub(super) fn prune_stale(dir: &Path, keep: &Path, keep_others: usize, keep_file: impl Fn(&Path) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut others: Vec<_> = entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path == keep || path.extension().and_then(|e| e.to_str()) != Some("substrate") {
+            if path == keep || !keep_file(&path) {
                 return None;
             }
             let meta = entry.metadata().ok()?;
@@ -667,4 +695,8 @@ fn prune_stale_substrates(dir: &Path, keep: &Path, keep_others: usize) {
         .collect();
     others.sort_by(|a, b| b.0.cmp(&a.0));
     others.into_iter().skip(keep_others).for_each(|(_, p)| drop(std::fs::remove_file(p)));
+}
+
+fn prune_stale_substrates(dir: &Path, keep: &Path, keep_others: usize) {
+    prune_stale(dir, keep, keep_others, |p| p.extension().and_then(|e| e.to_str()) == Some("substrate"));
 }

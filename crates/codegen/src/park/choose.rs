@@ -3,8 +3,12 @@ use crate::live::{Live, Range, overlaps};
 
 use super::{BackIndex, Hints, Pool, SlotSet, crosses_call, crosses_ranges, parks, slot_free, try_place_weighted};
 
-fn reuse_pair(hints: &Hints, reverse_reuse: &[Option<Value>], value: usize) -> [Option<Value>; 2] {
+pub(super) fn reuse_pair(hints: &Hints, reverse_reuse: &[Option<Value>], value: usize) -> [Option<Value>; 2] {
     [hints.reuse[value], reverse_reuse.get(value).copied().flatten()]
+}
+
+fn order_pair<T>(two_address: bool, fwd: T, reuse: T) -> (T, T) {
+    if two_address { (reuse, fwd) } else { (fwd, reuse) }
 }
 
 fn pick_slot<F: Copy + PartialEq>(
@@ -65,9 +69,9 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
     if let Some(s) = back_partners.iter().find_map(|&p| try_partner(p, false)) {
         return Some(s);
     }
+    let try_fwd = || hints.partners.and_then(|partners| partners[value].iter().find_map(|p| try_partner(p.index(), true)));
     if !hints.two_address
-        && let Some(partners) = hints.partners
-        && let Some(s) = partners[value].iter().find_map(|p| try_partner(p.index(), true))
+        && let Some(s) = try_fwd()
     {
         return Some(s);
     }
@@ -109,8 +113,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         }
     }
     if hints.two_address
-        && let Some(partners) = hints.partners
-        && let Some(s) = partners[value].iter().find_map(|p| try_partner(p.index(), true))
+        && let Some(s) = try_fwd()
     {
         return Some(s);
     }
@@ -126,7 +129,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
             return Some(s);
         }
     }
-    let (first_unalloc, second_unalloc) = if hints.two_address { (&unalloc_reuse, &unalloc_fwd) } else { (&unalloc_fwd, &unalloc_reuse) };
+    let (first_unalloc, second_unalloc) = order_pair(hints.two_address, &unalloc_fwd, &unalloc_reuse);
     for &(p, p_saved, p_start) in unalloc_back.iter().chain(first_unalloc).chain(second_unalloc) {
         let pr = live.ranges_of(p);
         if overlaps(pr, ranges) {
@@ -170,11 +173,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         }
     }
     let tier = |s: usize| {
-        let (sec, third) = if hints.two_address {
-            (!compat_reuse(s), !compat_fwd(s))
-        } else {
-            (!compat_fwd(s), !compat_reuse(s))
-        };
+        let (sec, third) = order_pair(hints.two_address, !compat_fwd(s), !compat_reuse(s));
         u8::from(!compat_back(s)) * 4 + u8::from(sec) * 2 + u8::from(third)
     };
     let try_pick = |allow_res: bool, pred: &dyn Fn(usize) -> bool| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, allow_res, &slot_used, &tier, pred);
@@ -198,11 +197,11 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         {
             return Some(s);
         }
-        let (first_saved, second_saved) = if hints.two_address {
-            ((reuse_needs_saved, &compat_reuse as &dyn Fn(usize) -> bool), (fwd_needs_saved, &compat_fwd as &dyn Fn(usize) -> bool))
-        } else {
-            ((fwd_needs_saved, &compat_fwd as &dyn Fn(usize) -> bool), (reuse_needs_saved, &compat_reuse as &dyn Fn(usize) -> bool))
-        };
+        let (first_saved, second_saved) = order_pair(
+            hints.two_address,
+            (fwd_needs_saved, &compat_fwd as &dyn Fn(usize) -> bool),
+            (reuse_needs_saved, &compat_reuse as &dyn Fn(usize) -> bool),
+        );
         for (needed, compat) in [first_saved, second_saved] {
             if needed
                 && let Some(s) = try_pick(false, &|s| pool.is_saved[s] && compat(s))
