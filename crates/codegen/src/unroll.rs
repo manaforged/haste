@@ -6,11 +6,11 @@ mod vector;
 
 use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
-use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, Op, Type, Value};
 use crate::{Arch, Target};
 pub(crate) use memset::Emit;
 pub(crate) use vector::splat_in;
-use count::{Counted, counted, head_defs, outside_preds, stride_const};
+use count::{counted, emit_dynamic_guard, guarded_trapz, head_defs, outside_preds, stride_const};
 
 const MAX_FULL_TRIPS: usize = 64;
 const MAX_FULL_INSTS: usize = 1024;
@@ -219,7 +219,7 @@ fn unroll_self(
 }
 
 fn blocks_dynamic_unroll(op: &Op) -> bool {
-    is_libcall_mem(op) || matches!(*op, Op::Trap | Op::Trapz(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)
+    is_libcall_mem(op) || matches!(*op, Op::Trap | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)
 }
 
 fn head_defs_dominated(func: &Function, cfg: &Cfg, (b, out_blk): (usize, usize), head_defs: &[bool]) -> bool {
@@ -237,57 +237,6 @@ fn head_defs_dominated(func: &Function, cfg: &Cfg, (b, out_blk): (usize, usize),
         }
     }
     true
-}
-
-fn emit_dynamic_guard(
-    func: &mut Function,
-    guard: Block,
-    counted_info: &Counted,
-    (const_stride, factor): (Option<i64>, i64),
-    (head, unrolled, guard_params): (Block, Block, Vec<Value>),
-) -> Value {
-    let &Counted { cmp_cc, is_ne, iv_ty, limit, iv_idx, stride, bias } = counted_info;
-    let mut emit_guard = |op: Op, ty: Type| -> Value {
-        let v = func.value(ty);
-        let i = func.add(op, Some(v));
-        func.blocks[guard.index()].insts.push(i);
-        v
-    };
-    let (s_need, g1) = if let Some(c) = const_stride {
-        (emit_guard(Op::Const(c * factor + bias), iv_ty), None)
-    } else {
-        let zero = emit_guard(Op::Const(0), iv_ty);
-        let sh = emit_guard(Op::Const(i64::from(iv_ty.bits() - 3)), iv_ty);
-        let cf = emit_guard(Op::Const(factor), iv_ty);
-        let stride_ok = if is_ne {
-            let one = emit_guard(Op::Const(1), iv_ty);
-            emit_guard(Op::Icmp(IntCC::Equal, stride, one), Type::I8)
-        } else {
-            emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8)
-        };
-        let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), iv_ty);
-        let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh), iv_ty);
-        let no_wrap = emit_guard(Op::Icmp(IntCC::Equal, hi_bits, zero), Type::I8);
-        let sf = emit_guard(Op::Binary(Binary::Imul, stride, cf), iv_ty);
-        let need = if bias > 0 {
-            let b_val = emit_guard(Op::Const(bias), iv_ty);
-            emit_guard(Op::Binary(Binary::Iadd, sf, b_val), iv_ty)
-        } else {
-            sf
-        };
-        (need, Some(emit_guard(Op::Binary(Binary::Band, stride_ok, no_wrap), Type::I8)))
-    };
-    let lim_ok = emit_guard(Op::Icmp(IntCC::UnsignedLessThanOrEqual, s_need, limit), Type::I8);
-    let safe_limit = emit_guard(Op::Binary(Binary::Isub, limit, s_need), iv_ty);
-    let init_ok = emit_guard(Op::Icmp(cmp_cc, guard_params[iv_idx], safe_limit), Type::I8);
-    let g2 = emit_guard(Op::Binary(Binary::Band, lim_ok, init_ok), Type::I8);
-    let guard_cond = match g1 {
-        Some(g1) => emit_guard(Op::Binary(Binary::Band, g1, g2), Type::I8),
-        None => g2,
-    };
-    let guard_br = func.add(Op::Brif(guard_cond, unrolled, guard_params.clone(), head, guard_params), None);
-    func.blocks[guard.index()].insts.push(guard_br);
-    safe_limit
 }
 
 fn retarget_outside_pred(func: &mut Function, out_blk: usize, head: Block, guard: Block) {
@@ -308,6 +257,9 @@ fn retarget_outside_pred(func: &mut Function, out_blk: usize, head: Block, guard
 
 fn peel_jumps(func: &Function, mut blk: Block) -> Block {
     for _ in 0..4 {
+        if func.blocks[blk.index()].insts.len() != 1 {
+            break;
+        }
         match func.last(blk) {
             Some(Op::Jump(next, _)) if *next != blk => blk = *next,
             _ => break,
@@ -326,7 +278,7 @@ pub(super) fn block_has_float(func: &Function, blk: usize) -> bool {
 
 fn is_preloop_for_remainder(func: &Function, cfg: &Cfg, head: Block, out_blk: usize, exit_blk: Block) -> bool {
     let rem = peel_jumps(func, exit_blk);
-    if rem == head || !cfg.loops().list.iter().any(|lp| lp.head == rem) {
+    if rem == head || !cfg.loops().list.iter().any(|lp| lp.head == rem && !lp.body.get(head.index()).copied().unwrap_or(false)) {
         return false;
     }
     match func.last(Block(out_blk as u32)) {
@@ -368,15 +320,18 @@ fn unroll_self_dynamic(
     let Some(counted_info) = counted(func, b, &body_insts, (cond, back_on_true), back_args, &head_defs, global_consts) else {
         return false;
     };
+    let iv_param = func.blocks[b].params[counted_info.iv_idx];
+    let Some((trap_insts, trap_lens)) = guarded_trapz(func, &body_insts, iv_param, counted_info.iv_ty, &head_defs) else {
+        return false;
+    };
     let const_stride = stride_const(global_consts, counted_info.stride, counted_info.is_ne);
-    let factor = if inst_count <= 16 { 4_i64 } else { 2_i64 };
+    let factor = if inst_count.saturating_sub(trap_insts.len() * 2) <= 16 { 4_i64 } else { 2_i64 };
     let param_tys: Vec<Type> = func.blocks[b].params.iter().map(|&p| func.ty(p)).collect();
     let guard_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
     let (guard, unrolled) = (Block(func.blocks.len() as u32), Block((func.blocks.len() + 1) as u32));
     let unrolled_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
     func.blocks.push(BlockData { params: guard_params.clone(), insts: Vec::new() });
     func.blocks.push(BlockData { params: unrolled_params.clone(), insts: Vec::new() });
-    let iv_param = func.blocks[b].params[counted_info.iv_idx];
     let iv_back = back_args[counted_info.iv_idx];
     let parallel_strides = (const_stride.is_none()
         && body_insts.iter().any(|&i| {
@@ -395,25 +350,34 @@ fn unroll_self_dynamic(
         }
         strides
     });
-    let safe_limit = emit_dynamic_guard(func, guard, &counted_info, (const_stride, factor), (head, unrolled, guard_params));
+    let pre_sf = parallel_strides.as_ref().map(|s| s[factor as usize - 1]);
+    let safe_limit = emit_dynamic_guard(
+        func,
+        guard,
+        &counted_info,
+        (const_stride, factor, pre_sf),
+        (head, unrolled, guard_params),
+        &trap_lens,
+    );
     let iv_base = unrolled_params[counted_info.iv_idx];
     let mut cur_args = unrolled_params;
     for step in 0..(factor as usize) {
         let mut map: Vec<(Value, Value)> = func.blocks[b].params.iter().copied().zip(cur_args.iter().copied()).collect();
-        if let Some(strides) = &parallel_strides {
-            for &orig_inst in &body_insts {
+        for &orig_inst in &body_insts {
+            if trap_insts.contains(&orig_inst) {
+                continue;
+            }
+            if let Some(strides) = &parallel_strides {
                 let data = &func.insts[orig_inst.index()];
                 if data.result == Some(iv_back) {
                     let nr = func.value_like(iv_back);
                     map.push((iv_back, nr));
                     let ni = func.add(Op::Binary(Binary::Iadd, iv_base, strides[step]), Some(nr));
                     func.blocks[unrolled.index()].insts.push(ni);
-                } else {
-                    clone_body(func, &[orig_inst], unrolled, &mut map);
+                    continue;
                 }
             }
-        } else {
-            clone_body(func, &body_insts, unrolled, &mut map);
+            clone_body(func, &[orig_inst], unrolled, &mut map);
         }
         cur_args = back_args.iter().map(|&v| remap_val(&map, v)).collect();
     }

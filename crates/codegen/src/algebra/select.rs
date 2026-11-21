@@ -24,7 +24,37 @@ pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Valu
     let (t, f) = (refuted_arm(cx, inner, t, true).unwrap_or(t), refuted_arm(cx, inner, f, false).unwrap_or(f));
     if t == f { cx.alias(res, t); return None; }
     if let Some(op) = simplify_unit_bool_select(cx, res, inner, t, f) { return op; }
-    fold_ord_select_cmp(cx, inner, t, f).or_else(|| (inner != cond || (t, f) != given).then_some(Op::Select(inner, t, f)))
+    fold_ord_select_cmp(cx, inner, t, f)
+        .or_else(|| factor_select_add(cx, inner, t, f))
+        .or_else(|| (inner != cond || (t, f) != given).then_some(Op::Select(inner, t, f)))
+}
+
+fn match_acc_delta(cx: &RewriteCx, ty: Type, cand: Value, acc: Value) -> Option<(Binary, Value)> {
+    if !cx.single_use(cand) { return None; }
+    match *cx.op(cand)? {
+        Op::Binary(Binary::Iadd, a, b) => {
+            let delta = if a == acc { b } else if b == acc { a } else { return None };
+            (cx.uconst(delta, ty) != Some(1)).then_some((Binary::Iadd, delta))
+        }
+        Op::Binary(Binary::Isub, a, b) if a == acc => Some((Binary::Isub, b)),
+        _ => None,
+    }
+}
+
+fn factor_select_add(cx: &mut RewriteCx, cond: Value, t: Value, f: Value) -> Option<Op> {
+    let ty = cx.func.ty(t);
+    if !matches!(ty, Type::I32 | Type::I64) { return None; }
+    let (acc, bin, t_arm, f_arm) = if let Some((bin, delta)) = match_acc_delta(cx, ty, t, f) {
+        let zero = cx.emit(ty, Op::Const(0));
+        (f, bin, delta, zero)
+    } else if let Some((bin, delta)) = match_acc_delta(cx, ty, f, t) {
+        let zero = cx.emit(ty, Op::Const(0));
+        (t, bin, zero, delta)
+    } else {
+        return None;
+    };
+    let sel = cx.emit(ty, Op::Select(cond, t_arm, f_arm));
+    Some(Op::Binary(bin, acc, sel))
 }
 
 fn simplify_unit_bool_select(cx: &mut RewriteCx, res: Option<Value>, inner: Value, t: Value, f: Value) -> Option<Option<Op>> {

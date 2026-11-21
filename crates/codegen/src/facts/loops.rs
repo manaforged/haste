@@ -615,7 +615,9 @@ impl ExtraPath {
     }
 
     fn proves_ult(&self, func: &Function, (cfg, ranges, env, path, block): (&Cfg, &Ranges, &Env, &Path, Block), ty: Type, a: Value, b: Value, depth: u8) -> bool {
-        if path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, a, b) == Some(true) {
+        if path.fact(ranges, a).hi < path.fact(ranges, b).lo
+            || path.decide_rel(func, ranges, IntCC::UnsignedLessThan, ty, a, b) == Some(true)
+        {
             return true;
         }
         if depth > 2 {
