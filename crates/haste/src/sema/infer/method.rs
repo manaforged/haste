@@ -64,7 +64,35 @@ impl<'a> Infer<'_, 'a> {
         let count = self.body.list(params.1).len();
         let origin = self.receiver_origin(receiver);
         let outer = std::mem::replace(&mut self.receiver_param, origin);
-        let probed = self.probe_steps((expr, found), (name, count), &steps, expected);
+        let mut probed = self.probe_steps((expr, found), (name, count), &steps, expected);
+        if matches!(probed, Ok(None))
+            && let Some(default_prim) = match self.cx.types.kind(*steps.last().unwrap()) {
+                Kind::IntVar(_) => Some(crate::names::Primitive::I32),
+                Kind::FloatVar(_) => Some(crate::names::Primitive::F64),
+                _ => None,
+            }
+        {
+            let default_ty = self.cx.types.prim(default_prim);
+            let last = *steps.last().unwrap();
+            let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());
+            if self.unify(last, default_ty).is_ok() {
+                let resolved: Vec<Ty> = steps.iter().map(|&s| self.resolve(s)).collect();
+                let retry = self.probe_steps((expr, found), (name, count), &resolved, expected);
+                if matches!(retry, Ok(Some(_))) {
+                    self.commit_vars(mark.0);
+                    steps = resolved;
+                    probed = retry;
+                } else {
+                    self.rollback_vars(mark.0);
+                    self.projections.truncate(mark.1);
+                    self.obligations.truncate(mark.2);
+                }
+            } else {
+                self.rollback_vars(mark.0);
+                self.projections.truncate(mark.1);
+                self.obligations.truncate(mark.2);
+            }
+        }
         self.receiver_param = outer;
         let probed = probed?;
         self.finish_method_call((expr, found), (name, at), &steps, probed, params, expected)
