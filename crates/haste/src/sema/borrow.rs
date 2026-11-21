@@ -1,13 +1,15 @@
 //! Ownership, mutability, and NLL-style borrow checking for local workspace function bodies.
 
 mod bind;
+mod calls;
+mod checks;
 mod flow;
 mod liveness;
 mod places;
 mod propagate;
 
 use anyhow::{Result, bail};
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, List, Pat, PatId, UnOp, jumps_to};
 use crate::names::ItemRef;
@@ -16,9 +18,9 @@ use crate::outline::source::Source;
 
 use super::Context;
 use super::infer::{Res, Typed};
-use super::ty::{Kind, Ty};
+use super::ty::{Kind, Mut, Ty};
 
-use places::{FieldKey, PlaceStep, push_step, steps_conflict};
+use places::{PlaceStep, steps_conflict};
 use propagate::BorrowSource;
 
 const TEMP_HOLDER_BASE: u32 = u32::MAX - 65_536;
@@ -72,9 +74,17 @@ struct Checker<'c, 'a> {
     no_move_captures: Vec<(u32, Vec<PlaceStep>)>,
     returns_borrow: bool,
     return_min_depth: u32,
+    closure_depth: u32,
+    closure_by_val_caps: Vec<u32>,
     stmt_depth: u32,
+    temp_scope_depth: u32,
     breaks: Vec<BreakFrame>,
     temp_depth: u32,
+    let_extend_depth: Option<u32>,
+    temp_sources: HashMap<ExprId, Vec<BorrowSource>>,
+    closure_effects: HashMap<ExprId, checks::ClosureEffects>,
+    drop_cache: HashMap<Ty, bool>,
+    drop_locals: HashSet<u32>,
 }
 
 /// Checks ownership, mutability, borrow aliasing, and dangling local reference escapes on `body`.
@@ -86,14 +96,11 @@ pub(super) fn check(
     typed: &Typed,
 ) -> Result<()> {
     let Some(root) = body.root else { return Ok(()) };
-    if typed.locals.is_empty() {
-        return Ok(());
-    }
     let n = typed.locals.len();
     let mut is_copy = vec![true; n];
     for (idx, local) in typed.locals.iter().enumerate() {
         if local.ty != Ty::NONE {
-            is_copy[idx] = matches!(cx.types.kind(local.ty), Kind::Ref(..))
+            is_copy[idx] = matches!(cx.types.kind(local.ty), Kind::Ref(Mut::Not, _))
                 || super::infer::is_copy(cx, item, local.ty).unwrap_or(true);
         }
     }
@@ -151,9 +158,16 @@ pub(super) fn check(
     }
     let mut checker = Checker {
         cx, item, body, src, typed, mutable, is_copy, is_param, scope_depth, names,
-        no_move_captures: Vec::new(), returns_borrow: false, return_min_depth: 1, stmt_depth: 1,
-        breaks: Vec::new(), temp_depth: 0,
+        no_move_captures: Vec::new(), returns_borrow: false, return_min_depth: 1, closure_depth: 0,
+        closure_by_val_caps: Vec::new(), stmt_depth: 1, temp_scope_depth: 1,
+        breaks: Vec::new(), temp_depth: 0, let_extend_depth: None, temp_sources: HashMap::default(),
+        closure_effects: HashMap::default(), drop_cache: HashMap::default(), drop_locals: HashSet::default(),
     };
+    for (idx, local) in typed.locals.iter().enumerate() {
+        if local.ty != Ty::NONE && checker.ty_holds_borrow(local.ty) && checker.ty_has_borrow_drop(local.ty) {
+            checker.drop_locals.insert(idx as u32);
+        }
+    }
     checker.returns_borrow = typed.ret.is_some_and(|ty| checker.ty_holds_borrow(ty));
     let mut state = State {
         maybe_init: init.clone(), init, moved: vec![false; n],
@@ -163,10 +177,12 @@ pub(super) fn check(
         checker.check_param_pat(pat, &mut state)?;
     }
     let empty_live = HashSet::default();
-    checker.check_expr(root, &mut state, false, &empty_live, true, 0)?;
+    let root_place_ctx = checker.is_mut_ref_ty(checker.expr_ty(root)) && typed.ret.is_some_and(|r| checker.is_mut_ref_ty(r));
+    checker.check_expr(root, &mut state, root_place_ctx, &empty_live, true, 0)?;
     if checker.returns_borrow && !state.diverged {
         checker.check_return_escape(root, &state)?;
     }
+    checker.check_coercion_vtables()?;
     Ok(())
 }
 
@@ -235,7 +251,29 @@ impl Checker<'_, '_> {
         id
     }
 
+    fn is_const_or_static_item(&self) -> bool {
+        self.closure_depth == 0
+            && matches!(self.cx.item(self.item).1.kind, ItemKind::Const | ItemKind::Static)
+    }
+
+    pub(super) fn with_let_extend<T>(&mut self, depth: Option<u32>, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::replace(&mut self.let_extend_depth, depth);
+        let res = f(self);
+        self.let_extend_depth = saved;
+        res
+    }
+
     fn is_escaping_return(&self, src: &BorrowSource) -> bool {
+        if checks::is_temp_target(src.target).is_some() {
+            return !self.is_const_or_static_item();
+        }
+        if self.closure_depth > 0
+            && !src.through_ref
+            && !self.is_ref_ty(self.local_ty(src.target))
+            && self.closure_by_val_caps.contains(&src.target)
+        {
+            return true;
+        }
         if src.through_ref && self.is_ref_ty(self.local_ty(src.target)) {
             return false;
         }
@@ -246,6 +284,13 @@ impl Checker<'_, '_> {
     }
 
     pub(super) fn escapes_depth(&self, target: u32, through_ref: bool, depth: u32) -> bool {
+        if let Some(t_depth) = checks::is_temp_target(target) {
+            if self.is_const_or_static_item() {
+                return false;
+            }
+            let effective = if t_depth >= 10_000 { t_depth - 10_000 } else { t_depth };
+            return effective >= depth;
+        }
         !self.from_caller(target, through_ref)
             && !(through_ref && self.is_ref_ty(self.local_ty(target)))
             && self.scope_depth.get(target as usize).copied().unwrap_or(0) >= depth
@@ -448,7 +493,8 @@ impl Checker<'_, '_> {
             Expr::Assign(lhs, rhs) => {
                 let mut after_rhs = outer_live.clone();
                 self.collect_live_expr(lhs, &mut after_rhs);
-                self.check_expr(rhs, state, false, &after_rhs, true, depth)?;
+                let reborrow_mut = self.is_mut_ref_ty(self.expr_ty(lhs)) && self.is_mut_ref_ty(self.expr_ty(rhs));
+                self.check_expr(rhs, state, reborrow_mut, &after_rhs, true, depth)?;
                 if !state.diverged {
                     self.check_mut_ref_reborrow(lhs, rhs, state)?;
                     let sources = self.expr_borrow_sources(rhs, state);
@@ -462,6 +508,11 @@ impl Checker<'_, '_> {
                 self.collect_live_expr(lhs, &mut after_rhs);
                 self.check_expr(rhs, state, false, &after_rhs, true, depth)?;
                 if !state.diverged {
+                    let sources = if self.typed.operators.contains_key(&expr) && self.ty_holds_borrow(self.expr_ty(lhs)) {
+                        self.expr_borrow_sources(rhs, state)
+                    } else {
+                        Vec::new()
+                    };
                     prune_dead_loans(state, &after_rhs);
                     if self.place_behind_shared_ref(lhs) {
                         bail!("cannot assign to data in a `&` reference");
@@ -470,6 +521,12 @@ impl Checker<'_, '_> {
                     if let Some(p) = self.root_place(lhs) {
                         self.check_not_moved(p.local, &p.steps, state)?;
                         self.check_can_mutate(p.local, p.through_ref, p.mut_ref_root, p.behind_shared, &p.steps, state, false)?;
+                        if !sources.is_empty() {
+                            self.check_assign_escape(&p, &sources, state)?;
+                            if !p.through_ref {
+                                self.push_sources_for_local(p.local, &sources, state);
+                            }
+                        }
                     } else {
                         self.check_expr(lhs, state, true, outer_live, false, depth)?;
                     }
@@ -479,11 +536,11 @@ impl Checker<'_, '_> {
                 if matches!(kind, BlockKind::Async | BlockKind::AsyncMove) {
                     self.check_closure(expr, None, expr, state, depth)?;
                 } else {
-                    self.check_block(kind, stmts, tail, label, state, (place_ctx, value_used), outer_live, depth)?;
+                    self.check_block(expr, kind, stmts, tail, label, state, (place_ctx, value_used), outer_live, depth)?;
                 }
             }
             Expr::If(cond, then, otherwise) => {
-                self.check_if(cond, then, otherwise, state, (place_ctx, value_used), outer_live, depth)?;
+                self.check_if(expr, cond, then, otherwise, state, (place_ctx, value_used), outer_live, depth)?;
             }
             Expr::Let(pat, init) => {
                 self.check_expr(init, state, true, outer_live, true, depth)?;
@@ -491,7 +548,7 @@ impl Checker<'_, '_> {
                 self.bind_pat(pat, Some(init), scrut_place.as_ref(), &[], &[], state, (true, true, depth))?;
             }
             Expr::Match(scrut, arms) => {
-                self.check_match(scrut, arms, state, (place_ctx, value_used), outer_live, depth)?;
+                self.check_match(expr, scrut, arms, state, (place_ctx, value_used), outer_live, depth)?;
             }
             Expr::Loop { label, body } => self.check_loop(label, None, None, None, body, state, outer_live, depth)?,
             Expr::While { label, cond, body } => self.check_loop(label, Some(cond), None, None, body, state, outer_live, depth)?,
@@ -520,9 +577,21 @@ impl Checker<'_, '_> {
                 self.check_expr(b, state, false, outer_live, true, depth)?;
             }
             Expr::Binary(op, a, b) => {
-                let cmp = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
-                self.check_expr(a, state, cmp, outer_live, !cmp, depth)?;
-                self.check_expr(b, state, cmp, outer_live, !cmp, depth)?;
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let mut after_a = outer_live.clone();
+                    self.collect_live_expr(b, &mut after_a);
+                    self.check_expr(a, state, false, &after_a, true, depth)?;
+                    if !state.diverged {
+                        let before_rhs = state.clone();
+                        let mut rhs_state = state.clone();
+                        self.check_expr(b, &mut rhs_state, false, outer_live, true, depth)?;
+                        merge_branch(state, &before_rhs, &rhs_state);
+                    }
+                } else {
+                    let cmp = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+                    self.check_expr(a, state, cmp, outer_live, !cmp, depth)?;
+                    self.check_expr(b, state, cmp, outer_live, !cmp, depth)?;
+                }
             }
             Expr::Repeat(a, b) => {
                 self.check_expr(a, state, false, outer_live, true, depth)?;
@@ -532,9 +601,24 @@ impl Checker<'_, '_> {
                 let moving = !place_ctx && !self.ty_is_copy(self.expr_ty(expr));
                 if let Some(p) = self.root_place(expr)
                     && !p.steps.is_empty()
-                    && !p.steps.contains(&PlaceStep::Opaque)
+                    && !p.steps.iter().any(|s| matches!(s, PlaceStep::Opaque(_)))
                 {
-                    if !moving {
+                    if p.steps.last() == Some(&PlaceStep::Union) {
+                        let prefix = &p.steps[..p.steps.len() - 1];
+                        if !moving {
+                            self.check_can_read(p.local, prefix, state)?;
+                        } else if p.through_ref {
+                            bail!("cannot move out of `{}` which is behind a reference", self.local_name(p.local));
+                        } else {
+                            self.check_can_move(p.local, prefix, state)?;
+                            if prefix.is_empty() {
+                                state.moved[p.local as usize] = true;
+                                state.partial_moves.retain(|m| m.local != p.local);
+                            } else {
+                                self.push_partial_move(state, p.local, prefix.to_vec());
+                            }
+                        }
+                    } else if !moving {
                         self.check_can_read(p.local, &p.steps, state)?;
                     } else if p.through_ref {
                         bail!("cannot move out of `{}` which is behind a reference", self.local_name(p.local));
@@ -556,7 +640,14 @@ impl Checker<'_, '_> {
                     self.check_expr(base, state, true, outer_live, false, depth)?;
                 }
             }
-            Expr::Cast(inner, _) | Expr::Try(inner) | Expr::Await(inner) | Expr::Paren(inner) | Expr::Become(inner) => {
+            Expr::Cast(inner, _) => {
+                let reborrow_mut = self.is_mut_ref_ty(self.expr_ty(inner));
+                self.check_expr(inner, state, reborrow_mut, outer_live, true, depth)?;
+            }
+            Expr::Try(inner) | Expr::Await(inner) | Expr::Become(inner) => {
+                self.check_expr(inner, state, false, outer_live, true, depth)?;
+            }
+            Expr::Paren(inner) => {
                 self.check_expr(inner, state, place_ctx, outer_live, value_used, depth)?;
             }
             Expr::Tuple(list) | Expr::Array(list) => {
@@ -576,7 +667,8 @@ impl Checker<'_, '_> {
             }
             Expr::Return(val) => {
                 if let Some(v) = val {
-                    self.check_expr(v, state, false, outer_live, true, depth)?;
+                    let reborrow_mut = self.is_mut_ref_ty(self.expr_ty(v)) && self.typed.ret.is_some_and(|r| self.is_mut_ref_ty(r));
+                    self.check_expr(v, state, reborrow_mut, outer_live, true, depth)?;
                     if self.returns_borrow {
                         self.check_return_escape(v, state)?;
                     }
@@ -616,26 +708,6 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn check_mut_ref_reborrow(&self, dst: ExprId, src: ExprId, state: &State) -> Result<()> {
-        if let Some(dst_local) = self.expr_plain_local(dst)
-            && let Some(src_local) = self.expr_plain_local(src)
-            && src_local != dst_local
-            && self.is_mut_ref_ty(self.local_ty(dst_local))
-            && self.is_mut_ref_ty(self.local_ty(src_local))
-            && state.loans.iter().any(|l| loan_conflicts_borrow(l, src_local, &[]))
-        {
-            bail!("cannot move out of `{}` because it is borrowed", self.local_name(src_local));
-        }
-        Ok(())
-    }
-
-    fn check_adt_drop_move(&mut self, ty: Ty) -> Result<()> {
-        if self.ty_has_own_drop(ty) {
-            bail!("cannot move out of type which implements the `Drop` trait");
-        }
-        Ok(())
-    }
-
     fn check_struct_expr(&mut self, expr: ExprId, fields: List, base: Option<ExprId>, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
         let val_ids: Vec<u32> = self.body.list(fields).iter().map(|&f| self.body.fields[f as usize].value.0).collect();
         self.check_arg_list(&val_ids, None, None, state, outer_live, depth)?;
@@ -643,106 +715,6 @@ impl Checker<'_, '_> {
             self.check_fru_base(expr, fields, b, state, outer_live, depth)?;
         }
         Ok(())
-    }
-
-    fn check_fru_base(&mut self, expr: ExprId, fields: List, b: ExprId, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
-        let deref_base = matches!(*self.body.expr(b), Expr::Unary(UnOp::Deref, _));
-        let Some(p) = self.root_place(b) else {
-            return self.check_expr(b, state, deref_base, outer_live, true, depth);
-        };
-        let Some((adt_item, variant, args)) = self.struct_adt(expr) else {
-            return self.check_expr(b, state, deref_base, outer_live, true, depth);
-        };
-        let args_vec = self.cx.types.substs(args).to_vec();
-        let Ok(field_tys) = super::infer::detached(self.cx, self.item, |infer| infer.adt_fields(adt_item, &args_vec)) else {
-            return self.check_expr(b, state, deref_base, outer_live, true, depth);
-        };
-        let pending_fields: Vec<(FieldKey, Ty)> = {
-            let Ok(def) = self.cx.adt_def(adt_item) else {
-                return self.check_expr(b, state, deref_base, outer_live, true, depth);
-            };
-            let Some(var) = def.variants.get(variant) else {
-                return self.check_expr(b, state, deref_base, outer_live, true, depth);
-            };
-            let overridden: HashSet<&str> = self
-                .body
-                .list(fields)
-                .iter()
-                .map(|&id| self.src.text(self.body.fields[id as usize].name))
-                .collect();
-            let adt_src = &self.cx.file(adt_item).source;
-            var.fields
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, fdef)| {
-                    let (fname, key) = match fdef.name {
-                        Some(n) => {
-                            let s = adt_src.text(n);
-                            (s.to_owned(), FieldKey::Named(s.to_owned()))
-                        }
-                        None => (idx.to_string(), FieldKey::Tuple(idx as u32)),
-                    };
-                    if overridden.contains(fname.as_str()) {
-                        return None;
-                    }
-                    let fty = field_tys.get(variant).and_then(|fs| fs.get(idx)).copied().unwrap_or(Ty::NONE);
-                    Some((key, fty))
-                })
-                .collect()
-        };
-        self.check_place_subexprs(b, state, outer_live, depth)?;
-        let behind_ref = self.place_behind_ref(b, false);
-        let mut drop_checked = false;
-        let adt_ty = self.expr_ty(expr);
-        for (key, fty) in pending_fields {
-            let mut steps = p.steps.clone();
-            push_step(&mut steps, PlaceStep::Field(key));
-            if self.ty_is_copy(fty) {
-                self.check_can_read(p.local, &steps, state)?;
-            } else {
-                if !drop_checked {
-                    drop_checked = true;
-                    self.check_adt_drop_move(adt_ty)?;
-                }
-                if behind_ref {
-                    bail!("cannot move out of a shared or mutable reference");
-                }
-                self.check_can_move(p.local, &steps, state)?;
-                if !p.through_ref {
-                    self.push_partial_move(state, p.local, steps);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn struct_adt(&self, expr: ExprId) -> Option<(ItemRef, usize, super::substs::Substs)> {
-        match self.typed.res.get(&expr).copied() {
-            Some(Res::Ctor(item, v, args)) => Some((item, v as usize, args)),
-            _ => match *self.cx.types.kind(self.expr_ty(expr)) {
-                Kind::Adt(item, args) => Some((item, 0, args)),
-                _ => None,
-            },
-        }
-    }
-
-    fn check_place_subexprs(
-        &mut self,
-        expr: ExprId,
-        state: &mut State,
-        outer_live: &HashSet<u32>,
-        depth: u32,
-    ) -> Result<()> {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Unary(_, inner) => {
-                self.check_place_subexprs(inner, state, outer_live, depth)
-            }
-            Expr::Index(base, idx) => {
-                self.check_place_subexprs(base, state, outer_live, depth)?;
-                self.check_expr(idx, state, false, outer_live, true, depth)
-            }
-            _ => Ok(()),
-        }
     }
 }
 

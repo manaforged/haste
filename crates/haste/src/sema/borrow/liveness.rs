@@ -50,6 +50,19 @@ impl Checker<'_, '_> {
         if let Some(t) = tail {
             self.collect_live_expr(t, &mut live);
         }
+        for &id in ids {
+            if let Stmt::Let { pat, init: Some(_), .. } = self.body.stmts[id as usize]
+                && !matches!(*self.body.pat(pat), Pat::Wild)
+            {
+                let mut bound = HashSet::default();
+                self.collect_pat_locals(pat, &mut bound);
+                for local in bound {
+                    if self.drop_locals.contains(&local) {
+                        live.insert(local);
+                    }
+                }
+            }
+        }
         let tail_live = live.clone();
         let mut after_stmt = vec![HashSet::default(); ids.len()];
         let mut before_stmt = vec![HashSet::default(); ids.len()];
@@ -99,7 +112,9 @@ impl Checker<'_, '_> {
             | Expr::Become(e) => self.collect_live_expr(e, live),
             Expr::Assign(lhs, rhs) => {
                 if let Some(local) = self.expr_plain_local(lhs) {
-                    live.remove(&local);
+                    if !self.drop_locals.contains(&local) {
+                        live.remove(&local);
+                    }
                     self.collect_live_expr(rhs, live);
                 } else {
                     self.collect_live_expr(rhs, live);

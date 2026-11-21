@@ -1,17 +1,14 @@
-use std::sync::Arc;
-
 use rustc_hash::FxHashSet as HashSet;
 
 use anyhow::{Result, bail};
 
-use crate::body::sig::Signature;
-use crate::body::{BlockKind, Expr, ExprId, List, Pat, PatId};
-use crate::sema::infer::{By, Res};
+use crate::body::{Expr, ExprId, Pat, PatId};
+use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::places::{FieldKey, Place, PlaceStep, push_step, steps_conflict};
 use super::propagate::BorrowSource;
-use super::{Checker, Loan, PartialMove, State, merge_states, prune_moved_loans};
+use super::{Checker, Loan, PartialMove, State, merge_states};
 
 #[derive(Clone, Copy)]
 struct PatCtx {
@@ -21,6 +18,7 @@ struct PatCtx {
     behind_ref: bool,
     in_drop_adt: bool,
     is_param: bool,
+    move_only: bool,
 }
 
 impl Checker<'_, '_> {
@@ -52,7 +50,7 @@ impl Checker<'_, '_> {
     }
 
     pub(super) fn bind_pat_param(&mut self, pat: PatId, state: &mut State) -> Result<()> {
-        let ctx = PatCtx { init_val: true, move_on_val: true, scope_depth: 0, behind_ref: false, in_drop_adt: false, is_param: true };
+        let ctx = PatCtx { init_val: true, move_on_val: true, scope_depth: 0, behind_ref: false, in_drop_adt: false, is_param: true, move_only: false };
         self.bind_pat_ctx(pat, None, None, &[], &[], state, ctx)
     }
 
@@ -60,8 +58,15 @@ impl Checker<'_, '_> {
         &mut self, pat: PatId, init: Option<ExprId>, scrut_place: Option<&Place>,
         pat_steps: &[PlaceStep], fallback_sources: &[BorrowSource], state: &mut State, options: (bool, bool, u32),
     ) -> Result<()> {
-        let ctx = PatCtx { init_val: options.0, move_on_val: options.1, scope_depth: options.2, behind_ref: false, in_drop_adt: false, is_param: false };
+        let ctx = PatCtx { init_val: options.0, move_on_val: options.1, scope_depth: options.2, behind_ref: false, in_drop_adt: false, is_param: false, move_only: false };
         self.bind_pat_ctx(pat, init, scrut_place, pat_steps, fallback_sources, state, ctx)
+    }
+
+    pub(super) fn bind_pat_moves(
+        &mut self, pat: PatId, init: Option<ExprId>, scrut_place: Option<&Place>, state: &mut State, scope_depth: u32,
+    ) -> Result<()> {
+        let ctx = PatCtx { init_val: true, move_on_val: true, scope_depth, behind_ref: false, in_drop_adt: false, is_param: false, move_only: true };
+        self.bind_pat_ctx(pat, init, scrut_place, &[], &[], state, ctx)
     }
 
     fn bind_pat_ctx(
@@ -80,18 +85,20 @@ impl Checker<'_, '_> {
                 if let Some(&local) = self.typed.binds.get(&pat)
                     && (local as usize) < state.init.len()
                 {
-                    if ctx.is_param && (ctx.behind_ref || !self.typed.ref_binds.contains_key(&pat)) {
-                        self.is_param[local as usize] = true;
+                    if !ctx.move_only {
+                        if ctx.is_param && (ctx.behind_ref || !self.typed.ref_binds.contains_key(&pat)) {
+                            self.is_param[local as usize] = true;
+                        }
+                        self.scope_depth[local as usize] = ctx.scope_depth;
+                        state.init[local as usize] = ctx.init_val;
+                        state.maybe_init[local as usize] = ctx.init_val;
+                        state.moved[local as usize] = false;
+                        state.partial_moves.retain(|m| m.local != local);
+                        clear_rebound_loans(local, state);
                     }
-                    self.scope_depth[local as usize] = ctx.scope_depth;
-                    state.init[local as usize] = ctx.init_val;
-                    state.maybe_init[local as usize] = ctx.init_val;
-                    state.moved[local as usize] = false;
-                    state.partial_moves.retain(|m| m.local != local);
-                    clear_rebound_loans(local, state);
                     if ctx.init_val {
                         let is_leaf = sub.is_none_or(|s| matches!(*self.body.pat(s), Pat::Rest));
-                        self.bind_local_init(pat, local, unwrapped_init, scrut_place, pat_steps, fallback_sources, state, (ctx.move_on_val, is_leaf, ctx.behind_ref, ctx.in_drop_adt))?;
+                        self.bind_local_init(pat, local, unwrapped_init, scrut_place, pat_steps, fallback_sources, state, (ctx.move_on_val, is_leaf, ctx.behind_ref, ctx.in_drop_adt, ctx.move_only))?;
                     }
                 }
                 if let Some(sub) = sub {
@@ -167,10 +174,11 @@ impl Checker<'_, '_> {
                     ctx.in_drop_adt = true;
                 }
                 let field_pat_ids: Vec<u32> = self.body.list(fields).to_vec();
-                let struct_fields = unwrapped_init.and_then(|e| match *self.body.expr(e) {
-                    Expr::Struct { fields: ef, .. } => Some(self.body.list(ef).to_vec()),
-                    _ => None,
+                let (struct_fields, has_base) = unwrapped_init.map_or((None, false), |e| match *self.body.expr(e) {
+                    Expr::Struct { fields: ef, base, .. } => (Some(self.body.list(ef).to_vec()), base.is_some()),
+                    _ => (None, false),
                 });
+                let saved_extend = if has_base { self.let_extend_depth.take() } else { None };
                 let next_fallback = self.fallback_or_empty(struct_fields.is_none(), unwrapped_init, fallback_sources, state);
                 for fp_id in field_pat_ids {
                     let fp = self.body.field_pats[fp_id as usize];
@@ -182,8 +190,12 @@ impl Checker<'_, '_> {
                     });
                     let mut next_steps = pat_steps.to_vec();
                     push_step(&mut next_steps, PlaceStep::Field(FieldKey::Named(fname)));
-                    self.bind_pat_ctx(fp.pat, f_init, scrut_place, &next_steps, &next_fallback, state, ctx)?;
+                    if let Err(err) = self.bind_pat_ctx(fp.pat, f_init, scrut_place, &next_steps, &next_fallback, state, ctx) {
+                        if has_base { self.let_extend_depth = saved_extend; }
+                        return Err(err);
+                    }
                 }
+                if has_base { self.let_extend_depth = saved_extend; }
             }
             Pat::Or(list) => {
                 let base = state.clone();
@@ -245,14 +257,17 @@ impl Checker<'_, '_> {
 
     fn fallback_or_empty(&mut self, needed: bool, unwrapped_init: Option<ExprId>, fallback_sources: &[BorrowSource], state: &State) -> Vec<BorrowSource> {
         if !needed { return Vec::new(); }
-        unwrapped_init.map(|e| self.expr_borrow_sources(e, state)).unwrap_or_else(|| fallback_sources.to_vec())
+        unwrapped_init.map(|e| self.expr_borrow_sources_let(e, state)).unwrap_or_else(|| fallback_sources.to_vec())
     }
 
     fn bind_local_init(
         &mut self, pat: PatId, local: u32, unwrapped_init: Option<ExprId>, scrut_place: Option<&Place>,
         pat_steps: &[PlaceStep], fallback_sources: &[BorrowSource], state: &mut State,
-        (move_on_val, leaf_bind, behind_ref, in_drop_adt): (bool, bool, bool, bool),
+        (move_on_val, leaf_bind, behind_ref, in_drop_adt, move_only): (bool, bool, bool, bool, bool),
     ) -> Result<()> {
+        if self.typed.ref_binds.contains_key(&pat) && move_only {
+            return Ok(());
+        }
         if let Some(&ref_mut) = self.typed.ref_binds.get(&pat) {
             let is_mut = ref_mut == Mut::Mut;
             let sources = if let Some(place) = scrut_place {
@@ -270,11 +285,12 @@ impl Checker<'_, '_> {
                 }
                 self.place_to_sources(&full_place, is_mut, state)
             } else {
+                let is_ref_init = unwrapped_init.is_some_and(|e| matches!(*self.body.expr(self.unwrap_parens(e)), Expr::Ref { .. }));
                 let mut sources = match unwrapped_init {
-                    Some(e) => self.expr_borrow_sources(e, state),
+                    Some(e) => self.place_borrow_sources(e, is_mut, state, self.let_extend_depth),
                     None => fallback_sources.to_vec(),
                 };
-                if is_mut {
+                if is_mut && !is_ref_init {
                     for s in &mut sources {
                         s.mutable = true;
                     }
@@ -284,18 +300,38 @@ impl Checker<'_, '_> {
             self.push_sources_for_local(local, &sources, state);
             return Ok(());
         }
-        if let Some(e) = unwrapped_init {
-            if let Some(src_local) = self.expr_plain_local(e)
-                && self.is_mut_ref_ty(self.local_ty(src_local))
-                && self.is_mut_ref_ty(self.local_ty(local))
-                && state.loans.iter().any(|l| super::loan_conflicts_borrow(l, src_local, &[]))
-            {
-                bail!("cannot move out of `{}` because it is borrowed", self.local_name(src_local));
+        if !move_only {
+            if let Some(e) = unwrapped_init {
+                if let Some(src_local) = self.expr_plain_local(e)
+                    && self.is_mut_ref_ty(self.local_ty(src_local))
+                    && self.is_mut_ref_ty(self.local_ty(local))
+                    && state.loans.iter().any(|l| super::loan_conflicts_borrow(l, src_local, &[]))
+                {
+                    bail!("cannot move out of `{}` because it is borrowed", self.local_name(src_local));
+                }
+                let sources = self.expr_borrow_sources_let(e, state);
+                self.push_sources_for_local(local, &sources, state);
+            } else if !fallback_sources.is_empty() {
+                if behind_ref && self.is_copy[local as usize] {
+                    let inner: Vec<BorrowSource> = fallback_sources
+                        .iter()
+                        .flat_map(|s| {
+                            state.loans.iter().filter(move |l| l.holder == Some(s.target)).map(|l| BorrowSource {
+                                target: l.target,
+                                steps: l.steps.clone(),
+                                mutable: l.mutable,
+                                through_ref: l.through_ref,
+                                env_only: l.env_only,
+                            })
+                        })
+                        .collect();
+                    if !inner.is_empty() {
+                        self.push_sources_for_local(local, &inner, state);
+                    }
+                } else {
+                    self.push_sources_for_local(local, fallback_sources, state);
+                }
             }
-            let sources = self.expr_borrow_sources(e, state);
-            self.push_sources_for_local(local, &sources, state);
-        } else if !fallback_sources.is_empty() {
-            self.push_sources_for_local(local, fallback_sources, state);
         }
         if move_on_val && leaf_bind && !self.is_copy[local as usize] {
             if behind_ref {
@@ -332,7 +368,7 @@ impl Checker<'_, '_> {
             if matches!(self.body.pat(p), Pat::Rest) { saw_rest = true; continue; }
             let sub_init = elem_exprs.filter(|_| !saw_rest).map(|es| ExprId(es[idx]));
             let mut next_steps = pat_steps.to_vec();
-            push_step(&mut next_steps, if !saw_rest { PlaceStep::Field(FieldKey::Tuple(idx as u32)) } else { PlaceStep::Opaque });
+            push_step(&mut next_steps, if !saw_rest { PlaceStep::Field(FieldKey::Tuple(idx as u32)) } else { PlaceStep::Opaque(None) });
             self.bind_pat_ctx(p, sub_init, scrut_place, &next_steps, fallback_sources, state, ctx)?;
         }
         Ok(())
@@ -359,9 +395,43 @@ impl Checker<'_, '_> {
             _ => {}
         }
         if let Some(p) = self.root_place(lhs) {
-            self.check_can_mutate(p.local, p.through_ref, p.mut_ref_root, p.behind_shared, &p.steps, state, p.steps.is_empty())?;
+            let idx_temp = if let Expr::Index(base, _) = *self.body.expr(lhs)
+                && self.typed.operators.contains_key(&lhs)
+                && let Some(mut bp) = self.root_place(base)
+            {
+                let autoderefs = self.typed.autoderefs.get(&lhs).copied().unwrap_or(0);
+                if autoderefs > 0 {
+                    self.apply_deref_steps(lhs, self.expr_ty(base), autoderefs, &mut bp);
+                }
+                if bp.behind_shared {
+                    bail!("cannot borrow data in a `&` reference or `*const` pointer as mutable");
+                }
+                let tid = self.next_temp_holder();
+                if let Some(prefix_len) = bp.raw_ptr_prefix {
+                    self.check_can_read(bp.local, &bp.steps[..prefix_len], state)?;
+                } else {
+                    self.check_borrow(bp.local, bp.through_ref, bp.mut_ref_root, &bp.steps, true, state)?;
+                    push_loan(&mut state.loans, bp.local, bp.steps, Some(tid), true, bp.through_ref, false, false);
+                }
+                Some(tid)
+            } else {
+                None
+            };
+            let sub_res = self.check_place_subexprs(lhs, state, outer_live, depth);
+            if let Some(tid) = idx_temp {
+                state.loans.retain(|l| l.holder != Some(tid));
+            }
+            sub_res?;
+            if p.through_ref {
+                let prefix_len = p.steps.iter().position(|s| matches!(s, PlaceStep::Deref)).unwrap_or(0);
+                self.check_not_moved(p.local, &p.steps[..prefix_len], state)?;
+            }
+            let is_union = p.steps.last() == Some(&PlaceStep::Union);
+            let union_prefix = if is_union { &p.steps[..p.steps.len() - 1] } else { &p.steps[..] };
+            self.check_can_mutate(p.local, p.through_ref, p.mut_ref_root, p.behind_shared, union_prefix, state, union_prefix.is_empty())?;
+            self.check_assign_escape(&p, sources, state)?;
             if !p.through_ref && (p.local as usize) < state.init.len() {
-                if p.steps.is_empty() {
+                if union_prefix.is_empty() {
                     state.init[p.local as usize] = true;
                     state.maybe_init[p.local as usize] = true;
                     state.moved[p.local as usize] = false;
@@ -370,10 +440,13 @@ impl Checker<'_, '_> {
                     let rebound: Vec<BorrowSource> = sources.iter().filter(|s| !(s.target == p.local && s.steps.first() == Some(&PlaceStep::Deref))).cloned().collect();
                     self.push_sources_for_local(p.local, &rebound, state);
                 } else {
-                    if !state.init[p.local as usize] || state.moved[p.local as usize] {
+                    if !state.init[p.local as usize]
+                        || state.moved[p.local as usize]
+                        || state.partial_moves.iter().any(|m| m.local == p.local && m.steps.len() < union_prefix.len() && union_prefix.starts_with(&m.steps))
+                    {
                         bail!("assign to part of moved or uninitialized value `{}`", self.local_name(p.local));
                     }
-                    state.partial_moves.retain(|m| !(m.local == p.local && steps_conflict(&m.steps, &p.steps)));
+                    state.partial_moves.retain(|m| !(m.local == p.local && steps_conflict(&m.steps, union_prefix)));
                 }
             }
         } else {
@@ -381,362 +454,9 @@ impl Checker<'_, '_> {
         }
         Ok(())
     }
-
-    pub(super) fn check_call(&mut self, expr: ExprId, callee: ExprId, args: List, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
-        self.check_expr(callee, state, true, outer_live, false, depth)?;
-        if let Some(c_local) = self.expr_plain_local(callee) {
-            let c_ty = self.local_ty(c_local);
-            if let Kind::Closure(parent, _, at) = *self.cx.types.kind(c_ty) {
-                let closure = if parent == self.item {
-                    self.typed.closures.get(&ExprId(at)).cloned()
-                } else {
-                    self.cx.closure(c_ty).map(|info| info.closure.clone())
-                };
-                if let Some(c) = closure {
-                    if c.consumes {
-                        self.check_can_move(c_local, &[], state)?;
-                        if let Some(slot) = state.moved.get_mut(c_local as usize) {
-                            *slot = true;
-                        }
-                    } else if parent == self.item
-                        && c.captures.iter().any(|cap| cap.by == By::Mut && self.closure_capture_info(ExprId(at), cap.by, cap.local).iter().any(|(_, m, ..)| *m))
-                    {
-                        self.check_borrow(c_local, false, false, &[], true, state)?;
-                    }
-                }
-            }
-        }
-        let arg_ids: Vec<u32> = self.body.list(args).to_vec();
-        if self.is_mem_drop(expr, callee)
-            && let Some(&first) = arg_ids.first()
-            && let Some(local) = self.expr_plain_local(ExprId(first))
-            && self.is_mut_ref_ty(self.local_ty(local))
-        {
-            self.check_can_move(local, &[], state)?;
-            if let Some(slot) = state.moved.get_mut(local as usize) {
-                *slot = true;
-            }
-            return Ok(());
-        }
-        let sig = self.callee_sig(expr, Some(callee));
-        let callee_ty = self.expr_ty(callee);
-        self.check_arg_list(&arg_ids, sig.as_deref(), Some(callee_ty), state, outer_live, depth)
-    }
-
-    fn callee_param_is_shared_ref(&self, callee_ty: Option<Ty>, idx: usize) -> bool {
-        let mut ty = match callee_ty {
-            Some(t) if t != Ty::NONE => t,
-            _ => return false,
-        };
-        while let Kind::Ref(_, inner) = *self.cx.types.kind(ty) {
-            ty = inner;
-        }
-        let param_ty = match *self.cx.types.kind(ty) {
-            Kind::FnPtr(params, _) => self.cx.types.substs(params).get(idx).copied(),
-            Kind::Dyn(_, args, ..) => self.cx.types.substs(args).first().copied().and_then(|tup| match *self.cx.types.kind(tup) {
-                Kind::Tuple(elems) => self.cx.types.substs(elems).get(idx).copied(),
-                _ => None,
-            }),
-            Kind::Closure(_, _, at) => self.typed.closures.get(&ExprId(at)).and_then(|c| c.params.get(idx)).map(|&l| self.local_ty(l)),
-            _ => None,
-        };
-        param_ty.is_some_and(|t| matches!(*self.cx.types.kind(t), Kind::Ref(Mut::Not, _)))
-    }
-
-    fn callee_res(&self, expr: ExprId, callee: Option<ExprId>) -> Option<&Res> {
-        if let Some(c) = callee
-            && self.body.names_callee(c)
-        {
-            self.typed.res.get(&c).or_else(|| self.typed.res.get(&expr))
-        } else {
-            self.typed.res.get(&expr)
-        }
-    }
-
-    fn callee_sig(&mut self, expr: ExprId, callee: Option<ExprId>) -> Option<Arc<Signature>> {
-        let Some(&Res::Fn(item, _)) = self.callee_res(expr, callee) else {
-            return None;
-        };
-        self.cx.signature(item).ok()
-    }
-
-    fn is_mem_drop(&mut self, expr: ExprId, callee: ExprId) -> bool {
-        let Some(&Res::Fn(item, _)) = self.callee_res(expr, Some(callee)) else { return false };
-        self.cx.name(item) == "drop" && matches!(self.cx.qualified(item).as_str(), "core::mem::drop" | "std::mem::drop")
-    }
-
-    pub(super) fn check_method(
-        &mut self,
-        expr: ExprId,
-        receiver: ExprId,
-        params: List,
-        state: &mut State,
-        outer_live: &HashSet<u32>,
-        depth: u32,
-    ) -> Result<()> {
-        let recv_borrow = self.typed.adjusts.get(&expr).and_then(|m| m.autoref).or_else(|| {
-            let sig = self.callee_sig(expr, None);
-            (self.is_mut_ref_ty(self.expr_ty(receiver))
-                && sig.as_deref().is_none_or(|s| !matches!(s.receiver, Some((crate::body::sig::SelfKind::Ref, _)))))
-            .then_some(Mut::Mut)
-        });
-        if recv_borrow == Some(Mut::Mut)
-            && (self.place_behind_shared_ref(receiver) || self.is_shared_ref_or_ptr(self.expr_ty(receiver)))
-        {
-            bail!("cannot borrow data in a `&` reference as mutable");
-        }
-        let temp_id = self.next_temp_holder();
-        let mut deferred_recv = None;
-        if let Some(mutability) = recv_borrow {
-            if mutability == Mut::Mut {
-                self.check_static_mut(receiver, self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs) > 0)?;
-            }
-            if let Some(mut p) = self.root_place(receiver) {
-                let derefs = self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs);
-                if derefs > 0 {
-                    self.apply_deref_steps(expr, self.expr_ty(receiver), derefs, &mut p);
-                }
-                if mutability == Mut::Mut && p.behind_shared {
-                    bail!("cannot borrow data in a `&` reference or `*const` pointer as mutable");
-                }
-                if let Some(prefix_len) = p.raw_ptr_prefix {
-                    self.check_can_read(p.local, &p.steps[..prefix_len], state)?;
-                    self.check_expr(receiver, state, true, outer_live, false, depth)?;
-                } else {
-                    if mutability == Mut::Mut {
-                        self.check_can_read_inner(p.local, &p.steps, state, true)?;
-                        deferred_recv = Some((p.local, p.through_ref, p.mut_ref_root || self.is_mut_ref_ty(self.expr_ty(receiver)), p.steps.clone()));
-                    } else {
-                        self.check_borrow(p.local, p.through_ref, p.mut_ref_root, &p.steps, false, state)?;
-                    }
-                    if !(deferred_recv.is_some() && self.expr_plain_local(receiver).is_some()) {
-                        self.check_expr(receiver, state, true, outer_live, false, depth)?;
-                    }
-                    if mutability == Mut::Not || !p.through_ref || p.mut_ref_root || self.is_mut_ref_ty(self.expr_ty(receiver)) {
-                        push_loan(&mut state.loans, p.local, p.steps, Some(temp_id), mutability == Mut::Mut, p.through_ref, mutability == Mut::Mut, false);
-                    }
-                }
-            } else {
-                self.check_expr(receiver, state, true, outer_live, false, depth)?;
-                if self.ty_holds_borrow(self.expr_ty(receiver)) {
-                    for s in self.expr_borrow_sources(receiver, state) {
-                        push_loan(&mut state.loans, s.target, s.steps, Some(temp_id), s.mutable && mutability == Mut::Mut, s.through_ref, false, s.env_only);
-                    }
-                }
-            }
-        } else {
-            let derefs = self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs);
-            let sig = self.callee_sig(expr, None);
-            if derefs > 0 && sig.as_deref().is_some_and(|s| matches!(s.receiver, Some((crate::body::sig::SelfKind::Value, _)))) {
-                self.check_method_by_val_derefs(expr, receiver, derefs, state, outer_live, depth)?;
-            } else {
-                self.check_expr(receiver, state, false, outer_live, true, depth)?;
-            }
-        }
-        if state.diverged {
-            state.loans.retain(|l| l.holder != Some(temp_id));
-            return Ok(());
-        }
-        let param_ids: Vec<u32> = self.body.list(params).to_vec();
-        let mut arg_live = outer_live.clone();
-        for &id in &param_ids {
-            self.collect_live_expr(ExprId(id), &mut arg_live);
-        }
-        super::prune_dead_loans(state, &arg_live);
-        let sig = self.callee_sig(expr, None);
-        let res = self.check_arg_list(&param_ids, sig.as_deref(), None, state, outer_live, depth);
-        state.loans.retain(|l| l.holder != Some(temp_id));
-        res?;
-        if !state.diverged && let Some((local, through_ref, mut_ref_root, steps)) = deferred_recv {
-            super::prune_dead_loans(state, outer_live);
-            self.check_borrow(local, through_ref, mut_ref_root, &steps, true, state)?;
-        }
-        Ok(())
-    }
-
-    fn check_method_by_val_derefs(&mut self, expr: ExprId, receiver: ExprId, derefs: u32, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
-        let mut cur = self.expr_ty(receiver);
-        let mut crossed_ref = false;
-        for step in 0..derefs {
-            if let Some(Res::Fn(d_fn, d_args)) = self.typed.derefs.get(&(expr, step)).cloned() {
-                crossed_ref = true;
-                let args_vec = self.cx.types.substs(d_args).to_vec();
-                cur = super::super::infer::detached(self.cx, self.item, |infer| infer.fn_types(d_fn, &args_vec))
-                    .ok()
-                    .and_then(|(_, ret)| match *self.cx.types.kind(ret) { Kind::Ref(_, inner) => Some(inner), _ => None })
-                    .unwrap_or(Ty::NONE);
-            } else if cur != Ty::NONE {
-                if matches!(self.cx.types.kind(cur), Kind::Ref(..) | Kind::Ptr(..)) { crossed_ref = true; }
-                cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);
-            }
-        }
-        if cur != Ty::NONE && !self.ty_is_copy(cur) {
-            if crossed_ref || self.place_behind_ref_or_ptr(receiver) { bail!("cannot move out of a reference or deref"); }
-            if let Some(mut p) = self.root_place(receiver) {
-                self.apply_deref_steps(expr, self.expr_ty(receiver), derefs, &mut p);
-                self.check_expr(receiver, state, true, outer_live, false, depth)?;
-                self.check_can_move(p.local, &p.steps, state)?;
-                self.push_partial_move(state, p.local, p.steps);
-                return Ok(());
-            }
-        }
-        self.check_expr(receiver, state, false, outer_live, true, depth)
-    }
-
-    pub(super) fn check_arg_list(&mut self, arg_ids: &[u32], sig: Option<&Signature>, callee_ty: Option<Ty>, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
-        let temp_id = self.next_temp_holder();
-        let mut deferred_mut_args = Vec::new();
-        let res = (|| -> Result<()> {
-            for (idx, &id) in arg_ids.iter().enumerate() {
-                let arg = ExprId(id);
-                let shared_reborrow = sig.is_some_and(|s| super::propagate::param_is_shared_ref(s, idx))
-                    || self.callee_param_is_shared_ref(callee_ty, idx);
-                let mut is_deferred_mut = false;
-                if let Some(local) = self.expr_plain_local(arg)
-                    && self.is_mut_ref_ty(self.local_ty(local))
-                {
-                    if shared_reborrow {
-                        self.check_not_moved(local, &[], state)?;
-                        if state.loans.iter().any(|l| super::loan_conflicts_borrow(l, local, &[]) && l.mutable && !l.two_phase) {
-                            bail!("cannot use `{}` because it was mutably borrowed", self.local_name(local));
-                        }
-                    } else {
-                        self.check_can_read_inner(local, &[], state, true)?;
-                        deferred_mut_args.push(local);
-                        is_deferred_mut = true;
-                    }
-                } else {
-                    self.check_expr(arg, state, false, outer_live, true, depth)?;
-                }
-                if state.diverged {
-                    break;
-                }
-                for s in self.expr_borrow_sources(arg, state) {
-                    push_loan(&mut state.loans, s.target, s.steps, Some(temp_id), s.mutable && !shared_reborrow, s.through_ref, is_deferred_mut, s.env_only);
-                }
-                prune_moved_loans(state);
-            }
-            if !state.diverged && !deferred_mut_args.is_empty() {
-                super::prune_dead_loans(state, outer_live);
-            }
-            if !state.diverged {
-                for local in deferred_mut_args {
-                    if state.loans.iter().any(|l| !(l.holder == Some(temp_id) && l.two_phase) && super::loan_conflicts_borrow(l, local, &[])) {
-                        bail!("cannot use `{}` because it was mutably borrowed", self.local_name(local));
-                    }
-                }
-            }
-            Ok(())
-        })();
-        state.loans.retain(|l| l.holder != Some(temp_id));
-        res
-    }
-
-    pub(super) fn check_closure(&mut self, expr: ExprId, params: Option<List>, body: ExprId, state: &mut State, depth: u32) -> Result<()> {
-        let Some(closure) = self.typed.closures.get(&expr).cloned() else { return Ok(()) };
-        let mut body_state = State {
-            init: state.init.clone(), maybe_init: state.maybe_init.clone(), moved: state.moved.clone(),
-            partial_moves: state.partial_moves.clone(), loans: Vec::new(), diverged: false,
-        };
-        let saved_no_move = self.no_move_captures.clone();
-        if let Err(err) = self.check_closure_captures(expr, &closure, state, &mut body_state) {
-            self.no_move_captures = saved_no_move;
-            return Err(err);
-        }
-        let closure_depth = depth + 1;
-        if let Some(params) = params {
-            let param_ids: Vec<u32> = self.body.list(params).to_vec();
-            for (idx, p_id) in param_ids.into_iter().enumerate() {
-                if let Some(&local) = closure.params.get(idx)
-                    && (local as usize) < body_state.init.len()
-                {
-                    self.scope_depth[local as usize] = closure_depth;
-                    body_state.init[local as usize] = true;
-                    body_state.maybe_init[local as usize] = true;
-                    body_state.moved[local as usize] = false;
-                }
-                if let Err(err) = self.bind_pat(self.body.params[p_id as usize].pat, None, None, &[], &[], &mut body_state, (true, true, closure_depth)) {
-                    self.no_move_captures = saved_no_move;
-                    return Err(err);
-                }
-            }
-        }
-        let saved_returns = (self.returns_borrow, self.return_min_depth);
-        self.returns_borrow = self.ty_holds_borrow(closure.ret);
-        self.return_min_depth = closure_depth;
-        let empty = HashSet::default();
-        let res = if let Expr::Block { kind, stmts, tail, label } = *self.body.expr(body)
-            && matches!(kind, BlockKind::Async | BlockKind::AsyncMove)
-        {
-            self.check_block(kind, stmts, tail, label, &mut body_state, (false, true), &empty, depth)
-        } else {
-            self.check_expr(body, &mut body_state, false, &empty, true, closure_depth)
-        };
-        self.no_move_captures = saved_no_move;
-        res?;
-        if self.returns_borrow && !body_state.diverged {
-            self.check_return_escape(body, &body_state)?;
-        }
-        (self.returns_borrow, self.return_min_depth) = saved_returns;
-        Ok(())
-    }
-
-    fn check_closure_captures(&mut self, expr: ExprId, closure: &super::super::infer::Closure, state: &mut State, body_state: &mut State) -> Result<()> {
-        let mut seen_whole = Vec::new();
-        for cap in &closure.captures {
-            let local = cap.local;
-            if (local as usize) >= self.is_copy.len() { continue; }
-            if cap.path.is_empty() {
-                if seen_whole.contains(&local) { continue; }
-                seen_whole.push(local);
-            }
-            let cap_steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(FieldKey::Tuple(f))).collect();
-            let cap_ty = if cap.path.is_empty() { self.local_ty(local) } else { let r = self.local_ty(local); cap.ty(self.cx, r).unwrap_or(r) };
-            let cap_copy = if cap.path.is_empty() { self.is_copy[local as usize] } else { self.ty_is_copy(cap_ty) };
-            match cap.by {
-                By::Ref | By::Mut => {
-                    let is_mut_ref = self.is_mut_ref_ty(self.local_ty(local));
-                    for (steps, is_mut, through_ref, mut_ref_root) in self.closure_capture_info(expr, cap.by, local) {
-                        if steps.starts_with(&cap_steps) {
-                            let ref_deref = is_mut_ref && steps.first() == Some(&PlaceStep::Deref);
-                            self.check_borrow(local, through_ref || ref_deref, (is_mut && mut_ref_root) || ref_deref, &steps, is_mut, state)?;
-                            if cap.by == By::Ref && !is_mut && !self.is_mut_ref_ty(cap_ty) && !mut_ref_root && !matches!(self.cx.types.kind(cap_ty), Kind::Closure(..)) {
-                                push_loan(&mut body_state.loans, local, steps, None, false, false, false, false);
-                            } else if cap.by == By::Mut && !closure.consumes {
-                                self.no_move_captures.push((local, steps));
-                            }
-                        }
-                    }
-                }
-                By::Value => {
-                    if self.is_mut_ref_ty(cap_ty) {
-                        self.check_borrow(local, false, true, &cap_steps, true, state)?;
-                    } else if cap_copy {
-                        self.check_can_read(local, &cap_steps, state)?;
-                    } else if cap_steps.is_empty() {
-                        let paths = self.closure_capture_info(expr, cap.by, local);
-                        if !paths.is_empty() && paths.iter().all(|(s, ..)| !s.is_empty() && s.first() != Some(&PlaceStep::Deref)) {
-                            for (steps, ..) in paths {
-                                self.check_can_move(local, &steps, state)?;
-                                self.push_partial_move(state, local, steps);
-                            }
-                        } else {
-                            self.check_can_move(local, &[], state)?;
-                            if let Some(slot) = state.moved.get_mut(local as usize) { *slot = true; }
-                            state.partial_moves.retain(|m| m.local != local);
-                        }
-                    } else {
-                        self.check_can_move(local, &cap_steps, state)?;
-                        self.push_partial_move(state, local, cap_steps);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
-fn push_loan(loans: &mut Vec<Loan>, target: u32, steps: Vec<PlaceStep>, holder: Option<u32>, mutable: bool, through_ref: bool, two_phase: bool, env_only: bool) {
+pub(super) fn push_loan(loans: &mut Vec<Loan>, target: u32, steps: Vec<PlaceStep>, holder: Option<u32>, mutable: bool, through_ref: bool, two_phase: bool, env_only: bool) {
     loans.push(Loan { target, steps, holder, mutable, through_ref, two_phase, env_only });
 }
 

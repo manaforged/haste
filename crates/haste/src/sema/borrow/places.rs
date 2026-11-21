@@ -18,7 +18,8 @@ pub(super) enum PlaceStep {
     SliceElem { offset: u64, min_len: u64, from_end: bool, array_len: Option<u64> },
     SliceSub { from: u64, to: u64, array_len: Option<u64> },
     Deref,
-    Opaque,
+    Union,
+    Opaque(Option<u32>),
 }
 
 #[derive(Clone, Debug)]
@@ -33,7 +34,15 @@ pub(super) struct Place {
 }
 
 pub(super) fn steps_conflict(a: &[PlaceStep], b: &[PlaceStep]) -> bool {
-    a.iter().zip(b).all(|(x, y)| step_conflict(x, y))
+    for (x, y) in a.iter().zip(b) {
+        if !step_conflict(x, y) { return false; }
+        match (x, y) {
+            (PlaceStep::Opaque(Some(a)), PlaceStep::Opaque(Some(b))) if a != b => return true,
+            (PlaceStep::Opaque(None), _) | (_, PlaceStep::Opaque(None)) => return true,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn step_conflict(a: &PlaceStep, b: &PlaceStep) -> bool {
@@ -41,8 +50,9 @@ fn step_conflict(a: &PlaceStep, b: &PlaceStep) -> bool {
         return true;
     }
     match (a, b) {
-        (PlaceStep::Opaque, PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. })
-        | (PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. }, PlaceStep::Opaque) => true,
+        (PlaceStep::Union, _) | (_, PlaceStep::Union) | (PlaceStep::Opaque(_), PlaceStep::Opaque(_)) => true,
+        (PlaceStep::Opaque(_), PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. })
+        | (PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. }, PlaceStep::Opaque(_)) => true,
         (
             PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. },
             PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. },
@@ -104,7 +114,7 @@ fn slice_steps_conflict(a: &PlaceStep, b: &PlaceStep) -> bool {
 }
 
 pub(super) fn push_step(steps: &mut Vec<PlaceStep>, step: PlaceStep) {
-    if steps.last() != Some(&PlaceStep::Opaque) {
+    if !(matches!(step, PlaceStep::Opaque(_)) && steps.last() == Some(&step)) {
         steps.push(step);
     }
 }
@@ -117,42 +127,15 @@ enum PlaceBehind {
 }
 
 impl Checker<'_, '_> {
-    pub(super) fn local_name(&self, local: u32) -> String {
-        self.names.get(local as usize).and_then(|n| n.clone()).unwrap_or_else(|| format!("_{local}"))
-    }
-
-    pub(super) fn local_ty(&self, local: u32) -> Ty {
-        self.typed.locals.get(local as usize).map_or(Ty::NONE, |l| l.ty)
-    }
-
-    pub(super) fn expr_ty(&self, expr: ExprId) -> Ty {
-        self.typed.exprs.get(expr.0 as usize).copied().unwrap_or(Ty::NONE)
-    }
-
-    pub(super) fn is_ref_ty(&self, ty: Ty) -> bool {
-        ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(..))
-    }
-
-    pub(super) fn is_mut_ref_ty(&self, ty: Ty) -> bool {
-        ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Mut, _))
-    }
-
-    pub(super) fn is_shared_ref_or_ptr(&self, ty: Ty) -> bool {
-        ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _) | Kind::Ptr(Mut::Not, _))
-    }
-
-    pub(super) fn is_mut_ref_or_ptr(&self, ty: Ty) -> bool {
-        ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Mut, _) | Kind::Ptr(Mut::Mut, _))
-    }
-
+    pub(super) fn local_name(&self, local: u32) -> String { self.names.get(local as usize).and_then(|n| n.clone()).unwrap_or_else(|| format!("_{local}")) }
+    pub(super) fn local_ty(&self, local: u32) -> Ty { self.typed.locals.get(local as usize).map_or(Ty::NONE, |l| l.ty) }
+    pub(super) fn expr_ty(&self, expr: ExprId) -> Ty { self.typed.exprs.get(expr.0 as usize).copied().unwrap_or(Ty::NONE) }
+    pub(super) fn is_ref_ty(&self, ty: Ty) -> bool { ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(..)) }
+    pub(super) fn is_mut_ref_ty(&self, ty: Ty) -> bool { ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Mut, _)) }
+    pub(super) fn is_shared_ref_or_ptr(&self, ty: Ty) -> bool { ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _) | Kind::Ptr(Mut::Not, _)) }
+    pub(super) fn is_mut_ref_or_ptr(&self, ty: Ty) -> bool { ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Mut, _) | Kind::Ptr(Mut::Mut, _)) }
     pub(super) fn ty_is_copy(&mut self, ty: Ty) -> bool {
-        if ty == Ty::NONE {
-            return true;
-        }
-        if self.is_ref_ty(ty) {
-            return true;
-        }
-        super::super::infer::is_copy(self.cx, self.item, ty).unwrap_or(true)
+        ty == Ty::NONE || matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) || super::super::infer::is_copy(self.cx, self.item, ty).unwrap_or(true)
     }
 
     fn update_ref_flags(&self, ty: Ty, mut_ref_root: &mut bool, behind_shared: &mut bool) {
@@ -191,7 +174,7 @@ impl Checker<'_, '_> {
         let mut cur = base_ty;
         for step in 0..count {
             if self.typed.derefs.contains_key(&(site, step)) {
-                push_step(&mut p.steps, PlaceStep::Opaque);
+                push_step(&mut p.steps, PlaceStep::Opaque(Some(site.0)));
                 if !p.behind_shared && self.is_mut_ref_or_ptr(cur) {
                     p.mut_ref_root = true;
                 }
@@ -241,15 +224,16 @@ impl Checker<'_, '_> {
             Expr::Index(base, _) => {
                 let mut p = self.root_place(base)?;
                 let base_ty = self.expr_ty(base);
-                self.deref_ref_step(base_ty, &mut p);
-                push_step(&mut p.steps, PlaceStep::Opaque);
+                let autoderefs = self.typed.autoderefs.get(&expr).copied().unwrap_or(0);
+                if autoderefs > 0 { self.apply_deref_steps(expr, base_ty, autoderefs, &mut p); } else { self.deref_ref_step(base_ty, &mut p); }
+                push_step(&mut p.steps, PlaceStep::Opaque(Some(expr.0)));
                 Some(p)
             }
             Expr::Unary(UnOp::Deref, inner) => {
                 let mut p = self.root_place(inner)?;
                 let inner_ty = self.expr_ty(inner);
                 if self.typed.derefs.contains_key(&(expr, 0)) {
-                    push_step(&mut p.steps, PlaceStep::Opaque);
+                    push_step(&mut p.steps, PlaceStep::Opaque(Some(expr.0)));
                     p.through_ref = true;
                 } else {
                     let was_ref = self.deref_ref_step(inner_ty, &mut p);
@@ -278,7 +262,7 @@ impl Checker<'_, '_> {
         };
         let is_union = cur != Ty::NONE
             && matches!(self.cx.types.kind(cur), Kind::Adt(item, _) if self.cx.item(*item).1.kind == ItemKind::Union);
-        push_step(&mut p.steps, if is_union { PlaceStep::Opaque } else { PlaceStep::Field(key) });
+        push_step(&mut p.steps, if is_union { PlaceStep::Union } else { PlaceStep::Field(key) });
     }
 
     pub(super) fn is_static_mut(&self, item: ItemRef) -> bool {
@@ -436,7 +420,7 @@ impl Checker<'_, '_> {
 
 fn capture_prefix(p: &Place) -> Vec<PlaceStep> {
     let limit = p.raw_ptr_prefix.unwrap_or(p.steps.len());
-    p.steps[..limit].iter().take_while(|s| !matches!(s, PlaceStep::Opaque)).cloned().collect()
+    p.steps[..limit].iter().take_while(|s| !matches!(s, PlaceStep::Opaque(_) | PlaceStep::Union)).cloned().collect()
 }
 
 struct CapturePathWalk<'a, 'c, 'x> {

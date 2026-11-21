@@ -673,8 +673,12 @@ fn parse_test_args(args: &[String]) -> TestArgs<'_> {
 }
 
 fn item_loc(outline: &outline::Outline, item: ItemRef) -> String {
-    let file = &outline.crates[item.krate as usize].files[item.file as usize];
-    let line = file.source.line(file.items.items[item.item as usize].start);
+    let outer = item.body_owner();
+    let file = &outline.crates[outer.krate as usize].files[outer.file as usize];
+    let Some(entry) = file.items.items.get(outer.item as usize) else {
+        return format!("{} ", file.source.path.display());
+    };
+    let line = file.source.line(entry.start);
     format!("{}:{line} ", file.source.path.display())
 }
 
