@@ -67,8 +67,10 @@ fn finish_br_table(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Val
 }
 
 fn dense_enough(runs_len: usize, covered: u64, table_len: u64) -> bool {
-    let (mul, div) = if runs_len >= 5 { (3, 1) } else { (5, 2) };
-    runs_len >= 3 && covered >= 4 && table_len <= 256 && covered * mul >= table_len * div
+    if runs_len < 3 || covered < 4 || table_len > 256 {
+        return false;
+    }
+    if runs_len >= 5 { covered * 3 >= table_len } else { (runs_len as u64) * 5 >= table_len * 2 }
 }
 
 fn signed_table_bounds(arms: &[Arm]) -> Option<(i64, usize)> {
@@ -164,7 +166,7 @@ fn emit_run_check(func: &mut Function, at: Option<(usize, Inst)>, (v, ty, (lo, h
         let jump = func.add(Op::Jump(run.hit.block, run.hit.args.clone()), None);
         return push_node(func, at, vec![jump]);
     }
-    let (floor, ceil) = if lo >= GUARD_MIN { (lo, hi) } else { (0, ty.unsigned_max()) };
+    let (floor, ceil) = (lo, hi);
     if run.lo > floor && run.hi < ceil && run.lo != run.hi {
         return emit_sub_range(func, at, (v, ty), (run.lo as i64, run.hi - run.lo), (&run.hit, otherwise));
     }
@@ -186,8 +188,8 @@ pub(super) fn emit_node(func: &mut Function, info: &Info, at: Option<(usize, Ins
     emit_within(func, info, at, (v, ty, (0, ty.unsigned_max())), runs, (default_blk, cache))
 }
 
-fn emit_within(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty, (lo, hi)): (Value, Type, (u64, u64)), runs: &[Run], (default_blk, cache): (Block, &mut Cache)) -> Block {
-    if let Some(blk) = try_emit_bitmask_runs(func, info, at, (v, ty), runs, (default_blk, cache)) {
+pub(super) fn emit_within(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty, (lo, hi)): (Value, Type, (u64, u64)), runs: &[Run], (default_blk, cache): (Block, &mut Cache)) -> Block {
+    if let Some(blk) = try_emit_bitmask_runs(func, info, at, (v, ty, (lo, hi)), runs, (default_blk, cache)) {
         return blk;
     }
     if let Some((min, table_len)) = can_br_table(runs) {
