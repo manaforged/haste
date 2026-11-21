@@ -84,7 +84,8 @@ impl Checker<'_, '_> {
         };
         if let Some(info) = self.cx.closure(ty) {
             return info.closure.captures.iter().any(|c| {
-                c.by != By::Value || self.ty_holds_borrow_inner(info.typed.locals[c.local as usize].ty, seen)
+                c.by != By::Value
+                    || self.ty_holds_borrow_inner(info.typed.locals.get(c.local as usize).map_or(Ty::NONE, |l| l.ty), seen)
             });
         }
         if parent == self.item
@@ -274,35 +275,23 @@ impl Checker<'_, '_> {
         let capture_env_only = |target: u32| ret_targets.as_ref().is_some_and(|set| !set.contains(&target));
         let mut out = Vec::new();
         for cap in &closure.captures {
-            match cap.by {
-                By::Ref | By::Mut => {
-                    let cap_steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(super::places::FieldKey::Tuple(f))).collect();
-                    for (steps, is_mut, through_ref, _) in self.closure_capture_info(expr, cap.by, cap.local) {
-                        if steps.starts_with(&cap_steps) {
-                            out.push(BorrowSource {
-                                target: cap.local,
-                                steps,
-                                mutable: is_mut,
-                                through_ref,
-                                env_only: capture_env_only(cap.local),
-                            });
-                        }
-                    }
-                    for l in state.loans.iter().filter(|l| l.holder == Some(cap.local)) {
-                        out.push(BorrowSource {
-                            env_only: l.env_only || capture_env_only(l.target),
-                            ..BorrowSource::from_loan(l)
-                        });
+            let cap_steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(super::places::FieldKey::Tuple(f))).collect();
+            if cap.by == By::Value {
+                let cap_ty = cap.ty(self.cx, self.local_ty(cap.local)).unwrap_or_else(|_| self.local_ty(cap.local));
+                if self.is_mut_ref_ty(cap_ty) {
+                    let mut steps = cap_steps;
+                    steps.push(PlaceStep::Deref);
+                    out.push(BorrowSource { target: cap.local, steps, mutable: true, through_ref: true, env_only: capture_env_only(cap.local) });
+                }
+            } else {
+                for (steps, is_mut, through_ref, _) in self.closure_capture_info(expr, cap.by, cap.local) {
+                    if steps.starts_with(&cap_steps) {
+                        out.push(BorrowSource { target: cap.local, steps, mutable: is_mut, through_ref, env_only: capture_env_only(cap.local) });
                     }
                 }
-                By::Value => {
-                    for l in state.loans.iter().filter(|l| l.holder == Some(cap.local)) {
-                        out.push(BorrowSource {
-                            env_only: l.env_only || capture_env_only(l.target),
-                            ..BorrowSource::from_loan(l)
-                        });
-                    }
-                }
+            }
+            for l in state.loans.iter().filter(|l| l.holder == Some(cap.local)) {
+                out.push(BorrowSource { env_only: l.env_only || capture_env_only(l.target), ..BorrowSource::from_loan(l) });
             }
         }
         dedup_sources(out)
