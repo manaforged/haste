@@ -154,6 +154,15 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
         if let Shape::Virtual(slot) = typed.shape {
             self.record_virtual(item, substs, slot);
         }
+        if self.cx.foreign(item)
+            && self.cx.symbol_name(item).as_deref() == Some("__rust_start_panic")
+            && let Some(first_ty) = typed.params.first().map(|&l| typed.locals[l as usize].ty)
+            && let Some(of) = dyn_trait_in(&self.cx.types, first_ty, OBJECT_DEPTH)
+            && self.demand.vcalls.insert((of, VTABLE_HEADER as u32))
+            && let Some(pending) = self.waiting_vcalls.remove(&(of, VTABLE_HEADER as u32))
+        {
+            pending.into_iter().for_each(|idx| enqueue_idx(&mut self.visited, &mut self.work, idx));
+        }
         for local in &typed.locals {
             collect_dyn_tys(&self.cx.types, local.ty, &mut self.demand.seen_tys, &mut self.demand.cands);
         }

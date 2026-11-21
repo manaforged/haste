@@ -51,9 +51,48 @@ pub struct Reached {
     states: Vec<ReachedEntry>,
     untyped_count: usize,
     filter: ReachFilter,
+    catch_unwind_checked: AtomicUsize,
+    catch_unwind_found: std::sync::atomic::AtomicBool,
 }
 
 impl Reached {
+    /// Whether any reached function calls the `catch_unwind` intrinsic.
+    pub fn has_catch_unwind(&self, cx: &Context) -> bool {
+        if self.catch_unwind_found.load(Ordering::Relaxed) {
+            return true;
+        }
+        let len = self.list.len();
+        let start = self.catch_unwind_checked.load(Ordering::Relaxed);
+        if start < len {
+            let mut next_start = len;
+            for (idx, ((item, _), res)) in self.list[start..len].iter().enumerate() {
+                if cx.outline.roots[item.krate as usize].name == "std"
+                    || cx.outline.roots[item.krate as usize].name == "core"
+                    || cx.outline.roots[item.krate as usize].name == "alloc"
+                    || cx.outline.roots[item.krate as usize].name == "panic_unwind"
+                    || cx.outline.roots[item.krate as usize].name == "panic_abort"
+                {
+                    continue;
+                }
+                match res {
+                    Ok(typed) => {
+                        if typed.calls().any(|(c, _)| {
+                            let (src, entry) = cx.item(c);
+                            entry.name.is_some_and(|at| src.text(at) == "catch_unwind")
+                        }) {
+                            self.catch_unwind_found.store(true, Ordering::Relaxed);
+                            self.catch_unwind_checked.store(len, Ordering::Relaxed);
+                            return true;
+                        }
+                    }
+                    Err(_) if next_start == len => next_start = start + idx,
+                    Err(_) => {}
+                }
+            }
+            self.catch_unwind_checked.store(next_start, Ordering::Relaxed);
+        }
+        false
+    }
     /// The typed body of function `index`, or an error naming `name` and why its body did not type-check.
     pub fn typed(&self, index: usize, name: &str) -> anyhow::Result<&Arc<Typed>> {
         self.list[index].1.as_ref().map_err(|why| anyhow::anyhow!("{name} did not type-check: {why}"))

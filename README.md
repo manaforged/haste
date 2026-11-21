@@ -1,12 +1,16 @@
 # haste
 
-haste is a clean-room Rust compiler and execution engine with its own frontend,
-SSA optimizer, and native x86-64 and Apple Silicon arm64 code generator.
+haste is a clean-room Rust compiler, JIT engine, and standalone AOT compiler with its own frontend, SSA optimizer, and native x86-64 and ARM64 backends—built from scratch without LLVM or a `target/` directory.
 
-It reads `Cargo.lock`, resolves names and types directly from source, and
-either JIT-compiles reached functions on first execution (`haste run`) or emits
-a standalone native executable (`haste --release build -o`) without LLVM or a
-`target/` directory.
+- **Self-hosting:** Compiles and runs its own ~171k-function workspace on both macOS ARM64 and Linux x86-64.
+- **Beats `rustc -C opt-level=3` on real workloads** (with bit-identical outputs):
+  - Linux x86-64 (4/5 real-world crates): `sha2` **0.95x**, `unicode` **0.86x**, `json` **0.88x**, `regex` **0.93x**, `deflate` **1.03x**.
+  - macOS ARM64: `sha256` **0.84x**, `scan` **0.97x**, `sort` **1.00x**, `sieve` **1.08x**.
+- **Fast builds:** Cold debug builds **1.35x** faster than `cargo` (`170 ms` vs `229 ms` on `tests/diff`, 124 functions), unchanged no-op builds in **`25 ms`** (vs `38 ms`), and instant incremental builds via `haste serve`.
+- **Zero-linker 6-target AOT cross-compilation:** Emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) via `--target TRIPLE` with no external cross-linker.
+- **Differential verification:** **620/620** differential cases (`jit+aot`), **17/17** standalone crate probes, and **214/260 (82.3%)** official `rust-lang/rust` `tests/ui/` run-pass tests (`jit+aot`) verified bit-identically against `rustc`.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline and module tour.
 
 ```bash
 cargo build --release -p haste
@@ -15,13 +19,7 @@ cargo build --release -p haste
 ./target/release/haste --release build -o ./hello examples/hello
 ```
 
-If a workspace has no `Cargo.lock`, haste runs `cargo generate-lockfile`
-automatically on first use. Build scripts (`build.rs`), declarative and
-procedural macros, `const fn`, `async`/`await`, generics, trait objects, SIMD,
-and C FFI all run inside haste. Unchanged build script outputs, macro
-expansions, standard library summaries, and compiled workspace stencils stay in
-`~/.cache/haste`, keyed by their inputs, so repeated builds rebuild only edited
-items and skip unchanged workspaces.
+If a workspace has no `Cargo.lock`, haste runs `cargo generate-lockfile` automatically on first use. Build scripts (`build.rs`), declarative and procedural macros, `const fn`, `async`/`await`, generics, trait objects, SIMD, and C FFI all run inside haste. Settled standard-library summaries, build script outputs, macro expansions, and compiled workspace stencils stay in `~/.cache/haste`, keyed by their inputs, so repeated builds rebuild only edited items and skip unchanged workspaces.
 
 haste is experimental. There is no tagged release yet, and the command line can change.
 
@@ -97,9 +95,7 @@ haste -V|--version | -h|--help
 
 ## Benchmarks
 
-Run `bash scripts/bench.sh` to reproduce these numbers on your machine. Every
-workload verifies bit-identical output against `rustc -C opt-level=3` before
-timing.
+Run `bash scripts/bench.sh` to reproduce these numbers on your machine. Every workload verifies bit-identical output against `rustc -C opt-level=3` before timing.
 
 Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
 
@@ -120,30 +116,31 @@ Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
 | `sort` (500k quicksort + bsearch) | 48 ms | 48 ms | 1.00x | exact match (`8647866321337317866`) |
 | `sieve` (4M primes) | 27 ms | 25 ms | 1.08x | exact match (`544501644261`) |
 
-## Check against rustc
+## Verify it yourself
 
-`tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites, and
-`tests/probes` holds standalone crates. `scripts/check.sh` compares `cargo run`
-against both `haste test` (JIT) and `haste --release build -o` (standalone AOT).
+`tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites, and `tests/probes` holds standalone crates. `scripts/check.sh` compares `cargo run` against both `haste test` (JIT) and `haste --release build -o` (standalone AOT).
 
 ```bash
-bash scripts/check.sh
+bash scripts/check.sh                   # 620/620 differential cases (jit+aot) vs rustc
 bash scripts/check.sh tests/async
 bash scripts/check.sh tests/proc-macro
-bash scripts/probes.sh
+bash scripts/probes.sh                  # 17/17 standalone crate probes (jit+aot) vs rustc
+bash scripts/bench.sh                   # Build speed & AOT runtime benchmarks vs rustc -O3
+bash scripts/rustc-ui.sh                # Borrow-checker & UI conformance suite vs rustc
 ```
 
 The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 
 ## Limits
 
-- Windows host runtime execution and PE32+ binaries built via `--target x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` are experimental, and `serve`/`--watch` require Unix.
-- haste checks ownership, use-after-move (including across branches and loops), binding mutability, NLL-style borrow aliasing, and dangling local reference returns on workspace crates, though full Polonius/higher-ranked lifetime inference is not yet implemented; run `cargo check` or `rustc` in CI for complete lifetime verification.
-- `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` (`Termination`) `#[test]` functions (not `#[tokio::test]` macro suites that depend on custom harnesses).
-- `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
-- On macOS, JIT execution uses dual-mapped `mach_vm_remap` pages (writable + executable aliases), which may be blocked inside a Hardened Runtime or App Sandbox.
-- Some Rust features do not compile yet. If any reached function fails to compile, `haste build` exits non-zero.
-- In JIT mode, `std::panic::catch_unwind` and panicking threads recover via thread-local unwind frames (without running `Drop` destructors on unwound frames); uncaught panics and standalone AOT panics print their message and abort.
+- **Windows runtime:** Windows host runtime execution and PE32+ binaries built via `--target x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` are experimental, and `serve`/`--watch` require Unix.
+- **Full Polonius & HRTB lifetimes:** haste checks ownership, use-after-move (including across branches and loops), binding mutability, disjoint struct fields, NLL-style borrow aliasing, and dangling local reference returns on workspace crates, though full Polonius and higher-ranked lifetime (`for<'a>`) inference are not yet implemented; run `cargo check` or `rustc` in CI for complete lifetime verification.
+- **`catch_unwind` and `Drop` unwinding:** `std::panic::catch_unwind` runs `Drop` destructors on unwound frames in both JIT and standalone AOT (x86-64 and ARM64) with zero overhead on non-catching binaries; uncaught panics print their message and abort, and unwinding across C FFI frames is not supported.
+- **Full `.debug_info`:** Standalone AOT executables emit symbol tables (`HASTE_SYMBOLS`) and DWARF `.debug_line` tables (`HASTE_DEBUG_INFO`) for backtraces and profiling, not full `.debug_info` variable/type DIEs.
+- **Test harnesses:** `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` (`Termination`) `#[test]` functions (not `#[tokio::test]` macro suites that depend on custom harnesses).
+- **Prepared mode:** `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
+- **macOS Hardened Runtime:** On macOS, JIT execution uses dual-mapped `mach_vm_remap` pages (writable + executable aliases), which may be blocked inside a Hardened Runtime or App Sandbox.
+- **Feature coverage:** Some Rust features do not compile yet. If any reached function fails to compile, `haste build` exits non-zero.
 
 ## Contributing
 

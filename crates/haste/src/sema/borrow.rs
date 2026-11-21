@@ -1,61 +1,88 @@
 //! Ownership, mutability, and NLL-style borrow checking for local workspace function bodies.
 
+mod bind;
+mod flow;
+mod liveness;
+mod places;
+mod propagate;
+
 use anyhow::{Result, bail};
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt, UnOp};
+use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Pat, PatId, UnOp, jumps_to};
 use crate::names::ItemRef;
 use crate::outline::source::Source;
 
 use super::Context;
 use super::infer::{Res, Typed};
-use super::ty::{Kind, Mut};
+use super::ty::{Kind, Ty};
+
+use places::{PlaceStep, steps_conflict};
+use propagate::BorrowSource;
+
+const TEMP_HOLDER_BASE: u32 = u32::MAX - 65_536;
+const ITER_HOLDER_BASE: u32 = TEMP_HOLDER_BASE - 65_536;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum FieldKey {
-    Named(String),
-    Tuple(u32),
-}
-
-#[derive(Clone, Debug)]
-struct Loan {
+pub(super) struct Loan {
     target: u32,
-    field: Option<FieldKey>,
+    steps: Vec<PlaceStep>,
     holder: Option<u32>,
     mutable: bool,
+    through_ref: bool,
+    two_phase: bool,
+    env_only: bool,
 }
 
-fn fields_conflict(a: &Option<FieldKey>, b: &Option<FieldKey>) -> bool {
-    match (a, b) {
-        (Some(x), Some(y)) => x == y,
-        _ => true,
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PartialMove {
+    local: u32,
+    steps: Vec<PlaceStep>,
 }
 
 #[derive(Clone, Debug)]
 struct State {
     init: Vec<bool>,
     moved: Vec<bool>,
+    partial_moves: Vec<PartialMove>,
     loans: Vec<Loan>,
-    borrows_local: Vec<bool>,
     diverged: bool,
 }
 
+struct BreakFrame {
+    label: Option<u32>,
+    is_block: bool,
+    depth: u32,
+    states: Vec<State>,
+}
+
 struct Checker<'c, 'a> {
-    types: &'a super::ty::Types,
+    cx: &'c mut Context<'a>,
+    item: ItemRef,
     body: &'c Body,
     src: &'c Source,
     typed: &'c Typed,
     mutable: Vec<bool>,
     is_copy: Vec<bool>,
     is_param: Vec<bool>,
+    scope_depth: Vec<u32>,
     names: Vec<Option<String>>,
     deref_non_copy: HashSet<ExprId>,
-    returns_ref: bool,
+    returns_borrow: bool,
+    return_min_depth: u32,
+    stmt_depth: u32,
+    breaks: Vec<BreakFrame>,
+    temp_depth: u32,
 }
 
-/// Checks ownership, mutability, borrow aliasing, and dangling local reference returns on `body`.
-pub(super) fn check(cx: &mut Context<'_>, item: ItemRef, (body, sig): (&Body, &crate::body::sig::Signature), src: &Source, typed: &Typed) -> Result<()> {
+/// Checks ownership, mutability, borrow aliasing, and dangling local reference escapes on `body`.
+pub(super) fn check(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    (body, sig): (&Body, &crate::body::sig::Signature),
+    src: &Source,
+    typed: &Typed,
+) -> Result<()> {
     let Some(root) = body.root else { return Ok(()) };
     if typed.locals.is_empty() {
         return Ok(());
@@ -63,18 +90,21 @@ pub(super) fn check(cx: &mut Context<'_>, item: ItemRef, (body, sig): (&Body, &c
     let n = typed.locals.len();
     let mut is_copy = vec![true; n];
     for (idx, local) in typed.locals.iter().enumerate() {
-        if local.ty != super::ty::Ty::NONE {
-            is_copy[idx] = matches!(cx.types.kind(local.ty), Kind::Ref(..)) || super::infer::is_copy(cx, item, local.ty).unwrap_or(true);
+        if local.ty != Ty::NONE {
+            is_copy[idx] = matches!(cx.types.kind(local.ty), Kind::Ref(..))
+                || super::infer::is_copy(cx, item, local.ty).unwrap_or(true);
         }
     }
     let mut mutable = vec![false; n];
     let mut is_param = vec![false; n];
+    let mut scope_depth = vec![1u32; n];
     let mut names = vec![None; n];
     let mut init = vec![false; n];
     for &p in &typed.params {
         if let Some(slot) = is_param.get_mut(p as usize) {
             *slot = true;
             init[p as usize] = true;
+            scope_depth[p as usize] = 0;
         }
     }
     let mut param_cursor = 0usize;
@@ -112,26 +142,62 @@ pub(super) fn check(cx: &mut Context<'_>, item: ItemRef, (body, sig): (&Body, &c
         let id = ExprId(at);
         if let Expr::Unary(UnOp::Deref, inner) = *body.expr(id)
             && let Some(&inner_ty) = typed.exprs.get(inner.0 as usize)
-            && inner_ty != super::ty::Ty::NONE
+            && inner_ty != Ty::NONE
             && let Kind::Ref(_, pointee) = cx.types.kind(inner_ty)
             && !super::infer::is_copy(cx, item, *pointee).unwrap_or(true)
         {
             deref_non_copy.insert(id);
         }
+        if let Expr::Closure { params, .. } = *body.expr(id)
+            && let Some(closure) = typed.closures.get(&id)
+        {
+            for (&p_id, &local) in body.list(params).iter().zip(&closure.params) {
+                collect_pat_meta_for_local(body, src, body.params[p_id as usize].pat, local, &mut mutable, &mut names);
+            }
+        }
     }
-    let returns_ref = typed.ret.is_some_and(|ty| matches!(cx.types.kind(ty), Kind::Ref(..)));
-    let checker = Checker { types: &cx.types, body, src, typed, mutable, is_copy, is_param, names, deref_non_copy, returns_ref };
-    let mut state = State { init, moved: vec![false; n], loans: Vec::new(), borrows_local: vec![false; n], diverged: false };
-    checker.check_expr(root, &mut state, false)?;
-    if checker.returns_ref && !state.diverged {
+    let mut checker = Checker {
+        cx,
+        item,
+        body,
+        src,
+        typed,
+        mutable,
+        is_copy,
+        is_param,
+        scope_depth,
+        names,
+        deref_non_copy,
+        returns_borrow: false,
+        return_min_depth: 1,
+        stmt_depth: 1,
+        breaks: Vec::new(),
+        temp_depth: 0,
+    };
+    checker.returns_borrow = typed.ret.is_some_and(|ty| checker.ty_holds_borrow(ty));
+    let mut state = State {
+        init,
+        moved: vec![false; n],
+        partial_moves: Vec::new(),
+        loans: Vec::new(),
+        diverged: false,
+    };
+    let empty_live = HashSet::default();
+    checker.check_expr(root, &mut state, false, &empty_live, true, 0)?;
+    if checker.returns_borrow && !state.diverged {
         checker.check_return_escape(root, &state)?;
     }
     Ok(())
 }
 
 fn collect_pat_meta(body: &Body, typed: &Typed, src: &Source, pat: PatId, mutable: &mut [bool], names: &mut [Option<String>]) {
+    if let Some(&local) = typed.binds.get(&pat) {
+        collect_pat_meta_for_local(body, src, pat, local, mutable, names);
+    }
+}
+
+fn collect_pat_meta_for_local(body: &Body, src: &Source, pat: PatId, local: u32, mutable: &mut [bool], names: &mut [Option<String>]) {
     if let Pat::Bind { name, mutable: is_mut, .. } = *body.pat(pat)
-        && let Some(&local) = typed.binds.get(&pat)
         && (local as usize) < mutable.len()
     {
         if is_mut {
@@ -143,336 +209,203 @@ fn collect_pat_meta(body: &Body, typed: &Typed, src: &Source, pat: PatId, mutabl
     }
 }
 
+fn loan_conflicts_borrow(l: &Loan, local: u32, steps: &[PlaceStep]) -> bool {
+    l.target == local && steps_conflict(&l.steps, steps)
+}
+
+fn loan_conflicts_assign(l: &Loan, local: u32, through_ref: bool, steps: &[PlaceStep]) -> bool {
+    if l.target != local {
+        return false;
+    }
+    if !through_ref && steps.is_empty() && l.steps.first() == Some(&PlaceStep::Deref) {
+        return false;
+    }
+    steps_conflict(&l.steps, steps)
+}
+
+pub(super) fn is_temp_holder(holder: Option<u32>) -> bool {
+    holder.is_some_and(|h| h >= TEMP_HOLDER_BASE)
+}
+
+fn prune_moved_loans(state: &mut State) {
+    state.loans.retain(|l| {
+        l.holder
+            .is_none_or(|h| is_temp_holder(Some(h)) || !state.moved.get(h as usize).copied().unwrap_or(false))
+    });
+}
+
+fn prune_dead_loans(state: &mut State, live: &HashSet<u32>) {
+    if !state.loans.is_empty() {
+        state
+            .loans
+            .retain(|l| l.holder.is_none_or(|h| is_temp_holder(Some(h)) || live.contains(&h)));
+    }
+}
+
 impl Checker<'_, '_> {
-    fn local_name(&self, local: u32) -> String {
-        self.names.get(local as usize).and_then(|n| n.clone()).unwrap_or_else(|| format!("_{local}"))
+    fn next_temp_holder(&mut self) -> u32 {
+        let id = TEMP_HOLDER_BASE + self.temp_depth;
+        self.temp_depth += 1;
+        id
     }
 
-    fn root_local(&self, expr: ExprId) -> Option<(u32, bool)> {
-        self.root_place(expr).map(|(local, through_ref, _)| (local, through_ref))
+    fn next_iter_holder(&mut self) -> u32 {
+        let id = ITER_HOLDER_BASE + self.temp_depth;
+        self.temp_depth += 1;
+        id
     }
 
-    fn root_place(&self, expr: ExprId) -> Option<(u32, bool, Option<FieldKey>)> {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner) => self.root_place(inner),
-            Expr::Path(_) => match self.typed.res.get(&expr) {
-                Some(Res::Local(local)) => Some((*local, false, None)),
-                _ => None,
-            },
-            Expr::Field(base, name) => {
-                let (local, through_ref, field) = self.root_place(base)?;
-                let deref = matches!(self.typed.exprs.get(base.0 as usize).copied(), Some(ty) if ty != super::ty::Ty::NONE && self.is_ref_or_ptr_expr(base));
-                let first = field.or_else(|| (!through_ref && !deref).then(|| FieldKey::Named(self.src.text(name).to_owned())));
-                Some((local, through_ref || deref, first))
-            }
-            Expr::TupleField(base, idx) => {
-                let (local, through_ref, field) = self.root_place(base)?;
-                let deref = matches!(self.typed.exprs.get(base.0 as usize).copied(), Some(ty) if ty != super::ty::Ty::NONE && self.is_ref_or_ptr_expr(base));
-                let first = field.or_else(|| (!through_ref && !deref).then_some(FieldKey::Tuple(idx)));
-                Some((local, through_ref || deref, first))
-            }
-            Expr::Index(base, _) => {
-                let (local, _, field) = self.root_place(base)?;
-                Some((local, true, field))
-            }
-            Expr::Unary(UnOp::Deref, inner) => self.root_place(inner).map(|(l, _, f)| (l, true, f)),
-            _ => None,
+    fn is_escaping_return(&self, src: &BorrowSource) -> bool {
+        if src.through_ref && self.is_ref_ty(self.local_ty(src.target)) {
+            return false;
         }
-    }
-
-    fn place_behind_shared_ref(&self, expr: ExprId) -> bool {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner) => self.place_behind_shared_ref(inner),
-            Expr::Unary(UnOp::Deref, inner) => {
-                self.typed
-                    .exprs
-                    .get(inner.0 as usize)
-                    .copied()
-                    .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Not, _)))
-            }
-            Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _) => {
-                let base_shared = self
-                    .typed
-                    .exprs
-                    .get(base.0 as usize)
-                    .copied()
-                    .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Not, _)));
-                base_shared || self.place_behind_shared_ref(base)
-            }
-            _ => false,
+        if self.return_min_depth <= 1 {
+            return !self.from_caller(src.target, src.through_ref);
         }
+        self.scope_depth.get(src.target as usize).copied().unwrap_or(0) >= self.return_min_depth
     }
 
-    fn is_ref_or_ptr_expr(&self, expr: ExprId) -> bool {
-        if self.typed.autoderefs.get(&expr).is_some_and(|&steps| steps > 0) {
-            return true;
-        }
-        self.typed
-            .exprs
-            .get(expr.0 as usize)
-            .copied()
-            .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(..) | Kind::Ptr(..)))
+    pub(super) fn escapes_depth(&self, target: u32, through_ref: bool, depth: u32) -> bool {
+        !self.from_caller(target, through_ref)
+            && !(through_ref && self.is_ref_ty(self.local_ty(target)))
+            && self.scope_depth.get(target as usize).copied().unwrap_or(0) >= depth
     }
 
-    fn check_not_moved(&self, local: u32, state: &State) -> Result<()> {
-        if state.moved.get(local as usize).copied().unwrap_or(false) {
+    fn check_not_moved(&self, local: u32, steps: &[PlaceStep], state: &State) -> Result<()> {
+        if state.moved.get(local as usize).copied().unwrap_or(false)
+            || state
+                .partial_moves
+                .iter()
+                .any(|m| m.local == local && steps_conflict(&m.steps, steps))
+        {
             bail!("use of moved value `{}`", self.local_name(local));
         }
         Ok(())
     }
 
-    fn check_can_read(&self, local: u32, state: &State) -> Result<()> {
-        self.check_not_moved(local, state)?;
-        if state.loans.iter().any(|l| l.target == local && l.mutable) {
+    fn check_can_read(&self, local: u32, steps: &[PlaceStep], state: &State) -> Result<()> {
+        self.check_can_read_inner(local, steps, state, false)
+    }
+
+    fn check_can_read_inner(&self, local: u32, steps: &[PlaceStep], state: &State, allow_shared: bool) -> Result<()> {
+        self.check_not_moved(local, steps, state)?;
+        if state.loans.iter().any(|l| {
+            loan_conflicts_borrow(l, local, steps) && l.mutable && (allow_shared || !l.two_phase)
+        }) {
             bail!("cannot use `{}` because it was mutably borrowed", self.local_name(local));
         }
         Ok(())
     }
 
-    fn check_can_move(&self, local: u32, state: &State) -> Result<()> {
-        self.check_not_moved(local, state)?;
-        if state.loans.iter().any(|l| l.target == local) {
+    fn check_can_move(&self, local: u32, steps: &[PlaceStep], state: &State) -> Result<()> {
+        self.check_not_moved(local, steps, state)?;
+        if state.loans.iter().any(|l| loan_conflicts_borrow(l, local, steps)) {
             bail!("cannot move out of `{}` because it is borrowed", self.local_name(local));
         }
         Ok(())
     }
 
-    fn check_can_mutate(&self, local: u32, through_ref: bool, field: &Option<FieldKey>, state: &State, init_ok: bool) -> Result<()> {
-        if !through_ref && !self.mutable.get(local as usize).copied().unwrap_or(true) && !(init_ok && !state.init.get(local as usize).copied().unwrap_or(true)) {
+    fn check_can_mutate(
+        &self,
+        local: u32,
+        through_ref: bool,
+        mut_ref_root: bool,
+        steps: &[PlaceStep],
+        state: &State,
+        init_ok: bool,
+    ) -> Result<()> {
+        if !mut_ref_root
+            && !through_ref
+            && !self.mutable.get(local as usize).copied().unwrap_or(true)
+            && !(init_ok && !state.init.get(local as usize).copied().unwrap_or(true))
+        {
             bail!("cannot assign to immutable variable `{}`", self.local_name(local));
         }
-        if !through_ref && state.loans.iter().any(|l| l.target == local && fields_conflict(&l.field, field)) {
+        if state
+            .loans
+            .iter()
+            .any(|l| loan_conflicts_assign(l, local, through_ref, steps))
+        {
             bail!("cannot assign to `{}` because it is borrowed", self.local_name(local));
         }
         Ok(())
     }
 
-    fn check_borrow(&self, local: u32, through_ref: bool, field: &Option<FieldKey>, mutable: bool, state: &State) -> Result<()> {
-        self.check_not_moved(local, state)?;
-        if mutable && !through_ref && !self.mutable.get(local as usize).copied().unwrap_or(true) {
+    fn check_borrow(
+        &self,
+        local: u32,
+        through_ref: bool,
+        mut_ref_root: bool,
+        steps: &[PlaceStep],
+        mutable: bool,
+        state: &State,
+    ) -> Result<()> {
+        self.check_not_moved(local, steps, state)?;
+        if mutable && !mut_ref_root && !through_ref && !self.mutable.get(local as usize).copied().unwrap_or(true) {
             bail!("cannot borrow `{}` as mutable, as it is not declared as mutable", self.local_name(local));
         }
-        if !through_ref {
-            if mutable && state.loans.iter().any(|l| l.target == local && l.mutable && fields_conflict(&l.field, field)) {
-                bail!("cannot borrow `{}` as mutable more than once at a time", self.local_name(local));
-            }
-            if mutable && state.loans.iter().any(|l| l.target == local && fields_conflict(&l.field, field)) {
-                bail!("cannot borrow `{}` as mutable because it is also borrowed as immutable", self.local_name(local));
-            }
-            if !mutable && state.loans.iter().any(|l| l.target == local && l.mutable && fields_conflict(&l.field, field)) {
-                bail!("cannot borrow `{}` as immutable because it is also borrowed as mutable", self.local_name(local));
-            }
+        if mutable && state.loans.iter().any(|l| loan_conflicts_borrow(l, local, steps) && l.mutable) {
+            bail!("cannot borrow `{}` as mutable more than once at a time", self.local_name(local));
+        }
+        if mutable && state.loans.iter().any(|l| loan_conflicts_borrow(l, local, steps)) {
+            bail!("cannot borrow `{}` as mutable because it is also borrowed as immutable", self.local_name(local));
+        }
+        if !mutable && state.loans.iter().any(|l| loan_conflicts_borrow(l, local, steps) && l.mutable && !l.two_phase) {
+            bail!("cannot borrow `{}` as immutable because it is also borrowed as mutable", self.local_name(local));
         }
         Ok(())
     }
 
-    fn expr_borrow_source(&self, expr: ExprId, state: &State) -> Option<(u32, Option<FieldKey>, bool)> {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner) => self.expr_borrow_source(inner, state),
-            Expr::Ref { mutable, raw: false, expr: inner } => {
-                let (local, through_ref, field) = self.root_place(inner)?;
-                (!through_ref).then_some((local, field, mutable))
-            }
-            Expr::Path(_) => {
-                let Some(Res::Local(local)) = self.typed.res.get(&expr) else { return None };
-                state.loans.iter().find(|l| l.holder == Some(*local)).map(|l| (l.target, l.field.clone(), l.mutable))
-            }
-            _ => None,
-        }
-    }
-
-    fn check_return_escape(&self, expr: ExprId, state: &State) -> Result<()> {
+    fn check_return_escape(&mut self, expr: ExprId, state: &State) -> Result<()> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) | Expr::Block { tail: Some(inner), .. } => self.check_return_escape(inner, state),
-            Expr::Ref { raw: false, expr: inner, .. } => {
-                if let Some((local, false)) = self.root_local(inner)
-                    && !self.is_param.get(local as usize).copied().unwrap_or(true)
-                {
-                    bail!("cannot return reference to local variable `{}`", self.local_name(local));
+            Expr::If(_, then, otherwise) => {
+                self.check_return_escape(then, state)?;
+                if let Some(alt) = otherwise {
+                    self.check_return_escape(alt, state)?;
                 }
                 Ok(())
             }
-            Expr::Path(_) => {
-                if let Some(Res::Local(local)) = self.typed.res.get(&expr)
-                    && state.borrows_local.get(*local as usize).copied().unwrap_or(false)
-                {
-                    bail!("cannot return value referencing local variable via `{}`", self.local_name(*local));
+            Expr::Match(_, arms) => {
+                let arm_ids: Vec<u32> = self.body.list(arms).to_vec();
+                for id in arm_ids {
+                    self.check_return_escape(self.body.arms[id as usize].body, state)?;
                 }
                 Ok(())
             }
-            _ => Ok(()),
-        }
-    }
-
-    fn bind_pat(&self, pat: PatId, state: &mut State, borrow_src: Option<(u32, Option<FieldKey>, bool)>) {
-        match *self.body.pat(pat) {
-            Pat::Bind { sub, .. } => {
-                if let Some(&local) = self.typed.binds.get(&pat)
-                    && (local as usize) < state.init.len()
-                {
-                    state.init[local as usize] = true;
-                    state.moved[local as usize] = false;
-                    state.loans.retain(|l| l.holder != Some(local));
-                    if let Some((target, field, mutable)) = borrow_src {
-                        state.loans.push(Loan { target, field, holder: Some(local), mutable });
-                        state.borrows_local[local as usize] = !self.is_param.get(target as usize).copied().unwrap_or(true);
-                    } else {
-                        state.borrows_local[local as usize] = false;
+            _ => {
+                for src in self.expr_borrow_sources(expr, state) {
+                    if self.is_escaping_return(&src) {
+                        bail!("cannot return value referencing local variable `{}`", self.local_name(src.target));
                     }
                 }
-                if let Some(sub) = sub {
-                    self.bind_pat(sub, state, None);
-                }
+                Ok(())
             }
-            Pat::Paren(inner) | Pat::Ref { pat: inner, .. } | Pat::Box(inner) | Pat::Deref(inner) => self.bind_pat(inner, state, None),
-            Pat::Tuple(list) | Pat::TupleStruct(_, list) | Pat::Slice(list) | Pat::Or(list) => {
-                for &at in self.body.list(list) {
-                    self.bind_pat(PatId(at), state, None);
-                }
-            }
-            Pat::Struct { fields, .. } => {
-                for &at in self.body.list(fields) {
-                    self.bind_pat(self.body.field_pats[at as usize].pat, state, None);
-                }
-            }
-            _ => {}
         }
     }
 
-    fn collect_reads_stmt(&self, stmt: Stmt, out: &mut HashSet<u32>) {
-        match stmt {
-            Stmt::Let { init, otherwise, .. } => {
-                if let Some(e) = init {
-                    self.collect_reads_expr(e, out);
-                }
-                if let Some(e) = otherwise {
-                    self.collect_reads_expr(e, out);
-                }
+    fn check_block_escape(&self, block_depth: u32, state: &State, outer_live: &HashSet<u32>) -> Result<()> {
+        for l in &state.loans {
+            let Some(holder) = l.holder else { continue };
+            if is_temp_holder(Some(holder)) {
+                continue;
             }
-            Stmt::Expr(e, _) => self.collect_reads_expr(e, out),
-            Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
-        }
-    }
-
-    fn collect_reads_expr(&self, expr: ExprId, out: &mut HashSet<u32>) {
-        match *self.body.expr(expr) {
-            Expr::Path(_) => {
-                if let Some(Res::Local(local)) = self.typed.res.get(&expr) {
-                    out.insert(*local);
-                }
+            if outer_live.contains(&holder) && self.escapes_depth(l.target, l.through_ref, block_depth) {
+                bail!("`{}` does not live long enough", self.local_name(l.target));
             }
-            Expr::Unary(_, e) | Expr::Field(e, _) | Expr::TupleField(e, _) | Expr::Cast(e, _) | Expr::Ref { expr: e, .. } | Expr::Try(e) | Expr::Await(e) | Expr::Paren(e) | Expr::Become(e) => {
-                self.collect_reads_expr(e, out);
-            }
-            Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) => {
-                self.collect_reads_expr(a, out);
-                self.collect_reads_expr(b, out);
-            }
-            Expr::Call(callee, args) => {
-                self.collect_reads_expr(callee, out);
-                self.body.list(args).iter().for_each(|&a| self.collect_reads_expr(ExprId(a), out));
-            }
-            Expr::Method { receiver, params, .. } => {
-                self.collect_reads_expr(receiver, out);
-                self.body.list(params).iter().for_each(|&a| self.collect_reads_expr(ExprId(a), out));
-            }
-            Expr::Block { stmts, tail, .. } => {
-                for &s in self.body.list(stmts) {
-                    self.collect_reads_stmt(self.body.stmts[s as usize], out);
-                }
-                if let Some(t) = tail {
-                    self.collect_reads_expr(t, out);
-                }
-            }
-            Expr::If(c, t, e) => {
-                self.collect_reads_expr(c, out);
-                self.collect_reads_expr(t, out);
-                if let Some(e) = e {
-                    self.collect_reads_expr(e, out);
-                }
-            }
-            Expr::Let(_, init) => self.collect_reads_expr(init, out),
-            Expr::While { cond, body, .. } => {
-                self.collect_reads_expr(cond, out);
-                self.collect_reads_expr(body, out);
-            }
-            Expr::Loop { body, .. } | Expr::Closure { body, .. } => self.collect_reads_expr(body, out),
-            Expr::For { iter, body, .. } => {
-                self.collect_reads_expr(iter, out);
-                self.collect_reads_expr(body, out);
-            }
-            Expr::Match(scrut, arms) => {
-                self.collect_reads_expr(scrut, out);
-                for &a in self.body.list(arms) {
-                    let arm = self.body.arms[a as usize];
-                    if let Some(g) = arm.guard {
-                        self.collect_reads_expr(g, out);
-                    }
-                    self.collect_reads_expr(arm.body, out);
-                }
-            }
-            Expr::Tuple(list) | Expr::Array(list) => self.body.list(list).iter().for_each(|&a| self.collect_reads_expr(ExprId(a), out)),
-            Expr::Struct { fields, base, .. } => {
-                self.body.list(fields).iter().for_each(|&f| self.collect_reads_expr(self.body.fields[f as usize].value, out));
-                if let Some(b) = base {
-                    self.collect_reads_expr(b, out);
-                }
-            }
-            Expr::Range { from, to, .. } => {
-                if let Some(f) = from {
-                    self.collect_reads_expr(f, out);
-                }
-                if let Some(t) = to {
-                    self.collect_reads_expr(t, out);
-                }
-            }
-            Expr::Return(e) | Expr::Break(_, e) | Expr::Yield(e) => {
-                if let Some(e) = e {
-                    self.collect_reads_expr(e, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn assign_place(&self, lhs: ExprId, state: &mut State, borrow_src: Option<(u32, Option<FieldKey>, bool)>) -> Result<()> {
-        if self.place_behind_shared_ref(lhs) {
-            bail!("cannot assign to data in a `&` reference");
-        }
-        match *self.body.expr(lhs) {
-            Expr::Paren(inner) => return self.assign_place(inner, state, borrow_src),
-            Expr::Tuple(list) | Expr::Array(list) => {
-                for &elem in self.body.list(list) {
-                    self.assign_place(ExprId(elem), state, None)?;
-                }
-                return Ok(());
-            }
-            Expr::Struct { fields, .. } => {
-                for &f in self.body.list(fields) {
-                    self.assign_place(self.body.fields[f as usize].value, state, None)?;
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-        if let Some((local, through_ref, field)) = self.root_place(lhs) {
-            self.check_can_mutate(local, through_ref, &field, state, true)?;
-            if !through_ref && field.is_none() && (local as usize) < state.init.len() {
-                state.init[local as usize] = true;
-                state.moved[local as usize] = false;
-                state.loans.retain(|l| l.holder != Some(local));
-                if let Some((target, src_field, mutable)) = borrow_src {
-                    state.loans.push(Loan { target, field: src_field, holder: Some(local), mutable });
-                    state.borrows_local[local as usize] = !self.is_param.get(target as usize).copied().unwrap_or(true);
-                }
-            }
-        } else {
-            self.check_expr(lhs, state, true)?;
         }
         Ok(())
     }
 
-    fn check_expr(&self, expr: ExprId, state: &mut State, place_ctx: bool) -> Result<()> {
+    fn check_expr(
+        &mut self,
+        expr: ExprId,
+        state: &mut State,
+        place_ctx: bool,
+        outer_live: &HashSet<u32>,
+        value_used: bool,
+        depth: u32,
+    ) -> Result<()> {
         if state.diverged {
             return Ok(());
         }
@@ -482,10 +415,11 @@ impl Checker<'_, '_> {
                     && (*local as usize) < self.is_copy.len()
                 {
                     if place_ctx || self.is_copy[*local as usize] {
-                        self.check_can_read(*local, state)?;
+                        self.check_can_read(*local, &[], state)?;
                     } else {
-                        self.check_can_move(*local, state)?;
+                        self.check_can_move(*local, &[], state)?;
                         state.moved[*local as usize] = true;
+                        state.partial_moves.retain(|m| m.local != *local);
                     }
                 }
             }
@@ -493,242 +427,154 @@ impl Checker<'_, '_> {
                 if !raw && mutable && self.place_behind_shared_ref(inner) {
                     bail!("cannot borrow data in a `&` reference as mutable");
                 }
-                if !raw && let Some((local, through_ref, field)) = self.root_place(inner) {
-                    self.check_borrow(local, through_ref, &field, mutable, state)?;
+                if !raw && let Some(p) = self.root_place(inner) {
+                    self.check_borrow(p.local, p.through_ref, p.mut_ref_root, &p.steps, mutable, state)?;
                 }
-                self.check_expr(inner, state, true)?;
+                self.check_expr(inner, state, true, outer_live, false, depth)?;
             }
             Expr::Assign(lhs, rhs) => {
-                self.check_expr(rhs, state, false)?;
-                let borrow_src = self.expr_borrow_source(rhs, state);
-                self.assign_place(lhs, state, borrow_src)?;
+                let mut after_rhs = outer_live.clone();
+                self.collect_live_expr(lhs, &mut after_rhs);
+                self.check_expr(rhs, state, false, &after_rhs, true, depth)?;
+                let sources = self.expr_borrow_sources(rhs, state);
+                prune_dead_loans(state, &after_rhs);
+                self.assign_place(lhs, &sources, state, outer_live, depth)?;
+                prune_moved_loans(state);
             }
             Expr::AssignOp(_, lhs, rhs) => {
-                self.check_expr(rhs, state, false)?;
+                let mut after_rhs = outer_live.clone();
+                self.collect_live_expr(lhs, &mut after_rhs);
+                self.check_expr(rhs, state, false, &after_rhs, true, depth)?;
+                prune_dead_loans(state, &after_rhs);
                 if self.place_behind_shared_ref(lhs) {
                     bail!("cannot assign to data in a `&` reference");
                 }
-                if let Some((local, through_ref, field)) = self.root_place(lhs) {
-                    self.check_not_moved(local, state)?;
-                    self.check_can_mutate(local, through_ref, &field, state, false)?;
+                if let Some(p) = self.root_place(lhs) {
+                    self.check_not_moved(p.local, &p.steps, state)?;
+                    self.check_can_mutate(p.local, p.through_ref, p.mut_ref_root, &p.steps, state, false)?;
                 } else {
-                    self.check_expr(lhs, state, true)?;
+                    self.check_expr(lhs, state, true, outer_live, false, depth)?;
                 }
             }
-            Expr::Block { stmts, tail, .. } => {
-                let ids: Vec<u32> = self.body.list(stmts).to_vec();
-                for (pos, &stmt_id) in ids.iter().enumerate() {
-                    if !state.loans.is_empty() {
-                        let mut live = HashSet::default();
-                        for &later in &ids[pos..] {
-                            self.collect_reads_stmt(self.body.stmts[later as usize], &mut live);
-                        }
-                        if let Some(t) = tail {
-                            self.collect_reads_expr(t, &mut live);
-                        }
-                        state.loans.retain(|l| l.holder.is_none_or(|h| live.contains(&h)));
-                    }
-                    match self.body.stmts[stmt_id as usize] {
-                        Stmt::Let { pat, init, otherwise, .. } => {
-                            let destructures = !matches!(*self.body.pat(pat), Pat::Bind { by_ref: false, sub: None, .. } | Pat::Wild);
-                            let borrow_src = if let Some(e) = init {
-                                self.check_expr(e, state, destructures)?;
-                                self.expr_borrow_source(e, state)
-                            } else {
-                                None
-                            };
-                            if let Some(e) = otherwise {
-                                let mut alt = state.clone();
-                                self.check_expr(e, &mut alt, false)?;
-                            }
-                            if init.is_some() {
-                                self.bind_pat(pat, state, borrow_src);
-                            }
-                        }
-                        Stmt::Expr(e, _) => self.check_expr(e, state, false)?,
-                        Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
-                    }
-                }
-                if let Some(t) = tail {
-                    if !state.loans.is_empty() {
-                        let mut live = HashSet::default();
-                        self.collect_reads_expr(t, &mut live);
-                        state.loans.retain(|l| l.holder.is_none_or(|h| live.contains(&h)));
-                    }
-                    self.check_expr(t, state, place_ctx)?;
+            Expr::Block { kind, stmts, tail, label } => {
+                if matches!(kind, BlockKind::Async | BlockKind::AsyncMove) {
+                    self.check_closure(expr, None, expr, state, depth)?;
+                } else {
+                    self.check_block(kind, stmts, tail, label, state, (place_ctx, value_used), outer_live, depth)?;
                 }
             }
             Expr::If(cond, then, otherwise) => {
-                self.check_expr(cond, state, false)?;
-                let mut then_state = state.clone();
-                self.check_expr(then, &mut then_state, place_ctx)?;
-                let mut else_state = state.clone();
-                if let Some(alt) = otherwise {
-                    self.check_expr(alt, &mut else_state, place_ctx)?;
-                }
-                merge_branch(state, &then_state, &else_state);
+                self.check_if(cond, then, otherwise, state, (place_ctx, value_used), outer_live, depth)?;
             }
             Expr::Let(pat, init) => {
-                self.check_expr(init, state, true)?;
-                let src = self.expr_borrow_source(init, state);
-                self.bind_pat(pat, state, src);
+                self.check_expr(init, state, true, outer_live, true, depth)?;
+                let scrut_place = self.root_place(init);
+                self.bind_pat(pat, Some(init), scrut_place.as_ref(), &[], &[], state, (true, true, depth))?;
             }
             Expr::Match(scrut, arms) => {
-                self.check_expr(scrut, state, true)?;
-                let arm_ids: Vec<u32> = self.body.list(arms).to_vec();
-                let mut merged: Option<State> = None;
-                for arm_id in arm_ids {
-                    let arm = self.body.arms[arm_id as usize];
-                    let mut arm_state = state.clone();
-                    self.bind_pat(arm.pat, &mut arm_state, None);
-                    if let Some(g) = arm.guard {
-                        self.check_expr(g, &mut arm_state, false)?;
-                    }
-                    self.check_expr(arm.body, &mut arm_state, place_ctx)?;
-                    if !arm_state.diverged {
-                        match &mut merged {
-                            Some(acc) => join_moved(acc, &arm_state),
-                            None => merged = Some(arm_state),
-                        }
-                    }
-                }
-                if let Some(acc) = merged {
-                    *state = acc;
-                } else {
-                    state.diverged = true;
-                }
+                self.check_match(scrut, arms, state, (place_ctx, value_used), outer_live, depth)?;
             }
-            Expr::Loop { body, .. } => {
-                self.check_loop(None, None, body, state)?;
-            }
-            Expr::While { cond, body, .. } => {
-                self.check_loop(Some(cond), None, body, state)?;
-            }
-            Expr::For { pat, iter, body, .. } => {
-                self.check_expr(iter, state, false)?;
-                self.check_loop(None, Some(pat), body, state)?;
-            }
-            Expr::Call(callee, args) => {
-                self.check_expr(callee, state, true)?;
-                self.check_list(args, state)?;
-            }
-            Expr::Method { receiver, params, .. } => {
-                let recv_borrow = self.typed.adjusts.get(&expr).and_then(|m| m.autoref);
-                if recv_borrow == Some(Mut::Mut)
-                    && (self.place_behind_shared_ref(receiver)
-                        || self
-                            .typed
-                            .exprs
-                            .get(receiver.0 as usize)
-                            .copied()
-                            .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Not, _))))
-                {
-                    bail!("cannot borrow data in a `&` reference as mutable");
-                }
-                if let Some(mutability) = recv_borrow
-                    && let Some((local, through_ref, field)) = self.root_place(receiver)
-                {
-                    let recv_is_mut_ref = self
-                        .typed
-                        .exprs
-                        .get(receiver.0 as usize)
-                        .copied()
-                        .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Mut, _)));
-                    self.check_borrow(local, through_ref || recv_is_mut_ref, &field, mutability == Mut::Mut, state)?;
-                    self.check_expr(receiver, state, true)?;
-                } else {
-                    self.check_expr(receiver, state, recv_borrow.is_some())?;
-                }
-                self.check_list(params, state)?;
-            }
+            Expr::Loop { label, body } => self.check_loop(label, None, None, None, body, state, outer_live, depth)?,
+            Expr::While { label, cond, body } => self.check_loop(label, Some(cond), None, None, body, state, outer_live, depth)?,
+            Expr::For { label, pat, iter, body } => self.check_for(label, pat, iter, body, state, outer_live, depth)?,
+            Expr::Call(callee, args) => self.check_call(expr, callee, args, state, outer_live, depth)?,
+            Expr::Method { receiver, params, .. } => self.check_method(expr, receiver, params, state, outer_live, depth)?,
             Expr::Unary(op, inner) => {
                 if op == UnOp::Deref && !place_ctx && self.deref_non_copy.contains(&expr) {
                     bail!("cannot move out of a shared or mutable reference");
                 }
-                self.check_expr(inner, state, op == UnOp::Deref)?;
+                self.check_expr(inner, state, op == UnOp::Deref, outer_live, false, depth)?;
             }
             Expr::Index(a, b) => {
-                self.check_expr(a, state, true)?;
-                self.check_expr(b, state, false)?;
+                self.check_expr(a, state, true, outer_live, false, depth)?;
+                self.check_expr(b, state, false, outer_live, true, depth)?;
             }
             Expr::Binary(op, a, b) => {
-                let cmp = matches!(op, crate::body::BinOp::Eq | crate::body::BinOp::Ne | crate::body::BinOp::Lt | crate::body::BinOp::Le | crate::body::BinOp::Gt | crate::body::BinOp::Ge);
-                self.check_expr(a, state, cmp)?;
-                self.check_expr(b, state, cmp)?;
+                let cmp = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+                self.check_expr(a, state, cmp, outer_live, !cmp, depth)?;
+                self.check_expr(b, state, cmp, outer_live, !cmp, depth)?;
             }
             Expr::Repeat(a, b) => {
-                self.check_expr(a, state, false)?;
-                self.check_expr(b, state, false)?;
+                self.check_expr(a, state, false, outer_live, true, depth)?;
+                self.check_expr(b, state, false, outer_live, true, depth)?;
             }
-            Expr::Field(base, _) | Expr::TupleField(base, _) => self.check_expr(base, state, true)?,
-            Expr::Cast(inner, _) | Expr::Try(inner) | Expr::Await(inner) | Expr::Paren(inner) | Expr::Become(inner) => self.check_expr(inner, state, place_ctx)?,
-            Expr::Tuple(list) | Expr::Array(list) => self.check_list(list, state)?,
-            Expr::Struct { fields, base, .. } => {
-                for &f in self.body.list(fields) {
-                    self.check_expr(self.body.fields[f as usize].value, state, false)?;
+            Expr::Field(base, _) | Expr::TupleField(base, _) => {
+                if let Some(p) = self.root_place(expr)
+                    && !p.steps.is_empty()
+                    && !p.steps.contains(&PlaceStep::Opaque)
+                {
+                    if place_ctx || p.through_ref || self.ty_is_copy(self.expr_ty(expr)) {
+                        self.check_can_read(p.local, &p.steps, state)?;
+                    } else {
+                        self.check_can_move(p.local, &p.steps, state)?;
+                        state.partial_moves.push(PartialMove { local: p.local, steps: p.steps });
+                    }
+                } else {
+                    self.check_expr(base, state, true, outer_live, false, depth)?;
                 }
+            }
+            Expr::Cast(inner, _) | Expr::Try(inner) | Expr::Await(inner) | Expr::Paren(inner) | Expr::Become(inner) => {
+                self.check_expr(inner, state, place_ctx, outer_live, value_used, depth)?;
+            }
+            Expr::Tuple(list) | Expr::Array(list) => {
+                let ids: Vec<u32> = self.body.list(list).to_vec();
+                self.check_arg_list(&ids, None, None, state, outer_live, depth)?;
+            }
+            Expr::Struct { fields, base, .. } => {
+                let val_ids: Vec<u32> = self
+                    .body
+                    .list(fields)
+                    .iter()
+                    .map(|&f| self.body.fields[f as usize].value.0)
+                    .collect();
+                self.check_arg_list(&val_ids, None, None, state, outer_live, depth)?;
                 if let Some(b) = base {
-                    self.check_expr(b, state, false)?;
+                    let deref_base = matches!(*self.body.expr(b), Expr::Unary(UnOp::Deref, _));
+                    self.check_expr(b, state, deref_base, outer_live, true, depth)?;
                 }
             }
             Expr::Range { from, to, .. } => {
                 if let Some(f) = from {
-                    self.check_expr(f, state, false)?;
+                    self.check_expr(f, state, false, outer_live, true, depth)?;
                 }
                 if let Some(t) = to {
-                    self.check_expr(t, state, false)?;
+                    self.check_expr(t, state, false, outer_live, true, depth)?;
                 }
             }
             Expr::Return(val) => {
                 if let Some(v) = val {
-                    self.check_expr(v, state, false)?;
-                    if self.returns_ref {
+                    self.check_expr(v, state, false, outer_live, true, depth)?;
+                    if self.returns_borrow {
                         self.check_return_escape(v, state)?;
                     }
                 }
                 state.diverged = true;
             }
-            Expr::Break(_, val) => {
+            Expr::Break(label, val) => {
                 if let Some(v) = val {
-                    self.check_expr(v, state, false)?;
+                    self.check_expr(v, state, false, outer_live, true, depth)?;
+                }
+                if let Some(idx) = self.breaks.iter().rposition(|f| jumps_to(self.src, (f.label, f.is_block), label)) {
+                    let target_depth = self.breaks[idx].depth;
+                    if let Some(v) = val {
+                        for src in self.expr_borrow_sources(v, state) {
+                            if self.escapes_depth(src.target, src.through_ref, target_depth) {
+                                bail!("`{}` does not live long enough", self.local_name(src.target));
+                            }
+                        }
+                    }
+                    self.breaks[idx].states.push(state.clone());
                 }
                 state.diverged = true;
             }
             Expr::Continue(_) => state.diverged = true,
             Expr::Yield(val) => {
                 if let Some(v) = val {
-                    self.check_expr(v, state, false)?;
+                    self.check_expr(v, state, false, outer_live, true, depth)?;
                 }
             }
-            Expr::Closure { .. } | Expr::Lit(..) | Expr::Macro { .. } | Expr::Underscore | Expr::FormatArgs(_) | Expr::OffsetOf { .. } => {}
-        }
-        Ok(())
-    }
-
-    fn check_list(&self, list: List, state: &mut State) -> Result<()> {
-        for &arg in self.body.list(list) {
-            self.check_expr(ExprId(arg), state, false)?;
-        }
-        Ok(())
-    }
-
-    fn check_loop(&self, cond: Option<ExprId>, pat: Option<PatId>, body: ExprId, state: &mut State) -> Result<()> {
-        let mut iter_state = state.clone();
-        for _ in 0..2 {
-            iter_state.diverged = false;
-            if let Some(c) = cond {
-                self.check_expr(c, &mut iter_state, false)?;
-            }
-            if let Some(p) = pat {
-                self.bind_pat(p, &mut iter_state, None);
-            }
-            self.check_expr(body, &mut iter_state, false)?;
-            if iter_state.diverged {
-                break;
-            }
-        }
-        if !iter_state.diverged {
-            join_moved(state, &iter_state);
+            Expr::Closure { params, body, .. } => self.check_closure(expr, Some(params), body, state, depth)?,
+            Expr::Lit(..) | Expr::Macro { .. } | Expr::Underscore | Expr::FormatArgs(_) | Expr::OffsetOf { .. } => {}
         }
         Ok(())
     }
@@ -737,6 +583,20 @@ impl Checker<'_, '_> {
 fn join_moved(dst: &mut State, other: &State) {
     for (d, &o) in dst.moved.iter_mut().zip(&other.moved) {
         *d |= o;
+    }
+    for pm in &other.partial_moves {
+        if !dst.partial_moves.contains(pm) {
+            dst.partial_moves.push(pm.clone());
+        }
+    }
+}
+
+fn merge_states(dst: &mut State, other: &State) {
+    join_moved(dst, other);
+    for l in &other.loans {
+        if !dst.loans.contains(l) {
+            dst.loans.push(l.clone());
+        }
     }
 }
 
@@ -747,7 +607,7 @@ fn merge_branch(out: &mut State, a: &State, b: &State) {
         (false, true) => *out = a.clone(),
         (false, false) => {
             *out = a.clone();
-            join_moved(out, b);
+            merge_states(out, b);
         }
     }
 }

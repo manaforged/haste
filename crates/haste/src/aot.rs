@@ -287,7 +287,11 @@ fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
         FillOnce => Binding::Shim(Shim::FillOnce),
         ThreadCell => Binding::Shim(Shim::ThreadCell),
         DsoHandle => Binding::DsoHandle,
-        Abort | StartPanic | PanicCleanup => Binding::Import("abort", None),
+        Abort => Binding::Import("abort", None),
+        StartPanic => Binding::Shim(Shim::StartPanic),
+        PanicCleanup => Binding::Shim(Shim::PanicCleanup),
+        DropPush => Binding::Shim(Shim::DropPush),
+        DropPop => Binding::Shim(Shim::DropPop),
         CatchUnwind => Binding::Shim(Shim::CatchUnwind),
         Math(MathSymbol::Powif32) => Binding::Shim(Shim::Wide(WideShim::Powi { f64: false })),
         Math(MathSymbol::Powif64) => Binding::Shim(Shim::Wide(WideShim::Powi { f64: true })),
@@ -442,11 +446,16 @@ impl<'a> Plan<'a> {
     }
 
     pub(super) fn bss_layout(&self, bss: u32) -> (u32, u32) {
-        if !self.has_shim(Shim::ThreadCell) {
+        if !(self.has_shim(Shim::ThreadCell)
+            || self.has_shim(Shim::CatchUnwind)
+            || self.has_shim(Shim::StartPanic)
+            || self.has_shim(Shim::DropPush)
+            || self.has_shim(Shim::DropPop))
+        {
             return (bss, bss);
         }
         let key_off = bss.next_multiple_of(16);
-        (key_off, key_off + 16)
+        (key_off, key_off + 32)
     }
 }
 
