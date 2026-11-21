@@ -232,9 +232,6 @@ impl Checker<'_, '_> {
     }
 
     fn non_place_borrow_sources(&mut self, expr: ExprId, mutable: bool, state: &State, extend_depth: Option<u32>) -> Vec<BorrowSource> {
-        if self.is_ref_ty(self.expr_ty(expr)) {
-            return clamp_mut(self.expr_borrow_sources_inner(expr, state, true, extend_depth), mutable);
-        }
         match *self.body.expr(expr) {
             Expr::Paren(inner) | Expr::Cast(inner, _) => {
                 self.non_place_borrow_sources(inner, mutable, state, extend_depth)
@@ -264,6 +261,9 @@ impl Checker<'_, '_> {
                 }
             }
             _ => {
+                if self.is_ref_ty(self.expr_ty(expr)) {
+                    return clamp_mut(self.expr_borrow_sources_inner(expr, state, true, extend_depth), mutable);
+                }
                 let mut out = Vec::new();
                 if self.is_non_promotable_temp(expr) {
                     let depth = extend_depth.unwrap_or(self.temp_scope_depth);
