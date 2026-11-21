@@ -35,6 +35,7 @@ struct Checker<'c, 'a> {
     is_copy: Vec<bool>,
     is_param: Vec<bool>,
     names: Vec<Option<String>>,
+    deref_non_copy: HashSet<ExprId>,
     returns_ref: bool,
 }
 
@@ -91,8 +92,20 @@ pub(super) fn check(cx: &mut Context<'_>, item: ItemRef, (body, sig): (&Body, &c
     for at in 0..body.pats.len() as u32 {
         collect_pat_meta(body, typed, src, PatId(at), &mut mutable, &mut names);
     }
+    let mut deref_non_copy = HashSet::default();
+    for at in 0..body.exprs.len() as u32 {
+        let id = ExprId(at);
+        if let Expr::Unary(UnOp::Deref, inner) = *body.expr(id)
+            && let Some(&inner_ty) = typed.exprs.get(inner.0 as usize)
+            && inner_ty != super::ty::Ty::NONE
+            && let Kind::Ref(_, pointee) = cx.types.kind(inner_ty)
+            && !super::infer::is_copy(cx, item, *pointee).unwrap_or(true)
+        {
+            deref_non_copy.insert(id);
+        }
+    }
     let returns_ref = typed.ret.is_some_and(|ty| matches!(cx.types.kind(ty), Kind::Ref(..)));
-    let checker = Checker { types: &cx.types, body, typed, mutable, is_copy, is_param, names, returns_ref };
+    let checker = Checker { types: &cx.types, body, typed, mutable, is_copy, is_param, names, deref_non_copy, returns_ref };
     let mut state = State { init, moved: vec![false; n], loans: Vec::new(), borrows_local: vec![false; n], diverged: false };
     checker.check_expr(root, &mut state, false)?;
     if checker.returns_ref && !state.diverged {
@@ -138,6 +151,29 @@ impl Checker<'_, '_> {
             }
             Expr::Unary(UnOp::Deref, inner) => self.root_local(inner).map(|(l, _)| (l, true)),
             _ => None,
+        }
+    }
+
+    fn place_behind_shared_ref(&self, expr: ExprId) -> bool {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) => self.place_behind_shared_ref(inner),
+            Expr::Unary(UnOp::Deref, inner) => {
+                self.typed
+                    .exprs
+                    .get(inner.0 as usize)
+                    .copied()
+                    .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Not, _)))
+            }
+            Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _) => {
+                let base_shared = self
+                    .typed
+                    .exprs
+                    .get(base.0 as usize)
+                    .copied()
+                    .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Not, _)));
+                base_shared || self.place_behind_shared_ref(base)
+            }
+            _ => false,
         }
     }
 
@@ -391,6 +427,9 @@ impl Checker<'_, '_> {
                 }
             }
             Expr::Ref { mutable, raw, expr: inner } => {
+                if !raw && mutable && self.place_behind_shared_ref(inner) {
+                    bail!("cannot borrow data in a `&` reference as mutable");
+                }
                 if !raw && let Some((local, through_ref)) = self.root_local(inner) {
                     self.check_borrow(local, through_ref, mutable, state)?;
                 }
@@ -398,6 +437,9 @@ impl Checker<'_, '_> {
             }
             Expr::Assign(lhs, rhs) => {
                 self.check_expr(rhs, state, false)?;
+                if self.place_behind_shared_ref(lhs) {
+                    bail!("cannot assign to data in a `&` reference");
+                }
                 let borrow_src = self.expr_borrow_source(rhs, state);
                 if let Some((local, through_ref)) = self.root_local(lhs) {
                     self.check_can_mutate(local, through_ref, state, true)?;
@@ -416,6 +458,9 @@ impl Checker<'_, '_> {
             }
             Expr::AssignOp(_, lhs, rhs) => {
                 self.check_expr(rhs, state, false)?;
+                if self.place_behind_shared_ref(lhs) {
+                    bail!("cannot assign to data in a `&` reference");
+                }
                 if let Some((local, through_ref)) = self.root_local(lhs) {
                     self.check_not_moved(local, state)?;
                     self.check_can_mutate(local, through_ref, state, false)?;
@@ -522,6 +567,17 @@ impl Checker<'_, '_> {
             }
             Expr::Method { receiver, params, .. } => {
                 let recv_borrow = self.typed.adjusts.get(&expr).and_then(|m| m.autoref);
+                if recv_borrow == Some(Mut::Mut)
+                    && (self.place_behind_shared_ref(receiver)
+                        || self
+                            .typed
+                            .exprs
+                            .get(receiver.0 as usize)
+                            .copied()
+                            .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Not, _))))
+                {
+                    bail!("cannot borrow data in a `&` reference as mutable");
+                }
                 if let Some(mutability) = recv_borrow
                     && let Some((local, through_ref)) = self.root_local(receiver)
                 {
@@ -532,7 +588,12 @@ impl Checker<'_, '_> {
                 }
                 self.check_list(params, state)?;
             }
-            Expr::Unary(op, inner) => self.check_expr(inner, state, op == UnOp::Deref)?,
+            Expr::Unary(op, inner) => {
+                if op == UnOp::Deref && !place_ctx && self.deref_non_copy.contains(&expr) {
+                    bail!("cannot move out of a shared or mutable reference");
+                }
+                self.check_expr(inner, state, op == UnOp::Deref)?;
+            }
             Expr::Index(a, b) => {
                 self.check_expr(a, state, true)?;
                 self.check_expr(b, state, false)?;
