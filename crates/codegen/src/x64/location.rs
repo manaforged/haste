@@ -101,6 +101,9 @@ impl Emit<'_> {
 
     /// The float register that holds `value`, when its location is one.
     pub(super) fn xmm_of(&self, value: Value) -> Option<Xmm> {
+        if self.plan.elided[value.index()] {
+            return None;
+        }
         self.plan.float_of(value).map(Xmm)
     }
 
@@ -426,6 +429,11 @@ impl Emit<'_> {
     /// Puts float `value` in `xmm`.
     pub(super) fn fget(&mut self, xmm: Xmm, value: Value) {
         let ty = self.ty(value);
+        if let Some(mem) = self.elided_mem(value) {
+            self.xmm_load(ty, xmm, mem);
+            self.clobber_xmm(xmm);
+            return;
+        }
         match self.location(value) {
             Location::Float(from) if Xmm(from) == xmm => {}
             Location::Float(from) => {
@@ -482,6 +490,9 @@ impl Emit<'_> {
 
     /// A float register or memory operand that holds `value`, using `scratch` when `value` has no float home.
     pub(super) fn foperand(&mut self, value: Value, scratch: Xmm) -> Rm {
+        if let Some(mem) = self.elided_mem(value) {
+            return mem.into();
+        }
         match self.location(value) {
             Location::Float(xmm) => Xmm(xmm).into(),
             Location::Slot => self.at(value).into(),

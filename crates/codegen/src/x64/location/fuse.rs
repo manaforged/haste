@@ -6,8 +6,9 @@ use super::super::{FRAME_REGS, REGS};
 use super::super::asm::Reg;
 use super::super::features::Features;
 use super::super::frame::SAVED;
+use super::super::vector::{float_vec_opcode, is_commutative, vec_alu_opcode};
 use crate::alloc::{Location, Plan};
-use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Lane, Op, TargetOpId, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Lane, Op, ShuffleMask, TargetOpId, Type, Unary, Value};
 use crate::live::{Sib, SibBase};
 
 pub(super) struct FuseCtx<'a> {
@@ -293,8 +294,49 @@ fn load_binop_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
     }
 }
 
+fn vec_load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, load_res: Value, udata: &InstData) -> bool {
+    let (ty, wide) = (ctx.func.ty(load_res), ctx.func.ty(load_res).is_wide_vec());
+    let Some((lane, count)) = ty.vec_shape().filter(|_| features.avx && (wide || (ty.is_valid_vec() && ty.bytes() == 16))) else { return false };
+    match udata.op {
+        Op::Unary(Unary::Ineg, x) => wide && lane.is_int() && x == load_res,
+        Op::Binary(op, a, b) => {
+            let other = if a == load_res { b } else { a };
+            if ctx.plan.elided[other.index()] || (a != load_res && b != load_res) { return false; }
+            if wide {
+                let packed = (vec_alu_opcode(op, lane).is_some() && (lane.is_int() || matches!(op, Binary::Band | Binary::Bor | Binary::Bxor))) || (float_vec_opcode(op).is_some() && lane.is_float());
+                return (packed && (b == load_res || (is_commutative(op) && ctx.plan.float_of(b).is_some()))) || (b == load_res && matches!((op, lane), (Binary::Ishl | Binary::Ushr, Lane::I32 | Lane::I64) | (Binary::Sshr, Lane::I32)));
+            }
+            let ok = vec_alu_opcode(op, lane).is_some() || (float_vec_opcode(op).is_some() && lane.is_float()) || (op == Binary::Imul && (lane == Lane::I16 || (lane == Lane::I32 && features.sse41))) || (matches!(op, Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax) && lane != Lane::I64 && (features.sse41 || matches!((op, lane), (Binary::Umin | Binary::Umax, Lane::I8) | (Binary::Smin | Binary::Smax, Lane::I16)))) || (matches!(op, Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat | Binary::AvgRound) && matches!(lane, Lane::I8 | Lane::I16));
+            ok && (b == load_res || is_commutative(op))
+        }
+        Op::TargetOp(id, ref args) => match (id, args.as_slice()) {
+            (TargetOpId::X64Low128 | TargetOpId::X64High128, &[v]) => wide && v == load_res,
+            (TargetOpId::X64Concat128, &[l, h]) => !wide && h == load_res && !ctx.plan.elided[l.index()],
+            (TargetOpId::X64Pshufb256 | TargetOpId::X64Pcmpeqb256 | TargetOpId::X64Pcmpgtb256 | TargetOpId::X64Psadbw256 | TargetOpId::X64Pmaddubsw256 | TargetOpId::X64Pmaddwd256, &[x, y]) => wide && y == load_res && !ctx.plan.elided[x.index()],
+            _ => false,
+        },
+        Op::Shuffle(a, b, ShuffleMask::Dyn(m)) => !wide && features.ssse3 && a == b && m == load_res && ty == Type::Vec { lane: Lane::I8, count: 16 } && ctx.func.ty(a) == ty && !ctx.plan.elided[a.index()],
+        Op::Shuffle(a, b, ShuffleMask::Const(indices)) if a != b && (a == load_res || b == load_res) && !ctx.plan.elided[(if a == load_res { b } else { a }).index()] => {
+            if wide {
+                let q = [indices[0], indices[1], indices[2], indices[3]];
+                if lane.bytes() != 8 || count != 4 || (q.iter().all(|&x| x == q[0]) && q[0] % 4 == 0) || q == [0, 1, 2, 3] || q == [4, 5, 6, 7] { return false; }
+                if q.iter().all(|&x| x < 4) { return a == load_res; } else if q.iter().all(|&x| x >= 4) { return b == load_res; }
+                if (0..4).all(|i| usize::from(q[i]) % 4 == i) || (q[0] % 2 == 0 && q[1] == q[0] + 1 && q[2] % 2 == 0 && q[3] == q[2] + 1) { return b == load_res; }
+                return match q { [0, 4, 2, 6] | [1, 5, 3, 7] | [5, 0, 7, 2] => b == load_res, [4, 0, 6, 2] | [5, 1, 7, 3] | [1, 4, 3, 6] => a == load_res, _ => true };
+            }
+            let (c, bytes) = (usize::from(count), lane.bytes() as usize);
+            if indices[..c].iter().all(|&i| i < count) || indices[..c].iter().all(|&i| i >= count && i < 2 * count) { return false; }
+            if lane.bytes() == 8 && count == 2 && matches!((indices[0], indices[1]), (0, 2) | (1, 3)) { return b == load_res; }
+            let bidx = |k: usize| { let i = indices[k / bytes]; if i < count { i * bytes as u8 + (k % bytes) as u8 } else if i < 2 * count { 16 + (i - count) * bytes as u8 + (k % bytes) as u8 } else { 0x80 } };
+            (features.ssse3 && (1..16).contains(&bidx(0)) && (0..16).all(|k| bidx(k) == bidx(0) + k as u8) && a == load_res) || (features.sse41 && b == load_res && (0..8).all(|w| { let (lo, hi) = (bidx(2 * w), bidx(2 * w + 1)); (lo == 16 + 2 * w as u8 && hi == 17 + 2 * w as u8) || (lo == 2 * w as u8 && hi == 2 * w as u8 + 1) }))
+        }
+        _ => false,
+    }
+}
+
 fn load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: Value, udata: &InstData) -> bool {
     let ty = ctx.func.ty(load_res);
+    if ty.is_vector() { return features.avx && vec_load_elide_ok(ctx, features, load_res, udata); }
     let non_wide = udata.result.is_some_and(|r| ctx.func.ty(r) != Type::I128);
     match udata.op {
         Op::Icmp(..) => true,
@@ -433,7 +475,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                 Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) if !plan.elided[res.index()] => {
                     cmp_tst.push((b_idx, pos, res, lhs, rhs));
                 }
-                Op::Load(..) | Op::StackLoad(..) if uses[res.index()] == 1 && !plan.elided[res.index()] && ty.is_small_int() => {
+                Op::Load(..) | Op::StackLoad(..) if uses[res.index()] == 1 && !plan.elided[res.index()] && (ty.is_small_int() || (features.avx && (ty.is_wide_vec() || (ty.is_valid_vec() && ty.bytes() == 16)))) => {
                     cand_loads.push((b_idx, pos, res));
                 }
                 _ => {}
