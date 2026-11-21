@@ -343,14 +343,17 @@ impl Lower<'_, '_> {
         let code = self.ins().load(Type::I64, vtable, slot as i32 * 8);
         let Some(&tuple) = self.cx.types.substs(substs).get(1) else { bail!("a trait object call with no argument tuple") };
         let packed = self.tuple_of(tuple, args)?;
-        let ret = self.ty_of(expr);
-        let unit = self.cx.types.unit();
-        let pointer = self.cx.types.intern(Kind::Ptr(Mut::Mut, unit));
-        let result = self.call_code(code, (vec![pointer, tuple], Some(ret)), std::iter::once(data).chain(packed).collect())?;
+        if !self.open {
+            return Ok(None);
+        }
         match moved {
             Some((root, path)) => self.moved_out(root, &path)?,
             None => self.moved_out(super::moves::Root::Temp(callee), &[])?,
         }
+        let ret = self.ty_of(expr);
+        let unit = self.cx.types.unit();
+        let pointer = self.cx.types.intern(Kind::Ptr(Mut::Mut, unit));
+        let result = self.call_code(code, (vec![pointer, tuple], Some(ret)), std::iter::once(data).chain(packed).collect())?;
         let target = self.address(boxed);
         self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::BoxFree(expr)), free, free_substs, vec![target])?;
         Ok(result)
@@ -365,13 +368,16 @@ impl Lower<'_, '_> {
         let Some((place, closure)) = self.deref_step((expr, 0), Some(owner), boxed)? else { return Ok(None) };
         let env = if self.cx.closure_takes_env(closure) { vec![self.address(place)] } else { Vec::new() };
         let values = self.args(args, env)?;
-        let result = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)?;
-        let target = self.address(owner);
-        self.invoke(super::reloc::SiteOrigin::DropFn(super::reloc::TyOrigin::Expr(callee)), free, free_substs, vec![target])?;
+        if !self.open {
+            return Ok(None);
+        }
         match moved {
             Some((root, path)) => self.moved_out(root, &path)?,
             None => self.moved_out(super::moves::Root::Temp(callee), &[])?,
         }
+        let result = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)?;
+        let target = self.address(owner);
+        self.invoke(super::reloc::SiteOrigin::DropFn(super::reloc::TyOrigin::Expr(callee)), free, free_substs, vec![target])?;
         Ok(result)
     }
 

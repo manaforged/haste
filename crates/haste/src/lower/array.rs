@@ -59,12 +59,23 @@ impl Lower<'_, '_> {
         let slot = self.slot(whole);
         let Kind::Array(element, _) = *self.cx.types.kind(ty) else { bail!("array literal of a type that is not an array") };
         let (stride, part) = (self.cx.layout(element)?.size.bytes() as i32, repr(self.cx, element)?);
+        let unwind = self.wants_field_unwind()?;
+        let mut guards = Vec::new();
         for (at, item) in self.body.list(items).to_vec().into_iter().enumerate() {
-            let value = self.expr(ExprId(item))?;
-            if let (Some(slot), Some(value)) = (slot, value) {
-                self.write(Place::slot(slot, whole).at(at as i32 * stride, part), value);
+            let item = ExprId(item);
+            let value = self.eval_operand(item)?;
+            if !self.open {
+                return Ok(None);
+            }
+            let elem_place = slot.map(|slot| Place::slot(slot, whole).at(at as i32 * stride, part));
+            if let (Some(place), Some(value)) = (elem_place, value) {
+                self.write(place, value);
+            }
+            if unwind && let Some(guard) = self.push_field_unwind(element, elem_place, item)? {
+                guards.push(guard);
             }
         }
+        self.disarm_unwind(guards);
         Ok(slot.and_then(|slot| self.read(Place::slot(slot, whole))))
     }
 
@@ -277,7 +288,7 @@ impl Lower<'_, '_> {
 
     fn check_bounds(&mut self, at: Value, len: Value) -> Result<()> {
         let inside = self.ins().icmp(IntCC::UnsignedLessThan, at, len);
-        self.check(inside, "index out of bounds")
+        self.check_with(inside, |lower| lower.panic_bounds(at, len))
     }
 
     /// The data pointer and length of the array or slice of type `ty` at `place`; `None` when it has no bytes.

@@ -272,6 +272,11 @@ pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
 pub fn reach_wave(cx: &mut Context<'_>, reached: &mut Reached, roots: &[Instance], force_commit: bool) {
     let mut initial = reached.take_blocked();
     initial.extend(enqueue(reached, roots.to_vec()));
+    if crate::profile() != crate::outline::tree::Profile::Release
+        && let Some(bounds) = cx.lang_item("panic_bounds_check")
+    {
+        initial.extend(enqueue(reached, vec![(bounds, Substs::EMPTY)]));
+    }
     reached.pin_roots(roots);
     let settled = drain_wave(cx, reached, initial, force_commit);
     reached.link(&settled);

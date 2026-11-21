@@ -41,7 +41,9 @@ impl Lower<'_, '_> {
         if self.typed.exprs[base.0 as usize] == Ty::NONE || matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..)) {
             return None;
         }
-        let (root, mut path) = self.move_path(base).or_else(|| (!self.is_place(base)).then(|| (Root::Temp(base), Vec::new())))?;
+        let (root, mut path) = self.move_path(base)
+            .or_else(|| self.boxed_deref_path(base))
+            .or_else(|| (!self.is_place(base)).then(|| (Root::Temp(base), Vec::new())))?;
         let mut ty = self.ty_of(base);
         while let Some(owned) = self.cx.boxed(ty) {
             path.push(BOX_STEP);
@@ -56,18 +58,28 @@ impl Lower<'_, '_> {
         Some((root, path))
     }
 
+    fn boxed_deref_path(&self, mut expr: ExprId) -> Option<(Root, MovePath)> {
+        while let Some(inner) = self.transparent(expr) {
+            expr = inner;
+        }
+        let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(expr) else {
+            return None;
+        };
+        if self.typed.derefs.contains_key(&(expr, 0)) || self.cx.boxed(self.ty_of(operand)).is_none() {
+            return None;
+        }
+        let (root, mut path) = self.scrutinee_path(operand)?;
+        path.push(BOX_STEP);
+        Some((root, path))
+    }
+
     /// The root and path whose value a pattern matched against `scrutinee` takes parts of: the temporary that holds a coerced value.
     pub fn scrutinee_path(&self, scrutinee: ExprId) -> Option<(Root, MovePath)> {
         if self.typed.coercions.contains_key(&scrutinee) {
             return Some((Root::Temp(scrutinee), Vec::new()));
         }
-        if let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(scrutinee)
-            && let Some(inner) = self.cx.boxed(self.ty_of(operand))
-            && matches!(self.cx.types.kind(inner), Kind::Array(..))
-        {
-            let (root, mut path) = self.move_path(operand)?;
-            path.push(BOX_STEP);
-            return Some((root, path));
+        if let Some(boxed) = self.boxed_deref_path(scrutinee) {
+            return Some(boxed);
         }
         self.move_path(scrutinee).or_else(|| (!self.is_place(scrutinee)).then(|| (Root::Temp(scrutinee), Vec::new())))
     }
@@ -124,6 +136,7 @@ impl Lower<'_, '_> {
             let mut each = |lower: &mut Self, path: Option<(Root, MovePath)>| lower.add_path(&mut found, path);
             match *self.body.expr(expr) {
                 Expr::Field(..) | Expr::TupleField(..) if self.typed.exprs[at as usize] != Ty::NONE && needs_drop(self.cx, self.ty_of(expr))? => each(self, self.move_path(expr)),
+                Expr::Call(callee, _) if self.typed.exprs[callee.0 as usize] != Ty::NONE && self.cx.closure_consumes(self.ty_of(callee)) => each(self, self.scrutinee_path(callee)),
                 Expr::Match(scrutinee, arms) => {
                     for arm in self.body.list(arms).to_vec() {
                         let pat = self.body.arms[arm as usize].pat;
@@ -131,6 +144,28 @@ impl Lower<'_, '_> {
                     }
                 }
                 Expr::Let(pat, init) => self.pattern_paths(pat, self.scrutinee_path(init), &mut found)?,
+                Expr::Struct { fields, base: Some(base_expr), .. } if self.typed.exprs[at as usize] != Ty::NONE => {
+                    if let Some(Res::Ctor(_, variant, _)) = self.typed.res.get(&expr).cloned()
+                        && let Some((root, base_path)) = self.scrutinee_path(base_expr)
+                    {
+                        let types = self.variant_field_types(self.ty_of(expr), variant)?;
+                        let mut explicit = vec![false; types.len()];
+                        for f in self.body.list(fields) {
+                            if let Some(&idx) = self.typed.inits.get(&self.body.fields[*f as usize].value)
+                                && (idx as usize) < explicit.len()
+                            {
+                                explicit[idx as usize] = true;
+                            }
+                        }
+                        for (idx, &field_ty) in types.iter().enumerate() {
+                            if !explicit[idx] && needs_drop(self.cx, field_ty)? {
+                                let mut path = base_path.clone();
+                                path.push((variant, idx as u32));
+                                self.add_path(&mut found, Some((root, path)));
+                            }
+                        }
+                    }
+                }
                 Expr::Closure { .. } if let Some(closure) = self.typed.closures.get(&expr).cloned() => {
                     for cap in &closure.captures {
                         if cap.by == crate::sema::infer::By::Value && !cap.path.is_empty() {

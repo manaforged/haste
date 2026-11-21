@@ -511,14 +511,10 @@ impl Lower<'_, '_> {
 
     /// The index of the reached instance of `item` at `substs`.
     pub(super) fn reached_index(&self, item: ItemRef, substs: Substs) -> Result<usize> {
-        let instance = (item, substs);
-        if let Some(&index) = self.reached.index.get(&instance)
-            && !self.reached.is_untyped(index)
-        {
-            return Ok(index);
+        match self.try_reached_index(item, substs)? {
+            Some(index) => Ok(index),
+            None => bail!("a use of `{}` that was not reached", self.cx.name(item)),
         }
-        self.slots.want(instance);
-        bail!("a use of `{}` that was not reached", self.cx.name(item))
     }
 
     /// The code address of reached function `index`, read from its call table entry.
@@ -626,27 +622,41 @@ impl Lower<'_, '_> {
         let Some(test) = self.expr(cond)? else {
             return Ok(None);
         };
+        let cond_end = self.owned.len();
         let (then_block, else_block) = (self.b.create_block(), self.b.create_block());
         let (join, joined, slot) = match otherwise {
             Some(_) => self.join_block(expr)?,
             None => (self.b.create_block(), None, None),
         };
         self.brif(test, (then_block, &[]), (else_block, &[]));
+        let cond_owned = self.owned[mark..cond_end].to_vec();
         self.enter(then_block);
         let value = self.expr(then)?;
         let value = self.snapshot_before_drops(mark, then, value)?;
         if self.open {
-            self.drop_to(mark)?;
+            self.end_scope(mark)?;
+        } else {
+            self.owned.truncate(mark);
         }
         self.branch_into(value, (join, slot));
+        let else_mark = self.owned.len();
+        self.owned.extend(cond_owned);
         self.enter(else_block);
-        self.drop_to(mark)?;
+        self.drop_to(else_mark)?;
+        self.owned.truncate(else_mark);
         let value = match otherwise {
-            Some(otherwise) => self.expr(otherwise)?,
+            Some(otherwise) => {
+                let value = self.expr(otherwise)?;
+                self.snapshot_before_drops(else_mark, otherwise, value)?
+            }
             None => None,
         };
+        if self.open {
+            self.end_scope(else_mark)?;
+        } else {
+            self.owned.truncate(else_mark);
+        }
         self.branch_into(value, (join, slot));
-        self.owned.truncate(mark);
         self.enter(join);
         Ok(self.joined(joined, slot))
     }

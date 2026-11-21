@@ -56,13 +56,42 @@ enum Life {
 }
 
 impl Lower<'_, '_> {
+    /// Whether runtime checks and drops should emit real panic/unwind paths rather than hardware traps.
+    pub(super) fn should_unwind(&self) -> bool {
+        self.overflow_checks || crate::profile() != crate::outline::tree::Profile::Release || self.reached.has_catch_unwind(self.cx)
+    }
+
+    /// Whether constructing fields should register per-field unwind drop guards while evaluating later fields.
+    pub(super) fn wants_field_unwind(&self) -> Result<bool> {
+        Ok(self.open && self.resume.is_none() && self.should_unwind() && self.body_may_unwind()?)
+    }
+
+    /// Pushes an unwind drop guard for a partially constructed field or element of `ty` at `place`.
+    pub(super) fn push_field_unwind(&mut self, ty: Ty, place: Option<Place>, expr: ExprId) -> Result<Option<StackSlot>> {
+        if !self.open || !needs_drop(self.cx, ty)? {
+            return Ok(None);
+        }
+        self.push_unwind_origin(super::reloc::TyOrigin::Expr(expr), ty, place, true).map(Some)
+    }
+
+    /// Disarms and pops temporary unwind drop guards once the owning aggregate is fully constructed.
+    pub(super) fn disarm_unwind(&mut self, guards: Vec<StackSlot>) {
+        if !self.open {
+            return;
+        }
+        for slot in guards.into_iter().rev() {
+            self.set_active(slot, true, false);
+            self.pop_unwind(slot);
+        }
+    }
+
     /// Takes ownership of the value of `ty` at `place` for `root`, when dropping it runs code, and marks it present when `init` holds.
     pub fn own(&mut self, root: Root, ty: Ty, place: Option<Place>, init: bool) -> Result<()> {
         if !needs_drop(self.cx, ty)? {
             return Ok(());
         }
         let paths = self.moved.get(&root).cloned().unwrap_or_default();
-        let want_unwind = self.open && self.resume.is_none() && self.reached.has_catch_unwind(self.cx) && self.body_may_unwind()?;
+        let want_unwind = self.open && self.resume.is_none() && self.should_unwind() && self.body_may_unwind()?;
         let into_box = paths.iter().any(|path| path.contains(&BOX_STEP));
         let (flag, unwind, parts) = if want_unwind && (paths.is_empty() || (!into_box && has_drop_impl(self.cx, ty)?)) {
             (self.push_unwind(root, ty, place, init)?, true, Vec::new())
@@ -582,7 +611,7 @@ impl Lower<'_, '_> {
     }
 
     fn drop_with_parts(&mut self, ty: Ty, target: Value, origin: super::reloc::TyOrigin, (item, substs): (crate::names::ItemRef, crate::sema::substs::Substs)) -> Result<()> {
-        let want_unwind = self.open && self.reached.has_catch_unwind(self.cx);
+        let want_unwind = self.open && self.should_unwind();
         let variants = if want_unwind { self.adt_variants(ty)? } else { None };
         let Some(variants) = variants else {
             self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;

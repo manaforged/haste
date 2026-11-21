@@ -624,7 +624,10 @@ impl<'l, 'a> Lower<'l, 'a> {
         let mark = self.owned.len();
         match stmt {
             Stmt::Let { pat, init, otherwise: None, .. } => self.let_stmt(pat, init)?,
-            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => self.let_else(pat, init, otherwise)?,
+            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => {
+                self.extend_let(pat, init);
+                self.let_else(pat, init, otherwise)?;
+            }
             Stmt::Expr(expr, _) => self.discard(expr)?,
             Stmt::Item(..) | Stmt::Empty => {}
             other => bail!("cannot lower statement {other:?} yet"),
@@ -657,7 +660,7 @@ impl<'l, 'a> Lower<'l, 'a> {
         if self.open && self.uninit_call(init) && self.can_declare_uninit_val(pat) && !self.typed.coercions.contains_key(&init) {
             return self.declare_binding(pat, true);
         }
-        self.extend(init);
+        self.extend_let(pat, init);
         let unboxed = self.moves_whole_box(pat, init)?;
         let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };
         if !self.open {
@@ -690,14 +693,60 @@ impl<'l, 'a> Lower<'l, 'a> {
         }
     }
 
+    fn extend_let(&mut self, pat: PatId, init: ExprId) {
+        self.extend(init);
+        if self.pat_binds_ref(pat) {
+            self.extend_place(init);
+        }
+    }
+
+    fn pat_binds_ref(&self, pat: PatId) -> bool {
+        match *self.body.pat(pat) {
+            Pat::Bind { by_ref, sub, .. } => by_ref || self.typed.ref_binds.contains_key(&pat) || sub.is_some_and(|sub| self.pat_binds_ref(sub)),
+            Pat::Paren(inner) => self.pat_binds_ref(inner),
+            Pat::Tuple(list) | Pat::TupleStruct(_, list) | Pat::Slice(list) | Pat::Or(list) => {
+                self.body.list(list).iter().any(|&at| self.pat_binds_ref(PatId(at)))
+            }
+            Pat::Struct { fields, .. } => self.body.list(fields).iter().any(|&at| self.pat_binds_ref(self.body.field_pats[at as usize].pat)),
+            _ => false,
+        }
+    }
+
+    fn extend_place(&mut self, mut expr: ExprId) {
+        loop {
+            self.extended.insert(expr);
+            match *self.body.expr(expr) {
+                Expr::Paren(inner)
+                | Expr::Field(inner, _)
+                | Expr::TupleField(inner, _)
+                | Expr::Index(inner, _)
+                | Expr::Unary(crate::body::UnOp::Deref, inner) => expr = inner,
+                Expr::Block { stmts, tail: Some(tail), .. } if self.body.list(stmts).is_empty() => expr = tail,
+                _ => break,
+            }
+        }
+    }
+
     fn extend(&mut self, expr: ExprId) {
         match *self.body.expr(expr) {
             Expr::Ref { expr: inner, .. } => {
-                self.extended.insert(inner);
+                self.extend_place(inner);
                 self.extend(inner);
             }
             Expr::Paren(inner) | Expr::Cast(inner, _) => self.extend(inner),
             Expr::Block { tail: Some(tail), .. } => self.extend(tail),
+            Expr::If(_, then, otherwise) => {
+                self.extend(then);
+                if let Some(otherwise) = otherwise {
+                    self.extend(otherwise);
+                }
+            }
+            Expr::Match(_, arms) => self.body.list(arms).to_vec().into_iter().for_each(|at| self.extend(self.body.arms[at as usize].body)),
+            Expr::Call(callee, args)
+                if self.body.names_callee(callee) && matches!(self.typed.res.get(&callee), Some(crate::sema::infer::Res::Ctor(..))) =>
+            {
+                self.body.list(args).to_vec().into_iter().for_each(|arg| self.extend(ExprId(arg)));
+            }
             Expr::Tuple(list) | Expr::Array(list) => self.body.list(list).to_vec().into_iter().for_each(|item| self.extend(ExprId(item))),
             Expr::Struct { fields, .. } => self.body.list(fields).to_vec().into_iter().for_each(|at| self.extend(self.body.fields[at as usize].value)),
             _ => {}

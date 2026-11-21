@@ -437,11 +437,31 @@ impl Lower<'_, '_> {
 
     /// Lowers the expressions `list` into a new frame slot as a tuple of type `ty`, and returns its value.
     pub(super) fn tuple_of(&mut self, ty: Ty, list: List) -> Result<Option<Value>> {
-        let mut values = Vec::new();
-        for &item in self.body.list(list).to_vec().iter() {
-            values.push(self.eval_operand(ExprId(item))?);
+        let whole = repr(self.cx, ty)?;
+        let Kind::Tuple(items) = *self.cx.types.kind(ty) else { bail!("a tuple of a type that is not a tuple") };
+        let items = self.cx.types.substs(items).to_vec();
+        let slot = self.slot(whole);
+        let unwind = self.wants_field_unwind()?;
+        let mut guards = Vec::new();
+        for (index, item) in self.body.list(list).to_vec().into_iter().enumerate() {
+            let item = ExprId(item);
+            let value = self.eval_operand(item)?;
+            let field_ty = items[index];
+            let field = repr(self.cx, field_ty)?;
+            let offset = self.field_offset(ty, index as u32)?;
+            let part = slot.map(|slot| Place::slot(slot, whole).at(offset, field));
+            if let (Some(place), Some(value)) = (part, value) {
+                self.write(place, value);
+            }
+            if unwind && let Some(guard) = self.push_field_unwind(field_ty, part, item)? {
+                guards.push(guard);
+            }
         }
-        self.tuple_from(ty, values)
+        self.disarm_unwind(guards);
+        if !self.open {
+            return Ok(None);
+        }
+        Ok(slot.and_then(|slot| self.read(Place::slot(slot, whole))))
     }
 
     /// Lowers the compiler-made `Clone::clone` of a tuple: each field of the referenced tuple cloned through its call in `calls`, into a new tuple.

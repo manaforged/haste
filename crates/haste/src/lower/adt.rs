@@ -265,17 +265,100 @@ impl Lower<'_, '_> {
             return Ok(Some(addr));
         }
         let Some(Res::Ctor(_, variant, _)) = self.typed.res.get(&expr).cloned() else { bail!("struct literal has no constructor") };
-        let mut values = Vec::new();
+        let ty = self.ty_of(expr);
+        let types = self.variant_field_types(ty, variant)?;
+        let mut pairs = Vec::new();
         for at in self.body.list(fields).to_vec() {
             let init = self.body.fields[at as usize];
             let Some(&index) = self.typed.inits.get(&init.value) else { bail!("field initializer has no field") };
-            values.push((index, self.eval_operand(init.value)?));
+            let Some(&field_ty) = types.get(index as usize) else { bail!("variant {variant} has no field {index}") };
+            pairs.push((index, init.value, field_ty));
         }
-        let base = match base {
-            Some(base) => self.eval_operand(base)?,
-            None => None,
+        let Some(base_expr) = base else {
+            return self.construct_eval(ty, variant, &pairs);
         };
-        self.construct(self.ty_of(expr), variant, values, base)
+        let unwind = self.wants_field_unwind()?;
+        let mut guards = Vec::new();
+        let mut values = Vec::with_capacity(pairs.len());
+        let mut explicit = vec![false; types.len()];
+        for (index, val_expr, field_ty) in pairs {
+            explicit[index as usize] = true;
+            let value = self.eval_operand(val_expr)?;
+            if !self.open {
+                return Ok(None);
+            }
+            if unwind && crate::sema::infer::needs_drop(self.cx, field_ty)? {
+                let spilled = self.spill(value, field_ty)?;
+                if let Some(guard) = self.push_field_unwind(field_ty, spilled, val_expr)? {
+                    guards.push(guard);
+                }
+                values.push((index, spilled.and_then(|place| self.read(place))));
+            } else {
+                values.push((index, value));
+            }
+        }
+        let base_val = self.place_or_temp(base_expr)?.and_then(|place| self.read(place));
+        if !self.open {
+            return Ok(None);
+        }
+        let result = self.construct(ty, variant, values, base_val)?;
+        if let Some((root, path)) = self.scrutinee_path(base_expr) {
+            for (index, &field_ty) in types.iter().enumerate() {
+                if !explicit[index] && crate::sema::infer::needs_drop(self.cx, field_ty)? {
+                    let mut field_path = path.clone();
+                    field_path.push((variant, index as u32));
+                    self.moved_out(root, &field_path)?;
+                }
+            }
+        }
+        self.disarm_unwind(guards);
+        Ok(result)
+    }
+
+    pub(super) fn variant_field_types(&mut self, ty: Ty, variant: u32) -> Result<Vec<Ty>> {
+        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
+        let slice = self.cx.types.substs(args).to_vec();
+        Ok(field_types(self.cx, item, &slice)?[variant as usize].clone())
+    }
+
+    fn construct_eval(&mut self, ty: Ty, variant: u32, fields: &[(u32, ExprId, Ty)]) -> Result<Option<Value>> {
+        let unwind = self.wants_field_unwind()?;
+        if !unwind || fields.len() <= 1 {
+            let mut values = Vec::with_capacity(fields.len());
+            for &(index, val_expr, _) in fields {
+                values.push((index, self.eval_operand(val_expr)?));
+            }
+            return self.construct(ty, variant, values, None);
+        }
+        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
+        let whole = repr(self.cx, ty)?;
+        let slot = self.slot(whole);
+        let layout = self.cx.layout(ty)?;
+        let mut guards = Vec::new();
+        for &(index, val_expr, field_ty) in fields {
+            let value = self.eval_operand(val_expr)?;
+            if !self.open {
+                return Ok(None);
+            }
+            let part = slot.map(|slot| repr(self.cx, field_ty).map(|field| Place::slot(slot, whole).at(field_offset(&layout, variant, index), field))).transpose()?;
+            if let (Some(place), Some(value)) = (part, value) {
+                self.write(place, value);
+            }
+            if let Some(guard) = self.push_field_unwind(field_ty, part, val_expr)? {
+                guards.push(guard);
+            }
+        }
+        if !self.open {
+            return Ok(None);
+        }
+        let Some(slot) = slot else {
+            self.disarm_unwind(guards);
+            return Ok(None);
+        };
+        let place = Place::slot(slot, whole);
+        self.set_tag(place, item, &layout, variant)?;
+        self.disarm_unwind(guards);
+        Ok(self.read(place))
     }
 
     /// Lowers the body of a constructor function: variant `variant` of the return type, built from the parameters.
@@ -294,11 +377,10 @@ impl Lower<'_, '_> {
         if let Some(addr) = self.materialize_const_expr(expr, (true, false))? {
             return Ok(Some(addr));
         }
-        let mut values = Vec::new();
-        for (index, at) in self.body.list(args).to_vec().into_iter().enumerate() {
-            values.push((index as u32, self.eval_operand(ExprId(at))?));
-        }
-        self.construct(self.ty_of(expr), variant, values, None)
+        let ty = self.ty_of(expr);
+        let types = self.variant_field_types(ty, variant)?;
+        let pairs: Vec<(u32, ExprId, Ty)> = self.body.list(args).to_vec().into_iter().enumerate().map(|(i, at)| (i as u32, ExprId(at), types[i])).collect();
+        self.construct_eval(ty, variant, &pairs)
     }
 }
 
