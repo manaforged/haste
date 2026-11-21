@@ -114,8 +114,12 @@ pub fn serve(_workspace: &mut graph::Workspace, _targets: &Targets, _root: &std:
     bail!("haste serve requires Unix domain sockets")
 }
 
+#[cfg(not(unix))]
+/// Spawns a detached idle-timed background server for `root` when supported.
+pub fn spawn(_root: &std::path::Path, _request: Request, _out: Option<&Path>) {}
+
 #[cfg(unix)]
-pub use unix_ipc::{ask, serve};
+pub use unix_ipc::{ask, serve, spawn};
 
 #[cfg(unix)]
 mod unix_ipc {
@@ -125,6 +129,8 @@ fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     root.hash(&mut hasher);
+    crate::graph::store::home().hash(&mut hasher);
+    crate::graph::store::program().hash(&mut hasher);
     (crate::profile() == Profile::Release).hash(&mut hasher);
     crate::prep::prepared().hash(&mut hasher);
     crate::selection().hash(&mut hasher);
@@ -194,7 +200,7 @@ fn connect(root: &std::path::Path) -> Result<Option<RawFd>> {
     let fd = socket()?;
     let (addr, len) = address(root);
     // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
-    if unsafe { libc::connect(fd, (&raw const addr).cast(), len) } != 0 {
+    if unsafe { libc::connect(fd, (&raw const addr).cast(), len) } != 0 || !same_user(fd) {
         close_all(&[fd]);
         return Ok(None);
     }
@@ -219,16 +225,114 @@ pub fn ask(root: &std::path::Path, request: Request, out: Option<&Path>, args: &
     Ok(Some(i32::from_le_bytes(status)))
 }
 
-/// Loads `workspace` once, then answers requests until the process is killed, loading it again when its lock file or a local manifest changes.
+/// Spawns a detached background `serve` daemon for `root` with an idle timeout.
+pub fn spawn(root: &std::path::Path, request: Request, out: Option<&Path>) {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = Command::new(exe);
+    cmd.arg("serve").arg(root);
+    let sel = crate::selection();
+    for (flag, on) in [
+        ("--release", crate::profile() == Profile::Release),
+        ("--prepared", crate::prep::prepared()),
+        ("--all-features", sel.all_features),
+        ("--no-default-features", sel.no_default_features),
+        ("--ignored", sel.ignored_only),
+        ("--include-ignored", sel.include_ignored),
+    ] {
+        if on {
+            cmd.arg(flag);
+        }
+    }
+    for (flag, val) in [("-p", sel.package.as_deref()), ("--bin", sel.bin.as_deref()), ("--example", sel.example.as_deref())] {
+        if let Some(val) = val {
+            cmd.arg(flag).arg(val);
+        }
+    }
+    if !sel.features.is_empty() {
+        cmd.arg("-F").arg(sel.features.join(","));
+    }
+    if std::env::var_os("HASTE_SERVE_IDLE_SECS").is_none() {
+        cmd.env("HASTE_SERVE_IDLE_SECS", "120");
+    }
+    cmd.env("HASTE_NO_DAEMON", "1");
+    match (request, out) {
+        (Request::Build, None) => drop(cmd.env("HASTE_SERVE_WARM", "build")),
+        (Request::Test, _) => drop(cmd.env("HASTE_SERVE_TEST", "1").env("HASTE_SERVE_WARM", "test")),
+        _ => {}
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // SAFETY: setsid takes no pointers and detaches the child into a new session before exec.
+    unsafe {
+        cmd.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    drop(cmd.spawn());
+}
+
+fn idle_timeout_ms() -> Option<i32> {
+    let secs: u64 = std::env::var_os("HASTE_SERVE_IDLE_SECS")?.to_str()?.parse().ok()?;
+    Some(secs.saturating_mul(1000).min(i32::MAX as u64) as i32)
+}
+
+fn wait_connection(listener: RawFd, timeout_ms: i32) -> Result<bool> {
+    loop {
+        let mut pfd = libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 };
+        // SAFETY: pfd is one live pollfd entry for the listening socket.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+        if rc > 0 {
+            return Ok(true);
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            bail!("poll: {err}");
+        }
+    }
+}
+
+fn unlink_addr(addr: &libc::sockaddr_un) {
+    if !cfg!(target_os = "linux") {
+        // SAFETY: sun_path is NUL-terminated, since address leaves its last byte zero.
+        unsafe { libc::unlink(addr.sun_path.as_ptr()) };
+    }
+}
+
+/// Loads `workspace` once, then answers requests until the process is killed or `HASTE_SERVE_IDLE_SECS` elapses, loading it again when its lock file or a local manifest changes.
 pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::path::Path) -> Result<()> {
     let listener = listen(root)?;
     let started = Instant::now();
     let mut build = Some(Build::load(workspace, targets)?);
+    if let Some(ref mut warm) = build {
+        match std::env::var_os("HASTE_SERVE_WARM").as_deref().and_then(|v| v.to_str()) {
+            Some("build") => drop(warm.compile_binary(workspace)),
+            Some("test") => drop(warm.compile_cases(workspace)),
+            _ => {}
+        }
+    }
     let manifests = Served::manifests(workspace, root);
     let watched = watched_stamps(workspace);
     let mut served = Served { root, targets, workspace, manifests, watched };
+    let idle_ms = idle_timeout_ms();
     eprintln!("serving {} after {:.1} ms", root.display(), started.elapsed().as_secs_f64() * 1e3);
     loop {
+        if let Some(timeout_ms) = idle_ms {
+            match wait_connection(listener, timeout_ms) {
+                Ok(true) => {}
+                Ok(false) => {
+                    unlink_addr(&address(root).0);
+                    close_all(&[listener]);
+                    return Ok(());
+                }
+                Err(err) => {
+                    unlink_addr(&address(root).0);
+                    close_all(&[listener]);
+                    return Err(err);
+                }
+            }
+        }
         // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
         let fd = unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
         if fd < 0 || crate::image::close_on_exec(fd).is_err() {
@@ -279,9 +383,8 @@ fn listen(root: &std::path::Path) -> Result<RawFd> {
     let fd = socket()?;
     let (addr, len) = address(root);
     let answered = connect(root)?.inspect(|fd| close_all(&[*fd])).is_some();
-    if !cfg!(target_os = "linux") && !answered {
-        // SAFETY: sun_path is NUL-terminated, since address leaves its last byte zero; no server answers on it.
-        unsafe { libc::unlink(addr.sun_path.as_ptr()) };
+    if !answered {
+        unlink_addr(&addr);
     }
     // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
     if unsafe { libc::bind(fd, (&raw const addr).cast(), len) } != 0 {
