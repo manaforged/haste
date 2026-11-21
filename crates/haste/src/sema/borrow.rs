@@ -11,11 +11,25 @@ use super::Context;
 use super::infer::{Res, Typed};
 use super::ty::{Kind, Mut};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FieldKey {
+    Named(String),
+    Tuple(u32),
+}
+
 #[derive(Clone, Debug)]
 struct Loan {
     target: u32,
+    field: Option<FieldKey>,
     holder: Option<u32>,
     mutable: bool,
+}
+
+fn fields_conflict(a: &Option<FieldKey>, b: &Option<FieldKey>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -30,6 +44,7 @@ struct State {
 struct Checker<'c, 'a> {
     types: &'a super::ty::Types,
     body: &'c Body,
+    src: &'c Source,
     typed: &'c Typed,
     mutable: Vec<bool>,
     is_copy: Vec<bool>,
@@ -105,7 +120,7 @@ pub(super) fn check(cx: &mut Context<'_>, item: ItemRef, (body, sig): (&Body, &c
         }
     }
     let returns_ref = typed.ret.is_some_and(|ty| matches!(cx.types.kind(ty), Kind::Ref(..)));
-    let checker = Checker { types: &cx.types, body, typed, mutable, is_copy, is_param, names, deref_non_copy, returns_ref };
+    let checker = Checker { types: &cx.types, body, src, typed, mutable, is_copy, is_param, names, deref_non_copy, returns_ref };
     let mut state = State { init, moved: vec![false; n], loans: Vec::new(), borrows_local: vec![false; n], diverged: false };
     checker.check_expr(root, &mut state, false)?;
     if checker.returns_ref && !state.diverged {
@@ -134,22 +149,33 @@ impl Checker<'_, '_> {
     }
 
     fn root_local(&self, expr: ExprId) -> Option<(u32, bool)> {
+        self.root_place(expr).map(|(local, through_ref, _)| (local, through_ref))
+    }
+
+    fn root_place(&self, expr: ExprId) -> Option<(u32, bool, Option<FieldKey>)> {
         match *self.body.expr(expr) {
-            Expr::Paren(inner) => self.root_local(inner),
+            Expr::Paren(inner) => self.root_place(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
-                Some(Res::Local(local)) => Some((*local, false)),
+                Some(Res::Local(local)) => Some((*local, false, None)),
                 _ => None,
             },
-            Expr::Field(base, _) | Expr::TupleField(base, _) => {
-                let (local, through_ref) = self.root_local(base)?;
+            Expr::Field(base, name) => {
+                let (local, through_ref, field) = self.root_place(base)?;
                 let deref = matches!(self.typed.exprs.get(base.0 as usize).copied(), Some(ty) if ty != super::ty::Ty::NONE && self.is_ref_or_ptr_expr(base));
-                Some((local, through_ref || deref))
+                let first = field.or_else(|| (!through_ref && !deref).then(|| FieldKey::Named(self.src.text(name).to_owned())));
+                Some((local, through_ref || deref, first))
+            }
+            Expr::TupleField(base, idx) => {
+                let (local, through_ref, field) = self.root_place(base)?;
+                let deref = matches!(self.typed.exprs.get(base.0 as usize).copied(), Some(ty) if ty != super::ty::Ty::NONE && self.is_ref_or_ptr_expr(base));
+                let first = field.or_else(|| (!through_ref && !deref).then_some(FieldKey::Tuple(idx)));
+                Some((local, through_ref || deref, first))
             }
             Expr::Index(base, _) => {
-                let (local, _) = self.root_local(base)?;
-                Some((local, true))
+                let (local, _, field) = self.root_place(base)?;
+                Some((local, true, field))
             }
-            Expr::Unary(UnOp::Deref, inner) => self.root_local(inner).map(|(l, _)| (l, true)),
+            Expr::Unary(UnOp::Deref, inner) => self.root_place(inner).map(|(l, _, f)| (l, true, f)),
             _ => None,
         }
     }
@@ -211,45 +237,45 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    fn check_can_mutate(&self, local: u32, through_ref: bool, state: &State, init_ok: bool) -> Result<()> {
+    fn check_can_mutate(&self, local: u32, through_ref: bool, field: &Option<FieldKey>, state: &State, init_ok: bool) -> Result<()> {
         if !through_ref && !self.mutable.get(local as usize).copied().unwrap_or(true) && !(init_ok && !state.init.get(local as usize).copied().unwrap_or(true)) {
             bail!("cannot assign to immutable variable `{}`", self.local_name(local));
         }
-        if !through_ref && state.loans.iter().any(|l| l.target == local) {
+        if !through_ref && state.loans.iter().any(|l| l.target == local && fields_conflict(&l.field, field)) {
             bail!("cannot assign to `{}` because it is borrowed", self.local_name(local));
         }
         Ok(())
     }
 
-    fn check_borrow(&self, local: u32, through_ref: bool, mutable: bool, state: &State) -> Result<()> {
+    fn check_borrow(&self, local: u32, through_ref: bool, field: &Option<FieldKey>, mutable: bool, state: &State) -> Result<()> {
         self.check_not_moved(local, state)?;
         if mutable && !through_ref && !self.mutable.get(local as usize).copied().unwrap_or(true) {
             bail!("cannot borrow `{}` as mutable, as it is not declared as mutable", self.local_name(local));
         }
         if !through_ref {
-            if mutable && state.loans.iter().any(|l| l.target == local && l.mutable) {
+            if mutable && state.loans.iter().any(|l| l.target == local && l.mutable && fields_conflict(&l.field, field)) {
                 bail!("cannot borrow `{}` as mutable more than once at a time", self.local_name(local));
             }
-            if mutable && state.loans.iter().any(|l| l.target == local) {
+            if mutable && state.loans.iter().any(|l| l.target == local && fields_conflict(&l.field, field)) {
                 bail!("cannot borrow `{}` as mutable because it is also borrowed as immutable", self.local_name(local));
             }
-            if !mutable && state.loans.iter().any(|l| l.target == local && l.mutable) {
+            if !mutable && state.loans.iter().any(|l| l.target == local && l.mutable && fields_conflict(&l.field, field)) {
                 bail!("cannot borrow `{}` as immutable because it is also borrowed as mutable", self.local_name(local));
             }
         }
         Ok(())
     }
 
-    fn expr_borrow_source(&self, expr: ExprId, state: &State) -> Option<(u32, bool)> {
+    fn expr_borrow_source(&self, expr: ExprId, state: &State) -> Option<(u32, Option<FieldKey>, bool)> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => self.expr_borrow_source(inner, state),
             Expr::Ref { mutable, raw: false, expr: inner } => {
-                let (local, through_ref) = self.root_local(inner)?;
-                (!through_ref).then_some((local, mutable))
+                let (local, through_ref, field) = self.root_place(inner)?;
+                (!through_ref).then_some((local, field, mutable))
             }
             Expr::Path(_) => {
                 let Some(Res::Local(local)) = self.typed.res.get(&expr) else { return None };
-                state.loans.iter().find(|l| l.holder == Some(*local)).map(|l| (l.target, l.mutable))
+                state.loans.iter().find(|l| l.holder == Some(*local)).map(|l| (l.target, l.field.clone(), l.mutable))
             }
             _ => None,
         }
@@ -278,7 +304,7 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn bind_pat(&self, pat: PatId, state: &mut State, borrow_src: Option<(u32, bool)>) {
+    fn bind_pat(&self, pat: PatId, state: &mut State, borrow_src: Option<(u32, Option<FieldKey>, bool)>) {
         match *self.body.pat(pat) {
             Pat::Bind { sub, .. } => {
                 if let Some(&local) = self.typed.binds.get(&pat)
@@ -287,8 +313,8 @@ impl Checker<'_, '_> {
                     state.init[local as usize] = true;
                     state.moved[local as usize] = false;
                     state.loans.retain(|l| l.holder != Some(local));
-                    if let Some((target, mutable)) = borrow_src {
-                        state.loans.push(Loan { target, holder: Some(local), mutable });
+                    if let Some((target, field, mutable)) = borrow_src {
+                        state.loans.push(Loan { target, field, holder: Some(local), mutable });
                         state.borrows_local[local as usize] = !self.is_param.get(target as usize).copied().unwrap_or(true);
                     } else {
                         state.borrows_local[local as usize] = false;
@@ -409,6 +435,43 @@ impl Checker<'_, '_> {
         }
     }
 
+    fn assign_place(&self, lhs: ExprId, state: &mut State, borrow_src: Option<(u32, Option<FieldKey>, bool)>) -> Result<()> {
+        if self.place_behind_shared_ref(lhs) {
+            bail!("cannot assign to data in a `&` reference");
+        }
+        match *self.body.expr(lhs) {
+            Expr::Paren(inner) => return self.assign_place(inner, state, borrow_src),
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for &elem in self.body.list(list) {
+                    self.assign_place(ExprId(elem), state, None)?;
+                }
+                return Ok(());
+            }
+            Expr::Struct { fields, .. } => {
+                for &f in self.body.list(fields) {
+                    self.assign_place(self.body.fields[f as usize].value, state, None)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        if let Some((local, through_ref, field)) = self.root_place(lhs) {
+            self.check_can_mutate(local, through_ref, &field, state, true)?;
+            if !through_ref && field.is_none() && (local as usize) < state.init.len() {
+                state.init[local as usize] = true;
+                state.moved[local as usize] = false;
+                state.loans.retain(|l| l.holder != Some(local));
+                if let Some((target, src_field, mutable)) = borrow_src {
+                    state.loans.push(Loan { target, field: src_field, holder: Some(local), mutable });
+                    state.borrows_local[local as usize] = !self.is_param.get(target as usize).copied().unwrap_or(true);
+                }
+            }
+        } else {
+            self.check_expr(lhs, state, true)?;
+        }
+        Ok(())
+    }
+
     fn check_expr(&self, expr: ExprId, state: &mut State, place_ctx: bool) -> Result<()> {
         if state.diverged {
             return Ok(());
@@ -430,40 +493,24 @@ impl Checker<'_, '_> {
                 if !raw && mutable && self.place_behind_shared_ref(inner) {
                     bail!("cannot borrow data in a `&` reference as mutable");
                 }
-                if !raw && let Some((local, through_ref)) = self.root_local(inner) {
-                    self.check_borrow(local, through_ref, mutable, state)?;
+                if !raw && let Some((local, through_ref, field)) = self.root_place(inner) {
+                    self.check_borrow(local, through_ref, &field, mutable, state)?;
                 }
                 self.check_expr(inner, state, true)?;
             }
             Expr::Assign(lhs, rhs) => {
                 self.check_expr(rhs, state, false)?;
-                if self.place_behind_shared_ref(lhs) {
-                    bail!("cannot assign to data in a `&` reference");
-                }
                 let borrow_src = self.expr_borrow_source(rhs, state);
-                if let Some((local, through_ref)) = self.root_local(lhs) {
-                    self.check_can_mutate(local, through_ref, state, true)?;
-                    if !through_ref && (local as usize) < state.init.len() {
-                        state.init[local as usize] = true;
-                        state.moved[local as usize] = false;
-                        state.loans.retain(|l| l.holder != Some(local));
-                        if let Some((target, mutable)) = borrow_src {
-                            state.loans.push(Loan { target, holder: Some(local), mutable });
-                            state.borrows_local[local as usize] = !self.is_param.get(target as usize).copied().unwrap_or(true);
-                        }
-                    }
-                } else {
-                    self.check_expr(lhs, state, true)?;
-                }
+                self.assign_place(lhs, state, borrow_src)?;
             }
             Expr::AssignOp(_, lhs, rhs) => {
                 self.check_expr(rhs, state, false)?;
                 if self.place_behind_shared_ref(lhs) {
                     bail!("cannot assign to data in a `&` reference");
                 }
-                if let Some((local, through_ref)) = self.root_local(lhs) {
+                if let Some((local, through_ref, field)) = self.root_place(lhs) {
                     self.check_not_moved(local, state)?;
-                    self.check_can_mutate(local, through_ref, state, false)?;
+                    self.check_can_mutate(local, through_ref, &field, state, false)?;
                 } else {
                     self.check_expr(lhs, state, true)?;
                 }
@@ -522,7 +569,7 @@ impl Checker<'_, '_> {
                 merge_branch(state, &then_state, &else_state);
             }
             Expr::Let(pat, init) => {
-                self.check_expr(init, state, false)?;
+                self.check_expr(init, state, true)?;
                 let src = self.expr_borrow_source(init, state);
                 self.bind_pat(pat, state, src);
             }
@@ -579,9 +626,15 @@ impl Checker<'_, '_> {
                     bail!("cannot borrow data in a `&` reference as mutable");
                 }
                 if let Some(mutability) = recv_borrow
-                    && let Some((local, through_ref)) = self.root_local(receiver)
+                    && let Some((local, through_ref, field)) = self.root_place(receiver)
                 {
-                    self.check_borrow(local, through_ref, mutability == Mut::Mut, state)?;
+                    let recv_is_mut_ref = self
+                        .typed
+                        .exprs
+                        .get(receiver.0 as usize)
+                        .copied()
+                        .is_some_and(|ty| ty != super::ty::Ty::NONE && matches!(self.types.kind(ty), Kind::Ref(Mut::Mut, _)));
+                    self.check_borrow(local, through_ref || recv_is_mut_ref, &field, mutability == Mut::Mut, state)?;
                     self.check_expr(receiver, state, true)?;
                 } else {
                     self.check_expr(receiver, state, recv_borrow.is_some())?;
@@ -670,8 +723,13 @@ impl Checker<'_, '_> {
                 self.bind_pat(p, &mut iter_state, None);
             }
             self.check_expr(body, &mut iter_state, false)?;
+            if iter_state.diverged {
+                break;
+            }
         }
-        join_moved(state, &iter_state);
+        if !iter_state.diverged {
+            join_moved(state, &iter_state);
+        }
         Ok(())
     }
 }
