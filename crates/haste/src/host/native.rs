@@ -128,7 +128,11 @@ fn open_libraries(libraries: &Libraries) -> Result<HashMap<Box<str>, usize>> {
         link(libraries, &path)?;
     }
     #[cfg(unix)]
-    let handle = open(&path, libc::RTLD_LAZY)?;
+    let handle = match open(&path, libc::RTLD_LAZY) {
+        Ok(handle) => handle,
+        Err(err) if err.to_string().contains("static TLS block") => return Ok(HashMap::default()),
+        Err(err) => return Err(err),
+    };
     #[cfg(not(unix))]
     let handle = open(&path, 0)?;
     table(handle)
