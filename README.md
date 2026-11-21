@@ -28,7 +28,7 @@ haste is experimental. There is no tagged release yet, and the command line can 
 ## Commands
 
 ```text
-haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] build|test|run|serve|prep [PATH] [--] [ARGS...]
+haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] build|test|run|serve|prep [PATH] [--] [ARGS...]
 haste clean
 haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]
 haste [--release] debug code PATH DIR
@@ -59,6 +59,7 @@ haste -V|--version | -h|--help
 - `--no-default-features`: Disables the `default` feature on the selected workspace packages.
 - `--ignored`: Runs only `#[ignore]` tests (`haste test` only).
 - `--include-ignored`: Runs both normal and `#[ignore]` tests (`haste test` only).
+- `--target TRIPLE`: Cross-compiles a standalone AOT executable (`haste build -o`) for any supported target triple (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`) without an external cross-linker.
 - `--jobs N`: Sets the worker thread or process count. Defaults to the cores available to the process.
 - `--release`: Enables full codegen optimization and release `cfg` settings.
 - `-o PATH`, `--output PATH`: Writes a standalone native executable (`haste build` only).
@@ -70,7 +71,8 @@ haste -V|--version | -h|--help
 
 ## Requirements and environment
 
-- Linux on x86-64 (`x86_64-unknown-linux-gnu`), Linux on ARM64 (`aarch64-unknown-linux-gnu`), or macOS on Apple Silicon (`aarch64-apple-darwin`).
+- Hosts: Linux (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`), macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), and Windows (`x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu`, `aarch64-pc-windows-msvc`; Windows runtime execution is experimental and `serve`/`--watch` require Unix).
+- AOT cross-compilation (`--target TRIPLE`): standalone ELF, Mach-O, and PE32+ executables for all six x86-64 and ARM64 Linux, macOS, and Windows targets.
 - Rust 1.88 or newer with the `rust-src` component installed (`rustup component add rust-src`).
 - On macOS, `codesign` (included with macOS / Xcode Command Line Tools) for ad-hoc signing standalone AOT executables.
 - A C compiler (`$CC`, defaulting to `cc`) when building workspaces that link native C libraries.
@@ -113,10 +115,10 @@ Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
 
 | Workload | haste --release | rustc -O3 | Ratio | Output |
 | --- | ---: | ---: | ---: | --- |
-| `sha256` (250k blocks) | 75 ms | 85 ms | 0.88x | exact match (`7333157476866902348`) |
-| `sort` (500k quicksort + bsearch) | 53 ms | 53 ms | 1.00x | exact match (`8647866321337317866`) |
-| `sieve` (4M primes) | 37 ms | 32 ms | 1.16x | exact match (`544501644261`) |
-| `scan` (JSON-like byte scanner) | 35 ms | 27 ms | 1.30x | exact match (`80005120000`) |
+| `sha256` (250k blocks) | 75 ms | 90 ms | 0.83x | exact match (`7333157476866902348`) |
+| `sort` (500k quicksort + bsearch) | 47 ms | 48 ms | 0.98x | exact match (`8647866321337317866`) |
+| `sieve` (4M primes) | 27 ms | 26 ms | 1.04x | exact match (`544501644261`) |
+| `scan` (JSON-like byte scanner) | 35 ms | 31 ms | 1.13x | exact match (`80005120000`) |
 
 ## Check against rustc
 
