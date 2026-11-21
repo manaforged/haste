@@ -9,23 +9,6 @@ haste_bin="${HASTE_BIN:-${CARGO_TARGET_DIR:-target}/release/haste}"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-now_ms() {
-    python3 -c 'import time; print(int(time.perf_counter() * 1000))'
-}
-
-median_ms() {
-    local rounds=$1; shift
-    local times=()
-    for ((i = 0; i < rounds; i++)); do
-        local t0 t1
-        t0=$(now_ms)
-        "$@" >/dev/null 2>&1
-        t1=$(now_ms)
-        times+=($((t1 - t0)))
-    done
-    printf '%s\n' "${times[@]}" | sort -n | sed -n "$(((rounds + 1) / 2))p"
-}
-
 echo "Host: $(uname -s) $(uname -m) | $(rustc --version)"
 echo
 
@@ -33,35 +16,6 @@ echo
 cp -R examples/hello "$tmp/hello"
 cp -R tests/diff "$tmp/diff"
 cp tests/case_inputs.rs "$tmp/case_inputs.rs"
-
-haste_home="$tmp/haste_home"
-cargo_target="$tmp/cargo_target"
-
-# Warm haste's stdlib substrate once (matches normal developer steady state)
-HASTE_HOME="$haste_home" "$haste_bin" build "$tmp/hello" >/dev/null 2>&1
-
-# Cold debug build (tests/diff, 124 fns / ~9,300 reached std+user fns)
-t0=$(now_ms); HASTE_HOME="$haste_home" "$haste_bin" build "$tmp/diff" >/dev/null 2>&1; t1=$(now_ms)
-h_diff_cold=$((t1 - t0))
-t0=$(now_ms); cargo build --quiet --locked --manifest-path "$tmp/diff/Cargo.toml" --target-dir "$cargo_target" >/dev/null 2>&1; t1=$(now_ms)
-c_diff_cold=$((t1 - t0))
-
-# Unchanged no-op build (median of 5)
-h_diff_noop=$(HASTE_HOME="$haste_home" median_ms 5 "$haste_bin" build "$tmp/diff")
-c_diff_noop=$(median_ms 5 cargo build --quiet --locked --manifest-path "$tmp/diff/Cargo.toml" --target-dir "$cargo_target")
-
-# Single-line edit rebuild (median of 3)
-h_edits=()
-c_edits=()
-for i in 1 2 3; do
-    printf '\n// edit %d\n' "$i" >> "$tmp/diff/src/main.rs"
-    t0=$(now_ms); HASTE_HOME="$haste_home" "$haste_bin" build "$tmp/diff" >/dev/null 2>&1; t1=$(now_ms)
-    h_edits+=($((t1 - t0)))
-    t0=$(now_ms); cargo build --quiet --locked --manifest-path "$tmp/diff/Cargo.toml" --target-dir "$cargo_target" >/dev/null 2>&1; t1=$(now_ms)
-    c_edits+=($((t1 - t0)))
-done
-h_diff_edit=$(printf '%s\n' "${h_edits[@]}" | sort -n | sed -n '2p')
-c_diff_edit=$(printf '%s\n' "${c_edits[@]}" | sort -n | sed -n '2p')
 
 # 2. CPU-bound AOT codegen benchmarks: haste --release vs rustc -C opt-level=3
 mkdir -p "$tmp/compute/src"
@@ -245,31 +199,102 @@ fn main() {
 }
 EOF
 
-HASTE_HOME="$haste_home" "$haste_bin" --release build -o "$tmp/compute_haste" "$tmp/compute" >/dev/null 2>&1
-rustc -C opt-level=3 --edition=2021 "$tmp/compute/src/main.rs" -o "$tmp/compute_rustc"
+python3 - "$tmp" "$haste_bin" <<'PYEOF'
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-echo "### Build Speed (\`tests/diff\`, 124 fns)"
-echo
-echo "| Benchmark | haste | cargo |"
-echo "| --- | ---: | ---: |"
-echo "| Single-line edit rebuild | ${h_diff_edit} ms | ${c_diff_edit} ms |"
-echo "| Unchanged no-op build | ${h_diff_noop} ms | ${c_diff_noop} ms |"
-echo "| Cold debug build | ${h_diff_cold} ms | ${c_diff_cold} ms |"
-echo
-echo "### AOT Codegen Runtime (\`haste --release\` vs \`rustc -C opt-level=3\`, median of 5)"
-echo
-echo "| Workload | haste --release | rustc -O3 | Ratio | Output |"
-echo "| --- | ---: | ---: | ---: | --- |"
+tmp, haste_bin = sys.argv[1], sys.argv[2]
+haste_home = os.path.join(tmp, "haste_home")
+cargo_target = os.path.join(tmp, "cargo_target")
+haste_env = {**os.environ, "HASTE_HOME": haste_home}
+cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")}
 
-for work in sha256 sieve sort scan; do
-    h_out=$("$tmp/compute_haste" "$work")
-    c_out=$("$tmp/compute_rustc" "$work")
-    if [ "$h_out" != "$c_out" ]; then
-        echo "MISMATCH on $work: haste=$h_out rustc=$c_out" >&2
-        exit 1
-    fi
-    h_ms=$(median_ms 5 "$tmp/compute_haste" "$work")
-    c_ms=$(median_ms 5 "$tmp/compute_rustc" "$work")
-    ratio=$(python3 -c "print(f'{$h_ms / max($c_ms, 1):.2f}x')")
-    echo "| \`$work\` | ${h_ms} ms | ${c_ms} ms | ${ratio} | exact match (\`$h_out\`) |"
-done
+def run_timed(cmd, env=None):
+    t0 = time.perf_counter()
+    subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return (time.perf_counter() - t0) * 1000.0
+
+def median_ms(rounds, cmd, env=None):
+    times = sorted(run_timed(cmd, env=env) for _ in range(rounds))
+    return times[len(times) // 2]
+
+def fmt_ms(ms):
+    if ms >= 100.0:
+        return f"{round(ms)} ms"
+    return f"{ms:.1f} ms"
+
+hello_dir = os.path.join(tmp, "hello")
+diff_dir = os.path.join(tmp, "diff")
+diff_manifest = os.path.join(diff_dir, "Cargo.toml")
+diff_main = Path(diff_dir) / "src" / "main.rs"
+haste_build_cmd = [haste_bin, "build", diff_dir]
+cargo_build_cmd = ["cargo", "build", "--quiet", "--locked", "--manifest-path", diff_manifest, "--target-dir", cargo_target]
+
+# Warm haste's stdlib substrate once (matches normal developer steady state)
+subprocess.run([haste_bin, "build", hello_dir], env=haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+# Cold debug build (tests/diff, 124 fns / ~9,300 reached std+user fns)
+h_diff_cold = run_timed(haste_build_cmd, env=haste_env)
+c_diff_cold = run_timed(cargo_build_cmd, env=cargo_env)
+
+# Unchanged no-op build (median of 5)
+h_diff_noop = median_ms(5, haste_build_cmd, env=haste_env)
+c_diff_noop = median_ms(5, cargo_build_cmd, env=cargo_env)
+
+# Single-line code edit rebuild (median of 3)
+orig_src = diff_main.read_text()
+needle = "(x + 3)"
+assert needle in orig_src, f"expected {needle!r} in {diff_main}"
+seed = int(time.time()) % 100_000
+prev_src = orig_src
+h_edits = []
+c_edits = []
+for i in range(1, 4):
+    new_src = orig_src.replace(needle, f"(x + {seed + i * 10})", 1)
+    assert new_src != prev_src
+    diff_main.write_text(new_src)
+    prev_src = new_src
+    h_edits.append(run_timed(haste_build_cmd, env=haste_env))
+    c_edits.append(run_timed(cargo_build_cmd, env=cargo_env))
+h_diff_edit = sorted(h_edits)[1]
+c_diff_edit = sorted(c_edits)[1]
+
+# Build AOT compute binaries
+compute_dir = os.path.join(tmp, "compute")
+compute_haste = os.path.join(tmp, "compute_haste")
+compute_rustc = os.path.join(tmp, "compute_rustc")
+subprocess.run([haste_bin, "--release", "build", "-o", compute_haste, compute_dir], env=haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+subprocess.run(["rustc", "-C", "opt-level=3", "--edition=2021", os.path.join(compute_dir, "src", "main.rs"), "-o", compute_rustc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+print("### Build Speed (`tests/diff`, 124 fns)")
+print()
+print("| Benchmark | haste | cargo | Speedup |")
+print("| --- | ---: | ---: | ---: |")
+for label, h_ms, c_ms in (
+    ("Single-line code edit rebuild", h_diff_edit, c_diff_edit),
+    ("Unchanged no-op build", h_diff_noop, c_diff_noop),
+    ("Cold debug build", h_diff_cold, c_diff_cold),
+):
+    speedup = f"{c_ms / max(h_ms, 1e-6):.1f}x"
+    print(f"| {label} | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {speedup} |")
+
+print()
+print("### AOT Codegen Runtime (`haste --release` vs `rustc -C opt-level=3`, median of 5)")
+print()
+print("| Workload | haste --release | rustc -O3 | Ratio | Output |")
+print("| --- | ---: | ---: | ---: | --- |")
+
+for work in ("sha256", "sieve", "sort", "scan"):
+    h_out = subprocess.run([compute_haste, work], capture_output=True, text=True, check=True).stdout.strip()
+    c_out = subprocess.run([compute_rustc, work], capture_output=True, text=True, check=True).stdout.strip()
+    if h_out != c_out:
+        print(f"MISMATCH on {work}: haste={h_out} rustc={c_out}", file=sys.stderr)
+        sys.exit(1)
+    h_ms = median_ms(5, [compute_haste, work])
+    c_ms = median_ms(5, [compute_rustc, work])
+    ratio = f"{h_ms / max(c_ms, 1e-6):.2f}x"
+    print(f"| `{work}` | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {ratio} | exact match (`{h_out}`) |")
+PYEOF

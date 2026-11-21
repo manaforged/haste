@@ -2,9 +2,9 @@
 
 haste is a clean-room Rust compiler, JIT engine, and standalone AOT compiler with its own frontend, SSA optimizer, and native x86-64 and ARM64 backends—built from scratch without LLVM or a `target/` directory.
 
-- **Self-hosting:** Compiles and runs its own ~174k-function workspace on both macOS ARM64 and Linux x86-64.
-- **Beats `rustc -C opt-level=3` on AOT compute kernels** (`scripts/bench.sh`, macOS ARM64, with bit-identical outputs): `sha256` **0.87x**, `sieve` **0.96x**, `sort` **1.00x**, `scan` **1.18x**.
-- **Faster than `cargo` on all 3 build benchmarks** (`tests/diff`, 124 functions): single-line edit rebuild **`27 ms`** vs `cargo` `39 ms` (**1.44x faster**), unchanged no-op **`25 ms`** vs `41 ms` (**1.64x faster**), and cold debug **`199 ms`** vs `218 ms`.
+- **Self-hosting:** Compiles its own ~176k-function workspace in **10.0 s** on macOS ARM64 (`5.35 s` sema, `0.48 s` codegen) and **11.8 s** on Linux x86-64 (`3.10 s` sema, `0.43 s` codegen).
+- **Matches or beats `rustc -C opt-level=3` on AOT compute kernels** (`scripts/bench.sh`, with bit-identical outputs): macOS ARM64 `sha256` **0.80x**, `sieve` **1.01x**, `sort` **1.02x**, `scan` **1.53x**; Linux x86-64 `sha256` **0.90x**, `sieve` **0.92x**, `sort` **1.02x**, `scan` **2.15x**.
+- **5x–21x faster than `cargo` across all 3 build benchmarks** (`tests/diff`, 124 functions, macOS ARM64): single-line code edit rebuild **`13.2 ms`** vs `cargo` `284 ms` (**21.6x faster**), unchanged no-op **`3.7 ms`** vs `20.4 ms` (**5.5x faster**), and cold debug **`169 ms`** vs `1061 ms` (**6.3x faster**). On Linux x86-64: edit **`11.8 ms`** vs `98.3 ms` (**8.3x**), no-op **`0.5 ms`** vs `6.3 ms` (**13.4x**), cold **`139 ms`** vs `403 ms` (**2.9x**).
 - **Zero-linker 6-target AOT cross-compilation:** Emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) via `--target TRIPLE` with no external cross-linker.
 - **Differential verification:** **620/620** differential cases, **90/90** async cases, **15/15** proc-macro cases, **17/17** standalone crate probes (`jit+aot`), and **259/259 (100.0%)** official `rust-lang/rust` `tests/ui/` run-pass tests (`jit+aot`) verified bit-identically against `rustc`.
 
@@ -100,20 +100,20 @@ Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
 
 ### Build speed (`tests/diff`, 124 functions)
 
-| Benchmark | haste | cargo |
-| --- | ---: | ---: |
-| Single-line edit rebuild | 27 ms | 39 ms |
-| Unchanged no-op build | 25 ms | 41 ms |
-| Cold debug build | 199 ms | 218 ms |
+| Benchmark | haste | cargo | Speedup |
+| --- | ---: | ---: | ---: |
+| Single-line code edit rebuild | 13.2 ms | 284 ms | 21.6x |
+| Unchanged no-op build | 3.7 ms | 20.4 ms | 5.5x |
+| Cold debug build | 169 ms | 1061 ms | 6.3x |
 
 ### AOT codegen runtime (`haste --release` vs `rustc -C opt-level=3`, median of 5)
 
 | Workload | haste --release | rustc -O3 | Ratio | Output |
 | --- | ---: | ---: | ---: | --- |
-| `sha256` (250k blocks) | 80 ms | 92 ms | 0.87x | exact match (`7333157476866902348`) |
-| `sieve` (4M primes) | 27 ms | 28 ms | 0.96x | exact match (`544501644261`) |
-| `sort` (500k quicksort + bsearch) | 51 ms | 51 ms | 1.00x | exact match (`8647866321337317866`) |
-| `scan` (JSON-like byte scanner) | 33 ms | 28 ms | 1.18x | exact match (`80005120000`) |
+| `sha256` (250k blocks) | 56.5 ms | 70.8 ms | 0.80x | exact match (`7333157476866902348`) |
+| `sieve` (4M primes) | 6.6 ms | 6.6 ms | 1.01x | exact match (`544501644261`) |
+| `sort` (500k quicksort + bsearch) | 28.8 ms | 28.3 ms | 1.02x | exact match (`8647866321337317866`) |
+| `scan` (JSON-like byte scanner) | 11.5 ms | 7.5 ms | 1.53x | exact match (`80005120000`) |
 
 ## Verify it yourself
 
