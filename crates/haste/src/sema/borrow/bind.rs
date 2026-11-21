@@ -34,18 +34,8 @@ impl Checker<'_, '_> {
             if s.target == local {
                 continue;
             }
-            let loan = Loan {
-                target: s.target,
-                steps: s.steps.clone(),
-                holder: Some(local),
-                mutable: s.mutable && (!s.through_ref || !self.is_shared_ref_or_ptr(self.local_ty(s.target))),
-                through_ref: s.through_ref,
-                two_phase: false,
-                env_only: s.env_only,
-            };
-            if !state.loans.contains(&loan) {
-                state.loans.push(loan);
-            }
+            let mutable = s.mutable && (!s.through_ref || !self.is_shared_ref_or_ptr(self.local_ty(s.target)));
+            push_loan(&mut state.loans, s.target, s.steps.clone(), Some(local), mutable, s.through_ref, false, s.env_only);
         }
     }
 
@@ -302,13 +292,7 @@ impl Checker<'_, '_> {
         }
         if !move_only {
             if let Some(e) = unwrapped_init {
-                if let Some(src_local) = self.expr_plain_local(e)
-                    && self.is_mut_ref_ty(self.local_ty(src_local))
-                    && self.is_mut_ref_ty(self.local_ty(local))
-                    && state.loans.iter().any(|l| super::loan_conflicts_borrow(l, src_local, &[]))
-                {
-                    bail!("cannot move out of `{}` because it is borrowed", self.local_name(src_local));
-                }
+                self.check_mut_ref_local_move(local, e, state)?;
                 let sources = self.expr_borrow_sources_let(e, state);
                 self.push_sources_for_local(local, &sources, state);
             } else if !fallback_sources.is_empty() {
@@ -457,7 +441,16 @@ impl Checker<'_, '_> {
 }
 
 pub(super) fn push_loan(loans: &mut Vec<Loan>, target: u32, steps: Vec<PlaceStep>, holder: Option<u32>, mutable: bool, through_ref: bool, two_phase: bool, env_only: bool) {
-    loans.push(Loan { target, steps, holder, mutable, through_ref, two_phase, env_only });
+    let loan = Loan { target, steps, holder, mutable, through_ref, two_phase, env_only };
+    if !loans.contains(&loan) {
+        loans.push(loan);
+    }
+}
+
+pub(super) fn push_source_loans(loans: &mut Vec<Loan>, holder: Option<u32>, sources: &[BorrowSource]) {
+    for s in sources {
+        push_loan(loans, s.target, s.steps.clone(), holder, s.mutable, s.through_ref, false, s.env_only);
+    }
 }
 
 fn clear_rebound_loans(local: u32, state: &mut State) {

@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::{SelfKind, Signature};
-use crate::body::{Args, BlockKind, Body, Bound, Expr, ExprId, GenericArg, List, Ty as AstTy, TyId};
+use crate::body::{Args, BlockKind, Body, Bound, Expr, ExprId, GenericArg, List, Stmt, Ty as AstTy, TyId};
 use crate::outline::item::Item;
 use crate::outline::source::Source;
 use crate::sema::infer::{By, Res};
@@ -12,6 +12,7 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::bind::push_loan;
 use super::places::{FieldKey, PlaceStep};
+use super::propagate::{BorrowSource, dedup_sources};
 use super::{Checker, State, prune_moved_loans};
 
 #[derive(Default)]
@@ -71,10 +72,11 @@ impl Checker<'_, '_> {
         let callee_ty = self.expr_ty(callee);
         let is_ctor = matches!(self.callee_res(expr, Some(callee)), Some(Res::Ctor(..)));
         let call_extend = if is_ctor { self.let_extend_depth } else { None };
+        let has_self_arg = sig.as_deref().is_some_and(|s| s.receiver.is_some());
         self.with_let_extend(call_extend, |this| {
-            this.check_arg_list(&arg_ids, sig.as_deref(), Some(callee_ty), state, outer_live, depth)?;
-            this.check_call_bounds(&arg_ids, sig.as_deref(), fn_item, state)?;
-            this.attach_call_out_sources(&arg_ids, sig.as_deref(), fn_item, state)
+            this.check_arg_list(&arg_ids, sig.as_deref(), Some(callee_ty), has_self_arg, state, outer_live, depth)?;
+            this.check_call_bounds(&arg_ids, sig.as_deref(), fn_item, has_self_arg, state)?;
+            this.attach_call_out_sources(expr, &arg_ids, sig.as_deref(), fn_item, has_self_arg, state)
         })
     }
 
@@ -228,7 +230,7 @@ impl Checker<'_, '_> {
             _ => None,
         };
         let sig = self.callee_sig(expr, None);
-        let res = self.check_arg_list(&param_ids, sig.as_deref(), None, state, outer_live, depth);
+        let res = self.check_arg_list(&param_ids, sig.as_deref(), None, false, state, outer_live, depth);
         state.loans.retain(|l| l.holder != Some(temp_id));
         res?;
         if !state.diverged && let Some((local, through_ref, mut_ref_root, steps)) = deferred_recv {
@@ -237,7 +239,7 @@ impl Checker<'_, '_> {
             self.check_borrow(local, through_ref, mut_ref_root, &steps, true, &check_state)?;
         }
         if !state.diverged {
-            self.check_call_bounds(&param_ids, sig.as_deref(), fn_item, state)?;
+            self.check_call_bounds(&param_ids, sig.as_deref(), fn_item, false, state)?;
             self.attach_method_arg_sources(expr, receiver, &param_ids, recv_borrow == Some(Mut::Mut), sig.as_deref(), state)?;
         }
         Ok(())
@@ -272,13 +274,13 @@ impl Checker<'_, '_> {
         self.check_expr(receiver, state, false, outer_live, true, depth)
     }
 
-    pub(super) fn check_arg_list(&mut self, arg_ids: &[u32], sig: Option<&Signature>, callee_ty: Option<Ty>, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
+    pub(super) fn check_arg_list(&mut self, arg_ids: &[u32], sig: Option<&Signature>, callee_ty: Option<Ty>, has_self_arg: bool, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
         let temp_id = self.next_temp_holder();
         let mut deferred_mut_args: Vec<(u32, Vec<PlaceStep>)> = Vec::new();
         let res = (|| -> Result<()> {
             for (idx, &id) in arg_ids.iter().enumerate() {
                 let arg = ExprId(id);
-                let param_ref = sig.and_then(|s| param_ref_mut(s, idx)).or_else(|| self.callee_param_ref_mut(callee_ty, idx));
+                let param_ref = sig.and_then(|s| param_ref_mut(s, idx, has_self_arg)).or_else(|| self.callee_param_ref_mut(callee_ty, idx));
                 let shared_reborrow = param_ref == Some(Mut::Not);
                 let mut_reborrow = param_ref == Some(Mut::Mut) || (param_ref.is_none() && self.typed.coercions.contains_key(&arg));
                 let mut is_deferred_mut = false;
@@ -403,8 +405,8 @@ impl Checker<'_, '_> {
         let cap_locals: Vec<u32> = closure.captures.iter().map(|c| c.local).collect();
         let moves_capture = Self::has_new_moves(&init_moved, &init_partial, &body_state, &cap_locals);
         let mutates_capture = closure.captures.iter().any(|c| {
-            c.by == By::Mut
-                || (c.by == By::Value && self.closure_capture_info(expr, By::Value, c.local).iter().any(|(_, m, ..)| *m))
+            matches!(c.by, By::Mut | By::Value)
+                && self.closure_capture_info(expr, c.by, c.local).iter().any(|(_, m, ..)| *m)
         });
         let borrows_local = self
             .closure_borrow_sources(expr, state)
@@ -466,6 +468,107 @@ impl Checker<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn closure_borrow_sources(&mut self, expr: ExprId, state: &State) -> Vec<BorrowSource> {
+        let Some(closure) = self.typed.closures.get(&expr).cloned() else {
+            return Vec::new();
+        };
+        let ret_targets = self.closure_ret_targets(expr, closure.ret, state);
+        let capture_env_only = |target: u32| ret_targets.as_ref().is_some_and(|set| !set.contains(&target));
+        let mut out = Vec::new();
+        for cap in &closure.captures {
+            let cap_steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(FieldKey::Tuple(f))).collect();
+            if cap.by == By::Value {
+                let cap_ty = cap.ty(self.cx, self.local_ty(cap.local)).unwrap_or_else(|_| self.local_ty(cap.local));
+                if self.is_mut_ref_ty(cap_ty) {
+                    let mut steps = cap_steps;
+                    steps.push(PlaceStep::Deref);
+                    out.push(BorrowSource { target: cap.local, steps, mutable: true, through_ref: true, env_only: capture_env_only(cap.local) });
+                }
+            } else {
+                for (steps, is_mut, through_ref, _) in self.closure_capture_info(expr, cap.by, cap.local) {
+                    if steps.starts_with(&cap_steps) {
+                        out.push(BorrowSource { target: cap.local, steps, mutable: is_mut, through_ref, env_only: capture_env_only(cap.local) });
+                    }
+                }
+            }
+            for l in state.loans.iter().filter(|l| l.holder == Some(cap.local)) {
+                out.push(BorrowSource { env_only: l.env_only || capture_env_only(l.target), ..BorrowSource::from_loan(l) });
+            }
+        }
+        dedup_sources(out)
+    }
+
+    pub(super) fn closure_ret_targets(&mut self, expr: ExprId, ret_ty: Ty, state: &State) -> Option<HashSet<u32>> {
+        if !self.ty_holds_borrow(ret_ty) {
+            return Some(HashSet::default());
+        }
+        let Expr::Closure { body, .. } = *self.body.expr(expr) else {
+            return None;
+        };
+        let mut inner_locals = HashSet::default();
+        if !self.can_analyze_closure_ret(body, &mut inner_locals) {
+            return None;
+        }
+        let targets = self.expr_borrow_sources(body, state).into_iter().map(|s| s.target).collect();
+        Some(targets)
+    }
+
+    fn can_analyze_closure_ret(&mut self, expr: ExprId, inner_locals: &mut HashSet<u32>) -> bool {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) | Expr::Cast(inner, _) | Expr::Try(inner) => {
+                self.can_analyze_closure_ret(inner, inner_locals)
+            }
+            Expr::Block { kind, stmts, tail, .. } => {
+                if matches!(kind, BlockKind::Async | BlockKind::AsyncMove) {
+                    return false;
+                }
+                let stm_ids: Vec<u32> = self.body.list(stmts).to_vec();
+                for id in stm_ids {
+                    match self.body.stmts[id as usize] {
+                        Stmt::Let { pat, init, otherwise, .. } => {
+                            self.collect_pat_locals(pat, inner_locals);
+                            if init.is_some_and(|e| self.expr_has_return(e))
+                                || otherwise.is_some_and(|e| self.expr_has_return(e))
+                            {
+                                return false;
+                            }
+                        }
+                        Stmt::Expr(e, _) => {
+                            if self.expr_has_return(e) {
+                                return false;
+                            }
+                        }
+                        Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
+                    }
+                }
+                tail.is_none_or(|t| self.can_analyze_closure_ret(t, inner_locals))
+            }
+            Expr::If(c, t, e) => {
+                !self.expr_has_return(c)
+                    && self.can_analyze_closure_ret(t, inner_locals)
+                    && e.is_none_or(|alt| self.can_analyze_closure_ret(alt, inner_locals))
+            }
+            Expr::Match(scrut, arms) => {
+                if self.expr_has_return(scrut) {
+                    return false;
+                }
+                let arm_ids: Vec<u32> = self.body.list(arms).to_vec();
+                for id in arm_ids {
+                    let arm = self.body.arms[id as usize];
+                    let mut arm_locals = inner_locals.clone();
+                    self.collect_pat_locals(arm.pat, &mut arm_locals);
+                    if arm.guard.is_some_and(|g| self.expr_has_return(g))
+                        || !self.can_analyze_closure_ret(arm.body, &mut arm_locals)
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => !self.expr_has_return(expr) && !self.expr_uses_inner_borrow_local(expr, inner_locals),
+        }
     }
 }
 
@@ -566,15 +669,29 @@ pub(super) fn ty_shares_name(body: &Body, src: &Source, ty: TyId, ret_names: &[&
     param_lts.names.iter().any(|n| ret_names.contains(n))
 }
 
-fn param_ref_mut(sig: &Signature, idx: usize) -> Option<Mut> {
-    let &(_, mut ty) = sig.params.get(idx)?;
-    while let AstTy::Paren(inner) = *sig.body.ty(ty) {
+pub(super) fn ast_ref_mut(body: &Body, mut ty: TyId) -> Option<Mut> {
+    while let AstTy::Paren(inner) = *body.ty(ty) {
         ty = inner;
     }
-    match *sig.body.ty(ty) {
+    match *body.ty(ty) {
         AstTy::Ref { mutable, .. } => Some(if mutable { Mut::Mut } else { Mut::Not }),
         _ => None,
     }
+}
+
+fn param_ref_mut(sig: &Signature, idx: usize, has_self_arg: bool) -> Option<Mut> {
+    if has_self_arg {
+        if idx == 0 {
+            return match sig.receiver? {
+                (SelfKind::Ref, _) => Some(Mut::Not),
+                (SelfKind::RefMut, _) => Some(Mut::Mut),
+                (SelfKind::Typed(ty), _) => ast_ref_mut(&sig.body, ty),
+                (SelfKind::Value, _) => None,
+            };
+        }
+        return sig.params.get(idx - 1).and_then(|&(_, ty)| ast_ref_mut(&sig.body, ty));
+    }
+    sig.params.get(idx).and_then(|&(_, ty)| ast_ref_mut(&sig.body, ty))
 }
 
 pub(super) fn recv_is_by_ref(sig: &Signature) -> bool {

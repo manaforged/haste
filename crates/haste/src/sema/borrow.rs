@@ -25,6 +25,7 @@ use propagate::BorrowSource;
 
 const TEMP_HOLDER_BASE: u32 = u32::MAX - 65_536;
 const ITER_HOLDER_BASE: u32 = TEMP_HOLDER_BASE - 65_536;
+pub(super) const STMT_TEMP_OFFSET: u32 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Loan {
@@ -288,7 +289,7 @@ impl Checker<'_, '_> {
             if self.is_const_or_static_item() {
                 return false;
             }
-            let effective = if t_depth >= 10_000 { t_depth - 10_000 } else { t_depth };
+            let effective = if t_depth >= STMT_TEMP_OFFSET { t_depth - STMT_TEMP_OFFSET } else { t_depth };
             return effective >= depth;
         }
         !self.from_caller(target, through_ref)
@@ -522,10 +523,7 @@ impl Checker<'_, '_> {
                         self.check_not_moved(p.local, &p.steps, state)?;
                         self.check_can_mutate(p.local, p.through_ref, p.mut_ref_root, p.behind_shared, &p.steps, state, false)?;
                         if !sources.is_empty() {
-                            self.check_assign_escape(&p, &sources, state)?;
-                            if !p.through_ref {
-                                self.push_sources_for_local(p.local, &sources, state);
-                            }
+                            self.propagate_assign_sources(&p, &sources, state)?;
                         }
                     } else {
                         self.check_expr(lhs, state, true, outer_live, false, depth)?;
@@ -652,7 +650,7 @@ impl Checker<'_, '_> {
             }
             Expr::Tuple(list) | Expr::Array(list) => {
                 let ids: Vec<u32> = self.body.list(list).to_vec();
-                self.check_arg_list(&ids, None, None, state, outer_live, depth)?;
+                self.check_arg_list(&ids, None, None, false, state, outer_live, depth)?;
             }
             Expr::Struct { fields, base, .. } => {
                 self.check_struct_expr(expr, fields, base, state, outer_live, depth)?;
@@ -710,7 +708,7 @@ impl Checker<'_, '_> {
 
     fn check_struct_expr(&mut self, expr: ExprId, fields: List, base: Option<ExprId>, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
         let val_ids: Vec<u32> = self.body.list(fields).iter().map(|&f| self.body.fields[f as usize].value.0).collect();
-        self.check_arg_list(&val_ids, None, None, state, outer_live, depth)?;
+        self.check_arg_list(&val_ids, None, None, false, state, outer_live, depth)?;
         if let Some(b) = base {
             self.check_fru_base(expr, fields, b, state, outer_live, depth)?;
         }

@@ -1,12 +1,12 @@
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::sig::{GenericKind, SelfKind};
-use crate::body::{BlockKind, Expr, ExprId, List, Stmt, Ty as AstTy, TyId, UnOp};
+use crate::body::sig::SelfKind;
+use crate::body::{BlockKind, Expr, ExprId, List, Ty as AstTy, TyId, UnOp};
 use crate::names::ItemRef;
-use crate::sema::infer::{By, Res};
+use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::calls::{Lifetimes, collect_ty_lifetimes, receiver_has_any_named, recv_is_by_ref, ty_shares_name};
+use super::calls::{Lifetimes, ast_ref_mut, collect_ty_lifetimes, receiver_has_any_named, recv_is_by_ref, ty_shares_name};
 use super::places::{PlaceStep, steps_conflict};
 use super::{Checker, Loan, State};
 
@@ -20,7 +20,7 @@ pub(super) struct BorrowSource {
 }
 
 impl BorrowSource {
-    fn from_loan(l: &Loan) -> Self {
+    pub(super) fn from_loan(l: &Loan) -> Self {
         Self {
             target: l.target,
             steps: l.steps.clone(),
@@ -35,88 +35,6 @@ impl Checker<'_, '_> {
     pub(super) fn from_caller(&self, target: u32, through_ref: bool) -> bool {
         self.is_param.get(target as usize).copied().unwrap_or(false)
             && (through_ref || self.is_ref_ty(self.local_ty(target)))
-    }
-
-    pub(super) fn ty_holds_borrow(&mut self, ty: Ty) -> bool {
-        let mut seen = HashSet::default();
-        self.ty_holds_borrow_inner(ty, &mut seen)
-    }
-
-    fn ty_holds_borrow_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
-        if ty == Ty::NONE || !seen.insert(ty) {
-            return false;
-        }
-        match self.cx.types.kind(ty).clone() {
-            Kind::Ref(..) | Kind::Dyn(..) => true,
-            Kind::Slice(elem) | Kind::Array(elem, _) | Kind::Pat(elem, ..) => {
-                self.ty_holds_borrow_inner(elem, seen)
-            }
-            Kind::Tuple(items) => {
-                let items = self.cx.types.substs(items).to_vec();
-                items.into_iter().any(|item| self.ty_holds_borrow_inner(item, seen))
-            }
-            Kind::Closure(..) => self.closure_ty_holds_borrow(ty, seen),
-            Kind::Adt(item, args) => {
-                let args = self.cx.types.substs(args).to_vec();
-                if args.into_iter().any(|arg| self.ty_holds_borrow_inner(arg, seen)) {
-                    return true;
-                }
-                self.cx.adt_def(item).is_ok_and(|def| {
-                    def.generics.params.iter().any(|g| g.kind == GenericKind::Lifetime)
-                })
-            }
-            _ => false,
-        }
-    }
-
-    fn closure_ty_holds_borrow(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
-        let Kind::Closure(parent, _, at) = *self.cx.types.kind(ty) else {
-            return false;
-        };
-        if let Some(info) = self.cx.closure(ty) {
-            return info.closure.captures.iter().any(|c| {
-                c.by != By::Value
-                    || self.ty_holds_borrow_inner(info.typed.locals.get(c.local as usize).map_or(Ty::NONE, |l| l.ty), seen)
-            });
-        }
-        if parent == self.item
-            && let Some(closure) = self.typed.closures.get(&ExprId(at))
-        {
-            return closure.captures.iter().any(|c| {
-                c.by != By::Value || self.ty_holds_borrow_inner(self.local_ty(c.local), seen)
-            });
-        }
-        true
-    }
-
-    pub(super) fn ty_holds_closure(&mut self, ty: Ty) -> bool {
-        let mut seen = HashSet::default();
-        self.ty_holds_closure_inner(ty, &mut seen)
-    }
-
-    fn ty_holds_closure_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
-        if ty == Ty::NONE || !seen.insert(ty) {
-            return false;
-        }
-        match self.cx.types.kind(ty).clone() {
-            Kind::Closure(..) | Kind::Dyn(..) | Kind::FnDef(..) | Kind::FnPtr(..) => true,
-            Kind::Ref(_, inner) | Kind::Slice(inner) | Kind::Array(inner, _) | Kind::Pat(inner, ..) => {
-                self.ty_holds_closure_inner(inner, seen)
-            }
-            Kind::Tuple(items) => {
-                let items = self.cx.types.substs(items).to_vec();
-                items.into_iter().any(|item| self.ty_holds_closure_inner(item, seen))
-            }
-            Kind::Adt(item, items) => {
-                let mod_path = self.cx.module_text(item);
-                if mod_path.starts_with("core::iter") || mod_path.starts_with("std::iter") {
-                    return true;
-                }
-                let items = self.cx.types.substs(items).to_vec();
-                items.into_iter().any(|item| self.ty_holds_closure_inner(item, seen))
-            }
-            _ => false,
-        }
     }
 
     pub(super) fn expr_borrow_sources(&mut self, expr: ExprId, state: &State) -> Vec<BorrowSource> {
@@ -295,107 +213,6 @@ impl Checker<'_, '_> {
         out
     }
 
-    pub(super) fn closure_borrow_sources(&mut self, expr: ExprId, state: &State) -> Vec<BorrowSource> {
-        let Some(closure) = self.typed.closures.get(&expr).cloned() else {
-            return Vec::new();
-        };
-        let ret_targets = self.closure_ret_targets(expr, closure.ret, state);
-        let capture_env_only = |target: u32| ret_targets.as_ref().is_some_and(|set| !set.contains(&target));
-        let mut out = Vec::new();
-        for cap in &closure.captures {
-            let cap_steps: Vec<PlaceStep> = cap.path.iter().map(|&(_, f)| PlaceStep::Field(super::places::FieldKey::Tuple(f))).collect();
-            if cap.by == By::Value {
-                let cap_ty = cap.ty(self.cx, self.local_ty(cap.local)).unwrap_or_else(|_| self.local_ty(cap.local));
-                if self.is_mut_ref_ty(cap_ty) {
-                    let mut steps = cap_steps;
-                    steps.push(PlaceStep::Deref);
-                    out.push(BorrowSource { target: cap.local, steps, mutable: true, through_ref: true, env_only: capture_env_only(cap.local) });
-                }
-            } else {
-                for (steps, is_mut, through_ref, _) in self.closure_capture_info(expr, cap.by, cap.local) {
-                    if steps.starts_with(&cap_steps) {
-                        out.push(BorrowSource { target: cap.local, steps, mutable: is_mut, through_ref, env_only: capture_env_only(cap.local) });
-                    }
-                }
-            }
-            for l in state.loans.iter().filter(|l| l.holder == Some(cap.local)) {
-                out.push(BorrowSource { env_only: l.env_only || capture_env_only(l.target), ..BorrowSource::from_loan(l) });
-            }
-        }
-        dedup_sources(out)
-    }
-
-    fn closure_ret_targets(&mut self, expr: ExprId, ret_ty: Ty, state: &State) -> Option<HashSet<u32>> {
-        if !self.ty_holds_borrow(ret_ty) {
-            return Some(HashSet::default());
-        }
-        let Expr::Closure { body, .. } = *self.body.expr(expr) else {
-            return None;
-        };
-        let mut inner_locals = HashSet::default();
-        if !self.can_analyze_closure_ret(body, &mut inner_locals) {
-            return None;
-        }
-        let targets = self.expr_borrow_sources(body, state).into_iter().map(|s| s.target).collect();
-        Some(targets)
-    }
-
-    fn can_analyze_closure_ret(&mut self, expr: ExprId, inner_locals: &mut HashSet<u32>) -> bool {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner) | Expr::Cast(inner, _) | Expr::Try(inner) => {
-                self.can_analyze_closure_ret(inner, inner_locals)
-            }
-            Expr::Block { kind, stmts, tail, .. } => {
-                if matches!(kind, BlockKind::Async | BlockKind::AsyncMove) {
-                    return false;
-                }
-                let stm_ids: Vec<u32> = self.body.list(stmts).to_vec();
-                for id in stm_ids {
-                    match self.body.stmts[id as usize] {
-                        Stmt::Let { pat, init, otherwise, .. } => {
-                            self.collect_pat_locals(pat, inner_locals);
-                            if init.is_some_and(|e| self.expr_has_return(e))
-                                || otherwise.is_some_and(|e| self.expr_has_return(e))
-                            {
-                                return false;
-                            }
-                        }
-                        Stmt::Expr(e, _) => {
-                            if self.expr_has_return(e) {
-                                return false;
-                            }
-                        }
-                        Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
-                    }
-                }
-                tail.is_none_or(|t| self.can_analyze_closure_ret(t, inner_locals))
-            }
-            Expr::If(c, t, e) => {
-                !self.expr_has_return(c)
-                    && self.can_analyze_closure_ret(t, inner_locals)
-                    && e.is_none_or(|alt| self.can_analyze_closure_ret(alt, inner_locals))
-            }
-            Expr::Match(scrut, arms) => {
-                if self.expr_has_return(scrut) {
-                    return false;
-                }
-                let arm_ids: Vec<u32> = self.body.list(arms).to_vec();
-                for id in arm_ids {
-                    let arm = self.body.arms[id as usize];
-                    let mut arm_locals = inner_locals.clone();
-                    self.collect_pat_locals(arm.pat, &mut arm_locals);
-                    if arm.guard.is_some_and(|g| self.expr_has_return(g))
-                        || !self.can_analyze_closure_ret(arm.body, &mut arm_locals)
-                    {
-                        return false;
-                    }
-                }
-                true
-            }
-            _ => !self.expr_has_return(expr) && !self.expr_uses_inner_borrow_local(expr, inner_locals),
-        }
-    }
-
     pub(super) fn place_borrow_sources(&mut self, expr: ExprId, mutable: bool, state: &State, extend_depth: Option<u32>) -> Vec<BorrowSource> {
         let Some(p) = self.root_place(expr) else {
             return self.non_place_borrow_sources(expr, mutable, state, extend_depth);
@@ -423,51 +240,33 @@ impl Checker<'_, '_> {
                 self.non_place_borrow_sources(inner, mutable, state, extend_depth)
             }
             Expr::Field(base, _) | Expr::TupleField(base, _) => {
-                let base_ty = self.expr_ty(base);
-                let autoderefs = self.typed.autoderefs.get(&expr).copied().unwrap_or(0);
-                let has_overloaded = (0..autoderefs).any(|s| self.typed.derefs.contains_key(&(expr, s)));
-                if self.is_ref_ty(base_ty) && !has_overloaded {
+                if self.is_ref_ty(self.expr_ty(base)) {
                     clamp_mut(self.expr_borrow_sources_inner(base, state, true, None), mutable)
                 } else {
-                    let next_ext = if has_overloaded || self.cx.boxed(base_ty).is_some() { None } else { extend_depth };
-                    self.non_place_borrow_sources(base, mutable, state, next_ext)
+                    self.non_place_borrow_sources(base, mutable, state, extend_depth)
                 }
             }
             Expr::Index(base, _) => {
                 if self.is_ref_ty(self.expr_ty(base)) {
                     clamp_mut(self.expr_borrow_sources_inner(base, state, true, None), mutable)
                 } else {
-                    let next_ext = if self.typed.operators.contains_key(&expr) { None } else { extend_depth };
-                    self.non_place_borrow_sources(base, mutable, state, next_ext)
+                    self.non_place_borrow_sources(base, mutable, state, extend_depth)
                 }
             }
             Expr::Unary(UnOp::Deref, inner) => {
                 let inner_ty = self.expr_ty(inner);
                 if inner_ty != Ty::NONE && matches!(self.cx.types.kind(inner_ty), Kind::Ptr(..)) {
                     Vec::new()
-                } else if self.is_ref_ty(inner_ty) && !self.typed.derefs.contains_key(&(expr, 0)) {
+                } else if self.is_ref_ty(inner_ty) {
                     clamp_mut(self.expr_borrow_sources_inner(inner, state, true, None), mutable)
                 } else {
-                    let next_ext = if self.typed.derefs.contains_key(&(expr, 0)) || self.cx.boxed(inner_ty).is_some() {
-                        None
-                    } else {
-                        extend_depth
-                    };
-                    self.non_place_borrow_sources(inner, mutable, state, next_ext)
+                    self.non_place_borrow_sources(inner, mutable, state, extend_depth)
                 }
             }
             _ => {
                 let mut out = Vec::new();
                 if self.is_non_promotable_temp(expr) {
-                    let ext = if matches!(
-                        *self.body.expr(expr),
-                        Expr::Method { .. } | Expr::Try(_) | Expr::Await(_) | Expr::Binary(..)
-                    ) {
-                        None
-                    } else {
-                        extend_depth
-                    };
-                    let depth = ext.unwrap_or(self.temp_scope_depth);
+                    let depth = extend_depth.unwrap_or(self.temp_scope_depth);
                     out.push(BorrowSource {
                         target: super::checks::temp_target_for(depth),
                         steps: Vec::new(),
@@ -588,7 +387,7 @@ impl Checker<'_, '_> {
                 for id in arg_ids {
                     out.extend(self.expr_borrow_sources_inner(ExprId(id), state, true, None));
                 }
-                self.finish_sig_sources(expr, out)
+                self.finish_sig_sources(expr, out, false)
             }
         }
     }
@@ -632,7 +431,17 @@ impl Checker<'_, '_> {
             let impl_src = &self.cx.impl_file(block).source;
             collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut ret_lts);
         }
-        let arg_ids: Vec<u32> = self.body.list(args).to_vec();
+        let raw_args = self.body.list(args);
+        let (receiver, arg_ids): (Option<ExprId>, Vec<u32>) = if receiver.is_none() && sig.receiver.is_some() && !raw_args.is_empty() {
+            (Some(ExprId(raw_args[0])), raw_args[1..].to_vec())
+        } else {
+            (receiver, raw_args.to_vec())
+        };
+        let mod_text = self.cx.module_text(fn_item);
+        let fn_name = self.cx.name(fn_item);
+        let is_iter_fn = mod_text.starts_with("core::iter") || mod_text.starts_with("std::iter");
+        let is_opt_fn = mod_text.starts_with("core::option") || mod_text.starts_with("std::option");
+        let is_by_ref = is_iter_fn && fn_name == "by_ref";
         let mut out = Vec::new();
         if !ret_lts.has_elided && ret_lts.named.is_empty() {
             if ret_lts.saw_static {
@@ -660,24 +469,10 @@ impl Checker<'_, '_> {
                 && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))
             {
                 let mut recv_sources = self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(&sig), None);
-                let is_iter_fn = self.cx.module_text(fn_item).starts_with("core::iter");
-                if is_iter_fn && matches!(self.cx.name(fn_item), "copied" | "cloned") {
-                    let mut cur = recv;
-                    loop {
-                        match *self.body.expr(cur) {
-                            Expr::Paren(inner) | Expr::Method { receiver: inner, .. } => cur = inner,
-                            _ => break,
-                        }
-                    }
-                    if let Some(p) = self.root_place(cur) {
-                        for s in &mut recv_sources {
-                            if s.target == p.local && s.steps.starts_with(&p.steps) {
-                                s.env_only = true;
-                            }
-                        }
-                    }
+                if (is_iter_fn || is_opt_fn) && matches!(fn_name, "copied" | "cloned") {
+                    recv_sources = self.copied_recv_sources(recv, recv_sources, state, is_opt_fn);
                 } else if is_iter_fn
-                    && matches!(self.cx.name(fn_item), "map" | "filter_map" | "flat_map")
+                    && matches!(fn_name, "map" | "filter_map" | "flat_map")
                     && arg_ids.first().is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state))
                 {
                     for s in &mut recv_sources {
@@ -686,7 +481,7 @@ impl Checker<'_, '_> {
                 }
                 out.extend(recv_sources);
             }
-            return self.finish_sig_sources(expr, out);
+            return self.finish_sig_sources(expr, out, is_by_ref);
         }
         let allow_elided_param = !recv_is_by_ref(&sig);
         for (idx, &arg) in arg_ids.iter().enumerate() {
@@ -735,7 +530,20 @@ impl Checker<'_, '_> {
                 Some((SelfKind::Value, _)) => true,
                 None => false,
             };
-            if recv_creates_borrow {
+            let recv_is_mut = matches!(sig.receiver, Some((SelfKind::RefMut, _)))
+                || matches!(sig.receiver, Some((SelfKind::Typed(st), _)) if ast_ref_mut(&sig.body, st) == Some(Mut::Mut));
+            if is_by_ref {
+                out.extend(self.by_ref_recv_sources(expr, recv, state));
+            } else if recv_creates_borrow && !recv_is_mut && self.is_mut_ref_to_shared_ref(self.expr_ty(recv)) {
+                let mut inner_srcs = if let Some(mut p) = self.root_place(recv) {
+                    p.reborrows_shared_field = true;
+                    self.place_to_sources(&p, false, state)
+                } else {
+                    self.expr_borrow_sources_inner(recv, state, false, None)
+                };
+                inner_srcs = unwrap_container_loans(inner_srcs, state, |s| self.is_ref_ty(self.local_ty(s.target)));
+                out.extend(inner_srcs);
+            } else if recv_creates_borrow {
                 if let Some(mutability) = self.typed.adjusts.get(&expr).and_then(|a| a.autoref) {
                     out.extend(self.method_recv_borrow_sources(expr, recv, mutability == Mut::Mut, state));
                 } else {
@@ -745,7 +553,92 @@ impl Checker<'_, '_> {
                 out.extend(self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(&sig), None));
             }
         }
-        self.finish_sig_sources(expr, out)
+        self.finish_sig_sources(expr, out, is_by_ref)
+    }
+
+    fn is_mut_ref_to_shared_ref(&self, ty: Ty) -> bool {
+        ty != Ty::NONE
+            && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Mut, inner) if matches!(*self.cx.types.kind(inner), Kind::Ref(Mut::Not, _)))
+    }
+
+    fn copied_recv_sources(&mut self, recv: ExprId, mut recv_sources: Vec<BorrowSource>, state: &State, unwrap: bool) -> Vec<BorrowSource> {
+        let mut cur = recv;
+        loop {
+            match *self.body.expr(cur) {
+                Expr::Paren(inner) | Expr::Method { receiver: inner, .. } => cur = inner,
+                _ => break,
+            }
+        }
+        let root = self.root_place(cur).map(|p| p.local);
+        let indirect = root.is_some_and(|r| {
+            let r_ty = self.local_ty(r);
+            cur == recv || self.is_ref_ty(r_ty) || self.ty_holds_closure(r_ty)
+        });
+        let targets: Vec<u32> = recv_sources.iter().map(|s| s.target).collect();
+        let container_targets: Vec<u32> = recv_sources
+            .iter()
+            .filter(|s| {
+                if super::checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
+                    return true;
+                }
+                if !indirect {
+                    return false;
+                }
+                let r = root.expect("indirect requires root");
+                if !state.loans.iter().any(|l| l.holder == Some(r) && l.target == s.target) {
+                    return false;
+                }
+                if !self.ty_holds_borrow(self.local_ty(s.target)) {
+                    return false;
+                }
+                !targets.iter().any(|&other| {
+                    other != s.target && state.loans.iter().any(|l| l.holder == Some(other) && l.target == s.target)
+                })
+            })
+            .map(|s| s.target)
+            .collect();
+        if unwrap {
+            unwrap_container_loans(recv_sources, state, |s| container_targets.contains(&s.target))
+        } else {
+            for s in &mut recv_sources {
+                if container_targets.contains(&s.target) {
+                    s.env_only = true;
+                }
+            }
+            recv_sources
+        }
+    }
+
+    fn by_ref_recv_sources(&mut self, expr: ExprId, recv: ExprId, state: &State) -> Vec<BorrowSource> {
+        if let Some(p) = self.root_place(recv) {
+            let mut srcs = if let Some(mutability) = self.typed.adjusts.get(&expr).and_then(|a| a.autoref) {
+                self.method_recv_borrow_sources(expr, recv, mutability == Mut::Mut, state)
+            } else {
+                self.expr_borrow_sources(recv, state)
+            };
+            for s in &mut srcs {
+                if s.target == p.local
+                    || (p.through_ref
+                        && self.ty_holds_borrow(self.local_ty(s.target))
+                        && state.loans.iter().any(|l| l.holder == Some(p.local) && l.target == s.target))
+                {
+                    s.env_only = true;
+                }
+            }
+            srcs
+        } else {
+            let mut srcs = self.expr_borrow_sources_inner(recv, state, true, None);
+            if self.is_non_promotable_temp(recv) {
+                srcs.push(BorrowSource {
+                    target: super::checks::temp_target_for(self.temp_scope_depth),
+                    steps: Vec::new(),
+                    mutable: true,
+                    through_ref: false,
+                    env_only: true,
+                });
+            }
+            srcs
+        }
     }
 
     fn iter_closure_ignores_param(&mut self, arg: ExprId, state: &State) -> bool {
@@ -764,9 +657,9 @@ impl Checker<'_, '_> {
         })
     }
 
-    fn finish_sig_sources(&mut self, expr: ExprId, mut out: Vec<BorrowSource>) -> Vec<BorrowSource> {
+    fn finish_sig_sources(&mut self, expr: ExprId, mut out: Vec<BorrowSource>, keep_env_only: bool) -> Vec<BorrowSource> {
         let ret_ty = self.expr_ty(expr);
-        if ret_ty != Ty::NONE && !self.ty_holds_closure(ret_ty) {
+        if !keep_env_only && ret_ty != Ty::NONE && !self.ty_holds_closure(ret_ty) {
             out.retain(|s| !s.env_only);
             for s in &mut out {
                 if self.is_ref_ty(self.local_ty(s.target)) {
@@ -778,6 +671,30 @@ impl Checker<'_, '_> {
     }
 }
 
+pub(super) fn unwrap_container_loans(
+    sources: Vec<BorrowSource>,
+    state: &State,
+    mut should_unwrap: impl FnMut(&BorrowSource) -> bool,
+) -> Vec<BorrowSource> {
+    let mut out = Vec::new();
+    for s in sources {
+        if super::checks::is_temp_target(s.target).is_some() {
+            if !should_unwrap(&s) {
+                out.push(s);
+            }
+            continue;
+        }
+        if should_unwrap(&s) {
+            for l in state.loans.iter().filter(|l| l.holder == Some(s.target)) {
+                out.push(BorrowSource::from_loan(l));
+            }
+        } else {
+            out.push(s);
+        }
+    }
+    dedup_sources(out)
+}
+
 fn clamp_mut(mut out: Vec<BorrowSource>, mutable: bool) -> Vec<BorrowSource> {
     if !mutable {
         for s in &mut out {
@@ -787,7 +704,7 @@ fn clamp_mut(mut out: Vec<BorrowSource>, mutable: bool) -> Vec<BorrowSource> {
     out
 }
 
-fn dedup_sources(sources: Vec<BorrowSource>) -> Vec<BorrowSource> {
+pub(super) fn dedup_sources(sources: Vec<BorrowSource>) -> Vec<BorrowSource> {
     let mut out = Vec::with_capacity(sources.len());
     for s in sources {
         if !out.contains(&s) {

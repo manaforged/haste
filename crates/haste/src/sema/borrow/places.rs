@@ -483,10 +483,10 @@ impl CapturePathWalk<'_, '_, '_> {
                         self.record_path(steps, true, true, true);
                     } else if cap.by == By::Value && !is_copy {
                         self.record_path(steps, true, false, false);
-                    } else if cap.path.is_empty() || (cap.by == By::Mut && is_mut_ref) {
+                    } else if cap.path.is_empty() || cap.by == By::Mut {
                         walk_body = true;
                     } else {
-                        self.record_path(steps, cap.by == By::Mut, false, false);
+                        self.record_path(steps, false, false, false);
                     }
                 }
                 return walk_body;

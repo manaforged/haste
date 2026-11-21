@@ -3,8 +3,9 @@ use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
 
+use super::bind::{push_loan, push_source_loans};
 use super::propagate::BorrowSource;
-use super::{BreakFrame, Checker, Loan, State, is_temp_holder, join_moved, merge_branch, merge_states, prune_dead_loans, prune_moved_loans};
+use super::{BreakFrame, Checker, STMT_TEMP_OFFSET, State, is_temp_holder, join_moved, merge_branch, merge_states, prune_dead_loans, prune_moved_loans};
 
 impl Checker<'_, '_> {
     pub(super) fn check_block(
@@ -45,7 +46,7 @@ impl Checker<'_, '_> {
                         }
                         let let_stmt_depth = this.stmt_depth;
                         let saved_temp_scope = this.temp_scope_depth;
-                        let stmt_temp_depth = block_depth + 10_000;
+                        let stmt_temp_depth = block_depth + STMT_TEMP_OFFSET;
                         if init.is_some() {
                             this.temp_scope_depth = if extend { let_stmt_depth } else { stmt_temp_depth };
                         }
@@ -94,7 +95,7 @@ impl Checker<'_, '_> {
                             this.stmt_depth = block_depth;
                         }
                         let saved_temp_scope = this.temp_scope_depth;
-                        let stmt_temp_depth = block_depth + 10_000;
+                        let stmt_temp_depth = block_depth + STMT_TEMP_OFFSET;
                         if semi {
                             this.temp_scope_depth = stmt_temp_depth;
                         }
@@ -223,19 +224,8 @@ impl Checker<'_, '_> {
                 both_live.extend(else_live);
                 self.check_expr(init, then_state, true, &both_live, true, scope_depth)?;
                 *else_state = then_state.clone();
-                let init_ty = self.expr_ty(init);
-                if self.ty_holds_borrow(init_ty) && self.ty_has_borrow_drop(init_ty) {
-                    let sources = self.expr_borrow_sources(init, then_state);
-                    if !sources.is_empty() {
-                        let temp_id = self.next_temp_holder();
-                        for s in sources {
-                            then_state.loans.push(Loan {
-                                target: s.target, steps: s.steps, holder: Some(temp_id),
-                                mutable: s.mutable, through_ref: s.through_ref, two_phase: false, env_only: s.env_only,
-                            });
-                        }
-                        drop_temps.push(temp_id);
-                    }
+                if let Some(temp_id) = self.hold_drop_temp(init, then_state) {
+                    drop_temps.push(temp_id);
                 }
                 let scrut_place = self.root_place(init);
                 self.bind_pat(pat, Some(init), scrut_place.as_ref(), &[], &[], then_state, (true, true, scope_depth))
@@ -279,24 +269,7 @@ impl Checker<'_, '_> {
             }
         }
         self.with_let_extend(None, |this| this.check_expr(scrut, state, true, &match_live, true, depth))?;
-        let scrut_ty = self.expr_ty(scrut);
-        let scrut_temp = if self.ty_holds_borrow(scrut_ty) && self.ty_has_borrow_drop(scrut_ty) {
-            let sources = self.expr_borrow_sources(scrut, state);
-            if sources.is_empty() {
-                None
-            } else {
-                let id = self.next_temp_holder();
-                for s in sources {
-                    state.loans.push(Loan {
-                        target: s.target, steps: s.steps, holder: Some(id),
-                        mutable: s.mutable, through_ref: s.through_ref, two_phase: false, env_only: s.env_only,
-                    });
-                }
-                Some(id)
-            }
-        } else {
-            None
-        };
+        let scrut_temp = self.hold_drop_temp(scrut, state);
         let scrut_place = self.root_place(scrut);
         let arm_depth = depth + 1;
         let mut fallthrough_state = state.clone();
@@ -326,10 +299,7 @@ impl Checker<'_, '_> {
                     && self.pat_inspects_scrut(arm.pat)
                 {
                     let id = self.next_temp_holder();
-                    arm_state.loans.push(Loan {
-                        target: p.local, steps: p.steps.clone(), holder: Some(id),
-                        mutable: false, through_ref: p.through_ref, two_phase: false, env_only: false,
-                    });
+                    push_loan(&mut arm_state.loans, p.local, p.steps.clone(), Some(id), false, p.through_ref, false, false);
                     Some(id)
                 } else {
                     None
@@ -391,6 +361,20 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
+    fn hold_drop_temp(&mut self, expr: ExprId, state: &mut State) -> Option<u32> {
+        let ty = self.expr_ty(expr);
+        if !self.ty_holds_borrow(ty) || !self.ty_has_borrow_drop(ty) {
+            return None;
+        }
+        let sources = self.expr_borrow_sources(expr, state);
+        if sources.is_empty() {
+            return None;
+        }
+        let id = self.next_temp_holder();
+        push_source_loans(&mut state.loans, Some(id), &sources);
+        Some(id)
+    }
+
     fn pat_inspects_scrut(&self, pat: PatId) -> bool {
         !matches!(*self.body.pat(pat), Pat::Wild | Pat::Bind { sub: None, .. })
     }
@@ -413,20 +397,11 @@ impl Checker<'_, '_> {
             None
         } else {
             let id = self.next_iter_holder();
-            for s in &iter_sources {
-                state.loans.push(Loan {
-                    target: s.target,
-                    steps: s.steps.clone(),
-                    holder: Some(id),
-                    mutable: s.mutable,
-                    through_ref: s.through_ref,
-                    two_phase: false,
-                    env_only: s.env_only,
-                });
-            }
+            push_source_loans(&mut state.loans, Some(id), &iter_sources);
             Some(id)
         };
-        self.check_loop(label, None, Some((pat, &iter_sources)), iter_temp, body, state, outer_live, depth)?;
+        let item_sources: Vec<BorrowSource> = iter_sources.iter().filter(|s| !s.env_only).cloned().collect();
+        self.check_loop(label, None, Some((pat, &item_sources)), iter_temp, body, state, outer_live, depth)?;
         if let Some(id) = iter_temp {
             state.loans.retain(|l| l.holder != Some(id));
         }
