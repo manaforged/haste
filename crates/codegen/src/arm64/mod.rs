@@ -198,13 +198,9 @@ pub(super) struct Emit<'a> {
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
-    fn func(&self) -> &'a Function {
-        self.func
-    }
+    fn func(&self) -> &'a Function { self.func }
 
-    fn is_elided(&self, value: Value) -> bool {
-        self.plan.elided[value.index()]
-    }
+    fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] }
 
     fn prologue(&mut self) {
         if !self.framed {
@@ -286,19 +282,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let data = &func.insts[inst.index()];
         let keep_flags = matches!(
             data.op,
-            Op::Brif(..)
-                | Op::Trapz(..)
-                | Op::Load(..)
-                | Op::Store(..)
-                | Op::StackAddr(..)
-                | Op::StackLoad(..)
-                | Op::StackStore(..)
-                | Op::Const(_)
-                | Op::FramePointer
+            Op::Brif(..) | Op::Trapz(..) | Op::Load(..) | Op::Store(..) | Op::StackAddr(..) | Op::StackLoad(..) | Op::StackStore(..)
+                | Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::FramePointer
         ) || matches!(data.op, Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond));
         if !keep_flags {
             self.flags = None;
-            if !matches!(data.op, Op::Icmp(..)) {
+            if !matches!(data.op, Op::Icmp(_, x, _) if !self.ty(x).is_vector())
+                && !matches!(data.op, Op::Select(cond, ..) if !self.ty(cond).is_vector())
+            {
                 self.last_cmp = None;
             }
         }
@@ -398,9 +389,7 @@ impl Emit<'_> {
         self.asm.mov_sp(FP, SP);
     }
 
-    fn ty(&self, value: Value) -> Type {
-        self.func.ty(value)
-    }
+    fn ty(&self, value: Value) -> Type { self.func.ty(value) }
 
     fn probe(&mut self, size: u32) {
         self.asm.mov_imm(IP, i64::from(size / PAGE));
@@ -476,6 +465,12 @@ impl Emit<'_> {
         Ok(())
     }
 
+    fn emit_cbz(&mut self, val: Value, nonzero: bool, label: Label) {
+        let bytes = self.ty(val).bytes();
+        let reg = if bytes >= 4 { self.bits(val, A) } else { self.zext_src(val, A) };
+        self.asm.cbz(nonzero, if bytes >= 8 { Size::X } else { Size::W }, reg, label);
+    }
+
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
         if self.plan.elided[condition.index()]
             && let Some(inst) = self.defs[condition.index()]
@@ -506,18 +501,19 @@ impl Emit<'_> {
                 }
                 return;
             }
+            if let Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs) = self.func.insts[inst.index()].op
+                && let Some(val) = fuse::zero_cmp_operand(&self.plan, self.ty(lhs), lhs, rhs)
+            {
+                return self.emit_cbz(val, (cc == IntCC::NotEqual) ^ invert, label);
+            }
         }
-        if let Some((value, cond)) = self.flags.take()
+        if let Some((value, cond)) = self.flags
             && value == condition
         {
             self.asm.bcond(if invert { cond.invert() } else { cond }, label);
             return;
         }
-        self.last_cmp = None;
-        let bytes = self.ty(condition).bytes();
-        let reg = if bytes >= 4 { self.bits(condition, A) } else { self.src(condition, A, Ext::Zero) };
-        let size = if bytes >= 8 { Size::X } else { Size::W };
-        self.asm.cbz(!invert, size, reg, label);
+        self.emit_cbz(condition, !invert, label);
     }
 
     fn br_table(&mut self, index: Value, default: Block, targets: &[Block]) {
@@ -526,8 +522,12 @@ impl Emit<'_> {
             return;
         }
         let idx = self.src(index, A, Ext::Zero);
-        self.asm.mov_imm(C, targets.len() as i64);
-        self.asm.alu(Alu::Subs, Size::X, ZR, idx, C);
+        if let Ok(len) = u32::try_from(targets.len()) && len < 4096 {
+            self.asm.add_imm(true, true, Size::X, ZR, idx, len);
+        } else {
+            self.asm.mov_imm(C, targets.len() as i64);
+            self.asm.alu(Alu::Subs, Size::X, ZR, idx, C);
+        }
         self.asm.bcond(Cond::Hs, self.blocks[self.func.jump_target(default).index()]);
         let table = self.asm.label();
         self.asm.adr(C, table);
@@ -729,9 +729,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn new_label(&mut self) -> Label { self.asm.label() }
     fn tails(&mut self) -> &mut Tails<'a, Label> { &mut self.tails }
-    fn island(&mut self) -> Result<(), String> {
-        self.asm.maybe_island()
-    }
+    fn island(&mut self) -> Result<(), String> { self.asm.maybe_island() }
 
     fn bind_label(&mut self, label: Label) {
         self.invalidate_spills();
