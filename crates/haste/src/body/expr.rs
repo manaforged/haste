@@ -587,7 +587,7 @@ impl Cursor<'_> {
         let ret = if self.eat("->") { Some(self.ty_no_bounds()?) } else { None };
         let body = if ret.is_some() { self.block_expr(None, BlockKind::Plain)? } else { self.expr()? };
         let (ret, body) = match asynchronous {
-            true => (None, self.push_expr(Expr::Block { stmts: super::List::default(), tail: Some(body), label: None, kind: BlockKind::AsyncMove })),
+            true => (None, self.push_expr(Expr::Block { stmts: super::List::default(), tail: Some(body), label: None, kind: BlockKind::Async })),
             false => (ret, body),
         };
         Ok(self.push_expr(Expr::Closure { params, ret, body, capture }))

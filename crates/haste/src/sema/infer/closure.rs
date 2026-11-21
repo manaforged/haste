@@ -100,6 +100,7 @@ impl<'a> Infer<'_, 'a> {
         let depth = self.scopes.len();
         self.uses.push(Captures { first: self.out.locals.len() as u32, ..Captures::default() });
         let ret = self.closure_part(ret, hint.as_ref().map(|(_, output)| *output))?;
+        let param_first = self.out.locals.len() as u32;
         let mut locals = Vec::new();
         for (index, &at) in self.body.list(params).iter().enumerate() {
             let Param { pat, ty } = self.body.params[at as usize];
@@ -107,7 +108,12 @@ impl<'a> Infer<'_, 'a> {
             let arena = self.body;
             locals.push(self.param_pat(arena, pat, ty, Some(pat))?);
         }
-        let found = self.closure_body(ret, |infer| infer.expr(body, Some(ret)).and_then(|found| infer.coerce_expr(body, found, ret)));
+        let param_locals: Vec<u32> = (param_first..self.out.locals.len() as u32).collect();
+        let async_body = matches!(*self.body.expr(body), Expr::Block { kind: crate::body::BlockKind::Async, stmts, .. } if self.body.list(stmts).is_empty());
+        let found = self.closure_body(ret, |infer| {
+            let found = if async_body { let ty = infer.coroutine_expr(body, (None, false), &param_locals)?; infer.out.exprs[body.0 as usize] = ty; ty } else { infer.expr(body, Some(ret))? };
+            infer.coerce_expr(body, found, ret)
+        });
         self.scopes.truncate(depth);
         let uses = self.uses.pop().expect("the closure pushed its uses");
         found?;
@@ -228,7 +234,7 @@ impl<'a> Infer<'_, 'a> {
             ty = step_field_ty(self.cx, ty, step)?;
         }
         let ty = self.resolve_opt(ty);
-        if ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Var(_)) { *known = false; }
+        if ty != Ty::NONE && self.has_vars(ty) { *known = false; }
         Ok((out, ty))
     }
 
@@ -315,7 +321,7 @@ impl<'a> Infer<'_, 'a> {
                 for cap in caps.into_iter().filter(|c| c.local < uses.first) {
                     let (_, cap_ty) = self.resolve_path(self.out.locals[cap.local as usize].ty, &cap.path, false, &mut known)?;
                     let by = if cap.by == By::Value && cap_ty != Ty::NONE && (!self.is_copy(cap_ty)? || self.needs_drop(cap_ty)?) { By::Value }
-                        else if cap.by != By::Ref { By::Mut } else { By::Ref };
+                        else if cap.by == By::Mut { By::Mut } else { By::Ref };
                     raw.push(Capture { local: cap.local, by, path: cap.path });
                 }
             }
