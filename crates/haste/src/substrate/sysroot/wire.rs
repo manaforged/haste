@@ -1,26 +1,27 @@
-use std::hash::Hasher as _;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::graph::Workspace;
 use crate::macros::Compilation;
 use crate::names::{Crate as NamesCrate, Sym, Symbols};
 use crate::outline::Outline;
-use crate::outline::source::{Outputs, Source};
-use crate::outline::tree::{Crate as OutlineCrate, Decl, File, Held, Impl, Macro, MemberBlock, Module, State, Textual, Waiting};
+use crate::outline::source::{Outputs, Source, SourceText, SourceTokens};
+use crate::outline::tree::{Crate as OutlineCrate, File, Macro, Textual};
 use crate::sema::summary::codec::{Cursor, write_u32, write_u64};
+use crate::substrate::Backing;
 
 use super::names::{read_names_crate, write_names_crate};
+use super::outline::{read_outline_crate, write_outline_crate};
 use super::tokens::{
-    frag_from_tag, read_items, read_mark, read_opt_u32, read_origins, read_path, read_paths, read_rules, read_str, read_tokens, read_u32s_map,
-    read_vis, u32_le, write_frag, write_items, write_mark, write_opt_u32, write_origins, write_path, write_paths, write_rules, write_str, write_tokens, write_usize,
-    write_vis,
+    TOKEN_WIRE_LEN, frag_from_tag, read_items, read_marks, read_opt_u32, read_origins, read_path, read_rules, read_str, u32_le,
+    write_frag, write_items, write_marks, write_opt_u32, write_origins, write_path, write_rules, write_str, write_tokens, write_usize,
 };
 use super::{CrateIdentity, HEADER_LEN, SYSROOT_MAGIC, SYSROOT_VERSION, identity_of, match_crates};
 
 const FIXED_SYM_COUNT: u32 = 23;
+const CHECKSUM_K: u64 = 0x517cc1b727220a95;
 
 pub(super) struct Tables<'a> {
     to_local: Vec<Option<u32>>,
@@ -68,7 +69,7 @@ impl<'a> Tables<'a> {
         id
     }
 
-    fn file(&mut self, file: &'a Arc<File>) -> u32 {
+    pub(super) fn file(&mut self, file: &'a Arc<File>) -> u32 {
         let ptr = Arc::as_ptr(file) as usize;
         if let Some(&id) = self.file_map.get(&ptr) {
             return id;
@@ -82,7 +83,7 @@ impl<'a> Tables<'a> {
         id
     }
 
-    fn mac(&mut self, mac: &'a Arc<Macro>) -> u32 {
+    pub(super) fn mac(&mut self, mac: &'a Arc<Macro>) -> u32 {
         let ptr = Arc::as_ptr(mac) as usize;
         if let Some(&id) = self.macro_map.get(&ptr) {
             return id;
@@ -94,7 +95,7 @@ impl<'a> Tables<'a> {
         id
     }
 
-    fn textual(&mut self, node: &'a Arc<Textual>) -> u32 {
+    pub(super) fn textual(&mut self, node: &'a Arc<Textual>) -> u32 {
         let ptr = Arc::as_ptr(node) as usize;
         if let Some(&id) = self.textual_map.get(&ptr) {
             return id;
@@ -114,10 +115,7 @@ impl<'a> Tables<'a> {
     }
 }
 
-fn write_chunked<T>(
-    items: &[T],
-    mut encode: impl FnMut(&mut Vec<u8>, &T) -> Option<()>,
-) -> Option<(Vec<u32>, Vec<u8>)> {
+fn write_chunked<T>(items: &[T], mut encode: impl FnMut(&mut Vec<u8>, &T) -> Option<()>) -> Option<(Vec<u32>, Vec<u8>)> {
     let mut ends = Vec::with_capacity(items.len());
     let mut blob = Vec::new();
     for item in items {
@@ -144,7 +142,7 @@ fn read_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<&'a [u8]>> 
     Ok(ranges.into_iter().map(|(s, e)| &blob[s..e]).collect())
 }
 
-fn read_file_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<(&'a [u8], Option<u32>)>> {
+fn read_file_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<(usize, &'a [u8], Option<u32>)>> {
     let table_bytes = count.checked_mul(8).context("file table overflow")?;
     let table = cur.take(table_bytes)?;
     let mut entries = Vec::with_capacity(count);
@@ -158,26 +156,61 @@ fn read_file_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<(&'a [
         entries.push((prev, end, (base_raw != u32::MAX).then_some(base_raw)));
         prev = end;
     }
+    let blob_off = cur.pos;
     let blob = cur.take(prev)?;
-    Ok(entries.into_iter().map(|(s, e, base)| (&blob[s..e], base)).collect())
+    Ok(entries.into_iter().map(|(s, e, base)| (blob_off + s, &blob[s..e], base)).collect())
+}
+
+#[inline]
+fn u64_le(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3],
+        bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7],
+    ])
+}
+
+#[inline]
+fn mix64(acc: u64, word: u64) -> u64 {
+    (acc.rotate_left(5) ^ word).wrapping_mul(CHECKSUM_K)
 }
 
 fn hash_chunk(chunk: &[u8]) -> u64 {
-    let mut hasher = FxHasher::default();
-    hasher.write(chunk);
-    hasher.finish()
+    let mut h0: u64 = 0x9e3779b97f4a7c15;
+    let mut h1: u64 = 0xbf58476d1ce4e5b9;
+    let mut h2: u64 = 0x94d049bb133111eb;
+    let mut h3: u64 = CHECKSUM_K;
+    let mut blocks = chunk.chunks_exact(32);
+    for b in &mut blocks {
+        h0 = mix64(h0, u64_le(b, 0));
+        h1 = mix64(h1, u64_le(b, 8));
+        h2 = mix64(h2, u64_le(b, 16));
+        h3 = mix64(h3, u64_le(b, 24));
+    }
+    let mut tail = blocks.remainder();
+    while tail.len() >= 8 {
+        h0 = mix64(h0, u64_le(tail, 0));
+        tail = &tail[8..];
+    }
+    for &byte in tail {
+        h0 = mix64(h0, u64::from(byte));
+    }
+    let mut acc = (chunk.len() as u64).wrapping_mul(CHECKSUM_K);
+    acc = mix64(acc, h0);
+    acc = mix64(acc, h1);
+    acc = mix64(acc, h2);
+    acc = mix64(acc, h3);
+    acc ^ (acc >> 32)
 }
 
 fn payload_checksum(payload: &[u8]) -> u64 {
     const CHUNK: usize = 1024 * 1024;
     let chunks: Vec<&[u8]> = payload.chunks(CHUNK).collect();
     let hashes = crate::sync::parallel_map(chunks, hash_chunk);
-    let mut hasher = FxHasher::default();
-    hasher.write_usize(payload.len());
+    let mut acc = (payload.len() as u64).wrapping_mul(CHECKSUM_K);
     for h in hashes {
-        hasher.write_u64(h);
+        acc = mix64(acc, h);
     }
-    hasher.finish()
+    acc ^ (acc >> 32)
 }
 
 pub(super) fn encode_sysroot(key: u64, workspace: &Workspace, compilation: &Compilation, sysroot_crates: &[usize]) -> Option<Vec<u8>> {
@@ -199,7 +232,17 @@ pub(super) fn encode_sysroot(key: u64, workspace: &Workspace, compilation: &Comp
         write_opt_u32(&mut file_table, base_id);
     }
 
-    let mut out = Vec::with_capacity(crates_blob.len() + names_blob.len() + files_blob.len() + file_table.len() + 65536);
+    let (macro_ends, macros_blob) = write_chunked(&tables.macros, |buf, mac| {
+        let file_id = *tables.file_map.get(&(Arc::as_ptr(&mac.file) as usize))?;
+        write_u32(buf, file_id);
+        write_u32(buf, tables.local_krate(mac.krate)?);
+        write_rules(buf, &mac.rules, &tables.to_local)
+    })?;
+
+    let sym_blob_len: usize = tables.extra_syms.iter().map(|s| s.len()).sum();
+    let mut out = Vec::with_capacity(
+        crates_blob.len() + names_blob.len() + files_blob.len() + file_table.len() + macros_blob.len() + sym_blob_len + 65536,
+    );
     out.extend_from_slice(&SYSROOT_MAGIC);
     write_u32(&mut out, SYSROOT_VERSION);
     write_u32(&mut out, u32::try_from(sysroot_crates.len()).ok()?);
@@ -213,21 +256,25 @@ pub(super) fn encode_sysroot(key: u64, workspace: &Workspace, compilation: &Comp
     }
 
     write_usize(&mut out, tables.extra_syms.len())?;
+    write_usize(&mut out, sym_blob_len)?;
+    let mut sym_end = 0usize;
     for sym in &tables.extra_syms {
-        write_str(&mut out, sym)?;
+        sym_end += sym.len();
+        write_usize(&mut out, sym_end)?;
+    }
+    for sym in &tables.extra_syms {
+        out.extend_from_slice(sym.as_bytes());
     }
 
     write_usize(&mut out, tables.files.len())?;
     out.extend_from_slice(&file_table);
     out.extend_from_slice(&files_blob);
 
-    write_usize(&mut out, tables.macros.len())?;
-    for mac in &tables.macros {
-        let file_id = *tables.file_map.get(&(Arc::as_ptr(&mac.file) as usize))?;
-        write_u32(&mut out, file_id);
-        write_u32(&mut out, tables.local_krate(mac.krate)?);
-        write_rules(&mut out, &mac.rules, &tables.to_local)?;
+    write_usize(&mut out, macro_ends.len())?;
+    for end in macro_ends {
+        write_u32(&mut out, end);
     }
+    out.extend_from_slice(&macros_blob);
 
     write_usize(&mut out, tables.textuals.len())?;
     for node in &tables.textuals {
@@ -250,12 +297,176 @@ pub(super) fn encode_sysroot(key: u64, workspace: &Workspace, compilation: &Comp
     Some(out)
 }
 
+fn decode_symbols(sym_ends: &[u8], sym_blob: &[u8]) -> Result<Symbols> {
+    let text = std::str::from_utf8(sym_blob).context("invalid sysroot symbol utf-8")?;
+    let symbols = Symbols::default();
+    let mut prev = 0usize;
+    for (idx, c) in sym_ends.chunks_exact(4).enumerate() {
+        let end = u32_le(c, 0) as usize;
+        if end < prev || end > text.len() || !text.is_char_boundary(end) {
+            bail!("invalid sysroot symbol boundary");
+        }
+        let expected = FIXED_SYM_COUNT + idx as u32;
+        if symbols.intern(&text[prev..end]).0 != expected {
+            bail!("sysroot symbol table mismatch");
+        }
+        prev = end;
+    }
+    if prev != text.len() {
+        bail!("trailing bytes in sysroot symbol blob");
+    }
+    Ok(symbols)
+}
+
+fn decode_files(backing: &Arc<Backing>, file_slices: Vec<(usize, &[u8], Option<u32>)>, remap: &[u32]) -> Result<Vec<Arc<File>>> {
+    let file_count = file_slices.len();
+    let mut depths = vec![0usize; file_count];
+    let mut max_depth = 0usize;
+    for (idx, &(_, _, base)) in file_slices.iter().enumerate() {
+        if let Some(base_id) = base {
+            let base_idx = base_id as usize;
+            if base_idx >= idx {
+                bail!("invalid sysroot file base dependency");
+            }
+            let d = depths[base_idx] + 1;
+            depths[idx] = d;
+            max_depth = max_depth.max(d);
+        }
+    }
+    let mut levels: Vec<Vec<(usize, usize, &[u8], Option<u32>)>> = (0..=max_depth).map(|_| Vec::new()).collect();
+    for (idx, (file_off, slice, base)) in file_slices.into_iter().enumerate() {
+        levels[depths[idx]].push((idx, file_off, slice, base));
+    }
+    let mut file_slots: Vec<Option<Arc<File>>> = vec![None; file_count];
+    for mut level in levels {
+        if level.is_empty() {
+            continue;
+        }
+        level.sort_unstable_by(|a, b| b.2.len().cmp(&a.2.len()));
+        let slots_ref: &[Option<Arc<File>>] = &file_slots;
+        let decode_one = |(idx, file_off, slice, base_id): (usize, usize, &[u8], Option<u32>)| -> Result<(usize, Arc<File>)> {
+            let base = match base_id {
+                Some(id) => Some(Arc::clone(slots_ref[id as usize].as_ref().context("base file out of bounds")?)),
+                None => None,
+            };
+            let mut fcur = Cursor::new(slice);
+            let file = read_file(&mut fcur, backing, file_off, base, remap)?;
+            if fcur.pos != slice.len() {
+                bail!("trailing bytes in sysroot file");
+            }
+            Ok((idx, Arc::new(file)))
+        };
+        let total_bytes: usize = level.iter().map(|(_, _, s, _)| s.len()).sum();
+        let decoded = if level.len() >= 4 || (level.len() >= 2 && total_bytes >= 32 * 1024) {
+            crate::sync::parallel_map(level, decode_one)
+        } else {
+            level.into_iter().map(decode_one).collect()
+        };
+        for item in decoded {
+            let (idx, file) = item?;
+            file_slots[idx] = Some(file);
+        }
+    }
+    Ok(file_slots.into_iter().map(|f| f.expect("every file index decoded")).collect())
+}
+
+fn decode_macros(macro_slices: Vec<&[u8]>, files: &[Arc<File>], remap: &[u32]) -> Result<Vec<Arc<Macro>>> {
+    let mut tasks: Vec<(usize, &[u8])> = macro_slices.into_iter().enumerate().collect();
+    tasks.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let decode_one = |(idx, slice): (usize, &[u8])| -> Result<(usize, Arc<Macro>)> {
+        let mut mcur = Cursor::new(slice);
+        let file = Arc::clone(files.get(mcur.u32()? as usize).context("macro file out of bounds")?);
+        let krate = *remap.get(mcur.u32()? as usize).context("macro crate out of bounds")? as usize;
+        let rules = read_rules(&mut mcur, remap)?;
+        if mcur.pos != slice.len() {
+            bail!("trailing bytes in sysroot macro");
+        }
+        Ok((idx, Arc::new(Macro { file, rules, krate })))
+    };
+    let count = tasks.len();
+    let decoded = if count >= 16 {
+        crate::sync::parallel_map(tasks, decode_one)
+    } else {
+        tasks.into_iter().map(decode_one).collect()
+    };
+    let mut slots: Vec<Option<Arc<Macro>>> = vec![None; count];
+    for item in decoded {
+        let (idx, mac) = item?;
+        slots[idx] = Some(mac);
+    }
+    Ok(slots.into_iter().map(|m| m.expect("every macro decoded")).collect())
+}
+
+fn decode_crates(
+    outline_slices: Vec<&[u8]>,
+    name_slices: Vec<&[u8]>,
+    files: &[Arc<File>],
+    macros: &[Arc<Macro>],
+    textuals: &[Arc<Textual>],
+    local_crates: &[usize],
+    remap: &[u32],
+) -> Result<(Vec<(usize, OutlineCrate)>, Vec<(usize, NamesCrate)>)> {
+    enum CrateTask<'a> {
+        Outline(usize, &'a [u8]),
+        Names(usize, &'a [u8]),
+    }
+    enum CrateOut {
+        Outline(usize, OutlineCrate),
+        Names(usize, NamesCrate),
+    }
+    let crate_count = local_crates.len();
+    let mut tasks = Vec::with_capacity(crate_count * 2);
+    for (pos, slice) in outline_slices.into_iter().enumerate() {
+        tasks.push(CrateTask::Outline(pos, slice));
+    }
+    for (pos, slice) in name_slices.into_iter().enumerate() {
+        tasks.push(CrateTask::Names(pos, slice));
+    }
+    tasks.sort_unstable_by(|a, b| {
+        let la = match a { CrateTask::Outline(_, s) | CrateTask::Names(_, s) => s.len() };
+        let lb = match b { CrateTask::Outline(_, s) | CrateTask::Names(_, s) => s.len() };
+        lb.cmp(&la)
+    });
+    let decoded = crate::sync::parallel_map(tasks, |task| -> Result<CrateOut> {
+        match task {
+            CrateTask::Outline(pos, slice) => {
+                let mut ccur = Cursor::new(slice);
+                let krate = read_outline_crate(&mut ccur, files, macros, textuals, remap)?;
+                if ccur.pos != slice.len() {
+                    bail!("trailing bytes in sysroot outline crate");
+                }
+                Ok(CrateOut::Outline(pos, krate))
+            }
+            CrateTask::Names(pos, slice) => {
+                let mut ccur = Cursor::new(slice);
+                let krate = read_names_crate(&mut ccur, remap)?;
+                if ccur.pos != slice.len() {
+                    bail!("trailing bytes in sysroot names crate");
+                }
+                Ok(CrateOut::Names(pos, krate))
+            }
+        }
+    });
+    let mut outline_slots: Vec<Option<OutlineCrate>> = (0..crate_count).map(|_| None).collect();
+    let mut name_slots: Vec<Option<NamesCrate>> = (0..crate_count).map(|_| None).collect();
+    for item in decoded {
+        match item? {
+            CrateOut::Outline(pos, krate) => outline_slots[pos] = Some(krate),
+            CrateOut::Names(pos, krate) => name_slots[pos] = Some(krate),
+        }
+    }
+    let outline_crates = local_crates.iter().zip(outline_slots).map(|(&k, s)| (k, s.expect("every outline crate decoded"))).collect();
+    let name_crates = local_crates.iter().zip(name_slots).map(|(&k, s)| (k, s.expect("every names crate decoded"))).collect();
+    Ok((outline_crates, name_crates))
+}
+
 pub(super) fn decode_sysroot(
-    data: &[u8],
+    backing: &Arc<Backing>,
     expected_key: u64,
     workspace: &Workspace,
     outline: &Outline,
 ) -> Result<Option<(Vec<(usize, OutlineCrate)>, Symbols, Vec<(usize, NamesCrate)>)>> {
+    let data = backing.as_slice();
     let mut cur = Cursor::new(data);
     if cur.take(8)? != SYSROOT_MAGIC {
         bail!("invalid sysroot cache magic");
@@ -282,69 +493,19 @@ pub(super) fn decode_sysroot(
     let remap: Vec<u32> = local_crates.iter().map(|&k| k as u32).collect();
 
     let sym_count = cur.count()?;
-    let symbols = Symbols::default();
-    for idx in 0..sym_count {
-        let text = read_str(&mut cur)?;
-        let expected = FIXED_SYM_COUNT + idx as u32;
-        if symbols.intern(text).0 != expected {
-            bail!("sysroot symbol table mismatch");
-        }
-    }
+    let sym_blob_len = cur.count()?;
+    let sym_ends = cur.take(sym_count.checked_mul(4).context("symbol ends overflow")?)?;
+    let sym_blob = cur.take(sym_blob_len)?;
 
     let file_count = cur.count()?;
     let file_slices = read_file_slices(&mut cur, file_count)?;
-    let mut indep = Vec::with_capacity(file_count);
-    let mut deps = Vec::new();
-    for (idx, &(slice, base)) in file_slices.iter().enumerate() {
-        match base {
-            None => indep.push((idx, slice)),
-            Some(base_id) => deps.push((idx, slice, base_id)),
-        }
-    }
-    indep.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()));
-    let decoded_indep = crate::sync::parallel_map(indep, |(idx, slice)| -> Result<(usize, Arc<File>)> {
-        let mut fcur = Cursor::new(slice);
-        let file = read_file(&mut fcur, None, &remap)?;
-        if fcur.pos != slice.len() {
-            bail!("trailing bytes in sysroot file");
-        }
-        Ok((idx, Arc::new(file)))
-    });
-    let mut file_slots: Vec<Option<Arc<File>>> = vec![None; file_count];
-    for item in decoded_indep {
-        let (idx, file) = item?;
-        file_slots[idx] = Some(file);
-    }
-    for (idx, slice, base_id) in deps {
-        let base = Arc::clone(file_slots.get(base_id as usize).and_then(Option::as_ref).context("base file out of bounds")?);
-        let mut fcur = Cursor::new(slice);
-        let file = read_file(&mut fcur, Some(base), &remap)?;
-        if fcur.pos != slice.len() {
-            bail!("trailing bytes in sysroot file");
-        }
-        file_slots[idx] = Some(Arc::new(file));
-    }
-    let files: Vec<Arc<File>> = file_slots.into_iter().map(|f| f.expect("every file index decoded")).collect();
-
     let macro_count = cur.count()?;
-    let mut macros = Vec::with_capacity(macro_count);
-    for _ in 0..macro_count {
-        let file = Arc::clone(files.get(cur.u32()? as usize).context("macro file out of bounds")?);
-        let krate = *remap.get(cur.u32()? as usize).context("macro crate out of bounds")? as usize;
-        let rules = read_rules(&mut cur, &remap)?;
-        macros.push(Arc::new(Macro { file, rules, krate }));
-    }
+    let macro_slices = read_slices(&mut cur, macro_count)?;
 
     let textual_count = cur.count()?;
-    let mut textuals: Vec<Arc<Textual>> = Vec::with_capacity(textual_count);
+    let mut textual_raw = Vec::with_capacity(textual_count);
     for _ in 0..textual_count {
-        let name = read_str(&mut cur)?.to_owned();
-        let def = Arc::clone(macros.get(cur.u32()? as usize).context("textual macro out of bounds")?);
-        let next = match read_opt_u32(&mut cur)? {
-            Some(id) => Some(Arc::clone(textuals.get(id as usize).context("textual next out of bounds")?)),
-            None => None,
-        };
-        textuals.push(Arc::new(Textual { name, def, next }));
+        textual_raw.push((read_str(&mut cur)?.to_owned(), cur.u32()?, read_opt_u32(&mut cur)?));
     }
 
     let outline_slices = read_slices(&mut cur, crate_count)?;
@@ -353,59 +514,35 @@ pub(super) fn decode_sysroot(
         bail!("trailing bytes in sysroot cache");
     }
 
-    enum CrateTask<'a> {
-        Outline(usize, &'a [u8]),
-        Names(usize, &'a [u8]),
-    }
-    enum CrateOut {
-        Outline(usize, OutlineCrate),
-        Names(usize, NamesCrate),
-    }
-
-    let mut tasks = Vec::with_capacity(crate_count * 2);
-    for (pos, slice) in outline_slices.into_iter().enumerate() {
-        tasks.push(CrateTask::Outline(pos, slice));
-    }
-    for (pos, slice) in name_slices.into_iter().enumerate() {
-        tasks.push(CrateTask::Names(pos, slice));
-    }
-    tasks.sort_unstable_by(|a, b| {
-        let la = match a { CrateTask::Outline(_, s) | CrateTask::Names(_, s) => s.len() };
-        let lb = match b { CrateTask::Outline(_, s) | CrateTask::Names(_, s) => s.len() };
-        lb.cmp(&la)
-    });
-
-    let decoded = crate::sync::parallel_map(tasks, |task| -> Result<CrateOut> {
-        match task {
-            CrateTask::Outline(pos, slice) => {
-                let mut ccur = Cursor::new(slice);
-                let krate = read_outline_crate(&mut ccur, &files, &macros, &textuals, &remap)?;
-                if ccur.pos != slice.len() {
-                    bail!("trailing bytes in sysroot outline crate");
-                }
-                Ok(CrateOut::Outline(pos, krate))
-            }
-            CrateTask::Names(pos, slice) => {
-                let mut ccur = Cursor::new(slice);
-                let krate = read_names_crate(&mut ccur, &remap)?;
-                if ccur.pos != slice.len() {
-                    bail!("trailing bytes in sysroot names crate");
-                }
-                Ok(CrateOut::Names(pos, krate))
-            }
+    let decode_rest = || -> Result<(Vec<(usize, OutlineCrate)>, Vec<(usize, NamesCrate)>)> {
+        let files = decode_files(backing, file_slices, &remap)?;
+        let macros = decode_macros(macro_slices, &files, &remap)?;
+        let mut textuals: Vec<Arc<Textual>> = Vec::with_capacity(textual_count);
+        for (name, def_id, next_id) in textual_raw {
+            let def = Arc::clone(macros.get(def_id as usize).context("textual macro out of bounds")?);
+            let next = match next_id {
+                Some(id) => Some(Arc::clone(textuals.get(id as usize).context("textual next out of bounds")?)),
+                None => None,
+            };
+            textuals.push(Arc::new(Textual { name, def, next }));
         }
-    });
+        decode_crates(outline_slices, name_slices, &files, &macros, &textuals, &local_crates, &remap)
+    };
 
-    let mut outline_slots: Vec<Option<OutlineCrate>> = (0..crate_count).map(|_| None).collect();
-    let mut name_slots: Vec<Option<NamesCrate>> = (0..crate_count).map(|_| None).collect();
-    for item in decoded {
-        match item? {
-            CrateOut::Outline(pos, krate) => outline_slots[pos] = Some(krate),
-            CrateOut::Names(pos, krate) => name_slots[pos] = Some(krate),
-        }
-    }
-    let outline_crates = local_crates.iter().zip(outline_slots).map(|(&krate, slot)| (krate, slot.expect("every outline crate decoded"))).collect();
-    let name_crates = local_crates.iter().zip(name_slots).map(|(&krate, slot)| (krate, slot.expect("every names crate decoded"))).collect();
+    let (symbols, (outline_crates, name_crates)) = if crate::jobs() > 1 && sym_count >= 256 {
+        std::thread::scope(|scope| -> Result<(Symbols, (Vec<(usize, OutlineCrate)>, Vec<(usize, NamesCrate)>))> {
+            let sym_handle = scope.spawn(|| decode_symbols(sym_ends, sym_blob));
+            let crates_res = decode_rest();
+            let syms_res = match sym_handle.join() {
+                Ok(res) => res,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+            Ok((syms_res?, crates_res?))
+        })?
+    } else {
+        (decode_symbols(sym_ends, sym_blob)?, decode_rest()?)
+    };
+
     Ok(Some((outline_crates, symbols, name_crates)))
 }
 
@@ -451,11 +588,7 @@ fn write_file(out: &mut Vec<u8>, file: &Arc<File>, to_local: &[Option<u32>]) -> 
     write_path(out, &src.path)?;
     write_str(out, &src.text)?;
     write_tokens(out, &src.tokens)?;
-    write_usize(out, src.marks.len())?;
-    for &(at, mark) in &src.marks {
-        write_u32(out, at);
-        write_mark(out, mark, to_local)?;
-    }
+    write_marks(out, &src.marks, to_local)?;
     write_usize(out, src.opaque.len())?;
     for &(from, to, frag) in &src.opaque {
         write_u32(out, from);
@@ -470,15 +603,20 @@ fn write_file(out: &mut Vec<u8>, file: &Arc<File>, to_local: &[Option<u32>]) -> 
     Some(())
 }
 
-fn read_file(cur: &mut Cursor<'_>, base: Option<Arc<File>>, remap: &[u32]) -> Result<File> {
+fn read_file(cur: &mut Cursor<'_>, backing: &Arc<Backing>, file_off: usize, base: Option<Arc<File>>, remap: &[u32]) -> Result<File> {
     let path = read_path(cur)?;
-    let text = read_str(cur)?.to_owned();
-    let tokens = read_tokens(cur)?;
-    let mark_len = cur.count()?;
-    let mut marks = Vec::with_capacity(mark_len);
-    for _ in 0..mark_len {
-        marks.push((cur.u32()?, read_mark(cur, remap)?));
-    }
+    let text_len = cur.count()?;
+    let text_start = file_off + cur.pos;
+    cur.take(text_len)?;
+    let text_end = file_off + cur.pos;
+    let text = SourceText::mapped(Arc::clone(backing), text_start, text_end)?;
+    let tok_count = cur.count()?;
+    let tok_bytes = tok_count.checked_mul(TOKEN_WIRE_LEN).context("token stream overflow")?;
+    let tok_start = file_off + cur.pos;
+    cur.take(tok_bytes)?;
+    let tok_end = file_off + cur.pos;
+    let tokens = SourceTokens::lazy(Arc::clone(backing), tok_start, tok_end, tok_count)?;
+    let marks = read_marks(cur, remap)?;
     let opaque_len = cur.count()?;
     let opaque_bytes = cur.take(opaque_len.checked_mul(9).context("opaque overflow")?)?;
     let mut opaque = Vec::with_capacity(opaque_len);
@@ -494,296 +632,4 @@ fn read_file(cur: &mut Cursor<'_>, base: Option<Arc<File>>, remap: &[u32]) -> Re
     let mut file = File::new(source, items, expanded);
     file.expand_origin = expand_origin;
     Ok(file)
-}
-
-fn write_waiting<'a>(out: &mut Vec<u8>, w: &'a Waiting, tables: &mut Tables<'a>) -> Option<()> {
-    write_u32(out, tables.file(&w.file));
-    write_usize(out, w.owner)?;
-    write_u32(out, w.at);
-    let scope = w.scope.as_ref().map(|s| tables.textual(s));
-    write_opt_u32(out, scope);
-    Some(())
-}
-
-fn read_waiting(cur: &mut Cursor<'_>, files: &[Arc<File>], textuals: &[Arc<Textual>]) -> Result<Waiting> {
-    let file = Arc::clone(files.get(cur.u32()? as usize).context("waiting file out of bounds")?);
-    let owner = cur.u32()? as usize;
-    let at = cur.u32()?;
-    let scope = match read_opt_u32(cur)? {
-        Some(id) => Some(Arc::clone(textuals.get(id as usize).context("waiting scope out of bounds")?)),
-        None => None,
-    };
-    Ok(Waiting { file, owner, at, scope })
-}
-
-fn write_held<'a>(out: &mut Vec<u8>, h: &'a Held, tables: &mut Tables<'a>) -> Option<()> {
-    write_u32(out, tables.file(&h.file));
-    write_usize(out, h.owner)?;
-    write_u32(out, h.at);
-    write_u32(out, h.path.0);
-    write_u32(out, h.path.1);
-    Some(())
-}
-
-fn read_held(cur: &mut Cursor<'_>, files: &[Arc<File>]) -> Result<Held> {
-    let file = Arc::clone(files.get(cur.u32()? as usize).context("held file out of bounds")?);
-    let owner = cur.u32()? as usize;
-    let at = cur.u32()?;
-    let path = (cur.u32()?, cur.u32()?);
-    Ok(Held { file, owner, at, path })
-}
-
-fn write_impls(out: &mut Vec<u8>, impls: &[Impl]) -> Option<()> {
-    write_usize(out, impls.len())?;
-    for block in impls {
-        write_usize(out, block.file)?;
-        write_u32(out, block.at);
-        write_usize(out, block.module)?;
-        write_usize(out, block.parts.len())?;
-        for &part in &block.parts {
-            write_usize(out, part)?;
-        }
-    }
-    Some(())
-}
-
-fn read_impls(cur: &mut Cursor<'_>) -> Result<Vec<Impl>> {
-    let count = cur.count()?;
-    let mut impls = Vec::with_capacity(count);
-    for _ in 0..count {
-        let file = cur.u32()? as usize;
-        let at = cur.u32()?;
-        let module = cur.u32()? as usize;
-        let parts = read_u32s_map(cur, |v| v as usize)?;
-        impls.push(Impl { file, at, module, parts });
-    }
-    Ok(impls)
-}
-
-fn write_local_krates(out: &mut Vec<u8>, krates: &[usize], tables: &Tables<'_>) -> Option<()> {
-    write_usize(out, krates.len())?;
-    for &dep in krates {
-        write_u32(out, tables.local_krate(dep)?);
-    }
-    Some(())
-}
-
-fn read_remapped_krates(cur: &mut Cursor<'_>, remap: &[u32], err: &'static str) -> Result<Vec<usize>> {
-    let count = cur.count()?;
-    let bytes = cur.take(count.checked_mul(4).context("crate list overflow")?)?;
-    let mut out = Vec::with_capacity(count);
-    for c in bytes.chunks_exact(4) {
-        out.push(*remap.get(u32_le(c, 0) as usize).context(err)? as usize);
-    }
-    Ok(out)
-}
-
-fn write_outline_crate<'a>(out: &mut Vec<u8>, krate: &'a OutlineCrate, tables: &mut Tables<'a>) -> Option<()> {
-    write_usize(out, krate.files.len())?;
-    for file in &krate.files {
-        let id = tables.file(file);
-        write_u32(out, id);
-    }
-    write_usize(out, krate.modules.len())?;
-    for module in &krate.modules {
-        write_opt_u32(out, (module.file != usize::MAX).then_some(module.file as u32));
-        write_opt_u32(out, module.item);
-        write_opt_u32(out, module.parent.map(|p| p as u32));
-        write_str(out, &module.name)?;
-        write_path(out, &module.dir)?;
-        write_usize(out, module.parts.len())?;
-        for &part in &module.parts {
-            write_usize(out, part)?;
-        }
-        write_vis(out, module.vis);
-        out.push(u8::from(module.macro_use));
-        match &module.state {
-            State::Declared(Decl::Inline { file, at }) => { out.push(0); write_usize(out, *file)?; write_u32(out, *at); }
-            State::Declared(Decl::File { candidates, by_attr }) => {
-                out.push(1);
-                write_paths(out, candidates)?;
-                out.push(u8::from(*by_attr));
-            }
-            State::Loaded => out.push(2),
-            State::Missing => out.push(3),
-            State::Gated => out.push(4),
-        }
-        let textual = module.textual.as_ref().map(|t| tables.textual(t));
-        write_opt_u32(out, textual);
-    }
-    write_paths(out, &krate.missing)?;
-    write_paths(out, &krate.gated)?;
-    write_usize(out, krate.errors.len())?;
-    for e in &krate.errors { write_str(out, e)?; }
-    write_usize(out, krate.exports.len())?;
-    for (name, mac) in &krate.exports {
-        write_str(out, name)?;
-        write_u32(out, tables.mac(mac));
-    }
-    write_usize(out, krate.defined.len())?;
-    for (&(file, item), mac) in &krate.defined {
-        write_u32(out, file);
-        write_u32(out, item);
-        write_u32(out, tables.mac(mac));
-    }
-    write_usize(out, krate.deferred.len())?;
-    for w in &krate.deferred { write_waiting(out, w, tables)?; }
-    write_impls(out, &krate.impls)?;
-    write_impls(out, &krate.traits)?;
-    write_usize(out, krate.impl_bodies.len())?;
-    for &(file, at) in &krate.impl_bodies {
-        write_usize(out, file)?;
-        write_u32(out, at);
-    }
-    write_usize(out, krate.members.len())?;
-    for (block, w) in &krate.members {
-        match *block {
-            MemberBlock::Impl(idx) => { out.push(0); write_usize(out, idx)?; }
-            MemberBlock::Trait(idx) => { out.push(1); write_usize(out, idx)?; }
-        }
-        write_waiting(out, w, tables)?;
-    }
-    write_local_krates(out, &krate.fallback, tables)?;
-    write_usize(out, krate.foreign.len())?;
-    for w in &krate.foreign { write_waiting(out, w, tables)?; }
-    write_usize(out, krate.global_asm.len())?;
-    for w in &krate.global_asm { write_waiting(out, w, tables)?; }
-    write_usize(out, krate.derived.len())?;
-    for h in &krate.derived { write_held(out, h, tables)?; }
-    write_usize(out, krate.attributed.len())?;
-    for h in &krate.attributed { write_held(out, h, tables)?; }
-    write_usize(out, krate.consumed.len())?;
-    for &(file, item) in &krate.consumed {
-        write_u32(out, file);
-        write_u32(out, item);
-    }
-    write_local_krates(out, &krate.macro_use, tables)?;
-    write_usize(out, krate.expansions)?;
-    Some(())
-}
-
-fn read_outline_crate(
-    cur: &mut Cursor<'_>,
-    files: &[Arc<File>],
-    macros: &[Arc<Macro>],
-    textuals: &[Arc<Textual>],
-    remap: &[u32],
-) -> Result<OutlineCrate> {
-    let file_count = cur.count()?;
-    let file_bytes = cur.take(file_count.checked_mul(4).context("crate files overflow")?)?;
-    let mut crate_files = Vec::with_capacity(file_count);
-    for c in file_bytes.chunks_exact(4) {
-        crate_files.push(Arc::clone(files.get(u32_le(c, 0) as usize).context("crate file out of bounds")?));
-    }
-    let mod_count = cur.count()?;
-    let mut modules = Vec::with_capacity(mod_count);
-    for _ in 0..mod_count {
-        let file = read_opt_u32(cur)?.map_or(usize::MAX, |v| v as usize);
-        let item = read_opt_u32(cur)?;
-        let parent = read_opt_u32(cur)?.map(|v| v as usize);
-        let name = read_str(cur)?.to_owned();
-        let dir = read_path(cur)?;
-        let parts = read_u32s_map(cur, |v| v as usize)?;
-        let vis = read_vis(cur)?;
-        let macro_use = cur.u8()? != 0;
-        let state = match cur.u8()? {
-            0 => State::Declared(Decl::Inline { file: cur.u32()? as usize, at: cur.u32()? }),
-            1 => State::Declared(Decl::File { candidates: read_paths(cur)?, by_attr: cur.u8()? != 0 }),
-            2 => State::Loaded,
-            3 => State::Missing,
-            4 => State::Gated,
-            _ => bail!("invalid module state tag"),
-        };
-        let textual = match read_opt_u32(cur)? {
-            Some(id) => Some(Arc::clone(textuals.get(id as usize).context("module textual out of bounds")?)),
-            None => None,
-        };
-        modules.push(Module { file, item, parent, name, dir, parts, vis, macro_use, state, textual });
-    }
-    let missing = read_paths(cur)?;
-    let gated = read_paths(cur)?;
-    let err_len = cur.count()?;
-    let mut errors = Vec::with_capacity(err_len);
-    for _ in 0..err_len { errors.push(read_str(cur)?.to_owned()); }
-    let export_len = cur.count()?;
-    let mut exports = HashMap::with_capacity_and_hasher(export_len, Default::default());
-    for _ in 0..export_len {
-        let name = read_str(cur)?.to_owned();
-        let mac = Arc::clone(macros.get(cur.u32()? as usize).context("export macro out of bounds")?);
-        exports.insert(name, mac);
-    }
-    let def_len = cur.count()?;
-    let def_bytes = cur.take(def_len.checked_mul(12).context("defined macros overflow")?)?;
-    let mut defined = HashMap::with_capacity_and_hasher(def_len, Default::default());
-    for c in def_bytes.chunks_exact(12) {
-        let key = (u32_le(c, 0), u32_le(c, 4));
-        let mac = Arc::clone(macros.get(u32_le(c, 8) as usize).context("defined macro out of bounds")?);
-        defined.insert(key, mac);
-    }
-    let deferred = read_waitings(cur, files, textuals)?;
-    let impls = read_impls(cur)?;
-    let traits = read_impls(cur)?;
-    let body_len = cur.count()?;
-    let body_bytes = cur.take(body_len.checked_mul(8).context("impl bodies overflow")?)?;
-    let impl_bodies = body_bytes.chunks_exact(8).map(|c| (u32_le(c, 0) as usize, u32_le(c, 4))).collect();
-    let member_len = cur.count()?;
-    let mut members = Vec::with_capacity(member_len);
-    for _ in 0..member_len {
-        let block = match cur.u8()? {
-            0 => MemberBlock::Impl(cur.u32()? as usize),
-            1 => MemberBlock::Trait(cur.u32()? as usize),
-            _ => bail!("invalid member block tag"),
-        };
-        members.push((block, read_waiting(cur, files, textuals)?));
-    }
-    let fallback = read_remapped_krates(cur, remap, "fallback crate out of bounds")?;
-    let foreign = read_waitings(cur, files, textuals)?;
-    let global_asm = read_waitings(cur, files, textuals)?;
-    let derived = read_helds(cur, files)?;
-    let attributed = read_helds(cur, files)?;
-    let consumed_len = cur.count()?;
-    let consumed_bytes = cur.take(consumed_len.checked_mul(8).context("consumed overflow")?)?;
-    let mut consumed = HashSet::with_capacity_and_hasher(consumed_len, Default::default());
-    for c in consumed_bytes.chunks_exact(8) {
-        consumed.insert((u32_le(c, 0), u32_le(c, 4)));
-    }
-    let macro_use = read_remapped_krates(cur, remap, "macro_use crate out of bounds")?;
-    let expansions = cur.u32()? as usize;
-    Ok(OutlineCrate {
-        env: Default::default(),
-        files: crate_files,
-        modules,
-        missing,
-        gated,
-        errors,
-        exports,
-        defined,
-        deferred,
-        impls,
-        traits,
-        impl_bodies,
-        members,
-        fallback,
-        foreign,
-        global_asm,
-        derived,
-        attributed,
-        consumed,
-        macro_use,
-        expansions,
-    })
-}
-
-fn read_waitings(cur: &mut Cursor<'_>, files: &[Arc<File>], textuals: &[Arc<Textual>]) -> Result<Vec<Waiting>> {
-    let count = cur.count()?;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count { out.push(read_waiting(cur, files, textuals)?); }
-    Ok(out)
-}
-
-fn read_helds(cur: &mut Cursor<'_>, files: &[Arc<File>]) -> Result<Vec<Held>> {
-    let count = cur.count()?;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count { out.push(read_held(cur, files)?); }
-    Ok(out)
 }

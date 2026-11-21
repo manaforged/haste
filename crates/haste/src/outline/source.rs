@@ -1,9 +1,8 @@
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+mod storage;
+pub use storage::{SourceText, SourceTokens};
 
-use super::rules::Frag;
-use super::tree::File;
-
+use std::{path::{Path, PathBuf}, sync::{Arc, Mutex}};
+use super::{rules::Frag, tree::File};
 use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap;
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
@@ -78,8 +77,8 @@ pub enum Mark {
 #[derive(Debug)]
 pub struct Source {
     pub path: PathBuf,
-    pub text: String,
-    pub tokens: Vec<Token>,
+    pub text: SourceText,
+    pub tokens: SourceTokens,
     pub marks: Vec<(u32, Mark)>,
     /// The token ranges, by index in this layer, that a macro wrote from an opaque fragment, with its kind.
     pub opaque: Vec<(u32, u32, Frag)>,
@@ -207,7 +206,7 @@ impl Tokens {
     pub fn finish(self, path: PathBuf) -> Result<Source> {
         let mut tokens = self.tokens;
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: self.text, tokens, marks: self.marks, opaque: self.opaque, base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(self.origins) })
+        Ok(Source { path, text: self.text.into(), tokens: tokens.into(), marks: self.marks, opaque: self.opaque, base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(self.origins) })
     }
 
     /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
@@ -586,7 +585,7 @@ impl Source {
         let mut text = text;
         let mut tokens = lex(&mut text);
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text, tokens, marks: Vec::new(), opaque: Vec::new(), base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(Vec::new()) })
+        Ok(Source { path, text: text.into(), tokens: tokens.into(), marks: Vec::new(), opaque: Vec::new(), base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(Vec::new()) })
     }
 
     #[inline]

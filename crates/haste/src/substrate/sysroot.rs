@@ -1,18 +1,20 @@
 //! Persistent disk cache for settled sysroot crate outlines, macros, and resolved name scopes.
 
 mod names;
-mod tokens;
+mod outline;
+pub(crate) mod tokens;
 mod wire;
 
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::graph::{Side, Targets, Workspace};
 use crate::macros::Compilation;
 use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::{Outline, Role};
 
-pub(crate) const SYSROOT_VERSION: u32 = 2;
+pub(crate) const SYSROOT_VERSION: u32 = 3;
 const SYSROOT_MAGIC: [u8; 8] = *b"HSTSYS01";
 const HEADER_LEN: usize = 32;
 const KEPT_SYSROOTS: usize = 8;
@@ -100,8 +102,8 @@ pub(crate) fn try_load(workspace: &Workspace, targets: &Targets, outline: &mut O
     }
     let key = super::sysroot_key(workspace, targets);
     let path = super::sysroot_cache_path(key);
-    let backing = super::Backing::open(&path, HEADER_LEN).ok()?;
-    match wire::decode_sysroot(backing.as_slice(), key, workspace, outline) {
+    let backing = Arc::new(super::Backing::open(&path, HEADER_LEN).ok()?);
+    match wire::decode_sysroot(&backing, key, workspace, outline) {
         Ok(Some((crates, symbols, names))) => {
             for (krate, mut tree) in crates {
                 tree.env = std::mem::take(&mut outline.crates[krate].env);

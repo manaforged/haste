@@ -105,7 +105,7 @@ fn decode_table<T>(bytes: &[u8], width: usize, name: &str, entry: impl FnMut(usi
 }
 
 #[cfg(unix)]
-pub(super) struct Backing {
+pub(crate) struct Backing {
     ptr: NonNull<u8>,
     len: usize,
 }
@@ -129,7 +129,7 @@ impl Drop for Backing {
 
 #[cfg(unix)]
 impl Backing {
-    pub(super) fn open(path: &Path, min_len: usize) -> Result<Self> {
+    pub(crate) fn open(path: &Path, min_len: usize) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
         let len_u64 = meta.len();
@@ -146,18 +146,18 @@ impl Backing {
         Ok(Backing { ptr, len })
     }
 
-    pub(super) fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` is valid for `len` bytes for the lifetime of `&self` and never mutated.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
 #[cfg(not(unix))]
-pub(super) struct Backing(Box<[u8]>);
+pub(crate) struct Backing(Box<[u8]>);
 
 #[cfg(not(unix))]
 impl Backing {
-    pub(super) fn open(path: &Path, min_len: usize) -> Result<Self> {
+    pub(crate) fn open(path: &Path, min_len: usize) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         if bytes.len() < min_len {
             bail!("backing file smaller than header");
@@ -165,7 +165,7 @@ impl Backing {
         Ok(Backing(bytes.into_boxed_slice()))
     }
 
-    pub(super) fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         &self.0
     }
 }
