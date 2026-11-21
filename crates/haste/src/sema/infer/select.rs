@@ -573,15 +573,21 @@ impl<'a> Infer<'_, 'a> {
 
     /// The obligation `ty: of<args>` hashed with every unbound inference variable of a kind alike, so a nested obligation that repeats an enclosing one is a cycle.
     fn query(&self, of: ItemRef, ty: Ty, args: &[Ty]) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
+        let (mut hasher, mut seen) = (rustc_hash::FxHasher::default(), rustc_hash::FxHashMap::default());
         of.hash(&mut hasher);
-        self.hash_canonical(ty, &mut hasher);
-        self.hash_list(args, &mut hasher);
+        self.hash_canonical(ty, &mut hasher, &mut seen);
+        self.hash_list(args, &mut hasher, &mut seen);
         hasher.finish()
     }
 
-    fn hash_canonical(&self, ty: Ty, hasher: &mut rustc_hash::FxHasher) {
-        let kind = self.cx.types.kind(self.resolve(ty));
+    fn hash_canonical(&self, ty: Ty, hasher: &mut rustc_hash::FxHasher, seen: &mut rustc_hash::FxHashMap<Ty, u32>) {
+        let ty = self.resolve(ty);
+        let kind = self.cx.types.kind(ty);
+        let compound = !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Never | Kind::Prim(_) | Kind::Value(_) | Kind::Param(_));
+        if compound {
+            if let Some(&id) = seen.get(&ty) { (0xFFu8, id).hash(hasher); return; }
+            seen.insert(ty, seen.len() as u32);
+        }
         std::mem::discriminant(kind).hash(hasher);
         match kind {
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Never => {}
@@ -589,40 +595,22 @@ impl<'a> Infer<'_, 'a> {
             Kind::Value(bits) => bits.hash(hasher),
             Kind::Param(index) => index.hash(hasher),
             Kind::Proj(id) => id.hash(hasher),
-            Kind::Ref(mutable, inner) | Kind::Ptr(mutable, inner) => {
-                mutable.hash(hasher);
-                self.hash_canonical(*inner, hasher);
-            }
-            Kind::Slice(inner) => self.hash_canonical(*inner, hasher),
-            Kind::Array(inner, len) => self.hash_list(&[*inner, *len], hasher),
-            Kind::Tuple(items) => self.hash_list(self.cx.types.substs(*items), hasher),
-            Kind::Adt(item, items) | Kind::FnDef(item, items) => {
-                item.hash(hasher);
-                self.hash_list(self.cx.types.substs(*items), hasher);
-            }
-            Kind::FnPtr(params, ret) => {
-                self.hash_list(self.cx.types.substs(*params), hasher);
-                self.hash_canonical(*ret, hasher);
-            }
-            Kind::Closure(item, items, id) => {
-                (item, id).hash(hasher);
-                self.hash_list(self.cx.types.substs(*items), hasher);
-            }
-            Kind::Dyn(of, items, members, autos) => {
-                (of, members, autos).hash(hasher);
-                self.hash_list(self.cx.types.substs(*items), hasher);
-            }
-            Kind::Pat(base, start, end) => {
-                (start, end).hash(hasher);
-                self.hash_canonical(*base, hasher);
-            }
+            Kind::Ref(m, inner) | Kind::Ptr(m, inner) => { m.hash(hasher); self.hash_canonical(*inner, hasher, seen); }
+            Kind::Slice(inner) => self.hash_canonical(*inner, hasher, seen),
+            Kind::Array(inner, len) => self.hash_list(&[*inner, *len], hasher, seen),
+            Kind::Tuple(items) => self.hash_list(self.cx.types.substs(*items), hasher, seen),
+            Kind::Adt(item, items) | Kind::FnDef(item, items) => { item.hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
+            Kind::FnPtr(params, ret) => { self.hash_list(self.cx.types.substs(*params), hasher, seen); self.hash_canonical(*ret, hasher, seen); }
+            Kind::Closure(item, items, id) => { (item, id).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
+            Kind::Dyn(of, items, members, autos) => { (of, members, autos).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
+            Kind::Pat(base, start, end) => { (start, end).hash(hasher); self.hash_canonical(*base, hasher, seen); }
         }
     }
 
-    fn hash_list(&self, items: &[Ty], hasher: &mut rustc_hash::FxHasher) {
+    fn hash_list(&self, items: &[Ty], hasher: &mut rustc_hash::FxHasher, seen: &mut rustc_hash::FxHashMap<Ty, u32>) {
         items.len().hash(hasher);
         for &item in items {
-            self.hash_canonical(item, hasher);
+            self.hash_canonical(item, hasher, seen);
         }
     }
 
