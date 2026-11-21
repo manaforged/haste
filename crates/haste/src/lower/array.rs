@@ -238,7 +238,7 @@ impl Lower<'_, '_> {
         let Some(at) = self.expr(index)? else {
             return Ok(None);
         };
-        self.check_bounds(at, len);
+        self.check_bounds(at, len)?;
         self.element_place(data, at, self.ty_of(expr)).map(Some)
     }
 
@@ -254,7 +254,7 @@ impl Lower<'_, '_> {
             return Ok(Some(place.at(off, repr(self.cx, elem_ty)?)));
         }
         let len = self.ins().iconst(Type::I64, count);
-        self.check_bounds(at, len);
+        self.check_bounds(at, len)?;
         let data = self.address(place);
         self.element_place(data, at, elem_ty).map(Some)
     }
@@ -270,14 +270,14 @@ impl Lower<'_, '_> {
         };
         let count = self.len(count)?;
         let len = self.ins().iconst(Type::I64, count);
-        self.check_bounds(at, len);
+        self.check_bounds(at, len)?;
         let data = self.address_or_dangling(None, ty)?;
         self.element_place(data, at, self.ty_of(expr)).map(Some)
     }
 
-    fn check_bounds(&mut self, at: Value, len: Value) {
+    fn check_bounds(&mut self, at: Value, len: Value) -> Result<()> {
         let inside = self.ins().icmp(IntCC::UnsignedLessThan, at, len);
-        self.ins().trapz(inside);
+        self.check(inside, "index out of bounds")
     }
 
     /// The data pointer and length of the array or slice of type `ty` at `place`; `None` when it has no bytes.

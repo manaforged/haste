@@ -3,8 +3,8 @@
 haste is a clean-room Rust compiler, JIT engine, and standalone AOT compiler with its own frontend, SSA optimizer, and native x86-64 and ARM64 backends—built from scratch without LLVM or a `target/` directory.
 
 - **Self-hosting:** Compiles its own ~177k-function workspace in **10.0–11.4 s** on macOS ARM64 (`0.50 s` codegen) and **8.66 s** on Linux x86-64 (`3.03 s` sema, `0.42 s` codegen).
-- **Matches or beats `rustc -C opt-level=3` on AOT compute kernels** (`scripts/bench.sh`, with bit-identical outputs): macOS ARM64 `sha256` **0.79x**, `sort` **1.00x**, `sieve` **1.04x**, `scan` **1.40x**; Linux x86-64 `sha256` **0.89x**, `sieve` **0.92x**, `sort` **1.02x**, `scan` **1.18x**.
-- **4x–21x faster than `cargo` across all 3 build benchmarks** (`tests/diff`, 124 functions, macOS ARM64): single-line code edit rebuild **`13.4 ms`** vs `cargo` `282 ms` (**21.1x faster**), unchanged no-op **`3.4 ms`** vs `19.9 ms` (**5.8x faster**), and cold debug **`166 ms`** vs `665 ms` (**4.0x faster**). On Linux x86-64: edit **`12.0 ms`** vs `100 ms` (**8.4x**), no-op **`0.4 ms`** vs `6.3 ms` (**14.3x**), cold **`137 ms`** vs `404 ms` (**3.0x**).
+- **Matches or beats `rustc -C opt-level=3` on AOT compute kernels** (`scripts/bench.sh`, with bit-identical outputs): macOS ARM64 `sha256` **0.80x**, `sort` **0.93x**, `sieve` **0.99x**, `scan` **1.25x**; Linux x86-64 `sha256` **0.88x**, `sieve` **0.92x**, `scan` **0.98x**, `sort` **1.02x**.
+- **4x–22x faster than `cargo` across all 3 build benchmarks** (`tests/diff`, 124 functions, macOS ARM64): single-line code edit rebuild **`12.5 ms`** vs `cargo` `277 ms` (**22.1x faster**), unchanged no-op **`3.3 ms`** vs `19.6 ms` (**5.9x faster**), and cold debug **`164 ms`** vs `672 ms` (**4.1x faster**). On Linux x86-64: edit **`14.1 ms`** vs `107 ms` (**7.6x**), no-op **`0.6 ms`** vs `6.6 ms` (**11.7x**), cold **`170 ms`** vs `496 ms` (**2.9x**).
 - **Zero-linker 6-target AOT cross-compilation:** Emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) via `--target TRIPLE` with no external cross-linker.
 - **Differential verification:** **620/620** differential cases, **90/90** async cases, **15/15** proc-macro cases, **17/17** standalone crate probes (`jit+aot`), and **259/259 (100.0%)** official `rust-lang/rust` `tests/ui/` run-pass tests (`jit+aot`) verified bit-identically against `rustc`.
 
@@ -102,18 +102,18 @@ Measured on macOS Apple Silicon (`Darwin arm64`, `rustc 1.99.1`):
 
 | Benchmark | haste | cargo | Speedup |
 | --- | ---: | ---: | ---: |
-| Single-line code edit rebuild | 13.4 ms | 282 ms | 21.1x |
-| Unchanged no-op build | 3.4 ms | 19.9 ms | 5.8x |
-| Cold debug build | 166 ms | 665 ms | 4.0x |
+| Single-line code edit rebuild | 12.5 ms | 277 ms | 22.1x |
+| Unchanged no-op build | 3.3 ms | 19.6 ms | 5.9x |
+| Cold debug build | 164 ms | 672 ms | 4.1x |
 
 ### AOT codegen runtime (`haste --release` vs `rustc -C opt-level=3`, median of 5)
 
 | Workload | haste --release | rustc -O3 | Ratio | Output |
 | --- | ---: | ---: | ---: | --- |
-| `sha256` (250k blocks) | 56.2 ms | 70.9 ms | 0.79x | exact match (`7333157476866902348`) |
-| `sieve` (4M primes) | 6.7 ms | 6.5 ms | 1.04x | exact match (`544501644261`) |
-| `sort` (500k quicksort + bsearch) | 28.2 ms | 28.3 ms | 1.00x | exact match (`8647866321337317866`) |
-| `scan` (JSON-like byte scanner) | 10.4 ms | 7.4 ms | 1.40x | exact match (`80005120000`) |
+| `sha256` (250k blocks) | 53.3 ms | 66.4 ms | 0.80x | exact match (`7333157476866902348`) |
+| `sieve` (4M primes) | 6.3 ms | 6.4 ms | 0.99x | exact match (`544501644261`) |
+| `sort` (500k quicksort + bsearch) | 27.5 ms | 29.5 ms | 0.93x | exact match (`8647866321337317866`) |
+| `scan` (JSON-like byte scanner) | 9.7 ms | 7.8 ms | 1.25x | exact match (`80005120000`) |
 
 ## Verify it yourself
 
@@ -134,7 +134,7 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 
 - **Windows runtime:** Windows host runtime execution and PE32+ binaries built via `--target x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` are experimental, and `serve`/`--watch` require Unix.
 - **Full Polonius & HRTB lifetimes:** haste checks ownership, use-after-move (including across branches and loops), binding mutability, disjoint struct fields, NLL-style borrow aliasing, and dangling local reference returns on workspace crates, though full Polonius and higher-ranked lifetime (`for<'a>`) inference are not yet implemented; run `cargo check` or `rustc` in CI for complete lifetime verification.
-- **`catch_unwind` and `Drop` unwinding:** `std::panic::catch_unwind` runs `Drop` destructors on unwound frames in both JIT and standalone AOT (x86-64 and ARM64) with zero overhead on non-catching binaries; failed bounds checks and divide-by-zero currently trap (signal) rather than unwinding via `catch_unwind`, uncaught panics print their message and abort, and unwinding across C FFI frames is not supported.
+- **`catch_unwind` and `Drop` unwinding:** `std::panic::catch_unwind` runs `Drop` destructors on unwound frames in both JIT and standalone AOT (x86-64 and ARM64) including bounds-check and divide-by-zero panics, with zero overhead on non-catching binaries; uncaught panics print their message and abort, and unwinding across C FFI frames is not supported.
 - **Full `.debug_info`:** Standalone AOT executables emit symbol tables (`HASTE_SYMBOLS`) and DWARF `.debug_line` tables (`HASTE_DEBUG_INFO`) for backtraces and profiling, not full `.debug_info` variable/type DIEs.
 - **Test harnesses:** `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` (`Termination`) `#[test]` functions (not `#[tokio::test]` macro suites that depend on custom harnesses).
 - **Prepared mode:** `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.

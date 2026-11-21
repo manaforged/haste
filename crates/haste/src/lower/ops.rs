@@ -117,7 +117,7 @@ impl Lower<'_, '_> {
             (UnOp::Neg, Num::Int { ty, signed: true }) => {
                 let min = self.min_value(ty);
                 let ok = self.ins().icmp(IntCC::NotEqual, value, min);
-                self.overflow_check(ok);
+                self.overflow_check(ok, "attempt to negate with overflow")?;
                 self.ins().ineg(value)
             }
             _ => bail!("cannot lower {op:?} on this type"),
@@ -137,16 +137,56 @@ impl Lower<'_, '_> {
         self.int_const(ty, 1u128 << (bits - 1))
     }
 
-    /// Traps unless `ok` is nonzero, where rustc's debug build panics.
-    fn check(&mut self, ok: Value) {
-        self.ins().trapz(ok);
+    /// Traps or unwinds with `msg` unless `ok` is nonzero.
+    pub(super) fn check(&mut self, ok: Value, msg: &str) -> Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        if !self.reached.has_catch_unwind(self.cx) {
+            self.ins().trapz(ok);
+            return Ok(());
+        }
+        let (pass, fail) = (self.b.create_block(), self.b.create_block());
+        self.brif(ok, (pass, &[]), (fail, &[]));
+        self.enter(fail);
+        self.panic_str(msg)?;
+        self.enter(pass);
+        Ok(())
+    }
+
+    fn panic_str(&mut self, msg: &str) -> Result<()> {
+        let Some(item) = self.cx.lang_item("panic") else {
+            self.ins().trap();
+            self.close();
+            return Ok(());
+        };
+        let instance = (item, Substs::EMPTY);
+        if self.reached.index.get(&instance).is_none_or(|&idx| self.reached.is_untyped(idx)) {
+            let before = self.slots.wanted_len();
+            self.slots.want(instance);
+            if self.slots.wanted_len() > before {
+                bail!("a use of `{}` that was not reached", self.cx.name(item));
+            }
+            self.ins().trap();
+            self.close();
+            return Ok(());
+        }
+        let data = self.emit_const_rodata(msg.as_bytes());
+        let str_val = self.wide_pointer(data, msg.len() as i64);
+        self.invoke(super::reloc::SiteOrigin::Known(item, Substs::EMPTY), item, Substs::EMPTY, vec![str_val])?;
+        if self.open {
+            self.ins().trap();
+            self.close();
+        }
+        Ok(())
     }
 
     /// Checks `ok` where the body's crate checks overflow, as rustc's MIR for that crate does.
-    fn overflow_check(&mut self, ok: Value) {
+    fn overflow_check(&mut self, ok: Value, msg: &str) -> Result<()> {
         if self.overflow_checks {
-            self.check(ok);
+            self.check(ok, msg)?;
         }
+        Ok(())
     }
 
     pub(super) fn binary(&mut self, expr: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Option<Value>> {
@@ -273,7 +313,12 @@ impl Lower<'_, '_> {
             });
         }
         let (result, ok) = self.overflowing(op, num, x, y)?;
-        self.check(ok);
+        let msg = match op {
+            BinOp::Add => "attempt to add with overflow",
+            BinOp::Sub => "attempt to subtract with overflow",
+            _ => "attempt to multiply with overflow",
+        };
+        self.check(ok, msg)?;
         Ok(result)
     }
 
@@ -360,13 +405,23 @@ impl Lower<'_, '_> {
 
     fn divide(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
         let nonzero = self.ins().icmp_imm(IntCC::NotEqual, y, 0);
-        self.check(nonzero);
+        let zero_msg = if op == BinOp::Div {
+            "attempt to divide by zero"
+        } else {
+            "attempt to calculate the remainder with a divisor of zero"
+        };
+        self.check(nonzero, zero_msg)?;
         if signed {
             let min = self.min_value(ty);
             let not_min = self.ins().icmp(IntCC::NotEqual, x, min);
             let not_minus_one = self.ins().icmp_imm(IntCC::NotEqual, y, -1);
             let ok = self.ins().bor(not_min, not_minus_one);
-            self.check(ok);
+            let overflow_msg = if op == BinOp::Div {
+                "attempt to divide with overflow"
+            } else {
+                "attempt to calculate the remainder with overflow"
+            };
+            self.check(ok, overflow_msg)?;
         }
         Ok(match (op, signed) {
             (BinOp::Div, true) => self.ins().sdiv(x, y),
@@ -381,7 +436,12 @@ impl Lower<'_, '_> {
         let y = if self.overflow_checks {
             let bits = self.int_const(by, u128::from(ty.bits()));
             let ok = self.ins().icmp(IntCC::UnsignedLessThan, y, bits);
-            self.check(ok);
+            let msg = if op == BinOp::Shl {
+                "attempt to shift left with overflow"
+            } else {
+                "attempt to shift right with overflow"
+            };
+            self.check(ok, msg)?;
             y
         } else {
             let mask = self.int_const(by, u128::from(ty.bits() - 1));

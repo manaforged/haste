@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{IntCC, StackSlot, Type, Value};
 
-use crate::body::{Expr, ExprId};
+use crate::body::{BinOp, Expr, ExprId, UnOp};
 use crate::host::HostSymbol;
 use crate::sema::infer::{Fields, Res, Shape, drop_fn, field_types, has_drop_impl, needs_drop};
 use crate::sema::intrinsic::Intrinsic;
@@ -166,7 +166,14 @@ impl Lower<'_, '_> {
         }
         for (idx, expr) in self.body.exprs.iter().enumerate() {
             match expr {
-                Expr::FormatArgs(_) => return Ok(true),
+                Expr::FormatArgs(_) | Expr::Index(..) => return Ok(true),
+                Expr::Binary(op, ..) | Expr::AssignOp(op, ..)
+                    if matches!(op, BinOp::Div | BinOp::Rem)
+                        || (self.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::Shr)) =>
+                {
+                    return Ok(true);
+                }
+                Expr::Unary(UnOp::Neg, _) if self.overflow_checks => return Ok(true),
                 Expr::Call(callee, _)
                     if !matches!(self.typed.res.get(&ExprId(idx as u32)), Some(Res::Fn(..) | Res::Ctor(..)))
                         && !matches!(self.typed.res.get(callee), Some(Res::Fn(..) | Res::Ctor(..))) =>
