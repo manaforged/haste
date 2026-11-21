@@ -684,12 +684,55 @@ fn map_tests(roots: &[usize], reached: &Reached, starts: &[Option<usize>], items
     roots.iter().zip(starts).map(|(&idx, &start)| (by_item[&reached.list[idx].0.0].clone(), start)).collect()
 }
 
+fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp> {
+    let mut out = HashMap::default();
+    let mut stack = Vec::new();
+    for pkg in workspace.packages.iter().filter(|pkg| pkg.local()) {
+        for sub in ["src", "tests", "examples", "benches"] {
+            let dir = pkg.manifest.dir.join(sub);
+            if dir.is_dir() {
+                stack.push(dir);
+            }
+        }
+        let roots = pkg
+            .manifest
+            .lib
+            .iter()
+            .chain(pkg.manifest.bins.iter().map(|(_, p)| p))
+            .chain(pkg.manifest.examples.iter().map(|(_, p)| p))
+            .chain(pkg.manifest.tests.iter().map(|(_, p)| p));
+        for path in roots {
+            if path.is_file() {
+                out.insert(path.clone(), stamp(path));
+            }
+        }
+    }
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.insert(path.clone(), stamp(&path));
+            }
+        }
+    }
+    out
+}
+
 impl Build {
     /// Loads every crate of `workspace`, resolves its names and expands its macros, inferring and compiling nothing yet.
     pub fn load(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
         let outline_clock = sema::census::Clock::now();
+        let pre = pre_stamps(workspace);
         let compilation = crate::macros::load_lazy(workspace, targets)?;
-        let stamps = stamps(workspace, &compilation.outline);
+        let mut stamps = stamps(workspace, &compilation.outline);
+        for watch in &mut stamps {
+            if let Some(&old) = pre.get(&watch.path) {
+                watch.stamp = old;
+            }
+        }
         let outline_span = outline_clock.elapsed();
         Ok(Build { compilation, cases: None, binary: None, program: None, stamps, outline_span })
     }

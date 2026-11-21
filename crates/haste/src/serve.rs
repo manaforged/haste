@@ -304,6 +304,8 @@ fn unlink_addr(addr: &libc::sockaddr_un) {
 pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::path::Path) -> Result<()> {
     let listener = listen(root)?;
     let started = Instant::now();
+    let manifests = Served::manifests(workspace, root);
+    let watched = watched_stamps(workspace);
     let mut build = Some(Build::load(workspace, targets)?);
     if let Some(ref mut warm) = build {
         match std::env::var_os("HASTE_SERVE_WARM").as_deref().and_then(|v| v.to_str()) {
@@ -312,8 +314,6 @@ pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::pa
             _ => {}
         }
     }
-    let manifests = Served::manifests(workspace, root);
-    let watched = watched_stamps(workspace);
     let mut served = Served { root, targets, workspace, manifests, watched };
     let idle_ms = idle_timeout_ms();
     eprintln!("serving {} after {:.1} ms", root.display(), started.elapsed().as_secs_f64() * 1e3);
