@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::names::ItemRef;
 use crate::names::path::Requests;
@@ -36,6 +36,16 @@ pub(super) enum ReachedEntry {
     Replaced,
 }
 
+const CATCH_UNWIND_FOUND: usize = 1usize << (usize::BITS - 1);
+const CRATE_STD: u8 = 1;
+const CRATE_SKIP_BODY: u8 = 2;
+
+#[derive(Default)]
+struct CatchUnwindCache {
+    checked_items: HashSet<ItemRef>,
+    checked_callees: HashSet<ItemRef>,
+}
+
 /// Every function reached from some roots, each with its inferred body or the reason it has none.
 #[derive(Default)]
 pub struct Reached {
@@ -50,63 +60,76 @@ pub struct Reached {
     pub(in crate::sema::reach) states: Vec<ReachedEntry>,
     untyped_count: usize,
     pub(in crate::sema::reach) filter: ReachFilter,
-    catch_unwind_checked: AtomicUsize,
-    catch_unwind_found: std::sync::atomic::AtomicBool,
+    catch_unwind_state: AtomicUsize,
+    catch_unwind_cache: Mutex<CatchUnwindCache>,
 }
 
-fn is_thread_spawn(cx: &Context, item: ItemRef) -> bool {
-    if cx.outline.roots[item.krate as usize].name != "std" {
-        return false;
-    }
-    let (src, entry) = cx.item(item);
-    let Some(name) = entry.name.map(|at| src.text(at)) else {
-        return false;
-    };
+fn is_thread_spawn_name(name: &str, src: &crate::outline::source::Source) -> bool {
     matches!(name, "spawn" | "spawn_unchecked" | "spawn_scoped" | "scope")
         && src.path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("thread")
+}
+
+fn crate_unwind_flags(cx: &Context) -> Vec<u8> {
+    cx.outline
+        .roots
+        .iter()
+        .map(|root| match root.name.as_str() {
+            "std" => CRATE_STD | CRATE_SKIP_BODY,
+            "core" | "alloc" | "panic_unwind" | "panic_abort" => CRATE_SKIP_BODY,
+            _ => 0,
+        })
+        .collect()
 }
 
 impl Reached {
     /// Whether any reached function calls the `catch_unwind` intrinsic or spawns a thread via `std::thread`.
     pub fn has_catch_unwind(&self, cx: &Context) -> bool {
-        if self.catch_unwind_found.load(Ordering::Relaxed) {
+        let state = self.catch_unwind_state.load(Ordering::Acquire);
+        if state & CATCH_UNWIND_FOUND != 0 {
             return true;
         }
         let len = self.list.len();
-        let start = self.catch_unwind_checked.load(Ordering::Relaxed);
-        if start < len {
-            let mut next_start = len;
-            for (idx, ((item, _), res)) in self.list[start..len].iter().enumerate() {
-                if is_thread_spawn(cx, *item) {
-                    self.catch_unwind_found.store(true, Ordering::Relaxed);
-                    self.catch_unwind_checked.store(len, Ordering::Relaxed);
-                    return true;
+        if state >= len {
+            return false;
+        }
+        let mut cache = crate::sync::lock(&self.catch_unwind_cache);
+        let start = self.catch_unwind_state.load(Ordering::Relaxed);
+        if start & CATCH_UNWIND_FOUND != 0 {
+            return true;
+        }
+        if start >= len {
+            return false;
+        }
+        let crate_flags = crate_unwind_flags(cx);
+        for (idx, ((item, _), res)) in self.list[start..len].iter().enumerate() {
+            let flags = crate_flags.get(item.krate as usize).copied().unwrap_or(0);
+            if flags & CRATE_SKIP_BODY != 0 {
+                if flags & CRATE_STD != 0 && cache.checked_items.insert(*item) {
+                    let (src, entry) = cx.item(*item);
+                    if entry.name.is_some_and(|at| is_thread_spawn_name(src.text(at), src)) {
+                        self.catch_unwind_state.store(CATCH_UNWIND_FOUND | (start + idx + 1), Ordering::Release);
+                        return true;
+                    }
                 }
-                if cx.outline.roots[item.krate as usize].name == "std"
-                    || cx.outline.roots[item.krate as usize].name == "core"
-                    || cx.outline.roots[item.krate as usize].name == "alloc"
-                    || cx.outline.roots[item.krate as usize].name == "panic_unwind"
-                    || cx.outline.roots[item.krate as usize].name == "panic_abort"
-                {
+                continue;
+            }
+            let Ok(typed) = res else { continue };
+            for (callee, _) in typed.calls() {
+                if !cache.checked_callees.insert(callee) {
                     continue;
                 }
-                match res {
-                    Ok(typed) => {
-                        if typed.calls().any(|(c, _)| {
-                            let (src, entry) = cx.item(c);
-                            entry.name.is_some_and(|at| src.text(at) == "catch_unwind") || is_thread_spawn(cx, c)
-                        }) {
-                            self.catch_unwind_found.store(true, Ordering::Relaxed);
-                            self.catch_unwind_checked.store(len, Ordering::Relaxed);
-                            return true;
-                        }
-                    }
-                    Err(_) if next_start == len => next_start = start + idx,
-                    Err(_) => {}
+                let (src, entry) = cx.item(callee);
+                let is_std = crate_flags.get(callee.krate as usize).copied().unwrap_or(0) & CRATE_STD != 0;
+                if entry.name.is_some_and(|at| {
+                    let name = src.text(at);
+                    name == "catch_unwind" || (is_std && is_thread_spawn_name(name, src))
+                }) {
+                    self.catch_unwind_state.store(CATCH_UNWIND_FOUND | (start + idx + 1), Ordering::Release);
+                    return true;
                 }
             }
-            self.catch_unwind_checked.store(next_start, Ordering::Relaxed);
         }
+        self.catch_unwind_state.store(len, Ordering::Release);
         false
     }
     /// The typed body of function `index`, or an error naming `name` and why its body did not type-check.
@@ -152,6 +175,13 @@ impl Reached {
         }
         self.states[index] = next;
         self.list[index].1 = result;
+        let checked = *self.catch_unwind_state.get_mut() & !CATCH_UNWIND_FOUND;
+        if index < checked {
+            *self.catch_unwind_state.get_mut() = index;
+            let cache = self.catch_unwind_cache.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.checked_items.clear();
+            cache.checked_callees.clear();
+        }
     }
 
     fn take_blocked(&mut self) -> Vec<usize> {
