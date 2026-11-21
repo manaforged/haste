@@ -581,7 +581,12 @@ fn lower_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
     let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
     Ok(quiet.lowered(slots, lowered)?.map(|(func, relocs, plan, cycle)| {
         let limit = if plan.has_calls() { limit } else { super::budget::leaf_limit(cx, reached, index, limit) };
-        (simplify_inline(func, limit), relocs, plan, cycle)
+        let res = if haste_codegen::trace_enabled() {
+            haste_codegen::with_trace_label(cx.name(reached.list[index].0.0), || simplify_inline(func, limit))
+        } else {
+            simplify_inline(func, limit)
+        };
+        (res, relocs, plan, cycle)
     }))
 }
 
