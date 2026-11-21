@@ -55,8 +55,20 @@ pub struct Reached {
     catch_unwind_found: std::sync::atomic::AtomicBool,
 }
 
+fn is_thread_spawn(cx: &Context, item: ItemRef) -> bool {
+    if cx.outline.roots[item.krate as usize].name != "std" {
+        return false;
+    }
+    let (src, entry) = cx.item(item);
+    let Some(name) = entry.name.map(|at| src.text(at)) else {
+        return false;
+    };
+    matches!(name, "spawn" | "spawn_unchecked" | "spawn_scoped" | "scope")
+        && src.path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("thread")
+}
+
 impl Reached {
-    /// Whether any reached function calls the `catch_unwind` intrinsic.
+    /// Whether any reached function calls the `catch_unwind` intrinsic or spawns a thread via `std::thread`.
     pub fn has_catch_unwind(&self, cx: &Context) -> bool {
         if self.catch_unwind_found.load(Ordering::Relaxed) {
             return true;
@@ -66,6 +78,11 @@ impl Reached {
         if start < len {
             let mut next_start = len;
             for (idx, ((item, _), res)) in self.list[start..len].iter().enumerate() {
+                if is_thread_spawn(cx, *item) {
+                    self.catch_unwind_found.store(true, Ordering::Relaxed);
+                    self.catch_unwind_checked.store(len, Ordering::Relaxed);
+                    return true;
+                }
                 if cx.outline.roots[item.krate as usize].name == "std"
                     || cx.outline.roots[item.krate as usize].name == "core"
                     || cx.outline.roots[item.krate as usize].name == "alloc"
@@ -78,7 +95,7 @@ impl Reached {
                     Ok(typed) => {
                         if typed.calls().any(|(c, _)| {
                             let (src, entry) = cx.item(c);
-                            entry.name.is_some_and(|at| src.text(at) == "catch_unwind")
+                            entry.name.is_some_and(|at| src.text(at) == "catch_unwind") || is_thread_spawn(cx, c)
                         }) {
                             self.catch_unwind_found.store(true, Ordering::Relaxed);
                             self.catch_unwind_checked.store(len, Ordering::Relaxed);

@@ -49,11 +49,25 @@ fn assemble(cx: &Context<'_>, reached: &Reached, target: &Target, item: ItemRef,
     let names: Vec<&str> = block.symbols.iter().map(|(name, _)| name.as_str()).collect();
     let assembly = haste_codegen::assemble(&block.text, target, &names).map_err(failed)?;
     let label = format!("{}{}", target.symbol_prefix, cx.symbol_name(item).unwrap_or_default());
-    if !assembly.labels.iter().any(|(name, offset)| *name == label && *offset == 0) {
-        return Err(failed(format!("its global_asm block does not start at label `{label}`")));
-    }
+    let Some(&(_, offset)) = assembly.labels.iter().find(|(name, _)| *name == label) else {
+        return Err(failed(format!("its global_asm block does not define label `{label}`")));
+    };
     let relocs = block.symbols.iter().map(|&(_, callee)| slot(cx, reached, callee)).collect::<Result<Vec<_>, _>>()?;
-    Ok((assembly.code, relocs))
+    Ok((slice_code(&assembly.code, offset), relocs))
+}
+
+fn slice_code(code: &Code, offset: u32) -> Code {
+    if offset == 0 {
+        return code.clone();
+    }
+    let bytes = code.bytes().get(offset as usize..).unwrap_or_default().to_vec();
+    let relocs = code
+        .relocs()
+        .iter()
+        .filter(|reloc| reloc.offset >= offset)
+        .map(|&reloc| haste_codegen::StencilReloc { offset: reloc.offset - offset, ..reloc })
+        .collect();
+    Code::from_parts(bytes, Vec::new(), relocs, Vec::new())
 }
 
 fn slot(cx: &Context<'_>, reached: &Reached, callee: ItemRef) -> Result<SymbolSource, String> {

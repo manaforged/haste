@@ -16,6 +16,14 @@ fn skips_fields(cx: &crate::sema::Context<'_>, item: crate::names::ItemRef) -> b
         || cx.item(item).1.kind == crate::outline::item::ItemKind::Union
 }
 
+/// One tracked sub-part of an owned value and its presence/unwind guard slot.
+#[derive(Clone, Debug)]
+struct Part {
+    path: MovePath,
+    flag: StackSlot,
+    unwind: bool,
+}
+
 /// A value that the body owns and drops when its scope ends: where it lives, and the flags that say which of it is still there.
 #[derive(Clone, Debug)]
 pub struct Owned {
@@ -24,7 +32,7 @@ pub struct Owned {
     place: Option<Place>,
     flag: StackSlot,
     unwind: bool,
-    parts: Vec<(MovePath, StackSlot)>,
+    parts: Vec<Part>,
     life: Life,
 }
 
@@ -54,15 +62,76 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         let paths = self.moved.get(&root).cloned().unwrap_or_default();
-        let unwind = self.open && self.resume.is_none() && paths.is_empty() && self.reached.has_catch_unwind(self.cx) && self.body_may_unwind()?;
-        let flag = if unwind { self.push_unwind(root, ty, place, init)? } else { self.flag(init) };
-        let parts = paths.into_iter().map(|path| (path, self.flag(init))).collect();
+        let want_unwind = self.open && self.resume.is_none() && self.reached.has_catch_unwind(self.cx) && self.body_may_unwind()?;
+        let into_box = paths.iter().any(|path| path.contains(&BOX_STEP));
+        let (flag, unwind, parts) = if want_unwind && (paths.is_empty() || (!into_box && has_drop_impl(self.cx, ty)?)) {
+            (self.push_unwind(root, ty, place, init)?, true, Vec::new())
+        } else if want_unwind {
+            let parts = self.expand_unwind_parts(root, ty, place, &paths, init)?;
+            (self.flag(init), false, parts)
+        } else {
+            (self.flag(init), false, self.plain_parts(&paths, init))
+        };
         let life = match root {
             Root::Local(_) => Life::Scope,
             Root::Temp(expr) if self.extended.contains(&expr) => Life::Extended,
             Root::Temp(_) | Root::Held(_) => Life::Statement,
         };
         self.owned.push(Owned { root, ty, place, flag, unwind, parts, life });
+        Ok(())
+    }
+
+    fn plain_parts(&mut self, paths: &[MovePath], init: bool) -> Vec<Part> {
+        paths.iter().map(|path| Part { path: path.clone(), flag: self.flag(init), unwind: false }).collect()
+    }
+
+    fn expand_unwind_parts(&mut self, root: Root, ty: Ty, place: Option<Place>, paths: &[MovePath], init: bool) -> Result<Vec<Part>> {
+        let Some(place) = place else {
+            return Ok(self.plain_parts(paths, init));
+        };
+        let mut parts = Vec::new();
+        self.push_unwind_parts(root, &[], ty, place, paths, init, &mut parts)?;
+        Ok(parts)
+    }
+
+    fn single_variant_fields(&mut self, ty: Ty) -> Result<Option<Vec<Ty>>> {
+        Ok(match *self.cx.types.kind(ty) {
+            Kind::Tuple(items) => Some(self.cx.types.substs(items).to_vec()),
+            Kind::Array(element, len) => Some(vec![element; self.len(len)? as usize]),
+            Kind::Adt(item, _) if skips_fields(self.cx, item) => Some(Vec::new()),
+            Kind::Adt(item, args) => {
+                let slice = self.cx.types.substs(args).to_vec();
+                let variants = field_types(self.cx, item, &slice)?;
+                (variants.len() == 1).then(|| variants[0].clone())
+            }
+            _ => None,
+        })
+    }
+
+    fn push_unwind_parts(&mut self, root: Root, path: &[(u32, u32)], ty: Ty, place: Place, paths: &[MovePath], init: bool, out: &mut Vec<Part>) -> Result<()> {
+        if !needs_drop(self.cx, ty)? {
+            return Ok(());
+        }
+        let below = paths.iter().any(|part| part.len() > path.len() && part.starts_with(path));
+        let inside: MovePath = path.iter().copied().chain([BOX_STEP]).collect();
+        let into_box = paths.iter().any(|part| part.starts_with(&inside));
+        if !into_box && (!below || has_drop_impl(self.cx, ty)?) {
+            let slot = self.push_unwind(root, ty, Some(place), init)?;
+            out.push(Part { path: path.to_vec(), flag: slot, unwind: true });
+            return Ok(());
+        }
+        if !into_box && let Some(fields) = self.single_variant_fields(ty)? {
+            for (index, field_ty) in fields.into_iter().enumerate().rev() {
+                let mut sub = path.to_vec();
+                sub.push((0, index as u32));
+                let part = self.part_place(place, ty, (0, index as u32))?;
+                self.push_unwind_parts(root, &sub, field_ty, part, paths, init, out)?;
+            }
+            return Ok(());
+        }
+        for part in paths.iter().filter(|part| part.starts_with(path)) {
+            out.push(Part { path: part.clone(), flag: self.flag(init), unwind: false });
+        }
         Ok(())
     }
 
@@ -156,64 +225,72 @@ impl Lower<'_, '_> {
 
     /// Marks the part `path` of `root` as moved out, so that its scope does not drop it.
     pub fn moved_out(&mut self, root: Root, path: &[(u32, u32)]) -> Result<()> {
-        if let Some((slot, unwind)) = self.move_flag(root, path)? {
+        for (slot, unwind) in self.move_flags(root, path)? {
             self.set_active(slot, unwind, false);
         }
         Ok(())
     }
 
-    fn move_flag(&self, root: Root, path: &[(u32, u32)]) -> Result<Option<(StackSlot, bool)>> {
+    fn collect_targets(&self, at: usize, path: &[(u32, u32)]) -> Vec<(StackSlot, bool)> {
+        let mut slots: Vec<(StackSlot, bool)> = self.owned[at]
+            .parts
+            .iter()
+            .filter(|part| part.path.starts_with(path))
+            .map(|part| (part.flag, part.unwind))
+            .collect();
+        if path.is_empty() {
+            slots.push((self.owned[at].flag, self.owned[at].unwind));
+        }
+        slots
+    }
+
+    fn move_flags(&self, root: Root, path: &[(u32, u32)]) -> Result<Vec<(StackSlot, bool)>> {
         let Some(at) = self.owner(root) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        Ok(Some(match path {
-            [] => (self.owned[at].flag, self.owned[at].unwind),
-            _ => match self.owned[at].parts.iter().find(|(part, _)| part == path) {
-                Some(&(_, slot)) => (slot, false),
-                None => {
-                    bail!("a move out of {root:?} at {path:?} that the move analysis did not find")
-                }
-            },
-        }))
+        let slots = self.collect_targets(at, path);
+        if !path.is_empty() && slots.is_empty() {
+            bail!("a move out of {root:?} at {path:?} that the move analysis did not find");
+        }
+        Ok(slots)
     }
 
     /// Marks the part `path` of `root` as moved out when every `(which, alternative)` of `when` holds.
     fn moved_out_when(&mut self, root: Root, path: &[(u32, u32)], when: &[(Value, i64)]) -> Result<()> {
-        let Some((slot, unwind)) = self.move_flag(root, path)? else {
+        let slots = self.move_flags(root, path)?;
+        if slots.is_empty() {
             return Ok(());
-        };
+        }
         let mut taken = self.ins().iconst(Type::I8, 1);
         for &(which, alternative) in when {
             let holds = self.ins().icmp_imm(IntCC::Equal, which, alternative);
             taken = self.ins().band(taken, holds);
         }
-        let present = self.ins().stack_load(Type::I8, slot, 0);
-        let cleared = if unwind {
-            let mask = self.ins().iconst(Type::I8, 0xFE);
-            self.ins().band(present, mask)
-        } else {
-            self.ins().iconst(Type::I8, 0)
-        };
-        let kept = self.ins().select(taken, cleared, present);
-        self.ins().stack_store(kept, slot, 0);
+        for (slot, unwind) in slots {
+            let present = self.ins().stack_load(Type::I8, slot, 0);
+            let cleared = if unwind {
+                let mask = self.ins().iconst(Type::I8, 0xFE);
+                self.ins().band(present, mask)
+            } else {
+                self.ins().iconst(Type::I8, 0)
+            };
+            let kept = self.ins().select(taken, cleared, present);
+            self.ins().stack_store(kept, slot, 0);
+        }
         Ok(())
     }
 
     /// Marks the part `path` of `root` and everything below it as present again, after an assignment.
     pub fn reinit(&mut self, root: Root, path: &[(u32, u32)]) {
         let Some(at) = self.owner(root) else { return };
-        let mut slots: Vec<(StackSlot, bool)> = self.owned[at].parts.iter().filter(|(part, _)| part.starts_with(path)).map(|&(_, slot)| (slot, false)).collect();
-        if path.is_empty() {
-            slots.push((self.owned[at].flag, self.owned[at].unwind));
-        }
-        for (slot, unwind) in slots {
+        for (slot, unwind) in self.collect_targets(at, path) {
             self.set_active(slot, unwind, true);
         }
     }
 
     /// Marks every owned value from index `mark` on as absent, on a path where their bindings did not happen.
     pub fn forget_from(&mut self, mark: usize) {
-        let slots: Vec<(StackSlot, bool)> = self.owned[mark..].iter().map(|owned| (owned.flag, owned.unwind)).collect();
+        let slots: Vec<(StackSlot, bool)> = (mark..self.owned.len()).flat_map(|at| self.collect_targets(at, &[])).collect();
         for (slot, unwind) in slots {
             self.set_active(slot, unwind, false);
             if unwind {
@@ -249,8 +326,18 @@ impl Lower<'_, '_> {
         };
         let (flag, unwind) = (self.owned[at].flag, self.owned[at].unwind);
         self.guarded_slot(flag, unwind, |lower| {
-            lower.set_active(flag, unwind, false);
-            lower.drop_path(at, path, ty, Some(place))
+            if path.is_empty() {
+                for (slot, slot_unwind) in lower.collect_targets(at, &[]) {
+                    lower.set_active(slot, slot_unwind, false);
+                }
+            }
+            lower.drop_path(at, path, ty, Some(place))?;
+            if !path.is_empty() {
+                for (slot, slot_unwind) in lower.collect_targets(at, path) {
+                    lower.set_active(slot, slot_unwind, false);
+                }
+            }
+            Ok(())
         })?;
         Ok(true)
     }
@@ -311,18 +398,19 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(());
         }
-        let Owned { ty, place, flag, unwind, .. } = self.owned[at].clone();
+        let Owned { ty, place, flag, unwind, parts, .. } = self.owned[at].clone();
         if unwind {
             self.pop_unwind(flag);
+        }
+        for part in &parts {
+            if part.unwind {
+                self.pop_unwind(part.flag);
+            }
         }
         self.guarded_slot(flag, unwind, |lower| {
             lower.set_active(flag, unwind, false);
             lower.drop_path(at, &[], ty, place)
         })
-    }
-
-    fn guarded(&mut self, flag: StackSlot, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        self.guarded_slot(flag, false, run)
     }
 
     fn guarded_slot(&mut self, flag: StackSlot, unwind: bool, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
@@ -348,10 +436,10 @@ impl Lower<'_, '_> {
 
     fn drop_path(&mut self, at: usize, path: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {
         let parts = &self.owned[at].parts;
-        let below = parts.iter().any(|(part, _)| part.len() > path.len() && part.starts_with(path));
-        let flag = parts.iter().find(|(part, _)| part == path).map(|&(_, slot)| slot).filter(|_| !path.is_empty());
+        let below = parts.iter().any(|part| part.path.len() > path.len() && part.path.starts_with(path));
+        let part_flag = parts.iter().find(|part| part.path == path).map(|part| (part.flag, part.unwind)).filter(|_| !path.is_empty());
         let inside: MovePath = path.iter().copied().chain([BOX_STEP]).collect();
-        let into_box = parts.iter().any(|(part, _)| part.starts_with(&inside));
+        let into_box = parts.iter().any(|part| part.path.starts_with(&inside));
         let opened = below && !has_drop_impl(self.cx, ty)?;
         let origin = super::reloc::TyOrigin::from_root(self.owned[at].root, self.typed).stepped(path);
         let run = |lower: &mut Self| match (into_box, opened) {
@@ -359,8 +447,11 @@ impl Lower<'_, '_> {
             (false, true) => lower.open_drop(at, path, ty, place),
             (false, false) => lower.glue(ty, place, origin.clone()),
         };
-        match flag {
-            Some(flag) => self.guarded(flag, run),
+        match part_flag {
+            Some((flag, unwind)) => self.guarded_slot(flag, unwind, |lower| {
+                lower.set_active(flag, unwind, false);
+                run(lower)
+            }),
             None => run(self),
         }
     }
