@@ -70,18 +70,50 @@ check_malformed() {
     fi
 }
 check_catch_unwind() {
-    local out_msg=$1 dir="$tmp/unwind_ok" c_out h_out c_status=0 h_status=0
-    write_scratch_crate "$dir" "unwind_ok" 'fn main() {
+    local out_msg=$1 dir="$tmp/unwind_ok" c_out h_out a_out c_status=0 h_status=0 a_status=0
+    write_scratch_crate "$dir" "unwind_ok" 'use std::sync::atomic::{AtomicI64, Ordering};
+static LOG: AtomicI64 = AtomicI64::new(0);
+struct Guard(i64);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let prev = LOG.load(Ordering::Relaxed);
+        LOG.store(prev * 10 + self.0, Ordering::Relaxed);
+    }
+}
+#[inline(never)]
+fn nounwind_use(g: Guard) -> i64 {
+    let v = g.0;
+    drop(g);
+    v
+}
+#[inline(never)]
+fn maybe_panic(n: i64) {
+    if n == 2 { panic!("loop_boom"); }
+}
+fn main() {
     let ok = std::panic::catch_unwind(|| 21 + 21).unwrap();
-    let msg = std::panic::catch_unwind(|| -> i32 { panic!("boom") }).unwrap_err();
+    let msg = std::panic::catch_unwind(|| -> i32 {
+        let _kept = Guard(1);
+        let moved = Guard(2);
+        let _ = nounwind_use(moved);
+        let _inner = Guard(3);
+        panic!("boom");
+    }).unwrap_err();
     let s = msg.downcast_ref::<&str>().copied().unwrap_or("");
+    let _ = std::panic::catch_unwind(|| {
+        for i in 0..4 {
+            let _g = Guard(4 + i);
+            maybe_panic(i);
+        }
+    });
     let t = std::thread::spawn(|| panic!("tboom")).join().is_err();
-    println!("{ok} {s} {t}");
+    println!("{ok} {s} {t} {}", LOG.load(Ordering::Relaxed));
 }'
     c_out=$(run_manifest "$dir" </dev/null 2>/dev/null) || c_status=$?
     h_out=$(run_haste run "$dir" </dev/null 2>/dev/null) || h_status=$?
-    if [ "$c_status" -ne 0 ] || [ "$h_status" -ne 0 ] || [ "$c_out" != "$h_out" ]; then
-        echo "catch_unwind DIFF: cargo=($c_status,$c_out) haste=($h_status,$h_out)" >"$out_msg"
+    run_haste --release build -o "$dir/unwind_aot" "$dir" </dev/null >/dev/null 2>&1 && a_out=$("$dir/unwind_aot" </dev/null 2>/dev/null) || a_status=$?
+    if [ "$c_status" -ne 0 ] || [ "$h_status" -ne 0 ] || [ "$a_status" -ne 0 ] || [ "$c_out" != "$h_out" ] || [ "$c_out" != "$a_out" ]; then
+        echo "catch_unwind DIFF: cargo=($c_status,$c_out) jit=($h_status,$h_out) aot=($a_status,$a_out)" >"$out_msg"
         return 1
     fi
 }

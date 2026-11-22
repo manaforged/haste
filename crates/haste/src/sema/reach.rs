@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -12,8 +12,10 @@ use super::substs::Substs;
 use super::summary::thaw;
 mod filter;
 mod order;
+mod unwind;
 mod wave;
 
+pub(crate) use unwind::host_symbol_may_unwind;
 pub use wave::infer_quiet;
 
 use filter::{ReachFilter, collect_filtered_callees};
@@ -62,6 +64,7 @@ pub struct Reached {
     pub(in crate::sema::reach) filter: ReachFilter,
     catch_unwind_state: AtomicUsize,
     catch_unwind_cache: Mutex<CatchUnwindCache>,
+    may_unwind_cache: RwLock<Option<(usize, Vec<bool>)>>,
 }
 
 fn is_thread_spawn_name(name: &str, src: &crate::outline::source::Source) -> bool {
@@ -132,6 +135,22 @@ impl Reached {
         self.catch_unwind_state.store(len, Ordering::Release);
         false
     }
+
+    /// Whether reached function `index` may unwind directly or transitively through any reachable call.
+    pub fn may_unwind(&self, cx: &mut Context<'_>, index: usize) -> bool {
+        let len = self.list.len();
+        if index >= len {
+            return true;
+        }
+        if let Some(bit) = crate::sync::read_lock(&self.may_unwind_cache).as_ref().filter(|(n, _)| *n == len).and_then(|(_, bits)| bits.get(index).copied()) {
+            return bit;
+        }
+        let mut cache = crate::sync::write_lock(&self.may_unwind_cache);
+        if cache.as_ref().is_none_or(|(n, _)| *n != len) {
+            *cache = Some((len, unwind::compute_may_unwind(cx, self)));
+        }
+        cache.as_ref().and_then(|(_, bits)| bits.get(index).copied()).unwrap_or(true)
+    }
     /// The typed body of function `index`, or an error naming `name` and why its body did not type-check.
     pub fn typed(&self, index: usize, name: &str) -> anyhow::Result<&Arc<Typed>> {
         self.list[index].1.as_ref().map_err(|why| anyhow::anyhow!("{name} did not type-check: {why}"))
@@ -182,6 +201,7 @@ impl Reached {
             cache.checked_items.clear();
             cache.checked_callees.clear();
         }
+        *self.may_unwind_cache.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn take_blocked(&mut self) -> Vec<usize> {
@@ -259,6 +279,7 @@ impl Reached {
             for (at, (c, i)) in own.into_iter().chain(joined) { (self.calls[at], self.indirect[at]) = (c, i); }
         }
         super::infer::recount_call_sites(self.list.len(), |at| self.states[at] == ReachedEntry::Settled, &self.calls, &self.indirect, &self.pinned, &mut self.call_sites);
+        *self.may_unwind_cache.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 

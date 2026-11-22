@@ -9,6 +9,7 @@ mod color;
 mod coroutine;
 mod copy;
 mod cse;
+mod drop_elide;
 mod emit;
 mod error;
 mod ir;

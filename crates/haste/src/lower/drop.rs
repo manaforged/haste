@@ -1,10 +1,9 @@
 use anyhow::{Result, bail};
 use haste_codegen::{IntCC, StackSlot, Type, Value};
 
-use crate::body::{BinOp, Expr, ExprId, UnOp};
+use crate::body::ExprId;
 use crate::host::HostSymbol;
 use crate::sema::infer::{Fields, Res, Shape, drop_fn, field_types, has_drop_impl, needs_drop};
-use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
 
 use super::moves::{BOX_STEP, MovePath, Root};
@@ -62,7 +61,7 @@ impl Lower<'_, '_> {
     }
 
     /// Whether constructing fields should register per-field unwind drop guards while evaluating later fields.
-    pub(super) fn wants_field_unwind(&self) -> Result<bool> {
+    pub(super) fn wants_field_unwind(&mut self) -> Result<bool> {
         Ok(self.open && self.resume.is_none() && self.should_unwind() && self.body_may_unwind()?)
     }
 
@@ -203,46 +202,8 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn body_may_unwind(&self) -> Result<bool> {
-        if !self.open {
-            return Ok(false);
-        }
-        for (item, _) in self.typed.calls() {
-            if let Some(intr) = self.cx.intrinsic(item) {
-                if matches!(intr, Intrinsic::ConstEvalSelect | Intrinsic::CatchUnwind) {
-                    return Ok(true);
-                }
-                continue;
-            }
-            if self.cx.foreign(item) {
-                let host = self.cx.symbol_name(item).as_deref().and_then(|name| HostSymbol::resolve_for(name, true));
-                if matches!(host, None | Some(HostSymbol::StartPanic | HostSymbol::CatchUnwind | HostSymbol::Dynamic(_))) {
-                    return Ok(true);
-                }
-                continue;
-            }
-            return Ok(true);
-        }
-        for (idx, expr) in self.body.exprs.iter().enumerate() {
-            match expr {
-                Expr::FormatArgs(_) | Expr::Index(..) => return Ok(true),
-                Expr::Binary(op, ..) | Expr::AssignOp(op, ..)
-                    if matches!(op, BinOp::Div | BinOp::Rem)
-                        || (self.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::Shr)) =>
-                {
-                    return Ok(true);
-                }
-                Expr::Unary(UnOp::Neg, _) if self.overflow_checks => return Ok(true),
-                Expr::Call(callee, _)
-                    if !matches!(self.typed.res.get(&ExprId(idx as u32)), Some(Res::Fn(..) | Res::Ctor(..)))
-                        && !matches!(self.typed.res.get(callee), Some(Res::Fn(..) | Res::Ctor(..))) =>
-                {
-                    return Ok(true);
-                }
-                _ => {}
-            }
-        }
-        Ok(false)
+    fn body_may_unwind(&mut self) -> Result<bool> {
+        Ok(self.open && self.reached.may_unwind(self.cx, self.index))
     }
 
     fn push_unwind(&mut self, root: Root, ty: Ty, place: Option<Place>, init: bool) -> Result<StackSlot> {

@@ -95,6 +95,7 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
     let mut cycle_root = usize::MAX;
     hash_instance_header(cx, &mut mix, (slots.low_entries(), slots.allow_inline()), item, typed)?;
     mix.bool(reached.has_catch_unwind(cx));
+    mix.bool(reached.may_unwind(cx, index));
     match &typed.shape {
         Shape::Glue(glue) => hash_glue_shape(cx, (reached, slots), inline, &mut mix, index, substs, glue, &mut cycle_root)?,
         Shape::Untuple(target) => hash_untuple_shape(cx, (reached, slots), inline, &mut mix, index, typed, *target, &mut cycle_root)?,
