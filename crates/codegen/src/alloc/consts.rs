@@ -200,11 +200,13 @@ pub(super) fn promote_loop_syms<R: Copy>(func: &Function, census: &Uses, depths:
         }
     }
     let folds = addressed_images(func);
+    let cold_cell = thread_cell_arg_only(func);
     let mut promoted = Vec::new();
     for (v, loc) in locations.iter_mut().enumerate() {
         if matches!(*loc, Location::SlotAddr(_) | Location::Symbol(_))
             && !elided[v]
             && !folds[v]
+            && !cold_cell[v]
             && (census.uses[v] >= 2 || in_loop[v] || depths.is_some_and(|d| census.def[v].is_some_and(|(db, _)| d[db] > 0)))
         {
             promoted.push((v, *loc));
@@ -212,6 +214,25 @@ pub(super) fn promote_loop_syms<R: Copy>(func: &Function, census: &Uses, depths:
         }
     }
     promoted
+}
+
+fn thread_cell_arg_only(func: &Function) -> Vec<bool> {
+    let mut only = vec![true; func.types.len()];
+    let mut seen = vec![false; func.types.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            match &func.insts[inst.index()].op {
+                Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } if func.is_thread_cell(*callee) => {
+                    only[callee.index()] = false;
+                    for &arg in args {
+                        seen[arg.index()] = true;
+                    }
+                }
+                op => op.for_operands(|v| only[v.index()] = false),
+            }
+        }
+    }
+    only.into_iter().zip(seen).map(|(ok, used)| ok && used).collect()
 }
 
 fn addressed_images(func: &Function) -> Vec<bool> {

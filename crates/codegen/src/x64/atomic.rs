@@ -410,7 +410,7 @@ impl Emit<'_> {
             self.asm.store_imm_sized(size, to, imm);
             return;
         }
-        let source = self.reg_of(value).unwrap_or(Reg::Rax);
+        let source = self.reg_of(value).or_else(|| (ty != Type::I128).then(|| self.cached_spill(value)).flatten()).unwrap_or(Reg::Rax);
         self.raw(source, value);
         if ty == Type::I128 {
             self.asm.store(Size::Q, to, Reg::Rax);

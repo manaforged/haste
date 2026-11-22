@@ -56,14 +56,18 @@ impl Emit<'_> {
     }
 
     /// Reads the calling thread's cell of thread slot `slot` from the static TLS slot table into rax and jumps to the returned label when the cell is made, so only a miss runs the call that follows; `None` when the table does not apply.
-    pub(super) fn thread_cell_hit(&mut self, slot: Value) -> Option<Label> {
-        let Some(&Op::Symbol(slot_sym)) = self.defs[slot.index()].map(|inst| &self.func.insts[inst.index()].op) else { return None };
+    pub(super) fn thread_cell_hit(&mut self, slot: Value, lookup: u32) -> Option<Label> {
         if !self.frame_cache {
             return None;
         }
+        let target_sym = match self.defs[slot.index()].map(|inst| &self.func.insts[inst.index()].op) {
+            Some(&Op::Symbol(slot_sym)) => slot_sym,
+            _ if self.const_of(slot) == Some(0) => lookup,
+            _ => return None,
+        };
         let hit = self.asm.label();
         let at = self.asm.fs_quad(0x8B, Reg::Rax as u8, 0, None);
-        self.relocs.push(StencilReloc::symbol(at, slot_sym, RelocKind::ThreadOff32));
+        self.relocs.push(StencilReloc::symbol(at, target_sym, RelocKind::ThreadOff32));
         self.asm.test(Reg::Rax, Reg::Rax);
         self.asm.jcc(Cond::Ne, hit);
         Some(hit)

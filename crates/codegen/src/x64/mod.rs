@@ -644,7 +644,7 @@ impl Emit<'_> {
         }
         let direct = self.plan.through[callee.index()];
         let cell = match direct {
-            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot)).map(|hit| (lookup, hit)),
+            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot, lookup)).map(|hit| (lookup, hit)),
             _ => None,
         };
         if cell.is_some() {

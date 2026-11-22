@@ -645,11 +645,20 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             continue;
         }
         if reloc.kind == RelocKind::ThreadOff32 {
-            ensure!(addrs.frame_tls != 0, "ThreadOff32 without a static TLS block");
             let addend = i64::from(i32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]));
             let word = match reloc.symbol {
-                Symbol::Runtime(_) => -(addrs.frame_tls as i64),
-                Symbol::Word(slot) => slot as i64 * 8 - addrs.thread_tls as i64,
+                Symbol::Runtime(_) => {
+                    ensure!(addrs.frame_tls != 0, "ThreadOff32 without a frame cache");
+                    -(addrs.frame_tls as i64)
+                }
+                Symbol::Word(slot) => {
+                    ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
+                    slot as i64 * 8 - addrs.thread_tls as i64
+                }
+                Symbol::Host(HostSymbol::ThreadCell) => {
+                    ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
+                    -(addrs.thread_tls as i64)
+                }
                 ref other => bail!("ThreadOff32 to {other:?}"),
             };
             let off = i32::try_from(addend + word).context("ThreadOff32 offset out of range")?;
