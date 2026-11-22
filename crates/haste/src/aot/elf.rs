@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Arch, Os};
 
-use super::shims::{Shim, emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
+use super::shims::{emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
+use super::tls::TlsLayout;
 use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, push_name, resolve_sym};
 
 const SECTION_NAMES: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0.rodata\0.data\0.bss\0.dynstr\0.dynamic\0.debug_line\0";
@@ -116,9 +117,6 @@ fn write_symbols(out: &mut Buf, exe: &Executable, sec: &ElfSections, (strtab, fn
     }
 }
 
-/// The bytes of the coroutine frame cache in the static TLS block: a head and a count for each 16-byte size class below 1024 bytes.
-const FRAME_CACHE_BYTES: u64 = 1024;
-
 struct ArchLayout {
     interp: &'static [u8],
     page: usize,
@@ -136,13 +134,18 @@ fn arch_layout(arch: Arch) -> Result<ArchLayout> {
     })
 }
 
-fn tls_sizes(arch: Arch, plan: &Plan<'_>, thread_slots: u32) -> (u64, u64) {
+fn elf_tls_addrs(arch: Arch, plan: &Plan<'_>, thread_slots: u32) -> (u64, u64, u64, u64) {
     if arch != Arch::X64 {
-        return (0, 0);
+        return (0, 0, 0, 0);
     }
-    let slots = if plan.has_shim(Shim::ThreadCell) { u64::from(thread_slots.max(1)) * 8 } else { 0 };
-    let cache = if plan.has_shim(Shim::FrameAlloc) { FRAME_CACHE_BYTES } else { 0 };
-    (cache, (cache + slots).next_multiple_of(16))
+    let tls = TlsLayout::compute(plan, thread_slots);
+    if tls.total == 0 {
+        return (0, 0, 0, 0);
+    }
+    let unwind_tls = if plan.has_unwind() { tls.total - tls.unwind_off } else { 0 };
+    let frame_tls = tls.total - tls.frame_off;
+    let thread_tls = tls.total - tls.cells_off;
+    (tls.total, unwind_tls, thread_tls, frame_tls)
 }
 
 fn build_prelude(plan: &Plan<'_>, shim_offs: &[usize], [stubs_off, stub_size, start_off, start_size, tramp_off, tramp_size, head_off]: [usize; 7], strtab: &mut Vec<u8>) -> Vec<(usize, usize, u32)> {
@@ -291,7 +294,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let plan = Plan::collect(exe, &["__libc_start_main"])?;
     let ArchLayout { interp, page, stub_size, start_size, tramp_size, machine } = arch_layout(arch)?;
     let (rx_base, tables, nsyms) = (ELF_BASE + page as u64, build_tables(&plan), 1 + plan.imports.len());
-    let (cache_tls, tls) = tls_sizes(arch, &plan, exe.thread_slots);
+    let (tls, unwind_tls, thread_tls, frame_tls) = elf_tls_addrs(arch, &plan, exe.thread_slots);
     let phnum = if tls == 0 { 6 } else { 7 };
     let interp_off = 64 + phnum * 56;
     let hash_off = (interp_off + interp.len()).next_multiple_of(8);
@@ -304,7 +307,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let start_off = (stubs_off + plan.imports.len() * stub_size).next_multiple_of(16);
     let tramp_off = (start_off + start_size).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
-    let (shim_offs, head_off) = plan_shims(arch, Os::Linux, &plan, rx_base, shims_off)?;
+    let probe_addrs = SectionAddrs { thread_key: rx_base, unwind_tls, thread_tls, frame_tls, ..SectionAddrs::default() };
+    let (shim_offs, head_off) = plan_shims(arch, Os::Linux, &plan, rx_base, shims_off, probe_addrs)?;
     let veneers = plan_veneers(exe, &plan, rx_base, head_off, &shim_offs, |_, _| stubs_off)?;
     let text_off = head_off + veneers.pre_len;
     let rw_off = (text_off + exe.text.len().next_multiple_of(16) + veneers.post_len).next_multiple_of(16);
@@ -317,7 +321,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let (strtab, fn_strx, prelude, lines, shdr_off, shstrndx, shnum) =
         build_optional_syms(exe, &plan, &shim_offs, prelude_offs, (symtab_off, rx_base + text_off as u64));
     let bss_va = rw_va + bss_in_rw as u64;
-    let addrs = SectionAddrs { text: rx_base + text_off as u64, rodata: ELF_BASE + rodata_off as u64, data: rw_va, bss: bss_va, dso_handle: ELF_BASE + dso_off as u64, thread_key: bss_va + u64::from(key_off), thread_tls: tls - cache_tls, frame_tls: tls };
+    let addrs = SectionAddrs { text: rx_base + text_off as u64, rodata: ELF_BASE + rodata_off as u64, data: rw_va, bss: bss_va, dso_handle: ELF_BASE + dso_off as u64, thread_key: bss_va + u64::from(key_off), tlv_desc: 0, unwind_tls, thread_tls, frame_tls };
     let mut out = Buf::new();
     let hdr = HeaderSpec { arch, machine, page, phnum, shstrndx, shnum, shdr_off, entry_va: rx_base + start_off as u64, interp, interp_off, ro_end, rx: (rx_base, stubs_off, rw_off), rw: (rw_va, rw_off, rw_filesz, bss_in_rw + bss_total as usize), dyn_seg: (dyn_off, dyn_size), tls_seg: (bss_va, rw_off + bss_in_rw, tls), tables: &tables };
     write_ro_prefix(&mut out, &hdr, |idx| rw_va + ((got_off - rw_off) + idx * 8) as u64);

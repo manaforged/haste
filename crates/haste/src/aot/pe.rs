@@ -194,7 +194,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let tramp_in_text = (start_in_text + start_size).next_multiple_of(16);
     let shims_in_text = (tramp_in_text + tramp_size).next_multiple_of(16);
     let text_base_va = PE_BASE + TEXT_RVA as u64;
-    let (shim_offs, head_in_text) = plan_shims(arch, Os::Windows, &plan, text_base_va, shims_in_text)?;
+    let probe_addrs = SectionAddrs { thread_key: text_base_va, ..SectionAddrs::default() };
+    let (shim_offs, head_in_text) = plan_shims(arch, Os::Windows, &plan, text_base_va, shims_in_text, probe_addrs)?;
     let post_rel = exe.text.len().next_multiple_of(16);
     let veneers = plan_veneers(exe, &plan, text_base_va, head_in_text, &shim_offs, |_, _| stubs_in_text)?;
     let text_in_text = head_in_text + veneers.pre_len;
@@ -228,6 +229,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         bss: PE_BASE + (data_rva + bss_in_data) as u64,
         dso_handle: PE_BASE + (rdata_rva + exe.rodata.len()) as u64,
         thread_key: PE_BASE + (data_rva + bss_in_data + thread_key_off as usize) as u64,
+        tlv_desc: 0,
+        unwind_tls: 0,
         thread_tls: 0,
         frame_tls: 0,
     };

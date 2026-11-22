@@ -13,6 +13,7 @@ mod elf;
 mod macho;
 mod pe;
 mod shims;
+mod tls;
 mod wide;
 
 use shims::Shim;
@@ -322,9 +323,9 @@ pub(super) struct SectionAddrs {
     pub(super) bss: u64,
     pub(super) dso_handle: u64,
     pub(super) thread_key: u64,
-    /// How far below the thread pointer the executable's static TLS block starts, on x86-64 ELF.
+    pub(super) tlv_desc: u64,
+    pub(super) unwind_tls: u64,
     pub(super) thread_tls: u64,
-    /// How far below the thread pointer the coroutine frame cache starts, on x86-64 ELF.
     pub(super) frame_tls: u64,
 }
 
@@ -445,13 +446,16 @@ impl<'a> Plan<'a> {
         self.shim_index.contains_key(&shim)
     }
 
+    pub(in crate::aot) fn has_unwind(&self) -> bool {
+        self.has_shim(Shim::CatchUnwind) || self.has_shim(Shim::StartPanic) || self.has_shim(Shim::DropPush) || self.has_shim(Shim::DropPop)
+    }
+
+    pub(in crate::aot) fn has_frame_cache(&self) -> bool {
+        self.has_shim(Shim::FrameAlloc) || self.has_shim(Shim::FrameFree)
+    }
+
     pub(super) fn bss_layout(&self, bss: u32) -> (u32, u32) {
-        if !(self.has_shim(Shim::ThreadCell)
-            || self.has_shim(Shim::CatchUnwind)
-            || self.has_shim(Shim::StartPanic)
-            || self.has_shim(Shim::DropPush)
-            || self.has_shim(Shim::DropPop))
-        {
+        if !(self.has_shim(Shim::ThreadCell) || self.has_unwind()) {
             return (bss, bss);
         }
         let key_off = bss.next_multiple_of(16);
