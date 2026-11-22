@@ -279,6 +279,9 @@ fn run_fixpoint(func: &mut Function, plan: &Plan, state: &mut PassState) {
             if (dirty[idx] & rule.reads).is_empty() {
                 continue;
             }
+            if rule.pass == Pass::Lsr && !dirty[Pass::Loads as usize].is_empty() {
+                continue;
+            }
             dirty[idx] = Domain::NONE;
             remaining -= 1;
             ran = true;

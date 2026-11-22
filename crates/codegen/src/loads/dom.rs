@@ -151,6 +151,11 @@ impl<'a> BlockWrites<'a> {
         }
     }
 
+    /// Whether `block` contains any potentially clobbering memory operation.
+    pub(super) fn has_writes(&self, block: Block) -> bool {
+        !self.writes[block.index()].is_empty()
+    }
+
     /// Computes surviving `KnownLoads` and live `(base, root)` keys at entry to `block`.
     pub(super) fn entry_known(
         &mut self,
