@@ -2,7 +2,7 @@ use super::fuse::{FuseCtx, preserved};
 use super::patterns::{FOLD_LIMIT, SibMatch, odd_scale_source, scaled_op};
 use super::super::asm::Reg;
 use crate::alloc::{Location, Plan};
-use crate::ir::{Convert, Function, Inst, Op, Type, Value};
+use crate::ir::{Binary, Convert, Function, Inst, Op, Type, Value};
 use crate::live::{Sib, SibBase};
 
 pub(super) fn sib_ok(ctx: &FuseCtx<'_>, m: &SibMatch, extra_skips: &[usize], end_pos: usize) -> bool {
@@ -295,6 +295,64 @@ pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, po
         }
         if preserved(func, plan, block, start, max_end, &[], base) {
             plan.elided[v] = true;
+        }
+    }
+}
+
+/// Elides single-use `Load + Alu + Store` (and stack equivalents) to the same address so `Store` emits one memory read-modify-write instruction.
+pub(super) fn fuse_mem_rmw(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    (uses, pos_of, defs): (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+) {
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (spos, &sinst) in block.insts.iter().enumerate() {
+            let (val, addr_match): (Value, Option<(Value, i32)>) = match func.insts[sinst.index()].op {
+                Op::Store(v, a, off) => (v, Some((a, off))),
+                Op::StackStore(v, _, _) => (v, None),
+                _ => continue,
+            };
+            let ty = func.ty(val);
+            if !ty.is_small_int() || uses[val.index()] != 1 || plan.elided[val.index()] || plan.fused[val.index()] || plan.sib[val.index()].is_some() {
+                continue;
+            }
+            let Some((rb, rpos, rinst)) = pos_of[val.index()] else { continue };
+            if rb != b_idx || rpos >= spos { continue; }
+            let Op::Binary(op @ (Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor), a, b) = func.insts[rinst.index()].op else { continue };
+            let matches_load = |v: Value| -> Option<usize> {
+                if uses[v.index()] != 1 || plan.elided[v.index()] || func.ty(v) != ty { return None; }
+                let (lb, lpos, linst) = pos_of[v.index()]?;
+                if lb != b_idx || lpos >= rpos { return None; }
+                let same = match (func.insts[sinst.index()].op.clone(), func.insts[linst.index()].op.clone()) {
+                    (Op::Store(_, sa, so), Op::Load(la, lo)) => sa == la && so == lo,
+                    (Op::StackStore(_, ss, so), Op::StackLoad(ls, lo)) => ss == ls && so == lo,
+                    _ => false,
+                };
+                same.then_some(lpos)
+            };
+            let Some((lpos, load_v, other)) = matches_load(a).map(|lp| (lp, a, b)).or_else(|| (op != Binary::Isub).then(|| matches_load(b).map(|lp| (lp, b, a))).flatten()) else { continue };
+            if block.insts[lpos + 1..spos].iter().any(|&mid| super::fuse::may_barrier_mem(&func.insts[mid.index()].op)) {
+                continue;
+            }
+            if let Some((addr, _)) = addr_match {
+                let addr_ok = if plan.elided[addr.index()] {
+                    plan.sib[addr.index()].is_some_and(|m| {
+                        let base_ok = match m.base {
+                            SibBase::Frame(_) => true,
+                            SibBase::Value(bv) => preserved(func, plan, b_idx, lpos, spos, &[rpos], bv),
+                        };
+                        base_ok && preserved(func, plan, b_idx, lpos, spos, &[rpos], idx_source(func, plan, defs, m.index))
+                    })
+                } else {
+                    preserved(func, plan, b_idx, lpos, spos, &[rpos], addr)
+                };
+                if !addr_ok { continue; }
+            }
+            let imm_ok = plan.const_of(other).is_some_and(|c| ty.bytes() < 8 || i32::try_from(c).is_ok());
+            let reg_ok = !plan.elided[other.index()] && plan.reg_of(other).is_some() && preserved(func, plan, b_idx, rpos, spos, &[], other);
+            if !imm_ok && !reg_ok { continue; }
+            plan.elided[load_v.index()] = true;
+            plan.elided[val.index()] = true;
         }
     }
 }

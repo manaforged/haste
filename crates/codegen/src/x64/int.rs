@@ -622,15 +622,31 @@ impl Emit<'_> {
 
     fn narrow_u32_cmp(&self, x: Value, y: Value) -> bool {
         let Some(c) = self.const_of(y) else { return false };
-        if u32::try_from(c as u64).is_err() || i32::try_from(c).is_ok() {
-            return false;
-        }
+        if u32::try_from(c as u64).is_err() || i32::try_from(c).is_ok() { return false; }
         let Some(inst) = self.defs[x.index()] else { return false };
         match self.func.insts[inst.index()].op {
             Op::Convert(crate::ir::Convert::Uextend, a) => self.ty(a).bits() <= 32,
             Op::Binary(Binary::Ushr, _, sh) => self.const_of(sh).is_some_and(|k| (k & 63) >= 32),
             Op::Binary(Binary::Band, a, b) => [a, b].into_iter().any(|v| self.const_of(v).is_some_and(|m| u32::try_from(m as u64).is_ok())),
             _ => false,
+        }
+    }
+
+    pub(super) fn emit_mem_rmw(&mut self, value: Value, to: Mem) {
+        self.flags = None;
+        let inst = self.defs[value.index()].expect("invariant: fuse_mem_rmw checked def");
+        let Op::Binary(op, a, b) = self.func.insts[inst.index()].op else { return };
+        let other = if self.plan.elided[a.index()] { b } else { a };
+        let alu = match op {
+            Binary::Iadd => Alu::Add, Binary::Isub => Alu::Sub,
+            Binary::Band => Alu::And, Binary::Bor => Alu::Or, Binary::Bxor => Alu::Xor,
+            _ => return,
+        };
+        let (ty, size) = (self.ty(value), Size::of(self.ty(value).bytes()));
+        if let Some(imm) = self.const_of(other).and_then(|c| if ty.bytes() < 8 { Some(c as i32) } else { i32::try_from(c).ok() }) {
+            self.asm.alu_imm_sized(size, alu, to, imm);
+        } else {
+            self.asm.alu_mem_reg(size, alu, to, self.reg_of(other).expect("invariant: fuse_mem_rmw checked reg"));
         }
     }
 

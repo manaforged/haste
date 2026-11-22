@@ -40,7 +40,7 @@ fn zero_cmp_band(
     crate::emit::zero_cmp_band(func, plan, (uses, pos_of), b_idx, (lhs, rhs), |v| is_zero_const(func, plan, v))
 }
 
-fn may_barrier_mem(op: &Op) -> bool {
+pub(super) fn may_barrier_mem(op: &Op) -> bool {
     matches!(
         op,
         Op::Store(..)
@@ -623,7 +623,9 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
     }
     apply_select_trees(func, plan, (&uses, &pos_of, &defs), &mut tst_end, &mut roots);
     super::sib::fuse_atomic_addrs(func, plan, (&uses, &pos_of));
+    super::sib::fuse_mem_rmw(func, plan, (&uses, &pos_of, &defs));
     for (b_idx, lpos, load_res) in cand_loads {
+        if plan.elided[load_res.index()] { continue; }
         let Some((ub, upos, uinst)) = use_of[load_res.index()] else { continue };
         if ub != b_idx || upos <= lpos { continue; }
         let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };

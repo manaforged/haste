@@ -740,7 +740,7 @@ pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos
         }
         let expected = match func.insts[inst.index()].op {
             Op::AtomicRmw(rmw, _, _, value) => {
-                if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor) {
+                if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor | AtomicRmwOp::Xchg) {
                     plan.fused[v] = true;
                     continue;
                 }
@@ -759,12 +759,16 @@ pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos
         };
         let Some((used_in, end, user)) = use_of[v] else { continue };
         let udata = &func.insts[user.index()];
-        let Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) = udata.op else { continue };
-        if used_in != block
-            || end <= start
-            || !udata.result.is_some_and(|r| !plan.elided[r.index()] && !plan.is_static(r))
-            || !((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
-        {
+        let zero_expected = plan.const_of(expected).is_some_and(|c| crate::fold::extend(c, ty, false) == 0);
+        let ok_user = match udata.op {
+            Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
+                udata.result.is_some_and(|r| !plan.elided[r.index()] && !plan.is_static(r))
+                    && ((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
+            }
+            Op::Brif(cond, ..) | Op::Trapz(cond) => cond == res && zero_expected,
+            _ => false,
+        };
+        if used_in != block || end <= start || !ok_user {
             continue;
         }
         let quiet = (start + 1..end).all(|p| {

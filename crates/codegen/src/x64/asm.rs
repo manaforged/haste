@@ -457,24 +457,15 @@ impl Asm {
         self.imm_sized(size, imm);
     }
 
-    pub fn imul_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) {
-        self.encode(&[], size == Size::Q, &[0x0F, 0xAF], dst as u8, src.into(), false);
-    }
-
-    pub fn imul(&mut self, dst: Reg, src: impl Into<Rm>) {
-        self.imul_sized(Size::Q, dst, src);
-    }
-
+    pub fn imul_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) { self.encode(&[], size == Size::Q, &[0x0F, 0xAF], dst as u8, src.into(), false); }
+    pub fn imul(&mut self, dst: Reg, src: impl Into<Rm>) { self.imul_sized(Size::Q, dst, src); }
     /// `dst = src * imm`.
     pub fn imul_imm_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, imm: i32) {
         self.encode(&[], size == Size::Q, &[0x69], dst as u8, src.into(), false);
         self.imm(&imm.to_le_bytes());
     }
-
     /// `dst = src * imm`.
-    pub fn imul_imm(&mut self, dst: Reg, src: impl Into<Rm>, imm: i32) {
-        self.imul_imm_sized(Size::Q, dst, src, imm);
-    }
+    pub fn imul_imm(&mut self, dst: Reg, src: impl Into<Rm>, imm: i32) { self.imul_imm_sized(Size::Q, dst, src, imm); }
 
     /// `op` on the low `size` bytes of `dst` and `src`.
     pub fn alu_sized(&mut self, size: Size, op: Alu, dst: Reg, src: impl Into<Rm>) {
@@ -482,22 +473,17 @@ impl Asm {
         self.sized(false, size, (&[op as u8 * 8 + 2], &[op as u8 * 8 + 3]), dst as u8, src.into());
     }
 
+    /// `dst op= src` on memory `dst` and register `src` at `size`.
+    pub fn alu_mem_reg(&mut self, size: Size, op: Alu, dst: Mem, src: Reg) {
+        self.alu_flags(op);
+        self.sized(false, size, (&[op as u8 * 8], &[op as u8 * 8 + 1]), src as u8, dst.into());
+    }
+
     /// The one-operand `op` on the low `size` bytes of `rm`.
-    pub fn group3_sized(&mut self, size: Size, op: Group3, rm: impl Into<Rm>) {
-        self.sized(false, size, (&[0xF6], &[0xF7]), op as u8, rm.into());
-    }
-
-    pub fn group3(&mut self, op: Group3, rm: impl Into<Rm>) {
-        self.encode(&[], true, &[0xF7], op as u8, rm.into(), false);
-    }
-
-    pub fn cqo(&mut self) {
-        self.code.extend([0x48, 0x99]);
-    }
-
-    pub fn shift(&mut self, size: Size, op: Shift, reg: Reg) {
-        self.sized(false, size, (&[0xD2], &[0xD3]), op as u8, reg.into());
-    }
+    pub fn group3_sized(&mut self, size: Size, op: Group3, rm: impl Into<Rm>) { self.sized(false, size, (&[0xF6], &[0xF7]), op as u8, rm.into()); }
+    pub fn group3(&mut self, op: Group3, rm: impl Into<Rm>) { self.encode(&[], true, &[0xF7], op as u8, rm.into(), false); }
+    pub fn cqo(&mut self) { self.code.extend([0x48, 0x99]); }
+    pub fn shift(&mut self, size: Size, op: Shift, reg: Reg) { self.sized(false, size, (&[0xD2], &[0xD3]), op as u8, reg.into()); }
 
     pub fn shift_imm(&mut self, size: Size, op: Shift, reg: Reg, imm: u8) {
         self.flags_overwritten();
@@ -770,21 +756,34 @@ impl Asm {
         self.fixup(label, Disp::Jcc);
     }
 
-    fn lea_rip_head(&mut self, dst: Reg) -> u32 {
+    fn rip_head(&mut self, wide: bool, op: &[u8], dst: Reg) -> u32 {
         let reg = dst as u8;
-        self.rex(true, reg, 0, 0, false);
-        self.code.extend([0x8D, 0x05 | ((reg & 7) << 3)]);
+        self.rex(wide, reg, 0, 0, false);
+        self.code.extend(op);
+        self.code.push(0x05 | ((reg & 7) << 3));
         self.pos()
     }
 
     pub fn lea_rip(&mut self, dst: Reg, label: Label) {
-        self.lea_rip_head(dst);
+        self.rip_head(true, &[0x8D], dst);
         self.fixup(label, Disp::Rip);
     }
 
     pub fn lea_rip_reloc(&mut self, dst: Reg) -> u32 {
-        let at = self.lea_rip_head(dst);
-        self.code.extend(0_u32.to_le_bytes());
+        let at = self.rip_head(true, &[0x8D], dst);
+        self.code.extend([0; 4]);
+        at
+    }
+
+    pub fn load_rip_reloc(&mut self, size: Size, dst: Reg) -> u32 {
+        let (wide, op): (bool, &[u8]) = match size {
+            Size::B => (false, &[0x0F, 0xB6]),
+            Size::W => (false, &[0x0F, 0xB7]),
+            Size::D => (false, &[0x8B]),
+            Size::Q => (true, &[0x8B]),
+        };
+        let at = self.rip_head(wide, op, dst);
+        self.code.extend([0; 4]);
         at
     }
 
