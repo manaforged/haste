@@ -46,6 +46,11 @@ impl Emit<'_> {
         self.last_fspill = None;
     }
 
+    pub(super) fn clobber_call_spills(&mut self) {
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi, Reg::Rdi, Reg::R8, Reg::R9, Reg::R10, Reg::R11]);
+        self.last_fspill = None;
+    }
+
     pub(super) fn clobber_reg(&mut self, reg: Reg) {
         self.last_spill.clobber(reg);
     }

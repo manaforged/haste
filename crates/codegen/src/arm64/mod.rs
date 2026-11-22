@@ -701,7 +701,12 @@ impl Emit<'_> {
             Some(CallTarget::Symbol(sym)) => self.relocs.push(self.asm.call_direct_symbol(sym, self.direct_calls, T)),
             None => self.asm.blr(target),
         }
-        self.invalidate_spills();
+        for r in 0..19 {
+            self.last_spill.clobber(Reg(r));
+        }
+        self.last_spill.clobber(LR);
+        self.last_fspill = None;
+        self.asm.clear_anchor();
         Ok(abi)
     }
 }
@@ -733,12 +738,10 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) { self.branch_cond(condition, invert, label); }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
-        self.invalidate_spills();
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], _is_try: bool) -> Result<Abi, String> {
         self.arguments(sig, callee, args)
     }
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
-        self.invalidate_spills();
         self.store_locs(values, locs);
     }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }

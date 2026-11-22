@@ -35,7 +35,7 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn jump_label(&mut self, label: L);
     fn branch_cond(&mut self, condition: Value, invert: bool, label: L);
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String>;
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi<R>, String>;
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi<R>, String>;
     fn store_locs(&mut self, values: &[Value], locs: &[Loc<R>]);
     fn store_loc(&mut self, value: Value, loc: Loc<R>);
     fn load_incoming(&mut self, value: Value, offset: u32);
@@ -436,7 +436,7 @@ pub(crate) fn emit_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         emit.park_spill(value, reg);
         emit.plan_mut().locations[value.index()] = Location::Slot;
     }
-    let abi = emit.arguments(sig, callee, args)?;
+    let abi = emit.arguments(sig, callee, args, false)?;
     emit.store_locs(results, &abi.returns);
     for (value, reg, lives) in parked {
         if lives {
@@ -456,7 +456,7 @@ pub(crate) fn emit_try_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, 
     args: &[Value],
     (normal, handler): (Block, Block),
 ) -> Result<(), String> {
-    emit.arguments(sig, callee, args)?;
+    emit.arguments(sig, callee, args, true)?;
     let ret = emit.pos();
     let normal_label = emit.block_label(normal);
     emit.jump_label(normal_label);

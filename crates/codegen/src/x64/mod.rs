@@ -205,7 +205,7 @@ pub(super) struct Emit<'a> {
     copied: Vec<bool>,
     direct_calls: bool,
     frame_cache: bool,
-    cold_calls: Vec<(Label, Label, StencilReloc)>,
+    cold_calls: Vec<frames::ColdCall>,
     shrink: Option<ShrinkWrap>,
     in_fast: bool,
     low_product: Option<(Value, Value)>,
@@ -633,7 +633,7 @@ impl Emit<'_> {
         self.clobber_reg(Reg::Rcx);
     }
 
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
         let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
         for (arg, loc) in args.iter().zip(&abi.params) {
             match *loc {
@@ -643,6 +643,14 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
+        if !is_try
+            && let Some(CallTarget::Symbol(lookup)) = direct
+            && self.func.is_thread_cell(callee)
+            && self.thread_cell_cold(lookup, args)
+        {
+            self.clobber_call_spills();
+            return Ok(abi);
+        }
         let cell = match direct {
             Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot, lookup)).map(|hit| (lookup, hit)),
             _ => None,
@@ -667,11 +675,11 @@ impl Emit<'_> {
             let at = self.asm.call_pcrel32();
             self.relocs.push(StencilReloc::symbol(at, lookup, crate::reloc::RelocKind::PcRel32));
             self.asm.bind(hit);
-            self.invalidate_spills();
+            self.clobber_call_spills();
             return Ok(abi);
         }
         if self.inline_call(direct, args) {
-            self.invalidate_spills();
+            self.clobber_call_spills();
             return Ok(abi);
         }
         match direct {
@@ -700,7 +708,7 @@ impl Emit<'_> {
             }
             None => self.asm.call(held.unwrap_or(Reg::R11)),
         }
-        self.invalidate_spills();
+        self.clobber_call_spills();
         Ok(abi)
     }
 }
@@ -735,7 +743,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
         self.asm.jcc(if invert { cond.invert() } else { cond }, label);
     }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> { self.arguments(sig, callee, args) }
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> { self.arguments(sig, callee, args, is_try) }
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) { self.store_locs(values, locs); }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
     fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, self.frame_mem(INCOMING + offset as i32), INTAKE_XMM); }
