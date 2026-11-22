@@ -420,16 +420,12 @@ impl Emit<'_> {
             && let Some(inst) = self.defs[condition.index()]
         {
             match self.func.insts[inst.index()].op {
-                Op::Binary(Binary::Band, x, y) => {
-                    self.emit_test_band(x, y);
-                    return Cond::Ne;
-                }
+                Op::Binary(Binary::Band, x, y) => return self.emit_test_band(x, y),
                 Op::Convert(crate::ir::Convert::Ireduce, inner) if self.plan.elided[inner.index()] => {
                     if let Some(iinst) = self.defs[inner.index()]
                         && let Op::Binary(Binary::Band, x, y) = self.func.insts[iinst.index()].op
                     {
-                        self.emit_test_band(x, y);
-                        return Cond::Ne;
+                        return self.emit_test_band(x, y);
                     }
                 }
                 Op::Icmp(cc, lhs, rhs) => return self.cmp_flags(cc, lhs, rhs, None),
@@ -491,8 +487,8 @@ impl Emit<'_> {
         } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
             && let Some((a, b)) = self.elided_band_cmp(x, y)
         {
-            self.emit_test_band(a, b);
-            int::cond(cc)
+            let nz = self.emit_test_band(a, b);
+            if cc == IntCC::NotEqual { nz } else { nz.invert() }
         } else if let Some(cond) = self.held_eq_compare(cc, x, y).or_else(|| self.held_compare(cc, x, y)) {
             cond
         } else {

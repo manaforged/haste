@@ -56,7 +56,7 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
         }
         stack.push((block, true));
         let mut succs: Vec<Block> = func.successors(block).filter(|succ| !visited[succ.index()]).collect();
-        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), is_latch[succ.index()], loops.depth_of(succ))));
+        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), loops.depth_of(succ), is_latch[succ.index()])));
         for succ in succs {
             stack.push((succ, false));
         }

@@ -526,7 +526,7 @@ impl Emit<'_> {
         Some((a, b))
     }
 
-    pub(super) fn emit_test_band(&mut self, x: Value, y: Value) {
+    pub(super) fn emit_test_band(&mut self, x: Value, y: Value) -> Cond {
         let ty = self.ty(x);
         let size = Size::of(ty.bytes());
         let imm_pair = match (self.const_of(y), self.const_of(x)) {
@@ -545,20 +545,6 @@ impl Emit<'_> {
             if let Some((tsz, timm)) = imm_sz {
                 let source = self.operand(val);
                 self.asm.test_imm_sized(tsz, source, timm);
-            } else if ty == Type::I64 && (imm as u64).checked_add(1).is_some_and(u64::is_power_of_two) {
-                let shift = (imm as u64).leading_zeros() as u8;
-                if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
-                    let source = self.operand(val);
-                    self.asm.load(Size::Q, Reg::Rax, source);
-                } else {
-                    self.raw(Reg::Rax, val);
-                }
-                if shift == 1 {
-                    self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax);
-                } else {
-                    self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift);
-                }
-                self.clobber_reg(Reg::Rax);
             } else {
                 let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
                     self.operand(val)
@@ -566,12 +552,24 @@ impl Emit<'_> {
                     self.raw(Reg::Rax, val);
                     Reg::Rax.into()
                 };
-                let (source, wide) = self.spare(None, val, source);
-                self.asm.mov_imm(wide, imm);
-                self.clobber_reg(wide);
-                self.asm.test_sized(Size::Q, source, wide);
+                if ty == Type::I64 && (imm as u64).is_power_of_two() {
+                    self.asm.bt_imm(source, (imm as u64).trailing_zeros() as u8);
+                    return Cond::B;
+                } else if ty == Type::I64 && (imm as u64).checked_add(1).is_some_and(u64::is_power_of_two) {
+                    let shift = (imm as u64).leading_zeros() as u8;
+                    if !matches!(source, Rm::Reg(0)) {
+                        self.asm.load(Size::Q, Reg::Rax, source);
+                    }
+                    if shift == 1 { self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax); } else { self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift); }
+                    self.clobber_reg(Reg::Rax);
+                } else {
+                    let (source, wide) = self.spare(None, val, source);
+                    self.asm.mov_imm(wide, imm);
+                    self.clobber_reg(wide);
+                    self.asm.test_sized(Size::Q, source, wide);
+                }
             }
-            return;
+            return Cond::Ne;
         }
         if let Some(ry) = self.reg_of(y).or_else(|| self.cached_beside(y, x)) {
             let sx = self.operand(x);
@@ -584,6 +582,7 @@ impl Emit<'_> {
             let sy = self.operand(y);
             self.asm.test_sized(size, sy, Reg::Rax);
         }
+        Cond::Ne
     }
 
     pub(super) fn emit_cmp_pair(&mut self, size: Size, x: Value, y: Option<Value>, zero_test: bool, unsigned: bool) {

@@ -220,6 +220,13 @@ impl Asm {
         self.imm(&[bit]);
     }
 
+    /// `bt rm, bit` on a 64-bit operand, copying bit `bit` into the carry flag.
+    pub fn bt_imm(&mut self, rm: impl Into<Rm>, bit: u8) {
+        self.flags_overwritten();
+        self.encode(&[], true, &[0x0F, 0xBA], 4, rm.into(), false);
+        self.imm(&[bit]);
+    }
+
     fn xmm_op(&mut self, pp: u8, opcode: u8, (xmm, src): (Xmm, Xmm), rm: impl Into<Rm>) {
         if self.avx {
             return self.vex_xmm(1, pp, opcode, (xmm, src), rm);

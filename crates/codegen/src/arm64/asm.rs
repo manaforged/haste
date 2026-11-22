@@ -188,7 +188,7 @@ impl PairKind {
 }
 
 #[derive(Clone, Copy)]
-struct LastMem { end_pos: u32, binds: u32, kind: PairKind, reg: u8, base: Reg, disp: i32 }
+struct LastMem { end_pos: u32, binds: u32, pair: Option<PairKind>, base_op: u32, is_int: bool, reg: u8, base: Reg, disp: i32 }
 
 #[derive(Default)]
 pub(crate) struct Asm {
@@ -398,6 +398,19 @@ impl Asm {
 
     /// `dst = a +/- imm` for `imm < 4096` or a multiple of 4096 below 2^24, where `a` or `dst` may be the stack pointer; sets the flags when `flags`.
     pub fn add_imm(&mut self, sub: bool, flags: bool, size: Size, dst: Reg, a: Reg, imm: u32) {
+        if !flags && size == Size::X && dst == a && dst != SP && imm != 0
+            && let Some(prev) = self.last_mem
+            && prev.end_pos == self.pos() && prev.binds == self.binds && prev.disp == 0 && prev.base == dst
+            && (!prev.is_int || prev.reg != dst.0)
+        {
+            let delta = if sub { -i64::from(imm) } else { i64::from(imm) };
+            if (-256..=255).contains(&delta) {
+                self.code.truncate((prev.end_pos - 4) as usize);
+                self.last_mem = None;
+                self.emit_gp(dst, prev.base_op | ((delta as u32) & 0x1FF) << 12 | 1 << 10 | u32::from(dst.0) << 5 | u32::from(prev.reg));
+                return;
+            }
+        }
         let (imm, shifted) = if imm >= 4096 { (imm >> 12, 1) } else { (imm, 0) };
         let base = 0x9100_0000 | u32::from(sub) << 30 | u32::from(flags) << 29 | shifted << 22;
         self.emit_gp(dst, sized(base, size) | (imm & 0xFFF) << 10 | u32::from(a.0) << 5 | u32::from(dst.0));
@@ -590,7 +603,7 @@ impl Asm {
     }
 
     fn pair_match(prev: LastMem, (kind, reg): (PairKind, u8), mem: Mem, (pos, binds): (u32, u32)) -> Option<(u8, u8, i32)> {
-        if prev.end_pos != pos || prev.binds != binds || prev.kind != kind || prev.base != mem.base {
+        if prev.end_pos != pos || prev.binds != binds || prev.pair != Some(kind) || prev.base != mem.base {
             return None;
         }
         let step = kind.step();
@@ -637,7 +650,7 @@ impl Asm {
         Mem::new(Reg(17), rem as i32)
     }
 
-    fn access_pair(&mut self, pair: Option<(PairKind, u8)>, base: u32, scale: u32, rt: u32, mem: Mem) {
+    fn access_pair(&mut self, pair: Option<(PairKind, u8)>, is_int: bool, base: u32, scale: u32, rt: u32, mem: Mem) {
         let mem = self.anchor_mem(scale, mem);
         if let Some((kind, reg)) = pair
             && let Some(prev) = self.last_mem
@@ -653,19 +666,21 @@ impl Asm {
             return;
         }
         let single = self.access(base, scale, rt, mem);
-        self.last_mem = pair.filter(|_| single).map(|(kind, reg)| LastMem { end_pos: self.pos(), binds: self.binds, kind, reg, base: mem.base, disp: mem.disp });
+        self.last_mem = single.then(|| LastMem {
+            end_pos: self.pos(), binds: self.binds, pair: pair.map(|(k, _)| k), base_op: base, is_int, reg: rt as u8, base: mem.base, disp: mem.disp,
+        });
     }
 
     /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
     pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
         let pair = (!signed && matches!(size, Size::W | Size::X)).then_some((PairKind::IntLoad(size), dst.0));
-        self.access_pair(pair, Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
+        self.access_pair(pair, true, Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
         self.clobber_anchor(dst);
     }
 
     pub fn store(&mut self, size: Size, mem: Mem, src: Reg) {
         let pair = matches!(size, Size::W | Size::X).then_some((PairKind::IntStore(size), src.0));
-        self.access_pair(pair, Self::store_base(size), size.log2(), u32::from(src.0), mem);
+        self.access_pair(pair, true, Self::store_base(size), size.log2(), u32::from(src.0), mem);
     }
 
     fn vpair(bytes: u32, reg: u8, load: bool) -> Option<(PairKind, u8)> {
@@ -676,12 +691,12 @@ impl Asm {
     /// Loads a float or vector register of `bytes` 4, 8 or 16.
     pub fn vload(&mut self, bytes: u32, dst: Vreg, mem: Mem) {
         let (base, scale) = Self::vbase(bytes);
-        self.access_pair(Self::vpair(bytes, dst.0, true), base | 0x40_0000, scale, u32::from(dst.0), mem);
+        self.access_pair(Self::vpair(bytes, dst.0, true), false, base | 0x40_0000, scale, u32::from(dst.0), mem);
     }
 
     pub fn vstore(&mut self, bytes: u32, mem: Mem, src: Vreg) {
         let (base, scale) = Self::vbase(bytes);
-        self.access_pair(Self::vpair(bytes, src.0, false), base, scale, u32::from(src.0), mem);
+        self.access_pair(Self::vpair(bytes, src.0, false), false, base, scale, u32::from(src.0), mem);
     }
 
     /// Loads `size` bytes at `base + (index << shift)` into `dst`.
