@@ -18,6 +18,16 @@ enum CalleeKind {
     MayUnwind,
 }
 
+fn def_op<'a>(func: &'a Function, defs: &[Option<Inst>], val: Value) -> Option<&'a Op> {
+    defs.get(val.index()).copied().flatten().map(|i| &func.insts[i.index()].op)
+}
+
+fn guard_call_slot(kind: CalleeKind, args: &[Value], addr_slot: &[Option<StackSlot>]) -> Option<StackSlot> {
+    (matches!(kind, CalleeKind::DropPush | CalleeKind::DropPop) && args.len() == 1)
+        .then(|| addr_slot[args[0].index()])
+        .flatten()
+}
+
 fn classify_callee(
     func: &Function,
     defs: &[Option<Inst>],
@@ -26,10 +36,9 @@ fn classify_callee(
     is_drop_pop: &mut impl FnMut(u32) -> bool,
     sym_may_unwind: &mut impl FnMut(u32) -> bool,
 ) -> CalleeKind {
-    let op = defs.get(callee.index()).copied().flatten().map(|i| &func.insts[i.index()].op);
-    let sym = match op {
+    let sym = match def_op(func, defs, callee) {
         Some(&(Op::Symbol(sym) | Op::SlotAddr(sym))) => Some(sym),
-        Some(&Op::Load(addr, 0)) => match defs.get(addr.index()).copied().flatten().map(|i| &func.insts[i.index()].op) {
+        Some(&Op::Load(addr, 0)) => match def_op(func, defs, addr) {
             Some(&Op::SlotAddr(sym)) => Some(sym),
             _ => None,
         },
@@ -51,16 +60,10 @@ fn classify_callee(
 }
 
 fn store_clears_active(func: &Function, defs: &[Option<Inst>], val: Value) -> bool {
-    let Some(inst) = defs.get(val.index()).copied().flatten() else { return false };
-    match func.insts[inst.index()].op {
-        Op::Const(imm) if (imm & 1) == 0 => true,
-        Op::Binary(Binary::Band, a, b) => {
-            let clears = |v: Value| {
-                defs.get(v.index())
-                    .copied()
-                    .flatten()
-                    .is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(imm) if (imm & 1) == 0))
-            };
+    match def_op(func, defs, val) {
+        Some(&Op::Const(imm)) if (imm & 1) == 0 => true,
+        Some(&Op::Binary(Binary::Band, a, b)) => {
+            let clears = |v: Value| matches!(def_op(func, defs, v), Some(&Op::Const(imm)) if (imm & 1) == 0);
             clears(a) || clears(b)
         }
         _ => false,
@@ -96,14 +99,16 @@ fn slot_needs_unwind(
         let mut stopped = false;
         for &inst in &insts[start_pos..] {
             match &func.insts[inst.index()].op {
-                Op::Call { args, .. } => match kinds[inst.index()] {
-                    CalleeKind::DropPop if args.len() == 1 && addr_slot[args[0].index()] == Some(slot) => {
+                Op::Call { args, .. } => {
+                    let kind = kinds[inst.index()];
+                    if kind == CalleeKind::DropPop && guard_call_slot(kind, args, addr_slot) == Some(slot) {
                         stopped = true;
                         break;
                     }
-                    CalleeKind::MayUnwind if active => return true,
-                    _ => {}
-                },
+                    if kind == CalleeKind::MayUnwind && active {
+                        return true;
+                    }
+                }
                 Op::TryCall { .. } if active => return true,
                 &Op::StackStore(v, s, 0) if s == slot => {
                     active = !store_clears_active(func, defs, v);
@@ -178,11 +183,7 @@ impl Function {
                     Op::Call { callee, args, .. } => {
                         let kind = classify_callee(self, &defs, *callee, &mut is_drop_push, &mut is_drop_pop, &mut sym_may_unwind);
                         kinds[inst.index()] = kind;
-                        let is_guard_call = matches!(kind, CalleeKind::DropPush | CalleeKind::DropPop)
-                            && args.len() == 1
-                            && addr_slot[args[0].index()].is_some();
-                        if is_guard_call {
-                            let slot = addr_slot[args[0].index()].unwrap();
+                        if let Some(slot) = guard_call_slot(kind, args, &addr_slot) {
                             if kind == CalleeKind::DropPush {
                                 pushes[slot.index()].push((b, pos));
                                 any_push = true;
@@ -236,13 +237,7 @@ impl Function {
         }
         for block in &mut self.blocks {
             block.insts.retain(|&inst| match &self.insts[inst.index()].op {
-                Op::Call { args, .. }
-                    if matches!(kinds[inst.index()], CalleeKind::DropPush | CalleeKind::DropPop)
-                        && args.len() == 1
-                        && addr_slot[args[0].index()].is_some_and(|s| dead[s.index()]) =>
-                {
-                    false
-                }
+                Op::Call { args, .. } if guard_call_slot(kinds[inst.index()], args, &addr_slot).is_some_and(|s| dead[s.index()]) => false,
                 &Op::StackStore(_, s, 24 | 32) if dead[s.index()] => false,
                 _ => true,
             });

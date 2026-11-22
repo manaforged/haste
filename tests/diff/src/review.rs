@@ -70,25 +70,48 @@ macro_rules! spell_expr {
 
 #[track_caller]
 #[inline(never)]
-fn caller_line_here() -> (&'static str, u32) {
+fn caller_line_here() -> (&'static str, u32, u32) {
     let loc = Location::caller();
-    (loc.file(), loc.line())
+    (loc.file(), loc.line(), loc.column())
 }
 
 #[inline(never)]
-fn caller_line_wrap() -> (&'static str, u32) {
+fn caller_line_wrap() -> (&'static str, u32, u32) {
     caller_line_here()
+}
+
+fn catch_panic_loc(f: impl FnOnce() + std::panic::UnwindSafe) -> (bool, u32, u32) {
+    use std::sync::Mutex;
+    static LAST: Mutex<(bool, u32, u32)> = Mutex::new((false, 0, 0));
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        if let Some(loc) = info.location()
+            && let Ok(mut slot) = LAST.lock()
+        {
+            *slot = (loc.file().ends_with("review.rs"), loc.line(), loc.column());
+        }
+    }));
+    let caught = std::panic::catch_unwind(f).is_err();
+    std::panic::set_hook(prev);
+    let got = LAST.lock().map(|g| *g).unwrap_or((false, 0, 0));
+    (caught && got.0, got.1, got.2)
 }
 
 pub fn case_rev_stringify_and_track_caller(seed: i64) -> i64 {
     let s = spell_expr!(x > 3);
     let exact = i64::from(s == "x > 3");
-    let (f1, l1) = caller_line_here();
-    let (f2, l2) = caller_line_wrap();
+    let (f1, l1, c1) = caller_line_here();
+    let (f2, l2, c2) = caller_line_wrap();
     let direct = Location::caller();
-    let ok_files = i64::from(f1.ends_with("review.rs") && f2.ends_with("review.rs") && direct.file().ends_with("review.rs"));
-    let diff = i64::from(l1.saturating_sub(l2)) + i64::from(direct.line().saturating_sub(l1));
-    exact * 1000 + ok_files * 100 + diff * 10 + (seed & 7)
+    let (u_ok, u_line, u_col) = catch_panic_loc(|| { let _ = black_box(None::<u32>).unwrap(); });
+    let (e_ok, e_line, e_col) = catch_panic_loc(|| { let _ = black_box(Err::<u32, _>("e")).expect("bad"); });
+    let (p_ok, p_line, p_col) = catch_panic_loc(|| { panic!("boom"); });
+    let ok_files = i64::from(f1.ends_with("review.rs") && f2.ends_with("review.rs") && direct.file().ends_with("review.rs") && u_ok && e_ok && p_ok);
+    let mut h = exact * 1_000_000 + ok_files * 100_000 + (seed & 7);
+    for v in [l1, c1, l2, c2, direct.line(), direct.column(), u_line, u_col, e_line, e_col, p_line, p_col] {
+        h = h.wrapping_mul(131).wrapping_add(i64::from(v));
+    }
+    h
 }
 
 fn reborrow_arc<'a>(w: Arc<&'a [u8]>) -> &'a [u8] {

@@ -1,5 +1,5 @@
 use crate::builder::FunctionBuilder;
-use crate::ir::{Binary, Convert, Function, Inst, Op, StackSlot, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, Value};
 
 fn def_op(func: &Function, mut value: Value) -> Option<(Value, &Op)> {
     for _ in 0..4 {
@@ -75,6 +75,16 @@ fn slot_store_const_u64(builder: &FunctionBuilder<'_>, ptr: Value, slot: StackSl
     None
 }
 
+fn resolve_sym(func: &Function, dict: Option<Value>, v: Value) -> Option<u32> {
+    let data = func.insts.iter().rev().find(|d| d.result == Some(v))?;
+    match data.op {
+        Op::Symbol(sym) | Op::SlotAddr(sym) => Some(sym),
+        Op::Load(addr, offset) if dict == Some(addr) && offset >= 0 && offset % 8 == 0 => Some((offset / 8) as u32),
+        Op::Load(addr, 0) | Op::Convert(Convert::Bitcast, addr) => resolve_sym(func, dict, addr),
+        _ => None,
+    }
+}
+
 impl FunctionBuilder<'_> {
     /// The integer constant value of `value` when defined directly in recent instructions.
     pub fn const_int(&self, value: Value) -> Option<i64> {
@@ -96,6 +106,54 @@ impl FunctionBuilder<'_> {
                 slot_store_const_u64(self, base, slot, target_off)
             }
             _ => None,
+        }
+    }
+
+    /// Number of blocks currently in this function.
+    pub fn block_count(&self) -> usize {
+        self.func.blocks.len()
+    }
+
+    /// Block handle at index `idx` within this function.
+    pub fn block_at(&self, idx: usize) -> Block {
+        Block(idx as u32)
+    }
+
+    /// Position of the first call in `block` whose callee matches `is_tracked(sym, first_const_arg)`, and whether control can leave `block` normally afterward.
+    pub fn block_first_tracked(&self, block: Block, dict: Option<Value>, mut is_tracked: impl FnMut(u32, Option<i64>) -> bool) -> Option<(usize, bool)> {
+        let insts = &self.func.blocks[block.index()].insts;
+        let first = insts.iter().position(|&inst| {
+            let (callee, args) = match &self.func.insts[inst.index()].op {
+                Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } => (*callee, args),
+                _ => return false,
+            };
+            let Some(sym) = resolve_sym(self.func, dict, callee) else {
+                return false;
+            };
+            let first_arg = args.first().and_then(|&v| self.const_int(v));
+            is_tracked(sym, first_arg)
+        })?;
+        let can_fall_through = insts
+            .last()
+            .is_some_and(|&last| !matches!(self.func.insts[last.index()].op, Op::Trap | Op::TryCall { .. }));
+        Some((first, can_fall_through))
+    }
+
+    /// Splits `block` at `pos` and switches the builder to `block`, returning `(saved_block, tail)`.
+    pub fn splice_open(&mut self, block: Block, pos: usize) -> (Option<Block>, Vec<Inst>) {
+        let saved = self.current;
+        let tail = self.func.blocks[block.index()].insts.split_off(pos);
+        self.current = Some(block);
+        (saved, tail)
+    }
+
+    /// Appends `insts` to the current block and restores `restore` when set.
+    pub fn splice_append(&mut self, insts: &[Inst], restore: Option<Block>) {
+        if let Some(block) = self.current {
+            self.func.blocks[block.index()].insts.extend_from_slice(insts);
+        }
+        if let Some(target) = restore {
+            self.current = Some(target);
         }
     }
 }

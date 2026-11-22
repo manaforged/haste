@@ -115,7 +115,7 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
 fn mix_instance_flags(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, mix: &mut HashMix, krate: u32, index: usize) {
     mix.bool(slots.low_entries());
     mix.bool(slots.allow_inline());
-    mix.bool(cx.outline.crates[krate as usize].env.overflow_checks());
+    mix.bool(cx.overflow_checks(krate));
     mix.bool(crate::sema::reach::unwind_enabled(cx, reached));
     mix.bool(reached.may_unwind(cx, index));
 }
@@ -182,7 +182,7 @@ fn try_unique_footprint(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slo
 fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, (low, allow_inline): (bool, bool), item: ItemRef, typed: &Typed) -> Result<()> {
     mix.bool(low);
     mix.bool(allow_inline);
-    mix.bool(cx.outline.crates[item.krate as usize].env.overflow_checks());
+    mix.bool(cx.overflow_checks(item.krate));
     let shape_tag = match &typed.shape {
         Shape::Body => 0,
         Shape::Glue(_) => 1,

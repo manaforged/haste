@@ -137,6 +137,55 @@ impl Lower<'_, '_> {
         Ok(self.emit_symbol(SymbolSource::Rodata(loc_id)))
     }
 
+    pub(super) fn expr_site_place(&self, expr: crate::body::ExprId) -> Option<u64> {
+        self.expr_site_token(expr)
+            .map(|tok| self.src.place(tok))
+            .filter(|&loc| loc != 0)
+            .or_else(|| self.body.expr_ends.get(expr.0 as usize).map(|&end| self.src.place(end.saturating_sub(1))).filter(|&loc| loc != 0))
+    }
+
+    fn expr_site_token(&self, expr: crate::body::ExprId) -> Option<u32> {
+        use crate::body::Expr;
+        match self.body.exprs[expr.0 as usize] {
+            Expr::Method { name, .. } => Some(name),
+            Expr::Call(callee, _) | Expr::Index(callee, _) => self.expr_site_token(callee),
+            Expr::Path(path) => {
+                let p = self.body.paths[path.0 as usize];
+                self.body.list(p.segments).first().map(|&seg| {
+                    let tok = self.body.segments[seg as usize].name;
+                    if p.global { tok.saturating_sub(1) } else { tok }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn wrap_inlined_caller_loc(&mut self, from_blk: usize, to_blk: usize) -> Result<()> {
+        for b_idx in from_blk..to_blk {
+            let block = self.b.block_at(b_idx);
+            let Some((first_call, can_fall_through)) = self.b.block_first_tracked(block, self.dict_param, |sym, arg0| match self.relocs.get(sym as usize) {
+                Some(SymbolSource::Slot(idx)) => self.cx.track_caller(self.reached.list[*idx].0.0),
+                Some(SymbolSource::Host(HostSymbol::ThreadCell)) => arg0 == Some(0),
+                _ => false,
+            }) else {
+                continue;
+            };
+            let (saved, tail) = self.b.splice_open(block, first_call);
+            let slot = self.caller_loc_slot()?;
+            let prev = self.ins().load(Type::I64, slot, 0);
+            let loc = self.current_site_location()?;
+            self.ins().store(loc, slot, 0);
+            if can_fall_through && let Some((&term, mid)) = tail.split_last() {
+                self.b.splice_append(mid, None);
+                self.ins().store(prev, slot, 0);
+                self.b.splice_append(&[term], saved);
+            } else {
+                self.b.splice_append(&tail, saved);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn with_caller_loc<T>(&mut self, track: bool, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if !track {
             return run(self);

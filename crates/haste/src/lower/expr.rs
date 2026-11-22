@@ -67,11 +67,8 @@ impl Lower<'_, '_> {
     /// Lowers `expr` and returns its value, or none for `()`, `!` and code after a jump; its instructions carry its source place.
     pub fn expr(&mut self, expr: ExprId) -> Result<Option<Value>> {
         let outer = self.b.loc();
-        if let Some(&end) = self.body.expr_ends.get(expr.0 as usize) {
-            let loc = self.src.place(end.saturating_sub(1));
-            if loc != 0 {
-                self.b.set_loc(loc);
-            }
+        if let Some(loc) = self.expr_site_place(expr) {
+            self.b.set_loc(loc);
         }
         let value = self.expr_placed(expr);
         self.b.set_loc(outer);
@@ -490,12 +487,14 @@ impl Lower<'_, '_> {
                 let wants_track = !self.cx.track_caller(self.reached.list[self.index].0.0) && self.cx.track_caller(self.reached.list[index].0.0);
                 match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
                     Some(inlined) => {
-                        let callee_item = self.reached.list[index].0.0;
-                        let track = wants_track
-                            && (crate::profile() != crate::outline::tree::Profile::Release
-                                || !self.cx.outline.crates[callee_item.krate as usize].is_sysroot()
-                                || inlined.body.calls_thread_cell_directly());
-                        return self.with_caller_loc(track, |this| this.emit_inlined(&inlined, origin, values));
+                        let was_open = self.open;
+                        let from_blk = self.b.block_count();
+                        let res = self.emit_inlined(&inlined, origin, values)?;
+                        if wants_track && was_open {
+                            let to_blk = self.b.block_count().saturating_sub(1);
+                            self.wrap_inlined_caller_loc(from_blk, to_blk)?;
+                        }
+                        return Ok(res);
                     }
                     None => {
                         track_site = wants_track;

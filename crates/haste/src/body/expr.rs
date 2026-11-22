@@ -346,12 +346,13 @@ impl Cursor<'_> {
     }
 
     fn path_expr(&mut self) -> Result<ExprId> {
+        let start = self.at;
         let path = self.path(Style::Expr)?;
         if self.punct("!") && !self.punct("!=") && opens(self.kind_at(self.at + 1)) {
             self.at += 1;
             let open = self.group();
             if let Some(&block) = self.config.calls.and_then(|calls| calls.get(&open)) {
-                return self.expanded(block);
+                return self.expanded(block, start);
             }
             return Ok(self.push_expr(Expr::Macro { path, open }));
         }
@@ -361,7 +362,7 @@ impl Cursor<'_> {
         Ok(self.push_expr(Expr::Path(path)))
     }
 
-    fn expanded(&mut self, block: u32) -> Result<ExprId> {
+    fn expanded(&mut self, block: u32, start: u32) -> Result<ExprId> {
         let (at, end) = (self.at, self.end);
         let first_expr = self.body.expr_ends.len();
         (self.at, self.end) = (block, self.src.pair(block) + 1);
@@ -369,7 +370,7 @@ impl Cursor<'_> {
         (self.at, self.end) = (at, end);
         for slot in &mut self.body.expr_ends[first_expr..] {
             if self.src.place(slot.saturating_sub(1)) == 0 {
-                *slot = at;
+                *slot = start + 1;
             }
         }
         self.expansion = expr.as_ref().ok().copied();

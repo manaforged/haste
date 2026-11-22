@@ -113,7 +113,7 @@ fn direct_may_unwind(cx: &mut Context<'_>, reached: &Reached, index: usize, body
                 Shape::Closure(cb) => cb.parent,
                 _ => item,
             };
-            let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
+            let overflow_checks = cx.overflow_checks(source.krate);
             if has_indirect_call(cx, source, overflow_checks, typed, body_cache) {
                 return true;
             }

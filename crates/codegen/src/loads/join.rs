@@ -478,6 +478,14 @@ fn match_indexed_phi(func: &Function, state: &State<'_>, join: &JoinCtx<'_>, joi
     check_pair(a, b).or_else(|| check_pair(b, a))
 }
 
+fn collect_pred_plans(preds: &[Block], mut plan_pred: impl FnMut(Block) -> Option<LocPlan>) -> Option<Vec<(Block, LocPlan)>> {
+    let mut plans = Vec::with_capacity(preds.len());
+    for &p in preds {
+        plans.push((p, plan_pred(p)?));
+    }
+    Some(plans)
+}
+
 fn try_phi_addr_join(
     func: &mut Function,
     (block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
@@ -506,52 +514,31 @@ fn try_phi_addr_join(
         if func.blocks[cur.index()].params.is_empty() || join.added_phis[cur.index()] >= MAX_JOIN_PHIS_PER_BLOCK {
             continue;
         }
-        if let Some(param_idx) = func.blocks[cur.index()].params.iter().position(|&p| p == addr) {
-            let mut plans = Vec::with_capacity(preds.len());
-            let mut all_ok = true;
-            for &p in &preds {
-                let Some(arg_p) = edge_param_arg(func, state.subst, p, cur, param_idx) else {
-                    all_ok = false;
-                    break;
-                };
+        if let Some(param_idx) = func.blocks[cur.index()].params.iter().position(|&p| p == addr)
+            && let Some(plans) = collect_pred_plans(&preds, |p| {
+                let arg_p = edge_param_arg(func, state.subst, p, cur, param_idx)?;
                 let p_loc = i32::try_from(loc.offset)
                     .map(|off| addr_loc(state.prov, state.subst, arg_p, off, ty.bytes()))
                     .unwrap_or_else(|_| state.prov.loc(arg_p, loc.offset, ty.bytes()));
-                let Some(plan) = plan_loc(func, state, &join.known_out[p.index()], p_loc, ty).and_then(|pl| validate_plan(pl, p, state, join)) else {
-                    all_ok = false;
-                    break;
-                };
-                plans.push((p, plan));
-            }
-            if all_ok {
-                return finish_join_forward(func, (cur, inst, loc, ty, result), state, known, join, plans);
-            }
+                plan_loc(func, state, &join.known_out[p.index()], p_loc, ty).and_then(|pl| validate_plan(pl, p, state, join))
+            })
+        {
+            return finish_join_forward(func, (cur, inst, loc, ty, result), state, known, join, plans);
         }
-        if let Some((base, param_idx, stride)) = match_indexed_phi(func, state, join, cur, addr) {
-            let mut plans = Vec::with_capacity(preds.len());
-            let mut all_ok = true;
-            for &p in &preds {
-                let Some(arg_p) = edge_param_arg(func, state.subst, p, cur, param_idx) else {
-                    all_ok = false;
-                    break;
-                };
-                let matched = join.block_bases[p.index()].iter().find_map(|&(kb, _)| {
+        if let Some((base, param_idx, stride)) = match_indexed_phi(func, state, join, cur, addr)
+            && let Some(plans) = collect_pred_plans(&preds, |p| {
+                let arg_p = edge_param_arg(func, state.subst, p, cur, param_idx)?;
+                join.block_bases[p.index()].iter().find_map(|&(kb, _)| {
                     let MemBase::Addr(kaddr) = kb else { return None };
                     if !matches_indexed(func, state, kaddr, base, arg_p, stride) {
                         return None;
                     }
                     let kloc = MemLoc::new(loc.root, kb, loc.offset, ty.bytes());
                     plan_loc(func, state, &join.known_out[p.index()], kloc, ty).and_then(|pl| validate_plan(pl, p, state, join))
-                });
-                let Some(plan) = matched else {
-                    all_ok = false;
-                    break;
-                };
-                plans.push((p, plan));
-            }
-            if all_ok {
-                return finish_join_forward(func, (cur, inst, loc, ty, result), state, known, join, plans);
-            }
+                })
+            })
+        {
+            return finish_join_forward(func, (cur, inst, loc, ty, result), state, known, join, plans);
         }
     }
     None
@@ -568,19 +555,11 @@ pub(super) fn try_join_phi_forward(
     if let Some(preds) = join.preds.as_ref()
         && !matches!(loc.base, MemBase::Addr(b) if !join.def_blocks.get(b.index()).copied().flatten().is_some_and(|d| d != block && join.cfg.dominates(d, block)))
         && !join_clobbered(func, state.prov, loc, clobbers_seen)
+        && let Some(plans) = collect_pred_plans(preds, |p| {
+            plan_loc(func, state, &join.known_out[p.index()], loc, ty).and_then(|pl| validate_plan(pl, p, state, join))
+        })
     {
-        let mut plans: Vec<(Block, LocPlan)> = Vec::with_capacity(preds.len());
-        let mut all_ok = true;
-        for &p in preds {
-            let Some(plan) = plan_loc(func, state, &join.known_out[p.index()], loc, ty).and_then(|pl| validate_plan(pl, p, state, join)) else {
-                all_ok = false;
-                break;
-            };
-            plans.push((p, plan));
-        }
-        if all_ok {
-            return finish_join_forward(func, (block, inst, loc, ty, result), state, known, join, plans);
-        }
+        return finish_join_forward(func, (block, inst, loc, ty, result), state, known, join, plans);
     }
     try_phi_addr_join(func, (block, inst, loc, ty, result), state, known, join, clobbers_seen)
 }

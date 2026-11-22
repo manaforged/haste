@@ -113,6 +113,11 @@ impl<'a> Context<'a> {
         self.attr_at(item, "thread_local").is_some()
     }
 
+    /// Whether arithmetic overflow checks are enabled for crate `krate`.
+    pub fn overflow_checks(&self, krate: u32) -> bool {
+        self.outline.crates[krate as usize].env.overflow_checks()
+    }
+
     /// Whether the function `item` carries `#[track_caller]`.
     pub fn track_caller(&self, item: ItemRef) -> bool {
         self.attr_at(item, "track_caller").is_some()

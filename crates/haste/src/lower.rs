@@ -301,7 +301,7 @@ impl<'l, 'a> Lower<'l, 'a> {
         (relocs, reloc_plan): (&'l mut RelocVec, &'l mut Vec<reloc::RelocStep>),
     ) -> Self {
         let src = cx.body_src(source);
-        let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
+        let overflow_checks = cx.overflow_checks(source.krate);
         Self {
             cx,
             reached,

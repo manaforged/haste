@@ -311,7 +311,7 @@ fn hash_header(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, bins: &mut Ha
         _ => item,
     };
     bins.k.flag(static_item);
-    bins.k.flag(cx.outline.crates[source.krate as usize].env.overflow_checks());
+    bins.k.flag(cx.overflow_checks(source.krate));
     let sig = if static_item { lower::signature_of(cx, None, []) } else { lower::signature(cx, typed) };
     if let Ok(sig) = sig {
         hash_signature(&sig, &mut bins.k);
