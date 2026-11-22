@@ -610,7 +610,7 @@ impl Lower<'_, '_> {
     }
 
     fn drop_with_parts(&mut self, ty: Ty, target: Value, origin: super::reloc::TyOrigin, (item, substs): (crate::names::ItemRef, crate::sema::substs::Substs)) -> Result<()> {
-        let want_unwind = self.open && self.should_unwind();
+        let want_unwind = self.open && self.should_unwind() && self.body_may_unwind()?;
         let variants = if want_unwind { self.adt_variants(ty)? } else { None };
         let Some(variants) = variants else {
             self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;

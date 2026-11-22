@@ -146,8 +146,14 @@ pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec
     let mut body_cache = FxHashMap::default();
     let mut work = Vec::new();
     for u in 0..n {
-        if let Some(callees) = reached.calls.get(u) {
+        if let Some(callees) = reached.calls.get(u).filter(|c| !c.is_empty()) {
             for &v in callees {
+                if v < n {
+                    rev[v].push(u);
+                }
+            }
+        } else if let Some((_, Ok(typed))) = reached.list.get(u) {
+            for v in typed.collect_link_edges(&reached.index).0 {
                 if v < n {
                     rev[v].push(u);
                 }

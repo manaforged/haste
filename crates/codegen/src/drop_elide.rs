@@ -16,20 +16,27 @@ fn classify_callee(
     is_drop_pop: &mut impl FnMut(u32) -> bool,
     sym_may_unwind: &mut impl FnMut(u32) -> bool,
 ) -> CalleeKind {
-    match defs.get(callee.index()).copied().flatten().map(|i| &func.insts[i.index()].op) {
-        Some(&(Op::Symbol(sym) | Op::SlotAddr(sym))) => {
-            if is_drop_push(sym) {
-                CalleeKind::DropPush
-            } else if is_drop_pop(sym) {
-                CalleeKind::DropPop
-            } else if sym_may_unwind(sym) {
-                CalleeKind::MayUnwind
-            } else {
-                CalleeKind::NoUnwind
-            }
-        }
-        Some(Op::Runtime(_)) => CalleeKind::NoUnwind,
-        _ => CalleeKind::MayUnwind,
+    let op = defs.get(callee.index()).copied().flatten().map(|i| &func.insts[i.index()].op);
+    let sym = match op {
+        Some(&(Op::Symbol(sym) | Op::SlotAddr(sym))) => Some(sym),
+        Some(&Op::Load(addr, 0)) => match defs.get(addr.index()).copied().flatten().map(|i| &func.insts[i.index()].op) {
+            Some(&Op::SlotAddr(sym)) => Some(sym),
+            _ => None,
+        },
+        Some(Op::Runtime(_)) => return CalleeKind::NoUnwind,
+        _ => None,
+    };
+    let Some(sym) = sym else {
+        return CalleeKind::MayUnwind;
+    };
+    if is_drop_push(sym) {
+        CalleeKind::DropPush
+    } else if is_drop_pop(sym) {
+        CalleeKind::DropPop
+    } else if sym_may_unwind(sym) {
+        CalleeKind::MayUnwind
+    } else {
+        CalleeKind::NoUnwind
     }
 }
 
