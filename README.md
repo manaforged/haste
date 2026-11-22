@@ -8,7 +8,7 @@ Use **haste** for instant local edit-run-test cycles, live hot-reloading, and ze
 - **Live hot-reloading:** `haste run --watch` watches workspace source files and patches changed function bodies directly into the running process.
 - **Zero-linker 6-target AOT cross-compilation:** `haste --release build -o ./app --target TRIPLE` emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) with no Docker and no external cross-linker.
 - **Self-hosting:** Compiles its own 86-package, ~178k-function workspace (including `serde`, `serde_derive`, `toml`, `syn`, `tracing`, `anyhow`, `indexmap`, `memchr`) in **10.3–10.8 s** (`0` failed; `13.1 s` end-to-end vs `23.9 s` for cold `cargo build` on macOS ARM64).
-- **Not a toy backend:** Matches or beats `rustc -C opt-level=3` on **all 4 of 4** AOT compute kernels on ARM64 (`sha256` **0.80x**, `sieve` **0.94x**, `sort` **1.00x**, `scan` **1.00x**) and **3 of 4** on x86-64 (`sha256` **0.89x**, `sieve` **0.93x**, `scan` **0.95x**, `scripts/bench.sh`, bit-identical outputs), and passes **645/645** differential tests, **90/90** async tests, **15/15** proc-macro tests, **17/17** crate probes (`jit+aot`), and **259/259 (100.0%)** single-file edition-2021 `rust-lang/rust` `tests/ui/` `run-pass` tests (`jit+aot`).
+- **Not a toy backend:** Matches or beats `rustc -C opt-level=3` on **all 4 of 4** AOT compute kernels on ARM64 (`sha256` **0.80x**, `sieve` **0.94x**, `sort` **1.00x**, `scan` **1.00x**) and **3 of 4** on x86-64 (`sha256` **0.89x**, `sieve` **0.93x**, `scan` **0.95x**, `scripts/bench.sh`, bit-identical outputs), and passes **645/645** differential tests, **95/95** async tests, **15/15** proc-macro tests, **17/17** crate probes (`jit+aot`), and **259/259 (100.0%)** single-file edition-2021 `rust-lang/rust` `tests/ui/` `run-pass` tests (`jit+aot`).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline and module tour.
 
@@ -137,7 +137,7 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime tables 
 
 ```bash
 bash scripts/check.sh                   # 645/645 differential cases (jit+aot) vs rustc
-bash scripts/check.sh tests/async       # 90/90 async cases (jit+aot)
+bash scripts/check.sh tests/async       # 95/95 async cases (jit+aot)
 bash scripts/check.sh tests/proc-macro  # 15/15 proc-macro cases (jit+aot)
 bash scripts/probes.sh                  # 17/17 standalone crate probes (jit+aot) vs rustc
 bash scripts/bench.sh                   # Build speed & AOT runtime benchmarks vs rustc -O3
@@ -158,6 +158,29 @@ The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 - **Prepared mode:** `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`, which is tied to the installed `rustc` version.
 - **macOS Hardened Runtime:** On macOS, JIT execution uses dual-mapped `mach_vm_remap` pages (writable + executable aliases), which may be blocked inside a Hardened Runtime or App Sandbox.
 - **Feature coverage:** Some Rust features and crates.io edge cases do not compile yet. If any reached function fails to compile, `haste build` exits non-zero.
+
+## References and design influences
+
+haste is a clean-room implementation, built on established compiler algorithms from the literature alongside several architectural techniques designed specifically for fast Rust inner loops.
+
+### Established techniques and prior art
+
+- **Iterative dominance (`crates/codegen/src/cfg.rs`):** Cooper, Harvey, & Kennedy (2001), *"A Simple, Fast Dominance Algorithm"*.
+- **Block-parameter SSA and on-demand promotion (`crates/codegen/src/ir.rs`, `promote.rs`):** Block-parameter SSA form (Kelsey 1995; Appel 1998) with demand-driven SSA construction in the spirit of Braun, Buchwald, Hack, Leißa, Mallon, & Zwinkau (2013), *"Simple and Efficient Construction of Static Single Assignment Form"* (CC 2013).
+- **Linear scan register allocation and out-of-SSA copy resolution (`crates/codegen/src/park.rs`, `alloc.rs`, `frame.rs`):** Poletto & Sarkar (1999), *"Linear Scan Register Allocation"* (TOPLAS); Wimmer & Franz (2010), *"Linear Scan Register Allocation on SSA Form"* (CGO 2010); Boissinot, Darte, Rastello, Dupont de Dinechin, & Guillon (2009), *"Revisiting Out-of-SSA Translation for Correctness, Code Quality, and Efficiency"* (CGO 2009).
+- **Shrink-wrapping (`crates/codegen/src/frame.rs`):** Fred C. Chow (1988), *"Minimizing Register Usage Penalty at Procedure Calls"* (PLDI 1988).
+- **Division by invariant integers via multiplication (`crates/codegen/src/algebra.rs`):** Torbjörn Granlund & Peter L. Montgomery (1994), *"Division by Invariant Integers using Multiplication"* (PLDI 1994).
+- **Superword-level parallelism (`crates/codegen/src/slp.rs`):** Samuel Larsen & Saman Amarasinghe (2000), *"Exploiting Superword Level Parallelism with Multimedia Instruction Sets"* (PLDI 2000).
+- **Dictionary passing and stencil instantiation (`crates/haste/src/lower/stencil.rs`, `image/stencil_jit.rs`):** Hall, Hammond, Peyton Jones, & Wadler (1996), *"Type Classes in Haskell"* (TOPLAS); Xu & Kjolstad (2021), *"Copy-and-Patch Compilation"* (OOPSLA 2021); Swift's hybrid dictionary/specialization model.
+- **Identical Code Folding (`crates/haste/src/image/aot/icf.rs`):** Tallam, Coutant, Taylor, Li, & Demetriou (2010), *"Safe ICF: Pointer Safe and Unwinding Aware Identical Code Folding in the Gold Linker"* (GCC Developers Summit 2010).
+- **Non-Lexical Lifetimes (`crates/haste/src/sema/borrow.rs`):** Rust RFC 2094 (*Non-Lexical Lifetimes*).
+
+### Distinctive architectural techniques in haste
+
+- **Whole-workspace wave-based lazy monomorphization and frozen sysroot substrate (`sema/reach/`, `substrate/sysroot.rs`):** Parallel `cfg`-pruning outline scans, a binary-serialized settled sysroot cache (`HSTSYS01`) that eliminates stdlib re-parsing on cold CLI invocations, and wave-based reachability keyed by 16-byte `Instance = (ItemRef, Substs)` so unreached stdlib and dependency bodies are never parsed into ASTs or type-checked—with no `.rlib` artifacts and no `target/` directory.
+- **Structural 128-bit `FootprintId` generic stencils with live JIT tier-up (`lower/stencil.rs`, `image/stencil_jit.rs`):** Hashes each generic body's lowered layout, ABI, inlining, and unwind footprint into a 128-bit digest to share compiled stencils or dictionary bodies across monomorphizations with identical machine-level footprints (cross-checked via `HASTE_VERIFY_STENCIL=1`), while hot-tiering hot dictionary instances to concrete specialized machine code in JIT after `HASTE_JIT_TIER_UP` calls.
+- **Call-site register parking paired with loop-header live-range splitting (`park.rs`, `loopargs.rs`):** Balances keeping call-crossing values in caller-saved registers with targeted spill/reload parking around crossed calls against function-wide callee-saved pressure, paired with hoisting loop-invariant reads into explicit loop-header block parameters so inner loops allocate registers independently of outer call pressure.
+- **Domain-dirty fixed-point pass scheduler and zero-linker 6-target native emitters (`schedule.rs`, `aot/`):** A single lightweight Rust codegen crate switching between `QUICK_RULES` (JIT/edit loop) and `FULL_RULES` (`--release`) via 3-bit `Domain` (`CFG | MEM | VALUES`) dirty tracking, emitting standalone ELF, Mach-O (with native `__thread_vars` TLV descriptors and per-thread lock-free frame caches), and PE32+ binaries directly with no external linker or LLVM.
 
 ## Contributing
 
