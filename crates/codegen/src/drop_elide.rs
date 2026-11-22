@@ -311,14 +311,15 @@ impl Function {
                 let data = &self.insts[inst.index()];
                 if let Some(res) = data.result {
                     defs[res.index()] = Some(inst);
-                    if let Op::StackAddr(slot, 0) = data.op {
+                    if let Op::StackAddr(slot, _) = data.op {
                         addr_slot[res.index()] = Some(slot);
                     }
                 }
             }
         }
         let mut kinds = vec![CalleeKind::NoUnwind; self.insts.len()];
-        let mut flag_escaped = vec![false; self.slots.len()];
+        let mut slot_escaped = vec![false; self.slots.len()];
+        let mut slot_loaded = vec![false; self.slots.len()];
         let mut any_unwind_call = false;
         for block in &self.blocks {
             for &inst in &block.insts {
@@ -330,11 +331,14 @@ impl Function {
                         any_unwind_call |= kind == CalleeKind::MayUnwind;
                     }
                     Op::TryCall { .. } => any_unwind_call = true,
+                    Op::StackLoad(slot, _) if slot.index() < slot_loaded.len() => slot_loaded[slot.index()] = true,
                     _ => {}
                 }
                 op.for_operands(|v| {
-                    if let Some(s) = addr_slot[v.index()] {
-                        flag_escaped[s.index()] = true;
+                    if let Some(s) = addr_slot[v.index()]
+                        && s.index() < slot_escaped.len()
+                    {
+                        slot_escaped[s.index()] = true;
                     }
                 });
             }
@@ -347,10 +351,194 @@ impl Function {
         let drops = std::mem::take(&mut self.unwind_drops);
         self.unwind_drops = drops
             .into_iter()
-            .filter(|u| flag_escaped[u.flag.index()] || unwind_flag_live_at_call(self, &defs, &kinds, entry, u.flag))
+            .filter(|u| {
+                u.flag.index() >= slot_escaped.len()
+                    || slot_escaped[u.flag.index()]
+                    || unwind_flag_live_at_call(self, &defs, &kinds, entry, u.flag)
+            })
             .collect();
-        self.unwind_drops.len() != before
+        let narrowed = narrow_unwind_drops(self, entry, (&defs, &kinds, &slot_escaped, &slot_loaded));
+        self.unwind_drops.len() != before || narrowed
     }
+}
+
+fn narrow_unwind_drops(
+    func: &mut Function,
+    entry: Block,
+    (defs, kinds, slot_escaped, slot_loaded): (&[Option<Inst>], &[CalleeKind], &[bool], &[bool]),
+) -> bool {
+    let nslots = func.slots.len();
+    let mut flag_uses = vec![0u32; nslots];
+    let mut local_uses = vec![0u32; nslots];
+    for u in &func.unwind_drops {
+        if u.flag.index() < nslots { flag_uses[u.flag.index()] += 1; }
+        if u.local.index() < nslots { local_uses[u.local.index()] += 1; }
+    }
+    let mut flag_stores: Vec<Vec<(Block, Inst, Option<bool>)>> = vec![Vec::new(); nslots];
+    let mut local_stores: Vec<Vec<(Block, Inst, Option<Value>)>> = vec![Vec::new(); nslots];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let b = Block(bi as u32);
+        for &inst in &block.insts {
+            if let Op::StackStore(v, slot, off) = func.insts[inst.index()].op
+                && slot.index() < nslots
+            {
+                if flag_uses[slot.index()] == 1 {
+                    let bit = (off == 0).then(|| match def_op(func, defs, v) {
+                        Some(&Op::Const(c)) => Some(c != 0),
+                        _ => None,
+                    }).flatten();
+                    flag_stores[slot.index()].push((b, inst, bit));
+                }
+                if local_uses[slot.index()] == 1 {
+                    local_stores[slot.index()].push((b, inst, (off == 0).then_some(v)));
+                }
+            }
+        }
+    }
+    let cfg = func.cfg();
+    let depths = &cfg.loops().depths;
+    let mut remove = vec![false; func.insts.len()];
+    let mut before_call: Vec<(Inst, Option<(StackSlot, Value)>, StackSlot)> = Vec::new();
+    for u in &func.unwind_drops {
+        let fi = u.flag.index();
+        if fi >= nslots || flag_uses[fi] != 1 || slot_escaped[fi] || slot_loaded[fi] {
+            continue;
+        }
+        let stores = &flag_stores[fi];
+        if stores.is_empty() || stores.iter().any(|s| s.2.is_none()) {
+            continue;
+        }
+        let arm_blocks: Vec<Block> = stores.iter().filter(|s| s.2 == Some(true)).map(|s| s.0).collect();
+        if arm_blocks.is_empty() {
+            continue;
+        }
+        let Some(live_calls) = exact_live_calls(func, defs, kinds, entry, u.flag) else { continue };
+        if live_calls.is_empty() || live_calls.len() > 4 {
+            continue;
+        }
+        let max_call_depth = live_calls.iter().map(|&(b, _)| depths[b.index()]).max().unwrap_or(0);
+        let min_arm_depth = arm_blocks.iter().map(|&b| depths[b.index()]).min().unwrap_or(0);
+        if max_call_depth > min_arm_depth
+            || !arm_blocks.iter().any(|ab| !live_calls.iter().any(|&(cb, _)| cb == *ab))
+        {
+            continue;
+        }
+        for &(_, inst, _) in stores {
+            remove[inst.index()] = true;
+        }
+        let mut sink_local = None;
+        let li = u.local.index();
+        if u.indirect
+            && u.local_off == 0
+            && live_calls.len() == 1
+            && li < nslots
+            && local_uses[li] == 1
+            && !slot_escaped[li]
+            && !slot_loaded[li]
+            && local_stores[li].len() == 1
+        {
+            let (sb, sinst, pval) = local_stores[li][0];
+            let cb = live_calls[0].0;
+            if let Some(pv) = pval && sb != cb && cfg.dominates(sb, cb) {
+                remove[sinst.index()] = true;
+                sink_local = Some((u.local, pv));
+            }
+        }
+        for &(_, cinst) in &live_calls {
+            before_call.push((cinst, sink_local, u.flag));
+        }
+    }
+    if before_call.is_empty() {
+        return false;
+    }
+    let one = func.value(crate::Type::I8);
+    let one_inst = func.add(Op::Const(1), Some(one));
+    let zero = func.value(crate::Type::I8);
+    let zero_inst = func.add(Op::Const(0), Some(zero));
+    let mut per_call: Vec<Vec<(Option<(StackSlot, Value)>, StackSlot)>> = vec![Vec::new(); remove.len()];
+    for (cinst, loc, flag) in before_call {
+        per_call[cinst.index()].push((loc, flag));
+    }
+    for bi in 0..func.blocks.len() {
+        let old = std::mem::take(&mut func.blocks[bi].insts);
+        let mut new = Vec::with_capacity(old.len() + 4);
+        if bi == entry.index() {
+            new.push(one_inst);
+            new.push(zero_inst);
+        }
+        for inst in old {
+            if inst.index() < remove.len() && remove[inst.index()] {
+                continue;
+            }
+            let hooks = if inst.index() < per_call.len() { &per_call[inst.index()] } else { &[][..] };
+            for &(loc, flag) in hooks {
+                if let Some((slot, pv)) = loc {
+                    new.push(func.add(Op::StackStore(pv, slot, 0), None));
+                }
+                new.push(func.add(Op::StackStore(one, flag, 0), None));
+            }
+            new.push(inst);
+            for &(_, flag) in hooks {
+                new.push(func.add(Op::StackStore(zero, flag, 0), None));
+            }
+        }
+        func.blocks[bi].insts = new;
+    }
+    true
+}
+
+fn exact_live_calls(
+    func: &Function,
+    defs: &[Option<Inst>],
+    kinds: &[CalleeKind],
+    entry: Block,
+    flag: StackSlot,
+) -> Option<Vec<(Block, Inst)>> {
+    let mut visited = vec![0u8; func.blocks.len()];
+    let mut call_state = vec![0u8; func.insts.len()];
+    visited[entry.index()] = 1;
+    let mut work = vec![(entry, false)];
+    while let Some((block, mut active)) = work.pop() {
+        let mut stopped = false;
+        let bit = |a: bool| if a { 2u8 } else { 1u8 };
+        for &inst in &func.blocks[block.index()].insts {
+            match &func.insts[inst.index()].op {
+                Op::Call { .. } if kinds[inst.index()] == CalleeKind::MayUnwind => {
+                    call_state[inst.index()] |= bit(active);
+                }
+                Op::TryCall { .. } => {
+                    if active { return None; }
+                }
+                &Op::StackStore(v, s, 0) if s == flag => active = !store_clears_active(func, defs, v),
+                Op::Return(..) | Op::Trap => {
+                    stopped = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if stopped { continue; }
+        let b = bit(active);
+        if let Some(last) = func.last(block) {
+            for target in last.targets() {
+                if visited[target.index()] & b == 0 {
+                    visited[target.index()] |= b;
+                    work.push((target, active));
+                }
+            }
+        }
+    }
+    let mut live = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for &inst in &block.insts {
+            match call_state[inst.index()] {
+                3 => return None,
+                2 => live.push((Block(bi as u32), inst)),
+                _ => {}
+            }
+        }
+    }
+    Some(live)
 }
 
 fn unwind_flag_live_at_call(func: &Function, defs: &[Option<Inst>], kinds: &[CalleeKind], entry: Block, flag: StackSlot) -> bool {
