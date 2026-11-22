@@ -268,17 +268,33 @@ pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
     }
 }
 
+pub(crate) const PANIC_BOUNDS_CHECK: &str = "panic_bounds_check";
+
+pub(crate) fn unwind_enabled(cx: &Context<'_>, reached: &Reached) -> bool {
+    crate::profile() != crate::outline::tree::Profile::Release || reached.has_catch_unwind(cx)
+}
+
+fn enqueue_bounds_check(cx: &mut Context<'_>, reached: &mut Reached) -> Vec<usize> {
+    if !unwind_enabled(cx, reached) {
+        return Vec::new();
+    }
+    let Some(bounds) = cx.lang_item(PANIC_BOUNDS_CHECK) else {
+        return Vec::new();
+    };
+    enqueue(reached, vec![(bounds, Substs::EMPTY)])
+}
+
 /// Advances `reached` monotonically from `roots` and any previously blocked instances, parking instances that emit new asks unless `force_commit` is set.
 pub fn reach_wave(cx: &mut Context<'_>, reached: &mut Reached, roots: &[Instance], force_commit: bool) {
     let mut initial = reached.take_blocked();
     initial.extend(enqueue(reached, roots.to_vec()));
-    if crate::profile() != crate::outline::tree::Profile::Release
-        && let Some(bounds) = cx.lang_item("panic_bounds_check")
-    {
-        initial.extend(enqueue(reached, vec![(bounds, Substs::EMPTY)]));
-    }
+    initial.extend(enqueue_bounds_check(cx, reached));
     reached.pin_roots(roots);
-    let settled = drain_wave(cx, reached, initial, force_commit);
+    let mut settled = drain_wave(cx, reached, initial, force_commit);
+    let extra = enqueue_bounds_check(cx, reached);
+    if !extra.is_empty() {
+        settled.extend(drain_wave(cx, reached, extra, force_commit));
+    }
     reached.link(&settled);
 }
 
@@ -293,6 +309,10 @@ pub fn reach_again(cx: &mut Context<'_>, reached: &mut Reached, stale: &[usize])
     }
     let mut found = stale;
     found.extend(drain(cx, reached, queue));
+    let extra = enqueue_bounds_check(cx, reached);
+    if !extra.is_empty() {
+        found.extend(drain_wave(cx, reached, extra, true));
+    }
     reached.link(&found);
     found
 }
@@ -348,7 +368,11 @@ pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], r
         reached.set_entry(index, ReachedEntry::Replaced, Err("replaced by an edit".to_owned()));
     }
     reached.link(dead);
-    let found = drain(cx, reached, roots.to_vec());
+    let mut found = drain(cx, reached, roots.to_vec());
+    let extra = enqueue_bounds_check(cx, reached);
+    if !extra.is_empty() {
+        found.extend(drain_wave(cx, reached, extra, true));
+    }
     reached.pin_roots(roots);
     reached.link(&found);
     found

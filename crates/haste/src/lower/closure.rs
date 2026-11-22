@@ -1,14 +1,14 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Coroutine, Type, Value};
+use haste_codegen::{Coroutine, IntCC, Type, Value};
 
-use crate::body::{Expr, ExprId, List};
+use crate::body::{Body, Expr, ExprId, List, Stmt};
 use crate::names::ItemRef;
-use crate::sema::infer::{By, Capture, ClosureBody, Res, Shape, needs_drop};
+use crate::sema::infer::{By, Capture, ClosureBody, Res, Shape, Typed, needs_drop};
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::moves::Root;
-use super::place::{Base, Place};
+use super::place::{Base, Place, transparent_in};
 use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
@@ -99,28 +99,8 @@ impl Lower<'_, '_> {
         Some((cap_local, self.locals[cap_local as usize]))
     }
 
-    pub(super) fn expr_capture_path(&self, mut expr: ExprId) -> Option<(u32, Vec<(u32, u32)>)> {
-        while let Some(inner) = self.transparent(expr) {
-            expr = inner;
-        }
-        match *self.body.expr(expr) {
-            Expr::Path(_) => match self.typed.res.get(&expr) {
-                Some(&Res::Local(local)) => Some((local, Vec::new())),
-                _ => None,
-            },
-            Expr::TupleField(base, index) if !self.typed.autoderefs.contains_key(&expr) => {
-                let (local, mut path) = self.expr_capture_path(base)?;
-                path.push((0, index));
-                Some((local, path))
-            }
-            Expr::Field(base, _) if !self.typed.autoderefs.contains_key(&expr) => {
-                let index = *self.typed.fields.get(&expr)?;
-                let (local, mut path) = self.expr_capture_path(base)?;
-                path.push((0, index));
-                Some((local, path))
-            }
-            _ => None,
-        }
+    pub(super) fn expr_capture_path(&self, expr: ExprId) -> Option<(u32, Vec<(u32, u32)>)> {
+        expr_capture_path_in(self.body, self.typed, expr)
     }
 
     /// Points each local that the closure being lowered captures at its place in the environment.
@@ -129,12 +109,13 @@ impl Lower<'_, '_> {
             return Ok(());
         };
         let (whole, env) = self.env_place(local, closure.coroutine)?;
+        let mut to_own = Vec::new();
         for (index, capture) in closure.captures.iter().enumerate() {
             let part = self.part_place(whole, env, (0, index as u32))?;
             let cap_ty = capture.ty(self.cx, self.typed.locals[capture.local as usize].ty)?;
             let slot_local = if capture.path.is_empty() { capture.local } else { Self::projected_capture_local(&closure, local, index) };
             if closure.consumes && capture.by == By::Value {
-                self.own(Root::Local(slot_local), cap_ty, Some(part), true)?;
+                to_own.push((index, slot_local, cap_ty, part));
             }
             self.locals[slot_local as usize] = Some(match capture.by {
                 By::Value => part,
@@ -143,6 +124,35 @@ impl Lower<'_, '_> {
                     Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, cap_ty)? }
                 }
             });
+        }
+        if !to_own.is_empty() {
+            let order = capture_drop_order(self.body, self.typed, &closure);
+            for idx in order.into_iter().rev() {
+                if let Some(&(_, slot_local, cap_ty, part)) = to_own.iter().find(|entry| entry.0 == idx) {
+                    self.own(Root::Local(slot_local), cap_ty, Some(part), true)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn drop_closure_parts(&mut self, ty: Ty, target: Value, origin: super::reloc::TyOrigin) -> Result<()> {
+        let Some(info) = self.cx.closure(ty) else { bail!("drop of a closure whose defining body was not inferred") };
+        let env_origin = origin.step(super::reloc::CLOSURE_ENV_STEP, 0);
+        if info.closure.coroutine {
+            return self.drop_parts(info.env, target, env_origin);
+        }
+        let Kind::Tuple(items) = *self.cx.types.kind(info.env) else {
+            return self.drop_parts(info.env, target, env_origin);
+        };
+        let fields = self.cx.types.substs(items).to_vec();
+        let body = self.cx.body(info.parent)?;
+        let order = capture_drop_order(&body, &info.typed, &info.closure);
+        let place = self.glue_place(info.env, target)?;
+        for idx in order {
+            let field_ty = fields[idx];
+            let part = self.part_place(place, info.env, (0, idx as u32))?;
+            self.glue(field_ty, Some(part), env_origin.clone().step(0, idx as u32))?;
         }
         Ok(())
     }
@@ -190,8 +200,29 @@ impl Lower<'_, '_> {
         let callee_ty = self.ty_of(callee);
         let by_value = self.cx.closure_consumes(callee_ty);
         let values = self.callee_env(callee, by_value)?;
-        let values = self.args(args, values)?;
+        let guards = if !self.body.list(args).is_empty() {
+            self.guard_consumed_callee(callee, &values, by_value)?
+        } else {
+            Vec::new()
+        };
+        let values = self.eval_guarded_args(args, values, guards, true)?;
         self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)
+    }
+
+    pub(super) fn guard_consumed_callee(&mut self, callee: ExprId, values: &[Value], by_value: bool) -> Result<Vec<usize>> {
+        let mut guards = Vec::new();
+        let callee_ty = self.ty_of(callee);
+        if by_value
+            && self.cx.closure_takes_env(callee_ty)
+            && self.wants_field_unwind()?
+            && let Some(&env) = values.first()
+        {
+            let place = Place { base: Base::Addr(env), offset: 0, repr: repr(self.cx, callee_ty)? };
+            if let Some(guard) = self.push_owned_guard(callee_ty, Some(place), callee)? {
+                guards.push(guard);
+            }
+        }
+        Ok(guards)
     }
 
     pub(super) fn callee_env(&mut self, callee: ExprId, by_value: bool) -> Result<Vec<Value>> {
@@ -331,11 +362,23 @@ impl Lower<'_, '_> {
         self.cx.types.tuple(&items)
     }
 
+    fn mark_boxed_moved(&mut self, moved: Option<(Root, super::moves::MovePath)>, callee: ExprId) -> Result<bool> {
+        if !self.open {
+            return Ok(false);
+        }
+        match moved {
+            Some((root, path)) => self.moved_out(root, &path)?,
+            None => self.moved_out(Root::Temp(callee), &[])?,
+        }
+        Ok(true)
+    }
+
     fn boxed_once_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Substs), args: List) -> Result<Option<Value>> {
         let moved = self.scrutinee_path(callee);
+        let box_ty = self.ty_of(callee);
         let Some(&Res::Fn(free, free_substs)) = self.typed.box_frees.get(&expr) else { bail!("a `Box<dyn FnOnce>` call with no box to free") };
         let Some(boxed) = self.place_or_temp(callee)? else { return Ok(None) };
-        let Some((place, _)) = self.deref_step((expr, 0), Some(boxed), self.ty_of(callee))? else { return Ok(None) };
+        let Some((place, inner_ty)) = self.deref_step((expr, 0), Some(boxed), box_ty)? else { return Ok(None) };
         let Some(slot) = crate::sema::infer::virtual_slot(self.cx, item, substs)? else { bail!("`call_once` has no vtable slot") };
         let pair = self.address(place);
         let data = self.ins().load(Type::I64, pair, 0);
@@ -343,19 +386,37 @@ impl Lower<'_, '_> {
         let code = self.ins().load(Type::I64, vtable, slot as i32 * 8);
         let Some(&tuple) = self.cx.types.substs(substs).get(1) else { bail!("a trait object call with no argument tuple") };
         let packed = self.tuple_of(tuple, args)?;
-        if !self.open {
+        if !self.mark_boxed_moved(moved, callee)? {
             return Ok(None);
         }
-        match moved {
-            Some((root, path)) => self.moved_out(root, &path)?,
-            None => self.moved_out(super::moves::Root::Temp(callee), &[])?,
+        let need_drop = if matches!(*self.cx.types.kind(inner_ty), Kind::Dyn(of, ..) if self.cx.lang(of) == Some("fn_once"))
+            && crate::prep::vtable(self.cx, inner_ty).is_none()
+        {
+            let already = self.ins().load(Type::I64, vtable, 32);
+            self.ins().icmp_imm(IntCC::Equal, already, 0)
+        } else {
+            let flag = i64::from(crate::prep::vtable(self.cx, inner_ty).is_none());
+            self.ins().iconst(Type::I8, flag)
+        };
+        let mut guards = Vec::new();
+        if self.wants_field_unwind()?
+            && let Some(guard) = self.push_owned_guard(box_ty, Some(boxed), callee)?
+        {
+            let flag = self.owned[guard].flag;
+            let unwind = self.owned[guard].unwind;
+            self.set_dynamic_active(flag, unwind, need_drop);
+            guards.push(guard);
         }
         let ret = self.ty_of(expr);
         let unit = self.cx.types.unit();
         let pointer = self.cx.types.intern(Kind::Ptr(Mut::Mut, unit));
         let result = self.call_code(code, (vec![pointer, tuple], Some(ret)), std::iter::once(data).chain(packed).collect())?;
-        let target = self.address(boxed);
-        self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::BoxFree(expr)), free, free_substs, vec![target])?;
+        self.disarm_owned_guards(guards);
+        if self.open {
+            self.when(need_drop, |lower| lower.drop_object(pair))?;
+            let target = self.address(boxed);
+            self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::BoxFree(expr)), free, free_substs, vec![target])?;
+        }
         Ok(result)
     }
 
@@ -368,12 +429,8 @@ impl Lower<'_, '_> {
         let Some((place, closure)) = self.deref_step((expr, 0), Some(owner), boxed)? else { return Ok(None) };
         let env = if self.cx.closure_takes_env(closure) { vec![self.address(place)] } else { Vec::new() };
         let values = self.args(args, env)?;
-        if !self.open {
+        if !self.mark_boxed_moved(moved, callee)? {
             return Ok(None);
-        }
-        match moved {
-            Some((root, path)) => self.moved_out(root, &path)?,
-            None => self.moved_out(super::moves::Root::Temp(callee), &[])?,
         }
         let result = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)?;
         let target = self.address(owner);
@@ -399,7 +456,7 @@ impl Lower<'_, '_> {
         first.is_some_and(|ty| matches!(self.cx.types.kind(ty), Kind::Closure(..))) && self.cx.call_once() == Some(item)
     }
 
-    pub(super) fn untuple_arg(&mut self, tuple_expr: ExprId, values: &mut Vec<Value>) -> Result<()> {
+    pub(super) fn untuple_arg_guarded(&mut self, tuple_expr: ExprId, values: &mut Vec<Value>, guards: Vec<usize>) -> Result<()> {
         let mut cur = tuple_expr;
         while !self.typed.coercions.contains_key(&cur)
             && let Some(inner) = self.transparent(cur)
@@ -409,12 +466,11 @@ impl Lower<'_, '_> {
         if !self.typed.coercions.contains_key(&cur)
             && let Expr::Tuple(list) = *self.body.expr(cur)
         {
-            for item in self.body.list(list).to_vec() {
-                values.extend(self.eval_operand(ExprId(item))?);
-            }
+            *values = self.eval_guarded_args(list, std::mem::take(values), guards, false)?;
             return Ok(());
         }
         let val = self.eval_operand(tuple_expr)?;
+        self.disarm_owned_guards(guards);
         if !self.open {
             return Ok(());
         }
@@ -428,5 +484,165 @@ impl Lower<'_, '_> {
             }
         }
         Ok(())
+    }
+}
+
+fn expr_capture_path_in(body: &Body, typed: &Typed, mut expr: ExprId) -> Option<(u32, Vec<(u32, u32)>)> {
+    while let Some(inner) = transparent_in(body, expr) {
+        expr = inner;
+    }
+    match *body.expr(expr) {
+        Expr::Path(_) => match typed.res.get(&expr) {
+            Some(&Res::Local(local)) => Some((local, Vec::new())),
+            _ => None,
+        },
+        Expr::TupleField(base, index) if !typed.autoderefs.contains_key(&expr) => {
+            let (local, mut path) = expr_capture_path_in(body, typed, base)?;
+            path.push((0, index));
+            Some((local, path))
+        }
+        Expr::Field(base, _) if !typed.autoderefs.contains_key(&expr) => {
+            let index = *typed.fields.get(&expr)?;
+            let (local, mut path) = expr_capture_path_in(body, typed, base)?;
+            path.push((0, index));
+            Some((local, path))
+        }
+        _ => None,
+    }
+}
+
+fn capture_drop_order(body: &Body, typed: &Typed, closure: &crate::sema::infer::Closure) -> Vec<usize> {
+    let mut order = Vec::with_capacity(closure.captures.len());
+    let mut seen = vec![false; closure.captures.len()];
+    visit_capture_order(body, typed, closure, closure.body, &mut seen, &mut order);
+    for (idx, was_seen) in seen.into_iter().enumerate() {
+        if !was_seen {
+            order.push(idx);
+        }
+    }
+    order
+}
+
+fn visit_capture_order(
+    body: &Body,
+    typed: &Typed,
+    closure: &crate::sema::infer::Closure,
+    expr: ExprId,
+    seen: &mut [bool],
+    order: &mut Vec<usize>,
+) {
+    if let Some((local, path)) = expr_capture_path_in(body, typed, expr)
+        && let Some(idx) = closure.captures.iter().position(|cap| cap.local == local && path.starts_with(&cap.path))
+    {
+        if !seen[idx] {
+            seen[idx] = true;
+            order.push(idx);
+        }
+        return;
+    }
+    let visit_list = |list: List, seen: &mut [bool], order: &mut Vec<usize>| {
+        for &at in body.list(list) {
+            visit_capture_order(body, typed, closure, ExprId(at), seen, order);
+        }
+    };
+    match *body.expr(expr) {
+        Expr::Unary(_, e)
+        | Expr::Field(e, _)
+        | Expr::TupleField(e, _)
+        | Expr::Cast(e, _)
+        | Expr::Ref { expr: e, .. }
+        | Expr::Try(e)
+        | Expr::Await(e)
+        | Expr::Become(e)
+        | Expr::Paren(e) => visit_capture_order(body, typed, closure, e, seen, order),
+        Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) => {
+            visit_capture_order(body, typed, closure, a, seen, order);
+            visit_capture_order(body, typed, closure, b, seen, order);
+        }
+        Expr::Call(callee, list) => {
+            visit_capture_order(body, typed, closure, callee, seen, order);
+            visit_list(list, seen, order);
+        }
+        Expr::Method { receiver, params, .. } => {
+            visit_capture_order(body, typed, closure, receiver, seen, order);
+            visit_list(params, seen, order);
+        }
+        Expr::Block { stmts, tail, .. } => {
+            for &at in body.list(stmts) {
+                match body.stmts[at as usize] {
+                    Stmt::Let { init, otherwise, .. } => {
+                        if let Some(init) = init {
+                            visit_capture_order(body, typed, closure, init, seen, order);
+                        }
+                        if let Some(otherwise) = otherwise {
+                            visit_capture_order(body, typed, closure, otherwise, seen, order);
+                        }
+                    }
+                    Stmt::Expr(e, _) => visit_capture_order(body, typed, closure, e, seen, order),
+                    Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
+                }
+            }
+            if let Some(tail) = tail {
+                visit_capture_order(body, typed, closure, tail, seen, order);
+            }
+        }
+        Expr::If(cond, then, otherwise) => {
+            visit_capture_order(body, typed, closure, cond, seen, order);
+            visit_capture_order(body, typed, closure, then, seen, order);
+            if let Some(otherwise) = otherwise {
+                visit_capture_order(body, typed, closure, otherwise, seen, order);
+            }
+        }
+        Expr::Let(_, init) => visit_capture_order(body, typed, closure, init, seen, order),
+        Expr::While { cond, body: inner, .. } => {
+            visit_capture_order(body, typed, closure, cond, seen, order);
+            visit_capture_order(body, typed, closure, inner, seen, order);
+        }
+        Expr::Loop { body: inner, .. } | Expr::Closure { body: inner, .. } => {
+            visit_capture_order(body, typed, closure, inner, seen, order);
+        }
+        Expr::For { iter, body: inner, .. } => {
+            visit_capture_order(body, typed, closure, iter, seen, order);
+            visit_capture_order(body, typed, closure, inner, seen, order);
+        }
+        Expr::Match(scrut, arms) => {
+            visit_capture_order(body, typed, closure, scrut, seen, order);
+            for &at in body.list(arms) {
+                let arm = body.arms[at as usize];
+                if let Some(guard) = arm.guard {
+                    visit_capture_order(body, typed, closure, guard, seen, order);
+                }
+                visit_capture_order(body, typed, closure, arm.body, seen, order);
+            }
+        }
+        Expr::Tuple(list) | Expr::Array(list) => visit_list(list, seen, order),
+        Expr::Struct { fields, base, .. } => {
+            for &at in body.list(fields) {
+                visit_capture_order(body, typed, closure, body.fields[at as usize].value, seen, order);
+            }
+            if let Some(base) = base {
+                visit_capture_order(body, typed, closure, base, seen, order);
+            }
+        }
+        Expr::Range { from, to, .. } => {
+            if let Some(from) = from {
+                visit_capture_order(body, typed, closure, from, seen, order);
+            }
+            if let Some(to) = to {
+                visit_capture_order(body, typed, closure, to, seen, order);
+            }
+        }
+        Expr::Return(e) | Expr::Break(_, e) | Expr::Yield(e) => {
+            if let Some(e) = e {
+                visit_capture_order(body, typed, closure, e, seen, order);
+            }
+        }
+        Expr::Lit(..)
+        | Expr::Path(_)
+        | Expr::Continue(_)
+        | Expr::Macro { .. }
+        | Expr::Underscore
+        | Expr::FormatArgs(_)
+        | Expr::OffsetOf { .. } => {}
     }
 }

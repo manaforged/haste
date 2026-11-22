@@ -32,6 +32,10 @@ pub(super) fn build_vtable_id(cx: &mut Context<'_>, reached: &Reached, slots: &d
     for inner in &vtable.supers {
         entries.push(VtableEntry::Super(build_vtable_id(cx, reached, slots, inner)?));
     }
+    if matches!(*cx.types.kind(vtable.object), Kind::Dyn(of, ..) if cx.lang(of) == Some("fn_once")) {
+        let already_drops = cx.closure_consumes(vtable.ty) || matches!(cx.types.kind(vtable.ty), Kind::Adt(..));
+        entries.push(VtableEntry::Word(Word::Int(u64::from(already_drops))));
+    }
     Ok(slots.vtable_id(&entries))
 }
 

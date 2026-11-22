@@ -208,11 +208,7 @@ impl Lower<'_, '_> {
 
     /// The expression that `expr` only wraps: the inside of parentheses, or the tail of a macro expansion with no statements.
     pub(super) fn transparent(&self, expr: ExprId) -> Option<ExprId> {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner) => Some(inner),
-            Expr::Block { stmts, tail, label: None, kind: BlockKind::Expansion } if self.body.list(stmts).is_empty() => tail,
-            _ => None,
-        }
+        transparent_in(self.body, expr)
     }
 
     fn coerced_repr(&mut self, expr: ExprId, coerced: Option<&Coercion>) -> Result<Repr> {
@@ -444,24 +440,64 @@ impl Lower<'_, '_> {
         let unwind = self.wants_field_unwind()?;
         let mut guards = Vec::new();
         for (index, item) in self.body.list(list).to_vec().into_iter().enumerate() {
-            let item = ExprId(item);
-            let value = self.eval_operand(item)?;
             let field_ty = items[index];
             let field = repr(self.cx, field_ty)?;
             let offset = self.field_offset(ty, index as u32)?;
             let part = slot.map(|slot| Place::slot(slot, whole).at(offset, field));
-            if let (Some(place), Some(value)) = (part, value) {
-                self.write(place, value);
-            }
-            if unwind && let Some(guard) = self.push_field_unwind(field_ty, part, item)? {
-                guards.push(guard);
+            if !self.eval_and_write_part(part, field_ty, ExprId(item), unwind, &mut guards)? {
+                return Ok(None);
             }
         }
-        self.disarm_unwind(guards);
-        if !self.open {
-            return Ok(None);
-        }
+        self.disarm_owned_guards(guards);
         Ok(slot.and_then(|slot| self.read(Place::slot(slot, whole))))
+    }
+
+    pub(super) fn push_arg_guard(&mut self, expr: ExprId, value: Option<Value>, guards: &mut Vec<usize>) -> Result<()> {
+        let ty = self.ty_of(expr);
+        if !self.open || !crate::sema::infer::needs_drop(self.cx, ty)? {
+            return Ok(());
+        }
+        let whole = repr(self.cx, ty)?;
+        let place = match (whole, value) {
+            (Repr::Zst, _) | (_, None) => None,
+            (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr: whole }),
+            (Repr::Scalar(Type::I64), Some(val)) if self.typed.coercions.get(&expr).is_some_and(Coercion::widens) => {
+                Some(Place { base: Base::Addr(val), offset: 0, repr: whole })
+            }
+            (Repr::Scalar(_), Some(val)) => self.spill(Some(val), ty)?,
+        };
+        if let Some(guard) = self.push_owned_guard(ty, place, expr)? {
+            guards.push(guard);
+        }
+        Ok(())
+    }
+
+    pub(super) fn eval_guarded_args(
+        &mut self,
+        args: List,
+        mut values: Vec<Value>,
+        mut guards: Vec<usize>,
+        check_const: bool,
+    ) -> Result<Vec<Value>> {
+        let list = self.body.list(args).to_vec();
+        let unwind = self.wants_field_unwind()?;
+        for (index, &arg) in list.iter().enumerate() {
+            let expr = ExprId(arg);
+            if check_const && self.typed.const_args.contains(&expr) {
+                continue;
+            }
+            let last = index + 1 == list.len();
+            let value = self.operand(expr, last)?;
+            if !self.open {
+                return Ok(values);
+            }
+            if unwind && !last {
+                self.push_arg_guard(expr, value, &mut guards)?;
+            }
+            values.extend(value);
+        }
+        self.disarm_owned_guards(guards);
+        Ok(values)
     }
 
     /// Lowers the compiler-made `Clone::clone` of a tuple: each field of the referenced tuple cloned through its call in `calls`, into a new tuple.
@@ -554,5 +590,13 @@ impl Lower<'_, '_> {
                 self.read(place).map(|val| if matches!(place.repr, Repr::Mem { .. }) { self.snapshot_repr(place.repr, val) } else { val })
             })),
         }
+    }
+}
+
+pub(super) fn transparent_in(body: &crate::body::Body, expr: ExprId) -> Option<ExprId> {
+    match *body.expr(expr) {
+        Expr::Paren(inner) => Some(inner),
+        Expr::Block { stmts, tail, label: None, kind: BlockKind::Expansion } if body.list(stmts).is_empty() => tail,
+        _ => None,
     }
 }

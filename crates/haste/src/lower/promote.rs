@@ -23,20 +23,30 @@ use literal::Scope;
 
 impl Lower<'_, '_> {
     /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one; in a constant or static initializer, which the compiler evaluates once, also a call, operator or block of them.
-    pub fn promotable(&self, expr: ExprId) -> bool {
+    pub fn promotable(&mut self, expr: ExprId) -> Result<bool> {
         let item = self.reached.list[self.index].0.0;
         self.promotable_in(expr, matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static))
     }
 
-    fn promotable_in(&self, expr: ExprId, constant: bool) -> bool {
+    fn promotable_in(&mut self, expr: ExprId, constant: bool) -> Result<bool> {
         if let Some(inner) = self.transparent(expr) {
             return self.promotable_in(inner, constant);
         }
-        let all = |list: crate::body::List| self.body.list(list).iter().all(|&at| self.promotable_in(ExprId(at), constant));
-        match *self.body.expr(expr) {
+        if !constant && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
+            return Ok(false);
+        }
+        let all = |lower: &mut Self, list: crate::body::List| -> Result<bool> {
+            for &at in lower.body.list(list).to_vec().iter() {
+                if !lower.promotable_in(ExprId(at), constant)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        Ok(match *self.body.expr(expr) {
             Expr::Lit(..) => true,
             Expr::Closure { .. } => !self.cx.closure_takes_env(self.ty_of(expr)),
-            Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable_in(inner, constant),
+            Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable_in(inner, constant)?,
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Fn(item, _)) => {
                     matches!(self.cx.item(*item).1.kind, ItemKind::Const | ItemKind::Fn)
@@ -50,16 +60,25 @@ impl Lower<'_, '_> {
                     Some(Res::Fn(item, _)) => constant || self.cx.rustc_promotable(*item),
                     _ => false,
                 };
-                callable && all(list)
+                callable && all(self, list)?
             }
-            Expr::Method { receiver, params, .. } => constant && self.promotable_in(receiver, constant) && all(params),
-            Expr::Unary(_, inner) | Expr::Cast(inner, _) => constant && self.promotable_in(inner, constant),
-            Expr::Binary(_, left, right) => constant && self.promotable_in(left, constant) && self.promotable_in(right, constant),
-            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } => constant && self.body.list(stmts).is_empty() && self.promotable_in(tail, constant),
-            Expr::Array(list) | Expr::Tuple(list) => all(list),
-            Expr::Struct { fields, base: None, .. } => self.body.list(fields).iter().all(|&at| self.promotable_in(self.body.fields[at as usize].value, constant)),
+            Expr::Method { receiver, params, .. } => constant && self.promotable_in(receiver, constant)? && all(self, params)?,
+            Expr::Unary(_, inner) | Expr::Cast(inner, _) => constant && self.promotable_in(inner, constant)?,
+            Expr::Binary(_, left, right) => constant && self.promotable_in(left, constant)? && self.promotable_in(right, constant)?,
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } => {
+                constant && self.body.list(stmts).is_empty() && self.promotable_in(tail, constant)?
+            }
+            Expr::Array(list) | Expr::Tuple(list) => all(self, list)?,
+            Expr::Struct { fields, base: None, .. } => {
+                for &at in self.body.list(fields).to_vec().iter() {
+                    if !self.promotable_in(self.body.fields[at as usize].value, constant)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
             _ => false,
-        }
+        })
     }
 
     /// The address of a program-lifetime cell that holds `expr`, which the first use fills.

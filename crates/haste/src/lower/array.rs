@@ -62,20 +62,12 @@ impl Lower<'_, '_> {
         let unwind = self.wants_field_unwind()?;
         let mut guards = Vec::new();
         for (at, item) in self.body.list(items).to_vec().into_iter().enumerate() {
-            let item = ExprId(item);
-            let value = self.eval_operand(item)?;
-            if !self.open {
+            let elem_place = slot.map(|slot| Place::slot(slot, whole).at(at as i32 * stride, part));
+            if !self.eval_and_write_part(elem_place, element, ExprId(item), unwind, &mut guards)? {
                 return Ok(None);
             }
-            let elem_place = slot.map(|slot| Place::slot(slot, whole).at(at as i32 * stride, part));
-            if let (Some(place), Some(value)) = (elem_place, value) {
-                self.write(place, value);
-            }
-            if unwind && let Some(guard) = self.push_field_unwind(element, elem_place, item)? {
-                guards.push(guard);
-            }
         }
-        self.disarm_unwind(guards);
+        self.disarm_owned_guards(guards);
         Ok(slot.and_then(|slot| self.read(Place::slot(slot, whole))))
     }
 

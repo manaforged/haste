@@ -20,8 +20,8 @@ fn skips_fields(cx: &crate::sema::Context<'_>, item: crate::names::ItemRef) -> b
 #[derive(Clone, Debug)]
 struct Part {
     path: MovePath,
-    flag: StackSlot,
-    unwind: bool,
+    pub(super) flag: StackSlot,
+    pub(super) unwind: bool,
 }
 
 /// A value that the body owns and drops when its scope ends: where it lives, and the flags that say which of it is still there.
@@ -30,8 +30,8 @@ pub struct Owned {
     root: Root,
     ty: Ty,
     place: Option<Place>,
-    flag: StackSlot,
-    unwind: bool,
+    pub(super) flag: StackSlot,
+    pub(super) unwind: bool,
     parts: Vec<Part>,
     life: Life,
 }
@@ -58,7 +58,7 @@ enum Life {
 impl Lower<'_, '_> {
     /// Whether runtime checks and drops should emit real panic/unwind paths rather than hardware traps.
     pub(super) fn should_unwind(&self) -> bool {
-        self.overflow_checks || crate::profile() != crate::outline::tree::Profile::Release || self.reached.has_catch_unwind(self.cx)
+        self.overflow_checks || crate::sema::reach::unwind_enabled(self.cx, self.reached)
     }
 
     /// Whether constructing fields should register per-field unwind drop guards while evaluating later fields.
@@ -66,23 +66,53 @@ impl Lower<'_, '_> {
         Ok(self.open && self.resume.is_none() && self.should_unwind() && self.body_may_unwind()?)
     }
 
-    /// Pushes an unwind drop guard for a partially constructed field or element of `ty` at `place`.
-    pub(super) fn push_field_unwind(&mut self, ty: Ty, place: Option<Place>, expr: ExprId) -> Result<Option<StackSlot>> {
+    pub(super) fn push_owned_guard(&mut self, ty: Ty, place: Option<Place>, expr: ExprId) -> Result<Option<usize>> {
         if !self.open || !needs_drop(self.cx, ty)? {
             return Ok(None);
         }
-        self.push_unwind_origin(super::reloc::TyOrigin::Expr(expr), ty, place, true).map(Some)
+        let want_unwind = self.resume.is_none() && self.should_unwind() && self.body_may_unwind()?;
+        let flag = if want_unwind {
+            self.push_unwind_origin(super::reloc::TyOrigin::Expr(expr), ty, place, true)?
+        } else {
+            self.flag(true)
+        };
+        let idx = self.owned.len();
+        self.owned.push(Owned { root: Root::Held(expr), ty, place, flag, unwind: want_unwind, parts: Vec::new(), life: Life::Statement });
+        Ok(Some(idx))
     }
 
-    /// Disarms and pops temporary unwind drop guards once the owning aggregate is fully constructed.
-    pub(super) fn disarm_unwind(&mut self, guards: Vec<StackSlot>) {
+    pub(super) fn disarm_owned_guards(&mut self, guards: Vec<usize>) {
         if !self.open {
             return;
         }
-        for slot in guards.into_iter().rev() {
-            self.set_active(slot, true, false);
-            self.pop_unwind(slot);
+        for idx in guards.into_iter().rev() {
+            let owned = self.owned.remove(idx);
+            self.set_active(owned.flag, owned.unwind, false);
+            if owned.unwind {
+                self.pop_unwind(owned.flag);
+            }
         }
+    }
+
+    pub(super) fn eval_and_write_part(
+        &mut self,
+        part: Option<Place>,
+        elem_ty: Ty,
+        expr: ExprId,
+        unwind: bool,
+        guards: &mut Vec<usize>,
+    ) -> Result<bool> {
+        let value = self.eval_operand(expr)?;
+        if !self.open {
+            return Ok(false);
+        }
+        if let (Some(place), Some(value)) = (part, value) {
+            self.write(place, value);
+        }
+        if unwind && let Some(guard) = self.push_owned_guard(elem_ty, part, expr)? {
+            guards.push(guard);
+        }
+        Ok(true)
     }
 
     /// Takes ownership of the value of `ty` at `place` for `root`, when dropping it runs code, and marks it present when `init` holds.
@@ -253,6 +283,18 @@ impl Lower<'_, '_> {
         self.ins().stack_store(value, slot, 0);
     }
 
+    pub(super) fn set_dynamic_active(&mut self, slot: StackSlot, unwind: bool, active: Value) {
+        let next = if unwind {
+            let cur = self.ins().stack_load(Type::I8, slot, 0);
+            let mask = self.ins().iconst(Type::I8, 0xFE);
+            let cleared = self.ins().band(cur, mask);
+            self.ins().bor(cleared, active)
+        } else {
+            active
+        };
+        self.ins().stack_store(next, slot, 0);
+    }
+
     fn set_active(&mut self, slot: StackSlot, unwind: bool, value: bool) {
         if !unwind {
             return self.set(slot, value);
@@ -376,15 +418,11 @@ impl Lower<'_, '_> {
         let (flag, unwind) = (self.owned[at].flag, self.owned[at].unwind);
         self.guarded_slot(flag, unwind, |lower| {
             if path.is_empty() {
-                for (slot, slot_unwind) in lower.collect_targets(at, &[]) {
-                    lower.set_active(slot, slot_unwind, false);
-                }
+                lower.set_active(flag, unwind, false);
             }
             lower.drop_path(at, path, ty, Some(place))?;
-            if !path.is_empty() {
-                for (slot, slot_unwind) in lower.collect_targets(at, path) {
-                    lower.set_active(slot, slot_unwind, false);
-                }
+            for (slot, slot_unwind) in lower.collect_targets(at, path) {
+                lower.set_active(slot, slot_unwind, false);
             }
             Ok(())
         })?;
@@ -473,7 +511,7 @@ impl Lower<'_, '_> {
         self.when(present, run)
     }
 
-    fn when(&mut self, cond: Value, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+    pub(super) fn when(&mut self, cond: Value, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         let (yes, after) = (self.b.create_block(), self.b.create_block());
         self.brif(cond, (yes, &[]), (after, &[]));
         self.enter(yes);
@@ -598,7 +636,7 @@ impl Lower<'_, '_> {
         self.drop_parts(ty, target, origin)
     }
 
-    fn glue_place(&mut self, ty: Ty, target: Value) -> Result<Place> {
+    pub(super) fn glue_place(&mut self, ty: Ty, target: Value) -> Result<Place> {
         let repr = if self.cx.is_unsized(ty)? { super::ops::WIDE } else { repr(self.cx, ty)? };
         Ok(Place { base: Base::Addr(target), offset: 0, repr })
     }
@@ -685,7 +723,7 @@ impl Lower<'_, '_> {
         self.invoke(super::reloc::SiteOrigin::DropGlue(origin), glue, substs, vec![wide]).map(drop)
     }
 
-    fn drop_parts(&mut self, ty: Ty, target: Value, origin: super::reloc::TyOrigin) -> Result<()> {
+    pub(super) fn drop_parts(&mut self, ty: Ty, target: Value, origin: super::reloc::TyOrigin) -> Result<()> {
         match self.cx.types.kind(ty).clone() {
             Kind::Array(inner, count) => {
                 let count = self.len(count)?;
@@ -700,16 +738,13 @@ impl Lower<'_, '_> {
                 let place = self.glue_place(ty, target)?;
                 self.drop_fields(ty, place, origin)
             }
-            Kind::Closure(..) => match self.cx.closure_env(ty) {
-                Some(env) => self.drop_parts(env, target, origin.step(super::reloc::CLOSURE_ENV_STEP, 0)),
-                None => bail!("drop of a closure whose defining body was not inferred"),
-            },
+            Kind::Closure(..) => self.drop_closure_parts(ty, target, origin),
             Kind::Dyn(..) => self.drop_object(target),
             _ => Ok(()),
         }
     }
 
-    fn drop_object(&mut self, wide: Value) -> Result<()> {
+    pub(super) fn drop_object(&mut self, wide: Value) -> Result<()> {
         let data = self.ins().load(Type::I64, wide, 0);
         let vtable = self.ins().load(Type::I64, wide, 8);
         let code = self.ins().load(Type::I64, vtable, 0);

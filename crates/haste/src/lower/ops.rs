@@ -206,7 +206,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn panic_bounds(&mut self, at: Value, len: Value) -> Result<()> {
-        if !self.panic_lang_call("panic_bounds_check", |_| vec![at, len])? {
+        if !self.panic_lang_call(crate::sema::reach::PANIC_BOUNDS_CHECK, |_| vec![at, len])? {
             self.panic_str("index out of bounds")?;
         }
         Ok(())
@@ -518,13 +518,37 @@ impl Lower<'_, '_> {
             let value = self.expr(rhs)?;
             return self.assign_parts(lhs, value).map(|_| None);
         }
-        let Some(value) = self.expr(rhs)? else {
+        let value = self.eval_operand(rhs)?;
+        if !self.open {
+            return Ok(None);
+        }
+        let mut guards = Vec::new();
+        if self.wants_field_unwind()? {
+            self.push_arg_guard(rhs, value, &mut guards)?;
+        }
+        let Some(place) = self.place_of(lhs)? else {
+            if value.is_some() {
+                bail!("cannot lower assignment to this expression yet");
+            }
+            self.disarm_owned_guards(guards);
             return Ok(None);
         };
-        let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
-        if !self.replace(lhs, place, value)? {
-            self.write(place, value);
+        if !self.open {
+            return Ok(None);
         }
+        match value {
+            Some(value) => {
+                if !self.replace(lhs, place, value)? {
+                    self.write(place, value);
+                }
+            }
+            None if crate::sema::infer::needs_drop(self.cx, self.ty_of(lhs))? => {
+                let dummy = self.ins().iconst(Type::I8, 0);
+                let _ = self.replace(lhs, place, dummy)?;
+            }
+            None => {}
+        }
+        self.disarm_owned_guards(guards);
         Ok(None)
     }
 

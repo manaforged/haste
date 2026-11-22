@@ -77,9 +77,16 @@ pub(super) fn tag_bits(cx: &mut Context<'_>, item: ItemRef, layout: &Layout, var
 }
 
 impl Lower<'_, '_> {
+    fn adt_item(&self, ty: Ty, action: &str) -> Result<(ItemRef, Substs)> {
+        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else {
+            bail!("{action} {:?}, a type that is not an ADT", self.cx.types.kind(ty));
+        };
+        Ok((item, args))
+    }
+
     /// Writes variant `variant` of `ty`, an ADT `item` at `args`, with `fields` given by index, over a copy of `base`; returns the value.
     pub fn construct(&mut self, ty: Ty, variant: u32, fields: Vec<(u32, Option<Value>)>, base: Option<Value>) -> Result<Option<Value>> {
-        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
+        let (item, args) = self.adt_item(ty, "constructing")?;
         let whole = repr(self.cx, ty)?;
         let Some(slot) = self.slot(whole) else {
             return Ok(None);
@@ -226,7 +233,7 @@ impl Lower<'_, '_> {
 
     /// The place of field `index` of variant `variant` inside the ADT `ty` at `place`.
     pub fn variant_field(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
-        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("field of a type that is not an ADT") };
+        let (item, args) = self.adt_item(ty, "field of")?;
         let layout = self.cx.layout(ty)?;
         let slice = self.cx.types.substs(args).to_vec();
         let fields = field_types(self.cx, item, &slice)?;
@@ -289,7 +296,7 @@ impl Lower<'_, '_> {
             }
             if unwind && crate::sema::infer::needs_drop(self.cx, field_ty)? {
                 let spilled = self.spill(value, field_ty)?;
-                if let Some(guard) = self.push_field_unwind(field_ty, spilled, val_expr)? {
+                if let Some(guard) = self.push_owned_guard(field_ty, spilled, val_expr)? {
                     guards.push(guard);
                 }
                 values.push((index, spilled.and_then(|place| self.read(place))));
@@ -311,12 +318,12 @@ impl Lower<'_, '_> {
                 }
             }
         }
-        self.disarm_unwind(guards);
+        self.disarm_owned_guards(guards);
         Ok(result)
     }
 
     pub(super) fn variant_field_types(&mut self, ty: Ty, variant: u32) -> Result<Vec<Ty>> {
-        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
+        let (item, args) = self.adt_item(ty, "constructing")?;
         let slice = self.cx.types.substs(args).to_vec();
         Ok(field_types(self.cx, item, &slice)?[variant as usize].clone())
     }
@@ -330,34 +337,24 @@ impl Lower<'_, '_> {
             }
             return self.construct(ty, variant, values, None);
         }
-        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
+        let (item, _) = self.adt_item(ty, "constructing")?;
         let whole = repr(self.cx, ty)?;
         let slot = self.slot(whole);
         let layout = self.cx.layout(ty)?;
         let mut guards = Vec::new();
         for &(index, val_expr, field_ty) in fields {
-            let value = self.eval_operand(val_expr)?;
-            if !self.open {
+            let part = slot.map(|slot| repr(self.cx, field_ty).map(|field| Place::slot(slot, whole).at(field_offset(&layout, variant, index), field))).transpose()?;
+            if !self.eval_and_write_part(part, field_ty, val_expr, true, &mut guards)? {
                 return Ok(None);
             }
-            let part = slot.map(|slot| repr(self.cx, field_ty).map(|field| Place::slot(slot, whole).at(field_offset(&layout, variant, index), field))).transpose()?;
-            if let (Some(place), Some(value)) = (part, value) {
-                self.write(place, value);
-            }
-            if let Some(guard) = self.push_field_unwind(field_ty, part, val_expr)? {
-                guards.push(guard);
-            }
-        }
-        if !self.open {
-            return Ok(None);
         }
         let Some(slot) = slot else {
-            self.disarm_unwind(guards);
+            self.disarm_owned_guards(guards);
             return Ok(None);
         };
         let place = Place::slot(slot, whole);
         self.set_tag(place, item, &layout, variant)?;
-        self.disarm_unwind(guards);
+        self.disarm_owned_guards(guards);
         Ok(self.read(place))
     }
 

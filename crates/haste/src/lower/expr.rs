@@ -155,7 +155,7 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Tuple(list) => self.tuple(expr, list),
             Expr::Closure { .. } => self.closure(expr),
-            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => match self.materialize_const_expr(inner, (false, true))? {
+            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner)? => match self.materialize_const_expr(inner, (false, true))? {
                 Some(addr) => Ok(Some(addr)),
                 None => self.promoted(inner),
             },
@@ -310,8 +310,11 @@ impl Lower<'_, '_> {
         }
         let arg_list = self.body.list(args).to_vec();
         let [f_expr, tuple_expr] = arg_list.as_slice() else { bail!("tupled closure call expects 2 arguments") };
-        let mut values = self.callee_env(ExprId(*f_expr), true)?;
-        self.untuple_arg(ExprId(*tuple_expr), &mut values)?;
+        let f_expr = ExprId(*f_expr);
+        let values = self.callee_env(f_expr, true)?;
+        let guards = self.guard_consumed_callee(f_expr, &values, true)?;
+        let mut values = values;
+        self.untuple_arg_guarded(ExprId(*tuple_expr), &mut values, guards)?;
         self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values).map(Some)
     }
 
@@ -396,27 +399,27 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(None);
         }
+        let mut guards = Vec::new();
+        if adjust == (crate::sema::infer::Adjust { derefs: 0, autoref: None })
+            && !self.body.list(params).is_empty()
+            && self.wants_field_unwind()?
+        {
+            self.push_arg_guard(receiver, first, &mut guards)?;
+        }
         if self.tupled_closure_call(item, substs) {
             let param_list = self.body.list(params).to_vec();
             let [tuple_expr] = param_list.as_slice() else { bail!("tupled closure method expects 1 argument") };
             let closure_ty = self.cx.types.substs(substs)[0];
             let mut values = if self.cx.closure_takes_env(closure_ty) { first.into_iter().collect() } else { Vec::new() };
-            self.untuple_arg(ExprId(*tuple_expr), &mut values)?;
+            self.untuple_arg_guarded(ExprId(*tuple_expr), &mut values, guards)?;
             return self.invoke(SiteOrigin::Table(SiteKey::ExprRes(expr)), item, substs, values);
         }
-        let values = self.args(params, first.into_iter().collect())?;
+        let values = self.eval_guarded_args(params, first.into_iter().collect(), guards, true)?;
         self.invoke(SiteOrigin::Table(SiteKey::ExprRes(expr)), item, substs, values)
     }
 
-    pub(super) fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
-        let list = self.body.list(args).to_vec();
-        for (index, &arg) in list.iter().enumerate() {
-            let expr = ExprId(arg);
-            if !self.typed.const_args.contains(&expr) {
-                values.extend(self.operand(expr, index + 1 == list.len())?);
-            }
-        }
-        Ok(values)
+    pub(super) fn args(&mut self, args: List, values: Vec<Value>) -> Result<Vec<Value>> {
+        self.eval_guarded_args(args, values, Vec::new(), true)
     }
 
     pub(super) fn invoke(&mut self, origin: SiteOrigin, item: ItemRef, substs: Substs, values: Vec<Value>) -> Result<Option<Value>> {
@@ -622,6 +625,9 @@ impl Lower<'_, '_> {
         let Some(test) = self.expr(cond)? else {
             return Ok(None);
         };
+        if !self.cond_has_let(cond) {
+            self.end_statement(mark)?;
+        }
         let cond_end = self.owned.len();
         let (then_block, else_block) = (self.b.create_block(), self.b.create_block());
         let (join, joined, slot) = match otherwise {
@@ -667,6 +673,9 @@ impl Lower<'_, '_> {
         self.enter(head);
         let depth = self.owned.len();
         let test = self.expr(cond)?;
+        if self.open && !self.cond_has_let(cond) {
+            self.end_statement(depth)?;
+        }
         if let Some(test) = test {
             let fail = self.b.create_block();
             self.brif(test, (inner, &[]), (fail, &[]));
@@ -676,6 +685,15 @@ impl Lower<'_, '_> {
         }
         self.enter(inner);
         self.loop_body((head, exit, depth), label, body)
+    }
+
+    fn cond_has_let(&self, expr: ExprId) -> bool {
+        match *self.body.expr(expr) {
+            Expr::Let(..) => true,
+            Expr::Paren(inner) => self.cond_has_let(inner),
+            Expr::Binary(crate::body::BinOp::And | crate::body::BinOp::Or, lhs, rhs) => self.cond_has_let(lhs) || self.cond_has_let(rhs),
+            _ => false,
+        }
     }
 
     fn labeled_block(&mut self, expr: ExprId, (stmts, tail): (List, Option<ExprId>), label: u32) -> Result<Option<Value>> {
