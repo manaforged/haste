@@ -16,7 +16,7 @@ use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, IntCC, Lane, Op, ReduceOp, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, IntCC, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, StencilReloc};
 use crate::target::{Os, Target};
@@ -34,26 +34,13 @@ const V1: Vreg = Vreg(1);
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 const OP_SCRATCH: [Reg; 3] = [D, S, T];
 
-fn arm64_uses_scratch(func: &Function, op: &Op) -> bool {
-    let mut wide = false;
-    op.for_operands(|v| wide |= func.ty(v) == Type::I128);
-    wide || match op {
-        Op::Copy(..) | Op::Move(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => true,
-        Op::Fits(Binary::Imul, _, x, _) => func.ty(*x) == Type::I64,
-        Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, _) => func.ty(*x).bits() < 32,
-        Op::Binary(Binary::AvgRound | Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat, ..) | Op::Convert(Convert::NarrowSat { .. }, _) | Op::Reduce(ReduceOp::Movemask, _) => true,
-        Op::Binary(Binary::Imul, x, _) => matches!(func.ty(*x), Type::Vec { lane: Lane::I64, count: 2 | 4 }),
-        _ => false,
-    }
-}
-
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
     saved_float: &SAVED_FLOAT,
     leaf: &[Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(8), D, S, T, Reg(14), Reg(15), LR],
     wide_scratch: &WIDE_SCRATCH,
     op_scratch: &OP_SCRATCH,
-    uses_scratch: arm64_uses_scratch,
+    scratch_mask: atomic::scratch_mask,
     dict: None,
     float: &float::POOL,
     float_branches: &float::BRANCHES,

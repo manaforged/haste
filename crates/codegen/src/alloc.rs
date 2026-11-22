@@ -17,7 +17,7 @@ pub(crate) struct Regs<R: 'static> {
     pub leaf: &'static [R],
     pub wide_scratch: &'static [R],
     pub op_scratch: &'static [R],
-    pub uses_scratch: fn(&Function, &Op) -> bool,
+    pub scratch_mask: fn(&Function, &Op) -> u8,
     pub dict: Option<R>,
     pub float: &'static [u8],
     pub float_branches: &'static [FloatCC],
@@ -49,7 +49,11 @@ impl<R: PartialEq + 'static> Regs<R> {
     /// Reports whether emitting `data` may overwrite `reg` as a wide or op scratch register.
     pub(crate) fn scratches(&self, func: &Function, data: &InstData, reg: R) -> bool {
         let wide = touches_i128(func, data);
-        (wide && self.wide_scratch.contains(&reg)) || ((wide || (self.uses_scratch)(func, &data.op)) && self.op_scratch.contains(&reg))
+        if wide && self.wide_scratch.contains(&reg) {
+            return true;
+        }
+        let mask = if wide { u8::MAX } else { (self.scratch_mask)(func, &data.op) };
+        self.op_scratch.iter().enumerate().any(|(i, r)| (mask >> i) & 1 != 0 && *r == reg)
     }
 }
 
@@ -390,7 +394,7 @@ fn int_class<'a, R: Copy + PartialEq>(
 ) -> Class<'a, R> {
     let dict = func.signature.params.iter().any(|param| param.purpose == ArgumentPurpose::Dict);
     let leaf = regs.leaf.iter().filter(|reg| !(dict && regs.dict == Some(**reg))).copied().collect();
-    let clobbers = crate::park::scratch_clobbers(func, (regs.wide_scratch, regs.op_scratch, regs.uses_scratch), (order, copied, elided));
+    let clobbers = crate::park::scratch_clobbers(func, (regs.wide_scratch, regs.op_scratch, regs.scratch_mask), (order, copied, elided));
     let arrivals = params.iter().map(|loc| match *loc { Loc::Int(reg) => vec![reg], Loc::Pair(low, high) => vec![low, high], _ => Vec::new() }).collect();
     Class { saved: regs.saved, leaf, arrivals, passed, clobbers }
 }

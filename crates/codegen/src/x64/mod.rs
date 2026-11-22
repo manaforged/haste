@@ -35,7 +35,7 @@ const REGS: Regs<Reg> = Regs {
     leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx, Reg::R11],
     wide_scratch: &wide::WIDE_SCRATCH,
     op_scratch: &[Reg::Rsi, Reg::Rdx, Reg::R11],
-    uses_scratch: atomic::uses_scratch,
+    scratch_mask: atomic::scratch_mask,
     dict: Some(Reg::R10),
     float: &float::POOL,
     float_branches: &float::BRANCHES,

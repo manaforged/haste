@@ -31,20 +31,27 @@ fn writes_last(func: &Function, data: &crate::ir::InstData) -> bool {
 
 pub(crate) fn scratch_clobbers<R>(
     func: &Function,
-    (wide_scratch, op_scratch, uses_scratch): (&'static [R], &'static [R], fn(&Function, &Op) -> bool),
+    (wide_scratch, op_scratch, scratch_mask): (&'static [R], &'static [R], fn(&Function, &Op) -> u8),
     (order, copied, elided): (&[Block], &[bool], &[bool]),
 ) -> Vec<(&'static [R], Vec<Range>)> {
     if wide_scratch.is_empty() && op_scratch.is_empty() {
         return Vec::new();
     }
-    let (mut wide, mut op) = (Vec::new(), Vec::new());
+    let mut wide = Vec::new();
+    let mut ops: Vec<Vec<Range>> = vec![Vec::new(); op_scratch.len()];
     let mut record = |data: &crate::ir::InstData, at_use: u32, at_def: u32| {
         let touches_i128 = crate::alloc::touches_i128(func, data);
         if !wide_scratch.is_empty() && touches_i128 {
             push_span(&mut wide, at_use, at_def);
         }
-        if !op_scratch.is_empty() && (touches_i128 || uses_scratch(func, &data.op)) {
-            push_span(&mut op, at_use, if writes_last(func, data) { at_use } else { at_def });
+        let mask = if touches_i128 { u8::MAX } else { scratch_mask(func, &data.op) };
+        if mask != 0 {
+            let end = if writes_last(func, data) { at_use } else { at_def };
+            for (i, ranges) in ops.iter_mut().enumerate() {
+                if (mask >> i) & 1 != 0 {
+                    push_span(ranges, at_use, end);
+                }
+            }
         }
     };
     let mut at = 0_u32;
@@ -79,8 +86,10 @@ pub(crate) fn scratch_clobbers<R>(
     if !wide.is_empty() {
         out.push((wide_scratch, wide));
     }
-    if !op.is_empty() {
-        out.push((op_scratch, op));
+    for (i, ranges) in ops.into_iter().enumerate() {
+        if !ranges.is_empty() {
+            out.push((&op_scratch[i..i + 1], ranges));
+        }
     }
     out
 }

@@ -1,9 +1,30 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, S, T};
-use crate::ir::{AtomicRmwOp, Binary, Convert, IntCC, Op, Type, Unary, Value};
+use crate::ir::{AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
+
+/// Bitmask of `[D, S, T]` scratch registers overwritten by `op` of `func`.
+pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
+    const ALL: u8 = 7;
+    const S_BIT: u8 = 2;
+    let mut wide = false;
+    op.for_operands(|v| wide |= func.ty(v) == Type::I128);
+    if wide {
+        return ALL;
+    }
+    match op {
+        Op::AtomicLoad(..) | Op::AtomicStore(..) => 0,
+        Op::Move(..) => S_BIT,
+        Op::Copy(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => ALL,
+        Op::Fits(Binary::Imul, _, x, _) if func.ty(*x) == Type::I64 => ALL,
+        Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, _) if func.ty(*x).bits() < 32 => ALL,
+        Op::Binary(Binary::AvgRound | Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat, ..) | Op::Convert(Convert::NarrowSat { .. }, _) | Op::Reduce(ReduceOp::Movemask, _) => ALL,
+        Op::Binary(Binary::Imul, x, _) if matches!(func.ty(*x), Type::Vec { lane: Lane::I64, count: 2 | 4 }) => ALL,
+        _ => 0,
+    }
+}
 
 #[derive(Clone, Copy)]
 enum SelectOp {
@@ -455,7 +476,7 @@ impl Emit<'_> {
         let size = Size::of(ty.bytes());
         match op {
             Op::AtomicLoad(addr, ord) => {
-                let at = self.bits(*addr, S);
+                let at = self.bits(*addr, C);
                 let dst = self.dst(result()?);
                 if ord.has_acquire() {
                     self.asm.load_acquire(size, dst, at);
@@ -465,7 +486,7 @@ impl Emit<'_> {
                 self.put(result()?, dst);
             }
             Op::AtomicStore(value, addr, ord) => {
-                let at = self.bits(*addr, S);
+                let at = self.bits(*addr, C);
                 let source = self.bits(*value, A);
                 if ord.has_release() {
                     self.asm.store_release(size, at, source);

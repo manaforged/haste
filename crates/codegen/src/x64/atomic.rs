@@ -18,31 +18,25 @@ const VECTOR: u32 = 16;
 /// The opcodes of `movups` from memory into an xmm register, and from an xmm register into memory.
 const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
 
-/// Whether `op` of `func` uses rsi, rdx or r11 as scratch.
-pub(super) fn uses_scratch(func: &Function, op: &Op) -> bool {
+/// Bitmask of `[Rsi, Rdx, R11]` scratch registers overwritten by `op` of `func`.
+pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
+    const RSI: u8 = 1;
+    const RDX: u8 = 2;
+    const R11: u8 = 4;
+    const ALL: u8 = RSI | RDX | R11;
     match op {
-        Op::Copy(..) | Op::Move(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Fits(Binary::Imul, ..) => true,
-        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut | TargetOpId::X64DivWide | TargetOpId::X64RemWide, _) => true,
-        Op::Unary(Unary::Popcnt | Unary::Bitrev, _) => true,
-        Op::Unary(Unary::Floor | Unary::Ceil | Unary::Trunc, x) if func.ty(*x).is_float() => true,
-        Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) if func.ty(*x) == Type::I128 => true,
-        Op::Binary(
-            Binary::Sdiv
-            | Binary::Srem
-            | Binary::Udiv
-            | Binary::Urem
-            | Binary::Smulhi
-            | Binary::Umulhi
-            | Binary::AvgRound
-            | Binary::SaddSat
-            | Binary::UaddSat
-            | Binary::SsubSat
-            | Binary::UsubSat
-            | Binary::Fcopysign,
-            _,
-            _,
-        ) => true,
-        _ => false,
+        Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) if func.ty(*x) == Type::I128 => ALL,
+        Op::Copy(..) | Op::Fits(Binary::Imul, ..) | Op::Binary(Binary::Fcopysign, ..) => ALL,
+        Op::TargetOp(TargetOpId::X64AddCarry | TargetOpId::X64AddCarryOut | TargetOpId::X64SubBorrow | TargetOpId::X64SubBorrowOut | TargetOpId::X64DivWide | TargetOpId::X64RemWide, _) => ALL,
+        Op::Move(..) | Op::AtomicCas(..) => R11,
+        Op::AtomicRmw(AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub, ..) => 0,
+        Op::AtomicRmw(..) => RSI | RDX,
+        Op::Binary(Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem | Binary::Smulhi | Binary::Umulhi | Binary::AvgRound | Binary::UaddSat | Binary::UsubSat, ..) => RDX,
+        Op::Binary(Binary::SaddSat | Binary::SsubSat, ..) => RDX | R11,
+        Op::Unary(Unary::Bitrev, _) => RDX,
+        Op::Unary(Unary::Floor | Unary::Ceil | Unary::Trunc, x) if func.ty(*x).is_float() => RDX,
+        Op::Unary(Unary::Popcnt, _) => RSI | R11,
+        _ => 0,
     }
 }
 
@@ -304,7 +298,11 @@ impl Emit<'_> {
                     self.lock_rmw(*rmw, size, *addr, *value);
                 } else {
                     self.rmw(*rmw, size, *addr, *value);
-                    self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi]);
+                    if matches!(rmw, AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub) {
+                        self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
+                    } else {
+                        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi]);
+                    }
                 }
                 if *rmw == AtomicRmwOp::Sub {
                     self.asm.hold_eq(res.index() as u32, value.index() as u32);
@@ -315,12 +313,12 @@ impl Emit<'_> {
             }
             Op::AtomicCas(_, addr, expected, replacement) => {
                 let res = result()?;
-                let target = self.atomic_target(*addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx]);
+                let target = self.atomic_target(*addr, Reg::R11, &[Reg::Rax, Reg::Rcx]);
                 self.raw(Reg::Rax, *expected);
                 self.raw(Reg::Rcx, *replacement);
                 self.asm.cmpxchg(size, target, Reg::Rcx);
                 self.asm.hold_eq(res.index() as u32, expected.index() as u32);
-                self.clobber_reg(Reg::Rax);
+                self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::R11]);
                 self.put(res, Reg::Rax);
             }
             other => return Err(format!("unexpected {other:?}")),
