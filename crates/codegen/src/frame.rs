@@ -606,7 +606,7 @@ fn pure_op(op: &Op) -> bool {
             | Op::AtomicStore(..)
             | Op::AtomicRmw(..)
             | Op::AtomicCas(..)
-            | Op::Fence
+            | Op::Fence(..)
             | Op::Trap
             | Op::Trapz(..)
     )

@@ -526,7 +526,7 @@ pub(crate) fn stack_store_overlaps(func: &Function, op: &Op, slot: StackSlot, (o
 
 /// Whether `op` is an atomic memory op or fence.
 pub(crate) fn is_atomic_barrier(op: &Op) -> bool {
-    matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)
+    matches!(op, Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..))
 }
 
 /// Whether `op` prevents hoisting, sinking, or rematerializing memory accesses across it.

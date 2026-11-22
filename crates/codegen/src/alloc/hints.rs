@@ -224,7 +224,7 @@ pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>],
             }
             let z = match func.insts[inst.index()].op {
                 Op::Const(imm) => (0..=ty_mask(ty)).contains(&imm),
-                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(_) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _) | Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => true,
+                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _) | Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => true,
                 Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Unary(Unary::Bitrev, _) => ty == Type::I32,
                 Op::Unary(Unary::Bswap, a) => ty == Type::I32 && out[a.index()],
                 Op::Select(_, a, b) => out[a.index()] && out[b.index()],

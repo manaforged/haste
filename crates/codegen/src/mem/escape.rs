@@ -112,11 +112,11 @@ fn is_unknown_mem_op(op: &Op, slots: &[Option<(StackSlot, i32)>], tracked: &[Tra
         Op::Move(dst, src, _) | Op::Copy(dst, src, _) => !known(dst) || !known(src),
         Op::Call { .. }
         | Op::TryCall { .. }
-        | Op::AtomicLoad(_)
+        | Op::AtomicLoad(..)
         | Op::AtomicStore(..)
         | Op::AtomicRmw(..)
         | Op::AtomicCas(..)
-        | Op::Fence => true,
+        | Op::Fence(..) => true,
         _ => false,
     }
 }

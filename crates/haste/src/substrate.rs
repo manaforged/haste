@@ -38,7 +38,7 @@ use haste_codegen::{Code, CodeUnwindDrop, RelocKind, Site, StencilReloc};
 use consumers::{CONSUMER_REC_LEN, Consumer};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 25;
+const VERSION: u32 = 26;
 const HEADER_LEN: usize = 72;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 80;

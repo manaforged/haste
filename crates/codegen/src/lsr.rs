@@ -308,11 +308,11 @@ fn loop_addr_uses(state: &State<'_>, each: &Loop) -> Vec<u32> {
         }
         for &inst in &state.func.blocks[b].insts {
             match state.func.insts[inst.index()].op {
-                Op::Load(addr, _) | Op::AtomicLoad(addr) => mark(addr),
+                Op::Load(addr, _) | Op::AtomicLoad(addr, _) => mark(addr),
                 Op::Store(_, addr, _)
-                | Op::AtomicStore(_, addr)
-                | Op::AtomicRmw(_, addr, _)
-                | Op::AtomicCas(addr, _, _) => mark(addr),
+                | Op::AtomicStore(_, addr, _)
+                | Op::AtomicRmw(_, _, addr, _)
+                | Op::AtomicCas(_, addr, _, _) => mark(addr),
                 Op::Copy(dst, src, _) | Op::Move(dst, src, _) => {
                     mark(dst);
                     mark(src);

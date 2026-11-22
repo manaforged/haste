@@ -7,7 +7,7 @@ use crate::frame::{Emitter, Ext};
 use crate::ir::{AtomicRmwOp, Binary, Block, Function, IntCC, Op, ShuffleMask, StackSlot, TargetOpId, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
-const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
+const SEQ_CST_FENCE: [u8; 6] = [0xF0, 0x48, 0x83, 0x0C, 0x24, 0x00];
 
 /// Scratch registers an inline copy holds its chunks in; none of them forms an address.
 const COPY_SCRATCH: [Reg; 4] = [Reg::Rax, Reg::Rdx, Reg::R11, Reg::Rsi];
@@ -214,7 +214,12 @@ impl Emit<'_> {
             }
             Op::StackLoad(slot, offset) => self.read(result()?, self.slot(*slot, *offset)),
             Op::StackStore(value, slot, offset) => self.write(*value, self.slot(*slot, *offset)),
-            Op::Fence => self.asm.bytes(&MFENCE),
+            Op::Fence(ord) => {
+                if ord.is_seq_cst() {
+                    self.clear_flags();
+                    self.asm.bytes(&SEQ_CST_FENCE);
+                }
+            }
             Op::FramePointer => self.put(result()?, Reg::Rbp),
             Op::Copy(to, from, bytes) => self.copy(*to, *from, *bytes)?,
             Op::Move(to, from, bytes) => self.move_bytes(*to, *from, *bytes),
@@ -267,7 +272,7 @@ impl Emit<'_> {
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         self.clear_flags();
         let ty = match op {
-            Op::AtomicStore(value, _) => self.ty(*value),
+            Op::AtomicStore(value, _, _) => self.ty(*value),
             _ => self.ty(result()?),
         };
         if ty == Type::I128 {
@@ -275,22 +280,27 @@ impl Emit<'_> {
         }
         let size = Size::of(ty.bytes());
         match op {
-            Op::AtomicLoad(addr) => {
+            Op::AtomicLoad(addr, _) => {
                 let target = self.atomic_target(*addr, Reg::Rcx, &[]);
                 self.read(result()?, target);
             }
-            Op::AtomicStore(value, addr) => {
-                let target = self.atomic_target(*addr, Reg::Rcx, &[Reg::Rax]);
-                self.raw(Reg::Rax, *value);
-                self.asm.xchg(size, target, Reg::Rax);
-                self.clobber_reg(Reg::Rax);
+            Op::AtomicStore(value, addr, ord) => {
+                if ord.is_seq_cst() {
+                    let target = self.atomic_target(*addr, Reg::Rcx, &[Reg::Rax]);
+                    self.raw(Reg::Rax, *value);
+                    self.asm.xchg(size, target, Reg::Rax);
+                    self.clobber_reg(Reg::Rax);
+                } else {
+                    let target = self.atomic_target(*addr, Reg::Rcx, &[]);
+                    self.write(*value, target);
+                }
             }
-            Op::AtomicRmw(rmw, addr, value) => {
+            Op::AtomicRmw(rmw, _, addr, value) => {
                 self.rmw(*rmw, size, *addr, *value);
                 self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi]);
                 self.put(result()?, Reg::Rax);
             }
-            Op::AtomicCas(addr, expected, replacement) => {
+            Op::AtomicCas(_, addr, expected, replacement) => {
                 let target = self.atomic_target(*addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx]);
                 self.raw(Reg::Rax, *expected);
                 self.raw(Reg::Rcx, *replacement);

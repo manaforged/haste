@@ -732,29 +732,29 @@ impl Ins<'_> {
         self.effect(Op::StackStore(value, slot, offset))
     }
 
-    /// A sequentially consistent read of a `ty` at `addr`.
-    pub fn atomic_load(mut self, ty: Type, addr: Value) -> Value {
-        self.value(Op::AtomicLoad(addr), ty)
+    /// An atomic read of a `ty` at `addr` with memory ordering `ord`.
+    pub fn atomic_load(mut self, ty: Type, addr: Value, ord: crate::ir::AtomicOrd) -> Value {
+        self.value(Op::AtomicLoad(addr, ord), ty)
     }
 
-    /// A sequentially consistent write of `value` at `addr`.
-    pub fn atomic_store(mut self, value: Value, addr: Value) -> Inst {
-        self.effect(Op::AtomicStore(value, addr))
+    /// An atomic write of `value` at `addr` with memory ordering `ord`.
+    pub fn atomic_store(mut self, value: Value, addr: Value, ord: crate::ir::AtomicOrd) -> Inst {
+        self.effect(Op::AtomicStore(value, addr, ord))
     }
 
-    /// Applies `op` with `value` to the `ty` at `addr` and returns the old contents.
-    pub fn atomic_rmw(mut self, ty: Type, op: AtomicRmwOp, addr: Value, value: Value) -> Value {
-        self.value(Op::AtomicRmw(op, addr, value), ty)
+    /// Applies `op` with `value` to the `ty` at `addr` with memory ordering `ord` and returns the old contents.
+    pub fn atomic_rmw(mut self, ty: Type, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, addr: Value, value: Value) -> Value {
+        self.value(Op::AtomicRmw(op, ord, addr, value), ty)
     }
 
-    /// Writes `replacement` at `addr` if it holds `expected`, and returns the old contents.
-    pub fn atomic_cas(mut self, addr: Value, expected: Value, replacement: Value) -> Value {
+    /// Writes `replacement` at `addr` if it holds `expected` with memory ordering `ord`, and returns the old contents.
+    pub fn atomic_cas(mut self, ord: crate::ir::AtomicOrd, addr: Value, expected: Value, replacement: Value) -> Value {
         let ty = self.func.ty(expected);
-        self.value(Op::AtomicCas(addr, expected, replacement), ty)
+        self.value(Op::AtomicCas(ord, addr, expected, replacement), ty)
     }
 
-    /// A full memory barrier.
-    pub fn fence(mut self) -> Inst { self.effect(Op::Fence) }
+    /// A memory barrier with ordering `ord`.
+    pub fn fence(mut self, ord: crate::ir::AtomicOrd) -> Inst { self.effect(Op::Fence(ord)) }
 
     /// This function's frame pointer.
     pub fn get_frame_pointer(mut self, ty: Type) -> Value { self.value(Op::FramePointer, ty) }

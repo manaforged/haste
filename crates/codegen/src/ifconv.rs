@@ -392,7 +392,7 @@ fn propagate_loop_taint(func: &Function, cfg: &Cfg, each: &Loop, tainted: &mut [
             for &inst in &func.blocks[b.index()].insts {
                 let data = &func.insts[inst.index()];
                 if check_load_addr
-                    && let Op::Load(addr, _) | Op::AtomicLoad(addr) = data.op
+                    && let Op::Load(addr, _) | Op::AtomicLoad(addr, _) = data.op
                     && tainted[addr.index()]
                 {
                     return (true, head_phis);

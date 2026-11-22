@@ -220,7 +220,7 @@ fn unroll_self(
 }
 
 fn blocks_dynamic_unroll(op: &Op) -> bool {
-    is_libcall_mem(op) || matches!(*op, Op::Trap | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)
+    is_libcall_mem(op) || matches!(*op, Op::Trap | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..))
 }
 
 fn head_defs_dominated(func: &Function, cfg: &Cfg, (b, out_blk): (usize, usize), head_defs: &[bool]) -> bool {

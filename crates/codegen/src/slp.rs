@@ -180,7 +180,7 @@ fn lanes_per_vector(nodes: &[Node], n: usize) -> Option<u8> {
 }
 
 fn writes_memory(op: &Op) -> bool {
-    matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Call { .. } | Op::TryCall { .. } | Op::Copy(..) | Op::Move(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)
+    matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Call { .. } | Op::TryCall { .. } | Op::Copy(..) | Op::Move(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..))
 }
 
 /// The scalar integer type `bytes` wide and its lane, for partial vector loads and stores.

@@ -502,7 +502,7 @@ fn is_mem_barrier(op: &Op) -> bool {
             | Op::AtomicStore(..)
             | Op::AtomicRmw(..)
             | Op::AtomicCas(..)
-            | Op::Fence
+            | Op::Fence(..)
             | Op::Copy(..)
             | Op::Move(..)
             | Op::Trap

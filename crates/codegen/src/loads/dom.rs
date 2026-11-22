@@ -129,11 +129,11 @@ impl<'a> BlockWrites<'a> {
                         | Op::StackStore(..)
                         | Op::Copy(..)
                         | Op::Move(..)
-                        | Op::AtomicLoad(_)
+                        | Op::AtomicLoad(..)
                         | Op::AtomicStore(..)
                         | Op::AtomicRmw(..)
                         | Op::AtomicCas(..)
-                        | Op::Fence
+                        | Op::Fence(..)
                         | Op::Call { .. }
                         | Op::TryCall { .. }
                 ) {

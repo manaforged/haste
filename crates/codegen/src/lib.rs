@@ -74,7 +74,7 @@ mod x64;
 pub use asm_text::{Assembly, assemble};
 pub use builder::{FunctionBuilder, Ins, Mark};
 pub use drop_elide::UnwindDrop;
-pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type, Value};
+pub use ir::{AbiParam, ArgumentPurpose, AtomicOrd, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type, Value};
 pub use coroutine::Coroutine;
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};

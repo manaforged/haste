@@ -47,7 +47,7 @@ fn may_barrier_mem(op: &Op) -> bool {
             | Op::StackStore(..)
             | Op::Copy(..)
             | Op::Move(..)
-            | Op::Fence
+            | Op::Fence(..)
             | Op::Call { .. }
             | Op::TryCall { .. }
             | Op::AtomicLoad(..)

@@ -236,7 +236,7 @@ impl Lower<'_, '_> {
 
     fn ensure_static_filled(&mut self, index: usize, address: Value, size: i32) -> Result<()> {
         let flag = self.ins().iadd_imm(address, i64::from(size));
-        let state = self.ins().atomic_load(Type::I8, flag);
+        let state = self.ins().atomic_load(Type::I8, flag, haste_codegen::AtomicOrd::Acquire);
         let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
         self.unless(filled, |lower| {
             let usize_ty = lower.cx.types.prim(Primitive::Usize);

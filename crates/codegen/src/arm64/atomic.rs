@@ -76,7 +76,11 @@ impl Emit<'_> {
             }
             Op::StackLoad(slot, offset) => self.read(result()?, self.slot(*slot, *offset)),
             Op::StackStore(value, slot, offset) => self.write(*value, self.slot(*slot, *offset)),
-            Op::Fence => self.asm.dmb(),
+            Op::Fence(ord) => match ord {
+                crate::ir::AtomicOrd::Relaxed => {}
+                crate::ir::AtomicOrd::Acquire => self.asm.dmb_ld(),
+                _ => self.asm.dmb(),
+            },
             Op::FramePointer => self.put(result()?, FP),
             Op::Copy(to, from, bytes) => self.copy(*to, *from, *bytes)?,
             Op::Move(to, from, bytes) => self.move_bytes(*to, *from, *bytes),
@@ -442,7 +446,7 @@ impl Emit<'_> {
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         self.invalidate_spills();
         let ty = match op {
-            Op::AtomicStore(value, _) => self.ty(*value),
+            Op::AtomicStore(value, _, _) => self.ty(*value),
             _ => self.ty(result()?),
         };
         if ty == Type::I128 {
@@ -450,23 +454,31 @@ impl Emit<'_> {
         }
         let size = Size::of(ty.bytes());
         match op {
-            Op::AtomicLoad(addr) => {
+            Op::AtomicLoad(addr, ord) => {
                 let at = self.bits(*addr, S);
                 let dst = self.dst(result()?);
-                self.asm.load_acquire(false, size, dst, at);
+                if ord.has_acquire() {
+                    self.asm.load_acquire(size, dst, at);
+                } else {
+                    self.asm.load(size, false, dst, Mem::new(at, 0));
+                }
                 self.put(result()?, dst);
             }
-            Op::AtomicStore(value, addr) => {
+            Op::AtomicStore(value, addr, ord) => {
                 let at = self.bits(*addr, S);
                 let source = self.bits(*value, A);
-                self.asm.store_release(size, at, source);
+                if ord.has_release() {
+                    self.asm.store_release(size, at, source);
+                } else {
+                    self.asm.store(size, Mem::new(at, 0), source);
+                }
             }
-            Op::AtomicRmw(rmw, addr, value) => {
-                self.rmw(*rmw, size, *addr, *value);
+            Op::AtomicRmw(rmw, ord, addr, value) => {
+                self.rmw(*rmw, *ord, size, *addr, *value);
                 self.put(result()?, A);
             }
-            Op::AtomicCas(addr, expected, replacement) => {
-                self.cas(size, *addr, (*expected, *replacement));
+            Op::AtomicCas(ord, addr, expected, replacement) => {
+                self.cas(*ord, size, *addr, (*expected, *replacement));
                 self.put(result()?, A);
             }
             other => return Err(format!("unexpected {other:?}")),
@@ -474,14 +486,23 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
+    fn rmw(&mut self, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
         self.get_opt(D, value, signed);
+        if self.lse && op != AtomicRmwOp::Nand {
+            match op {
+                AtomicRmwOp::Sub => self.asm.alu(Alu::Sub, Size::X, D, ZR, D),
+                AtomicRmwOp::And => self.asm.alu(Alu::Orn, Size::X, D, ZR, D),
+                _ => {}
+            }
+            self.asm.lse_rmw(op, ord, size, (S, D, A));
+            return;
+        }
         let again = self.asm.label();
         self.asm.bind(again);
-        self.asm.load_acquire(true, size, A, S);
+        self.asm.load_exclusive(ord.has_acquire(), size, A, S);
         let old = if signed {
             self.asm.extend(true, bytes, C, A);
             C
@@ -511,22 +532,28 @@ impl Emit<'_> {
                 self.asm.alu(Alu::Orn, Size::X, C, ZR, C);
             }
         }
-        self.asm.store_exclusive(size, T, S, C);
+        self.asm.store_exclusive(ord.has_release(), size, T, S, C);
         self.asm.cbz(true, Size::W, T, again);
     }
 
-    fn cas(&mut self, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
+    fn cas(&mut self, ord: crate::ir::AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
+        if self.lse {
+            self.raw(A, expected);
+            self.raw(C, replacement);
+            self.asm.lse_cas(ord, size, (S, A, C));
+            return;
+        }
         self.zext_get(D, expected);
         self.raw(C, replacement);
         let (again, done) = (self.asm.label(), self.asm.label());
         self.asm.bind(again);
-        self.asm.load_acquire(true, size, A, S);
+        self.asm.load_exclusive(ord.has_acquire(), size, A, S);
         let compare = if bytes < 8 { Size::W } else { Size::X };
         self.asm.alu(Alu::Subs, compare, ZR, A, D);
         self.asm.bcond(Cond::Ne, done);
-        self.asm.store_exclusive(size, T, S, C);
+        self.asm.store_exclusive(ord.has_release(), size, T, S, C);
         self.asm.cbz(true, Size::W, T, again);
         self.asm.bind(done);
     }
