@@ -135,6 +135,8 @@ pre_launch check_reject mut_ref_immut 'fn main() { let x = 1; let r = &mut x; *r
 pre_launch check_reject conflict_mut_imm 'fn main() { let mut x = 1; let r1 = &x; let r2 = &mut x; *r2 = 2; println!("{r1}"); }'
 pre_launch check_reject mutate_borrowed 'fn main() { let mut x = 1; let r = &x; x = 2; println!("{r}"); }'
 pre_launch check_reject return_local_ref 'fn bad() -> &'\''static i32 { let x = 1; &x } fn main() { let _ = bad(); }'
+pre_launch check_reject return_byval_deref 'fn bad<'\''a>(p: (String, &'\''a str)) -> &'\''a str { &*p.0 } fn main() { let _ = bad((String::new(), "")); }'
+pre_launch check_reject invalid_arc_unsize 'use std::sync::Arc; fn main() { let a = [1, 2, 3]; let x: Arc<&[i32; 3]> = Arc::new(&a); let _y: Arc<&[i32]> = x; }'
 pre_launch check_malformed
 pre_fail=0
 for idx in "${!pre_pids[@]}"; do
