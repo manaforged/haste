@@ -74,9 +74,10 @@ impl Checker<'_, '_> {
         let call_extend = if is_ctor { self.let_extend_depth } else { None };
         let has_self_arg = sig.as_deref().is_some_and(|s| s.receiver.is_some());
         self.with_let_extend(call_extend, |this| {
-            this.check_arg_list(&arg_ids, sig.as_deref(), Some(callee_ty), has_self_arg, state, outer_live, depth)?;
+            let arg_sources = this.check_arg_list_sources(&arg_ids, sig.as_deref(), Some(callee_ty), has_self_arg, state, outer_live, depth)?;
             this.check_call_bounds(&arg_ids, sig.as_deref(), fn_item, has_self_arg, state)?;
-            this.attach_call_out_sources(expr, &arg_ids, sig.as_deref(), fn_item, has_self_arg, state)
+            this.attach_call_out_sources(expr, &arg_ids, sig.as_deref(), fn_item, has_self_arg, state)?;
+            this.apply_closure_call_loans(callee, &arg_ids, &arg_sources, state)
         })
     }
 
@@ -122,7 +123,7 @@ impl Checker<'_, '_> {
 
     fn is_mem_drop(&mut self, expr: ExprId, callee: ExprId) -> bool {
         let Some(&Res::Fn(item, _)) = self.callee_res(expr, Some(callee)) else { return false };
-        self.cx.name(item) == "drop" && matches!(self.cx.qualified(item).as_str(), "core::mem::drop" | "std::mem::drop")
+        self.item_in_std_mod(item, "mem") && self.cx.name(item) == "drop"
     }
 
     pub(super) fn check_method(
@@ -152,7 +153,7 @@ impl Checker<'_, '_> {
             let is_by_val = adjust.map_or(0, |a| a.derefs) == 0
                 && sig.as_deref().is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
             (!is_by_val && self.is_mut_ref_ty(self.expr_ty(receiver))).then(|| {
-                if sig.as_deref().is_some_and(|s| matches!(s.receiver, Some((SelfKind::Ref, _)))) {
+                if sig.as_deref().is_some_and(|s| recv_ref_mut(s) == Some(Mut::Not)) {
                     Mut::Not
                 } else {
                     Mut::Mut
@@ -198,9 +199,15 @@ impl Checker<'_, '_> {
             } else {
                 self.check_expr(receiver, state, true, outer_live, false, depth)?;
                 if self.ty_holds_borrow(self.expr_ty(receiver)) {
-                    for s in self.expr_borrow_sources(receiver, state) {
-                        push_loan(&mut state.loans, s.target, s.steps, Some(temp_id), s.mutable && mutability == Mut::Mut, s.through_ref, false, s.env_only);
-                    }
+                    let recv_sources = self.expr_borrow_sources(receiver, state);
+                    super::bind::push_source_loans_filtered(
+                        &mut state.loans,
+                        Some(temp_id),
+                        &recv_sources,
+                        false,
+                        |_| true,
+                        |s| s.mutable && mutability == Mut::Mut,
+                    );
                 }
             }
         } else {
@@ -217,6 +224,11 @@ impl Checker<'_, '_> {
             return Ok(());
         }
         let param_ids: Vec<u32> = self.body.list(params).to_vec();
+        let recv_closure_sources = if !param_ids.is_empty() && self.ty_holds_borrow(self.expr_ty(receiver)) {
+            self.expr_borrow_sources(receiver, state)
+        } else {
+            Vec::new()
+        };
         let mut arg_live = outer_live.clone();
         if self.ty_holds_borrow(self.expr_ty(expr)) {
             self.collect_live_expr(receiver, &mut arg_live);
@@ -230,9 +242,9 @@ impl Checker<'_, '_> {
             _ => None,
         };
         let sig = self.callee_sig(expr, None);
-        let res = self.check_arg_list(&param_ids, sig.as_deref(), None, false, state, outer_live, depth);
+        let res = self.check_arg_list_sources(&param_ids, sig.as_deref(), None, false, state, outer_live, depth);
         state.loans.retain(|l| l.holder != Some(temp_id));
-        res?;
+        let arg_sources = res?;
         if !state.diverged && let Some((local, through_ref, mut_ref_root, steps)) = deferred_recv {
             let mut check_state = state.clone();
             super::prune_dead_loans(&mut check_state, outer_live);
@@ -241,6 +253,7 @@ impl Checker<'_, '_> {
         if !state.diverged {
             self.check_call_bounds(&param_ids, sig.as_deref(), fn_item, false, state)?;
             self.attach_method_arg_sources(expr, receiver, &param_ids, recv_borrow == Some(Mut::Mut), sig.as_deref(), state)?;
+            self.attach_closure_arg_param_loans(Some(&recv_closure_sources), &param_ids, &arg_sources, state)?;
         }
         Ok(())
     }
@@ -275,8 +288,13 @@ impl Checker<'_, '_> {
     }
 
     pub(super) fn check_arg_list(&mut self, arg_ids: &[u32], sig: Option<&Signature>, callee_ty: Option<Ty>, has_self_arg: bool, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<()> {
+        self.check_arg_list_sources(arg_ids, sig, callee_ty, has_self_arg, state, outer_live, depth).map(|_| ())
+    }
+
+    fn check_arg_list_sources(&mut self, arg_ids: &[u32], sig: Option<&Signature>, callee_ty: Option<Ty>, has_self_arg: bool, state: &mut State, outer_live: &HashSet<u32>, depth: u32) -> Result<Vec<Vec<BorrowSource>>> {
         let temp_id = self.next_temp_holder();
         let mut deferred_mut_args: Vec<(u32, Vec<PlaceStep>)> = Vec::new();
+        let mut arg_sources = Vec::with_capacity(arg_ids.len());
         let res = (|| -> Result<()> {
             for (idx, &id) in arg_ids.iter().enumerate() {
                 let arg = ExprId(id);
@@ -319,9 +337,16 @@ impl Checker<'_, '_> {
                 if state.diverged {
                     break;
                 }
-                for s in self.expr_borrow_sources(arg, state) {
-                    push_loan(&mut state.loans, s.target, s.steps, Some(temp_id), s.mutable && !shared_reborrow, s.through_ref, is_deferred_mut, s.env_only);
-                }
+                let sources = self.expr_borrow_sources(arg, state);
+                super::bind::push_source_loans_filtered(
+                    &mut state.loans,
+                    Some(temp_id),
+                    &sources,
+                    is_deferred_mut,
+                    |_| true,
+                    |s| s.mutable && !shared_reborrow,
+                );
+                arg_sources.push(sources);
                 prune_moved_loans(state);
             }
             if !state.diverged && !deferred_mut_args.is_empty() {
@@ -337,7 +362,7 @@ impl Checker<'_, '_> {
             Ok(())
         })();
         state.loans.retain(|l| l.holder != Some(temp_id));
-        res
+        res.map(|()| arg_sources)
     }
 
     pub(super) fn check_closure(&mut self, expr: ExprId, params: Option<List>, body: ExprId, state: &mut State, depth: u32) -> Result<()> {
@@ -355,6 +380,7 @@ impl Checker<'_, '_> {
         if let Some(params) = params {
             let param_ids: Vec<u32> = self.body.list(params).to_vec();
             for (idx, p_id) in param_ids.into_iter().enumerate() {
+                let mut fallback = Vec::new();
                 if let Some(&local) = closure.params.get(idx)
                     && (local as usize) < body_state.init.len()
                 {
@@ -362,8 +388,17 @@ impl Checker<'_, '_> {
                     body_state.init[local as usize] = true;
                     body_state.maybe_init[local as usize] = true;
                     body_state.moved[local as usize] = false;
+                    if self.ty_holds_borrow(self.local_ty(local)) {
+                        fallback.push(BorrowSource {
+                            target: local,
+                            steps: Vec::new(),
+                            mutable: self.is_mut_ref_ty(self.local_ty(local)),
+                            through_ref: self.is_ref_ty(self.local_ty(local)),
+                            env_only: false,
+                        });
+                    }
                 }
-                if let Err(err) = self.bind_pat(self.body.params[p_id as usize].pat, None, None, &[], &[], &mut body_state, (true, true, closure_depth)) {
+                if let Err(err) = self.bind_pat(self.body.params[p_id as usize].pat, None, None, &[], &fallback, &mut body_state, (true, true, closure_depth)) {
                     self.no_move_captures = saved_no_move;
                     return Err(err);
                 }
@@ -412,7 +447,14 @@ impl Checker<'_, '_> {
             .closure_borrow_sources(expr, state)
             .iter()
             .any(|s| super::checks::is_temp_target(s.target).is_some() || !self.from_caller(s.target, s.through_ref));
-        self.closure_effects.insert(expr, super::checks::ClosureEffects { moves_capture, mutates_capture, borrows_local });
+        self.record_closure_body_loans(
+            expr,
+            &closure.params,
+            closure_depth,
+            &body_state,
+            state,
+            (moves_capture, mutates_capture, borrows_local),
+        );
         Ok(())
     }
 
@@ -679,15 +721,19 @@ pub(super) fn ast_ref_mut(body: &Body, mut ty: TyId) -> Option<Mut> {
     }
 }
 
+pub(super) fn recv_ref_mut(sig: &Signature) -> Option<Mut> {
+    match sig.receiver? {
+        (SelfKind::Ref, _) => Some(Mut::Not),
+        (SelfKind::RefMut, _) => Some(Mut::Mut),
+        (SelfKind::Typed(ty), _) => ast_ref_mut(&sig.body, ty),
+        (SelfKind::Value, _) => None,
+    }
+}
+
 fn param_ref_mut(sig: &Signature, idx: usize, has_self_arg: bool) -> Option<Mut> {
     if has_self_arg {
         if idx == 0 {
-            return match sig.receiver? {
-                (SelfKind::Ref, _) => Some(Mut::Not),
-                (SelfKind::RefMut, _) => Some(Mut::Mut),
-                (SelfKind::Typed(ty), _) => ast_ref_mut(&sig.body, ty),
-                (SelfKind::Value, _) => None,
-            };
+            return recv_ref_mut(sig);
         }
         return sig.params.get(idx - 1).and_then(|&(_, ty)| ast_ref_mut(&sig.body, ty));
     }
@@ -695,8 +741,7 @@ fn param_ref_mut(sig: &Signature, idx: usize, has_self_arg: bool) -> Option<Mut>
 }
 
 pub(super) fn recv_is_by_ref(sig: &Signature) -> bool {
-    matches!(sig.receiver, Some((SelfKind::Ref | SelfKind::RefMut, _)))
-        || matches!(sig.receiver, Some((SelfKind::Typed(self_ty), _)) if matches!(sig.body.ty(self_ty), AstTy::Ref { .. }))
+    recv_ref_mut(sig).is_some()
 }
 
 pub(super) fn receiver_has_any_named(src: &Source, item: &Item, named: &[&str]) -> bool {

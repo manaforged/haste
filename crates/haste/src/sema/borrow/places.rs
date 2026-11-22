@@ -134,6 +134,8 @@ impl Checker<'_, '_> {
     pub(super) fn is_mut_ref_ty(&self, ty: Ty) -> bool { ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Mut, _)) }
     pub(super) fn is_shared_ref_or_ptr(&self, ty: Ty) -> bool { ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _) | Kind::Ptr(Mut::Not, _)) }
     pub(super) fn is_mut_ref_or_ptr(&self, ty: Ty) -> bool { ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Mut, _) | Kind::Ptr(Mut::Mut, _)) }
+    pub(super) fn is_param_local(&self, local: u32) -> bool { self.is_param.get(local as usize).copied().unwrap_or(false) }
+    pub(super) fn is_closure_param(&self, local: u32) -> bool { self.typed.closures.values().any(|c| c.params.contains(&local)) }
     pub(super) fn ty_is_copy(&mut self, ty: Ty) -> bool {
         ty == Ty::NONE || matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) || super::super::infer::is_copy(self.cx, self.item, ty).unwrap_or(true)
     }
@@ -483,7 +485,7 @@ impl CapturePathWalk<'_, '_, '_> {
                         self.record_path(steps, true, true, true);
                     } else if cap.by == By::Value && !is_copy {
                         self.record_path(steps, true, false, false);
-                    } else if cap.path.is_empty() || cap.by == By::Mut {
+                    } else if cap.by == By::Mut || (cap.by == By::Ref && cap.path.is_empty()) {
                         walk_body = true;
                     } else {
                         self.record_path(steps, false, false, false);

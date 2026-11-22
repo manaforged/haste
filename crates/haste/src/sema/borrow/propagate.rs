@@ -6,7 +6,7 @@ use crate::names::ItemRef;
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::calls::{Lifetimes, ast_ref_mut, collect_ty_lifetimes, receiver_has_any_named, recv_is_by_ref, ty_shares_name};
+use super::calls::{Lifetimes, collect_ty_lifetimes, receiver_has_any_named, recv_is_by_ref, recv_ref_mut, ty_shares_name};
 use super::places::{PlaceStep, steps_conflict};
 use super::{Checker, Loan, State};
 
@@ -27,6 +27,16 @@ impl BorrowSource {
             mutable: l.mutable,
             through_ref: l.through_ref,
             env_only: l.env_only,
+        }
+    }
+
+    pub(super) fn temp(depth: u32, mutable: bool, env_only: bool) -> Self {
+        Self {
+            target: super::checks::temp_target_for(depth),
+            steps: Vec::new(),
+            mutable,
+            through_ref: false,
+            env_only,
         }
     }
 }
@@ -72,6 +82,12 @@ impl Checker<'_, '_> {
                 if allow_mut_ref_reborrow && self.is_mut_ref_ty(ty) =>
             {
                 self.place_borrow_sources(expr, true, state, None)
+            }
+            Expr::Field(base, _)
+            | Expr::TupleField(base, _)
+            | Expr::Index(base, _)
+            | Expr::Unary(UnOp::Deref, base) => {
+                self.copy_projected_borrow_sources(expr, base, state)
             }
             Expr::Path(_) => self.path_borrow_sources(expr, state, allow_mut_ref_reborrow),
             Expr::Tuple(list) | Expr::Array(list) => {
@@ -152,6 +168,65 @@ impl Checker<'_, '_> {
             Expr::Method { receiver, params, .. } => self.method_borrow_sources(expr, receiver, params, state),
             _ => Vec::new(),
         }
+    }
+
+    fn copy_projected_borrow_sources(
+        &mut self,
+        expr: ExprId,
+        base: ExprId,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        let mut unwrapped_base = base;
+        while let Expr::Paren(inner) = *self.body.expr(unwrapped_base) {
+            unwrapped_base = inner;
+        }
+        if let Expr::Ref { expr: inner, .. } = *self.body.expr(unwrapped_base) {
+            return self.expr_borrow_sources_inner(inner, state, false, None);
+        }
+        let base_ty = self.expr_ty(base);
+        let sources = self.expr_borrow_sources_inner(base, state, false, None);
+        if matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _))
+            && sources.is_empty()
+            && let Some(local) = self.expr_plain_local(unwrapped_base)
+            && self.is_closure_param(local)
+            && self.is_ref_ty(self.local_ty(local))
+        {
+            return vec![BorrowSource {
+                target: local,
+                steps: vec![PlaceStep::Deref],
+                mutable: self.is_mut_ref_ty(self.local_ty(local)),
+                through_ref: true,
+                env_only: false,
+            }];
+        }
+        let derefs_base = self.is_ref_ty(base_ty)
+            || self.cx.boxed(base_ty).is_some()
+            || self.typed.autoderefs.get(&expr).is_some_and(|&d| d > 0);
+        if !derefs_base {
+            return sources;
+        }
+        let unwrap_temp = matches!(*self.body.expr(expr), Expr::Index(..))
+            || matches!(*self.body.expr(unwrapped_base), Expr::Method { .. });
+        self.unwrap_outer_container_loans(sources, state, unwrap_temp)
+    }
+
+    pub(super) fn unwrap_outer_container_loans(
+        &mut self,
+        sources: Vec<BorrowSource>,
+        state: &State,
+        unwrap_temp: bool,
+    ) -> Vec<BorrowSource> {
+        let targets: Vec<u32> = sources.iter().map(|s| s.target).collect();
+        unwrap_container_loans(sources, state, |s| {
+            if super::checks::is_temp_target(s.target).is_some() {
+                return unwrap_temp;
+            }
+            !self.from_caller(s.target, s.through_ref)
+                && self.ty_holds_borrow(self.local_ty(s.target))
+                && !targets.iter().any(|&other| {
+                    other != s.target && state.loans.iter().any(|l| l.holder == Some(other) && l.target == s.target)
+                })
+        })
     }
 
     fn struct_shared_ref_fields(&mut self, expr: ExprId) -> HashSet<String> {
@@ -267,13 +342,7 @@ impl Checker<'_, '_> {
                 let mut out = Vec::new();
                 if self.is_non_promotable_temp(expr) {
                     let depth = extend_depth.unwrap_or(self.temp_scope_depth);
-                    out.push(BorrowSource {
-                        target: super::checks::temp_target_for(depth),
-                        steps: Vec::new(),
-                        mutable,
-                        through_ref: false,
-                        env_only: false,
-                    });
+                    out.push(BorrowSource::temp(depth, mutable, false));
                 }
                 if self.ty_holds_borrow(self.expr_ty(expr)) {
                     for s in clamp_mut(self.expr_borrow_sources_inner(expr, state, true, extend_depth), mutable) {
@@ -377,7 +446,7 @@ impl Checker<'_, '_> {
             }
             Some(Res::Fn(fn_item, _))
                 if !matches!(self.cx.types.kind(self.expr_ty(callee)), Kind::Closure(..))
-                    && !self.cx.owner_trait(fn_item).and_then(|tr| self.cx.lang(tr)).is_some_and(|l| matches!(l, "fn" | "fn_mut" | "fn_once" | "async_fn" | "async_fn_mut" | "async_fn_once")) =>
+                    && !self.cx.owner_trait(fn_item).and_then(|tr| self.cx.lang(tr)).is_some_and(crate::sema::infer::is_callable_lang) =>
             {
                 self.sig_borrow_sources(expr, fn_item, None, args, state)
             }
@@ -437,10 +506,9 @@ impl Checker<'_, '_> {
         } else {
             (receiver, raw_args.to_vec())
         };
-        let mod_text = self.cx.module_text(fn_item);
         let fn_name = self.cx.name(fn_item);
-        let is_iter_fn = mod_text.starts_with("core::iter") || mod_text.starts_with("std::iter");
-        let is_opt_fn = mod_text.starts_with("core::option") || mod_text.starts_with("std::option");
+        let is_iter_fn = self.is_iter_mod(fn_item);
+        let is_opt_fn = self.item_in_std_mod(fn_item, "option");
         let is_by_ref = is_iter_fn && fn_name == "by_ref";
         let mut out = Vec::new();
         if !ret_lts.has_elided && ret_lts.named.is_empty() {
@@ -530,8 +598,7 @@ impl Checker<'_, '_> {
                 Some((SelfKind::Value, _)) => true,
                 None => false,
             };
-            let recv_is_mut = matches!(sig.receiver, Some((SelfKind::RefMut, _)))
-                || matches!(sig.receiver, Some((SelfKind::Typed(st), _)) if ast_ref_mut(&sig.body, st) == Some(Mut::Mut));
+            let recv_is_mut = recv_ref_mut(&sig) == Some(Mut::Mut);
             if is_by_ref {
                 out.extend(self.by_ref_recv_sources(expr, recv, state));
             } else if recv_creates_borrow && !recv_is_mut && self.is_mut_ref_to_shared_ref(self.expr_ty(recv)) {
@@ -629,13 +696,7 @@ impl Checker<'_, '_> {
         } else {
             let mut srcs = self.expr_borrow_sources_inner(recv, state, true, None);
             if self.is_non_promotable_temp(recv) {
-                srcs.push(BorrowSource {
-                    target: super::checks::temp_target_for(self.temp_scope_depth),
-                    steps: Vec::new(),
-                    mutable: true,
-                    through_ref: false,
-                    env_only: true,
-                });
+                srcs.push(BorrowSource::temp(self.temp_scope_depth, true, true));
             }
             srcs
         }

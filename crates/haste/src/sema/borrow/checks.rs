@@ -1,27 +1,23 @@
+mod closure;
+
 use anyhow::{Result, bail};
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::sig::{GenericKind, SelfKind, Signature};
+use crate::body::sig::{GenericKind, Signature};
 use crate::body::{BlockKind, Expr, ExprId, List, Stmt, Ty as AstTy, UnOp};
 use crate::outline::item::ItemKind;
 use crate::sema::impls::ImplRef;
 use crate::sema::infer::{By, Coercion, Res};
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::bind::push_loan;
-use super::calls::{Lifetimes, ast_ref_mut, collect_ty_lifetimes, ty_shares_name};
+use super::calls::{Lifetimes, collect_ty_lifetimes, ty_shares_name};
 use super::places::{FieldKey, Place, PlaceStep, push_step};
 use super::propagate::BorrowSource;
 use super::{Checker, PartialMove, State, loan_conflicts_borrow};
 
 pub(super) const TEMP_TARGET_BASE: u32 = u32::MAX - 262_144;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ClosureEffects {
-    pub(super) moves_capture: bool,
-    pub(super) mutates_capture: bool,
-    pub(super) borrows_local: bool,
-}
+pub(super) use closure::ClosureEffects;
 
 pub(super) fn is_temp_target(target: u32) -> Option<u32> {
     (target >= TEMP_TARGET_BASE && target < super::ITER_HOLDER_BASE).then(|| target - TEMP_TARGET_BASE)
@@ -103,8 +99,7 @@ impl Checker<'_, '_> {
                 items.into_iter().any(|item| self.ty_holds_closure_inner(item, seen))
             }
             Kind::Adt(item, items) => {
-                let mod_path = self.cx.module_text(item);
-                if mod_path.starts_with("core::iter") || mod_path.starts_with("std::iter") {
+                if self.is_iter_mod(item) {
                     return true;
                 }
                 let items = self.cx.types.substs(items).to_vec();
@@ -112,6 +107,18 @@ impl Checker<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    pub(super) fn item_in_std_mod(&mut self, item: crate::names::ItemRef, submod: &str) -> bool {
+        let mod_path = self.cx.module_text(item);
+        let Some(rest) = mod_path.strip_prefix("core::").or_else(|| mod_path.strip_prefix("std::")) else {
+            return false;
+        };
+        rest == submod || (rest.starts_with(submod) && rest.as_bytes().get(submod.len()) == Some(&b':'))
+    }
+
+    pub(super) fn is_iter_mod(&mut self, item: crate::names::ItemRef) -> bool {
+        self.item_in_std_mod(item, "iter")
     }
 
     pub(super) fn ty_has_borrow_drop(&mut self, ty: Ty) -> bool {
@@ -233,21 +240,32 @@ impl Checker<'_, '_> {
         if sources.is_empty() {
             return Ok(());
         }
-        if p.through_ref && self.is_param.get(p.local as usize).copied().unwrap_or(false) {
+        let mut targets: Vec<u32> = if p.through_ref {
+            state.loans.iter().filter(|l| l.holder == Some(p.local) && l.mutable).map(|l| l.target).collect()
+        } else {
+            Vec::new()
+        };
+        if p.through_ref && (!self.is_param_local(p.local) || self.closure_depth > 0) && !targets.contains(&p.local) {
+            targets.push(p.local);
+        }
+        if p.through_ref && (self.is_param_local(p.local) || targets.iter().any(|&t| self.is_param_local(t))) {
             for s in sources {
-                if is_temp_target(s.target).is_some()
-                    || (!self.from_caller(s.target, s.through_ref) && !(s.through_ref && self.is_ref_ty(self.local_ty(s.target))))
-                {
+                let allowed_ref = self.is_ref_ty(self.local_ty(s.target)) && (s.through_ref || self.is_closure_param(s.target));
+                if is_temp_target(s.target).is_some() || (!self.from_caller(s.target, s.through_ref) && !allowed_ref) {
                     bail!("`{}` does not live long enough", self.local_name(s.target));
                 }
             }
         }
         if self.closure_depth > 0 && self.scope_depth.get(p.local as usize).copied().unwrap_or(0) < self.closure_depth {
             for s in sources {
+                let is_cparam = self.is_closure_param(s.target);
+                let cparam_borrow = is_cparam && self.ty_holds_borrow(self.local_ty(s.target));
+                let allowed_ref = self.is_ref_ty(self.local_ty(s.target)) && (s.through_ref || is_cparam);
                 if is_temp_target(s.target).is_some()
                     || (!s.through_ref && !self.is_ref_ty(self.local_ty(s.target)) && self.closure_by_val_caps.contains(&s.target))
                     || (!self.from_caller(s.target, s.through_ref)
-                        && !(s.through_ref && self.is_ref_ty(self.local_ty(s.target)))
+                        && !allowed_ref
+                        && !cparam_borrow
                         && self.scope_depth.get(s.target as usize).copied().unwrap_or(0) >= self.closure_depth)
                 {
                     bail!("borrowed data escapes outside of closure");
@@ -255,17 +273,16 @@ impl Checker<'_, '_> {
             }
         }
         if p.through_ref {
-            let mut targets: Vec<u32> = state.loans.iter().filter(|l| l.holder == Some(p.local) && l.mutable).map(|l| l.target).collect();
-            if !self.is_param.get(p.local as usize).copied().unwrap_or(false) && !targets.contains(&p.local) {
-                targets.push(p.local);
-            }
             for holder in targets {
                 if self.ty_holds_borrow(self.local_ty(holder)) {
-                    for s in sources {
-                        if s.target != holder {
-                            push_loan(&mut state.loans, s.target, s.steps.clone(), Some(holder), s.mutable, s.through_ref, false, s.env_only);
-                        }
-                    }
+                    super::bind::push_source_loans_filtered(
+                        &mut state.loans,
+                        Some(holder),
+                        sources,
+                        false,
+                        |s| s.target != holder,
+                        |s| s.mutable,
+                    );
                 }
             }
         }
@@ -409,7 +426,11 @@ impl Checker<'_, '_> {
         let Some(mut p) = self.root_place(receiver) else {
             return Ok(());
         };
-        if !self.typed.adjusts.contains_key(&expr)
+        let adjust = self.typed.adjusts.get(&expr).copied();
+        let derefs = adjust.map_or(0, |a| a.derefs);
+        if derefs > 0 {
+            self.apply_deref_steps(expr, self.expr_ty(receiver), derefs, &mut p);
+        } else if adjust.and_then(|a| a.autoref).is_none()
             && self.is_mut_ref_ty(self.expr_ty(receiver))
             && sig.is_some_and(super::calls::recv_is_by_ref)
         {
@@ -488,10 +509,19 @@ impl Checker<'_, '_> {
             return sources;
         };
         let recv_substs = self.cx.types.substs(recv_args).to_vec();
+        let coerced_target = match self.typed.coercions.get(&arg) {
+            Some(Coercion::Deref(_, to)) => Some(*to),
+            Some(Coercion::Vtable(v)) => Some(v.object),
+            Some(Coercion::Len(_)) => match *self.cx.types.kind(inner) {
+                Kind::Array(elem, _) => Some(self.cx.types.intern(Kind::Slice(elem))),
+                _ => None,
+            },
+            _ => None,
+        };
         if inner_elems.is_empty()
             || recv_substs.is_empty()
             || self.cx.adt_def(recv_item).is_ok_and(|def| def.generics.params.iter().any(|g| g.kind == GenericKind::Lifetime))
-            || recv_substs.iter().any(|&t| self.ty_contains_ref_to(t, inner, &inner_elems))
+            || recv_substs.iter().any(|&t| self.ty_contains_ref_to(t, inner, coerced_target, &inner_elems))
         {
             return sources;
         }
@@ -510,13 +540,13 @@ impl Checker<'_, '_> {
         })
     }
 
-    fn ty_contains_ref_to(&self, ty: Ty, container: Ty, elems: &[Ty]) -> bool {
+    fn ty_contains_ref_to(&self, ty: Ty, container: Ty, coerced: Option<Ty>, elems: &[Ty]) -> bool {
         match *self.cx.types.kind(ty) {
-            Kind::Ref(_, target) => target == container || elems.contains(&target),
+            Kind::Ref(_, target) => target == container || coerced == Some(target) || elems.contains(&target),
             Kind::Tuple(items) | Kind::Adt(_, items) => {
-                self.cx.types.substs(items).iter().any(|&t| self.ty_contains_ref_to(t, container, elems))
+                self.cx.types.substs(items).iter().any(|&t| self.ty_contains_ref_to(t, container, coerced, elems))
             }
-            Kind::Slice(t) | Kind::Array(t, _) | Kind::Pat(t, ..) => self.ty_contains_ref_to(t, container, elems),
+            Kind::Slice(t) | Kind::Array(t, _) | Kind::Pat(t, ..) => self.ty_contains_ref_to(t, container, coerced, elems),
             _ => false,
         }
     }
@@ -580,8 +610,7 @@ impl Checker<'_, '_> {
     pub(super) fn attach_call_out_sources(&mut self, expr: ExprId, arg_ids: &[u32], sig: Option<&Signature>, fn_item: Option<crate::names::ItemRef>, has_self_arg: bool, state: &mut State) -> Result<()> {
         let Some(sig) = sig else { return Ok(()) };
         if has_self_arg && !arg_ids.is_empty() {
-            let recv_mut = matches!(sig.receiver, Some((SelfKind::RefMut, _)))
-                || matches!(sig.receiver, Some((SelfKind::Typed(st), _)) if ast_ref_mut(&sig.body, st) == Some(Mut::Mut));
+            let recv_mut = super::calls::recv_ref_mut(sig) == Some(Mut::Mut);
             let recv_expr = match *self.body.expr(ExprId(arg_ids[0])) {
                 Expr::Ref { mutable: true, raw: false, expr: inner } => inner,
                 _ => ExprId(arg_ids[0]),
@@ -639,143 +668,6 @@ impl Checker<'_, '_> {
                 lts_a.names.contains(&name) && lts_b.names.contains(&name)
             }
         })
-    }
-
-    pub(super) fn check_call_bounds(&mut self, arg_ids: &[u32], sig: Option<&Signature>, fn_item: Option<crate::names::ItemRef>, has_self_arg: bool, state: &State) -> Result<()> {
-        let Some(sig) = sig else { return Ok(()) };
-        let sig_src = fn_item.map_or(self.src, |item| self.cx.item(item).0);
-        for (idx, &id) in arg_ids.iter().enumerate() {
-            let param_idx = if has_self_arg {
-                let Some(p) = idx.checked_sub(1) else { continue };
-                p
-            } else {
-                idx
-            };
-            let Some(&(_, param_ty)) = sig.params.get(param_idx) else { continue };
-            let arg = ExprId(id);
-            let ref_static = matches!(*sig.body.ty(param_ty), AstTy::Ref { lifetime: Some(lt), .. } if sig_src.text(lt) == "'static");
-            let (req_fn, req_fn_mut, req_static) = self.param_bound_reqs(sig, sig_src, param_ty);
-            if req_static || ref_static {
-                self.check_static_arg(arg, state)?;
-            }
-            if req_fn || req_fn_mut || req_static {
-                self.check_closure_arg_reqs(arg, req_fn, req_fn_mut, req_static)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn param_bound_reqs(&self, sig: &Signature, src: &crate::outline::source::Source, param_ty: crate::body::TyId) -> (bool, bool, bool) {
-        let (mut req_fn, mut req_fn_mut, mut req_static) = (false, false, false);
-        let mut check_bounds = |list: List| {
-            for &b_id in sig.body.list(list) {
-                match sig.body.bounds[b_id as usize] {
-                    crate::body::Bound::Lifetime(lt) if src.text(lt) == "'static" => req_static = true,
-                    crate::body::Bound::Trait { path, .. } => {
-                        if let Some(&seg) = sig.body.list(sig.body.path(path).segments).last() {
-                            match src.text(sig.body.segments[seg as usize].name) {
-                                "Fn" => req_fn = true,
-                                "FnMut" => req_fn_mut = true,
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        };
-        match *sig.body.ty(param_ty) {
-            AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) => check_bounds(bounds),
-            AstTy::Ref { ty: inner, .. } => {
-                if let AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) = *sig.body.ty(inner) {
-                    check_bounds(bounds);
-                }
-            }
-            AstTy::Path(path) => {
-                let p = sig.body.path(path);
-                let segs = sig.body.list(p.segments);
-                if p.qself.is_none()
-                    && segs.len() == 1
-                {
-                    let name = src.text(sig.body.segments[segs[0] as usize].name);
-                    for g in &sig.generics {
-                        if g.kind == GenericKind::Type && src.text(g.name) == name {
-                            check_bounds(g.bounds);
-                        }
-                    }
-                    for pred in &sig.predicates {
-                        if let Some(pty) = pred.ty
-                            && let AstTy::Path(pp) = *sig.body.ty(pty)
-                        {
-                            let psegs = sig.body.list(sig.body.path(pp).segments);
-                            if psegs.len() == 1 && src.text(sig.body.segments[psegs[0] as usize].name) == name {
-                                check_bounds(pred.bounds);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        (req_fn, req_fn_mut, req_static)
-    }
-
-    fn check_static_arg(&mut self, expr: ExprId, state: &State) -> Result<()> {
-        for s in self.expr_borrow_sources(expr, state) {
-            if is_temp_target(s.target).is_some() || !self.from_caller(s.target, s.through_ref) {
-                bail!("`{}` does not live long enough", self.local_name(s.target));
-            }
-        }
-        Ok(())
-    }
-
-    fn check_closure_effects(&self, eff: ClosureEffects, req_fn: bool, req_fn_mut: bool, req_static: bool) -> Result<()> {
-        if (req_fn || req_fn_mut) && eff.moves_capture {
-            bail!("cannot move out of a captured variable in an `Fn` or `FnMut` closure");
-        }
-        if req_fn && eff.mutates_capture {
-            bail!("cannot borrow captured variable as mutable in an `Fn` closure");
-        }
-        if req_static && eff.borrows_local {
-            bail!("closure may outlive the current function, but it borrows a local variable");
-        }
-        Ok(())
-    }
-
-    fn check_closure_arg_reqs(&self, expr: ExprId, req_fn: bool, req_fn_mut: bool, req_static: bool) -> Result<()> {
-        let eff = match *self.body.expr(self.unwrap_expr(expr)) {
-            Expr::Closure { .. } => self.closure_effects.get(&self.unwrap_expr(expr)).copied(),
-            _ => match *self.cx.types.kind(self.expr_ty(expr)) {
-                Kind::Closure(parent, _, at) if parent == self.item => self.closure_effects.get(&ExprId(at)).copied(),
-                _ => None,
-            },
-        };
-        let Some(eff) = eff else { return Ok(()) };
-        self.check_closure_effects(eff, req_fn, req_fn_mut, req_static)
-    }
-
-    fn unwrap_expr(&self, mut expr: ExprId) -> ExprId {
-        loop {
-            match *self.body.expr(expr) {
-                Expr::Paren(inner) | Expr::Ref { expr: inner, .. } => expr = inner,
-                _ => return expr,
-            }
-        }
-    }
-
-    pub(super) fn check_coercion_vtables(&self) -> Result<()> {
-        for coercion in self.typed.coercions.values() {
-            let Coercion::Vtable(vtable) = coercion else { continue };
-            let Kind::Closure(parent, _, at) = *self.cx.types.kind(vtable.ty) else { continue };
-            if parent != self.item {
-                continue;
-            }
-            let Kind::Dyn(of, ..) = *self.cx.types.kind(vtable.object) else { continue };
-            let Some(&eff) = self.closure_effects.get(&ExprId(at)) else { continue };
-            let lang = self.cx.lang(of);
-            self.check_closure_effects(eff, lang == Some("fn"), lang == Some("fn_mut"), false)?;
-        }
-        Ok(())
     }
 
     pub(super) fn has_new_moves(before_moved: &[bool], before_partial: &[PartialMove], after: &State, locals: &[u32]) -> bool {

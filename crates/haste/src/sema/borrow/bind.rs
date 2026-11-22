@@ -30,13 +30,15 @@ impl Checker<'_, '_> {
         if ty != Ty::NONE && !self.ty_holds_borrow(ty) {
             return;
         }
-        for s in sources {
-            if s.target == local {
-                continue;
-            }
-            let mutable = s.mutable && (!s.through_ref || !self.is_shared_ref_or_ptr(self.local_ty(s.target)));
-            push_loan(&mut state.loans, s.target, s.steps.clone(), Some(local), mutable, s.through_ref, false, s.env_only);
-        }
+        let is_shared_target = |target: u32| self.is_shared_ref_or_ptr(self.local_ty(target));
+        push_source_loans_filtered(
+            &mut state.loans,
+            Some(local),
+            sources,
+            false,
+            |s| s.target != local,
+            |s| s.mutable && (!s.through_ref || !is_shared_target(s.target)),
+        );
     }
 
     pub(super) fn bind_pat_param(&mut self, pat: PatId, state: &mut State) -> Result<()> {
@@ -297,18 +299,21 @@ impl Checker<'_, '_> {
                 self.push_sources_for_local(local, &sources, state);
             } else if !fallback_sources.is_empty() {
                 if behind_ref && self.is_copy[local as usize] {
-                    let inner: Vec<BorrowSource> = fallback_sources
+                    let mut inner: Vec<BorrowSource> = fallback_sources
                         .iter()
                         .flat_map(|s| {
-                            state.loans.iter().filter(move |l| l.holder == Some(s.target)).map(|l| BorrowSource {
-                                target: l.target,
-                                steps: l.steps.clone(),
-                                mutable: l.mutable,
-                                through_ref: l.through_ref,
-                                env_only: l.env_only,
-                            })
+                            state.loans.iter().filter(move |l| l.holder == Some(s.target)).map(BorrowSource::from_loan)
                         })
                         .collect();
+                    if inner.is_empty() && self.ty_holds_borrow(self.local_ty(local)) {
+                        for s in fallback_sources {
+                            if self.is_closure_param(s.target) && self.is_ref_ty(self.local_ty(s.target)) {
+                                let mut steps = s.steps.clone();
+                                push_step(&mut steps, PlaceStep::Deref);
+                                inner.push(BorrowSource { steps, ..s.clone() });
+                            }
+                        }
+                    }
                     if !inner.is_empty() {
                         self.push_sources_for_local(local, &inner, state);
                     }
@@ -448,8 +453,21 @@ pub(super) fn push_loan(loans: &mut Vec<Loan>, target: u32, steps: Vec<PlaceStep
 }
 
 pub(super) fn push_source_loans(loans: &mut Vec<Loan>, holder: Option<u32>, sources: &[BorrowSource]) {
+    push_source_loans_filtered(loans, holder, sources, false, |_| true, |s| s.mutable);
+}
+
+pub(super) fn push_source_loans_filtered(
+    loans: &mut Vec<Loan>,
+    holder: Option<u32>,
+    sources: &[BorrowSource],
+    two_phase: bool,
+    mut include: impl FnMut(&BorrowSource) -> bool,
+    mut mutable_of: impl FnMut(&BorrowSource) -> bool,
+) {
     for s in sources {
-        push_loan(loans, s.target, s.steps.clone(), holder, s.mutable, s.through_ref, false, s.env_only);
+        if include(s) {
+            push_loan(loans, s.target, s.steps.clone(), holder, mutable_of(s), s.through_ref, two_phase, s.env_only);
+        }
     }
 }
 
