@@ -18,7 +18,7 @@ use crate::sema::substs::{ProjDef, Substs};
 use crate::sema::summary::codec::{Cursor, FileIndex, ItemRecord, read_mut, write_u16, write_u32, write_u32s, write_u64, write_u128};
 use crate::sema::ty::{Kind, Mut, Ty, Types};
 
-const PLAN_MAGIC: [u8; 4] = *b"HRP1";
+const PLAN_MAGIC: [u8; 4] = *b"HRP2";
 
 const PRIMS: [Primitive; 19] = [
     Primitive::Bool, Primitive::Char, Primitive::Str, Primitive::I8, Primitive::I16, Primitive::I32, Primitive::I64, Primitive::I128, Primitive::Isize,
@@ -138,9 +138,17 @@ pub fn decode_reloc_plan(
         let mut relocs = Vec::with_capacity(reloc_count);
         for _ in 0..reloc_count {
             let offset = cur.u32()?;
-            let target_idx = cur.u32()? as usize;
-            let target_id = *rodatas.get(target_idx).context("rodata reloc out of bounds")?;
-            relocs.push(RodataReloc { offset, target: RodataTarget::Rodata(target_id) });
+            let target = match cur.u8()? {
+                0 => RodataTarget::Rodata(*rodatas.get(cur.u32()? as usize).context("rodata reloc out of bounds")?),
+                1 => {
+                    let item = *items.get(cur.u32()? as usize).context("rodata fn item out of bounds")?;
+                    let substs = read_substs(&mut cur, types, &tys)?;
+                    let Some(idx) = resolve_reached(reached, (item, substs)) else { return Ok(None) };
+                    RodataTarget::Fn(idx)
+                }
+                _ => bail!("invalid rodata reloc tag"),
+            };
+            relocs.push(RodataReloc { offset, target });
         }
         rodatas.push(slots.rodata(data, &relocs));
     }
@@ -177,9 +185,14 @@ pub fn decode_reloc_plan(
     Ok(Some(plan))
 }
 
+enum EncRodataTarget {
+    Rodata(u32),
+    Fn(u32, Vec<u32>),
+}
+
 struct EncRodata {
     bytes: Vec<u8>,
-    relocs: Vec<(u32, u32)>,
+    relocs: Vec<(u32, EncRodataTarget)>,
 }
 
 enum EncVtableEntry {
@@ -218,9 +231,12 @@ where
             write_u32(&mut out, u32::try_from(entry.bytes.len()).ok()?);
             out.extend_from_slice(&entry.bytes);
             write_u32(&mut out, u32::try_from(entry.relocs.len()).ok()?);
-            for &(offset, target) in &entry.relocs {
-                write_u32(&mut out, offset);
-                write_u32(&mut out, target);
+            for (offset, target) in &entry.relocs {
+                write_u32(&mut out, *offset);
+                match target {
+                    EncRodataTarget::Rodata(id) => { out.push(0); write_u32(&mut out, *id); }
+                    EncRodataTarget::Fn(item, substs) => { out.push(1); write_u32(&mut out, *item); write_u32s(&mut out, substs); }
+                }
             }
         }
         Some(out)
@@ -322,11 +338,17 @@ where
         let (bytes, relocs) = (self.rodata_of)(id)?;
         let mut enc_relocs = Vec::with_capacity(relocs.len());
         for reloc in relocs {
-            let RodataTarget::Rodata(child) = reloc.target;
-            if child == id {
-                return None;
-            }
-            enc_relocs.push((reloc.offset, self.rodata_id(child)?));
+            let target = match reloc.target {
+                RodataTarget::Rodata(child) => {
+                    if child == id { return None; }
+                    EncRodataTarget::Rodata(self.rodata_id(child)?)
+                }
+                RodataTarget::Fn(fn_idx) => {
+                    let (item, substs) = self.reached_ref(fn_idx)?;
+                    EncRodataTarget::Fn(item, substs)
+                }
+            };
+            enc_relocs.push((reloc.offset, target));
         }
         let idx = u32::try_from(self.rodatas.len()).ok()?;
         self.rodatas.push(EncRodata { bytes, relocs: enc_relocs });

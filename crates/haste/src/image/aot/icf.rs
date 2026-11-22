@@ -174,8 +174,23 @@ pub(super) fn fold_functions(state: &AotState, live_fns: &[bool], pre: &PreSyms<
     Ok(canon)
 }
 
-type RodataKey<'a> = (&'a [u8], Vec<(u32, u32)>);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RodataRef {
+    Rodata(u32),
+    Fn(usize),
+}
+
+type RodataKey<'a> = (&'a [u8], Vec<(u32, RodataRef)>);
 type VtablePlacement = (Vec<Option<u32>>, Vec<(u32, usize)>);
+
+fn emit_rodata_relocs(base: u32, resolved: &[(u32, RodataRef)], exe: &mut Executable, fn_relocs: &mut Vec<(u32, usize)>) {
+    for &(reloc_off, target) in resolved {
+        match target {
+            RodataRef::Rodata(child_off) => exe.pointer(true, base + reloc_off, Symbol::Rodata(child_off)),
+            RodataRef::Fn(fn_idx) => fn_relocs.push((base + reloc_off, fn_idx)),
+        }
+    }
+}
 
 fn place_rodata_node<'a>(
     id: usize,
@@ -183,6 +198,7 @@ fn place_rodata_node<'a>(
     rodata_offs: &mut [Option<u32>],
     visiting: &mut [bool],
     seen: &mut HashMap<RodataKey<'a>, u32>,
+    fn_relocs: &mut Vec<(u32, usize)>,
     exe: &mut Executable,
 ) -> Result<u32> {
     if let Some(off) = rodata_offs[id] {
@@ -197,24 +213,22 @@ fn place_rodata_node<'a>(
     visiting[id] = true;
     let mut resolved = Vec::with_capacity(entry.1.len());
     for reloc in &entry.1 {
-        let RodataTarget::Rodata(target) = reloc.target;
-        let child_off = place_rodata_node(target.0 as usize, state, rodata_offs, visiting, seen, exe)?;
-        resolved.push((reloc.offset, child_off));
+        let target = match reloc.target {
+            RodataTarget::Rodata(child) => RodataRef::Rodata(place_rodata_node(child.0 as usize, state, rodata_offs, visiting, seen, fn_relocs, exe)?),
+            RodataTarget::Fn(fn_idx) => RodataRef::Fn(fn_idx),
+        };
+        resolved.push((reloc.offset, target));
     }
     visiting[id] = false;
     if let Some(off) = rodata_offs[id] {
-        for &(reloc_off, child_off) in &resolved {
-            exe.pointer(true, off + reloc_off, Symbol::Rodata(child_off));
-        }
+        emit_rodata_relocs(off, &resolved, exe, fn_relocs);
         return Ok(off);
     }
     let off = if let Some(&existing) = seen.get(&(entry.0.as_slice(), resolved.clone())) {
         existing
     } else {
         let fresh = exe.rodata(&entry.0, 16);
-        for &(reloc_off, child_off) in &resolved {
-            exe.pointer(true, fresh + reloc_off, Symbol::Rodata(child_off));
-        }
+        emit_rodata_relocs(fresh, &resolved, exe, fn_relocs);
         seen.insert((entry.0.as_slice(), resolved), fresh);
         fresh
     };
@@ -222,14 +236,15 @@ fn place_rodata_node<'a>(
     Ok(off)
 }
 
-pub(super) fn emit_rodata(state: &AotState, live: &AotReach, exe: &mut Executable) -> Result<Vec<Option<u32>>> {
+pub(super) fn emit_rodata(state: &AotState, live: &AotReach, exe: &mut Executable) -> Result<(Vec<Option<u32>>, Vec<(u32, usize)>)> {
     let mut rodata_offs = vec![None; state.rodata.len()];
     let mut visiting = vec![false; state.rodata.len()];
     let mut seen: HashMap<RodataKey<'_>, u32> = HashMap::default();
+    let mut fn_relocs = Vec::new();
     for &id in &live.rodata_order {
-        place_rodata_node(id, state, &mut rodata_offs, &mut visiting, &mut seen, exe)?;
+        place_rodata_node(id, state, &mut rodata_offs, &mut visiting, &mut seen, &mut fn_relocs, exe)?;
     }
-    Ok(rodata_offs)
+    Ok((rodata_offs, fn_relocs))
 }
 
 pub(super) fn alloc_slots(

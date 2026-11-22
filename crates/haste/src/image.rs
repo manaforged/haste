@@ -226,6 +226,13 @@ impl Image {
         let index = self.file_index.get_or_init(|| crate::sema::summary::codec::FileIndex::build(outline));
         crate::substrate::relocs::decode_reloc_plan(outline, types, reached, self, index, is_sysroot, bytes).ok().flatten()
     }
+
+    pub(super) fn register_code_fixup(&self, index: usize, at: usize) {
+        let mut fixups = lock(&self.fixups);
+        fixups.entry(index).or_default().push(at);
+        self.registered.fetch_add(1, Ordering::SeqCst);
+        patch(&[at], self.slot(index).load(Ordering::SeqCst));
+    }
 }
 
 impl Slots for Image {
@@ -260,13 +267,9 @@ impl Slots for Image {
         };
         let bytes: Vec<u8> = words.iter().flat_map(|word| value(word).to_le_bytes()).collect();
         let address = self.data(&bytes);
-        let mut fixups = lock(&self.fixups);
         for (at, word) in words.iter().enumerate() {
             if let Word::Code(index) = *word {
-                let at = address as usize + at * 8;
-                fixups.entry(index).or_default().push(at);
-                self.registered.fetch_add(1, Ordering::SeqCst);
-                patch(&[at], self.slot(index).load(Ordering::SeqCst));
+                self.register_code_fixup(index, address as usize + at * 8);
             }
         }
         tables.insert(words.to_vec(), address);

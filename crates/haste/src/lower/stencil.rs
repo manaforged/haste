@@ -39,6 +39,7 @@ pub struct VtableId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RodataTarget {
     Rodata(RodataId),
+    Fn(usize),
 }
 
 /// One 8-byte pointer relocation inside a read-only data blob.

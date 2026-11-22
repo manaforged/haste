@@ -25,6 +25,7 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
                 Some(Val::wide(target, len))
             }
             Coercion::Deref(steps, _) => self.apply_deref_coercion(steps, val),
+            Coercion::Reify(Res::Fn(item, substs)) => Some(Val::ptr(PtrTarget::Fn(self.lower.rodata_fn_target(*item, *substs)?))),
             _ => None,
         }
     }
@@ -104,6 +105,7 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
                     self.read_place(&PlaceRef { target: PtrTarget::Obj { id, addend: 0 }, ty, slice_len: None })
                 }
                 ItemKind::Const => self.eval_const_item_val(item, substs, ty),
+                ItemKind::Fn if matches!(*self.lower.cx.types.kind(ty), Kind::FnDef(..)) => Some(Val::zst()),
                 _ => None,
             },
         }
@@ -194,6 +196,9 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
         let src_ty = scope.typed.expr_ty(&self.lower.cx.types, inner);
         if self.lower.cx.is_unsized(dst_ty).ok()? {
             return None;
+        }
+        if let (Kind::FnDef(item, substs), Kind::FnPtr(..)) = (self.lower.cx.types.kind(src_ty).clone(), self.lower.cx.types.kind(dst_ty).clone()) {
+            return Some(Val::ptr(PtrTarget::Fn(self.lower.rodata_fn_target(item, substs)?)));
         }
         let (Kind::Prim(src_prim), Kind::Prim(dst_prim)) = (self.lower.cx.types.kind(src_ty).clone(), self.lower.cx.types.kind(dst_ty).clone()) else {
             return None;

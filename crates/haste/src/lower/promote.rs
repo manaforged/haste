@@ -337,10 +337,24 @@ impl Lower<'_, '_> {
         self.materialize_blob(expr, ty, blob)
     }
 
+    /// Resolves a function item to a reached index when safe to embed as a constant rodata relocation.
+    pub(super) fn rodata_fn_target(&mut self, item: ItemRef, substs: Substs) -> Option<usize> {
+        let enclosing_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
+        if (enclosing_generic && !self.cx.types.substs(substs).is_empty())
+            || self.cx.types.substs_have_params(substs)
+            || self.cx.intrinsic(item).is_some()
+        {
+            return None;
+        }
+        self.reached_index(item, substs).ok()
+    }
+
     fn materialize_mem_blob(&mut self, expr: ExprId, ty: Ty, bytes: &[u8], relocs: &[RodataReloc]) -> Result<Option<Value>> {
-        if bytes.len() == 16 && matches!(relocs, [RodataReloc { offset: 0, .. }]) && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) {
-            let RodataTarget::Rodata(child_id) = relocs[0].target;
-            let data = self.emit_child_rodata(child_id);
+        if bytes.len() == 16
+            && let [RodataReloc { offset: 0, target: RodataTarget::Rodata(child_id) }] = relocs
+            && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _))
+        {
+            let data = self.emit_child_rodata(*child_id);
             let len = u64::from_le_bytes(bytes[8..].try_into()?);
             return Ok(Some(self.wide_pointer(data, len as i64)));
         }

@@ -233,6 +233,7 @@ pub(crate) struct AotState {
     pub(super) stencils: HashMap<(ItemRef, FootprintId), CachedAotTemplate>,
     pub(super) frontier: Option<Arc<AotQueue>>,
     frontier_vtables: Vec<bool>,
+    frontier_rodata: Vec<bool>,
 }
 
 impl AotState {
@@ -242,7 +243,7 @@ impl AotState {
             vtables: Vec::new(), vtable_buckets: HashMap::default(),
             statics: HashMap::default(), promoted: Vec::new(), promoted_seen: HashMap::default(),
             foreign_fns: HashMap::default(), functions: vec![None; len],
-            stencils: HashMap::default(), frontier: None, frontier_vtables: Vec::new(),
+            stencils: HashMap::default(), frontier: None, frontier_vtables: Vec::new(), frontier_rodata: Vec::new(),
         })
     }
 
@@ -309,24 +310,33 @@ impl AotState {
         }
     }
 
+    fn collect_rodata_targets(&mut self, mut rstack: Vec<usize>, queue: &AotQueue, out: &mut Vec<usize>) {
+        while let Some(id) = rstack.pop() {
+            if id >= self.frontier_rodata.len() { self.frontier_rodata.resize(id + 1, false); }
+            if std::mem::replace(&mut self.frontier_rodata[id], true) { continue; }
+            for reloc in self.rodata.get(id).into_iter().flat_map(|(_, r)| r) {
+                match reloc.target {
+                    RodataTarget::Rodata(child) => rstack.push(child.0 as usize),
+                    RodataTarget::Fn(fn_idx) if queue.claim(fn_idx) => out.push(fn_idx),
+                    RodataTarget::Fn(_) => {}
+                }
+            }
+        }
+    }
+
     fn collect_new_targets(&mut self, entry: &AotFn, queue: &AotQueue) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut vstack = Vec::new();
+        let (mut out, mut vstack, mut rstack) = (Vec::new(), Vec::new(), Vec::new());
         for_each_fn_edge(entry, |edge| match edge {
             FnEdge::Sym(SymbolSource::Slot(idx) | SymbolSource::StaticCell { index: idx, .. }, _) => {
-                if queue.claim(*idx) {
-                    out.push(*idx);
-                }
+                if queue.claim(*idx) { out.push(*idx); }
             }
             FnEdge::Sym(SymbolSource::Vtable(id), _) => vstack.push(id.0 as usize),
+            FnEdge::Sym(SymbolSource::Rodata(id), _) => rstack.push(id.0 as usize),
             FnEdge::Sym(_, _) => {}
-            FnEdge::Alias(leader) => {
-                if queue.claim(leader) {
-                    out.push(leader);
-                }
-            }
+            FnEdge::Alias(leader) => { if queue.claim(leader) { out.push(leader); } }
         });
         self.collect_vtable_targets(vstack, queue, &mut out);
+        self.collect_rodata_targets(rstack, queue, &mut out);
         out
     }
 }
@@ -491,8 +501,10 @@ impl AotReach {
     fn drain_rodata_vtables(&mut self, state: &AotState, vmask: &vdce::VtableMask) {
         while let Some(id) = self.work_rodata.pop() {
             for reloc in state.rodata.get(id).into_iter().flat_map(|(_, r)| r) {
-                let RodataTarget::Rodata(target) = reloc.target;
-                mark_id(&mut self.rodata, &mut self.rodata_order, &mut self.work_rodata, target.0 as usize);
+                match reloc.target {
+                    RodataTarget::Rodata(target) => mark_id(&mut self.rodata, &mut self.rodata_order, &mut self.work_rodata, target.0 as usize),
+                    RodataTarget::Fn(fn_idx) => self.mark_fn(fn_idx),
+                }
             }
         }
         while let Some(id) = self.work_vtables.pop() {
@@ -734,7 +746,7 @@ impl Image {
         let mut exe = Executable::new(target);
         let thread_slots: HashMap<usize, u64> = live.thread_slots.list.iter().enumerate().map(|(rank, &index)| (index, (rank + 1) as u64)).collect();
         exe.thread_slots = live.thread_slots.list.len() as u32 + 1;
-        let rodata_offs = icf::emit_rodata(&state, &live, &mut exe)?;
+        let (rodata_offs, rodata_fns) = icf::emit_rodata(&state, &live, &mut exe)?;
         let (static_syms, promoted_syms) = emit_static_syms(&state, &live, &mut exe);
         let pre = icf::PreSyms { rodata_offs: &rodata_offs, static_syms: &static_syms, promoted_syms: &promoted_syms, thread_slots: &thread_slots };
         let roots = icf::alias_roots(&state.functions);
@@ -749,7 +761,7 @@ impl Image {
         let fn_offs = emit_functions(&state, &live, (target, debug_info), (&syms, &dict_bodies), (&roots, &canon), &mut exe)?;
         icf::emit_unwind_table(&state, &live, (&roots, &canon), &fn_offs, &mut exe);
         patch_vtables(&state, &vmask, (&vtable_offs, &fn_offs), &unique_vtables, &mut exe)?;
-        for (slot_off, target_idx) in unique_slots {
+        for (slot_off, target_idx) in unique_slots.into_iter().chain(rodata_fns) {
             exe.pointer(true, slot_off, slot_target(&fn_offs, &state.foreign_fns, target_idx));
         }
         let Some(start_off) = fn_offs.get(lang_start).copied().flatten() else {

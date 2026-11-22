@@ -594,10 +594,10 @@ fn pure_value<R: Copy + PartialEq>(value: Value, plan: &Plan<R>, frame: &Frame<R
         return true;
     }
     match plan.location(value) {
-        Location::Imm(_) => true,
+        Location::Imm(_) | Location::Symbol(_) => true,
         Location::Reg(r) => !frame.saves.contains(&r) && !clobbers.contains(&r),
         Location::Float(f) => !frame.float_saves.contains(&f),
-        Location::Slot | Location::SlotAddr(_) | Location::Symbol(_) | Location::Frame(..) => false,
+        Location::Slot | Location::SlotAddr(_) | Location::Frame(..) => false,
     }
 }
 
@@ -608,16 +608,10 @@ fn pure_op(op: &Op) -> bool {
             | Op::StackLoad(..)
             | Op::StackStore(..)
             | Op::FramePointer
-            | Op::Store(..)
             | Op::Call { .. }
             | Op::TryCall { .. }
             | Op::Copy(..)
             | Op::Move(..)
-            | Op::AtomicLoad(..)
-            | Op::AtomicStore(..)
-            | Op::AtomicRmw(..)
-            | Op::AtomicCas(..)
-            | Op::Fence(..)
             | Op::Trap
             | Op::Trapz(..)
     )

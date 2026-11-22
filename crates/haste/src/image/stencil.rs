@@ -245,6 +245,7 @@ impl Image {
                 // SAFETY: at..at + 8 lies within the freshly allocated rodata blob in shared memory.
                 unsafe { (at as *mut u64).write_unaligned(ptr) };
             }
+            RodataTarget::Fn(index) => self.register_code_fixup(index, at),
         }
     }
 
