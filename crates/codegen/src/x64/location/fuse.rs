@@ -157,23 +157,22 @@ fn push_branch_tst(
     (b_idx, pos, cond_val): (usize, usize, Value),
     out: &mut Vec<(usize, Value, Option<Value>)>,
 ) {
-    if uses[cond_val.index()] != 1 || plan.elided[cond_val.index()] {
-        return;
-    }
+    if uses[cond_val.index()] != 1 || plan.elided[cond_val.index()] { return; }
     let Some((cb, cpos, cinst)) = pos_of[cond_val.index()] else { return };
-    if cb != b_idx || cpos >= pos {
-        return;
-    }
+    if cb != b_idx || cpos >= pos { return; }
     match func.insts[cinst.index()].op {
         Op::Binary(Binary::Band, x, y) if band_ok(func, plan, b_idx, (cpos, pos, &[]), (x, y)) => out.push((pos, cond_val, None)),
-        Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
+        Op::Convert(Convert::Ireduce, m)
+            if uses[m.index()] == 1 && !plan.elided[m.index()]
+                && let Some((mb, mpos, minst)) = pos_of[m.index()]
+                && mb == b_idx && mpos < cpos
+                && let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op
+                && narrows_exactly(func, plan, &|v| pos_of[v.index()].map(|(_, _, i)| i), m, func.ty(cond_val))
+                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y)) => out.push((pos, cond_val, Some(m))),
+        Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs)
             if let Some((m, mpos, x, y)) = zero_cmp_band(func, plan, uses, pos_of, b_idx, lhs, rhs)
                 && mpos < cpos
-                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y))
-            {
-                out.push((pos, cond_val, Some(m)));
-            }
-        }
+                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y)) => out.push((pos, cond_val, Some(m))),
         _ => {}
     }
 }

@@ -404,6 +404,14 @@ impl Emit<'_> {
                     self.emit_test_band(x, y);
                     return Cond::Ne;
                 }
+                Op::Convert(crate::ir::Convert::Ireduce, inner) if self.plan.elided[inner.index()] => {
+                    if let Some(iinst) = self.defs[inner.index()]
+                        && let Op::Binary(Binary::Band, x, y) = self.func.insts[iinst.index()].op
+                    {
+                        self.emit_test_band(x, y);
+                        return Cond::Ne;
+                    }
+                }
                 Op::Icmp(cc, lhs, rhs) => return self.cmp_flags(cc, lhs, rhs, None),
                 _ => {}
             }

@@ -170,7 +170,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn static_rodata_blob(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
-        if self.is_mutable_static(item) || !super::is_freeze_ty(self.cx, ty, 0) {
+        if self.is_mutable_static(item) || self.cx.thread_local(item) || !super::is_freeze_ty(self.cx, ty, 0) {
             return Ok(None);
         }
         self.static_literal(item, substs, ty)
@@ -182,7 +182,7 @@ impl Lower<'_, '_> {
     }
 
     fn static_literal(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
-        if self.cx.foreign(item) || self.cx.thread_local(item) {
+        if self.cx.foreign(item) {
             return Ok(None);
         }
         if self.cx.layout(ty)?.align.bytes() > 16 {

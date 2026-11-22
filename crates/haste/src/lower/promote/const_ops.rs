@@ -197,15 +197,20 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
         if self.lower.cx.is_unsized(dst_ty).ok()? {
             return None;
         }
-        if let (Kind::FnDef(item, substs), Kind::FnPtr(..)) = (self.lower.cx.types.kind(src_ty).clone(), self.lower.cx.types.kind(dst_ty).clone()) {
-            return Some(Val::ptr(PtrTarget::Fn(self.lower.rodata_fn_target(item, substs)?)));
+        let (src_kind, dst_kind) = (self.lower.cx.types.kind(src_ty).clone(), self.lower.cx.types.kind(dst_ty).clone());
+        match (src_kind, dst_kind) {
+            (Kind::FnDef(item, substs), Kind::FnPtr(..)) => Some(Val::ptr(PtrTarget::Fn(self.lower.rodata_fn_target(item, substs)?))),
+            (Kind::Prim(_), Kind::Ptr(_, _)) => Some(Val::scalar(8, self.eval_expr_val(scope, inner, frame)?.as_u128()?)),
+            (Kind::Ptr(_, _) | Kind::Ref(_, _), Kind::Ptr(_, _)) if !self.lower.cx.is_unsized(src_ty).ok()? => {
+                self.eval_expr_val(scope, inner, frame)
+            }
+            (Kind::Prim(src_prim), Kind::Prim(dst_prim)) => {
+                let src_val = self.eval_expr_val(scope, inner, frame)?.as_u128()?;
+                let out = cast_scalar(src_val, src_prim, dst_prim)?;
+                Some(Val::scalar(self.ty_size(dst_ty)?, out))
+            }
+            _ => None,
         }
-        let (Kind::Prim(src_prim), Kind::Prim(dst_prim)) = (self.lower.cx.types.kind(src_ty).clone(), self.lower.cx.types.kind(dst_ty).clone()) else {
-            return None;
-        };
-        let src_val = self.eval_expr_val(scope, inner, frame)?.as_u128()?;
-        let out = cast_scalar(src_val, src_prim, dst_prim)?;
-        Some(Val::scalar(self.ty_size(dst_ty)?, out))
     }
 
     /// Evaluates simple assignment `lhs = rhs`.
