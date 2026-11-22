@@ -323,6 +323,12 @@ impl Emit<'_> {
         }
     }
 
+    /// Loads `sym` into `reg` relative to `rip`.
+    pub(super) fn emit_rip_symbol(&mut self, reg: Reg, sym: u32) {
+        let at = self.asm.lea_rip_reloc(reg);
+        self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::X64RipRel32));
+    }
+
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
         if let Some(mem) = self.elided_mem(value) {
             self.asm.load(Size::of(self.ty(value).bytes()), reg, mem);
@@ -331,14 +337,12 @@ impl Emit<'_> {
         }
         match self.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
-            Location::SlotAddr(sym) if self.direct_calls => {
-                let at = self.asm.lea_rip_reloc(reg);
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::X64RipRel32));
-            }
+            Location::SlotAddr(sym) if self.direct_calls => self.emit_rip_symbol(reg, sym),
             Location::SlotAddr(sym) => {
                 let at = self.asm.mov_slot_reloc(reg);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
+            Location::Symbol(sym) if self.direct_calls && self.func.is_image_addr(value) => self.emit_rip_symbol(reg, sym),
             Location::Symbol(sym) => {
                 let at = self.asm.mov_abs64(reg);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs64));

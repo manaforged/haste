@@ -1,6 +1,7 @@
 use super::Emit;
-use super::asm::{Alu, Cond, Reg, Rm, Shift, Size};
-use crate::ir::{Binary, Type};
+use super::asm::{Alu, Cond, Group3, Reg, Rm, Shift, Size};
+use crate::frame::Ext;
+use crate::ir::{Binary, Type, Value};
 
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
@@ -88,5 +89,97 @@ impl Emit<'_> {
         self.asm.alu(Alu::Cmp, reg, Reg::Rcx);
         self.asm.cmov(Cond::G, reg, Reg::Rcx);
         self.clobber_regs(&[reg, Reg::Rcx]);
+    }
+
+    /// Divides or takes the remainder by a power of two into `dst` with a shift or a mask, when `op` is unsigned and `y` is one.
+    pub(super) fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
+        let ty = self.ty(y);
+        let Some(divisor) = self.const_of(y).map(|imm| crate::fold::extend(imm, ty, false) as u64).filter(|d| d.is_power_of_two()) else {
+            return false;
+        };
+        match op {
+            Binary::Udiv => {
+                self.get(dst, x, Ext::Zero);
+                let shift = divisor.trailing_zeros() as u8;
+                if shift != 0 {
+                    self.asm.shift_imm(Size::Q, Shift::Shr, dst, shift);
+                }
+            }
+            Binary::Urem => {
+                let Ok(mask) = i32::try_from(divisor - 1) else { return false };
+                self.raw(dst, x);
+                self.asm.alu_imm(Alu::And, dst, mask);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Divides `x` by `y` at 32-bit width for sub-64-bit operands and 64-bit otherwise, returning `Rdx` for remainders and `Rax` for quotients.
+    pub(super) fn divide(&mut self, op: Binary, x: Value, y: Value) -> Reg {
+        let ty = self.ty(x);
+        let signed = matches!(op, Binary::Sdiv | Binary::Srem);
+        let ext = Ext::of(signed);
+        let narrow = ty.bytes() <= 4;
+        self.get(Reg::Rax, x, ext);
+        let divisor = self
+            .reg_of(y)
+            .filter(|&r| !matches!(r, Reg::Rax | Reg::Rdx | Reg::Rsp) && (ty.bytes() >= 4 || (!signed && self.plan.zero_ext[y.index()])))
+            .unwrap_or_else(|| {
+                self.get(Reg::Rcx, y, ext);
+                Reg::Rcx
+            });
+        self.asm.flags_overwritten();
+        if signed {
+            if narrow {
+                self.asm.bytes(&[0x99]);
+                self.asm.group3_sized(Size::D, Group3::Idiv, divisor);
+            } else {
+                self.asm.cqo();
+                self.asm.group3(Group3::Idiv, divisor);
+            }
+        } else {
+            self.asm.alu32(Alu::Xor, Reg::Rdx, Reg::Rdx);
+            if narrow {
+                self.asm.group3_sized(Size::D, Group3::Div, divisor);
+            } else {
+                self.asm.group3(Group3::Div, divisor);
+            }
+        }
+        self.clobber_regs(&[Reg::Rax, Reg::Rdx]);
+        if matches!(op, Binary::Srem | Binary::Urem) { Reg::Rdx } else { Reg::Rax }
+    }
+
+    /// Divides the 128-bit value `high:low` by `by` with one `div`, putting the quotient, or the remainder when `rem` is set, in `result`.
+    pub(super) fn divide_wide(&mut self, rem: bool, [high, low, by]: [Value; 3], result: Value) {
+        self.get(Reg::Rdx, high, Ext::Zero);
+        self.get(Reg::Rax, low, Ext::Zero);
+        self.get(Reg::Rcx, by, Ext::Zero);
+        self.asm.group3(Group3::Div, Reg::Rcx);
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
+        self.flags = None;
+        self.put(result, if rem { Reg::Rdx } else { Reg::Rax });
+    }
+
+    /// Computes the high half of `x * y` and returns its register; a 64-bit product leaves its low half in rax for the `Imul` that follows.
+    pub(super) fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) -> Reg {
+        let ext = Ext::of(signed);
+        self.get(Reg::Rax, x, ext);
+        if bits == 64 {
+            let source = self.reg_of(y).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)).unwrap_or_else(|| {
+                self.get(Reg::Rcx, y, ext);
+                Reg::Rcx
+            });
+            self.clobber_reg(Reg::Rax);
+            self.asm.group3(if signed { Group3::Imul } else { Group3::Mul }, source);
+            self.clobber_reg(Reg::Rdx);
+            self.low_product = Some((x, y));
+            return Reg::Rdx;
+        }
+        self.get(Reg::Rcx, y, ext);
+        self.clobber_reg(Reg::Rax);
+        self.asm.imul(Reg::Rax, Reg::Rcx);
+        self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
+        Reg::Rax
     }
 }

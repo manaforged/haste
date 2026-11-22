@@ -23,7 +23,7 @@ fn emit_zero_interval<'a, E: Emitter<'a>>(emit: &mut E, start: i32, stop: i32) {
         1 | 2 | 4 | 8 => emit.emit_zero_frame(cur, rem as u32),
         3 => {
             emit.emit_zero_frame(cur, 2);
-            emit.emit_zero_frame(cur + 1, 2);
+            emit.emit_zero_frame(cur + 2, 1);
         }
         5..=7 => {
             emit.emit_zero_frame(cur, 4);

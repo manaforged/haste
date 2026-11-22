@@ -138,8 +138,7 @@ impl Emit<'_> {
                 if !self.is_static(result) {
                     let dst = self.dst(result);
                     if self.direct_calls {
-                        let at = self.asm.lea_rip_reloc(dst);
-                        self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::X64RipRel32));
+                        self.emit_rip_symbol(dst, *sym);
                     } else {
                         let at = self.asm.mov_slot_reloc(dst);
                         self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs32));
@@ -151,8 +150,12 @@ impl Emit<'_> {
                 let result = result()?;
                 if !self.is_static(result) && self.plan.through[result.index()].is_none() {
                     let dst = self.dst(result);
-                    let at = self.asm.mov_abs64(dst);
-                    self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs64));
+                    if self.direct_calls && self.func.is_image_addr(result) {
+                        self.emit_rip_symbol(dst, *sym);
+                    } else {
+                        let at = self.asm.mov_abs64(dst);
+                        self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs64));
+                    }
                     self.put(result, dst);
                 }
             }
@@ -397,8 +400,18 @@ impl Emit<'_> {
                 _ => {}
             }
         }
+        if self.held_eq_zero(condition) {
+            return Cond::Ne;
+        }
         self.test_value(condition);
         Cond::Ne
+    }
+
+    fn held_eq_zero(&self, value: Value) -> bool {
+        let Some((a, b)) = self.asm.held_eq() else { return false };
+        let ty = self.ty(value);
+        let is_zero = |u: u32| self.const_of(Value(u)).is_some_and(|c| crate::fold::extend(c, ty, false) == 0);
+        (a == value.index() as u32 && is_zero(b)) || (b == value.index() as u32 && is_zero(a))
     }
 
     fn test_value(&mut self, value: Value) {
