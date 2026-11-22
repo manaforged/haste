@@ -69,13 +69,25 @@ impl Lower<'_, '_> {
                 constant && self.body.list(stmts).is_empty() && self.promotable_in(tail, constant)?
             }
             Expr::Array(list) | Expr::Tuple(list) => all(self, list)?,
-            Expr::Struct { fields, base: None, .. } => {
+            Expr::Repeat(val, _) => self.promotable_in(val, constant)?,
+            Expr::Range { from: start, to: end, .. } => {
+                start.map_or(Ok(true), |e| self.promotable_in(e, constant))?
+                    && end.map_or(Ok(true), |e| self.promotable_in(e, constant))?
+            }
+            Expr::Index(base, idx) => constant && self.promotable_in(base, constant)? && self.promotable_in(idx, constant)?,
+            Expr::If(cond, then, alt) => {
+                constant
+                    && self.promotable_in(cond, constant)?
+                    && self.promotable_in(then, constant)?
+                    && alt.map_or(Ok(true), |e| self.promotable_in(e, constant))?
+            }
+            Expr::Struct { fields, base, .. } => {
                 for &at in self.body.list(fields).to_vec().iter() {
                     if !self.promotable_in(self.body.fields[at as usize].value, constant)? {
                         return Ok(false);
                     }
                 }
-                true
+                base.map_or(Ok(true), |e| self.promotable_in(e, constant))?
             }
             _ => false,
         })
