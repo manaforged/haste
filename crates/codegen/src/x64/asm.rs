@@ -500,6 +500,7 @@ impl Asm {
     }
 
     pub fn shift_imm(&mut self, size: Size, op: Shift, reg: Reg, imm: u8) {
+        self.flags_overwritten();
         self.sized(false, size, (&[0xC0], &[0xC1]), op as u8, reg.into());
         self.code.push(imm);
     }

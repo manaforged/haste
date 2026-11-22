@@ -85,7 +85,29 @@ pub(super) fn shifted_bit_test(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value
     Some(Op::Icmp(cc, hit, y))
 }
 
-/// Normalizes integer compares against 0/1, signed-range boundaries, or single-bit known-zero masks into compares against zero.
+/// Rewrites `(x >> k) == 0` / `!= 0` (logical right shift by constant `k`) into a sign test or unsigned range compare against `1 << k`.
+fn shr_zero_compare(cx: &mut RewriteCx, ty: Type, cc: IntCC, shifted: Value, zero: Value) -> Option<Op> {
+    if !cx.single_use(shifted) {
+        return None;
+    }
+    let &Op::Binary(Binary::Ushr, inner, shift) = cx.op(shifted)? else { return None };
+    let k = cx.uconst(shift, ty)?;
+    let bits = u64::from(ty.bits());
+    if k == 0 || k >= bits {
+        return None;
+    }
+    let eq = cc == IntCC::Equal;
+    if k == bits - 1 {
+        return Some(Op::Icmp(if eq { IntCC::SignedGreaterThanOrEqual } else { IntCC::SignedLessThan }, inner, zero));
+    }
+    if k <= 23 {
+        let bound = cx.emit(ty, Op::Const((1_u64 << k) as i64));
+        return Some(Op::Icmp(if eq { IntCC::UnsignedLessThan } else { IntCC::UnsignedGreaterThanOrEqual }, inner, bound));
+    }
+    None
+}
+
+/// Normalizes integer compares against 0/1, signed-range boundaries, shifted-zero tests, or single-bit known-zero masks.
 pub(super) fn zero_compare(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     let ty = cx.func.ty(x);
     if !ty.is_small_int() {
@@ -94,7 +116,16 @@ pub(super) fn zero_compare(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) ->
     let umax = ty.unsigned_max();
     let smin = 1_u64 << (ty.bits() - 1);
     let smax = smin - 1;
-    let (val, new_cc, existing_zero) = match (cc, cx.uconst(x, ty), cx.uconst(y, ty)) {
+    let (cx_u, cy_u) = (cx.uconst(x, ty), cx.uconst(y, ty));
+    if matches!(cc, IntCC::Equal | IntCC::NotEqual) {
+        if cy_u == Some(0) && let Some(op) = shr_zero_compare(cx, ty, cc, x, y) {
+            return Some(op);
+        }
+        if cx_u == Some(0) && let Some(op) = shr_zero_compare(cx, ty, cc, y, x) {
+            return Some(op);
+        }
+    }
+    let (val, new_cc, existing_zero) = match (cc, cx_u, cy_u) {
         (IntCC::UnsignedLessThanOrEqual, _, Some(0)) => (x, IntCC::Equal, Some(y)),
         (IntCC::UnsignedGreaterThanOrEqual, Some(0), _) => (y, IntCC::Equal, Some(x)),
         (IntCC::UnsignedGreaterThan, _, Some(0)) => (x, IntCC::NotEqual, Some(y)),

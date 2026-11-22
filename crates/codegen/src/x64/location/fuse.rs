@@ -464,11 +464,12 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                         cand_alu.push((b_idx, pos, res, op, x, y));
                     }
                 }
-                Op::Binary(op @ (Binary::Band | Binary::Ushr), x, y) if !plan.elided[res.index()] && matches!(ty, Type::I32 | Type::I64) => {
-                    if features.bmi1 {
+                Op::Binary(op @ (Binary::Band | Binary::Ushr | Binary::Ishl | Binary::Sshr), x, y) if !plan.elided[res.index()] && matches!(ty, Type::I32 | Type::I64) => {
+                    if features.bmi1 && matches!(op, Binary::Band | Binary::Ushr) {
                         cand_bextr.push((b_idx, pos, res, op, x, y));
                     }
-                    if op == Binary::Band || features.bmi1 {
+                    let nz_shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr) && plan.const_of(y).is_some_and(|c| (c & i64::from(ty.bits() - 1)) != 0);
+                    if op == Binary::Band || nz_shift || (op == Binary::Ushr && features.bmi1) {
                         cand_alu.push((b_idx, pos, res, op, x, y));
                     }
                 }
@@ -648,7 +649,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         if op == Binary::Band && [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF))) {
             continue;
         }
-        if op == Binary::Ushr && bextr_parts(func, plan, func.ty(res), op, (x, y), |v| plan.elided[v.index()], def_inst).is_none() {
+        if op == Binary::Ushr && !plan.const_of(y).is_some_and(|c| (c & i64::from(func.ty(res).bits() - 1)) != 0) && bextr_parts(func, plan, func.ty(res), op, (x, y), |v| plan.elided[v.index()], def_inst).is_none() {
             continue;
         }
         let shrink_safe = matches!(plan.location(res), Location::Reg(r) if !SAVED.contains(&r) && !FRAME_REGS.contains(&r))

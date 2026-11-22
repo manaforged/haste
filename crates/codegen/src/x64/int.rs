@@ -461,6 +461,9 @@ impl Emit<'_> {
             load_x(self, dst, need_ext || (count == 0 && ty == Type::I32 && matches!(op, Binary::Ushr | Binary::Rotl | Binary::Rotr) && !self.plan.zero_ext[x.index()]));
             if count != 0 {
                 self.asm.shift_imm(size, shift, dst, count);
+                if matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr) && self.plan.fused[result.index()] {
+                    self.flags = Some((result, Cond::Ne));
+                }
             }
             return dst;
         }

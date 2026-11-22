@@ -315,7 +315,16 @@ fn find_nest(func: &Function, cfg: &Cfg, each: &Loop) -> Option<NestPlan> {
     let best = masks.iter().map(|m| m & !common).filter(|&s| s != 0).max_by_key(|&s| (covers(s), s.count_ones()))?;
     let inner: Vec<Block> = each.latches.iter().zip(&masks).filter(|(_, m)| *m & best == best).map(|(latch, _)| *latch).collect();
     let body = cfg::natural_loop(cfg, head, inner.clone()).body;
-    hoists_from(func, &body, params, best | common, best).then_some(NestPlan { head, inner, fixed: best | common })
+    (hoists_from(func, &body, params, best | common, best) || rotatable_inner(func, head, &inner, &body))
+        .then_some(NestPlan { head, inner, fixed: best | common })
+}
+
+fn rotatable_inner(func: &Function, head: Block, inner: &[Block], body: &[bool]) -> bool {
+    let Some((&last, head_body)) = func.blocks[head.index()].insts.split_last() else { return false };
+    let Op::Brif(_, t_blk, _, f_blk, _) = func.insts[last.index()].op else { return false };
+    let inside = |b: Block| body.get(b.index()).copied().unwrap_or(false);
+    let exiting = inner.iter().any(|&latch| matches!(func.last(latch), Some(&Op::Brif(_, t, _, f, _)) if inside(t) != inside(f)));
+    !exiting && inside(t_blk) != inside(f_blk) && head_body.len() <= 32 && head_body.iter().all(|&i| safe_head_inst(func, i))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
