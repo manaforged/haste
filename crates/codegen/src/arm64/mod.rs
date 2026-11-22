@@ -14,7 +14,7 @@ mod wide;
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
-use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
+use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, IntCC, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
@@ -100,7 +100,6 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    let slow_thunk = asm.label();
     let emit = Emit {
         func,
         frame,
@@ -124,11 +123,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         lse: target.os == Os::Darwin,
         sp_bias: 0,
         shrink,
-        slow_thunk,
         trap_label: None,
         lines: Vec::new(),
-        in_shrink_entry: false,
-        in_fast_ret: false,
+        in_fast: false,
         tails: Tails::new(),
     };
     drive(emit, &order)
@@ -185,11 +182,9 @@ pub(super) struct Emit<'a> {
     lse: bool,
     sp_bias: i32,
     shrink: Option<ShrinkWrap>,
-    slow_thunk: Label,
     trap_label: Option<Label>,
     lines: Vec<(u32, u64)>,
-    in_shrink_entry: bool,
-    in_fast_ret: bool,
+    in_fast: bool,
     tails: Tails<'a, Label>,
 }
 
@@ -241,31 +236,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.shrink.is_some()
     }
 
-    fn blocks_fallthrough_to(&self, block: Block) -> bool {
-        self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
-    }
-
-    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
+    fn before_block_bind(&mut self, _block: Block) -> Result<(), String> {
         self.asm.maybe_island()?;
-        if let Some(shrink) = self.shrink
-            && shrink.use_slow_thunk
-            && block == shrink.slow_entry
-        {
-            self.asm.bind(self.slow_thunk);
-            emit_slow_prologue(self, shrink.slow_entry)?;
-        }
         Ok(())
     }
 
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
-        self.in_shrink_entry = self.shrink.is_some() && self.func.entry == Some(block);
-        self.in_fast_ret = self.shrink.is_some_and(|s| s.fast_ret == block);
-        if let Some(shrink) = self.shrink
-            && !shrink.use_slow_thunk
-            && block == shrink.slow_entry
-        {
-            emit_slow_prologue(self, shrink.slow_entry)?;
-        }
+        self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]);
         Ok(())
     }
 
@@ -310,6 +287,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 res
             }
             Op::Jump(block, args) => {
+                if self.is_split_ret(*block) {
+                    self.edge(*block, args)?;
+                    return self.fast_ret(*block);
+                }
+                if self.exits_fast(*block) {
+                    self.prologue();
+                    self.in_fast = false;
+                }
                 self.edge(*block, args)?;
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
@@ -546,7 +531,7 @@ impl Emit<'_> {
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {
         let returns = self.abi.returns.clone();
         self.move_locs(values, &returns, None);
-        if self.in_fast_ret {
+        if self.in_fast {
             self.asm.ret();
         } else {
             self.epilogue();
@@ -726,9 +711,12 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn plan_mut(&mut self) -> &mut Plan<Reg> { &mut self.plan }
     fn frame(&self) -> &Frame<Reg> { &self.frame }
     fn abi(&self) -> &Abi { &self.abi }
-    fn shrink(&self) -> Option<ShrinkWrap> { self.shrink }
-    fn slow_thunk(&self) -> Label { self.slow_thunk }
-    fn in_shrink_entry(&self) -> bool { self.in_shrink_entry }
+    fn shrink(&self) -> Option<&ShrinkWrap> { self.shrink.as_ref() }
+    fn in_fast(&self) -> bool { self.in_fast }
+    fn ret_fast(&mut self, values: &[Value]) -> Result<(), String> {
+        self.in_fast = true;
+        self.ret(values)
+    }
     fn next_block(&self) -> Option<Block> { self.next }
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn new_label(&mut self) -> Label { self.asm.label() }

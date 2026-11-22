@@ -77,7 +77,7 @@ impl Emit<'_> {
 
     /// Keeps the reload cache for the block bound next when the current block ends with a branch that moves no edge arguments.
     pub(super) fn carry_spills(&mut self, plain: bool) {
-        self.carry.1 = (plain && !self.in_shrink_entry && !self.in_fast_ret).then_some(self.last_spill);
+        self.carry.1 = (plain && !self.in_fast).then_some(self.last_spill);
     }
 
     /// Restores the carried reload cache when `block`'s only predecessor is the block that carried it, and marks `block` as the current block.

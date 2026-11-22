@@ -1,9 +1,11 @@
 mod emit;
+mod shrink;
 pub(crate) use emit::{emit_body, stack_zero_store};
+pub(crate) use shrink::{ShrinkWrap, shrink_wrap};
 use emit::mark_line;
 
 use crate::alloc::{Location, Plan, Regs};
-use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, Signature, Type, Value};
+use crate::ir::{Block, Function, Inst, Op, Signature, Type, Value};
 
 pub(crate) const WORD: u32 = 8;
 /// The most alignment, as a shift, that the frame gives a slot.
@@ -582,111 +584,6 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
     Ok(Prepared { order, copied, abi, plan, frame, framed })
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ShrinkWrap {
-    pub fast_ret: Block,
-    pub slow_entry: Block,
-    pub use_slow_thunk: bool,
-}
-
-fn pure_value<R: Copy + PartialEq>(value: Value, plan: &Plan<R>, frame: &Frame<R>, clobbers: &[R]) -> bool {
-    if plan.elided[value.index()] || plan.fused[value.index()] {
-        return true;
-    }
-    match plan.location(value) {
-        Location::Imm(_) | Location::Symbol(_) => true,
-        Location::Reg(r) => !frame.saves.contains(&r) && !clobbers.contains(&r),
-        Location::Float(f) => !frame.float_saves.contains(&f),
-        Location::Slot | Location::SlotAddr(_) | Location::Frame(..) => false,
-    }
-}
-
-fn pure_op(op: &Op) -> bool {
-    !matches!(
-        op,
-        Op::StackAddr(..)
-            | Op::StackLoad(..)
-            | Op::StackStore(..)
-            | Op::FramePointer
-            | Op::Call { .. }
-            | Op::TryCall { .. }
-            | Op::Copy(..)
-            | Op::Move(..)
-            | Op::Trap
-            | Op::Trapz(..)
-    )
-}
-
-fn pure_block<R: Copy + PartialEq>(func: &Function, block: Block, plan: &Plan<R>, frame: &Frame<R>, clobbers: &[R]) -> bool {
-    let insts = &func.blocks[block.index()].insts;
-    if insts.is_empty() {
-        return false;
-    }
-    for &inst in &insts[..insts.len() - 1] {
-        let data = &func.insts[inst.index()];
-        if !pure_op(&data.op) || data.result.is_some_and(|r| !pure_value(r, plan, frame, clobbers)) {
-            return false;
-        }
-        let mut ok = true;
-        data.op.for_operands(|v| ok &= pure_value(v, plan, frame, clobbers));
-        if !ok {
-            return false;
-        }
-    }
-    true
-}
-
-pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, plan: &Plan<R>, frame: &Frame<R>, params: &[Loc<R>], clobbers: &[R]) -> Option<ShrinkWrap> {
-    if !framed || func.signature.params.iter().any(|p| p.purpose == ArgumentPurpose::StructReturn) {
-        return None;
-    }
-    let entry = func.entry?;
-    if params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..) | Loc::Pair(..))) {
-        return None;
-    }
-    if func.blocks[entry.index()].params.iter().any(|&p| !pure_value(p, plan, frame, clobbers)) {
-        return None;
-    }
-    let cfg = func.cfg();
-    if cfg.pred_count(entry) != 0 || !pure_block(func, entry, plan, frame, clobbers) {
-        return None;
-    }
-    let term = *func.blocks[entry.index()].insts.last()?;
-    let Op::Brif(cond, then_b, then_args, else_b, else_args) = &func.insts[term.index()].op else { return None };
-    if *then_b == *else_b || !pure_value(*cond, plan, frame, clobbers) {
-        return None;
-    }
-    let fast_ret_ok = |block: Block, edge_args: &[Value]| {
-        cfg.pred_count(block) == 1
-            && func.jump_target(block) == block
-            && edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
-            && func.blocks[block.index()].params.iter().all(|&p| pure_value(p, plan, frame, clobbers))
-            && !edge_steps(func, &plan.locations, &frame.values, edge_args, &func.blocks[block.index()].params)
-                .iter()
-                .any(|s| matches!(s, Step::Save(_, EdgeScratch::Stack(_)) | Step::Restore(EdgeScratch::Stack(_), _)))
-            && pure_block(func, block, plan, frame, clobbers)
-            && func.blocks[block.index()].insts.last().is_some_and(|&t| match &func.insts[t.index()].op {
-                Op::Return(vals) => vals.iter().all(|&v| pure_value(v, plan, frame, clobbers)),
-                _ => false,
-            })
-    };
-    let slow_ok = |block: Block, edge_args: &[Value]| {
-        edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
-            .then(|| cfg.pred_count(block) != 1 || func.jump_target(block) != block)
-    };
-    if fast_ret_ok(*then_b, then_args)
-        && let Some(use_slow_thunk) = slow_ok(*else_b, else_args)
-    {
-        Some(ShrinkWrap { fast_ret: *then_b, slow_entry: *else_b, use_slow_thunk })
-    } else if fast_ret_ok(*else_b, else_args)
-        && let Some(use_slow_thunk) = slow_ok(*then_b, then_args)
-    {
-        Some(ShrinkWrap { fast_ret: *else_b, slow_entry: *then_b, use_slow_thunk })
-    } else {
-        None
-    }
-}
-
 pub(crate) trait Emitter<'a>: Sized {
     fn func(&self) -> &'a Function;
     fn prologue(&mut self);
@@ -708,10 +605,6 @@ pub(crate) trait Emitter<'a>: Sized {
     }
 
     fn deferred_prologue(&self) -> bool {
-        false
-    }
-
-    fn blocks_fallthrough_to(&self, _block: Block) -> bool {
         false
     }
 
@@ -745,8 +638,7 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
     emit.intake(entry)?;
     let fallthrough_entry = !entry_has_preds(func, order, entry);
     for (index, &block) in order.iter().enumerate() {
-        let next_blk = order.get(index + 1).copied().filter(|&nb| !emit.blocks_fallthrough_to(nb));
-        emit.set_next(next_blk);
+        emit.set_next(order.get(index + 1).copied());
         emit.before_block_bind(block)?;
         starts.push(emit.pos());
         if index == 0 && block == entry && fallthrough_entry {

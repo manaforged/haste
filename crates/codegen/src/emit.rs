@@ -12,9 +12,22 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn plan_mut(&mut self) -> &mut Plan<R>;
     fn frame(&self) -> &Frame<R>;
     fn abi(&self) -> &Abi<R>;
-    fn shrink(&self) -> Option<ShrinkWrap>;
-    fn slow_thunk(&self) -> L;
-    fn in_shrink_entry(&self) -> bool;
+    fn shrink(&self) -> Option<&ShrinkWrap>;
+    fn in_fast(&self) -> bool;
+    fn is_fast(&self, block: Block) -> bool { self.shrink().is_some_and(|s| s.fast[block.index()]) }
+    fn is_split_ret(&self, block: Block) -> bool {
+        self.in_fast() && self.shrink().is_some_and(|s| s.split_ret[self.func().jump_target(block).index()])
+    }
+    fn exits_fast(&self, block: Block) -> bool {
+        self.in_fast() && !self.is_fast(block) && !self.is_split_ret(block)
+    }
+    fn ret_fast(&mut self, values: &[Value]) -> Result<(), String>;
+    fn fast_ret(&mut self, block: Block) -> Result<(), String> {
+        let Some(Op::Return(values)) = self.func().last(self.func().jump_target(block)) else {
+            return Err("split_ret target is not a return".to_owned());
+        };
+        self.ret_fast(values)
+    }
     fn next_block(&self) -> Option<Block>;
     fn block_label(&self, block: Block) -> L;
     fn new_label(&mut self) -> L;
@@ -36,10 +49,18 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn island(&mut self) -> Result<(), String> { Ok(()) }
 }
 
+#[derive(Clone, Copy)]
+enum StubKind {
+    Plain,
+    Prologue,
+    FastRet,
+}
+
 struct Stub<'a, L> {
     label: L,
     block: Block,
     args: &'a [Value],
+    kind: StubKind,
 }
 
 pub(crate) struct Tails<'a, L> {
@@ -104,18 +125,6 @@ pub(crate) fn intake_params<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, 
     Ok(())
 }
 
-pub(crate) fn emit_slow_prologue<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E, slow_entry: Block) -> Result<(), String> {
-    emit.prologue();
-    if let Some(entry) = emit.func().entry
-        && let Some(term) = emit.func().blocks[entry.index()].insts.last()
-        && let Op::Brif(_, then_b, then_args, else_b, else_args) = &emit.func().insts[term.index()].op
-    {
-        let args = if *then_b == slow_entry { then_args.as_slice() } else if *else_b == slow_entry { else_args.as_slice() } else { &[] };
-        emit.edge(slow_entry, args)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn emit_goto<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E, block: Block, last: bool) {
     let target = emit.func().jump_target(block);
     if last && (emit.next_block() == Some(block) || emit.next_block() == Some(target)) {
@@ -125,36 +134,15 @@ pub(crate) fn emit_goto<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit.jump_label(label);
 }
 
-fn target_label<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &E, block: Block) -> L {
-    if emit.in_shrink_entry() && emit.shrink().is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
-        emit.slow_thunk()
-    } else {
-        emit.block_label(emit.func().jump_target(block))
-    }
-}
-
-fn goto_branch<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E, block: Block, last: bool) {
-    if emit.in_shrink_entry() && emit.shrink().is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
-        let slow = emit.slow_thunk();
-        emit.jump_label(slow);
-    } else {
-        emit_goto(emit, block, last);
-    }
-}
-
-fn shrink_edges<'a, 'b, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
-    emit: &E,
-    then: (Block, &'b [Value]),
-    otherwise: (Block, &'b [Value]),
-) -> ((Block, &'b [Value]), (Block, &'b [Value])) {
-    if !emit.in_shrink_entry() {
-        return (then, otherwise);
-    }
-    let slow = emit.shrink().map(|s| s.slow_entry);
-    (
-        (then.0, if Some(then.0) == slow { &[][..] } else { then.1 }),
-        (otherwise.0, if Some(otherwise.0) == slow { &[][..] } else { otherwise.1 }),
-    )
+fn push_stub<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    block: Block,
+    args: &'a [Value],
+    kind: StubKind,
+) -> L {
+    let label = emit.new_label();
+    emit.tails().stubs.push(Stub { label, block, args, kind });
+    label
 }
 
 fn falls<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &E, block: Block) -> bool {
@@ -172,7 +160,7 @@ fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     (then, then_moves): ((Block, &'a [Value]), bool),
     (otherwise, else_moves): ((Block, &'a [Value]), bool),
 ) -> Result<bool, String> {
-    if emit.in_shrink_entry() || !(then_moves || else_moves) {
+    if emit.in_fast() || !(then_moves || else_moves) {
         return Ok(false);
     }
     let func = emit.func();
@@ -186,11 +174,10 @@ fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     if !hot_moves && !falls(emit, hot.0) {
         return Ok(false);
     }
-    let label = emit.new_label();
+    let label = push_stub(emit, cold.0, cold.1, StubKind::Plain);
     emit.branch_cond(condition, invert, label);
-    emit.tails().stubs.push(Stub { label, block: cold.0, args: cold.1 });
     emit.edge(hot.0, hot.1)?;
-    goto_branch(emit, hot.0, true);
+    emit_goto(emit, hot.0, true);
     Ok(true)
 }
 
@@ -199,9 +186,23 @@ pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>
         emit.island()?;
         emit.clear_flags();
         emit.bind_label(stub.label);
-        emit.edge(stub.block, stub.args)?;
-        let target = emit.block_label(emit.func().jump_target(stub.block));
-        emit.jump_label(target);
+        match stub.kind {
+            StubKind::Plain => {
+                emit.edge(stub.block, stub.args)?;
+                let target = emit.block_label(emit.func().jump_target(stub.block));
+                emit.jump_label(target);
+            }
+            StubKind::Prologue => {
+                emit.prologue();
+                emit.edge(stub.block, stub.args)?;
+                let target = emit.block_label(emit.func().jump_target(stub.block));
+                emit.jump_label(target);
+            }
+            StubKind::FastRet => {
+                emit.edge(stub.block, stub.args)?;
+                emit.fast_ret(stub.block)?;
+            }
+        }
     }
     Ok(())
 }
@@ -228,7 +229,7 @@ fn hoist_common_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     then: (Block, &'a [Value]),
     otherwise: (Block, &'a [Value]),
 ) -> Result<bool, String> {
-    if emit.in_shrink_entry() {
+    if emit.in_fast() {
         return Ok(false);
     }
     let (func, plan, frame) = (emit.func(), emit.plan(), emit.frame());
@@ -262,7 +263,7 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     (moved, to_then): ((Block, &'a [Value]), bool),
     plain: Block,
 ) -> Result<bool, String> {
-    if emit.in_shrink_entry() || falls(emit, moved.0) {
+    if emit.in_fast() || falls(emit, moved.0) {
         return Ok(false);
     }
     let closes = emit.func().cfg().loops().list.iter().any(|each| each.head == moved.0 && !each.body.get(plain.index()).copied().unwrap_or(true));
@@ -280,9 +281,9 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         return Ok(false);
     }
     emit.edge(moved.0, moved.1)?;
-    let target = target_label(emit, moved.0);
+    let target = emit.block_label(emit.func().jump_target(moved.0));
     emit.branch_cond(condition, !to_then, target);
-    goto_branch(emit, plain, true);
+    emit_goto(emit, plain, true);
     Ok(true)
 }
 
@@ -292,12 +293,86 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     then: (Block, &'a [Value]),
     otherwise: (Block, &'a [Value]),
 ) -> Result<(), String> {
-    let (then, otherwise) = shrink_edges(emit, then, otherwise);
     if let Some(known) = emit.plan().const_of(condition) {
         let (block, args) = if crate::fold::extend(known, emit.func().ty(condition), false) != 0 { then } else { otherwise };
+        if emit.is_split_ret(block) {
+            emit.edge(block, args)?;
+            return emit.fast_ret(block);
+        }
+        if emit.exits_fast(block) {
+            emit.prologue();
+        }
         emit.edge(block, args)?;
-        goto_branch(emit, block, true);
+        emit_goto(emit, block, true);
         return Ok(());
+    }
+    if emit.in_fast() {
+        #[derive(Clone, Copy)]
+        enum Dest { Fast, SplitRet, Slow }
+        let kind = |b: Block| if emit.is_fast(b) { Dest::Fast } else if emit.is_split_ret(b) { Dest::SplitRet } else { Dest::Slow };
+        match (kind(then.0), kind(otherwise.0)) {
+            (Dest::Fast, Dest::Fast) => {}
+            (Dest::Slow, Dest::Fast) => {
+                let label = push_stub(emit, then.0, then.1, StubKind::Prologue);
+                emit.branch_cond(condition, false, label);
+                emit.edge(otherwise.0, otherwise.1)?;
+                emit_goto(emit, otherwise.0, true);
+                return Ok(());
+            }
+            (Dest::Fast, Dest::Slow) => {
+                let label = push_stub(emit, otherwise.0, otherwise.1, StubKind::Prologue);
+                emit.branch_cond(condition, true, label);
+                emit.edge(then.0, then.1)?;
+                emit_goto(emit, then.0, true);
+                return Ok(());
+            }
+            (Dest::Slow, Dest::SplitRet) => {
+                let label = push_stub(emit, then.0, then.1, StubKind::Prologue);
+                emit.branch_cond(condition, false, label);
+                emit.edge(otherwise.0, otherwise.1)?;
+                return emit.fast_ret(otherwise.0);
+            }
+            (Dest::SplitRet, Dest::Slow) => {
+                let label = push_stub(emit, otherwise.0, otherwise.1, StubKind::Prologue);
+                emit.branch_cond(condition, true, label);
+                emit.edge(then.0, then.1)?;
+                return emit.fast_ret(then.0);
+            }
+            (Dest::Slow, Dest::Slow) => {
+                let label = push_stub(emit, then.0, then.1, StubKind::Prologue);
+                emit.branch_cond(condition, false, label);
+                emit.prologue();
+                emit.edge(otherwise.0, otherwise.1)?;
+                emit_goto(emit, otherwise.0, true);
+                return Ok(());
+            }
+            (Dest::SplitRet, Dest::Fast) => {
+                let label = push_stub(emit, then.0, then.1, StubKind::FastRet);
+                emit.branch_cond(condition, false, label);
+                emit.edge(otherwise.0, otherwise.1)?;
+                emit_goto(emit, otherwise.0, true);
+                return Ok(());
+            }
+            (Dest::Fast, Dest::SplitRet) => {
+                if !falls(emit, then.0) && !emit.plan().moves(emit.func(), emit.frame(), then.0, then.1) {
+                    let target = emit.block_label(emit.func().jump_target(then.0));
+                    emit.branch_cond(condition, false, target);
+                    emit.edge(otherwise.0, otherwise.1)?;
+                    return emit.fast_ret(otherwise.0);
+                }
+                let label = push_stub(emit, otherwise.0, otherwise.1, StubKind::FastRet);
+                emit.branch_cond(condition, true, label);
+                emit.edge(then.0, then.1)?;
+                emit_goto(emit, then.0, true);
+                return Ok(());
+            }
+            (Dest::SplitRet, Dest::SplitRet) => {
+                let label = push_stub(emit, then.0, then.1, StubKind::FastRet);
+                emit.branch_cond(condition, false, label);
+                emit.edge(otherwise.0, otherwise.1)?;
+                return emit.fast_ret(otherwise.0);
+            }
+        }
     }
     let mut then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
     let mut else_moves = emit.plan().moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
@@ -308,12 +383,11 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     if set_aside(emit, condition, (then, then_moves), (otherwise, else_moves))? {
         return Ok(());
     }
-    if then_moves && !else_moves && !emit.in_shrink_entry() && falls(emit, otherwise.0) && is_latch(emit.func(), otherwise.0) {
-        let label = emit.new_label();
+    if then_moves && !else_moves && !emit.in_fast() && falls(emit, otherwise.0) && is_latch(emit.func(), otherwise.0) {
+        let label = push_stub(emit, then.0, then.1, StubKind::Plain);
         emit.branch_cond(condition, false, label);
-        emit.tails().stubs.push(Stub { label, block: then.0, args: then.1 });
         emit.edge(otherwise.0, otherwise.1)?;
-        goto_branch(emit, otherwise.0, true);
+        emit_goto(emit, otherwise.0, true);
         return Ok(());
     }
     if then_moves && !else_moves && hoist_moves(emit, condition, (then, true), otherwise.0)? {
@@ -323,30 +397,30 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         return Ok(());
     }
     if !else_moves && (then_moves || falls(emit, then.0)) {
-        let target = target_label(emit, otherwise.0);
+        let target = emit.block_label(emit.func().jump_target(otherwise.0));
         emit.branch_cond(condition, true, target);
         if then_moves {
             emit.edge(then.0, then.1)?;
         }
-        goto_branch(emit, then.0, true);
+        emit_goto(emit, then.0, true);
         return Ok(());
     }
     if !then_moves {
-        let target = target_label(emit, then.0);
+        let target = emit.block_label(emit.func().jump_target(then.0));
         emit.branch_cond(condition, false, target);
         if else_moves {
             emit.edge(otherwise.0, otherwise.1)?;
         }
-        goto_branch(emit, otherwise.0, true);
+        emit_goto(emit, otherwise.0, true);
         return Ok(());
     }
     let other = emit.new_label();
     emit.branch_cond(condition, true, other);
     emit.edge(then.0, then.1)?;
-    goto_branch(emit, then.0, false);
+    emit_goto(emit, then.0, false);
     emit.bind_label(other);
     emit.edge(otherwise.0, otherwise.1)?;
-    goto_branch(emit, otherwise.0, true);
+    emit_goto(emit, otherwise.0, true);
     Ok(())
 }
 
