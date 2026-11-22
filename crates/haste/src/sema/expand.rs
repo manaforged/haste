@@ -432,7 +432,19 @@ impl Writer {
             Builtin::Cfg => self.cfg(cx, src, input, out)?,
             Builtin::ModulePath => out.lexed(&format!("{:?}", cx.outline.module_path(self.home))),
             Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
-            Builtin::Assert => builtin::assert(src, &src.args(open), site.krate, out),
+            Builtin::Assert => {
+                let args = src.args(open);
+                if let &[cond] = args.as_slice() && !src.opaques_in(cond.0, cond.1).is_empty() {
+                    out.lexed("if ! (");
+                    out.copy_range(src, cond.0, cond.1);
+                    out.lexed(") {");
+                    builtin::crate_path(out, site.krate, "::panicking::panic");
+                    out.lexed(&format!("({:?})", format!("assertion failed: {}", crate::outline::build::spelled_fragment(src, cond))));
+                    out.lexed("}");
+                } else {
+                    builtin::assert(src, &args, site.krate, out);
+                }
+            }
             Builtin::Asm => self.asm(cx, run, open, out)?,
             Builtin::Panic | Builtin::Unreachable => self.panic(cx, run, site, out),
         }
@@ -765,6 +777,6 @@ fn position(run: Run<'_>, site: Site, input: (u32, u32), out: &mut Tokens) {
         Builtin::Line => out.lexed(&format!("{}u32", src.line(at))),
         Builtin::Column => out.lexed(&format!("{}u32", src.column(at))),
         Builtin::File => out.lexed(&format!("{:?}", src.path.display().to_string())),
-        _ => out.lexed(&format!("{:?}", run.src.spelled(input))),
+        _ => out.lexed(&format!("{:?}", crate::outline::build::spelled_fragment(run.src, input))),
     }
 }

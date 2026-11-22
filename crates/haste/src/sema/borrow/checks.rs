@@ -248,7 +248,7 @@ impl Checker<'_, '_> {
         if p.through_ref && (!self.is_param_local(p.local) || self.closure_depth > 0) && !targets.contains(&p.local) {
             targets.push(p.local);
         }
-        if p.through_ref && (self.is_param_local(p.local) || targets.iter().any(|&t| self.is_param_local(t))) {
+        if (p.through_ref || p.through_deref) && (self.is_param_local(p.local) || targets.iter().any(|&t| self.is_param_local(t))) {
             for s in sources {
                 let allowed_ref = self.is_ref_ty(self.local_ty(s.target)) && (s.through_ref || self.is_closure_param(s.target));
                 if is_temp_target(s.target).is_some() || (!self.from_caller(s.target, s.through_ref) && !allowed_ref) {

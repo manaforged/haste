@@ -543,9 +543,62 @@ pub(crate) fn path_text(src: &Source, (from, to): (u32, u32), env: &super::tree:
     match src.text(from) {
         "concat" => parts.into_iter().map(|range| path_text(src, range, env)).collect(),
         "env" => env.var(&path_text(src, *parts.first()?, env)?),
-        "stringify" => Some(src.spelled((from + 3, src.pair(from + 2)))),
+        "stringify" => Some(spelled_fragment(src, (from + 3, src.pair(from + 2)))),
         _ => None,
     }
+}
+
+/// Spells `from..to` without synthetic grouping parentheses inserted around `macro_rules!` expression fragments.
+pub(crate) fn spelled_fragment(src: &Source, (from, to): (u32, u32)) -> String {
+    if from >= to {
+        return String::new();
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Skip {
+        None,
+        Open,
+        Close,
+    }
+    let mut skip = vec![Skip::None; (to - from) as usize];
+    for (op_from, op_to, frag) in src.opaques_in(from, to) {
+        if frag != super::rules::Frag::Expr {
+            continue;
+        }
+        let mut open = op_from;
+        while open + 1 < op_to && src.kind(open) == TokenKind::Pound && src.kind(open + 1) == TokenKind::OpenBracket {
+            open = src.pair(open + 1) + 1;
+        }
+        if open + 1 < op_to
+            && src.kind(open) == TokenKind::OpenParen
+            && src.pair(open) == op_to - 1
+            && src.origin(open).is_none()
+            && src.origin(op_to - 1).is_none()
+            && !src.joint(open)
+        {
+            skip[(open - from) as usize] = Skip::Open;
+            skip[(op_to - 1 - from) as usize] = Skip::Close;
+        }
+    }
+    let mut text = String::new();
+    let mut pending_space = false;
+    for at in from..to {
+        match skip[(at - from) as usize] {
+            Skip::Open => continue,
+            Skip::Close => {
+                if !text.is_empty() && !src.joint(at) {
+                    pending_space = true;
+                }
+                continue;
+            }
+            Skip::None => {}
+        }
+        if pending_space {
+            text.push(' ');
+        }
+        text.push_str(src.text(at));
+        pending_space = !src.joint(at);
+    }
+    text
 }
 
 fn child_dir(found: &Path, by_attr: bool, name: &str) -> PathBuf {

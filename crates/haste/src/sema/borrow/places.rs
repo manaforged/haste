@@ -26,6 +26,7 @@ pub(super) enum PlaceStep {
 pub(super) struct Place {
     pub(super) local: u32,
     pub(super) through_ref: bool,
+    pub(super) through_deref: bool,
     pub(super) mut_ref_root: bool,
     pub(super) behind_shared: bool,
     pub(super) reborrows_shared_field: bool,
@@ -180,14 +181,14 @@ impl Checker<'_, '_> {
                 if !p.behind_shared && self.is_mut_ref_or_ptr(cur) {
                     p.mut_ref_root = true;
                 }
-                p.through_ref = true;
+                p.through_deref = true;
                 cur = Ty::NONE;
                 continue;
             }
             if cur != Ty::NONE {
                 self.deref_ref_step(cur, p);
                 cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);
-            } else {
+            } else if !p.through_deref {
                 p.mut_ref_root = !p.behind_shared;
                 p.through_ref = true;
             }
@@ -208,7 +209,7 @@ impl Checker<'_, '_> {
             Expr::Paren(inner) => self.root_place(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Local(local)) => Some(Place {
-                    local: *local, through_ref: false, mut_ref_root: false, behind_shared: false,
+                    local: *local, through_ref: false, through_deref: false, mut_ref_root: false, behind_shared: false,
                     reborrows_shared_field: false, raw_ptr_prefix: None, steps: Vec::new(),
                 }),
                 _ => None,
@@ -236,7 +237,7 @@ impl Checker<'_, '_> {
                 let inner_ty = self.expr_ty(inner);
                 if self.typed.derefs.contains_key(&(expr, 0)) {
                     push_step(&mut p.steps, PlaceStep::Opaque(Some(expr.0)));
-                    p.through_ref = true;
+                    p.through_deref = true;
                 } else {
                     let was_ref = self.deref_ref_step(inner_ty, &mut p);
                     if !was_ref && inner_ty == Ty::NONE {

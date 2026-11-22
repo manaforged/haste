@@ -174,8 +174,18 @@ pub(super) fn check(
         maybe_init: init.clone(), init, moved: vec![false; n],
         partial_moves: Vec::new(), loans: Vec::new(), diverged: false,
     };
-    for &pat in &body.fn_params {
-        checker.check_param_pat(pat, &mut state)?;
+    let param_offset = usize::from(sig.receiver.is_some());
+    for (idx, &pat) in body.fn_params.iter().enumerate() {
+        let fallback = typed.params.get(param_offset + idx).map(|&pl| {
+            vec![BorrowSource {
+                target: pl,
+                steps: Vec::new(),
+                mutable: false,
+                through_ref: checker.ty_holds_borrow(checker.local_ty(pl)),
+                env_only: false,
+            }]
+        });
+        checker.check_param_pat(pat, fallback.as_deref().unwrap_or(&[]), &mut state)?;
     }
     let empty_live = HashSet::default();
     let root_place_ctx = checker.is_mut_ref_ty(checker.expr_ty(root)) && typed.ret.is_some_and(|r| checker.is_mut_ref_ty(r));
@@ -316,8 +326,8 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    fn check_param_pat(&mut self, pat: PatId, state: &mut State) -> Result<()> {
-        self.bind_pat_param(pat, state)
+    fn check_param_pat(&mut self, pat: PatId, fallback: &[BorrowSource], state: &mut State) -> Result<()> {
+        self.bind_pat_param(pat, fallback, state)
     }
 
     fn check_not_moved(&self, local: u32, steps: &[PlaceStep], state: &State) -> Result<()> {

@@ -246,6 +246,7 @@ impl Checker<'_, '_> {
         let dst = Place {
             local: holder,
             through_ref,
+            through_deref: false,
             mut_ref_root: false,
             behind_shared: false,
             reborrows_shared_field: false,

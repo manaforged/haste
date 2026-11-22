@@ -41,9 +41,9 @@ impl Checker<'_, '_> {
         );
     }
 
-    pub(super) fn bind_pat_param(&mut self, pat: PatId, state: &mut State) -> Result<()> {
+    pub(super) fn bind_pat_param(&mut self, pat: PatId, fallback_sources: &[BorrowSource], state: &mut State) -> Result<()> {
         let ctx = PatCtx { init_val: true, move_on_val: true, scope_depth: 0, behind_ref: false, in_drop_adt: false, is_param: true, move_only: false };
-        self.bind_pat_ctx(pat, None, None, &[], &[], state, ctx)
+        self.bind_pat_ctx(pat, None, None, &[], fallback_sources, state, ctx)
     }
 
     pub(super) fn bind_pat(
@@ -280,7 +280,16 @@ impl Checker<'_, '_> {
                 let is_ref_init = unwrapped_init.is_some_and(|e| matches!(*self.body.expr(self.unwrap_parens(e)), Expr::Ref { .. }));
                 let mut sources = match unwrapped_init {
                     Some(e) => self.place_borrow_sources(e, is_mut, state, self.let_extend_depth),
-                    None => fallback_sources.to_vec(),
+                    None => fallback_sources
+                        .iter()
+                        .map(|s| {
+                            let mut s = s.clone();
+                            if !behind_ref && !self.is_ref_ty(self.local_ty(s.target)) {
+                                s.through_ref = false;
+                            }
+                            s
+                        })
+                        .collect(),
                 };
                 if is_mut && !is_ref_init {
                     for s in &mut sources {
@@ -330,7 +339,7 @@ impl Checker<'_, '_> {
                 bail!("cannot move out of type which implements the `Drop` trait");
             }
             if let Some(place) = scrut_place {
-                if place.through_ref {
+                if place.through_ref || place.through_deref {
                     bail!("cannot move out of `{}` which is behind a reference", self.local_name(place.local));
                 }
                 let mut full_steps = place.steps.clone();
@@ -411,15 +420,15 @@ impl Checker<'_, '_> {
                 state.loans.retain(|l| l.holder != Some(tid));
             }
             sub_res?;
-            if p.through_ref {
-                let prefix_len = p.steps.iter().position(|s| matches!(s, PlaceStep::Deref)).unwrap_or(0);
+            if p.through_ref || p.through_deref {
+                let prefix_len = p.steps.iter().position(|s| matches!(s, PlaceStep::Deref | PlaceStep::Opaque(_))).unwrap_or(0);
                 self.check_not_moved(p.local, &p.steps[..prefix_len], state)?;
             }
             let is_union = p.steps.last() == Some(&PlaceStep::Union);
             let union_prefix = if is_union { &p.steps[..p.steps.len() - 1] } else { &p.steps[..] };
             self.check_can_mutate(p.local, p.through_ref, p.mut_ref_root, p.behind_shared, union_prefix, state, union_prefix.is_empty())?;
             self.check_assign_escape(&p, sources, state)?;
-            if !p.through_ref && (p.local as usize) < state.init.len() {
+            if !p.through_ref && !p.through_deref && (p.local as usize) < state.init.len() {
                 if union_prefix.is_empty() {
                     state.init[p.local as usize] = true;
                     state.maybe_init[p.local as usize] = true;
