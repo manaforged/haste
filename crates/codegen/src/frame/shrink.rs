@@ -21,7 +21,7 @@ fn pure_value<R: Copy + PartialEq>(
     if plan.elided[value.index()]
         || (plan.fused[value.index()]
             && defs.get(value.index()).copied().flatten().is_some_and(|i| match func.insts[i.index()].op {
-                Op::AtomicRmw(..) | Op::Icmp(..) | Op::Fcmp(..) => true,
+                Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Icmp(..) | Op::Fcmp(..) => true,
                 Op::Fits(..) => plan.pairs[value.index()].is_none(),
                 _ => false,
             }))

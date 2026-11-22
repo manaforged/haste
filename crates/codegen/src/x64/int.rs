@@ -586,10 +586,16 @@ impl Emit<'_> {
         }
     }
 
-    pub(super) fn emit_cmp_pair(&mut self, size: Size, x: Value, y: Option<Value>, zero_test: bool) {
-        let imm = match y {
-            Some(yv) => self.imm_sized(yv, size),
-            None => Some(1),
+    pub(super) fn emit_cmp_pair(&mut self, size: Size, x: Value, y: Option<Value>, zero_test: bool, unsigned: bool) {
+        let (size, imm) = match y {
+            Some(yv) => match self.imm_sized(yv, size) {
+                Some(imm) => (size, Some(imm)),
+                None if unsigned && size == Size::Q && self.narrow_u32_cmp(x, yv) => {
+                    (Size::D, self.const_of(yv).map(|c| c as u32 as i32))
+                }
+                None => (size, None),
+            },
+            None => (size, Some(1)),
         };
         if (matches!(self.location(x), Location::Slot) && self.cached_spill(x).is_none() || self.has_elided_mem(x))
             && let Some(imm) = imm
@@ -598,7 +604,7 @@ impl Emit<'_> {
             self.asm.alu_imm_sized(size, Alu::Cmp, rm, imm);
             return;
         }
-        let left = self.reg_of(x).or_else(|| y.filter(|&yv| self.imm_sized(yv, size).is_none()).map_or_else(|| self.cached_spill(x), |yv| self.cached_beside(x, yv))).unwrap_or_else(|| {
+        let left = self.reg_of(x).or_else(|| y.filter(|&yv| imm.is_none() && self.imm_sized(yv, size).is_none()).map_or_else(|| self.cached_spill(x), |yv| self.cached_beside(x, yv))).unwrap_or_else(|| {
             self.raw(Reg::Rax, x);
             Reg::Rax
         });
@@ -606,8 +612,25 @@ impl Emit<'_> {
             Some(yv) if zero_test && self.const_of(yv).is_some_and(|c| crate::fold::extend(c, self.ty(yv), false) == 0) => {
                 self.asm.test_sized(size, left, left);
             }
+            Some(_) if size == Size::D && imm.is_some() && self.ty(x) == Type::I64 => {
+                self.asm.alu_imm_sized(Size::D, Alu::Cmp, left, imm.expect("invariant: checked Some"));
+            }
             Some(yv) => self.alu_at(size, Alu::Cmp, left, yv),
             None => self.asm.alu_imm_sized(size, Alu::Cmp, left, 1),
+        }
+    }
+
+    fn narrow_u32_cmp(&self, x: Value, y: Value) -> bool {
+        let Some(c) = self.const_of(y) else { return false };
+        if u32::try_from(c as u64).is_err() || i32::try_from(c).is_ok() {
+            return false;
+        }
+        let Some(inst) = self.defs[x.index()] else { return false };
+        match self.func.insts[inst.index()].op {
+            Op::Convert(crate::ir::Convert::Uextend, a) => self.ty(a).bits() <= 32,
+            Op::Binary(Binary::Ushr, _, sh) => self.const_of(sh).is_some_and(|k| (k & 63) >= 32),
+            Op::Binary(Binary::Band, a, b) => [a, b].into_iter().any(|v| self.const_of(v).is_some_and(|m| u32::try_from(m as u64).is_ok())),
+            _ => false,
         }
     }
 

@@ -224,7 +224,7 @@ impl Emit<'_> {
         let operands_ready = fold.map_or_else(|| ready(self, other), |(p, q)| ready(self, p) && ready(self, q));
         let held = operands_ready && right.is_some_and(|right| self.overflow_held(left, right));
         if !held {
-            self.emit_cmp_pair(Size::of(self.ty(left).bytes()), left, right, false);
+            self.emit_cmp_pair(Size::of(self.ty(left).bytes()), left, right, false, false);
         }
         let (alu, imm) = match (op == Binary::Iadd, invert) {
             (true, false) => (Alu::Adc, 0),

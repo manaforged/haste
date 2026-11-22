@@ -339,6 +339,7 @@ fn load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
     let non_wide = udata.result.is_some_and(|r| ctx.func.ty(r) != Type::I128);
     match udata.op {
         Op::Icmp(..) => true,
+        Op::Brif(cond, ..) | Op::Trapz(cond) => cond == load_res,
         Op::Convert(Convert::Uextend | Convert::Sextend, _) => ty.bytes() <= 4 && non_wide,
         Op::Convert(Convert::Ireduce, _) => ty.bytes() <= 8 && non_wide,
         Op::Binary(..) => load_binop_ok(ctx, features, linst, load_res, udata),
@@ -621,25 +622,20 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         }
     }
     apply_select_trees(func, plan, (&uses, &pos_of, &defs), &mut tst_end, &mut roots);
+    super::sib::fuse_atomic_addrs(func, plan, (&uses, &pos_of));
     for (b_idx, lpos, load_res) in cand_loads {
         let Some((ub, upos, uinst)) = use_of[load_res.index()] else { continue };
-        if ub != b_idx || upos <= lpos {
-            continue;
-        }
+        if ub != b_idx || upos <= lpos { continue; }
         let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
         let udata = &func.insts[uinst.index()];
         let eff_pos = if let Some(ur) = udata.result.filter(|r| plan.elided[r.index()]) {
             let Some(fpos) = tst_end[ur.index()] else { continue };
             fpos
         } else {
-            if !load_elide_ok(&ctx, features, func.blocks[b_idx].insts[lpos], load_res, udata) {
-                continue;
-            }
+            if !load_elide_ok(&ctx, features, func.blocks[b_idx].insts[lpos], load_res, udata) { continue; }
             upos
         };
-        if load_fuses(&ctx, lpos, eff_pos, &[]) {
-            plan.elided[load_res.index()] = true;
-        }
+        if load_fuses(&ctx, lpos, eff_pos, &[]) { plan.elided[load_res.index()] = true; }
     }
     for (b_idx, pos, res, op, x, y) in cand_alu {
         if plan.elided[res.index()] || plan.deferred[res.index()] || plan.fused[res.index()] || plan.sib[res.index()].is_some() || skip_flags[res.index()] {

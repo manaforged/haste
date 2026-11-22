@@ -314,13 +314,19 @@ impl Emit<'_> {
             }
             Op::AtomicCas(_, addr, expected, replacement) => {
                 let res = result()?;
-                let target = self.atomic_target(*addr, Reg::R11, &[Reg::Rax, Reg::Rcx]);
+                let (target, src) = match self.reg_of(*replacement).filter(|&r| r != Reg::Rax && r != Reg::R11) {
+                    Some(rep) => (self.atomic_target(*addr, Reg::R11, &[Reg::Rax, rep]), rep),
+                    None => {
+                        let t = self.atomic_target(*addr, Reg::R11, &[Reg::Rax, Reg::Rcx]);
+                        self.raw(Reg::Rcx, *replacement);
+                        (t, Reg::Rcx)
+                    }
+                };
                 self.raw(Reg::Rax, *expected);
-                self.raw(Reg::Rcx, *replacement);
-                self.asm.cmpxchg(size, target, Reg::Rcx);
+                self.asm.cmpxchg(size, target, src);
                 self.asm.hold_eq(res.index() as u32, expected.index() as u32);
-                self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::R11]);
-                self.put(res, Reg::Rax);
+                self.clobber_regs(if src == Reg::Rcx { &[Reg::Rax, Reg::Rcx, Reg::R11] } else { &[Reg::Rax, Reg::R11] });
+                if !self.plan.fused[res.index()] { self.put(res, Reg::Rax); }
             }
             other => return Err(format!("unexpected {other:?}")),
         }
@@ -431,11 +437,14 @@ impl Emit<'_> {
     }
 
     fn test_value(&mut self, value: Value) {
-        let reg = self.reg_of(value).or_else(|| self.cached_spill(value)).unwrap_or_else(|| {
-            self.get(Reg::Rax, value, Ext::Zero);
-            Reg::Rax
-        });
-        self.asm.test_sized(Size::of(self.ty(value).bytes()), reg, reg);
+        let size = Size::of(self.ty(value).bytes());
+        if self.ty(value).is_small_int() && (self.has_elided_mem(value) || (matches!(self.location(value), Location::Slot) && self.cached_spill(value).is_none())) {
+            let rm = self.operand(value);
+            self.asm.alu_imm_sized(size, Alu::Cmp, rm, 0);
+            return;
+        }
+        let reg = self.reg_of(value).or_else(|| self.cached_spill(value)).unwrap_or_else(|| { self.get(Reg::Rax, value, Ext::Zero); Reg::Rax });
+        self.asm.test_sized(size, reg, reg);
     }
 
     fn held_eq_compare(&self, cc: IntCC, x: Value, y: Value) -> Option<Cond> {
@@ -479,7 +488,7 @@ impl Emit<'_> {
             } else {
                 (cc, x, y)
             };
-            self.emit_cmp_pair(size, x, Some(y), matches!(cc, IntCC::Equal | IntCC::NotEqual) || cc.is_signed());
+            self.emit_cmp_pair(size, x, Some(y), matches!(cc, IntCC::Equal | IntCC::NotEqual) || cc.is_signed(), !cc.is_signed());
             int::cond(cc)
         }
     }

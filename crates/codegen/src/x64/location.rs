@@ -734,25 +734,36 @@ pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos
     };
     for (v, def) in pos_of.iter().enumerate() {
         let Some((block, start, inst)) = *def else { continue };
-        let Op::AtomicRmw(rmw, _, _, value) = func.insts[inst.index()].op else { continue };
         let (res, ty) = (Value(v as u32), func.ty(Value(v as u32)));
         if !ty.is_small_int() || plan.elided[v] || plan.fused[v] {
             continue;
         }
-        if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor) {
-            plan.fused[v] = true;
-            continue;
-        }
-        if rmw != AtomicRmwOp::Sub || uses[v] != 1 {
-            continue;
-        }
+        let expected = match func.insts[inst.index()].op {
+            Op::AtomicRmw(rmw, _, _, value) => {
+                if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor) {
+                    plan.fused[v] = true;
+                    continue;
+                }
+                if rmw != AtomicRmwOp::Sub || uses[v] != 1 { continue; }
+                value
+            }
+            Op::AtomicCas(_, _, expected, _) => {
+                if uses[v] == 0 {
+                    plan.fused[v] = true;
+                    continue;
+                }
+                if uses[v] != 1 { continue; }
+                expected
+            }
+            _ => continue,
+        };
         let Some((used_in, end, user)) = use_of[v] else { continue };
         let udata = &func.insts[user.index()];
         let Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) = udata.op else { continue };
         if used_in != block
             || end <= start
             || !udata.result.is_some_and(|r| !plan.elided[r.index()] && !plan.is_static(r))
-            || !((lhs == res && eq_val(plan, ty, rhs, value)) || (rhs == res && eq_val(plan, ty, lhs, value)))
+            || !((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
         {
             continue;
         }
@@ -768,5 +779,4 @@ pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos
             plan.fused[v] = true;
         }
     }
-    sib::fuse_atomic_addrs(func, plan, (uses, pos_of));
 }
