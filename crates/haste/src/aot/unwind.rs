@@ -18,27 +18,38 @@ pub(super) fn emit_walk(arch: Arch, os: Os, out: &mut Buf) -> Result<()> {
     Ok(())
 }
 
-/// Emits the fixed-size ARM64 call from `StartPanic` to `UnwindWalk(x29, [x23+STOP_FP_OFFSET], text, table)`.
+/// Emits the fixed-size ARM64 call from `StartPanic` to `UnwindWalk(x29, x23, text, table)`.
 pub(super) fn emit_arm64_walk_call(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) {
-    out.words(&[0xAA1D_03E0, 0xF940_02E1 | ((STOP_FP_OFFSET / 8) << 10)]);
+    out.words(&[0xAA1D_03E0, 0xAA17_03E1]);
     emit_arm64_adrp_add(c.at(out), addrs.text, 2, out);
-    emit_arm64_adrp_add(c.at(out), addrs.unwind_table, 3, out);
+    if addrs.unwind_table == 0 {
+        out.u32(0xD280_0003);
+    } else {
+        emit_arm64_adrp_add(c.at(out), addrs.unwind_table, 3, out);
+    }
     emit_rel_branch(Arch::Arm64, true, c.at(out), addrs.unwind_walk, out);
 }
 
-/// Emits the fixed-size x86-64 call from `StartPanic` to `UnwindWalk(rbp, [r15+STOP_FP_OFFSET], text, table)`.
+/// Emits the fixed-size x86-64 call from `StartPanic` to `UnwindWalk(rbp, r15, text, table)`.
 pub(super) fn emit_x64_walk_call(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) {
-    let off = STOP_FP_OFFSET.to_le_bytes();
     if c.win {
-        out.bytes(&[0x48, 0x89, 0xE9, 0x49, 0x8B, 0x97, off[0], off[1], off[2], off[3], 0x4C, 0x8D, 0x05]);
+        out.bytes(&[0x48, 0x89, 0xE9, 0x4C, 0x89, 0xFA, 0x4C, 0x8D, 0x05]);
         out.u32(((addrs.text as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
-        out.bytes(&[0x4C, 0x8D, 0x0D]);
-        out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        if addrs.unwind_table == 0 {
+            out.bytes(&[0x45, 0x31, 0xC9]);
+        } else {
+            out.bytes(&[0x4C, 0x8D, 0x0D]);
+            out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        }
     } else {
-        out.bytes(&[0x48, 0x89, 0xEF, 0x49, 0x8B, 0xB7, off[0], off[1], off[2], off[3], 0x48, 0x8D, 0x15]);
+        out.bytes(&[0x48, 0x89, 0xEF, 0x4C, 0x89, 0xFE, 0x48, 0x8D, 0x15]);
         out.u32(((addrs.text as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
-        out.bytes(&[0x48, 0x8D, 0x0D]);
-        out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        if addrs.unwind_table == 0 {
+            out.bytes(&[0x31, 0xC9]);
+        } else {
+            out.bytes(&[0x48, 0x8D, 0x0D]);
+            out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        }
     }
     emit_rel_branch(Arch::X64, true, c.at(out), addrs.unwind_walk, out);
 }
@@ -53,9 +64,22 @@ fn build_unwind_walk() -> Function {
     let drop_sig = b.import_signature(drop_sig);
 
     let entry = b.create_block();
+    let load_table = b.create_block();
+    let init_done = b.create_block();
     let frame_loop = b.create_block();
     let load_caller = b.create_block();
     let check_stop = b.create_block();
+    let drain_loop = b.create_block();
+    let drain_check_mark = b.create_block();
+    let drain_check_limit = b.create_block();
+    let drain_unlink = b.create_block();
+    let drain_set_prev = b.create_block();
+    let drain_check_next = b.create_block();
+    let drain_set_next = b.create_block();
+    let drain_set_head = b.create_block();
+    let drain_after_unlink = b.create_block();
+    let drain_invoke = b.create_block();
+    let drain_done = b.create_block();
     let check_pc = b.create_block();
     let search_init = b.create_block();
     let bsearch = b.create_block();
@@ -70,7 +94,14 @@ fn build_unwind_walk() -> Function {
     let done = b.create_block();
 
     b.append_block_params_for_function_params(entry);
+    let count = b.append_block_param(init_done, Type::I64);
+    let fn_recs = b.append_block_param(init_done, Type::I64);
+    let drops_base = b.append_block_param(init_done, Type::I64);
     let fp = b.append_block_param(frame_loop, Type::I64);
+    let limit_addr = b.append_block_param(drain_loop, Type::I64);
+    let next_fp = b.append_block_param(drain_loop, Type::I64);
+    let next_ret = b.append_block_param(drain_loop, Type::I64);
+    let is_final = b.append_block_param(drain_loop, Type::I8);
     let lo = b.append_block_param(bsearch, Type::I64);
     let hi = b.append_block_param(bsearch, Type::I64);
     let idx = b.append_block_param(drop_loop, Type::I64);
@@ -78,44 +109,112 @@ fn build_unwind_walk() -> Function {
 
     b.switch_to_block(entry);
     let cur_fp = b.block_params(entry)[0];
-    let stop_fp = b.block_params(entry)[1];
+    let frame_ptr = b.block_params(entry)[1];
     let text_base = b.block_params(entry)[2];
     let table_ptr = b.block_params(entry)[3];
-    let count = b.ins().load(Type::I64, table_ptr, 0);
-    let empty = b.ins().icmp_imm(IntCC::Equal, count, 0);
-    let fn_recs = b.ins().iadd_imm(table_ptr, 8);
+    let state_ptr = b.ins().load(Type::I64, frame_ptr, 0);
+    let mark = b.ins().load(Type::I64, frame_ptr, 8);
+    let stop_fp = b.ins().load(Type::I64, frame_ptr, STOP_FP_OFFSET as i32);
+    let zero = b.ins().iconst(Type::I64, 0);
     let c4 = b.ins().iconst(Type::I64, 4);
-    let fn_bytes = b.ins().ishl(count, c4);
-    let drops_base = b.ins().iadd(fn_recs, fn_bytes);
-    b.ins().brif(empty, done, &[], frame_loop, &[cur_fp]);
+    let z8 = b.ins().iconst(Type::I8, 0);
+    let one8 = b.ins().iconst(Type::I8, 1);
+    let no_table = b.ins().icmp_imm(IntCC::Equal, table_ptr, 0);
+    b.ins().brif(no_table, init_done, &[zero, zero, zero], load_table, &[]);
+
+    b.switch_to_block(load_table);
+    let t_count = b.ins().load(Type::I64, table_ptr, 0);
+    let t_recs = b.ins().iadd_imm(table_ptr, 8);
+    let fn_bytes = b.ins().ishl(t_count, c4);
+    let t_drops = b.ins().iadd(t_recs, fn_bytes);
+    b.ins().jump(init_done, &[t_count, t_recs, t_drops]);
+
+    b.switch_to_block(init_done);
+    let empty = b.ins().icmp_imm(IntCC::Equal, count, 0);
+    b.ins().brif(empty, drain_loop, &[zero, zero, zero, one8], frame_loop, &[cur_fp]);
 
     b.switch_to_block(frame_loop);
     let fp_zero = b.ins().icmp_imm(IntCC::Equal, fp, 0);
-    b.ins().brif(fp_zero, done, &[], load_caller, &[]);
+    b.ins().brif(fp_zero, drain_loop, &[zero, zero, zero, one8], load_caller, &[]);
 
     b.switch_to_block(load_caller);
     let caller_fp = b.ins().load(Type::I64, fp, 0);
     let ret_pc = b.ins().load(Type::I64, fp, 8);
     let bad_fp = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, caller_fp, fp);
-    b.ins().brif(bad_fp, done, &[], check_stop, &[]);
+    b.ins().brif(bad_fp, drain_loop, &[zero, zero, zero, one8], check_stop, &[]);
 
     b.switch_to_block(check_stop);
     let at_stop = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, caller_fp, stop_fp);
-    b.ins().brif(at_stop, done, &[], check_pc, &[]);
+    b.ins().brif(at_stop, drain_loop, &[zero, zero, zero, one8], drain_loop, &[caller_fp, caller_fp, ret_pc, z8]);
+
+    b.switch_to_block(drain_loop);
+    let node = b.ins().load(Type::I64, state_ptr, 8);
+    let node_null = b.ins().icmp_imm(IntCC::Equal, node, 0);
+    b.ins().brif(node_null, drain_done, &[], drain_check_mark, &[]);
+
+    b.switch_to_block(drain_check_mark);
+    let at_mark = b.ins().icmp(IntCC::Equal, node, mark);
+    b.ins().brif(at_mark, drain_done, &[], drain_check_limit, &[]);
+
+    b.switch_to_block(drain_check_limit);
+    let has_limit = b.ins().icmp_imm(IntCC::NotEqual, limit_addr, 0);
+    let past_limit = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, node, limit_addr);
+    let stop_limit = b.ins().band(has_limit, past_limit);
+    b.ins().brif(stop_limit, drain_done, &[], drain_unlink, &[]);
+
+    b.switch_to_block(drain_unlink);
+    let prev = b.ins().load(Type::I64, node, 8);
+    let next = b.ins().load(Type::I64, node, 16);
+    let has_prev = b.ins().icmp_imm(IntCC::NotEqual, prev, 0);
+    b.ins().brif(has_prev, drain_set_prev, &[], drain_check_next, &[]);
+
+    b.switch_to_block(drain_set_prev);
+    b.ins().store(next, prev, 16);
+    b.ins().jump(drain_check_next, &[]);
+
+    b.switch_to_block(drain_check_next);
+    let has_next = b.ins().icmp_imm(IntCC::NotEqual, next, 0);
+    b.ins().brif(has_next, drain_set_next, &[], drain_set_head, &[]);
+
+    b.switch_to_block(drain_set_next);
+    b.ins().store(prev, next, 8);
+    b.ins().jump(drain_after_unlink, &[]);
+
+    b.switch_to_block(drain_set_head);
+    b.ins().store(prev, state_ptr, 8);
+    b.ins().jump(drain_after_unlink, &[]);
+
+    b.switch_to_block(drain_after_unlink);
+    b.ins().store(zero, node, 8);
+    b.ins().store(zero, node, 16);
+    let st = b.ins().load(Type::I8, node, 0);
+    let mask_clear = b.ins().iconst(Type::I8, !3_i64);
+    let st_cleared = b.ins().band(st, mask_clear);
+    b.ins().store(st_cleared, node, 0);
+    let is_active = b.ins().band(st, one8);
+    b.ins().brif(is_active, drain_invoke, &[], drain_loop, &[limit_addr, next_fp, next_ret, is_final]);
+
+    b.switch_to_block(drain_invoke);
+    let node_fn = b.ins().load(Type::I64, node, 24);
+    let node_arg = b.ins().load(Type::I64, node, 32);
+    b.ins().call_indirect(drop_sig, node_fn, &[node_arg]);
+    b.ins().jump(drain_loop, &[limit_addr, next_fp, next_ret, is_final]);
+
+    b.switch_to_block(drain_done);
+    b.ins().brif(is_final, done, &[], check_pc, &[]);
 
     b.switch_to_block(check_pc);
-    let in_text = b.ins().icmp(IntCC::UnsignedGreaterThan, ret_pc, text_base);
-    b.ins().brif(in_text, search_init, &[], frame_loop, &[caller_fp]);
+    let in_text = b.ins().icmp(IntCC::UnsignedGreaterThan, next_ret, text_base);
+    b.ins().brif(in_text, search_init, &[], frame_loop, &[next_fp]);
 
     b.switch_to_block(search_init);
-    let pc_m1 = b.ins().iadd_imm(ret_pc, -1);
+    let pc_m1 = b.ins().iadd_imm(next_ret, -1);
     let rel_pc = b.ins().isub(pc_m1, text_base);
-    let zero = b.ins().iconst(Type::I64, 0);
     b.ins().jump(bsearch, &[zero, count]);
 
     b.switch_to_block(bsearch);
     let more = b.ins().icmp(IntCC::UnsignedLessThan, lo, hi);
-    b.ins().brif(more, bsearch_step, &[], frame_loop, &[caller_fp]);
+    b.ins().brif(more, bsearch_step, &[], frame_loop, &[next_fp]);
 
     b.switch_to_block(bsearch_step);
     let diff = b.ins().isub(hi, lo);
@@ -146,7 +245,7 @@ fn build_unwind_walk() -> Function {
 
     b.switch_to_block(drop_loop);
     let has_more = b.ins().icmp(IntCC::UnsignedGreaterThan, idx, dstart);
-    b.ins().brif(has_more, drop_step, &[], frame_loop, &[caller_fp]);
+    b.ins().brif(has_more, drop_step, &[], frame_loop, &[next_fp]);
 
     b.switch_to_block(drop_step);
     let next_idx = b.ins().iadd_imm(idx, -1);
@@ -154,17 +253,16 @@ fn build_unwind_walk() -> Function {
     let dptr = b.ins().iadd(drops_base, doff);
     let flag_off32 = b.ins().load(Type::I32, dptr, 4);
     let flag_off = b.ins().sextend(Type::I64, flag_off32);
-    let flag_ptr = b.ins().iadd(caller_fp, flag_off);
+    let flag_ptr = b.ins().iadd(next_fp, flag_off);
     let flag = b.ins().load(Type::I8, flag_ptr, 0);
     let active = b.ins().icmp_imm(IntCC::NotEqual, flag, 0);
     b.ins().brif(active, drop_run, &[], drop_loop, &[next_idx]);
 
     b.switch_to_block(drop_run);
-    let z8 = b.ins().iconst(Type::I8, 0);
     b.ins().store(z8, flag_ptr, 0);
     let local_off32 = b.ins().load(Type::I32, dptr, 0);
     let local_off = b.ins().sextend(Type::I64, local_off32);
-    let slot_ptr = b.ins().iadd(caller_fp, local_off);
+    let slot_ptr = b.ins().iadd(next_fp, local_off);
     let ind32 = b.ins().load(Type::I32, dptr, 12);
     let is_ind = b.ins().icmp_imm(IntCC::NotEqual, ind32, 0);
     b.ins().brif(is_ind, load_ind, &[], do_call, &[slot_ptr]);

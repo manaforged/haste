@@ -364,19 +364,8 @@ fn emit_x64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Res
     let no_frame = x64_fwd32(&[0x0F, 0x84], out);
     out.bytes(&[0x49, 0x8B, 0x07, 0x48, 0x89, 0x03, 0x49, 0x8B, 0x46, 0x18]);
     out.bytes(if c.win { &[0x4C, 0x89, 0xE1] } else { &[0x4C, 0x89, 0xE7] });
-    out.bytes(&[0xFF, 0xD0, 0x49, 0x89, 0x47, 0x10, 0x49, 0x89, 0x57, 0x18, 0x4D, 0x8B, 0x77, 0x08]);
-    let drain_loop = out.pos();
-    let drain_null = x64_jcc(&[0x4C, 0x8B, 0x63, 0x08, 0x4D, 0x85, 0xE4], 0x74, out);
-    let drain_mark = x64_jcc(&[0x4D, 0x39, 0xF4], 0x74, out);
-    emit_x64_unlink_r12(out);
-    let skip_inactive = x64_jcc(&[0x41, 0x0F, 0xB6, 0x04, 0x24, 0xA8, 0x01], 0x74, out);
-    out.bytes(&[0x24, 0xFE, 0x41, 0x88, 0x04, 0x24, 0x49, 0x8B, 0x44, 0x24, 0x18]);
-    out.bytes(if c.win { &[0x49, 0x8B, 0x4C, 0x24, 0x20, 0xFF, 0xD0] } else { &[0x49, 0x8B, 0x7C, 0x24, 0x20, 0xFF, 0xD0] });
-    x64_patch8(skip_inactive, out);
-    out.u8(0xE9);
-    out.u32(((drain_loop as i64 - (out.pos() as i64 + 4)) as i32) as u32);
-    x64_here(&[drain_null, drain_mark], out);
-    if addrs.unwind_table != 0 { super::unwind::emit_x64_walk_call(c, addrs, out); }
+    out.bytes(&[0xFF, 0xD0, 0x49, 0x89, 0x47, 0x10, 0x49, 0x89, 0x57, 0x18, 0x49, 0x89, 0x1F]);
+    super::unwind::emit_x64_walk_call(c, addrs, out);
     let longjmp_args = if c.win { &[0x49, 0x8D, 0x4F, 0x20, 0xBA, 1, 0, 0, 0][..] } else { &[0x49, 0x8D, 0x7F, 0x20, 0xBE, 1, 0, 0, 0] };
     c.bytes_call(longjmp_args, c.pick("longjmp", "_longjmp"), out)?;
     [no_state, no_frame].into_iter().for_each(|l| x64_patch32(l, out));
@@ -575,20 +564,8 @@ fn emit_arm64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> R
     emit_arm64_unwind_state(c, addrs, out)?;
     let no_state = arm64_fwd(0xB400_0000, out);
     let no_frame = arm64_jcc(&[0xAA00_03F3, 0xF940_0277], 0xB400_0017, out);
-    out.words(&[0xF940_02E8, 0xF900_0268, 0xF940_0EC8, 0xAA14_03E0, 0xD63F_0100, 0xA901_06E0, 0xF940_06F8]);
-    let drain_loop = out.pos();
-    out.u32(0xF940_0674);
-    let drain_null = arm64_fwd(0xB400_0014, out);
-    out.u32(0xEB18_029F);
-    let drain_mark = arm64_fwd(0x5400_0000, out);
-    emit_arm64_unlink_x20(out);
-    let skip_inactive = arm64_jcc(&[0x7200_011F], 0x5400_0000, out);
-    out.words(&[0x121F_7908, 0x3900_0288, 0xF940_0E88, 0xF940_1280, 0xD63F_0100]);
-    arm64_here(&[skip_inactive], out);
-    let back = arm64_fwd(0x1400_0000, out);
-    arm64_patch(back, drain_loop, out);
-    arm64_here(&[drain_null, drain_mark], out);
-    if addrs.unwind_table != 0 { super::unwind::emit_arm64_walk_call(c, addrs, out); }
+    out.words(&[0xF940_02E8, 0xF900_0268, 0xF940_0EC8, 0xAA14_03E0, 0xD63F_0100, 0xA901_06E0, 0xF900_02F3]);
+    super::unwind::emit_arm64_walk_call(c, addrs, out);
     c.words_call(&[0x9100_82E0, 0x5280_0021], c.pick("longjmp", "_longjmp"), out)?;
     arm64_here(&[no_state, no_frame], out);
     c.call("abort", out)?;
