@@ -102,7 +102,7 @@ impl Emit<'_> {
         }
         if op == Count::Tzcnt {
             self.raw(dst, x);
-            self.asm.bts(dst, bits);
+            self.asm.bt_imm(Size::Q, 5, dst, bits);
         } else {
             self.get(dst, x, Ext::Zero);
         }
@@ -144,6 +144,11 @@ impl Emit<'_> {
         let ty = self.ty(x);
         if self.is_static(result) || self.plan.deferred[result.index()] {
             self.flags = saved_flags;
+            return Ok(());
+        }
+        if op == Binary::Band && self.pure_test[result.index()] {
+            let cond = self.emit_test_band(x, y);
+            self.flags = Some((result, cond));
             return Ok(());
         }
         if op == Binary::Iconcat {
@@ -313,6 +318,19 @@ impl Emit<'_> {
                     self.asm.lea_sized(size, dst, Mem::sib(rx, ry, 0, 0));
                     return Ok(dst);
                 }
+            }
+            if size == Size::Q && !self.plan.fused[result.index()] && self.imm_sized(y, size).is_none()
+                && let Some(c) = self.const_of(y)
+                && let Some((ext, bit)) = match alu {
+                    Alu::Or if (c as u64).is_power_of_two() => Some((5, (c as u64).trailing_zeros() as u8)),
+                    Alu::Xor if (c as u64).is_power_of_two() => Some((7, (c as u64).trailing_zeros() as u8)),
+                    Alu::And if (!(c as u64)).is_power_of_two() => Some((6, (!(c as u64)).trailing_zeros() as u8)),
+                    _ => None,
+                }
+            {
+                self.raw(dst, x);
+                self.asm.bt_imm(Size::Q, ext, dst, bit);
+                return Ok(dst);
             }
             if self.imm_sized(y, size).is_none() && self.reg_of(y) == Some(dst) && x != y {
                 self.asm.mov(Reg::Rax, dst);
@@ -509,7 +527,7 @@ impl Emit<'_> {
     }
 
     /// The cached spill register of `value` when it survives reading `other`: not the rcx that reading `other` may write.
-    fn cached_beside(&self, value: Value, other: Value) -> Option<Reg> {
+    pub(super) fn cached_beside(&self, value: Value, other: Value) -> Option<Reg> {
         self.cached_spill(value).filter(|&reg| !(reg == Reg::Rcx && self.reads_through_rcx(other)))
     }
 
@@ -524,65 +542,6 @@ impl Emit<'_> {
             return None;
         };
         Some((a, b))
-    }
-
-    pub(super) fn emit_test_band(&mut self, x: Value, y: Value) -> Cond {
-        let ty = self.ty(x);
-        let size = Size::of(ty.bytes());
-        let imm_pair = match (self.const_of(y), self.const_of(x)) {
-            (Some(imm), _) => Some((x, crate::fold::extend(imm, ty, false))),
-            (None, Some(imm)) => Some((y, crate::fold::extend(imm, ty, false))),
-            (None, None) => None,
-        };
-        if let Some((val, imm)) = imm_pair {
-            let imm_sz = if ty != Type::I64 {
-                Some((size, imm as i32))
-            } else if let Ok(u) = u32::try_from(imm as u64) {
-                Some((Size::D, u as i32))
-            } else {
-                i32::try_from(imm).ok().map(|s| (Size::Q, s))
-            };
-            if let Some((tsz, timm)) = imm_sz {
-                let source = self.operand(val);
-                self.asm.test_imm_sized(tsz, source, timm);
-            } else {
-                let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
-                    self.operand(val)
-                } else {
-                    self.raw(Reg::Rax, val);
-                    Reg::Rax.into()
-                };
-                if ty == Type::I64 && (imm as u64).is_power_of_two() {
-                    self.asm.bt_imm(source, (imm as u64).trailing_zeros() as u8);
-                    return Cond::B;
-                } else if ty == Type::I64 && (imm as u64).checked_add(1).is_some_and(u64::is_power_of_two) {
-                    let shift = (imm as u64).leading_zeros() as u8;
-                    if !matches!(source, Rm::Reg(0)) {
-                        self.asm.load(Size::Q, Reg::Rax, source);
-                    }
-                    if shift == 1 { self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax); } else { self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift); }
-                    self.clobber_reg(Reg::Rax);
-                } else {
-                    let (source, wide) = self.spare(None, val, source);
-                    self.asm.mov_imm(wide, imm);
-                    self.clobber_reg(wide);
-                    self.asm.test_sized(Size::Q, source, wide);
-                }
-            }
-            return Cond::Ne;
-        }
-        if let Some(ry) = self.reg_of(y).or_else(|| self.cached_beside(y, x)) {
-            let sx = self.operand(x);
-            self.asm.test_sized(size, sx, ry);
-        } else if let Some(rx) = self.reg_of(x).or_else(|| self.cached_beside(x, y)) {
-            let sy = self.operand(y);
-            self.asm.test_sized(size, sy, rx);
-        } else {
-            self.raw(Reg::Rax, x);
-            let sy = self.operand(y);
-            self.asm.test_sized(size, sy, Reg::Rax);
-        }
-        Cond::Ne
     }
 
     pub(super) fn emit_cmp_pair(&mut self, size: Size, x: Value, y: Option<Value>, zero_test: bool, unsigned: bool) {
@@ -628,24 +587,6 @@ impl Emit<'_> {
             Op::Binary(Binary::Ushr, _, sh) => self.const_of(sh).is_some_and(|k| (k & 63) >= 32),
             Op::Binary(Binary::Band, a, b) => [a, b].into_iter().any(|v| self.const_of(v).is_some_and(|m| u32::try_from(m as u64).is_ok())),
             _ => false,
-        }
-    }
-
-    pub(super) fn emit_mem_rmw(&mut self, value: Value, to: Mem) {
-        self.flags = None;
-        let inst = self.defs[value.index()].expect("invariant: fuse_mem_rmw checked def");
-        let Op::Binary(op, a, b) = self.func.insts[inst.index()].op else { return };
-        let other = if self.plan.elided[a.index()] { b } else { a };
-        let alu = match op {
-            Binary::Iadd => Alu::Add, Binary::Isub => Alu::Sub,
-            Binary::Band => Alu::And, Binary::Bor => Alu::Or, Binary::Bxor => Alu::Xor,
-            _ => return,
-        };
-        let (ty, size) = (self.ty(value), Size::of(self.ty(value).bytes()));
-        if let Some(imm) = self.const_of(other).and_then(|c| if ty.bytes() < 8 { Some(c as i32) } else { i32::try_from(c).ok() }) {
-            self.asm.alu_imm_sized(size, alu, to, imm);
-        } else {
-            self.asm.alu_mem_reg(size, alu, to, self.reg_of(other).expect("invariant: fuse_mem_rmw checked reg"));
         }
     }
 

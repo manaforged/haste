@@ -509,11 +509,6 @@ impl Asm {
         self.imm(&[imm]);
     }
 
-    pub fn bts(&mut self, reg: Reg, bit: u8) {
-        self.encode(&[], true, &[0x0F, 0xBA], 5, reg.into(), false);
-        self.code.push(bit);
-    }
-
     pub fn setcc(&mut self, cond: Cond, reg: Reg) {
         self.encode(&[], false, &[0x0F, 0x90 + cond as u8], 0, reg.into(), Rm::from(reg).byte_rex());
     }

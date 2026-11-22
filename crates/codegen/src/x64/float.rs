@@ -38,8 +38,7 @@ impl Emit<'_> {
     }
 
     fn bit_sign(&mut self, ty: Type, toggle: bool, reg: Reg) {
-        self.asm.encode(&[], ty == Type::F64, &[0x0F, 0xBA], if toggle { 7 } else { 6 }, reg.into(), false);
-        self.asm.bytes(&[ty.bits() as u8 - 1]);
+        self.asm.bt_imm(if ty == Type::F64 { Size::Q } else { Size::D }, if toggle { 7 } else { 6 }, reg, ty.bits() as u8 - 1);
     }
 
     pub(super) fn float_unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
@@ -413,7 +412,7 @@ impl Emit<'_> {
         self.asm.jcc(Cond::Ae, max);
         self.asm.sse(&[0xF2], &[0x0F, 0x5C], X0.0, X1);
         self.asm.sse_wide(0xF2, 0x2C, Reg::Rax as u8, X0);
-        self.asm.bts(Reg::Rax, 63);
+        self.asm.bt_imm(Size::Q, 5, Reg::Rax, 63);
         self.asm.jmp(done);
         self.asm.bind(max);
         self.asm.mov_imm(Reg::Rax, -1);

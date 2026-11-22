@@ -1,4 +1,4 @@
-use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
+use super::asm::{Alu, Cond, Mem, Reg, Size, Xmm};
 use super::float::{X0, X1};
 use super::location::LEAF;
 use super::{Emit, int};
@@ -228,10 +228,8 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// Reads `result` from `addr + offset`, unless a call reads it in place.
-    fn load(&mut self, addr: Value, offset: i32, result: Value) {
-        if self.plan.through[result.index()].is_some() { return; }
-        if offset == 0 && self.direct_calls && self.ty(result).is_small_int()
+    fn try_load_rip(&mut self, addr: Value, result: Value) -> bool {
+        if self.direct_calls && self.ty(result).is_small_int()
             && let Some(sym) = match self.location(addr) {
                 Location::SlotAddr(s) => Some(s),
                 Location::Symbol(s) if self.func.is_image_addr(addr) => Some(s),
@@ -240,9 +238,16 @@ impl Emit<'_> {
         {
             let dst = self.dst(result);
             let at = self.asm.load_rip_reloc(Size::of(self.ty(result).bytes()), dst);
-            self.relocs.push(crate::reloc::StencilReloc::symbol(at, sym, crate::reloc::RelocKind::X64RipRel32));
-            return self.put(result, dst);
+            self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::X64RipRel32));
+            self.put(result, dst);
+            return true;
         }
+        false
+    }
+
+    /// Reads `result` from `addr + offset`, unless a call reads it in place.
+    fn load(&mut self, addr: Value, offset: i32, result: Value) {
+        if self.plan.through[result.index()].is_some() || (offset == 0 && self.try_load_rip(addr, result)) { return; }
         let from = self.address(addr, offset);
         self.read(result, from);
     }
@@ -262,19 +267,32 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax; r11 and rcx hold addresses.
+    /// Copies `bytes` bytes between two ranges that are the same or disjoint: 32 at a time under AVX, 16 through xmm1, then word by word through rax; r11 and rcx hold addresses.
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
         let source = self.address_in(from, 0, Reg::R11, Some(Reg::Rax));
         let target = self.address_in(to, 0, Reg::Rcx, Some(Reg::Rax));
-        let whole = bytes / VECTOR * VECTOR;
-        for at in (0..whole).step_by(VECTOR as usize) {
-            self.asm.sse(&[], &MOVUPS.0, X1.0, source.offset(at as i32));
-            self.asm.sse(&[], &MOVUPS.1, X1.0, target.offset(at as i32));
+        let mut at = 0_u32;
+        if self.features.avx {
+            while at + 32 <= bytes {
+                self.ymm_load(X1, source.offset(at as i32));
+                self.ymm_store(target.offset(at as i32), X1);
+                at += 32;
+            }
         }
-        for (ty, at) in crate::copy::words(bytes - whole) {
-            let at = (whole + at) as i32;
-            self.asm.load(Size::of(ty.bytes()), Reg::Rax, source.offset(at));
-            self.asm.store(Size::of(ty.bytes()), target.offset(at), Reg::Rax);
+        while at + VECTOR <= bytes {
+            if self.features.avx {
+                self.asm.vex_xmm(0b00001, 0b00, 0x10, (X1, Xmm(0)), source.offset(at as i32));
+                self.asm.vex_xmm(0b00001, 0b00, 0x11, (X1, Xmm(0)), target.offset(at as i32));
+            } else {
+                self.asm.sse(&[], &MOVUPS.0, X1.0, source.offset(at as i32));
+                self.asm.sse(&[], &MOVUPS.1, X1.0, target.offset(at as i32));
+            }
+            at += VECTOR;
+        }
+        for (ty, off) in crate::copy::words(bytes - at) {
+            let off = (at + off) as i32;
+            self.asm.load(Size::of(ty.bytes()), Reg::Rax, source.offset(off));
+            self.asm.store(Size::of(ty.bytes()), target.offset(off), Reg::Rax);
         }
         self.clobber_regs(&[Reg::R11, Reg::Rcx, Reg::Rax]);
         self.clobber_xmm(X1);
@@ -292,8 +310,11 @@ impl Emit<'_> {
         let size = Size::of(ty.bytes());
         match op {
             Op::AtomicLoad(addr, _) => {
-                let target = self.atomic_target(*addr, Reg::Rcx, &[]);
-                self.read(result()?, target);
+                let res = result()?;
+                if !self.try_load_rip(*addr, res) {
+                    let target = self.atomic_target(*addr, Reg::Rcx, &[]);
+                    self.read(res, target);
+                }
             }
             Op::AtomicStore(value, addr, ord) => {
                 if ord.is_seq_cst() {
@@ -725,68 +746,5 @@ impl Emit<'_> {
     fn emit_setcc_byte(&mut self, cond: Cond, dst: Reg) {
         self.asm.setcc(cond, dst);
         self.asm.load(Size::B, dst, dst);
-    }
-
-    /// Leaves the old contents in rax.
-    fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
-        match op {
-            AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub => {
-                let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
-                if op == AtomicRmwOp::Sub
-                    && let Some(imm) = self.const_of(value)
-                {
-                    self.asm.mov_imm(Reg::Rax, imm.wrapping_neg());
-                    self.asm.xadd(size, target, Reg::Rax);
-                    return;
-                }
-                self.raw(Reg::Rax, value);
-                if op == AtomicRmwOp::Xchg {
-                    self.asm.flags_overwritten();
-                    self.asm.xchg(size, target, Reg::Rax);
-                    return;
-                }
-                if op == AtomicRmwOp::Sub {
-                    self.asm.group3(Group3::Neg, Reg::Rax);
-                }
-                self.asm.xadd(size, target, Reg::Rax);
-            }
-            _ => self.rmw_loop(op, size, addr, value),
-        }
-    }
-
-    fn rmw_loop(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
-        let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
-        let imm_alu = match op {
-            AtomicRmwOp::Or => self.imm_sized(value, size).map(|imm| (Alu::Or, imm)),
-            AtomicRmwOp::Xor => self.imm_sized(value, size).map(|imm| (Alu::Xor, imm)),
-            AtomicRmwOp::And => self.imm_sized(value, size).map(|imm| (Alu::And, imm)),
-            _ => None,
-        };
-        let avoid: &[Reg] = if imm_alu.is_some() { &[Reg::Rax, Reg::Rcx] } else { &[Reg::Rax, Reg::Rcx, Reg::Rdx] };
-        let target = self.atomic_target(addr, Reg::Rsi, avoid);
-        if imm_alu.is_none() { self.get(Reg::Rdx, value, Ext::of(signed)); }
-        self.asm.load(size, Reg::Rax, target);
-        let again = self.asm.label();
-        self.asm.bind(again);
-        if signed { self.asm.load_signed(size, Reg::Rcx, Reg::Rax); } else { self.asm.load(size, Reg::Rcx, Reg::Rax); }
-        let choose = match op {
-            AtomicRmwOp::Smin => Some(Cond::G),
-            AtomicRmwOp::Smax => Some(Cond::L),
-            AtomicRmwOp::Umin => Some(Cond::A),
-            AtomicRmwOp::Umax => Some(Cond::B),
-            _ => None,
-        };
-        match (choose, imm_alu, op) {
-            (Some(cond), _, _) => { self.asm.alu(Alu::Cmp, Reg::Rcx, Reg::Rdx); self.asm.cmov(cond, Reg::Rcx, Reg::Rdx); }
-            (None, Some((alu, imm)), _) => self.asm.alu_imm_sized(size, alu, Reg::Rcx, imm),
-            (None, None, AtomicRmwOp::Or) => self.asm.alu(Alu::Or, Reg::Rcx, Reg::Rdx),
-            (None, None, AtomicRmwOp::Xor) => self.asm.alu(Alu::Xor, Reg::Rcx, Reg::Rdx),
-            (None, None, _) => {
-                self.asm.alu(Alu::And, Reg::Rcx, Reg::Rdx);
-                if op == AtomicRmwOp::Nand { self.asm.group3(Group3::Not, Reg::Rcx); }
-            }
-        }
-        self.asm.cmpxchg(size, target, Reg::Rcx);
-        self.asm.jcc(Cond::Ne, again);
     }
 }

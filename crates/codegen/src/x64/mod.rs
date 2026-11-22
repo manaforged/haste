@@ -84,7 +84,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let features = Features::host();
     let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
     let dropped_before = dropped(&plan);
-    let roots = location::fuse(func, &mut plan, &features);
+    let (roots, pure_test) = location::fuse(func, &mut plan, &features);
     if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
@@ -113,6 +113,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         plan,
         defs,
         roots,
+        pure_test,
         flags: None,
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
@@ -189,6 +190,7 @@ pub(super) struct Emit<'a> {
     plan: Plan<Reg>,
     defs: Vec<Option<Inst>>,
     roots: Vec<Option<location::Root>>,
+    pure_test: Vec<bool>,
     flags: Option<(Value, Cond)>,
     last_spill: crate::spills::SpillCache<Reg>,
     last_fspill: Option<(i32, Xmm, Type)>,

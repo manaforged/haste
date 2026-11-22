@@ -356,3 +356,39 @@ pub(super) fn fuse_mem_rmw(
         }
     }
 }
+
+/// Elides single-use variable `Ushr(word, k)` feeding a flag-tested `Band(ushr, 1)` so x64 emits `bt k, word`.
+pub(super) fn fuse_bt_shifts(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    tst_end: &[Option<usize>],
+    pure_test: &[bool],
+) {
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (bpos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let (Op::Binary(Binary::Band, x, y), Some(band)) = (&data.op, data.result) else { continue };
+            let end = if pure_test[band.index()] {
+                bpos
+            } else if plan.elided[band.index()] {
+                let Some(e) = tst_end[band.index()] else { continue };
+                e
+            } else {
+                continue;
+            };
+            if !matches!(func.ty(band), Type::I32 | Type::I64) { continue; }
+            let Some(shifted) = [(*x, *y), (*y, *x)].into_iter().find_map(|(s, m)| (plan.const_of(m) == Some(1)).then_some(s)) else { continue };
+            if uses[shifted.index()] != 1 || plan.elided[shifted.index()] { continue; }
+            let Some((sb, upos, uinst)) = pos_of[shifted.index()] else { continue };
+            if sb != b_idx || upos >= end { continue; }
+            let Op::Binary(Binary::Ushr, word, k) = func.insts[uinst.index()].op else { continue };
+            if plan.const_of(k).is_some() || plan.elided[word.index()] || plan.elided[k.index()] || plan.reg_of(word).is_none() {
+                continue;
+            }
+            if preserved(func, plan, b_idx, upos, end, &[], word) && preserved(func, plan, b_idx, upos, end, &[], k) {
+                plan.elided[shifted.index()] = true;
+            }
+        }
+    }
+}

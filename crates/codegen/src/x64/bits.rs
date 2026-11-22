@@ -254,6 +254,151 @@ impl Emit<'_> {
         self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
         Reg::Rax
     }
+    pub(super) fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
+        match op {
+            AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub => {
+                let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
+                if op == AtomicRmwOp::Sub
+                    && let Some(imm) = self.const_of(value)
+                {
+                    self.asm.mov_imm(Reg::Rax, imm.wrapping_neg());
+                    self.asm.xadd(size, target, Reg::Rax);
+                    return;
+                }
+                self.raw(Reg::Rax, value);
+                if op == AtomicRmwOp::Xchg {
+                    self.asm.flags_overwritten();
+                    self.asm.xchg(size, target, Reg::Rax);
+                    return;
+                }
+                if op == AtomicRmwOp::Sub {
+                    self.asm.group3(Group3::Neg, Reg::Rax);
+                }
+                self.asm.xadd(size, target, Reg::Rax);
+            }
+            _ => self.rmw_loop(op, size, addr, value),
+        }
+    }
+
+    fn rmw_loop(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
+        let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
+        let imm_alu = match op {
+            AtomicRmwOp::Or => self.imm_sized(value, size).map(|imm| (Alu::Or, imm)),
+            AtomicRmwOp::Xor => self.imm_sized(value, size).map(|imm| (Alu::Xor, imm)),
+            AtomicRmwOp::And => self.imm_sized(value, size).map(|imm| (Alu::And, imm)),
+            _ => None,
+        };
+        let avoid: &[Reg] = if imm_alu.is_some() { &[Reg::Rax, Reg::Rcx] } else { &[Reg::Rax, Reg::Rcx, Reg::Rdx] };
+        let target = self.atomic_target(addr, Reg::Rsi, avoid);
+        if imm_alu.is_none() { self.get(Reg::Rdx, value, Ext::of(signed)); }
+        self.asm.load(size, Reg::Rax, target);
+        let again = self.asm.label();
+        self.asm.bind(again);
+        if signed { self.asm.load_signed(size, Reg::Rcx, Reg::Rax); } else { self.asm.load(size, Reg::Rcx, Reg::Rax); }
+        let choose = match op {
+            AtomicRmwOp::Smin => Some(Cond::G),
+            AtomicRmwOp::Smax => Some(Cond::L),
+            AtomicRmwOp::Umin => Some(Cond::A),
+            AtomicRmwOp::Umax => Some(Cond::B),
+            _ => None,
+        };
+        match (choose, imm_alu, op) {
+            (Some(cond), _, _) => { self.asm.alu(Alu::Cmp, Reg::Rcx, Reg::Rdx); self.asm.cmov(cond, Reg::Rcx, Reg::Rdx); }
+            (None, Some((alu, imm)), _) => self.asm.alu_imm_sized(size, alu, Reg::Rcx, imm),
+            (None, None, AtomicRmwOp::Or) => self.asm.alu(Alu::Or, Reg::Rcx, Reg::Rdx),
+            (None, None, AtomicRmwOp::Xor) => self.asm.alu(Alu::Xor, Reg::Rcx, Reg::Rdx),
+            (None, None, _) => {
+                self.asm.alu(Alu::And, Reg::Rcx, Reg::Rdx);
+                if op == AtomicRmwOp::Nand { self.asm.group3(Group3::Not, Reg::Rcx); }
+            }
+        }
+        self.asm.cmpxchg(size, target, Reg::Rcx);
+        self.asm.jcc(Cond::Ne, again);
+    }
+
+    pub(super) fn emit_test_band(&mut self, x: Value, y: Value) -> Cond {
+        let ty = self.ty(x);
+        let size = Size::of(ty.bytes());
+        let imm_pair = match (self.const_of(y), self.const_of(x)) {
+            (Some(imm), _) => Some((x, crate::fold::extend(imm, ty, false))),
+            (None, Some(imm)) => Some((y, crate::fold::extend(imm, ty, false))),
+            (None, None) => None,
+        };
+        if let Some((val, imm)) = imm_pair {
+            if imm == 1 && matches!(ty, Type::I32 | Type::I64) && self.plan.elided[val.index()]
+                && let Some(uinst) = self.defs[val.index()]
+                && let Op::Binary(Binary::Ushr, word, k) = self.func.insts[uinst.index()].op
+                && let Some(rw) = self.reg_of(word)
+            {
+                let rk = self.reg_of(k).unwrap_or_else(|| { self.raw(Reg::Rax, k); self.clobber_reg(Reg::Rax); Reg::Rax });
+                self.asm.bt_reg(size, rw, rk);
+                return Cond::B;
+            }
+            let imm_sz = if ty != Type::I64 {
+                Some((size, imm as i32))
+            } else if let Ok(u) = u32::try_from(imm as u64) {
+                Some((Size::D, u as i32))
+            } else {
+                i32::try_from(imm).ok().map(|s| (Size::Q, s))
+            };
+            if let Some((tsz, timm)) = imm_sz {
+                let source = self.operand(val);
+                self.asm.test_imm_sized(tsz, source, timm);
+            } else {
+                let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
+                    self.operand(val)
+                } else {
+                    self.raw(Reg::Rax, val);
+                    Reg::Rax.into()
+                };
+                if ty == Type::I64 && (imm as u64).is_power_of_two() {
+                    self.asm.bt_imm(Size::Q, 4, source, (imm as u64).trailing_zeros() as u8);
+                    return Cond::B;
+                } else if ty == Type::I64 && (imm as u64).checked_add(1).is_some_and(u64::is_power_of_two) {
+                    let shift = (imm as u64).leading_zeros() as u8;
+                    if !matches!(source, Rm::Reg(0)) { self.asm.load(Size::Q, Reg::Rax, source); }
+                    if shift == 1 { self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax); } else { self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift); }
+                    self.clobber_reg(Reg::Rax);
+                } else {
+                    let (source, wide) = self.spare(None, val, source);
+                    self.asm.mov_imm(wide, imm);
+                    self.clobber_reg(wide);
+                    self.asm.test_sized(Size::Q, source, wide);
+                }
+            }
+            return Cond::Ne;
+        }
+        if let Some(ry) = self.reg_of(y).or_else(|| self.cached_beside(y, x)) {
+            let sx = self.operand(x);
+            self.asm.test_sized(size, sx, ry);
+        } else if let Some(rx) = self.reg_of(x).or_else(|| self.cached_beside(x, y)) {
+            let sy = self.operand(y);
+            self.asm.test_sized(size, sy, rx);
+        } else {
+            self.raw(Reg::Rax, x);
+            let sy = self.operand(y);
+            self.asm.test_sized(size, sy, Reg::Rax);
+        }
+        Cond::Ne
+    }
+
+    pub(super) fn emit_mem_rmw(&mut self, value: Value, to: Mem) {
+        self.flags = None;
+        let inst = self.defs[value.index()].expect("invariant: fuse_mem_rmw checked def");
+        let Op::Binary(op, a, b) = self.func.insts[inst.index()].op else { return };
+        let other = if self.plan.elided[a.index()] { b } else { a };
+        let alu = match op {
+            Binary::Iadd => Alu::Add, Binary::Isub => Alu::Sub,
+            Binary::Band => Alu::And, Binary::Bor => Alu::Or, Binary::Bxor => Alu::Xor,
+            _ => return,
+        };
+        let (ty, size) = (self.ty(value), Size::of(self.ty(value).bytes()));
+        if let Some(imm) = self.const_of(other).and_then(|c| if ty.bytes() < 8 { Some(c as i32) } else { i32::try_from(c).ok() }) {
+            self.asm.alu_imm_sized(size, alu, to, imm);
+        } else {
+            self.asm.alu_mem_reg(size, alu, to, self.reg_of(other).expect("invariant: fuse_mem_rmw checked reg"));
+        }
+    }
 }
 
 /// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.

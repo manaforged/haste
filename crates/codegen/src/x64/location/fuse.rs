@@ -359,11 +359,11 @@ pub(in super::super) fn narrows_exactly(func: &Function, plan: &Plan<Reg>, def: 
     func.ty(x).unsigned_max() & !to.unsigned_max() & !zeros == 0
 }
 
-pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &Features) -> Vec<Option<Root>> {
+pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &Features) -> (Vec<Option<Root>>, Vec<bool>) {
     let n = func.types.len();
-    let mut roots = vec![None; n];
+    let (mut roots, mut pure_test) = (vec![None; n], vec![false; n]);
     if func.size() > 8192 {
-        return roots;
+        return (roots, pure_test);
     }
     let defs = crate::fold::defs(func);
     let (mut uses, mut pos_of, mut ls_uses, mut use_of) = (vec![0_u32; n], vec![None; n], vec![Vec::new(); n], vec![None; n]);
@@ -643,7 +643,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         if plan.elided[res.index()] || plan.deferred[res.index()] || plan.fused[res.index()] || plan.sib[res.index()].is_some() || skip_flags[res.index()] {
             continue;
         }
-        if op == Binary::Band && [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF))) {
+        if op == Binary::Band && ((uses[res.index()] > 0 && !non_flag_use[res.index()]) || [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF)))) {
             continue;
         }
         if op == Binary::Ushr && !plan.const_of(y).is_some_and(|c| (c & i64::from(func.ty(res).bits() - 1)) != 0) && bextr_parts(func, plan, func.ty(res), op, (x, y), |v| plan.elided[v.index()], def_inst).is_none() {
@@ -694,23 +694,23 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             if plan.elided[cmp_res.index()] || plan.fused[cmp_res.index()] || uses[cmp_res.index()] == 0 || non_flag_use[cmp_res.index()] {
                 continue;
             }
-            if !flag_cmp(func, &data.op) {
-                continue;
-            }
+            let is_band = matches!(data.op, Op::Binary(Binary::Band, a, _) if func.ty(a).is_small_int());
+            if !flag_cmp(func, &data.op) && !is_band { continue; }
             let Some((ub, last_pos)) = last_flag_use[cmp_res.index()] else { continue };
-            if ub != b_idx || last_pos <= cpos {
-                continue;
-            }
+            if ub != b_idx || last_pos <= cpos { continue; }
             if (cpos + 1..=last_pos).all(|pos| mid_preserves_flags(func, plan, &defs, &roots, cmp_res, block.insts[pos], pos == last_pos)) {
                 plan.fused[cmp_res.index()] = true;
+                pure_test[cmp_res.index()] = is_band;
             } else if let Op::Icmp(_, a, b) = data.op {
                 let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
                 if !parked(plan, cmp_res) && [a, b].into_iter().all(|v| cmp_operand_ok(&ctx, &tst_end, cpos, last_pos, v)) {
                     plan.elided[cmp_res.index()] = true;
+                    for v in [a, b] { if tst_end[v.index()].is_some() { tst_end[v.index()] = Some(last_pos); } }
                 }
             }
         }
     }
+    super::sib::fuse_bt_shifts(func, plan, (&uses, &pos_of), &tst_end, &pure_test);
     fold_products(func, plan, &uses, &defs);
     if features.avx2 { super::elide_broadcast_inserts(func, plan, &defs, (&uses, &pos_of, &use_of)); }
     super::fuse_atomic_rmws(func, plan, (&uses, &pos_of, &use_of));
@@ -722,7 +722,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             }
         }
     }
-    roots
+    (roots, pure_test)
 }
 
 /// Elides each zero vector read only as the base of integer lane-0 inserts, which write their scalar into a zeroed register without reading the base.

@@ -220,11 +220,17 @@ impl Asm {
         self.imm(&[bit]);
     }
 
-    /// `bt rm, bit` on a 64-bit operand, copying bit `bit` into the carry flag.
-    pub fn bt_imm(&mut self, rm: impl Into<Rm>, bit: u8) {
+    /// `bt/bts/btr/btc rm, bit` (`ext` = 4/5/6/7) at `size` (`Size::D` or `Size::Q`), copying bit `bit` into CF.
+    pub fn bt_imm(&mut self, size: Size, ext: u8, rm: impl Into<Rm>, bit: u8) {
         self.flags_overwritten();
-        self.encode(&[], true, &[0x0F, 0xBA], 4, rm.into(), false);
+        self.encode(&[], size == Size::Q, &[0x0F, 0xBA], ext, rm.into(), false);
         self.imm(&[bit]);
+    }
+
+    /// `bt dst, bit` on registers at `size` (`Size::D` or `Size::Q`), copying bit `bit & (bits - 1)` of `dst` into CF.
+    pub fn bt_reg(&mut self, size: Size, dst: Reg, bit: Reg) {
+        self.flags_overwritten();
+        self.encode(&[], size == Size::Q, &[0x0F, 0xA3], bit as u8, dst.into(), false);
     }
 
     fn xmm_op(&mut self, pp: u8, opcode: u8, (xmm, src): (Xmm, Xmm), rm: impl Into<Rm>) {
