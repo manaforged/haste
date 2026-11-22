@@ -254,29 +254,34 @@ impl Emit<'_> {
         self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
         Reg::Rax
     }
-    pub(super) fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
+    pub(super) fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value, dst: Option<Reg>) -> Reg {
         match op {
             AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub => {
                 let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
+                let out = dst.filter(|&r| target.base != r && target.index.is_none_or(|(idx, _)| idx != r)).unwrap_or(Reg::Rax);
                 if op == AtomicRmwOp::Sub
                     && let Some(imm) = self.const_of(value)
                 {
-                    self.asm.mov_imm(Reg::Rax, imm.wrapping_neg());
-                    self.asm.xadd(size, target, Reg::Rax);
-                    return;
+                    self.asm.mov_imm(out, imm.wrapping_neg());
+                    self.asm.xadd(size, target, out);
+                    return out;
                 }
-                self.raw(Reg::Rax, value);
+                self.raw(out, value);
                 if op == AtomicRmwOp::Xchg {
                     self.asm.flags_overwritten();
-                    self.asm.xchg(size, target, Reg::Rax);
-                    return;
+                    self.asm.xchg(size, target, out);
+                    return out;
                 }
                 if op == AtomicRmwOp::Sub {
-                    self.asm.group3(Group3::Neg, Reg::Rax);
+                    self.asm.group3(Group3::Neg, out);
                 }
-                self.asm.xadd(size, target, Reg::Rax);
+                self.asm.xadd(size, target, out);
+                out
             }
-            _ => self.rmw_loop(op, size, addr, value),
+            _ => {
+                self.rmw_loop(op, size, addr, value);
+                Reg::Rax
+            }
         }
     }
 

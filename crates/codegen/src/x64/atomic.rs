@@ -330,21 +330,23 @@ impl Emit<'_> {
             }
             Op::AtomicRmw(rmw, _, addr, value) => {
                 let res = result()?;
-                if self.plan.fused[res.index()] && *rmw != AtomicRmwOp::Xchg {
+                let out = if self.plan.fused[res.index()] && *rmw != AtomicRmwOp::Xchg {
                     self.lock_rmw(*rmw, size, *addr, *value);
+                    Reg::Rax
                 } else {
-                    self.rmw(*rmw, size, *addr, *value);
+                    let out = self.rmw(*rmw, size, *addr, *value, self.reg_of(res));
                     if matches!(rmw, AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub) {
-                        self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
+                        self.clobber_regs(&[out, Reg::Rcx]);
                     } else {
                         self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi]);
                     }
-                }
+                    out
+                };
                 if *rmw == AtomicRmwOp::Sub {
                     self.asm.hold_eq(res.index() as u32, value.index() as u32);
                 }
                 if !self.plan.fused[res.index()] {
-                    self.put(res, Reg::Rax);
+                    self.put(res, out);
                 }
             }
             Op::AtomicCas(_, addr, expected, replacement) => {

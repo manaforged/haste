@@ -156,6 +156,40 @@ impl<'a> BlockWrites<'a> {
         !self.writes[block.index()].is_empty()
     }
 
+    /// Immediate dominator of `cur` when neither it nor any block on a path from it to `cur` has writes.
+    pub(super) fn write_free_idom(&self, cur: Block) -> Option<Block> {
+        let dom = self.cfg.idom[cur.index()]?;
+        if self.has_writes(dom) {
+            return None;
+        }
+        if self.cfg.single_pred(cur) == Some(dom) {
+            return Some(dom);
+        }
+        let mut seen = Vec::new();
+        let mut work = Vec::new();
+        for &pred in self.cfg.preds_of(cur) {
+            if self.cfg.reachable[pred.index()] && pred != dom && !seen.contains(&pred) {
+                if self.has_writes(pred) || seen.len() >= MAX_MERGE_WALK {
+                    return None;
+                }
+                seen.push(pred);
+                work.push(pred);
+            }
+        }
+        while let Some(m) = work.pop() {
+            for &pred in self.cfg.preds_of(m) {
+                if self.cfg.reachable[pred.index()] && pred != dom && !seen.contains(&pred) {
+                    if self.has_writes(pred) || seen.len() >= MAX_MERGE_WALK {
+                        return None;
+                    }
+                    seen.push(pred);
+                    work.push(pred);
+                }
+            }
+        }
+        Some(dom)
+    }
+
     /// Computes surviving `KnownLoads` and live `(base, root)` keys at entry to `block`.
     pub(super) fn entry_known(
         &mut self,

@@ -192,17 +192,36 @@ impl Emit<'_> {
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
         let source = self.address_in(from, 0, S);
         let target = self.address_in(to, 0, C);
-        let whole = bytes / 16 * 16;
-        for at in (0..whole).step_by(16) {
+        let qpair_ok = |d: i32| d % 16 == 0 && (-1024..=1008).contains(&d);
+        let mut at = 0_u32;
+        let mut used_v0 = false;
+        let mut used_v1 = false;
+        while at + 32 <= bytes
+            && let (Some(sd), Some(td)) = (source.disp.checked_add(at as i32), target.disp.checked_add(at as i32))
+            && qpair_ok(sd)
+            && qpair_ok(td)
+        {
+            self.asm.qldp_offset(super::V0, super::V1, source.base, sd);
+            self.asm.qstp_offset(super::V0, super::V1, target.base, td);
+            used_v0 = true;
+            used_v1 = true;
+            at += 32;
+        }
+        while at + 16 <= bytes {
             self.asm.vload(16, super::V1, source.offset(at as i32));
             self.asm.vstore(16, target.offset(at as i32), super::V1);
+            used_v1 = true;
+            at += 16;
         }
-        for (ty, at) in crate::copy::words(bytes - whole) {
-            let at = (whole + at) as i32;
-            self.asm.load(Size::of(ty.bytes()), false, A, source.offset(at));
-            self.asm.store(Size::of(ty.bytes()), target.offset(at), A);
+        for (ty, off) in crate::copy::words(bytes - at) {
+            let off = (at + off) as i32;
+            self.asm.load(Size::of(ty.bytes()), false, A, source.offset(off));
+            self.asm.store(Size::of(ty.bytes()), target.offset(off), A);
         }
-        if whole > 0 {
+        if used_v0 {
+            self.clobber_vreg(super::V0);
+        }
+        if used_v1 {
             self.clobber_vreg(super::V1);
         }
         self.clobber_regs(&[A, C, S]);

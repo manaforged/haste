@@ -463,21 +463,16 @@ fn scan(
                 }
                 write_preserving(func, known, bases, loc, ty, value, state.prov);
                 record_base(bases, loc);
-                let safe_write = slot_unescaped(state.prov, loc);
-                bufs.const_stores.retain(|cs| {
-                    !may_alias(loc, cs.loc, state.prov)
-                        && (slot_unescaped(state.prov, cs.loc) || safe_write || cs.loc.base == loc.base)
-                });
                 let track = state.post_inline || !matches!(loc.root, MemRoot::Slot(s) if !state.prov.slot_unescaped(s));
+                if track && !state.post_inline {
+                    changed |= drop_covered_stores(func, &mut bufs, &mut guard, (loc, false));
+                }
+                let mut push_loc = loc;
+                if let Some(wide_loc) = try_coalesce_store(func, state, known, bases, &mut bufs, (inst, loc, ty, value, track)) {
+                    push_loc = wide_loc;
+                    changed = true;
+                }
                 if track {
-                    if !state.post_inline {
-                        changed |= drop_covered_stores(func, &mut bufs, &mut guard, (loc, false));
-                    }
-                    let mut push_loc = loc;
-                    if let Some(wide_loc) = try_coalesce_store(func, state, known, bases, &mut bufs, (inst, loc, ty, value)) {
-                        push_loc = wide_loc;
-                        changed = true;
-                    }
                     if state.post_inline {
                         changed |= drop_covered_stores(func, &mut bufs, &mut guard, (push_loc, true));
                     }
