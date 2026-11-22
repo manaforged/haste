@@ -31,7 +31,7 @@ impl Emit<'_> {
             }
             Op::SlotAddr(sym) | Op::Symbol(sym) => {
                 let result = result()?;
-                if !self.plan.is_static(result) {
+                if !self.plan.is_static(result) && self.plan.through[result.index()].is_none() {
                     let dst = self.dst(result);
                     if self.direct_calls {
                         let at = self.asm.adrp_add_reloc(dst);
@@ -45,14 +45,16 @@ impl Emit<'_> {
             }
             Op::Runtime(rt) => {
                 let result = result()?;
-                let dst = self.dst(result);
-                let (at, kind) = if self.direct_calls {
-                    (self.asm.adrp_add_reloc(dst), RelocKind::Arm64AdrpAdd)
-                } else {
-                    (self.asm.mov_symbol(dst), RelocKind::Arm64Movw64)
-                };
-                self.relocs.push(StencilReloc::runtime(at, *rt, kind));
-                self.put(result, dst);
+                if !self.plan.is_static(result) && self.plan.through[result.index()].is_none() {
+                    let dst = self.dst(result);
+                    let (at, kind) = if self.direct_calls {
+                        (self.asm.adrp_add_reloc(dst), RelocKind::Arm64AdrpAdd)
+                    } else {
+                        (self.asm.mov_symbol(dst), RelocKind::Arm64Movw64)
+                    };
+                    self.relocs.push(StencilReloc::runtime(at, *rt, kind));
+                    self.put(result, dst);
+                }
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
             _ => return self.access(op, result),

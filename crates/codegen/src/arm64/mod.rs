@@ -59,7 +59,7 @@ const REGS: Regs<Reg> = Regs {
     float_branches: &float::BRANCHES,
     vectors: true,
     absolute_calls: true,
-    constant_calls: false,
+    constant_calls: true,
     two_address: false,
     park: true,
     fold_sib: true,
@@ -716,7 +716,8 @@ impl Emit<'_> {
                 self.asm.mov_imm(T, i64::from(at));
                 self.asm.blr(T);
             }
-            Some(CallTarget::Runtime(_) | CallTarget::Symbol(_)) => return Err("arm64 plans no constant call target".to_owned()),
+            Some(CallTarget::Runtime(rt)) => self.relocs.push(self.asm.call_runtime(rt, self.direct_calls, T)),
+            Some(CallTarget::Symbol(sym)) => self.relocs.push(self.asm.call_direct_symbol(sym, self.direct_calls, T)),
             None => self.asm.blr(target),
         }
         Ok(abi)
