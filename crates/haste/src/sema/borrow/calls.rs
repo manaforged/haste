@@ -537,6 +537,11 @@ impl Checker<'_, '_> {
         let Expr::Closure { body, .. } = *self.body.expr(expr) else {
             return None;
         };
+        if let Some(cached) = self.temp_sources.get(&body)
+            && !self.expr_has_return(body)
+        {
+            return Some(cached.iter().map(|s| s.target).collect());
+        }
         let mut inner_locals = HashSet::default();
         if !self.can_analyze_closure_ret(body, &mut inner_locals) {
             return None;

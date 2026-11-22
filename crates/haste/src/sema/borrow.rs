@@ -76,6 +76,7 @@ struct Checker<'c, 'a> {
     returns_borrow: bool,
     return_min_depth: u32,
     closure_depth: u32,
+    const_depth: u32,
     closure_by_val_caps: Vec<u32>,
     stmt_depth: u32,
     temp_scope_depth: u32,
@@ -159,7 +160,7 @@ pub(super) fn check(
     }
     let mut checker = Checker {
         cx, item, body, src, typed, mutable, is_copy, is_param, scope_depth, names,
-        no_move_captures: Vec::new(), returns_borrow: false, return_min_depth: 1, closure_depth: 0,
+        no_move_captures: Vec::new(), returns_borrow: false, return_min_depth: 1, closure_depth: 0, const_depth: 0,
         closure_by_val_caps: Vec::new(), stmt_depth: 1, temp_scope_depth: 1,
         breaks: Vec::new(), temp_depth: 0, let_extend_depth: None, temp_sources: HashMap::default(),
         closure_effects: HashMap::default(), drop_cache: HashMap::default(), drop_locals: HashSet::default(),
@@ -254,9 +255,10 @@ impl Checker<'_, '_> {
         id
     }
 
-    fn is_const_or_static_item(&self) -> bool {
-        self.closure_depth == 0
-            && matches!(self.cx.item(self.item).1.kind, ItemKind::Const | ItemKind::Static)
+    pub(super) fn is_const_or_static_item(&self) -> bool {
+        self.const_depth > 0
+            || (self.closure_depth == 0
+                && matches!(self.cx.item(self.item).1.kind, ItemKind::Const | ItemKind::Static))
     }
 
     pub(super) fn with_let_extend<T>(&mut self, depth: Option<u32>, f: impl FnOnce(&mut Self) -> T) -> T {
@@ -428,6 +430,7 @@ impl Checker<'_, '_> {
 
     fn check_return_escape(&mut self, expr: ExprId, state: &State) -> Result<()> {
         match *self.body.expr(expr) {
+            Expr::Block { kind: BlockKind::Const, .. } => Ok(()),
             Expr::Paren(inner) | Expr::Block { tail: Some(inner), .. } => self.check_return_escape(inner, state),
             Expr::If(_, then, otherwise) => {
                 self.check_return_escape(then, state)?;

@@ -6,10 +6,20 @@ use crate::outline::source::Source;
 use crate::sema::ty::Kind;
 
 use super::super::bind::push_loan;
+use super::super::calls::{Lifetimes, collect_ty_lifetimes};
 use super::super::places::{Place, PlaceStep};
 use super::super::propagate::{BorrowSource, dedup_sources};
 use super::super::{Checker, State, is_temp_holder};
 use super::is_temp_target;
+
+#[derive(Default)]
+struct ParamBounds {
+    req_fn: bool,
+    req_fn_mut: bool,
+    req_static: bool,
+    hrtb_params: Vec<usize>,
+    hrtb_non_ret: Vec<usize>,
+}
 
 #[derive(Clone, Debug)]
 pub(in super::super) struct ClosureParamLoan {
@@ -49,45 +59,75 @@ impl Checker<'_, '_> {
             let Some(&(_, param_ty)) = sig.params.get(param_idx) else { continue };
             let arg = ExprId(id);
             let ref_static = matches!(*sig.body.ty(param_ty), AstTy::Ref { lifetime: Some(lt), .. } if sig_src.text(lt) == "'static");
-            let (req_fn, req_fn_mut, req_static, hrtb_params) = self.param_bound_reqs(sig, sig_src, param_ty);
-            if req_static || ref_static {
+            let bounds = self.param_bound_reqs(sig, sig_src, param_ty);
+            if bounds.req_static || ref_static {
                 self.check_static_arg(arg, state)?;
             }
-            if req_fn || req_fn_mut || req_static || !hrtb_params.is_empty() {
-                self.check_closure_arg_reqs(arg, req_fn, req_fn_mut, req_static, &hrtb_params)?;
+            if bounds.req_fn || bounds.req_fn_mut || bounds.req_static || !bounds.hrtb_params.is_empty() {
+                self.check_closure_arg_reqs(arg, bounds.req_fn, bounds.req_fn_mut, bounds.req_static, &bounds.hrtb_params)?;
             }
         }
         Ok(())
     }
 
-    fn param_bound_reqs(&self, sig: &Signature, src: &Source, param_ty: TyId) -> (bool, bool, bool, Vec<usize>) {
-        let (mut req_fn, mut req_fn_mut, mut req_static) = (false, false, false);
-        let mut hrtb_params = Vec::new();
+    pub(in super::super) fn callee_hrtb_non_ret_params(&mut self, callee: ExprId) -> Vec<usize> {
+        let mut cur = callee;
+        while let Expr::Paren(inner) = *self.body.expr(cur) {
+            cur = inner;
+        }
+        let Some(crate::sema::infer::Res::Local(local)) = self.typed.res.get(&cur).copied() else {
+            return Vec::new();
+        };
+        let Some(pos) = self.typed.params.iter().position(|&p| p == local) else {
+            return Vec::new();
+        };
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return Vec::new();
+        };
+        let Some(param_idx) = (if sig.receiver.is_some() { pos.checked_sub(1) } else { Some(pos) }) else {
+            return Vec::new();
+        };
+        let Some(&(_, param_ty)) = sig.params.get(param_idx) else {
+            return Vec::new();
+        };
+        self.param_bound_reqs(&sig, self.src, param_ty).hrtb_non_ret
+    }
+
+    fn param_bound_reqs(&self, sig: &Signature, src: &Source, param_ty: TyId) -> ParamBounds {
+        let mut out = ParamBounds::default();
         let mut check_bounds = |list: List| {
             for &b_id in sig.body.list(list) {
                 match sig.body.bounds[b_id as usize] {
-                    Bound::Lifetime(lt) if src.text(lt) == "'static" => req_static = true,
+                    Bound::Lifetime(lt) if src.text(lt) == "'static" => out.req_static = true,
                     Bound::Trait { path, .. } => {
                         if let Some(&seg_id) = sig.body.list(sig.body.path(path).segments).last() {
                             let seg = sig.body.segments[seg_id as usize];
                             let is_callable = match src.text(seg.name) {
                                 "Fn" => {
-                                    req_fn = true;
+                                    out.req_fn = true;
                                     true
                                 }
                                 "FnMut" => {
-                                    req_fn_mut = true;
+                                    out.req_fn_mut = true;
                                     true
                                 }
                                 "FnOnce" => true,
                                 _ => false,
                             };
-                            if is_callable && let Some(Args::Paren { inputs, .. }) = seg.args {
+                            if is_callable && let Some(Args::Paren { inputs, output }) = seg.args {
+                                let out_elided = output.is_some_and(|out_ty| {
+                                    let mut lts = Lifetimes::default();
+                                    collect_ty_lifetimes(&sig.body, src, out_ty, &mut lts);
+                                    lts.has_elided
+                                });
                                 for (p_idx, &in_ty) in sig.body.list(inputs).iter().enumerate() {
-                                    if matches!(*sig.body.ty(TyId(in_ty)), AstTy::Ref { lifetime: None, .. })
-                                        && !hrtb_params.contains(&p_idx)
-                                    {
-                                        hrtb_params.push(p_idx);
+                                    if matches!(*sig.body.ty(TyId(in_ty)), AstTy::Ref { lifetime: None, .. }) {
+                                        if !out.hrtb_params.contains(&p_idx) {
+                                            out.hrtb_params.push(p_idx);
+                                        }
+                                        if !out_elided && !out.hrtb_non_ret.contains(&p_idx) {
+                                            out.hrtb_non_ret.push(p_idx);
+                                        }
                                     }
                                 }
                             }
@@ -128,10 +168,13 @@ impl Checker<'_, '_> {
             }
             _ => {}
         }
-        (req_fn, req_fn_mut, req_static, hrtb_params)
+        out
     }
 
     fn check_static_arg(&mut self, expr: ExprId, state: &State) -> Result<()> {
+        if self.is_const_or_static_item() {
+            return Ok(());
+        }
         for s in self.expr_borrow_sources(expr, state) {
             if is_temp_target(s.target).is_some() || !self.from_caller(s.target, s.through_ref) {
                 bail!("`{}` does not live long enough", self.local_name(s.target));

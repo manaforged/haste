@@ -22,6 +22,10 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         let block_depth = depth + 1;
         let saved_stmt_depth = self.stmt_depth;
+        let is_const = kind == BlockKind::Const;
+        if is_const {
+            self.const_depth += 1;
+        }
         let update_stmt_depth = !matches!(kind, BlockKind::Expansion | BlockKind::Unsafe);
         if label.is_some() {
             self.breaks.push(BreakFrame {
@@ -126,10 +130,13 @@ impl Checker<'_, '_> {
                         bail!("`{}` does not live long enough", self.local_name(src.target));
                     }
                 }
-                if !tail_srcs.is_empty() {
+                if !tail_srcs.is_empty() && !is_const {
                     self.temp_sources.insert(expr_id, tail_srcs);
                 }
             }
+        }
+        if is_const {
+            self.const_depth -= 1;
         }
         self.stmt_depth = saved_stmt_depth;
         if !state.diverged {
