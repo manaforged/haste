@@ -1,6 +1,6 @@
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::emit::{Cache, can_br_table, emit_within, push_node};
+use super::emit::{Cache, can_br_table, emit_split, emit_within, push_node};
 use super::{Arm, Edge, Info, Range, Run, intersect_ranges, match_test, range_fits, range_of_test, same_edge};
 
 #[derive(Clone, Copy)]
@@ -190,7 +190,7 @@ fn best_bitmask_window(ty: Type, subset: &[Run]) -> Option<(BitmaskPlan, usize, 
     best_window_for(ty, subset, true, min_2w).or(best_1w)
 }
 
-fn find_bitmask_target(func: &Function, info: &Info, ty: Type, runs: &[Run]) -> Option<(BitmaskPlan, Edge, Vec<Run>)> {
+fn find_bitmask_target(func: &Function, info: &Info, ty: Type, runs: &[Run]) -> Option<(BitmaskPlan, Edge, Vec<Run>, u64, u64)> {
     if runs.len() < 3 {
         return None;
     }
@@ -204,9 +204,9 @@ fn find_bitmask_target(func: &Function, info: &Info, ty: Type, runs: &[Run]) -> 
     }
     groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     let can_tbl = groups.len() > 1 && can_br_table(runs).is_some();
-    let mut best: Option<(BitmaskPlan, Edge, Vec<Run>, usize, usize)> = None;
+    let mut best: Option<(BitmaskPlan, Edge, Vec<Run>, usize, usize, u64, u64)> = None;
     for (hit, subset) in groups {
-        if subset.len() < 3 || best.as_ref().is_some_and(|(_, _, _, wi, wj)| subset.len() < wj - wi) {
+        if subset.len() < 3 || best.as_ref().is_some_and(|(_, _, _, wi, wj, _, _)| subset.len() < wj - wi) {
             break;
         }
         let Some((plan, wi, wj)) = best_bitmask_window(ty, &subset) else { continue };
@@ -219,11 +219,11 @@ fn find_bitmask_target(func: &Function, info: &Info, ty: Type, runs: &[Run]) -> 
         if can_tbl && rest.len() > 2 {
             continue;
         }
-        if best.as_ref().is_none_or(|&(bp, _, _, bi, bj)| plan_rank(plan, wi, wj) > plan_rank(bp, bi, bj)) {
-            best = Some((plan, hit, rest, wi, wj));
+        if best.as_ref().is_none_or(|&(bp, _, _, bi, bj, _, _)| plan_rank(plan, wi, wj) > plan_rank(bp, bi, bj)) {
+            best = Some((plan, hit, rest, wi, wj, w_lo, w_hi));
         }
     }
-    best.map(|(plan, hit, rest, _, _)| (plan, hit, rest))
+    best.map(|(plan, hit, rest, _, _, w_lo, w_hi)| (plan, hit, rest, w_lo, w_hi))
 }
 
 pub(super) fn can_bitmask_runs(func: &Function, info: &Info, ty: Type, runs: &[Run]) -> bool {
@@ -392,6 +392,67 @@ fn emit_bitmask_branch(
     insts
 }
 
+fn masked_quad_params(ty: Type, runs: &[Run]) -> Option<(u64, u64, u64)> {
+    if !ty.is_small_int() || runs.len() != 4 || runs.iter().any(|r| r.lo != r.hi) {
+        return None;
+    }
+    let [a, b, c, d] = [runs[0].lo, runs[1].lo, runs[2].lo, runs[3].lo];
+    if a >= 4096 || d > ty.unsigned_max() {
+        return None;
+    }
+    for (hi_bit, delta, mid_hi) in [(a ^ c, b - a, b), (a ^ b, c - a, c)] {
+        let other_hi = if mid_hi == b { c } else { b };
+        if hi_bit.is_power_of_two()
+            && delta.is_power_of_two()
+            && hi_bit < (1 << 31)
+            && delta < (1 << 31)
+            && (a & hi_bit) == 0
+            && (mid_hi & hi_bit) == 0
+            && other_hi == (a | hi_bit)
+            && d == (mid_hi | hi_bit)
+        {
+            return Some((a, hi_bit, delta));
+        }
+    }
+    None
+}
+
+fn emit_masked_quad(
+    func: &mut Function,
+    at: Option<(usize, Inst)>,
+    (v, ty): (Value, Type),
+    (base, hi_bit, delta): (u64, u64, u64),
+    (hit, otherwise): (Edge, Block),
+) -> Block {
+    let to = if ty.bits() < 32 { Type::I32 } else { ty };
+    let mut insts = Vec::with_capacity(10);
+    let vw = if ty == to {
+        v
+    } else {
+        let res = func.value(to);
+        insts.push(func.add(Op::Convert(Convert::Uextend, v), Some(res)));
+        res
+    };
+    let (hi_mask_c, cleared) = (func.value(to), func.value(to));
+    insts.push(func.add(Op::Const(crate::fold::extend((!hi_bit) as i64, to, true)), Some(hi_mask_c)));
+    insts.push(func.add(Op::Binary(Binary::Band, vw, hi_mask_c), Some(cleared)));
+    let diff = if base == 0 {
+        cleared
+    } else {
+        let (base_c, sub) = (func.value(to), func.value(to));
+        insts.push(func.add(Op::Const(crate::fold::extend(base as i64, to, true)), Some(base_c)));
+        insts.push(func.add(Op::Binary(Binary::Isub, cleared, base_c), Some(sub)));
+        sub
+    };
+    let (delta_mask_c, masked, zero_c, cond) = (func.value(to), func.value(to), func.value(to), func.value(Type::I8));
+    insts.push(func.add(Op::Const(crate::fold::extend((!delta) as i64, to, true)), Some(delta_mask_c)));
+    insts.push(func.add(Op::Binary(Binary::Band, diff, delta_mask_c), Some(masked)));
+    insts.push(func.add(Op::Const(0), Some(zero_c)));
+    insts.push(func.add(Op::Icmp(IntCC::Equal, masked, zero_c), Some(cond)));
+    insts.push(func.add(Op::Brif(cond, hit.block, hit.args, otherwise, Vec::new()), None));
+    push_node(func, at, insts)
+}
+
 pub(super) fn try_emit_bitmask_runs(
     func: &mut Function,
     info: &Info,
@@ -400,12 +461,35 @@ pub(super) fn try_emit_bitmask_runs(
     runs: &[Run],
     (default_blk, cache): (Block, &mut Cache),
 ) -> Option<Block> {
-    let (plan, hit, rest) = find_bitmask_target(func, info, ty, runs)?;
+    let (plan, hit, rest, w_lo, w_hi) = find_bitmask_target(func, info, ty, runs)?;
+    if !rest.is_empty() && rest.len() > 2 && !plan.signed && plan.base >= 0 {
+        let split = if rest.last().is_some_and(|r| r.hi < w_lo) {
+            Some(w_lo)
+        } else if rest.first().is_some_and(|r| r.lo > w_hi) {
+            Some(rest[0].lo)
+        } else {
+            None
+        };
+        if let Some(split) = split
+            && let Some(split_idx) = runs.iter().position(|r| r.lo >= split)
+            && split_idx > 0
+            && split_idx < runs.len()
+        {
+            let left = emit_within(func, info, None, (v, ty, (lo, split - 1)), &runs[..split_idx], (default_blk, cache));
+            let right = emit_within(func, info, None, (v, ty, (split, hi)), &runs[split_idx..], (default_blk, cache));
+            return Some(emit_split(func, at, (v, ty), split, (left, right)));
+        }
+    }
     let otherwise = if rest.is_empty() {
         default_blk
     } else {
         emit_within(func, info, None, (v, ty, (lo, hi)), &rest, (default_blk, cache))
     };
+    if rest.is_empty()
+        && let Some((base, hi_bit, delta)) = masked_quad_params(ty, runs)
+    {
+        return Some(emit_masked_quad(func, at, (v, ty), (base, hi_bit, delta), (hit, otherwise)));
+    }
     let known_u_max = known_upper_bound(func, info, v).min(hi);
     let insts = emit_bitmask_branch(func, (v, ty), (plan, lo, known_u_max), ((hit.block, hit.args), (otherwise, Vec::new())));
     Some(push_node(func, at, insts))

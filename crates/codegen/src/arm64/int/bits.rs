@@ -88,6 +88,27 @@ impl Emit<'_> {
         Some(hit)
     }
 
+    pub(super) fn is_zext_sub_cmp(&self, lhs: Value, cc: IntCC, raw_imm: i64) -> bool {
+        let ty = self.ty(lhs);
+        if ty.bytes() >= 4 || cc.is_signed() {
+            return false;
+        }
+        let Some(inst) = self.defs[lhs.index()] else { return false };
+        let Op::Binary(Binary::Isub, base, c_val) = self.func.insts[inst.index()].op else { return false };
+        let Some(raw_c) = self.plan.const_of(c_val) else { return false };
+        let simm_c = crate::fold::extend(raw_c, ty, true);
+        if simm_c <= 0 || !self.is_zext_reg(base) {
+            return false;
+        }
+        let wrap_floor = (1_u64 << ty.bits()) - (simm_c as u64);
+        let u_imm = crate::fold::extend(raw_imm, ty, false) as u64;
+        if matches!(cc, IntCC::UnsignedLessThan | IntCC::UnsignedGreaterThanOrEqual) {
+            u_imm <= wrap_floor
+        } else {
+            u_imm < wrap_floor
+        }
+    }
+
     fn sload_op(&self, val: Value) -> Option<Op> {
         match self.func.insts[self.defs[val.index()]?.index()].op {
             Op::Load(addr, off) => Some(Op::Load(addr, off)),

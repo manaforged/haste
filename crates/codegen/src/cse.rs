@@ -654,50 +654,29 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                     Op::Binary(Binary::Bor, x, y) if bool_val[x.index()] && bool_val[y.index()] => bool_val[ri] = true,
                     Op::Binary(Binary::Bxor, x, y) => {
                         bool_val[ri] = bool_val[x.index()] && bool_val[y.index()];
-                        if consts[y.index()] == Some(1) && bool_val[x.index()] {
-                            bool_neg[ri] = Some(x);
-                        } else if consts[x.index()] == Some(1) && bool_val[y.index()] {
-                            bool_neg[ri] = Some(y);
-                        }
+                        if consts[y.index()] == Some(1) && bool_val[x.index()] { bool_neg[ri] = Some(x); }
+                        else if consts[x.index()] == Some(1) && bool_val[y.index()] { bool_neg[ri] = Some(y); }
                     }
-                    Op::Binary(Binary::Isub, x, y) if consts[x.index()] == Some(1) && bool_val[y.index()] => {
-                        bool_val[ri] = true;
-                        bool_neg[ri] = Some(y);
-                    }
+                    Op::Binary(Binary::Isub, x, y) if consts[x.index()] == Some(1) && bool_val[y.index()] => { bool_val[ri] = true; bool_neg[ri] = Some(y); }
                     Op::Select(_, x, y) if bool_val[x.index()] && bool_val[y.index()] => bool_val[ri] = true,
                     _ => {}
                 }
             }
-            if let Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) = data.op
-                && uses[c.index()] == 1
-                && def_block[c.index()] == block_tag(b)
-                && let Some(c_def) = blk.insts.iter().find(|&&i| func.insts[i.index()].result == Some(c))
-                && matches!(func.insts[c_def.index()].op, Op::Icmp(..))
+            if let Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) = data.op && uses[c.index()] == 1 && def_block[c.index()] == block_tag(b)
+                && blk.insts.iter().find(|&&i| func.insts[i.index()].result == Some(c)).is_some_and(|&c_def| matches!(func.insts[c_def.index()].op, Op::Icmp(..)))
             {
                 local_flag_only[c.index()] = true;
             }
         }
     }
     let affine = identity(func.types.len()).into_iter().map(|v| (v, 0_i64)).collect();
-    let stack_addrs = vec![None; func.types.len()];
     let nvals = func.types.len();
     let mut table = Table {
-        consts,
-        bool_neg,
-        icmp_def,
-        def_block,
-        local_flag_only,
-        bool_val,
-        affine,
-        stack_addrs,
-        assoc: vec![None; nvals],
-        unary_src: vec![None; nvals],
-        conv_src: vec![None; nvals],
-        select_def: vec![None; nvals],
+        consts, bool_neg, icmp_def, def_block, local_flag_only, bool_val, affine,
+        stack_addrs: vec![None; nvals], assoc: vec![None; nvals], unary_src: vec![None; nvals], conv_src: vec![None; nvals], select_def: vec![None; nvals],
         ..Table::default()
     };
-    let mut dropped = false;
-    let mut stack = vec![Visit::Enter(entry)];
+    let (mut dropped, mut stack) = (false, vec![Visit::Enter(entry)]);
     while let Some(visit) = stack.pop() {
         match visit {
             Visit::Leave(mark) => table.forget(mark),
@@ -708,10 +687,110 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             }
         }
     }
-    if dropped {
-        rename(func, &subst);
-        Domain::VALUES
-    } else {
-        Domain::NONE
+    if dropped { rename(func, &subst); }
+    let changed = narrow_widened_subs(func, &cfg, &table.consts, &table.bool_val);
+    if dropped || changed { Domain::VALUES } else { Domain::NONE }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeVal { Const(i64), Val(Value) }
+
+pub(crate) struct CmpEnv<'a> {
+    pub(crate) defs: &'a [Option<Inst>],
+    pub(crate) consts: &'a [Option<i64>],
+    pub(crate) subst: &'a [Value],
+    pub(crate) bool_val: Option<&'a [bool]>,
+}
+
+impl CmpEnv<'_> {
+    fn find(&self, mut v: Value) -> Value { while let Some(&s) = self.subst.get(v.index()) && s != v { v = s; } v }
+    fn known(&self, v: Value) -> Option<i64> { self.consts.get(self.find(v).index()).copied().flatten() }
+    pub(crate) fn edge_val(&self, v: Value) -> EdgeVal { self.known(v).map_or_else(|| EdgeVal::Val(self.find(v)), EdgeVal::Const) }
+    fn is_bool(&self, func: &Function, v: Value) -> bool { self.bool_val.map_or_else(|| self.defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Icmp(..) | Op::Fits(..))), |b| b.get(v.index()).copied().unwrap_or(false)) }
+}
+
+pub(crate) fn cmp_proves(ty: Type, (mut hcc, mut hx, mut hy): (IntCC, EdgeVal, EdgeVal), (mut wcc, mut wx, mut wy): (IntCC, EdgeVal, EdgeVal)) -> bool {
+    use IntCC::*;
+    if let (EdgeVal::Const(a), EdgeVal::Const(b)) = (wx, wy) { return crate::fold::holds(wcc, ty, a, b); }
+    if matches!((hx, hy), (EdgeVal::Const(_), EdgeVal::Val(_))) { (hcc, hx, hy) = (flip_int_cc(hcc), hy, hx); }
+    if matches!((wx, wy), (EdgeVal::Const(_), EdgeVal::Val(_))) { (wcc, wx, wy) = (flip_int_cc(wcc), wy, wx); }
+    let cc_ok = |h, w| h == w || matches!((h, w), (Equal, UnsignedLessThanOrEqual | UnsignedGreaterThanOrEqual | SignedLessThanOrEqual | SignedGreaterThanOrEqual) | (UnsignedLessThan, UnsignedLessThanOrEqual | NotEqual) | (UnsignedGreaterThan, UnsignedGreaterThanOrEqual | NotEqual) | (SignedLessThan, SignedLessThanOrEqual | NotEqual) | (SignedGreaterThan, SignedGreaterThanOrEqual | NotEqual));
+    if ((hx, hy) == (wx, wy) && cc_ok(hcc, wcc)) || ((hy, hx) == (wx, wy) && cc_ok(flip_int_cc(hcc), wcc)) { return true; }
+    let (EdgeVal::Val(hv), EdgeVal::Const(hc), EdgeVal::Val(wv), EdgeVal::Const(wc)) = (hx, hy, wx, wy) else { return false };
+    if hv != wv { return false; }
+    let (um, ch, cw) = (ty.unsigned_max(), crate::fold::extend(hc, ty, false) as u64, crate::fold::extend(wc, ty, false) as u64);
+    let (lo, hi) = match hcc {
+        Equal => (ch, ch), UnsignedLessThan if ch > 0 => (0, ch - 1), UnsignedLessThanOrEqual => (0, ch), UnsignedGreaterThan if ch < um => (ch + 1, um),
+        UnsignedGreaterThanOrEqual => (ch, um), NotEqual if ch == 0 && um >= 1 => (1, um), NotEqual if ch == um && um >= 1 => (0, um - 1), _ => return false,
+    };
+    matches!((wcc, cw), (Equal, c) if lo == c && hi == c) || matches!(wcc, NotEqual if cw < lo || cw > hi)
+        || matches!(wcc, UnsignedLessThan if hi < cw) || matches!(wcc, UnsignedLessThanOrEqual if hi <= cw)
+        || matches!(wcc, UnsignedGreaterThan if lo > cw) || matches!(wcc, UnsignedGreaterThanOrEqual if lo >= cw)
+}
+
+pub(crate) fn cond_proves_want(func: &Function, env: &CmpEnv<'_>, (cond, taken, depth): (Value, bool, u8), ty: Type, want: (IntCC, EdgeVal, EdgeVal)) -> bool {
+    let Some(inst) = (depth < 4).then(|| env.defs.get(cond.index()).copied().flatten()).flatten() else { return false };
+    match func.insts[inst.index()].op {
+        Op::Convert(Convert::Uextend, inner) if func.ty(inner).is_small_int() => cond_proves_want(func, env, (inner, taken, depth + 1), ty, want),
+        Op::Binary(Binary::Bxor, a, b) => [(a, b), (b, a)].into_iter().any(|(i, k)| env.is_bool(func, i) && env.known(k).is_some_and(|v| crate::fold::extend(v, func.ty(k), false) == 1) && cond_proves_want(func, env, (i, !taken, depth + 1), ty, want)),
+        Op::Binary(Binary::Band, a, b) if taken => cond_proves_want(func, env, (a, true, depth + 1), ty, want) || cond_proves_want(func, env, (b, true, depth + 1), ty, want),
+        Op::Binary(Binary::Bor, a, b) if !taken => cond_proves_want(func, env, (a, false, depth + 1), ty, want) || cond_proves_want(func, env, (b, false, depth + 1), ty, want),
+        Op::Icmp(cc, x, y) if func.ty(x) == ty => cmp_proves(ty, (if taken { cc } else { cc.inverse() }, env.edge_val(x), env.edge_val(y)), want),
+        _ => false,
     }
+}
+
+pub(crate) fn dom_proves_want(func: &Function, cfg: &crate::cfg::Cfg, env: &CmpEnv<'_>, mut cur: Block, skip: Option<Block>, ty: Type, want: (IntCC, EdgeVal, EdgeVal)) -> bool {
+    let start = cur;
+    for _ in 0..24 {
+        if Some(cur) != skip && func.blocks[cur.index()].insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Trapz(c) | Op::Assume(c) if cond_proves_want(func, env, (c, true, 0), ty, want))) { return true; }
+        let Some(parent) = cfg.idom[cur.index()].filter(|&p| p != cur) else { break };
+        if let Some(&Op::Brif(c, tb, _, eb, _)) = func.last(parent) && tb != eb
+            && let Some(t) = (cfg.single_pred(tb) == Some(parent) && cfg.dominates(tb, start)).then_some(true).or_else(|| (cfg.single_pred(eb) == Some(parent) && cfg.dominates(eb, start)).then_some(false))
+            && cond_proves_want(func, env, (c, t, 0), ty, want) { return true; }
+        cur = parent;
+    }
+    false
+}
+
+fn sub_add_const(consts: &[Option<i64>], op: &Op, ty: Type) -> Option<(Value, i64)> {
+    let um = ty.unsigned_max() as i64;
+    match *op {
+        Op::Binary(Binary::Isub, x, y) => consts[y.index()].map(|c| (x, crate::fold::extend(c, ty, false).wrapping_neg() & um)),
+        Op::Binary(Binary::Iadd, x, y) => consts[y.index()].map(|c| (x, crate::fold::extend(c, ty, false) & um)).or_else(|| consts[x.index()].map(|c| (y, crate::fold::extend(c, ty, false) & um))),
+        _ => None,
+    }
+}
+
+fn narrow_widened_subs(func: &mut Function, cfg: &crate::cfg::Cfg, consts: &[Option<i64>], bool_val: &[bool]) -> bool {
+    let defs = crate::fold::defs(func);
+    let mut wide = Vec::new();
+    for &b in &cfg.rpo {
+        for (p, &i) in func.blocks[b.index()].insts.iter().enumerate() {
+            if let Some(r) = func.insts[i.index()].result && matches!(func.ty(r), Type::I32 | Type::I64)
+                && let Some((u, d)) = sub_add_const(consts, &func.insts[i.index()].op, func.ty(r))
+                && let Some(ui) = defs[u.index()] && let Op::Convert(Convert::Uextend, base) = func.insts[ui.index()].op && matches!(func.ty(base), Type::I8 | Type::I16)
+            { wide.push((base, func.ty(base), d & (func.ty(base).unsigned_max() as i64), r, b, p)); }
+        }
+    }
+    if wide.is_empty() { return false; }
+    let id_subst: Vec<Value> = (0..func.types.len() as u32).map(Value).collect();
+    let env = CmpEnv { defs: &defs, consts, subst: &id_subst, bool_val: Some(bool_val) };
+    let (mut changed, mut subst, mut has_subst) = (false, id_subst.clone(), false);
+    for &block in &cfg.rpo {
+        for pos in 0..func.blocks[block.index()].insts.len() {
+            let inst = func.blocks[block.index()].insts[pos];
+            let Some(res) = func.insts[inst.index()].result else { continue };
+            let ty = func.ty(res);
+            if matches!(ty, Type::I8 | Type::I16) && let Some((base, delta)) = sub_add_const(consts, &func.insts[inst.index()].op, ty)
+                && let Some(&(_, _, _, dw, _, _)) = wide.iter().find(|&&(bw, st, d, _, wb, wp)| bw == base && st == ty && d == delta && (wb == block && wp < pos || wb != block && cfg.dominates(wb, block)))
+            { func.insts[inst.index()].op = Op::Convert(Convert::Ireduce, dw); changed = true; }
+            if let Op::Convert(Convert::Uextend, inner) = func.insts[inst.index()].op && let Some(ii) = defs[inner.index()] && let Op::Convert(Convert::Ireduce, src) = func.insts[ii.index()].op
+                && func.ty(inner).bits() < func.ty(src).bits() && dom_proves_want(func, cfg, &env, block, Some(block), func.ty(src), (IntCC::UnsignedLessThanOrEqual, EdgeVal::Val(src), EdgeVal::Const(func.ty(inner).unsigned_max() as i64)))
+            { func.insts[inst.index()].op = if ty.bits() > func.ty(src).bits() { Op::Convert(Convert::Uextend, src) } else if ty.bits() < func.ty(src).bits() { Op::Convert(Convert::Ireduce, src) } else { subst[res.index()] = src; has_subst = true; continue }; changed = true; }
+        }
+    }
+    if has_subst { rename(func, &subst); changed = true; }
+    if changed { let u = func.use_counts(); for b in &mut func.blocks { b.insts.retain(|&i| !matches!(func.insts[i.index()].op, Op::Convert(Convert::Ireduce | Convert::Uextend, _)) || func.insts[i.index()].result.is_none_or(|r| u[r.index()] > 0)); } }
+    changed
 }
