@@ -66,6 +66,7 @@ fn outside_uses(func: &Function) -> Vec<u64> {
 fn step_block(
     func: &Function,
     cx: &ThreadCx<'_>,
+    pred: Option<Block>,
     cur: Block,
     cur_args: &[Value],
     state: &mut EvalState,
@@ -80,7 +81,7 @@ fn step_block(
     }
     bind(cx, state, &block.params, cur_args);
     for &inst in body {
-        step_inst(func, cx, inst, state)?;
+        step_inst(func, cx, pred, inst, state)?;
     }
     let (next_b, raw_args, resolved_branch): (Block, &[Value], bool) = match &func.insts[last.index()].op {
         Op::Brif(cond, then_b, then_args, else_b, else_args) => {
@@ -125,8 +126,8 @@ fn marks(state: &EvalState) -> (usize, usize, usize) {
     (state.map.len(), state.local_ops.len(), state.local_consts.len())
 }
 
-fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>], disp: Block, incoming: &[Value], seed: EdgeSeed) -> Option<Eval> {
-    if func.blocks[disp.index()].params.is_empty() && matches!(seed, EdgeSeed::None) {
+fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>], (pred, disp): (Option<Block>, Block), incoming: &[Value], seed: EdgeSeed) -> Option<Eval> {
+    if func.blocks[disp.index()].params.is_empty() && matches!(seed, EdgeSeed::None) && !(pred.is_some() && stored::body_has_load(func, disp)) {
         return None;
     }
     let mut state = EvalState::default();
@@ -135,7 +136,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>],
     if redefines(func, disp, &seeded) {
         return None;
     }
-    let first = step_block(func, cx, disp, incoming, &mut state)?;
+    let first = step_block(func, cx, pred, disp, incoming, &mut state)?;
     let mut visited = vec![disp];
     let mut stops = vec![(first, marks(&state))];
     while let Some(((next_b, next_args, resolved), _)) = stops.last() {
@@ -143,7 +144,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>],
             break;
         }
         let cur = *next_b;
-        let Some((nb, na, step_resolved)) = step_block(func, cx, cur, next_args, &mut state) else {
+        let Some((nb, na, step_resolved)) = step_block(func, cx, pred, cur, next_args, &mut state) else {
             break;
         };
         let resolved = *resolved | step_resolved;
@@ -376,8 +377,8 @@ fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, d
     for at in 0..args.len() {
         let Some((sel_c, args_t, args_f)) = select_split(func, cx.defs, args, at) else { continue };
         let (Some(et), Some(ef)) = (
-            eval_dispatcher(func, cx, &[], disp, &args_t, EdgeSeed::Brif(sel_c, true)),
-            eval_dispatcher(func, cx, &[], disp, &args_f, EdgeSeed::Brif(sel_c, false)),
+            eval_dispatcher(func, cx, &[], (Some(pred), disp), &args_t, EdgeSeed::Brif(sel_c, true)),
+            eval_dispatcher(func, cx, &[], (Some(pred), disp), &args_f, EdgeSeed::Brif(sel_c, false)),
         ) else {
             continue;
         };
@@ -392,8 +393,8 @@ fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, d
             continue;
         }
         let (Some(et), Some(ef)) = (
-            eval_dispatcher(func, cx, &[], disp, args, EdgeSeed::Const(arg, 1)),
-            eval_dispatcher(func, cx, &[], disp, args, EdgeSeed::Const(arg, 0)),
+            eval_dispatcher(func, cx, &[], (Some(pred), disp), args, EdgeSeed::Const(arg, 1)),
+            eval_dispatcher(func, cx, &[], (Some(pred), disp), args, EdgeSeed::Const(arg, 0)),
         ) else {
             continue;
         };
@@ -432,13 +433,13 @@ fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<
         return false;
     }
     let args = args.clone();
-    if let Some(eval) = eval_dispatcher(func, cx, single, disp, &args, EdgeSeed::None) {
+    if let Some(eval) = eval_dispatcher(func, cx, single, (Some(pred), disp), &args, EdgeSeed::None) {
         let (new_target, new_args) = carry::commit(func, cx, single, pred, eval);
         func.insts[term.index()].op = Op::Jump(new_target, new_args);
         return true;
     }
     if let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
-        && let Some(eval) = eval_dispatcher(func, cx, single, disp, &args, EdgeSeed::Brif(cond, taken))
+        && let Some(eval) = eval_dispatcher(func, cx, single, (Some(pred), disp), &args, EdgeSeed::Brif(cond, taken))
         && eval.chosen_target != disp
         && non_const_needed(&eval) <= MAX_BRIF_SPEC_OPS
     {
@@ -465,9 +466,9 @@ fn brif_arm(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Blo
             && (eval.carry.values.is_empty() || !func.successors(pred).any(|s| s == eval.chosen_target))
             && (!strict || (eval.resolved_branch && needed == 0 && eval.carry.values.is_empty()))
     };
-    let eval = eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Brif(*cond, taken))
+    let eval = eval_dispatcher(func, cx, single, (Some(pred), disp), args, EdgeSeed::Brif(*cond, taken))
         .filter(|eval| ok(eval, false))
-        .or_else(|| eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Equal(*cond, taken)).filter(|eval| ok(eval, true)))?;
+        .or_else(|| eval_dispatcher(func, cx, single, (Some(pred), disp), args, EdgeSeed::Equal(*cond, taken)).filter(|eval| ok(eval, true)))?;
     Some(carry::commit(func, cx, single, pred, eval))
 }
 
@@ -510,7 +511,7 @@ fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, single: &[Option<Bloc
         if *target != disp {
             continue;
         }
-        let Some(eval) = eval_dispatcher(func, cx, &[], disp, &[], EdgeSeed::Const(index, k as i64)) else {
+        let Some(eval) = eval_dispatcher(func, cx, &[], (Some(pred), disp), &[], EdgeSeed::Const(index, k as i64)) else {
             continue;
         };
         if eval.chosen_args.is_empty() && non_const_needed(&eval) == 0 && eval.chosen_target != *target {
@@ -520,7 +521,7 @@ fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, single: &[Option<Bloc
     }
     if new_default == disp
         && let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
-        && let Some(eval) = eval_dispatcher(func, cx, &[], disp, &[], EdgeSeed::Brif(cond, taken))
+        && let Some(eval) = eval_dispatcher(func, cx, &[], (Some(pred), disp), &[], EdgeSeed::Brif(cond, taken))
         && eval.chosen_args.is_empty()
         && non_const_needed(&eval) == 0
         && eval.chosen_target != new_default
@@ -556,23 +557,13 @@ fn body(func: &Function, block: Block) -> &[Inst] {
     func.blocks[block.index()].insts.split_last().map_or(&[][..], |(_, body)| body)
 }
 
-fn steppable(func: &Function, block: Block) -> bool {
-    let insts = &func.blocks[block.index()].insts;
-    let Some((&last, body)) = insts.split_last() else {
-        return false;
-    };
-    insts.len() <= MAX_DISP_INSTS
-        && matches!(func.insts[last.index()].op, Op::Brif(..) | Op::Jump(..) | Op::BrTable(..))
-        && body.iter().all(|inst| func.insts[inst.index()].result.is_some() && func.insts[inst.index()].op.is_speculable())
-}
-
 fn dispatches(func: &Function, pinned: &[bool], disp: Block) -> bool {
-    if pinned[disp.index()] || !steppable(func, disp) {
+    if pinned[disp.index()] || !stored::steppable(func, disp, MAX_DISP_INSTS) {
         return false;
     }
     match func.last(disp) {
         Some(Op::Jump(next, _)) => {
-            func.blocks[disp.index()].insts.len() <= MAX_JUMP_DISP_INSTS && *next != disp && !pinned[next.index()] && steppable(func, *next)
+            func.blocks[disp.index()].insts.len() <= MAX_JUMP_DISP_INSTS && *next != disp && !pinned[next.index()] && stored::steppable(func, *next, MAX_DISP_INSTS)
         }
         _ => true,
     }

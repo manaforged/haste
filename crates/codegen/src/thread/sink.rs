@@ -49,7 +49,7 @@ fn evaluate(func: &Function, cx: &ThreadCx<'_>, disp: Block, found: &[(Inst, Val
     }
     bind(cx, &mut state, &func.blocks[disp.index()].params, args);
     for &(inst, _) in found {
-        let _ = step_inst(func, cx, inst, &mut state);
+        let _ = step_inst(func, cx, None, inst, &mut state);
     }
     state
 }

@@ -73,11 +73,18 @@ pub(super) fn bind(cx: &ThreadCx<'_>, state: &mut EvalState, params: &[Value], a
     }
 }
 
-pub(super) fn step_inst(func: &Function, cx: &ThreadCx<'_>, inst: Inst, state: &mut EvalState) -> Option<()> {
+pub(super) fn step_inst(func: &Function, cx: &ThreadCx<'_>, pred: Option<Block>, inst: Inst, state: &mut EvalState) -> Option<()> {
     let data = &func.insts[inst.index()];
     let res = data.result?;
     if !data.op.is_speculable() {
-        return None;
+        let p = pred?;
+        let mut op = data.op.clone();
+        op.map_operands(|v| lookup(&state.map, v));
+        let imm = super::stored::pred_load_const(func, cx, state, p, &op, func.ty(res))?;
+        state.local_consts.push((res, imm));
+        state.local_ops.push((res, Op::Const(imm)));
+        state.map.retain(|&(k, _)| k != res);
+        return Some(());
     }
     let mut op = data.op.clone();
     op.map_operands(|v| lookup(&state.map, v));
