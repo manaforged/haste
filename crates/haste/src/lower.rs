@@ -237,8 +237,8 @@ struct Loop {
 #[derive(Default)]
 pub(super) struct Inline {
     pub stack: Vec<usize>,
-    pub local: rustc_hash::FxHashMap<usize, (Option<Arc<stencil::InlinedCallee>>, usize)>,
-    pub local_meta: rustc_hash::FxHashMap<usize, (Option<stencil::InlineMeta>, usize)>,
+    pub local: rustc_hash::FxHashMap<(usize, usize), (Option<Arc<stencil::InlinedCallee>>, usize)>,
+    pub local_meta: rustc_hash::FxHashMap<(usize, usize), (Option<stencil::InlineMeta>, usize)>,
     pub max_callee_height: u8,
     pub max_callee_size: u16,
     pub host: budget::Copies,

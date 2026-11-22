@@ -145,8 +145,8 @@ impl InlineTemplate {
     }
 }
 
-const TRANSIENT_CAP: usize = 4_096;
-const TRIM_SHARDS: usize = 8;
+const TRANSIENT_CAP: usize = 32_768;
+const TRIM_SHARDS: usize = 4;
 const MAX_INLINE_HEIGHT: u8 = 12;
 
 pub(super) type InlineMeta = (ItemRef, FootprintId, bool, u8, u16);
@@ -187,10 +187,11 @@ pub(super) fn simplify_tallied(func: &mut Function, kind: Tally) {
 #[derive(Default)]
 pub struct Bodies {
     pub(super) plans: Table<(ItemRef, Option<ExprId>), Arc<BodyFootprintPlan>>,
-    inlined: Table<usize, Option<Arc<InlinedCallee>>>,
+    inlined: Table<(usize, usize), Option<Arc<InlinedCallee>>>,
     pub(super) partial: Table<(usize, bool), Option<Arc<InlinedCallee>>>,
-    inline_meta: Table<usize, Option<InlineMeta>>,
-    templates: Table<TemplateKey, Option<Arc<InlineTemplate>>>,
+    inline_meta: Table<(usize, usize), Option<InlineMeta>>,
+    templates: Table<TemplateKey, Arc<InlineTemplate>>,
+    rejected: Table<TemplateKey, ()>,
     cyclic: RwLock<FxHashMap<usize, cycles::CycleState>>,
     persist: std::sync::OnceLock<persist::Persist>,
     transient_entries: AtomicUsize,
@@ -201,17 +202,18 @@ impl Bodies {
     /// Drops all cached inlineable bodies and footprints.
     pub fn clear(&self) {
         self.clear_transient();
+        self.inline_meta.clear();
+        self.rejected.clear();
         self.plans.clear();
         write_lock(&self.cyclic).clear();
     }
 
-    /// Drops cached inline templates while retaining footprint plans and precomputed cycle entries.
+    /// Drops cached inline templates while retaining footprint plans, shape metadata, and precomputed cycle entries.
     pub fn clear_transient(&self) {
         self.transient_entries.store(0, Ordering::Relaxed);
         self.evict_cursor.store(0, Ordering::Relaxed);
         self.inlined.clear();
         self.partial.clear();
-        self.inline_meta.clear();
         self.templates.clear();
     }
 
@@ -236,7 +238,6 @@ impl Bodies {
             let shard = (start + offset) % crate::sema::table::SHARDS;
             removed += self.inlined.clear_shard(shard);
             removed += self.partial.clear_shard(shard);
-            removed += self.inline_meta.clear_shard(shard);
             removed += self.templates.clear_shard(shard);
         }
         self.plans.clear_shard((start / TRIM_SHARDS) % crate::sema::table::SHARDS);
@@ -320,7 +321,7 @@ fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slot
     Ok((tmpl, cycle, depth, quiet))
 }
 
-fn limit_flags(cx: &mut Context<'_>, reached: &Reached, (bodies, inline): (&Bodies, &Inline), index: usize, limit: usize) -> Option<(usize, bool, bool, bool)> {
+fn limit_flags(cx: &mut Context<'_>, reached: &Reached, (bodies, inline): (&Bodies, &Inline), index: usize, limit: usize) -> Option<(usize, Option<usize>, bool, bool)> {
     let cap = if !reached.is_sole_called(index) && bodies.is_cyclic(cx, reached, index) {
         let host = inline.stack.last().copied().filter(|&host| host >= index);
         if host.is_some_and(|host| bodies.is_cyclic(cx, reached, host)) {
@@ -332,29 +333,38 @@ fn limit_flags(cx: &mut Context<'_>, reached: &Reached, (bodies, inline): (&Bodi
     };
     let std_limit = super::budget::inline_limit(cx, reached, index).map(|standard| standard.min(cap));
     let limit = limit.min(cap);
-    Some((limit, std_limit == Some(limit), std_limit.is_some_and(|sl| limit >= sl), std_limit.is_some_and(|sl| limit <= sl)))
+    Some((limit, std_limit, std_limit.is_some_and(|sl| limit >= sl), std_limit.is_some_and(|sl| limit <= sl)))
 }
 
-fn cached_inline(bodies: &Bodies, inline: &Inline, index: usize, (pos_valid, neg_valid, shape_only): (bool, bool, bool)) -> Option<(Option<Arc<InlinedCallee>>, Option<InlineMeta>, usize)> {
+fn cached_inline(bodies: &Bodies, inline: &Inline, (index, limit, std_limit): (usize, usize, Option<usize>), (pos_valid, neg_valid, shape_only): (bool, bool, bool)) -> Option<(Option<Arc<InlinedCallee>>, Option<InlineMeta>, usize)> {
     let whole = |callee: Option<Arc<InlinedCallee>>, cycle: usize| {
         let meta = callee.as_deref().map(InlinedCallee::meta);
         (callee, meta, cycle)
     };
     let ok_cal = |callee: &Option<Arc<InlinedCallee>>| if callee.is_some() { pos_valid } else { neg_valid };
-    let usable = |meta: &Option<InlineMeta>| if meta.is_some() { shape_only && pos_valid } else { neg_valid };
-    if let Some(callee) = bodies.inlined.get(&index).filter(ok_cal) {
+    if let Some(callee) = bodies.inlined.get(&(index, limit)) {
         return Some(whole(callee, usize::MAX));
     }
-    if let Some(meta) = bodies.inline_meta.get(&index).filter(usable) {
+    if let Some(sl) = std_limit.filter(|&sl| sl != limit)
+        && let Some(callee) = bodies.inlined.get(&(index, sl)).filter(ok_cal)
+    {
+        return Some(whole(callee, usize::MAX));
+    }
+    if let Some(meta) = bodies.inline_meta.get(&(index, limit)).filter(|m| shape_only || m.is_none()) {
         return Some((None, meta, usize::MAX));
     }
     if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
         return Some((None, None, pos));
     }
-    if let Some((callee, cycle)) = inline.local.get(&index).filter(|(callee, _)| ok_cal(callee)) {
+    if let Some((callee, cycle)) = inline.local.get(&(index, limit)) {
         return Some(whole(callee.clone(), *cycle));
     }
-    inline.local_meta.get(&index).filter(|(meta, _)| usable(meta)).map(|&(meta, cycle)| (None, meta, cycle))
+    if let Some(sl) = std_limit.filter(|&sl| sl != limit)
+        && let Some((callee, cycle)) = inline.local.get(&(index, sl)).filter(|(callee, _)| ok_cal(callee))
+    {
+        return Some(whole(callee.clone(), *cycle));
+    }
+    inline.local_meta.get(&(index, limit)).filter(|(m, _)| shape_only || m.is_none()).map(|&(meta, cycle)| (None, meta, cycle))
 }
 
 fn build_inlined(item: ItemRef, footprint: FootprintId, t: &InlineTemplate, relocs: RelocVec) -> Arc<InlinedCallee> {
@@ -373,10 +383,10 @@ fn build_inlined(item: ItemRef, footprint: FootprintId, t: &InlineTemplate, relo
 
 pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<(ItemRef, FootprintId, bool)>, usize)> {
     let bodies = slots.bodies();
-    let Some((limit, standard, pos_valid, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
+    let Some((limit, std_limit, pos_valid, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
         return Ok((None, usize::MAX));
     };
-    if let Some((_, meta, cycle)) = cached_inline(bodies, inline, index, (pos_valid, neg_valid, true)) {
+    if let Some((_, meta, cycle)) = cached_inline(bodies, inline, (index, limit, std_limit), (pos_valid, neg_valid, true)) {
         return Ok((record_meta_height(inline, meta), cycle));
     }
     let item = reached.list[index].0.0;
@@ -389,22 +399,20 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
         Some((footprint, Found::Shape(returns, height, size))) => (Some((item, footprint, returns, height, size)), None),
         None => (None, Some(None)),
     };
-    if standard {
-        if cycle > depth && quiet.holds(cx, slots) {
+    if cycle > depth && quiet.holds(cx, slots) {
+        if let Some(Some(cal)) = inlined {
             bodies.bump_transient();
-            if let Some(cal) = inlined {
-                let stored = bodies.inlined.get_or_insert_with(index, || cal);
-                return Ok((record_meta_height(inline, stored.as_deref().map(InlinedCallee::meta)), cycle));
-            }
-            let stored = bodies.inline_meta.get_or_insert_with(index, || meta);
-            return Ok((record_meta_height(inline, stored), cycle));
+            let stored = bodies.inlined.get_or_insert_with((index, limit), || Some(cal));
+            return Ok((record_meta_height(inline, stored.as_deref().map(InlinedCallee::meta)), cycle));
         }
-        let local_cyc = if cycle < depth { cycle } else { usize::MAX };
-        if let Some(cal) = inlined {
-            inline.local.insert(index, (cal, local_cyc));
-        } else {
-            inline.local_meta.insert(index, (meta, local_cyc));
-        }
+        let stored = bodies.inline_meta.get_or_insert_with((index, limit), || meta);
+        return Ok((record_meta_height(inline, stored), cycle));
+    }
+    let local_cyc = if cycle < depth { cycle } else { usize::MAX };
+    if let Some(cal) = inlined {
+        inline.local.insert((index, limit), (cal, local_cyc));
+    } else {
+        inline.local_meta.insert((index, limit), (meta, local_cyc));
     }
     Ok((record_meta_height(inline, meta), cycle))
 }
@@ -416,10 +424,10 @@ fn finish_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots),
 
 pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, compact): (usize, bool)) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
     let bodies = slots.bodies();
-    let Some((limit, standard, pos_valid, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
+    let Some((limit, std_limit, pos_valid, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
         return Ok((None, usize::MAX));
     };
-    if !compact && let Some((callee, _, cycle)) = cached_inline(bodies, inline, index, (pos_valid, neg_valid, false)) {
+    if !compact && let Some((callee, _, cycle)) = cached_inline(bodies, inline, (index, limit, std_limit), (pos_valid, neg_valid, false)) {
         return finish_inline(cx, (reached, slots), inline, (index, callee, cycle));
     }
     let item = reached.list[index].0.0;
@@ -433,13 +441,17 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         Some((_, Found::Shape(..))) => unreachable!("a body probe never answers from recorded metadata"),
         None => None,
     };
-    if standard && !compact {
+    if !compact {
         if cycle > depth && quiet.holds(cx, slots) {
-            bodies.bump_transient();
-            let stored = bodies.inlined.get_or_insert_with(index, || result);
-            return finish_inline(cx, (reached, slots), inline, (index, stored, cycle));
+            if let Some(cal) = result {
+                bodies.bump_transient();
+                let stored = bodies.inlined.get_or_insert_with((index, limit), || Some(cal));
+                return finish_inline(cx, (reached, slots), inline, (index, stored, cycle));
+            }
+            bodies.inline_meta.get_or_insert_with((index, limit), || None);
+            return finish_inline(cx, (reached, slots), inline, (index, None, cycle));
         }
-        inline.local.insert(index, (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
+        inline.local.insert((index, limit), (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
     }
     finish_inline(cx, (reached, slots), inline, (index, result, cycle))
 }
@@ -484,9 +496,13 @@ fn ensure_inline_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dy
 }
 
 fn try_cached_template<'a>(cx: &Context<'_>, (reached, slots): (&Reached, &'a dyn Slots), key: &TemplateKey, (shape_only, open_ok, quiet): (bool, bool, &Quiet)) -> Result<Option<Option<Found>>, Option<persist::Disk<'a>>> {
+    if slots.bodies().rejected.get(key).is_some() {
+        tally(Tally::Hit);
+        return Ok(Some(None));
+    }
     if let Some(template) = slots.bodies().templates.get(key) {
         tally(Tally::Hit);
-        return Ok(Some(template.map(|t| Found::Body(t, None))));
+        return Ok(Some(Some(Found::Body(template, None))));
     }
     tally(Tally::Miss);
     let disk = if key.compact { None } else { slots.bodies().disk(cx, key) };
@@ -495,8 +511,15 @@ fn try_cached_template<'a>(cx: &Context<'_>, (reached, slots): (&Reached, &'a dy
     }
     if !shape_only && open_ok && let Some(d) = &disk && let Some(mut found) = d.template(cx, (reached, slots)) {
         if quiet.holds(cx, slots) {
-            slots.bodies().bump_transient();
-            found = slots.bodies().templates.get_or_insert_with(*key, || found);
+            match found {
+                Some(t) => {
+                    slots.bodies().bump_transient();
+                    found = Some(slots.bodies().templates.get_or_insert_with(*key, || t));
+                }
+                None => {
+                    slots.bodies().rejected.get_or_insert_with(*key, || ());
+                }
+            }
         }
         return Ok(Some(found.map(|t| Found::Body(t, None))));
     }
@@ -507,11 +530,19 @@ fn settle_built_template(cx: &Context<'_>, (reached, slots): (&Reached, &dyn Slo
     if in_cycle {
         tally(Tally::OpenCycle);
     } else if calm {
-        slots.bodies().bump_transient();
-        let built = template.as_ref().map(Arc::as_ptr);
-        template = slots.bodies().templates.get_or_insert_with(key, || template);
-        if built != template.as_ref().map(Arc::as_ptr) {
-            tally(Tally::Raced);
+        match template {
+            Some(t) => {
+                slots.bodies().bump_transient();
+                let built = Arc::as_ptr(&t);
+                let stored = slots.bodies().templates.get_or_insert_with(key, || t);
+                if built != Arc::as_ptr(&stored) {
+                    tally(Tally::Raced);
+                }
+                template = Some(stored);
+            }
+            None => {
+                slots.bodies().rejected.get_or_insert_with(key, || ());
+            }
         }
     } else {
         tally(Tally::Deferred);
