@@ -47,6 +47,13 @@ pub(crate) struct Abi<R> {
     pub stack: u32,
 }
 
+impl<R: Copy + PartialEq> Abi<R> {
+    /// Whether placing `self.params` writes register `reg`.
+    pub(crate) fn clobbers(&self, reg: R) -> bool {
+        self.params.iter().any(|loc| matches!(*loc, Loc::Int(p) if p == reg) || matches!(*loc, Loc::Pair(a, b) if a == reg || b == reg))
+    }
+}
+
 pub(crate) fn round(value: u32, to: u32) -> u32 {
     value.div_ceil(to) * to
 }

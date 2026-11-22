@@ -486,10 +486,7 @@ impl Table {
                 let x_ty = types[find(subst, x).index()];
                 let (cc, a, b) = canonical_icmp(cc, operand(&self.consts, types, subst, x), operand(&self.consts, types, subst, y));
                 if a == b {
-                    let cval = match cc {
-                        IntCC::Equal | IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => 1,
-                        _ => 0,
-                    };
+                    let cval = i64::from(crate::fold::holds(cc, x_ty, 0, 0));
                     if let Some(&existing) = self.known.get(&Key::Const(ty, cval)) {
                         return Some(Err(existing));
                     }

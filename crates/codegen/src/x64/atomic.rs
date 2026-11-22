@@ -301,12 +301,15 @@ impl Emit<'_> {
                 self.put(result()?, Reg::Rax);
             }
             Op::AtomicCas(_, addr, expected, replacement) => {
+                let res = result()?;
                 let target = self.atomic_target(*addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx]);
                 self.raw(Reg::Rax, *expected);
                 self.raw(Reg::Rcx, *replacement);
+                self.asm.flags_overwritten();
                 self.asm.cmpxchg(size, target, Reg::Rcx);
+                self.asm.hold_eq(res.index() as u32, expected.index() as u32);
                 self.clobber_reg(Reg::Rax);
-                self.put(result()?, Reg::Rax);
+                self.put(res, Reg::Rax);
             }
             other => return Err(format!("unexpected {other:?}")),
         }
@@ -406,6 +409,21 @@ impl Emit<'_> {
         self.asm.test_sized(Size::of(self.ty(value).bytes()), reg, reg);
     }
 
+    fn held_eq_compare(&self, cc: IntCC, x: Value, y: Value) -> Option<Cond> {
+        if !matches!(cc, IntCC::Equal | IntCC::NotEqual) {
+            return None;
+        }
+        let (a, b) = self.asm.held_eq()?;
+        let ty = self.ty(x);
+        let eq = |u: u32, v: Value| {
+            u == v.index() as u32
+                || self.const_of(Value(u)).zip(self.const_of(v)).is_some_and(|(c1, c2)| {
+                    crate::fold::extend(c1, ty, false) == crate::fold::extend(c2, ty, false)
+                })
+        };
+        ((eq(a, x) && eq(b, y)) || (eq(a, y) && eq(b, x))).then(|| int::cond(cc))
+    }
+
     /// Compares `x` with `y` and returns the flags condition under which `cc` holds.
     pub(super) fn cmp_flags(&mut self, cc: IntCC, x: Value, y: Value, live_flags: Option<(Value, Cond)>) -> Cond {
         let is_zero = |v: Value| self.const_of(v).is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 0);
@@ -423,7 +441,7 @@ impl Emit<'_> {
         {
             self.emit_test_band(a, b);
             int::cond(cc)
-        } else if let Some(cond) = self.held_compare(cc, x, y) {
+        } else if let Some(cond) = self.held_eq_compare(cc, x, y).or_else(|| self.held_compare(cc, x, y)) {
             cond
         } else {
             let size = Size::of(self.ty(x).bytes());
@@ -432,7 +450,7 @@ impl Emit<'_> {
             } else {
                 (cc, x, y)
             };
-            self.emit_cmp_pair(size, x, Some(y), matches!(cc, IntCC::Equal | IntCC::NotEqual));
+            self.emit_cmp_pair(size, x, Some(y), matches!(cc, IntCC::Equal | IntCC::NotEqual) || cc.is_signed());
             int::cond(cc)
         }
     }

@@ -702,7 +702,7 @@ impl Emit<'_> {
         }
         let direct = self.plan.through[callee.index()];
         let (target, extra) = if direct.is_none() {
-            match self.plan.reg_of(callee).filter(|reg| SAVED.contains(reg)) {
+            match self.plan.reg_of(callee).filter(|&reg| !matches!(reg, A | C | IP | FP | LR | SP) && !abi.clobbers(reg)) {
                 Some(reg) => (reg, None),
                 None => (T, Some((callee, T))),
             }

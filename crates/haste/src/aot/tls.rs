@@ -46,7 +46,7 @@ pub(super) fn emit_x64_tls_unwind_state(unwind_tls: u64, out: &mut Buf) {
 
 pub(super) fn emit_arm64_tlv_base(c: &Emit<'_>, desc_va: u64, out: &mut Buf) {
     emit_arm64_adrp_add(c.at(out), desc_va, 0, out);
-    out.words(&[0xF940_0008, 0xD63F_0100]);
+    out.words(&[0xF940_0010, 0xD63F_0200]);
 }
 
 pub(super) fn emit_arm64_tlv_unwind_state(c: &Emit<'_>, desc_va: u64, unwind_off: u64, out: &mut Buf) {
@@ -57,22 +57,25 @@ pub(super) fn emit_arm64_tlv_unwind_state(c: &Emit<'_>, desc_va: u64, unwind_off
 }
 
 pub(super) fn emit_arm64_tlv_thread_cell(c: &Emit<'_>, desc_va: u64, cells_off: u64, out: &mut Buf) -> Result<()> {
-    out.words(&[0xD101_03FF, 0xA900_7BFD, 0xA901_53F3, 0xF900_13F5, 0xAA00_03F3, 0xAA01_03F4]);
+    out.words(&[0xAA00_03E9, 0xAA1E_03EA]);
     emit_arm64_tlv_base(c, desc_va, out);
     if cells_off != 0 {
         out.u32(arm64_add_imm(0, 0, cells_off as u32));
     }
-    out.words(&[0x8B13_0C15, 0xF940_02A0]);
-    let hit = arm64_fwd(0xB500_0000, out);
-    c.words_call(&[0xF100_029F, 0xD280_0029, 0x9A89_1294, 0xF900_1BFF, 0x9100_C3E0, 0xD280_0801, 0xAA14_03E2], "posix_memalign", out)?;
+    out.words(&[0x8B09_0C0B, 0xF940_0160]);
+    let miss = arm64_fwd(0xB400_0000, out);
+    out.words(&[0xAA0A_03FE, 0xD65F_03C0]);
+    arm64_here(&[miss], out);
+    out.words(&[0xD100_C3FF, 0xA900_2BFD, 0xA901_53F3, 0xAA0B_03F3, 0xAA01_03F4]);
+    c.words_call(&[0xF100_029F, 0xD280_0029, 0x9A89_1294, 0xF900_13FF, 0x9100_83E0, 0xD280_0801, 0xAA14_03E2], "posix_memalign", out)?;
     let fail = arm64_fwd(0x3500_0000, out);
-    c.words_call(&[0xF940_1BE0, 0x5280_0001, 0xAA14_03E2], "memset", out)?;
-    out.u32(0xF900_02A0);
+    c.words_call(&[0xF940_13E0, 0x5280_0001, 0xAA14_03E2], "memset", out)?;
+    out.u32(0xF900_0260);
     let done = arm64_fwd(0x1400_0000, out);
     arm64_here(&[fail], out);
     out.u32(0xD280_0000);
-    arm64_here(&[hit, done], out);
-    out.words(&[0xF940_13F5, 0xA941_53F3, 0xA940_7BFD, 0x9101_03FF, 0xD65F_03C0]);
+    arm64_here(&[done], out);
+    out.words(&[0xA941_53F3, 0xA940_7BFD, 0x9100_C3FF, 0xD65F_03C0]);
     Ok(())
 }
 
@@ -80,31 +83,31 @@ pub(super) fn emit_arm64_tlv_frame_cache(c: &Emit<'_>, alloc: bool, desc_va: u64
     if alloc {
         out.u32(0xF100_001F | (FRAME_CACHE_LIMIT << 10));
         let big = arm64_fwd(0x5400_0002, out);
-        out.words(&[0xA9BE_7BFD, 0xF900_0BF3, 0xAA00_03F3]);
+        out.words(&[0xAA00_03E9, 0xAA1E_03EA]);
         emit_arm64_tlv_base(c, desc_va, out);
         if frame_off != 0 {
             out.u32(arm64_add_imm(0, 0, frame_off as u32));
         }
-        out.words(&[0x8B13_0002, 0xF940_0040]);
+        out.words(&[0x8B09_0002, 0xF940_0040]);
         let miss = arm64_fwd(0xB400_0000, out);
-        out.words(&[0xF940_0008, 0xF900_0048, 0xF940_0449, 0xD100_0529, 0xF900_0449, 0xF940_0BF3, 0xA8C2_7BFD, 0xD65F_03C0]);
+        out.words(&[0xF940_0008, 0xF900_0048, 0xF940_0449, 0xD100_0529, 0xF900_0449, 0xAA0A_03FE, 0xD65F_03C0]);
         arm64_here(&[miss], out);
-        out.words(&[0xAA13_03E0, 0xF940_0BF3, 0xA8C2_7BFD]);
+        out.words(&[0xAA09_03E0, 0xAA0A_03FE]);
         arm64_here(&[big], out);
         c.tail("malloc", out)
     } else {
         out.u32(0xF100_003F | (FRAME_CACHE_LIMIT << 10));
         let big = arm64_fwd(0x5400_0002, out);
-        out.words(&[0xA9BE_7BFD, 0xA901_53F3, 0xAA00_03F3, 0xAA01_03F4]);
+        out.words(&[0xAA00_03E9, 0xAA1E_03EA]);
         emit_arm64_tlv_base(c, desc_va, out);
         if frame_off != 0 {
             out.u32(arm64_add_imm(0, 0, frame_off as u32));
         }
-        out.words(&[0x8B14_0002, 0xF940_0448, 0xF100_011F | (u32::from(FRAME_CACHE_DEPTH) << 10)]);
+        out.words(&[0x8B01_0002, 0xF940_0448, 0xF100_011F | (u32::from(FRAME_CACHE_DEPTH) << 10)]);
         let full = arm64_fwd(0x5400_0002, out);
-        out.words(&[0xF940_0049, 0xF900_0269, 0xF900_0053, 0x9100_0508, 0xF900_0448, 0xA941_53F3, 0xA8C2_7BFD, 0xD65F_03C0]);
+        out.words(&[0xF940_004B, 0xF900_012B, 0xF900_0049, 0x9100_0508, 0xF900_0448, 0xAA0A_03FE, 0xD65F_03C0]);
         arm64_here(&[full], out);
-        out.words(&[0xAA13_03E0, 0xA941_53F3, 0xA8C2_7BFD]);
+        out.words(&[0xAA09_03E0, 0xAA0A_03FE]);
         arm64_here(&[big], out);
         c.tail("free", out)
     }

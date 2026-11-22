@@ -228,25 +228,6 @@ fn match_swar_msb_broadcast(cx: &RewriteCx, v: Value) -> Option<Value> {
     })
 }
 
-fn zero_compare(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
-    let ty = cx.func.ty(x);
-    if !ty.is_small_int() {
-        return None;
-    }
-    let (val, new_cc, existing_zero) = match (cc, cx.uconst(x, ty), cx.uconst(y, ty)) {
-        (IntCC::UnsignedLessThanOrEqual, _, Some(0)) => (x, IntCC::Equal, Some(y)),
-        (IntCC::UnsignedGreaterThanOrEqual, Some(0), _) => (y, IntCC::Equal, Some(x)),
-        (IntCC::UnsignedGreaterThan, _, Some(0)) => (x, IntCC::NotEqual, Some(y)),
-        (IntCC::UnsignedLessThan, Some(0), _) => (y, IntCC::NotEqual, Some(x)),
-        (IntCC::UnsignedLessThan, _, Some(1)) => (x, IntCC::Equal, None),
-        (IntCC::UnsignedGreaterThan, Some(1), _) => (y, IntCC::Equal, None),
-        (IntCC::UnsignedGreaterThanOrEqual, _, Some(1)) => (x, IntCC::NotEqual, None),
-        (IntCC::UnsignedLessThanOrEqual, Some(1), _) => (y, IntCC::NotEqual, None),
-        _ => return None,
-    };
-    Some(Op::Icmp(new_cc, val, existing_zero.unwrap_or_else(|| cx.emit(ty, Op::Const(0)))))
-}
-
 fn narrow_pair_icmp(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     let (&Op::Convert(k1, a), &Op::Convert(k2, b)) = (&cx.func.insts[cx.def(x)?.index()].op, &cx.func.insts[cx.def(y)?.index()].op) else {
         return None;
@@ -316,7 +297,7 @@ fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y:
                 if let Some(folded) = icmp::eval_select(cx, res, ncc, nx, ny).or_else(|| select::eval_select_zero_cmp(cx, res, ncc, nx, ny)) {
                     return folded;
                 }
-                Some(zero_compare(cx, ncc, nx, ny).unwrap_or(Op::Icmp(ncc, nx, ny)))
+                Some(bits::zero_compare(cx, ncc, nx, ny).unwrap_or(Op::Icmp(ncc, nx, ny)))
             }
             other => Some(other),
         };
@@ -324,7 +305,7 @@ fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y:
     if let Some(folded) = icmp::eval_select(cx, res, cc, x, y).or_else(|| select::eval_select_zero_cmp(cx, res, cc, x, y)) {
         return folded;
     }
-    zero_compare(cx, cc, x, y)
+    bits::zero_compare(cx, cc, x, y)
 }
 
 fn simplify_band(cx: &mut RewriteCx, res: Option<Value>, a: Value, b: Value) -> Option<Op> {

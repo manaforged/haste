@@ -668,7 +668,7 @@ impl Emit<'_> {
             Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot)).map(|hit| (lookup, hit)),
             _ => None,
         };
-        let held = self.reg_of(callee).filter(|reg| SAVED.contains(reg));
+        let held = self.reg_of(callee).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {
             values.push(callee);

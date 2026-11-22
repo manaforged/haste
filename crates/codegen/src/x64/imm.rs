@@ -16,6 +16,7 @@ enum Kind {
     Zeros { movs: [Zero; PENDING_ZEROS], len: usize },
     ZeroRun { start: u32, run: Mem, len: i32, last: Last },
     Carry { tag: usize },
+    Eq { a: u32, b: u32 },
 }
 
 /// A `mov r32, 0` at `start..end` that becomes `xor r32, r32` once the flags are dead.
@@ -73,11 +74,13 @@ impl Asm {
         self.tail.as_mut().filter(|tail| tail.end == at && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. }))
     }
 
-    /// Carries pending zero movs, or a held carry, past the one instruction emitted since `start`, which neither reads nor writes the flags.
+    /// Carries pending zero movs, or a held carry or equality flag, past the one instruction emitted since `start`, which neither reads nor writes the flags.
     pub(super) fn flags_kept(&mut self, start: u32) {
         let end = self.pos();
         let marks = self.marks();
-        if let Some(tail) = self.tail.as_mut().filter(|tail| tail.end == start && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. } | Kind::Carry { .. })) {
+        if let Some(tail) = self.tail.as_mut().filter(|tail| {
+            tail.end == start && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. } | Kind::Carry { .. } | Kind::Eq { .. })
+        }) {
             tail.end = end;
         }
     }
@@ -95,9 +98,22 @@ impl Asm {
         })
     }
 
+    /// Notes that the zero flag holds `a == b` here, until an instruction that may write the flags.
+    pub fn hold_eq(&mut self, a: u32, b: u32) {
+        self.set_tail(Kind::Eq { a, b });
+    }
+
+    /// The value pair the zero flag still compares here, if only flag-neutral instructions followed `hold_eq`.
+    pub fn held_eq(&self) -> Option<(u32, u32)> {
+        self.tail.filter(|tail| tail.end == self.pos() && tail.marks == self.marks()).and_then(|tail| match tail.kind {
+            Kind::Eq { a, b } => Some((a, b)),
+            _ => None,
+        })
+    }
+
     fn push_zero(&mut self, zero: Zero) {
         let marks = self.marks();
-        if self.tail.is_some_and(|tail| tail.end == zero.start && tail.marks == marks && matches!(tail.kind, Kind::Carry { .. })) {
+        if self.tail.is_some_and(|tail| tail.end == zero.start && tail.marks == marks && matches!(tail.kind, Kind::Carry { .. } | Kind::Eq { .. })) {
             self.flags_kept(zero.start);
             return;
         }
