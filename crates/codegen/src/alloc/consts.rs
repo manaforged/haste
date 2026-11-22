@@ -5,6 +5,10 @@ use crate::ir::{Binary, Function, Op, Type, Value};
 use super::{Location, Uses};
 
 const MAX_ARM64_LOOP_GP: usize = 18;
+const I64_CONST_MIN_HALVES: usize = 3;
+const SHIFT_LHS_MIN_HALVES: usize = 2;
+const LOOP_CONST_MIN_USES: u32 = 2;
+const CONST_PROMOTE_MIN_USES: u32 = 4;
 
 fn half_counts_at_least(u: u64, min: usize) -> bool {
     let non_zero = (0..4).filter(|&s| ((u >> (s * 16)) & 0xffff) != 0).count();
@@ -18,7 +22,7 @@ fn arm64_bitmask(u: u64) -> bool {
 
 fn expensive_i64_const(imm: i64, two_address: bool) -> bool {
     let u = imm as u64;
-    !(two_address && (u >> 32) == (u & 0xffff_ffff)) && half_counts_at_least(u, 3) && (two_address || !arm64_bitmask(u))
+    !(two_address && (u >> 32) == (u & 0xffff_ffff)) && half_counts_at_least(u, I64_CONST_MIN_HALVES) && (two_address || !arm64_bitmask(u))
 }
 
 fn shift_lhs_expensive(imm: i64, ty: Type, two_address: bool) -> bool {
@@ -26,7 +30,7 @@ fn shift_lhs_expensive(imm: i64, ty: Type, two_address: bool) -> bool {
         ty == Type::I64 && !fits_imm32(imm) && u32::try_from(imm).is_err()
     } else {
         let u = crate::fold::extend(imm, ty, false) as u64;
-        half_counts_at_least(u, 2) && !arm64_bitmask(u)
+        half_counts_at_least(u, SHIFT_LHS_MIN_HALVES) && !arm64_bitmask(u)
     }
 }
 
@@ -53,6 +57,7 @@ fn arm64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
     }
 }
 
+/// Returns whether ARM64 lowers an integer multiply by `imm` without materializing a register constant.
 pub(crate) fn arm64_trivial_mul_imm(ty: Type, imm: i64) -> bool {
     let uimm = crate::fold::extend(imm, ty, false) as u64;
     let simm = crate::fold::extend(imm, ty, true);
@@ -105,10 +110,11 @@ fn scan_const_op<R>(
             let is_mul = matches!(op, Op::Binary(Binary::Imul, ..));
             for (idx, v) in [x, y].into_iter().enumerate() {
                 if let Location::Imm(imm) = locations[v.index()] {
+                    let is_pow2 = (crate::fold::extend(imm, func.ty(v), false) as u64).is_power_of_two();
                     let keep_imm = if two_address {
-                        (pow2_ok && imm > 0 && imm.count_ones() == 1) || (is_mul && fits_imm32(imm))
+                        (pow2_ok && is_pow2) || (is_mul && fits_imm32(imm))
                     } else {
-                        (is_mul && arm64_trivial_mul_imm(func.ty(v), imm)) || (!is_mul && idx == 1 && pow2_ok && imm > 0 && imm.count_ones() == 1)
+                        (is_mul && arm64_trivial_mul_imm(func.ty(v), imm)) || (!is_mul && idx == 1 && pow2_ok && is_pow2)
                     };
                     if keep_imm { must_stay_imm[v.index()] = true; } else if in_loop && outer(v) { loop_mat[v.index()] += 1; }
                 }
@@ -148,7 +154,7 @@ pub(super) fn promote_loop_consts<R>(func: &Function, census: &Uses, loops: &Loo
                 if let Location::Imm(imm) = locations[vi]
                     && func.ty(v) == Type::I64
                     && expensive_i64_const(imm, two_address)
-                    && ((depth > 0 && (outer(v) || (!two_address && census.uses[vi] >= 2))) || census.uses[vi] >= 4)
+                    && ((depth > 0 && (outer(v) || (!two_address && census.uses[vi] >= LOOP_CONST_MIN_USES))) || census.uses[vi] >= CONST_PROMOTE_MIN_USES)
                 {
                     loop_mat[vi] += 1;
                 }

@@ -6,7 +6,7 @@ use super::{A, C, D, Emit, IP, T, V0};
 use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
-pub(crate) use imm::{add_imm_parts, encode_bitmask_imm};
+pub(crate) use imm::{add_imm_parts, add_imm_split_parts, encode_bitmask_imm};
 
 fn imm_within(imm: i64, bits: u32) -> bool {
     let mask = if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 };
@@ -266,10 +266,7 @@ impl Emit<'_> {
     fn add_imm_split(&self, sub: bool, value: Value, ty: Type) -> Option<(bool, u32, u32)> {
         let raw = self.plan.const_of(value)?;
         if super::asm::Asm::mov_imm_is_single(raw) { return None; }
-        let simm = crate::fold::extend(raw, ty, true);
-        let abs = simm.unsigned_abs();
-        let (hi, lo) = ((abs & 0xFFF_000) as u32, (abs & 0xFFF) as u32);
-        (abs < (1 << 24) && hi != 0 && lo != 0).then(|| (if simm < 0 { !sub } else { sub }, hi, lo))
+        add_imm_split_parts(sub, crate::fold::extend(raw, ty, true))
     }
 
     fn emit_add_sub_imm(&mut self, sub: bool, (x, y): (Value, Value), (ty, size): (Type, Size), dst: Reg) -> bool {
@@ -521,7 +518,7 @@ impl Emit<'_> {
 
     fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
         let ty = self.ty(y);
-        let Some(divisor) = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, ty, false)).filter(|imm| *imm > 0 && imm.count_ones() == 1) else { return false };
+        let Some(divisor) = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, ty, false) as u64).filter(|imm| imm.is_power_of_two()) else { return false };
         if divisor == 1 && op == Binary::Urem { self.asm.mov_imm(dst, 0); return true; }
         if op == Binary::Udiv {
             let left = self.zext_src(x, A);
@@ -529,7 +526,7 @@ impl Emit<'_> {
             return true;
         }
         let left = self.bits(x, A);
-        self.asm.mov_imm(C, divisor - 1);
+        self.asm.mov_imm(C, (divisor - 1) as i64);
         self.asm.alu(Alu::And, Size::X, dst, left, C);
         self.clobber_reg(C);
         true

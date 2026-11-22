@@ -589,28 +589,19 @@ impl Table {
     fn forget(&mut self, mark: usize) {
         for (key, prev) in self.added.drain(mark..).rev() {
             match prev {
-                Some(v) => {
-                    self.known.insert(key, v);
-                }
-                None => {
-                    self.known.remove(&key);
-                }
+                Some(v) => { self.known.insert(key, v); }
+                None => { self.known.remove(&key); }
             }
         }
     }
 }
 
-enum Visit {
-    Enter(Block),
-    Leave(usize),
-}
+enum Visit { Enter(Block), Leave(usize) }
 
 /// Replaces every pure instruction that a dominating instruction already computed with that instruction's result, returning the invalidated IR domain.
 pub(crate) fn run(func: &mut Function) -> Domain {
     let Some(entry) = func.entry else { return Domain::NONE };
-    if func.coroutine.is_some() {
-        return Domain::NONE;
-    }
+    if func.coroutine.is_some() { return Domain::NONE; }
     let cfg = func.cfg();
     let children = cfg.children();
     let mut subst = identity(func.types.len());
@@ -629,23 +620,17 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 let ri = res.index();
                 def_block[ri] = block_tag(b);
                 match data.op {
-                    Op::Const(imm) => {
-                        let ty = func.ty(res);
-                        if ty.is_small_int() {
-                            let z = extend(imm, ty, false);
-                            consts[ri] = Some(z);
-                            bool_val[ri] = z == 0 || z == 1;
-                        }
+                    Op::Const(imm) if func.ty(res).is_small_int() => {
+                        let z = extend(imm, func.ty(res), false);
+                        consts[ri] = Some(z);
+                        bool_val[ri] = z == 0 || z == 1;
                     }
                     Op::Icmp(cc, x, y) => {
                         bool_val[ri] = true;
                         icmp_def[ri] = Some((cc, func.ty(x), x, y));
                         if cc == IntCC::Equal {
-                            if consts[x.index()] == Some(0) && bool_val[y.index()] {
-                                bool_neg[ri] = Some(y);
-                            } else if consts[y.index()] == Some(0) && bool_val[x.index()] {
-                                bool_neg[ri] = Some(x);
-                            }
+                            if consts[x.index()] == Some(0) && bool_val[y.index()] { bool_neg[ri] = Some(y); }
+                            else if consts[y.index()] == Some(0) && bool_val[x.index()] { bool_neg[ri] = Some(x); }
                         }
                     }
                     Op::Fcmp(..) | Op::Fits(..) => bool_val[ri] = true,
@@ -692,23 +677,40 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if dropped || changed { Domain::VALUES } else { Domain::NONE }
 }
 
+const COND_PEEL_DEPTH: u8 = 4;
+const DOM_PROVE_STEPS: u8 = 24;
+
+/// Operand or constant represented on a branch edge.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EdgeVal { Const(i64), Val(Value) }
 
-pub(crate) struct CmpEnv<'a> {
-    pub(crate) defs: &'a [Option<Inst>],
-    pub(crate) consts: &'a [Option<i64>],
-    pub(crate) subst: &'a [Value],
-    pub(crate) bool_val: Option<&'a [bool]>,
-}
+/// Predicate context mapping values through substitutions, constants, and known booleans.
+pub(crate) struct CmpEnv<'a> { pub(crate) defs: &'a [Option<Inst>], pub(crate) consts: &'a [Option<i64>], pub(crate) subst: &'a [Value], pub(crate) bool_val: Option<&'a [bool]> }
 
 impl CmpEnv<'_> {
-    fn find(&self, mut v: Value) -> Value { while let Some(&s) = self.subst.get(v.index()) && s != v { v = s; } v }
+    /// Resolves `v` to its canonical representative in `subst`.
+    pub(crate) fn find(&self, v: Value) -> Value { crate::merge::find(self.subst, v) }
     fn known(&self, v: Value) -> Option<i64> { self.consts.get(self.find(v).index()).copied().flatten() }
+    /// Returns `v` as a constant `EdgeVal` when known, or its canonical `Value`.
     pub(crate) fn edge_val(&self, v: Value) -> EdgeVal { self.known(v).map_or_else(|| EdgeVal::Val(self.find(v)), EdgeVal::Const) }
     fn is_bool(&self, func: &Function, v: Value) -> bool { self.bool_val.map_or_else(|| self.defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Icmp(..) | Op::Fits(..))), |b| b.get(v.index()).copied().unwrap_or(false)) }
+
+    /// Peels zero-extensions and boolean xor-1 inversions off `cond`, returning the inner op, polarity, and depth.
+    pub(crate) fn peel_cond<'a>(&self, func: &'a Function, mut cond: Value, mut taken: bool, mut depth: u8) -> Option<(&'a Op, bool, u8)> {
+        while depth < COND_PEEL_DEPTH {
+            let op = &func.insts[self.defs.get(cond.index()).copied().flatten()?.index()].op;
+            match *op {
+                Op::Convert(Convert::Uextend, inner) if func.ty(inner).is_small_int() => cond = inner,
+                Op::Binary(Binary::Bxor, a, b) => { let (i, _) = [(a, b), (b, a)].into_iter().find(|&(i, k)| self.is_bool(func, i) && self.known(k).is_some_and(|v| crate::fold::extend(v, func.ty(k), false) == 1))?; (cond, taken) = (i, !taken); }
+                _ => return Some((op, taken, depth)),
+            }
+            depth += 1;
+        }
+        None
+    }
 }
 
+/// Returns whether holding `hcc(hx, hy)` implies `wcc(wx, wy)` at integer type `ty`.
 pub(crate) fn cmp_proves(ty: Type, (mut hcc, mut hx, mut hy): (IntCC, EdgeVal, EdgeVal), (mut wcc, mut wx, mut wy): (IntCC, EdgeVal, EdgeVal)) -> bool {
     use IntCC::*;
     if let (EdgeVal::Const(a), EdgeVal::Const(b)) = (wx, wy) { return crate::fold::holds(wcc, ty, a, b); }
@@ -728,11 +730,10 @@ pub(crate) fn cmp_proves(ty: Type, (mut hcc, mut hx, mut hy): (IntCC, EdgeVal, E
         || matches!(wcc, UnsignedGreaterThan if lo > cw) || matches!(wcc, UnsignedGreaterThanOrEqual if lo >= cw)
 }
 
+/// Returns whether assuming `cond == taken` implies comparison `want` at `ty`.
 pub(crate) fn cond_proves_want(func: &Function, env: &CmpEnv<'_>, (cond, taken, depth): (Value, bool, u8), ty: Type, want: (IntCC, EdgeVal, EdgeVal)) -> bool {
-    let Some(inst) = (depth < 4).then(|| env.defs.get(cond.index()).copied().flatten()).flatten() else { return false };
-    match func.insts[inst.index()].op {
-        Op::Convert(Convert::Uextend, inner) if func.ty(inner).is_small_int() => cond_proves_want(func, env, (inner, taken, depth + 1), ty, want),
-        Op::Binary(Binary::Bxor, a, b) => [(a, b), (b, a)].into_iter().any(|(i, k)| env.is_bool(func, i) && env.known(k).is_some_and(|v| crate::fold::extend(v, func.ty(k), false) == 1) && cond_proves_want(func, env, (i, !taken, depth + 1), ty, want)),
+    let Some((op, taken, depth)) = env.peel_cond(func, cond, taken, depth) else { return false };
+    match *op {
         Op::Binary(Binary::Band, a, b) if taken => cond_proves_want(func, env, (a, true, depth + 1), ty, want) || cond_proves_want(func, env, (b, true, depth + 1), ty, want),
         Op::Binary(Binary::Bor, a, b) if !taken => cond_proves_want(func, env, (a, false, depth + 1), ty, want) || cond_proves_want(func, env, (b, false, depth + 1), ty, want),
         Op::Icmp(cc, x, y) if func.ty(x) == ty => cmp_proves(ty, (if taken { cc } else { cc.inverse() }, env.edge_val(x), env.edge_val(y)), want),
@@ -740,9 +741,10 @@ pub(crate) fn cond_proves_want(func: &Function, env: &CmpEnv<'_>, (cond, taken, 
     }
 }
 
+/// Returns whether a dominating edge or trap/assume proves `want` at `ty` reaching `cur`.
 pub(crate) fn dom_proves_want(func: &Function, cfg: &crate::cfg::Cfg, env: &CmpEnv<'_>, mut cur: Block, skip: Option<Block>, ty: Type, want: (IntCC, EdgeVal, EdgeVal)) -> bool {
     let start = cur;
-    for _ in 0..24 {
+    for _ in 0..DOM_PROVE_STEPS {
         if Some(cur) != skip && func.blocks[cur.index()].insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Trapz(c) | Op::Assume(c) if cond_proves_want(func, env, (c, true, 0), ty, want))) { return true; }
         let Some(parent) = cfg.idom[cur.index()].filter(|&p| p != cur) else { break };
         if let Some(&Op::Brif(c, tb, _, eb, _)) = func.last(parent) && tb != eb

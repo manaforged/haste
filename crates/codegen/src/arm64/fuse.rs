@@ -546,10 +546,7 @@ fn fuse_int_binary_wide(
 fn fits_add_sub_imm(plan: &Plan<Reg>, sub: bool, ty: Type, val: Value) -> bool {
     let Some(raw) = plan.const_of(val) else { return false };
     let simm = crate::fold::extend(raw, ty, true);
-    super::int::add_imm_parts(sub, simm).is_some() || {
-        let abs = simm.unsigned_abs();
-        abs < (1 << 24) && (abs & 0xFFF_000) != 0 && (abs & 0xFFF) != 0
-    }
+    super::int::add_imm_parts(sub, simm).is_some() || super::int::add_imm_split_parts(sub, simm).is_some()
 }
 
 fn has_zext_uextend_imm_skip(func: &Function, plan: &Plan<Reg>, def: &dyn Fn(Value) -> Option<Inst>, (alu_op, ty, imm_val, ext_val): (Binary, Type, Value, Value)) -> bool {

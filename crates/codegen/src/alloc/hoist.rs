@@ -62,6 +62,7 @@ impl<R: Copy + PartialEq> Hoist<R> {
         }
     }
 
+    /// Whether writing the register `loc` leaves every location `condition` reads intact.
     pub(crate) fn reads_free(&self, loc: Location<R>, condition: Value) -> bool {
         self.reads.get(&condition).is_some_and(|reads| !reads.iter().any(|&other| Self::clash(loc, other)))
     }

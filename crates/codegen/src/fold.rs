@@ -622,7 +622,7 @@ impl Fold {
             let (block, params, mut drop) = (Block(b as u32), &func.blocks[b].params, Vec::new());
             for &inst in &func.blocks[b].insts {
                 let (cond, brif) = match func.insts[inst.index()].op { Op::Trapz(c) => (c, None), Op::Brif(c, tb, ref ta, eb, ref ea) if tb != eb => (c, Some((tb, ta.clone(), eb, ea.clone()))), _ => continue };
-                let Some((cc, ty, x, y)) = extract_cmp(func, self, cond) else { continue };
+                let Some((cc, ty, x, y)) = extract_cmp(func, &env, cond) else { continue };
                 let check = |wc: IntCC| edges.iter().all(|(pred, args)| entry_map_val(&env, &def_blocks, block, params, args, x).zip(entry_map_val(&env, &def_blocks, block, params, args, y)).is_some_and(|(mx, my)| edge_proves_want(func, &cfg, &env, (*pred, block), ty, (wc, mx, my))));
                 match (check(cc).then_some(true).or_else(|| check(cc.inverse()).then_some(false)), brif) {
                     (Some(true), None) => { drop.push(inst); changed = true; }
@@ -717,26 +717,14 @@ fn edge_proves_want(func: &Function, cfg: &crate::cfg::Cfg, env: &crate::cse::Cm
     crate::cse::dom_proves_want(func, cfg, env, pred, Some(block), ty, want)
 }
 
-fn extract_cmp(func: &Function, fold: &Fold, mut cond: Value) -> Option<(IntCC, Type, Value, Value)> {
-    let mut inv = false;
-    for _ in 0..4 {
-        match fold.def(func, cond)? {
-            &Op::Convert(Convert::Uextend, inner) if func.ty(inner).is_small_int() => cond = inner,
-            &Op::Binary(Binary::Bxor, a, b) => {
-                let (inner, _) = [(a, b), (b, a)].into_iter().find(|&(i, k)| fold.boolean(func, i) && fold.known(k).is_some_and(|v| extend(v, func.ty(k), false) == 1))?;
-                inv = !inv;
-                cond = inner;
-            }
-            &Op::Icmp(cc, x, y) if func.ty(x).is_small_int() => return Some((if inv { cc.inverse() } else { cc }, func.ty(x), x, y)),
-            _ => return None,
-        }
-    }
-    None
+fn extract_cmp(func: &Function, env: &crate::cse::CmpEnv<'_>, cond: Value) -> Option<(IntCC, Type, Value, Value)> {
+    let (op, taken, _) = env.peel_cond(func, cond, true, 0)?;
+    let &Op::Icmp(cc, x, y) = op else { return None };
+    func.ty(x).is_small_int().then_some((if taken { cc } else { cc.inverse() }, func.ty(x), x, y))
 }
 
 fn entry_map_val(env: &crate::cse::CmpEnv<'_>, def_blocks: &[Option<Block>], block: Block, params: &[Value], args: &[Value], raw: Value) -> Option<crate::cse::EdgeVal> {
-    let mut v = raw;
-    while let Some(&s) = env.subst.get(v.index()) && s != v { v = s; }
+    let v = env.find(raw);
     if let Some(k) = params.iter().position(|&p| p == v) { return Some(env.edge_val(args[k])); }
     env.consts.get(v.index()).copied().flatten().map(crate::cse::EdgeVal::Const).or_else(|| (def_blocks[v.index()] != Some(block)).then_some(crate::cse::EdgeVal::Val(v)))
 }

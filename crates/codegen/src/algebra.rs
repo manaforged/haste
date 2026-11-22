@@ -114,7 +114,7 @@ fn magic_udiv(cx: &mut RewriteCx, ty: Type, x: Value, d: u64) -> Op {
         let sh = cx.emit(Type::I64, Op::Const(i64::from(s)));
         return Op::Binary(Binary::Ushr, hi, sh);
     }
-    let m_full = (1_u128 << (64 + l)) / d128 + 1;
+    let m_full = if l == 64 { u128::MAX / d128 + 1 } else { (1_u128 << (64 + l)) / d128 + 1 };
     let m_low = (m_full - (1_u128 << 64)) as u64;
     let m_val = cx.emit(Type::I64, Op::Const(m_low as i64));
     let t1 = cx.emit(Type::I64, Op::Binary(Binary::Umulhi, x, m_val));

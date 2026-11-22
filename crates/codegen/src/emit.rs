@@ -215,6 +215,13 @@ fn simple_move_val<R: Copy + PartialEq>(func: &Function, plan: &Plan<R>, v: Valu
         && (func.ty(v).is_small_int() || func.ty(v).is_float())
 }
 
+fn hoistable_move<R: Copy + PartialEq>(func: &Function, plan: &Plan<R>, arg: Value, param: Value) -> bool {
+    simple_move_val(func, plan, arg)
+        && simple_move_val(func, plan, param)
+        && matches!(plan.locations[arg.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
+        && matches!(plan.locations[param.index()], Location::Reg(_) | Location::Float(_))
+}
+
 fn hoist_common_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
@@ -236,10 +243,7 @@ fn hoist_common_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
                 && plan.same_home(frame, *tp, *ep)
                 && func.ty(*ta).bytes() == func.ty(*ea).bytes()
                 && func.ty(*tp).bytes() == func.ty(*ep).bytes()
-                && simple_move_val(func, plan, *ta)
-                && simple_move_val(func, plan, *tp)
-                && matches!(plan.locations[ta.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
-                && matches!(plan.locations[tp.index()], Location::Reg(_) | Location::Float(_))
+                && hoistable_move(func, plan, *ta, *tp)
                 && plan.hoist.reads_free(plan.locations[tp.index()], condition)
         }
         _ => false,
@@ -269,10 +273,7 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     let params = &func.blocks[moved.0.index()].params;
     let hoistable = moved.1.iter().zip(params).all(|(&arg, &param)| {
         plan.same_home(frame, arg, param)
-            || (simple_move_val(func, plan, arg)
-                && simple_move_val(func, plan, param)
-                && matches!(plan.locations[arg.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
-                && matches!(plan.locations[param.index()], Location::Reg(_) | Location::Float(_))
+            || (hoistable_move(func, plan, arg, param)
                 && plan.hoist.free(plan.locations[param.index()], plain, condition))
     });
     if !hoistable {
