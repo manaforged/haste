@@ -82,9 +82,10 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
     let func = split.as_ref().unwrap_or(func);
     let features = Features::host();
-    let elided_before = plan.elided.iter().filter(|&&e| e).count();
+    let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
+    let dropped_before = dropped(&plan);
     let roots = location::fuse(func, &mut plan, &features);
-    if plan.elided.iter().filter(|&&e| e).count() != elided_before {
+    if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS);

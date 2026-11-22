@@ -16,6 +16,7 @@ struct UseCounts {
 
 pub(super) struct SlotEscapes {
     pub(super) unescaped: Vec<bool>,
+    pub(super) addr_unescaped: Vec<bool>,
     pub(super) call_readonly: Vec<bool>,
     pub(super) return_only: Vec<bool>,
     pub(super) noalias: Vec<bool>,
@@ -40,6 +41,7 @@ impl SlotEscapes {
     fn new(func: &Function) -> Self {
         Self {
             unescaped: vec![true; func.slots.len()],
+            addr_unescaped: vec![true; func.slots.len()],
             call_readonly: vec![true; func.slots.len()],
             return_only: vec![true; func.slots.len()],
             noalias: vec![false; func.signature.params.len()],
@@ -84,6 +86,7 @@ fn finish_slot_escape(
             esc.noalias[usize::from(p)] = true;
         }
     }
+    esc.addr_unescaped = esc.unescaped.clone();
     for u in &func.unwind_drops {
         for s in [u.local, u.flag] {
             esc.unescaped[s.index()] = false;

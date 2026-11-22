@@ -178,6 +178,48 @@ impl Asm {
         }
     }
 
+    /// Atomic `xchg [dst], src` of width `size`.
+    pub fn xchg(&mut self, size: Size, dst: Mem, src: Reg) {
+        self.sized(false, size, (&[0x86], &[0x87]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock xadd [dst], src` of width `size`.
+    pub fn xadd(&mut self, size: Size, dst: Mem, src: Reg) {
+        self.flags_overwritten();
+        self.sized(true, size, (&[0x0F, 0xC0], &[0x0F, 0xC1]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock cmpxchg [dst], src` of width `size`.
+    pub fn cmpxchg(&mut self, size: Size, dst: Mem, src: Reg) {
+        self.flags_overwritten();
+        self.sized(true, size, (&[0x0F, 0xB0], &[0x0F, 0xB1]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock op [dst], src` of width `size`.
+    pub fn lock_alu_reg(&mut self, size: Size, op: Alu, dst: Mem, src: Reg) {
+        self.alu_flags(op);
+        self.sized(true, size, (&[op as u8 * 8], &[op as u8 * 8 + 1]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock op [dst], imm` of width `size`.
+    pub fn lock_alu_imm(&mut self, size: Size, op: Alu, dst: Mem, imm: i32) {
+        self.alu_imm_raw(true, size, op, dst.into(), imm);
+    }
+
+    /// Atomic `lock inc/dec [dst]` of width `size`.
+    pub fn lock_inc_dec(&mut self, size: Size, dec: bool, dst: Mem) {
+        self.flags_overwritten();
+        self.sized(true, size, (&[0xFE], &[0xFF]), u8::from(dec), dst.into());
+    }
+
+    /// Atomic `lock bts/btr/btc [dst], bit` (`ext` = 5/6/7) for `size != Size::B`.
+    pub fn lock_bt_imm(&mut self, size: Size, ext: u8, dst: Mem, bit: u8) {
+        debug_assert!(size != Size::B);
+        self.flags_overwritten();
+        self.sized(true, size, (&[], &[0x0F, 0xBA]), ext, dst.into());
+        self.imm(&[bit]);
+    }
+
     fn xmm_op(&mut self, pp: u8, opcode: u8, (xmm, src): (Xmm, Xmm), rm: impl Into<Rm>) {
         if self.avx {
             return self.vex_xmm(1, pp, opcode, (xmm, src), rm);

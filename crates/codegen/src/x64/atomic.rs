@@ -299,16 +299,25 @@ impl Emit<'_> {
                 }
             }
             Op::AtomicRmw(rmw, _, addr, value) => {
-                self.rmw(*rmw, size, *addr, *value);
-                self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi]);
-                self.put(result()?, Reg::Rax);
+                let res = result()?;
+                if self.plan.fused[res.index()] {
+                    self.lock_rmw(*rmw, size, *addr, *value);
+                } else {
+                    self.rmw(*rmw, size, *addr, *value);
+                    self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi]);
+                }
+                if *rmw == AtomicRmwOp::Sub {
+                    self.asm.hold_eq(res.index() as u32, value.index() as u32);
+                }
+                if !self.plan.fused[res.index()] {
+                    self.put(res, Reg::Rax);
+                }
             }
             Op::AtomicCas(_, addr, expected, replacement) => {
                 let res = result()?;
                 let target = self.atomic_target(*addr, Reg::Rsi, &[Reg::Rax, Reg::Rcx]);
                 self.raw(Reg::Rax, *expected);
                 self.raw(Reg::Rcx, *replacement);
-                self.asm.flags_overwritten();
                 self.asm.cmpxchg(size, target, Reg::Rcx);
                 self.asm.hold_eq(res.index() as u32, expected.index() as u32);
                 self.clobber_reg(Reg::Rax);
@@ -693,7 +702,7 @@ impl Emit<'_> {
     }
 
     /// The memory at `addr`: in the register that holds it unless the operation writes that register, else through `scratch`.
-    fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
+    pub(super) fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
         if let Some(reg) = self.reg_of(addr).filter(|reg| !written.contains(reg) && *reg != Reg::Rsp) {
             return Mem::new(reg, 0);
         }
