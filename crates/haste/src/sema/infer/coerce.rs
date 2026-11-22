@@ -78,8 +78,13 @@ impl Infer<'_, '_> {
             if let Some(unsize) = self.unsize_pointee(a, b)? {
                 return Ok(Some((at, unsize)));
             }
-            let nested = matches!((self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b))), (Kind::Adt(x, _), Kind::Adt(y, _)) if x == y);
-            if nested && let Some(unsize) = self.coercion(a, b)? {
+            let (ka, kb) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+            let unsize = match (ka, kb) {
+                (Kind::Ref(from, p1) | Kind::Ptr(from, p1), Kind::Ref(to, p2) | Kind::Ptr(to, p2)) => self.unsize_pointer((from, p1), (to, p2))?,
+                (Kind::Adt(x, _), Kind::Adt(y, _)) if x == y => self.coercion(a, b)?,
+                _ => None,
+            };
+            if let Some(unsize) = unsize {
                 return Ok(Some((at, unsize)));
             }
         }
@@ -87,16 +92,21 @@ impl Infer<'_, '_> {
     }
 
     fn pointer_coercion(&mut self, (found, expected): (Ty, Ty), (from, a): (Mut, Ty), (to, b): (Mut, Ty)) -> Result<Option<Coercion>> {
-        let unsize = self.unsize_pointee(a, b)?;
+        let unsize = self.unsize_pointer((from, a), (to, b))?;
         let loosens = from == Mut::Not && to == Mut::Mut;
-        if unsize.is_some() && loosens {
-            bail!("cannot coerce a shared pointer to a mutable one");
-        }
         let both_refs = matches!(self.cx.types.kind(found), Kind::Ref(..)) && matches!(self.cx.types.kind(expected), Kind::Ref(..));
         match unsize {
             None if both_refs && !loosens => self.deref_coercion(a, b, to),
             unsize => Ok(unsize),
         }
+    }
+
+    fn unsize_pointer(&mut self, (from, a): (Mut, Ty), (to, b): (Mut, Ty)) -> Result<Option<Coercion>> {
+        let unsize = self.unsize_pointee(a, b)?;
+        if unsize.is_some() && from == Mut::Not && to == Mut::Mut {
+            bail!("cannot coerce a shared pointer to a mutable one");
+        }
+        Ok(unsize)
     }
 
     fn deref_coercion(&mut self, from: Ty, to: Ty, mutability: Mut) -> Result<Option<Coercion>> {

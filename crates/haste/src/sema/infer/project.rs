@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::body::sig::Predicate;
-use crate::body::{Body, PathId};
+use crate::body::{Body, PathId, TyId};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
@@ -10,7 +10,7 @@ use super::super::impls::ImplRef;
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Ty};
 use super::Infer;
-use super::scope::{named_bounds, one_name, type_params};
+use super::scope::{named_bounds, one_name, same_param, type_params};
 
 /// An associated type whose `Self` is not known yet: trait, `Self`, trait arguments, name, and the variable that stands for it.
 pub(super) type Projection = (ItemRef, Ty, Vec<Ty>, String, Ty);
@@ -270,7 +270,7 @@ impl Infer<'_, '_> {
     pub(super) fn typed_predicates(&mut self, arena: &Body, src: &Source, predicates: &[Predicate]) -> Vec<(Ty, u32)> {
         let mut found = Vec::new();
         for predicate in predicates {
-            let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else {
+            let Some(ty) = predicate.ty.filter(|&ty| !self.is_frame_param(arena, src, ty)) else {
                 continue;
             };
             let Ok(ty) = self.lower_ty(arena, ty) else {
@@ -279,6 +279,13 @@ impl Infer<'_, '_> {
             found.extend(arena.list(predicate.bounds).iter().map(|&bound| (ty, bound)));
         }
         found
+    }
+
+    fn is_frame_param(&self, arena: &Body, src: &Source, ty: TyId) -> bool {
+        let Some(name) = one_name(arena, src, ty) else {
+            return false;
+        };
+        (name == "Self" && self.self_ty.is_some()) || self.generics.iter().any(|&(param, _)| same_param(param, name))
     }
 
     /// Whether trait `of` has a member `name`.
