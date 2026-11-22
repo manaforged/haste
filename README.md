@@ -4,7 +4,7 @@ haste is a clean-room Rust compiler, JIT engine, and standalone AOT compiler for
 
 Use **haste** for instant local edit-run-test cycles, live hot-reloading, and zero-linker cross-compilation; keep `cargo check` / `rustc` in CI for full Polonius lifetime verification and production releases.
 
-- **Instant inner loop:** Single-line edit rebuilds in **12–13 ms** on `tests/diff` (**8x–37x faster than `cargo`**), **56–74 ms** edit-and-run on a real `serde` + `serde_derive` + `serde_json` + `regex` app (**5.5x–8.2x faster than `cargo`**), and **0.5–6.0 ms** no-op checks—with zero multi-GB `target/` directories.
+- **Instant inner loop:** Single-line edit rebuilds in **12–13 ms** on `tests/diff` (**8x–37x faster than `cargo`**) and **0.5–6.0 ms** no-op checks—with zero multi-GB `target/` directories.
 - **Live hot-reloading:** `haste run --watch` watches workspace source files and patches changed function bodies directly into the running process.
 - **Zero-linker 6-target AOT cross-compilation:** `haste --release build -o ./app --target TRIPLE` emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) with no Docker and no external cross-linker.
 - **Self-hosting:** Compiles its own 86-package, ~178k-function workspace (including `serde`, `serde_derive`, `toml`, `syn`, `tracing`, `anyhow`, `indexmap`, `memchr`) in **10.3–10.8 s** (`0` failed; `13.1 s` end-to-end vs `23.9 s` for cold `cargo build` on macOS ARM64).
@@ -119,7 +119,6 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime tables 
 | `tests/diff` (124 fns) — single-line edit rebuild | macOS ARM64 | 13.1 ms | 491 ms | 37.6x |
 | `tests/diff` (124 fns) — single-line edit rebuild | Linux x86-64 | 12.4 ms | 102 ms | 8.2x |
 | `tests/diff` (124 fns) — unchanged no-op | Linux x86-64 | 0.5 ms | 4.8 ms | 9.8x |
-| `serde` + `serde_json` + `regex` (15 pkgs) — warm edit+run | macOS ARM64 | 56–74 ms | 329–531 ms | 5.5x–8.2x |
 | Self-host `haste` (86 pkgs, 178k fns) — cold debug build | macOS ARM64 | 13.1 s | 23.9 s | 1.8x |
 | Self-host `haste` (86 pkgs, 178k fns) — unchanged no-op | macOS ARM64 | 6.0 ms | 36.4 ms | 6.0x |
 

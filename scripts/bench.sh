@@ -222,6 +222,8 @@ def median_ms(rounds, cmd, env=None):
     return times[len(times) // 2]
 
 def fmt_ms(ms):
+    if ms >= 1000.0:
+        return f"{ms / 1000.0:.1f} s"
     if ms >= 100.0:
         return f"{round(ms)} ms"
     return f"{ms:.1f} ms"
@@ -269,6 +271,22 @@ compute_rustc = os.path.join(tmp, "compute_rustc")
 subprocess.run([haste_bin, "--release", "build", "-o", compute_haste, compute_dir], env=haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 subprocess.run(["rustc", "-C", "opt-level=3", "--edition=2021", os.path.join(compute_dir, "src", "main.rs"), "-o", compute_rustc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
+# Self-host workspace (., 86 pkgs)
+self_cargo_target = os.path.join(tmp, "self_cargo_target")
+haste_self_cmd = [haste_bin, "build", "."]
+cargo_self_cmd = ["cargo", "build", "--quiet", "--locked", "--target-dir", self_cargo_target]
+run_cold_self = os.environ.get("HASTE_BENCH_COLD", "1") != "0"
+if run_cold_self:
+    h_self_cold = run_timed(haste_self_cmd, env=haste_env)
+    c_self_cold = run_timed(cargo_self_cmd, env=cargo_env)
+else:
+    subprocess.run(haste_self_cmd, env=haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    subprocess.run(cargo_self_cmd, env=cargo_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    h_self_cold = None
+    c_self_cold = None
+h_self_noop = median_ms(5, haste_self_cmd, env=haste_env)
+c_self_noop = median_ms(5, cargo_self_cmd, env=cargo_env)
+
 print("### Build Speed (`tests/diff`, 124 fns)")
 print()
 print("| Benchmark | haste | cargo | Speedup |")
@@ -278,6 +296,19 @@ for label, h_ms, c_ms in (
     ("Unchanged no-op build", h_diff_noop, c_diff_noop),
     ("Cold debug build", h_diff_cold, c_diff_cold),
 ):
+    speedup = f"{c_ms / max(h_ms, 1e-6):.1f}x"
+    print(f"| {label} | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {speedup} |")
+
+print()
+print("### Self-Host Build Speed (`.`)")
+print()
+print("| Benchmark | haste | cargo | Speedup |")
+print("| --- | ---: | ---: | ---: |")
+self_rows = []
+if h_self_cold is not None:
+    self_rows.append(("Cold debug build", h_self_cold, c_self_cold))
+self_rows.append(("Unchanged no-op build", h_self_noop, c_self_noop))
+for label, h_ms, c_ms in self_rows:
     speedup = f"{c_ms / max(h_ms, 1e-6):.1f}x"
     print(f"| {label} | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {speedup} |")
 

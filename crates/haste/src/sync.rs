@@ -52,7 +52,9 @@ pub(crate) fn parallel_map<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> 
     let queue = Mutex::new(items.into_iter().enumerate());
     let worker = || {
         let mut local = Vec::new();
-        while let Some((idx, item)) = lock(&queue).next() {
+        loop {
+            let next = lock(&queue).next();
+            let Some((idx, item)) = next else { break };
             local.push((idx, work(item)));
         }
         local
