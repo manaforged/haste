@@ -8,7 +8,7 @@ Use **haste** for instant local edit-run-test cycles, live hot-reloading, and ze
 - **Live hot-reloading:** `haste run --watch` watches workspace source files and patches changed function bodies directly into the running process.
 - **Zero-linker 6-target AOT cross-compilation:** `haste --release build -o ./app --target TRIPLE` emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) with no Docker and no external cross-linker.
 - **Self-hosting:** Compiles its own 86-package, ~178k-function workspace (including `serde`, `serde_derive`, `toml`, `syn`, `tracing`, `anyhow`, `indexmap`, `memchr`) in **10.3–10.8 s** (`0` failed; `13.1 s` end-to-end vs `23.9 s` for cold `cargo build` on macOS ARM64).
-- **Not a toy backend:** Matches or beats `rustc -C opt-level=3` on **3 of 4** AOT compute kernels on both x86-64 (`sha256`, `sieve`, `scan`) and ARM64 (`sha256` **0.78x**, `scan` **0.98x**, `sort` **1.00x**, `scripts/bench.sh`, bit-identical outputs), and passes **620/620** differential tests, **90/90** async tests, **15/15** proc-macro tests, **17/17** crate probes (`jit+aot`), and **259/259 (100.0%)** single-file edition-2021 `rust-lang/rust` `tests/ui/` `run-pass` tests (`jit+aot`).
+- **Not a toy backend:** Matches or beats `rustc -C opt-level=3` on **all 4 of 4** AOT compute kernels on ARM64 (`sha256` **0.80x**, `sieve` **0.94x**, `sort` **1.00x**, `scan` **1.00x**) and **3 of 4** on x86-64 (`sha256` **0.89x**, `sieve` **0.93x**, `scan` **0.95x**, `scripts/bench.sh`, bit-identical outputs), and passes **645/645** differential tests, **90/90** async tests, **15/15** proc-macro tests, **17/17** crate probes (`jit+aot`), and **259/259 (100.0%)** single-file edition-2021 `rust-lang/rust` `tests/ui/` `run-pass` tests (`jit+aot`).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline and module tour.
 
@@ -126,17 +126,17 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime tables 
 
 | Workload | macOS ARM64 (`haste` / `rustc -O3`) | Linux x86-64 (`haste` / `rustc -O3`) | Output |
 | --- | ---: | ---: | --- |
-| `sha256` (250k blocks) | 57.1 ms / 73.0 ms (**0.78x**) | 32.1 ms / 36.0 ms (**0.89x**) | exact match (`7333157476866902348`) |
-| `sieve` (4M primes) | 7.0 ms / 6.7 ms (**1.06x**) | 3.6 ms / 3.9 ms (**0.93x**) | exact match (`544501644261`) |
-| `sort` (500k quicksort + bsearch) | 29.1 ms / 29.0 ms (**1.00x**) | 23.4 ms / 23.0 ms (**1.02x**) | exact match (`8647866321337317866`) |
-| `scan` (JSON-like byte scanner) | 7.5 ms / 7.6 ms (**0.98x**) | 2.6 ms / 2.8 ms (**0.95x**) | exact match (`80005120000`) |
+| `sha256` (250k blocks) | 57.4 ms / 71.7 ms (**0.80x**) | 32.1 ms / 36.0 ms (**0.89x**) | exact match (`7333157476866902348`) |
+| `sieve` (4M primes) | 6.1 ms / 6.5 ms (**0.94x**) | 3.6 ms / 3.9 ms (**0.93x**) | exact match (`544501644261`) |
+| `sort` (500k quicksort + bsearch) | 28.7 ms / 28.7 ms (**1.00x**) | 23.4 ms / 23.0 ms (**1.02x**) | exact match (`8647866321337317866`) |
+| `scan` (JSON-like byte scanner) | 7.7 ms / 7.6 ms (**1.00x**) | 2.6 ms / 2.8 ms (**0.95x**) | exact match (`80005120000`) |
 
 ## Verify it yourself
 
 `tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites, and `tests/probes` holds standalone crates. `scripts/check.sh` compares `cargo run` against both `haste test` (JIT) and `haste --release build -o` (standalone AOT).
 
 ```bash
-bash scripts/check.sh                   # 620/620 differential cases (jit+aot) vs rustc
+bash scripts/check.sh                   # 645/645 differential cases (jit+aot) vs rustc
 bash scripts/check.sh tests/async       # 90/90 async cases (jit+aot)
 bash scripts/check.sh tests/proc-macro  # 15/15 proc-macro cases (jit+aot)
 bash scripts/probes.sh                  # 17/17 standalone crate probes (jit+aot) vs rustc
