@@ -509,12 +509,16 @@ pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32
             let Some(res) = data.result else { continue };
             pos_of[res.index()] = Some((b_idx, pos, inst));
             let Op::Icmp(cc, a, b) = data.op else { continue };
-            if uses[res.index()] != 1 || plan.elided[res.index()] || plan.fused[res.index()] || plan.is_static(res) || func.ty(a).is_vector() {
+            if uses[res.index()] != 1 || plan.elided[res.index()] || plan.is_static(res) || func.ty(a).is_vector() {
                 continue;
             }
+            let was_fused = plan.fused[res.index()];
             let zero_val = matches!(cc, IntCC::Equal | IntCC::NotEqual)
                 .then(|| zero_cmp_operand(plan, func.ty(a), a, b))
                 .flatten();
+            if was_fused && zero_val.is_none() {
+                continue;
+            }
             let Some((off, is_branch, flags_ok)) = flag_consumer(func, &block.insts[pos + 1..], res, zero_val.is_some()) else {
                 continue;
             };
@@ -522,8 +526,9 @@ pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32
                 && let Some(val) = zero_val
                 && can_elide_cbz(func, plan, (uses, &pos_of), (b_idx, pos, pos + 1 + off), val)
             {
+                plan.fused[res.index()] = false;
                 plan.elided[res.index()] = true;
-            } else if flags_ok {
+            } else if !was_fused && flags_ok {
                 plan.fused[res.index()] = true;
             }
         }

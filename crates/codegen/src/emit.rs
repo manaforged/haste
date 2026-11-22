@@ -206,6 +206,51 @@ pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>
     Ok(())
 }
 
+fn simple_move_val<R: Copy + PartialEq>(func: &Function, plan: &Plan<R>, v: Value) -> bool {
+    let flag = |list: &[bool]| list.get(v.index()).copied().unwrap_or(true);
+    !flag(&plan.elided)
+        && !flag(&plan.deferred)
+        && !flag(&plan.fused)
+        && plan.pairs.get(v.index()).is_some_and(Option::is_none)
+        && (func.ty(v).is_small_int() || func.ty(v).is_float())
+}
+
+fn hoist_common_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    then: (Block, &'a [Value]),
+    otherwise: (Block, &'a [Value]),
+) -> Result<bool, String> {
+    if emit.in_shrink_entry() {
+        return Ok(false);
+    }
+    let (func, plan, frame) = (emit.func(), emit.plan(), emit.frame());
+    let then_steps = crate::frame::edge_steps(func, &plan.locations, &frame.values, then.1, &func.blocks[then.0.index()].params);
+    let else_steps = crate::frame::edge_steps(func, &plan.locations, &frame.values, otherwise.1, &func.blocks[otherwise.0.index()].params);
+    if then_steps.is_empty() || then_steps.len() != else_steps.len() {
+        return Ok(false);
+    }
+    let same = then_steps.iter().zip(&else_steps).all(|(ts, es)| match (ts, es) {
+        (crate::frame::Step::Move(ta, tp), crate::frame::Step::Move(ea, ep)) => {
+            plan.same_home(frame, *ta, *ea)
+                && plan.same_home(frame, *tp, *ep)
+                && func.ty(*ta).bytes() == func.ty(*ea).bytes()
+                && func.ty(*tp).bytes() == func.ty(*ep).bytes()
+                && simple_move_val(func, plan, *ta)
+                && simple_move_val(func, plan, *tp)
+                && matches!(plan.locations[ta.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
+                && matches!(plan.locations[tp.index()], Location::Reg(_) | Location::Float(_))
+                && plan.hoist.reads_free(plan.locations[tp.index()], condition)
+        }
+        _ => false,
+    });
+    if !same {
+        return Ok(false);
+    }
+    emit.edge(then.0, then.1)?;
+    Ok(true)
+}
+
 /// Runs the moves of a back edge to loop head `moved` whose other edge leaves that loop ahead of the branch, when each copies a register or stack home into a register that neither `plain` nor the condition reads, so the branch reaches `moved` without a jump of its own.
 fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
@@ -221,15 +266,11 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         return Ok(false);
     }
     let (func, plan, frame) = (emit.func(), emit.plan(), emit.frame());
-    let flag = |list: &[bool], v: Value| list.get(v.index()).copied().unwrap_or(true);
-    let simple = |v: Value| {
-        !flag(&plan.elided, v) && !flag(&plan.deferred, v) && !flag(&plan.fused, v) && plan.pairs.get(v.index()).is_some_and(Option::is_none) && (func.ty(v).is_small_int() || func.ty(v).is_float())
-    };
     let params = &func.blocks[moved.0.index()].params;
     let hoistable = moved.1.iter().zip(params).all(|(&arg, &param)| {
         plan.same_home(frame, arg, param)
-            || (simple(arg)
-                && simple(param)
+            || (simple_move_val(func, plan, arg)
+                && simple_move_val(func, plan, param)
                 && matches!(plan.locations[arg.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
                 && matches!(plan.locations[param.index()], Location::Reg(_) | Location::Float(_))
                 && plan.hoist.free(plan.locations[param.index()], plain, condition))
@@ -257,8 +298,12 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         goto_branch(emit, block, true);
         return Ok(());
     }
-    let then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
-    let else_moves = emit.plan().moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
+    let mut then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
+    let mut else_moves = emit.plan().moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
+    if then_moves && else_moves && hoist_common_moves(emit, condition, then, otherwise)? {
+        then_moves = false;
+        else_moves = false;
+    }
     if set_aside(emit, condition, (then, then_moves), (otherwise, else_moves))? {
         return Ok(());
     }
@@ -279,14 +324,18 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     if !else_moves && (then_moves || falls(emit, then.0)) {
         let target = target_label(emit, otherwise.0);
         emit.branch_cond(condition, true, target);
-        emit.edge(then.0, then.1)?;
+        if then_moves {
+            emit.edge(then.0, then.1)?;
+        }
         goto_branch(emit, then.0, true);
         return Ok(());
     }
     if !then_moves {
         let target = target_label(emit, then.0);
         emit.branch_cond(condition, false, target);
-        emit.edge(otherwise.0, otherwise.1)?;
+        if else_moves {
+            emit.edge(otherwise.0, otherwise.1)?;
+        }
         goto_branch(emit, otherwise.0, true);
         return Ok(());
     }
