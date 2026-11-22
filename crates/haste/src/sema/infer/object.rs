@@ -37,6 +37,30 @@ pub const ALIGN_SLOT: u32 = 2;
 pub const FIRST_METHOD: u32 = 3;
 
 impl Infer<'_, '_> {
+    pub(super) fn unsize_bound_holds(&mut self, arena: &crate::body::Body, (of, path): (ItemRef, crate::body::PathId), ty: Ty) -> Result<bool> {
+        let args = self.bound_args(of, arena, path, ty)?;
+        let Some(&target) = args.first() else { return Ok(false) };
+        if matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) || matches!(self.cx.types.kind(self.resolve(target)), Kind::Var(_)) {
+            self.obligations.push((of, vec![ty, target]));
+            return Ok(true);
+        }
+        self.unsize_holds(of, ty, target)
+    }
+
+    pub(super) fn unsize_holds(&mut self, of: ItemRef, from: Ty, to: Ty) -> Result<bool> {
+        let (from, to) = (self.resolve(from), self.resolve(to));
+        if self.poly.is_some()
+            && (self.has_params(from) || self.has_params(to))
+            && self.poly_holds_in_env(of, from, &[to])?
+        {
+            return Ok(true);
+        }
+        let saved = self.save_deferred();
+        let holds = self.probe(|infer| Ok::<_, anyhow::Error>(infer.unsize_pointee(from, to).ok().flatten().is_some()))?;
+        self.restore_deferred(saved);
+        Ok(holds)
+    }
+
     pub(super) fn unsize_pointee(&mut self, from: Ty, to: Ty) -> Result<Option<Coercion>> {
         let (from, to) = (self.resolve(from), self.resolve(to));
         match (self.cx.types.kind(from).clone(), self.cx.types.kind(to).clone()) {

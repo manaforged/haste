@@ -454,6 +454,9 @@ impl<'a> Infer<'_, 'a> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(true);
         };
+        if self.cx.lang(of) == Some("unsize") {
+            return self.unsize_bound_holds(arena, (of, path), ty);
+        }
         if self.compiler_decides(of, ty) {
             return Ok(self.compiler_holds(of, ty));
         }

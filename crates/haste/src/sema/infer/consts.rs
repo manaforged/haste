@@ -452,7 +452,14 @@ impl<'a> Infer<'_, 'a> {
         let target = self.lower_ty(arena, ty)?;
         let Kind::Prim(primitive) = *self.cx.types.kind(target) else { bail!("a cast to a type that is not an integer") };
         let Some(int) = int_info(primitive) else { bail!("a cast to a type that is not an integer") };
-        let (value, from) = self.const_defaulted(arena, inner, I32)?;
+        let fallback = match super::expr::cast_lit_kind(arena, inner) {
+            Some((Lit::Int, at, negated)) => match parse_int(self.src.text(at))? {
+                (value, None) if super::expr::int_lit_fits(value, int, negated) => int,
+                _ => I32,
+            },
+            _ => I32,
+        };
+        let (value, from) = self.const_defaulted(arena, inner, fallback)?;
         Ok((convert(value, from, int), Some(int)))
     }
 

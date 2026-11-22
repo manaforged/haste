@@ -452,6 +452,9 @@ impl Infer<'_, '_> {
 
     fn builtin_obligation_holds(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
         if !self.has_vars(self_ty) {
+            if self.cx.lang(of) == Some("unsize") {
+                return Ok(args.first().is_some_and(|&to| !self.has_vars(to)) && self.unsize_holds(of, self_ty, args[0])?);
+            }
             if self.compiler_decides(of, self_ty) {
                 return Ok(self.compiler_holds(of, self_ty));
             }

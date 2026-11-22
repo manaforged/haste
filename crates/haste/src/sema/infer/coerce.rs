@@ -40,7 +40,8 @@ impl Infer<'_, '_> {
             (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) => self.pointer_coercion((found, expected), (from, a), (to, b)),
             (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => {
                 let (from, to) = (self.cx.types.substs(from).to_vec(), self.cx.types.substs(to).to_vec());
-                self.unsize_args(&from, &to)
+                let Some(coercion) = self.unsize_args(&from, &to)? else { return Ok(None) };
+                Ok(self.single_pointer_adt(found)?.then_some(coercion))
             }
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
                 let args = self.cx.types.substs(substs).to_vec();
@@ -62,6 +63,73 @@ impl Infer<'_, '_> {
             return Ok(false);
         };
         self.may_implement(of, found, &[expected])
+    }
+
+    fn single_pointer_adt(&mut self, ty: Ty) -> Result<bool> {
+        let mut cur = self.resolve(ty);
+        for _ in 0..RECURSION_LIMIT {
+            match self.cx.types.kind(cur).clone() {
+                Kind::Ref(..) | Kind::Ptr(..) => return Ok(true),
+                Kind::Pat(base, ..) => cur = self.resolve(base),
+                Kind::Adt(item, args) => {
+                    if self.cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
+                        return Ok(false);
+                    }
+                    let slice = self.cx.types.substs(args).to_vec();
+                    let fields = self.adt_fields(item, &slice)?;
+                    let Some(variant) = fields.first() else {
+                        return Ok(false);
+                    };
+                    let mut non_zst = None;
+                    for &field in variant {
+                        if self.is_zero_sized(field)? {
+                            continue;
+                        }
+                        if non_zst.is_some() {
+                            return Ok(false);
+                        }
+                        non_zst = Some(field);
+                    }
+                    let Some(only) = non_zst else {
+                        return Ok(false);
+                    };
+                    cur = self.resolve(only);
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_zero_sized(&mut self, ty: Ty) -> Result<bool> {
+        let mut stack = vec![ty];
+        let mut steps = 0;
+        while let Some(next) = stack.pop() {
+            steps += 1;
+            if steps > RECURSION_LIMIT {
+                return Ok(false);
+            }
+            match self.cx.types.kind(self.resolve(next)).clone() {
+                Kind::Tuple(items) => stack.extend(self.cx.types.substs(items).iter().copied()),
+                Kind::Array(elem, len) => {
+                    if self.cx.types.len(len) != Some(0) {
+                        stack.push(elem);
+                    }
+                }
+                Kind::Adt(item, args) => {
+                    if self.cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
+                        return Ok(false);
+                    }
+                    let slice = self.cx.types.substs(args).to_vec();
+                    let fields = self.adt_fields(item, &slice)?;
+                    if let Some(variant) = fields.first() {
+                        stack.extend(variant.iter().copied());
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     fn unsize_args(&mut self, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {
@@ -213,7 +281,10 @@ impl Infer<'_, '_> {
             return false;
         }
         let args = &substs[1..];
-        let known_holds = self.compiler_decides(of, self_ty)
+        let known_holds = (self.cx.lang(of) == Some("unsize")
+            && args.first().is_some_and(|&to| !self.has_vars(to))
+            && self.unsize_holds(of, self_ty, args[0]).unwrap_or(false))
+            || self.compiler_decides(of, self_ty)
             || self.compiler_impl(of, self_ty)
             || self.object_holds(of, self_ty, args) == Some(true);
         !known_holds && self.probe(|infer| infer.may_implement(of, self_ty, args).ok() == Some(false))

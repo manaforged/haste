@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 
-use crate::body::{BinOp, Expr, ExprId, List, Lit, TyId, UnOp};
+use crate::body::{BinOp, Body, Expr, ExprId, List, Lit, TyId, UnOp};
 use crate::names::{ItemRef, Primitive};
 
-use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
+use super::super::ty::{Kind, Mut, Ty, float_bits, int_info, mask};
 use super::path::parse_int;
 use super::{Breaks, Infer, Res};
 
@@ -45,7 +45,7 @@ impl Infer<'_, '_> {
 
     fn cast(&mut self, inner: ExprId, ty: TyId) -> Result<Ty> {
         let target = self.lower_ty(self.body, ty)?;
-        let hint = matches!(self.cx.types.kind(self.resolve(target)), Kind::FnPtr(..)).then_some(target);
+        let hint = self.cast_hint(inner, target)?;
         let found = self.expr(inner, hint)?;
         self.note_cast_pointee(inner, found, target);
         let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
@@ -59,6 +59,29 @@ impl Infer<'_, '_> {
             self.finish_identity_cast(found, target)?;
         }
         Ok(target)
+    }
+
+    fn cast_hint(&self, inner: ExprId, target: Ty) -> Result<Option<Ty>> {
+        let target = self.resolve(target);
+        let kind = self.cx.types.kind(target);
+        if matches!(kind, Kind::FnPtr(..)) {
+            return Ok(Some(target));
+        }
+        let Kind::Prim(prim) = *kind else {
+            return Ok(None);
+        };
+        let Some((lit, at, negated)) = cast_lit_kind(self.body, inner) else {
+            return Ok(None);
+        };
+        match lit {
+            Lit::Float => Ok(float_bits(prim).is_some().then_some(target)),
+            Lit::Int => {
+                let Some(int) = int_info(prim) else { return Ok(None) };
+                let (value, suffix) = parse_int(self.src.text(at))?;
+                Ok((suffix.is_none() && int_lit_fits(value, int, negated)).then_some(target))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Notes a cast to a raw pointer whose pointee has unresolved inference variables.
@@ -706,4 +729,29 @@ const OPERATORS: [(BinOp, &str, &str); 16] = [
 /// The lang item of the trait that overloads `op`, and its method.
 pub(super) fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
     OPERATORS.iter().find(|(each, ..)| *each == op).map(|&(_, lang, name)| (lang, name))
+}
+
+pub(super) fn cast_lit_kind(body: &Body, mut expr: ExprId) -> Option<(Lit, u32, bool)> {
+    let mut negated = false;
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Block { stmts, tail: Some(tail), label: None, kind } if kind.is_plain_scope() && body.list(stmts).is_empty() => expr = tail,
+            Expr::Unary(UnOp::Neg, inner) => {
+                negated = true;
+                expr = inner;
+            }
+            Expr::Lit(lit @ (Lit::Int | Lit::Float), at) => return Some((lit, at, negated)),
+            _ => return None,
+        }
+    }
+}
+
+pub(super) fn int_lit_fits(value: u128, (bits, signed): (u32, bool), negated: bool) -> bool {
+    match (signed, negated) {
+        (false, true) => false,
+        (false, false) => value <= mask(bits),
+        (true, false) => value <= (mask(bits) >> 1),
+        (true, true) => value <= (mask(bits) >> 1) + 1,
+    }
 }
