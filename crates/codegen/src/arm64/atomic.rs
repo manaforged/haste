@@ -1,12 +1,11 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
-use super::{A, C, D, Emit, S, T};
+use super::{A, C, D, Emit, IP, S, T};
 use crate::ir::{AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
 
-/// Bitmask of `[D, S, T]` scratch registers overwritten by `op` of `func`.
-pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
+fn scratch_mask_for(func: &Function, op: &Op, lse: bool) -> u8 {
     const ALL: u8 = 7;
     const S_BIT: u8 = 2;
     let mut wide = false;
@@ -16,6 +15,8 @@ pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
     }
     match op {
         Op::AtomicLoad(..) | Op::AtomicStore(..) => 0,
+        Op::AtomicRmw(rmw, ..) if lse && *rmw != AtomicRmwOp::Nand => 0,
+        Op::AtomicCas(..) if lse => 0,
         Op::Move(..) => S_BIT,
         Op::Copy(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => ALL,
         Op::Fits(Binary::Imul, _, x, _) if func.ty(*x) == Type::I64 => ALL,
@@ -24,6 +25,16 @@ pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
         Op::Binary(Binary::Imul, x, _) if matches!(func.ty(*x), Type::Vec { lane: Lane::I64, count: 2 | 4 }) => ALL,
         _ => 0,
     }
+}
+
+/// Bitmask of `[D, S, T]` scratch registers overwritten by `op` of `func` on LL/SC targets.
+pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
+    scratch_mask_for(func, op, false)
+}
+
+/// Bitmask of `[D, S, T]` scratch registers overwritten by `op` of `func` on ARMv8.1 LSE targets.
+pub(super) fn scratch_mask_lse(func: &Function, op: &Op) -> u8 {
+    scratch_mask_for(func, op, true)
 }
 
 #[derive(Clone, Copy)]
@@ -495,39 +506,84 @@ impl Emit<'_> {
                 }
             }
             Op::AtomicRmw(rmw, ord, addr, value) => {
-                self.rmw(*rmw, *ord, size, *addr, *value);
-                self.put(result()?, A);
+                let res = result()?;
+                if self.lse && *rmw != AtomicRmwOp::Nand {
+                    self.lse_rmw(*rmw, *ord, size, *addr, *value, res);
+                } else {
+                    self.rmw(*rmw, *ord, size, *addr, *value);
+                    self.put(res, A);
+                }
             }
             Op::AtomicCas(ord, addr, expected, replacement) => {
-                self.cas(*ord, size, *addr, (*expected, *replacement));
-                self.put(result()?, A);
+                let res = result()?;
+                if self.lse {
+                    self.lse_cas(*ord, size, *addr, (*expected, *replacement), res);
+                } else {
+                    self.cas(*ord, size, *addr, (*expected, *replacement));
+                    self.put(res, A);
+                }
             }
             other => return Err(format!("unexpected {other:?}")),
         }
         Ok(())
     }
 
+    fn lse_rmw(&mut self, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, size: Size, addr: Value, value: Value, result: Value) {
+        let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
+        let at = self.bits(addr, C);
+        let val = match (op, self.plan.const_of(value)) {
+            (AtomicRmwOp::Sub, Some(imm)) => {
+                self.asm.mov_imm(IP, imm.wrapping_neg());
+                IP
+            }
+            (AtomicRmwOp::And, Some(imm)) => {
+                self.asm.mov_imm(IP, !imm);
+                IP
+            }
+            (AtomicRmwOp::Sub, None) => {
+                let v = self.bits(value, IP);
+                self.asm.alu(Alu::Sub, Size::X, IP, ZR, v);
+                IP
+            }
+            (AtomicRmwOp::And, None) => {
+                let v = self.bits(value, IP);
+                self.asm.alu(Alu::Orn, Size::X, IP, ZR, v);
+                IP
+            }
+            (_, Some(0)) => ZR,
+            _ if signed => {
+                self.get_opt(IP, value, true);
+                IP
+            }
+            _ => self.bits(value, IP),
+        };
+        let dead = self.plan.fused[result.index()];
+        let dst = if dead {
+            if ord.has_acquire() { A } else { ZR }
+        } else {
+            self.dst(result)
+        };
+        self.asm.lse_rmw(op, ord, size, (at, val, dst));
+        if !dead {
+            self.put(result, dst);
+        }
+    }
+
+    fn lse_cas(&mut self, ord: crate::ir::AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value), result: Value) {
+        let at = self.bits(addr, C);
+        let dst = self.dst(result);
+        let rep_reg = self.plan.reg_of(replacement);
+        let old = if dst == at || Some(dst) == rep_reg { A } else { dst };
+        self.raw(old, expected);
+        let rep = if self.plan.const_of(replacement) == Some(0) { ZR } else { self.bits(replacement, IP) };
+        self.asm.lse_cas(ord, size, (at, old, rep));
+        self.put(result, old);
+    }
+
     fn rmw(&mut self, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        if self.lse && op != AtomicRmwOp::Nand {
-            match (op, self.plan.const_of(value)) {
-                (AtomicRmwOp::Sub, Some(imm)) => self.asm.mov_imm(D, imm.wrapping_neg()),
-                (AtomicRmwOp::And, Some(imm)) => self.asm.mov_imm(D, !imm),
-                (AtomicRmwOp::Sub, None) => {
-                    self.get_opt(D, value, false);
-                    self.asm.alu(Alu::Sub, Size::X, D, ZR, D);
-                }
-                (AtomicRmwOp::And, None) => {
-                    self.get_opt(D, value, false);
-                    self.asm.alu(Alu::Orn, Size::X, D, ZR, D);
-                }
-                _ => self.get_opt(D, value, signed),
-            }
-            self.asm.lse_rmw(op, ord, size, (S, D, A));
-            return;
-        }
         self.get_opt(D, value, signed);
         let again = self.asm.label();
         self.asm.bind(again);
@@ -568,12 +624,6 @@ impl Emit<'_> {
     fn cas(&mut self, ord: crate::ir::AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        if self.lse {
-            self.raw(A, expected);
-            self.raw(C, replacement);
-            self.asm.lse_cas(ord, size, (S, A, C));
-            return;
-        }
         self.zext_get(D, expected);
         self.raw(C, replacement);
         let (again, done) = (self.asm.label(), self.asm.label());

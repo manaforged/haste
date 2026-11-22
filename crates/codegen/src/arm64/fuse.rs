@@ -734,7 +734,7 @@ fn fuse_block_inst(
     }
 }
 
-pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
+pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>, lse: bool) {
     let mut uses = vec![0_u32; func.types.len()];
     let mut pos_of = vec![None; func.types.len()];
     for (b_idx, block) in func.blocks.iter().enumerate() {
@@ -750,6 +750,14 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
         for (pos, &inst) in block.insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             if let Some(res) = data.result && !plan.elided[res.index()] {
+                if lse
+                    && uses[res.index()] == 0
+                    && func.ty(res).is_small_int()
+                    && matches!(data.op, Op::AtomicRmw(op, ..) if op != crate::ir::AtomicRmwOp::Nand)
+                {
+                    plan.fused[res.index()] = true;
+                    continue;
+                }
                 fuse_block_inst(func, plan, (&uses, &pos_of), (b_idx, pos, res), &data.op);
             }
         }

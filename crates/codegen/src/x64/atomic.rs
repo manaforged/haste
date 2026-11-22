@@ -700,15 +700,6 @@ impl Emit<'_> {
         self.asm.load(Size::B, dst, dst);
     }
 
-    /// The memory at `addr`: in the register that holds it unless the operation writes that register, else through `scratch`.
-    pub(super) fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
-        if let Some(reg) = self.reg_of(addr).filter(|reg| !written.contains(reg) && *reg != Reg::Rsp) {
-            return Mem::new(reg, 0);
-        }
-        self.raw(scratch, addr);
-        Mem::new(scratch, 0)
-    }
-
     /// Leaves the old contents in rax.
     fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
         match op {

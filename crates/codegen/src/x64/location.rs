@@ -1,4 +1,4 @@
-mod fuse;
+pub(super) mod fuse;
 mod patterns;
 mod sib;
 
@@ -768,4 +768,5 @@ pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos
             plan.fused[v] = true;
         }
     }
+    sib::fuse_atomic_addrs(func, plan, (uses, pos_of));
 }

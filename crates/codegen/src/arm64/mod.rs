@@ -34,26 +34,31 @@ const V1: Vreg = Vreg(1);
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 const OP_SCRATCH: [Reg; 3] = [D, S, T];
 
-const REGS: Regs<Reg> = Regs {
-    saved: &SAVED,
-    saved_float: &SAVED_FLOAT,
-    leaf: &[Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(8), D, S, T, Reg(14), Reg(15), LR],
-    wide_scratch: &WIDE_SCRATCH,
-    op_scratch: &OP_SCRATCH,
-    scratch_mask: atomic::scratch_mask,
-    dict: None,
-    float: &float::POOL,
-    float_branches: &float::BRANCHES,
-    vectors: true,
-    absolute_calls: true,
-    constant_calls: true,
-    two_address: false,
-    park: true,
-    fold_sib: true,
-    call_zext: true,
-    imm_store,
-    high_product: None,
-};
+const fn make_regs(scratch_mask: fn(&Function, &Op) -> u8) -> Regs<Reg> {
+    Regs {
+        saved: &SAVED,
+        saved_float: &SAVED_FLOAT,
+        leaf: &[Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(8), D, S, T, Reg(14), Reg(15), LR],
+        wide_scratch: &WIDE_SCRATCH,
+        op_scratch: &OP_SCRATCH,
+        scratch_mask,
+        dict: None,
+        float: &float::POOL,
+        float_branches: &float::BRANCHES,
+        vectors: true,
+        absolute_calls: true,
+        constant_calls: true,
+        two_address: false,
+        park: true,
+        fold_sib: true,
+        call_zext: true,
+        imm_store,
+        high_product: None,
+    }
+}
+
+const REGS: Regs<Reg> = make_regs(atomic::scratch_mask);
+const REGS_LSE: Regs<Reg> = make_regs(atomic::scratch_mask_lse);
 
 /// Zero stores from `xzr`; any other constant goes into a register first.
 fn imm_store(imm: i64) -> u64 {
@@ -77,13 +82,15 @@ fn emit_save_pairs<T: Copy>(asm: &mut Asm, regs: &[T], base: usize, mut step: im
 }
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
+    let lse = target.os == Os::Darwin;
+    let regs = if lse { &REGS_LSE } else { &REGS };
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
     let func = split.as_ref().unwrap_or(func);
     let defs = crate::fold::defs(func);
     let dropped = |plan: &crate::alloc::Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
     let dropped_before = dropped(&plan);
-    fuse::fuse(func, &mut plan);
+    fuse::fuse(func, &mut plan, lse);
     if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, packing))?;
     }

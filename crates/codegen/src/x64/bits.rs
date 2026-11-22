@@ -1,5 +1,6 @@
 use super::Emit;
-use super::asm::{Alu, Cond, Group3, Reg, Rm, Shift, Size};
+use super::asm::{Alu, Cond, Group3, Mem, Reg, Rm, Shift, Size};
+use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{AtomicRmwOp, Binary, Type, Value};
 
@@ -7,6 +8,33 @@ use crate::ir::{AtomicRmwOp, Binary, Type, Value};
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
 impl Emit<'_> {
+    fn atomic_offset(&self, addr: Value) -> (Value, i32) {
+        if self.plan.elided[addr.index()]
+            && self.plan.sib[addr.index()].is_none()
+            && let Some(inst) = self.defs[addr.index()]
+            && let Some((base, delta)) = super::location::fuse::iadd_sub_const(&self.plan, &self.func.insts[inst.index()].op)
+            && let Ok(disp) = i32::try_from(delta)
+        {
+            return (base, disp);
+        }
+        (addr, 0)
+    }
+
+    /// The memory at `addr`: folds elided constant offsets and stack frames, using the register holding the base unless the operation writes it, else `scratch`.
+    pub(super) fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
+        let (base, disp) = self.atomic_offset(addr);
+        if let Location::Frame(slot, off) = self.location(base)
+            && let Some(total) = self.frame.slots[slot.index()].checked_add(off).and_then(|d| d.checked_add(disp))
+        {
+            return self.frame_mem(total);
+        }
+        if let Some(reg) = self.reg_of(base).filter(|reg| !written.contains(reg) && *reg != Reg::Rsp) {
+            return Mem::new(reg, disp);
+        }
+        self.raw(scratch, base);
+        Mem::new(scratch, disp)
+    }
+
     pub(super) fn lock_rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
         let ty = self.ty(value);
         let imm = self.const_of(value).map(|c| crate::fold::extend(c, ty, false) as u64);

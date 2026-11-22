@@ -109,7 +109,7 @@ fn load_dst_clobber(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (u_res, op)
     addr_reads(ctx.func, ctx.plan, ctx.defs, addr, r_dst)
 }
 
-fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
+pub(in crate::x64) fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
     match *op {
         Op::Binary(Binary::Iadd, a, b) => match (plan.const_of(a), plan.const_of(b)) {
             (None, Some(c)) => Some((a, c)),
