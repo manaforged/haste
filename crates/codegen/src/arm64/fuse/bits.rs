@@ -579,6 +579,7 @@ fn peel_bit_op(func: &Function, plan: &Plan<Reg>, val: Value, bit: u8, def: &dyn
         }
         Op::Convert(Convert::Uextend, inner) => (u32::from(bit) < func.ty(inner).bits()).then_some((inner, bit)),
         Op::Convert(Convert::Sextend, inner) => Some((inner, bit.min(func.ty(inner).bits() as u8 - 1))),
+        Op::Convert(Convert::Ireduce, inner) => (u32::from(bit) < bits).then_some((inner, bit)),
         _ => None,
     }
 }
@@ -711,10 +712,14 @@ fn check_branch_tst(
     }
     match func.insts[cinst.index()].op {
         Op::Binary(Binary::Band, x, y) => {
-            if let Some(extra) = single_bit_raw(func, plan, x, y).and_then(|b| can_elide_bit(func, plan, info, (b_idx, cpos, pos, None), b)) {
-                return Some((cond_val, None, extra));
-            }
+            if let Some(extra) = single_bit_raw(func, plan, x, y).and_then(|b| can_elide_bit(func, plan, info, (b_idx, cpos, pos, None), b)) { return Some((cond_val, None, extra)); }
             can_elide_tst_band(func, plan, pos_of, (b_idx, cpos, pos, None), (x, y)).then_some((cond_val, None, None))
+        }
+        Op::Convert(Convert::Ireduce, inner) => {
+            let (mpos, minst) = local_single(plan, info, b_idx, cpos, inner)?;
+            let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op else { return None };
+            let (val, bit) = single_bit_raw(func, plan, x, y).filter(|&(_, b)| u32::from(b) < func.ty(cond_val).bits())?;
+            can_elide_bit(func, plan, info, (b_idx, mpos, pos, Some(cpos)), (val, bit)).map(|extra| (cond_val, Some(inner), extra))
         }
         Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
             let (m, mpos, x, y) = super::zero_cmp_band(func, plan, uses, pos_of, b_idx, lhs, rhs)?;

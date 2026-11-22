@@ -485,6 +485,12 @@ impl Emit<'_> {
             }
             let band_branch = match self.func.insts[inst.index()].op {
                 Op::Binary(Binary::Band, x, y) => Some((x, y, !invert)),
+                Op::Convert(Convert::Ireduce, inner) if self.plan.elided[inner.index()] => {
+                    match self.defs[inner.index()].map(|i| &self.func.insts[i.index()].op) {
+                        Some(&Op::Binary(Binary::Band, x, y)) => Some((x, y, !invert)),
+                        _ => None,
+                    }
+                }
                 Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs) => {
                     self.elided_band_cmp(lhs, rhs).map(|(x, y)| (x, y, (cc == IntCC::Equal) ^ !invert))
                 }

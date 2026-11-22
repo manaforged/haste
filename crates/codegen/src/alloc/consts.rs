@@ -70,20 +70,28 @@ pub(crate) fn arm64_trivial_mul_imm(ty: Type, imm: i64) -> bool {
         || simm.checked_neg().filter(|&n| n > 2).and_then(|n| (n as u64).checked_add(1)).is_some_and(|n| n.is_power_of_two() && n.trailing_zeros() as u8 <= max_shift)
 }
 
-fn arm64_loop_pressure<R>(func: &Function, loops: &Loops, elided: &[bool], locations: &[Location<R>], is_cand: &[bool]) -> (Vec<usize>, Vec<Vec<usize>>) {
+fn arm64_loop_pressure<R>(func: &Function, census: &Uses, loops: &Loops, elided: &[bool], locations: &[Location<R>], is_cand: &[bool]) -> (Vec<usize>, Vec<Vec<usize>>) {
     let (mut loop_gp, mut cand_loops, mut seen) = (vec![0_usize; loops.list.len()], vec![Vec::new(); func.types.len()], vec![0_u32; func.types.len()]);
     for (idx, each) in loops.list.iter().enumerate() {
         let (tag, mut gp) = ((idx + 1) as u32, 0_usize);
-        let mut count_val = |v: Value| {
+        let mut count_val = |v: Value, is_head_param: bool| {
             let vi = v.index();
             if seen[vi] != tag && !elided[vi] {
-                seen[vi] = tag;
-                if func.types[vi].is_small_int() && matches!(locations[vi], Location::Slot) { gp += 1; } else if is_cand[vi] { cand_loops[vi].push(idx); }
+                if func.types[vi].is_small_int() && matches!(locations[vi], Location::Slot) {
+                    let outside = census.def[vi].is_none_or(|(db, _)| !each.body.get(db).copied().unwrap_or(false));
+                    if is_head_param || outside {
+                        seen[vi] = tag;
+                        gp += 1;
+                    }
+                } else if is_cand[vi] {
+                    seen[vi] = tag;
+                    cand_loops[vi].push(idx);
+                }
             }
         };
-        func.blocks[each.head.index()].params.iter().copied().for_each(&mut count_val);
+        func.blocks[each.head.index()].params.iter().copied().for_each(|v| count_val(v, true));
         for (b, &in_l) in each.body.iter().enumerate() {
-            if in_l { func.blocks[b].insts.iter().for_each(|&inst| func.insts[inst.index()].op.for_operands(&mut count_val)); }
+            if in_l { func.blocks[b].insts.iter().for_each(|&inst| func.insts[inst.index()].op.for_operands(|v| count_val(v, false))); }
         }
         loop_gp[idx] = gp;
     }
@@ -125,7 +133,7 @@ fn scan_const_op<R>(
             for (rhs, v) in [(false, x), (true, y)] {
                 let Location::Imm(imm) = locations[v.index()] else { continue };
                 let inline = if two_address { x64_inline_imm(op, ty, rhs, imm) } else { arm64_inline_imm(op, ty, rhs, imm) };
-                if inline { must_stay_imm[v.index()] = true; } else if two_address && outer(v) { loop_mat[v.index()] += 1; }
+                if inline { must_stay_imm[v.index()] = true; } else if outer(v) { loop_mat[v.index()] += 1; }
             }
         }
         Op::Store(val, ..) | Op::StackStore(val, ..) if in_loop => {
@@ -147,7 +155,7 @@ pub(super) fn promote_loop_consts<R>(func: &Function, census: &Uses, loops: &Loo
         let outer = |v: Value| census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth);
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|r| elided[r.index()]) { continue; }
+            if data.result.is_some_and(|r| elided[r.index()]) && !matches!(data.op, Op::Binary(Binary::Imul, ..)) { continue; }
             scan_const_op(func, &data.op, locations, (two_address, depth > 0, &outer), (&mut must_stay_imm, &mut loop_mat));
             data.op.for_operands(|v| {
                 let vi = v.index();
@@ -162,7 +170,7 @@ pub(super) fn promote_loop_consts<R>(func: &Function, census: &Uses, loops: &Loo
         }
     }
     let is_cand: Vec<bool> = (0..count).map(|v| matches!(locations[v], Location::Imm(imm) if imm != 0) && !elided[v] && !must_stay_imm[v] && loop_mat[v] > 0).collect();
-    let mut pressure = (!two_address).then(|| arm64_loop_pressure(func, loops, elided, locations, &is_cand));
+    let mut pressure = (!two_address).then(|| arm64_loop_pressure(func, census, loops, elided, locations, &is_cand));
     let mut promoted = Vec::new();
     for (v, loc) in locations.iter_mut().enumerate() {
         if is_cand[v] && let Location::Imm(imm) = *loc {

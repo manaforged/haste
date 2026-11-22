@@ -671,6 +671,17 @@ impl Function {
         self.blocks.iter().flat_map(|block| &block.insts).map(|inst| self.insts[inst.index()].loc).find(|&loc| loc != 0).unwrap_or(0)
     }
 
+    /// Inserts a constant in the entry block so loop-invariant register allocation can hoist it out of loops.
+    pub(crate) fn entry_const(&mut self, imm: i64, ty: Type) -> Option<Value> {
+        let entry = self.entry?;
+        let val = self.value(ty);
+        let inst = self.add(Op::Const(imm), Some(val));
+        let block = &mut self.blocks[entry.index()].insts;
+        let at = block.len().saturating_sub(1);
+        block.insert(at, inst);
+        Some(val)
+    }
+
     /// Whether the body is a single block with a live thread-cell call (such as `Location::caller`).
     pub fn calls_thread_cell_directly(&self) -> bool {
         self.blocks.len() == 1

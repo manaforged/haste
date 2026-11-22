@@ -306,20 +306,27 @@ fn bounds_elidable(layout: TableLayout, lo: u64, known_u_max: u64) -> bool {
         && known_u_max.saturating_sub(layout.base as u64) <= layout.bounds_elide_max
 }
 
+fn emit_entry_const(func: &mut Function, imm: i64, fallback: &mut Vec<Inst>) -> Value {
+    if let Some(val) = func.entry_const(imm, Type::I64) {
+        return val;
+    }
+    let val = func.value(Type::I64);
+    fallback.push(func.add(Op::Const(imm), Some(val)));
+    val
+}
+
 fn emit_word_select(func: &mut Function, diff: Value, layout: TableLayout, insts: &mut Vec<Inst>) -> Value {
     if layout.two_words && layout.words[0] != layout.words[1] {
         let (split_c, in_lo) = (func.value(Type::I64), func.value(Type::I8));
         insts.push(func.add(Op::Const(layout.per_word as i64), Some(split_c)));
         insts.push(func.add(Op::Icmp(IntCC::UnsignedLessThan, diff, split_c), Some(in_lo)));
-        let (lo_c, hi_c, chosen) = (func.value(Type::I64), func.value(Type::I64), func.value(Type::I64));
-        insts.push(func.add(Op::Const(layout.words[0] as i64), Some(lo_c)));
-        insts.push(func.add(Op::Const(layout.words[1] as i64), Some(hi_c)));
+        let lo_c = emit_entry_const(func, layout.words[0] as i64, insts);
+        let hi_c = emit_entry_const(func, layout.words[1] as i64, insts);
+        let chosen = func.value(Type::I64);
         insts.push(func.add(Op::Select(in_lo, lo_c, hi_c), Some(chosen)));
         chosen
     } else {
-        let mask_c = func.value(Type::I64);
-        insts.push(func.add(Op::Const(layout.words[0] as i64), Some(mask_c)));
-        mask_c
+        emit_entry_const(func, layout.words[0] as i64, insts)
     }
 }
 

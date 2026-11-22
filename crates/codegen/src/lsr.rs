@@ -413,7 +413,8 @@ fn unwrap_base(state: &State<'_>, each: &Loop, raw: Value) -> Option<(Value, i64
 
 fn standard_group_ok(state: &State<'_>, each: &Loop, g: &Group) -> bool {
     let off_or_nondom = g.occs.iter().any(|o| o.byte_offset != 0) || !is_outside_dom(state, each, g.key.base);
-    g.occs.len() >= 2 || off_or_nondom || (g.key.stride != 1 && (g.has_mul || g.key.stride <= 0 || g.key.stride > 8 || g.total_uses >= 2))
+    let hw_scale = matches!(g.key.stride, 1 | 2 | 4 | 8) && !g.has_mul;
+    g.occs.len() >= 2 || off_or_nondom || !hw_scale
 }
 
 fn plan_lftr_for_iv(state: &State<'_>, each: &Loop, iv_info: &IvInfo, iv_groups: &[&Group]) -> Option<(usize, Vec<LftrMatch>)> {
