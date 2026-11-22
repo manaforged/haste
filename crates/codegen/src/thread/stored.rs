@@ -1,5 +1,5 @@
 use crate::fold::holds;
-use crate::ir::{Binary, Block, Function, Inst, IntCC, Op, Value};
+use crate::ir::{Block, Function, Inst, IntCC, Op, Value};
 
 /// A block that loads one word, compares it with a constant and branches on the result: the loaded address and offset, the test as `stored cc constant` or `constant cc stored`, and the two targets.
 struct Reload {
@@ -85,11 +85,11 @@ fn reload(func: &Function, defs: &[Option<Inst>], users: &[u32], block: Block, c
     let Op::Load(addr, offset) = func.insts[first.index()].op else { return None };
     let value = func.insts[first.index()].result?;
     let test = defs[cond.index()].filter(|inst| rest.contains(inst) && users[cond.index()] == 1);
-    let (cc, a, b) = match test.map(|inst| &func.insts[inst.index()].op) {
-        _ if cond == value => (IntCC::NotEqual, value, None),
-        Some(&Op::Icmp(cc, a, b)) => (cc, a, Some(b)),
-        Some(&Op::Binary(Binary::Isub | Binary::Bxor, a, b)) => (IntCC::NotEqual, a, Some(b)),
-        _ => return None,
+    let (cc, a, b) = if cond == value {
+        (IntCC::NotEqual, value, None)
+    } else {
+        let (cc, a, b) = test.and_then(|inst| crate::algebra::branch_cmp(&func.insts[inst.index()].op))?;
+        (cc, a, Some(b))
     };
     let local = |inst: Inst| func.insts[inst.index()].result.is_some_and(|res| users[res.index()] == 1);
     if !rest.iter().all(|&inst| Some(inst) == test || (local(inst) && matches!(func.insts[inst.index()].op, Op::Const(_)))) {

@@ -215,7 +215,7 @@ pub(super) fn record_edge_cmp(
 /// The two sides of the integer compare `cond` that the edge taken as `taken` proves equal, when `disp` neither defines nor binds either side.
 fn edge_equal(func: &Function, cx: &ThreadCx<'_>, disp: Block, cond: Value, taken: bool) -> Option<(Value, Value)> {
     let inst = cx.defs.get(cond.index()).copied().flatten()?;
-    let Op::Icmp(cc, x, y) = func.insts[inst.index()].op else { return None };
+    let (cc, x, y) = crate::algebra::branch_cmp(&func.insts[inst.index()].op)?;
     let equal = matches!((cc, taken), (IntCC::Equal, true) | (IntCC::NotEqual, false));
     let data = &func.blocks[disp.index()];
     let outside = |v: Value| !data.params.contains(&v) && cx.defs.get(v.index()).copied().flatten().is_none_or(|def| !data.insts.contains(&def));
@@ -251,35 +251,35 @@ pub(super) fn seed_edge(
             seed_edge(func, cx, a, false, depth + 1, (local_consts, edge_cmps));
             seed_edge(func, cx, b, false, depth + 1, (local_consts, edge_cmps));
         }
-        Op::Icmp(cc, x, y) if func.ty(x).is_small_int() => {
-            let eff = if taken { cc } else { cc.inverse() };
-            let (lhs, ord, imm) = match (lookup_const(local_consts, cx.consts, x), lookup_const(local_consts, cx.consts, y)) {
-                (None, Some(k)) => (x, eff, k),
-                (Some(k), None) => (y, flip_int_cc(eff), k),
-                _ => return,
-            };
-            let ty = func.ty(lhs);
-            record_edge_cmp(lhs, ty, ord, imm, local_consts, edge_cmps);
-            if let Some(lhs_inst) = cx.defs.get(lhs.index()).copied().flatten()
-                && let Op::Convert(kind @ (Convert::Uextend | Convert::Sextend), inner) = func.insts[lhs_inst.index()].op
-            {
-                let sub_ty = func.ty(inner);
-                if sub_ty.is_small_int() && sub_ty.bits() < ty.bits() {
-                    if kind == Convert::Uextend && !ord.is_signed() {
-                        let u = extend(imm, ty, false) as u64;
-                        if u <= sub_ty.unsigned_max() {
-                            record_edge_cmp(inner, sub_ty, ord, extend(u as i64, sub_ty, true), local_consts, edge_cmps);
-                        }
-                    } else if kind == Convert::Sextend && (ord.is_signed() || matches!(ord, IntCC::Equal | IntCC::NotEqual)) {
-                        let (sc, half) = (extend(imm, ty, true), 1_i64 << (sub_ty.bits() - 1));
-                        if (-half..half).contains(&sc) {
-                            record_edge_cmp(inner, sub_ty, ord, extend(sc, sub_ty, true), local_consts, edge_cmps);
-                        }
+        _ => {}
+    }
+    if let Some((cc, x, y)) = crate::algebra::branch_cmp(op) && func.ty(x).is_small_int() {
+        let eff = if taken { cc } else { cc.inverse() };
+        let (lhs, ord, imm) = match (lookup_const(local_consts, cx.consts, x), lookup_const(local_consts, cx.consts, y)) {
+            (None, Some(k)) => (x, eff, k),
+            (Some(k), None) => (y, flip_int_cc(eff), k),
+            _ => return,
+        };
+        let ty = func.ty(lhs);
+        record_edge_cmp(lhs, ty, ord, imm, local_consts, edge_cmps);
+        if let Some(lhs_inst) = cx.defs.get(lhs.index()).copied().flatten()
+            && let Op::Convert(kind @ (Convert::Uextend | Convert::Sextend), inner) = func.insts[lhs_inst.index()].op
+        {
+            let sub_ty = func.ty(inner);
+            if sub_ty.is_small_int() && sub_ty.bits() < ty.bits() {
+                if kind == Convert::Uextend && !ord.is_signed() {
+                    let u = extend(imm, ty, false) as u64;
+                    if u <= sub_ty.unsigned_max() {
+                        record_edge_cmp(inner, sub_ty, ord, extend(u as i64, sub_ty, true), local_consts, edge_cmps);
+                    }
+                } else if kind == Convert::Sextend && (ord.is_signed() || matches!(ord, IntCC::Equal | IntCC::NotEqual)) {
+                    let (sc, half) = (extend(imm, ty, true), 1_i64 << (sub_ty.bits() - 1));
+                    if (-half..half).contains(&sc) {
+                        record_edge_cmp(inner, sub_ty, ord, extend(sc, sub_ty, true), local_consts, edge_cmps);
                     }
                 }
             }
         }
-        _ => {}
     }
 }
 

@@ -193,28 +193,28 @@ impl Path {
                     self.add_with_backprop(func, ranges, y, Fact::range(0, fx.hi), 0);
                 }
             }
-            Some(&Op::Icmp(cc, x, y)) => {
-                let operand_ty = func.ty(x);
-                if !operand_ty.is_small_int() {
-                    return;
+            _ => {}
+        }
+        if let Some((cc, x, y)) = ranges.op(func, condition).and_then(crate::algebra::branch_cmp) {
+            let operand_ty = func.ty(x);
+            if !operand_ty.is_small_int() {
+                return;
+            }
+            let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
+            let order = unsigned_order(cc, operand_ty, &left, &right).unwrap_or(cc);
+            if !order.is_signed() {
+                if let Some(fact) = compared_range(order, operand_ty, &right, taken) {
+                    self.add_with_backprop(func, ranges, x, fact, 0);
                 }
-                let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
-                let order = unsigned_order(cc, operand_ty, &left, &right).unwrap_or(cc);
-                if !order.is_signed() {
-                    if let Some(fact) = compared_range(order, operand_ty, &right, taken) {
-                        self.add_with_backprop(func, ranges, x, fact, 0);
-                    }
-                    if let Some(fact) = compared_range(swapped(order), operand_ty, &left, taken) {
-                        self.add_with_backprop(func, ranges, y, fact, 0);
-                    }
-                }
-                if x != y {
-                    let eff = if taken { order } else { order.inverse() };
-                    let (kind, lhs, rhs) = rel_of(eff, x, y);
-                    self.push_rel(Rel { kind, lhs, rhs, ty: operand_ty });
+                if let Some(fact) = compared_range(swapped(order), operand_ty, &left, taken) {
+                    self.add_with_backprop(func, ranges, y, fact, 0);
                 }
             }
-            _ => {}
+            if x != y {
+                let eff = if taken { order } else { order.inverse() };
+                let (kind, lhs, rhs) = rel_of(eff, x, y);
+                self.push_rel(Rel { kind, lhs, rhs, ty: operand_ty });
+            }
         }
     }
 
@@ -558,23 +558,9 @@ fn cond_truth_depth(func: &Function, ranges: &Ranges, path: &Path, condition: Va
     if depth > 4 {
         return None;
     }
-    match ranges.op(func, condition) {
+    let op = ranges.op(func, condition);
+    let direct = match op {
         Some(&Op::Fits(op, signed, x, y)) => fits_truth(func, ranges, path, op, signed, x, y),
-        Some(&Op::Icmp(cc, x, y)) if func.ty(x).is_small_int() => {
-            let ty = func.ty(x);
-            decide(cc, ty, &path.refined_fact(func, ranges, x, 0), &path.refined_fact(func, ranges, y, 0))
-                .or_else(|| path.decide_rel(func, ranges, cc, ty, x, y))
-                .or_else(|| {
-                    matches!(cc, IntCC::Equal | IntCC::NotEqual).then(|| {
-                        [(x, y), (y, x)].into_iter().find_map(|(expr, imm)| {
-                            let k = path.fact(ranges, imm).exact()?;
-                            ((k == 0 || k == 1) && path.fact(ranges, expr).hi <= 1).then(|| {
-                                cond_truth_depth(func, ranges, path, expr, depth + 1).map(|t| (t == (k == 1)) ^ (cc == IntCC::NotEqual))
-                            }).flatten()
-                        })
-                    }).flatten()
-                })
-        }
         Some(&Op::Binary(Binary::Bxor, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| {
             (path.fact(ranges, mask).exact() == Some(1) && path.fact(ranges, inner).hi <= 1)
                 .then(|| cond_truth_depth(func, ranges, path, inner, depth + 1).map(|t| !t))
@@ -601,5 +587,27 @@ fn cond_truth_depth(func: &Function, ranges: &Ranges, path: &Path, condition: Va
             }
         }
         _ => None,
+    };
+    if direct.is_some() {
+        return direct;
     }
+    let Some((cc, x, y)) = op.and_then(crate::algebra::branch_cmp) else {
+        return None;
+    };
+    if !func.ty(x).is_small_int() {
+        return None;
+    }
+    let ty = func.ty(x);
+    decide(cc, ty, &path.refined_fact(func, ranges, x, 0), &path.refined_fact(func, ranges, y, 0))
+        .or_else(|| path.decide_rel(func, ranges, cc, ty, x, y))
+        .or_else(|| {
+            matches!(cc, IntCC::Equal | IntCC::NotEqual).then(|| {
+                [(x, y), (y, x)].into_iter().find_map(|(expr, imm)| {
+                    let k = path.fact(ranges, imm).exact()?;
+                    ((k == 0 || k == 1) && path.fact(ranges, expr).hi <= 1).then(|| {
+                        cond_truth_depth(func, ranges, path, expr, depth + 1).map(|t| (t == (k == 1)) ^ (cc == IntCC::NotEqual))
+                    }).flatten()
+                })
+            }).flatten()
+        })
 }

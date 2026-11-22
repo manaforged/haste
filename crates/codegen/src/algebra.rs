@@ -8,7 +8,7 @@ mod ovf;
 mod select;
 mod sum;
 mod vec;
-pub(crate) use cond::{compare_offsets, fold_bxor_conds, invert};
+pub(crate) use cond::{branch_cmp, compare_offsets, fold_bxor_conds, invert};
 pub(crate) use icmp::{is_non_null_addr, non_null_cmp};
 
 struct RewriteCx<'a> {
