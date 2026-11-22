@@ -675,8 +675,11 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
     }
     if mode == LowerMode::Stencil {
         splice::canonicalize_const_symbols((cx, reached), &mut func, (&reloc_plan, &relocs), (concrete, inline.stack.is_empty()));
+        if func.is_coroutine() {
+            haste_codegen::split_coroutine(&mut func);
+        }
         let has_drop_push = relocs.iter().any(|src| matches!(src, SymbolSource::Host(HostSymbol::DropPush)));
-        if !func.is_coroutine() && (!func.unwind_drops().is_empty() || has_drop_push) {
+        if !func.unwind_drops().is_empty() || has_drop_push {
             simplify_tallied(&mut func, Tally::Built);
             let mut sym_may_unwind = |sym: u32| match relocs.get(sym as usize) {
                 Some(SymbolSource::Slot(idx)) => reached.may_unwind(cx, *idx),
@@ -692,9 +695,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
                 );
             }
         }
-        if !func.is_coroutine() {
-            func.zero_init_unwind_flags();
-        }
+        func.zero_init_unwind_flags();
     }
     Ok((func, relocs, Arc::new(RelocPlan::from_vec(reloc_plan)), cycle))
 }

@@ -168,9 +168,6 @@ pub(crate) fn split(func: &mut Function) {
     if spec.resumes.is_empty() {
         ready_entry(func, &spec, old_entry);
         func.bump_cfg();
-        func.elide_dead_unwind_drops(|_| true);
-        func.zero_init_unwind_flags();
-        func.bump_cfg();
         return;
     }
     let defs = func.def_blocks();
@@ -217,9 +214,6 @@ pub(crate) fn split(func: &mut Function) {
     if let Some(lazy) = lazy {
         lazy::settle(func, &spec, anchor, lazy, orig_blocks);
     }
-    func.bump_cfg();
-    func.elide_dead_unwind_drops(|_| true);
-    func.zero_init_unwind_flags();
     func.bump_cfg();
 }
 
