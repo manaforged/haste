@@ -285,6 +285,7 @@ impl Emit<'_> {
                 if ord.is_seq_cst() {
                     let target = self.atomic_target(*addr, Reg::Rcx, &[Reg::Rax]);
                     self.raw(Reg::Rax, *value);
+                    self.asm.flags_overwritten();
                     self.asm.xchg(size, target, Reg::Rax);
                     self.clobber_reg(Reg::Rax);
                 } else {
@@ -722,6 +723,7 @@ impl Emit<'_> {
                 }
                 self.raw(Reg::Rax, value);
                 if op == AtomicRmwOp::Xchg {
+                    self.asm.flags_overwritten();
                     self.asm.xchg(size, target, Reg::Rax);
                     return;
                 }

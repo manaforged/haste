@@ -3,11 +3,10 @@ use crate::ir::{Block, Function, Inst, IntCC, Op, Value};
 /// The most instructions a copied block may run before its branch.
 const MAX_COPY: usize = 8;
 
-/// The branch a block ends with: either an integer compare defined in the block or a boolean condition value, and the two targets.
-struct Branch {
-    test: Test,
-    then: Block,
-    other: Block,
+/// The branch a block ends with: an integer compare in the block, a condition parameter, or a jump-table parameter.
+enum Branch {
+    Brif { test: Test, then: Block, other: Block },
+    Table { index: Value, default: Block, targets: Vec<Block> },
 }
 
 enum Test {
@@ -15,7 +14,7 @@ enum Test {
     Cond(Value),
 }
 
-/// Copies a short block that branches on a compare or condition into each predecessor whose jump arguments decide that branch, and sends the copy straight to the taken side; returns whether it copied any block.
+/// Copies a short block that branches on a compare, condition, or jump table into each predecessor whose jump arguments decide that branch, and sends the copy straight to the taken target; returns whether it copied any block.
 pub(super) fn run(func: &mut Function) -> bool {
     let cfg = func.cfg();
     let defs = crate::fold::defs(func);
@@ -31,11 +30,10 @@ pub(super) fn run(func: &mut Function) -> bool {
             if pred == block || *target != block || args.len() != func.blocks[block.index()].params.len() || copies.iter().any(|&(p, ..)| p == pred) {
                 continue;
             }
-            let Some(taken) = decide(func, &defs, block, args, &found.test) else {
+            let Some(to) = decide(func, &defs, block, args, &found) else {
                 continue;
             };
-            let (to, skipped) = if taken { (found.then, found.other) } else { (found.other, found.then) };
-            if to != skipped && to != block && cfg.single_pred(skipped) == Some(block) && stays_under(func, &cfg, block, skipped) {
+            if to != block && stays_under(func, &cfg, block, to) {
                 copies.push((pred, block, to));
             }
         }
@@ -50,10 +48,9 @@ pub(super) fn run(func: &mut Function) -> bool {
     !copies.is_empty()
 }
 
-/// The branch ending `block` when its body is a short run of pure instructions, loads and stores and its condition is a compare in the block or a parameter.
+/// The branch ending `block` when its body is a short run of pure instructions, loads and stores and its terminator is a decidable `Brif` or `BrTable`.
 fn branch(func: &Function, defs: &[Option<Inst>], block: Block) -> Option<Branch> {
     let (&last, body) = func.blocks[block.index()].insts.split_last()?;
-    let Op::Brif(cond, then, _, other, _) = func.insts[last.index()].op else { return None };
     if body.len() > MAX_COPY
         || !body.iter().all(|inst| {
             matches!(func.insts[inst.index()].op, Op::Store(..) | Op::Load(..) | Op::StackStore(..) | Op::StackLoad(..))
@@ -62,33 +59,54 @@ fn branch(func: &Function, defs: &[Option<Inst>], block: Block) -> Option<Branch
     {
         return None;
     }
-    let test = if let Some(def) = defs[cond.index()].filter(|inst| body.contains(inst)) {
-        let Op::Icmp(cc, a, b) = func.insts[def.index()].op else { return None };
-        Test::Cmp(cc, [a, b])
-    } else if func.blocks[block.index()].params.contains(&cond) {
-        Test::Cond(cond)
-    } else {
-        return None;
-    };
-    Some(Branch { test, then, other })
+    match func.insts[last.index()].op {
+        Op::Brif(cond, then, _, other, _) if then != other => {
+            let test = if let Some(def) = defs[cond.index()].filter(|inst| body.contains(inst)) {
+                let Op::Icmp(cc, a, b) = func.insts[def.index()].op else { return None };
+                Test::Cmp(cc, [a, b])
+            } else if func.blocks[block.index()].params.contains(&cond) {
+                Test::Cond(cond)
+            } else {
+                return None;
+            };
+            Some(Branch::Brif { test, then, other })
+        }
+        Op::BrTable(index, default, ref targets) if func.blocks[block.index()].params.contains(&index) => {
+            Some(Branch::Table { index, default, targets: targets.clone() })
+        }
+        _ => None,
+    }
 }
 
-/// Evaluates `test` in `block` under incoming `args` when both compare sides fold to constants, compute one expression, or a condition parameter is constant.
-fn decide(func: &Function, defs: &[Option<Inst>], block: Block, args: &[Value], test: &Test) -> Option<bool> {
+/// Evaluates `found` in `block` under incoming `args` when its branch target is statically known.
+fn decide(func: &Function, defs: &[Option<Inst>], block: Block, args: &[Value], found: &Branch) -> Option<Block> {
     let params = &func.blocks[block.index()].params;
     let subst = |v: Value| params.iter().position(|&p| p == v).map_or(v, |i| args[i]);
     let constant = |v: Value| match defs[v.index()].map(|inst| &func.insts[inst.index()].op) {
         Some(&Op::Const(imm)) => Some(imm),
         _ => None,
     };
-    match *test {
-        Test::Cond(cond) => constant(subst(cond)).map(|c| crate::fold::extend(c, func.ty(cond), false) != 0),
-        Test::Cmp(cc, sides) => {
-            let ty = func.ty(sides[0]);
-            if let (Some(ca), Some(cb)) = (constant(subst(sides[0])), constant(subst(sides[1]))) {
-                return Some(crate::fold::holds(cc, ty, ca, cb));
-            }
-            same(func, defs, block, args, sides).then(|| crate::fold::holds(cc, ty, 0, 0))
+    match found {
+        Branch::Brif { test, then, other } => {
+            let taken = match *test {
+                Test::Cond(cond) => constant(subst(cond)).map(|c| crate::fold::extend(c, func.ty(cond), false) != 0)?,
+                Test::Cmp(cc, sides) => {
+                    let ty = func.ty(sides[0]);
+                    if let (Some(ca), Some(cb)) = (constant(subst(sides[0])), constant(subst(sides[1]))) {
+                        crate::fold::holds(cc, ty, ca, cb)
+                    } else if same(func, defs, block, args, sides) {
+                        crate::fold::holds(cc, ty, 0, 0)
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            Some(if taken { *then } else { *other })
+        }
+        Branch::Table { index, default, targets } => {
+            let imm = constant(subst(*index))?;
+            let u = crate::fold::extend(imm, func.ty(*index), false) as u64;
+            Some(usize::try_from(u).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default))
         }
     }
 }
@@ -116,16 +134,20 @@ fn same(func: &Function, defs: &[Option<Inst>], block: Block, args: &[Value], si
     a == b || matches!((a_op, b_op), (Some((p, x1, y1)), Some((q, x2, y2))) if p == q && leaf(x1, x2) && leaf(y1, y2))
 }
 
-/// Whether every read of a parameter or computed value of `block` outside `block` sits where `skipped` dominates.
-fn stays_under(func: &Function, cfg: &crate::cfg::Cfg, block: Block, skipped: Block) -> bool {
+/// Whether every read of a parameter or computed value of `block` outside `block` sits under a single-pred successor of `block` other than `to`.
+fn stays_under(func: &Function, cfg: &crate::cfg::Cfg, block: Block, to: Block) -> bool {
     let data = &func.blocks[block.index()];
     let mut own = vec![false; func.types.len()];
     data.params.iter().for_each(|&p| own[p.index()] = true);
     data.insts.iter().filter(|inst| !matches!(func.insts[inst.index()].op, Op::Const(_))).filter_map(|inst| func.insts[inst.index()].result).for_each(|r| own[r.index()] = true);
+    let kept: Vec<Block> = func
+        .successors(block)
+        .filter(|&s| s != to && s != block && cfg.single_pred(s) == Some(block))
+        .collect();
     func.blocks.iter().enumerate().all(|(at, other)| {
         let here = Block(at as u32);
         here == block
-            || cfg.dominates(skipped, here)
+            || kept.iter().any(|&s| cfg.dominates(s, here))
             || other.insts.iter().all(|inst| {
                 let mut reads = false;
                 func.insts[inst.index()].op.for_operands(|v| reads |= own[v.index()]);
@@ -192,8 +214,11 @@ fn copy_into(func: &mut Function, pred: Block, block: Block, to: Block) {
         func.insts[new.index()].loc = data.loc;
         copied.push(new);
     }
-    let Op::Brif(_, then, ref then_args, _, ref other_args) = func.insts[last.index()].op else { return };
-    let mut to_args = if to == then { then_args.clone() } else { other_args.clone() };
+    let mut to_args = match &func.insts[last.index()].op {
+        Op::Brif(_, then, then_args, _, other_args) => if to == *then { then_args.clone() } else { other_args.clone() },
+        Op::BrTable(..) => Vec::new(),
+        _ => return,
+    };
     to_args.iter_mut().for_each(|v| *v = map.iter().find(|&&(from, _)| from == *v).map_or(*v, |&(_, into)| into));
     func.insts[jump.index()].op = Op::Jump(to, to_args);
     let insts = &mut func.blocks[pred.index()].insts;
