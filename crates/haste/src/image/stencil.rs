@@ -489,7 +489,8 @@ impl Image {
             pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
             return Ok(());
         }
-        let code = Arc::new(compile_traced(cx, reached, index, out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
+        let target = self.compile_target_for(cx, item);
+        let code = Arc::new(compile_traced(cx, reached, index, out.func, &target).map_err(|e| item_err(cx, item, e))?);
         if let Some(fp) = footprint.filter(|&fp| aot_relocs_valid(&code, out.relocs.len()) && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)) {
             self.freeze_stencil(cx, reached, index, fp, false, &code, Some(&out.reloc_plan), pass);
         }
@@ -667,7 +668,8 @@ impl Image {
             return Ok(());
         }
         let reloc_plan = out.reloc_plan;
-        let code = Arc::new(compile_traced(cx, reached, rep, out.func, &self.compile_target()).map_err(|e| item_err(cx, group.item, e))?);
+        let target = self.compile_target_for(cx, group.item);
+        let code = Arc::new(compile_traced(cx, reached, rep, out.func, &target).map_err(|e| item_err(cx, group.item, e))?);
         if cfg.shares_dict(code.bytes().len(), group.distinct.len()) {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);

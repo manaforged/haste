@@ -50,7 +50,7 @@ impl Image {
             let plan = footprint.and_then(|fp| self.pass.stencils.jit_templates.get(&(item, fp)).map(|template| Arc::clone(&template.reloc_plan)).or_else(|| plans.get(&fp).cloned()));
             let ready = match plan {
                 Some(plan) => Ready { footprint, code: None, relocs: self.quietly(cx, |cx| lower::eval_relocs(cx, reached, self, &plan, index).ok()).map(|relocs| (plan, relocs)) },
-                None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target()).ok()?, out.relocs, out.reloc_plan))) {
+                None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target_for(cx, item)).ok()?, out.relocs, out.reloc_plan))) {
                     Some((code, relocs, plan)) => {
                         if let Some(fp) = footprint {
                             plans.insert(fp, Arc::clone(&plan));
@@ -104,7 +104,7 @@ impl Image {
         if self.wanted_len() > wanted0 {
             bail!("unreached inline callee");
         }
-        Ok((Arc::new(haste_codegen::compile(out.func, &self.compile_target())?), out.relocs, out.reloc_plan))
+        Ok((Arc::new(haste_codegen::compile(out.func, &self.compile_target_for(cx, reached.list[index].0.0))?), out.relocs, out.reloc_plan))
     }
 
     pub(super) fn compile_jit_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<usize> {
@@ -293,7 +293,7 @@ impl Image {
         let out = lower::lower_stencil(cx, reached, fresh, index)?;
         let slots: &dyn Slots = fresh;
         let fresh_syms: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
-        let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target())?;
+        let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target_for(cx, reached.list[index].0.0))?;
         if code.bytes() != fresh_code.bytes() {
             bail!("stencil verification byte mismatch ({} vs {} bytes)", code.bytes().len(), fresh_code.bytes().len());
         }
@@ -310,7 +310,7 @@ impl Image {
         let out = lower::lower_stencil(cx, reached, fresh, index)?;
         let slots: &dyn Slots = fresh;
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
-        let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target())?;
+        let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target_for(cx, reached.list[index].0.0))?;
         let mut expected = vec![0u8; fresh_code.bytes().len()];
         fresh_code.patch(&symbols, &mut expected);
         // SAFETY: exec..exec + len is mapped readable executable code in this image.
