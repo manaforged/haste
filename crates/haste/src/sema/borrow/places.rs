@@ -173,6 +173,15 @@ impl Checker<'_, '_> {
         }
     }
 
+    fn ty_contains_ref(&self, ty: Ty) -> bool {
+        match *self.cx.types.kind(ty) {
+            Kind::Ref(..) => true,
+            Kind::Adt(_, args) => self.cx.types.substs(args).iter().any(|&a| self.ty_contains_ref(a)),
+            Kind::Tuple(items) => self.cx.types.substs(items).iter().any(|&a| self.ty_contains_ref(a)),
+            _ => false,
+        }
+    }
+
     pub(super) fn apply_deref_steps(&self, site: ExprId, base_ty: Ty, count: u32, p: &mut Place) -> Ty {
         let mut cur = base_ty;
         for step in 0..count {
@@ -188,7 +197,7 @@ impl Checker<'_, '_> {
             if cur != Ty::NONE {
                 self.deref_ref_step(cur, p);
                 cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);
-            } else if !p.through_deref {
+            } else if !p.through_deref || self.ty_contains_ref(base_ty) {
                 p.mut_ref_root = !p.behind_shared;
                 p.through_ref = true;
             }

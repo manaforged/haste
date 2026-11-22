@@ -68,7 +68,10 @@ impl Lower<'_, '_> {
     pub fn expr(&mut self, expr: ExprId) -> Result<Option<Value>> {
         let outer = self.b.loc();
         if let Some(&end) = self.body.expr_ends.get(expr.0 as usize) {
-            self.b.set_loc(self.src.place(end.saturating_sub(1)));
+            let loc = self.src.place(end.saturating_sub(1));
+            if loc != 0 {
+                self.b.set_loc(loc);
+            }
         }
         let value = self.expr_placed(expr);
         self.b.set_loc(outer);
@@ -83,18 +86,15 @@ impl Lower<'_, '_> {
         let typed = self.typed;
         match (typed.coercions.get(&expr), value) {
             _ if !self.open => Ok(None),
-            (Some(Coercion::Len(len)), Some(value)) => {
-                let data = self.sized_pointer(value, self.ty_of(expr));
-                let len = self.len(*len)?;
-                Ok(Some(self.wide_pointer(data, len)))
+            (Some(coercion @ (Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_))), Some(value)) => {
+                let coercion = coercion.clone();
+                self.apply_leaf_coercion(expr, value, self.ty_of(expr), &coercion)
             }
-            (Some(Coercion::Vtable(vtable)), Some(value)) => {
-                let data = self.sized_pointer(value, self.ty_of(expr));
-                let table = self.vtable(expr, vtable)?;
-                Ok(Some(self.wide(data, table)))
+            (Some(Coercion::Field { target, inner }), Some(value)) => {
+                let (target, inner) = (*target, inner.as_ref().clone());
+                self.coerce_struct(expr, value, self.ty_of(expr), target, &inner)
             }
             (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(expr, value, steps.clone()),
-            (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot, self.ty_of(expr))?)),
             (Some(&Coercion::Reify(Res::Fn(item, substs))), _) => {
                 let index = self.reached_index(item, substs)?;
                 Ok(Some(self.code_of(index, SiteOrigin::Table(SiteKey::CoercionReify(expr)))))
@@ -478,16 +478,32 @@ impl Lower<'_, '_> {
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
     fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
+        let mut track_site = false;
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
-                Some(inlined) => return self.emit_inlined(&inlined, origin, values),
-                None => self.code_of(index, origin),
-            },
+            Callee::Reached(index, origin) => {
+                let wants_track = !self.cx.track_caller(self.reached.list[self.index].0.0) && self.cx.track_caller(self.reached.list[index].0.0);
+                match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
+                    Some(inlined) => {
+                        let callee_item = self.reached.list[index].0.0;
+                        let track = wants_track
+                            && (crate::profile() != crate::outline::tree::Profile::Release
+                                || !self.cx.outline.crates[callee_item.krate as usize].is_sysroot()
+                                || inlined.body.calls_thread_cell_directly());
+                        return self.with_caller_loc(track, |this| this.emit_inlined(&inlined, origin, values));
+                    }
+                    None => {
+                        track_site = wants_track;
+                        self.code_of(index, origin)
+                    }
+                }
+            }
         };
-        let sig = self.b.import_signature(signature);
-        let call = self.ins().call_indirect(sig, code, values);
-        Ok(self.b.inst_results(call).to_vec())
+        self.with_caller_loc(track_site, |this| {
+            let sig = this.b.import_signature(signature);
+            let call = this.ins().call_indirect(sig, code, values);
+            Ok(this.b.inst_results(call).to_vec())
+        })
     }
 
     fn pointer_call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {

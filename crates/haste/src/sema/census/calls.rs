@@ -97,6 +97,11 @@ fn hash_one_coercion(cx: &mut Context<'_>, reached: &Reached, (key, coercion): (
             }
         }
         Coercion::Reify(_) | Coercion::Autos => bins.k.byte(6),
+        Coercion::Field { target, inner } => {
+            bins.k.byte(7);
+            hash_type_use(cx, *target, bins);
+            hash_one_coercion(cx, reached, (key, inner), bins, edges);
+        }
     }
 }
 

@@ -23,12 +23,47 @@ pub enum Coercion {
     Autos,
     /// A pointer to a trait object becomes a pointer to a trait object of a supertrait, whose vtable this slot of the old one holds.
     Upcast(u32),
+    /// A multi-field struct coerces to `target` by applying `inner` to its unsized pointer field.
+    Field { target: Ty, inner: Box<Coercion> },
 }
 
 impl Coercion {
-    /// Whether the coerced value is a pointer that carries metadata after its address.
+    /// Whether the coerced value is a single wide pointer that carries metadata after its address.
     pub fn widens(&self) -> bool {
-        !matches!(self, Coercion::Reify(_) | Coercion::Deref(..))
+        !matches!(self, Coercion::Reify(_) | Coercion::Deref(..) | Coercion::Field { .. })
+    }
+
+    /// The underlying pointer coercion, unwrapping any multi-field struct wrapper.
+    pub fn leaf(&self) -> &Self {
+        match self {
+            Coercion::Field { inner, .. } => inner.leaf(),
+            other => other,
+        }
+    }
+
+    /// Consumes this coercion and returns its underlying pointer coercion.
+    pub fn into_leaf(self) -> Self {
+        match self {
+            Coercion::Field { inner, .. } => inner.into_leaf(),
+            other => other,
+        }
+    }
+
+    /// The trait-object vtable built by this coercion, if any.
+    pub fn vtable(&self) -> Option<&Vtable> {
+        match self.leaf() {
+            Coercion::Vtable(vt) => Some(vt),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the trait-object vtable built by this coercion, if any.
+    pub fn vtable_mut(&mut self) -> Option<&mut Vtable> {
+        match self {
+            Coercion::Vtable(vt) => Some(vt),
+            Coercion::Field { inner, .. } => inner.vtable_mut(),
+            _ => None,
+        }
     }
 }
 
@@ -41,7 +76,11 @@ impl Infer<'_, '_> {
             (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => {
                 let (from, to) = (self.cx.types.substs(from).to_vec(), self.cx.types.substs(to).to_vec());
                 let Some(coercion) = self.unsize_args(&from, &to)? else { return Ok(None) };
-                Ok(self.single_pointer_adt(found)?.then_some(coercion))
+                if self.single_pointer_adt(found)? {
+                    Ok(Some(coercion.into_leaf()))
+                } else {
+                    Ok(Some(Coercion::Field { target: expected, inner: Box::new(coercion.into_leaf()) }))
+                }
             }
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
                 let args = self.cx.types.substs(substs).to_vec();
@@ -495,6 +534,7 @@ impl Infer<'_, '_> {
                 }
                 Ok(Coercion::Deref(zonked, self.zonk(to)))
             }
+            Coercion::Field { target, inner } => Ok(Coercion::Field { target: self.zonk(target), inner: Box::new(self.zonk_coercion(*inner)?) }),
         }
     }
 }

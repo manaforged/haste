@@ -201,6 +201,7 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
         match coercion {
             Coercion::Upcast(slot) => self.record_upcast(*slot, expr_ty),
             Coercion::Vtable(vt) => self.visit_vtable(vt),
+            Coercion::Field { inner, .. } => self.record_coercion(inner, expr_ty),
             _ => {}
         }
     }

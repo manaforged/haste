@@ -219,17 +219,17 @@ impl std::ops::DerefMut for Typed {
 }
 
 fn non_vtable_coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
-    match coercion {
+    match coercion.leaf() {
         Coercion::Reify(res) => Box::new(std::iter::once(res)),
         Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
-        Coercion::Vtable(_) | Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Box::new(std::iter::empty()),
+        Coercion::Vtable(_) | Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) | Coercion::Field { .. } => Box::new(std::iter::empty()),
     }
 }
 
 fn coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
-    match coercion {
-        Coercion::Vtable(vtable) => Box::new(vtable.calls().into_iter()),
-        other => non_vtable_coercion_calls(other),
+    match coercion.vtable() {
+        Some(vtable) => Box::new(vtable.calls().into_iter()),
+        None => non_vtable_coercion_calls(coercion),
     }
 }
 
@@ -249,13 +249,13 @@ fn body_calls(t: &BodyTables, include_vtable: bool) -> impl Iterator<Item = (Ite
 fn visit_eager_edges(t: &BodyTables, on_edge: &mut impl FnMut(ItemRef, Substs, bool)) {
     direct_body_calls(t).for_each(|(item, substs)| on_edge(item, substs, false));
     for coercion in t.coercions.values() {
-        let ind = matches!(coercion, Coercion::Reify(_) | Coercion::Vtable(_));
+        let ind = matches!(coercion.leaf(), Coercion::Reify(_) | Coercion::Vtable(_));
         coercion_calls(coercion).filter_map(res_fn).for_each(|(item, substs)| on_edge(item, substs, ind));
     }
 }
 
 fn visit_summary_edges(summary: &PolySummary, resolved: &[(SiteKey, ItemRef, Substs)], on_edge: &mut impl FnMut(ItemRef, Substs, bool)) {
-    let has_vtable = summary.template.coercions.values().any(|c| matches!(c, Coercion::Vtable(_)));
+    let has_vtable = summary.template.coercions.values().any(|c| c.vtable().is_some());
     let has_reify = !has_vtable && summary.template.coercions.values().any(|c| matches!(c, Coercion::Reify(_)));
     for &(item, substs) in &summary.fixed_calls {
         let ind = has_vtable || (has_reify && summary.template.coercions.values().any(|c| matches!(c, Coercion::Reify(Res::Fn(ci, cs)) if (*ci, *cs) == (item, substs))));
@@ -466,7 +466,7 @@ impl Typed {
         }
         match &self.tables {
             LazyTables::Eager(t) => body_calls(t, false).for_each(|(i, s)| on_callee(i, s)),
-            LazyTables::Poly(poly) if poly.summary.template.coercions.values().any(|c| matches!(c, Coercion::Vtable(_))) => {
+            LazyTables::Poly(poly) if poly.summary.template.coercions.values().any(|c| c.vtable().is_some()) => {
                 body_calls(poly.ensure_tables(types), false).for_each(|(i, s)| on_callee(i, s));
             }
             LazyTables::Poly(poly) => poly.calls().for_each(|(i, s)| on_callee(i, s)),

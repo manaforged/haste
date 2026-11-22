@@ -113,6 +113,11 @@ impl<'a> Context<'a> {
         self.attr_at(item, "thread_local").is_some()
     }
 
+    /// Whether the function `item` carries `#[track_caller]`.
+    pub fn track_caller(&self, item: ItemRef) -> bool {
+        self.attr_at(item, "track_caller").is_some()
+    }
+
     /// Whether the function `item` is `#[inline(always)]`.
     pub fn inline_always(&self, item: ItemRef) -> bool {
         self.attr_at(item, "inline").is_some_and(|at| self.item(item).0.text(at + 2) == "always")

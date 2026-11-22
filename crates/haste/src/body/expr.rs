@@ -363,9 +363,15 @@ impl Cursor<'_> {
 
     fn expanded(&mut self, block: u32) -> Result<ExprId> {
         let (at, end) = (self.at, self.end);
+        let first_expr = self.body.expr_ends.len();
         (self.at, self.end) = (block, self.src.pair(block) + 1);
         let expr = self.block_expr(None, BlockKind::Expansion);
         (self.at, self.end) = (at, end);
+        for slot in &mut self.body.expr_ends[first_expr..] {
+            if self.src.place(slot.saturating_sub(1)) == 0 {
+                *slot = at;
+            }
+        }
         self.expansion = expr.as_ref().ok().copied();
         self.expansion_stmt = None;
         if let Ok(block) = expr

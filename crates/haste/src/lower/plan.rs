@@ -686,6 +686,12 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
             let to_ty = sub(cx, *to);
             hash_ty_facts(cx, mix, to_ty)?;
         }
+        Coercion::Field { target, inner } => {
+            mix.byte(7);
+            let target_ty = sub(cx, *target);
+            hash_ty_facts(cx, mix, target_ty)?;
+            hash_one_coercion(cx, mix, typed, id, inner, poly)?;
+        }
     }
     Ok(())
 }

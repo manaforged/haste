@@ -67,18 +67,19 @@ impl Infer<'_, '_> {
         if matches!(kind, Kind::FnPtr(..)) {
             return Ok(Some(target));
         }
-        let Kind::Prim(prim) = *kind else {
-            return Ok(None);
+        let (prim, hint_ty) = match *kind {
+            Kind::Prim(prim) => (prim, target),
+            Kind::Ptr(..) => (Primitive::Usize, self.cx.types.prim(Primitive::Usize)),
+            _ => return Ok(None),
         };
-        let Some((lit, at, negated)) = cast_lit_kind(self.body, inner) else {
+        let Some((lit, _, _)) = cast_lit_kind(self.body, inner) else {
             return Ok(None);
         };
         match lit {
-            Lit::Float => Ok(float_bits(prim).is_some().then_some(target)),
+            Lit::Float => Ok(float_bits(prim).is_some().then_some(hint_ty)),
             Lit::Int => {
                 let Some(int) = int_info(prim) else { return Ok(None) };
-                let (value, suffix) = parse_int(self.src.text(at))?;
-                Ok((suffix.is_none() && int_lit_fits(value, int, negated)).then_some(target))
+                Ok(cast_int_lit_fits(self.body, self.src, inner, int)?.then_some(hint_ty))
             }
             _ => Ok(None),
         }
@@ -745,6 +746,14 @@ pub(super) fn cast_lit_kind(body: &Body, mut expr: ExprId) -> Option<(Lit, u32, 
             _ => return None,
         }
     }
+}
+
+pub(super) fn cast_int_lit_fits(body: &Body, src: &crate::outline::source::Source, inner: ExprId, int: (u32, bool)) -> Result<bool> {
+    let Some((Lit::Int, at, negated)) = cast_lit_kind(body, inner) else {
+        return Ok(false);
+    };
+    let (value, suffix) = parse_int(src.text(at))?;
+    Ok(suffix.is_none() && int_lit_fits(value, int, negated))
 }
 
 pub(super) fn int_lit_fits(value: u128, (bits, signed): (u32, bool), negated: bool) -> bool {

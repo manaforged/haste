@@ -135,16 +135,13 @@ impl Lower<'_, '_> {
 
     /// The address that the value `value` of the sized pointer type `ty` holds, whether a reference, a raw pointer, or a smart pointer such as `Box` or `Rc`.
     pub(super) fn sized_pointer(&mut self, value: Value, ty: Ty) -> Value {
-        match self.cx.types.kind(ty) {
-            Kind::Ref(..) | Kind::Ptr(..) => value,
-            _ => {
-                let data = self.box_data(value);
-                if self.cx.boxed(ty).is_some() {
-                    self.b.func.mark_unique_ptr(data);
-                }
-                data
-            }
+        let is_scalar = matches!(self.cx.types.kind(ty), Kind::Ref(..) | Kind::Ptr(..))
+            || matches!(repr(self.cx, ty), Ok(Repr::Scalar(_)));
+        let data = if is_scalar { value } else { self.box_data(value) };
+        if self.cx.boxed(ty).is_some() {
+            self.b.func.mark_unique_ptr(data);
         }
+        data
     }
 
     /// The data pointer that the value `boxed` of a `Box` of a sized type holds.
@@ -213,6 +210,7 @@ impl Lower<'_, '_> {
 
     fn coerced_repr(&mut self, expr: ExprId, coerced: Option<&Coercion>) -> Result<Repr> {
         Ok(match coerced {
+            Some(Coercion::Field { target, .. }) => repr(self.cx, *target)?,
             Some(coercion) if coercion.widens() => super::ops::WIDE,
             Some(Coercion::Deref(_, to)) if self.cx.is_unsized(*to)? => super::ops::WIDE,
             Some(Coercion::Deref(..) | Coercion::Reify(_)) => Repr::Scalar(Type::I64),
@@ -423,7 +421,7 @@ impl Lower<'_, '_> {
             return Ok(None);
         };
         let coerced = self.typed.coercions.get(&expr);
-        let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_)));
+        let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_) | Coercion::Field { .. }));
         if !self.open || !self.may_alias_place(expr) || fresh_coercion || (in_place && coerced.is_none()) {
             return Ok(Some(addr));
         }
@@ -453,7 +451,10 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn push_arg_guard(&mut self, expr: ExprId, value: Option<Value>, guards: &mut Vec<usize>) -> Result<()> {
-        let ty = self.ty_of(expr);
+        let ty = match self.typed.coercions.get(&expr) {
+            Some(Coercion::Field { target, .. }) => *target,
+            _ => self.ty_of(expr),
+        };
         if !self.open || !crate::sema::infer::needs_drop(self.cx, ty)? {
             return Ok(());
         }
@@ -590,6 +591,72 @@ impl Lower<'_, '_> {
                 self.read(place).map(|val| if matches!(place.repr, Repr::Mem { .. }) { self.snapshot_repr(place.repr, val) } else { val })
             })),
         }
+    }
+    /// Applies a single-pointer widening coercion `coercion` to `value` of type `from_ty`.
+    pub(super) fn apply_leaf_coercion(&mut self, expr: ExprId, value: Value, from_ty: Ty, coercion: &Coercion) -> Result<Option<Value>> {
+        match coercion {
+            Coercion::Len(len) => {
+                let data = self.sized_pointer(value, from_ty);
+                let len = self.len(*len)?;
+                Ok(Some(self.wide_pointer(data, len)))
+            }
+            Coercion::Vtable(vtable) => {
+                let data = self.sized_pointer(value, from_ty);
+                let table = self.vtable(expr, vtable)?;
+                Ok(Some(self.wide(data, table)))
+            }
+            Coercion::Upcast(slot) => Ok(Some(self.upcast(value, *slot, from_ty)?)),
+            _ => Ok(Some(value)),
+        }
+    }
+
+    /// Applies widening coercion `inner` to the unsized field inside struct `from_ty` to build `to_ty`.
+    pub(super) fn coerce_struct(&mut self, expr: ExprId, value: Value, from_ty: Ty, to_ty: Ty, inner: &Coercion) -> Result<Option<Value>> {
+        if from_ty == to_ty {
+            return Ok(Some(value));
+        }
+        let from_repr = repr(self.cx, from_ty)?;
+        if matches!(from_repr, Repr::Scalar(Type::I64)) {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        }
+        let (Kind::Adt(item, from_s), Kind::Adt(item2, to_s)) = (self.cx.types.kind(from_ty).clone(), self.cx.types.kind(to_ty).clone()) else {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        };
+        if item != item2 {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        }
+        let from_args = self.cx.types.substs(from_s).to_vec();
+        let to_args = self.cx.types.substs(to_s).to_vec();
+        let from_fields = crate::sema::infer::field_types(self.cx, item, &from_args)?;
+        let to_fields = crate::sema::infer::field_types(self.cx, item, &to_args)?;
+        let (Some(ff), Some(tf)) = (from_fields.first(), to_fields.first()) else {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        };
+        let to_repr = repr(self.cx, to_ty)?;
+        let Some(slot) = self.slot(to_repr) else { return Ok(None) };
+        let src_place = Place { base: Base::Addr(value), offset: 0, repr: from_repr };
+        let dst_place = Place::slot(slot, to_repr);
+        for (i, (&f_ty, &t_ty)) in ff.iter().zip(tf.iter()).enumerate() {
+            let f_repr = repr(self.cx, f_ty)?;
+            let t_repr = repr(self.cx, t_ty)?;
+            if matches!(t_repr, Repr::Zst) {
+                continue;
+            }
+            let f_off = self.field_offset(from_ty, i as u32)?;
+            let t_off = self.field_offset(to_ty, i as u32)?;
+            let field_val = self.read(src_place.at(f_off, f_repr));
+            let out_val = if f_ty == t_ty {
+                field_val
+            } else if let Some(v) = field_val {
+                self.coerce_struct(expr, v, f_ty, t_ty, inner)?
+            } else {
+                None
+            };
+            if let Some(v) = out_val {
+                self.write(dst_place.at(t_off, t_repr), v);
+            }
+        }
+        Ok(self.read(dst_place))
     }
 }
 

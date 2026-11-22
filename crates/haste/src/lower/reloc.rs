@@ -290,7 +290,7 @@ pub(crate) fn reached_index_of(cx: &Context<'_>, reached: &Reached, slots: &dyn 
 
 fn eval_vtable_at(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, typed: &Typed, expr: ExprId) -> Result<super::stencil::VtableId> {
     let scoped = typed.scoped(&cx.types);
-    let Some(Coercion::Vtable(vt)) = scoped.coercions.get(&expr) else {
+    let Some(vt) = scoped.coercions.get(&expr).and_then(Coercion::vtable) else {
         bail!("missing vtable coercion at {:?}", expr);
     };
     build_vtable_id(cx, reached, slots, vt)

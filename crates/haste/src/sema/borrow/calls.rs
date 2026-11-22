@@ -388,13 +388,7 @@ impl Checker<'_, '_> {
                     body_state.init[local as usize] = true;
                     body_state.maybe_init[local as usize] = true;
                     body_state.moved[local as usize] = false;
-                    fallback.push(BorrowSource {
-                        target: local,
-                        steps: Vec::new(),
-                        mutable: self.is_mut_ref_ty(self.local_ty(local)),
-                        through_ref: self.ty_holds_borrow(self.local_ty(local)),
-                        env_only: false,
-                    });
+                    fallback.push(self.param_fallback_source(local));
                 }
                 if let Err(err) = self.bind_pat(self.body.params[p_id as usize].pat, None, None, &[], &fallback, &mut body_state, (true, true, closure_depth)) {
                     self.no_move_captures = saved_no_move;

@@ -719,8 +719,8 @@ impl Image {
             (live, fns, counts)
         });
         let mut exe = Executable::new(target);
-        let thread_slots: HashMap<usize, u64> = live.thread_slots.list.iter().enumerate().map(|(rank, &index)| (index, rank as u64)).collect();
-        exe.thread_slots = live.thread_slots.list.len() as u32;
+        let thread_slots: HashMap<usize, u64> = live.thread_slots.list.iter().enumerate().map(|(rank, &index)| (index, (rank + 1) as u64)).collect();
+        exe.thread_slots = live.thread_slots.list.len() as u32 + 1;
         let rodata_offs = icf::emit_rodata(&state, &live, &mut exe)?;
         let (static_syms, promoted_syms) = emit_static_syms(&state, &live, &mut exe);
         let pre = icf::PreSyms { rodata_offs: &rodata_offs, static_syms: &static_syms, promoted_syms: &promoted_syms, thread_slots: &thread_slots };

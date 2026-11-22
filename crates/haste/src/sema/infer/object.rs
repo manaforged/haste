@@ -190,12 +190,12 @@ impl Infer<'_, '_> {
 
 /// Sets the drop glue of each vtable of the finished body `typed`, once the closures that it defines are registered, and says whether it set any.
 pub fn fill_drops(cx: &mut Context<'_>, typed: &mut super::Typed) -> Result<bool> {
-    if !typed.coercions.values().any(|coercion| matches!(coercion, Coercion::Vtable(_))) {
+    if !typed.coercions.values().any(|coercion| coercion.vtable().is_some()) {
         return Ok(false);
     }
     let mut filled = false;
     for coercion in typed.coercions.values_mut() {
-        if let Coercion::Vtable(vtable) = coercion {
+        if let Some(vtable) = coercion.vtable_mut() {
             set_drops(cx, vtable)?;
             filled = true;
         }

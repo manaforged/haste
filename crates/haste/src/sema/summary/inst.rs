@@ -378,6 +378,10 @@ impl PolyInst {
                 let mapped = steps.iter().enumerate().map(|(idx, (ty, r))| (self.sub_ty_cached(types, cache, *ty), r.as_ref().map(|r| self.sub_res_cached(types, cache, SiteKey::CoercionDeref(id, idx as u16), r)))).collect();
                 Coercion::Deref(mapped, self.sub_ty_cached(types, cache, *to))
             }
+            Coercion::Field { target, inner } => Coercion::Field {
+                target: self.sub_ty_cached(types, cache, *target),
+                inner: Box::new(self.materialize_coercion(types, cache, id, inner)),
+            },
         }
     }
 

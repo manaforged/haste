@@ -3,7 +3,6 @@ use anyhow::{Result, bail};
 use crate::body::sig::{GenericKind, Signature};
 use crate::body::{Args, Bound, Expr, ExprId, List, Ty as AstTy, TyId};
 use crate::outline::source::Source;
-use crate::sema::infer::Coercion;
 use crate::sema::ty::Kind;
 
 use super::super::bind::push_loan;
@@ -338,7 +337,7 @@ impl Checker<'_, '_> {
 
     pub(in super::super) fn check_coercion_vtables(&self) -> Result<()> {
         for coercion in self.typed.coercions.values() {
-            let Coercion::Vtable(vtable) = coercion else { continue };
+            let Some(vtable) = coercion.vtable() else { continue };
             let Kind::Closure(parent, _, at) = *self.cx.types.kind(vtable.ty) else { continue };
             if parent != self.item {
                 continue;

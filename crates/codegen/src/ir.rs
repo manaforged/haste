@@ -671,6 +671,15 @@ impl Function {
         self.blocks.iter().flat_map(|block| &block.insts).map(|inst| self.insts[inst.index()].loc).find(|&loc| loc != 0).unwrap_or(0)
     }
 
+    /// Whether the body is a single block with a live thread-cell call (such as `Location::caller`).
+    pub fn calls_thread_cell_directly(&self) -> bool {
+        self.blocks.len() == 1
+            && self.blocks[0]
+                .insts
+                .iter()
+                .any(|&inst| self.insts[inst.index()].result.is_some_and(|v| self.is_thread_cell(v)))
+    }
+
     /// The number of instructions in the body.
     pub fn size(&self) -> usize {
         self.blocks.iter().map(|block| block.insts.len()).sum()

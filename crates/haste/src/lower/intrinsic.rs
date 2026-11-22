@@ -83,13 +83,45 @@ impl Lower<'_, '_> {
         self.b.inst_results(call).first().copied()
     }
 
-    fn caller_location(&mut self) -> Result<Value> {
+    pub(super) fn caller_loc_slot(&mut self) -> Result<Value> {
+        const CALLER_LOC_SLOT: i64 = 0;
+        const CALLER_LOC_CELL_BYTES: i64 = 8;
+        let usize_ty = self.cx.types.prim(Primitive::Usize);
+        let code = self.emit_symbol(SymbolSource::Host(HostSymbol::ThreadCell));
+        self.b.func.mark_thread_cell(code);
+        let args = vec![self.ins().iconst(Type::I64, CALLER_LOC_SLOT), self.ins().iconst(Type::I64, CALLER_LOC_CELL_BYTES)];
+        let cell = self.call_code(code, (vec![usize_ty, usize_ty], Some(usize_ty)), args)?;
+        cell.ok_or_else(|| anyhow::anyhow!("no caller location cell"))
+    }
+
+    pub(super) fn current_site_location(&mut self) -> Result<Value> {
         let Some(location) = self.cx.lang_item("panic_location") else { bail!("no `Location` lang item") };
         let ty = self.cx.types.adt(location, &[]);
         let layout = self.cx.layout(ty)?;
-        let (src, entry) = self.cx.item(self.reached.list[self.index].0.0);
-        let mut file = src.path.display().to_string().into_bytes();
-        let (len, line, column) = (file.len() as u64, src.line(entry.start) as u32, src.column(entry.start) as u32);
+        let src = self.src;
+        let root = src.base.as_deref().map_or(src, |f| &f.source);
+        let (line, column) = match self.b.loc() {
+            0 => {
+                let (item_src, entry) = self.cx.item(self.reached.list[self.index].0.0);
+                if item_src.path == src.path {
+                    (item_src.line(entry.start) as u32, item_src.column(entry.start) as u32)
+                } else {
+                    (1, 1)
+                }
+            }
+            loc => {
+                let mut byte = (loc as u32 as usize).min(root.text.len());
+                while byte > 0 && !root.text.is_char_boundary(byte) {
+                    byte -= 1;
+                }
+                let before = &root.text[..byte];
+                let line = before.matches('\n').count() as u32 + 1;
+                let col = before[before.rfind('\n').map_or(0, |n| n + 1)..].chars().count() as u32 + 1;
+                (line, col)
+            }
+        };
+        let mut file = root.path.display().to_string().into_bytes();
+        let len = file.len() as u64;
         file.push(0);
         let file_id = self.slots.rodata(&file, &[]);
         let mut bytes = vec![0u8; layout.size.bytes() as usize];
@@ -103,6 +135,29 @@ impl Lower<'_, '_> {
         let ptr_offset = crate::sema::layout::field_offset(&layout, 0, 0) as u32;
         let loc_id = self.slots.rodata(&bytes, &[RodataReloc { offset: ptr_offset, target: RodataTarget::Rodata(file_id) }]);
         Ok(self.emit_symbol(SymbolSource::Rodata(loc_id)))
+    }
+
+    pub(super) fn with_caller_loc<T>(&mut self, track: bool, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if !track {
+            return run(self);
+        }
+        let slot = self.caller_loc_slot()?;
+        let prev = self.ins().load(Type::I64, slot, 0);
+        let loc = self.current_site_location()?;
+        self.ins().store(loc, slot, 0);
+        let res = run(self)?;
+        if self.open {
+            self.ins().store(prev, slot, 0);
+        }
+        Ok(res)
+    }
+
+    fn caller_location(&mut self) -> Result<Value> {
+        let fallback = self.current_site_location()?;
+        let slot = self.caller_loc_slot()?;
+        let cur = self.ins().load(Type::I64, slot, 0);
+        let has = self.ins().icmp_imm(IntCC::NotEqual, cur, 0);
+        Ok(self.ins().select(has, cur, fallback))
     }
 
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {

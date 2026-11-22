@@ -176,15 +176,7 @@ pub(super) fn check(
     };
     let param_offset = usize::from(sig.receiver.is_some());
     for (idx, &pat) in body.fn_params.iter().enumerate() {
-        let fallback = typed.params.get(param_offset + idx).map(|&pl| {
-            vec![BorrowSource {
-                target: pl,
-                steps: Vec::new(),
-                mutable: false,
-                through_ref: checker.ty_holds_borrow(checker.local_ty(pl)),
-                env_only: false,
-            }]
-        });
+        let fallback = typed.params.get(param_offset + idx).map(|&pl| vec![checker.param_fallback_source(pl)]);
         checker.check_param_pat(pat, fallback.as_deref().unwrap_or(&[]), &mut state)?;
     }
     let empty_live = HashSet::default();
@@ -272,6 +264,17 @@ impl Checker<'_, '_> {
         let res = f(self);
         self.let_extend_depth = saved;
         res
+    }
+
+    pub(super) fn param_fallback_source(&mut self, local: u32) -> BorrowSource {
+        let ty = self.local_ty(local);
+        BorrowSource {
+            target: local,
+            steps: Vec::new(),
+            mutable: self.is_mut_ref_ty(ty),
+            through_ref: self.ty_holds_borrow(ty),
+            env_only: false,
+        }
     }
 
     fn is_escaping_return(&self, src: &BorrowSource) -> bool {

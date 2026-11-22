@@ -509,7 +509,7 @@ impl Checker<'_, '_> {
             return sources;
         };
         let recv_substs = self.cx.types.substs(recv_args).to_vec();
-        let coerced_target = match self.typed.coercions.get(&arg) {
+        let coerced_target = match self.typed.coercions.get(&arg).map(Coercion::leaf) {
             Some(Coercion::Deref(_, to)) => Some(*to),
             Some(Coercion::Vtable(v)) => Some(v.object),
             Some(Coercion::Len(_)) => match *self.cx.types.kind(inner) {

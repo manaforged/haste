@@ -466,7 +466,7 @@ impl Image {
     /// The dense number of the per-thread cell of the `#[thread_local]` static that reached function `index` initializes, given out in order of first use and kept for the life of the image.
     fn thread_slot(&self, index: usize) -> u64 {
         let mut slots = lock(&self.thread_slots);
-        let next = slots.len() as u64;
+        let next = slots.len() as u64 + 1;
         *slots.entry(index).or_insert(next)
     }
 

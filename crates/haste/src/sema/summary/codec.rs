@@ -357,19 +357,7 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         write_map_opt(out, &t.operators, |out, k, v| { write_u32(out, k.0); self.write_res(out, v) })?;
         write_map_opt(out, &t.coercions, |out, k, v| {
             write_u32(out, k.0);
-            match v {
-                Coercion::Len(ty) => { out.push(0); write_u32(out, self.ty_id(*ty)?); }
-                Coercion::Vtable(vt) => { out.push(1); self.write_vtable(out, vt)?; }
-                Coercion::Reify(r) => { out.push(2); self.write_res(out, r)?; }
-                Coercion::Deref(steps, ty) => {
-                    out.push(3); write_u32(out, steps.len() as u32);
-                    for (st, sr) in steps { write_u32(out, self.ty_id(*st)?); write_opt(out, sr.as_ref(), |out, r| self.write_res(out, r))?; }
-                    write_u32(out, self.ty_id(*ty)?);
-                }
-                Coercion::Autos => out.push(4),
-                Coercion::Upcast(idx) => { out.push(5); write_u32(out, *idx); }
-            }
-            Some(())
+            self.write_coercion(out, v)
         })?;
         write_map_opt(out, &t.offsets, |out, k, v| { write_u32(out, k.0); write_u64(out, *v); Some(()) })?;
         write_map_opt(out, &t.pat_res, |out, k, v| { write_u32(out, k.0); self.write_res(out, v) })?;
@@ -407,6 +395,27 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         write_map_opt(out, &t.box_frees, |out, k, v| { write_u32(out, k.0); self.write_res(out, v) })?;
         Some(())
     }
+
+    fn write_coercion(&mut self, out: &mut Vec<u8>, v: &Coercion) -> Option<()> {
+        match v {
+            Coercion::Len(ty) => { out.push(0); write_u32(out, self.ty_id(*ty)?); }
+            Coercion::Vtable(vt) => { out.push(1); self.write_vtable(out, vt)?; }
+            Coercion::Reify(r) => { out.push(2); self.write_res(out, r)?; }
+            Coercion::Deref(steps, ty) => {
+                out.push(3); write_u32(out, steps.len() as u32);
+                for (st, sr) in steps { write_u32(out, self.ty_id(*st)?); write_opt(out, sr.as_ref(), |out, r| self.write_res(out, r))?; }
+                write_u32(out, self.ty_id(*ty)?);
+            }
+            Coercion::Autos => out.push(4),
+            Coercion::Upcast(idx) => { out.push(5); write_u32(out, *idx); }
+            Coercion::Field { target, inner } => {
+                out.push(6);
+                write_u32(out, self.ty_id(*target)?);
+                self.write_coercion(out, inner)?;
+            }
+        }
+        Some(())
+    }
 }
 
 fn write_syntax(out: &mut Vec<u8>, syn: &SyntaxTables) {
@@ -435,6 +444,18 @@ struct Decoder<'a> {
 }
 
 impl Decoder<'_> {
+    fn read_coercion(&self, c: &mut Cursor<'_>) -> Result<Coercion> {
+        Ok(match c.u8()? {
+            0 => Coercion::Len(self.ty(c.u32()?)?),
+            1 => Coercion::Vtable(self.vtable(c)?),
+            2 => Coercion::Reify(self.res(c)?),
+            3 => Coercion::Deref((0..c.u32()?).map(|_| Ok((self.ty(c.u32()?)?, read_opt(c, |c2| self.res(c2))?))).collect::<Result<Vec<_>>>()?, self.ty(c.u32()?)?),
+            4 => Coercion::Autos,
+            5 => Coercion::Upcast(c.u32()?),
+            6 => Coercion::Field { target: self.ty(c.u32()?)?, inner: Box::new(self.read_coercion(c)?) },
+            _ => bail!("invalid coercion tag"),
+        })
+    }
     fn ty(&self, idx: u32) -> Result<Ty> {
         if idx == u32::MAX { return Ok(Ty::NONE); }
         self.tys.get(idx as usize).copied().context("type index out of bounds")
@@ -554,19 +575,7 @@ impl Decoder<'_> {
         let autoderefs = read_map(cur, |c| Ok((ExprId(c.u32()?), c.u32()?)))?;
         let derefs = read_map(cur, |c| Ok(((ExprId(c.u32()?), c.u32()?), self.res(c)?)))?;
         let operators = read_map(cur, |c| Ok((ExprId(c.u32()?), self.res(c)?)))?;
-        let coercions = read_map(cur, |c| {
-            let k = ExprId(c.u32()?);
-            let v = match c.u8()? {
-                0 => Coercion::Len(self.ty(c.u32()?)?),
-                1 => Coercion::Vtable(self.vtable(c)?),
-                2 => Coercion::Reify(self.res(c)?),
-                3 => Coercion::Deref((0..c.u32()?).map(|_| Ok((self.ty(c.u32()?)?, read_opt(c, |c2| self.res(c2))?))).collect::<Result<Vec<_>>>()?, self.ty(c.u32()?)?),
-                4 => Coercion::Autos,
-                5 => Coercion::Upcast(c.u32()?),
-                _ => bail!("invalid coercion tag"),
-            };
-            Ok((k, v))
-        })?;
+        let coercions = read_map(cur, |c| Ok((ExprId(c.u32()?), self.read_coercion(c)?)))?;
         let offsets = read_map(cur, |c| Ok((ExprId(c.u32()?), c.u64()?)))?;
         let pat_res = read_map(cur, |c| Ok((PatId(c.u32()?), self.res(c)?)))?;
         let overloaded = PackedSet::pack((0..cur.u32()?).map(|_| cur.u32().map(ExprId)).collect::<Result<Vec<_>>>()?);
