@@ -3,15 +3,19 @@ use crate::ir::{Block, Function, Inst, IntCC, Op, Value};
 /// The most instructions a copied block may run before its branch.
 const MAX_COPY: usize = 8;
 
-/// The compare a block branches on: the condition, its two sides, and the two targets.
+/// The branch a block ends with: either an integer compare defined in the block or a boolean condition value, and the two targets.
 struct Branch {
-    cc: IntCC,
-    sides: [Value; 2],
+    test: Test,
     then: Block,
     other: Block,
 }
 
-/// Copies a short block that branches on a compare into each predecessor whose jump arguments make both sides of that compare one expression, and sends the copy straight to the side the compare takes; returns whether it copied any block.
+enum Test {
+    Cmp(IntCC, [Value; 2]),
+    Cond(Value),
+}
+
+/// Copies a short block that branches on a compare or condition into each predecessor whose jump arguments decide that branch, and sends the copy straight to the taken side; returns whether it copied any block.
 pub(super) fn run(func: &mut Function) -> bool {
     let cfg = func.cfg();
     let defs = crate::fold::defs(func);
@@ -24,12 +28,14 @@ pub(super) fn run(func: &mut Function) -> bool {
         let Some(found) = branch(func, &defs, block) else { continue };
         for &pred in cfg.preds_of(block) {
             let Some(Op::Jump(target, args)) = func.last(pred) else { continue };
-            if pred == block || *target != block || copies.iter().any(|&(p, ..)| p == pred) || !same(func, &defs, block, args, found.sides) {
+            if pred == block || *target != block || args.len() != func.blocks[block.index()].params.len() || copies.iter().any(|&(p, ..)| p == pred) {
                 continue;
             }
-            let taken = matches!(found.cc, IntCC::Equal | IntCC::UnsignedLessThanOrEqual | IntCC::UnsignedGreaterThanOrEqual | IntCC::SignedLessThanOrEqual | IntCC::SignedGreaterThanOrEqual);
+            let Some(taken) = decide(func, &defs, block, args, &found.test) else {
+                continue;
+            };
             let (to, skipped) = if taken { (found.then, found.other) } else { (found.other, found.then) };
-            if to != skipped && cfg.single_pred(skipped) == Some(block) && stays_under(func, &cfg, block, skipped) {
+            if to != skipped && to != block && cfg.single_pred(skipped) == Some(block) && stays_under(func, &cfg, block, skipped) {
                 copies.push((pred, block, to));
             }
         }
@@ -44,16 +50,47 @@ pub(super) fn run(func: &mut Function) -> bool {
     !copies.is_empty()
 }
 
-/// The branch ending `block` when its body is a short run of pure instructions, loads and stores and its condition is a compare the body defines.
+/// The branch ending `block` when its body is a short run of pure instructions, loads and stores and its condition is a compare in the block or a parameter.
 fn branch(func: &Function, defs: &[Option<Inst>], block: Block) -> Option<Branch> {
     let (&last, body) = func.blocks[block.index()].insts.split_last()?;
     let Op::Brif(cond, then, _, other, _) = func.insts[last.index()].op else { return None };
-    if body.len() > MAX_COPY || !body.iter().all(|inst| matches!(func.insts[inst.index()].op, Op::Store(..) | Op::Load(..)) || func.insts[inst.index()].op.is_speculable()) {
+    if body.len() > MAX_COPY
+        || !body.iter().all(|inst| {
+            matches!(func.insts[inst.index()].op, Op::Store(..) | Op::Load(..) | Op::StackStore(..) | Op::StackLoad(..))
+                || func.insts[inst.index()].op.is_speculable()
+        })
+    {
         return None;
     }
-    let def = defs[cond.index()].filter(|inst| body.contains(inst))?;
-    let Op::Icmp(cc, a, b) = func.insts[def.index()].op else { return None };
-    Some(Branch { cc, sides: [a, b], then, other })
+    let test = if let Some(def) = defs[cond.index()].filter(|inst| body.contains(inst)) {
+        let Op::Icmp(cc, a, b) = func.insts[def.index()].op else { return None };
+        Test::Cmp(cc, [a, b])
+    } else if func.blocks[block.index()].params.contains(&cond) {
+        Test::Cond(cond)
+    } else {
+        return None;
+    };
+    Some(Branch { test, then, other })
+}
+
+/// Evaluates `test` in `block` under incoming `args` when both compare sides fold to constants, compute one expression, or a condition parameter is constant.
+fn decide(func: &Function, defs: &[Option<Inst>], block: Block, args: &[Value], test: &Test) -> Option<bool> {
+    let params = &func.blocks[block.index()].params;
+    let subst = |v: Value| params.iter().position(|&p| p == v).map_or(v, |i| args[i]);
+    let constant = |v: Value| match defs[v.index()].map(|inst| &func.insts[inst.index()].op) {
+        Some(&Op::Const(imm)) => Some(imm),
+        _ => None,
+    };
+    match *test {
+        Test::Cond(cond) => constant(subst(cond)).map(|c| crate::fold::extend(c, func.ty(cond), false) != 0),
+        Test::Cmp(cc, sides) => {
+            let ty = func.ty(sides[0]);
+            if let (Some(ca), Some(cb)) = (constant(subst(sides[0])), constant(subst(sides[1]))) {
+                return Some(crate::fold::holds(cc, ty, ca, cb));
+            }
+            same(func, defs, block, args, sides).then(|| crate::fold::holds(cc, ty, 0, 0))
+        }
+    }
 }
 
 /// Whether both `sides` of the compare in `block` compute one expression once its parameters take `args`.
