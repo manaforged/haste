@@ -97,21 +97,85 @@ fn catch_panic_loc(f: impl FnOnce() + std::panic::UnwindSafe) -> (bool, u32, u32
     (caught && got.0, got.1, got.2)
 }
 
+trait TrackTr {
+    fn loc(&self) -> u32;
+}
+
+struct TrackA;
+struct TrackB;
+
+impl TrackTr for TrackA {
+    #[track_caller]
+    #[inline(never)]
+    fn loc(&self) -> u32 {
+        Location::caller().line()
+    }
+}
+
+impl TrackTr for TrackB {
+    #[inline(never)]
+    fn loc(&self) -> u32 {
+        Location::caller().line()
+    }
+}
+
+#[inline(never)]
+fn call_track_tr<T: TrackTr>(t: &T) -> u32 {
+    t.loc()
+}
+
+#[track_caller]
+fn fnptr_here() -> u32 {
+    Location::caller().line()
+}
+
+#[track_caller]
+fn fnptr_outer() -> u32 {
+    let f: fn() -> u32 = fnptr_here;
+    f()
+}
+
+#[track_caller]
+fn fnptr_chain() -> u32 {
+    fnptr_here()
+}
+
 pub fn case_rev_stringify_and_track_caller(seed: i64) -> i64 {
     let s = spell_expr!(x > 3);
     let exact = i64::from(s == "x > 3");
     let (f1, l1, c1) = caller_line_here();
     let (f2, l2, c2) = caller_line_wrap();
     let direct = Location::caller();
+    let qself = <std::panic::Location>::caller();
+    let tb = call_track_tr(&TrackB);
+    let ta = call_track_tr(&TrackA);
     let (u_ok, u_line, u_col) = catch_panic_loc(|| { let _ = black_box(None::<u32>).unwrap(); });
     let (e_ok, e_line, e_col) = catch_panic_loc(|| { let _ = black_box(Err::<u32, _>("e")).expect("bad"); });
     let (p_ok, p_line, p_col) = catch_panic_loc(|| { panic!("boom"); });
+    let fptr: fn() -> u32 = fnptr_here;
+    let gptr: fn() -> u32 = fnptr_chain;
+    let fp1 = fptr();
+    let fp2 = fnptr_outer();
+    let fp3 = gptr();
     let ok_files = i64::from(f1.ends_with("review.rs") && f2.ends_with("review.rs") && direct.file().ends_with("review.rs") && u_ok && e_ok && p_ok);
     let mut h = exact * 1_000_000 + ok_files * 100_000 + (seed & 7);
-    for v in [l1, c1, l2, c2, direct.line(), direct.column(), u_line, u_col, e_line, e_col, p_line, p_col] {
+    for v in [l1, c1, l2, c2, direct.line(), direct.column(), qself.line(), qself.column(), tb, ta, fp1, fp2, fp3, u_line, u_col, e_line, e_col, p_line, p_col] {
         h = h.wrapping_mul(131).wrapping_add(i64::from(v));
     }
     h
+}
+
+struct DerefWrap<'a>(&'a [u8]);
+
+impl<'a> std::ops::Deref for DerefWrap<'a> {
+    type Target = &'a [u8];
+    fn deref(&self) -> &&'a [u8] {
+        &self.0
+    }
+}
+
+fn reborrow_user_deref<'a>(w: DerefWrap<'a>) -> &'a [u8] {
+    &w[..1]
 }
 
 fn reborrow_arc<'a>(w: Arc<&'a [u8]>) -> &'a [u8] {
@@ -140,6 +204,7 @@ pub fn case_rev_arc_reborrow_and_refcell_unsize(seed: i64) -> i64 {
     let buf = [((seed.unsigned_abs() % 50) + 1) as u8, 2, 3];
     let r1 = reborrow_arc(Arc::new(&buf[..]))[0] as i64;
     let r2 = reborrow_arc_wrap(ArcWrap(Arc::new(&buf[..])))[0] as i64;
+    let r3 = reborrow_user_deref(DerefWrap(&buf[..]))[0] as i64;
     let arr: RefCell<Box<[i32; 3]>> = RefCell::new(Box::new([10, 20, seed as i32]));
     let slice: RefCell<Box<[i32]>> = arr;
     let slice_sum: i64 = slice.borrow().iter().map(|&v| i64::from(v)).sum();
@@ -147,7 +212,7 @@ pub fn case_rev_arc_reborrow_and_refcell_unsize(seed: i64) -> i64 {
     let concrete: RefCell<Box<Num>> = RefCell::new(Box::new(Num(seed + 7)));
     let dyn_cell: RefCell<Box<dyn Val>> = concrete;
     let dyn_val = dyn_cell.borrow().get();
-    r1 * 1000 + r2 * 100 + slice_len * 10 + slice_sum + dyn_val
+    r1 * 1000 + r2 * 100 + r3 * 10000 + slice_len * 10 + slice_sum + dyn_val
 }
 
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[

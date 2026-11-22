@@ -462,7 +462,7 @@ impl Fold {
             }
             Op::BrTable(index, default, targets) => {
                 let target = if let Some(known) = self.known(*index) {
-                    usize::try_from(extend(known, types[index.index()], false) as u64).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default)
+                    table_target(extend(known, types[index.index()], false) as u64, *default, targets)
                 } else if targets.iter().all(|target| target == default) { *default } else { return false };
                 *op = Op::Jump(target, Vec::new());
                 true
@@ -751,6 +751,11 @@ fn settle_cfg_and_params(func: &mut Function, fold: &mut Fold, entry: Block, eff
         changed |= branched | replaced;
         if !branched && !replaced { return (changed, cfg_changed); }
     }
+}
+
+/// Resolves a jump-table dispatch for an unsigned `index`, falling back to `default` when out of bounds.
+pub(crate) fn table_target(index: u64, default: Block, targets: &[Block]) -> Block {
+    usize::try_from(index).ok().and_then(|at| targets.get(at).copied()).unwrap_or(default)
 }
 
 /// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump; returns the invalidated IR domain.

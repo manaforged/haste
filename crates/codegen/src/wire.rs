@@ -30,7 +30,6 @@ table!(INT_CC: IntCC = [
 ]);
 table!(FLOAT_CC: FloatCC = [Equal, NotEqual, LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual]);
 table!(RMW: AtomicRmwOp = [Add, Sub, And, Nand, Or, Xor, Xchg, Umin, Umax, Smin, Smax]);
-table!(ORD: AtomicOrd = [Relaxed, Release, Acquire, AcqRel, SeqCst]);
 table!(REDUCE: ReduceOp = [Add, Smin, Smax, Umin, Umax, Fmin, Fmax, And, Or, Xor, Movemask]);
 table!(TARGET_OPS: TargetOpId = [
     Arm64Sha256H, Arm64Sha256H2, Arm64Sha256Su0, Arm64Sha256Su1, Arm64AesE, Arm64AesD, Arm64AesMc, Arm64AesImc, X64Sha1NextE, X64Sha1Msg1, X64Sha1Msg2,
@@ -649,24 +648,25 @@ impl<'a> Reader<'a> {
             20 => Op::StackLoad(self.slot()?, self.i32()?),
             21 => Op::StackStore(self.value()?, self.slot()?, self.i32()?),
             22 => {
-                let ord = pick(ORD, self.byte()?)?;
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
                 Op::AtomicLoad(self.value()?, ord)
             }
             23 => {
-                let (ord, x, y) = self.pair(ORD)?;
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
+                let (x, y) = (self.value()?, self.value()?);
                 Op::AtomicStore(x, y, ord)
             }
             24 => {
                 let (rmw, x, y) = self.pair(RMW)?;
-                let ord = pick(ORD, self.byte()?)?;
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
                 Op::AtomicRmw(rmw, ord, x, y)
             }
             25 => {
                 let (a, b, c) = self.values3()?;
-                let ord = pick(ORD, self.byte()?)?;
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
                 Op::AtomicCas(ord, a, b, c)
             }
-            26 => Op::Fence(pick(ORD, self.byte()?)?),
+            26 => Op::Fence(AtomicOrd::from_u8(self.byte()?)?),
             27 => Op::FramePointer,
             28 => {
                 let (a, b, c) = self.values3()?;

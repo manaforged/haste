@@ -224,7 +224,7 @@ fn add_iv_sums(
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for (i, iv_sum) in shape.iv_sums.iter().enumerate() {
-        let raw_cond = map.iter().rev().find(|&&(s, _)| s == iv_sum.cond).map(|&(_, d)| d).expect("iv sum cond mapped");
+        let raw_cond = map.iter().rev().find(|&&(s, _)| s == iv_sum.cond).map(|&(_, d)| d).expect("invariant: iv sum cond mapped");
         let mut mask = if shape.kinds[iv_sum.cond.index()] == Some(Kind::Data) {
             let zero = e.op(Op::Const(0), VEC);
             e.op(Op::Icmp(IntCC::NotEqual, raw_cond, zero), VEC)

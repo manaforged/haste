@@ -283,6 +283,7 @@ pub struct Lower<'l, 'a> {
     resume: Option<coroutine::Resume>,
     overflow_checks: bool,
     child_rodata: Vec<(RodataId, Option<Vec<u8>>)>,
+    caller_loc_guard: Option<(Value, Value)>,
     /// The statics whose read-only bytes are being built now, which a cycle of statics that point to each other reaches again.
     blob_statics: rustc_hash::FxHashSet<(ItemRef, crate::sema::substs::Substs)>,
 }
@@ -332,6 +333,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             resume: None,
             overflow_checks,
             child_rodata: Vec::new(),
+            caller_loc_guard: None,
             blob_statics: rustc_hash::FxHashSet::default(),
         }
     }
@@ -366,6 +368,9 @@ impl<'l, 'a> Lower<'l, 'a> {
     fn run(&mut self) -> Result<()> {
         let (prologue, start, _) = self.begin_entry()?;
         let filling = is_static(self.cx, self.reached.list[self.index].0.0);
+        if !filling && self.inline.stack.is_empty() && self.cx.track_caller(self.reached.list[self.index].0.0) {
+            self.enter_tracked_caller_loc()?;
+        }
         let value = self.root_value()?;
         match filling {
             true => self.fill_static(value)?,
@@ -441,6 +446,9 @@ impl<'l, 'a> Lower<'l, 'a> {
             _ => None,
         };
         self.drop_to(0)?;
+        if let Some((slot, prev)) = self.caller_loc_guard {
+            self.ins().store(prev, slot, 0);
+        }
         match values {
             Some(values) => self.ins().return_(&values),
             None => self.ins().trap(),

@@ -173,16 +173,20 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn ty_contains_ref(&self, ty: Ty) -> bool {
-        match *self.cx.types.kind(ty) {
-            Kind::Ref(..) => true,
-            Kind::Adt(_, args) => self.cx.types.substs(args).iter().any(|&a| self.ty_contains_ref(a)),
-            Kind::Tuple(items) => self.cx.types.substs(items).iter().any(|&a| self.ty_contains_ref(a)),
-            _ => false,
-        }
+    pub(super) fn deref_target_ty(&mut self, site: ExprId, step: u32) -> Option<Ty> {
+        let Some(Res::Fn(d_fn, d_args)) = self.typed.derefs.get(&(site, step)).cloned() else {
+            return None;
+        };
+        let args_vec = self.cx.types.substs(d_args).to_vec();
+        super::super::infer::detached(self.cx, self.item, |infer| infer.fn_types(d_fn, &args_vec))
+            .ok()
+            .and_then(|(_, ret)| match *self.cx.types.kind(ret) {
+                Kind::Ref(_, inner) => Some(inner),
+                _ => None,
+            })
     }
 
-    pub(super) fn apply_deref_steps(&self, site: ExprId, base_ty: Ty, count: u32, p: &mut Place) -> Ty {
+    pub(super) fn apply_deref_steps(&mut self, site: ExprId, base_ty: Ty, count: u32, p: &mut Place) -> Ty {
         let mut cur = base_ty;
         for step in 0..count {
             if self.typed.derefs.contains_key(&(site, step)) {
@@ -191,13 +195,13 @@ impl Checker<'_, '_> {
                     p.mut_ref_root = true;
                 }
                 p.through_deref = true;
-                cur = Ty::NONE;
+                cur = self.deref_target_ty(site, step).unwrap_or(Ty::NONE);
                 continue;
             }
             if cur != Ty::NONE {
                 self.deref_ref_step(cur, p);
                 cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);
-            } else if !p.through_deref || self.ty_contains_ref(base_ty) {
+            } else if !p.through_deref {
                 p.mut_ref_root = !p.behind_shared;
                 p.through_ref = true;
             }
@@ -213,7 +217,7 @@ impl Checker<'_, '_> {
         }
     }
 
-    pub(super) fn root_place(&self, expr: ExprId) -> Option<Place> {
+    pub(super) fn root_place(&mut self, expr: ExprId) -> Option<Place> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => self.root_place(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
@@ -261,7 +265,7 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn project_field(&self, expr: ExprId, base: ExprId, key: FieldKey, p: &mut Place) {
+    fn project_field(&mut self, expr: ExprId, base: ExprId, key: FieldKey, p: &mut Place) {
         let base_ty = self.expr_ty(base);
         let autoderefs = self.typed.autoderefs.get(&expr).copied().unwrap_or(0);
         let cur = if autoderefs > 0 {

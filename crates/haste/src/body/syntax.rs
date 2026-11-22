@@ -239,11 +239,12 @@ pub enum GenericArg {
     Constraint { name: u32, bounds: List },
 }
 
-/// A path: an optional `<T as Trait>` qualifier, a leading `::`, and its segments.
+/// A path: an optional `<T as Trait>` qualifier, a leading `::`, its start token, and its segments.
 #[derive(Clone, Copy, Debug)]
 pub struct Path {
     pub qself: Option<(TyId, Option<PathId>)>,
     pub global: bool,
+    pub start: u32,
     pub segments: List,
 }
 

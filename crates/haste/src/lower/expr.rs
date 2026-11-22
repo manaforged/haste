@@ -480,27 +480,23 @@ impl Lower<'_, '_> {
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
     fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
-        let mut track_site = false;
+        let caller_tracked = self.cx.track_caller(self.reached.list[self.index].0.0);
+        let mut track_site: Option<bool> = None;
         let code = match callee {
             Callee::Code(code) => code,
             Callee::Reached(index, origin) => {
-                let wants_track = !self.cx.track_caller(self.reached.list[self.index].0.0) && self.cx.track_caller(self.reached.list[index].0.0);
-                match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
-                    Some(inlined) => {
-                        let was_open = self.open;
-                        let from_blk = self.b.block_count();
-                        let res = self.emit_inlined(&inlined, origin, values)?;
-                        if wants_track && was_open {
-                            let to_blk = self.b.block_count().saturating_sub(1);
-                            self.wrap_inlined_caller_loc(from_blk, to_blk)?;
-                        }
-                        return Ok(res);
+                let callee_tracked = self.cx.track_caller(self.reached.list[index].0.0);
+                let wants_track = !caller_tracked && callee_tracked;
+                if let Some(inlined) = self.slots.allow_inline().then(|| self.inline_callee(index)).transpose()?.flatten() {
+                    let (was_open, from_blk) = (self.open, self.b.block_count());
+                    let res = self.emit_inlined(&inlined, origin, values)?;
+                    if wants_track && was_open {
+                        self.wrap_inlined_caller_loc(from_blk, self.b.block_count().saturating_sub(1))?;
                     }
-                    None => {
-                        track_site = wants_track;
-                        self.code_of(index, origin)
-                    }
+                    return Ok(res);
                 }
+                track_site = (caller_tracked != callee_tracked).then_some(wants_track);
+                self.code_of(index, origin)
             }
         };
         self.with_caller_loc(track_site, |this| {
@@ -529,7 +525,8 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(None);
         }
-        self.call_code(code, (params, Some(ret)), values)
+        let clear = self.cx.track_caller(self.reached.list[self.index].0.0).then_some(false);
+        self.with_caller_loc(clear, |this| this.call_code(code, (params, Some(ret)), values))
     }
 
     /// The index of the reached instance of `item` at `substs`.

@@ -5,7 +5,7 @@ use super::shims::{Emit, Shim, arm64_fwd, arm64_here, emit_arm64_adrp_add};
 use super::{Buf, Plan};
 
 pub(super) const UNWIND_STATE_BYTES: u64 = 16;
-pub(super) const FRAME_CACHE_BYTES: u64 = 1024;
+pub(super) const FRAME_CACHE_BYTES: u64 = FRAME_CACHE_LIMIT as u64;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct TlsLayout {

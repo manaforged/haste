@@ -262,13 +262,9 @@ impl Checker<'_, '_> {
         let mut cur = self.expr_ty(receiver);
         let mut crossed_ref = false;
         for step in 0..derefs {
-            if let Some(Res::Fn(d_fn, d_args)) = self.typed.derefs.get(&(expr, step)).cloned() {
+            if self.typed.derefs.contains_key(&(expr, step)) {
                 crossed_ref = true;
-                let args_vec = self.cx.types.substs(d_args).to_vec();
-                cur = super::super::infer::detached(self.cx, self.item, |infer| infer.fn_types(d_fn, &args_vec))
-                    .ok()
-                    .and_then(|(_, ret)| match *self.cx.types.kind(ret) { Kind::Ref(_, inner) => Some(inner), _ => None })
-                    .unwrap_or(Ty::NONE);
+                cur = self.deref_target_ty(expr, step).unwrap_or(Ty::NONE);
             } else if cur != Ty::NONE {
                 if matches!(self.cx.types.kind(cur), Kind::Ref(..) | Kind::Ptr(..)) { crossed_ref = true; }
                 cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);

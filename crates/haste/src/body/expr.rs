@@ -419,7 +419,7 @@ impl Cursor<'_> {
         self.body.segments.push(super::Segment { name, args: None });
         let segment = self.body.segments.len() as u32 - 1;
         let segments = self.list(&[segment]);
-        let path = self.push_path(super::Path { qself: None, global: false, segments });
+        let path = self.push_path(super::Path { qself: None, global: false, start: name, segments });
         self.push_expr(Expr::Path(path))
     }
 

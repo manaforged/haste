@@ -4,6 +4,9 @@ use haste_codegen::{AbiParam, Arch, CallConv, Effort, Function, FunctionBuilder,
 use super::shims::{Emit, emit_arm64_adrp_add, emit_rel_branch};
 use super::{Buf, SectionAddrs};
 
+/// Byte offset of `stop_fp` inside the AOT `catch_unwind` frame record.
+pub(super) const STOP_FP_OFFSET: u32 = 0x220;
+
 /// Compiles and appends the native frame-table unwind walker `fn(cur_fp, stop_fp, text_base, table_ptr)`.
 pub(super) fn emit_walk(arch: Arch, os: Os, out: &mut Buf) -> Result<()> {
     let target = TARGETS.iter().find(|t| t.arch == arch && t.os == os).copied().context("missing codegen target for unwind walker")?.effort(Effort::Quick);
@@ -15,23 +18,24 @@ pub(super) fn emit_walk(arch: Arch, os: Os, out: &mut Buf) -> Result<()> {
     Ok(())
 }
 
-/// Emits the fixed-size ARM64 call from `StartPanic` to `UnwindWalk(x29, [x23+0x220], text, table)`.
+/// Emits the fixed-size ARM64 call from `StartPanic` to `UnwindWalk(x29, [x23+STOP_FP_OFFSET], text, table)`.
 pub(super) fn emit_arm64_walk_call(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) {
-    out.words(&[0xAA1D_03E0, 0xF941_12E1]);
+    out.words(&[0xAA1D_03E0, 0xF940_02E1 | ((STOP_FP_OFFSET / 8) << 10)]);
     emit_arm64_adrp_add(c.at(out), addrs.text, 2, out);
     emit_arm64_adrp_add(c.at(out), addrs.unwind_table, 3, out);
     emit_rel_branch(Arch::Arm64, true, c.at(out), addrs.unwind_walk, out);
 }
 
-/// Emits the fixed-size x86-64 call from `StartPanic` to `UnwindWalk(rbp, [r15+0x220], text, table)`.
+/// Emits the fixed-size x86-64 call from `StartPanic` to `UnwindWalk(rbp, [r15+STOP_FP_OFFSET], text, table)`.
 pub(super) fn emit_x64_walk_call(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) {
+    let off = STOP_FP_OFFSET.to_le_bytes();
     if c.win {
-        out.bytes(&[0x48, 0x89, 0xE9, 0x49, 0x8B, 0x97, 0x20, 0x02, 0x00, 0x00, 0x4C, 0x8D, 0x05]);
+        out.bytes(&[0x48, 0x89, 0xE9, 0x49, 0x8B, 0x97, off[0], off[1], off[2], off[3], 0x4C, 0x8D, 0x05]);
         out.u32(((addrs.text as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
         out.bytes(&[0x4C, 0x8D, 0x0D]);
         out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
     } else {
-        out.bytes(&[0x48, 0x89, 0xEF, 0x49, 0x8B, 0xB7, 0x20, 0x02, 0x00, 0x00, 0x48, 0x8D, 0x15]);
+        out.bytes(&[0x48, 0x89, 0xEF, 0x49, 0x8B, 0xB7, off[0], off[1], off[2], off[3], 0x48, 0x8D, 0x15]);
         out.u32(((addrs.text as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
         out.bytes(&[0x48, 0x8D, 0x0D]);
         out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);

@@ -104,7 +104,8 @@ impl Lower<'_, '_> {
             0 => {
                 let (item_src, entry) = self.cx.item(self.reached.list[self.index].0.0);
                 if item_src.path == src.path {
-                    (item_src.line(entry.start) as u32, item_src.column(entry.start) as u32)
+                    let tok = entry.name.unwrap_or(entry.start);
+                    (item_src.line(tok) as u32, item_src.column(tok) as u32)
                 } else {
                     (1, 1)
                 }
@@ -149,15 +150,20 @@ impl Lower<'_, '_> {
         match self.body.exprs[expr.0 as usize] {
             Expr::Method { name, .. } => Some(name),
             Expr::Call(callee, _) | Expr::Index(callee, _) => self.expr_site_token(callee),
-            Expr::Path(path) => {
-                let p = self.body.paths[path.0 as usize];
-                self.body.list(p.segments).first().map(|&seg| {
-                    let tok = self.body.segments[seg as usize].name;
-                    if p.global { tok.saturating_sub(1) } else { tok }
-                })
-            }
+            Expr::Path(path) => Some(self.body.paths[path.0 as usize].start),
             _ => None,
         }
+    }
+
+    pub(super) fn enter_tracked_caller_loc(&mut self) -> Result<()> {
+        let slot = self.caller_loc_slot()?;
+        let prev = self.ins().load(Type::I64, slot, 0);
+        let has = self.ins().icmp_imm(IntCC::NotEqual, prev, 0);
+        let own = self.current_site_location()?;
+        let cur = self.ins().select(has, prev, own);
+        self.ins().store(cur, slot, 0);
+        self.caller_loc_guard = Some((slot, prev));
+        Ok(())
     }
 
     pub(super) fn wrap_inlined_caller_loc(&mut self, from_blk: usize, to_blk: usize) -> Result<()> {
@@ -186,14 +192,14 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn with_caller_loc<T>(&mut self, track: bool, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        if !track {
+    pub(super) fn with_caller_loc<T>(&mut self, track: Option<bool>, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let Some(set_site) = track else {
             return run(self);
-        }
+        };
         let slot = self.caller_loc_slot()?;
         let prev = self.ins().load(Type::I64, slot, 0);
-        let loc = self.current_site_location()?;
-        self.ins().store(loc, slot, 0);
+        let next = if set_site { self.current_site_location()? } else { self.ins().iconst(Type::I64, 0) };
+        self.ins().store(next, slot, 0);
         let res = run(self)?;
         if self.open {
             self.ins().store(prev, slot, 0);
@@ -211,7 +217,21 @@ impl Lower<'_, '_> {
 
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {
         let &[try_fn, data, catch_fn] = args else { bail!("catch_unwind takes three arguments") };
-        Ok(self.call_host(HostSymbol::CatchUnwind, &[try_fn, data, catch_fn], Some(Type::I32)).expect("catch_unwind returns i32"))
+        let res = self.call_host(HostSymbol::CatchUnwind, &[try_fn, data, catch_fn], Some(Type::I32)).expect("invariant: catch_unwind returns i32");
+        if self.open {
+            let caught = self.b.create_block();
+            let done = self.b.create_block();
+            self.brif(res, (caught, &[]), (done, &[]));
+            self.enter(caught);
+            let (slot, restore) = match self.caller_loc_guard {
+                Some((slot, prev)) => (slot, prev),
+                None => (self.caller_loc_slot()?, self.ins().iconst(Type::I64, 0)),
+            };
+            self.ins().store(restore, slot, 0);
+            self.jump(done, &[]);
+            self.enter(done);
+        }
+        Ok(res)
     }
 
     fn cpuid(&mut self, args: &[Value]) -> Result<Value> {

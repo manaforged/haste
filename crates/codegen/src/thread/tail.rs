@@ -168,7 +168,7 @@ fn decide(func: &Function, defs: &[Option<Inst>], block: Block, args: &[Value], 
         Branch::Table { index, default, targets } => {
             let imm = constant(subst(*index))?;
             let u = crate::fold::extend(imm, func.ty(*index), false) as u64;
-            Some(usize::try_from(u).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default))
+            Some(crate::fold::table_target(u, *default, targets))
         }
     }
 }

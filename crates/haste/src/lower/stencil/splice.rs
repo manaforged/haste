@@ -115,6 +115,9 @@ fn resolve_splice_site(
     let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(callee_sym as usize) else {
         return Ok(None);
     };
+    if cx.track_caller(reached.list[callee_idx].0.0) {
+        return Ok(None);
+    }
     let origin = match RelocPlan::vtable_slot_at_slice(reloc_plan, callee_sym as usize) {
         Some((expr, slot)) => SiteOrigin::VtableMethod { expr, slot },
         None if RelocPlan::step_at_slice(reloc_plan, callee_sym as usize).is_some_and(RelocStep::is_reify) => SiteOrigin::Symbol(callee_sym),

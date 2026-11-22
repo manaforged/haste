@@ -300,7 +300,8 @@ impl Function {
 
     /// Removes frame-table unwind drop entries whose flag can never be active across a potentially-unwinding call.
     pub fn elide_dead_unwind_drops(&mut self, mut sym_may_unwind: impl FnMut(u32) -> bool) -> bool {
-        if self.entry.is_none() || self.coroutine.is_some() || self.unwind_drops.is_empty() {
+        let Some(entry) = self.entry else { return false };
+        if self.coroutine.is_some() || self.unwind_drops.is_empty() {
             return false;
         }
         let mut defs = vec![None; self.types.len()];
@@ -342,7 +343,6 @@ impl Function {
             self.unwind_drops.clear();
             return true;
         }
-        let entry = self.entry.unwrap();
         let before = self.unwind_drops.len();
         let drops = std::mem::take(&mut self.unwind_drops);
         self.unwind_drops = drops

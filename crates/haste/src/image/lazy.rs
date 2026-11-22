@@ -625,7 +625,7 @@ impl Jit {
             journal.iter().for_each(|&at| self.reached.forget(at));
             self.expanded.clear();
             self.tried.clear();
-            self.image.bodies.clear_transient();
+            self.image.bodies.clear();
         } else if answer.is_ok() {
             self.compile_ahead(cx, index);
         }

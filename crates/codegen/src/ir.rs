@@ -665,8 +665,7 @@ impl Function {
         let val = self.value(ty);
         let inst = self.add(Op::Const(imm), Some(val));
         let block = &mut self.blocks[entry.index()].insts;
-        let at = block.len().saturating_sub(1);
-        block.insert(at, inst);
+        block.insert(0, inst);
         Some(val)
     }
 
