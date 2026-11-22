@@ -43,7 +43,7 @@ enum RelocTargetKey {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum FnIcfKey<'a> {
-    Direct(&'a [u8], Vec<(u32, RelocKind, RelocTargetKey)>),
+    Direct(&'a [u8], Vec<(u32, RelocKind, RelocTargetKey)>, Vec<(i32, i32, RelocTargetKey, bool)>),
     Dict(usize, Vec<RelocTargetKey>),
 }
 
@@ -124,7 +124,12 @@ fn direct_icf_key<'a>(
         };
         sig.push((reloc.offset, reloc.kind, target));
     }
-    Ok(FnIcfKey::Direct(code.bytes(), sig))
+    let mut drops = Vec::with_capacity(code.unwind_drops().len());
+    for d in code.unwind_drops() {
+        let target = sym_reloc_key(self_idx, (&relocs[d.drop_sym as usize], true), state, pre, (roots, canon))?;
+        drops.push((d.local_off, d.flag_off, target, d.indirect));
+    }
+    Ok(FnIcfKey::Direct(code.bytes(), sig, drops))
 }
 
 fn dict_icf_key<'a>(
@@ -317,4 +322,53 @@ pub(super) fn alloc_vtables(
         place_vtable_node(id, state, vmask, &mut alloc, exe)?;
     }
     Ok((alloc.vtable_offs, alloc.unique))
+}
+
+pub(super) fn emit_unwind_table(state: &AotState, live: &AotReach, (roots, canon): (&[usize], &[usize]), fn_offs: &[Option<u32>], exe: &mut Executable) {
+    let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    let mut fns: Vec<(u32, u32, Vec<(i32, i32, u32, u32)>)> = Vec::new();
+    for &idx in &live.order {
+        let leader = canon[roots[idx]];
+        if !seen.insert(leader) {
+            continue;
+        }
+        let Some(fn_start) = fn_offs.get(leader).copied().flatten() else { continue };
+        let Some(AotFn::Direct { code, relocs }) = &state.functions[leader] else { continue };
+        if code.unwind_drops().is_empty() {
+            continue;
+        }
+        let mut drops = Vec::with_capacity(code.unwind_drops().len());
+        for d in code.unwind_drops() {
+            if let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(d.drop_sym as usize)
+                && let Some(drop_off) = fn_offs.get(callee_idx).copied().flatten()
+            {
+                drops.push((d.local_off, d.flag_off, drop_off, u32::from(d.indirect)));
+            }
+        }
+        if !drops.is_empty() {
+            fns.push((fn_start, fn_start + code.bytes().len() as u32, drops));
+        }
+    }
+    if fns.is_empty() {
+        return;
+    }
+    fns.sort_unstable_by_key(|&(start, _, _)| start);
+    let total_drops: usize = fns.iter().map(|(_, _, d)| d.len()).sum();
+    let mut buf = Vec::with_capacity(8 + (fns.len() + total_drops) * 16);
+    buf.extend_from_slice(&(fns.len() as u64).to_le_bytes());
+    let mut cursor = 0u32;
+    for &(start, end, ref drops) in &fns {
+        for word in [start, end, cursor, drops.len() as u32] {
+            buf.extend_from_slice(&word.to_le_bytes());
+        }
+        cursor += drops.len() as u32;
+    }
+    for (_, _, drops) in fns {
+        for (local_off, flag_off, drop_off, ind) in drops {
+            for word in [local_off as u32, flag_off as u32, drop_off, ind] {
+                buf.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+    }
+    exe.unwind_table_off = Some(exe.rodata(&buf, 8));
 }

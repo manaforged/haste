@@ -144,7 +144,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
 
 /// Whether a framed function addresses its frame from rbp: it reads the frame pointer or catches an unwind.
 fn keeps_frame_pointer(func: &Function) -> bool {
-    func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
+    func.keep_fp
+        || !func.unwind_drops.is_empty()
+        || func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -389,7 +391,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         emit_stubs(&mut self)?;
         self.relocs.extend(self.asm.rips.drain(..).map(|(at, sym)| StencilReloc::symbol(at, sym, RelocKind::PcRel32)));
         self.asm.relax().apply(starts, &mut self.sites, &mut self.relocs);
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new() })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new(), unwind_drops: crate::frame::resolve_unwind_drops(self.func, &self.frame) })
     }
 }
 

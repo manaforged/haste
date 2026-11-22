@@ -379,7 +379,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             self.asm.brk();
         }
         emit_stubs(&mut self)?;
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new() })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new(), unwind_drops: crate::frame::resolve_unwind_drops(self.func, &self.frame) })
     }
 }
 

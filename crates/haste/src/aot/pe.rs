@@ -194,7 +194,13 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let tramp_in_text = (start_in_text + start_size).next_multiple_of(16);
     let shims_in_text = (tramp_in_text + tramp_size).next_multiple_of(16);
     let text_base_va = PE_BASE + TEXT_RVA as u64;
-    let probe_addrs = SectionAddrs { thread_key: text_base_va, ..SectionAddrs::default() };
+    let probe_addrs = SectionAddrs {
+        text: text_base_va,
+        thread_key: text_base_va,
+        unwind_table: if exe.unwind_table_off.is_some() { text_base_va } else { 0 },
+        unwind_walk: text_base_va,
+        ..SectionAddrs::default()
+    };
     let (shim_offs, head_in_text) = plan_shims(arch, Os::Windows, &plan, text_base_va, shims_in_text, probe_addrs)?;
     let post_rel = exe.text.len().next_multiple_of(16);
     let veneers = plan_veneers(exe, &plan, text_base_va, head_in_text, &shim_offs, |_, _| stubs_in_text)?;
@@ -222,9 +228,11 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let idata_raw_size = idata.bytes.len().next_multiple_of(FILE_ALIGN);
     let size_of_image = (idata_rva + idata_vsize.next_multiple_of(SECT_ALIGN)) as u32;
 
+    let rodata_va = PE_BASE + rdata_rva as u64;
+    let (unwind_table, unwind_walk) = plan.unwind_addrs(exe, rodata_va, text_base_va, &shim_offs);
     let addrs = SectionAddrs {
         text: text_base_va + text_in_text as u64,
-        rodata: PE_BASE + rdata_rva as u64,
+        rodata: rodata_va,
         data: PE_BASE + data_rva as u64,
         bss: PE_BASE + (data_rva + bss_in_data) as u64,
         dso_handle: PE_BASE + (rdata_rva + exe.rodata.len()) as u64,
@@ -233,6 +241,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         unwind_tls: 0,
         thread_tls: 0,
         frame_tls: 0,
+        unwind_table,
+        unwind_walk,
     };
 
     let stub_va = |name: &str| {

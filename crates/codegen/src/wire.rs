@@ -4,7 +4,7 @@ use crate::ir::{
 };
 use crate::reloc::RuntimeSymbol;
 
-const FORMAT: u8 = 2;
+const FORMAT: u8 = 3;
 
 macro_rules! table {
     ($name:ident: $ty:ident = [$($variant:ident),* $(,)?]) => {
@@ -111,6 +111,15 @@ impl Function {
             w.u32(*sym);
             w.raw(bytes);
         }
+        w.byte(u8::from(self.keep_fp));
+        w.len(self.unwind_drops.len());
+        for u in &self.unwind_drops {
+            w.u32(u.local.0);
+            w.i64(i64::from(u.local_off));
+            w.u32(u.flag.0);
+            w.u32(u.drop_sym);
+            w.byte(u8::from(u.indirect));
+        }
         w.u32(self.cfg_rev);
         Some(w.0)
     }
@@ -144,6 +153,19 @@ impl Function {
         func.vtable_slots = (0..vtable_slots).map(|_| Some((r.u32()?, i32::try_from(r.i64()?).ok()?, r.u32()?, r.flag()?))).collect::<Option<_>>()?;
         let rodata = r.len()?;
         func.rodata_bytes = (0..rodata).map(|_| Some((r.u32()?, r.raw()?.to_vec()))).collect::<Option<_>>()?;
+        func.keep_fp = r.flag()?;
+        let unwind_drops = r.len()?;
+        func.unwind_drops = (0..unwind_drops)
+            .map(|_| {
+                Some(crate::UnwindDrop {
+                    local: r.slot()?,
+                    local_off: i32::try_from(r.i64()?).ok()?,
+                    flag: r.slot()?,
+                    drop_sym: r.u32()?,
+                    indirect: r.flag()?,
+                })
+            })
+            .collect::<Option<_>>()?;
         func.cfg_rev = r.u32()?;
         (r.at == bytes.len()).then_some(func)
     }

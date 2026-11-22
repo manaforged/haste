@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Code, DictTierUp, Site};
+use haste_codegen::{Code, CodeUnwindDrop, DictTierUp, Site};
 
 use crate::lower::{self, FootprintId, RelocPlan, RelocVec, Slots, SymbolSource};
 use crate::names::ItemRef;
@@ -25,6 +25,15 @@ pub(super) struct Ready {
 type Lowered = (Arc<Code>, RelocVec, Arc<RelocPlan>);
 
 impl Image {
+    pub(super) fn register_jit_drops(&self, exec: usize, len: usize, drops: &[CodeUnwindDrop], symbols: &[u64]) {
+        crate::host::unwind::register_shared_drops(self.unwind_head, |bytes| lock(&self.shared).alloc(bytes).ok(), exec, len, drops, symbols);
+    }
+
+    pub(super) fn write_jit_code(&self, memory: &mut haste_codegen::Memory, code: &Code, symbols: &[u64]) -> Result<usize, haste_codegen::Error> {
+        let exec = memory.write_patched(code, symbols)?;
+        self.register_jit_drops(exec, code.bytes().len(), code.unwind_drops(), symbols);
+        Ok(exec)
+    }
     /// Compiles the inferred functions `work` of a lazy image, lowering and encoding them on every core first, and gives the code of each that compiled; one that did not keeps its stub and its slot.
     pub(super) fn compile_batch(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize]) -> Vec<(usize, usize)> {
         let mut work = work.to_vec();
@@ -125,7 +134,7 @@ impl Image {
             None => {
                 let (code, relocs, reloc_plan) = self.lowered(cx, reached, index, wanted0, pass)?;
                 let symbols = self.symbols(&relocs);
-                let exec = pass.memory.write_patched(&code, &symbols)?;
+                let exec = self.write_jit_code(&mut pass.memory, &code, &symbols)?;
                 pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan }));
                 Ok(Some(exec))
             }
@@ -169,7 +178,7 @@ impl Image {
             {
                 let rec = match (is_dict, &jt.dict) {
                     (true, Some((body_exec, dict_code))) => VerifyRecord::Dict { body_exec: *body_exec, stub_exec: addr, stub_bytes: Vec::new(), code: dict_code.clone() },
-                    _ => VerifyRecord::Patched { exec: addr, len: jt.stencil.bytes().len(), sites: jt.stencil.sites().to_vec() },
+                    _ => VerifyRecord::Patched { exec: addr, len: jt.stencil.bytes().len(), sites: jt.stencil.sites().to_vec(), unwind_drops: jt.stencil.unwind_drops().to_vec() },
                 };
                 self.verify_single(cx, reached, index, &rec)?;
             }
@@ -180,10 +189,10 @@ impl Image {
         if stencil.bytes().len() > cfg.min_bytes && fanout >= cfg.min_fanout {
             return self.instantiate_jit_dict(cx, reached, index, (item, footprint), symbols, cfg, pass);
         }
-        let exec = pass.memory.write_patched(&stencil, &symbols)?;
+        let exec = self.write_jit_code(&mut pass.memory, &stencil, &symbols)?;
         pass.stencils.aliases.insert(alias_key, (exec, false));
         if cfg.verify {
-            let rec = VerifyRecord::Patched { exec, len: stencil.bytes().len(), sites: stencil.sites().to_vec() };
+            let rec = VerifyRecord::Patched { exec, len: stencil.bytes().len(), sites: stencil.sites().to_vec(), unwind_drops: stencil.unwind_drops().to_vec() };
             self.verify_single(cx, reached, index, &rec)?;
         }
         Ok(exec)
@@ -251,6 +260,7 @@ impl Image {
             bail!("missing stencil template for slot {index}");
         };
         let exec = self.pass.memory.write_patched(&jt.stencil, &entry.symbols)?;
+        self.register_jit_drops(exec, jt.stencil.bytes().len(), jt.stencil.unwind_drops(), &entry.symbols);
         self.pass.stencils.aliases.insert((entry.item, entry.footprint, entry.symbols), (exec, false));
         self.publish(index, exec);
         Ok(exec)
@@ -283,7 +293,7 @@ impl Image {
 
     fn verify_with_fresh(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, record: &VerifyRecord) -> Result<()> {
         match record {
-            VerifyRecord::Patched { exec, len, sites } => Self::verify_patched(cx, reached, fresh, index, (*exec, *len), sites),
+            VerifyRecord::Patched { exec, len, sites, unwind_drops } => Self::verify_patched(cx, reached, fresh, index, (*exec, *len), sites, unwind_drops),
             VerifyRecord::Compiled { code, symbols } => Self::verify_compiled(cx, reached, fresh, index, code, symbols),
             VerifyRecord::Dict { body_exec, stub_exec, stub_bytes, code } => Self::verify_dict(cx, reached, fresh, index, (*body_exec, *stub_exec), stub_bytes, code),
         }
@@ -300,13 +310,20 @@ impl Image {
         if code.sites() != fresh_code.sites() {
             bail!("stencil verification Site table mismatch");
         }
-        if code.relocs() != fresh_code.relocs() || symbols != fresh_syms.as_slice() {
-            bail!("stencil verification relocation mismatch");
+        if code.unwind_drops() != fresh_code.unwind_drops() {
+            bail!("stencil verification unwind drop table mismatch");
+        }
+        if code.relocs() != fresh_code.relocs() {
+            bail!("stencil verification code.relocs mismatch ({} vs {})", code.relocs().len(), fresh_code.relocs().len());
+        }
+        if symbols != fresh_syms.as_slice() {
+            let first = symbols.iter().zip(&fresh_syms).position(|(a, b)| a != b);
+            bail!("stencil verification symbol mismatch (len {} vs {}, first diff {first:?})", symbols.len(), fresh_syms.len());
         }
         Ok(())
     }
 
-    fn verify_patched(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (exec, len): (usize, usize), sites: &[Site]) -> Result<()> {
+    fn verify_patched(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (exec, len): (usize, usize), sites: &[Site], unwind_drops: &[CodeUnwindDrop]) -> Result<()> {
         let out = lower::lower_stencil(cx, reached, fresh, index)?;
         let slots: &dyn Slots = fresh;
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
@@ -320,6 +337,9 @@ impl Image {
         }
         if sites != fresh_code.sites() {
             bail!("stencil verification Site table mismatch");
+        }
+        if unwind_drops != fresh_code.unwind_drops() {
+            bail!("stencil verification unwind drop table mismatch");
         }
         Ok(())
     }

@@ -159,6 +159,10 @@ impl Scan {
         };
         scan.addresses(func);
         scan.open_slots = subword::copy_open_slots(func, &scan.addrs, &scan.consts, &prov.param_roots);
+        for u in &func.unwind_drops {
+            scan.open_slots[u.local.index()] = false;
+            scan.open_slots[u.flag.index()] = false;
+        }
         for (index, block) in func.blocks.iter().enumerate() {
             for inst in &block.insts {
                 let data = &func.insts[inst.index()];

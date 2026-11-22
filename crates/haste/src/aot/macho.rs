@@ -122,11 +122,14 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let tramp_off = (32 + sizeofcmds + 64).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
     let probe_addrs = SectionAddrs {
+        text: MACH_BASE,
         thread_key: MACH_BASE,
         tlv_desc: if has_tlv { MACH_BASE } else { 0 },
         unwind_tls: tls.unwind_off,
         thread_tls: tls.cells_off,
         frame_tls: tls.frame_off,
+        unwind_table: if exe.unwind_table_off.is_some() { MACH_BASE } else { 0 },
+        unwind_walk: MACH_BASE,
         ..SectionAddrs::default()
     };
     let (shim_offs, head_off) = plan_shims(arch, Os::Darwin, &plan, MACH_BASE, shims_off, probe_addrs)?;
@@ -149,9 +152,11 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let data_seg_vmsz = (tbss_off + if has_tlv { tls.total as usize } else { 0 }).next_multiple_of(MACH_PAGE as usize) - data_seg_off;
 
     let bss_va = MACH_BASE + bss_off as u64;
+    let rodata_va = MACH_BASE + rodata_off as u64;
+    let (unwind_table, unwind_walk) = plan.unwind_addrs(exe, rodata_va, MACH_BASE, &shim_offs);
     let addrs = SectionAddrs {
         text: MACH_BASE + text_off as u64,
-        rodata: MACH_BASE + rodata_off as u64,
+        rodata: rodata_va,
         data: MACH_BASE + data_off as u64,
         bss: bss_va,
         dso_handle: MACH_BASE + dso_off as u64,
@@ -160,6 +165,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         unwind_tls: tls.unwind_off,
         thread_tls: tls.cells_off,
         frame_tls: tls.frame_off,
+        unwind_table,
+        unwind_walk,
     };
     let stub_va = |name: &str| Ok(MACH_BASE + (stubs_off + plan.import_idx(name)? * stub_size) as u64);
     let got_va = |idx: usize| MACH_BASE + (data_seg_off + idx * 8) as u64;

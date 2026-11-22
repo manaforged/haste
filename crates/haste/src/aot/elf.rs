@@ -307,7 +307,16 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let start_off = (stubs_off + plan.imports.len() * stub_size).next_multiple_of(16);
     let tramp_off = (start_off + start_size).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
-    let probe_addrs = SectionAddrs { thread_key: rx_base, unwind_tls, thread_tls, frame_tls, ..SectionAddrs::default() };
+    let probe_addrs = SectionAddrs {
+        text: rx_base,
+        thread_key: rx_base,
+        unwind_tls,
+        thread_tls,
+        frame_tls,
+        unwind_table: if exe.unwind_table_off.is_some() { rx_base } else { 0 },
+        unwind_walk: rx_base,
+        ..SectionAddrs::default()
+    };
     let (shim_offs, head_off) = plan_shims(arch, Os::Linux, &plan, rx_base, shims_off, probe_addrs)?;
     let veneers = plan_veneers(exe, &plan, rx_base, head_off, &shim_offs, |_, _| stubs_off)?;
     let text_off = head_off + veneers.pre_len;
@@ -321,7 +330,9 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let (strtab, fn_strx, prelude, lines, shdr_off, shstrndx, shnum) =
         build_optional_syms(exe, &plan, &shim_offs, prelude_offs, (symtab_off, rx_base + text_off as u64));
     let bss_va = rw_va + bss_in_rw as u64;
-    let addrs = SectionAddrs { text: rx_base + text_off as u64, rodata: ELF_BASE + rodata_off as u64, data: rw_va, bss: bss_va, dso_handle: ELF_BASE + dso_off as u64, thread_key: bss_va + u64::from(key_off), tlv_desc: 0, unwind_tls, thread_tls, frame_tls };
+    let rodata_va = ELF_BASE + rodata_off as u64;
+    let (unwind_table, unwind_walk) = plan.unwind_addrs(exe, rodata_va, rx_base, &shim_offs);
+    let addrs = SectionAddrs { text: rx_base + text_off as u64, rodata: rodata_va, data: rw_va, bss: bss_va, dso_handle: ELF_BASE + dso_off as u64, thread_key: bss_va + u64::from(key_off), tlv_desc: 0, unwind_tls, thread_tls, frame_tls, unwind_table, unwind_walk };
     let mut out = Buf::new();
     let hdr = HeaderSpec { arch, machine, page, phnum, shstrndx, shnum, shdr_off, entry_va: rx_base + start_off as u64, interp, interp_off, ro_end, rx: (rx_base, stubs_off, rw_off), rw: (rw_va, rw_off, rw_filesz, bss_in_rw + bss_total as usize), dyn_seg: (dyn_off, dyn_size), tls_seg: (bss_va, rw_off + bss_in_rw, tls), tables: &tables };
     write_ro_prefix(&mut out, &hdr, |idx| rw_va + ((got_off - rw_off) + idx * 8) as u64);

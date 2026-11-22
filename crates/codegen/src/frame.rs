@@ -260,6 +260,7 @@ pub(crate) fn saved<R: Copy>(func: &Function, used: &[R], all: &[R]) -> Vec<R> {
 
 fn needs_frame<R>(func: &Function, frame: &Frame<R>, stack_params: bool, bracketed: bool) -> bool {
     stack_params
+        || !func.unwind_drops.is_empty()
         || frame.size > 0
         || !frame.saves.is_empty()
         || !frame.float_saves.is_empty()
@@ -320,8 +321,25 @@ fn present(func: &Function, fused: &[bool]) -> (Vec<bool>, Vec<bool>) {
             }
         }
     }
+    for u in &func.unwind_drops {
+        slots[u.local.index()] = true;
+        slots[u.flag.index()] = true;
+    }
     flags.into_iter().for_each(|value| values[value.index()] = false);
     (values, slots)
+}
+
+/// Resolves function-level `UnwindDrop` slots into frame-pointer-relative `CodeUnwindDrop` entries.
+pub(crate) fn resolve_unwind_drops<R>(func: &Function, frame: &Frame<R>) -> Vec<crate::CodeUnwindDrop> {
+    func.unwind_drops
+        .iter()
+        .map(|u| crate::CodeUnwindDrop {
+            local_off: frame.slots[u.local.index()] + u.local_off,
+            flag_off: frame.slots[u.flag.index()],
+            drop_sym: u.drop_sym,
+            indirect: u.indirect,
+        })
+        .collect()
 }
 
 pub(crate) fn terminator_edges<'a>(op: &'a Op, mut f: impl FnMut(Block, &'a [Value])) {

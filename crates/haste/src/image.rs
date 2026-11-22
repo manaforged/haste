@@ -123,6 +123,7 @@ pub struct Image {
     times: Vec<u64>,
     stubs: Memory,
     shared: Mutex<OptArena>,
+    unwind_head: usize,
     state: Mutex<OptArena>,
     tables: Mutex<HashMap<Vec<Word>, i64>>,
     fixups: Mutex<HashMap<usize, Vec<usize>>>,
@@ -378,13 +379,16 @@ impl Image {
     }
 
     pub(super) fn create(reached: &Reached, mode: ImageMode, (shared_bytes, state_bytes, table_slots): (usize, usize, usize)) -> Result<Image> {
-        let (shared, low, table, state, capacity) = if mode == ImageMode::Jit {
+        let (shared, unwind_head, low, table, state, capacity) = if mode == ImageMode::Jit {
             let capacity = reached.list.len().max(table_slots);
             let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
             let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
-            (OptArena(Some(Arena::shared(shared_bytes)?)), OptArena(Some(low)), table, OptArena(Some(Arena::private(state_bytes)?)), capacity)
+            let mut shared = Arena::shared(shared_bytes)?;
+            let unwind_head = shared.alloc(size_of::<AtomicUsize>())?;
+            crate::host::unwind::set_jit_unwind_head(unwind_head);
+            (OptArena(Some(shared)), unwind_head, OptArena(Some(low)), table, OptArena(Some(Arena::private(state_bytes)?)), capacity)
         } else {
-            (OptArena(None), OptArena(None), 0, OptArena(None), 0)
+            (OptArena(None), 0, OptArena(None), 0, OptArena(None), 0)
         };
         Ok(Image {
             table,
@@ -395,6 +399,7 @@ impl Image {
             times: vec![0; reached.list.len()],
             stubs: Memory::default(),
             shared: Mutex::new(shared),
+            unwind_head,
             state: Mutex::new(state),
             tables: Mutex::default(),
             fixups: Mutex::default(),
@@ -682,6 +687,7 @@ impl Image {
     #[cfg(unix)]
     fn run_in_child(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>, mut progress: std::fs::File) -> std::io::Result<()> {
         use std::io::Write;
+        crate::host::unwind::set_jit_unwind_head(self.unwind_head);
         for (i, &(index, name)) in items.iter().enumerate() {
             let address = self.slot(index).load(Ordering::Acquire);
             invoke(offset + i, address, name)?;
@@ -692,6 +698,7 @@ impl Image {
 
     /// Runs the program the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling; returns its exit status.
     fn enter_main(&self, (start, main): (usize, usize), args: &[String]) -> i32 {
+        crate::host::unwind::set_jit_unwind_head(self.unwind_head);
         let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
         let Ok(owned) = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<Vec<_>, _>>() else {
             return 101;
@@ -703,6 +710,12 @@ impl Image {
         let status = lang_start(main, owned.len() as isize, argv.as_ptr(), 0) as i32;
         crate::prep::finish();
         status
+    }
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        crate::host::unwind::clear_jit_unwind_head(self.unwind_head);
     }
 }
 

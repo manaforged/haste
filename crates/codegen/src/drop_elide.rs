@@ -1,5 +1,15 @@
 use crate::ir::{Binary, Block, Function, Inst, Op, StackSlot, Value};
 
+/// One stack-allocated owned value dropped during panic unwinding when its 1-byte active flag is non-zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnwindDrop {
+    pub local: StackSlot,
+    pub local_off: i32,
+    pub flag: StackSlot,
+    pub drop_sym: u32,
+    pub indirect: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CalleeKind {
     DropPush,
@@ -239,4 +249,145 @@ impl Function {
         }
         true
     }
+
+    /// Alignment shift of stack slot `slot`.
+    pub fn slot_align_shift(&self, slot: StackSlot) -> u8 {
+        self.slots[slot.index()].align_shift
+    }
+
+    /// Registers a frame-table unwind drop entry on this function.
+    pub fn add_unwind_drop(&mut self, drop: UnwindDrop) {
+        self.unwind_drops.push(drop);
+    }
+
+    /// Frame-table unwind drop entries registered on this function.
+    pub fn unwind_drops(&self) -> &[UnwindDrop] {
+        &self.unwind_drops
+    }
+
+    pub(crate) fn is_unwind_slot(&self, slot: StackSlot) -> bool {
+        self.unwind_drops.iter().any(|u| u.local == slot || u.flag == slot)
+    }
+
+    pub(crate) fn import_unwind_drops(&mut self, callee: &Function, slot_base: u32, sym_base: u32) {
+        self.keep_fp |= callee.keep_fp;
+        for u in &callee.unwind_drops {
+            self.unwind_drops.push(UnwindDrop {
+                local: StackSlot(u.local.0 + slot_base),
+                local_off: u.local_off,
+                flag: StackSlot(u.flag.0 + slot_base),
+                drop_sym: u.drop_sym + sym_base,
+                indirect: u.indirect,
+            });
+        }
+    }
+
+    /// Zero-initializes every unwind-drop flag slot at the start of the entry block so early panics never read uninitialized stack bytes.
+    pub fn zero_init_unwind_flags(&mut self) {
+        let Some(entry) = self.entry else { return };
+        if self.unwind_drops.is_empty() {
+            return;
+        }
+        let mut flags: Vec<StackSlot> = self.unwind_drops.iter().map(|u| u.flag).collect();
+        flags.sort_unstable_by_key(|s| s.0);
+        flags.dedup();
+        let zero = self.value(crate::Type::I8);
+        let zinst = self.add(Op::Const(0), Some(zero));
+        let mut init = Vec::with_capacity(1 + flags.len());
+        init.push(zinst);
+        for flag in flags {
+            init.push(self.add(Op::StackStore(zero, flag, 0), None));
+        }
+        let rest = std::mem::take(&mut self.blocks[entry.index()].insts);
+        init.extend(rest);
+        self.blocks[entry.index()].insts = init;
+    }
+
+    /// Removes frame-table unwind drop entries whose flag can never be active across a potentially-unwinding call.
+    pub fn elide_dead_unwind_drops(&mut self, mut sym_may_unwind: impl FnMut(u32) -> bool) -> bool {
+        if self.entry.is_none() || self.coroutine.is_some() || self.unwind_drops.is_empty() {
+            return false;
+        }
+        let mut defs = vec![None; self.types.len()];
+        let mut addr_slot = vec![None; self.types.len()];
+        for block in &self.blocks {
+            for &inst in &block.insts {
+                let data = &self.insts[inst.index()];
+                if let Some(res) = data.result {
+                    defs[res.index()] = Some(inst);
+                    if let Op::StackAddr(slot, 0) = data.op {
+                        addr_slot[res.index()] = Some(slot);
+                    }
+                }
+            }
+        }
+        let mut kinds = vec![CalleeKind::NoUnwind; self.insts.len()];
+        let mut flag_escaped = vec![false; self.slots.len()];
+        let mut any_unwind_call = false;
+        for block in &self.blocks {
+            for &inst in &block.insts {
+                let op = &self.insts[inst.index()].op;
+                match op {
+                    Op::Call { callee, .. } => {
+                        let kind = classify_callee(self, &defs, *callee, &mut |_| false, &mut |_| false, &mut sym_may_unwind);
+                        kinds[inst.index()] = kind;
+                        any_unwind_call |= kind == CalleeKind::MayUnwind;
+                    }
+                    Op::TryCall { .. } => any_unwind_call = true,
+                    _ => {}
+                }
+                op.for_operands(|v| {
+                    if let Some(s) = addr_slot[v.index()] {
+                        flag_escaped[s.index()] = true;
+                    }
+                });
+            }
+        }
+        if !any_unwind_call {
+            self.unwind_drops.clear();
+            return true;
+        }
+        let entry = self.entry.unwrap();
+        let before = self.unwind_drops.len();
+        let drops = std::mem::take(&mut self.unwind_drops);
+        self.unwind_drops = drops
+            .into_iter()
+            .filter(|u| flag_escaped[u.flag.index()] || unwind_flag_live_at_call(self, &defs, &kinds, entry, u.flag))
+            .collect();
+        self.unwind_drops.len() != before
+    }
+}
+
+fn unwind_flag_live_at_call(func: &Function, defs: &[Option<Inst>], kinds: &[CalleeKind], entry: Block, flag: StackSlot) -> bool {
+    let mut visited = vec![0u8; func.blocks.len()];
+    visited[entry.index()] = 1;
+    let mut work = vec![(entry, false)];
+    while let Some((block, mut active)) = work.pop() {
+        let mut stopped = false;
+        for &inst in &func.blocks[block.index()].insts {
+            match &func.insts[inst.index()].op {
+                Op::Call { .. } if active && kinds[inst.index()] == CalleeKind::MayUnwind => return true,
+                Op::TryCall { .. } if active => return true,
+                &Op::StackStore(v, s, 0) if s == flag => active = !store_clears_active(func, defs, v),
+                Op::Return(..) | Op::Trap => {
+                    stopped = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if stopped {
+            continue;
+        }
+        let bit = if active { 2 } else { 1 };
+        if let Some(last) = func.last(block) {
+            for target in last.targets() {
+                if visited[target.index()] & bit == 0 {
+                    visited[target.index()] |= bit;
+                    work.push((target, active));
+                }
+            }
+        }
+    }
+    false
 }

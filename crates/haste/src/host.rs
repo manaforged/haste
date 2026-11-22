@@ -123,7 +123,7 @@ impl HostSymbol {
             Self::ThreadCell => crate::image::thread_cell as *const () as usize,
             Self::Syscall => syscall::run as *const () as usize,
             Self::CatchUnwind => unwind::catch_unwind as *const () as usize,
-            Self::StartPanic => unwind::start_panic as *const () as usize,
+            Self::StartPanic => unwind::start_panic_addr(),
             Self::PanicCleanup => unwind::panic_cleanup as *const () as usize,
             Self::DropPush => unwind::drop_push as *const () as usize,
             Self::DropPop => unwind::drop_pop as *const () as usize,

@@ -8,7 +8,13 @@ use super::{PendingStencil, STENCIL_REC_LEN, SubstrateBuilder, aligned8, push_al
 
 impl PendingStencil {
     fn cost(&self) -> usize {
-        STENCIL_REC_LEN + aligned8(self.code_len as usize) + aligned8(self.sites_len as usize) + aligned8(self.relocs_len as usize) + aligned8(self.plan_len as usize) + aligned8(self.loops_len as usize)
+        STENCIL_REC_LEN
+            + aligned8(self.code_len as usize)
+            + aligned8(self.sites_len as usize)
+            + aligned8(self.relocs_len as usize)
+            + aligned8(self.plan_len as usize)
+            + aligned8(self.loops_len as usize)
+            + aligned8(self.unwind_len as usize)
     }
 }
 
@@ -41,6 +47,7 @@ impl SubstrateBuilder {
             repack(&mut s.relocs_off, &mut s.relocs_len)?;
             repack(&mut s.plan_off, &mut s.plan_len)?;
             repack(&mut s.loops_off, &mut s.loops_len)?;
+            repack(&mut s.unwind_off, &mut s.unwind_len)?;
         }
         for i in &mut self.instances {
             repack(&mut i.off, &mut i.len)?;

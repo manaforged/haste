@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
-use haste_codegen::{Code, RelocKind, StencilReloc, Target};
+use haste_codegen::{Code, CodeUnwindDrop, RelocKind, StencilReloc, Target};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 
 use crate::aot::{Executable, Symbol};
@@ -45,17 +45,25 @@ pub(super) struct AotCode {
     relocs: Vec<StencilReloc>,
     loops: Vec<std::ops::Range<u32>>,
     lines: Vec<(u32, u64)>,
+    unwind_drops: Vec<CodeUnwindDrop>,
 }
 
 impl AotCode {
     pub(super) fn from_code(code: &Code) -> Arc<Self> {
-        Arc::new(Self { bytes: code.bytes().to_vec(), relocs: code.relocs().to_vec(), loops: code.loops().to_vec(), lines: code.lines().to_vec() })
+        Arc::new(Self {
+            bytes: code.bytes().to_vec(),
+            relocs: code.relocs().to_vec(),
+            loops: code.loops().to_vec(),
+            lines: code.lines().to_vec(),
+            unwind_drops: code.unwind_drops().to_vec(),
+        })
     }
 
     pub(super) fn loops(&self) -> &[std::ops::Range<u32>] { &self.loops }
     pub(super) fn lines(&self) -> &[(u32, u64)] { &self.lines }
     pub(super) fn bytes(&self) -> &[u8] { &self.bytes }
     pub(super) fn relocs(&self) -> &[StencilReloc] { &self.relocs }
+    pub(super) fn unwind_drops(&self) -> &[CodeUnwindDrop] { &self.unwind_drops }
 }
 
 #[derive(Clone)]
@@ -340,6 +348,11 @@ fn for_each_fn_edge(entry: &AotFn, mut on_edge: impl FnMut(FnEdge<'_>)) {
                         sym,
                         matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32),
                     ));
+                }
+            }
+            for drop in code.unwind_drops() {
+                if let Some(sym) = relocs.get(drop.drop_sym as usize) {
+                    on_edge(FnEdge::Sym(sym, true));
                 }
             }
         }
@@ -734,6 +747,7 @@ impl Image {
         };
         let dict_bodies = emit_dict_bodies(&state, &live.order, debug_info, &mut exe)?;
         let fn_offs = emit_functions(&state, &live, (target, debug_info), (&syms, &dict_bodies), (&roots, &canon), &mut exe)?;
+        icf::emit_unwind_table(&state, &live, (&roots, &canon), &fn_offs, &mut exe);
         patch_vtables(&state, &vmask, (&vtable_offs, &fn_offs), &unique_vtables, &mut exe)?;
         for (slot_off, target_idx) in unique_slots {
             exe.pointer(true, slot_off, slot_target(&fn_offs, &state.foreign_fns, target_idx));

@@ -25,6 +25,7 @@ pub(in crate::aot) enum Shim {
     PanicCleanup,
     DropPush,
     DropPop,
+    UnwindWalk,
     Wide(WideShim),
 }
 
@@ -161,7 +162,7 @@ pub(super) fn emit_elf_start(arch: Arch, start_va: u64, tramp_va: u64, libc_star
     }
 }
 
-fn emit_rel_branch(arch: Arch, link: bool, from_va: u64, to_va: u64, out: &mut Buf) {
+pub(super) fn emit_rel_branch(arch: Arch, link: bool, from_va: u64, to_va: u64, out: &mut Buf) {
     if arch == Arch::X64 {
         out.u8(if link { 0xE8 } else { 0xE9 });
         out.u32(((to_va as i64 - (from_va as i64 + 5)) as i32) as u32);
@@ -223,7 +224,7 @@ fn arm64_jcc(words: &[u32], word: u32, out: &mut Buf) -> usize {
 
 pub(super) struct Emit<'a> {
     arch: Arch,
-    win: bool,
+    pub(super) win: bool,
     va: u64,
     base: usize,
     stub_va: &'a dyn Fn(&str) -> Result<u64>,
@@ -321,15 +322,17 @@ fn emit_x64_drop_op(c: &Emit<'_>, push: bool, addrs: SectionAddrs, out: &mut Buf
 
 fn emit_x64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
     let d: u8 = if c.win { 0x20 } else { 0 };
-    out.bytes(&[0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC]);
-    out.u32(0x220 + u32::from(d));
+    out.bytes(&[0x55, 0x48, 0x89, 0xE5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC]);
+    out.u32(0x238 + u32::from(d));
     out.bytes(if c.win { &[0x49, 0x89, 0xCC, 0x49, 0x89, 0xD6, 0x4D, 0x89, 0xC7] } else { &[0x49, 0x89, 0xFC, 0x49, 0x89, 0xF6, 0x49, 0x89, 0xD7] });
     emit_x64_unwind_state(c, addrs, out)?;
     let no_state = x64_jcc(&[0x48, 0x85, 0xC0], 0x74, out);
     out.bytes(&[
         0x48, 0x89, 0xC3, 0x48, 0x8B, 0x03, 0x48, 0x89, 0x44, 0x24, d, 0x48, 0x8B, 0x43, 0x08, 0x48, 0x89, 0x44, 0x24, d + 8,
-        0x48, 0xC7, 0x44, 0x24, d + 0x10, 0, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, d + 0x18, 0, 0, 0, 0, 0x48, 0x8D, 0x44, 0x24, d, 0x48, 0x89, 0x03,
+        0x48, 0xC7, 0x44, 0x24, d + 0x10, 0, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, d + 0x18, 0, 0, 0, 0, 0x48, 0x89, 0xAC, 0x24,
     ]);
+    out.u32(0x220 + u32::from(d));
+    out.bytes(&[0x48, 0x8D, 0x44, 0x24, d, 0x48, 0x89, 0x03]);
     let jmp_args = if c.win { &[0x48, 0x8D, 0x4C, 0x24, d + 0x20, 0x31, 0xD2][..] } else { &[0x48, 0x8D, 0x7C, 0x24, d + 0x20] };
     c.bytes_call(jmp_args, "_setjmp", out)?;
     let caught = x64_jcc(&[0x85, 0xC0], 0x75, out);
@@ -346,14 +349,14 @@ fn emit_x64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Re
     out.bytes(&[0x41, 0xFF, 0xD7, 0xB8, 1, 0, 0, 0]);
     x64_patch8(done, out);
     out.bytes(&[0x48, 0x81, 0xC4]);
-    out.u32(0x220 + u32::from(d));
-    out.bytes(&[0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3]);
+    out.u32(0x238 + u32::from(d));
+    out.bytes(&[0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0x5D, 0xC3]);
     Ok(())
 }
 
 fn emit_x64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
-    out.bytes(&[0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]);
-    out.bytes(if c.win { &[0x48, 0x83, 0xEC, 0x20, 0x49, 0x89, 0xCC, 0x49, 0x89, 0xD6] } else { &[0x49, 0x89, 0xFC, 0x49, 0x89, 0xF6] });
+    out.bytes(&[0x55, 0x48, 0x89, 0xE5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]);
+    out.bytes(if c.win { &[0x48, 0x83, 0xEC, 0x28, 0x49, 0x89, 0xCC, 0x49, 0x89, 0xD6] } else { &[0x48, 0x83, 0xEC, 0x08, 0x49, 0x89, 0xFC, 0x49, 0x89, 0xF6] });
     emit_x64_unwind_state(c, addrs, out)?;
     out.bytes(&[0x48, 0x85, 0xC0]);
     let no_state = x64_fwd32(&[0x0F, 0x84], out);
@@ -373,6 +376,7 @@ fn emit_x64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Res
     out.u8(0xE9);
     out.u32(((drain_loop as i64 - (out.pos() as i64 + 4)) as i32) as u32);
     x64_here(&[drain_null, drain_mark], out);
+    if addrs.unwind_table != 0 { super::unwind::emit_x64_walk_call(c, addrs, out); }
     let longjmp_args = if c.win { &[0x49, 0x8D, 0x4F, 0x20, 0xBA, 1, 0, 0, 0][..] } else { &[0x49, 0x8D, 0x7F, 0x20, 0xBE, 1, 0, 0, 0] };
     c.bytes_call(longjmp_args, c.pick("longjmp", "_longjmp"), out)?;
     [no_state, no_frame].into_iter().for_each(|l| x64_patch32(l, out));
@@ -547,10 +551,10 @@ fn emit_arm64_drop_op(c: &Emit<'_>, push: bool, addrs: SectionAddrs, out: &mut B
 }
 
 fn emit_arm64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
-    out.words(&[0xA9BC_7BFD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, 0xD108_83FF, 0xAA00_03F4, 0xAA01_03F6, 0xAA02_03F7]);
+    out.words(&[0xA9BC_7BFD, 0x9100_03FD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, 0xD108_C3FF, 0xAA00_03F4, 0xAA01_03F6, 0xAA02_03F7]);
     emit_arm64_unwind_state(c, addrs, out)?;
     let no_state = arm64_fwd(0xB400_0000, out);
-    out.words(&[0xAA00_03F3, 0xA940_2668, 0xA900_27E8, 0xA901_7FFF, 0x9100_03E8, 0xF900_0268, 0x9100_83E0]);
+    out.words(&[0xAA00_03F3, 0xA940_2668, 0xA900_27E8, 0xA901_7FFF, 0xF901_13FD, 0x9100_03E8, 0xF900_0268, 0x9100_83E0]);
     if c.win { out.u32(0xAA1F_03E1); }
     c.call("_setjmp", out)?;
     let caught = arm64_fwd(0x3500_0000, out);
@@ -562,12 +566,12 @@ fn emit_arm64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> 
     arm64_here(&[caught], out);
     out.words(&[0xAA16_03E0, 0x9100_43E1, 0xD63F_02E0, 0x5280_0020]);
     arm64_here(&[done], out);
-    out.words(&[0x9108_83FF, 0xA943_63F7, 0xA942_5BF5, 0xA941_53F3, 0xA8C4_7BFD, 0xD65F_03C0]);
+    out.words(&[0x9108_C3FF, 0xA943_63F7, 0xA942_5BF5, 0xA941_53F3, 0xA8C4_7BFD, 0xD65F_03C0]);
     Ok(())
 }
 
 fn emit_arm64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
-    out.words(&[0xA9BC_7BFD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, 0xAA00_03F4, 0xAA01_03F6]);
+    out.words(&[0xA9BC_7BFD, 0x9100_03FD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, 0xAA00_03F4, 0xAA01_03F6]);
     emit_arm64_unwind_state(c, addrs, out)?;
     let no_state = arm64_fwd(0xB400_0000, out);
     let no_frame = arm64_jcc(&[0xAA00_03F3, 0xF940_0277], 0xB400_0017, out);
@@ -584,6 +588,7 @@ fn emit_arm64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> R
     let back = arm64_fwd(0x1400_0000, out);
     arm64_patch(back, drain_loop, out);
     arm64_here(&[drain_null, drain_mark], out);
+    if addrs.unwind_table != 0 { super::unwind::emit_arm64_walk_call(c, addrs, out); }
     c.words_call(&[0x9100_82E0, 0x5280_0021], c.pick("longjmp", "_longjmp"), out)?;
     arm64_here(&[no_state, no_frame], out);
     c.call("abort", out)?;
@@ -708,6 +713,7 @@ fn emit_shim_x64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &dyn
         Shim::StartPanic => emit_x64_start_panic(&c, addrs, out)?,
         Shim::PanicCleanup => out.bytes(if c.win { &[0x48, 0x8B, 0x01, 0x48, 0x8B, 0x51, 0x08, 0xC3] } else { &[0x48, 0x8B, 0x07, 0x48, 0x8B, 0x57, 0x08, 0xC3] }),
         Shim::DropPush | Shim::DropPop => emit_x64_drop_op(&c, shim == Shim::DropPush, addrs, out)?,
+        Shim::UnwindWalk => super::unwind::emit_walk(Arch::X64, os, out)?,
         Shim::Wide(wide) => super::wide::emit(Arch::X64, os, wide, out)?,
     }
     Ok(())
@@ -764,6 +770,7 @@ fn emit_shim_arm64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &d
         Shim::StartPanic => emit_arm64_start_panic(&c, addrs, out)?,
         Shim::PanicCleanup => out.words(&[0xA940_0400, 0xD65F_03C0]),
         Shim::DropPush | Shim::DropPop => emit_arm64_drop_op(&c, shim == Shim::DropPush, addrs, out)?,
+        Shim::UnwindWalk => super::unwind::emit_walk(Arch::Arm64, os, out)?,
         Shim::Wide(wide) => super::wide::emit(Arch::Arm64, os, wide, out)?,
     }
     Ok(())

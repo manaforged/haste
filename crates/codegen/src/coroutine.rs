@@ -124,15 +124,26 @@ fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Va
     let framed = slots::framed(func, cfg, resumes, is_spill);
     let mut frame = Frame { size: 0, slots: vec![Home::Stack(StackSlot(0)); func.slots.len()], spills: HashMap::default() };
     let mut stack = vec![SlotData { size: 8, align_shift: 3 }];
+    let mut on_stack = vec![false; func.slots.len()];
     let (mut private, mut shared) = (Vec::new(), Vec::new());
     for (d, &raw_slot) in framed.raw_of.iter().enumerate() {
-        if framed.kept[d] {
+        if framed.kept[d] && !func.is_unwind_slot(StackSlot(raw_slot as u32)) {
             let data = &func.slots[raw_slot];
             let placed = if framed.escaped[d] { &mut shared } else { &mut private };
             placed.push((d, data.size, 1_u32 << data.align_shift));
         } else {
             stack.push(func.slots[raw_slot].clone());
             frame.slots[raw_slot] = Home::Stack(StackSlot(stack.len() as u32 - 1));
+            on_stack[raw_slot] = true;
+        }
+    }
+    for u in &func.unwind_drops {
+        for slot in [u.local, u.flag] {
+            if !on_stack[slot.index()] {
+                stack.push(func.slots[slot.index()].clone());
+                frame.slots[slot.index()] = Home::Stack(StackSlot(stack.len() as u32 - 1));
+                on_stack[slot.index()] = true;
+            }
         }
     }
     for (&(d, _, _), offset) in private.iter().zip(frame.place_colored(0, &private, &framed.conflicts)) {
@@ -156,6 +167,7 @@ pub(crate) fn split(func: &mut Function) {
     let old_entry = func.entry.expect("a coroutine has an entry");
     if spec.resumes.is_empty() {
         ready_entry(func, &spec, old_entry);
+        func.zero_init_unwind_flags();
         func.bump_cfg();
         return;
     }
@@ -167,6 +179,14 @@ pub(crate) fn split(func: &mut Function) {
     let (frame, mut stack) = build_frame(func, &cfg, &spec.resumes, spills, &is_spill);
     let lazy = lazy::plan(func, &frame, &is_spill, &mut stack);
     func.slots = stack;
+    for u in &mut func.unwind_drops {
+        if let Home::Stack(slot) = frame.slots[u.local.index()] {
+            u.local = slot;
+        }
+        if let Home::Stack(slot) = frame.slots[u.flag.index()] {
+            u.flag = slot;
+        }
+    }
     let (anchor, orig_blocks) = (StackSlot(0), func.blocks.len());
     let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), (frame.bytes(), lazy));
     func.bump_cfg();
@@ -195,6 +215,7 @@ pub(crate) fn split(func: &mut Function) {
     if let Some(lazy) = lazy {
         lazy::settle(func, &spec, anchor, lazy, orig_blocks);
     }
+    func.zero_init_unwind_flags();
     func.bump_cfg();
 }
 

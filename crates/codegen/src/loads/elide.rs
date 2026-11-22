@@ -27,7 +27,7 @@ pub(super) fn elide_moves(func: &mut Function, prov: &Provenance) -> bool {
     let mut dead: Vec<Site> = undefined_moves(func, &cfg, prov, &sealed);
     for (site, to, from) in moves {
         let (to, from) = (find(&owner, to), find(&owner, from));
-        if dead.contains(&site) || to == from || !sealed[from.index()] || !elidable(func, &cfg, site, &refs[from.index()], &refs[to.index()]) {
+        if dead.contains(&site) || to == from || !sealed[from.index()] || func.is_unwind_slot(to) || func.is_unwind_slot(from) || !elidable(func, &cfg, site, &refs[from.index()], &refs[to.index()]) {
             continue;
         }
         owner[to.index()] = from;

@@ -550,6 +550,9 @@ pub struct Function {
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
     pub(crate) value_flags: Vec<u8>,
+    /// Whether this function must keep a standard frame pointer chain for unwind stack walking.
+    pub keep_fp: bool,
+    pub(crate) unwind_drops: Vec<crate::UnwindDrop>,
     /// The bytes at the start of this coroutine's own frame that no code outside the frame can address.
     pub(crate) frame_private: u32,
     pub(crate) cfg_rev: u32,
@@ -559,7 +562,7 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), keep_fp: false, unwind_drops: Vec::new(), frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
     }
 
     pub(crate) fn bump_cfg(&mut self) {

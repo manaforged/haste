@@ -322,7 +322,7 @@ fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) ->
         }
         tried.push(slot);
         let index = slot.index() as u32;
-        if func.slots[slot.index()].size > bytes || func.self_slots.contains(&index) || func.vtable_slots.iter().any(|&(at, ..)| at == index) {
+        if func.slots[slot.index()].size > bytes || func.self_slots.contains(&index) || func.vtable_slots.iter().any(|&(at, ..)| at == index) || func.is_unwind_slot(slot) {
             continue;
         }
         let moves: Vec<(Block, Inst)> = copies.iter().filter(|copy| copy.0 == slot).map(|&(_, block, _, inst)| (block, inst)).collect();

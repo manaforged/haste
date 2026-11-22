@@ -630,6 +630,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         sig.params.push(AbiParam::special(Type::I64, ArgumentPurpose::Dict));
     }
     let mut func = Function::new(sig);
+    func.keep_fp = crate::sema::reach::unwind_enabled(cx, reached);
     let b = FunctionBuilder::new(&mut func);
     let (mut relocs, mut reloc_plan) = (Vec::new(), Vec::new());
     let mut cycle = {
@@ -642,17 +643,25 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
     }
     if mode == LowerMode::Stencil {
         splice::canonicalize_const_symbols((cx, reached), &mut func, (&reloc_plan, &relocs), (concrete, inline.stack.is_empty()));
-        if !func.is_coroutine() && relocs.iter().any(|src| matches!(src, SymbolSource::Host(HostSymbol::DropPush))) {
+        let has_drop_push = relocs.iter().any(|src| matches!(src, SymbolSource::Host(HostSymbol::DropPush)));
+        if !func.is_coroutine() && (!func.unwind_drops().is_empty() || has_drop_push) {
             simplify_tallied(&mut func, Tally::Built);
-            func.elide_dead_drop_guards(
-                |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPush))),
-                |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPop))),
-                |sym| match relocs.get(sym as usize) {
-                    Some(SymbolSource::Slot(idx)) => reached.may_unwind(cx, *idx),
-                    Some(SymbolSource::Host(h)) => crate::sema::reach::host_symbol_may_unwind(h),
-                    _ => true,
-                },
-            );
+            let mut sym_may_unwind = |sym: u32| match relocs.get(sym as usize) {
+                Some(SymbolSource::Slot(idx)) => reached.may_unwind(cx, *idx),
+                Some(SymbolSource::Host(h)) => crate::sema::reach::host_symbol_may_unwind(h),
+                _ => true,
+            };
+            func.elide_dead_unwind_drops(&mut sym_may_unwind);
+            if has_drop_push {
+                func.elide_dead_drop_guards(
+                    |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPush))),
+                    |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPop))),
+                    sym_may_unwind,
+                );
+            }
+        }
+        if !func.is_coroutine() {
+            func.zero_init_unwind_flags();
         }
     }
     Ok((func, relocs, Arc::new(RelocPlan::from_vec(reloc_plan)), cycle))

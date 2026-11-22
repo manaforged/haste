@@ -14,6 +14,7 @@ mod macho;
 mod pe;
 mod shims;
 mod tls;
+mod unwind;
 mod wide;
 
 use shims::Shim;
@@ -65,6 +66,7 @@ pub(crate) struct Executable {
     pub(super) pointers: Vec<PtrReloc>,
     pub(super) symbols: Vec<(u32, String)>,
     pub(super) thread_slots: u32,
+    pub(super) unwind_table_off: Option<u32>,
     pub(super) lines: Vec<(u32, u64)>,
     pub(super) sources: Vec<std::path::PathBuf>,
 }
@@ -92,6 +94,7 @@ impl Executable {
             pointers: Vec::new(),
             symbols: Vec::new(),
             thread_slots: 0,
+            unwind_table_off: None,
             lines: Vec::new(),
             sources: Vec::new(),
         }
@@ -327,6 +330,8 @@ pub(super) struct SectionAddrs {
     pub(super) unwind_tls: u64,
     pub(super) thread_tls: u64,
     pub(super) frame_tls: u64,
+    pub(super) unwind_table: u64,
+    pub(super) unwind_walk: u64,
 }
 
 fn classify<'a>(sym: &'a Symbol, addrs: SectionAddrs) -> Result<Binding<'a>> {
@@ -379,6 +384,7 @@ impl<'a> Plan<'a> {
             for binding in collect_dynamic_chunk(exe.relocs.iter().map(|r| &r.symbol).chain(exe.pointers.iter().map(|p| &p.symbol)))? {
                 plan.visit(binding);
             }
+            plan.add_unwind_walk(exe);
             return Ok(plan);
         }
         let reloc_chunk = exe.relocs.len().div_ceil(workers).max(1);
@@ -409,7 +415,21 @@ impl<'a> Plan<'a> {
                 plan.visit(binding);
             }
         }
+        plan.add_unwind_walk(exe);
         Ok(plan)
+    }
+
+    fn add_unwind_walk(&mut self, exe: &Executable) {
+        if exe.unwind_table_off.is_some() && self.has_shim(Shim::StartPanic) {
+            self.visit(Binding::Shim(Shim::UnwindWalk));
+        }
+    }
+
+    pub(super) fn unwind_addrs(&self, exe: &Executable, rodata_va: u64, base_va: u64, shim_offs: &[usize]) -> (u64, u64) {
+        match (exe.unwind_table_off, self.shim_idx(Shim::UnwindWalk).ok()) {
+            (Some(off), Some(idx)) => (rodata_va + u64::from(off), base_va + shim_offs[idx] as u64),
+            _ => (0, 0),
+        }
     }
 
     fn visit(&mut self, binding: Binding<'a>) {

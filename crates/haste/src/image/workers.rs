@@ -529,7 +529,7 @@ impl Image {
             return Err(Tally::MissOther);
         }
         let Ok(code) = slice.to_code().map(Arc::new) else { return Err(Tally::MissOther) };
-        if code.relocs().iter().all(|r| r.symbol_index().is_none()) {
+        if code.relocs().iter().all(|r| r.symbol_index().is_none()) && code.unwind_drops().is_empty() {
             let len = code.bytes().len() as u32;
             let aot_code = AotCode::from_code(&code);
             self.cache_aot_template(cx, reached, (item, footprint, rep), CachedAotTemplate::Direct { code: Arc::clone(&aot_code), reloc_plan: Arc::default() });

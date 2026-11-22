@@ -183,7 +183,8 @@ impl Lower<'_, '_> {
         let inside: MovePath = path.iter().copied().chain([BOX_STEP]).collect();
         let into_box = paths.iter().any(|part| part.starts_with(&inside));
         if !into_box && (!below || has_drop_impl(self.cx, ty)?) {
-            let slot = self.push_unwind(root, ty, Some(place), init)?;
+            let origin = super::reloc::TyOrigin::from_root(root, self.typed).stepped(path);
+            let slot = self.push_unwind_origin(origin, ty, Some(place), init)?;
             out.push(Part { path: path.to_vec(), flag: slot, unwind: true });
             return Ok(());
         }
@@ -211,10 +212,36 @@ impl Lower<'_, '_> {
         self.push_unwind_origin(origin, ty, place, init)
     }
 
+    fn uses_drop_list(&self) -> bool {
+        self.mode == super::stencil::LowerMode::Dict
+    }
+
     fn push_unwind_origin(&mut self, origin: super::reloc::TyOrigin, ty: Ty, place: Option<Place>, init: bool) -> Result<StackSlot> {
         let Some(glue) = self.cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
         let substs = self.cx.types.intern_substs(&[ty]);
         let glue_index = self.reached_index(glue, substs)?;
+        if !self.uses_drop_list() {
+            let drop_sym = self.push_reloc(
+                super::stencil::SymbolSource::Slot(glue_index),
+                super::reloc::RelocStep::SiteSlot(super::reloc::SiteOrigin::DropGlue(origin)),
+            );
+            let (local, local_off, indirect) = match place {
+                Some(Place { base: Base::Slot(slot), offset, repr })
+                    if !matches!(repr, Repr::Zst) && self.b.func.slot_align_shift(slot) <= 4 =>
+                {
+                    (slot, offset, false)
+                }
+                _ => {
+                    let addr = self.address_or_dangling(place, ty)?;
+                    let ptr_slot = self.b.create_stack_slot(8, 3);
+                    self.ins().stack_store(addr, ptr_slot, 0);
+                    (ptr_slot, 0, true)
+                }
+            };
+            let flag = self.flag(init);
+            self.b.func.add_unwind_drop(haste_codegen::UnwindDrop { local, local_off, flag, drop_sym, indirect });
+            return Ok(flag);
+        }
         let drop_fn = self.code_of(glue_index, super::reloc::SiteOrigin::DropGlue(origin));
         let addr = self.address_or_dangling(place, ty)?;
         let slot = self.b.create_stack_slot(40, 3);
@@ -228,6 +255,9 @@ impl Lower<'_, '_> {
     }
 
     fn pop_unwind(&mut self, slot: StackSlot) {
+        if !self.uses_drop_list() {
+            return;
+        }
         let node = self.ins().stack_addr(Type::I64, slot, 0);
         self.call_host(HostSymbol::DropPop, &[node], None);
     }
@@ -245,7 +275,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn set_dynamic_active(&mut self, slot: StackSlot, unwind: bool, active: Value) {
-        let next = if unwind {
+        let next = if unwind && self.uses_drop_list() {
             let cur = self.ins().stack_load(Type::I8, slot, 0);
             let mask = self.ins().iconst(Type::I8, 0xFE);
             let cleared = self.ins().band(cur, mask);
@@ -257,7 +287,7 @@ impl Lower<'_, '_> {
     }
 
     fn set_active(&mut self, slot: StackSlot, unwind: bool, value: bool) {
-        if !unwind {
+        if !(unwind && self.uses_drop_list()) {
             return self.set(slot, value);
         }
         let cur = self.ins().stack_load(Type::I8, slot, 0);
@@ -320,7 +350,7 @@ impl Lower<'_, '_> {
         }
         for (slot, unwind) in slots {
             let present = self.ins().stack_load(Type::I8, slot, 0);
-            let cleared = if unwind {
+            let cleared = if unwind && self.uses_drop_list() {
                 let mask = self.ins().iconst(Type::I8, 0xFE);
                 self.ins().band(present, mask)
             } else {
@@ -463,7 +493,7 @@ impl Lower<'_, '_> {
 
     fn guarded_slot(&mut self, flag: StackSlot, unwind: bool, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         let raw = self.ins().stack_load(Type::I8, flag, 0);
-        let present = if unwind {
+        let present = if unwind && self.uses_drop_list() {
             let mask = self.ins().iconst(Type::I8, 1);
             self.ins().band(raw, mask)
         } else {
@@ -644,6 +674,7 @@ impl Lower<'_, '_> {
                 return Ok(());
             }
             for ((field, field_ty, part), slot) in fields.into_iter().zip(slots.into_iter().rev()) {
+                self.set_active(slot, true, false);
                 self.pop_unwind(slot);
                 self.glue(field_ty, Some(part), origin.clone().step(0, field))?;
             }
@@ -657,6 +688,7 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         for slot in slots {
+            self.set_active(slot, true, false);
             self.pop_unwind(slot);
         }
         self.drop_fields(ty, place, origin)

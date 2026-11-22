@@ -450,13 +450,18 @@ impl Lower<'_, '_> {
         };
         let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, false))?;
         self.cycle_root = self.cycle_root.min(cycle);
-        let Some(found) = callee.filter(|found| self.inline.host.takes(self.cx, self.reached, index, found)) else { return Ok(None) };
+        let Some(found) = callee.filter(|found| {
+            self.inline.host.takes(self.cx, self.reached, index, found)
+                && (self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty())
+        }) else {
+            return Ok(None);
+        };
         if !self.inline.host.compact || found.form != Form::Dense {
             return Ok(Some(found));
         }
         let (compact, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, true))?;
         self.cycle_root = self.cycle_root.min(cycle);
-        Ok(compact)
+        Ok(compact.filter(|found| self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty()))
     }
 
     fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Result<Vec<Value>> {

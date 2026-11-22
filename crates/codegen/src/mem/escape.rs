@@ -84,6 +84,14 @@ fn finish_slot_escape(
             esc.noalias[usize::from(p)] = true;
         }
     }
+    for u in &func.unwind_drops {
+        for s in [u.local, u.flag] {
+            esc.unescaped[s.index()] = false;
+            esc.call_readonly[s.index()] = false;
+            esc.return_only[s.index()] = false;
+            esc.spilled[s.index()] = true;
+        }
+    }
     esc
 }
 
