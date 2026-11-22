@@ -2,7 +2,7 @@ use super::Emit;
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Rm, Shift, Size};
 use crate::alloc::Location;
 use crate::frame::Ext;
-use crate::ir::{AtomicRmwOp, Binary, Type, Value};
+use crate::ir::{AtomicRmwOp, Binary, Block, Function, Op, Type, Value};
 
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
@@ -254,4 +254,27 @@ impl Emit<'_> {
         self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
         Reg::Rax
     }
+}
+
+/// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
+pub(super) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
+    let mut cloned = vec![false; func.blocks.len()];
+    for data in &func.blocks {
+        if let Some(&last) = data.insts.last()
+            && copied.get(last.index()) == Some(&true)
+            && let Op::Jump(head, _) = &func.insts[last.index()].op
+        {
+            cloned[head.index()] = true;
+        }
+    }
+    let mut preds: Vec<(u32, Option<Block>)> = vec![(0, None); func.blocks.len()];
+    for at in 0..func.blocks.len() {
+        let from = Block(at as u32);
+        for next in func.successors(from) {
+            let entry = &mut preds[next.index()];
+            entry.0 += 1;
+            entry.1 = Some(from);
+        }
+    }
+    preds.into_iter().map(|(count, from)| from.filter(|from| count == 1 && !cloned[from.index()])).collect()
 }

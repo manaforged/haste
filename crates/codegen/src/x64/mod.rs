@@ -118,7 +118,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
         carry: (None, None),
-        sole_pred: atomic::sole_preds(func, &copied),
+        sole_pred: bits::sole_preds(func, &copied),
         next: None,
         last_block,
         at_end: false,
@@ -260,14 +260,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         intake_params(self, entry)
     }
 
-    fn set_next(&mut self, next: Option<Block>) {
-        self.next = next;
-    }
+    fn set_next(&mut self, next: Option<Block>) { self.next = next; }
 
     fn bind_block(&mut self, block: Block) {
         self.invalidate_spills();
         self.resume_spills(block);
         self.at_end = self.last_block == Some(block);
+        self.asm.flags_overwritten();
         self.asm.bind(self.blocks[block.index()]);
     }
 
@@ -277,9 +276,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.bind(self.blocks[block.index()]);
     }
 
-    fn deferred_prologue(&self) -> bool {
-        self.shrink.is_some()
-    }
+    fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
 
     fn blocks_fallthrough_to(&self, block: Block) -> bool {
         self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
@@ -738,6 +735,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn tails(&mut self) -> &mut Tails<'a, Label> { &mut self.tails }
     fn bind_label(&mut self, label: Label) {
         self.invalidate_spills();
+        self.asm.flags_overwritten();
         self.asm.bind(label);
     }
     fn jump_label(&mut self, label: Label) {

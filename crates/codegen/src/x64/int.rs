@@ -545,6 +545,20 @@ impl Emit<'_> {
             if let Some((tsz, timm)) = imm_sz {
                 let source = self.operand(val);
                 self.asm.test_imm_sized(tsz, source, timm);
+            } else if ty == Type::I64 && (imm as u64).checked_add(1).is_some_and(u64::is_power_of_two) {
+                let shift = (imm as u64).leading_zeros() as u8;
+                if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
+                    let source = self.operand(val);
+                    self.asm.load(Size::Q, Reg::Rax, source);
+                } else {
+                    self.raw(Reg::Rax, val);
+                }
+                if shift == 1 {
+                    self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax);
+                } else {
+                    self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift);
+                }
+                self.clobber_reg(Reg::Rax);
             } else {
                 let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
                     self.operand(val)
