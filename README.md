@@ -8,7 +8,7 @@ Use **haste** for instant local edit-run-test cycles, live hot-reloading, and ze
 - **Live hot-reloading:** `haste run --watch` watches workspace source files and patches changed function bodies directly into the running process.
 - **Zero-linker 6-target AOT cross-compilation:** `haste --release build -o ./app --target TRIPLE` emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) with no Docker and no external cross-linker.
 - **Self-hosting:** Compiles its own 86-package, ~178k-function workspace (including `serde`, `serde_derive`, `toml`, `syn`, `tracing`, `anyhow`, `indexmap`, `memchr`) in **10.3–10.8 s** (`0` failed; `13.1 s` end-to-end vs `23.9 s` for cold `cargo build` on macOS ARM64).
-- **Not a toy backend:** Beats `rustc -C opt-level=3` on **3 of 4** AOT compute kernels on x86-64 (`sha256`, `sieve`, `scan`) and beats/matches on `sha256` and `sort` on ARM64 (`scripts/bench.sh`, bit-identical outputs), and passes **620/620** differential tests, **90/90** async tests, **15/15** proc-macro tests, **17/17** crate probes (`jit+aot`), and **259/259 (100.0%)** single-file edition-2021 `rust-lang/rust` `tests/ui/` `run-pass` tests (`jit+aot`).
+- **Not a toy backend:** Matches or beats `rustc -C opt-level=3` on **3 of 4** AOT compute kernels on both x86-64 (`sha256`, `sieve`, `scan`) and ARM64 (`sha256` **0.78x**, `scan` **0.98x**, `sort` **1.00x**, `scripts/bench.sh`, bit-identical outputs), and passes **620/620** differential tests, **90/90** async tests, **15/15** proc-macro tests, **17/17** crate probes (`jit+aot`), and **259/259 (100.0%)** single-file edition-2021 `rust-lang/rust` `tests/ui/` `run-pass` tests (`jit+aot`).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline and module tour.
 
@@ -126,10 +126,10 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime tables 
 
 | Workload | macOS ARM64 (`haste` / `rustc -O3`) | Linux x86-64 (`haste` / `rustc -O3`) | Output |
 | --- | ---: | ---: | --- |
-| `sha256` (250k blocks) | 64.4 ms / 72.9 ms (**0.88x**) | 32.1 ms / 36.0 ms (**0.89x**) | exact match (`7333157476866902348`) |
-| `sieve` (4M primes) | 6.9 ms / 6.8 ms (**1.02x**) | 3.6 ms / 3.9 ms (**0.93x**) | exact match (`544501644261`) |
-| `sort` (500k quicksort + bsearch) | 29.4 ms / 29.4 ms (**1.00x**) | 23.4 ms / 23.0 ms (**1.02x**) | exact match (`8647866321337317866`) |
-| `scan` (JSON-like byte scanner) | 9.8 ms / 7.6 ms (**1.28x**) | 2.6 ms / 2.8 ms (**0.95x**) | exact match (`80005120000`) |
+| `sha256` (250k blocks) | 57.1 ms / 73.0 ms (**0.78x**) | 32.1 ms / 36.0 ms (**0.89x**) | exact match (`7333157476866902348`) |
+| `sieve` (4M primes) | 7.0 ms / 6.7 ms (**1.06x**) | 3.6 ms / 3.9 ms (**0.93x**) | exact match (`544501644261`) |
+| `sort` (500k quicksort + bsearch) | 29.1 ms / 29.0 ms (**1.00x**) | 23.4 ms / 23.0 ms (**1.02x**) | exact match (`8647866321337317866`) |
+| `scan` (JSON-like byte scanner) | 7.5 ms / 7.6 ms (**0.98x**) | 2.6 ms / 2.8 ms (**0.95x**) | exact match (`80005120000`) |
 
 ## Verify it yourself
 
