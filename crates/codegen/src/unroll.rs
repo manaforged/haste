@@ -3,6 +3,7 @@ mod memset;
 mod region;
 mod symbolic;
 mod vector;
+mod vector_shape;
 
 use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};

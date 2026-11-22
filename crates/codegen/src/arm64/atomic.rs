@@ -311,7 +311,8 @@ impl Emit<'_> {
         self.last_cmp = None;
         if !self.tst_small_zero(condition) {
             let flag = self.zext_src(condition, C);
-            self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+            let size = if self.ty(condition).bytes() <= 4 { Size::W } else { Size::X };
+            self.asm.add_imm(true, true, size, ZR, flag, 0);
         }
         Cond::Ne
     }
