@@ -393,7 +393,7 @@ impl Checker<'_, '_> {
                             target: local,
                             steps: Vec::new(),
                             mutable: self.is_mut_ref_ty(self.local_ty(local)),
-                            through_ref: self.is_ref_ty(self.local_ty(local)),
+                            through_ref: true,
                             env_only: false,
                         });
                     }

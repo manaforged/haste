@@ -275,7 +275,7 @@ impl Checker<'_, '_> {
         {
             return true;
         }
-        if src.through_ref && self.is_ref_ty(self.local_ty(src.target)) {
+        if src.through_ref && (self.is_ref_ty(self.local_ty(src.target)) || self.is_closure_param(src.target)) {
             return false;
         }
         if self.return_min_depth <= 1 {
