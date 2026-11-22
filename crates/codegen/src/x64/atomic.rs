@@ -199,7 +199,7 @@ impl Emit<'_> {
             Op::Load(addr, offset) => self.load(*addr, *offset, result()?),
             Op::Store(value, addr, offset) => {
                 let to = self.address(*addr, *offset);
-                if self.plan.elided[value.index()] { self.emit_mem_rmw(*value, to); } else { self.write(*value, to); }
+                if self.plan.elided[value.index()] && !self.has_elided_mem(*value) { self.emit_mem_rmw(*value, to); } else { self.write(*value, to); }
             }
             Op::StackAddr(slot, offset) => {
                 let result = result()?;
@@ -212,7 +212,7 @@ impl Emit<'_> {
             Op::StackLoad(slot, offset) => self.read(result()?, self.slot(*slot, *offset)),
             Op::StackStore(value, slot, offset) => {
                 let to = self.slot(*slot, *offset);
-                if self.plan.elided[value.index()] { self.emit_mem_rmw(*value, to); } else { self.write(*value, to); }
+                if self.plan.elided[value.index()] && !self.has_elided_mem(*value) { self.emit_mem_rmw(*value, to); } else { self.write(*value, to); }
             }
             Op::Fence(ord) => {
                 if ord.is_seq_cst() {

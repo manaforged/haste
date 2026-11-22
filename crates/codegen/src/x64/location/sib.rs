@@ -392,3 +392,20 @@ pub(super) fn fuse_bt_shifts(
         }
     }
 }
+
+/// Whether a spilled single-use load may fold directly into a store without scratch-register collision.
+pub(super) fn store_load_ok(func: &Function, plan: &Plan<Reg>, linst: Inst, load_res: Value, op: &Op) -> bool {
+    if !matches!(plan.location(load_res), Location::Slot) || !func.ty(load_res).is_small_int() {
+        return false;
+    }
+    match *op {
+        Op::StackStore(val, ..) => val == load_res,
+        Op::Store(val, addr, _) => {
+            val == load_res
+                && addr != load_res
+                && (matches!(func.insts[linst.index()].op, Op::StackLoad(..))
+                    || (!plan.elided[addr.index()] && matches!(plan.location(addr), Location::Reg(_) | Location::Frame(..))))
+        }
+        _ => false,
+    }
+}

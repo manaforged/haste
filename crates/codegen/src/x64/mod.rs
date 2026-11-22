@@ -305,7 +305,6 @@ impl<'a> Emitter<'a> for Emit<'a> {
             Op::Call { sig, callee, args, results } => {
                 let res = emit_call(self, inst, (*sig, *callee), args, results);
                 self.clear_flags();
-                self.invalidate_spills();
                 res
             }
             Op::TryCall { sig, callee, args, normal, handler } => {
@@ -635,7 +634,6 @@ impl Emit<'_> {
     }
 
     fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
-        self.invalidate_spills();
         let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
         for (arg, loc) in args.iter().zip(&abi.params) {
             match *loc {
@@ -649,6 +647,9 @@ impl Emit<'_> {
             Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot)).map(|hit| (lookup, hit)),
             _ => None,
         };
+        if cell.is_some() {
+            self.clobber_reg(Reg::Rax);
+        }
         let held = self.reg_of(callee).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {
@@ -735,10 +736,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
     fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> { self.arguments(sig, callee, args) }
-    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
-        self.store_locs(values, locs);
-        self.invalidate_spills();
-    }
+    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) { self.store_locs(values, locs); }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
     fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, self.frame_mem(INCOMING + offset as i32), INTAKE_XMM); }
     fn intake_struct(&mut self, value: Value, offset: u32) {

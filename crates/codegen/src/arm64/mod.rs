@@ -278,7 +278,6 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 if self.bracket {
                     self.asm.ldp_post(FP, LR, SP, 16);
                 }
-                self.invalidate_spills();
                 res
             }
             Op::TryCall { sig, callee, args, normal, handler } => {
@@ -702,6 +701,7 @@ impl Emit<'_> {
             Some(CallTarget::Symbol(sym)) => self.relocs.push(self.asm.call_direct_symbol(sym, self.direct_calls, T)),
             None => self.asm.blr(target),
         }
+        self.invalidate_spills();
         Ok(abi)
     }
 }

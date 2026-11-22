@@ -340,6 +340,7 @@ fn load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
     match udata.op {
         Op::Icmp(..) => true,
         Op::Brif(cond, ..) | Op::Trapz(cond) => cond == load_res,
+        Op::Store(..) | Op::StackStore(..) => super::sib::store_load_ok(ctx.func, ctx.plan, linst, load_res, &udata.op),
         Op::Convert(Convert::Uextend | Convert::Sextend, _) => ty.bytes() <= 4 && non_wide,
         Op::Convert(Convert::Ireduce, _) => ty.bytes() <= 8 && non_wide,
         Op::Binary(..) => load_binop_ok(ctx, features, linst, load_res, udata),
