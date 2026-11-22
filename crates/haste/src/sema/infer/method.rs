@@ -66,31 +66,23 @@ impl<'a> Infer<'_, 'a> {
         let outer = std::mem::replace(&mut self.receiver_param, origin);
         let mut probed = self.probe_steps((expr, found), (name, count), &steps, expected);
         if matches!(probed, Ok(None))
-            && let Some(default_prim) = match self.cx.types.kind(*steps.last().unwrap()) {
+            && let Some(&last) = steps.last()
+            && let Some(default_prim) = match self.cx.types.kind(last) {
                 Kind::IntVar(_) => Some(crate::names::Primitive::I32),
                 Kind::FloatVar(_) => Some(crate::names::Primitive::F64),
                 _ => None,
             }
         {
             let default_ty = self.cx.types.prim(default_prim);
-            let last = *steps.last().unwrap();
-            let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());
-            if self.unify(last, default_ty).is_ok() {
-                let resolved: Vec<Ty> = steps.iter().map(|&s| self.resolve(s)).collect();
-                let retry = self.probe_steps((expr, found), (name, count), &resolved, expected);
-                if matches!(retry, Ok(Some(_))) {
-                    self.commit_vars(mark.0);
-                    steps = resolved;
-                    probed = retry;
-                } else {
-                    self.rollback_vars(mark.0);
-                    self.projections.truncate(mark.1);
-                    self.obligations.truncate(mark.2);
+            if let Some((pick, resolved)) = self.trial(|infer| {
+                if !infer.unifies(last, default_ty) {
+                    return Ok(None);
                 }
-            } else {
-                self.rollback_vars(mark.0);
-                self.projections.truncate(mark.1);
-                self.obligations.truncate(mark.2);
+                let resolved: Vec<Ty> = steps.iter().map(|&s| infer.resolve(s)).collect();
+                Ok(infer.probe_steps((expr, found), (name, count), &resolved, expected)?.map(|pick| (pick, resolved)))
+            })? {
+                steps = resolved;
+                probed = Ok(Some(pick));
             }
         }
         self.receiver_param = outer;
@@ -185,7 +177,7 @@ impl<'a> Infer<'_, 'a> {
     fn probe_step(&mut self, step: Ty, (candidates, traits): (&[Candidate], &[TraitCandidate]), expected: Option<Ty>) -> Result<Option<Pick>> {
         let (bounded, all_unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits.iter().partition(|candidate| candidate.bound.is_some());
         let step_ty = self.substitute(step);
-        let is_var = matches!(self.cx.types.kind(self.resolve(step)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_));
+        let is_var = matches!(self.cx.types.kind(self.resolve(step)), Kind::Var(_));
         let bounded_at: Vec<TraitCandidate> = bounded.iter().map(|candidate| TraitCandidate { bound: candidate.bound.map(|bound| self.substitute(bound)), ..*candidate }).collect();
         let wanted = self.known(expected);
         let unshadowed: Vec<TraitCandidate> = all_unbounded.iter().copied().filter(|candidate| !shadowed(&bounded_at, candidate.of, step_ty)).collect();

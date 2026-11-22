@@ -11,14 +11,23 @@ impl Infer<'_, '_> {
     pub fn array_expr(&mut self, items: List, expected: Option<Ty>) -> Result<Ty> {
         let items = self.body.list(items).to_vec();
         let element = match expected.map(|ty| self.cx.types.kind(self.resolve(ty)).clone()) {
-            Some(Kind::Array(element, _) | Kind::Slice(element)) => element,
-            _ => return self.merged_array(&items),
+            Some(Kind::Array(element, _) | Kind::Slice(element)) => Some(element),
+            _ => None,
+        };
+        let Some(known_element) = self.known(element) else {
+            let array = self.merged_array(&items)?;
+            if let Some(expected_elem) = element
+                && let Kind::Array(found_elem, _) = *self.cx.types.kind(array)
+            {
+                self.unify(found_elem, expected_elem)?;
+            }
+            return Ok(array);
         };
         for &item in &items {
-            let found = self.expr(ExprId(item), Some(element))?;
-            self.coerce_expr(ExprId(item), found, element)?;
+            let found = self.expr(ExprId(item), Some(known_element))?;
+            self.coerce_expr(ExprId(item), found, known_element)?;
         }
-        Ok(self.cx.types.array(element, items.len() as u64))
+        Ok(self.cx.types.array(known_element, items.len() as u64))
     }
 
     /// Infers an array of `items` with no expected element, whose element is the common type of its items, as for the arms of a `match`.

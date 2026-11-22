@@ -225,17 +225,33 @@ impl<'a> Infer<'_, 'a> {
 
     fn resolve_path(&mut self, mut ty: Ty, path: &[(u32, u32)], stop_drop: bool, known: &mut bool) -> Result<(Vec<(u32, u32)>, Ty)> {
         let mut out = Vec::new();
+        let mut drop_at = None;
         for &step in path {
             ty = self.resolve_opt(ty);
             if ty == Ty::NONE { return Ok((out, Ty::NONE)); }
             if self.has_vars(ty) { *known = false; return Ok((out, if stop_drop { ty } else { Ty::NONE })); }
-            if stop_drop && matches!(self.cx.types.kind(ty), Kind::Adt(..)) && self.drop_impl(ty)?.is_some() { return Ok((out, ty)); }
+            if stop_drop && drop_at.is_none() && matches!(self.cx.types.kind(ty), Kind::Adt(..)) && self.drop_impl(ty)?.is_some() {
+                drop_at = Some((out.len(), ty));
+            }
             out.push(step);
             ty = step_field_ty(self.cx, ty, step)?;
         }
         let ty = self.resolve_opt(ty);
         if ty != Ty::NONE && self.has_vars(ty) { *known = false; }
+        if let Some((len, drop_ty)) = drop_at && (ty == Ty::NONE || self.has_vars(ty) || !self.is_copy(ty)? || self.needs_drop(ty)?) {
+            out.truncate(len);
+            return Ok((out, drop_ty));
+        }
         Ok((out, ty))
+    }
+
+    fn truncate_value_paths(&mut self, caps: &mut [Capture], known: &mut bool) -> Result<()> {
+        for cap in caps {
+            if cap.by == By::Value && !cap.path.is_empty() {
+                (cap.path, _) = self.resolve_path(self.out.locals[cap.local as usize].ty, &cap.path, true, known)?;
+            }
+        }
+        Ok(())
     }
 
     fn expr_proj(&mut self, expr: ExprId) -> Result<(Vec<(u32, u32)>, bool)> {
@@ -331,25 +347,17 @@ impl<'a> Infer<'_, 'a> {
             known &= mut_known;
             raw.push(Capture { local, by: By::Mut, path: mut_proj });
         }
-        if uses.inner_closures.is_empty() {
-            uses.used.iter().filter(|l| !read_locals.contains(l)).for_each(|&local| raw.push(Capture { local, by: By::Ref, path: Vec::new() }));
-        }
+        if uses.inner_closures.is_empty() { uses.used.iter().filter(|l| !read_locals.contains(l)).for_each(|&local| raw.push(Capture { local, by: By::Ref, path: Vec::new() })); }
         let consumes = raw.iter().any(|c| c.by == By::Value);
-        for cap in &mut raw {
-            if by_move { cap.by = By::Value; }
-            if cap.by == By::Value && !cap.path.is_empty() { (cap.path, _) = self.resolve_path(self.out.locals[cap.local as usize].ty, &cap.path, true, &mut known)?; }
-        }
+        if by_move { raw.iter_mut().for_each(|cap| cap.by = By::Value); }
+        self.truncate_value_paths(&mut raw, &mut known)?;
         raw.sort_by(|a, b| (a.local, a.path.len(), &a.path).cmp(&(b.local, b.path.len(), &b.path)));
         let mut captures: Vec<Capture> = Vec::new();
         for cap in raw {
             if let Some(prev) = captures.iter_mut().find(|p| p.local == cap.local && cap.path.starts_with(&p.path)) { prev.by = Self::max_by(prev.by, cap.by); }
             else { captures.push(cap); }
         }
-        for cap in &mut captures {
-            if cap.by == By::Value && !cap.path.is_empty() {
-                (cap.path, _) = self.resolve_path(self.out.locals[cap.local as usize].ty, &cap.path, true, &mut known)?;
-            }
-        }
+        self.truncate_value_paths(&mut captures, &mut known)?;
         Ok((captures, consumes, known))
     }
 
@@ -479,9 +487,7 @@ impl<'a> Infer<'_, 'a> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Index(inner, _) | Expr::Unary(UnOp::Deref, inner) => {
                 let inner_ty = self.resolve_opt(self.out.exprs[inner.0 as usize]);
-                (inner_ty == Ty::NONE || !matches!(self.cx.types.kind(inner_ty), Kind::Ptr(..)))
-                    .then(|| self.place_local(inner))
-                    .flatten()
+                (inner_ty == Ty::NONE || !matches!(self.cx.types.kind(inner_ty), Kind::Ptr(..))).then(|| self.place_local(inner)).flatten()
             }
             Expr::Path(_) => match self.out.res.get(&expr) { Some(Res::Local(local)) => Some(*local), _ => None },
             _ => None,
@@ -706,18 +712,12 @@ pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, Substs), typed
     }
 }
 
-fn push_projected_locals(cx: &mut Context<'_>, typed: &mut Typed, closure: &Closure) -> Result<()> {
-    for cap in &closure.captures {
-        if !cap.path.is_empty() {
-            let ty = cap.ty(cx, typed.locals[cap.local as usize].ty)?;
-            typed.locals.push(Local { ty });
+fn finish_closure(cx: &mut Context<'_>, mut typed: Typed, info: &ClosureInfo, env: Option<u32>, ret: Ty) -> Result<Typed> {
+    if env.is_some() {
+        for cap in &info.closure.captures {
+            if !cap.path.is_empty() { typed.locals.push(Local { ty: cap.ty(cx, typed.locals[cap.local as usize].ty)? }); }
         }
     }
-    Ok(())
-}
-
-fn finish_closure(cx: &mut Context<'_>, mut typed: Typed, info: &ClosureInfo, env: Option<u32>, ret: Ty) -> Result<Typed> {
-    if env.is_some() { push_projected_locals(cx, &mut typed, &info.closure)?; }
     typed.ret = Some(ret);
     typed.shape = Shape::Closure(ClosureBody { parent: info.parent, closure: info.closure.clone(), env });
     typed.drops = super::drop::drop_calls(cx, &typed)?;
@@ -750,10 +750,8 @@ impl<'a> Context<'a> {
 
     pub(in crate::sema) fn ensure_closure_env(&mut self, ty: Ty) -> Result<Ty> {
         if let Some(info) = self.closure_ready(ty, false) { return Ok(info.env); }
-        match self.load_closure_owner(ty, false)? {
-            Some(info) => Ok(info.env),
-            None => self.async_coroutine_env(ty)?.ok_or_else(|| anyhow::anyhow!("layout of a closure whose defining body was not inferred")),
-        }
+        if let Some(info) = self.load_closure_owner(ty, false)? { return Ok(info.env); }
+        self.async_coroutine_env(ty)?.ok_or_else(|| anyhow::anyhow!("layout of a closure whose defining body was not inferred"))
     }
 
     fn closure_ready(&self, ty: Ty, full: bool) -> Option<Arc<ClosureInfo>> { self.store.closures.get(&ty).filter(|info| !full || !info.typed.exprs.is_empty()) }
