@@ -1,3 +1,7 @@
+mod emit;
+pub(crate) use emit::{emit_body, stack_zero_store};
+use emit::mark_line;
+
 use crate::alloc::{Location, Plan, Regs};
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, Signature, Type, Value};
 
@@ -717,43 +721,12 @@ pub(crate) trait Emitter<'a>: Sized {
     fn on_block_bound(&mut self, _block: Block) -> Result<(), String> {
         Ok(())
     }
-}
 
-pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Result<(), String> {
-    emit.clear_flags();
-    let func = emit.func();
-    let insts = &func.blocks[block.index()].insts;
-    let (mut ahead, mut loc) = (0, 0);
-    for (k, &inst) in insts.iter().enumerate() {
-        let data = &func.insts[inst.index()];
-        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
-            continue;
-        }
-        if ahead <= k {
-            ahead = insts[k..].iter().position(|i| func.insts[i.index()].loc != 0).map_or(insts.len(), |at| k + at);
-            loc = insts.get(ahead).map_or(loc, |i| func.insts[i.index()].loc);
-            if loc == 0 {
-                loc = func.home_loc();
-            }
-        }
-        mark_line(emit, loc);
-        emit.inst(inst)?;
+    fn zero_stack_store(&self, _inst: Inst) -> Option<(i32, u32)> {
+        None
     }
-    if !insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator()) {
-        emit.trap();
-    }
-    Ok(())
-}
 
-/// Starts a line-table row for `loc` at the current offset unless the open row already has it; 0 marks code with no source.
-fn mark_line<'a, E: Emitter<'a>>(emit: &mut E, loc: u64) {
-    let at = emit.pos();
-    let lines = emit.lines();
-    match lines.last_mut() {
-        Some(last) if last.1 == loc => {}
-        Some(last) if last.0 == at => last.1 = loc,
-        _ => lines.push((at, loc)),
-    }
+    fn emit_zero_frame(&mut self, _offset: i32, _bytes: u32) {}
 }
 
 fn entry_has_preds(func: &Function, order: &[Block], entry: Block) -> bool {

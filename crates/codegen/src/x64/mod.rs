@@ -225,8 +225,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.func
     }
 
-    fn is_elided(&self, value: Value) -> bool {
-        self.plan.elided[value.index()]
+    fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] }
+
+    fn zero_stack_store(&self, inst: Inst) -> Option<(i32, u32)> { crate::frame::stack_zero_store(self.func, &self.frame.slots, inst, |v| self.const_of(v)) }
+
+    fn emit_zero_frame(&mut self, offset: i32, bytes: u32) {
+        let to = self.frame_mem(offset);
+        if bytes == 8 { self.zero_to(to); } else { self.asm.store_imm_sized(Size::of(bytes), to, 0); }
     }
 
     fn prologue(&mut self) {

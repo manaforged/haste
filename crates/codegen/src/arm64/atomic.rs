@@ -490,16 +490,24 @@ impl Emit<'_> {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        self.get_opt(D, value, signed);
         if self.lse && op != AtomicRmwOp::Nand {
-            match op {
-                AtomicRmwOp::Sub => self.asm.alu(Alu::Sub, Size::X, D, ZR, D),
-                AtomicRmwOp::And => self.asm.alu(Alu::Orn, Size::X, D, ZR, D),
-                _ => {}
+            match (op, self.plan.const_of(value)) {
+                (AtomicRmwOp::Sub, Some(imm)) => self.asm.mov_imm(D, imm.wrapping_neg()),
+                (AtomicRmwOp::And, Some(imm)) => self.asm.mov_imm(D, !imm),
+                (AtomicRmwOp::Sub, None) => {
+                    self.get_opt(D, value, false);
+                    self.asm.alu(Alu::Sub, Size::X, D, ZR, D);
+                }
+                (AtomicRmwOp::And, None) => {
+                    self.get_opt(D, value, false);
+                    self.asm.alu(Alu::Orn, Size::X, D, ZR, D);
+                }
+                _ => self.get_opt(D, value, signed),
             }
             self.asm.lse_rmw(op, ord, size, (S, D, A));
             return;
         }
+        self.get_opt(D, value, signed);
         let again = self.asm.label();
         self.asm.bind(again);
         self.asm.load_exclusive(ord.has_acquire(), size, A, S);
