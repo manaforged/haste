@@ -258,24 +258,33 @@ impl Lower<'_, '_> {
         if let Some(base) = self.non_zero_static_rodata(index, item, substs, ty)? {
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
-        let (address, size) = self.static_cell(index, ty)?;
-        if !self.cx.foreign(item) && index != self.index && !self.zero_static(item, substs, ty)? {
+        let is_tls = !self.cx.foreign(item) && self.cx.thread_local(item);
+        let needs_fill = !self.cx.foreign(item) && index != self.index && !self.zero_static(item, substs, ty)?;
+        let (address, size) = self.static_cell(index, ty, is_tls && needs_fill)?;
+        if !is_tls && needs_fill {
             self.ensure_static_filled(index, address, size)?;
         }
         Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
     }
 
-    fn static_cell(&mut self, index: usize, ty: Ty) -> Result<(Value, i32)> {
+    /// Calls `HostSymbol::ThreadCell(slot, size, init_slot)` with the shared 3-argument ABI.
+    pub(super) fn call_thread_cell(&mut self, slot: Value, size: i64, init_slot: Option<Value>) -> Result<Value> {
+        let usize_ty = self.cx.types.prim(Primitive::Usize);
+        let code = self.emit_symbol(SymbolSource::Host(HostSymbol::ThreadCell));
+        self.b.func.mark_thread_cell(code);
+        let init = init_slot.unwrap_or_else(|| self.ins().iconst(Type::I64, 0));
+        let args = vec![slot, self.ins().iconst(Type::I64, size), init];
+        let cell = self.call_code(code, (vec![usize_ty, usize_ty, usize_ty], Some(usize_ty)), args)?;
+        cell.ok_or_else(|| anyhow::anyhow!("no thread cell"))
+    }
+
+    fn static_cell(&mut self, index: usize, ty: Ty, init_tls: bool) -> Result<(Value, i32)> {
         let size = self.cx.layout(ty)?.size.bytes() as u32;
         let item = self.reached.list[index].0.0;
         if !self.cx.foreign(item) && self.cx.thread_local(item) {
-            let usize_ty = self.cx.types.prim(Primitive::Usize);
-            let code = self.emit_symbol(SymbolSource::Host(HostSymbol::ThreadCell));
-            self.b.func.mark_thread_cell(code);
             let idx_val = self.emit_symbol(SymbolSource::ThreadSlot(index));
-            let args = vec![idx_val, self.ins().iconst(Type::I64, i64::from(size) + 1)];
-            let cell = self.call_code(code, (vec![usize_ty, usize_ty], Some(usize_ty)), args)?;
-            return Ok((cell.ok_or_else(|| anyhow::anyhow!("no thread cell"))?, size as i32));
+            let init = init_tls.then(|| self.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index))));
+            return Ok((self.call_thread_cell(idx_val, i64::from(size), init)?, size as i32));
         }
         let address = self.emit_symbol(SymbolSource::StaticCell { index, size });
         Ok((address, size as i32))
@@ -285,7 +294,7 @@ impl Lower<'_, '_> {
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
         let (item, ty) = (self.reached.list[self.index].0.0, self.typed.ret_ty());
         if self.open && crate::prep::static_address(self.cx, item).is_none() {
-            let (address, _) = self.static_cell(self.index, ty)?;
+            let (address, _) = self.static_cell(self.index, ty, false)?;
             let place = Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? };
             if let Some(value) = value {
                 self.write(place, value);

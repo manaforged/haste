@@ -644,13 +644,24 @@ pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
     }
 }
 
-/// The calling thread's cell of `size` zeroed bytes for the `#[thread_local]` static with thread slot `slot`; cells are never freed, since the program's thread exit code may still read them.
-pub(crate) extern "C" fn thread_cell(slot: usize, size: usize) -> usize {
-    let state = thread_state();
-    match state.cells.get(slot) {
-        Some(&cell) if cell != 0 => cell,
-        _ => new_cell(state, slot, size),
+/// The calling thread's cell of `size` zeroed bytes for the `#[thread_local]` static with thread slot `slot`, running `*init_slot` once on first allocation when non-zero.
+pub(crate) extern "C" fn thread_cell(slot: usize, size: usize, init_slot: usize) -> usize {
+    let cell = {
+        let state = thread_state();
+        if let Some(&cell) = state.cells.get(slot)
+            && cell != 0
+        {
+            return cell;
+        }
+        new_cell(state, slot, size)
+    };
+    if init_slot != 0 {
+        // SAFETY: init_slot points to the 8-byte function slot holding this static's zero-arg initializer.
+        let code = unsafe { *(init_slot as *const usize) };
+        let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(code) };
+        fill();
     }
+    cell
 }
 
 /// Makes the calling thread's cell of `size` zeroed bytes for thread slot `slot`.

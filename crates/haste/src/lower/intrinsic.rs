@@ -86,12 +86,8 @@ impl Lower<'_, '_> {
     pub(super) fn caller_loc_slot(&mut self) -> Result<Value> {
         const CALLER_LOC_SLOT: i64 = 0;
         const CALLER_LOC_CELL_BYTES: i64 = 8;
-        let usize_ty = self.cx.types.prim(Primitive::Usize);
-        let code = self.emit_symbol(SymbolSource::Host(HostSymbol::ThreadCell));
-        self.b.func.mark_thread_cell(code);
-        let args = vec![self.ins().iconst(Type::I64, CALLER_LOC_SLOT), self.ins().iconst(Type::I64, CALLER_LOC_CELL_BYTES)];
-        let cell = self.call_code(code, (vec![usize_ty, usize_ty], Some(usize_ty)), args)?;
-        cell.ok_or_else(|| anyhow::anyhow!("no caller location cell"))
+        let slot = self.ins().iconst(Type::I64, CALLER_LOC_SLOT);
+        self.call_thread_cell(slot, CALLER_LOC_CELL_BYTES, None)
     }
 
     pub(super) fn current_site_location(&mut self) -> Result<Value> {

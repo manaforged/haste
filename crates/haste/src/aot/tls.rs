@@ -66,16 +66,19 @@ pub(super) fn emit_arm64_tlv_thread_cell(c: &Emit<'_>, desc_va: u64, cells_off: 
     let miss = arm64_fwd(0xB400_0000, out);
     out.words(&[0xAA0A_03FE, 0xD65F_03C0]);
     arm64_here(&[miss], out);
-    out.words(&[0xD100_C3FF, 0xA900_2BFD, 0xA901_53F3, 0xAA0B_03F3, 0xAA01_03F4]);
-    c.words_call(&[0xF100_029F, 0xD280_0029, 0x9A89_1294, 0xF900_13FF, 0x9100_83E0, 0xD280_0801, 0xAA14_03E2], "posix_memalign", out)?;
+    out.words(&[0xD101_03FF, 0xA900_2BFD, 0xA901_53F3, 0xF900_13F5, 0xAA0B_03F3, 0xAA01_03F4, 0xAA02_03F5]);
+    c.words_call(&[0xF100_029F, 0xD280_0029, 0x9A89_1294, 0xF900_1BFF, 0x9100_C3E0, 0xD280_0801, 0xAA14_03E2], "posix_memalign", out)?;
     let fail = arm64_fwd(0x3500_0000, out);
-    c.words_call(&[0xF940_13E0, 0x5280_0001, 0xAA14_03E2], "memset", out)?;
+    c.words_call(&[0xF940_1BE0, 0x5280_0001, 0xAA14_03E2], "memset", out)?;
     out.u32(0xF900_0260);
+    let skip_init = arm64_fwd(0xB400_0015, out);
+    out.words(&[0xF940_02A8, 0xD63F_0100, 0xF940_0260]);
+    arm64_here(&[skip_init], out);
     let done = arm64_fwd(0x1400_0000, out);
     arm64_here(&[fail], out);
     out.u32(0xD280_0000);
     arm64_here(&[done], out);
-    out.words(&[0xA941_53F3, 0xA940_7BFD, 0x9100_C3FF, 0xD65F_03C0]);
+    out.words(&[0xF940_13F5, 0xA941_53F3, 0xA940_7BFD, 0x9101_03FF, 0xD65F_03C0]);
     Ok(())
 }
 
