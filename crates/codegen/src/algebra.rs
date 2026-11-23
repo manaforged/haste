@@ -380,8 +380,9 @@ fn simplify_convert(cx: &mut RewriteCx, res: Option<Value>, kind: Convert, x: Va
         (Convert::Sextend, &Op::Convert(Convert::Sextend, inner)) if cx.func.ty(inner).is_small_int() => Some(Op::Convert(Convert::Sextend, inner)),
         (Convert::Uextend, &Op::Convert(Convert::Ireduce, inner)) if cx.func.ty(inner) == dst => {
             let hi = dst.unsigned_max() & !src.unsigned_max();
-            if (cx.known(inner).0 & hi) == hi { cx.alias(res, inner); }
-            None
+            if (cx.known(inner).0 & hi) == hi { cx.alias(res, inner); return None; }
+            let mask = cx.emit(dst, Op::Const(extend(src.unsigned_max() as i64, dst, true)));
+            Some(Op::Binary(Binary::Band, inner, mask))
         }
         _ => None,
     }

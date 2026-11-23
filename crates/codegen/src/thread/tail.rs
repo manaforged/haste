@@ -17,6 +17,18 @@ impl Edge {
     }
 }
 
+fn pred_edge_to(func: &Function, pred: Block, target: Block) -> Option<(Edge, &[Value])> {
+    match func.last(pred) {
+        Some(Op::Jump(t, args)) if *t == target => Some((Edge::Jump(pred), args.as_slice())),
+        Some(Op::Brif(_, then, then_args, other, other_args)) if *then != *other => {
+            if *then == target { Some((Edge::Brif(pred, true), then_args.as_slice())) }
+            else if *other == target { Some((Edge::Brif(pred, false), other_args.as_slice())) }
+            else { None }
+        }
+        _ => None,
+    }
+}
+
 /// The branch a block ends with: an integer compare in the block, a condition parameter, or a jump-table parameter.
 enum Branch {
     Brif { test: Test, then: Block, other: Block },
@@ -43,16 +55,7 @@ pub(super) fn run(func: &mut Function) -> bool {
         let params_len = func.blocks[block.index()].params.len();
         for &pred in cfg.preds_of(block) {
             if pred == block || copies.iter().any(|&(e, b, _)| e.pred() == pred || b == pred || e.pred() == block) { continue; }
-            let edge_args = match func.last(pred) {
-                Some(Op::Jump(target, args)) if *target == block => Some((Edge::Jump(pred), args.as_slice())),
-                Some(Op::Brif(_, then, then_args, other, other_args)) if *then != *other => {
-                    if *then == block { Some((Edge::Brif(pred, true), then_args.as_slice())) }
-                    else if *other == block { Some((Edge::Brif(pred, false), other_args.as_slice())) }
-                    else { None }
-                }
-                _ => None,
-            };
-            let Some((edge, args)) = edge_args else { continue };
+            let Some((edge, args)) = pred_edge_to(func, pred, block) else { continue };
             if args.len() != params_len { continue; }
             let Some(to) = decide(func, defs, consts, pred, block, args, &found) else { continue };
             if to != block && stays_under(func, &cfg, block, to) { copies.push((edge, block, to)); }
@@ -127,7 +130,7 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
                     }
                 }
             });
-            if need_count > 4 {
+            if need_count > 6 {
                 return None;
             }
         }
@@ -264,50 +267,38 @@ fn thread_repaired_joins(func: &mut Function, defs_cache: &mut Option<Vec<Option
             let mut picked = None;
             'blocks: for at in 0..func.blocks.len() {
                 let block = Block(at as u32);
-                if !cfg.reachable[at] || cfg.preds_of(block).len() < 2 {
-                    continue;
-                }
+                if !cfg.reachable[at] || cfg.preds_of(block).len() < 2 || cfg.preds_of(block).iter().any(|&p| cfg.dominates(block, p)) { continue; }
                 let Some(found) = branch(func, defs, block) else { continue };
                 let params_len = func.blocks[at].params.len();
                 let mut own_vals: Vec<Value> = func.blocks[at].params.clone();
                 for &inst in &func.blocks[at].insts {
-                    if !matches!(func.insts[inst.index()].op, Op::Const(_))
-                        && let Some(r) = func.insts[inst.index()].result
-                    {
-                        own_vals.push(r);
-                    }
+                    if !matches!(func.insts[inst.index()].op, Op::Const(_)) && let Some(r) = func.insts[inst.index()].result { own_vals.push(r); }
                 }
                 for &pred in cfg.preds_of(block) {
-                    if pred == block || cfg.dominates(block, pred) {
-                        continue;
-                    }
-                    let Some(Op::Jump(target, args)) = func.last(pred) else { continue };
-                    if *target != block || args.len() != params_len {
-                        continue;
-                    }
+                    if pred == block || cfg.dominates(block, pred) { continue; }
+                    let Some((edge, args)) = pred_edge_to(func, pred, block) else { continue };
+                    if args.len() != params_len { continue; }
                     let Some(to) = decide(func, defs, consts, pred, block, args, &found) else { continue };
-                    if to == block || !cfg.dominates(block, to) {
-                        continue;
-                    }
+                    if to == block || !cfg.dominates(block, to) { continue; }
+                    let is_brif = matches!(edge, Edge::Brif(..));
+                    if is_brif && cfg.preds_of(to).iter().any(|&p| cfg.dominates(to, p)) { continue; }
                     let Some(ssa) = plan_ssa_joins(func, &cfg, block, to, &[], &own_vals) else { continue };
-                    if ssa.need.is_empty() {
-                        continue;
-                    }
-                    picked = Some((pred, block, to, ssa));
+                    if ssa.need.is_empty() || (is_brif && ssa.joins.len() > 1) { continue; }
+                    picked = Some((edge, block, to, ssa));
                     break 'blocks;
                 }
             }
             picked
         };
-        let Some((pred, block, to, ssa)) = found_plan else { break };
+        let Some((edge, block, to, ssa)) = found_plan else { break };
         localize_consts(func, block);
-        let map = copy_into(func, pred, block, to);
-        let pairs: Vec<(Value, Value)> = ssa
-            .need
-            .iter()
-            .filter_map(|&orig| map.iter().find(|&&(from, _)| from == orig).map(|&(_, into)| (orig, into)))
-            .collect();
-        apply_ssa_repair(func, &ssa, to, pred, &pairs);
+        let new_pred = match edge {
+            Edge::Jump(pred) => pred,
+            Edge::Brif(pred, on_then) => { let Some(split) = split_brif_arm(func, pred, on_then, block) else { break }; split }
+        };
+        let map = copy_into(func, new_pred, block, to);
+        let pairs: Vec<(Value, Value)> = ssa.need.iter().filter_map(|&orig| map.iter().find(|&&(from, _)| from == orig).map(|&(_, into)| (orig, into))).collect();
+        apply_ssa_repair(func, &ssa, to, new_pred, &pairs);
         func.bump_cfg();
         *defs_cache = None;
         *consts_cache = None;

@@ -45,7 +45,7 @@ fn x64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64, flag_only_band: bool) 
         Op::Binary(Binary::Bor | Binary::Bxor, ..) => x64_alu_imm(ty, imm) || (ty == Type::I64 && (imm as u64).is_power_of_two()),
         Op::Binary(Binary::Band, ..) => {
             x64_alu_imm(ty, imm)
-                || (rhs && imm == 0xFFFF_FFFF)
+                || imm == 0xFFFF_FFFF
                 || (ty == Type::I64 && ((!(imm as u64)).is_power_of_two() || (flag_only_band && (imm as u64).is_power_of_two())))
         }
         Op::Binary(Binary::Isub, ..) => rhs && x64_alu_imm(ty, imm),
