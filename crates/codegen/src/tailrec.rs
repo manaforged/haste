@@ -299,22 +299,9 @@ fn clone_pure_insts(
 ) -> bool {
     for &inst in insts {
         let mut data = func.insts[inst.index()].clone();
-        if matches!(
-            data.op,
-            Op::Call { .. }
-                | Op::TryCall { .. }
-                | Op::Store(..)
-                | Op::StackStore(..)
-                | Op::Copy(..)
-                | Op::Move(..)
-                | Op::AtomicLoad(..)
-                | Op::AtomicStore(..)
-                | Op::AtomicRmw(..)
-                | Op::AtomicCas(..)
-                | Op::Fence(..)
-                | Op::Trap
-                | Op::Trapz(..)
-        ) {
+        if crate::mem::is_atomic_barrier(&data.op)
+            || matches!(data.op, Op::Call { .. } | Op::TryCall { .. } | Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..) | Op::Trap | Op::Trapz(..))
+        {
             return false;
         }
         let mut ok = true;

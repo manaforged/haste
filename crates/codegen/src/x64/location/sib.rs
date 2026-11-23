@@ -213,7 +213,7 @@ fn eval_uext_group(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)]
 pub(super) fn apply_sib_groups(
     func: &Function,
     plan: &mut Plan<Reg>,
-    (uses, pos_of, defs): (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    (uses, pos_of, defs): (&[u32], &[super::Site], &[Option<Inst>]),
     ls_uses: &[Vec<(usize, usize, i32)>],
 ) {
     for unscaled_only in [true, false] {
@@ -252,7 +252,7 @@ pub(super) fn double(ctx: &FuseCtx<'_>, root: Value, root_pos: usize) -> Option<
 }
 
 /// Elides each `Iadd`/`Isub` by an `i32` constant whose only uses are atomic-operation addresses in its own block, so `atomic_target` folds the displacement directly into the memory operand.
-pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>])) {
+pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[super::Site])) {
     let mut atomic_uses: Vec<(u32, usize, usize)> = vec![(0, usize::MAX, 0); func.types.len()];
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for (pos, &inst) in block.insts.iter().enumerate() {
@@ -303,7 +303,7 @@ pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, po
 pub(super) fn fuse_mem_rmw(
     func: &Function,
     plan: &mut Plan<Reg>,
-    (uses, pos_of, defs): (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    (uses, pos_of, defs): (&[u32], &[super::Site], &[Option<Inst>]),
 ) {
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for (spos, &sinst) in block.insts.iter().enumerate() {
@@ -361,7 +361,7 @@ pub(super) fn fuse_mem_rmw(
 pub(super) fn fuse_bt_shifts(
     func: &Function,
     plan: &mut Plan<Reg>,
-    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (uses, pos_of): (&[u32], &[super::Site]),
     tst_end: &[Option<usize>],
     pure_test: &[bool],
 ) {

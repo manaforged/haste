@@ -93,7 +93,7 @@ pub(super) fn shifted_bit_test(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value
             Some((w, k))
         })
     {
-        (w, k, if cc == IntCC::Equal { IntCC::NotEqual } else { IntCC::Equal }, None)
+        (w, k, cc.inverse(), None)
     } else {
         return None;
     };
@@ -166,10 +166,10 @@ pub(super) fn zero_compare(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) ->
         (IntCC::SignedGreaterThan, _, Some(c)) if c == umax => (x, IntCC::SignedGreaterThanOrEqual, None),
         (IntCC::SignedLessThan, Some(c), _) if c == umax => (y, IntCC::SignedGreaterThanOrEqual, None),
         (IntCC::Equal | IntCC::NotEqual, _, Some(k)) if k.is_power_of_two() && ((cx.known(x).0 & umax) | k) == umax => {
-            (x, if cc == IntCC::Equal { IntCC::NotEqual } else { IntCC::Equal }, None)
+            (x, cc.inverse(), None)
         }
         (IntCC::Equal | IntCC::NotEqual, Some(k), _) if k.is_power_of_two() && ((cx.known(y).0 & umax) | k) == umax => {
-            (y, if cc == IntCC::Equal { IntCC::NotEqual } else { IntCC::Equal }, None)
+            (y, cc.inverse(), None)
         }
         _ => return None,
     };

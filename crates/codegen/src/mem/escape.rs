@@ -113,14 +113,8 @@ fn is_unknown_mem_op(op: &Op, slots: &[Option<(StackSlot, i32)>], tracked: &[Tra
     match *op {
         Op::Load(addr, _) | Op::Store(_, addr, _) => !known(addr),
         Op::Move(dst, src, _) | Op::Copy(dst, src, _) => !known(dst) || !known(src),
-        Op::Call { .. }
-        | Op::TryCall { .. }
-        | Op::AtomicLoad(..)
-        | Op::AtomicStore(..)
-        | Op::AtomicRmw(..)
-        | Op::AtomicCas(..)
-        | Op::Fence(..) => true,
-        _ => false,
+        Op::Call { .. } | Op::TryCall { .. } => true,
+        _ => super::is_atomic_barrier(op),
     }
 }
 

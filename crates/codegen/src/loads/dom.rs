@@ -123,20 +123,10 @@ impl<'a> BlockWrites<'a> {
         let mut writes = vec![Vec::new(); func.blocks.len()];
         for (b_idx, block) in func.blocks.iter().enumerate() {
             for &inst in &block.insts {
-                if matches!(
-                    func.insts[inst.index()].op,
-                    Op::Store(..)
-                        | Op::StackStore(..)
-                        | Op::Copy(..)
-                        | Op::Move(..)
-                        | Op::AtomicLoad(..)
-                        | Op::AtomicStore(..)
-                        | Op::AtomicRmw(..)
-                        | Op::AtomicCas(..)
-                        | Op::Fence(..)
-                        | Op::Call { .. }
-                        | Op::TryCall { .. }
-                ) {
+                let op = &func.insts[inst.index()].op;
+                if is_atomic_barrier(op)
+                    || matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. })
+                {
                     writes[b_idx].push(inst);
                 }
             }

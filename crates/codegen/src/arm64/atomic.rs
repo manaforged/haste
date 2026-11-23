@@ -1,6 +1,6 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, IP, S, T};
-use crate::ir::{AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
+use crate::ir::{AtomicOrd, AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
@@ -109,9 +109,9 @@ impl Emit<'_> {
             Op::StackLoad(slot, offset) => self.read(result()?, self.slot(*slot, *offset)),
             Op::StackStore(value, slot, offset) => self.write(*value, self.slot(*slot, *offset)),
             Op::Fence(ord) => match ord {
-                crate::ir::AtomicOrd::Relaxed => {}
-                crate::ir::AtomicOrd::Acquire => self.asm.dmb_ld(),
-                crate::ir::AtomicOrd::Isb => self.asm.word(0xD503_3FDF),
+                AtomicOrd::Relaxed => {}
+                AtomicOrd::Acquire => self.asm.dmb_ld(),
+                AtomicOrd::Isb => self.asm.word(0xD503_3FDF),
                 _ => self.asm.dmb(),
             },
             Op::FramePointer => self.put(result()?, FP),
@@ -576,7 +576,7 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn lse_rmw(&mut self, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, size: Size, addr: Value, value: Value, result: Value) {
+    fn lse_rmw(&mut self, op: AtomicRmwOp, ord: AtomicOrd, size: Size, addr: Value, value: Value, result: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let at = self.bits(addr, C);
         let val = match (op, self.plan.const_of(value)) {
@@ -617,7 +617,7 @@ impl Emit<'_> {
         }
     }
 
-    fn lse_cas(&mut self, ord: crate::ir::AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value), result: Value) {
+    fn lse_cas(&mut self, ord: AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value), result: Value) {
         let at = self.bits(addr, C);
         let dst = self.dst(result);
         let rep_reg = self.plan.reg_of(replacement);
@@ -628,7 +628,7 @@ impl Emit<'_> {
         self.put(result, old);
     }
 
-    fn rmw(&mut self, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, size: Size, addr: Value, value: Value) {
+    fn rmw(&mut self, op: AtomicRmwOp, ord: AtomicOrd, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
@@ -669,7 +669,7 @@ impl Emit<'_> {
         self.asm.cbz(true, Size::W, T, again);
     }
 
-    fn cas(&mut self, ord: crate::ir::AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
+    fn cas(&mut self, ord: AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
         self.zext_get(D, expected);

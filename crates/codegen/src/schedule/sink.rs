@@ -359,12 +359,7 @@ fn factor_bitwise(func: &mut Function, balance: bool) {
 }
 
 fn has_mem_or_trap(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. }
-            | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..)
-            | Op::Trap | Op::Trapz(..) | Op::Assume(..) | Op::Binary(Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem, ..)
-    )
+    crate::mem::is_hard_barrier(op) || matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..))
 }
 
 fn barrier_prefix(func: &Function, insts: &[Inst]) -> Vec<u32> {

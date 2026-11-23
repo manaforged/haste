@@ -15,7 +15,7 @@ pub(super) struct FuseCtx<'a> {
     pub(super) func: &'a Function,
     pub(super) plan: &'a Plan<Reg>,
     pub(super) uses: &'a [u32],
-    pub(super) pos_of: &'a [Option<(usize, usize, Inst)>],
+    pub(super) pos_of: &'a [super::Site],
     pub(super) defs: &'a [Option<Inst>],
     pub(super) b_idx: usize,
 }
@@ -32,7 +32,7 @@ fn zero_cmp_band(
     func: &Function,
     plan: &Plan<Reg>,
     uses: &[u32],
-    pos_of: &[Option<(usize, usize, Inst)>],
+    pos_of: &[super::Site],
     b_idx: usize,
     lhs: Value,
     rhs: Value,
@@ -153,7 +153,7 @@ fn cmp_operand_ok(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], cpos: usize, las
 fn push_branch_tst(
     func: &Function,
     plan: &Plan<Reg>,
-    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (uses, pos_of): (&[u32], &[super::Site]),
     (b_idx, pos, cond_val): (usize, usize, Value),
     out: &mut Vec<(usize, Value, Option<Value>)>,
 ) {
@@ -216,7 +216,7 @@ fn select_leaf_ok(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], (pos, skip): (us
 fn apply_select_at(
     func: &Function,
     plan: &mut Plan<Reg>,
-    (uses, pos_of, defs): (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    (uses, pos_of, defs): (&[u32], &[super::Site], &[Option<Inst>]),
     (b_idx, pos, inst): (usize, usize, Inst),
     (tst_end, roots): (&mut [Option<usize>], &mut [Option<Root>]),
 ) {
@@ -253,7 +253,7 @@ fn apply_select_at(
 fn apply_select_trees(
     func: &Function,
     plan: &mut Plan<Reg>,
-    tables: (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    tables: (&[u32], &[super::Site], &[Option<Inst>]),
     tst_end: &mut [Option<usize>],
     roots: &mut [Option<Root>],
 ) {
