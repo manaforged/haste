@@ -428,19 +428,62 @@ struct DupJoinPlan {
     repairs: Vec<(Block, SsaRepairPlan)>,
 }
 
-fn pred_forwards_join_load(func: &Function, pred: Block, join: Block, args: &[Value]) -> bool {
-    let params = &func.blocks[join.index()].params;
-    let mut wanted: Vec<(Value, i32)> = Vec::new();
-    for &inst in &func.blocks[join.index()].insts {
+fn collect_param_loads(func: &Function, blk: Block, params: &[Value], mapped: &[Value], out: &mut Vec<(Value, i32)>) -> bool {
+    for &inst in &func.blocks[blk.index()].insts {
         match func.insts[inst.index()].op {
             Op::Load(addr, off) => {
                 if let Some(pos) = params.iter().position(|&p| p == addr) {
-                    wanted.push((args[pos], off));
+                    out.push((mapped[pos], off));
                 }
             }
             Op::Call { .. } | Op::TryCall { .. } => return false,
             ref op if crate::mem::is_atomic_barrier(op) => return false,
             _ => {}
+        }
+    }
+    true
+}
+
+fn pred_forwards_join_load(func: &Function, pred: Block, join: Block, args: &[Value]) -> bool {
+    let params = &func.blocks[join.index()].params;
+    let mut wanted: Vec<(Value, i32)> = Vec::new();
+    if !collect_param_loads(func, join, params, args, &mut wanted) {
+        return false;
+    }
+    if wanted.is_empty()
+        && func.blocks[join.index()].insts.len() <= 4
+        && let Some(Op::Jump(next, next_args)) = func.last(join)
+        && *next != join
+        && *next != pred
+        && func.blocks[next.index()].insts.len() <= 12
+    {
+        let next_params = &func.blocks[next.index()].params;
+        if next_params.len() == next_args.len() {
+            let mut next_wanted = Vec::new();
+            for &inst in &func.blocks[next.index()].insts {
+                match func.insts[inst.index()].op {
+                    Op::Load(addr, off) => {
+                        if let Some(np) = next_params.iter().position(|&p| p == addr)
+                            && let Some(jp) = params.iter().position(|&p| p == next_args[np])
+                        {
+                            next_wanted.push((params[jp], args[jp], off));
+                        }
+                    }
+                    Op::Call { .. } | Op::TryCall { .. } => return false,
+                    ref op if crate::mem::is_atomic_barrier(op) => return false,
+                    _ => {}
+                }
+            }
+            for (jparam, parg, off) in next_wanted {
+                let overwritten = func.blocks[join.index()].insts.iter().any(|&i| match func.insts[i.index()].op {
+                    Op::Store(_, a, o) => a == jparam && o == off,
+                    Op::Copy(..) | Op::Move(..) => true,
+                    _ => false,
+                });
+                if !overwritten {
+                    wanted.push((parg, off));
+                }
+            }
         }
     }
     if wanted.is_empty() {
@@ -462,7 +505,8 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
     for at in 0..func.blocks.len() {
         let join = Block(at as u32);
         let jdata = &func.blocks[at];
-        if !cfg.reachable[at] || jdata.params.is_empty() || jdata.insts.len() > 12 || cfg.preds_of(join).len() != 2 {
+        let npreds = cfg.preds_of(join).len();
+        if !cfg.reachable[at] || jdata.params.is_empty() || jdata.insts.len() > 12 || !(2..=4).contains(&npreds) {
             continue;
         }
         let Some(&last) = jdata.insts.last() else { continue };
@@ -483,8 +527,7 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
         let mut ssa_ok = true;
         for &t in &succs {
             if !cfg.dominates(join, t) {
-                ssa_ok = false;
-                break;
+                continue;
             }
             let Some(ssa) = plan_ssa_joins(func, &cfg, join, t, &[], &own_vals) else {
                 ssa_ok = false;
@@ -565,7 +608,7 @@ pub(super) fn run(func: &mut Function) -> bool {
         apply_plan(func, plan);
         any = true;
     }
-    for _ in 0..2 {
+    for _ in 0..4 {
         let Some(plan) = find_forwarding_join(func) else { break };
         apply_forwarding_join(func, plan);
         any = true;
