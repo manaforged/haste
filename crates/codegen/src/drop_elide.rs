@@ -160,9 +160,87 @@ impl Function {
                     || unwind_flag_live_at_call(self, &defs, &kinds, entry, u.flag)
             })
             .collect();
+        let folded = fold_known_flag_loads(self, entry, (&defs, &kinds, &slot_escaped, &mut slot_loaded));
         let narrowed = narrow_unwind_drops(self, entry, (&defs, &kinds, &slot_escaped, &slot_loaded));
-        self.unwind_drops.len() != before || narrowed
+        self.unwind_drops.len() != before || folded || narrowed
     }
+}
+
+fn fold_known_flag_loads(
+    func: &mut Function,
+    entry: Block,
+    (defs, kinds, slot_escaped, slot_loaded): (&[Option<Inst>], &[CalleeKind], &[bool], &mut [bool]),
+) -> bool {
+    let nslots = func.slots.len();
+    let mut is_flag = vec![false; nslots];
+    let mut flags = Vec::new();
+    for u in &func.unwind_drops {
+        let fi = u.flag.index();
+        if fi < nslots && !is_flag[fi] && !slot_escaped[fi] && slot_loaded[fi] {
+            is_flag[fi] = true;
+            flags.push(u.flag);
+        }
+    }
+    if flags.is_empty() {
+        return false;
+    }
+    let mut exact = vec![true; nslots];
+    let mut loads: Vec<Vec<Inst>> = vec![Vec::new(); nslots];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            match data.op {
+                Op::StackStore(v, slot, off) if slot.index() < nslots && is_flag[slot.index()] => {
+                    if off != 0 || func.ty(v) != crate::Type::I8 || !matches!(def_op(func, defs, v), Some(&Op::Const(0 | 1))) {
+                        exact[slot.index()] = false;
+                    }
+                }
+                Op::StackLoad(slot, off) if slot.index() < nslots && is_flag[slot.index()] => {
+                    if off != 0 || !data.result.is_some_and(|r| func.ty(r) == crate::Type::I8) {
+                        exact[slot.index()] = false;
+                    } else {
+                        loads[slot.index()].push(inst);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut changed = false;
+    let mut load_state = vec![0u8; func.insts.len()];
+    for flag in flags {
+        let fi = flag.index();
+        if !exact[fi] || loads[fi].is_empty() {
+            continue;
+        }
+        for &inst in &loads[fi] {
+            load_state[inst.index()] = 0;
+        }
+        walk_flag_cfg(func, defs, kinds, entry, flag, |ev| {
+            if let FlagEvent::Load(inst, active) = ev {
+                load_state[inst.index()] |= if active { 2 } else { 1 };
+            }
+            false
+        });
+        let mut remaining = false;
+        for &inst in &loads[fi] {
+            match load_state[inst.index()] {
+                1 => {
+                    func.insts[inst.index()].op = Op::Const(0);
+                    changed = true;
+                }
+                2 => {
+                    func.insts[inst.index()].op = Op::Const(1);
+                    changed = true;
+                }
+                _ => remaining = true,
+            }
+        }
+        if !remaining {
+            slot_loaded[fi] = false;
+        }
+    }
+    changed
 }
 
 fn narrow_unwind_drops(
@@ -305,6 +383,7 @@ enum FlagEvent {
     Call(Inst, bool),
     TryCall(bool),
     Clear(Inst, bool),
+    Load(Inst, bool),
 }
 
 fn walk_flag_cfg(
@@ -332,6 +411,11 @@ fn walk_flag_cfg(
                         return true;
                     }
                 }
+                &Op::StackLoad(s, 0) if s == flag => {
+                    if on_event(FlagEvent::Load(inst, active)) {
+                        return true;
+                    }
+                }
                 &Op::StackStore(v, s, 0) if s == flag => {
                     if store_clears_active(func, defs, v) {
                         if on_event(FlagEvent::Clear(inst, active)) {
@@ -354,6 +438,16 @@ fn walk_flag_cfg(
         }
         let bit = if active { 2 } else { 1 };
         if let Some(last) = func.last(block) {
+            if let Op::Brif(cond, then, _, otherwise, _) = *last
+                && let Some(&Op::Const(imm)) = def_op(func, defs, cond)
+            {
+                let target = if crate::fold::extend(imm, func.ty(cond), false) != 0 { then } else { otherwise };
+                if visited[target.index()] & bit == 0 {
+                    visited[target.index()] |= bit;
+                    work.push((target, active));
+                }
+                continue;
+            }
             for target in last.targets() {
                 if visited[target.index()] & bit == 0 {
                     visited[target.index()] |= bit;
@@ -381,6 +475,7 @@ fn analyze_flag(
             FlagEvent::Call(inst, active) => call_state[inst.index()] |= bit(active),
             FlagEvent::TryCall(active) => try_active |= active,
             FlagEvent::Clear(inst, active) => clear_state[inst.index()] |= bit(active),
+            FlagEvent::Load(..) => {}
         }
         false
     });
