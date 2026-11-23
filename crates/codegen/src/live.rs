@@ -39,7 +39,7 @@ fn cold_with(func: &Function, cfg: &Cfg) -> Vec<bool> {
     cold
 }
 
-fn has_regular_call(func: &Function, block: Block) -> bool {
+pub(crate) fn has_regular_call(func: &Function, block: Block) -> bool {
     func.blocks[block.index()].insts.iter().any(|&inst| match &func.insts[inst.index()].op {
         Op::Call { callee, .. } | Op::TryCall { callee, .. } => !func.is_thread_cell(*callee),
         _ => false,

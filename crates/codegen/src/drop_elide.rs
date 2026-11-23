@@ -238,7 +238,7 @@ fn sink_entry_zeros(
         }
         let Some(zinst) = first[fi] else { continue };
         let Op::StackStore(val, flag, 0) = func.insts[zinst.index()].op else { continue };
-        let Some(frontier) = plan_entry_zero_sink(func, &cfg, &kinds, depths, (entry, flag, zinst)) else { continue };
+        let Some(frontier) = plan_entry_zero_sink(func, &cfg, &defs, &kinds, depths, (entry, flag, zinst)) else { continue };
         remove.push(zinst);
         for t in frontier {
             insert.push((t, val, flag));
@@ -521,7 +521,8 @@ fn narrow_unwind_drops(
                         && local_write_only[li]
                         && !local_stores[li].is_empty()
                         && local_stores[li].len() <= 2
-                        && frontier.len() <= 2
+                        && (frontier.len() <= 2
+                            || local_stores[li].iter().all(|&(_, _, val, _)| matches!(def_op(func, defs, val), Some(Op::Const(_) | Op::StackAddr(..)))))
                         && local_stores[li].iter().all(|&(lb, ..)| lb == sb)
                     {
                         for &(_, linst, val, off) in &local_stores[li] {

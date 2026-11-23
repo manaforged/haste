@@ -194,10 +194,10 @@ pub(super) fn plan_flag_sink(
             }
         }
     }
-    sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b, 4), &mut in_r).or_else(|| {
+    sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b, 8), &mut in_r).or_else(|| {
         let mut solo = vec![false; n];
         solo[b.index()] = true;
-        sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b, 4), &mut solo)
+        sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b, 8), &mut solo)
     })
 }
 
@@ -312,9 +312,42 @@ pub(super) fn plan_local_sink(
     sink_frontier(func, cfg, depths, (&live_in, None, b), &mut in_r)
 }
 
+fn flag_always_zero(func: &Function, defs: &[Option<Inst>], entry: Block, flag: StackSlot) -> Vec<bool> {
+    let n = func.blocks.len();
+    let (mut in_state, mut out_state) = (vec![0u8; n], vec![0u8; n]);
+    in_state[entry.index()] = 1;
+    let mut work = vec![(entry, false)];
+    while let Some((block, mut active)) = work.pop() {
+        let mut stopped = false;
+        for &inst in &func.blocks[block.index()].insts {
+            match func.insts[inst.index()].op {
+                Op::StackStore(v, s, 0) if s == flag => active = !store_clears_active(func, defs, v),
+                Op::Return(..) | Op::Trap => {
+                    stopped = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if stopped {
+            continue;
+        }
+        let bit = if active { 2 } else { 1 };
+        out_state[block.index()] |= bit;
+        for target in func.successors(block) {
+            if in_state[target.index()] & bit == 0 {
+                in_state[target.index()] |= bit;
+                work.push((target, active));
+            }
+        }
+    }
+    (0..n).map(|bi| in_state[bi] == 1 && out_state[bi] == 1).collect()
+}
+
 pub(super) fn plan_entry_zero_sink(
     func: &Function,
     cfg: &Cfg,
+    defs: &[Option<Inst>],
     kinds: &[CalleeKind],
     depths: &[u32],
     (entry, flag, zinst): (Block, StackSlot, Inst),
@@ -380,6 +413,8 @@ pub(super) fn plan_entry_zero_sink(
     if !func.successors(entry).any(|s| live_in[s.index()]) {
         return Some(Vec::new());
     }
+    let always_zero = flag_always_zero(func, defs, entry, flag);
+    let has_call: Vec<bool> = (0..n).map(|bi| block_has_unwind_call(func, kinds, Block(bi as u32))).collect();
     let (mut in_r, mut work) = (vec![false; n], vec![entry]);
     in_r[entry.index()] = true;
     while let Some(u) = work.pop() {
@@ -391,5 +426,5 @@ pub(super) fn plan_entry_zero_sink(
             }
         }
     }
-    sink_frontier_with_calls(func, cfg, depths, (&live_in, None, None, entry, 8), &mut in_r)
+    sink_frontier_with_calls(func, cfg, depths, (&live_in, Some(&always_zero), Some(&has_call), entry, 4), &mut in_r)
 }

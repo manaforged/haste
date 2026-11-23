@@ -325,14 +325,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
-                self.carry_spills(args.is_empty());
-                self.invalidate_spills();
                 emit_goto(self, *block, true);
+                self.carry_spills(self.next == Some(*block));
+                self.invalidate_spills();
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
-                self.carry_spills(then_args.is_empty() && else_args.is_empty());
+                self.carry_spills(then != otherwise && (self.next == Some(*then) || self.next == Some(*otherwise)));
                 self.invalidate_spills();
                 res
             }

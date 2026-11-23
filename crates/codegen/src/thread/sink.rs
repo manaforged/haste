@@ -322,7 +322,16 @@ fn diamond_safe(func: &Function, cfg: &Cfg, (block, target): (Block, Block), (op
     base >= 6 || base + queued.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count() < 6
 }
 
-fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Block)], (op, moves): (&Op, &[Vec<Inst>])) -> Option<Block> {
+fn cheap_call_addr(func: &Function, defs: &[Option<Inst>], op: &Op) -> bool {
+    let is_const = |v: Value| defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_)));
+    match *op {
+        Op::StackAddr(..) => true,
+        Op::Binary(crate::ir::Binary::Iadd | crate::ir::Binary::Isub, a, b) => is_const(a) || is_const(b),
+        _ => false,
+    }
+}
+
+fn pick_sink_target(func: &Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, block: Block, sites: &[(Inst, Block)], (op, moves): (&Op, &[Vec<Inst>])) -> Option<Block> {
     let mut lca = sites.first()?.1;
     for &(_, site) in sites {
         if !cfg.reachable[site.index()] {
@@ -333,8 +342,14 @@ fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Bl
         }
     }
     let mut target = lca;
-    while target != block && !loops_subset(cfg.loops(), target, block) {
-        target = cfg.idom[target.index()]?;
+    if !(target != block
+        && !loops_subset(cfg.loops(), target, block)
+        && defs.is_some_and(|d| cheap_call_addr(func, d, op))
+        && crate::live::has_regular_call(func, target))
+    {
+        while target != block && !loops_subset(cfg.loops(), target, block) {
+            target = cfg.idom[target.index()]?;
+        }
     }
     if target == block || !cfg.dominates(block, target) {
         return None;
@@ -366,7 +381,7 @@ fn flush_moves(func: &mut Function, block: Block, moves: &mut Vec<Inst>) {
     func.blocks[block.index()].insts = next;
 }
 
-fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, has_child: bool, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
+fn sink_block(func: &mut Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, block: Block, has_child: bool, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
     flush_moves(func, block, &mut moves[block.index()]);
     if !has_child {
         return false;
@@ -385,7 +400,7 @@ fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, has_child: bool, use
         if !data.op.is_speculable() {
             continue;
         }
-        let Some(target) = pick_sink_target(func, cfg, block, &users[res.index()], (&data.op, moves)) else {
+        let Some(target) = pick_sink_target(func, cfg, defs, block, &users[res.index()], (&data.op, moves)) else {
             continue;
         };
         if kept.is_empty() {
@@ -451,11 +466,12 @@ fn sink_dominated(func: &mut Function) -> bool {
     if !any_spec {
         return false;
     }
+    let defs = (!cfg.loops().list.is_empty()).then(|| crate::fold::defs(func));
     let mut users = build_users(func, &spec_def);
     let mut moves = vec![Vec::new(); func.blocks.len()];
     let mut changed = false;
     for &block in &cfg.rpo {
-        changed |= sink_block(func, &cfg, block, has_child[block.index()], &mut users, &mut moves);
+        changed |= sink_block(func, &cfg, defs.as_deref(), block, has_child[block.index()], &mut users, &mut moves);
     }
     changed
 }

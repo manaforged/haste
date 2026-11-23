@@ -89,7 +89,6 @@ impl Emit<'_> {
     pub(super) fn resume_spills(&mut self, block: Block) {
         if let (Some(from), Some(cache)) = self.carry
             && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
-            && self.func.blocks[block.index()].params.is_empty()
         {
             self.last_spill = cache;
         }
