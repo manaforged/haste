@@ -93,7 +93,7 @@ fn sink_frontier_with_calls(
     let n = func.blocks.len();
     let mut members: Vec<Block> = in_r.iter().enumerate().filter_map(|(bi, &m)| m.then_some(Block(bi as u32))).collect();
     loop {
-        let mut pruned = false;
+        let before = members.len();
         members.retain(|&blk| {
             let bi = blk.index();
             if bi == b.index() {
@@ -106,13 +106,13 @@ fn sink_frontier_with_calls(
             });
             let bad_succ = func.successors(blk).any(|s| !in_r[s.index()] && live_in[s.index()] && !target_ok(cfg, depths, always_active, call_in_loop, b, in_r, s));
             if bad_pred || bad_succ {
-                (in_r[bi], pruned) = (false, true);
+                in_r[bi] = false;
                 false
             } else {
                 true
             }
         });
-        if !pruned {
+        if members.len() == before {
             break;
         }
     }

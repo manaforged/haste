@@ -83,7 +83,7 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
     let mut compilation = Compilation { outline, names, expander: None, substrate };
     for (krate, &on) in selected.iter().enumerate() {
         if on {
-            compilation.names.crates[krate].eager = true;
+            compilation.names.crates[krate].set_eager();
         }
     }
     resolve(&mut compilation)?;
@@ -439,7 +439,7 @@ fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Resul
     compilation.outline.load_selected(&selected)?;
     for (krate, &on) in selected.iter().enumerate() {
         if on {
-            compilation.names.crates[krate].eager = true;
+            compilation.names.crates[krate].set_eager();
         }
     }
     compilation.names.resolve(&mut compilation.outline)
