@@ -45,8 +45,11 @@ impl<'a> Context<'a> {
 
     /// The `#[repr]` options of `item`, written directly or through a `cfg_attr` that holds.
     pub fn repr(&self, item: ItemRef) -> ReprOptions {
+        let (src, entry) = self.item(item);
+        if entry.attrs.is_empty() {
+            return ReprOptions::default();
+        }
         self.store.lookups.reprs.get_or_insert_with(item, || {
-            let (src, entry) = self.item(item);
             let mut repr = ReprOptions::default();
             read_repr_words(src, repr_words(src, &entry.attrs, &self.outline.crates[item.krate as usize].env), &mut repr);
             repr
@@ -147,18 +150,31 @@ impl<'a> Context<'a> {
 
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
     pub(super) fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
+        let (src, entry) = self.item(item);
+        if entry.attrs.is_empty() {
+            return None;
+        }
+        if item.outer().is_none() {
+            let bit = mark(key);
+            if bit != 0 {
+                let marks = &self.file(item).items.marks;
+                if !marks.binary_search_by_key(&item.item, |(at, _)| *at).is_ok_and(|pos| marks[pos].1 & bit != 0) {
+                    return None;
+                }
+            }
+        }
+        if !entry.attrs.iter().any(|attr| matches!(attr, Attr::CfgAttr(..))) {
+            return entry.attrs.iter().find_map(|attr| match *attr {
+                Attr::Other(at) if src.text(at) == key => Some(at),
+                _ => None,
+            });
+        }
         let active = self.store.lookups.attrs.get_or_insert_with(item, || {
-            let entry = self.item(item).1;
             let mut out = Vec::new();
             collect_active_attrs(&self.outline.crates[item.krate as usize].env, &entry.attrs, &mut out);
             ActiveAttrs::from_vec(out)
         });
-        let slice = active.as_slice();
-        if slice.is_empty() {
-            return None;
-        }
-        let src = self.item(item).0;
-        slice.iter().copied().find(|&at| src.text(at) == key)
+        active.as_slice().iter().copied().find(|&at| src.text(at) == key)
     }
 
     /// The layout of the struct, enum or union `item` at `args`.

@@ -103,25 +103,6 @@ impl<K, V> Table<K, V> {
             write_lock(&shard.0).retain(&mut keep);
         }
     }
-
-    /// A new table holding clones of the entries for which `keep` holds.
-    pub fn retained(&self, mut keep: impl FnMut(&K, &V) -> bool) -> Self
-    where
-        K: Clone + Eq + Hash,
-        V: Clone,
-    {
-        let out = Self::default();
-        for (index, shard) in self.shards.iter().enumerate() {
-            let guard = read_lock(&shard.0);
-            let mut target = write_lock(&out.shards[index].0);
-            for (key, value) in guard.iter() {
-                if keep(key, value) {
-                    target.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        out
-    }
 }
 
 enum SlotState<V> {
@@ -190,6 +171,10 @@ impl<K, V> Drop for WaitGuard<'_, K, V> {
 }
 
 impl<K, V> Flight<K, V> {
+    pub(super) fn clear(&self) {
+        self.inner.slots.clear();
+    }
+
     pub(super) fn retain(&self, mut keep: impl FnMut(&K) -> bool) {
         self.inner.slots.retain(|key, _| keep(key));
     }

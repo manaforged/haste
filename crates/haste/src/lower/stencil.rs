@@ -678,7 +678,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         if func.is_coroutine() {
             haste_codegen::split_coroutine(&mut func);
         }
-        if !func.unwind_drops().is_empty() {
+        if !func.unwind_drops().is_empty() && (!reached.is_incremental() || slots.allow_inline()) {
             simplify_tallied(&mut func, Tally::Built);
             let mut sym_may_unwind = |sym: u32| match relocs.get(sym as usize) {
                 Some(SymbolSource::Slot(idx)) => reached.may_unwind(cx, *idx),

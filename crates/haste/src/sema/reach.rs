@@ -65,6 +65,7 @@ pub struct Reached {
     catch_unwind_state: AtomicUsize,
     catch_unwind_cache: Mutex<CatchUnwindCache>,
     may_unwind_cache: RwLock<Option<(usize, Vec<bool>)>>,
+    incremental: bool,
 }
 
 fn is_thread_spawn_name(name: &str, src: &crate::outline::source::Source) -> bool {
@@ -136,8 +137,21 @@ impl Reached {
         false
     }
 
+    /// Marks this reach graph as incrementally grown (lazy JIT), skipping whole-graph unwind fixed-point scans.
+    pub fn set_incremental(&mut self, incremental: bool) {
+        self.incremental = incremental;
+    }
+
+    /// Whether this reach graph grows incrementally during lazy JIT execution.
+    pub fn is_incremental(&self) -> bool {
+        self.incremental
+    }
+
     /// Whether reached function `index` may unwind directly or transitively through any reachable call.
     pub fn may_unwind(&self, cx: &mut Context<'_>, index: usize) -> bool {
+        if self.incremental {
+            return true;
+        }
         let len = self.list.len();
         if index >= len {
             return true;

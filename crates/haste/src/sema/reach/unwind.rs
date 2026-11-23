@@ -80,16 +80,39 @@ fn has_indirect_call(cx: &mut Context<'_>, source: ItemRef, overflow_checks: boo
     false
 }
 
-fn direct_may_unwind(cx: &mut Context<'_>, reached: &Reached, index: usize, body_cache: &mut FxHashMap<(ItemRef, bool), BodyScan>) -> bool {
+#[derive(Clone, Copy)]
+enum ItemUnwind {
+    Normal,
+    Intrinsic(bool),
+    Foreign(bool),
+}
+
+fn item_unwind(cx: &Context<'_>, item: ItemRef, cache: &mut FxHashMap<ItemRef, ItemUnwind>) -> ItemUnwind {
+    *cache.entry(item).or_insert_with(|| {
+        if let Some(intr) = cx.intrinsic(item) {
+            ItemUnwind::Intrinsic(intrinsic_may_unwind(intr))
+        } else if cx.foreign(item) {
+            ItemUnwind::Foreign(foreign_may_unwind(cx, item))
+        } else {
+            ItemUnwind::Normal
+        }
+    })
+}
+
+fn direct_may_unwind(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    index: usize,
+    body_cache: &mut FxHashMap<(ItemRef, bool), BodyScan>,
+    item_cache: &mut FxHashMap<ItemRef, ItemUnwind>,
+) -> bool {
     let Some(((item, substs), res)) = reached.list.get(index) else {
         return true;
     };
     let item = *item;
-    if let Some(intr) = cx.intrinsic(item) {
-        return intrinsic_may_unwind(intr);
-    }
-    if cx.foreign(item) {
-        return foreign_may_unwind(cx, item);
+    match item_unwind(cx, item, item_cache) {
+        ItemUnwind::Intrinsic(u) | ItemUnwind::Foreign(u) => return u,
+        ItemUnwind::Normal => {}
     }
     let Ok(typed) = res else {
         return true;
@@ -120,17 +143,10 @@ fn direct_may_unwind(cx: &mut Context<'_>, reached: &Reached, index: usize, body
         }
     }
     for (callee, csubsts) in typed.calls() {
-        if let Some(intr) = cx.intrinsic(callee) {
-            if intrinsic_may_unwind(intr) {
-                return true;
-            }
-            continue;
-        }
-        if cx.foreign(callee) {
-            if foreign_may_unwind(cx, callee) {
-                return true;
-            }
-            continue;
+        match item_unwind(cx, callee, item_cache) {
+            ItemUnwind::Intrinsic(true) | ItemUnwind::Foreign(true) => return true,
+            ItemUnwind::Intrinsic(false) | ItemUnwind::Foreign(false) => continue,
+            ItemUnwind::Normal => {}
         }
         if !reached.index.contains_key(&(callee, csubsts)) {
             return true;
@@ -144,6 +160,7 @@ pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec
     let mut may_unwind = vec![false; n];
     let mut rev: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut body_cache = FxHashMap::default();
+    let mut item_cache = FxHashMap::default();
     let mut work = Vec::new();
     for u in 0..n {
         if let Some(callees) = reached.calls.get(u).filter(|c| !c.is_empty()) {
@@ -159,7 +176,7 @@ pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec
                 }
             }
         }
-        if direct_may_unwind(cx, reached, u, &mut body_cache) {
+        if direct_may_unwind(cx, reached, u, &mut body_cache, &mut item_cache) {
             may_unwind[u] = true;
             work.push(u);
         }

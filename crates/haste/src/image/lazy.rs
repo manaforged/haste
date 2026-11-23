@@ -156,7 +156,8 @@ impl Jit {
     }
 
     fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
-        let reached = Reached::default();
+        let mut reached = Reached::default();
+        reached.set_incremental(true);
         let mut image = Image::create(&reached, super::ImageMode::Jit, (shared_bytes, state_bytes, table_slots))?;
         image.backend = super::ImageBackend::LazyJit { fast: false };
         image.stubs.reserve(table_slots * stub::STUB_BYTES)?;
@@ -624,6 +625,11 @@ impl Jit {
         if let super::ImageBackend::EagerJit { fast: f } | super::ImageBackend::LazyJit { fast: f } = &mut self.image.backend {
             *f = fast;
         }
+    }
+
+    /// Configures whether each stub ask speculatively compiles reachable callees ahead of their first call.
+    pub(crate) fn set_ahead(&mut self, ahead: bool) {
+        self.ahead = ahead;
     }
 
     /// Declares and infers the functions `wanted`, and returns their indexes.

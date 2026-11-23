@@ -155,40 +155,19 @@ impl Lookups {
     }
 
     fn reset_after_names(&mut self, outline: &Outline) {
-        let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
-        let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
-        let projections = self.projections.retained(|_, found| found.is_some());
-        *self = Lookups {
-            modules: std::mem::take(&mut self.modules),
-            heads,
-            owners: std::mem::take(&mut self.owners),
-            trait_defs: std::mem::take(&mut self.trait_defs),
-            discriminants: std::mem::take(&mut self.discriminants),
-            reprs: std::mem::take(&mut self.reprs),
-            attrs: std::mem::take(&mut self.attrs),
-            state: Arc::clone(&self.state),
-            drops: std::mem::take(&mut self.drops),
-            unpins: std::mem::take(&mut self.unpins),
-            freezes: std::mem::take(&mut self.freezes),
-            glues: std::mem::take(&mut self.glues),
-            fields: std::mem::take(&mut self.fields),
-            forms: self.forms.retained(|_, found| found.is_some()),
-            futures: std::mem::take(&mut self.futures),
-            scope_traits: self.scope_traits.retained(|home, _| outline.is_fixed(home.krate)),
-            impl_traits: std::mem::take(&mut self.impl_traits),
-            selections,
-            projections,
-            summaries: std::mem::take(&mut self.summaries),
-            verdicts: std::mem::take(&mut self.verdicts),
-            fresh_summaries: std::mem::take(&mut self.fresh_summaries),
-            fresh_instances: std::mem::take(&mut self.fresh_instances),
-            has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
-            has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
-            substrate: self.substrate.clone(),
-            file_index: Arc::clone(&self.file_index),
-            skip_warm_sysroot_bodies: self.skip_warm_sysroot_bodies,
-            ..Lookups::default()
-        };
+        self.heads.retain(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
+        self.selections.retain(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
+        self.projections.retain(|_, found| found.is_some());
+        self.forms.retain(|_, found| found.is_some());
+        self.scope_traits.retain(|home, _| outline.is_fixed(home.krate));
+        self.reveals.clear();
+        self.provisional_rets.clear();
+        self.type_defs.clear();
+        self.trait_calls.clear();
+        self.assoc_types.clear();
+        if self.lang_items.get().is_some() {
+            self.lang_items = Arc::new(std::sync::OnceLock::new());
+        }
     }
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
