@@ -8,7 +8,7 @@ use rustc_index::{Idx, IndexVec};
 
 use crate::names::{ItemRef, Primitive};
 use crate::outline::attr::{repr_words, split_commas};
-use crate::outline::item::{Attr, ItemKind, MARK_CFG_ATTR, mark};
+use crate::outline::item::{Attr, ItemKind, MARK_CFG_ATTR, MARK_INLINE_SPEC, mark};
 use crate::outline::source::Source;
 use crate::outline::tree::{Env, Truth};
 
@@ -105,6 +105,23 @@ impl<'a> Context<'a> {
         let Some(at) = self.attr_at(item, "link_name") else { return entry.name.map(|at| src.text(at).to_owned()) };
         let text = src.literal_text(at + 2).ok().flatten()?;
         Some(text.strip_prefix('\u{1}').map(str::to_owned).unwrap_or(text))
+    }
+
+    /// The value of `#[inline]` on `item`, returning `Some("")` for plain `#[inline]` without scanning attributes.
+    pub fn inline_attr(&self, item: ItemRef) -> Option<&'a str> {
+        let (_, entry) = self.item(item);
+        if entry.attrs.is_empty() {
+            return None;
+        }
+        if let Some(bits) = self.item_marks(item) {
+            if bits & mark("inline") == 0 {
+                return None;
+            }
+            if bits & (MARK_CFG_ATTR | MARK_INLINE_SPEC) == 0 {
+                return Some("");
+            }
+        }
+        self.attr_value(item, "inline")
     }
 
     /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.

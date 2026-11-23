@@ -90,6 +90,8 @@ pub struct Import {
     pub leaf: Leaf,
 }
 
+/// Bit set in `Items::marks` alongside `inline` when `#[inline(...)]` carries a parenthesized argument.
+pub const MARK_INLINE_SPEC: u16 = 1 << 14;
 /// Bit set in `Items::marks` alongside any marked attribute when the item also carries a `cfg_attr`.
 pub const MARK_CFG_ATTR: u16 = 1 << 15;
 

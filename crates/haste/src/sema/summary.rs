@@ -143,12 +143,16 @@ fn cached_poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySu
     frozen::frozen_summary(cx, item)
 }
 
+fn has_summary_body(entry: &crate::outline::item::Item) -> bool {
+    (entry.kind == ItemKind::Fn && entry.body.is_some()) || (entry.kind == ItemKind::Const && entry.name.is_some())
+}
+
 pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
     if let Some(summary) = cached_poly_summary(cx, item) {
         return Some(summary);
     }
     let (_, entry) = cx.item(item);
-    if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
+    if !has_summary_body(entry) || cx.foreign(item) {
         return None;
     }
     let expected = expected_param_count(cx, item)?;
@@ -175,7 +179,7 @@ fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
         return false;
     }
     let (_, entry) = cx.item(item);
-    if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
+    if !has_summary_body(entry) || cx.foreign(item) {
         return false;
     }
     if !matches!(super::infer::virtual_slot(cx, item, substs), Ok(None)) {

@@ -18,10 +18,11 @@ use super::Instance;
 pub(super) struct SealInfo {
     sealed: bool,
     params: u16,
+    sized_mask: u64,
 }
 
 impl SealInfo {
-    const UNSEALED: Self = Self { sealed: false, params: 0 };
+    const UNSEALED: Self = Self { sealed: false, params: 0, sized_mask: 0 };
 }
 
 #[derive(Default)]
@@ -101,7 +102,7 @@ impl ReachFilter {
         }
         if let Some(intrinsic) = cx.intrinsic(item) {
             let sealed = !matches!(intrinsic, Intrinsic::Transmute);
-            self.record_sealed(item, SealInfo { sealed, params: 0 });
+            self.record_sealed(item, SealInfo { sealed, params: 0, sized_mask: 0 });
             return sealed.then_some(usize::MAX);
         }
         if !cx.outline.is_fixed(item.krate) || matches!(cx.lang(item), Some("drop_glue" | "clone_fn" | "poll")) {
@@ -115,40 +116,51 @@ impl ReachFilter {
             self.record_sealed(item, SealInfo::UNSEALED);
             return None;
         };
-        if !local_sealed(cx, item, &summary) {
+        let Some(mut req_sized) = local_sealed(cx, item, &summary) else {
             self.record_sealed(item, SealInfo::UNSEALED);
             return None;
-        }
+        };
         let my_depth = stack.len();
         stack.push(item);
-        let dep = self.seal_callees(cx, &summary, stack);
+        let dep = self.seal_callees(cx, item, &summary, stack, &mut req_sized);
         stack.pop();
         let Some(dep) = dep else {
             self.record_sealed(item, SealInfo::UNSEALED);
             return None;
         };
-        if dep >= my_depth {
-            self.record_sealed(item, SealInfo { sealed: true, params: summary.param_count });
-            return Some(usize::MAX);
+        if dep < my_depth {
+            if req_sized != 0 {
+                self.record_sealed(item, SealInfo::UNSEALED);
+                return None;
+            }
+            return Some(dep);
         }
-        Some(dep)
+        self.record_sealed(item, SealInfo { sealed: true, params: summary.param_count, sized_mask: req_sized });
+        Some(usize::MAX)
     }
 
-    fn seal_callees(&mut self, cx: &mut Context<'_>, summary: &PolySummary, stack: &mut Vec<ItemRef>) -> Option<usize> {
+    fn seal_callees(&mut self, cx: &mut Context<'_>, caller: ItemRef, summary: &PolySummary, stack: &mut Vec<ItemRef>, req_sized: &mut u64) -> Option<usize> {
         let mut dep = usize::MAX;
-        for &(_, callee, _) in &summary.direct_calls {
+        for &(_, callee, callee_substs) in &summary.direct_calls {
             if cx.intrinsic(callee).is_some() {
                 continue;
             }
-            dep = dep.min(self.compute_seal(cx, callee, stack)?);
+            let d = self.compute_seal(cx, callee, stack)?;
+            dep = dep.min(d);
+            if d == usize::MAX
+                && let Some(info) = self.sealed_cache.get(&callee).copied()
+                && !propagate_callee_sized(cx, caller, callee_substs, info.sized_mask, req_sized)
+            {
+                return None;
+            }
         }
         for &(_, hole_item, hole_substs) in &summary.call_holes {
-            dep = dep.min(self.call_hole_seal(cx, hole_item, hole_substs, stack)?);
+            dep = dep.min(self.call_hole_seal(cx, caller, hole_item, hole_substs, stack, req_sized)?);
         }
         Some(dep)
     }
 
-    fn call_hole_seal(&mut self, cx: &mut Context<'_>, item: ItemRef, substs: Substs, stack: &mut Vec<ItemRef>) -> Option<usize> {
+    fn call_hole_seal(&mut self, cx: &mut Context<'_>, caller: ItemRef, item: ItemRef, substs: Substs, stack: &mut Vec<ItemRef>, req_sized: &mut u64) -> Option<usize> {
         let tr = cx.owner_trait(item)?;
         if !cx.outline.is_fixed(tr.krate) {
             return None;
@@ -175,7 +187,14 @@ impl ReachFilter {
                 continue;
             }
             let member = cx.member(block, name).unwrap_or(item);
-            dep = dep.min(self.compute_seal(cx, member, stack)?);
+            let d = self.compute_seal(cx, member, stack)?;
+            dep = dep.min(d);
+            if d == usize::MAX
+                && let Some(info) = self.sealed_cache.get(&member).copied()
+                && !propagate_callee_sized(cx, caller, substs, info.sized_mask, req_sized)
+            {
+                return None;
+            }
         }
         Some(dep)
     }
@@ -209,14 +228,38 @@ fn fixed_holders(cx: &Context<'_>, root_tys: &[Ty], tr_krate: u32) -> Vec<u32> {
     holders
 }
 
-fn local_sealed(cx: &mut Context<'_>, item: ItemRef, summary: &PolySummary) -> bool {
-    summary.projections.is_empty()
-        && summary.obligations.iter().all(|o| matches!(o, PolyObligation::Prove { .. }))
-        && summary.op_holes.is_empty()
-        && summary.const_holes.iter().all(|h| matches!(h, ConstHole::Intrinsic { .. }))
-        && summary.template.closures.is_empty()
-        && summary.layout_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty))
-        && summary.drop_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty))
+fn propagate_callee_sized(cx: &mut Context<'_>, caller: ItemRef, substs: Substs, mut mask: u64, req_sized: &mut u64) -> bool {
+    if mask == 0 {
+        return true;
+    }
+    let slice = cx.types.substs(substs).to_vec();
+    while mask != 0 {
+        let idx = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        let Some(&arg) = slice.get(idx) else { return false };
+        if !ty_is_sized(cx, caller, arg, req_sized) {
+            return false;
+        }
+    }
+    true
+}
+
+fn local_sealed(cx: &mut Context<'_>, item: ItemRef, summary: &PolySummary) -> Option<u64> {
+    if !summary.projections.is_empty()
+        || !summary.obligations.iter().all(|o| matches!(o, PolyObligation::Prove { .. }))
+        || !summary.op_holes.is_empty()
+        || !summary.const_holes.iter().all(|h| matches!(h, ConstHole::Intrinsic { .. }))
+        || !summary.template.closures.is_empty()
+    {
+        return None;
+    }
+    let mut req_sized = 0u64;
+    for &ty in summary.layout_tys.iter().chain(&summary.drop_tys) {
+        if !layout_ty_infallible(cx, item, ty, &mut req_sized) {
+            return None;
+        }
+    }
+    Some(req_sized)
 }
 
 fn param_is_sized(cx: &mut Context<'_>, item: ItemRef, idx: u16) -> bool {
@@ -254,14 +297,25 @@ fn nth_param_relaxes(
     type_params(generics).nth(idx).is_none_or(|g| param_relaxes_sized(arena, src, predicates, g))
 }
 
-fn ty_is_sized(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
+fn require_param_sized(cx: &mut Context<'_>, item: ItemRef, idx: u16, req_sized: &mut u64) -> bool {
+    if param_is_sized(cx, item, idx) {
+        return true;
+    }
+    if idx < 64 {
+        *req_sized |= 1u64 << idx;
+        return true;
+    }
+    false
+}
+
+fn ty_is_sized(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: &mut u64) -> bool {
     match *cx.types.kind(ty) {
         Kind::Prim(p) => !matches!(p, Primitive::Str),
         Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Array(..) => true,
-        Kind::Pat(inner, ..) => ty_is_sized(cx, item, inner),
+        Kind::Pat(inner, ..) => ty_is_sized(cx, item, inner, req_sized),
         Kind::Slice(..) | Kind::Dyn(..) => false,
-        Kind::Param(idx) => param_is_sized(cx, item, idx),
-        Kind::Tuple(elems) => cx.types.substs(elems).last().copied().is_none_or(|last| ty_is_sized(cx, item, last)),
+        Kind::Param(idx) => require_param_sized(cx, item, idx, req_sized),
+        Kind::Tuple(elems) => cx.types.substs(elems).last().copied().is_none_or(|last| ty_is_sized(cx, item, last, req_sized)),
         Kind::Adt(adt, args) => {
             if !cx.outline.is_fixed(adt.krate) {
                 return false;
@@ -269,36 +323,47 @@ fn ty_is_sized(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
             if !maybe_unsized(cx, adt).unwrap_or(true) {
                 return true;
             }
-            cx.types.substs(args).to_vec().into_iter().all(|arg| ty_is_sized(cx, item, arg))
+            cx.types.substs(args).to_vec().into_iter().all(|arg| ty_is_sized(cx, item, arg, req_sized))
         }
         _ => false,
     }
 }
 
-fn layout_ty_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
+fn concrete_ty_is_sized(cx: &mut Context<'_>, ty: Ty) -> bool {
     match *cx.types.kind(ty) {
-        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never => true,
-        Kind::Param(idx) => param_is_sized(cx, item, idx),
-        Kind::Slice(elem) => sized_layout_infallible(cx, item, elem),
-        Kind::Array(elem, len) => matches!(cx.types.kind(len), Kind::Value(n) if *n <= 1 || !cx.types.has_params(elem)) && sized_layout_infallible(cx, item, elem),
-        Kind::Pat(inner, ..) => !cx.types.has_params(inner) && sized_layout_infallible(cx, item, inner),
-        Kind::Tuple(elems) => tuple_layout_infallible(cx, item, elems),
-        Kind::Adt(adt, args) => adt_layout_infallible(cx, item, adt, args),
+        Kind::Prim(p) => !matches!(p, Primitive::Str),
+        Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Array(..) | Kind::Closure(..) => true,
+        Kind::Pat(inner, ..) => concrete_ty_is_sized(cx, inner),
+        Kind::Tuple(elems) => cx.types.substs(elems).last().copied().is_none_or(|last| concrete_ty_is_sized(cx, last)),
+        Kind::Adt(adt, _) => !maybe_unsized(cx, adt).unwrap_or(true),
         _ => false,
     }
 }
 
-fn sized_layout_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
-    ty_is_sized(cx, item, ty) && layout_ty_infallible(cx, item, ty)
+fn layout_ty_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: &mut u64) -> bool {
+    match *cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never => true,
+        Kind::Param(idx) => require_param_sized(cx, item, idx, req_sized),
+        Kind::Slice(elem) => sized_layout_infallible(cx, item, elem, req_sized),
+        Kind::Array(elem, len) => matches!(cx.types.kind(len), Kind::Value(n) if *n <= 1 || !cx.types.has_params(elem)) && sized_layout_infallible(cx, item, elem, req_sized),
+        Kind::Pat(inner, ..) => !cx.types.has_params(inner) && sized_layout_infallible(cx, item, inner, req_sized),
+        Kind::Tuple(elems) => tuple_layout_infallible(cx, item, elems, req_sized),
+        Kind::Adt(adt, args) => adt_layout_infallible(cx, item, adt, args, req_sized),
+        _ => false,
+    }
 }
 
-fn tuple_layout_infallible(cx: &mut Context<'_>, item: ItemRef, elems: Substs) -> bool {
+fn sized_layout_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: &mut u64) -> bool {
+    ty_is_sized(cx, item, ty, req_sized) && layout_ty_infallible(cx, item, ty, req_sized)
+}
+
+fn tuple_layout_infallible(cx: &mut Context<'_>, item: ItemRef, elems: Substs, req_sized: &mut u64) -> bool {
     let elems = cx.types.substs(elems).to_vec();
     let non_last = elems.len().saturating_sub(1);
-    elems[..non_last].iter().all(|&e| ty_is_sized(cx, item, e)) && elems.iter().all(|&e| layout_ty_infallible(cx, item, e))
+    elems[..non_last].iter().all(|&e| ty_is_sized(cx, item, e, req_sized)) && elems.iter().all(|&e| layout_ty_infallible(cx, item, e, req_sized))
 }
 
-fn adt_layout_infallible(cx: &mut Context<'_>, item: ItemRef, adt: ItemRef, args: Substs) -> bool {
+fn adt_layout_infallible(cx: &mut Context<'_>, item: ItemRef, adt: ItemRef, args: Substs, req_sized: &mut u64) -> bool {
     if !cx.outline.is_fixed(adt.krate) {
         return false;
     }
@@ -320,7 +385,7 @@ fn adt_layout_infallible(cx: &mut Context<'_>, item: ItemRef, adt: ItemRef, args
         if !adt_unsized && param_relaxed {
             continue;
         }
-        if !layout_ty_infallible(cx, item, arg) || !ty_is_sized(cx, item, arg) {
+        if !layout_ty_infallible(cx, item, arg, req_sized) || !ty_is_sized(cx, item, arg, req_sized) {
             return false;
         }
     }
@@ -406,7 +471,22 @@ fn can_prune_fixed(cx: &mut Context<'_>, filter: &mut ReachFilter, (item, substs
         return false;
     }
     let slice = cx.types.substs(substs);
-    slice.len() == usize::from(info.params) && !slice.iter().any(|&ty| matches!(cx.types.kind(ty), Kind::Never | Kind::Dyn(..)))
+    if slice.len() != usize::from(info.params) || slice.iter().any(|&ty| matches!(cx.types.kind(ty), Kind::Never | Kind::Dyn(..))) {
+        return false;
+    }
+    if info.sized_mask == 0 {
+        return true;
+    }
+    let args = slice.to_vec();
+    let mut mask = info.sized_mask;
+    while mask != 0 {
+        let idx = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        if !concrete_ty_is_sized(cx, args[idx]) {
+            return false;
+        }
+    }
+    true
 }
 
 fn push_poly_callees(

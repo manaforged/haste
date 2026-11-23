@@ -72,7 +72,7 @@ fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
     if cx.item(item).1.attrs.is_empty() {
         return Hint::Default;
     }
-    match cx.attr_value(item, "inline") {
+    match cx.inline_attr(item) {
         Some("always") => Hint::Always,
         Some("never") => Hint::Never,
         inline => {

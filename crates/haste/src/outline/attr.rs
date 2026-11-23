@@ -200,11 +200,18 @@ pub fn attrs(src: &Source, mut at: u32, inner: bool, into: &mut Vec<Attr>) -> Re
 
 /// The bits of the marked attributes that `attrs` name, directly or inside a `cfg_attr` whatever its condition.
 pub fn marks(src: &Source, attrs: &[Attr]) -> u16 {
+    let inline_bit = mark("inline");
     let mut bits = 0u16;
     let mut has_cfg = false;
     for attr in attrs {
         match attr {
-            Attr::Other(at) => bits |= mark(src.text(*at)),
+            Attr::Other(at) => {
+                let b = mark(src.text(*at));
+                bits |= b;
+                if b == inline_bit && src.kind(*at + 1) == TokenKind::OpenParen {
+                    bits |= super::item::MARK_INLINE_SPEC;
+                }
+            }
             Attr::CfgAttr(_, inner) => {
                 has_cfg = true;
                 bits |= marks(src, inner);
