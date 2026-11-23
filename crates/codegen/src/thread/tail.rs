@@ -84,7 +84,317 @@ pub(super) fn run(func: &mut Function) -> bool {
     if !copies.is_empty() {
         func.bump_cfg();
     }
-    !copies.is_empty()
+    let split = split_correlated_join(func);
+    !copies.is_empty() || split
+}
+
+fn has_call(func: &Function, block: Block) -> bool {
+    func.blocks[block.index()].insts.iter().any(|&inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. }))
+}
+
+fn defs_local_only(func: &Function, blocks: &[Block]) -> bool {
+    let mut own = vec![false; func.types.len()];
+    for &b in blocks {
+        for &inst in &func.blocks[b.index()].insts {
+            if let Some(res) = func.insts[inst.index()].result {
+                own[res.index()] = true;
+            }
+        }
+    }
+    func.blocks.iter().enumerate().all(|(bi, bdata)| {
+        let cur = Block(bi as u32);
+        blocks.contains(&cur)
+            || bdata.insts.iter().all(|&inst| {
+                let mut hit = false;
+                func.insts[inst.index()].op.for_operands(|v| hit |= own[v.index()]);
+                !hit
+            })
+    })
+}
+
+fn clone_block(func: &mut Function, src: Block, map: &mut Vec<(Value, Value)>, term_override: Option<Op>) -> Block {
+    let fresh_block = Block(func.blocks.len() as u32);
+    let insts_src = func.blocks[src.index()].insts.clone();
+    let mut new_insts = Vec::with_capacity(insts_src.len());
+    for (idx, inst) in insts_src.iter().copied().enumerate() {
+        let is_last = idx + 1 == insts_src.len();
+        let data = func.insts[inst.index()].clone();
+        let mut op = if is_last && let Some(over) = term_override.clone() { over } else { data.op };
+        op.map_operands(|v| map.iter().find(|&&(from, _)| from == v).map_or(v, |&(_, into)| into));
+        let result = data.result.map(|r| {
+            let fresh = func.value(func.ty(r));
+            map.push((r, fresh));
+            fresh
+        });
+        let added = func.add(op, result);
+        func.insts[added.index()].loc = data.loc;
+        new_insts.push(added);
+    }
+    func.blocks.push(BlockData { params: Vec::new(), insts: new_insts });
+    fresh_block
+}
+
+fn push_edge_arg(func: &mut Function, src: Block, dst: Block, arg: Value) {
+    let Some(&last) = func.blocks[src.index()].insts.last() else { return };
+    match &mut func.insts[last.index()].op {
+        Op::Jump(target, args) if *target == dst => args.push(arg),
+        Op::Brif(_, then, then_args, other, other_args) => {
+            if *then == dst {
+                then_args.push(arg);
+            }
+            if *other == dst {
+                other_args.push(arg);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct CorrelatedPlan {
+    pred: Block,
+    disp: Block,
+    to: Block,
+    mid: Block,
+    mid_is_then: bool,
+    exit: Block,
+    exit_args: Vec<Value>,
+    args: Vec<Value>,
+    need_params: Vec<usize>,
+    from_exit: Vec<bool>,
+    joins: Vec<Block>,
+    join_of: Vec<Option<usize>>,
+}
+
+fn find_correlated_join(func: &Function) -> Option<CorrelatedPlan> {
+    let cfg = func.cfg();
+    let defs = crate::fold::defs(func);
+    for at in 0..func.blocks.len() {
+        let disp = Block(at as u32);
+        if !cfg.reachable[at] || func.blocks[at].params.is_empty() || func.blocks[at].insts.len() != 1 {
+            continue;
+        }
+        let Some(found) = branch(func, &defs, disp) else { continue };
+        let disp_params = &func.blocks[at].params;
+        for &pred in cfg.preds_of(disp) {
+            if pred == disp {
+                continue;
+            }
+            let Some(Op::Jump(target, args)) = func.last(pred) else { continue };
+            if *target != disp || args.len() != disp_params.len() {
+                continue;
+            }
+            let Some(to) = decide(func, &defs, disp, args, &found) else { continue };
+            if to == disp
+                || !func.blocks[to.index()].params.is_empty()
+                || cfg.preds_of(to).len() < 2
+                || !cfg.dominates(disp, to)
+                || cfg.dominates(to, pred)
+                || func.blocks[to.index()].insts.len() > 6
+                || has_call(func, to)
+            {
+                continue;
+            }
+            let Some(Op::Brif(_, succ_a, a_args, succ_b, b_args)) = func.last(to) else { continue };
+            if *succ_a == *succ_b || *succ_a == to || *succ_b == to {
+                continue;
+            }
+            let candidates = [(*succ_a, a_args.is_empty(), true, *succ_b), (*succ_b, b_args.is_empty(), false, *succ_a)];
+            for (mid, mid_empty, mid_is_then, other_succ) in candidates {
+                if !mid_empty
+                    || cfg.single_pred(mid) != Some(to)
+                    || !func.blocks[mid.index()].params.is_empty()
+                    || func.blocks[mid.index()].insts.len() > 6
+                    || has_call(func, mid)
+                    || !defs_local_only(func, &[to, mid])
+                {
+                    continue;
+                }
+                if cfg.dominates(disp, other_succ) {
+                    continue;
+                }
+                let Some(Op::Brif(mid_cond, m_then, m_then_args, m_else, m_else_args)) = func.last(mid) else { continue };
+                if *m_then == *m_else {
+                    continue;
+                }
+                let Some(pidx) = disp_params.iter().position(|&p| p == *mid_cond) else { continue };
+                let Some(&Op::Const(imm)) = defs[args[pidx].index()].map(|i| &func.insts[i.index()].op) else { continue };
+                let taken = crate::fold::extend(imm, func.ty(*mid_cond), false) != 0;
+                let (exit, exit_args) = if taken { (*m_then, m_then_args.clone()) } else { (*m_else, m_else_args.clone()) };
+                if exit == disp || exit == to || exit == mid || !cfg.dominates(disp, exit) {
+                    continue;
+                }
+                let mut from_exit = vec![false; func.blocks.len()];
+                let mut stack = vec![exit];
+                while let Some(b) = stack.pop() {
+                    if !cfg.dominates(disp, b) || b == disp || b == to || b == mid || std::mem::replace(&mut from_exit[b.index()], true) {
+                        continue;
+                    }
+                    for s in func.successors(b) {
+                        stack.push(s);
+                    }
+                }
+                let mut need_params = Vec::new();
+                for (pi, &p) in disp_params.iter().enumerate() {
+                    let used_in_exit = from_exit.iter().enumerate().any(|(bi, &in_fe)| {
+                        in_fe
+                            && func.blocks[bi].insts.iter().any(|&inst| {
+                                let mut hit = false;
+                                func.insts[inst.index()].op.for_operands(|v| hit |= v == p);
+                                hit
+                            })
+                    });
+                    if used_in_exit {
+                        need_params.push(pi);
+                    }
+                }
+                if need_params.len() > 2 {
+                    continue;
+                }
+                let mut joins = Vec::new();
+                if !need_params.is_empty() {
+                    for (bi, &in_fe) in from_exit.iter().enumerate() {
+                        if !in_fe {
+                            continue;
+                        }
+                        let b = Block(bi as u32);
+                        if b == exit || cfg.preds_of(b).iter().any(|&pr| !from_exit[pr.index()]) {
+                            joins.push(b);
+                        }
+                    }
+                }
+                let mut join_of = vec![None; func.blocks.len()];
+                let mut ok = true;
+                if !need_params.is_empty() {
+                    loop {
+                        let mut added = false;
+                        for &b in &cfg.rpo {
+                            let bi = b.index();
+                            if !from_exit[bi] {
+                                continue;
+                            }
+                            let doms: Vec<usize> = joins.iter().enumerate().filter(|&(_, &j)| cfg.dominates(j, b)).map(|(ji, _)| ji).collect();
+                            let deepest = doms.iter().copied().find(|&ji| doms.iter().all(|&other| cfg.dominates(joins[other], joins[ji])));
+                            match deepest {
+                                Some(ji) => join_of[bi] = Some(ji),
+                                None => {
+                                    if joins.len() >= 8 {
+                                        ok = false;
+                                        break;
+                                    }
+                                    joins.push(b);
+                                    added = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !ok || !added {
+                            break;
+                        }
+                    }
+                    if ok {
+                        for &j in &joins {
+                            for &pr in cfg.preds_of(j) {
+                                if !matches!(func.last(pr), Some(Op::Jump(..) | Op::Brif(..))) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if ok {
+                    return Some(CorrelatedPlan {
+                        pred,
+                        disp,
+                        to,
+                        mid,
+                        mid_is_then,
+                        exit,
+                        exit_args,
+                        args: args.clone(),
+                        need_params,
+                        from_exit,
+                        joins,
+                        join_of,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Duplicates a short non-call join block and its correlated single-pred continuation onto a predecessor edge that decides both branches.
+fn split_correlated_join(func: &mut Function) -> bool {
+    let mut any = false;
+    for _ in 0..4 {
+        let Some(plan) = find_correlated_join(func) else { break };
+        let disp_params = func.blocks[plan.disp.index()].params.clone();
+        let mut map: Vec<(Value, Value)> = disp_params.iter().copied().zip(plan.args.iter().copied()).collect();
+        let to_clone = clone_block(func, plan.to, &mut map, None);
+        let mid_term = Op::Jump(plan.exit, plan.exit_args.clone());
+        let mid_clone = clone_block(func, plan.mid, &mut map, Some(mid_term));
+        let to_last = *func.blocks[to_clone.index()].insts.last().expect("invariant: to_clone has Brif");
+        if let Op::Brif(_, ref mut then, _, ref mut other, _) = func.insts[to_last.index()].op {
+            if plan.mid_is_then {
+                *then = mid_clone;
+            } else {
+                *other = mid_clone;
+            }
+        }
+        let pred_last = *func.blocks[plan.pred.index()].insts.last().expect("invariant: pred has Jump");
+        func.insts[pred_last.index()].op = Op::Jump(to_clone, Vec::new());
+        if !plan.need_params.is_empty() {
+            let cfg = func.cfg();
+            let orig_preds: Vec<Vec<Block>> = plan
+                .joins
+                .iter()
+                .map(|&j| cfg.preds_of(j).iter().copied().filter(|&pr| pr != mid_clone).collect())
+                .collect();
+            for &pi in &plan.need_params {
+                let orig_p = disp_params[pi];
+                let arg_p = plan.args[pi];
+                let mut j_params = Vec::with_capacity(plan.joins.len());
+                for &j in &plan.joins {
+                    let fresh = func.value(func.ty(orig_p));
+                    func.blocks[j.index()].params.push(fresh);
+                    j_params.push(fresh);
+                }
+                for (bi, &in_fe) in plan.from_exit.iter().enumerate() {
+                    if !in_fe {
+                        continue;
+                    }
+                    let Some(ji) = plan.join_of[bi] else { continue };
+                    let rep = j_params[ji];
+                    let insts = func.blocks[bi].insts.clone();
+                    for inst in insts {
+                        func.insts[inst.index()].op.map_operands(|v| if v == orig_p { rep } else { v });
+                    }
+                }
+                for (ji, &j) in plan.joins.iter().enumerate() {
+                    if j == plan.exit {
+                        push_edge_arg(func, mid_clone, j, arg_p);
+                    }
+                    let mut seen_preds = Vec::new();
+                    for &pr in &orig_preds[ji] {
+                        if seen_preds.contains(&pr) {
+                            continue;
+                        }
+                        seen_preds.push(pr);
+                        let val = if plan.from_exit[pr.index()] {
+                            plan.join_of[pr.index()].map_or(orig_p, |pji| j_params[pji])
+                        } else {
+                            orig_p
+                        };
+                        push_edge_arg(func, pr, j, val);
+                    }
+                }
+            }
+        }
+        func.bump_cfg();
+        any = true;
+    }
+    any
 }
 
 /// Splits one arm of `pred`'s `Brif` into a fresh block jumping to `target` with that arm's arguments.
