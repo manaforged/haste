@@ -90,7 +90,7 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
     if let (Some(slot), Some(expander)) = (macro_slot, &compilation.expander) {
         crate::with_host_target(|| crate::build::substrate::save_jit_substrate(&compilation.outline, expander.jit.store(), expander.jit.image(), slot));
     }
-    if was_miss {
+    if was_miss && crate::scripts::sysroot_scripts_settled(workspace) {
         crate::substrate::sysroot::save(workspace, targets, &compilation);
     }
     let errors = compilation.outline.local_errors(workspace);

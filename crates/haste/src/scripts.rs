@@ -18,6 +18,14 @@ use binary::{Binaries, Kept};
 
 const OUT: &str = "out";
 
+/// Whether every sysroot unit that has a build script already has its settled script output.
+pub(crate) fn sysroot_scripts_settled(workspace: &Workspace) -> bool {
+    workspace.graph.units.iter().all(|unit| {
+        let pkg = &workspace.packages[unit.package];
+        !pkg.sysroot || pkg.manifest.build.is_none() || unit.script.is_some()
+    })
+}
+
 /// Gives every unit with a build script its output: the stored one while it is current, else from running the script.
 pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
     crate::with_host_target(|| settle_inner(workspace, targets))
@@ -283,7 +291,12 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
     let compiled: Vec<(usize, usize)> = scripts.iter().zip(&kept).filter(|(_, kept)| !matches!(kept, Kept::Executable(_))).map(|(script, _)| *script).collect();
     let mains: Vec<Option<crate::names::ItemRef>> = compiled.iter().map(|(_, krate)| outline.main(*krate)).collect();
     let owners = outline.roots.iter().map(|root| root.unit).collect();
-    let (entries, store) = image::entries(&mut compilation, (crate::sema::Cache::default(), &mains))?;
+    let (slot, cache) = if sysroot_scripts_settled(workspace) {
+        crate::build::substrate::cache_with_toolchain_substrate(workspace)
+    } else {
+        (None, crate::sema::Cache::default())
+    };
+    let (entries, store) = image::entries(&mut compilation, (cache, &mains))?;
     let mut demand = Jit::new(store)?;
     demand.set_fast(true);
     demand.set_ahead(false);
@@ -335,6 +348,9 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
         executables: HashSet::default(),
     };
     image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;
+    if let Some(slot) = slot {
+        crate::build::substrate::save_jit_substrate(&compilation.outline, demand.store(), demand.image(), slot);
+    }
     let Runs { outcome, reran, .. } = driver;
     let rerun: Vec<(usize, usize)> = scripts.into_iter().filter(|(unit, _)| reran.contains(unit) && outcome.iter().any(|(at, result)| at == unit && result.is_ok())).collect();
     if let Err(error) = binaries.keep_detached(workspace, &mut compilation, &rerun, locks) {

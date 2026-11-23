@@ -95,8 +95,7 @@ impl ImageBackend {
     pub(super) fn stencil_tag(&self) -> u64 {
         match self {
             Self::Aot(_) => 0xA070_A070_A070_A070,
-            Self::LazyJit { fast: false } => 0x1A27_0000_1A27_0000,
-            Self::LazyJit { fast: true } => 0x1A27_FA57_1A27_FA57,
+            Self::LazyJit { fast } => if *fast || crate::profile() != crate::outline::tree::Profile::Release { 0x1A27_FA57_1A27_FA57 } else { 0x1A27_0000_1A27_0000 },
             Self::Check | Self::EagerJit { .. } => 0,
         }
     }

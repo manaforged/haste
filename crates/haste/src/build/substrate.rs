@@ -45,8 +45,7 @@ impl PreBuilders {
     }
 }
 
-pub(crate) fn cache_with_substrate(workspace: &graph::Workspace, warm_sysroot_bodies: bool) -> (Option<SubstrateSlot>, Cache) {
-    let slot = open_batch_substrate(workspace);
+fn cache_from_slot(slot: Option<SubstrateSlot>, warm_sysroot_bodies: bool) -> (Option<SubstrateSlot>, Cache) {
     let mut cache = Cache::default();
     cache.set_warm_sysroot_bodies(warm_sysroot_bodies);
     if let Some(sub) = slot.as_ref().and_then(SubstrateSlot::top) {
@@ -55,19 +54,37 @@ pub(crate) fn cache_with_substrate(workspace: &graph::Workspace, warm_sysroot_bo
     (slot, cache)
 }
 
-pub(crate) fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+pub(crate) fn cache_with_substrate(workspace: &graph::Workspace, warm_sysroot_bodies: bool) -> (Option<SubstrateSlot>, Cache) {
+    cache_from_slot(open_batch_substrate(workspace), warm_sysroot_bodies)
+}
+
+pub(crate) fn cache_with_toolchain_substrate(workspace: &graph::Workspace) -> (Option<SubstrateSlot>, Cache) {
+    cache_from_slot(open_toolchain_substrate(workspace), true)
+}
+
+fn open_toolchain_layer(workspace: &graph::Workspace) -> Option<(u64, u64, haste_codegen::Target, Option<Arc<Substrate>>)> {
     if !enabled() {
         return None;
     }
     let target = crate::host_target();
     let toolchain_key = toolchain_key(workspace, &target);
     let target_key = target_hash(&target);
-    let deps_key = deps_key(workspace, &target, toolchain_key);
-    let workspace_key = workspace_key(workspace, &target, toolchain_key);
     let toolchain = match Substrate::open_toolchain(toolchain_key) {
         Ok(sub) if sub.toolchain_hash() == toolchain_key && sub.target_hash() == target_key => Some(Arc::new(sub)),
         _ => None,
     };
+    Some((toolchain_key, target_key, target, toolchain))
+}
+
+pub(crate) fn open_toolchain_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+    let (toolchain_key, target_key, _, toolchain) = open_toolchain_layer(workspace)?;
+    Some(SubstrateSlot { toolchain_key, deps_key: None, workspace_key: None, target_key, toolchain, deps: None, workspace: None })
+}
+
+pub(crate) fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+    let (toolchain_key, target_key, target, toolchain) = open_toolchain_layer(workspace)?;
+    let deps_key = deps_key(workspace, &target, toolchain_key);
+    let workspace_key = workspace_key(workspace, &target, toolchain_key);
     let deps = deps_key.and_then(|dk| match Substrate::open_deps(dk, target_key) {
         Ok(sub) => Some(Arc::new(match &toolchain {
             Some(tc) => sub.with_parent(Arc::clone(tc)),
