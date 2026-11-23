@@ -82,9 +82,8 @@ pub trait Driver {
     }
 }
 
-/// The most functions that one ask compiles ahead of their first call.
-const AHEAD_FUNCTIONS: usize = 256;
-const AHEAD_DEPTH: usize = 4;
+/// The most direct callees that one ask compiles ahead of their first call.
+const AHEAD_FUNCTIONS: usize = 64;
 
 /// The functions declared so far, the inference store whose types their instances name, the image that holds their stubs and code, the children that run it, whether an ask compiles the functions it reaches ahead, the functions that compiling ahead left to their first call, and the watched source files with whether they changed.
 pub struct Jit {
@@ -151,8 +150,7 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
 
 impl Jit {
     pub fn new(store: Cache) -> Result<Jit> {
-        let mut jit = Self::create(store, (SHARED_BYTES, STATE_BYTES, CODE_BYTES, TABLE_SLOTS))?;
-        jit.ahead = true;
+        let jit = Self::create(store, (SHARED_BYTES, STATE_BYTES, CODE_BYTES, TABLE_SLOTS))?;
         Ok(jit)
     }
 
@@ -497,29 +495,33 @@ impl Jit {
         self.tried.extend(work.into_iter().filter(|at| !self.compiled.contains(at)));
     }
 
-    /// The inferred functions without code that function `index` reaches through calls, level by level until `AHEAD_FUNCTIONS` or no new one, each declared and inferred on every core; one whose inference asked for more or failed is left to its first call, with what it calls.
+    /// The direct uncompiled callees of `index` (up to `AHEAD_FUNCTIONS`), with their own direct callees quietly inferred so lowering them hits no untyped callee.
     fn frontier(&mut self, cx: &mut Context<'_>, index: usize) -> Vec<usize> {
         let mut seen = HashSet::default();
         seen.insert(index);
-        let mut members = Vec::new();
         let mut level = self.fresh_callees(cx, index, &mut seen);
-        let mut depth = 0;
-        while !level.is_empty() && members.len() < AHEAD_FUNCTIONS && depth < AHEAD_DEPTH {
-            depth += 1;
-            level.truncate(AHEAD_FUNCTIONS - members.len());
-            let inferred = infer_quiet(cx, &mut self.reached, &level);
-            self.image.bind_foreign_statics(cx, &self.reached, &inferred);
-            let (typed, left): (Vec<usize>, Vec<usize>) = level.into_iter().partition(|&at| self.reached.list[at].1.is_ok());
-            self.tried.extend(left);
-            level = typed;
-            let mut next = Vec::new();
-            for &at in &level {
-                next.extend(self.fresh_callees(cx, at, &mut seen));
-            }
-            members.append(&mut level);
-            level = next;
+        if level.is_empty() {
+            return level;
         }
-        members
+        level.truncate(AHEAD_FUNCTIONS);
+        let inferred = infer_quiet(cx, &mut self.reached, &level);
+        self.image.bind_foreign_statics(cx, &self.reached, &inferred);
+        let (typed, left): (Vec<usize>, Vec<usize>) = level.into_iter().partition(|&at| self.reached.list[at].1.is_ok());
+        self.tried.extend(left);
+        let mut deps = Vec::new();
+        for &at in &typed {
+            for callee in calls(cx, &self.reached.list[at].1).collect::<Vec<_>>() {
+                let id = self.declare(callee);
+                if self.reached.is_untyped(id) && seen.insert(id) {
+                    deps.push(id);
+                }
+            }
+        }
+        if !deps.is_empty() {
+            let kept = infer_quiet(cx, &mut self.reached, &deps);
+            self.image.bind_foreign_statics(cx, &self.reached, &kept);
+        }
+        typed
     }
 
     /// The functions that function `at` calls, declared, that have no code, were not left to their first call, and are not in `seen`, which takes them.

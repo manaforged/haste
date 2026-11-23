@@ -39,10 +39,15 @@ impl Image {
     pub(super) fn compile_batch(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize]) -> Vec<(usize, usize)> {
         let mut work = work.to_vec();
         work.sort_unstable();
-        let shards = lpt_shards(bucket_work(reached, &work), crate::jobs());
-        let forks = shards.iter().map(|_| cx.fork()).collect();
-        let made = self.run_shards(forks, &shards, |mut fork, shard| shard.iter().flat_map(|bucket| self.ready_bucket(&mut fork, reached, bucket)).collect::<Vec<_>>());
-        self.pass.ready = made.into_iter().filter_map(Result::ok).flatten().collect();
+        let buckets = bucket_work(reached, &work);
+        self.pass.ready = if buckets.len() <= 1 || crate::jobs() <= 1 {
+            buckets.iter().flat_map(|bucket| self.ready_bucket(cx, reached, bucket)).collect()
+        } else {
+            let shards = lpt_shards(buckets, crate::jobs());
+            let forks = shards.iter().map(|_| cx.fork()).collect();
+            let made = self.run_shards(forks, &shards, |mut fork, shard| shard.iter().flat_map(|bucket| self.ready_bucket(&mut fork, reached, bucket)).collect::<Vec<_>>());
+            made.into_iter().filter_map(Result::ok).flatten().collect()
+        };
         work.retain(|index| self.pass.ready.contains_key(index));
         let compiled = work.into_iter().filter_map(|index| self.compile_one(cx, reached, index).ok().map(|code| (index, code))).collect();
         self.pass.ready.clear();
@@ -100,7 +105,8 @@ impl Image {
             let ready = match plan {
                 Some(plan) => Ready { footprint, code: None, relocs: self.quietly(cx, |cx| lower::eval_relocs(cx, reached, self, &plan, index).ok()).map(|relocs| (plan, relocs)), thawed: false },
                 None => {
-                    let thawed = footprint.and_then(|fp| self.quietly(cx, |cx| self.thaw_lazy_stencil(cx, reached, index, fp, self.wanted_len()).ok().flatten()));
+                    let wanted_before = self.wanted_len();
+                    let thawed = footprint.and_then(|fp| self.quietly(cx, |cx| self.thaw_lazy_stencil(cx, reached, index, fp, wanted_before).ok().flatten()));
                     match thawed {
                         Some((code, relocs, plan)) => {
                             if let Some(fp) = footprint {
@@ -108,6 +114,7 @@ impl Image {
                             }
                             Ready { footprint, code: Some(code), relocs: Some((plan, relocs)), thawed: true }
                         }
+                        None if self.wanted_len() > wanted_before => continue,
                         None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target_for(cx, item)).ok()?, out.relocs, out.reloc_plan))) {
                             Some((code, relocs, plan)) => {
                                 if let Some(fp) = footprint {

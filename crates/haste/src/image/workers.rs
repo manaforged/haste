@@ -720,7 +720,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         let Some((is_sysroot, direct_key, fp_bits)) = valid_relocs.then(|| self.frozen_stencil_key(cx, reached, index, fp)).flatten() else {
             return tally(Tally::FreezeSkipped);
         };
-        let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some());
+        let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some()) || !code.unwind_drops().is_empty();
         let (store_sysroot, plan_bytes) = if (self.backend.is_aot() || self.backend.is_lazy_jit()) && needs_plan {
             let Some(pair) = self.encode_frozen_plan(cx, reached, is_sysroot, plan) else {
                 return tally(if is_dict { Tally::FreezeSkipped } else { Tally::FreezePlanless });

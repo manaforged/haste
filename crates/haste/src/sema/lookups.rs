@@ -97,7 +97,7 @@ impl ActiveAttrs {
 
 #[derive(Default)]
 pub(super) struct OutlineState {
-    pub(super) langs: RwLock<Option<traits::Langs>>,
+    pub(super) langs: RwLock<Option<Arc<traits::Langs>>>,
     pub(super) global_allocator: RwLock<Option<Option<ItemRef>>>,
     pub(super) loaded: RwLock<Vec<crate::outline::tree::CrateExtent>>,
     pub(super) primitives: RwLock<Option<Arc<[u32]>>>,

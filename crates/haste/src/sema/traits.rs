@@ -39,6 +39,27 @@ pub struct Langs {
     partial: Vec<u32>,
     /// The standard crates whose files the table was built from.
     pub(super) crates: Arc<[u32]>,
+    hot: [Option<ItemRef>; 10],
+}
+
+impl Langs {
+    #[inline]
+    fn get(&self, name: &str) -> Option<ItemRef> {
+        let idx = match name {
+            "drop" => 0,
+            "copy" => 1,
+            "sized" => 2,
+            "fn_once" => 3,
+            "fn_mut" => 4,
+            "fn" => 5,
+            "drop_glue" => 6,
+            "future_trait" => 7,
+            "owned_box" => 8,
+            "manually_drop" => 9,
+            _ => return self.table.get(name).copied(),
+        };
+        self.hot[idx]
+    }
 }
 
 /// Which allocator shim function (`__rust_alloc`, `__rust_alloc_zeroed`, `__rust_dealloc`, `__rust_realloc`) dispatches to `#[global_allocator]`.
@@ -240,15 +261,23 @@ impl<'a> Context<'a> {
 
     /// The item that `#[lang = "name"]` marks in the standard crates.
     pub fn lang_item(&mut self, name: &str) -> Option<ItemRef> {
-        if let Some(langs) = read_lock(&self.store.lookups.state.langs).as_ref() {
+        let langs = match &self.langs {
+            Some(langs) => langs,
+            None => {
+                let loaded = if let Some(langs) = read_lock(&self.store.lookups.state.langs).as_ref() {
+                    Arc::clone(langs)
+                } else {
+                    let built = Arc::new(self.lang_table());
+                    let mut guard = write_lock(&self.store.lookups.state.langs);
+                    Arc::clone(guard.get_or_insert(built))
+                };
+                self.langs.insert(loaded)
+            }
+        };
+        if !langs.partial.is_empty() {
             self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
-            return langs.table.get(name).copied();
         }
-        let built = self.lang_table();
-        let mut guard = write_lock(&self.store.lookups.state.langs);
-        let langs = guard.get_or_insert(built);
-        self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
-        langs.table.get(name).copied()
+        langs.get(name)
     }
 
     fn lang_table(&self) -> Langs {
@@ -271,6 +300,18 @@ impl<'a> Context<'a> {
                 }
             }
         }
-        Langs { table, partial, crates }
+        let hot = [
+            table.get("drop").copied(),
+            table.get("copy").copied(),
+            table.get("sized").copied(),
+            table.get("fn_once").copied(),
+            table.get("fn_mut").copied(),
+            table.get("fn").copied(),
+            table.get("drop_glue").copied(),
+            table.get("future_trait").copied(),
+            table.get("owned_box").copied(),
+            table.get("manually_drop").copied(),
+        ];
+        Langs { table, partial, crates, hot }
     }
 }

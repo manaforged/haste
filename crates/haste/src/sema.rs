@@ -62,6 +62,7 @@ pub struct Context<'a> {
     pub(super) drop_stack: Vec<ty::Ty>,
     pub(super) form_stack: Vec<(infer::Form, usize)>,
     global_asm: Option<Arc<global_asm::Table>>,
+    langs: Option<Arc<traits::Langs>>,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
@@ -126,6 +127,7 @@ impl<'a> Context<'a> {
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
             global_asm: None,
+            langs: None,
         }
     }
 
@@ -148,6 +150,7 @@ impl<'a> Context<'a> {
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
             global_asm: self.global_asm.clone(),
+            langs: self.langs.clone(),
         }
     }
 
