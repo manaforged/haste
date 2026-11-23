@@ -51,23 +51,32 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn cached_selection(&self, key: Option<&SelectionKey>, local_key: Option<&SelectionKey>) -> Option<Option<(ImplRef, Substs)>> {
-        key.and_then(|k| self.cx.store.lookups.selections.get(k)).or_else(|| local_key.and_then(|k| self.local_selections.get(k).copied()))
+        key.and_then(|k| self.cx.selection(k)).or_else(|| local_key.and_then(|k| self.local_selections.get(k).copied()))
     }
 
     fn store_selection(&mut self, key: Option<SelectionKey>, local_key: Option<SelectionKey>, picked: Option<&Picked>, state: (((usize, usize), usize, usize), u32)) {
         if self.cache_state() != state { return; }
         let Some((k, local)) = key.map(|k| (k, false)).or_else(|| local_key.map(|k| (k, true))) else { return; };
         let Some(kept) = (match picked { None => Some(None), Some((b, a)) => (if local { self.locally_closed_substs(a) } else { self.closed_substs(a) }).map(|a| Some((*b, a))) }) else { return; };
-        if local { self.local_selections.insert(k, kept); } else { self.cx.store.lookups.selections.insert(k, kept); }
+        if local { self.local_selections.insert(k, kept); } else { self.cx.set_selection(k, kept); }
     }
 
     pub(super) fn substs_if(&mut self, tys: &[Ty], ok: fn(&Self, Ty) -> bool) -> Option<Substs> {
-        tys.iter().all(|&ty| ok(self, ty)).then(|| { let sub: Vec<Ty> = tys.iter().map(|&ty| self.substitute(ty)).collect(); self.cx.types.intern_substs(&sub) })
+        if tys.is_empty() { return Some(Substs::EMPTY); }
+        if !tys.iter().all(|&ty| ok(self, ty)) { return None; }
+        if tys.len() <= 8 {
+            let mut buf = [Ty::NONE; 8];
+            for (dst, &ty) in buf.iter_mut().zip(tys) { *dst = self.substitute(ty); }
+            return Some(self.cx.types.intern_substs(&buf[..tys.len()]));
+        }
+        let sub: Vec<Ty> = tys.iter().map(|&ty| self.substitute(ty)).collect();
+        Some(self.cx.types.intern_substs(&sub))
     }
     pub(super) fn closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> { self.substs_if(tys, Self::closed) }
     pub(super) fn locally_closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> { self.substs_if(tys, Self::locally_closed) }
 
     fn selection_keys(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> (Option<SelectionKey>, Option<SelectionKey>) {
+        if args.is_empty() && self.cx.types.is_ground(self_ty) { return (Some((of, self_ty, Substs::EMPTY)), None); }
         let build = |this: &mut Self, ok: fn(&Self, Ty) -> bool| ok(this, self_ty).then(|| this.substs_if(args, ok)).flatten().map(|a| (of, this.substitute(self_ty), a));
         if let Some(k) = build(self, Self::closed) { (Some(k), None) } else { (None, build(self, Self::locally_closed)) }
     }
@@ -135,18 +144,10 @@ impl<'a> Infer<'_, 'a> {
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;
         if found.len() > 1 && !self.obligation_open(self_ty, args) {
             let mut kept = Vec::new();
-            for entry in &found {
-                if !self.blanket(entry.0.0)? {
-                    kept.push(entry.clone());
-                }
-            }
-            if !kept.is_empty() {
-                found = kept;
-            }
+            for entry in &found { if !self.blanket(entry.0.0)? { kept.push(entry.clone()); } }
+            if !kept.is_empty() { found = kept; }
         }
-        if found.len() > 1 && self.same_trait_args(&found, args) {
-            found = self.most_specialized(found)?;
-        }
+        if found.len() > 1 && self.same_trait_args(&found, args) { found = self.most_specialized(found)?; }
         Ok(found)
     }
 
@@ -169,10 +170,7 @@ impl<'a> Infer<'_, 'a> {
                     found.push(((block, impl_args), Vars { base_len, updates, added, diverges, projections, obligations }));
                 }
                 Ok(Some(_)) | Ok(None) => self.rollback_vars(mark.0),
-                Err(err) => {
-                    self.rollback_vars(mark.0);
-                    return Err(err);
-                }
+                Err(err) => { self.rollback_vars(mark.0); return Err(err); }
             }
         }
         Ok(found)
@@ -583,20 +581,23 @@ impl<'a> Infer<'_, 'a> {
 
     /// The obligation `ty: of<args>` hashed with every unbound inference variable of a kind alike, so a nested obligation that repeats an enclosing one is a cycle.
     fn query(&self, of: ItemRef, ty: Ty, args: &[Ty]) -> u64 {
-        let (mut hasher, mut seen) = (rustc_hash::FxHasher::default(), rustc_hash::FxHashMap::default());
+        let (mut hasher, mut seen) = (rustc_hash::FxHasher::default(), ([Ty::NONE; 16], 0usize, Vec::new()));
         of.hash(&mut hasher);
         self.hash_canonical(ty, &mut hasher, &mut seen);
         self.hash_list(args, &mut hasher, &mut seen);
         hasher.finish()
     }
 
-    fn hash_canonical(&self, ty: Ty, hasher: &mut rustc_hash::FxHasher, seen: &mut rustc_hash::FxHashMap<Ty, u32>) {
+    fn hash_canonical(&self, ty: Ty, hasher: &mut rustc_hash::FxHasher, seen: &mut ([Ty; 16], usize, Vec<Ty>)) {
         let ty = self.resolve(ty);
         let kind = self.cx.types.kind(ty);
         let compound = !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Never | Kind::Prim(_) | Kind::Value(_) | Kind::Param(_));
         if compound {
-            if let Some(&id) = seen.get(&ty) { (0xFFu8, id).hash(hasher); return; }
-            seen.insert(ty, seen.len() as u32);
+            let (buf, len, extra) = seen;
+            if let Some(pos) = buf[..(*len).min(16)].iter().position(|&t| t == ty) { (0xFFu8, pos as u32).hash(hasher); return; }
+            if *len > 16 && let Some(pos) = extra.iter().position(|&t| t == ty) { (0xFFu8, (16 + pos) as u32).hash(hasher); return; }
+            if *len < 16 { buf[*len] = ty; } else { extra.push(ty); }
+            *len += 1;
         }
         std::mem::discriminant(kind).hash(hasher);
         match kind {
@@ -617,7 +618,7 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
-    fn hash_list(&self, items: &[Ty], hasher: &mut rustc_hash::FxHasher, seen: &mut rustc_hash::FxHashMap<Ty, u32>) {
+    fn hash_list(&self, items: &[Ty], hasher: &mut rustc_hash::FxHasher, seen: &mut ([Ty; 16], usize, Vec<Ty>)) {
         items.len().hash(hasher);
         for &item in items {
             self.hash_canonical(item, hasher, seen);

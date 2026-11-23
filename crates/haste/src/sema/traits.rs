@@ -147,15 +147,20 @@ impl<'a> Context<'a> {
         Ok(super::infer::type_params(&self.trait_generics(of)?.1.params).next().is_some())
     }
 
-    /// The traits in scope in module `home`.
-    pub fn traits_in_scope(&self, home: ModRef) -> Vec<ItemRef> {
+    /// The traits in scope in module `home`, returned as a shared slice from a per-context cache.
+    pub fn traits_in_scope(&self, home: ModRef) -> Arc<[ItemRef]> {
+        if let Some(known) = self.scope_traits_local.borrow().get(&home) {
+            return Arc::clone(known);
+        }
         if let Some(known) = self.store.lookups.scope_traits.get(&home) {
-            return known.to_vec();
+            self.scope_traits_local.borrow_mut().insert(home, Arc::clone(&known));
+            return known;
         }
         let before = self.quiet_mark();
-        let found = self.paths(home.krate).traits_in(home);
+        let found: Arc<[ItemRef]> = self.paths(home.krate).traits_in(home).into();
         if self.quiet_mark() == before {
-            self.store.lookups.scope_traits.insert(home, Arc::from(found.as_slice()));
+            self.store.lookups.scope_traits.insert(home, Arc::clone(&found));
+            self.scope_traits_local.borrow_mut().insert(home, Arc::clone(&found));
         }
         found
     }

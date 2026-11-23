@@ -74,7 +74,8 @@ impl Infer<'_, '_> {
             let args = super::super::ty::object_parts(self.cx.types.substs(args), self.cx.types.items(members)).0.to_vec();
             return self.trait_value(of, (Some(owner), Some(args)), (name, given));
         }
-        let scope = current.into_iter().chain(self.cx.traits_in_scope(self.home)).chain(self.body_traits());
+        let in_scope = self.cx.traits_in_scope(self.home);
+        let scope = current.into_iter().chain(in_scope.iter().copied()).chain(self.body_traits());
         let traits: Vec<ItemRef> = scope.filter(|&of| self.cx.trait_member(of, name).is_some()).collect();
         for &of in &traits {
             if self.implements(of, owner)? {

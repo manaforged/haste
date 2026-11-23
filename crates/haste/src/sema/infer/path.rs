@@ -44,6 +44,7 @@ impl std::ops::Deref for PathSyms {
 }
 
 /// The interned segments of `path` in `arena`, whether it starts with `::`, and the crate a leading `$crate` names.
+#[inline]
 pub fn segments(symbols: &Symbols, src: &Source, arena: &Body, path: PathId) -> (PathSyms, bool, Option<u32>) {
     let path = arena.path(path);
     let syms = arena.syms(symbols, src);
