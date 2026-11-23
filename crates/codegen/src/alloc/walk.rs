@@ -4,7 +4,7 @@ use std::slice::Iter;
 use crate::cfg::Cfg;
 use crate::frame::terminator_edges;
 use crate::ir::{Block, Function, InstData, Op, Value};
-use crate::live::{Live, Sib, for_effective_operands, results};
+use crate::live::{Elided, Live, for_effective_operands, results};
 
 /// The (parameter, argument) copies one block edge makes.
 pub(super) type Copies<'f> = Zip<Iter<'f, Value>, Iter<'f, Value>>;
@@ -24,13 +24,13 @@ pub(super) fn edge_copies<'f>(func: &'f Function, blocks: Option<&[u64]>, mut vi
     }
 }
 
-pub(super) fn weights(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elided: &[bool]) -> Vec<u64> {
+pub(super) fn weights(func: &Function, blocks: &[u64], eff: Elided<'_>) -> Vec<u64> {
     let mut weight = vec![0_u64; func.types.len()];
     for (each, data) in weighted(func, blocks) {
-        if data.result.is_some_and(|res| elided[res.index()]) {
+        if data.result.is_some_and(|res| eff.elided[res.index()]) {
             continue;
         }
-        for_effective_operands(data, sib, elided, |value| weight[value.index()] += each);
+        for_effective_operands(data, eff, |value| weight[value.index()] += each);
         results(data).for_each(|value| weight[value.index()] += each);
     }
     weight

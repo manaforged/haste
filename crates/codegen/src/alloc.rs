@@ -8,7 +8,7 @@ use crate::cfg::{Cfg, Loops};
 use crate::fold::{constant, holds};
 use crate::frame::{Abi, Loc};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, InstData, Op, Signature, StackSlot, Type, Value};
-use crate::live::{Live, Sib, SibBase, live, results};
+use crate::live::{Elided, Live, Sib, SibBase, live, results};
 use crate::park::{Class, Hints, ParkReg, allocate};
 
 pub(crate) struct Regs<R: 'static> {
@@ -285,6 +285,71 @@ fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, zero_
     (sib, elided)
 }
 
+/// Extracts `(base, delta)` from an integer `Iadd`/`Isub` with one constant operand supplied by `imm_of`.
+pub(crate) fn iadd_sub_const(op: &Op, imm_of: impl Fn(Value) -> Option<i64>) -> Option<(Value, i64)> {
+    match *op {
+        Op::Binary(Binary::Iadd, a, b) => match (imm_of(a), imm_of(b)) {
+            (None, Some(c)) => Some((a, c)),
+            (Some(c), None) => Some((b, c)),
+            _ => None,
+        },
+        Op::Binary(Binary::Isub, a, b) if imm_of(a).is_none() => imm_of(b).and_then(i64::checked_neg).map(|c| (a, c)),
+        _ => None,
+    }
+}
+
+fn atomic_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, sib: &[Option<Sib>], elided: &mut [bool]) -> Vec<Option<Value>> {
+    let count = func.types.len();
+    let mut atomic_base = vec![None; count];
+    let mut atomic_uses = vec![0_u32; count];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let addr = match func.insts[inst.index()].op {
+                Op::AtomicLoad(addr, _) => Some(addr),
+                Op::AtomicStore(val, addr, _) if val != addr => Some(addr),
+                Op::AtomicRmw(_, _, addr, val) if val != addr => Some(addr),
+                Op::AtomicCas(_, addr, exp, rep) if exp != addr && rep != addr => Some(addr),
+                _ => None,
+            };
+            if let Some(addr) = addr {
+                atomic_uses[addr.index()] += 1;
+            }
+        }
+    }
+    for (v, &def) in census.def_inst.iter().enumerate() {
+        let Some(def_inst) = def else { continue };
+        if atomic_uses[v] == 0
+            || atomic_uses[v] != census.uses[v]
+            || elided[v]
+            || sib[v].is_some()
+            || func.types[v] != Type::I64
+            || !matches!(locations[v], Location::Slot)
+        {
+            continue;
+        }
+        let Some((base, delta)) = iadd_sub_const(&func.insts[def_inst.index()].op, |x| match locations[x.index()] {
+            Location::Imm(c) => Some(c),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if base.index() == v || i32::try_from(delta).is_err() || elided[base.index()] || sib[base.index()].is_some() || func.ty(base) != Type::I64 {
+            continue;
+        }
+        match locations[base.index()] {
+            Location::Slot => {
+                elided[v] = true;
+                atomic_base[v] = Some(base);
+            }
+            Location::Frame(_, off) if (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(i64::from(off) + delta)) => {
+                elided[v] = true;
+            }
+            _ => {}
+        }
+    }
+    atomic_base
+}
+
 fn fuses(func: &Function, census: &Uses, value: usize, float_branches: &[FloatCC], two_address: bool) -> bool {
     let (Some((block, at)), Some((use_block, last))) = (census.def[value], census.last_use[value]) else { return false };
     if block != use_block || census.uses[value] != 1 || at >= last {
@@ -463,8 +528,10 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let census = census(func);
     let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
+    let atomic_base = if regs.two_address { atomic_addrs(func, &locations, &census, &sib, &mut elided) } else { vec![None; count] };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.constant_calls) } else { vec![None; count] };
     const_pairs(func, &census, &mut elided);
+    let eff = Elided { sib: &sib, atomic_base: &atomic_base, elided: &elided };
     let cfg = weighed.then(|| func.cfg());
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
     let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
@@ -472,14 +539,14 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let promoted_syms = regs.absolute_calls.then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
-    let live = live(func, order, copied, &tracked, &sib, &elided);
+    let live = live(func, order, copied, &tracked, eff);
     let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches, regs.two_address)).collect();
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
-    let natural = blocks.as_deref().map(|blocks| walk::weights(func, blocks, &sib, &elided));
+    let natural = blocks.as_deref().map(|blocks| walk::weights(func, blocks, eff));
     let weights = natural.clone().map(|natural| walk::inherit(natural, &live, split));
     let (partners, back_args, edge_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref());
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
@@ -504,7 +571,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         }
     }
     let (pairs, deferred) = pairs(func, &locations, &elided);
-    let webs = blocks.as_deref().zip(partners.as_deref()).map(|edges| demote::webs(func, &live, edges, (&sib, &elided, &deferred), regs.imm_store, &mut locations));
+    let webs = blocks.as_deref().zip(partners.as_deref()).map(|edges| demote::webs(func, &live, edges, (eff, &deferred), regs.imm_store, &mut locations));
     let parked = if park.is_some() { parked(func, &live, &locations, (regs.saved, regs.saved_float), classify) } else { Vec::new() };
     let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);

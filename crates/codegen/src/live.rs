@@ -182,8 +182,15 @@ pub(crate) struct Sib {
     pub disp: i32,
 }
 
-pub(crate) fn for_effective_operands(data: &InstData, sib: &[Option<Sib>], elided: &[bool], mut f: impl FnMut(Value)) {
-    if data.result.is_some_and(|res| elided.get(res.index()) == Some(&true)) {
+#[derive(Clone, Copy)]
+pub(crate) struct Elided<'a> {
+    pub sib: &'a [Option<Sib>],
+    pub atomic_base: &'a [Option<Value>],
+    pub elided: &'a [bool],
+}
+
+pub(crate) fn for_effective_operands(data: &InstData, eff: Elided<'_>, mut f: impl FnMut(Value)) {
+    if data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
         return;
     }
     let visit_mode = |mode: Sib, f: &mut dyn FnMut(Value)| {
@@ -192,12 +199,16 @@ pub(crate) fn for_effective_operands(data: &InstData, sib: &[Option<Sib>], elide
         }
         f(mode.index);
     };
-    if let Some(mode) = data.result.and_then(|res| sib.get(res.index()).copied().flatten()) {
+    if let Some(mode) = data.result.and_then(|res| eff.sib.get(res.index()).copied().flatten()) {
         visit_mode(mode, &mut f);
         return;
     }
-    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match sib.get(addr.index()).copied().flatten() {
+    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match eff.sib.get(addr.index()).copied().flatten() {
         Some(mode) => visit_mode(mode, f),
+        None => f(addr),
+    };
+    let visit_atomic = |addr: Value, f: &mut dyn FnMut(Value)| match eff.atomic_base.get(addr.index()).copied().flatten() {
+        Some(base) => f(base),
         None => f(addr),
     };
     match &data.op {
@@ -205,6 +216,20 @@ pub(crate) fn for_effective_operands(data: &InstData, sib: &[Option<Sib>], elide
         Op::Store(value, addr, _) => {
             f(*value);
             visit_addr(*addr, &mut f);
+        }
+        Op::AtomicLoad(addr, _) => visit_atomic(*addr, &mut f),
+        Op::AtomicStore(value, addr, _) => {
+            f(*value);
+            visit_atomic(*addr, &mut f);
+        }
+        Op::AtomicRmw(_, _, addr, value) => {
+            visit_atomic(*addr, &mut f);
+            f(*value);
+        }
+        Op::AtomicCas(_, addr, expected, replacement) => {
+            visit_atomic(*addr, &mut f);
+            f(*expected);
+            f(*replacement);
         }
         op => op.for_operands(f),
     }
@@ -388,13 +413,13 @@ where
     live
 }
 
-fn crossing(func: &Function, wanted: &[bool], sib: &[Option<Sib>], elided: &[bool]) -> (Vec<Option<usize>>, Vec<Value>) {
+fn crossing(func: &Function, wanted: &[bool], eff: Elided<'_>) -> (Vec<Option<usize>>, Vec<Value>) {
     let mut location = vec![usize::MAX; func.types.len()];
     for (block, data) in func.blocks.iter().enumerate() {
         data.params.iter().for_each(|param| location[param.index()] = block);
         for inst in &data.insts {
             let inst_data = &func.insts[inst.index()];
-            if !inst_data.result.is_some_and(|res| elided.get(res.index()) == Some(&true)) {
+            if !inst_data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
                 results(inst_data).for_each(|result| location[result.index()] = block);
             }
         }
@@ -403,7 +428,7 @@ fn crossing(func: &Function, wanted: &[bool], sib: &[Option<Sib>], elided: &[boo
     let mut values = Vec::new();
     for (block, data) in func.blocks.iter().enumerate() {
         for inst in &data.insts {
-            for_effective_operands(&func.insts[inst.index()], sib, elided, |value| {
+            for_effective_operands(&func.insts[inst.index()], eff, |value| {
                 if wanted[value.index()] && location[value.index()] != block && dense[value.index()].is_none() {
                     dense[value.index()] = Some(values.len());
                     values.push(value);
@@ -414,7 +439,7 @@ fn crossing(func: &Function, wanted: &[bool], sib: &[Option<Sib>], elided: &[boo
     (dense, values)
 }
 
-fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> (BitMatrix, BitMatrix) {
+fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, eff: Elided<'_>) -> (BitMatrix, BitMatrix) {
     let blocks = func.blocks.len();
     let (mut uses, mut defs) = (BitMatrix::new(blocks, count), BitMatrix::new(blocks, count));
     for (block, data) in func.blocks.iter().enumerate() {
@@ -423,10 +448,10 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Opt
         }
         for inst in &data.insts {
             let inst = &func.insts[inst.index()];
-            if inst.result.is_some_and(|res| elided.get(res.index()) == Some(&true)) {
+            if inst.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
                 continue;
             }
-            for_effective_operands(inst, sib, elided, |value| {
+            for_effective_operands(inst, eff, |value| {
                 if let Some(value) = dense[value.index()]
                     && !defs.get(block, value)
                 {
@@ -441,8 +466,8 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, sib: &[Opt
     (uses, defs)
 }
 
-fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usize, sib: &[Option<Sib>], elided: &[bool]) -> BitMatrix {
-    let (uses, defs) = local_sets(func, dense, count, sib, elided);
+fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usize, eff: Elided<'_>) -> BitMatrix {
+    let (uses, defs) = local_sets(func, dense, count, eff);
     solve_backward_liveness(func, order.iter().copied(), &uses, &defs)
 }
 
@@ -456,10 +481,10 @@ fn push_range(out: &mut [Vec<Range>], value: usize, start: u32, end: u32) {
     }
 }
 
-pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[bool], sib: &[Option<Sib>], elided: &[bool]) -> Live {
+pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[bool], eff: Elided<'_>) -> Live {
     let count = func.types.len();
-    let (dense, crossing) = crossing(func, wanted, sib, elided);
-    let live_in = live_in(func, order, &dense, crossing.len(), sib, elided);
+    let (dense, crossing) = crossing(func, wanted, eff);
+    let live_in = live_in(func, order, &dense, crossing.len(), eff);
     let mut per_val: Vec<Vec<Range>> = vec![Vec::new(); count];
     let mut open: Vec<Option<(u32, u32)>> = vec![None; count];
     let mut touched: Vec<usize> = Vec::new();
@@ -520,7 +545,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
         let insts = &func.blocks[index].insts;
         for (place, &inst) in insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|res| elided.get(res.index()) == Some(&true)) {
+            if data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
                 continue;
             }
             if copied.get(inst.index()) == Some(&true)
@@ -536,11 +561,11 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                 }
                 for &h_inst in &func.blocks[head.index()].insts {
                     let h_data = &func.insts[h_inst.index()];
-                    if h_data.result.is_some_and(|res| elided.get(res.index()) == Some(&true)) {
+                    if h_data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
                         continue;
                     }
                     at += 1;
-                    for_effective_operands(h_data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+                    for_effective_operands(h_data, eff, |v| use_val(v, at, &mut open, &mut touched));
                     at += 1;
                     results(h_data).for_each(|r| def_val(r, at, false, &mut defs, &mut open, &mut touched, &mut per_val));
                 }
@@ -549,7 +574,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
             }
             if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) {
                 at += 1;
-                for_effective_operands(data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+                for_effective_operands(data, eff, |v| use_val(v, at, &mut open, &mut touched));
                 at += 1;
                 results(data).for_each(|r| def_val(r, at, true, &mut defs, &mut open, &mut touched, &mut per_val));
                 if matches!(data.op, Op::TryCall { .. }) {
@@ -563,9 +588,9 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                 continue;
             }
             at += 1;
-            let flags_only = carry_out_of_pair(func, insts, place) && func.insts[insts[place - 1].index()].result.is_some_and(|sum| elided.get(sum.index()) != Some(&true));
+            let flags_only = carry_out_of_pair(func, insts, place) && func.insts[insts[place - 1].index()].result.is_some_and(|sum| eff.elided.get(sum.index()) != Some(&true));
             if !flags_only {
-                for_effective_operands(data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+                for_effective_operands(data, eff, |v| use_val(v, at, &mut open, &mut touched));
             }
             at += 1;
             results(data).for_each(|r| def_val(r, at, true, &mut defs, &mut open, &mut touched, &mut per_val));

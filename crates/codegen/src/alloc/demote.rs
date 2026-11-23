@@ -1,6 +1,6 @@
 use crate::color::{Webs, shareable};
 use crate::ir::{Function, Op, Value};
-use crate::live::{Live, Sib, for_effective_operands};
+use crate::live::{Elided, Live, for_effective_operands};
 
 use super::Location;
 use super::walk::{edge_copies, weighted};
@@ -23,13 +23,13 @@ fn copies(func: &Function, blocks: &[u64]) -> (Vec<(u64, usize, usize)>, Vec<boo
 }
 
 /// The block-weighted count of reads of each value other than block edge copies.
-fn reads(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elided: &[bool]) -> Vec<u64> {
+fn reads(func: &Function, blocks: &[u64], eff: Elided<'_>) -> Vec<u64> {
     let mut reads = vec![0_u64; func.types.len()];
     for (weight, data) in weighted(func, blocks) {
         match data.op {
             Op::Jump(..) => {}
             Op::Brif(condition, ..) => reads[condition.index()] += weight,
-            _ => for_effective_operands(data, sib, elided, |value| reads[value.index()] += weight),
+            _ => for_effective_operands(data, eff, |value| reads[value.index()] += weight),
         }
     }
     reads
@@ -40,7 +40,7 @@ pub(super) fn webs<R: Copy + PartialEq>(
     func: &Function,
     live: &Live,
     (blocks, partners): (&[u64], &[Vec<Value>]),
-    (sib, elided, deferred): (&[Option<Sib>], &[bool], &[bool]),
+    (eff, deferred): (Elided<'_>, &[bool]),
     imm_store: fn(i64) -> u64,
     locations: &mut [Location<R>],
 ) -> Webs {
@@ -58,7 +58,7 @@ pub(super) fn webs<R: Copy + PartialEq>(
         }
     }
     let (copies, fixed) = copies(func, blocks);
-    let reads = reads(func, blocks, sib, elided);
+    let reads = reads(func, blocks, eff);
     let mut touching = vec![Vec::new(); count];
     for (at, &(_, param, arg)) in copies.iter().enumerate() {
         if param != arg {

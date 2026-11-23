@@ -32,6 +32,7 @@ enum Test {
 pub(super) fn run(func: &mut Function) -> bool {
     let cfg = func.cfg();
     let defs = crate::fold::defs(func);
+    let consts = func.const_values();
     let mut copies: Vec<(Edge, Block, Block)> = Vec::new();
     for at in 0..func.blocks.len() {
         let block = Block(at as u32);
@@ -63,7 +64,7 @@ pub(super) fn run(func: &mut Function) -> bool {
             if args.len() != params_len {
                 continue;
             }
-            let Some(to) = decide(func, &defs, block, args, &found) else {
+            let Some(to) = decide(func, &defs, &consts, pred, block, args, &found) else {
                 continue;
             };
             if to != block && stays_under(func, &cfg, block, to) {
@@ -91,14 +92,14 @@ pub(super) fn run(func: &mut Function) -> bool {
     !copies.is_empty() || split || repaired
 }
 
-struct SsaRepairPlan {
-    need: Vec<Value>,
-    from_exit: Vec<bool>,
-    joins: Vec<Block>,
+pub(super) struct SsaRepairPlan {
+    pub(super) need: Vec<Value>,
+    pub(super) from_exit: Vec<bool>,
+    pub(super) joins: Vec<Block>,
     join_of: Vec<Option<usize>>,
 }
 
-fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block, exit: Block, skip: &[Block], vals: &[Value]) -> Option<SsaRepairPlan> {
+pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block, exit: Block, skip: &[Block], vals: &[Value]) -> Option<SsaRepairPlan> {
     let mut from_exit = vec![false; func.blocks.len()];
     let mut stack = vec![exit];
     while let Some(b) = stack.pop() {
@@ -110,21 +111,48 @@ fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block, exit: Blo
         }
     }
     let mut need = Vec::new();
+    let mut use_blocks = vec![false; func.blocks.len()];
     for &v in vals {
-        let used_in_exit = from_exit.iter().enumerate().any(|(bi, &in_fe)| {
-            in_fe
+        let mut used_in_exit = false;
+        for (bi, &in_fe) in from_exit.iter().enumerate() {
+            if in_fe
                 && func.blocks[bi].insts.iter().any(|&inst| {
                     let mut hit = false;
                     func.insts[inst.index()].op.for_operands(|op| hit |= op == v);
                     hit
                 })
-        });
+            {
+                used_in_exit = true;
+                use_blocks[bi] = true;
+            }
+        }
         if used_in_exit {
             need.push(v);
         }
     }
     if need.len() > 4 {
         return None;
+    }
+    if !need.is_empty() {
+        let mut live = vec![false; func.blocks.len()];
+        let mut back: Vec<Block> = use_blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(bi, &u)| u.then_some(Block(bi as u32)))
+            .collect();
+        while let Some(b) = back.pop() {
+            if !from_exit[b.index()] || std::mem::replace(&mut live[b.index()], true) {
+                continue;
+            }
+            if b != exit {
+                for &pr in cfg.preds_of(b) {
+                    if from_exit[pr.index()] && !live[pr.index()] {
+                        back.push(pr);
+                    }
+                }
+            }
+        }
+        from_exit = live;
     }
     let mut joins = Vec::new();
     if !need.is_empty() {
@@ -176,7 +204,7 @@ fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block, exit: Blo
     Some(SsaRepairPlan { need, from_exit, joins, join_of })
 }
 
-fn apply_ssa_repair(func: &mut Function, plan: &SsaRepairPlan, exit: Block, new_pred: Block, pairs: &[(Value, Value)]) {
+pub(super) fn apply_ssa_repair(func: &mut Function, plan: &SsaRepairPlan, exit: Block, new_pred: Block, pairs: &[(Value, Value)]) {
     if pairs.is_empty() {
         return;
     }
@@ -231,6 +259,7 @@ fn thread_repaired_joins(func: &mut Function) -> bool {
         let found_plan = {
             let cfg = func.cfg();
             let defs = crate::fold::defs(func);
+            let consts = func.const_values();
             let mut picked = None;
             'blocks: for at in 0..func.blocks.len() {
                 let block = Block(at as u32);
@@ -255,7 +284,7 @@ fn thread_repaired_joins(func: &mut Function) -> bool {
                     if *target != block || args.len() != params_len {
                         continue;
                     }
-                    let Some(to) = decide(func, &defs, block, args, &found) else { continue };
+                    let Some(to) = decide(func, &defs, &consts, pred, block, args, &found) else { continue };
                     if to == block || !cfg.dominates(block, to) {
                         continue;
                     }
@@ -361,6 +390,7 @@ struct CorrelatedPlan {
 fn find_correlated_join(func: &Function) -> Option<CorrelatedPlan> {
     let cfg = func.cfg();
     let defs = crate::fold::defs(func);
+    let consts = func.const_values();
     for at in 0..func.blocks.len() {
         let disp = Block(at as u32);
         if !cfg.reachable[at] || func.blocks[at].params.is_empty() || func.blocks[at].insts.len() != 1 {
@@ -376,7 +406,7 @@ fn find_correlated_join(func: &Function) -> Option<CorrelatedPlan> {
             if *target != disp || args.len() != disp_params.len() {
                 continue;
             }
-            let Some(to) = decide(func, &defs, disp, args, &found) else { continue };
+            let Some(to) = decide(func, &defs, &consts, pred, disp, args, &found) else { continue };
             if to == disp
                 || !func.blocks[to.index()].params.is_empty()
                 || cfg.preds_of(to).len() < 2
@@ -492,6 +522,12 @@ fn split_brif_arm(func: &mut Function, pred: Block, on_then: bool, target: Block
     Some(split)
 }
 
+fn is_body_small_load(func: &Function, defs: &[Option<Inst>], body: &[Inst], val: Value) -> bool {
+    defs[val.index()].is_some_and(|i| {
+        body.contains(&i) && matches!(func.insts[i.index()].op, Op::Load(..) | Op::StackLoad(..)) && func.ty(val).is_small_int()
+    })
+}
+
 /// The branch ending `block` when its body is a short run of pure instructions, loads and stores and its terminator is a decidable `Brif` or `BrTable`.
 fn branch(func: &Function, defs: &[Option<Inst>], block: Block) -> Option<Branch> {
     let (&last, body) = func.blocks[block.index()].insts.split_last()?;
@@ -505,41 +541,68 @@ fn branch(func: &Function, defs: &[Option<Inst>], block: Block) -> Option<Branch
     }
     match func.insts[last.index()].op {
         Op::Brif(cond, then, _, other, _) if then != other => {
-            let test = if let Some(def) = defs[cond.index()].filter(|inst| body.contains(inst)) {
+            let test = if is_body_small_load(func, defs, body, cond) || func.blocks[block.index()].params.contains(&cond) {
+                Test::Cond(cond)
+            } else if let Some(def) = defs[cond.index()].filter(|inst| body.contains(inst)) {
                 let (cc, a, b) = crate::algebra::branch_cmp(&func.insts[def.index()].op)?;
                 if !func.ty(a).is_small_int() {
                     return None;
                 }
                 Test::Cmp(cc, [a, b])
-            } else if func.blocks[block.index()].params.contains(&cond) {
-                Test::Cond(cond)
             } else {
                 return None;
             };
             Some(Branch::Brif { test, then, other })
         }
-        Op::BrTable(index, default, ref targets) if func.blocks[block.index()].params.contains(&index) => {
+        Op::BrTable(index, default, ref targets)
+            if func.blocks[block.index()].params.contains(&index) || is_body_small_load(func, defs, body, index) =>
+        {
             Some(Branch::Table { index, default, targets: targets.clone() })
         }
         _ => None,
     }
 }
 
-/// Evaluates `found` in `block` under incoming `args` when its branch target is statically known.
-fn decide(func: &Function, defs: &[Option<Inst>], block: Block, args: &[Value], found: &Branch) -> Option<Block> {
+/// Evaluates `found` in `block` under incoming `args` and predecessor `pred` when its branch target is statically known.
+fn decide(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], pred: Block, block: Block, args: &[Value], found: &Branch) -> Option<Block> {
     let params = &func.blocks[block.index()].params;
+    let body = &func.blocks[block.index()].insts[..func.blocks[block.index()].insts.len().saturating_sub(1)];
     let subst = |v: Value| params.iter().position(|&p| p == v).map_or(v, |i| args[i]);
-    let constant = |v: Value| match defs[v.index()].map(|inst| &func.insts[inst.index()].op) {
-        Some(&Op::Const(imm)) => Some(imm),
-        _ => None,
+    let eval_val = |v: Value| -> Option<i64> {
+        let mapped = subst(v);
+        if let Some(imm) = consts.get(mapped.index()).copied().flatten() {
+            return Some(imm);
+        }
+        let def = defs[v.index()]?;
+        let pos = body.iter().position(|&i| i == def)?;
+        if !matches!(func.insts[def.index()].op, Op::Load(..) | Op::StackLoad(..)) {
+            return None;
+        }
+        if body[..pos].iter().any(|&i| matches!(func.insts[i.index()].op, Op::Store(..) | Op::StackStore(..))) {
+            return None;
+        }
+        let mut local_ops = Vec::with_capacity(pos);
+        for &i in &body[..pos] {
+            let data = &func.insts[i.index()];
+            if let Some(res) = data.result
+                && data.op.is_speculable()
+            {
+                let mut op = data.op.clone();
+                op.map_operands(&subst);
+                local_ops.push((res, op));
+            }
+        }
+        let mut op = func.insts[def.index()].op.clone();
+        op.map_operands(&subst);
+        super::stored::pred_load_const_raw(func, defs, consts, Some((&local_ops, &[])), pred, &op, func.ty(v))
     };
     match found {
         Branch::Brif { test, then, other } => {
             let taken = match *test {
-                Test::Cond(cond) => constant(subst(cond)).map(|c| crate::fold::extend(c, func.ty(cond), false) != 0)?,
+                Test::Cond(cond) => eval_val(cond).map(|c| crate::fold::extend(c, func.ty(cond), false) != 0)?,
                 Test::Cmp(cc, sides) => {
                     let ty = func.ty(sides[0]);
-                    if let (Some(ca), Some(cb)) = (constant(subst(sides[0])), constant(subst(sides[1]))) {
+                    if let (Some(ca), Some(cb)) = (eval_val(sides[0]), eval_val(sides[1])) {
                         crate::fold::holds(cc, ty, ca, cb)
                     } else if same(func, defs, block, args, sides) {
                         crate::fold::holds(cc, ty, 0, 0)
@@ -551,7 +614,7 @@ fn decide(func: &Function, defs: &[Option<Inst>], block: Block, args: &[Value], 
             Some(if taken { *then } else { *other })
         }
         Branch::Table { index, default, targets } => {
-            let imm = constant(subst(*index))?;
+            let imm = eval_val(*index)?;
             let u = crate::fold::extend(imm, func.ty(*index), false) as u64;
             Some(crate::fold::table_target(u, *default, targets))
         }
@@ -604,7 +667,7 @@ fn stays_under(func: &Function, cfg: &crate::cfg::Cfg, block: Block, to: Block) 
 }
 
 /// Gives each other block that reads a constant of `block` its own copy of that constant.
-fn localize_consts(func: &mut Function, block: Block) {
+pub(super) fn localize_consts(func: &mut Function, block: Block) {
     let consts: Vec<(Value, i64)> = func.blocks[block.index()]
         .insts
         .iter()

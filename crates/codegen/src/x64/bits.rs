@@ -12,7 +12,12 @@ impl Emit<'_> {
         if self.plan.elided[addr.index()]
             && self.plan.sib[addr.index()].is_none()
             && let Some(inst) = self.defs[addr.index()]
-            && let Some((base, delta)) = super::location::fuse::iadd_sub_const(&self.plan, &self.func.insts[inst.index()].op)
+            && let Some((base, delta)) = crate::alloc::iadd_sub_const(&self.func.insts[inst.index()].op, |v| {
+                self.const_of(v).or_else(|| match self.defs[v.index()].map(|i| &self.func.insts[i.index()].op) {
+                    Some(&Op::Const(imm)) => Some(imm),
+                    _ => None,
+                })
+            })
             && let Ok(disp) = i32::try_from(delta)
         {
             return (base, disp);

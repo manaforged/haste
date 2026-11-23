@@ -110,15 +110,7 @@ fn load_dst_clobber(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (u_res, op)
 }
 
 pub(in crate::x64) fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
-    match *op {
-        Op::Binary(Binary::Iadd, a, b) => match (plan.const_of(a), plan.const_of(b)) {
-            (None, Some(c)) => Some((a, c)),
-            (Some(c), None) => Some((b, c)),
-            _ => None,
-        },
-        Op::Binary(Binary::Isub, a, b) if plan.const_of(a).is_none() => plan.const_of(b).and_then(|c| c.checked_neg()).map(|c| (a, c)),
-        _ => None,
-    }
+    crate::alloc::iadd_sub_const(op, |v| plan.const_of(v))
 }
 
 fn cmp_band_arg_ok(ctx: &FuseCtx<'_>, (mpos, cpos, last_pos): (usize, usize, usize), u: Value) -> bool {
@@ -623,7 +615,6 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         }
     }
     apply_select_trees(func, plan, (&uses, &pos_of, &defs), &mut tst_end, &mut roots);
-    super::sib::fuse_atomic_addrs(func, plan, (&uses, &pos_of));
     super::sib::fuse_mem_rmw(func, plan, (&uses, &pos_of, &defs));
     for (b_idx, lpos, load_res) in cand_loads {
         if plan.elided[load_res.index()] { continue; }

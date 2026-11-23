@@ -1,6 +1,7 @@
 mod carry;
 mod decided;
 mod eval;
+mod loop_spec;
 mod ret;
 mod sink;
 mod stored;
@@ -605,7 +606,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
     }
-    let split = split_select_branches(func) | decided::run(func) | stored::run(func) | tail::run(func);
+    let split = split_select_branches(func) | decided::run(func) | stored::run(func) | tail::run(func) | loop_spec::run(func);
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
     for data in &func.insts {
