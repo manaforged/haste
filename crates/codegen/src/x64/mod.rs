@@ -499,8 +499,18 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
+        let params = &self.func.blocks[block.index()].params;
+        let (mut rem_a, mut rem_p) = (Vec::new(), Vec::new());
+        let (a_slice, p_slice) = if args.iter().any(|&a| self.is_fused_cas(a)) {
+            for (&arg, &param) in args.iter().zip(params) {
+                if self.is_fused_cas(arg) { self.put(param, Reg::Rax); } else { rem_a.push(arg); rem_p.push(param); }
+            }
+            (&rem_a[..], &rem_p[..])
+        } else {
+            (args, &params[..])
+        };
         let float_scratch = [Xmm(0), Xmm(1)];
-        for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, args, &self.func.blocks[block.index()].params) {
+        for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, a_slice, p_slice) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
                 Step::Save(arg, EdgeScratch::Int(i)) => self.save_edge(i, arg),

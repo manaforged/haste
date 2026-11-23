@@ -12,7 +12,7 @@ use super::Emit;
 use crate::alloc::{Location, Plan};
 use crate::fold::fits_imm32;
 use crate::frame::{ArgStep, Emitter, Ext};
-use crate::ir::{AtomicRmwOp, Function, Inst, IntCC, Op, ShuffleMask, Type, Value};
+use crate::ir::{Function, Inst, Op, ShuffleMask, Type, Value};
 use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -720,78 +720,6 @@ pub(super) fn elide_broadcast_inserts(func: &Function, plan: &mut Plan<Reg>, def
         if used_in != block || a.index() != v || uses[v] != reads || mask[..usize::from(count)].iter().any(|&at| at != 0) { continue; }
         if fuse::preserved(func, plan, block, start, end, &[], scalar) {
             plan.elided[v] = true;
-        }
-    }
-}
-
-/// Marks each integer `AtomicRmw` whose result is unused (or a `Sub` consumed solely by an adjacent equality compare against its operand) as `fused` for a direct `lock` op.
-pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of, use_of): (&[u32], &[Site], &[Site])) {
-    let eq_val = |plan: &Plan<Reg>, ty: Type, a: Value, b: Value| {
-        a == b
-            || plan.const_of(a).zip(plan.const_of(b)).is_some_and(|(c1, c2)| {
-                crate::fold::extend(c1, ty, false) == crate::fold::extend(c2, ty, false)
-            })
-    };
-    for (v, def) in pos_of.iter().enumerate() {
-        let Some((block, start, inst)) = *def else { continue };
-        let (res, ty) = (Value(v as u32), func.ty(Value(v as u32)));
-        if !ty.is_small_int() || plan.elided[v] || plan.fused[v] {
-            continue;
-        }
-        let expected = match func.insts[inst.index()].op {
-            Op::AtomicRmw(rmw, _, _, value) => {
-                if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor | AtomicRmwOp::Xchg) {
-                    plan.fused[v] = true;
-                    if let Some((_, bit)) = super::bits::lock_bt_shift_bit(func, plan, |x| pos_of[x.index()].map(|(_, _, i)| i), rmw, value)
-                        && uses[value.index()] == 1
-                        && !plan.elided[value.index()]
-                        && let Some((mb, mpos, _)) = pos_of[value.index()]
-                        && mb == block
-                        && mpos < start
-                        && fuse::preserved(func, plan, block, mpos, start, &[], bit)
-                    {
-                        plan.elided[value.index()] = true;
-                    }
-                    continue;
-                }
-                if rmw != AtomicRmwOp::Sub || uses[v] != 1 { continue; }
-                value
-            }
-            Op::AtomicCas(_, _, expected, _) => {
-                if uses[v] == 0 {
-                    plan.fused[v] = true;
-                    continue;
-                }
-                if uses[v] != 1 { continue; }
-                expected
-            }
-            _ => continue,
-        };
-        let Some((used_in, end, user)) = use_of[v] else { continue };
-        let udata = &func.insts[user.index()];
-        let zero_expected = plan.const_of(expected).is_some_and(|c| crate::fold::extend(c, ty, false) == 0);
-        let ok_user = match udata.op {
-            Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
-                udata.result.is_some_and(|r| !plan.elided[r.index()] && !plan.is_static(r))
-                    && ((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
-            }
-            Op::Brif(cond, _, ref ta, _, ref ea) => cond == res && zero_expected && ta.is_empty() && ea.is_empty(),
-            Op::Trapz(cond) => cond == res && zero_expected,
-            _ => false,
-        };
-        if used_in != block || end <= start || !ok_user {
-            continue;
-        }
-        let quiet = (start + 1..end).all(|p| {
-            let mid = &func.insts[func.blocks[block].insts[p].index()];
-            !matches!(mid.op, Op::Call { .. } | Op::TryCall { .. })
-                && mid.result.is_some_and(|r| {
-                    plan.elided[r.index()]
-                        || (plan.is_static(r) && matches!(mid.op, Op::Const(_) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_)))
-                })
-        });
-        if quiet {
-            plan.fused[v] = true;
         }
     }
 }

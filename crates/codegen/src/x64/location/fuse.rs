@@ -705,7 +705,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
     super::sib::fuse_bt_shifts(func, plan, (&uses, &pos_of), &tst_end, &pure_test);
     fold_products(func, plan, &uses, &defs);
     if features.avx2 { super::elide_broadcast_inserts(func, plan, &defs, (&uses, &pos_of, &use_of)); }
-    super::fuse_atomic_rmws(func, plan, (&uses, &pos_of, &use_of));
+    super::sib::fuse_atomic_rmws(func, plan, (&uses, &pos_of, &use_of));
     elide_zero_bases(func, plan, &defs);
     for (low, operands) in paired {
         if plan.is_static(low) || plan.deferred[low.index()] {

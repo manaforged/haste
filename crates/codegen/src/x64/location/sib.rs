@@ -2,7 +2,7 @@ use super::fuse::{FuseCtx, preserved};
 use super::patterns::{FOLD_LIMIT, SibMatch, odd_scale_source, scaled_op};
 use super::super::asm::Reg;
 use crate::alloc::{Location, Plan};
-use crate::ir::{Binary, Convert, Function, Inst, Op, Type, Value};
+use crate::ir::{AtomicRmwOp, Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 use crate::live::{Sib, SibBase};
 
 pub(super) fn sib_ok(ctx: &FuseCtx<'_>, m: &SibMatch, extra_skips: &[usize], end_pos: usize) -> bool {
@@ -359,5 +359,120 @@ pub(super) fn store_load_ok(func: &Function, plan: &Plan<Reg>, linst: Inst, load
                     || (!plan.elided[addr.index()] && matches!(plan.location(addr), Location::Reg(_) | Location::Frame(..))))
         }
         _ => false,
+    }
+}
+
+fn eq_val(plan: &Plan<Reg>, ty: Type, a: Value, b: Value) -> bool {
+    a == b
+        || plan.const_of(a).zip(plan.const_of(b)).is_some_and(|(c1, c2)| {
+            crate::fold::extend(c1, ty, false) == crate::fold::extend(c2, ty, false)
+        })
+}
+
+fn quiet_between(func: &Function, plan: &Plan<Reg>, block: usize, mut range: std::ops::Range<usize>, skip: Option<usize>) -> bool {
+    range.all(|p| {
+        skip == Some(p) || {
+            let mid = &func.insts[func.blocks[block].insts[p].index()];
+            !matches!(mid.op, Op::Call { .. } | Op::TryCall { .. })
+                && mid.result.is_some_and(|r| {
+                    plan.elided[r.index()]
+                        || (plan.is_static(r) && matches!(mid.op, Op::Const(_) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_)))
+                })
+        }
+    })
+}
+
+fn cas_brif_edge_ok(func: &Function, plan: &Plan<Reg>, uses: &[u32], (block, start, res, expected, ty): (usize, usize, Value, Value, Type)) -> bool {
+    let insts = &func.blocks[block].insts;
+    let Some(bpos) = insts.len().checked_sub(1) else { return false };
+    if bpos <= start + 1 { return false; }
+    let Op::Brif(cond, then, ref ta, otherwise, ref ea) = func.insts[insts[bpos].index()].op else { return false };
+    let arm_uses = ta.iter().chain(ea).filter(|&&a| a == res).count() as u32;
+    if arm_uses == 0 || uses[res.index()] != 1 + arm_uses || !(plan.fused[cond.index()] || plan.elided[cond.index()]) {
+        return false;
+    }
+    let Some(cpos) = (start + 1..bpos).find(|&p| func.insts[insts[p].index()].result == Some(cond)) else { return false };
+    let Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) = func.insts[insts[cpos].index()].op else { return false };
+    if !((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
+        || !quiet_between(func, plan, block, start + 1..bpos, Some(cpos))
+    {
+        return false;
+    }
+    for (target, args) in [(then, ta.as_slice()), (otherwise, ea.as_slice())] {
+        if !args.contains(&res) { continue; }
+        let params = &func.blocks[target.index()].params;
+        if args.len() != params.len() { return false; }
+        for (&arg, &param) in args.iter().zip(params) {
+            if arg != res { continue; }
+            if !matches!(plan.location(param), Location::Reg(_) | Location::Slot)
+                || plan.reg_of(res).is_some_and(|r| plan.reg_of(param) == Some(r))
+            {
+                return false;
+            }
+            let pr = plan.reg_of(param);
+            if args.iter().any(|&o| o != res && (o == param || pr.is_some_and(|r| plan.reg_of(o) == Some(r)))) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Marks dead or flag-only `AtomicRmw`/`AtomicCas` results (and `AtomicCas` results consumed only by a fused compare and its `Brif` edge) as fused.
+pub(super) fn fuse_atomic_rmws(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    (uses, pos_of, use_of): (&[u32], &[super::Site], &[super::Site]),
+) {
+    for (v, def) in pos_of.iter().enumerate() {
+        let Some((block, start, inst)) = *def else { continue };
+        let (res, ty) = (Value(v as u32), func.ty(Value(v as u32)));
+        if !ty.is_small_int() || plan.elided[v] || plan.fused[v] {
+            continue;
+        }
+        let expected = match func.insts[inst.index()].op {
+            Op::AtomicRmw(rmw, _, _, value) => {
+                if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor | AtomicRmwOp::Xchg) {
+                    plan.fused[v] = true;
+                    if let Some((_, bit)) = super::super::bits::lock_bt_shift_bit(func, plan, |x| pos_of[x.index()].map(|(_, _, i)| i), rmw, value)
+                        && uses[value.index()] == 1
+                        && !plan.elided[value.index()]
+                        && let Some((mb, mpos, _)) = pos_of[value.index()]
+                        && mb == block
+                        && mpos < start
+                        && preserved(func, plan, block, mpos, start, &[], bit)
+                    {
+                        plan.elided[value.index()] = true;
+                    }
+                    continue;
+                }
+                if rmw != AtomicRmwOp::Sub || uses[v] != 1 { continue; }
+                value
+            }
+            Op::AtomicCas(_, _, expected, _) => {
+                if uses[v] == 0 || (uses[v] >= 2 && cas_brif_edge_ok(func, plan, uses, (block, start, res, expected, ty))) {
+                    plan.fused[v] = true;
+                    continue;
+                }
+                if uses[v] != 1 { continue; }
+                expected
+            }
+            _ => continue,
+        };
+        let Some((used_in, end, user)) = use_of[v] else { continue };
+        let udata = &func.insts[user.index()];
+        let zero_expected = plan.const_of(expected).is_some_and(|c| crate::fold::extend(c, ty, false) == 0);
+        let ok_user = match udata.op {
+            Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
+                udata.result.is_some_and(|r| !plan.elided[r.index()] && !plan.is_static(r))
+                    && ((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
+            }
+            Op::Brif(cond, _, ref ta, _, ref ea) => cond == res && zero_expected && ta.is_empty() && ea.is_empty(),
+            Op::Trapz(cond) => cond == res && zero_expected,
+            _ => false,
+        };
+        if used_in == block && end > start && ok_user && quiet_between(func, plan, block, start + 1..end, None) {
+            plan.fused[v] = true;
+        }
     }
 }

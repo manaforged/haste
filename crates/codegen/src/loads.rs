@@ -687,7 +687,14 @@ fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affi
             continue;
         };
         let (Op::Load(addr, off) | Op::Store(_, addr, off)) = &mut func.insts[inst.index()].op else { continue };
-        if slots[addr.index()].is_some() {
+        if let Some((slot, base_off)) = slots[addr.index()] {
+            if let Some(total) = i64::from(base_off).checked_add(i64::from(*off))
+                && crate::mem::in_range(total, ty.bytes(), func.slots[slot.index()].size)
+                && let Ok(disp) = i32::try_from(total)
+            {
+                func.insts[inst.index()].op = match func.insts[inst.index()].op { Op::Load(..) => Op::StackLoad(slot, disp), Op::Store(v, ..) => Op::StackStore(v, slot, disp), _ => unreachable!() };
+                changed = true;
+            }
             continue;
         }
         let (root, base_off) = affine[addr.index()];

@@ -113,6 +113,10 @@ impl Emit<'_> {
         self.last_spill.holders(disp).find(|&r| r == preferred).or_else(|| self.last_spill.holders(disp).next())
     }
 
+    pub(super) fn is_fused_cas(&self, v: Value) -> bool {
+        self.plan.fused[v.index()] && self.defs[v.index()].is_some_and(|i| matches!(self.func.insts[i.index()].op, Op::AtomicCas(..)))
+    }
+
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
             Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => self.vector_zero(result()?),

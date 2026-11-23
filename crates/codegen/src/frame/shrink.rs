@@ -69,7 +69,7 @@ fn pure_block<R: Copy + PartialEq>(
     match &func.insts[term.index()].op {
         Op::Return(vals) => vals.iter().all(|&v| ok_val(v)),
         Op::Jump(_, args) => args.iter().all(|&v| ok_val(v)),
-        Op::Brif(cond, _, ta, _, ea) => ok_val(*cond) && ta.iter().chain(ea).all(|&v| ok_val(v)),
+        Op::Brif(cond, _, ta, _, ea) => ok_val(*cond) && ta.iter().chain(ea).all(|&v| !plan.fused[v.index()] && ok_val(v)),
         _ => false,
     }
 }

@@ -297,9 +297,15 @@ fn diamond_safe(func: &Function, cfg: &Cfg, (block, target): (Block, Block), (op
     {
         return true;
     }
-    let base = body(func, target).iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
-    let extra = queued.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
-    base + extra < 6
+    let insts = body(func, target);
+    if insts.iter().any(|&i| {
+        let op = &func.insts[i.index()].op;
+        !op.is_speculable() && !matches!(op, Op::Load(..) | Op::StackLoad(..))
+    }) {
+        return true;
+    }
+    let base = insts.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
+    base >= 6 || base + queued.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count() < 6
 }
 
 fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Block)], (op, moves): (&Op, &[Vec<Inst>])) -> Option<Block> {
