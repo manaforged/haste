@@ -69,10 +69,7 @@ pub(super) fn fast_range(func: &Function, ranges: &Ranges, op: &Op, ty: Type) ->
             let inner = ranges.table[x.index()];
             (inner.1 <= ty.unsigned_max()).then_some(inner)
         }
-        Op::Binary(_, x, _) if func.ty(x).is_small_int() => {
-            let fact = transfer(func, ranges, op, ty, &|value| ranges.of(value));
-            Some((fact.lo, fact.hi))
-        }
+        Op::Binary(bin, x, y) if func.ty(x).is_small_int() => binary_bounds(func, ranges, bin, (x, y), |v| ranges.table[v.index()]),
         Op::Select(..) => {
             let fact = transfer(func, ranges, op, ty, &|value| ranges.of(value));
             Some((fact.lo, fact.hi))
@@ -89,7 +86,11 @@ pub(super) fn transfer(func: &Function, ranges: &Ranges, op: &Op, ty: Type, of: 
     match *op {
         Op::Convert(Convert::Uextend, x) => of(x),
         Op::Convert(Convert::Ireduce, x) => Some(of(x)).filter(|inner| inner.hi <= ty.unsigned_max()).unwrap_or_else(|| Fact::full(ty)),
-        Op::Binary(op, x, y) if func.ty(x).is_small_int() => binary(func, ranges, op, (x, y), of),
+        Op::Binary(op, x, y) if func.ty(x).is_small_int() => binary_bounds(func, ranges, op, (x, y), |v| {
+            let f = of(v);
+            (f.lo, f.hi)
+        })
+        .map_or_else(|| Fact::full(ty), |(lo, hi)| Fact::range(lo, hi)),
         Op::Select(cond, x, y) => match (arm(func, ranges, (cond, x, true), of), arm(func, ranges, (cond, y, false), of)) {
             (Some(a), Some(b)) => Fact::range(a.lo.min(b.lo), a.hi.max(b.hi)),
             (Some(only), None) | (None, Some(only)) => Fact::range(only.lo, only.hi),
@@ -202,73 +203,75 @@ pub(super) fn unwrapped(op: Binary, ty: Type, a: &Fact, b: &Fact) -> Option<Fact
     (lo <= max).then(|| Fact::range(lo, hi.min(max)))
 }
 
-/// The count a shift by `count` moves at the width of `ty`, when it is one constant.
-fn shift_count(ty: Type, count: &Fact) -> Option<u32> {
-    count.exact().map(|count| (count & u64::from(ty.bits() - 1)) as u32)
+#[inline]
+fn shift_count_bounds(ty: Type, (lo, hi): (u64, u64)) -> Option<u32> {
+    (lo == hi).then(|| (lo & u64::from(ty.bits() - 1)) as u32)
 }
 
-/// The range of `x op y` from the facts on its operands.
-fn binary(func: &Function, ranges: &Ranges, op: Binary, (x, y): (Value, Value), of: Of<'_>) -> Fact {
+#[inline]
+fn binary_bounds(func: &Function, ranges: &Ranges, op: Binary, (x, y): (Value, Value), bounds: impl Fn(Value) -> (u64, u64)) -> Option<(u64, u64)> {
     let ty = func.ty(x);
-    let full = || Fact::full(ty);
     match op {
-        Binary::Band => Fact::range(0, of(x).hi.min(of(y).hi)),
+        Binary::Band => Some((0, bounds(x).1.min(bounds(y).1))),
         Binary::Bor => {
-            let (a, b) = (of(x), of(y));
-            added(ty, &a, &b).map_or_else(full, |sum| Fact::range(a.lo.max(b.lo), sum.hi))
+            let (a, b) = (bounds(x), bounds(y));
+            added_bounds(ty, a, b).map(|(_, hi)| (a.0.max(b.0), hi))
         }
-        Binary::Ushr => shift_count(ty, &of(y)).map_or_else(full, |shift| {
-            let inner = of(x);
-            Fact::range(inner.lo >> shift, inner.hi >> shift)
+        Binary::Ushr => shift_count_bounds(ty, bounds(y)).map(|shift| {
+            let (lo, hi) = bounds(x);
+            (lo >> shift, hi >> shift)
         }),
-        Binary::Ishl => shift_count(ty, &of(y)).map_or_else(full, |shift| {
-            let inner = of(x);
-            if inner.hi <= (ty.unsigned_max() >> shift) { Fact::range(inner.lo << shift, inner.hi << shift) } else { full() }
+        Binary::Ishl => shift_count_bounds(ty, bounds(y)).and_then(|shift| {
+            let (lo, hi) = bounds(x);
+            (hi <= (ty.unsigned_max() >> shift)).then_some((lo << shift, hi << shift))
         }),
-        Binary::Udiv => match of(y).exact() {
-            Some(divisor) if divisor > 0 => {
-                let inner = of(x);
-                Fact::range(inner.lo / divisor, inner.hi / divisor)
-            }
-            _ => full(),
-        },
-        Binary::Urem => match of(y).exact() {
-            Some(divisor) if divisor > 0 => Fact::range(0, divisor - 1),
-            _ => full(),
-        },
+        Binary::Udiv => {
+            let (dlo, dhi) = bounds(y);
+            (dlo == dhi && dlo > 0).then(|| {
+                let (lo, hi) = bounds(x);
+                (lo / dlo, hi / dlo)
+            })
+        }
+        Binary::Urem => {
+            let (dlo, dhi) = bounds(y);
+            (dlo == dhi && dlo > 0).then_some((0, dlo - 1))
+        }
         Binary::Imul => {
-            let (a, b) = (of(x), of(y));
-            a.hi.checked_mul(b.hi).filter(|&hi| hi <= ty.unsigned_max()).map_or_else(full, |hi| Fact::range(a.lo * b.lo, hi))
+            let (a, b) = (bounds(x), bounds(y));
+            a.1.checked_mul(b.1).filter(|&hi| hi <= ty.unsigned_max()).map(|hi| (a.0 * b.0, hi))
         }
         Binary::Iadd => {
-            let (a, b) = (of(x), of(y));
-            added(ty, &a, &b).or_else(|| wrapped(ty, &a, &b)).or_else(|| wrapped(ty, &b, &a)).unwrap_or_else(full)
+            let (a, b) = (bounds(x), bounds(y));
+            added_bounds(ty, a, b).or_else(|| wrapped_bounds(ty, a, b)).or_else(|| wrapped_bounds(ty, b, a))
         }
         Binary::Isub => {
             if let Some(&Op::Binary(Binary::Ushr, base, count)) = ranges.op(func, y)
                 && base == x
             {
-                let inner = of(x);
-                let (lo, hi) = shift_count(ty, &of(count)).map_or((0, inner.hi), |k| (inner.lo - (inner.lo >> k), inner.hi - (inner.hi >> k)));
-                return Fact::range(lo, hi);
+                let (lo, hi) = bounds(x);
+                return Some(shift_count_bounds(ty, bounds(count)).map_or((0, hi), |k| (lo - (lo >> k), hi - (hi >> k))));
             }
-            let (a, b) = (of(x), of(y));
-            if a.lo >= b.hi {
-                return Fact::range(a.lo - b.hi, a.hi - b.lo);
+            let (a, b) = (bounds(x), bounds(y));
+            if a.0 >= b.1 {
+                return Some((a.0 - b.1, a.1 - b.0));
             }
-            b.exact().and_then(|k| added(ty, &a, &Fact::constant(ty, k.wrapping_neg() as i64))).unwrap_or_else(full)
+            (b.0 == b.1).then(|| {
+                let k = super::unsigned(b.0.wrapping_neg() as i64, ty);
+                added_bounds(ty, a, (k, k))
+            })?
         }
-        _ => full(),
+        _ => None,
     }
 }
 
-/// The range of `a + b` when no pair of values in the two ranges wraps at the width of `ty`.
-fn added(ty: Type, a: &Fact, b: &Fact) -> Option<Fact> {
-    a.hi.checked_add(b.hi).filter(|&hi| hi <= ty.unsigned_max()).map(|hi| Fact::range(a.lo + b.lo, hi))
+#[inline]
+fn added_bounds(ty: Type, a: (u64, u64), b: (u64, u64)) -> Option<(u64, u64)> {
+    a.1.checked_add(b.1).filter(|&hi| hi <= ty.unsigned_max()).map(|hi| (a.0 + b.0, hi))
 }
 
-/// The range of `a + k` for a constant `k` when every value of `a` wraps past the width of `ty`.
-fn wrapped(ty: Type, a: &Fact, k: &Fact) -> Option<Fact> {
-    let back = (ty.unsigned_max() - k.exact().filter(|&k| k > 0)?) + 1;
-    (a.lo >= back).then(|| Fact::range(a.lo - back, a.hi - back))
+#[inline]
+fn wrapped_bounds(ty: Type, a: (u64, u64), k: (u64, u64)) -> Option<(u64, u64)> {
+    let val = (k.0 == k.1 && k.0 > 0).then_some(k.0)?;
+    let back = (ty.unsigned_max() - val) + 1;
+    (a.0 >= back).then_some((a.0 - back, a.1 - back))
 }

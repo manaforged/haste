@@ -490,9 +490,28 @@ impl Fold {
 
     /// Sends each edge that passes a constant to a block holding only a branch on that parameter straight to the target the branch takes.
     fn thread(&self, func: &mut Function, pinned: &[bool]) -> bool {
-        let hop = func.blocks.iter().any(|block| matches!(block.insts[..], [only] if matches!(func.insts[only.index()].op, Op::Jump(..) | Op::Brif(..))) || matches!(block.insts[..], [_, last] if matches!(func.insts[last.index()].op, Op::Brif(..))));
+        let (mut hop, mut need_uses) = (false, false);
+        for block in &func.blocks {
+            match block.insts[..] {
+                [only] => match func.insts[only.index()].op {
+                    Op::Jump(next, _) if !pinned[next.index()] => { hop = true; need_uses |= !block.params.is_empty(); }
+                    Op::Brif(cond, ..) if block.params.contains(&cond) => (hop, need_uses) = (true, true),
+                    _ => {}
+                },
+                [cmp, last] => {
+                    let c = &func.insts[cmp.index()];
+                    if let (Op::Icmp(_, x, y), Some(res), Op::Brif(cond, ..)) = (&c.op, c.result, &func.insts[last.index()].op)
+                        && res == *cond && func.ty(*x).is_small_int() && (!block.params.is_empty() || (self.known(*x).is_some() && self.known(*y).is_some()))
+                    {
+                        (hop, need_uses) = (true, true);
+                    }
+                }
+                _ => {}
+            }
+            if hop && need_uses { break; }
+        }
         if !hop { return false; }
-        let mut uses = func.use_counts();
+        let mut uses = if need_uses { func.use_counts() } else { Vec::new() };
         let mut changed = false;
         for block in 0..func.blocks.len() {
             let Some(&last) = func.blocks[block].insts.last() else { continue };
@@ -521,8 +540,10 @@ impl Fold {
             (at, values) = (next, next_values);
         }
         if !self.agrees(func, at, &values) { return false; }
-        args.iter().for_each(|value| uses[value.index()] -= 1);
-        values.iter().for_each(|value| uses[value.index()] += 1);
+        if !uses.is_empty() {
+            args.iter().for_each(|value| uses[value.index()] -= 1);
+            values.iter().for_each(|value| uses[value.index()] += 1);
+        }
         (*target, *args) = (at, values);
         true
     }
@@ -561,23 +582,28 @@ impl Fold {
         let Some(compare) = compare else { return self.known(arg(condition)?) };
         let data = &func.insts[compare.index()];
         let (Op::Icmp(cc, x, y), Some(result)) = (&data.op, data.result) else { return None };
-        if result != condition || uses[result.index()] != 1 || !func.ty(*x).is_small_int() {
-            return None;
-        }
+        if result != condition || !func.ty(*x).is_small_int() { return None; }
         let value = |operand: Value| arg(operand).map_or_else(|| self.known(operand), |given| self.known(given));
-        Some(i64::from(holds(*cc, func.ty(*x), value(*x)?, value(*y)?)))
+        let (vx, vy) = (value(*x)?, value(*y)?);
+        if uses[result.index()] != 1 { return None; }
+        Some(i64::from(holds(*cc, func.ty(*x), vx, vy)))
     }
 
     /// Replaces each block parameter that every reachable edge gives one value, other than itself, or the value of an earlier parameter of its block.
     fn params(&mut self, func: &Function, reachable: &[bool], pinned: &[bool]) -> bool {
-        for param in func.blocks.iter().flat_map(|block| &block.params) {
-            self.incoming[param.index()] = None;
-            self.mixed[param.index()] = false;
+        let (mut any, mut multi) = (false, false);
+        for (b, data) in func.blocks.iter().enumerate() {
+            if reachable[b] && !pinned[b] && !data.params.is_empty() { any = true; multi |= data.params.len() > 1; }
         }
-        let mut into: Vec<Vec<&[Value]>> = vec![Vec::new(); func.blocks.len()];
+        if !any { return false; }
+        if self.incoming.is_empty() { (self.incoming, self.mixed) = (vec![None; func.types.len()], vec![false; func.types.len()]); }
+        for param in func.blocks.iter().flat_map(|block| &block.params) {
+            (self.incoming[param.index()], self.mixed[param.index()]) = (None, false);
+        }
+        let mut into: Vec<Vec<&[Value]>> = if multi { vec![Vec::new(); func.blocks.len()] } else { Vec::new() };
         for (block, _) in reachable.iter().enumerate().filter(|(_, live)| **live) {
             for_edges(func, block, |target, args| {
-                if func.blocks[target.index()].params.len() > 1 { into[target.index()].push(args); }
+                if multi && func.blocks[target.index()].params.len() > 1 { into[target.index()].push(args); }
                 for (param, arg) in func.blocks[target.index()].params.iter().zip(args) {
                     let arg = self.find(*arg);
                     match self.incoming[param.index()] {
@@ -593,11 +619,10 @@ impl Fold {
         for (block, data) in func.blocks.iter().enumerate().filter(|(block, _)| reachable[*block] && !pinned[*block]) {
             for param in &data.params {
                 if let (Some(value), false) = (self.incoming[param.index()], self.mixed[param.index()]) && self.subst[param.index()] == *param {
-                    self.subst[param.index()] = value;
-                    changed = true;
+                    (self.subst[param.index()], changed) = (value, true);
                 }
             }
-            changed |= self.twins(func, &data.params, &into[block]);
+            if multi && data.params.len() > 1 { changed |= self.twins(func, &data.params, &into[block]); }
         }
         changed
     }
@@ -671,35 +696,8 @@ pub(crate) fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(
     }
 }
 
-fn pinned(func: &Function, entry: Block) -> Vec<bool> {
-    let mut pinned = vec![false; func.blocks.len()];
-    pinned[entry.index()] = true;
-    for block in 0..func.blocks.len() as u32 {
-        match func.last(Block(block)) {
-            Some(Op::TryCall { normal, handler, .. }) => (pinned[normal.index()], pinned[handler.index()]) = (true, true),
-            Some(Op::BrTable(_, d, t)) => { pinned[d.index()] = true; t.iter().for_each(|x| pinned[x.index()] = true); }
-            _ => {}
-        }
-    }
-    pinned
-}
-
-fn drop_params(func: &mut Function, fold: &Fold) -> bool {
-    let gone = |param: &Value| fold.subst[param.index()] != *param;
-    if !func.blocks.iter().any(|block| block.params.iter().any(gone)) { return false; }
-    let blocks = &func.blocks;
-    let keep = |args: &mut Vec<Value>, target: Block| { let mut i = 0; let p = &blocks[target.index()].params; args.retain(|_| { i += 1; !p.get(i - 1).is_some_and(gone) }); };
-    for block in blocks {
-        let Some(&last) = block.insts.last() else { continue };
-        match &mut func.insts[last.index()].op {
-            Op::Jump(target, args) => keep(args, *target),
-            Op::Brif(_, then, then_args, otherwise, else_args) => { keep(then_args, *then); keep(else_args, *otherwise); }
-            _ => {}
-        }
-    }
-    for block in &mut func.blocks { block.params.retain(|param| !gone(param)); }
-    true
-}
+fn pinned(func: &Function, entry: Block) -> Vec<bool> { unused::pinned(func, entry) }
+fn drop_params(func: &mut Function, fold: &Fold) -> bool { unused::drop_params(func, &fold.subst) }
 
 /// The instruction in a block that defines each value.
 pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
@@ -786,7 +784,7 @@ pub(crate) fn table_target(index: u64, default: Block, targets: &[Block]) -> Blo
 pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let Some(entry) = func.entry else { return Domain::NONE };
     let count = func.types.len();
-    let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: vec![None; count], mixed: vec![false; count], defs: defs(func) };
+    let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: Vec::new(), mixed: Vec::new(), defs: defs(func) };
     let pinned = pinned(func, entry);
     let (mut changed, mut cfg_changed) = settle_cfg_and_params(func, &mut fold, entry, effort, &pinned);
     let (dropped_params, mut body_changed) = (drop_params(func, &fold), false);

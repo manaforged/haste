@@ -40,12 +40,6 @@ impl Fact {
         Self { lo: 0, hi: ty.unsigned_max(), not: Vec::new() }
     }
 
-    /// Exactly the constant `imm` of type `ty`.
-    fn constant(ty: Type, imm: i64) -> Self {
-        let value = unsigned(imm, ty);
-        Self::range(value, value)
-    }
-
     pub(super) fn range(lo: u64, hi: u64) -> Self {
         Self { lo, hi, not: Vec::new() }
     }

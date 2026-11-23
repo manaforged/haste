@@ -60,6 +60,9 @@ pub(super) fn dead(func: &mut Function) -> bool {
 
 /// Drops each block parameter that nothing reads but edge arguments of other dropped parameters, with its argument on every edge; parameters of `pinned` blocks stay.
 pub(super) fn run(func: &mut Function, pinned: &[bool]) -> bool {
+    if !func.blocks.iter().enumerate().any(|(b, d)| !pinned[b] && !d.params.is_empty()) {
+        return false;
+    }
     let mut live = vec![false; func.types.len()];
     for (block, data) in func.blocks.iter().enumerate() {
         if pinned[block] {
@@ -109,6 +112,53 @@ pub(super) fn run(func: &mut Function, pinned: &[bool]) -> bool {
     }
     for block in &mut func.blocks {
         block.params.retain(|param| live[param.index()]);
+    }
+    true
+}
+
+pub(super) fn pinned(func: &Function, entry: Block) -> Vec<bool> {
+    let mut pinned = vec![false; func.blocks.len()];
+    pinned[entry.index()] = true;
+    for block in 0..func.blocks.len() as u32 {
+        match func.last(Block(block)) {
+            Some(Op::TryCall { normal, handler, .. }) => (pinned[normal.index()], pinned[handler.index()]) = (true, true),
+            Some(Op::BrTable(_, d, t)) => {
+                pinned[d.index()] = true;
+                t.iter().for_each(|x| pinned[x.index()] = true);
+            }
+            _ => {}
+        }
+    }
+    pinned
+}
+
+pub(super) fn drop_params(func: &mut Function, subst: &[Value]) -> bool {
+    let gone = |param: &Value| subst[param.index()] != *param;
+    if !func.blocks.iter().any(|block| block.params.iter().any(gone)) {
+        return false;
+    }
+    let blocks = &func.blocks;
+    let keep = |args: &mut Vec<Value>, target: Block| {
+        let mut i = 0;
+        let p = &blocks[target.index()].params;
+        args.retain(|_| {
+            i += 1;
+            !p.get(i - 1).is_some_and(gone)
+        });
+    };
+    for block in blocks {
+        let Some(&last) = block.insts.last() else { continue };
+        match &mut func.insts[last.index()].op {
+            Op::Jump(target, args) => keep(args, *target),
+            Op::Brif(_, then, then_args, otherwise, else_args) => {
+                keep(then_args, *then);
+                keep(else_args, *otherwise);
+            }
+            _ => {}
+        }
+    }
+    for block in &mut func.blocks {
+        block.params.retain(|param| !gone(param));
     }
     true
 }

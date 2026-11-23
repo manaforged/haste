@@ -291,7 +291,7 @@ pub(super) fn read_names_crate(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Na
         let vis = read_vis(cur)?;
         let stamp = if cur.u8()? != 0 { Some((read_def(cur, remap)?, cur.u32()?)) } else { None };
         let active = cur.u8()? != 0;
-        pending.push(Pending { module, file, import, segments, absolute, dollar, name, vis, stamp, active });
+        pending.push(Pending { module, file, import, segments, absolute, dollar, name, vis, stamp, guard: Default::default(), active });
     }
     let enum_len = cur.count()?;
     let mut enums = HashMap::with_capacity_and_hasher(enum_len, Default::default());

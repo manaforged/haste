@@ -297,7 +297,7 @@ pub(super) fn classify_uses(
     cfg: &Cfg,
     slots: &[Option<(StackSlot, i32)>],
     tracked: &[TrackRoot],
-    is_spill: Option<&[bool]>,
+    (is_spill, positions): (Option<&[bool]>, bool),
 ) -> SlotEscapes {
     let has_noalias = func.signature.params.iter().any(|abi| abi.noalias);
     if func.slots.is_empty() && !has_noalias {
@@ -359,15 +359,17 @@ pub(super) fn classify_uses(
                 }
                 continue;
             }
-            used.clear();
+            if positions {
+                used.clear();
+            }
             let mut has_tracked = false;
             data.op.for_operands(|v| {
                 let vi = v.index();
                 if slots[vi].is_some() || matches!(tracked[vi], TrackRoot::Set(_)) {
                     has_tracked = true;
                     counts.total[vi] += 1;
-                    if let Some(s) = slot_root(v, slots, tracked) {
-                        let uw = counts.unwind_stores.get(vi).copied().unwrap_or(0);
+                    if positions && let Some(s) = slot_root(v, slots, tracked) {
+                        let uw = if has_indirect_unwind { counts.unwind_stores[vi] } else { 0 };
                         used.push((v, s, counts.safe[vi] + uw));
                     }
                 }
@@ -377,13 +379,13 @@ pub(super) fn classify_uses(
             }
             let cx = EscapeCx { func, cfg, slots, tracked, is_const: &is_const, unwind_write_only: &unwind_write_only, has_noalias, danger: &danger };
             classify_inst(&cx, &mut counts, b, pos, data);
-            if !used.is_empty() {
+            if positions && !used.is_empty() {
                 for (i, &(v, s, before)) in used.iter().enumerate() {
                     if used[..i].iter().any(|&(u, _, _)| u == v) {
                         continue;
                     }
                     let uses = used[i..].iter().filter(|&&(u, _, _)| u == v).count() as u32;
-                    let after = counts.safe[v.index()] + counts.unwind_stores.get(v.index()).copied().unwrap_or(0);
+                    let after = counts.safe[v.index()] + if has_indirect_unwind { counts.unwind_stores[v.index()] } else { 0 };
                     if after - before < uses {
                         points.entry(s.0).or_default().push((b.index() as u32, pos as u32));
                     }
@@ -473,20 +475,26 @@ pub(super) fn finish_fresh_owners(
     updated
 }
 
-pub(super) fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool {
+#[inline]
+pub(super) fn inst_escapes_caller_loc(op: &Op, tracked: &[TrackRoot]) -> bool {
     let is_cl = |v: Value| tracked[v.index()] == TrackRoot::Set(MemRoot::CallerLoc);
+    match *op {
+        Op::Load(addr, 0) if is_cl(addr) => false,
+        Op::Store(val, addr, 0) if is_cl(addr) && !is_cl(val) => false,
+        Op::Convert(crate::ir::Convert::Bitcast, _) | Op::Jump(..) | Op::Brif(..) => false,
+        _ => {
+            let mut bad = false;
+            op.for_operands(|v| bad |= is_cl(v));
+            bad
+        }
+    }
+}
+
+pub(super) fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool {
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
-            let op = &func.insts[inst.index()].op;
-            match *op {
-                Op::Load(addr, 0) if is_cl(addr) => {}
-                Op::Store(val, addr, 0) if is_cl(addr) && !is_cl(val) => {}
-                Op::Convert(crate::ir::Convert::Bitcast, _) | Op::Jump(..) | Op::Brif(..) => {}
-                _ => {
-                    let mut bad = false;
-                    op.for_operands(|v| bad |= is_cl(v));
-                    if bad { return true; }
-                }
+            if inst_escapes_caller_loc(&func.insts[inst.index()].op, tracked) {
+                return true;
             }
         }
     }
