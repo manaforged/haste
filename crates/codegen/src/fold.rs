@@ -662,38 +662,40 @@ impl Fold {
         });
         let want: Vec<bool> = (0..func.blocks.len()).map(has_cmp).collect();
         if !want.iter().any(|&w| w) { return false; }
-        let (cfg, def_blocks) = (func.cfg(), func.def_blocks());
-        let mut incoming: Vec<Vec<(Block, Vec<Value>)>> = vec![Vec::new(); func.blocks.len()];
-        for (b, _) in reachable.iter().enumerate().filter(|(_, live)| **live) { for_edges(func, b, |t, a| if want[t.index()] { incoming[t.index()].push((Block(b as u32), a.to_vec())); }); }
-        let mut changed = false;
-        for (b, edges) in incoming.iter().enumerate() {
-            if !want[b] || edges.is_empty() { continue; }
-            let (block, params, mut drop) = (Block(b as u32), &func.blocks[b].params, Vec::new());
-            for &inst in &func.blocks[b].insts {
-                let (cond, brif) = match func.insts[inst.index()].op { Op::Trapz(c) => (c, None), Op::Brif(c, tb, ref ta, eb, ref ea) if tb != eb => (c, Some((tb, ta.clone(), eb, ea.clone()))), _ => continue };
-                let Some((cc, ty, x, y)) = extract_cmp(func, &env, cond) else { continue };
-                let check = |wc: IntCC| edges.iter().all(|(pred, args)| entry_map_val(&env, &def_blocks, block, params, args, x).zip(entry_map_val(&env, &def_blocks, block, params, args, y)).is_some_and(|(mx, my)| edge_proves_want(func, &cfg, &env, (*pred, block), ty, (wc, mx, my))));
-                match (check(cc).then_some(true).or_else(|| check(cc.inverse()).then_some(false)), brif) {
-                    (Some(true), None) => { drop.push(inst); changed = true; }
-                    (Some(false), None) => { func.insts[inst.index()].op = Op::Trap; changed = true; }
-                    (Some(t), Some((tb, ta, eb, ea))) => { func.insts[inst.index()].op = Op::Jump(if t { tb } else { eb }, if t { ta } else { ea }); changed = true; }
-                    _ => {}
+        let (cfg, mut edits) = (func.cfg(), Vec::new());
+        {
+            let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
+            for (b, _) in reachable.iter().enumerate().filter(|(_, live)| **live) { for_edges(func, b, |t, a| if want[t.index()] { incoming[t.index()].push((Block(b as u32), a)); }); }
+            for (b, edges) in incoming.iter().enumerate() {
+                if !want[b] || edges.is_empty() { continue; }
+                let (block, params, insts) = (Block(b as u32), &func.blocks[b].params, &func.blocks[b].insts);
+                for &inst in insts {
+                    let (cond, is_brif) = match func.insts[inst.index()].op { Op::Trapz(c) => (c, false), Op::Brif(c, tb, _, eb, _) if tb != eb => (c, true), _ => continue };
+                    let Some((cc, ty, x, y)) = extract_cmp(func, &env, cond) else { continue };
+                    let (vx, vy) = (env.find(x), env.find(y));
+                    let local = |v: Value| env.defs.get(v.index()).copied().flatten().is_some_and(|di| insts.contains(&di));
+                    let (lx, ly) = (local(vx), local(vy));
+                    let check = |wc: IntCC| edges.iter().all(|&(pred, args)| entry_map_val(&env, params, args, vx, lx).zip(entry_map_val(&env, params, args, vy, ly)).is_some_and(|(mx, my)| edge_proves_want(func, &cfg, &env, (pred, block), ty, (wc, mx, my))));
+                    if let Some(t) = check(cc).then_some(true).or_else(|| check(cc.inverse()).then_some(false)) { edits.push((b, inst, if is_brif { Some(t) } else if t { None } else { Some(false) })); }
                 }
             }
-            if !drop.is_empty() { func.blocks[b].insts.retain(|i| !drop.contains(i)); }
         }
-        changed
+        if edits.is_empty() { return false; }
+        for (b, inst, kind) in edits {
+            match (kind, std::mem::replace(&mut func.insts[inst.index()].op, Op::Trap)) {
+                (Some(t), Op::Brif(_, tb, ta, eb, ea)) => func.insts[inst.index()].op = Op::Jump(if t { tb } else { eb }, if t { ta } else { ea }),
+                (None, Op::Trapz(_)) => func.blocks[b].insts.retain(|&i| i != inst),
+                _ => {}
+            }
+        }
+        true
     }
 }
 
 /// Calls `f` with each block the terminator of `block` jumps to with arguments, and those arguments.
 pub(crate) fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(Block, &'a [Value])) {
     let Some(last) = func.blocks[block].insts.last() else { return };
-    match &func.insts[last.index()].op {
-        Op::Jump(target, args) => f(*target, args),
-        Op::Brif(_, then, then_args, otherwise, else_args) => { f(*then, then_args); f(*otherwise, else_args); }
-        _ => {}
-    }
+    match &func.insts[last.index()].op { Op::Jump(target, args) => f(*target, args), Op::Brif(_, then, then_args, otherwise, else_args) => { f(*then, then_args); f(*otherwise, else_args); } _ => {} }
 }
 
 fn pinned(func: &Function, entry: Block) -> Vec<bool> { unused::pinned(func, entry) }
@@ -745,10 +747,9 @@ fn extract_cmp(func: &Function, env: &crate::cse::CmpEnv<'_>, cond: Value) -> Op
     func.ty(x).is_small_int().then_some((if taken { cc } else { cc.inverse() }, func.ty(x), x, y))
 }
 
-fn entry_map_val(env: &crate::cse::CmpEnv<'_>, def_blocks: &[Option<Block>], block: Block, params: &[Value], args: &[Value], raw: Value) -> Option<crate::cse::EdgeVal> {
-    let v = env.find(raw);
+fn entry_map_val(env: &crate::cse::CmpEnv<'_>, params: &[Value], args: &[Value], v: Value, is_local: bool) -> Option<crate::cse::EdgeVal> {
     if let Some(k) = params.iter().position(|&p| p == v) { return Some(env.edge_val(args[k])); }
-    env.consts.get(v.index()).copied().flatten().map(crate::cse::EdgeVal::Const).or_else(|| (def_blocks[v.index()] != Some(block)).then_some(crate::cse::EdgeVal::Val(v)))
+    env.consts.get(v.index()).copied().flatten().map(crate::cse::EdgeVal::Const).or_else(|| (!is_local).then_some(crate::cse::EdgeVal::Val(v)))
 }
 
 fn settle_cfg_and_params(func: &mut Function, fold: &mut Fold, entry: Block, effort: crate::Effort, pinned: &[bool]) -> (bool, bool) {

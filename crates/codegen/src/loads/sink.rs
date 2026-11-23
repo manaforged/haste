@@ -360,19 +360,36 @@ fn plan_store_frontier(
     (live_in, reads, writes): (&[u64], &[u64], &[u64]),
     (b, bit): (Block, u64),
 ) -> Option<Vec<Block>> {
+    let (mut has_fast, mut has_clean_dom) = (false, false);
+    for s in func.successors(b) {
+        let si = s.index();
+        if live_in[si] & bit == 0 {
+            has_fast = true;
+        } else if cfg.reachable[si] && cfg.dominates(b, s) && (reads[si] | writes[si]) & bit == 0 {
+            has_clean_dom = true;
+        }
+    }
+    if !has_fast && !has_clean_dom {
+        return None;
+    }
     let n = func.blocks.len();
-    let live: Vec<bool> = live_in.iter().map(|m| m & bit != 0).collect();
-    let (mut in_r, mut work) = (vec![false; n], vec![b]);
+    let (mut in_r, mut work, mut saw_fast) = (vec![false; n], vec![b], has_fast);
     in_r[b.index()] = true;
     while let Some(u) = work.pop() {
         for s in func.successors(u) {
             let si = s.index();
-            if !in_r[si] && cfg.reachable[si] && cfg.dominates(b, s) && live[si] && (reads[si] | writes[si]) & bit == 0 {
+            if live_in[si] & bit == 0 {
+                saw_fast = true;
+            } else if !in_r[si] && cfg.reachable[si] && cfg.dominates(b, s) && (reads[si] | writes[si]) & bit == 0 {
                 in_r[si] = true;
                 work.push(s);
             }
         }
     }
+    if !saw_fast {
+        return None;
+    }
+    let live: Vec<bool> = live_in.iter().map(|m| m & bit != 0).collect();
     crate::drop_elide::sink_frontier(func, cfg, &cfg.loops().depths, (&live, None, b), &mut in_r)
 }
 

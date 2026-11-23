@@ -93,13 +93,14 @@ fn sink_frontier_with_calls(
     in_r: &mut [bool],
 ) -> Option<Vec<Block>> {
     let n = func.blocks.len();
+    let mut members: Vec<Block> = in_r.iter().enumerate().filter_map(|(bi, &m)| m.then_some(Block(bi as u32))).collect();
     loop {
         let mut pruned = false;
-        for bi in 0..n {
-            if !in_r[bi] || bi == b.index() {
-                continue;
+        members.retain(|&blk| {
+            let bi = blk.index();
+            if bi == b.index() {
+                return true;
             }
-            let blk = Block(bi as u32);
             let bad_pred = cfg.preds_of(blk).iter().any(|&p| {
                 cfg.reachable[p.index()]
                     && !in_r[p.index()]
@@ -108,18 +109,24 @@ fn sink_frontier_with_calls(
             let bad_succ = func.successors(blk).any(|s| !in_r[s.index()] && live_in[s.index()] && !target_ok(cfg, depths, always_active, call_in_loop, b, in_r, s));
             if bad_pred || bad_succ {
                 (in_r[bi], pruned) = (false, true);
+                false
+            } else {
+                true
             }
-        }
+        });
         if !pruned {
             break;
         }
     }
     let (mut useful, mut q) = (vec![false; n], Vec::new());
-    for bi in 0..n {
-        if in_r[bi] && func.successors(Block(bi as u32)).any(|s| !in_r[s.index()] && !live_in[s.index()]) {
-            useful[bi] = true;
-            q.push(Block(bi as u32));
+    for &blk in &members {
+        if func.successors(blk).any(|s| !in_r[s.index()] && !live_in[s.index()]) {
+            useful[blk.index()] = true;
+            q.push(blk);
         }
+    }
+    if q.is_empty() {
+        return None;
     }
     while let Some(u) = q.pop() {
         for &p in cfg.preds_of(u) {
@@ -129,17 +136,18 @@ fn sink_frontier_with_calls(
             }
         }
     }
-    for bi in 0..n {
-        if in_r[bi] && bi != b.index() && !useful[bi] {
+    members.retain(|&blk| {
+        let bi = blk.index();
+        if bi != b.index() && !useful[bi] {
             in_r[bi] = false;
+            false
+        } else {
+            true
         }
-    }
+    });
     let (mut frontier, mut skipped_fast) = (Vec::new(), false);
-    for bi in 0..n {
-        if !in_r[bi] {
-            continue;
-        }
-        for s in func.successors(Block(bi as u32)) {
+    for &blk in &members {
+        for s in func.successors(blk) {
             if in_r[s.index()] {
                 continue;
             }

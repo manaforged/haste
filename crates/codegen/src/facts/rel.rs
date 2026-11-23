@@ -21,8 +21,8 @@ pub(super) const fn kind_bit(kind: RelKind) -> u8 {
 }
 
 #[inline]
-fn val_bit(v: Value) -> u64 {
-    1_u64 << (v.index() & 63)
+fn val_bit(v: Value) -> u128 {
+    1_u128 << (v.index() & 127)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,11 +76,11 @@ pub(super) fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
 pub(super) struct Path {
     fact_vals: Vec<Value>,
     fact_data: Vec<Fact>,
-    fact_mask: u64,
+    fact_mask: u128,
     rels: Vec<Rel>,
     rel_kinds: u8,
-    rel_src_mask: u64,
-    rel_dst_mask: u64,
+    rel_src_mask: u128,
+    rel_dst_mask: u128,
     no_wrap_adds: Vec<(Value, Value)>,
     pub(super) uppers: Uppers,
 }
@@ -138,7 +138,11 @@ impl Path {
 
     /// Records `fact` on `value`, forgetting the oldest fact past `MAX_FACTS`.
     pub(super) fn add(&mut self, ranges: &Ranges, value: Value, fact: Fact) {
-        let merged = self.fact(ranges, value).meet(&fact);
+        let cur = self.fact(ranges, value);
+        if cur.subsumes(&fact) {
+            return;
+        }
+        let merged = cur.meet(&fact);
         let bit = val_bit(value);
         if self.fact_mask & bit != 0
             && let Some(pos) = self.fact_vals.iter().position(|&at| at == value)
@@ -152,7 +156,7 @@ impl Path {
             self.fact_data.remove(0);
             self.fact_vals.push(value);
             self.fact_data.push(merged);
-            self.fact_mask = self.fact_vals.iter().fold(0_u64, |m, &v| m | val_bit(v));
+            self.fact_mask = self.fact_vals.iter().fold(0_u128, |m, &v| m | val_bit(v));
         } else {
             self.fact_vals.push(value);
             self.fact_data.push(merged);
@@ -299,6 +303,7 @@ impl Path {
         }
     }
 
+    #[inline]
     pub(super) fn steps_from(&self, ty: Type, start: Value, kinds: (RelKind, RelKind)) -> bool {
         let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
         if self.rel_kinds & needed == 0 || self.rel_src_mask & val_bit(start) == 0 {
@@ -307,6 +312,7 @@ impl Path {
         self.rels.iter().any(|&r| rel_step(r, start, ty, kinds).is_some())
     }
 
+    #[inline]
     pub(super) fn steps_into(&self, ty: Type, target: Value, kinds: (RelKind, RelKind)) -> bool {
         let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
         if self.rel_kinds & needed == 0 || self.rel_dst_mask & val_bit(target) == 0 {

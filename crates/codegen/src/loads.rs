@@ -301,18 +301,17 @@ fn scan(
     known: &mut KnownLoads,
     bases: &mut Vec<(MemBase, MemRoot)>,
     join: &mut JoinCtx<'_>,
+    (bufs, clobbers_seen): (&mut ScanBuf, &mut Vec<BlockClobber>),
 ) -> (bool, bool) {
-    let insts = std::mem::take(&mut func.blocks[block.index()].insts);
-    let mut bufs = ScanBuf {
-        kept: Vec::with_capacity(insts.len()),
-        pending_stores: Vec::new(),
-        const_stores: Vec::new(),
-    };
-    let mut clobbers_seen = Vec::new();
+    let mut insts = std::mem::take(&mut func.blocks[block.index()].insts);
+    bufs.kept.clear();
+    bufs.pending_stores.clear();
+    bufs.const_stores.clear();
+    clobbers_seen.clear();
     let (mut changed, mut renamed) = (false, false);
     let mut guard = FarCseGuard::new(insts.len(), func.types.len());
     let mut slices = SubwordSlices::new();
-    for inst in insts {
+    for &inst in &insts {
         let kept_before = bufs.kept.len();
         if let Some((_, from, bytes)) = copy_len(&func.insts[inst.index()].op, state.consts) {
             if bytes > 0 {
@@ -337,11 +336,11 @@ fn scan(
                     bufs.const_stores.clear();
                 }
                 Op::Return(..) if state.post_inline => {
-                    changed |= drop_stores_if(func, &mut bufs, &mut guard, |ploc| slot_unescaped(state.prov, ploc));
+                    changed |= drop_stores_if(func, bufs, &mut guard, |ploc| slot_unescaped(state.prov, ploc));
                 }
                 _ => {}
             }
-            changed |= remat::drop_freed_stores(func, state, (&mut bufs, &mut guard), inst);
+            changed |= remat::drop_freed_stores(func, state, (bufs, &mut guard), inst);
         }
         match effect(func, state, inst) {
             Effect::Read(loc, ty, result) => {
@@ -448,16 +447,16 @@ fn scan(
                 record_base(bases, loc);
                 let track = state.post_inline || !matches!(loc.root, MemRoot::Slot(s) if !state.prov.slot_unescaped(s));
                 if track && !state.post_inline {
-                    changed |= drop_covered_stores(func, &mut bufs, &mut guard, (loc, false));
+                    changed |= drop_covered_stores(func, bufs, &mut guard, (loc, false));
                 }
                 let mut push_loc = loc;
-                if let Some(wide_loc) = try_coalesce_store(func, state, known, bases, &mut bufs, (inst, loc, ty, value, track)) {
+                if let Some(wide_loc) = try_coalesce_store(func, state, known, bases, bufs, (inst, loc, ty, value, track)) {
                     push_loc = wide_loc;
                     changed = true;
                 }
                 if track {
                     if state.post_inline {
-                        changed |= drop_covered_stores(func, &mut bufs, &mut guard, (push_loc, true));
+                        changed |= drop_covered_stores(func, bufs, &mut guard, (push_loc, true));
                     }
                     bufs.pending_stores.push((push_loc, bufs.kept.len()));
                 }
@@ -468,7 +467,7 @@ fn scan(
                     record_base(bases, wloc);
                     if state.post_inline {
                         slices.prune_on_write(func, state.prov, wloc, Some(inst));
-                        drop_covered_stores(func, &mut bufs, &mut guard, (wloc, true));
+                        drop_covered_stores(func, bufs, &mut guard, (wloc, true));
                     }
                     bufs.pending_stores.retain(|&(ploc, _)| !may_alias_at(wloc, ploc, state.prov, Some(inst)));
                     bufs.const_stores.retain(|cs| !may_alias_at(wloc, cs.loc, state.prov, Some(inst)));
@@ -538,7 +537,7 @@ fn scan(
                 invalidate_preserving(func, known, bases, (clobber_op, Some(inst)), state.prov);
                 if let Some((bytes, dst_loc, _)) = canon_move {
                     if state.post_inline && bytes > 0 {
-                        changed |= drop_covered_stores(func, &mut bufs, &mut guard, (dst_loc, true));
+                        changed |= drop_covered_stores(func, bufs, &mut guard, (dst_loc, true));
                     }
                     if let Some((dst_loc, copied)) = copy_remaps
                         && let Some(dst_end) = dst_loc.offset.checked_add(i64::from(bytes))
@@ -572,7 +571,8 @@ fn scan(
         guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
     }
     bases.retain(|&(base, _)| !known.entries_for(base).is_empty());
-    func.blocks[block.index()].insts = bufs.kept.into_iter().flatten().collect();
+    if changed { insts.clear(); insts.extend(bufs.kept.drain(..).flatten()); }
+    func.blocks[block.index()].insts = insts;
     (changed, renamed)
 }
 
@@ -712,21 +712,15 @@ fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affi
     changed
 }
 
-fn collect_scan_meta(
-    func: &Function,
-) -> Option<(Vec<Option<Inst>>, Vec<Option<i64>>, Vec<Option<(Value, Value, Value)>>)> {
-    let mut defs = vec![None; func.types.len()];
-    let mut consts = vec![None; func.types.len()];
-    let mut selects = vec![None; func.types.len()];
-    let mut accesses = false;
+fn collect_scan_meta(func: &Function) -> Option<(Vec<Option<Inst>>, Vec<Option<i64>>, Vec<Option<(Value, Value, Value)>>)> {
+    let n = func.types.len();
+    let (mut defs, mut consts, mut selects, mut accesses) = (vec![None; n], vec![None; n], Vec::new(), false);
     for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let data = &func.insts[inst.index()];
-        if let Some(result) = data.result {
-            defs[result.index()] = Some(inst);
-        }
+        if let Some(result) = data.result { defs[result.index()] = Some(inst); }
         match (&data.op, data.result) {
             (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
-            (&Op::Select(c, a, b), Some(result)) => selects[result.index()] = Some((c, a, b)),
+            (&Op::Select(c, a, b), Some(result)) => { if selects.is_empty() { selects.resize(n, None); } selects[result.index()] = Some((c, a, b)); }
             (op, _) if matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..)) => accesses = true,
             _ => {}
         }
@@ -773,11 +767,13 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     let (mut visited, mut added_phis) = (vec![false; func.blocks.len()], vec![0u8; func.blocks.len()]);
     let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
     let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = vec![Vec::new(); func.blocks.len()];
+    let mut bufs = ScanBuf { kept: Vec::new(), pending_stores: Vec::new(), const_stores: Vec::new() };
+    let mut clobbers_seen = Vec::new();
     for &block in &cfg.rpo {
         let (mut known, mut bases) = bw.entry_known(func, state.subst, &known_out, &block_bases, block);
         let preds = eligible_join_preds(func, &cfg, &visited, block);
         let mut join = JoinCtx { cfg: &cfg, bw: &bw, known_out: &known_out, block_bases: &block_bases, visited: &visited, def_blocks: &mut def_blocks, preds, added_phis: &mut added_phis };
-        let (bc, br) = scan(func, block, &mut state, &mut known, &mut bases, &mut join);
+        let (bc, br) = scan(func, block, &mut state, &mut known, &mut bases, &mut join, (&mut bufs, &mut clobbers_seen));
         if has_join { def_blocks.resize(func.types.len(), Some(block)); }
         visited[block.index()] = true;
         (scan_changed, changed, renamed) = (scan_changed | bc, changed | bc, renamed | br);

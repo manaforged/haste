@@ -49,6 +49,12 @@ impl Fact {
         (self.lo == self.hi).then_some(self.lo)
     }
 
+    /// Whether `self` already implies every constraint in `other`.
+    #[inline]
+    pub(super) fn subsumes(&self, other: &Fact) -> bool {
+        self.lo >= other.lo && self.hi <= other.hi && (other.not.is_empty() || other.not.iter().all(|&v| !self.admits(v)))
+    }
+
     /// What both facts say.
     pub(super) fn meet(mut self, other: &Fact) -> Self {
         self.lo = self.lo.max(other.lo);
@@ -754,7 +760,8 @@ fn settle_ctrl(
         }
         _ => {
             if let Some(addr) = transfer::deref_ptr(&data.op) && func.ty(addr) == Type::I64 {
-                path.add(ranges, dom.resolve(addr), Fact::range(1, u64::MAX));
+                let resolved = dom.resolve(addr);
+                if path.fact(ranges, resolved).lo == 0 { path.add(ranges, resolved, Fact::range(1, u64::MAX)); }
             }
         }
     }
