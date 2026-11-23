@@ -2,7 +2,10 @@ pub(crate) mod consts;
 mod demote;
 mod hints;
 pub(crate) mod hoist;
+mod preserved;
 pub(crate) mod walk;
+
+pub(crate) use preserved::{cold_cached_frame, cold_thread_cell, is_preserved_call_op, used_preserved_leaf_regs};
 
 use crate::cfg::{Cfg, Loops};
 use crate::fold::{constant, holds};
@@ -500,37 +503,6 @@ fn int_class<'a, R: Copy + PartialEq>(
     Class { saved: regs.saved, leaf, arrivals, passed, clobbers }
 }
 
-/// Returns `(lookup, [slot, size, init])` when a non-try `ThreadCell` call has static arguments eligible for inline TLS with register-preserving cold miss stub.
-pub(crate) fn cold_thread_cell<R>(
-    func: &Function,
-    (callee, args): (Value, &[Value]),
-    through: &[Option<CallTarget>],
-    locations: &[Location<R>],
-    elided: &[bool],
-) -> Option<(u32, [Value; 3])> {
-    let Some(CallTarget::Symbol(lookup)) = through[callee.index()] else { return None };
-    if !func.is_thread_cell(callee) {
-        return None;
-    }
-    let [slot, size, init] = *args else { return None };
-    let static_ok = |v: Value| !elided[v.index()] && matches!(locations[v.index()], Location::Imm(_) | Location::Symbol(_) | Location::SlotAddr(_));
-    if !(static_ok(slot) && static_ok(size) && static_ok(init)) {
-        return None;
-    }
-    matches!(locations[slot.index()], Location::Symbol(_) | Location::Imm(0)).then_some((lookup, [slot, size, init]))
-}
-
-pub(crate) fn cold_thread_cell_op<R>(
-    func: &Function,
-    op: &Op,
-    through: &[Option<CallTarget>],
-    locations: &[Location<R>],
-    elided: &[bool],
-) -> Option<(u32, [Value; 3])> {
-    let Op::Call { callee, args, .. } = op else { return None };
-    cold_thread_cell(func, (*callee, args), through, locations, elided)
-}
-
 fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, bool)>>, preserved_calls: &[u32]) -> Class<'static, u8> {
     let arrivals = params.iter().map(|loc| match *loc { Loc::Float(reg) => vec![reg], _ => Vec::new() }).collect();
     let clobbers = if preserved_calls.is_empty() || regs.float.is_empty() {
@@ -622,8 +594,14 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let promoted_syms = regs.absolute_calls.then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
-    let preserved_tc: Vec<bool> = if preserve_tc && func.has_thread_cell() {
-        func.insts.iter().map(|d| cold_thread_cell_op(func, &d.op, &through, &locations, &elided).is_some()).collect()
+    let preserved_tc: Vec<bool> = if preserve_tc {
+        let has_tc = func.has_thread_cell();
+        let has_fc = through.iter().any(|t| matches!(t, Some(CallTarget::Runtime(crate::reloc::RuntimeSymbol::Malloc | crate::reloc::RuntimeSymbol::Free))));
+        if has_tc || has_fc {
+            func.insts.iter().map(|d| is_preserved_call_op(func, &d.op, &through, &locations, &elided)).collect()
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -697,39 +675,6 @@ impl<R: Copy + PartialEq> Plan<R> {
     pub(crate) fn moves(&self, func: &Function, frame: &crate::frame::Frame<R>, block: Block, args: &[Value]) -> bool {
         args.iter().zip(&func.blocks[block.index()].params).any(|(arg, param)| !self.same_home(frame, *arg, *param))
     }
-}
-
-pub(crate) fn used_preserved_leaf_regs<R: Copy + PartialEq>(regs: &Regs<R>, locations: &[Location<R>], include_dict: bool) -> Vec<R> {
-    let mut eligible = [false; 32];
-    let mut need_mask = 0u32;
-    for (i, &r) in regs.leaf.iter().enumerate() {
-        if !regs.preserved_clobbers.contains(&r) {
-            eligible[i] = true;
-            need_mask |= 1u32 << i;
-        }
-    }
-    let mut used_mask = 0u32;
-    if include_dict
-        && let Some(dict) = regs.dict
-        && let Some(i) = regs.leaf.iter().position(|&r| r == dict)
-        && eligible[i]
-    {
-        used_mask |= 1u32 << i;
-    }
-    if used_mask != need_mask {
-        for loc in locations {
-            if let Location::Reg(at) = *loc
-                && let Some(i) = regs.leaf.iter().position(|&r| r == at)
-                && eligible[i]
-            {
-                used_mask |= 1u32 << i;
-                if used_mask == need_mask {
-                    break;
-                }
-            }
-        }
-    }
-    regs.leaf.iter().enumerate().filter(|&(i, _)| (used_mask & (1u32 << i)) != 0).map(|(_, &r)| r).collect()
 }
 
 fn passed_own<R: Copy + PartialEq>(func: &Function, inst: Inst, value: Value, reg: ParkReg<R>, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> bool {

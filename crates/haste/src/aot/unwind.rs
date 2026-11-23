@@ -117,6 +117,28 @@ pub(super) fn emit_x64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut 
 }
 
 pub(super) fn emit_arm64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
+    if !c.win && addrs.tlv_desc != 0 {
+        out.words(&[
+            0xA9BC_7BFD, 0x9100_03FD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, 0xD102_C3FF,
+            0xAA00_03E9, 0xA903_0BE1,
+        ]);
+        super::tls::emit_arm64_tlv_unwind_state(c, addrs.tlv_desc, addrs.unwind_tls, out);
+        out.words(&[
+            0xAA00_03F3, 0xA940_2E6A, 0xA900_2FEA, 0xF900_13FD,
+            0xA905_6BF9, 0xA906_73FB, 0x6D07_27E8, 0x6D08_2FEA, 0x6D09_37EC, 0x6D0A_3FEE,
+        ]);
+        let caught_adr = arm64_fwd(0x1000_000A, out);
+        out.words(&[
+            0xF900_23EA, 0x9100_03EA, 0xF900_026A, 0xAA01_03E0, 0xD63F_0120,
+            0xF940_03E8, 0xF900_0268, 0x5280_0000, 0xF940_0BB3, 0x9100_03BF, 0xA8C4_7BFD, 0xD65F_03C0,
+        ]);
+        arm64_patch_adr(caught_adr, out.pos(), out);
+        out.words(&[
+            0xAA16_03E0, 0x9100_43E1, 0xD63F_02E0, 0x5280_0020, 0x9100_03BF,
+            0xA943_63F7, 0xA942_5BF5, 0xA941_53F3, 0xA8C4_7BFD, 0xD65F_03C0,
+        ]);
+        return Ok(());
+    }
     let sub_sp = if c.win { 0xD109_03FF } else { 0xD102_C3FF };
     let add_sp = if c.win { 0x9109_03FF } else { 0x9102_C3FF };
     out.words(&[0xA9BC_7BFD, 0x9100_03FD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, sub_sp, 0xAA00_03F4, 0xAA01_03F6, 0xAA02_03F7]);
@@ -137,7 +159,7 @@ pub(super) fn emit_arm64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &m
     } else {
         out.words(&[
             0xAA00_03F3, 0xA940_2668, 0xA900_27E8, 0x9100_03E8,
-            0xA902_23FD, 0xA903_5FF6, 0xA905_6BF9, 0xA906_73FB,
+            0xF900_13FD, 0xA903_5FF6, 0xA905_6BF9, 0xA906_73FB,
             0x6D07_27E8, 0x6D08_2FEA, 0x6D09_37EC, 0x6D0A_3FEE,
         ]);
         let caught_adr = arm64_fwd(0x1000_0009, out);
@@ -170,7 +192,7 @@ pub(super) fn emit_arm64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mu
     } else {
         out.words(&[
             0xA945_6AF9, 0xA946_72FB, 0x6D47_26E8, 0x6D48_2EEA, 0x6D49_36EC, 0x6D4A_3EEE,
-            0xA942_22FD, 0x9100_011F, 0xF940_22E9, 0xA943_5EF6, 0xD61F_0120,
+            0xF940_12FD, 0x9100_02FF, 0xF940_22E9, 0xA943_5EF6, 0xD61F_0120,
         ]);
     }
     arm64_here(&[no_state, no_frame], out);

@@ -149,7 +149,7 @@ pub(super) fn patch_arm64_tlv_cell(sym: &Symbol, addrs: SectionAddrs, pc_va: u64
             let bytes = (u32::from_le_bytes([slot[16], slot[17], slot[18], slot[19]]) >> 10) & 0xFFF;
             let total = addrs.frame_tls as u32 + bytes;
             ensure!(total < 4096, "Arm64TlvCell frame offset {total} out of range");
-            arm64_add_imm(2, 0, total)
+            arm64_add_imm(10, 0, total)
         }
         Symbol::Word(s) => {
             ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");

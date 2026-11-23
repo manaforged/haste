@@ -91,7 +91,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
-    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |op| preserve_tc && crate::alloc::cold_thread_cell_op(func, op, &plan.through, &plan.locations, &plan.elided).is_some());
+    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |op| preserve_tc && crate::alloc::is_preserved_call_op(func, op, &plan.through, &plan.locations, &plan.elided));
     let (base, bias) = if framed && !keeps { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
@@ -656,7 +656,7 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
-        if !is_try && self.thread_cell_cold(callee, args) {
+        if !is_try && (self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args)) {
             self.clobber_call_spills();
             return Ok(abi);
         }

@@ -691,8 +691,7 @@ impl Emit<'_> {
         }
         let direct = self.plan.through[callee.index()];
         if !is_try {
-            let inlined = self.thread_cell_cold(callee, args)
-                || matches!(direct, Some(CallTarget::Runtime(rt)) if self.cached_frame_cold(rt, args));
+            let inlined = self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args);
             if inlined {
                 self.clobber_call_spills();
                 return Ok(abi);
