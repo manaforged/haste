@@ -80,6 +80,12 @@ fn find_plan(func: &Function, cfg: &Cfg, each: &Loop, inner: bool) -> Option<Rot
     if !head_body.iter().all(|&i| safe_head_inst(func, i)) {
         return None;
     }
+    if each.size == 2
+        && head_body.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Load(..)))
+        && head_body.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Trapz(..)))
+    {
+        return None;
+    }
     let mut is_head_val = vec![false; func.types.len()];
     for &p in &func.blocks[head.index()].params {
         is_head_val[p.index()] = true;
@@ -205,7 +211,88 @@ fn split_latch_edge(func: &mut Function, plan: &RotatePlan, target: &mut Block, 
     args.clear();
 }
 
+fn rotate_trap_prefix(func: &mut Function, cfg: &Cfg, each: &Loop) -> bool {
+    if each.size != 2 || each.latches.len() != 1 {
+        return false;
+    }
+    let (head, latch) = (each.head, each.latches[0]);
+    if Some(head) == func.entry || latch == head {
+        return false;
+    }
+    let Some(Op::Jump(lt, latch_args)) = func.last(latch).cloned() else { return false };
+    let params = func.blocks[head.index()].params.clone();
+    if lt != head || latch_args.len() != params.len() {
+        return false;
+    }
+    let head_insts = &func.blocks[head.index()].insts;
+    let Some((&last, head_body)) = head_insts.split_last() else { return false };
+    if !matches!(func.insts[last.index()].op, Op::Brif(..)) || !head_body.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Load(..))) {
+        return false;
+    }
+    let Some(trap_pos) = head_body.iter().position(|&i| matches!(func.insts[i.index()].op, Op::Trapz(_))) else {
+        return false;
+    };
+    let Op::Trapz(cond) = func.insts[head_body[trap_pos].index()].op else { return false };
+    let mut need_val = vec![false; func.types.len()];
+    need_val[cond.index()] = true;
+    let mut slice = Vec::new();
+    for &inst in head_body[..trap_pos].iter().rev() {
+        let data = &func.insts[inst.index()];
+        if data.result.is_some_and(|r| need_val[r.index()]) {
+            if !data.op.is_speculable() {
+                return false;
+            }
+            data.op.for_operands(|v| need_val[v.index()] = true);
+            slice.push(inst);
+        }
+    }
+    slice.reverse();
+    let Some(pre) = cfg::preheader(func, cfg, each) else { return false };
+    let Some(Op::Jump(pt, pre_args)) = func.last(pre).cloned() else { return false };
+    if pt != head || pre_args.len() != params.len() {
+        return false;
+    }
+    let clone_slice = |func: &mut Function, dst: Block, incoming: &[Value], insert_before_last: bool| -> Value {
+        let mut map: Vec<(Value, Value)> = params.iter().copied().zip(incoming.iter().copied()).collect();
+        let saved = insert_before_last.then(|| func.blocks[dst.index()].insts.pop()).flatten();
+        for &orig in &slice {
+            let mut op = func.insts[orig.index()].op.clone();
+            op.map_operands(|v| remap_val(&map, v));
+            let res = func.insts[orig.index()].result.map(|r| {
+                let nr = func.value_like(r);
+                map.push((r, nr));
+                nr
+            });
+            let ni = func.add(op, res);
+            func.blocks[dst.index()].insts.push(ni);
+        }
+        let mapped_cond = remap_val(&map, cond);
+        if let Some(j) = saved {
+            let t = func.add(Op::Trapz(mapped_cond), None);
+            func.blocks[dst.index()].insts.push(t);
+            func.blocks[dst.index()].insts.push(j);
+        }
+        mapped_cond
+    };
+    let _ = clone_slice(func, pre, &pre_args, true);
+    if let Some(old_jump) = func.blocks[latch.index()].insts.pop() {
+        func.insts[old_jump.index()].op = Op::Trap;
+    }
+    let latch_cond = clone_slice(func, latch, &latch_args, false);
+    let trap_blk = Block(func.blocks.len() as u32);
+    let trap_inst = func.add(Op::Trap, None);
+    func.blocks.push(BlockData { params: Vec::new(), insts: vec![trap_inst] });
+    let brif = func.add(Op::Brif(latch_cond, head, latch_args, trap_blk, Vec::new()), None);
+    func.blocks[latch.index()].insts.push(brif);
+    let removed = func.blocks[head.index()].insts.remove(trap_pos);
+    func.insts[removed.index()].op = Op::Trap;
+    true
+}
+
 fn rotate_one(func: &mut Function, cfg: &Cfg, each: &Loop, inner: bool) -> bool {
+    if rotate_trap_prefix(func, cfg, each) {
+        return true;
+    }
     let Some(plan) = find_plan(func, cfg, each, inner) else {
         return false;
     };
