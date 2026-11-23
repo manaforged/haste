@@ -518,6 +518,11 @@ impl Checker<'_, '_> {
         let is_iter_fn = self.is_iter_mod(fn_item);
         let is_opt_fn = self.item_in_std_mod(fn_item, "option");
         let is_res_fn = self.item_in_std_mod(fn_item, "result");
+        let is_clone_fn = fn_name == "clone"
+            && recv_is_by_ref(&sig)
+            && self.cx.owner_trait(fn_item)
+                .or_else(|| self.cx.owner_impl(fn_item).and_then(|b| self.cx.impl_trait(b)))
+                .is_some_and(|tr| self.item_in_std_mod(tr, "clone"));
         let is_by_ref = is_iter_fn && fn_name == "by_ref";
         let mut out = Vec::new();
         if !ret_lts.has_elided && ret_lts.named.is_empty() {
@@ -546,8 +551,8 @@ impl Checker<'_, '_> {
                 && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))
             {
                 let mut recv_sources = self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(&sig), None);
-                if (is_iter_fn || is_opt_fn) && matches!(fn_name, "copied" | "cloned") {
-                    recv_sources = self.copied_recv_sources(recv, recv_sources, state, is_opt_fn);
+                if ((is_iter_fn || is_opt_fn) && matches!(fn_name, "copied" | "cloned")) || is_clone_fn {
+                    recv_sources = self.copied_recv_sources(recv, recv_sources, state, is_opt_fn || is_clone_fn);
                 } else if (is_iter_fn
                     && matches!(fn_name, "map" | "filter_map" | "flat_map")
                     && arg_ids.first().is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state)))
@@ -648,7 +653,7 @@ impl Checker<'_, '_> {
                 _ => break,
             }
         }
-        let root = self.root_place(cur).map(|p| p.local);
+        let root = (!matches!(*self.body.expr(cur), Expr::Ref { .. })).then(|| self.root_place(cur).map(|p| p.local)).flatten();
         let indirect = root.is_some_and(|r| {
             let r_ty = self.local_ty(r);
             cur == recv || self.is_ref_ty(r_ty) || self.ty_holds_closure(r_ty)
