@@ -201,7 +201,7 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
     }
 }
 
-type TrackedRoots = (Vec<TrackRoot>, bool, Vec<Option<u32>>, Vec<Option<RuntimeSymbol>>);
+type TrackedRoots = (Vec<TrackRoot>, bool, bool, Vec<Option<u32>>, Vec<Option<RuntimeSymbol>>);
 
 fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> TrackedRoots {
     let n = func.types.len();
@@ -224,7 +224,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
     let mut consts: Option<Vec<Option<i64>>> = None;
     let (mut mallocs, mut frees, mut called): (Vec<Value>, Vec<Value>, Vec<(Value, bool, Block, usize)>) = (Vec::new(), Vec::new(), Vec::new());
     let rank = (cfg.rpo.len() > 1).then(|| Cfg::ranks(&cfg.rpo, func.blocks.len()));
-    let (mut has_caller_loc, mut cl_escaped, mut need_fixpoint) = (false, false, false);
+    let (mut has_caller_loc, mut cl_escaped, mut need_fixpoint, mut has_mem, mut has_span_op) = (false, false, false, false, false);
     for &b in &cfg.rpo {
         let br = rank.as_ref().map_or(0, |r| r[b.index()]);
         let insts = &func.blocks[b.index()].insts;
@@ -270,12 +270,22 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
                     }
                 }
                 (op, Some(res)) if func.ty(res) == Type::I64 => {
+                    if matches!(*op, Op::Load(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..)) {
+                        has_mem = true;
+                    } else if matches!(*op, Op::Select(..))
+                        || (matches!(*op, Op::Binary(Binary::Iadd | Binary::Isub, ..)) && affine[res.index()].0 == res)
+                    {
+                        has_span_op = true;
+                    }
                     if func.is_unique_ptr(res) {
                         let owner = match *op { Op::Load(addr, _) => affine.get(addr.index()).map(|&(r, _)| r), _ => None };
                         tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(owner));
                     } else if is_derived_i64(op, Type::I64) {
                         tracked[res.index()] = step_track(op, Type::I64, &tracked);
                     }
+                }
+                (Op::Load(..) | Op::Store(..) | Op::Move(..) | Op::Copy(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..), _) => {
+                    has_mem = true;
                 }
                 _ => {}
             }
@@ -339,7 +349,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
             has_caller_loc = false;
         }
     }
-    (tracked, has_caller_loc, symbol_defs, frame_runtime)
+    (tracked, has_caller_loc, has_mem && has_span_op, symbol_defs, frame_runtime)
 }
 
 fn step_affine(op: &Op, out: &[(Value, i64)], consts: &[Option<i64>], types: &[Type]) -> Option<(Value, i64)> {
@@ -401,7 +411,7 @@ impl Provenance {
 
     fn build(func: &Function, cfg: &Cfg, (is_spill, positions): (Option<&[bool]>, bool), affine: Option<Vec<(Value, i64)>>) -> Self {
         let affine = affine.unwrap_or_else(|| compute_affine_in(func, Some(&cfg.rpo)));
-        let (tracked, has_caller_loc, symbol_defs, frame_runtime) = compute_tracked_roots(func, cfg, &affine);
+        let (tracked, has_caller_loc, need_spans, symbol_defs, frame_runtime) = compute_tracked_roots(func, cfg, &affine);
         let mut prov = Self::from_roots(func, cfg, (&tracked, has_caller_loc, symbol_defs, frame_runtime), affine);
         let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, (is_spill, positions));
         if positions {
@@ -420,7 +430,9 @@ impl Provenance {
                 }
             }
         }
-        prov.spans = loop_mem::compute_spans(func, cfg, &prov.slot_offsets, &prov.symbol_defs);
+        if need_spans {
+            prov.spans = loop_mem::compute_spans(func, cfg, &prov.slot_offsets, &prov.symbol_defs);
+        }
         prov
     }
 
@@ -452,7 +464,7 @@ impl Provenance {
     /// The address facts alone, for `loc` and `ro_bytes`: no escape classification and no loop spans.
     pub(crate) fn addresses(func: &Function, cfg: &Cfg) -> Self {
         let affine = compute_affine_in(func, Some(&cfg.rpo));
-        let (tracked, has_caller_loc, symbol_defs, frame_runtime) = compute_tracked_roots(func, cfg, &affine);
+        let (tracked, has_caller_loc, _, symbol_defs, frame_runtime) = compute_tracked_roots(func, cfg, &affine);
         Self::from_roots(func, cfg, (&tracked, has_caller_loc, symbol_defs, frame_runtime), affine)
     }
 

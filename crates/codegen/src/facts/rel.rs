@@ -109,6 +109,12 @@ impl Path {
         &self.rels
     }
 
+    /// Whether any symbolic relation or no-wrap sum is recorded here.
+    #[inline]
+    pub(super) fn has_rels(&self) -> bool {
+        !self.rels.is_empty() || !self.no_wrap_adds.is_empty()
+    }
+
     #[inline]
     fn get(&self, value: Value) -> Option<&Fact> {
         if self.fact_mask & val_bit(value) == 0 {

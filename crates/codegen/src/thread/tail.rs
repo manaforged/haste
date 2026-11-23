@@ -30,66 +30,45 @@ enum Test {
 
 /// Copies a short block that branches on a compare, condition, or jump table into each predecessor edge whose jump arguments decide that branch, and sends the copy straight to the taken target; returns whether it copied any block.
 pub(super) fn run(func: &mut Function) -> bool {
+    if func.blocks.len() < 2 { return false; }
     let cfg = func.cfg();
-    let defs = crate::fold::defs(func);
-    let consts = func.const_values();
+    let mut defs_cache = Some(crate::fold::defs(func));
+    let mut consts_cache = Some(func.const_values());
+    let (defs, consts) = (defs_cache.as_deref().expect("invariant: defs initialized"), consts_cache.as_deref().expect("invariant: consts initialized"));
     let mut copies: Vec<(Edge, Block, Block)> = Vec::new();
     for at in 0..func.blocks.len() {
         let block = Block(at as u32);
-        if !cfg.reachable[at] {
-            continue;
-        }
-        let Some(found) = branch(func, &defs, block) else { continue };
+        if !cfg.reachable[at] { continue; }
+        let Some(found) = branch(func, defs, block) else { continue };
         let params_len = func.blocks[block.index()].params.len();
         for &pred in cfg.preds_of(block) {
-            if pred == block
-                || copies.iter().any(|&(e, b, _)| e.pred() == pred || b == pred || e.pred() == block)
-            {
-                continue;
-            }
+            if pred == block || copies.iter().any(|&(e, b, _)| e.pred() == pred || b == pred || e.pred() == block) { continue; }
             let edge_args = match func.last(pred) {
                 Some(Op::Jump(target, args)) if *target == block => Some((Edge::Jump(pred), args.as_slice())),
                 Some(Op::Brif(_, then, then_args, other, other_args)) if *then != *other => {
-                    if *then == block {
-                        Some((Edge::Brif(pred, true), then_args.as_slice()))
-                    } else if *other == block {
-                        Some((Edge::Brif(pred, false), other_args.as_slice()))
-                    } else {
-                        None
-                    }
+                    if *then == block { Some((Edge::Brif(pred, true), then_args.as_slice())) }
+                    else if *other == block { Some((Edge::Brif(pred, false), other_args.as_slice())) }
+                    else { None }
                 }
                 _ => None,
             };
             let Some((edge, args)) = edge_args else { continue };
-            if args.len() != params_len {
-                continue;
-            }
-            let Some(to) = decide(func, &defs, &consts, pred, block, args, &found) else {
-                continue;
-            };
-            if to != block && stays_under(func, &cfg, block, to) {
-                copies.push((edge, block, to));
-            }
+            if args.len() != params_len { continue; }
+            let Some(to) = decide(func, defs, consts, pred, block, args, &found) else { continue };
+            if to != block && stays_under(func, &cfg, block, to) { copies.push((edge, block, to)); }
         }
     }
     for &(edge, block, to) in &copies {
         localize_consts(func, block);
         match edge {
-            Edge::Jump(pred) => {
-                copy_into(func, pred, block, to);
-            }
-            Edge::Brif(pred, on_then) => {
-                let Some(split) = split_brif_arm(func, pred, on_then, block) else { continue };
-                copy_into(func, split, block, to);
-            }
+            Edge::Jump(pred) => { copy_into(func, pred, block, to); }
+            Edge::Brif(pred, on_then) => { if let Some(split) = split_brif_arm(func, pred, on_then, block) { copy_into(func, split, block, to); } }
         }
     }
-    if !copies.is_empty() {
-        func.bump_cfg();
-    }
-    let split = split_correlated_join(func);
-    let collapsed = collapse_convergent_join(func);
-    let repaired = thread_repaired_joins(func);
+    if !copies.is_empty() { func.bump_cfg(); defs_cache = None; consts_cache = None; }
+    let split = split_correlated_join(func, &mut defs_cache, &mut consts_cache);
+    let collapsed = collapse_convergent_join(func, &mut defs_cache, &mut consts_cache);
+    let repaired = thread_repaired_joins(func, &mut defs_cache, &mut consts_cache);
     !copies.is_empty() || split || collapsed || repaired
 }
 
@@ -102,17 +81,22 @@ pub(super) struct SsaRepairPlan {
 
 pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block, exit: Block, skip: &[Block], vals: &[Value]) -> Option<SsaRepairPlan> {
     if vals.is_empty() {
-        return Some(SsaRepairPlan { need: Vec::new(), from_exit: vec![false; func.blocks.len()], joins: Vec::new(), join_of: vec![None; func.blocks.len()] });
+        return Some(SsaRepairPlan { need: Vec::new(), from_exit: Vec::new(), joins: Vec::new(), join_of: Vec::new() });
     }
     let mut from_exit = vec![false; func.blocks.len()];
+    let mut visited = Vec::new();
     let mut stack = vec![exit];
     while let Some(b) = stack.pop() {
         if !cfg.dominates(disp, b) || b == disp || skip.contains(&b) || std::mem::replace(&mut from_exit[b.index()], true) {
             continue;
         }
+        visited.push(b);
         for s in func.successors(b) {
             stack.push(s);
         }
+    }
+    if visited.is_empty() {
+        return Some(SsaRepairPlan { need: Vec::new(), from_exit: Vec::new(), joins: Vec::new(), join_of: Vec::new() });
     }
     let val_map = (vals.len() > 8).then(|| {
         let mut map = vec![u32::MAX; func.types.len()];
@@ -123,19 +107,17 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
     });
     let mut seen_val = vec![false; vals.len()];
     let mut need_count = 0usize;
-    let mut use_blocks = vec![false; func.blocks.len()];
-    for (bi, &in_fe) in from_exit.iter().enumerate() {
-        if !in_fe {
-            continue;
-        }
-        for &inst in &func.blocks[bi].insts {
+    let mut back = Vec::new();
+    for &b in &visited {
+        let mut used_here = false;
+        for &inst in &func.blocks[b.index()].insts {
             func.insts[inst.index()].op.for_operands(|op| {
                 let pos = match &val_map {
                     Some(map) => map.get(op.index()).copied().filter(|&p| p != u32::MAX).map(|p| p as usize),
                     None => vals.iter().position(|&v| v == op),
                 };
                 if let Some(pos) = pos {
-                    use_blocks[bi] = true;
+                    used_here = true;
                     if !std::mem::replace(&mut seen_val[pos], true) {
                         need_count += 1;
                     }
@@ -145,73 +127,67 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
                 return None;
             }
         }
+        if used_here {
+            back.push(b);
+        }
     }
     let need: Vec<Value> = vals.iter().zip(&seen_val).filter_map(|(&v, &s)| s.then_some(v)).collect();
-    if !need.is_empty() {
-        let mut live = vec![false; func.blocks.len()];
-        let mut back: Vec<Block> = use_blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(bi, &u)| u.then_some(Block(bi as u32)))
-            .collect();
-        while let Some(b) = back.pop() {
-            if !from_exit[b.index()] || std::mem::replace(&mut live[b.index()], true) {
-                continue;
-            }
-            if b != exit {
-                for &pr in cfg.preds_of(b) {
-                    if from_exit[pr.index()] && !live[pr.index()] {
-                        back.push(pr);
-                    }
+    if need.is_empty() {
+        return Some(SsaRepairPlan { need, from_exit, joins: Vec::new(), join_of: Vec::new() });
+    }
+    let mut live = vec![false; func.blocks.len()];
+    let mut live_list = Vec::new();
+    while let Some(b) = back.pop() {
+        if !from_exit[b.index()] || std::mem::replace(&mut live[b.index()], true) {
+            continue;
+        }
+        live_list.push(b);
+        if b != exit {
+            for &pr in cfg.preds_of(b) {
+                if from_exit[pr.index()] && !live[pr.index()] {
+                    back.push(pr);
                 }
             }
         }
-        from_exit = live;
     }
+    from_exit = live;
+    live_list.sort_unstable_by_key(|b| b.0);
     let mut joins = Vec::new();
-    if !need.is_empty() {
-        for (bi, &in_fe) in from_exit.iter().enumerate() {
-            if !in_fe {
-                continue;
-            }
-            let b = Block(bi as u32);
-            if b == exit || cfg.preds_of(b).iter().any(|&pr| !from_exit[pr.index()]) {
-                joins.push(b);
-            }
+    for &b in &live_list {
+        if b == exit || cfg.preds_of(b).iter().any(|&pr| !from_exit[pr.index()]) {
+            joins.push(b);
         }
     }
     let mut join_of = vec![None; func.blocks.len()];
-    if !need.is_empty() {
-        loop {
-            let mut added = false;
-            for &b in &cfg.rpo {
-                let bi = b.index();
-                if !from_exit[bi] {
-                    continue;
-                }
-                let doms: Vec<usize> = joins.iter().enumerate().filter(|&(_, &j)| cfg.dominates(j, b)).map(|(ji, _)| ji).collect();
-                let deepest = doms.iter().copied().find(|&ji| doms.iter().all(|&other| cfg.dominates(joins[other], joins[ji])));
-                match deepest {
-                    Some(ji) => join_of[bi] = Some(ji),
-                    None => {
-                        if joins.len() >= 8 {
-                            return None;
-                        }
-                        joins.push(b);
-                        added = true;
-                        break;
-                    }
-                }
+    loop {
+        let mut added = false;
+        for &b in &cfg.rpo {
+            let bi = b.index();
+            if !from_exit[bi] {
+                continue;
             }
-            if !added {
-                break;
+            let doms: Vec<usize> = joins.iter().enumerate().filter(|&(_, &j)| cfg.dominates(j, b)).map(|(ji, _)| ji).collect();
+            let deepest = doms.iter().copied().find(|&ji| doms.iter().all(|&other| cfg.dominates(joins[other], joins[ji])));
+            match deepest {
+                Some(ji) => join_of[bi] = Some(ji),
+                None => {
+                    if joins.len() >= 8 {
+                        return None;
+                    }
+                    joins.push(b);
+                    added = true;
+                    break;
+                }
             }
         }
-        for &j in &joins {
-            for &pr in cfg.preds_of(j) {
-                if !matches!(func.last(pr), Some(Op::Jump(..) | Op::Brif(..))) {
-                    return None;
-                }
+        if !added {
+            break;
+        }
+    }
+    for &j in &joins {
+        for &pr in cfg.preds_of(j) {
+            if !matches!(func.last(pr), Some(Op::Jump(..) | Op::Brif(..))) {
+                return None;
             }
         }
     }
@@ -267,20 +243,23 @@ pub(super) fn apply_ssa_repair(func: &mut Function, plan: &SsaRepairPlan, exit: 
     }
 }
 
-fn thread_repaired_joins(func: &mut Function) -> bool {
+fn thread_repaired_joins(func: &mut Function, defs_cache: &mut Option<Vec<Option<Inst>>>, consts_cache: &mut Option<Vec<Option<i64>>>) -> bool {
     let mut any = false;
     for _ in 0..8 {
         let found_plan = {
             let cfg = func.cfg();
-            let defs = crate::fold::defs(func);
-            let consts = func.const_values();
+            if !(0..func.blocks.len()).any(|at| cfg.reachable[at] && cfg.preds_of(Block(at as u32)).len() >= 2) {
+                break;
+            }
+            let defs = defs_cache.get_or_insert_with(|| crate::fold::defs(func));
+            let consts = consts_cache.get_or_insert_with(|| func.const_values());
             let mut picked = None;
             'blocks: for at in 0..func.blocks.len() {
                 let block = Block(at as u32);
                 if !cfg.reachable[at] || cfg.preds_of(block).len() < 2 {
                     continue;
                 }
-                let Some(found) = branch(func, &defs, block) else { continue };
+                let Some(found) = branch(func, defs, block) else { continue };
                 let params_len = func.blocks[at].params.len();
                 let mut own_vals: Vec<Value> = func.blocks[at].params.clone();
                 for &inst in &func.blocks[at].insts {
@@ -298,7 +277,7 @@ fn thread_repaired_joins(func: &mut Function) -> bool {
                     if *target != block || args.len() != params_len {
                         continue;
                     }
-                    let Some(to) = decide(func, &defs, &consts, pred, block, args, &found) else { continue };
+                    let Some(to) = decide(func, defs, consts, pred, block, args, &found) else { continue };
                     if to == block || !cfg.dominates(block, to) {
                         continue;
                     }
@@ -322,6 +301,8 @@ fn thread_repaired_joins(func: &mut Function) -> bool {
             .collect();
         apply_ssa_repair(func, &ssa, to, pred, &pairs);
         func.bump_cfg();
+        *defs_cache = None;
+        *consts_cache = None;
         any = true;
     }
     any
@@ -401,16 +382,19 @@ struct CorrelatedPlan {
     ssa: SsaRepairPlan,
 }
 
-fn find_correlated_join(func: &Function) -> Option<CorrelatedPlan> {
+fn find_correlated_join(func: &Function, defs_cache: &mut Option<Vec<Option<Inst>>>, consts_cache: &mut Option<Vec<Option<i64>>>) -> Option<CorrelatedPlan> {
+    if !func.blocks.iter().any(|b| !b.params.is_empty() && b.insts.len() == 1) {
+        return None;
+    }
     let cfg = func.cfg();
-    let defs = crate::fold::defs(func);
-    let consts = func.const_values();
+    let defs = defs_cache.get_or_insert_with(|| crate::fold::defs(func));
+    let consts = consts_cache.get_or_insert_with(|| func.const_values());
     for at in 0..func.blocks.len() {
         let disp = Block(at as u32);
         if !cfg.reachable[at] || func.blocks[at].params.is_empty() || func.blocks[at].insts.len() != 1 {
             continue;
         }
-        let Some(found) = branch(func, &defs, disp) else { continue };
+        let Some(found) = branch(func, defs, disp) else { continue };
         let disp_params = &func.blocks[at].params;
         for &pred in cfg.preds_of(disp) {
             if pred == disp {
@@ -420,7 +404,7 @@ fn find_correlated_join(func: &Function) -> Option<CorrelatedPlan> {
             if *target != disp || args.len() != disp_params.len() {
                 continue;
             }
-            let Some(to) = decide(func, &defs, &consts, pred, disp, args, &found) else { continue };
+            let Some(to) = decide(func, defs, consts, pred, disp, args, &found) else { continue };
             if to == disp
                 || !func.blocks[to.index()].params.is_empty()
                 || cfg.preds_of(to).len() < 2
@@ -484,10 +468,10 @@ fn find_correlated_join(func: &Function) -> Option<CorrelatedPlan> {
 }
 
 /// Duplicates a short non-call join block and its correlated single-pred continuation onto a predecessor edge that decides both branches.
-fn split_correlated_join(func: &mut Function) -> bool {
+fn split_correlated_join(func: &mut Function, defs_cache: &mut Option<Vec<Option<Inst>>>, consts_cache: &mut Option<Vec<Option<i64>>>) -> bool {
     let mut any = false;
     for _ in 0..4 {
-        let Some(plan) = find_correlated_join(func) else { break };
+        let Some(plan) = find_correlated_join(func, defs_cache, consts_cache) else { break };
         let disp_params = func.blocks[plan.disp.index()].params.clone();
         let mut map: Vec<(Value, Value)> = disp_params.iter().copied().zip(plan.args.iter().copied()).collect();
         let to_clone = clone_block(func, plan.to, &mut map, None);
@@ -511,14 +495,19 @@ fn split_correlated_join(func: &mut Function) -> bool {
             .collect();
         apply_ssa_repair(func, &plan.ssa, plan.exit, mid_clone, &pairs);
         func.bump_cfg();
+        *defs_cache = None;
+        *consts_cache = None;
         any = true;
     }
     any
 }
 
-fn find_convergent_join(func: &Function) -> Option<(Block, Block, Block, Block, Vec<Value>, SsaRepairPlan)> {
+fn find_convergent_join(func: &Function, consts_cache: &mut Option<Vec<Option<i64>>>) -> Option<(Block, Block, Block, Block, Vec<Value>, SsaRepairPlan)> {
+    if !func.blocks.iter().any(|b| !b.params.is_empty() && b.insts.len() == 1) {
+        return None;
+    }
     let cfg = func.cfg();
-    let consts = func.const_values();
+    let consts = consts_cache.get_or_insert_with(|| func.const_values());
     for at in 0..func.blocks.len() {
         let disp = Block(at as u32);
         let disp_params = &func.blocks[at].params;
@@ -547,16 +536,18 @@ fn find_convergent_join(func: &Function) -> Option<(Block, Block, Block, Block, 
     None
 }
 
-fn collapse_convergent_join(func: &mut Function) -> bool {
+fn collapse_convergent_join(func: &mut Function, defs_cache: &mut Option<Vec<Option<Inst>>>, consts_cache: &mut Option<Vec<Option<i64>>>) -> bool {
     let mut any = false;
     for _ in 0..4 {
-        let Some((pred, disp, _, exit, args, ssa)) = find_convergent_join(func) else { break };
+        let Some((pred, disp, _, exit, args, ssa)) = find_convergent_join(func, consts_cache) else { break };
         let disp_params = func.blocks[disp.index()].params.clone();
         let pred_last = *func.blocks[pred.index()].insts.last().expect("invariant: pred has Jump");
         func.insts[pred_last.index()].op = Op::Jump(exit, Vec::new());
         let pairs: Vec<(Value, Value)> = ssa.need.iter().filter_map(|&o| disp_params.iter().position(|&p| p == o).map(|i| (o, args[i]))).collect();
         apply_ssa_repair(func, &ssa, exit, pred, &pairs);
         func.bump_cfg();
+        *defs_cache = None;
+        *consts_cache = None;
         any = true;
     }
     any
