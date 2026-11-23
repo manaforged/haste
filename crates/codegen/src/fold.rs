@@ -453,7 +453,7 @@ impl Fold {
             let non_null_br = through.is_none() && matches!(func.insts[last.index()].op, Op::Brif(cond, ..) if self.non_null(func, at, cond));
             if let Some((inner, swap)) = through && let Op::Brif(cond, then, then_args, otherwise, else_args) = &mut func.insts[last.index()].op {
                 *cond = inner;
-                if swap { std::mem::swap(then, otherwise); std::mem::swap(then_args, else_args); }
+                if swap { std::mem::swap(then, otherwise); std::mem::swap(then_args, else_args); cfg_dirty = true; }
                 changed = true;
             }
             if self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op) || self.exits(func, last) {
@@ -787,11 +787,12 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let (mut changed, mut cfg_changed) = settle_cfg_and_params(func, &mut fold, entry, effort, &pinned);
     let (dropped_params, mut body_changed) = (unused::drop_params(func, &fold.subst), false);
     for b in 0..func.blocks.len() { for idx in 0..func.blocks[b].insts.len() { body_changed |= rewrite_folded_inst(func, &fold, func.blocks[b].insts[idx]); } }
+    let rev_before = func.cfg_rev;
     if effort == crate::Effort::Full {
         body_changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func);
     }
     body_changed |= unused::run(func, &pinned) | unused::dead(func);
-    changed |= body_changed;
+    (changed, cfg_changed) = (changed | body_changed, cfg_changed | (func.cfg_rev != rev_before));
     if (body_changed || dropped_params) && (fold.thread(func, &pinned) | fold.branches(func)) { func.bump_cfg(); unused::prune_changed(func, entry, false); unused::dead(func); (changed, cfg_changed) = (true, true); }
     if effort == crate::Effort::Full && (crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func)) { unused::dead(func); changed = true; }
     if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }

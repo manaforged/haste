@@ -142,6 +142,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     drive(emit, &order)
 }
 
+pub(crate) const DICT_STUB_RELOCS: [(u32, crate::reloc::RelocKind); 2] = [(0, crate::reloc::RelocKind::Arm64Movw64), (16, crate::reloc::RelocKind::Arm64Movw64)];
+
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
     let mut asm = Asm::default();
     if let Some(tier) = tier_up {

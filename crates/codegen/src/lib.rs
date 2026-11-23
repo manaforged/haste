@@ -156,9 +156,12 @@ impl Code {
     }
 
     /// Copies `bytes` into `out` and patches every relocation against `symbols`.
-    pub fn patch(&self, symbols: &[u64], out: &mut [u8]) {
+    pub fn patch(&self, symbols: &[u64], out: &mut [u8]) -> Result<(), Error> {
+        if out.len() < self.bytes.len() {
+            return Err(Error::new(ErrorKind::Unsupported, format!("patch buffer too small: {} < {}", out.len(), self.bytes.len())));
+        }
         out[..self.bytes.len()].copy_from_slice(&self.bytes);
-        reloc::patch_bytes(&self.relocs, symbols, &mut out[..self.bytes.len()]);
+        reloc::patch_bytes(&self.relocs, symbols, &mut out[..self.bytes.len()])
     }
 }
 
@@ -176,8 +179,8 @@ impl Target {
     /// Returns the `(dict_offset, body_offset, kind)` relocation offsets inside an unlinked `dict_entry_stub(0, 1 << 40, 0, None)`.
     pub fn dict_stub_relocs(&self) -> Result<[(u32, RelocKind); 2], Error> {
         match self.arch {
-            Arch::X64 => Ok([(2, RelocKind::Abs64), (12, RelocKind::Abs64)]),
-            Arch::Arm64 => Ok([(0, RelocKind::Arm64Movw64), (16, RelocKind::Arm64Movw64)]),
+            Arch::X64 => Ok(x64::DICT_STUB_RELOCS),
+            Arch::Arm64 => Ok(arm64::DICT_STUB_RELOCS),
             other => Err(Error::new(ErrorKind::Unsupported, format!("no encoder for {other:?} yet"))),
         }
     }
@@ -217,11 +220,16 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     if !(target.direct_calls && target.arch == Arch::X64) {
         func.forget_image_addrs();
     }
-    verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     let tracing = trace::enabled();
     if tracing {
         trace::on_compile_start(&func);
     }
+    verify::verify(&func, target).map_err(|message| {
+        if verify::verify_passes_enabled() {
+            eprintln!("[haste-verify] failed at entry: {message}\n{func}");
+        }
+        Error::new(ErrorKind::Verify, message)
+    })?;
     schedule::run(&mut func, promote::Moves::Split, target);
     if tracing {
         trace::on_compile_end(&func);

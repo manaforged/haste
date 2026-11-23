@@ -600,15 +600,19 @@ impl Pass {
         self.promoted_vars[var] = true;
     }
 
-    fn dropped(&self, count: usize) -> Vec<bool> {
-        let mut dropped = vec![false; count];
+    fn dropped(&self, func: &Function) -> Vec<bool> {
+        let mut dropped = vec![false; func.insts.len()];
         for access in &self.scan.accesses {
             if self.promoted_vars[access.var] && !self.kept[access.inst.index()] {
                 dropped[access.inst.index()] = true;
             }
         }
+        let live_addr_slot = join_slots::live_addr_slots(func, &self.scan.addrs, &self.scan.addr_insts, &dropped);
         let all_promoted = |slot: usize| {
-            !self.scan.escaped[slot] && !self.scan.slot_vars[slot].is_empty() && self.scan.slot_vars[slot].iter().all(|&var| self.promoted_vars[var])
+            !self.scan.escaped[slot]
+                && !live_addr_slot[slot]
+                && !self.scan.slot_vars[slot].is_empty()
+                && self.scan.slot_vars[slot].iter().all(|&var| self.promoted_vars[var])
         };
         for (inst, slot) in &self.scan.addr_insts {
             if all_promoted(slot.index()) {
@@ -620,7 +624,7 @@ impl Pass {
 
     fn finish(mut self, func: &mut Function, entry: Block) {
         func.types.extend(&self.fresh.types);
-        let dropped = self.dropped(func.insts.len());
+        let dropped = self.dropped(func);
         for block in &mut func.blocks {
             block.insts.retain(|inst| !dropped[inst.index()]);
         }

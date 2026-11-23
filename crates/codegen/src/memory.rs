@@ -114,7 +114,7 @@ impl Memory {
         let (write, exec) = self.reserve_at(len)?;
         // SAFETY: write..write + len is a fresh unaliased slice of this chunk's writable mapping.
         let out = unsafe { std::slice::from_raw_parts_mut(write as *mut u8, len) };
-        code.patch(symbols, out);
+        code.patch(symbols, out)?;
         flush(exec, len);
         Ok(exec)
     }
@@ -123,10 +123,12 @@ impl Memory {
     pub fn write_with(&mut self, max_len: usize, build: impl FnOnce(usize) -> Result<Vec<u8>, Error>) -> Result<usize, Error> {
         let (write, exec) = self.reserve_at(max_len)?;
         let bytes = build(exec)?;
-        let len = bytes.len().min(max_len);
-        // SAFETY: write..write + max_len is inside this chunk's writable mapping and bytes does not overlap it.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), write as *mut u8, len) };
-        flush(exec, len);
+        if bytes.len() > max_len {
+            return Err(memory_error(format!("write_with built {} bytes, exceeding reserved {max_len}", bytes.len())));
+        }
+        // SAFETY: write..write + bytes.len() is inside this chunk's writable mapping and bytes does not overlap it.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), write as *mut u8, bytes.len()) };
+        flush(exec, bytes.len());
         Ok(exec)
     }
 
@@ -172,10 +174,7 @@ impl Memory {
 impl Drop for Memory {
     fn drop(&mut self) {
         for chunk in &self.chunks {
-            unmap(chunk.write, chunk.len);
-            if chunk.exec != chunk.write {
-                unmap(chunk.exec, chunk.len);
-            }
+            unmap_code(chunk.write, chunk.exec, chunk.len);
         }
     }
 }
@@ -276,10 +275,29 @@ fn unmap(base: usize, size: usize) {
     unsafe { libc::munmap(base as *mut libc::c_void, size) };
 }
 
+#[cfg(unix)]
+fn unmap_code(write: usize, exec: usize, size: usize) {
+    unmap(write, size);
+    if exec != write {
+        unmap(exec, size);
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn unmap(base: usize, _size: usize) {
     // SAFETY: base is a region returned by VirtualAlloc that this process owns and is dropping.
     unsafe { win::VirtualFree(base as *mut std::ffi::c_void, 0, win::MEM_RELEASE) };
+}
+
+#[cfg(target_os = "windows")]
+fn unmap_code(write: usize, exec: usize, _size: usize) {
+    // SAFETY: write and exec are views returned by MapViewOfFile that this process owns and is dropping.
+    unsafe {
+        win::UnmapViewOfFile(write as *const std::ffi::c_void);
+        if exec != write {
+            win::UnmapViewOfFile(exec as *const std::ffi::c_void);
+        }
+    }
 }
 
 /// Asks the kernel to fail rather than move the mapping when the hint is taken, where it can.
@@ -338,25 +356,53 @@ fn map_data(size: usize, _sharing: Sharing) -> Result<usize, Error> {
 
 #[cfg(target_os = "windows")]
 fn views(size: usize) -> Result<(usize, usize), Error> {
-    // SAFETY: VirtualAlloc with a null address allocates fresh executable read/write memory for JIT code.
-    let base = unsafe { win::VirtualAlloc(std::ptr::null_mut(), size, win::MEM_COMMIT | win::MEM_RESERVE, win::PAGE_EXECUTE_READWRITE) };
-    if base.is_null() {
-        return Err(memory_error(format!("VirtualAlloc: {}", std::io::Error::last_os_error())));
+    let hi = ((size as u64) >> 32) as u32;
+    let lo = size as u32;
+    // SAFETY: anonymous pagefile-backed section with valid size; views are distinct RW and RX mappings (W^X).
+    let section = unsafe { win::CreateFileMappingW(win::INVALID_HANDLE_VALUE, std::ptr::null_mut(), win::PAGE_EXECUTE_READWRITE, hi, lo, std::ptr::null()) };
+    if section.is_null() {
+        return Err(memory_error(format!("CreateFileMappingW: {}", std::io::Error::last_os_error())));
     }
-    Ok((base as usize, base as usize))
+    // SAFETY: section is a valid file mapping handle of length `size`.
+    let write = unsafe { win::MapViewOfFile(section, win::FILE_MAP_WRITE, 0, 0, size) };
+    if write.is_null() {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: section is a valid open handle.
+        unsafe { win::CloseHandle(section) };
+        return Err(memory_error(format!("MapViewOfFile(RW): {err}")));
+    }
+    // SAFETY: section is a valid file mapping handle of length `size`.
+    let exec = unsafe { win::MapViewOfFile(section, win::FILE_MAP_READ | win::FILE_MAP_EXECUTE, 0, 0, size) };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: section is a valid open handle; existing mapped views keep the section alive.
+    unsafe { win::CloseHandle(section) };
+    if exec.is_null() {
+        // SAFETY: write is a valid mapped view.
+        unsafe { win::UnmapViewOfFile(write) };
+        return Err(memory_error(format!("MapViewOfFile(RX): {err}")));
+    }
+    Ok((write as usize, exec as usize))
 }
 
 #[cfg(target_os = "windows")]
 mod win {
+    pub const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
     pub const MEM_COMMIT: u32 = 0x1000;
     pub const MEM_RESERVE: u32 = 0x2000;
     pub const MEM_RELEASE: u32 = 0x8000;
     pub const PAGE_READWRITE: u32 = 0x04;
     pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    pub const FILE_MAP_WRITE: u32 = 0x0002;
+    pub const FILE_MAP_READ: u32 = 0x0004;
+    pub const FILE_MAP_EXECUTE: u32 = 0x0020;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn VirtualAlloc(addr: *mut std::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut std::ffi::c_void;
         pub fn VirtualFree(addr: *mut std::ffi::c_void, size: usize, kind: u32) -> i32;
+        pub fn CreateFileMappingW(file: *mut std::ffi::c_void, attrs: *mut std::ffi::c_void, protect: u32, max_hi: u32, max_lo: u32, name: *const u16) -> *mut std::ffi::c_void;
+        pub fn MapViewOfFile(mapping: *mut std::ffi::c_void, access: u32, off_hi: u32, off_lo: u32, bytes: usize) -> *mut std::ffi::c_void;
+        pub fn UnmapViewOfFile(base: *const std::ffi::c_void) -> i32;
+        pub fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         pub fn GetCurrentProcessId() -> u32;
         pub fn GetCurrentProcess() -> *mut std::ffi::c_void;
         pub fn FlushInstructionCache(process: *mut std::ffi::c_void, base: *const std::ffi::c_void, size: usize) -> i32;

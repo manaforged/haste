@@ -1,4 +1,12 @@
+use std::sync::OnceLock;
+
 use crate::ir::{AbiParam, Binary, Block, Convert, Function, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, Type, Unary, Value};
+
+/// Whether `HASTE_VERIFY_PASSES` is set to a non-zero value.
+pub(crate) fn verify_passes_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HASTE_VERIFY_PASSES").is_some_and(|v| !v.is_empty() && v != "0"))
+}
 
 fn value_types<'a>(func: &'a Function, values: &'a [Value]) -> impl Iterator<Item = Type> + 'a {
     values.iter().map(|value| func.ty(*value))
@@ -25,10 +33,14 @@ fn edge(func: &Function, block: Block, args: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-fn call(func: &Function, sig: usize, args: &[Value]) -> Result<(), String> {
+fn call(func: &Function, sig: usize, args: &[Value], results: &[Value]) -> Result<(), String> {
     let params = &func.sigs[sig].params;
     if !typed(func, args, params) {
         return Err(format!("a call takes {:?}, given {:?}", abi_types(params).collect::<Vec<_>>(), types(func, args)));
+    }
+    let returns = &func.sigs[sig].returns;
+    if !typed(func, results, returns) {
+        return Err(format!("a call returns {:?}, given {:?}", abi_types(returns).collect::<Vec<_>>(), types(func, results)));
     }
     Ok(())
 }
@@ -190,11 +202,68 @@ fn condition(func: &Function, value: Value) -> Result<(), String> {
     Ok(())
 }
 
-fn shape(func: &Function) -> Result<(), String> {
+fn check_value(func: &Function, value: Value) -> Result<(), String> {
+    if value.index() >= func.types.len() {
+        return Err(format!("v{} is out of bounds ({} values)", value.0, func.types.len()));
+    }
+    Ok(())
+}
+
+fn check_block(func: &Function, block: Block) -> Result<(), String> {
+    if block.index() >= func.blocks.len() {
+        return Err(format!("block{} is out of bounds ({} blocks)", block.0, func.blocks.len()));
+    }
+    Ok(())
+}
+
+fn check_bounds(func: &Function, entry: Block) -> Result<(), String> {
+    check_block(func, entry)?;
+    for (b, block) in func.blocks.iter().enumerate() {
+        for &param in &block.params {
+            check_value(func, param)?;
+        }
+        for &inst in &block.insts {
+            if inst.index() >= func.insts.len() {
+                return Err(format!("block{b} references out-of-bounds inst {}", inst.0));
+            }
+            let data = &func.insts[inst.index()];
+            let mut bad_val = None;
+            data.op.for_operands(|v| {
+                if bad_val.is_none() && v.index() >= func.types.len() {
+                    bad_val = Some(v);
+                }
+            });
+            if let Some(v) = bad_val {
+                return Err(format!("v{} is out of bounds ({} values)", v.0, func.types.len()));
+            }
+            for res in crate::live::results(data) {
+                check_value(func, res)?;
+            }
+            for target in data.op.targets() {
+                check_block(func, target)?;
+            }
+            match data.op {
+                Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) if slot.index() >= func.slots.len() => {
+                    return Err(format!("slot {} is out of bounds ({} slots)", slot.0, func.slots.len()));
+                }
+                Op::Call { sig, .. } | Op::TryCall { sig, .. } if sig.index() >= func.sigs.len() => {
+                    return Err(format!("sig {} is out of bounds ({} sigs)", sig.0, func.sigs.len()));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn shape(func: &Function, entry: Block) -> Result<(), String> {
     let mut entered = vec![false; func.blocks.len()];
-    for inst in &func.insts {
-        for target in inst.op.targets() {
-            entered[target.index()] = true;
+    entered[entry.index()] = true;
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            for target in func.insts[inst.index()].op.targets() {
+                entered[target.index()] = true;
+            }
         }
     }
     for (index, block) in func.blocks.iter().enumerate() {
@@ -206,6 +275,57 @@ fn shape(func: &Function) -> Result<(), String> {
         };
         if !func.insts[last.index()].op.is_terminator() || body.iter().any(|inst| func.insts[inst.index()].op.is_terminator()) {
             return Err(format!("block{index} does not end with exactly one terminator"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_ssa(func: &Function) -> Result<(), String> {
+    let cfg = func.cfg();
+    if !cfg.matches(func) {
+        return Err("cached CFG does not match current block terminators".to_owned());
+    }
+    let mut def_site: Vec<Option<(Block, usize)>> = vec![None; func.types.len()];
+    for &block in &cfg.rpo {
+        let data = &func.blocks[block.index()];
+        for &param in &data.params {
+            if def_site[param.index()].replace((block, 0)).is_some() {
+                return Err(format!("v{} is defined more than once", param.0));
+            }
+        }
+        for (idx, &inst) in data.insts.iter().enumerate() {
+            for res in crate::live::results(&func.insts[inst.index()]) {
+                if def_site[res.index()].replace((block, idx + 1)).is_some() {
+                    return Err(format!("v{} is defined more than once", res.0));
+                }
+            }
+        }
+    }
+    for &block in &cfg.rpo {
+        for (idx, &inst) in func.blocks[block.index()].insts.iter().enumerate() {
+            let use_pos = idx + 1;
+            let mut err = None;
+            func.insts[inst.index()].op.for_operands(|v| {
+                if err.is_some() {
+                    return;
+                }
+                match def_site[v.index()] {
+                    None => err = Some(format!("v{} used in block{} inst {} without a reachable definition", v.0, block.0, inst.0)),
+                    Some((def_block, def_pos)) if def_block == block => {
+                        if def_pos >= use_pos {
+                            err = Some(format!("v{} used before its definition in block{} inst {}", v.0, block.0, inst.0));
+                        }
+                    }
+                    Some((def_block, _)) => {
+                        if !cfg.dominates(def_block, block) {
+                            err = Some(format!("definition of v{} in block{} does not dominate use in block{}", v.0, def_block.0, block.0));
+                        }
+                    }
+                }
+            });
+            if let Some(message) = err {
+                return Err(message);
+            }
         }
     }
     Ok(())
@@ -265,7 +385,7 @@ fn op(func: &Function, op: &Op, result: Option<Value>) -> Result<(), String> {
             edge(func, *default, &[])?;
             targets.iter().try_for_each(|target| edge(func, *target, &[]))
         }
-        Op::Call { sig, args, .. } => call(func, sig.index(), args),
+        Op::Call { sig, args, results, .. } => call(func, sig.index(), args, results),
         Op::TryCall { sig, args, normal, handler, .. } => try_call(func, sig.index(), args, *normal, *handler),
         Op::Return(values) => returned(func, values),
         _ => Ok(()),
@@ -273,7 +393,7 @@ fn op(func: &Function, op: &Op, result: Option<Value>) -> Result<(), String> {
 }
 
 fn try_call(func: &Function, sig: usize, args: &[Value], normal: Block, handler: Block) -> Result<(), String> {
-    call(func, sig, args)?;
+    call(func, sig, args, &[])?;
     edge(func, normal, &[])?;
     match func.blocks[handler.index()].params[..] {
         [exception] if func.ty(exception) == Type::I64 && func.sigs[sig].returns.is_empty() => Ok(()),
@@ -289,9 +409,10 @@ fn returned(func: &Function, values: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-/// Checks that every instruction agrees with the types of its operands, blocks and signatures, and every block ends with one terminator.
+/// Checks types, bounds, CFG shape, SSA single-definition, and dominance of definitions over uses.
 pub(crate) fn verify(func: &Function, target: &crate::Target) -> Result<(), String> {
     let entry = func.entry.ok_or("the function has no entry block")?;
+    check_bounds(func, entry)?;
     if !typed(func, &func.blocks[entry.index()].params, &func.signature.params) {
         return Err("the entry block parameters do not match the signature".to_owned());
     }
@@ -300,11 +421,15 @@ pub(crate) fn verify(func: &Function, target: &crate::Target) -> Result<(), Stri
             return Err(format!("invalid vector type {ty:?}"));
         }
     }
-    for inst in &func.insts {
-        if matches!(inst.op, Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_)) && inst.result.map(|res| func.ty(res)) != Some(Type::I64) {
-            return Err("a symbol relocation instruction must define an I64 value".to_owned());
+    for block in &func.blocks {
+        for &inst_id in &block.insts {
+            let inst = &func.insts[inst_id.index()];
+            if matches!(inst.op, Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_)) && inst.result.map(|res| func.ty(res)) != Some(Type::I64) {
+                return Err("a symbol relocation instruction must define an I64 value".to_owned());
+            }
+            op(func, &inst.op, inst.result)?;
         }
-        op(func, &inst.op, inst.result)?;
     }
-    shape(func)
+    shape(func, entry)?;
+    verify_ssa(func)
 }

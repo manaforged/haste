@@ -155,29 +155,46 @@ impl StencilReloc {
     }
 }
 
-pub(crate) fn patch_bytes(relocs: &[StencilReloc], symbols: &[u64], out: &mut [u8]) {
+pub(crate) fn patch_bytes(relocs: &[StencilReloc], symbols: &[u64], out: &mut [u8]) -> Result<(), crate::Error> {
     for reloc in relocs {
         let value = match reloc.as_runtime() {
             Some(rt) => rt.host_addr() as u64,
-            None => symbols[reloc.symbol as usize],
+            None => *symbols.get(reloc.symbol as usize).ok_or_else(|| {
+                crate::Error::new(crate::ErrorKind::Unsupported, format!("relocation symbol {} out of range ({})", reloc.symbol, symbols.len()))
+            })?,
         };
-        if let Err(err) = patch_reloc(reloc.kind, value, &mut out[reloc.offset as usize..]) {
-            panic!("{err}");
+        let at = reloc.offset as usize;
+        if at > out.len() {
+            return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("relocation offset {at} exceeds buffer len {}", out.len())));
         }
+        patch_reloc(reloc.kind, value, &mut out[at..])?;
     }
+    Ok(())
 }
 
 /// Patches one relocation of `kind` targeting `value` at the start of `out`.
 pub fn patch_reloc(kind: RelocKind, value: u64, out: &mut [u8]) -> Result<(), crate::Error> {
+    let need = |n: usize| {
+        (out.len() >= n).then_some(()).ok_or_else(|| {
+            crate::Error::new(crate::ErrorKind::Unsupported, format!("{kind:?} needs {n} bytes, got {}", out.len()))
+        })
+    };
     match kind {
         RelocKind::Abs32 => {
+            need(4)?;
             if value >= (1 << 31) {
                 return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("Abs32 target {value:#x} exceeds low 2 GiB")));
             }
             out[..4].copy_from_slice(&(value as u32).to_le_bytes());
         }
-        RelocKind::Abs64 => out[..8].copy_from_slice(&value.to_le_bytes()),
-        RelocKind::Arm64Movw64 => patch_arm64_movw64(&mut out[..16], value),
+        RelocKind::Abs64 => {
+            need(8)?;
+            out[..8].copy_from_slice(&value.to_le_bytes());
+        }
+        RelocKind::Arm64Movw64 => {
+            need(16)?;
+            patch_arm64_movw64(&mut out[..16], value);
+        }
         RelocKind::PcRel32 | RelocKind::X64RipRel32 | RelocKind::Arm64Call26 | RelocKind::Arm64AdrpAdd | RelocKind::ThreadOff32 | RelocKind::Arm64TlvCell => {
             return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("{kind:?} requires AOT PC-relative patching")));
         }

@@ -424,7 +424,7 @@ impl Image {
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
         let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target_for(cx, reached.list[index].0.0))?;
         let mut expected = vec![0u8; fresh_code.bytes().len()];
-        fresh_code.patch(&symbols, &mut expected);
+        fresh_code.patch(&symbols, &mut expected)?;
         // SAFETY: exec..exec + len is mapped readable executable code in this image.
         let actual = unsafe { std::slice::from_raw_parts(exec as *const u8, len) };
         if actual != expected.as_slice() {
@@ -451,7 +451,7 @@ impl Image {
             }
         } else {
             let mut expected = vec![0u8; fresh_code.bytes().len()];
-            fresh_code.patch(&[], &mut expected);
+            fresh_code.patch(&[], &mut expected)?;
             // SAFETY: body_exec..body_exec + code.bytes().len() is mapped readable executable code in this image.
             let actual_body = unsafe { std::slice::from_raw_parts(body_exec as *const u8, code.bytes().len()) };
             if actual_body != expected.as_slice() {

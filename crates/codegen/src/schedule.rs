@@ -5,6 +5,15 @@ mod sink;
 
 use std::time::Instant;
 
+fn verify_stage(func: &Function, target: &crate::Target, stage: &str) {
+    if crate::verify::verify_passes_enabled()
+        && let Err(err) = crate::verify::verify(func, target)
+    {
+        eprintln!("[haste-verify] failed after {stage}: {err}\n{func}");
+        panic!("IR verification failed after {stage}: {err}");
+    }
+}
+
 use crate::ir::{Binary, Block, Domain, Function, Inst, IntCC, Op, Type, Value};
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
@@ -145,6 +154,9 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
     };
     if changed.contains(Domain::CFG) {
         func.bump_cfg();
+    }
+    if !changed.is_empty() {
+        verify_stage(func, target, pass.name());
     }
     if let Some(start) = start {
         crate::trace::after_pass(pass, before_blocks, before_insts, changed, start.elapsed(), func);
@@ -419,18 +431,22 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
         return;
     }
     if (plan.effort == Effort::Full || func.elide_drops) && func.elide_dead_unwind_drops_post_init(true) {
+        verify_stage(func, plan.target, "elide_dead_unwind_drops_late");
         *state = PassState::new();
         run_fixpoint(func, plan, state);
     }
     if strip_assumes(func) {
+        verify_stage(func, plan.target, "strip_assumes");
         rerun_after_rewrite(func, plan, state);
     }
     if plan.effort == Effort::Full {
         let wide_changed = (plan.target.arch == crate::Arch::X64 && crate::native::divide_by_word(func)) | crate::pairs::split(func);
         if wide_changed {
+            verify_stage(func, plan.target, "wide_split");
             rerun_after_rewrite(func, plan, state);
         }
         if crate::slp::run(func) {
+            verify_stage(func, plan.target, "slp");
             rerun_after_rewrite(func, plan, state);
         }
     }
@@ -520,6 +536,7 @@ fn run_backend_prep(func: &mut Function, plan: &Plan) {
         products::adjoin(func);
         copies::pair(func);
     }
+    verify_stage(func, plan.target, "backend_prep");
 }
 
 pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Target) {
@@ -534,9 +551,11 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
         && (plan.effort == Effort::Full || func.elide_drops)
         && func.elide_dead_unwind_drops_post_init(false)
     {
+        verify_stage(func, target, "elide_dead_unwind_drops_early");
         state = PassState::new();
     }
     if moves == promote::Moves::Split && plan.effort == Effort::Full && crate::loads::elide_early(func) {
+        verify_stage(func, target, "loads_elide_early");
         state.fold_clean = false;
         state.merge_clean = false;
     }

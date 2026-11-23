@@ -421,10 +421,47 @@ fn build_users(func: &Function, spec_def: &[bool]) -> Vec<Vec<(Inst, Block)>> {
     users
 }
 
+fn topo_visit(func: &Function, moves: &[Inst], defs: &[(u32, usize)], state: &mut [u8], ordered: &mut Vec<Inst>, i: usize) {
+    if state[i] != 0 {
+        return;
+    }
+    state[i] = 1;
+    func.insts[moves[i].index()].op.for_operands(|v| {
+        if let Ok(pos) = defs.binary_search_by_key(&v.0, |&(r, _)| r) {
+            topo_visit(func, moves, defs, state, ordered, defs[pos].1);
+        }
+    });
+    state[i] = 2;
+    ordered.push(moves[i]);
+}
+
+fn topo_sort_moves(func: &Function, moves: &mut Vec<Inst>) {
+    let n = moves.len();
+    if n <= 1 {
+        return;
+    }
+    let mut defs: Vec<(u32, usize)> = moves
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &inst)| func.insts[inst.index()].result.map(|r| (r.0, i)))
+        .collect();
+    if defs.len() <= 1 {
+        return;
+    }
+    defs.sort_unstable_by_key(|&(r, _)| r);
+    let mut ordered = Vec::with_capacity(n);
+    let mut state = vec![0_u8; n];
+    for i in 0..n {
+        topo_visit(func, moves, &defs, &mut state, &mut ordered, i);
+    }
+    *moves = ordered;
+}
+
 fn flush_moves(func: &mut Function, block: Block, moves: &mut Vec<Inst>) {
     if moves.is_empty() {
         return;
     }
+    topo_sort_moves(func, moves);
     let mut next: Vec<Inst> = moves.drain(..).collect();
     next.extend_from_slice(&func.blocks[block.index()].insts);
     func.blocks[block.index()].insts = next;

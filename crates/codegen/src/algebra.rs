@@ -696,7 +696,7 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
             let (ta, ea) = (ta.clone(), ea.clone());
             match select::tested_select(cx, cond) {
                 Some((test, true)) => Some(Op::Brif(test, tb, ta, eb, ea)),
-                Some((test, false)) => Some(Op::Brif(test, eb, ea, tb, ta)),
+                Some((test, false)) => { cx.func.bump_cfg(); Some(Op::Brif(test, eb, ea, tb, ta)) }
                 None => known_cond(cx, cond).or_else(|| icmp::strip_zero_test(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
             }
         }

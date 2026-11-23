@@ -160,6 +160,8 @@ fn keeps_frame_pointer(func: &Function) -> bool {
         || func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
 
+pub(crate) const DICT_STUB_RELOCS: [(u32, crate::reloc::RelocKind); 2] = [(2, crate::reloc::RelocKind::Abs64), (12, crate::reloc::RelocKind::Abs64)];
+
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
     let mut asm = Asm::default();
     if let Some(tier) = tier_up {
