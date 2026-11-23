@@ -64,6 +64,38 @@ fn block_has_unwind_call(func: &Function, kinds: &[CalleeKind], b: Block) -> boo
     })
 }
 
+fn call_bounded_blocks(func: &Function, cfg: &Cfg, kinds: &[CalleeKind]) -> Vec<bool> {
+    let n = func.blocks.len();
+    let has_call: Vec<bool> = (0..n).map(|bi| block_has_unwind_call(func, kinds, Block(bi as u32))).collect();
+    let mut outdeg = vec![0u32; n];
+    let mut ok = has_call.clone();
+    let mut q = Vec::new();
+    for bi in 0..n {
+        if ok[bi] || !cfg.reachable[bi] {
+            continue;
+        }
+        let deg = func.successors(Block(bi as u32)).filter(|s| cfg.reachable[s.index()] && !has_call[s.index()]).count() as u32;
+        outdeg[bi] = deg;
+        if deg == 0 {
+            ok[bi] = true;
+            q.push(Block(bi as u32));
+        }
+    }
+    while let Some(u) = q.pop() {
+        for &p in cfg.preds_of(u) {
+            let pi = p.index();
+            if !ok[pi] && cfg.reachable[pi] {
+                outdeg[pi] = outdeg[pi].saturating_sub(1);
+                if outdeg[pi] == 0 {
+                    ok[pi] = true;
+                    q.push(p);
+                }
+            }
+        }
+    }
+    ok
+}
+
 fn target_ok(cfg: &Cfg, depths: &[u32], always_active: Option<&[bool]>, call_in_loop: Option<&[bool]>, b: Block, in_r: &[bool], s: Block) -> bool {
     let si = s.index();
     let depth_ok = depths[si] <= depths[b.index()] || call_in_loop.is_some_and(|c| c[si]);
@@ -180,7 +212,7 @@ pub(super) fn plan_flag_sink(
         return None;
     }
     let n = func.blocks.len();
-    let has_call: Vec<bool> = (0..n).map(|bi| block_has_unwind_call(func, kinds, Block(bi as u32))).collect();
+    let call_bounded = call_bounded_blocks(func, cfg, kinds);
     let (mut in_r, mut work) = (vec![false; n], vec![b]);
     in_r[b.index()] = true;
     while let Some(u) = work.pop() {
@@ -192,10 +224,10 @@ pub(super) fn plan_flag_sink(
             }
         }
     }
-    sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b, 8), &mut in_r).or_else(|| {
+    sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&call_bounded), b, 8), &mut in_r).or_else(|| {
         let mut solo = vec![false; n];
         solo[b.index()] = true;
-        sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b, 8), &mut solo)
+        sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&call_bounded), b, 8), &mut solo)
     })
 }
 
@@ -412,7 +444,7 @@ pub(super) fn plan_entry_zero_sink(
         return Some(Vec::new());
     }
     let always_zero = flag_always_zero(func, defs, entry, flag);
-    let has_call: Vec<bool> = (0..n).map(|bi| block_has_unwind_call(func, kinds, Block(bi as u32))).collect();
+    let call_bounded = call_bounded_blocks(func, cfg, kinds);
     let (mut in_r, mut work) = (vec![false; n], vec![entry]);
     in_r[entry.index()] = true;
     while let Some(u) = work.pop() {
@@ -424,5 +456,9 @@ pub(super) fn plan_entry_zero_sink(
             }
         }
     }
-    sink_frontier_with_calls(func, cfg, depths, (&live_in, Some(&always_zero), Some(&has_call), entry, 4), &mut in_r)
+    sink_frontier_with_calls(func, cfg, depths, (&live_in, Some(&always_zero), Some(&call_bounded), entry, 8), &mut in_r).or_else(|| {
+        let mut solo = vec![false; n];
+        solo[entry.index()] = true;
+        sink_frontier_with_calls(func, cfg, depths, (&live_in, Some(&always_zero), Some(&call_bounded), entry, 8), &mut solo)
+    })
 }

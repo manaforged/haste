@@ -25,6 +25,14 @@ fn emit_zero_interval<'a, E: Emitter<'a>>(emit: &mut E, start: i32, stop: i32) {
             emit.emit_zero_frame(cur, 2);
             emit.emit_zero_frame(cur + 2, 1);
         }
+        6 if (cur & 3) == 2 => {
+            emit.emit_zero_frame(cur, 2);
+            emit.emit_zero_frame(cur + 2, 4);
+        }
+        6 if (cur & 3) == 0 => {
+            emit.emit_zero_frame(cur, 4);
+            emit.emit_zero_frame(cur + 4, 2);
+        }
         5..=7 => {
             emit.emit_zero_frame(cur, 4);
             emit.emit_zero_frame(stop - 4, 4);
