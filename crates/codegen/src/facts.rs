@@ -234,34 +234,34 @@ impl<'a> Ranges<'a> {
     }
 
     fn propagate(&mut self, func: &Function, info: &CfgInfo, order: &[Block]) -> bool {
-        let mut narrowed = false;
-        let mut falls_through = Vec::new();
+        let (mut narrowed, mut falls_through, mut epoch) = (false, vec![0_u32; func.types.len()], 0_u32);
+        let bump = |epoch: &mut u32, ft: &mut [u32]| { *epoch = epoch.wrapping_add(1); if *epoch == 0 { ft.fill(0); *epoch = 1; } };
         for &block in order {
             narrowed |= self.refine_params(func, info, block);
-            falls_through.clear();
-            falls_through.extend(func.blocks[block.index()].params.iter().copied().filter(|&p| func.ty(p).is_small_int()));
+            bump(&mut epoch, &mut falls_through);
+            for &p in &func.blocks[block.index()].params { if func.ty(p).is_small_int() { falls_through[p.index()] = epoch; } }
             for inst in &func.blocks[block.index()].insts {
                 let data = &func.insts[inst.index()];
-                narrowed |= transfer::note_deref(func, &data.op, &falls_through, &mut self.table);
+                narrowed |= transfer::note_deref(func, &data.op, &falls_through, epoch, &mut self.table);
                 match data.op {
                     Op::Assume(value) => {
                         let (lo, hi) = &mut self.table[value.index()];
-                        if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through.contains(&value) {
+                        if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through[value.index()] == epoch {
                             *lo = 1;
                             if !self.raised.contains(&value) { self.raised.push(value); }
                         }
                         continue;
                     }
                     Op::Call { ref results, .. } => {
-                        falls_through.clear();
-                        falls_through.extend(results.iter().copied().filter(|&r| func.ty(r).is_small_int()));
+                        bump(&mut epoch, &mut falls_through);
+                        for &r in results { if func.ty(r).is_small_int() { falls_through[r.index()] = epoch; } }
                         continue;
                     }
-                    ref op if !op.is_speculable() => falls_through.clear(),
+                    ref op if !op.is_speculable() => bump(&mut epoch, &mut falls_through),
                     _ => {}
                 }
                 let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
-                falls_through.push(result);
+                falls_through[result.index()] = epoch;
                 let fact = match info.consts.get(result.index()).copied().flatten() {
                     Some(imm) => Fact::constant(func.ty(result), imm),
                     None => transfer::transfer(func, self, &data.op, func.ty(result), &|value| self.of(value)),

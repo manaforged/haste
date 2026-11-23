@@ -421,6 +421,7 @@ impl Op {
     }
 
     /// Calls `f` with every value this instruction reads, once per read.
+    #[inline]
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}

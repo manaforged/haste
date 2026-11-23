@@ -160,7 +160,7 @@ fn wrap_cl_block(
 
 /// Narrows `#[track_caller]` TLS stores and save/restore spans onto cold call sites, drops silent or unobservable stores, and sinks cold cell lookups.
 pub(super) fn optimize(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool {
-    if !prov.param_roots.contains(&MemRoot::CallerLoc) {
+    if !prov.has_caller_loc {
         return false;
     }
     let mut zeros = func.thread_cell_zeros();
@@ -594,40 +594,49 @@ fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl:
         }
     }
     let cl_defs = collect_cl_defs(func, cfg, zeros);
+    let mut def_blocks: Vec<Option<Block>> = vec![None; func.types.len()];
+    let mut any_def = false;
+    for (res_idx, def) in cl_defs.iter().enumerate() {
+        if let Some((b_def, ..)) = def {
+            def_blocks[res_idx] = Some(*b_def);
+            any_def = true;
+        }
+    }
+    if !any_def {
+        return changed;
+    }
+    let mut all_use_blocks: Vec<Vec<Block>> = vec![Vec::new(); func.types.len()];
+    let mut all_ok = vec![true; func.types.len()];
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let op = &func.insts[inst.index()].op;
+            op.for_operands(|v| {
+                let vi = v.index();
+                if let Some(b_def) = def_blocks[vi]
+                    && all_ok[vi]
+                {
+                    let valid = matches!(*op, Op::Load(a, 0) if a == v)
+                        || matches!(*op, Op::Store(val, a, 0) if a == v && val != v);
+                    if b == b_def || !valid {
+                        all_ok[vi] = false;
+                    } else if all_use_blocks[vi].last() != Some(&b) {
+                        all_use_blocks[vi].push(b);
+                    }
+                }
+            });
+        }
+    }
     let loops = cfg.loops();
     let n = func.blocks.len();
     for (res_idx, def) in cl_defs.into_iter().enumerate() {
         let Some((b_def, def_inst, (sig, callee, args))) = def else {
             continue;
         };
-        let res = Value(res_idx as u32);
-        let mut use_blocks: Vec<Block> = Vec::new();
-        let mut ok = true;
-        for &b in &cfg.rpo {
-            for &inst in &func.blocks[b.index()].insts {
-                let op = &func.insts[inst.index()].op;
-                let mut hit = false;
-                op.for_operands(|v| hit |= v == res);
-                if !hit {
-                    continue;
-                }
-                let valid = matches!(*op, Op::Load(a, 0) if a == res)
-                    || matches!(*op, Op::Store(v, a, 0) if a == res && v != res);
-                if b == b_def || !valid {
-                    ok = false;
-                    break;
-                }
-                if use_blocks.last() != Some(&b) {
-                    use_blocks.push(b);
-                }
-            }
-            if !ok {
-                break;
-            }
-        }
-        if !ok {
+        if !all_ok[res_idx] {
             continue;
         }
+        let res = Value(res_idx as u32);
+        let use_blocks = std::mem::take(&mut all_use_blocks[res_idx]);
         if use_blocks.is_empty() {
             if let Some(pos) = func.blocks[b_def.index()].insts.iter().position(|&i| i == def_inst) {
                 func.blocks[b_def.index()].insts.remove(pos);

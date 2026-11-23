@@ -23,14 +23,19 @@ struct Run {
 }
 
 /// Regroups field copies into moves when some block stores enough loaded values to be worth it.
-pub(super) fn run(func: &mut Function) -> bool {
+pub(super) fn run(func: &mut Function, prov: Option<&Provenance>) -> bool {
+    if !func.blocks.iter().any(|b| b.insts.iter().filter(|&&i| matches!(func.insts[i.index()].op, Op::Store(..))).count() >= MIN_PIECES) {
+        return false;
+    }
     let defs = defs(func);
     if !worth(func, &defs) {
         return false;
     }
     let cfg = func.cfg();
-    let prov = Provenance::new(func, &cfg);
-    regroup(func, &prov, &cfg, &defs)
+    match prov {
+        Some(existing) => regroup(func, existing, &cfg, &defs),
+        None => regroup(func, &Provenance::new(func, &cfg), &cfg, &defs),
+    }
 }
 
 fn worth(func: &Function, defs: &[Option<Inst>]) -> bool {

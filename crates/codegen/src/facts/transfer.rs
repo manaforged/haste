@@ -34,11 +34,12 @@ pub(super) fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: 
     }
 }
 
-/// Raises the lower bound of a dereferenced pointer in `falls_through` to 1, returning whether it narrowed.
-pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[Value], table: &mut [(u64, u64)]) -> bool {
-    let Some(addr) = deref_ptr(op).filter(|&a| func.ty(a) == Type::I64 && falls_through.contains(&a)) else { return false };
-    let (lo, hi) = &mut table[addr.index()];
-    if *lo == 0 && *hi != 0 {
+/// Raises the lower bound of a dereferenced pointer marked at `epoch` in `falls_through` to 1, returning whether it narrowed.
+pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> bool {
+    let Some(addr) = deref_ptr(op) else { return false };
+    let idx = addr.index();
+    let (lo, hi) = &mut table[idx];
+    if *lo == 0 && *hi != 0 && func.ty(addr) == Type::I64 && falls_through[idx] == epoch {
         *lo = 1;
         return true;
     }

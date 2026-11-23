@@ -769,8 +769,7 @@ fn sink_common_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
         func.bump_cfg();
     }
     let cfg = func.cfg();
-    let mut consts = collect_consts(func);
-    let mut uses = func.use_counts();
+    let mut meta: Option<(Vec<Option<i64>>, Vec<u32>)> = None;
     let mut changed = false;
     for j_idx in 0..func.blocks.len() {
         let target = Block(j_idx as u32);
@@ -779,10 +778,10 @@ fn sink_common_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
             continue;
         }
         let Some(preds) = collect_jump_preds(func, &cfg, target) else { continue };
-        let Some(plan) = find_jump_tail_plan(func, &consts, &uses, &preds, param_len) else { continue };
+        let (consts, uses) = meta.get_or_insert_with(|| (collect_consts(func), func.use_counts()));
+        let Some(plan) = find_jump_tail_plan(func, consts, uses, &preds, param_len) else { continue };
         apply_jump_tail_plan(func, j_idx, &preds, plan);
-        consts = collect_consts(func);
-        uses = func.use_counts();
+        meta = None;
         changed = true;
     }
     changed

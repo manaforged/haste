@@ -321,22 +321,36 @@ pub(super) fn classify_uses(
     let cx = EscapeCx { func, slots: &slots, tracked: &tracked, is_const: &is_const, unwind_write_only: &unwind_write_only, in_loop: &in_loop, danger: &danger, unknown_end: &unknown_end };
     let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], unwind_stores: vec![0_u32; n], ro_calls: vec![0_u32; n], returns: vec![0_u32; n] };
     let mut points: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
-    let mut used = Vec::new();
+    let mut used: Vec<(Value, StackSlot, u32)> = Vec::new();
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             used.clear();
+            let mut has_tracked = false;
             data.op.for_operands(|v| {
-                counts.total[v.index()] += 1;
-                used.push((v, counts.safe[v.index()] + counts.unwind_stores[v.index()]));
+                let vi = v.index();
+                if slots[vi].is_some() || matches!(tracked[vi], TrackRoot::Set(_)) {
+                    has_tracked = true;
+                    counts.total[vi] += 1;
+                    if let Some(s) = slot_root(v, slots, tracked) {
+                        used.push((v, s, counts.safe[vi] + counts.unwind_stores[vi]));
+                    }
+                }
             });
+            if !has_tracked {
+                continue;
+            }
             classify_inst(&cx, &mut counts, b, pos, data);
-            for (i, &(v, before)) in used.iter().enumerate() {
-                let Some(s) = slot_root(v, slots, tracked) else { continue };
-                let uses = used.iter().filter(|&&(u, _)| u == v).count() as u32;
-                let after = counts.safe[v.index()] + counts.unwind_stores[v.index()];
-                if !used[..i].iter().any(|&(u, _)| u == v) && after - before < uses {
-                    points.entry(s.0).or_default().push((b.index() as u32, pos as u32));
+            if !used.is_empty() {
+                for (i, &(v, s, before)) in used.iter().enumerate() {
+                    if used[..i].iter().any(|&(u, _, _)| u == v) {
+                        continue;
+                    }
+                    let uses = used[i..].iter().filter(|&&(u, _, _)| u == v).count() as u32;
+                    let after = counts.safe[v.index()] + counts.unwind_stores[v.index()];
+                    if after - before < uses {
+                        points.entry(s.0).or_default().push((b.index() as u32, pos as u32));
+                    }
                 }
             }
         }

@@ -761,7 +761,7 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     }
     changed |= crate::mem::drop_unread_frame_stores(func, &cfg, &prov);
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
-    changed |= pack::coalesce_loads(func, &prov, target);
+    changed |= pack::coalesce_loads(func, &cfg, &prov, target);
     changed |= sink_terminator_defs(func);
     let Some((defs, mut consts, selects)) = collect_scan_meta(func) else { return domain(changed) };
     let mut bw = BlockWrites::new(func, &cfg, &prov);
@@ -793,6 +793,6 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
             changed |= elide::forward_moves(func, &prov);
         }
     }
-    changed |= regroup::run(func);
+    changed |= regroup::run(func, (!changed).then_some(&prov));
     domain(changed)
 }

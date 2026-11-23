@@ -103,6 +103,7 @@ pub(crate) struct Provenance {
     pub incoming: Vec<bool>,
     pub affine: Vec<(Value, i64)>,
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
+    pub has_caller_loc: bool,
     frontiers: HashMap<u32, escape::Frontier>,
     inst_at: Vec<(u32, u32)>,
     frame: frame::FrameFacts,
@@ -271,47 +272,87 @@ fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool
     false
 }
 
-fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> Vec<TrackRoot> {
+fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> (Vec<TrackRoot>, bool) {
     let mut tracked = vec![TrackRoot::Unset; func.types.len()];
     seed_entry_roots(func, cfg, &mut tracked);
     let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
     seed_fresh_owners(func, entry, affine, &mut tracked);
-    let has_caller_loc = seed_thread_cells(func, &mut tracked);
-    let mut steps = Vec::new();
-    let mut changed = false;
+    let mut has_caller_loc = seed_thread_cells(func, &mut tracked);
+    let rank = Cfg::ranks(&cfg.rpo, func.blocks.len());
+    let mut need_fixpoint = false;
     for &b in &cfg.rpo {
+        let br = rank[b.index()];
         let insts = &func.blocks[b.index()].insts;
         for &inst in insts {
-            changed |= track_def(func, inst, &mut tracked, affine);
-            let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|res| is_derived_i64(&data.op, func.ty(res))) {
-                steps.push((inst, false));
+            track_def(func, inst, &mut tracked, affine);
+            if !need_fixpoint
+                && let Some(res) = func.insts[inst.index()].result
+                && tracked[res.index()] == TrackRoot::Unset
+                && is_derived_i64(&func.insts[inst.index()].op, func.ty(res))
+            {
+                need_fixpoint = true;
             }
         }
-        if let Some(&last) = insts.last()
-            && matches!(func.insts[last.index()].op, Op::Jump(..) | Op::Brif(..))
-        {
-            changed |= track_edges(func, entry, last, &mut tracked);
-            steps.push((last, true));
+        if let Some(&last) = insts.last() {
+            match &func.insts[last.index()].op {
+                Op::Jump(t, args) if !args.is_empty() => {
+                    if join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *t, args) && rank[t.index()] <= br {
+                        need_fixpoint = true;
+                    }
+                }
+                Op::Brif(_, t, ta, f, fa) if !ta.is_empty() || !fa.is_empty() => {
+                    if !ta.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *t, ta) && rank[t.index()] <= br {
+                        need_fixpoint = true;
+                    }
+                    if !fa.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *f, fa) && rank[f.index()] <= br {
+                        need_fixpoint = true;
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    let mut rounds = 1;
-    while changed && rounds < 64 {
-        changed = false;
-        for &(inst, edges) in &steps {
-            changed |= if edges { track_edges(func, entry, inst, &mut tracked) } else { track_def(func, inst, &mut tracked, affine) };
+    let mut changed = need_fixpoint;
+    if changed {
+        let mut steps = Vec::new();
+        for &b in &cfg.rpo {
+            let insts = &func.blocks[b.index()].insts;
+            for &inst in insts {
+                let data = &func.insts[inst.index()];
+                if data.result.is_some_and(|res| is_derived_i64(&data.op, func.ty(res))) {
+                    steps.push((inst, false));
+                }
+            }
+            if let Some(&last) = insts.last()
+                && match &func.insts[last.index()].op {
+                    Op::Jump(_, args) => !args.is_empty(),
+                    Op::Brif(_, _, ta, _, fa) => !ta.is_empty() || !fa.is_empty(),
+                    _ => false,
+                }
+            {
+                steps.push((last, true));
+            }
         }
-        rounds += 1;
+        let mut rounds = 1;
+        while changed && rounds < 64 {
+            changed = false;
+            for &(inst, edges) in &steps {
+                changed |= if edges { track_edges(func, entry, inst, &mut tracked) } else { track_def(func, inst, &mut tracked, affine) };
+            }
+            rounds += 1;
+        }
     }
     if changed {
         tracked.fill(TrackRoot::Conflict);
+        has_caller_loc = false;
     } else {
         tracked.iter_mut().filter(|item| **item == TrackRoot::Unset).for_each(|item| *item = TrackRoot::Conflict);
         if has_caller_loc && caller_loc_escaped(func, cfg, &tracked) {
             tracked.iter_mut().filter(|item| **item == TrackRoot::Set(MemRoot::CallerLoc)).for_each(|item| *item = TrackRoot::Conflict);
+            has_caller_loc = false;
         }
     }
-    tracked
+    (tracked, has_caller_loc)
 }
 
 fn step_affine(op: &Op, out: &[(Value, i64)], consts: &[Option<i64>], types: &[Type]) -> Option<(Value, i64)> {
@@ -375,8 +416,8 @@ impl Provenance {
 
     fn build(func: &Function, cfg: &Cfg, (is_spill, positions): (Option<&[bool]>, bool), affine: Option<Vec<(Value, i64)>>) -> Self {
         let affine = affine.unwrap_or_else(|| compute_affine(func));
-        let tracked = compute_tracked_roots(func, cfg, &affine);
-        let mut prov = Self::from_roots(func, cfg, &tracked, affine);
+        let (tracked, has_caller_loc) = compute_tracked_roots(func, cfg, &affine);
+        let mut prov = Self::from_roots(func, cfg, &tracked, has_caller_loc, affine);
         let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, is_spill);
         if positions {
             prov.frontiers = escape::frontiers(func, &esc);
@@ -398,7 +439,7 @@ impl Provenance {
         prov
     }
 
-    fn from_roots(func: &Function, cfg: &Cfg, tracked: &[TrackRoot], affine: Vec<(Value, i64)>) -> Self {
+    fn from_roots(func: &Function, cfg: &Cfg, tracked: &[TrackRoot], has_caller_loc: bool, affine: Vec<(Value, i64)>) -> Self {
         let slot_offsets = slot_addresses(func);
         let mut param_roots = vec![MemRoot::Unknown; func.types.len()];
         for (i, t) in tracked.iter().enumerate() {
@@ -425,14 +466,14 @@ impl Provenance {
                 incoming[param.index()] = fresh;
             }
         }
-        Self { slot_offsets, param_roots, symbol_defs, frame_runtime, ro_bytes, incoming, affine, frame: frame::FrameFacts::new(func, cfg), ..Self::default() }
+        Self { slot_offsets, param_roots, symbol_defs, frame_runtime, ro_bytes, incoming, affine, has_caller_loc, frame: frame::FrameFacts::new(func, cfg), ..Self::default() }
     }
 
     /// The address facts alone, for `loc` and `ro_bytes`: no escape classification and no loop spans.
     pub(crate) fn addresses(func: &Function, cfg: &Cfg) -> Self {
         let affine = compute_affine(func);
-        let tracked = compute_tracked_roots(func, cfg, &affine);
-        Self::from_roots(func, cfg, &tracked, affine)
+        let (tracked, has_caller_loc) = compute_tracked_roots(func, cfg, &affine);
+        Self::from_roots(func, cfg, &tracked, has_caller_loc, affine)
     }
 
     pub(crate) fn new(func: &Function, cfg: &Cfg) -> Self {

@@ -16,8 +16,13 @@ pub(super) enum RelKind {
 }
 
 #[inline]
-const fn kind_bit(kind: RelKind) -> u8 {
+pub(super) const fn kind_bit(kind: RelKind) -> u8 {
     1_u8 << (kind as u8)
+}
+
+#[inline]
+fn val_bit(v: Value) -> u64 {
+    1_u64 << (v.index() & 63)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,9 +74,13 @@ pub(super) fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
 /// The conditions known to hold at one point of a function: facts on values that the branches taken to get there give.
 #[derive(Clone, Default)]
 pub(super) struct Path {
-    facts: Vec<(Value, Fact)>,
+    fact_vals: Vec<Value>,
+    fact_data: Vec<Fact>,
+    fact_mask: u64,
     rels: Vec<Rel>,
     rel_kinds: u8,
+    rel_src_mask: u64,
+    rel_dst_mask: u64,
     no_wrap_adds: Vec<(Value, Value)>,
     pub(super) uppers: Uppers,
 }
@@ -86,7 +95,13 @@ pub(super) struct Reached {
 impl Path {
     /// Whether this path has recorded no branch-specific facts, relations, or no-wrap sums.
     pub(super) fn is_empty(&self) -> bool {
-        self.facts.is_empty() && self.no_wrap_adds.is_empty()
+        self.fact_vals.is_empty() && self.no_wrap_adds.is_empty()
+    }
+
+    /// Whether any recorded relation has a kind in `mask`.
+    #[inline]
+    pub(super) fn has_rel_kind(&self, mask: u8) -> bool {
+        self.rel_kinds & mask != 0
     }
 
     /// The symbolic relations known here, oldest first.
@@ -94,11 +109,19 @@ impl Path {
         &self.rels
     }
 
+    #[inline]
     fn get(&self, value: Value) -> Option<&Fact> {
-        self.facts.iter().rev().find(|(at, _)| *at == value).map(|(_, fact)| fact)
+        if self.fact_mask & val_bit(value) == 0 {
+            return None;
+        }
+        self.fact_vals
+            .iter()
+            .rposition(|&at| at == value)
+            .map(|pos| &self.fact_data[pos])
     }
 
     /// Everything known about `value` here: its definition's range and the path's facts.
+    #[inline]
     pub(super) fn fact(&self, ranges: &Ranges, value: Value) -> Fact {
         let defined = ranges.of(value);
         match self.get(value) {
@@ -110,12 +133,25 @@ impl Path {
     /// Records `fact` on `value`, forgetting the oldest fact past `MAX_FACTS`.
     pub(super) fn add(&mut self, ranges: &Ranges, value: Value, fact: Fact) {
         let merged = self.fact(ranges, value).meet(&fact);
-        if let Some(pos) = self.facts.iter().position(|(at, _)| *at == value) {
-            self.facts.remove(pos);
-        } else if self.facts.len() >= MAX_FACTS {
-            self.facts.remove(0);
+        let bit = val_bit(value);
+        if self.fact_mask & bit != 0
+            && let Some(pos) = self.fact_vals.iter().position(|&at| at == value)
+        {
+            self.fact_vals.remove(pos);
+            self.fact_data.remove(pos);
+            self.fact_vals.push(value);
+            self.fact_data.push(merged);
+        } else if self.fact_vals.len() >= MAX_FACTS {
+            self.fact_vals.remove(0);
+            self.fact_data.remove(0);
+            self.fact_vals.push(value);
+            self.fact_data.push(merged);
+            self.fact_mask = self.fact_vals.iter().fold(0_u64, |m, &v| m | val_bit(v));
+        } else {
+            self.fact_vals.push(value);
+            self.fact_data.push(merged);
+            self.fact_mask |= bit;
         }
-        self.facts.push((value, merged));
         self.uppers.clear();
     }
 
@@ -124,12 +160,35 @@ impl Path {
             if self.rels.len() >= MAX_RELS {
                 self.rels.remove(0);
                 self.rels.push(rel);
-                self.rel_kinds = self.rels.iter().fold(0_u8, |mask, r| mask | kind_bit(r.kind));
+                self.rebuild_rel_masks();
             } else {
                 self.rels.push(rel);
                 self.rel_kinds |= kind_bit(rel.kind);
+                self.note_rel_masks(rel);
             }
             self.uppers.clear();
+        }
+    }
+
+    fn note_rel_masks(&mut self, rel: Rel) {
+        if rel.kind == RelKind::Eq {
+            let both = val_bit(rel.lhs) | val_bit(rel.rhs);
+            self.rel_src_mask |= both;
+            self.rel_dst_mask |= both;
+        } else if rel.kind != RelKind::Ne {
+            self.rel_src_mask |= val_bit(rel.lhs);
+            self.rel_dst_mask |= val_bit(rel.rhs);
+        }
+    }
+
+    fn rebuild_rel_masks(&mut self) {
+        self.rel_kinds = 0;
+        self.rel_src_mask = 0;
+        self.rel_dst_mask = 0;
+        for i in 0..self.rels.len() {
+            let r = self.rels[i];
+            self.rel_kinds |= kind_bit(r.kind);
+            self.note_rel_masks(r);
         }
     }
 
@@ -235,11 +294,23 @@ impl Path {
     }
 
     pub(super) fn steps_from(&self, ty: Type, start: Value, kinds: (RelKind, RelKind)) -> bool {
+        let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
+        if self.rel_kinds & needed == 0 || self.rel_src_mask & val_bit(start) == 0 {
+            return false;
+        }
         self.rels.iter().any(|&r| rel_step(r, start, ty, kinds).is_some())
     }
 
     pub(super) fn steps_into(&self, ty: Type, target: Value, kinds: (RelKind, RelKind)) -> bool {
-        self.rels.iter().any(|&r| [r.lhs, r.rhs].into_iter().any(|cur| rel_step(r, cur, ty, kinds).is_some_and(|(next, _)| next == target)))
+        let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
+        if self.rel_kinds & needed == 0 || self.rel_dst_mask & val_bit(target) == 0 {
+            return false;
+        }
+        self.rels.iter().any(|&r| {
+            r.ty == ty
+                && ((r.rhs == target && (r.kind == RelKind::Eq || r.kind == kinds.0 || r.kind == kinds.1))
+                    || (r.lhs == target && r.kind == RelKind::Eq))
+        })
     }
 
     pub(super) fn reaches(&self, ty: Type, start: Value, target: Value, kinds: (RelKind, RelKind), require_strict: bool) -> bool {
@@ -461,10 +532,10 @@ impl Path {
     }
 
     fn strictly_ordered(&self, ty: Type, a: Value, b: Value) -> bool {
-        self.reaches(ty, a, b, UNSIGNED, true)
-            || self.reaches(ty, b, a, UNSIGNED, true)
-            || self.reaches(ty, a, b, SIGNED, true)
-            || self.reaches(ty, b, a, SIGNED, true)
+        let has_u = self.rel_kinds & kind_bit(RelKind::Ult) != 0;
+        let has_s = self.rel_kinds & kind_bit(RelKind::Slt) != 0;
+        (has_u && (self.reaches(ty, a, b, UNSIGNED, true) || self.reaches(ty, b, a, UNSIGNED, true)))
+            || (has_s && (self.reaches(ty, a, b, SIGNED, true) || self.reaches(ty, b, a, SIGNED, true)))
     }
 
     pub(super) fn decide_rel(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> Option<bool> {

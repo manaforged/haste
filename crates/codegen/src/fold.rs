@@ -192,19 +192,6 @@ pub(crate) struct Before<'a> {
     pub(crate) block: Option<Block>,
 }
 
-impl<'a> Before<'a> {
-    fn insts(self, func: &'a Function) -> impl Iterator<Item = Inst> + 'a {
-        let (mut at, mut cfg) = (self.block, None);
-        let above = std::iter::from_fn(move || {
-            let block = at?;
-            let idom = &cfg.get_or_insert_with(|| func.cfg()).idom;
-            at = idom.get(block.index()).copied().flatten().filter(|parent| *parent != block);
-            at
-        });
-        self.prefix.iter().rev().chain(above.flat_map(move |block| func.blocks[block.index()].insts.iter().rev())).copied().take(DEREF_SCAN)
-    }
-}
-
 /// Whether `v` is a non-null address where `at` reads it: by its definition, or because a load or store that ran before touched a byte range that holds or ends at `v`.
 pub(crate) fn non_null_at(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, known: &dyn Fn(Value) -> Option<i64>, at: Before, v: Value) -> bool {
     if crate::algebra::is_non_null_addr(func, def_of, known, v, 0) {
@@ -218,16 +205,42 @@ pub(crate) fn non_null_at(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst
         Some(&Op::Binary(Binary::Isub, a, b)) => known(b).map_or((v, 0), |c| (a, c.wrapping_neg())),
         _ => (v, 0),
     };
-    at.insts(func).any(|inst| {
-        let data = &func.insts[inst.index()];
-        let (addr, off, bytes) = match data.op {
-            Op::Load(addr, off) => (addr, off, data.result.map_or(0, |result| func.ty(result).bytes())),
-            Op::Store(value, addr, off) => (addr, off, func.ty(value).bytes()),
-            _ => return false,
-        };
-        let touched = i64::from(off)..=i64::from(off) + i64::from(bytes);
-        bytes != 0 && ((addr == v && touched.contains(&0)) || (addr == base && touched.contains(&disp)))
-    })
+    let stop = def_of(base);
+    let mut left = DEREF_SCAN;
+    let check_slice = |insts: &[Inst], left: &mut usize| -> Option<bool> {
+        for &inst in insts.iter().rev() {
+            if *left == 0 {
+                return Some(false);
+            }
+            *left -= 1;
+            if stop == Some(inst) {
+                return Some(false);
+            }
+            let data = &func.insts[inst.index()];
+            let (addr, off, bytes) = match data.op {
+                Op::Load(addr, off) => (addr, off, data.result.map_or(0, |result| func.ty(result).bytes())),
+                Op::Store(value, addr, off) => (addr, off, func.ty(value).bytes()),
+                _ => continue,
+            };
+            let touched = i64::from(off)..=i64::from(off) + i64::from(bytes);
+            if bytes != 0 && ((addr == v && touched.contains(&0)) || (addr == base && touched.contains(&disp))) {
+                return Some(true);
+            }
+        }
+        None
+    };
+    if let Some(hit) = check_slice(at.prefix, &mut left) {
+        return hit;
+    }
+    let Some(mut cur) = at.block else { return false };
+    let cfg = func.cfg();
+    while let Some(parent) = cfg.idom.get(cur.index()).copied().flatten().filter(|p| *p != cur) {
+        if let Some(hit) = check_slice(&func.blocks[parent.index()].insts, &mut left) {
+            return hit;
+        }
+        cur = parent;
+    }
+    false
 }
 
 pub(super) struct Fold {
@@ -394,13 +407,14 @@ impl Fold {
 
     /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, branches on the condition of a select between zero and a non-zero value, jumps straight to one of two returns that agree on the edge's equality, drops traps that cannot fire, rewrites always-firing traps to `Op::Trap`, and truncates after `Op::Trap`.
     fn branches(&self, func: &mut Function) -> bool {
-        func.bump_cfg();
         let mut changed = false;
+        let mut cfg_dirty = false;
         for block in 0..func.blocks.len() {
             let mut trapped = false;
+            let mut dropped_after_trap = false;
             let mut keep = std::mem::take(&mut func.blocks[block].insts);
             keep.retain(|&inst| {
-                if trapped { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
+                if trapped { func.insts[inst.index()].op = Op::Trap; changed = true; dropped_after_trap = true; return false; }
                 match func.insts[inst.index()].op {
                     Op::Trapz(x) => {
                         if let Some(k) = self.known(x) {
@@ -415,6 +429,13 @@ impl Fold {
                 }
             });
             func.blocks[block].insts = keep;
+            if dropped_after_trap {
+                cfg_dirty = true;
+            }
+            if cfg_dirty && func.blocks[block].insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Brif(..))) {
+                func.bump_cfg();
+                cfg_dirty = false;
+            }
             let Some((&last, prefix)) = func.blocks[block].insts.split_last() else { continue };
             let at = Before { prefix, block: Some(Block(block as u32)) };
             let through = match func.insts[last.index()].op {
@@ -435,7 +456,13 @@ impl Fold {
                 if swap { std::mem::swap(then, otherwise); std::mem::swap(then_args, else_args); }
                 changed = true;
             }
-            changed |= self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op) || self.exits(func, last);
+            if self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op) || self.exits(func, last) {
+                changed = true;
+                cfg_dirty = true;
+            }
+        }
+        if cfg_dirty {
+            func.bump_cfg();
         }
         changed
     }
