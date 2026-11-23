@@ -199,6 +199,7 @@ fn icmp_select_root(
 
 fn find_select_consumers(
     func: &Function,
+    plan: &Plan<Reg>,
     (b_idx, start_pos): (usize, usize),
     flag_val: Value,
     total_uses: u32,
@@ -226,7 +227,11 @@ fn find_select_consumers(
     let b_pos = brif?;
     insts[last_sel + 1..b_pos]
         .iter()
-        .all(|&ni| preserves_flags(&func.insts[ni.index()].op))
+        .all(|&ni| {
+            let nd = &func.insts[ni.index()];
+            (!matches!(nd.op, Op::Call { .. }) && nd.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]))
+                || preserves_flags(func, plan, &nd.op, nd.result, false)
+        })
         .then_some((1, last_sel, true))
 }
 
@@ -351,7 +356,7 @@ fn try_fuse_icmp_select_with(
     let Op::Icmp(cc, _, _) = func.insts[func.blocks[b_idx].insts[pos].index()].op else {
         return;
     };
-    let Some((cmp_count, last_sel, has_brif)) = find_select_consumers(func, (b_idx, search_pos), flag_val, flag_uses) else {
+    let Some((cmp_count, last_sel, has_brif)) = find_select_consumers(func, plan, (b_idx, search_pos), flag_val, flag_uses) else {
         return;
     };
     if allow_defer && should_defer_icmp_select(func, plan, info, (b_idx, pos, last_sel, skip_pos), (cc, a, b)) {
@@ -399,13 +404,13 @@ pub(super) fn fuse_icmp_selects(func: &Function, plan: &mut Plan<Reg>, info: (&[
 fn fits_consumer(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Value) -> bool {
     for &ni in tail {
         let nd = &func.insts[ni.index()];
-        if !matches!(nd.op, Op::Call { .. }) && nd.result.is_some_and(|r| plan.elided[r.index()]) {
+        if !matches!(nd.op, Op::Call { .. }) && nd.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
             continue;
         }
         if consumes_flag_only(&nd.op, res) {
             return true;
         }
-        if !preserves_flags(&nd.op) {
+        if !preserves_flags(func, plan, &nd.op, nd.result, false) {
             return false;
         }
     }
@@ -440,20 +445,45 @@ pub(super) fn consumes_flag_only(op: &Op, res: Value) -> bool {
     }
 }
 
-pub(super) fn preserves_flags(op: &Op) -> bool {
-    matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..))
+/// Whether emitting `op` leaves ARM64 NZCV flags untouched.
+pub(in super::super) fn preserves_flags(func: &Function, plan: &Plan<Reg>, op: &Op, result: Option<Value>, allow_i8_bitwise: bool) -> bool {
+    matches!(
+        *op,
+        Op::Load(..) | Op::Store(..) | Op::StackAddr(..) | Op::StackLoad(..) | Op::StackStore(..)
+            | Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::FramePointer
+    ) || match *op {
+        Op::Binary(b, x, y) => !matches!(func.ty(x), Type::I128) && !func.ty(x).is_vector() && match b {
+            Binary::Iadd | Binary::Isub | Binary::Imul | Binary::Bxor | Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr => true,
+            Binary::Band | Binary::Bor => {
+                (allow_i8_bitwise || func.ty(x) != Type::I8)
+                    && !plan.elided[x.index()]
+                    && !plan.elided[y.index()]
+                    && result.is_none_or(|r| !plan.fused[r.index()])
+            }
+            _ => false,
+        },
+        Op::Unary(u, x) => !matches!(func.ty(x), Type::I128) && !func.ty(x).is_vector()
+            && matches!(u, Unary::Ineg | Unary::Bnot | Unary::Clz | Unary::Ctz | Unary::Popcnt | Unary::Bswap),
+        Op::Convert(c, x) => !matches!(func.ty(x), Type::I128) && !func.ty(x).is_vector()
+            && result.is_some_and(|r| !func.ty(r).is_vector() && !func.ty(r).is_float())
+            && matches!(c, Convert::Uextend | Convert::Sextend | Convert::Ireduce | Convert::Bitcast),
+        _ => false,
+    }
 }
 
-fn flag_consumer(func: &Function, tail: &[Inst], res: Value, allow_clobber_branch: bool) -> Option<(usize, bool, bool)> {
+fn flag_consumer(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Value, allow_clobber_branch: bool) -> Option<(usize, bool, bool)> {
     let mut flags_ok = true;
     let capped = func.size() > 2000;
     for (off, &ni) in tail.iter().enumerate() {
-        let op = &func.insts[ni.index()].op;
-        if consumes_flag_only(op, res) {
-            let is_branch = !matches!(op, Op::Select(..));
+        let nd = &func.insts[ni.index()];
+        if !matches!(nd.op, Op::Call { .. }) && nd.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
+            continue;
+        }
+        if consumes_flag_only(&nd.op, res) {
+            let is_branch = !matches!(nd.op, Op::Select(..));
             return (flags_ok || (allow_clobber_branch && is_branch)).then_some((off, is_branch, flags_ok));
         }
-        if !preserves_flags(op) {
+        if !preserves_flags(func, plan, &nd.op, nd.result, false) {
             if !allow_clobber_branch {
                 return None;
             }
@@ -466,8 +496,29 @@ fn flag_consumer(func: &Function, tail: &[Inst], res: Value, allow_clobber_branc
     None
 }
 
-pub(super) fn icmp_consumer(func: &Function, tail: &[Inst], res: Value) -> bool {
-    flag_consumer(func, tail, res, false).is_some()
+fn multi_flag_consumers(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Value, total_uses: u32) -> bool {
+    let mut found = 0_u32;
+    for &ni in tail {
+        let nd = &func.insts[ni.index()];
+        if !matches!(nd.op, Op::Call { .. }) && nd.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
+            continue;
+        }
+        if consumes_flag_only(&nd.op, res) {
+            found += 1;
+            if found == total_uses {
+                return true;
+            }
+            continue;
+        }
+        if !preserves_flags(func, plan, &nd.op, nd.result, false) {
+            return false;
+        }
+    }
+    false
+}
+
+pub(super) fn icmp_consumer(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Value) -> bool {
+    flag_consumer(func, plan, tail, res, false).is_some()
 }
 
 pub(in super::super) fn zero_cmp_operand(plan: &Plan<Reg>, ty: Type, a: Value, b: Value) -> Option<Value> {
@@ -509,7 +560,17 @@ pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32
             let Some(res) = data.result else { continue };
             pos_of[res.index()] = Some((b_idx, pos, inst));
             let Op::Icmp(cc, a, b) = data.op else { continue };
-            if uses[res.index()] != 1 || plan.elided[res.index()] || plan.is_static(res) || func.ty(a).is_vector() {
+            if plan.elided[res.index()] || plan.is_static(res) || func.ty(a).is_vector() {
+                continue;
+            }
+            let use_count = uses[res.index()];
+            if use_count > 1 {
+                if !plan.fused[res.index()] && multi_flag_consumers(func, plan, &block.insts[pos + 1..], res, use_count) {
+                    plan.fused[res.index()] = true;
+                }
+                continue;
+            }
+            if use_count != 1 {
                 continue;
             }
             let was_fused = plan.fused[res.index()];
@@ -519,7 +580,7 @@ pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32
             if was_fused && zero_val.is_none() {
                 continue;
             }
-            let Some((off, is_branch, flags_ok)) = flag_consumer(func, &block.insts[pos + 1..], res, zero_val.is_some()) else {
+            let Some((off, is_branch, flags_ok)) = flag_consumer(func, plan, &block.insts[pos + 1..], res, zero_val.is_some()) else {
                 continue;
             };
             if is_branch

@@ -13,7 +13,7 @@ use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 pub(super) use bfi::bfi_parts;
 pub(super) use bits::{Bfx, bfx_parts, conv_bfx_parts, extr_parts, single_bit_mask, unwrap_elided_tst};
 use flag::{fuse_fits, fuse_icmp_flags, fuse_icmp_selects, try_fuse_flag_operand, try_fuse_icmp_select};
-pub(super) use flag::zero_cmp_operand;
+pub(super) use flag::{preserves_flags, zero_cmp_operand};
 pub(super) use mem::{encode_neon_movi, madd_parts, store_source};
 use mem::try_fuse_vec_op;
 pub(super) use sign::sign_bit_test;

@@ -111,15 +111,18 @@ fn local_child(
         .flatten()
 }
 
-fn branch_or_trap_only(func: &Function, tail: &[Inst], res: Value) -> bool {
+fn branch_or_trap_only(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Value) -> bool {
     for &ni in tail {
-        let op = &func.insts[ni.index()].op;
-        if matches!(op, Op::Brif(c, _, ta, _, ea) if *c == res && !ta.contains(&res) && !ea.contains(&res))
-            || matches!(op, Op::Trapz(c) if *c == res)
+        let nd = &func.insts[ni.index()];
+        if !matches!(nd.op, Op::Call { .. }) && nd.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
+            continue;
+        }
+        if matches!(&nd.op, Op::Brif(c, _, ta, _, ea) if *c == res && !ta.contains(&res) && !ea.contains(&res))
+            || matches!(&nd.op, Op::Trapz(c) if *c == res)
         {
             return true;
         }
-        if !preserves_flags(op) {
+        if !preserves_flags(func, plan, &nd.op, nd.result, false) {
             return false;
         }
     }
@@ -138,7 +141,7 @@ fn try_fuse_root(
     }
     let tail = &func.blocks[b_idx].insts[pos + 1..];
     let already_elided = plan.elided[res.index()];
-    if already_elided && (op != Binary::Band || uses[res.index()] != 1 || !branch_or_trap_only(func, tail, res)) {
+    if already_elided && (op != Binary::Band || uses[res.index()] != 1 || !branch_or_trap_only(func, plan, tail, res)) {
         return;
     }
     let view: &Plan<Reg> = plan;
@@ -151,7 +154,7 @@ fn try_fuse_root(
         return;
     }
     let Some(band) = head_band(func, plan, info, (b_idx, pos), &chain, head) else { return };
-    let fuse_flags = already_elided || (uses[res.index()] == 1 && icmp_consumer(func, tail, res));
+    let fuse_flags = already_elided || (uses[res.index()] == 1 && icmp_consumer(func, plan, tail, res));
     for v in chain {
         plan.elided[v.index()] = true;
     }
