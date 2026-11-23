@@ -177,6 +177,34 @@ pub(crate) fn cold_and_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::L
     (cold, deferred)
 }
 
+/// Fast reverse-postorder block layout for `Effort::Quick`, skipping CFG dominators, loops, and cold-block partitioning.
+pub(crate) fn quick_order(func: &Function) -> Vec<Block> {
+    let Some(entry) = func.entry else { return Vec::new() };
+    let n = func.blocks.len();
+    let mut visited = vec![false; n];
+    let mut post = Vec::with_capacity(n);
+    let mut stack = vec![(entry, false)];
+    while let Some((block, done)) = stack.pop() {
+        if done {
+            post.push(block);
+            continue;
+        }
+        if std::mem::replace(&mut visited[block.index()], true) {
+            continue;
+        }
+        stack.push((block, true));
+        for succ in func.successors(block) {
+            if !visited[succ.index()] {
+                stack.push((succ, false));
+            }
+        }
+    }
+    post.reverse();
+    post.retain(|block| *block == entry || !func.blocks[block.index()].insts.is_empty());
+    post.extend((0..n as u32).map(Block).filter(|b| !visited[b.index()] && !func.blocks[b.index()].insts.is_empty()));
+    post
+}
+
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
     let cfg = func.cfg();

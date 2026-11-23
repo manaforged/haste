@@ -1,7 +1,7 @@
 use super::Emit;
 use crate::frame::Ext;
 use super::asm::{Alu, Cond, Count, Group3, Reg, Rm, Shift, Size};
-use crate::ir::{Binary, Function, IntCC, Op, TargetOpId, Type, Unary, Value};
+use crate::ir::{Binary, Function, Inst, IntCC, Op, TargetOpId, Type, Unary, Value};
 use crate::wide::half_score;
 
 /// The registers 128-bit rotates use as scratch besides rax, rcx and rdx.
@@ -33,14 +33,13 @@ fn carry_op(op: &Op) -> Option<(TargetOpId, &[Value])> {
 }
 
 /// Marks each carry out whose every use is the carry operand of the next carry pair in its block, with only register loads and stores between, so the carry flag hands it over and no register needs it.
-pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>) -> Vec<bool> {
+pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>, defs: &[Option<Inst>]) -> Vec<bool> {
     let mut uses = vec![0_u32; func.types.len()];
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         func.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
     }
     let held = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_));
     let moved = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_) | crate::alloc::Location::Slot);
-    let defs = crate::fold::defs(func);
     let in_memory = |value: Value| {
         plan.elided[value.index()]
             && defs[value.index()].is_some_and(|inst| match func.insts[inst.index()].op {

@@ -574,8 +574,8 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
     split: &[(Value, u64)],
 ) -> Result<Prepared<R>, String> {
-    let order = crate::live::order(func);
-    let copied = crate::live::copied_tests(func, &order);
+    let order = if weighed { crate::live::order(func) } else { crate::live::quick_order(func) };
+    let copied = if weighed { crate::live::copied_tests(func, &order) } else { vec![false; func.insts.len()] };
     let abi = classify(&func.signature)?;
     let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed, preserve_tc), (&abi.params, split), &classify);
     let saves = saved(func, &plan.used, regs.saved);

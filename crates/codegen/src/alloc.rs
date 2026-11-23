@@ -582,8 +582,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     statics(func, &mut locations);
     let census = census(func);
     let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
-    let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
-    let atomic_base = if regs.two_address { atomic_addrs(func, &locations, &census, &sib, &mut elided) } else { vec![None; count] };
+    let (sib, mut elided) = if weighed && regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
+    let atomic_base = if weighed && regs.two_address { atomic_addrs(func, &locations, &census, &sib, &mut elided) } else { vec![None; count] };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.constant_calls) } else { vec![None; count] };
     const_pairs(func, &census, &mut elided);
     let eff = Elided { sib: &sib, atomic_base: &atomic_base, elided: &elided };
@@ -591,7 +591,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
     let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
     let promoted_consts = loops.as_deref().map(|loops| consts::promote_loop_consts(func, &census, loops, &elided, regs.two_address, &mut locations)).unwrap_or_default();
-    let promoted_syms = regs.absolute_calls.then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
+    let promoted_syms = (weighed && regs.absolute_calls).then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
     let preserved_tc: Vec<bool> = if preserve_tc {
@@ -610,16 +610,16 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches, regs.two_address)).collect();
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
-    let reuse = hints::reusable(func, regs, &locations, &live, &elided);
+    let reuse = if weighed { hints::reusable(func, regs, &locations, &live, &elided) } else { vec![None; count] };
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| {
         let (cold, slow) = slow_blocks(func, cfg, loops);
         block_weights(&loops.depths, (&cold, &slow))
     });
     let natural = blocks.as_deref().map(|blocks| walk::weights(func, blocks, eff));
     let weights = natural.clone().map(|natural| walk::inherit(natural, &live, split));
-    let (partners, back_args, edge_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref());
+    let (partners, back_args, edge_args) = if weighed { walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref()) } else { (None, Vec::new(), Vec::new()) };
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
-    let copies = if regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
+    let copies = if weighed && regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
     let hints = Hints { reuse: &reuse, weights: weights.as_deref(), partners: partners.as_deref(), back_args: &back_args, edge_args: &edge_args, park: park.as_deref(), two_address: regs.two_address, copies: &copies };
     let (passed_ints, passed_floats) = hints::passed(func, classify, regs.high_product);
     let (homes, used) = allocate(func, &live, &int_class(func, regs, (order, copied, &elided), params, passed_ints, &live.preserved_calls), &ints, &hints);
@@ -655,7 +655,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         }
     }
     let spill_cost = natural.map_or(0, |natural| (0..count).filter(|&v| (ints[v] || floats[v]) && matches!(locations[v], Location::Slot)).map(|v| natural[v]).sum());
-    let hoist = hoist::Hoist::new(func, &live, &locations);
+    let hoist = if weighed { hoist::Hoist::new(func, &live, &locations) } else { hoist::Hoist::empty() };
     Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density, spill_cost, hoist }
 }
 

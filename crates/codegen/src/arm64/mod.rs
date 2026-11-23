@@ -88,20 +88,23 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let lse = target.os == Os::Darwin;
     let regs = if lse { &REGS_LSE } else { &REGS };
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
+    let full = target.effort == crate::Effort::Full;
     let tlv_cells = target.direct_calls && target.os == Os::Darwin;
-    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (target.effort == crate::Effort::Full, tlv_cells), |sig| classify(sig, packing))?;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (full, tlv_cells), |sig| classify(sig, packing))?;
     let func = split.as_ref().unwrap_or(func);
     let defs = crate::fold::defs(func);
-    let dropped = |plan: &crate::alloc::Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
-    let dropped_before = dropped(&plan);
-    fuse::fuse(func, &mut plan, lse);
-    if dropped(&plan) != dropped_before {
-        crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, packing))?;
+    if full {
+        let dropped = |plan: &crate::alloc::Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
+        let dropped_before = dropped(&plan);
+        fuse::fuse(func, &mut plan, lse);
+        if dropped(&plan) != dropped_before {
+            crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, packing))?;
+        }
     }
     let lr = plan.locations.iter().any(|loc| matches!(loc, Location::Reg(LR)));
     let bracket = !lr && crate::frame::brackets_calls(func, &frame, &abi);
     framed = (framed || lr) && !bracket;
-    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP], |_| false);
+    let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP], |_| false)).flatten();
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let emit = Emit {
@@ -122,7 +125,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
         carry: (None, None),
-        sole_pred: crate::spills::sole_preds(func, &copied),
+        sole_pred: if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() },
         next: None,
         copied,
         direct_calls: target.direct_calls,

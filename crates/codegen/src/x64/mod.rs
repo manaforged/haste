@@ -80,26 +80,35 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         (_, true) => &REGS,
         (_, false) => &REGS_RBP,
     };
+    let full = target.effort == crate::Effort::Full;
     let frame_cache = target.direct_calls && target.os == crate::target::Os::Linux;
     let preserve_tc = frame_cache && abi_kind == CallAbi::SysV;
-    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (target.effort == crate::Effort::Full, preserve_tc), |sig| classify(sig, abi_kind))?;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (full, preserve_tc), |sig| classify(sig, abi_kind))?;
     let func = split.as_ref().unwrap_or(func);
     let features = Features::host();
-    let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
-    let dropped_before = dropped(&plan);
-    let (roots, pure_test) = location::fuse(func, &mut plan, &features);
-    if dropped(&plan) != dropped_before {
-        crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
-    }
-    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |op| preserve_tc && crate::alloc::is_preserved_call_op(func, op, &plan.through, &plan.locations, &plan.elided));
+    let (roots, pure_test) = if full {
+        let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
+        let dropped_before = dropped(&plan);
+        let fused = location::fuse(func, &mut plan, &features);
+        if dropped(&plan) != dropped_before {
+            crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
+        }
+        fused
+    } else {
+        (vec![None; func.types.len()], vec![false; func.types.len()])
+    };
+    let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |op| preserve_tc && crate::alloc::is_preserved_call_op(func, op, &plan.through, &plan.locations, &plan.elided))).flatten();
     let (base, bias) = if framed && !keeps { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let defs = crate::fold::defs(func);
-    let overflow_read = wide::overflow_reads(func);
-    let adc_sum = wide::adc_sums(func, &plan, &defs);
-    let flag_carry = wide::flag_carries(func, &plan);
+    let (overflow_read, adc_sum, flag_carry) = if full {
+        (wide::overflow_reads(func), wide::adc_sums(func, &plan, &defs), wide::flag_carries(func, &plan, &defs))
+    } else {
+        let n = func.types.len();
+        (vec![false; n], vec![false; n], vec![false; n])
+    };
     let last_block = order.last().copied();
     let emit = Emit {
         func,
@@ -121,7 +130,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
         carry: (None, None),
-        sole_pred: crate::spills::sole_preds(func, &copied),
+        sole_pred: if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() },
         next: None,
         last_block,
         at_end: false,
@@ -256,36 +265,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         }
     }
 
-    fn intake(&mut self, entry: Block) -> Result<(), String> {
-        intake_params(self, entry)
-    }
-
+    fn intake(&mut self, entry: Block) -> Result<(), String> { intake_params(self, entry) }
     fn set_next(&mut self, next: Option<Block>) { self.next = next; }
-
-    fn bind_block(&mut self, block: Block) {
-        self.invalidate_spills();
-        self.resume_spills(block);
-        self.at_end = self.last_block == Some(block);
-        self.asm.flags_overwritten();
-        self.asm.bind(self.blocks[block.index()]);
-    }
-
-    fn bind_entry(&mut self, block: Block) {
-        self.carry = (Some(block), None);
-        self.at_end = self.last_block == Some(block);
-        self.asm.bind(self.blocks[block.index()]);
-    }
-
+    fn bind_block(&mut self, block: Block) { self.invalidate_spills(); self.resume_spills(block); self.at_end = self.last_block == Some(block); self.asm.flags_overwritten(); self.asm.bind(self.blocks[block.index()]); }
+    fn bind_entry(&mut self, block: Block) { self.carry = (Some(block), None); self.at_end = self.last_block == Some(block); self.asm.bind(self.blocks[block.index()]); }
     fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
-
-    fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
-        self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]);
-        Ok(())
-    }
-
-    fn clear_flags(&mut self) {
-        self.flags = None;
-    }
+    fn on_block_bound(&mut self, block: Block) -> Result<(), String> { self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]); Ok(()) }
+    fn clear_flags(&mut self) { self.flags = None; }
 
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;

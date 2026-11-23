@@ -15,6 +15,11 @@ pub(crate) struct Hoist<R> {
 }
 
 impl<R: Copy + PartialEq> Hoist<R> {
+    /// An empty hoist table that declines all pre-branch edge-move hoisting.
+    pub(super) fn empty() -> Self {
+        Self { live_in: Vec::new(), reads: HashMap::default() }
+    }
+
     /// Collects, for each block, the register of every value live on entry (every register of a value with no live range counts everywhere), and for each branch condition the locations of the values its computation reads within its block.
     pub(super) fn new(func: &Function, live: &Live, locations: &[Location<R>]) -> Self {
         let mut starts: Vec<(u32, usize)> = live.spans.iter().enumerate().map(|(block, span)| (span.0, block)).collect();
