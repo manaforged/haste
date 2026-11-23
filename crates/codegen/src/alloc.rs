@@ -197,9 +197,48 @@ fn statics<R: Copy>(func: &Function, locations: &mut [Location<R>]) {
     }
 }
 
-fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, zero_ext: &[bool], two_address: bool) -> (Vec<Option<Sib>>, Vec<bool>) {
+#[derive(Clone, Copy)]
+struct MemUses {
+    count: u32,
+    min_off: i32,
+    max_off: i32,
+    size_mask: u8,
+    cross_block: bool,
+    max_depth: u32,
+}
+
+fn mem_uses(func: &Function, census: &Uses, loop_depths: Option<&[u32]>) -> Vec<MemUses> {
+    let mut out = vec![MemUses { count: 0, min_off: i32::MAX, max_off: i32::MIN, size_mask: 0, cross_block: false, max_depth: 0 }; func.types.len()];
+    for (b, data) in func.blocks.iter().enumerate() {
+        let depth = loop_depths.map_or(0, |d| d[b]);
+        for &inst in &data.insts {
+            let (addr, off, bytes) = match (&func.insts[inst.index()].op, func.insts[inst.index()].result) {
+                (&Op::Load(a, off), Some(r)) => (a, off, func.ty(r).bytes()),
+                (&Op::Store(val, a, off), _) if val != a => (a, off, func.ty(val).bytes()),
+                _ => continue,
+            };
+            let info = &mut out[addr.index()];
+            info.count += 1;
+            info.min_off = info.min_off.min(off);
+            info.max_off = info.max_off.max(off);
+            info.size_mask |= match bytes {
+                1 => 1,
+                2 => 2,
+                4 => 4,
+                8 => 8,
+                _ => 16,
+            };
+            info.cross_block |= census.def[addr.index()].is_some_and(|(db, _)| db != b);
+            info.max_depth = info.max_depth.max(depth);
+        }
+    }
+    out
+}
+
+fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, zero_ext: &[bool], loop_depths: Option<&[u32]>, two_address: bool) -> (Vec<Option<Sib>>, Vec<bool>) {
     let count = func.types.len();
     let (mut sib, mut elided) = (vec![None; count], vec![false; count]);
+    let uses_of = mem_uses(func, census, loop_depths);
     let slot_i64 = |v: Value| func.ty(v) == Type::I64 && matches!(locations[v.index()], Location::Slot);
     let single_i64 = |v: Value, block: usize| slot_i64(v) && census.uses[v.index()] == 1 && census.def[v.index()].is_some_and(|(b, _)| b == block);
     let unwrap_idx = |v: Value, block: usize| -> Option<(Value, Option<Value>)> {
@@ -232,17 +271,17 @@ fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, zero_
         }
     };
     for (block, data) in func.blocks.iter().enumerate() {
+        let def_depth = loop_depths.map_or(0, |d| d[block]);
         for &inst in &data.insts {
-            let addr = match func.insts[inst.index()].op {
-                Op::Load(addr, _) => addr,
-                Op::Store(val, addr, _) if val != addr => addr,
-                _ => continue,
-            };
-            if sib[addr.index()].is_some() || !slot_i64(addr) || census.uses[addr.index()] == 0 || !census.def[addr.index()].is_some_and(|(b, _)| b == block) {
+            let Some(addr) = func.insts[inst.index()].result else { continue };
+            let info = uses_of[addr.index()];
+            if info.count == 0 || info.count != census.uses[addr.index()] || !slot_i64(addr) {
                 continue;
             }
-            let Some(def_inst) = census.def_inst[addr.index()] else { continue };
-            let Op::Binary(Binary::Iadd, mut left, mut right) = func.insts[def_inst.index()].op else { continue };
+            if info.cross_block && info.max_depth > def_depth {
+                continue;
+            }
+            let Op::Binary(Binary::Iadd, mut left, mut right) = func.insts[inst.index()].op else { continue };
             let (mut outer_disp, mut peeled_add) = (0_i64, None);
             for (inner, imm_v) in [(left, right), (right, left)] {
                 if let Location::Imm(imm) = locations[imm_v.index()]
@@ -264,21 +303,20 @@ fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, zero_
             if !(-FOLD_LIMIT..=FOLD_LIMIT).contains(&total) {
                 continue;
             }
-            let (disp, multi, mut uses) = (total as i32, census.uses[addr.index()] > 1, 0_u32);
-            let ok = data.insts.iter().all(|&u| {
-                let (off, bytes) = match (&func.insts[u.index()].op, func.insts[u.index()].result) {
-                    (&Op::Load(a, off), Some(r)) if a == addr => (off, func.ty(r).bytes()),
-                    (&Op::Store(val, a, off), _) if a == addr && val != addr => (off, func.ty(val).bytes()),
-                    _ => return true,
-                };
-                uses += 1;
-                let fits = match base {
-                    SibBase::Frame(_) => (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(total + i64::from(off))),
-                    SibBase::Value(_) => disp.checked_add(off).and_then(|d| d.checked_add(16)).is_some(),
-                };
-                fits && (two_address || !multi || (total + i64::from(off) == 0 && bytes <= 8 && (shift == 0 || bytes == (1 << shift)) && !matches!(base, SibBase::Frame(_))))
-            });
-            if !ok || uses != census.uses[addr.index()] {
+            let disp = total as i32;
+            let fits_off = |off: i32| match base {
+                SibBase::Frame(_) => (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(total + i64::from(off))),
+                SibBase::Value(_) => disp.checked_add(off).and_then(|d| d.checked_add(16)).is_some(),
+            };
+            if !fits_off(info.min_off) || !fits_off(info.max_off) {
+                continue;
+            }
+            let hw_indexed = total + i64::from(info.min_off) == 0
+                && total + i64::from(info.max_off) == 0
+                && (info.size_mask & 16) == 0
+                && (shift == 0 || info.size_mask == (1 << shift))
+                && !matches!(base, SibBase::Frame(_));
+            if !two_address && (info.count > 1 || info.cross_block) && !hw_indexed {
                 continue;
             }
             sib[addr.index()] = Some(Sib { base, index, shift, disp });
@@ -582,14 +620,14 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     statics(func, &mut locations);
     let census = census(func);
     let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
-    let (sib, mut elided) = if weighed && regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
+    let cfg = weighed.then(|| func.cfg());
+    let loops = cfg.as_ref().map(|cfg| cfg.loops());
+    let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
+    let (sib, mut elided) = if weighed && regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, loop_depths, regs.two_address) } else { (vec![None; count], vec![false; count]) };
     let atomic_base = if weighed && regs.two_address { atomic_addrs(func, &locations, &census, &sib, &mut elided) } else { vec![None; count] };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.constant_calls) } else { vec![None; count] };
     const_pairs(func, &census, &mut elided);
     let eff = Elided { sib: &sib, atomic_base: &atomic_base, elided: &elided };
-    let cfg = weighed.then(|| func.cfg());
-    let loops = cfg.as_ref().map(|cfg| cfg.loops());
-    let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
     let promoted_consts = loops.as_deref().map(|loops| consts::promote_loop_consts(func, &census, loops, &elided, regs.two_address, &mut locations)).unwrap_or_default();
     let promoted_syms = (weighed && regs.absolute_calls).then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
