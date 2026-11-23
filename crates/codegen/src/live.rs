@@ -50,6 +50,35 @@ fn has_caller_loc_call(func: &Function, zeros: &[bool], block: Block) -> bool {
             .any(|&inst| func.caller_loc_result(&func.insts[inst.index()].op, |v| zeros[v.index()]).is_some())
 }
 
+fn has_atomic_rmw(func: &Function, block: Block) -> bool {
+    func.blocks[block.index()].insts.iter().any(|&inst| matches!(func.insts[inst.index()].op, Op::AtomicCas(..) | Op::AtomicRmw(..)))
+}
+
+fn arm_has_atomic_call_detour(func: &Function, cfg: &Cfg, arm: Block, stop: Block) -> bool {
+    if !has_atomic_rmw(func, arm) {
+        return false;
+    }
+    let mut visited = [arm; 16];
+    let mut len = 1;
+    let mut stack = vec![arm];
+    while let Some(cur) = stack.pop() {
+        for s in func.successors(cur) {
+            if s == stop || !cfg.dominates(arm, s) {
+                continue;
+            }
+            if has_regular_call(func, s) {
+                return true;
+            }
+            if len < visited.len() && !visited[..len].contains(&s) {
+                visited[len] = s;
+                len += 1;
+                stack.push(s);
+            }
+        }
+    }
+    false
+}
+
 fn arm_inevitably_calls(func: &Function, cfg: &Cfg, cold: &[bool], (root, cur, stop, depth): (Block, Block, Option<Block>, u8)) -> bool {
     if has_regular_call(func, cur) {
         return true;
@@ -99,7 +128,8 @@ fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[b
             } else {
                 None
             };
-            let arm_calls = arm_inevitably_calls(func, cfg, cold, (arm, arm, stop, 0));
+            let arm_calls = arm_inevitably_calls(func, cfg, cold, (arm, arm, stop, 0))
+                || (direct_rejoin && arm_has_atomic_call_detour(func, cfg, arm, other));
             let colder = (arm_calls && (direct_rejoin || !has_regular_call(func, other)))
                 || (has_caller_loc_call(func, &zeros, arm) && (direct_rejoin || !has_caller_loc_call(func, &zeros, other)));
             if Some(arm) == func.entry

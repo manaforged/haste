@@ -679,14 +679,11 @@ fn slot_unescaped_at(loc: MemLoc, at: Option<Inst>, prov: &Provenance) -> bool {
 
 fn noalias_immune_to_atomic(op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
     let MemRoot::NoAliasParam(p) = loc.root else { return false };
-    if !prov.noalias_unescaped(p) {
-        return false;
-    }
     match *op {
-        Op::AtomicStore(_, addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
-            prov.loc(addr, 0, 1).root != MemRoot::NoAliasParam(p)
-        }
         Op::AtomicLoad(..) | Op::Fence(_) => true,
+        Op::AtomicStore(_, addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
+            prov.noalias_unescaped(p) && prov.loc(addr, 0, 1).root != MemRoot::NoAliasParam(p)
+        }
         _ => false,
     }
 }

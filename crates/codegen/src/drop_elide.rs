@@ -382,6 +382,24 @@ fn narrow_unwind_drops(
     let mut remove = vec![false; func.insts.len()];
     let mut before_call: Vec<(Inst, Vec<(StackSlot, Value, i32)>, Option<StackSlot>)> = Vec::new();
     let mut block_head_sets: Vec<(Block, Vec<(StackSlot, Value, i32)>, Option<StackSlot>)> = Vec::new();
+    let try_local_sinks = |u: &crate::UnwindDrop,
+                           flag_visited: &[u8],
+                           remove: &mut [bool],
+                           block_head_sets: &mut Vec<(Block, Vec<(StackSlot, Value, i32)>, Option<StackSlot>)>| {
+        let li = u.local.index();
+        if !u.indirect && u.local != u.flag && li < nslots && local_uses[li] == 1 && !slot_escaped[li] {
+            for &(lb, linst, val, off) in &local_stores[li] {
+                if !remove[linst.index()]
+                    && let Some(frontier) = plan_local_sink(func, &cfg, defs, depths, (flag_visited, u.local, u.flag), (lb, linst, off, func.ty(val).bytes()))
+                {
+                    remove[linst.index()] = true;
+                    for t in frontier {
+                        block_head_sets.push((t, vec![(u.local, val, off)], None));
+                    }
+                }
+            }
+        }
+    };
     for u in &func.unwind_drops {
         let fi = u.flag.index();
         if fi >= nslots || flag_uses[fi] != 1 || slot_escaped[fi] {
@@ -464,19 +482,7 @@ fn narrow_unwind_drops(
                     }
                 }
             }
-            let li = u.local.index();
-            if !u.indirect && u.local != u.flag && li < nslots && local_uses[li] == 1 && !slot_escaped[li] {
-                for &(lb, linst, val, off) in &local_stores[li] {
-                    if !remove[linst.index()]
-                        && let Some(frontier) = plan_local_sink(func, &cfg, defs, depths, (&flag_visited, u.local, u.flag), (lb, linst, off, func.ty(val).bytes()))
-                    {
-                        remove[linst.index()] = true;
-                        for t in frontier {
-                            block_head_sets.push((t, vec![(u.local, val, off)], None));
-                        }
-                    }
-                }
-            }
+            try_local_sinks(u, &flag_visited, &mut remove, &mut block_head_sets);
             continue;
         };
         let flag_needs_narrow = arm_blocks.iter().any(|ab| !live_calls.iter().any(|&(cb, _)| cb == *ab));
@@ -509,6 +515,9 @@ fn narrow_unwind_drops(
                     sink_local.push((u.local, val, off));
                 }
             }
+        }
+        if sink_local.is_empty() {
+            try_local_sinks(u, &flag_visited, &mut remove, &mut block_head_sets);
         }
         if !flag_needs_narrow && sink_local.is_empty() {
             mark_dead_zeros(&mut remove, &dead_zeros, keep_zero.as_deref(), fi);
