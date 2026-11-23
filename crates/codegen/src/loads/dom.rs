@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_load, is_atomic_barrier, is_rodata, may_alias};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_load, is_atomic_barrier, is_rodata, may_alias, may_alias_at};
 use crate::merge::find;
 
 const MAX_MERGE_WALK: usize = 32;
@@ -107,11 +107,12 @@ pub(super) fn write_preserving(
     ty: Type,
     value: Value,
     prov: &Provenance,
+    at: Option<Inst>,
 ) {
     let saved = save_immutable_entries(func, known, bases, |loc| {
-        matches!(loc.root, MemRoot::Global(_)) || wloc.root != loc.root || !may_alias(wloc, loc, prov)
+        matches!(loc.root, MemRoot::Global(_)) || wloc.root != loc.root || !may_alias_at(wloc, loc, prov, at)
     });
-    known.write(wloc, ty, value, prov);
+    known.write_at(wloc, ty, value, prov, at);
     for (loc, ety, eval) in saved {
         known.remember(loc, ety, eval);
     }

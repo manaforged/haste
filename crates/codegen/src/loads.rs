@@ -17,7 +17,7 @@ use join::{BlockClobber, JoinCtx, const_eq_for_ty, eligible_join_preds, for_edge
 use remat::{FarCseGuard, SubwordAction, SubwordSlices, drop_covered_stores, drop_stores_if, resolve_subword_plan, sink_terminator_defs};
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, TargetOpId, TinyArgs, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, compute_affine, may_alias};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, compute_affine, may_alias, may_alias_at};
 use crate::merge::{find, identity, rename};
 use crate::reloc::RuntimeSymbol;
 
@@ -413,10 +413,10 @@ fn scan(
                         changed = true;
                     } else {
                         known.remember(loc, ty, result);
-                        bufs.pending_stores.retain(|&(ploc, _)| !may_alias(loc, ploc, state.prov));
+                        bufs.pending_stores.retain(|&(ploc, _)| !may_alias_at(loc, ploc, state.prov, Some(inst)));
                         let safe_read = slot_unescaped(state.prov, loc);
                         bufs.const_stores.retain(|cs| {
-                            !may_alias(loc, cs.loc, state.prov)
+                            !may_alias_at(loc, cs.loc, state.prov, Some(inst))
                                 && (slot_unescaped(state.prov, cs.loc) || safe_read || cs.loc.base == loc.base)
                         });
                     }
@@ -441,10 +441,10 @@ fn scan(
                 }
                 clobbers_seen.push(BlockClobber::Loc(loc));
                 if state.post_inline {
-                    slices.prune_on_write(func, state.prov, loc);
+                    slices.prune_on_write(func, state.prov, loc, Some(inst));
                     slices.save_split_slices(known, state.subst, loc);
                 }
-                write_preserving(func, known, bases, loc, ty, value, state.prov);
+                write_preserving(func, known, bases, loc, ty, value, state.prov, Some(inst));
                 record_base(bases, loc);
                 let track = state.post_inline || !matches!(loc.root, MemRoot::Slot(s) if !state.prov.slot_unescaped(s));
                 if track && !state.post_inline {
@@ -467,11 +467,11 @@ fn scan(
                     clobbers_seen.push(BlockClobber::Loc(wloc));
                     record_base(bases, wloc);
                     if state.post_inline {
-                        slices.prune_on_write(func, state.prov, wloc);
+                        slices.prune_on_write(func, state.prov, wloc, Some(inst));
                         drop_covered_stores(func, &mut bufs, &mut guard, (wloc, true));
                     }
-                    bufs.pending_stores.retain(|&(ploc, _)| !may_alias(wloc, ploc, state.prov));
-                    bufs.const_stores.retain(|cs| !may_alias(wloc, cs.loc, state.prov));
+                    bufs.pending_stores.retain(|&(ploc, _)| !may_alias_at(wloc, ploc, state.prov, Some(inst)));
+                    bufs.const_stores.retain(|cs| !may_alias_at(wloc, cs.loc, state.prov, Some(inst)));
                     changed = true;
                     guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
                     continue;
@@ -483,8 +483,8 @@ fn scan(
                     for (wloc, store) in stores {
                         clobbers_seen.push(BlockClobber::Loc(wloc));
                         record_base(bases, wloc);
-                        slices.prune_on_write(func, state.prov, wloc);
-                        bufs.const_stores.retain(|cs| !may_alias(wloc, cs.loc, state.prov));
+                        slices.prune_on_write(func, state.prov, wloc, Some(inst));
+                        bufs.const_stores.retain(|cs| !may_alias_at(wloc, cs.loc, state.prov, Some(inst)));
                         bufs.pending_stores.push((wloc, bufs.kept.len()));
                         bufs.kept.push(Some(store));
                     }

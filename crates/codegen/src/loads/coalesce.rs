@@ -147,7 +147,7 @@ fn emit_wide_const_store(
         StoreBase::Slot(s) => Op::StackStore(c_val, s, lo_i32),
         StoreBase::Addr(a) => Op::Store(c_val, a, lo_i32),
     };
-    super::dom::write_preserving(func, known, bases, loc, wide_ty, c_val, state.prov);
+    super::dom::write_preserving(func, known, bases, loc, wide_ty, c_val, state.prov, Some(inst));
     bufs.const_stores.push(ConstStore { loc, imm: wide_imm, kept_idx: bufs.kept.len(), base: chosen });
     loc
 }

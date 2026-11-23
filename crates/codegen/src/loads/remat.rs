@@ -1,5 +1,5 @@
 use crate::ir::{Block, Convert, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, is_hard_barrier, may_alias};
+use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, is_hard_barrier, may_alias_at};
 use crate::merge::find;
 
 use super::coalesce::ScanBuf;
@@ -533,7 +533,7 @@ impl SubwordSlices {
         Self(Vec::new())
     }
 
-    pub(super) fn prune_on_write(&mut self, func: &Function, prov: &Provenance, wloc: MemLoc) {
+    pub(super) fn prune_on_write(&mut self, func: &Function, prov: &Provenance, wloc: MemLoc, at: Option<Inst>) {
         let Some(w_hi) = wloc.offset.checked_add(i64::from(wloc.size)) else {
             self.0.retain(|s| loc_immutable(func, s.loc));
             return;
@@ -545,7 +545,7 @@ impl SubwordSlices {
                     push_clipped_slice(&mut self.0, wloc, (wloc.offset, w_hi), (s.orig_off, s.ty, s.val), (s.loc.offset, s_hi));
                 }
             } else if (loc_immutable(func, s.loc) && (matches!(s.loc.root, MemRoot::Global(_)) || wloc.root != s.loc.root))
-                || !may_alias(wloc, s.loc, prov)
+                || !may_alias_at(wloc, s.loc, prov, at)
             {
                 self.0.push(s);
             }

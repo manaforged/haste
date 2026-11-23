@@ -544,6 +544,11 @@ impl Provenance {
 }
 
 pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
+    may_alias_at(a, b, prov, None)
+}
+
+/// Whether `a` and `b` may alias at instruction `at`, using slot escape frontiers when `at` is known.
+pub(crate) fn may_alias_at(a: MemLoc, b: MemLoc, prov: &Provenance, at: Option<Inst>) -> bool {
     if a.size == 0 || b.size == 0 {
         return false;
     }
@@ -578,7 +583,7 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
         (MemRoot::NoAliasParam(p), MemRoot::Unknown) | (MemRoot::Unknown, MemRoot::NoAliasParam(p)) => !prov.noalias_unescaped(p),
         (MemRoot::Slot(_), _) if prov.is_incoming(b.base) => false,
         (_, MemRoot::Slot(_)) if prov.is_incoming(a.base) => false,
-        (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_addr_unescaped(s) && !prov.slot_return_only(s),
+        (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_addr_unescaped(s) && !prov.slot_return_only(s) && prov.slot_escaped_at(s, at),
         _ => true,
     }
 }
@@ -632,9 +637,9 @@ pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance)
 }
 
 /// Whether a write of unknown length at `addr` may overwrite `loc`.
-fn block_clobbers(addr: Value, loc: MemLoc, prov: &Provenance) -> bool {
+fn block_clobbers(addr: Value, loc: MemLoc, prov: &Provenance, at: Option<Inst>) -> bool {
     let w = prov.loc(addr, 0, u32::MAX);
-    w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
+    w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias_at(w, loc, prov, at)
 }
 
 pub(crate) use frame::drop_unread_frame_stores;
@@ -661,12 +666,12 @@ fn noalias_immune_to_atomic(op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
 pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
     match *op {
         Op::StackStore(val, slot, off) => stack_store_clobbers(func, op, (val, slot, off), loc, prov),
-        Op::Store(val, addr, off) => may_alias(prov.loc(addr, i64::from(off), func.ty(val).bytes()), loc, prov),
-        Op::Move(dst, _, bytes) => may_alias(prov.loc(dst, 0, bytes), loc, prov),
-        Op::Copy(dst, _, _) => block_clobbers(dst, loc, prov),
+        Op::Store(val, addr, off) => may_alias_at(prov.loc(addr, i64::from(off), func.ty(val).bytes()), loc, prov, at),
+        Op::Move(dst, _, bytes) => may_alias_at(prov.loc(dst, 0, bytes), loc, prov, at),
+        Op::Copy(dst, _, _) => block_clobbers(dst, loc, prov, at),
         Op::Call { callee, .. } if func.is_fresh_alloc(callee) => false,
         Op::Call { callee, ref args, .. } if let Some(rt) = prov.frame_runtime(callee) => {
-            loc.root != MemRoot::CallerLoc && rt == RuntimeSymbol::Free && args.first().is_none_or(|&freed| block_clobbers(freed, loc, prov))
+            loc.root != MemRoot::CallerLoc && rt == RuntimeSymbol::Free && args.first().is_none_or(|&freed| block_clobbers(freed, loc, prov, at))
         }
         Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
             MemRoot::Slot(s) => {
@@ -738,8 +743,12 @@ impl KnownLoads {
     }
 
     pub(crate) fn write(&mut self, loc: MemLoc, ty: Type, value: Value, prov: &Provenance) {
+        self.write_at(loc, ty, value, prov, None);
+    }
+
+    pub(crate) fn write_at(&mut self, loc: MemLoc, ty: Type, value: Value, prov: &Provenance, at: Option<Inst>) {
         self.by_base.retain(|&base, (root, entries)| {
-            entries.retain(|&(off, t, _)| !may_alias(loc, MemLoc::new(*root, base, off, t.bytes()), prov));
+            entries.retain(|&(off, t, _)| !may_alias_at(loc, MemLoc::new(*root, base, off, t.bytes()), prov, at));
             !entries.is_empty()
         });
         self.remember(loc, ty, value);

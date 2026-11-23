@@ -68,7 +68,12 @@ fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[b
             let direct_rejoin = cfg.preds_of(other).iter().any(|&q| cfg.dominates(arm, q));
             let jump_rejoin = !direct_rejoin
                 && matches!(func.last(other), Some(&Op::Jump(m, _)) if m != other && cfg.preds_of(m).iter().any(|&q| cfg.dominates(arm, q)));
-            let rejoins = direct_rejoin || jump_rejoin;
+            let fast_ret = !direct_rejoin
+                && !jump_rejoin
+                && matches!(func.last(other), Some(Op::Return(_)))
+                && !has_regular_call(func, other)
+                && !has_caller_loc_call(func, &zeros, other);
+            let rejoins = direct_rejoin || jump_rejoin || fast_ret;
             let colder = (has_regular_call(func, arm) && (direct_rejoin || !has_regular_call(func, other)))
                 || (has_caller_loc_call(func, &zeros, arm) && (direct_rejoin || !has_caller_loc_call(func, &zeros, other)));
             if Some(arm) == func.entry
