@@ -187,7 +187,7 @@ fn ok_call_hole_head(cx: &Context<'_>, ty: Ty) -> bool {
         Kind::Ref(..) | Kind::Tuple(..) => !ty_has_non_fixed(cx, ty),
         Kind::Adt(adt, _) => {
             cx.outline.is_fixed(adt.krate)
-                && ((cx.lang(adt) != Some("owned_box") && cx.attr_at(adt, "fundamental").is_none()) || !ty_has_non_fixed(cx, ty))
+                && ((cx.lang(adt) != Some("owned_box") && !cx.has_attr(adt, "fundamental")) || !ty_has_non_fixed(cx, ty))
         }
         _ => false,
     }

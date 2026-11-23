@@ -76,7 +76,7 @@ fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
         Some("always") => Hint::Always,
         Some("never") => Hint::Never,
         inline => {
-            if cx.attr_value(item, "cold").is_some() {
+            if cx.has_attr(item, "cold") {
                 Hint::Never
             } else if inline.is_some() {
                 Hint::Inline

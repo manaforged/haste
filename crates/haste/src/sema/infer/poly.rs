@@ -43,7 +43,7 @@ pub(in crate::sema) struct PolyState {
 
 pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
     let before = cx.quiet_mark();
-    if cx.attr_at(item, "define_opaque").is_some() {
+    if cx.has_attr(item, "define_opaque") {
         return SummaryKind::MonomorphicFallback;
     }
     let (Ok(sig), Ok(body), Ok(home)) = (cx.signature(item), cx.body(item), cx.module_of(item)) else {

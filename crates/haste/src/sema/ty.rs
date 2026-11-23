@@ -113,6 +113,8 @@ fn map_proj(pools: &Pools, id: ProjId, f: &mut impl FnMut(Ty) -> Ty) -> Kind {
 const FLAG_PARAM: u8 = 1;
 const FLAG_VAR: u8 = 2;
 const FLAG_PROJ: u8 = 4;
+const FLAG_CLOSURE: u8 = 8;
+const FLAG_NONE: u8 = 16;
 
 const TY_SHARDS: usize = 64;
 const TY_SLAB: usize = 65_536;
@@ -150,6 +152,8 @@ const FLOAT_VAR_BASE: u32 = INT_VAR_BASE + FAST_INT_VARS;
 const FAST_FLOAT_VARS: u32 = 16;
 const VALUE_BASE: u32 = FLOAT_VAR_BASE + FAST_FLOAT_VARS;
 const FAST_VALUES: u32 = 16;
+const PARAM_BASE: u32 = VALUE_BASE + FAST_VALUES;
+const FAST_PARAMS: u32 = 32;
 
 /// The type interner.
 #[derive(Clone)]
@@ -170,7 +174,8 @@ impl Default for Types {
             .chain((0..FAST_VARS).map(Kind::Var))
             .chain((0..FAST_INT_VARS).map(Kind::IntVar))
             .chain((0..FAST_FLOAT_VARS).map(Kind::FloatVar))
-            .chain((0..FAST_VALUES).map(|bits| Kind::Value(u128::from(bits))));
+            .chain((0..FAST_VALUES).map(|bits| Kind::Value(u128::from(bits))))
+            .chain((0..FAST_PARAMS as u16).map(Kind::Param));
         for kind in fixed {
             types.intern_slow(kind);
         }
@@ -191,6 +196,7 @@ fn fast_ty(kind: &Kind) -> Option<Ty> {
         Kind::IntVar(index) if index < FAST_INT_VARS => Some(Ty(INT_VAR_BASE + index)),
         Kind::FloatVar(index) if index < FAST_FLOAT_VARS => Some(Ty(FLOAT_VAR_BASE + index)),
         Kind::Value(bits) if bits < u128::from(FAST_VALUES) => Some(Ty(VALUE_BASE + bits as u32)),
+        Kind::Param(index) if u32::from(index) < FAST_PARAMS => Some(Ty(PARAM_BASE + u32::from(index))),
         _ => None,
     }
 }
@@ -227,7 +233,7 @@ impl Types {
     }
 
     fn flags_of(&self, ty: Ty) -> u8 {
-        if ty == Ty::NONE { 0 } else { self.flags.get(ty.0 as usize).copied().unwrap_or(0) }
+        if ty == Ty::NONE { FLAG_NONE } else { self.flags.get(ty.0 as usize).copied().unwrap_or(0) }
     }
 
     fn substs_flags(&self, substs: Substs) -> u8 {
@@ -249,6 +255,16 @@ impl Types {
         (self.flags_of(ty) & FLAG_PROJ) != 0
     }
 
+    /// Whether `ty` contains no parameters, inference variables, closures, or `Ty::NONE` at any depth.
+    pub fn is_ground(&self, ty: Ty) -> bool {
+        (self.flags_of(ty) & (FLAG_PARAM | FLAG_VAR | FLAG_CLOSURE | FLAG_NONE)) == 0
+    }
+
+    /// Whether `ty` contains a `Closure` type at any depth.
+    pub fn has_closure(&self, ty: Ty) -> bool {
+        (self.flags_of(ty) & FLAG_CLOSURE) != 0
+    }
+
     /// Whether any type in `substs` contains a rigid `Param` or `Proj`.
     pub fn substs_have_params(&self, substs: Substs) -> bool {
         (self.substs_flags(substs) & FLAG_PARAM) != 0
@@ -260,9 +276,10 @@ impl Types {
             Kind::Proj(id) => {
                 let proj = self.proj(*id);
                 let sub = self.flags_of(proj.self_ty) | self.substs_flags(proj.args) | self.substs_flags(proj.own);
-                FLAG_PARAM | FLAG_PROJ | (sub & FLAG_VAR)
+                FLAG_PARAM | FLAG_PROJ | (sub & (FLAG_VAR | FLAG_CLOSURE | FLAG_NONE))
             }
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => FLAG_VAR,
+            Kind::Closure(..) => FLAG_CLOSURE | kind.children(self).fold(0, |acc, child| acc | self.flags_of(child)),
             other => other.children(self).fold(0, |acc, child| acc | self.flags_of(child)),
         }
     }

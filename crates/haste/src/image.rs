@@ -464,7 +464,7 @@ impl Image {
 
     pub(super) fn compile_target_for(&self, cx: &Context<'_>, item: crate::names::ItemRef) -> haste_codegen::Target {
         let base = self.compile_target();
-        if cx.attr_value(item, "cold").is_some() { base.effort(haste_codegen::Effort::Quick) } else { base }
+        if cx.has_attr(item, "cold") { base.effort(haste_codegen::Effort::Quick) } else { base }
     }
 
     /// The encoded machine-code byte length of each reached function, or zero when not compiled.

@@ -296,6 +296,16 @@ impl<'a> Context<'a> {
         false
     }
 
+    /// Whether any impl of trait `of` in crates `holders` may match a self type with head `head`.
+    pub fn has_trait_impl_for_head(&mut self, of: ItemRef, head: Head, holders: &[u32]) -> bool {
+        self.any_holder(holders, Some(head), Some(of), |cx, holder| {
+            cx.index_of(holder)
+                .traits
+                .get(&of)
+                .is_some_and(|bucket| !bucket.blanket.is_empty() || bucket.by_head.get(&head).is_some_and(|matching| !matching.is_empty()))
+        })
+    }
+
     /// The impls of trait `of` in crates `holders` whose self type may have head `head`.
     pub fn trait_impls(&mut self, of: ItemRef, head: Option<Head>, holders: &[u32]) -> Vec<ImplRef> {
         let mut found = Vec::new();

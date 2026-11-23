@@ -162,7 +162,7 @@ impl AotQueue {
 fn warmable_callee(cx: &Context<'_>, reached: &Reached, idx: usize) -> bool {
     let Some(((item, _), Ok(typed))) = reached.list.get(idx) else { return false };
     !cx.foreign(*item)
-        && cx.attr_value(*item, "cold").is_none()
+        && !cx.has_attr(*item, "cold")
         && cx.attr_value(*item, "inline") != Some("never")
         && !typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never))
 }

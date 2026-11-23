@@ -78,6 +78,8 @@ impl<'a> Infer<'_, 'a> {
 
     fn closed_at(&self, mut ty: Ty, depth: u32, local: bool, check_trail: bool) -> bool {
         if depth > 24 || ty == Ty::NONE { return false; }
+        if self.cx.types.is_ground(ty) { return true; }
+        if !local && self.cx.types.has_closure(ty) { return false; }
         while let Some(index) = self.var_of(ty) {
             let Some(bound) = self.vars.get(index as usize).copied().flatten() else { break };
             if check_trail && self.trail_depth > 0 && self.var_trail.iter().any(|&(i, _)| i == index) { return false; }

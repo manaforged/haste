@@ -229,7 +229,7 @@ impl<'a> Infer<'_, 'a> {
             return true;
         }
         let quiet = self.items.is_empty() && self.const_args.is_empty() && self.evaluating.is_empty() && self.selecting.is_empty();
-        quiet && root.is_none() && self.instance.as_ref().is_none_or(|(at, _)| self.cx.attr_at(*at, "define_opaque").is_none())
+        quiet && root.is_none() && self.instance.as_ref().is_none_or(|(at, _)| !self.cx.has_attr(*at, "define_opaque"))
     }
 
     /// `ty` of a generic form with each rigid parameter `index` replaced by `args[index]`.

@@ -204,7 +204,7 @@ impl<'a> Context<'a> {
                         continue;
                     }
                     let item = ItemRef { krate: krate as u32, file: file as u32, item: at };
-                    if self.attr_at(item, "global_allocator").is_some() {
+                    if self.has_attr(item, "global_allocator") {
                         found = Some(item);
                         break;
                     }
@@ -265,7 +265,7 @@ impl<'a> Context<'a> {
                     let item = ItemRef { krate, file: file as u32, item: at };
                     if let Some(lang) = self.lang(item) {
                         table.insert(lang.to_owned(), item);
-                    } else if std && entry.items.items[at as usize].kind == ItemKind::Fn && self.attr_at(item, "panic_handler").is_some() {
+                    } else if std && entry.items.items[at as usize].kind == ItemKind::Fn && self.has_attr(item, "panic_handler") {
                         table.insert(PANIC_HANDLER.to_owned(), item);
                     }
                 }

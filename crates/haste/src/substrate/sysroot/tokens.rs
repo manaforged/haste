@@ -569,10 +569,10 @@ pub(super) fn write_items(out: &mut Vec<u8>, items: &Items) -> Option<()> {
         }
     }
     write_usize(out, items.marks.len())?;
-    out.reserve(items.marks.len() * 5);
+    out.reserve(items.marks.len() * 6);
     for &(at, bits) in &items.marks {
         write_u32(out, at);
-        out.push(bits);
+        out.extend_from_slice(&bits.to_le_bytes());
     }
     Some(())
 }
@@ -637,8 +637,8 @@ pub(super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
         bail!("trailing bytes in import paths");
     }
     let mark_count = cur.count()?;
-    let mark_bytes = cur.take(mark_count.checked_mul(5).context("item marks overflow")?)?;
-    let marks = mark_bytes.chunks_exact(5).map(|c| (u32_le(c, 0), c[4])).collect();
+    let mark_bytes = cur.take(mark_count.checked_mul(6).context("item marks overflow")?)?;
+    let marks = mark_bytes.chunks_exact(6).map(|c| (u32_le(c, 0), u16::from_le_bytes([c[4], c[5]]))).collect();
     Ok(Items { inner, items, imports, marks })
 }
 

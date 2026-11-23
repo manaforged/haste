@@ -4,6 +4,7 @@ use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 
 use super::super::Context;
+use super::super::impls::Head;
 use super::super::ty::{Kind, Mut, Ty};
 use super::select::Picked;
 use super::{Infer, Local, Res, Shape, Typed, detached};
@@ -107,6 +108,10 @@ impl Infer<'_, '_> {
 
     /// The `Drop` impl of `ty` itself.
     pub fn drop_impl(&mut self, ty: Ty) -> Result<Option<Picked>> {
+        let ty = self.resolve(ty);
+        if !adt_may_have_drop(self.cx, ty)? {
+            return Ok(None);
+        }
         let Some(drop) = self.cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
         self.select(drop, ty, &[])
     }
@@ -278,12 +283,26 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
     with_drop(cx, |infer| infer.needs_drop(ty))
 }
 
+fn adt_may_have_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    let Kind::Adt(def, _) = *cx.types.kind(ty) else {
+        return Ok(matches!(cx.types.kind(ty), Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)));
+    };
+    let Some(drop) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+    let two;
+    let one;
+    let holders: &[u32] = if def.krate == drop.krate {
+        one = [def.krate];
+        &one
+    } else {
+        two = [def.krate, drop.krate];
+        &two
+    };
+    Ok(cx.has_trait_impl_for_head(drop, Head::Adt(def), holders))
+}
+
 /// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    if ty == Ty::NONE {
-        return Ok(false);
-    }
-    if !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
+    if ty == Ty::NONE || !adt_may_have_drop(cx, ty)? {
         return Ok(false);
     }
     with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
