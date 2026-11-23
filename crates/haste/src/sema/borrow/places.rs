@@ -138,7 +138,7 @@ impl Checker<'_, '_> {
     pub(super) fn is_param_local(&self, local: u32) -> bool { self.is_param.get(local as usize).copied().unwrap_or(false) }
     pub(super) fn is_closure_param(&self, local: u32) -> bool { self.typed.closures.values().any(|c| c.params.contains(&local)) }
     pub(super) fn ty_is_copy(&mut self, ty: Ty) -> bool {
-        ty == Ty::NONE || matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) || super::super::infer::is_copy(self.cx, self.item, ty).unwrap_or(true)
+        super::is_copy_ty(self.cx, self.item, ty)
     }
 
     fn update_ref_flags(&self, ty: Ty, mut_ref_root: &mut bool, behind_shared: &mut bool) {

@@ -89,6 +89,13 @@ struct Checker<'c, 'a> {
     drop_locals: HashSet<u32>,
 }
 
+/// Whether `ty` is `Copy` in `item`; defaults conservatively to `false` when classification fails on a real type.
+pub(super) fn is_copy_ty(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
+    ty == Ty::NONE
+        || matches!(cx.types.kind(ty), Kind::Ref(Mut::Not, _))
+        || super::infer::is_copy(cx, item, ty).unwrap_or(false)
+}
+
 /// Checks ownership, mutability, borrow aliasing, and dangling local reference escapes on `body`.
 pub(super) fn check(
     cx: &mut Context<'_>,
@@ -99,12 +106,9 @@ pub(super) fn check(
 ) -> Result<()> {
     let Some(root) = body.root else { return Ok(()) };
     let n = typed.locals.len();
-    let mut is_copy = vec![true; n];
+    let mut is_copy = vec![false; n];
     for (idx, local) in typed.locals.iter().enumerate() {
-        if local.ty != Ty::NONE {
-            is_copy[idx] = matches!(cx.types.kind(local.ty), Kind::Ref(Mut::Not, _))
-                || super::infer::is_copy(cx, item, local.ty).unwrap_or(true);
-        }
+        is_copy[idx] = is_copy_ty(cx, item, local.ty);
     }
     let mut mutable = vec![false; n];
     let mut is_param = vec![false; n];

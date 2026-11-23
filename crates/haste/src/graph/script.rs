@@ -19,6 +19,13 @@ pub struct Output {
     pub watched_vars: Vec<String>,
 }
 
+impl Output {
+    /// The build-script cfg and env fields included in cache keys.
+    pub fn key_parts(&self) -> (&BTreeSet<String>, &BTreeSet<(String, String)>, &[(String, String)]) {
+        (&self.names, &self.pairs, &self.vars)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Directive {
     Cfg,
@@ -169,14 +176,15 @@ pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metada
     vars.extend(cfg_vars(target));
     vars.extend(manifest.links.iter().map(|links| ("CARGO_MANIFEST_LINKS".to_owned(), links.clone())));
     vars.extend(metadata.iter().cloned());
+    let release = crate::profile() == crate::outline::tree::Profile::Release;
     let fixed = [
         ("OUT_DIR", out_dir(workspace, unit)),
         ("TARGET", target.triple.clone()),
         ("HOST", targets.host.triple.clone()),
         ("NUM_JOBS", crate::jobs().to_string()),
-        ("OPT_LEVEL", "0".to_owned()),
-        ("DEBUG", "true".to_owned()),
-        ("PROFILE", "debug".to_owned()),
+        ("OPT_LEVEL", if release { "3" } else { "0" }.to_owned()),
+        ("DEBUG", if release { "false" } else { "true" }.to_owned()),
+        ("PROFILE", if release { "release" } else { "debug" }.to_owned()),
         ("CARGO", tool("CARGO")),
         ("RUSTC", tool("RUSTC")),
         ("RUSTDOC", tool("RUSTDOC")),
@@ -201,7 +209,15 @@ fn upper(name: &str) -> String {
 }
 
 fn cfg_vars(target: &super::cfg::Target) -> Vec<(String, String)> {
-    let mut vars: Vec<(String, String)> = target.names.iter().chain(["debug_assertions".to_owned()].iter()).map(|name| (format!("CARGO_CFG_{}", upper(name)), String::new())).collect();
+    let debug = crate::profile() != crate::outline::tree::Profile::Release;
+    let extra = debug.then_some("debug_assertions");
+    let mut vars: Vec<(String, String)> = target
+        .names
+        .iter()
+        .map(String::as_str)
+        .chain(extra)
+        .map(|name| (format!("CARGO_CFG_{}", upper(name)), String::new()))
+        .collect();
     let mut joined: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
     for (key, value) in &target.pairs {
         joined.entry(key).or_default().push(value);

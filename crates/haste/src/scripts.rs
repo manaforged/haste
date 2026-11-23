@@ -60,7 +60,7 @@ fn settle_inner(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
         wave.sort_by_key(|&unit| std::cmp::Reverse((dag.build_users[unit].len(), dag.links_users[unit].len())));
         let outcome = run(workspace, targets, &wave, &dag, &mut locks, &mut ran)?;
         drop(locks);
-        finish_wave(workspace, targets, &wave, outcome, &mut dag, &mut ran, &mut failed, &mut kept_queue);
+        finish_wave(workspace, &wave, outcome, &mut dag, &mut ran, &mut failed, &mut kept_queue);
     }
 }
 
@@ -187,7 +187,6 @@ fn drain_kept(
 
 fn finish_wave(
     workspace: &mut Workspace,
-    targets: &Targets,
     wave: &[usize],
     outcome: Outcome,
     dag: &mut ScriptDag,
@@ -213,20 +212,19 @@ fn finish_wave(
     for (unit, failure) in errors {
         let retried = failure.broken.is_some_and(|at| wave_set.contains(&at) && workspace.graph.units[at].script.is_some());
         if !retried {
-            give_up(workspace, targets, unit, &failure, ran, failed);
+            give_up(workspace, unit, &failure, failed);
             dag.finish_unit(workspace, failed, unit, kept_queue);
         }
     }
 }
 
-/// Reports that `unit`'s script did not build or run, keeps that failure for later runs unless something outside stopped the script, and builds its package with the script's cfgs open.
-fn give_up(workspace: &Workspace, targets: &Targets, unit: usize, failure: &Failure, ran: &Ran, failed: &mut HashSet<usize>) {
-    let error = &failure.error;
-    report(workspace, unit, error, failed);
+/// Reports that `unit`'s script did not build or run, clears any stale cache entry so a retry runs fresh, and builds its package with the script's cfgs open.
+fn give_up(workspace: &Workspace, unit: usize, failure: &Failure, failed: &mut HashSet<usize>) {
+    report(workspace, unit, &failure.error, failed);
     if !failure.interrupted
-        && let Err(write) = store::keep_failure(workspace, unit, &vars(workspace, targets, unit, ran), error)
+        && let Err(write) = store::clear_failure(workspace, unit)
     {
-        eprintln!("cannot keep that failure: {write}");
+        eprintln!("cannot clear stale build script state: {write}");
     }
 }
 

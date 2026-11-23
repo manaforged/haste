@@ -199,7 +199,7 @@ fn hash_file(outline: &crate::outline::Outline, idx: u32, file: &crate::outline:
         pin.hash(&mut hasher);
         krate.env.features.hash(&mut hasher);
         if let Some(script) = &krate.env.script {
-            (&script.names, &script.pairs, &script.vars).hash(&mut hasher);
+            script.key_parts().hash(&mut hasher);
         }
         krate.env.vars.hash(&mut hasher);
         base_dir.file_name().hash(&mut hasher);
@@ -447,14 +447,16 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
     toolchain_key_for(workspace, target.triple, target.effort)
 }
 
+fn hash_cache_header(hasher: &mut FxHasher) {
+    (super::MAGIC, super::VERSION, crate::profile() == Profile::Release).hash(hasher);
+}
+
 /// Computes a cache key for the settled sysroot outline and resolved names for `targets`.
 pub fn sysroot_key(workspace: &crate::graph::Workspace, targets: &crate::graph::Targets) -> u64 {
     let mut hasher = FxHasher::default();
-    super::MAGIC.hash(&mut hasher);
-    super::VERSION.hash(&mut hasher);
+    hash_cache_header(&mut hasher);
     super::sysroot::SYSROOT_VERSION.hash(&mut hasher);
     toolchain_key_for(workspace, &targets.target.triple, crate::profile().into()).hash(&mut hasher);
-    (crate::profile() == Profile::Release).hash(&mut hasher);
     (&targets.target.triple, &targets.target.names, &targets.target.pairs, &targets.target.internal).hash(&mut hasher);
     (&targets.host.triple, &targets.host.names, &targets.host.pairs, &targets.host.internal).hash(&mut hasher);
     crate::graph::script::tool("CARGO").hash(&mut hasher);
@@ -463,7 +465,7 @@ pub fn sysroot_key(workspace: &crate::graph::Workspace, targets: &crate::graph::
         let pkg = &workspace.packages[unit.package];
         (&pkg.manifest.edition, &pkg.manifest.lib_name, &pkg.manifest.dir, pkg.manifest.build.is_some()).hash(&mut hasher);
         if let Some(script) = &unit.script {
-            (&script.names, &script.pairs, &script.vars).hash(&mut hasher);
+            script.key_parts().hash(&mut hasher);
         }
         let mut deps: Vec<(&str, &str, bool)> = unit
             .deps
@@ -508,7 +510,7 @@ fn hash_deps_units(workspace: &crate::graph::Workspace, hasher: &mut FxHasher) -
         (&locked.name, locked.version.to_string(), &locked.source).hash(hasher);
         (matches!(unit.side, crate::graph::Side::Host), &pkg.manifest.dir, &unit.features).hash(hasher);
         if let Some(script) = &unit.script {
-            (&script.names, &script.pairs, &script.vars).hash(hasher);
+            script.key_parts().hash(hasher);
         }
     }
     true
@@ -517,14 +519,16 @@ fn hash_deps_units(workspace: &crate::graph::Workspace, hasher: &mut FxHasher) -
 /// Computes a workspace-scoped key for non-local, non-sysroot fixed units, or `None` when none exist.
 pub fn deps_key(workspace: &crate::graph::Workspace, target: &Target, toolchain_hash: u64) -> Option<u64> {
     let mut hasher = FxHasher::default();
-    (super::MAGIC, super::VERSION, toolchain_hash, target_hash(target), crate::profile() == Profile::Release).hash(&mut hasher);
+    hash_cache_header(&mut hasher);
+    (toolchain_hash, target_hash(target)).hash(&mut hasher);
     hash_deps_units(workspace, &mut hasher).then(|| hasher.finish())
 }
 
 fn fixed_files_paths(workspace: &crate::graph::Workspace, triple: &str) -> (PathBuf, Option<PathBuf>) {
     let home = crate::graph::store::home();
     let mut sys_hasher = FxHasher::default();
-    (super::MAGIC, super::VERSION, triple, crate::profile() == Profile::Release, crate::graph::store::program()).hash(&mut sys_hasher);
+    hash_cache_header(&mut sys_hasher);
+    (triple, crate::graph::store::program()).hash(&mut sys_hasher);
     hash_program(&mut sys_hasher);
     for unit in workspace.graph.units.iter().filter(|u| workspace.packages[u.package].sysroot) {
         let pkg = &workspace.packages[unit.package];
@@ -624,11 +628,7 @@ pub fn workspace_key(workspace: &crate::graph::Workspace, target: &Target, toolc
     dirs.sort_unstable();
     dirs.dedup();
     let mut hasher = FxHasher::default();
-    super::MAGIC.hash(&mut hasher);
-    super::VERSION.hash(&mut hasher);
-    toolchain_hash.hash(&mut hasher);
-    target_hash(target).hash(&mut hasher);
-    (crate::profile() == Profile::Release).hash(&mut hasher);
-    dirs.hash(&mut hasher);
+    hash_cache_header(&mut hasher);
+    (toolchain_hash, target_hash(target), dirs).hash(&mut hasher);
     Some(hasher.finish())
 }
