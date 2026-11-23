@@ -1,4 +1,4 @@
-use crate::fold::{const_offset, extend, known_bits};
+use crate::fold::{const_offset, extend, is_unit_bool, known_bits};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
 use super::icmp::complementary_eq_pair;
@@ -27,10 +27,18 @@ impl BoolFacts {
             uextends: vec![None; n],
             bools: vec![false; n],
         };
+        let mut defs = vec![None; n];
         for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+            if let Some(r) = func.insts[inst.index()].result {
+                defs[r.index()] = Some(*inst);
+            }
             f.record_inst(func, *inst);
         }
-        f.propagate(func);
+        for (idx, def) in defs.iter().enumerate() {
+            if def.is_some() && f.consts[idx].is_none() && !f.bools[idx] {
+                f.bools[idx] = is_unit_bool(func, &|v| defs.get(v.index()).copied().flatten(), &|v| f.konst(v), Value(idx as u32));
+            }
+        }
         f
     }
 
@@ -47,30 +55,6 @@ impl BoolFacts {
             Op::Binary(Binary::Bxor, x, y) => self.xors[r.index()] = Some((x, y)),
             Op::Convert(Convert::Uextend, inner) => self.uextends[r.index()] = Some(inner),
             _ => {}
-        }
-    }
-
-    fn propagate(&mut self, func: &Function) {
-        for _ in 0..2 {
-            for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-                let d = &func.insts[inst.index()];
-                if let Some(r) = d.result {
-                    self.bools[r.index()] |= self.op_is_bool(&d.op);
-                }
-            }
-        }
-    }
-
-    fn op_is_bool(&self, op: &Op) -> bool {
-        match *op {
-            Op::Binary(Binary::Band, x, y) => {
-                matches!(self.konst(x), Some(0 | 1))
-                    || matches!(self.konst(y), Some(0 | 1))
-                    || (self.is_01(x) && self.is_01(y))
-            }
-            Op::Binary(Binary::Bor | Binary::Bxor, x, y) | Op::Select(_, x, y) => self.is_01(x) && self.is_01(y),
-            Op::Convert(Convert::Uextend, inner) => self.is_bool(inner),
-            _ => false,
         }
     }
 
@@ -96,10 +80,6 @@ impl BoolFacts {
 
     fn is_bool(&self, v: Value) -> bool {
         fact(&self.bools, v)
-    }
-
-    fn is_01(&self, v: Value) -> bool {
-        self.is_bool(v) || matches!(self.konst(v), Some(0 | 1))
     }
 
     fn unwrap_uext(&self, v: Value) -> Value {

@@ -29,7 +29,7 @@ impl<'a> RewriteCx<'a> {
     fn op(&self, v: Value) -> Option<&Op> { op_of(self.func, |x| self.def(x), v) }
     fn count(&self, sh: Value, ty: Type) -> Option<u32> { self.sconst(sh).map(|imm| (imm as u32) & (ty.bits() - 1)) }
     fn single_use(&self, v: Value) -> bool { self.uses.get(v.index()).copied().unwrap_or(1) <= 1 }
-    fn is_unit_bool(&self, v: Value) -> bool { let t = self.func.ty(v); t.is_small_int() && (self.known(v).0 & (t.unsigned_max() & !1)) == (t.unsigned_max() & !1) }
+    fn is_unit_bool(&self, v: Value) -> bool { crate::fold::is_unit_bool(self.func, &|x| self.def(x), &|x| self.sconst(x), v) }
 
     fn emit(&mut self, ty: Type, op: Op) -> Value {
         let val = self.func.value(ty);

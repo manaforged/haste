@@ -177,6 +177,12 @@ pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>
     }
 }
 
+/// Whether `v` is proven to hold only `0` or `1` via `known_bits`.
+pub(crate) fn is_unit_bool(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, known: &dyn Fn(Value) -> Option<i64>, v: Value) -> bool {
+    let ty = func.ty(v);
+    ty.is_small_int() && (known_bits(func, def_of, known, v, 0).0 | 1) == ty.unsigned_max()
+}
+
 const DEREF_SCAN: usize = 256;
 
 /// Where a value is read: after `prefix` in its block, and below every block that dominates `block`.
@@ -284,23 +290,7 @@ impl Fold {
 
     /// Whether `value` is 0 or 1 in its low byte because a comparison, overflow check, or boolean op defines it.
     fn boolean(&self, func: &Function, value: Value) -> bool {
-        self.boolean_at(func, value, 0)
-    }
-
-    fn boolean_at(&self, func: &Function, value: Value, depth: u8) -> bool {
-        if depth >= 8 || func.ty(value).is_vector() {
-            return false;
-        }
-        let is_01 = |v: Value| matches!(self.known(v), Some(0 | 1)) || self.boolean_at(func, v, depth + 1);
-        match self.def(func, value) {
-            Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)) => true,
-            Some(Op::Convert(Convert::Uextend, inner)) => self.boolean_at(func, *inner, depth + 1),
-            Some(Op::Binary(Binary::Band, a, b)) => {
-                matches!(self.known(*a), Some(0 | 1)) || matches!(self.known(*b), Some(0 | 1)) || (is_01(*a) && is_01(*b))
-            }
-            Some(Op::Binary(Binary::Bor | Binary::Bxor, a, b) | Op::Select(_, a, b)) => is_01(*a) && is_01(*b),
-            _ => false,
-        }
+        self.known(value).is_none() && is_unit_bool(func, &|v| self.def_inst(v), &|v| self.known(v), value)
     }
 
     /// Whether `x` and `y` of type `ty` hold the same bits at that width.
