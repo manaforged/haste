@@ -165,10 +165,19 @@ pub(super) fn optimize(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> boo
     }
     let mut zeros = func.thread_cell_zeros();
     let mut is_cl: Vec<bool> = prov.param_roots.iter().map(|&r| r == MemRoot::CallerLoc).collect();
-    let mut changed = narrow_stores(func, cfg, prov, &mut zeros, &mut is_cl);
-    changed |= narrow_saves(func, cfg, prov, &mut zeros, &mut is_cl);
-    changed |= drop_silent_stores(func, cfg, prov, &zeros, &is_cl);
-    changed |= drop_dead_stores(func, cfg, prov, &zeros, &is_cl);
+    let has_store = cfg.rpo.iter().any(|&b| {
+        func.blocks[b.index()]
+            .insts
+            .iter()
+            .any(|&i| matches!(func.insts[i.index()].op, Op::Store(_, a, 0) if is_cl.get(a.index()) == Some(&true)))
+    });
+    let mut changed = false;
+    if has_store {
+        changed |= narrow_stores(func, cfg, prov, &mut zeros, &mut is_cl);
+        changed |= narrow_saves(func, cfg, prov, &mut zeros, &mut is_cl);
+        changed |= drop_silent_stores(func, cfg, prov, &zeros, &is_cl);
+        changed |= drop_dead_stores(func, cfg, prov, &zeros, &is_cl);
+    }
     changed |= sink_cell_calls(func, cfg, &mut zeros, &mut is_cl);
     changed
 }
@@ -574,53 +583,72 @@ fn drop_dead_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance, zeros: &[
 }
 
 fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl: &mut Vec<bool>) -> bool {
-    let uses = func.use_counts();
+    let has_cl_load = cfg.rpo.iter().any(|&b| {
+        func.blocks[b.index()].insts.iter().any(|&i| {
+            let d = &func.insts[i.index()];
+            matches!((&d.op, d.result), (Op::Load(addr, 0), Some(_)) if is_cl.get(addr.index()) == Some(&true))
+        })
+    });
     let mut changed = false;
-    for &b in &cfg.rpo {
-        let mut dead = Vec::new();
-        for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
-            let data = &func.insts[inst.index()];
-            if let (Op::Load(addr, 0), Some(res)) = (&data.op, data.result)
-                && is_cl.get(addr.index()) == Some(&true)
-                && uses.get(res.index()) == Some(&0)
-            {
-                dead.push(pos);
+    if has_cl_load {
+        let uses = func.use_counts();
+        for &b in &cfg.rpo {
+            let mut dead = Vec::new();
+            for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
+                let data = &func.insts[inst.index()];
+                if let (Op::Load(addr, 0), Some(res)) = (&data.op, data.result)
+                    && is_cl.get(addr.index()) == Some(&true)
+                    && uses.get(res.index()) == Some(&0)
+                {
+                    dead.push(pos);
+                }
+            }
+            for pos in dead.into_iter().rev() {
+                let inst = func.blocks[b.index()].insts.remove(pos);
+                func.insts[inst.index()].op = Op::Trap;
+                changed = true;
             }
         }
-        for pos in dead.into_iter().rev() {
-            let inst = func.blocks[b.index()].insts.remove(pos);
-            func.insts[inst.index()].op = Op::Trap;
-            changed = true;
+    }
+    let mut defs_list: Vec<(Value, Block, Inst, ClDef)> = Vec::new();
+    if !zeros.is_empty() {
+        for &b in &cfg.rpo {
+            for &inst in &func.blocks[b.index()].insts {
+                let data = &func.insts[inst.index()];
+                if data.result.is_none()
+                    && let Some(res) = func.caller_loc_result(&data.op, |v| zeros.get(v.index()) == Some(&true))
+                    && let Op::Call { sig, callee, args, results } = &data.op
+                    && results.len() == 1
+                {
+                    defs_list.push((res, b, inst, (*sig, *callee, args.clone())));
+                }
+            }
         }
     }
-    let cl_defs = collect_cl_defs(func, cfg, zeros);
-    let mut def_blocks: Vec<Option<Block>> = vec![None; func.types.len()];
-    let mut any_def = false;
-    for (res_idx, def) in cl_defs.iter().enumerate() {
-        if let Some((b_def, ..)) = def {
-            def_blocks[res_idx] = Some(*b_def);
-            any_def = true;
-        }
-    }
-    if !any_def {
+    if defs_list.is_empty() {
         return changed;
     }
-    let mut all_use_blocks: Vec<Vec<Block>> = vec![Vec::new(); func.types.len()];
-    let mut all_ok = vec![true; func.types.len()];
+    let mut cl_slot = vec![u32::MAX; func.types.len()];
+    for (idx, &(res, ..)) in defs_list.iter().enumerate() {
+        cl_slot[res.index()] = idx as u32;
+    }
+    let mut all_use_blocks: Vec<Vec<Block>> = vec![Vec::new(); defs_list.len()];
+    let mut all_ok = vec![true; defs_list.len()];
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
             let op = &func.insts[inst.index()].op;
             op.for_operands(|v| {
-                let vi = v.index();
-                if let Some(b_def) = def_blocks[vi]
-                    && all_ok[vi]
-                {
-                    let valid = matches!(*op, Op::Load(a, 0) if a == v)
-                        || matches!(*op, Op::Store(val, a, 0) if a == v && val != v);
-                    if b == b_def || !valid {
-                        all_ok[vi] = false;
-                    } else if all_use_blocks[vi].last() != Some(&b) {
-                        all_use_blocks[vi].push(b);
+                let slot = cl_slot.get(v.index()).copied().unwrap_or(u32::MAX);
+                if slot != u32::MAX {
+                    let si = slot as usize;
+                    if all_ok[si] {
+                        let valid = matches!(*op, Op::Load(a, 0) if a == v)
+                            || matches!(*op, Op::Store(val, a, 0) if a == v && val != v);
+                        if b == defs_list[si].1 || !valid {
+                            all_ok[si] = false;
+                        } else if all_use_blocks[si].last() != Some(&b) {
+                            all_use_blocks[si].push(b);
+                        }
                     }
                 }
             });
@@ -628,15 +656,11 @@ fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl:
     }
     let loops = cfg.loops();
     let n = func.blocks.len();
-    for (res_idx, def) in cl_defs.into_iter().enumerate() {
-        let Some((b_def, def_inst, (sig, callee, args))) = def else {
-            continue;
-        };
-        if !all_ok[res_idx] {
+    for (si, (res, b_def, def_inst, (sig, callee, args))) in defs_list.into_iter().enumerate() {
+        if !all_ok[si] {
             continue;
         }
-        let res = Value(res_idx as u32);
-        let use_blocks = std::mem::take(&mut all_use_blocks[res_idx]);
+        let use_blocks = std::mem::take(&mut all_use_blocks[si]);
         if use_blocks.is_empty() {
             if let Some(pos) = func.blocks[b_def.index()].insts.iter().position(|&i| i == def_inst) {
                 func.blocks[b_def.index()].insts.remove(pos);

@@ -100,6 +100,9 @@ pub(super) struct SsaRepairPlan {
 }
 
 pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block, exit: Block, skip: &[Block], vals: &[Value]) -> Option<SsaRepairPlan> {
+    if vals.is_empty() {
+        return Some(SsaRepairPlan { need: Vec::new(), from_exit: vec![false; func.blocks.len()], joins: Vec::new(), join_of: vec![None; func.blocks.len()] });
+    }
     let mut from_exit = vec![false; func.blocks.len()];
     let mut stack = vec![exit];
     while let Some(b) = stack.pop() {
@@ -110,29 +113,39 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
             stack.push(s);
         }
     }
-    let mut need = Vec::new();
+    let val_map = (vals.len() > 8).then(|| {
+        let mut map = vec![u32::MAX; func.types.len()];
+        for (idx, &v) in vals.iter().enumerate() {
+            map[v.index()] = idx as u32;
+        }
+        map
+    });
+    let mut seen_val = vec![false; vals.len()];
+    let mut need_count = 0usize;
     let mut use_blocks = vec![false; func.blocks.len()];
-    for &v in vals {
-        let mut used_in_exit = false;
-        for (bi, &in_fe) in from_exit.iter().enumerate() {
-            if in_fe
-                && func.blocks[bi].insts.iter().any(|&inst| {
-                    let mut hit = false;
-                    func.insts[inst.index()].op.for_operands(|op| hit |= op == v);
-                    hit
-                })
-            {
-                used_in_exit = true;
-                use_blocks[bi] = true;
+    for (bi, &in_fe) in from_exit.iter().enumerate() {
+        if !in_fe {
+            continue;
+        }
+        for &inst in &func.blocks[bi].insts {
+            func.insts[inst.index()].op.for_operands(|op| {
+                let pos = match &val_map {
+                    Some(map) => map.get(op.index()).copied().filter(|&p| p != u32::MAX).map(|p| p as usize),
+                    None => vals.iter().position(|&v| v == op),
+                };
+                if let Some(pos) = pos {
+                    use_blocks[bi] = true;
+                    if !std::mem::replace(&mut seen_val[pos], true) {
+                        need_count += 1;
+                    }
+                }
+            });
+            if need_count > 4 {
+                return None;
             }
         }
-        if used_in_exit {
-            need.push(v);
-        }
     }
-    if need.len() > 4 {
-        return None;
-    }
+    let need: Vec<Value> = vals.iter().zip(&seen_val).filter_map(|(&v, &s)| s.then_some(v)).collect();
     if !need.is_empty() {
         let mut live = vec![false; func.blocks.len()];
         let mut back: Vec<Block> = use_blocks

@@ -227,41 +227,43 @@ impl<'a> Ranges<'a> {
         }
         let mut ranges = Self { defs, table, raised: Vec::new() };
         let info = CfgInfo { consts, incoming, complete, single, idom };
-        if ranges.propagate(func, &info, order) {
-            ranges.propagate(func, &info, order);
+        let mut falls_through = vec![0_u32; func.types.len()];
+        let mut epoch = 0_u32;
+        if ranges.propagate(func, &info, order, &mut falls_through, &mut epoch) {
+            ranges.propagate(func, &info, order, &mut falls_through, &mut epoch);
         }
         ranges
     }
 
-    fn propagate(&mut self, func: &Function, info: &CfgInfo, order: &[Block]) -> bool {
-        let (mut narrowed, mut falls_through, mut epoch) = (false, vec![0_u32; func.types.len()], 0_u32);
+    fn propagate(&mut self, func: &Function, info: &CfgInfo, order: &[Block], falls_through: &mut [u32], epoch: &mut u32) -> bool {
+        let mut narrowed = false;
         let bump = |epoch: &mut u32, ft: &mut [u32]| { *epoch = epoch.wrapping_add(1); if *epoch == 0 { ft.fill(0); *epoch = 1; } };
         for &block in order {
             narrowed |= self.refine_params(func, info, block);
-            bump(&mut epoch, &mut falls_through);
-            for &p in &func.blocks[block.index()].params { if func.ty(p).is_small_int() { falls_through[p.index()] = epoch; } }
+            bump(epoch, falls_through);
+            for &p in &func.blocks[block.index()].params { if func.ty(p).is_small_int() { falls_through[p.index()] = *epoch; } }
             for inst in &func.blocks[block.index()].insts {
                 let data = &func.insts[inst.index()];
-                narrowed |= transfer::note_deref(func, &data.op, &falls_through, epoch, &mut self.table);
+                narrowed |= transfer::note_deref(func, &data.op, falls_through, *epoch, &mut self.table);
                 match data.op {
                     Op::Assume(value) => {
                         let (lo, hi) = &mut self.table[value.index()];
-                        if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through[value.index()] == epoch {
+                        if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through[value.index()] == *epoch {
                             *lo = 1;
                             if !self.raised.contains(&value) { self.raised.push(value); }
                         }
                         continue;
                     }
                     Op::Call { ref results, .. } => {
-                        bump(&mut epoch, &mut falls_through);
-                        for &r in results { if func.ty(r).is_small_int() { falls_through[r.index()] = epoch; } }
+                        bump(epoch, falls_through);
+                        for &r in results { if func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; } }
                         continue;
                     }
-                    ref op if !op.is_speculable() => bump(&mut epoch, &mut falls_through),
+                    ref op if !op.is_speculable() => bump(epoch, falls_through),
                     _ => {}
                 }
                 let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
-                falls_through[result.index()] = epoch;
+                falls_through[result.index()] = *epoch;
                 let fact = match info.consts.get(result.index()).copied().flatten() {
                     Some(imm) => Fact::constant(func.ty(result), imm),
                     None => transfer::transfer(func, self, &data.op, func.ty(result), &|value| self.of(value)),
@@ -532,6 +534,10 @@ fn join_incoming_rels(
     let edges = &incoming[block.index()];
     if !complete[block.index()] || edges.len() < 2 || edges.len() > 16 || func.blocks[block.index()].params.is_empty() { return; }
     if !edges.iter().all(|&(pred, _)| exits.get(pred.index()).and_then(Option::as_ref).is_some()) { return; }
+    if !edges.iter().any(|&(pred, _)| {
+        exits[pred.index()].as_ref().is_some_and(|p| !p.rels().is_empty())
+            || matches!(func.last(pred), Some(&Op::Brif(_, then, _, otherwise, _)) if then != otherwise)
+    }) { return; }
     let edge_paths: Vec<Path> = edges.iter().map(|&(pred, _)| {
         let mut p = exits[pred.index()].clone().unwrap_or_default();
         if matches!(func.last(pred), Some(&Op::Brif(_, then, _, otherwise, _)) if then != otherwise) {
@@ -590,9 +596,9 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
         let loops = cfg.loops();
         let mut env = Env::default();
         let mut exits = exits::Exits::new(func, &cfg, (&single, entry), (loops, &incoming));
-        let mut seen = vec![false; func.types.len()];
+        let mut seen = if selects.is_empty() { Vec::new() } else { vec![false; func.types.len()] };
         for &block in &cfg.rpo {
-            for &param in &func.blocks[block.index()].params { seen[param.index()] = true; }
+            if !seen.is_empty() { for &param in &func.blocks[block.index()].params { seen[param.index()] = true; } }
             live.enter(&cfg, &selects, block);
             for each in &loops.list {
                 if each.head == block {
@@ -619,10 +625,10 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
             }
             for &inst in &func.blocks[block.index()].insts {
                 settle_one(func, (&cfg, &ranges, &env, &mut path, &mut extra, &mut dom, &live.recs, block, &seen), inst, (&mut decided, &mut compares, &mut rewrites));
-                let data = &func.insts[inst.index()];
-                if let Some(res) = data.result { seen[res.index()] = true; }
-                if let Op::Call { results, .. } = &data.op {
-                    for &res in results { seen[res.index()] = true; }
+                if !seen.is_empty() {
+                    let data = &func.insts[inst.index()];
+                    if let Some(res) = data.result { seen[res.index()] = true; }
+                    if let Op::Call { results, .. } = &data.op { for &res in results { seen[res.index()] = true; } }
                 }
             }
             exits.store(block, (path, extra, dom));

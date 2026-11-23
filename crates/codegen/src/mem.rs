@@ -202,51 +202,50 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
 }
 
 /// Gives each unique pointer that a call returns and the function stores into an entry parameter's or dominating frame's object that object as its owner, since it predates the allocation.
-fn seed_fresh_owners(func: &Function, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
-    let n = func.types.len();
-    let (mut is_malloc, mut is_free, mut called, mut from_malloc) = (vec![false; n], vec![false; n], vec![false; n], vec![false; n]);
-    for data in &func.insts {
-        match (&data.op, data.result) {
-            (&Op::Runtime(RuntimeSymbol::Malloc), Some(res)) => is_malloc[res.index()] = true,
-            (&Op::Runtime(RuntimeSymbol::Free), Some(res)) => is_free[res.index()] = true,
-            _ => {}
+fn seed_fresh_owners(func: &Function, cfg: &Cfg, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
+    let (mut mallocs, mut frees, mut called): (Vec<Value>, Vec<Value>, Vec<(Value, bool)>) = (Vec::new(), Vec::new(), Vec::new());
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let data = &func.insts[inst.index()];
+            match (&data.op, data.result) {
+                (&Op::Runtime(RuntimeSymbol::Malloc), Some(res)) => mallocs.push(res),
+                (&Op::Runtime(RuntimeSymbol::Free), Some(res)) => frees.push(res),
+                (Op::Call { callee, results, .. }, _) => {
+                    for &result in results {
+                        if func.is_unique_ptr(result) { called.push((result, false)); }
+                    }
+                    let malloc = !mallocs.is_empty() && mallocs.contains(callee);
+                    if (func.is_fresh_alloc(*callee) || malloc) && let Some(&res) = results.first() {
+                        tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(None));
+                        if malloc { called.push((res, true)); }
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    let mut any_unique = false;
-    for data in &func.insts {
-        if let Op::Call { callee, results, .. } = &data.op {
-            for &result in results {
-                if func.is_unique_ptr(result) { (called[result.index()], any_unique) = (true, true); }
-            }
-            let malloc = is_malloc[callee.index()];
-            if (func.is_fresh_alloc(*callee) || malloc) && let Some(&res) = results.first() {
-                tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(None));
-                if malloc { (called[res.index()], from_malloc[res.index()], any_unique) = (true, true, true); }
-            }
-        }
-    }
-    if !any_unique { return; }
-    let mut freed_in_non_ret = vec![false; n];
-    if func.frame_private > 0 {
-        for block in &func.blocks {
-            if block.insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Return(_))) { continue; }
-            for &inst in &block.insts {
+    if called.is_empty() { return; }
+    let mut freed_in_non_ret: Vec<Value> = Vec::new();
+    if func.frame_private > 0 && !frees.is_empty() {
+        for &b in &cfg.rpo {
+            let insts = &func.blocks[b.index()].insts;
+            if insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Return(_))) { continue; }
+            for &inst in insts {
                 if let Op::Call { callee, args, .. } = &func.insts[inst.index()].op
-                    && is_free[callee.index()] && let Some(&ptr) = args.first()
+                    && frees.contains(callee) && let Some(&ptr) = args.first() && !freed_in_non_ret.contains(&ptr)
                 {
-                    freed_in_non_ret[ptr.index()] = true;
+                    freed_in_non_ret.push(ptr);
                 }
             }
         }
     }
-    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        if let Op::Store(value, addr, _) = func.insts[inst.index()].op
-            && called[value.index()]
-            && let Some(&(owner, _)) = affine.get(addr.index())
-            && owner != value
-            && (entry.contains(&owner) || (from_malloc[value.index()] && func.is_frame_ptr(owner) && !freed_in_non_ret[owner.index()]))
-        {
-            tracked[value.index()] = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner)));
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            if let Op::Store(value, addr, _) = func.insts[inst.index()].op
+                && let Some(&(_, is_m)) = called.iter().find(|&&(v, _)| v == value)
+                && let Some(&(owner, _)) = affine.get(addr.index())
+                && owner != value && (entry.contains(&owner) || (is_m && func.is_frame_ptr(owner) && !freed_in_non_ret.contains(&owner)))
+            { tracked[value.index()] = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner))); }
         }
     }
 }
@@ -295,16 +294,17 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
     let mut tracked = vec![TrackRoot::Unset; func.types.len()];
     seed_entry_roots(func, cfg, &mut tracked);
     let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
-    seed_fresh_owners(func, entry, affine, &mut tracked);
+    seed_fresh_owners(func, cfg, entry, affine, &mut tracked);
     let mut has_caller_loc = seed_thread_cells(func, &mut tracked);
-    let rank = Cfg::ranks(&cfg.rpo, func.blocks.len());
+    let rank = (cfg.rpo.len() > 1).then(|| Cfg::ranks(&cfg.rpo, func.blocks.len()));
     let mut need_fixpoint = false;
     for &b in &cfg.rpo {
-        let br = rank[b.index()];
+        let br = rank.as_ref().map_or(0, |r| r[b.index()]);
         let insts = &func.blocks[b.index()].insts;
         for &inst in insts {
             track_def(func, inst, &mut tracked, affine);
             if !need_fixpoint
+                && rank.is_some()
                 && let Some(res) = func.insts[inst.index()].result
                 && tracked[res.index()] == TrackRoot::Unset
                 && is_derived_i64(&func.insts[inst.index()].op, func.ty(res))
@@ -312,7 +312,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
                 need_fixpoint = true;
             }
         }
-        if let Some(&last) = insts.last() {
+        if let (Some(rank), Some(&last)) = (&rank, insts.last()) {
             match &func.insts[last.index()].op {
                 Op::Jump(t, args) if !args.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *t, args) && rank[t.index()] <= br => need_fixpoint = true,
                 Op::Brif(_, t, ta, f, fa) if !ta.is_empty() || !fa.is_empty() => {
@@ -369,11 +369,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
 fn step_affine(op: &Op, out: &[(Value, i64)], consts: &[Option<i64>], types: &[Type]) -> Option<(Value, i64)> {
     match *op {
         Op::Binary(Binary::Iadd, a, b) => {
-            let (base, k) = if let Some(k) = consts[b.index()] {
-                (a, k)
-            } else {
-                (b, consts[a.index()]?)
-            };
+            let (base, k) = consts[b.index()].map(|k| (a, k)).or_else(|| consts[a.index()].map(|k| (b, k)))?;
             let (root, off) = out[base.index()];
             off.checked_add(k).map(|total| (root, total))
         }
@@ -388,36 +384,38 @@ fn step_affine(op: &Op, out: &[(Value, i64)], consts: &[Option<i64>], types: &[T
     }
 }
 
-pub(crate) fn compute_affine(func: &Function) -> Vec<(Value, i64)> {
+fn compute_affine_in(func: &Function, rpo: Option<&[Block]>) -> Vec<(Value, i64)> {
     let count = func.types.len();
-    let mut consts = vec![None; count];
-    let mut out: Vec<(Value, i64)> = (0..count as u32).map(|i| (Value(i), 0)).collect();
-    let mut steps = Vec::new();
-    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+    let (mut consts, mut out, mut steps, mut need_more) = (vec![None; count], (0..count as u32).map(|i| (Value(i), 0)).collect::<Vec<_>>(), Vec::new(), rpo.is_none());
+    let mut visit = |inst: Inst| {
         let data = &func.insts[inst.index()];
-        let Some(res) = data.result else { continue };
+        let Some(res) = data.result else { return };
         if let Op::Const(imm) = data.op {
             consts[res.index()] = Some(imm);
         } else if is_derived_i64(&data.op, func.ty(res)) {
+            if let Some(cand) = step_affine(&data.op, &out, &consts, &func.types) { out[res.index()] = cand; } else { need_more = true; }
             steps.push((data, res));
         }
+    };
+    match rpo {
+        Some(blocks) => blocks.iter().for_each(|b| func.blocks[b.index()].insts.iter().copied().for_each(&mut visit)),
+        None => func.blocks.iter().flat_map(|b| b.insts.iter().copied()).for_each(&mut visit),
     }
-    for _ in 0..8 {
-        let mut changed = false;
-        for &(data, res) in &steps {
-            if let Some(cand) = step_affine(&data.op, &out, &consts, &func.types)
-                && cand != out[res.index()]
-            {
-                out[res.index()] = cand;
-                changed = true;
+    if need_more && !steps.is_empty() {
+        for _ in 0..7 {
+            let mut changed = false;
+            for &(data, res) in &steps {
+                if let Some(cand) = step_affine(&data.op, &out, &consts, &func.types) && cand != out[res.index()] {
+                    (out[res.index()], changed) = (cand, true);
+                }
             }
-        }
-        if !changed {
-            break;
+            if !changed { break; }
         }
     }
     out
 }
+
+pub(crate) fn compute_affine(func: &Function) -> Vec<(Value, i64)> { compute_affine_in(func, None) }
 
 impl Provenance {
     /// The coroutine frame runtime that `callee` names, if any: `Malloc` writes no memory the function can read, and `Free` writes only the block it frees.
@@ -426,7 +424,7 @@ impl Provenance {
     }
 
     fn build(func: &Function, cfg: &Cfg, (is_spill, positions): (Option<&[bool]>, bool), affine: Option<Vec<(Value, i64)>>) -> Self {
-        let affine = affine.unwrap_or_else(|| compute_affine(func));
+        let affine = affine.unwrap_or_else(|| compute_affine_in(func, Some(&cfg.rpo)));
         let (tracked, has_caller_loc) = compute_tracked_roots(func, cfg, &affine);
         let mut prov = Self::from_roots(func, cfg, &tracked, has_caller_loc, affine);
         let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, is_spill);

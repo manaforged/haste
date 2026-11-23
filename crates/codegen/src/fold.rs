@@ -628,14 +628,21 @@ impl Fold {
     }
 
     fn entry_guards(&mut self, func: &mut Function, reachable: &[bool], pinned: &[bool]) -> bool {
-        let (cfg, def_blocks) = (func.cfg(), func.def_blocks());
-        self.defs = defs(func);
+        if func.blocks.len() <= 1 { return false; }
         let env = crate::cse::CmpEnv { defs: &self.defs, consts: &self.consts, subst: &self.subst, bool_val: None };
+        let has_cmp = |b: usize| reachable[b] && !pinned[b] && func.blocks[b].insts.iter().any(|&inst| match func.insts[inst.index()].op {
+            Op::Trapz(c) => extract_cmp(func, &env, c).is_some(),
+            Op::Brif(c, tb, _, eb, _) if tb != eb => extract_cmp(func, &env, c).is_some(),
+            _ => false,
+        });
+        let want: Vec<bool> = (0..func.blocks.len()).map(has_cmp).collect();
+        if !want.iter().any(|&w| w) { return false; }
+        let (cfg, def_blocks) = (func.cfg(), func.def_blocks());
         let mut incoming: Vec<Vec<(Block, Vec<Value>)>> = vec![Vec::new(); func.blocks.len()];
-        for (b, _) in reachable.iter().enumerate().filter(|(_, live)| **live) { for_edges(func, b, |t, a| incoming[t.index()].push((Block(b as u32), a.to_vec()))); }
+        for (b, _) in reachable.iter().enumerate().filter(|(_, live)| **live) { for_edges(func, b, |t, a| if want[t.index()] { incoming[t.index()].push((Block(b as u32), a.to_vec())); }); }
         let mut changed = false;
         for (b, edges) in incoming.iter().enumerate() {
-            if !reachable[b] || pinned[b] || edges.is_empty() { continue; }
+            if !want[b] || edges.is_empty() { continue; }
             let (block, params, mut drop) = (Block(b as u32), &func.blocks[b].params, Vec::new());
             for &inst in &func.blocks[b].insts {
                 let (cond, brif) = match func.insts[inst.index()].op { Op::Trapz(c) => (c, None), Op::Brif(c, tb, ref ta, eb, ref ea) if tb != eb => (c, Some((tb, ta.clone(), eb, ea.clone()))), _ => continue };
@@ -664,13 +671,12 @@ pub(crate) fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(
     }
 }
 
-/// The entry and every block a call enters, whose parameters are not edge arguments.
 fn pinned(func: &Function, entry: Block) -> Vec<bool> {
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
     for block in 0..func.blocks.len() as u32 {
         match func.last(Block(block)) {
-            Some(Op::TryCall { normal, handler, .. }) => { pinned[normal.index()] = true; pinned[handler.index()] = true; }
+            Some(Op::TryCall { normal, handler, .. }) => (pinned[normal.index()], pinned[handler.index()]) = (true, true),
             Some(Op::BrTable(_, d, t)) => { pinned[d.index()] = true; t.iter().for_each(|x| pinned[x.index()] = true); }
             _ => {}
         }
@@ -678,7 +684,6 @@ fn pinned(func: &Function, entry: Block) -> Vec<bool> {
     pinned
 }
 
-/// Drops the parameters `fold` replaced, and their arguments on every edge.
 fn drop_params(func: &mut Function, fold: &Fold) {
     let gone = |param: &Value| fold.subst[param.index()] != *param;
     let blocks = &func.blocks;
@@ -724,7 +729,7 @@ fn rewrite_folded_inst(func: &mut Function, fold: &Fold, inst: Inst) -> bool {
         _ => vector::vec_zero_fold(func, fold, &func.insts[inst.index()].op, func.insts[inst.index()].result)
             .or_else(|| func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const)),
     };
-    if let Some(op) = replacement && func.insts[inst.index()].op != op { func.insts[inst.index()].op = op; changed = true; }
+    if let Some(op) = replacement && func.insts[inst.index()].op != op { (func.insts[inst.index()].op, changed) = (op, true); }
     changed
 }
 
@@ -791,5 +796,4 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     if crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func) { unused::dead(func); changed = true; }
     if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }
 }
-
 pub(crate) use crate::ir::compact;
