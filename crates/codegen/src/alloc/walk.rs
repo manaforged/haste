@@ -36,7 +36,7 @@ pub(super) fn weights(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elid
     weight
 }
 
-pub(super) fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], blocks: Option<&[u64]>, three_address: bool) -> (Option<Vec<Vec<Value>>>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
+pub(super) fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], blocks: Option<&[u64]>) -> (Option<Vec<Vec<Value>>>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
     let rank = cfg.is_none().then(|| Cfg::ranks(order, func.blocks.len()));
     let is_back = |src: Block, target: Block| match (cfg, rank.as_deref()) {
         (Some(cfg), _) => cfg.reachable[src.index()] && cfg.dominates(target, src),
@@ -70,7 +70,7 @@ pub(super) fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], bl
     let mut edge_args = Vec::new();
     let mut out = cfg.is_some().then(|| vec![Vec::new(); func.types.len()]);
     for (back, _, p, a) in edges {
-        if (back || incoming[p] == 1 || (three_address && uses[a] == copied[a])) && !back_args.contains(&(p, a)) { back_args.push((p, a)); }
+        if (back || incoming[p] == 1 || uses[a] == copied[a]) && !back_args.contains(&(p, a)) { back_args.push((p, a)); }
         if cfg.is_some() && !back && !edge_args.contains(&(p, a)) { edge_args.push((p, a)); }
         if let Some(partners) = out.as_mut() {
             let (pv, av) = (Value(p as u32), Value(a as u32));
