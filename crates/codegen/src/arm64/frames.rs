@@ -1,5 +1,6 @@
-use super::asm::{Cond, Label, Mem, Reg, Size};
+use super::asm::{Cond, Label, Mem, Reg, SP, Size};
 use super::{A, Emit, IP, T};
+use crate::alloc::Location;
 use crate::ir::{Op, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
 
@@ -30,11 +31,13 @@ impl Emit<'_> {
         at
     }
 
-    pub(super) fn thread_cell_cold(&mut self, lookup: u32, args: &[Value]) -> bool {
-        let [slot, size, init] = *args else { return false };
-        if !args.iter().all(|&a| self.plan.is_static(a)) {
+    pub(super) fn thread_cell_cold(&mut self, callee: Value, args: &[Value]) -> bool {
+        if !self.tlv_cells {
             return false;
         }
+        let Some((lookup, [slot, size, init])) = crate::alloc::cold_thread_cell(self.func, (callee, args), &self.plan.through, &self.plan.locations, &self.plan.elided) else {
+            return false;
+        };
         let Some(target_sym) = self.thread_cell_sym(slot, lookup) else { return false };
         let (cold, back) = (self.asm.label(), self.asm.label());
         let at = self.emit_tlv_base();
@@ -90,11 +93,37 @@ impl Emit<'_> {
             match call {
                 ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]) => {
                     self.asm.bind(cold);
+                    let saved: Vec<Reg> = super::REGS.leaf.iter().copied()
+                        .filter(|&r| !super::REGS.preserved_clobbers.contains(&r) && self.plan.locations.iter().any(|loc| matches!(loc, Location::Reg(at) if *at == r)))
+                        .collect();
+                    let alloc = (saved.len().div_ceil(2) * 16) as u32;
+                    if alloc > 0 {
+                        self.asm.add_imm(true, false, Size::X, SP, SP, alloc);
+                        let mut i = 0;
+                        while i + 1 < saved.len() {
+                            self.asm.stp_offset(saved[i], saved[i + 1], SP, (i * 8) as i32);
+                            i += 2;
+                        }
+                        if i < saved.len() {
+                            self.asm.store(Size::X, Mem::new(SP, (i * 8) as i32), saved[i]);
+                        }
+                    }
                     self.raw(Reg(0), slot);
                     self.raw(Reg(1), size);
                     self.raw(Reg(2), init);
                     let reloc = self.asm.call_direct_symbol(lookup, true, T);
                     self.relocs.push(reloc);
+                    if alloc > 0 {
+                        let mut i = 0;
+                        while i + 1 < saved.len() {
+                            self.asm.ldp_offset(saved[i], saved[i + 1], SP, (i * 8) as i32);
+                            i += 2;
+                        }
+                        if i < saved.len() {
+                            self.asm.load(Size::X, false, saved[i], Mem::new(SP, (i * 8) as i32));
+                        }
+                        self.asm.add_imm(false, false, Size::X, SP, SP, alloc);
+                    }
                     self.asm.b(back);
                 }
                 ColdCall::FrameAlloc(cold, back, bytes) => {

@@ -17,6 +17,7 @@ pub(crate) struct Regs<R: 'static> {
     pub leaf: &'static [R],
     pub wide_scratch: &'static [R],
     pub op_scratch: &'static [R],
+    pub preserved_clobbers: &'static [R],
     pub scratch_mask: fn(&Function, &Op) -> u8,
     pub dict: Option<R>,
     pub float: &'static [u8],
@@ -477,16 +478,24 @@ fn eligible(live: &Live, wanted: &[bool], value: usize) -> bool {
     wanted[value] && !live.ranges_of(value).is_empty() && !crate::park::crosses_ranges(&live.unwinds, live.ranges_of(value))
 }
 
+fn preserved_clobber_ranges(preserved_calls: &[u32]) -> Vec<crate::live::Range> {
+    preserved_calls.iter().map(|&at| crate::live::Range { start: at - 1, end: at - 1 }).collect()
+}
+
 fn int_class<'a, R: Copy + PartialEq>(
     func: &Function,
     regs: &'a Regs<R>,
     (order, copied, elided): (&[Block], &[bool], &[bool]),
     params: &[Loc<R>],
     passed: Vec<Option<(R, bool)>>,
+    preserved_calls: &[u32],
 ) -> Class<'a, R> {
     let dict = func.signature.params.iter().any(|param| param.purpose == ArgumentPurpose::Dict);
     let leaf = regs.leaf.iter().filter(|reg| !(dict && regs.dict == Some(**reg))).copied().collect();
-    let clobbers = crate::park::scratch_clobbers(func, (regs.wide_scratch, regs.op_scratch, regs.scratch_mask), (order, copied, elided));
+    let mut clobbers = crate::park::scratch_clobbers(func, (regs.wide_scratch, regs.op_scratch, regs.scratch_mask), (order, copied, elided));
+    if !preserved_calls.is_empty() && !regs.preserved_clobbers.is_empty() {
+        clobbers.push((regs.preserved_clobbers, preserved_clobber_ranges(preserved_calls)));
+    }
     let arrivals = params.iter().map(|loc| match *loc { Loc::Int(reg) => vec![reg], Loc::Pair(low, high) => vec![low, high], _ => Vec::new() }).collect();
     Class { saved: regs.saved, leaf, arrivals, passed, clobbers }
 }
@@ -527,7 +536,7 @@ fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, boo
     let clobbers = if preserved_calls.is_empty() || regs.float.is_empty() {
         Vec::new()
     } else {
-        vec![(regs.float, preserved_calls.iter().map(|&at| crate::live::Range { start: at - 1, end: at - 1 }).collect())]
+        vec![(regs.float, preserved_clobber_ranges(preserved_calls))]
     };
     Class { saved: regs.saved_float, leaf: regs.float.to_vec(), arrivals, passed, clobbers }
 }
@@ -635,7 +644,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let copies = if regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
     let hints = Hints { reuse: &reuse, weights: weights.as_deref(), partners: partners.as_deref(), back_args: &back_args, edge_args: &edge_args, park: park.as_deref(), two_address: regs.two_address, copies: &copies };
     let (passed_ints, passed_floats) = hints::passed(func, classify, regs.high_product);
-    let (homes, used) = allocate(func, &live, &int_class(func, regs, (order, copied, &elided), params, passed_ints), &ints, &hints);
+    let (homes, used) = allocate(func, &live, &int_class(func, regs, (order, copied, &elided), params, passed_ints, &live.preserved_calls), &ints, &hints);
     place(&mut locations, homes, Location::Reg);
     for (v, loc) in promoted_consts.into_iter().map(|(v, i)| (v, Location::Imm(i))).chain(promoted_syms) {
         if !matches!(locations[v], Location::Reg(_)) {

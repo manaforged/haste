@@ -34,6 +34,7 @@ const V1: Vreg = Vreg(1);
 
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 const OP_SCRATCH: [Reg; 3] = [D, S, T];
+const PRESERVED_CLOBBERS: [Reg; 2] = [Reg(0), LR];
 
 const fn make_regs(scratch_mask: fn(&Function, &Op) -> u8) -> Regs<Reg> {
     Regs {
@@ -42,6 +43,7 @@ const fn make_regs(scratch_mask: fn(&Function, &Op) -> u8) -> Regs<Reg> {
         leaf: &[Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(8), D, S, T, Reg(14), Reg(15), LR],
         wide_scratch: &WIDE_SCRATCH,
         op_scratch: &OP_SCRATCH,
+        preserved_clobbers: &PRESERVED_CLOBBERS,
         scratch_mask,
         dict: None,
         float: &float::POOL,
@@ -86,7 +88,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let lse = target.os == Os::Darwin;
     let regs = if lse { &REGS_LSE } else { &REGS };
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (target.effort == crate::Effort::Full, false), |sig| classify(sig, packing))?;
+    let tlv_cells = target.direct_calls && target.os == Os::Darwin;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (target.effort == crate::Effort::Full, tlv_cells), |sig| classify(sig, packing))?;
     let func = split.as_ref().unwrap_or(func);
     let defs = crate::fold::defs(func);
     let dropped = |plan: &crate::alloc::Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
@@ -121,7 +124,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         next: None,
         copied,
         direct_calls: target.direct_calls,
-        tlv_cells: target.direct_calls && target.os == Os::Darwin,
+        tlv_cells,
         lse: target.os == Os::Darwin,
         sp_bias: 0,
         shrink,
@@ -688,11 +691,8 @@ impl Emit<'_> {
         }
         let direct = self.plan.through[callee.index()];
         if !is_try {
-            let inlined = match direct {
-                Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => self.thread_cell_cold(lookup, args),
-                Some(CallTarget::Runtime(rt)) => self.cached_frame_cold(rt, args),
-                _ => false,
-            };
+            let inlined = self.thread_cell_cold(callee, args)
+                || matches!(direct, Some(CallTarget::Runtime(rt)) if self.cached_frame_cold(rt, args));
             if inlined {
                 self.clobber_call_spills();
                 return Ok(abi);
