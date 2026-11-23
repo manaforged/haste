@@ -100,7 +100,6 @@ pub(crate) struct Plan<R> {
     pub sib: Vec<Option<Sib>>,
     pub elided: Vec<bool>,
     pub zero_ext: Vec<bool>,
-    pub density: Vec<u64>,
     /// The summed block-weighted accesses of the register candidates left in stack slots.
     pub spill_cost: u64,
     pub hoist: hoist::Hoist<R>,
@@ -611,7 +610,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
     (order, copied, weighed, preserve_tc): (&[Block], &[bool], bool, bool),
-    (params, split): (&[Loc<R>], &[(Value, u64)]),
+    params: &[Loc<R>],
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Plan<R> {
     let count = func.types.len();
@@ -653,8 +652,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         let (cold, slow) = slow_blocks(func, cfg, loops);
         block_weights(&loops.depths, (&cold, &slow))
     });
-    let natural = blocks.as_deref().map(|blocks| walk::weights(func, blocks, eff));
-    let weights = natural.clone().map(|natural| walk::inherit(natural, &live, split));
+    let weights = blocks.as_deref().map(|blocks| walk::weights(func, blocks, eff));
     let (partners, back_args, edge_args) = if weighed { walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref()) } else { (None, Vec::new(), Vec::new()) };
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
     let copies = if weighed && regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
@@ -684,7 +682,6 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let shared = webs.map_or_else(Vec::new, |webs| crate::color::share(func, &live, &locations, &deferred, &webs));
     let zero_ext = if regs.call_zext && hints::has_reg_reduce(func, &locations) { hints::zero_ext(func, &locations, &census, true) } else { zero_ext };
-    let density = weights.as_deref().map_or_else(Vec::new, |weights| walk::densities(weights, &live));
     if crate::trace::enabled() {
         crate::trace::on_alloc(func, &live, (0..count).filter(|&value| ints[value]).map(|value| (value, matches!(locations[value], Location::Slot))));
         if let (Some(loops), Some(blocks)) = (loops, blocks.as_deref()) {
@@ -692,9 +689,9 @@ pub(crate) fn plan<R: Copy + PartialEq>(
             crate::trace::on_edge_copies(func, &live, blocks, |value| if let Location::Reg(reg) = locations[value] { Some(reg) } else { None });
         }
     }
-    let spill_cost = natural.map_or(0, |natural| (0..count).filter(|&v| (ints[v] || floats[v]) && matches!(locations[v], Location::Slot)).map(|v| natural[v]).sum());
+    let spill_cost = weights.map_or(0, |weights| (0..count).filter(|&v| (ints[v] || floats[v]) && matches!(locations[v], Location::Slot)).map(|v| weights[v]).sum());
     let hoist = if weighed { hoist::Hoist::new(func, &live, &locations) } else { hoist::Hoist::empty() };
-    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, density, spill_cost, hoist }
+    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, spill_cost, hoist }
 }
 
 impl<R: Copy> Plan<R> {

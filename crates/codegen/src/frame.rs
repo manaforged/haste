@@ -539,18 +539,17 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
     (weighed, preserve_tc): (bool, bool),
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<(Option<Function>, Prepared<R>), String> {
-    let first = prepare(func, regs, (weighed, preserve_tc), &classify, &[])?;
+    let first = prepare(func, regs, (weighed, preserve_tc), &classify)?;
     if !weighed {
         return Ok((None, first));
     }
     let plan = &first.plan;
-    let carried = |made: &[(Value, Value, Block)]| -> Vec<(Value, u64)> { made.iter().map(|&(param, origin, _)| (param, plan.density.get(origin.index()).copied().unwrap_or(0))).collect() };
     let mut split = func.clone();
     let made = crate::loopargs::run(&mut split, |_, v| v.index() < plan.locations.len() && matches!(plan.location(v), Location::Slot) && !plan.elided[v.index()] && !plan.fused[v.index()]);
     if made.is_empty() {
         return Ok((None, first));
     }
-    let second = prepare(&split, regs, (weighed, preserve_tc), &classify, &carried(&made))?;
+    let second = prepare(&split, regs, (weighed, preserve_tc), &classify)?;
     let kept: Vec<(Block, Value)> = made.iter().filter(|&&(param, _, _)| matches!(second.plan.location(param), Location::Reg(_) | Location::Float(_))).map(|&(_, origin, head)| (head, origin)).collect();
     if crate::trace::enabled() {
         crate::trace::on_split(&made, &kept);
@@ -562,8 +561,8 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
         return Ok((None, first));
     }
     let mut pruned = func.clone();
-    let made = crate::loopargs::run(&mut pruned, |head, v| kept.contains(&(head, v)));
-    let third = prepare(&pruned, regs, (weighed, preserve_tc), &classify, &carried(&made))?;
+    let _ = crate::loopargs::run(&mut pruned, |head, v| kept.contains(&(head, v)));
+    let third = prepare(&pruned, regs, (weighed, preserve_tc), &classify)?;
     Ok(if third.plan.spill_cost < first.plan.spill_cost { (Some(pruned), third) } else { (None, first) })
 }
 
@@ -572,12 +571,11 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
     regs: &Regs<R>,
     (weighed, preserve_tc): (bool, bool),
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
-    split: &[(Value, u64)],
 ) -> Result<Prepared<R>, String> {
     let order = if weighed { crate::live::order(func) } else { crate::live::quick_order(func) };
     let copied = if weighed { crate::live::copied_tests(func, &order) } else { vec![false; func.insts.len()] };
     let abi = classify(&func.signature)?;
-    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed, preserve_tc), (&abi.params, split), &classify);
+    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed, preserve_tc), &abi.params, &classify);
     let saves = saved(func, &plan.used, regs.saved);
     let float_saves = saved(func, &plan.used_floats, regs.saved_float);
     let (frame, framed) = build_frame(func, (saves, float_saves), &plan, &abi, &classify)?;
