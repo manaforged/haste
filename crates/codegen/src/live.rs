@@ -13,6 +13,10 @@ pub(crate) fn carry_out_of_pair(func: &Function, insts: &[Inst], pos: usize) -> 
 
 pub(crate) fn cold(func: &Function) -> Vec<bool> {
     let cfg = func.cfg();
+    cold_with(func, &cfg)
+}
+
+fn cold_with(func: &Function, cfg: &Cfg) -> Vec<bool> {
     let mut cold = vec![true; func.blocks.len()];
     let mut work = Vec::new();
     for b in 0..func.blocks.len() {
@@ -164,11 +168,20 @@ fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[b
     deferred
 }
 
+/// Returns `(cold, deferred)` blocks for `func` using precomputed `cfg` and `loops`.
+pub(crate) fn cold_and_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops) -> (Vec<bool>, Vec<bool>) {
+    let cold = cold_with(func, cfg);
+    let mut is_latch = vec![false; func.blocks.len()];
+    loops.list.iter().flat_map(|each| &each.latches).for_each(|latch| is_latch[latch.index()] = true);
+    let deferred = call_detours(func, cfg, loops, &cold, &is_latch);
+    (cold, deferred)
+}
+
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
     let cfg = func.cfg();
     let loops = cfg.loops();
-    let cold = cold(func);
+    let cold = cold_with(func, &cfg);
     let mut is_latch = vec![false; func.blocks.len()];
     loops.list.iter().flat_map(|each| &each.latches).for_each(|latch| is_latch[latch.index()] = true);
     let deferred = call_detours(func, &cfg, loops, &cold, &is_latch);

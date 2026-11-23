@@ -496,14 +496,15 @@ fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, boo
     Class { saved: regs.saved_float, leaf: regs.float.to_vec(), arrivals, passed, clobbers: Vec::new() }
 }
 
+const BASE_WEIGHT: u64 = 8;
 const LOOP_WEIGHT: u64 = 16;
 const MAX_DEPTH: u32 = 4;
 const SLOW_SHARE: u64 = 16;
 
-fn slow_blocks(func: &Function, cfg: &Cfg, loops: &Loops) -> Vec<bool> {
+fn slow_blocks(func: &Function, cfg: &Cfg, loops: &Loops) -> (Vec<bool>, Vec<bool>) {
     let count = func.blocks.len();
     let calls: Vec<bool> = func.blocks.iter().map(|data| data.insts.iter().any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. } | Op::Copy(..)))).collect();
-    let mut slow = vec![false; count];
+    let (cold, mut slow) = crate::live::cold_and_detours(func, cfg, loops);
     for each in &loops.list {
         let mut spine = vec![0_usize; count];
         for &latch in &each.latches {
@@ -526,11 +527,21 @@ fn slow_blocks(func: &Function, cfg: &Cfg, loops: &Loops) -> Vec<bool> {
             }
         }
     }
-    slow
+    (cold, slow)
 }
 
-fn block_weights(depths: &[u32], slow: &[bool]) -> Vec<u64> {
-    depths.iter().zip(slow).map(|(&depth, &slow)| (LOOP_WEIGHT.pow(depth.min(MAX_DEPTH)) / if slow { SLOW_SHARE } else { 1 }).max(1)).collect()
+fn block_weights(depths: &[u32], (cold, slow): (&[bool], &[bool])) -> Vec<u64> {
+    depths
+        .iter()
+        .enumerate()
+        .map(|(i, &depth)| {
+            if cold[i] {
+                1
+            } else {
+                (BASE_WEIGHT * LOOP_WEIGHT.pow(depth.min(MAX_DEPTH)) / if slow[i] { SLOW_SHARE } else { 1 }).max(1)
+            }
+        })
+        .collect()
 }
 
 fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl Fn(F) -> Location<R>) {
@@ -572,7 +583,10 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
-    let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
+    let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| {
+        let (cold, slow) = slow_blocks(func, cfg, loops);
+        block_weights(&loops.depths, (&cold, &slow))
+    });
     let natural = blocks.as_deref().map(|blocks| walk::weights(func, blocks, eff));
     let weights = natural.clone().map(|natural| walk::inherit(natural, &live, split));
     let (partners, back_args, edge_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref());

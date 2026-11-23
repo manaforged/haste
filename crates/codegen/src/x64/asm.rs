@@ -230,6 +230,7 @@ pub(crate) struct Asm {
     pub(super) fixups: Vec<Fixup>,
     pub(super) table_fixups: Vec<(u32, Label, Label)>,
     pub(super) tail: Option<super::imm::Tail>,
+    pub(super) zeros: Option<super::imm::PendingZeros>,
     /// The offset and symbol of each `rip`-relative displacement, holding its addend.
     pub(super) rips: Vec<(u32, u32)>,
 }
@@ -696,11 +697,13 @@ impl Asm {
 
     /// `call` through the eight bytes at the 32-bit absolute address `at`.
     pub fn call_absolute(&mut self, at: i32) {
+        self.flags_overwritten();
         self.code.extend([0xFF, 0x14, 0x25]);
         self.code.extend(at.to_le_bytes());
     }
 
     pub fn call_slot_reloc(&mut self) -> u32 {
+        self.flags_overwritten();
         self.code.extend([0xFF, 0x14, 0x25]);
         let at = self.pos();
         self.code.extend(0_u32.to_le_bytes());
@@ -708,6 +711,7 @@ impl Asm {
     }
 
     pub fn call_pcrel32(&mut self) -> u32 {
+        self.flags_overwritten();
         self.code.push(0xE8);
         let at = self.pos();
         self.code.extend(0_u32.to_le_bytes());
@@ -715,10 +719,12 @@ impl Asm {
     }
 
     pub fn call(&mut self, reg: Reg) {
+        self.flags_overwritten();
         self.encode(&[], false, &[0xFF], 2, reg.into(), false);
     }
 
     pub fn jmp_reg(&mut self, reg: Reg) {
+        self.flags_overwritten();
         self.encode(&[], false, &[0xFF], 4, reg.into(), false);
     }
 
@@ -733,6 +739,7 @@ impl Asm {
 
     pub fn bind(&mut self, label: Label) {
         self.tail = None;
+        self.zeros = None;
         self.labels[label.0 as usize] = Some(self.pos());
     }
 
@@ -742,6 +749,7 @@ impl Asm {
     }
 
     pub fn jmp(&mut self, label: Label) {
+        self.flags_overwritten();
         self.code.push(0xE9);
         self.fixup(label, Disp::Jmp);
     }
