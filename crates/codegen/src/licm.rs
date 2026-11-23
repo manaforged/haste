@@ -463,6 +463,7 @@ const MAX_LOOP_VEC_LIVE: usize = 11;
 struct Invariants<'a> {
     prov: &'a Provenance,
     is_const: &'a mut Vec<bool>,
+    zeros: &'a [bool],
 }
 
 fn always_executes_in_loop(cfg: &Cfg, each: &Loop, blk: Block) -> bool {
@@ -538,18 +539,23 @@ fn hoist(
         let mut head_prefix = head;
         for inst in insts {
             let op = &func.insts[inst.index()].op;
-            if matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Brif(..)) {
+            let tc_res = (!inv.zeros.is_empty() && always_exec)
+                .then(|| func.pure_thread_cell_result(op, |v| inv.zeros.get(v.index()) == Some(&true)))
+                .flatten();
+            if tc_res.is_none() && matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Brif(..)) {
                 head_prefix = false;
             }
             let is_symbol = matches!(op, Op::Symbol(_));
-            let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_));
+            let static_loc = matches!(op, Op::StackAddr(..)) || (matches!(op, Op::SlotAddr(_)) && !always_exec);
             let sym_ok = !mem.calls || (always_exec && hoisted_symbols < MAX_HOISTED_SYMBOLS);
-            let res_ty = func.insts[inst.index()].result.map(|r| func.ty(r));
+            let res_val = func.insts[inst.index()].result.or(tc_res);
+            let res_ty = res_val.map(|r| func.ty(r));
             let is_vec_mat = res_ty.is_some_and(Type::in_float_register)
                 && matches!(op, Op::Insert(..) | Op::Shuffle(..) | Op::Const(_) | Op::Load(..) | Op::StackLoad(..));
             let replaces_single_use = matches!(op, Op::Insert(prev, ..) if hoisted_vec.contains(prev) && uses.as_ref().is_some_and(|u| u[prev.index()] == 1));
             let vec_ok = !is_vec_mat || replaces_single_use || vec_live + hoisted_vecs < MAX_LOOP_VEC_LIVE;
-            let movable = (op.is_speculable() && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
+            let movable = tc_res.is_some()
+                || (op.is_speculable() && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
                 || mem.can_hoist_load(func, prov, head_prefix, inst)
                 || can_hoist_global_load(func, mem, prov, head_prefix, inst);
             let mut operands_invariant = true;
@@ -559,13 +565,13 @@ fn hoist(
                 frees_operand |= loop_uses[v.index()] == 1 && !func.ty(v).in_float_register();
             });
             let adds_gp = !frees_operand && !matches!(op, Op::Const(_)) && res_ty.is_some_and(|ty| !ty.in_float_register());
-            let gp_ok = !(adds_gp && op.is_speculable() && gp_live + hoisted_gp >= MAX_LOOP_GP_LIVE)
+            let gp_ok = !(adds_gp && (op.is_speculable() || tc_res.is_some()) && gp_live + hoisted_gp >= MAX_LOOP_GP_LIVE)
                 && !(adds_gp
                     && mem.unique_heap_writes
                     && matches!(op, Op::Load(..))
                     && gp_live + hoisted_gp >= 12
                     && !mem.hoists_past_heap_writes(func, prov, head_prefix, inst));
-            if movable && vec_ok && gp_ok && operands_invariant && let Some(res) = func.insts[inst.index()].result {
+            if movable && vec_ok && gp_ok && operands_invariant && let Some(res) = res_val {
                 hoisted_gp += usize::from(adds_gp);
                 if is_symbol {
                     hoisted_symbols += 1;
@@ -727,7 +733,8 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             is_const[res.index()] = true;
         }
     }
-    let mut inv = Invariants { prov: &prov, is_const: &mut is_const };
+    let zeros = func.thread_cell_zeros();
+    let mut inv = Invariants { prov: &prov, is_const: &mut is_const, zeros: &zeros };
     let mut dirty = Domain::NONE;
     let mut made = Vec::new();
     for idx in 0..found.list.len() {
