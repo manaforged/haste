@@ -735,13 +735,14 @@ fn run_slot_splits(func: &mut Function, scan: &mut Scan, moves: Moves) -> bool {
     split_changed
 }
 
-pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
+pub(crate) fn step(func: &mut Function, moves: Moves, effort: crate::Effort) -> Domain {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return Domain::NONE;
     };
-    let params = crate::copy::forward_param_slots(func);
-    let returned = crate::copy::forward_sret_slot(func);
-    let join_changed = pre_split(func, moves) | cold_copy::run(func);
+    let opt = effort == crate::Effort::Full;
+    let params = opt && crate::copy::forward_param_slots(func);
+    let returned = opt && crate::copy::forward_sret_slot(func);
+    let join_changed = pre_split(func, moves) | (opt && cold_copy::run(func));
     let mut scan = Scan::new(func);
     let (mut splits, mut copy_splits, mut dropped_zero) = (Vec::new(), Vec::new(), false);
     if has_open_move(func, &scan) {
@@ -753,7 +754,7 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     }
     let split_changed = run_slot_splits(func, &mut scan, moves);
     let changed = (scan.any_promotable() && promote(func, entry, scan)) || join_changed || split_changed || dropped_zero;
-    crate::copy::rejoin(func, &splits);
+    crate::copy::rejoin(func, &splits, opt);
     let all_copies_rejoined = subword::rejoin_copies(func, &copy_splits);
     let cfg = if returned { Domain::CFG } else { Domain::NONE };
     if changed || returned || params || !all_copies_rejoined { Domain::MEM | Domain::VALUES | cfg } else { Domain::NONE }

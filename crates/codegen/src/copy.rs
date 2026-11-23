@@ -95,7 +95,7 @@ fn pairs(func: &mut Function, (to, from, pieces): (Value, Value, Vec<(Type, u32)
 }
 
 /// Turns back into its move each split whose loads and stores all still stand together, each store writing the word its load read.
-pub(crate) fn rejoin(func: &mut Function, splits: &[Split]) {
+pub(crate) fn rejoin(func: &mut Function, splits: &[Split], forward_sret: bool) {
     for split in splits {
         let insts = &func.blocks[split.block].insts;
         let Some(at) = insts.iter().position(|inst| Some(inst) == split.pairs.first()) else { continue };
@@ -104,7 +104,13 @@ pub(crate) fn rejoin(func: &mut Function, splits: &[Split]) {
         func.insts[split.original.index()].op = Op::Move(ends.0, ends.1, bytes);
         func.blocks[split.block].insts.splice(at..at + split.pairs.len(), [split.original]);
     }
-    forward_sret_calls(func);
+    if forward_sret {
+        forward_sret_calls(func);
+    }
+}
+
+fn has_sret_move(func: &Function, sret_ptr: Value) -> bool {
+    crate::schedule::has_live_op(func, |op| matches!(*op, Op::Move(dst, _, _) | Op::Copy(dst, _, _) if dst == sret_ptr))
 }
 
 /// The entry block, incoming `StructReturn` pointer and its size, when the function has one noalias return pointer and slots that could stand for it.
@@ -121,7 +127,7 @@ fn sret_param(func: &Function) -> Option<(Block, Value, u32)> {
         return None;
     }
     let sret_ptr = *func.blocks[entry.index()].params.get(sret_idx)?;
-    Some((entry, sret_ptr, sret_abi.deref_bytes))
+    has_sret_move(func, sret_ptr).then_some((entry, sret_ptr, sret_abi.deref_bytes))
 }
 
 /// Forwards a function's incoming `StructReturn` pointer directly into a non-aliased callee `StructReturn` temporary slot when the slot is copied out intact.
@@ -186,7 +192,7 @@ enum Edge {
 fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) -> Vec<(Block, Vec<(Block, Edge, Value)>)> {
     let info = collect_sret_info(func, entry);
     let mut splits = Vec::new();
-    for &(join, pos, copy) in &info.uses_by_val[sret_ptr.index()] {
+    for &(join, pos, copy) in info.uses_of(sret_ptr) {
         let data = &func.blocks[join.index()];
         let ([param], [_, ret], 0) = (&data.params[..], &data.insts[..], pos) else { continue };
         if !matches!(func.insts[ret.index()].op, Op::Return(ref values) if values.is_empty()) || move_to_sret_src(func, &info.defs, copy, sret_ptr, bytes) != Some(*param) {
@@ -198,7 +204,7 @@ fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32)
         };
         let mut edges = Vec::new();
         let mut all = true;
-        for &pred in &info.preds[join.index()] {
+        for &pred in info.preds_of(join) {
             let found: Vec<(Edge, Option<Value>)> = match func.last(pred) {
                 Some(Op::Jump(target, args)) if *target == join => vec![(Edge::Jump, slot_arg(args))],
                 Some(Op::Brif(_, then, then_args, other, other_args)) => {
@@ -307,7 +313,7 @@ fn rejoin_returns(func: &mut Function, split: &[SplitReturn]) -> bool {
 fn sret_slot_plan(func: &Function, entry: Block, sret_ptr: Value, bytes: u32) -> Option<(StackSlot, Vec<(Block, Inst)>)> {
     let info = collect_sret_info(func, entry);
     let mut copies = Vec::new();
-    for &(block, pos, inst) in &info.uses_by_val[sret_ptr.index()] {
+    for &(block, pos, inst) in info.uses_of(sret_ptr) {
         if let Some(slot) = move_to_sret_src(func, &info.defs, inst, sret_ptr, bytes).and_then(|src| resolve_slot(func, &info.defs, src)) {
             copies.push((slot, block, pos, inst));
         }
@@ -384,11 +390,25 @@ fn retarget_slot(func: &mut Function, slot: StackSlot, sret_ptr: Value, moves: &
 
 struct SretUseInfo {
     defs: Vec<Option<Inst>>,
-    uses_by_val: Vec<Vec<(Block, usize, Inst)>>,
-    preds: Vec<Vec<Block>>,
+    uses_off: Vec<u32>,
+    uses_flat: Vec<(Block, usize, Inst)>,
+    preds_off: Vec<u32>,
+    preds_flat: Vec<Block>,
     reachable: Vec<bool>,
     bad_slots: Vec<bool>,
     slot_addrs: Vec<Vec<(Block, Inst, Value)>>,
+}
+
+impl SretUseInfo {
+    fn uses_of(&self, v: Value) -> &[(Block, usize, Inst)] {
+        let i = v.index();
+        &self.uses_flat[self.uses_off[i] as usize..self.uses_off[i + 1] as usize]
+    }
+
+    fn preds_of(&self, b: Block) -> &[Block] {
+        let i = b.index();
+        &self.preds_flat[self.preds_off[i] as usize..self.preds_off[i + 1] as usize]
+    }
 }
 
 struct SretCandidate {
@@ -422,6 +442,7 @@ fn remove_inst_in_block(func: &mut Function, block: Block, inst: Inst) {
 
 fn collect_sret_info(func: &Function, entry: Block) -> SretUseInfo {
     let nblocks = func.blocks.len();
+    let nvals = func.types.len();
     let mut reachable = vec![false; nblocks];
     let mut work = vec![entry];
     reachable[entry.index()] = true;
@@ -433,43 +454,53 @@ fn collect_sret_info(func: &Function, entry: Block) -> SretUseInfo {
             }
         }
     }
-    let mut defs = vec![None; func.types.len()];
-    let mut uses_by_val = vec![Vec::new(); func.types.len()];
-    let mut preds = vec![Vec::new(); nblocks];
+    let mut defs = vec![None; nvals];
+    let mut uses_off = vec![0u32; nvals + 1];
+    let mut preds_off = vec![0u32; nblocks + 1];
     let mut bad_slots = vec![false; func.slots.len()];
     let mut slot_addrs = vec![Vec::new(); func.slots.len()];
     for (bi, block) in func.blocks.iter().enumerate() {
-        if !reachable[bi] {
-            continue;
-        }
+        if !reachable[bi] { continue; }
         let b = Block(bi as u32);
-        for succ in func.successors(b) {
-            preds[succ.index()].push(b);
-        }
-        for (pos, &inst) in block.insts.iter().enumerate() {
+        func.successors(b).for_each(|s| preds_off[s.index() + 1] += 1);
+        for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            if let Some(res) = data.result {
-                defs[res.index()] = Some(inst);
-            }
+            if let Some(res) = data.result { defs[res.index()] = Some(inst); }
             match &data.op {
                 Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) => bad_slots[slot.index()] = true,
-                Op::StackAddr(slot, off) => {
-                    if *off != 0 {
-                        bad_slots[slot.index()] = true;
-                    } else if let Some(res) = data.result {
-                        slot_addrs[slot.index()].push((b, inst, res));
-                    }
-                }
+                Op::StackAddr(slot, off) if *off != 0 => bad_slots[slot.index()] = true,
+                Op::StackAddr(slot, _) => if let Some(res) = data.result { slot_addrs[slot.index()].push((b, inst, res)); }
                 _ => {}
             }
-            data.op.for_operands(|v| uses_by_val[v.index()].push((b, pos, inst)));
+            data.op.for_operands(|v| uses_off[v.index() + 1] += 1);
         }
     }
-    SretUseInfo { defs, uses_by_val, preds, reachable, bad_slots, slot_addrs }
+    for i in 1..=nvals { uses_off[i] += uses_off[i - 1]; }
+    for i in 1..=nblocks { preds_off[i] += preds_off[i - 1]; }
+    let mut uses_flat = vec![(Block(0), 0usize, Inst(0)); uses_off[nvals] as usize];
+    let mut preds_flat = vec![Block(0); preds_off[nblocks] as usize];
+    let (mut uses_cur, mut preds_cur) = (uses_off[..nvals].to_vec(), preds_off[..nblocks].to_vec());
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if !reachable[bi] { continue; }
+        let b = Block(bi as u32);
+        for succ in func.successors(b) {
+            let idx = preds_cur[succ.index()] as usize;
+            preds_flat[idx] = b;
+            preds_cur[succ.index()] = (idx + 1) as u32;
+        }
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            func.insts[inst.index()].op.for_operands(|v| {
+                let idx = uses_cur[v.index()] as usize;
+                uses_flat[idx] = (b, pos, inst);
+                uses_cur[v.index()] = (idx + 1) as u32;
+            });
+        }
+    }
+    SretUseInfo { defs, uses_off, uses_flat, preds_off, preds_flat, reachable, bad_slots, slot_addrs }
 }
 
 fn find_sret_candidate(func: &Function, info: &SretUseInfo, sret_ptr: Value, bytes: u32) -> Option<SretCandidate> {
-    let sret_uses = &info.uses_by_val[sret_ptr.index()];
+    let sret_uses = info.uses_of(sret_ptr);
     for &(b, move_pos, move_inst) in sret_uses {
         if !info.reachable[b.index()] {
             continue;
@@ -522,13 +553,13 @@ fn resolve_slot(func: &Function, defs: &[Option<Inst>], mut val: Value) -> Optio
 }
 
 fn sret_ptr_clean_before(info: &SretUseInfo, sret_uses: &[(Block, usize, Inst)], block: Block, move_pos: usize) -> bool {
-    let mut can_reach = vec![false; info.preds.len()];
-    let mut stack = info.preds[block.index()].clone();
+    let mut can_reach = vec![false; info.reachable.len()];
+    let mut stack = info.preds_of(block).to_vec();
     for &p in &stack {
         can_reach[p.index()] = true;
     }
     while let Some(cur) = stack.pop() {
-        for &p in &info.preds[cur.index()] {
+        for &p in info.preds_of(cur) {
             if !can_reach[p.index()] {
                 can_reach[p.index()] = true;
                 stack.push(p);
@@ -573,7 +604,7 @@ fn exclusive_slot_insts(
     let mut saw_move = false;
     while i < derived.len() {
         let v = derived[i];
-        for &(ub, _, uinst) in &info.uses_by_val[v.index()] {
+        for &(ub, _, uinst) in info.uses_of(v) {
             if uinst == call_inst {
                 let Op::Call { callee, args, .. } = &func.insts[call_inst.index()].op else {
                     return None;
@@ -651,7 +682,7 @@ fn accesses_at(func: &Function, info: &SretUseInfo, mut addrs: Vec<Value>, skip:
         if addrs[..at - 1].contains(&addr) {
             continue;
         }
-        for &(block, pos, user) in &info.uses_by_val[addr.index()] {
+        for &(block, pos, user) in info.uses_of(addr) {
             if skip.iter().any(|&(_, inst)| inst == user) {
                 continue;
             }

@@ -342,10 +342,21 @@ fn adt_may_have_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
 
 /// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    if ty == Ty::NONE || !adt_may_have_drop(cx, ty)? {
+    if ty == Ty::NONE || !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
         return Ok(false);
     }
-    with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
+    let cacheable = !cx.types.has_var_flag(ty) && !cx.types.has_params(ty);
+    if cacheable
+        && let Some(known) = cx.store.lookups.own_drops.get(&ty)
+    {
+        return Ok(known);
+    }
+    let before = cx.quiet_mark();
+    let has = adt_may_have_drop(cx, ty)? && with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))?;
+    if cacheable && cx.quiet_mark() == before {
+        cx.store.lookups.own_drops.insert(ty, has);
+    }
+    Ok(has)
 }
 
 /// The `Drop::drop` of `ty`'s own `Drop` impl, which for a `Box` frees the allocation without dropping what it owns.

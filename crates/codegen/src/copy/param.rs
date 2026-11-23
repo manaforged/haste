@@ -13,10 +13,17 @@ pub(crate) fn forward_param_slots(func: &mut Function) -> bool {
     changed
 }
 
+fn has_entry_param_copy(func: &Function, entry: Block, params: &[(Value, u32)]) -> bool {
+    func.blocks[entry.index()].insts.iter().any(|&inst| match func.insts[inst.index()].op {
+        Op::Load(from, _) | Op::Move(_, from, _) => params.iter().any(|&(p, _)| p == from),
+        _ => false,
+    })
+}
+
 /// A slot that nothing writes but stores in the entry block that copy each byte from the same offset of one read-only, unaliased parameter, with that parameter and those stores.
 fn param_slot_plan(func: &Function, entry: Block) -> Option<(StackSlot, Value, Vec<(Block, Inst)>)> {
     let params: Vec<(Value, u32)> = func.blocks[entry.index()].params.iter().zip(&func.signature.params).filter(|(_, abi)| abi.noalias && abi.readonly && abi.deref_bytes > 0).map(|(&value, abi)| (value, abi.deref_bytes)).collect();
-    if params.is_empty() {
+    if params.is_empty() || !has_entry_param_copy(func, entry, &params) {
         return None;
     }
     let info = collect_sret_info(func, entry);

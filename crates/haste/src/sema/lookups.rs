@@ -148,6 +148,7 @@ pub(super) struct Lookups {
     pub(super) attrs: Table<ItemRef, ActiveAttrs>,
     pub(super) state: Arc<OutlineState>,
     pub(super) drops: Table<ty::Ty, bool>,
+    pub(super) own_drops: Table<ty::Ty, bool>,
     pub(super) unpins: Table<ty::Ty, (bool, u32)>,
     pub(super) freezes: Table<ty::Ty, (bool, u32)>,
     pub(super) glues: Table<ty::Ty, Option<infer::Res>>,
@@ -410,6 +411,7 @@ impl Cache {
 impl Lookups {
     fn forget_edited<F: Fn(ItemRef) -> bool>(&mut self, edited: Edited<'_>, naming: &mut Naming<'_, F>, mine: &F, block_kept: &dyn Fn(&impls::ImplRef) -> bool) {
         self.drops.retain(|ty, _| !naming.names(*ty));
+        self.own_drops.retain(|ty, _| !naming.names(*ty));
         self.unpins.retain(|ty, _| !naming.names(*ty));
         self.freezes.retain(|ty, _| !naming.names(*ty));
         self.glues.retain(|ty, _| !naming.names(*ty));

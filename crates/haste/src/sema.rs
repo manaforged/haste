@@ -69,6 +69,7 @@ pub struct Context<'a> {
     crate_heads: Vec<Option<Arc<impls::Index>>>,
     headers_local: HashMap<impls::ImplRef, Arc<sig::ImplHeader>>,
     trait_members_local: std::cell::RefCell<HashMap<ItemRef, Arc<HashMap<&'a str, ItemRef>>>>,
+    pub(crate) ty_facts: HashMap<ty::Ty, u128>,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
@@ -109,6 +110,7 @@ impl<'a> Context<'a> {
         self.impl_members.clear();
         self.aliases.clear();
         self.eval_errors.clear();
+        self.ty_facts.clear();
     }
 
     /// A pass over an outline and its resolved names that reuses `store`.
@@ -140,6 +142,7 @@ impl<'a> Context<'a> {
             crate_heads: vec![None; outline.crates.len()],
             headers_local: HashMap::default(),
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
+            ty_facts: HashMap::default(),
         }
     }
 
@@ -170,6 +173,7 @@ impl<'a> Context<'a> {
             crate_heads: vec![None; crates],
             headers_local: HashMap::default(),
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
+            ty_facts: HashMap::default(),
         }
     }
 
