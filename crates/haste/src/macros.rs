@@ -369,8 +369,16 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
         .iter()
         .zip(inputs)
         .map(|(&(call, _, caller), texts)| {
-            let caller_pin = if caller == usize::MAX { Some(0) } else { outline.pins[caller] };
-            Some(store::Expansion::new((outline.pins[call.krate as usize]?, caller_pin?), &macro_name(outline, call), texts))
+            let macro_pin = outline.pins[call.krate as usize]?;
+            let caller_pin = if caller == usize::MAX {
+                0
+            } else if let Some(pin) = outline.pins[caller] {
+                pin
+            } else {
+                use std::hash::BuildHasher as _;
+                rustc_hash::FxBuildHasher.hash_one((0x6c6f_6361_6c5f_7069_u64, caller_vars(outline, caller)))
+            };
+            Some(store::Expansion::new((macro_pin, caller_pin), &macro_name(outline, call), texts))
         })
         .collect();
     let mut results: Vec<Option<Result<String, String>>> = vec![None; keys.len()];

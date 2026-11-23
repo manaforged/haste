@@ -45,6 +45,16 @@ impl PreBuilders {
     }
 }
 
+pub(crate) fn cache_with_substrate(workspace: &graph::Workspace, warm_sysroot_bodies: bool) -> (Option<SubstrateSlot>, Cache) {
+    let slot = open_batch_substrate(workspace);
+    let mut cache = Cache::default();
+    cache.set_warm_sysroot_bodies(warm_sysroot_bodies);
+    if let Some(sub) = slot.as_ref().and_then(SubstrateSlot::top) {
+        cache.set_substrate(Some(sub));
+    }
+    (slot, cache)
+}
+
 pub(crate) fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
     if !enabled() {
         return None;

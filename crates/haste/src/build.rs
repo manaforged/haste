@@ -19,7 +19,7 @@ pub(crate) mod substrate;
 mod test_args;
 mod watch;
 
-use substrate::{SubstrateSlot, export_pre_summaries, open_batch_substrate, save_batch_substrate};
+use substrate::{SubstrateSlot, cache_with_substrate, export_pre_summaries, save_batch_substrate};
 use test_args::parse_test_args;
 use watch::{Stamp, Watch, body_edits, edits, paths, pre_stamps, stamps};
 
@@ -264,12 +264,7 @@ impl Batch {
         let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
         let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, kind) };
-        let mut substrate = open_batch_substrate(workspace);
-        let mut cache = Cache::default();
-        cache.set_warm_sysroot_bodies(mode != crate::image::ImageMode::Check);
-        if let Some(sub) = substrate.as_ref().and_then(SubstrateSlot::top) {
-            cache.set_substrate(Some(sub));
-        }
+        let (mut substrate, cache) = cache_with_substrate(workspace, mode != crate::image::ImageMode::Check);
         let batch = crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
@@ -695,7 +690,8 @@ impl Build {
             Some(program) => program,
             None => {
                 let main = require_main(workspace, &self.compilation.outline)?;
-                Program::new(&mut self.compilation, Cache::default(), main)?
+                let (_, cache) = cache_with_substrate(workspace, true);
+                Program::new(&mut self.compilation, cache, main)?
             }
         };
         let program = self.program.insert(program);
@@ -721,25 +717,27 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
 }
 
 fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], ahead: Option<&mut crate::prep::Ahead>) -> Result<i32> {
-    let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
+    let use_prep = crate::profile() == Profile::Release && crate::prep::prepared();
+    let mut compilation = if use_prep { crate::macros::load_eager(workspace, targets, &[])? } else { crate::macros::load_lazy(workspace, targets)? };
     let main = require_main(workspace, &compilation.outline)?;
-    if crate::profile() == Profile::Release && crate::prep::prepared() {
+    if use_prep {
         bind_prepped(workspace, &mut compilation, args, ahead);
     }
+    let (_, cache) = cache_with_substrate(workspace, true);
     let status = match crate::image::watch::enabled() {
-        true => run_watched(workspace, &mut compilation, main, args),
-        false => crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args),
+        true => run_watched(workspace, &mut compilation, cache, main, args),
+        false => crate::image::run_on_demand(&mut compilation, (cache, main), args),
     };
     std::mem::forget(compilation);
     status
 }
 
 /// Runs the binary's `main` with `args` as argv like `run_on_demand`, while it watches the local source files and swaps in the function bodies an edit changes.
-fn run_watched(workspace: &graph::Workspace, compilation: &mut Compilation, main: ItemRef, args: &[String]) -> Result<i32> {
+fn run_watched(workspace: &graph::Workspace, compilation: &mut Compilation, cache: Cache, main: ItemRef, args: &[String]) -> Result<i32> {
     let mut watched = stamps(workspace, &compilation.outline);
     let files = paths(&watched);
     let mut reread = |compilation: &mut Compilation| body_edits(workspace, &mut watched, &mut compilation.outline);
-    let mut program = Program::new(compilation, Cache::default(), main)?;
+    let mut program = Program::new(compilation, cache, main)?;
     let status = program.run_watched(compilation, args, (files, &mut reread));
     std::mem::forget(program);
     status

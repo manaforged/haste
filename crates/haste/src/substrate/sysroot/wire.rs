@@ -21,7 +21,6 @@ use super::tokens::{
 use super::{CrateIdentity, HEADER_LEN, SYSROOT_MAGIC, SYSROOT_VERSION, identity_of, match_crates};
 
 const FIXED_SYM_COUNT: u32 = 23;
-const CHECKSUM_K: u64 = 0x517cc1b727220a95;
 
 pub(super) struct Tables<'a> {
     to_local: Vec<Option<u32>>,
@@ -161,58 +160,6 @@ fn read_file_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<(usize
     Ok(entries.into_iter().map(|(s, e, base)| (blob_off + s, &blob[s..e], base)).collect())
 }
 
-#[inline]
-fn u64_le(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes([
-        bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3],
-        bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7],
-    ])
-}
-
-#[inline]
-fn mix64(acc: u64, word: u64) -> u64 {
-    (acc.rotate_left(5) ^ word).wrapping_mul(CHECKSUM_K)
-}
-
-fn hash_chunk(chunk: &[u8]) -> u64 {
-    let mut h0: u64 = 0x9e3779b97f4a7c15;
-    let mut h1: u64 = 0xbf58476d1ce4e5b9;
-    let mut h2: u64 = 0x94d049bb133111eb;
-    let mut h3: u64 = CHECKSUM_K;
-    let mut blocks = chunk.chunks_exact(32);
-    for b in &mut blocks {
-        h0 = mix64(h0, u64_le(b, 0));
-        h1 = mix64(h1, u64_le(b, 8));
-        h2 = mix64(h2, u64_le(b, 16));
-        h3 = mix64(h3, u64_le(b, 24));
-    }
-    let mut tail = blocks.remainder();
-    while tail.len() >= 8 {
-        h0 = mix64(h0, u64_le(tail, 0));
-        tail = &tail[8..];
-    }
-    for &byte in tail {
-        h0 = mix64(h0, u64::from(byte));
-    }
-    let mut acc = (chunk.len() as u64).wrapping_mul(CHECKSUM_K);
-    acc = mix64(acc, h0);
-    acc = mix64(acc, h1);
-    acc = mix64(acc, h2);
-    acc = mix64(acc, h3);
-    acc ^ (acc >> 32)
-}
-
-fn payload_checksum(payload: &[u8]) -> u64 {
-    const CHUNK: usize = 1024 * 1024;
-    let chunks: Vec<&[u8]> = payload.chunks(CHUNK).collect();
-    let hashes = crate::sync::parallel_map(chunks, hash_chunk);
-    let mut acc = (payload.len() as u64).wrapping_mul(CHECKSUM_K);
-    for h in hashes {
-        acc = mix64(acc, h);
-    }
-    acc ^ (acc >> 32)
-}
-
 pub(super) fn encode_sysroot(key: u64, workspace: &Workspace, compilation: &Compilation, sysroot_crates: &[usize]) -> Option<Vec<u8>> {
     let mut tables = Tables::new(compilation.outline.crates.len(), sysroot_crates, &compilation.names.symbols);
     let (crate_ends, crates_blob) = write_chunked(sysroot_crates, |buf, &krate| {
@@ -247,7 +194,7 @@ pub(super) fn encode_sysroot(key: u64, workspace: &Workspace, compilation: &Comp
     write_u32(&mut out, SYSROOT_VERSION);
     write_u32(&mut out, u32::try_from(sysroot_crates.len()).ok()?);
     write_u64(&mut out, key);
-    let checksum_at = out.len();
+    let len_at = out.len();
     write_u64(&mut out, 0);
 
     for &krate in sysroot_crates {
@@ -292,8 +239,9 @@ pub(super) fn encode_sysroot(key: u64, workspace: &Workspace, compilation: &Comp
         write_u32(&mut out, end);
     }
     out.extend_from_slice(&names_blob);
-    let checksum = payload_checksum(&out[HEADER_LEN..]);
-    out[checksum_at..checksum_at + 8].copy_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&SYSROOT_MAGIC);
+    let total_len = out.len() as u64;
+    out[len_at..len_at + 8].copy_from_slice(&total_len.to_le_bytes());
     Some(out)
 }
 
@@ -478,8 +426,8 @@ pub(super) fn decode_sysroot(
     if cur.u64()? != expected_key {
         return Ok(None);
     }
-    let expected_checksum = cur.u64()?;
-    if payload_checksum(&data[HEADER_LEN..]) != expected_checksum {
+    let expected_len = cur.u64()?;
+    if expected_len != data.len() as u64 || data.len() < HEADER_LEN + SYSROOT_MAGIC.len() || &data[data.len() - SYSROOT_MAGIC.len()..] != SYSROOT_MAGIC {
         return Ok(None);
     }
 
@@ -510,7 +458,7 @@ pub(super) fn decode_sysroot(
 
     let outline_slices = read_slices(&mut cur, crate_count)?;
     let name_slices = read_slices(&mut cur, crate_count)?;
-    if cur.pos != data.len() {
+    if cur.take(SYSROOT_MAGIC.len())? != SYSROOT_MAGIC || cur.pos != data.len() {
         bail!("trailing bytes in sysroot cache");
     }
 
