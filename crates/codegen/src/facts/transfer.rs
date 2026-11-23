@@ -6,6 +6,7 @@ use super::{Fact, Ranges, compared_range, swapped, unsigned_order};
 pub(super) type Of<'a> = &'a dyn Fn(Value) -> Fact;
 
 /// Returns the base pointer dereferenced within page zero by `op`, proving it nonzero when `op` runs.
+#[inline]
 pub(crate) fn deref_ptr(op: &Op) -> Option<Value> {
     match *op {
         Op::Load(addr, off) | Op::Store(_, addr, off) if (0..4096).contains(&off) => Some(addr),
@@ -34,16 +35,17 @@ pub(super) fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: 
     }
 }
 
-/// Raises the lower bound of a dereferenced pointer marked at `epoch` in `falls_through` to 1, returning whether it narrowed.
-pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> bool {
-    let Some(addr) = deref_ptr(op) else { return false };
+/// Raises the lower bound of a dereferenced pointer marked at `epoch` in `falls_through` to 1, returning it when narrowed.
+#[inline]
+pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> Option<Value> {
+    let addr = deref_ptr(op)?;
     let idx = addr.index();
     let (lo, hi) = &mut table[idx];
     if *lo == 0 && *hi != 0 && func.ty(addr) == Type::I64 && falls_through[idx] == epoch {
         *lo = 1;
-        return true;
+        return Some(addr);
     }
-    false
+    None
 }
 
 #[inline]

@@ -213,8 +213,9 @@ fn narrow_stores(
     if candidates.is_empty() {
         return false;
     }
-    let loops = cfg.loops();
     let n = func.blocks.len();
+    let mut loops = None;
+    let (mut visited, mut pass, mut kills) = (Vec::new(), Vec::new(), Vec::new());
     let mut changed = false;
     for (b_s, store_inst) in candidates {
         let Some(pos_s) = func.blocks[b_s.index()].insts.iter().position(|&i| i == store_inst) else {
@@ -229,9 +230,14 @@ fn narrow_stores(
         if !tail_is_cl_clean(func, prov, zeros, is_cl, b_s, pos_s) {
             continue;
         }
-        let mut visited = vec![false; n];
-        let mut pass = vec![false; n];
-        let mut kills = vec![false; n];
+        let loops = loops.get_or_insert_with(|| cfg.loops());
+        if visited.is_empty() {
+            (visited, pass, kills) = (vec![false; n], vec![false; n], vec![false; n]);
+        } else {
+            visited.fill(false);
+            pass.fill(false);
+            kills.fill(false);
+        }
         let mut obs: Vec<(Block, usize, usize, bool)> = Vec::new();
         let mut work: Vec<Block> = Vec::new();
         push_unvisited_succs(func, b_s, &mut visited, &mut work);
@@ -345,8 +351,9 @@ fn narrow_saves(
     if candidates.is_empty() {
         return false;
     }
-    let loops = cfg.loops();
     let n = func.blocks.len();
+    let mut loops = None;
+    let (mut visited, mut pass, mut restores) = (Vec::new(), Vec::new(), Vec::new());
     let mut changed = false;
     for (b_l, load_inst) in candidates {
         let Some(pos_l) = func.blocks[b_l.index()].insts.iter().position(|&i| i == load_inst) else {
@@ -365,9 +372,14 @@ fn narrow_saves(
         if !tail_is_cl_clean(func, prov, zeros, is_cl, b_l, pos_l) {
             continue;
         }
-        let mut visited = vec![false; n];
-        let mut pass = vec![false; n];
-        let mut restores = vec![false; n];
+        let loops = loops.get_or_insert_with(|| cfg.loops());
+        if visited.is_empty() {
+            (visited, pass, restores) = (vec![false; n], vec![false; n], vec![false; n]);
+        } else {
+            visited.fill(false);
+            pass.fill(false);
+            restores.fill(false);
+        }
         let mut dirty: Vec<(Block, usize, usize)> = Vec::new();
         let mut work: Vec<Block> = Vec::new();
         push_unvisited_succs(func, b_l, &mut visited, &mut work);
@@ -640,19 +652,28 @@ fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl:
     if defs_list.is_empty() {
         return changed;
     }
-    let mut cl_slot = vec![u32::MAX; func.types.len()];
-    for (idx, &(res, ..)) in defs_list.iter().enumerate() {
-        cl_slot[res.index()] = idx as u32;
-    }
+    let defs_mask = defs_list.iter().fold(0_u128, |m, &(res, ..)| m | (1_u128 << (res.0 & 127)));
+    let cl_slot = (defs_list.len() > 8).then(|| {
+        let mut map = vec![u32::MAX; func.types.len()];
+        for (idx, &(res, ..)) in defs_list.iter().enumerate() {
+            map[res.index()] = idx as u32;
+        }
+        map
+    });
     let mut all_use_blocks: Vec<Vec<Block>> = vec![Vec::new(); defs_list.len()];
     let mut all_ok = vec![true; defs_list.len()];
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
             let op = &func.insts[inst.index()].op;
             op.for_operands(|v| {
-                let slot = cl_slot.get(v.index()).copied().unwrap_or(u32::MAX);
-                if slot != u32::MAX {
-                    let si = slot as usize;
+                if defs_mask & (1_u128 << (v.0 & 127)) == 0 {
+                    return;
+                }
+                let slot = match &cl_slot {
+                    Some(map) => map.get(v.index()).copied().filter(|&s| s != u32::MAX).map(|s| s as usize),
+                    None => defs_list.iter().position(|&(res, ..)| res == v),
+                };
+                if let Some(si) = slot {
                     if all_ok[si] {
                         let valid = matches!(*op, Op::Load(a, 0) if a == v)
                             || matches!(*op, Op::Store(val, a, 0) if a == v && val != v);

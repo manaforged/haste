@@ -77,7 +77,9 @@ impl Path {
     }
 
     pub(super) fn add_with_backprop(&mut self, func: &Function, ranges: &Ranges, value: Value, fact: Fact, depth: u8) {
-        self.add(ranges, value, fact);
+        if !self.add(ranges, value, fact) {
+            return;
+        }
         let merged = self.fact(ranges, value);
         if depth >= 3 || merged.lo > merged.hi {
             return;
@@ -243,7 +245,7 @@ impl Path {
 
     fn min_reachable_hi(&self, ranges: &Ranges, ty: Type, start: Value) -> u64 {
         let mut best = self.fact(ranges, start).hi;
-        if self.rels().is_empty() {
+        if !self.steps_from(ty, start, UNSIGNED) {
             return best;
         }
         self.walk(ty, start, UNSIGNED, |next, next_strict| {
@@ -293,7 +295,7 @@ impl Path {
                 let mut rhs_hi = None;
                 let (steps, len) = self.non_wrap_iadd_chain(func, ranges, lhs, ty);
                 for &(s_base, k) in &steps[..len] {
-                    if self.reaches_in(*from_x.get_or_insert_with(|| self.reached(ty, x, UNSIGNED)), s_base) {
+                    if x == s_base || self.reaches_in(*from_x.get_or_insert_with(|| self.reached(ty, x, UNSIGNED)), s_base) {
                         let rhi = *rhs_hi.get_or_insert_with(|| self.min_reachable_hi(ranges, ty, rhs));
                         if let Some(bound) = k.checked_add(extra).and_then(|d| rhi.checked_sub(d)) {
                             hi = hi.min(bound);
@@ -325,8 +327,23 @@ impl Path {
         }
         let (b_steps, b_len) = if b_is_add { self.non_wrap_iadd_chain(func, ranges, b, ty) } else { ([(b, 0); CHAIN_STEPS], 0) };
         let need_uppers = has_u && (multi || into_b);
+        if !need_uppers {
+            if b_len == 0 || (!multi && !b_steps[..b_len].iter().any(|&(_, k)| k > 0)) {
+                return false;
+            }
+            for &(a_base, c) in a_forms {
+                let mut from_a = None;
+                for &(b_base, k) in &b_steps[..b_len] {
+                    let ok_k = if c <= k { !(strict && c == k) } else { false };
+                    if ok_k && (a_base == b_base || self.reaches_in(*from_a.get_or_insert_with(|| self.reached(ty, a_base, UNSIGNED)), b_base)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
         let mut uppers = self.uppers.0.borrow_mut();
-        let (values, any_add) = if need_uppers { uppers.of(func, ranges, self.rels(), ty) } else { (&mut [][..], false) };
+        let (values, any_add) = uppers.of(func, ranges, self.rels(), ty);
         if !multi && b_len == 0 && !(into_b && any_add) {
             return false;
         }
@@ -368,8 +385,8 @@ impl Path {
                     return false;
                 };
                 (s == b || into_b)
-                    && self.reaches_in(*from_a.get_or_insert_with(|| self.reached(ty, a_base, UNSIGNED)), s_base)
-                    && self.reaches(ty, s, b, UNSIGNED, require_strict)
+                    && (a_base == s_base || self.reaches_in(*from_a.get_or_insert_with(|| self.reached(ty, a_base, UNSIGNED)), s_base))
+                    && (if s == b { !require_strict } else { self.reaches(ty, s, b, UNSIGNED, require_strict) })
             };
             for &(b_base, k) in &b_steps[..b_len] {
                 if try_term(b, b_base, k) {

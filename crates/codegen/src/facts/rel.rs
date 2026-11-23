@@ -137,10 +137,10 @@ impl Path {
     }
 
     /// Records `fact` on `value`, forgetting the oldest fact past `MAX_FACTS`.
-    pub(super) fn add(&mut self, ranges: &Ranges, value: Value, fact: Fact) {
+    pub(super) fn add(&mut self, ranges: &Ranges, value: Value, fact: Fact) -> bool {
         let cur = self.fact(ranges, value);
         if cur.subsumes(&fact) {
-            return;
+            return false;
         }
         let merged = cur.meet(&fact);
         let bit = val_bit(value);
@@ -163,6 +163,7 @@ impl Path {
             self.fact_mask |= bit;
         }
         self.uppers.clear();
+        true
     }
 
     fn push_rel(&mut self, rel: Rel) {
@@ -355,6 +356,9 @@ impl Path {
 
     /// Walks once from `start` and keeps every value it steps to.
     pub(super) fn reached(&self, ty: Type, start: Value, kinds: (RelKind, RelKind)) -> Reached {
+        if !self.steps_from(ty, start, kinds) {
+            return Reached { start, ends: 0 };
+        }
         let mut ends = 0_u128;
         self.walk_rels(ty, start, kinds, |idx, next, _| {
             ends |= 1_u128 << (2 * idx + usize::from(next != self.rels[idx].rhs));
@@ -447,9 +451,9 @@ impl Path {
         }
         let (mut from_a, mut from_b) = (None, None);
         self.rels.iter().filter(|r| r.kind == RelKind::Ne && r.ty == ty).any(|r| {
-            let at_a = *from_a.get_or_insert_with(|| self.reached(ty, a, EQUAL));
-            let mut at_b = |target| self.reaches_in(*from_b.get_or_insert_with(|| self.reached(ty, b, EQUAL)), target);
-            (self.reaches_in(at_a, r.lhs) && at_b(r.rhs)) || (self.reaches_in(at_a, r.rhs) && at_b(r.lhs))
+            let mut at_a = |target| a == target || self.reaches_in(*from_a.get_or_insert_with(|| self.reached(ty, a, EQUAL)), target);
+            let mut at_b = |target| b == target || self.reaches_in(*from_b.get_or_insert_with(|| self.reached(ty, b, EQUAL)), target);
+            (at_a(r.lhs) && at_b(r.rhs)) || (at_a(r.rhs) && at_b(r.lhs))
         })
     }
 

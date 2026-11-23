@@ -312,6 +312,35 @@ fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[S
 }
 
 fn sink_pure_defs_into(func: &mut Function, from: Block, to: Block) {
+    let mut cand_mask = 0_u128;
+    let mut any_cand = false;
+    for &inst in &func.blocks[from.index()].insts {
+        let data = &func.insts[inst.index()];
+        if let Some(res) = data.result
+            && data.op.is_speculable()
+            && !matches!(data.op, Op::Const(_))
+        {
+            cand_mask |= 1_u128 << (res.0 & 127);
+            any_cand = true;
+        }
+    }
+    if !any_cand {
+        return;
+    }
+    let mut used_in_to_any = false;
+    for &inst in &func.blocks[to.index()].insts {
+        func.insts[inst.index()].op.for_operands(|v| {
+            if cand_mask & (1_u128 << (v.0 & 127)) != 0 {
+                used_in_to_any = true;
+            }
+        });
+        if used_in_to_any {
+            break;
+        }
+    }
+    if !used_in_to_any {
+        return;
+    }
     let mut uses = func.use_counts();
     let mut to_move = Vec::new();
     for &inst in &func.blocks[to.index()].insts {

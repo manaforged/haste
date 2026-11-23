@@ -179,19 +179,22 @@ struct CfgInfo<'a> {
     consts: &'a [Option<i64>],
     incoming: &'a [Vec<(Block, &'a [Value])>],
     complete: &'a [bool],
+    edge_args: &'a [bool],
     single: &'a [Option<Block>],
     idom: &'a [Option<Block>],
 }
 
-fn collect_incoming(func: &Function) -> (Vec<Vec<(Block, &[Value])>>, Vec<bool>) {
-    if !func.blocks.iter().any(|b| !b.params.is_empty()) { return (Vec::new(), Vec::new()); }
-    let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
+fn collect_incoming<'a>(func: &'a Function) -> (Vec<Vec<(Block, &'a [Value])>>, Vec<bool>, Vec<bool>) {
+    if !func.blocks.iter().any(|b| !b.params.is_empty()) { return (Vec::new(), Vec::new(), Vec::new()); }
+    let mut incoming: Vec<Vec<(Block, &'a [Value])>> = vec![Vec::new(); func.blocks.len()];
     let mut complete = vec![true; func.blocks.len()];
+    let mut edge_args = vec![false; func.types.len()];
     for pred_idx in 0..func.blocks.len() {
         let pred = Block(pred_idx as u32);
-        let mut edge = |target: Block, args| {
+        let mut edge = |target: Block, args: &'a [Value]| {
             if !func.blocks[target.index()].params.is_empty() {
                 incoming[target.index()].push((pred, args));
+                for &a in args { edge_args[a.index()] = true; }
             }
         };
         match func.last(pred) {
@@ -200,24 +203,20 @@ fn collect_incoming(func: &Function) -> (Vec<Vec<(Block, &[Value])>>, Vec<bool>)
                 edge(*then, then_args.as_slice());
                 edge(*otherwise, else_args.as_slice());
             }
-            _ => {
-                for target in func.successors(pred) {
-                    complete[target.index()] = false;
-                }
-            }
+            _ => { for target in func.successors(pred) { complete[target.index()] = false; } }
         }
     }
-    (incoming, complete)
+    (incoming, complete, edge_args)
 }
 
 impl<'a> Ranges<'a> {
     /// The ranges of `func`'s values over the blocks of `order`, with the constants `consts` an earlier fold found.
     pub(crate) fn new(func: &Function, parts: (&'a [Option<Inst>], &[Option<i64>]), blocks: (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
-        let (incoming, complete) = collect_incoming(func);
-        Self::over(func, parts, blocks, (&incoming, &complete))
+        let (incoming, complete, edge_args) = collect_incoming(func);
+        Self::over(func, parts, blocks, (&incoming, &complete, &edge_args))
     }
 
-    fn over(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>]), (incoming, complete): (&[Vec<(Block, &[Value])>], &[bool])) -> Self {
+    fn over(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>]), (incoming, complete, edge_args): (&[Vec<(Block, &[Value])>], &[bool], &[bool])) -> Self {
         let mut table: Vec<(u64, u64)> = func.types.iter().map(|ty| (0, ty.unsigned_max())).collect();
         if let Some(entry) = func.entry {
             for (&param, abi) in func.blocks[entry.index()].params.iter().zip(&func.signature.params) {
@@ -227,7 +226,7 @@ impl<'a> Ranges<'a> {
             }
         }
         let mut ranges = Self { defs, table, raised: Vec::new() };
-        let info = CfgInfo { consts, incoming, complete, single, idom };
+        let info = CfgInfo { consts, incoming, complete, edge_args, single, idom };
         let mut falls_through = vec![0_u32; func.types.len()];
         let mut epoch = 0_u32;
         if ranges.propagate(func, &info, order, &mut falls_through, &mut epoch) {
@@ -246,10 +245,19 @@ impl<'a> Ranges<'a> {
             let mut prev_res = None;
             for (pos, inst) in func.blocks[block.index()].insts.iter().enumerate() {
                 let data = &func.insts[inst.index()];
-                if transfer::note_deref(func, &data.op, falls_through, *epoch, &mut self.table) && (!info.incoming.is_empty() || (pos > 0 && prev_res != transfer::deref_ptr(&data.op))) { narrowed = true; }
-                prev_res = data.result;
                 match data.op {
+                    Op::Const(imm) => {
+                        prev_res = data.result;
+                        if let Some(r) = data.result && func.ty(r).is_small_int() {
+                            falls_through[r.index()] = *epoch;
+                            let u = unsigned(imm, func.ty(r));
+                            self.table[r.index()] = (u, u);
+                        }
+                        continue;
+                    }
+                    Op::Jump(..) | Op::Brif(..) | Op::Return(..) | Op::BrTable(..) | Op::Trap => { prev_res = None; continue; }
                     Op::Assume(value) => {
+                        prev_res = None;
                         let (lo, hi) = &mut self.table[value.index()];
                         if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through[value.index()] == *epoch {
                             *lo = 1;
@@ -258,22 +266,20 @@ impl<'a> Ranges<'a> {
                         continue;
                     }
                     Op::Call { ref results, .. } => {
+                        prev_res = None;
                         bump(epoch, falls_through);
                         for &r in results { if func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; } }
                         continue;
                     }
-                    ref op if !op.is_speculable() => bump(epoch, falls_through),
                     _ => {}
                 }
+                if let Some(addr) = transfer::note_deref(func, &data.op, falls_through, *epoch, &mut self.table) && (info.edge_args.get(addr.index()).copied().unwrap_or(false) || (pos > 0 && prev_res != Some(addr))) { narrowed = true; }
+                prev_res = data.result;
+                if !data.op.is_speculable() { bump(epoch, falls_through); }
                 let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
                 falls_through[result.index()] = *epoch;
                 let ty = func.ty(result);
-                if let Some(imm) = info.consts.get(result.index()).copied().flatten() {
-                    let u = unsigned(imm, ty);
-                    self.table[result.index()] = (u, u);
-                } else if let Some(pair) = transfer::fast_range(func, self, &data.op, ty) {
-                    self.table[result.index()] = pair;
-                }
+                if let Some(imm) = info.consts.get(result.index()).copied().flatten() { let u = unsigned(imm, ty); self.table[result.index()] = (u, u); } else if let Some(pair) = transfer::fast_range(func, self, &data.op, ty) { self.table[result.index()] = pair; }
             }
         }
         narrowed
@@ -595,8 +601,8 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
     let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
     let (mut decided, mut compares, mut rewrites) = (Vec::new(), Vec::new(), Vec::new());
     {
-        let (incoming, complete) = collect_incoming(func);
-        let ranges = Ranges::over(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom), (&incoming, &complete));
+        let (incoming, complete, edge_args) = collect_incoming(func);
+        let ranges = Ranges::over(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom), (&incoming, &complete, &edge_args));
         let def_blocks = std::cell::OnceCell::new();
         let mut live = live::Live::default();
         let loops = cfg.loops();
@@ -684,43 +690,21 @@ fn sub_cond_truth(func: &Function, ctx: (&Cfg, &Ranges, &Env, &Path, &ExtraPath,
 }
 
 /// Settles `inst` under `path` and moves the path past it.
-fn settle_one(
-    func: &Function,
-    (cfg, ranges, env, path, extra, dom, selects, block, seen): (&Cfg, &Ranges, &Env, &mut Path, &mut ExtraPath, &mut DomState, &[SelectRec], Block, &[bool]),
-    inst: Inst,
-    out: (&mut Vec<(Inst, Option<bool>)>, &mut Vec<(Value, bool)>, &mut Vec<(Inst, Value, Value)>),
-) {
+fn settle_one(func: &Function, (cfg, ranges, env, path, extra, dom, selects, block, seen): (&Cfg, &Ranges, &Env, &mut Path, &mut ExtraPath, &mut DomState, &[SelectRec], Block, &[bool]), inst: Inst, out: (&mut Vec<(Inst, Option<bool>)>, &mut Vec<(Value, bool)>, &mut Vec<(Inst, Value, Value)>)) {
     let data = &func.insts[inst.index()];
-    if !dom.aliases.is_empty() {
-        data.op.for_operands(|v| {
-            let mapped = dom.resolve(v);
-            if mapped != v { out.2.push((inst, v, mapped)); }
-        });
-    }
-    if !settle_value(func, (cfg, ranges, env, path, extra, dom, block), data, out.1) {
-        settle_ctrl(func, (cfg, ranges, env, path, extra, dom, selects, block, seen), inst, data, out.0);
-    }
+    if !dom.aliases.is_empty() { data.op.for_operands(|v| { let mapped = dom.resolve(v); if mapped != v { out.2.push((inst, v, mapped)); } }); }
+    if !settle_value(func, (cfg, ranges, env, path, extra, dom, block), data, out.1) { settle_ctrl(func, (cfg, ranges, env, path, extra, dom, selects, block, seen), inst, data, out.0); }
 }
 
-fn settle_value(
-    func: &Function,
-    (cfg, ranges, env, path, extra, dom, block): (&Cfg, &Ranges, &Env, &Path, &ExtraPath, &DomState, Block),
-    data: &crate::ir::InstData,
-    compares: &mut Vec<(Value, bool)>,
-) -> bool {
+fn settle_value(func: &Function, (cfg, ranges, env, path, extra, dom, block): (&Cfg, &Ranges, &Env, &Path, &ExtraPath, &DomState, Block), data: &crate::ir::InstData, compares: &mut Vec<(Value, bool)>) -> bool {
     let known = match (&data.op, data.result) {
         (&Op::Icmp(cc, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
             let (x, y) = (dom.resolve(raw_x), dom.resolve(raw_y));
             let ty = func.ty(x);
             let ctx = (cfg, ranges, env, path, extra, block);
-            decide(cc, ty, &sub_fact(func, ctx, x), &sub_fact(func, ctx, y))
-                .or_else(|| path.decide_rel(func, ranges, cc, ty, x, y))
-                .or_else(|| extra.decide(func, (cfg, ranges, env, path, block), cc, x, y))
-                .map(|b| (result, b))
+            decide(cc, ty, &sub_fact(func, ctx, x), &sub_fact(func, ctx, y)).or_else(|| path.decide_rel(func, ranges, cc, ty, x, y)).or_else(|| extra.decide(func, (cfg, ranges, env, path, block), cc, x, y)).map(|b| (result, b))
         }
-        (&Op::Fits(op, signed, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
-            fits_truth(func, ranges, path, op, signed, dom.resolve(raw_x), dom.resolve(raw_y)).map(|b| (result, b))
-        }
+        (&Op::Fits(op, signed, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => fits_truth(func, ranges, path, op, signed, dom.resolve(raw_x), dom.resolve(raw_y)).map(|b| (result, b)),
         _ => return false,
     };
     if let Some((result, b)) = known { compares.push((result, b)); }

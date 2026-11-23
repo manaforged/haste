@@ -98,6 +98,7 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
     if visited.is_empty() {
         return Some(SsaRepairPlan { need: Vec::new(), from_exit: Vec::new(), joins: Vec::new(), join_of: Vec::new() });
     }
+    let vals_mask = vals.iter().fold(0_u128, |m, &v| m | (1_u128 << (v.0 & 127)));
     let val_map = (vals.len() > 8).then(|| {
         let mut map = vec![u32::MAX; func.types.len()];
         for (idx, &v) in vals.iter().enumerate() {
@@ -112,6 +113,9 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
         let mut used_here = false;
         for &inst in &func.blocks[b.index()].insts {
             func.insts[inst.index()].op.for_operands(|op| {
+                if vals_mask & (1_u128 << (op.0 & 127)) == 0 {
+                    return;
+                }
                 let pos = match &val_map {
                     Some(map) => map.get(op.index()).copied().filter(|&p| p != u32::MAX).map(|p| p as usize),
                     None => vals.iter().position(|&v| v == op),
@@ -159,15 +163,15 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
         }
     }
     let mut join_of = vec![None; func.blocks.len()];
+    let rank = crate::cfg::Cfg::ranks(&cfg.rpo, func.blocks.len());
+    live_list.sort_unstable_by_key(|b| rank[b.index()]);
     loop {
         let mut added = false;
-        for &b in &cfg.rpo {
+        for &b in &live_list {
             let bi = b.index();
-            if !from_exit[bi] {
-                continue;
-            }
-            let doms: Vec<usize> = joins.iter().enumerate().filter(|&(_, &j)| cfg.dominates(j, b)).map(|(ji, _)| ji).collect();
-            let deepest = doms.iter().copied().find(|&ji| doms.iter().all(|&other| cfg.dominates(joins[other], joins[ji])));
+            let deepest = (0..joins.len())
+                .filter(|&ji| cfg.dominates(joins[ji], b))
+                .find(|&ji| (0..joins.len()).all(|other| !cfg.dominates(joins[other], b) || cfg.dominates(joins[other], joins[ji])));
             match deepest {
                 Some(ji) => join_of[bi] = Some(ji),
                 None => {
