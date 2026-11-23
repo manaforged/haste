@@ -438,6 +438,7 @@ impl Emit<'_> {
         if self.framed && self.base == Reg::Rsp {
             self.asm.alu_imm(Alu::Add, Reg::Rsp, self.bias + 8);
         }
+        self.asm.flags_overwritten();
         self.asm.bytes(if self.framed && self.base == Reg::Rbp { &[0xC9, 0xC3] } else { &[0xC3] });
     }
 

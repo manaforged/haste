@@ -418,7 +418,7 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
     if plan.moves == promote::Moves::Guided {
         return;
     }
-    if (plan.effort == Effort::Full || func.elide_drops) && func.elide_dead_unwind_drops_post_init() {
+    if (plan.effort == Effort::Full || func.elide_drops) && func.elide_dead_unwind_drops_post_init(true) {
         *state = PassState::new();
         run_fixpoint(func, plan, state);
     }
@@ -525,7 +525,7 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     state.merge_clean = merge_init.is_empty();
     if moves != promote::Moves::Guided
         && (plan.effort == Effort::Full || func.elide_drops)
-        && func.elide_dead_unwind_drops_post_init()
+        && func.elide_dead_unwind_drops_post_init(false)
     {
         state = PassState::new();
     }

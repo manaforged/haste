@@ -2,7 +2,7 @@ mod sink;
 
 use crate::ir::{Binary, Block, Function, Inst, Op, StackSlot, Value};
 pub(crate) use sink::sink_frontier;
-use sink::{flag_call_liveness, plan_flag_sink, plan_local_sink};
+use sink::{flag_call_liveness, plan_entry_zero_sink, plan_flag_sink, plan_local_sink};
 
 /// One stack-allocated owned value dropped during panic unwinding when its 1-byte active flag is non-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,22 +111,22 @@ impl Function {
 
     /// Removes frame-table unwind drop entries whose flag can never be active across a potentially-unwinding call.
     pub fn elide_dead_unwind_drops(&mut self, sym_may_unwind: impl FnMut(u32) -> bool) -> bool {
-        self.elide_dead_unwind_drops_inner(false, sym_may_unwind)
+        self.elide_dead_unwind_drops_inner(false, false, sym_may_unwind)
     }
 
-    /// Post-optimization unwind-drop cleanup that preserves or re-emits entry zero-initialization for every surviving flag.
-    pub(crate) fn elide_dead_unwind_drops_post_init(&mut self) -> bool {
+    /// Post-optimization unwind-drop cleanup that preserves or re-emits entry zero-initialization for every surviving flag, optionally sinking entry zeros onto cold unwind-call frontiers.
+    pub(crate) fn elide_dead_unwind_drops_post_init(&mut self, sink_zeros: bool) -> bool {
         if self.no_unwind_syms.is_empty() {
-            return self.elide_dead_unwind_drops_inner(true, |_| true);
+            return self.elide_dead_unwind_drops_inner(true, sink_zeros, |_| true);
         }
         let mut no_unwind = std::mem::take(&mut self.no_unwind_syms);
         no_unwind.sort_unstable();
-        let changed = self.elide_dead_unwind_drops_inner(true, |sym| no_unwind.binary_search(&sym).is_err());
+        let changed = self.elide_dead_unwind_drops_inner(true, sink_zeros, |sym| no_unwind.binary_search(&sym).is_err());
         self.no_unwind_syms = no_unwind;
         changed
     }
 
-    fn elide_dead_unwind_drops_inner(&mut self, post_init: bool, mut sym_may_unwind: impl FnMut(u32) -> bool) -> bool {
+    fn elide_dead_unwind_drops_inner(&mut self, post_init: bool, sink_zeros: bool, mut sym_may_unwind: impl FnMut(u32) -> bool) -> bool {
         let Some(entry) = self.entry else { return false };
         if self.coroutine.is_some() || self.unwind_drops.is_empty() {
             return false;
@@ -200,8 +200,62 @@ impl Function {
             .collect();
         let folded = fold_known_flag_loads(self, entry, (&defs, &kinds, &slot_escaped, &mut slot_loaded));
         let narrowed = narrow_unwind_drops(self, entry, post_init, (&defs, &kinds, &addr_slot, &slot_escaped, &slot_loaded, &local_write_only));
-        self.unwind_drops.len() != before || folded || narrowed
+        let sunk_zeros = sink_zeros && sink_entry_zeros(self, entry, (&slot_escaped, &slot_loaded), &mut sym_may_unwind);
+        self.unwind_drops.len() != before || folded || narrowed || sunk_zeros
     }
+}
+
+fn sink_entry_zeros(
+    func: &mut Function,
+    entry: Block,
+    (slot_escaped, slot_loaded): (&[bool], &[bool]),
+    sym_may_unwind: &mut impl FnMut(u32) -> bool,
+) -> bool {
+    let nslots = func.slots.len();
+    let defs = crate::fold::defs(func);
+    let kinds: Vec<CalleeKind> = func
+        .insts
+        .iter()
+        .map(|data| match data.op {
+            Op::Call { callee, .. } => classify_callee(func, &defs, callee, sym_may_unwind),
+            _ => CalleeKind::MayUnwind,
+        })
+        .collect();
+    let first = entry_first_zeros(func, &defs, entry, nslots);
+    let mut is_local = vec![false; nslots];
+    let mut is_flag = vec![false; nslots];
+    for u in &func.unwind_drops {
+        if u.local.index() < nslots { is_local[u.local.index()] = true; }
+        if u.flag.index() < nslots { is_flag[u.flag.index()] = true; }
+    }
+    let cfg = func.cfg();
+    let depths = &cfg.loops().depths;
+    let mut remove = Vec::new();
+    let mut insert: Vec<(Block, Value, StackSlot)> = Vec::new();
+    for fi in 0..nslots {
+        if !is_flag[fi] || is_local[fi] || slot_escaped[fi] || slot_loaded[fi] {
+            continue;
+        }
+        let Some(zinst) = first[fi] else { continue };
+        let Op::StackStore(val, flag, 0) = func.insts[zinst.index()].op else { continue };
+        let Some(frontier) = plan_entry_zero_sink(func, &cfg, &kinds, depths, (entry, flag, zinst)) else { continue };
+        remove.push(zinst);
+        for t in frontier {
+            insert.push((t, val, flag));
+        }
+    }
+    if remove.is_empty() {
+        return false;
+    }
+    for &i in &remove {
+        func.insts[i.index()].op = Op::Trap;
+    }
+    func.blocks[entry.index()].insts.retain(|i| !remove.contains(i));
+    for (t, val, flag) in insert {
+        let store = func.add(Op::StackStore(val, flag, 0), None);
+        func.blocks[t.index()].insts.insert(0, store);
+    }
+    true
 }
 
 fn fold_known_flag_loads(
