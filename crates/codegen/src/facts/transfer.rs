@@ -1,9 +1,49 @@
-use crate::ir::{Binary, Convert, Function, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Block, Convert, Function, IntCC, Op, Type, Value};
 
 use super::{Fact, Ranges, compared_range, swapped, unsigned_order};
 
 /// The fact on an operand: its definition's range, or what one path knows about it.
 pub(super) type Of<'a> = &'a dyn Fn(Value) -> Fact;
+
+/// Returns the base pointer dereferenced within page zero by `op`, proving it nonzero when `op` runs.
+pub(crate) fn deref_ptr(op: &Op) -> Option<Value> {
+    match *op {
+        Op::Load(addr, off) | Op::Store(_, addr, off) if (0..4096).contains(&off) => Some(addr),
+        Op::AtomicLoad(addr, _)
+        | Op::AtomicStore(_, addr, _)
+        | Op::AtomicRmw(_, _, addr, _)
+        | Op::AtomicCas(_, addr, ..) => Some(addr),
+        _ => None,
+    }
+}
+
+/// The way a branch goes when exactly one of its targets assumes a constant zero before any call or trap: control that enters that target breaks the assumption, so it never does.
+pub(super) fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: Block) -> Option<bool> {
+    let barred = |block: Block| {
+        func.blocks[block.index()]
+            .insts
+            .iter()
+            .map(|inst| &func.insts[inst.index()].op)
+            .take_while(|op| !matches!(op, Op::Call { .. } | Op::Trapz(_)))
+            .any(|op| matches!(op, Op::Assume(value) if ranges.constant(*value) == Some(0)))
+    };
+    match (barred(then), barred(otherwise)) {
+        (true, false) => Some(false),
+        (false, true) => Some(true),
+        _ => None,
+    }
+}
+
+/// Raises the lower bound of a dereferenced pointer in `falls_through` to 1, returning whether it narrowed.
+pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[Value], table: &mut [(u64, u64)]) -> bool {
+    let Some(addr) = deref_ptr(op).filter(|&a| func.ty(a) == Type::I64 && falls_through.contains(&a)) else { return false };
+    let (lo, hi) = &mut table[addr.index()];
+    if *lo == 0 && *hi != 0 {
+        *lo = 1;
+        return true;
+    }
+    false
+}
 
 /// The range of the result of `op`, of type `ty`, from the facts `of` gives on its operands.
 pub(super) fn transfer(func: &Function, ranges: &Ranges, op: &Op, ty: Type, of: Of<'_>) -> Fact {

@@ -132,6 +132,9 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>],
     }
     let mut state = EvalState::default();
     state.seed(func, cx, disp, seed);
+    if let Some(p) = pred {
+        state.seed_pred(func, cx, p, disp);
+    }
     let seeded = state.seeded();
     if redefines(func, disp, &seeded) {
         return None;

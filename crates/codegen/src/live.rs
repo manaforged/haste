@@ -35,14 +35,69 @@ pub(crate) fn cold(func: &Function) -> Vec<bool> {
     cold
 }
 
+fn has_regular_call(func: &Function, block: Block) -> bool {
+    func.blocks[block.index()].insts.iter().any(|&inst| match &func.insts[inst.index()].op {
+        Op::Call { callee, .. } | Op::TryCall { callee, .. } => !func.is_thread_cell(*callee),
+        _ => false,
+    })
+}
+
+fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[bool], is_latch: &[bool]) -> Vec<bool> {
+    let n = func.blocks.len();
+    let mut deferred = vec![false; n];
+    let mut is_head = vec![false; n];
+    loops.list.iter().for_each(|each| is_head[each.head.index()] = true);
+    let mut is_root = vec![false; n];
+    let mut any = false;
+    for b in 0..n {
+        let p = Block(b as u32);
+        let Some(&Op::Brif(_, then, _, otherwise, _)) = func.last(p) else { continue };
+        if then == otherwise {
+            continue;
+        }
+        for (arm, other) in [(then, otherwise), (otherwise, then)] {
+            if Some(arm) == func.entry
+                || cold[arm.index()]
+                || cold[other.index()]
+                || is_head[arm.index()]
+                || is_latch[arm.index()]
+                || cfg.single_pred(arm) != Some(p)
+                || loops.depth_of(other) < loops.depth_of(arm)
+                || !has_regular_call(func, arm)
+                || has_regular_call(func, other)
+                || !cfg.preds_of(other).iter().any(|&q| cfg.dominates(arm, q))
+                || loops.list.iter().any(|l| l.body[b] && l.latches.iter().any(|&lt| cfg.dominates(arm, lt)))
+            {
+                continue;
+            }
+            is_root[arm.index()] = true;
+            any = true;
+        }
+    }
+    if any {
+        for b in 0..n {
+            let mut cur = Some(Block(b as u32));
+            while let Some(c) = cur {
+                if is_root[c.index()] {
+                    deferred[b] = true;
+                    break;
+                }
+                cur = cfg.idom[c.index()].filter(|&d| d != c);
+            }
+        }
+    }
+    deferred
+}
+
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
     let cfg = func.cfg();
     let loops = cfg.loops();
     let cold = cold(func);
-    let is_cold = |block: Block| cold[block.index()];
     let mut is_latch = vec![false; func.blocks.len()];
     loops.list.iter().flat_map(|each| &each.latches).for_each(|latch| is_latch[latch.index()] = true);
+    let deferred = call_detours(func, &cfg, loops, &cold, &is_latch);
+    let is_cold = |block: Block| cold[block.index()] || deferred[block.index()];
     let mut visited = vec![false; func.blocks.len()];
     let mut post = Vec::with_capacity(func.blocks.len());
     let mut stack = vec![(entry, false)];

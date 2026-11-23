@@ -10,6 +10,7 @@ use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Function, Inst, IntCC, Op, Type, Value};
 use loops::{Env, ExtraPath};
 use rel::{Path, RelKind, cond_truth, fits_truth, rel_of};
+pub(crate) use transfer::deref_ptr;
 
 /// The most facts a path keeps; past it the oldest goes.
 pub(super) const MAX_FACTS: usize = 64;
@@ -238,17 +239,22 @@ impl<'a> Ranges<'a> {
         for &block in order {
             narrowed |= self.refine_params(func, info, block);
             falls_through.clear();
+            falls_through.extend(func.blocks[block.index()].params.iter().copied().filter(|&p| func.ty(p).is_small_int()));
             for inst in &func.blocks[block.index()].insts {
                 let data = &func.insts[inst.index()];
+                narrowed |= transfer::note_deref(func, &data.op, &falls_through, &mut self.table);
                 match data.op {
                     Op::Assume(value) => {
                         let (lo, hi) = &mut self.table[value.index()];
                         if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through.contains(&value) {
                             *lo = 1;
-                            if !self.raised.contains(&value) {
-                                self.raised.push(value);
-                            }
+                            if !self.raised.contains(&value) { self.raised.push(value); }
                         }
+                        continue;
+                    }
+                    Op::Call { ref results, .. } => {
+                        falls_through.clear();
+                        falls_through.extend(results.iter().copied().filter(|&r| func.ty(r).is_small_int()));
                         continue;
                     }
                     ref op if !op.is_speculable() => falls_through.clear(),
@@ -736,33 +742,20 @@ fn settle_ctrl(
             dom.propagate_selects(func, (cfg, ranges, env, path, extra), selects, block, seen);
         }
         (&Op::Brif(raw_cond, then, _, otherwise, _), _) if ranges.constant(raw_cond).is_none() => {
-            if let Some(taken) = truth_of(dom.resolve(raw_cond), path).or_else(|| avoided(func, ranges, then, otherwise)) {
+            if let Some(taken) = truth_of(dom.resolve(raw_cond), path).or_else(|| transfer::avoided(func, ranges, then, otherwise)) {
                 decided.push((inst, Some(taken)));
             }
         }
-        _ => {}
-    }
-}
-
-/// The way a branch goes when exactly one of its targets assumes a constant zero before any call or trap: control that enters that target breaks the assumption, so it never does.
-fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: Block) -> Option<bool> {
-    let barred = |block: Block| {
-        func.blocks[block.index()]
-            .insts
-            .iter()
-            .map(|inst| &func.insts[inst.index()].op)
-            .take_while(|op| !matches!(op, Op::Call { .. } | Op::Trapz(_)))
-            .any(|op| matches!(op, Op::Assume(value) if ranges.constant(*value) == Some(0)))
-    };
-    match (barred(then), barred(otherwise)) {
-        (true, false) => Some(false),
-        (false, true) => Some(true),
-        _ => None,
+        _ => {
+            if let Some(addr) = transfer::deref_ptr(&data.op) && func.ty(addr) == Type::I64 {
+                path.add(ranges, dom.resolve(addr), Fact::range(1, u64::MAX));
+            }
+        }
     }
 }
 
 /// Whether a value with `fact` is nonzero, when the fact settles it.
-pub(super) fn truth(fact: &Fact) -> Option<bool> {
+pub(crate) fn truth(fact: &Fact) -> Option<bool> {
     match fact.exact() {
         Some(known) => Some(known != 0),
         None => (!fact.admits(0)).then_some(true),

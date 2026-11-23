@@ -1,5 +1,5 @@
 use crate::cse::flip_int_cc;
-use crate::facts::{Fact, Ranges, decide};
+use crate::facts::{Fact, Ranges, decide, deref_ptr, truth};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -32,7 +32,29 @@ pub(super) struct EvalState {
 
 impl EvalState {
     pub(super) fn seeded(&self) -> Vec<Value> {
-        self.local_consts.iter().map(|&(value, _)| value).chain(self.edge_cmps.iter().map(|&(value, ..)| value)).collect()
+        self.local_consts
+            .iter()
+            .map(|&(value, _)| value)
+            .chain(self.edge_cmps.iter().map(|&(value, ..)| value))
+            .chain(self.local_facts.iter().map(|&(value, _)| value))
+            .collect()
+    }
+
+    /// Records non-null facts for `I64` pointers dereferenced in `pred` and not redefined in `disp`.
+    pub(super) fn seed_pred(&mut self, func: &Function, cx: &ThreadCx<'_>, pred: Block, disp: Block) {
+        for &inst in &func.blocks[pred.index()].insts {
+            let Some(addr) = deref_ptr(&func.insts[inst.index()].op) else { continue };
+            if func.ty(addr) != Type::I64
+                || super::redefines(func, disp, &[addr])
+                || fact_of(&self.local_facts, cx.ranges, cx.ranges_len, addr).is_some_and(|f| f.lo >= 1)
+            {
+                continue;
+            }
+            self.local_facts.push((addr, Fact::range(1, u64::MAX)));
+            if self.local_facts.len() >= 16 {
+                break;
+            }
+        }
     }
 
     /// Records what the edge `seed` into `disp` proves: the branch condition, the values an equal compare makes one value, or a constant.
@@ -53,8 +75,9 @@ impl EvalState {
     fn rename(&mut self, cx: &ThreadCx<'_>, from: Value, to: Value) {
         self.map.retain(|&(k, _)| k != from);
         self.map.push((from, to));
-        if let Some(f) = fact_of(&self.local_facts, cx.ranges, cx.ranges_len, to) {
-            self.local_facts.retain(|&(k, _)| k != from);
+        let fact = fact_of(&self.local_facts, cx.ranges, cx.ranges_len, to);
+        self.local_facts.retain(|&(k, _)| k != from);
+        if let Some(f) = fact {
             self.local_facts.push((from, f));
         }
     }
@@ -321,8 +344,8 @@ pub(super) fn eval_cond_truth(func: &Function, cx: &ThreadCx<'_>, state: &EvalSt
     if let Some(c) = lookup_const(&state.local_consts, cx.consts, cond_val) {
         return Some(extend(c, func.ty(cond_val), false) != 0);
     }
-    if let Some(u) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, cond_val).and_then(|f| f.exact()) {
-        return Some(u != 0);
+    if let Some(t) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, cond_val).and_then(|f| truth(&f)) {
+        return Some(t);
     }
     state.edge_cmps.iter().find_map(|&(v, v_ty, cc1, imm1)| (v == cond_val).then(|| cmp_implies(v_ty, cc1, imm1, IntCC::NotEqual, 0)).flatten())
 }
