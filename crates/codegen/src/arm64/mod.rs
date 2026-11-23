@@ -3,6 +3,7 @@ mod atomic;
 mod call;
 mod float;
 mod frame;
+mod frames;
 mod fuse;
 pub(crate) mod int;
 mod location;
@@ -120,10 +121,12 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         next: None,
         copied,
         direct_calls: target.direct_calls,
+        tlv_cells: target.direct_calls && target.os == Os::Darwin,
         lse: target.os == Os::Darwin,
         sp_bias: 0,
         shrink,
         trap_label: None,
+        cold_calls: Vec::new(),
         lines: Vec::new(),
         in_fast: false,
         tails: Tails::new(),
@@ -179,10 +182,12 @@ pub(super) struct Emit<'a> {
     next: Option<Block>,
     copied: Vec<bool>,
     direct_calls: bool,
+    tlv_cells: bool,
     lse: bool,
     sp_bias: i32,
     shrink: Option<ShrinkWrap>,
     trap_label: Option<Label>,
+    cold_calls: Vec<frames::ColdCall>,
     lines: Vec<(u32, u64)>,
     in_fast: bool,
     tails: Tails<'a, Label>,
@@ -354,6 +359,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn lines(&mut self) -> &mut Vec<(u32, u64)> { &mut self.lines }
 
     fn finish(mut self, _starts: &mut [u32]) -> Result<Code, String> {
+        self.emit_cold_calls();
         self.asm.maybe_island()?;
         if let Some(label) = self.trap_label.take() {
             self.asm.bind(label);
@@ -669,7 +675,14 @@ impl Emit<'_> {
         self.move_to(to, value);
     }
 
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
+    fn clobber_call_spills(&mut self) {
+        for r in 0..19 { self.last_spill.clobber(Reg(r)); }
+        self.last_spill.clobber(LR);
+        self.last_fspill = None;
+        self.asm.clear_anchor();
+    }
+
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
         let sig_data = &self.func.sigs[sig.index()];
         let abi = classify(sig_data, self.packing)?;
         for ((arg, loc), param) in args.iter().zip(&abi.params).zip(&sig_data.params) {
@@ -678,6 +691,10 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
+        if !is_try && let Some(CallTarget::Symbol(lookup)) = direct && self.func.is_thread_cell(callee) && self.thread_cell_cold(lookup, args) {
+            self.clobber_call_spills();
+            return Ok(abi);
+        }
         let (target, extra) = if direct.is_none() {
             match self.plan.reg_of(callee).filter(|&reg| !matches!(reg, A | C | IP | FP | LR | SP) && !abi.clobbers(reg)) {
                 Some(reg) => (reg, None),
@@ -700,12 +717,7 @@ impl Emit<'_> {
             Some(CallTarget::Symbol(sym)) => self.relocs.push(self.asm.call_direct_symbol(sym, self.direct_calls, T)),
             None => self.asm.blr(target),
         }
-        for r in 0..19 {
-            self.last_spill.clobber(Reg(r));
-        }
-        self.last_spill.clobber(LR);
-        self.last_fspill = None;
-        self.asm.clear_anchor();
+        self.clobber_call_spills();
         Ok(abi)
     }
 }
@@ -737,8 +749,8 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) { self.branch_cond(condition, invert, label); }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], _is_try: bool) -> Result<Abi, String> {
-        self.arguments(sig, callee, args)
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
+        self.arguments(sig, callee, args, is_try)
     }
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
         self.store_locs(values, locs);

@@ -24,6 +24,7 @@ pub enum AtomicOrd {
     Acquire = 2,
     AcqRel = 3,
     SeqCst = 4,
+    Isb = 5,
 }
 
 impl AtomicOrd {
@@ -35,6 +36,7 @@ impl AtomicOrd {
             2 => Some(Self::Acquire),
             3 => Some(Self::AcqRel),
             4 => Some(Self::SeqCst),
+            5 => Some(Self::Isb),
             _ => None,
         }
     }

@@ -424,15 +424,19 @@ impl Lower<'_, '_> {
             return Ok(None);
         }
         if let Some(which) = self.cx.intrinsic(item) {
-            let slice = self.cx.types.substs(substs).to_vec();
-            return self.intrinsic(&origin, which, &slice, &values);
+            return self.intrinsic(&origin, which, &self.cx.types.substs(substs).to_vec(), &values);
         }
         let index = self.reached_index(item, substs)?;
         let callee = self.reached.typed(index, self.cx.name(item))?;
         let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
         if self.cx.foreign(item) {
-            if callee.ret.map_or(Ok(true), |ret| repr(self.cx, ret).map(|r| r == Repr::Zst))? && self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve) == Some(crate::host::HostSymbol::Noop) {
-                return Ok(None);
+            if callee.ret.map_or(Ok(true), |ret| repr(self.cx, ret).map(|r| r == Repr::Zst))? {
+                match self.cx.symbol_name(item).as_deref() {
+                    Some(n) if crate::host::HostSymbol::resolve(n) == Some(crate::host::HostSymbol::Noop) => return Ok(None),
+                    Some("llvm.aarch64.isb") => { self.ins().fence(haste_codegen::AtomicOrd::Isb); return Ok(None); }
+                    Some("llvm.aarch64.dmb") => { self.ins().fence(haste_codegen::AtomicOrd::SeqCst); return Ok(None); }
+                    _ => {}
+                }
             }
             let code = self.code_of(index, origin);
             return self.native_call(code, (params, callee.ret), values);
@@ -447,12 +451,7 @@ impl Lower<'_, '_> {
         };
         let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, false))?;
         self.cycle_root = self.cycle_root.min(cycle);
-        let Some(found) = callee.filter(|found| {
-            self.inline.host.takes(self.cx, self.reached, index, found)
-                && (self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty())
-        }) else {
-            return Ok(None);
-        };
+        let Some(found) = callee.filter(|found| self.inline.host.takes(self.cx, self.reached, index, found) && (self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty())) else { return Ok(None) };
         if !self.inline.host.compact || found.form != Form::Dense {
             return Ok(Some(found));
         }

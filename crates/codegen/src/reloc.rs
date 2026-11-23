@@ -17,6 +17,8 @@ pub enum RelocKind {
     Arm64AdrpAdd,
     /// The 32-bit offset from the thread pointer to a thread-local word, plus the addend in the field: the frame cache for a runtime symbol, the slot table entry for a slot word.
     ThreadOff32,
+    /// A 20-byte ARM64 Mach-O TLV thread-cell load sequence (`adrp+add+ldr+blr+ldr`) patched to the TLV descriptor and slot offset.
+    Arm64TlvCell,
 }
 
 /// A runtime helper linked into generated code.
@@ -176,7 +178,7 @@ pub fn patch_reloc(kind: RelocKind, value: u64, out: &mut [u8]) -> Result<(), cr
         }
         RelocKind::Abs64 => out[..8].copy_from_slice(&value.to_le_bytes()),
         RelocKind::Arm64Movw64 => patch_arm64_movw64(&mut out[..16], value),
-        RelocKind::PcRel32 | RelocKind::X64RipRel32 | RelocKind::Arm64Call26 | RelocKind::Arm64AdrpAdd | RelocKind::ThreadOff32 => {
+        RelocKind::PcRel32 | RelocKind::X64RipRel32 | RelocKind::Arm64Call26 | RelocKind::Arm64AdrpAdd | RelocKind::ThreadOff32 | RelocKind::Arm64TlvCell => {
             return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("{kind:?} requires AOT PC-relative patching")));
         }
     }

@@ -111,6 +111,7 @@ impl Emit<'_> {
             Op::Fence(ord) => match ord {
                 crate::ir::AtomicOrd::Relaxed => {}
                 crate::ir::AtomicOrd::Acquire => self.asm.dmb_ld(),
+                crate::ir::AtomicOrd::Isb => self.asm.word(0xD503_3FDF),
                 _ => self.asm.dmb(),
             },
             Op::FramePointer => self.put(result()?, FP),
