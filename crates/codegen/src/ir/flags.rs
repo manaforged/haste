@@ -42,6 +42,29 @@ impl Function {
         self.flags(value) & THREAD_CELL != 0
     }
 
+    /// Mask of values defined by `Op::Const(0)`, empty when no thread-cell lookup is present.
+    pub(crate) fn thread_cell_zeros(&self) -> Vec<bool> {
+        if !self.value_flags.iter().any(|&bits| bits & THREAD_CELL != 0) {
+            return Vec::new();
+        }
+        let mut zeros = vec![false; self.types.len()];
+        for inst in &self.insts {
+            if let (super::Op::Const(0), Some(res)) = (&inst.op, inst.result) {
+                zeros[res.index()] = true;
+            }
+        }
+        zeros
+    }
+
+    /// Result value of `op` when it is a zero-initialized `ThreadCell` lookup with no user-visible memory effects.
+    pub(crate) fn pure_thread_cell_result(&self, op: &super::Op, is_zero: impl Fn(Value) -> bool) -> Option<Value> {
+        match op {
+            super::Op::Call { callee, args, results, .. }
+                if self.is_thread_cell(*callee) && args.get(2).is_some_and(|&v| is_zero(v)) => results.first().copied(),
+            _ => None,
+        }
+    }
+
     /// Whether `value` is the address of data that the output image holds.
     pub(crate) fn is_image_addr(&self, value: Value) -> bool {
         self.flags(value) & IMAGE_ADDR != 0

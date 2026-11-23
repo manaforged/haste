@@ -17,22 +17,8 @@ fn order_pair(a: Operand, b: Operand) -> (Operand, Operand) {
 fn is_commutative_binary(op: Binary) -> bool {
     matches!(
         op,
-        Binary::Iadd
-            | Binary::Imul
-            | Binary::Umulhi
-            | Binary::Smulhi
-            | Binary::Smin
-            | Binary::Smax
-            | Binary::Umin
-            | Binary::Umax
-            | Binary::SaddSat
-            | Binary::UaddSat
-            | Binary::AvgRound
-            | Binary::Fmin
-            | Binary::Fmax
-            | Binary::Band
-            | Binary::Bor
-            | Binary::Bxor
+        Binary::Iadd | Binary::Imul | Binary::Umulhi | Binary::Smulhi | Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax
+            | Binary::SaddSat | Binary::UaddSat | Binary::AvgRound | Binary::Fmin | Binary::Fmax | Binary::Band | Binary::Bor | Binary::Bxor
     )
 }
 
@@ -175,6 +161,7 @@ enum Key {
     StackAddr(StackSlot, i32),
     SlotAddr(u32),
     Symbol(u32),
+    ThreadCell(Operand, Operand, Operand),
 }
 
 fn operand(consts: &[Option<i64>], types: &[Type], subst: &[Value], value: Value) -> Operand {
@@ -534,6 +521,20 @@ impl Table {
             .filter(|inst| {
                 let data = &func.insts[inst.index()];
                 if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) {
+                    if let Op::Call { callee, ref args, ref results, .. } = data.op
+                        && (func.is_thread_cell(callee) || func.is_thread_cell(find(subst, callee)))
+                        && let ([slot, size, init], [result]) = (args.as_slice(), results.as_slice())
+                    {
+                        let opnd = |v: Value| operand(&self.consts, &func.types, subst, v);
+                        let tc_key = Key::ThreadCell(opnd(*slot), opnd(*size), opnd(*init));
+                        if let Some(&earlier) = self.known.get(&tc_key) {
+                            subst[result.index()] = earlier;
+                            mutated = true;
+                            return false;
+                        }
+                        let prev = self.known.insert(tc_key, *result);
+                        self.added.push((tc_key, prev));
+                    }
                     self.drop_buf.clear();
                     self.drop_buf.extend(self.known.keys().copied().filter(|k| matches!(k, Key::Const(..))));
                     for k in self.drop_buf.drain(..) {

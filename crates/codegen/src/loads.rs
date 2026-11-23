@@ -110,7 +110,9 @@ fn effect(func: &Function, state: &State<'_>, inst: Inst) -> Effect {
             let ty = func.ty(value);
             Effect::Write(MemLoc::slot(to, i64::from(offset), ty.bytes()), ty, find(state.subst, value))
         }
-        (&Op::Call { callee, .. }, _) if state.prov.frame_runtime(callee) == Some(RuntimeSymbol::Malloc) => Effect::None,
+        (&Op::Call { callee, .. }, _)
+            if state.prov.frame_runtime(callee) == Some(RuntimeSymbol::Malloc)
+                || func.pure_thread_cell_result(&data.op, |v| state.consts[v.index()] == Some(0)).is_some() => Effect::None,
         (op, _) if matches!(op, Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..)) => Effect::Unknown,
         (op, _) if matches!(op, Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. }) => Effect::Unknown,
         _ => Effect::None,

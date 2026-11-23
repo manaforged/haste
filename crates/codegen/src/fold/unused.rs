@@ -31,21 +31,25 @@ pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
 /// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
 pub(super) fn dead(func: &mut Function) -> bool {
     let mut uses = func.use_counts();
+    let zeros = func.thread_cell_zeros();
     let mut keep = Vec::new();
     let mut dropped = false;
-    for block in func.blocks.iter_mut().rev() {
+    for b in (0..func.blocks.len()).rev() {
+        let len = func.blocks[b].insts.len();
         keep.clear();
-        keep.resize(block.insts.len(), true);
-        for (at, inst) in block.insts.iter().enumerate().rev() {
-            let data = &func.insts[inst.index()];
-            if data.op.is_removable() && data.result.is_some_and(|result| uses[result.index()] == 0) {
+        keep.resize(len, true);
+        for at in (0..len).rev() {
+            let data = &func.insts[func.blocks[b].insts[at].index()];
+            let dead = (data.op.is_removable() && data.result.is_some_and(|result| uses[result.index()] == 0))
+                || (!zeros.is_empty() && func.pure_thread_cell_result(&data.op, |v| zeros[v.index()]).is_some_and(|result| uses[result.index()] == 0));
+            if dead {
                 keep[at] = false;
                 dropped = true;
                 data.op.for_operands(|value| uses[value.index()] -= 1);
             }
         }
         let mut at = 0;
-        block.insts.retain(|_| {
+        func.blocks[b].insts.retain(|_| {
             at += 1;
             keep[at - 1]
         });
