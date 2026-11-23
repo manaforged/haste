@@ -468,8 +468,13 @@ fn invert_unlikely_branches(func: &mut Function) {
     if cands.is_empty() {
         return;
     }
-    let uses = func.use_counts();
-    let defs = crate::fold::defs(func);
+    let mut uses = vec![0_u32; func.types.len()];
+    let mut defs = vec![None; func.types.len()];
+    for &i in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[i.index()];
+        data.op.for_operands(|v| uses[v.index()] += 1);
+        if let Some(r) = data.result { defs[r.index()] = Some(i); }
+    }
     let const_val = |func: &Function, v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
     let mut changed = false;
     for (term, cond) in cands {

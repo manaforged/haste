@@ -410,28 +410,28 @@ impl Fold {
         let mut changed = false;
         let mut cfg_dirty = false;
         for block in 0..func.blocks.len() {
-            let mut trapped = false;
             let mut dropped_after_trap = false;
-            let mut keep = std::mem::take(&mut func.blocks[block].insts);
-            keep.retain(|&inst| {
-                if trapped { func.insts[inst.index()].op = Op::Trap; changed = true; dropped_after_trap = true; return false; }
-                match func.insts[inst.index()].op {
-                    Op::Trapz(x) => {
-                        if let Some(k) = self.known(x) {
-                            trapped = extend(k, func.types[x.index()], false) == 0;
-                            func.insts[inst.index()].op = Op::Trap; changed = true; return trapped;
+            if func.blocks[block].insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Trap | Op::Trapz(_))) {
+                let mut trapped = false;
+                let mut keep = std::mem::take(&mut func.blocks[block].insts);
+                keep.retain(|&inst| {
+                    if trapped { func.insts[inst.index()].op = Op::Trap; changed = true; dropped_after_trap = true; return false; }
+                    match func.insts[inst.index()].op {
+                        Op::Trapz(x) => {
+                            if let Some(k) = self.known(x) {
+                                trapped = extend(k, func.types[x.index()], false) == 0;
+                                func.insts[inst.index()].op = Op::Trap; changed = true; return trapped;
+                            }
+                            if self.non_null(func, Before { prefix: &[], block: None }, x) { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
+                            true
                         }
-                        if self.non_null(func, Before { prefix: &[], block: None }, x) { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
-                        true
+                        Op::Trap => { trapped = true; true }
+                        _ => true,
                     }
-                    Op::Trap => { trapped = true; true }
-                    _ => true,
-                }
-            });
-            func.blocks[block].insts = keep;
-            if dropped_after_trap {
-                cfg_dirty = true;
+                });
+                func.blocks[block].insts = keep;
             }
+            if dropped_after_trap { cfg_dirty = true; }
             if cfg_dirty && func.blocks[block].insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Brif(..))) {
                 func.bump_cfg();
                 cfg_dirty = false;

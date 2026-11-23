@@ -163,10 +163,14 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
         }
     }
     let mut join_of = vec![None; func.blocks.len()];
-    let rank = crate::cfg::Cfg::ranks(&cfg.rpo, func.blocks.len());
-    live_list.sort_unstable_by_key(|b| rank[b.index()]);
+    let mut ranked = false;
     loop {
         let mut added = false;
+        if !ranked && (joins.len() > 1 || live_list.iter().any(|&b| !cfg.dominates(joins[0], b))) {
+            let rank = crate::cfg::Cfg::ranks(&cfg.rpo, func.blocks.len());
+            live_list.sort_unstable_by_key(|b| rank[b.index()]);
+            ranked = true;
+        }
         for &b in &live_list {
             let bi = b.index();
             let deepest = (0..joins.len())

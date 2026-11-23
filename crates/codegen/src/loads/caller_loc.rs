@@ -52,11 +52,9 @@ fn cl_event(func: &Function, prov: &Provenance, zeros: &[bool], is_cl: &[bool], 
 
 type ClDef = (SigRef, Value, Vec<Value>);
 
-fn collect_cl_defs(func: &Function, cfg: &Cfg, zeros: &[bool]) -> Vec<Option<(Block, Inst, ClDef)>> {
-    let mut defs = vec![None; func.types.len()];
-    if zeros.is_empty() {
-        return defs;
-    }
+fn collect_cl_list(func: &Function, cfg: &Cfg, zeros: &[bool]) -> Vec<(Value, Block, Inst, ClDef)> {
+    let mut out = Vec::new();
+    if zeros.is_empty() { return out; }
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
             let data = &func.insts[inst.index()];
@@ -65,10 +63,18 @@ fn collect_cl_defs(func: &Function, cfg: &Cfg, zeros: &[bool]) -> Vec<Option<(Bl
                 && let Op::Call { sig, callee, args, results } = &data.op
                 && results.len() == 1
             {
-                defs[res.index()] = Some((b, inst, (*sig, *callee, args.clone())));
+                out.push((res, b, inst, (*sig, *callee, args.clone())));
             }
         }
     }
+    out
+}
+
+fn collect_cl_defs(func: &Function, cfg: &Cfg, zeros: &[bool]) -> Vec<Option<(Block, Inst, ClDef)>> {
+    let list = collect_cl_list(func, cfg, zeros);
+    if list.is_empty() { return Vec::new(); }
+    let mut defs = vec![None; func.types.len()];
+    for (res, b, inst, def) in list { defs[res.index()] = Some((b, inst, def)); }
     defs
 }
 
@@ -165,30 +171,51 @@ pub(super) fn optimize(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> boo
     }
     let mut zeros = func.thread_cell_zeros();
     let mut is_cl: Vec<bool> = prov.param_roots.iter().map(|&r| r == MemRoot::CallerLoc).collect();
-    let (mut has_store, mut has_load) = (false, false);
+    let mut store_cands: Vec<(Block, Inst)> = Vec::new();
+    let mut load_cands: Vec<(Block, Inst)> = Vec::new();
+    let mut defs_list: Vec<(Value, Block, Inst, ClDef)> = Vec::new();
+    let mut cl_defs: Vec<Option<(Block, Inst, ClDef)>> = Vec::new();
     for &b in &cfg.rpo {
         for &i in &func.blocks[b.index()].insts {
             let d = &func.insts[i.index()];
             match (&d.op, d.result) {
-                (Op::Store(_, a, 0), _) if is_cl.get(a.index()) == Some(&true) => has_store = true,
-                (Op::Load(a, 0), Some(_)) if is_cl.get(a.index()) == Some(&true) => has_load = true,
+                (Op::Store(_, a, 0), _) if is_cl.get(a.index()) == Some(&true) => store_cands.push((b, i)),
+                (Op::Load(a, 0), Some(_)) if is_cl.get(a.index()) == Some(&true) => load_cands.push((b, i)),
+                (Op::Call { sig, callee, args, results }, None)
+                    if !zeros.is_empty()
+                        && results.len() == 1
+                        && let Some(res) = func.caller_loc_result(&d.op, |v| zeros.get(v.index()) == Some(&true)) =>
+                {
+                    let def = (*sig, *callee, args.clone());
+                    defs_list.push((res, b, i, def.clone()));
+                    if cl_defs.is_empty() {
+                        cl_defs.resize(func.types.len(), None);
+                    }
+                    cl_defs[res.index()] = Some((b, i, def));
+                }
                 _ => {}
             }
         }
     }
+    let has_load = !load_cands.is_empty();
     let mut changed = false;
-    if has_store {
-        let mut cl_defs = collect_cl_defs(func, cfg, &zeros);
-        let ns = narrow_stores(func, cfg, prov, &mut zeros, &mut is_cl, &cl_defs);
+    if !store_cands.is_empty() {
+        let ns = narrow_stores(func, cfg, prov, &mut zeros, &mut is_cl, &cl_defs, store_cands);
         changed |= ns;
         if has_load || ns {
-            if ns { cl_defs = collect_cl_defs(func, cfg, &zeros); }
-            changed |= narrow_saves(func, cfg, prov, &mut zeros, &mut is_cl, &cl_defs);
+            if ns {
+                cl_defs = collect_cl_defs(func, cfg, &zeros);
+            }
+            let loads_arg = if ns { None } else { Some(load_cands) };
+            changed |= narrow_saves(func, cfg, prov, &mut zeros, &mut is_cl, &cl_defs, loads_arg);
         }
         changed |= drop_silent_stores(func, cfg, prov, &zeros, &is_cl);
         changed |= drop_dead_stores(func, cfg, prov, &zeros, &is_cl);
     }
-    changed |= sink_cell_calls(func, cfg, &mut zeros, &mut is_cl, has_load || changed);
+    if changed || has_load || !defs_list.is_empty() {
+        let pre_defs = (!changed).then_some(defs_list);
+        changed |= sink_cell_calls(func, cfg, &mut zeros, &mut is_cl, has_load || changed, pre_defs);
+    }
     changed
 }
 
@@ -199,18 +226,9 @@ fn narrow_stores(
     zeros: &mut Vec<bool>,
     is_cl: &mut Vec<bool>,
     cl_defs: &[Option<(Block, Inst, ClDef)>],
+    candidates: Vec<(Block, Inst)>,
 ) -> bool {
-    let mut candidates: Vec<(Block, Inst)> = Vec::new();
-    for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
-            if let Op::Store(_, addr, 0) = func.insts[inst.index()].op
-                && is_cl.get(addr.index()) == Some(&true)
-            {
-                candidates.push((b, inst));
-            }
-        }
-    }
-    if candidates.is_empty() {
+    if candidates.is_empty() || cl_defs.is_empty() {
         return false;
     }
     let n = func.blocks.len();
@@ -326,9 +344,32 @@ fn narrow_saves(
     zeros: &mut Vec<bool>,
     is_cl: &mut Vec<bool>,
     cl_defs: &[Option<(Block, Inst, ClDef)>],
+    pre_cands: Option<Vec<(Block, Inst)>>,
 ) -> bool {
-    let mut non_restore = vec![false; func.types.len()];
-    let mut candidates: Vec<(Block, Inst)> = Vec::new();
+    if cl_defs.is_empty() {
+        return false;
+    }
+    let candidates = pre_cands.unwrap_or_else(|| {
+        let mut out = Vec::new();
+        for &b in &cfg.rpo {
+            for &inst in &func.blocks[b.index()].insts {
+                let data = &func.insts[inst.index()];
+                if let Op::Load(addr, 0) = data.op
+                    && data.result.is_some()
+                    && is_cl.get(addr.index()) == Some(&true)
+                {
+                    out.push((b, inst));
+                }
+            }
+        }
+        out
+    });
+    if candidates.is_empty() {
+        return false;
+    }
+    let saved_vals: Vec<Value> = candidates.iter().filter_map(|&(_, i)| func.insts[i.index()].result).collect();
+    let saved_mask = saved_vals.iter().fold(0_u128, |m, &v| m | (1_u128 << (v.0 & 127)));
+    let mut non_restore = vec![false; saved_vals.len()];
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
             let data = &func.insts[inst.index()];
@@ -336,26 +377,27 @@ fn narrow_saves(
                 && is_cl.get(addr.index()) == Some(&true)
                 && val != addr
             {
-                non_restore[addr.index()] = true;
+                if saved_mask & (1_u128 << (addr.0 & 127)) != 0 {
+                    for (idx, &sv) in saved_vals.iter().enumerate() {
+                        if sv == addr { non_restore[idx] = true; }
+                    }
+                }
             } else {
-                data.op.for_operands(|v| non_restore[v.index()] = true);
-            }
-            if let Op::Load(addr, 0) = data.op
-                && data.result.is_some()
-                && is_cl.get(addr.index()) == Some(&true)
-            {
-                candidates.push((b, inst));
+                data.op.for_operands(|v| {
+                    if saved_mask & (1_u128 << (v.0 & 127)) != 0 {
+                        for (idx, &sv) in saved_vals.iter().enumerate() {
+                            if sv == v { non_restore[idx] = true; }
+                        }
+                    }
+                });
             }
         }
-    }
-    if candidates.is_empty() {
-        return false;
     }
     let n = func.blocks.len();
     let mut loops = None;
     let (mut visited, mut pass, mut restores) = (Vec::new(), Vec::new(), Vec::new());
     let mut changed = false;
-    for (b_l, load_inst) in candidates {
+    for (ci, (b_l, load_inst)) in candidates.into_iter().enumerate() {
         let Some(pos_l) = func.blocks[b_l.index()].insts.iter().position(|&i| i == load_inst) else {
             continue;
         };
@@ -363,7 +405,7 @@ fn narrow_saves(
         let (Op::Load(addr, 0), Some(saved)) = (data.op.clone(), data.result) else {
             continue;
         };
-        if non_restore.get(saved.index()) == Some(&true) {
+        if non_restore.get(ci) == Some(&true) {
             continue;
         }
         let Some((_, _, def)) = cl_defs.get(addr.index()).and_then(Clone::clone) else {
@@ -607,7 +649,14 @@ fn drop_dead_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance, zeros: &[
     dropped
 }
 
-fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl: &mut Vec<bool>, check_loads: bool) -> bool {
+fn sink_cell_calls(
+    func: &mut Function,
+    cfg: &Cfg,
+    zeros: &mut Vec<bool>,
+    is_cl: &mut Vec<bool>,
+    check_loads: bool,
+    pre_defs: Option<Vec<(Value, Block, Inst, ClDef)>>,
+) -> bool {
     let mut changed = false;
     if check_loads {
         let mut cl_loads: Vec<(Block, usize, Value)> = Vec::new();
@@ -618,11 +667,13 @@ fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl:
             }
         }
         if !cl_loads.is_empty() {
+            let load_mask = cl_loads.iter().fold(0_u128, |m, &(_, _, r)| m | (1_u128 << (r.0 & 127)));
             let (mut used, mut rem) = (vec![false; cl_loads.len()], cl_loads.len());
             for &b in &cfg.rpo {
                 if rem == 0 { break; }
                 for &inst in &func.blocks[b.index()].insts {
                     func.insts[inst.index()].op.for_operands(|v| {
+                        if load_mask & (1_u128 << (v.0 & 127)) == 0 { return; }
                         for (idx, &(_, _, r)) in cl_loads.iter().enumerate() { if r == v && !used[idx] { used[idx] = true; rem -= 1; } }
                     });
                 }
@@ -634,21 +685,7 @@ fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl:
             }
         }
     }
-    let mut defs_list: Vec<(Value, Block, Inst, ClDef)> = Vec::new();
-    if !zeros.is_empty() {
-        for &b in &cfg.rpo {
-            for &inst in &func.blocks[b.index()].insts {
-                let data = &func.insts[inst.index()];
-                if data.result.is_none()
-                    && let Some(res) = func.caller_loc_result(&data.op, |v| zeros.get(v.index()) == Some(&true))
-                    && let Op::Call { sig, callee, args, results } = &data.op
-                    && results.len() == 1
-                {
-                    defs_list.push((res, b, inst, (*sig, *callee, args.clone())));
-                }
-            }
-        }
-    }
+    let defs_list = if !changed && let Some(pre) = pre_defs { pre } else { collect_cl_list(func, cfg, zeros) };
     if defs_list.is_empty() {
         return changed;
     }

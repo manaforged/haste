@@ -601,15 +601,18 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let mut icmp_def = vec![None; func.types.len()];
     let mut def_block = vec![0_u32; func.types.len()];
     let mut local_flag_only = vec![false; func.types.len()];
-    let uses = func.use_counts();
+    let mut uses = vec![0_u32; func.types.len()];
+    let mut flag_cands: Vec<(Value, u32)> = Vec::new();
     let mut has_narrow_uext = false;
     for &b in &cfg.rpo {
         let blk = &func.blocks[b.index()];
+        let btag = block_tag(b);
         for &inst in &blk.insts {
             let data = &func.insts[inst.index()];
+            data.op.for_operands(|v| uses[v.index()] += 1);
             if let Some(res) = data.result {
                 let ri = res.index();
-                def_block[ri] = block_tag(b);
+                def_block[ri] = btag;
                 match data.op {
                     Op::Const(imm) if func.ty(res).is_small_int() => {
                         let z = extend(imm, func.ty(res), false);
@@ -641,10 +644,13 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                     _ => {}
                 }
             }
-            if let Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) = data.op && uses[c.index()] == 1 && def_block[c.index()] == block_tag(b) && icmp_def[c.index()].is_some() {
-                local_flag_only[c.index()] = true;
+            if let Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) = data.op && def_block[c.index()] == btag && icmp_def[c.index()].is_some() {
+                flag_cands.push((c, btag));
             }
         }
+    }
+    for (c, _) in flag_cands {
+        if uses[c.index()] == 1 { local_flag_only[c.index()] = true; }
     }
     let affine = identity(func.types.len()).into_iter().map(|v| (v, 0_i64)).collect();
     let nvals = func.types.len();
