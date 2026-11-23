@@ -165,9 +165,10 @@ impl Lower<'_, '_> {
     pub(super) fn wrap_inlined_caller_loc(&mut self, from_blk: usize, to_blk: usize) -> Result<()> {
         for b_idx in from_blk..to_blk {
             let block = self.b.block_at(b_idx);
-            let Some((first_call, can_fall_through)) = self.b.block_first_tracked(block, self.dict_param, |sym, arg0| match self.relocs.get(sym as usize) {
+            let Some((first_call, can_fall_through)) = self.b.block_first_tracked(block, self.dict_param, |sym, arg0| match sym.and_then(|s| self.relocs.get(s as usize)) {
                 Some(SymbolSource::Slot(idx)) => self.cx.track_caller(self.reached.list[*idx].0.0),
                 Some(SymbolSource::Host(HostSymbol::ThreadCell)) => arg0 == Some(0),
+                None => sym.is_none(),
                 _ => false,
             }) else {
                 continue;

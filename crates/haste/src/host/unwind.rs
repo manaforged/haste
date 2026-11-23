@@ -49,7 +49,7 @@ pub(crate) fn set_jit_unwind_head(head: usize) {
 /// Clears the active JIT unwind-list head if it still matches `head`.
 pub(crate) fn clear_jit_unwind_head(head: usize) {
     if head != 0 {
-        let _ = JIT_UNWIND_HEAD.compare_exchange(head, 0, Ordering::AcqRel, Ordering::Relaxed);
+        JIT_UNWIND_HEAD.compare_exchange(head, 0, Ordering::AcqRel, Ordering::Relaxed).ok();
     }
 }
 

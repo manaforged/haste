@@ -770,6 +770,7 @@ impl Asm {
         at
     }
 
+    /// Emits a RIP-relative load into `dst` with a 32-bit zero displacement and returns the displacement offset.
     pub fn load_rip_reloc(&mut self, size: Size, dst: Reg) -> u32 {
         let (wide, op): (bool, &[u8]) = match size {
             Size::B => (false, &[0x0F, 0xB6]),

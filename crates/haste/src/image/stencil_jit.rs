@@ -177,7 +177,7 @@ impl Image {
                 && let Some(jt) = pass.stencils.jit_templates.get(&(item, footprint))
             {
                 let rec = match (is_dict, &jt.dict) {
-                    (true, Some((body_exec, dict_code))) => VerifyRecord::Dict { body_exec: *body_exec, stub_exec: addr, stub_bytes: Vec::new(), code: dict_code.clone() },
+                    (true, Some((body_exec, dict_code, _))) => VerifyRecord::Dict { body_exec: *body_exec, stub_exec: addr, stub_bytes: Vec::new(), code: dict_code.clone() },
                     _ => VerifyRecord::Patched { exec: addr, len: jt.stencil.bytes().len(), sites: jt.stencil.sites().to_vec(), unwind_drops: jt.stencil.unwind_drops().to_vec() },
                 };
                 self.verify_single(cx, reached, index, &rec)?;
@@ -215,20 +215,22 @@ impl Image {
     }
 
     fn instantiate_jit_dict(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, key: (ItemRef, FootprintId), symbols: Vec<u64>, cfg: DictConfig, pass: &mut Pass) -> Result<usize> {
-        let (body_exec, dict_code) = match pass.stencils.jit_templates.get(&key).and_then(|jt| jt.dict.clone()) {
-            Some(pair) => pair,
+        let (body_exec, dict_code, dict_plan) = match pass.stencils.jit_templates.get(&key).and_then(|jt| jt.dict.clone()) {
+            Some(triple) => triple,
             None => {
-                let (func, _, _) = lower::lower_dict(cx, reached, self, index)?;
+                let (func, _, dict_plan) = lower::lower_dict(cx, reached, self, index)?;
                 let code = Arc::new(haste_codegen::compile(func, &self.compile_target())?);
                 let exec = self.write_dict_body(&code, pass)?;
                 if let Some(jt) = pass.stencils.jit_templates.get_mut(&key) {
-                    jt.dict = Some((exec, code.clone()));
+                    jt.dict = Some((exec, code.clone(), Arc::clone(&dict_plan)));
                 }
-                (exec, code)
+                (exec, code, dict_plan)
             }
         };
+        let dict_relocs = lower::eval_relocs(cx, reached, self, &dict_plan, index)?;
+        let dict_symbols = self.symbols(&dict_relocs);
         let tier = self.make_tier_up(index, key, &symbols, cfg.tier_up, pass)?;
-        let (stub_exec, stub_bytes) = self.emit_dict_stub_with_tier(body_exec, &symbols, tier, pass)?;
+        let (stub_exec, stub_bytes) = self.emit_dict_stub_with_tier(body_exec, &dict_symbols, tier, pass)?;
         if tier.is_none() {
             pass.stencils.aliases.insert((key.0, key.1, symbols), (stub_exec, true));
         }

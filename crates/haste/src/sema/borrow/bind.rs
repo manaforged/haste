@@ -372,7 +372,7 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    fn unwrap_parens(&self, mut expr: ExprId) -> ExprId {
+    pub(super) fn unwrap_parens(&self, mut expr: ExprId) -> ExprId {
         while let Expr::Paren(inner) = *self.body.expr(expr) { expr = inner; }
         expr
     }

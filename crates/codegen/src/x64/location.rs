@@ -765,7 +765,8 @@ pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos
                 udata.result.is_some_and(|r| !plan.elided[r.index()] && !plan.is_static(r))
                     && ((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
             }
-            Op::Brif(cond, ..) | Op::Trapz(cond) => cond == res && zero_expected,
+            Op::Brif(cond, _, ref ta, _, ref ea) => cond == res && zero_expected && ta.is_empty() && ea.is_empty(),
+            Op::Trapz(cond) => cond == res && zero_expected,
             _ => false,
         };
         if used_in != block || end <= start || !ok_user {

@@ -455,7 +455,8 @@ impl Checker<'_, '_> {
             }
             _ => {
                 let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
-                let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee);
+                let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
+                let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee, ret_has_borrow);
                 let arg_ids: Vec<u32> = self.body.list(args).to_vec();
                 for (idx, id) in arg_ids.into_iter().enumerate() {
                     if hrtb_non_ret.contains(&idx) {
@@ -713,22 +714,9 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn fn_arg_returns_static(&mut self, mut arg: ExprId) -> bool {
-        while let Expr::Paren(inner) = *self.body.expr(arg) { arg = inner; }
-        let Some(Res::Fn(f_item, _)) = self.typed.res.get(&arg).copied() else { return false };
-        let Ok(sig) = self.cx.signature(f_item) else { return false };
-        let Some(ret_ast) = sig.ret else { return false };
-        let mut lts = Lifetimes::default();
-        collect_ty_lifetimes(&sig.body, self.cx.item(f_item).0, ret_ast, &mut lts);
-        !lts.has_elided && lts.named.is_empty() && lts.saw_static
-    }
-
     fn iter_closure_ignores_param(&mut self, arg: ExprId, state: &State) -> bool {
         if self.fn_arg_returns_static(arg) { return true; }
-        let mut cur = arg;
-        while let Expr::Paren(inner) = *self.body.expr(cur) {
-            cur = inner;
-        }
+        let cur = self.unwrap_parens(arg);
         let Some(closure) = self.typed.closures.get(&cur).cloned() else {
             return false;
         };

@@ -658,6 +658,7 @@ pub(crate) extern "C" fn thread_cell(slot: usize, size: usize, init_slot: usize)
     if init_slot != 0 {
         // SAFETY: init_slot points to the 8-byte function slot holding this static's zero-arg initializer.
         let code = unsafe { *(init_slot as *const usize) };
+        // SAFETY: code is the entry address of the zero-arg extern "C" static initializer stored in init_slot.
         let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(code) };
         fill();
     }

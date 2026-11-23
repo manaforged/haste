@@ -678,8 +678,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         if func.is_coroutine() {
             haste_codegen::split_coroutine(&mut func);
         }
-        let has_drop_push = relocs.iter().any(|src| matches!(src, SymbolSource::Host(HostSymbol::DropPush)));
-        if !func.unwind_drops().is_empty() || has_drop_push {
+        if !func.unwind_drops().is_empty() {
             simplify_tallied(&mut func, Tally::Built);
             let mut sym_may_unwind = |sym: u32| match relocs.get(sym as usize) {
                 Some(SymbolSource::Slot(idx)) => reached.may_unwind(cx, *idx),
@@ -687,13 +686,6 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
                 _ => true,
             };
             func.elide_dead_unwind_drops(&mut sym_may_unwind);
-            if has_drop_push {
-                func.elide_dead_drop_guards(
-                    |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPush))),
-                    |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPop))),
-                    sym_may_unwind,
-                );
-            }
         }
         func.zero_init_unwind_flags();
     }

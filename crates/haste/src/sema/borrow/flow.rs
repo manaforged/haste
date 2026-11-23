@@ -24,6 +24,12 @@ impl Checker<'_, '_> {
         let saved_stmt_depth = self.stmt_depth;
         let is_const = kind == BlockKind::Const;
         if is_const {
+            let ids_check: Vec<u32> = self.body.list(stmts).to_vec();
+            let (c_before, _, c_tail) = self.block_liveness(&ids_check, tail, &HashSet::default());
+            let live_in = c_before.first().unwrap_or(&c_tail);
+            if let Some(&bad) = live_in.iter().find(|&&loc| self.scope_depth.get(loc as usize).is_some_and(|&d| d < block_depth)) {
+                bail!("attempt to use a non-constant value `{}` in a constant", self.local_name(bad));
+            }
             self.const_depth += 1;
         }
         let update_stmt_depth = !matches!(kind, BlockKind::Expansion | BlockKind::Unsafe);

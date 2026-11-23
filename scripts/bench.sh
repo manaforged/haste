@@ -238,7 +238,7 @@ cargo_build_cmd = ["cargo", "build", "--quiet", "--locked", "--manifest-path", d
 # Warm haste's stdlib substrate once (matches normal developer steady state)
 subprocess.run([haste_bin, "build", hello_dir], env=haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-# Cold debug build (tests/diff, 124 fns / ~9,300 reached std+user fns)
+# Cold debug build (tests/diff, 129 fns / ~9,900 reached std+user fns)
 h_diff_cold = run_timed(haste_build_cmd, env=haste_env)
 c_diff_cold = run_timed(cargo_build_cmd, env=cargo_env)
 
@@ -287,7 +287,7 @@ else:
 h_self_noop = median_ms(5, haste_self_cmd, env=haste_env)
 c_self_noop = median_ms(5, cargo_self_cmd, env=cargo_env)
 
-print("### Build Speed (`tests/diff`, 124 fns)")
+print("### Build Speed (`tests/diff`, 129 fns)")
 print()
 print("| Benchmark | haste | cargo | Speedup |")
 print("| --- | ---: | ---: | ---: |")

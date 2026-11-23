@@ -120,16 +120,14 @@ impl FunctionBuilder<'_> {
     }
 
     /// Position of the first call in `block` whose callee matches `is_tracked(sym, first_const_arg)`, and whether control can leave `block` normally afterward.
-    pub fn block_first_tracked(&self, block: Block, dict: Option<Value>, mut is_tracked: impl FnMut(u32, Option<i64>) -> bool) -> Option<(usize, bool)> {
+    pub fn block_first_tracked(&self, block: Block, dict: Option<Value>, mut is_tracked: impl FnMut(Option<u32>, Option<i64>) -> bool) -> Option<(usize, bool)> {
         let insts = &self.func.blocks[block.index()].insts;
         let first = insts.iter().position(|&inst| {
             let (callee, args) = match &self.func.insts[inst.index()].op {
                 Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } => (*callee, args),
                 _ => return false,
             };
-            let Some(sym) = resolve_sym(self.func, dict, callee) else {
-                return false;
-            };
+            let sym = resolve_sym(self.func, dict, callee);
             let first_arg = args.first().and_then(|&v| self.const_int(v));
             is_tracked(sym, first_arg)
         })?;

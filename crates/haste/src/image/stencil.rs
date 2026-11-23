@@ -77,7 +77,7 @@ impl CachedTemplate {
 
 pub(super) struct JitTemplate {
     pub stencil: Arc<Code>,
-    pub dict: Option<(usize, Arc<Code>)>,
+    pub dict: Option<(usize, Arc<Code>, Arc<RelocPlan>)>,
     pub fanout: usize,
     pub reloc_plan: Arc<RelocPlan>,
 }

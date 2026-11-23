@@ -364,7 +364,7 @@ impl Emit<'_> {
                         (t, Reg::Rcx)
                     }
                 };
-                self.raw(Reg::Rax, *expected);
+                if size == Size::D { self.get(Reg::Rax, *expected, Ext::Zero); } else { self.raw(Reg::Rax, *expected); }
                 self.asm.cmpxchg(size, target, src);
                 self.asm.hold_eq(res.index() as u32, expected.index() as u32);
                 self.clobber_regs(if src == Reg::Rcx { &[Reg::Rax, Reg::Rcx, Reg::R11] } else { &[Reg::Rax, Reg::R11] });
