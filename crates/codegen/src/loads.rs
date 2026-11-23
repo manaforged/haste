@@ -544,6 +544,7 @@ fn scan(
                 }
                 let keep_fn = |ploc: MemLoc| match ploc.root {
                     MemRoot::Slot(s) => state.prov.slot_unescaped(s),
+                    MemRoot::CallerLoc => !matches!(canon_move.as_ref().map_or(&func.insts[inst.index()].op, |(_, _, m)| m), Op::Call { .. } | Op::TryCall { .. }),
                     MemRoot::NoAliasParam(p) => {
                         let cop = canon_move.as_ref().map_or(&func.insts[inst.index()].op, |(_, _, m)| m);
                         !call_passes_noalias(cop, state.prov, p)
@@ -747,6 +748,7 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     }
     let cfg = func.cfg();
     let prov = Provenance::with_affine(func, &cfg, affine);
+    changed |= remat::drop_dead_caller_loc_stores(func, &cfg, &prov);
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
     changed |= pack::coalesce_loads(func, &prov, target);
     changed |= sink_terminator_defs(func);

@@ -712,3 +712,69 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
     }
     changed
 }
+
+/// Drops stores to the internal `#[track_caller]` TLS cell that no call, return, or load can observe before the cell is overwritten or trapped.
+pub(super) fn drop_dead_caller_loc_stores(func: &mut Function, cfg: &crate::cfg::Cfg, prov: &Provenance) -> bool {
+    if !prov.param_roots.contains(&MemRoot::CallerLoc) {
+        return false;
+    }
+    let zeros = func.thread_cell_zeros();
+    let is_cl = |v: Value| prov.param_roots.get(v.index()).copied() == Some(MemRoot::CallerLoc);
+    let step = |op: &Op, live: bool| match *op {
+        Op::Store(_, addr, 0) if is_cl(addr) => false,
+        Op::Load(addr, 0) if is_cl(addr) => true,
+        Op::Call { callee, .. } | Op::TryCall { callee, .. } => {
+            if prov.frame_runtime(callee).is_some() || (!zeros.is_empty() && func.pure_thread_cell_result(op, |v| zeros[v.index()]).is_some()) {
+                live
+            } else {
+                true
+            }
+        }
+        _ => live,
+    };
+    let n = func.blocks.len();
+    let mut live_in = vec![false; n];
+    loop {
+        let mut changed = false;
+        for &b in cfg.rpo.iter().rev() {
+            let mut live = match func.last(b) {
+                Some(Op::Trap) => false,
+                Some(Op::Return(..)) => true,
+                _ => func.successors(b).any(|s| live_in[s.index()]),
+            };
+            for &inst in func.blocks[b.index()].insts.iter().rev() {
+                live = step(&func.insts[inst.index()].op, live);
+            }
+            if live && !live_in[b.index()] {
+                live_in[b.index()] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut kills = Vec::new();
+    for &b in &cfg.rpo {
+        let mut live = match func.last(b) {
+            Some(Op::Trap) => false,
+            Some(Op::Return(..)) => true,
+            _ => func.successors(b).any(|s| live_in[s.index()]),
+        };
+        let len = func.blocks[b.index()].insts.len();
+        for pos in (0..len).rev() {
+            let inst = func.blocks[b.index()].insts[pos];
+            let op = &func.insts[inst.index()].op;
+            if let Op::Store(_, addr, 0) = *op && is_cl(addr) && !live {
+                kills.push((b.index(), pos));
+            }
+            live = step(op, live);
+        }
+    }
+    let dropped = !kills.is_empty();
+    for (b_idx, pos) in kills {
+        let inst = func.blocks[b_idx].insts.remove(pos);
+        func.insts[inst.index()].op = Op::Trap;
+    }
+    dropped
+}

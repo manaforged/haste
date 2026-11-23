@@ -16,6 +16,7 @@ pub(crate) enum MemRoot {
     ReadonlyParam(u16),
     Global(u32),
     UniqueHeap(Option<Value>),
+    CallerLoc,
     Unknown,
 }
 
@@ -218,11 +219,49 @@ fn seed_fresh_owners(func: &Function, entry: &[Value], affine: &[(Value, i64)], 
     }
 }
 
+fn seed_caller_locs(func: &Function, tracked: &mut [TrackRoot]) -> bool {
+    let zeros = func.thread_cell_zeros();
+    if zeros.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    for data in &func.insts {
+        if let Some(res) = func.caller_loc_result(&data.op, |v| zeros[v.index()]) {
+            tracked[res.index()] = TrackRoot::Set(MemRoot::CallerLoc);
+            found = true;
+        }
+    }
+    found
+}
+
+fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool {
+    let is_cl = |v: Value| tracked[v.index()] == TrackRoot::Set(MemRoot::CallerLoc);
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let op = &func.insts[inst.index()].op;
+            match *op {
+                Op::Load(addr, 0) if is_cl(addr) => {}
+                Op::Store(val, addr, 0) if is_cl(addr) && !is_cl(val) => {}
+                Op::Convert(Convert::Bitcast, _) | Op::Jump(..) | Op::Brif(..) => {}
+                _ => {
+                    let mut bad = false;
+                    op.for_operands(|v| bad |= is_cl(v));
+                    if bad {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> Vec<TrackRoot> {
     let mut tracked = vec![TrackRoot::Unset; func.types.len()];
     seed_entry_roots(func, cfg, &mut tracked);
     let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
     seed_fresh_owners(func, entry, affine, &mut tracked);
+    let has_caller_loc = seed_caller_locs(func, &mut tracked);
     let mut steps = Vec::new();
     let mut changed = false;
     for &b in &cfg.rpo {
@@ -253,6 +292,9 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
         tracked.fill(TrackRoot::Conflict);
     } else {
         tracked.iter_mut().filter(|item| **item == TrackRoot::Unset).for_each(|item| *item = TrackRoot::Conflict);
+        if has_caller_loc && caller_loc_escaped(func, cfg, &tracked) {
+            tracked.iter_mut().filter(|item| **item == TrackRoot::Set(MemRoot::CallerLoc)).for_each(|item| *item = TrackRoot::Conflict);
+        }
     }
     tracked
 }
@@ -491,6 +533,8 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
         }
     }
     match (a.root, b.root) {
+        (MemRoot::CallerLoc, MemRoot::CallerLoc) => a.overlaps(b),
+        (MemRoot::CallerLoc, _) | (_, MemRoot::CallerLoc) => false,
         (MemRoot::Slot(sa), MemRoot::Slot(sb)) => sa == sb,
         (MemRoot::NoAliasParam(pa), MemRoot::NoAliasParam(pb)) => pa == pb,
         (MemRoot::Global(ga), MemRoot::Global(gb)) => ga == gb,
@@ -570,7 +614,7 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
         Op::Move(dst, _, bytes) => may_alias(prov.loc(dst, 0, bytes), loc, prov),
         Op::Copy(dst, _, _) => block_clobbers(dst, loc, prov),
         Op::Call { callee, ref args, .. } if let Some(rt) = prov.frame_runtime(callee) => {
-            rt == RuntimeSymbol::Free && args.first().is_none_or(|&freed| block_clobbers(freed, loc, prov))
+            loc.root != MemRoot::CallerLoc && rt == RuntimeSymbol::Free && args.first().is_none_or(|&freed| block_clobbers(freed, loc, prov))
         }
         Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
             MemRoot::Slot(s) => {
@@ -583,6 +627,7 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
             _ => !prov.private_frame(loc),
         },
         _ => is_atomic_barrier(op)
+            && loc.root != MemRoot::CallerLoc
             && !(prov.private_frame(loc) && !prov.touches_frame(op))
             && !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s)),
     }

@@ -65,6 +65,17 @@ impl Function {
         }
     }
 
+    /// Result value of `op` when it looks up the internal `#[track_caller]` cell (`slot == 0`, `init == 0`).
+    pub(crate) fn caller_loc_result(&self, op: &super::Op, is_zero: impl Fn(Value) -> bool) -> Option<Value> {
+        match op {
+            super::Op::Call { callee, args, results, .. }
+                if self.is_thread_cell(*callee)
+                    && args.first().is_some_and(|&v| is_zero(v))
+                    && args.get(2).is_some_and(|&v| is_zero(v)) => results.first().copied(),
+            _ => None,
+        }
+    }
+
     /// Whether `value` is the address of data that the output image holds.
     pub(crate) fn is_image_addr(&self, value: Value) -> bool {
         self.flags(value) & IMAGE_ADDR != 0
