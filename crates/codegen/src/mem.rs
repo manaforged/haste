@@ -634,8 +634,14 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
         }
         Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
             MemRoot::Slot(s) => {
-                let escaped = if matches!(*op, Op::TryCall { .. }) { !prov.slot_unescaped(s) } else { !prov.slot_addr_unescaped(s) };
-                escaped && prov.slot_escaped_at(s, at) && !prov.slot_call_readonly(s) && (!prov.slot_return_only(s) || args.iter().any(|&arg| prov.loc(arg, 0, 1).root == MemRoot::Slot(s)))
+                if matches!(*op, Op::TryCall { .. }) {
+                    !prov.slot_unescaped(s) && !prov.slot_call_readonly(s)
+                } else {
+                    !prov.slot_addr_unescaped(s)
+                        && prov.slot_escaped_at(s, at)
+                        && !prov.slot_call_readonly(s)
+                        && (!prov.slot_return_only(s) || args.iter().any(|&arg| prov.loc(arg, 0, 1).root == MemRoot::Slot(s)))
+                }
             }
             MemRoot::NoAliasParam(p) => {
                 !prov.noalias_unescaped(p) || call_writes_noalias(&func.sigs[sig.index()].params, args, prov, p)
@@ -645,7 +651,7 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
         _ => is_atomic_barrier(op)
             && loc.root != MemRoot::CallerLoc
             && !(prov.private_frame(loc) && !prov.touches_frame(op))
-            && !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s)),
+            && !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s) || !prov.slot_escaped_at(s, at)),
     }
 }
 
@@ -656,7 +662,8 @@ pub(crate) fn clobbers_load(func: &Function, op: (&Op, Option<Inst>), loc: MemLo
         Op::AtomicStore(val, addr, AtomicOrd::Relaxed | AtomicOrd::Release)
         | Op::AtomicRmw(_, AtomicOrd::Relaxed | AtomicOrd::Release, addr, val)
         | Op::AtomicCas(AtomicOrd::Relaxed | AtomicOrd::Release, addr, _, val) => {
-            may_alias(prov.loc(addr, 0, func.ty(val).bytes()), loc, prov)
+            !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s) || !prov.slot_escaped_at(s, op.1))
+                && may_alias(prov.loc(addr, 0, func.ty(val).bytes()), loc, prov)
         }
         _ => clobbers_op(func, op, loc, prov),
     }

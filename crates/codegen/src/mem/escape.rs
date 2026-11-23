@@ -322,13 +322,14 @@ pub(super) fn classify_uses(
             used.clear();
             data.op.for_operands(|v| {
                 counts.total[v.index()] += 1;
-                used.push((v, counts.safe[v.index()]));
+                used.push((v, counts.safe[v.index()] + counts.unwind_stores[v.index()]));
             });
             classify_inst(&cx, &mut counts, b, pos, data);
             for (i, &(v, before)) in used.iter().enumerate() {
                 let Some(s) = slot_root(v, slots, tracked) else { continue };
                 let uses = used.iter().filter(|&&(u, _)| u == v).count() as u32;
-                if !used[..i].iter().any(|&(u, _)| u == v) && counts.safe[v.index()] - before < uses {
+                let after = counts.safe[v.index()] + counts.unwind_stores[v.index()];
+                if !used[..i].iter().any(|&(u, _)| u == v) && after - before < uses {
                     points.entry(s.0).or_default().push((b.index() as u32, pos as u32));
                 }
             }
