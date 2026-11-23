@@ -4,7 +4,7 @@ use crate::ir::{
 };
 use crate::reloc::RuntimeSymbol;
 
-const FORMAT: u8 = 5;
+const FORMAT: u8 = 6;
 
 macro_rules! table {
     ($name:ident: $ty:ident = [$($variant:ident),* $(,)?]) => {
@@ -344,6 +344,15 @@ impl Writer {
             }
             Op::Store(x, y, offset) => {
                 self.pair(18, 0, (*x, *y));
+                self.i64(i64::from(*offset));
+            }
+            Op::VolatileLoad(x, offset) => {
+                self.byte(39);
+                self.value(*x);
+                self.i64(i64::from(*offset));
+            }
+            Op::VolatileStore(x, y, offset) => {
+                self.pair(40, 0, (*x, *y));
                 self.i64(i64::from(*offset));
             }
             Op::StackAddr(slot, offset) | Op::StackLoad(slot, offset) => {
@@ -691,6 +700,11 @@ impl<'a> Reader<'a> {
             36 => Op::Trap,
             37 => Op::Trapz(self.value()?),
             38 => Op::Assume(self.value()?),
+            39 => Op::VolatileLoad(self.value()?, self.i32()?),
+            40 => {
+                let (x, y) = self.plain_pair()?;
+                Op::VolatileStore(x, y, self.i32()?)
+            }
             _ => return None,
         })
     }

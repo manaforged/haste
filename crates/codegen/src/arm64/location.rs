@@ -41,8 +41,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn invalidate_spills(&mut self) {
-        self.last_spill.clear();
-        self.last_fspill = None;
+        self.spills.clear();
         self.asm.clear_anchor();
     }
 
@@ -51,44 +50,22 @@ impl Emit<'_> {
             return;
         }
         self.asm.clobber_anchor(reg);
-        self.last_spill.clobber(reg);
+        self.spills.clobber_reg(reg);
     }
 
-    pub(super) fn clobber_regs(&mut self, regs: &[Reg]) {
-        for &reg in regs {
-            self.clobber_reg(reg);
-        }
-    }
+    pub(super) fn clobber_regs(&mut self, regs: &[Reg]) { regs.iter().for_each(|&reg| self.clobber_reg(reg)); }
 
-    pub(super) fn clobber_vreg(&mut self, reg: Vreg) {
-        if self.last_fspill.is_some_and(|(_, r, _)| r == reg) {
-            self.last_fspill = None;
-        }
-    }
+    pub(super) fn clobber_vreg(&mut self, reg: Vreg) { self.spills.clobber_freg(reg); }
 
-    pub(super) fn invalidate_disp(&mut self, disp: i32) {
-        self.last_spill.invalidate(disp);
-        if self.last_fspill.is_some_and(|(d, _, _)| d == disp) {
-            self.last_fspill = None;
-        }
-    }
+    pub(super) fn invalidate_disp(&mut self, disp: i32) { self.spills.invalidate_disp(disp); }
 
-    pub(super) fn carry_spills(&mut self, plain: bool) {
-        self.carry.1 = (plain && !self.in_fast).then_some(self.last_spill);
-    }
+    pub(super) fn carry_spills(&mut self, plain: bool) { self.spills.carry(plain && !self.in_fast); }
 
-    pub(super) fn resume_spills(&mut self, block: crate::ir::Block) {
-        if let (Some(from), Some(cache)) = self.carry
-            && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
-        {
-            self.last_spill = cache;
-        }
-        self.carry = (Some(block), None);
-    }
+    pub(super) fn resume_spills(&mut self, block: crate::ir::Block) { self.spills.resume(block); }
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
         self.clobber_reg(reg);
-        self.last_spill.record(disp, reg);
+        self.spills.cache.record(disp, reg);
     }
 
     pub(super) fn write_spill(&mut self, disp: i32, reg: Reg) {
@@ -97,16 +74,7 @@ impl Emit<'_> {
     }
 
     fn cached_spill_for(&self, disp: i32, preferred: Reg) -> Option<Reg> {
-        let mut fallback = None;
-        for r in self.last_spill.holders(disp) {
-            if r == preferred {
-                return Some(r);
-            }
-            if r != super::ZR || fallback.is_none() {
-                fallback = Some(r);
-            }
-        }
-        fallback
+        self.spills.cached_for(disp, preferred, Some(super::ZR))
     }
 
     pub(super) fn slot_address(&mut self, reg: Reg, slot: StackSlot, offset: i32) {
@@ -193,7 +161,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Imm(imm) => {
                 self.asm.mov_imm(reg, imm);
-                self.last_spill.clobber(reg);
+                self.spills.clobber_reg(reg);
             }
             Location::SlotAddr(sym) | Location::Symbol(sym) if self.direct_calls => {
                 let at = self.asm.adrp_add_reloc(reg);
@@ -272,7 +240,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Imm(imm) => {
                 self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed));
-                self.last_spill.clobber(reg);
+                self.spills.clobber_reg(reg);
             }
             Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => self.raw(reg, value),
             Location::Reg(from) if full => {
@@ -314,7 +282,7 @@ impl Emit<'_> {
         };
         let disp = self.frame.values[value.index()];
         let mut fallback = None;
-        for r in self.last_spill.holders(disp) {
+        for r in self.spills.cache.holders(disp) {
             if Self::borrowable(r, scratch) {
                 if r == scratch {
                     return Some(r);
@@ -430,10 +398,7 @@ impl Emit<'_> {
     fn fget_slot(&mut self, reg: Vreg, value: Value, ty: Type) {
         let disp = self.frame.values[value.index()];
         debug_assert_ne!(disp, 0, "unhomed value {value:?} in fget()");
-        if let Some((cached_disp, cached_reg, cached_ty)) = self.last_fspill
-            && cached_disp == disp
-            && cached_ty == ty
-        {
+        if let Some(cached_reg) = self.spills.cached_fspill(disp, ty) {
             self.asm.vmov(reg, cached_reg);
             if cached_reg != reg {
                 self.clobber_vreg(reg);
@@ -441,7 +406,7 @@ impl Emit<'_> {
             return;
         }
         if self.const_bits(value).is_some_and(|imm| self.try_emit_float_imm_bits(ty, imm, reg)) {
-            self.last_fspill = Some((disp, reg, ty));
+            self.spills.fspill = Some((disp, reg, ty));
             return;
         }
         if !ty.is_vector()
@@ -450,13 +415,13 @@ impl Emit<'_> {
         {
             self.asm.fmov_in(ty.bytes() == 8, reg, cached);
             self.clobber_vreg(reg);
-            self.last_fspill = Some((disp, reg, ty));
+            self.spills.fspill = Some((disp, reg, ty));
             return;
         }
         let at = self.frame_mem(disp);
         self.asm.vload(ty.bytes(), reg, at);
         self.clobber_vreg(reg);
-        self.last_fspill = Some((disp, reg, ty));
+        self.spills.fspill = Some((disp, reg, ty));
     }
 
     pub(super) fn fget(&mut self, reg: Vreg, value: Value) {
@@ -491,8 +456,7 @@ impl Emit<'_> {
             _ => {
                 let disp = self.frame.values[value.index()];
                 self.asm.vstore(ty.bytes(), self.at(value), reg);
-                self.invalidate_disp(disp);
-                self.last_fspill = Some((disp, reg, ty));
+                self.spills.write_fspill(disp, reg, ty);
             }
         }
     }
@@ -587,14 +551,10 @@ impl Emit<'_> {
             if let Some(d) = slot_disp {
                 self.write_spill(d, cached);
             }
-        } else if let Some((cd, cr, ct)) = self.last_fspill
-            && cd == src_disp
-            && ct == ty
-        {
+        } else if let Some(cr) = self.spills.cached_fspill(src_disp, ty) {
             self.asm.vstore(ty.bytes(), to, cr);
             if let Some(d) = slot_disp {
-                self.invalidate_disp(d);
-                self.last_fspill = Some((d, cr, ct));
+                self.spills.write_fspill(d, cr, ty);
             }
         } else if self.const_bits(value) == Some(0) {
             self.store_zero(to, slot_disp, ty);
@@ -620,8 +580,7 @@ impl Emit<'_> {
             Location::Float(v) => {
                 self.asm.vstore(ty.bytes(), to, Vreg(v));
                 if let Some(d) = slot_disp {
-                    self.invalidate_disp(d);
-                    self.last_fspill = Some((d, Vreg(v), ty));
+                    self.spills.write_fspill(d, Vreg(v), ty);
                 }
             }
             Location::Slot => self.move_slot_to_slot(to, slot_disp, value, ty),

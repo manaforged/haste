@@ -122,10 +122,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         defs,
         flags: None,
         last_cmp: None,
-        last_spill: crate::spills::SpillCache::new(),
-        last_fspill: None,
-        carry: (None, None),
-        sole_pred: if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() },
+        spills: crate::spills::SpillState::new(if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() }),
         next: None,
         copied,
         direct_calls: target.direct_calls,
@@ -187,10 +184,7 @@ pub(super) struct Emit<'a> {
     defs: Vec<Option<Inst>>,
     flags: Option<(Value, Cond)>,
     last_cmp: Option<(Size, Value, Value, bool)>,
-    last_spill: crate::spills::SpillCache<Reg>,
-    last_fspill: Option<(i32, Vreg, Type)>,
-    carry: (Option<Block>, Option<crate::spills::SpillCache<Reg>>),
-    sole_pred: Vec<Option<Block>>,
+    spills: crate::spills::SpillState<Reg, Vreg>,
     next: Option<Block>,
     copied: Vec<bool>,
     direct_calls: bool,
@@ -235,7 +229,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn intake(&mut self, entry: Block) -> Result<(), String> { intake_params(self, entry) }
     fn set_next(&mut self, next: Option<Block>) { self.next = next; }
     fn bind_block(&mut self, block: Block) { self.invalidate_spills(); self.resume_spills(block); self.asm.bind(self.blocks[block.index()]); }
-    fn bind_entry(&mut self, block: Block) { self.carry = (Some(block), None); self.asm.bind(self.blocks[block.index()]); }
+    fn bind_entry(&mut self, block: Block) { self.spills.bind_entry(block); self.asm.bind(self.blocks[block.index()]); }
     fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
     fn before_block_bind(&mut self, _block: Block) -> Result<(), String> { self.asm.maybe_island()?; Ok(()) }
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> { self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]); Ok(()) }
@@ -659,9 +653,9 @@ impl Emit<'_> {
     }
 
     fn clobber_call_spills(&mut self) {
-        for r in 0..19 { self.last_spill.clobber(Reg(r)); }
-        self.last_spill.clobber(LR);
-        self.last_fspill = None;
+        for r in 0..19 { self.spills.clobber_reg(Reg(r)); }
+        self.spills.clobber_reg(LR);
+        self.spills.clear_fspill();
         self.asm.clear_anchor();
     }
 
@@ -678,7 +672,7 @@ impl Emit<'_> {
             let inlined = self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args);
             if inlined {
                 self.clobber_regs(&[Reg(0), A, C, IP, Reg(17), LR]);
-                self.last_fspill = None;
+                self.spills.clear_fspill();
                 self.asm.clear_anchor();
                 return Ok(abi);
             }
@@ -752,8 +746,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
             }
             ParkReg::Float(v) => {
                 self.asm.vstore(self.ty(value).bytes(), home, Vreg(v));
-                self.invalidate_disp(disp);
-                self.last_fspill = Some((disp, Vreg(v), self.ty(value)));
+                self.spills.write_fspill(disp, Vreg(v), self.ty(value));
             }
         }
     }
@@ -768,7 +761,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
             ParkReg::Float(v) => {
                 self.asm.vload(self.ty(value).bytes(), Vreg(v), home);
                 self.clobber_vreg(Vreg(v));
-                self.last_fspill = Some((disp, Vreg(v), self.ty(value)));
+                self.spills.fspill = Some((disp, Vreg(v), self.ty(value)));
             }
         }
     }

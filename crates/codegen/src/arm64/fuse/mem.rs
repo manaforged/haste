@@ -499,6 +499,8 @@ fn is_mem_barrier(op: &Op) -> bool {
             | Op::StackStore(..)
             | Op::Call { .. }
             | Op::TryCall { .. }
+            | Op::VolatileLoad(..)
+            | Op::VolatileStore(..)
             | Op::AtomicLoad(..)
             | Op::AtomicStore(..)
             | Op::AtomicRmw(..)

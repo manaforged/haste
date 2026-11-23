@@ -1,6 +1,6 @@
 //! The stack slots whose values registers still hold after a spill or reload, shared by the backends' reload caches.
 
-use crate::ir::{Block, Function, Op};
+use crate::ir::{Block, Function, Op, Type};
 
 /// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
 pub(crate) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
@@ -74,5 +74,89 @@ impl<R: Copy + PartialEq> SpillCache<R> {
     /// The registers that hold the slot at `disp`, newest first.
     pub(crate) fn holders(&self, disp: i32) -> impl Iterator<Item = R> + '_ {
         self.0.iter().flatten().filter(move |&&(d, _)| d == disp).map(|&(_, r)| r)
+    }
+}
+
+/// Per-block integer and float spill reload cache with single-predecessor fallthrough carry.
+pub(crate) struct SpillState<R, F> {
+    pub(crate) cache: SpillCache<R>,
+    pub(crate) fspill: Option<(i32, F, Type)>,
+    carry: (Option<Block>, Option<SpillCache<R>>),
+    sole_pred: Vec<Option<Block>>,
+}
+
+impl<R: Copy + PartialEq, F: Copy + PartialEq> SpillState<R, F> {
+    pub(crate) fn new(sole_pred: Vec<Option<Block>>) -> Self {
+        Self { cache: SpillCache::new(), fspill: None, carry: (None, None), sole_pred }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.cache.clear();
+        self.fspill = None;
+    }
+
+    pub(crate) fn clear_fspill(&mut self) {
+        self.fspill = None;
+    }
+
+    pub(crate) fn clobber_reg(&mut self, reg: R) {
+        self.cache.clobber(reg);
+    }
+
+    pub(crate) fn clobber_freg(&mut self, reg: F) {
+        if self.fspill.is_some_and(|(_, r, _)| r == reg) {
+            self.fspill = None;
+        }
+    }
+
+    pub(crate) fn invalidate_disp(&mut self, disp: i32) {
+        self.cache.invalidate(disp);
+        if self.fspill.is_some_and(|(d, _, _)| d == disp) {
+            self.fspill = None;
+        }
+    }
+
+    pub(crate) fn bind_entry(&mut self, block: Block) {
+        self.carry = (Some(block), None);
+    }
+
+    pub(crate) fn carry(&mut self, keep: bool) {
+        self.carry.1 = keep.then_some(self.cache);
+    }
+
+    pub(crate) fn resume(&mut self, block: Block) {
+        if let (Some(from), Some(cache)) = self.carry
+            && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
+        {
+            self.cache = cache;
+        }
+        self.carry = (Some(block), None);
+    }
+
+    pub(crate) fn record(&mut self, disp: i32, reg: R) {
+        self.cache.clobber(reg);
+        self.cache.record(disp, reg);
+    }
+
+    pub(crate) fn write_fspill(&mut self, disp: i32, reg: F, ty: Type) {
+        self.invalidate_disp(disp);
+        self.fspill = Some((disp, reg, ty));
+    }
+
+    pub(crate) fn cached_for(&self, disp: i32, preferred: R, deprioritize: Option<R>) -> Option<R> {
+        let mut fallback = None;
+        for r in self.cache.holders(disp) {
+            if r == preferred {
+                return Some(r);
+            }
+            if deprioritize != Some(r) || fallback.is_none() {
+                fallback = Some(r);
+            }
+        }
+        fallback
+    }
+
+    pub(crate) fn cached_fspill(&self, disp: i32, ty: Type) -> Option<F> {
+        self.fspill.and_then(|(d, r, t)| (d == disp && t == ty).then_some(r))
     }
 }

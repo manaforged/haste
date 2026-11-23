@@ -564,6 +564,8 @@ fn prior_may_trap_or_write(func: &Function, prior: &[Option<Inst>]) -> bool {
                 | Op::StackStore(..)
                 | Op::Copy(..)
                 | Op::Move(..)
+                | Op::VolatileLoad(..)
+                | Op::VolatileStore(..)
                 | Op::AtomicStore(..)
                 | Op::AtomicRmw(..)
                 | Op::AtomicCas(..)

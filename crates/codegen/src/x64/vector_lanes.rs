@@ -538,7 +538,7 @@ impl Emit<'_> {
         }
         let disp = self.frame.values[value.index()];
         let ty = self.ty(value);
-        self.last_fspill.and_then(|(d, r, t)| (d == disp && t == ty).then_some(r))
+        self.spills.cached_fspill(disp, ty)
     }
 
     fn emit_target_binary(&mut self, spec: &TargetOpSpec, (a, b, k): (Value, Value, Option<Value>), imm: Option<u8>, result: Value) {

@@ -59,3 +59,28 @@ pub(crate) fn known_halves<R: Copy>(func: &Function, plan: &Plan<R>, defs: &[Opt
     let (lo, hi) = const_halves(func, plan, defs, v);
     (lo, hi.or_else(|| has_zero_high(func, plan, defs, v).then_some(0)))
 }
+
+/// Shared 128-bit constant-half queries for backend emitters.
+pub(crate) trait WideCtx<R: Copy> {
+    fn wide_ctx(&self) -> (&Function, &Plan<R>, &[Option<Inst>]);
+
+    fn const_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
+        let (f, p, d) = self.wide_ctx();
+        const_halves(f, p, d, v)
+    }
+
+    fn has_zero_high(&self, v: Value) -> bool {
+        let (f, p, d) = self.wide_ctx();
+        has_zero_high(f, p, d, v)
+    }
+
+    fn known_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
+        let (f, p, d) = self.wide_ctx();
+        known_halves(f, p, d, v)
+    }
+
+    fn shift_const(&self, v: Value) -> Option<u8> {
+        let (f, p, d) = self.wide_ctx();
+        shift_const(f, p, d, v)
+    }
+}

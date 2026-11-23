@@ -97,7 +97,9 @@ impl Emit<'_> {
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
             Op::Load(addr, offset) => self.load_at(result()?, *addr, *offset),
+            Op::VolatileLoad(addr, offset) => { let from = self.address(*addr, *offset); self.read(result()?, from); }
             Op::Store(value, addr, offset) => self.store_at(*value, *addr, *offset),
+            Op::VolatileStore(value, addr, offset) => { let to = self.address(*addr, *offset); self.write(*value, to); }
             Op::StackAddr(slot, offset) => {
                 let result = result()?;
                 if !self.plan.is_static(result) {

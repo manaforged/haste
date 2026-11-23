@@ -190,6 +190,7 @@ pub(crate) fn drop_unread_frame_stores(func: &mut Function, cfg: &Cfg, prov: &Pr
                         return false;
                     }
                 }
+                Op::VolatileLoad(..) | Op::VolatileStore(..) => return false,
                 Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
                     if let Some(base) = offs[addr.index()] {
                         let Some(bytes) = data.result.map(|r| func.ty(r).bytes()) else { return false };
@@ -320,7 +321,7 @@ fn store_killed_by_free(
                 Some(false) => {}
                 None => return false,
             },
-            Op::TryCall { .. } | Op::Return(..) | Op::Trap | Op::Trapz(_) | Op::BrTable(..) | Op::Fence(_) => return false,
+            Op::TryCall { .. } | Op::Return(..) | Op::Trap | Op::Trapz(_) | Op::BrTable(..) | Op::Fence(_) | Op::VolatileLoad(..) | Op::VolatileStore(..) => return false,
             Op::AtomicStore(_, _, ord) if !matches!(ord, AtomicOrd::Relaxed) => return false,
             Op::Load(a, o) => {
                 let Some(res) = data.result else { return false };

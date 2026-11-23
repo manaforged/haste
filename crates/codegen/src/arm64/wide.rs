@@ -6,25 +6,15 @@ use crate::ir::{Binary, IntCC, Unary, Value};
 const E: Reg = WIDE_SCRATCH[0];
 const F: Reg = WIDE_SCRATCH[1];
 
-use crate::wide::half_score;
+use crate::wide::{WideCtx, half_score};
+
+impl WideCtx<Reg> for Emit<'_> {
+    fn wide_ctx(&self) -> (&crate::ir::Function, &crate::alloc::Plan<Reg>, &[Option<crate::ir::Inst>]) {
+        (self.func, &self.plan, &self.defs)
+    }
+}
 
 impl Emit<'_> {
-    fn const_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
-        crate::wide::const_halves(self.func, &self.plan, &self.defs, v)
-    }
-
-    fn has_zero_high(&self, v: Value) -> bool {
-        crate::wide::has_zero_high(self.func, &self.plan, &self.defs, v)
-    }
-
-    fn known_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
-        crate::wide::known_halves(self.func, &self.plan, &self.defs, v)
-    }
-
-    fn shift_const(&self, y: Value) -> Option<u8> {
-        crate::wide::shift_const(self.func, &self.plan, &self.defs, y)
-    }
-
     fn load_half(&mut self, high: bool, reg: Reg, value: Value) {
         let half = if high { self.known_halves(value).1 } else { self.const_halves(value).0 };
         if let Some(imm) = half {

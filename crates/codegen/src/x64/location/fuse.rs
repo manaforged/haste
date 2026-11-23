@@ -50,6 +50,8 @@ pub(super) fn may_barrier_mem(op: &Op) -> bool {
             | Op::Fence(..)
             | Op::Call { .. }
             | Op::TryCall { .. }
+            | Op::VolatileLoad(..)
+            | Op::VolatileStore(..)
             | Op::AtomicLoad(..)
             | Op::AtomicStore(..)
             | Op::AtomicRmw(..)

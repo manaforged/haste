@@ -127,10 +127,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         roots,
         pure_test,
         flags: None,
-        last_spill: crate::spills::SpillCache::new(),
-        last_fspill: None,
-        carry: (None, None),
-        sole_pred: if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() },
+        spills: crate::spills::SpillState::new(if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() }),
         next: None,
         last_block,
         at_end: false,
@@ -206,10 +203,7 @@ pub(super) struct Emit<'a> {
     roots: Vec<Option<location::Root>>,
     pure_test: Vec<bool>,
     flags: Option<(Value, Cond)>,
-    last_spill: crate::spills::SpillCache<Reg>,
-    last_fspill: Option<(i32, Xmm, Type)>,
-    carry: (Option<Block>, Option<crate::spills::SpillCache<Reg>>),
-    sole_pred: Vec<Option<Block>>,
+    spills: crate::spills::SpillState<Reg, Xmm>,
     next: Option<Block>,
     last_block: Option<Block>,
     at_end: bool,
@@ -270,7 +264,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn intake(&mut self, entry: Block) -> Result<(), String> { intake_params(self, entry) }
     fn set_next(&mut self, next: Option<Block>) { self.next = next; }
     fn bind_block(&mut self, block: Block) { self.invalidate_spills(); self.resume_spills(block); self.at_end = self.last_block == Some(block); self.asm.flags_overwritten(); self.asm.bind(self.blocks[block.index()]); }
-    fn bind_entry(&mut self, block: Block) { self.carry = (Some(block), None); self.at_end = self.last_block == Some(block); self.asm.bind(self.blocks[block.index()]); }
+    fn bind_entry(&mut self, block: Block) { self.spills.bind_entry(block); self.at_end = self.last_block == Some(block); self.asm.bind(self.blocks[block.index()]); }
     fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> { self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]); Ok(()) }
     fn clear_flags(&mut self) { self.flags = None; }
@@ -759,8 +753,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
             }
             ParkReg::Float(xmm) => {
                 self.xmm_store(self.ty(value), home, Xmm(xmm));
-                self.invalidate_disp(disp);
-                self.last_fspill = Some((disp, Xmm(xmm), self.ty(value)));
+                self.spills.write_fspill(disp, Xmm(xmm), self.ty(value));
             }
         }
     }
@@ -775,7 +768,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
             ParkReg::Float(xmm) => {
                 self.xmm_load(self.ty(value), Xmm(xmm), home);
                 self.clobber_xmm(Xmm(xmm));
-                self.last_fspill = Some((disp, Xmm(xmm), self.ty(value)));
+                self.spills.fspill = Some((disp, Xmm(xmm), self.ty(value)));
             }
         }
     }

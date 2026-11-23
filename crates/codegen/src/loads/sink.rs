@@ -222,7 +222,7 @@ fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenan
     let op = &func.insts[inst.index()].op;
     match *op {
         Op::StackLoad(s, _) | Op::StackAddr(s, _) => s == slot,
-        Op::Load(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
+        Op::Load(addr, _) | Op::VolatileLoad(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
             prov.loc(addr, 0, 1).root == MemRoot::Slot(slot)
         }
         Op::Move(_, src, _) | Op::Copy(_, src, _) => prov.loc(src, 0, 1).root == MemRoot::Slot(slot),
@@ -267,7 +267,7 @@ fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[S
                         }
                     }
                 }
-                Op::Load(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, ..) => {
+                Op::Load(addr, _) | Op::VolatileLoad(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, ..) => {
                     if let MemRoot::Slot(s) = prov.loc(addr, 0, 1).root {
                         let bit = slot_bit[s.index()];
                         if bit != 0 && k_mask & bit == 0 {

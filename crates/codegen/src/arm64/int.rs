@@ -78,7 +78,7 @@ impl Emit<'_> {
         let bits = ty.bits();
         match *op {
             Op::Const(imm) => imm_within(imm, expect_bits),
-            Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => bits <= expect_bits,
+            Op::Load(..) | Op::VolatileLoad(..) | Op::StackLoad(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => bits <= expect_bits,
             Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => expect_bits >= 1,
             Op::Extract(..) | Op::Reduce(..) => ty.is_small_int() && bits <= expect_bits,
             Op::Unary(u, a) => self.unary_zext_within(u, a, (bits, expect_bits, d)),
