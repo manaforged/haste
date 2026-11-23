@@ -86,7 +86,7 @@ const FLAG_PROJ: u8 = 4;
 const FLAG_CLOSURE: u8 = 8;
 const FLAG_NONE: u8 = 16;
 
-const TY_SHARDS: usize = 64;
+const TY_SHARDS: usize = 128;
 const TY_SLAB: usize = 65_536;
 const TY_SLABS: usize = 256;
 
@@ -126,7 +126,7 @@ const PARAM_BASE: u32 = VALUE_BASE + FAST_VALUES;
 const FAST_PARAMS: u32 = 32;
 
 #[derive(Default)]
-struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 5]);
+struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 6]);
 
 /// The type interner.
 #[derive(Clone)]
@@ -157,16 +157,16 @@ impl Default for Types {
     }
 }
 
-fn unary_slot(kind: &Kind) -> Option<(usize, Ty)> {
-    let (slot, inner) = match *kind {
-        Kind::Ref(Mut::Not, inner) => (0, inner),
-        Kind::Ref(Mut::Mut, inner) => (1, inner),
-        Kind::Ptr(Mut::Not, inner) => (2, inner),
-        Kind::Ptr(Mut::Mut, inner) => (3, inner),
-        Kind::Slice(inner) => (4, inner),
-        _ => return None,
-    };
-    (inner != Ty::NONE).then_some((slot, inner))
+fn unary_slot(kind: &Kind) -> Option<(usize, u32)> {
+    match *kind {
+        Kind::Ref(Mut::Not, inner) if inner != Ty::NONE => Some((0, inner.0)),
+        Kind::Ref(Mut::Mut, inner) if inner != Ty::NONE => Some((1, inner.0)),
+        Kind::Ptr(Mut::Not, inner) if inner != Ty::NONE => Some((2, inner.0)),
+        Kind::Ptr(Mut::Mut, inner) if inner != Ty::NONE => Some((3, inner.0)),
+        Kind::Slice(inner) if inner != Ty::NONE => Some((4, inner.0)),
+        Kind::Tuple(substs) if !substs.is_empty() => Some((5, substs.0)),
+        _ => None,
+    }
 }
 
 fn prim_index(primitive: Primitive) -> u32 {
@@ -270,12 +270,12 @@ impl Types {
         if let Some(ty) = fast_ty(&kind) {
             return ty;
         }
-        if let Some((slot, inner)) = unary_slot(&kind) {
-            if let Some(raw) = self.unary.0[slot].get(inner.0 as usize) {
+        if let Some((slot, key)) = unary_slot(&kind) {
+            if let Some(raw) = self.unary.0[slot].get(key as usize) {
                 return Ty(raw - 1);
             }
             let ty = self.intern_slow(kind);
-            self.unary.0[slot].set(inner.0 as usize, ty.0 + 1);
+            self.unary.0[slot].set(key as usize, ty.0 + 1);
             return ty;
         }
         self.intern_slow(kind)

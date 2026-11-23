@@ -183,9 +183,6 @@ impl ReachFilter {
         let name = cx.name(item);
         let mut dep = usize::MAX;
         for block in blocks {
-            if cx.reserved(block) {
-                continue;
-            }
             let member = cx.member(block, name).unwrap_or(item);
             let d = self.compute_seal(cx, member, stack)?;
             dep = dep.min(d);

@@ -184,7 +184,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// How many type arguments impl `block` takes.
     pub fn impl_params(&mut self, block: ImplRef) -> Result<usize> {
-        Ok(type_params(&self.cx.impl_header(block)?.generics).count())
+        Ok(type_params(&self.cx.impl_header_ref(block)?.generics).count())
     }
 
     /// The type parameters of impl `block` set to `args`, and its self type at them.

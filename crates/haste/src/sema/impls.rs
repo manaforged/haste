@@ -153,15 +153,29 @@ impl<'a> Context<'a> {
         Some(self.impl_file(block).source.text(header.body.segments[last as usize].name).to_owned())
     }
 
+    fn ensure_impl_header(&mut self, block: ImplRef) -> Result<&Arc<ImplHeader>> {
+        if !self.headers_local.contains_key(&block) {
+            let found = if let Some(found) = self.store.headers.get(&block) {
+                found
+            } else {
+                let (file, item) = (self.impl_file(block), self.impl_entry(block));
+                let parsed = Arc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
+                self.store.headers.insert(block, Arc::clone(&parsed));
+                parsed
+            };
+            self.headers_local.insert(block, found);
+        }
+        Ok(&self.headers_local[&block])
+    }
+
     /// The parsed header of impl `block`.
     pub fn impl_header(&mut self, block: ImplRef) -> Result<Arc<ImplHeader>> {
-        if let Some(found) = self.store.headers.get(&block) {
-            return Ok(found);
-        }
-        let (file, item) = (self.impl_file(block), self.impl_entry(block));
-        let parsed = Arc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
-        self.store.headers.insert(block, Arc::clone(&parsed));
-        Ok(parsed)
+        Ok(Arc::clone(self.ensure_impl_header(block)?))
+    }
+
+    /// Borrows the parsed header of impl `block` from the per-context cache without cloning its `Arc`.
+    pub fn impl_header_ref(&mut self, block: ImplRef) -> Result<&ImplHeader> {
+        Ok(self.ensure_impl_header(block)?)
     }
 
     fn impl_entry(&self, block: ImplRef) -> &'a crate::outline::item::Item {
@@ -172,8 +186,7 @@ impl<'a> Context<'a> {
         &self.impl_file(block).items.items[at as usize]
     }
 
-    /// Whether impl `block` is a `#[rustc_reservation_impl]`, which selection never picks.
-    pub fn reserved(&self, block: ImplRef) -> bool {
+    fn reserved(&self, block: ImplRef) -> bool {
         let src = &self.impl_file(block).source;
         self.impl_entry(block).attrs.iter().any(|attr| matches!(attr, crate::outline::item::Attr::Other(at) if src.text(*at) == "rustc_reservation_impl"))
     }
@@ -481,7 +494,9 @@ impl<'a> Context<'a> {
             (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
             (false, None) => {}
             (true, _) => {
-                if let Some(of) = self.impl_trait(block) {
+                if !self.reserved(block)
+                    && let Some(of) = self.impl_trait(block)
+                {
                     let bucket = index.traits.entry(of).or_default();
                     bucket.all.push(block);
                     match head {

@@ -95,6 +95,40 @@ impl ActiveAttrs {
     }
 }
 
+pub(super) struct LangMap {
+    pub(super) map: HashMap<ItemRef, u32>,
+    crates_lo: u64,
+    crates_hi: u64,
+    any_high: bool,
+}
+
+impl LangMap {
+    pub(super) fn from_map(map: HashMap<ItemRef, u32>) -> Self {
+        let (mut crates_lo, mut crates_hi, mut any_high) = (0u64, 0u64, false);
+        for item in map.keys() {
+            if item.krate < 64 {
+                crates_lo |= 1u64 << item.krate;
+            } else if item.krate < 128 {
+                crates_hi |= 1u64 << (item.krate - 64);
+            } else {
+                any_high = true;
+            }
+        }
+        Self { map, crates_lo, crates_hi, any_high }
+    }
+
+    #[inline]
+    pub(super) fn has_crate(&self, krate: u32) -> bool {
+        if krate < 64 {
+            self.crates_lo & (1u64 << krate) != 0
+        } else if krate < 128 {
+            self.crates_hi & (1u64 << (krate - 64)) != 0
+        } else {
+            self.any_high
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct OutlineState {
     pub(super) langs: RwLock<Option<Arc<traits::Langs>>>,
@@ -137,7 +171,7 @@ pub(super) struct Lookups {
     pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
     pub(super) file_index: Arc<std::sync::OnceLock<Arc<summary::codec::FileIndex>>>,
-    pub(super) lang_items: Arc<std::sync::OnceLock<HashMap<ItemRef, u32>>>,
+    pub(super) lang_items: Arc<std::sync::OnceLock<Arc<LangMap>>>,
     pub(super) skip_warm_sysroot_bodies: bool,
 }
 

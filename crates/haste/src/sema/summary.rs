@@ -192,7 +192,7 @@ fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
     let sig = cx.signature(item).ok()?;
     let own = super::infer::type_params(&sig.generics).count();
     if let Some(block) = cx.owner_impl(item) {
-        let outer = super::infer::type_params(&cx.impl_header(block).ok()?.generics).count();
+        let outer = super::infer::type_params(&cx.impl_header_ref(block).ok()?.generics).count();
         return Some(outer + own);
     }
     if let Some(of) = cx.owner_trait(item) {

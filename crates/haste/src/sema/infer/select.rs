@@ -85,6 +85,7 @@ impl<'a> Infer<'_, 'a> {
             if check_trail && self.trail_depth > 0 && self.var_trail.iter().any(|&(i, _)| i == index) { return false; }
             ty = bound;
         }
+        if self.cx.types.is_ground(ty) { return true; }
         if self.has_params(ty) { return false; }
         let kind = self.cx.types.kind(ty);
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || (!local && matches!(kind, Kind::Closure(..))) { return false; }
@@ -154,7 +155,6 @@ impl<'a> Infer<'_, 'a> {
         let blocks = self.cx.trait_impls(of, head(self.cx.types.kind(self_ty)), &holders);
         let opaque_var = matches!(self.cx.types.kind(self_ty), Kind::Var(_));
         let mut found = Vec::new();
-        let blocks: Vec<ImplRef> = blocks.into_iter().filter(|&block| !self.cx.reserved(block)).collect();
         for block in blocks {
             if opaque_var && !self.blanket(block)? { continue; }
             let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());

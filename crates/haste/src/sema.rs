@@ -63,9 +63,11 @@ pub struct Context<'a> {
     pub(super) form_stack: Vec<(infer::Form, usize)>,
     global_asm: Option<Arc<global_asm::Table>>,
     langs: Option<Arc<traits::Langs>>,
+    lang_map: std::cell::OnceCell<Arc<lookups::LangMap>>,
     crate_owners: Vec<Option<Arc<HashMap<(u32, Option<u32>), u32>>>>,
     crate_modules: Vec<Option<Arc<HashMap<(u32, u32), u32>>>>,
     crate_heads: Vec<Option<Arc<impls::Index>>>,
+    headers_local: HashMap<impls::ImplRef, Arc<sig::ImplHeader>>,
     trait_members_local: std::cell::RefCell<HashMap<ItemRef, Arc<HashMap<&'a str, ItemRef>>>>,
 }
 
@@ -132,9 +134,11 @@ impl<'a> Context<'a> {
             form_stack: Vec::new(),
             global_asm: None,
             langs: None,
+            lang_map: std::cell::OnceCell::new(),
             crate_owners: vec![None; outline.crates.len()],
             crate_modules: vec![None; outline.crates.len()],
             crate_heads: vec![None; outline.crates.len()],
+            headers_local: HashMap::default(),
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
         }
     }
@@ -160,9 +164,11 @@ impl<'a> Context<'a> {
             form_stack: Vec::new(),
             global_asm: self.global_asm.clone(),
             langs: self.langs.clone(),
+            lang_map: std::cell::OnceCell::new(),
             crate_owners: vec![None; crates],
             crate_modules: vec![None; crates],
             crate_heads: vec![None; crates],
+            headers_local: HashMap::default(),
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
         }
     }

@@ -13,18 +13,57 @@ use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
 use super::{Infer, Res};
 
+/// Stack-inline path segment symbols avoiding heap allocation for paths of up to 4 segments.
+pub struct PathSyms {
+    inline: [Sym; 4],
+    len: u8,
+    overflow: Vec<Sym>,
+}
+
+impl PathSyms {
+    /// An empty segment list.
+    pub const EMPTY: Self = Self { inline: [Sym(0); 4], len: 0, overflow: Vec::new() };
+
+    /// Shortens the segment list to at most `len` elements.
+    pub fn truncate(&mut self, len: usize) {
+        if self.len == u8::MAX {
+            self.overflow.truncate(len);
+        } else if len < usize::from(self.len) {
+            self.len = len as u8;
+        }
+    }
+}
+
+impl std::ops::Deref for PathSyms {
+    type Target = [Sym];
+
+    #[inline]
+    fn deref(&self) -> &[Sym] {
+        if self.len == u8::MAX { &self.overflow } else { &self.inline[..usize::from(self.len)] }
+    }
+}
+
 /// The interned segments of `path` in `arena`, whether it starts with `::`, and the crate a leading `$crate` names.
-pub fn segments(symbols: &Symbols, src: &Source, arena: &Body, path: PathId) -> (Vec<Sym>, bool, Option<u32>) {
+pub fn segments(symbols: &Symbols, src: &Source, arena: &Body, path: PathId) -> (PathSyms, bool, Option<u32>) {
     let path = arena.path(path);
     let syms = arena.syms(symbols, src);
-    let segments: Vec<Sym> = arena.list(path.segments).iter().map(|&at| syms[at as usize]).collect();
-    let first = arena.list(path.segments).first().map(|&at| arena.segments[at as usize].name).unwrap_or(0);
+    let list = arena.list(path.segments);
+    let segments = if list.len() <= 4 {
+        let mut inline = [Sym(0); 4];
+        for (slot, &at) in inline.iter_mut().zip(list) {
+            *slot = syms[at as usize];
+        }
+        PathSyms { inline, len: list.len() as u8, overflow: Vec::new() }
+    } else {
+        PathSyms { inline: [Sym(0); 4], len: u8::MAX, overflow: list.iter().map(|&at| syms[at as usize]).collect() }
+    };
+    let first = list.first().map(|&at| arena.segments[at as usize].name).unwrap_or(0);
     let dollar = first.checked_sub(1).and_then(|at| src.dollar(at));
     (segments, path.global, dollar)
 }
 
 impl<'a> Infer<'_, 'a> {
-    pub(super) fn segments(&self, arena: &Body, path: PathId) -> (Vec<Sym>, bool, Option<u32>) {
+    pub(super) fn segments(&self, arena: &Body, path: PathId) -> (PathSyms, bool, Option<u32>) {
         segments(&self.cx.names.symbols, self.src, arena, path)
     }
 
@@ -596,7 +635,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let owner = match *arena.ty(inner) {
             syntax::Ty::Path(named) if arena.path(named).qself.is_none() => self.segments(arena, named).0,
-            _ => Vec::new(),
+            _ => PathSyms::EMPTY,
         };
         let name = self.segments(arena, path).0;
         if let ([owner], [name]) = (&owner[..], &name[..])
