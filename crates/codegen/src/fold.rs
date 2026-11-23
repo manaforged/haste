@@ -765,4 +765,4 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }
 }
 
-pub(crate) use crate::thread::compact;
+pub(crate) use crate::ir::compact;

@@ -117,7 +117,13 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Fill => fill::run(func),
         Pass::Fold => fold::run(func, effort),
         Pass::Merge => merge::run(func),
-        Pass::Promote => promote::step(func, moves),
+        Pass::Promote => {
+            let did = promote::step(func, moves);
+            if !did.is_empty() && func.slots.len() > 64 {
+                crate::ir::compact_slots(func);
+            }
+            did
+        }
         Pass::Cse => cse::run(func),
         Pass::Loads => loads::run(func, moves == promote::Moves::Split, target),
         Pass::Thread => thread::run(func),

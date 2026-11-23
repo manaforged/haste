@@ -291,13 +291,21 @@ impl Path {
 
     pub(super) fn proves_add_rel(&self, func: &Function, ranges: &Ranges, ty: Type, a: Value, b: Value, strict: bool) -> bool {
         let is_add = |v: Value| matches!(ranges.op(func, v), Some(Op::Binary(Binary::Iadd, ..)));
-        if self.rels().is_empty() && !is_add(b) {
+        let b_is_add = is_add(b);
+        if self.rels().is_empty() && !b_is_add {
+            return false;
+        }
+        let into_b = !self.rels().is_empty() && self.steps_into(ty, b, UNSIGNED);
+        if !b_is_add && !into_b && !is_add(a) {
             return false;
         }
         let (forms, len) = self.add_const_chain(func, ranges, a, ty);
         let a_forms = &forms[..len];
-        let into_b = self.steps_into(ty, b, UNSIGNED);
-        let (b_steps, b_len) = if is_add(b) { self.non_wrap_iadd_chain(func, ranges, b, ty) } else { ([(b, 0); CHAIN_STEPS], 0) };
+        let multi = a_forms.len() > 1;
+        if !b_is_add && !into_b && !multi {
+            return false;
+        }
+        let (b_steps, b_len) = if b_is_add { self.non_wrap_iadd_chain(func, ranges, b, ty) } else { ([(b, 0); CHAIN_STEPS], 0) };
         let mut uppers = self.uppers.0.borrow_mut();
         let values = uppers.of(self.rels(), ty);
         if into_b {
@@ -305,22 +313,30 @@ impl Path {
                 steps.get_or_insert_with(|| self.non_wrap_iadd_chain(func, ranges, *s, ty));
             }
         }
-        let multi = a_forms.len() > 1;
-        let upper_terms = b_steps[..b_len].iter().map(|&(b_base, k)| (b, b_base, k)).chain(
-            values.iter().filter(|(s, _)| into_b || *s == b).flat_map(|&(s, ref steps)| {
-                let chain = match steps {
-                    Some((steps, len)) if s != b => &steps[..*len],
-                    _ => &[][..],
-                };
-                multi.then_some((s, s, 0)).into_iter().chain(chain.iter().map(move |&(s_base, k)| (s, s_base, k)))
-            }),
-        );
-        if upper_terms.clone().next().is_none() || (!multi && !upper_terms.clone().any(|(_, _, k)| k > 0)) {
+        let mut terms: Vec<(Value, Value, u64)> = Vec::new();
+        for &(b_base, k) in &b_steps[..b_len] {
+            terms.push((b, b_base, k));
+        }
+        let mut any_pos = terms.iter().any(|&(_, _, k)| k > 0);
+        for &(s, ref steps) in values.iter().filter(|(s, _)| into_b || *s == b) {
+            if multi {
+                terms.push((s, s, 0));
+            }
+            if s != b
+                && let Some((steps, slen)) = steps
+            {
+                for &(s_base, k) in &steps[..*slen] {
+                    any_pos |= k > 0;
+                    terms.push((s, s_base, k));
+                }
+            }
+        }
+        if terms.is_empty() || (!multi && !any_pos) {
             return false;
         }
         for &(a_base, c) in a_forms {
             let mut from_a = None;
-            for (s, s_base, k) in upper_terms.clone() {
+            for &(s, s_base, k) in &terms {
                 let require_strict = if c <= k {
                     strict && c == k
                 } else if !strict && k.checked_add(1) == Some(c) {

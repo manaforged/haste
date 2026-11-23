@@ -1,6 +1,7 @@
 use std::fmt;
 
 mod atomic;
+mod compact;
 mod consts;
 mod edges;
 mod flags;
@@ -8,6 +9,7 @@ mod rodata;
 mod vector;
 
 pub use atomic::{AtomicOrd, AtomicRmwOp};
+pub(crate) use compact::{compact, compact_slots};
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
 pub(crate) use vector::{CfgCache, Domain};
 
