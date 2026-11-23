@@ -699,6 +699,9 @@ fn fuse_block_shift(
     if matches!(sop, Binary::Ishl | Binary::Ushr | Binary::Sshr) && func.ty(res).is_small_int() {
         bits::try_fuse_bfx(func, plan, info, (b_idx, pos, res), (sop, x, y));
     }
+    if matches!(sop, Binary::Ishl | Binary::Ushr) && matches!(func.ty(res), Type::I32 | Type::I64) && !plan.elided[x.index()] {
+        peel_other_uextend(func, plan, info, (b_idx, pos, res), x);
+    }
 }
 
 fn fuse_block_icmp(

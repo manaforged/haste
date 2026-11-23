@@ -347,6 +347,26 @@ fn validate_plan(plan: LocPlan, pred: Block, state: &State<'_>, join: &JoinCtx<'
     }
 }
 
+fn create_join_phi(
+    func: &mut Function,
+    (join_block, loc, ty): (Block, MemLoc, Type),
+    state: &mut State<'_>,
+    known: &mut KnownLoads,
+    join: &mut JoinCtx<'_>,
+    vals: Vec<(Block, Value)>,
+) -> Value {
+    let phi = func.value(ty);
+    func.blocks[join_block.index()].params.push(phi);
+    state.subst.push(phi);
+    state.consts.push(None);
+    join.def_blocks.resize(func.types.len(), Some(join_block));
+    join.def_blocks[phi.index()] = Some(join_block);
+    join.added_phis[join_block.index()] += 1;
+    vals.into_iter().for_each(|(p, v)| for_edge_args_mut(func, p, join_block, |a| a.push(v)));
+    known.remember(loc, ty, phi);
+    phi
+}
+
 fn finish_join_forward(
     func: &mut Function,
     (join_block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
@@ -386,15 +406,7 @@ fn finish_join_forward(
         let val = materialize_plan(func, state, ty, plan, &mut emit);
         vals.push((p, val));
     }
-    let phi = func.value(ty);
-    func.blocks[join_block.index()].params.push(phi);
-    state.subst.push(phi);
-    state.consts.push(None);
-    def_blocks.resize(func.types.len(), Some(join_block));
-    def_blocks[phi.index()] = Some(join_block);
-    join.added_phis[join_block.index()] += 1;
-    vals.into_iter().for_each(|(p, v)| for_edge_args_mut(func, p, join_block, |a| a.push(v)));
-    known.remember(loc, ty, phi);
+    let phi = create_join_phi(func, (join_block, loc, ty), state, known, join, vals);
     Some(Some(phi))
 }
 
@@ -540,22 +552,98 @@ fn try_phi_addr_join(
     None
 }
 
+fn prior_may_trap_or_write(func: &Function, prior: &[Option<Inst>]) -> bool {
+    prior.iter().flatten().any(|&i| {
+        matches!(
+            func.insts[i.index()].op,
+            Op::Trap
+                | Op::Trapz(..)
+                | Op::Call { .. }
+                | Op::TryCall { .. }
+                | Op::Store(..)
+                | Op::StackStore(..)
+                | Op::Copy(..)
+                | Op::Move(..)
+                | Op::AtomicStore(..)
+                | Op::AtomicRmw(..)
+                | Op::AtomicCas(..)
+                | Op::Binary(Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem, ..)
+        )
+    })
+}
+
+fn try_cold_load_pre(
+    func: &mut Function,
+    (block, inst, loc, ty): (Block, Inst, MemLoc, Type),
+    state: &mut State<'_>,
+    known: &mut KnownLoads,
+    join: &mut JoinCtx<'_>,
+    prior: &[Option<Inst>],
+) -> Option<Option<Value>> {
+    let preds = join.preds.as_ref().filter(|p| p.len() <= 4)?;
+    if join.added_phis[block.index()] >= MAX_JOIN_PHIS_PER_BLOCK || !(ty.is_small_int() || ty.is_float()) || prior_may_trap_or_write(func, prior) {
+        return None;
+    }
+    let (reload_op, addr_def) = match func.insts[inst.index()].op {
+        Op::Load(raw_addr, off) => {
+            let addr = find(state.subst, raw_addr);
+            (Op::Load(addr, off), Some(join.def_blocks.get(addr.index()).copied().flatten()?))
+        }
+        Op::StackLoad(slot, off) => (Op::StackLoad(slot, off), None),
+        _ => return None,
+    };
+    let mut actions = Vec::with_capacity(preds.len());
+    let (mut known_hot, mut reloads) = (0_usize, 0_usize);
+    for &p in preds {
+        if let Some(plan) = plan_loc(func, state, &join.known_out[p.index()], loc, ty).and_then(|pl| validate_plan(pl, p, state, join)) {
+            known_hot += usize::from(!func.block_has_call(p));
+            actions.push((p, Some(plan)));
+        } else if func.block_has_call(p)
+            && matches!(func.last(p), Some(Op::Jump(t, _)) if *t == block)
+            && addr_def.is_none_or(|d| join.cfg.dominates(d, p))
+        {
+            reloads += 1;
+            actions.push((p, None));
+        } else {
+            return None;
+        }
+    }
+    if known_hot == 0 || reloads == 0 {
+        return None;
+    }
+    let mut vals = Vec::with_capacity(actions.len());
+    let def_blocks = &mut *join.def_blocks;
+    for (p, plan) in actions {
+        let val = match plan {
+            Some(pl) => materialize_plan(func, state, ty, pl, |f, s, op_ty, op| emit_pred_inst(f, s, def_blocks, p, op_ty, op)),
+            None => emit_pred_inst(func, state, def_blocks, p, ty, reload_op.clone()),
+        };
+        vals.push((p, val));
+    }
+    let phi = create_join_phi(func, (block, loc, ty), state, known, join, vals);
+    Some(Some(phi))
+}
+
 pub(super) fn try_join_phi_forward(
     func: &mut Function,
     (block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
     state: &mut State<'_>,
     known: &mut KnownLoads,
     join: &mut JoinCtx<'_>,
-    clobbers_seen: &[BlockClobber],
+    (clobbers_seen, prior): (&[BlockClobber], &[Option<Inst>]),
 ) -> Option<Option<Value>> {
     if let Some(preds) = join.preds.as_ref()
         && !matches!(loc.base, MemBase::Addr(b) if !join.def_blocks.get(b.index()).copied().flatten().is_some_and(|d| d != block && join.cfg.dominates(d, block)))
         && !join_clobbered(func, state.prov, loc, clobbers_seen)
-        && let Some(plans) = collect_pred_plans(preds, |p| {
-            plan_loc(func, state, &join.known_out[p.index()], loc, ty).and_then(|pl| validate_plan(pl, p, state, join))
-        })
     {
-        return finish_join_forward(func, (block, inst, loc, ty, result), state, known, join, plans);
+        if let Some(plans) = collect_pred_plans(preds, |p| {
+            plan_loc(func, state, &join.known_out[p.index()], loc, ty).and_then(|pl| validate_plan(pl, p, state, join))
+        }) {
+            return finish_join_forward(func, (block, inst, loc, ty, result), state, known, join, plans);
+        }
+        if let Some(pre) = try_cold_load_pre(func, (block, inst, loc, ty), state, known, join, prior) {
+            return Some(pre);
+        }
     }
     try_phi_addr_join(func, (block, inst, loc, ty, result), state, known, join, clobbers_seen)
 }

@@ -564,17 +564,18 @@ impl Emit<'_> {
 
     fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), bits: u8, dst: Reg) {
         let alu = match op { Binary::Ishl => Alu::Lslv, Binary::Ushr => Alu::Lsrv, _ => Alu::Asrv };
+        let peeled = if bits >= 32 && matches!(op, Binary::Ishl | Binary::Ushr) { self.peel_uextend(x) } else { x };
         if let Some(count) = self.plan.const_of(y) {
             let count = (count as u8) & (bits - 1);
-            if bits == 32 && op == Binary::Ushr && count != 0 { let value = self.bits(x, A); return self.asm.shift32_imm(false, dst, value, count); }
-            let value = self.shift_src(op, x);
+            if bits == 32 && op == Binary::Ushr && count != 0 { let value = if peeled != x { self.zext_src(peeled, A) } else { self.bits(x, A) }; return self.asm.shift32_imm(false, dst, value, count); }
+            let value = if peeled != x { self.zext_src(peeled, A) } else { self.shift_src(op, x) };
             if count == 0 { self.asm.mov(dst, value); return; }
             match alu { Alu::Lslv => self.asm.lsl_imm(dst, value, count), Alu::Lsrv => self.asm.lsr_imm(dst, value, count), _ => self.asm.asr_imm(dst, value, count) }
             return;
         }
         let y = self.unwrap_shift_mask(y, bits);
         if bits >= 32 {
-            let (value, count) = self.bits_pair(x, y);
+            let (value, count) = if peeled != x { (self.zext_src(peeled, A), self.bits(y, C)) } else { self.bits_pair(x, y) };
             return self.asm.alu(alu, if bits == 32 { Size::W } else { Size::X }, dst, value, count);
         }
         let (value, count) = (self.shift_src(op, x), self.bits(y, C));
