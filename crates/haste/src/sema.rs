@@ -66,7 +66,7 @@ pub struct Context<'a> {
     crate_owners: Vec<Option<Arc<HashMap<(u32, Option<u32>), u32>>>>,
     crate_modules: Vec<Option<Arc<HashMap<(u32, u32), u32>>>>,
     crate_heads: Vec<Option<Arc<impls::Index>>>,
-    trait_member_l1: std::cell::RefCell<Option<Box<[traits::MemberSlot; 256]>>>,
+    trait_members_local: std::cell::RefCell<HashMap<ItemRef, Arc<HashMap<&'a str, ItemRef>>>>,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
@@ -135,7 +135,7 @@ impl<'a> Context<'a> {
             crate_owners: vec![None; outline.crates.len()],
             crate_modules: vec![None; outline.crates.len()],
             crate_heads: vec![None; outline.crates.len()],
-            trait_member_l1: std::cell::RefCell::new(None),
+            trait_members_local: std::cell::RefCell::new(HashMap::default()),
         }
     }
 
@@ -163,7 +163,7 @@ impl<'a> Context<'a> {
             crate_owners: vec![None; crates],
             crate_modules: vec![None; crates],
             crate_heads: vec![None; crates],
-            trait_member_l1: std::cell::RefCell::new(None),
+            trait_members_local: std::cell::RefCell::new(HashMap::default()),
         }
     }
 

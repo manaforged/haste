@@ -34,7 +34,8 @@ impl Token {
     }
 
     /// Whether the next token follows with no space between them.
-    fn joint(self) -> bool {
+    #[inline]
+    pub(crate) fn joint(self) -> bool {
         self.len & JOINT != 0
     }
 
@@ -383,6 +384,12 @@ impl Source {
     pub fn kind(&self, at: u32) -> TokenKind {
         let (src, local) = self.layer(at);
         src.tokens.at(local).map_or(TokenKind::Eof, |token| token.kind)
+    }
+
+    #[inline]
+    pub(crate) fn token_at(&self, at: u32) -> Option<Token> {
+        let (src, local) = self.layer(at);
+        src.tokens.at(local)
     }
 
     /// The token ranges of the comma-separated arguments in the group that opens at `open`.

@@ -45,6 +45,22 @@ impl Form {
     }
 }
 
+fn instantiate_ty(mut types: &super::super::ty::Types, ty: Ty, args: &[Ty]) -> Ty {
+    if !types.has_params(ty) {
+        return ty;
+    }
+    if let Kind::Param(index) = *types.kind(ty) {
+        return args.get(index as usize).copied().unwrap_or(ty);
+    }
+    let Ok(mapped) = super::super::ty::try_map_children::<_, std::convert::Infallible>(
+        &mut types,
+        ty,
+        |t| *t,
+        &mut |t, inner| Ok(instantiate_ty(*t, inner, args)),
+    );
+    mapped
+}
+
 /// The names of the type parameters of `params` in `src`, each paired with its argument in `args`.
 pub fn named_args<'a>(src: &'a Source, params: &[Generic], args: &[Ty]) -> Vec<(&'a str, Ty)> {
     type_params(params).map(|generic| src.text(generic.name)).zip(args.iter().copied()).collect()
@@ -233,16 +249,8 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// `ty` of a generic form with each rigid parameter `index` replaced by `args[index]`.
-    pub(super) fn instantiate(&mut self, ty: Ty, args: &[Ty]) -> Ty {
-        if !self.cx.types.has_params(ty) {
-            return ty;
-        }
-        if let Kind::Param(index) = *self.cx.types.kind(ty) {
-            return args.get(index as usize).copied().unwrap_or(ty);
-        }
-        let kind = self.cx.types.kind(ty).clone();
-        let mapped = self.map_kind(&kind, |this, inner| this.instantiate(inner, args));
-        self.cx.types.intern(mapped)
+    pub(super) fn instantiate(&self, ty: Ty, args: &[Ty]) -> Ty {
+        instantiate_ty(&self.cx.types, ty, args)
     }
 
     /// The headers whose generic parameters and where clauses the frame's type parameters come from: the item's own, its impl's, and its trait's.

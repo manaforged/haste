@@ -72,14 +72,17 @@ impl<'a> Context<'a> {
 
     /// The value of `#[lang = "..."]` on `item`.
     pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
+        let (src, entry) = self.item(item);
+        if entry.attrs.is_empty() {
+            return None;
+        }
         if item.outer().is_some() {
-            let (src, entry) = self.item(item);
             let at = active_attr_at(&self.outline.crates[item.krate as usize].env, src, &entry.attrs, "lang")?;
             return Some(src.text(at + 2).trim_matches('"'));
         }
         let map = self.store.lookups.lang_items.get_or_init(|| self.build_lang_map());
         let &val = map.get(&item)?;
-        Some(self.file(item).source.text(val).trim_matches('"'))
+        Some(src.text(val).trim_matches('"'))
     }
 
     fn build_lang_map(&self) -> HashMap<ItemRef, u32> {

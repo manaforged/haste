@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::names::{ItemRef, Primitive};
 use crate::sync::{AtomicU32Slab, Interner, Slab};
 
-use super::substs::{Pools, ProjDef, ProjId, ProjPool, Substs, SubstsPool};
+use super::substs::{ProjDef, ProjId, ProjPool, Substs, SubstsPool};
 
 /// An interned type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,40 +74,10 @@ impl Kind {
         first.into_iter().chain(items.iter().copied()).chain(extra.iter().copied())
     }
 
-    /// This shape with each type directly inside it replaced by `f` of that type, interning slices and projections in `pools`.
-    pub fn map_pool(&self, pools: &Pools, mut f: impl FnMut(Ty) -> Ty) -> Kind {
-        match self {
-            Kind::Tuple(items) => Kind::Tuple(pools.substs.map(*items, &mut f)),
-            Kind::Ref(mutable, inner) => Kind::Ref(*mutable, f(*inner)),
-            Kind::Ptr(mutable, inner) => Kind::Ptr(*mutable, f(*inner)),
-            Kind::Array(inner, len) => Kind::Array(f(*inner), f(*len)),
-            Kind::Slice(inner) => Kind::Slice(f(*inner)),
-            Kind::Adt(item, args) => Kind::Adt(*item, pools.substs.map(*args, &mut f)),
-            Kind::FnDef(item, args) => Kind::FnDef(*item, pools.substs.map(*args, &mut f)),
-            Kind::Closure(parent, args, at) => Kind::Closure(*parent, pools.substs.map(*args, &mut f), *at),
-            Kind::Dyn(of, args, members, autos) => Kind::Dyn(*of, pools.substs.map(*args, &mut f), members.clone(), autos.clone()),
-            Kind::FnPtr(params, ret) => {
-                let params = pools.substs.map(*params, &mut f);
-                Kind::FnPtr(params, f(*ret))
-            }
-            Kind::Pat(base, start, end) => Kind::Pat(f(*base), *start, *end),
-            Kind::Proj(id) => map_proj(pools, *id, &mut f),
-            other => other.clone(),
-        }
-    }
-
     /// Whether a value of this shape has no size known before it runs, so a pointer to it carries metadata.
     pub fn is_unsized(&self) -> bool {
         matches!(self, Kind::Slice(_) | Kind::Prim(Primitive::Str) | Kind::Dyn(..))
     }
-}
-
-fn map_proj(pools: &Pools, id: ProjId, f: &mut impl FnMut(Ty) -> Ty) -> Kind {
-    let def = pools.projs.get(id);
-    let self_ty = f(def.self_ty);
-    let args = pools.substs.map(def.args, f);
-    let own = pools.substs.map(def.own, f);
-    if self_ty == def.self_ty && args == def.args && own == def.own { Kind::Proj(id) } else { Kind::Proj(pools.projs.intern(ProjDef { self_ty, args, own, ..def })) }
 }
 
 const FLAG_PARAM: u8 = 1;
@@ -218,16 +188,6 @@ fn fast_ty(kind: &Kind) -> Option<Ty> {
 }
 
 impl Types {
-    /// Clones the handle to the `[Ty]` slice interner.
-    pub fn pool(&self) -> SubstsPool {
-        self.substs.clone()
-    }
-
-    /// Clones the handles to both the slice and projection interners.
-    pub fn pools(&self) -> Pools {
-        Pools { substs: self.substs.clone(), projs: self.projs.clone() }
-    }
-
     /// Interns `slice` into a `Substs` handle.
     pub fn intern_substs(&self, slice: &[Ty]) -> Substs {
         self.substs.intern(slice)
@@ -236,6 +196,11 @@ impl Types {
     /// The slice of type arguments that `id` names.
     pub fn substs(&self, id: Substs) -> &[Ty] {
         self.substs.get(id)
+    }
+
+    /// Maps `f` across `id` in place without cloning the interner handle.
+    pub fn map_substs(&self, id: Substs, f: &mut impl FnMut(Ty) -> Ty) -> Substs {
+        self.substs.map(id, f)
     }
 
     /// Interns `def` into a `ProjId` handle.
@@ -374,6 +339,172 @@ impl Types {
             _ => None,
         }
     }
+}
+
+/// Maps each element of `id` via `f` without cloning pool handles or heap-allocating for up to 8 arguments.
+pub(in crate::sema) fn try_map_substs<S, E>(
+    state: &mut S,
+    id: Substs,
+    types_of: fn(&S) -> &Types,
+    f: &mut impl FnMut(&mut S, Ty) -> Result<Ty, E>,
+) -> Result<Substs, E> {
+    if id.is_empty() {
+        return Ok(Substs::EMPTY);
+    }
+    enum SliceCopy {
+        One(Ty),
+        Small([Ty; 8], usize),
+        Large(Vec<Ty>),
+    }
+    let copied = {
+        let slice = types_of(state).substs(id);
+        match slice.len() {
+            1 => SliceCopy::One(slice[0]),
+            len if len <= 8 => {
+                let mut buf = [Ty::NONE; 8];
+                buf[..len].copy_from_slice(slice);
+                SliceCopy::Small(buf, len)
+            }
+            _ => SliceCopy::Large(slice.to_vec()),
+        }
+    };
+    match copied {
+        SliceCopy::One(ty) => {
+            let mapped = f(state, ty)?;
+            Ok(if mapped == ty { id } else { types_of(state).intern_substs(&[mapped]) })
+        }
+        SliceCopy::Small(mut buf, len) => {
+            let mut changed = false;
+            for slot in &mut buf[..len] {
+                let mapped = f(state, *slot)?;
+                if mapped != *slot {
+                    *slot = mapped;
+                    changed = true;
+                }
+            }
+            Ok(if changed { types_of(state).intern_substs(&buf[..len]) } else { id })
+        }
+        SliceCopy::Large(mut vec) => {
+            let mut changed = false;
+            for slot in &mut vec {
+                let mapped = f(state, *slot)?;
+                if mapped != *slot {
+                    *slot = mapped;
+                    changed = true;
+                }
+            }
+            Ok(if changed { types_of(state).intern_substs(&vec) } else { id })
+        }
+    }
+}
+
+enum ChildShape {
+    Tuple(Substs),
+    Ref(Mut, Ty),
+    Ptr(Mut, Ty),
+    Array(Ty, Ty),
+    Slice(Ty),
+    Adt(ItemRef, Substs),
+    FnDef(ItemRef, Substs),
+    Closure(ItemRef, Substs, u32),
+    Dyn(ItemRef, Substs, Vec<ItemRef>, Vec<ItemRef>),
+    FnPtr(Substs, Ty),
+    Pat(Ty, u128, u128),
+    Proj(ProjId),
+}
+
+/// Maps direct child types of `ty` via `f` without cloning `Kind` or pool handles, returning `ty` unchanged when no child changed.
+pub(in crate::sema) fn try_map_children<S, E>(
+    state: &mut S,
+    ty: Ty,
+    types_of: fn(&S) -> &Types,
+    f: &mut impl FnMut(&mut S, Ty) -> Result<Ty, E>,
+) -> Result<Ty, E> {
+    let shape = match types_of(state).kind(ty) {
+        Kind::Tuple(items) => ChildShape::Tuple(*items),
+        Kind::Ref(mutable, inner) => ChildShape::Ref(*mutable, *inner),
+        Kind::Ptr(mutable, inner) => ChildShape::Ptr(*mutable, *inner),
+        Kind::Array(inner, len) => ChildShape::Array(*inner, *len),
+        Kind::Slice(inner) => ChildShape::Slice(*inner),
+        Kind::Adt(item, args) => ChildShape::Adt(*item, *args),
+        Kind::FnDef(item, args) => ChildShape::FnDef(*item, *args),
+        Kind::Closure(parent, args, at) => ChildShape::Closure(*parent, *args, *at),
+        Kind::Dyn(of, args, members, autos) => ChildShape::Dyn(*of, *args, members.clone(), autos.clone()),
+        Kind::FnPtr(params, ret) => ChildShape::FnPtr(*params, *ret),
+        Kind::Pat(base, start, end) => ChildShape::Pat(*base, *start, *end),
+        Kind::Proj(id) => ChildShape::Proj(*id),
+        _ => return Ok(ty),
+    };
+    let next = match shape {
+        ChildShape::Tuple(items) => {
+            let mapped = try_map_substs(state, items, types_of, f)?;
+            if mapped == items { return Ok(ty); }
+            Kind::Tuple(mapped)
+        }
+        ChildShape::Ref(mutable, inner) => {
+            let mapped = f(state, inner)?;
+            if mapped == inner { return Ok(ty); }
+            Kind::Ref(mutable, mapped)
+        }
+        ChildShape::Ptr(mutable, inner) => {
+            let mapped = f(state, inner)?;
+            if mapped == inner { return Ok(ty); }
+            Kind::Ptr(mutable, mapped)
+        }
+        ChildShape::Array(inner, len) => {
+            let m_inner = f(state, inner)?;
+            let m_len = f(state, len)?;
+            if m_inner == inner && m_len == len { return Ok(ty); }
+            Kind::Array(m_inner, m_len)
+        }
+        ChildShape::Slice(inner) => {
+            let mapped = f(state, inner)?;
+            if mapped == inner { return Ok(ty); }
+            Kind::Slice(mapped)
+        }
+        ChildShape::Adt(item, args) => {
+            let mapped = try_map_substs(state, args, types_of, f)?;
+            if mapped == args { return Ok(ty); }
+            Kind::Adt(item, mapped)
+        }
+        ChildShape::FnDef(item, args) => {
+            let mapped = try_map_substs(state, args, types_of, f)?;
+            if mapped == args { return Ok(ty); }
+            Kind::FnDef(item, mapped)
+        }
+        ChildShape::Closure(parent, args, at) => {
+            let mapped = try_map_substs(state, args, types_of, f)?;
+            if mapped == args { return Ok(ty); }
+            Kind::Closure(parent, mapped, at)
+        }
+        ChildShape::Dyn(of, args, members, autos) => {
+            let mapped = try_map_substs(state, args, types_of, f)?;
+            if mapped == args { return Ok(ty); }
+            Kind::Dyn(of, mapped, members, autos)
+        }
+        ChildShape::FnPtr(params, ret) => {
+            let m_params = try_map_substs(state, params, types_of, f)?;
+            let m_ret = f(state, ret)?;
+            if m_params == params && m_ret == ret { return Ok(ty); }
+            Kind::FnPtr(m_params, m_ret)
+        }
+        ChildShape::Pat(base, start, end) => {
+            let mapped = f(state, base)?;
+            if mapped == base { return Ok(ty); }
+            Kind::Pat(mapped, start, end)
+        }
+        ChildShape::Proj(id) => {
+            let def = types_of(state).proj(id);
+            let self_ty = f(state, def.self_ty)?;
+            let args = try_map_substs(state, def.args, types_of, f)?;
+            let own = try_map_substs(state, def.own, types_of, f)?;
+            if self_ty == def.self_ty && args == def.args && own == def.own {
+                return Ok(ty);
+            }
+            Kind::Proj(types_of(state).intern_proj(ProjDef { self_ty, args, own, ..def }))
+        }
+    };
+    Ok(types_of(state).intern(next))
 }
 
 /// The value with the low `bits` bits set: the mask of an integer that wide.

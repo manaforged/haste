@@ -112,27 +112,30 @@ impl Infer<'_, '_> {
         if !self.cx.types.has_var_flag(ty) {
             return ty;
         }
-        let kind = self.cx.types.kind(ty).clone();
-        let fallback = match kind {
-            Kind::IntVar(_) => self.cx.types.prim(Primitive::I32),
-            Kind::FloatVar(_) => self.cx.types.prim(Primitive::F64),
-            Kind::Var(_) => self.cx.types.unit(),
+        match self.cx.types.kind(ty) {
+            Kind::IntVar(_) => if fall_back { self.cx.types.prim(Primitive::I32) } else { ty },
+            Kind::FloatVar(_) => if fall_back { self.cx.types.prim(Primitive::F64) } else { ty },
+            Kind::Var(_) => if fall_back { self.cx.types.unit() } else { ty },
             _ => {
-                let kind = self.map_kind(&kind, |this, item| this.fill(item, fall_back));
-                return self.cx.types.intern(kind);
+                let Ok(mapped) = super::super::ty::try_map_children::<_, std::convert::Infallible>(
+                    self,
+                    ty,
+                    |this| &this.cx.types,
+                    &mut |this, item| Ok(this.fill(item, fall_back)),
+                );
+                mapped
             }
-        };
-        if fall_back { fallback } else { ty }
+        }
     }
 
     pub(super) fn map_substs(&mut self, id: super::super::substs::Substs, mut f: impl FnMut(&mut Self, Ty) -> Ty) -> super::super::substs::Substs {
-        let pool = self.cx.types.pool();
-        pool.map(id, &mut |ty| f(self, ty))
-    }
-
-    pub(super) fn map_kind(&mut self, kind: &Kind, mut f: impl FnMut(&mut Self, Ty) -> Ty) -> Kind {
-        let pools = self.cx.types.pools();
-        kind.map_pool(&pools, |ty| f(self, ty))
+        let Ok(mapped) = super::super::ty::try_map_substs::<_, std::convert::Infallible>(
+            self,
+            id,
+            |this| &this.cx.types,
+            &mut |this, ty| Ok(f(this, ty)),
+        );
+        mapped
     }
 
     fn settle_all(&mut self) -> Result<()> {
@@ -236,8 +239,12 @@ impl Infer<'_, '_> {
     }
 
     fn fall_back_numbers(&mut self) -> Result<()> {
-        let exprs = self.out.exprs.iter().copied().filter(|ty| *ty != Ty::NONE);
-        let roots: Vec<Ty> = exprs.chain(self.out.locals.iter().map(|local| local.ty)).collect();
+        let exprs = self.out.exprs.iter().copied().filter(|&ty| ty != Ty::NONE && self.cx.types.has_var_flag(ty));
+        let locals = self.out.locals.iter().map(|local| local.ty).filter(|&ty| self.cx.types.has_var_flag(ty));
+        let roots: Vec<Ty> = exprs.chain(locals).collect();
+        if roots.is_empty() {
+            return Ok(());
+        }
         self.fall_back_in(roots)
     }
 
@@ -245,8 +252,11 @@ impl Infer<'_, '_> {
     pub(super) fn fall_back_in(&mut self, mut stack: Vec<Ty>) -> Result<()> {
         let mut seen = HashSet::default();
         while let Some(ty) = stack.pop() {
+            if !self.cx.types.has_var_flag(ty) {
+                continue;
+            }
             let ty = self.resolve(ty);
-            if !seen.insert(ty) {
+            if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
                 continue;
             }
             let fallback = match self.cx.types.kind(ty) {
@@ -541,8 +551,11 @@ impl Infer<'_, '_> {
     }
 
     fn check_no_type_vars(&self, ty: Ty, seen: &mut HashSet<Ty>) -> Result<()> {
+        if !self.cx.types.has_var_flag(ty) {
+            return Ok(());
+        }
         let ty = self.resolve(ty);
-        if !seen.insert(ty) {
+        if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
             return Ok(());
         }
         match self.cx.types.kind(ty) {

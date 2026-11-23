@@ -46,14 +46,17 @@ impl<'a> Cursor<'a> {
         crate::outline::attr::attrs(self.src, from, false, &mut parsed).is_ok() && !env.enabled(&parsed)
     }
 
+    #[inline]
     pub fn kind_at(&self, at: u32) -> TokenKind {
         if at < self.end { self.src.kind(at) } else { TokenKind::Eof }
     }
 
+    #[inline]
     pub fn kind(&self) -> TokenKind {
         self.kind_at(self.at)
     }
 
+    #[inline]
     pub fn done(&self) -> bool {
         self.at >= self.end
     }
@@ -84,14 +87,17 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    #[inline]
     pub fn punct_at(&self, at: u32, text: &str) -> bool {
         punct_in(self.src, (at, self.end), text)
     }
 
+    #[inline]
     pub fn punct(&self, text: &str) -> bool {
         self.punct_at(self.at, text)
     }
 
+    #[inline]
     pub fn eat(&mut self, text: &str) -> bool {
         let found = self.punct(text);
         if found {
@@ -278,11 +284,20 @@ const PUNCT_KINDS: [Option<TokenKind>; 128] = {
 };
 
 /// Whether the joined punctuation tokens of `src` from `at` spell `text` and end before `end`.
+#[inline]
 pub(crate) fn punct_in(src: &Source, (at, end): (u32, u32), text: &str) -> bool {
-    let last = at + text.len() as u32 - 1;
-    last < end && text.bytes().zip(at..).all(|(byte, here)| Some(src.kind(here)) == punct_kind(byte) && (here == last || src.joint(here)))
+    let bytes = text.as_bytes();
+    if bytes.len() == 1 {
+        return at < end && Some(src.kind(at)) == punct_kind(bytes[0]);
+    }
+    let last = at + bytes.len() as u32 - 1;
+    last < end
+        && bytes.iter().zip(at..).all(|(&byte, here)| {
+            src.token_at(here).is_some_and(|tok| Some(tok.kind) == punct_kind(byte) && (here == last || tok.joint()))
+        })
 }
 
+#[inline]
 fn punct_kind(byte: u8) -> Option<TokenKind> {
     PUNCT_KINDS.get(byte as usize).copied().flatten()
 }

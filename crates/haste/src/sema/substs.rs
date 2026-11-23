@@ -69,9 +69,22 @@ impl SubstsPool {
             return Substs::EMPTY;
         }
         let slice = self.get(id);
+        if let &[ty] = slice {
+            let mapped = f(ty);
+            return if mapped == ty { id } else { self.intern(&[mapped]) };
+        }
         for (idx, &ty) in slice.iter().enumerate() {
             let mapped = f(ty);
             if mapped != ty {
+                if slice.len() <= 8 {
+                    let mut buf = [Ty::NONE; 8];
+                    buf[..idx].copy_from_slice(&slice[..idx]);
+                    buf[idx] = mapped;
+                    for (slot, &rest) in buf[idx + 1..slice.len()].iter_mut().zip(&slice[idx + 1..]) {
+                        *slot = f(rest);
+                    }
+                    return self.intern(&buf[..slice.len()]);
+                }
                 let mut out = Vec::with_capacity(slice.len());
                 out.extend_from_slice(&slice[..idx]);
                 out.push(mapped);
@@ -113,13 +126,6 @@ impl ProjPool {
     pub fn get(&self, id: ProjId) -> ProjDef {
         *self.inner.get(slot(id.0).expect("interned projection"))
     }
-}
-
-/// Cloned handles to the slice and projection interners of `Types`.
-#[derive(Clone, Default)]
-pub struct Pools {
-    pub substs: SubstsPool,
-    pub projs: ProjPool,
 }
 
 /// A sorted immutable key-value table backed by a single boxed slice.
