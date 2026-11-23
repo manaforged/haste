@@ -160,7 +160,7 @@ impl Tokens {
     }
 
     fn copy_local(&mut self, layer: &Source, local: usize, mark: Option<Mark>) {
-        let token = layer.tokens[local];
+        let token = layer.tokens.at(local).expect("token index in bounds");
         if let Some(mark) = mark {
             self.marks.push((self.tokens.len() as u32, mark));
         }
@@ -333,10 +333,10 @@ impl Source {
         }
         let ((first, start), (last, end)) = (self.layer(from), self.layer(to - 1));
         if std::ptr::eq(first, last) {
-            let (Some(first_tok), Some(last_tok)) = (first.tokens.get(start), last.tokens.get(end)) else {
+            let (Some((f_start, _)), Some((l_start, l_len))) = (first.tokens.raw_span(start), last.tokens.raw_span(end)) else {
                 return false;
             };
-            let span = &first.text[first_tok.start as usize..last_tok.end() as usize];
+            let span = &first.text[f_start as usize..(l_start + (l_len & !JOINT)) as usize];
             if !span.contains(word) {
                 return false;
             }
@@ -347,10 +347,11 @@ impl Source {
     /// The text of token `at`.
     pub fn text(&self, at: u32) -> &str {
         let (src, local) = self.layer(at);
-        let Some(&token) = src.tokens.get(local) else {
+        let Some((start, raw_len)) = src.tokens.raw_span(local) else {
             return "";
         };
-        &src.text[token.start as usize..token.end() as usize]
+        let end = start + (raw_len & !JOINT);
+        &src.text[start as usize..end as usize]
     }
 
     /// The source text from the start of token `from` to the end of token `to`, inclusive, within the layer of `from`.
@@ -366,10 +367,10 @@ impl Source {
             let clamped = to.min(self.offset.saturating_sub(1)).saturating_sub(src.offset) as usize;
             clamped.min(src.tokens.len().saturating_sub(1))
         };
-        let (Some(&first), Some(&last)) = (src.tokens.get(first), src.tokens.get(last)) else {
+        let (Some((f_start, _)), Some((l_start, l_len))) = (src.tokens.raw_span(first), src.tokens.raw_span(last)) else {
             return "";
         };
-        let (start, end) = (first.start as usize, last.end() as usize);
+        let (start, end) = (f_start as usize, (l_start + (l_len & !JOINT)) as usize);
         if start > end || end > src.text.len() {
             return "";
         }
@@ -379,7 +380,7 @@ impl Source {
     /// The kind of token `at`, or `Eof` past the end.
     pub fn kind(&self, at: u32) -> TokenKind {
         let (src, local) = self.layer(at);
-        src.tokens.get(local).map_or(TokenKind::Eof, |token| token.kind)
+        src.tokens.at(local).map_or(TokenKind::Eof, |token| token.kind)
     }
 
     /// The token ranges of the comma-separated arguments in the group that opens at `open`.
@@ -402,7 +403,7 @@ impl Source {
     /// The index of the delimiter that matches token `at`.
     pub fn pair(&self, at: u32) -> u32 {
         let (src, local) = self.layer(at);
-        src.tokens.get(local).map_or(at, |token| token.pair + (at - local as u32))
+        src.tokens.at(local).map_or(at, |token| token.pair + (at - local as u32))
     }
 
     /// The tokens from `from` up to `to` as `stringify!` spells them.
@@ -436,7 +437,7 @@ impl Source {
 
     pub fn joint(&self, at: u32) -> bool {
         let (src, local) = self.layer(at);
-        src.tokens.get(local).is_some_and(|token| token.joint())
+        src.tokens.raw_span(local).is_some_and(|(_, raw_len)| raw_len & JOINT != 0)
     }
 
     /// The crate that the `$crate` starting at token `at` names, when a macro wrote it.
@@ -494,7 +495,7 @@ impl Source {
     pub fn origin(&self, at: u32) -> Option<u32> {
         let (src, local) = self.layer(at);
         match &src.origins {
-            Origins::Read => src.tokens.get(local).map(|token| token.start),
+            Origins::Read => src.tokens.raw_span(local).map(|(start, _)| start),
             Origins::Copied(copied) => copied.binary_search_by_key(&(local as u32), |&(token, _)| token).ok().map(|found| copied[found].1),
         }
     }
@@ -507,7 +508,7 @@ impl Source {
     /// The byte offset of token `at` in the text of its layer.
     pub fn byte(&self, at: u32) -> u32 {
         let (src, local) = self.layer(at);
-        src.tokens.get(local).map_or(src.text.len() as u32, |token| token.start)
+        src.tokens.raw_span(local).map_or(src.text.len() as u32, |(start, _)| start)
     }
 
     /// The line of token `at` in the text of its layer, counting from one.

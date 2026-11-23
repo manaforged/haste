@@ -557,7 +557,7 @@ fn read_file(cur: &mut Cursor<'_>, backing: &Arc<Backing>, file_off: usize, base
     let text_start = file_off + cur.pos;
     cur.take(text_len)?;
     let text_end = file_off + cur.pos;
-    let text = SourceText::mapped(Arc::clone(backing), text_start, text_end)?;
+    let text = SourceText::mapped_trusted(Arc::clone(backing), text_start, text_end)?;
     let tok_count = cur.count()?;
     let tok_bytes = tok_count.checked_mul(TOKEN_WIRE_LEN).context("token stream overflow")?;
     let tok_start = file_off + cur.pos;

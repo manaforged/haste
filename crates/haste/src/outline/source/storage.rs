@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result, bail};
 
 use crate::substrate::Backing;
-use crate::substrate::sysroot::tokens::{TOKEN_WIRE_LEN, decode_tokens_slice};
+use crate::substrate::sysroot::tokens::{TOKEN_WIRE_LEN, decode_token_at, decode_tokens_slice, token_raw_span_at};
 
 use super::Token;
 
@@ -29,10 +29,11 @@ impl SourceText {
         Self(TextRepr::Owned(text))
     }
 
-    /// Creates zero-copy mapped source text from `backing[start..end]` after validating UTF-8 and bounds.
-    pub fn mapped(backing: Arc<Backing>, start: usize, end: usize) -> Result<Self> {
-        let slice = backing.as_slice().get(start..end).context("mapped source text out of bounds")?;
-        std::str::from_utf8(slice).context("invalid utf-8 in mapped source text")?;
+    /// Creates zero-copy mapped source text from trusted cache bytes `backing[start..end]` after checking bounds.
+    pub fn mapped_trusted(backing: Arc<Backing>, start: usize, end: usize) -> Result<Self> {
+        if start > end || end > backing.as_slice().len() {
+            bail!("mapped source text out of bounds");
+        }
         Ok(Self(TextRepr::Mapped { backing, start, end }))
     }
 
@@ -42,7 +43,7 @@ impl SourceText {
         match &self.0 {
             TextRepr::Owned(text) => text.as_str(),
             TextRepr::Mapped { backing, start, end } => {
-                // SAFETY: `start..end` was bounds-checked and validated as UTF-8 in `SourceText::mapped`.
+                // SAFETY: `start..end` was bounds-checked in `SourceText::mapped_trusted` over UTF-8 source bytes written by this cache.
                 unsafe { std::str::from_utf8_unchecked(&backing.as_slice()[*start..*end]) }
             }
         }
@@ -178,6 +179,40 @@ impl SourceTokens {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.len(),
             TokensRepr::Lazy { count, .. } => *count,
+        }
+    }
+
+    /// Returns token `index` in O(1), decoding only that 14-byte record from mmap when lazy.
+    #[inline]
+    pub fn at(&self, index: usize) -> Option<Token> {
+        match &self.0 {
+            TokensRepr::Eager(tokens) => tokens.get(index).copied(),
+            TokensRepr::Lazy { backing, start, count, decoded, .. } => {
+                if let Some(tokens) = decoded.get() {
+                    return tokens.get(index).copied();
+                }
+                if index >= *count {
+                    return None;
+                }
+                Some(decode_token_at(backing.as_slice(), *start + index * TOKEN_WIRE_LEN))
+            }
+        }
+    }
+
+    /// Returns `(start, raw_len)` of token `index` in O(1) without decoding its `TokenKind`.
+    #[inline]
+    pub fn raw_span(&self, index: usize) -> Option<(u32, u32)> {
+        match &self.0 {
+            TokensRepr::Eager(tokens) => tokens.get(index).map(|t| (t.start, t.raw().0)),
+            TokensRepr::Lazy { backing, start, count, decoded, .. } => {
+                if let Some(tokens) = decoded.get() {
+                    return tokens.get(index).map(|t| (t.start, t.raw().0));
+                }
+                if index >= *count {
+                    return None;
+                }
+                Some(token_raw_span_at(backing.as_slice(), *start + index * TOKEN_WIRE_LEN))
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::names::{Binding, Crate as NamesCrate, Def, ItemRef, ModRef, Ns, Origin, PRIMITIVES, PerNs, Scope, Sym, Unresolved, collect::Pending};
+use crate::names::{Binding, Crate as NamesCrate, Def, ItemRef, ModRef, Ns, Origin, PRIMITIVES, PerNs, Scope, Sym, UNDERSCORE, Unresolved, collect::Pending};
 use crate::sema::summary::codec::{Cursor, write_u32};
 
 use super::tokens::{read_str, read_u32s_map, read_vis, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str, write_usize, write_vis};
@@ -40,13 +40,6 @@ impl<'a> SliceReader<'a> {
     fn u32(&mut self) -> Result<u32> {
         let s = self.take(4)?;
         Ok(u32_le(s, 0))
-    }
-
-    #[inline]
-    fn syms(&mut self) -> Result<Vec<Sym>> {
-        let len = self.u32()? as usize;
-        let bytes = self.take(len.checked_mul(4).context("sym list overflow")?)?;
-        Ok(bytes.chunks_exact(4).map(|c| Sym(u32_le(c, 0))).collect())
     }
 }
 
@@ -135,28 +128,27 @@ fn read_binding(reader: &mut SliceReader<'_>, remap: &[u32]) -> Result<Binding> 
 
 pub(super) fn write_names_crate(out: &mut Vec<u8>, krate: &NamesCrate, tables: &mut Tables<'_>) -> Option<()> {
     write_usize(out, krate.scopes.len())?;
-    let scope_len_at = out.len();
-    write_u32(out, 0);
-    let scope_start = out.len();
+    let mut scope_ends = Vec::with_capacity(krate.scopes.len());
+    let mut scope_buf = Vec::new();
     for scope in &krate.scopes {
-        write_usize(out, scope.names.len())?;
+        write_usize(&mut scope_buf, scope.names.len())?;
         for (&sym, per) in &scope.names {
-            write_u32(out, tables.sym(sym));
+            write_u32(&mut scope_buf, tables.sym(sym));
             let mask = u8::from(per.types.is_some()) | (u8::from(per.values.is_some()) << 1) | (u8::from(per.macros.is_some()) << 2);
-            out.push(mask);
+            scope_buf.push(mask);
             for ns in [Ns::Types, Ns::Values, Ns::Macros] {
                 if let Some(binding) = per.get(ns) {
-                    write_binding(out, binding, tables)?;
+                    write_binding(&mut scope_buf, binding, tables)?;
                 }
             }
         }
-        write_usize(out, scope.log.len())?;
-        for &sym in &scope.log {
-            write_u32(out, tables.sym(sym));
-        }
+        scope_ends.push(u32::try_from(scope_buf.len()).ok()?);
     }
-    let scope_bytes = u32::try_from(out.len() - scope_start).ok()?;
-    out[scope_len_at..scope_len_at + 4].copy_from_slice(&scope_bytes.to_le_bytes());
+    for end in scope_ends {
+        write_u32(out, end);
+    }
+    write_usize(out, scope_buf.len())?;
+    out.extend_from_slice(&scope_buf);
 
     match krate.prelude {
         Some(m) => { out.push(1); write_u32(out, tables.local_krate(m.krate as usize)?); write_u32(out, m.module); }
@@ -183,8 +175,9 @@ pub(super) fn write_names_crate(out: &mut Vec<u8>, krate: &NamesCrate, tables: &
     for &c in &krate.collected {
         write_opt_u32(out, c.map(|v| v as u32));
     }
-    write_usize(out, krate.pending.len())?;
-    for p in &krate.pending {
+    let kept_pending: Vec<&Pending> = krate.pending.iter().filter(|p| p.name.is_none() || p.name == Some(UNDERSCORE)).collect();
+    write_usize(out, kept_pending.len())?;
+    for p in kept_pending {
         write_u32(out, p.module);
         write_u32(out, p.file);
         write_u32(out, p.import);
@@ -219,30 +212,49 @@ pub(super) fn write_names_crate(out: &mut Vec<u8>, krate: &NamesCrate, tables: &
     Some(())
 }
 
+fn decode_scope(slice: &[u8], remap: &[u32]) -> Result<Scope> {
+    let mut reader = SliceReader::new(slice);
+    let name_len = reader.u32()? as usize;
+    let mut names = HashMap::with_capacity_and_hasher(name_len, Default::default());
+    for _ in 0..name_len {
+        let b = reader.take(5)?;
+        let sym = Sym(u32_le(b, 0));
+        let mask = b[4];
+        let types = if mask & 1 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
+        let values = if mask & 2 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
+        let macros = if mask & 4 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
+        names.insert(sym, PerNs { types, values, macros });
+    }
+    if reader.pos != slice.len() {
+        bail!("trailing bytes in sysroot scope");
+    }
+    Ok(Scope { names, log: Vec::new() })
+}
+
 pub(super) fn read_names_crate(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<NamesCrate> {
     let scope_len = cur.count()?;
-    let scope_byte_len = cur.count()?;
-    let scope_bytes = cur.take(scope_byte_len)?;
-    let mut reader = SliceReader::new(scope_bytes);
-    let mut scopes = Vec::with_capacity(scope_len);
-    for _ in 0..scope_len {
-        let name_len = reader.u32()? as usize;
-        let mut names = HashMap::with_capacity_and_hasher(name_len, Default::default());
-        for _ in 0..name_len {
-            let b = reader.take(5)?;
-            let sym = Sym(u32_le(b, 0));
-            let mask = b[4];
-            let types = if mask & 1 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
-            let values = if mask & 2 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
-            let macros = if mask & 4 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
-            names.insert(sym, PerNs { types, values, macros });
+    let end_bytes = cur.take(scope_len.checked_mul(4).context("scope table overflow")?)?;
+    let mut ranges = Vec::with_capacity(scope_len);
+    let mut prev = 0usize;
+    for c in end_bytes.chunks_exact(4) {
+        let end = u32_le(c, 0) as usize;
+        if end < prev {
+            bail!("non-monotonic sysroot scope offset");
         }
-        let log = reader.syms()?;
-        scopes.push(Scope { names, log });
+        ranges.push((prev, end));
+        prev = end;
     }
-    if reader.pos != scope_bytes.len() {
-        bail!("trailing bytes in sysroot scopes");
+    let scope_byte_len = cur.count()?;
+    if prev != scope_byte_len {
+        bail!("sysroot scope table length mismatch");
     }
+    let scope_bytes = cur.take(scope_byte_len)?;
+    let scopes: Vec<Scope> = if scope_len >= 64 && scope_byte_len >= 64 * 1024 && crate::jobs() > 1 {
+        let slices: Vec<&[u8]> = ranges.into_iter().map(|(s, e)| &scope_bytes[s..e]).collect();
+        crate::sync::parallel_map(slices, |s| decode_scope(s, remap)).into_iter().collect::<Result<Vec<_>>>()?
+    } else {
+        ranges.into_iter().map(|(s, e)| decode_scope(&scope_bytes[s..e], remap)).collect::<Result<Vec<_>>>()?
+    };
 
     let prelude = if cur.u8()? != 0 {
         let b = cur.take(8)?;
