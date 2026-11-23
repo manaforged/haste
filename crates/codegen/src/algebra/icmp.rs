@@ -1,6 +1,6 @@
 use crate::cse::flip_int_cc;
 use crate::fold::{Before, extend, holds, known_bits, non_null_at};
-use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 use super::{RewriteCx, const_u128, op_of};
 
@@ -529,19 +529,50 @@ fn emit_cmp_const(cx: &mut RewriteCx, cc: IntCC, lhs: Value, c: i64) -> Op {
     Op::Icmp(cc, lhs, rhs)
 }
 
-/// Folds an equality compare of `x + c` or `x - c` against `x` for a nonzero constant `c`, which never holds even when the add wraps.
-pub(super) fn offset_self(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+/// Peels zero-preserving ops (`x * odd`, exact `x >> k` / `x << k`, `-x`) from a small-int value tested only against zero.
+pub(super) fn strip_zero_test(cx: &RewriteCx, v: Value) -> Option<Value> {
+    let ty = cx.func.ty(v);
+    if !ty.is_small_int() { return None; }
+    let (bits, w) = (ty.bits(), ty.unsigned_max());
+    let mut cur = v;
+    for _ in 0..4 {
+        let next = match cx.op(cur)? {
+            Op::Binary(Binary::Imul, a, b) => [(*a, *b), (*b, *a)].into_iter().find_map(|(x, k)| {
+                cx.uconst(k, ty).filter(|&c| (c & 1) == 1).map(|_| x)
+            }),
+            Op::Binary(Binary::Ushr, a, sh) => cx.count(*sh, ty).filter(|&k| k > 0 && k < bits).and_then(|k| {
+                let lo = (1_u64 << k) - 1;
+                ((cx.known(*a).0 & lo) == lo).then_some(*a)
+            }),
+            Op::Binary(Binary::Ishl, a, sh) => cx.count(*sh, ty).filter(|&k| k > 0 && k < bits).and_then(|k| {
+                let hi = w & !((1_u64 << (bits - k)) - 1);
+                ((cx.known(*a).0 & hi) == hi).then_some(*a)
+            }),
+            Op::Unary(Unary::Ineg, a) => Some(*a),
+            _ => None,
+        };
+        let Some(inner) = next else { break };
+        cur = inner;
+    }
+    (cur != v).then_some(cur)
+}
+
+/// Simplifies an equality compare of `x + y` or `x - y` against `x`: folds constant `y` and rewrites variable `y` to `y == 0` / `y != 0`.
+pub(super) fn offset_self(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     if !matches!(cc, IntCC::Equal | IntCC::NotEqual) { return None; }
     let ty = cx.func.ty(x);
-    [(x, y), (y, x)].into_iter().find_map(|(moved, base)| {
-        let step = match *cx.op(moved)? {
-            Op::Binary(Binary::Iadd, p, q) if p == base => q,
-            Op::Binary(Binary::Iadd, p, q) if q == base => p,
-            Op::Binary(Binary::Isub, p, q) if p == base => q,
-            _ => return None,
-        };
-        cx.uconst(step, ty).filter(|&c| c != 0).map(|_| Op::Const(i64::from(cc == IntCC::NotEqual)))
-    })
+    if !ty.is_small_int() { return None; }
+    let step = [(x, y), (y, x)].into_iter().find_map(|(moved, base)| match *cx.op(moved)? {
+        Op::Binary(Binary::Iadd, p, q) if p == base => Some(q),
+        Op::Binary(Binary::Iadd, p, q) if q == base => Some(p),
+        Op::Binary(Binary::Isub, p, q) if p == base => Some(q),
+        _ => None,
+    })?;
+    if let Some(c) = cx.uconst(step, ty) {
+        return Some(Op::Const(i64::from((c != 0) == (cc == IntCC::NotEqual))));
+    }
+    let zero = cx.emit(ty, Op::Const(0));
+    Some(Op::Icmp(cc, step, zero))
 }
 
 /// Rewrites an unsigned compare of a single-use `x + c1` against `c2` into `x` against `c2 - c1` when `x + c1` cannot wrap.

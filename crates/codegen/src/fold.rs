@@ -169,6 +169,7 @@ pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>
         Op::Binary(Binary::Bor, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (za & zb & w, (oa | ob) & w) }
         Op::Binary(Binary::Bxor, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (((za & zb) | (oa & ob)) & w, ((za & ob) | (oa & zb)) & w) }
         Op::Binary(op @ (Binary::Ushr | Binary::Ishl), a, sh) => known(sh).map_or((0, 0), |c| known_shift_bits(op, ty, rec(a), c)),
+        Op::Binary(Binary::Imul, a, b) => { let tz = (rec(a).0.trailing_ones() + rec(b).0.trailing_ones()).min(ty.bits()); (if tz == 64 { u64::MAX } else { ((1_u64 << tz) - 1) & w }, 0) }
         Op::Convert(Convert::Uextend, a) if func.ty(a).is_small_int() => { let ((za, oa), aw) = (rec(a), func.ty(a).unsigned_max()); ((za | !aw) & w, oa & aw) }
         Op::Convert(Convert::Ireduce, a) if func.ty(a).is_small_int() => { let (za, oa) = rec(a); (za & w, oa & w) }
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => (w & !1, 0),

@@ -284,7 +284,7 @@ fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y:
     }
     if matches!(cc, IntCC::Equal | IntCC::NotEqual)
         && let Some(op) = [(x, y), (y, x)].into_iter().find_map(|(m, z)| {
-            (cx.sconst(z) == Some(0)).then(|| match_swar_msb_broadcast(cx, m)).flatten().map(|w| Op::Icmp(cc, w, z))
+            (cx.sconst(z) == Some(0)).then(|| icmp::strip_zero_test(cx, m)).flatten().map(|w| Op::Icmp(cc, w, z))
         })
     {
         return Some(op);
@@ -697,7 +697,7 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
             match select::tested_select(cx, cond) {
                 Some((test, true)) => Some(Op::Brif(test, tb, ta, eb, ea)),
                 Some((test, false)) => Some(Op::Brif(test, eb, ea, tb, ta)),
-                None => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
+                None => known_cond(cx, cond).or_else(|| icmp::strip_zero_test(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
             }
         }
         Op::Load(addr, off) => {
