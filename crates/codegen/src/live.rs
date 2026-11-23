@@ -50,6 +50,24 @@ fn has_caller_loc_call(func: &Function, zeros: &[bool], block: Block) -> bool {
             .any(|&inst| func.caller_loc_result(&func.insts[inst.index()].op, |v| zeros[v.index()]).is_some())
 }
 
+fn arm_inevitably_calls(func: &Function, cfg: &Cfg, cold: &[bool], (root, cur, stop, depth): (Block, Block, Option<Block>, u8)) -> bool {
+    if has_regular_call(func, cur) {
+        return true;
+    }
+    if depth >= 3 {
+        return false;
+    }
+    match func.last(cur) {
+        Some(&Op::Jump(t, _)) if Some(t) != stop && t != cur && cfg.dominates(root, t) => {
+            cold[t.index()] || arm_inevitably_calls(func, cfg, cold, (root, t, stop, depth + 1))
+        }
+        Some(&Op::Brif(_, t, _, e, _)) if t != e => [t, e].into_iter().all(|s| {
+            Some(s) != stop && s != cur && cfg.dominates(root, s) && (cold[s.index()] || arm_inevitably_calls(func, cfg, cold, (root, s, stop, depth + 1)))
+        }),
+        _ => false,
+    }
+}
+
 fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[bool], is_latch: &[bool]) -> Vec<bool> {
     let n = func.blocks.len();
     let zeros = func.thread_cell_zeros();
@@ -74,7 +92,15 @@ fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[b
                 && !has_regular_call(func, other)
                 && !has_caller_loc_call(func, &zeros, other);
             let rejoins = direct_rejoin || jump_rejoin || fast_ret;
-            let colder = (has_regular_call(func, arm) && (direct_rejoin || !has_regular_call(func, other)))
+            let stop = if direct_rejoin {
+                Some(other)
+            } else if let Some(&Op::Jump(m, _)) = func.last(other).filter(|_| jump_rejoin) {
+                Some(m)
+            } else {
+                None
+            };
+            let arm_calls = arm_inevitably_calls(func, cfg, cold, (arm, arm, stop, 0));
+            let colder = (arm_calls && (direct_rejoin || !has_regular_call(func, other)))
                 || (has_caller_loc_call(func, &zeros, arm) && (direct_rejoin || !has_caller_loc_call(func, &zeros, other)));
             if Some(arm) == func.entry
                 || cold[arm.index()]

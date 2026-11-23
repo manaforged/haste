@@ -1,7 +1,8 @@
 mod sink;
 
 use crate::ir::{Binary, Block, Function, Inst, Op, StackSlot, Value};
-use sink::{flag_call_liveness, plan_flag_sink};
+pub(crate) use sink::sink_frontier;
+use sink::{flag_call_liveness, plan_flag_sink, plan_local_sink};
 
 /// One stack-allocated owned value dropped during panic unwinding when its 1-byte active flag is non-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,7 +360,7 @@ fn narrow_unwind_drops(
                         }).flatten();
                         flag_stores[slot.index()].push((b, inst, bit));
                     }
-                    if local_uses[slot.index()] == 1 && local_write_only[slot.index()] {
+                    if local_uses[slot.index()] == 1 && !slot_escaped[slot.index()] {
                         local_stores[slot.index()].push((b, inst, v, off));
                     }
                 }
@@ -380,7 +381,7 @@ fn narrow_unwind_drops(
     }
     let mut remove = vec![false; func.insts.len()];
     let mut before_call: Vec<(Inst, Vec<(StackSlot, Value, i32)>, Option<StackSlot>)> = Vec::new();
-    let mut block_head_sets: Vec<(Block, Vec<(StackSlot, Value, i32)>, StackSlot)> = Vec::new();
+    let mut block_head_sets: Vec<(Block, Vec<(StackSlot, Value, i32)>, Option<StackSlot>)> = Vec::new();
     for u in &func.unwind_drops {
         let fi = u.flag.index();
         if fi >= nslots || flag_uses[fi] != 1 || slot_escaped[fi] {
@@ -395,7 +396,8 @@ fn narrow_unwind_drops(
         if arm_blocks.is_empty() {
             continue;
         }
-        let (dead_zeros, fresh_sets, live_calls, always_active) = analyze_flag(func, defs, kinds, entry, u.flag);
+        let (dead_zeros, fresh_sets, live_calls, flag_visited) = analyze_flag(func, defs, kinds, entry, u.flag);
+        let always_active: Vec<bool> = flag_visited.iter().map(|&v| v == 2).collect();
         let narrow_calls = (!loaded_or_dyn).then_some(live_calls).flatten().filter(|lc| {
             !lc.is_empty()
                 && lc.len() <= 4
@@ -404,12 +406,13 @@ fn narrow_unwind_drops(
         let Some(live_calls) = narrow_calls else {
             mark_dead_zeros(&mut remove, &dead_zeros, keep_zero.as_deref(), fi);
             let (live_in, live_out) = flag_call_liveness(func, &cfg, defs, kinds, u.flag);
-            let mut visited_set_blocks = Vec::new();
-            for &(sb, sinst, is_set) in stores {
-                if is_set != Some(true) || visited_set_blocks.contains(&sb) {
+            let kept_entry = keep_zero.as_deref().and_then(|kz| kz[fi]);
+            let mut visited_blocks = Vec::new();
+            for &(sb, _, _) in stores {
+                if visited_blocks.contains(&sb) {
                     continue;
                 }
-                visited_set_blocks.push(sb);
+                visited_blocks.push(sb);
                 let mut live = live_out[sb.index()];
                 for &inst in func.blocks[sb.index()].insts.iter().rev() {
                     match func.insts[inst.index()].op {
@@ -418,16 +421,16 @@ fn narrow_unwind_drops(
                         Op::TryCall { .. } => live = true,
                         Op::StackLoad(s, _) if s == u.flag => live = true,
                         Op::StackStore(v, s, 0) if s == u.flag => {
+                            if !live && kept_entry != Some(inst) {
+                                remove[inst.index()] = true;
+                            }
                             if store_clears_active(func, defs, v) {
                                 live = false;
-                            } else if !live {
-                                remove[inst.index()] = true;
                             }
                         }
                         _ => {}
                     }
                 }
-                let _ = sinst;
             }
             for &(sb, sinst, is_set) in stores {
                 if is_set == Some(true)
@@ -455,8 +458,21 @@ fn narrow_unwind_drops(
                         }
                     }
                     for t in frontier {
-                        if !block_head_sets.iter().any(|&(bt, _, bf)| bt == t && bf == u.flag) {
-                            block_head_sets.push((t, sink_local.clone(), u.flag));
+                        if !block_head_sets.iter().any(|&(bt, _, bf)| bt == t && bf == Some(u.flag)) {
+                            block_head_sets.push((t, sink_local.clone(), Some(u.flag)));
+                        }
+                    }
+                }
+            }
+            let li = u.local.index();
+            if !u.indirect && u.local != u.flag && li < nslots && local_uses[li] == 1 && !slot_escaped[li] {
+                for &(lb, linst, val, off) in &local_stores[li] {
+                    if !remove[linst.index()]
+                        && let Some(frontier) = plan_local_sink(func, &cfg, defs, depths, (&flag_visited, u.local, u.flag), (lb, linst))
+                    {
+                        remove[linst.index()] = true;
+                        for t in frontier {
+                            block_head_sets.push((t, vec![(u.local, val, off)], None));
                         }
                     }
                 }
@@ -514,7 +530,7 @@ fn narrow_unwind_drops(
     if before_call.is_empty() && block_head_sets.is_empty() && !remove.iter().any(|&r| r) {
         return false;
     }
-    let consts = (before_call.iter().any(|(_, _, f)| f.is_some()) || !block_head_sets.is_empty()).then(|| {
+    let consts = (before_call.iter().any(|(_, _, f)| f.is_some()) || block_head_sets.iter().any(|(_, _, f)| f.is_some())).then(|| {
         let one = func.value(crate::Type::I8);
         let one_inst = func.add(Op::Const(1), Some(one));
         let zero = func.value(crate::Type::I8);
@@ -525,7 +541,7 @@ fn narrow_unwind_drops(
     for (cinst, locs, flag) in before_call {
         per_call[cinst.index()].push((locs, flag));
     }
-    let mut per_head: Vec<Vec<(Vec<(StackSlot, Value, i32)>, StackSlot)>> = vec![Vec::new(); func.blocks.len()];
+    let mut per_head: Vec<Vec<(Vec<(StackSlot, Value, i32)>, Option<StackSlot>)>> = vec![Vec::new(); func.blocks.len()];
     for (b, locs, flag) in block_head_sets {
         per_head[b.index()].push((locs, flag));
     }
@@ -541,11 +557,11 @@ fn narrow_unwind_drops(
                 new.push(func.add(Op::StackStore(zero, flag, 0), None));
             }
         }
-        if let Some((one, ..)) = consts {
-            for (locs, flag) in &per_head[bi] {
-                for &(slot, pv, off) in locs {
-                    new.push(func.add(Op::StackStore(pv, slot, off), None));
-                }
+        for (locs, flag) in &per_head[bi] {
+            for &(slot, pv, off) in locs {
+                new.push(func.add(Op::StackStore(pv, slot, off), None));
+            }
+            if let (Some(flag), Some((one, ..))) = (flag, consts) {
                 new.push(func.add(Op::StackStore(one, *flag, 0), None));
             }
         }
@@ -666,7 +682,7 @@ fn analyze_flag(
     kinds: &[CalleeKind],
     entry: Block,
     flag: StackSlot,
-) -> (Vec<Inst>, Vec<Inst>, Option<Vec<(Block, Inst)>>, Vec<bool>) {
+) -> (Vec<Inst>, Vec<Inst>, Option<Vec<(Block, Inst)>>, Vec<u8>) {
     let mut call_state = vec![0u8; func.insts.len()];
     let mut clear_state = vec![0u8; func.insts.len()];
     let mut set_state = vec![0u8; func.insts.len()];
@@ -706,8 +722,7 @@ fn analyze_flag(
             }
         }
     }
-    let always_active = visited.into_iter().map(|v| v == 2).collect();
-    (dead_zeros, fresh_sets, exact.then_some(live), always_active)
+    (dead_zeros, fresh_sets, exact.then_some(live), visited)
 }
 
 fn unwind_flag_live_at_call(func: &Function, defs: &[Option<Inst>], kinds: &[CalleeKind], entry: Block, flag: StackSlot) -> bool {

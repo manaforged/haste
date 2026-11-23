@@ -58,17 +58,19 @@ fn block_is_flag_clean(func: &Function, kinds: &[CalleeKind], b: Block, flag: St
     })
 }
 
-fn target_ok(cfg: &Cfg, depths: &[u32], always_active: &[bool], b: Block, in_r: &[bool], s: Block) -> bool {
+fn target_ok(cfg: &Cfg, depths: &[u32], always_active: Option<&[bool]>, b: Block, in_r: &[bool], s: Block) -> bool {
     let si = s.index();
     depths[si] <= depths[b.index()]
-        && (cfg.preds_of(s).iter().all(|&p| !cfg.reachable[p.index()] || in_r[p.index()]) || (always_active[si] && cfg.dominates(b, s)))
+        && (cfg.preds_of(s).iter().all(|&p| !cfg.reachable[p.index()] || in_r[p.index()])
+            || (always_active.is_some_and(|aa| aa[si]) && cfg.dominates(b, s)))
 }
 
-fn sink_frontier(
+/// Prunes a clean dominated region `in_r` starting at `b` to blocks reaching a `!live_in` fast exit and returns the `<= 4` cold frontier blocks.
+pub(crate) fn sink_frontier(
     func: &Function,
     cfg: &Cfg,
     depths: &[u32],
-    (live_in, always_active, b): (&[bool], &[bool], Block),
+    (live_in, always_active, b): (&[bool], Option<&[bool]>, Block),
     in_r: &mut [bool],
 ) -> Option<Vec<Block>> {
     let n = func.blocks.len();
@@ -160,9 +162,98 @@ pub(super) fn plan_flag_sink(
             }
         }
     }
-    sink_frontier(func, cfg, depths, (live_in, always_active, b), &mut in_r).or_else(|| {
+    sink_frontier(func, cfg, depths, (live_in, Some(always_active), b), &mut in_r).or_else(|| {
         let mut solo = vec![false; n];
         solo[b.index()] = true;
-        sink_frontier(func, cfg, depths, (live_in, always_active, b), &mut solo)
+        sink_frontier(func, cfg, depths, (live_in, Some(always_active), b), &mut solo)
     })
+}
+
+pub(super) fn plan_local_sink(
+    func: &Function,
+    cfg: &Cfg,
+    defs: &[Option<Inst>],
+    depths: &[u32],
+    (flag_visited, local, flag): (&[u8], StackSlot, StackSlot),
+    (b, sinst): (Block, Inst),
+) -> Option<Vec<Block>> {
+    if flag_visited[b.index()] != 1 {
+        return None;
+    }
+    let insts = &func.blocks[b.index()].insts;
+    let pos = insts.iter().position(|&i| i == sinst)?;
+    let sets_flag = |op: &Op| matches!(*op, Op::StackStore(v, s, 0) if s == flag && !store_clears_active(func, defs, v));
+    if insts[..pos].iter().any(|&i| sets_flag(&func.insts[i.index()].op)) {
+        return None;
+    }
+    if insts[pos + 1..].iter().any(|&i| {
+        let op = &func.insts[i.index()].op;
+        matches!(*op, Op::StackLoad(s, _) | Op::StackStore(_, s, _) if s == local)
+            || sets_flag(op)
+            || matches!(*op, Op::Return(..) | Op::Trap)
+    }) {
+        return None;
+    }
+    let n = func.blocks.len();
+    let (mut gen_b, mut kill_b, mut clean_b) = (vec![false; n], vec![false; n], vec![true; n]);
+    for &blk in &cfg.rpo {
+        let bi = blk.index();
+        if flag_visited[bi] != 1 {
+            gen_b[bi] = true;
+            clean_b[bi] = false;
+            continue;
+        }
+        for &inst in &func.blocks[bi].insts {
+            let op = &func.insts[inst.index()].op;
+            match *op {
+                Op::StackLoad(s, _) if s == local => {
+                    gen_b[bi] = true;
+                    clean_b[bi] = false;
+                    break;
+                }
+                Op::StackStore(v, s, 0) if s == local && func.ty(v).bytes() == func.slots[local.index()].size => {
+                    kill_b[bi] = true;
+                    clean_b[bi] = false;
+                    break;
+                }
+                Op::StackStore(_, s, _) if s == local => {
+                    clean_b[bi] = false;
+                }
+                Op::Return(..) | Op::Trap => {
+                    kill_b[bi] = true;
+                    break;
+                }
+                _ if sets_flag(op) => {
+                    gen_b[bi] = true;
+                    clean_b[bi] = false;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let (mut live_in, mut changed) = (gen_b.clone(), true);
+    while changed {
+        changed = false;
+        for &blk in cfg.rpo.iter().rev() {
+            let bi = blk.index();
+            let out = func.successors(blk).any(|s| live_in[s.index()]);
+            let inp = gen_b[bi] || (!kill_b[bi] && out);
+            if inp != live_in[bi] {
+                (live_in[bi], changed) = (inp, true);
+            }
+        }
+    }
+    let (mut in_r, mut work) = (vec![false; n], vec![b]);
+    in_r[b.index()] = true;
+    while let Some(u) = work.pop() {
+        for s in func.successors(u) {
+            let si = s.index();
+            if !in_r[si] && cfg.reachable[si] && cfg.dominates(b, s) && live_in[si] && clean_b[si] {
+                in_r[si] = true;
+                work.push(s);
+            }
+        }
+    }
+    sink_frontier(func, cfg, depths, (&live_in, None, b), &mut in_r)
 }

@@ -519,6 +519,11 @@ impl Provenance {
         }
     }
 
+    /// Whether `slot` has escaped by `at`, returning `false` for slots whose address never escapes.
+    pub(crate) fn slot_is_escaped_at(&self, slot: StackSlot, at: Option<Inst>) -> bool {
+        !self.slot_addr_unescaped(slot) && self.slot_escaped_at(slot, at)
+    }
+
     /// Whether `base` is an address the caller passed in, which cannot point into this frame's slots.
     pub(crate) fn is_incoming(&self, base: MemBase) -> bool {
         matches!(base, MemBase::Addr(v) if self.incoming.get(v.index()).copied().unwrap_or(false))
@@ -657,7 +662,7 @@ fn block_clobbers(addr: Value, loc: MemLoc, prov: &Provenance, at: Option<Inst>)
 pub(crate) use frame::drop_unread_frame_stores;
 
 fn slot_unescaped_at(loc: MemLoc, at: Option<Inst>, prov: &Provenance) -> bool {
-    matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s) || !prov.slot_escaped_at(s, at))
+    matches!(loc.root, MemRoot::Slot(s) if !prov.slot_is_escaped_at(s, at))
 }
 
 fn noalias_immune_to_atomic(op: &Op, loc: MemLoc, prov: &Provenance) -> bool {

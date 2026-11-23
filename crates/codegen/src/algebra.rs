@@ -629,8 +629,32 @@ fn simplify_rotate(cx: &mut RewriteCx, bin: Binary, a: Value, b: Value) -> Optio
     None
 }
 
+fn fold_select_const_bin(cx: &mut RewriteCx, bin: Binary, a: Value, b: Value) -> Option<Op> {
+    if !matches!(bin, Binary::Iadd | Binary::Isub | Binary::Imul | Binary::Band | Binary::Bor | Binary::Bxor | Binary::Ishl | Binary::Ushr | Binary::Sshr) {
+        return None;
+    }
+    let ty = cx.func.ty(a);
+    if !ty.is_small_int() { return None; }
+    for (sel_v, c_v, sel_lhs) in [(a, b, true), (b, a, false)] {
+        if !sel_lhs && matches!(bin, Binary::Ishl | Binary::Ushr | Binary::Sshr) { continue; }
+        let (Some(c), true) = (cx.sconst(c_v), cx.single_use(sel_v)) else { continue };
+        let Some(&Op::Select(cond, t, f)) = cx.op(sel_v) else { continue };
+        let (Some(kt), Some(kf)) = (cx.sconst(t), cx.sconst(f)) else { continue };
+        let (nt, nf) = if sel_lhs {
+            (crate::fold::binary(bin, ty, kt, c)?, crate::fold::binary(bin, ty, kf, c)?)
+        } else {
+            (crate::fold::binary(bin, ty, c, kt)?, crate::fold::binary(bin, ty, c, kf)?)
+        };
+        let (et, ef) = (extend(nt, ty, true), extend(nf, ty, true));
+        if et == ef { return Some(Op::Const(et)); }
+        let (tv, fv) = (cx.emit(ty, Op::Const(et)), cx.emit(ty, Op::Const(ef)));
+        return Some(Op::Select(cond, tv, fv));
+    }
+    None
+}
+
 fn simplify_binary(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(Value, Value, Value)>, res: Option<Value>, (bin, a, b): (Binary, Value, Value)) -> Option<Op> {
-    match bin {
+    let out = match bin {
         Binary::Iadd => sum::negated_shift_add(cx, cx.func.ty(a), a, b).map(|(base, idx, shift)| {
             let ty = cx.func.ty(base);
             let k = cx.emit(ty, Op::Const(shift));
@@ -644,7 +668,8 @@ fn simplify_binary(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec
         Binary::Imul => sum::scale_sum(cx, a, b),
         Binary::Udiv | Binary::Urem => simplify_div_rem(cx, block_udivs, res, (bin, a, b)),
         _ => None,
-    }
+    };
+    out.or_else(|| fold_select_const_bin(cx, bin, a, b))
 }
 
 fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(Value, Value, Value)>, res: Option<Value>, inst: Inst) -> Option<Op> {

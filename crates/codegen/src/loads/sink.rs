@@ -216,7 +216,7 @@ fn is_full_slot_store(func: &Function, op: &Op, slot: StackSlot) -> bool {
 }
 
 fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenance) -> bool {
-    if prov.slot_escaped_at(slot, Some(inst)) {
+    if prov.slot_is_escaped_at(slot, Some(inst)) {
         return true;
     }
     let op = &func.insts[inst.index()].op;
@@ -230,26 +230,23 @@ fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenan
     }
 }
 
-fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[StackSlot]) -> (Vec<u64>, Vec<u64>) {
+fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[StackSlot]) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
     let n = func.blocks.len();
     let all_mask = if batch.len() == 64 { u64::MAX } else { (1_u64 << batch.len()) - 1 };
     let mut slot_bit = vec![0_u64; func.slots.len()];
     for (i, &s) in batch.iter().enumerate() {
         slot_bit[s.index()] = 1_u64 << i;
     }
-    let (mut reads, mut kill) = (vec![0_u64; n], vec![0_u64; n]);
+    let (mut reads, mut kill, mut writes) = (vec![0_u64; n], vec![0_u64; n], vec![0_u64; n]);
     for &b in &cfg.rpo {
         let bi = b.index();
-        let (mut r_mask, mut k_mask) = (0_u64, 0_u64);
+        let (mut r_mask, mut k_mask, mut w_mask) = (0_u64, 0_u64, 0_u64);
         for &inst in &func.blocks[bi].insts {
             let mut rem = all_mask & !(r_mask | k_mask);
-            if rem == 0 {
-                break;
-            }
             while rem != 0 {
                 let i = rem.trailing_zeros() as usize;
                 rem &= rem - 1;
-                if prov.slot_escaped_at(batch[i], Some(inst)) {
+                if prov.slot_is_escaped_at(batch[i], Some(inst)) {
                     r_mask |= 1_u64 << i;
                 }
             }
@@ -263,8 +260,11 @@ fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[S
                 }
                 Op::StackStore(_, s, _) => {
                     let bit = slot_bit[s.index()];
-                    if bit != 0 && r_mask & bit == 0 && is_full_slot_store(func, op, s) {
-                        k_mask |= bit;
+                    if bit != 0 {
+                        w_mask |= bit;
+                        if r_mask & bit == 0 && is_full_slot_store(func, op, s) {
+                            k_mask |= bit;
+                        }
                     }
                 }
                 Op::Load(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, ..) => {
@@ -288,6 +288,7 @@ fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[S
         }
         reads[bi] = r_mask;
         kill[bi] = k_mask;
+        writes[bi] = w_mask;
     }
     let (mut live_in, mut live_out) = (reads.clone(), vec![0_u64; n]);
     let mut changed = true;
@@ -307,7 +308,7 @@ fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[S
             }
         }
     }
-    (live_in, live_out)
+    (live_in, live_out, reads, writes)
 }
 
 fn sink_pure_defs_into(func: &mut Function, from: Block, to: Block) {
@@ -353,6 +354,28 @@ fn sink_pure_defs_into(func: &mut Function, from: Block, to: Block) {
     func.blocks[to.index()].insts.splice(0..0, to_move);
 }
 
+fn plan_store_frontier(
+    func: &Function,
+    cfg: &Cfg,
+    (live_in, reads, writes): (&[u64], &[u64], &[u64]),
+    (b, bit): (Block, u64),
+) -> Option<Vec<Block>> {
+    let n = func.blocks.len();
+    let live: Vec<bool> = live_in.iter().map(|m| m & bit != 0).collect();
+    let (mut in_r, mut work) = (vec![false; n], vec![b]);
+    in_r[b.index()] = true;
+    while let Some(u) = work.pop() {
+        for s in func.successors(u) {
+            let si = s.index();
+            if !in_r[si] && cfg.reachable[si] && cfg.dominates(b, s) && live[si] && (reads[si] | writes[si]) & bit == 0 {
+                in_r[si] = true;
+                work.push(s);
+            }
+        }
+    }
+    crate::drop_elide::sink_frontier(func, cfg, &cfg.loops().depths, (&live, None, b), &mut in_r)
+}
+
 fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool {
     let mut cand_slots: Vec<StackSlot> = Vec::new();
     let mut slot_pos: Vec<u32> = vec![u32::MAX; func.slots.len()];
@@ -361,7 +384,7 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
         for &inst in &func.blocks[b.index()].insts {
             if let Op::StackStore(_, slot, _) = func.insts[inst.index()].op
                 && !func.is_unwind_slot(slot)
-                && !prov.slot_escaped_at(slot, Some(inst))
+                && !prov.slot_is_escaped_at(slot, Some(inst))
             {
                 let idx = if slot_pos[slot.index()] == u32::MAX {
                     let next = cand_slots.len();
@@ -385,14 +408,14 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
     }
     let mut changed = false;
     for (chunk_idx, batch) in cand_slots.chunks(64).enumerate() {
-        let (live_in, live_out) = slot_liveness_batch(func, cfg, prov, batch);
+        let (live_in, live_out, reads, writes) = slot_liveness_batch(func, cfg, prov, batch);
         for (bit_i, &slot) in batch.iter().enumerate() {
             let bit = 1_u64 << bit_i;
             let blocks = &store_blocks[chunk_idx * 64 + bit_i];
             for &b in blocks {
                 let bi = b.index();
                 let mut dead = Vec::new();
-                let mut sink_to: Option<(Block, Vec<Inst>)> = None;
+                let mut sink_targets: Option<(Vec<Block>, Vec<Inst>)> = None;
                 let brif_arms = match func.last(b) {
                     Some(&Op::Brif(_, then, _, other, _)) if then != other => Some((then, other)),
                     _ => None,
@@ -403,19 +426,30 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
                     let op = &func.insts[inst.index()].op;
                     if let Op::StackStore(_, s, _) = *op
                         && s == slot
-                        && !prov.slot_escaped_at(slot, Some(inst))
+                        && !prov.slot_is_escaped_at(slot, Some(inst))
                     {
                         if !live_after {
                             dead.push(inst);
                             continue;
                         }
-                        if !any_access_after
-                            && let Some((then, other)) = brif_arms
-                            && (live_in[then.index()] & bit != 0) != (live_in[other.index()] & bit != 0)
-                        {
-                            let target = if live_in[then.index()] & bit != 0 { then } else { other };
-                            if cfg.single_pred(target) == Some(b) && cfg.loops().depth_of(target) <= cfg.loops().depth_of(b) {
-                                sink_to.get_or_insert_with(|| (target, Vec::new())).1.push(inst);
+                        if !any_access_after {
+                            if let Some((_, list)) = sink_targets.as_mut() {
+                                list.push(inst);
+                                if is_full_slot_store(func, op, slot) {
+                                    live_after = false;
+                                }
+                                continue;
+                            }
+                            let targets = if let Some((then, other)) = brif_arms
+                                && (live_in[then.index()] & bit != 0) != (live_in[other.index()] & bit != 0)
+                            {
+                                let target = if live_in[then.index()] & bit != 0 { then } else { other };
+                                (cfg.single_pred(target) == Some(b) && cfg.loops().depth_of(target) <= cfg.loops().depth_of(b)).then(|| vec![target])
+                            } else {
+                                plan_store_frontier(func, cfg, (&live_in, &reads, &writes), (b, bit))
+                            };
+                            if let Some(targets) = targets {
+                                sink_targets = Some((targets, vec![inst]));
                                 if is_full_slot_store(func, op, slot) {
                                     live_after = false;
                                 }
@@ -440,11 +474,23 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
                     func.blocks[bi].insts.retain(|i| !dead.contains(i));
                     changed = true;
                 }
-                if let Some((target, mut sunk)) = sink_to {
+                if let Some((targets, mut sunk)) = sink_targets {
                     sunk.reverse();
                     func.blocks[bi].insts.retain(|i| !sunk.contains(i));
-                    func.blocks[target.index()].insts.splice(0..0, sunk.iter().copied());
-                    sink_pure_defs_into(func, b, target);
+                    if targets.len() == 1 {
+                        let target = targets[0];
+                        func.blocks[target.index()].insts.splice(0..0, sunk.iter().copied());
+                        sink_pure_defs_into(func, b, target);
+                    } else {
+                        let ops: Vec<Op> = sunk.iter().map(|&i| func.insts[i.index()].op.clone()).collect();
+                        for &i in &sunk {
+                            func.insts[i.index()].op = Op::Trap;
+                        }
+                        for target in targets {
+                            let clones: Vec<Inst> = ops.iter().map(|op| func.add(op.clone(), None)).collect();
+                            func.blocks[target.index()].insts.splice(0..0, clones);
+                        }
+                    }
                     changed = true;
                 }
             }
