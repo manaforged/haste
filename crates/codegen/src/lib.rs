@@ -208,7 +208,9 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     let was_coro = func.is_coroutine();
     split_coroutine(&mut func);
     if was_coro {
-        func.elide_dead_unwind_drops(|_| true);
+        if target.effort == Effort::Full {
+            func.elide_dead_unwind_drops(|_| true);
+        }
         func.zero_init_unwind_flags();
     }
     keep_honored_marks(&mut func, target);

@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHasher;
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -34,12 +34,21 @@ impl<T: Default> Default for CachePadded<T> {
     }
 }
 
-pub(crate) fn shard_index<Q: Hash + ?Sized, const SHARDS: usize>(key: &Q) -> usize {
-    const { assert!(SHARDS.is_power_of_two()) };
+#[inline]
+fn hash_key<Q: Hash + ?Sized>(key: &Q) -> u64 {
     let mut hasher = FxHasher::default();
     key.hash(&mut hasher);
-    let hash = hasher.finish();
+    hasher.finish()
+}
+
+#[inline]
+fn shard_of<const SHARDS: usize>(hash: u64) -> usize {
+    const { assert!(SHARDS.is_power_of_two()) };
     (((hash >> 58) ^ (hash >> 29) ^ hash) as usize) & (SHARDS - 1)
+}
+
+pub(crate) fn shard_index<Q: Hash + ?Sized, const SHARDS: usize>(key: &Q) -> usize {
+    shard_of::<SHARDS>(hash_key(key))
 }
 
 /// Evaluates `work` over `items` on worker threads, returning outputs in input order.
@@ -94,6 +103,7 @@ impl<T, const SLAB: usize, const SLABS: usize> Slab<T, SLAB, SLABS> {
         slab[index % SLAB].get_or_init(|| value);
     }
 
+    #[inline]
     pub(crate) fn get(&self, index: usize) -> Option<&T> {
         self.slabs.get(index / SLAB)?.get()?.get(index % SLAB)?.get()
     }
@@ -126,8 +136,67 @@ impl<const SLAB: usize, const SLABS: usize> AtomicU32Slab<SLAB, SLABS> {
     }
 }
 
+#[derive(Default)]
+struct IndexTable {
+    entries: Box<[(u32, u32)]>,
+    len: usize,
+}
+
+impl IndexTable {
+    #[inline]
+    fn tag(hash: u64) -> u32 {
+        ((hash >> 32) as u32) | 1
+    }
+
+    #[inline]
+    fn find(&self, hash: u64, mut eq: impl FnMut(u32) -> bool) -> Option<u32> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mask = self.entries.len() - 1;
+        let tag = Self::tag(hash);
+        let mut pos = ((hash >> 7) as usize) & mask;
+        loop {
+            let (entry_tag, id) = self.entries[pos];
+            if entry_tag == 0 {
+                return None;
+            }
+            if entry_tag == tag && eq(id) {
+                return Some(id);
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    fn insert(&mut self, hash: u64, id: u32, mut hash_of: impl FnMut(u32) -> u64) {
+        if self.len * 4 >= self.entries.len() * 3 {
+            let next_cap = if self.entries.is_empty() { 16 } else { self.entries.len() * 2 };
+            let mut next = vec![(0u32, 0u32); next_cap].into_boxed_slice();
+            let mask = next_cap - 1;
+            for &(entry_tag, entry_id) in &self.entries {
+                if entry_tag == 0 {
+                    continue;
+                }
+                let mut pos = ((hash_of(entry_id) >> 7) as usize) & mask;
+                while next[pos].0 != 0 {
+                    pos = (pos + 1) & mask;
+                }
+                next[pos] = (entry_tag, entry_id);
+            }
+            self.entries = next;
+        }
+        let mask = self.entries.len() - 1;
+        let mut pos = ((hash >> 7) as usize) & mask;
+        while self.entries[pos].0 != 0 {
+            pos = (pos + 1) & mask;
+        }
+        self.entries[pos] = (Self::tag(hash), id);
+        self.len += 1;
+    }
+}
+
 pub(crate) struct Interner<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> {
-    shards: Box<[CachePadded<RwLock<FxHashMap<K, u32>>>]>,
+    shards: Box<[CachePadded<RwLock<IndexTable>>]>,
     slabs: Slab<K, SLAB, SLABS>,
     next: AtomicU32,
 }
@@ -138,28 +207,43 @@ impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default for 
     }
 }
 
-impl<K: Eq + Hash + Clone, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Interner<K, SHARDS, SLAB, SLABS> {
+impl<K: Eq + Hash, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Interner<K, SHARDS, SLAB, SLABS> {
     /// The id of `key`, calling `make` with the new id under the shard's write lock, before the id is visible, when `key` is new.
     pub(crate) fn intern<Q>(&self, key: &Q, make: impl FnOnce(&Q, u32) -> K) -> u32
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let shard = &self.shards[shard_index::<_, SHARDS>(key)].0;
-        if let Some(&id) = read_lock(shard).get(key) {
+        let hash = hash_key(key);
+        self.intern_with(hash, key, |stored, key| stored.borrow() == *key, make)
+    }
+
+    /// The id of owned `key`, moving it into the slab without cloning when new and invoking `on_new` before publishing it.
+    pub(crate) fn intern_owned(&self, key: K, on_new: impl FnOnce(&K, u32)) -> u32 {
+        let hash = hash_key(&key);
+        self.intern_with(hash, key, |stored, key| stored == key, |key, id| {
+            on_new(&key, id);
+            key
+        })
+    }
+
+    fn intern_with<T>(&self, hash: u64, key: T, eq: impl Fn(&K, &T) -> bool, make: impl FnOnce(T, u32) -> K) -> u32 {
+        let shard = &self.shards[shard_of::<SHARDS>(hash)].0;
+        if let Some(id) = read_lock(shard).find(hash, |id| eq(self.get(id), &key)) {
             return id;
         }
         let mut write = write_lock(shard);
-        if let Some(&id) = write.get(key) {
+        if let Some(id) = write.find(hash, |id| eq(self.get(id), &key)) {
             return id;
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let owned = make(key, id);
-        self.slabs.set(id as usize, owned.clone());
-        write.insert(owned, id);
+        self.slabs.set(id as usize, owned);
+        write.insert(hash, id, |old| hash_key(self.get(old)));
         id
     }
 
+    #[inline]
     pub(crate) fn get(&self, id: u32) -> &K {
         self.slabs.get(id as usize).expect("interned entry exists")
     }

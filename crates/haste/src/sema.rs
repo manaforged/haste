@@ -71,6 +71,9 @@ pub struct Context<'a> {
     trait_members_local: std::cell::RefCell<HashMap<ItemRef, Arc<HashMap<&'a str, ItemRef>>>>,
     impl_members_local: std::cell::RefCell<HashMap<impls::ImplRef, Arc<HashMap<&'a str, ItemRef>>>>,
     intrinsics_local: std::cell::RefCell<HashMap<ItemRef, Option<intrinsic::Intrinsic>>>,
+    type_defs_local: std::cell::RefCell<HashMap<(TypeScope, SegKey), crate::names::Def>>,
+    pub(super) glues_local: HashMap<ty::Ty, Option<infer::Res>>,
+    pub(super) drops_local: HashMap<ty::Ty, bool>,
     pub(crate) ty_facts: HashMap<ty::Ty, u128>,
 }
 
@@ -113,6 +116,9 @@ impl<'a> Context<'a> {
         self.impl_members.clear();
         self.impl_members_local.borrow_mut().clear();
         self.intrinsics_local.borrow_mut().clear();
+        self.type_defs_local.borrow_mut().clear();
+        self.glues_local.clear();
+        self.drops_local.clear();
         self.aliases.clear();
         self.eval_errors.clear();
         self.ty_facts.clear();
@@ -149,6 +155,9 @@ impl<'a> Context<'a> {
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
             impl_members_local: std::cell::RefCell::new(HashMap::default()),
             intrinsics_local: std::cell::RefCell::new(HashMap::default()),
+            type_defs_local: std::cell::RefCell::new(HashMap::default()),
+            glues_local: HashMap::default(),
+            drops_local: HashMap::default(),
             ty_facts: HashMap::default(),
         }
     }
@@ -182,6 +191,9 @@ impl<'a> Context<'a> {
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
             impl_members_local: std::cell::RefCell::new(HashMap::default()),
             intrinsics_local: std::cell::RefCell::new(HashMap::default()),
+            type_defs_local: std::cell::RefCell::new(HashMap::default()),
+            glues_local: HashMap::default(),
+            drops_local: HashMap::default(),
             ty_facts: HashMap::default(),
         }
     }
@@ -209,12 +221,20 @@ impl<'a> Context<'a> {
 
     /// The cached type-namespace definition for `segments` in `scope`.
     pub fn type_def(&self, scope: TypeScope, segments: &[crate::names::Sym]) -> Option<crate::names::Def> {
-        self.store.lookups.type_defs.get(&(scope, SegKey::from_slice(segments)))
+        let key = (scope, SegKey::from_slice(segments));
+        if let Some(&found) = self.type_defs_local.borrow().get(&key) {
+            return Some(found);
+        }
+        let found = self.store.lookups.type_defs.get(&key)?;
+        self.type_defs_local.borrow_mut().insert(key, found);
+        Some(found)
     }
 
     /// Caches `def` as the type-namespace definition for `segments` in `scope`.
     pub fn set_type_def(&self, scope: TypeScope, segments: &[crate::names::Sym], def: crate::names::Def) {
-        self.store.lookups.type_defs.insert((scope, SegKey::from_slice(segments)), def);
+        let key = (scope, SegKey::from_slice(segments));
+        self.store.lookups.type_defs.insert(key.clone(), def);
+        self.type_defs_local.borrow_mut().insert(key, def);
     }
 
     /// The source file and outline entry of `item`.

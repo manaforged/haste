@@ -17,7 +17,11 @@ impl Infer<'_, '_> {
             return self.parts_need_drop(ty);
         }
         let ty = self.substitute(ty);
+        if let Some(&known) = self.cx.drops_local.get(&ty) {
+            return Ok(known);
+        }
         if let Some(known) = self.cx.store.lookups.drops.get(&ty) {
+            self.cx.drops_local.insert(ty, known);
             return Ok(known);
         }
         if self.cx.drop_stack.contains(&ty) {
@@ -33,6 +37,7 @@ impl Infer<'_, '_> {
             && (needs || (self.cx.drop_stack.is_empty() && !has_uninferred_closure(self.cx, ty)))
         {
             self.cx.store.lookups.drops.insert(ty, needs);
+            self.cx.drops_local.insert(ty, needs);
         }
         Ok(needs)
     }
@@ -171,7 +176,11 @@ fn has_uninferred_closure(cx: &Context<'_>, ty: Ty) -> bool {
 
 /// The call of the drop glue of `ty`, when dropping a value of `ty` runs code.
 pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
+    if let Some(&cached) = cx.glues_local.get(&ty) {
+        return Ok(cached);
+    }
     if let Some(cached) = cx.store.lookups.glues.get(&ty) {
+        cx.glues_local.insert(ty, cached);
         return Ok(cached);
     }
     let before = cx.quiet_mark();
@@ -186,6 +195,7 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
         && (call.is_some() || (cx.drop_stack.is_empty() && !has_uninferred_closure(cx, ty)))
     {
         cx.store.lookups.glues.insert(ty, call);
+        cx.glues_local.insert(ty, call);
     }
     Ok(call)
 }

@@ -71,7 +71,7 @@ impl<'a> Context<'a> {
     }
 
     /// The value of `#[lang = "..."]` on `item`.
-    pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
+    pub fn lang(&self, item: ItemRef) -> Option<&str> {
         if item.outer().is_some() {
             let (src, entry) = self.item(item);
             if entry.attrs.is_empty() {
@@ -84,8 +84,7 @@ impl<'a> Context<'a> {
         if !langs.has_crate(item.krate) {
             return None;
         }
-        let &val = langs.map.get(&item)?;
-        Some(self.file(item).source.text(val).trim_matches('"'))
+        langs.map.get(&item).map(Box::as_ref)
     }
 
     fn build_lang_map(&self) -> super::lookups::LangMap {
@@ -97,7 +96,7 @@ impl<'a> Context<'a> {
                     if bits & lang_bit != 0
                         && let Some(attr_tok) = active_attr_at(&tree.env, &entry.source, &entry.items.items[at as usize].attrs, "lang")
                     {
-                        map.insert(ItemRef { krate: krate as u32, file: file as u32, item: at }, attr_tok + 2);
+                        map.insert(ItemRef { krate: krate as u32, file: file as u32, item: at }, entry.source.text(attr_tok + 2).trim_matches('"').into());
                     }
                 }
             }

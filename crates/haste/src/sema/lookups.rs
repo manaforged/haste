@@ -96,14 +96,14 @@ impl ActiveAttrs {
 }
 
 pub(super) struct LangMap {
-    pub(super) map: HashMap<ItemRef, u32>,
+    pub(super) map: HashMap<ItemRef, Box<str>>,
     crates_lo: u64,
     crates_hi: u64,
     any_high: bool,
 }
 
 impl LangMap {
-    pub(super) fn from_map(map: HashMap<ItemRef, u32>) -> Self {
+    pub(super) fn from_map(map: HashMap<ItemRef, Box<str>>) -> Self {
         let (mut crates_lo, mut crates_hi, mut any_high) = (0u64, 0u64, false);
         for item in map.keys() {
             if item.krate < 64 {

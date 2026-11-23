@@ -561,43 +561,45 @@ impl Infer<'_, '_> {
         if a == b {
             return Ok(());
         }
-        let (kind_a, kind_b) = (self.cx.types.kind(a).clone(), self.cx.types.kind(b).clone());
-        match (&kind_a, &kind_b) {
-            (Kind::Var(_), _) => self.bind(a, b),
-            (_, Kind::Var(_)) => self.bind(b, a),
-            (Kind::IntVar(_) | Kind::FloatVar(_), _) => self.bind(a, b),
-            (_, Kind::IntVar(_) | Kind::FloatVar(_)) => self.bind(b, a),
-            _ => self.unify_shapes(&kind_a, &kind_b).map_err(|()| Clash { a, b, cycle: false }),
-        }
-    }
-
-    fn unify_shapes(&mut self, a: &Kind, b: &Kind) -> Result<(), ()> {
-        let pairs: Vec<(Ty, Ty)> = match (a, b) {
-            (Kind::Tuple(x), Kind::Tuple(y)) => self.zip_substs(*x, *y)?,
-            (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => vec![(*x, *y)],
-            (Kind::Array(x, m), Kind::Array(y, n)) => vec![(*x, *y), (*m, *n)],
-            (Kind::Slice(x), Kind::Slice(y)) => vec![(*x, *y)],
-            (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
-            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && dyn_members(a) == dyn_members(b) => self.zip_substs(*x, *y)?,
-            (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => {
-                let mut pairs = self.zip_substs(*x, *y)?;
-                pairs.push((*r, *s));
-                pairs
-            }
-            _ => return Err(()),
+        enum Action { Bind(Ty, Ty), One(Ty, Ty), Two(Ty, Ty, Ty, Ty), Substs(Substs, Substs), FnPtr(Substs, Substs, Ty, Ty) }
+        let action = match (self.cx.types.kind(a), self.cx.types.kind(b)) {
+            (Kind::Var(_), _) => Action::Bind(a, b),
+            (_, Kind::Var(_)) => Action::Bind(b, a),
+            (Kind::IntVar(_) | Kind::FloatVar(_), _) => Action::Bind(a, b),
+            (_, Kind::IntVar(_) | Kind::FloatVar(_)) => Action::Bind(b, a),
+            (Kind::Tuple(x), Kind::Tuple(y)) => Action::Substs(*x, *y),
+            (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => Action::One(*x, *y),
+            (Kind::Array(x, m), Kind::Array(y, n)) => Action::Two(*x, *y, *m, *n),
+            (Kind::Slice(x), Kind::Slice(y)) => Action::One(*x, *y),
+            (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => Action::One(*x, *y),
+            (ka @ (Kind::Adt(i, x) | Kind::FnDef(i, x) | Kind::Dyn(i, x, ..)), kb @ (Kind::Adt(j, y) | Kind::FnDef(j, y) | Kind::Dyn(j, y, ..)))
+                if std::mem::discriminant(ka) == std::mem::discriminant(kb) && i == j && dyn_members(ka) == dyn_members(kb) => Action::Substs(*x, *y),
+            (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => Action::FnPtr(*x, *y, *r, *s),
+            _ => return Err(Clash { a, b, cycle: false }),
         };
-        pairs.into_iter().try_for_each(|(x, y)| self.unify_quiet(x, y).map_err(drop))
+        let clash = || Clash { a, b, cycle: false };
+        match action {
+            Action::Bind(var, ty) => self.bind(var, ty),
+            Action::One(x, y) => self.unify_quiet(x, y).map_err(|_| clash()),
+            Action::Two(x0, y0, x1, y1) => self.unify_quiet(x0, y0).and_then(|()| self.unify_quiet(x1, y1)).map_err(|_| clash()),
+            Action::Substs(x, y) => self.unify_substs(x, y).map_err(|()| clash()),
+            Action::FnPtr(x, y, r, s) => self.unify_substs(x, y).map_err(|()| clash()).and_then(|()| self.unify_quiet(r, s).map_err(|_| clash())),
+        }
     }
 
-    fn zip_substs(&self, a: Substs, b: Substs) -> Result<Vec<(Ty, Ty)>, ()> {
+    fn unify_substs(&mut self, a: Substs, b: Substs) -> Result<(), ()> {
         if a == b {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let (xs, ys) = (self.cx.types.substs(a), self.cx.types.substs(b));
-        if xs.len() != ys.len() {
+        let len = self.cx.types.substs(a).len();
+        if len != self.cx.types.substs(b).len() {
             return Err(());
         }
-        Ok(xs.iter().copied().zip(ys.iter().copied()).collect())
+        for i in 0..len {
+            let (x, y) = (self.cx.types.substs(a)[i], self.cx.types.substs(b)[i]);
+            self.unify_quiet(x, y).map_err(drop)?;
+        }
+        Ok(())
     }
 
     /// Checks that a value of type `found` can be used where `expected` is wanted, through the coercions that keep its bits.

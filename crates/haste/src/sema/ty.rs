@@ -126,7 +126,7 @@ const PARAM_BASE: u32 = VALUE_BASE + FAST_VALUES;
 const FAST_PARAMS: u32 = 32;
 
 #[derive(Default)]
-struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 6]);
+struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 7]);
 
 /// The type interner.
 #[derive(Clone)]
@@ -165,6 +165,7 @@ fn unary_slot(kind: &Kind) -> Option<(usize, u32)> {
         Kind::Ptr(Mut::Mut, inner) if inner != Ty::NONE => Some((3, inner.0)),
         Kind::Slice(inner) if inner != Ty::NONE => Some((4, inner.0)),
         Kind::Tuple(substs) if !substs.is_empty() => Some((5, substs.0)),
+        Kind::Proj(id) => Some((6, id.0)),
         _ => None,
     }
 }
@@ -282,9 +283,8 @@ impl Types {
     }
 
     fn intern_slow(&self, kind: Kind) -> Ty {
-        Ty(self.inner.intern(&kind, |kind, id| {
+        Ty(self.inner.intern_owned(kind, |kind, id| {
             self.flags.set(id as usize, self.kind_flags(kind));
-            kind.clone()
         }))
     }
 

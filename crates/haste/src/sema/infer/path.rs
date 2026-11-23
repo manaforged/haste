@@ -682,13 +682,26 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type that `segments` names through the frame: `Self`, a type parameter, or an associated type `Param::Name` of one.
     fn scoped_ty(&mut self, segments: &[Sym]) -> Result<Option<Ty>> {
+        if self.self_ty.is_none() && self.generics.is_empty() {
+            return Ok(None);
+        }
         let symbols = &self.cx.names.symbols;
         match *segments {
-            [one] if symbols.text(one) == "Self" && self.self_ty.is_some() => Ok(self.self_ty),
-            [one] => Ok(self.generics.iter().find(|(generic, _)| *generic == symbols.text(one)).map(|&(_, ty)| ty)),
-            [param, name] if symbols.text(param) == "Self" || self.generics.iter().any(|(generic, _)| *generic == symbols.text(param)) => {
-                let (param, name) = (symbols.text(param).to_string(), symbols.text(name).to_string());
-                self.param_projection(&param, &name)
+            [one] => {
+                let text = symbols.text(one);
+                if text == "Self" && self.self_ty.is_some() {
+                    return Ok(self.self_ty);
+                }
+                Ok(self.generics.iter().find(|(generic, _)| *generic == text).map(|&(_, ty)| ty))
+            }
+            [param, name] => {
+                let param_text = symbols.text(param);
+                if param_text == "Self" || self.generics.iter().any(|(generic, _)| *generic == param_text) {
+                    let (param, name) = (param_text.to_string(), symbols.text(name).to_string());
+                    self.param_projection(&param, &name)
+                } else {
+                    Ok(None)
+                }
             }
             _ => Ok(None),
         }

@@ -168,14 +168,20 @@ impl Infer<'_, '_> {
 
     /// Built-in associated type projection for `FnOnce::Output`, `AsyncFnOnce::Output`, `AsyncFnOnce::CallOnceFuture` and `AsyncFnMut::CallRefFuture`.
     pub(super) fn callable_assoc_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
-        let Some(lang) = self.cx.lang(of) else {
-            return Ok(None);
-        };
-        if lang == "fn_once" && name == "Output" {
-            return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
+        enum CallableAssoc {
+            FnOnceOutput,
+            AsyncFuture,
+            AsyncOutput,
         }
-        if !ASYNC_CALLABLE.contains(&lang) {
-            return Ok(None);
+        let assoc = match (self.cx.lang(of), name) {
+            (Some("fn_once"), "Output") => CallableAssoc::FnOnceOutput,
+            (Some("async_fn_once"), "CallOnceFuture") => CallableAssoc::AsyncFuture,
+            (Some("async_fn" | "async_fn_mut"), "CallRefFuture") => CallableAssoc::AsyncFuture,
+            (Some("async_fn" | "async_fn_mut" | "async_fn_once"), "Output") => CallableAssoc::AsyncOutput,
+            _ => return Ok(None),
+        };
+        if matches!(assoc, CallableAssoc::FnOnceOutput) {
+            return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
         }
         let kind_ok = matches!(
             self.cx.types.kind(self.resolve(ty)),
@@ -187,16 +193,15 @@ impl Infer<'_, '_> {
         let Some((_, ret)) = self.callable_sig(ty)? else {
             return Ok(None);
         };
-        match name {
-            "CallOnceFuture" if lang == "async_fn_once" => Ok(Some(ret)),
-            "CallRefFuture" if matches!(lang, "async_fn" | "async_fn_mut") => Ok(Some(ret)),
-            "Output" => {
+        match assoc {
+            CallableAssoc::AsyncFuture => Ok(Some(ret)),
+            CallableAssoc::AsyncOutput => {
                 let Some(future_trait) = self.cx.lang_item("future_trait") else {
                     bail!("core has no `Future`");
                 };
                 self.project(future_trait, ret, Vec::new(), "Output").map(Some)
             }
-            _ => Ok(None),
+            CallableAssoc::FnOnceOutput => unreachable!(),
         }
     }
 
