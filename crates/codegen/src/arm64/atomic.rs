@@ -502,6 +502,25 @@ impl Emit<'_> {
         }
     }
 
+    fn relaxed_atomic_target(&self, addr: Value) -> (Value, i32) {
+        if !self.plan.elided[addr.index()] || self.plan.sib[addr.index()].is_some() {
+            return (addr, 0);
+        }
+        let Some(inst) = self.defs[addr.index()] else { return (addr, 0) };
+        let c = |v: Value| super::fuse::const_of(self.func, &self.plan, v, |x| self.defs[x.index()]);
+        match self.func.insts[inst.index()].op {
+            Op::Binary(crate::ir::Binary::Iadd, x, y) => {
+                if let Some(imm) = c(y).and_then(|v| i32::try_from(v).ok()) { return (x, imm); }
+                if let Some(imm) = c(x).and_then(|v| i32::try_from(v).ok()) { return (y, imm); }
+            }
+            Op::Binary(crate::ir::Binary::Isub, base, rhs) => {
+                if let Some(imm) = c(rhs).and_then(|v| v.checked_neg()).and_then(|v| i32::try_from(v).ok()) { return (base, imm); }
+            }
+            _ => {}
+        }
+        (addr, 0)
+    }
+
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         self.invalidate_spills();
         let ty = match op {
@@ -514,22 +533,24 @@ impl Emit<'_> {
         let size = Size::of(ty.bytes());
         match op {
             Op::AtomicLoad(addr, ord) => {
-                let at = self.bits(*addr, C);
-                let dst = self.dst(result()?);
                 if ord.has_acquire() {
+                    let at = self.bits(*addr, C);
+                    let dst = self.dst(result()?);
                     self.asm.load_acquire(size, dst, at);
+                    self.put(result()?, dst);
                 } else {
-                    self.asm.load(size, false, dst, Mem::new(at, 0));
+                    let (base, off) = self.relaxed_atomic_target(*addr);
+                    self.load_at(result()?, base, off);
                 }
-                self.put(result()?, dst);
             }
             Op::AtomicStore(value, addr, ord) => {
-                let at = self.bits(*addr, C);
-                let source = self.bits(*value, A);
                 if ord.has_release() {
+                    let at = self.bits(*addr, C);
+                    let source = self.store_src(*value);
                     self.asm.store_release(size, at, source);
                 } else {
-                    self.asm.store(size, Mem::new(at, 0), source);
+                    let (base, off) = self.relaxed_atomic_target(*addr);
+                    self.store_at(*value, base, off);
                 }
             }
             Op::AtomicRmw(rmw, ord, addr, value) => {

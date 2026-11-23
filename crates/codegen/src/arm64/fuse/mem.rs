@@ -47,6 +47,8 @@ fn sib_uses_span(func: &Function, (b_idx, pos, res): (usize, usize, Value), cand
         let hit = match (&u_data.op, u_data.result) {
             (&Op::Load(addr, off), Some(r)) if addr == res => Some((func.ty(r), off)),
             (&Op::Store(val, addr, off), _) if addr == res && val != res => Some((func.ty(val), off)),
+            (&Op::AtomicLoad(addr, ord), Some(r)) if !ord.has_acquire() && addr == res => Some((func.ty(r), 0)),
+            (&Op::AtomicStore(val, addr, ord), _) if !ord.has_release() && addr == res && val != res => Some((func.ty(val), 0)),
             _ => None,
         };
         if hit.is_some_and(|(t, off)| sib_use_ok(func, cand, expected, t, off)) {
@@ -723,8 +725,51 @@ fn narrow_store_ok(func: &Function, plan: &Plan<Reg>, uses: &[u32], (b_idx, pos,
         .iter()
         .enumerate()
         .skip(pos + 1)
-        .find_map(|(at, &inst)| matches!(func.insts[inst.index()].op, Op::Store(val, addr, _) if val == res && addr != res).then_some(at));
+        .find_map(|(at, &inst)| {
+            matches!(func.insts[inst.index()].op, Op::Store(val, addr, _) | Op::AtomicStore(val, addr, _) if val == res && addr != res).then_some(at)
+        });
     store.is_some_and(|at| super::elided_use_end(func, plan, insts, at, inner).is_some() && preserved(func, plan, b_idx, pos, at, None, inner))
+}
+
+pub(super) fn fuse_relaxed_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>])) {
+    let mut info: Vec<(u32, usize, usize, u8)> = vec![(0, usize::MAX, 0, 0); func.types.len()];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let hit = match (&data.op, data.result) {
+                (&Op::AtomicLoad(addr, ord), Some(r)) if !ord.has_acquire() => Some((addr, func.ty(r).bytes())),
+                (&Op::AtomicStore(val, addr, ord), _) if !ord.has_release() && val != addr => Some((addr, func.ty(val).bytes())),
+                _ => None,
+            };
+            if let Some((addr, bytes)) = hit && matches!(bytes, 1 | 2 | 4 | 8) {
+                let entry = &mut info[addr.index()];
+                let mask = bytes as u8;
+                if entry.0 == 0 {
+                    *entry = (1, b_idx, pos, mask);
+                } else if entry.1 == b_idx {
+                    entry.0 += 1;
+                    entry.2 = entry.2.max(pos);
+                    entry.3 |= mask;
+                } else {
+                    entry.0 = u32::MAX;
+                }
+            }
+        }
+    }
+    for (v, def) in pos_of.iter().enumerate() {
+        let Some((block, start, inst)) = *def else { continue };
+        let (count, use_block, max_end, mask) = info[v];
+        if count == 0 || count != uses[v] || use_block != block || max_end <= start { continue; }
+        let val = Value(v as u32);
+        if func.ty(val) != Type::I64 || plan.elided[v] || plan.is_static(val) || plan.sib[v].is_some() { continue; }
+        let Some((base, delta)) = parse_sib_base_op(func, plan, pos_of, &func.insts[inst.index()].op) else { continue };
+        if plan.elided[base.index()] || plan.sib[base.index()].is_some() { continue; }
+        if count > 1 && plan.reg_of(base).is_none() && !matches!(plan.location(base), Location::Frame(..)) { continue; }
+        if ![1u8, 2, 4, 8].into_iter().filter(|&b| mask & b != 0).all(|b| mem_imm_fits(delta, u32::from(b))) { continue; }
+        if preserved(func, plan, block, start, max_end, None, base) {
+            plan.elided[v] = true;
+        }
+    }
 }
 
 pub(super) fn fuse_store_ireduce(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
