@@ -560,7 +560,11 @@ fn hash_foreign_callee(cx: &mut Context<'_>, mix: &mut HashMix, callee: &Typed) 
 }
 
 fn hash_callee_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, (caller, callee_idx): (usize, usize), cycle_root: &mut usize) -> Result<()> {
-    let Some(limit) = super::super::budget::caller_inline_limit(cx, reached, (caller, callee_idx), false).filter(|_| slots.allow_inline()) else {
+    if !slots.allow_inline() {
+        mix.byte(0);
+        return Ok(());
+    }
+    let Some(limit) = super::super::budget::caller_inline_limit(cx, reached, (caller, callee_idx), false) else {
         mix.byte(0);
         return Ok(());
     };

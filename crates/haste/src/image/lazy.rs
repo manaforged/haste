@@ -155,6 +155,10 @@ impl Jit {
         Ok(jit)
     }
 
+    pub(crate) fn store(&self) -> &Cache {
+        &self.store
+    }
+
     fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
         let mut reached = Reached::default();
         reached.set_incremental(true);
@@ -634,14 +638,27 @@ impl Jit {
 
     /// Declares and infers the functions `wanted`, and returns their indexes.
     fn reach(&mut self, cx: &mut Context<'_>, wanted: Vec<Instance>, journal: &mut Journal) -> Result<Vec<usize>, Stop> {
-        let mut callees = Vec::new();
+        let mut callees = Vec::with_capacity(wanted.len());
+        let mut untyped = Vec::new();
         for instance in wanted {
             let at = self.declare(instance);
+            callees.push(at);
+            if self.reached.is_untyped(at) {
+                untyped.push(at);
+            }
+        }
+        if untyped.len() >= 4 && crate::jobs() > 1 {
+            let kept = infer_quiet(cx, &mut self.reached, &untyped);
+            if !kept.is_empty() {
+                self.image.bind_foreign_statics(cx, &self.reached, &kept);
+                journal.extend(kept);
+            }
+        }
+        for at in untyped {
             if infer_declared(cx, &mut self.reached, at) {
                 journal.push(at);
                 self.image.bind_foreign_statics(cx, &self.reached, &[at]);
             }
-            callees.push(at);
         }
         if self.strict && !cx.resolved() {
             return Err(Stop::Asked);

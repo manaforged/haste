@@ -69,14 +69,21 @@ enum Hint {
 }
 
 fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
-    if cx.inline_always(item) {
-        Hint::Always
-    } else if cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never") {
-        Hint::Never
-    } else if cx.attr_value(item, "inline").is_some() {
-        Hint::Inline
-    } else {
-        Hint::Default
+    if cx.item(item).1.attrs.is_empty() {
+        return Hint::Default;
+    }
+    match cx.attr_value(item, "inline") {
+        Some("always") => Hint::Always,
+        Some("never") => Hint::Never,
+        inline => {
+            if cx.attr_value(item, "cold").is_some() {
+                Hint::Never
+            } else if inline.is_some() {
+                Hint::Inline
+            } else {
+                Hint::Default
+            }
+        }
     }
 }
 

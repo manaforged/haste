@@ -165,9 +165,6 @@ impl Lookups {
         self.type_defs.clear();
         self.trait_calls.clear();
         self.assoc_types.clear();
-        if self.lang_items.get().is_some() {
-            self.lang_items = Arc::new(std::sync::OnceLock::new());
-        }
     }
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
@@ -214,7 +211,7 @@ impl Lookups {
             self.summaries = table::Flight::default();
             self.glues.clear();
         }
-        if (!same_len || guard.iter().zip(&loaded).any(|(a, b)| a.files != b.files)) && self.lang_items.get().is_some() {
+        if self.lang_items.get().is_some() && lang_files_changed(outline, &guard, &loaded, same_len) {
             self.lang_items = Arc::new(std::sync::OnceLock::new());
         }
         if reset_sysroot {
@@ -234,6 +231,27 @@ impl Lookups {
         self.type_defs.clear();
         *guard = loaded;
     }
+}
+
+fn lang_files_changed(
+    outline: &Outline,
+    prev: &[crate::outline::tree::CrateExtent],
+    next: &[crate::outline::tree::CrateExtent],
+    same_len: bool,
+) -> bool {
+    if !same_len {
+        return true;
+    }
+    let lang_bit = crate::outline::item::mark("lang");
+    prev.iter().zip(next).enumerate().any(|(k, (a, b))| {
+        if a.files == b.files {
+            return false;
+        }
+        b.files < a.files
+            || outline.crates[k].files[a.files..]
+                .iter()
+                .any(|f| f.items.marks.iter().any(|&(_, bits)| bits & lang_bit != 0))
+    })
 }
 
 impl Cache {

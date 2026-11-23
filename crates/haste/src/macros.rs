@@ -23,6 +23,7 @@ pub struct Compilation {
     pub outline: Outline,
     pub names: Names,
     expander: Option<Expander>,
+    substrate: Option<std::sync::Arc<crate::substrate::Substrate>>,
 }
 
 struct Expander {
@@ -76,13 +77,19 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
         .collect();
     outline.load_selected(&selected)?;
     let names = Names::new_with(workspace, &outline, cached);
-    let mut compilation = Compilation { outline, names, expander: None };
+    let has_proc_macro = outline.roots.iter().any(|root| root.path.as_os_str() == PROC_MACRO_ROOT);
+    let macro_slot = has_proc_macro.then(|| crate::with_host_target(|| crate::build::substrate::open_batch_substrate(workspace))).flatten();
+    let substrate = macro_slot.as_ref().and_then(crate::build::substrate::SubstrateSlot::top);
+    let mut compilation = Compilation { outline, names, expander: None, substrate };
     for (krate, &on) in selected.iter().enumerate() {
         if on {
             compilation.names.crates[krate].eager = true;
         }
     }
     resolve(&mut compilation)?;
+    if let (Some(slot), Some(expander)) = (macro_slot, &compilation.expander) {
+        crate::with_host_target(|| crate::build::substrate::save_macro_summaries(&compilation.outline, expander.jit.store(), slot));
+    }
     if was_miss {
         crate::substrate::sysroot::save(workspace, targets, &compilation);
     }
@@ -404,12 +411,56 @@ fn caller_vars(outline: &Outline, caller: usize) -> Vec<(String, String)> {
     vars
 }
 
+fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Result<()> {
+    let n = compilation.outline.crates.len();
+    let mut seen = vec![false; n];
+    let mut queue = Vec::new();
+    for &root in roots {
+        if root < n && !seen[root] {
+            seen[root] = true;
+            queue.push(root);
+        }
+    }
+    let mut head = 0;
+    while head < queue.len() {
+        let krate = queue[head];
+        head += 1;
+        for &(_, dep) in &compilation.outline.deps[krate] {
+            if dep < n && !seen[dep] {
+                seen[dep] = true;
+                queue.push(dep);
+            }
+        }
+    }
+    let selected: Vec<bool> = (0..n).map(|k| seen[k] && compilation.outline.crates[k].partial()).collect();
+    if !selected.iter().any(|&on| on) {
+        return Ok(());
+    }
+    compilation.outline.load_selected(&selected)?;
+    for (krate, &on) in selected.iter().enumerate() {
+        if on {
+            compilation.names.crates[krate].eager = true;
+        }
+    }
+    compilation.names.resolve(&mut compilation.outline)
+}
+
 /// Runs each call `bound` on its `inputs` in children that compile each function on its first call; `None` for a call that did not run. The macro expander keeps its code and inference while its macro crate graph is unchanged.
 fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Option<Result<String, String>>>> {
     let pair = entries(&mut compilation.outline)?;
+    let mut preload_roots = Vec::with_capacity(bound.len() + 1);
+    preload_roots.push(pair[0].krate as usize);
+    preload_roots.extend(bound.iter().map(|(call, ..)| call.krate as usize));
+    preload_macro_crates(compilation, &preload_roots)?;
     let (mut demand, mut roots) = match compilation.expander.take() {
         Some(kept) if kept.matches(&compilation.outline) => (kept.jit, kept.roots),
-        _ => (Jit::new(Cache::default())?, Vec::new()),
+        _ => {
+            let mut cache = Cache::default();
+            if let Some(sub) = &compilation.substrate {
+                cache.set_substrate(Some(std::sync::Arc::clone(sub)));
+            }
+            (Jit::new(cache)?, Vec::new())
+        }
     };
     let mut env_by_caller: HashMap<usize, Vec<(String, String)>> = HashMap::default();
     for &(_, _, caller) in bound {

@@ -138,11 +138,6 @@ impl<'a> Context<'a> {
         self.attr_at(member, "track_caller").is_some()
     }
 
-    /// Whether the function `item` is `#[inline(always)]`.
-    pub fn inline_always(&self, item: ItemRef) -> bool {
-        self.attr_at(item, "inline").is_some_and(|at| self.item(item).0.text(at + 2) == "always")
-    }
-
     /// Whether the const function `item` is `#[rustc_promotable]`, so a reference to its call on promotable arguments lives for the whole program.
     pub fn rustc_promotable(&self, item: ItemRef) -> bool {
         self.attr_at(item, "rustc_promotable").is_some()

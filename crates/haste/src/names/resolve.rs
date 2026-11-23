@@ -371,7 +371,7 @@ impl Names {
         let swept: Vec<usize> = (0..self.crates.len()).filter(|&krate| sweep[krate] && !self.crates[krate].settled).collect();
         let mut found = Vec::new();
         let mut unresolved = vec![Vec::new(); self.crates.len()];
-        if swept.len() >= 4 && crate::jobs() > 1 {
+        if swept.len() >= 2 && crate::jobs() > 1 {
             let results = crate::sync::parallel_map(swept, |krate| {
                 let local_asks = Requests::default();
                 let out = sweep_crate_imports(self, outline, krate, &local_asks);

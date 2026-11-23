@@ -96,7 +96,13 @@ impl Names {
         crates.sort_unstable();
         crates.dedup();
         crates.retain(|krate| outline.crates[*krate as usize].partial());
-        for &krate in &crates {
+        if crates.len() > 1 {
+            let mut selected = vec![false; outline.crates.len()];
+            for &krate in &crates {
+                selected[krate as usize] = true;
+            }
+            outline.load_selected(&selected)?;
+        } else if let Some(&krate) = crates.first() {
             outline.load_crate(krate as usize)?;
         }
         self.resolve(outline)?;
