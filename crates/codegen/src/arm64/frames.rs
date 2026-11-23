@@ -1,10 +1,12 @@
-use super::asm::{Label, Reg, Size};
-use super::{Emit, IP, T};
+use super::asm::{Cond, Label, Mem, Reg, Size};
+use super::{A, Emit, IP, T};
 use crate::ir::{Op, Value};
-use crate::reloc::{RelocKind, StencilReloc};
+use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
 
 pub(super) enum ColdCall {
     ThreadCell(Label, Label, u32, [Value; 3]),
+    FrameAlloc(Label, Label, u32),
+    FrameFree(Label, Label, u32),
 }
 
 impl Emit<'_> {
@@ -19,6 +21,15 @@ impl Emit<'_> {
         }
     }
 
+    fn emit_tlv_base(&mut self) -> u32 {
+        let at = self.asm.pos();
+        self.asm.word(0x9000_0000);
+        self.asm.word(0x9100_0000);
+        self.asm.word(0xF940_0010);
+        self.asm.blr(IP);
+        at
+    }
+
     pub(super) fn thread_cell_cold(&mut self, lookup: u32, args: &[Value]) -> bool {
         let [slot, size, init] = *args else { return false };
         if !args.iter().all(|&a| self.plan.is_static(a)) {
@@ -26,11 +37,7 @@ impl Emit<'_> {
         }
         let Some(target_sym) = self.thread_cell_sym(slot, lookup) else { return false };
         let (cold, back) = (self.asm.label(), self.asm.label());
-        let at = self.asm.pos();
-        self.asm.word(0x9000_0000);
-        self.asm.word(0x9100_0000);
-        self.asm.word(0xF940_0010);
-        self.asm.blr(IP);
+        let at = self.emit_tlv_base();
         self.asm.word(0xF940_0000);
         self.relocs.push(StencilReloc::symbol(at, target_sym, RelocKind::Arm64TlvCell));
         self.asm.cbz(false, Size::X, Reg(0), cold);
@@ -39,17 +46,73 @@ impl Emit<'_> {
         true
     }
 
+    pub(super) fn cached_frame_cold(&mut self, rt: RuntimeSymbol, args: &[Value]) -> bool {
+        if !self.tlv_cells || !matches!(rt, RuntimeSymbol::Malloc | RuntimeSymbol::Free) {
+            return false;
+        }
+        let Some(bytes) = args.last().and_then(|&b| self.plan.const_of(b)).filter(|&b| (0..i64::from(FRAME_CACHE_LIMIT)).contains(&b) && b % 16 == 0) else {
+            return false;
+        };
+        let bytes = bytes as u32;
+        let (cold, back) = (self.asm.label(), self.asm.label());
+        if rt == RuntimeSymbol::Malloc {
+            let at = self.emit_tlv_base();
+            self.asm.word(0x9100_0002 | ((bytes & 0xFFF) << 10));
+            self.relocs.push(StencilReloc::runtime(at, rt, RelocKind::Arm64TlvCell));
+            self.asm.ldp_offset(Reg(0), A, Reg(2), 0);
+            self.asm.cbz(false, Size::X, Reg(0), cold);
+            self.asm.load(Size::X, false, Reg(8), Mem::new(Reg(0), 0));
+            self.asm.add_imm(true, false, Size::X, A, A, 1);
+            self.asm.stp_offset(Reg(8), A, Reg(2), 0);
+            self.asm.bind(back);
+            self.cold_calls.push(ColdCall::FrameAlloc(cold, back, bytes));
+        } else {
+            let Some(&ptr) = args.first() else { return false };
+            self.raw(A, ptr);
+            let at = self.emit_tlv_base();
+            self.asm.word(0x9100_0002 | ((bytes & 0xFFF) << 10));
+            self.relocs.push(StencilReloc::runtime(at, rt, RelocKind::Arm64TlvCell));
+            self.asm.ldp_offset(Reg(11), Reg(8), Reg(2), 0);
+            self.asm.add_imm(true, true, Size::X, super::asm::ZR, Reg(8), u32::from(FRAME_CACHE_DEPTH));
+            self.asm.bcond(Cond::Hs, cold);
+            self.asm.store(Size::X, Mem::new(A, 0), Reg(11));
+            self.asm.add_imm(false, false, Size::X, Reg(8), Reg(8), 1);
+            self.asm.stp_offset(A, Reg(8), Reg(2), 0);
+            self.asm.bind(back);
+            self.cold_calls.push(ColdCall::FrameFree(cold, back, bytes));
+        }
+        true
+    }
+
     pub(super) fn emit_cold_calls(&mut self) {
         self.invalidate_spills();
         for call in std::mem::take(&mut self.cold_calls) {
-            let ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]) = call;
-            self.asm.bind(cold);
-            self.raw(Reg(0), slot);
-            self.raw(Reg(1), size);
-            self.raw(Reg(2), init);
-            let reloc = self.asm.call_direct_symbol(lookup, true, T);
-            self.relocs.push(reloc);
-            self.asm.b(back);
+            match call {
+                ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]) => {
+                    self.asm.bind(cold);
+                    self.raw(Reg(0), slot);
+                    self.raw(Reg(1), size);
+                    self.raw(Reg(2), init);
+                    let reloc = self.asm.call_direct_symbol(lookup, true, T);
+                    self.relocs.push(reloc);
+                    self.asm.b(back);
+                }
+                ColdCall::FrameAlloc(cold, back, bytes) => {
+                    self.asm.bind(cold);
+                    self.asm.mov_imm(Reg(0), i64::from(bytes));
+                    let reloc = self.asm.call_runtime(RuntimeSymbol::Malloc, true, T);
+                    self.relocs.push(reloc);
+                    self.asm.b(back);
+                }
+                ColdCall::FrameFree(cold, back, bytes) => {
+                    self.asm.bind(cold);
+                    self.asm.mov(Reg(0), A);
+                    self.asm.mov_imm(Reg(1), i64::from(bytes));
+                    let reloc = self.asm.call_runtime(RuntimeSymbol::Free, true, T);
+                    self.relocs.push(reloc);
+                    self.asm.b(back);
+                }
+            }
         }
     }
 }

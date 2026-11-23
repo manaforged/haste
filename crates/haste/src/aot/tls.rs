@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail, ensure};
 use haste_codegen::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT};
 
-use super::shims::{Emit, Shim, arm64_fwd, arm64_here, emit_arm64_adrp_add};
-use super::{Buf, Plan};
+use crate::host::HostSymbol;
+
+use super::shims::{Emit, Shim, arm64_fwd, arm64_here, emit_arm64_adrp_add, patch_arm64_adrp_add};
+use super::{Buf, Plan, SectionAddrs, Symbol};
 
 pub(super) const UNWIND_STATE_BYTES: u64 = 16;
 pub(super) const FRAME_CACHE_BYTES: u64 = FRAME_CACHE_LIMIT as u64;
@@ -114,4 +116,54 @@ pub(super) fn emit_arm64_tlv_frame_cache(c: &Emit<'_>, alloc: bool, desc_va: u64
         arm64_here(&[big], out);
         c.tail("free", out)
     }
+}
+
+pub(super) fn patch_thread_off32(sym: &Symbol, addrs: SectionAddrs, slot: &mut [u8]) -> Result<()> {
+    let addend = i64::from(i32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]));
+    let word = match *sym {
+        Symbol::Runtime(_) => {
+            ensure!(addrs.frame_tls != 0, "ThreadOff32 without a frame cache");
+            -(addrs.frame_tls as i64)
+        }
+        Symbol::Word(s) => {
+            ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
+            s as i64 * 8 - addrs.thread_tls as i64
+        }
+        Symbol::Host(HostSymbol::ThreadCell) => {
+            ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
+            -(addrs.thread_tls as i64)
+        }
+        ref other => bail!("ThreadOff32 to {other:?}"),
+    };
+    let off = i32::try_from(addend + word).context("ThreadOff32 offset out of range")?;
+    slot[..4].copy_from_slice(&off.to_le_bytes());
+    Ok(())
+}
+
+pub(super) fn patch_arm64_tlv_cell(sym: &Symbol, addrs: SectionAddrs, pc_va: u64, slot: &mut [u8]) -> Result<()> {
+    ensure!(addrs.tlv_desc != 0, "Arm64TlvCell without Mach-O TLV");
+    patch_arm64_adrp_add(&mut slot[..8], pc_va, false, addrs.tlv_desc, false)?;
+    let word = match *sym {
+        Symbol::Runtime(_) => {
+            ensure!(addrs.frame_tls != 0, "Arm64TlvCell without frame cache");
+            let bytes = (u32::from_le_bytes([slot[16], slot[17], slot[18], slot[19]]) >> 10) & 0xFFF;
+            let total = addrs.frame_tls as u32 + bytes;
+            ensure!(total < 4096, "Arm64TlvCell frame offset {total} out of range");
+            arm64_add_imm(2, 0, total)
+        }
+        Symbol::Word(s) => {
+            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
+            let byte_off = addrs.thread_tls + s * 8;
+            ensure!(byte_off % 8 == 0 && byte_off < 32_768, "Arm64TlvCell offset {byte_off} out of range");
+            0xF940_0000u32 | (((byte_off as u32 / 8) & 0xFFF) << 10)
+        }
+        Symbol::Host(HostSymbol::ThreadCell) => {
+            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
+            ensure!(addrs.thread_tls % 8 == 0 && addrs.thread_tls < 32_768, "Arm64TlvCell offset out of range");
+            0xF940_0000u32 | (((addrs.thread_tls as u32 / 8) & 0xFFF) << 10)
+        }
+        ref other => bail!("Arm64TlvCell to {other:?}"),
+    };
+    slot[16..20].copy_from_slice(&word.to_le_bytes());
+    Ok(())
 }

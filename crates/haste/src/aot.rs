@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use haste_codegen::{Arch, Format, Os, RelocKind, RuntimeSymbol, Target, patch_reloc};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -646,38 +646,12 @@ fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64
             continue;
         }
         if reloc.kind == RelocKind::ThreadOff32 {
-            let addend = i64::from(i32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]));
-            let word = match reloc.symbol {
-                Symbol::Runtime(_) => {
-                    ensure!(addrs.frame_tls != 0, "ThreadOff32 without a frame cache");
-                    -(addrs.frame_tls as i64)
-                }
-                Symbol::Word(slot) => {
-                    ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
-                    slot as i64 * 8 - addrs.thread_tls as i64
-                }
-                Symbol::Host(HostSymbol::ThreadCell) => {
-                    ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
-                    -(addrs.thread_tls as i64)
-                }
-                ref other => bail!("ThreadOff32 to {other:?}"),
-            };
-            let off = i32::try_from(addend + word).context("ThreadOff32 offset out of range")?;
-            out[at..at + 4].copy_from_slice(&off.to_le_bytes());
+            tls::patch_thread_off32(&reloc.symbol, addrs, &mut out[at..at + 4])?;
             continue;
         }
         if reloc.kind == RelocKind::Arm64TlvCell {
-            ensure!(addrs.tlv_desc != 0 && addrs.thread_tls != 0, "Arm64TlvCell without Mach-O TLV");
             let pc_va = text_va + u64::from(reloc.offset);
-            shims::patch_arm64_adrp_add(&mut out[at..at + 8], pc_va, false, addrs.tlv_desc, false)?;
-            let slot = match reloc.symbol {
-                Symbol::Word(s) => s,
-                Symbol::Host(HostSymbol::ThreadCell) => 0,
-                ref other => bail!("Arm64TlvCell to {other:?}"),
-            };
-            let byte_off = addrs.thread_tls + slot * 8;
-            ensure!(byte_off % 8 == 0 && byte_off < 32_768, "Arm64TlvCell offset {byte_off} out of range");
-            out[at + 16..at + 20].copy_from_slice(&(0xF940_0000u32 | (((byte_off as u32 / 8) & 0xFFF) << 10)).to_le_bytes());
+            tls::patch_arm64_tlv_cell(&reloc.symbol, addrs, pc_va, &mut out[at..at + 20])?;
             continue;
         }
         if reloc.kind == RelocKind::X64RipRel32 {

@@ -691,9 +691,16 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
-        if !is_try && let Some(CallTarget::Symbol(lookup)) = direct && self.func.is_thread_cell(callee) && self.thread_cell_cold(lookup, args) {
-            self.clobber_call_spills();
-            return Ok(abi);
+        if !is_try {
+            let inlined = match direct {
+                Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => self.thread_cell_cold(lookup, args),
+                Some(CallTarget::Runtime(rt)) => self.cached_frame_cold(rt, args),
+                _ => false,
+            };
+            if inlined {
+                self.clobber_call_spills();
+                return Ok(abi);
+            }
         }
         let (target, extra) = if direct.is_none() {
             match self.plan.reg_of(callee).filter(|&reg| !matches!(reg, A | C | IP | FP | LR | SP) && !abi.clobbers(reg)) {
@@ -749,12 +756,8 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) { self.branch_cond(condition, invert, label); }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
-        self.arguments(sig, callee, args, is_try)
-    }
-    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
-        self.store_locs(values, locs);
-    }
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> { self.arguments(sig, callee, args, is_try) }
+    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) { self.store_locs(values, locs); }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
     fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(FP, INCOMING + offset as i32)); }
     fn intake_struct(&mut self, _value: Value, _offset: u32) {}
