@@ -8,6 +8,7 @@ use crate::ir::{AbiParam, Binary, Block, CallConv, Function, Inst, InstData, Int
 use crate::live::{BitMatrix, results};
 use crate::reloc::RuntimeSymbol;
 
+mod fold_flags;
 mod lazy;
 mod slots;
 
@@ -170,6 +171,7 @@ pub(crate) fn split(func: &mut Function) {
         func.bump_cfg();
         return;
     }
+    fold_flags::run(func, &spec, old_entry);
     let defs = func.def_blocks();
     let cfg = func.cfg();
     let spills = live_across_suspend(func, &cfg, &spec.resumes, &defs);
