@@ -349,15 +349,11 @@ impl Fold {
     fn neutral(&self, func: &Function, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
         let is = |value: Value, want: i64| self.known(value).is_some_and(|imm| extend(imm, ty, false) == extend(want, ty, false));
         if let Some(unit) = unit(op) {
-            if is(y, unit) {
-                return Some(x);
-            }
+            if is(y, unit) { return Some(x); }
             return (!matches!(op, Binary::Isub | Binary::Sdiv | Binary::Udiv) && is(x, unit)).then_some(y);
         }
         let shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr);
-        if shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0) {
-            return Some(x);
-        }
+        if shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0) { return Some(x); }
         if op == Binary::Band {
             for (val, other) in [(x, y), (y, x)] {
                 if let Some(mask) = self.known(other) {
@@ -392,15 +388,18 @@ impl Fold {
 
     /// Finds, in one pass in block order, the small integers that are constants, wrapped to their type, and the results that equal an existing value.
     fn constants(&mut self, func: &Function) {
-        for (block, pos, inst) in func.blocks.iter().enumerate().flat_map(|(block, data)| data.insts.iter().enumerate().map(move |(pos, inst)| (block, pos, inst))) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result.filter(|result| self.subst[result.index()] == *result && self.consts[result.index()].is_none()) else { continue };
-            let ty = func.ty(result);
-            let at = Before { prefix: &func.blocks[block].insts[..pos], block: Some(Block(block as u32)) };
-            if let Some(imm) = self.evaluate(func, at, &data.op, ty) {
-                self.consts[result.index()] = Some(imm);
-            } else if let Some(value) = self.identity(func, &data.op, ty) {
-                self.subst[result.index()] = value;
+        for (block, data_b) in func.blocks.iter().enumerate() {
+            for (pos, inst) in data_b.insts.iter().enumerate() {
+                let data = &func.insts[inst.index()];
+                let Some(result) = data.result.filter(|r| self.subst[r.index()] == *r && self.consts[r.index()].is_none()) else { continue };
+                let ty = func.ty(result);
+                match data.op {
+                    Op::Const(imm) => { if ty.is_small_int() { self.consts[result.index()] = Some(extend(imm, ty, true)); } continue; }
+                    Op::StackLoad(..) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) | Op::Runtime(_) | Op::Call { .. } | Op::TryCall { .. } | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Insert(..) => continue,
+                    _ => {}
+                }
+                let at = Before { prefix: &data_b.insts[..pos], block: Some(Block(block as u32)) };
+                if let Some(imm) = self.evaluate(func, at, &data.op, ty) { self.consts[result.index()] = Some(imm); } else if let Some(v) = self.identity(func, &data.op, ty) { self.subst[result.index()] = v; }
             }
         }
     }
@@ -654,8 +653,8 @@ impl Fold {
 
     fn entry_guards(&mut self, func: &mut Function, reachable: &[bool], pinned: &[bool]) -> bool {
         if func.blocks.len() <= 1 { return false; }
-        let env = crate::cse::CmpEnv { defs: &self.defs, consts: &self.consts, subst: &self.subst, bool_val: None };
-        let has_cmp = |b: usize| reachable[b] && !pinned[b] && func.blocks[b].insts.iter().any(|&inst| match func.insts[inst.index()].op {
+        let (entry_idx, env) = (func.entry.map_or(usize::MAX, |e| e.index()), crate::cse::CmpEnv { defs: &self.defs, consts: &self.consts, subst: &self.subst, bool_val: None });
+        let has_cmp = |b: usize| b != entry_idx && reachable[b] && !pinned[b] && func.blocks[b].insts.iter().any(|&inst| match func.insts[inst.index()].op {
             Op::Trapz(c) => extract_cmp(func, &env, c).is_some(),
             Op::Brif(c, tb, _, eb, _) if tb != eb => extract_cmp(func, &env, c).is_some(),
             _ => false,

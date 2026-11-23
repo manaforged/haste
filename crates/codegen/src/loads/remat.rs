@@ -22,14 +22,23 @@ pub(super) struct FarCseGuard {
     cur_pos: usize,
     cur_defs: usize,
     loads: Vec<Option<LoadTrack>>,
+    touched: Vec<usize>,
 }
 
 impl FarCseGuard {
-    pub(super) fn new(block_len: usize, num_values: usize) -> Self {
-        if block_len < MIN_BLOCK_INSTS {
-            return Self { active: false, cur_pos: 0, cur_defs: 0, loads: Vec::new() };
+    pub(super) fn empty() -> Self {
+        Self { active: false, cur_pos: 0, cur_defs: 0, loads: Vec::new(), touched: Vec::new() }
+    }
+
+    pub(super) fn reset(&mut self, block_len: usize, num_values: usize) {
+        for idx in self.touched.drain(..) {
+            if idx < self.loads.len() { self.loads[idx] = None; }
         }
-        Self { active: true, cur_pos: 0, cur_defs: 0, loads: vec![None; num_values] }
+        (self.cur_pos, self.cur_defs) = (0, 0);
+        self.active = block_len >= MIN_BLOCK_INSTS;
+        if self.active && self.loads.len() < num_values {
+            self.loads.resize(num_values, None);
+        }
     }
 
     pub(super) fn should_skip_value(&self, op: &Op, ty: Type, dom_val: Value) -> bool {
@@ -79,6 +88,7 @@ impl FarCseGuard {
             && matches!(data.op, Op::Load(..))
             && is_scalar_remat_ty(func.ty(res))
         {
+            if self.loads[res.index()].is_none() { self.touched.push(res.index()); }
             self.loads[res.index()] = Some(LoadTrack {
                 last_use_pos: self.cur_pos,
                 last_use_defs: next_defs,

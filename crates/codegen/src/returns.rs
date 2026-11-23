@@ -20,10 +20,11 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if factor_tail_calls(func, changed) {
         changed = true;
     }
+    let mut meta: Option<(Vec<Option<i64>>, Vec<u32>)> = None;
     for _ in 0..MAX_SINK_DEPTH {
-        let round = factor_common_returns(func, changed);
-        let sunk = sink_common_jump_tails(func, changed || round);
-        let jumped = factor_jump_tails(func, changed || round || sunk);
+        let round = factor_common_returns(func, changed, &mut meta);
+        let sunk = sink_common_jump_tails(func, changed || round, &mut meta);
+        let jumped = factor_jump_tails(func, changed || round || sunk, &mut meta);
         if !round && !sunk && !jumped {
             break;
         }
@@ -587,17 +588,14 @@ fn group_tail_sites<K: Eq + std::hash::Hash + Clone>(
     groups
 }
 
-fn factor_common_returns(func: &mut Function, cfg_dirty: bool) -> bool {
+fn factor_common_returns(func: &mut Function, cfg_dirty: bool, meta: &mut Option<(Vec<Option<i64>>, Vec<u32>)>) -> bool {
     if func.blocks.iter().filter(|b| b.insts.len() >= 2 && matches!(b.insts.last().map(|i| &func.insts[i.index()].op), Some(Op::Return(_)))).count() < MIN_TAIL_GROUP {
         return false;
     }
-    if cfg_dirty {
-        func.bump_cfg();
-    }
+    if cfg_dirty { func.bump_cfg(); }
     let cfg = func.cfg();
-    let consts = collect_consts(func);
-    let uses = func.use_counts();
-    let groups = group_tail_sites(func, &cfg, |b| return_site_entry(func, &consts, &uses, b));
+    let (consts, uses) = meta.get_or_insert_with(|| (collect_consts(func), func.use_counts()));
+    let groups = group_tail_sites(func, &cfg, |b| return_site_entry(func, consts, uses, b));
     let mut changed = false;
     for (key, group) in &groups {
         if group.len() >= MIN_TAIL_GROUP
@@ -606,6 +604,7 @@ fn factor_common_returns(func: &mut Function, cfg_dirty: bool) -> bool {
             changed = true;
         }
     }
+    if changed { *meta = None; }
     changed
 }
 
@@ -631,17 +630,20 @@ fn jump_site_entry(func: &Function, consts: &[Option<i64>], uses: &[u32], block:
     Some((key, site))
 }
 
-fn factor_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
-    if func.blocks.iter().filter(|b| b.insts.len() >= 2 && matches!(b.insts.last().map(|i| &func.insts[i.index()].op), Some(Op::Jump(_, a)) if !a.is_empty())).count() < MIN_TAIL_GROUP {
-        return false;
+fn factor_jump_tails(func: &mut Function, cfg_dirty: bool, meta: &mut Option<(Vec<Option<i64>>, Vec<u32>)>) -> bool {
+    let mut counts = vec![0_u32; func.blocks.len()];
+    let mut has_group = false;
+    for (bi, b) in func.blocks.iter().enumerate() {
+        if b.insts.len() >= 2 && let Some(Op::Jump(t, a)) = b.insts.last().map(|i| &func.insts[i.index()].op) && !a.is_empty() && t.index() != bi {
+            counts[t.index()] += 1;
+            if counts[t.index()] >= MIN_TAIL_GROUP as u32 { has_group = true; break; }
+        }
     }
-    if cfg_dirty {
-        func.bump_cfg();
-    }
+    if !has_group { return false; }
+    if cfg_dirty { func.bump_cfg(); }
     let cfg = func.cfg();
-    let consts = collect_consts(func);
-    let uses = func.use_counts();
-    let groups = group_tail_sites(func, &cfg, |b| jump_site_entry(func, &consts, &uses, b));
+    let (consts, uses) = meta.get_or_insert_with(|| (collect_consts(func), func.use_counts()));
+    let groups = group_tail_sites(func, &cfg, |b| jump_site_entry(func, consts, uses, b));
     let mut changed = false;
     for (key, group) in &groups {
         let max_params = key.out_types.len().min(MAX_SINK_PARAMS);
@@ -651,6 +653,7 @@ fn factor_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
             changed = true;
         }
     }
+    if changed { *meta = None; }
     changed
 }
 
@@ -770,12 +773,11 @@ fn apply_jump_tail_plan(func: &mut Function, target_idx: usize, preds: &[usize],
     prune_dead_consts(func, preds);
 }
 
-fn sink_common_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
+fn sink_common_jump_tails(func: &mut Function, cfg_dirty: bool, meta: &mut Option<(Vec<Option<i64>>, Vec<u32>)>) -> bool {
     if cfg_dirty {
         func.bump_cfg();
     }
     let cfg = func.cfg();
-    let mut meta: Option<(Vec<Option<i64>>, Vec<u32>)> = None;
     let mut changed = false;
     for j_idx in 0..func.blocks.len() {
         let target = Block(j_idx as u32);
@@ -787,7 +789,7 @@ fn sink_common_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
         let (consts, uses) = meta.get_or_insert_with(|| (collect_consts(func), func.use_counts()));
         let Some(plan) = find_jump_tail_plan(func, consts, uses, &preds, param_len) else { continue };
         apply_jump_tail_plan(func, j_idx, &preds, plan);
-        meta = None;
+        *meta = None;
         changed = true;
     }
     changed

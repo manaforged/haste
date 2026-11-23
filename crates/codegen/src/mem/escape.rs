@@ -353,11 +353,28 @@ pub(super) fn classify_uses(
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
-            if matches!(data.op, Op::Const(_)) {
-                if let Some(res) = data.result {
-                    is_const[res.index()] = true;
+            match data.op {
+                Op::Const(_) => {
+                    if let Some(res) = data.result { is_const[res.index()] = true; }
+                    continue;
                 }
-                continue;
+                Op::StackLoad(..) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) | Op::Runtime(_) | Op::Trap => continue,
+                Op::Load(addr, _) => {
+                    if is_rooted(addr, slots, tracked) {
+                        counts.total[addr.index()] += 1;
+                        counts.safe[addr.index()] += 1;
+                    }
+                    continue;
+                }
+                Op::Store(val, addr, _) if !is_rooted(val, slots, tracked) => {
+                    if is_rooted(addr, slots, tracked) {
+                        counts.total[addr.index()] += 1;
+                        counts.safe[addr.index()] += 1;
+                    }
+                    continue;
+                }
+                Op::StackStore(val, ..) if !is_rooted(val, slots, tracked) => continue,
+                _ => {}
             }
             if positions {
                 used.clear();

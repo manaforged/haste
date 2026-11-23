@@ -35,21 +35,26 @@ pub(super) fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: 
     }
 }
 
-/// Raises the lower bound of a dereferenced pointer marked at `epoch` in `falls_through` to 1, returning it when narrowed.
 #[inline]
-pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> Option<Value> {
-    let addr = deref_ptr(op)?;
+pub(super) fn note_deref_addr(func: &Function, addr: Value, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> bool {
     let idx = addr.index();
     let (lo, hi) = &mut table[idx];
     if *lo == 0 && *hi != 0 && func.ty(addr) == Type::I64 && falls_through[idx] == epoch {
         *lo = 1;
-        return Some(addr);
+        return true;
     }
-    None
+    false
+}
+
+/// Raises the lower bound of a dereferenced pointer marked at `epoch` in `falls_through` to 1, returning it when narrowed.
+#[inline]
+pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> Option<Value> {
+    let addr = deref_ptr(op)?;
+    note_deref_addr(func, addr, falls_through, epoch, table).then_some(addr)
 }
 
 #[inline]
-fn known_range(op: &Op, ty: Type) -> Option<(u64, u64)> {
+pub(super) fn known_range(op: &Op, ty: Type) -> Option<(u64, u64)> {
     Some(match *op {
         Op::Const(imm) => { let u = super::unsigned(imm, ty); (u, u) }
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => (0, 1),

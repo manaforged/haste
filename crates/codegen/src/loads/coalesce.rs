@@ -17,6 +17,15 @@ pub(super) struct ConstStore {
     pub base: StoreBase,
 }
 
+pub(super) fn is_pure_scan_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_) | Op::Binary(..) | Op::Unary(..) | Op::Icmp(..) | Op::Fcmp(..) | Op::Convert(..) | Op::Select(..)
+            | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) | Op::Runtime(_) | Op::Jump(..) | Op::Brif(..)
+            | Op::BrTable(..) | Op::Fits(..) | Op::Insert(..) | Op::Extract(..) | Op::Shuffle(..) | Op::TargetOp(..)
+    )
+}
+
 pub(super) struct ScanBuf {
     pub kept: Vec<Option<Inst>>,
     pub pending_stores: Vec<(MemLoc, usize)>,

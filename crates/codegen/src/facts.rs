@@ -248,11 +248,23 @@ impl<'a> Ranges<'a> {
                 match data.op {
                     Op::Const(imm) => {
                         prev_res = data.result;
-                        if let Some(r) = data.result && func.ty(r).is_small_int() {
-                            falls_through[r.index()] = *epoch;
-                            let u = unsigned(imm, func.ty(r));
-                            self.table[r.index()] = (u, u);
-                        }
+                        if let Some(r) = data.result && func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; let u = unsigned(imm, func.ty(r)); self.table[r.index()] = (u, u); }
+                        continue;
+                    }
+                    Op::StackStore(..) => { prev_res = None; bump(epoch, falls_through); continue; }
+                    Op::Store(_, addr, off) => {
+                        if (0..4096).contains(&off) && transfer::note_deref_addr(func, addr, falls_through, *epoch, &mut self.table) && (info.edge_args.get(addr.index()).copied().unwrap_or(false) || (pos > 0 && prev_res != Some(addr))) { narrowed = true; }
+                        prev_res = None; bump(epoch, falls_through); continue;
+                    }
+                    Op::StackLoad(..) | Op::Load(..) => {
+                        if let Op::Load(addr, off) = data.op && (0..4096).contains(&off) && transfer::note_deref_addr(func, addr, falls_through, *epoch, &mut self.table) && (info.edge_args.get(addr.index()).copied().unwrap_or(false) || (pos > 0 && prev_res != Some(addr))) { narrowed = true; }
+                        prev_res = data.result; bump(epoch, falls_through);
+                        if let Some(r) = data.result && func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; if let Some(imm) = info.consts.get(r.index()).copied().flatten() { let u = unsigned(imm, func.ty(r)); self.table[r.index()] = (u, u); } }
+                        continue;
+                    }
+                    Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) => {
+                        prev_res = data.result;
+                        if let Some(r) = data.result && func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; let ty = func.ty(r); self.table[r.index()] = info.consts.get(r.index()).copied().flatten().map_or_else(|| transfer::known_range(&data.op, ty).unwrap_or((0, ty.unsigned_max())), |imm| { let u = unsigned(imm, ty); (u, u) }); }
                         continue;
                     }
                     Op::Jump(..) | Op::Brif(..) | Op::Return(..) | Op::BrTable(..) | Op::Trap => { prev_res = None; continue; }
