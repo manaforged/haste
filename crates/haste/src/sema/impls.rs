@@ -144,6 +144,31 @@ impl Index {
     }
 }
 
+fn impl_file_entry(outline: &crate::outline::Outline, block: ImplRef) -> (&File, &crate::outline::item::Item) {
+    match block {
+        ImplRef::Module { krate, index } => {
+            let tree = &outline.crates[krate as usize];
+            let entry = &tree.impls[index as usize];
+            let file = &tree.files[entry.file];
+            (file, &file.items.items[entry.at as usize])
+        }
+        ImplRef::Body(item) => {
+            let file = match item.outer() {
+                Some((outer, _)) => {
+                    let owner = outer.body_owner();
+                    &outline.crates[owner.krate as usize].files[owner.file as usize]
+                        .expansion(owner.krate, owner.item)
+                        .expect("a body that declares items is read")
+                        .file
+                }
+                None => &outline.crates[item.krate as usize].files[item.file as usize],
+            };
+            let at = item.outer().map_or(item.item, |(_, at)| at);
+            (file, &file.items.items[at as usize])
+        }
+    }
+}
+
 impl<'a> Context<'a> {
     /// The last path segment of the self type of impl `block`, or `None` when it is no path.
     pub fn impl_self_name(&mut self, block: ImplRef) -> Option<String> {
@@ -154,18 +179,21 @@ impl<'a> Context<'a> {
     }
 
     fn ensure_impl_header(&mut self, block: ImplRef) -> Result<&Arc<ImplHeader>> {
-        if !self.headers_local.contains_key(&block) {
-            let found = if let Some(found) = self.store.headers.get(&block) {
-                found
-            } else {
-                let (file, item) = (self.impl_file(block), self.impl_entry(block));
-                let parsed = Arc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
-                self.store.headers.insert(block, Arc::clone(&parsed));
-                parsed
-            };
-            self.headers_local.insert(block, found);
+        use std::collections::hash_map::Entry;
+        match self.headers_local.entry(block) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(slot) => {
+                let found = if let Some(found) = self.store.headers.get(&block) {
+                    found
+                } else {
+                    let (file, item) = impl_file_entry(self.outline, block);
+                    let parsed = Arc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
+                    self.store.headers.insert(block, Arc::clone(&parsed));
+                    parsed
+                };
+                Ok(slot.insert(found))
+            }
         }
-        Ok(&self.headers_local[&block])
     }
 
     /// The parsed header of impl `block`.
@@ -179,11 +207,7 @@ impl<'a> Context<'a> {
     }
 
     fn impl_entry(&self, block: ImplRef) -> &'a crate::outline::item::Item {
-        let at = match block {
-            ImplRef::Module { krate, index } => self.outline.crates[krate as usize].impls[index as usize].at,
-            ImplRef::Body(item) => item.outer().map_or(item.item, |(_, at)| at),
-        };
-        &self.impl_file(block).items.items[at as usize]
+        impl_file_entry(self.outline, block).1
     }
 
     fn reserved(&self, block: ImplRef) -> bool {
@@ -193,13 +217,7 @@ impl<'a> Context<'a> {
 
     /// The outline file that holds the header of impl `block`.
     pub fn impl_file(&self, block: ImplRef) -> &'a File {
-        match block {
-            ImplRef::Module { krate, index } => {
-                let tree = &self.outline.crates[krate as usize];
-                &tree.files[tree.impls[index as usize].file]
-            }
-            ImplRef::Body(item) => self.file(item),
-        }
+        impl_file_entry(self.outline, block).0
     }
 
     /// The module around impl `block`.

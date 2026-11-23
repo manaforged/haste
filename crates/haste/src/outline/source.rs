@@ -452,6 +452,7 @@ impl Source {
     }
 
     /// The crate that the `$crate` starting at token `at` names, when a macro wrote it.
+    #[inline]
     pub fn dollar(&self, at: u32) -> Option<u32> {
         match self.mark(at) {
             Some(Mark::Crate(krate)) => Some(krate),
@@ -460,6 +461,7 @@ impl Source {
     }
 
     /// The hygiene scope of name `at` for local variables and the scope its macro was defined in: the `macro_rules!` expansion that wrote it, or zero for a name the program spelled.
+    #[inline]
     pub fn scope(&self, at: u32) -> (u32, u32) {
         match self.mark(at) {
             Some(Mark::Scope { id, parent }) => (id, parent),
@@ -468,13 +470,21 @@ impl Source {
     }
 
     /// The origin mark of token `at`, when a macro wrote it.
+    #[inline]
     pub fn mark(&self, at: u32) -> Option<Mark> {
+        if self.marks.is_empty() && self.base.is_none() {
+            return None;
+        }
         let (src, local) = self.layer(at);
         src.own_mark(local as u32)
     }
 
     /// The end and fragment kind of the opaque fragment that starts at token `at`, if one does.
+    #[inline]
     pub fn opaque_at(&self, at: u32) -> Option<(u32, Frag)> {
+        if self.opaque.is_empty() && self.base.is_none() {
+            return None;
+        }
         let (src, local) = self.layer(at);
         let found = src.opaque.binary_search_by_key(&(local as u32), |&(start, _, _)| start).ok()?;
         let (_, end, frag) = src.opaque[found];

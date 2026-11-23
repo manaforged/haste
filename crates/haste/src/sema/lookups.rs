@@ -97,15 +97,24 @@ impl ActiveAttrs {
 
 pub(super) struct LangMap {
     pub(super) map: HashMap<ItemRef, Box<str>>,
+    bloom: [u64; 32],
     crates_lo: u64,
     crates_hi: u64,
     any_high: bool,
 }
 
 impl LangMap {
+    #[inline]
+    fn bloom_bit(item: ItemRef) -> (usize, u64) {
+        let h = item.file.wrapping_mul(0x9E37_79B1) ^ item.item.wrapping_mul(0x85EB_CA77);
+        let bit = ((h ^ (h >> 16)) as usize) & 2047;
+        (bit >> 6, 1u64 << (bit & 63))
+    }
+
     pub(super) fn from_map(map: HashMap<ItemRef, Box<str>>) -> Self {
         let (mut crates_lo, mut crates_hi, mut any_high) = (0u64, 0u64, false);
-        for item in map.keys() {
+        let mut bloom = [0u64; 32];
+        for &item in map.keys() {
             if item.krate < 64 {
                 crates_lo |= 1u64 << item.krate;
             } else if item.krate < 128 {
@@ -113,19 +122,26 @@ impl LangMap {
             } else {
                 any_high = true;
             }
+            let (word, mask) = Self::bloom_bit(item);
+            bloom[word] |= mask;
         }
-        Self { map, crates_lo, crates_hi, any_high }
+        Self { map, bloom, crates_lo, crates_hi, any_high }
     }
 
     #[inline]
-    pub(super) fn has_crate(&self, krate: u32) -> bool {
-        if krate < 64 {
-            self.crates_lo & (1u64 << krate) != 0
-        } else if krate < 128 {
-            self.crates_hi & (1u64 << (krate - 64)) != 0
+    pub(super) fn may_contain(&self, item: ItemRef) -> bool {
+        let has_krate = if item.krate < 64 {
+            self.crates_lo & (1u64 << item.krate) != 0
+        } else if item.krate < 128 {
+            self.crates_hi & (1u64 << (item.krate - 64)) != 0
         } else {
             self.any_high
+        };
+        if !has_krate {
+            return false;
         }
+        let (word, mask) = Self::bloom_bit(item);
+        (self.bloom[word] & mask) != 0
     }
 }
 

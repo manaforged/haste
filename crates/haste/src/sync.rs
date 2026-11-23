@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rustc_hash::FxHasher;
@@ -195,7 +195,10 @@ impl IndexTable {
     }
 }
 
+const INTERNER_CACHE: usize = 16_384;
+
 pub(crate) struct Interner<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> {
+    cache: Box<[AtomicU64]>,
     shards: Box<[CachePadded<RwLock<IndexTable>>]>,
     slabs: Slab<K, SLAB, SLABS>,
     next: AtomicU32,
@@ -203,7 +206,12 @@ pub(crate) struct Interner<K, const SHARDS: usize, const SLAB: usize, const SLAB
 
 impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default for Interner<K, SHARDS, SLAB, SLABS> {
     fn default() -> Self {
-        Self { shards: (0..SHARDS).map(|_| CachePadded::default()).collect(), slabs: Slab::default(), next: AtomicU32::new(0) }
+        Self {
+            cache: (0..INTERNER_CACHE).map(|_| AtomicU64::new(0)).collect(),
+            shards: (0..SHARDS).map(|_| CachePadded::default()).collect(),
+            slabs: Slab::default(),
+            next: AtomicU32::new(0),
+        }
     }
 }
 
@@ -228,18 +236,30 @@ impl<K: Eq + Hash, const SHARDS: usize, const SLAB: usize, const SLABS: usize> I
     }
 
     fn intern_with<T>(&self, hash: u64, key: T, eq: impl Fn(&K, &T) -> bool, make: impl FnOnce(T, u32) -> K) -> u32 {
+        let slot = &self.cache[(hash as usize) & (INTERNER_CACHE - 1)];
+        let hi = hash >> 32;
+        let packed = slot.load(Ordering::Acquire);
+        if packed != 0 && (packed >> 32) == hi {
+            let id = (packed as u32) - 1;
+            if eq(self.get(id), &key) {
+                return id;
+            }
+        }
         let shard = &self.shards[shard_of::<SHARDS>(hash)].0;
         if let Some(id) = read_lock(shard).find(hash, |id| eq(self.get(id), &key)) {
+            slot.store((hi << 32) | u64::from(id + 1), Ordering::Release);
             return id;
         }
         let mut write = write_lock(shard);
         if let Some(id) = write.find(hash, |id| eq(self.get(id), &key)) {
+            slot.store((hi << 32) | u64::from(id + 1), Ordering::Release);
             return id;
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let owned = make(key, id);
         self.slabs.set(id as usize, owned);
         write.insert(hash, id, |old| hash_key(self.get(old)));
+        slot.store((hi << 32) | u64::from(id + 1), Ordering::Release);
         id
     }
 

@@ -81,7 +81,7 @@ impl<'a> Context<'a> {
             return Some(src.text(at + 2).trim_matches('"'));
         }
         let langs = self.lang_map.get_or_init(|| Arc::clone(self.store.lookups.lang_items.get_or_init(|| Arc::new(self.build_lang_map()))));
-        if !langs.has_crate(item.krate) {
+        if !langs.may_contain(item) {
             return None;
         }
         langs.map.get(&item).map(Box::as_ref)
