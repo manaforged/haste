@@ -84,7 +84,7 @@ impl Emit<'_> {
 
     pub(super) fn has_elided_mem(&self, value: Value) -> bool {
         self.plan.elided[value.index()]
-            && self.defs[value.index()].is_some_and(|inst| matches!(self.func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..)))
+            && self.defs[value.index()].is_some_and(|inst| matches!(self.func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..)))
     }
 
     pub(super) fn elided_mem(&mut self, value: Value) -> Option<Mem> {
@@ -95,6 +95,13 @@ impl Emit<'_> {
         match self.func.insts[inst.index()].op {
             Op::Load(addr, off) => Some(self.address(addr, off)),
             Op::StackLoad(slot, off) => Some(self.slot(slot, off)),
+            Op::AtomicLoad(addr, _) => Some(if let Some(sym) = self.image_sym(addr) {
+                Mem::rip(sym, 0)
+            } else if self.plan.elided[addr.index()] && self.plan.sib[addr.index()].is_some() {
+                self.address(addr, 0)
+            } else {
+                self.atomic_target(addr, Reg::Rcx, &[])
+            }),
             _ => None,
         }
     }

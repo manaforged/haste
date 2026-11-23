@@ -67,33 +67,39 @@ fn load_fuses(ctx: &FuseCtx<'_>, lpos: usize, eff_pos: usize, skip: &[usize]) ->
     }
     match ctx.func.insts[insts[lpos].index()].op {
         Op::StackLoad(..) => true,
-        Op::Load(addr, _) if ctx.plan.elided[addr.index()] => ctx.plan.sib[addr.index()].is_some_and(|m| {
-            let base_ok = match m.base {
-                SibBase::Frame(_) => true,
-                SibBase::Value(b) => preserved(ctx.func, ctx.plan, ctx.b_idx, lpos, eff_pos, skip, b),
-            };
-            let idx = idx_source(ctx.func, ctx.plan, ctx.defs, m.index);
-            base_ok && preserved(ctx.func, ctx.plan, ctx.b_idx, lpos, eff_pos, skip, idx)
-        }),
-        Op::Load(addr, _) => preserved(ctx.func, ctx.plan, ctx.b_idx, lpos, eff_pos, skip, addr),
+        Op::Load(addr, _) | Op::AtomicLoad(addr, _) if ctx.plan.elided[addr.index()] => {
+            if let Some(m) = ctx.plan.sib[addr.index()] {
+                let base_ok = match m.base {
+                    SibBase::Frame(_) => true,
+                    SibBase::Value(b) => preserved(ctx.func, ctx.plan, ctx.b_idx, lpos, eff_pos, skip, b),
+                };
+                let idx = idx_source(ctx.func, ctx.plan, ctx.defs, m.index);
+                base_ok && preserved(ctx.func, ctx.plan, ctx.b_idx, lpos, eff_pos, skip, idx)
+            } else {
+                super::super::bits::atomic_addr_base(ctx.func, ctx.plan, ctx.defs, addr)
+                    .is_some_and(|(base, _)| !ctx.plan.elided[base.index()] && preserved(ctx.func, ctx.plan, ctx.b_idx, lpos, eff_pos, skip, base))
+            }
+        }
+        Op::Load(addr, _) | Op::AtomicLoad(addr, _) => preserved(ctx.func, ctx.plan, ctx.b_idx, lpos, eff_pos, skip, addr),
         _ => false,
     }
 }
 
 fn addr_reads(func: &Function, plan: &Plan<Reg>, defs: &[Option<Inst>], addr: Value, reg: Reg) -> bool {
     if plan.elided[addr.index()] {
-        return plan.sib[addr.index()].is_some_and(|m| {
+        if let Some(m) = plan.sib[addr.index()] {
             let idx = idx_source(func, plan, defs, m.index);
-            matches!(m.base, SibBase::Value(base) if !plan.elided[base.index()] && plan.reg_of(base) == Some(reg))
-                || (!plan.elided[idx.index()] && plan.reg_of(idx) == Some(reg))
-        });
+            return matches!(m.base, SibBase::Value(base) if !plan.elided[base.index()] && plan.reg_of(base) == Some(reg))
+                || (!plan.elided[idx.index()] && plan.reg_of(idx) == Some(reg));
+        }
+        return super::super::bits::atomic_addr_base(func, plan, defs, addr).is_some_and(|(base, _)| plan.reg_of(base) == Some(reg));
     }
     plan.reg_of(addr) == Some(reg)
 }
 
 fn reads_reg(ctx: &FuseCtx<'_>, v: Value, reg: Reg) -> bool {
     ctx.plan.reg_of(v) == Some(reg)
-        || ctx.pos_of[v.index()].is_some_and(|(_, _, inst)| matches!(ctx.func.insts[inst.index()].op, Op::Load(addr, _) if addr_reads(ctx.func, ctx.plan, ctx.defs, addr, reg)))
+        || ctx.pos_of[v.index()].is_some_and(|(_, _, inst)| matches!(ctx.func.insts[inst.index()].op, Op::Load(addr, _) | Op::AtomicLoad(addr, _) if addr_reads(ctx.func, ctx.plan, ctx.defs, addr, reg)))
 }
 
 fn load_dst_clobber(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (u_res, op): (Option<Value>, Binary), (a, b): (Value, Value)) -> bool {
@@ -105,7 +111,7 @@ fn load_dst_clobber(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (u_res, op)
     if ctx.plan.reg_of(other) == Some(r_dst) {
         return false;
     }
-    let Op::Load(addr, _) = ctx.func.insts[linst.index()].op else { return false };
+    let (Op::Load(addr, _) | Op::AtomicLoad(addr, _)) = ctx.func.insts[linst.index()].op else { return false };
     addr_reads(ctx.func, ctx.plan, ctx.defs, addr, r_dst)
 }
 
@@ -120,7 +126,7 @@ fn cmp_band_arg_ok(ctx: &FuseCtx<'_>, (mpos, cpos, last_pos): (usize, usize, usi
     ctx.pos_of[u.index()].is_some_and(|(lb, lpos, linst)| {
         lb == ctx.b_idx
             && lpos < mpos
-            && matches!(ctx.func.insts[linst.index()].op, Op::Load(..) | Op::StackLoad(..))
+            && matches!(ctx.func.insts[linst.index()].op, Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..))
             && load_fuses(ctx, lpos, last_pos, &[cpos])
     })
 }
@@ -134,7 +140,7 @@ fn cmp_operand_ok(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], cpos: usize, las
         return false;
     }
     match ctx.func.insts[linst.index()].op {
-        Op::Load(..) | Op::StackLoad(..) => load_fuses(ctx, lpos, last_pos, &[]),
+        Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..) => load_fuses(ctx, lpos, last_pos, &[]),
         Op::Binary(Binary::Band, x, y) if tst_end[v.index()].is_some() => {
             [x, y].into_iter().all(|u| cmp_band_arg_ok(ctx, (lpos, cpos, last_pos), u))
         }
@@ -332,7 +338,7 @@ fn load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
     match udata.op {
         Op::Icmp(..) => true,
         Op::Brif(cond, ..) | Op::Trapz(cond) => cond == load_res,
-        Op::Store(..) | Op::StackStore(..) => super::sib::store_load_ok(ctx.func, ctx.plan, linst, load_res, &udata.op),
+        Op::Store(..) | Op::StackStore(..) => !matches!(ctx.func.insts[linst.index()].op, Op::AtomicLoad(..)) && super::sib::store_load_ok(ctx.func, ctx.plan, linst, load_res, &udata.op),
         Op::Convert(Convert::Uextend | Convert::Sextend, _) => ty.bytes() <= 4 && non_wide,
         Op::Convert(Convert::Ireduce, _) => ty.bytes() <= 8 && non_wide,
         Op::Binary(..) => load_binop_ok(ctx, features, linst, load_res, udata),
@@ -470,6 +476,9 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                     cmp_tst.push((b_idx, pos, res, lhs, rhs));
                 }
                 Op::Load(..) | Op::StackLoad(..) if uses[res.index()] == 1 && !plan.elided[res.index()] && (ty.is_small_int() || (features.avx && (ty.is_wide_vec() || (ty.is_valid_vec() && ty.bytes() == 16)))) => {
+                    cand_loads.push((b_idx, pos, res));
+                }
+                Op::AtomicLoad(..) if uses[res.index()] == 1 && !plan.elided[res.index()] && ty.is_small_int() => {
                     cand_loads.push((b_idx, pos, res));
                 }
                 _ => {}
