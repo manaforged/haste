@@ -2,6 +2,14 @@ use crate::ir::{Binary, Block, BlockData, Function, Inst, Op, Value};
 
 /// Splits each branch on the `and` or `or` of two single-use conditions of its own block into a branch on the first and, in a new block, a branch on the second, and moves there the pure instructions only the second condition reads, unless both compare one value and so fold into one range compare.
 pub(super) fn split_conditions(func: &mut Function) {
+    let has_cand = func.blocks.iter().any(|b| {
+        let Some((&term, body)) = b.insts.split_last() else { return false };
+        matches!(func.insts[term.index()].op, Op::Brif(_, then, _, otherwise, _) if then != otherwise)
+            && body.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Binary(Binary::Band | Binary::Bor, ..)))
+    });
+    if !has_cand {
+        return;
+    }
     let uses = func.use_counts();
     let (defs, consts) = (crate::fold::defs(func), crate::returns::collect_consts(func));
     let mut changed = false;

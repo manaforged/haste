@@ -243,9 +243,11 @@ impl<'a> Ranges<'a> {
             narrowed |= self.refine_params(func, info, block);
             bump(epoch, falls_through);
             for &p in &func.blocks[block.index()].params { if func.ty(p).is_small_int() { falls_through[p.index()] = *epoch; } }
-            for inst in &func.blocks[block.index()].insts {
+            let mut prev_res = None;
+            for (pos, inst) in func.blocks[block.index()].insts.iter().enumerate() {
                 let data = &func.insts[inst.index()];
-                narrowed |= transfer::note_deref(func, &data.op, falls_through, *epoch, &mut self.table);
+                if transfer::note_deref(func, &data.op, falls_through, *epoch, &mut self.table) && (!info.incoming.is_empty() || (pos > 0 && prev_res != transfer::deref_ptr(&data.op))) { narrowed = true; }
+                prev_res = data.result;
                 match data.op {
                     Op::Assume(value) => {
                         let (lo, hi) = &mut self.table[value.index()];
@@ -265,11 +267,13 @@ impl<'a> Ranges<'a> {
                 }
                 let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
                 falls_through[result.index()] = *epoch;
-                let fact = match info.consts.get(result.index()).copied().flatten() {
-                    Some(imm) => Fact::constant(func.ty(result), imm),
-                    None => transfer::transfer(func, self, &data.op, func.ty(result), &|value| self.of(value)),
-                };
-                self.table[result.index()] = (fact.lo, fact.hi);
+                let ty = func.ty(result);
+                if let Some(imm) = info.consts.get(result.index()).copied().flatten() {
+                    let u = unsigned(imm, ty);
+                    self.table[result.index()] = (u, u);
+                } else if let Some(pair) = transfer::fast_range(func, self, &data.op, ty) {
+                    self.table[result.index()] = pair;
+                }
             }
         }
         narrowed

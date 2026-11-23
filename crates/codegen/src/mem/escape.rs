@@ -78,10 +78,12 @@ fn finish_slot_escape(
             if spilled || counts.safe[v] + uw != counts.total[v] {
                 esc.addr_unescaped[s.index()] = false;
             }
-            if spilled || counts.safe[v] + counts.ro_calls[v] != counts.total[v] {
+            let ro = counts.ro_calls.get(v).copied().unwrap_or(0);
+            if spilled || counts.safe[v] + ro != counts.total[v] {
                 esc.call_readonly[s.index()] = false;
             }
-            if spilled || counts.safe[v] + counts.returns[v] != counts.total[v] {
+            let ret = counts.returns.get(v).copied().unwrap_or(0);
+            if spilled || counts.safe[v] + ret != counts.total[v] {
                 esc.return_only[s.index()] = false;
             }
         }
@@ -228,7 +230,7 @@ struct EscapeCx<'a> {
     is_const: &'a [bool],
     unwind_write_only: &'a [bool],
     has_noalias: bool,
-    danger: std::cell::OnceCell<(Vec<bool>, Vec<bool>, Vec<usize>)>,
+    danger: &'a std::cell::OnceCell<(Vec<bool>, Vec<bool>, Vec<usize>)>,
 }
 
 fn classify_call(
@@ -240,9 +242,11 @@ fn classify_call(
     let mut post_safe: Option<bool> = None;
     for (i, &arg) in args.iter().enumerate() {
         if params.get(i).is_some_and(|p| p.readonly) {
+            if counts.ro_calls.is_empty() { counts.ro_calls.resize(counts.total.len(), 0); }
             counts.ro_calls[arg.index()] += 1;
         }
         if params.get(i).is_some_and(|p| p.purpose == ArgumentPurpose::StructReturn) {
+            if counts.returns.is_empty() { counts.returns.resize(counts.total.len(), 0); }
             counts.returns[arg.index()] += 1;
         }
         if cx.has_noalias
@@ -326,35 +330,35 @@ pub(super) fn classify_uses(
         Vec::new()
     };
     let mut is_const = vec![false; n];
-    for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
-            let data = &func.insts[inst.index()];
-            match data.op {
-                Op::Const(_) => {
-                    if let Some(res) = data.result {
-                        is_const[res.index()] = true;
-                    }
+    if has_indirect_unwind {
+        for &b in &cfg.rpo {
+            for &inst in &func.blocks[b.index()].insts {
+                match func.insts[inst.index()].op {
+                    Op::StackLoad(slot, _) | Op::StackAddr(slot, _) => unwind_write_only[slot.index()] = false,
+                    _ => {}
                 }
-                Op::StackLoad(slot, _) | Op::StackAddr(slot, _) if has_indirect_unwind => {
-                    unwind_write_only[slot.index()] = false;
-                }
-                _ => {}
             }
         }
     }
-    let cx = EscapeCx { func, cfg, slots, tracked, is_const: &is_const, unwind_write_only: &unwind_write_only, has_noalias, danger: std::cell::OnceCell::new() };
     let mut counts = UseCounts {
         total: vec![0_u32; n],
         safe: vec![0_u32; n],
         unwind_stores: if has_indirect_unwind { vec![0_u32; n] } else { Vec::new() },
-        ro_calls: vec![0_u32; n],
-        returns: vec![0_u32; n],
+        ro_calls: Vec::new(),
+        returns: Vec::new(),
     };
+    let danger = std::cell::OnceCell::new();
     let mut points: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
     let mut used: Vec<(Value, StackSlot, u32)> = Vec::new();
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
+            if matches!(data.op, Op::Const(_)) {
+                if let Some(res) = data.result {
+                    is_const[res.index()] = true;
+                }
+                continue;
+            }
             used.clear();
             let mut has_tracked = false;
             data.op.for_operands(|v| {
@@ -371,6 +375,7 @@ pub(super) fn classify_uses(
             if !has_tracked {
                 continue;
             }
+            let cx = EscapeCx { func, cfg, slots, tracked, is_const: &is_const, unwind_write_only: &unwind_write_only, has_noalias, danger: &danger };
             classify_inst(&cx, &mut counts, b, pos, data);
             if !used.is_empty() {
                 for (i, &(v, s, before)) in used.iter().enumerate() {

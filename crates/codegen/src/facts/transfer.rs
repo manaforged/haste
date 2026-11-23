@@ -46,13 +46,47 @@ pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch:
     false
 }
 
+#[inline]
+fn known_range(op: &Op, ty: Type) -> Option<(u64, u64)> {
+    Some(match *op {
+        Op::Const(imm) => { let u = super::unsigned(imm, ty); (u, u) }
+        Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => (0, 1),
+        Op::StackAddr(..) if ty == Type::I64 => (1, u64::MAX - 0x1000_0000),
+        Op::Symbol(_) | Op::SlotAddr(_) => (1, ty.unsigned_max()),
+        _ => return None,
+    })
+}
+
+/// Fast `(lo, hi)` range for `Ranges::propagate`, returning `None` when `op` always produces the full range (leaving `table` intact).
+#[inline]
+pub(super) fn fast_range(func: &Function, ranges: &Ranges, op: &Op, ty: Type) -> Option<(u64, u64)> {
+    if let Some(pair) = known_range(op, ty) {
+        return Some(pair);
+    }
+    match *op {
+        Op::Convert(Convert::Uextend, x) => Some(ranges.table[x.index()]),
+        Op::Convert(Convert::Ireduce, x) => {
+            let inner = ranges.table[x.index()];
+            (inner.1 <= ty.unsigned_max()).then_some(inner)
+        }
+        Op::Binary(_, x, _) if func.ty(x).is_small_int() => {
+            let fact = transfer(func, ranges, op, ty, &|value| ranges.of(value));
+            Some((fact.lo, fact.hi))
+        }
+        Op::Select(..) => {
+            let fact = transfer(func, ranges, op, ty, &|value| ranges.of(value));
+            Some((fact.lo, fact.hi))
+        }
+        _ => None,
+    }
+}
+
 /// The range of the result of `op`, of type `ty`, from the facts `of` gives on its operands.
 pub(super) fn transfer(func: &Function, ranges: &Ranges, op: &Op, ty: Type, of: Of<'_>) -> Fact {
+    if let Some((lo, hi)) = known_range(op, ty) {
+        return Fact::range(lo, hi);
+    }
     match *op {
-        Op::Const(imm) => Fact::constant(ty, imm),
-        Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => Fact::range(0, 1),
-        Op::StackAddr(..) if ty == Type::I64 => Fact::range(1, u64::MAX - 0x1000_0000),
-        Op::Symbol(_) | Op::SlotAddr(_) => Fact::range(1, ty.unsigned_max()),
         Op::Convert(Convert::Uextend, x) => of(x),
         Op::Convert(Convert::Ireduce, x) => Some(of(x)).filter(|inner| inner.hi <= ty.unsigned_max()).unwrap_or_else(|| Fact::full(ty)),
         Op::Binary(op, x, y) if func.ty(x).is_small_int() => binary(func, ranges, op, (x, y), of),

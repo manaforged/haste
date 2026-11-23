@@ -67,20 +67,46 @@ fn pair_at(func: &mut Function, (insts, uses, defs): (&[Inst], &[u32], &[Option<
 
 /// Turns each pair of stores in a loop that copies two adjacent quadwords loaded in the same block into one 16-byte load and store.
 pub(super) fn pair(func: &mut Function) {
-    let uses = func.use_counts();
-    let defs = crate::fold::defs(func);
     if func.entry.is_none() {
         return;
     }
-    let depths = func.cfg().loops().depths.clone();
+    let depths = {
+        let cfg = func.cfg();
+        if cfg.loops().list.is_empty() {
+            return;
+        }
+        cfg.loops().depths.clone()
+    };
+    let has_cand = (0..func.blocks.len()).any(|block| {
+        depths.get(block).is_some_and(|&depth| depth > 0)
+            && func.blocks[block].insts.windows(2).any(|w| {
+                matches!(func.insts[w[0].index()].op, Op::Store(..))
+                    && matches!(func.insts[w[1].index()].op, Op::Store(..))
+            })
+    });
+    if !has_cand {
+        return;
+    }
+    let uses = func.use_counts();
+    let defs = crate::fold::defs(func);
     for block in (0..func.blocks.len()).filter(|&block| depths.get(block).is_some_and(|&depth| depth > 0)) {
+        if func.blocks[block].insts.len() < 4 {
+            continue;
+        }
+        let mut insts = func.blocks[block].insts.clone();
         let mut at = 0;
-        while at + 1 < func.blocks[block].insts.len() {
-            let insts = func.blocks[block].insts.clone();
+        let mut changed = false;
+        while at + 1 < insts.len() {
             match pair_at(func, (&insts, &uses, &defs), at) {
-                Some(out) => func.blocks[block].insts = out,
+                Some(out) => {
+                    insts = out;
+                    changed = true;
+                }
                 None => at += 1,
             }
+        }
+        if changed {
+            func.blocks[block].insts = insts;
         }
     }
 }

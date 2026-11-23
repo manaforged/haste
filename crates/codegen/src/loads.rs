@@ -677,12 +677,6 @@ fn fits_mem_imm(ty: Type, off: i64) -> bool {
 }
 
 fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affine: &[(Value, i64)]) -> bool {
-    let mut is_stack_addr = vec![false; func.types.len()];
-    for data in &func.insts {
-        if let (Op::StackAddr(..), Some(res)) = (&data.op, data.result) {
-            is_stack_addr[res.index()] = true;
-        }
-    }
     let mut changed = false;
     for &inst in func.blocks.iter().flat_map(|b| &b.insts) {
         let Some(ty) = (match func.insts[inst.index()].op {
@@ -699,7 +693,7 @@ fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affi
         let (root, base_off) = affine[addr.index()];
         if root != *addr
             && func.types[root.index()] == Type::I64
-            && !is_stack_addr[root.index()]
+            && slots[root.index()].is_none()
             && let Some(new_off) = i64::from(*off).checked_add(base_off)
             && fits_mem_imm(ty, new_off)
         {
@@ -767,7 +761,8 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
     let mut state = State { prov: &prov, defs: &defs, selects: &selects, consts: &mut consts, subst: &mut subst, target, post_inline };
-    let (mut renamed, mut scan_changed, mut def_blocks) = (false, false, func.def_blocks());
+    let has_join = cfg.rpo.len() > 1 && cfg.rpo.iter().any(|&b| cfg.pred_count(b) >= 2);
+    let (mut renamed, mut scan_changed, mut def_blocks) = (false, false, if has_join { func.def_blocks() } else { Vec::new() });
     let (mut visited, mut added_phis) = (vec![false; func.blocks.len()], vec![0u8; func.blocks.len()]);
     let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
     let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = vec![Vec::new(); func.blocks.len()];
@@ -776,7 +771,7 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         let preds = eligible_join_preds(func, &cfg, &visited, block);
         let mut join = JoinCtx { cfg: &cfg, bw: &bw, known_out: &known_out, block_bases: &block_bases, visited: &visited, def_blocks: &mut def_blocks, preds, added_phis: &mut added_phis };
         let (bc, br) = scan(func, block, &mut state, &mut known, &mut bases, &mut join);
-        def_blocks.resize(func.types.len(), Some(block));
+        if has_join { def_blocks.resize(func.types.len(), Some(block)); }
         visited[block.index()] = true;
         (scan_changed, changed, renamed) = (scan_changed | bc, changed | bc, renamed | br);
         (known_out[block.index()], block_bases[block.index()]) = (known, bases);

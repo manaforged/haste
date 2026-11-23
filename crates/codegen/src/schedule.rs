@@ -437,7 +437,7 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
 }
 
 fn invert_unlikely_branches(func: &mut Function) {
-    let cfg = func.cfg().clone();
+    let cfg = func.cfg();
     let loops = cfg.loops();
     if loops.list.is_empty() {
         return;
@@ -445,10 +445,7 @@ fn invert_unlikely_branches(func: &mut Function) {
     let cold = crate::live::cold(func);
     let mut is_latch = vec![false; func.blocks.len()];
     loops.list.iter().flat_map(|each| &each.latches).for_each(|l| is_latch[l.index()] = true);
-    let uses = func.use_counts();
-    let defs = crate::fold::defs(func);
-    let const_val = |func: &Function, v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
-    let mut changed = false;
+    let mut cands = Vec::new();
     for b in 0..func.blocks.len() {
         let block = Block(b as u32);
         let depth = loops.depth_of(block);
@@ -457,14 +454,26 @@ fn invert_unlikely_branches(func: &mut Function) {
         }
         let Some(&term) = func.blocks[b].insts.last() else { continue };
         let Op::Brif(cond, then_b, _, else_b, _) = func.insts[term.index()].op else { continue };
-        if then_b == else_b
-            || cold[then_b.index()]
-            || cold[else_b.index()]
-            || is_latch[then_b.index()] != is_latch[else_b.index()]
-            || loops.depth_of(then_b) != loops.depth_of(else_b)
-            || loops.depth_of(then_b) < depth
-            || uses[cond.index()] != 1
+        if then_b != else_b
+            && !cold[then_b.index()]
+            && !cold[else_b.index()]
+            && is_latch[then_b.index()] == is_latch[else_b.index()]
+            && loops.depth_of(then_b) == loops.depth_of(else_b)
+            && loops.depth_of(then_b) >= depth
         {
+            cands.push((term, cond));
+        }
+    }
+    drop(cfg);
+    if cands.is_empty() {
+        return;
+    }
+    let uses = func.use_counts();
+    let defs = crate::fold::defs(func);
+    let const_val = |func: &Function, v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
+    let mut changed = false;
+    for (term, cond) in cands {
+        if uses[cond.index()] != 1 {
             continue;
         }
         let Some(cmp_inst) = defs[cond.index()] else { continue };
