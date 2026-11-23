@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Function, Inst, Op, Value};
-use crate::mem::{MemLoc, Provenance, clobbers};
+use crate::ir::{Block, Function, Inst, Op, StackSlot, Value};
+use crate::mem::{MemLoc, MemRoot, Provenance, clobbers};
 
 /// The most blocks one group of loads may sink through.
 const MAX_REGION: usize = 1024;
@@ -20,12 +20,12 @@ struct Candidate {
 /// Moves each load whose every use is in later blocks into those blocks when no path between them may write the loaded bytes and some path passes a call or the load is one of a wide group from one address, so the value no longer lives across that call or beside the rest of the group.
 pub(super) fn sink_loads(func: &mut Function, prov: &Provenance) -> bool {
     let cfg = func.cfg().clone();
+    let mut changed = sink_stack_stores(func, &cfg, prov);
     let users = user_blocks(func);
     let mut rank = vec![usize::MAX; func.blocks.len()];
     for (index, block) in cfg.rpo.iter().enumerate() {
         rank[block.index()] = index;
     }
-    let mut changed = false;
     for &block in &cfg.rpo {
         changed |= sink_block(func, (&cfg, &rank), prov, &users, block);
     }
@@ -189,4 +189,185 @@ fn clone_into(func: &mut Function, target: Block, load: Candidate, shared: Optio
         func.blocks[target.index()].insts.insert(pos, inst);
     }
     value
+}
+
+fn is_full_slot_store(func: &Function, op: &Op, slot: StackSlot) -> bool {
+    matches!(*op, Op::StackStore(v, s, 0) if s == slot && func.ty(v).bytes() == func.slots[slot.index()].size)
+}
+
+fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenance) -> bool {
+    if prov.slot_escaped_at(slot, Some(inst)) {
+        return true;
+    }
+    let op = &func.insts[inst.index()].op;
+    match *op {
+        Op::StackLoad(s, _) | Op::StackAddr(s, _) => s == slot,
+        Op::Load(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
+            prov.loc(addr, 0, 1).root == MemRoot::Slot(slot)
+        }
+        Op::Move(_, src, _) | Op::Copy(_, src, _) => prov.loc(src, 0, 1).root == MemRoot::Slot(slot),
+        _ => false,
+    }
+}
+
+fn slot_liveness(func: &Function, cfg: &Cfg, prov: &Provenance, slot: StackSlot) -> (Vec<bool>, Vec<bool>) {
+    let n = func.blocks.len();
+    let (mut reads, mut kill) = (vec![false; n], vec![false; n]);
+    for &b in &cfg.rpo {
+        let bi = b.index();
+        for &inst in &func.blocks[bi].insts {
+            if inst_reads_slot(func, inst, slot, prov) {
+                reads[bi] = true;
+                break;
+            }
+            if is_full_slot_store(func, &func.insts[inst.index()].op, slot) {
+                kill[bi] = true;
+                break;
+            }
+        }
+    }
+    let (mut live_in, mut live_out) = (reads.clone(), vec![false; n]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in cfg.rpo.iter().rev() {
+            let bi = b.index();
+            let out = func.successors(b).any(|s| live_in[s.index()]);
+            let inp = reads[bi] || (out && !kill[bi]);
+            if out != live_out[bi] || inp != live_in[bi] {
+                live_out[bi] = out;
+                live_in[bi] = inp;
+                changed = true;
+            }
+        }
+    }
+    (live_in, live_out)
+}
+
+fn sink_pure_defs_into(func: &mut Function, from: Block, to: Block) {
+    let mut uses = func.use_counts();
+    let mut to_move = Vec::new();
+    for &inst in &func.blocks[to.index()].insts {
+        func.insts[inst.index()].op.for_operands(|v| {
+            if uses[v.index()] > 0 {
+                uses[v.index()] -= 1;
+            }
+        });
+    }
+    let from_insts = &func.blocks[from.index()].insts;
+    for &inst in from_insts.iter().rev() {
+        let data = &func.insts[inst.index()];
+        let Some(res) = data.result else { continue };
+        if !data.op.is_speculable() || matches!(data.op, Op::Const(_)) {
+            continue;
+        }
+        if uses[res.index()] != 0 {
+            continue;
+        }
+        let used_in_to = func.blocks[to.index()].insts.iter().chain(to_move.iter()).any(|&u| {
+            let mut hit = false;
+            func.insts[u.index()].op.for_operands(|v| hit |= v == res);
+            hit
+        });
+        if !used_in_to {
+            continue;
+        }
+        data.op.for_operands(|v| {
+            if uses[v.index()] > 0 {
+                uses[v.index()] -= 1;
+            }
+        });
+        to_move.push(inst);
+    }
+    if to_move.is_empty() {
+        return;
+    }
+    to_move.reverse();
+    func.blocks[from.index()].insts.retain(|i| !to_move.contains(i));
+    func.blocks[to.index()].insts.splice(0..0, to_move);
+}
+
+fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool {
+    let mut cand_slots: Vec<StackSlot> = Vec::new();
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            if let Op::StackStore(_, slot, _) = func.insts[inst.index()].op
+                && !func.is_unwind_slot(slot)
+                && !prov.slot_escaped_at(slot, Some(inst))
+                && !cand_slots.contains(&slot)
+            {
+                cand_slots.push(slot);
+            }
+        }
+    }
+    if cand_slots.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for slot in cand_slots {
+        let (live_in, live_out) = slot_liveness(func, cfg, prov, slot);
+        for &b in &cfg.rpo {
+            let bi = b.index();
+            let insts = func.blocks[bi].insts.clone();
+            let mut dead = Vec::new();
+            let mut sink_to: Option<(Block, Vec<Inst>)> = None;
+            let brif_arms = match func.last(b) {
+                Some(&Op::Brif(_, then, _, other, _)) if then != other => Some((then, other)),
+                _ => None,
+            };
+            let mut live_after = live_out[bi];
+            let mut any_access_after = false;
+            for &inst in insts.iter().rev() {
+                let op = &func.insts[inst.index()].op;
+                if let Op::StackStore(_, s, _) = *op
+                    && s == slot
+                    && !prov.slot_escaped_at(slot, Some(inst))
+                {
+                    if !live_after {
+                        dead.push(inst);
+                        continue;
+                    }
+                    if !any_access_after
+                        && let Some((then, other)) = brif_arms
+                        && live_in[then.index()] != live_in[other.index()]
+                    {
+                        let target = if live_in[then.index()] { then } else { other };
+                        if cfg.single_pred(target) == Some(b) && cfg.loops().depth_of(target) <= cfg.loops().depth_of(b) {
+                            sink_to.get_or_insert_with(|| (target, Vec::new())).1.push(inst);
+                            if is_full_slot_store(func, op, slot) {
+                                live_after = false;
+                            }
+                            continue;
+                        }
+                    }
+                    any_access_after = true;
+                    if is_full_slot_store(func, op, slot) {
+                        live_after = false;
+                    }
+                } else {
+                    if inst_reads_slot(func, inst, slot, prov) {
+                        live_after = true;
+                        any_access_after = true;
+                    } else if matches!(*op, Op::StackStore(_, s, _) if s == slot) {
+                        any_access_after = true;
+                    }
+                }
+            }
+            if !dead.is_empty() {
+                for &inst in &dead {
+                    func.insts[inst.index()].op = Op::Trap;
+                }
+                func.blocks[bi].insts.retain(|i| !dead.contains(i));
+                changed = true;
+            }
+            if let Some((target, mut sunk)) = sink_to {
+                sunk.reverse();
+                func.blocks[bi].insts.retain(|i| !sunk.contains(i));
+                func.blocks[target.index()].insts.splice(0..0, sunk.iter().copied());
+                sink_pure_defs_into(func, b, target);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
