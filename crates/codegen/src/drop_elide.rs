@@ -395,7 +395,7 @@ fn narrow_unwind_drops(
         if arm_blocks.is_empty() {
             continue;
         }
-        let (dead_zeros, fresh_sets, live_calls) = analyze_flag(func, defs, kinds, entry, u.flag);
+        let (dead_zeros, fresh_sets, live_calls, always_active) = analyze_flag(func, defs, kinds, entry, u.flag);
         let narrow_calls = (!loaded_or_dyn).then_some(live_calls).flatten().filter(|lc| {
             !lc.is_empty()
                 && lc.len() <= 4
@@ -433,7 +433,7 @@ fn narrow_unwind_drops(
                 if is_set == Some(true)
                     && !remove[sinst.index()]
                     && fresh_sets.contains(&sinst)
-                    && let Some(frontier) = plan_flag_sink(func, &cfg, kinds, depths, (&live_in, sb, sinst, u.flag))
+                    && let Some(frontier) = plan_flag_sink(func, &cfg, kinds, depths, (&live_in, &always_active, sb, sinst, u.flag))
                 {
                     remove[sinst.index()] = true;
                     let mut sink_local = Vec::new();
@@ -591,7 +591,7 @@ fn walk_flag_cfg(
     entry: Block,
     flag: StackSlot,
     mut on_event: impl FnMut(FlagEvent) -> bool,
-) -> bool {
+) -> (bool, Vec<u8>) {
     let mut visited = vec![0u8; func.blocks.len()];
     visited[entry.index()] = 1;
     let mut work = vec![(entry, false)];
@@ -601,28 +601,28 @@ fn walk_flag_cfg(
             match &func.insts[inst.index()].op {
                 Op::Call { .. } if kinds[inst.index()] == CalleeKind::MayUnwind => {
                     if on_event(FlagEvent::Call(inst, active)) {
-                        return true;
+                        return (true, visited);
                     }
                 }
                 Op::TryCall { .. } => {
                     if on_event(FlagEvent::TryCall(active)) {
-                        return true;
+                        return (true, visited);
                     }
                 }
                 &Op::StackLoad(s, 0) if s == flag => {
                     if on_event(FlagEvent::Load(inst, active)) {
-                        return true;
+                        return (true, visited);
                     }
                 }
                 &Op::StackStore(v, s, 0) if s == flag => {
                     if store_clears_active(func, defs, v) {
                         if on_event(FlagEvent::Clear(inst, active)) {
-                            return true;
+                            return (true, visited);
                         }
                         active = false;
                     } else {
                         if on_event(FlagEvent::Set(inst, active)) {
-                            return true;
+                            return (true, visited);
                         }
                         active = true;
                     }
@@ -657,7 +657,7 @@ fn walk_flag_cfg(
             }
         }
     }
-    false
+    (false, visited)
 }
 
 fn analyze_flag(
@@ -666,13 +666,13 @@ fn analyze_flag(
     kinds: &[CalleeKind],
     entry: Block,
     flag: StackSlot,
-) -> (Vec<Inst>, Vec<Inst>, Option<Vec<(Block, Inst)>>) {
+) -> (Vec<Inst>, Vec<Inst>, Option<Vec<(Block, Inst)>>, Vec<bool>) {
     let mut call_state = vec![0u8; func.insts.len()];
     let mut clear_state = vec![0u8; func.insts.len()];
     let mut set_state = vec![0u8; func.insts.len()];
     let mut try_active = false;
     let bit = |a: bool| if a { 2u8 } else { 1u8 };
-    walk_flag_cfg(func, defs, kinds, entry, flag, |ev| {
+    let (_, visited) = walk_flag_cfg(func, defs, kinds, entry, flag, |ev| {
         match ev {
             FlagEvent::Call(inst, active) => call_state[inst.index()] |= bit(active),
             FlagEvent::TryCall(active) => try_active |= active,
@@ -706,11 +706,13 @@ fn analyze_flag(
             }
         }
     }
-    (dead_zeros, fresh_sets, exact.then_some(live))
+    let always_active = visited.into_iter().map(|v| v == 2).collect();
+    (dead_zeros, fresh_sets, exact.then_some(live), always_active)
 }
 
 fn unwind_flag_live_at_call(func: &Function, defs: &[Option<Inst>], kinds: &[CalleeKind], entry: Block, flag: StackSlot) -> bool {
     walk_flag_cfg(func, defs, kinds, entry, flag, |ev| {
         matches!(ev, FlagEvent::Call(_, true) | FlagEvent::TryCall(true))
     })
+    .0
 }

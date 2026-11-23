@@ -65,10 +65,12 @@ fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[b
             continue;
         }
         for (arm, other) in [(then, otherwise), (otherwise, then)] {
-            let rejoins = cfg.preds_of(other).iter().any(|&q| cfg.dominates(arm, q))
-                || matches!(func.last(other), Some(&Op::Jump(m, _)) if m != other && cfg.preds_of(m).iter().any(|&q| cfg.dominates(arm, q)));
-            let colder = (has_regular_call(func, arm) && !has_regular_call(func, other))
-                || (has_caller_loc_call(func, &zeros, arm) && !has_caller_loc_call(func, &zeros, other));
+            let direct_rejoin = cfg.preds_of(other).iter().any(|&q| cfg.dominates(arm, q));
+            let jump_rejoin = !direct_rejoin
+                && matches!(func.last(other), Some(&Op::Jump(m, _)) if m != other && cfg.preds_of(m).iter().any(|&q| cfg.dominates(arm, q)));
+            let rejoins = direct_rejoin || jump_rejoin;
+            let colder = (has_regular_call(func, arm) && (direct_rejoin || !has_regular_call(func, other)))
+                || (has_caller_loc_call(func, &zeros, arm) && (direct_rejoin || !has_caller_loc_call(func, &zeros, other)));
             if Some(arm) == func.entry
                 || cold[arm.index()]
                 || cold[other.index()]

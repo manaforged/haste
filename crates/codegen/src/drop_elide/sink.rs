@@ -58,7 +58,19 @@ fn block_is_flag_clean(func: &Function, kinds: &[CalleeKind], b: Block, flag: St
     })
 }
 
-fn sink_frontier(func: &Function, cfg: &Cfg, depths: &[u32], (live_in, b): (&[bool], Block), in_r: &mut [bool]) -> Option<Vec<Block>> {
+fn target_ok(cfg: &Cfg, depths: &[u32], always_active: &[bool], b: Block, in_r: &[bool], s: Block) -> bool {
+    let si = s.index();
+    depths[si] <= depths[b.index()]
+        && (cfg.preds_of(s).iter().all(|&p| !cfg.reachable[p.index()] || in_r[p.index()]) || (always_active[si] && cfg.dominates(b, s)))
+}
+
+fn sink_frontier(
+    func: &Function,
+    cfg: &Cfg,
+    depths: &[u32],
+    (live_in, always_active, b): (&[bool], &[bool], Block),
+    in_r: &mut [bool],
+) -> Option<Vec<Block>> {
     let n = func.blocks.len();
     loop {
         let mut pruned = false;
@@ -68,12 +80,7 @@ fn sink_frontier(func: &Function, cfg: &Cfg, depths: &[u32], (live_in, b): (&[bo
             }
             let blk = Block(bi as u32);
             let bad_pred = cfg.preds_of(blk).iter().any(|&p| cfg.reachable[p.index()] && !in_r[p.index()]);
-            let bad_succ = func.successors(blk).any(|s| {
-                let si = s.index();
-                !in_r[si]
-                    && live_in[si]
-                    && (depths[si] > depths[b.index()] || cfg.preds_of(s).iter().any(|&p| cfg.reachable[p.index()] && !in_r[p.index()]))
-            });
+            let bad_succ = func.successors(blk).any(|s| !in_r[s.index()] && live_in[s.index()] && !target_ok(cfg, depths, always_active, b, in_r, s));
             if bad_pred || bad_succ {
                 (in_r[bi], pruned) = (false, true);
             }
@@ -121,10 +128,7 @@ fn sink_frontier(func: &Function, cfg: &Cfg, depths: &[u32], (live_in, b): (&[bo
     if !skipped_fast || frontier.is_empty() || frontier.len() > 4 {
         return None;
     }
-    frontier
-        .iter()
-        .all(|&t| depths[t.index()] <= depths[b.index()] && cfg.preds_of(t).iter().all(|&p| !cfg.reachable[p.index()] || in_r[p.index()]))
-        .then_some(frontier)
+    frontier.iter().all(|&t| target_ok(cfg, depths, always_active, b, in_r, t)).then_some(frontier)
 }
 
 pub(super) fn plan_flag_sink(
@@ -132,7 +136,7 @@ pub(super) fn plan_flag_sink(
     cfg: &Cfg,
     kinds: &[CalleeKind],
     depths: &[u32],
-    (live_in, b, sinst, flag): (&[bool], Block, Inst, StackSlot),
+    (live_in, always_active, b, sinst, flag): (&[bool], &[bool], Block, Inst, StackSlot),
 ) -> Option<Vec<Block>> {
     let insts = &func.blocks[b.index()].insts;
     let pos = insts.iter().position(|&i| i == sinst)?;
@@ -156,9 +160,9 @@ pub(super) fn plan_flag_sink(
             }
         }
     }
-    sink_frontier(func, cfg, depths, (live_in, b), &mut in_r).or_else(|| {
+    sink_frontier(func, cfg, depths, (live_in, always_active, b), &mut in_r).or_else(|| {
         let mut solo = vec![false; n];
         solo[b.index()] = true;
-        sink_frontier(func, cfg, depths, (live_in, b), &mut solo)
+        sink_frontier(func, cfg, depths, (live_in, always_active, b), &mut solo)
     })
 }
