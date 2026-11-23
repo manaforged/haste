@@ -199,6 +199,7 @@ pub(crate) struct Asm {
     binds: u32,
     last_mem: Option<LastMem>,
     last_anchor: Option<(u32, Reg, i64)>,
+    last_imm: Option<(u32, Reg, i64)>,
 }
 
 fn sized(base: u32, size: Size) -> u32 {
@@ -210,34 +211,20 @@ impl Asm {
 
     pub fn word(&mut self, word: u32) { self.code.extend(word.to_le_bytes()); }
 
-    pub(super) fn clear_anchor(&mut self) { self.last_anchor = None; }
+    pub(super) fn clear_anchor(&mut self) { self.last_anchor = None; self.last_imm = None; }
 
     pub(super) fn clobber_anchor(&mut self, reg: Reg) {
-        if reg == Reg(17) || self.last_anchor.is_some_and(|(_, base, _)| base == reg) {
-            self.last_anchor = None;
-        }
+        if reg == Reg(17) || self.last_anchor.is_some_and(|(_, base, _)| base == reg) { self.last_anchor = None; }
+        if self.last_imm.is_some_and(|(_, r, _)| r == reg) { self.last_imm = None; }
     }
 
-    pub(in crate::arm64) fn emit_gp(&mut self, dst: Reg, word: u32) {
-        self.clobber_anchor(dst);
-        self.word(word);
-    }
+    pub(in crate::arm64) fn emit_gp(&mut self, dst: Reg, word: u32) { self.clobber_anchor(dst); self.word(word); }
 
-    fn clear_word(&mut self, word: u32) {
-        self.clear_anchor();
-        self.word(word);
-    }
+    fn clear_word(&mut self, word: u32) { self.clear_anchor(); self.word(word); }
 
-    pub fn label(&mut self) -> Label {
-        self.labels.push(None);
-        Label(self.labels.len() - 1)
-    }
+    pub fn label(&mut self) -> Label { self.labels.push(None); Label(self.labels.len() - 1) }
 
-    pub fn bind(&mut self, label: Label) {
-        self.labels[label.0] = Some(self.pos());
-        self.binds = self.binds.wrapping_add(1);
-        self.clear_anchor();
-    }
+    pub fn bind(&mut self, label: Label) { self.labels[label.0] = Some(self.pos()); self.binds = self.binds.wrapping_add(1); self.clear_anchor(); }
 
     fn jump(&mut self, word: u32, label: Label, kind: Fixup) {
         self.fixups.push((self.pos(), label.0, kind));
@@ -485,23 +472,26 @@ impl Asm {
     }
 
     pub fn mov_imm(&mut self, dst: Reg, imm: i64) {
+        if dst != ZR && self.last_imm == Some((self.binds, dst, imm)) { return; }
         self.clobber_anchor(dst);
         let value = imm as u64;
         let (ones, zeros) = Self::half_counts(value);
-        if self.try_emit_bitmask_imm(dst, value, ones, zeros) { return; }
-        let (inverted, skip, mut first) = (ones > zeros, if ones > zeros { 0xFFFF } else { 0 }, true);
-        for half in 0..4 {
-            let bits = (value >> (16 * half)) as u16;
-            if bits == skip && !(first && half == 3) { continue; }
-            let shift = (half as u32) << 21;
-            let word = match (first, inverted) {
-                (true, true) => 0x9280_0000 | shift | u32::from(!bits) << 5,
-                (true, false) => 0xD280_0000 | shift | u32::from(bits) << 5,
-                (false, _) => Self::MOVK | shift | u32::from(bits) << 5,
-            };
-            self.word(word | u32::from(dst.0));
-            first = false;
+        if !self.try_emit_bitmask_imm(dst, value, ones, zeros) {
+            let (inverted, skip, mut first) = (ones > zeros, if ones > zeros { 0xFFFF } else { 0 }, true);
+            for half in 0..4 {
+                let bits = (value >> (16 * half)) as u16;
+                if bits == skip && !(first && half == 3) { continue; }
+                let shift = (half as u32) << 21;
+                let word = match (first, inverted) {
+                    (true, true) => 0x9280_0000 | shift | u32::from(!bits) << 5,
+                    (true, false) => 0xD280_0000 | shift | u32::from(bits) << 5,
+                    (false, _) => Self::MOVK | shift | u32::from(bits) << 5,
+                };
+                self.word(word | u32::from(dst.0));
+                first = false;
+            }
         }
+        if dst != ZR { self.last_imm = Some((self.binds, dst, imm)); }
     }
 
     pub fn mov_symbol(&mut self, dst: Reg) -> u32 {

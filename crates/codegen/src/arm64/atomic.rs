@@ -354,6 +354,27 @@ impl Emit<'_> {
         }
     }
 
+    pub(super) fn preserves_flags(&self, op: &Op, result: Option<Value>) -> bool {
+        use crate::ir::{Binary, Unary};
+        matches!(
+            *op,
+            Op::Brif(..) | Op::Trapz(..) | Op::Load(..) | Op::Store(..) | Op::StackAddr(..) | Op::StackLoad(..) | Op::StackStore(..)
+                | Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::FramePointer
+        ) || matches!(*op, Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond))
+            || match *op {
+                Op::Binary(b, x, _) => !matches!(self.ty(x), Type::I128) && !self.ty(x).is_vector() && matches!(
+                    b,
+                    Binary::Iadd | Binary::Isub | Binary::Imul | Binary::Band | Binary::Bor | Binary::Bxor | Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr
+                ),
+                Op::Unary(u, x) => !matches!(self.ty(x), Type::I128) && !self.ty(x).is_vector()
+                    && matches!(u, Unary::Ineg | Unary::Bnot | Unary::Clz | Unary::Ctz | Unary::Popcnt | Unary::Bswap),
+                Op::Convert(c, x) => !matches!(self.ty(x), Type::I128) && !self.ty(x).is_vector()
+                    && result.is_some_and(|r| !self.ty(r).is_vector() && !self.ty(r).is_float())
+                    && matches!(c, Convert::Uextend | Convert::Sextend | Convert::Ireduce | Convert::Bitcast),
+                _ => false,
+            }
+    }
+
     fn select_cond(&mut self, condition: Value) -> Cond {
         if let Some((val, c)) = self.flags
             && val == condition
@@ -372,6 +393,7 @@ impl Emit<'_> {
             let size = if self.ty(condition).bytes() <= 4 { Size::W } else { Size::X };
             self.asm.add_imm(true, true, size, ZR, flag, 0);
         }
+        self.flags = Some((condition, Cond::Ne));
         Cond::Ne
     }
 

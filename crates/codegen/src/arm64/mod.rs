@@ -259,11 +259,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;
         let data = &func.insts[inst.index()];
-        let keep_flags = matches!(
-            data.op,
-            Op::Brif(..) | Op::Trapz(..) | Op::Load(..) | Op::Store(..) | Op::StackAddr(..) | Op::StackLoad(..) | Op::StackStore(..)
-                | Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::FramePointer
-        ) || matches!(data.op, Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond));
+        let keep_flags = self.preserves_flags(&data.op, data.result);
         if !keep_flags {
             self.flags = None;
             if !matches!(data.op, Op::Icmp(_, x, _) if !self.ty(x).is_vector())
