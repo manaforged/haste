@@ -7,6 +7,33 @@ use crate::ir::{AtomicRmwOp, Binary, Block, Function, Op, Type, Value};
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
+/// Matches an atomic `Or`/`Xor` mask `1 << bit` whose `bit` is masked strictly inside `0..ty.bits()`, returning the x64 `lock bts`/`lock btc` opcode and `bit`.
+pub(super) fn lock_bt_shift_bit(
+    func: &Function,
+    plan: &crate::alloc::Plan<Reg>,
+    def: impl Fn(Value) -> Option<crate::ir::Inst>,
+    op: AtomicRmwOp,
+    value: Value,
+) -> Option<(u8, Value)> {
+    let opcode = match op {
+        AtomicRmwOp::Or => 0xAB,
+        AtomicRmwOp::Xor => 0xBB,
+        _ => return None,
+    };
+    let ty = func.ty(value);
+    if !matches!(ty, Type::I32 | Type::I64) {
+        return None;
+    }
+    let Op::Binary(Binary::Ishl, one, bit) = func.insts[def(value)?.index()].op else { return None };
+    if func.ty(bit) != ty || plan.const_of(one) != Some(1) {
+        return None;
+    }
+    let Op::Binary(Binary::Band, a, b) = func.insts[def(bit)?.index()].op else { return None };
+    let limit = i64::from(ty.bits());
+    let bounded = [a, b].into_iter().any(|v| plan.const_of(v).is_some_and(|m| (0..limit).contains(&m)));
+    bounded.then_some((opcode, bit))
+}
+
 impl Emit<'_> {
     fn atomic_offset(&self, addr: Value) -> (Value, i32) {
         if self.plan.elided[addr.index()]
@@ -64,7 +91,18 @@ impl Emit<'_> {
             AtomicRmwOp::And => Alu::And,
             _ => Alu::Xor,
         };
-        if let Some(dec) = inc_dec {
+        if self.plan.elided[value.index()]
+            && let Some((opcode, bit)) = lock_bt_shift_bit(self.func, &self.plan, |v| self.defs[v.index()], op, value)
+        {
+            if let Some(br) = self.reg_of(bit) {
+                let target = self.atomic_target(addr, if br == Reg::Rcx { Reg::Rax } else { Reg::Rcx }, &[]);
+                self.asm.lock_bt_reg(size, opcode, target, br);
+            } else {
+                let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
+                self.raw(Reg::Rax, bit);
+                self.asm.lock_bt_reg(size, opcode, target, Reg::Rax);
+            }
+        } else if let Some(dec) = inc_dec {
             let target = self.atomic_target(addr, Reg::Rcx, &[]);
             self.asm.lock_inc_dec(size, dec, target);
         } else if let Some(imm32) = self.imm_sized(value, size) {

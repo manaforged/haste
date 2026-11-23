@@ -428,14 +428,20 @@ struct DupJoinPlan {
     repairs: Vec<(Block, SsaRepairPlan)>,
 }
 
-fn collect_param_loads(func: &Function, blk: Block, params: &[Value], mapped: &[Value], out: &mut Vec<(Value, i32)>) -> bool {
+fn is_malloc_call(func: &Function, defs: &[Option<Inst>], op: &Op) -> bool {
+    matches!(*op, Op::Call { callee, .. } if defs.get(callee.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Runtime(crate::reloc::RuntimeSymbol::Malloc))))
+}
+
+fn collect_param_loads(func: &Function, defs: &[Option<Inst>], blk: Block, params: &[Value], mapped: &[Value], out: &mut Vec<(Value, i32)>) -> bool {
     for &inst in &func.blocks[blk.index()].insts {
-        match func.insts[inst.index()].op {
+        let op = &func.insts[inst.index()].op;
+        match *op {
             Op::Load(addr, off) => {
                 if let Some(pos) = params.iter().position(|&p| p == addr) {
                     out.push((mapped[pos], off));
                 }
             }
+            Op::Call { .. } if is_malloc_call(func, defs, op) => {}
             Op::Call { .. } | Op::TryCall { .. } => return false,
             ref op if crate::mem::is_atomic_barrier(op) => return false,
             _ => {}
@@ -444,10 +450,10 @@ fn collect_param_loads(func: &Function, blk: Block, params: &[Value], mapped: &[
     true
 }
 
-fn pred_forwards_join_load(func: &Function, pred: Block, join: Block, args: &[Value]) -> bool {
+fn pred_forwards_join_load(func: &Function, defs: &[Option<Inst>], pred: Block, join: Block, args: &[Value]) -> bool {
     let params = &func.blocks[join.index()].params;
     let mut wanted: Vec<(Value, i32)> = Vec::new();
-    if !collect_param_loads(func, join, params, args, &mut wanted) {
+    if !collect_param_loads(func, defs, join, params, args, &mut wanted) {
         return false;
     }
     if wanted.is_empty()
@@ -502,11 +508,13 @@ fn pred_forwards_join_load(func: &Function, pred: Block, join: Block, args: &[Va
 
 fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
     let cfg = func.cfg();
+    let defs = crate::fold::defs(func);
     for at in 0..func.blocks.len() {
         let join = Block(at as u32);
         let jdata = &func.blocks[at];
         let npreds = cfg.preds_of(join).len();
-        if !cfg.reachable[at] || jdata.params.is_empty() || jdata.insts.len() > 12 || !(2..=4).contains(&npreds) {
+        let non_const = jdata.insts.iter().filter(|i| !matches!(func.insts[i.index()].op, Op::Const(_))).count();
+        if !cfg.reachable[at] || jdata.params.is_empty() || non_const > 16 || !(2..=4).contains(&npreds) {
             continue;
         }
         let Some(&last) = jdata.insts.last() else { continue };
@@ -517,10 +525,8 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
         };
         let mut own_vals: Vec<Value> = jdata.params.clone();
         for &inst in &jdata.insts {
-            if !matches!(func.insts[inst.index()].op, Op::Const(_))
-                && let Some(r) = func.insts[inst.index()].result
-            {
-                own_vals.push(r);
+            if !matches!(func.insts[inst.index()].op, Op::Const(_)) {
+                own_vals.extend(crate::live::results(&func.insts[inst.index()]));
             }
         }
         let mut repairs: Vec<(Block, SsaRepairPlan)> = Vec::new();
@@ -553,7 +559,7 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
             if *target != join || args.len() != jdata.params.len() {
                 continue;
             }
-            if pred_forwards_join_load(func, pred, join, args) {
+            if pred_forwards_join_load(func, &defs, pred, join, args) {
                 return Some(DupJoinPlan { pred, join, repairs });
             }
         }
@@ -573,6 +579,13 @@ fn apply_forwarding_join(func: &mut Function, plan: DupJoinPlan) {
         let data = func.insts[inst.index()].clone();
         let mut op = data.op;
         op.map_operands(|v| map.iter().find(|&&(from, _)| from == v).map_or(v, |&(_, into)| into));
+        if let Op::Call { ref mut results, .. } = op {
+            for r in results.iter_mut() {
+                let fresh = func.value(func.ty(*r));
+                map.push((*r, fresh));
+                *r = fresh;
+            }
+        }
         let res = data.result.map(|r| {
             let fresh = func.value(func.ty(r));
             map.push((r, fresh));

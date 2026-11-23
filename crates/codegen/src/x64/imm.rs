@@ -220,6 +220,13 @@ impl Asm {
         self.imm(&[bit]);
     }
 
+    /// Atomic `lock bts/btr/btc [dst], bit` (`opcode` = `0xAB`/`0xB3`/`0xBB`) for `size != Size::B`.
+    pub fn lock_bt_reg(&mut self, size: Size, opcode: u8, dst: Mem, bit: Reg) {
+        debug_assert!(size != Size::B);
+        self.flags_overwritten();
+        self.sized(true, size, (&[], &[0x0F, opcode]), bit as u8, dst.into());
+    }
+
     /// `bt/bts/btr/btc rm, bit` (`ext` = 4/5/6/7) at `size` (`Size::D` or `Size::Q`), copying bit `bit` into CF.
     pub fn bt_imm(&mut self, size: Size, ext: u8, rm: impl Into<Rm>, bit: u8) {
         self.flags_overwritten();

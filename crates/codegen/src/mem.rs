@@ -203,21 +203,21 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
 
 /// Gives each unique pointer that a call returns and the function stores into an entry parameter's or dominating frame's object that object as its owner, since it predates the allocation.
 fn seed_fresh_owners(func: &Function, cfg: &Cfg, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
-    let (mut mallocs, mut frees, mut called): (Vec<Value>, Vec<Value>, Vec<(Value, bool)>) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut mallocs, mut frees, mut called): (Vec<Value>, Vec<Value>, Vec<(Value, bool, Block, usize)>) = (Vec::new(), Vec::new(), Vec::new());
     for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
+        for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             match (&data.op, data.result) {
                 (&Op::Runtime(RuntimeSymbol::Malloc), Some(res)) => mallocs.push(res),
                 (&Op::Runtime(RuntimeSymbol::Free), Some(res)) => frees.push(res),
                 (Op::Call { callee, results, .. }, _) => {
                     for &result in results {
-                        if func.is_unique_ptr(result) { called.push((result, false)); }
+                        if func.is_unique_ptr(result) { called.push((result, false, b, pos)); }
                     }
                     let malloc = !mallocs.is_empty() && mallocs.contains(callee);
                     if (func.is_fresh_alloc(*callee) || malloc) && let Some(&res) = results.first() {
                         tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(None));
-                        if malloc { called.push((res, true)); }
+                        if malloc { called.push((res, true, b, pos)); }
                     }
                 }
                 _ => {}
@@ -226,7 +226,7 @@ fn seed_fresh_owners(func: &Function, cfg: &Cfg, entry: &[Value], affine: &[(Val
     }
     if called.is_empty() { return; }
     let mut freed_in_non_ret: Vec<Value> = Vec::new();
-    if func.frame_private > 0 && !frees.is_empty() {
+    if !frees.is_empty() {
         for &b in &cfg.rpo {
             let insts = &func.blocks[b.index()].insts;
             if insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Return(_))) { continue; }
@@ -240,11 +240,13 @@ fn seed_fresh_owners(func: &Function, cfg: &Cfg, entry: &[Value], affine: &[(Val
         }
     }
     for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
+        let insts = &func.blocks[b.index()].insts;
+        for (spos, &inst) in insts.iter().enumerate() {
             if let Op::Store(value, addr, _) = func.insts[inst.index()].op
-                && let Some(&(_, is_m)) = called.iter().find(|&&(v, _)| v == value)
+                && let Some(&(_, is_m, cb, cpos)) = called.iter().find(|&&(v, ..)| v == value)
                 && let Some(&(owner, _)) = affine.get(addr.index())
-                && owner != value && (entry.contains(&owner) || (is_m && func.is_frame_ptr(owner) && !freed_in_non_ret.contains(&owner)))
+                && owner != value
+                && (entry.contains(&owner) || (is_m && !freed_in_non_ret.contains(&owner) && (func.is_frame_ptr(owner) || (cb == b && spos > cpos && !insts[cpos..spos].iter().any(|&i| crate::live::results(&func.insts[i.index()]).any(|r| r == owner))))))
             { tracked[value.index()] = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner))); }
         }
     }

@@ -742,6 +742,16 @@ pub(super) fn fuse_atomic_rmws(func: &Function, plan: &mut Plan<Reg>, (uses, pos
             Op::AtomicRmw(rmw, _, _, value) => {
                 if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor | AtomicRmwOp::Xchg) {
                     plan.fused[v] = true;
+                    if let Some((_, bit)) = super::bits::lock_bt_shift_bit(func, plan, |x| pos_of[x.index()].map(|(_, _, i)| i), rmw, value)
+                        && uses[value.index()] == 1
+                        && !plan.elided[value.index()]
+                        && let Some((mb, mpos, _)) = pos_of[value.index()]
+                        && mb == block
+                        && mpos < start
+                        && fuse::preserved(func, plan, block, mpos, start, &[], bit)
+                    {
+                        plan.elided[value.index()] = true;
+                    }
                     continue;
                 }
                 if rmw != AtomicRmwOp::Sub || uses[v] != 1 { continue; }

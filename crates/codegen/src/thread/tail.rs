@@ -88,8 +88,9 @@ pub(super) fn run(func: &mut Function) -> bool {
         func.bump_cfg();
     }
     let split = split_correlated_join(func);
+    let collapsed = collapse_convergent_join(func);
     let repaired = thread_repaired_joins(func);
-    !copies.is_empty() || split || repaired
+    !copies.is_empty() || split || collapsed || repaired
 }
 
 pub(super) struct SsaRepairPlan {
@@ -509,6 +510,52 @@ fn split_correlated_join(func: &mut Function) -> bool {
             .filter_map(|&orig| disp_params.iter().position(|&p| p == orig).map(|pi| (orig, plan.args[pi])))
             .collect();
         apply_ssa_repair(func, &plan.ssa, plan.exit, mid_clone, &pairs);
+        func.bump_cfg();
+        any = true;
+    }
+    any
+}
+
+fn find_convergent_join(func: &Function) -> Option<(Block, Block, Block, Block, Vec<Value>, SsaRepairPlan)> {
+    let cfg = func.cfg();
+    let consts = func.const_values();
+    for at in 0..func.blocks.len() {
+        let disp = Block(at as u32);
+        let disp_params = &func.blocks[at].params;
+        if !cfg.reachable[at] || disp_params.is_empty() || func.blocks[at].insts.len() != 1 { continue; }
+        let Some(&Op::Brif(_, then, ref ta, other, ref oa)) = func.last(disp) else { continue };
+        if !ta.is_empty() || !oa.is_empty() || then == other { continue; }
+        for (arm, exit) in [(then, other), (other, then)] {
+            if arm == disp || exit == disp || arm == exit || !cfg.dominates(disp, exit) { continue; }
+            if !func.blocks[arm.index()].params.is_empty() || func.blocks[arm.index()].insts.len() != 1 { continue; }
+            let Some(&Op::Brif(arm_cond, a_then, ref ata, a_other, ref aoa)) = func.last(arm) else { continue };
+            if !ata.is_empty() || !aoa.is_empty() || a_then == a_other { continue; }
+            let Some(pidx) = disp_params.iter().position(|&p| p == arm_cond) else { continue };
+            for &pred in cfg.preds_of(disp) {
+                if pred == disp || cfg.dominates(disp, pred) { continue; }
+                let Some(Op::Jump(target, args)) = func.last(pred) else { continue };
+                if *target != disp || args.len() != disp_params.len() { continue; }
+                let Some(imm) = consts.get(args[pidx].index()).copied().flatten() else { continue };
+                let taken = crate::fold::extend(imm, func.ty(arm_cond), false) != 0;
+                if (if taken { a_then } else { a_other }) != exit { continue; }
+                if let Some(ssa) = plan_ssa_joins(func, &cfg, disp, exit, &[arm], disp_params) {
+                    return Some((pred, disp, arm, exit, args.clone(), ssa));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn collapse_convergent_join(func: &mut Function) -> bool {
+    let mut any = false;
+    for _ in 0..4 {
+        let Some((pred, disp, _, exit, args, ssa)) = find_convergent_join(func) else { break };
+        let disp_params = func.blocks[disp.index()].params.clone();
+        let pred_last = *func.blocks[pred.index()].insts.last().expect("invariant: pred has Jump");
+        func.insts[pred_last.index()].op = Op::Jump(exit, Vec::new());
+        let pairs: Vec<(Value, Value)> = ssa.need.iter().filter_map(|&o| disp_params.iter().position(|&p| p == o).map(|i| (o, args[i]))).collect();
+        apply_ssa_repair(func, &ssa, exit, pred, &pairs);
         func.bump_cfg();
         any = true;
     }
