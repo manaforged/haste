@@ -69,6 +69,7 @@ impl Checker<'_, '_> {
             _ => None,
         };
         let sig = self.callee_sig(expr, Some(callee));
+        self.check_call_unsafe(fn_item, sig.as_deref())?;
         let callee_ty = self.expr_ty(callee);
         let is_ctor = matches!(self.callee_res(expr, Some(callee)), Some(Res::Ctor(..)));
         let call_extend = if is_ctor { self.let_extend_depth } else { None };
@@ -120,6 +121,18 @@ impl Checker<'_, '_> {
             return None;
         };
         self.cx.signature(item).ok()
+    }
+
+    fn check_call_unsafe(&self, fn_item: Option<crate::names::ItemRef>, sig: Option<&Signature>) -> Result<()> {
+        if self.unsafe_depth == 0 {
+            let is_unsafe = sig.is_some_and(|s| s.is_unsafe)
+                || fn_item.is_some_and(|it| self.cx.foreign(it) && !sig.is_some_and(|s| s.is_safe));
+            if is_unsafe {
+                let name = fn_item.map_or("function", |it| self.cx.name(it));
+                bail!("call to unsafe function `{name}` is unsafe and requires unsafe function or block");
+            }
+        }
+        Ok(())
     }
 
     fn is_mem_drop(&mut self, expr: ExprId, callee: ExprId) -> bool {
@@ -243,6 +256,7 @@ impl Checker<'_, '_> {
             _ => None,
         };
         let sig = self.callee_sig(expr, None);
+        self.check_call_unsafe(fn_item, sig.as_deref())?;
         let res = self.check_arg_list_sources(&param_ids, sig.as_deref(), None, false, state, outer_live, depth);
         state.loans.retain(|l| l.holder != Some(temp_id));
         let arg_sources = res?;

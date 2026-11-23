@@ -23,6 +23,10 @@ impl Checker<'_, '_> {
         let block_depth = depth + 1;
         let saved_stmt_depth = self.stmt_depth;
         let is_const = kind == BlockKind::Const;
+        let is_unsafe = kind == BlockKind::Unsafe;
+        if is_unsafe {
+            self.unsafe_depth += 1;
+        }
         if is_const {
             let ids_check: Vec<u32> = self.body.list(stmts).to_vec();
             let (c_before, _, c_tail) = self.block_liveness(&ids_check, tail, &HashSet::default());
@@ -143,6 +147,9 @@ impl Checker<'_, '_> {
         }
         if is_const {
             self.const_depth -= 1;
+        }
+        if is_unsafe {
+            self.unsafe_depth -= 1;
         }
         self.stmt_depth = saved_stmt_depth;
         if !state.diverged {

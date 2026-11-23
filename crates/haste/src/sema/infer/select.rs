@@ -142,12 +142,25 @@ impl<'a> Infer<'_, 'a> {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;
-        if found.len() > 1 && !self.obligation_open(self_ty, args) {
+        let open = found.len() > 1 && self.obligation_open(self_ty, args);
+        let non_sysroot = |b: ImplRef| !self.cx.outline.is_sysroot(match b { ImplRef::Module { krate, .. } => krate, ImplRef::Body(i) => i.krate });
+        if found.len() > 1 && !open {
             let mut kept = Vec::new();
-            for entry in &found { if !self.blanket(entry.0.0)? { kept.push(entry.clone()); } }
-            if !kept.is_empty() { found = kept; }
+            for entry in &found {
+                if non_sysroot(entry.0.0) || !self.blanket(entry.0.0)? {
+                    kept.push(entry.clone());
+                }
+            }
+            if !kept.is_empty() {
+                found = kept;
+            }
         }
-        if found.len() > 1 && self.same_trait_args(&found, args) { found = self.most_specialized(found)?; }
+        if found.len() > 1 && self.same_trait_args(&found, args) {
+            found = self.most_specialized(found)?;
+            if found.len() > 1 && !open && found.iter().any(|((b, _), _)| non_sysroot(*b)) {
+                bail!("conflicting implementations of trait `{}`", self.cx.name(of));
+            }
+        }
         Ok(found)
     }
 
@@ -759,29 +772,6 @@ impl<'a> Infer<'_, 'a> {
             _ => None,
         }
     }
-
-    fn collect_header_traits(&mut self, item: ItemRef) -> Result<Vec<ItemRef>> {
-        self.frame_item = Some(item);
-        self.block = self.cx.owner_impl(item);
-        let mut direct = Vec::new();
-        direct.extend(self.cx.owner_trait(item));
-        direct.extend(self.block.and_then(|block| self.cx.impl_trait(block)));
-        for (header, src, home) in self.headers()? {
-            let (arena, generics, predicates) = header.parts();
-            let bounds: Vec<u32> = type_params(generics).flat_map(|g| arena.list(g.bounds).iter().copied()).chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied())).collect();
-            let found = self.in_source_home(src, home, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
-            direct.extend(found);
-        }
-        self.implied_traits(direct)
-    }
-}
-
-/// The traits declared in `item`'s header and any enclosing impl or trait header, with every supertrait they imply.
-pub fn header_bound_traits(cx: &mut super::super::Context<'_>, item: ItemRef) -> Vec<ItemRef> {
-    if !matches!(cx.item(item).1.kind, ItemKind::Fn | ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Type) {
-        return Vec::new();
-    }
-    super::detached(cx, item, |infer| infer.collect_header_traits(item)).unwrap_or_default()
 }
 
 /// What ranks one applicable impl against another under specialization: whether it has `default` items, the traits its bounds name, and those with every supertrait.

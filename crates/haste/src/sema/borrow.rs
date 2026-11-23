@@ -77,6 +77,7 @@ struct Checker<'c, 'a> {
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
+    unsafe_depth: u32,
     closure_by_val_caps: Vec<u32>,
     stmt_depth: u32,
     temp_scope_depth: u32,
@@ -165,6 +166,7 @@ pub(super) fn check(
     let mut checker = Checker {
         cx, item, body, src, typed, mutable, is_copy, is_param, scope_depth, names,
         no_move_captures: Vec::new(), returns_borrow: false, return_min_depth: 1, closure_depth: 0, const_depth: 0,
+        unsafe_depth: u32::from(sig.is_unsafe),
         closure_by_val_caps: Vec::new(), stmt_depth: 1, temp_scope_depth: 1,
         breaks: Vec::new(), temp_depth: 0, let_extend_depth: None, temp_sources: HashMap::default(),
         closure_effects: HashMap::default(), drop_cache: HashMap::default(), drop_locals: HashSet::default(),
@@ -486,13 +488,19 @@ impl Checker<'_, '_> {
                     }
                 } else if let Some(Res::Fn(item, _)) = self.typed.res.get(&expr)
                     && self.cx.item(*item).1.kind == ItemKind::Static
-                    && !place_ctx
-                    && !self.ty_is_copy(self.expr_ty(expr))
                 {
-                    bail!("cannot move out of static item `{}`", self.cx.name(*item));
+                    if self.unsafe_depth == 0 && self.is_static_mut(*item) {
+                        bail!("use of mutable static `{}` is unsafe and requires unsafe function or block", self.cx.name(*item));
+                    }
+                    if !place_ctx && !self.ty_is_copy(self.expr_ty(expr)) {
+                        bail!("cannot move out of static item `{}`", self.cx.name(*item));
+                    }
                 }
             }
-            Expr::Ref { mutable, raw: _, expr: inner } => {
+            Expr::Ref { mutable, raw, expr: inner } => {
+                if !raw {
+                    self.check_union_place(inner)?;
+                }
                 if mutable && self.place_behind_shared_ref(inner) {
                     bail!("cannot borrow data in a `&` reference as mutable");
                 }
@@ -525,6 +533,7 @@ impl Checker<'_, '_> {
                 }
             }
             Expr::AssignOp(_, lhs, rhs) => {
+                self.check_union_place(lhs)?;
                 let mut after_rhs = outer_live.clone();
                 self.collect_live_expr(lhs, &mut after_rhs);
                 self.check_expr(rhs, state, false, &after_rhs, true, depth)?;
@@ -574,6 +583,13 @@ impl Checker<'_, '_> {
             Expr::Call(callee, args) => self.check_call(expr, callee, args, state, outer_live, depth)?,
             Expr::Method { receiver, params, .. } => self.check_method(expr, receiver, params, state, outer_live, depth)?,
             Expr::Unary(op, inner) => {
+                if op == UnOp::Deref
+                    && self.unsafe_depth == 0
+                    && self.expr_ty(inner) != Ty::NONE
+                    && matches!(self.cx.types.kind(self.expr_ty(inner)), Kind::Ptr(..))
+                {
+                    bail!("dereference of raw pointer is unsafe and requires unsafe function or block");
+                }
                 if op == UnOp::Deref && !place_ctx && !self.ty_is_copy(self.expr_ty(expr)) {
                     if self.typed.derefs.contains_key(&(expr, 0)) || self.place_behind_ref_or_ptr(expr) {
                         bail!("cannot move out of a shared or mutable reference");
@@ -616,6 +632,9 @@ impl Checker<'_, '_> {
                 self.check_expr(b, state, false, outer_live, true, depth)?;
             }
             Expr::Field(base, _) | Expr::TupleField(base, _) => {
+                if !place_ctx && matches!(*self.body.expr(expr), Expr::Field(..)) {
+                    self.check_union_access(expr, base)?;
+                }
                 let moving = !place_ctx && !self.ty_is_copy(self.expr_ty(expr));
                 if let Some(p) = self.root_place(expr)
                     && !p.steps.is_empty()

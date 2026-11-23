@@ -46,8 +46,7 @@ pub use name::type_name;
 pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
-pub use scope::{Form, type_params};
-pub use select::header_bound_traits;
+pub use scope::{Form, header_bound_traits, type_params};
 pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
 pub(super) use tables::{CallSites, recount_call_sites, shape_calls};
 

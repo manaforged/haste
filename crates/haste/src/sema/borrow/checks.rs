@@ -677,4 +677,33 @@ impl Checker<'_, '_> {
                 || after.partial_moves.iter().any(|m| m.local == l && !before_partial.contains(m))
         })
     }
+
+    pub(super) fn check_union_access(&self, expr: ExprId, base: ExprId) -> Result<()> {
+        if self.unsafe_depth == 0 {
+            let cont = self.field_container_ty(expr, base);
+            if cont != Ty::NONE
+                && matches!(self.cx.types.kind(cont), Kind::Adt(item, _) if self.cx.item(*item).1.kind == crate::outline::item::ItemKind::Union)
+            {
+                bail!("access to union field is unsafe and requires unsafe function or block");
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_union_place(&self, mut expr: ExprId) -> Result<()> {
+        if self.unsafe_depth > 0 {
+            return Ok(());
+        }
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Field(base, _) => {
+                    self.check_union_access(expr, base)?;
+                    expr = base;
+                }
+                Expr::TupleField(base, _) | Expr::Index(base, _) => expr = base,
+                _ => return Ok(()),
+            }
+        }
+    }
 }
