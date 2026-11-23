@@ -367,6 +367,15 @@ const NAMES: &[(&str, Intrinsic)] = {
 impl Context<'_> {
     /// The intrinsic that the function `item` is, when it carries `#[rustc_intrinsic]` and lowering knows it, or when it is the panic handler. `Trap` stands for the panic runtime, which is not lowered yet. `Unreachable` also stands for `core::hint::unreachable_unchecked` where its precondition check is compiled out.
     pub fn intrinsic(&self, item: ItemRef) -> Option<Intrinsic> {
+        if let Some(&cached) = self.intrinsics_local.borrow().get(&item) {
+            return cached;
+        }
+        let found = self.compute_intrinsic(item);
+        self.intrinsics_local.borrow_mut().insert(item, found);
+        found
+    }
+
+    fn compute_intrinsic(&self, item: ItemRef) -> Option<Intrinsic> {
         let (src, entry) = self.item(item);
         if entry.kind != ItemKind::Fn {
             return None;

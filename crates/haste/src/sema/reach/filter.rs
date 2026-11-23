@@ -33,6 +33,8 @@ pub(super) struct ReachFilter {
     sealed_log: Vec<(ItemRef, SealInfo)>,
     seen_sealed_log: Vec<ItemRef>,
     dirty: Vec<(ItemRef, SealInfo)>,
+    ty_non_fixed: Vec<u8>,
+    substs_non_fixed: Vec<u8>,
 }
 
 impl ReachFilter {
@@ -168,10 +170,10 @@ impl ReachFilter {
         let tg = cx.trait_generics(tr).ok()?;
         let count = 1 + tg.1.params.iter().filter(|g| g.kind != GenericKind::Lifetime).count();
         let slice = cx.types.substs(substs).to_vec();
-        if slice.len() < count || slice[1..count].iter().any(|&ty| ty_has_non_fixed(cx, ty)) {
+        if slice.len() < count || slice[1..count].iter().any(|&ty| self.ty_has_non_fixed(cx, ty)) {
             return None;
         }
-        if !ok_call_hole_head(cx, slice[0]) {
+        if !ok_call_hole_head(cx, self, slice[0]) {
             return None;
         }
         let head_key = head(cx.types.kind(slice[0]))?;
@@ -195,15 +197,23 @@ impl ReachFilter {
         }
         Some(dep)
     }
+
+    fn ty_has_non_fixed(&mut self, cx: &Context<'_>, ty: Ty) -> bool {
+        ty_has_non_fixed_memo(cx.outline, &cx.types, ty, Some((&mut self.ty_non_fixed, &mut self.substs_non_fixed)))
+    }
+
+    fn substs_has_non_fixed(&mut self, cx: &Context<'_>, substs: Substs) -> bool {
+        substs_has_non_fixed_memo(cx.outline, &cx.types, substs, Some((&mut self.ty_non_fixed, &mut self.substs_non_fixed)))
+    }
 }
 
-fn ok_call_hole_head(cx: &Context<'_>, ty: Ty) -> bool {
+fn ok_call_hole_head(cx: &Context<'_>, filter: &mut ReachFilter, ty: Ty) -> bool {
     match *cx.types.kind(ty) {
         Kind::Prim(_) | Kind::Never | Kind::Ptr(..) | Kind::Slice(..) | Kind::Array(..) | Kind::FnPtr(..) => true,
-        Kind::Ref(..) | Kind::Tuple(..) => !ty_has_non_fixed(cx, ty),
+        Kind::Ref(..) | Kind::Tuple(..) => !filter.ty_has_non_fixed(cx, ty),
         Kind::Adt(adt, _) => {
             cx.outline.is_fixed(adt.krate)
-                && ((cx.lang(adt) != Some("owned_box") && !cx.has_attr(adt, "fundamental")) || !ty_has_non_fixed(cx, ty))
+                && ((cx.lang(adt) != Some("owned_box") && !cx.has_attr(adt, "fundamental")) || !filter.ty_has_non_fixed(cx, ty))
         }
         _ => false,
     }
@@ -389,32 +399,89 @@ fn adt_layout_infallible(cx: &mut Context<'_>, item: ItemRef, adt: ItemRef, args
     true
 }
 
-pub(in crate::sema) fn ty_has_non_fixed_raw(outline: &crate::outline::Outline, types: &super::super::ty::Types, ty: Ty) -> bool {
+fn ty_has_non_fixed_memo(
+    outline: &crate::outline::Outline,
+    types: &super::super::ty::Types,
+    ty: Ty,
+    mut memo: Option<(&mut Vec<u8>, &mut Vec<u8>)>,
+) -> bool {
     if ty == Ty::NONE {
         return true;
     }
-    match types.kind(ty) {
-        Kind::Prim(_) | Kind::Never | Kind::Value(_) => false,
-        Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => ty_has_non_fixed_raw(outline, types, *inner),
-        Kind::Array(elem, count) => ty_has_non_fixed_raw(outline, types, *elem) || ty_has_non_fixed_raw(outline, types, *count),
-        Kind::Tuple(args) => substs_has_non_fixed_raw(outline, types, *args),
-        Kind::FnPtr(args, ret) => substs_has_non_fixed_raw(outline, types, *args) || ty_has_non_fixed_raw(outline, types, *ret),
-        Kind::Adt(def, args) | Kind::FnDef(def, args) | Kind::Closure(def, args, _) => !outline.is_fixed(def.krate) || substs_has_non_fixed_raw(outline, types, *args),
-        Kind::Dyn(tr, args, assoc, auto) => !outline.is_fixed(tr.krate) || assoc.iter().chain(auto).any(|d| !outline.is_fixed(d.krate)) || substs_has_non_fixed_raw(outline, types, *args),
-        Kind::Proj(_) | Kind::Param(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => true,
+    let idx = ty.0 as usize;
+    if let Some((ty_memo, _)) = memo.as_ref()
+        && let Some(&v) = ty_memo.get(idx)
+        && v != 0
+    {
+        return v == 2;
     }
+    let res = match types.kind(ty) {
+        Kind::Prim(_) | Kind::Never | Kind::Value(_) => false,
+        Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => {
+            ty_has_non_fixed_memo(outline, types, *inner, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+        }
+        Kind::Array(elem, count) => {
+            ty_has_non_fixed_memo(outline, types, *elem, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+                || ty_has_non_fixed_memo(outline, types, *count, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+        }
+        Kind::Tuple(args) => substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b))),
+        Kind::FnPtr(args, ret) => {
+            substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+                || ty_has_non_fixed_memo(outline, types, *ret, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+        }
+        Kind::Adt(def, args) | Kind::FnDef(def, args) | Kind::Closure(def, args, _) => {
+            !outline.is_fixed(def.krate) || substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+        }
+        Kind::Dyn(tr, args, assoc, auto) => {
+            !outline.is_fixed(tr.krate)
+                || assoc.iter().chain(auto).any(|d| !outline.is_fixed(d.krate))
+                || substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+        }
+        Kind::Proj(_) | Kind::Param(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => true,
+    };
+    if let Some((ty_memo, _)) = memo {
+        if idx >= ty_memo.len() {
+            ty_memo.resize(idx + 1, 0);
+        }
+        ty_memo[idx] = if res { 2 } else { 1 };
+    }
+    res
+}
+
+fn substs_has_non_fixed_memo(
+    outline: &crate::outline::Outline,
+    types: &super::super::ty::Types,
+    substs: Substs,
+    mut memo: Option<(&mut Vec<u8>, &mut Vec<u8>)>,
+) -> bool {
+    if substs.is_empty() {
+        return false;
+    }
+    let idx = substs.0 as usize;
+    if let Some((_, sub_memo)) = memo.as_ref()
+        && let Some(&v) = sub_memo.get(idx)
+        && v != 0
+    {
+        return v == 2;
+    }
+    let mut res = false;
+    for &ty in types.substs(substs) {
+        if ty_has_non_fixed_memo(outline, types, ty, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b))) {
+            res = true;
+            break;
+        }
+    }
+    if let Some((_, sub_memo)) = memo {
+        if idx >= sub_memo.len() {
+            sub_memo.resize(idx + 1, 0);
+        }
+        sub_memo[idx] = if res { 2 } else { 1 };
+    }
+    res
 }
 
 pub(in crate::sema) fn substs_has_non_fixed_raw(outline: &crate::outline::Outline, types: &super::super::ty::Types, substs: Substs) -> bool {
-    !substs.is_empty() && types.substs(substs).iter().any(|&ty| ty_has_non_fixed_raw(outline, types, ty))
-}
-
-fn ty_has_non_fixed(cx: &Context<'_>, ty: Ty) -> bool {
-    ty_has_non_fixed_raw(cx.outline, &cx.types, ty)
-}
-
-fn substs_has_non_fixed(cx: &Context<'_>, substs: Substs) -> bool {
-    substs_has_non_fixed_raw(cx.outline, &cx.types, substs)
+    substs_has_non_fixed_memo(outline, types, substs, None)
 }
 
 pub(super) fn pre_collect_callees(
@@ -451,7 +518,7 @@ fn push_filtered_callee(
     }
     let mut sealed = false;
     if prune_fixed && cx.outline.is_fixed(item.krate) {
-        if !substs_has_non_fixed(cx, substs) {
+        if !filter.substs_has_non_fixed(cx, substs) {
             return;
         }
         sealed = can_prune_fixed(cx, filter, (item, substs));

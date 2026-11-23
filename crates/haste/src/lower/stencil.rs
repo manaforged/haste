@@ -689,7 +689,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
             if func.is_coroutine() {
                 haste_codegen::split_coroutine(&mut func);
             }
-            if !func.unwind_drops().is_empty() && (!reached.is_incremental() || slots.allow_inline()) {
+            if !func.unwind_drops().is_empty() && slots.allow_inline() {
                 func.enable_drop_elision();
                 for (sym, src) in relocs.iter().enumerate() {
                     if !sym_may_unwind(cx, reached, Some(src)) {

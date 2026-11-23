@@ -786,10 +786,13 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let (mut changed, mut cfg_changed) = settle_cfg_and_params(func, &mut fold, entry, effort, &pinned);
     let (dropped_params, mut body_changed) = (unused::drop_params(func, &fold.subst), false);
     for b in 0..func.blocks.len() { for idx in 0..func.blocks[b].insts.len() { body_changed |= rewrite_folded_inst(func, &fold, func.blocks[b].insts[idx]); } }
-    body_changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | unused::dead(func);
+    if effort == crate::Effort::Full {
+        body_changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func);
+    }
+    body_changed |= unused::run(func, &pinned) | unused::dead(func);
     changed |= body_changed;
     if (body_changed || dropped_params) && (fold.thread(func, &pinned) | fold.branches(func)) { func.bump_cfg(); unused::prune_changed(func, entry, false); unused::dead(func); (changed, cfg_changed) = (true, true); }
-    if crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func) { unused::dead(func); changed = true; }
+    if effort == crate::Effort::Full && (crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func)) { unused::dead(func); changed = true; }
     if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }
 }
 pub(crate) use crate::ir::compact;

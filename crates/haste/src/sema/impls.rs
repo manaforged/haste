@@ -221,6 +221,9 @@ impl<'a> Context<'a> {
 
     /// The member of impl `block` named `name`.
     pub fn member(&self, block: ImplRef, name: &str) -> Option<ItemRef> {
+        if let Some(members) = self.impl_members_local.borrow().get(&block) {
+            return members.get(name).copied();
+        }
         let members = self.impl_members.get_or_insert_with(block, || {
             let mut map = HashMap::default();
             for member in self.members(block) {
@@ -228,7 +231,9 @@ impl<'a> Context<'a> {
             }
             Arc::new(map)
         });
-        members.get(name).copied()
+        let found = members.get(name).copied();
+        self.impl_members_local.borrow_mut().insert(block, members);
+        found
     }
 
     /// The impl block whose member `item` is.

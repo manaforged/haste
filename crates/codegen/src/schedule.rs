@@ -91,7 +91,7 @@ static QUICK_RULES: &[Rule] = &[
     Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
     Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
 ];
-static QUICK_FINISH: &[Pass] = &[Pass::Cse, Pass::Returns];
+static QUICK_FINISH: &[Pass] = &[Pass::Returns];
 
 static FULL_RULES: &[Rule] = &[
     Rule { pass: Pass::Fill, reads: Domain::CFG.union(Domain::VALUES) },
@@ -502,10 +502,12 @@ fn run_backend_prep(func: &mut Function, plan: &Plan) {
     if plan.moves == promote::Moves::Guided {
         return;
     }
-    if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
-        crate::algebra::compare_offsets(func);
+    if plan.effort == Effort::Full {
+        if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
+            crate::algebra::compare_offsets(func);
+        }
+        sink::run(func, plan.moves == promote::Moves::Split);
     }
-    sink::run(func, plan.moves == promote::Moves::Split && plan.effort == Effort::Full);
     let x64_full = plan.target.arch == crate::Arch::X64 && plan.effort == Effort::Full;
     if x64_full {
         branches::split_conditions(func);
