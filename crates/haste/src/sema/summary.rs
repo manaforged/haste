@@ -466,6 +466,15 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
         frozen::try_cached_instantiate(cx, instance, summary, check_only).or_else(|| detached_outcome(cx, instance, summary, &concrete_args, check_only))?
     };
     let (typed, concrete_layouts) = settle_outcome(cx, instance, summary, outcome)?;
+    if !cx.outline.is_fixed(instance.0.krate) && matches!(typed.shape, Shape::Body) {
+        typed.ensure_tables(&cx.types);
+        let body = match cx.body(instance.0) { Ok(b) => b, Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))) };
+        let sig = match cx.signature(instance.0) { Ok(s) => s, Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))) };
+        let src = cx.body_src(instance.0);
+        if let Err(err) = super::borrow::check(cx, instance.0, (&body, &sig), src, &typed) {
+            return Some(Err(format!("{}: {err:#}", cx.name(instance.0))));
+        }
+    }
     if record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before) {
         thaw::note_fresh(cx, instance, &typed);
     }

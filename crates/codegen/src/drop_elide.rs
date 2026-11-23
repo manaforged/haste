@@ -301,33 +301,42 @@ fn narrow_unwind_drops(
     true
 }
 
-fn analyze_flag(
+enum FlagEvent {
+    Call(Inst, bool),
+    TryCall(bool),
+    Clear(Inst, bool),
+}
+
+fn walk_flag_cfg(
     func: &Function,
     defs: &[Option<Inst>],
     kinds: &[CalleeKind],
     entry: Block,
     flag: StackSlot,
-) -> (Vec<Inst>, Option<Vec<(Block, Inst)>>) {
+    mut on_event: impl FnMut(FlagEvent) -> bool,
+) -> bool {
     let mut visited = vec![0u8; func.blocks.len()];
-    let mut call_state = vec![0u8; func.insts.len()];
-    let mut clear_state = vec![0u8; func.insts.len()];
-    let mut try_active = false;
     visited[entry.index()] = 1;
     let mut work = vec![(entry, false)];
     while let Some((block, mut active)) = work.pop() {
         let mut stopped = false;
-        let bit = |a: bool| if a { 2u8 } else { 1u8 };
         for &inst in &func.blocks[block.index()].insts {
             match &func.insts[inst.index()].op {
                 Op::Call { .. } if kinds[inst.index()] == CalleeKind::MayUnwind => {
-                    call_state[inst.index()] |= bit(active);
+                    if on_event(FlagEvent::Call(inst, active)) {
+                        return true;
+                    }
                 }
                 Op::TryCall { .. } => {
-                    if active { try_active = true; }
+                    if on_event(FlagEvent::TryCall(active)) {
+                        return true;
+                    }
                 }
                 &Op::StackStore(v, s, 0) if s == flag => {
                     if store_clears_active(func, defs, v) {
-                        clear_state[inst.index()] |= bit(active);
+                        if on_event(FlagEvent::Clear(inst, active)) {
+                            return true;
+                        }
                         active = false;
                     } else {
                         active = true;
@@ -340,17 +349,41 @@ fn analyze_flag(
                 _ => {}
             }
         }
-        if stopped { continue; }
-        let b = bit(active);
+        if stopped {
+            continue;
+        }
+        let bit = if active { 2 } else { 1 };
         if let Some(last) = func.last(block) {
             for target in last.targets() {
-                if visited[target.index()] & b == 0 {
-                    visited[target.index()] |= b;
+                if visited[target.index()] & bit == 0 {
+                    visited[target.index()] |= bit;
                     work.push((target, active));
                 }
             }
         }
     }
+    false
+}
+
+fn analyze_flag(
+    func: &Function,
+    defs: &[Option<Inst>],
+    kinds: &[CalleeKind],
+    entry: Block,
+    flag: StackSlot,
+) -> (Vec<Inst>, Option<Vec<(Block, Inst)>>) {
+    let mut call_state = vec![0u8; func.insts.len()];
+    let mut clear_state = vec![0u8; func.insts.len()];
+    let mut try_active = false;
+    let bit = |a: bool| if a { 2u8 } else { 1u8 };
+    walk_flag_cfg(func, defs, kinds, entry, flag, |ev| {
+        match ev {
+            FlagEvent::Call(inst, active) => call_state[inst.index()] |= bit(active),
+            FlagEvent::TryCall(active) => try_active |= active,
+            FlagEvent::Clear(inst, active) => clear_state[inst.index()] |= bit(active),
+        }
+        false
+    });
     let mut dead_zeros = Vec::new();
     let mut live = Vec::new();
     let mut exact = !try_active;
@@ -374,35 +407,7 @@ fn analyze_flag(
 }
 
 fn unwind_flag_live_at_call(func: &Function, defs: &[Option<Inst>], kinds: &[CalleeKind], entry: Block, flag: StackSlot) -> bool {
-    let mut visited = vec![0u8; func.blocks.len()];
-    visited[entry.index()] = 1;
-    let mut work = vec![(entry, false)];
-    while let Some((block, mut active)) = work.pop() {
-        let mut stopped = false;
-        for &inst in &func.blocks[block.index()].insts {
-            match &func.insts[inst.index()].op {
-                Op::Call { .. } if active && kinds[inst.index()] == CalleeKind::MayUnwind => return true,
-                Op::TryCall { .. } if active => return true,
-                &Op::StackStore(v, s, 0) if s == flag => active = !store_clears_active(func, defs, v),
-                Op::Return(..) | Op::Trap => {
-                    stopped = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if stopped {
-            continue;
-        }
-        let bit = if active { 2 } else { 1 };
-        if let Some(last) = func.last(block) {
-            for target in last.targets() {
-                if visited[target.index()] & bit == 0 {
-                    visited[target.index()] |= bit;
-                    work.push((target, active));
-                }
-            }
-        }
-    }
-    false
+    walk_flag_cfg(func, defs, kinds, entry, flag, |ev| {
+        matches!(ev, FlagEvent::Call(_, true) | FlagEvent::TryCall(true))
+    })
 }

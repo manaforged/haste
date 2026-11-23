@@ -19,6 +19,7 @@ struct ParamBounds {
     req_static: bool,
     hrtb_params: Vec<usize>,
     hrtb_non_ret: Vec<usize>,
+    caller_lt_params: Vec<(usize, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,25 +71,42 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    pub(in super::super) fn callee_hrtb_non_ret_params(&mut self, callee: ExprId, ret_has_borrow: bool) -> Vec<usize> {
+    fn callee_param_bounds(&mut self, callee: ExprId) -> Option<ParamBounds> {
         let cur = self.unwrap_parens(callee);
-        let Some(crate::sema::infer::Res::Local(local)) = self.typed.res.get(&cur).copied() else {
+        let crate::sema::infer::Res::Local(local) = self.typed.res.get(&cur).copied()? else {
+            return None;
+        };
+        let pos = self.typed.params.iter().position(|&p| p == local)?;
+        let sig = self.cx.signature(self.item).ok()?;
+        let param_idx = if sig.receiver.is_some() { pos.checked_sub(1)? } else { pos };
+        let &(_, param_ty) = sig.params.get(param_idx)?;
+        Some(self.param_bound_reqs(&sig, self.src, param_ty))
+    }
+
+    pub(in super::super) fn callee_hrtb_non_ret_params(&mut self, callee: ExprId, ret_has_borrow: bool) -> Vec<usize> {
+        let Some(bounds) = self.callee_param_bounds(callee) else {
             return Vec::new();
         };
-        let Some(pos) = self.typed.params.iter().position(|&p| p == local) else {
-            return Vec::new();
-        };
-        let Ok(sig) = self.cx.signature(self.item) else {
-            return Vec::new();
-        };
-        let Some(param_idx) = (if sig.receiver.is_some() { pos.checked_sub(1) } else { Some(pos) }) else {
-            return Vec::new();
-        };
-        let Some(&(_, param_ty)) = sig.params.get(param_idx) else {
-            return Vec::new();
-        };
-        let bounds = self.param_bound_reqs(&sig, self.src, param_ty);
         if ret_has_borrow { bounds.hrtb_non_ret } else { bounds.hrtb_params }
+    }
+
+    pub(in super::super) fn check_callee_bound_args(&mut self, callee: ExprId, arg_ids: &[u32], state: &State) -> Result<()> {
+        let Some(bounds) = self.callee_param_bounds(callee) else {
+            return Ok(());
+        };
+        for (p_idx, outer_elided) in bounds.caller_lt_params {
+            let Some(&id) = arg_ids.get(p_idx) else { continue };
+            let arg = self.unwrap_parens(ExprId(id));
+            let check_expr = if outer_elided
+                && let Expr::Ref { raw: false, expr: inner, .. } = *self.body.expr(arg)
+            {
+                inner
+            } else {
+                arg
+            };
+            self.check_static_arg(check_expr, state)?;
+        }
+        Ok(())
     }
 
     fn param_bound_reqs(&self, sig: &Signature, src: &Source, param_ty: TyId) -> ParamBounds {
@@ -115,7 +133,17 @@ impl Checker<'_, '_> {
                             if is_callable && let Some(Args::Paren { inputs, output }) = seg.args {
                                 let out_elided = output.is_some_and(|out_ty| ast_ty_may_carry_elided_lt(&sig.body, src, out_ty));
                                 for (p_idx, &in_ty) in sig.body.list(inputs).iter().enumerate() {
-                                    if matches!(*sig.body.ty(TyId(in_ty)), AstTy::Ref { lifetime: None, .. }) {
+                                    let mut in_lts = Lifetimes::default();
+                                    collect_ty_lifetimes(&sig.body, src, TyId(in_ty), &mut in_lts);
+                                    let outer_elided = matches!(*sig.body.ty(TyId(in_ty)), AstTy::Ref { lifetime: None, .. });
+                                    let has_caller_lt = in_lts.saw_static
+                                        || in_lts.named.iter().any(|&lt| {
+                                            sig.generics.iter().any(|g| g.kind == GenericKind::Lifetime && src.text(g.name) == lt)
+                                        });
+                                    if has_caller_lt && !out.caller_lt_params.iter().any(|&(idx, _)| idx == p_idx) {
+                                        out.caller_lt_params.push((p_idx, outer_elided));
+                                    }
+                                    if outer_elided && in_lts.named.is_empty() {
                                         if !out.hrtb_params.contains(&p_idx) {
                                             out.hrtb_params.push(p_idx);
                                         }
@@ -189,16 +217,7 @@ impl Checker<'_, '_> {
         let sig_src = self.cx.item(f_item).0;
         let mut lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut lts);
-        if lts.has_elided || !lts.named.is_empty() || !lts.saw_static {
-            return false;
-        }
-        let type_params: Vec<&str> = sig
-            .generics
-            .iter()
-            .filter(|g| g.kind == GenericKind::Type)
-            .map(|g| sig_src.text(g.name))
-            .collect();
-        !ast_ty_has_type_param(&sig.body, sig_src, ret_ast, &type_params)
+        sig_returns_only_static(&sig, sig_src, ret_ast, &lts)
     }
 
     fn check_closure_effects(&self, eff: &ClosureEffects, req_fn: bool, req_fn_mut: bool, req_static: bool) -> Result<()> {
@@ -450,6 +469,19 @@ fn ast_ty_may_carry_elided_lt(body: &Body, src: &Source, ty_id: TyId) -> bool {
         }
         _ => true,
     }
+}
+
+pub(in super::super) fn sig_returns_only_static(sig: &Signature, src: &Source, ret_ast: TyId, lts: &Lifetimes) -> bool {
+    if lts.has_elided || !lts.named.is_empty() || !lts.saw_static {
+        return false;
+    }
+    let type_params: Vec<&str> = sig
+        .generics
+        .iter()
+        .filter(|g| g.kind == GenericKind::Type)
+        .map(|g| src.text(g.name))
+        .collect();
+    !ast_ty_has_type_param(&sig.body, src, ret_ast, &type_params)
 }
 
 fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, params: &[&str]) -> bool {

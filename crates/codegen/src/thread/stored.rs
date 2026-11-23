@@ -91,6 +91,23 @@ pub(super) fn steppable(func: &Function, block: Block, max_insts: usize) -> bool
         })
 }
 
+enum StoreMatch {
+    Hit(i64),
+    Abort,
+    Skip,
+}
+
+fn match_const_store(func: &Function, cx: &ThreadCx<'_>, (sval, s_lo): (Value, i64), (t_lo, t_hi, ty): (i64, i64, Type)) -> StoreMatch {
+    let Some(s_hi) = s_lo.checked_add(i64::from(func.ty(sval).bytes())) else { return StoreMatch::Abort };
+    if s_lo <= t_lo && t_hi <= s_hi {
+        return match extract_const(func, cx.defs, cx.consts, sval, t_lo - s_lo, ty) {
+            Some(c) => StoreMatch::Hit(c),
+            None => StoreMatch::Abort,
+        };
+    }
+    if s_lo < t_hi && t_lo < s_hi { StoreMatch::Abort } else { StoreMatch::Skip }
+}
+
 /// Resolves a mapped `Load` or `StackLoad` of a small integer against trailing non-aliasing constant stores in `pred`.
 pub(super) fn pred_load_const(func: &Function, cx: &ThreadCx<'_>, state: &EvalState, pred: Block, op: &Op, ty: Type) -> Option<i64> {
     if !ty.is_small_int() {
@@ -99,61 +116,42 @@ pub(super) fn pred_load_const(func: &Function, cx: &ThreadCx<'_>, state: &EvalSt
     let (_, body) = func.blocks[pred.index()].insts.split_last()?;
     let sz = i64::from(ty.bytes());
     let local = Some((state.local_ops.as_slice(), state.local_consts.as_slice()));
-    match *op {
+    let (target_addr, t_lo) = match *op {
         Op::Load(raw_addr, raw_off) => {
-            let (t_addr, t_lo) = unwrap_addr_offset(func, cx.defs, cx.consts, local, raw_addr, raw_off);
-            let t_hi = t_lo.checked_add(sz)?;
-            for &inst in body.iter().rev() {
-                let pop = &func.insts[inst.index()].op;
-                match *pop {
-                    Op::Store(sval, saddr, soff) => {
-                        let (sb, s_lo) = unwrap_addr_offset(func, cx.defs, cx.consts, None, saddr, soff);
-                        if sb != t_addr {
-                            return None;
-                        }
-                        let s_hi = s_lo.checked_add(i64::from(func.ty(sval).bytes()))?;
-                        if s_lo <= t_lo && t_hi <= s_hi {
-                            return extract_const(func, cx.defs, cx.consts, sval, t_lo - s_lo, ty);
-                        }
-                        if s_lo < t_hi && t_lo < s_hi {
-                            return None;
-                        }
-                    }
-                    Op::Load(..) | Op::StackLoad(..) => {}
-                    _ if pop.is_speculable() => {}
-                    _ => return None,
-                }
-            }
-            None
+            let (addr, lo) = unwrap_addr_offset(func, cx.defs, cx.consts, local, raw_addr, raw_off);
+            (Ok(addr), lo)
         }
-        Op::StackLoad(t_slot, raw_off) => {
-            let t_lo = i64::from(raw_off);
-            let t_hi = t_lo.checked_add(sz)?;
-            for &inst in body.iter().rev() {
-                let pop = &func.insts[inst.index()].op;
-                match *pop {
-                    Op::StackStore(sval, sslot, soff) => {
-                        if sslot != t_slot {
-                            continue;
-                        }
-                        let s_lo = i64::from(soff);
-                        let s_hi = s_lo.checked_add(i64::from(func.ty(sval).bytes()))?;
-                        if s_lo <= t_lo && t_hi <= s_hi {
-                            return extract_const(func, cx.defs, cx.consts, sval, t_lo - s_lo, ty);
-                        }
-                        if s_lo < t_hi && t_lo < s_hi {
-                            return None;
-                        }
-                    }
-                    Op::Load(..) | Op::StackLoad(..) => {}
-                    _ if pop.is_speculable() => {}
-                    _ => return None,
+        Op::StackLoad(slot, raw_off) => (Err(slot), i64::from(raw_off)),
+        _ => return None,
+    };
+    let t_hi = t_lo.checked_add(sz)?;
+    for &inst in body.iter().rev() {
+        let pop = &func.insts[inst.index()].op;
+        let hit = match (target_addr, pop) {
+            (Ok(t_addr), &Op::Store(sval, saddr, soff)) => {
+                let (sb, s_lo) = unwrap_addr_offset(func, cx.defs, cx.consts, None, saddr, soff);
+                if sb != t_addr {
+                    return None;
                 }
+                match_const_store(func, cx, (sval, s_lo), (t_lo, t_hi, ty))
             }
-            None
+            (Err(t_slot), &Op::StackStore(sval, sslot, soff)) => {
+                if sslot != t_slot {
+                    continue;
+                }
+                match_const_store(func, cx, (sval, i64::from(soff)), (t_lo, t_hi, ty))
+            }
+            (_, Op::Load(..) | Op::StackLoad(..)) => StoreMatch::Skip,
+            (_, o) if o.is_speculable() => StoreMatch::Skip,
+            _ => return None,
+        };
+        match hit {
+            StoreMatch::Hit(c) => return Some(c),
+            StoreMatch::Abort => return None,
+            StoreMatch::Skip => {}
         }
-        _ => None,
     }
+    None
 }
 
 /// Sends each edge into a block that reloads, tests and branches on a word its predecessor just stored as a constant straight to the side that constant takes; returns whether it moved any edge.

@@ -118,9 +118,21 @@ impl<'a> Context<'a> {
         self.outline.crates[krate as usize].env.overflow_checks()
     }
 
-    /// Whether the function `item` carries `#[track_caller]`.
-    pub fn track_caller(&self, item: ItemRef) -> bool {
-        self.attr_at(item, "track_caller").is_some()
+    /// Whether the function `item` carries `#[track_caller]`, directly or inherited from its trait method declaration.
+    pub fn track_caller(&mut self, item: ItemRef) -> bool {
+        if self.attr_at(item, "track_caller").is_some() {
+            return true;
+        }
+        let Some(block) = self.owner_impl(item) else {
+            return false;
+        };
+        let Some(tr) = self.impl_trait(block) else {
+            return false;
+        };
+        let Some(member) = self.trait_member(tr, self.plain_name(item)) else {
+            return false;
+        };
+        self.attr_at(member, "track_caller").is_some()
     }
 
     /// Whether the function `item` is `#[inline(always)]`.

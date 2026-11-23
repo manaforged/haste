@@ -1,4 +1,4 @@
-mod closure;
+pub(super) mod closure;
 
 use anyhow::{Result, bail};
 use rustc_hash::FxHashSet as HashSet;

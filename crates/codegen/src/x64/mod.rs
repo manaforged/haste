@@ -586,7 +586,6 @@ impl Emit<'_> {
                 self.high(high, val);
             }
         }
-        self.invalidate_spills();
         float_targets.len()
     }
 

@@ -76,6 +76,7 @@ impl Checker<'_, '_> {
         self.with_let_extend(call_extend, |this| {
             let arg_sources = this.check_arg_list_sources(&arg_ids, sig.as_deref(), Some(callee_ty), has_self_arg, state, outer_live, depth)?;
             this.check_call_bounds(&arg_ids, sig.as_deref(), fn_item, has_self_arg, state)?;
+            this.check_callee_bound_args(callee, &arg_ids, state)?;
             this.attach_call_out_sources(expr, &arg_ids, sig.as_deref(), fn_item, has_self_arg, state)?;
             this.apply_closure_call_loans(callee, &arg_ids, &arg_sources, state)
         })

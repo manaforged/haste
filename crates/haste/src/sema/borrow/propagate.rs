@@ -521,7 +521,7 @@ impl Checker<'_, '_> {
         let is_by_ref = is_iter_fn && fn_name == "by_ref";
         let mut out = Vec::new();
         if !ret_lts.has_elided && ret_lts.named.is_empty() {
-            if ret_lts.saw_static {
+            if super::checks::closure::sig_returns_only_static(&sig, sig_src, ret_ast, &ret_lts) {
                 return Vec::new();
             }
             let mut param_matched_own_generic = false;

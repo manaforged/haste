@@ -488,10 +488,13 @@ impl Lower<'_, '_> {
                 let callee_tracked = self.cx.track_caller(self.reached.list[index].0.0);
                 let wants_track = !caller_tracked && callee_tracked;
                 if let Some(inlined) = self.slots.allow_inline().then(|| self.inline_callee(index)).transpose()?.flatten() {
-                    let (was_open, from_blk) = (self.open, self.b.block_count());
+                    if caller_tracked && !callee_tracked && inlined.body.has_calls() {
+                        return self.with_caller_loc(Some(false), |this| this.emit_inlined(&inlined, origin, values));
+                    }
+                    let (was_open, caller_blk, from_blk) = (self.open, self.b.current_block(), self.b.block_count());
                     let res = self.emit_inlined(&inlined, origin, values)?;
                     if wants_track && was_open {
-                        self.wrap_inlined_caller_loc(from_blk, self.b.block_count().saturating_sub(1))?;
+                        self.wrap_inlined_caller_loc(caller_blk, from_blk, self.b.block_count().saturating_sub(1))?;
                     }
                     return Ok(res);
                 }

@@ -162,17 +162,40 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn wrap_inlined_caller_loc(&mut self, from_blk: usize, to_blk: usize) -> Result<()> {
+    pub(super) fn wrap_inlined_caller_loc(&mut self, caller_blk: Option<haste_codegen::Block>, from_blk: usize, to_blk: usize) -> Result<()> {
+        let after = self.b.block_at(to_blk);
+        let mut hits = Vec::new();
+        let mut flows_inlined = false;
         for b_idx in from_blk..to_blk {
             let block = self.b.block_at(b_idx);
-            let Some((first_call, can_fall_through)) = self.b.block_first_tracked(block, self.dict_param, |sym, arg0| match sym.and_then(|s| self.relocs.get(s as usize)) {
-                Some(SymbolSource::Slot(idx)) => self.cx.track_caller(self.reached.list[*idx].0.0),
+            let (b, cx, relocs, reached, dict_param) = (&self.b, &mut self.cx, &self.relocs, self.reached, self.dict_param);
+            if let Some((first_call, can_fall_through, flows)) = b.block_first_tracked(block, after, dict_param, |sym, arg0| match sym.and_then(|s| relocs.get(s as usize)) {
+                Some(SymbolSource::Slot(idx)) => cx.track_caller(reached.list[*idx].0.0),
                 Some(SymbolSource::Host(HostSymbol::ThreadCell)) => arg0 == Some(0),
                 None => sym.is_none(),
                 _ => false,
-            }) else {
-                continue;
-            };
+            }) {
+                flows_inlined |= flows;
+                hits.push((block, first_call, can_fall_through));
+            }
+        }
+        if hits.is_empty() {
+            return Ok(());
+        }
+        if flows_inlined && let Some(cblk) = caller_blk {
+            let jump_pos = self.b.block_len(cblk).saturating_sub(1);
+            let (saved, tail) = self.b.splice_open(cblk, jump_pos);
+            let slot = self.caller_loc_slot()?;
+            let prev = self.ins().load(Type::I64, slot, 0);
+            let loc = self.current_site_location()?;
+            self.ins().store(loc, slot, 0);
+            self.b.splice_append(&tail, saved);
+            if self.open {
+                self.ins().store(prev, slot, 0);
+            }
+            return Ok(());
+        }
+        for (block, first_call, can_fall_through) in hits {
             let (saved, tail) = self.b.splice_open(block, first_call);
             let slot = self.caller_loc_slot()?;
             let prev = self.ins().load(Type::I64, slot, 0);

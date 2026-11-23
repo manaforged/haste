@@ -585,7 +585,6 @@ impl Emit<'_> {
                 self.high(high, val);
             }
         }
-        self.invalidate_spills();
     }
 
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {

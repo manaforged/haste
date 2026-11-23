@@ -114,13 +114,29 @@ impl FunctionBuilder<'_> {
         self.func.blocks.len()
     }
 
+    /// The block currently accepting appended instructions, if any.
+    pub fn current_block(&self) -> Option<Block> {
+        self.current
+    }
+
+    /// Number of instructions currently in `block`.
+    pub fn block_len(&self, block: Block) -> usize {
+        self.func.blocks[block.index()].insts.len()
+    }
+
     /// Block handle at index `idx` within this function.
     pub fn block_at(&self, idx: usize) -> Block {
         Block(idx as u32)
     }
 
-    /// Position of the first call in `block` whose callee matches `is_tracked(sym, first_const_arg)`, and whether control can leave `block` normally afterward.
-    pub fn block_first_tracked(&self, block: Block, dict: Option<Value>, mut is_tracked: impl FnMut(Option<u32>, Option<i64>) -> bool) -> Option<(usize, bool)> {
+    /// Position of the first call in `block` matching `is_tracked(sym, first_const_arg)`, whether control can leave `block` normally, and whether any edge targets a block other than `after`.
+    pub fn block_first_tracked(
+        &self,
+        block: Block,
+        after: Block,
+        dict: Option<Value>,
+        mut is_tracked: impl FnMut(Option<u32>, Option<i64>) -> bool,
+    ) -> Option<(usize, bool, bool)> {
         let insts = &self.func.blocks[block.index()].insts;
         let first = insts.iter().position(|&inst| {
             let (callee, args) = match &self.func.insts[inst.index()].op {
@@ -131,10 +147,10 @@ impl FunctionBuilder<'_> {
             let first_arg = args.first().and_then(|&v| self.const_int(v));
             is_tracked(sym, first_arg)
         })?;
-        let can_fall_through = insts
-            .last()
-            .is_some_and(|&last| !matches!(self.func.insts[last.index()].op, Op::Trap | Op::TryCall { .. }));
-        Some((first, can_fall_through))
+        let last = insts.last().map(|&inst| &self.func.insts[inst.index()].op);
+        let can_fall_through = last.is_some_and(|op| !matches!(op, Op::Trap | Op::TryCall { .. }));
+        let flows_inlined = last.is_some_and(|op| op.targets().any(|t| t != after));
+        Some((first, can_fall_through, flows_inlined))
     }
 
     /// Splits `block` at `pos` and switches the builder to `block`, returning `(saved_block, tail)`.
@@ -153,5 +169,12 @@ impl FunctionBuilder<'_> {
         if let Some(target) = restore {
             self.current = Some(target);
         }
+    }
+}
+
+impl Function {
+    /// Whether this function contains any `Call` or `TryCall` instruction.
+    pub fn has_calls(&self) -> bool {
+        self.blocks.iter().any(|b| b.insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. })))
     }
 }

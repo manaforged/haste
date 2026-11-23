@@ -457,8 +457,8 @@ impl Asm {
         self.imm_sized(size, imm);
     }
 
-    pub fn imul_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) { self.encode(&[], size == Size::Q, &[0x0F, 0xAF], dst as u8, src.into(), false); }
-    pub fn imul(&mut self, dst: Reg, src: impl Into<Rm>) { self.imul_sized(Size::Q, dst, src); }
+    pub(super) fn imul_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) { self.encode(&[], size == Size::Q, &[0x0F, 0xAF], dst as u8, src.into(), false); }
+    pub(super) fn imul(&mut self, dst: Reg, src: impl Into<Rm>) { self.imul_sized(Size::Q, dst, src); }
     /// `dst = src * imm`.
     pub fn imul_imm_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, imm: i32) {
         self.encode(&[], size == Size::Q, &[0x69], dst as u8, src.into(), false);
@@ -481,9 +481,9 @@ impl Asm {
 
     /// The one-operand `op` on the low `size` bytes of `rm`.
     pub fn group3_sized(&mut self, size: Size, op: Group3, rm: impl Into<Rm>) { self.sized(false, size, (&[0xF6], &[0xF7]), op as u8, rm.into()); }
-    pub fn group3(&mut self, op: Group3, rm: impl Into<Rm>) { self.encode(&[], true, &[0xF7], op as u8, rm.into(), false); }
-    pub fn cqo(&mut self) { self.code.extend([0x48, 0x99]); }
-    pub fn shift(&mut self, size: Size, op: Shift, reg: Reg) { self.sized(false, size, (&[0xD2], &[0xD3]), op as u8, reg.into()); }
+    pub(super) fn group3(&mut self, op: Group3, rm: impl Into<Rm>) { self.encode(&[], true, &[0xF7], op as u8, rm.into(), false); }
+    pub(super) fn cqo(&mut self) { self.code.extend([0x48, 0x99]); }
+    pub(super) fn shift(&mut self, size: Size, op: Shift, reg: Reg) { self.sized(false, size, (&[0xD2], &[0xD3]), op as u8, reg.into()); }
 
     pub fn shift_imm(&mut self, size: Size, op: Shift, reg: Reg, imm: u8) {
         self.flags_overwritten();
