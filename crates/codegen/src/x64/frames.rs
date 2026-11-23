@@ -1,6 +1,6 @@
 use super::Emit;
 use super::asm::{Alu, Asm, Cond, Label, Mem, Reg, Size};
-use crate::alloc::{CallTarget, Location};
+use crate::alloc::CallTarget;
 use crate::CallAbi;
 use crate::ir::{ArgumentPurpose, Op, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
@@ -110,6 +110,7 @@ impl Emit<'_> {
     /// Emits the out-of-line runtime calls of cache misses, each returning to the code after its inline path.
     pub(super) fn emit_cold_calls(&mut self) {
         self.invalidate_spills();
+        let mut saved_leaf: Option<Vec<Reg>> = None;
         for call in std::mem::take(&mut self.cold_calls) {
             match call {
                 ColdCall::Frame(cold, back, target) => {
@@ -120,12 +121,12 @@ impl Emit<'_> {
                 }
                 ColdCall::ThreadCell(cold, back, lookup, [slot, size, init], base_unaligned) => {
                     self.asm.bind(cold);
-                    let has_dict = self.func.signature.params.iter().any(|p| p.purpose == ArgumentPurpose::Dict);
-                    let saved: Vec<Reg> = super::REGS.leaf.iter().copied()
-                        .filter(|&r| (has_dict && super::REGS.dict == Some(r)) || self.plan.locations.iter().any(|loc| matches!(loc, Location::Reg(at) if *at == r)))
-                        .collect();
+                    let saved = saved_leaf.get_or_insert_with(|| {
+                        let has_dict = self.func.signature.params.iter().any(|p| p.purpose == ArgumentPurpose::Dict);
+                        crate::alloc::used_preserved_leaf_regs(&super::REGS, &self.plan.locations, has_dict)
+                    });
                     let needs_align = base_unaligned ^ (saved.len() % 2 == 1);
-                    for &r in &saved { self.asm.push(r); }
+                    for &r in saved.iter() { self.asm.push(r); }
                     if needs_align { self.asm.alu_imm(Alu::Sub, Reg::Rsp, 8); }
                     self.raw(Reg::Rdi, slot);
                     self.raw(Reg::Rsi, size);

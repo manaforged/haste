@@ -699,6 +699,39 @@ impl<R: Copy + PartialEq> Plan<R> {
     }
 }
 
+pub(crate) fn used_preserved_leaf_regs<R: Copy + PartialEq>(regs: &Regs<R>, locations: &[Location<R>], include_dict: bool) -> Vec<R> {
+    let mut eligible = [false; 32];
+    let mut need_mask = 0u32;
+    for (i, &r) in regs.leaf.iter().enumerate() {
+        if !regs.preserved_clobbers.contains(&r) {
+            eligible[i] = true;
+            need_mask |= 1u32 << i;
+        }
+    }
+    let mut used_mask = 0u32;
+    if include_dict
+        && let Some(dict) = regs.dict
+        && let Some(i) = regs.leaf.iter().position(|&r| r == dict)
+        && eligible[i]
+    {
+        used_mask |= 1u32 << i;
+    }
+    if used_mask != need_mask {
+        for loc in locations {
+            if let Location::Reg(at) = *loc
+                && let Some(i) = regs.leaf.iter().position(|&r| r == at)
+                && eligible[i]
+            {
+                used_mask |= 1u32 << i;
+                if used_mask == need_mask {
+                    break;
+                }
+            }
+        }
+    }
+    regs.leaf.iter().enumerate().filter(|&(i, _)| (used_mask & (1u32 << i)) != 0).map(|(_, &r)| r).collect()
+}
+
 fn passed_own<R: Copy + PartialEq>(func: &Function, inst: Inst, value: Value, reg: ParkReg<R>, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> bool {
     let Op::Call { sig, args, .. } = &func.insts[inst.index()].op else { return false };
     let Ok(abi) = classify(&func.sigs[sig.index()]) else { return false };

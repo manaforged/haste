@@ -1,6 +1,5 @@
 use super::asm::{Cond, Label, Mem, Reg, SP, Size};
 use super::{A, Emit, IP, T};
-use crate::alloc::Location;
 use crate::ir::{Op, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
 
@@ -89,13 +88,12 @@ impl Emit<'_> {
 
     pub(super) fn emit_cold_calls(&mut self) {
         self.invalidate_spills();
+        let mut saved_leaf: Option<Vec<Reg>> = None;
         for call in std::mem::take(&mut self.cold_calls) {
             match call {
                 ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]) => {
                     self.asm.bind(cold);
-                    let saved: Vec<Reg> = super::REGS.leaf.iter().copied()
-                        .filter(|&r| !super::REGS.preserved_clobbers.contains(&r) && self.plan.locations.iter().any(|loc| matches!(loc, Location::Reg(at) if *at == r)))
-                        .collect();
+                    let saved = saved_leaf.get_or_insert_with(|| crate::alloc::used_preserved_leaf_regs(&super::REGS, &self.plan.locations, false));
                     let alloc = (saved.len().div_ceil(2) * 16) as u32;
                     if alloc > 0 {
                         self.asm.add_imm(true, false, Size::X, SP, SP, alloc);
