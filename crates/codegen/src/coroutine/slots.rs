@@ -131,7 +131,7 @@ type SlotTrace = (Vec<bool>, Vec<bool>, Vec<Vec<(Block, Inst)>>);
 
 fn trace_stack_addrs(func: &Function, (dense_of, raw_of): (&[u32], &[usize]), value_uses: &[Vec<(Block, Inst)>], is_spill: &[bool]) -> SlotTrace {
     let slots = raw_of.len();
-    let raw_escaped = Provenance::compute_with_spills(func, Some(is_spill)).escaped_slots();
+    let raw_escaped = Provenance::compute_with_spills(func, Some(is_spill)).addr_escaped_slots();
     let escaped: Vec<bool> = raw_of.iter().map(|&raw| raw_escaped[raw]).collect();
     let mut taken = vec![false; slots];
     let mut extra_uses = vec![Vec::new(); slots];

@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_op, is_atomic_barrier, is_rodata, may_alias};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_load, is_atomic_barrier, is_rodata, may_alias};
 use crate::merge::find;
 
 const MAX_MERGE_WALK: usize = 32;
@@ -67,7 +67,7 @@ pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: 
             _ => is_atomic_barrier(op),
         };
     }
-    clobbers_op(func, (op, at), loc, prov)
+    clobbers_load(func, (op, at), loc, prov)
 }
 
 fn save_immutable_entries(

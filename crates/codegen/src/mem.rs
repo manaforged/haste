@@ -5,7 +5,7 @@ mod loop_mem;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
-use crate::ir::{AbiParam, Binary, Block, BlockData, Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::ir::{AbiParam, AtomicOrd, Binary, Block, BlockData, Convert, Function, Inst, Op, StackSlot, Type, Value};
 use crate::reloc::RuntimeSymbol;
 pub(crate) use loop_mem::{LoopMem, PromoteBase, PromoteCand};
 
@@ -510,6 +510,10 @@ impl Provenance {
         self.unescaped_slots.iter().map(|&u| !u).collect()
     }
 
+    pub(crate) fn addr_escaped_slots(&self) -> Vec<bool> {
+        self.addr_unescaped_slots.iter().map(|&u| !u).collect()
+    }
+
     /// Whether every call that takes `slot`'s address takes it as the memory for its result, so only those calls write it.
     pub(crate) fn slot_return_only(&self, slot: StackSlot) -> bool {
         self.return_only_slots.get(slot.index()).copied().unwrap_or(false)
@@ -636,12 +640,25 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
             MemRoot::NoAliasParam(p) => {
                 !prov.noalias_unescaped(p) || call_writes_noalias(&func.sigs[sig.index()].params, args, prov, p)
             }
-            _ => !prov.private_frame(loc),
+            _ => matches!(*op, Op::TryCall { .. }) || !prov.private_frame(loc),
         },
         _ => is_atomic_barrier(op)
             && loc.root != MemRoot::CallerLoc
             && !(prov.private_frame(loc) && !prov.touches_frame(op))
             && !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s)),
+    }
+}
+
+/// Whether `op` may overwrite `loc` for load forwarding; `Relaxed` and `Release` atomics cannot acquire writes from other threads.
+pub(crate) fn clobbers_load(func: &Function, op: (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
+    match *op.0 {
+        Op::AtomicLoad(_, AtomicOrd::Relaxed) => false,
+        Op::AtomicStore(val, addr, AtomicOrd::Relaxed | AtomicOrd::Release)
+        | Op::AtomicRmw(_, AtomicOrd::Relaxed | AtomicOrd::Release, addr, val)
+        | Op::AtomicCas(AtomicOrd::Relaxed | AtomicOrd::Release, addr, _, val) => {
+            may_alias(prov.loc(addr, 0, func.ty(val).bytes()), loc, prov)
+        }
+        _ => clobbers_op(func, op, loc, prov),
     }
 }
 
@@ -686,7 +703,7 @@ impl KnownLoads {
 
     pub(crate) fn invalidate(&mut self, func: &Function, op: (&Op, Option<Inst>), prov: &Provenance) {
         self.by_base.retain(|&base, (root, entries)| {
-            entries.retain(|&(off, t, _)| !clobbers_op(func, op, MemLoc::new(*root, base, off, t.bytes()), prov));
+            entries.retain(|&(off, t, _)| !clobbers_load(func, op, MemLoc::new(*root, base, off, t.bytes()), prov));
             !entries.is_empty()
         });
     }

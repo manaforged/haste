@@ -10,6 +10,7 @@ use super::{MemRoot, TrackRoot};
 struct UseCounts {
     total: Vec<u32>,
     safe: Vec<u32>,
+    unwind_stores: Vec<u32>,
     ro_calls: Vec<u32>,
     returns: Vec<u32>,
 }
@@ -73,6 +74,9 @@ fn finish_slot_escape(
             if spilled || counts.safe[v] != counts.total[v] {
                 esc.unescaped[s.index()] = false;
             }
+            if spilled || counts.safe[v] + counts.unwind_stores[v] != counts.total[v] {
+                esc.addr_unescaped[s.index()] = false;
+            }
             if spilled || counts.safe[v] + counts.ro_calls[v] != counts.total[v] {
                 esc.call_readonly[s.index()] = false;
             }
@@ -86,7 +90,6 @@ fn finish_slot_escape(
             esc.noalias[usize::from(p)] = true;
         }
     }
-    esc.addr_unescaped = esc.unescaped.clone();
     for u in &func.unwind_drops {
         for s in [u.local, u.flag] {
             esc.unescaped[s.index()] = false;
@@ -222,6 +225,7 @@ struct EscapeCx<'a> {
     slots: &'a [Option<(StackSlot, i32)>],
     tracked: &'a [TrackRoot],
     is_const: &'a [bool],
+    unwind_write_only: &'a [bool],
     in_loop: &'a [bool],
     danger: &'a [bool],
     unknown_end: &'a [usize],
@@ -255,6 +259,9 @@ fn classify_inst(cx: &EscapeCx<'_>, counts: &mut UseCounts, b: Block, pos: usize
         Op::Load(addr, _) => mark_safe(*addr, cx.slots, cx.tracked, &mut counts.safe),
         Op::Trapz(addr) => mark_param_safe(*addr, cx.slots, cx.tracked, &mut counts.safe),
         Op::Store(val, addr, _) if val != addr => mark_safe(*addr, cx.slots, cx.tracked, &mut counts.safe),
+        Op::StackStore(val, slot, 0) if cx.unwind_write_only[slot.index()] => {
+            mark_safe(*val, cx.slots, cx.tracked, &mut counts.unwind_stores);
+        }
         Op::Move(dst, src, _) | Op::Copy(dst, src, _) => {
             mark_param_safe(*dst, cx.slots, cx.tracked, &mut counts.safe);
             mark_param_safe(*src, cx.slots, cx.tracked, &mut counts.safe);
@@ -286,6 +293,12 @@ pub(super) fn classify_uses(
         return SlotEscapes::new(func);
     }
     let n = func.types.len();
+    let mut unwind_write_only = vec![false; func.slots.len()];
+    for u in &func.unwind_drops {
+        if u.indirect {
+            unwind_write_only[u.local.index()] = true;
+        }
+    }
     let mut is_const = vec![false; n];
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
@@ -293,11 +306,14 @@ pub(super) fn classify_uses(
             if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
                 is_const[res.index()] = true;
             }
+            if let Op::StackLoad(slot, _) | Op::StackAddr(slot, _) = data.op {
+                unwind_write_only[slot.index()] = false;
+            }
         }
     }
     let (in_loop, danger, unknown_end) = compute_block_danger(func, cfg, slots, tracked);
-    let cx = EscapeCx { func, slots: &slots, tracked: &tracked, is_const: &is_const, in_loop: &in_loop, danger: &danger, unknown_end: &unknown_end };
-    let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n], returns: vec![0_u32; n] };
+    let cx = EscapeCx { func, slots: &slots, tracked: &tracked, is_const: &is_const, unwind_write_only: &unwind_write_only, in_loop: &in_loop, danger: &danger, unknown_end: &unknown_end };
+    let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], unwind_stores: vec![0_u32; n], ro_calls: vec![0_u32; n], returns: vec![0_u32; n] };
     let mut points: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
     let mut used = Vec::new();
     for &b in &cfg.rpo {
