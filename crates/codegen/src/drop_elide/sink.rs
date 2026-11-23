@@ -58,9 +58,18 @@ fn block_is_flag_clean(func: &Function, kinds: &[CalleeKind], b: Block, flag: St
     })
 }
 
-fn target_ok(cfg: &Cfg, depths: &[u32], always_active: Option<&[bool]>, b: Block, in_r: &[bool], s: Block) -> bool {
+fn block_has_unwind_call(func: &Function, kinds: &[CalleeKind], b: Block) -> bool {
+    func.blocks[b.index()].insts.iter().any(|&inst| match func.insts[inst.index()].op {
+        Op::Call { .. } => kinds[inst.index()] == CalleeKind::MayUnwind,
+        Op::TryCall { .. } => true,
+        _ => false,
+    })
+}
+
+fn target_ok(cfg: &Cfg, depths: &[u32], always_active: Option<&[bool]>, call_in_loop: Option<&[bool]>, b: Block, in_r: &[bool], s: Block) -> bool {
     let si = s.index();
-    depths[si] <= depths[b.index()]
+    let depth_ok = depths[si] <= depths[b.index()] || call_in_loop.is_some_and(|c| c[si]);
+    depth_ok
         && (cfg.preds_of(s).iter().all(|&p| !cfg.reachable[p.index()] || in_r[p.index()])
             || (always_active.is_some_and(|aa| aa[si]) && cfg.dominates(b, s)))
 }
@@ -73,6 +82,16 @@ pub(crate) fn sink_frontier(
     (live_in, always_active, b): (&[bool], Option<&[bool]>, Block),
     in_r: &mut [bool],
 ) -> Option<Vec<Block>> {
+    sink_frontier_with_calls(func, cfg, depths, (live_in, always_active, None, b), in_r)
+}
+
+fn sink_frontier_with_calls(
+    func: &Function,
+    cfg: &Cfg,
+    depths: &[u32],
+    (live_in, always_active, call_in_loop, b): (&[bool], Option<&[bool]>, Option<&[bool]>, Block),
+    in_r: &mut [bool],
+) -> Option<Vec<Block>> {
     let n = func.blocks.len();
     loop {
         let mut pruned = false;
@@ -81,8 +100,12 @@ pub(crate) fn sink_frontier(
                 continue;
             }
             let blk = Block(bi as u32);
-            let bad_pred = cfg.preds_of(blk).iter().any(|&p| cfg.reachable[p.index()] && !in_r[p.index()]);
-            let bad_succ = func.successors(blk).any(|s| !in_r[s.index()] && live_in[s.index()] && !target_ok(cfg, depths, always_active, b, in_r, s));
+            let bad_pred = cfg.preds_of(blk).iter().any(|&p| {
+                cfg.reachable[p.index()]
+                    && !in_r[p.index()]
+                    && !(always_active.is_some_and(|aa| aa[p.index()]) && cfg.dominates(b, p))
+            });
+            let bad_succ = func.successors(blk).any(|s| !in_r[s.index()] && live_in[s.index()] && !target_ok(cfg, depths, always_active, call_in_loop, b, in_r, s));
             if bad_pred || bad_succ {
                 (in_r[bi], pruned) = (false, true);
             }
@@ -130,7 +153,7 @@ pub(crate) fn sink_frontier(
     if !skipped_fast || frontier.is_empty() || frontier.len() > 4 {
         return None;
     }
-    frontier.iter().all(|&t| target_ok(cfg, depths, always_active, b, in_r, t)).then_some(frontier)
+    frontier.iter().all(|&t| target_ok(cfg, depths, always_active, call_in_loop, b, in_r, t)).then_some(frontier)
 }
 
 pub(super) fn plan_flag_sink(
@@ -151,6 +174,7 @@ pub(super) fn plan_flag_sink(
         return None;
     }
     let n = func.blocks.len();
+    let has_call: Vec<bool> = (0..n).map(|bi| block_has_unwind_call(func, kinds, Block(bi as u32))).collect();
     let (mut in_r, mut work) = (vec![false; n], vec![b]);
     in_r[b.index()] = true;
     while let Some(u) = work.pop() {
@@ -162,11 +186,21 @@ pub(super) fn plan_flag_sink(
             }
         }
     }
-    sink_frontier(func, cfg, depths, (live_in, Some(always_active), b), &mut in_r).or_else(|| {
+    sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b), &mut in_r).or_else(|| {
         let mut solo = vec![false; n];
         solo[b.index()] = true;
-        sink_frontier(func, cfg, depths, (live_in, Some(always_active), b), &mut solo)
+        sink_frontier_with_calls(func, cfg, depths, (live_in, Some(always_active), Some(&has_call), b), &mut solo)
     })
+}
+
+fn range_covers(w_off: i32, w_bytes: u32, off: i32, bytes: u32) -> bool {
+    let (w0, s0) = (i64::from(w_off), i64::from(off));
+    w0 <= s0 && w0 + i64::from(w_bytes) >= s0 + i64::from(bytes)
+}
+
+fn range_overlaps(a_off: i32, a_bytes: u32, b_off: i32, b_bytes: u32) -> bool {
+    let (a0, b0) = (i64::from(a_off), i64::from(b_off));
+    a0 < b0 + i64::from(b_bytes) && b0 < a0 + i64::from(a_bytes)
 }
 
 pub(super) fn plan_local_sink(
@@ -175,7 +209,7 @@ pub(super) fn plan_local_sink(
     defs: &[Option<Inst>],
     depths: &[u32],
     (flag_visited, local, flag): (&[u8], StackSlot, StackSlot),
-    (b, sinst): (Block, Inst),
+    (b, sinst, store_off, store_bytes): (Block, Inst, i32, u32),
 ) -> Option<Vec<Block>> {
     if flag_visited[b.index()] != 1 {
         return None;
@@ -186,13 +220,22 @@ pub(super) fn plan_local_sink(
     if insts[..pos].iter().any(|&i| sets_flag(&func.insts[i.index()].op)) {
         return None;
     }
-    if insts[pos + 1..].iter().any(|&i| {
-        let op = &func.insts[i.index()].op;
-        matches!(*op, Op::StackLoad(s, _) | Op::StackStore(_, s, _) if s == local)
-            || sets_flag(op)
-            || matches!(*op, Op::Return(..) | Op::Trap)
-    }) {
-        return None;
+    for &i in &insts[pos + 1..] {
+        let data = &func.insts[i.index()];
+        match data.op {
+            Op::StackLoad(s, roff) if s == local && data.result.is_none_or(|r| range_overlaps(roff, func.ty(r).bytes(), store_off, store_bytes)) => {
+                return None;
+            }
+            Op::StackStore(v, s, woff) if s == local && range_covers(woff, func.ty(v).bytes(), store_off, store_bytes) => {
+                return Some(Vec::new());
+            }
+            Op::StackStore(v, s, woff) if s == local && range_overlaps(woff, func.ty(v).bytes(), store_off, store_bytes) => {
+                return None;
+            }
+            Op::Return(..) | Op::Trap => return Some(Vec::new()),
+            ref op if sets_flag(op) => return None,
+            _ => {}
+        }
     }
     let n = func.blocks.len();
     let (mut gen_b, mut kill_b, mut clean_b) = (vec![false; n], vec![false; n], vec![true; n]);
@@ -204,26 +247,26 @@ pub(super) fn plan_local_sink(
             continue;
         }
         for &inst in &func.blocks[bi].insts {
-            let op = &func.insts[inst.index()].op;
-            match *op {
-                Op::StackLoad(s, _) if s == local => {
+            let data = &func.insts[inst.index()];
+            match data.op {
+                Op::StackLoad(s, roff) if s == local && data.result.is_none_or(|r| range_overlaps(roff, func.ty(r).bytes(), store_off, store_bytes)) => {
                     gen_b[bi] = true;
                     clean_b[bi] = false;
                     break;
                 }
-                Op::StackStore(v, s, 0) if s == local && func.ty(v).bytes() == func.slots[local.index()].size => {
+                Op::StackStore(v, s, woff) if s == local && range_covers(woff, func.ty(v).bytes(), store_off, store_bytes) => {
                     kill_b[bi] = true;
                     clean_b[bi] = false;
                     break;
                 }
-                Op::StackStore(_, s, _) if s == local => {
+                Op::StackStore(v, s, woff) if s == local && range_overlaps(woff, func.ty(v).bytes(), store_off, store_bytes) => {
                     clean_b[bi] = false;
                 }
                 Op::Return(..) | Op::Trap => {
                     kill_b[bi] = true;
                     break;
                 }
-                _ if sets_flag(op) => {
+                ref op if sets_flag(op) => {
                     gen_b[bi] = true;
                     clean_b[bi] = false;
                     break;
@@ -243,6 +286,9 @@ pub(super) fn plan_local_sink(
                 (live_in[bi], changed) = (inp, true);
             }
         }
+    }
+    if !func.successors(b).any(|s| live_in[s.index()]) {
+        return Some(Vec::new());
     }
     let (mut in_r, mut work) = (vec![false; n], vec![b]);
     in_r[b.index()] = true;

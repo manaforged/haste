@@ -48,7 +48,7 @@ pub(super) fn loc_immutable(func: &Function, loc: MemLoc) -> bool {
     }
 }
 
-/// Whether `op` may overwrite `loc`, treating immutable `.rodata` and non-atomic `ReadonlyParam` accesses as un-clobbered by calls or alien stores.
+/// Whether `op` may overwrite `loc`, treating immutable `.rodata` and `Freeze` `ReadonlyParam` accesses as un-clobbered by calls, alien stores, or non-aliasing atomics.
 pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
     if is_rodata(func, loc) {
         return false;
@@ -59,12 +59,16 @@ pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: 
                 let w = prov.loc(addr, i64::from(off), func.ty(val).bytes());
                 w.root == loc.root && may_alias(w, loc, prov)
             }
+            Op::AtomicStore(val, addr, _) | Op::AtomicRmw(_, _, addr, val) | Op::AtomicCas(_, addr, _, val) => {
+                let w = prov.loc(addr, 0, func.ty(val).bytes());
+                w.root == loc.root && may_alias(w, loc, prov)
+            }
             Op::Move(dst, _, bytes) => {
                 let w = prov.loc(dst, 0, bytes);
                 w.root == loc.root && may_alias(w, loc, prov)
             }
             Op::Copy(dst, ..) => prov.loc(dst, 0, u32::MAX).root == loc.root,
-            _ => is_atomic_barrier(op),
+            _ => false,
         };
     }
     clobbers_load(func, (op, at), loc, prov)

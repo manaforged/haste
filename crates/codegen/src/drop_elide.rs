@@ -468,7 +468,7 @@ fn narrow_unwind_drops(
             if !u.indirect && u.local != u.flag && li < nslots && local_uses[li] == 1 && !slot_escaped[li] {
                 for &(lb, linst, val, off) in &local_stores[li] {
                     if !remove[linst.index()]
-                        && let Some(frontier) = plan_local_sink(func, &cfg, defs, depths, (&flag_visited, u.local, u.flag), (lb, linst))
+                        && let Some(frontier) = plan_local_sink(func, &cfg, defs, depths, (&flag_visited, u.local, u.flag), (lb, linst, off, func.ty(val).bytes()))
                     {
                         remove[linst.index()] = true;
                         for t in frontier {
