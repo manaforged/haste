@@ -79,7 +79,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         (_, true) => &REGS,
         (_, false) => &REGS_RBP,
     };
-    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let frame_cache = target.direct_calls && target.os == crate::target::Os::Linux;
+    let preserve_tc = frame_cache && abi_kind == CallAbi::SysV;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (target.effort == crate::Effort::Full, preserve_tc), |sig| classify(sig, abi_kind))?;
     let func = split.as_ref().unwrap_or(func);
     let features = Features::host();
     let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
@@ -88,7 +90,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
-    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS);
+    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |op| preserve_tc && crate::alloc::cold_thread_cell_op(func, op, &plan.through, &plan.locations, &plan.elided).is_some());
     let (base, bias) = if framed && !keeps { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
@@ -127,7 +129,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         features,
         copied,
         direct_calls: target.direct_calls,
-        frame_cache: target.direct_calls && target.os == crate::target::Os::Linux,
+        frame_cache,
         cold_calls: Vec::new(),
         shrink,
         in_fast: false,
@@ -653,11 +655,7 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
-        if !is_try
-            && let Some(CallTarget::Symbol(lookup)) = direct
-            && self.func.is_thread_cell(callee)
-            && self.thread_cell_cold(lookup, args)
-        {
+        if !is_try && self.thread_cell_cold(callee, args) {
             self.clobber_call_spills();
             return Ok(abi);
         }

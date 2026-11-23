@@ -36,12 +36,12 @@ fn pure_value<R: Copy + PartialEq>(
     }
 }
 
-fn pure_op(op: &Op) -> bool {
-    !matches!(
-        op,
-        Op::StackAddr(..) | Op::StackLoad(..) | Op::StackStore(..) | Op::FramePointer
-            | Op::Call { .. } | Op::TryCall { .. } | Op::Copy(..) | Op::Move(..) | Op::Trap | Op::Trapz(..)
-    )
+fn pure_op(op: &Op, fast_call: &impl Fn(&Op) -> bool) -> bool {
+    match op {
+        Op::Call { .. } => fast_call(op),
+        Op::StackAddr(..) | Op::StackLoad(..) | Op::StackStore(..) | Op::FramePointer | Op::TryCall { .. } | Op::Copy(..) | Op::Move(..) | Op::Trap | Op::Trapz(..) => false,
+        _ => true,
+    }
 }
 
 fn pure_block<R: Copy + PartialEq>(
@@ -51,6 +51,7 @@ fn pure_block<R: Copy + PartialEq>(
     plan: &Plan<R>,
     frame: &Frame<R>,
     clobbers: &[R],
+    fast_call: &impl Fn(&Op) -> bool,
 ) -> bool {
     let data = &func.blocks[block.index()];
     let Some((&term, body)) = data.insts.split_last() else { return false };
@@ -60,7 +61,7 @@ fn pure_block<R: Copy + PartialEq>(
     }
     for &inst in body {
         let id = &func.insts[inst.index()];
-        let mut ok = pure_op(&id.op) && id.result.is_none_or(ok_val);
+        let mut ok = pure_op(&id.op, fast_call) && crate::live::results(id).all(ok_val);
         id.op.for_operands(|v| ok &= ok_val(v));
         if !ok {
             return false;
@@ -95,6 +96,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(
     frame: &Frame<R>,
     params: &[Loc<R>],
     clobbers: &[R],
+    fast_call: impl Fn(&Op) -> bool,
 ) -> Option<ShrinkWrap> {
     if !framed || func.signature.params.iter().any(|p| p.purpose == ArgumentPurpose::StructReturn) {
         return None;
@@ -112,7 +114,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(
     }
     let n = func.blocks.len();
     let mut fast: Vec<bool> = (0..n)
-        .map(|i| cfg.reachable[i] && pure_block(func, &defs, Block(i as u32), plan, frame, clobbers))
+        .map(|i| cfg.reachable[i] && pure_block(func, &defs, Block(i as u32), plan, frame, clobbers, &fast_call))
         .collect();
     if !fast[entry.index()] {
         return None;
@@ -151,7 +153,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(
             let b = Block(i as u32);
             !fast[i] && cfg.reachable[i] && func.blocks[i].insts.len() == 1
                 && matches!(func.last(b), Some(Op::Return(_)))
-                && pure_block(func, &defs, b, plan, frame, clobbers)
+                && pure_block(func, &defs, b, plan, frame, clobbers, &fast_call)
         })
         .collect();
     for i in 0..n {

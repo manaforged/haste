@@ -346,10 +346,11 @@ impl Emit<'_> {
             { let cond = self.compare(cc, a, b); self.asm.csinv(size, cond.invert(), dst, ZR, ZR); return Ok(()); }
             if matches!(alu, Alu::Add | Alu::Sub) && matches!(ty, Type::I32 | Type::I64) {
                 let ext_of = |v: Value| super::fuse::ext_parts(self.func, &self.plan, ty, v, |d| self.defs[d.index()]);
+                let other_ok = |other: Value| !self.plan.elided[other.index()] || self.peel_uextend(other) != other;
                 let ext = if alu == Alu::Add && super::fuse::ext_swapped(self.func, &self.plan, (x, y), &|v| self.defs[v.index()]) {
                     ext_of(x).map(|e| (y, e))
                 } else {
-                    ext_of(y).map(|e| (x, e)).or_else(|| (alu == Alu::Add).then(|| ext_of(x).map(|e| (y, e))).flatten())
+                    ext_of(y).filter(|_| other_ok(x)).map(|e| (x, e)).or_else(|| (alu == Alu::Add).then(|| ext_of(x).filter(|_| other_ok(y)).map(|e| (y, e))).flatten())
                 };
                 if let Some((other, (ext_op, shift, inner))) = ext {
                     let (left, right) = self.bits_pair(self.peel_uextend(other), inner); self.asm.alu_extended(alu, size, ext_op, shift, dst, left, right); return Ok(());

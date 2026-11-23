@@ -1,13 +1,13 @@
 use super::Emit;
-use super::asm::{Asm, Cond, Label, Mem, Reg, Size};
-use crate::alloc::CallTarget;
+use super::asm::{Alu, Asm, Cond, Label, Mem, Reg, Size};
+use crate::alloc::{CallTarget, Location};
 use crate::CallAbi;
-use crate::ir::{Op, Value};
+use crate::ir::{ArgumentPurpose, Op, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
 
 pub(super) enum ColdCall {
     Frame(Label, Label, StencilReloc),
-    ThreadCell(Label, Label, u32, [Value; 3]),
+    ThreadCell(Label, Label, u32, [Value; 3], bool),
 }
 
 impl Asm {
@@ -83,12 +83,14 @@ impl Emit<'_> {
         Some(hit)
     }
 
-    /// Reads a thread cell inline with a straight-line fast path and an out-of-line cold miss stub when all arguments are static.
-    pub(super) fn thread_cell_cold(&mut self, lookup: u32, args: &[Value]) -> bool {
-        let [slot, size, init] = *args else { return false };
-        if self.abi_kind != CallAbi::SysV || !args.iter().all(|&a| self.is_static(a)) {
+    /// Reads a thread cell inline with a straight-line fast path and a register-preserving out-of-line cold miss stub when all arguments are static.
+    pub(super) fn thread_cell_cold(&mut self, callee: Value, args: &[Value]) -> bool {
+        if self.abi_kind != CallAbi::SysV || !self.frame_cache {
             return false;
         }
+        let Some((lookup, [slot, size, init])) = crate::alloc::cold_thread_cell(self.func, (callee, args), &self.plan.through, &self.plan.locations, &self.plan.elided) else {
+            return false;
+        };
         let Some(target_sym) = self.thread_cell_sym(slot, lookup) else { return false };
         let (cold, back) = (self.asm.label(), self.asm.label());
         let at = self.asm.fs_quad(0x8B, Reg::Rax as u8, 0, None);
@@ -96,7 +98,7 @@ impl Emit<'_> {
         self.asm.test(Reg::Rax, Reg::Rax);
         self.asm.jcc(Cond::E, cold);
         self.asm.bind(back);
-        self.cold_calls.push(ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]));
+        self.cold_calls.push(ColdCall::ThreadCell(cold, back, lookup, [slot, size, init], !self.framed || self.in_fast));
         true
     }
 
@@ -116,14 +118,23 @@ impl Emit<'_> {
                     self.relocs.push(StencilReloc { offset, ..target });
                     self.asm.jmp(back);
                 }
-                ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]) => {
+                ColdCall::ThreadCell(cold, back, lookup, [slot, size, init], base_unaligned) => {
                     self.asm.bind(cold);
+                    let has_dict = self.func.signature.params.iter().any(|p| p.purpose == ArgumentPurpose::Dict);
+                    let saved: Vec<Reg> = super::REGS.leaf.iter().copied()
+                        .filter(|&r| (has_dict && super::REGS.dict == Some(r)) || self.plan.locations.iter().any(|loc| matches!(loc, Location::Reg(at) if *at == r)))
+                        .collect();
+                    let needs_align = base_unaligned ^ (saved.len() % 2 == 1);
+                    for &r in &saved { self.asm.push(r); }
+                    if needs_align { self.asm.alu_imm(Alu::Sub, Reg::Rsp, 8); }
                     self.raw(Reg::Rdi, slot);
                     self.raw(Reg::Rsi, size);
                     self.raw(Reg::Rdx, init);
                     self.asm.flags_overwritten();
                     let offset = self.asm.call_pcrel32();
                     self.relocs.push(StencilReloc::symbol(offset, lookup, RelocKind::PcRel32));
+                    if needs_align { self.asm.alu_imm(Alu::Add, Reg::Rsp, 8); }
+                    for &r in saved.iter().rev() { self.asm.pop(r); }
                     self.asm.jmp(back);
                 }
             }

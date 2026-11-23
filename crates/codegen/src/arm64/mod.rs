@@ -86,7 +86,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let lse = target.os == Os::Darwin;
     let regs = if lse { &REGS_LSE } else { &REGS };
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (target.effort == crate::Effort::Full, false), |sig| classify(sig, packing))?;
     let func = split.as_ref().unwrap_or(func);
     let defs = crate::fold::defs(func);
     let dropped = |plan: &crate::alloc::Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
@@ -98,7 +98,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let lr = plan.locations.iter().any(|loc| matches!(loc, Location::Reg(LR)));
     let bracket = !lr && crate::frame::brackets_calls(func, &frame, &abi);
     framed = (framed || lr) && !bracket;
-    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
+    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP], |_| false);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let emit = Emit {

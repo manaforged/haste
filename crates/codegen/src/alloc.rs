@@ -491,9 +491,45 @@ fn int_class<'a, R: Copy + PartialEq>(
     Class { saved: regs.saved, leaf, arrivals, passed, clobbers }
 }
 
-fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, bool)>>) -> Class<'static, u8> {
+/// Returns `(lookup, [slot, size, init])` when a non-try `ThreadCell` call has static arguments eligible for inline TLS with register-preserving cold miss stub.
+pub(crate) fn cold_thread_cell<R>(
+    func: &Function,
+    (callee, args): (Value, &[Value]),
+    through: &[Option<CallTarget>],
+    locations: &[Location<R>],
+    elided: &[bool],
+) -> Option<(u32, [Value; 3])> {
+    let Some(CallTarget::Symbol(lookup)) = through[callee.index()] else { return None };
+    if !func.is_thread_cell(callee) {
+        return None;
+    }
+    let [slot, size, init] = *args else { return None };
+    let static_ok = |v: Value| !elided[v.index()] && matches!(locations[v.index()], Location::Imm(_) | Location::Symbol(_) | Location::SlotAddr(_));
+    if !(static_ok(slot) && static_ok(size) && static_ok(init)) {
+        return None;
+    }
+    matches!(locations[slot.index()], Location::Symbol(_) | Location::Imm(0)).then_some((lookup, [slot, size, init]))
+}
+
+pub(crate) fn cold_thread_cell_op<R>(
+    func: &Function,
+    op: &Op,
+    through: &[Option<CallTarget>],
+    locations: &[Location<R>],
+    elided: &[bool],
+) -> Option<(u32, [Value; 3])> {
+    let Op::Call { callee, args, .. } = op else { return None };
+    cold_thread_cell(func, (*callee, args), through, locations, elided)
+}
+
+fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, bool)>>, preserved_calls: &[u32]) -> Class<'static, u8> {
     let arrivals = params.iter().map(|loc| match *loc { Loc::Float(reg) => vec![reg], _ => Vec::new() }).collect();
-    Class { saved: regs.saved_float, leaf: regs.float.to_vec(), arrivals, passed, clobbers: Vec::new() }
+    let clobbers = if preserved_calls.is_empty() || regs.float.is_empty() {
+        Vec::new()
+    } else {
+        vec![(regs.float, preserved_calls.iter().map(|&at| crate::live::Range { start: at - 1, end: at - 1 }).collect())]
+    };
+    Class { saved: regs.saved_float, leaf: regs.float.to_vec(), arrivals, passed, clobbers }
 }
 
 const BASE_WEIGHT: u64 = 8;
@@ -555,7 +591,7 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
 pub(crate) fn plan<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
-    (order, copied, weighed): (&[Block], &[bool], bool),
+    (order, copied, weighed, preserve_tc): (&[Block], &[bool], bool, bool),
     (params, split): (&[Loc<R>], &[(Value, u64)]),
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Plan<R> {
@@ -577,7 +613,12 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let promoted_syms = regs.absolute_calls.then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
-    let live = live(func, order, copied, &tracked, eff);
+    let preserved_tc: Vec<bool> = if preserve_tc && func.has_thread_cell() {
+        func.insts.iter().map(|d| cold_thread_cell_op(func, &d.op, &through, &locations, &elided).is_some()).collect()
+    } else {
+        Vec::new()
+    };
+    let live = live(func, order, copied, &tracked, eff, &preserved_tc);
     let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches, regs.two_address)).collect();
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
@@ -601,7 +642,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
             locations[v] = loc;
         }
     }
-    let (float_homes, used_floats) = allocate(func, &live, &float_class(regs, params, passed_floats), &floats, &hints);
+    let (float_homes, used_floats) = allocate(func, &live, &float_class(regs, params, passed_floats, &live.preserved_calls), &floats, &hints);
     place(&mut locations, float_homes, Location::Float);
     for data in &func.insts {
         if let (Op::Const(0), Some(res)) = (&data.op, data.result)
