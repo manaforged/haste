@@ -1,36 +1,34 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, StackSlot};
 
-use super::{CalleeKind, store_clears_active};
+use super::{CalleeKind, FlagOp, classify_flag_op, store_clears_active};
 
-pub(super) fn flag_call_liveness(func: &Function, cfg: &Cfg, defs: &[Option<Inst>], kinds: &[CalleeKind], flag: StackSlot) -> (Vec<bool>, Vec<bool>) {
+pub(super) fn flag_call_liveness(
+    func: &Function,
+    cfg: &Cfg,
+    defs: &[Option<Inst>],
+    kinds: &[CalleeKind],
+    removed: &[bool],
+    flag: StackSlot,
+) -> (Vec<bool>, Vec<bool>) {
     let n = func.blocks.len();
     let (mut gen_b, mut kill_b) = (vec![false; n], vec![false; n]);
     for &b in &cfg.rpo {
         let bi = b.index();
         for &inst in &func.blocks[bi].insts {
-            match func.insts[inst.index()].op {
-                Op::Call { .. } if kinds[inst.index()] == CalleeKind::MayUnwind => {
+            if removed[inst.index()] {
+                continue;
+            }
+            match classify_flag_op(func, defs, kinds, flag, inst) {
+                Some(FlagOp::MayUnwindCall | FlagOp::TryCall | FlagOp::Load) => {
                     gen_b[bi] = true;
                     break;
                 }
-                Op::TryCall { .. } => {
-                    gen_b[bi] = true;
-                    break;
-                }
-                Op::StackLoad(s, _) if s == flag => {
-                    gen_b[bi] = true;
-                    break;
-                }
-                Op::Return(..) | Op::Trap => {
+                Some(FlagOp::Exit | FlagOp::Clear) => {
                     kill_b[bi] = true;
                     break;
                 }
-                Op::StackStore(v, s, 0) if s == flag && store_clears_active(func, defs, v) => {
-                    kill_b[bi] = true;
-                    break;
-                }
-                _ => {}
+                Some(FlagOp::Set) | None => {}
             }
         }
     }

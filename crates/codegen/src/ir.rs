@@ -592,9 +592,13 @@ impl Function {
         !self.vtable_slots.is_empty()
     }
 
+    pub(crate) fn block_has_call(&self, block: Block) -> bool {
+        self.blocks[block.index()].insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. }))
+    }
+
     /// Whether this function contains any `Call` or `TryCall` instruction.
     pub fn has_call(&self) -> bool {
-        self.blocks.iter().any(|b| b.insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. })))
+        (0..self.blocks.len()).any(|b| self.block_has_call(Block(b as u32)))
     }
 
     /// Marks relocation symbol `sym` as guaranteed not to unwind.

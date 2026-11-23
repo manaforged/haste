@@ -697,9 +697,6 @@ pub(crate) fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(
     match &func.insts[last.index()].op { Op::Jump(target, args) => f(*target, args), Op::Brif(_, then, then_args, otherwise, else_args) => { f(*then, then_args); f(*otherwise, else_args); } _ => {} }
 }
 
-fn pinned(func: &Function, entry: Block) -> Vec<bool> { unused::pinned(func, entry) }
-fn drop_params(func: &mut Function, fold: &Fold) -> bool { unused::drop_params(func, &fold.subst) }
-
 /// The instruction in a block that defines each value.
 pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     let mut defs = vec![None; func.types.len()];
@@ -785,9 +782,9 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let Some(entry) = func.entry else { return Domain::NONE };
     let count = func.types.len();
     let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: Vec::new(), mixed: Vec::new(), defs: defs(func) };
-    let pinned = pinned(func, entry);
+    let pinned = unused::pinned(func, entry);
     let (mut changed, mut cfg_changed) = settle_cfg_and_params(func, &mut fold, entry, effort, &pinned);
-    let (dropped_params, mut body_changed) = (drop_params(func, &fold), false);
+    let (dropped_params, mut body_changed) = (unused::drop_params(func, &fold.subst), false);
     for b in 0..func.blocks.len() { for idx in 0..func.blocks[b].insts.len() { body_changed |= rewrite_folded_inst(func, &fold, func.blocks[b].insts[idx]); } }
     body_changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | unused::dead(func);
     changed |= body_changed;

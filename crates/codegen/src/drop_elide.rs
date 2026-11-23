@@ -51,6 +51,19 @@ pub(super) fn store_clears_active(func: &Function, defs: &[Option<Inst>], val: V
     }
 }
 
+pub(super) enum FlagOp { MayUnwindCall, TryCall, Load, Clear, Set, Exit }
+
+pub(super) fn classify_flag_op(func: &Function, defs: &[Option<Inst>], kinds: &[CalleeKind], flag: StackSlot, inst: Inst) -> Option<FlagOp> {
+    match func.insts[inst.index()].op {
+        Op::Call { .. } if kinds[inst.index()] == CalleeKind::MayUnwind => Some(FlagOp::MayUnwindCall),
+        Op::TryCall { .. } => Some(FlagOp::TryCall),
+        Op::StackLoad(s, _) if s == flag => Some(FlagOp::Load),
+        Op::StackStore(v, s, 0) if s == flag => Some(if store_clears_active(func, defs, v) { FlagOp::Clear } else { FlagOp::Set }),
+        Op::Return(..) | Op::Trap => Some(FlagOp::Exit),
+        _ => None,
+    }
+}
+
 impl Function {
     /// Alignment shift of stack slot `slot`.
     pub fn slot_align_shift(&self, slot: StackSlot) -> u8 {
@@ -477,7 +490,7 @@ fn narrow_unwind_drops(
         });
         let Some(live_calls) = narrow_calls else {
             mark_dead_zeros(&mut remove, &dead_zeros, keep_zero.as_deref(), fi);
-            let (live_in, live_out) = flag_call_liveness(func, &cfg, defs, kinds, u.flag);
+            let (live_in, live_out) = flag_call_liveness(func, &cfg, defs, kinds, &remove, u.flag);
             let kept_entry = keep_zero.as_deref().and_then(|kz| kz[fi]);
             let mut visited_blocks = Vec::new();
             for &(sb, _, _) in stores {
@@ -487,20 +500,21 @@ fn narrow_unwind_drops(
                 visited_blocks.push(sb);
                 let mut live = live_out[sb.index()];
                 for &inst in func.blocks[sb.index()].insts.iter().rev() {
-                    match func.insts[inst.index()].op {
-                        Op::Return(..) | Op::Trap => live = false,
-                        Op::Call { .. } if kinds[inst.index()] == CalleeKind::MayUnwind => live = true,
-                        Op::TryCall { .. } => live = true,
-                        Op::StackLoad(s, _) if s == u.flag => live = true,
-                        Op::StackStore(v, s, 0) if s == u.flag => {
+                    if remove[inst.index()] {
+                        continue;
+                    }
+                    match classify_flag_op(func, defs, kinds, u.flag, inst) {
+                        Some(FlagOp::Exit) => live = false,
+                        Some(FlagOp::MayUnwindCall | FlagOp::TryCall | FlagOp::Load) => live = true,
+                        Some(op @ (FlagOp::Clear | FlagOp::Set)) => {
                             if !live && kept_entry != Some(inst) {
                                 remove[inst.index()] = true;
                             }
-                            if store_clears_active(func, defs, v) {
+                            if matches!(op, FlagOp::Clear) && !remove[inst.index()] {
                                 live = false;
                             }
                         }
-                        _ => {}
+                        None => {}
                     }
                 }
             }
@@ -678,40 +692,23 @@ fn walk_flag_cfg(
     while let Some((block, mut active)) = work.pop() {
         let mut stopped = false;
         for &inst in &func.blocks[block.index()].insts {
-            match &func.insts[inst.index()].op {
-                Op::Call { .. } if kinds[inst.index()] == CalleeKind::MayUnwind => {
-                    if on_event(FlagEvent::Call(inst, active)) {
-                        return (true, visited);
-                    }
+            match classify_flag_op(func, defs, kinds, flag, inst) {
+                Some(FlagOp::MayUnwindCall) => if on_event(FlagEvent::Call(inst, active)) { return (true, visited); },
+                Some(FlagOp::TryCall) => if on_event(FlagEvent::TryCall(active)) { return (true, visited); },
+                Some(FlagOp::Load) => if on_event(FlagEvent::Load(inst, active)) { return (true, visited); },
+                Some(FlagOp::Clear) => {
+                    if on_event(FlagEvent::Clear(inst, active)) { return (true, visited); }
+                    active = false;
                 }
-                Op::TryCall { .. } => {
-                    if on_event(FlagEvent::TryCall(active)) {
-                        return (true, visited);
-                    }
+                Some(FlagOp::Set) => {
+                    if on_event(FlagEvent::Set(inst, active)) { return (true, visited); }
+                    active = true;
                 }
-                &Op::StackLoad(s, 0) if s == flag => {
-                    if on_event(FlagEvent::Load(inst, active)) {
-                        return (true, visited);
-                    }
-                }
-                &Op::StackStore(v, s, 0) if s == flag => {
-                    if store_clears_active(func, defs, v) {
-                        if on_event(FlagEvent::Clear(inst, active)) {
-                            return (true, visited);
-                        }
-                        active = false;
-                    } else {
-                        if on_event(FlagEvent::Set(inst, active)) {
-                            return (true, visited);
-                        }
-                        active = true;
-                    }
-                }
-                Op::Return(..) | Op::Trap => {
+                Some(FlagOp::Exit) => {
                     stopped = true;
                     break;
                 }
-                _ => {}
+                None => {}
             }
         }
         if stopped {

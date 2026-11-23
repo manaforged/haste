@@ -316,10 +316,6 @@ fn thread_repaired_joins(func: &mut Function, defs_cache: &mut Option<Vec<Option
     any
 }
 
-fn has_call(func: &Function, block: Block) -> bool {
-    func.blocks[block.index()].insts.iter().any(|&inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. }))
-}
-
 fn defs_local_only(func: &Function, blocks: &[Block]) -> bool {
     let mut own = vec![false; func.types.len()];
     for &b in blocks {
@@ -419,7 +415,7 @@ fn find_correlated_join(func: &Function, defs_cache: &mut Option<Vec<Option<Inst
                 || !cfg.dominates(disp, to)
                 || cfg.dominates(to, pred)
                 || func.blocks[to.index()].insts.len() > 6
-                || has_call(func, to)
+                || func.block_has_call(to)
             {
                 continue;
             }
@@ -433,7 +429,7 @@ fn find_correlated_join(func: &Function, defs_cache: &mut Option<Vec<Option<Inst
                     || cfg.single_pred(mid) != Some(to)
                     || !func.blocks[mid.index()].params.is_empty()
                     || func.blocks[mid.index()].insts.len() > 6
-                    || has_call(func, mid)
+                    || func.block_has_call(mid)
                     || !defs_local_only(func, &[to, mid])
                 {
                     continue;
