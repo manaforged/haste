@@ -96,7 +96,7 @@ fn direct_may_unwind(cx: &mut Context<'_>, reached: &Reached, index: usize, body
     };
     match &typed.shape {
         Shape::Virtual(_) | Shape::Asm(_) | Shape::Anon(_) => return true,
-        Shape::Untuple(Res::Fn(..)) | Shape::Clone(_) | Shape::Ctor(_) => {}
+        Shape::Untuple(Res::Fn(..)) | Shape::Clone(_) | Shape::Ctor(_) | Shape::GlobalAlloc(_) => {}
         Shape::Untuple(_) => return true,
         Shape::Glue(_) => {
             if let Some(&ty) = cx.types.substs(*substs).first()

@@ -146,13 +146,13 @@ impl Image {
             let mut eval_requests = Vec::new();
             for (shard, output) in current_shards.iter().zip(outputs) {
                 match output {
-                    Some((pass, failed, later, reqs)) => {
+                    Ok((pass, failed, later, reqs)) => {
                         self.pass.merge(pass);
                         errors.extend(failed);
                         deferred.extend(later);
                         eval_requests.extend(reqs);
                     }
-                    None => errors.extend(self.lost(cx, reached, shard)),
+                    Err(reason) => errors.extend(self.lost(cx, reached, shard, &reason)),
                 }
             }
             if deferred.is_empty() || eval_requests.is_empty() || wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < min_parallel {
@@ -175,23 +175,33 @@ impl Image {
         errors
     }
 
-    /// Clears the slots of a worker that panicked, whose code chunks unmapped as it unwound, and gives each of its functions an error.
-    fn lost(&self, cx: &Context<'_>, reached: &Reached, shard: &[Vec<usize>]) -> Vec<(usize, String)> {
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+/// Clears the slots of a worker that panicked, whose code chunks unmapped as it unwound, and gives each of its functions an error.
+    fn lost(&self, cx: &Context<'_>, reached: &Reached, shard: &[Vec<usize>], reason: &str) -> Vec<(usize, String)> {
         let lost = shard.iter().flatten().map(|&index| {
             if self.backend.is_jit() {
                 self.slot(index).store(0, Ordering::Release);
             }
-            (index, format!("{}: compile worker panicked", cx.name(reached.list[index].0.0)))
+            (index, format!("{}: compile worker panicked: {reason}", cx.name(reached.list[index].0.0)))
         });
         lost.collect()
     }
 
-    /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, and gives what each thread returned, or `None` for one that panicked.
-    pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Option<T>> {
+    /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, returning each thread's value or its panic payload message.
+    pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Result<T, String>> {
         let work = &work;
         std::thread::scope(|scope| {
             let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || work(fork, shard))).collect();
-            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
+            handles.into_iter().map(|handle| handle.join().map_err(Self::panic_message)).collect()
         })
     }
 

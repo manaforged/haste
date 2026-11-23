@@ -299,6 +299,15 @@ fn entry_first_zeros(func: &Function, defs: &[Option<Inst>], entry: Block, nslot
     first
 }
 
+fn mark_dead_zeros(remove: &mut [bool], dead_zeros: &[Inst], keep_zero: Option<&[Option<Inst>]>, fi: usize) {
+    let kept = keep_zero.and_then(|kz| kz[fi]);
+    for &zinst in dead_zeros {
+        if kept != Some(zinst) {
+            remove[zinst.index()] = true;
+        }
+    }
+}
+
 fn narrow_unwind_drops(
     func: &mut Function,
     entry: Block,
@@ -377,11 +386,7 @@ fn narrow_unwind_drops(
                 && lc.iter().map(|&(b, _)| depths[b.index()]).max().unwrap_or(0) <= arm_blocks.iter().map(|&b| depths[b.index()]).min().unwrap_or(0)
         });
         let Some(live_calls) = narrow_calls else {
-            for zinst in dead_zeros {
-                if keep_zero.as_ref().and_then(|kz| kz[fi]) != Some(zinst) {
-                    remove[zinst.index()] = true;
-                }
-            }
+            mark_dead_zeros(&mut remove, &dead_zeros, keep_zero.as_deref(), fi);
             continue;
         };
         let flag_needs_narrow = arm_blocks.iter().any(|ab| !live_calls.iter().any(|&(cb, _)| cb == *ab));
@@ -416,11 +421,7 @@ fn narrow_unwind_drops(
             }
         }
         if !flag_needs_narrow && sink_local.is_empty() {
-            for zinst in dead_zeros {
-                if keep_zero.as_ref().and_then(|kz| kz[fi]) != Some(zinst) {
-                    remove[zinst.index()] = true;
-                }
-            }
+            mark_dead_zeros(&mut remove, &dead_zeros, keep_zero.as_deref(), fi);
             continue;
         }
         if flag_needs_narrow {

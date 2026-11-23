@@ -298,14 +298,10 @@ pub(super) fn classify_uses(
             unwind_write_only[u.local.index()] = true;
         }
     }
-    let mut is_const = vec![false; n];
+    let is_const: Vec<bool> = func.const_values().into_iter().map(|c| c.is_some()).collect();
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
-            let data = &func.insts[inst.index()];
-            if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
-                is_const[res.index()] = true;
-            }
-            if let Op::StackLoad(slot, _) | Op::StackAddr(slot, _) = data.op {
+            if let Op::StackLoad(slot, _) | Op::StackAddr(slot, _) = func.insts[inst.index()].op {
                 unwind_write_only[slot.index()] = false;
             }
         }

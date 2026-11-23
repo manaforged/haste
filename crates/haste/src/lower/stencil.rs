@@ -642,7 +642,7 @@ fn body_arena(cx: &mut Context<'_>, source: ItemRef, shape: &Shape) -> Result<Ar
     match shape {
         Shape::Body | Shape::Closure(_) => Ok(Arena::Body(cx.body(source)?)),
         Shape::Anon(anon) => Ok(anon.arena.clone()),
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) | Shape::Asm(_) => Ok(Arena::Body(Arc::default())),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) | Shape::Asm(_) | Shape::GlobalAlloc(_) => Ok(Arena::Body(Arc::default())),
     }
 }
 

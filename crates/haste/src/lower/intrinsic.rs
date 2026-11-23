@@ -72,13 +72,58 @@ impl Lower<'_, '_> {
         self.close();
     }
 
-    /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
-    pub(super) fn call_host(&mut self, host: HostSymbol, args: &[Value], ret: Option<Type>) -> Option<Value> {
-        let fresh_alloc = matches!(host, HostSymbol::Alloc | HostSymbol::AllocZeroed);
-        let code = self.emit_symbol(SymbolSource::Host(host));
-        if fresh_alloc {
+    /// Marks `code` as a pure fresh-heap allocator when `host` is an allocator symbol and no custom `#[global_allocator]` is installed.
+    pub(super) fn mark_if_fresh_alloc(&mut self, host: &HostSymbol, code: Value) {
+        if host.is_fresh_alloc() && self.cx.global_allocator().is_none() {
             self.b.func.mark_fresh_alloc(code);
         }
+    }
+
+    /// Lowers a `__rust_*alloc*` shim by dispatching to the crate graph's `#[global_allocator]` static.
+    pub(super) fn global_alloc_body(&mut self, shim: crate::sema::infer::GlobalAllocShim) -> Result<Option<Value>> {
+        use crate::sema::infer::Res;
+        use crate::sema::traits::GlobalAllocOp;
+        let Res::Fn(alloc_static, _) = shim.allocator else { bail!("global allocator shim has no static") };
+        let Res::Fn(method_item, method_substs) = shim.method else { bail!("global allocator shim has no method") };
+        let alloc_place = self.static_place((alloc_static, crate::sema::substs::Substs::EMPTY), shim.alloc_ty)?;
+        let self_ref = self.address(alloc_place);
+        let param_word = |this: &mut Self, idx: usize| -> Result<Value> {
+            let Some(place) = this.locals.get(idx).copied().flatten() else { bail!("global allocator shim missing param {idx}") };
+            let scalar = match place.repr {
+                Repr::Scalar(_) => place,
+                Repr::Mem { .. } => place.at(0, Repr::Scalar(Type::I64)),
+                Repr::Zst => bail!("global allocator shim param {idx} is zero-sized"),
+            };
+            this.read(scalar).ok_or_else(|| anyhow::anyhow!("global allocator shim param {idx} has no value"))
+        };
+        let (ptr, size, align, new_size) = match shim.op {
+            GlobalAllocOp::Alloc | GlobalAllocOp::AllocZeroed => (None, param_word(self, 0)?, param_word(self, 1)?, None),
+            GlobalAllocOp::Dealloc => (Some(param_word(self, 0)?), param_word(self, 1)?, param_word(self, 2)?, None),
+            GlobalAllocOp::Realloc => (Some(param_word(self, 0)?), param_word(self, 1)?, param_word(self, 2)?, Some(param_word(self, 3)?)),
+        };
+        let lrepr = repr(self.cx, shim.layout_ty)?;
+        let Some(slot) = self.slot(lrepr) else { bail!("Layout has no stack slot") };
+        let lo = self.cx.layout(shim.layout_ty)?;
+        let size_off = lo.fields.offset(0).bytes() as i32;
+        let align_off = lo.fields.offset(1).bytes() as i32;
+        self.ins().stack_store(size, slot, size_off);
+        self.ins().stack_store(align, slot, align_off);
+        let layout_val = self.read(super::place::Place::slot(slot, lrepr)).ok_or_else(|| anyhow::anyhow!("Layout has no value"))?;
+        let mut args = vec![self_ref];
+        if let Some(p) = ptr {
+            args.push(p);
+        }
+        args.push(layout_val);
+        if let Some(ns) = new_size {
+            args.push(ns);
+        }
+        self.invoke(SiteOrigin::Known(method_item, method_substs), method_item, method_substs, args)
+    }
+
+    /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
+    pub(super) fn call_host(&mut self, host: HostSymbol, args: &[Value], ret: Option<Type>) -> Option<Value> {
+        let code = self.emit_symbol(SymbolSource::Host(host.clone()));
+        self.mark_if_fresh_alloc(&host, code);
         let mut signature = Signature::new(CallConv::Native);
         signature.params.extend(args.iter().map(|&arg| AbiParam::new(self.b.func.ty(arg))));
         signature.returns.extend(ret.map(AbiParam::new));

@@ -41,7 +41,7 @@ impl Image {
         let shards = lpt_shards(bucket_work(reached, &work), crate::jobs());
         let forks = shards.iter().map(|_| cx.fork()).collect();
         let made = self.run_shards(forks, &shards, |mut fork, shard| shard.iter().flat_map(|bucket| self.ready_bucket(&mut fork, reached, bucket)).collect::<Vec<_>>());
-        self.pass.ready = made.into_iter().flatten().flatten().collect();
+        self.pass.ready = made.into_iter().filter_map(Result::ok).flatten().collect();
         work.retain(|index| self.pass.ready.contains_key(index));
         let compiled = work.into_iter().filter_map(|index| self.compile_one(cx, reached, index).ok().map(|code| (index, code))).collect();
         self.pass.ready.clear();

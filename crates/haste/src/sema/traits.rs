@@ -41,6 +41,38 @@ pub struct Langs {
     pub(super) crates: Arc<[u32]>,
 }
 
+/// Which allocator shim function (`__rust_alloc`, `__rust_alloc_zeroed`, `__rust_dealloc`, `__rust_realloc`) dispatches to `#[global_allocator]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlobalAllocOp {
+    Alloc,
+    AllocZeroed,
+    Dealloc,
+    Realloc,
+}
+
+impl GlobalAllocOp {
+    /// Classifies a foreign allocator shim symbol name into its `GlobalAlloc` operation.
+    pub fn from_symbol(name: &str) -> Option<Self> {
+        match name {
+            "__rust_alloc" => Some(Self::Alloc),
+            "__rust_alloc_zeroed" => Some(Self::AllocZeroed),
+            "__rust_dealloc" => Some(Self::Dealloc),
+            "__rust_realloc" => Some(Self::Realloc),
+            _ => None,
+        }
+    }
+
+    /// The `core::alloc::GlobalAlloc` trait method name for this operation.
+    pub const fn method_name(self) -> &'static str {
+        match self {
+            Self::Alloc => "alloc",
+            Self::AllocZeroed => "alloc_zeroed",
+            Self::Dealloc => "dealloc",
+            Self::Realloc => "realloc",
+        }
+    }
+}
+
 /// The lang-table key of the function `#[panic_handler]` marks, which no `#[lang]` value can spell.
 pub(crate) const PANIC_HANDLER: &str = "#[panic_handler]";
 
@@ -152,6 +184,50 @@ impl<'a> Context<'a> {
     pub fn is_auto_trait(&self, item: ItemRef) -> bool {
         let (src, entry) = self.item(item);
         entry.name.is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "auto"))
+    }
+
+    /// The `#[global_allocator]` static item in the crate graph, when one is defined.
+    pub fn global_allocator(&self) -> Option<ItemRef> {
+        if let Some(cached) = *read_lock(&self.store.lookups.state.global_allocator) {
+            return cached;
+        }
+        let wanted = mark("global_allocator");
+        let mut found = None;
+        for (krate, tree) in self.outline.crates.iter().enumerate() {
+            if self.outline.is_sysroot(krate as u32) {
+                continue;
+            }
+            for (file, entry) in tree.files.iter().enumerate() {
+                for &(at, _) in entry.items.marks.iter().filter(|(_, bits)| bits & wanted != 0) {
+                    let meta = &entry.items.items[at as usize];
+                    if meta.kind != ItemKind::Static || !tree.env.enabled(&meta.attrs) {
+                        continue;
+                    }
+                    let item = ItemRef { krate: krate as u32, file: file as u32, item: at };
+                    if self.attr_at(item, "global_allocator").is_some() {
+                        found = Some(item);
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        *write_lock(&self.store.lookups.state.global_allocator) = Some(found);
+        found
+    }
+
+    /// The `(op, static_item)` pair when `item` is one of the four foreign `__rust_*alloc*` shims and a `#[global_allocator]` is installed.
+    pub fn global_alloc_shim(&self, item: ItemRef) -> Option<(GlobalAllocOp, ItemRef)> {
+        if !self.is_extern_fn(item) {
+            return None;
+        }
+        let op = GlobalAllocOp::from_symbol(self.symbol_name(item)?.as_str())?;
+        Some((op, self.global_allocator()?))
     }
 
     /// The function that a call to `item` runs: std's `#[panic_handler]` for core's `panic_impl` declaration, as the linker binds it, else `item`.

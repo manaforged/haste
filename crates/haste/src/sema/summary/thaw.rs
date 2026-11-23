@@ -29,7 +29,7 @@ pub(in crate::sema) fn thawed(cx: &mut Context<'_>, instance: &Instance, unlaid:
 /// Lays out `typed` and keeps it as the final body of `instance` when it laid out and nothing was asked since `before`.
 pub(in crate::sema) fn keep_laid(cx: &mut Context<'_>, instance: Instance, typed: &Arc<Typed>, unlaid: &mut Vec<String>, before: (usize, usize)) {
     let laid = lay_out(cx, typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
-    if laid.is_ok() && cx.quiet_mark() == before {
+    if laid.is_ok() && cx.quiet_mark() == before && !matches!(typed.shape, Shape::GlobalAlloc(_)) {
         cx.store.finals.insert(instance, Arc::clone(typed));
     }
 }

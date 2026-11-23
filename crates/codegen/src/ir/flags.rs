@@ -53,18 +53,23 @@ impl Function {
         self.flags(value) & FRESH_ALLOC != 0
     }
 
+    /// Table of constant integer values defined by `Op::Const` instructions across this function.
+    pub(crate) fn const_values(&self) -> Vec<Option<i64>> {
+        let mut consts = vec![None; self.types.len()];
+        for inst in &self.insts {
+            if let (super::Op::Const(imm), Some(res)) = (&inst.op, inst.result) {
+                consts[res.index()] = Some(*imm);
+            }
+        }
+        consts
+    }
+
     /// Mask of values defined by `Op::Const(0)`, empty when no thread-cell lookup is present.
     pub(crate) fn thread_cell_zeros(&self) -> Vec<bool> {
         if !self.value_flags.iter().any(|&bits| bits & THREAD_CELL != 0) {
             return Vec::new();
         }
-        let mut zeros = vec![false; self.types.len()];
-        for inst in &self.insts {
-            if let (super::Op::Const(0), Some(res)) = (&inst.op, inst.result) {
-                zeros[res.index()] = true;
-            }
-        }
-        zeros
+        self.const_values().into_iter().map(|c| c == Some(0)).collect()
     }
 
     /// Result value of `op` when it is a zero-initialized `ThreadCell` lookup with no user-visible memory effects.

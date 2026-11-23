@@ -88,7 +88,7 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
                 out.push(5);
                 self.write_res_list(out, calls)?;
             }
-            Shape::Closure(_) | Shape::Anon(_) | Shape::Asm(_) => return None,
+            Shape::Closure(_) | Shape::Anon(_) | Shape::Asm(_) | Shape::GlobalAlloc(_) => return None,
         }
         Some(())
     }

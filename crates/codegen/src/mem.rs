@@ -228,12 +228,7 @@ fn seed_thread_cells(func: &Function, tracked: &mut [TrackRoot]) -> bool {
     if zeros.is_empty() {
         return false;
     }
-    let mut consts = vec![None; func.types.len()];
-    for inst in &func.insts {
-        if let (Op::Const(imm), Some(res)) = (&inst.op, inst.result) {
-            consts[res.index()] = Some(*imm);
-        }
-    }
+    let consts = func.const_values();
     let mut found_caller = false;
     for data in &func.insts {
         if let Some(res) = func.caller_loc_result(&data.op, |v| zeros[v.index()]) {

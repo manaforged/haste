@@ -316,7 +316,7 @@ impl Lower<'_, '_> {
     }
 
     fn try_box_new_zeroed(&mut self, expr: ExprId, item: ItemRef, args: List) -> Result<Option<Value>> {
-        if !self.open || self.cx.name(item) != "new" || self.cx.outline.roots[item.krate as usize].name != "alloc" {
+        if !self.open || self.cx.global_allocator().is_some() || self.cx.name(item) != "new" || self.cx.outline.roots[item.krate as usize].name != "alloc" {
             return Ok(None);
         }
         let &[arg] = self.body.list(args) else { return Ok(None) };
@@ -439,8 +439,8 @@ impl Lower<'_, '_> {
                 }
             }
             let code = self.code_of(index, origin);
-            if matches!(self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve), Some(crate::host::HostSymbol::Alloc | crate::host::HostSymbol::AllocZeroed)) {
-                self.b.func.mark_fresh_alloc(code);
+            if let Some(host) = self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve) {
+                self.mark_if_fresh_alloc(&host, code);
             }
             return self.native_call(code, (params, callee.ret), values);
         }

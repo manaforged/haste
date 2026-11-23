@@ -1,4 +1,5 @@
 mod adt;
+mod alloc;
 mod array;
 mod assign;
 mod assoc;
@@ -29,6 +30,7 @@ mod tables;
 mod zonk;
 
 pub use adt::{Fields, field_types, maybe_unsized};
+pub use alloc::GlobalAllocShim;
 pub(in crate::sema) use callable::callable_method_name;
 pub(crate) use callable::is_callable_lang;
 pub(in crate::sema) use adt::{body_relaxes_sized, param_relaxes_sized};
@@ -96,6 +98,7 @@ pub enum Shape {
     Clone(Vec<Res>),
     Anon(Anon),
     Asm(Vec<Res>),
+    GlobalAlloc(GlobalAllocShim),
 }
 
 pub(super) type Name<'a> = (&'a str, u32);
@@ -233,6 +236,9 @@ pub struct Awaited {
 }
 
 pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<Typed>> {
+    if let Some((op, alloc_static)) = cx.global_alloc_shim(item) {
+        return alloc::global_alloc_typed(cx, item, op, alloc_static).map(Some);
+    }
     if adt::is_ctor(cx, item) {
         return adt::ctor_typed(cx, item, substs).map(Some);
     }

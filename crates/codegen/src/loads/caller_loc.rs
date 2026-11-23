@@ -81,6 +81,83 @@ fn push_cl_value(func: &mut Function, zeros: &mut Vec<bool>, is_cl: &mut Vec<boo
     val
 }
 
+fn tail_is_cl_clean(func: &Function, prov: &Provenance, zeros: &[bool], is_cl: &[bool], block: Block, after_pos: usize) -> bool {
+    !func.blocks[block.index()].insts[after_pos + 1..]
+        .iter()
+        .any(|&i| !matches!(cl_event(func, prov, zeros, is_cl, &func.insts[i.index()].op), ClEvent::None))
+}
+
+fn push_unvisited_succs(func: &Function, block: Block, visited: &mut [bool], work: &mut Vec<Block>) {
+    for succ in func.successors(block) {
+        if !std::mem::replace(&mut visited[succ.index()], true) {
+            work.push(succ);
+        }
+    }
+}
+
+fn has_fast_path(func: &Function, start: Block, pass: &[bool], targets: &[bool]) -> bool {
+    let mut fast_vis = vec![false; func.blocks.len()];
+    let mut fast_work: Vec<Block> = func.successors(start).collect();
+    while let Some(u) = fast_work.pop() {
+        if targets[u.index()] {
+            return true;
+        }
+        if pass[u.index()] && !std::mem::replace(&mut fast_vis[u.index()], true) {
+            fast_work.extend(func.successors(u));
+        }
+    }
+    false
+}
+
+enum ClWrap {
+    TrapStore(Value),
+    SaveStore(Value),
+    SaveLocal(Value),
+}
+
+fn wrap_cl_block(
+    func: &mut Function,
+    (zeros, is_cl): (&mut Vec<bool>, &mut Vec<bool>),
+    (sig, callee, args): &ClDef,
+    (u, first, last): (Block, usize, usize),
+    mode: ClWrap,
+) {
+    let cl_u = push_cl_value(func, zeros, is_cl, true);
+    let cl_inst = func.add(Op::Call { sig: *sig, callee: *callee, args: args.clone(), results: vec![cl_u] }, None);
+    let orig = std::mem::take(&mut func.blocks[u.index()].insts);
+    let mut rebuilt = Vec::with_capacity(orig.len() + 4);
+    rebuilt.extend_from_slice(&orig[..first]);
+    rebuilt.push(cl_inst);
+    match mode {
+        ClWrap::TrapStore(val) => {
+            rebuilt.push(func.add(Op::Store(val, cl_u, 0), None));
+            rebuilt.extend_from_slice(&orig[first..]);
+        }
+        ClWrap::SaveStore(val) => {
+            let prev_u = push_cl_value(func, zeros, is_cl, false);
+            rebuilt.push(func.add(Op::Load(cl_u, 0), Some(prev_u)));
+            rebuilt.push(func.add(Op::Store(val, cl_u, 0), None));
+            rebuilt.extend_from_slice(&orig[first..=last]);
+            rebuilt.push(func.add(Op::Store(prev_u, cl_u, 0), None));
+            rebuilt.extend_from_slice(&orig[last + 1..]);
+        }
+        ClWrap::SaveLocal(old_addr) => {
+            for &inst in &orig[first..=last] {
+                match &mut func.insts[inst.index()].op {
+                    Op::Store(_, a, 0) | Op::Load(a, 0) if *a == old_addr => *a = cl_u,
+                    _ => {}
+                }
+            }
+            let prev_u = push_cl_value(func, zeros, is_cl, false);
+            rebuilt.push(func.add(Op::Load(cl_u, 0), Some(prev_u)));
+            rebuilt.extend_from_slice(&orig[first..=last]);
+            rebuilt.push(func.add(Op::Store(prev_u, cl_u, 0), None));
+            rebuilt.extend_from_slice(&orig[last + 1..]);
+        }
+    }
+    func.blocks[u.index()].insts = rebuilt;
+}
+
 /// Narrows `#[track_caller]` TLS stores and save/restore spans onto cold call sites, drops silent or unobservable stores, and sinks cold cell lookups.
 pub(super) fn optimize(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool {
     if !prov.param_roots.contains(&MemRoot::CallerLoc) {
@@ -127,13 +204,10 @@ fn narrow_stores(
         let Op::Store(val, addr, 0) = func.insts[store_inst.index()].op else {
             continue;
         };
-        let Some((_, _, (sig, callee, args))) = cl_defs.get(addr.index()).and_then(Clone::clone) else {
+        let Some((_, _, def)) = cl_defs.get(addr.index()).and_then(Clone::clone) else {
             continue;
         };
-        if func.blocks[b_s.index()].insts[pos_s + 1..]
-            .iter()
-            .any(|&i| !matches!(cl_event(func, prov, zeros, is_cl, &func.insts[i.index()].op), ClEvent::None))
-        {
+        if !tail_is_cl_clean(func, prov, zeros, is_cl, b_s, pos_s) {
             continue;
         }
         let mut visited = vec![false; n];
@@ -141,12 +215,7 @@ fn narrow_stores(
         let mut kills = vec![false; n];
         let mut obs: Vec<(Block, usize, usize, bool)> = Vec::new();
         let mut work: Vec<Block> = Vec::new();
-        for succ in func.successors(b_s) {
-            if !visited[succ.index()] {
-                visited[succ.index()] = true;
-                work.push(succ);
-            }
-        }
+        push_unvisited_succs(func, b_s, &mut visited, &mut work);
         let mut ok = !work.is_empty();
         while let Some(u) = work.pop() {
             if u == b_s {
@@ -204,63 +273,21 @@ fn narrow_stores(
                 let ends_in_trap = matches!(last_op, Some(Op::Trap));
                 obs.push((u, first, last_obs, ends_in_trap));
                 if !ends_in_trap {
-                    for succ in func.successors(u) {
-                        if !visited[succ.index()] {
-                            visited[succ.index()] = true;
-                            work.push(succ);
-                        }
-                    }
+                    push_unvisited_succs(func, u, &mut visited, &mut work);
                 }
             } else {
                 pass[u.index()] = true;
-                for succ in func.successors(u) {
-                    if !visited[succ.index()] {
-                        visited[succ.index()] = true;
-                        work.push(succ);
-                    }
-                }
+                push_unvisited_succs(func, u, &mut visited, &mut work);
             }
         }
-        if !ok || obs.is_empty() {
-            continue;
-        }
-        let mut fast_vis = vec![false; n];
-        let mut fast_work: Vec<Block> = func.successors(b_s).collect();
-        let mut has_fast = false;
-        while let Some(u) = fast_work.pop() {
-            if kills[u.index()] {
-                has_fast = true;
-                break;
-            }
-            if pass[u.index()] && !fast_vis[u.index()] {
-                fast_vis[u.index()] = true;
-                fast_work.extend(func.successors(u));
-            }
-        }
-        if !has_fast {
+        if !ok || obs.is_empty() || !has_fast_path(func, b_s, &pass, &kills) {
             continue;
         }
         let removed = func.blocks[b_s.index()].insts.remove(pos_s);
         func.insts[removed.index()].op = Op::Trap;
         for (u, first, last, ends_in_trap) in obs {
-            let cl_u = push_cl_value(func, zeros, is_cl, true);
-            let cl_inst = func.add(Op::Call { sig, callee, args: args.clone(), results: vec![cl_u] }, None);
-            let orig = std::mem::take(&mut func.blocks[u.index()].insts);
-            let mut rebuilt = Vec::with_capacity(orig.len() + 4);
-            rebuilt.extend_from_slice(&orig[..first]);
-            rebuilt.push(cl_inst);
-            if ends_in_trap {
-                rebuilt.push(func.add(Op::Store(val, cl_u, 0), None));
-                rebuilt.extend_from_slice(&orig[first..]);
-            } else {
-                let prev_u = push_cl_value(func, zeros, is_cl, false);
-                rebuilt.push(func.add(Op::Load(cl_u, 0), Some(prev_u)));
-                rebuilt.push(func.add(Op::Store(val, cl_u, 0), None));
-                rebuilt.extend_from_slice(&orig[first..=last]);
-                rebuilt.push(func.add(Op::Store(prev_u, cl_u, 0), None));
-                rebuilt.extend_from_slice(&orig[last + 1..]);
-            }
-            func.blocks[u.index()].insts = rebuilt;
+            let mode = if ends_in_trap { ClWrap::TrapStore(val) } else { ClWrap::SaveStore(val) };
+            wrap_cl_block(func, (zeros, is_cl), &def, (u, first, last), mode);
         }
         changed = true;
     }
@@ -313,13 +340,10 @@ fn narrow_saves(
         if non_restore.get(saved.index()) == Some(&true) {
             continue;
         }
-        let Some((_, _, (sig, callee, args))) = cl_defs.get(addr.index()).and_then(Clone::clone) else {
+        let Some((_, _, def)) = cl_defs.get(addr.index()).and_then(Clone::clone) else {
             continue;
         };
-        if func.blocks[b_l.index()].insts[pos_l + 1..]
-            .iter()
-            .any(|&i| !matches!(cl_event(func, prov, zeros, is_cl, &func.insts[i.index()].op), ClEvent::None))
-        {
+        if !tail_is_cl_clean(func, prov, zeros, is_cl, b_l, pos_l) {
             continue;
         }
         let mut visited = vec![false; n];
@@ -327,12 +351,7 @@ fn narrow_saves(
         let mut restores = vec![false; n];
         let mut dirty: Vec<(Block, usize, usize)> = Vec::new();
         let mut work: Vec<Block> = Vec::new();
-        for succ in func.successors(b_l) {
-            if !visited[succ.index()] {
-                visited[succ.index()] = true;
-                work.push(succ);
-            }
-        }
+        push_unvisited_succs(func, b_l, &mut visited, &mut work);
         let mut ok = !work.is_empty();
         while let Some(u) = work.pop() {
             if u == b_l {
@@ -404,61 +423,18 @@ fn narrow_saves(
                 }
                 if !matches!(last_op, Some(Op::Trap)) {
                     dirty.push((u, fw, last_event));
-                    for succ in func.successors(u) {
-                        if !visited[succ.index()] {
-                            visited[succ.index()] = true;
-                            work.push(succ);
-                        }
-                    }
+                    push_unvisited_succs(func, u, &mut visited, &mut work);
                 }
             } else {
                 pass[u.index()] = true;
-                for succ in func.successors(u) {
-                    if !visited[succ.index()] {
-                        visited[succ.index()] = true;
-                        work.push(succ);
-                    }
-                }
+                push_unvisited_succs(func, u, &mut visited, &mut work);
             }
         }
-        if !ok || dirty.is_empty() {
-            continue;
-        }
-        let mut fast_vis = vec![false; n];
-        let mut fast_work: Vec<Block> = func.successors(b_l).collect();
-        let mut has_fast = false;
-        while let Some(u) = fast_work.pop() {
-            if restores[u.index()] {
-                has_fast = true;
-                break;
-            }
-            if pass[u.index()] && !fast_vis[u.index()] {
-                fast_vis[u.index()] = true;
-                fast_work.extend(func.successors(u));
-            }
-        }
-        if !has_fast {
+        if !ok || dirty.is_empty() || !has_fast_path(func, b_l, &pass, &restores) {
             continue;
         }
         for (u, first, last) in dirty {
-            let cl_u = push_cl_value(func, zeros, is_cl, true);
-            let prev_u = push_cl_value(func, zeros, is_cl, false);
-            let cl_inst = func.add(Op::Call { sig, callee, args: args.clone(), results: vec![cl_u] }, None);
-            let orig = std::mem::take(&mut func.blocks[u.index()].insts);
-            for &inst in &orig[first..=last] {
-                match &mut func.insts[inst.index()].op {
-                    Op::Store(_, a, 0) | Op::Load(a, 0) if *a == addr => *a = cl_u,
-                    _ => {}
-                }
-            }
-            let mut rebuilt = Vec::with_capacity(orig.len() + 3);
-            rebuilt.extend_from_slice(&orig[..first]);
-            rebuilt.push(cl_inst);
-            rebuilt.push(func.add(Op::Load(cl_u, 0), Some(prev_u)));
-            rebuilt.extend_from_slice(&orig[first..=last]);
-            rebuilt.push(func.add(Op::Store(prev_u, cl_u, 0), None));
-            rebuilt.extend_from_slice(&orig[last + 1..]);
-            func.blocks[u.index()].insts = rebuilt;
+            wrap_cl_block(func, (zeros, is_cl), &def, (u, first, last), ClWrap::SaveLocal(addr));
         }
         changed = true;
     }

@@ -272,18 +272,25 @@ fn op_keeps_alloc_private(op: &Op, addr: Value, subst: &[Value]) -> bool {
     }
 }
 
-fn is_unescaped_fresh_alloc(func: &Function, cfg: &Cfg, block: Block, kept: &[Option<Inst>], subst: &[Value], addr: Value) -> bool {
-    for &inst in kept.iter().rev().flatten() {
+fn scan_fresh_alloc(func: &Function, insts: impl Iterator<Item = Inst>, subst: &[Value], addr: Value) -> Option<bool> {
+    for inst in insts {
         let op = &func.insts[inst.index()].op;
         if let Op::Call { callee, results, .. } = op
             && func.is_fresh_alloc(*callee)
             && results.first().is_some_and(|&r| find_val(subst, r) == addr)
         {
-            return true;
+            return Some(true);
         }
         if !op_keeps_alloc_private(op, addr, subst) {
-            return false;
+            return Some(false);
         }
+    }
+    None
+}
+
+fn is_unescaped_fresh_alloc(func: &Function, cfg: &Cfg, block: Block, kept: &[Option<Inst>], subst: &[Value], addr: Value) -> bool {
+    if let Some(found) = scan_fresh_alloc(func, kept.iter().rev().flatten().copied(), subst, addr) {
+        return found;
     }
     let mut cur = block;
     for _ in 0..4 {
@@ -291,17 +298,8 @@ fn is_unescaped_fresh_alloc(func: &Function, cfg: &Cfg, block: Block, kept: &[Op
         if pred == block {
             return false;
         }
-        for &inst in func.blocks[pred.index()].insts.iter().rev() {
-            let op = &func.insts[inst.index()].op;
-            if let Op::Call { callee, results, .. } = op
-                && func.is_fresh_alloc(*callee)
-                && results.first().is_some_and(|&r| find_val(subst, r) == addr)
-            {
-                return true;
-            }
-            if !op_keeps_alloc_private(op, addr, subst) {
-                return false;
-            }
+        if let Some(found) = scan_fresh_alloc(func, func.blocks[pred.index()].insts.iter().rev().copied(), subst, addr) {
+            return found;
         }
         cur = pred;
     }

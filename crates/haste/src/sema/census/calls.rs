@@ -179,6 +179,10 @@ fn append_shape_calls<'a>(shape: &'a Shape, sites: &mut Vec<(u8, u64, &'a Res)>)
         Shape::Untuple(res) => sites.push((13, 0, res)),
         Shape::Clone(calls) => sites.extend(calls.iter().enumerate().map(|(idx, r)| (14, idx as u64, r))),
         Shape::Asm(calls) => sites.extend(calls.iter().enumerate().map(|(idx, r)| (15, idx as u64, r))),
+        Shape::GlobalAlloc(shim) => {
+            sites.push((16, 0, &shim.allocator));
+            sites.push((16, 1, &shim.method));
+        }
         _ => {}
     }
 }

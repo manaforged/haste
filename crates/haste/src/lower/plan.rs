@@ -107,7 +107,7 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
             hash_closure_header(cx, &mut mix, typed, cb)?;
             eval_body_footprint(cx, (reached, slots), inline, &mut mix, index, (cb.parent, Some(cb.closure.body)), typed, &mut cycle_root)?;
         }
-        Shape::Anon(_) | Shape::Asm(_) => mix.local_index(index),
+        Shape::Anon(_) | Shape::Asm(_) | Shape::GlobalAlloc(_) => mix.local_index(index),
     }
     Ok((mix.finish(), cycle_root))
 }
@@ -118,6 +118,7 @@ fn mix_instance_flags(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots
     mix.bool(cx.overflow_checks(krate));
     mix.bool(crate::sema::reach::unwind_enabled(cx, reached));
     mix.bool(reached.may_unwind(cx, index));
+    mix.bool(cx.global_allocator().is_some());
 }
 
 fn try_unique_closure_footprint(
@@ -157,7 +158,7 @@ fn try_unique_footprint(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slo
         mix.item(cx.outline, item);
         return Some(mix.finish());
     }
-    if matches!(typed.shape, Shape::Anon(_)) || typed.has_awaits() {
+    if matches!(typed.shape, Shape::Anon(_) | Shape::GlobalAlloc(_)) || typed.has_awaits() {
         let mut mix = HashMix::new(0x51a7_1c02);
         mix.item(cx.outline, item);
         mix.local_index(index);
@@ -193,6 +194,7 @@ fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, (low, allow_inl
         Shape::Clone(_) => 6,
         Shape::Anon(_) => 7,
         Shape::Asm(_) => 8,
+        Shape::GlobalAlloc(_) => 9,
     };
     mix.byte(shape_tag);
     let sig = signature(cx, typed)?;

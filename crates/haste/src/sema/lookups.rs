@@ -98,6 +98,7 @@ impl ActiveAttrs {
 #[derive(Default)]
 pub(super) struct OutlineState {
     pub(super) langs: RwLock<Option<traits::Langs>>,
+    pub(super) global_allocator: RwLock<Option<Option<ItemRef>>>,
     pub(super) loaded: RwLock<Vec<crate::outline::tree::CrateExtent>>,
     pub(super) primitives: RwLock<Option<Arc<[u32]>>>,
 }
@@ -248,6 +249,7 @@ impl Lookups {
             self.has_new_sysroot_summaries.store(false, Ordering::Relaxed);
             self.has_new_sysroot_instances.store(false, Ordering::Relaxed);
         }
+        *write_lock(&self.state.global_allocator) = None;
         self.trait_calls.clear();
         self.assoc_types.clear();
         self.type_defs.clear();
@@ -398,6 +400,7 @@ impl Lookups {
         self.trait_defs.retain(|item, _| !mine(*item));
         self.selections.clear();
         self.projections.clear();
+        *write_lock(&self.state.global_allocator) = None;
         self.trait_calls.clear();
         self.assoc_types.clear();
         self.summaries = table::Flight::default();

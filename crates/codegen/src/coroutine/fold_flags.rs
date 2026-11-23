@@ -236,20 +236,53 @@ fn eval_op(func: &Function, op: &Op, res_ty: crate::ir::Type, lookup: impl Fn(Va
     }
 }
 
+fn step_slot_inst(
+    func: &mut Function,
+    (dense, global_consts): (&[u32], &[Option<i64>]),
+    (state, local_consts): (&mut [SlotVal], &mut HashMap<Value, i64>),
+    inst: crate::ir::Inst,
+    rewrite: bool,
+) -> bool {
+    let data = &func.insts[inst.index()];
+    match data.op {
+        Op::StackStore(v, s, 0) if dense[s.index()] != u32::MAX => {
+            let t = dense[s.index()] as usize;
+            let c = local_consts.get(&v).copied().or_else(|| global_consts[v.index()]);
+            state[t] = c.map_or(SlotVal::Varying, SlotVal::Const);
+        }
+        Op::StackLoad(s, 0) if dense[s.index()] != u32::MAX => {
+            if let (Some(res), SlotVal::Const(k)) = (data.result, state[dense[s.index()] as usize]) {
+                let k = extend(k, func.ty(res), false);
+                if rewrite {
+                    func.insts[inst.index()].op = Op::Const(k);
+                }
+                local_consts.insert(res, k);
+            }
+        }
+        Op::Brif(cond, t, ref t_args, f, ref f_args) if rewrite => {
+            if let Some(c) = local_consts.get(&cond).copied().or_else(|| global_consts[cond.index()]) {
+                let (dst, args) = if c != 0 { (t, t_args.clone()) } else { (f, f_args.clone()) };
+                func.insts[inst.index()].op = Op::Jump(dst, args);
+                return true;
+            }
+        }
+        _ => {
+            if let Some(res) = data.result
+                && let Some(k) = eval_op(func, &data.op, func.ty(res), |v| local_consts.get(&v).copied().or_else(|| global_consts[v.index()]))
+            {
+                local_consts.insert(res, k);
+            }
+        }
+    }
+    false
+}
+
 /// Folds constant unescaped scalar stack slots (such as drop flags) across coroutine suspend/resume edges before state-machine splitting.
 pub(super) fn run(func: &mut Function, spec: &Coroutine, old_entry: Block) {
     if spec.resumes.is_empty() || func.slots.is_empty() {
         return;
     }
-    let mut global_consts = vec![None; func.types.len()];
-    for block in &func.blocks {
-        for &inst in &block.insts {
-            let data = &func.insts[inst.index()];
-            if let (Op::Const(k), Some(res)) = (&data.op, data.result) {
-                global_consts[res.index()] = Some(*k);
-            }
-        }
-    }
+    let global_consts = func.const_values();
     let Some(ret_suspend) = find_suspend_edges(func, spec, old_entry, &global_consts) else {
         return;
     };
@@ -272,27 +305,9 @@ pub(super) fn run(func: &mut Function, spec: &Coroutine, old_entry: Block) {
         in_work[bi] = false;
         state.copy_from_slice(&in_vals[bi]);
         local_consts.clear();
-        for &inst in &func.blocks[bi].insts {
-            let data = &func.insts[inst.index()];
-            match data.op {
-                Op::StackStore(v, s, 0) if dense[s.index()] != u32::MAX => {
-                    let t = dense[s.index()] as usize;
-                    let c = local_consts.get(&v).copied().or_else(|| global_consts[v.index()]);
-                    state[t] = c.map_or(SlotVal::Varying, SlotVal::Const);
-                }
-                Op::StackLoad(s, 0) if dense[s.index()] != u32::MAX => {
-                    if let (Some(res), SlotVal::Const(k)) = (data.result, state[dense[s.index()] as usize]) {
-                        local_consts.insert(res, extend(k, func.ty(res), false));
-                    }
-                }
-                _ => {
-                    if let Some(res) = data.result
-                        && let Some(k) = eval_op(func, &data.op, func.ty(res), |v| local_consts.get(&v).copied().or_else(|| global_consts[v.index()]))
-                    {
-                        local_consts.insert(res, k);
-                    }
-                }
-            }
+        let insts = func.blocks[bi].insts.clone();
+        for inst in insts {
+            step_slot_inst(func, (&dense, &global_consts), (&mut state, &mut local_consts), inst, false);
         }
         let mut targets: Vec<Block> = Vec::new();
         if let Some(&Op::Brif(cond, t, _, f, _)) = func.last(b)
@@ -331,35 +346,7 @@ pub(super) fn run(func: &mut Function, spec: &Coroutine, old_entry: Block) {
         local_consts.clear();
         let insts = func.blocks[bi].insts.clone();
         for inst in insts {
-            let data = &func.insts[inst.index()];
-            match data.op {
-                Op::StackStore(v, s, 0) if dense[s.index()] != u32::MAX => {
-                    let t = dense[s.index()] as usize;
-                    let c = local_consts.get(&v).copied().or_else(|| global_consts[v.index()]);
-                    state[t] = c.map_or(SlotVal::Varying, SlotVal::Const);
-                }
-                Op::StackLoad(s, 0) if dense[s.index()] != u32::MAX => {
-                    if let (Some(res), SlotVal::Const(k)) = (data.result, state[dense[s.index()] as usize]) {
-                        let k = extend(k, func.ty(res), false);
-                        func.insts[inst.index()].op = Op::Const(k);
-                        local_consts.insert(res, k);
-                    }
-                }
-                Op::Brif(cond, t, ref t_args, f, ref f_args) => {
-                    if let Some(c) = local_consts.get(&cond).copied().or_else(|| global_consts[cond.index()]) {
-                        let (dst, args) = if c != 0 { (t, t_args.clone()) } else { (f, f_args.clone()) };
-                        func.insts[inst.index()].op = Op::Jump(dst, args);
-                        cfg_changed = true;
-                    }
-                }
-                _ => {
-                    if let Some(res) = data.result
-                        && let Some(k) = eval_op(func, &data.op, func.ty(res), |v| local_consts.get(&v).copied().or_else(|| global_consts[v.index()]))
-                    {
-                        local_consts.insert(res, k);
-                    }
-                }
-            }
+            cfg_changed |= step_slot_inst(func, (&dense, &global_consts), (&mut state, &mut local_consts), inst, true);
         }
     }
     if cfg_changed {
