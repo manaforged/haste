@@ -70,7 +70,7 @@ check_malformed() {
     fi
 }
 check_catch_unwind() {
-    local out_msg=$1 dir="$tmp/unwind_ok" c_out h_out a_out c_status=0 h_status=0 a_status=0
+    local out_msg=$1 dir="$tmp/unwind_ok" c_out h_out a_out c_status=0 h_status=0 a_status=0 p_c p_h p_a
     write_scratch_crate "$dir" "unwind_ok" 'use std::sync::atomic::{AtomicI64, Ordering};
 static LOG: AtomicI64 = AtomicI64::new(0);
 struct Guard(i64);
@@ -109,16 +109,25 @@ fn main() {
     let t = std::thread::spawn(|| panic!("tboom")).join().is_err();
     println!("{ok} {s} {t} {}", LOG.load(Ordering::Relaxed));
 }'
-    c_out=$(run_manifest "$dir" </dev/null 2>/dev/null) || c_status=$?
-    h_out=$(run_haste run "$dir" </dev/null 2>/dev/null) || h_status=$?
-    run_haste --release build -o "$dir/unwind_aot" "$dir" </dev/null >/dev/null 2>&1 && a_out=$("$dir/unwind_aot" </dev/null 2>/dev/null) || a_status=$?
+    run_manifest "$dir" </dev/null >"$dir/c.out" 2>/dev/null &
+    p_c=$!
+    run_haste run "$dir" </dev/null >"$dir/h.out" 2>/dev/null &
+    p_h=$!
+    (run_haste --release build -o "$dir/unwind_aot" "$dir" </dev/null >/dev/null 2>&1 && "$dir/unwind_aot" </dev/null >"$dir/a.out" 2>/dev/null) &
+    p_a=$!
+    wait "$p_c" || c_status=$?
+    wait "$p_h" || h_status=$?
+    wait "$p_a" || a_status=$?
+    c_out=$(cat "$dir/c.out" 2>/dev/null || true)
+    h_out=$(cat "$dir/h.out" 2>/dev/null || true)
+    a_out=$(cat "$dir/a.out" 2>/dev/null || true)
     if [ "$c_status" -ne 0 ] || [ "$h_status" -ne 0 ] || [ "$a_status" -ne 0 ] || [ "$c_out" != "$h_out" ] || [ "$c_out" != "$a_out" ]; then
         echo "catch_unwind DIFF: cargo=($c_status,$c_out) jit=($h_status,$h_out) aot=($a_status,$a_out)" >"$out_msg"
         return 1
     fi
 }
 check_unit_tests() {
-    local out_msg=$1 dir="$tmp/unit_tests" c_status=0 h_status=0
+    local out_msg=$1 dir="$tmp/unit_tests" c_status=0 h_status=0 p_c p_h
     mkdir -p "$dir/src"
     printf '[package]\nname = "unit_tests"\nversion = "0.1.0"\nedition = "2021"\n' >"$dir/Cargo.toml"
     printf 'version = 4\n\n[[package]]\nname = "unit_tests"\nversion = "0.1.0"\n' >"$dir/Cargo.lock"
@@ -137,62 +146,39 @@ mod tests {
     fn skip_me() { panic!("should not run"); }
 }
 EOF
-    run_cargo test --quiet --locked --manifest-path "$dir/Cargo.toml" </dev/null >/dev/null 2>&1 || c_status=$?
-    run_haste test "$dir" </dev/null >"$dir/haste.out" 2>&1 || h_status=$?
+    run_cargo test --quiet --locked --manifest-path "$dir/Cargo.toml" </dev/null >/dev/null 2>&1 &
+    p_c=$!
+    run_haste test "$dir" </dev/null >"$dir/haste.out" 2>&1 &
+    p_h=$!
+    wait "$p_c" || c_status=$?
+    wait "$p_h" || h_status=$?
     if [ "$c_status" -ne 0 ] || [ "$h_status" -ne 0 ] || ! grep -q 'test result: ok. 3 passed; 0 failed; 1 ignored;' "$dir/haste.out"; then
         echo "unit_tests DIFF: cargo=$c_status haste=$h_status: $(tail -3 "$dir/haste.out")" >"$out_msg"
         return 1
     fi
 }
-pre_pids=()
-pre_msgs=()
-pre_launch() {
-    local msg="$tmp/pre.${#pre_pids[@]}.msg"
-    "$@" "$msg" &
-    pre_pids+=($!)
-    pre_msgs+=("$msg")
-}
-for build_target in examples/hello tests/diff tests/probes/cl; do
-    pre_launch check_build_target "$build_target"
-done
-pre_launch check_accept_ok
-pre_launch check_catch_unwind
-pre_launch check_unit_tests
-pre_launch check_reject unsatisfied_bound 'trait Marker {} fn needs<T: Marker>(_: T) {} fn main() { needs(1u8); }'
-pre_launch check_reject unconstrained_var 'fn main() { let _v = Vec::new(); }'
-pre_launch check_reject use_after_move 'fn main() { let s = String::from("hi"); drop(s); println!("{s}"); }'
-pre_launch check_reject loop_move 'fn main() { let s = String::from("hi"); for _ in 0..2 { drop(s); } }'
-pre_launch check_reject assign_immut 'fn main() { let x = 1; x = 2; println!("{x}"); }'
-pre_launch check_reject mut_ref_immut 'fn main() { let x = 1; let r = &mut x; *r = 2; }'
-pre_launch check_reject conflict_mut_imm 'fn main() { let mut x = 1; let r1 = &x; let r2 = &mut x; *r2 = 2; println!("{r1}"); }'
-pre_launch check_reject mutate_borrowed 'fn main() { let mut x = 1; let r = &x; x = 2; println!("{r}"); }'
-pre_launch check_reject return_local_ref 'fn bad() -> &'\''static i32 { let x = 1; &x } fn main() { let _ = bad(); }'
-pre_launch check_reject return_byval_deref 'fn bad<'\''a>(p: (String, &'\''a str)) -> &'\''a str { &*p.0 } fn main() { let _ = bad((String::new(), "")); }'
-pre_launch check_reject invalid_arc_unsize 'use std::sync::Arc; fn main() { let a = [1, 2, 3]; let x: Arc<&[i32; 3]> = Arc::new(&a); let _y: Arc<&[i32]> = x; }'
-pre_launch check_malformed
-pre_fail=0
-for idx in "${!pre_pids[@]}"; do
-    if ! wait "${pre_pids[$idx]}"; then
-        [ -s "${pre_msgs[$idx]}" ] && cat "${pre_msgs[$idx]}"
-        pre_fail=1
-    fi
-done
-[ "$pre_fail" -ne 0 ] && exit 1
-dirs=(tests/probes/*/)
-total=${#dirs[@]}
-jobs=$(cpu_count)
-[ "$jobs" -gt "$total" ] && jobs=$total
-[ "$jobs" -lt 1 ] && jobs=1
 probe_one() {
-    local dir=$1 out=$2 name expected expected_status=0 found found_status=0 aot_out aot_status=0 p_exp
+    local dir=$1 out=$2 name expected expected_status=0 found found_status=0 aot_out aot_build_status=0 aot_status=0 p_exp p_jit p_aot=
     name=$(basename "$dir")
     run_manifest "$dir" </dev/null >"$out.exp" 2>/dev/null &
     p_exp=$!
     if [ -n "${HASTE_BIN:-}" ]; then
-        found=$(with_timeout "$HASTE_BIN" run "$dir" </dev/null 2>/dev/null) || found_status=$?
+        with_timeout "$HASTE_BIN" run "$dir" </dev/null >"$out.jit" 2>/dev/null &
     else
-        found=$(run_haste run "$dir" </dev/null 2>/dev/null) || found_status=$?
+        run_haste run "$dir" </dev/null >"$out.jit" 2>/dev/null &
     fi
+    p_jit=$!
+    if [ "$name" != "so" ]; then
+        (
+            if ! run_haste --release build -o "$tmp/aot_$name" "$dir" </dev/null >/dev/null 2>"$tmp/aot_$name.err"; then
+                exit 2
+            fi
+            with_timeout "$tmp/aot_$name" </dev/null >"$out.aot" 2>/dev/null || exit 3
+        ) &
+        p_aot=$!
+    fi
+    wait "$p_jit" || found_status=$?
+    found=$(cat "$out.jit" 2>/dev/null || true)
     if [ "$name" = "so" ]; then
         wait "$p_exp" || expected_status=$?
         expected=$(cat "$out.exp")
@@ -203,39 +189,106 @@ probe_one() {
         echo "$name DIFF: status $found_status (expected=$found), cargo $expected_status ($expected)" >"$out"
         return 1
     fi
+    wait "$p_aot" || aot_build_status=$?
+    wait "$p_exp" || expected_status=$?
+    expected=$(cat "$out.exp")
     if [ "$found_status" -ne 0 ]; then
-        wait "$p_exp" || expected_status=$?
         echo "$name DIFF: status $found_status, cargo $expected_status: $(printf '%s\n' "$found" | tail -2 | cut -c1-160)" >"$out"
         return 1
     fi
-    if ! run_haste --release build -o "$tmp/aot_$name" "$dir" </dev/null >/dev/null 2>"$tmp/aot_$name.err"; then
-        wait "$p_exp" || expected_status=$?
+    if [ "$aot_build_status" -eq 2 ]; then
         echo "$name AOT BUILD DIFF: $(tail -2 "$tmp/aot_$name.err" | cut -c1-160)" >"$out"
         return 1
     fi
-    aot_out=$(with_timeout "$tmp/aot_$name" </dev/null 2>/dev/null) || aot_status=$?
-    wait "$p_exp" || expected_status=$?
-    expected=$(cat "$out.exp")
     if [ "$expected_status" -ne 0 ] || [ "$expected" != "$found" ]; then
         echo "$name DIFF: status $found_status, cargo $expected_status: $(printf '%s\n' "$found" | tail -2 | cut -c1-160)" >"$out"
         return 1
     fi
-    if [ "$aot_status" -ne 0 ] || [ "$aot_out" != "$expected" ]; then
-        echo "$name AOT RUN DIFF: status $aot_status: $(printf '%s\n' "$aot_out" | tail -2 | cut -c1-160)" >"$out"
+    if [ "$aot_build_status" -ne 0 ]; then
+        aot_status=$aot_build_status
+        echo "$name AOT RUN DIFF: status $aot_status" >"$out"
+        return 1
+    fi
+    aot_out=$(cat "$out.aot" 2>/dev/null || true)
+    if [ "$aot_out" != "$expected" ]; then
+        echo "$name AOT RUN DIFF: status 0: $(printf '%s\n' "$aot_out" | tail -2 | cut -c1-160)" >"$out"
         return 1
     fi
     echo "$name same" >"$out"
 }
+dirs=()
+while IFS= read -r d; do
+    dirs+=("$d")
+done < <(
+    for d in tests/probes/*/; do
+        lock_sz=$(wc -c <"${d}Cargo.lock" 2>/dev/null | tr -d ' ' || echo 0)
+        src_sz=$(wc -c <"${d}src/main.rs" 2>/dev/null | tr -d ' ' || echo 0)
+        printf '%012d %012d %s\n' "$lock_sz" "$src_sz" "$d"
+    done | sort -r | awk '{print $3}'
+)
+probe_total=${#dirs[@]}
+reject_labels=(
+    unsatisfied_bound unconstrained_var use_after_move loop_move assign_immut
+    mut_ref_immut conflict_mut_imm mutate_borrowed return_local_ref
+    return_byval_deref invalid_arc_unsize
+)
+reject_bodies=(
+    'trait Marker {} fn needs<T: Marker>(_: T) {} fn main() { needs(1u8); }'
+    'fn main() { let _v = Vec::new(); }'
+    'fn main() { let s = String::from("hi"); drop(s); println!("{s}"); }'
+    'fn main() { let s = String::from("hi"); for _ in 0..2 { drop(s); } }'
+    'fn main() { let x = 1; x = 2; println!("{x}"); }'
+    'fn main() { let x = 1; let r = &mut x; *r = 2; }'
+    'fn main() { let mut x = 1; let r1 = &x; let r2 = &mut x; *r2 = 2; println!("{r1}"); }'
+    'fn main() { let mut x = 1; let r = &x; x = 2; println!("{r}"); }'
+    'fn bad() -> &'\''static i32 { let x = 1; &x } fn main() { let _ = bad(); }'
+    'fn bad<'\''a>(p: (String, &'\''a str)) -> &'\''a str { &*p.0 } fn main() { let _ = bad((String::new(), "")); }'
+    'use std::sync::Arc; fn main() { let a = [1, 2, 3]; let x: Arc<&[i32; 3]> = Arc::new(&a); let _y: Arc<&[i32]> = x; }'
+)
+build_targets=(examples/hello tests/diff tests/probes/cl)
+# Unified queue ordered heaviest-first so slow probes and pre-checks share one bounded worker pool.
+task_kinds=()
+task_args=()
+for ((i = 0; i < probe_total; i++)); do
+    task_kinds+=(probe); task_args+=("$i")
+done
+task_kinds+=(catch_unwind unit_tests accept_ok malformed)
+task_args+=(0 0 0 0)
+for ((i = 0; i < ${#build_targets[@]}; i++)); do
+    task_kinds+=(build_target); task_args+=("$i")
+done
+for ((i = 0; i < ${#reject_labels[@]}; i++)); do
+    task_kinds+=(reject); task_args+=("$i")
+done
+task_total=${#task_kinds[@]}
+run_task() {
+    local idx=$1 kind=${task_kinds[$1]} arg=${task_args[$1]} msg="$tmp/pre.$1.msg"
+    case "$kind" in
+        probe) probe_one "${dirs[$arg]}" "$tmp/out.$arg" ;;
+        catch_unwind) check_catch_unwind "$msg" ;;
+        unit_tests) check_unit_tests "$msg" ;;
+        accept_ok) check_accept_ok "$msg" ;;
+        malformed) check_malformed "$msg" ;;
+        build_target) check_build_target "${build_targets[$arg]}" "$msg" ;;
+        reject) check_reject "${reject_labels[$arg]}" "${reject_bodies[$arg]}" "$msg" ;;
+    esac
+}
+jobs=$(cpu_count)
+[ "$jobs" -gt "$task_total" ] && jobs=$task_total
+[ "$jobs" -lt 1 ] && jobs=1
 for ((w = 0; w < jobs; w++)); do
     (
-        for ((i = 0; i < total; i++)); do
+        for ((i = 0; i < task_total; i++)); do
             mkdir "$tmp/claim.$i" 2>/dev/null || continue
-            probe_one "${dirs[$i]}" "$tmp/out.$i" || : >"$tmp/failed"
+            run_task "$i" || : >"$tmp/failed"
         done
     ) &
 done
 wait
-for ((i = 0; i < total; i++)); do
-    cat "$tmp/out.$i"
+for ((i = 0; i < task_total; i++)); do
+    [ -s "$tmp/pre.$i.msg" ] && cat "$tmp/pre.$i.msg"
 done
+for ((i = 0; i < probe_total; i++)); do
+    cat "$tmp/out.$i"
+done | sort
 [ ! -e "$tmp/failed" ]
