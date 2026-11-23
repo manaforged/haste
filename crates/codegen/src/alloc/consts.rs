@@ -100,13 +100,13 @@ fn arm64_loop_pressure<R>(func: &Function, census: &Uses, loops: &Loops, elided:
         let mut count_val = |v: Value, is_head_param: bool| {
             let vi = v.index();
             if seen[vi] != tag && !elided[vi] {
+                let outside = census.def[vi].is_none_or(|(db, _)| !each.body.get(db).copied().unwrap_or(false));
                 if func.types[vi].is_small_int() && matches!(locations[vi], Location::Slot) {
-                    let outside = census.def[vi].is_none_or(|(db, _)| !each.body.get(db).copied().unwrap_or(false));
                     if is_head_param || outside {
                         seen[vi] = tag;
                         gp += 1;
                     }
-                } else if is_cand[vi] {
+                } else if is_cand[vi] && outside {
                     seen[vi] = tag;
                     cand_loops[vi].push(idx);
                 }

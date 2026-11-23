@@ -466,7 +466,7 @@ struct Invariants<'a> {
     zeros: &'a [bool],
 }
 
-fn always_executes_in_loop(cfg: &Cfg, each: &Loop, blk: Block) -> bool {
+pub(crate) fn always_executes_in_loop(cfg: &Cfg, each: &Loop, blk: Block) -> bool {
     each.latches.iter().all(|&latch| cfg::dominates(&cfg.idom, blk, latch))
 }
 
@@ -551,11 +551,13 @@ fn hoist(
             let res_val = func.insts[inst.index()].result.or(tc_res);
             let res_ty = res_val.map(|r| func.ty(r));
             let is_vec_mat = res_ty.is_some_and(Type::in_float_register)
-                && matches!(op, Op::Insert(..) | Op::Shuffle(..) | Op::Const(_) | Op::Load(..) | Op::StackLoad(..));
+                && matches!(op, Op::Insert(..) | Op::Shuffle(..) | Op::Const(_) | Op::Load(..) | Op::StackLoad(..) | Op::Convert(crate::ir::Convert::Bitcast, _));
             let replaces_single_use = matches!(op, Op::Insert(prev, ..) if hoisted_vec.contains(prev) && uses.as_ref().is_some_and(|u| u[prev.index()] == 1));
-            let vec_ok = !is_vec_mat || replaces_single_use || vec_live + hoisted_vecs < MAX_LOOP_VEC_LIVE;
+            let vec_call_block = mem.calls && res_ty.is_some_and(Type::is_vector);
+            let vec_ok = !is_vec_mat || (!vec_call_block && (replaces_single_use || vec_live + hoisted_vecs < MAX_LOOP_VEC_LIVE));
+            let const_call_block = mem.calls && !always_exec && matches!(op, Op::Const(_));
             let movable = tc_res.is_some()
-                || (op.is_speculable() && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
+                || (op.is_speculable() && !const_call_block && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
                 || mem.can_hoist_load(func, prov, head_prefix, inst)
                 || can_hoist_global_load(func, mem, prov, head_prefix, inst);
             let mut operands_invariant = true;

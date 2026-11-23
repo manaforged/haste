@@ -149,11 +149,9 @@ pub(super) fn plan_ssa_joins(func: &Function, cfg: &crate::cfg::Cfg, disp: Block
             continue;
         }
         live_list.push(b);
-        if b != exit {
-            for &pr in cfg.preds_of(b) {
-                if from_exit[pr.index()] && !live[pr.index()] {
-                    back.push(pr);
-                }
+        for &pr in cfg.preds_of(b) {
+            if from_exit[pr.index()] && !live[pr.index()] {
+                back.push(pr);
             }
         }
     }
