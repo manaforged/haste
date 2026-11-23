@@ -341,22 +341,25 @@ fn factor_block(func: &mut Function, bi: usize, fs: &mut FactorState, balance: b
     }
 }
 
-fn factor_bitwise(func: &mut Function, balance: bool) {
+fn factor_bitwise(func: &mut Function, balance: bool) -> Option<(Vec<Option<Inst>>, Vec<u32>)> {
     if !func.blocks.iter().flat_map(|b| &b.insts).any(|&i| matches!(func.insts[i.index()].op, Op::Binary(Binary::Bor | Binary::Bxor, ..))) {
-        return;
+        return None;
     }
-    let mut inst_block = vec![usize::MAX; func.insts.len()];
-    if balance {
+    let inst_block = if balance {
+        let mut map = vec![usize::MAX; func.insts.len()];
         for (bi, block) in func.blocks.iter().enumerate() {
-            for &inst in &block.insts { inst_block[inst.index()] = bi; }
+            for &inst in &block.insts { map[inst.index()] = bi; }
         }
-    }
+        map
+    } else {
+        Vec::new()
+    };
     let mut fs = FactorState { defs: defs(func), uses: func.use_counts(), depth: Vec::new(), inst_block, dead: vec![false; func.insts.len()], changed: false };
     for bi in 0..func.blocks.len() {
         factor_block(func, bi, &mut fs, balance);
     }
     if !fs.changed {
-        return;
+        return Some((fs.defs, fs.uses));
     }
     for block in &mut func.blocks {
         block.insts.retain(|i| {
@@ -367,6 +370,7 @@ fn factor_bitwise(func: &mut Function, balance: bool) {
             !kill
         });
     }
+    None
 }
 
 fn has_mem_or_trap(op: &Op) -> bool {
@@ -774,8 +778,10 @@ fn bypass_two_use_adds_block(func: &mut Function, uses: &mut Vec<u32>, depth: &m
 
 /// Factors single-use bitwise identities, balances addition trees by latency, sinks deferred loads and pure scalar ops, and splits shared address sums.
 pub(crate) fn run(func: &mut Function, balance: bool) {
-    factor_bitwise(func, balance);
-    let mut uses = func.use_counts();
+    let (cached_defs, mut uses) = match factor_bitwise(func, balance) {
+        Some((d, u)) => (Some(d), u),
+        None => (None, func.use_counts()),
+    };
     let mut balanced = false;
     if balance && func.blocks.iter().any(|b| b.insts.len() >= 8) {
         let mut depth = Vec::new();
@@ -783,13 +789,9 @@ pub(crate) fn run(func: &mut Function, balance: bool) {
         for bi in 0..func.blocks.len() { bypass_two_use_adds_block(func, &mut uses, &mut depth, bi); }
     }
     let uses = if balanced { func.use_counts() } else { uses };
-    for bi in 0..func.blocks.len() {
-        sink_loads_block(func, &uses, bi);
-    }
-    let live_defs = defs(func);
-    for bi in 0..func.blocks.len() {
-        sink_pure_block(func, &live_defs, &uses, bi);
-    }
+    for bi in 0..func.blocks.len() { sink_loads_block(func, &uses, bi); }
+    let live_defs = if !balanced && let Some(d) = cached_defs { d } else { defs(func) };
+    for bi in 0..func.blocks.len() { sink_pure_block(func, &live_defs, &uses, bi); }
     reuse::after_last_read(func, &uses, &live_defs);
     addr::split_address_sums(func);
 }

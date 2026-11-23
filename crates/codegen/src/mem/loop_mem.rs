@@ -171,7 +171,7 @@ fn ptr_base(
     if let Some((slot, off)) = slots[v.index()] {
         return (MemBase::Slot(slot), i64::from(off), i64::from(off));
     }
-    if let Some(sym) = symbols[v.index()] {
+    if let Some(sym) = symbols.get(v.index()).copied().flatten() {
         return (MemBase::Global(sym), 0, 0);
     }
     (MemBase::Addr(v), 0, 0)

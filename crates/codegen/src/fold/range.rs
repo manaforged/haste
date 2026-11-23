@@ -668,12 +668,19 @@ pub(super) fn fold_range_checks(func: &mut Function) -> bool {
         return false;
     }
     let mut consts = vec![None; func.types.len()];
-    for data in &func.insts {
-        if let (&Op::Const(imm), Some(res)) = (&data.op, data.result) && func.ty(res).is_small_int() {
-            consts[res.index()] = Some(extend(imm, func.ty(res), false));
+    let mut def_tab = vec![None; func.types.len()];
+    let mut uses = vec![0_u32; func.types.len()];
+    for &i in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[i.index()];
+        data.op.for_operands(|v| uses[v.index()] += 1);
+        if let Some(res) = data.result {
+            def_tab[res.index()] = Some(i);
+            if let Op::Const(imm) = data.op && func.ty(res).is_small_int() {
+                consts[res.index()] = Some(extend(imm, func.ty(res), false));
+            }
         }
     }
-    let mut state = RangeState { defs: defs(func), uses: func.use_counts(), consts };
+    let mut state = RangeState { defs: def_tab, uses, consts };
     let mut changed = false;
     for b_idx in 0..func.blocks.len() {
         let orig = std::mem::take(&mut func.blocks[b_idx].insts);

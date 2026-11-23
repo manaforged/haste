@@ -739,8 +739,10 @@ impl Function {
 
     /// Resolves each value derived from a stack slot plus constant offsets, returning `(slot_offsets, addr_insts)`.
     pub(crate) fn slot_offsets(&self, eval_const: impl Fn(Value) -> Option<i64>) -> (Vec<Option<(StackSlot, i64)>>, Vec<(Inst, StackSlot)>) {
-        let mut consts = vec![None; self.types.len()];
         let mut addrs = vec![None; self.types.len()];
+        if self.slots.is_empty() {
+            return (addrs, Vec::new());
+        }
         let mut addr_insts = Vec::new();
         let mut adds = Vec::new();
         for inst in self.blocks.iter().flat_map(|block| &block.insts) {
@@ -751,11 +753,14 @@ impl Function {
                     addrs[result.index()] = Some((*slot, i64::from(*offset)));
                     addr_insts.push((*inst, *slot));
                 }
-                Op::Const(imm) => consts[result.index()] = Some(*imm),
                 Op::Binary(Binary::Iadd, x, c) => adds.push((*inst, result, *x, *c)),
                 _ => {}
             }
         }
+        if addr_insts.is_empty() || adds.is_empty() {
+            return (addrs, addr_insts);
+        }
+        let consts = self.const_values();
         loop {
             let before = adds.len();
             adds.retain(|&(inst, result, x, c)| {

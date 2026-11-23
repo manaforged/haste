@@ -206,8 +206,8 @@ type TrackedRoots = (Vec<TrackRoot>, bool, bool, Vec<Option<u32>>, Vec<Option<Ru
 fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> TrackedRoots {
     let n = func.types.len();
     let mut tracked = vec![TrackRoot::Conflict; n];
-    let mut symbol_defs = vec![None; n];
-    let mut frame_runtime = vec![None; n];
+    let mut symbol_defs = Vec::new();
+    let mut frame_runtime = Vec::new();
     let mut any_params = false;
     for &b in &cfg.rpo {
         if Some(b) != cfg.entry {
@@ -232,10 +232,12 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
             let data = &func.insts[inst.index()];
             match (&data.op, data.result) {
                 (&Op::Runtime(rt @ RuntimeSymbol::Malloc), Some(res)) => {
+                    if frame_runtime.is_empty() { frame_runtime.resize(n, None); }
                     frame_runtime[res.index()] = Some(rt);
                     mallocs.push(res);
                 }
                 (&Op::Runtime(rt @ RuntimeSymbol::Free), Some(res)) => {
+                    if frame_runtime.is_empty() { frame_runtime.resize(n, None); }
                     frame_runtime[res.index()] = Some(rt);
                     frees.push(res);
                 }
@@ -264,6 +266,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
                     tracked[res.index()] = TrackRoot::Set(MemRoot::Slot(slot));
                 }
                 (&(Op::Symbol(sym) | Op::SlotAddr(sym)), Some(res)) => {
+                    if symbol_defs.is_empty() { symbol_defs.resize(n, None); }
                     symbol_defs[res.index()] = Some(sym);
                     if func.ty(res) == Type::I64 {
                         tracked[res.index()] = TrackRoot::Set(MemRoot::Global(sym));

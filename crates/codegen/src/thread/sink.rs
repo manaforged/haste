@@ -342,12 +342,16 @@ fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Bl
     diamond_safe(func, cfg, (block, target), (op, &moves[target.index()])).then_some(target)
 }
 
-fn build_users(func: &Function) -> Vec<Vec<(Inst, Block)>> {
+fn build_users(func: &Function, spec_def: &[bool]) -> Vec<Vec<(Inst, Block)>> {
     let mut users = vec![Vec::new(); func.types.len()];
     for (bi, data) in func.blocks.iter().enumerate() {
         let blk = Block(bi as u32);
         for &inst in &data.insts {
-            func.insts[inst.index()].op.for_operands(|v| users[v.index()].push((inst, blk)));
+            func.insts[inst.index()].op.for_operands(|v| {
+                if spec_def[v.index()] {
+                    users[v.index()].push((inst, blk));
+                }
+            });
         }
     }
     users
@@ -362,17 +366,20 @@ fn flush_moves(func: &mut Function, block: Block, moves: &mut Vec<Inst>) {
     func.blocks[block.index()].insts = next;
 }
 
-fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
+fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, has_child: bool, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
     flush_moves(func, block, &mut moves[block.index()]);
-    let insts = func.blocks[block.index()].insts.clone();
-    let body_len = insts.len().saturating_sub(1);
+    if !has_child {
+        return false;
+    }
+    let bi = block.index();
+    let len = func.blocks[bi].insts.len();
+    let body_len = len.saturating_sub(1);
     if body_len == 0 {
         return false;
     }
-    let mut kept = vec![true; insts.len()];
-    let mut changed = false;
+    let mut kept: Vec<bool> = Vec::new();
     for pos in (0..body_len).rev() {
-        let inst = insts[pos];
+        let inst = func.blocks[bi].insts[pos];
         let data = &func.insts[inst.index()];
         let Some(res) = data.result else { continue };
         if !data.op.is_speculable() {
@@ -381,6 +388,9 @@ fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, users: &mut [Vec<(In
         let Some(target) = pick_sink_target(func, cfg, block, &users[res.index()], (&data.op, moves)) else {
             continue;
         };
+        if kept.is_empty() {
+            kept.resize(len, true);
+        }
         kept[pos] = false;
         moves[target.index()].push(inst);
         data.op.for_operands(|v| {
@@ -390,26 +400,62 @@ fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, users: &mut [Vec<(In
                 }
             }
         });
-        changed = true;
     }
-    if changed {
+    if !kept.is_empty() {
         let mut idx = 0;
-        func.blocks[block.index()].insts.retain(|_| {
+        func.blocks[bi].insts.retain(|_| {
             let keep = kept[idx];
             idx += 1;
             keep
         });
+        return true;
     }
-    changed
+    false
 }
 
 fn sink_dominated(func: &mut Function) -> bool {
+    if func.blocks.len() <= 1 {
+        return false;
+    }
     let cfg = func.cfg().clone();
-    let mut users = build_users(func);
+    let mut has_child = vec![false; func.blocks.len()];
+    let mut any_child = false;
+    for &b in &cfg.rpo {
+        if let Some(p) = cfg.idom[b.index()]
+            && p != b
+        {
+            has_child[p.index()] = true;
+            any_child = true;
+        }
+    }
+    if !any_child {
+        return false;
+    }
+    let mut spec_def = vec![false; func.types.len()];
+    let mut any_spec = false;
+    for &b in &cfg.rpo {
+        if !has_child[b.index()] {
+            continue;
+        }
+        let insts = &func.blocks[b.index()].insts;
+        for &inst in &insts[..insts.len().saturating_sub(1)] {
+            let data = &func.insts[inst.index()];
+            if let Some(res) = data.result
+                && data.op.is_speculable()
+            {
+                spec_def[res.index()] = true;
+                any_spec = true;
+            }
+        }
+    }
+    if !any_spec {
+        return false;
+    }
+    let mut users = build_users(func, &spec_def);
     let mut moves = vec![Vec::new(); func.blocks.len()];
     let mut changed = false;
     for &block in &cfg.rpo {
-        changed |= sink_block(func, &cfg, block, &mut users, &mut moves);
+        changed |= sink_block(func, &cfg, block, has_child[block.index()], &mut users, &mut moves);
     }
     changed
 }
