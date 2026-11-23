@@ -1,4 +1,4 @@
-use crate::ir::{Block, Function, Op, Value};
+use crate::ir::{AtomicOrd, Block, Function, Op, Value};
 
 use super::for_edges;
 
@@ -40,7 +40,8 @@ pub(super) fn dead(func: &mut Function) -> bool {
         keep.resize(len, true);
         for at in (0..len).rev() {
             let data = &func.insts[func.blocks[b].insts[at].index()];
-            let dead = (data.op.is_removable() && data.result.is_some_and(|result| uses[result.index()] == 0))
+            let dead = ((data.op.is_removable() || matches!(data.op, Op::AtomicLoad(_, AtomicOrd::Relaxed)))
+                && data.result.is_some_and(|result| uses[result.index()] == 0))
                 || (!zeros.is_empty() && func.pure_thread_cell_result(&data.op, |v| zeros[v.index()]).is_some_and(|result| uses[result.index()] == 0));
             if dead {
                 keep[at] = false;

@@ -95,7 +95,6 @@ fn finish_slot_escape(
             esc.unescaped[s.index()] = false;
             esc.call_readonly[s.index()] = false;
             esc.return_only[s.index()] = false;
-            esc.spilled[s.index()] = true;
         }
     }
     esc
