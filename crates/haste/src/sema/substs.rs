@@ -128,6 +128,59 @@ impl ProjPool {
     }
 }
 
+/// An interned slice of item references, such as trait object associated types or auto traits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ItemList(pub u32);
+
+impl ItemList {
+    /// The empty slice of item references.
+    pub const EMPTY: ItemList = ItemList(0);
+}
+
+/// A sharded thread-safe interner of `[ItemRef]` slices with lock-free reads.
+#[derive(Clone, Default)]
+pub struct ItemListPool {
+    inner: Arc<Interner<Arc<[ItemRef]>, SHARDS, PROJ_SLAB, PROJ_SLABS>>,
+}
+
+impl ItemListPool {
+    /// Interns `slice` and returns its handle, returning `ItemList::EMPTY` without locking when empty.
+    pub fn intern(&self, slice: &[ItemRef]) -> ItemList {
+        if slice.is_empty() {
+            return ItemList::EMPTY;
+        }
+        ItemList(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))))
+    }
+
+    /// The slice of item references that `id` names.
+    pub fn get(&self, id: ItemList) -> &[ItemRef] {
+        let Some(slot) = slot(id.0) else { return &[] };
+        self.inner.get(slot)
+    }
+}
+
+/// An interned valid range `(start, end)` for a pattern type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PatRange(pub u32);
+
+/// A sharded thread-safe interner of `(u128, u128)` pattern ranges with lock-free reads.
+#[derive(Clone, Default)]
+pub struct PatPool {
+    inner: Arc<Interner<(u128, u128), SHARDS, PROJ_SLAB, PROJ_SLABS>>,
+}
+
+impl PatPool {
+    /// Interns `range` and returns its handle.
+    pub fn intern(&self, range: (u128, u128)) -> PatRange {
+        PatRange(handle(self.inner.intern(&range, |range, _| *range)))
+    }
+
+    /// The `(start, end)` range that `id` names.
+    pub fn get(&self, id: PatRange) -> (u128, u128) {
+        *self.inner.get(slot(id.0).expect("interned pattern range"))
+    }
+}
+
 /// A sorted immutable key-value table backed by a single boxed slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedMap<K, V>(Box<[(K, V)]>);

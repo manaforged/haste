@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rustc_hash::FxHasher;
@@ -109,32 +109,63 @@ impl<T, const SLAB: usize, const SLABS: usize> Slab<T, SLAB, SLABS> {
     }
 }
 
-pub(crate) struct AtomicU32Slab<const SLAB: usize, const SLABS: usize> {
-    slabs: Box<[OnceLock<Box<[AtomicU32]>>]>,
+pub(crate) trait AtomicWord: Sized {
+    type Val: Copy + Eq;
+    const ZERO: Self::Val;
+    fn new_zero() -> Self;
+    fn load_acquire(&self) -> Self::Val;
+    fn store_release(&self, value: Self::Val);
 }
 
-impl<const SLAB: usize, const SLABS: usize> Default for AtomicU32Slab<SLAB, SLABS> {
+impl AtomicWord for AtomicU8 {
+    type Val = u8;
+    const ZERO: u8 = 0;
+    fn new_zero() -> Self { Self::new(0) }
+    #[inline]
+    fn load_acquire(&self) -> u8 { self.load(Ordering::Acquire) }
+    #[inline]
+    fn store_release(&self, value: u8) { self.store(value, Ordering::Release) }
+}
+
+impl AtomicWord for AtomicU32 {
+    type Val = u32;
+    const ZERO: u32 = 0;
+    fn new_zero() -> Self { Self::new(0) }
+    #[inline]
+    fn load_acquire(&self) -> u32 { self.load(Ordering::Acquire) }
+    #[inline]
+    fn store_release(&self, value: u32) { self.store(value, Ordering::Release) }
+}
+
+pub(crate) struct AtomicSlab<A, const SLAB: usize, const SLABS: usize> {
+    slabs: Box<[OnceLock<Box<[A]>>]>,
+}
+
+impl<A, const SLAB: usize, const SLABS: usize> Default for AtomicSlab<A, SLAB, SLABS> {
     fn default() -> Self {
         Self { slabs: (0..SLABS).map(|_| OnceLock::new()).collect::<Vec<_>>().into_boxed_slice() }
     }
 }
 
-impl<const SLAB: usize, const SLABS: usize> AtomicU32Slab<SLAB, SLABS> {
+impl<A: AtomicWord, const SLAB: usize, const SLABS: usize> AtomicSlab<A, SLAB, SLABS> {
     #[inline]
-    pub(crate) fn get(&self, index: usize) -> Option<u32> {
-        let val = self.slabs.get(index / SLAB)?.get()?[index % SLAB].load(Ordering::Acquire);
-        (val != 0).then_some(val)
+    pub(crate) fn get(&self, index: usize) -> Option<A::Val> {
+        let val = self.slabs.get(index / SLAB)?.get()?[index % SLAB].load_acquire();
+        (val != A::ZERO).then_some(val)
     }
 
-    pub(crate) fn set(&self, index: usize, value: u32) {
-        debug_assert!(value != 0);
+    pub(crate) fn set(&self, index: usize, value: A::Val) {
+        debug_assert!(value != A::ZERO);
         if index >= SLAB * SLABS {
             return;
         }
-        let slab = self.slabs[index / SLAB].get_or_init(|| (0..SLAB).map(|_| AtomicU32::new(0)).collect::<Vec<_>>().into_boxed_slice());
-        slab[index % SLAB].store(value, Ordering::Release);
+        let slab = self.slabs[index / SLAB].get_or_init(|| (0..SLAB).map(|_| A::new_zero()).collect::<Vec<_>>().into_boxed_slice());
+        slab[index % SLAB].store_release(value);
     }
 }
+
+pub(crate) type AtomicU8Slab<const SLAB: usize, const SLABS: usize> = AtomicSlab<AtomicU8, SLAB, SLABS>;
+pub(crate) type AtomicU32Slab<const SLAB: usize, const SLABS: usize> = AtomicSlab<AtomicU32, SLAB, SLABS>;
 
 #[derive(Default)]
 struct IndexTable {
@@ -195,7 +226,7 @@ impl IndexTable {
     }
 }
 
-const INTERNER_CACHE: usize = 16_384;
+const INTERNER_CACHE: usize = 65_536;
 
 pub(crate) struct Interner<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> {
     cache: Box<[AtomicU64]>,

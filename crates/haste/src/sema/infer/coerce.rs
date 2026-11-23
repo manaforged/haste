@@ -450,14 +450,14 @@ impl Infer<'_, '_> {
     /// Deduces a callable `FnPtr` signature from a trait object's supertraits when the object's principal trait is not itself a callable lang trait.
     pub(super) fn dyn_callable_super_sig(&mut self, ty: Ty) -> Result<Option<Ty>> {
         let ty = self.resolve(ty);
-        let Kind::Dyn(of, parts, members, _) = self.cx.types.kind(ty).clone() else {
+        let Kind::Dyn(of, parts, members, _) = *self.cx.types.kind(ty) else {
             return Ok(None);
         };
         if self.is_callable_trait(of) {
             return Ok(None);
         }
         let (obj_output, init_substs) = {
-            let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), &members);
+            let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), self.cx.types.items(members));
             let obj_output = bound.find(|&(m, _)| self.cx.name(m) == "Output").map(|(_, out)| out);
             let init_substs = std::iter::once(ty).chain(given.iter().copied()).collect::<Vec<Ty>>();
             (obj_output, init_substs)

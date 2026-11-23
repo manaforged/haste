@@ -149,10 +149,10 @@ impl Indirect {
 /// The parameter and return types of the call that a trait object of type `ty` and trait `of` makes through its slot for trait method `method`, whose trait is `of` itself or one without type parameters.
 fn virtual_signature(cx: &mut Context<'_>, (ty, of): (Ty, ItemRef), method: ItemRef) -> Option<(Vec<Ty>, Option<Ty>)> {
     let owner = cx.owner_trait(method)?;
-    let Kind::Dyn(_, args, members, _) = cx.types.kind(ty).clone() else { return None };
+    let Kind::Dyn(_, args, members, _) = *cx.types.kind(ty) else { return None };
     let substs = if owner == of {
         let all = cx.types.substs(args).to_vec();
-        let given = crate::sema::ty::object_parts(&all, &members).0.to_vec();
+        let given = crate::sema::ty::object_parts(&all, cx.types.items(members)).0.to_vec();
         std::iter::once(ty).chain(given).collect::<Vec<_>>()
     } else {
         let generics = cx.trait_generics(owner).ok()?;

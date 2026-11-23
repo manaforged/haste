@@ -9,9 +9,9 @@ use super::{Infer, Res};
 impl Infer<'_, '_> {
     /// Infers the call `expr` of the `dyn Fn` or `dyn FnMut` value of type `ty`, recording it as a call of `call` or `call_mut` on the trait object.
     pub(super) fn object_call(&mut self, (expr, found): (ExprId, Ty), ty: Ty, args: List) -> Result<Ty> {
-        let Kind::Dyn(of, parts, members, _) = self.cx.types.kind(ty).clone() else { bail!("an object call of a type that is not a trait object") };
+        let Kind::Dyn(of, parts, members, _) = *self.cx.types.kind(ty) else { bail!("an object call of a type that is not a trait object") };
         let (tuple, bound_ret) = {
-            let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), &members);
+            let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), self.cx.types.items(members));
             let Some(&tuple) = given.first() else { bail!("a callable trait object with no argument tuple") };
             (tuple, bound.next().map(|(_, ret)| ret))
         };

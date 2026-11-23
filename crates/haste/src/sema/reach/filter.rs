@@ -434,7 +434,7 @@ fn ty_has_non_fixed_memo(
         }
         Kind::Dyn(tr, args, assoc, auto) => {
             !outline.is_fixed(tr.krate)
-                || assoc.iter().chain(auto).any(|d| !outline.is_fixed(d.krate))
+                || types.items(*assoc).iter().chain(types.items(*auto)).any(|d| !outline.is_fixed(d.krate))
                 || substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
         }
         Kind::Proj(_) | Kind::Param(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => true,

@@ -405,7 +405,8 @@ fn hash_ty_facts_depth(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u
             mix.byte(0x1b);
             hash_dyn_facts(cx, mix, ty, of)?;
         }
-        Kind::Pat(inner, start, end) => {
+        Kind::Pat(inner, range) => {
+            let (start, end) = cx.types.pat(range);
             mix.byte(0x1c);
             mix.u128(start);
             mix.u128(end);

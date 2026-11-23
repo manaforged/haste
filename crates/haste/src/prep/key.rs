@@ -107,7 +107,7 @@ impl Keys {
             Kind::FnDef(item, args) => form::fn_def(&self.function(cx, item)?, &self.list(cx, &cx.types.substs(args).to_vec())?),
             Kind::Closure(..) => self.closure(cx, ty)?,
             Kind::FnPtr(params, ret) => form::fn_ptr(&self.types(cx, &cx.types.substs(params).to_vec())?, &self.ty(cx, ret)?),
-            Kind::Dyn(of, args, members, _) => self.object(cx, of, (&cx.types.substs(args).to_vec(), &members))?,
+            Kind::Dyn(of, args, members, _) => self.object(cx, of, (&cx.types.substs(args).to_vec(), &cx.types.items(members).to_vec()))?,
             _ => return Err(Miss::Unnamed),
         })
     }

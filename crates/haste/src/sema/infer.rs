@@ -571,7 +571,7 @@ impl Infer<'_, '_> {
             (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => Action::One(*x, *y),
             (Kind::Array(x, m), Kind::Array(y, n)) => Action::Two(*x, *y, *m, *n),
             (Kind::Slice(x), Kind::Slice(y)) => Action::One(*x, *y),
-            (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => Action::One(*x, *y),
+            (Kind::Pat(x, r1), Kind::Pat(y, r2)) if r1 == r2 => Action::One(*x, *y),
             (ka @ (Kind::Adt(i, x) | Kind::FnDef(i, x) | Kind::Dyn(i, x, ..)), kb @ (Kind::Adt(j, y) | Kind::FnDef(j, y) | Kind::Dyn(j, y, ..)))
                 if std::mem::discriminant(ka) == std::mem::discriminant(kb) && i == j && dyn_members(ka) == dyn_members(kb) => Action::Substs(*x, *y),
             (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => Action::FnPtr(*x, *y, *r, *s),
@@ -754,10 +754,10 @@ impl Infer<'_, '_> {
     }
 }
 
-fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
-    match kind {
+fn dyn_members(kind: &Kind) -> (super::substs::ItemList, super::substs::ItemList) {
+    match *kind {
         Kind::Dyn(_, _, members, autos) => (members, autos),
-        _ => (&[], &[]),
+        _ => (super::substs::ItemList::EMPTY, super::substs::ItemList::EMPTY),
     }
 }
 

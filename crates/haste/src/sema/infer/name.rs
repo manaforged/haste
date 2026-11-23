@@ -18,7 +18,7 @@ pub fn type_name(cx: &mut Context<'_>, ty: Ty) -> String {
         }
         Kind::FnPtr(params, ret) => format!("fn({}){}", names(cx, cx.types.substs(params).to_vec()).join(", "), returns(cx, ret)),
         Kind::Closure(item, ..) => format!("{}::{{{{closure}}}}", def_path(cx, item)),
-        Kind::Dyn(of, args, members, autos) => dyn_name(cx, (of, args), &members, &autos),
+        Kind::Dyn(of, args, members, autos) => dyn_name(cx, (of, args), &cx.types.items(members).to_vec(), &cx.types.items(autos).to_vec()),
         _ => shape_name(cx, ty),
     }
 }

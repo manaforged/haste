@@ -519,7 +519,8 @@ impl<'a> Infer<'_, 'a> {
                 bail!("a trait object with no trait");
             }
             let first = autos.remove(0);
-            return Ok(Kind::Dyn(first, Substs::EMPTY, Vec::new(), autos));
+            let autos = self.cx.types.intern_items(&autos);
+            return Ok(Kind::Dyn(first, Substs::EMPTY, super::super::substs::ItemList::EMPTY, autos));
         };
         let count = arena.list(arena.path(path).segments).len();
         let given = self.segment_args(arena, path, count)?;
@@ -537,7 +538,8 @@ impl<'a> Infer<'_, 'a> {
         bound.sort_by_key(|(member, _)| (member.krate, member.file, member.item));
         let (members, tys): (Vec<ItemRef>, Vec<Ty>) = bound.into_iter().unzip();
         let parts: Vec<Ty> = given.into_iter().chain(tys).collect();
-        Ok(Kind::Dyn(of, self.cx.types.intern_substs(&parts), members, autos))
+        let (parts, members, autos) = (self.cx.types.intern_substs(&parts), self.cx.types.intern_items(&members), self.cx.types.intern_items(&autos));
+        Ok(Kind::Dyn(of, parts, members, autos))
     }
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame over the alias's own source, when the impl has one.

@@ -97,7 +97,7 @@ impl ActiveAttrs {
 
 pub(super) struct LangMap {
     pub(super) map: HashMap<ItemRef, Box<str>>,
-    bloom: [u64; 32],
+    bloom: [u64; 64],
     crates_lo: u64,
     crates_hi: u64,
     any_high: bool,
@@ -105,15 +105,17 @@ pub(super) struct LangMap {
 
 impl LangMap {
     #[inline]
-    fn bloom_bit(item: ItemRef) -> (usize, u64) {
-        let h = item.file.wrapping_mul(0x9E37_79B1) ^ item.item.wrapping_mul(0x85EB_CA77);
-        let bit = ((h ^ (h >> 16)) as usize) & 2047;
-        (bit >> 6, 1u64 << (bit & 63))
+    fn bloom_bits(item: ItemRef) -> (usize, u64, usize, u64) {
+        let h1 = item.file.wrapping_mul(0x9E37_79B1) ^ item.item.wrapping_mul(0x85EB_CA77);
+        let h2 = item.file.wrapping_mul(0xC2B2_AE35) ^ item.item.wrapping_mul(0x27D4_EB2F);
+        let b1 = ((h1 ^ (h1 >> 16)) as usize) & 4095;
+        let b2 = ((h2 ^ (h2 >> 16)) as usize) & 4095;
+        (b1 >> 6, 1u64 << (b1 & 63), b2 >> 6, 1u64 << (b2 & 63))
     }
 
     pub(super) fn from_map(map: HashMap<ItemRef, Box<str>>) -> Self {
         let (mut crates_lo, mut crates_hi, mut any_high) = (0u64, 0u64, false);
-        let mut bloom = [0u64; 32];
+        let mut bloom = [0u64; 64];
         for &item in map.keys() {
             if item.krate < 64 {
                 crates_lo |= 1u64 << item.krate;
@@ -122,8 +124,9 @@ impl LangMap {
             } else {
                 any_high = true;
             }
-            let (word, mask) = Self::bloom_bit(item);
-            bloom[word] |= mask;
+            let (w1, m1, w2, m2) = Self::bloom_bits(item);
+            bloom[w1] |= m1;
+            bloom[w2] |= m2;
         }
         Self { map, bloom, crates_lo, crates_hi, any_high }
     }
@@ -140,8 +143,8 @@ impl LangMap {
         if !has_krate {
             return false;
         }
-        let (word, mask) = Self::bloom_bit(item);
-        (self.bloom[word] & mask) != 0
+        let (w1, m1, w2, m2) = Self::bloom_bits(item);
+        (self.bloom[w1] & m1) != 0 && (self.bloom[w2] & m2) != 0
     }
 }
 

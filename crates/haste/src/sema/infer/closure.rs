@@ -539,11 +539,11 @@ impl<'a> Infer<'_, 'a> {
         let expected = self.resolve(expected);
         let own_ret = self.out.ret.is_some_and(|ret| self.resolve(ret) == expected);
         let expected = self.ret_sig.filter(|_| own_ret).unwrap_or(expected);
-        match self.cx.types.kind(expected).clone() {
+        match *self.cx.types.kind(expected) {
             Kind::FnPtr(inputs, output) => Some((self.cx.types.substs(inputs).to_vec(), output)),
             Kind::Dyn(of, parts, members, _) if self.is_callable_trait(of) => {
                 let (first, output) = {
-                    let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), &members);
+                    let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), self.cx.types.items(members));
                     (*given.first()?, bound.next().map(|(_, ty)| ty))
                 };
                 let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(first)) else { return None };

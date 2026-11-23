@@ -62,8 +62,9 @@ impl<'a> Infer<'_, 'a> {
         let Some(is) = (open + 1..close).find(|&at| src.kind(at) == TokenKind::Ident && src.text(at) == "is") else { bail!("pattern_type! needs `is`") };
         let (inner, base) = syntax::parse_ty(src, open + 1, is)?;
         let base = self.lower_ty(&inner, base)?;
-        let (start, end) = self.valid_range(base, (is + 1, close))?;
-        Ok(self.cx.types.intern(Kind::Pat(base, start, end)))
+        let bounds = self.valid_range(base, (is + 1, close))?;
+        let range = self.cx.types.intern_pat(bounds);
+        Ok(self.cx.types.intern(Kind::Pat(base, range)))
     }
 
     fn valid_range(&mut self, base: Ty, (from, to): (u32, u32)) -> Result<(u128, u128)> {

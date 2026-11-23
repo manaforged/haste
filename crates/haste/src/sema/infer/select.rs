@@ -612,8 +612,8 @@ impl<'a> Infer<'_, 'a> {
             Kind::Adt(item, items) | Kind::FnDef(item, items) => { item.hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
             Kind::FnPtr(params, ret) => { self.hash_list(self.cx.types.substs(*params), hasher, seen); self.hash_canonical(*ret, hasher, seen); }
             Kind::Closure(item, items, id) => { (item, id).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
-            Kind::Dyn(of, items, members, autos) => { (of, members, autos).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
-            Kind::Pat(base, start, end) => { (start, end).hash(hasher); self.hash_canonical(*base, hasher, seen); }
+            Kind::Dyn(of, items, members, autos) => { (of, self.cx.types.items(*members), self.cx.types.items(*autos)).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
+            Kind::Pat(base, range) => { self.cx.types.pat(*range).hash(hasher); self.hash_canonical(*base, hasher, seen); }
         }
     }
 
@@ -645,8 +645,8 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
     pub(in crate::sema) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
-        let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
-        let given = super::super::ty::object_parts(self.cx.types.substs(parts), &members).0.to_vec();
+        let Kind::Dyn(object, parts, members, _) = *self.cx.types.kind(self.resolve(ty)) else { return None };
+        let given = super::super::ty::object_parts(self.cx.types.substs(parts), self.cx.types.items(members)).0.to_vec();
         let same_family = (self.is_sync_callable_trait(object) && self.is_sync_callable_trait(of))
             || (self.is_async_callable_trait(object) && self.is_async_callable_trait(of));
         if object != of && same_family {

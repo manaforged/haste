@@ -704,14 +704,14 @@ fn resolve_call_override(infer: &mut Infer<'_, '_>, expr: ExprId, found: Ty, tup
             Ok(CallOverride { expr, res, autoderefs, overloaded: false, box_free: None })
         }
         Kind::FnPtr(..) => Ok(CallOverride { expr, res: None, autoderefs, overloaded: false, box_free: None }),
-        Kind::Dyn(of, parts, members, _) if infer.is_callable_trait(of) => resolve_dyn_call(infer, (expr, found, ty), (of, parts, &members), autoderefs),
+        Kind::Dyn(of, parts, members, _) if infer.is_callable_trait(of) => resolve_dyn_call(infer, (expr, found, ty), (of, parts, members), autoderefs),
         Kind::Adt(..) => resolve_overloaded_call(infer, expr, found, tuple),
         _ => bail!("unsupported concrete callable {}", infer.show(ty)),
     }
 }
 
-fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, &[ItemRef]), autoderefs: Option<u32>) -> Result<CallOverride> {
-    let dyn_tuple = *object_parts(infer.cx.types.substs(parts), members).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
+fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, super::substs::ItemList), autoderefs: Option<u32>) -> Result<CallOverride> {
+    let dyn_tuple = *object_parts(infer.cx.types.substs(parts), infer.cx.types.items(members)).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
     let name = super::infer::callable_method_name(infer.cx.lang(of));
     let box_free = matches!(name, "call_once" | "async_call_once")
         .then(|| resolve_box_free(infer, found, autoderefs))

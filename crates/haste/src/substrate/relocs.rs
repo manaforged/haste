@@ -305,12 +305,13 @@ where
                 rec.push(11);
                 write_u32(&mut rec, self.item_id(o)?);
                 write_u32s(&mut rec, &self.substs_ids(s)?);
-                let ms = m.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
-                let aus = a.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
+                let (m_vec, a_vec) = (self.types.items(m).to_vec(), self.types.items(a).to_vec());
+                let ms = m_vec.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
+                let aus = a_vec.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
                 write_u32s(&mut rec, &ms);
                 write_u32s(&mut rec, &aus);
             }
-            Kind::Pat(b, lo, hi) => { rec.push(12); write_u32(&mut rec, self.ty_id(b)?); write_u128(&mut rec, lo); write_u128(&mut rec, hi); }
+            Kind::Pat(b, range) => { let (lo, hi) = self.types.pat(range); rec.push(12); write_u32(&mut rec, self.ty_id(b)?); write_u128(&mut rec, lo); write_u128(&mut rec, hi); }
             Kind::Value(v) => { rec.push(13); write_u128(&mut rec, v); }
             Kind::Param(p) => { rec.push(14); write_u16(&mut rec, p); }
             Kind::Proj(id) => {
@@ -671,9 +672,9 @@ fn read_ty(cur: &mut Cursor<'_>, types: &Types, items: &[ItemRef], tys: &[Ty]) -
             for _ in 0..a_count {
                 autos.push(item_at(cur.u32()?)?);
             }
-            Kind::Dyn(of, s, members, autos)
+            Kind::Dyn(of, s, types.intern_items(&members), types.intern_items(&autos))
         }
-        12 => Kind::Pat(ty_at(tys, cur.u32()?)?, cur.u128()?, cur.u128()?),
+        12 => Kind::Pat(ty_at(tys, cur.u32()?)?, types.intern_pat((cur.u128()?, cur.u128()?))),
         13 => Kind::Value(cur.u128()?),
         14 => Kind::Param(cur.u16()?),
         15 => Kind::Proj(types.intern_proj(ProjDef {

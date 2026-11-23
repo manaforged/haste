@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::names::{ItemRef, Primitive};
-use crate::sync::{AtomicU32Slab, Interner, Slab};
+use crate::sync::{AtomicU8Slab, AtomicU32Slab, Interner};
 
-use super::substs::{ProjDef, ProjId, ProjPool, Substs, SubstsPool};
+use super::substs::{ItemList, ItemListPool, PatPool, PatRange, ProjDef, ProjId, ProjPool, Substs, SubstsPool};
 
 /// An interned type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,7 +22,7 @@ pub enum Mut {
 }
 
 /// The shape of a type.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Prim(Primitive),
     Never,
@@ -38,8 +38,8 @@ pub enum Kind {
     /// The closure expression `2` of the body of `0` at type arguments `1`.
     Closure(ItemRef, Substs, u32),
     /// A trait object of the trait `0`: its trait arguments, then the type bound to each associated type in `2`, with the sorted auto traits `3`.
-    Dyn(ItemRef, Substs, Vec<ItemRef>, Vec<ItemRef>),
-    Pat(Ty, u128, u128),
+    Dyn(ItemRef, Substs, ItemList, ItemList),
+    Pat(Ty, PatRange),
     /// The value of a const generic argument, as the bits of its type.
     Value(u128),
     /// A rigid generic type or const parameter by its slot in the item's substitutions.
@@ -85,6 +85,7 @@ const FLAG_VAR: u8 = 2;
 const FLAG_PROJ: u8 = 4;
 const FLAG_CLOSURE: u8 = 8;
 const FLAG_NONE: u8 = 16;
+const FLAG_SET: u8 = 0x80;
 
 const TY_SHARDS: usize = 128;
 const TY_SLAB: usize = 65_536;
@@ -132,15 +133,25 @@ struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 7]);
 #[derive(Clone)]
 pub struct Types {
     inner: Arc<Interner<Kind, TY_SHARDS, TY_SLAB, TY_SLABS>>,
-    flags: Arc<Slab<u8, TY_SLAB, TY_SLABS>>,
+    flags: Arc<AtomicU8Slab<TY_SLAB, TY_SLABS>>,
     unary: Arc<UnaryCache>,
     substs: SubstsPool,
     projs: ProjPool,
+    items: ItemListPool,
+    pats: PatPool,
 }
 
 impl Default for Types {
     fn default() -> Self {
-        let types = Self { inner: Arc::default(), flags: Arc::default(), unary: Arc::default(), substs: SubstsPool::default(), projs: ProjPool::default() };
+        let types = Self {
+            inner: Arc::default(),
+            flags: Arc::default(),
+            unary: Arc::default(),
+            substs: SubstsPool::default(),
+            projs: ProjPool::default(),
+            items: ItemListPool::default(),
+            pats: PatPool::default(),
+        };
         let fixed = ALL_PRIMITIVES
             .into_iter()
             .map(Kind::Prim)
@@ -214,8 +225,29 @@ impl Types {
         self.projs.get(id)
     }
 
+    /// Interns `slice` into an `ItemList` handle.
+    pub fn intern_items(&self, slice: &[ItemRef]) -> ItemList {
+        self.items.intern(slice)
+    }
+
+    /// The slice of item references that `id` names.
+    pub fn items(&self, id: ItemList) -> &[ItemRef] {
+        self.items.get(id)
+    }
+
+    /// Interns `range` into a `PatRange` handle.
+    pub fn intern_pat(&self, range: (u128, u128)) -> PatRange {
+        self.pats.intern(range)
+    }
+
+    /// The `(start, end)` range that `id` names.
+    pub fn pat(&self, id: PatRange) -> (u128, u128) {
+        self.pats.get(id)
+    }
+
+    #[inline]
     fn flags_of(&self, ty: Ty) -> u8 {
-        if ty == Ty::NONE { FLAG_NONE } else { self.flags.get(ty.0 as usize).copied().unwrap_or(0) }
+        if ty == Ty::NONE { FLAG_NONE } else { self.flags.get(ty.0 as usize).unwrap_or(0) & !FLAG_SET }
     }
 
     fn substs_flags(&self, substs: Substs) -> u8 {
@@ -284,7 +316,7 @@ impl Types {
 
     fn intern_slow(&self, kind: Kind) -> Ty {
         Ty(self.inner.intern_owned(kind, |kind, id| {
-            self.flags.set(id as usize, self.kind_flags(kind));
+            self.flags.set(id as usize, self.kind_flags(kind) | FLAG_SET);
         }))
     }
 
@@ -398,102 +430,72 @@ pub(in crate::sema) fn try_map_substs<S, E>(
     }
 }
 
-enum ChildShape {
-    Tuple(Substs),
-    Ref(Mut, Ty),
-    Ptr(Mut, Ty),
-    Array(Ty, Ty),
-    Slice(Ty),
-    Adt(ItemRef, Substs),
-    FnDef(ItemRef, Substs),
-    Closure(ItemRef, Substs, u32),
-    Dyn(ItemRef, Substs, Vec<ItemRef>, Vec<ItemRef>),
-    FnPtr(Substs, Ty),
-    Pat(Ty, u128, u128),
-    Proj(ProjId),
-}
-
-/// Maps direct child types of `ty` via `f` without cloning `Kind` or pool handles, returning `ty` unchanged when no child changed.
+/// Maps direct child types of `ty` via `f` without cloning pool handles, returning `ty` unchanged when no child changed.
 pub(in crate::sema) fn try_map_children<S, E>(
     state: &mut S,
     ty: Ty,
     types_of: fn(&S) -> &Types,
     f: &mut impl FnMut(&mut S, Ty) -> Result<Ty, E>,
 ) -> Result<Ty, E> {
-    let shape = match types_of(state).kind(ty) {
-        Kind::Tuple(items) => ChildShape::Tuple(*items),
-        Kind::Ref(mutable, inner) => ChildShape::Ref(*mutable, *inner),
-        Kind::Ptr(mutable, inner) => ChildShape::Ptr(*mutable, *inner),
-        Kind::Array(inner, len) => ChildShape::Array(*inner, *len),
-        Kind::Slice(inner) => ChildShape::Slice(*inner),
-        Kind::Adt(item, args) => ChildShape::Adt(*item, *args),
-        Kind::FnDef(item, args) => ChildShape::FnDef(*item, *args),
-        Kind::Closure(parent, args, at) => ChildShape::Closure(*parent, *args, *at),
-        Kind::Dyn(of, args, members, autos) => ChildShape::Dyn(*of, *args, members.clone(), autos.clone()),
-        Kind::FnPtr(params, ret) => ChildShape::FnPtr(*params, *ret),
-        Kind::Pat(base, start, end) => ChildShape::Pat(*base, *start, *end),
-        Kind::Proj(id) => ChildShape::Proj(*id),
-        _ => return Ok(ty),
-    };
-    let next = match shape {
-        ChildShape::Tuple(items) => {
+    let next = match *types_of(state).kind(ty) {
+        Kind::Tuple(items) => {
             let mapped = try_map_substs(state, items, types_of, f)?;
             if mapped == items { return Ok(ty); }
             Kind::Tuple(mapped)
         }
-        ChildShape::Ref(mutable, inner) => {
+        Kind::Ref(mutable, inner) => {
             let mapped = f(state, inner)?;
             if mapped == inner { return Ok(ty); }
             Kind::Ref(mutable, mapped)
         }
-        ChildShape::Ptr(mutable, inner) => {
+        Kind::Ptr(mutable, inner) => {
             let mapped = f(state, inner)?;
             if mapped == inner { return Ok(ty); }
             Kind::Ptr(mutable, mapped)
         }
-        ChildShape::Array(inner, len) => {
+        Kind::Array(inner, len) => {
             let m_inner = f(state, inner)?;
             let m_len = f(state, len)?;
             if m_inner == inner && m_len == len { return Ok(ty); }
             Kind::Array(m_inner, m_len)
         }
-        ChildShape::Slice(inner) => {
+        Kind::Slice(inner) => {
             let mapped = f(state, inner)?;
             if mapped == inner { return Ok(ty); }
             Kind::Slice(mapped)
         }
-        ChildShape::Adt(item, args) => {
+        Kind::Adt(item, args) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
             if mapped == args { return Ok(ty); }
             Kind::Adt(item, mapped)
         }
-        ChildShape::FnDef(item, args) => {
+        Kind::FnDef(item, args) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
             if mapped == args { return Ok(ty); }
             Kind::FnDef(item, mapped)
         }
-        ChildShape::Closure(parent, args, at) => {
+        Kind::Closure(parent, args, at) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
             if mapped == args { return Ok(ty); }
             Kind::Closure(parent, mapped, at)
         }
-        ChildShape::Dyn(of, args, members, autos) => {
+        Kind::Dyn(of, args, members, autos) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
             if mapped == args { return Ok(ty); }
             Kind::Dyn(of, mapped, members, autos)
         }
-        ChildShape::FnPtr(params, ret) => {
+        Kind::FnPtr(params, ret) => {
             let m_params = try_map_substs(state, params, types_of, f)?;
             let m_ret = f(state, ret)?;
             if m_params == params && m_ret == ret { return Ok(ty); }
             Kind::FnPtr(m_params, m_ret)
         }
-        ChildShape::Pat(base, start, end) => {
+        Kind::Pat(base, range) => {
             let mapped = f(state, base)?;
             if mapped == base { return Ok(ty); }
-            Kind::Pat(mapped, start, end)
+            Kind::Pat(mapped, range)
         }
-        ChildShape::Proj(id) => {
+        Kind::Proj(id) => {
             let def = types_of(state).proj(id);
             let self_ty = f(state, def.self_ty)?;
             let args = try_map_substs(state, def.args, types_of, f)?;
@@ -503,6 +505,7 @@ pub(in crate::sema) fn try_map_children<S, E>(
             }
             Kind::Proj(types_of(state).intern_proj(ProjDef { self_ty, args, own, ..def }))
         }
+        _ => return Ok(ty),
     };
     Ok(types_of(state).intern(next))
 }
