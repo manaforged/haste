@@ -588,6 +588,9 @@ fn group_tail_sites<K: Eq + std::hash::Hash + Clone>(
 }
 
 fn factor_common_returns(func: &mut Function, cfg_dirty: bool) -> bool {
+    if func.blocks.iter().filter(|b| b.insts.len() >= 2 && matches!(b.insts.last().map(|i| &func.insts[i.index()].op), Some(Op::Return(_)))).count() < MIN_TAIL_GROUP {
+        return false;
+    }
     if cfg_dirty {
         func.bump_cfg();
     }
@@ -629,6 +632,9 @@ fn jump_site_entry(func: &Function, consts: &[Option<i64>], uses: &[u32], block:
 }
 
 fn factor_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
+    if func.blocks.iter().filter(|b| b.insts.len() >= 2 && matches!(b.insts.last().map(|i| &func.insts[i.index()].op), Some(Op::Jump(_, a)) if !a.is_empty())).count() < MIN_TAIL_GROUP {
+        return false;
+    }
     if cfg_dirty {
         func.bump_cfg();
     }

@@ -687,9 +687,10 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
 /// Rewrites constant unsigned divisions/remainders, unsigned zero compares, negated shift-adds, converts, shifts, selects, and bitwise/SWAR masks, returning whether anything changed.
 pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) -> bool {
     let len = func.types.len();
-    let (mut consts, mut fits_used) = (vec![None; len], vec![false; len]);
+    let (mut consts, mut fits_used, mut uses) = (vec![None; len], vec![false; len], vec![0_u32; len]);
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let data = &func.insts[inst.index()];
+        data.op.for_operands(|v| uses[v.index()] += 1);
         if let (Op::Const(imm), Some(res)) = (&data.op, data.result) {
             consts[res.index()] = Some(*imm);
         }
@@ -698,7 +699,6 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) -> boo
             fits_used[y.index()] = true;
         }
     }
-    let uses = func.use_counts();
     let mut cx = RewriteCx { func, defs: initial_defs.to_vec(), consts, uses, out: Vec::new(), subst: Vec::new(), changed: false };
     for b in 0..cx.func.blocks.len() {
         let old = std::mem::take(&mut cx.func.blocks[b].insts);

@@ -69,7 +69,7 @@ fn settles(edge: &Edge, local: &[usize], value: Value, plain: bool) -> bool {
 
 fn incoming(func: &Function, cx: &ThreadCx<'_>, (cfg, single): (&Cfg, &[Option<Block>]), disp: Block, found: &[(Inst, Value)]) -> Option<Vec<Edge>> {
     let params = func.blocks[disp.index()].params.len();
-    let mut preds = cfg.preds[disp.index()].clone();
+    let mut preds = cfg.preds_of(disp).to_vec();
     preds.sort_unstable();
     preds.dedup();
     let mut edges = Vec::new();

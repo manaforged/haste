@@ -435,7 +435,7 @@ impl Pass {
     }
 
     fn prepare(&mut self, vars: usize) {
-        let need = vars * self.cfg.preds.len();
+        let need = vars * self.cfg.reachable.len();
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
             self.memo.fill((0, Value(0)));
@@ -456,7 +456,7 @@ impl Pass {
 
     fn step(&mut self, build: &mut Build, var: SlotVar, block: Block) -> Option<Step> {
         let ty = self.scan.vars[var.index].home();
-        let preds = &self.cfg.preds[block.index()];
+        let preds = self.cfg.preds_of(block);
         if self.cfg.entry == Some(block) && !preds.is_empty() {
             return None;
         }
@@ -475,7 +475,7 @@ impl Pass {
     }
 
     fn entry(&mut self, build: &mut Build, var: SlotVar, start: Block) -> Option<Value> {
-        let blocks = self.cfg.preds.len();
+        let blocks = self.cfg.reachable.len();
         self.path.clear();
         let mut block = start;
         let value = loop {
@@ -509,10 +509,10 @@ impl Pass {
         let mut next = 0;
         while next < build.phis.len() {
             let (block, var) = (build.phis[next].block, build.phis[next].var);
-            let count = self.cfg.preds[block.index()].len();
+            let count = self.cfg.preds_of(block).len();
             let mut args = Vec::with_capacity(count);
             for at in 0..count {
-                let pred = self.cfg.preds[block.index()][at];
+                let pred = self.cfg.preds_of(block)[at];
                 args.push(self.exit(build, var, pred)?);
             }
             build.phis[next].args = args;
@@ -590,7 +590,7 @@ impl Pass {
         }
         for phi in build.phis {
             func.blocks[phi.block.index()].params.push(phi.value);
-            let preds = &self.cfg.preds[phi.block.index()];
+            let preds = self.cfg.preds_of(phi.block);
             for (i, (pred, arg)) in preds.iter().zip(&phi.args).enumerate() {
                 if !preds[..i].contains(pred) {
                     push_edge_arg(func, *pred, phi.block, *arg);

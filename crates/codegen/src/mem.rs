@@ -250,19 +250,28 @@ fn seed_fresh_owners(func: &Function, cfg: &Cfg, entry: &[Value], affine: &[(Val
     }
 }
 
-fn seed_thread_cells(func: &Function, tracked: &mut [TrackRoot]) -> bool {
+fn seed_thread_cells(func: &Function, cfg: &Cfg, tracked: &mut [TrackRoot]) -> bool {
     let zeros = func.thread_cell_zeros();
     if zeros.is_empty() {
         return false;
     }
-    let consts = func.const_values();
+    let mut consts: Option<Vec<Option<i64>>> = None;
     let mut found_caller = false;
-    for data in &func.insts {
-        if let Some(res) = func.caller_loc_result(&data.op, |v| zeros[v.index()]) {
-            tracked[res.index()] = TrackRoot::Set(MemRoot::CallerLoc);
-            found_caller = true;
-        } else if let Some((res, slot)) = func.thread_cell_slot(&data.op, |v| consts[v.index()]) {
-            tracked[res.index()] = TrackRoot::Set(MemRoot::ThreadCell(slot));
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let data = &func.insts[inst.index()];
+            if !matches!(data.op, Op::Call { .. }) {
+                continue;
+            }
+            if let Some(res) = func.caller_loc_result(&data.op, |v| zeros[v.index()]) {
+                tracked[res.index()] = TrackRoot::Set(MemRoot::CallerLoc);
+                found_caller = true;
+            } else {
+                let consts = consts.get_or_insert_with(|| func.const_values());
+                if let Some((res, slot)) = func.thread_cell_slot(&data.op, |v| consts[v.index()]) {
+                    tracked[res.index()] = TrackRoot::Set(MemRoot::ThreadCell(slot));
+                }
+            }
         }
     }
     found_caller
@@ -295,7 +304,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
     seed_entry_roots(func, cfg, &mut tracked);
     let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
     seed_fresh_owners(func, cfg, entry, affine, &mut tracked);
-    let mut has_caller_loc = seed_thread_cells(func, &mut tracked);
+    let mut has_caller_loc = seed_thread_cells(func, cfg, &mut tracked);
     let rank = (cfg.rpo.len() > 1).then(|| Cfg::ranks(&cfg.rpo, func.blocks.len()));
     let mut need_fixpoint = false;
     for &b in &cfg.rpo {
@@ -303,14 +312,6 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
         let insts = &func.blocks[b.index()].insts;
         for &inst in insts {
             track_def(func, inst, &mut tracked, affine);
-            if !need_fixpoint
-                && rank.is_some()
-                && let Some(res) = func.insts[inst.index()].result
-                && tracked[res.index()] == TrackRoot::Unset
-                && is_derived_i64(&func.insts[inst.index()].op, func.ty(res))
-            {
-                need_fixpoint = true;
-            }
         }
         if let (Some(rank), Some(&last)) = (&rank, insts.last()) {
             match &func.insts[last.index()].op {

@@ -651,14 +651,17 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         let mut cx = ThreadCx { defs: &defs, consts: &mut consts, uses: &mut uses, ranges: &ranges, ranges_len, pinned: &pinned, idom: &cfg.idom };
         let mut changed = sink::run(func, &mut cx, (&*cfg, &single));
         let mut stale = false;
-        let mut preds = cfg.preds.clone();
+        let mut extra_preds: Vec<Vec<Block>> = Vec::new();
         let mut live = single.clone();
         for disp_idx in 0..func.blocks.len() {
             let disp = Block(disp_idx as u32);
             if !dispatches(func, cx.pinned, disp) {
                 continue;
             }
-            let mut into = std::mem::take(&mut preds[disp_idx]);
+            let mut into = cfg.preds_of(disp).to_vec();
+            if let Some(extra) = extra_preds.get(disp_idx) {
+                into.extend_from_slice(extra);
+            }
             into.sort_unstable();
             into.dedup();
             for pred in into {
@@ -671,7 +674,10 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 pred_changed |= thread_br_table(func, &cx, &live, pred, disp);
                 if pred_changed {
                     changed = true;
-                    func.successors(pred).for_each(|s| preds[s.index()].push(pred));
+                    if extra_preds.is_empty() {
+                        extra_preds.resize(func.blocks.len(), Vec::new());
+                    }
+                    func.successors(pred).for_each(|s| extra_preds[s.index()].push(pred));
                     if func.successors(pred).any(|s| {
                         s != disp
                             && single[s.index()] == live[s.index()]

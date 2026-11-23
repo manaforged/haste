@@ -184,6 +184,7 @@ struct CfgInfo<'a> {
 }
 
 fn collect_incoming(func: &Function) -> (Vec<Vec<(Block, &[Value])>>, Vec<bool>) {
+    if !func.blocks.iter().any(|b| !b.params.is_empty()) { return (Vec::new(), Vec::new()); }
     let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
     let mut complete = vec![true; func.blocks.len()];
     for pred_idx in 0..func.blocks.len() {
@@ -275,7 +276,7 @@ impl<'a> Ranges<'a> {
     }
 
     fn refine_params(&mut self, func: &Function, info: &CfgInfo, block: Block) -> bool {
-        if !info.complete[block.index()] || info.incoming[block.index()].is_empty() {
+        if info.incoming.is_empty() || !info.complete[block.index()] || info.incoming[block.index()].is_empty() {
             return false;
         }
         let mut narrowed = false;
@@ -531,8 +532,9 @@ fn join_incoming_rels(
     block: Block,
     path: &mut Path,
 ) {
+    if incoming.is_empty() || !complete[block.index()] || func.blocks[block.index()].params.is_empty() { return; }
     let edges = &incoming[block.index()];
-    if !complete[block.index()] || edges.len() < 2 || edges.len() > 16 || func.blocks[block.index()].params.is_empty() { return; }
+    if edges.len() < 2 || edges.len() > 16 { return; }
     if !edges.iter().all(|&(pred, _)| exits.get(pred.index()).and_then(Option::as_ref).is_some()) { return; }
     if !edges.iter().any(|&(pred, _)| {
         exits[pred.index()].as_ref().is_some_and(|p| !p.rels().is_empty())
@@ -607,7 +609,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
             }
             let (follow, mut path, mut extra, mut dom) = exits.start(&cfg, block, entry);
             if let Some(pred) = follow {
-                if single[block.index()] == Some(pred) && let [(_, args)] = incoming[block.index()][..] {
+                if single[block.index()] == Some(pred) && let Some(&[(_, args)]) = incoming.get(block.index()).map(Vec::as_slice) {
                     for (&param, &arg) in func.blocks[block.index()].params.iter().zip(args) {
                         if func.ty(param).is_small_int() && param != arg { path.push_rel_kind(RelKind::Eq, param, arg, func.ty(param)); }
                     }

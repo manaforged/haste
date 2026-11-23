@@ -313,12 +313,20 @@ fn apply_maj_refactor(func: &mut Function, block: Block, at: usize, m: MajMatch,
 }
 
 fn factor_block(func: &mut Function, bi: usize, fs: &mut FactorState, balance: bool) {
+    if !func.blocks[bi].insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Binary(Binary::Bor | Binary::Bxor, ..))) {
+        return;
+    }
     let block = Block(bi as u32);
     if balance { fill_block_depths(func, bi, &mut fs.depth); }
     let mut at = 0;
     while at < func.blocks[bi].insts.len() {
         let inst = func.blocks[bi].insts[at];
-        if fs.dead.get(inst.index()).copied().unwrap_or(false) { at += 1; continue; }
+        if fs.dead.get(inst.index()).copied().unwrap_or(false)
+            || !matches!(func.insts[inst.index()].op, Op::Binary(Binary::Bor | Binary::Bxor, ..))
+        {
+            at += 1;
+            continue;
+        }
         let op = func.insts[inst.index()].op.clone();
         if let Some(m) = match_ch(func, &fs.defs, &fs.uses, &op) {
             fs.dead.resize(func.insts.len(), false);
@@ -334,6 +342,9 @@ fn factor_block(func: &mut Function, bi: usize, fs: &mut FactorState, balance: b
 }
 
 fn factor_bitwise(func: &mut Function, balance: bool) {
+    if !func.blocks.iter().flat_map(|b| &b.insts).any(|&i| matches!(func.insts[i.index()].op, Op::Binary(Binary::Bor | Binary::Bxor, ..))) {
+        return;
+    }
     let mut inst_block = vec![usize::MAX; func.insts.len()];
     if balance {
         for (bi, block) in func.blocks.iter().enumerate() {
@@ -658,9 +669,9 @@ fn plan_add_tree(
     Some((ops, va, vb, new_root_d))
 }
 
-fn balance_add_trees_block(func: &mut Function, uses: &[u32], depth: &mut Vec<u32>, bi: usize) {
+fn balance_add_trees_block(func: &mut Function, uses: &[u32], depth: &mut Vec<u32>, bi: usize) -> bool {
+    if func.blocks[bi].insts.len() < 8 { return false; }
     let orig = func.blocks[bi].insts.clone();
-    if orig.len() < 8 { return; }
     fill_block_depths(func, bi, depth);
     let (pinned, def_pos, roots) = add_scan(func, &orig, uses);
     let (mut killed, mut at_start) = (vec![false; func.insts.len()], Vec::new());
@@ -680,7 +691,7 @@ fn balance_add_trees_block(func: &mut Function, uses: &[u32], depth: &mut Vec<u3
         func.insts[root_inst.index()].op = Op::Binary(Binary::Iadd, ra, rb);
         changed = true;
     }
-    if !changed { return; }
+    if !changed { return false; }
     let mut rebuilt = Vec::with_capacity(orig.len());
     rebuilt.extend(at_start);
     for (pos, &inst) in orig.iter().enumerate() {
@@ -688,6 +699,7 @@ fn balance_add_trees_block(func: &mut Function, uses: &[u32], depth: &mut Vec<u3
         rebuilt.extend(after[pos].iter().copied());
     }
     func.blocks[bi].insts = rebuilt;
+    true
 }
 
 fn block_peak_gpr(func: &Function, insts: &[Inst], total_uses: &[u32]) -> usize {
@@ -764,12 +776,13 @@ fn bypass_two_use_adds_block(func: &mut Function, uses: &mut Vec<u32>, depth: &m
 pub(crate) fn run(func: &mut Function, balance: bool) {
     factor_bitwise(func, balance);
     let mut uses = func.use_counts();
-    if balance {
+    let mut balanced = false;
+    if balance && func.blocks.iter().any(|b| b.insts.len() >= 8) {
         let mut depth = Vec::new();
-        for bi in 0..func.blocks.len() { balance_add_trees_block(func, &uses, &mut depth, bi); }
+        for bi in 0..func.blocks.len() { balanced |= balance_add_trees_block(func, &uses, &mut depth, bi); }
         for bi in 0..func.blocks.len() { bypass_two_use_adds_block(func, &mut uses, &mut depth, bi); }
     }
-    let uses = if balance { func.use_counts() } else { uses };
+    let uses = if balanced { func.use_counts() } else { uses };
     for bi in 0..func.blocks.len() {
         sink_loads_block(func, &uses, bi);
     }

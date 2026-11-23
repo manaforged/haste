@@ -404,7 +404,7 @@ fn ptr_end_parts(func: &Function, ranges: &Ranges, end: Value, base: Value) -> O
 
 impl Env {
     pub(super) fn collect_loop(&mut self, func: &Function, (cfg, ranges, incoming, complete, exits, def_blocks): (&Cfg, &Ranges, &[Vec<(Block, &[Value])>], &[bool], &[Option<Path>], &std::cell::OnceCell<Vec<Option<Block>>>), each: &Loop) {
-        if !complete[each.head.index()] || func.blocks[each.head.index()].params.is_empty() { return; }
+        if incoming.is_empty() || !complete[each.head.index()] || func.blocks[each.head.index()].params.is_empty() { return; }
         let dom_exit = cfg.idom.get(each.head.index()).copied().flatten().filter(|&d| d != each.head).and_then(|d| exits.get(d.index()).and_then(Option::as_ref));
         let (mut outside, mut inside): (Vec<(Path, &[Value])>, Vec<(Block, Path, ExtraPath, &[Value])>) = (Vec::new(), Vec::new());
         for &(pred, args) in &incoming[each.head.index()] {
