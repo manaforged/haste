@@ -758,11 +758,38 @@ fn finish_fused(cx: &mut RewriteCx, res: Option<Value>, ext_a: bool, fused: Fuse
     }
 }
 
+fn eq_zero_sub(cx: &RewriteCx, v: Value) -> Option<(IntCC, Value, Value)> {
+    let &Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), x, y) = cx.op(v)? else { return None };
+    let sub = (cx.sconst(y) == Some(0)).then_some(x).or_else(|| (cx.sconst(x) == Some(0)).then_some(y));
+    if let Some(&Op::Binary(Binary::Isub, p, q)) = sub.and_then(|d| cx.op(d)) { return Some((cc, p, q)); }
+    Some((cc, x, y))
+}
+
+fn fuse_strict_cmp(cx: &RewriteCx, is_and: bool, a: Value, b: Value) -> Option<FusedCmp> {
+    use IntCC::*;
+    const PAIRS: [(IntCC, IntCC); 4] = [
+        (UnsignedLessThanOrEqual, UnsignedLessThan), (UnsignedGreaterThanOrEqual, UnsignedGreaterThan),
+        (SignedLessThanOrEqual, SignedLessThan), (SignedGreaterThanOrEqual, SignedGreaterThan),
+    ];
+    let want_eq = if is_and { NotEqual } else { Equal };
+    for (ord_v, eq_v) in [(a, b), (b, a)] {
+        let Some(&Op::Icmp(ord_cc, p, q)) = cx.op(ord_v) else { continue };
+        let Some((eq_cc, ep, eq)) = eq_zero_sub(cx, eq_v) else { continue };
+        if eq_cc != want_eq || !((ep == p && eq == q) || (ep == q && eq == p)) { continue; }
+        for (weak, strict) in PAIRS {
+            if ord_cc == if is_and { weak } else { strict } { return Some(FusedCmp::Op(Op::Icmp(if is_and { strict } else { weak }, p, q))); }
+            if ord_cc == if is_and { strict } else { weak } { return Some(FusedCmp::Alias(ord_v)); }
+        }
+    }
+    None
+}
+
 pub(super) fn fuse_cmp_ops(cx: &mut RewriteCx, res: Option<Value>, is_and: bool, raw_a: Value, raw_b: Value) -> Option<Op> {
     let ((a, ext_a), (b, ext_b)) = (peel_uext_i8(cx, raw_a), peel_uext_i8(cx, raw_b));
     if ext_a != ext_b { return None; }
     let pair_single = cx.single_use(raw_a) && cx.single_use(raw_b) && (!ext_a || (cx.single_use(a) && cx.single_use(b)));
-    let fused = fuse_dual_ranges(cx, pair_single, is_and, a, b)
+    let fused = fuse_strict_cmp(cx, is_and, a, b)
+        .or_else(|| fuse_dual_ranges(cx, pair_single, is_and, a, b))
         .or_else(|| fuse_range_adj_eq(cx, pair_single, is_and, a, b))
         .or_else(|| {
             let (cmp1, cmp2) = (cmp_const(cx, a)?, cmp_const(cx, b)?);

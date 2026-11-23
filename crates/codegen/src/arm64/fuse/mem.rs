@@ -446,7 +446,7 @@ struct PairHalf {
     addr_elide: Option<Value>,
 }
 
-pub(super) fn const_splat(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], res: Value) -> Option<(Value, i64)> {
+fn splat_insert(func: &Function, pos_of: &[Option<(usize, usize, Inst)>], res: Value) -> Option<(Value, Value)> {
     let Op::Shuffle(a, b, ShuffleMask::Const(m)) = func.insts[def_inst(pos_of, res)?.index()].op else { return None };
     let Type::Vec { lane, count } = func.ty(res) else { return None };
     let (count, first) = (usize::from(count), usize::from(m[0]));
@@ -455,24 +455,23 @@ pub(super) fn const_splat(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(u
     }
     let src = if first < count { a } else { b };
     let Op::Insert(_, scalar, idx) = func.insts[def_inst(pos_of, src)?.index()].op else { return None };
-    (usize::from(idx) == first % count).then(|| const_of(func, plan, scalar, |v| def_inst(pos_of, v)).map(|imm| (src, imm))).flatten()
+    (usize::from(idx) == first % count).then_some((src, scalar))
 }
 
-fn try_fuse_splat_shuffle(
-    func: &Function,
-    plan: &mut Plan<Reg>,
-    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
-    res: Value,
-    (a, b): (Value, Value),
-) {
+pub(super) fn const_splat(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], res: Value) -> Option<(Value, i64)> {
+    let (src, scalar) = splat_insert(func, pos_of, res)?;
+    const_of(func, plan, scalar, |v| def_inst(pos_of, v)).map(|imm| (src, imm))
+}
+
+fn try_fuse_splat_shuffle(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, res): (usize, usize, Value), (a, b): (Value, Value)) {
     let Type::Vec { lane, count } = func.ty(res) else { return };
-    let Some((src, imm)) = const_splat(func, plan, pos_of, res) else { return };
-    if uses[src.index()] == u32::from(a == src) + u32::from(b == src)
-        && !plan.elided[src.index()]
-        && encode_neon_movi(u32::from(lane.bytes() * u32::from(count) == 16), splat_pattern64(lane, imm)).is_some()
-    {
-        plan.elided[src.index()] = true;
-    }
+    let Some((src, scalar)) = splat_insert(func, pos_of, res) else { return };
+    if uses[src.index()] != u32::from(a == src) + u32::from(b == src) || plan.elided[src.index()] { return; }
+    let movi_ok = const_of(func, plan, scalar, |v| def_inst(pos_of, v))
+        .is_some_and(|imm| encode_neon_movi(u32::from(lane.bytes() * u32::from(count) == 16), splat_pattern64(lane, imm)).is_some());
+    let gpr_ok = lane.is_int() && count > 1
+        && def_entry(pos_of, src).is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos && preserved(func, plan, b_idx, spos, pos, None, scalar));
+    if movi_ok || gpr_ok { plan.elided[src.index()] = true; }
 }
 
 fn unwrap_iadd_const(
@@ -625,7 +624,7 @@ pub(super) fn try_fuse_vec_op(
     op: &Op,
 ) -> bool {
     match *op {
-        Op::Shuffle(a, b, ShuffleMask::Const(_)) => try_fuse_splat_shuffle(func, plan, ctx, res, (a, b)),
+        Op::Shuffle(a, b, ShuffleMask::Const(_)) => try_fuse_splat_shuffle(func, plan, ctx, (b_idx, pos, res), (a, b)),
         Op::Insert(vec, val, idx) => try_fuse_vec_insert(func, plan, ctx, (b_idx, pos, res), (vec, val, idx)),
         _ => return false,
     }

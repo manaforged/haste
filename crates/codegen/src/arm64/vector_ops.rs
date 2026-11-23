@@ -80,6 +80,21 @@ impl Emit<'_> {
 
     fn vec_shuffle_const(&mut self, spec: VecSpec, (a, b): (Value, Value), m: [u8; 16], result: Value) -> Result<(), String> {
         let n = usize::from(spec.count);
+        let first = usize::from(m[0]);
+        if spec.lane.is_int() && spec.count > 1 && first < 2 * n && m[..n].iter().all(|&x| usize::from(x) == first) {
+            let src = if first < n { a } else { b };
+            if self.plan.elided[src.index()]
+                && let Some(inst) = self.defs[src.index()]
+                && let crate::ir::Op::Insert(_, scalar, idx) = self.func.insts[inst.index()].op
+                && usize::from(idx) == first % n
+            {
+                let dst = self.fdst(result);
+                let reg = if self.plan.const_of(scalar) == Some(0) { ZR } else { self.bits(scalar, A) };
+                self.asm.word(0x0E00_0C00 | (spec.q << 30) | ((1_u32 << spec.size) << 16) | u32::from(reg.0) << 5 | u32::from(dst.0));
+                self.fput(result, dst);
+                return Ok(());
+            }
+        }
         let eb = spec.lane.bytes() as usize;
         let total = n * eb;
         let mut bidx = [0x80_u8; 16];

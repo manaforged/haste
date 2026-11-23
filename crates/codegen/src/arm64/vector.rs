@@ -677,6 +677,19 @@ impl Emit<'_> {
         let fspec = VecSpec::of(from)?;
         let tspec = VecSpec::of(to)?;
         let dst = self.fdst(result);
+        if op == Convert::Ireduce
+            && self.plan.elided[x.index()]
+            && let Some(inst) = self.defs[x.index()]
+            && let Op::Binary(Binary::Ushr | Binary::Sshr, val, amt) = self.func.insts[inst.index()].op
+            && let Some(imm) = self.splat_const_lane(amt)
+            && let Some(shift) = super::fuse::shrn_shift(from, to, imm)
+        {
+            let src = self.fin(val, V0);
+            let enc_imm = 2 * tspec.lane.bits() - shift;
+            self.v_two(0x0F00_8400 | (enc_imm << 16), dst, src);
+            self.fput(result, dst);
+            return Ok(());
+        }
         let src = self.fin(x, V0);
         match op {
             Convert::Fpromote => self.v_two(0x0E61_7800, dst, src),

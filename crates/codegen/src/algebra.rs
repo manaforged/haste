@@ -679,7 +679,7 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Binary(bin, a, b) => {
             if res.is_some_and(|r| cx.func.ty(r).is_vector()) {
                 vec::simplify_vec_binary(cx, res, bin, a, b)
-            } else if bin == Binary::Bor && let Some(op) = vec::merge_movemasks(cx, a, b) {
+            } else if matches!(bin, Binary::Band | Binary::Bor | Binary::Bxor) && let Some(op) = vec::merge_vec_bitwise(cx, bin, a, b) {
                 Some(op)
             } else {
                 simplify_binary(cx, fits_used, block_udivs, res, (bin, a, b))
