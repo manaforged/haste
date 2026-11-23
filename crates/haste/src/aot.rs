@@ -389,7 +389,7 @@ impl<'a> Plan<'a> {
         }
         let reloc_chunk = exe.relocs.len().div_ceil(workers).max(1);
         let ptr_chunk = exe.pointers.len().div_ceil(workers).max(1);
-        let (reloc_batches, ptr_batches): (Result<Vec<_>>, Result<Vec<_>>) = std::thread::scope(|scope| {
+        let (reloc_batches, ptr_batches): (Result<Vec<_>>, Result<Vec<_>>) = crate::sync::scope(|scope| {
             let reloc_handles: Vec<_> = exe
                 .relocs
                 .chunks(reloc_chunk)
@@ -751,7 +751,7 @@ pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
     }
     let (text_va, pie_arm64, addrs, base_va, shim_offs, plan, veneers) = (ctx.text_va, ctx.pie_arm64, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, ctx.veneers);
     let (stub_vas_ref, got_vas_ref) = (stub_vas.as_slice(), got_vas.as_slice());
-    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+    let results: Vec<Result<()>> = crate::sync::scope(|scope| {
         let handles: Vec<_> = slices
             .into_iter()
             .map(|(chunk, base, buf)| scope.spawn(move || patch_slice(chunk, base, text_va, pie_arm64, addrs, base_va, shim_offs, plan, stub_vas_ref, got_vas_ref, veneers, buf)))

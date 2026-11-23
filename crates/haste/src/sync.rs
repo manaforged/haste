@@ -5,6 +5,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuar
 
 use rustc_hash::FxHasher;
 
+mod scope;
+
+pub(crate) use scope::scope;
+
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -68,7 +72,7 @@ pub(crate) fn parallel_map<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> 
         }
         local
     };
-    let chunks = std::thread::scope(|scope| {
+    let chunks = scope(|scope| {
         let handles: Vec<_> = (0..workers - 1).map(|_| scope.spawn(&worker)).collect();
         let mut all = worker();
         for handle in handles {

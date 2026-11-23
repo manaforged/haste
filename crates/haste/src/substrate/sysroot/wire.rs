@@ -478,7 +478,7 @@ pub(super) fn decode_sysroot(
     };
 
     let (symbols, (outline_crates, name_crates)) = if crate::jobs() > 1 && sym_count >= 256 {
-        std::thread::scope(|scope| -> Result<(Symbols, (Vec<(usize, OutlineCrate)>, Vec<(usize, NamesCrate)>))> {
+        crate::sync::scope(|scope| -> Result<(Symbols, (Vec<(usize, OutlineCrate)>, Vec<(usize, NamesCrate)>))> {
             let sym_handle = scope.spawn(|| decode_symbols(sym_ends, sym_blob));
             let crates_res = decode_rest();
             let syms_res = match sym_handle.join() {

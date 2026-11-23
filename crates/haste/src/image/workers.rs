@@ -199,7 +199,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, returning each thread's value or its panic payload message.
     pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Result<T, String>> {
         let work = &work;
-        std::thread::scope(|scope| {
+        crate::sync::scope(|scope| {
             let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || work(fork, shard))).collect();
             handles.into_iter().map(|handle| handle.join().map_err(Self::panic_message)).collect()
         })
@@ -323,7 +323,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
     fn run_aot_workers(&self, cx: &Context<'_>, reached: &Reached, queue: &AotQueue, jobs: usize, plan: Plan) -> Vec<Option<WorkerOutput>> {
         let forks: Vec<Context<'_>> = (0..jobs).map(|_| cx.fork()).collect();
-        std::thread::scope(|scope| {
+        crate::sync::scope(|scope| {
             let handles: Vec<_> = forks.into_iter().map(|fork| scope.spawn(move || self.aot_worker_loop(fork, reached, queue, plan))).collect();
             handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
         })

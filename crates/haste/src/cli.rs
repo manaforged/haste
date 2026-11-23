@@ -328,7 +328,7 @@ fn report_bodies(outline: &outline::Outline, threads: usize) {
     let started = Instant::now();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
+    crate::sync::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
                 while let Some(tree) = outline.crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {

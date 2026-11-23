@@ -509,7 +509,7 @@ impl Files {
             return;
         }
         let next = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
+        crate::sync::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
                     while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {

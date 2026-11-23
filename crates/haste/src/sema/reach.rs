@@ -286,7 +286,7 @@ impl Reached {
                 }
                 local
             };
-            let (own, joined) = std::thread::scope(|scope| {
+            let (own, joined) = crate::sync::scope(|scope| {
                 let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker)).collect();
                 (worker(), handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect::<Vec<_>>())
             });
@@ -559,7 +559,7 @@ fn run_deferred(cx: &mut Context<'_>, (reached, wave, workers, check_undeclared)
 }
 
 pub(super) fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reached, (wave, next, check_undeclared): (&[usize], &AtomicUsize, bool)) -> (Vec<WaveItem>, Vec<Option<WorkerOut>>) {
-    std::thread::scope(|scope| {
+    crate::sync::scope(|scope| {
         let handles: Vec<_> = forks
             .into_iter()
             .map(|mut fork| {
