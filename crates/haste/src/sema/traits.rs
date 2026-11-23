@@ -1,12 +1,10 @@
-use std::cell::Cell;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Clone, Copy)]
-struct MemberSlot {
-    file_ptr: usize,
+pub(super) struct MemberSlot {
     of: ItemRef,
     len: u8,
     bytes: [u8; 23],
@@ -14,11 +12,7 @@ struct MemberSlot {
 }
 
 impl MemberSlot {
-    const EMPTY: Self = Self { file_ptr: 0, of: ItemRef { krate: 0, file: 0, item: 0 }, len: 0, bytes: [0; 23], found: None };
-}
-
-thread_local! {
-    static TRAIT_MEMBER_L1: [Cell<MemberSlot>; 64] = [const { Cell::new(MemberSlot::EMPTY) }; 64];
+    const EMPTY: Self = Self { of: ItemRef { krate: 0, file: 0, item: 0 }, len: 0, bytes: [0; 23], found: None };
 }
 
 use crate::body::Body;
@@ -118,15 +112,25 @@ impl<'a> Context<'a> {
     /// The member of trait `of` named `name`.
     pub fn trait_member(&self, of: ItemRef, name: &str) -> Option<ItemRef> {
         let nb = name.as_bytes();
-        let file_ptr = self.outline.crates.get(of.krate as usize).and_then(|c| c.files.get(of.file as usize)).map_or(0, |f| Arc::as_ptr(f) as usize);
-        let idx = ((of.krate as usize).wrapping_mul(31) ^ (of.file as usize).wrapping_mul(17) ^ (of.item as usize) ^ usize::from(nb.first().copied().unwrap_or(0)).wrapping_shl(3) ^ nb.len()) & 63;
-        if file_ptr != 0 && nb.len() <= 23 {
-            let hit = TRAIT_MEMBER_L1.with(|tls| {
-                let slot = tls[idx].get();
-                (slot.file_ptr == file_ptr && slot.of == of && usize::from(slot.len) == nb.len() && &slot.bytes[..nb.len()] == nb).then_some(slot.found)
-            });
-            if let Some(found) = hit {
-                return found;
+        let cacheable = !nb.is_empty() && nb.len() <= 23;
+        let idx = if cacheable {
+            ((of.krate as usize).wrapping_mul(31)
+                ^ (of.file as usize).wrapping_mul(17)
+                ^ (of.item as usize).wrapping_mul(13)
+                ^ usize::from(nb[0]).wrapping_shl(3)
+                ^ usize::from(nb[nb.len() - 1]).wrapping_shl(5)
+                ^ nb.len())
+                & 255
+        } else {
+            0
+        };
+        if cacheable {
+            let l1 = self.trait_member_l1.borrow();
+            if let Some(table) = l1.as_deref() {
+                let slot = &table[idx];
+                if usize::from(slot.len) == nb.len() && slot.of == of && &slot.bytes[..nb.len()] == nb {
+                    return slot.found;
+                }
             }
         }
         let members = self.trait_members.get_or_insert_with(of, || {
@@ -137,12 +141,14 @@ impl<'a> Context<'a> {
             Arc::new(map)
         });
         let found = members.get(name).copied();
-        if file_ptr != 0 && nb.len() <= 23 {
-            TRAIT_MEMBER_L1.with(|tls| {
-                let mut bytes = [0u8; 23];
-                bytes[..nb.len()].copy_from_slice(nb);
-                tls[idx].set(MemberSlot { file_ptr, of, len: nb.len() as u8, bytes, found });
-            });
+        if cacheable {
+            let mut l1 = self.trait_member_l1.borrow_mut();
+            let table = l1.get_or_insert_with(|| Box::new([MemberSlot::EMPTY; 256]));
+            let slot = &mut table[idx];
+            slot.of = of;
+            slot.len = nb.len() as u8;
+            slot.bytes[..nb.len()].copy_from_slice(nb);
+            slot.found = found;
         }
         found
     }

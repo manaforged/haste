@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::names::{ItemRef, Primitive};
-use crate::sync::{Interner, Slab};
+use crate::sync::{AtomicU32Slab, Interner, Slab};
 
 use super::substs::{Pools, ProjDef, ProjId, ProjPool, Substs, SubstsPool};
 
@@ -155,18 +155,22 @@ const FAST_VALUES: u32 = 16;
 const PARAM_BASE: u32 = VALUE_BASE + FAST_VALUES;
 const FAST_PARAMS: u32 = 32;
 
+#[derive(Default)]
+struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 5]);
+
 /// The type interner.
 #[derive(Clone)]
 pub struct Types {
     inner: Arc<Interner<Kind, TY_SHARDS, TY_SLAB, TY_SLABS>>,
     flags: Arc<Slab<u8, TY_SLAB, TY_SLABS>>,
+    unary: Arc<UnaryCache>,
     substs: SubstsPool,
     projs: ProjPool,
 }
 
 impl Default for Types {
     fn default() -> Self {
-        let types = Self { inner: Arc::default(), flags: Arc::default(), substs: SubstsPool::default(), projs: ProjPool::default() };
+        let types = Self { inner: Arc::default(), flags: Arc::default(), unary: Arc::default(), substs: SubstsPool::default(), projs: ProjPool::default() };
         let fixed = ALL_PRIMITIVES
             .into_iter()
             .map(Kind::Prim)
@@ -181,6 +185,18 @@ impl Default for Types {
         }
         types
     }
+}
+
+fn unary_slot(kind: &Kind) -> Option<(usize, Ty)> {
+    let (slot, inner) = match *kind {
+        Kind::Ref(Mut::Not, inner) => (0, inner),
+        Kind::Ref(Mut::Mut, inner) => (1, inner),
+        Kind::Ptr(Mut::Not, inner) => (2, inner),
+        Kind::Ptr(Mut::Mut, inner) => (3, inner),
+        Kind::Slice(inner) => (4, inner),
+        _ => return None,
+    };
+    (inner != Ty::NONE).then_some((slot, inner))
 }
 
 fn prim_index(primitive: Primitive) -> u32 {
@@ -287,6 +303,14 @@ impl Types {
     /// The type of shape `kind`.
     pub fn intern(&self, kind: Kind) -> Ty {
         if let Some(ty) = fast_ty(&kind) {
+            return ty;
+        }
+        if let Some((slot, inner)) = unary_slot(&kind) {
+            if let Some(raw) = self.unary.0[slot].get(inner.0 as usize) {
+                return Ty(raw - 1);
+            }
+            let ty = self.intern_slow(kind);
+            self.unary.0[slot].set(inner.0 as usize, ty.0 + 1);
             return ty;
         }
         self.intern_slow(kind)

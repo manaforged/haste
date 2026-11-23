@@ -99,6 +99,33 @@ impl<T, const SLAB: usize, const SLABS: usize> Slab<T, SLAB, SLABS> {
     }
 }
 
+pub(crate) struct AtomicU32Slab<const SLAB: usize, const SLABS: usize> {
+    slabs: Box<[OnceLock<Box<[AtomicU32]>>]>,
+}
+
+impl<const SLAB: usize, const SLABS: usize> Default for AtomicU32Slab<SLAB, SLABS> {
+    fn default() -> Self {
+        Self { slabs: (0..SLABS).map(|_| OnceLock::new()).collect::<Vec<_>>().into_boxed_slice() }
+    }
+}
+
+impl<const SLAB: usize, const SLABS: usize> AtomicU32Slab<SLAB, SLABS> {
+    #[inline]
+    pub(crate) fn get(&self, index: usize) -> Option<u32> {
+        let val = self.slabs.get(index / SLAB)?.get()?[index % SLAB].load(Ordering::Acquire);
+        (val != 0).then_some(val)
+    }
+
+    pub(crate) fn set(&self, index: usize, value: u32) {
+        debug_assert!(value != 0);
+        if index >= SLAB * SLABS {
+            return;
+        }
+        let slab = self.slabs[index / SLAB].get_or_init(|| (0..SLAB).map(|_| AtomicU32::new(0)).collect::<Vec<_>>().into_boxed_slice());
+        slab[index % SLAB].store(value, Ordering::Release);
+    }
+}
+
 pub(crate) struct Interner<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> {
     shards: Box<[CachePadded<RwLock<FxHashMap<K, u32>>>]>,
     slabs: Slab<K, SLAB, SLABS>,

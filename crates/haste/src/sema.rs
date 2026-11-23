@@ -63,6 +63,10 @@ pub struct Context<'a> {
     pub(super) form_stack: Vec<(infer::Form, usize)>,
     global_asm: Option<Arc<global_asm::Table>>,
     langs: Option<Arc<traits::Langs>>,
+    crate_owners: Vec<Option<Arc<HashMap<(u32, Option<u32>), u32>>>>,
+    crate_modules: Vec<Option<Arc<HashMap<(u32, u32), u32>>>>,
+    crate_heads: Vec<Option<Arc<impls::Index>>>,
+    trait_member_l1: std::cell::RefCell<Option<Box<[traits::MemberSlot; 256]>>>,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
@@ -128,11 +132,16 @@ impl<'a> Context<'a> {
             form_stack: Vec::new(),
             global_asm: None,
             langs: None,
+            crate_owners: vec![None; outline.crates.len()],
+            crate_modules: vec![None; outline.crates.len()],
+            crate_heads: vec![None; outline.crates.len()],
+            trait_member_l1: std::cell::RefCell::new(None),
         }
     }
 
     /// A sibling context over the same outline, names, types and caches, with its own empty request list so a worker thread can run without contending on asks.
     pub fn fork(&self) -> Context<'a> {
+        let crates = self.outline.crates.len();
         Context {
             outline: self.outline,
             names: self.names,
@@ -151,6 +160,10 @@ impl<'a> Context<'a> {
             form_stack: Vec::new(),
             global_asm: self.global_asm.clone(),
             langs: self.langs.clone(),
+            crate_owners: vec![None; crates],
+            crate_modules: vec![None; crates],
+            crate_heads: vec![None; crates],
+            trait_member_l1: std::cell::RefCell::new(None),
         }
     }
 
@@ -186,6 +199,7 @@ impl<'a> Context<'a> {
     }
 
     /// The source file and outline entry of `item`.
+    #[inline]
     pub fn item(&self, item: ItemRef) -> (&'a Source, &'a Item) {
         let file = self.file(item);
         let index = item.outer().map_or(item.item, |(_, index)| index);
@@ -384,11 +398,17 @@ impl<'a> Context<'a> {
     }
 
     /// The outline file that holds `item`, or the expansion of the body that declares it.
+    #[inline]
     pub fn file(&self, item: ItemRef) -> &'a crate::outline::tree::File {
         match item.outer() {
-            Some((outer, _)) => &self.expansion(outer).expect("a body that declares items is read").file,
+            Some((outer, _)) => self.expanded_file(outer),
             None => &self.outline.crates[item.krate as usize].files[item.file as usize],
         }
+    }
+
+    #[cold]
+    fn expanded_file(&self, outer: ItemRef) -> &'a crate::outline::tree::File {
+        &self.expansion(outer).expect("a body that declares items is read").file
     }
 
     /// Path resolution inside crate `krate`, recording what it finds not loaded yet.
@@ -427,7 +447,6 @@ impl<'a> Context<'a> {
         if let Some(of) = self.owner_trait(item) {
             return self.module_of(of);
         }
-        let map = self.modules_of(item.krate);
         let (_, mut entry) = self.item(item);
         let mut top = item.item;
         let file = &self.outline.crates[item.krate as usize].files[item.file as usize];
@@ -435,15 +454,18 @@ impl<'a> Context<'a> {
             top = parent;
             entry = &file.items.items[parent as usize];
         }
-        let module = map.get(&(item.file, top)).copied().with_context(|| format!("no module holds item {item:?}"))?;
+        let module = self.modules_of(item.krate).get(&(item.file, top)).copied().with_context(|| format!("no module holds item {item:?}"))?;
         Ok(ModRef { krate: item.krate, module })
     }
 
-    fn modules_of(&mut self, krate: u32) -> Arc<HashMap<(u32, u32), u32>> {
+    fn modules_of(&mut self, krate: u32) -> &HashMap<(u32, u32), u32> {
         let tree = &self.outline.crates[krate as usize];
-        self.store.lookups.modules.get_or_insert_with(krate, || {
-            let pairs = (0..tree.modules.len()).flat_map(|module| items_of(tree, module).into_iter().map(move |pair| (pair, module as u32)));
-            Arc::new(pairs.collect())
+        let store = &self.store.lookups.modules;
+        self.crate_modules[krate as usize].get_or_insert_with(|| {
+            store.get_or_insert_with(krate, || {
+                let pairs = (0..tree.modules.len()).flat_map(|module| items_of(tree, module).into_iter().map(move |pair| (pair, module as u32)));
+                Arc::new(pairs.collect())
+            })
         })
     }
 

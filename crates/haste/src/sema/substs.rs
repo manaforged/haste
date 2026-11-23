@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::names::ItemRef;
-use crate::sync::Interner;
+use crate::sync::{AtomicU32Slab, Interner};
 
 use super::table::SHARDS;
 use super::ty::Ty;
@@ -37,15 +37,24 @@ impl Substs {
 #[derive(Clone, Default)]
 pub struct SubstsPool {
     inner: Arc<Interner<Arc<[Ty]>, SHARDS, SUBSTS_SLAB, SUBSTS_SLABS>>,
+    singles: Arc<AtomicU32Slab<SUBSTS_SLAB, SUBSTS_SLABS>>,
 }
 
 impl SubstsPool {
     /// Interns `slice` and returns its handle, returning `Substs::EMPTY` without locking when empty.
     pub fn intern(&self, slice: &[Ty]) -> Substs {
-        if slice.is_empty() {
-            return Substs::EMPTY;
+        match slice {
+            [] => Substs::EMPTY,
+            &[ty] if ty != Ty::NONE => {
+                if let Some(cached) = self.singles.get(ty.0 as usize) {
+                    return Substs(cached);
+                }
+                let id = Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))));
+                self.singles.set(ty.0 as usize, id.0);
+                id
+            }
+            _ => Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice)))),
         }
-        Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))))
     }
 
     /// The slice of type arguments that `id` names.

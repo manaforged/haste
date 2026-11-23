@@ -345,6 +345,7 @@ impl Source {
     }
 
     /// The text of token `at`.
+    #[inline]
     pub fn text(&self, at: u32) -> &str {
         let (src, local) = self.layer(at);
         let Some((start, raw_len)) = src.tokens.raw_span(local) else {
@@ -378,6 +379,7 @@ impl Source {
     }
 
     /// The kind of token `at`, or `Eof` past the end.
+    #[inline]
     pub fn kind(&self, at: u32) -> TokenKind {
         let (src, local) = self.layer(at);
         src.tokens.at(local).map_or(TokenKind::Eof, |token| token.kind)
@@ -401,6 +403,7 @@ impl Source {
     }
 
     /// The index of the delimiter that matches token `at`.
+    #[inline]
     pub fn pair(&self, at: u32) -> u32 {
         let (src, local) = self.layer(at);
         src.tokens.at(local).map_or(at, |token| token.pair + (at - local as u32))
@@ -435,6 +438,7 @@ impl Source {
         text
     }
 
+    #[inline]
     pub fn joint(&self, at: u32) -> bool {
         let (src, local) = self.layer(at);
         src.tokens.raw_span(local).is_some_and(|(_, raw_len)| raw_len & JOINT != 0)

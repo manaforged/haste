@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 
 use anyhow::Result;
@@ -112,6 +112,7 @@ enum SlotState<V> {
 }
 
 struct Slot<V> {
+    ready_val: OnceLock<V>,
     state: Mutex<SlotState<V>>,
     ready: Condvar,
 }
@@ -185,6 +186,9 @@ impl<K, V> Flight<K, V> {
         V: Clone,
     {
         let slot = self.inner.slots.get(key)?;
+        if let Some(value) = slot.ready_val.get() {
+            return Some(value.clone());
+        }
         match &*lock(&slot.state) {
             SlotState::Ready(value) => Some(value.clone()),
             _ => None,
@@ -256,7 +260,7 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
         if let Some(slot) = self.inner.slots.get(key) {
             return self.wait_or_cycle(&slot, me);
         }
-        let fresh = Arc::new(Slot { state: Mutex::new(SlotState::Running(me)), ready: Condvar::new() });
+        let fresh = Arc::new(Slot { ready_val: OnceLock::new(), state: Mutex::new(SlotState::Running(me)), ready: Condvar::new() });
         let slot = self.inner.slots.get_or_insert_with(key.clone(), || Arc::clone(&fresh));
         if Arc::ptr_eq(&slot, &fresh) {
             return Step::Compute(fresh);
@@ -265,6 +269,9 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
     }
 
     fn wait_or_cycle(&self, slot: &Slot<V>, me: ThreadId) -> Step<V> {
+        if let Some(value) = slot.ready_val.get() {
+            return Step::Ready(value.clone());
+        }
         let mut guard = lock(&slot.state);
         let owner = match &*guard {
             SlotState::Ready(value) => return Step::Ready(value.clone()),
@@ -290,6 +297,7 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
     fn finish(&self, key: &K, slot: &Slot<V>, result: &Result<V>) {
         match result {
             Ok(value) => {
+                let _ = slot.ready_val.set(value.clone());
                 *lock(&slot.state) = SlotState::Ready(value.clone());
                 slot.ready.notify_all();
             }

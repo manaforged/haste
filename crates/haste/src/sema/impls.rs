@@ -96,12 +96,26 @@ impl Asked {
         self.modules.is_empty() && self.names.is_empty() && self.crates.is_empty() && self.scopes.is_empty() && self.procs.is_empty()
     }
 
+    #[inline]
     fn replay(&self, into: &crate::names::path::Requests) {
-        into.modules.borrow_mut().extend(self.modules.iter().copied());
-        into.names.borrow_mut().extend(self.names.iter().copied());
-        into.crates.borrow_mut().extend(self.crates.iter().copied());
-        into.scopes.borrow_mut().extend(self.scopes.iter().copied());
-        into.procs.borrow_mut().extend(self.procs.iter().cloned());
+        if self.is_empty() {
+            return;
+        }
+        if !self.modules.is_empty() {
+            into.modules.borrow_mut().extend(self.modules.iter().copied());
+        }
+        if !self.names.is_empty() {
+            into.names.borrow_mut().extend(self.names.iter().copied());
+        }
+        if !self.crates.is_empty() {
+            into.crates.borrow_mut().extend(self.crates.iter().copied());
+        }
+        if !self.scopes.is_empty() {
+            into.scopes.borrow_mut().extend(self.scopes.iter().copied());
+        }
+        if !self.procs.is_empty() {
+            into.procs.borrow_mut().extend(self.procs.iter().cloned());
+        }
     }
 }
 
@@ -209,25 +223,28 @@ impl<'a> Context<'a> {
         if item.declaring_body().is_some() {
             return self.parent_item(item).filter(|parent| self.item(*parent).1.kind == ItemKind::Impl).map(ImplRef::Body);
         }
-        let owners = self.owners_of(item.krate);
         let file = self.file(item);
         let key = match file.items.items[item.item as usize].parent {
             Some(parent) if file.items.items[parent as usize].kind == ItemKind::Impl => (item.file, Some(parent)),
             Some(_) => return None,
+            None if !file.expanded => return None,
             None => (item.file, None),
         };
-        owners.get(&key).map(|&index| ImplRef::Module { krate: item.krate, index })
+        self.owners_of(item.krate).get(&key).map(|&index| ImplRef::Module { krate: item.krate, index })
     }
 
-    fn owners_of(&mut self, krate: u32) -> Arc<HashMap<(u32, Option<u32>), u32>> {
+    fn owners_of(&mut self, krate: u32) -> &HashMap<(u32, Option<u32>), u32> {
         let tree = &self.outline.crates[krate as usize];
-        self.store.lookups.owners.get_or_insert_with(krate, || {
-            let mut map = HashMap::default();
-            for (index, entry) in tree.impls.iter().enumerate() {
-                map.insert((entry.file as u32, Some(entry.at)), index as u32);
-                map.extend(entry.parts.iter().map(|&part| ((part as u32, None), index as u32)));
-            }
-            Arc::new(map)
+        let store = &self.store.lookups.owners;
+        self.crate_owners[krate as usize].get_or_insert_with(|| {
+            store.get_or_insert_with(krate, || {
+                let mut map = HashMap::default();
+                for (index, entry) in tree.impls.iter().enumerate() {
+                    map.insert((entry.file as u32, Some(entry.at)), index as u32);
+                    map.extend(entry.parts.iter().map(|&part| ((part as u32, None), index as u32)));
+                }
+                Arc::new(map)
+            })
         })
     }
 
@@ -253,8 +270,8 @@ impl<'a> Context<'a> {
             _ => &standard,
         };
         let mut found = Vec::new();
-        self.any_holder(holders, Some(head), None, |cx, holder| {
-            found.extend(cx.index_of(holder).inherent.get(&head).into_iter().flatten().copied());
+        self.any_holder(holders, Some(head), None, |index| {
+            found.extend(index.inherent.get(&head).into_iter().flatten().copied());
             false
         });
         found
@@ -282,24 +299,36 @@ impl<'a> Context<'a> {
         out
     }
 
-    fn any_holder(&mut self, crates: &[u32], head: Option<Head>, of: Option<ItemRef>, mut visit: impl FnMut(&mut Self, Holder) -> bool) -> bool {
+    fn any_holder(&mut self, crates: &[u32], head: Option<Head>, of: Option<ItemRef>, mut visit: impl FnMut(&Index) -> bool) -> bool {
         for &krate in crates {
-            if visit(self, Holder::Crate(krate)) {
+            if self.with_crate_index(krate, &mut visit) {
                 return true;
             }
         }
         for root in self.extra_body_holders(crates, head, of).into_iter().flatten() {
-            if visit(self, Holder::Body(root)) {
+            let index = self.index_of(Holder::Body(root));
+            if visit(&index) {
                 return true;
             }
         }
         false
     }
 
+    fn with_crate_index(&mut self, krate: u32, visit: &mut impl FnMut(&Index) -> bool) -> bool {
+        if let Some(index) = self.crate_heads[krate as usize].as_deref() {
+            index.asked.replay(&self.asks);
+            return visit(index);
+        }
+        let index = self.index_of(Holder::Crate(krate));
+        let hit = visit(&index);
+        self.crate_heads[krate as usize] = Some(index);
+        hit
+    }
+
     /// Whether any impl of trait `of` in crates `holders` may match a self type with head `head`.
     pub fn has_trait_impl_for_head(&mut self, of: ItemRef, head: Head, holders: &[u32]) -> bool {
-        self.any_holder(holders, Some(head), Some(of), |cx, holder| {
-            cx.index_of(holder)
+        self.any_holder(holders, Some(head), Some(of), |index| {
+            index
                 .traits
                 .get(&of)
                 .is_some_and(|bucket| !bucket.blanket.is_empty() || bucket.by_head.get(&head).is_some_and(|matching| !matching.is_empty()))
@@ -309,8 +338,7 @@ impl<'a> Context<'a> {
     /// The impls of trait `of` in crates `holders` whose self type may have head `head`.
     pub fn trait_impls(&mut self, of: ItemRef, head: Option<Head>, holders: &[u32]) -> Vec<ImplRef> {
         let mut found = Vec::new();
-        self.any_holder(holders, head, Some(of), |cx, holder| {
-            let index = cx.index_of(holder);
+        self.any_holder(holders, head, Some(of), |index| {
             if let Some(bucket) = index.traits.get(&of) {
                 match head {
                     None => found.extend_from_slice(&bucket.all),
@@ -329,7 +357,7 @@ impl<'a> Context<'a> {
 
     /// Whether crates `holders` write a negative impl of trait `of` for a self type with head `head`.
     pub fn negative_impl(&mut self, of: ItemRef, head: Head, holders: &[u32]) -> bool {
-        self.any_holder(holders, Some(head), Some(of), |cx, holder| cx.index_of(holder).negative.get(&of).is_some_and(|heads| heads.contains(&head)))
+        self.any_holder(holders, Some(head), Some(of), |index| index.negative.get(&of).is_some_and(|heads| heads.contains(&head)))
     }
 
     /// The trait that impl `block` implements, or none for an inherent impl.
