@@ -204,6 +204,7 @@ impl Image {
         let mut addrs = lock(&self.rodata_addrs);
         let id = RodataId(addrs.len() as u32);
         addrs.push(address);
+        if self.backend.is_lazy_jit() { lock(&self.rodata_entries).push((bytes.to_vec(), relocs.to_vec())); }
         id
     }
 
@@ -751,11 +752,11 @@ impl Image {
     }
 
     pub(super) fn frozen_stencil_key(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId) -> Option<(bool, u64, u128)> {
-        if self.backend.is_lazy_jit() || !fp.is_portable() { return None; }
+        if !fp.is_portable() { return None; }
         let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
         if matches!(typed.shape, crate::sema::infer::Shape::Anon(_)) || typed.has_awaits() { return None; }
         let (is_sysroot, item_key) = crate::substrate::layer_item_key(cx.outline, *item)?;
-        Some((is_sysroot, mode_stencil_key(self.backend.mode(), item_key), fp.0))
+        Some((is_sysroot, item_key ^ self.backend.stencil_tag(), fp.0))
     }
 
     fn emit_dict_stub(&self, body_exec: usize, symbols: &[u64], pass: &mut Pass) -> Result<(usize, Vec<u8>)> {

@@ -66,19 +66,16 @@ impl Program {
         self.jit.forget(outline, edited);
     }
 
+    /// Inference store and JIT image for persisting newly frozen summaries and stencils.
+    pub(crate) fn store_and_image(&self) -> (&Cache, &Image) {
+        (self.jit.store(), self.jit.image())
+    }
+
     /// The inference store, without what the crates `edited` touch.
     pub fn into_store(mut self, outline: &Outline, edited: Edited<'_>) -> Cache {
         self.jit.store.forget(outline, edited);
         std::mem::take(&mut self.jit.store)
     }
-}
-
-/// Runs the binary whose `main` is `main` with `args` as argv, starting inference from `store`, compiling each function when the program first calls it, and returns the program's exit status.
-pub fn run_on_demand(compilation: &mut Compilation, (store, main): (Cache, ItemRef), args: &[String]) -> Result<i32> {
-    let mut program = Program::new(compilation, store, main)?;
-    let status = program.run(compilation, args);
-    std::mem::forget(program);
-    status
 }
 
 /// One run of a program's `main`, what reads its watched files again when it is watched, and its exit status once it ends.

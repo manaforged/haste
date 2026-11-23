@@ -10,7 +10,7 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
-use super::stencil::{DictConfig, FirstJit, FirstJitState, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
+use super::stencil::{DictConfig, FirstJit, FirstJitState, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord, aot_relocs_valid};
 use super::workers::{bucket_work, lpt_shards};
 use super::{Image, Pass, stub};
 
@@ -19,6 +19,7 @@ pub(super) struct Ready {
     footprint: Option<FootprintId>,
     code: Option<Arc<Code>>,
     relocs: Option<(Arc<RelocPlan>, RelocVec)>,
+    thawed: bool,
 }
 
 /// A function's encoded stencil, its relocations, and their plan.
@@ -49,7 +50,46 @@ impl Image {
         compiled
     }
 
-    /// What a worker makes ahead for the functions `bucket` of one item: relocations under a plan that a template or an earlier function of the bucket already has, else a lowered and encoded stencil.
+    fn thaw_lazy_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, fp: FootprintId, wanted0: usize) -> Result<Option<Lowered>> {
+        if !self.backend.is_lazy_jit() {
+            return Ok(None);
+        }
+        let Some((_, key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp) else {
+            return Ok(None);
+        };
+        let Some(substrate) = cx.store().substrate().cloned() else {
+            return Ok(None);
+        };
+        let Some(slice) = substrate.stencil(key, fp_bits) else {
+            return Ok(None);
+        };
+        let Ok(code) = slice.to_code().map(Arc::new) else {
+            return Ok(None);
+        };
+        if code.relocs().iter().all(|r| r.symbol_index().is_none()) && code.unwind_drops().is_empty() {
+            return Ok(Some((code, RelocVec::new(), Arc::default())));
+        }
+        let Some(plan) = self.decode_lazy_reloc_plan(cx, reached, slice.plan()).map(Arc::new) else {
+            if self.wanted_len() > wanted0 {
+                bail!("unreached inline callee");
+            }
+            return Ok(None);
+        };
+        if !aot_relocs_valid(&code, plan.reloc_len()) {
+            return Ok(None);
+        }
+        let relocs = match lower::eval_relocs(cx, reached, self, &plan, index) {
+            Ok(r) => r,
+            Err(_) if self.wanted_len() > wanted0 => bail!("unreached inline callee"),
+            Err(_) => return Ok(None),
+        };
+        if self.wanted_len() > wanted0 {
+            bail!("unreached inline callee");
+        }
+        Ok(Some((code, relocs, plan)))
+    }
+
+    /// What a worker makes ahead for the functions `bucket` of one item: relocations under a plan that a template or an earlier function of the bucket already has, else a thawed substrate stencil, else a lowered and encoded stencil.
     fn ready_bucket(&self, cx: &mut Context<'_>, reached: &Reached, bucket: &[usize]) -> Vec<(usize, Ready)> {
         let mut plans: rustc_hash::FxHashMap<FootprintId, Arc<RelocPlan>> = rustc_hash::FxHashMap::default();
         let mut made = Vec::new();
@@ -58,16 +98,27 @@ impl Image {
             let footprint = self.quietly(cx, |cx| lower::eval_footprint(cx, reached, self, index).ok());
             let plan = footprint.and_then(|fp| self.pass.stencils.jit_templates.get(&(item, fp)).map(|template| Arc::clone(&template.reloc_plan)).or_else(|| plans.get(&fp).cloned()));
             let ready = match plan {
-                Some(plan) => Ready { footprint, code: None, relocs: self.quietly(cx, |cx| lower::eval_relocs(cx, reached, self, &plan, index).ok()).map(|relocs| (plan, relocs)) },
-                None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target_for(cx, item)).ok()?, out.relocs, out.reloc_plan))) {
-                    Some((code, relocs, plan)) => {
-                        if let Some(fp) = footprint {
-                            plans.insert(fp, Arc::clone(&plan));
+                Some(plan) => Ready { footprint, code: None, relocs: self.quietly(cx, |cx| lower::eval_relocs(cx, reached, self, &plan, index).ok()).map(|relocs| (plan, relocs)), thawed: false },
+                None => {
+                    let thawed = footprint.and_then(|fp| self.quietly(cx, |cx| self.thaw_lazy_stencil(cx, reached, index, fp, self.wanted_len()).ok().flatten()));
+                    match thawed {
+                        Some((code, relocs, plan)) => {
+                            if let Some(fp) = footprint {
+                                plans.insert(fp, Arc::clone(&plan));
+                            }
+                            Ready { footprint, code: Some(code), relocs: Some((plan, relocs)), thawed: true }
                         }
-                        Ready { footprint, code: Some(Arc::new(code)), relocs: Some((plan, relocs)) }
+                        None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target_for(cx, item)).ok()?, out.relocs, out.reloc_plan))) {
+                            Some((code, relocs, plan)) => {
+                                if let Some(fp) = footprint {
+                                    plans.insert(fp, Arc::clone(&plan));
+                                }
+                                Ready { footprint, code: Some(Arc::new(code)), relocs: Some((plan, relocs)), thawed: false }
+                            }
+                            None => continue,
+                        },
                     }
-                    None => continue,
-                },
+                }
             };
             if ready.relocs.is_some() {
                 made.push((index, ready));
@@ -104,16 +155,22 @@ impl Image {
         }
     }
 
-    /// Function `index` lowered and encoded: what a worker made ahead, or a fresh lowering that fails when it noted an unreached function since `wanted0`.
-    fn lowered(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, wanted0: usize, pass: &Pass) -> Result<Lowered> {
-        if let Some(Ready { code: Some(code), relocs: Some((plan, relocs)), .. }) = pass.ready.get(&index) {
-            return Ok((Arc::clone(code), relocs.clone(), Arc::clone(plan)));
+    /// Function `index` lowered and encoded: what a worker made ahead, else a fresh lowering that fails when it noted an unreached function since `wanted0`, plus whether it was thawed from substrate.
+    fn lowered(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, wanted0: usize, pass: &Pass) -> Result<(Lowered, bool)> {
+        if let Some(Ready { code: Some(code), relocs: Some((plan, relocs)), thawed, .. }) = pass.ready.get(&index) {
+            return Ok(((Arc::clone(code), relocs.clone(), Arc::clone(plan)), *thawed));
         }
         let out = lower::lower_stencil(cx, reached, self, index)?;
         if self.wanted_len() > wanted0 {
             bail!("unreached inline callee");
         }
-        Ok((Arc::new(haste_codegen::compile(out.func, &self.compile_target_for(cx, reached.list[index].0.0))?), out.relocs, out.reloc_plan))
+        Ok(((Arc::new(haste_codegen::compile(out.func, &self.compile_target_for(cx, reached.list[index].0.0))?), out.relocs, out.reloc_plan), false))
+    }
+
+    fn freeze_lazy(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId, (code, plan): (&Arc<Code>, &RelocPlan), pass: &mut Pass) {
+        if self.backend.is_lazy_jit() && !pass.stencils.cfg.verify && cx.outline.is_fixed(reached.list[index].0.0.krate) {
+            self.freeze_stencil(cx, reached, index, fp, false, code, Some(plan), pass);
+        }
     }
 
     pub(super) fn compile_jit_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<usize> {
@@ -132,7 +189,26 @@ impl Image {
     fn try_first_jit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, pass: &mut Pass) -> Result<Option<usize>> {
         match pass.stencils.first_jit.get(&item).cloned() {
             None => {
-                let (code, relocs, reloc_plan) = self.lowered(cx, reached, index, wanted0, pass)?;
+                let fp = if self.backend.is_lazy_jit() && cx.outline.is_fixed(item.krate) {
+                    let fp = self.footprint(cx, reached, index, pass)?;
+                    if self.wanted_len() > wanted0 {
+                        bail!("unreached inline callee");
+                    }
+                    Some(fp)
+                } else {
+                    None
+                };
+                let ((code, relocs, reloc_plan), thawed) = if let Some(fp) = fp
+                    && pass.ready.get(&index).is_none_or(|r| r.code.is_none())
+                    && let Some(hit) = self.thaw_lazy_stencil(cx, reached, index, fp, wanted0)?
+                {
+                    (hit, true)
+                } else {
+                    self.lowered(cx, reached, index, wanted0, pass)?
+                };
+                if !thawed && let Some(fp) = fp {
+                    self.freeze_lazy(cx, reached, index, fp, (&code, &reloc_plan), pass);
+                }
                 let symbols = self.symbols(&relocs);
                 let exec = self.write_jit_code(&mut pass.memory, &code, &symbols)?;
                 pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan }));
@@ -167,7 +243,17 @@ impl Image {
                 (self.symbols(&relocs), None)
             }
             None => {
-                let (code, relocs, plan) = self.lowered(cx, reached, index, wanted0, pass)?;
+                let ((code, relocs, plan), thawed) = if !cfg.verify
+                    && pass.ready.get(&index).is_none_or(|r| r.code.is_none())
+                    && let Some(hit) = self.thaw_lazy_stencil(cx, reached, index, footprint, wanted0)?
+                {
+                    (hit, true)
+                } else {
+                    self.lowered(cx, reached, index, wanted0, pass)?
+                };
+                if !thawed {
+                    self.freeze_lazy(cx, reached, index, footprint, (&code, &plan), pass);
+                }
                 (self.symbols(&relocs), Some((code, plan)))
             }
         };
@@ -206,7 +292,7 @@ impl Image {
         let (stencil, reloc_plan) = match prelowered {
             Some(pair) => pair,
             None => {
-                let (code, _, plan) = self.lowered(cx, reached, index, usize::MAX, pass)?;
+                let ((code, _, plan), _) = self.lowered(cx, reached, index, usize::MAX, pass)?;
                 (code, plan)
             }
         };

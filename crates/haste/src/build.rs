@@ -19,7 +19,7 @@ pub(crate) mod substrate;
 mod test_args;
 mod watch;
 
-use substrate::{SubstrateSlot, cache_with_substrate, export_pre_summaries, save_batch_substrate};
+use substrate::{SubstrateSlot, cache_with_substrate, export_pre_summaries, save_batch_substrate, save_jit_substrate};
 use test_args::parse_test_args;
 use watch::{Stamp, Watch, body_edits, edits, paths, pre_stamps, stamps};
 
@@ -723,10 +723,19 @@ fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], 
     if use_prep {
         bind_prepped(workspace, &mut compilation, args, ahead);
     }
-    let (_, cache) = cache_with_substrate(workspace, true);
+    let (slot, cache) = cache_with_substrate(workspace, true);
     let status = match crate::image::watch::enabled() {
         true => run_watched(workspace, &mut compilation, cache, main, args),
-        false => crate::image::run_on_demand(&mut compilation, (cache, main), args),
+        false => {
+            let mut program = Program::new(&mut compilation, cache, main)?;
+            let status = program.run(&mut compilation, args);
+            if let Some(slot) = slot {
+                let (store, image) = program.store_and_image();
+                save_jit_substrate(&compilation.outline, store, image, slot);
+            }
+            std::mem::forget(program);
+            status
+        }
     };
     std::mem::forget(compilation);
     status

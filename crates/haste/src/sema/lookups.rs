@@ -255,6 +255,11 @@ fn lang_files_changed(
 }
 
 impl Cache {
+    /// Returns the reconciled file index for `outline`, building it lazily on first use.
+    pub(crate) fn file_index(&self, outline: &Outline) -> &summary::codec::FileIndex {
+        self.lookups.file_index.get_or_init(|| Arc::new(summary::codec::FileIndex::build(outline)))
+    }
+
     /// Attaches a frozen sysroot substrate to serve pre-computed `PolySummary` entries.
     pub fn set_substrate(&mut self, substrate: Option<Arc<crate::substrate::Substrate>>) {
         self.lookups.substrate = substrate;

@@ -712,7 +712,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         let valid_relocs = if is_dict {
             code.relocs().iter().all(|r| r.as_runtime().is_some())
         } else {
-            code.relocs().iter().all(|r| r.symbol_index().is_some() || (self.backend.is_aot() && r.as_runtime().is_some()))
+            code.relocs().iter().all(|r| r.symbol_index().is_some() || ((self.backend.is_aot() || self.backend.is_lazy_jit()) && r.as_runtime().is_some()))
         };
         if !cx.deferred_evals.is_empty() {
             return tally(Tally::FreezeDeferred);
@@ -721,7 +721,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
             return tally(Tally::FreezeSkipped);
         };
         let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some());
-        let (store_sysroot, plan_bytes) = if self.backend.is_aot() && needs_plan {
+        let (store_sysroot, plan_bytes) = if (self.backend.is_aot() || self.backend.is_lazy_jit()) && needs_plan {
             let Some(pair) = self.encode_frozen_plan(cx, reached, is_sysroot, plan) else {
                 return tally(if is_dict { Tally::FreezeSkipped } else { Tally::FreezePlanless });
             };

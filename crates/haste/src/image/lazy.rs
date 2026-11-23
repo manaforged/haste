@@ -1,7 +1,7 @@
 //! Programs that compile each function on its first call: each runs in a forked child whose call table starts at stubs, and this process infers, lowers and encodes each function a stub asks for.
 
 mod program;
-pub use program::{Program, evaluator, run_on_demand};
+pub use program::{Program, evaluator};
 
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -83,7 +83,8 @@ pub trait Driver {
 }
 
 /// The most functions that one ask compiles ahead of their first call.
-const AHEAD_FUNCTIONS: usize = 4096;
+const AHEAD_FUNCTIONS: usize = 256;
+const AHEAD_DEPTH: usize = 4;
 
 /// The functions declared so far, the inference store whose types their instances name, the image that holds their stubs and code, the children that run it, whether an ask compiles the functions it reaches ahead, the functions that compiling ahead left to their first call, and the watched source files with whether they changed.
 pub struct Jit {
@@ -157,6 +158,10 @@ impl Jit {
 
     pub(crate) fn store(&self) -> &Cache {
         &self.store
+    }
+
+    pub(crate) fn image(&self) -> &Image {
+        &self.image
     }
 
     fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
@@ -498,7 +503,9 @@ impl Jit {
         seen.insert(index);
         let mut members = Vec::new();
         let mut level = self.fresh_callees(cx, index, &mut seen);
-        while !level.is_empty() && members.len() < AHEAD_FUNCTIONS {
+        let mut depth = 0;
+        while !level.is_empty() && members.len() < AHEAD_FUNCTIONS && depth < AHEAD_DEPTH {
+            depth += 1;
             level.truncate(AHEAD_FUNCTIONS - members.len());
             let inferred = infer_quiet(cx, &mut self.reached, &level);
             self.image.bind_foreign_statics(cx, &self.reached, &inferred);

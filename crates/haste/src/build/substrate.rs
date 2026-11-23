@@ -145,13 +145,23 @@ fn export_and_save_layers((outline, store): (&outline::Outline, &mut Cache), ima
     save_substrate_layer(builders.toolchain, (workspace, kind), slot.toolchain.take(), SubstrateBuilder::save_toolchain)
 }
 
-pub(crate) fn save_macro_summaries(outline: &outline::Outline, store: &Cache, mut slot: SubstrateSlot) {
-    if !store.has_new_sysroot_summaries() {
+pub(crate) fn save_jit_substrate(outline: &outline::Outline, store: &Cache, image: &Image, mut slot: SubstrateSlot) {
+    let has_summaries = store.has_new_sysroot_summaries();
+    let has_stencils = image.has_new_frozen_stencils();
+    if !has_summaries && !has_stencils {
         return;
     }
     let mut builders = make_builders(&slot);
-    if let Err(error) = store.export_sysroot_summaries(outline, Some(&mut builders.toolchain), builders.deps.as_mut()) {
-        eprintln!("haste: cannot export macro summaries: {error:#}");
+    if has_summaries
+        && let Err(error) = store.export_sysroot_summaries(outline, Some(&mut builders.toolchain), builders.deps.as_mut())
+    {
+        eprintln!("haste: cannot export jit summaries: {error:#}");
+        return;
+    }
+    if has_stencils
+        && let Err(error) = image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())
+    {
+        eprintln!("haste: cannot export jit stencils: {error:#}");
         return;
     }
     let workspace = slot.workspace_key.or(slot.deps_key).unwrap_or(slot.toolchain_key);
@@ -162,7 +172,7 @@ pub(crate) fn save_macro_summaries(outline: &outline::Outline, store: &Cache, mu
         save_substrate_layer(builders.toolchain, (workspace, BatchKind::MainAot), slot.toolchain.take(), SubstrateBuilder::save_toolchain)
     };
     if let Err(error) = save() {
-        eprintln!("haste: cannot save macro substrate: {error:#}");
+        eprintln!("haste: cannot save jit substrate: {error:#}");
     }
 }
 

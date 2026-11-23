@@ -88,7 +88,7 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
     }
     resolve(&mut compilation)?;
     if let (Some(slot), Some(expander)) = (macro_slot, &compilation.expander) {
-        crate::with_host_target(|| crate::build::substrate::save_macro_summaries(&compilation.outline, expander.jit.store(), slot));
+        crate::with_host_target(|| crate::build::substrate::save_jit_substrate(&compilation.outline, expander.jit.store(), expander.jit.image(), slot));
     }
     if was_miss {
         crate::substrate::sysroot::save(workspace, targets, &compilation);
