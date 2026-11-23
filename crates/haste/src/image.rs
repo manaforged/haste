@@ -578,7 +578,11 @@ impl Image {
         }
     }
 
-    fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
+    pub(super) fn is_fast_lazy(&self) -> bool {
+        matches!(self.backend, ImageBackend::LazyJit { fast: true })
+    }
+
+    fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<(usize, bool)> {
         self.with_pass(|image, pass| image.compile_jit_one(cx, reached, index, pass))
     }
 }

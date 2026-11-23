@@ -49,7 +49,7 @@ impl Image {
             made.into_iter().filter_map(Result::ok).flatten().collect()
         };
         work.retain(|index| self.pass.ready.contains_key(index));
-        let compiled = work.into_iter().filter_map(|index| self.compile_one(cx, reached, index).ok().map(|code| (index, code))).collect();
+        let compiled = work.into_iter().filter_map(|index| self.compile_one(cx, reached, index).ok().map(|(code, _)| (index, code))).collect();
         self.pass.ready.clear();
         self.take_wanted();
         compiled
@@ -180,20 +180,20 @@ impl Image {
         }
     }
 
-    pub(super) fn compile_jit_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<usize> {
+    pub(super) fn compile_jit_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<(usize, bool)> {
         let cfg = pass.stencils.cfg;
         let item = reached.list[index].0.0;
         let wanted0 = self.wanted_len();
         if !cfg.verify
             && cfg.min_fanout > 1
-            && let Some(exec) = self.try_first_jit(cx, reached, index, item, wanted0, pass)?
+            && let Some(hit) = self.try_first_jit(cx, reached, index, item, wanted0, pass)?
         {
-            return Ok(exec);
+            return Ok(hit);
         }
         self.compile_jit_cached(cx, reached, index, item, wanted0, cfg, pass)
     }
 
-    fn try_first_jit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, pass: &mut Pass) -> Result<Option<usize>> {
+    fn try_first_jit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, pass: &mut Pass) -> Result<Option<(usize, bool)>> {
         match pass.stencils.first_jit.get(&item).cloned() {
             None => {
                 let fp = if self.backend.is_lazy_jit() && cx.outline.is_fixed(item.krate) {
@@ -219,7 +219,7 @@ impl Image {
                 let symbols = self.symbols(&relocs);
                 let exec = self.write_jit_code(&mut pass.memory, &code, &symbols)?;
                 pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan }));
-                Ok(Some(exec))
+                Ok(Some((exec, thawed)))
             }
             Some(FirstJitState::First(first)) => {
                 let fp1 = self.footprint(cx, reached, first.index, pass)?;
@@ -235,19 +235,19 @@ impl Image {
         }
     }
 
-    fn compile_jit_cached(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, cfg: DictConfig, pass: &mut Pass) -> Result<usize> {
+    fn compile_jit_cached(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, cfg: DictConfig, pass: &mut Pass) -> Result<(usize, bool)> {
         let footprint = self.footprint(cx, reached, index, pass)?;
         if self.wanted_len() > wanted0 {
             bail!("unreached inline callee");
         }
         let existing_plan = pass.stencils.jit_templates.get(&(item, footprint)).map(|jt| Arc::clone(&jt.reloc_plan));
-        let (symbols, prelowered) = match existing_plan {
+        let (symbols, prelowered, reused) = match existing_plan {
             Some(plan) => {
                 let relocs = self.relocs(cx, reached, &plan, index, pass)?;
                 if self.wanted_len() > wanted0 {
                     bail!("unreached inline callee");
                 }
-                (self.symbols(&relocs), None)
+                (self.symbols(&relocs), None, true)
             }
             None => {
                 let ((code, relocs, plan), thawed) = if !cfg.verify
@@ -261,7 +261,7 @@ impl Image {
                 if !thawed {
                     self.freeze_lazy(cx, reached, index, footprint, (&code, &plan), pass);
                 }
-                (self.symbols(&relocs), Some((code, plan)))
+                (self.symbols(&relocs), Some((code, plan)), thawed)
             }
         };
         let alias_key = (item, footprint, symbols.clone());
@@ -275,12 +275,12 @@ impl Image {
                 };
                 self.verify_single(cx, reached, index, &rec)?;
             }
-            return Ok(addr);
+            return Ok((addr, true));
         }
         let stencil = self.ensure_jit_stencil(cx, reached, index, (item, footprint), prelowered, pass)?;
         let fanout = pass.stencils.jit_templates.get(&(item, footprint)).map_or(1, |jt| jt.fanout);
         if stencil.bytes().len() > cfg.min_bytes && fanout >= cfg.min_fanout {
-            return self.instantiate_jit_dict(cx, reached, index, (item, footprint), symbols, cfg, pass);
+            return Ok((self.instantiate_jit_dict(cx, reached, index, (item, footprint), symbols, cfg, pass)?, reused));
         }
         let exec = self.write_jit_code(&mut pass.memory, &stencil, &symbols)?;
         pass.stencils.aliases.insert(alias_key, (exec, false));
@@ -288,7 +288,7 @@ impl Image {
             let rec = VerifyRecord::Patched { exec, len: stencil.bytes().len(), sites: stencil.sites().to_vec(), unwind_drops: stencil.unwind_drops().to_vec() };
             self.verify_single(cx, reached, index, &rec)?;
         }
-        Ok(exec)
+        Ok((exec, reused))
     }
 
     fn ensure_jit_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, key: (ItemRef, FootprintId), prelowered: Option<(Arc<Code>, Arc<RelocPlan>)>, pass: &mut Pass) -> Result<Arc<Code>> {

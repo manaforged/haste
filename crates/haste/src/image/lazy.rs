@@ -454,15 +454,22 @@ impl Jit {
         }
         let mut journal = Journal::new();
         let answer = self.code(cx, index, &mut journal);
-        if matches!(answer, Err(Stop::Asked)) {
-            journal.iter().for_each(|&at| self.reached.forget(at));
-            self.expanded.clear();
-            self.tried.clear();
-            self.image.bodies.clear();
-        } else if answer.is_ok() {
-            self.compile_ahead(cx, index);
+        match answer {
+            Err(Stop::Asked) => {
+                journal.iter().for_each(|&at| self.reached.forget(at));
+                self.expanded.clear();
+                self.tried.clear();
+                self.image.bodies.clear();
+                Err(Stop::Asked)
+            }
+            Ok((code, fresh)) => {
+                if fresh {
+                    self.compile_ahead(cx, index);
+                }
+                Ok(code)
+            }
+            Err(err) => Err(err),
         }
-        answer
     }
 
     /// Compiles ahead, on every core, the functions without code that function `index` reaches through calls, up to `AHEAD_FUNCTIONS` of them, but those a prepped library binds; one whose inference or compile asks for more, defers, or fails keeps its stub, so it compiles, or fails, on its first call as it would have.
@@ -495,7 +502,7 @@ impl Jit {
         self.tried.extend(work.into_iter().filter(|at| !self.compiled.contains(at)));
     }
 
-    /// The direct uncompiled callees of `index` (up to `AHEAD_FUNCTIONS`), with their own direct callees quietly inferred so lowering them hits no untyped callee.
+    /// The direct uncompiled callees of `index` (up to `AHEAD_FUNCTIONS`, extending one extra hop when hop 1 is narrow), with their own direct callees quietly inferred so lowering them hits no untyped callee.
     fn frontier(&mut self, cx: &mut Context<'_>, index: usize) -> Vec<usize> {
         let mut seen = HashSet::default();
         seen.insert(index);
@@ -506,8 +513,30 @@ impl Jit {
         level.truncate(AHEAD_FUNCTIONS);
         let inferred = infer_quiet(cx, &mut self.reached, &level);
         self.image.bind_foreign_statics(cx, &self.reached, &inferred);
-        let (typed, left): (Vec<usize>, Vec<usize>) = level.into_iter().partition(|&at| self.reached.list[at].1.is_ok());
+        let (mut typed, left): (Vec<usize>, Vec<usize>) = level.into_iter().partition(|&at| self.reached.list[at].1.is_ok());
         self.tried.extend(left);
+        if !typed.is_empty() && typed.len() < 16 && typed.len() < AHEAD_FUNCTIONS {
+            let cap = AHEAD_FUNCTIONS - typed.len();
+            let mut hop2 = Vec::new();
+            for &at in &typed {
+                if hop2.len() >= cap {
+                    break;
+                }
+                for callee in self.fresh_callees(cx, at, &mut seen) {
+                    hop2.push(callee);
+                    if hop2.len() >= cap {
+                        break;
+                    }
+                }
+            }
+            if !hop2.is_empty() {
+                let inferred2 = infer_quiet(cx, &mut self.reached, &hop2);
+                self.image.bind_foreign_statics(cx, &self.reached, &inferred2);
+                let (typed2, left2): (Vec<usize>, Vec<usize>) = hop2.into_iter().partition(|&at| self.reached.list[at].1.is_ok());
+                self.tried.extend(left2);
+                typed.extend(typed2);
+            }
+        }
         let mut deps = Vec::new();
         for &at in &typed {
             for callee in calls(cx, &self.reached.list[at].1).collect::<Vec<_>>() {
@@ -526,9 +555,13 @@ impl Jit {
 
     /// The functions that function `at` calls, declared, that have no code, were not left to their first call, and are not in `seen`, which takes them.
     fn fresh_callees(&mut self, cx: &Context<'_>, at: usize, seen: &mut HashSet<usize>) -> Vec<usize> {
+        let fast_lazy = self.image.is_fast_lazy();
         let callees: Vec<Instance> = calls(cx, &self.reached.list[at].1).collect();
         let mut fresh = Vec::new();
         for callee in callees {
+            if cx.has_attr(callee.0, "cold") || (fast_lazy && (cx.outline.is_sysroot(callee.0.krate) || cx.foreign(callee.0))) {
+                continue;
+            }
             let callee = self.declare(callee);
             if !self.compiled.contains(&callee) && !self.tried.contains(&callee) && seen.insert(callee) {
                 fresh.push(callee);
@@ -542,23 +575,25 @@ impl Jit {
         calls(cx, &self.reached.list[at].1).all(|callee| self.reached.index.get(&callee).is_some_and(|&callee| !self.reached.is_untyped(callee)))
     }
 
-    /// Infers, lowers and encodes function `index` unless it has code, and returns its code.
-    fn code(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Result<usize, Stop> {
+    /// Infers, lowers and encodes function `index` unless it has code, and returns its code plus whether it compiled fresh.
+    fn code(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Result<(usize, bool), Stop> {
         let item = self.reached.list[index].0.0;
         if cx.foreign(item) {
-            return self.foreign_code(cx, index, journal);
+            return self.foreign_code(cx, index, journal).map(|code| (code, false));
         }
         if let Some(code) = self.prepped(cx, index, journal) {
             let origin = if crate::prep::bind(cx, &self.reached, index) == Some(code) { super::perf::Origin::Rustc } else { super::perf::Origin::Adapter };
             super::perf::note(cx, &self.reached, (index, code), origin);
-            return Ok(self.publish(index, code));
+            return Ok((self.publish(index, code), false));
         }
         let mut callees = self.infer(cx, index, journal)?;
+        let mut fresh = false;
         while !self.compiled.contains(&index) {
             match self.image.compile_one(cx, &self.reached, index) {
-                Ok(code) => {
+                Ok((code, reused)) => {
                     super::perf::note(cx, &self.reached, (index, code), super::perf::Origin::Haste);
                     self.publish(index, code);
+                    fresh = !reused;
                 }
                 Err(error) => {
                     let wanted = self.image.take_wanted();
@@ -569,7 +604,7 @@ impl Jit {
                 }
             }
         }
-        Ok(self.image.slot(index).load(Ordering::Acquire))
+        Ok((self.image.slot(index).load(Ordering::Acquire), fresh))
     }
 
     /// Binds the foreign function `index` once the functions its `global_asm!` block calls are reached, publishes its code and returns it.

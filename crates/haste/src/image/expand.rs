@@ -38,7 +38,7 @@ fn run_macros_inner(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job
     }
     let mut shares = Shares { jobs, next: vec![0; parts.len()], parts, running: Vec::new(), results: jobs.iter().map(|_| None).collect() };
     demand.set_fast(true);
-    demand.set_ahead(false);
+    demand.set_ahead(true);
     serve(compilation, ask, demand, &mut shares)?;
     Ok(shares.results)
 }
