@@ -759,6 +759,7 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         changed = true;
         if func.types.len() > prov.param_roots.len() { prov = Provenance::new(func, &cfg); }
     }
+    changed |= crate::mem::drop_unread_frame_stores(func, &cfg, &prov);
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
     changed |= pack::coalesce_loads(func, &prov, target);
     changed |= sink_terminator_defs(func);

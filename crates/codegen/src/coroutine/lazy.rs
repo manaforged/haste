@@ -60,6 +60,7 @@ pub(super) fn settle(func: &mut Function, spec: &Coroutine, anchor: StackSlot, l
             call(b.func, &mut insts, RuntimeSymbol::Free, &[fp, size], false);
         } else {
             let heap = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[size], true).expect("malloc returns");
+            b.func.mark_frame_ptr(heap);
             push(b.func, &mut insts, Op::Move(heap, buf, lazy.bytes), None);
             let object = push(b.func, &mut insts, Op::StackLoad(anchor, 8), Some(Type::I64)).expect("a load has a result");
             push(b.func, &mut insts, Op::Store(heap, object, spec.header.1), None);

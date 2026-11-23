@@ -4,7 +4,7 @@ use crate::ir::{
 };
 use crate::reloc::RuntimeSymbol;
 
-const FORMAT: u8 = 4;
+const FORMAT: u8 = 5;
 
 macro_rules! table {
     ($name:ident: $ty:ident = [$($variant:ident),* $(,)?]) => {
@@ -120,6 +120,7 @@ impl Function {
             w.u32(u.drop_sym);
             w.byte(u8::from(u.indirect));
         }
+        w.u32(self.frame_private);
         w.u32(self.cfg_rev);
         Some(w.0)
     }
@@ -166,6 +167,7 @@ impl Function {
                 })
             })
             .collect::<Option<_>>()?;
+        func.frame_private = r.u32()?;
         func.cfg_rev = r.u32()?;
         (r.at == bytes.len()).then_some(func)
     }

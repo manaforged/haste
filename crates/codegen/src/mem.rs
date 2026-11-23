@@ -620,8 +620,24 @@ fn block_clobbers(addr: Value, loc: MemLoc, prov: &Provenance) -> bool {
     w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
 }
 
+pub(crate) use frame::drop_unread_frame_stores;
+
 fn slot_unescaped_at(loc: MemLoc, at: Option<Inst>, prov: &Provenance) -> bool {
     matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s) || !prov.slot_escaped_at(s, at))
+}
+
+fn noalias_immune_to_atomic(op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
+    let MemRoot::NoAliasParam(p) = loc.root else { return false };
+    if !prov.noalias_unescaped(p) {
+        return false;
+    }
+    match *op {
+        Op::AtomicStore(_, addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
+            prov.loc(addr, 0, 1).root != MemRoot::NoAliasParam(p)
+        }
+        Op::AtomicLoad(..) | Op::Fence(_) => true,
+        _ => false,
+    }
 }
 
 /// Whether `op`, run as instruction `at` when known, may overwrite `loc`; `at` rules out slots whose address leaves only later.
@@ -654,7 +670,8 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
         _ => is_atomic_barrier(op)
             && loc.root != MemRoot::CallerLoc
             && !(prov.private_frame(loc) && !prov.touches_frame(op))
-            && !slot_unescaped_at(loc, at, prov),
+            && !slot_unescaped_at(loc, at, prov)
+            && !noalias_immune_to_atomic(op, loc, prov),
     }
 }
 
