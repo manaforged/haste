@@ -422,12 +422,152 @@ fn apply_plan(func: &mut Function, plan: SpecPlan) {
     func.bump_cfg();
 }
 
-/// Specializes a small call-free inner loop on a pre-loop constant stack-slot invariant so slot-tag branches fold off the fast path.
+struct DupJoinPlan {
+    pred: Block,
+    join: Block,
+    repairs: Vec<(Block, SsaRepairPlan)>,
+}
+
+fn pred_forwards_join_load(func: &Function, pred: Block, join: Block, args: &[Value]) -> bool {
+    let params = &func.blocks[join.index()].params;
+    let mut wanted: Vec<(Value, i32)> = Vec::new();
+    for &inst in &func.blocks[join.index()].insts {
+        match func.insts[inst.index()].op {
+            Op::Load(addr, off) => {
+                if let Some(pos) = params.iter().position(|&p| p == addr) {
+                    wanted.push((args[pos], off));
+                }
+            }
+            Op::Call { .. } | Op::TryCall { .. } => return false,
+            ref op if crate::mem::is_atomic_barrier(op) => return false,
+            _ => {}
+        }
+    }
+    if wanted.is_empty() {
+        return false;
+    }
+    for &inst in func.blocks[pred.index()].insts.iter().rev() {
+        match func.insts[inst.index()].op {
+            Op::Store(_, addr, off) if wanted.contains(&(addr, off)) => return true,
+            Op::Call { .. } | Op::TryCall { .. } | Op::Copy(..) | Op::Move(..) => return false,
+            ref op if crate::mem::is_atomic_barrier(op) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
+    let cfg = func.cfg();
+    for at in 0..func.blocks.len() {
+        let join = Block(at as u32);
+        let jdata = &func.blocks[at];
+        if !cfg.reachable[at] || jdata.params.is_empty() || jdata.insts.len() > 12 || cfg.preds_of(join).len() != 2 {
+            continue;
+        }
+        let Some(&last) = jdata.insts.last() else { continue };
+        let succs: Vec<Block> = match func.insts[last.index()].op {
+            Op::Jump(t, _) if t != join => vec![t],
+            Op::Brif(_, t, _, f, _) if t != f && t != join && f != join => vec![t, f],
+            _ => continue,
+        };
+        let mut own_vals: Vec<Value> = jdata.params.clone();
+        for &inst in &jdata.insts {
+            if !matches!(func.insts[inst.index()].op, Op::Const(_))
+                && let Some(r) = func.insts[inst.index()].result
+            {
+                own_vals.push(r);
+            }
+        }
+        let mut repairs: Vec<(Block, SsaRepairPlan)> = Vec::new();
+        let mut ssa_ok = true;
+        for &t in &succs {
+            if !cfg.dominates(join, t) {
+                ssa_ok = false;
+                break;
+            }
+            let Some(ssa) = plan_ssa_joins(func, &cfg, join, t, &[], &own_vals) else {
+                ssa_ok = false;
+                break;
+            };
+            if ssa.need.is_empty() {
+                continue;
+            }
+            if repairs.iter().any(|(_, prev)| prev.from_exit.iter().zip(&ssa.from_exit).any(|(&a, &b)| a && b)) {
+                ssa_ok = false;
+                break;
+            }
+            repairs.push((t, ssa));
+        }
+        if !ssa_ok {
+            continue;
+        }
+        for &pred in cfg.preds_of(join) {
+            if pred == join || cfg.dominates(join, pred) {
+                continue;
+            }
+            let Some(Op::Jump(target, args)) = func.last(pred) else { continue };
+            if *target != join || args.len() != jdata.params.len() {
+                continue;
+            }
+            if pred_forwards_join_load(func, pred, join, args) {
+                return Some(DupJoinPlan { pred, join, repairs });
+            }
+        }
+    }
+    None
+}
+
+fn apply_forwarding_join(func: &mut Function, plan: DupJoinPlan) {
+    localize_consts(func, plan.join);
+    let Some(&jump) = func.blocks[plan.pred.index()].insts.last() else { return };
+    let Op::Jump(_, ref args) = func.insts[jump.index()].op else { return };
+    let mut map: Vec<(Value, Value)> = func.blocks[plan.join.index()].params.iter().copied().zip(args.iter().copied()).collect();
+    let jinsts = func.blocks[plan.join.index()].insts.clone();
+    let (&last, body) = jinsts.split_last().expect("invariant: join has terminator");
+    let mut copied = Vec::with_capacity(body.len());
+    for &inst in body {
+        let data = func.insts[inst.index()].clone();
+        let mut op = data.op;
+        op.map_operands(|v| map.iter().find(|&&(from, _)| from == v).map_or(v, |&(_, into)| into));
+        let res = data.result.map(|r| {
+            let fresh = func.value(func.ty(r));
+            map.push((r, fresh));
+            fresh
+        });
+        let added = func.add(op, res);
+        func.insts[added.index()].loc = data.loc;
+        copied.push(added);
+    }
+    let mut term = func.insts[last.index()].op.clone();
+    term.map_operands(|v| map.iter().find(|&&(from, _)| from == v).map_or(v, |&(_, into)| into));
+    func.insts[jump.index()].op = term;
+    let pinsts = &mut func.blocks[plan.pred.index()].insts;
+    let at = pinsts.len() - 1;
+    pinsts.splice(at..at, copied);
+    func.bump_cfg();
+    for (exit, ssa) in plan.repairs {
+        let pairs: Vec<(Value, Value)> = ssa
+            .need
+            .iter()
+            .filter_map(|&orig| map.iter().find(|&&(from, _)| from == orig).map(|&(_, into)| (orig, into)))
+            .collect();
+        apply_ssa_repair(func, &ssa, exit, plan.pred, &pairs);
+    }
+    func.bump_cfg();
+}
+
+/// Specializes a small call-free inner loop on a pre-loop constant stack-slot invariant and duplicates small store-forwarding joins.
 pub(super) fn run(func: &mut Function) -> bool {
     let mut any = false;
     for _ in 0..2 {
         let Some(plan) = find_plan(func) else { break };
         apply_plan(func, plan);
+        any = true;
+    }
+    for _ in 0..2 {
+        let Some(plan) = find_forwarding_join(func) else { break };
+        apply_forwarding_join(func, plan);
         any = true;
     }
     any

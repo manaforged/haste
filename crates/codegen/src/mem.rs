@@ -201,31 +201,50 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
     }
 }
 
-/// Gives each unique pointer that a call returns and the function stores into an entry parameter's object that parameter as its owner, since the object predates the allocation.
+/// Gives each unique pointer that a call returns and the function stores into an entry parameter's or dominating frame's object that object as its owner, since it predates the allocation.
 fn seed_fresh_owners(func: &Function, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
-    let mut called = vec![false; func.types.len()];
+    let n = func.types.len();
+    let (mut is_malloc, mut is_free, mut called, mut from_malloc) = (vec![false; n], vec![false; n], vec![false; n], vec![false; n]);
+    for data in &func.insts {
+        match (&data.op, data.result) {
+            (&Op::Runtime(RuntimeSymbol::Malloc), Some(res)) => is_malloc[res.index()] = true,
+            (&Op::Runtime(RuntimeSymbol::Free), Some(res)) => is_free[res.index()] = true,
+            _ => {}
+        }
+    }
     let mut any_unique = false;
     for data in &func.insts {
         if let Op::Call { callee, results, .. } = &data.op {
             for &result in results {
-                if func.is_unique_ptr(result) {
-                    called[result.index()] = true;
-                    any_unique = true;
-                }
+                if func.is_unique_ptr(result) { (called[result.index()], any_unique) = (true, true); }
             }
-            if func.is_fresh_alloc(*callee) && let Some(&res) = results.first() {
+            let malloc = is_malloc[callee.index()];
+            if (func.is_fresh_alloc(*callee) || malloc) && let Some(&res) = results.first() {
                 tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(None));
+                if malloc { (called[res.index()], from_malloc[res.index()], any_unique) = (true, true, true); }
             }
         }
     }
-    if !any_unique || entry.is_empty() {
-        return;
+    if !any_unique { return; }
+    let mut freed_in_non_ret = vec![false; n];
+    if func.frame_private > 0 {
+        for block in &func.blocks {
+            if block.insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Return(_))) { continue; }
+            for &inst in &block.insts {
+                if let Op::Call { callee, args, .. } = &func.insts[inst.index()].op
+                    && is_free[callee.index()] && let Some(&ptr) = args.first()
+                {
+                    freed_in_non_ret[ptr.index()] = true;
+                }
+            }
+        }
     }
     for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Op::Store(value, addr, _) = func.insts[inst.index()].op
             && called[value.index()]
             && let Some(&(owner, _)) = affine.get(addr.index())
-            && entry.contains(&owner)
+            && owner != value
+            && (entry.contains(&owner) || (from_malloc[value.index()] && func.is_frame_ptr(owner) && !freed_in_non_ret[owner.index()]))
         {
             tracked[value.index()] = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner)));
         }
@@ -295,18 +314,10 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
         }
         if let Some(&last) = insts.last() {
             match &func.insts[last.index()].op {
-                Op::Jump(t, args) if !args.is_empty() => {
-                    if join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *t, args) && rank[t.index()] <= br {
-                        need_fixpoint = true;
-                    }
-                }
+                Op::Jump(t, args) if !args.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *t, args) && rank[t.index()] <= br => need_fixpoint = true,
                 Op::Brif(_, t, ta, f, fa) if !ta.is_empty() || !fa.is_empty() => {
-                    if !ta.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *t, ta) && rank[t.index()] <= br {
-                        need_fixpoint = true;
-                    }
-                    if !fa.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *f, fa) && rank[f.index()] <= br {
-                        need_fixpoint = true;
-                    }
+                    if !ta.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *t, ta) && rank[t.index()] <= br { need_fixpoint = true; }
+                    if !fa.is_empty() && join_track_args(&mut tracked, (func.blocks.as_slice(), entry), *f, fa) && rank[f.index()] <= br { need_fixpoint = true; }
                 }
                 _ => {}
             }

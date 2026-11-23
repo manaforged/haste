@@ -298,10 +298,9 @@ pub(crate) fn iadd_sub_const(op: &Op, imm_of: impl Fn(Value) -> Option<i64>) -> 
     }
 }
 
-fn atomic_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, sib: &[Option<Sib>], elided: &mut [bool]) -> Vec<Option<Value>> {
-    let count = func.types.len();
-    let mut atomic_base = vec![None; count];
-    let mut atomic_uses = vec![0_u32; count];
+/// Counts atomic memory address uses of each value.
+pub(crate) fn atomic_addr_uses(func: &Function) -> Vec<u32> {
+    let mut atomic_uses = vec![0_u32; func.types.len()];
     for block in &func.blocks {
         for &inst in &block.insts {
             let addr = match func.insts[inst.index()].op {
@@ -316,6 +315,34 @@ fn atomic_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, si
             }
         }
     }
+    atomic_uses
+}
+
+/// Returns which `I64` `Iadd`/`Isub` constant-offset values are used exclusively as atomic memory addresses and can fold directly into x64 atomic operands.
+pub(crate) fn atomic_elidable_addrs(func: &Function, defs: &[Option<Inst>], uses: &[u32]) -> Vec<bool> {
+    let consts = func.const_values();
+    let atomic_uses = atomic_addr_uses(func);
+    let mut out = vec![false; func.types.len()];
+    for (v, &def) in defs.iter().enumerate() {
+        let Some(def_inst) = def else { continue };
+        if atomic_uses[v] == 0 || atomic_uses[v] != uses[v] || func.types[v] != Type::I64 {
+            continue;
+        }
+        if let Some((base, delta)) = iadd_sub_const(&func.insts[def_inst.index()].op, |x| consts[x.index()])
+            && base.index() != v
+            && i32::try_from(delta).is_ok()
+            && func.ty(base) == Type::I64
+        {
+            out[v] = true;
+        }
+    }
+    out
+}
+
+fn atomic_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, sib: &[Option<Sib>], elided: &mut [bool]) -> Vec<Option<Value>> {
+    let count = func.types.len();
+    let mut atomic_base = vec![None; count];
+    let atomic_uses = atomic_addr_uses(func);
     for (v, &def) in census.def_inst.iter().enumerate() {
         let Some(def_inst) = def else { continue };
         if atomic_uses[v] == 0
