@@ -28,6 +28,15 @@ pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
     prune_changed(func, entry, true).0
 }
 
+fn removable_result(func: &Function, zeros: &[bool], data: &crate::ir::InstData) -> Option<Value> {
+    if (data.op.is_removable() || matches!(data.op, Op::AtomicLoad(_, AtomicOrd::Relaxed)))
+        && let Some(res) = data.result
+    {
+        return Some(res);
+    }
+    (!zeros.is_empty()).then(|| func.pure_thread_cell_result(&data.op, |v| zeros[v.index()])).flatten()
+}
+
 /// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
 pub(super) fn dead(func: &mut Function) -> bool {
     let mut uses = func.use_counts();
@@ -40,9 +49,7 @@ pub(super) fn dead(func: &mut Function) -> bool {
         keep.resize(len, true);
         for at in (0..len).rev() {
             let data = &func.insts[func.blocks[b].insts[at].index()];
-            let dead = ((data.op.is_removable() || matches!(data.op, Op::AtomicLoad(_, AtomicOrd::Relaxed)))
-                && data.result.is_some_and(|result| uses[result.index()] == 0))
-                || (!zeros.is_empty() && func.pure_thread_cell_result(&data.op, |v| zeros[v.index()]).is_some_and(|result| uses[result.index()] == 0));
+            let dead = removable_result(func, &zeros, data).is_some_and(|result| uses[result.index()] == 0);
             if dead {
                 keep[at] = false;
                 dropped = true;
@@ -58,36 +65,79 @@ pub(super) fn dead(func: &mut Function) -> bool {
     dropped
 }
 
-/// Drops each block parameter that nothing reads but edge arguments of other dropped parameters, with its argument on every edge; parameters of `pinned` blocks stay.
+/// Drops each block parameter that nothing side-effecting or control-flow reads (including dead pure phi cycles), with its argument on every edge; parameters of `pinned` blocks stay.
 pub(super) fn run(func: &mut Function, pinned: &[bool]) -> bool {
     if !func.blocks.iter().enumerate().any(|(b, d)| !pinned[b] && !d.params.is_empty()) {
         return false;
     }
-    let mut live = vec![false; func.types.len()];
+    let nvals = func.types.len();
+    let zeros = func.thread_cell_zeros();
+    let mut def_inst: Vec<Option<crate::ir::Inst>> = vec![None; nvals];
+    let mut param_id: Vec<u32> = vec![u32::MAX; nvals];
+    let mut live = vec![false; nvals];
+    let mut work: Vec<Value> = Vec::new();
+    let mut num_params = 0_u32;
     for (block, data) in func.blocks.iter().enumerate() {
         if pinned[block] {
-            data.params.iter().for_each(|param| live[param.index()] = true);
+            for &param in &data.params {
+                if !std::mem::replace(&mut live[param.index()], true) {
+                    work.push(param);
+                }
+            }
+        } else {
+            for &param in &data.params {
+                param_id[param.index()] = num_params;
+                num_params += 1;
+            }
         }
-        for inst in &data.insts {
-            match &func.insts[inst.index()].op {
+        for &inst in &data.insts {
+            let idata = &func.insts[inst.index()];
+            if let Some(res) = removable_result(func, &zeros, idata) {
+                def_inst[res.index()] = Some(inst);
+                continue;
+            }
+            match &idata.op {
                 Op::Jump(..) => {}
-                Op::Brif(cond, ..) => live[cond.index()] = true,
-                op => op.for_operands(|value| live[value.index()] = true),
+                Op::Brif(cond, ..) => {
+                    if !std::mem::replace(&mut live[cond.index()], true) {
+                        work.push(*cond);
+                    }
+                }
+                op => op.for_operands(|value| {
+                    if !std::mem::replace(&mut live[value.index()], true) {
+                        work.push(value);
+                    }
+                }),
             }
         }
     }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in 0..func.blocks.len() {
-            for_edges(func, block, |target, args| {
-                for (param, arg) in func.blocks[target.index()].params.iter().zip(args) {
-                    if live[param.index()] && !live[arg.index()] {
-                        live[arg.index()] = true;
-                        changed = true;
-                    }
+    let mut incoming: Vec<Vec<Value>> = vec![Vec::new(); num_params as usize];
+    for block in 0..func.blocks.len() {
+        for_edges(func, block, |target, args| {
+            for (param, &arg) in func.blocks[target.index()].params.iter().zip(args) {
+                let id = param_id[param.index()];
+                if id != u32::MAX {
+                    incoming[id as usize].push(arg);
+                }
+            }
+        });
+    }
+    while let Some(v) = work.pop() {
+        if let Some(inst) = def_inst[v.index()] {
+            func.insts[inst.index()].op.for_operands(|opnd| {
+                if !std::mem::replace(&mut live[opnd.index()], true) {
+                    work.push(opnd);
                 }
             });
+        } else {
+            let id = param_id[v.index()];
+            if id != u32::MAX {
+                for &arg in &incoming[id as usize] {
+                    if !std::mem::replace(&mut live[arg.index()], true) {
+                        work.push(arg);
+                    }
+                }
+            }
         }
     }
     let dead = |param: &Value| !live[param.index()];
