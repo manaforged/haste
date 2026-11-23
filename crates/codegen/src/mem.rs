@@ -204,8 +204,11 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
 fn seed_fresh_owners(func: &Function, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
     let mut called = vec![false; func.types.len()];
     for data in &func.insts {
-        if let Op::Call { results, .. } = &data.op {
+        if let Op::Call { callee, results, .. } = &data.op {
             results.iter().for_each(|result| called[result.index()] = true);
+            if func.is_fresh_alloc(*callee) && let Some(&res) = results.first() {
+                tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(None));
+            }
         }
     }
     for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
@@ -633,6 +636,7 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
         Op::Store(val, addr, off) => may_alias(prov.loc(addr, i64::from(off), func.ty(val).bytes()), loc, prov),
         Op::Move(dst, _, bytes) => may_alias(prov.loc(dst, 0, bytes), loc, prov),
         Op::Copy(dst, _, _) => block_clobbers(dst, loc, prov),
+        Op::Call { callee, .. } if func.is_fresh_alloc(callee) => false,
         Op::Call { callee, ref args, .. } if let Some(rt) = prov.frame_runtime(callee) => {
             loc.root != MemRoot::CallerLoc && rt == RuntimeSymbol::Free && args.first().is_none_or(|&freed| block_clobbers(freed, loc, prov))
         }

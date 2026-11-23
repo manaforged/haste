@@ -439,6 +439,9 @@ impl Lower<'_, '_> {
                 }
             }
             let code = self.code_of(index, origin);
+            if matches!(self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve), Some(crate::host::HostSymbol::Alloc | crate::host::HostSymbol::AllocZeroed)) {
+                self.b.func.mark_fresh_alloc(code);
+            }
             return self.native_call(code, (params, callee.ret), values);
         }
         self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)

@@ -1,6 +1,7 @@
 use crate::cfg::Cfg;
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, Op, StackSlot, Value};
-use crate::mem::{MemLoc, MemRoot, Provenance, clobbers, may_alias};
+use crate::ir::{ArgumentPurpose, AtomicOrd, AtomicRmwOp, Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, clobbers, may_alias};
+use crate::merge::find as find_val;
 
 /// A place in the function: a block and a position in it.
 type Site = (Block, usize);
@@ -253,4 +254,95 @@ fn drop_unread_moves(func: &mut Function, prov: &Provenance) -> bool {
 pub(super) fn forward_moves(func: &mut Function, prov: &Provenance) -> bool {
     let forwarded = forward_moved_loads(func, prov);
     forwarded | drop_unread_moves(func, prov)
+}
+
+fn op_keeps_alloc_private(op: &Op, addr: Value, subst: &[Value]) -> bool {
+    let mut used = false;
+    op.for_operands(|v| used |= find_val(subst, v) == addr);
+    if !used {
+        return true;
+    }
+    match *op {
+        Op::Load(a, _) => find_val(subst, a) == addr,
+        Op::Store(v, a, _) => find_val(subst, a) == addr && find_val(subst, v) != addr,
+        Op::Move(dst, src, _) => find_val(subst, dst) == addr && find_val(subst, src) != addr,
+        Op::Icmp(..) | Op::Trapz(_) => true,
+        Op::Brif(_, _, ref ta, _, ref ea) => !ta.iter().chain(ea).any(|&v| find_val(subst, v) == addr),
+        _ => false,
+    }
+}
+
+fn is_unescaped_fresh_alloc(func: &Function, cfg: &Cfg, block: Block, kept: &[Option<Inst>], subst: &[Value], addr: Value) -> bool {
+    for &inst in kept.iter().rev().flatten() {
+        let op = &func.insts[inst.index()].op;
+        if let Op::Call { callee, results, .. } = op
+            && func.is_fresh_alloc(*callee)
+            && results.first().is_some_and(|&r| find_val(subst, r) == addr)
+        {
+            return true;
+        }
+        if !op_keeps_alloc_private(op, addr, subst) {
+            return false;
+        }
+    }
+    let mut cur = block;
+    for _ in 0..4 {
+        let Some(pred) = cfg.single_pred(cur) else { return false };
+        if pred == block {
+            return false;
+        }
+        for &inst in func.blocks[pred.index()].insts.iter().rev() {
+            let op = &func.insts[inst.index()].op;
+            if let Op::Call { callee, results, .. } = op
+                && func.is_fresh_alloc(*callee)
+                && results.first().is_some_and(|&r| find_val(subst, r) == addr)
+            {
+                return true;
+            }
+            if !op_keeps_alloc_private(op, addr, subst) {
+                return false;
+            }
+        }
+        cur = pred;
+    }
+    false
+}
+
+/// Folds a `Relaxed` `Add` RMW on a freshly allocated, unescaped heap pointer whose previous constant value is known into a plain constant store.
+pub(super) fn try_fold_private_rmw(
+    func: &mut Function,
+    (cfg, prov, block, inst): (&Cfg, &Provenance, Block, Inst),
+    (consts, subst): (&mut Vec<Option<i64>>, &mut Vec<Value>),
+    (known, kept): (&mut KnownLoads, &mut Vec<Option<Inst>>),
+) -> Option<(MemLoc, Type, Value)> {
+    let (Op::AtomicRmw(AtomicRmwOp::Add, AtomicOrd::Relaxed, raw_addr, raw_delta), Some(res)) =
+        (func.insts[inst.index()].op.clone(), func.insts[inst.index()].result)
+    else {
+        return None;
+    };
+    let addr = find_val(subst, raw_addr);
+    let delta = find_val(subst, raw_delta);
+    let ty = func.ty(res);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let d = consts.get(delta.index()).copied().flatten()?;
+    let loc = prov.loc(addr, 0, ty.bytes());
+    let prev_val = known.get(loc.base, 0, ty)?;
+    let prev = consts.get(find_val(subst, prev_val).index()).copied().flatten()?;
+    if !is_unescaped_fresh_alloc(func, cfg, block, kept, subst, addr) {
+        return None;
+    }
+    let prev_ext = crate::fold::extend(prev, ty, false);
+    let next_ext = crate::fold::extend(prev.wrapping_add(d), ty, false);
+    func.insts[inst.index()].op = Op::Const(prev_ext);
+    consts[res.index()] = Some(prev_ext);
+    kept.push(Some(inst));
+    let c_new = func.value(ty);
+    subst.push(c_new);
+    consts.push(Some(next_ext));
+    kept.push(Some(func.add(Op::Const(next_ext), Some(c_new))));
+    kept.push(Some(func.add(Op::Store(c_new, addr, 0), None)));
+    known.write(loc, ty, c_new, prov);
+    Some((loc, ty, c_new))
 }

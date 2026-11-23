@@ -5,6 +5,7 @@ const UNPREDICTABLE: u8 = 2;
 const IMAGE_ADDR: u8 = 4;
 const THREAD_CELL: u8 = 8;
 const FRAME_PTR: u8 = 16;
+const FRESH_ALLOC: u8 = 32;
 
 impl Function {
     /// Marks `value` as a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
@@ -40,6 +41,16 @@ impl Function {
     /// Whether `value` is the runtime's thread-cell lookup.
     pub(crate) fn is_thread_cell(&self, value: Value) -> bool {
         self.flags(value) & THREAD_CELL != 0
+    }
+
+    /// Marks `value` as a fresh-heap allocator symbol (`__rust_alloc` / `__rust_alloc_zeroed`) that never reads `CallerLoc` or aliases live memory.
+    pub fn mark_fresh_alloc(&mut self, value: Value) {
+        self.set_flags(value, FRESH_ALLOC);
+    }
+
+    /// Whether `value` is a fresh-heap allocator symbol.
+    pub(crate) fn is_fresh_alloc(&self, value: Value) -> bool {
+        self.flags(value) & FRESH_ALLOC != 0
     }
 
     /// Mask of values defined by `Op::Const(0)`, empty when no thread-cell lookup is present.

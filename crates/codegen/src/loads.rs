@@ -113,6 +113,7 @@ fn effect(func: &Function, state: &State<'_>, inst: Inst) -> Effect {
         }
         (&Op::Call { callee, .. }, _)
             if state.prov.frame_runtime(callee) == Some(RuntimeSymbol::Malloc)
+                || func.is_fresh_alloc(callee)
                 || func.pure_thread_cell_result(&data.op, |v| state.consts[v.index()] == Some(0)).is_some() => Effect::None,
         (op, _) if crate::mem::is_atomic_barrier(op) => Effect::Unknown,
         (op, _) if matches!(op, Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. }) => Effect::Unknown,
@@ -161,12 +162,8 @@ enum ConcatHalf {
 }
 
 fn resolve_concat_half(known: &KnownLoads, loc: MemLoc, offset: i64, consts: &[Option<i64>]) -> Option<ConcatHalf> {
-    if let Some(v) = known.get(loc.base, offset, Type::I32) {
-        return Some(ConcatHalf::Val(v, false));
-    }
-    if let Some(v) = known.get(loc.base, offset, Type::F32) {
-        return Some(ConcatHalf::Val(v, true));
-    }
+    if let Some(v) = known.get(loc.base, offset, Type::I32) { return Some(ConcatHalf::Val(v, false)); }
+    if let Some(v) = known.get(loc.base, offset, Type::F32) { return Some(ConcatHalf::Val(v, true)); }
     match assemble_const(known, MemLoc { offset, size: 4, ..loc }, Type::I32, consts) {
         Some(Assembled::Int(imm)) => Some(ConcatHalf::Const(imm)),
         _ => None,
@@ -181,34 +178,19 @@ fn materialize_concat_half(func: &mut Function, state: &mut State<'_>, kept: &mu
     }
 }
 
-enum Word64Plan {
-    Val(Value),
-    Bitcast(Value),
-    Const(i64),
-    Pair32(ConcatHalf, ConcatHalf),
-}
+enum Word64Plan { Val(Value), Bitcast(Value), Const(i64), Pair32(ConcatHalf, ConcatHalf) }
 
 fn plan_word64(func: &Function, known: &KnownLoads, loc: MemLoc, offset: i64, consts: &[Option<i64>]) -> Option<Word64Plan> {
-    if let Some(v) = known.get(loc.base, offset, Type::I64) {
-        return Some(Word64Plan::Val(v));
-    }
-    if let Some(v) = known.get(loc.base, offset, Type::F64) {
-        return Some(Word64Plan::Bitcast(v));
-    }
+    if let Some(v) = known.get(loc.base, offset, Type::I64) { return Some(Word64Plan::Val(v)); }
+    if let Some(v) = known.get(loc.base, offset, Type::F64) { return Some(Word64Plan::Bitcast(v)); }
     if let Some(&(_, _, v)) = known.entries_for(loc.base).iter().find(|&&(off, kty, _)| off == offset && kty.is_vector() && kty.bytes() == 8) {
         return Some(Word64Plan::Bitcast(v));
     }
     let slice = MemLoc { offset, size: 8, ..loc };
-    if let Some(imm) = rodata_const(func, slice, Type::I64) {
-        return Some(Word64Plan::Const(imm));
-    }
-    if let Some(Assembled::Int(imm)) = assemble_const(known, slice, Type::I64, consts) {
-        return Some(Word64Plan::Const(imm));
-    }
+    if let Some(imm) = rodata_const(func, slice, Type::I64) { return Some(Word64Plan::Const(imm)); }
+    if let Some(Assembled::Int(imm)) = assemble_const(known, slice, Type::I64, consts) { return Some(Word64Plan::Const(imm)); }
     let hi_off = offset.checked_add(4)?;
-    let lo_half = resolve_concat_half(known, loc, offset, consts)?;
-    let hi_half = resolve_concat_half(known, loc, hi_off, consts)?;
-    Some(Word64Plan::Pair32(lo_half, hi_half))
+    Some(Word64Plan::Pair32(resolve_concat_half(known, loc, offset, consts)?, resolve_concat_half(known, loc, hi_off, consts)?))
 }
 
 fn emit_pack32_op(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, lo_half: ConcatHalf, hi_half: ConcatHalf) -> Op {
@@ -245,9 +227,7 @@ fn quad_op(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Ins
 }
 
 fn set_load(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, (inst, ty): (Inst, Type), (built, op): (Type, Op)) {
-    if ty == built {
-        func.insts[inst.index()].op = op;
-    } else {
+    if ty == built { func.insts[inst.index()].op = op; } else {
         let value = emit_op(func, state, kept, built, op);
         func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, value);
     }
@@ -483,6 +463,16 @@ fn scan(
                 }
             }
             Effect::Unknown => {
+                if let Some((wloc, ..)) = elide::try_fold_private_rmw(func, (join.cfg, state.prov, block, inst), (state.consts, state.subst), (known, &mut bufs.kept)) {
+                    clobbers_seen.push(BlockClobber::Loc(wloc));
+                    record_base(bases, wloc);
+                    if state.post_inline { slices.prune_on_write(func, state.prov, wloc); }
+                    bufs.pending_stores.retain(|&(ploc, _)| !may_alias(wloc, ploc, state.prov));
+                    bufs.const_stores.retain(|cs| !may_alias(wloc, cs.loc, state.prov));
+                    changed = true;
+                    guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
+                    continue;
+                }
                 let mut copy_remaps: Option<(MemLoc, Vec<(i64, Type, Value)>)> = None;
                 let canon_move = copy_len(&func.insts[inst.index()].op, state.consts).map(|(dst, src, bytes)| {
                     let dst_loc = addr_loc(state.prov, state.subst, dst, 0, bytes);

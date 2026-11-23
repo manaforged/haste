@@ -74,7 +74,11 @@ impl Lower<'_, '_> {
 
     /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
     pub(super) fn call_host(&mut self, host: HostSymbol, args: &[Value], ret: Option<Type>) -> Option<Value> {
+        let fresh_alloc = matches!(host, HostSymbol::Alloc | HostSymbol::AllocZeroed);
         let code = self.emit_symbol(SymbolSource::Host(host));
+        if fresh_alloc {
+            self.b.func.mark_fresh_alloc(code);
+        }
         let mut signature = Signature::new(CallConv::Native);
         signature.params.extend(args.iter().map(|&arg| AbiParam::new(self.b.func.ty(arg))));
         signature.returns.extend(ret.map(AbiParam::new));

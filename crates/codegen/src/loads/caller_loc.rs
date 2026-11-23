@@ -36,6 +36,7 @@ fn cl_event(func: &Function, prov: &Provenance, zeros: &[bool], is_cl: &[bool], 
         Op::Load(addr, 0) if is_cl.get(addr.index()) == Some(&true) => ClEvent::Read,
         Op::Call { callee, .. } | Op::TryCall { callee, .. } => {
             if prov.frame_runtime(callee).is_some()
+                || func.is_fresh_alloc(callee)
                 || (!zeros.is_empty() && func.pure_thread_cell_result(op, |v| zeros.get(v.index()) == Some(&true)).is_some())
             {
                 ClEvent::None
