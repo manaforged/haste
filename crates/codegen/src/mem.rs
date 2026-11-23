@@ -622,6 +622,10 @@ fn block_clobbers(addr: Value, loc: MemLoc, prov: &Provenance) -> bool {
     w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
 }
 
+fn slot_unescaped_at(loc: MemLoc, at: Option<Inst>, prov: &Provenance) -> bool {
+    matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s) || !prov.slot_escaped_at(s, at))
+}
+
 /// Whether `op`, run as instruction `at` when known, may overwrite `loc`; `at` rules out slots whose address leaves only later.
 pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
     match *op {
@@ -651,7 +655,7 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
         _ => is_atomic_barrier(op)
             && loc.root != MemRoot::CallerLoc
             && !(prov.private_frame(loc) && !prov.touches_frame(op))
-            && !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s) || !prov.slot_escaped_at(s, at)),
+            && !slot_unescaped_at(loc, at, prov),
     }
 }
 
@@ -662,7 +666,7 @@ pub(crate) fn clobbers_load(func: &Function, op: (&Op, Option<Inst>), loc: MemLo
         Op::AtomicStore(val, addr, AtomicOrd::Relaxed | AtomicOrd::Release)
         | Op::AtomicRmw(_, AtomicOrd::Relaxed | AtomicOrd::Release, addr, val)
         | Op::AtomicCas(AtomicOrd::Relaxed | AtomicOrd::Release, addr, _, val) => {
-            !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s) || !prov.slot_escaped_at(s, op.1))
+            !slot_unescaped_at(loc, op.1, prov)
                 && may_alias(prov.loc(addr, 0, func.ty(val).bytes()), loc, prov)
         }
         _ => clobbers_op(func, op, loc, prov),

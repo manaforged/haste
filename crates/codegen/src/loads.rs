@@ -1,5 +1,6 @@
 //! Reuses what memory holds along straight-line code: a load of the bytes an earlier load or store on the same path read or wrote, with no write of unknown reach between them, takes that value.
 
+mod caller_loc;
 mod coalesce;
 mod dom;
 mod elide;
@@ -747,14 +748,15 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         return domain(changed);
     }
     let cfg = func.cfg();
-    let prov = Provenance::with_affine(func, &cfg, affine);
-    changed |= remat::drop_dead_caller_loc_stores(func, &cfg, &prov);
+    let mut prov = Provenance::with_affine(func, &cfg, affine);
+    if caller_loc::optimize(func, &cfg, &prov) {
+        changed = true;
+        if func.types.len() > prov.param_roots.len() { prov = Provenance::new(func, &cfg); }
+    }
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
     changed |= pack::coalesce_loads(func, &prov, target);
     changed |= sink_terminator_defs(func);
-    let Some((defs, mut consts, selects)) = collect_scan_meta(func) else {
-        return domain(changed);
-    };
+    let Some((defs, mut consts, selects)) = collect_scan_meta(func) else { return domain(changed) };
     let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
     let mut state = State { prov: &prov, defs: &defs, selects: &selects, consts: &mut consts, subst: &mut subst, target, post_inline };
@@ -776,12 +778,8 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         known_out[block.index()] = known;
         block_bases[block.index()] = bases;
     }
-    if renamed {
-        rename(func, state.subst);
-    }
-    if scan_changed {
-        changed |= pack::coalesce_vec_rescan(func, &cfg, target);
-    }
+    if renamed { rename(func, state.subst); }
+    if scan_changed { changed |= pack::coalesce_vec_rescan(func, &cfg, target); }
     changed |= remat::split_long_loads(func, &prov);
     changed |= sink::sink_loads(func, &prov);
     if post_inline {

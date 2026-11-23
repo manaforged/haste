@@ -42,8 +42,17 @@ fn has_regular_call(func: &Function, block: Block) -> bool {
     })
 }
 
+fn has_caller_loc_call(func: &Function, zeros: &[bool], block: Block) -> bool {
+    !zeros.is_empty()
+        && func.blocks[block.index()]
+            .insts
+            .iter()
+            .any(|&inst| func.caller_loc_result(&func.insts[inst.index()].op, |v| zeros[v.index()]).is_some())
+}
+
 fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[bool], is_latch: &[bool]) -> Vec<bool> {
     let n = func.blocks.len();
+    let zeros = func.thread_cell_zeros();
     let mut deferred = vec![false; n];
     let mut is_head = vec![false; n];
     loops.list.iter().for_each(|each| is_head[each.head.index()] = true);
@@ -56,6 +65,10 @@ fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[b
             continue;
         }
         for (arm, other) in [(then, otherwise), (otherwise, then)] {
+            let rejoins = cfg.preds_of(other).iter().any(|&q| cfg.dominates(arm, q))
+                || matches!(func.last(other), Some(&Op::Jump(m, _)) if m != other && cfg.preds_of(m).iter().any(|&q| cfg.dominates(arm, q)));
+            let colder = (has_regular_call(func, arm) && !has_regular_call(func, other))
+                || (has_caller_loc_call(func, &zeros, arm) && !has_caller_loc_call(func, &zeros, other));
             if Some(arm) == func.entry
                 || cold[arm.index()]
                 || cold[other.index()]
@@ -63,9 +76,8 @@ fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[b
                 || is_latch[arm.index()]
                 || cfg.single_pred(arm) != Some(p)
                 || loops.depth_of(other) < loops.depth_of(arm)
-                || !has_regular_call(func, arm)
-                || has_regular_call(func, other)
-                || !cfg.preds_of(other).iter().any(|&q| cfg.dominates(arm, q))
+                || !colder
+                || !rejoins
                 || loops.list.iter().any(|l| l.body[b] && l.latches.iter().any(|&lt| cfg.dominates(arm, lt)))
             {
                 continue;

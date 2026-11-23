@@ -271,7 +271,7 @@ fn addressed_images(func: &Function) -> Vec<bool> {
     for block in &func.blocks {
         for &inst in &block.insts {
             match func.insts[inst.index()].op {
-                Op::Load(..) => {}
+                Op::Load(..) | Op::AtomicLoad(..) => {}
                 Op::Store(value, ..) => folds[value.index()] = false,
                 Op::Binary(Binary::Iadd | Binary::Isub, _, k) if small[k.index()] => {}
                 ref op => op.for_operands(|v| folds[v.index()] = false),
