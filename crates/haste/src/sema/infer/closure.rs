@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -73,6 +74,8 @@ pub struct ClosureBody {
     pub parent: ItemRef,
     pub closure: Closure,
     pub env: Option<u32>,
+    pub(in crate::sema) parent_laid: bool,
+    pub(in crate::sema) parent_locals: u32,
 }
 
 /// A closure type once its defining body is inferred: the body's typed form, the closure, and the tuple its captures form.
@@ -82,6 +85,8 @@ pub struct ClosureInfo {
     pub typed: std::sync::Arc<Typed>,
     pub closure: Closure,
     pub env: Ty,
+    pub(in crate::sema) parent_drops: Arc<OnceLock<Box<[Res]>>>,
+    pub(in crate::sema) parent_laid: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -696,6 +701,7 @@ pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, Substs), typed
     let typed = typed.scoped(&cx.types);
     typed.ensure_tables(&cx.types);
     let shared = Arc::new(Typed { drops: Vec::new(), ..(*typed).clone() });
+    let (parent_drops, parent_laid) = (Arc::new(OnceLock::new()), Arc::new(AtomicBool::new(false)));
     for (at, closure) in &typed.closures {
         let ty = cx.types.intern(Kind::Closure(parent, substs, at.0));
         let parts: Vec<Ty> = closure.captures.iter().map(|c| {
@@ -704,23 +710,18 @@ pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, Substs), typed
             match c.by { By::Ref => cx.types.intern(Kind::Ref(Mut::Not, held)), By::Mut => cx.types.intern(Kind::Ref(Mut::Mut, held)), By::Value => held }
         }).collect();
         let mut env = cx.types.tuple(&parts);
-        if closure.coroutine {
-            let word = cx.types.prim(crate::names::Primitive::Usize);
-            env = cx.types.tuple(&[word, word, env]);
-        }
-        cx.set_closure(ty, ClosureInfo { parent, typed: shared.clone(), closure: closure.clone(), env });
+        if closure.coroutine { let word = cx.types.prim(crate::names::Primitive::Usize); env = cx.types.tuple(&[word, word, env]); }
+        cx.set_closure(ty, ClosureInfo { parent, typed: shared.clone(), closure: closure.clone(), env, parent_drops: parent_drops.clone(), parent_laid: parent_laid.clone() });
     }
 }
 
 fn finish_closure(cx: &mut Context<'_>, mut typed: Typed, info: &ClosureInfo, env: Option<u32>, ret: Ty) -> Result<Typed> {
     if env.is_some() {
-        for cap in &info.closure.captures {
-            if !cap.path.is_empty() { typed.locals.push(Local { ty: cap.ty(cx, typed.locals[cap.local as usize].ty)? }); }
-        }
+        for cap in &info.closure.captures { if !cap.path.is_empty() { typed.locals.push(Local { ty: cap.ty(cx, typed.locals[cap.local as usize].ty)? }); } }
     }
     typed.ret = Some(ret);
-    typed.shape = Shape::Closure(ClosureBody { parent: info.parent, closure: info.closure.clone(), env });
-    typed.drops = super::drop::drop_calls(cx, &typed)?;
+    typed.shape = Shape::Closure(ClosureBody { parent: info.parent, closure: info.closure.clone(), env, parent_laid: info.parent_laid.load(Ordering::Acquire), parent_locals: info.typed.locals.len() as u32 });
+    typed.drops = super::drop::closure_drop_calls(cx, &typed, info)?;
     Ok(typed)
 }
 

@@ -105,7 +105,13 @@ impl Infer<'_, '_> {
     }
 
     fn fill(&mut self, ty: Ty, fall_back: bool) -> Ty {
+        if !self.cx.types.has_var_flag(ty) {
+            return ty;
+        }
         let ty = self.resolve(ty);
+        if !self.cx.types.has_var_flag(ty) {
+            return ty;
+        }
         let kind = self.cx.types.kind(ty).clone();
         let fallback = match kind {
             Kind::IntVar(_) => self.cx.types.prim(Primitive::I32),

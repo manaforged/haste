@@ -117,29 +117,29 @@ fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Ou
         0u8.hash(hasher);
         return Some(());
     }
-    match types.kind(ty).clone() {
-        Kind::Prim(p) => { 1u8.hash(hasher); (p as u8).hash(hasher); }
+    match types.kind(ty) {
+        Kind::Prim(p) => { 1u8.hash(hasher); (*p as u8).hash(hasher); }
         Kind::Never => { 2u8.hash(hasher); }
-        Kind::Tuple(s) => { 3u8.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
-        Kind::Ref(m, i) => { 4u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher, closures)?; }
-        Kind::Ptr(m, i) => { 5u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher, closures)?; }
-        Kind::Array(e, l) => { 6u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher, closures)?; hash_ty(outline, types, l, key_of, hasher, closures)?; }
-        Kind::Slice(e) => { 7u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher, closures)?; }
-        Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
-        Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
-        Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, p, key_of, hasher, closures)?; hash_ty(outline, types, r, key_of, hasher, closures)?; }
+        Kind::Tuple(s) => { 3u8.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
+        Kind::Ref(m, i) => { 4u8.hash(hasher); (*m == Mut::Mut).hash(hasher); hash_ty(outline, types, *i, key_of, hasher, closures)?; }
+        Kind::Ptr(m, i) => { 5u8.hash(hasher); (*m == Mut::Mut).hash(hasher); hash_ty(outline, types, *i, key_of, hasher, closures)?; }
+        Kind::Array(e, l) => { 6u8.hash(hasher); hash_ty(outline, types, *e, key_of, hasher, closures)?; hash_ty(outline, types, *l, key_of, hasher, closures)?; }
+        Kind::Slice(e) => { 7u8.hash(hasher); hash_ty(outline, types, *e, key_of, hasher, closures)?; }
+        Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, *i)?.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
+        Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, *i)?.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
+        Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, *p, key_of, hasher, closures)?; hash_ty(outline, types, *r, key_of, hasher, closures)?; }
         Kind::Dyn(o, s, m, a) => {
             12u8.hash(hasher);
-            key_of(outline, o)?.hash(hasher);
-            hash_substs(outline, types, s, key_of, hasher, closures)?;
+            key_of(outline, *o)?.hash(hasher);
+            hash_substs(outline, types, *s, key_of, hasher, closures)?;
             m.len().hash(hasher);
-            for x in m { key_of(outline, x)?.hash(hasher); }
+            for &x in m { key_of(outline, x)?.hash(hasher); }
             a.len().hash(hasher);
-            for x in a { key_of(outline, x)?.hash(hasher); }
+            for &x in a { key_of(outline, x)?.hash(hasher); }
         }
-        Kind::Pat(b, lo, hi) => { 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, b, key_of, hasher, closures)?; }
+        Kind::Pat(b, lo, hi) => { 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, *b, key_of, hasher, closures)?; }
         Kind::Value(v) => { 14u8.hash(hasher); v.hash(hasher); }
-        Kind::Closure(parent, s, at) if closures => { 11u8.hash(hasher); key_of(outline, parent)?.hash(hasher); at.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
+        Kind::Closure(parent, s, at) if closures => { 11u8.hash(hasher); key_of(outline, *parent)?.hash(hasher); at.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
         Kind::Closure(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
     }
     Some(())

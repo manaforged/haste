@@ -178,10 +178,10 @@ fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
     if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
         return false;
     }
-    if !matches!(super::infer::compiler_made(cx, item, substs), Ok(None)) {
+    if !matches!(super::infer::virtual_slot(cx, item, substs), Ok(None)) {
         return false;
     }
-    matches!(super::infer::virtual_slot(cx, item, substs), Ok(None))
+    true
 }
 
 fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
@@ -475,9 +475,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
             return Some(Err(format!("{}: {err:#}", cx.name(instance.0))));
         }
     }
-    if record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before) {
-        thaw::note_fresh(cx, instance, &typed);
-    }
+    record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before);
     Some(Ok(typed))
 }
 

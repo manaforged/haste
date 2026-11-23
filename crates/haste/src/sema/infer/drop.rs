@@ -190,6 +190,46 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
     Ok(call)
 }
 
+/// The drop glue calls for a closure body, reusing its parent's settled drop list when available.
+pub(super) fn closure_drop_calls(cx: &mut Context<'_>, typed: &Typed, info: &super::closure::ClosureInfo) -> Result<Vec<Res>> {
+    let Some(parent) = info.parent_drops.get() else {
+        return drop_calls(cx, typed);
+    };
+    let mut drops = parent.to_vec();
+    for ty in typed.locals[info.typed.locals.len()..].iter().map(|local| local.ty).chain(typed.ret) {
+        if ty != Ty::NONE
+            && let Some(call) = glue_call(cx, ty)?
+            && !drops.contains(&call)
+        {
+            drops.push(call);
+        }
+    }
+    Ok(drops)
+}
+
+fn first_closure_info(cx: &Context<'_>, (parent, substs): (ItemRef, super::super::substs::Substs), typed: &Typed) -> Option<std::sync::Arc<super::closure::ClosureInfo>> {
+    if !typed.has_closures() {
+        return None;
+    }
+    let scoped = typed.scoped(&cx.types);
+    let &(at, _) = scoped.closures.as_slice().first()?;
+    cx.closure(cx.types.intern(Kind::Closure(parent, substs, at.0)))
+}
+
+/// Records `typed.drops` on the shared closure metadata of `(parent, substs)`.
+pub(in crate::sema) fn record_parent_drops(cx: &Context<'_>, instance: (ItemRef, super::super::substs::Substs), typed: &Typed) {
+    if let Some(info) = first_closure_info(cx, instance, typed) {
+        let _ = info.parent_drops.set(typed.drops.clone().into_boxed_slice());
+    }
+}
+
+/// Marks the shared closure metadata of `(parent, substs)` as having laid out the parent body.
+pub(in crate::sema) fn mark_parent_laid(cx: &Context<'_>, instance: (ItemRef, super::super::substs::Substs), typed: &Typed) {
+    if let Some(info) = first_closure_info(cx, instance, typed) {
+        info.parent_laid.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The drop glue calls for every type that a local or an expression of `typed` holds and that needs drop.
 pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
     let scoped = typed.scoped(&cx.types);

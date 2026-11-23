@@ -39,6 +39,7 @@ pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, 
 pub use coerce::Coercion;
 pub use consts::{Anon, Arena};
 pub use drop::{Glue, drop_fn, glue_call, has_drop_impl, needs_drop};
+pub(in crate::sema) use drop::{mark_parent_laid, record_parent_drops};
 pub use looping::{For, Tried};
 pub use method::Adjust;
 pub use name::type_name;
@@ -189,6 +190,15 @@ pub(super) fn infer_with_hints(
     if let Some(typed) = compiler_made(cx, item, substs)? {
         return Ok(typed);
     }
+    infer_after_compiler_made(cx, item, substs, method_hints)
+}
+
+pub(super) fn infer_after_compiler_made(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    substs: Substs,
+    method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
+) -> Result<Typed> {
     let sig = cx.signature(item)?;
     let slot = object::virtual_slot(cx, item, substs)?;
     let foreign = cx.foreign(item) || slot.is_some();
@@ -223,6 +233,7 @@ pub(super) fn settle(cx: &mut Context<'_>, instance: (ItemRef, Substs), mut type
         closure::register(cx, instance, &typed);
     }
     typed.drops = drop::drop_calls(cx, &typed)?;
+    drop::record_parent_drops(cx, instance, &typed);
     Ok(typed)
 }
 
