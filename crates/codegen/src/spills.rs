@@ -1,5 +1,30 @@
 //! The stack slots whose values registers still hold after a spill or reload, shared by the backends' reload caches.
 
+use crate::ir::{Block, Function, Op};
+
+/// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
+pub(crate) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
+    let mut cloned = vec![false; func.blocks.len()];
+    for data in &func.blocks {
+        if let Some(&last) = data.insts.last()
+            && copied.get(last.index()) == Some(&true)
+            && let Op::Jump(head, _) = &func.insts[last.index()].op
+        {
+            cloned[head.index()] = true;
+        }
+    }
+    let mut preds: Vec<(u32, Option<Block>)> = vec![(0, None); func.blocks.len()];
+    for at in 0..func.blocks.len() {
+        let from = Block(at as u32);
+        for next in func.successors(from) {
+            let entry = &mut preds[next.index()];
+            entry.0 += 1;
+            entry.1 = Some(from);
+        }
+    }
+    preds.into_iter().map(|(count, from)| from.filter(|from| count == 1 && !cloned[from.index()])).collect()
+}
+
 /// Up to four slot displacements and the registers that hold them, newest first.
 #[derive(Clone, Copy)]
 pub(crate) struct SpillCache<R>([Option<(i32, R)>; 4]);

@@ -726,7 +726,6 @@ impl Emit<'_> {
     pub(super) fn fits(&mut self, op: Binary, signed: bool, (x, y): (Value, Value), result: Value) -> Result<(), String> {
         let pair = self.plan.pairs[result.index()];
         if self.plan.is_static(result) && pair.is_none() { return Ok(()); }
-        self.invalidate_spills();
         let bits = self.ty(x).bits() as u8;
         let reg = pair.and_then(|sum| self.plan.reg_of(sum)).unwrap_or(IP);
         let ok = match (op, bits) {
@@ -750,6 +749,7 @@ impl Emit<'_> {
                 }
                 self.asm.extend(signed, u32::from(bits) / 8, A, reg);
                 self.asm.alu(Alu::Subs, Size::X, ZR, reg, A);
+                self.clobber_reg(A);
                 Cond::Eq
             }
             (Binary::Imul, _) => {
@@ -758,11 +758,12 @@ impl Emit<'_> {
                 self.asm.madd(false, Size::X, reg, (left, right), ZR);
                 let expected = if signed { self.asm.asr_imm(A, reg, 63); A } else { ZR };
                 self.asm.alu(Alu::Subs, Size::X, ZR, T, expected);
+                self.clobber_regs(&[A, T]);
                 Cond::Eq
             }
             (other, _) => return Err(format!("{other:?} has no overflow check")),
         };
-        if let Some(sum) = pair { self.put(sum, reg); }
+        if let Some(sum) = pair { self.put(sum, reg); } else { self.clobber_reg(reg); }
         self.set_flag(result, ok);
         Ok(())
     }

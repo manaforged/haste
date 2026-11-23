@@ -73,6 +73,19 @@ impl Emit<'_> {
         }
     }
 
+    pub(super) fn carry_spills(&mut self, plain: bool) {
+        self.carry.1 = (plain && !self.in_fast).then_some(self.last_spill);
+    }
+
+    pub(super) fn resume_spills(&mut self, block: crate::ir::Block) {
+        if let (Some(from), Some(cache)) = self.carry
+            && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
+        {
+            self.last_spill = cache;
+        }
+        self.carry = (Some(block), None);
+    }
+
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
         self.clobber_reg(reg);
         self.last_spill.record(disp, reg);

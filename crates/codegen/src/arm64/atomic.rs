@@ -522,7 +522,6 @@ impl Emit<'_> {
     }
 
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
-        self.invalidate_spills();
         let ty = match op {
             Op::AtomicStore(value, _, _) => self.ty(*value),
             _ => self.ty(result()?),
@@ -559,6 +558,7 @@ impl Emit<'_> {
                     self.lse_rmw(*rmw, *ord, size, *addr, *value, res);
                 } else {
                     self.rmw(*rmw, *ord, size, *addr, *value);
+                    self.clobber_regs(&[A, C, D, S, T]);
                     self.put(res, A);
                 }
             }
@@ -568,6 +568,7 @@ impl Emit<'_> {
                     self.lse_cas(*ord, size, *addr, (*expected, *replacement), res);
                 } else {
                     self.cas(*ord, size, *addr, (*expected, *replacement));
+                    self.clobber_regs(&[A, C, D, S, T]);
                     self.put(res, A);
                 }
             }
@@ -582,20 +583,24 @@ impl Emit<'_> {
         let val = match (op, self.plan.const_of(value)) {
             (AtomicRmwOp::Sub, Some(imm)) => {
                 self.asm.mov_imm(IP, imm.wrapping_neg());
+                self.clobber_reg(IP);
                 IP
             }
             (AtomicRmwOp::And, Some(imm)) => {
                 self.asm.mov_imm(IP, !imm);
+                self.clobber_reg(IP);
                 IP
             }
             (AtomicRmwOp::Sub, None) => {
                 let v = self.bits(value, IP);
                 self.asm.alu(Alu::Sub, Size::X, IP, ZR, v);
+                self.clobber_reg(IP);
                 IP
             }
             (AtomicRmwOp::And, None) => {
                 let v = self.bits(value, IP);
                 self.asm.alu(Alu::Orn, Size::X, IP, ZR, v);
+                self.clobber_reg(IP);
                 IP
             }
             (_, Some(0)) => ZR,
@@ -612,7 +617,9 @@ impl Emit<'_> {
             self.dst(result)
         };
         self.asm.lse_rmw(op, ord, size, (at, val, dst));
-        if !dead {
+        if dead {
+            self.clobber_reg(dst);
+        } else {
             self.put(result, dst);
         }
     }
@@ -625,6 +632,7 @@ impl Emit<'_> {
         self.raw(old, expected);
         let rep = if self.plan.const_of(replacement) == Some(0) { ZR } else { self.bits(replacement, IP) };
         self.asm.lse_cas(ord, size, (at, old, rep));
+        self.clobber_reg(old);
         self.put(result, old);
     }
 

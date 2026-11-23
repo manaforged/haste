@@ -121,7 +121,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
         carry: (None, None),
-        sole_pred: bits::sole_preds(func, &copied),
+        sole_pred: crate::spills::sole_preds(func, &copied),
         next: None,
         last_block,
         at_end: false,

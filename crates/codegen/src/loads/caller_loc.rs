@@ -207,15 +207,15 @@ fn wrap_cl_region(
     }
 }
 
-fn starts_with_restore(func: &Function, prov: &Provenance, zeros: &[bool], is_cl: &[bool], b: Block, saved: Value) -> bool {
+fn first_restore_inst(func: &Function, prov: &Provenance, zeros: &[bool], is_cl: &[bool], b: Block, saved: Value) -> Option<Inst> {
     for &inst in &func.blocks[b.index()].insts {
         match cl_event(func, prov, zeros, is_cl, &func.insts[inst.index()].op) {
             ClEvent::None => {}
-            ClEvent::Write(w) => return w == saved,
-            _ => return false,
+            ClEvent::Write(w) => return (w == saved).then_some(inst),
+            _ => return None,
         }
     }
-    false
+    None
 }
 
 fn starts_with_trap(func: &Function, prov: &Provenance, zeros: &[bool], is_cl: &[bool], b: Block) -> bool {
@@ -237,6 +237,7 @@ fn collect_dirty_region(
     (zeros, is_cl): (&[bool], &[bool]),
     (b_l, saved, root, depth_l): (Block, Value, Block, u32),
     restores: &mut [bool],
+    hit_restores: &mut Vec<(Block, Inst)>,
 ) -> Option<(Vec<Block>, Vec<Block>)> {
     if matches!(func.last(root), Some(Op::Return(..) | Op::TryCall { .. }))
         || cfg.preds_of(root).iter().any(|&p| cfg.dominates(root, p))
@@ -244,17 +245,17 @@ fn collect_dirty_region(
         return None;
     }
     let (mut region, mut exits, mut stack) = (vec![root], Vec::new(), vec![root]);
-    let mut touched_restores = Vec::new();
+    let mut touched_restores: Vec<(Block, Inst)> = Vec::new();
     while let Some(cur) = stack.pop() {
         if matches!(func.last(cur), Some(Op::Trap)) {
             continue;
         }
         for s in func.successors(cur) {
-            if s != root && cfg.dominates(b_l, s) && starts_with_restore(func, prov, zeros, is_cl, s, saved) {
+            if s != root && cfg.dominates(b_l, s) && let Some(r_inst) = first_restore_inst(func, prov, zeros, is_cl, s, saved) {
                 if !matches!(func.last(cur), Some(&Op::Jump(t, _)) if t == s) {
                     return None;
                 }
-                touched_restores.push(s);
+                touched_restores.push((s, r_inst));
                 if !exits.contains(&cur) {
                     exits.push(cur);
                 }
@@ -279,8 +280,11 @@ fn collect_dirty_region(
             stack.push(s);
         }
     }
-    for s in touched_restores {
+    for (s, r_inst) in touched_restores {
         restores[s.index()] = true;
+        if !hit_restores.iter().any(|&(_, ri)| ri == r_inst) {
+            hit_restores.push((s, r_inst));
+        }
     }
     Some((region, exits))
 }
@@ -491,6 +495,7 @@ fn narrow_saves(
     let saved_vals: Vec<Value> = candidates.iter().filter_map(|&(_, i)| func.insts[i.index()].result).collect();
     let saved_mask = saved_vals.iter().fold(0_u128, |m, &v| m | (1_u128 << (v.0 & 127)));
     let mut non_restore = vec![false; saved_vals.len()];
+    let mut restore_counts = vec![0_u32; saved_vals.len()];
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
             let data = &func.insts[inst.index()];
@@ -498,6 +503,11 @@ fn narrow_saves(
                 && is_cl.get(addr.index()) == Some(&true)
                 && val != addr
             {
+                if saved_mask & (1_u128 << (val.0 & 127)) != 0 {
+                    for (idx, &sv) in saved_vals.iter().enumerate() {
+                        if sv == val { restore_counts[idx] += 1; }
+                    }
+                }
                 if saved_mask & (1_u128 << (addr.0 & 127)) != 0 {
                     for (idx, &sv) in saved_vals.iter().enumerate() {
                         if sv == addr { non_restore[idx] = true; }
@@ -545,19 +555,20 @@ fn narrow_saves(
         }
         let mut dirty: Vec<(Block, usize, usize)> = Vec::new();
         let mut regions: Vec<(Block, usize, Vec<Block>, Vec<Block>)> = Vec::new();
+        let mut hit_restores: Vec<(Block, Inst)> = Vec::new();
         let mut work: Vec<Block> = Vec::new();
         push_unvisited_succs(func, b_l, &mut visited, &mut work);
         let mut ok = !work.is_empty();
         while let Some(u) = work.pop() {
             if u == b_l { ok = false; break; }
             let insts = &func.blocks[u.index()].insts;
-            let (mut first_write, mut last_event, mut starts_restore, mut starts_trap, mut bad_event) = (None, 0, false, false, false);
+            let (mut first_write, mut last_event, mut starts_restore, mut starts_trap, mut bad_event) = (None, 0, None, false, false);
             for (idx, &inst) in insts.iter().enumerate() {
                 match cl_event(func, prov, zeros, is_cl, &func.insts[inst.index()].op) {
                     ClEvent::None => {}
                     ClEvent::Write(w) => {
                         if first_write.is_none() {
-                            if w == saved { starts_restore = true; break; }
+                            if w == saved { starts_restore = Some(inst); break; }
                             (first_write, last_event) = (Some(idx), idx);
                         } else if w == saved { bad_event = true; break; } else { last_event = idx; }
                     }
@@ -565,9 +576,12 @@ fn narrow_saves(
                     ClEvent::Read | ClEvent::Observe => { if first_write.is_none() { bad_event = true; break; } last_event = idx; }
                 }
             }
-            if starts_restore {
+            if let Some(r_inst) = starts_restore {
                 if !cfg.dominates(b_l, u) { ok = false; break; }
                 restores[u.index()] = true;
+                if !hit_restores.iter().any(|&(_, ri)| ri == r_inst) {
+                    hit_restores.push((u, r_inst));
+                }
                 continue;
             }
             if starts_trap { continue; }
@@ -581,7 +595,7 @@ fn narrow_saves(
                     ok = false;
                     break;
                 }
-                if let Some((region, exits)) = collect_dirty_region(func, cfg, loops, prov, (zeros, is_cl), (b_l, saved, u, loops.depth_of(b_l)), &mut restores) {
+                if let Some((region, exits)) = collect_dirty_region(func, cfg, loops, prov, (zeros, is_cl), (b_l, saved, u, loops.depth_of(b_l)), &mut restores, &mut hit_restores) {
                     regions.push((u, fw, region, exits));
                 } else if !matches!(last_op, Some(Op::Trap)) {
                     dirty.push((u, fw, last_event));
@@ -592,7 +606,21 @@ fn narrow_saves(
                 push_unvisited_succs(func, u, &mut visited, &mut work);
             }
         }
-        if !ok || (dirty.is_empty() && regions.is_empty()) || !has_fast_path(func, b_l, &pass, &restores) { continue; }
+        if !ok
+            || (dirty.is_empty() && regions.is_empty())
+            || hit_restores.len() != restore_counts[ci] as usize
+            || !has_fast_path(func, b_l, &pass, &restores)
+        {
+            continue;
+        }
+        func.blocks[b_l.index()].insts.remove(pos_l);
+        func.insts[load_inst.index()].op = Op::Trap;
+        for (rb, r_inst) in hit_restores {
+            if let Some(rpos) = func.blocks[rb.index()].insts.iter().position(|&i| i == r_inst) {
+                func.blocks[rb.index()].insts.remove(rpos);
+                func.insts[r_inst.index()].op = Op::Trap;
+            }
+        }
         for (u, first, last) in dirty {
             wrap_cl_block(func, (zeros, is_cl), &def, (u, first, last), ClWrap::SaveLocal(addr));
         }

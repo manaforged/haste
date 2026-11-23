@@ -121,6 +121,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_cmp: None,
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
+        carry: (None, None),
+        sole_pred: crate::spills::sole_preds(func, &copied),
         next: None,
         copied,
         direct_calls: target.direct_calls,
@@ -182,6 +184,8 @@ pub(super) struct Emit<'a> {
     last_cmp: Option<(Size, Value, Value, bool)>,
     last_spill: crate::spills::SpillCache<Reg>,
     last_fspill: Option<(i32, Vreg, Type)>,
+    carry: (Option<Block>, Option<crate::spills::SpillCache<Reg>>),
+    sole_pred: Vec<Option<Block>>,
     next: Option<Block>,
     copied: Vec<bool>,
     direct_calls: bool,
@@ -223,41 +227,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         });
     }
 
-    fn intake(&mut self, entry: Block) -> Result<(), String> {
-        intake_params(self, entry)
-    }
-
-    fn set_next(&mut self, next: Option<Block>) {
-        self.next = next;
-    }
-
-    fn bind_block(&mut self, block: Block) {
-        self.invalidate_spills();
-        self.asm.bind(self.blocks[block.index()]);
-    }
-
-    fn bind_entry(&mut self, block: Block) {
-        self.asm.bind(self.blocks[block.index()]);
-    }
-
-    fn deferred_prologue(&self) -> bool {
-        self.shrink.is_some()
-    }
-
-    fn before_block_bind(&mut self, _block: Block) -> Result<(), String> {
-        self.asm.maybe_island()?;
-        Ok(())
-    }
-
-    fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
-        self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]);
-        Ok(())
-    }
-
-    fn clear_flags(&mut self) {
-        self.flags = None;
-        self.last_cmp = None;
-    }
+    fn intake(&mut self, entry: Block) -> Result<(), String> { intake_params(self, entry) }
+    fn set_next(&mut self, next: Option<Block>) { self.next = next; }
+    fn bind_block(&mut self, block: Block) { self.invalidate_spills(); self.resume_spills(block); self.asm.bind(self.blocks[block.index()]); }
+    fn bind_entry(&mut self, block: Block) { self.carry = (Some(block), None); self.asm.bind(self.blocks[block.index()]); }
+    fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
+    fn before_block_bind(&mut self, _block: Block) -> Result<(), String> { self.asm.maybe_island()?; Ok(()) }
+    fn on_block_bound(&mut self, block: Block) -> Result<(), String> { self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]); Ok(()) }
+    fn clear_flags(&mut self) { self.flags = None; self.last_cmp = None; }
 
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;
@@ -302,12 +279,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
+                self.carry_spills(self.next == Some(*block));
                 self.invalidate_spills();
                 emit_goto(self, *block, true);
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
+                self.carry_spills(then != otherwise && (self.next == Some(*then) || self.next == Some(*otherwise)));
                 self.invalidate_spills();
                 res
             }
@@ -693,7 +672,9 @@ impl Emit<'_> {
         if !is_try {
             let inlined = self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args);
             if inlined {
-                self.clobber_call_spills();
+                self.clobber_regs(&[Reg(0), A, C, IP, Reg(17), LR]);
+                self.last_fspill = None;
+                self.asm.clear_anchor();
                 return Ok(abi);
             }
         }
