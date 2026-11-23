@@ -290,6 +290,9 @@ impl Slots for Image {
     }
 
     fn wanted_len(&self) -> usize {
+        if !self.backend.is_lazy_jit() {
+            return 0;
+        }
         let me = std::thread::current().id();
         lock(&self.wanted).iter().filter(|(thread, _)| *thread == me).count()
     }

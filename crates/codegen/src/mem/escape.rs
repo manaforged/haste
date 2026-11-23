@@ -293,16 +293,27 @@ pub(super) fn classify_uses(
     }
     let n = func.types.len();
     let mut unwind_write_only = vec![false; func.slots.len()];
+    let mut has_indirect_unwind = false;
     for u in &func.unwind_drops {
         if u.indirect {
             unwind_write_only[u.local.index()] = true;
+            has_indirect_unwind = true;
         }
     }
-    let is_const: Vec<bool> = func.const_values().into_iter().map(|c| c.is_some()).collect();
+    let mut is_const = vec![false; n];
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
-            if let Op::StackLoad(slot, _) | Op::StackAddr(slot, _) = func.insts[inst.index()].op {
-                unwind_write_only[slot.index()] = false;
+            let data = &func.insts[inst.index()];
+            match data.op {
+                Op::Const(_) => {
+                    if let Some(res) = data.result {
+                        is_const[res.index()] = true;
+                    }
+                }
+                Op::StackLoad(slot, _) | Op::StackAddr(slot, _) if has_indirect_unwind => {
+                    unwind_write_only[slot.index()] = false;
+                }
+                _ => {}
             }
         }
     }

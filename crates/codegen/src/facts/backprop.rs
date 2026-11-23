@@ -148,6 +148,9 @@ impl Path {
 
     /// Everything known about `value` here, with its definition evaluated again on what the path knows of its operands.
     pub(super) fn refined_fact(&self, func: &Function, ranges: &Ranges, value: Value, depth: u8) -> Fact {
+        if self.is_empty() {
+            return ranges.of(value);
+        }
         let fact = self.fact(ranges, value);
         let ty = func.ty(value);
         let Some(op) = ranges.op(func, value).filter(|_| depth < 3 && ty.is_small_int()) else { return fact };

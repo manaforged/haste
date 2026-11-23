@@ -1,7 +1,5 @@
-use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use haste_codegen::{Code, CodeUnwindDrop, RelocKind, StencilReloc, Target};
@@ -14,7 +12,10 @@ use crate::names::ItemRef;
 use crate::sync::lock;
 
 mod icf;
+mod queue;
 mod vdce;
+
+pub(super) use queue::{AotQueue, AotWork, bucket_by_item, collect_warm_callees, lpt_chunks};
 
 use super::Image;
 
@@ -90,128 +91,6 @@ impl CachedAotTemplate {
 pub(super) enum AotStatic {
     Local(u32),
     Foreign { weak: bool, host: Option<HostSymbol> },
-}
-
-struct QueueState {
-    buckets: VecDeque<Vec<usize>>,
-    loose: Vec<usize>,
-    active: usize,
-}
-
-pub(super) fn bucket_by_item(work: &[usize], item_of: impl Fn(usize) -> ItemRef) -> Vec<Vec<usize>> {
-    let mut pos_map: HashMap<ItemRef, usize> = HashMap::default();
-    let mut buckets: Vec<Vec<usize>> = Vec::new();
-    for &index in work {
-        let item = item_of(index);
-        if let Some(&pos) = pos_map.get(&item) {
-            buckets[pos].push(index);
-        } else {
-            pos_map.insert(item, buckets.len());
-            buckets.push(vec![index]);
-        }
-    }
-    buckets
-}
-
-pub(super) fn lpt_chunks(buckets: Vec<Vec<usize>>, max_bucket: usize) -> Vec<Vec<usize>> {
-    let mut chunks: Vec<Vec<usize>> = buckets
-        .into_iter()
-        .flat_map(|b| if b.len() <= max_bucket { vec![b] } else { b.chunks(max_bucket).map(|c| c.to_vec()).collect() })
-        .collect();
-    chunks.sort_by_key(|b| std::cmp::Reverse(b.len()));
-    chunks
-}
-
-pub(super) struct AotQueue {
-    claimed: Vec<AtomicBool>,
-    items: Box<[ItemRef]>,
-    max_bucket: usize,
-    state: Mutex<QueueState>,
-    wake: Condvar,
-}
-
-pub(super) struct TaskGuard<'a>(&'a AotQueue);
-
-impl Drop for TaskGuard<'_> {
-    fn drop(&mut self) {
-        self.0.finish_task();
-    }
-}
-
-impl AotQueue {
-    pub(super) fn new(claimed: Vec<AtomicBool>, items: Box<[ItemRef]>, max_bucket: usize, initial_buckets: Vec<Vec<usize>>) -> Arc<Self> {
-        Arc::new(Self {
-            claimed,
-            items,
-            max_bucket,
-            state: Mutex::new(QueueState { buckets: initial_buckets.into(), loose: Vec::new(), active: 0 }),
-            wake: Condvar::new(),
-        })
-    }
-
-    pub(super) fn claim(&self, idx: usize) -> bool {
-        idx < self.claimed.len() && !self.claimed[idx].swap(true, Ordering::AcqRel)
-    }
-
-    pub(super) fn push_loose(&self, items: Vec<usize>) {
-        if items.is_empty() {
-            return;
-        }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.loose.extend(items);
-        self.wake.notify_all();
-    }
-
-    pub(super) fn reseed_buckets(&self, buckets: Vec<Vec<usize>>) {
-        if buckets.is_empty() {
-            return;
-        }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.buckets.extend(buckets);
-        self.wake.notify_all();
-    }
-
-    pub(super) fn pop(&self) -> Option<(Vec<usize>, TaskGuard<'_>)> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if let Some(bucket) = state.buckets.pop_front() {
-                state.active += 1;
-                return Some((bucket, TaskGuard(self)));
-            }
-            if !state.loose.is_empty() {
-                let loose = std::mem::take(&mut state.loose);
-                let buckets = lpt_chunks(bucket_by_item(&loose, |idx| self.items[idx]), self.max_bucket);
-                state.buckets.extend(buckets);
-                if state.buckets.len() > 1 {
-                    self.wake.notify_all();
-                }
-                continue;
-            }
-            if state.active == 0 {
-                self.wake.notify_all();
-                return None;
-            }
-            state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    pub(super) fn take_all_pending(&self) -> Vec<usize> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = Vec::new();
-        while let Some(bucket) = state.buckets.pop_front() {
-            out.extend(bucket);
-        }
-        out.append(&mut state.loose);
-        out
-    }
-
-    fn finish_task(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.active = state.active.saturating_sub(1);
-        if state.active == 0 && state.buckets.is_empty() && state.loose.is_empty() {
-            self.wake.notify_all();
-        }
-    }
 }
 
 fn hash_key<T: Hash + ?Sized>(val: &T) -> u64 {

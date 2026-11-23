@@ -15,6 +15,7 @@ pub(super) fn should_splice_devirt(slots: &dyn Slots, func: &Function, mode: Low
     mode == LowerMode::Stencil
         && slots.allow_inline()
         && !func.is_coroutine()
+        && func.has_call()
         && (func.has_vtable_slots() || RelocPlan::steps_have_fn_ptrs(reloc_plan))
 }
 

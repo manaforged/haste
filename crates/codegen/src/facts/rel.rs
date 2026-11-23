@@ -5,13 +5,19 @@ use super::backprop::Uppers;
 use super::{Fact, MAX_FACTS, MAX_RELS, Ranges, compared_range, decide, swapped, truth, unsigned_order};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub(super) enum RelKind {
-    Eq,
-    Ne,
-    Ult,
-    Ule,
-    Slt,
-    Sle,
+    Eq = 0,
+    Ne = 1,
+    Ult = 2,
+    Ule = 3,
+    Slt = 4,
+    Sle = 5,
+}
+
+#[inline]
+const fn kind_bit(kind: RelKind) -> u8 {
+    1_u8 << (kind as u8)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +71,7 @@ pub(super) fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
 pub(super) struct Path {
     facts: Vec<(Value, Fact)>,
     rels: Vec<Rel>,
+    rel_kinds: u8,
     no_wrap_adds: Vec<(Value, Value)>,
     pub(super) uppers: Uppers,
 }
@@ -77,6 +84,11 @@ pub(super) struct Reached {
 }
 
 impl Path {
+    /// Whether this path has recorded no branch-specific facts, relations, or no-wrap sums.
+    pub(super) fn is_empty(&self) -> bool {
+        self.facts.is_empty() && self.no_wrap_adds.is_empty()
+    }
+
     /// The symbolic relations known here, oldest first.
     pub(super) fn rels(&self) -> &[Rel] {
         &self.rels
@@ -111,8 +123,12 @@ impl Path {
         if !self.rels.contains(&rel) {
             if self.rels.len() >= MAX_RELS {
                 self.rels.remove(0);
+                self.rels.push(rel);
+                self.rel_kinds = self.rels.iter().fold(0_u8, |mask, r| mask | kind_bit(r.kind));
+            } else {
+                self.rels.push(rel);
+                self.rel_kinds |= kind_bit(rel.kind);
             }
-            self.rels.push(rel);
             self.uppers.clear();
         }
     }
@@ -234,6 +250,10 @@ impl Path {
         if start == target {
             return Some(!require_strict);
         }
+        let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
+        if self.rel_kinds & needed == 0 || (require_strict && self.rel_kinds & kind_bit(kinds.0) == 0) {
+            return None;
+        }
         if !self.steps_from(ty, start, kinds) || !self.steps_into(ty, target, kinds) {
             return None;
         }
@@ -339,6 +359,9 @@ impl Path {
     }
 
     fn known_ne(&self, ty: Type, a: Value, b: Value) -> bool {
+        if self.rel_kinds & kind_bit(RelKind::Ne) == 0 {
+            return false;
+        }
         let (mut from_a, mut from_b) = (None, None);
         self.rels.iter().filter(|r| r.kind == RelKind::Ne && r.ty == ty).any(|r| {
             let at_a = *from_a.get_or_insert_with(|| self.reached(ty, a, EQUAL));
@@ -348,9 +371,10 @@ impl Path {
     }
 
     fn has_strict_upper_expr(&self, func: &Function, ranges: &Ranges, ty: Type, val: Value, depth: u8) -> bool {
-        if self.steps_from(ty, val, UNSIGNED) && self.rels.iter().any(|r| {
-            r.ty == ty && r.kind == RelKind::Ult && self.reaches(ty, val, r.rhs, UNSIGNED, true)
-        }) {
+        if self.rel_kinds & kind_bit(RelKind::Ult) != 0
+            && self.steps_from(ty, val, UNSIGNED)
+            && self.rels.iter().any(|r| r.ty == ty && r.kind == RelKind::Ult && self.reaches(ty, val, r.rhs, UNSIGNED, true))
+        {
             return true;
         }
         if depth >= 2 {
@@ -444,6 +468,9 @@ impl Path {
     }
 
     pub(super) fn decide_rel(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> Option<bool> {
+        if self.rels.is_empty() && self.no_wrap_adds.is_empty() {
+            return None;
+        }
         if self.proves(func, ranges, cc, ty, x, y) {
             Some(true)
         } else if self.proves(func, ranges, cc.inverse(), ty, x, y) {

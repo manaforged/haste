@@ -86,9 +86,9 @@ pub(super) fn run(func: &mut Function) -> bool {
     if !copies.is_empty() {
         func.bump_cfg();
     }
-    let repaired = thread_repaired_joins(func);
     let split = split_correlated_join(func);
-    !copies.is_empty() || repaired || split
+    let repaired = thread_repaired_joins(func);
+    !copies.is_empty() || split || repaired
 }
 
 struct SsaRepairPlan {

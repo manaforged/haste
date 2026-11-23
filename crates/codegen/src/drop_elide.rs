@@ -69,6 +69,10 @@ impl Function {
 
     pub(crate) fn import_unwind_drops(&mut self, callee: &Function, slot_base: u32, sym_base: u32) {
         self.keep_fp |= callee.keep_fp;
+        self.elide_drops |= callee.elide_drops;
+        for &sym in &callee.no_unwind_syms {
+            self.no_unwind_syms.push(sym + sym_base);
+        }
         for u in &callee.unwind_drops {
             self.unwind_drops.push(UnwindDrop {
                 local: StackSlot(u.local.0 + slot_base),
@@ -108,7 +112,14 @@ impl Function {
 
     /// Post-optimization unwind-drop cleanup that preserves or re-emits entry zero-initialization for every surviving flag.
     pub(crate) fn elide_dead_unwind_drops_post_init(&mut self) -> bool {
-        self.elide_dead_unwind_drops_inner(true, |_| true)
+        if self.no_unwind_syms.is_empty() {
+            return self.elide_dead_unwind_drops_inner(true, |_| true);
+        }
+        let mut no_unwind = std::mem::take(&mut self.no_unwind_syms);
+        no_unwind.sort_unstable();
+        let changed = self.elide_dead_unwind_drops_inner(true, |sym| no_unwind.binary_search(&sym).is_err());
+        self.no_unwind_syms = no_unwind;
+        changed
     }
 
     fn elide_dead_unwind_drops_inner(&mut self, post_init: bool, mut sym_may_unwind: impl FnMut(u32) -> bool) -> bool {

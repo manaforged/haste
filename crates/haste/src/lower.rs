@@ -33,7 +33,7 @@ pub(super) use abi::is_freeze_ty;
 pub(crate) use object::VTABLE_HEADER;
 pub use plan::eval_footprint;
 pub use reloc::{RelocPlan, eval_relocs};
-pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil};
+pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil, warm_inline};
 
 use std::sync::Arc;
 
@@ -242,6 +242,8 @@ pub(super) struct Inline {
     pub max_callee_height: u8,
     pub max_callee_size: u16,
     pub host: budget::Copies,
+    pub warming: bool,
+    pub aborted: bool,
 }
 
 impl Inline {

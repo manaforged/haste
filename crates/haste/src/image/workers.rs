@@ -14,7 +14,7 @@ use crate::substrate::tally::{Tally, clock, tally};
 use crate::sync::lock;
 use haste_codegen::{Code, Memory};
 
-use super::aot::{self, AotCode, AotFn, AotQueue, CachedAotTemplate, bucket_by_item, lpt_chunks};
+use super::aot::{self, AotCode, AotFn, AotQueue, AotWork, CachedAotTemplate, bucket_by_item, collect_warm_callees, lpt_chunks};
 use super::stencil::{DictConfig, DistinctInst, GroupWork, aot_relocs_valid, item_err, mode_dict_key, mode_stencil_key};
 use super::global_asm::Foreign;
 use super::{Image, ImageMode, Pass, resolve_host_symbol, weak};
@@ -333,12 +333,24 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         let mut pass = Pass::default();
         pass.stencils.cfg = cfg;
         let (mut errors, mut deferred, mut eval_requests) = (Vec::new(), Vec::new(), Vec::new());
-        while let Some((batch, _guard)) = queue.pop() {
-            let mut batch_errors = Vec::new();
-            let work = self.prepare_work(&mut cx, reached, &batch, (&mut batch_errors, None));
-            errors.extend(batch_errors);
-            if !work.is_empty() {
-                self.compile_worker_bucket(&mut cx, reached, &work, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
+        while let Some(item) = queue.pop() {
+            match item {
+                AotWork::Compile(batch, _guard) => {
+                    if self.allow_inline() && queue.want_warm() {
+                        queue.push_warm(collect_warm_callees(&cx, reached, queue, &batch));
+                    }
+                    let mut batch_errors = Vec::new();
+                    let work = self.prepare_work(&mut cx, reached, &batch, (&mut batch_errors, None));
+                    errors.extend(batch_errors);
+                    if !work.is_empty() {
+                        self.compile_worker_bucket(&mut cx, reached, &work, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
+                    }
+                }
+                AotWork::Warm(idx) => {
+                    lower::warm_inline(&mut cx, reached, self, idx);
+                    let _ = cx.take_deferred_evals();
+                    self.bodies.trim_transient();
+                }
             }
         }
         (pass, errors, deferred, eval_requests)

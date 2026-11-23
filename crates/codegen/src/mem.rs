@@ -203,18 +203,26 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
 /// Gives each unique pointer that a call returns and the function stores into an entry parameter's object that parameter as its owner, since the object predates the allocation.
 fn seed_fresh_owners(func: &Function, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
     let mut called = vec![false; func.types.len()];
+    let mut any_unique = false;
     for data in &func.insts {
         if let Op::Call { callee, results, .. } = &data.op {
-            results.iter().for_each(|result| called[result.index()] = true);
+            for &result in results {
+                if func.is_unique_ptr(result) {
+                    called[result.index()] = true;
+                    any_unique = true;
+                }
+            }
             if func.is_fresh_alloc(*callee) && let Some(&res) = results.first() {
                 tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(None));
             }
         }
     }
+    if !any_unique || entry.is_empty() {
+        return;
+    }
     for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Op::Store(value, addr, _) = func.insts[inst.index()].op
             && called[value.index()]
-            && func.is_unique_ptr(value)
             && let Some(&(owner, _)) = affine.get(addr.index())
             && entry.contains(&owner)
         {

@@ -108,6 +108,7 @@ static FULL_RULES: &[Rule] = &[
     Rule { pass: Pass::Lsr, reads: Domain::CFG.union(Domain::VALUES) },
 ];
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
+static INLINE_FINISH: &[Pass] = &[Pass::Returns];
 
 fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort, target: &crate::Target) -> Domain {
     let tracing = crate::trace::enabled();
@@ -388,6 +389,14 @@ fn build_plan<'t>(moves: promote::Moves, target: &'t crate::Target) -> Plan<'t> 
             budget: 6,
             finish: QUICK_FINISH,
         },
+        Effort::Full if moves == promote::Moves::Guided => Plan {
+            moves,
+            effort,
+            target,
+            rules: FULL_RULES,
+            budget: 32,
+            finish: INLINE_FINISH,
+        },
         Effort::Full => Plan {
             moves,
             effort,
@@ -409,8 +418,9 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
     if plan.moves == promote::Moves::Guided {
         return;
     }
-    if plan.effort == Effort::Full && func.elide_dead_unwind_drops_post_init() {
-        rerun_after_rewrite(func, plan, state);
+    if (plan.effort == Effort::Full || func.elide_drops) && func.elide_dead_unwind_drops_post_init() {
+        *state = PassState::new();
+        run_fixpoint(func, plan, state);
     }
     if strip_assumes(func) {
         rerun_after_rewrite(func, plan, state);
@@ -475,12 +485,13 @@ fn invert_unlikely_branches(func: &mut Function) {
 }
 
 fn run_backend_prep(func: &mut Function, plan: &Plan) {
-    if plan.moves != promote::Moves::Guided {
-        if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
-            crate::algebra::compare_offsets(func);
-        }
-        sink::run(func, plan.moves == promote::Moves::Split && plan.effort == Effort::Full);
+    if plan.moves == promote::Moves::Guided {
+        return;
     }
+    if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
+        crate::algebra::compare_offsets(func);
+    }
+    sink::run(func, plan.moves == promote::Moves::Split && plan.effort == Effort::Full);
     let x64_full = plan.target.arch == crate::Arch::X64 && plan.effort == Effort::Full;
     if x64_full {
         branches::split_conditions(func);
@@ -503,6 +514,12 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     let merge_init = run_step(func, &plan, &mut state, INIT[2]);
     state.fold_clean = fold_init.is_empty() && merge_init.is_empty();
     state.merge_clean = merge_init.is_empty();
+    if moves != promote::Moves::Guided
+        && (plan.effort == Effort::Full || func.elide_drops)
+        && func.elide_dead_unwind_drops_post_init()
+    {
+        state = PassState::new();
+    }
     if moves == promote::Moves::Split && plan.effort == Effort::Full && crate::loads::elide_early(func) {
         state.fold_clean = false;
         state.merge_clean = false;
