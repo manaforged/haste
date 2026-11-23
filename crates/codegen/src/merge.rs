@@ -589,6 +589,14 @@ fn match_triangle_arm(func: &Function, cfg: &Cfg, uses: &[u32], defs: &[Option<I
 }
 
 fn collect_triangle_round(func: &Function) -> Vec<(usize, TriangleMatch)> {
+    if func.blocks.len() < 3 { return Vec::new(); }
+    let has_brif_pair = func.blocks.iter().enumerate().any(|(b, _)| {
+        matches!(func.last(Block(b as u32)), Some(&Op::Brif(_, t1, _, e1, _)) if t1 != e1 && (
+            matches!(func.last(t1), Some(&Op::Brif(_, t2, _, e2, _)) if t2 != e2)
+            || matches!(func.last(e1), Some(&Op::Brif(_, t2, _, e2, _)) if t2 != e2)
+        ))
+    });
+    if !has_brif_pair { return Vec::new(); }
     let (cfg, uses) = (func.cfg(), func.use_counts());
     let mut defs = vec![None; func.types.len()];
     for inst in func.blocks.iter().flat_map(|blk| &blk.insts) {

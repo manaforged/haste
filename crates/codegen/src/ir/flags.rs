@@ -64,12 +64,23 @@ impl Function {
         consts
     }
 
+    /// Whether any value carries the thread-cell lookup mark.
+    pub(crate) fn has_thread_cell(&self) -> bool {
+        self.value_flags.iter().any(|&bits| bits & THREAD_CELL != 0)
+    }
+
     /// Mask of values defined by `Op::Const(0)`, empty when no thread-cell lookup is present.
     pub(crate) fn thread_cell_zeros(&self) -> Vec<bool> {
-        if !self.value_flags.iter().any(|&bits| bits & THREAD_CELL != 0) {
+        if !self.has_thread_cell() {
             return Vec::new();
         }
-        self.const_values().into_iter().map(|c| c == Some(0)).collect()
+        let mut zeros = vec![false; self.types.len()];
+        for inst in &self.insts {
+            if let (super::Op::Const(0), Some(res)) = (&inst.op, inst.result) {
+                zeros[res.index()] = true;
+            }
+        }
+        zeros
     }
 
     /// Result value of `op` when it is a zero-initialized `ThreadCell` lookup with no user-visible memory effects.

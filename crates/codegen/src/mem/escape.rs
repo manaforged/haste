@@ -429,3 +429,66 @@ pub(super) fn frontiers(func: &Function, esc: &SlotEscapes) -> HashMap<u32, Fron
     }
     out
 }
+
+pub(super) fn finish_fresh_owners(
+    func: &Function,
+    cfg: &Cfg,
+    entry: &[Value],
+    affine: &[(Value, i64)],
+    (frees, called): (&[Value], &[(Value, bool, Block, usize)]),
+    tracked: &mut [TrackRoot],
+) -> bool {
+    let mut freed_in_non_ret: Vec<Value> = Vec::new();
+    if !frees.is_empty() {
+        for &b in &cfg.rpo {
+            let insts = &func.blocks[b.index()].insts;
+            if insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Return(_))) { continue; }
+            for &inst in insts {
+                if let Op::Call { callee, args, .. } = &func.insts[inst.index()].op
+                    && frees.contains(callee) && let Some(&ptr) = args.first() && !freed_in_non_ret.contains(&ptr)
+                {
+                    freed_in_non_ret.push(ptr);
+                }
+            }
+        }
+    }
+    let mut updated = false;
+    for &b in &cfg.rpo {
+        let insts = &func.blocks[b.index()].insts;
+        for (spos, &inst) in insts.iter().enumerate() {
+            if let Op::Store(value, addr, _) = func.insts[inst.index()].op
+                && let Some(&(_, is_m, cb, cpos)) = called.iter().find(|&&(v, ..)| v == value)
+                && let Some(&(owner, _)) = affine.get(addr.index())
+                && owner != value
+                && (entry.contains(&owner) || (is_m && !freed_in_non_ret.contains(&owner) && (func.is_frame_ptr(owner) || (cb == b && spos > cpos && !insts[cpos..spos].iter().any(|&i| crate::live::results(&func.insts[i.index()]).any(|r| r == owner))))))
+            {
+                let next = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner)));
+                if tracked[value.index()] != next {
+                    tracked[value.index()] = next;
+                    updated = true;
+                }
+            }
+        }
+    }
+    updated
+}
+
+pub(super) fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool {
+    let is_cl = |v: Value| tracked[v.index()] == TrackRoot::Set(MemRoot::CallerLoc);
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let op = &func.insts[inst.index()].op;
+            match *op {
+                Op::Load(addr, 0) if is_cl(addr) => {}
+                Op::Store(val, addr, 0) if is_cl(addr) && !is_cl(val) => {}
+                Op::Convert(crate::ir::Convert::Bitcast, _) | Op::Jump(..) | Op::Brif(..) => {}
+                _ => {
+                    let mut bad = false;
+                    op.for_operands(|v| bad |= is_cl(v));
+                    if bad { return true; }
+                }
+            }
+        }
+    }
+    false
+}

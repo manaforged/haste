@@ -324,8 +324,9 @@ impl Path {
             return false;
         }
         let (b_steps, b_len) = if b_is_add { self.non_wrap_iadd_chain(func, ranges, b, ty) } else { ([(b, 0); CHAIN_STEPS], 0) };
+        let need_uppers = has_u && (multi || into_b);
         let mut uppers = self.uppers.0.borrow_mut();
-        let (values, any_add) = if has_u { uppers.of(func, ranges, self.rels(), ty) } else { (&mut [][..], false) };
+        let (values, any_add) = if need_uppers { uppers.of(func, ranges, self.rels(), ty) } else { (&mut [][..], false) };
         if !multi && b_len == 0 && !(into_b && any_add) {
             return false;
         }

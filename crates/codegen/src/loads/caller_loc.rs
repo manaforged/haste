@@ -165,20 +165,30 @@ pub(super) fn optimize(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> boo
     }
     let mut zeros = func.thread_cell_zeros();
     let mut is_cl: Vec<bool> = prov.param_roots.iter().map(|&r| r == MemRoot::CallerLoc).collect();
-    let has_store = cfg.rpo.iter().any(|&b| {
-        func.blocks[b.index()]
-            .insts
-            .iter()
-            .any(|&i| matches!(func.insts[i.index()].op, Op::Store(_, a, 0) if is_cl.get(a.index()) == Some(&true)))
-    });
+    let (mut has_store, mut has_load) = (false, false);
+    for &b in &cfg.rpo {
+        for &i in &func.blocks[b.index()].insts {
+            let d = &func.insts[i.index()];
+            match (&d.op, d.result) {
+                (Op::Store(_, a, 0), _) if is_cl.get(a.index()) == Some(&true) => has_store = true,
+                (Op::Load(a, 0), Some(_)) if is_cl.get(a.index()) == Some(&true) => has_load = true,
+                _ => {}
+            }
+        }
+    }
     let mut changed = false;
     if has_store {
-        changed |= narrow_stores(func, cfg, prov, &mut zeros, &mut is_cl);
-        changed |= narrow_saves(func, cfg, prov, &mut zeros, &mut is_cl);
+        let mut cl_defs = collect_cl_defs(func, cfg, &zeros);
+        let ns = narrow_stores(func, cfg, prov, &mut zeros, &mut is_cl, &cl_defs);
+        changed |= ns;
+        if has_load || ns {
+            if ns { cl_defs = collect_cl_defs(func, cfg, &zeros); }
+            changed |= narrow_saves(func, cfg, prov, &mut zeros, &mut is_cl, &cl_defs);
+        }
         changed |= drop_silent_stores(func, cfg, prov, &zeros, &is_cl);
         changed |= drop_dead_stores(func, cfg, prov, &zeros, &is_cl);
     }
-    changed |= sink_cell_calls(func, cfg, &mut zeros, &mut is_cl);
+    changed |= sink_cell_calls(func, cfg, &mut zeros, &mut is_cl, has_load || changed);
     changed
 }
 
@@ -188,8 +198,8 @@ fn narrow_stores(
     prov: &Provenance,
     zeros: &mut Vec<bool>,
     is_cl: &mut Vec<bool>,
+    cl_defs: &[Option<(Block, Inst, ClDef)>],
 ) -> bool {
-    let cl_defs = collect_cl_defs(func, cfg, zeros);
     let mut candidates: Vec<(Block, Inst)> = Vec::new();
     for &b in &cfg.rpo {
         for &inst in &func.blocks[b.index()].insts {
@@ -309,8 +319,8 @@ fn narrow_saves(
     prov: &Provenance,
     zeros: &mut Vec<bool>,
     is_cl: &mut Vec<bool>,
+    cl_defs: &[Option<(Block, Inst, ClDef)>],
 ) -> bool {
-    let cl_defs = collect_cl_defs(func, cfg, zeros);
     let mut non_restore = vec![false; func.types.len()];
     let mut candidates: Vec<(Block, Inst)> = Vec::new();
     for &b in &cfg.rpo {
@@ -488,36 +498,47 @@ fn step_forward(
     state
 }
 
+#[derive(Clone, Copy)]
+enum BlockFwd { PassThrough, Const(ClVal), Dynamic }
+
 fn drop_silent_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance, zeros: &[bool], is_cl: &[bool]) -> bool {
     let Some(entry) = func.entry else { return false };
     let n = func.blocks.len();
-    let mut in_val = vec![ClVal::Uninit; n];
-    let mut out_val = vec![ClVal::Uninit; n];
+    let (mut fwd, mut has_write, mut any_write) = (vec![BlockFwd::PassThrough; n], vec![false; n], false);
+    for &b in &cfg.rpo {
+        let (mut saw_read, mut saw_effect, mut out) = (false, false, ClVal::Unknown);
+        for &inst in &func.blocks[b.index()].insts {
+            match cl_event(func, prov, zeros, is_cl, &func.insts[inst.index()].op) {
+                ClEvent::None => {}
+                ClEvent::Read => saw_read = true,
+                ClEvent::Write(val) => { (has_write[b.index()], any_write, saw_effect, out) = (true, true, true, ClVal::Known(val)); }
+                ClEvent::Observe => (saw_effect, out) = (true, ClVal::Unknown),
+                ClEvent::Trap => break,
+            }
+        }
+        fwd[b.index()] = if saw_read { BlockFwd::Dynamic } else if saw_effect { BlockFwd::Const(out) } else { BlockFwd::PassThrough };
+    }
+    if !any_write { return false; }
+    let (mut in_val, mut out_val) = (vec![ClVal::Uninit; n], vec![ClVal::Uninit; n]);
     in_val[entry.index()] = ClVal::Unknown;
     loop {
         let mut changed = false;
         for &b in &cfg.rpo {
-            let state = if b == entry {
-                ClVal::Unknown
-            } else {
-                cfg.preds_of(b).iter().fold(ClVal::Uninit, |acc, &p| acc.join(out_val[p.index()]))
+            let bi = b.index();
+            let state = if b == entry { ClVal::Unknown } else { cfg.preds_of(b).iter().fold(ClVal::Uninit, |acc, &p| acc.join(out_val[p.index()])) };
+            if state != in_val[bi] { (in_val[bi], changed) = (state, true); }
+            let out = match fwd[bi] {
+                BlockFwd::PassThrough => state,
+                BlockFwd::Const(v) => v,
+                BlockFwd::Dynamic => step_forward(func, prov, zeros, is_cl, b, state, |_| {}),
             };
-            if state != in_val[b.index()] {
-                in_val[b.index()] = state;
-                changed = true;
-            }
-            let out = step_forward(func, prov, zeros, is_cl, b, in_val[b.index()], |_| {});
-            if out != out_val[b.index()] {
-                out_val[b.index()] = out;
-                changed = true;
-            }
+            if out != out_val[bi] { (out_val[bi], changed) = (out, true); }
         }
-        if !changed {
-            break;
-        }
+        if !changed { break; }
     }
     let mut dropped = false;
     for &b in &cfg.rpo {
+        if !has_write[b.index()] { continue; }
         let mut kills = Vec::new();
         step_forward(func, prov, zeros, is_cl, b, in_val[b.index()], |pos| kills.push(pos));
         for pos in kills.into_iter().rev() {
@@ -536,77 +557,68 @@ fn drop_dead_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance, zeros: &[
         ClEvent::Trap | ClEvent::None => live,
     };
     let n = func.blocks.len();
-    let mut live_in = vec![false; n];
+    let (mut gen_b, mut trans, mut has_write, mut any_write) = (vec![false; n], vec![false; n], vec![false; n], false);
+    for &b in &cfg.rpo {
+        let bi = b.index();
+        let (mut g, mut t) = match func.last(b) { Some(Op::Trap) => (false, false), Some(Op::Return(..)) => (true, false), _ => (false, true) };
+        for &inst in func.blocks[bi].insts.iter().rev() {
+            match cl_event(func, prov, zeros, is_cl, &func.insts[inst.index()].op) {
+                ClEvent::Write(..) => (g, t, has_write[bi], any_write) = (false, false, true, true),
+                ClEvent::Read | ClEvent::Observe => (g, t) = (true, false),
+                ClEvent::Trap | ClEvent::None => {}
+            }
+        }
+        (gen_b[bi], trans[bi]) = (g, t);
+    }
+    if !any_write { return false; }
+    let mut live_in = gen_b;
     loop {
         let mut changed = false;
         for &b in cfg.rpo.iter().rev() {
-            let mut live = match func.last(b) {
-                Some(Op::Trap) => false,
-                Some(Op::Return(..)) => true,
-                _ => func.successors(b).any(|s| live_in[s.index()]),
-            };
-            for &inst in func.blocks[b.index()].insts.iter().rev() {
-                live = step(&func.insts[inst.index()].op, live);
-            }
-            if live && !live_in[b.index()] {
-                live_in[b.index()] = true;
-                changed = true;
-            }
+            let bi = b.index();
+            if !live_in[bi] && trans[bi] && func.successors(b).any(|s| live_in[s.index()]) { (live_in[bi], changed) = (true, true); }
         }
-        if !changed {
-            break;
-        }
+        if !changed { break; }
     }
     let mut kills = Vec::new();
     for &b in &cfg.rpo {
-        let mut live = match func.last(b) {
-            Some(Op::Trap) => false,
-            Some(Op::Return(..)) => true,
-            _ => func.successors(b).any(|s| live_in[s.index()]),
-        };
-        let len = func.blocks[b.index()].insts.len();
-        for pos in (0..len).rev() {
-            let inst = func.blocks[b.index()].insts[pos];
-            let op = &func.insts[inst.index()].op;
-            if matches!(cl_event(func, prov, zeros, is_cl, op), ClEvent::Write(..)) && !live {
-                kills.push((b.index(), pos));
-            }
+        if !has_write[b.index()] { continue; }
+        let mut live = match func.last(b) { Some(Op::Trap) => false, Some(Op::Return(..)) => true, _ => func.successors(b).any(|s| live_in[s.index()]) };
+        for pos in (0..func.blocks[b.index()].insts.len()).rev() {
+            let op = &func.insts[func.blocks[b.index()].insts[pos].index()].op;
+            if matches!(cl_event(func, prov, zeros, is_cl, op), ClEvent::Write(..)) && !live { kills.push((b.index(), pos)); }
             live = step(op, live);
         }
     }
     let dropped = !kills.is_empty();
-    for (b_idx, pos) in kills {
-        let inst = func.blocks[b_idx].insts.remove(pos);
-        func.insts[inst.index()].op = Op::Trap;
-    }
+    for (b_idx, pos) in kills { let inst = func.blocks[b_idx].insts.remove(pos); func.insts[inst.index()].op = Op::Trap; }
     dropped
 }
 
-fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl: &mut Vec<bool>) -> bool {
-    let has_cl_load = cfg.rpo.iter().any(|&b| {
-        func.blocks[b.index()].insts.iter().any(|&i| {
-            let d = &func.insts[i.index()];
-            matches!((&d.op, d.result), (Op::Load(addr, 0), Some(_)) if is_cl.get(addr.index()) == Some(&true))
-        })
-    });
+fn sink_cell_calls(func: &mut Function, cfg: &Cfg, zeros: &mut Vec<bool>, is_cl: &mut Vec<bool>, check_loads: bool) -> bool {
     let mut changed = false;
-    if has_cl_load {
-        let uses = func.use_counts();
+    if check_loads {
+        let mut cl_loads: Vec<(Block, usize, Value)> = Vec::new();
         for &b in &cfg.rpo {
-            let mut dead = Vec::new();
             for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
-                let data = &func.insts[inst.index()];
-                if let (Op::Load(addr, 0), Some(res)) = (&data.op, data.result)
-                    && is_cl.get(addr.index()) == Some(&true)
-                    && uses.get(res.index()) == Some(&0)
-                {
-                    dead.push(pos);
+                let d = &func.insts[inst.index()];
+                if let (Op::Load(addr, 0), Some(res)) = (&d.op, d.result) && is_cl.get(addr.index()) == Some(&true) { cl_loads.push((b, pos, res)); }
+            }
+        }
+        if !cl_loads.is_empty() {
+            let (mut used, mut rem) = (vec![false; cl_loads.len()], cl_loads.len());
+            for &b in &cfg.rpo {
+                if rem == 0 { break; }
+                for &inst in &func.blocks[b.index()].insts {
+                    func.insts[inst.index()].op.for_operands(|v| {
+                        for (idx, &(_, _, r)) in cl_loads.iter().enumerate() { if r == v && !used[idx] { used[idx] = true; rem -= 1; } }
+                    });
                 }
             }
-            for pos in dead.into_iter().rev() {
-                let inst = func.blocks[b.index()].insts.remove(pos);
-                func.insts[inst.index()].op = Op::Trap;
-                changed = true;
+            if rem > 0 {
+                for (idx, &(b, pos, _)) in cl_loads.iter().enumerate().rev() {
+                    if !used[idx] { let inst = func.blocks[b.index()].insts.remove(pos); func.insts[inst.index()].op = Op::Trap; changed = true; }
+                }
             }
         }
     }

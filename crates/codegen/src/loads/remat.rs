@@ -661,10 +661,29 @@ fn for_term_args(op: &Op, mut f: impl FnMut(Value)) -> bool {
 }
 
 pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
+    let mut any_cand = false;
+    for b in &func.blocks {
+        if b.insts.len() < 2 { continue; }
+        let last = b.insts[b.insts.len() - 1];
+        match &func.insts[last.index()].op {
+            Op::Jump(_, args) if !args.is_empty() => { any_cand = true; break; }
+            Op::Brif(c, _, t_args, _, e_args) => {
+                if !t_args.is_empty() || !e_args.is_empty() || func.insts[b.insts[b.insts.len() - 2].index()].result != Some(*c) {
+                    any_cand = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !any_cand {
+        return false;
+    }
     let uses = func.use_counts();
-    let mut fits_used = vec![false; func.types.len()];
+    let mut fits_used: Vec<bool> = Vec::new();
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         if let Op::Fits(_, _, x, y) = func.insts[inst.index()].op {
+            if fits_used.is_empty() { fits_used.resize(func.types.len(), false); }
             fits_used[x.index()] = true;
             fits_used[y.index()] = true;
         }
@@ -672,19 +691,41 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
     let mut term_uses = vec![0_u32; func.types.len()];
     let mut changed = false;
     for b in 0..func.blocks.len() {
-        if func.blocks[b].insts.len() < 2 {
-            continue;
-        }
-        let Some(&last) = func.blocks[b].insts.last() else { continue };
-        if !for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] += 1) {
+        let len = func.blocks[b].insts.len();
+        if len < 2 { continue; }
+        let last = func.blocks[b].insts[len - 1];
+        let mut arg_count = 0_u32;
+        if !for_term_args(&func.insts[last.index()].op, |v| { term_uses[v.index()] += 1; arg_count += 1; }) {
             continue;
         }
         let cond = match func.insts[last.index()].op {
             Op::Brif(c, ..) if uses[c.index()] == 1 => Some(c),
             _ => None,
         };
+        if arg_count == 0 && cond.is_none_or(|c| func.insts[func.blocks[b].insts[len - 2].index()].result == Some(c)) {
+            continue;
+        }
+        let mut needs_move = false;
+        for (pos, &inst) in func.blocks[b].insts[..len - 1].iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            if data.result.is_some() && data.result == cond && crate::schedule::is_condition(func, inst) {
+                if pos != len - 2 { needs_move = true; break; }
+            } else if arg_count > 0
+                && let Some(res) = data.result
+                && data.op.is_speculable()
+                && !fits_used.get(res.index()).copied().unwrap_or(false)
+                && term_uses[res.index()] > 0
+                && uses[res.index()] == term_uses[res.index()]
+            {
+                needs_move = true;
+                break;
+            }
+        }
+        if !needs_move {
+            if arg_count > 0 { for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0); }
+            continue;
+        }
         let insts = std::mem::take(&mut func.blocks[b].insts);
-        let len = insts.len();
         let mut kept = Vec::with_capacity(len);
         let mut sunk = Vec::new();
         let mut tail = None;
@@ -694,7 +735,7 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
                 tail = Some(inst);
             } else if let Some(res) = data.result
                 && data.op.is_speculable()
-                && !fits_used[res.index()]
+                && !fits_used.get(res.index()).copied().unwrap_or(false)
                 && term_uses[res.index()] > 0
                 && uses[res.index()] == term_uses[res.index()]
             {
@@ -708,7 +749,7 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
         kept.push(last);
         changed |= kept != insts;
         func.blocks[b].insts = kept;
-        for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0);
+        if arg_count > 0 { for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0); }
     }
     changed
 }

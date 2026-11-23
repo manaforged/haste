@@ -201,119 +201,70 @@ fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [Trac
     }
 }
 
-/// Gives each unique pointer that a call returns and the function stores into an entry parameter's or dominating frame's object that object as its owner, since it predates the allocation.
-fn seed_fresh_owners(func: &Function, cfg: &Cfg, entry: &[Value], affine: &[(Value, i64)], tracked: &mut [TrackRoot]) {
-    let (mut mallocs, mut frees, mut called): (Vec<Value>, Vec<Value>, Vec<(Value, bool, Block, usize)>) = (Vec::new(), Vec::new(), Vec::new());
+fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> (Vec<TrackRoot>, bool) {
+    let mut tracked = vec![TrackRoot::Conflict; func.types.len()];
+    let mut any_params = false;
     for &b in &cfg.rpo {
-        for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
+        if Some(b) != cfg.entry {
+            for &p in &func.blocks[b.index()].params {
+                tracked[p.index()] = TrackRoot::Unset;
+                any_params = true;
+            }
+        }
+    }
+    seed_entry_roots(func, cfg, &mut tracked);
+    let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
+    let zeros = func.thread_cell_zeros();
+    let has_tc = !zeros.is_empty();
+    let mut consts: Option<Vec<Option<i64>>> = None;
+    let (mut mallocs, mut frees, mut called): (Vec<Value>, Vec<Value>, Vec<(Value, bool, Block, usize)>) = (Vec::new(), Vec::new(), Vec::new());
+    let rank = (cfg.rpo.len() > 1).then(|| Cfg::ranks(&cfg.rpo, func.blocks.len()));
+    let (mut has_caller_loc, mut need_fixpoint) = (false, false);
+    for &b in &cfg.rpo {
+        let br = rank.as_ref().map_or(0, |r| r[b.index()]);
+        let insts = &func.blocks[b.index()].insts;
+        for (pos, &inst) in insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             match (&data.op, data.result) {
                 (&Op::Runtime(RuntimeSymbol::Malloc), Some(res)) => mallocs.push(res),
                 (&Op::Runtime(RuntimeSymbol::Free), Some(res)) => frees.push(res),
                 (Op::Call { callee, results, .. }, _) => {
-                    for &result in results {
-                        if func.is_unique_ptr(result) { called.push((result, false, b, pos)); }
+                    for &r in results {
+                        if func.is_unique_ptr(r) { called.push((r, false, b, pos)); }
                     }
                     let malloc = !mallocs.is_empty() && mallocs.contains(callee);
                     if (func.is_fresh_alloc(*callee) || malloc) && let Some(&res) = results.first() {
                         tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(None));
                         if malloc { called.push((res, true, b, pos)); }
                     }
+                    if has_tc && func.is_thread_cell(*callee) {
+                        if let Some(res) = func.caller_loc_result(&data.op, |v| zeros[v.index()]) {
+                            tracked[res.index()] = TrackRoot::Set(MemRoot::CallerLoc);
+                            has_caller_loc = true;
+                        } else {
+                            let c = consts.get_or_insert_with(|| func.const_values());
+                            if let Some((res, slot)) = func.thread_cell_slot(&data.op, |v| c[v.index()]) {
+                                tracked[res.index()] = TrackRoot::Set(MemRoot::ThreadCell(slot));
+                            }
+                        }
+                    }
+                }
+                (&Op::StackAddr(slot, _), Some(res)) if func.ty(res) == Type::I64 => {
+                    tracked[res.index()] = TrackRoot::Set(MemRoot::Slot(slot));
+                }
+                (&(Op::Symbol(sym) | Op::SlotAddr(sym)), Some(res)) if func.ty(res) == Type::I64 => {
+                    tracked[res.index()] = TrackRoot::Set(MemRoot::Global(sym));
+                }
+                (op, Some(res)) if func.ty(res) == Type::I64 => {
+                    if func.is_unique_ptr(res) {
+                        let owner = match *op { Op::Load(addr, _) => affine.get(addr.index()).map(|&(r, _)| r), _ => None };
+                        tracked[res.index()] = TrackRoot::Set(MemRoot::UniqueHeap(owner));
+                    } else if is_derived_i64(op, Type::I64) {
+                        tracked[res.index()] = step_track(op, Type::I64, &tracked);
+                    }
                 }
                 _ => {}
             }
-        }
-    }
-    if called.is_empty() { return; }
-    let mut freed_in_non_ret: Vec<Value> = Vec::new();
-    if !frees.is_empty() {
-        for &b in &cfg.rpo {
-            let insts = &func.blocks[b.index()].insts;
-            if insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Return(_))) { continue; }
-            for &inst in insts {
-                if let Op::Call { callee, args, .. } = &func.insts[inst.index()].op
-                    && frees.contains(callee) && let Some(&ptr) = args.first() && !freed_in_non_ret.contains(&ptr)
-                {
-                    freed_in_non_ret.push(ptr);
-                }
-            }
-        }
-    }
-    for &b in &cfg.rpo {
-        let insts = &func.blocks[b.index()].insts;
-        for (spos, &inst) in insts.iter().enumerate() {
-            if let Op::Store(value, addr, _) = func.insts[inst.index()].op
-                && let Some(&(_, is_m, cb, cpos)) = called.iter().find(|&&(v, ..)| v == value)
-                && let Some(&(owner, _)) = affine.get(addr.index())
-                && owner != value
-                && (entry.contains(&owner) || (is_m && !freed_in_non_ret.contains(&owner) && (func.is_frame_ptr(owner) || (cb == b && spos > cpos && !insts[cpos..spos].iter().any(|&i| crate::live::results(&func.insts[i.index()]).any(|r| r == owner))))))
-            { tracked[value.index()] = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner))); }
-        }
-    }
-}
-
-fn seed_thread_cells(func: &Function, cfg: &Cfg, tracked: &mut [TrackRoot]) -> bool {
-    let zeros = func.thread_cell_zeros();
-    if zeros.is_empty() {
-        return false;
-    }
-    let mut consts: Option<Vec<Option<i64>>> = None;
-    let mut found_caller = false;
-    for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
-            let data = &func.insts[inst.index()];
-            if !matches!(data.op, Op::Call { .. }) {
-                continue;
-            }
-            if let Some(res) = func.caller_loc_result(&data.op, |v| zeros[v.index()]) {
-                tracked[res.index()] = TrackRoot::Set(MemRoot::CallerLoc);
-                found_caller = true;
-            } else {
-                let consts = consts.get_or_insert_with(|| func.const_values());
-                if let Some((res, slot)) = func.thread_cell_slot(&data.op, |v| consts[v.index()]) {
-                    tracked[res.index()] = TrackRoot::Set(MemRoot::ThreadCell(slot));
-                }
-            }
-        }
-    }
-    found_caller
-}
-
-fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool {
-    let is_cl = |v: Value| tracked[v.index()] == TrackRoot::Set(MemRoot::CallerLoc);
-    for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
-            let op = &func.insts[inst.index()].op;
-            match *op {
-                Op::Load(addr, 0) if is_cl(addr) => {}
-                Op::Store(val, addr, 0) if is_cl(addr) && !is_cl(val) => {}
-                Op::Convert(Convert::Bitcast, _) | Op::Jump(..) | Op::Brif(..) => {}
-                _ => {
-                    let mut bad = false;
-                    op.for_operands(|v| bad |= is_cl(v));
-                    if bad {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> (Vec<TrackRoot>, bool) {
-    let mut tracked = vec![TrackRoot::Unset; func.types.len()];
-    seed_entry_roots(func, cfg, &mut tracked);
-    let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
-    seed_fresh_owners(func, cfg, entry, affine, &mut tracked);
-    let mut has_caller_loc = seed_thread_cells(func, cfg, &mut tracked);
-    let rank = (cfg.rpo.len() > 1).then(|| Cfg::ranks(&cfg.rpo, func.blocks.len()));
-    let mut need_fixpoint = false;
-    for &b in &cfg.rpo {
-        let br = rank.as_ref().map_or(0, |r| r[b.index()]);
-        let insts = &func.blocks[b.index()].insts;
-        for &inst in insts {
-            track_def(func, inst, &mut tracked, affine);
         }
         if let (Some(rank), Some(&last)) = (&rank, insts.last()) {
             match &func.insts[last.index()].op {
@@ -325,6 +276,9 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
                 _ => {}
             }
         }
+    }
+    if !called.is_empty() && escape::finish_fresh_owners(func, cfg, entry, affine, (&frees, &called), &mut tracked) {
+        need_fixpoint = true;
     }
     let mut changed = need_fixpoint;
     if changed {
@@ -360,8 +314,10 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
         tracked.fill(TrackRoot::Conflict);
         has_caller_loc = false;
     } else {
-        tracked.iter_mut().filter(|item| **item == TrackRoot::Unset).for_each(|item| *item = TrackRoot::Conflict);
-        if has_caller_loc && caller_loc_escaped(func, cfg, &tracked) {
+        if any_params {
+            tracked.iter_mut().filter(|item| **item == TrackRoot::Unset).for_each(|item| *item = TrackRoot::Conflict);
+        }
+        if has_caller_loc && escape::caller_loc_escaped(func, cfg, &tracked) {
             tracked.iter_mut().filter(|item| **item == TrackRoot::Set(MemRoot::CallerLoc)).for_each(|item| *item = TrackRoot::Conflict);
             has_caller_loc = false;
         }

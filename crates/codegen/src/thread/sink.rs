@@ -249,9 +249,23 @@ fn add_jump_block(func: &mut Function, target: Block, args: Vec<Value>) -> Block
 }
 
 fn split_cold_loop_exits(func: &mut Function) -> bool {
+    let orig_len = func.blocks.len();
+    let has_cand = {
+        let cfg = func.cfg();
+        !cfg.loops().list.is_empty()
+            && (0..orig_len).any(|bi| {
+                let block = Block(bi as u32);
+                let depth = cfg.loops().depth_of(block);
+                cfg.reachable[bi]
+                    && depth > 0
+                    && matches!(func.last(block), Some(Op::Brif(_, t_b, t_a, e_b, e_a)) if t_b != e_b && ((!t_a.is_empty() && cfg.loops().depth_of(*t_b) < depth) || (!e_a.is_empty() && cfg.loops().depth_of(*e_b) < depth)))
+            })
+    };
+    if !has_cand {
+        return false;
+    }
     let uses = func.use_counts();
     let cfg = func.cfg().clone();
-    let orig_len = func.blocks.len();
     let mut split_any = false;
     for bi in 0..orig_len {
         let block = Block(bi as u32);
