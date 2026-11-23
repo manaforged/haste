@@ -403,6 +403,9 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
     if plan.moves == promote::Moves::Guided {
         return;
     }
+    if plan.effort == Effort::Full && func.elide_dead_unwind_drops_post_init() {
+        rerun_after_rewrite(func, plan, state);
+    }
     if strip_assumes(func) {
         rerun_after_rewrite(func, plan, state);
     }

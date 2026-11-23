@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
 use crate::ir::{ArgumentPurpose, AtomicOrd, AtomicRmwOp, Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Value};
-use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, clobbers, may_alias};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, may_alias};
 use crate::merge::find as find_val;
 
 /// A place in the function: a block and a position in it.
@@ -345,4 +345,115 @@ pub(super) fn try_fold_private_rmw(
     kept.push(Some(func.add(Op::Store(c_new, addr, 0), None)));
     known.write(loc, ty, c_new, prov);
     Some((loc, ty, c_new))
+}
+
+fn slot_op_sealed(func: &Function, prov: &Provenance, inst: Inst, other: Inst, slot: StackSlot) -> bool {
+    if other == inst {
+        return true;
+    }
+    let data = &func.insts[other.index()];
+    let stays = |v: Value| data.result.is_some_and(|r| slot_of(prov, r) == Some(slot) && slot_of(prov, v) == Some(slot));
+    let mut ok = true;
+    data.op.for_operands(|v| {
+        if slot_of(prov, v) != Some(slot) {
+            return;
+        }
+        ok &= match &data.op {
+            Op::Load(..) | Op::Icmp(..) => true,
+            Op::Store(stored, ..) => *stored != v,
+            Op::Binary(Binary::Iadd | Binary::Isub, ..) | Op::Convert(Convert::Bitcast, _) => stays(v),
+            _ => false,
+        };
+    });
+    ok
+}
+
+fn slot_writes_covered(func: &Function, cfg: &Cfg, prov: &Provenance, (block, inst): (Block, Inst), slot: StackSlot, entries: &[(i64, Type, Value)]) -> bool {
+    let pred = cfg.single_pred(block);
+    let covered = |off: i64, size: u32| -> bool {
+        let Some(end) = off.checked_add(i64::from(size)) else { return false };
+        (off..end).all(|b| entries.iter().any(|&(eo, et, _)| eo <= b && eo.checked_add(i64::from(et.bytes())).is_some_and(|ee| b < ee)))
+    };
+    for (bi, bdata) in func.blocks.iter().enumerate() {
+        let cur = Block(bi as u32);
+        let in_cur = cur == block;
+        let allowed_block = in_cur || pred == Some(cur);
+        let mut past_inst = false;
+        for &other in &bdata.insts {
+            if !slot_op_sealed(func, prov, inst, other, slot) {
+                return false;
+            }
+            if in_cur && other == inst {
+                past_inst = true;
+                continue;
+            }
+            let op = &func.insts[other.index()].op;
+            let write = match *op {
+                Op::StackStore(v, s, off) if s == slot => Some((i64::from(off), func.ty(v).bytes())),
+                Op::Store(v, a, off) => {
+                    let l = prov.loc(a, i64::from(off), func.ty(v).bytes());
+                    (l.root == MemRoot::Slot(slot)).then_some((l.offset, l.size))
+                }
+                _ => None,
+            };
+            if let Some((off, size)) = write
+                && (!allowed_block || (in_cur && past_inst) || !covered(off, size))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Replaces a whole-slot `Move` into a fresh heap allocation with direct scalar stores for every initialized field of the slot, dropping copies of uninitialized padding.
+pub(super) fn try_scalarize_slot_move(
+    func: &mut Function,
+    (cfg, prov, block, inst): (&Cfg, &Provenance, Block, Inst),
+    (dst, src, bytes): (Value, Value, u32),
+    subst: &[Value],
+    known: &mut KnownLoads,
+) -> Option<Vec<(MemLoc, Inst)>> {
+    if bytes == 0 {
+        return None;
+    }
+    let dst = find_val(subst, dst);
+    let src = find_val(subst, src);
+    let src_loc = prov.loc(src, 0, bytes);
+    let dst_loc = prov.loc(dst, 0, bytes);
+    let MemRoot::Slot(slot) = src_loc.root else { return None };
+    if src_loc.offset != 0
+        || func.slots[slot.index()].size != bytes
+        || !matches!(dst_loc.root, MemRoot::UniqueHeap(_))
+        || may_alias(dst_loc, src_loc, prov)
+    {
+        return None;
+    }
+    let mut entries: Vec<(i64, Type, Value)> = known
+        .entries_for(MemBase::Slot(slot))
+        .iter()
+        .copied()
+        .filter(|&(off, ty, _)| off >= 0 && off.checked_add(i64::from(ty.bytes())).is_some_and(|e| e <= i64::from(bytes)))
+        .collect();
+    let move_ops = 2 * crate::copy::vec_words(bytes).len();
+    if entries.is_empty() || entries.len() > 8 || entries.len() >= move_ops {
+        return None;
+    }
+    entries.sort_by_key(|&(off, ..)| off);
+    if entries.iter().any(|&(off, ty, _)| i32::try_from(off).is_err() || !super::fits_mem_imm(ty, off)) {
+        return None;
+    }
+    if !slot_writes_covered(func, cfg, prov, (block, inst), slot, &entries) {
+        return None;
+    }
+    func.insts[inst.index()].op = Op::Trap;
+    let mut emitted = Vec::with_capacity(entries.len());
+    for (off, ty, raw_val) in entries {
+        let val = find_val(subst, raw_val);
+        let store = func.add(Op::Store(val, dst, off as i32), None);
+        let wloc = prov.loc(dst, off, ty.bytes());
+        known.write(wloc, ty, val, prov);
+        emitted.push((wloc, store));
+    }
+    Some(emitted)
 }

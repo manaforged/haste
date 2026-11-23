@@ -466,9 +466,28 @@ fn scan(
                 if let Some((wloc, ..)) = elide::try_fold_private_rmw(func, (join.cfg, state.prov, block, inst), (state.consts, state.subst), (known, &mut bufs.kept)) {
                     clobbers_seen.push(BlockClobber::Loc(wloc));
                     record_base(bases, wloc);
-                    if state.post_inline { slices.prune_on_write(func, state.prov, wloc); }
+                    if state.post_inline {
+                        slices.prune_on_write(func, state.prov, wloc);
+                        drop_covered_stores(func, &mut bufs, &mut guard, (wloc, true));
+                    }
                     bufs.pending_stores.retain(|&(ploc, _)| !may_alias(wloc, ploc, state.prov));
                     bufs.const_stores.retain(|cs| !may_alias(wloc, cs.loc, state.prov));
+                    changed = true;
+                    guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
+                    continue;
+                }
+                if state.post_inline
+                    && let Some(op) = copy_len(&func.insts[inst.index()].op, state.consts)
+                    && let Some(stores) = elide::try_scalarize_slot_move(func, (join.cfg, state.prov, block, inst), op, state.subst, known)
+                {
+                    for (wloc, store) in stores {
+                        clobbers_seen.push(BlockClobber::Loc(wloc));
+                        record_base(bases, wloc);
+                        slices.prune_on_write(func, state.prov, wloc);
+                        bufs.const_stores.retain(|cs| !may_alias(wloc, cs.loc, state.prov));
+                        bufs.pending_stores.push((wloc, bufs.kept.len()));
+                        bufs.kept.push(Some(store));
+                    }
                     changed = true;
                     guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
                     continue;
@@ -653,11 +672,8 @@ fn eliminate_affine_block_params(func: &mut Function) -> (bool, Option<Vec<(Valu
 
 fn fits_mem_imm(ty: Type, off: i64) -> bool {
     let fits_one = |align: i64, o: i64| (-256..=255).contains(&o) || (o >= 0 && o % align == 0 && o <= align * 4095);
-    if ty == Type::I128 {
-        return off.checked_add(8).is_some_and(|hi| fits_one(8, off) && fits_one(8, hi));
-    }
-    let align = i64::from(ty.bytes().max(1));
-    fits_one(align, off)
+    if ty == Type::I128 { return off.checked_add(8).is_some_and(|hi| fits_one(8, off) && fits_one(8, hi)); }
+    fits_one(i64::from(ty.bytes().max(1)), off)
 }
 
 fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affine: &[(Value, i64)]) -> bool {
@@ -750,8 +766,7 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
     let mut state = State { prov: &prov, defs: &defs, selects: &selects, consts: &mut consts, subst: &mut subst, target, post_inline };
-    let (mut renamed, mut scan_changed) = (false, false);
-    let mut def_blocks = func.def_blocks();
+    let (mut renamed, mut scan_changed, mut def_blocks) = (false, false, func.def_blocks());
     let (mut visited, mut added_phis) = (vec![false; func.blocks.len()], vec![0u8; func.blocks.len()]);
     let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
     let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = vec![Vec::new(); func.blocks.len()];
@@ -759,19 +774,15 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         let (mut known, mut bases) = bw.entry_known(func, state.subst, &known_out, &block_bases, block);
         let preds = eligible_join_preds(func, &cfg, &visited, block);
         let mut join = JoinCtx { cfg: &cfg, bw: &bw, known_out: &known_out, block_bases: &block_bases, visited: &visited, def_blocks: &mut def_blocks, preds, added_phis: &mut added_phis };
-        let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known, &mut bases, &mut join);
+        let (bc, br) = scan(func, block, &mut state, &mut known, &mut bases, &mut join);
         def_blocks.resize(func.types.len(), Some(block));
         visited[block.index()] = true;
-        scan_changed |= block_changed;
-        changed |= block_changed;
-        renamed |= block_renamed;
-        known_out[block.index()] = known;
-        block_bases[block.index()] = bases;
+        (scan_changed, changed, renamed) = (scan_changed | bc, changed | bc, renamed | br);
+        (known_out[block.index()], block_bases[block.index()]) = (known, bases);
     }
     if renamed { rename(func, state.subst); }
     if scan_changed { changed |= pack::coalesce_vec_rescan(func, &cfg, target); }
-    changed |= remat::split_long_loads(func, &prov);
-    changed |= sink::sink_loads(func, &prov);
+    changed |= remat::split_long_loads(func, &prov) | sink::sink_loads(func, &prov);
     if post_inline {
         if elide::elide_moves(func, &prov) {
             changed = true;
