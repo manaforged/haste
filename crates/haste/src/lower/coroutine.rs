@@ -199,16 +199,15 @@ impl Lower<'_, '_> {
         self.b.switch_to_block(block);
         self.open = true;
         let context = self.take_call(&params)?;
-        let dropped = self.ins().icmp_imm(IntCC::Equal, context, 0);
-        let (dropping, again) = (self.b.create_block(), self.b.create_block());
-        self.brif(dropped, (dropping, &[]), (again, &[]));
+        let running = self.ins().icmp_imm(IntCC::NotEqual, context, 0);
+        let (again, dropping) = (self.b.create_block(), self.b.create_block());
+        self.brif(running, (again, &[]), (dropping, &[]));
+        self.enter(again);
+        self.jump(head, &[]);
         self.enter(dropping);
         self.retire()?;
         let pending = self.poll_value("Pending", None)?;
         self.return_poll(pending, true)?;
-        self.enter(again);
-        self.jump(head, &[]);
-        self.close();
         Ok(())
     }
 

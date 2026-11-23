@@ -1,6 +1,6 @@
 use crate::cfg::Loops;
 use crate::fold::fits_imm32;
-use crate::ir::{Binary, Function, Op, Type, Value};
+use crate::ir::{Binary, Function, IntCC, Op, Type, Value};
 
 use super::{Location, Uses};
 
@@ -38,14 +38,37 @@ fn x64_alu_imm(ty: Type, imm: i64) -> bool {
     ty == Type::I32 || fits_imm32(imm)
 }
 
-fn x64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
+fn x64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64, flag_only_band: bool) -> bool {
     match op {
         Op::Icmp(..) => ty != Type::I64 || fits_imm32(imm),
-        Op::Binary(Binary::Iadd | Binary::Bor | Binary::Bxor, ..) => x64_alu_imm(ty, imm),
-        Op::Binary(Binary::Band, ..) => x64_alu_imm(ty, imm) || (rhs && imm == 0xFFFF_FFFF),
+        Op::Binary(Binary::Iadd, ..) => x64_alu_imm(ty, imm),
+        Op::Binary(Binary::Bor | Binary::Bxor, ..) => x64_alu_imm(ty, imm) || (ty == Type::I64 && (imm as u64).is_power_of_two()),
+        Op::Binary(Binary::Band, ..) => {
+            x64_alu_imm(ty, imm)
+                || (rhs && imm == 0xFFFF_FFFF)
+                || (ty == Type::I64 && ((!(imm as u64)).is_power_of_two() || (flag_only_band && (imm as u64).is_power_of_two())))
+        }
         Op::Binary(Binary::Isub, ..) => rhs && x64_alu_imm(ty, imm),
         _ => false,
     }
+}
+
+fn flag_only_bands<R>(func: &Function, census: &Uses, locations: &[Location<R>]) -> Vec<bool> {
+    let mut flag = vec![false; func.types.len()];
+    let is_zero = |v: Value| matches!(locations[v.index()], Location::Imm(0));
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            match func.insts[inst.index()].op {
+                Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) if census.uses[c.index()] == 1 => flag[c.index()] = true,
+                Op::Icmp(IntCC::Equal | IntCC::NotEqual, a, b) => {
+                    if is_zero(b) && census.uses[a.index()] == 1 { flag[a.index()] = true; }
+                    if is_zero(a) && census.uses[b.index()] == 1 { flag[b.index()] = true; }
+                }
+                _ => {}
+            }
+        }
+    }
+    flag
 }
 
 fn arm64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
@@ -102,7 +125,7 @@ fn scan_const_op<R>(
     func: &Function,
     op: &Op,
     locations: &[Location<R>],
-    (two_address, in_loop, outer): (bool, bool, &dyn Fn(Value) -> bool),
+    (two_address, in_loop, flag_only_band, outer): (bool, bool, bool, &dyn Fn(Value) -> bool),
     (must_stay_imm, loop_mat): (&mut [bool], &mut [u32]),
 ) {
     match *op {
@@ -132,7 +155,7 @@ fn scan_const_op<R>(
             let ty = func.ty(x);
             for (rhs, v) in [(false, x), (true, y)] {
                 let Location::Imm(imm) = locations[v.index()] else { continue };
-                let inline = if two_address { x64_inline_imm(op, ty, rhs, imm) } else { arm64_inline_imm(op, ty, rhs, imm) };
+                let inline = if two_address { x64_inline_imm(op, ty, rhs, imm, flag_only_band) } else { arm64_inline_imm(op, ty, rhs, imm) };
                 if inline { must_stay_imm[v.index()] = true; } else if outer(v) { loop_mat[v.index()] += 1; }
             }
         }
@@ -150,13 +173,15 @@ pub(super) fn promote_loop_consts<R>(func: &Function, census: &Uses, loops: &Loo
     let count = func.types.len();
     let (mut must_stay_imm, mut loop_mat) = (vec![false; count], vec![0_u32; count]);
     let depths = &loops.depths;
+    let flag_bands = two_address.then(|| flag_only_bands(func, census, locations));
     for (b, block) in func.blocks.iter().enumerate() {
         let depth = depths[b];
         let outer = |v: Value| census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth);
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
             if data.result.is_some_and(|r| elided[r.index()]) && !matches!(data.op, Op::Binary(Binary::Imul, ..)) { continue; }
-            scan_const_op(func, &data.op, locations, (two_address, depth > 0, &outer), (&mut must_stay_imm, &mut loop_mat));
+            let flag_band = flag_bands.as_ref().is_some_and(|fb| data.result.is_some_and(|r| fb[r.index()]));
+            scan_const_op(func, &data.op, locations, (two_address, depth > 0, flag_band, &outer), (&mut must_stay_imm, &mut loop_mat));
             data.op.for_operands(|v| {
                 let vi = v.index();
                 if let Location::Imm(imm) = locations[vi]

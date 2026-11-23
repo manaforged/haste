@@ -16,6 +16,7 @@ pub(crate) enum MemRoot {
     ReadonlyParam(u16),
     Global(u32),
     UniqueHeap(Option<Value>),
+    ThreadCell(u32),
     CallerLoc,
     Unknown,
 }
@@ -219,19 +220,27 @@ fn seed_fresh_owners(func: &Function, entry: &[Value], affine: &[(Value, i64)], 
     }
 }
 
-fn seed_caller_locs(func: &Function, tracked: &mut [TrackRoot]) -> bool {
+fn seed_thread_cells(func: &Function, tracked: &mut [TrackRoot]) -> bool {
     let zeros = func.thread_cell_zeros();
     if zeros.is_empty() {
         return false;
     }
-    let mut found = false;
+    let mut consts = vec![None; func.types.len()];
+    for inst in &func.insts {
+        if let (Op::Const(imm), Some(res)) = (&inst.op, inst.result) {
+            consts[res.index()] = Some(*imm);
+        }
+    }
+    let mut found_caller = false;
     for data in &func.insts {
         if let Some(res) = func.caller_loc_result(&data.op, |v| zeros[v.index()]) {
             tracked[res.index()] = TrackRoot::Set(MemRoot::CallerLoc);
-            found = true;
+            found_caller = true;
+        } else if let Some((res, slot)) = func.thread_cell_slot(&data.op, |v| consts[v.index()]) {
+            tracked[res.index()] = TrackRoot::Set(MemRoot::ThreadCell(slot));
         }
     }
-    found
+    found_caller
 }
 
 fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool {
@@ -261,7 +270,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
     seed_entry_roots(func, cfg, &mut tracked);
     let entry = cfg.entry.map_or(&[][..], |block| func.blocks[block.index()].params.as_slice());
     seed_fresh_owners(func, entry, affine, &mut tracked);
-    let has_caller_loc = seed_caller_locs(func, &mut tracked);
+    let has_caller_loc = seed_thread_cells(func, &mut tracked);
     let mut steps = Vec::new();
     let mut changed = false;
     for &b in &cfg.rpo {
@@ -535,6 +544,9 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
     match (a.root, b.root) {
         (MemRoot::CallerLoc, MemRoot::CallerLoc) => a.overlaps(b),
         (MemRoot::CallerLoc, _) | (_, MemRoot::CallerLoc) => false,
+        (MemRoot::ThreadCell(ta), MemRoot::ThreadCell(tb)) => ta == tb,
+        (MemRoot::ThreadCell(_), MemRoot::Slot(_) | MemRoot::Global(_) | MemRoot::UniqueHeap(_))
+        | (MemRoot::Slot(_) | MemRoot::Global(_) | MemRoot::UniqueHeap(_), MemRoot::ThreadCell(_)) => false,
         (MemRoot::Slot(sa), MemRoot::Slot(sb)) => sa == sb,
         (MemRoot::NoAliasParam(pa), MemRoot::NoAliasParam(pb)) => pa == pb,
         (MemRoot::Global(ga), MemRoot::Global(gb)) => ga == gb,

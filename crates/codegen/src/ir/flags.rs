@@ -65,6 +65,17 @@ impl Function {
         }
     }
 
+    /// Result value and constant slot index of `op` when it is a `ThreadCell` lookup.
+    pub(crate) fn thread_cell_slot(&self, op: &super::Op, const_val: impl Fn(Value) -> Option<i64>) -> Option<(Value, u32)> {
+        match op {
+            super::Op::Call { callee, args, results, .. } if self.is_thread_cell(*callee) => {
+                let slot = args.first().and_then(|&v| const_val(v)).and_then(|k| u32::try_from(k).ok())?;
+                Some((*results.first()?, slot))
+            }
+            _ => None,
+        }
+    }
+
     /// Result value of `op` when it looks up the internal `#[track_caller]` cell (`slot == 0`, `init == 0`).
     pub(crate) fn caller_loc_result(&self, op: &super::Op, is_zero: impl Fn(Value) -> bool) -> Option<Value> {
         match op {
