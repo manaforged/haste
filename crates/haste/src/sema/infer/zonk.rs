@@ -593,11 +593,31 @@ impl Infer<'_, '_> {
             other => Ok(other),
         }
     }
+    pub(super) fn init_poly_for_item(&mut self, item: ItemRef, param_count: u16) -> Result<()> {
+        let args: Vec<Ty> = (0..param_count).map(|idx| self.cx.types.intern(Kind::Param(idx))).collect();
+        let substs = self.cx.types.intern_substs(&args);
+        let root = Some(item.body_owner());
+        (self.root, self.instance) = (root, Some((item, substs)));
+        self.poly = Some(Box::new(super::poly::PolyState::default()));
+        let mut frame = self.frame(item, &args)?;
+        (frame.src, frame.root) = (self.cx.body_src(item), root);
+        self.swap_frame(frame);
+        self.init_poly_env(item)
+    }
 }
 
 /// Whether `ty` implements `Copy` in the context of `item`.
 pub fn is_copy(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<bool> {
-    detached(cx, item, |infer| infer.is_copy(ty))
+    detached(cx, item, |infer| {
+        if infer.cx.types.has_params(ty)
+            && let Some(count) = super::super::summary::expected_param_count(infer.cx, item)
+            && count > 0
+            && count <= u16::MAX as usize
+        {
+            let _ = infer.init_poly_for_item(item, count as u16);
+        }
+        infer.is_copy(ty)
+    })
 }
 
 /// Whether `item` is a non-generic synchronous `fn(i64) -> i64` suitable as a JIT test case.
@@ -631,8 +651,8 @@ pub fn test_sig(cx: &mut Context<'_>, item: ItemRef) -> Option<bool> {
     .flatten()
 }
 
-/// Whether `item` is a non-generic free function suitable as a root for library `haste build`.
+/// Whether `item` is a non-generic function suitable as a root for `haste build`.
 pub fn is_concrete_fn(cx: &mut Context<'_>, item: ItemRef) -> bool {
     let Ok(sig) = cx.signature(item) else { return false };
-    sig.receiver.is_none() && !sig.variadic && !sig.opaque && scope::type_params(&sig.generics).next().is_none()
+    !sig.variadic && super::super::summary::expected_param_count(cx, item) == Some(0)
 }

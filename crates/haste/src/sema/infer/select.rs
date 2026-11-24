@@ -112,7 +112,7 @@ impl<'a> Infer<'_, 'a> {
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
         let query = self.query(of, self_ty, args);
-        if self.selecting.contains(&query) {
+        if self.selecting.len() > crate::RECURSION_LIMIT || self.selecting.contains(&query) {
             self.cycle_hits += 1;
             return Ok(None);
         }
@@ -138,12 +138,15 @@ impl<'a> Infer<'_, 'a> {
 
     pub(super) fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
         let self_ty = self.resolve(self_ty);
-        if depth as usize > crate::RECURSION_LIMIT || (matches!(self.cx.types.kind(self_ty), Kind::Var(_)) && !self.is_pending_opaque(self_ty)) {
+        if depth as usize + self.selecting.len() > crate::RECURSION_LIMIT
+            || (matches!(self.cx.types.kind(self_ty), Kind::Var(_)) && !self.is_pending_opaque(self_ty))
+        {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;
         let open = found.len() > 1 && self.obligation_open(self_ty, args);
-        let non_sysroot = |b: ImplRef| !self.cx.outline.is_sysroot(match b { ImplRef::Module { krate, .. } => krate, ImplRef::Body(i) => i.krate });
+        let outline = self.cx.outline;
+        let non_sysroot = |b: ImplRef| !outline.is_sysroot(match b { ImplRef::Module { krate, .. } => krate, ImplRef::Body(i) => i.krate });
         if found.len() > 1 && !open {
             let mut kept = Vec::new();
             for entry in &found {
@@ -509,7 +512,7 @@ impl<'a> Infer<'_, 'a> {
     /// Whether an impl proves `ty: of<args>` for the bound at `path`, where an obligation that repeats an enclosing one is a cycle.
     fn impl_holds(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
         let query = self.query(of, ty, args);
-        if self.selecting.contains(&query) {
+        if self.selecting.len() > crate::RECURSION_LIMIT || self.selecting.contains(&query) {
             self.cycle_hits += 1;
             return Ok(self.obligation_open(ty, args));
         }

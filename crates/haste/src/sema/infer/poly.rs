@@ -52,17 +52,9 @@ pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, p
     if sig.is_async || (param_count == 0 && sig.body.tys.iter().any(|ty| matches!(ty, crate::body::Ty::ImplTrait(..)))) {
         return SummaryKind::MonomorphicFallback;
     }
-    let args: Vec<Ty> = (0..param_count).map(|idx| cx.types.intern(Kind::Param(idx))).collect();
-    let substs = cx.types.intern_substs(&args);
     let src = cx.body_src(item);
-    let root = Some(item.body_owner());
     let mut infer = Infer::start(cx, (&body, &sig, src), home);
-    (infer.root, infer.instance) = (root, Some((item, substs)));
-    infer.poly = Some(Box::new(PolyState::default()));
-    let Ok(mut frame) = infer.frame(item, &args) else { return SummaryKind::MonomorphicFallback };
-    (frame.src, frame.root) = (src, root);
-    infer.swap_frame(frame);
-    if infer.init_poly_env(item).is_err() {
+    if infer.init_poly_for_item(item, param_count).is_err() {
         return SummaryKind::MonomorphicFallback;
     }
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
@@ -73,6 +65,14 @@ pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, p
     let Ok((mut typed, poly, clean)) = infer.finish_poly() else { return fallback_kind(pre_hints) };
     if cx.quiet_mark() != before || (!typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err()) {
         return fallback_kind(poly.map(|poly| poly.method_traits).unwrap_or(pre_hints));
+    }
+    if !cx.outline.is_fixed(item.krate)
+        && clean
+        && poly.as_ref().is_some_and(|p| p.phase != PolyPhase::Fallback)
+        && matches!(typed.shape, super::Shape::Body)
+        && let Err(err) = super::super::borrow::check(cx, item, (&body, &sig), src, &typed)
+    {
+        return SummaryKind::BorrowError(format!("{}: {err:#}", cx.name(item)));
     }
     finalize_summary(cx, typed, poly, clean, param_count)
 }

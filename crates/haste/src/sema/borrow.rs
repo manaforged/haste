@@ -90,11 +90,30 @@ struct Checker<'c, 'a> {
     drop_locals: HashSet<u32>,
 }
 
-/// Whether `ty` is `Copy` in `item`; defaults conservatively to `false` when classification fails on a real type.
-pub(super) fn is_copy_ty(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
-    ty == Ty::NONE
-        || matches!(cx.types.kind(ty), Kind::Ref(Mut::Not, _))
-        || super::infer::is_copy(cx, item, ty).unwrap_or(false)
+/// Whether `ty` is `Copy` in `item`, resolving closures declared inside `typed` directly and defaulting conservatively to `false`.
+pub(super) fn is_copy_ty(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, ty: Ty) -> bool {
+    if ty == Ty::NONE {
+        return true;
+    }
+    match cx.types.kind(ty).clone() {
+        Kind::Ref(Mut::Not, _) => true,
+        Kind::Ref(Mut::Mut, _) | Kind::Slice(_) | Kind::Dyn(..) | Kind::Prim(crate::names::Primitive::Str) => false,
+        Kind::Tuple(items) => cx.types.substs(items).to_vec().into_iter().all(|t| is_copy_ty(cx, item, typed, t)),
+        Kind::Array(inner, _) => is_copy_ty(cx, item, typed, inner),
+        Kind::Closure(parent, _, at) if parent == item => typed.closures.get(&ExprId(at)).is_some_and(|c| {
+            !c.coroutine
+                && c.captures.iter().all(|cap| match cap.by {
+                    super::infer::By::Ref => true,
+                    super::infer::By::Mut => false,
+                    super::infer::By::Value => {
+                        let local_ty = typed.locals[cap.local as usize].ty;
+                        let cap_ty = cap.ty(cx, local_ty).unwrap_or(local_ty);
+                        is_copy_ty(cx, item, typed, cap_ty)
+                    }
+                })
+        }),
+        _ => super::infer::is_copy(cx, item, ty).unwrap_or(false),
+    }
 }
 
 /// Checks ownership, mutability, borrow aliasing, and dangling local reference escapes on `body`.
@@ -109,7 +128,7 @@ pub(super) fn check(
     let n = typed.locals.len();
     let mut is_copy = vec![false; n];
     for (idx, local) in typed.locals.iter().enumerate() {
-        is_copy[idx] = is_copy_ty(cx, item, local.ty);
+        is_copy[idx] = is_copy_ty(cx, item, typed, local.ty);
     }
     let mut mutable = vec![false; n];
     let mut is_param = vec![false; n];

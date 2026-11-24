@@ -132,22 +132,36 @@ impl Checker<'_, '_> {
                             };
                             if is_callable && let Some(Args::Paren { inputs, output }) = seg.args {
                                 let out_elided = output.is_some_and(|out_ty| ast_ty_may_carry_elided_lt(&sig.body, src, out_ty));
+                                let mut out_lts = Lifetimes::default();
+                                if let Some(out_ty) = output {
+                                    collect_ty_lifetimes(&sig.body, src, out_ty, &mut out_lts);
+                                }
                                 for (p_idx, &in_ty) in sig.body.list(inputs).iter().enumerate() {
                                     let mut in_lts = Lifetimes::default();
                                     collect_ty_lifetimes(&sig.body, src, TyId(in_ty), &mut in_lts);
                                     let outer_elided = matches!(*sig.body.ty(TyId(in_ty)), AstTy::Ref { lifetime: None, .. });
+                                    let outer_named_hrtb = match *sig.body.ty(TyId(in_ty)) {
+                                        AstTy::Ref { lifetime: Some(lt), .. } => {
+                                            let name = src.text(lt);
+                                            (name != "'static" && !sig.generics.iter().any(|g| g.kind == GenericKind::Lifetime && src.text(g.name) == name)).then_some(name)
+                                        }
+                                        _ => None,
+                                    };
                                     let has_caller_lt = in_lts.saw_static
                                         || in_lts.named.iter().any(|&lt| {
                                             sig.generics.iter().any(|g| g.kind == GenericKind::Lifetime && src.text(g.name) == lt)
                                         });
+                                    let outer_hrtb = outer_elided || outer_named_hrtb.is_some();
                                     if has_caller_lt && !out.caller_lt_params.iter().any(|&(idx, _)| idx == p_idx) {
-                                        out.caller_lt_params.push((p_idx, outer_elided));
+                                        out.caller_lt_params.push((p_idx, outer_hrtb));
                                     }
-                                    if outer_elided && in_lts.named.is_empty() {
+                                    let is_hrtb = (outer_elided && in_lts.named.is_empty()) || outer_named_hrtb.is_some();
+                                    if is_hrtb {
                                         if !out.hrtb_params.contains(&p_idx) {
                                             out.hrtb_params.push(p_idx);
                                         }
-                                        if !out_elided && !out.hrtb_non_ret.contains(&p_idx) {
+                                        let ret_uses_hrtb = outer_named_hrtb.map_or(out_elided, |name| out_lts.named.contains(&name));
+                                        if !ret_uses_hrtb && !out.hrtb_non_ret.contains(&p_idx) {
                                             out.hrtb_non_ret.push(p_idx);
                                         }
                                     }

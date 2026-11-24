@@ -27,6 +27,7 @@ pub enum SummaryKind {
     Poly(Arc<PolySummary>),
     MonomorphicHints(Arc<HashMap<ExprId, ItemRef>>),
     MonomorphicFallback,
+    BorrowError(String),
 }
 
 /// Pre-extracted operand types for deciding whether an overloaded operator simplifies to a builtin.
@@ -116,6 +117,7 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     );
     let summary = match built {
         Ok(SummaryKind::Poly(summary)) => summary,
+        Ok(SummaryKind::BorrowError(err)) => return Some(Err(err)),
         Ok(SummaryKind::MonomorphicHints(hints)) => {
             let m_before = cx.quiet_mark();
             let typed = match super::infer::infer_with_hints(cx, instance.0, instance.1, Some(hints)) {
@@ -137,7 +139,7 @@ fn cached_poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySu
     if let Some(kind) = cx.store.lookups.summaries.get_ready(&item) {
         return match kind {
             SummaryKind::Poly(summary) => Some(summary),
-            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback => None,
+            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback | SummaryKind::BorrowError(_) => None,
         };
     }
     frozen::frozen_summary(cx, item)
@@ -188,7 +190,25 @@ fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
     true
 }
 
-fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
+/// Checks a generic local function body polymorphically when possible, returning any borrow or unsafe error.
+pub fn check_poly_item(cx: &mut Context<'_>, item: ItemRef) -> Result<(), String> {
+    let (_, entry) = cx.item(item);
+    if !has_summary_body(entry) || cx.foreign(item) || cx.outline.is_fixed(item.krate) {
+        return Ok(());
+    }
+    let Some(expected) = expected_param_count(cx, item) else { return Ok(()) };
+    if expected == 0 || expected > u16::MAX as usize {
+        return Ok(());
+    }
+    let summaries = cx.store.lookups.summaries.clone();
+    let built = summaries.run(cx, item, |cx| Ok(load_summary(cx, item, expected as u16)), |_| Ok(SummaryKind::MonomorphicFallback));
+    match built {
+        Ok(SummaryKind::BorrowError(err)) => Err(err),
+        _ => Ok(()),
+    }
+}
+
+pub(super) fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
     let sig = cx.signature(item).ok()?;
     let own = super::infer::type_params(&sig.generics).count();
     if let Some(block) = cx.owner_impl(item) {

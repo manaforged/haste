@@ -577,6 +577,17 @@ impl Infer<'_, '_> {
 
     /// Whether each associated type that the bound path `path` binds, as in `Iterator<Item = X>`, is its type for `ty` under trait `of` at `args`; unifies the two.
     pub(super) fn assoc_bounds_hold(&mut self, (arena, home, path): (&Body, crate::names::ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
+        let key = (of, self.resolve(ty), path);
+        if self.assoc_stack.len() >= 16 || self.assoc_stack.contains(&key) {
+            return Ok(false);
+        }
+        self.assoc_stack.push(key);
+        let res = self.assoc_bounds_hold_inner((arena, home, path), (of, ty, args), depth);
+        self.assoc_stack.pop();
+        res
+    }
+
+    fn assoc_bounds_hold_inner(&mut self, (arena, home, path): (&Body, crate::names::ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
         if !self.bindings_hold(arena, path, (of, ty, args))? {
             return Ok(false);
         }
