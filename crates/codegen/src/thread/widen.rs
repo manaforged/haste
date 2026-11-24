@@ -39,8 +39,14 @@ enum EdgePlan {
 
 /// Widens narrow `I8` and `I16` loop and block parameters to `I32` or `I64` when their upper bits are provably zero or cheaply preserved, eliminating repeated `Uextend` operations inside loops.
 pub(super) fn run(func: &mut Function) -> bool {
-    let Some(entry) = func.entry else { return false };
-    if !func.blocks.iter().any(|block| block.params.iter().any(|&param| is_narrow(func.ty(param)))) {
+    let Some(entry) = func.entry else {
+        return false;
+    };
+    if !func
+        .blocks
+        .iter()
+        .any(|block| block.params.iter().any(|&param| is_narrow(func.ty(param))))
+    {
         return false;
     }
     let cfg = func.cfg();
@@ -48,7 +54,9 @@ pub(super) fn run(func: &mut Function) -> bool {
     blocked[entry.index()] = true;
     for data in &func.insts {
         match &data.op {
-            Op::TryCall { normal, handler, .. } => {
+            Op::TryCall {
+                normal, handler, ..
+            } => {
                 blocked[normal.index()] = true;
                 blocked[handler.index()] = true;
             }
@@ -75,7 +83,11 @@ pub(super) fn run(func: &mut Function) -> bool {
     propagate_wide_ty(&mut cands, &val_to_cand);
     prune_candidates(func, &defs, &consts, &mut cands, &val_to_cand);
 
-    let kept: Vec<usize> = cands.iter().enumerate().filter_map(|(i, c)| c.active.then_some(i)).collect();
+    let kept: Vec<usize> = cands
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.active.then_some(i))
+        .collect();
     if kept.is_empty() {
         return false;
     }
@@ -93,7 +105,8 @@ fn fold_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
         for &inst in &func.blocks[b.index()].insts {
             let data = &func.insts[inst.index()];
             if let Some(res) = data.result {
-                consts[res.index()] = evaluate_wrapped(func, &data.op, func.ty(res), &|v| consts[v.index()]);
+                consts[res.index()] =
+                    evaluate_wrapped(func, &data.op, func.ty(res), &|v| consts[v.index()]);
             }
         }
     }
@@ -121,7 +134,11 @@ fn collect_candidates(func: &Function, cfg: &Cfg, blocked: &[bool]) -> Vec<Candi
     }
 
     let mut cands = Vec::new();
-    let mut slot_to_cand: Vec<Vec<Option<usize>>> = func.blocks.iter().map(|b| vec![None; b.params.len()]).collect();
+    let mut slot_to_cand: Vec<Vec<Option<usize>>> = func
+        .blocks
+        .iter()
+        .map(|b| vec![None; b.params.len()])
+        .collect();
     for (b_idx, block) in func.blocks.iter().enumerate() {
         if blocked[b_idx] || !cfg.reachable[b_idx] {
             continue;
@@ -131,7 +148,11 @@ fn collect_candidates(func: &Function, cfg: &Cfg, blocked: &[bool]) -> Vec<Candi
             if !is_narrow(ty) || uext_counts[param.index()] == 0 || bad_use[param.index()] {
                 continue;
             }
-            let wide_ty = if uext_has_64[param.index()] { Type::I64 } else { Type::I32 };
+            let wide_ty = if uext_has_64[param.index()] {
+                Type::I64
+            } else {
+                Type::I32
+            };
             slot_to_cand[b_idx][p_idx] = Some(cands.len());
             cands.push(Candidate {
                 block: b_idx,
@@ -150,7 +171,9 @@ fn collect_candidates(func: &Function, cfg: &Cfg, blocked: &[bool]) -> Vec<Candi
         if !cfg.reachable[pred] {
             continue;
         }
-        let Some(&term) = block.insts.last() else { continue };
+        let Some(&term) = block.insts.last() else {
+            continue;
+        };
         let pred_block = Block(pred as u32);
         let mut push_edge = |target: Block, args: &[Value], arm: EdgeArm| {
             let t_idx = target.index();
@@ -160,7 +183,13 @@ fn collect_candidates(func: &Function, cfg: &Cfg, blocked: &[bool]) -> Vec<Candi
             let in_loop = cfg.dominates(target, pred_block);
             for (p_idx, &arg) in args.iter().enumerate() {
                 if let Some(c_idx) = slot_to_cand[t_idx][p_idx] {
-                    cands[c_idx].edges.push(EdgeSite { pred, term, arm, arg, in_loop });
+                    cands[c_idx].edges.push(EdgeSite {
+                        pred,
+                        term,
+                        arm,
+                        arg,
+                        in_loop,
+                    });
                 }
             }
         };
@@ -230,8 +259,25 @@ fn upper_bits_zero(
         && let Some(inst) = defs[v.index()]
         && let Op::Select(_, a, b) = func.insts[inst.index()].op
     {
-        return upper_bits_zero(func, defs, consts, cands, val_to_cand, narrow_mask, a, depth + 1)
-            && upper_bits_zero(func, defs, consts, cands, val_to_cand, narrow_mask, b, depth + 1);
+        return upper_bits_zero(
+            func,
+            defs,
+            consts,
+            cands,
+            val_to_cand,
+            narrow_mask,
+            a,
+            depth + 1,
+        ) && upper_bits_zero(
+            func,
+            defs,
+            consts,
+            cands,
+            val_to_cand,
+            narrow_mask,
+            b,
+            depth + 1,
+        );
     }
     let (zeros, _) = known_bits(func, &|u| defs[u.index()], &|u| consts[u.index()], v, depth);
     ((zeros | narrow_mask) & ty.unsigned_max()) == ty.unsigned_max()
@@ -281,7 +327,9 @@ fn can_widen_icmp(
     cand: &Candidate,
     inst: Inst,
 ) -> bool {
-    let Op::Icmp(cc, lhs, rhs) = func.insts[inst.index()].op else { return false };
+    let Op::Icmp(cc, lhs, rhs) = func.insts[inst.index()].op else {
+        return false;
+    };
     if cc.is_signed() {
         return false;
     }
@@ -297,7 +345,8 @@ fn can_widen_icmp(
     if consts[other.index()].is_some() {
         return true;
     }
-    val_to_cand[other.index()].is_some_and(|idx| cands[idx].active && cands[idx].wide_ty == cand.wide_ty)
+    val_to_cand[other.index()]
+        .is_some_and(|idx| cands[idx].active && cands[idx].wide_ty == cand.wide_ty)
 }
 
 fn candidate_profitable(
@@ -344,7 +393,9 @@ fn candidate_profitable(
                 continue;
             }
             let handled_as_edge = match &data.op {
-                Op::Jump(target, args) => count_active_edge_hits(target, args, cand.param, val_to_cand, cands),
+                Op::Jump(target, args) => {
+                    count_active_edge_hits(target, args, cand.param, val_to_cand, cands)
+                }
                 Op::Brif(_, then_b, then_args, else_b, else_args) => {
                     count_active_edge_hits(then_b, then_args, cand.param, val_to_cand, cands)
                         + count_active_edge_hits(else_b, else_args, cand.param, val_to_cand, cands)
@@ -381,7 +432,10 @@ fn count_active_edge_hits(
     let mut hits = 0;
     for (idx, &arg) in args.iter().enumerate() {
         if arg == param
-            && let Some(&dst_param) = cands.iter().find(|c| c.active && c.block == target.index() && c.param_idx == idx).map(|c| &c.param)
+            && let Some(&dst_param) = cands
+                .iter()
+                .find(|c| c.active && c.block == target.index() && c.param_idx == idx)
+                .map(|c| &c.param)
             && val_to_cand[dst_param.index()].is_some()
         {
             hits += 1;
@@ -400,7 +454,9 @@ fn prune_candidates(
     loop {
         let mut changed = false;
         for idx in 0..cands.len() {
-            if cands[idx].active && !candidate_profitable(func, defs, consts, cands, val_to_cand, &cands[idx]) {
+            if cands[idx].active
+                && !candidate_profitable(func, defs, consts, cands, val_to_cand, &cands[idx])
+            {
                 cands[idx].active = false;
                 changed = true;
             }
@@ -416,79 +472,68 @@ fn emit_convert(func: &mut Function, val: Value, to_ty: Type, extra: &mut Vec<In
     if from_ty == to_ty {
         return val;
     }
-    let conv = if from_ty.bits() < to_ty.bits() { Convert::Uextend } else { Convert::Ireduce };
+    let conv = if from_ty.bits() < to_ty.bits() {
+        Convert::Uextend
+    } else {
+        Convert::Ireduce
+    };
     let res = func.value(to_ty);
     extra.push(func.add(Op::Convert(conv, val), Some(res)));
     res
 }
 
-fn apply_widening(
+fn materialize_edge(
+    func: &mut Function,
+    pred: usize,
+    wide_ty: Type,
+    plan: EdgePlan,
+    wide_params: &[Option<Value>],
+) -> Value {
+    let mut extra = Vec::new();
+    let val = match plan {
+        EdgePlan::Const(imm) => {
+            let v = func.value(wide_ty);
+            extra.push(func.add(Op::Const(imm), Some(v)));
+            v
+        }
+        EdgePlan::Param(src_param) => {
+            let src_wide = wide_params[src_param.index()].unwrap_or(src_param);
+            emit_convert(func, src_wide, wide_ty, &mut extra)
+        }
+        EdgePlan::ConvertOnly(src) | EdgePlan::Extend(src) => {
+            emit_convert(func, src, wide_ty, &mut extra)
+        }
+        EdgePlan::Mask(src, mask) => {
+            let src_w = emit_convert(func, src, wide_ty, &mut extra);
+            let m = func.value(wide_ty);
+            extra.push(func.add(Op::Const(mask as i64), Some(m)));
+            let masked = func.value(wide_ty);
+            extra.push(func.add(Op::Binary(Binary::Band, src_w, m), Some(masked)));
+            masked
+        }
+    };
+    if !extra.is_empty() {
+        let pos = func.blocks[pred].insts.len() - 1;
+        func.blocks[pred].insts.splice(pos..pos, extra);
+    }
+    val
+}
+
+fn rewrite_edges(
     func: &mut Function,
     defs: &[Option<Inst>],
     consts: &[Option<i64>],
     cands: &[Candidate],
     val_to_cand: &[Option<usize>],
     kept: &[usize],
+    wide_params: &[Option<Value>],
 ) {
-    let orig_vals = func.types.len();
-    let mut wide_params = vec![None; orig_vals];
-    for &idx in kept {
-        let c = &cands[idx];
-        let p_wide = func.value(c.wide_ty);
-        wide_params[c.param.index()] = Some(p_wide);
-    }
-
     let mut per_pred: Vec<Vec<(Inst, EdgeArm, usize, Value)>> = vec![Vec::new(); func.blocks.len()];
     for &idx in kept {
         let c = &cands[idx];
         for edge in &c.edges {
             let plan = classify_edge(func, defs, consts, cands, val_to_cand, c, edge.arg).0;
-            let val = match plan {
-                EdgePlan::Const(imm) => {
-                    let v = func.value(c.wide_ty);
-                    let inst = func.add(Op::Const(imm), Some(v));
-                    let pos = func.blocks[edge.pred].insts.len() - 1;
-                    func.blocks[edge.pred].insts.insert(pos, inst);
-                    v
-                }
-                EdgePlan::Param(src_param) => {
-                    let src_wide = wide_params[src_param.index()].unwrap_or(src_param);
-                    if func.ty(src_wide) == c.wide_ty {
-                        src_wide
-                    } else {
-                        let mut extra = Vec::with_capacity(1);
-                        let res = emit_convert(func, src_wide, c.wide_ty, &mut extra);
-                        let pos = func.blocks[edge.pred].insts.len() - 1;
-                        func.blocks[edge.pred].insts.splice(pos..pos, extra);
-                        res
-                    }
-                }
-                EdgePlan::ConvertOnly(src) => {
-                    let mut extra = Vec::with_capacity(1);
-                    let res = emit_convert(func, src, c.wide_ty, &mut extra);
-                    let pos = func.blocks[edge.pred].insts.len() - 1;
-                    func.blocks[edge.pred].insts.splice(pos..pos, extra);
-                    res
-                }
-                EdgePlan::Mask(src, mask) => {
-                    let mut extra = Vec::with_capacity(3);
-                    let src_w = emit_convert(func, src, c.wide_ty, &mut extra);
-                    let m = func.value(c.wide_ty);
-                    extra.push(func.add(Op::Const(mask as i64), Some(m)));
-                    let masked = func.value(c.wide_ty);
-                    extra.push(func.add(Op::Binary(Binary::Band, src_w, m), Some(masked)));
-                    let pos = func.blocks[edge.pred].insts.len() - 1;
-                    func.blocks[edge.pred].insts.splice(pos..pos, extra);
-                    masked
-                }
-                EdgePlan::Extend(arg) => {
-                    let mut extra = Vec::with_capacity(1);
-                    let res = emit_convert(func, arg, c.wide_ty, &mut extra);
-                    let pos = func.blocks[edge.pred].insts.len() - 1;
-                    func.blocks[edge.pred].insts.splice(pos..pos, extra);
-                    res
-                }
-            };
+            let val = materialize_edge(func, edge.pred, c.wide_ty, plan, wide_params);
             per_pred[edge.pred].push((edge.term, edge.arm, c.param_idx, val));
         }
     }
@@ -497,20 +542,76 @@ fn apply_widening(
         for (term, arm, param_idx, val) in edits {
             match &mut func.insts[term.index()].op {
                 Op::Jump(_, args) if arm == EdgeArm::Jump => args[param_idx] = val,
-                Op::Brif(_, _, then_args, _, _) if arm == EdgeArm::BrifThen => then_args[param_idx] = val,
-                Op::Brif(_, _, _, _, else_args) if arm == EdgeArm::BrifElse => else_args[param_idx] = val,
+                Op::Brif(_, _, then_args, _, _) if arm == EdgeArm::BrifThen => {
+                    then_args[param_idx] = val
+                }
+                Op::Brif(_, _, _, _, else_args) if arm == EdgeArm::BrifElse => {
+                    else_args[param_idx] = val
+                }
                 _ => {}
             }
         }
     }
+}
 
-    for &idx in kept {
-        let c = &cands[idx];
-        if let Some(p_wide) = wide_params[c.param.index()] {
-            func.blocks[c.block].params[c.param_idx] = p_wide;
-        }
+fn emit_wide_const(func: &mut Function, cand: &Candidate, imm: i64, out: &mut Vec<Inst>) -> Value {
+    let c_val = func.value(cand.wide_ty);
+    out.push(func.add(Op::Const(extend(imm, cand.narrow_ty, false)), Some(c_val)));
+    c_val
+}
+
+fn rewrite_icmp(
+    func: &mut Function,
+    consts: &[Option<i64>],
+    cands: &[Candidate],
+    val_to_cand: &[Option<usize>],
+    wide_params: &[Option<Value>],
+    inst: Inst,
+    out: &mut Vec<Inst>,
+) {
+    let Op::Icmp(cc, lhs, rhs) = func.insts[inst.index()].op else {
+        return;
+    };
+    if cc.is_signed() {
+        return;
     }
+    let orig_vals = wide_params.len();
+    let active_cand = |v: Value| {
+        (v.index() < orig_vals)
+            .then(|| val_to_cand[v.index()])
+            .flatten()
+            .filter(|&i| cands[i].active)
+    };
+    match (active_cand(lhs), active_cand(rhs)) {
+        (Some(li), Some(ri)) if cands[li].wide_ty == cands[ri].wide_ty => {
+            if let (Some(lw), Some(rw)) = (wide_params[lhs.index()], wide_params[rhs.index()]) {
+                func.insts[inst.index()].op = Op::Icmp(cc, lw, rw);
+            }
+        }
+        (Some(li), None) if rhs.index() < orig_vals => {
+            if let (Some(lw), Some(imm)) = (wide_params[lhs.index()], consts[rhs.index()]) {
+                let c_val = emit_wide_const(func, &cands[li], imm, out);
+                func.insts[inst.index()].op = Op::Icmp(cc, lw, c_val);
+            }
+        }
+        (None, Some(ri)) if lhs.index() < orig_vals => {
+            if let (Some(rw), Some(imm)) = (wide_params[rhs.index()], consts[lhs.index()]) {
+                let c_val = emit_wide_const(func, &cands[ri], imm, out);
+                func.insts[inst.index()].op = Op::Icmp(cc, c_val, rw);
+            }
+        }
+        _ => {}
+    }
+}
 
+fn rewrite_uses(
+    func: &mut Function,
+    consts: &[Option<i64>],
+    cands: &[Candidate],
+    val_to_cand: &[Option<usize>],
+    wide_params: &[Option<Value>],
+) -> (Vec<Option<Value>>, Vec<bool>) {
+    let orig_vals = wide_params.len();
     let mut subst = vec![None; orig_vals];
     let mut dead_insts = vec![false; func.insts.len()];
     for b_idx in 0..func.blocks.len() {
@@ -529,39 +630,33 @@ fn apply_widening(
                     continue;
                 }
                 func.insts[inst.index()].op = Op::Convert(Convert::Ireduce, p_wide);
-            } else if let Op::Icmp(cc, lhs, rhs) = func.insts[inst.index()].op
-                && !cc.is_signed()
-            {
-                let lhs_c = (lhs.index() < orig_vals).then(|| val_to_cand[lhs.index()]).flatten().filter(|&i| cands[i].active);
-                let rhs_c = (rhs.index() < orig_vals).then(|| val_to_cand[rhs.index()]).flatten().filter(|&i| cands[i].active);
-                match (lhs_c, rhs_c) {
-                    (Some(li), Some(ri)) if cands[li].wide_ty == cands[ri].wide_ty => {
-                        if let (Some(lw), Some(rw)) = (wide_params[lhs.index()], wide_params[rhs.index()]) {
-                            func.insts[inst.index()].op = Op::Icmp(cc, lw, rw);
-                        }
-                    }
-                    (Some(li), None) if rhs.index() < orig_vals && consts[rhs.index()].is_some() => {
-                        if let (Some(lw), Some(imm)) = (wide_params[lhs.index()], consts[rhs.index()]) {
-                            let c_val = func.value(cands[li].wide_ty);
-                            out.push(func.add(Op::Const(extend(imm, cands[li].narrow_ty, false)), Some(c_val)));
-                            func.insts[inst.index()].op = Op::Icmp(cc, lw, c_val);
-                        }
-                    }
-                    (None, Some(ri)) if lhs.index() < orig_vals && consts[lhs.index()].is_some() => {
-                        if let (Some(rw), Some(imm)) = (wide_params[rhs.index()], consts[lhs.index()]) {
-                            let c_val = func.value(cands[ri].wide_ty);
-                            out.push(func.add(Op::Const(extend(imm, cands[ri].narrow_ty, false)), Some(c_val)));
-                            func.insts[inst.index()].op = Op::Icmp(cc, c_val, rw);
-                        }
-                    }
-                    _ => {}
-                }
+            } else {
+                rewrite_icmp(
+                    func,
+                    consts,
+                    cands,
+                    val_to_cand,
+                    wide_params,
+                    inst,
+                    &mut out,
+                );
             }
             out.push(inst);
         }
         func.blocks[b_idx].insts = out;
     }
+    (subst, dead_insts)
+}
 
+fn insert_fallbacks_and_substitute(
+    func: &mut Function,
+    cands: &[Candidate],
+    kept: &[usize],
+    wide_params: &[Option<Value>],
+    dead_insts: &[bool],
+    subst: &mut [Option<Value>],
+) {
+    let orig_vals = wide_params.len();
     let mut still_used = vec![false; orig_vals];
     for block in &func.blocks {
         for &inst in &block.insts {
@@ -591,8 +686,39 @@ fn apply_widening(
     for block in &func.blocks {
         for &inst in &block.insts {
             func.insts[inst.index()].op.map_operands(|v| {
-                if v.index() < orig_vals { subst[v.index()].unwrap_or(v) } else { v }
+                if v.index() < orig_vals {
+                    subst[v.index()].unwrap_or(v)
+                } else {
+                    v
+                }
             });
         }
     }
+}
+
+fn apply_widening(
+    func: &mut Function,
+    defs: &[Option<Inst>],
+    consts: &[Option<i64>],
+    cands: &[Candidate],
+    val_to_cand: &[Option<usize>],
+    kept: &[usize],
+) {
+    let mut wide_params = vec![None; func.types.len()];
+    for &idx in kept {
+        let c = &cands[idx];
+        wide_params[c.param.index()] = Some(func.value(c.wide_ty));
+    }
+
+    rewrite_edges(func, defs, consts, cands, val_to_cand, kept, &wide_params);
+
+    for &idx in kept {
+        let c = &cands[idx];
+        if let Some(p_wide) = wide_params[c.param.index()] {
+            func.blocks[c.block].params[c.param_idx] = p_wide;
+        }
+    }
+
+    let (mut subst, dead_insts) = rewrite_uses(func, consts, cands, val_to_cand, &wide_params);
+    insert_fallbacks_and_substitute(func, cands, kept, &wide_params, &dead_insts, &mut subst);
 }
