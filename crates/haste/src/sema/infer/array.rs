@@ -88,10 +88,15 @@ impl Infer<'_, '_> {
                     None => self.deref_step(expr, steps, step)?,
                 },
             };
-            let Some(next) = next else { bail!("cannot index {} by {}", self.show(found), self.show(at)) };
+            let Some(next) = next else {
+                bail!("cannot index {} by {}", self.show(found), self.show(at))
+            };
             (step, steps) = (self.resolve(next), steps + 1);
             if steps as usize == crate::RECURSION_LIMIT {
-                bail!("reached the recursion limit while dereferencing {}", self.show(found));
+                bail!(
+                    "reached the recursion limit while dereferencing {}",
+                    self.show(found)
+                );
             }
         }
     }
@@ -99,17 +104,26 @@ impl Infer<'_, '_> {
     fn index_step(&mut self, expr: ExprId, step: Ty, at: Ty) -> Result<Option<Ty>> {
         let usize_ty = self.cx.types.prim(Primitive::Usize);
         if let Kind::Array(element, _) | Kind::Slice(element) = *self.cx.types.kind(step)
-            && matches!(self.cx.types.kind(self.resolve(at)), Kind::IntVar(_) | Kind::Prim(Primitive::Usize))
+            && matches!(
+                self.cx.types.kind(self.resolve(at)),
+                Kind::IntVar(_) | Kind::Prim(Primitive::Usize)
+            )
         {
             self.coerce(at, usize_ty)?;
             return Ok(Some(element));
         }
-        let Some(of) = self.cx.lang_item("index") else { bail!("core has no `Index` trait") };
+        let Some(of) = self.cx.lang_item("index") else {
+            bail!("core has no `Index` trait")
+        };
         if !self.select_or_prove(of, step, &[at])? {
             return Ok(None);
         }
-        let Some(method) = self.cx.trait_member(of, "index") else { bail!("`Index` has no `index`") };
-        self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[step, at]));
+        let Some(method) = self.cx.trait_member(of, "index") else {
+            bail!("`Index` has no `index`")
+        };
+        self.out
+            .operators
+            .insert(expr, Res::fn_of(&self.cx.types, method, &[step, at]));
         self.project(of, step, vec![at], "Output").map(Some)
     }
 }

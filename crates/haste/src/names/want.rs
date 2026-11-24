@@ -19,7 +19,10 @@ impl Crate {
         for mut pending in found {
             let index = self.pending.len();
             self.index_pending(index, &pending);
-            let asked = self.wanted.get(&pending.module).is_some_and(|names| pending.name.is_none_or(|name| names.contains(&name)));
+            let asked = self
+                .wanted
+                .get(&pending.module)
+                .is_some_and(|names| pending.name.is_none_or(|name| names.contains(&name)));
             pending.active = asked || self.resolves_all(pending.module);
             self.pending.push(pending);
         }
@@ -27,7 +30,10 @@ impl Crate {
 
     /// The names that lookups asked for in `module`.
     pub fn wanted_in(&self, module: u32) -> Vec<Sym> {
-        self.wanted.get(&module).map(|names| names.iter().copied().collect()).unwrap_or_default()
+        self.wanted
+            .get(&module)
+            .map(|names| names.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -43,15 +49,21 @@ impl Names {
                 continue;
             }
             new = true;
-            let named = entry.named.get(&(at.module, name)).cloned().unwrap_or_default();
+            let named = entry
+                .named
+                .get(&(at.module, name))
+                .cloned()
+                .unwrap_or_default();
             let globs = entry.globs.get(&at.module).cloned().unwrap_or_default();
             for index in named.into_iter().chain(globs.iter().copied()) {
                 entry.pending[index].active = true;
             }
-            let targets = globs.iter().filter_map(|index| match entry.pending[*index].stamp {
-                Some((Def::Module(target), _)) => Some((target, name)),
-                _ => None,
-            });
+            let targets = globs
+                .iter()
+                .filter_map(|index| match entry.pending[*index].stamp {
+                    Some((Def::Module(target), _)) => Some((target, name)),
+                    _ => None,
+                });
             asked.extend(targets);
         }
         new
@@ -66,7 +78,11 @@ impl Names {
             };
             if !entry.eager && entry.whole.insert(at.module) {
                 new = true;
-                entry.pending.iter_mut().filter(|pending| pending.module == at.module).for_each(|pending| pending.active = true);
+                entry
+                    .pending
+                    .iter_mut()
+                    .filter(|pending| pending.module == at.module)
+                    .for_each(|pending| pending.active = true);
             }
             let globs = entry.globs.get(&at.module).into_iter().flatten();
             let targets: Vec<ModRef> = globs
@@ -75,7 +91,11 @@ impl Names {
                     _ => None,
                 })
                 .collect();
-            modules.extend(targets.into_iter().filter(|target| self.crates.get(target.krate as usize).is_some_and(|other| !other.resolves_all(target.module))));
+            modules.extend(targets.into_iter().filter(|target| {
+                self.crates
+                    .get(target.krate as usize)
+                    .is_some_and(|other| !other.resolves_all(target.module))
+            }));
         }
         new
     }
@@ -86,8 +106,16 @@ impl Names {
             .iter()
             .enumerate()
             .flat_map(|(krate, entry)| {
-                let eager = (entry.eager && !entry.settled).then(|| entry.globs.keys().copied()).into_iter().flatten();
-                eager.chain(entry.whole.iter().copied()).map(move |module| ModRef { krate: krate as u32, module })
+                let eager = (entry.eager && !entry.settled)
+                    .then(|| entry.globs.keys().copied())
+                    .into_iter()
+                    .flatten();
+                eager
+                    .chain(entry.whole.iter().copied())
+                    .map(move |module| ModRef {
+                        krate: krate as u32,
+                        module,
+                    })
             })
             .collect();
         self.want_whole(modules)
@@ -96,7 +124,12 @@ impl Names {
     /// Loads the modules and resolves the names that later lookups asked for, then settles; returns whether anything was new.
     pub fn load(&mut self, outline: &mut Outline, asks: Requests) -> Result<bool> {
         let wanted = self.want(asks.names.into_inner()) | self.want_whole(asks.scopes.into_inner());
-        let mut modules: Vec<(usize, usize)> = asks.modules.into_inner().iter().map(|module| (module.krate as usize, module.module as usize)).collect();
+        let mut modules: Vec<(usize, usize)> = asks
+            .modules
+            .into_inner()
+            .iter()
+            .map(|module| (module.krate as usize, module.module as usize))
+            .collect();
         modules.sort_unstable();
         modules.dedup();
         outline.load_many(&modules)?;

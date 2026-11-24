@@ -25,7 +25,12 @@ fn stack_addr_of(func: &Function, defs: &[Option<Inst>], addr: Value) -> Option<
     }
 }
 
-fn pred_const_slots(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], pred: Block) -> Vec<SlotConst> {
+fn pred_const_slots(
+    func: &Function,
+    defs: &[Option<Inst>],
+    consts: &[Option<i64>],
+    pred: Block,
+) -> Vec<SlotConst> {
     let Some((_, body)) = func.blocks[pred.index()].insts.split_last() else {
         return Vec::new();
     };
@@ -38,7 +43,12 @@ fn pred_const_slots(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64
                     if let Some(imm) = consts.get(val.index()).copied().flatten()
                         && func.ty(val).is_small_int()
                     {
-                        out.push(SlotConst { slot, off: i64::from(off), ty: func.ty(val), imm });
+                        out.push(SlotConst {
+                            slot,
+                            off: i64::from(off),
+                            ty: func.ty(val),
+                            imm,
+                        });
                     }
                     clobbered.push(slot);
                 }
@@ -51,7 +61,12 @@ fn pred_const_slots(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64
                     if let Some(imm) = consts.get(val.index()).copied().flatten()
                         && func.ty(val).is_small_int()
                     {
-                        out.push(SlotConst { slot, off, ty: func.ty(val), imm });
+                        out.push(SlotConst {
+                            slot,
+                            off,
+                            ty: func.ty(val),
+                            imm,
+                        });
                     }
                     clobbered.push(slot);
                 }
@@ -63,7 +78,13 @@ fn pred_const_slots(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64
     out
 }
 
-fn matches_slot_load(func: &Function, defs: &[Option<Inst>], op: &Op, res: Value, sc: SlotConst) -> bool {
+fn matches_slot_load(
+    func: &Function,
+    defs: &[Option<Inst>],
+    op: &Op,
+    res: Value,
+    sc: SlotConst,
+) -> bool {
     if func.ty(res) != sc.ty {
         return false;
     }
@@ -80,7 +101,11 @@ fn block_clean(func: &Function, prov: &Provenance, block: Block, slot: StackSlot
     for &inst in &func.blocks[block.index()].insts {
         let op = &func.insts[inst.index()].op;
         match *op {
-            Op::Call { .. } | Op::TryCall { .. } | Op::Copy(..) | Op::Move(..) | Op::BrTable(..) => return false,
+            Op::Call { .. }
+            | Op::TryCall { .. }
+            | Op::Copy(..)
+            | Op::Move(..)
+            | Op::BrTable(..) => return false,
             Op::StackStore(_, s, _) | Op::StackAddr(s, _) if s == slot => return false,
             Op::Load(addr, _) => {
                 let _ = addr;
@@ -109,7 +134,8 @@ fn decide_block_with_slot(
     sc: SlotConst,
 ) -> Option<(Block, Vec<Value>)> {
     let (&last, body) = func.blocks[block.index()].insts.split_last()?;
-    let Op::Brif(cond, then, ref then_args, other, ref other_args) = func.insts[last.index()].op else {
+    let Op::Brif(cond, then, ref then_args, other, ref other_args) = func.insts[last.index()].op
+    else {
         return None;
     };
     if then == other {
@@ -196,7 +222,9 @@ fn find_plan(func: &Function) -> Option<SpecPlan> {
             if each.body[pred.index()] {
                 continue;
             }
-            let Some(Op::Jump(target, _)) = func.last(pred) else { continue };
+            let Some(Op::Jump(target, _)) = func.last(pred) else {
+                continue;
+            };
             if *target != head {
                 continue;
             }
@@ -210,7 +238,9 @@ fn find_plan(func: &Function) -> Option<SpecPlan> {
                 if !prov.slot_addr_unescaped(sc.slot) && prov.slot_escaped_at(sc.slot, pred_last) {
                     continue;
                 }
-                if let Some(plan) = try_build_plan(func, &cfg, prov, (&defs, &consts), (pred, head, sc)) {
+                if let Some(plan) =
+                    try_build_plan(func, &cfg, prov, (&defs, &consts), (pred, head, sc))
+                {
                     return Some(plan);
                 }
             }
@@ -244,7 +274,9 @@ fn try_build_plan(
         if !cfg.dominates(head, b) || !block_clean(func, prov, b, sc.slot) {
             continue;
         }
-        if blocks.len() >= MAX_CLONE_BLOCKS || total_insts + func.blocks[b.index()].insts.len() > MAX_CLONE_INSTS {
+        if blocks.len() >= MAX_CLONE_BLOCKS
+            || total_insts + func.blocks[b.index()].insts.len() > MAX_CLONE_INSTS
+        {
             return None;
         }
         in_r[b.index()] = true;
@@ -315,30 +347,48 @@ fn try_build_plan(
         if repairs.len() >= 4 {
             return None;
         }
-        let mut srcs = exits.iter().filter(|&&(_, dst)| dst == t).map(|&(src, _)| src);
+        let mut srcs = exits
+            .iter()
+            .filter(|&&(_, dst)| dst == t)
+            .map(|&(src, _)| src);
         let src = srcs.next()?;
         if srcs.next().is_some() {
             return None;
         }
-        if exits.iter().any(|&(os, ot)| (os != src || ot != t) && ssa.joins.contains(&ot)) {
+        if exits
+            .iter()
+            .any(|&(os, ot)| (os != src || ot != t) && ssa.joins.contains(&ot))
+        {
             return None;
         }
         let disjoint = repairs.iter().all(|(_, _, prev)| {
             !prev.need.iter().any(|v| ssa.need.contains(v))
-                && !prev.from_exit.iter().zip(&ssa.from_exit).any(|(&a, &b)| a && b)
+                && !prev
+                    .from_exit
+                    .iter()
+                    .zip(&ssa.from_exit)
+                    .any(|(&a, &b)| a && b)
         });
         if !disjoint {
             return None;
         }
         let src_idx = blocks.iter().position(|&b| b == src)?;
-        let term_ok = decided[src_idx].is_some() || matches!(func.last(src), Some(Op::Jump(..) | Op::Brif(..)));
+        let term_ok = decided[src_idx].is_some()
+            || matches!(func.last(src), Some(Op::Jump(..) | Op::Brif(..)));
         if !term_ok {
             return None;
         }
         repairs.push((src, t, ssa));
     }
 
-    Some(SpecPlan { pred, head, sc, blocks, decided, repairs })
+    Some(SpecPlan {
+        pred,
+        head,
+        sc,
+        blocks,
+        decided,
+        repairs,
+    })
 }
 
 fn apply_plan(func: &mut Function, plan: SpecPlan) {
@@ -361,7 +411,10 @@ fn apply_plan(func: &mut Function, plan: SpecPlan) {
                 fresh
             })
             .collect();
-        func.blocks.push(BlockData { params, insts: Vec::new() });
+        func.blocks.push(BlockData {
+            params,
+            insts: Vec::new(),
+        });
         let insts = func.blocks[b.index()].insts.clone();
         for inst in insts {
             if let Some(r) = func.insts[inst.index()].result {
@@ -370,8 +423,18 @@ fn apply_plan(func: &mut Function, plan: SpecPlan) {
             }
         }
     }
-    let map_val = |v: Value| val_map.iter().find(|&&(from, _)| from == v).map_or(v, |&(_, into)| into);
-    let map_block = |b: Block| block_map.iter().find(|&&(from, _)| from == b).map_or(b, |&(_, into)| into);
+    let map_val = |v: Value| {
+        val_map
+            .iter()
+            .find(|&&(from, _)| from == v)
+            .map_or(v, |&(_, into)| into)
+    };
+    let map_block = |b: Block| {
+        block_map
+            .iter()
+            .find(|&&(from, _)| from == b)
+            .map_or(b, |&(_, into)| into)
+    };
 
     for (idx, &b) in plan.blocks.iter().enumerate() {
         let fresh_b = block_map[idx].1;
@@ -382,7 +445,10 @@ fn apply_plan(func: &mut Function, plan: SpecPlan) {
             let data = func.insts[inst.index()].clone();
             let fresh_res = data.result.map(map_val);
             let op = if is_last && let Some((target, args)) = &plan.decided[idx] {
-                Op::Jump(map_block(*target), args.iter().copied().map(map_val).collect())
+                Op::Jump(
+                    map_block(*target),
+                    args.iter().copied().map(map_val).collect(),
+                )
             } else if let Some(orig_r) = data.result
                 && matches_slot_load(func, &defs, &data.op, orig_r, plan.sc)
             {
@@ -416,7 +482,8 @@ fn apply_plan(func: &mut Function, plan: SpecPlan) {
     }
 
     for (src, exit, ssa) in plan.repairs {
-        let pairs: Vec<(Value, Value)> = ssa.need.iter().map(|&orig| (orig, map_val(orig))).collect();
+        let pairs: Vec<(Value, Value)> =
+            ssa.need.iter().map(|&orig| (orig, map_val(orig))).collect();
         apply_ssa_repair(func, &ssa, exit, map_block(src), &pairs);
     }
     func.bump_cfg();
@@ -432,7 +499,14 @@ fn is_malloc_call(func: &Function, defs: &[Option<Inst>], op: &Op) -> bool {
     matches!(*op, Op::Call { callee, .. } if defs.get(callee.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Runtime(crate::reloc::RuntimeSymbol::Malloc))))
 }
 
-fn collect_param_loads(func: &Function, defs: &[Option<Inst>], blk: Block, params: &[Value], mapped: &[Value], out: &mut Vec<(Value, i32)>) -> bool {
+fn collect_param_loads(
+    func: &Function,
+    defs: &[Option<Inst>],
+    blk: Block,
+    params: &[Value],
+    mapped: &[Value],
+    out: &mut Vec<(Value, i32)>,
+) -> bool {
     for &inst in &func.blocks[blk.index()].insts {
         let op = &func.insts[inst.index()].op;
         match *op {
@@ -450,7 +524,13 @@ fn collect_param_loads(func: &Function, defs: &[Option<Inst>], blk: Block, param
     true
 }
 
-fn pred_forwards_join_load(func: &Function, defs: &[Option<Inst>], pred: Block, join: Block, args: &[Value]) -> bool {
+fn pred_forwards_join_load(
+    func: &Function,
+    defs: &[Option<Inst>],
+    pred: Block,
+    join: Block,
+    args: &[Value],
+) -> bool {
     let params = &func.blocks[join.index()].params;
     let mut wanted: Vec<(Value, i32)> = Vec::new();
     if !collect_param_loads(func, defs, join, params, args, &mut wanted) {
@@ -481,10 +561,12 @@ fn pred_forwards_join_load(func: &Function, defs: &[Option<Inst>], pred: Block, 
                 }
             }
             for (jparam, parg, off) in next_wanted {
-                let overwritten = func.blocks[join.index()].insts.iter().any(|&i| match func.insts[i.index()].op {
-                    Op::Store(_, a, o) => a == jparam && o == off,
-                    Op::Copy(..) | Op::Move(..) => true,
-                    _ => false,
+                let overwritten = func.blocks[join.index()].insts.iter().any(|&i| {
+                    match func.insts[i.index()].op {
+                        Op::Store(_, a, o) => a == jparam && o == off,
+                        Op::Copy(..) | Op::Move(..) => true,
+                        _ => false,
+                    }
                 });
                 if !overwritten {
                     wanted.push((parg, off));
@@ -513,11 +595,21 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
         let join = Block(at as u32);
         let jdata = &func.blocks[at];
         let npreds = cfg.preds_of(join).len();
-        let non_const = jdata.insts.iter().filter(|i| !matches!(func.insts[i.index()].op, Op::Const(_))).count();
-        if !cfg.reachable[at] || jdata.params.is_empty() || non_const > 16 || !(2..=4).contains(&npreds) {
+        let non_const = jdata
+            .insts
+            .iter()
+            .filter(|i| !matches!(func.insts[i.index()].op, Op::Const(_)))
+            .count();
+        if !cfg.reachable[at]
+            || jdata.params.is_empty()
+            || non_const > 16
+            || !(2..=4).contains(&npreds)
+        {
             continue;
         }
-        let Some(&last) = jdata.insts.last() else { continue };
+        let Some(&last) = jdata.insts.last() else {
+            continue;
+        };
         let succs: Vec<Block> = match func.insts[last.index()].op {
             Op::Jump(t, _) if t != join => vec![t],
             Op::Brif(_, t, _, f, _) if t != f && t != join && f != join => vec![t, f],
@@ -542,7 +634,12 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
             if ssa.need.is_empty() {
                 continue;
             }
-            if repairs.iter().any(|(_, prev)| prev.from_exit.iter().zip(&ssa.from_exit).any(|(&a, &b)| a && b)) {
+            if repairs.iter().any(|(_, prev)| {
+                prev.from_exit
+                    .iter()
+                    .zip(&ssa.from_exit)
+                    .any(|(&a, &b)| a && b)
+            }) {
                 ssa_ok = false;
                 break;
             }
@@ -555,12 +652,18 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
             if pred == join || cfg.dominates(join, pred) {
                 continue;
             }
-            let Some(Op::Jump(target, args)) = func.last(pred) else { continue };
+            let Some(Op::Jump(target, args)) = func.last(pred) else {
+                continue;
+            };
             if *target != join || args.len() != jdata.params.len() {
                 continue;
             }
             if pred_forwards_join_load(func, &defs, pred, join, args) {
-                return Some(DupJoinPlan { pred, join, repairs });
+                return Some(DupJoinPlan {
+                    pred,
+                    join,
+                    repairs,
+                });
             }
         }
     }
@@ -569,17 +672,33 @@ fn find_forwarding_join(func: &Function) -> Option<DupJoinPlan> {
 
 fn apply_forwarding_join(func: &mut Function, plan: DupJoinPlan) {
     localize_consts(func, plan.join);
-    let Some(&jump) = func.blocks[plan.pred.index()].insts.last() else { return };
-    let Op::Jump(_, ref args) = func.insts[jump.index()].op else { return };
-    let mut map: Vec<(Value, Value)> = func.blocks[plan.join.index()].params.iter().copied().zip(args.iter().copied()).collect();
+    let Some(&jump) = func.blocks[plan.pred.index()].insts.last() else {
+        return;
+    };
+    let Op::Jump(_, ref args) = func.insts[jump.index()].op else {
+        return;
+    };
+    let mut map: Vec<(Value, Value)> = func.blocks[plan.join.index()]
+        .params
+        .iter()
+        .copied()
+        .zip(args.iter().copied())
+        .collect();
     let jinsts = func.blocks[plan.join.index()].insts.clone();
     let (&last, body) = jinsts.split_last().expect("invariant: join has terminator");
     let mut copied = Vec::with_capacity(body.len());
     for &inst in body {
         let data = func.insts[inst.index()].clone();
         let mut op = data.op;
-        op.map_operands(|v| map.iter().find(|&&(from, _)| from == v).map_or(v, |&(_, into)| into));
-        if let Op::Call { ref mut results, .. } = op {
+        op.map_operands(|v| {
+            map.iter()
+                .find(|&&(from, _)| from == v)
+                .map_or(v, |&(_, into)| into)
+        });
+        if let Op::Call {
+            ref mut results, ..
+        } = op
+        {
             for r in results.iter_mut() {
                 let fresh = func.value(func.ty(*r));
                 map.push((*r, fresh));
@@ -596,7 +715,11 @@ fn apply_forwarding_join(func: &mut Function, plan: DupJoinPlan) {
         copied.push(added);
     }
     let mut term = func.insts[last.index()].op.clone();
-    term.map_operands(|v| map.iter().find(|&&(from, _)| from == v).map_or(v, |&(_, into)| into));
+    term.map_operands(|v| {
+        map.iter()
+            .find(|&&(from, _)| from == v)
+            .map_or(v, |&(_, into)| into)
+    });
     func.insts[jump.index()].op = term;
     let pinsts = &mut func.blocks[plan.pred.index()].insts;
     let at = pinsts.len() - 1;
@@ -606,7 +729,11 @@ fn apply_forwarding_join(func: &mut Function, plan: DupJoinPlan) {
         let pairs: Vec<(Value, Value)> = ssa
             .need
             .iter()
-            .filter_map(|&orig| map.iter().find(|&&(from, _)| from == orig).map(|&(_, into)| (orig, into)))
+            .filter_map(|&orig| {
+                map.iter()
+                    .find(|&&(from, _)| from == orig)
+                    .map(|&(_, into)| (orig, into))
+            })
             .collect();
         apply_ssa_repair(func, &ssa, exit, plan.pred, &pairs);
     }
@@ -622,7 +749,9 @@ pub(super) fn run(func: &mut Function) -> bool {
         any = true;
     }
     for _ in 0..4 {
-        let Some(plan) = find_forwarding_join(func) else { break };
+        let Some(plan) = find_forwarding_join(func) else {
+            break;
+        };
         apply_forwarding_join(func, plan);
         any = true;
     }

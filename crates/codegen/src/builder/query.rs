@@ -3,7 +3,12 @@ use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, Value};
 
 fn def_op(func: &Function, mut value: Value) -> Option<(Value, &Op)> {
     for _ in 0..4 {
-        let data = func.insts.iter().rev().take(128).find(|d| d.result == Some(value))?;
+        let data = func
+            .insts
+            .iter()
+            .rev()
+            .take(128)
+            .find(|d| d.result == Some(value))?;
         if let Op::Convert(Convert::Bitcast, inner) = data.op {
             value = inner;
             continue;
@@ -20,8 +25,12 @@ fn const_int_at(func: &Function, value: Value, depth: u8) -> Option<i64> {
     let (_, op) = def_op(func, value)?;
     match *op {
         Op::Const(imm) => Some(imm),
-        Op::Binary(Binary::Imul, a, b) => const_int_at(func, a, depth + 1)?.checked_mul(const_int_at(func, b, depth + 1)?),
-        Op::Convert(Convert::Ireduce, inner) => Some(const_int_at(func, inner, depth + 1)? & func.ty(value).unsigned_max() as i64),
+        Op::Binary(Binary::Imul, a, b) => {
+            const_int_at(func, a, depth + 1)?.checked_mul(const_int_at(func, b, depth + 1)?)
+        }
+        Op::Convert(Convert::Ireduce, inner) => {
+            Some(const_int_at(func, inner, depth + 1)? & func.ty(value).unsigned_max() as i64)
+        }
         _ => None,
     }
 }
@@ -41,31 +50,61 @@ enum SlotStep {
     Continue,
 }
 
-fn check_slot_inst(func: &Function, ptr: Value, slot: StackSlot, target_off: i32, inst: Inst) -> SlotStep {
+fn check_slot_inst(
+    func: &Function,
+    ptr: Value,
+    slot: StackSlot,
+    target_off: i32,
+    inst: Inst,
+) -> SlotStep {
     match func.insts[inst.index()].op {
         Op::StackStore(val, s, off) if s == slot => {
             if off == target_off {
-                return SlotStep::Hit(const_int_at(func, val, 0).and_then(|n| u64::try_from(n).ok()));
+                return SlotStep::Hit(
+                    const_int_at(func, val, 0).and_then(|n| u64::try_from(n).ok()),
+                );
             }
             let end = i64::from(off) + i64::from(func.ty(val).bytes());
             let target = i64::from(target_off);
-            if i64::from(off) < target + 8 && end > target { SlotStep::Stop } else { SlotStep::Continue }
+            if i64::from(off) < target + 8 && end > target {
+                SlotStep::Stop
+            } else {
+                SlotStep::Continue
+            }
         }
         Op::Store(val, addr, off) if addr == ptr => {
             if off == 8 {
-                return SlotStep::Hit(const_int_at(func, val, 0).and_then(|n| u64::try_from(n).ok()));
+                return SlotStep::Hit(
+                    const_int_at(func, val, 0).and_then(|n| u64::try_from(n).ok()),
+                );
             }
             let end = i64::from(off) + i64::from(func.ty(val).bytes());
-            if i64::from(off) < 16 && end > 8 { SlotStep::Stop } else { SlotStep::Continue }
+            if i64::from(off) < 16 && end > 8 {
+                SlotStep::Stop
+            } else {
+                SlotStep::Continue
+            }
         }
-        Op::Store(..) | Op::Call { .. } | Op::TryCall { .. } | Op::Move(..) | Op::Copy(..) => SlotStep::Stop,
+        Op::Store(..) | Op::Call { .. } | Op::TryCall { .. } | Op::Move(..) | Op::Copy(..) => {
+            SlotStep::Stop
+        }
         _ => SlotStep::Continue,
     }
 }
 
-fn slot_store_const_u64(builder: &FunctionBuilder<'_>, ptr: Value, slot: StackSlot, target_off: i32) -> Option<u64> {
+fn slot_store_const_u64(
+    builder: &FunctionBuilder<'_>,
+    ptr: Value,
+    slot: StackSlot,
+    target_off: i32,
+) -> Option<u64> {
     let block = builder.current?;
-    for &inst in builder.func.blocks[block.index()].insts.iter().rev().take(128) {
+    for &inst in builder.func.blocks[block.index()]
+        .insts
+        .iter()
+        .rev()
+        .take(128)
+    {
         match check_slot_inst(builder.func, ptr, slot, target_off, inst) {
             SlotStep::Hit(len) => return len,
             SlotStep::Stop => return None,
@@ -79,7 +118,9 @@ fn resolve_sym(func: &Function, dict: Option<Value>, v: Value) -> Option<u32> {
     let data = func.insts.iter().rev().find(|d| d.result == Some(v))?;
     match data.op {
         Op::Symbol(sym) | Op::SlotAddr(sym) => Some(sym),
-        Op::Load(addr, offset) if dict == Some(addr) && offset >= 0 && offset % 8 == 0 => Some((offset / 8) as u32),
+        Op::Load(addr, offset) if dict == Some(addr) && offset >= 0 && offset % 8 == 0 => {
+            Some((offset / 8) as u32)
+        }
         Op::Load(addr, 0) | Op::Convert(Convert::Bitcast, addr) => resolve_sym(func, dict, addr),
         _ => None,
     }
@@ -164,7 +205,9 @@ impl FunctionBuilder<'_> {
     /// Appends `insts` to the current block and restores `restore` when set.
     pub fn splice_append(&mut self, insts: &[Inst], restore: Option<Block>) {
         if let Some(block) = self.current {
-            self.func.blocks[block.index()].insts.extend_from_slice(insts);
+            self.func.blocks[block.index()]
+                .insts
+                .extend_from_slice(insts);
         }
         if let Some(target) = restore {
             self.current = Some(target);
@@ -175,6 +218,13 @@ impl FunctionBuilder<'_> {
 impl Function {
     /// Whether this function contains any `Call` or `TryCall` instruction.
     pub fn has_calls(&self) -> bool {
-        self.blocks.iter().any(|b| b.insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. })))
+        self.blocks.iter().any(|b| {
+            b.insts.iter().any(|&i| {
+                matches!(
+                    self.insts[i.index()].op,
+                    Op::Call { .. } | Op::TryCall { .. }
+                )
+            })
+        })
     }
 }

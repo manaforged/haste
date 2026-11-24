@@ -26,7 +26,9 @@ pub(crate) fn pred_totals(func: &Function, order: &[Block], copied: &[bool]) -> 
         let disable_succs = cloned[fi]
             || match func.last(from) {
                 Some(Op::BrTable(..) | Op::TryCall { .. }) => true,
-                Some(Op::Brif(_, then, _, otherwise, _)) => func.jump_target(*then) == func.jump_target(*otherwise),
+                Some(Op::Brif(_, then, _, otherwise, _)) => {
+                    func.jump_target(*then) == func.jump_target(*otherwise)
+                }
                 _ => false,
             };
         for next in func.successors(from) {
@@ -101,7 +103,11 @@ impl<R: Copy + PartialEq> SpillCache<R> {
 
     /// The registers that hold the slot at `disp`, newest first.
     pub(crate) fn holders(&self, disp: i32) -> impl Iterator<Item = R> + '_ {
-        self.0.iter().flatten().filter(move |&&(d, _)| d == disp).map(|&(_, r)| r)
+        self.0
+            .iter()
+            .flatten()
+            .filter(move |&&(d, _)| d == disp)
+            .map(|&(_, r)| r)
     }
 }
 
@@ -204,6 +210,7 @@ impl<R: Copy + PartialEq, F: Copy + PartialEq> SpillState<R, F> {
     }
 
     pub(crate) fn cached_fspill(&self, disp: i32, ty: Type) -> Option<F> {
-        self.fspill.and_then(|(d, r, t)| (d == disp && t == ty).then_some(r))
+        self.fspill
+            .and_then(|(d, r, t)| (d == disp && t == ty).then_some(r))
     }
 }

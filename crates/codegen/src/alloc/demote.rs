@@ -18,7 +18,9 @@ fn copies(func: &Function, blocks: &[u64]) -> (Vec<(u64, usize, usize)>, Vec<boo
         }
     }
     let mut copies = Vec::new();
-    edge_copies(func, Some(blocks), |_, weight, _, pairs| copies.extend(pairs.map(|(param, arg)| (weight, param.index(), arg.index()))));
+    edge_copies(func, Some(blocks), |_, weight, _, pairs| {
+        copies.extend(pairs.map(|(param, arg)| (weight, param.index(), arg.index())))
+    });
     (copies, fixed)
 }
 
@@ -45,9 +47,12 @@ pub(super) fn webs<R: Copy + PartialEq>(
     locations: &mut [Location<R>],
 ) -> Webs {
     let count = func.types.len();
-    let memory = |locations: &[Location<R>], value: usize| shareable(live, locations, deferred, value);
+    let memory =
+        |locations: &[Location<R>], value: usize| shareable(live, locations, deferred, value);
     let joins = |locations: &[Location<R>], webs: &Webs, value: usize, partner: usize| {
-        memory(locations, partner) && func.types[partner] == func.types[value] && webs.fits(live, value, partner)
+        memory(locations, partner)
+            && func.types[partner] == func.types[value]
+            && webs.fits(live, value, partner)
     };
     let mut webs = Webs::new(count);
     for (value, list) in partners.iter().enumerate() {
@@ -66,9 +71,16 @@ pub(super) fn webs<R: Copy + PartialEq>(
             touching[arg].push(at);
         }
     }
-    let params = func.blocks.iter().enumerate().filter(|(block, _)| !fixed[*block]).flat_map(|(_, data)| data.params.iter().map(|param| param.index()));
+    let params = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(block, _)| !fixed[*block])
+        .flat_map(|(_, data)| data.params.iter().map(|param| param.index()));
     for value in params {
-        let Location::Reg(reg) = locations[value] else { continue };
+        let Location::Reg(reg) = locations[value] else {
+            continue;
+        };
         if deferred[value] || live.bounds(value).is_none() {
             continue;
         }
@@ -80,7 +92,10 @@ pub(super) fn webs<R: Copy + PartialEq>(
                     kept += if other == reg { 0 } else { weight };
                     moved += weight;
                 }
-                Location::Slot if joins(locations, &webs, value, partner) && joined.iter().all(|&web| webs.fits(live, web, partner)) => {
+                Location::Slot
+                    if joins(locations, &webs, value, partner)
+                        && joined.iter().all(|&web| webs.fits(live, web, partner)) =>
+                {
                     kept += weight;
                     joined.push(partner);
                 }
@@ -96,7 +111,9 @@ pub(super) fn webs<R: Copy + PartialEq>(
         }
         if moved < kept {
             locations[value] = Location::Slot;
-            joined.into_iter().for_each(|partner| webs.merge(value, partner));
+            joined
+                .into_iter()
+                .for_each(|partner| webs.merge(value, partner));
         }
     }
     webs

@@ -34,12 +34,18 @@ pub struct Clock {
 impl Clock {
     /// Captures the current wall-clock and process-plus-children CPU time.
     pub fn now() -> Self {
-        Self { wall: Instant::now(), cpu_ns: process_cpu_ns() }
+        Self {
+            wall: Instant::now(),
+            cpu_ns: process_cpu_ns(),
+        }
     }
 
     /// The wall-clock and CPU duration elapsed since this clock was captured.
     pub fn elapsed(self) -> Span {
-        Span { wall_ns: self.wall.elapsed().as_nanos() as u64, cpu_ns: process_cpu_ns().saturating_sub(self.cpu_ns) }
+        Span {
+            wall_ns: self.wall.elapsed().as_nanos() as u64,
+            cpu_ns: process_cpu_ns().saturating_sub(self.cpu_ns),
+        }
     }
 }
 
@@ -194,12 +200,18 @@ fn process_cpu_ns() -> u64 {
         // SAFETY: rusage is plain data where all-zero bytes are valid, and getrusage writes only into usage.
         let usage = unsafe {
             let mut usage: libc::rusage = std::mem::zeroed();
-            if libc::getrusage(who, &mut usage) == 0 { Some(usage) } else { None }
+            if libc::getrusage(who, &mut usage) == 0 {
+                Some(usage)
+            } else {
+                None
+            }
         };
         if let Some(u) = usage {
             let secs = (u.ru_utime.tv_sec as u64).saturating_add(u.ru_stime.tv_sec as u64);
             let usecs = (u.ru_utime.tv_usec as u64).saturating_add(u.ru_stime.tv_usec as u64);
-            total = total.saturating_add(secs.saturating_mul(1_000_000_000)).saturating_add(usecs.saturating_mul(1_000));
+            total = total
+                .saturating_add(secs.saturating_mul(1_000_000_000))
+                .saturating_add(usecs.saturating_mul(1_000));
         }
     }
     total
@@ -234,7 +246,9 @@ fn fill_outline_origins(cx: &Context<'_>, origins_of: &[Origin], origins: &mut [
         for file in &tree.files {
             if !file.expanded {
                 bucket.files += 1;
-                bucket.source_bytes = bucket.source_bytes.saturating_add(file.source.text.len() as u64);
+                bucket.source_bytes = bucket
+                    .source_bytes
+                    .saturating_add(file.source.text.len() as u64);
             }
             bucket.items += file.items.items.len();
         }
@@ -274,7 +288,13 @@ struct Accum {
 }
 
 impl Accum {
-    fn ingest(&mut self, orig: usize, item: ItemRef, rec: &InstanceRecord, (code_len, worker_ns): (u32, u64)) {
+    fn ingest(
+        &mut self,
+        orig: usize,
+        item: ItemRef,
+        rec: &InstanceRecord,
+        (code_len, worker_ns): (u32, u64),
+    ) {
         self.origins[orig].n_reached += 1;
         if !rec.valid {
             self.n_failed += 1;
@@ -285,26 +305,42 @@ impl Accum {
         if rec.generic {
             self.record_generic(orig, item, rec);
         }
-        self.origins[orig].codegen_worker_ns = self.origins[orig].codegen_worker_ns.saturating_add(worker_ns);
+        self.origins[orig].codegen_worker_ns = self.origins[orig]
+            .codegen_worker_ns
+            .saturating_add(worker_ns);
         if code_len > 0 {
-            record_code_size(&mut self.histogram, &mut self.stencil_map, &mut self.origin_sets[orig].stencil_map, (item, rec, code_len));
+            record_code_size(
+                &mut self.histogram,
+                &mut self.stencil_map,
+                &mut self.origin_sets[orig].stencil_map,
+                (item, rec, code_len),
+            );
             self.origins[orig].savings.compiled_functions += 1;
-            self.origins[orig].savings.total_code_bytes = self.origins[orig].savings.total_code_bytes.saturating_add(u64::from(code_len));
+            self.origins[orig].savings.total_code_bytes = self.origins[orig]
+                .savings
+                .total_code_bytes
+                .saturating_add(u64::from(code_len));
         }
     }
 
     fn record_valid(&mut self, orig: usize, item: ItemRef, rec: &InstanceRecord) {
         self.n_inst += 1;
         self.origins[orig].n_inst += 1;
-        self.origins[orig].inferred_exprs = self.origins[orig].inferred_exprs.saturating_add(rec.expr_count as u64);
+        self.origins[orig].inferred_exprs = self.origins[orig]
+            .inferred_exprs
+            .saturating_add(rec.expr_count as u64);
         self.fn_set.insert(item);
         self.origin_sets[orig].fn_set.insert(item);
         self.fp_no_inline_set.insert((item, rec.k_no_inline));
         self.fp_set.insert((item, rec.k_inline));
         self.alias_set.insert((item, rec.k_inline, rec.d_inline));
-        self.origin_sets[orig].fp_no_inline_set.insert((item, rec.k_no_inline));
+        self.origin_sets[orig]
+            .fp_no_inline_set
+            .insert((item, rec.k_no_inline));
         self.origin_sets[orig].fp_set.insert((item, rec.k_inline));
-        self.origin_sets[orig].alias_set.insert((item, rec.k_inline, rec.d_inline));
+        self.origin_sets[orig]
+            .alias_set
+            .insert((item, rec.k_inline, rec.d_inline));
         if rec.foreign {
             self.n_foreign += 1;
             self.origins[orig].n_foreign += 1;
@@ -320,9 +356,14 @@ impl Accum {
         self.origin_sets[orig].gen_fn_set.insert(item);
         self.gen_fp_no_inline_set.insert((item, rec.k_no_inline));
         self.gen_fp_set.insert((item, rec.k_inline));
-        self.gen_alias_set.insert((item, rec.k_inline, rec.d_inline));
+        self.gen_alias_set
+            .insert((item, rec.k_inline, rec.d_inline));
         if !rec.foreign {
-            record_naive_member(self.naive_map.entry((item, rec.outer_shape)).or_default(), orig, rec);
+            record_naive_member(
+                self.naive_map.entry((item, rec.outer_shape)).or_default(),
+                orig,
+                rec,
+            );
         }
     }
 }
@@ -337,9 +378,14 @@ fn aggregate(cx: &Context<'_>, input: &CensusInput<'_>, records: &[InstanceRecor
         let worker_ns = input.compile_times.get(index).copied().unwrap_or(0);
         acc.ingest(orig, *item, &records[index], (code_len, worker_ns));
     }
-    let (n_naive_shape, n_naive_shape_hazards, hazard_causes) = summarize_hazards(&acc.naive_map, &mut acc.origins);
+    let (n_naive_shape, n_naive_shape_hazards, hazard_causes) =
+        summarize_hazards(&acc.naive_map, &mut acc.origins);
     let mut savings = finalize_savings(&acc.stencil_map);
-    savings.compiled_functions = acc.origins.iter().map(|o| o.savings.compiled_functions).sum();
+    savings.compiled_functions = acc
+        .origins
+        .iter()
+        .map(|o| o.savings.compiled_functions)
+        .sum();
     savings.total_code_bytes = acc.origins.iter().map(|o| o.savings.total_code_bytes).sum();
     finalize_origins(&mut acc.origins, &acc.origin_sets, input.timings);
     Report {
@@ -401,7 +447,10 @@ fn record_code_size(
     }
 }
 
-fn summarize_hazards(naive_map: &FxHashMap<(ItemRef, Digest), NaiveGroup>, origins: &mut [OriginReport; 3]) -> (usize, usize, HazardCauses) {
+fn summarize_hazards(
+    naive_map: &FxHashMap<(ItemRef, Digest), NaiveGroup>,
+    origins: &mut [OriginReport; 3],
+) -> (usize, usize, HazardCauses) {
     let mut causes = HazardCauses::default();
     let mut hazards = 0;
     for group in naive_map.values() {
@@ -422,7 +471,8 @@ fn summarize_hazards(naive_map: &FxHashMap<(ItemRef, Digest), NaiveGroup>, origi
         causes.assoc_abi_mismatch += usize::from(assoc);
         causes.specialization_mismatch += usize::from(spec);
         causes.reflection_mismatch += usize::from(reflection);
-        causes.other_footprint_mismatch += usize::from(!niche && !offset && !assoc && !spec && !reflection);
+        causes.other_footprint_mismatch +=
+            usize::from(!niche && !offset && !assoc && !spec && !reflection);
     }
     (naive_map.len(), hazards, causes)
 }
@@ -430,15 +480,20 @@ fn summarize_hazards(naive_map: &FxHashMap<(ItemRef, Digest), NaiveGroup>, origi
 fn finalize_savings(stencil_map: &FxHashMap<(ItemRef, Digest), StencilClass>) -> CodeSavings {
     let mut out = CodeSavings::default();
     for class in stencil_map.values() {
-        out.unique_footprint_code_bytes = out.unique_footprint_code_bytes.saturating_add(class.rep_bytes);
+        out.unique_footprint_code_bytes = out
+            .unique_footprint_code_bytes
+            .saturating_add(class.rep_bytes);
         let alias_bytes: u64 = class.alias_map.values().copied().sum();
         out.unique_alias_code_bytes = out.unique_alias_code_bytes.saturating_add(alias_bytes);
         let aliases = class.alias_map.len() as u64;
         if class.rep_bytes > DICT_MIN_BYTES && aliases >= DICT_MIN_FANOUT {
-            let dict_cost = class.rep_bytes.saturating_add(aliases.saturating_mul(class.d_slots.saturating_mul(8).saturating_add(24)));
+            let dict_cost = class.rep_bytes.saturating_add(
+                aliases.saturating_mul(class.d_slots.saturating_mul(8).saturating_add(24)),
+            );
             if dict_cost < alias_bytes {
                 out.dict_stencil_classes += 1;
-                out.projected_stenciled_bytes = out.projected_stenciled_bytes.saturating_add(dict_cost);
+                out.projected_stenciled_bytes =
+                    out.projected_stenciled_bytes.saturating_add(dict_cost);
                 continue;
             }
         }
@@ -453,13 +508,24 @@ fn split_span(span: Span, weights: [u64; 3]) -> [Span; 3] {
         return [Span::default(); 3];
     }
     let scale = |total: u64, w: u64| ((u128::from(total) * u128::from(w)) / u128::from(sum)) as u64;
-    weights.map(|w| Span { wall_ns: scale(span.wall_ns, w), cpu_ns: scale(span.cpu_ns, w) })
+    weights.map(|w| Span {
+        wall_ns: scale(span.wall_ns, w),
+        cpu_ns: scale(span.cpu_ns, w),
+    })
 }
 
 fn finalize_origins(origins: &mut [OriginReport; 3], sets: &[OriginSets; 3], timings: Timings) {
-    let outline_w = [0, 1, 2].map(|i| (origins[i].items as u64).saturating_add((origins[i].expansions as u64) * 8).max(origins[i].source_bytes / 64));
+    let outline_w = [0, 1, 2].map(|i| {
+        (origins[i].items as u64)
+            .saturating_add((origins[i].expansions as u64) * 8)
+            .max(origins[i].source_bytes / 64)
+    });
     let reach_w = [0, 1, 2].map(|i| origins[i].inferred_exprs.max(origins[i].n_inst as u64));
-    let codegen_w = [0, 1, 2].map(|i| origins[i].codegen_worker_ns.max(origins[i].savings.total_code_bytes));
+    let codegen_w = [0, 1, 2].map(|i| {
+        origins[i]
+            .codegen_worker_ns
+            .max(origins[i].savings.total_code_bytes)
+    });
     let outline_spans = split_span(timings.outline, outline_w);
     let reach_spans = split_span(timings.reach, reach_w);
     let codegen_spans = split_span(timings.codegen, codegen_w);

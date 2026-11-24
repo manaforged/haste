@@ -70,10 +70,19 @@ pub fn ahead(workspace: &Workspace, targets: &Targets) -> Option<Ahead> {
 }
 
 fn start(workspace: &Workspace, targets: &Targets) -> Result<Option<Ahead>> {
-    let dir = super::dir(super::key(&super::pins(workspace, targets), workspace, super::toolchain()?)?);
+    let dir = super::dir(super::key(
+        &super::pins(workspace, targets),
+        workspace,
+        super::toolchain()?,
+    )?);
     let out = dir.join(super::RUSTC);
     let before = std::fs::read_link(&out).ok();
-    let manifest = out.canonicalize().ok().map(|at| at.join(files::manifest(files::LIBRARY))).filter(|path| path.is_file()).map(|path| std::thread::spawn(move || Parsed::read(&path)));
+    let manifest = out
+        .canonicalize()
+        .ok()
+        .map(|at| at.join(files::manifest(files::LIBRARY)))
+        .filter(|path| path.is_file())
+        .map(|path| std::thread::spawn(move || Parsed::read(&path)));
     let stale = !Snapshot::read(&out.join(SNAPSHOT)).is_ok_and(|then| then.sources.unchanged());
     let race = if stale && !budget().is_zero() {
         std::fs::create_dir_all(&dir)?;
@@ -81,15 +90,29 @@ fn start(workspace: &Workspace, targets: &Targets) -> Result<Option<Ahead>> {
     } else {
         None
     };
-    Ok(Some(Ahead { dir, out, before, race, waited: false, manifest }))
+    Ok(Some(Ahead {
+        dir,
+        out,
+        before,
+        race,
+        waited: false,
+        manifest,
+    }))
 }
 
 /// Starts `haste --release prep` on the build's member package in the background, with its standard error in the build's prep directory `dir`, unless a prep of the build runs now; the prep takes over the lock this takes, on its standard input, so no other run starts one in between.
 pub(super) fn spawn(dir: &Path, workspace: &Workspace) -> Result<Option<Child>> {
-    let Some(lock) = super::lock(dir, false)? else { return Ok(None) };
+    let Some(lock) = super::lock(dir, false)? else {
+        return Ok(None);
+    };
     let log = std::fs::File::create(dir.join(LOG))?;
     let mut command = Command::new(std::env::current_exe()?);
-    command.args(PREP_ARGS).arg(super::root(workspace)?).stdin(lock).stdout(Stdio::null()).stderr(log);
+    command
+        .args(PREP_ARGS)
+        .arg(super::root(workspace)?)
+        .stdin(lock)
+        .stdout(Stdio::null())
+        .stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     Ok(Some(command.spawn().context("starting a background prep")?))
@@ -98,13 +121,17 @@ pub(super) fn spawn(dir: &Path, workspace: &Workspace) -> Result<Option<Child>> 
 impl Ahead {
     /// Waits, when the run races a prep of a library the store holds, until it lands, or no prep runs, or the budget runs out, and says so on standard error only when the budget ran out; the program then binds whatever library the store names, and a first prep finishes for the next run.
     pub fn wait(&mut self) {
-        if self.race.is_none() || self.before.is_none() || std::mem::replace(&mut self.waited, true) {
+        if self.race.is_none() || self.before.is_none() || std::mem::replace(&mut self.waited, true)
+        {
             return;
         }
         let deadline = Instant::now() + budget();
         while !self.landed() {
             if Instant::now() >= deadline {
-                eprintln!("haste: rustc's code is not ready after {} ms, so Haste's code runs what changed", budget().as_millis());
+                eprintln!(
+                    "haste: rustc's code is not ready after {} ms, so Haste's code runs what changed",
+                    budget().as_millis()
+                );
                 return;
             }
             std::thread::sleep(POLL);
@@ -116,7 +143,11 @@ impl Ahead {
         if std::fs::read_link(&self.out).ok() != self.before {
             return true;
         }
-        let running = self.race.iter_mut().flatten().any(|child| matches!(child.try_wait(), Ok(None)));
+        let running = self
+            .race
+            .iter_mut()
+            .flatten()
+            .any(|child| matches!(child.try_wait(), Ok(None)));
         !running && super::lock(&self.dir, false).is_ok_and(|held| held.is_some())
     }
 

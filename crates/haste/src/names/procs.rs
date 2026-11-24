@@ -60,21 +60,38 @@ impl Names {
         let (mut bound, demands) = (Vec::new(), Requests::default());
         for krate in 0..outline.crates.len() {
             let holder = &mut outline.crates[krate];
-            let bangs = std::mem::take(&mut holder.foreign).into_iter().map(Site::Bang);
-            let derives = std::mem::take(&mut holder.derived).into_iter().map(Site::Derive);
-            let sites: Vec<Site> = bangs.chain(derives).chain(std::mem::take(&mut holder.attributed).into_iter().map(Site::Attribute)).collect();
+            let bangs = std::mem::take(&mut holder.foreign)
+                .into_iter()
+                .map(Site::Bang);
+            let derives = std::mem::take(&mut holder.derived)
+                .into_iter()
+                .map(Site::Derive);
+            let sites: Vec<Site> = bangs
+                .chain(derives)
+                .chain(
+                    std::mem::take(&mut holder.attributed)
+                        .into_iter()
+                        .map(Site::Attribute),
+                )
+                .collect();
             let paths = paths_of(self, outline, krate, &demands);
             let (mut left, start) = (Vec::new(), bound.len());
             for site in sites {
                 let before = demands.count();
                 match proc_at(outline, &paths, &site, krate) {
-                    Some((run, kind)) => bound.push(Bound { krate, run, kind, site }),
+                    Some((run, kind)) => bound.push(Bound {
+                        krate,
+                        run,
+                        kind,
+                        site,
+                    }),
                     None => left.push((demands.count() > before, site)),
                 }
             }
             drop(paths);
             defer_derives(&mut bound, start, &mut left);
-            left.into_iter().for_each(|(asked, site)| hold(outline, krate, asked, site));
+            left.into_iter()
+                .for_each(|(asked, site)| hold(outline, krate, asked, site));
         }
         (bound, demands)
     }
@@ -83,7 +100,10 @@ impl Names {
 /// Leaves out each derive of crate calls `bound[start..]` and `left` whose item an attribute macro written before it rewrites, since the derive runs on that macro's output, and holds back the derives whose attribute is still being resolved.
 fn defer_derives(bound: &mut Vec<Bound>, start: usize, left: &mut Vec<(bool, Site)>) {
     let ready = bound[start..].iter().map(|call| (&call.site, true));
-    let pending = left.iter().filter(|(asked, _)| *asked).map(|(_, site)| (site, false));
+    let pending = left
+        .iter()
+        .filter(|(asked, _)| *asked)
+        .map(|(_, site)| (site, false));
     let attrs: Vec<(Arc<File>, u32, u32, bool)> = ready
         .chain(pending)
         .filter_map(|(site, ready)| match site {
@@ -92,7 +112,12 @@ fn defer_derives(bound: &mut Vec<Bound>, start: usize, left: &mut Vec<(bool, Sit
         })
         .collect();
     let over = |site: &Site| match site {
-        Site::Derive(held) => attrs.iter().find(|(file, at, path, _)| Arc::ptr_eq(file, &held.file) && *at == held.at && *path < held.path.0).map(|entry| entry.3),
+        Site::Derive(held) => attrs
+            .iter()
+            .find(|(file, at, path, _)| {
+                Arc::ptr_eq(file, &held.file) && *at == held.at && *path < held.path.0
+            })
+            .map(|entry| entry.3),
         _ => None,
     };
     left.retain(|(_, site)| over(site) != Some(true));
@@ -117,9 +142,22 @@ fn hold(outline: &mut Outline, krate: usize, asked: bool, site: Site) {
     }
 }
 
-fn proc_at(outline: &Outline, paths: &Paths<'_>, site: &Site, krate: usize) -> Option<(ItemRef, ProcKind)> {
+fn proc_at(
+    outline: &Outline,
+    paths: &Paths<'_>,
+    site: &Site,
+    krate: usize,
+) -> Option<(ItemRef, ProcKind)> {
     let (src, path) = site.path()?;
-    let run = macro_at(paths, src, path, ModRef { krate: krate as u32, module: site.module() as u32 })?;
+    let run = macro_at(
+        paths,
+        src,
+        path,
+        ModRef {
+            krate: krate as u32,
+            module: site.module() as u32,
+        },
+    )?;
     if run.outer().is_some() {
         return None;
     }

@@ -32,7 +32,16 @@ pub(crate) struct Bits {
     pub(crate) xcr0: u64,
 }
 
-const NONE: Bits = Bits { leaf1_ecx: 0, leaf7_ebx: 0, leaf7_ecx: 0, leaf7_edx: 0, leaf7_1_eax: 0, leaf7_1_edx: 0, extended_ecx: 0, xcr0: 0 };
+const NONE: Bits = Bits {
+    leaf1_ecx: 0,
+    leaf7_ebx: 0,
+    leaf7_ecx: 0,
+    leaf7_edx: 0,
+    leaf7_1_eax: 0,
+    leaf7_1_edx: 0,
+    extended_ecx: 0,
+    xcr0: 0,
+};
 
 impl Bits {
     const fn with(self, other: Bits) -> Bits {
@@ -64,17 +73,35 @@ impl Family {
             .with(Self::Fma.bits())
             .with(Self::Avx2.bits())
             .with(Self::VectorCrypto.bits()),
-            Self::Fma => Bits { leaf1_ecx: 1 << 12, ..NONE },
-            Self::Avx2 => Bits { leaf7_ebx: 1 << 5, leaf7_1_eax: 1 << 4, ..NONE }.with(Self::Avx512.bits()),
+            Self::Fma => Bits {
+                leaf1_ecx: 1 << 12,
+                ..NONE
+            },
+            Self::Avx2 => Bits {
+                leaf7_ebx: 1 << 5,
+                leaf7_1_eax: 1 << 4,
+                ..NONE
+            }
+            .with(Self::Avx512.bits()),
             Self::Avx512 => Bits {
-                leaf7_ebx: 1 << 16 | 1 << 17 | 1 << 21 | 1 << 26 | 1 << 27 | 1 << 28 | 1 << 30 | 1 << 31,
+                leaf7_ebx: 1 << 16
+                    | 1 << 17
+                    | 1 << 21
+                    | 1 << 26
+                    | 1 << 27
+                    | 1 << 28
+                    | 1 << 30
+                    | 1 << 31,
                 leaf7_ecx: 1 << 1 | 1 << 6 | 1 << 11 | 1 << 12 | 1 << 14,
                 leaf7_edx: 1 << 2 | 1 << 3 | 1 << 8 | 1 << 23,
                 leaf7_1_eax: 1 << 5,
                 xcr0: 0b111 << 5,
                 ..NONE
             },
-            Self::VectorCrypto => Bits { leaf7_ecx: 1 << 9 | 1 << 10, ..NONE },
+            Self::VectorCrypto => Bits {
+                leaf7_ecx: 1 << 9 | 1 << 10,
+                ..NONE
+            },
         }
     }
 }
@@ -96,8 +123,18 @@ pub(super) fn registers(leaf: u32, sub_leaf: u32) -> [u32; 4] {
     let [eax, ebx, ecx, edx] = arch::registers(leaf, sub_leaf);
     match (leaf, sub_leaf) {
         (1, _) => [eax, ebx, ecx & !HIDDEN.leaf1_ecx, edx],
-        (7, 0) => [eax, ebx & !HIDDEN.leaf7_ebx, ecx & !HIDDEN.leaf7_ecx, edx & !HIDDEN.leaf7_edx],
-        (7, 1) => [eax & !HIDDEN.leaf7_1_eax, ebx, ecx, edx & !HIDDEN.leaf7_1_edx],
+        (7, 0) => [
+            eax,
+            ebx & !HIDDEN.leaf7_ebx,
+            ecx & !HIDDEN.leaf7_ecx,
+            edx & !HIDDEN.leaf7_edx,
+        ],
+        (7, 1) => [
+            eax & !HIDDEN.leaf7_1_eax,
+            ebx,
+            ecx,
+            edx & !HIDDEN.leaf7_1_edx,
+        ],
         (0x8000_0001, _) => [eax, ebx, ecx & !HIDDEN.extended_ecx, edx],
         _ => [eax, ebx, ecx, edx],
     }
@@ -106,7 +143,11 @@ pub(super) fn registers(leaf: u32, sub_leaf: u32) -> [u32; 4] {
 /// The extended control register `register` that `xgetbv` gives compiled code, or zero when the OS has not enabled `xgetbv`.
 pub(super) fn control(register: u32) -> u64 {
     let value = arch::control(register);
-    if register == 0 { value & !HIDDEN.xcr0 } else { value }
+    if register == 0 {
+        value & !HIDDEN.xcr0
+    } else {
+        value
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -123,7 +164,11 @@ mod arch {
     pub(super) fn control(register: u32) -> u64 {
         let enabled = __cpuid(1).ecx & OSXSAVE != 0;
         // SAFETY: the OS set CR4.OSXSAVE, which `cpuid` leaf 1 reports, so `xgetbv` does not fault.
-        if enabled { unsafe { _xgetbv(register) } } else { 0 }
+        if enabled {
+            unsafe { _xgetbv(register) }
+        } else {
+            0
+        }
     }
 }
 

@@ -17,7 +17,10 @@ impl Checker<'_, '_> {
                     self.collect_pat_locals(sub, out);
                 }
             }
-            Pat::Paren(inner) | Pat::Ref { pat: inner, .. } | Pat::Box(inner) | Pat::Deref(inner) => {
+            Pat::Paren(inner)
+            | Pat::Ref { pat: inner, .. }
+            | Pat::Box(inner)
+            | Pat::Deref(inner) => {
                 self.collect_pat_locals(inner, out);
             }
             Pat::Tuple(list) | Pat::TupleStruct(_, list) | Pat::Slice(list) | Pat::Or(list) => {
@@ -45,13 +48,20 @@ impl Checker<'_, '_> {
         }
     }
 
-    pub(super) fn block_liveness(&self, ids: &[u32], tail: Option<ExprId>, outer_live: &HashSet<u32>) -> (Vec<HashSet<u32>>, Vec<HashSet<u32>>, HashSet<u32>) {
+    pub(super) fn block_liveness(
+        &self,
+        ids: &[u32],
+        tail: Option<ExprId>,
+        outer_live: &HashSet<u32>,
+    ) -> (Vec<HashSet<u32>>, Vec<HashSet<u32>>, HashSet<u32>) {
         let mut live = outer_live.clone();
         if let Some(t) = tail {
             self.collect_live_expr(t, &mut live);
         }
         for &id in ids {
-            if let Stmt::Let { pat, init: Some(_), .. } = self.body.stmts[id as usize]
+            if let Stmt::Let {
+                pat, init: Some(_), ..
+            } = self.body.stmts[id as usize]
                 && !matches!(*self.body.pat(pat), Pat::Wild)
             {
                 let mut bound = HashSet::default();
@@ -76,7 +86,12 @@ impl Checker<'_, '_> {
 
     pub(super) fn collect_live_stmt(&self, stmt: Stmt, live: &mut HashSet<u32>) {
         match stmt {
-            Stmt::Let { pat, init, otherwise, .. } => {
+            Stmt::Let {
+                pat,
+                init,
+                otherwise,
+                ..
+            } => {
                 let mut bound = HashSet::default();
                 self.collect_pat_locals(pat, &mut bound);
                 for local in bound {
@@ -121,7 +136,10 @@ impl Checker<'_, '_> {
                     self.collect_live_expr(lhs, live);
                 }
             }
-            Expr::Binary(_, a, b) | Expr::AssignOp(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) => {
+            Expr::Binary(_, a, b)
+            | Expr::AssignOp(_, a, b)
+            | Expr::Index(a, b)
+            | Expr::Repeat(a, b) => {
                 self.collect_live_expr(b, live);
                 self.collect_live_expr(a, live);
             }
@@ -131,7 +149,9 @@ impl Checker<'_, '_> {
                 }
                 self.collect_live_expr(callee, live);
             }
-            Expr::Method { receiver, params, .. } => {
+            Expr::Method {
+                receiver, params, ..
+            } => {
                 for &a in self.body.list(params).iter().rev() {
                     self.collect_live_expr(ExprId(a), live);
                 }
@@ -193,7 +213,9 @@ impl Checker<'_, '_> {
                 }
                 live.extend(body_live);
             }
-            Expr::For { pat, iter, body, .. } => {
+            Expr::For {
+                pat, iter, body, ..
+            } => {
                 let mut loop_live = HashSet::default();
                 self.collect_live_expr(body, &mut loop_live);
                 let mut bound = HashSet::default();
@@ -268,16 +290,32 @@ impl Checker<'_, '_> {
                 self.collect_pat_locals(pat, out);
                 self.collect_declared_locals_expr(init, out);
             }
-            Expr::Paren(e) | Expr::Unary(_, e) | Expr::Field(e, _) | Expr::TupleField(e, _) | Expr::Cast(e, _) | Expr::Ref { expr: e, .. } | Expr::Try(e) | Expr::Await(e) => {
+            Expr::Paren(e)
+            | Expr::Unary(_, e)
+            | Expr::Field(e, _)
+            | Expr::TupleField(e, _)
+            | Expr::Cast(e, _)
+            | Expr::Ref { expr: e, .. }
+            | Expr::Try(e)
+            | Expr::Await(e) => {
                 self.collect_declared_locals_expr(e, out);
             }
-            Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) | Expr::Index(a, b) => {
+            Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::AssignOp(_, a, b)
+            | Expr::Index(a, b) => {
                 self.collect_declared_locals_expr(a, out);
                 self.collect_declared_locals_expr(b, out);
             }
             Expr::Block { stmts, tail, .. } => {
                 for &s in self.body.list(stmts) {
-                    if let Stmt::Let { pat, init, otherwise, .. } = self.body.stmts[s as usize] {
+                    if let Stmt::Let {
+                        pat,
+                        init,
+                        otherwise,
+                        ..
+                    } = self.body.stmts[s as usize]
+                    {
                         self.collect_pat_locals(pat, out);
                         if let Some(e) = init {
                             self.collect_declared_locals_expr(e, out);
@@ -319,52 +357,103 @@ impl Checker<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Return(_) => true,
             Expr::Closure { .. } => false,
-            Expr::Paren(e) | Expr::Unary(_, e) | Expr::Field(e, _) | Expr::TupleField(e, _) | Expr::Cast(e, _) | Expr::Ref { expr: e, .. } | Expr::Try(e) | Expr::Await(e) | Expr::Become(e) | Expr::Let(_, e) | Expr::Loop { body: e, .. } => {
-                self.expr_has_return(e)
+            Expr::Paren(e)
+            | Expr::Unary(_, e)
+            | Expr::Field(e, _)
+            | Expr::TupleField(e, _)
+            | Expr::Cast(e, _)
+            | Expr::Ref { expr: e, .. }
+            | Expr::Try(e)
+            | Expr::Await(e)
+            | Expr::Become(e)
+            | Expr::Let(_, e)
+            | Expr::Loop { body: e, .. } => self.expr_has_return(e),
+            Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::AssignOp(_, a, b)
+            | Expr::Index(a, b)
+            | Expr::Repeat(a, b)
+            | Expr::While {
+                cond: a, body: b, ..
             }
-            Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) | Expr::While { cond: a, body: b, .. } | Expr::For { iter: a, body: b, .. } => {
-                self.expr_has_return(a) || self.expr_has_return(b)
+            | Expr::For {
+                iter: a, body: b, ..
+            } => self.expr_has_return(a) || self.expr_has_return(b),
+            Expr::Call(a, list)
+            | Expr::Method {
+                receiver: a,
+                params: list,
+                ..
+            } => {
+                self.expr_has_return(a)
+                    || self
+                        .body
+                        .list(list)
+                        .iter()
+                        .any(|&id| self.expr_has_return(ExprId(id)))
             }
-            Expr::Call(a, list) | Expr::Method { receiver: a, params: list, .. } => {
-                self.expr_has_return(a) || self.body.list(list).iter().any(|&id| self.expr_has_return(ExprId(id)))
-            }
-            Expr::Tuple(list) | Expr::Array(list) => {
-                self.body.list(list).iter().any(|&id| self.expr_has_return(ExprId(id)))
-            }
+            Expr::Tuple(list) | Expr::Array(list) => self
+                .body
+                .list(list)
+                .iter()
+                .any(|&id| self.expr_has_return(ExprId(id))),
             Expr::Struct { fields, base, .. } => {
-                self.body.list(fields).iter().any(|&id| self.expr_has_return(self.body.fields[id as usize].value))
+                self.body
+                    .list(fields)
+                    .iter()
+                    .any(|&id| self.expr_has_return(self.body.fields[id as usize].value))
                     || base.is_some_and(|b| self.expr_has_return(b))
             }
-            Expr::Block { kind, stmts, tail, .. } => {
+            Expr::Block {
+                kind, stmts, tail, ..
+            } => {
                 !matches!(kind, BlockKind::Async | BlockKind::AsyncMove)
-                    && (self.body.list(stmts).iter().any(|&id| match self.body.stmts[id as usize] {
-                        Stmt::Let { init, otherwise, .. } => {
-                            init.is_some_and(|e| self.expr_has_return(e))
-                                || otherwise.is_some_and(|e| self.expr_has_return(e))
+                    && (self.body.list(stmts).iter().any(|&id| {
+                        match self.body.stmts[id as usize] {
+                            Stmt::Let {
+                                init, otherwise, ..
+                            } => {
+                                init.is_some_and(|e| self.expr_has_return(e))
+                                    || otherwise.is_some_and(|e| self.expr_has_return(e))
+                            }
+                            Stmt::Expr(e, _) => self.expr_has_return(e),
+                            Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => false,
                         }
-                        Stmt::Expr(e, _) => self.expr_has_return(e),
-                        Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => false,
                     }) || tail.is_some_and(|t| self.expr_has_return(t)))
             }
             Expr::If(c, t, e) => {
-                self.expr_has_return(c) || self.expr_has_return(t) || e.is_some_and(|alt| self.expr_has_return(alt))
+                self.expr_has_return(c)
+                    || self.expr_has_return(t)
+                    || e.is_some_and(|alt| self.expr_has_return(alt))
             }
             Expr::Match(s, arms) => {
                 self.expr_has_return(s)
                     || self.body.list(arms).iter().any(|&id| {
                         let arm = self.body.arms[id as usize];
-                        arm.guard.is_some_and(|g| self.expr_has_return(g)) || self.expr_has_return(arm.body)
+                        arm.guard.is_some_and(|g| self.expr_has_return(g))
+                            || self.expr_has_return(arm.body)
                     })
             }
             Expr::Range { from, to, .. } => {
-                from.is_some_and(|f| self.expr_has_return(f)) || to.is_some_and(|t| self.expr_has_return(t))
+                from.is_some_and(|f| self.expr_has_return(f))
+                    || to.is_some_and(|t| self.expr_has_return(t))
             }
             Expr::Break(_, e) | Expr::Yield(e) => e.is_some_and(|e| self.expr_has_return(e)),
-            Expr::Lit(..) | Expr::Path(_) | Expr::Continue(_) | Expr::Macro { .. } | Expr::Underscore | Expr::FormatArgs(_) | Expr::OffsetOf { .. } => false,
+            Expr::Lit(..)
+            | Expr::Path(_)
+            | Expr::Continue(_)
+            | Expr::Macro { .. }
+            | Expr::Underscore
+            | Expr::FormatArgs(_)
+            | Expr::OffsetOf { .. } => false,
         }
     }
 
-    pub(super) fn expr_uses_inner_borrow_local(&mut self, expr: ExprId, inner_locals: &HashSet<u32>) -> bool {
+    pub(super) fn expr_uses_inner_borrow_local(
+        &mut self,
+        expr: ExprId,
+        inner_locals: &HashSet<u32>,
+    ) -> bool {
         if inner_locals.is_empty() {
             return false;
         }
@@ -379,27 +468,52 @@ impl Checker<'_, '_> {
                 false
             }
             Expr::Closure { .. } => true,
-            Expr::Paren(e) | Expr::Unary(_, e) | Expr::Field(e, _) | Expr::TupleField(e, _) | Expr::Cast(e, _) | Expr::Ref { expr: e, .. } | Expr::Try(e) | Expr::Await(e) | Expr::Become(e) => {
-                self.expr_uses_inner_borrow_local(e, inner_locals)
-            }
+            Expr::Paren(e)
+            | Expr::Unary(_, e)
+            | Expr::Field(e, _)
+            | Expr::TupleField(e, _)
+            | Expr::Cast(e, _)
+            | Expr::Ref { expr: e, .. }
+            | Expr::Try(e)
+            | Expr::Await(e)
+            | Expr::Become(e) => self.expr_uses_inner_borrow_local(e, inner_locals),
             Expr::Binary(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) => {
-                self.expr_uses_inner_borrow_local(a, inner_locals) || self.expr_uses_inner_borrow_local(b, inner_locals)
+                self.expr_uses_inner_borrow_local(a, inner_locals)
+                    || self.expr_uses_inner_borrow_local(b, inner_locals)
             }
-            Expr::Call(a, list) | Expr::Method { receiver: a, params: list, .. } => {
+            Expr::Call(a, list)
+            | Expr::Method {
+                receiver: a,
+                params: list,
+                ..
+            } => {
                 let ids: Vec<u32> = self.body.list(list).to_vec();
                 self.expr_uses_inner_borrow_local(a, inner_locals)
-                    || ids.into_iter().any(|id| self.expr_uses_inner_borrow_local(ExprId(id), inner_locals))
+                    || ids
+                        .into_iter()
+                        .any(|id| self.expr_uses_inner_borrow_local(ExprId(id), inner_locals))
             }
             Expr::Tuple(list) | Expr::Array(list) => {
                 let ids: Vec<u32> = self.body.list(list).to_vec();
-                ids.into_iter().any(|id| self.expr_uses_inner_borrow_local(ExprId(id), inner_locals))
+                ids.into_iter()
+                    .any(|id| self.expr_uses_inner_borrow_local(ExprId(id), inner_locals))
             }
             Expr::Struct { fields, base, .. } => {
-                let vals: Vec<ExprId> = self.body.list(fields).iter().map(|&id| self.body.fields[id as usize].value).collect();
-                vals.into_iter().any(|v| self.expr_uses_inner_borrow_local(v, inner_locals))
+                let vals: Vec<ExprId> = self
+                    .body
+                    .list(fields)
+                    .iter()
+                    .map(|&id| self.body.fields[id as usize].value)
+                    .collect();
+                vals.into_iter()
+                    .any(|v| self.expr_uses_inner_borrow_local(v, inner_locals))
                     || base.is_some_and(|b| self.expr_uses_inner_borrow_local(b, inner_locals))
             }
-            Expr::Lit(..) | Expr::Continue(_) | Expr::Underscore | Expr::FormatArgs(_) | Expr::OffsetOf { .. } => false,
+            Expr::Lit(..)
+            | Expr::Continue(_)
+            | Expr::Underscore
+            | Expr::FormatArgs(_)
+            | Expr::OffsetOf { .. } => false,
             _ => true,
         }
     }

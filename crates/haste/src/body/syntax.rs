@@ -1,4 +1,7 @@
-#![expect(dead_code, reason = "the syntax tree records every part of the syntax it parses; sema reads the parts it supports and prints the rest in errors")]
+#![expect(
+    dead_code,
+    reason = "the syntax tree records every part of the syntax it parses; sema reads the parts it supports and prints the rest in errors"
+)]
 
 /// An expression in a body's arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -99,25 +102,65 @@ pub enum Expr {
     Assign(ExprId, ExprId),
     AssignOp(BinOp, ExprId, ExprId),
     Call(ExprId, List),
-    Method { receiver: ExprId, name: u32, args: Option<List>, params: List },
+    Method {
+        receiver: ExprId,
+        name: u32,
+        args: Option<List>,
+        params: List,
+    },
     Field(ExprId, u32),
     TupleField(ExprId, u32),
     Index(ExprId, ExprId),
     Cast(ExprId, TyId),
-    Ref { mutable: bool, raw: bool, expr: ExprId },
-    Block { stmts: List, tail: Option<ExprId>, label: Option<u32>, kind: BlockKind },
+    Ref {
+        mutable: bool,
+        raw: bool,
+        expr: ExprId,
+    },
+    Block {
+        stmts: List,
+        tail: Option<ExprId>,
+        label: Option<u32>,
+        kind: BlockKind,
+    },
     If(ExprId, ExprId, Option<ExprId>),
     Let(PatId, ExprId),
-    While { label: Option<u32>, cond: ExprId, body: ExprId },
-    Loop { label: Option<u32>, body: ExprId },
-    For { label: Option<u32>, pat: PatId, iter: ExprId, body: ExprId },
+    While {
+        label: Option<u32>,
+        cond: ExprId,
+        body: ExprId,
+    },
+    Loop {
+        label: Option<u32>,
+        body: ExprId,
+    },
+    For {
+        label: Option<u32>,
+        pat: PatId,
+        iter: ExprId,
+        body: ExprId,
+    },
     Match(ExprId, List),
-    Closure { params: List, ret: Option<TyId>, body: ExprId, capture: bool },
+    Closure {
+        params: List,
+        ret: Option<TyId>,
+        body: ExprId,
+        capture: bool,
+    },
     Tuple(List),
     Array(List),
     Repeat(ExprId, ExprId),
-    Struct { path: PathId, fields: List, base: Option<ExprId>, rest: bool },
-    Range { from: Option<ExprId>, to: Option<ExprId>, inclusive: bool },
+    Struct {
+        path: PathId,
+        fields: List,
+        base: Option<ExprId>,
+        rest: bool,
+    },
+    Range {
+        from: Option<ExprId>,
+        to: Option<ExprId>,
+        inclusive: bool,
+    },
     Try(ExprId),
     Await(ExprId),
     Return(Option<ExprId>),
@@ -125,11 +168,17 @@ pub enum Expr {
     Continue(Option<u32>),
     Yield(Option<ExprId>),
     Become(ExprId),
-    Macro { path: PathId, open: u32 },
+    Macro {
+        path: PathId,
+        open: u32,
+    },
     Paren(ExprId),
     Underscore,
     FormatArgs(u32),
-    OffsetOf { ty: TyId, fields: List },
+    OffsetOf {
+        ty: TyId,
+        fields: List,
+    },
 }
 
 /// What kind of block a block expression is.
@@ -150,10 +199,20 @@ pub enum BlockKind {
 /// A statement.
 #[derive(Clone, Copy, Debug)]
 pub enum Stmt {
-    Let { pat: PatId, ty: Option<TyId>, init: Option<ExprId>, otherwise: Option<ExprId>, extend: bool },
+    Let {
+        pat: PatId,
+        ty: Option<TyId>,
+        init: Option<ExprId>,
+        otherwise: Option<ExprId>,
+        extend: bool,
+    },
     Expr(ExprId, bool),
     Item(u32, u32),
-    Macro { path: PathId, open: u32, semi: bool },
+    Macro {
+        path: PathId,
+        open: u32,
+        semi: bool,
+    },
     Empty,
 }
 
@@ -162,18 +221,37 @@ pub enum Stmt {
 pub enum Pat {
     Wild,
     Rest,
-    Bind { name: u32, by_ref: bool, mutable: bool, sub: Option<PatId> },
+    Bind {
+        name: u32,
+        by_ref: bool,
+        mutable: bool,
+        sub: Option<PatId>,
+    },
     Lit(ExprId),
-    Range { from: Option<ExprId>, to: Option<ExprId>, inclusive: bool },
+    Range {
+        from: Option<ExprId>,
+        to: Option<ExprId>,
+        inclusive: bool,
+    },
     Path(PathId),
     TupleStruct(PathId, List),
-    Struct { path: PathId, fields: List, rest: bool },
+    Struct {
+        path: PathId,
+        fields: List,
+        rest: bool,
+    },
     Tuple(List),
     Slice(List),
-    Ref { mutable: bool, pat: PatId },
+    Ref {
+        mutable: bool,
+        pat: PatId,
+    },
     Box(PatId),
     Or(List),
-    Macro { path: PathId, open: u32 },
+    Macro {
+        path: PathId,
+        open: u32,
+    },
     Paren(PatId),
     Never,
     Deref(PatId),
@@ -190,17 +268,31 @@ pub struct FieldPat {
 #[derive(Clone, Copy, Debug)]
 pub enum Ty {
     Path(PathId),
-    Ref { lifetime: Option<u32>, mutable: bool, ty: TyId },
-    Ptr { mutable: bool, ty: TyId },
+    Ref {
+        lifetime: Option<u32>,
+        mutable: bool,
+        ty: TyId,
+    },
+    Ptr {
+        mutable: bool,
+        ty: TyId,
+    },
     Slice(TyId),
     Array(TyId, ExprId),
     Tuple(List),
-    Fn { params: List, ret: Option<TyId>, variadic: bool },
+    Fn {
+        params: List,
+        ret: Option<TyId>,
+        variadic: bool,
+    },
     ImplTrait(u32, List),
     DynTrait(List),
     Never,
     Infer,
-    Macro { path: PathId, open: u32 },
+    Macro {
+        path: PathId,
+        open: u32,
+    },
     Paren(TyId),
     Pat(TyId, PatId),
     Const(ExprId),
@@ -209,7 +301,11 @@ pub enum Ty {
 /// A bound in `impl`, `dyn` or a where clause: a trait path with its modifiers and `for<..>` lifetimes, or a lifetime.
 #[derive(Clone, Copy, Debug)]
 pub enum Bound {
-    Trait { path: PathId, maybe: bool, constness: bool },
+    Trait {
+        path: PathId,
+        maybe: bool,
+        constness: bool,
+    },
     Lifetime(u32),
     Use(u32),
 }
@@ -235,8 +331,15 @@ pub enum GenericArg {
     Ty(TyId),
     Lifetime(u32),
     Const(ExprId),
-    Binding { name: u32, args: Option<Args>, ty: TyId },
-    Constraint { name: u32, bounds: List },
+    Binding {
+        name: u32,
+        args: Option<Args>,
+        ty: TyId,
+    },
+    Constraint {
+        name: u32,
+        bounds: List,
+    },
 }
 
 /// A path: an optional `<T as Trait>` qualifier, a leading `::`, its start token, and its segments.

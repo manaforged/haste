@@ -7,7 +7,9 @@ fn scaled(cx: &RewriteCx, x: Value, y: Value) -> Option<(Value, u64)> {
     if !ty.is_small_int() {
         return None;
     }
-    [(x, y), (y, x)].into_iter().find_map(|(n, c)| cx.uconst(c, ty).filter(|&c| c != 0).map(|c| (n, c)))
+    [(x, y), (y, x)]
+        .into_iter()
+        .find_map(|(n, c)| cx.uconst(c, ty).filter(|&c| c != 0).map(|c| (n, c)))
 }
 
 fn upper(cx: &RewriteCx, cc: IntCC, limit: Value, ty: Type) -> Option<u64> {
@@ -22,8 +24,12 @@ fn upper(cx: &RewriteCx, cc: IntCC, limit: Value, ty: Type) -> Option<u64> {
 fn fits_bound(cx: &RewriteCx, cond: Value, (n, c): (Value, u64)) -> Option<u64> {
     let ty = cx.func.ty(n);
     match *cx.op(cond)? {
-        Op::Fits(Binary::Imul, false, x, y) => (scaled(cx, x, y)? == (n, c)).then(|| ty.unsigned_max() / c),
-        Op::Icmp(cc, x, limit) if x == n => upper(cx, cc, limit, ty).filter(|&m| m <= ty.unsigned_max() / c),
+        Op::Fits(Binary::Imul, false, x, y) => {
+            (scaled(cx, x, y)? == (n, c)).then(|| ty.unsigned_max() / c)
+        }
+        Op::Icmp(cc, x, limit) if x == n => {
+            upper(cx, cc, limit, ty).filter(|&m| m <= ty.unsigned_max() / c)
+        }
         _ => None,
     }
 }
@@ -46,10 +52,18 @@ pub(super) fn simplify_mul_fits(cx: &mut RewriteCx, x: Value, y: Value) -> Optio
 
 /// `fits(n * c) ? (n * c <= l ? a : z) : z` as `n <= l / c ? a : z`, the bound that also proves the product fits.
 pub(super) fn gated_product(cx: &mut RewriteCx, cond: Value, inner: Value, z: Value) -> Option<Op> {
-    let &Op::Select(test, a, other) = cx.op(inner)? else { return None };
-    let same = other == z || (cx.func.ty(other) == cx.func.ty(z) && cx.sconst(other).is_some_and(|v| cx.sconst(z) == Some(v)));
-    let &Op::Icmp(cc, product, limit) = cx.op(test)? else { return None };
-    let &Op::Binary(Binary::Imul, px, py) = cx.op(product)? else { return None };
+    let &Op::Select(test, a, other) = cx.op(inner)? else {
+        return None;
+    };
+    let same = other == z
+        || (cx.func.ty(other) == cx.func.ty(z)
+            && cx.sconst(other).is_some_and(|v| cx.sconst(z) == Some(v)));
+    let &Op::Icmp(cc, product, limit) = cx.op(test)? else {
+        return None;
+    };
+    let &Op::Binary(Binary::Imul, px, py) = cx.op(product)? else {
+        return None;
+    };
     let (n, c) = scaled(cx, px, py)?;
     let bound = upper(cx, cc, limit, cx.func.ty(n))? / c;
     if !same || fits_bound(cx, cond, (n, c))? < bound {

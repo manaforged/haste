@@ -39,7 +39,14 @@ impl Body {
 
     /// Whether the parameter pattern `id` is a plain name or `_`, which binds the argument without taking it apart.
     pub fn plain_param(&self, id: PatId) -> bool {
-        matches!(self.pat(id), Pat::Bind { sub: None, by_ref: false, .. } | Pat::Wild)
+        matches!(
+            self.pat(id),
+            Pat::Bind {
+                sub: None,
+                by_ref: false,
+                ..
+            } | Pat::Wild
+        )
     }
 
     /// The type `id`.
@@ -59,7 +66,12 @@ impl Body {
 
     /// The interned name of each segment of this body, parsed from `src`, interned once per body.
     pub fn syms(&self, symbols: &Symbols, src: &Source) -> &[Sym] {
-        self.syms.get_or_init(|| self.segments.iter().map(|segment| symbols.intern(plain(src.text(segment.name)))).collect())
+        self.syms.get_or_init(|| {
+            self.segments
+                .iter()
+                .map(|segment| symbols.intern(plain(src.text(segment.name))))
+                .collect()
+        })
     }
 }
 

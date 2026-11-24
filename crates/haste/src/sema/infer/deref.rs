@@ -38,10 +38,15 @@ impl Infer<'_, '_> {
     pub(super) fn field_base(&mut self, expr: ExprId, found: Ty, field: &str) -> Result<Ty> {
         let (mut ty, mut steps) = (self.known_ty(found)?, 0);
         loop {
-            let Some(next) = self.next_field_step(expr, steps, ty, field)? else { break };
+            let Some(next) = self.next_field_step(expr, steps, ty, field)? else {
+                break;
+            };
             (ty, steps) = (self.resolve(next), steps + 1);
             if steps as usize == crate::RECURSION_LIMIT {
-                bail!("reached the recursion limit while dereferencing {}", self.show(found));
+                bail!(
+                    "reached the recursion limit while dereferencing {}",
+                    self.show(found)
+                );
             }
         }
         if steps > 0 {
@@ -50,10 +55,18 @@ impl Infer<'_, '_> {
         Ok(ty)
     }
 
-    fn next_field_step(&mut self, expr: ExprId, steps: u32, ty: Ty, field: &str) -> Result<Option<Ty>> {
+    fn next_field_step(
+        &mut self,
+        expr: ExprId,
+        steps: u32,
+        ty: Ty,
+        field: &str,
+    ) -> Result<Option<Ty>> {
         match self.cx.types.kind(ty).clone() {
             Kind::Ref(_, inner) => self.known_ty(inner).map(Some),
-            Kind::Adt(item, _) if self.cx.boxed(ty).is_some() && !self.sees_private(item)? => Ok(self.cx.boxed(ty)),
+            Kind::Adt(item, _) if self.cx.boxed(ty).is_some() && !self.sees_private(item)? => {
+                Ok(self.cx.boxed(ty))
+            }
             Kind::Adt(..) if !self.has_field(ty, field)? => self.deref_step(expr, steps, ty),
             Kind::Param(_) | Kind::Proj(_) => {
                 self.poly_fallback();
@@ -73,7 +86,13 @@ impl Infer<'_, '_> {
         let Some(index) = self.field_index(item, 0, field)? else {
             return Ok(false);
         };
-        let vis = self.cx.adt_def(item)?.variants.first().and_then(|v| v.fields.get(index as usize)).map(|f| f.vis);
+        let vis = self
+            .cx
+            .adt_def(item)?
+            .variants
+            .first()
+            .and_then(|v| v.fields.get(index as usize))
+            .map(|f| f.vis);
         match vis {
             Some(crate::body::adt::FieldVis::Public) => Ok(true),
             Some(crate::body::adt::FieldVis::Crate) => Ok(self.home.krate == item.krate),
@@ -91,7 +110,9 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn deref_step_raw(&mut self, expr: ExprId, step: u32, ty: Ty) -> Result<Option<Ty>> {
-        let Some((res, target)) = self.overloaded_deref(ty, Mut::Not)? else { return Ok(None) };
+        let Some((res, target)) = self.overloaded_deref(ty, Mut::Not)? else {
+            return Ok(None);
+        };
         self.out.derefs.insert((expr, step), res);
         Ok(Some(target))
     }
@@ -102,7 +123,9 @@ impl Infer<'_, '_> {
         for step in 0..count {
             let next = match self.out.derefs.contains_key(&(expr, step)) {
                 true => {
-                    let Some((res, target)) = self.overloaded_deref(ty, Mut::Mut)? else { bail!("{} cannot be dereferenced mutably", self.show(ty)) };
+                    let Some((res, target)) = self.overloaded_deref(ty, Mut::Mut)? else {
+                        bail!("{} cannot be dereferenced mutably", self.show(ty))
+                    };
                     self.out.derefs.insert((expr, step), res);
                     Some(target)
                 }
@@ -117,8 +140,10 @@ impl Infer<'_, '_> {
     /// The callable type that the call `expr` of a callee of type `found` invokes, after it dereferences references and `Box`es; records the count on `expr`.
     pub(super) fn callee_base(&mut self, expr: ExprId, found: Ty) -> Ty {
         let (mut ty, mut steps) = (self.resolve(found), 0);
-        while !matches!(self.cx.types.kind(ty), Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Ptr(..))
-            && let Some(inner) = self.builtin_deref(ty)
+        while !matches!(
+            self.cx.types.kind(ty),
+            Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Ptr(..)
+        ) && let Some(inner) = self.builtin_deref(ty)
         {
             (ty, steps) = (self.resolve(inner), steps + 1);
         }
@@ -132,28 +157,50 @@ impl Infer<'_, '_> {
         let Some(Res::Fn(_, substs)) = self.out.operators.get(&expr).cloned() else {
             return Ok(());
         };
-        let Some(method) = self.cx.lang_item("index_mut").and_then(|of| self.cx.trait_member(of, "index_mut")) else { bail!("core has no `IndexMut::index_mut`") };
+        let Some(method) = self
+            .cx
+            .lang_item("index_mut")
+            .and_then(|of| self.cx.trait_member(of, "index_mut"))
+        else {
+            bail!("core has no `IndexMut::index_mut`")
+        };
         self.out.operators.insert(expr, Res::Fn(method, substs));
         Ok(())
     }
 
     fn sees_private(&mut self, item: crate::names::ItemRef) -> Result<bool> {
         let module = self.cx.module_of(item)?;
-        Ok(self.home.krate == module.krate && self.cx.paths(self.home.krate).within(self.home, module))
+        Ok(self.home.krate == module.krate
+            && self.cx.paths(self.home.krate).within(self.home, module))
     }
 
-    pub(super) fn overloaded_deref(&mut self, ty: Ty, mutability: Mut) -> Result<Option<(Res, Ty)>> {
+    pub(super) fn overloaded_deref(
+        &mut self,
+        ty: Ty,
+        mutability: Mut,
+    ) -> Result<Option<(Res, Ty)>> {
         let (lang, name) = match mutability {
             Mut::Not => ("deref", "deref"),
             Mut::Mut => ("deref_mut", "deref_mut"),
         };
-        let Some(method) = self.cx.lang_item(lang).and_then(|of| self.cx.trait_member(of, name)) else { bail!("core has no `{lang}` trait") };
+        let Some(method) = self
+            .cx
+            .lang_item(lang)
+            .and_then(|of| self.cx.trait_member(of, name))
+        else {
+            bail!("core has no `{lang}` trait")
+        };
         let receiver = self.cx.types.intern(Kind::Ref(mutability, ty));
         let Some((item, substs)) = self.trait_method(method, receiver)? else {
             return Ok(None);
         };
         let (_, ret) = self.fn_types(item, &substs)?;
-        let Kind::Ref(_, target) = *self.cx.types.kind(self.resolve(ret)) else { bail!("`{}` returns a value that is not a reference", self.cx.name(item)) };
+        let Kind::Ref(_, target) = *self.cx.types.kind(self.resolve(ret)) else {
+            bail!(
+                "`{}` returns a value that is not a reference",
+                self.cx.name(item)
+            )
+        };
         Ok(Some((Res::fn_of(&self.cx.types, item, &substs), target)))
     }
 

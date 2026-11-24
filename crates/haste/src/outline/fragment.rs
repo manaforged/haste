@@ -10,13 +10,19 @@ fn is_name(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Ident | TokenKind::RawIdent)
 }
 
-const OPERATORS: [&str; 24] = ["<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", ".."];
+const OPERATORS: [&str; 24] = [
+    "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=",
+    "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", "..",
+];
 
 fn glued(src: &Source, at: u32, operator: &str) -> bool {
     operator.char_indices().all(|(index, ch)| {
         let token = at + index as u32;
         let last = index + 1 == operator.len();
-        token < src.len() && src.text(token).len() == 1 && src.text(token).starts_with(ch) && (last || src.joint(token))
+        token < src.len()
+            && src.text(token).len() == 1
+            && src.text(token).starts_with(ch)
+            && (last || src.joint(token))
     })
 }
 
@@ -45,11 +51,18 @@ enum Stop {
 }
 
 fn is_punct(kind: TokenKind) -> bool {
-    !matches!(kind, TokenKind::Ident | TokenKind::RawIdent | TokenKind::Literal { .. } | TokenKind::Lifetime { .. })
+    !matches!(
+        kind,
+        TokenKind::Ident
+            | TokenKind::RawIdent
+            | TokenKind::Literal { .. }
+            | TokenKind::Lifetime { .. }
+    )
 }
 
 fn single_eq(src: &Source, at: u32) -> bool {
-    let glued_before = at > 0 && src.joint(at - 1) && is_punct(src.kind(at - 1)) && !opens(src.kind(at - 1));
+    let glued_before =
+        at > 0 && src.joint(at - 1) && is_punct(src.kind(at - 1)) && !opens(src.kind(at - 1));
     let glued_after = src.joint(at) && matches!(src.kind(at + 1), TokenKind::Eq | TokenKind::Gt);
     src.kind(at) == TokenKind::Eq && !glued_before && !glued_after
 }
@@ -57,8 +70,13 @@ fn single_eq(src: &Source, at: u32) -> bool {
 fn ty_stops(src: &Source, at: u32, first: bool) -> bool {
     let kind = src.kind(at);
     let word = if is_name(kind) { src.text(at) } else { "" };
-    let block = kind == TokenKind::OpenBrace || (!first && kind == TokenKind::OpenBracket && ends_type(src, at));
-    single_eq(src, at) || kind == TokenKind::Or || single_colon(src, at) || matches!(word, "as" | "where") || block
+    let block = kind == TokenKind::OpenBrace
+        || (!first && kind == TokenKind::OpenBracket && ends_type(src, at));
+    single_eq(src, at)
+        || kind == TokenKind::Or
+        || single_colon(src, at)
+        || matches!(word, "as" | "where")
+        || block
 }
 
 fn pat_stops(src: &Source, at: u32, param: bool) -> bool {
@@ -68,7 +86,8 @@ fn pat_stops(src: &Source, at: u32, param: bool) -> bool {
 }
 
 fn stops(src: &Source, at: u32, stop: Stop, first: bool) -> bool {
-    let common = is_pair(src, at, TokenKind::Eq, TokenKind::Gt) || matches!(src.kind(at), TokenKind::Comma | TokenKind::Semi);
+    let common = is_pair(src, at, TokenKind::Eq, TokenKind::Gt)
+        || matches!(src.kind(at), TokenKind::Comma | TokenKind::Semi);
     common
         || match stop {
             Stop::Expr => false,
@@ -83,7 +102,9 @@ fn ends_type(src: &Source, at: u32) -> bool {
         return false;
     };
     match src.kind(before) {
-        TokenKind::Ident | TokenKind::RawIdent => !matches!(src.text(before), "mut" | "dyn" | "impl" | "const"),
+        TokenKind::Ident | TokenKind::RawIdent => {
+            !matches!(src.text(before), "mut" | "dyn" | "impl" | "const")
+        }
         TokenKind::Gt | TokenKind::CloseParen | TokenKind::CloseBracket => true,
         _ => false,
     }
@@ -96,7 +117,8 @@ fn single_colon(src: &Source, at: u32) -> bool {
 }
 
 fn angle(src: &Source, at: u32, angles: u32) -> Option<u32> {
-    let arrow = at > 0 && matches!(src.kind(at - 1), TokenKind::Minus | TokenKind::Eq) && src.joint(at - 1);
+    let arrow =
+        at > 0 && matches!(src.kind(at - 1), TokenKind::Minus | TokenKind::Eq) && src.joint(at - 1);
     match src.kind(at) {
         TokenKind::Lt => Some(angles + 1),
         TokenKind::Gt if arrow => Some(angles),
@@ -124,12 +146,19 @@ fn until(src: &Source, mut at: u32, end: u32, stop: Stop) -> u32 {
 }
 
 fn literal(src: &Source, at: u32) -> Option<u32> {
-    let at = if src.kind(at) == TokenKind::Minus { at + 1 } else { at };
+    let at = if src.kind(at) == TokenKind::Minus {
+        at + 1
+    } else {
+        at
+    };
     let word = is_name(src.kind(at)) && matches!(src.text(at), "true" | "false");
     (matches!(src.kind(at), TokenKind::Literal { .. }) || word).then_some(at + 1)
 }
 
-const PREFIX_WORDS: [&str; 20] = ["if", "match", "while", "for", "loop", "let", "move", "async", "unsafe", "return", "break", "mut", "const", "dyn", "ref", "box", "yield", "static", "impl", "where"];
+const PREFIX_WORDS: [&str; 20] = [
+    "if", "match", "while", "for", "loop", "let", "move", "async", "unsafe", "return", "break",
+    "mut", "const", "dyn", "ref", "box", "yield", "static", "impl", "where",
+];
 
 fn closure_params(src: &Source, at: u32, end: u32) -> u32 {
     if src.kind(at + 1) == TokenKind::Or && src.joint(at) {
@@ -164,7 +193,10 @@ fn is_open_at(src: &Source, at: u32) -> bool {
 }
 
 fn turbofish(src: &Source, at: u32, end: u32) -> Option<u32> {
-    let after_path = at >= 2 && src.kind(at - 1) == TokenKind::Colon && src.kind(at - 2) == TokenKind::Colon && src.joint(at - 2);
+    let after_path = at >= 2
+        && src.kind(at - 1) == TokenKind::Colon
+        && src.kind(at - 2) == TokenKind::Colon
+        && src.joint(at - 2);
     if src.kind(at) != TokenKind::Lt || !after_path {
         return None;
     }
@@ -198,7 +230,11 @@ fn before_operand(src: &Source, at: u32, end: u32) -> (u32, bool) {
 fn expr(src: &Source, mut at: u32, end: u32) -> u32 {
     let mut operand = false;
     while at < end && !stops(src, at, Stop::Expr, false) {
-        let step = if operand { after_operand(src, at) } else { Some(before_operand(src, at, end)) };
+        let step = if operand {
+            after_operand(src, at)
+        } else {
+            Some(before_operand(src, at, end))
+        };
         let Some((next, done)) = step else { break };
         at = next;
         operand = done;
@@ -218,7 +254,11 @@ fn vis(src: &Source, at: u32) -> u32 {
 }
 
 fn path(src: &Source, mut at: u32, end: u32) -> u32 {
-    while at < end && (is_name(src.kind(at)) || src.kind(at) == TokenKind::Colon || src.kind(at) == TokenKind::Dollar) {
+    while at < end
+        && (is_name(src.kind(at))
+            || src.kind(at) == TokenKind::Colon
+            || src.kind(at) == TokenKind::Dollar)
+    {
         at += 1;
     }
     at
@@ -281,12 +321,32 @@ fn long(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
 /// Whether a token of kind `kind` can start an expression, as rustc checks before it parses an `expr` fragment.
 fn can_begin_expr(kind: TokenKind) -> bool {
     use TokenKind::*;
-    opens(kind) || matches!(kind, Ident | RawIdent | Literal { .. } | Lifetime { .. } | Bang | Minus | Star | And | Or | Lt | Colon | Dot | Pound | Dollar)
+    opens(kind)
+        || matches!(
+            kind,
+            Ident
+                | RawIdent
+                | Literal { .. }
+                | Lifetime { .. }
+                | Bang
+                | Minus
+                | Star
+                | And
+                | Or
+                | Lt
+                | Colon
+                | Dot
+                | Pound
+                | Dollar
+        )
 }
 
 /// Whether a fragment of kind `frag` is found by looking at its first token or tree, without parsing.
 pub(super) fn is_short(frag: Frag) -> bool {
-    matches!(frag, Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal | Frag::Block | Frag::Vis)
+    matches!(
+        frag,
+        Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal | Frag::Block | Frag::Vis
+    )
 }
 
 /// The end of the fragment of kind `frag` that starts at `at`, or `None` when it cannot start there.
@@ -297,6 +357,10 @@ pub fn extent(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
     if at >= end {
         return None;
     }
-    let to = if is_short(frag) { short(src, frag, at)? } else { long(src, frag, at, end)? };
+    let to = if is_short(frag) {
+        short(src, frag, at)?
+    } else {
+        long(src, frag, at, end)?
+    };
     (to > at && to <= end).then_some(to)
 }

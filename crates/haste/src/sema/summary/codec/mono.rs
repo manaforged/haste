@@ -11,34 +11,78 @@ use crate::sema::substs::Substs;
 use crate::sema::ty::Types;
 
 use super::super::SummaryKind;
-use super::{Cursor, Decoder, Encoder, FileIndex, framed, read_opt, read_syntax, unframed, write_opt, write_syntax, write_u32, write_u32s};
+use super::{
+    Cursor, Decoder, Encoder, FileIndex, framed, read_opt, read_syntax, unframed, write_opt,
+    write_syntax, write_u32, write_u32s,
+};
 
 const TYPED_MAGIC: [u8; 4] = *b"HMT1";
 const VERDICT_MAGIC: [u8; 4] = *b"HPV1";
 
 /// Encodes the eagerly typed body of a concrete fixed instance at `substs`, or `None` if it is lazy or names a closure or local item.
-pub fn encode_typed(outline: &Outline, types: &Types, substs: Substs, typed: &Typed, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Result<Option<Vec<u8>>> {
-    let LazyTables::Eager(tables) = &typed.tables else { return Ok(None) };
-    Ok(framed((outline, types, &mut key_of), TYPED_MAGIC, |enc, body| enc.write_typed(body, (substs, typed), tables)))
+pub fn encode_typed(
+    outline: &Outline,
+    types: &Types,
+    substs: Substs,
+    typed: &Typed,
+    mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>,
+) -> Result<Option<Vec<u8>>> {
+    let LazyTables::Eager(tables) = &typed.tables else {
+        return Ok(None);
+    };
+    Ok(framed(
+        (outline, types, &mut key_of),
+        TYPED_MAGIC,
+        |enc, body| enc.write_typed(body, (substs, typed), tables),
+    ))
 }
 
 /// Decodes an eagerly typed fixed instance body from `bytes`, or `None` if `expected_substs` or any item mismatches.
-pub fn decode_typed(outline: &Outline, index: &FileIndex, types: &Types, expected_substs: Substs, bytes: &[u8]) -> Result<Option<Typed>> {
-    unframed((outline, index, types), TYPED_MAGIC, bytes, |dec, cur| dec.read_typed(cur, expected_substs))
+pub fn decode_typed(
+    outline: &Outline,
+    index: &FileIndex,
+    types: &Types,
+    expected_substs: Substs,
+    bytes: &[u8],
+) -> Result<Option<Typed>> {
+    unframed((outline, index, types), TYPED_MAGIC, bytes, |dec, cur| {
+        dec.read_typed(cur, expected_substs)
+    })
 }
 
 /// Encodes a settled non-polymorphic summary verdict, or `None` for a polymorphic summary or a hint naming a local item.
-pub fn encode_verdict(outline: &Outline, types: &Types, kind: &SummaryKind, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Result<Option<Vec<u8>>> {
-    Ok(framed((outline, types, &mut key_of), VERDICT_MAGIC, |enc, body| enc.write_verdict(body, kind)))
+pub fn encode_verdict(
+    outline: &Outline,
+    types: &Types,
+    kind: &SummaryKind,
+    mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>,
+) -> Result<Option<Vec<u8>>> {
+    Ok(framed(
+        (outline, types, &mut key_of),
+        VERDICT_MAGIC,
+        |enc, body| enc.write_verdict(body, kind),
+    ))
 }
 
 /// Decodes a non-polymorphic summary verdict from `bytes`, or `None` if any hinted item is absent.
-pub fn decode_verdict(outline: &Outline, index: &FileIndex, types: &Types, bytes: &[u8]) -> Result<Option<SummaryKind>> {
-    unframed((outline, index, types), VERDICT_MAGIC, bytes, |dec, cur| dec.read_verdict(cur).map(Some))
+pub fn decode_verdict(
+    outline: &Outline,
+    index: &FileIndex,
+    types: &Types,
+    bytes: &[u8],
+) -> Result<Option<SummaryKind>> {
+    unframed((outline, index, types), VERDICT_MAGIC, bytes, |dec, cur| {
+        dec.read_verdict(cur).map(Some)
+    })
 }
 
 impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
-    fn write_typed(&mut self, out: &mut Vec<u8>, (substs, typed): (Substs, &Typed), tables: &BodyTables) -> Option<()> {
+    fn write_typed(
+        &mut self,
+        out: &mut Vec<u8>,
+        (substs, typed): (Substs, &Typed),
+        tables: &BodyTables,
+    ) -> Option<()> {
         self.write_substs(out, substs)?;
         self.write_shape(out, &typed.shape)?;
         write_u32(out, typed.locals.len() as u32);
@@ -88,7 +132,9 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
                 out.push(5);
                 self.write_res_list(out, calls)?;
             }
-            Shape::Closure(_) | Shape::Anon(_) | Shape::Asm(_) | Shape::GlobalAlloc(_) => return None,
+            Shape::Closure(_) | Shape::Anon(_) | Shape::Asm(_) | Shape::GlobalAlloc(_) => {
+                return None;
+            }
         }
         Some(())
     }
@@ -99,7 +145,8 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
             SummaryKind::MonomorphicFallback => out.push(0),
             SummaryKind::MonomorphicHints(hints) => {
                 out.push(1);
-                let mut pairs: Vec<(ExprId, ItemRef)> = hints.iter().map(|(&expr, &item)| (expr, item)).collect();
+                let mut pairs: Vec<(ExprId, ItemRef)> =
+                    hints.iter().map(|(&expr, &item)| (expr, item)).collect();
                 pairs.sort_unstable_by_key(|&(expr, _)| expr.0);
                 write_u32(out, pairs.len() as u32);
                 for (expr, item) in pairs {
@@ -118,13 +165,26 @@ impl Decoder<'_> {
             return Ok(None);
         }
         let shape = self.read_shape(cur)?;
-        let locals = (0..cur.u32()?).map(|_| Ok(Local { ty: self.ty(cur.u32()?)? })).collect::<Result<Vec<_>>>()?;
+        let locals = (0..cur.u32()?)
+            .map(|_| {
+                Ok(Local {
+                    ty: self.ty(cur.u32()?)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let params = cur.u32s()?;
         let ret = read_opt(cur, |c| self.ty(c.u32()?))?;
         let drops = self.res_list(cur)?;
         let syntax = Arc::new(read_syntax(cur)?);
         let tables = Arc::new(self.read_tables(cur, syntax)?);
-        Ok(Some(Typed { tables: LazyTables::Eager(tables), locals, params, ret, drops, shape }))
+        Ok(Some(Typed {
+            tables: LazyTables::Eager(tables),
+            locals,
+            params,
+            ret,
+            drops,
+            shape,
+        }))
     }
 
     fn res_list(&self, cur: &mut Cursor<'_>) -> Result<Vec<Res>> {
@@ -134,7 +194,11 @@ impl Decoder<'_> {
     fn read_shape(&self, cur: &mut Cursor<'_>) -> Result<Shape> {
         Ok(match cur.u8()? {
             0 => Shape::Body,
-            1 => Shape::Glue(Glue { drop: read_opt(cur, |c| self.res(c))?, parts: self.res_list(cur)?, resume: read_opt(cur, |c| self.res(c))? }),
+            1 => Shape::Glue(Glue {
+                drop: read_opt(cur, |c| self.res(c))?,
+                parts: self.res_list(cur)?,
+                resume: read_opt(cur, |c| self.res(c))?,
+            }),
             2 => Shape::Virtual(cur.u32()?),
             3 => Shape::Untuple(self.res(cur)?),
             4 => Shape::Ctor(cur.u32()?),
@@ -147,7 +211,9 @@ impl Decoder<'_> {
         Ok(match cur.u8()? {
             0 => SummaryKind::MonomorphicFallback,
             1 => {
-                let hints = (0..cur.u32()?).map(|_| Ok((ExprId(cur.u32()?), self.item(cur.u32()?)?))).collect::<Result<HashMap<_, _>>>()?;
+                let hints = (0..cur.u32()?)
+                    .map(|_| Ok((ExprId(cur.u32()?), self.item(cur.u32()?)?)))
+                    .collect::<Result<HashMap<_, _>>>()?;
                 SummaryKind::MonomorphicHints(Arc::new(hints))
             }
             _ => bail!("invalid verdict tag"),

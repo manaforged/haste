@@ -44,8 +44,16 @@ pub fn defined(path: &Path, table: Table, scope: Scope) -> Result<HashSet<String
         Table::Static => SYMTAB,
         Table::Dynamic => DYNSYM,
     };
-    let kept = |symbol: &Symbol| symbol.section != UNDEFINED && !symbol.name.is_empty() && (scope == Scope::All || matches!(symbol.info >> 4, GLOBAL | WEAK));
-    Ok(symbols(&bytes, kind)?.into_iter().filter(kept).map(|symbol| symbol.name).collect())
+    let kept = |symbol: &Symbol| {
+        symbol.section != UNDEFINED
+            && !symbol.name.is_empty()
+            && (scope == Scope::All || matches!(symbol.info >> 4, GLOBAL | WEAK))
+    };
+    Ok(symbols(&bytes, kind)?
+        .into_iter()
+        .filter(kept)
+        .map(|symbol| symbol.name)
+        .collect())
 }
 
 /// Makes every global symbol that the ELF64 object at `path` defines weak, so the release and exported copies of an instance may both be linked and the first one kept, and gives default visibility to every hidden global or weak symbol that `names` lists, so a shared library exports the instances that rustc declared hidden across codegen units; returns how many symbols changed.
@@ -76,15 +84,27 @@ fn symbols(bytes: &[u8], kind: u32) -> Result<Vec<Symbol>> {
         if word(bytes, section + 4)? as u32 != kind {
             continue;
         }
-        let (start, size) = (word(bytes, section + 0x18)? as usize, word(bytes, section + 0x20)? as usize);
+        let (start, size) = (
+            word(bytes, section + 0x18)? as usize,
+            word(bytes, section + 0x20)? as usize,
+        );
         let strings = section_offset(bytes, word(bytes, section + 0x28)? as u32 as usize)?;
         for at in (start..start + size).step_by(SYMBOL_SIZE) {
             let info = *bytes.get(at + 4).ok_or_else(truncated)?;
             let other = *bytes.get(at + 5).ok_or_else(truncated)?;
             let name = strings + word(bytes, at)? as u32 as usize;
-            let end = bytes.get(name..).and_then(|tail| tail.iter().position(|&byte| byte == 0)).ok_or_else(truncated)?;
+            let end = bytes
+                .get(name..)
+                .and_then(|tail| tail.iter().position(|&byte| byte == 0))
+                .ok_or_else(truncated)?;
             let name = String::from_utf8_lossy(&bytes[name..name + end]).into_owned();
-            found.push(Symbol { at, name, info, other, section: half(bytes, at + 6)? });
+            found.push(Symbol {
+                at,
+                name,
+                info,
+                other,
+                section: half(bytes, at + 6)?,
+            });
         }
     }
     Ok(found)

@@ -10,8 +10,14 @@ const OPCODE_BASE: u8 = 13;
 const STANDARD_LENGTHS: [u8; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
 
 /// The DWARF 4 `.debug_line` section for `.text` at `text_va` of `text_len` bytes, from `.text` offsets paired with `Source::place` keys, naming files among `paths`.
-pub(super) fn debug_line(text_va: u64, text_len: u32, lines: &[(u32, u64)], paths: &[PathBuf]) -> Vec<u8> {
-    let by_key: FxHashMap<u32, &PathBuf> = paths.iter().map(|path| (file_key(path), path)).collect();
+pub(super) fn debug_line(
+    text_va: u64,
+    text_len: u32,
+    lines: &[(u32, u64)],
+    paths: &[PathBuf],
+) -> Vec<u8> {
+    let by_key: FxHashMap<u32, &PathBuf> =
+        paths.iter().map(|path| (file_key(path), path)).collect();
     let mut files: Vec<(&PathBuf, Vec<u32>)> = Vec::new();
     let mut index: FxHashMap<u32, u32> = FxHashMap::default();
     let mut rows = Vec::with_capacity(lines.len());
@@ -24,7 +30,9 @@ pub(super) fn debug_line(text_va: u64, text_len: u32, lines: &[(u32, u64)], path
             files.push((path, line_starts(path)));
             files.len() as u32
         });
-        let line = files[file as usize - 1].1.partition_point(|&start| start <= place as u32);
+        let line = files[file as usize - 1]
+            .1
+            .partition_point(|&start| start <= place as u32);
         rows.push((at, file, line as i64));
     }
     if files.is_empty() {
@@ -68,7 +76,14 @@ pub(super) fn debug_line(text_va: u64, text_len: u32, lines: &[(u32, u64)], path
 
 fn line_starts(path: &PathBuf) -> Vec<u32> {
     let text = std::fs::read(path).unwrap_or_default();
-    std::iter::once(0).chain(text.iter().enumerate().filter(|&(_, &byte)| byte == b'\n').map(|(at, _)| at as u32 + 1)).collect()
+    std::iter::once(0)
+        .chain(
+            text.iter()
+                .enumerate()
+                .filter(|&(_, &byte)| byte == b'\n')
+                .map(|(at, _)| at as u32 + 1),
+        )
+        .collect()
 }
 
 fn set_address(out: &mut Vec<u8>, address: u64) {

@@ -291,7 +291,10 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "forwards block AST fields and checker context to check_block"
+    )]
     fn check_block_expr(
         &mut self,
         expr: ExprId,

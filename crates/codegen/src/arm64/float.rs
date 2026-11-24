@@ -4,8 +4,17 @@ use super::{A, C, Emit, V0, V1};
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
 
-pub(super) const POOL: [u8; 20] = [4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
-pub(super) const BRANCHES: [FloatCC; 6] = [FloatCC::Equal, FloatCC::NotEqual, FloatCC::LessThan, FloatCC::LessThanOrEqual, FloatCC::GreaterThan, FloatCC::GreaterThanOrEqual];
+pub(super) const POOL: [u8; 20] = [
+    4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+];
+pub(super) const BRANCHES: [FloatCC; 6] = [
+    FloatCC::Equal,
+    FloatCC::NotEqual,
+    FloatCC::LessThan,
+    FloatCC::LessThanOrEqual,
+    FloatCC::GreaterThan,
+    FloatCC::GreaterThanOrEqual,
+];
 
 fn swap_float_cc(cc: FloatCC) -> FloatCC {
     match cc {
@@ -52,7 +61,13 @@ impl Emit<'_> {
         Ok(())
     }
 
-    pub(super) fn float_binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
+    pub(super) fn float_binary(
+        &mut self,
+        op: Binary,
+        x: Value,
+        y: Value,
+        result: Value,
+    ) -> Result<(), String> {
         let ty = self.ty(x);
         let fop = match op {
             Binary::Fadd => Fop::Add,
@@ -63,8 +78,17 @@ impl Emit<'_> {
                 let dst = self.fdst(result);
                 let left = self.fin(x, V0);
                 let right = self.fin(y, V1);
-                let base = if op == Binary::Fmin { 0x1E20_7800 } else { 0x1E20_6800 };
-                self.asm.word(base | u32::from(ty == Type::F64) << 22 | u32::from(right.0) << 16 | u32::from(left.0) << 5 | u32::from(dst.0));
+                let base = if op == Binary::Fmin {
+                    0x1E20_7800
+                } else {
+                    0x1E20_6800
+                };
+                self.asm.word(
+                    base | u32::from(ty == Type::F64) << 22
+                        | u32::from(right.0) << 16
+                        | u32::from(left.0) << 5
+                        | u32::from(dst.0),
+                );
                 self.fput(result, dst);
                 return Ok(());
             }
@@ -84,7 +108,8 @@ impl Emit<'_> {
 
     fn is_float_zero(&self, v: Value, ty: Type) -> bool {
         let mag_mask = (ty.sign_bit() as u64).wrapping_sub(1);
-        self.const_bits(v).is_some_and(|bits| (bits as u64 & mag_mask) == 0)
+        self.const_bits(v)
+            .is_some_and(|bits| (bits as u64 & mag_mask) == 0)
     }
 
     pub(super) fn try_emit_float_imm_bits(&mut self, to: Type, raw: i64, dst: Vreg) -> bool {
@@ -97,7 +122,11 @@ impl Emit<'_> {
             return false;
         }
         let double = to == Type::F64;
-        let u = if double { raw as u64 } else { raw as u32 as u64 };
+        let u = if double {
+            raw as u64
+        } else {
+            raw as u32 as u64
+        };
         if u == 0 {
             self.asm.veor_zero(dst);
             self.clobber_vreg(dst);
@@ -105,7 +134,12 @@ impl Emit<'_> {
         }
         if let Some(imm8) = fmov_imm8(double, u) {
             self.clobber_vreg(dst);
-            self.asm.word(0x1E20_1000 | (u32::from(double) << 22) | (u32::from(imm8) << 13) | u32::from(dst.0));
+            self.asm.word(
+                0x1E20_1000
+                    | (u32::from(double) << 22)
+                    | (u32::from(imm8) << 13)
+                    | u32::from(dst.0),
+            );
             return true;
         }
         let pat = if double { u } else { u | (u << 32) };
@@ -118,7 +152,8 @@ impl Emit<'_> {
     }
 
     fn try_emit_float_imm(&mut self, to: Type, x: Value, dst: Vreg) -> bool {
-        self.const_bits(x).is_some_and(|raw| self.try_emit_float_imm_bits(to, raw, dst))
+        self.const_bits(x)
+            .is_some_and(|raw| self.try_emit_float_imm_bits(to, raw, dst))
     }
 
     fn copysign(&mut self, ty: Type, x: Value, y: Value, result: Value) {
@@ -126,15 +161,22 @@ impl Emit<'_> {
         let va = self.fin(x, if vb == V0 { V1 } else { V0 });
         let dst = self.fdst(result);
         let out = if dst == vb {
-            [V0, V1, V2, V3].into_iter().find(|&r| r != vb && r != va).unwrap_or(V3)
+            [V0, V1, V2, V3]
+                .into_iter()
+                .find(|&r| r != vb && r != va)
+                .unwrap_or(V3)
         } else {
             dst
         };
-        let mask = [V0, V1, V2, V3].into_iter().find(|&r| r != va && r != vb && r != out).unwrap_or(V2);
+        let mask = [V0, V1, V2, V3]
+            .into_iter()
+            .find(|&r| r != va && r != vb && r != out)
+            .unwrap_or(V2);
         self.clobber_vreg(mask);
         self.asm.word(0x0F04_6400 | u32::from(mask.0));
         if ty == Type::F64 {
-            self.asm.word(0x5F60_5400 | (u32::from(mask.0) << 5) | u32::from(mask.0));
+            self.asm
+                .word(0x5F60_5400 | (u32::from(mask.0) << 5) | u32::from(mask.0));
         }
         if out != va {
             self.asm.vmov(out, va);
@@ -144,7 +186,13 @@ impl Emit<'_> {
         self.fput(result, out);
     }
 
-    pub(super) fn fma(&mut self, a: Value, b: Value, c: Value, result: Value) -> Result<(), String> {
+    pub(super) fn fma(
+        &mut self,
+        a: Value,
+        b: Value,
+        c: Value,
+        result: Value,
+    ) -> Result<(), String> {
         if self.plan.is_static(result) || self.plan.deferred[result.index()] {
             return Ok(());
         }
@@ -156,7 +204,12 @@ impl Emit<'_> {
         let vb = self.fin(b, V1);
         let vc = self.fin(c, V2);
         let dst = self.fdst(result);
-        let word = 0x1F00_0000 | u32::from(ty == Type::F64) << 22 | u32::from(vb.0) << 16 | u32::from(vc.0) << 10 | u32::from(va.0) << 5 | u32::from(dst.0);
+        let word = 0x1F00_0000
+            | u32::from(ty == Type::F64) << 22
+            | u32::from(vb.0) << 16
+            | u32::from(vc.0) << 10
+            | u32::from(va.0) << 5
+            | u32::from(dst.0);
         self.asm.word(word);
         self.fput(result, dst);
         Ok(())
@@ -178,7 +231,8 @@ impl Emit<'_> {
         };
         if let Some(arg) = zero_arg {
             let reg = self.fin(arg, V0);
-            self.asm.word(0x1E20_2008 | (u32::from(double) << 22) | (u32::from(reg.0) << 5));
+            self.asm
+                .word(0x1E20_2008 | (u32::from(double) << 22) | (u32::from(reg.0) << 5));
         } else {
             let left = self.fin(x, V0);
             let right = self.fin(y, V1);
@@ -195,7 +249,12 @@ impl Emit<'_> {
         self.set_flag(result, cond);
     }
 
-    pub(super) fn float_convert(&mut self, op: Convert, x: Value, result: Value) -> Result<(), String> {
+    pub(super) fn float_convert(
+        &mut self,
+        op: Convert,
+        x: Value,
+        result: Value,
+    ) -> Result<(), String> {
         let (from, to) = (self.ty(x), self.ty(result));
         if from == Type::I128 || to == Type::I128 {
             return Err(format!("{op:?} from {from:?} to {to:?}"));
@@ -211,7 +270,13 @@ impl Emit<'_> {
                 let signed = op == Convert::FromSint;
                 let src = self.src(x, A, Ext::of(signed));
                 let dst = self.fdst(result);
-                self.asm.fconv(if signed { Fconv::Scvtf } else { Fconv::Ucvtf }, to == Type::F64, true, src, dst);
+                self.asm.fconv(
+                    if signed { Fconv::Scvtf } else { Fconv::Ucvtf },
+                    to == Type::F64,
+                    true,
+                    src,
+                    dst,
+                );
                 self.fput(result, dst);
             }
             Convert::ToSintSat | Convert::ToUintSat => {
@@ -219,7 +284,8 @@ impl Emit<'_> {
                 let src = self.fin(x, V0);
                 let dst = self.dst(result);
                 let conv = if signed { Fconv::Fcvtzs } else { Fconv::Fcvtzu };
-                self.asm.fconv(conv, from == Type::F64, to.bits() > 32, dst, src);
+                self.asm
+                    .fconv(conv, from == Type::F64, to.bits() > 32, dst, src);
                 self.clamp(to.bits(), signed, dst);
                 self.put(result, dst);
             }

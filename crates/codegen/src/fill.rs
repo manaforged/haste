@@ -17,18 +17,35 @@ fn known(func: &Function, defs: &[Option<Inst>], value: Value, depth: u32) -> Op
     let next = depth.checked_sub(1)?;
     match *op {
         Op::Const(imm) => Some(imm),
-        Op::Convert(Convert::Uextend, x) => Some(extend(known(func, defs, x, next)?, func.ty(x), false)),
+        Op::Convert(Convert::Uextend, x) => {
+            Some(extend(known(func, defs, x, next)?, func.ty(x), false))
+        }
         Op::Convert(Convert::Sextend | Convert::Ireduce, x) => known(func, defs, x, next),
-        Op::Binary(op, x, y) if func.ty(x).is_small_int() => constant(op, known(func, defs, x, next)?, known(func, defs, y, next)?),
+        Op::Binary(op, x, y) if func.ty(x).is_small_int() => {
+            constant(op, known(func, defs, x, next)?, known(func, defs, y, next)?)
+        }
         _ => None,
     }
 }
 
 /// The target, byte and size of `inst` when it calls `memset` with a constant byte and a small constant size.
 fn fill(func: &Function, defs: &[Option<Inst>], inst: Inst) -> Option<(Value, i64, u32)> {
-    let Op::Call { callee, args, results, .. } = &func.insts[inst.index()].op else { return None };
-    let (&[to, byte, bytes], true) = (&args[..], results.is_empty()) else { return None };
-    if !matches!(func.insts[defs[callee.index()]?.index()].op, Op::Runtime(RuntimeSymbol::Memset)) {
+    let Op::Call {
+        callee,
+        args,
+        results,
+        ..
+    } = &func.insts[inst.index()].op
+    else {
+        return None;
+    };
+    let (&[to, byte, bytes], true) = (&args[..], results.is_empty()) else {
+        return None;
+    };
+    if !matches!(
+        func.insts[defs[callee.index()]?.index()].op,
+        Op::Runtime(RuntimeSymbol::Memset)
+    ) {
         return None;
     }
     let size = known(func, defs, bytes, DEPTH).filter(|size| (0..=FILL_INLINE).contains(size))?;
@@ -55,13 +72,31 @@ fn zero_tested(func: &Function, defs: &[Option<Inst>], res: Value) -> bool {
 }
 
 /// The operands, size and result of `inst` when it calls `memcmp` over a small constant size whose result the code can compute inline.
-fn compare(func: &Function, defs: &[Option<Inst>], inst: Inst) -> Option<(Value, Value, i64, Value)> {
-    let Op::Call { callee, args, results, .. } = &func.insts[inst.index()].op else { return None };
-    let (&[x, y, bytes], &[res]) = (&args[..], &results[..]) else { return None };
-    if !matches!(func.insts[defs[callee.index()]?.index()].op, Op::Runtime(RuntimeSymbol::Memcmp)) {
+fn compare(
+    func: &Function,
+    defs: &[Option<Inst>],
+    inst: Inst,
+) -> Option<(Value, Value, i64, Value)> {
+    let Op::Call {
+        callee,
+        args,
+        results,
+        ..
+    } = &func.insts[inst.index()].op
+    else {
+        return None;
+    };
+    let (&[x, y, bytes], &[res]) = (&args[..], &results[..]) else {
+        return None;
+    };
+    if !matches!(
+        func.insts[defs[callee.index()]?.index()].op,
+        Op::Runtime(RuntimeSymbol::Memcmp)
+    ) {
         return None;
     }
-    let size = known(func, defs, bytes, DEPTH).filter(|size| (1..=COMPARE_INLINE).contains(size))?;
+    let size =
+        known(func, defs, bytes, DEPTH).filter(|size| (1..=COMPARE_INLINE).contains(size))?;
     (size == 1 || zero_tested(func, defs, res)).then_some((x, y, size, res))
 }
 
@@ -72,20 +107,36 @@ fn push(func: &mut Function, op: Op, ty: Type, out: &mut Vec<Inst>) -> Value {
 }
 
 /// Emits the `memcmp` that `compare` found: the byte difference for one byte, else a nonzero value exactly when two overlapping wide reads differ.
-fn compare_inline(func: &mut Function, (x, y, size, res): (Value, Value, i64, Value), out: &mut Vec<Inst>) {
+fn compare_inline(
+    func: &mut Function,
+    (x, y, size, res): (Value, Value, i64, Value),
+    out: &mut Vec<Inst>,
+) {
     let ty = func.ty(res);
     if size == 1 {
-        let (a, b) = (push(func, Op::Load(x, 0), Type::I8, out), push(func, Op::Load(y, 0), Type::I8, out));
-        let (a, b) = (push(func, Op::Convert(Convert::Uextend, a), ty, out), push(func, Op::Convert(Convert::Uextend, b), ty, out));
+        let (a, b) = (
+            push(func, Op::Load(x, 0), Type::I8, out),
+            push(func, Op::Load(y, 0), Type::I8, out),
+        );
+        let (a, b) = (
+            push(func, Op::Convert(Convert::Uextend, a), ty, out),
+            push(func, Op::Convert(Convert::Uextend, b), ty, out),
+        );
         out.push(func.add(Op::Binary(Binary::Isub, a, b), Some(res)));
         return;
     }
-    let wide = [8, 4, 2].into_iter().find(|&w| w <= size).expect("invariant: size is at least two");
+    let wide = [8, 4, 2]
+        .into_iter()
+        .find(|&w| w <= size)
+        .expect("invariant: size is at least two");
     let word = Type::int_of_bytes(wide).expect("invariant: wide is 2, 4 or 8");
     let last = i32::try_from(size - wide).expect("invariant: size is at most eight");
     let mut diff = None;
     for at in if last == 0 { vec![0] } else { vec![0, last] } {
-        let (a, b) = (push(func, Op::Load(x, at), word, out), push(func, Op::Load(y, at), word, out));
+        let (a, b) = (
+            push(func, Op::Load(x, at), word, out),
+            push(func, Op::Load(y, at), word, out),
+        );
         let d = push(func, Op::Binary(Binary::Bxor, a, b), word, out);
         diff = Some(match diff {
             Some(prev) => push(func, Op::Binary(Binary::Bor, prev, d), word, out),
@@ -93,16 +144,38 @@ fn compare_inline(func: &mut Function, (x, y, size, res): (Value, Value, i64, Va
         });
     }
     let zero = push(func, Op::Const(0), word, out);
-    let ne = push(func, Op::Icmp(IntCC::NotEqual, diff.expect("invariant: one read at least"), zero), Type::I8, out);
+    let ne = push(
+        func,
+        Op::Icmp(
+            IntCC::NotEqual,
+            diff.expect("invariant: one read at least"),
+            zero,
+        ),
+        Type::I8,
+        out,
+    );
     out.push(func.add(Op::Convert(Convert::Uextend, ne), Some(res)));
 }
 
-fn resolve_slot(slots: &[Option<(StackSlot, i64)>], ptr: Value, off: i32) -> Option<(StackSlot, i32)> {
+fn resolve_slot(
+    slots: &[Option<(StackSlot, i64)>],
+    ptr: Value,
+    off: i32,
+) -> Option<(StackSlot, i32)> {
     let (slot, base) = slots.get(ptr.index()).copied().flatten()?;
-    i32::try_from(base).ok()?.checked_add(off).map(|total| (slot, total))
+    i32::try_from(base)
+        .ok()?
+        .checked_add(off)
+        .map(|total| (slot, total))
 }
 
-fn emit_load(func: &mut Function, slots: &[Option<(StackSlot, i64)>], (src, off): (Value, i32), ty: Type, out: &mut Vec<Inst>) -> Value {
+fn emit_load(
+    func: &mut Function,
+    slots: &[Option<(StackSlot, i64)>],
+    (src, off): (Value, i32),
+    ty: Type,
+    out: &mut Vec<Inst>,
+) -> Value {
     let val = func.value(ty);
     let op = match resolve_slot(slots, src, off) {
         Some((slot, total)) => Op::StackLoad(slot, total),
@@ -112,7 +185,13 @@ fn emit_load(func: &mut Function, slots: &[Option<(StackSlot, i64)>], (src, off)
     val
 }
 
-fn emit_store(func: &mut Function, slots: &[Option<(StackSlot, i64)>], val: Value, (dst, off): (Value, i32), out: &mut Vec<Inst>) {
+fn emit_store(
+    func: &mut Function,
+    slots: &[Option<(StackSlot, i64)>],
+    val: Value,
+    (dst, off): (Value, i32),
+    out: &mut Vec<Inst>,
+) {
     let op = match resolve_slot(slots, dst, off) {
         Some((slot, total)) => Op::StackStore(val, slot, total),
         None => Op::Store(val, dst, off),
@@ -126,7 +205,9 @@ fn slot_vec_chunks(func: &Function, slots: &[Option<(StackSlot, i64)>]) -> Vec<V
         if ty.is_vector()
             && matches!(ty.bytes(), 8 | 16)
             && let Some(list) = chunks.get_mut(slot.index())
-            && !list.iter().any(|&(o, t)| o == off && t.bytes() == ty.bytes())
+            && !list
+                .iter()
+                .any(|&(o, t)| o == off && t.bytes() == ty.bytes())
         {
             list.push((off, ty));
         }
@@ -210,7 +291,11 @@ fn vec_pieces(
         let next_vec = (at + 1..bytes)
             .find(|&pos| match_vec_at(vec_chunks, slots, (dst, src), pos, bytes).is_some())
             .unwrap_or(bytes);
-        out.extend(crate::copy::words(next_vec - at).into_iter().map(|(ty, off)| (ty, at + off)));
+        out.extend(
+            crate::copy::words(next_vec - at)
+                .into_iter()
+                .map(|(ty, off)| (ty, at + off)),
+        );
         at = next_vec;
     }
     out
@@ -224,9 +309,17 @@ fn stores(
     (to, byte, bytes): (Value, i64, u32),
     out: &mut Vec<Inst>,
 ) {
-    let pieces = if byte == 0 { vec_pieces(vec_chunks, slots, None, to, bytes) } else { crate::copy::words(bytes) };
+    let pieces = if byte == 0 {
+        vec_pieces(vec_chunks, slots, None, to, bytes)
+    } else {
+        crate::copy::words(bytes)
+    };
     for (ty, at) in pieces {
-        let imm = if ty.is_vector() { 0 } else { extend(byte.wrapping_mul(BYTES), ty, false) };
+        let imm = if ty.is_vector() {
+            0
+        } else {
+            extend(byte.wrapping_mul(BYTES), ty, false)
+        };
         let word = func.value(ty);
         out.push(func.add(Op::Const(imm), Some(word)));
         emit_store(func, slots, word, (to, at as i32), out);
@@ -241,12 +334,20 @@ fn expand_copy(
     inst: Inst,
     out: &mut Vec<Inst>,
 ) -> bool {
-    let Op::Copy(dst, src, len) = func.insts[inst.index()].op else { return false };
-    let Some(bytes) = known(func, defs, len, DEPTH).and_then(|n| u32::try_from(n).ok()).filter(|&b| b <= crate::copy::MOVE_INLINE) else {
+    let Op::Copy(dst, src, len) = func.insts[inst.index()].op else {
+        return false;
+    };
+    let Some(bytes) = known(func, defs, len, DEPTH)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&b| b <= crate::copy::MOVE_INLINE)
+    else {
         return false;
     };
     let pieces = vec_pieces(vec_chunks, slots, Some(src), dst, bytes);
-    let loaded: Vec<_> = pieces.iter().map(|&(ty, at)| (emit_load(func, slots, (src, at as i32), ty, out), at as i32)).collect();
+    let loaded: Vec<_> = pieces
+        .iter()
+        .map(|&(ty, at)| (emit_load(func, slots, (src, at as i32), ty, out), at as i32))
+        .collect();
     for (val, at) in loaded {
         emit_store(func, slots, val, (dst, at), out);
     }
@@ -255,7 +356,12 @@ fn expand_copy(
 
 /// Replaces each `memset` of a constant byte and small constant size by stores, each small constant-size `memcmp` by loads and compares, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
 pub(crate) fn run(func: &mut Function) -> Domain {
-    if !crate::schedule::has_live_op(func, |op| matches!(op, Op::Runtime(RuntimeSymbol::Memset | RuntimeSymbol::Memcmp) | Op::Copy(..))) {
+    if !crate::schedule::has_live_op(func, |op| {
+        matches!(
+            op,
+            Op::Runtime(RuntimeSymbol::Memset | RuntimeSymbol::Memcmp) | Op::Copy(..)
+        )
+    }) {
         return Domain::NONE;
     }
     let defs = defs(func);
@@ -280,5 +386,9 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         }
         func.blocks[block].insts = out;
     }
-    if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE }
+    if changed {
+        Domain::MEM | Domain::VALUES
+    } else {
+        Domain::NONE
+    }
 }

@@ -17,11 +17,25 @@ struct Test {
 pub(super) fn run(func: &mut Function) -> bool {
     let cfg = func.cfg();
     let (defs, users) = super::defs_and_uses(func);
-    let tests: Vec<Option<Test>> = (0..func.blocks.len()).map(|b| test(func, &defs, &users, Block(b as u32))).collect();
+    let tests: Vec<Option<Test>> = (0..func.blocks.len())
+        .map(|b| test(func, &defs, &users, Block(b as u32)))
+        .collect();
     let mut moved = Vec::new();
     for (at, found) in tests.iter().enumerate() {
-        let Some(Test { value, constant, equal, other }) = *found else { continue };
-        if !cfg.reachable[at] || cfg.single_pred(equal) != Some(Block(at as u32)) || equal == other || tests[other.index()].is_none_or(|next| next.value != value) {
+        let Some(Test {
+            value,
+            constant,
+            equal,
+            other,
+        }) = *found
+        else {
+            continue;
+        };
+        if !cfg.reachable[at]
+            || cfg.single_pred(equal) != Some(Block(at as u32))
+            || equal == other
+            || tests[other.index()].is_none_or(|next| next.value != value)
+        {
             continue;
         }
         let land = walk(func, &tests, other, value, constant);
@@ -38,11 +52,23 @@ pub(super) fn run(func: &mut Function) -> bool {
 }
 
 /// Where the tests from `block` on lead when `value` holds `constant`.
-fn walk(func: &Function, tests: &[Option<Test>], mut block: Block, value: Value, constant: i64) -> Block {
+fn walk(
+    func: &Function,
+    tests: &[Option<Test>],
+    mut block: Block,
+    value: Value,
+    constant: i64,
+) -> Block {
     let ty = func.ty(value);
     for _ in 0..MAX_WALK {
-        let Some(test) = tests[block.index()].filter(|test| test.value == value) else { break };
-        block = if extend(test.constant, ty, false) == extend(constant, ty, false) { test.equal } else { test.other };
+        let Some(test) = tests[block.index()].filter(|test| test.value == value) else {
+            break;
+        };
+        block = if extend(test.constant, ty, false) == extend(constant, ty, false) {
+            test.equal
+        } else {
+            test.other
+        };
     }
     block
 }
@@ -51,11 +77,18 @@ fn walk(func: &Function, tests: &[Option<Test>], mut block: Block, value: Value,
 fn test(func: &Function, defs: &[Option<Inst>], users: &[u32], block: Block) -> Option<Test> {
     let data = &func.blocks[block.index()];
     let (&last, body) = data.insts.split_last()?;
-    let Op::Brif(cond, then, ref then_args, other, ref other_args) = func.insts[last.index()].op else { return None };
+    let Op::Brif(cond, then, ref then_args, other, ref other_args) = func.insts[last.index()].op
+    else {
+        return None;
+    };
     if !data.params.is_empty() || !then_args.is_empty() || !other_args.is_empty() {
         return None;
     }
-    let local = |inst: &Inst| func.insts[inst.index()].result.is_some_and(|res| users[res.index()] == 1);
+    let local = |inst: &Inst| {
+        func.insts[inst.index()]
+            .result
+            .is_some_and(|res| users[res.index()] == 1)
+    };
     if !body.iter().all(|inst| {
         let op = &func.insts[inst.index()].op;
         local(inst) && (matches!(op, Op::Const(_)) || crate::algebra::branch_cmp(op).is_some())
@@ -63,7 +96,11 @@ fn test(func: &Function, defs: &[Option<Inst>], users: &[u32], block: Block) -> 
         return None;
     }
     let def = defs[cond.index()].filter(|inst| body.contains(inst))?;
-    let (cc @ (IntCC::Equal | IntCC::NotEqual), a, b) = crate::algebra::branch_cmp(&func.insts[def.index()].op)? else { return None };
+    let (cc @ (IntCC::Equal | IntCC::NotEqual), a, b) =
+        crate::algebra::branch_cmp(&func.insts[def.index()].op)?
+    else {
+        return None;
+    };
     if !func.ty(a).is_small_int() {
         return None;
     }
@@ -76,6 +113,15 @@ fn test(func: &Function, defs: &[Option<Inst>], users: &[u32], block: Block) -> 
         (Some(imm), None) => (b, imm),
         _ => return None,
     };
-    let (equal, other) = if cc == IntCC::Equal { (then, other) } else { (other, then) };
-    Some(Test { value, constant, equal, other })
+    let (equal, other) = if cc == IntCC::Equal {
+        (then, other)
+    } else {
+        (other, then)
+    };
+    Some(Test {
+        value,
+        constant,
+        equal,
+        other,
+    })
 }

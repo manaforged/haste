@@ -1,7 +1,10 @@
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow, bail};
-use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, LayoutData, Primitive as Abi, ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange};
+use rustc_abi::{
+    AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, LayoutData, Primitive as Abi,
+    ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange,
+};
 use rustc_index::{Idx, IndexVec};
 
 use crate::names::Primitive;
@@ -41,7 +44,10 @@ pub type Layout = LayoutData<Field, Variant>;
 /// The byte offset of field `index` of variant `variant` in a value of `layout`.
 pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
     match &layout.variants {
-        rustc_abi::Variants::Multiple { variants, .. } => variants[Variant::new(variant as usize)].field_offsets.get(Field::new(index as usize)).map_or(0, |offset| offset.bytes() as i32),
+        rustc_abi::Variants::Multiple { variants, .. } => variants[Variant::new(variant as usize)]
+            .field_offsets
+            .get(Field::new(index as usize))
+            .map_or(0, |offset| offset.bytes() as i32),
         rustc_abi::Variants::Single { index } if index.0 != variant => 0,
         rustc_abi::Variants::Empty => 0,
         _ => layout.fields.offset(index as usize).bytes() as i32,
@@ -50,14 +56,21 @@ pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
 
 /// The data layout of the target being compiled for.
 pub fn target() -> Result<&'static TargetDataLayout> {
-    static CACHE: [OnceLock<TargetDataLayout>; haste_codegen::TARGETS.len()] = [const { OnceLock::new() }; haste_codegen::TARGETS.len()];
+    static CACHE: [OnceLock<TargetDataLayout>; haste_codegen::TARGETS.len()] =
+        [const { OnceLock::new() }; haste_codegen::TARGETS.len()];
     let current = crate::compile_target();
-    let idx = haste_codegen::TARGETS.iter().position(|t| t.triple == current.triple).unwrap_or(0);
+    let idx = haste_codegen::TARGETS
+        .iter()
+        .position(|t| t.triple == current.triple)
+        .unwrap_or(0);
     if let Some(dl) = CACHE[idx].get() {
         return Ok(dl);
     }
     let spec = current.data_layout;
-    let Ok(parsed) = TargetDataLayout::parse_from_llvm_datalayout_string(spec, AddressSpace::ZERO) else { bail!("bad data layout: {spec}") };
+    let Ok(parsed) = TargetDataLayout::parse_from_llvm_datalayout_string(spec, AddressSpace::ZERO)
+    else {
+        bail!("bad data layout: {spec}")
+    };
     Ok(CACHE[idx].get_or_init(|| parsed))
 }
 
@@ -71,7 +84,14 @@ fn scalar(dl: &TargetDataLayout, value: Abi, valid: Option<(u128, u128)>) -> Lay
 
 fn pointer_scalar(dl: &TargetDataLayout, nonnull: bool) -> Scalar {
     let value = Abi::Pointer(AddressSpace::ZERO);
-    let valid_range = if nonnull { WrappingRange { start: 1, end: u64::MAX as u128 } } else { WrappingRange::full(value.size(dl)) };
+    let valid_range = if nonnull {
+        WrappingRange {
+            start: 1,
+            end: u64::MAX as u128,
+        }
+    } else {
+        WrappingRange::full(value.size(dl))
+    };
     Scalar::Initialized { value, valid_range }
 }
 
@@ -84,7 +104,11 @@ fn primitive(dl: &TargetDataLayout, primitive: Primitive) -> Result<Layout> {
         I8 | U8 => scalar(dl, int(Integer::I8, primitive == I8), None),
         I16 | U16 => scalar(dl, int(Integer::I16, primitive == I16), None),
         I32 | U32 => scalar(dl, int(Integer::I32, primitive == I32), None),
-        I64 | U64 | Isize | Usize => scalar(dl, int(Integer::I64, matches!(primitive, I64 | Isize)), None),
+        I64 | U64 | Isize | Usize => scalar(
+            dl,
+            int(Integer::I64, matches!(primitive, I64 | Isize)),
+            None,
+        ),
         I128 | U128 => scalar(dl, int(Integer::I128, primitive == I128), None),
         F32 => scalar(dl, Abi::Float(Float::F32), None),
         F64 => scalar(dl, Abi::Float(Float::F64), None),
@@ -124,32 +148,55 @@ impl Context<'_> {
             }
             Kind::Closure(..) => return self.closure_layout(ty),
             Kind::Array(element, count) => {
-                let Some(count) = self.types.len(count) else { bail!("layout of an array whose length is not known") };
+                let Some(count) = self.types.len(count) else {
+                    bail!("layout of an array whose length is not known")
+                };
                 let element = self.layout(element)?;
-                return calc.layout_of_array_like::<Field, Variant, ()>(&element, Some(count)).map_err(|error| anyhow!("layout of an array: {error:?}"));
+                return calc
+                    .layout_of_array_like::<Field, Variant, ()>(&element, Some(count))
+                    .map_err(|error| anyhow!("layout of an array: {error:?}"));
             }
             ref kind if kind.is_unsized() => return self.unsized_layout(&calc, kind.clone()),
             ref other => bail!("no layout for {other:?} yet"),
         };
-        let layouts = fields.iter().map(|field| self.layout(*field)).collect::<Result<Vec<_>>>()?;
+        let layouts = fields
+            .iter()
+            .map(|field| self.layout(*field))
+            .collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Layout> = layouts.iter().map(|layout| &**layout).collect();
         let refs: IndexVec<Field, &&Layout> = refs.iter().collect();
-        let kind = if fields.is_empty() { StructKind::AlwaysSized } else { StructKind::MaybeUnsized };
-        calc.layout_of_univariant(&refs, &ReprOptions::default(), kind).map_err(|error| anyhow!("layout: {error:?}"))
+        let kind = if fields.is_empty() {
+            StructKind::AlwaysSized
+        } else {
+            StructKind::MaybeUnsized
+        };
+        calc.layout_of_univariant(&refs, &ReprOptions::default(), kind)
+            .map_err(|error| anyhow!("layout: {error:?}"))
     }
 
-    fn unsized_layout(&mut self, calc: &LayoutCalculator<&TargetDataLayout>, kind: Kind) -> Result<Layout> {
+    fn unsized_layout(
+        &mut self,
+        calc: &LayoutCalculator<&TargetDataLayout>,
+        kind: Kind,
+    ) -> Result<Layout> {
         let element = match kind {
             Kind::Slice(element) => element,
             Kind::Prim(Primitive::Str) => self.types.intern(Kind::Prim(Primitive::U8)),
             _ => {
-                let mut unit = calc.layout_of_univariant::<Field, Variant, &&Layout>(&IndexVec::new(), &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout of a trait object: {error:?}"))?;
+                let mut unit = calc
+                    .layout_of_univariant::<Field, Variant, &&Layout>(
+                        &IndexVec::new(),
+                        &ReprOptions::default(),
+                        StructKind::AlwaysSized,
+                    )
+                    .map_err(|error| anyhow!("layout of a trait object: {error:?}"))?;
                 unit.backend_repr = BackendRepr::Memory { sized: false };
                 return Ok(unit);
             }
         };
         let element = self.layout(element)?;
-        calc.layout_of_array_like::<Field, Variant, ()>(&element, None).map_err(|error| anyhow!("layout of a slice: {error:?}"))
+        calc.layout_of_array_like::<Field, Variant, ()>(&element, None)
+            .map_err(|error| anyhow!("layout of a slice: {error:?}"))
     }
 
     /// The type at the end of `ty` whose metadata a pointer to `ty` carries: `ty` itself, or the tail of its last struct field.
@@ -157,7 +204,9 @@ impl Context<'_> {
         if ty == Ty::NONE {
             return Ok(ty);
         }
-        let Kind::Adt(item, _) = *self.types.kind(ty) else { return Ok(ty) };
+        let Kind::Adt(item, _) = *self.types.kind(ty) else {
+            return Ok(ty);
+        };
         if self.types.has_var_flag(ty) {
             bail!("cannot compute tail of open inference variable outside Infer");
         }
@@ -193,10 +242,26 @@ impl Context<'_> {
         }))
     }
 
-    fn pattern(&mut self, dl: &TargetDataLayout, base: Ty, valid_range: WrappingRange) -> Result<Layout> {
+    fn pattern(
+        &mut self,
+        dl: &TargetDataLayout,
+        base: Ty,
+        valid_range: WrappingRange,
+    ) -> Result<Layout> {
         match self.layout(base)?.backend_repr {
-            BackendRepr::Scalar(Scalar::Initialized { value, .. }) => Ok(Layout::scalar(dl, Scalar::Initialized { value, valid_range })),
-            BackendRepr::ScalarPair { a: Scalar::Initialized { value, .. }, b: metadata, .. } => Ok(Layout::scalar_pair(dl, Scalar::Initialized { value, valid_range }, metadata)),
+            BackendRepr::Scalar(Scalar::Initialized { value, .. }) => Ok(Layout::scalar(
+                dl,
+                Scalar::Initialized { value, valid_range },
+            )),
+            BackendRepr::ScalarPair {
+                a: Scalar::Initialized { value, .. },
+                b: metadata,
+                ..
+            } => Ok(Layout::scalar_pair(
+                dl,
+                Scalar::Initialized { value, valid_range },
+                metadata,
+            )),
             _ => bail!("a pattern type on a type that is not a scalar or a pointer with metadata"),
         }
     }
@@ -211,7 +276,10 @@ impl Context<'_> {
         let tail = self.tail(pointee)?;
         let metadata = match self.types.kind(tail) {
             Kind::Dyn(..) => pointer_scalar(dl, true),
-            kind if kind.is_unsized() => Scalar::Initialized { value: Abi::Int(Integer::I64, false), valid_range: WrappingRange::full(Size::from_bytes(8)) },
+            kind if kind.is_unsized() => Scalar::Initialized {
+                value: Abi::Int(Integer::I64, false),
+                valid_range: WrappingRange::full(Size::from_bytes(8)),
+            },
             _ => return Ok(Layout::scalar(dl, data)),
         };
         Ok(Layout::scalar_pair(dl, data, metadata))

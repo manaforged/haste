@@ -32,7 +32,12 @@ impl TlsLayout {
         if plan.has_shim(Shim::ThreadCell) {
             cursor += u64::from(thread_slots.max(1)) * 8;
         }
-        Self { unwind_off, frame_off, cells_off, total: cursor.next_multiple_of(16) }
+        Self {
+            unwind_off,
+            frame_off,
+            cells_off,
+            total: cursor.next_multiple_of(16),
+        }
     }
 }
 
@@ -51,14 +56,24 @@ pub(super) fn emit_arm64_tlv_base(c: &Emit<'_>, desc_va: u64, out: &mut Buf) {
     out.words(&[0xF940_0010, 0xD63F_0200]);
 }
 
-pub(super) fn emit_arm64_tlv_unwind_state(c: &Emit<'_>, desc_va: u64, unwind_off: u64, out: &mut Buf) {
+pub(super) fn emit_arm64_tlv_unwind_state(
+    c: &Emit<'_>,
+    desc_va: u64,
+    unwind_off: u64,
+    out: &mut Buf,
+) {
     emit_arm64_tlv_base(c, desc_va, out);
     if unwind_off != 0 {
         out.u32(arm64_add_imm(0, 0, unwind_off as u32));
     }
 }
 
-pub(super) fn emit_arm64_tlv_thread_cell(c: &Emit<'_>, desc_va: u64, cells_off: u64, out: &mut Buf) -> Result<()> {
+pub(super) fn emit_arm64_tlv_thread_cell(
+    c: &Emit<'_>,
+    desc_va: u64,
+    cells_off: u64,
+    out: &mut Buf,
+) -> Result<()> {
     out.words(&[0xAA00_03E9, 0xAA1E_03EA]);
     emit_arm64_tlv_base(c, desc_va, out);
     if cells_off != 0 {
@@ -68,8 +83,28 @@ pub(super) fn emit_arm64_tlv_thread_cell(c: &Emit<'_>, desc_va: u64, cells_off: 
     let miss = arm64_fwd(0xB400_0000, out);
     out.words(&[0xAA0A_03FE, 0xD65F_03C0]);
     arm64_here(&[miss], out);
-    out.words(&[0xD101_03FF, 0xA900_2BFD, 0xA901_53F3, 0xF900_13F5, 0xAA0B_03F3, 0xAA01_03F4, 0xAA02_03F5]);
-    c.words_call(&[0xF100_029F, 0xD280_0029, 0x9A89_1294, 0xF900_1BFF, 0x9100_C3E0, 0xD280_0801, 0xAA14_03E2], "posix_memalign", out)?;
+    out.words(&[
+        0xD101_03FF,
+        0xA900_2BFD,
+        0xA901_53F3,
+        0xF900_13F5,
+        0xAA0B_03F3,
+        0xAA01_03F4,
+        0xAA02_03F5,
+    ]);
+    c.words_call(
+        &[
+            0xF100_029F,
+            0xD280_0029,
+            0x9A89_1294,
+            0xF900_1BFF,
+            0x9100_C3E0,
+            0xD280_0801,
+            0xAA14_03E2,
+        ],
+        "posix_memalign",
+        out,
+    )?;
     let fail = arm64_fwd(0x3500_0000, out);
     c.words_call(&[0xF940_1BE0, 0x5280_0001, 0xAA14_03E2], "memset", out)?;
     out.u32(0xF900_0260);
@@ -80,11 +115,23 @@ pub(super) fn emit_arm64_tlv_thread_cell(c: &Emit<'_>, desc_va: u64, cells_off: 
     arm64_here(&[fail], out);
     out.u32(0xD280_0000);
     arm64_here(&[done], out);
-    out.words(&[0xF940_13F5, 0xA941_53F3, 0xA940_7BFD, 0x9101_03FF, 0xD65F_03C0]);
+    out.words(&[
+        0xF940_13F5,
+        0xA941_53F3,
+        0xA940_7BFD,
+        0x9101_03FF,
+        0xD65F_03C0,
+    ]);
     Ok(())
 }
 
-pub(super) fn emit_arm64_tlv_frame_cache(c: &Emit<'_>, alloc: bool, desc_va: u64, frame_off: u64, out: &mut Buf) -> Result<()> {
+pub(super) fn emit_arm64_tlv_frame_cache(
+    c: &Emit<'_>,
+    alloc: bool,
+    desc_va: u64,
+    frame_off: u64,
+    out: &mut Buf,
+) -> Result<()> {
     if alloc {
         out.u32(0xF100_001F | (FRAME_CACHE_LIMIT << 10));
         let big = arm64_fwd(0x5400_0002, out);
@@ -95,7 +142,15 @@ pub(super) fn emit_arm64_tlv_frame_cache(c: &Emit<'_>, alloc: bool, desc_va: u64
         }
         out.words(&[0x8B09_0002, 0xF940_0040]);
         let miss = arm64_fwd(0xB400_0000, out);
-        out.words(&[0xF940_0008, 0xF900_0048, 0xF940_0449, 0xD100_0529, 0xF900_0449, 0xAA0A_03FE, 0xD65F_03C0]);
+        out.words(&[
+            0xF940_0008,
+            0xF900_0048,
+            0xF940_0449,
+            0xD100_0529,
+            0xF900_0449,
+            0xAA0A_03FE,
+            0xD65F_03C0,
+        ]);
         arm64_here(&[miss], out);
         out.words(&[0xAA09_03E0, 0xAA0A_03FE]);
         arm64_here(&[big], out);
@@ -108,9 +163,21 @@ pub(super) fn emit_arm64_tlv_frame_cache(c: &Emit<'_>, alloc: bool, desc_va: u64
         if frame_off != 0 {
             out.u32(arm64_add_imm(0, 0, frame_off as u32));
         }
-        out.words(&[0x8B01_0002, 0xF940_0448, 0xF100_011F | (u32::from(FRAME_CACHE_DEPTH) << 10)]);
+        out.words(&[
+            0x8B01_0002,
+            0xF940_0448,
+            0xF100_011F | (u32::from(FRAME_CACHE_DEPTH) << 10),
+        ]);
         let full = arm64_fwd(0x5400_0002, out);
-        out.words(&[0xF940_004B, 0xF900_012B, 0xF900_0049, 0x9100_0508, 0xF900_0448, 0xAA0A_03FE, 0xD65F_03C0]);
+        out.words(&[
+            0xF940_004B,
+            0xF900_012B,
+            0xF900_0049,
+            0x9100_0508,
+            0xF900_0448,
+            0xAA0A_03FE,
+            0xD65F_03C0,
+        ]);
         arm64_here(&[full], out);
         out.words(&[0xAA09_03E0, 0xAA0A_03FE]);
         arm64_here(&[big], out);
@@ -130,18 +197,33 @@ fn arm64_tlv_word(sym: &Symbol, addrs: SectionAddrs, existing: u32) -> Result<u3
             ensure!(addrs.frame_tls != 0, "Arm64TlvCell without frame cache");
             let bytes = (existing >> 10) & 0xFFF;
             let total = addrs.frame_tls as u32 + bytes;
-            ensure!(total < 4096, "Arm64TlvCell frame offset {total} out of range");
+            ensure!(
+                total < 4096,
+                "Arm64TlvCell frame offset {total} out of range"
+            );
             Ok(arm64_add_imm(10, rn, total))
         }
         Symbol::Word(s) => {
-            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
+            ensure!(
+                addrs.thread_tls != 0,
+                "Arm64TlvCell without thread cell table"
+            );
             let byte_off = addrs.thread_tls + s * 8;
-            ensure!(byte_off % 8 == 0 && byte_off < 32_768, "Arm64TlvCell offset {byte_off} out of range");
+            ensure!(
+                byte_off % 8 == 0 && byte_off < 32_768,
+                "Arm64TlvCell offset {byte_off} out of range"
+            );
             Ok(0xF940_0000u32 | (((byte_off as u32 / 8) & 0xFFF) << 10) | (rn << 5))
         }
         Symbol::Host(HostSymbol::ThreadCell) => {
-            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
-            ensure!(addrs.thread_tls % 8 == 0 && addrs.thread_tls < 32_768, "Arm64TlvCell offset out of range");
+            ensure!(
+                addrs.thread_tls != 0,
+                "Arm64TlvCell without thread cell table"
+            );
+            ensure!(
+                addrs.thread_tls % 8 == 0 && addrs.thread_tls < 32_768,
+                "Arm64TlvCell offset out of range"
+            );
             Ok(0xF940_0000u32 | (((addrs.thread_tls as u32 / 8) & 0xFFF) << 10) | (rn << 5))
         }
         ref other => bail!("Arm64TlvCell to {other:?}"),
@@ -162,11 +244,17 @@ pub(super) fn patch_thread_off32(sym: &Symbol, addrs: SectionAddrs, slot: &mut [
             -(addrs.frame_tls as i64)
         }
         Symbol::Word(s) => {
-            ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
+            ensure!(
+                addrs.thread_tls != 0,
+                "ThreadOff32 without a thread cell table"
+            );
             s as i64 * 8 - addrs.thread_tls as i64
         }
         Symbol::Host(HostSymbol::ThreadCell) => {
-            ensure!(addrs.thread_tls != 0, "ThreadOff32 without a thread cell table");
+            ensure!(
+                addrs.thread_tls != 0,
+                "ThreadOff32 without a thread cell table"
+            );
             -(addrs.thread_tls as i64)
         }
         ref other => bail!("ThreadOff32 to {other:?}"),
@@ -176,7 +264,12 @@ pub(super) fn patch_thread_off32(sym: &Symbol, addrs: SectionAddrs, slot: &mut [
     Ok(())
 }
 
-pub(super) fn patch_arm64_tlv_cell(sym: &Symbol, addrs: SectionAddrs, pc_va: u64, slot: &mut [u8]) -> Result<()> {
+pub(super) fn patch_arm64_tlv_cell(
+    sym: &Symbol,
+    addrs: SectionAddrs,
+    pc_va: u64,
+    slot: &mut [u8],
+) -> Result<()> {
     ensure!(addrs.tlv_desc != 0, "Arm64TlvCell without Mach-O TLV");
     patch_arm64_adrp_add(&mut slot[..8], pc_va, false, addrs.tlv_desc, false)?;
     let existing = u32::from_le_bytes([slot[16], slot[17], slot[18], slot[19]]);

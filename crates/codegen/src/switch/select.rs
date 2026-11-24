@@ -1,10 +1,10 @@
 use crate::fold::extend;
 use crate::ir::{Function, Inst, Op, Type, Value};
 
+use super::Info;
 use super::bitmask::known_upper_bound;
 use super::lut::{ColExpr, build_col_lut, emit_col_expr, uval_of};
 use super::tree::{intersect_intervals, match_cond_intervals};
-use super::Info;
 
 struct SelectWalk<'a> {
     func: &'a Function,
@@ -20,7 +20,12 @@ struct SelectWalk<'a> {
 
 impl SelectWalk<'_> {
     fn visit(&mut self, node: Value, domain: Vec<(u64, u64)>, depth: u8, is_root: bool) -> bool {
-        if domain.is_empty() || domain.len() > 64 || depth > 24 || self.select_nodes > 64 || self.leaves.len() > 256 {
+        if domain.is_empty()
+            || domain.len() > 64
+            || depth > 24
+            || self.select_nodes > 64
+            || self.leaves.len() > 256
+        {
             return false;
         }
         if let Some(imm) = self.info.consts.get(node.index()).copied().flatten() {
@@ -36,11 +41,15 @@ impl SelectWalk<'_> {
         if !is_root && self.info.uses.get(node.index()).copied() != Some(1) {
             return false;
         }
-        let Some(inst) = self.info.def_inst.get(node.index()).copied().flatten() else { return false };
+        let Some(inst) = self.info.def_inst.get(node.index()).copied().flatten() else {
+            return false;
+        };
         let Op::Select(cond, t_val, e_val) = self.func.insts[inst.index()].op else {
             return false;
         };
-        let Some(ci) = match_cond_intervals(self.func, self.info, self.b0, cond, self.val, false, false) else {
+        let Some(ci) =
+            match_cond_intervals(self.func, self.info, self.b0, cond, self.val, false, false)
+        else {
             return false;
         };
         self.val = Some(ci.val);
@@ -50,7 +59,9 @@ impl SelectWalk<'_> {
             self.dead.push(inst);
         }
         for u_inst in ci.used {
-            let Some(res) = self.func.insts[u_inst.index()].result else { break };
+            let Some(res) = self.func.insts[u_inst.index()].result else {
+                break;
+            };
             if self.info.def_block.get(res.index()).copied().flatten() != Some(self.b0)
                 || self.info.uses.get(res.index()).copied() != Some(1)
             {
@@ -60,7 +71,10 @@ impl SelectWalk<'_> {
                 self.dead.push(u_inst);
             }
         }
-        let (t_dom, e_dom) = (intersect_intervals(&domain, &ci.true_ivs), intersect_intervals(&domain, &ci.false_ivs));
+        let (t_dom, e_dom) = (
+            intersect_intervals(&domain, &ci.true_ivs),
+            intersect_intervals(&domain, &ci.false_ivs),
+        );
         self.visit(t_val, t_dom, depth + 1, false) && self.visit(e_val, e_dom, depth + 1, false)
     }
 }
@@ -72,12 +86,16 @@ pub(super) fn try_rewrite_select_trees(func: &mut Function, info: &Info, b0: usi
         pos -= 1;
         let root_inst = func.blocks[b0].insts[pos];
         let data = &func.insts[root_inst.index()];
-        let (&Op::Select(cond, ..), Some(root_val)) = (&data.op, data.result) else { continue };
+        let (&Op::Select(cond, ..), Some(root_val)) = (&data.op, data.result) else {
+            continue;
+        };
         let out_ty = func.ty(root_val);
         if !out_ty.is_small_int() {
             continue;
         }
-        let Some(ci0) = match_cond_intervals(func, info, b0, cond, None, false, false) else { continue };
+        let Some(ci0) = match_cond_intervals(func, info, b0, cond, None, false, false) else {
+            continue;
+        };
         let ty = func.ty(ci0.val);
         let mut walk = SelectWalk {
             func,
@@ -98,14 +116,20 @@ pub(super) fn try_rewrite_select_trees(func: &mut Function, info: &Info, b0: usi
         for &(lo, hi, val) in &walk.leaves {
             let count = u128::from(hi - lo) + 1;
             let uv = uval_of(val, out_ty);
-            if let Some((_, tot, cnt)) = groups.iter_mut().find(|(gv, _, _)| uval_of(*gv, out_ty) == uv) {
+            if let Some((_, tot, cnt)) = groups
+                .iter_mut()
+                .find(|(gv, _, _)| uval_of(*gv, out_ty) == uv)
+            {
                 *tot += count;
                 *cnt += 1;
             } else {
                 groups.push((val, count, 1));
             }
         }
-        let Some((default_c, _, _)) = groups.into_iter().max_by_key(|&(_, tot, cnt)| (tot, cnt)) else { continue };
+        let Some((default_c, _, _)) = groups.into_iter().max_by_key(|&(_, tot, cnt)| (tot, cnt))
+        else {
+            continue;
+        };
         let def_u = uval_of(default_c, out_ty);
         let mut non_def: Vec<(u64, u64, i64)> = walk
             .leaves
@@ -128,7 +152,8 @@ pub(super) fn try_rewrite_select_trees(func: &mut Function, info: &Info, b0: usi
         let known_u_max = known_upper_bound(func, info, v);
         let expr = if merged.is_empty() {
             ColExpr::Same(default_c)
-        } else if let Some(expr) = build_col_lut(ty, out_ty, &merged, Some(default_c), known_u_max) {
+        } else if let Some(expr) = build_col_lut(ty, out_ty, &merged, Some(default_c), known_u_max)
+        {
             let words = expr.word_count();
             let profitable = match words {
                 0 => true,
@@ -146,7 +171,9 @@ pub(super) fn try_rewrite_select_trees(func: &mut Function, info: &Info, b0: usi
         let dead = walk.dead;
         let mut insts = Vec::with_capacity(16);
         let _ = emit_col_expr(func, (v, ty), out_ty, expr, known_u_max, &mut insts);
-        let Some(final_inst) = insts.pop() else { continue };
+        let Some(final_inst) = insts.pop() else {
+            continue;
+        };
         let final_op = func.insts[final_inst.index()].op.clone();
         func.insts[final_inst.index()].op = Op::Trap;
         func.insts[root_inst.index()].op = final_op;

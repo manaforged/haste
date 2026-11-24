@@ -6,9 +6,26 @@ use crate::outline::scan;
 use super::cursor::{Cursor, is_name};
 use super::{BlockKind, Expr, ExprId, Node, Stmt};
 
-const QUALIFIED: [(&str, &[&str]); 3] = [("unsafe", &["fn", "impl", "trait", "extern", "auto"]), ("async", &["fn", "unsafe"]), ("safe", &["fn", "static"])];
+const QUALIFIED: [(&str, &[&str]); 3] = [
+    ("unsafe", &["fn", "impl", "trait", "extern", "auto"]),
+    ("async", &["fn", "unsafe"]),
+    ("safe", &["fn", "static"]),
+];
 
-const ITEM_WORDS: [&str; 12] = ["fn", "struct", "enum", "trait", "impl", "mod", "use", "type", "extern", "pub", "macro_rules", "macro"];
+const ITEM_WORDS: [&str; 12] = [
+    "fn",
+    "struct",
+    "enum",
+    "trait",
+    "impl",
+    "mod",
+    "use",
+    "type",
+    "extern",
+    "pub",
+    "macro_rules",
+    "macro",
+];
 
 impl Cursor<'_> {
     /// Parses the block that opens at the current token.
@@ -19,7 +36,12 @@ impl Cursor<'_> {
         let open = self.group();
         let (stmts, tail) = self.inside(open, Cursor::stmts)?;
         let stmts = self.list(&stmts);
-        Ok(self.push_expr(Expr::Block { stmts, tail, label, kind }))
+        Ok(self.push_expr(Expr::Block {
+            stmts,
+            tail,
+            label,
+            kind,
+        }))
     }
 
     fn stmts(&mut self) -> Result<(Vec<u32>, Option<ExprId>)> {
@@ -54,7 +76,12 @@ impl Cursor<'_> {
     }
 
     /// The statements and tail of a block whose last expression is `tail` with attributes `attrs`: the last statement without a semicolon when `tail` is configured out or a macro that expands to no tail.
-    fn ended(&self, mut stmts: Vec<u32>, tail: ExprId, attrs: Option<(u32, u32)>) -> (Vec<u32>, Option<ExprId>) {
+    fn ended(
+        &self,
+        mut stmts: Vec<u32>,
+        tail: ExprId,
+        attrs: Option<(u32, u32)>,
+    ) -> (Vec<u32>, Option<ExprId>) {
         if self.configured_out(attrs) {
             return self.last_as_tail(stmts);
         }
@@ -77,7 +104,12 @@ impl Cursor<'_> {
             return Some((vec![stmt], None));
         }
         match self.body.exprs[expr.0 as usize] {
-            super::Expr::Block { stmts, tail, label: None, kind: super::BlockKind::Expansion } => Some((self.body.list(stmts).to_vec(), tail)),
+            super::Expr::Block {
+                stmts,
+                tail,
+                label: None,
+                kind: super::BlockKind::Expansion,
+            } => Some((self.body.list(stmts).to_vec(), tail)),
             _ => None,
         }
     }
@@ -167,7 +199,9 @@ impl Cursor<'_> {
         while is_name(self.kind_at(at)) && self.punct_at(at + 1, "::") {
             at += 3;
         }
-        is_name(self.kind_at(at)) && self.punct_at(at + 1, "!") && self.kind_at(at + 2) == TokenKind::OpenBrace
+        is_name(self.kind_at(at))
+            && self.punct_at(at + 1, "!")
+            && self.kind_at(at + 2) == TokenKind::OpenBrace
     }
 
     fn item_ahead(&self) -> bool {
@@ -179,7 +213,10 @@ impl Cursor<'_> {
             "macro_rules" => self.punct_at(self.at + 1, "!"),
             "macro" => !next.is_empty(),
             "static" => next != "move" && !self.punct_at(self.at + 1, "|"),
-            "const" => !matches!(next, "" | "move" | "async") || (next == "async" && self.word_at(self.at + 2) == "fn"),
+            "const" => {
+                !matches!(next, "" | "move" | "async")
+                    || (next == "async" && self.word_at(self.at + 2) == "fn")
+            }
             "union" | "auto" => !next.is_empty() && !self.punct_at(self.at + 1, "!"),
             word => ITEM_WORDS.contains(&word),
         }
@@ -188,10 +225,28 @@ impl Cursor<'_> {
     fn let_stmt(&mut self, extend: bool) -> Result<Stmt> {
         self.at += 1;
         let pat = self.pat()?;
-        let ty = if self.eat(":") { Some(self.ty()?) } else { None };
-        let init = if self.eat("=") { Some(self.expr()?) } else { None };
-        let otherwise = if self.eat_word("else") { Some(self.block_expr(None, BlockKind::Plain)?) } else { None };
+        let ty = if self.eat(":") {
+            Some(self.ty()?)
+        } else {
+            None
+        };
+        let init = if self.eat("=") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let otherwise = if self.eat_word("else") {
+            Some(self.block_expr(None, BlockKind::Plain)?)
+        } else {
+            None
+        };
         self.expect(";")?;
-        Ok(Stmt::Let { pat, ty, init, otherwise, extend })
+        Ok(Stmt::Let {
+            pat,
+            ty,
+            init,
+            otherwise,
+            extend,
+        })
     }
 }

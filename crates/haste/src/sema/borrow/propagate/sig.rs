@@ -207,7 +207,10 @@ impl<'a> Checker<'_, 'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "decomposed helper receiving signature metadata and call inputs"
+    )]
     fn sig_sources_without_ret_lifetimes(
         &mut self,
         expr: ExprId,
@@ -339,7 +342,10 @@ impl<'a> Checker<'_, 'a> {
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "decomposed helper receiving receiver lifetime context and state"
+    )]
     fn sig_recv_sources_with_lifetimes(
         &mut self,
         expr: ExprId,

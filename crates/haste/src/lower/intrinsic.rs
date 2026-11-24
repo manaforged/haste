@@ -15,11 +15,19 @@ use super::{Lower, Repr, host_is_x64_or_arm64, repr};
 
 impl Lower<'_, '_> {
     /// Emits intrinsic `which` at type arguments `substs` on `args` inline.
-    pub(super) fn intrinsic(&mut self, origin: &SiteOrigin, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    pub(super) fn intrinsic(
+        &mut self,
+        origin: &SiteOrigin,
+        which: Intrinsic,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Option<Value>> {
         match which {
             Intrinsic::Transmute => self.transmute(substs, args),
             Intrinsic::FloatToInt => {
-                let (&[from, to], &[value]) = (substs, args) else { bail!("float_to_int_unchecked takes one float") };
+                let (&[from, to], &[value]) = (substs, args) else {
+                    bail!("float_to_int_unchecked takes one float")
+                };
                 let (from, to) = (self.num(from)?, self.num(to)?);
                 self.convert(value, from, to).map(Some)
             }
@@ -38,7 +46,9 @@ impl Lower<'_, '_> {
                 Ok(None)
             }
             Intrinsic::Assume => {
-                let &[cond] = args else { bail!("assume takes one bool") };
+                let &[cond] = args else {
+                    bail!("assume takes one bool")
+                };
                 self.ins().assume(cond);
                 Ok(None)
             }
@@ -46,7 +56,13 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn extra_intrinsic(&mut self, origin: &SiteOrigin, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    fn extra_intrinsic(
+        &mut self,
+        origin: &SiteOrigin,
+        which: Intrinsic,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Option<Value>> {
         match which {
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
             Intrinsic::CallerLocation => self.caller_location().map(Some),
@@ -80,35 +96,64 @@ impl Lower<'_, '_> {
     }
 
     /// Lowers a `__rust_*alloc*` shim by dispatching to the crate graph's `#[global_allocator]` static.
-    pub(super) fn global_alloc_body(&mut self, shim: crate::sema::infer::GlobalAllocShim) -> Result<Option<Value>> {
+    pub(super) fn global_alloc_body(
+        &mut self,
+        shim: crate::sema::infer::GlobalAllocShim,
+    ) -> Result<Option<Value>> {
         use crate::sema::infer::Res;
         use crate::sema::traits::GlobalAllocOp;
-        let Res::Fn(alloc_static, _) = shim.allocator else { bail!("global allocator shim has no static") };
-        let Res::Fn(method_item, method_substs) = shim.method else { bail!("global allocator shim has no method") };
-        let alloc_place = self.static_place((alloc_static, crate::sema::substs::Substs::EMPTY), shim.alloc_ty)?;
+        let Res::Fn(alloc_static, _) = shim.allocator else {
+            bail!("global allocator shim has no static")
+        };
+        let Res::Fn(method_item, method_substs) = shim.method else {
+            bail!("global allocator shim has no method")
+        };
+        let alloc_place = self.static_place(
+            (alloc_static, crate::sema::substs::Substs::EMPTY),
+            shim.alloc_ty,
+        )?;
         let self_ref = self.address(alloc_place);
         let param_word = |this: &mut Self, idx: usize| -> Result<Value> {
-            let Some(place) = this.locals.get(idx).copied().flatten() else { bail!("global allocator shim missing param {idx}") };
+            let Some(place) = this.locals.get(idx).copied().flatten() else {
+                bail!("global allocator shim missing param {idx}")
+            };
             let scalar = match place.repr {
                 Repr::Scalar(_) => place,
                 Repr::Mem { .. } => place.at(0, Repr::Scalar(Type::I64)),
                 Repr::Zst => bail!("global allocator shim param {idx} is zero-sized"),
             };
-            this.read(scalar).ok_or_else(|| anyhow::anyhow!("global allocator shim param {idx} has no value"))
+            this.read(scalar)
+                .ok_or_else(|| anyhow::anyhow!("global allocator shim param {idx} has no value"))
         };
         let (ptr, size, align, new_size) = match shim.op {
-            GlobalAllocOp::Alloc | GlobalAllocOp::AllocZeroed => (None, param_word(self, 0)?, param_word(self, 1)?, None),
-            GlobalAllocOp::Dealloc => (Some(param_word(self, 0)?), param_word(self, 1)?, param_word(self, 2)?, None),
-            GlobalAllocOp::Realloc => (Some(param_word(self, 0)?), param_word(self, 1)?, param_word(self, 2)?, Some(param_word(self, 3)?)),
+            GlobalAllocOp::Alloc | GlobalAllocOp::AllocZeroed => {
+                (None, param_word(self, 0)?, param_word(self, 1)?, None)
+            }
+            GlobalAllocOp::Dealloc => (
+                Some(param_word(self, 0)?),
+                param_word(self, 1)?,
+                param_word(self, 2)?,
+                None,
+            ),
+            GlobalAllocOp::Realloc => (
+                Some(param_word(self, 0)?),
+                param_word(self, 1)?,
+                param_word(self, 2)?,
+                Some(param_word(self, 3)?),
+            ),
         };
         let lrepr = repr(self.cx, shim.layout_ty)?;
-        let Some(slot) = self.slot(lrepr) else { bail!("Layout has no stack slot") };
+        let Some(slot) = self.slot(lrepr) else {
+            bail!("Layout has no stack slot")
+        };
         let lo = self.cx.layout(shim.layout_ty)?;
         let size_off = lo.fields.offset(0).bytes() as i32;
         let align_off = lo.fields.offset(1).bytes() as i32;
         self.ins().stack_store(size, slot, size_off);
         self.ins().stack_store(align, slot, align_off);
-        let layout_val = self.read(super::place::Place::slot(slot, lrepr)).ok_or_else(|| anyhow::anyhow!("Layout has no value"))?;
+        let layout_val = self
+            .read(super::place::Place::slot(slot, lrepr))
+            .ok_or_else(|| anyhow::anyhow!("Layout has no value"))?;
         let mut args = vec![self_ref];
         if let Some(p) = ptr {
             args.push(p);
@@ -117,15 +162,27 @@ impl Lower<'_, '_> {
         if let Some(ns) = new_size {
             args.push(ns);
         }
-        self.invoke(SiteOrigin::Known(method_item, method_substs), method_item, method_substs, args)
+        self.invoke(
+            SiteOrigin::Known(method_item, method_substs),
+            method_item,
+            method_substs,
+            args,
+        )
     }
 
     /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
-    pub(super) fn call_host(&mut self, host: HostSymbol, args: &[Value], ret: Option<Type>) -> Option<Value> {
+    pub(super) fn call_host(
+        &mut self,
+        host: HostSymbol,
+        args: &[Value],
+        ret: Option<Type>,
+    ) -> Option<Value> {
         let code = self.emit_symbol(SymbolSource::Host(host.clone()));
         self.mark_if_fresh_alloc(&host, code);
         let mut signature = Signature::new(CallConv::Native);
-        signature.params.extend(args.iter().map(|&arg| AbiParam::new(self.b.func.ty(arg))));
+        signature
+            .params
+            .extend(args.iter().map(|&arg| AbiParam::new(self.b.func.ty(arg))));
         signature.returns.extend(ret.map(AbiParam::new));
         let sig = self.b.import_signature(signature);
         let call = self.ins().call_indirect(sig, code, args);
@@ -140,7 +197,9 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn current_site_location(&mut self) -> Result<Value> {
-        let Some(location) = self.cx.lang_item("panic_location") else { bail!("no `Location` lang item") };
+        let Some(location) = self.cx.lang_item("panic_location") else {
+            bail!("no `Location` lang item")
+        };
         let ty = self.cx.types.adt(location, &[]);
         let layout = self.cx.layout(ty)?;
         let src = self.src;
@@ -162,7 +221,10 @@ impl Lower<'_, '_> {
                 }
                 let before = &root.text[..byte];
                 let line = before.matches('\n').count() as u32 + 1;
-                let col = before[before.rfind('\n').map_or(0, |n| n + 1)..].chars().count() as u32 + 1;
+                let col = before[before.rfind('\n').map_or(0, |n| n + 1)..]
+                    .chars()
+                    .count() as u32
+                    + 1;
                 (line, col)
             }
         };
@@ -179,7 +241,13 @@ impl Lower<'_, '_> {
         put(1, 0, &line.to_le_bytes());
         put(2, 0, &column.to_le_bytes());
         let ptr_offset = crate::sema::layout::field_offset(&layout, 0, 0) as u32;
-        let loc_id = self.slots.rodata(&bytes, &[RodataReloc { offset: ptr_offset, target: RodataTarget::Rodata(file_id) }]);
+        let loc_id = self.slots.rodata(
+            &bytes,
+            &[RodataReloc {
+                offset: ptr_offset,
+                target: RodataTarget::Rodata(file_id),
+            }],
+        );
         Ok(self.emit_symbol(SymbolSource::Rodata(loc_id)))
     }
 
@@ -187,7 +255,13 @@ impl Lower<'_, '_> {
         self.expr_site_token(expr)
             .map(|tok| self.src.place(tok))
             .filter(|&loc| loc != 0)
-            .or_else(|| self.body.expr_ends.get(expr.0 as usize).map(|&end| self.src.place(end.saturating_sub(1))).filter(|&loc| loc != 0))
+            .or_else(|| {
+                self.body
+                    .expr_ends
+                    .get(expr.0 as usize)
+                    .map(|&end| self.src.place(end.saturating_sub(1)))
+                    .filter(|&loc| loc != 0)
+            })
     }
 
     fn expr_site_token(&self, expr: crate::body::ExprId) -> Option<u32> {
@@ -211,19 +285,34 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn wrap_inlined_caller_loc(&mut self, caller_blk: Option<haste_codegen::Block>, from_blk: usize, to_blk: usize) -> Result<()> {
+    pub(super) fn wrap_inlined_caller_loc(
+        &mut self,
+        caller_blk: Option<haste_codegen::Block>,
+        from_blk: usize,
+        to_blk: usize,
+    ) -> Result<()> {
         let after = self.b.block_at(to_blk);
         let mut hits = Vec::new();
         let mut flows_inlined = false;
         for b_idx in from_blk..to_blk {
             let block = self.b.block_at(b_idx);
-            let (b, cx, relocs, reached, dict_param) = (&self.b, &mut self.cx, &self.relocs, self.reached, self.dict_param);
-            if let Some((first_call, can_fall_through, flows)) = b.block_first_tracked(block, after, dict_param, |sym, arg0| match sym.and_then(|s| relocs.get(s as usize)) {
-                Some(SymbolSource::Slot(idx)) => cx.track_caller(reached.list[*idx].0.0),
-                Some(SymbolSource::Host(HostSymbol::ThreadCell)) => arg0 == Some(0),
-                None => sym.is_none(),
-                _ => false,
-            }) {
+            let (b, cx, relocs, reached, dict_param) = (
+                &self.b,
+                &mut self.cx,
+                &self.relocs,
+                self.reached,
+                self.dict_param,
+            );
+            if let Some((first_call, can_fall_through, flows)) =
+                b.block_first_tracked(block, after, dict_param, |sym, arg0| {
+                    match sym.and_then(|s| relocs.get(s as usize)) {
+                        Some(SymbolSource::Slot(idx)) => cx.track_caller(reached.list[*idx].0.0),
+                        Some(SymbolSource::Host(HostSymbol::ThreadCell)) => arg0 == Some(0),
+                        None => sym.is_none(),
+                        _ => false,
+                    }
+                })
+            {
                 flows_inlined |= flows;
                 hits.push((block, first_call, can_fall_through));
             }
@@ -261,13 +350,21 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn with_caller_loc<T>(&mut self, track: Option<bool>, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(super) fn with_caller_loc<T>(
+        &mut self,
+        track: Option<bool>,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         let Some(set_site) = track else {
             return run(self);
         };
         let slot = self.caller_loc_slot()?;
         let prev = self.ins().load(Type::I64, slot, 0);
-        let next = if set_site { self.current_site_location()? } else { self.ins().iconst(Type::I64, 0) };
+        let next = if set_site {
+            self.current_site_location()?
+        } else {
+            self.ins().iconst(Type::I64, 0)
+        };
         self.ins().store(next, slot, 0);
         let res = run(self)?;
         if self.open {
@@ -285,8 +382,16 @@ impl Lower<'_, '_> {
     }
 
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {
-        let &[try_fn, data, catch_fn] = args else { bail!("catch_unwind takes three arguments") };
-        let res = self.call_host(HostSymbol::CatchUnwind, &[try_fn, data, catch_fn], Some(Type::I32)).expect("invariant: catch_unwind returns i32");
+        let &[try_fn, data, catch_fn] = args else {
+            bail!("catch_unwind takes three arguments")
+        };
+        let res = self
+            .call_host(
+                HostSymbol::CatchUnwind,
+                &[try_fn, data, catch_fn],
+                Some(Type::I32),
+            )
+            .expect("invariant: catch_unwind returns i32");
         if self.open {
             let caught = self.b.create_block();
             let done = self.b.create_block();
@@ -304,7 +409,9 @@ impl Lower<'_, '_> {
     }
 
     fn cpuid(&mut self, args: &[Value]) -> Result<Value> {
-        let &[leaf, sub_leaf] = args else { bail!("`__cpuid_count` takes a leaf and a subleaf") };
+        let &[leaf, sub_leaf] = args else {
+            bail!("`__cpuid_count` takes a leaf and a subleaf")
+        };
         let slot = self.b.create_stack_slot(16, 3);
         let out = self.ins().stack_addr(Type::I64, slot, 0);
         self.call_host(HostSymbol::Cpuid, &[out, leaf, sub_leaf], None);
@@ -312,16 +419,24 @@ impl Lower<'_, '_> {
     }
 
     fn transmute(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
-        let (&[from, to], value) = (substs, args.first().copied()) else { bail!("transmute takes two type arguments") };
+        let (&[from, to], value) = (substs, args.first().copied()) else {
+            bail!("transmute takes two type arguments")
+        };
         let (from, to) = (repr(self.cx, from)?, repr(self.cx, to)?);
         Ok(match (from, to, value) {
             (_, Repr::Zst, _) | (Repr::Zst, _, _) | (_, _, None) => None,
             (Repr::Scalar(a), Repr::Scalar(b), Some(value)) if a == b => Some(value),
-            (Repr::Scalar(a), Repr::Scalar(b), Some(value)) if can_bitcast(a, b) => Some(self.ins().bitcast(b, value)),
+            (Repr::Scalar(a), Repr::Scalar(b), Some(value)) if can_bitcast(a, b) => {
+                Some(self.ins().bitcast(b, value))
+            }
             (Repr::Mem { .. }, Repr::Mem { .. }, Some(address)) => Some(address),
-            (Repr::Mem { .. }, Repr::Scalar(ty), Some(address)) => Some(self.ins().load(ty, address, 0)),
+            (Repr::Mem { .. }, Repr::Scalar(ty), Some(address)) => {
+                Some(self.ins().load(ty, address, 0))
+            }
             (Repr::Scalar(ty), _, Some(value)) => {
-                let slot = self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8);
+                let slot = self
+                    .b
+                    .create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8);
                 self.ins().stack_store(value, slot, 0);
                 match to {
                     Repr::Scalar(other) => Some(self.ins().stack_load(other, slot, 0)),
@@ -332,8 +447,16 @@ impl Lower<'_, '_> {
     }
 
     fn with_overflow(&mut self, op: BinOp, substs: &[Ty], args: &[Value]) -> Result<Value> {
-        let (Some(&ty), &[x, y]) = (substs.first(), args) else { bail!("{op:?} with overflow takes one type and two values") };
-        let Num::Int { ty: machine, signed } = self.num(ty)? else { bail!("{op:?} with overflow on a non-integer") };
+        let (Some(&ty), &[x, y]) = (substs.first(), args) else {
+            bail!("{op:?} with overflow takes one type and two values")
+        };
+        let Num::Int {
+            ty: machine,
+            signed,
+        } = self.num(ty)?
+        else {
+            bail!("{op:?} with overflow on a non-integer")
+        };
         let (result, ok) = self.overflowing(op, (machine, signed), x, y)?;
         let overflowed = self.ins().icmp_imm(IntCC::Equal, ok, 0);
         self.flagged(ty, result, overflowed)
@@ -349,7 +472,9 @@ impl Lower<'_, '_> {
     pub(super) fn pair(&mut self, tys: [Ty; 2], values: [Value; 2]) -> Result<Value> {
         let tuple = self.cx.types.tuple(&tys);
         let tuple_repr = repr(self.cx, tuple)?;
-        let Some(slot) = self.slot(tuple_repr) else { bail!("a pair takes no bytes") };
+        let Some(slot) = self.slot(tuple_repr) else {
+            bail!("a pair takes no bytes")
+        };
         for (index, value) in (0..).zip(values) {
             let at = self.field_offset(tuple, index)?;
             self.ins().stack_store(value, slot, at);
@@ -357,33 +482,60 @@ impl Lower<'_, '_> {
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
-    fn const_eval_select(&mut self, origin: &SiteOrigin, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
-        let (Some(&tuple), Some(&runtime)) = (substs.first(), substs.get(2)) else { bail!("const_eval_select takes four type arguments") };
-        let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else { bail!("const_eval_select needs a tuple of arguments and a function item") };
+    fn const_eval_select(
+        &mut self,
+        origin: &SiteOrigin,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Option<Value>> {
+        let (Some(&tuple), Some(&runtime)) = (substs.first(), substs.get(2)) else {
+            bail!("const_eval_select takes four type arguments")
+        };
+        let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (
+            self.cx.types.kind(tuple).clone(),
+            self.cx.types.kind(runtime).clone(),
+        ) else {
+            bail!("const_eval_select needs a tuple of arguments and a function item")
+        };
         let fields = self.cx.types.substs(fields).to_vec();
         let mut values = Vec::new();
         if let Some(&address) = args.first() {
             for (index, field) in fields.into_iter().enumerate() {
                 let offset = self.field_offset(tuple, index as u32)?;
-                let place = Place { base: Base::Addr(address), offset, repr: repr(self.cx, field)? };
+                let place = Place {
+                    base: Base::Addr(address),
+                    offset,
+                    repr: repr(self.cx, field)?,
+                };
                 values.extend(self.read(place));
             }
         }
-        self.invoke(SiteOrigin::ConstEvalSelect(Box::new(origin.clone())), item, fn_substs, values)
+        self.invoke(
+            SiteOrigin::ConstEvalSelect(Box::new(origin.clone())),
+            item,
+            fn_substs,
+            values,
+        )
     }
 
     fn select_unpredictable(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
-        let Some(&ty) = substs.first() else { bail!("select_unpredictable takes one type argument") };
+        let Some(&ty) = substs.first() else {
+            bail!("select_unpredictable takes one type argument")
+        };
         let whole = repr(self.cx, ty)?;
         if whole == Repr::Zst {
             return Ok(None);
         }
-        let &[cond, yes, no] = args else { bail!("select_unpredictable takes three arguments") };
+        let &[cond, yes, no] = args else {
+            bail!("select_unpredictable takes three arguments")
+        };
         match whole {
             Repr::Zst => Ok(None),
             Repr::Scalar(_) => Ok(Some(self.unpredictable(cond, yes, no))),
             Repr::Mem { parts, .. } => {
-                let Some(slot) = self.slot(whole) else { return Ok(None) };
+                let Some(slot) = self.slot(whole) else {
+                    return Ok(None);
+                };
                 let out = self.ins().stack_addr(Type::I64, slot, 0);
                 let mut pick = |m: Type, at: i32| {
                     let a = self.ins().load(m, yes, at);
@@ -414,7 +566,9 @@ impl Lower<'_, '_> {
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
-        let (Some(&pointee), Some(&pointer)) = (substs.first(), args.first()) else { bail!("ptr_metadata takes a pointer") };
+        let (Some(&pointee), Some(&pointer)) = (substs.first(), args.first()) else {
+            bail!("ptr_metadata takes a pointer")
+        };
         let tail = self.cx.tail(pointee)?;
         match self.cx.types.kind(tail) {
             Kind::Dyn(..) => Ok(Some(self.ins().iadd_imm(pointer, 8))),
@@ -423,7 +577,12 @@ impl Lower<'_, '_> {
         }
     }
 
-    pub(super) fn value_intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Value> {
+    pub(super) fn value_intrinsic(
+        &mut self,
+        which: Intrinsic,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Value> {
         use Intrinsic::*;
         match (which, args) {
             (Fabs, &[x]) => Ok(self.ins().fabs(x)),
@@ -437,14 +596,23 @@ impl Lower<'_, '_> {
             (Fma, &[a, b, c]) => Ok(self.ins().fma(a, b, c)),
             (Round(bits), &[x]) => self.round(if bits == 32 { Type::F32 } else { Type::F64 }, x),
             _ => {
-                let Some(&ty) = substs.first() else { bail!("intrinsic {which:?} has no type argument") };
-                let Num::Int { ty, signed } = self.num(ty)? else { bail!("intrinsic {which:?} on a non-integer") };
+                let Some(&ty) = substs.first() else {
+                    bail!("intrinsic {which:?} has no type argument")
+                };
+                let Num::Int { ty, signed } = self.num(ty)? else {
+                    bail!("intrinsic {which:?} on a non-integer")
+                };
                 self.int_intrinsic(which, (ty, signed), args)
             }
         }
     }
 
-    fn int_intrinsic(&mut self, which: Intrinsic, num: (Type, bool), args: &[Value]) -> Result<Value> {
+    fn int_intrinsic(
+        &mut self,
+        which: Intrinsic,
+        num: (Type, bool),
+        args: &[Value],
+    ) -> Result<Value> {
         use Intrinsic::*;
         Ok(match (which, args) {
             (WrappingAdd, &[x, y]) => self.ins().iadd(x, y),
@@ -473,7 +641,13 @@ impl Lower<'_, '_> {
         self.resize(value, (ty, false), Type::I32)
     }
 
-    pub(super) fn saturating(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
+    pub(super) fn saturating(
+        &mut self,
+        op: BinOp,
+        (ty, signed): (Type, bool),
+        x: Value,
+        y: Value,
+    ) -> Result<Value> {
         let (result, ok) = self.overflowing(op, (ty, signed), x, y)?;
         let bound = match (op, signed) {
             (BinOp::Add, false) => self.int_const(ty, u128::MAX),
@@ -500,7 +674,12 @@ impl Lower<'_, '_> {
         Ok(self.ins().select(up, away, whole))
     }
 
-    fn compare_const_bytes(&mut self, origin: &SiteOrigin, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    fn compare_const_bytes(
+        &mut self,
+        origin: &SiteOrigin,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Option<Value>> {
         let &[x, y, count] = args else {
             return self.memory_intrinsic(origin, Intrinsic::CompareBytes, substs, args);
         };
@@ -512,7 +691,10 @@ impl Lower<'_, '_> {
         };
         let (a, b) = (self.ins().load(ty, x, 0), self.ins().load(ty, y, 0));
         let (a, b) = (self.ins().bswap(a), self.ins().bswap(b));
-        let (lt, gt) = (self.ins().icmp(IntCC::UnsignedLessThan, a, b), self.ins().icmp(IntCC::UnsignedGreaterThan, a, b));
+        let (lt, gt) = (
+            self.ins().icmp(IntCC::UnsignedLessThan, a, b),
+            self.ins().icmp(IntCC::UnsignedGreaterThan, a, b),
+        );
         let diff = self.ins().isub(gt, lt);
         Ok(Some(self.ins().sextend(Type::I32, diff)))
     }
@@ -520,7 +702,9 @@ impl Lower<'_, '_> {
 
 fn can_bitcast(a: Type, b: Type) -> bool {
     a.bytes() == b.bytes()
-        && ((a.bytes() == 8 && (a.is_vector() || matches!(a, Type::F64 | Type::I64)) && (b.is_vector() || matches!(b, Type::F64 | Type::I64)))
+        && ((a.bytes() == 8
+            && (a.is_vector() || matches!(a, Type::F64 | Type::I64))
+            && (b.is_vector() || matches!(b, Type::F64 | Type::I64)))
             || matches!((a, b), (Type::F32 | Type::I32, Type::F32 | Type::I32))
             || (a.is_vector() && b.is_vector()))
 }

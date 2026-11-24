@@ -168,13 +168,20 @@ impl From<TokenTree> for TokenStream {
 
 impl FromIterator<TokenTree> for TokenStream {
     fn from_iter<I: IntoIterator<Item = TokenTree>>(trees: I) -> TokenStream {
-        TokenStream { trees: trees.into_iter().collect() }
+        TokenStream {
+            trees: trees.into_iter().collect(),
+        }
     }
 }
 
 impl FromIterator<TokenStream> for TokenStream {
     fn from_iter<I: IntoIterator<Item = TokenStream>>(streams: I) -> TokenStream {
-        TokenStream { trees: streams.into_iter().flat_map(|stream| stream.trees).collect() }
+        TokenStream {
+            trees: streams
+                .into_iter()
+                .flat_map(|stream| stream.trees)
+                .collect(),
+        }
     }
 }
 
@@ -186,7 +193,8 @@ impl Extend<TokenTree> for TokenStream {
 
 impl Extend<TokenStream> for TokenStream {
     fn extend<I: IntoIterator<Item = TokenStream>>(&mut self, streams: I) {
-        self.trees.extend(streams.into_iter().flat_map(|stream| stream.trees));
+        self.trees
+            .extend(streams.into_iter().flat_map(|stream| stream.trees));
     }
 }
 
@@ -195,7 +203,9 @@ impl IntoIterator for TokenStream {
     type IntoIter = token_stream::IntoIter;
 
     fn into_iter(self) -> token_stream::IntoIter {
-        token_stream::IntoIter { trees: self.trees.into_iter() }
+        token_stream::IntoIter {
+            trees: self.trees.into_iter(),
+        }
     }
 }
 
@@ -270,7 +280,11 @@ impl From<Literal> for TokenTree {
 impl Group {
     /// A group of `stream` between `delimiter`.
     pub fn new(delimiter: Delimiter, stream: TokenStream) -> Group {
-        Group { delimiter, stream, span: Span::call_site() }
+        Group {
+            delimiter,
+            stream,
+            span: Span::call_site(),
+        }
     }
 
     /// The delimiter of the group.
@@ -320,14 +334,22 @@ impl fmt::Display for Group {
 
 impl fmt::Debug for Group {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Group").field("delimiter", &self.delimiter).field("stream", &self.stream).field("span", &self.span).finish()
+        f.debug_struct("Group")
+            .field("delimiter", &self.delimiter)
+            .field("stream", &self.stream)
+            .field("span", &self.span)
+            .finish()
     }
 }
 
 impl Punct {
     /// The punctuation character `ch` with `spacing`.
     pub fn new(ch: char, spacing: Spacing) -> Punct {
-        Punct { ch, spacing, span: Span::call_site() }
+        Punct {
+            ch,
+            spacing,
+            span: Span::call_site(),
+        }
     }
 
     /// The character.
@@ -371,7 +393,11 @@ impl fmt::Display for Punct {
 
 impl fmt::Debug for Punct {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Punct").field("ch", &self.ch).field("spacing", &self.spacing).field("span", &self.span).finish()
+        f.debug_struct("Punct")
+            .field("ch", &self.ch)
+            .field("spacing", &self.spacing)
+            .field("span", &self.span)
+            .finish()
     }
 }
 
@@ -379,14 +405,26 @@ impl Ident {
     /// The identifier `name` at `span`.
     pub fn new(name: &str, span: Span) -> Ident {
         match name.strip_prefix("r#") {
-            Some(rest) => Ident { name: rest.to_owned(), raw: true, span },
-            None => Ident { name: name.to_owned(), raw: false, span },
+            Some(rest) => Ident {
+                name: rest.to_owned(),
+                raw: true,
+                span,
+            },
+            None => Ident {
+                name: name.to_owned(),
+                raw: false,
+                span,
+            },
         }
     }
 
     /// The raw identifier `r#name` at `span`.
     pub fn new_raw(name: &str, span: Span) -> Ident {
-        Ident { name: name.to_owned(), raw: true, span }
+        Ident {
+            name: name.to_owned(),
+            raw: true,
+            span,
+        }
     }
 
     /// The span of the identifier.
@@ -411,7 +449,10 @@ impl fmt::Display for Ident {
 
 impl fmt::Debug for Ident {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Ident").field("ident", &self.to_string()).field("span", &self.span).finish()
+        f.debug_struct("Ident")
+            .field("ident", &self.to_string())
+            .field("span", &self.span)
+            .finish()
     }
 }
 
@@ -497,7 +538,8 @@ impl fmt::Display for LexError {
 impl std::error::Error for LexError {}
 
 fn parsed(text: &[u8]) -> TokenStream {
-    let text = std::str::from_utf8(text).unwrap_or_else(|error| panic!("macro input is not UTF-8: {error}"));
+    let text = std::str::from_utf8(text)
+        .unwrap_or_else(|error| panic!("macro input is not UTF-8: {error}"));
     TokenStream::from_str(text).unwrap_or_else(|error| panic!("macro input does not lex: {error}"))
 }
 
@@ -512,7 +554,12 @@ fn hand_back(stream: TokenStream, out: *mut usize) {
 
 /// Runs the derive or function-like macro `run` on the text at `input` and writes the address and length of its output text to `out`.
 #[doc(hidden)]
-pub fn __haste_expand1(run: fn(TokenStream) -> TokenStream, input: *const u8, len: usize, out: *mut usize) {
+pub fn __haste_expand1(
+    run: fn(TokenStream) -> TokenStream,
+    input: *const u8,
+    len: usize,
+    out: *mut usize,
+) {
     // SAFETY: the host passes `len` readable bytes at `input`.
     let input = parsed(unsafe { std::slice::from_raw_parts(input, len) });
     hand_back(expanding(|| run(input)), out);
@@ -520,8 +567,20 @@ pub fn __haste_expand1(run: fn(TokenStream) -> TokenStream, input: *const u8, le
 
 /// Runs the attribute macro `run` on the attribute text and the item text, and writes the address and length of its output text to `out`.
 #[doc(hidden)]
-pub fn __haste_expand2(run: fn(TokenStream, TokenStream) -> TokenStream, attr: *const u8, attr_len: usize, item: *const u8, item_len: usize, out: *mut usize) {
+pub fn __haste_expand2(
+    run: fn(TokenStream, TokenStream) -> TokenStream,
+    attr: *const u8,
+    attr_len: usize,
+    item: *const u8,
+    item_len: usize,
+    out: *mut usize,
+) {
     // SAFETY: the host passes the given number of readable bytes at each address.
-    let (attr, item) = unsafe { (parsed(std::slice::from_raw_parts(attr, attr_len)), parsed(std::slice::from_raw_parts(item, item_len))) };
+    let (attr, item) = unsafe {
+        (
+            parsed(std::slice::from_raw_parts(attr, attr_len)),
+            parsed(std::slice::from_raw_parts(item, item_len)),
+        )
+    };
     hand_back(expanding(|| run(attr, item)), out);
 }

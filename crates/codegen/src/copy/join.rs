@@ -1,4 +1,6 @@
-use super::{Edge, collect_sret_info, incoming_edges, move_to_sret_src, resolve_slot, retarget_edge};
+use super::{
+    Edge, collect_sret_info, incoming_edges, move_to_sret_src, resolve_slot, retarget_edge,
+};
 use crate::ir::{Block, BlockData, Function, Inst, Op, Value};
 
 /// A copy into the return memory that `hoist` moved from the head of a join onto each edge that reaches it.
@@ -14,21 +16,39 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
     let mut plans: Vec<(Block, Inst, Vec<(Block, Edge, Option<Value>)>)> = Vec::new();
     let mut reads = Vec::new();
     for &(join, pos, copy) in info.uses_of(sret_ptr) {
-        let Some(param) = move_to_sret_src(func, &info.defs, copy, sret_ptr, bytes) else { continue };
+        let Some(param) = move_to_sret_src(func, &info.defs, copy, sret_ptr, bytes) else {
+            continue;
+        };
         let block = &func.blocks[join.index()];
-        if join == entry || !block.params.contains(&param) || !block.insts[..pos].iter().all(|&inst| pure(&func.insts[inst.index()].op)) {
+        if join == entry
+            || !block.params.contains(&param)
+            || !block.insts[..pos]
+                .iter()
+                .all(|&inst| pure(&func.insts[inst.index()].op))
+        {
             continue;
         }
-        let Some(loads) = later_loads(func, &info, (join, pos), param, copy) else { continue };
-        let at = block.params.iter().position(|&p| p == param).unwrap_or(usize::MAX);
+        let Some(loads) = later_loads(func, &info, (join, pos), param, copy) else {
+            continue;
+        };
+        let at = block
+            .params
+            .iter()
+            .position(|&p| p == param)
+            .unwrap_or(usize::MAX);
         let mut edges = Vec::new();
         for &pred in info.preds_of(join) {
             for (edge, args) in incoming_edges(func, pred, join) {
-                let addr = args.and_then(|a| a.get(at).copied()).filter(|&addr| resolve_slot(func, &info.defs, addr).is_some());
+                let addr = args
+                    .and_then(|a| a.get(at).copied())
+                    .filter(|&addr| resolve_slot(func, &info.defs, addr).is_some());
                 edges.push((pred, edge, addr));
             }
         }
-        if !edges.is_empty() && edges.iter().all(|&(.., addr)| addr.is_some()) && !plans.iter().any(|&(seen, ..)| seen == join) {
+        if !edges.is_empty()
+            && edges.iter().all(|&(.., addr)| addr.is_some())
+            && !plans.iter().any(|&(seen, ..)| seen == join)
+        {
             plans.push((join, copy, edges));
             reads.extend(loads);
         }
@@ -38,7 +58,10 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
             *from = sret_ptr;
         }
     }
-    let hoisted: Vec<Hoist> = plans.into_iter().map(|(join, copy, edges)| hoist_one(func, sret_ptr, bytes, join, copy, &edges)).collect();
+    let hoisted: Vec<Hoist> = plans
+        .into_iter()
+        .map(|(join, copy, edges)| hoist_one(func, sret_ptr, bytes, join, copy, &edges))
+        .collect();
     if !hoisted.is_empty() {
         func.bump_cfg();
     }
@@ -46,15 +69,28 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
 }
 
 /// The loads of `param` in `join` after its copy at `pos`, when they are its only other uses and nothing between the copy and them writes memory, so each can read the copy's target instead.
-fn later_loads(func: &Function, info: &super::SretUseInfo, (join, pos): (Block, usize), param: Value, copy: Inst) -> Option<Vec<Inst>> {
+fn later_loads(
+    func: &Function,
+    info: &super::SretUseInfo,
+    (join, pos): (Block, usize),
+    param: Value,
+    copy: Inst,
+) -> Option<Vec<Inst>> {
     let insts = &func.blocks[join.index()].insts;
     let mut loads = Vec::new();
     for &(block, at, user) in info.uses_of(param) {
         if user == copy {
             continue;
         }
-        let quiet = |inst: &Inst| pure(&func.insts[inst.index()].op) || matches!(func.insts[inst.index()].op, Op::Load(..));
-        if block != join || at <= pos || !matches!(func.insts[user.index()].op, Op::Load(from, _) if from == param) || !insts[pos + 1..at].iter().all(quiet) {
+        let quiet = |inst: &Inst| {
+            pure(&func.insts[inst.index()].op)
+                || matches!(func.insts[inst.index()].op, Op::Load(..))
+        };
+        if block != join
+            || at <= pos
+            || !matches!(func.insts[user.index()].op, Op::Load(from, _) if from == param)
+            || !insts[pos + 1..at].iter().all(quiet)
+        {
             return None;
         }
         loads.push(user);
@@ -64,11 +100,21 @@ fn later_loads(func: &Function, info: &super::SretUseInfo, (join, pos): (Block, 
 
 /// Whether `op` neither touches memory nor branches.
 fn pure(op: &Op) -> bool {
-    matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::SlotAddr(_) | Op::Binary(..) | Op::Convert(..))
+    matches!(
+        op,
+        Op::Const(_) | Op::StackAddr(..) | Op::SlotAddr(_) | Op::Binary(..) | Op::Convert(..)
+    )
 }
 
 /// Removes `copy` from the head of `join` and puts a copy of each edge's slot before that edge.
-fn hoist_one(func: &mut Function, sret_ptr: Value, bytes: u32, join: Block, copy: Inst, edges: &[(Block, Edge, Option<Value>)]) -> Hoist {
+fn hoist_one(
+    func: &mut Function,
+    sret_ptr: Value,
+    bytes: u32,
+    join: Block,
+    copy: Inst,
+    edges: &[(Block, Edge, Option<Value>)],
+) -> Hoist {
     func.blocks[join.index()].insts.retain(|&inst| inst != copy);
     let mut placed = Vec::new();
     for &(pred, edge, addr) in edges {
@@ -80,40 +126,70 @@ fn hoist_one(func: &mut Function, sret_ptr: Value, bytes: u32, join: Block, copy
             placed.push((pred, edge, moved, None));
             continue;
         }
-        let Some(Op::Brif(_, then, then_args, other, other_args)) = func.last(pred) else { continue };
-        let args = if edge == Edge::Then { then_args.clone() } else { other_args.clone() };
+        let Some(Op::Brif(_, then, then_args, other, other_args)) = func.last(pred) else {
+            continue;
+        };
+        let args = if edge == Edge::Then {
+            then_args.clone()
+        } else {
+            other_args.clone()
+        };
         let target = if edge == Edge::Then { *then } else { *other };
         let jump = func.add(Op::Jump(target, args), None);
         let block = Block(func.blocks.len() as u32);
-        func.blocks.push(BlockData { params: Vec::new(), insts: vec![moved, jump] });
+        func.blocks.push(BlockData {
+            params: Vec::new(),
+            insts: vec![moved, jump],
+        });
         retarget_edge(func, pred, edge, block, Vec::new());
         placed.push((pred, edge, moved, Some(block)));
     }
-    Hoist { join, copy, edges: placed }
+    Hoist {
+        join,
+        copy,
+        edges: placed,
+    }
 }
 
 /// Puts back at its join each hoisted copy none of whose edge copies was forwarded; returns whether any hoist stayed.
 pub(super) fn settle(func: &mut Function, hoisted: Vec<Hoist>) -> bool {
     let mut kept = false;
     for one in hoisted {
-        if !one.edges.iter().all(|&(_, _, moved, _)| matches!(func.insts[moved.index()].op, Op::Move(..))) {
+        if !one
+            .edges
+            .iter()
+            .all(|&(_, _, moved, _)| matches!(func.insts[moved.index()].op, Op::Move(..)))
+        {
             kept = true;
             continue;
         }
         for (pred, edge, moved, block) in one.edges {
             match block {
-                None => func.blocks[pred.index()].insts.retain(|&inst| inst != moved),
+                None => func.blocks[pred.index()]
+                    .insts
+                    .retain(|&inst| inst != moved),
                 Some(block) => {
-                    let Some(&jump) = func.blocks[block.index()].insts.last() else { continue };
-                    let Op::Jump(_, ref args) = func.insts[jump.index()].op else { continue };
+                    let Some(&jump) = func.blocks[block.index()].insts.last() else {
+                        continue;
+                    };
+                    let Op::Jump(_, ref args) = func.insts[jump.index()].op else {
+                        continue;
+                    };
                     let args = args.clone();
                     retarget_edge(func, pred, edge, one.join, args);
-                    func.blocks[block.index()].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
+                    func.blocks[block.index()]
+                        .insts
+                        .drain(..)
+                        .for_each(|inst| func.insts[inst.index()].op = Op::Trap);
                 }
             }
             func.insts[moved.index()].op = Op::Trap;
         }
-        let at = func.blocks[one.join.index()].insts.iter().position(|&inst| !pure(&func.insts[inst.index()].op)).unwrap_or(0);
+        let at = func.blocks[one.join.index()]
+            .insts
+            .iter()
+            .position(|&inst| !pure(&func.insts[inst.index()].op))
+            .unwrap_or(0);
         func.blocks[one.join.index()].insts.insert(at, one.copy);
     }
     func.bump_cfg();

@@ -24,12 +24,27 @@ fn unwrap_addr_offset(
     off: i32,
 ) -> (Value, i64) {
     let op = local
-        .and_then(|(ops, _)| ops.iter().rev().find(|&&(r, _)| r == addr).map(|(_, op)| op))
-        .or_else(|| defs.get(addr.index()).copied().flatten().map(|i| &func.insts[i.index()].op));
+        .and_then(|(ops, _)| {
+            ops.iter()
+                .rev()
+                .find(|&&(r, _)| r == addr)
+                .map(|(_, op)| op)
+        })
+        .or_else(|| {
+            defs.get(addr.index())
+                .copied()
+                .flatten()
+                .map(|i| &func.insts[i.index()].op)
+        });
     let k = |v: Value| {
-        local.map_or_else(|| consts.get(v.index()).copied().flatten(), |(_, lc)| lookup_const(lc, consts, v))
+        local.map_or_else(
+            || consts.get(v.index()).copied().flatten(),
+            |(_, lc)| lookup_const(lc, consts, v),
+        )
     };
-    let Some(op) = op else { return (addr, i64::from(off)) };
+    let Some(op) = op else {
+        return (addr, i64::from(off));
+    };
     match *op {
         Op::Binary(Binary::Iadd, a, b) => {
             if let Some(c) = k(b).and_then(|c| i64::from(off).checked_add(c)) {
@@ -49,7 +64,14 @@ fn unwrap_addr_offset(
     (addr, i64::from(off))
 }
 
-fn extract_const(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], val: Value, delta: i64, ty: Type) -> Option<i64> {
+fn extract_const(
+    func: &Function,
+    defs: &[Option<Inst>],
+    consts: &[Option<i64>],
+    val: Value,
+    delta: i64,
+    ty: Type,
+) -> Option<i64> {
     let vty = func.ty(val);
     if vty.is_vector() {
         let inst = defs.get(val.index()).copied().flatten()?;
@@ -64,8 +86,15 @@ fn extract_const(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>],
 
 /// Whether `block` contains a small-integer load that predecessor stores can resolve.
 pub(super) fn body_has_load(func: &Function, block: Block) -> bool {
-    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else { return false };
-    body.iter().any(|inst| matches!(func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..)))
+    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else {
+        return false;
+    };
+    body.iter().any(|inst| {
+        matches!(
+            func.insts[inst.index()].op,
+            Op::Load(..) | Op::StackLoad(..)
+        )
+    })
 }
 
 /// Whether `block` is a small pure-or-load dispatcher eligible for jump threading.
@@ -76,13 +105,19 @@ pub(super) fn steppable(func: &Function, block: Block, max_insts: usize) -> bool
     };
     let mut loads = 0_u8;
     insts.len() <= max_insts
-        && matches!(func.insts[last.index()].op, Op::Brif(..) | Op::Jump(..) | Op::BrTable(..))
+        && matches!(
+            func.insts[last.index()].op,
+            Op::Brif(..) | Op::Jump(..) | Op::BrTable(..)
+        )
         && body.iter().all(|inst| {
             let data = &func.insts[inst.index()];
             let Some(res) = data.result else { return false };
             if data.op.is_speculable() {
                 true
-            } else if matches!(data.op, Op::Load(..) | Op::StackLoad(..)) && func.ty(res).is_small_int() && loads < 2 {
+            } else if matches!(data.op, Op::Load(..) | Op::StackLoad(..))
+                && func.ty(res).is_small_int()
+                && loads < 2
+            {
                 loads += 1;
                 true
             } else {
@@ -97,15 +132,27 @@ enum StoreMatch {
     Skip,
 }
 
-fn match_const_store(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], (sval, s_lo): (Value, i64), (t_lo, t_hi, ty): (i64, i64, Type)) -> StoreMatch {
-    let Some(s_hi) = s_lo.checked_add(i64::from(func.ty(sval).bytes())) else { return StoreMatch::Abort };
+fn match_const_store(
+    func: &Function,
+    defs: &[Option<Inst>],
+    consts: &[Option<i64>],
+    (sval, s_lo): (Value, i64),
+    (t_lo, t_hi, ty): (i64, i64, Type),
+) -> StoreMatch {
+    let Some(s_hi) = s_lo.checked_add(i64::from(func.ty(sval).bytes())) else {
+        return StoreMatch::Abort;
+    };
     if s_lo <= t_lo && t_hi <= s_hi {
         return match extract_const(func, defs, consts, sval, t_lo - s_lo, ty) {
             Some(c) => StoreMatch::Hit(c),
             None => StoreMatch::Abort,
         };
     }
-    if s_lo < t_hi && t_lo < s_hi { StoreMatch::Abort } else { StoreMatch::Skip }
+    if s_lo < t_hi && t_lo < s_hi {
+        StoreMatch::Abort
+    } else {
+        StoreMatch::Skip
+    }
 }
 
 fn normalize_addr(
@@ -118,8 +165,18 @@ fn normalize_addr(
 ) -> Option<(Result<Value, crate::ir::StackSlot>, i64)> {
     let (addr, lo) = unwrap_addr_offset(func, defs, consts, local, raw_addr, raw_off);
     let op = local
-        .and_then(|(ops, _)| ops.iter().rev().find(|&&(r, _)| r == addr).map(|(_, op)| op))
-        .or_else(|| defs.get(addr.index()).copied().flatten().map(|i| &func.insts[i.index()].op));
+        .and_then(|(ops, _)| {
+            ops.iter()
+                .rev()
+                .find(|&&(r, _)| r == addr)
+                .map(|(_, op)| op)
+        })
+        .or_else(|| {
+            defs.get(addr.index())
+                .copied()
+                .flatten()
+                .map(|i| &func.insts[i.index()].op)
+        });
     if let Some(&Op::StackAddr(slot, base)) = op {
         return Some((Err(slot), lo.checked_add(i64::from(base))?));
     }
@@ -142,7 +199,9 @@ pub(super) fn pred_load_const_raw(
     let (_, body) = func.blocks[pred.index()].insts.split_last()?;
     let sz = i64::from(ty.bytes());
     let (target_addr, t_lo) = match *op {
-        Op::Load(raw_addr, raw_off) => normalize_addr(func, defs, consts, local, raw_addr, raw_off)?,
+        Op::Load(raw_addr, raw_off) => {
+            normalize_addr(func, defs, consts, local, raw_addr, raw_off)?
+        }
         Op::StackLoad(slot, raw_off) => (Err(slot), i64::from(raw_off)),
         _ => return None,
     };
@@ -161,7 +220,13 @@ pub(super) fn pred_load_const_raw(
                 if sslot != t_slot {
                     continue;
                 }
-                match_const_store(func, defs, consts, (sval, i64::from(soff)), (t_lo, t_hi, ty))
+                match_const_store(
+                    func,
+                    defs,
+                    consts,
+                    (sval, i64::from(soff)),
+                    (t_lo, t_hi, ty),
+                )
             }
             (Err(t_slot), &Op::Store(sval, saddr, soff)) => {
                 let (sb, s_lo) = normalize_addr(func, defs, consts, None, saddr, soff)?;
@@ -184,8 +249,23 @@ pub(super) fn pred_load_const_raw(
 }
 
 /// Resolves a mapped `Load` or `StackLoad` of a small integer against trailing non-aliasing constant stores in `pred`.
-pub(super) fn pred_load_const(func: &Function, cx: &ThreadCx<'_>, state: &EvalState, pred: Block, op: &Op, ty: Type) -> Option<i64> {
-    pred_load_const_raw(func, cx.defs, cx.consts, Some((state.local_ops.as_slice(), state.local_consts.as_slice())), pred, op, ty)
+pub(super) fn pred_load_const(
+    func: &Function,
+    cx: &ThreadCx<'_>,
+    state: &EvalState,
+    pred: Block,
+    op: &Op,
+    ty: Type,
+) -> Option<i64> {
+    pred_load_const_raw(
+        func,
+        cx.defs,
+        cx.consts,
+        Some((state.local_ops.as_slice(), state.local_consts.as_slice())),
+        pred,
+        op,
+        ty,
+    )
 }
 
 /// Sends each edge into a block that reloads, tests and branches on a word its predecessor just stored as a constant straight to the side that constant takes; returns whether it moved any edge.
@@ -202,14 +282,29 @@ pub(super) fn run(func: &mut Function) -> bool {
         if !cfg.reachable[at] || Some(block) == func.entry {
             continue;
         }
-        let Some(reload) = reload(func, &defs, &users, block, &constant) else { continue };
+        let Some(reload) = reload(func, &defs, &users, block, &constant) else {
+            continue;
+        };
         let ty = func.ty(reload.value);
         let readers = reader_blocks(func, block, reload.value);
-        let held = |side: Block| cfg.single_pred(side) == Some(block) && readers.iter().all(|&at| cfg.dominates(side, at));
+        let held = |side: Block| {
+            cfg.single_pred(side) == Some(block)
+                && readers.iter().all(|&at| cfg.dominates(side, at))
+        };
         for &pred in cfg.preds_of(block) {
-            let Some(stored) = stored_const(func, pred, &reload).and_then(constant) else { continue };
-            let decided = if reload.stored_left { holds(reload.cc, ty, stored, reload.constant) } else { holds(reload.cc, ty, reload.constant, stored) };
-            let (to, skipped) = if decided { (reload.then, reload.other) } else { (reload.other, reload.then) };
+            let Some(stored) = stored_const(func, pred, &reload).and_then(constant) else {
+                continue;
+            };
+            let decided = if reload.stored_left {
+                holds(reload.cc, ty, stored, reload.constant)
+            } else {
+                holds(reload.cc, ty, reload.constant, stored)
+            };
+            let (to, skipped) = if decided {
+                (reload.then, reload.other)
+            } else {
+                (reload.other, reload.then)
+            };
             if readers.is_empty() || held(skipped) {
                 moved.push((pred, block, to));
             }
@@ -219,25 +314,43 @@ pub(super) fn run(func: &mut Function) -> bool {
 }
 
 /// The reload `block` holds when it has no parameters, starts with a load read by the branch or one integer compare, subtract or xor with a constant that only the branch reads, holds nothing else but constants read only there, and branches without arguments.
-fn reload(func: &Function, defs: &[Option<Inst>], users: &[u32], block: Block, constant: &impl Fn(Value) -> Option<i64>) -> Option<Reload> {
+fn reload(
+    func: &Function,
+    defs: &[Option<Inst>],
+    users: &[u32],
+    block: Block,
+    constant: &impl Fn(Value) -> Option<i64>,
+) -> Option<Reload> {
     let data = &func.blocks[block.index()];
     let (&last, body) = data.insts.split_last()?;
-    let Op::Brif(cond, then, ref then_args, other, ref other_args) = func.insts[last.index()].op else { return None };
+    let Op::Brif(cond, then, ref then_args, other, ref other_args) = func.insts[last.index()].op
+    else {
+        return None;
+    };
     if !data.params.is_empty() || !then_args.is_empty() || !other_args.is_empty() || then == other {
         return None;
     }
     let (&first, rest) = body.split_first()?;
-    let Op::Load(addr, offset) = func.insts[first.index()].op else { return None };
+    let Op::Load(addr, offset) = func.insts[first.index()].op else {
+        return None;
+    };
     let value = func.insts[first.index()].result?;
     let test = defs[cond.index()].filter(|inst| rest.contains(inst) && users[cond.index()] == 1);
     let (cc, a, b) = if cond == value {
         (IntCC::NotEqual, value, None)
     } else {
-        let (cc, a, b) = test.and_then(|inst| crate::algebra::branch_cmp(&func.insts[inst.index()].op))?;
+        let (cc, a, b) =
+            test.and_then(|inst| crate::algebra::branch_cmp(&func.insts[inst.index()].op))?;
         (cc, a, Some(b))
     };
-    let local = |inst: Inst| func.insts[inst.index()].result.is_some_and(|res| users[res.index()] == 1);
-    if !rest.iter().all(|&inst| Some(inst) == test || (local(inst) && matches!(func.insts[inst.index()].op, Op::Const(_)))) {
+    let local = |inst: Inst| {
+        func.insts[inst.index()]
+            .result
+            .is_some_and(|res| users[res.index()] == 1)
+    };
+    if !rest.iter().all(|&inst| {
+        Some(inst) == test || (local(inst) && matches!(func.insts[inst.index()].op, Op::Const(_)))
+    }) {
         return None;
     }
     let (stored_left, other_side) = match b {
@@ -250,7 +363,16 @@ fn reload(func: &Function, defs: &[Option<Inst>], users: &[u32], block: Block, c
         None => 0,
         Some(side) => constant(side)?,
     };
-    Some(Reload { addr, offset, value, cc, constant, stored_left, then, other })
+    Some(Reload {
+        addr,
+        offset,
+        value,
+        cc,
+        constant,
+        stored_left,
+        then,
+        other,
+    })
 }
 
 /// The blocks other than `block` that read `value`.
@@ -258,11 +380,15 @@ fn reader_blocks(func: &Function, block: Block, value: Value) -> Vec<Block> {
     let mut readers = Vec::new();
     for (at, data) in func.blocks.iter().enumerate() {
         let here = Block(at as u32);
-        if here != block && data.insts.iter().any(|inst| {
-            let mut hit = false;
-            func.insts[inst.index()].op.for_operands(|v| hit |= v == value);
-            hit
-        }) {
+        if here != block
+            && data.insts.iter().any(|inst| {
+                let mut hit = false;
+                func.insts[inst.index()]
+                    .op
+                    .for_operands(|v| hit |= v == value);
+                hit
+            })
+        {
             readers.push(here);
         }
     }

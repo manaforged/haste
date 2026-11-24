@@ -31,7 +31,10 @@ pub enum Coercion {
 impl Coercion {
     /// Whether the coerced value is a single wide pointer that carries metadata after its address.
     pub fn widens(&self) -> bool {
-        !matches!(self, Coercion::Reify(_) | Coercion::Deref(..) | Coercion::Field { .. })
+        !matches!(
+            self,
+            Coercion::Reify(_) | Coercion::Deref(..) | Coercion::Field { .. }
+        )
     }
 
     /// The underlying pointer coercion, unwrapping any multi-field struct wrapper.
@@ -72,15 +75,30 @@ impl Infer<'_, '_> {
     /// The coercion of a value of type `found` to `expected`, when one applies.
     pub(super) fn coercion(&mut self, found: Ty, expected: Ty) -> Result<Option<Coercion>> {
         let (found, expected) = (self.resolve(found), self.resolve(expected));
-        match (self.cx.types.kind(found).clone(), self.cx.types.kind(expected).clone()) {
-            (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) => self.pointer_coercion((found, expected), (from, a), (to, b)),
-            (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => {
-                let (from, to) = (self.cx.types.substs(from).to_vec(), self.cx.types.substs(to).to_vec());
-                let Some(coercion) = self.unsize_args(&from, &to)? else { return Ok(None) };
+        match (
+            self.cx.types.kind(found).clone(),
+            self.cx.types.kind(expected).clone(),
+        ) {
+            (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) => {
+                self.pointer_coercion((found, expected), (from, a), (to, b))
+            }
+            (Kind::Adt(a, from), Kind::Adt(b, to))
+                if a == b && from != to && self.coerces(found, expected)? =>
+            {
+                let (from, to) = (
+                    self.cx.types.substs(from).to_vec(),
+                    self.cx.types.substs(to).to_vec(),
+                );
+                let Some(coercion) = self.unsize_args(&from, &to)? else {
+                    return Ok(None);
+                };
                 if self.single_pointer_adt(found)? {
                     Ok(Some(coercion.into_leaf()))
                 } else {
-                    Ok(Some(Coercion::Field { target: expected, inner: Box::new(coercion.into_leaf()) }))
+                    Ok(Some(Coercion::Field {
+                        target: expected,
+                        inner: Box::new(coercion.into_leaf()),
+                    }))
                 }
             }
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
@@ -176,8 +194,13 @@ impl Infer<'_, '_> {
         let Some((at, unsize)) = self.unsized_arg(from, to)? else {
             return Ok(None);
         };
-        let rest = from.iter().zip(to).enumerate().filter(|(index, _)| *index != at);
-        rest.map(|(_, pair)| pair).try_for_each(|(&a, &b)| self.unify(a, b))?;
+        let rest = from
+            .iter()
+            .zip(to)
+            .enumerate()
+            .filter(|(index, _)| *index != at);
+        rest.map(|(_, pair)| pair)
+            .try_for_each(|(&a, &b)| self.unify(a, b))?;
         Ok(Some(unsize))
     }
 
@@ -186,9 +209,15 @@ impl Infer<'_, '_> {
             if let Some(unsize) = self.unsize_pointee(a, b)? {
                 return Ok(Some((at, unsize)));
             }
-            let (ka, kb) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+            let (ka, kb) = (
+                self.cx.types.kind(self.resolve(a)).clone(),
+                self.cx.types.kind(self.resolve(b)).clone(),
+            );
             let unsize = match (ka, kb) {
-                (Kind::Ref(from, p1) | Kind::Ptr(from, p1), Kind::Ref(to, p2) | Kind::Ptr(to, p2)) => self.unsize_pointer((from, p1), (to, p2))?,
+                (
+                    Kind::Ref(from, p1) | Kind::Ptr(from, p1),
+                    Kind::Ref(to, p2) | Kind::Ptr(to, p2),
+                ) => self.unsize_pointer((from, p1), (to, p2))?,
                 (Kind::Adt(x, _), Kind::Adt(y, _)) if x == y => self.coercion(a, b)?,
                 _ => None,
             };
@@ -199,17 +228,27 @@ impl Infer<'_, '_> {
         Ok(None)
     }
 
-    fn pointer_coercion(&mut self, (found, expected): (Ty, Ty), (from, a): (Mut, Ty), (to, b): (Mut, Ty)) -> Result<Option<Coercion>> {
+    fn pointer_coercion(
+        &mut self,
+        (found, expected): (Ty, Ty),
+        (from, a): (Mut, Ty),
+        (to, b): (Mut, Ty),
+    ) -> Result<Option<Coercion>> {
         let unsize = self.unsize_pointer((from, a), (to, b))?;
         let loosens = from == Mut::Not && to == Mut::Mut;
-        let both_refs = matches!(self.cx.types.kind(found), Kind::Ref(..)) && matches!(self.cx.types.kind(expected), Kind::Ref(..));
+        let both_refs = matches!(self.cx.types.kind(found), Kind::Ref(..))
+            && matches!(self.cx.types.kind(expected), Kind::Ref(..));
         match unsize {
             None if both_refs && !loosens => self.deref_coercion(a, b, to),
             unsize => Ok(unsize),
         }
     }
 
-    fn unsize_pointer(&mut self, (from, a): (Mut, Ty), (to, b): (Mut, Ty)) -> Result<Option<Coercion>> {
+    fn unsize_pointer(
+        &mut self,
+        (from, a): (Mut, Ty),
+        (to, b): (Mut, Ty),
+    ) -> Result<Option<Coercion>> {
         let unsize = self.unsize_pointee(a, b)?;
         if unsize.is_some() && from == Mut::Not && to == Mut::Mut {
             bail!("cannot coerce a shared pointer to a mutable one");
@@ -229,12 +268,19 @@ impl Infer<'_, '_> {
                 return Ok(Some(Coercion::Deref(steps, self.resolve(to))));
             }
             let next = match self.cx.types.kind(ty).clone() {
-                Kind::Ref(m, inner) if mutability == Mut::Not || m == Mut::Mut => Some((inner, None)),
-                Kind::Adt(..) if self.cx.boxed(ty).is_some() => self.cx.boxed(ty).map(|inner| (inner, None)),
-                Kind::Adt(..) => self.overloaded_deref(ty, mutability)?.map(|(res, target)| (target, Some(res))),
+                Kind::Ref(m, inner) if mutability == Mut::Not || m == Mut::Mut => {
+                    Some((inner, None))
+                }
+                Kind::Adt(..) if self.cx.boxed(ty).is_some() => {
+                    self.cx.boxed(ty).map(|inner| (inner, None))
+                }
+                Kind::Adt(..) => self
+                    .overloaded_deref(ty, mutability)?
+                    .map(|(res, target)| (target, Some(res))),
                 Kind::Param(_) | Kind::Proj(_) => {
                     self.poly_fallback();
-                    self.overloaded_deref(ty, mutability)?.map(|(res, target)| (target, Some(res)))
+                    self.overloaded_deref(ty, mutability)?
+                        .map(|(res, target)| (target, Some(res)))
                 }
                 _ => None,
             };
@@ -290,7 +336,11 @@ impl Infer<'_, '_> {
                 return false;
             }
             let hit_fallback = saved_poly.is_some_and(|(was, _)| {
-                was != PolyPhase::Fallback && infer.poly.as_ref().is_some_and(|p| p.phase == PolyPhase::Fallback)
+                was != PolyPhase::Fallback
+                    && infer
+                        .poly
+                        .as_ref()
+                        .is_some_and(|p| p.phase == PolyPhase::Fallback)
             });
             !hit_fallback && infer.stuck_obligations() <= stuck_before
         });
@@ -316,7 +366,10 @@ impl Infer<'_, '_> {
         let self_ty = self.resolve(substs[0]);
         if self.has_vars(self_ty)
             || self.is_callable_trait(of)
-            || matches!(self.cx.lang(of), Some("discriminant_kind" | "bikeshed_guaranteed_no_drop"))
+            || matches!(
+                self.cx.lang(of),
+                Some("discriminant_kind" | "bikeshed_guaranteed_no_drop")
+            )
         {
             return false;
         }
@@ -327,7 +380,8 @@ impl Infer<'_, '_> {
             || self.compiler_decides(of, self_ty)
             || self.compiler_impl(of, self_ty)
             || self.object_holds(of, self_ty, args) == Some(true);
-        !known_holds && self.probe(|infer| infer.may_implement(of, self_ty, args).ok() == Some(false))
+        !known_holds
+            && self.probe(|infer| infer.may_implement(of, self_ty, args).ok() == Some(false))
     }
 
     fn same_head(&self, a: Ty, b: Ty) -> bool {
@@ -340,25 +394,49 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn trial_unify(&mut self, a: Ty, b: Ty) -> bool {
-        matches!(self.trial(|infer| Ok(infer.unifies(a, b).then_some(()))), Ok(Some(())))
+        matches!(
+            self.trial(|infer| Ok(infer.unifies(a, b).then_some(()))),
+            Ok(Some(()))
+        )
     }
 
-    fn reify_closure(&mut self, found: Ty, (params, ret): (Vec<Ty>, Ty)) -> Result<Option<Coercion>> {
+    fn reify_closure(
+        &mut self,
+        found: Ty,
+        (params, ret): (Vec<Ty>, Ty),
+    ) -> Result<Option<Coercion>> {
         let (inputs, output, captures) = self.closure_sig(found)?;
         if captures {
             bail!("a closure that captures variables cannot become a function pointer");
         }
         self.unify_fn((inputs.clone(), output), (params, ret))?;
-        let Some(call_once) = self.cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
+        let Some(call_once) = self.cx.call_once() else {
+            bail!("core has no `FnOnce::call_once`")
+        };
         let tuple = self.cx.types.tuple(&inputs);
-        Ok(Some(Coercion::Reify(Res::fn_of(&self.cx.types, call_once, &[found, tuple]))))
+        Ok(Some(Coercion::Reify(Res::fn_of(
+            &self.cx.types,
+            call_once,
+            &[found, tuple],
+        ))))
     }
 
-    fn unify_fn(&mut self, (params, ret): (Vec<Ty>, Ty), (wanted, out): (Vec<Ty>, Ty)) -> Result<()> {
+    fn unify_fn(
+        &mut self,
+        (params, ret): (Vec<Ty>, Ty),
+        (wanted, out): (Vec<Ty>, Ty),
+    ) -> Result<()> {
         if params.len() != wanted.len() {
-            bail!("a function of {} parameters where {} are wanted", params.len(), wanted.len());
+            bail!(
+                "a function of {} parameters where {} are wanted",
+                params.len(),
+                wanted.len()
+            );
         }
-        params.into_iter().zip(wanted).try_for_each(|(param, wanted)| self.unify(param, wanted))?;
+        params
+            .into_iter()
+            .zip(wanted)
+            .try_for_each(|(param, wanted)| self.unify(param, wanted))?;
         self.unify(ret, out)
     }
 
@@ -370,7 +448,10 @@ impl Infer<'_, '_> {
         if let Some(target) = self.fn_branch(a, b)? {
             return Ok(Some(target));
         }
-        let (ka, kb) = (self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b)));
+        let (ka, kb) = (
+            self.cx.types.kind(self.resolve(a)),
+            self.cx.types.kind(self.resolve(b)),
+        );
         let pointers = match (ka, kb) {
             (Kind::Ref(..), Kind::Ref(..)) => true,
             (Kind::Adt(x, _), Kind::Adt(y, _)) => x == y,
@@ -379,16 +460,23 @@ impl Infer<'_, '_> {
         if !pointers {
             return Ok(None);
         }
-        if self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.is_some() {
+        if self
+            .trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?
+            .is_some()
+        {
             return Ok(Some(a));
         }
-        Ok(self.trial(|infer| Ok(infer.coercion(a, b).ok().flatten()))?.map(|_| b))
+        Ok(self
+            .trial(|infer| Ok(infer.coercion(a, b).ok().flatten()))?
+            .map(|_| b))
     }
 
     /// The branch type that the other branch unsizes to, when one branch points to an array and the other to a slice.
     fn slice_branch(&self, a: Ty, b: Ty) -> Option<Ty> {
         let pointee = |ty: Ty| match self.cx.types.kind(self.resolve(ty)) {
-            Kind::Ref(_, inner) | Kind::Ptr(_, inner) => Some(self.cx.types.kind(self.resolve(*inner)).clone()),
+            Kind::Ref(_, inner) | Kind::Ptr(_, inner) => {
+                Some(self.cx.types.kind(self.resolve(*inner)).clone())
+            }
             _ => None,
         };
         match (pointee(a)?, pointee(b)?) {
@@ -418,18 +506,44 @@ impl Infer<'_, '_> {
             (Kind::FnPtr(..), Kind::FnDef(..)) => Ok(Some(a)),
             (Kind::Closure(..), Kind::FnPtr(..)) => Ok(self.non_cap_closure_sig(a)?.map(|_| b)),
             (Kind::FnPtr(..), Kind::Closure(..)) => Ok(self.non_cap_closure_sig(b)?.map(|_| a)),
-            (Kind::FnDef(item, substs), Kind::FnDef(..)) if a_kind != b_kind => self.fn_def_ptr(*item, *substs).map(Some),
-            (Kind::FnDef(item, substs), Kind::Closure(..)) => Ok(self.non_cap_closure_sig(b)?.is_some().then(|| self.fn_def_ptr(*item, *substs)).transpose()?),
-            (Kind::Closure(..), Kind::FnDef(item, substs)) => Ok(self.non_cap_closure_sig(a)?.is_some().then(|| self.fn_def_ptr(*item, *substs)).transpose()?),
+            (Kind::FnDef(item, substs), Kind::FnDef(..)) if a_kind != b_kind => {
+                self.fn_def_ptr(*item, *substs).map(Some)
+            }
+            (Kind::FnDef(item, substs), Kind::Closure(..)) => Ok(self
+                .non_cap_closure_sig(b)?
+                .is_some()
+                .then(|| self.fn_def_ptr(*item, *substs))
+                .transpose()?),
+            (Kind::Closure(..), Kind::FnDef(item, substs)) => Ok(self
+                .non_cap_closure_sig(a)?
+                .is_some()
+                .then(|| self.fn_def_ptr(*item, *substs))
+                .transpose()?),
             (Kind::Closure(..), Kind::Closure(..)) if a_kind != b_kind => {
-                let (Some((in_a, out_a)), Some((in_b, out_b))) = (self.non_cap_closure_sig(a)?, self.non_cap_closure_sig(b)?) else {
+                let (Some((in_a, out_a)), Some((in_b, out_b))) =
+                    (self.non_cap_closure_sig(a)?, self.non_cap_closure_sig(b)?)
+                else {
                     return Ok(None);
                 };
                 if in_a.len() != in_b.len() {
                     return Ok(None);
                 }
-                let params: Vec<Ty> = in_a.iter().zip(&in_b).map(|(&x, &y)| if self.has_vars(x) && !self.has_vars(y) { y } else { x }).collect();
-                let ret = if self.has_vars(out_a) && !self.has_vars(out_b) { out_b } else { out_a };
+                let params: Vec<Ty> = in_a
+                    .iter()
+                    .zip(&in_b)
+                    .map(|(&x, &y)| {
+                        if self.has_vars(x) && !self.has_vars(y) {
+                            y
+                        } else {
+                            x
+                        }
+                    })
+                    .collect();
+                let ret = if self.has_vars(out_a) && !self.has_vars(out_b) {
+                    out_b
+                } else {
+                    out_a
+                };
                 Ok(Some(self.cx.types.fn_ptr(&params, ret)))
             }
             _ => Ok(None),
@@ -437,10 +551,17 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn shared_pointer(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
-        let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+        let (a, b) = (
+            self.cx.types.kind(self.resolve(a)).clone(),
+            self.cx.types.kind(self.resolve(b)).clone(),
+        );
         let (shared, inner, other) = match (a, b) {
-            (Kind::Ptr(x, inner), Kind::Ptr(y, other)) if x != y => (Kind::Ptr(Mut::Not, inner), inner, other),
-            (Kind::Ref(x, inner), Kind::Ref(y, other)) if x != y => (Kind::Ref(Mut::Not, inner), inner, other),
+            (Kind::Ptr(x, inner), Kind::Ptr(y, other)) if x != y => {
+                (Kind::Ptr(Mut::Not, inner), inner, other)
+            }
+            (Kind::Ref(x, inner), Kind::Ref(y, other)) if x != y => {
+                (Kind::Ref(Mut::Not, inner), inner, other)
+            }
             _ => return Ok(None),
         };
         self.unify(inner, other)?;
@@ -457,9 +578,16 @@ impl Infer<'_, '_> {
             return Ok(None);
         }
         let (obj_output, init_substs) = {
-            let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), self.cx.types.items(members));
-            let obj_output = bound.find(|&(m, _)| self.cx.name(m) == "Output").map(|(_, out)| out);
-            let init_substs = std::iter::once(ty).chain(given.iter().copied()).collect::<Vec<Ty>>();
+            let (given, mut bound) = super::super::ty::object_parts(
+                self.cx.types.substs(parts),
+                self.cx.types.items(members),
+            );
+            let obj_output = bound
+                .find(|&(m, _)| self.cx.name(m) == "Output")
+                .map(|(_, out)| out);
+            let init_substs = std::iter::once(ty)
+                .chain(given.iter().copied())
+                .collect::<Vec<Ty>>();
             (obj_output, init_substs)
         };
         let mut queue = vec![(of, init_substs, 0u32)];
@@ -507,7 +635,14 @@ impl Infer<'_, '_> {
                 | (Kind::Slice(_), Kind::Slice(_))
                 | (Kind::FnPtr(..), Kind::FnPtr(..))
                 | (Kind::Never, _)
-                | (Kind::Var(_), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Slice(_) | Kind::FnPtr(..))
+                | (
+                    Kind::Var(_),
+                    Kind::Adt(..)
+                        | Kind::Tuple(_)
+                        | Kind::Array(..)
+                        | Kind::Slice(_)
+                        | Kind::FnPtr(..)
+                )
         );
         if structural {
             self.unify(f, t)?;
@@ -531,11 +666,17 @@ impl Infer<'_, '_> {
             Coercion::Deref(steps, to) => {
                 let mut zonked = Vec::new();
                 for (ty, res) in steps {
-                    zonked.push((self.zonk(ty), res.map(|res| self.zonk_res(res)).transpose()?));
+                    zonked.push((
+                        self.zonk(ty),
+                        res.map(|res| self.zonk_res(res)).transpose()?,
+                    ));
                 }
                 Ok(Coercion::Deref(zonked, self.zonk(to)))
             }
-            Coercion::Field { target, inner } => Ok(Coercion::Field { target: self.zonk(target), inner: Box::new(self.zonk_coercion(*inner)?) }),
+            Coercion::Field { target, inner } => Ok(Coercion::Field {
+                target: self.zonk(target),
+                inner: Box::new(self.zonk_coercion(*inner)?),
+            }),
         }
     }
 }

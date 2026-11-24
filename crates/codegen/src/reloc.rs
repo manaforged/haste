@@ -137,16 +137,26 @@ pub struct StencilReloc {
 
 impl StencilReloc {
     pub(crate) fn symbol(offset: u32, index: u32, kind: RelocKind) -> Self {
-        Self { offset, symbol: index, kind }
+        Self {
+            offset,
+            symbol: index,
+            kind,
+        }
     }
 
     pub(crate) fn runtime(offset: u32, sym: RuntimeSymbol, kind: RelocKind) -> Self {
-        Self { offset, symbol: RUNTIME_TAG | u32::from(sym as u8), kind }
+        Self {
+            offset,
+            symbol: RUNTIME_TAG | u32::from(sym as u8),
+            kind,
+        }
     }
 
     /// The runtime helper this relocation names, when it targets one.
     pub fn as_runtime(self) -> Option<RuntimeSymbol> {
-        (self.symbol & RUNTIME_TAG != 0).then(|| RuntimeSymbol::from_raw((self.symbol & !RUNTIME_TAG) as u8)).flatten()
+        (self.symbol & RUNTIME_TAG != 0)
+            .then(|| RuntimeSymbol::from_raw((self.symbol & !RUNTIME_TAG) as u8))
+            .flatten()
     }
 
     /// The caller relocation table index, when this relocation is not a runtime helper.
@@ -155,17 +165,31 @@ impl StencilReloc {
     }
 }
 
-pub(crate) fn patch_bytes(relocs: &[StencilReloc], symbols: &[u64], out: &mut [u8]) -> Result<(), crate::Error> {
+pub(crate) fn patch_bytes(
+    relocs: &[StencilReloc],
+    symbols: &[u64],
+    out: &mut [u8],
+) -> Result<(), crate::Error> {
     for reloc in relocs {
         let value = match reloc.as_runtime() {
             Some(rt) => rt.host_addr() as u64,
             None => *symbols.get(reloc.symbol as usize).ok_or_else(|| {
-                crate::Error::new(crate::ErrorKind::Unsupported, format!("relocation symbol {} out of range ({})", reloc.symbol, symbols.len()))
+                crate::Error::new(
+                    crate::ErrorKind::Unsupported,
+                    format!(
+                        "relocation symbol {} out of range ({})",
+                        reloc.symbol,
+                        symbols.len()
+                    ),
+                )
             })?,
         };
         let at = reloc.offset as usize;
         if at > out.len() {
-            return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("relocation offset {at} exceeds buffer len {}", out.len())));
+            return Err(crate::Error::new(
+                crate::ErrorKind::Unsupported,
+                format!("relocation offset {at} exceeds buffer len {}", out.len()),
+            ));
         }
         patch_reloc(reloc.kind, value, &mut out[at..])?;
     }
@@ -176,14 +200,20 @@ pub(crate) fn patch_bytes(relocs: &[StencilReloc], symbols: &[u64], out: &mut [u
 pub fn patch_reloc(kind: RelocKind, value: u64, out: &mut [u8]) -> Result<(), crate::Error> {
     let need = |n: usize| {
         (out.len() >= n).then_some(()).ok_or_else(|| {
-            crate::Error::new(crate::ErrorKind::Unsupported, format!("{kind:?} needs {n} bytes, got {}", out.len()))
+            crate::Error::new(
+                crate::ErrorKind::Unsupported,
+                format!("{kind:?} needs {n} bytes, got {}", out.len()),
+            )
         })
     };
     match kind {
         RelocKind::Abs32 => {
             need(4)?;
             if value >= (1 << 31) {
-                return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("Abs32 target {value:#x} exceeds low 2 GiB")));
+                return Err(crate::Error::new(
+                    crate::ErrorKind::Unsupported,
+                    format!("Abs32 target {value:#x} exceeds low 2 GiB"),
+                ));
             }
             out[..4].copy_from_slice(&(value as u32).to_le_bytes());
         }
@@ -195,8 +225,16 @@ pub fn patch_reloc(kind: RelocKind, value: u64, out: &mut [u8]) -> Result<(), cr
             need(16)?;
             patch_arm64_movw64(&mut out[..16], value);
         }
-        RelocKind::PcRel32 | RelocKind::X64RipRel32 | RelocKind::Arm64Call26 | RelocKind::Arm64AdrpAdd | RelocKind::ThreadOff32 | RelocKind::Arm64TlvCell => {
-            return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("{kind:?} requires AOT PC-relative patching")));
+        RelocKind::PcRel32
+        | RelocKind::X64RipRel32
+        | RelocKind::Arm64Call26
+        | RelocKind::Arm64AdrpAdd
+        | RelocKind::ThreadOff32
+        | RelocKind::Arm64TlvCell => {
+            return Err(crate::Error::new(
+                crate::ErrorKind::Unsupported,
+                format!("{kind:?} requires AOT PC-relative patching"),
+            ));
         }
     }
     Ok(())

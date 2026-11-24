@@ -12,10 +12,19 @@ pub(super) struct Carry {
 }
 
 fn block_defs(func: &Function, block: Block) -> impl Iterator<Item = Value> + '_ {
-    func.blocks[block.index()].params.iter().copied().chain(body(func, block).iter().filter_map(move |&inst| func.insts[inst.index()].result))
+    func.blocks[block.index()].params.iter().copied().chain(
+        body(func, block)
+            .iter()
+            .filter_map(move |&inst| func.insts[inst.index()].result),
+    )
 }
 
-fn flood(func: &Function, start: Block, wall: Block, mut visit: impl FnMut(Block) -> bool) -> Vec<bool> {
+fn flood(
+    func: &Function,
+    start: Block,
+    wall: Block,
+    mut visit: impl FnMut(Block) -> bool,
+) -> Vec<bool> {
     let mut seen = vec![false; func.blocks.len()];
     seen[wall.index()] = true;
     let mut stack = vec![start];
@@ -35,9 +44,18 @@ fn below(free: &[bool], target: Block, block: Block) -> bool {
     block == target || !free[block.index()]
 }
 
-fn reads(func: &Function, uses: &[u64], start: Block, def_block: Block, every: bool, carry: &mut Carry) {
+fn reads(
+    func: &Function,
+    uses: &[u64],
+    start: Block,
+    def_block: Block,
+    every: bool,
+    carry: &mut Carry,
+) {
     let defs: Vec<Value> = block_defs(func, def_block).collect();
-    let users = defs.iter().fold(0, |all, v| all | uses.get(v.index()).copied().unwrap_or(0));
+    let users = defs
+        .iter()
+        .fold(0, |all, v| all | uses.get(v.index()).copied().unwrap_or(0));
     if users == 0 || start == def_block {
         return;
     }
@@ -65,12 +83,21 @@ fn rebinds(func: &Function, chain: &[Block], incoming: &[Value]) -> bool {
     let mut read = incoming.to_vec();
     chain.iter().any(|&block| {
         let hit = redefines(func, block, &read);
-        func.blocks[block.index()].insts.iter().for_each(|inst| func.insts[inst.index()].op.for_operands(|v| read.push(v)));
+        func.blocks[block.index()]
+            .insts
+            .iter()
+            .for_each(|inst| func.insts[inst.index()].op.for_operands(|v| read.push(v)));
         hit
     })
 }
 
-pub(super) fn plan(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>], (chain, incoming): (&[Block], &[Value]), target: Block) -> Option<Carry> {
+pub(super) fn plan(
+    func: &Function,
+    cx: &ThreadCx<'_>,
+    single: &[Option<Block>],
+    (chain, incoming): (&[Block], &[Value]),
+    target: Block,
+) -> Option<Carry> {
     let last = *chain.last()?;
     let mut linked = !chain.contains(&target)
         && !cx.pinned[target.index()]
@@ -92,11 +119,24 @@ pub(super) fn plan(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>],
         return None;
     }
     let free = flood(func, func.entry?, target, |_| true);
-    carry.blocks.iter().all(|&block| below(&free, target, block)).then_some(carry)
+    carry
+        .blocks
+        .iter()
+        .all(|&block| below(&free, target, block))
+        .then_some(carry)
 }
 
-fn apply(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, target: Block, carry: Carry, args: &mut [Value]) {
-    let (Some(entry), Some(last)) = (func.entry, single.get(target.index()).copied().flatten()) else {
+fn apply(
+    func: &mut Function,
+    cx: &mut ThreadCx<'_>,
+    single: &mut [Option<Block>],
+    pred: Block,
+    target: Block,
+    carry: Carry,
+    args: &mut [Value],
+) {
+    let (Some(entry), Some(last)) = (func.entry, single.get(target.index()).copied().flatten())
+    else {
         return;
     };
     let Carry { values, mut blocks } = carry;
@@ -118,10 +158,14 @@ fn apply(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>
     for &block in &blocks {
         for at in 0..func.blocks[block.index()].insts.len() {
             let inst = func.blocks[block.index()].insts[at];
-            func.insts[inst.index()].op.map_operands(|v| lookup(&fresh, v));
+            func.insts[inst.index()]
+                .op
+                .map_operands(|v| lookup(&fresh, v));
         }
         if block != target {
-            fresh.iter().for_each(|&(_, param)| note_use(cx.uses, block, param));
+            fresh
+                .iter()
+                .for_each(|&(_, param)| note_use(cx.uses, block, param));
         }
     }
     if inside {
@@ -130,7 +174,13 @@ fn apply(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>
     single[target.index()] = None;
 }
 
-pub(super) fn commit(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, mut eval: Eval) -> (Block, Vec<Value>) {
+pub(super) fn commit(
+    func: &mut Function,
+    cx: &mut ThreadCx<'_>,
+    single: &mut [Option<Block>],
+    pred: Block,
+    mut eval: Eval,
+) -> (Block, Vec<Value>) {
     let carry = std::mem::take(&mut eval.carry);
     let (target, mut args) = emit_needed(func, pred, (&mut *cx.consts, &mut *cx.uses), eval);
     if !carry.values.is_empty() {

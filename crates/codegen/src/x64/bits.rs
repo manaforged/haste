@@ -5,7 +5,11 @@ use crate::frame::Ext;
 use crate::ir::{AtomicRmwOp, Binary, Function, Op, Type, Value};
 
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
-const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
+const BIT_STEPS: [(u64, u8); 3] = [
+    (0x5555_5555_5555_5555, 1),
+    (0x3333_3333_3333_3333, 2),
+    (0x0F0F_0F0F_0F0F_0F0F, 4),
+];
 
 /// Matches an atomic `Or`/`Xor` mask `1 << bit` whose `bit` is masked strictly inside `0..ty.bits()`, returning the x64 `lock bts`/`lock btc` opcode and `bit`.
 pub(super) fn lock_bt_shift_bit(
@@ -24,27 +28,40 @@ pub(super) fn lock_bt_shift_bit(
     if !matches!(ty, Type::I32 | Type::I64) {
         return None;
     }
-    let Op::Binary(Binary::Ishl, one, bit) = func.insts[def(value)?.index()].op else { return None };
+    let Op::Binary(Binary::Ishl, one, bit) = func.insts[def(value)?.index()].op else {
+        return None;
+    };
     if func.ty(bit) != ty || plan.const_of(one) != Some(1) {
         return None;
     }
-    let Op::Binary(Binary::Band, a, b) = func.insts[def(bit)?.index()].op else { return None };
+    let Op::Binary(Binary::Band, a, b) = func.insts[def(bit)?.index()].op else {
+        return None;
+    };
     let limit = i64::from(ty.bits());
-    let bounded = [a, b].into_iter().any(|v| plan.const_of(v).is_some_and(|m| (0..limit).contains(&m)));
+    let bounded = [a, b]
+        .into_iter()
+        .any(|v| plan.const_of(v).is_some_and(|m| (0..limit).contains(&m)));
     bounded.then_some((opcode, bit))
 }
 
 /// Unwraps an elided constant-offset `Iadd`/`Isub` address feeding an atomic op into `(base, disp)`.
-pub(super) fn atomic_addr_base(func: &Function, plan: &crate::alloc::Plan<Reg>, defs: &[Option<crate::ir::Inst>], addr: Value) -> Option<(Value, i32)> {
+pub(super) fn atomic_addr_base(
+    func: &Function,
+    plan: &crate::alloc::Plan<Reg>,
+    defs: &[Option<crate::ir::Inst>],
+    addr: Value,
+) -> Option<(Value, i32)> {
     if !plan.elided[addr.index()] || plan.sib[addr.index()].is_some() {
         return None;
     }
     let inst = defs[addr.index()]?;
     let (base, delta) = crate::alloc::iadd_sub_const(&func.insts[inst.index()].op, |v| {
-        plan.const_of(v).or_else(|| match defs[v.index()].map(|i| &func.insts[i.index()].op) {
-            Some(&Op::Const(imm)) => Some(imm),
-            _ => None,
-        })
+        plan.const_of(v).or_else(
+            || match defs[v.index()].map(|i| &func.insts[i.index()].op) {
+                Some(&Op::Const(imm)) => Some(imm),
+                _ => None,
+            },
+        )
     })?;
     i32::try_from(delta).ok().map(|disp| (base, disp))
 }
@@ -58,11 +75,16 @@ impl Emit<'_> {
     pub(super) fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
         let (base, disp) = self.atomic_offset(addr);
         if let Location::Frame(slot, off) = self.location(base)
-            && let Some(total) = self.frame.slots[slot.index()].checked_add(off).and_then(|d| d.checked_add(disp))
+            && let Some(total) = self.frame.slots[slot.index()]
+                .checked_add(off)
+                .and_then(|d| d.checked_add(disp))
         {
             return self.frame_mem(total);
         }
-        if let Some(reg) = self.reg_of(base).filter(|reg| !written.contains(reg) && *reg != Reg::Rsp) {
+        if let Some(reg) = self
+            .reg_of(base)
+            .filter(|reg| !written.contains(reg) && *reg != Reg::Rsp)
+        {
             return Mem::new(reg, disp);
         }
         self.raw(scratch, base);
@@ -71,7 +93,9 @@ impl Emit<'_> {
 
     pub(super) fn lock_rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
         let ty = self.ty(value);
-        let imm = self.const_of(value).map(|c| crate::fold::extend(c, ty, false) as u64);
+        let imm = self
+            .const_of(value)
+            .map(|c| crate::fold::extend(c, ty, false) as u64);
         let mask = ty.unsigned_max();
         let inc_dec = match (op, imm) {
             (AtomicRmwOp::Add, Some(1)) => Some(false),
@@ -81,9 +105,15 @@ impl Emit<'_> {
             _ => None,
         };
         let bt_ext = match (op, size != Size::B, imm) {
-            (AtomicRmwOp::Or, true, Some(u)) if u.count_ones() == 1 => Some((5, u.trailing_zeros() as u8)),
-            (AtomicRmwOp::And, true, Some(u)) if ((!u) & mask).count_ones() == 1 => Some((6, ((!u) & mask).trailing_zeros() as u8)),
-            (AtomicRmwOp::Xor, true, Some(u)) if u.count_ones() == 1 => Some((7, u.trailing_zeros() as u8)),
+            (AtomicRmwOp::Or, true, Some(u)) if u.count_ones() == 1 => {
+                Some((5, u.trailing_zeros() as u8))
+            }
+            (AtomicRmwOp::And, true, Some(u)) if ((!u) & mask).count_ones() == 1 => {
+                Some((6, ((!u) & mask).trailing_zeros() as u8))
+            }
+            (AtomicRmwOp::Xor, true, Some(u)) if u.count_ones() == 1 => {
+                Some((7, u.trailing_zeros() as u8))
+            }
             _ => None,
         };
         let alu = match op {
@@ -94,10 +124,12 @@ impl Emit<'_> {
             _ => Alu::Xor,
         };
         if self.plan.elided[value.index()]
-            && let Some((opcode, bit)) = lock_bt_shift_bit(self.func, &self.plan, |v| self.defs[v.index()], op, value)
+            && let Some((opcode, bit)) =
+                lock_bt_shift_bit(self.func, &self.plan, |v| self.defs[v.index()], op, value)
         {
             if let Some(br) = self.reg_of(bit) {
-                let target = self.atomic_target(addr, if br == Reg::Rcx { Reg::Rax } else { Reg::Rcx }, &[]);
+                let target =
+                    self.atomic_target(addr, if br == Reg::Rcx { Reg::Rax } else { Reg::Rcx }, &[]);
                 self.asm.lock_bt_reg(size, opcode, target, br);
             } else {
                 let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
@@ -114,7 +146,8 @@ impl Emit<'_> {
             let target = self.atomic_target(addr, Reg::Rcx, &[]);
             self.asm.lock_bt_imm(size, ext, target, bit);
         } else if let Some(vr) = self.reg_of(value) {
-            let target = self.atomic_target(addr, if vr == Reg::Rcx { Reg::Rax } else { Reg::Rcx }, &[]);
+            let target =
+                self.atomic_target(addr, if vr == Reg::Rcx { Reg::Rax } else { Reg::Rcx }, &[]);
             self.asm.lock_alu_reg(size, alu, target, vr);
         } else {
             let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
@@ -143,7 +176,11 @@ impl Emit<'_> {
                 self.asm.cmov(Cond::B, dst, Reg::Rdx);
             }
             Binary::SaddSat | Binary::SsubSat => {
-                let alu = if op == Binary::SaddSat { Alu::Add } else { Alu::Sub };
+                let alu = if op == Binary::SaddSat {
+                    Alu::Add
+                } else {
+                    Alu::Sub
+                };
                 self.asm.alu_sized(size, alu, dst, src);
                 self.asm.mov_imm(Reg::Rdx, smin);
                 self.asm.mov_imm(Reg::R11, smax);
@@ -211,7 +248,11 @@ impl Emit<'_> {
     /// Divides or takes the remainder by a power of two into `dst` with a shift or a mask, when `op` is unsigned and `y` is one.
     pub(super) fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
         let ty = self.ty(y);
-        let Some(divisor) = self.const_of(y).map(|imm| crate::fold::extend(imm, ty, false) as u64).filter(|d| d.is_power_of_two()) else {
+        let Some(divisor) = self
+            .const_of(y)
+            .map(|imm| crate::fold::extend(imm, ty, false) as u64)
+            .filter(|d| d.is_power_of_two())
+        else {
             return false;
         };
         match op {
@@ -223,7 +264,9 @@ impl Emit<'_> {
                 }
             }
             Binary::Urem => {
-                let Ok(mask) = i32::try_from(divisor - 1) else { return false };
+                let Ok(mask) = i32::try_from(divisor - 1) else {
+                    return false;
+                };
                 self.raw(dst, x);
                 self.asm.alu_imm(Alu::And, dst, mask);
             }
@@ -241,7 +284,10 @@ impl Emit<'_> {
         self.get(Reg::Rax, x, ext);
         let divisor = self
             .reg_of(y)
-            .filter(|&r| !matches!(r, Reg::Rax | Reg::Rdx | Reg::Rsp) && (ty.bytes() >= 4 || (!signed && self.plan.zero_ext[y.index()])))
+            .filter(|&r| {
+                !matches!(r, Reg::Rax | Reg::Rdx | Reg::Rsp)
+                    && (ty.bytes() >= 4 || (!signed && self.plan.zero_ext[y.index()]))
+            })
             .unwrap_or_else(|| {
                 self.get(Reg::Rcx, y, ext);
                 Reg::Rcx
@@ -264,7 +310,11 @@ impl Emit<'_> {
             }
         }
         self.clobber_regs(&[Reg::Rax, Reg::Rdx]);
-        if matches!(op, Binary::Srem | Binary::Urem) { Reg::Rdx } else { Reg::Rax }
+        if matches!(op, Binary::Srem | Binary::Urem) {
+            Reg::Rdx
+        } else {
+            Reg::Rax
+        }
     }
 
     /// Divides the 128-bit value `high:low` by `by` with one `div`, putting the quotient, or the remainder when `rem` is set, in `result`.
@@ -283,12 +333,16 @@ impl Emit<'_> {
         let ext = Ext::of(signed);
         self.get(Reg::Rax, x, ext);
         if bits == 64 {
-            let source = self.reg_of(y).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)).unwrap_or_else(|| {
-                self.get(Reg::Rcx, y, ext);
-                Reg::Rcx
-            });
+            let source = self
+                .reg_of(y)
+                .filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp))
+                .unwrap_or_else(|| {
+                    self.get(Reg::Rcx, y, ext);
+                    Reg::Rcx
+                });
             self.clobber_reg(Reg::Rax);
-            self.asm.group3(if signed { Group3::Imul } else { Group3::Mul }, source);
+            self.asm
+                .group3(if signed { Group3::Imul } else { Group3::Mul }, source);
             self.clobber_reg(Reg::Rdx);
             self.low_product = Some((x, y));
             return Reg::Rdx;
@@ -296,14 +350,28 @@ impl Emit<'_> {
         self.get(Reg::Rcx, y, ext);
         self.clobber_reg(Reg::Rax);
         self.asm.imul(Reg::Rax, Reg::Rcx);
-        self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
+        self.asm.shift_imm(
+            Size::Q,
+            if signed { Shift::Sar } else { Shift::Shr },
+            Reg::Rax,
+            bits,
+        );
         Reg::Rax
     }
-    pub(super) fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value, dst: Option<Reg>) -> Reg {
+    pub(super) fn rmw(
+        &mut self,
+        op: AtomicRmwOp,
+        size: Size,
+        addr: Value,
+        value: Value,
+        dst: Option<Reg>,
+    ) -> Reg {
         match op {
             AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub => {
                 let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
-                let out = dst.filter(|&r| target.base != r && target.index.is_none_or(|(idx, _)| idx != r)).unwrap_or(Reg::Rax);
+                let out = dst
+                    .filter(|&r| target.base != r && target.index.is_none_or(|(idx, _)| idx != r))
+                    .unwrap_or(Reg::Rax);
                 if op == AtomicRmwOp::Sub
                     && let Some(imm) = self.const_of(value)
                 {
@@ -338,13 +406,23 @@ impl Emit<'_> {
             AtomicRmwOp::And => self.imm_sized(value, size).map(|imm| (Alu::And, imm)),
             _ => None,
         };
-        let avoid: &[Reg] = if imm_alu.is_some() { &[Reg::Rax, Reg::Rcx] } else { &[Reg::Rax, Reg::Rcx, Reg::Rdx] };
+        let avoid: &[Reg] = if imm_alu.is_some() {
+            &[Reg::Rax, Reg::Rcx]
+        } else {
+            &[Reg::Rax, Reg::Rcx, Reg::Rdx]
+        };
         let target = self.atomic_target(addr, Reg::Rsi, avoid);
-        if imm_alu.is_none() { self.get(Reg::Rdx, value, Ext::of(signed)); }
+        if imm_alu.is_none() {
+            self.get(Reg::Rdx, value, Ext::of(signed));
+        }
         self.asm.load(size, Reg::Rax, target);
         let again = self.asm.label();
         self.asm.bind(again);
-        if signed { self.asm.load_signed(size, Reg::Rcx, Reg::Rax); } else { self.asm.load(size, Reg::Rcx, Reg::Rax); }
+        if signed {
+            self.asm.load_signed(size, Reg::Rcx, Reg::Rax);
+        } else {
+            self.asm.load(size, Reg::Rcx, Reg::Rax);
+        }
         let choose = match op {
             AtomicRmwOp::Smin => Some(Cond::G),
             AtomicRmwOp::Smax => Some(Cond::L),
@@ -353,13 +431,18 @@ impl Emit<'_> {
             _ => None,
         };
         match (choose, imm_alu, op) {
-            (Some(cond), _, _) => { self.asm.alu(Alu::Cmp, Reg::Rcx, Reg::Rdx); self.asm.cmov(cond, Reg::Rcx, Reg::Rdx); }
+            (Some(cond), _, _) => {
+                self.asm.alu(Alu::Cmp, Reg::Rcx, Reg::Rdx);
+                self.asm.cmov(cond, Reg::Rcx, Reg::Rdx);
+            }
             (None, Some((alu, imm)), _) => self.asm.alu_imm_sized(size, alu, Reg::Rcx, imm),
             (None, None, AtomicRmwOp::Or) => self.asm.alu(Alu::Or, Reg::Rcx, Reg::Rdx),
             (None, None, AtomicRmwOp::Xor) => self.asm.alu(Alu::Xor, Reg::Rcx, Reg::Rdx),
             (None, None, _) => {
                 self.asm.alu(Alu::And, Reg::Rcx, Reg::Rdx);
-                if op == AtomicRmwOp::Nand { self.asm.group3(Group3::Not, Reg::Rcx); }
+                if op == AtomicRmwOp::Nand {
+                    self.asm.group3(Group3::Not, Reg::Rcx);
+                }
             }
         }
         self.asm.cmpxchg(size, target, Reg::Rcx);
@@ -375,12 +458,18 @@ impl Emit<'_> {
             (None, None) => None,
         };
         if let Some((val, imm)) = imm_pair {
-            if imm == 1 && matches!(ty, Type::I32 | Type::I64) && self.plan.elided[val.index()]
+            if imm == 1
+                && matches!(ty, Type::I32 | Type::I64)
+                && self.plan.elided[val.index()]
                 && let Some(uinst) = self.defs[val.index()]
                 && let Op::Binary(Binary::Ushr, word, k) = self.func.insts[uinst.index()].op
                 && let Some(rw) = self.reg_of(word)
             {
-                let rk = self.reg_of(k).unwrap_or_else(|| { self.raw(Reg::Rax, k); self.clobber_reg(Reg::Rax); Reg::Rax });
+                let rk = self.reg_of(k).unwrap_or_else(|| {
+                    self.raw(Reg::Rax, k);
+                    self.clobber_reg(Reg::Rax);
+                    Reg::Rax
+                });
                 self.asm.bt_reg(size, rw, rk);
                 return Cond::B;
             }
@@ -395,19 +484,32 @@ impl Emit<'_> {
                 let source = self.operand(val);
                 self.asm.test_imm_sized(tsz, source, timm);
             } else {
-                let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
+                let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot)
+                    || self.has_elided_mem(val)
+                {
                     self.operand(val)
                 } else {
                     self.raw(Reg::Rax, val);
                     Reg::Rax.into()
                 };
                 if ty == Type::I64 && (imm as u64).is_power_of_two() {
-                    self.asm.bt_imm(Size::Q, 4, source, (imm as u64).trailing_zeros() as u8);
+                    self.asm
+                        .bt_imm(Size::Q, 4, source, (imm as u64).trailing_zeros() as u8);
                     return Cond::B;
-                } else if ty == Type::I64 && (imm as u64).checked_add(1).is_some_and(u64::is_power_of_two) {
+                } else if ty == Type::I64
+                    && (imm as u64)
+                        .checked_add(1)
+                        .is_some_and(u64::is_power_of_two)
+                {
                     let shift = (imm as u64).leading_zeros() as u8;
-                    if !matches!(source, Rm::Reg(0)) { self.asm.load(Size::Q, Reg::Rax, source); }
-                    if shift == 1 { self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax); } else { self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift); }
+                    if !matches!(source, Rm::Reg(0)) {
+                        self.asm.load(Size::Q, Reg::Rax, source);
+                    }
+                    if shift == 1 {
+                        self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax);
+                    } else {
+                        self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift);
+                    }
                     self.clobber_reg(Reg::Rax);
                 } else {
                     let (source, wide) = self.spare(None, val, source);
@@ -435,18 +537,35 @@ impl Emit<'_> {
     pub(super) fn emit_mem_rmw(&mut self, value: Value, to: Mem) {
         self.flags = None;
         let inst = self.defs[value.index()].expect("invariant: fuse_mem_rmw checked def");
-        let Op::Binary(op, a, b) = self.func.insts[inst.index()].op else { return };
+        let Op::Binary(op, a, b) = self.func.insts[inst.index()].op else {
+            return;
+        };
         let other = if self.plan.elided[a.index()] { b } else { a };
         let alu = match op {
-            Binary::Iadd => Alu::Add, Binary::Isub => Alu::Sub,
-            Binary::Band => Alu::And, Binary::Bor => Alu::Or, Binary::Bxor => Alu::Xor,
+            Binary::Iadd => Alu::Add,
+            Binary::Isub => Alu::Sub,
+            Binary::Band => Alu::And,
+            Binary::Bor => Alu::Or,
+            Binary::Bxor => Alu::Xor,
             _ => return,
         };
         let (ty, size) = (self.ty(value), Size::of(self.ty(value).bytes()));
-        if let Some(imm) = self.const_of(other).and_then(|c| if ty.bytes() < 8 { Some(c as i32) } else { i32::try_from(c).ok() }) {
+        if let Some(imm) = self.const_of(other).and_then(|c| {
+            if ty.bytes() < 8 {
+                Some(c as i32)
+            } else {
+                i32::try_from(c).ok()
+            }
+        }) {
             self.asm.alu_imm_sized(size, alu, to, imm);
         } else {
-            self.asm.alu_mem_reg(size, alu, to, self.reg_of(other).expect("invariant: fuse_mem_rmw checked reg"));
+            self.asm.alu_mem_reg(
+                size,
+                alu,
+                to,
+                self.reg_of(other)
+                    .expect("invariant: fuse_mem_rmw checked reg"),
+            );
         }
     }
 }

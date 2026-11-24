@@ -3,9 +3,9 @@ use std::io::{BufWriter, Write};
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
-use rustc_middle::mono::{MonoItem, MonoItemData};
-use rustc_middle::ty::print::{with_resolve_crate_name, with_no_trimmed_paths};
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
+use rustc_middle::mono::{MonoItem, MonoItemData};
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{self, GenericArgKind, Instance, InstanceKind, TyCtxt};
 use rustc_session::config::CrateType;
 use rustc_span::Symbol;
@@ -76,16 +76,26 @@ pub fn write(tcx: TyCtxt<'_>, unit: &Unit) -> Result<()> {
         writeln!(out, "{}", crate::object::facts(tcx, ty)?)?;
     }
     out.flush()?;
-    if tcx.crate_types().iter().any(|kind| *kind != CrateType::Rlib) {
+    if tcx
+        .crate_types()
+        .iter()
+        .any(|kind| *kind != CrateType::Rlib)
+    {
         crate::link::write_libraries(tcx, &unit.dir.join(LINK))?;
     }
     Ok(())
 }
 
 /// The manifest line of mono item `item` of unit `cgu`: a record for a function instance not yet seen, the facts of a static that holds state.
-fn line<'tcx>(tcx: TyCtxt<'tcx>, (item, data): (MonoItem<'tcx>, &MonoItemData), (cgu, found): (Symbol, &mut Found<'tcx>)) -> Result<Option<Value>> {
+fn line<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    (item, data): (MonoItem<'tcx>, &MonoItemData),
+    (cgu, found): (Symbol, &mut Found<'tcx>),
+) -> Result<Option<Value>> {
     match item {
-        MonoItem::Fn(instance) if found.seen.insert(instance) => record(tcx, instance, data, (cgu, found)).map(Some),
+        MonoItem::Fn(instance) if found.seen.insert(instance) => {
+            record(tcx, instance, data, (cgu, found)).map(Some)
+        }
         MonoItem::Static(def_id) => Ok(crate::statics::facts(tcx, def_id)),
         MonoItem::Fn(_) | MonoItem::GlobalAsm(_) => Ok(None),
     }
@@ -112,21 +122,55 @@ fn header(tcx: TyCtxt<'_>, unit: &Unit) -> Value {
 fn stdout(tcx: TyCtxt<'_>) -> Option<(String, String)> {
     let stdout = tcx.get_diagnostic_item(Symbol::intern(STDOUT_ITEM))?;
     let write = tcx.get_diagnostic_item(Symbol::intern(WRITE_ITEM))?;
-    let flush = tcx.associated_items(write).filter_by_name_unhygienic(Symbol::intern(FLUSH)).next()?.def_id;
-    let ty = tcx.fn_sig(stdout).instantiate_identity().skip_normalization().output().skip_binder();
-    let instance = Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), flush, tcx.mk_args(&[ty.into()])).ok()??;
-    Some((tcx.symbol_name(Instance::mono(tcx, stdout)).name.to_string(), tcx.symbol_name(instance).name.to_string()))
+    let flush = tcx
+        .associated_items(write)
+        .filter_by_name_unhygienic(Symbol::intern(FLUSH))
+        .next()?
+        .def_id;
+    let ty = tcx
+        .fn_sig(stdout)
+        .instantiate_identity()
+        .skip_normalization()
+        .output()
+        .skip_binder();
+    let instance = Instance::try_resolve(
+        tcx,
+        ty::TypingEnv::fully_monomorphized(),
+        flush,
+        tcx.mk_args(&[ty.into()]),
+    )
+    .ok()??;
+    Some((
+        tcx.symbol_name(Instance::mono(tcx, stdout))
+            .name
+            .to_string(),
+        tcx.symbol_name(instance).name.to_string(),
+    ))
 }
 
 fn args_init(tcx: TyCtxt<'_>) -> Option<String> {
-    let std = tcx.crates(()).iter().copied().find(|&cnum| tcx.crate_name(cnum).as_str() == "std" && crate::link::sysroot(tcx, cnum))?;
-    tcx.exported_non_generic_symbols(std).iter().find_map(|(symbol, _)| match symbol {
-        ExportedSymbol::NonGeneric(def_id) if path(tcx, *def_id) == ARGS_INIT => Some(tcx.symbol_name(Instance::mono(tcx, *def_id)).name.to_string()),
-        _ => None,
-    })
+    let std =
+        tcx.crates(()).iter().copied().find(|&cnum| {
+            tcx.crate_name(cnum).as_str() == "std" && crate::link::sysroot(tcx, cnum)
+        })?;
+    tcx.exported_non_generic_symbols(std)
+        .iter()
+        .find_map(|(symbol, _)| match symbol {
+            ExportedSymbol::NonGeneric(def_id) if path(tcx, *def_id) == ARGS_INIT => Some(
+                tcx.symbol_name(Instance::mono(tcx, *def_id))
+                    .name
+                    .to_string(),
+            ),
+            _ => None,
+        })
 }
 
-fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData, (cgu, found): (Symbol, &mut Found<'tcx>)) -> Result<Value> {
+fn record<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data: &MonoItemData,
+    (cgu, found): (Symbol, &mut Found<'tcx>),
+) -> Result<Value> {
     let used = uses::used(tcx, instance);
     found.indirect.extend(used.indirect);
     found.upstream.extend(used.upstream);
@@ -195,7 +239,9 @@ fn path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 
 pub fn kind(def: InstanceKind<'_>) -> String {
     let text = format!("{def:?}");
-    let mut words = text.split(['(', ' ', ',', ')']).filter(|word| !word.is_empty());
+    let mut words = text
+        .split(['(', ' ', ',', ')'])
+        .filter(|word| !word.is_empty());
     match (words.next(), words.next()) {
         (Some("Shim"), Some(shim)) => format!("Shim::{shim}"),
         (Some(kind), _) => kind.to_string(),
@@ -211,7 +257,12 @@ fn closure<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Value {
     let parent = tcx.parent(def_id);
     let root = tcx.typeck_root_def_id(def_id);
     let index = tcx.def_key(def_id).disambiguated_data.disambiguator;
-    let kind = match tcx.type_of(def_id).instantiate_identity().skip_normalization().kind() {
+    let kind = match tcx
+        .type_of(def_id)
+        .instantiate_identity()
+        .skip_normalization()
+        .kind()
+    {
         ty::Closure(..) => Some(format!("{:?}", instance.args.as_closure().kind())),
         _ => None,
     };
@@ -226,14 +277,23 @@ pub fn order(tcx: TyCtxt<'_>, def_id: DefId) -> Option<(usize, usize)> {
     let mut ends = Vec::new();
     for nested in tcx.nested_bodies_within(root) {
         let span = tcx.hir_span_with_body(tcx.local_def_id_to_hir_id(nested));
-        let plain = matches!(tcx.type_of(nested).instantiate_identity().skip_normalization().kind(), ty::Closure(..));
+        let plain = matches!(
+            tcx.type_of(nested)
+                .instantiate_identity()
+                .skip_normalization()
+                .kind(),
+            ty::Closure(..)
+        );
         if !plain || span.from_expansion() {
             return None;
         }
         ends.push((span.hi(), std::cmp::Reverse(span.lo()), nested));
     }
     ends.sort_by_key(|(hi, lo, _)| (*hi, *lo));
-    Some((ends.iter().position(|(_, _, nested)| *nested == local)?, ends.len()))
+    Some((
+        ends.iter().position(|(_, _, nested)| *nested == local)?,
+        ends.len(),
+    ))
 }
 
 fn span(tcx: TyCtxt<'_>, def_id: DefId) -> Value {
@@ -246,7 +306,16 @@ fn span(tcx: TyCtxt<'_>, def_id: DefId) -> Value {
 
 fn args<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<String> {
     let def_id = instance.def_id();
-    let count = if tcx.is_closure_like(def_id) { tcx.generics_of(def_id).parent_count } else { instance.args.len() };
-    let kept = instance.args.iter().take(count).filter(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
-    kept.map(|arg| with_no_trimmed_paths!(arg.to_string())).collect()
+    let count = if tcx.is_closure_like(def_id) {
+        tcx.generics_of(def_id).parent_count
+    } else {
+        instance.args.len()
+    };
+    let kept = instance
+        .args
+        .iter()
+        .take(count)
+        .filter(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
+    kept.map(|arg| with_no_trimmed_paths!(arg.to_string()))
+        .collect()
 }

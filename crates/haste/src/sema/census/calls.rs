@@ -10,14 +10,22 @@ use crate::sema::ty::{Kind, Ty};
 use super::digest::{Mix, TraitFacts, hash_num_tag, hash_signature};
 use super::footprint::{Edge, HashBins, hash_closure_env_offsets, hash_field_at, hash_type_use};
 
-pub(super) fn hash_control_and_coercions(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, bins: &mut HashBins, edges: &mut Vec<Edge>) {
+pub(super) fn hash_control_and_coercions(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    typed: &Typed,
+    bins: &mut HashBins,
+    edges: &mut Vec<Edge>,
+) {
     for (&e, &off) in &typed.offsets {
         bins.k.u32(e.0);
         bins.k.u64(off);
         bins.offset.u64(off);
     }
     for (&e, fields) in &typed.ranges {
-        if let Some(&ty) = typed.exprs.get(e.0 as usize) && ty != Ty::NONE {
+        if let Some(&ty) = typed.exprs.get(e.0 as usize)
+            && ty != Ty::NONE
+        {
             for &idx in fields.iter() {
                 hash_field_at(cx, ty, 0, idx, bins);
             }
@@ -44,20 +52,34 @@ fn hash_loop_and_try_layouts(cx: &mut Context<'_>, typed: &Typed, bins: &mut Has
         hash_field_at(cx, awaited.polled, 0, 0, bins);
     }
     for (&expr, _) in &typed.closures {
-        if let Some(&ty) = typed.exprs.get(expr.0 as usize) && ty != Ty::NONE {
+        if let Some(&ty) = typed.exprs.get(expr.0 as usize)
+            && ty != Ty::NONE
+        {
             hash_closure_env_offsets(cx, ty, bins);
         }
     }
 }
 
-fn hash_coercion_table(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, bins: &mut HashBins, edges: &mut Vec<Edge>) {
+fn hash_coercion_table(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    typed: &Typed,
+    bins: &mut HashBins,
+    edges: &mut Vec<Edge>,
+) {
     for (&expr, coercion) in &typed.coercions {
         bins.k.u32(expr.0);
         hash_one_coercion(cx, reached, (expr.0, coercion), bins, edges);
     }
 }
 
-fn hash_one_coercion(cx: &mut Context<'_>, reached: &Reached, (key, coercion): (u32, &Coercion), bins: &mut HashBins, edges: &mut Vec<Edge>) {
+fn hash_one_coercion(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    (key, coercion): (u32, &Coercion),
+    bins: &mut HashBins,
+    edges: &mut Vec<Edge>,
+) {
     match coercion {
         Coercion::Len(len) => {
             bins.k.byte(1);
@@ -79,7 +101,13 @@ fn hash_one_coercion(cx: &mut Context<'_>, reached: &Reached, (key, coercion): (
                 if let Some(Res::Fn(item, substs)) = step_res
                     && let Some(&callee) = reached.index.get(&(*item, *substs))
                 {
-                    edges.push(Edge { tag: 9, key: (u64::from(key) << 16) | (step_idx as u64), callee, item: *item, foreign: cx.foreign(*item) });
+                    edges.push(Edge {
+                        tag: 9,
+                        key: (u64::from(key) << 16) | (step_idx as u64),
+                        callee,
+                        item: *item,
+                        foreign: cx.foreign(*item),
+                    });
                 }
             }
         }
@@ -125,13 +153,25 @@ fn hash_vtable_fn(reached: &Reached, res: Option<&Res>, mix: &mut Mix) {
     match res {
         Some(Res::Fn(item, substs)) => {
             mix.byte(1);
-            mix.usize(reached.index.get(&(*item, *substs)).copied().unwrap_or(usize::MAX));
+            mix.usize(
+                reached
+                    .index
+                    .get(&(*item, *substs))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            );
         }
         _ => mix.byte(0),
     }
 }
 
-pub(super) fn collect_calls(cx: &mut Context<'_>, reached: &Reached, (owner, typed): (ItemRef, &Typed), (bins, edges): (&mut HashBins, &mut Vec<Edge>), facts: &mut TraitFacts) {
+pub(super) fn collect_calls(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    (owner, typed): (ItemRef, &Typed),
+    (bins, edges): (&mut HashBins, &mut Vec<Edge>),
+    facts: &mut TraitFacts,
+) {
     let mut sites = gather_call_sites(typed);
     sites.sort_unstable_by_key(|&(tag, key, _)| (tag, key));
     for (tag, key, res) in sites {
@@ -144,9 +184,19 @@ fn gather_call_sites(typed: &Typed) -> Vec<(u8, u64, &Res)> {
     let mut sites: Vec<(u8, u64, &Res)> = Vec::new();
     sites.extend(typed.res.iter().map(|(&e, r)| (1, u64::from(e.0), r)));
     sites.extend(typed.pat_res.iter().map(|(&p, r)| (2, u64::from(p.0), r)));
-    sites.extend(typed.derefs.iter().map(|(&(e, step), r)| (3, (u64::from(e.0) << 16) | u64::from(step), r)));
+    sites.extend(
+        typed
+            .derefs
+            .iter()
+            .map(|(&(e, step), r)| (3, (u64::from(e.0) << 16) | u64::from(step), r)),
+    );
     sites.extend(typed.operators.iter().map(|(&e, r)| (4, u64::from(e.0), r)));
-    sites.extend(typed.try_blocks.iter().map(|(&e, r)| (5, u64::from(e.0), r)));
+    sites.extend(
+        typed
+            .try_blocks
+            .iter()
+            .map(|(&e, r)| (5, u64::from(e.0), r)),
+    );
     sites.extend(typed.box_frees.iter().map(|(&e, r)| (6, u64::from(e.0), r)));
     for (&expr, each) in &typed.fors {
         sites.push((7, u64::from(expr.0) * 2, &each.into_iter));
@@ -160,7 +210,13 @@ fn gather_call_sites(typed: &Typed) -> Vec<(u8, u64, &Res)> {
         sites.push((10, u64::from(expr.0) * 2, &awaited.into_future));
         sites.push((10, u64::from(expr.0) * 2 + 1, &awaited.poll));
     }
-    sites.extend(typed.drops.iter().enumerate().map(|(idx, r)| (11, idx as u64, r)));
+    sites.extend(
+        typed
+            .drops
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| (11, idx as u64, r)),
+    );
     append_shape_calls(&typed.shape, &mut sites);
     sites
 }
@@ -171,14 +227,23 @@ fn append_shape_calls<'a>(shape: &'a Shape, sites: &mut Vec<(u8, u64, &'a Res)>)
             if let Some(drop) = &glue.drop {
                 sites.push((12, 0, drop));
             }
-            sites.extend(glue.parts.iter().enumerate().map(|(idx, r)| (12, 1 + idx as u64, r)));
+            sites.extend(
+                glue.parts
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, r)| (12, 1 + idx as u64, r)),
+            );
             if let Some(resume) = &glue.resume {
                 sites.push((12, 0xffff, resume));
             }
         }
         Shape::Untuple(res) => sites.push((13, 0, res)),
-        Shape::Clone(calls) => sites.extend(calls.iter().enumerate().map(|(idx, r)| (14, idx as u64, r))),
-        Shape::Asm(calls) => sites.extend(calls.iter().enumerate().map(|(idx, r)| (15, idx as u64, r))),
+        Shape::Clone(calls) => {
+            sites.extend(calls.iter().enumerate().map(|(idx, r)| (14, idx as u64, r)))
+        }
+        Shape::Asm(calls) => {
+            sites.extend(calls.iter().enumerate().map(|(idx, r)| (15, idx as u64, r)))
+        }
         Shape::GlobalAlloc(shim) => {
             sites.push((16, 0, &shim.allocator));
             sites.push((16, 1, &shim.method));
@@ -187,7 +252,13 @@ fn append_shape_calls<'a>(shape: &'a Shape, sites: &mut Vec<(u8, u64, &'a Res)>)
     }
 }
 
-fn record_res_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key, res): (ItemRef, u8, u64, &Res), (bins, edges): (&mut HashBins, &mut Vec<Edge>), facts: &mut TraitFacts) {
+fn record_res_site(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    (owner, tag, key, res): (ItemRef, u8, u64, &Res),
+    (bins, edges): (&mut HashBins, &mut Vec<Edge>),
+    facts: &mut TraitFacts,
+) {
     match res {
         Res::Const(val) => {
             bins.k.byte(tag);
@@ -201,18 +272,38 @@ fn record_res_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key, re
             bins.k.u64(key);
             bins.k.u32(*variant);
         }
-        Res::Fn(item, substs) => record_fn_site(cx, reached, (owner, tag, key), (*item, *substs), (bins, edges, facts)),
+        Res::Fn(item, substs) => record_fn_site(
+            cx,
+            reached,
+            (owner, tag, key),
+            (*item, *substs),
+            (bins, edges, facts),
+        ),
         Res::Local(_) => {}
     }
 }
 
-fn record_fn_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key): (ItemRef, u8, u64), (item, substs): (ItemRef, Substs), (bins, edges, facts): (&mut HashBins, &mut Vec<Edge>, &mut TraitFacts)) {
+fn record_fn_site(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    (owner, tag, key): (ItemRef, u8, u64),
+    (item, substs): (ItemRef, Substs),
+    (bins, edges, facts): (&mut HashBins, &mut Vec<Edge>, &mut TraitFacts),
+) {
     if let Some(which) = cx.intrinsic(item) {
         let slice = cx.types.substs(substs).to_vec();
-        hash_intrinsic_site(cx, reached, (owner, tag, key), (which, &slice), (bins, edges));
+        hash_intrinsic_site(
+            cx,
+            reached,
+            (owner, tag, key),
+            (which, &slice),
+            (bins, edges),
+        );
         return;
     }
-    let Some(&callee) = reached.index.get(&(item, substs)) else { return };
+    let Some(&callee) = reached.index.get(&(item, substs)) else {
+        return;
+    };
     if lower::is_static(cx, item) {
         bins.k.byte(tag);
         bins.k.u64(key);
@@ -239,10 +330,22 @@ fn record_fn_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key): (I
             hash_signature(&sig, &mut bins.assoc_abi);
         }
     }
-    edges.push(Edge { tag, key, callee, item, foreign: cx.foreign(item) });
+    edges.push(Edge {
+        tag,
+        key,
+        callee,
+        item,
+        foreign: cx.foreign(item),
+    });
 }
 
-fn hash_intrinsic_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key): (ItemRef, u8, u64), (which, substs): (Intrinsic, &[Ty]), (bins, edges): (&mut HashBins, &mut Vec<Edge>)) {
+fn hash_intrinsic_site(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    (owner, tag, key): (ItemRef, u8, u64),
+    (which, substs): (Intrinsic, &[Ty]),
+    (bins, edges): (&mut HashBins, &mut Vec<Edge>),
+) {
     bins.k.byte(tag);
     bins.k.u64(key);
     match which {
@@ -279,8 +382,12 @@ fn hash_intrinsic_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key
             bins.d.item(owner);
             bins.d_slots = bins.d_slots.saturating_add(1);
         }
-        Intrinsic::SizeOf | Intrinsic::AlignOf | Intrinsic::NeedsDrop => hash_layout_intrinsic(cx, which, substs.first().copied(), bins),
-        Intrinsic::ConstEvalSelect => hash_const_eval_select(cx, reached, (tag, key), substs, (bins, edges)),
+        Intrinsic::SizeOf | Intrinsic::AlignOf | Intrinsic::NeedsDrop => {
+            hash_layout_intrinsic(cx, which, substs.first().copied(), bins)
+        }
+        Intrinsic::ConstEvalSelect => {
+            hash_const_eval_select(cx, reached, (tag, key), substs, (bins, edges))
+        }
         Intrinsic::Simd(op) => hash_simd_intrinsic(cx, op, substs, bins),
         _ => {
             bins.k.byte(8);
@@ -292,7 +399,12 @@ fn hash_intrinsic_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key
     }
 }
 
-fn hash_layout_intrinsic(cx: &mut Context<'_>, which: Intrinsic, ty: Option<Ty>, bins: &mut HashBins) {
+fn hash_layout_intrinsic(
+    cx: &mut Context<'_>,
+    which: Intrinsic,
+    ty: Option<Ty>,
+    bins: &mut HashBins,
+) {
     match (which, ty) {
         (Intrinsic::SizeOf, Some(ty)) => {
             bins.k.byte(4);
@@ -310,7 +422,13 @@ fn hash_layout_intrinsic(cx: &mut Context<'_>, which: Intrinsic, ty: Option<Ty>,
     }
 }
 
-fn hash_const_eval_select(cx: &mut Context<'_>, reached: &Reached, (tag, key): (u8, u64), substs: &[Ty], (bins, edges): (&mut HashBins, &mut Vec<Edge>)) {
+fn hash_const_eval_select(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    (tag, key): (u8, u64),
+    substs: &[Ty],
+    (bins, edges): (&mut HashBins, &mut Vec<Edge>),
+) {
     bins.k.byte(7);
     if let Some(&tuple) = substs.first() {
         hash_type_use(cx, tuple, bins);
@@ -319,7 +437,13 @@ fn hash_const_eval_select(cx: &mut Context<'_>, reached: &Reached, (tag, key): (
         && let Kind::FnDef(fn_item, fn_substs) = *cx.types.kind(runtime)
         && let Some(&callee) = reached.index.get(&(fn_item, fn_substs))
     {
-        edges.push(Edge { tag, key, callee, item: fn_item, foreign: cx.foreign(fn_item) });
+        edges.push(Edge {
+            tag,
+            key,
+            callee,
+            item: fn_item,
+            foreign: cx.foreign(fn_item),
+        });
     }
 }
 

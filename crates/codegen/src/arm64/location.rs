@@ -53,13 +53,21 @@ impl Emit<'_> {
         self.spills.clobber_reg(reg);
     }
 
-    pub(super) fn clobber_regs(&mut self, regs: &[Reg]) { regs.iter().for_each(|&reg| self.clobber_reg(reg)); }
+    pub(super) fn clobber_regs(&mut self, regs: &[Reg]) {
+        regs.iter().for_each(|&reg| self.clobber_reg(reg));
+    }
 
-    pub(super) fn clobber_vreg(&mut self, reg: Vreg) { self.spills.clobber_freg(reg); }
+    pub(super) fn clobber_vreg(&mut self, reg: Vreg) {
+        self.spills.clobber_freg(reg);
+    }
 
-    pub(super) fn invalidate_disp(&mut self, disp: i32) { self.spills.invalidate_disp(disp); }
+    pub(super) fn invalidate_disp(&mut self, disp: i32) {
+        self.spills.invalidate_disp(disp);
+    }
 
-    pub(super) fn resume_spills(&mut self, block: crate::ir::Block) { self.spills.resume(block); }
+    pub(super) fn resume_spills(&mut self, block: crate::ir::Block) {
+        self.spills.resume(block);
+    }
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
         self.clobber_reg(reg);
@@ -82,7 +90,9 @@ impl Emit<'_> {
 
     pub(super) fn add_const(&mut self, dst: Reg, base: Reg, imm: i64) {
         match u32::try_from(imm.unsigned_abs()) {
-            Ok(small) if small < 4096 => self.asm.add_imm(imm < 0, false, Size::X, dst, base, small),
+            Ok(small) if small < 4096 => {
+                self.asm.add_imm(imm < 0, false, Size::X, dst, base, small)
+            }
             Ok(mid) if mid < (1 << 24) => {
                 let (hi, lo) = (mid & !0xFFF, mid & 0xFFF);
                 self.asm.add_imm(imm < 0, false, Size::X, dst, base, hi);
@@ -103,7 +113,12 @@ impl Emit<'_> {
         self.address_in(addr, offset, C)
     }
 
-    pub(super) fn sib_indexed(&mut self, addr: Value, offset: i32, bytes: u32) -> Option<(Reg, Reg, u8)> {
+    pub(super) fn sib_indexed(
+        &mut self,
+        addr: Value,
+        offset: i32,
+        bytes: u32,
+    ) -> Option<(Reg, Reg, u8)> {
         let mode = self.plan.sib[addr.index()]?;
         let (_, shift) = decode_sib(mode.shift);
         if shift != 0 && (1u32 << shift) != bytes {
@@ -111,7 +126,9 @@ impl Emit<'_> {
         }
         let disp = i64::from(mode.disp) + i64::from(offset);
         let base_reg = match mode.base {
-            SibBase::Frame(slot) => self.frame_base(disp + i64::from(self.frame.slots[slot.index()])),
+            SibBase::Frame(slot) => {
+                self.frame_base(disp + i64::from(self.frame.slots[slot.index()]))
+            }
             SibBase::Value(base) if disp == 0 => self.bits(base, C),
             SibBase::Value(_) => return None,
         };
@@ -138,7 +155,8 @@ impl Emit<'_> {
             if ext == ExtOp::Uxtx {
                 self.asm.add_shifted(scratch, base_reg, idx_reg, shift);
             } else {
-                self.asm.alu_extended(Alu::Add, Size::X, ext, shift, scratch, base_reg, idx_reg);
+                self.asm
+                    .alu_extended(Alu::Add, Size::X, ext, shift, scratch, base_reg, idx_reg);
             }
             self.clobber_reg(scratch);
             return Mem::new(scratch, disp);
@@ -152,7 +170,9 @@ impl Emit<'_> {
             return Mem::new(base, disp);
         }
         if let Location::Frame(slot, base) = self.plan.location(addr)
-            && let Some(disp) = self.frame.slots[slot.index()].checked_add(base).and_then(|disp| disp.checked_add(offset))
+            && let Some(disp) = self.frame.slots[slot.index()]
+                .checked_add(base)
+                .and_then(|disp| disp.checked_add(offset))
         {
             return self.frame_mem(disp);
         }
@@ -168,12 +188,14 @@ impl Emit<'_> {
             }
             Location::SlotAddr(sym) | Location::Symbol(sym) if self.direct_calls => {
                 let at = self.asm.adrp_add_reloc(reg);
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64AdrpAdd));
+                self.relocs
+                    .push(StencilReloc::symbol(at, sym, RelocKind::Arm64AdrpAdd));
                 self.clobber_reg(reg);
             }
             Location::SlotAddr(sym) | Location::Symbol(sym) => {
                 let at = self.asm.mov_symbol(reg);
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64Movw64));
+                self.relocs
+                    .push(StencilReloc::symbol(at, sym, RelocKind::Arm64Movw64));
                 self.clobber_reg(reg);
             }
             Location::Frame(slot, offset) => self.slot_address(reg, slot, offset),
@@ -185,7 +207,8 @@ impl Emit<'_> {
                 }
             }
             Location::Float(from) => {
-                self.asm.fmov_out(self.ty(value).bytes() == 8, reg, Vreg(from));
+                self.asm
+                    .fmov_out(self.ty(value).bytes() == 8, reg, Vreg(from));
                 self.clobber_reg(reg);
             }
             Location::Slot => {
@@ -196,7 +219,10 @@ impl Emit<'_> {
                         self.asm.mov(reg, cached_reg);
                         self.record_spill(disp, reg);
                     }
-                } else if let Some(imm) = self.const_bits(value).filter(|&imm| imm == 0 || Asm::mov_imm_is_single(imm)) {
+                } else if let Some(imm) = self
+                    .const_bits(value)
+                    .filter(|&imm| imm == 0 || Asm::mov_imm_is_single(imm))
+                {
                     self.asm.mov_imm(reg, imm);
                     self.record_spill(disp, reg);
                 } else {
@@ -246,7 +272,10 @@ impl Emit<'_> {
                 self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed));
                 self.spills.clobber_reg(reg);
             }
-            Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) | Location::Offset(..) => self.raw(reg, value),
+            Location::Frame(..)
+            | Location::SlotAddr(_)
+            | Location::Symbol(_)
+            | Location::Offset(..) => self.raw(reg, value),
             Location::Reg(from) if full => {
                 if reg != from {
                     self.asm.mov(reg, from);
@@ -269,7 +298,10 @@ impl Emit<'_> {
     }
 
     fn is_scratch(reg: Reg) -> bool {
-        matches!(reg, super::ZR | super::A | super::C | super::D | super::S | super::T | super::IP) || reg.0 == 17
+        matches!(
+            reg,
+            super::ZR | super::A | super::C | super::D | super::S | super::T | super::IP
+        ) || reg.0 == 17
     }
 
     fn borrowable(cached: Reg, scratch: Reg) -> bool {
@@ -300,11 +332,13 @@ impl Emit<'_> {
     }
 
     fn is_full(&self, value: Value, ext: Ext) -> bool {
-        self.ty(value).bytes() >= 8 || (matches!(ext, Ext::Zero) && self.plan.zero_ext[value.index()])
+        self.ty(value).bytes() >= 8
+            || (matches!(ext, Ext::Zero) && self.plan.zero_ext[value.index()])
     }
 
     fn op_in_scratch(&self, value: Value, scratch: Reg, ext: Option<Ext>) -> bool {
-        ext.is_none_or(|e| self.is_full(value, e)) && self.spill_borrow(value, scratch) == Some(scratch)
+        ext.is_none_or(|e| self.is_full(value, e))
+            && self.spill_borrow(value, scratch) == Some(scratch)
     }
 
     fn op_ready(&self, value: Value, ext: Option<Ext>) -> bool {
@@ -321,7 +355,11 @@ impl Emit<'_> {
 
     fn resolve_pair(&mut self, x: Value, y: Value, ext: Option<Ext>) -> (Reg, Reg) {
         if x == y {
-            let scratch = if self.op_ready(x, ext) || !self.op_in_scratch(x, C, ext) { A } else { C };
+            let scratch = if self.op_ready(x, ext) || !self.op_in_scratch(x, C, ext) {
+                A
+            } else {
+                C
+            };
             let reg = self.resolve_op(x, scratch, ext);
             return (reg, reg);
         }
@@ -346,7 +384,10 @@ impl Emit<'_> {
 
     pub(super) fn src(&mut self, value: Value, scratch: Reg, ext: Ext) -> Reg {
         if self.is_full(value, ext)
-            && let Some(reg) = self.plan.reg_of(value).or_else(|| self.spill_borrow(value, scratch))
+            && let Some(reg) = self
+                .plan
+                .reg_of(value)
+                .or_else(|| self.spill_borrow(value, scratch))
         {
             return reg;
         }
@@ -378,7 +419,8 @@ impl Emit<'_> {
             }
             Location::Float(location) => {
                 self.clobber_vreg(Vreg(location));
-                self.asm.fmov_in(self.ty(value).bytes() == 8, Vreg(location), reg);
+                self.asm
+                    .fmov_in(self.ty(value).bytes() == 8, Vreg(location), reg);
             }
             _ => {
                 let disp = self.frame.values[value.index()];
@@ -409,7 +451,10 @@ impl Emit<'_> {
             }
             return;
         }
-        if self.const_bits(value).is_some_and(|imm| self.try_emit_float_imm_bits(ty, imm, reg)) {
+        if self
+            .const_bits(value)
+            .is_some_and(|imm| self.try_emit_float_imm_bits(ty, imm, reg))
+        {
             self.spills.fspill = Some((disp, reg, ty));
             return;
         }
@@ -572,7 +617,11 @@ impl Emit<'_> {
         let ty = self.ty(value);
         match self.plan.location(value) {
             Location::Imm(0) => self.store_zero(to, slot_disp, ty),
-            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) | Location::Offset(..) => {
+            Location::Imm(_)
+            | Location::Frame(..)
+            | Location::SlotAddr(_)
+            | Location::Symbol(_)
+            | Location::Offset(..) => {
                 self.raw(IP, value);
                 self.asm.store(Size::X, to, IP);
                 self.finish_slot_store(slot_disp, ty, IP);

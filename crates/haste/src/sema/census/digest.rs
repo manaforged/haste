@@ -20,12 +20,17 @@ pub(super) struct Mix(u64, u64);
 
 impl Mix {
     pub(super) fn new(seed: u64) -> Self {
-        Self(0xcbf2_9ce4_8422_2325 ^ seed, 0x9e37_79b9_7f4a_7c15 ^ seed.rotate_left(17))
+        Self(
+            0xcbf2_9ce4_8422_2325 ^ seed,
+            0x9e37_79b9_7f4a_7c15 ^ seed.rotate_left(17),
+        )
     }
 
     pub(super) fn byte(&mut self, value: u8) {
         self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01b3);
-        self.1 = (self.1.wrapping_add(u64::from(value) + 1)).wrapping_mul(0xbf58_476d_1ce4_e5b9).rotate_left(13);
+        self.1 = (self.1.wrapping_add(u64::from(value) + 1))
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9)
+            .rotate_left(13);
     }
 
     pub(super) fn flag(&mut self, value: bool) {
@@ -96,7 +101,12 @@ struct ProbeSlots {
 impl ProbeSlots {
     fn alloc(&self, len: usize) -> i64 {
         let step = ((len.max(1) as i64) + 15) & !15;
-        let prev = self.next.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.max(PROBE_DATA) + step)).unwrap_or_else(|cur| cur);
+        let prev = self
+            .next
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.max(PROBE_DATA) + step)
+            })
+            .unwrap_or_else(|cur| cur);
         prev.max(PROBE_DATA)
     }
 }
@@ -152,7 +162,10 @@ impl TraitFacts {
         for krate in 0..krate_count {
             let impl_len = cx.outline.crates[krate].impls.len();
             for index in 0..impl_len {
-                let block = ImplRef::Module { krate: krate as u32, index: index as u32 };
+                let block = ImplRef::Module {
+                    krate: krate as u32,
+                    index: index as u32,
+                };
                 if cx.specializable(block)
                     && let Some(of) = cx.impl_trait(block)
                 {
@@ -160,20 +173,33 @@ impl TraitFacts {
                 }
             }
         }
-        Self { spec_trait_set, item_trait_map: FxHashMap::default(), owner_bounds_map: FxHashMap::default() }
+        Self {
+            spec_trait_set,
+            item_trait_map: FxHashMap::default(),
+            owner_bounds_map: FxHashMap::default(),
+        }
     }
 
     pub(super) fn trait_of(&mut self, cx: &mut Context<'_>, item: ItemRef) -> Option<ItemRef> {
         if let Some(&cached) = self.item_trait_map.get(&item) {
             return cached;
         }
-        let found = cx.owner_trait(item).or_else(|| cx.owner_impl(item).and_then(|block| cx.impl_trait(block)));
+        let found = cx
+            .owner_trait(item)
+            .or_else(|| cx.owner_impl(item).and_then(|block| cx.impl_trait(block)));
         self.item_trait_map.insert(item, found);
         found
     }
 
-    pub(super) fn is_unbounded_spec_callee(&mut self, cx: &mut Context<'_>, owner: ItemRef, item: ItemRef) -> bool {
-        let Some(of) = self.trait_of(cx, item) else { return false };
+    pub(super) fn is_unbounded_spec_callee(
+        &mut self,
+        cx: &mut Context<'_>,
+        owner: ItemRef,
+        item: ItemRef,
+    ) -> bool {
+        let Some(of) = self.trait_of(cx, item) else {
+            return false;
+        };
         if !self.spec_trait_set.contains(&of) {
             return false;
         }

@@ -18,7 +18,9 @@ impl Live {
             return;
         }
         self.near.resize(cfg.idom.len(), usize::MAX);
-        let up = cfg.idom[block.index()].filter(|&d| d != block).map_or(usize::MAX, |d| self.near[d.index()]);
+        let up = cfg.idom[block.index()]
+            .filter(|&d| d != block)
+            .map_or(usize::MAX, |d| self.near[d.index()]);
         let start = selects.partition_point(|rec| rec.block.index() < block.index());
         let end = start + selects[start..].partition_point(|rec| rec.block == block);
         let mut at = up;

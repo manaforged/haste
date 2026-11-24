@@ -4,18 +4,26 @@ use crate::ir::{Binary, Function, Op, StackSlot, Type, Value};
 /// Gives each frame slot that asks for more alignment than the frame keeps a larger slot and an address rounded up inside it, computed once at entry, which its accesses then go through.
 pub(crate) fn lower(func: &mut Function) {
     let Some(entry) = func.entry else { return };
-    if func.slots.iter().all(|slot| slot.align_shift <= FRAME_ALIGN_SHIFT) {
+    if func
+        .slots
+        .iter()
+        .all(|slot| slot.align_shift <= FRAME_ALIGN_SHIFT)
+    {
         return;
     }
     let mut used = vec![false; func.slots.len()];
     for block in &func.blocks {
         for inst in &block.insts {
-            if let Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) = func.insts[inst.index()].op {
+            if let Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) =
+                func.insts[inst.index()].op
+            {
                 used[slot.index()] = true;
             }
         }
     }
-    let wide: Vec<usize> = (0..func.slots.len()).filter(|&slot| used[slot] && func.slots[slot].align_shift > FRAME_ALIGN_SHIFT).collect();
+    let wide: Vec<usize> = (0..func.slots.len())
+        .filter(|&slot| used[slot] && func.slots[slot].align_shift > FRAME_ALIGN_SHIFT)
+        .collect();
     if wide.is_empty() {
         return;
     }
@@ -49,8 +57,12 @@ pub(crate) fn lower(func: &mut Function) {
                     func.blocks[block].insts.splice(at..at, added);
                     at += count;
                 }
-                Op::StackLoad(slot, offset) if let Some(base) = bases[slot.index()] => func.insts[inst.index()].op = Op::Load(base, offset),
-                Op::StackStore(value, slot, offset) if let Some(base) = bases[slot.index()] => func.insts[inst.index()].op = Op::Store(value, base, offset),
+                Op::StackLoad(slot, offset) if let Some(base) = bases[slot.index()] => {
+                    func.insts[inst.index()].op = Op::Load(base, offset)
+                }
+                Op::StackStore(value, slot, offset) if let Some(base) = bases[slot.index()] => {
+                    func.insts[inst.index()].op = Op::Store(value, base, offset)
+                }
                 _ => {}
             }
             at += 1;

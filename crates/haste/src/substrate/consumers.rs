@@ -14,7 +14,11 @@ pub(super) struct Consumer {
 
 impl Consumer {
     pub(super) fn read(data: &[u8], rec: usize) -> Self {
-        Self { workspace: read_u64(data, rec), kind: read_u32(data, rec + 8), generation: read_u32(data, rec + 12) }
+        Self {
+            workspace: read_u64(data, rec),
+            kind: read_u32(data, rec + 8),
+            generation: read_u32(data, rec + 12),
+        }
     }
 
     pub(super) fn write(&self, out: &mut Vec<u8>) {
@@ -36,5 +40,9 @@ pub(super) fn retain_live(consumers: &mut Vec<Consumer>, current: Consumer) -> u
     }
     consumers.retain(|c| live.contains(&c.workspace));
     consumers.sort_by_key(|c| (c.workspace, c.kind));
-    consumers.iter().map(|c| c.generation).min().unwrap_or(current.generation)
+    consumers
+        .iter()
+        .map(|c| c.generation)
+        .min()
+        .unwrap_or(current.generation)
 }

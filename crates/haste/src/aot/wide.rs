@@ -1,5 +1,8 @@
 use anyhow::{Context as _, Result, anyhow};
-use haste_codegen::{AbiParam, Arch, CallConv, Effort, FloatCC, Function, FunctionBuilder, IntCC, Os, RuntimeSymbol, Signature, TARGETS, Type, Value};
+use haste_codegen::{
+    AbiParam, Arch, CallConv, Effort, FloatCC, Function, FunctionBuilder, IntCC, Os, RuntimeSymbol,
+    Signature, TARGETS, Type, Value,
+};
 
 use super::Buf;
 
@@ -10,7 +13,12 @@ pub(in crate::aot) enum WideShim {
 }
 
 pub(super) fn emit(arch: Arch, os: Os, kind: WideShim, out: &mut Buf) -> Result<()> {
-    let target = TARGETS.iter().find(|t| t.arch == arch && t.os == os).copied().context("missing codegen target for AOT shim")?.effort(Effort::Full);
+    let target = TARGETS
+        .iter()
+        .find(|t| t.arch == arch && t.os == os)
+        .copied()
+        .context("missing codegen target for AOT shim")?
+        .effort(Effort::Full);
     let func = match kind {
         WideShim::Runtime(RuntimeSymbol::I128Udiv) => build_divrem(false, false, arch),
         WideShim::Runtime(RuntimeSymbol::I128Urem) => build_divrem(false, true, arch),
@@ -60,7 +68,12 @@ fn apply_sign128(b: &mut FunctionBuilder<'_>, u: Value, sign: Value) -> Value {
     b.ins().isub(xored, sign)
 }
 
-fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, arch): (bool, Arch)) -> Value {
+fn udivrem(
+    b: &mut FunctionBuilder<'_>,
+    x: Value,
+    y: Value,
+    (want_rem, arch): (bool, Arch),
+) -> Value {
     let zero = const128(b, 0, 0);
     let is_zero = b.ins().icmp(IntCC::Equal, y, zero);
     let z_blk = b.create_block();
@@ -120,11 +133,20 @@ fn udivrem(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, arch): (b
     out
 }
 
-fn udivrem_by_u64(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, arch): (bool, Arch)) -> Value {
+fn udivrem_by_u64(
+    b: &mut FunctionBuilder<'_>,
+    x: Value,
+    y: Value,
+    (want_rem, arch): (bool, Arch),
+) -> Value {
     let v = b.ins().ireduce(Type::I64, y);
     if arch == Arch::X64 {
         let word = b.ins().uextend(Type::I128, v);
-        return if want_rem { b.ins().urem(x, word) } else { b.ins().udiv(x, word) };
+        return if want_rem {
+            b.ins().urem(x, word)
+        } else {
+            b.ins().udiv(x, word)
+        };
     }
     let c64 = b.ins().iconst(Type::I64, 64);
     let x_hi128 = b.ins().ushr(x, c64);
@@ -134,7 +156,11 @@ fn udivrem_by_u64(b: &mut FunctionBuilder<'_>, x: Value, y: Value, (want_rem, ar
     let q_hi_v = b.ins().imul(q_hi, v);
     let r_hi = b.ins().isub(x_hi, q_hi_v);
     let (q_lo, r) = divlu(b, (r_hi, x_lo), v);
-    if want_rem { b.ins().uextend(Type::I128, r) } else { b.ins().iconcat(q_lo, q_hi) }
+    if want_rem {
+        b.ins().uextend(Type::I128, r)
+    } else {
+        b.ins().iconcat(q_lo, q_hi)
+    }
 }
 
 fn divlu(b: &mut FunctionBuilder<'_>, (u1, u0): (Value, Value), v: Value) -> (Value, Value) {
@@ -161,14 +187,20 @@ fn divlu(b: &mut FunctionBuilder<'_>, (u1, u0): (Value, Value), v: Value) -> (Va
     (q, b.ins().ushr(rn, s))
 }
 
-fn divlu_digit(b: &mut FunctionBuilder<'_>, (num, next): (Value, Value), (vn, vn1, vn0): (Value, Value, Value)) -> (Value, Value) {
+fn divlu_digit(
+    b: &mut FunctionBuilder<'_>,
+    (num, next): (Value, Value),
+    (vn, vn1, vn0): (Value, Value, Value),
+) -> (Value, Value) {
     let c32 = b.ins().iconst(Type::I64, 32);
     let zero = b.ins().iconst(Type::I64, 0);
     let mut q = b.ins().udiv(num, vn1);
     let q_vn1 = b.ins().imul(q, vn1);
     let mut rhat = b.ins().isub(num, q_vn1);
     for _ in 0..2 {
-        let big = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, q, 1 << 32);
+        let big = b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, q, 1 << 32);
         let rhat_small = b.ins().icmp_imm(IntCC::UnsignedLessThan, rhat, 1 << 32);
         let q_vn0 = b.ins().imul(q, vn0);
         let rhat_shl = b.ins().ishl(rhat, c32);
@@ -345,7 +377,11 @@ fn build_float_to_int(from: Type, signed: bool) -> Function {
     b.append_block_params_for_function_params(entry);
     b.switch_to_block(entry);
     let raw = b.block_params(entry)[0];
-    let x = if from == Type::F32 { b.ins().fpromote(Type::F64, raw) } else { raw };
+    let x = if from == Type::F32 {
+        b.ins().fpromote(Type::F64, raw)
+    } else {
+        raw
+    };
     if !signed {
         let res = f64_to_u128(&mut b, x);
         b.ins().return_(&[res]);
@@ -407,7 +443,11 @@ fn build_powi(ty: Type) -> Function {
     let x = b.block_params(entry)[0];
     let n = b.block_params(entry)[1];
 
-    let one_bits = if ty == Type::F64 { 1.0_f64.to_bits() as i64 } else { i64::from(1.0_f32.to_bits()) };
+    let one_bits = if ty == Type::F64 {
+        1.0_f64.to_bits() as i64
+    } else {
+        i64::from(1.0_f32.to_bits())
+    };
     let one = b.ins().iconst(ty, one_bits);
     let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, n, 0);
     let neg_n = b.ins().ineg(n);

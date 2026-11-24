@@ -69,16 +69,33 @@ fn load_user_blocks(func: &Function) -> Option<Vec<Vec<Block>>> {
 
 fn candidates(func: &Function, users: &[Vec<Block>], block: Block) -> Vec<Candidate> {
     let insts = &func.blocks[block.index()].insts;
-    insts.iter().enumerate().filter_map(|(pos, inst)| {
-        let data = &func.insts[inst.index()];
-        let Op::Load(addr, offset) = data.op else { return None };
-        let result = data.result?;
-        let blocks = users.get(result.index())?;
-        (!blocks.is_empty() && !blocks.contains(&block)).then_some(Candidate { pos, addr, offset, result })
-    }).collect()
+    insts
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, inst)| {
+            let data = &func.insts[inst.index()];
+            let Op::Load(addr, offset) = data.op else {
+                return None;
+            };
+            let result = data.result?;
+            let blocks = users.get(result.index())?;
+            (!blocks.is_empty() && !blocks.contains(&block)).then_some(Candidate {
+                pos,
+                addr,
+                offset,
+                result,
+            })
+        })
+        .collect()
 }
 
-fn sink_block(func: &mut Function, (cfg, rank): (&Cfg, &[usize]), prov: &Provenance, users: &[Vec<Block>], block: Block) -> bool {
+fn sink_block(
+    func: &mut Function,
+    (cfg, rank): (&Cfg, &[usize]),
+    prov: &Provenance,
+    users: &[Vec<Block>],
+    block: Block,
+) -> bool {
     let found = candidates(func, users, block);
     let mut addrs: Vec<Value> = found.iter().map(|c| c.addr).collect();
     addrs.sort_unstable();
@@ -86,10 +103,15 @@ fn sink_block(func: &mut Function, (cfg, rank): (&Cfg, &[usize]), prov: &Provena
     let mut moved: Vec<Inst> = Vec::new();
     for addr in addrs {
         let group: Vec<Candidate> = found.iter().copied().filter(|c| c.addr == addr).collect();
-        let Some(loc) = span(func, prov, &group) else { continue };
+        let Some(loc) = span(func, prov, &group) else {
+            continue;
+        };
         let first = group.iter().map(|c| c.pos).min().unwrap_or(0);
         let insts = &func.blocks[block.index()].insts;
-        if insts[first + 1..].iter().any(|inst| clobbers(func, &func.insts[inst.index()].op, loc, prov)) {
+        if insts[first + 1..]
+            .iter()
+            .any(|inst| clobbers(func, &func.insts[inst.index()].op, loc, prov))
+        {
             continue;
         }
         let region = clean_region(func, cfg, prov, block, loc);
@@ -99,16 +121,29 @@ fn sink_block(func: &mut Function, (cfg, rank): (&Cfg, &[usize]), prov: &Provena
             let targets = &users[load.result.index()];
             let fits = targets.iter().all(|&target| {
                 region[target.index()].is_some_and(|first_write| {
-                    cfg.loops().depth_of(target) <= depth && first_use(func, target, load.result).is_some_and(|pos| pos < first_write)
+                    cfg.loops().depth_of(target) <= depth
+                        && first_use(func, target, load.result).is_some_and(|pos| pos < first_write)
                 })
-            }) && (wide || crosses_call(func, cfg, (block, load.pos), &region, (targets, load.result)));
+            }) && (wide
+                || crosses_call(
+                    func,
+                    cfg,
+                    (block, load.pos),
+                    &region,
+                    (targets, load.result),
+                ));
             if fits {
                 moved.push(func.blocks[block.index()].insts[load.pos]);
                 let mut ordered = targets.clone();
                 ordered.sort_unstable_by_key(|target| rank[target.index()]);
                 let mut clones: Vec<(Block, Value)> = Vec::new();
                 for target in ordered {
-                    let shared = clones.iter().find(|&&(at, _)| region[at.index()] == Some(usize::MAX) && cfg.dominates(at, target)).map(|&(_, value)| value);
+                    let shared = clones
+                        .iter()
+                        .find(|&&(at, _)| {
+                            region[at.index()] == Some(usize::MAX) && cfg.dominates(at, target)
+                        })
+                        .map(|&(_, value)| value);
                     let value = clone_into(func, target, load, shared);
                     clones.push((target, value));
                 }
@@ -118,18 +153,29 @@ fn sink_block(func: &mut Function, (cfg, rank): (&Cfg, &[usize]), prov: &Provena
     if moved.is_empty() {
         return false;
     }
-    func.blocks[block.index()].insts.retain(|inst| !moved.contains(inst));
+    func.blocks[block.index()]
+        .insts
+        .retain(|inst| !moved.contains(inst));
     true
 }
 
 fn span(func: &Function, prov: &Provenance, group: &[Candidate]) -> Option<MemLoc> {
     let lo = group.iter().map(|c| i64::from(c.offset)).min()?;
-    let hi = group.iter().map(|c| i64::from(c.offset) + i64::from(func.ty(c.result).bytes())).max()?;
+    let hi = group
+        .iter()
+        .map(|c| i64::from(c.offset) + i64::from(func.ty(c.result).bytes()))
+        .max()?;
     Some(prov.loc(group[0].addr, lo, u32::try_from(hi - lo).ok()?))
 }
 
 /// For each block `from` dominates that every path from `from` reaches without passing an instruction that may write `loc`, the position of its first such instruction, or `usize::MAX`.
-fn clean_region(func: &Function, cfg: &Cfg, prov: &Provenance, from: Block, loc: MemLoc) -> Vec<Option<usize>> {
+fn clean_region(
+    func: &Function,
+    cfg: &Cfg,
+    prov: &Provenance,
+    from: Block,
+    loc: MemLoc,
+) -> Vec<Option<usize>> {
     let mut region: Vec<Option<usize>> = vec![None; func.blocks.len()];
     let mut members: Vec<Block> = Vec::new();
     let mut inside = vec![false; func.blocks.len()];
@@ -137,18 +183,30 @@ fn clean_region(func: &Function, cfg: &Cfg, prov: &Provenance, from: Block, loc:
         if members.len() >= MAX_REGION {
             break;
         }
-        let dominated = block != from && cfg.idom[block.index()].is_some_and(|idom| idom == from || inside[idom.index()]);
+        let dominated = block != from
+            && cfg.idom[block.index()].is_some_and(|idom| idom == from || inside[idom.index()]);
         if dominated {
             inside[block.index()] = true;
             members.push(block);
-            region[block.index()] = Some(func.blocks[block.index()].insts.iter().position(|inst| clobbers(func, &func.insts[inst.index()].op, loc, prov)).unwrap_or(usize::MAX));
+            region[block.index()] = Some(
+                func.blocks[block.index()]
+                    .insts
+                    .iter()
+                    .position(|inst| clobbers(func, &func.insts[inst.index()].op, loc, prov))
+                    .unwrap_or(usize::MAX),
+            );
         }
     }
     let mut changed = true;
     while changed {
         changed = false;
         for &block in &members {
-            if region[block.index()].is_some() && !cfg.preds_of(block).iter().all(|&pred| pred == from || region[pred.index()] == Some(usize::MAX)) {
+            if region[block.index()].is_some()
+                && !cfg
+                    .preds_of(block)
+                    .iter()
+                    .all(|&pred| pred == from || region[pred.index()] == Some(usize::MAX))
+            {
                 region[block.index()] = None;
                 changed = true;
             }
@@ -158,19 +216,34 @@ fn clean_region(func: &Function, cfg: &Cfg, prov: &Provenance, from: Block, loc:
 }
 
 fn is_call(func: &Function, inst: Inst) -> bool {
-    matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. })
+    matches!(
+        func.insts[inst.index()].op,
+        Op::Call { .. } | Op::TryCall { .. }
+    )
 }
 
 /// Whether a path from the load at `at` to a use of `result` passes a call, so the loaded value would live across it.
-fn crosses_call(func: &Function, cfg: &Cfg, (from, pos): (Block, usize), region: &[Option<usize>], (targets, result): (&[Block], Value)) -> bool {
-    if func.blocks[from.index()].insts[pos + 1..].iter().any(|&inst| is_call(func, inst)) {
+fn crosses_call(
+    func: &Function,
+    cfg: &Cfg,
+    (from, pos): (Block, usize),
+    region: &[Option<usize>],
+    (targets, result): (&[Block], Value),
+) -> bool {
+    if func.blocks[from.index()].insts[pos + 1..]
+        .iter()
+        .any(|&inst| is_call(func, inst))
+    {
         return true;
     }
     let mut seen = vec![false; func.blocks.len()];
     let mut work: Vec<Block> = Vec::new();
     for &target in targets {
         let before = first_use(func, target, result).unwrap_or(0);
-        if func.blocks[target.index()].insts[..before].iter().any(|&inst| is_call(func, inst)) {
+        if func.blocks[target.index()].insts[..before]
+            .iter()
+            .any(|&inst| is_call(func, inst))
+        {
             return true;
         }
         work.extend(cfg.preds_of(target).iter().copied());
@@ -180,7 +253,11 @@ fn crosses_call(func: &Function, cfg: &Cfg, (from, pos): (Block, usize), region:
             continue;
         }
         seen[block.index()] = true;
-        if func.blocks[block.index()].insts.iter().any(|&inst| is_call(func, inst)) {
+        if func.blocks[block.index()]
+            .insts
+            .iter()
+            .any(|&inst| is_call(func, inst))
+        {
             return true;
         }
         work.extend(cfg.preds_of(block).iter().copied());
@@ -191,7 +268,9 @@ fn crosses_call(func: &Function, cfg: &Cfg, (from, pos): (Block, usize), region:
 fn first_use(func: &Function, block: Block, value: Value) -> Option<usize> {
     func.blocks[block.index()].insts.iter().position(|inst| {
         let mut uses = false;
-        func.insts[inst.index()].op.for_operands(|v| uses |= v == value);
+        func.insts[inst.index()]
+            .op
+            .for_operands(|v| uses |= v == value);
         uses
     })
 }
@@ -202,7 +281,9 @@ fn clone_into(func: &mut Function, target: Block, load: Candidate, shared: Optio
     let value = shared.unwrap_or_else(|| func.value(func.ty(load.result)));
     let insts = func.blocks[target.index()].insts.clone();
     for &user in &insts[pos..] {
-        func.insts[user.index()].op.map_operands(|v| if v == load.result { value } else { v });
+        func.insts[user.index()]
+            .op
+            .map_operands(|v| if v == load.result { value } else { v });
     }
     if shared.is_none() {
         let inst = func.add(Op::Load(load.addr, load.offset), Some(value));
@@ -222,17 +303,30 @@ fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenan
     let op = &func.insts[inst.index()].op;
     match *op {
         Op::StackLoad(s, _) | Op::StackAddr(s, _) => s == slot,
-        Op::Load(addr, _) | Op::VolatileLoad(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, _, _) => {
-            prov.loc(addr, 0, 1).root == MemRoot::Slot(slot)
+        Op::Load(addr, _)
+        | Op::VolatileLoad(addr, _)
+        | Op::AtomicLoad(addr, _)
+        | Op::AtomicRmw(_, _, addr, _)
+        | Op::AtomicCas(_, addr, _, _) => prov.loc(addr, 0, 1).root == MemRoot::Slot(slot),
+        Op::Move(_, src, _) | Op::Copy(_, src, _) => {
+            prov.loc(src, 0, 1).root == MemRoot::Slot(slot)
         }
-        Op::Move(_, src, _) | Op::Copy(_, src, _) => prov.loc(src, 0, 1).root == MemRoot::Slot(slot),
         _ => false,
     }
 }
 
-fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[StackSlot]) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
+fn slot_liveness_batch(
+    func: &Function,
+    cfg: &Cfg,
+    prov: &Provenance,
+    batch: &[StackSlot],
+) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
     let n = func.blocks.len();
-    let all_mask = if batch.len() == 64 { u64::MAX } else { (1_u64 << batch.len()) - 1 };
+    let all_mask = if batch.len() == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << batch.len()) - 1
+    };
     let mut slot_bit = vec![0_u64; func.slots.len()];
     for (i, &s) in batch.iter().enumerate() {
         slot_bit[s.index()] = 1_u64 << i;
@@ -267,7 +361,11 @@ fn slot_liveness_batch(func: &Function, cfg: &Cfg, prov: &Provenance, batch: &[S
                         }
                     }
                 }
-                Op::Load(addr, _) | Op::VolatileLoad(addr, _) | Op::AtomicLoad(addr, _) | Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, ..) => {
+                Op::Load(addr, _)
+                | Op::VolatileLoad(addr, _)
+                | Op::AtomicLoad(addr, _)
+                | Op::AtomicRmw(_, _, addr, _)
+                | Op::AtomicCas(_, addr, ..) => {
                     if let MemRoot::Slot(s) = prov.loc(addr, 0, 1).root {
                         let bit = slot_bit[s.index()];
                         if bit != 0 && k_mask & bit == 0 {
@@ -360,11 +458,15 @@ fn sink_pure_defs_into(func: &mut Function, from: Block, to: Block) {
         if uses[res.index()] != 0 {
             continue;
         }
-        let used_in_to = func.blocks[to.index()].insts.iter().chain(to_move.iter()).any(|&u| {
-            let mut hit = false;
-            func.insts[u.index()].op.for_operands(|v| hit |= v == res);
-            hit
-        });
+        let used_in_to = func.blocks[to.index()]
+            .insts
+            .iter()
+            .chain(to_move.iter())
+            .any(|&u| {
+                let mut hit = false;
+                func.insts[u.index()].op.for_operands(|v| hit |= v == res);
+                hit
+            });
         if !used_in_to {
             continue;
         }
@@ -379,7 +481,9 @@ fn sink_pure_defs_into(func: &mut Function, from: Block, to: Block) {
         return;
     }
     to_move.reverse();
-    func.blocks[from.index()].insts.retain(|i| !to_move.contains(i));
+    func.blocks[from.index()]
+        .insts
+        .retain(|i| !to_move.contains(i));
     func.blocks[to.index()].insts.splice(0..0, to_move);
 }
 
@@ -409,7 +513,11 @@ fn plan_store_frontier(
             let si = s.index();
             if live_in[si] & bit == 0 {
                 saw_fast = true;
-            } else if !in_r[si] && cfg.reachable[si] && cfg.dominates(b, s) && (reads[si] | writes[si]) & bit == 0 {
+            } else if !in_r[si]
+                && cfg.reachable[si]
+                && cfg.dominates(b, s)
+                && (reads[si] | writes[si]) & bit == 0
+            {
                 in_r[si] = true;
                 work.push(s);
             }
@@ -487,12 +595,24 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
                                 continue;
                             }
                             let targets = if let Some((then, other)) = brif_arms
-                                && (live_in[then.index()] & bit != 0) != (live_in[other.index()] & bit != 0)
+                                && (live_in[then.index()] & bit != 0)
+                                    != (live_in[other.index()] & bit != 0)
                             {
-                                let target = if live_in[then.index()] & bit != 0 { then } else { other };
-                                (cfg.single_pred(target) == Some(b) && cfg.loops().depth_of(target) <= cfg.loops().depth_of(b)).then(|| vec![target])
+                                let target = if live_in[then.index()] & bit != 0 {
+                                    then
+                                } else {
+                                    other
+                                };
+                                (cfg.single_pred(target) == Some(b)
+                                    && cfg.loops().depth_of(target) <= cfg.loops().depth_of(b))
+                                .then(|| vec![target])
                             } else {
-                                plan_store_frontier(func, cfg, (&live_in, &reads, &writes), (b, bit))
+                                plan_store_frontier(
+                                    func,
+                                    cfg,
+                                    (&live_in, &reads, &writes),
+                                    (b, bit),
+                                )
                             };
                             if let Some(targets) = targets {
                                 sink_targets = Some((targets, vec![inst]));
@@ -525,15 +645,21 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
                     func.blocks[bi].insts.retain(|i| !sunk.contains(i));
                     if targets.len() == 1 {
                         let target = targets[0];
-                        func.blocks[target.index()].insts.splice(0..0, sunk.iter().copied());
+                        func.blocks[target.index()]
+                            .insts
+                            .splice(0..0, sunk.iter().copied());
                         sink_pure_defs_into(func, b, target);
                     } else {
-                        let ops: Vec<Op> = sunk.iter().map(|&i| func.insts[i.index()].op.clone()).collect();
+                        let ops: Vec<Op> = sunk
+                            .iter()
+                            .map(|&i| func.insts[i.index()].op.clone())
+                            .collect();
                         for &i in &sunk {
                             func.insts[i.index()].op = Op::Trap;
                         }
                         for target in targets {
-                            let clones: Vec<Inst> = ops.iter().map(|op| func.add(op.clone(), None)).collect();
+                            let clones: Vec<Inst> =
+                                ops.iter().map(|op| func.add(op.clone(), None)).collect();
                             func.blocks[target.index()].insts.splice(0..0, clones);
                         }
                     }

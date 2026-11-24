@@ -4,7 +4,10 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::builder::FunctionBuilder;
 use crate::cfg::Cfg;
-use crate::ir::{AbiParam, Binary, Block, CallConv, Function, Inst, InstData, IntCC, Op, SlotData, StackSlot, Type, Value};
+use crate::ir::{
+    AbiParam, Binary, Block, CallConv, Function, Inst, InstData, IntCC, Op, SlotData, StackSlot,
+    Type, Value,
+};
 use crate::live::{BitMatrix, results};
 use crate::reloc::RuntimeSymbol;
 
@@ -79,7 +82,11 @@ struct Frame {
 impl Frame {
     /// The heap size of the frame: a multiple of 16 bytes, so the frame cache picks a size class without rounding.
     const fn bytes(&self) -> u32 {
-        if self.size < 16 { 16 } else { self.size.next_multiple_of(16) }
+        if self.size < 16 {
+            16
+        } else {
+            self.size.next_multiple_of(16)
+        }
     }
 
     fn place(&mut self, size: u32, align: u32) -> u32 {
@@ -88,7 +95,12 @@ impl Frame {
         at
     }
 
-    fn place_colored(&mut self, start: u32, slots: &[(usize, u32, u32)], conflicts: &BitMatrix) -> Vec<u32> {
+    fn place_colored(
+        &mut self,
+        start: u32,
+        slots: &[(usize, u32, u32)],
+        conflicts: &BitMatrix,
+    ) -> Vec<u32> {
         let mut order: Vec<usize> = (0..slots.len()).collect();
         order.sort_by_key(|&idx| std::cmp::Reverse((slots[idx].1, slots[idx].2)));
         let mut placed = vec![0_u32; slots.len()];
@@ -121,16 +133,33 @@ impl Frame {
     }
 }
 
-fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Value>, is_spill: &[bool]) -> (Frame, Vec<SlotData>) {
+fn build_frame(
+    func: &mut Function,
+    cfg: &Cfg,
+    resumes: &[Block],
+    spills: Vec<Value>,
+    is_spill: &[bool],
+) -> (Frame, Vec<SlotData>) {
     let framed = slots::framed(func, cfg, resumes, is_spill);
-    let mut frame = Frame { size: 0, slots: vec![Home::Stack(StackSlot(0)); func.slots.len()], spills: HashMap::default() };
-    let mut stack = vec![SlotData { size: 8, align_shift: 3 }];
+    let mut frame = Frame {
+        size: 0,
+        slots: vec![Home::Stack(StackSlot(0)); func.slots.len()],
+        spills: HashMap::default(),
+    };
+    let mut stack = vec![SlotData {
+        size: 8,
+        align_shift: 3,
+    }];
     let mut on_stack = vec![false; func.slots.len()];
     let (mut private, mut shared) = (Vec::new(), Vec::new());
     for (d, &raw_slot) in framed.raw_of.iter().enumerate() {
         if framed.kept[d] && !func.is_unwind_slot(StackSlot(raw_slot as u32)) {
             let data = &func.slots[raw_slot];
-            let placed = if framed.escaped[d] { &mut shared } else { &mut private };
+            let placed = if framed.escaped[d] {
+                &mut shared
+            } else {
+                &mut private
+            };
             placed.push((d, data.size, 1_u32 << data.align_shift));
         } else {
             stack.push(func.slots[raw_slot].clone());
@@ -147,7 +176,11 @@ fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Va
             }
         }
     }
-    for (&(d, _, _), offset) in private.iter().zip(frame.place_colored(0, &private, &framed.conflicts)) {
+    for (&(d, _, _), offset) in
+        private
+            .iter()
+            .zip(frame.place_colored(0, &private, &framed.conflicts))
+    {
         frame.slots[framed.raw_of[d]] = Home::Frame(offset);
     }
     for value in spills {
@@ -156,7 +189,11 @@ fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Va
         frame.spills.insert(value, at as i32);
     }
     func.frame_private = frame.size;
-    for (&(d, _, _), offset) in shared.iter().zip(frame.place_colored(frame.size, &shared, &framed.conflicts)) {
+    for (&(d, _, _), offset) in
+        shared
+            .iter()
+            .zip(frame.place_colored(frame.size, &shared, &framed.conflicts))
+    {
         frame.slots[framed.raw_of[d]] = Home::Frame(offset);
     }
     (frame, stack)
@@ -164,7 +201,9 @@ fn build_frame(func: &mut Function, cfg: &Cfg, resumes: &[Block], spills: Vec<Va
 
 /// Splits `func` when it is a coroutine's resume function.
 pub(crate) fn split(func: &mut Function) {
-    let Some(spec) = func.coroutine.take() else { return };
+    let Some(spec) = func.coroutine.take() else {
+        return;
+    };
     let old_entry = func.entry.expect("a coroutine has an entry");
     if spec.resumes.is_empty() {
         ready_entry(func, &spec, old_entry);
@@ -189,7 +228,8 @@ pub(crate) fn split(func: &mut Function) {
         }
     }
     let (anchor, orig_blocks) = (StackSlot(0), func.blocks.len());
-    let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), (frame.bytes(), lazy));
+    let (init, init_fp, dispatch, disp_fp) =
+        entry(func, &spec, (old_entry, anchor), (frame.bytes(), lazy));
     func.bump_cfg();
     let split_cfg = func.cfg();
     let mut active_fp: Vec<Option<Value>> = vec![None; func.blocks.len()];
@@ -202,7 +242,13 @@ pub(crate) fn split(func: &mut Function) {
         }
         if idx < orig_blocks {
             let done = lazy.is_none() && spec.done.contains(&block);
-            let chosen = rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (active_fp[idx], done));
+            let chosen = rewrite(
+                func,
+                block,
+                (&frame, anchor),
+                (&split_cfg, &defs),
+                (active_fp[idx], done),
+            );
             active_fp[idx] = active_fp[idx].or(chosen);
         }
     }
@@ -210,7 +256,13 @@ pub(crate) fn split(func: &mut Function) {
         if !split_cfg.reachable[idx] {
             let block = Block(idx as u32);
             let done = lazy.is_none() && spec.done.contains(&block);
-            rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (None, done));
+            rewrite(
+                func,
+                block,
+                (&frame, anchor),
+                (&split_cfg, &defs),
+                (None, done),
+            );
         }
     }
     if let Some(lazy) = lazy {
@@ -226,7 +278,9 @@ fn check_unresumed(b: &mut FunctionBuilder<'_>, spec: &Coroutine) -> (Vec<Value>
     b.switch_to_block(start);
     let object = params[spec.object];
     let state = b.ins().load(Type::I64, object, spec.header.0);
-    let fresh = b.ins().icmp_imm(IntCC::Equal, state, CoroutineState::Unresumed.code());
+    let fresh = b
+        .ins()
+        .icmp_imm(IntCC::Equal, state, CoroutineState::Unresumed.code());
     (params, state, fresh)
 }
 
@@ -239,7 +293,12 @@ fn ready_entry(func: &mut Function, spec: &Coroutine, old_entry: Block) {
     b.ins().trap();
 }
 
-fn live_across_suspend(func: &Function, cfg: &Cfg, resumes: &[Block], defs: &[Option<Block>]) -> Vec<Value> {
+fn live_across_suspend(
+    func: &Function,
+    cfg: &Cfg,
+    resumes: &[Block],
+    defs: &[Option<Block>],
+) -> Vec<Value> {
     let mut can_resume = vec![false; func.blocks.len()];
     let mut stack: Vec<Block> = resumes.to_vec();
     while let Some(b) = stack.pop() {
@@ -258,7 +317,8 @@ fn live_across_suspend(func: &Function, cfg: &Cfg, resumes: &[Block], defs: &[Op
         for &inst in &block.insts {
             func.insts[inst.index()].op.for_operands(|value| {
                 let idx = value.index();
-                if defs[idx].is_some_and(|home| home != blk) && use_blocks[idx].last() != Some(&blk) {
+                if defs[idx].is_some_and(|home| home != blk) && use_blocks[idx].last() != Some(&blk)
+                {
                     use_blocks[idx].push(blk);
                 }
             });
@@ -275,7 +335,9 @@ fn live_across_suspend(func: &Function, cfg: &Cfg, resumes: &[Block], defs: &[Op
         if uses.is_empty() {
             continue;
         }
-        let Some(def_block) = defs[val_idx] else { continue };
+        let Some(def_block) = defs[val_idx] else {
+            continue;
+        };
         let stamp = (val_idx + 1) as u32;
         queue.clear();
         for &use_blk in uses {
@@ -324,11 +386,16 @@ fn block_needs_fp(func: &Function, block: Block, frame: &Frame, free: bool) -> b
     for &inst in &func.blocks[block.index()].insts {
         let data = &func.insts[inst.index()];
         match &data.op {
-            Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) if matches!(frame.slots[slot.index()], Home::Frame(_)) => return true,
+            Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _)
+                if matches!(frame.slots[slot.index()], Home::Frame(_)) =>
+            {
+                return true;
+            }
             _ => {}
         }
         let mut uses_spill = false;
-        data.op.for_operands(|value| uses_spill |= frame.spills.contains_key(&value));
+        data.op
+            .for_operands(|value| uses_spill |= frame.spills.contains_key(&value));
         if uses_spill || results(data).any(|value| frame.spills.contains_key(&value)) {
             return true;
         }
@@ -353,7 +420,8 @@ fn rewrite(
         Some(match inherited_fp {
             Some(fp) => fp,
             None => {
-                let fp = push(func, &mut insts, Op::StackLoad(anchor, 0), Some(Type::I64)).expect("a load has a result");
+                let fp = push(func, &mut insts, Op::StackLoad(anchor, 0), Some(Type::I64))
+                    .expect("a load has a result");
                 func.mark_frame_ptr(fp);
                 fp
             }
@@ -375,39 +443,71 @@ fn rewrite(
                 return;
             }
             if let Some(&at) = frame.spills.get(&value) {
-                let dom_live = cfg.reachable[block.index()] && defs[value.index()].is_some_and(|def| def != block && cfg.dominates(def, block));
+                let dom_live = cfg.reachable[block.index()]
+                    && defs[value.index()]
+                        .is_some_and(|def| def != block && cfg.dominates(def, block));
                 if dom_live {
                     loaded.insert(value, value);
                 } else {
                     let fp = fp.expect("spilled operand requires frame pointer");
                     let ty = func.types[value.index()];
-                    loaded.insert(value, push(func, &mut insts, Op::Load(fp, at), Some(ty)).expect("a load has a result"));
+                    loaded.insert(
+                        value,
+                        push(func, &mut insts, Op::Load(fp, at), Some(ty))
+                            .expect("a load has a result"),
+                    );
                 }
             }
         });
-        data.op.map_operands(|value| loaded.get(&value).copied().unwrap_or(value));
+        data.op
+            .map_operands(|value| loaded.get(&value).copied().unwrap_or(value));
         data.op = match data.op {
             Op::StackAddr(slot, offset) => match frame.slots[slot.index()] {
                 Home::Frame(home) => {
                     let fp = fp.expect("framed slot requires frame pointer");
-                    let at = push(func, &mut insts, Op::Const(i64::from(home) + i64::from(offset)), Some(Type::I64)).expect("a constant has a result");
+                    let at = push(
+                        func,
+                        &mut insts,
+                        Op::Const(i64::from(home) + i64::from(offset)),
+                        Some(Type::I64),
+                    )
+                    .expect("a constant has a result");
                     Op::Binary(Binary::Iadd, fp, at)
                 }
                 Home::Stack(native) => Op::StackAddr(native, offset),
             },
             Op::StackLoad(slot, offset) => match frame.slots[slot.index()] {
-                Home::Frame(home) => Op::Load(fp.expect("framed load requires frame pointer"), home as i32 + offset),
+                Home::Frame(home) => Op::Load(
+                    fp.expect("framed load requires frame pointer"),
+                    home as i32 + offset,
+                ),
                 Home::Stack(native) => Op::StackLoad(native, offset),
             },
             Op::StackStore(value, slot, offset) => match frame.slots[slot.index()] {
-                Home::Frame(home) => Op::Store(value, fp.expect("framed store requires frame pointer"), home as i32 + offset),
+                Home::Frame(home) => Op::Store(
+                    value,
+                    fp.expect("framed store requires frame pointer"),
+                    home as i32 + offset,
+                ),
                 Home::Stack(native) => Op::StackStore(value, native, offset),
             },
             op => op,
         };
         if data.op.is_terminator() && free {
-            let bytes = push(func, &mut insts, Op::Const(i64::from(frame.bytes())), Some(Type::I64)).expect("a constant has a result");
-            call(func, &mut insts, RuntimeSymbol::Free, &[fp.expect("free requires frame pointer"), bytes], false);
+            let bytes = push(
+                func,
+                &mut insts,
+                Op::Const(i64::from(frame.bytes())),
+                Some(Type::I64),
+            )
+            .expect("a constant has a result");
+            call(
+                func,
+                &mut insts,
+                RuntimeSymbol::Free,
+                &[fp.expect("free requires frame pointer"), bytes],
+                false,
+            );
         }
         let spilled: Vec<(Value, i32)> = results(&data)
             .filter_map(|value| {
@@ -427,7 +527,13 @@ fn rewrite(
     fp.or(inherited_fp)
 }
 
-fn call(func: &mut Function, insts: &mut Vec<Inst>, symbol: RuntimeSymbol, args: &[Value], returns: bool) -> Option<Value> {
+fn call(
+    func: &mut Function,
+    insts: &mut Vec<Inst>,
+    symbol: RuntimeSymbol,
+    args: &[Value],
+    returns: bool,
+) -> Option<Value> {
     let mut signature = crate::ir::Signature::new(CallConv::Native);
     signature.params = args.iter().map(|_| AbiParam::new(Type::I64)).collect();
     if returns {
@@ -435,14 +541,32 @@ fn call(func: &mut Function, insts: &mut Vec<Inst>, symbol: RuntimeSymbol, args:
     }
     func.sigs.push(signature);
     let sig = crate::ir::SigRef(func.sigs.len() as u32 - 1);
-    let callee = push(func, insts, Op::Runtime(symbol), Some(Type::I64)).expect("a runtime symbol has a result");
-    let results: Vec<Value> = (0..usize::from(returns)).map(|_| func.value(Type::I64)).collect();
+    let callee = push(func, insts, Op::Runtime(symbol), Some(Type::I64))
+        .expect("a runtime symbol has a result");
+    let results: Vec<Value> = (0..usize::from(returns))
+        .map(|_| func.value(Type::I64))
+        .collect();
     let result = results.first().copied();
-    push(func, insts, Op::Call { sig, callee, args: args.to_vec(), results }, None);
+    push(
+        func,
+        insts,
+        Op::Call {
+            sig,
+            callee,
+            args: args.to_vec(),
+            results,
+        },
+        None,
+    );
     result
 }
 
-fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, StackSlot), (size, lazy): (u32, Option<lazy::Lazy>)) -> (Block, Value, Block, Value) {
+fn entry(
+    func: &mut Function,
+    spec: &Coroutine,
+    (old_entry, anchor): (Block, StackSlot),
+    (size, lazy): (u32, Option<lazy::Lazy>),
+) -> (Block, Value, Block, Value) {
     let mut b = FunctionBuilder::new(func);
     let (params, state, fresh) = check_unresumed(&mut b, spec);
     let object = params[spec.object];
@@ -456,8 +580,15 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
         buf
     } else {
         let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
-        let bytes = push(b.func, &mut insts, Op::Const(i64::from(size)), Some(Type::I64)).expect("a constant has a result");
-        let heap = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
+        let bytes = push(
+            b.func,
+            &mut insts,
+            Op::Const(i64::from(size)),
+            Some(Type::I64),
+        )
+        .expect("a constant has a result");
+        let heap = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true)
+            .expect("malloc returns");
         b.func.blocks[init.index()].insts = insts;
         b.ins().store(heap, object, spec.header.1);
         b.func.mark_unique_ptr(heap);
@@ -472,7 +603,9 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     b.func.mark_frame_ptr(disp_fp);
     b.ins().stack_store(disp_fp, anchor, 0);
     if spec.resumes.len() >= 2 {
-        let idx = b.ins().iadd_imm(state, -CoroutineState::FirstSuspend.code());
+        let idx = b
+            .ins()
+            .iadd_imm(state, -CoroutineState::FirstSuspend.code());
         let trap = b.create_block();
         let fwds: Vec<Block> = spec.resumes.iter().map(|_| b.create_block()).collect();
         b.ins().br_table(idx, trap, &fwds);
@@ -486,7 +619,9 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     }
     for (index, &resume) in spec.resumes.iter().enumerate() {
         let next = b.create_block();
-        let here = b.ins().icmp_imm(IntCC::Equal, state, CoroutineState::suspended(index));
+        let here = b
+            .ins()
+            .icmp_imm(IntCC::Equal, state, CoroutineState::suspended(index));
         b.ins().brif(here, resume, &params, next, &[]);
         b.switch_to_block(next);
     }

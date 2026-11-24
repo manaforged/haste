@@ -16,7 +16,10 @@ struct QueueState {
     active: usize,
 }
 
-pub(in crate::image) fn bucket_by_item(work: &[usize], item_of: impl Fn(usize) -> ItemRef) -> Vec<Vec<usize>> {
+pub(in crate::image) fn bucket_by_item(
+    work: &[usize],
+    item_of: impl Fn(usize) -> ItemRef,
+) -> Vec<Vec<usize>> {
     let mut pos_map: HashMap<ItemRef, usize> = HashMap::default();
     let mut buckets: Vec<Vec<usize>> = Vec::new();
     for &index in work {
@@ -34,7 +37,13 @@ pub(in crate::image) fn bucket_by_item(work: &[usize], item_of: impl Fn(usize) -
 pub(in crate::image) fn lpt_chunks(buckets: Vec<Vec<usize>>, max_bucket: usize) -> Vec<Vec<usize>> {
     let mut chunks: Vec<Vec<usize>> = buckets
         .into_iter()
-        .flat_map(|b| if b.len() <= max_bucket { vec![b] } else { b.chunks(max_bucket).map(|c| c.to_vec()).collect() })
+        .flat_map(|b| {
+            if b.len() <= max_bucket {
+                vec![b]
+            } else {
+                b.chunks(max_bucket).map(|c| c.to_vec()).collect()
+            }
+        })
         .collect();
     chunks.sort_by_key(|b| std::cmp::Reverse(b.len()));
     chunks
@@ -63,14 +72,24 @@ impl Drop for TaskGuard<'_> {
 }
 
 impl AotQueue {
-    pub(in crate::image) fn new(claimed: Vec<AtomicBool>, items: Box<[ItemRef]>, max_bucket: usize, initial_buckets: Vec<Vec<usize>>) -> Arc<Self> {
+    pub(in crate::image) fn new(
+        claimed: Vec<AtomicBool>,
+        items: Box<[ItemRef]>,
+        max_bucket: usize,
+        initial_buckets: Vec<Vec<usize>>,
+    ) -> Arc<Self> {
         let warmed = (0..claimed.len()).map(|_| AtomicBool::new(false)).collect();
         Arc::new(Self {
             claimed,
             warmed,
             items,
             max_bucket,
-            state: Mutex::new(QueueState { buckets: initial_buckets.into(), loose: Vec::new(), warm: Vec::new(), active: 0 }),
+            state: Mutex::new(QueueState {
+                buckets: initial_buckets.into(),
+                loose: Vec::new(),
+                warm: Vec::new(),
+                active: 0,
+            }),
             wake: Condvar::new(),
         })
     }
@@ -90,7 +109,11 @@ impl AotQueue {
 
     pub(in crate::image) fn push_warm(&self, items: Vec<usize>) {
         if !items.is_empty() {
-            self.state.lock().unwrap_or_else(|e| e.into_inner()).warm.extend(items);
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .warm
+                .extend(items);
             self.wake.notify_all();
         }
     }
@@ -122,7 +145,10 @@ impl AotQueue {
             }
             if !state.loose.is_empty() {
                 let loose = std::mem::take(&mut state.loose);
-                let buckets = lpt_chunks(bucket_by_item(&loose, |idx| self.items[idx]), self.max_bucket);
+                let buckets = lpt_chunks(
+                    bucket_by_item(&loose, |idx| self.items[idx]),
+                    self.max_bucket,
+                );
                 state.buckets.extend(buckets);
                 if state.buckets.len() > 1 {
                     self.wake.notify_all();
@@ -160,14 +186,23 @@ impl AotQueue {
 }
 
 fn warmable_callee(cx: &Context<'_>, reached: &Reached, idx: usize) -> bool {
-    let Some(((item, _), Ok(typed))) = reached.list.get(idx) else { return false };
+    let Some(((item, _), Ok(typed))) = reached.list.get(idx) else {
+        return false;
+    };
     !cx.foreign(*item)
         && !cx.has_attr(*item, "cold")
         && cx.inline_attr(*item) != Some("never")
-        && !typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never))
+        && !typed
+            .ret
+            .is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never))
 }
 
-pub(in crate::image) fn collect_warm_callees(cx: &Context<'_>, reached: &Reached, queue: &AotQueue, seeds: &[usize]) -> Vec<usize> {
+pub(in crate::image) fn collect_warm_callees(
+    cx: &Context<'_>,
+    reached: &Reached,
+    queue: &AotQueue,
+    seeds: &[usize],
+) -> Vec<usize> {
     let mut frontier: VecDeque<(usize, u8)> = seeds.iter().map(|&s| (s, 0)).collect();
     let mut out = Vec::new();
     while let Some((u, depth)) = frontier.pop_front() {

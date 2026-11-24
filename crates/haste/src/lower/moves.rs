@@ -38,10 +38,16 @@ impl Lower<'_, '_> {
             Expr::TupleField(base, index) => (base, index),
             _ => return None,
         };
-        if self.typed.exprs[base.0 as usize] == Ty::NONE || matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..)) {
+        if self.typed.exprs[base.0 as usize] == Ty::NONE
+            || matches!(
+                self.cx.types.kind(self.ty_of(base)),
+                Kind::Ref(..) | Kind::Ptr(..)
+            )
+        {
             return None;
         }
-        let (root, mut path) = self.move_path(base)
+        let (root, mut path) = self
+            .move_path(base)
             .or_else(|| self.boxed_deref_path(base))
             .or_else(|| (!self.is_place(base)).then(|| (Root::Temp(base), Vec::new())))?;
         let mut ty = self.ty_of(base);
@@ -65,7 +71,9 @@ impl Lower<'_, '_> {
         let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(expr) else {
             return None;
         };
-        if self.typed.derefs.contains_key(&(expr, 0)) || self.cx.boxed(self.ty_of(operand)).is_none() {
+        if self.typed.derefs.contains_key(&(expr, 0))
+            || self.cx.boxed(self.ty_of(operand)).is_none()
+        {
             return None;
         }
         let (root, mut path) = self.scrutinee_path(operand)?;
@@ -81,16 +89,26 @@ impl Lower<'_, '_> {
         if let Some(boxed) = self.boxed_deref_path(scrutinee) {
             return Some(boxed);
         }
-        self.move_path(scrutinee).or_else(|| (!self.is_place(scrutinee)).then(|| (Root::Temp(scrutinee), Vec::new())))
+        self.move_path(scrutinee)
+            .or_else(|| (!self.is_place(scrutinee)).then(|| (Root::Temp(scrutinee), Vec::new())))
     }
 
     /// Whether binding `pat` to `init` moves the whole value out of a `Box` that `init` dereferences.
     pub fn moves_whole_box(&mut self, pat: PatId, init: ExprId) -> Result<bool> {
-        let by_value = matches!(*self.body.pat(pat), Pat::Bind { by_ref: false, sub: None, .. }) && !self.typed.ref_binds.contains_key(&pat);
+        let by_value = matches!(
+            *self.body.pat(pat),
+            Pat::Bind {
+                by_ref: false,
+                sub: None,
+                ..
+            }
+        ) && !self.typed.ref_binds.contains_key(&pat);
         let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(init) else {
             return Ok(false);
         };
-        Ok(by_value && self.cx.boxed(self.ty_of(operand)).is_some() && needs_drop(self.cx, self.ty_of(init))?)
+        Ok(by_value
+            && self.cx.boxed(self.ty_of(operand)).is_some()
+            && needs_drop(self.cx, self.ty_of(init))?)
     }
 
     pub(super) fn is_place(&self, expr: ExprId) -> bool {
@@ -103,7 +121,10 @@ impl Lower<'_, '_> {
                 Some(Res::Fn(item, _)) => super::is_static(self.cx, *item),
                 _ => false,
             },
-            Expr::Field(..) | Expr::TupleField(..) | Expr::Index(..) | Expr::Unary(UnOp::Deref, _) => true,
+            Expr::Field(..)
+            | Expr::TupleField(..)
+            | Expr::Index(..)
+            | Expr::Unary(UnOp::Deref, _) => true,
             _ => false,
         }
     }
@@ -115,12 +136,23 @@ impl Lower<'_, '_> {
         }
         match *self.body.expr(expr) {
             Expr::Block { label: Some(_), .. } | Expr::Loop { .. } => true,
-            Expr::Block { tail: Some(tail), .. } => self.may_alias_place(tail),
-            Expr::If(_, then, otherwise) => self.may_alias_place(then) || otherwise.is_some_and(|alt| self.may_alias_place(alt)),
-            Expr::Match(_, arms) => self.body.list(arms).iter().any(|&at| self.may_alias_place(self.body.arms[at as usize].body)),
+            Expr::Block {
+                tail: Some(tail), ..
+            } => self.may_alias_place(tail),
+            Expr::If(_, then, otherwise) => {
+                self.may_alias_place(then) || otherwise.is_some_and(|alt| self.may_alias_place(alt))
+            }
+            Expr::Match(_, arms) => self
+                .body
+                .list(arms)
+                .iter()
+                .any(|&at| self.may_alias_place(self.body.arms[at as usize].body)),
             Expr::Field(base, _) | Expr::TupleField(base, _) => {
                 self.typed.exprs[base.0 as usize] == Ty::NONE
-                    || matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..))
+                    || matches!(
+                        self.cx.types.kind(self.ty_of(base)),
+                        Kind::Ref(..) | Kind::Ptr(..)
+                    )
                     || self.cx.boxed(self.ty_of(base)).is_some()
                     || self.may_alias_place(base)
             }
@@ -133,25 +165,43 @@ impl Lower<'_, '_> {
         let mut found: FxHashMap<Root, Vec<MovePath>> = FxHashMap::default();
         for at in 0..self.body.exprs.len() as u32 {
             let expr = ExprId(at);
-            let mut each = |lower: &mut Self, path: Option<(Root, MovePath)>| lower.add_path(&mut found, path);
+            let mut each =
+                |lower: &mut Self, path: Option<(Root, MovePath)>| lower.add_path(&mut found, path);
             match *self.body.expr(expr) {
-                Expr::Field(..) | Expr::TupleField(..) if self.typed.exprs[at as usize] != Ty::NONE && needs_drop(self.cx, self.ty_of(expr))? => each(self, self.move_path(expr)),
-                Expr::Call(callee, _) if self.typed.exprs[callee.0 as usize] != Ty::NONE && self.cx.closure_consumes(self.ty_of(callee)) => each(self, self.scrutinee_path(callee)),
+                Expr::Field(..) | Expr::TupleField(..)
+                    if self.typed.exprs[at as usize] != Ty::NONE
+                        && needs_drop(self.cx, self.ty_of(expr))? =>
+                {
+                    each(self, self.move_path(expr))
+                }
+                Expr::Call(callee, _)
+                    if self.typed.exprs[callee.0 as usize] != Ty::NONE
+                        && self.cx.closure_consumes(self.ty_of(callee)) =>
+                {
+                    each(self, self.scrutinee_path(callee))
+                }
                 Expr::Match(scrutinee, arms) => {
                     for arm in self.body.list(arms).to_vec() {
                         let pat = self.body.arms[arm as usize].pat;
                         self.pattern_paths(pat, self.scrutinee_path(scrutinee), &mut found)?;
                     }
                 }
-                Expr::Let(pat, init) => self.pattern_paths(pat, self.scrutinee_path(init), &mut found)?,
-                Expr::Struct { fields, base: Some(base_expr), .. } if self.typed.exprs[at as usize] != Ty::NONE => {
+                Expr::Let(pat, init) => {
+                    self.pattern_paths(pat, self.scrutinee_path(init), &mut found)?
+                }
+                Expr::Struct {
+                    fields,
+                    base: Some(base_expr),
+                    ..
+                } if self.typed.exprs[at as usize] != Ty::NONE => {
                     if let Some(Res::Ctor(_, variant, _)) = self.typed.res.get(&expr).cloned()
                         && let Some((root, base_path)) = self.scrutinee_path(base_expr)
                     {
                         let types = self.variant_field_types(self.ty_of(expr), variant)?;
                         let mut explicit = vec![false; types.len()];
                         for f in self.body.list(fields) {
-                            if let Some(&idx) = self.typed.inits.get(&self.body.fields[*f as usize].value)
+                            if let Some(&idx) =
+                                self.typed.inits.get(&self.body.fields[*f as usize].value)
                                 && (idx as usize) < explicit.len()
                             {
                                 explicit[idx as usize] = true;
@@ -166,15 +216,21 @@ impl Lower<'_, '_> {
                         }
                     }
                 }
-                Expr::Closure { .. } if let Some(closure) = self.typed.closures.get(&expr).cloned() => {
+                Expr::Closure { .. }
+                    if let Some(closure) = self.typed.closures.get(&expr).cloned() =>
+                {
                     for cap in &closure.captures {
                         if cap.by == crate::sema::infer::By::Value && !cap.path.is_empty() {
-                            let cap_ty = cap.ty(self.cx, self.typed.locals[cap.local as usize].ty)?;
+                            let cap_ty =
+                                cap.ty(self.cx, self.typed.locals[cap.local as usize].ty)?;
                             if needs_drop(self.cx, cap_ty)? {
-                                let entry = (1..=cap.path.len()).rev().find_map(|k| {
-                                    self.capture_local_by_path(cap.local, &cap.path[..k])
-                                        .map(|slot| (Root::Local(slot), cap.path[k..].to_vec()))
-                                }).unwrap_or_else(|| (Root::Local(cap.local), cap.path.clone()));
+                                let entry = (1..=cap.path.len())
+                                    .rev()
+                                    .find_map(|k| {
+                                        self.capture_local_by_path(cap.local, &cap.path[..k])
+                                            .map(|slot| (Root::Local(slot), cap.path[k..].to_vec()))
+                                    })
+                                    .unwrap_or_else(|| (Root::Local(cap.local), cap.path.clone()));
                                 self.add_path(&mut found, Some(entry));
                             }
                         }
@@ -189,7 +245,12 @@ impl Lower<'_, '_> {
 
     fn binding_paths(&mut self, found: &mut FxHashMap<Root, Vec<MovePath>>) -> Result<()> {
         for stmt in self.body.stmts.clone() {
-            if let Stmt::Let { pat, init: Some(init), .. } = stmt {
+            if let Stmt::Let {
+                pat,
+                init: Some(init),
+                ..
+            } = stmt
+            {
                 self.pattern_paths(pat, self.scrutinee_path(init), found)?;
             }
         }
@@ -208,7 +269,12 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn pattern_paths(&mut self, pat: PatId, at: Option<(Root, MovePath)>, found: &mut FxHashMap<Root, Vec<MovePath>>) -> Result<()> {
+    fn pattern_paths(
+        &mut self,
+        pat: PatId,
+        at: Option<(Root, MovePath)>,
+        found: &mut FxHashMap<Root, Vec<MovePath>>,
+    ) -> Result<()> {
         let Some(at) = at.filter(|_| self.typed.pats.contains_key(&pat)) else {
             return Ok(());
         };
@@ -216,14 +282,22 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         match *self.body.pat(pat) {
-            Pat::Bind { by_ref: false, .. } if !self.typed.pat_res.contains_key(&pat) && !self.typed.ref_binds.contains_key(&pat) => {
+            Pat::Bind { by_ref: false, .. }
+                if !self.typed.pat_res.contains_key(&pat)
+                    && !self.typed.ref_binds.contains_key(&pat) =>
+            {
                 if needs_drop(self.cx, self.pat_ty(pat)?)? {
                     self.add_path(found, Some(at));
                 }
                 Ok(())
             }
             Pat::Paren(inner) => self.pattern_paths(inner, Some(at), found),
-            Pat::Or(list) => self.body.list(list).to_vec().into_iter().try_for_each(|alt| self.pattern_paths(PatId(alt), Some(at.clone()), found)),
+            Pat::Or(list) => self
+                .body
+                .list(list)
+                .to_vec()
+                .into_iter()
+                .try_for_each(|alt| self.pattern_paths(PatId(alt), Some(at.clone()), found)),
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
                 for (sub, step) in self.part_indices(pat)? {
                     let mut path = at.1.clone();

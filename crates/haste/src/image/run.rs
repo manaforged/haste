@@ -15,7 +15,8 @@ impl Image {
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             // SAFETY: address is code that the encoder wrote for a native fn(i64) -> i64 signature, checked to be set before the fork.
-            let case: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute::<usize, extern "C" fn(i64) -> i64>(address) };
+            let case: extern "C" fn(i64) -> i64 =
+                unsafe { std::mem::transmute::<usize, extern "C" fn(i64) -> i64>(address) };
             for &input in inputs {
                 writeln!(out, "{name} {input} {}", case(input))?;
                 out.flush()?;
@@ -26,7 +27,12 @@ impl Image {
 
     /// Runs a single `#[test]` function in a forked child with stderr captured, returning `(exit_status, stderr)`.
     #[cfg(unix)]
-    pub fn run_test_captured(&self, index: usize, start: Option<usize>, name: &str) -> Result<(i32, String)> {
+    pub fn run_test_captured(
+        &self,
+        index: usize,
+        start: Option<usize>,
+        name: &str,
+    ) -> Result<(i32, String)> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
             bail!("{name} has no code");
@@ -38,7 +44,12 @@ impl Image {
         }
         let (pid, mut stderr_pipe) = fork_piped(|writer| {
             // SAFETY: writer is a live pipe write fd; dup2 redirects child stderr to it before running the test.
-            unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&writer), libc::STDERR_FILENO) };
+            unsafe {
+                libc::dup2(
+                    std::os::fd::AsRawFd::as_raw_fd(&writer),
+                    libc::STDERR_FILENO,
+                )
+            };
             drop(writer);
             if let Some(start) = start {
                 let status = self.enter_main((start, index), &[name.to_owned()]);
@@ -47,7 +58,8 @@ impl Image {
                 }
             } else {
                 // SAFETY: address is code that the encoder wrote for a native fn() signature, checked to be set before the fork.
-                let test_fn: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
+                let test_fn: extern "C" fn() =
+                    unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
                 test_fn();
             }
             Ok::<(), std::io::Error>(())
@@ -59,7 +71,12 @@ impl Image {
 
     /// Runs a single `#[test]` function in-process on non-Unix platforms, returning `(exit_status, stderr)`.
     #[cfg(not(unix))]
-    pub fn run_test_captured(&self, index: usize, start: Option<usize>, name: &str) -> Result<(i32, String)> {
+    pub fn run_test_captured(
+        &self,
+        index: usize,
+        start: Option<usize>,
+        name: &str,
+    ) -> Result<(i32, String)> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
             bail!("{name} has no code");
@@ -68,11 +85,15 @@ impl Image {
             if self.slot(s).load(Ordering::Acquire) == 0 {
                 bail!("{name} has no start wrapper (slot {s})");
             }
-            return Ok((self.enter_main((s, index), &[name.to_owned()]), String::new()));
+            return Ok((
+                self.enter_main((s, index), &[name.to_owned()]),
+                String::new(),
+            ));
         }
         extern "C" fn run_fn(ptr: *mut u8) {
             // SAFETY: ptr is the native fn() code address checked non-zero above.
-            let test_fn: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(ptr as usize) };
+            let test_fn: extern "C" fn() =
+                unsafe { std::mem::transmute::<usize, extern "C" fn()>(ptr as usize) };
             test_fn();
         }
         extern "C" fn caught(_data: *mut u8, _payload: *mut u8) {}
@@ -83,7 +104,10 @@ impl Image {
     /// Runs each `#[test]` function `(index, start_index, name)` in a forked child and returns each test's exit status (0 for pass, non-zero for panic/Err).
     pub fn run_tests(&self, tests: &[(usize, Option<usize>, &str)]) -> Result<Vec<i32>> {
         let pairs: Vec<(usize, &str)> = tests.iter().map(|&(idx, _, name)| (idx, name)).collect();
-        if let Some((_, Some(start), name)) = tests.iter().find(|(_, start, _)| start.is_some_and(|s| self.slot(s).load(Ordering::Acquire) == 0)) {
+        if let Some((_, Some(start), name)) = tests
+            .iter()
+            .find(|(_, start, _)| start.is_some_and(|s| self.slot(s).load(Ordering::Acquire) == 0))
+        {
             bail!("{name} has no start wrapper (slot {start})");
         }
         let starts: Vec<Option<usize>> = tests.iter().map(|&(_, start, _)| start).collect();
@@ -95,15 +119,23 @@ impl Image {
                 }
             } else {
                 // SAFETY: address is code that the encoder wrote for a native fn() signature, checked to be set before the fork.
-                let test_fn: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
+                let test_fn: extern "C" fn() =
+                    unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
                 test_fn();
             }
             Ok(())
         })
     }
 
-    fn run_batch(&self, items: &[(usize, &str)], invoke: impl Fn(usize, usize, &str) -> std::io::Result<()>) -> Result<Vec<i32>> {
-        if let Some((_, name)) = items.iter().find(|(index, _)| self.slot(*index).load(Ordering::Acquire) == 0) {
+    fn run_batch(
+        &self,
+        items: &[(usize, &str)],
+        invoke: impl Fn(usize, usize, &str) -> std::io::Result<()>,
+    ) -> Result<Vec<i32>> {
+        if let Some((_, name)) = items
+            .iter()
+            .find(|(index, _)| self.slot(*index).load(Ordering::Acquire) == 0)
+        {
             bail!("{name} has no code");
         }
         let mut statuses = vec![0; items.len()];
@@ -121,15 +153,26 @@ impl Image {
     }
 
     #[cfg(unix)]
-    fn run_from(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>) -> Result<(usize, i32)> {
-        let (pid, mut progress) = fork_piped(|progress| self.run_in_child(offset, items, invoke, progress))?;
+    fn run_from(
+        &self,
+        offset: usize,
+        items: &[(usize, &str)],
+        invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>,
+    ) -> Result<(usize, i32)> {
+        let (pid, mut progress) =
+            fork_piped(|progress| self.run_in_child(offset, items, invoke, progress))?;
         let mut done = Vec::new();
         std::io::Read::read_to_end(&mut progress, &mut done)?;
         Ok((done.len(), wait(pid)))
     }
 
     #[cfg(not(unix))]
-    fn run_from(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>) -> Result<(usize, i32)> {
+    fn run_from(
+        &self,
+        offset: usize,
+        items: &[(usize, &str)],
+        invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>,
+    ) -> Result<(usize, i32)> {
         for (i, &(index, name)) in items.iter().enumerate() {
             let address = self.slot(index).load(Ordering::Acquire);
             if invoke(offset + i, address, name).is_err() {
@@ -140,7 +183,13 @@ impl Image {
     }
 
     #[cfg(unix)]
-    fn run_in_child(&self, offset: usize, items: &[(usize, &str)], invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>, mut progress: std::fs::File) -> std::io::Result<()> {
+    fn run_in_child(
+        &self,
+        offset: usize,
+        items: &[(usize, &str)],
+        invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>,
+        mut progress: std::fs::File,
+    ) -> std::io::Result<()> {
         use std::io::Write;
         crate::host::unwind::set_jit_unwind_head(self.unwind_head);
         for (i, &(index, name)) in items.iter().enumerate() {
@@ -154,14 +203,22 @@ impl Image {
     /// Runs the program the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling; returns its exit status.
     pub(super) fn enter_main(&self, (start, main): (usize, usize), args: &[String]) -> i32 {
         crate::host::unwind::set_jit_unwind_head(self.unwind_head);
-        let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
-        let Ok(owned) = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<Vec<_>, _>>() else {
+        let (start, main) = (
+            self.slot(start).load(Ordering::Acquire),
+            self.slot(main).load(Ordering::Acquire),
+        );
+        let Ok(owned) = args
+            .iter()
+            .map(|arg| std::ffi::CString::new(arg.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+        else {
             return 101;
         };
         let mut argv: Vec<*const u8> = owned.iter().map(|arg| arg.as_ptr().cast()).collect();
         argv.push(std::ptr::null());
         // SAFETY: start is code that the encoder wrote, or a stub that compiles it, for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.
-        let lang_start: extern "C" fn(usize, isize, *const *const u8, u8) -> isize = unsafe { std::mem::transmute::<usize, _>(start) };
+        let lang_start: extern "C" fn(usize, isize, *const *const u8, u8) -> isize =
+            unsafe { std::mem::transmute::<usize, _>(start) };
         let status = lang_start(main, owned.len() as isize, argv.as_ptr(), 0) as i32;
         crate::prep::finish();
         status
@@ -174,13 +231,19 @@ pub(crate) fn wait(pid: libc::pid_t) -> i32 {
     let mut status = 0;
     // SAFETY: pid is a child of this process, and status is a live local.
     unsafe { libc::waitpid(pid, &mut status, 0) };
-    if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) }
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    }
 }
 
 /// Whether a child that ended with `status` was stopped from outside, by a hangup, an interrupt, a kill or a termination request, so its failure says nothing about its input.
 #[cfg(unix)]
 pub(crate) fn interrupted(status: i32) -> bool {
-    [libc::SIGHUP, libc::SIGINT, libc::SIGKILL, libc::SIGTERM].iter().any(|&signal| status == 128 + signal)
+    [libc::SIGHUP, libc::SIGINT, libc::SIGKILL, libc::SIGTERM]
+        .iter()
+        .any(|&signal| status == 128 + signal)
 }
 
 /// Whether a child that ended with `status` was stopped from outside.
@@ -231,7 +294,9 @@ pub(crate) fn close_on_exec(fd: i32) -> Result<i32> {
 
 /// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.
 #[cfg(unix)]
-pub(crate) fn fork_piped<E>(child: impl FnOnce(std::fs::File) -> Result<(), E>) -> Result<(libc::pid_t, std::fs::File)> {
+pub(crate) fn fork_piped<E>(
+    child: impl FnOnce(std::fs::File) -> Result<(), E>,
+) -> Result<(libc::pid_t, std::fs::File)> {
     let [read, write] = pipe()?;
     let pid = fork_child(|| {
         // SAFETY: read is the end this child does not use, and write is the end it owns from here on.

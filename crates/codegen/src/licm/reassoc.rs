@@ -16,9 +16,17 @@ struct AddChain {
 
 impl AddChain {
     fn push_const(&mut self, val: Value, neg: bool, imm: i64) {
-        self.const_sum = if neg { self.const_sum.wrapping_sub(imm) } else { self.const_sum.wrapping_add(imm) };
+        self.const_sum = if neg {
+            self.const_sum.wrapping_sub(imm)
+        } else {
+            self.const_sum.wrapping_add(imm)
+        };
         self.const_count = self.const_count.saturating_add(1);
-        self.single_const = if self.const_count == 1 { Some((val, neg, imm)) } else { None };
+        self.single_const = if self.const_count == 1 {
+            Some((val, neg, imm))
+        } else {
+            None
+        };
         if self.const_count == 1 {
             self.first_const_pos = self.terms.len();
         }
@@ -58,7 +66,10 @@ struct ReassocState<'a> {
 
 fn term_rank(ctx: &ReassocCtx<'_>, val: Value) -> (bool, usize) {
     match ctx.home.get(val.index()).copied().flatten() {
-        Some(b) => (ctx.each.body.get(b.index()).copied().unwrap_or(false), ctx.rpo_rank[b.index()]),
+        Some(b) => (
+            ctx.each.body.get(b.index()).copied().unwrap_or(false),
+            ctx.rpo_rank[b.index()],
+        ),
         None => (false, 0),
     }
 }
@@ -77,12 +88,22 @@ fn record_block_const_adds(
         if !ty.is_small_int() {
             continue;
         }
-        let Op::Binary(bop @ (Binary::Iadd | Binary::Isub), a, b) = data.op else { continue };
+        let Op::Binary(bop @ (Binary::Iadd | Binary::Isub), a, b) = data.op else {
+            continue;
+        };
         let mask = ty.unsigned_max();
         let ca = consts.get(a.index()).copied().flatten();
         let cb = consts.get(b.index()).copied().flatten();
         let key = match (bop, ca, cb) {
-            (_, _, Some(c)) => (a, (if bop == Binary::Isub { c.wrapping_neg() } else { c }) as u64 & mask),
+            (_, _, Some(c)) => (
+                a,
+                (if bop == Binary::Isub {
+                    c.wrapping_neg()
+                } else {
+                    c
+                }) as u64
+                    & mask,
+            ),
             (Binary::Iadd, Some(c), _) => (b, (c as u64) & mask),
             _ => continue,
         };
@@ -92,8 +113,17 @@ fn record_block_const_adds(
     }
 }
 
-fn flatten_add(ctx: &ReassocCtx<'_>, defs: &[Option<Inst>], blk: Block, ty: Type, root: Inst) -> Option<AddChain> {
-    let Op::Binary(bop @ (Binary::Iadd | Binary::Isub), lhs, rhs) = ctx.func.insts[root.index()].op else { return None };
+fn flatten_add(
+    ctx: &ReassocCtx<'_>,
+    defs: &[Option<Inst>],
+    blk: Block,
+    ty: Type,
+    root: Inst,
+) -> Option<AddChain> {
+    let Op::Binary(bop @ (Binary::Iadd | Binary::Isub), lhs, rhs) = ctx.func.insts[root.index()].op
+    else {
+        return None;
+    };
     let mut work = vec![(rhs, bop == Binary::Isub, true), (lhs, false, false)];
     let mut chain = AddChain::default();
     while let Some((val, neg, is_right)) = work.pop() {
@@ -110,7 +140,8 @@ fn flatten_add(ctx: &ReassocCtx<'_>, defs: &[Option<Inst>], blk: Block, ty: Type
                 && ctx.func.ty(val) == ty
         });
         if let Some(c_inst) = child
-            && let Op::Binary(cbop @ (Binary::Iadd | Binary::Isub), a, b) = ctx.func.insts[c_inst.index()].op
+            && let Op::Binary(cbop @ (Binary::Iadd | Binary::Isub), a, b) =
+                ctx.func.insts[c_inst.index()].op
         {
             chain.absorbed.push(c_inst);
             chain.right_expanded |= is_right;
@@ -120,17 +151,28 @@ fn flatten_add(ctx: &ReassocCtx<'_>, defs: &[Option<Inst>], blk: Block, ty: Type
             chain.terms.push((val, neg));
         }
     }
-    (!chain.absorbed.is_empty() && (chain.terms.len() >= 2 || chain.const_count >= 2)).then_some(chain)
+    (!chain.absorbed.is_empty() && (chain.terms.len() >= 2 || chain.const_count >= 2))
+        .then_some(chain)
 }
 
-fn try_reuse_const_add(ctx: &ReassocCtx<'_>, chain: &mut AddChain, blk: Block, masked_const: u64) -> bool {
+fn try_reuse_const_add(
+    ctx: &ReassocCtx<'_>,
+    chain: &mut AddChain,
+    blk: Block,
+    masked_const: u64,
+) -> bool {
     let blk_rank = (true, ctx.rpo_rank[blk.index()]);
     for (idx, &(v, neg)) in chain.terms.iter().enumerate() {
         if neg || term_rank(ctx, v) >= blk_rank {
             continue;
         }
-        let Some(cands) = ctx.const_adds.get(&(v, masked_const)) else { continue };
-        if let Some(&(_, existing)) = cands.iter().find(|&&(b, _)| b != blk && cfg::dominates(&ctx.cfg.idom, b, blk)) {
+        let Some(cands) = ctx.const_adds.get(&(v, masked_const)) else {
+            continue;
+        };
+        if let Some(&(_, existing)) = cands
+            .iter()
+            .find(|&&(b, _)| b != blk && cfg::dominates(&ctx.cfg.idom, b, blk))
+        {
             chain.terms[idx] = (existing, false);
             chain.const_sum = 0;
             chain.single_const = None;
@@ -140,12 +182,23 @@ fn try_reuse_const_add(ctx: &ReassocCtx<'_>, chain: &mut AddChain, blk: Block, m
     false
 }
 
-fn already_sub_grouped(ctx: &ReassocCtx<'_>, chain: &AddChain, orig: &[(Value, bool)], root: Inst, pos_idx: usize) -> bool {
+fn already_sub_grouped(
+    ctx: &ReassocCtx<'_>,
+    chain: &AddChain,
+    orig: &[(Value, bool)],
+    root: Inst,
+    pos_idx: usize,
+) -> bool {
     let pos_len = orig.len() - pos_idx;
-    let Op::Binary(Binary::Isub, _, rhs) = ctx.func.insts[root.index()].op else { return false };
+    let Op::Binary(Binary::Isub, _, rhs) = ctx.func.insts[root.index()].op else {
+        return false;
+    };
     orig[..pos_len] == chain.terms[pos_idx..]
         && orig[pos_len..] == chain.terms[..pos_idx]
-        && chain.absorbed.iter().any(|&a| ctx.func.insts[a.index()].result == Some(rhs))
+        && chain
+            .absorbed
+            .iter()
+            .any(|&a| ctx.func.insts[a.index()].result == Some(rhs))
 }
 
 fn add_rewrite_profitable(ctx: &ReassocCtx<'_>, chain: &AddChain, masked_const: u64) -> bool {
@@ -153,17 +206,34 @@ fn add_rewrite_profitable(ctx: &ReassocCtx<'_>, chain: &AddChain, masked_const: 
     if folds_const {
         return true;
     }
-    let max_rank = chain.terms.iter().map(|&(v, _)| term_rank(ctx, v)).max().unwrap_or((false, 0));
-    let early = chain.terms.iter().filter(|&&(v, _)| term_rank(ctx, v) < max_rank).count();
+    let max_rank = chain
+        .terms
+        .iter()
+        .map(|&(v, _)| term_rank(ctx, v))
+        .max()
+        .unwrap_or((false, 0));
+    let early = chain
+        .terms
+        .iter()
+        .filter(|&&(v, _)| term_rank(ctx, v) < max_rank)
+        .count();
     let has_inv = chain.terms.iter().any(|&(v, _)| !term_rank(ctx, v).0);
     early >= 2 || (masked_const != 0 && early >= 1 && has_inv)
 }
 
-fn same_add_shape(ctx: &ReassocCtx<'_>, chain: &AddChain, orig: &[(Value, bool)], root: Inst, pos_idx: Option<usize>) -> bool {
+fn same_add_shape(
+    ctx: &ReassocCtx<'_>,
+    chain: &AddChain,
+    orig: &[(Value, bool)],
+    root: Inst,
+    pos_idx: Option<usize>,
+) -> bool {
     if let Some(p) = pos_idx {
         return already_sub_grouped(ctx, chain, orig, root, p);
     }
-    !chain.right_expanded && orig == chain.terms.as_slice() && (chain.const_count == 0 || chain.first_const_pos <= 1)
+    !chain.right_expanded
+        && orig == chain.terms.as_slice()
+        && (chain.const_count == 0 || chain.first_const_pos <= 1)
 }
 
 fn normalize_leading_neg(terms: &mut [(Value, bool)], masked_const: u64) -> Option<Option<usize>> {
@@ -179,28 +249,43 @@ fn normalize_leading_neg(terms: &mut [(Value, bool)], masked_const: u64) -> Opti
     }
 }
 
-fn plan_add_rewrite(ctx: &ReassocCtx<'_>, mut chain: AddChain, blk: Block, ty: Type, root: Inst) -> Option<AddPlan> {
+fn plan_add_rewrite(
+    ctx: &ReassocCtx<'_>,
+    mut chain: AddChain,
+    blk: Block,
+    ty: Type,
+    root: Inst,
+) -> Option<AddPlan> {
     let mut masked_const = (chain.const_sum as u64) & ty.unsigned_max();
     if chain.terms.len() <= 1 && masked_const == 0 {
         return None;
     }
     let orig = chain.terms.clone();
-    chain.terms.sort_by_key(|&(v, neg)| (term_rank(ctx, v), neg));
+    chain
+        .terms
+        .sort_by_key(|&(v, neg)| (term_rank(ctx, v), neg));
     let matched = masked_const != 0 && try_reuse_const_add(ctx, &mut chain, blk, masked_const);
     if matched {
         if chain.terms.len() <= 1 {
             return None;
         }
         masked_const = 0;
-        chain.terms.sort_by_key(|&(v, neg)| (term_rank(ctx, v), neg));
+        chain
+            .terms
+            .sort_by_key(|&(v, neg)| (term_rank(ctx, v), neg));
     }
     if !matched && !add_rewrite_profitable(ctx, &chain, masked_const) {
         return None;
     }
     let pos_idx = normalize_leading_neg(&mut chain.terms, masked_const)?;
-    let folds_const = !matched && (chain.const_count >= 2 || (chain.const_count == 1 && masked_const == 0));
+    let folds_const =
+        !matched && (chain.const_count >= 2 || (chain.const_count == 1 && masked_const == 0));
     let unchanged = !folds_const && !matched && same_add_shape(ctx, &chain, &orig, root, pos_idx);
-    (!unchanged).then_some(AddPlan { chain, masked_const, pos_idx })
+    (!unchanged).then_some(AddPlan {
+        chain,
+        masked_const,
+        pos_idx,
+    })
 }
 
 fn emit_add_step(func: &mut Function, ty: Type, prefix: &mut Vec<Inst>, op: Op) -> Value {
@@ -209,13 +294,23 @@ fn emit_add_step(func: &mut Function, ty: Type, prefix: &mut Vec<Inst>, op: Op) 
     val
 }
 
-fn fold_tail_ops(func: &mut Function, prefix: &mut Vec<Inst>, ops: &mut Vec<Op>, tail: &[(Value, bool)], mut acc: Value) {
+fn fold_tail_ops(
+    func: &mut Function,
+    prefix: &mut Vec<Inst>,
+    ops: &mut Vec<Op>,
+    tail: &[(Value, bool)],
+    mut acc: Value,
+) {
     let ty = func.ty(acc);
     for &(v, neg) in tail {
         if let Some(prev) = ops.pop() {
             acc = emit_add_step(func, ty, prefix, prev);
         }
-        ops.push(Op::Binary(if neg { Binary::Isub } else { Binary::Iadd }, acc, v));
+        ops.push(Op::Binary(
+            if neg { Binary::Isub } else { Binary::Iadd },
+            acc,
+            v,
+        ));
     }
 }
 
@@ -228,7 +323,11 @@ fn build_const_add_ops(
 ) -> Vec<Op> {
     let terms = &plan.chain.terms;
     if terms.is_empty() {
-        return vec![Op::Const(crate::fold::extend(plan.masked_const as i64, ty, true))];
+        return vec![Op::Const(crate::fold::extend(
+            plan.masked_const as i64,
+            ty,
+            true,
+        ))];
     }
     let mut ops = Vec::with_capacity(terms.len() + 1);
     let need_pos = terms[0].1;
@@ -244,13 +343,22 @@ fn build_const_add_ops(
     if need_pos {
         fold_tail_ops(func, prefix, &mut ops, terms, cv);
     } else {
-        ops.push(Op::Binary(if cneg { Binary::Isub } else { Binary::Iadd }, terms[0].0, cv));
+        ops.push(Op::Binary(
+            if cneg { Binary::Isub } else { Binary::Iadd },
+            terms[0].0,
+            cv,
+        ));
         fold_tail_ops(func, prefix, &mut ops, &terms[1..], terms[0].0);
     }
     ops
 }
 
-fn build_zero_const_ops(func: &mut Function, plan: &AddPlan, ty: Type, prefix: &mut Vec<Inst>) -> Vec<Op> {
+fn build_zero_const_ops(
+    func: &mut Function,
+    plan: &AddPlan,
+    ty: Type,
+    prefix: &mut Vec<Inst>,
+) -> Vec<Op> {
     let terms = &plan.chain.terms;
     let mut ops = Vec::with_capacity(terms.len());
     let Some(p) = plan.pos_idx else {
@@ -266,7 +374,12 @@ fn build_zero_const_ops(func: &mut Function, plan: &AddPlan, ty: Type, prefix: &
     ops
 }
 
-fn apply_add_plan(func: &mut Function, plan: AddPlan, root: Inst, ty: Type) -> (Vec<Inst>, Op, Option<(Value, i64)>) {
+fn apply_add_plan(
+    func: &mut Function,
+    plan: AddPlan,
+    root: Inst,
+    ty: Type,
+) -> (Vec<Inst>, Op, Option<(Value, i64)>) {
     let mut prefix = Vec::new();
     let mut new_const = None;
     let mut ops = if plan.masked_const != 0 {
@@ -279,7 +392,12 @@ fn apply_add_plan(func: &mut Function, plan: AddPlan, root: Inst, ty: Type) -> (
     (prefix, final_op, new_const)
 }
 
-fn try_reassociate_inst(st: &mut ReassocState<'_>, blk: Block, inst: Inst, removed: &mut Vec<bool>) -> Option<Vec<Inst>> {
+fn try_reassociate_inst(
+    st: &mut ReassocState<'_>,
+    blk: Block,
+    inst: Inst,
+    removed: &mut Vec<bool>,
+) -> Option<Vec<Inst>> {
     let res = st.func.insts[inst.index()].result?;
     let ty = st.func.ty(res);
     if !ty.is_small_int() {
@@ -381,7 +499,9 @@ pub(super) fn reassociate_loop_adds(
     home: &mut Vec<Option<Block>>,
     is_const: &mut Vec<bool>,
 ) -> bool {
-    if !cfg.rpo.iter().any(|&blk| each.body.get(blk.index()).copied().unwrap_or(false) && may_chain(func, blk, home)) {
+    if !cfg.rpo.iter().any(|&blk| {
+        each.body.get(blk.index()).copied().unwrap_or(false) && may_chain(func, blk, home)
+    }) {
         return false;
     }
     let uses = func.use_counts();
@@ -395,7 +515,18 @@ pub(super) fn reassociate_loop_adds(
         }
     }
     let rpo_rank = Cfg::ranks(&cfg.rpo, func.blocks.len());
-    let mut st = ReassocState { func, cfg, each, rpo_rank: &rpo_rank, defs, uses, home, is_const, consts, const_adds: HashMap::default() };
+    let mut st = ReassocState {
+        func,
+        cfg,
+        each,
+        rpo_rank: &rpo_rank,
+        defs,
+        uses,
+        home,
+        is_const,
+        consts,
+        const_adds: HashMap::default(),
+    };
     let mut changed = false;
     for &blk in &cfg.rpo {
         if each.body.get(blk.index()).copied().unwrap_or(false) {

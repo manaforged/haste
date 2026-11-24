@@ -6,7 +6,9 @@ struct Json {
 
 impl Json {
     fn new() -> Self {
-        Self { buf: String::with_capacity(4096) }
+        Self {
+            buf: String::with_capacity(4096),
+        }
     }
 
     fn line(&mut self, text: &str) {
@@ -47,7 +49,12 @@ pub(super) fn render_json(report: &Report) -> String {
     let mut out = Json::new();
     out.line("{");
     write_top_counts(&mut out, report);
-    write_hazards(&mut out, report.n_naive_shape, report.n_naive_shape_hazards, &report.hazard_causes);
+    write_hazards(
+        &mut out,
+        report.n_naive_shape,
+        report.n_naive_shape_hazards,
+        &report.hazard_causes,
+    );
     write_footprints_and_ratios(&mut out, report);
     write_histogram(&mut out, &report.histogram);
     write_savings(&mut out, &report.savings);
@@ -58,11 +65,19 @@ pub(super) fn render_json(report: &Report) -> String {
 }
 
 fn ratio(num: usize, den: usize) -> f64 {
-    if den == 0 { 0.0 } else { (num as f64) / (den as f64) }
+    if den == 0 {
+        0.0
+    } else {
+        (num as f64) / (den as f64)
+    }
 }
 
 fn pct(part: u64, whole: u64) -> f64 {
-    if whole == 0 { 0.0 } else { 100.0 * (part as f64) / (whole as f64) }
+    if whole == 0 {
+        0.0
+    } else {
+        100.0 * (part as f64) / (whole as f64)
+    }
 }
 
 fn ms(ns: u64) -> f64 {
@@ -88,24 +103,49 @@ fn write_hazards(out: &mut Json, n_naive_shape: usize, n_hazards: usize, c: &Haz
     out.count("  ", "n_naive_shape", n_naive_shape, true);
     out.count("  ", "n_naive_shape_hazards", n_hazards, true);
     out.line("  \"naive_shape_hazard_causes\": {");
-    out.count("    ", "niche_layout_mismatch", c.niche_layout_mismatch, true);
-    out.count("    ", "field_offset_mismatch", c.field_offset_mismatch, true);
+    out.count(
+        "    ",
+        "niche_layout_mismatch",
+        c.niche_layout_mismatch,
+        true,
+    );
+    out.count(
+        "    ",
+        "field_offset_mismatch",
+        c.field_offset_mismatch,
+        true,
+    );
     out.count("    ", "assoc_abi_mismatch", c.assoc_abi_mismatch, true);
-    out.count("    ", "specialization_mismatch", c.specialization_mismatch, true);
+    out.count(
+        "    ",
+        "specialization_mismatch",
+        c.specialization_mismatch,
+        true,
+    );
     out.count("    ", "reflection_mismatch", c.reflection_mismatch, true);
-    out.count("    ", "other_footprint_mismatch", c.other_footprint_mismatch, false);
+    out.count(
+        "    ",
+        "other_footprint_mismatch",
+        c.other_footprint_mismatch,
+        false,
+    );
     out.line("  },");
 }
 
 fn write_footprints_and_ratios(out: &mut Json, r: &Report) {
     let splits = r.n_footprint.saturating_sub(r.n_footprint_no_inline);
-    let gen_splits = r.n_generic_footprint.saturating_sub(r.n_generic_footprint_no_inline);
+    let gen_splits = r
+        .n_generic_footprint
+        .saturating_sub(r.n_generic_footprint_no_inline);
     for (key, val) in [
         ("n_footprint_no_inline", r.n_footprint_no_inline),
         ("n_footprint", r.n_footprint),
         ("n_inlined_splits", splits),
         ("n_alias", r.n_alias),
-        ("n_generic_footprint_no_inline", r.n_generic_footprint_no_inline),
+        (
+            "n_generic_footprint_no_inline",
+            r.n_generic_footprint_no_inline,
+        ),
         ("n_generic_footprint", r.n_generic_footprint),
         ("n_generic_inlined_splits", gen_splits),
         ("n_generic_alias", r.n_generic_alias),
@@ -114,12 +154,37 @@ fn write_footprints_and_ratios(out: &mut Json, r: &Report) {
     }
     out.line("  \"ratios\": {");
     out.f4("    ", "inst_per_fn", ratio(r.n_inst, r.n_fn), true);
-    out.f4("    ", "inst_per_footprint_no_inline", ratio(r.n_inst, r.n_footprint_no_inline), true);
-    out.f4("    ", "inst_per_footprint", ratio(r.n_inst, r.n_footprint), true);
+    out.f4(
+        "    ",
+        "inst_per_footprint_no_inline",
+        ratio(r.n_inst, r.n_footprint_no_inline),
+        true,
+    );
+    out.f4(
+        "    ",
+        "inst_per_footprint",
+        ratio(r.n_inst, r.n_footprint),
+        true,
+    );
     out.f4("    ", "inst_per_alias", ratio(r.n_inst, r.n_alias), true);
-    out.f4("    ", "generic_inst_per_generic_fn", ratio(r.n_generic_inst, r.n_generic_fn), true);
-    out.f4("    ", "generic_inst_per_generic_footprint", ratio(r.n_generic_inst, r.n_generic_footprint), true);
-    out.f4("    ", "inlined_split_pct", pct(splits as u64, r.n_footprint_no_inline as u64), false);
+    out.f4(
+        "    ",
+        "generic_inst_per_generic_fn",
+        ratio(r.n_generic_inst, r.n_generic_fn),
+        true,
+    );
+    out.f4(
+        "    ",
+        "generic_inst_per_generic_footprint",
+        ratio(r.n_generic_inst, r.n_generic_footprint),
+        true,
+    );
+    out.f4(
+        "    ",
+        "inlined_split_pct",
+        pct(splits as u64, r.n_footprint_no_inline as u64),
+        false,
+    );
     out.line("  },");
 }
 
@@ -135,31 +200,72 @@ fn write_histogram(out: &mut Json, h: &Histogram) {
 
 fn write_savings(out: &mut Json, s: &CodeSavings) {
     let alias_saved = s.total_code_bytes.saturating_sub(s.unique_alias_code_bytes);
-    let projected_saved = s.total_code_bytes.saturating_sub(s.projected_stenciled_bytes);
+    let projected_saved = s
+        .total_code_bytes
+        .saturating_sub(s.projected_stenciled_bytes);
     out.line("  \"code_size_savings\": {");
     out.count("    ", "compiled_functions", s.compiled_functions, true);
     out.num("    ", "total_code_bytes", s.total_code_bytes, true);
-    out.num("    ", "unique_footprint_code_bytes", s.unique_footprint_code_bytes, true);
-    out.num("    ", "unique_alias_code_bytes", s.unique_alias_code_bytes, true);
+    out.num(
+        "    ",
+        "unique_footprint_code_bytes",
+        s.unique_footprint_code_bytes,
+        true,
+    );
+    out.num(
+        "    ",
+        "unique_alias_code_bytes",
+        s.unique_alias_code_bytes,
+        true,
+    );
     out.num("    ", "alias_saved_bytes", alias_saved, true);
-    out.num("    ", "copy_patch_code_bytes", s.unique_alias_code_bytes, true);
+    out.num(
+        "    ",
+        "copy_patch_code_bytes",
+        s.unique_alias_code_bytes,
+        true,
+    );
     out.count("    ", "dict_stencil_classes", s.dict_stencil_classes, true);
-    out.num("    ", "projected_stenciled_bytes", s.projected_stenciled_bytes, true);
+    out.num(
+        "    ",
+        "projected_stenciled_bytes",
+        s.projected_stenciled_bytes,
+        true,
+    );
     out.num("    ", "projected_saved_bytes", projected_saved, true);
-    out.f4("    ", "projected_saved_pct", pct(projected_saved, s.total_code_bytes), false);
+    out.f4(
+        "    ",
+        "projected_saved_pct",
+        pct(projected_saved, s.total_code_bytes),
+        false,
+    );
     out.line("  },");
 }
 
 fn write_span(out: &mut Json, label: &str, span: Span, comma: bool) {
-    let val = format!("{{ \"wall_ms\": {:.3}, \"cpu_ms\": {:.3} }}", ms(span.wall_ns), ms(span.cpu_ns));
+    let val = format!(
+        "{{ \"wall_ms\": {:.3}, \"cpu_ms\": {:.3} }}",
+        ms(span.wall_ns),
+        ms(span.cpu_ns)
+    );
     out.raw("    ", label, &val, comma);
 }
 
 fn write_stages(out: &mut Json, r: &Report) {
     let t = r.timings;
     let total = Span {
-        wall_ns: t.graph.wall_ns.saturating_add(t.outline.wall_ns).saturating_add(t.reach.wall_ns).saturating_add(t.codegen.wall_ns),
-        cpu_ns: t.graph.cpu_ns.saturating_add(t.outline.cpu_ns).saturating_add(t.reach.cpu_ns).saturating_add(t.codegen.cpu_ns),
+        wall_ns: t
+            .graph
+            .wall_ns
+            .saturating_add(t.outline.wall_ns)
+            .saturating_add(t.reach.wall_ns)
+            .saturating_add(t.codegen.wall_ns),
+        cpu_ns: t
+            .graph
+            .cpu_ns
+            .saturating_add(t.outline.cpu_ns)
+            .saturating_add(t.reach.cpu_ns)
+            .saturating_add(t.codegen.cpu_ns),
     };
     out.line("  \"stages\": {");
     write_span(out, "graph", t.graph, true);
@@ -181,9 +287,20 @@ fn write_origins(out: &mut Json, r: &Report) {
 
 fn write_origin_entry(out: &mut Json, label: &str, o: &OriginReport, comma: bool) {
     let splits = o.n_footprint.saturating_sub(o.n_footprint_no_inline);
-    let saved = o.savings.total_code_bytes.saturating_sub(o.savings.projected_stenciled_bytes);
-    let total_cpu_ns = o.outline_span.cpu_ns.saturating_add(o.reach_span.cpu_ns).saturating_add(o.codegen_span.cpu_ns);
-    let total_wall_ns = o.outline_span.wall_ns.saturating_add(o.reach_span.wall_ns).saturating_add(o.codegen_span.wall_ns);
+    let saved = o
+        .savings
+        .total_code_bytes
+        .saturating_sub(o.savings.projected_stenciled_bytes);
+    let total_cpu_ns = o
+        .outline_span
+        .cpu_ns
+        .saturating_add(o.reach_span.cpu_ns)
+        .saturating_add(o.codegen_span.cpu_ns);
+    let total_wall_ns = o
+        .outline_span
+        .wall_ns
+        .saturating_add(o.reach_span.wall_ns)
+        .saturating_add(o.codegen_span.wall_ns);
     out.line(&format!("    \"{label}\": {{"));
     for (key, val) in [
         ("crates", o.crates),
@@ -212,9 +329,15 @@ fn write_origin_entry(out: &mut Json, label: &str, o: &OriginReport, comma: bool
         ("source_bytes", o.source_bytes),
         ("inferred_exprs", o.inferred_exprs),
         ("total_code_bytes", o.savings.total_code_bytes),
-        ("unique_footprint_code_bytes", o.savings.unique_footprint_code_bytes),
+        (
+            "unique_footprint_code_bytes",
+            o.savings.unique_footprint_code_bytes,
+        ),
         ("unique_alias_code_bytes", o.savings.unique_alias_code_bytes),
-        ("projected_stenciled_bytes", o.savings.projected_stenciled_bytes),
+        (
+            "projected_stenciled_bytes",
+            o.savings.projected_stenciled_bytes,
+        ),
         ("projected_saved_bytes", saved),
     ] {
         out.num("      ", key, val, true);

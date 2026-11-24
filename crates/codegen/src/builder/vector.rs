@@ -6,7 +6,10 @@ impl Ins<'_> {
     pub fn splat(mut self, vec_ty: Type, scalar: Value) -> Value {
         let zero = self.value(Op::Const(0), vec_ty);
         let first = self.value(Op::Insert(zero, scalar, 0), vec_ty);
-        self.value(Op::Shuffle(first, first, ShuffleMask::Const([0; 16])), vec_ty)
+        self.value(
+            Op::Shuffle(first, first, ShuffleMask::Const([0; 16])),
+            vec_ty,
+        )
     }
 
     /// Static lane permute across `a` (`0..count`) and `b` (`count..2*count`).
@@ -23,7 +26,12 @@ impl Ins<'_> {
 
     /// Extracts scalar lane `lane` from `vec`.
     pub fn extract(mut self, vec: Value, lane: u8) -> Value {
-        let ty = self.func.ty(vec).lane().expect("extract requires a vector").to_type();
+        let ty = self
+            .func
+            .ty(vec)
+            .lane()
+            .expect("extract requires a vector")
+            .to_type();
         self.value(Op::Extract(vec, lane), ty)
     }
 
@@ -37,7 +45,12 @@ impl Ins<'_> {
     pub fn reduce(mut self, op: ReduceOp, vec: Value) -> Value {
         let ty = match op {
             ReduceOp::Movemask => Type::I32,
-            _ => self.func.ty(vec).lane().expect("reduce requires a vector").to_type(),
+            _ => self
+                .func
+                .ty(vec)
+                .lane()
+                .expect("reduce requires a vector")
+                .to_type(),
         };
         self.value(Op::Reduce(op, vec), ty)
     }
@@ -49,22 +62,34 @@ impl Ins<'_> {
     }
 
     /// Signed saturating addition.
-    pub fn sadd_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::SaddSat, x, y) }
+    pub fn sadd_sat(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::SaddSat, x, y)
+    }
 
     /// Unsigned saturating addition.
-    pub fn uadd_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::UaddSat, x, y) }
+    pub fn uadd_sat(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::UaddSat, x, y)
+    }
 
     /// Signed saturating subtraction.
-    pub fn ssub_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::SsubSat, x, y) }
+    pub fn ssub_sat(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::SsubSat, x, y)
+    }
 
     /// Unsigned saturating subtraction.
-    pub fn usub_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::UsubSat, x, y) }
+    pub fn usub_sat(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::UsubSat, x, y)
+    }
 
     /// Unsigned rounding average `((x + y + 1) >> 1)`.
-    pub fn avg_round(self, x: Value, y: Value) -> Value { self.binary(Binary::AvgRound, x, y) }
+    pub fn avg_round(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::AvgRound, x, y)
+    }
 
     /// Saturating integer narrowing conversion to `to`.
-    pub fn narrow_sat(self, to: Type, signed: bool, x: Value) -> Value { self.convert(Convert::NarrowSat { signed }, to, x) }
+    pub fn narrow_sat(self, to: Type, signed: bool, x: Value) -> Value {
+        self.convert(Convert::NarrowSat { signed }, to, x)
+    }
 
     /// Fused multiply-add `a * b + c`.
     pub fn fma(mut self, a: Value, b: Value, c: Value) -> Value {

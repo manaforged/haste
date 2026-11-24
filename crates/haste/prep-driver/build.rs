@@ -1,7 +1,10 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rustc-env=PREP_TARGET={}", std::env::var("TARGET").unwrap_or_default());
+    println!(
+        "cargo:rustc-env=PREP_TARGET={}",
+        std::env::var("TARGET").unwrap_or_default()
+    );
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let output = Command::new(rustc).args(["--print", "sysroot"]).output();
     if let Ok(output) = output {

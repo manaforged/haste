@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, ArgumentPurpose, CallConv, Function, FunctionBuilder, Signature, Type, Value};
+use haste_codegen::{
+    AbiParam, ArgumentPurpose, CallConv, Function, FunctionBuilder, Signature, Type, Value,
+};
 
 use crate::lower::{Parts, Repr, passed_parts, repr, signature_of};
 use crate::sema::Context;
@@ -21,12 +23,20 @@ pub(crate) struct Shapes {
 }
 
 /// The signatures of a function taking `params` and returning `ret` in Haste's convention and in rustc's when argument `i` reaches it as `carries[i]` says.
-pub(crate) fn shapes(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), carries: &[Carry]) -> Result<Shapes> {
+pub(crate) fn shapes(
+    cx: &mut Context<'_>,
+    (params, ret): (&[Ty], Option<Ty>),
+    carries: &[Carry],
+) -> Result<Shapes> {
     let haste = signature_of(cx, ret, params.iter().copied())?;
     let mut native = Signature::new(CallConv::Native);
     native.returns = haste.returns.clone();
     let mut passed = haste.params.iter();
-    let sret = haste.params.first().filter(|param| param.purpose == ArgumentPurpose::StructReturn).copied();
+    let sret = haste
+        .params
+        .first()
+        .filter(|param| param.purpose == ArgumentPurpose::StructReturn)
+        .copied();
     if let Some(sret) = sret {
         native.params.push(sret);
         passed.next();
@@ -44,7 +54,9 @@ pub(crate) fn shapes(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), c
         match carry {
             Carry::Same => {
                 for _ in 0..arity {
-                    let Some(&haste_param) = passed.next() else { bail!("a call with fewer parameters than its function") };
+                    let Some(&haste_param) = passed.next() else {
+                        bail!("a call with fewer parameters than its function")
+                    };
                     native.params.push(haste_param);
                 }
             }
@@ -54,16 +66,28 @@ pub(crate) fn shapes(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), c
                         bail!("a call with fewer parameters than its function");
                     }
                 }
-                native.params.extend([AbiParam::new(first), AbiParam::new(second)]);
+                native
+                    .params
+                    .extend([AbiParam::new(first), AbiParam::new(second)]);
             }
         }
         kept.push((carry, arity));
     }
-    Ok(Shapes { haste, native, kept, sret: sret.is_some() })
+    Ok(Shapes {
+        haste,
+        native,
+        kept,
+        sret: sret.is_some(),
+    })
 }
 
 /// Calls rustc's code at `code` from Haste's code with the Haste-convention argument values `values`, loading both halves of each argument that `shapes` splits, and returns the call's results.
-pub(crate) fn call_native(b: &mut FunctionBuilder<'_>, shapes: &Shapes, code: Value, values: &[Value]) -> Vec<Value> {
+pub(crate) fn call_native(
+    b: &mut FunctionBuilder<'_>,
+    shapes: &Shapes,
+    code: Value,
+    values: &[Value],
+) -> Vec<Value> {
     let mut values = values.iter().copied();
     let mut args: Vec<Value> = values.by_ref().take(usize::from(shapes.sret)).collect();
     for &(carry, arity) in &shapes.kept {
@@ -83,7 +107,12 @@ pub(crate) fn call_native(b: &mut FunctionBuilder<'_>, shapes: &Shapes, code: Va
 }
 
 /// A function in Haste's convention for a function taking `params` and returning `ret` that calls rustc's code at `address`, passing each argument as `carries` says.
-pub(super) fn adapter(cx: &mut Context<'_>, types: (&[Ty], Option<Ty>), carries: &[Carry], address: usize) -> Result<Function> {
+pub(super) fn adapter(
+    cx: &mut Context<'_>,
+    types: (&[Ty], Option<Ty>),
+    carries: &[Carry],
+    address: usize,
+) -> Result<Function> {
     let shapes = shapes(cx, types, carries)?;
     let mut func = Function::new(shapes.haste.clone());
     let mut b = FunctionBuilder::new(&mut func);
@@ -98,7 +127,12 @@ pub(super) fn adapter(cx: &mut Context<'_>, types: (&[Ty], Option<Ty>), carries:
 }
 
 /// A function in rustc's convention for a function taking `params` and returning `ret`, receiving each argument as `carries` says, that calls the Haste code whose address the call table entry at `entry` holds, storing both halves of each split argument to memory and passing its address.
-pub(super) fn entry(cx: &mut Context<'_>, types: (&[Ty], Option<Ty>), carries: &[Carry], entry: i64) -> Result<Function> {
+pub(super) fn entry(
+    cx: &mut Context<'_>,
+    types: (&[Ty], Option<Ty>),
+    carries: &[Carry],
+    entry: i64,
+) -> Result<Function> {
     let shapes = shapes(cx, types, carries)?;
     let mut func = Function::new(shapes.native.clone());
     let mut b = FunctionBuilder::new(&mut func);
@@ -111,10 +145,17 @@ pub(super) fn entry(cx: &mut Context<'_>, types: (&[Ty], Option<Ty>), carries: &
         match carry {
             Carry::Same => args.extend(values.by_ref().take(usize::from(arity))),
             Carry::Split(first, second, offset) => {
-                let Some(value) = values.next() else { bail!("an entry with fewer arguments than its function") };
-                let Some(high) = values.next() else { bail!("an entry with a split argument missing its second half") };
+                let Some(value) = values.next() else {
+                    bail!("an entry with fewer arguments than its function")
+                };
+                let Some(high) = values.next() else {
+                    bail!("an entry with a split argument missing its second half")
+                };
                 let size = offset as u32 + second.bytes();
-                let slot = b.create_stack_slot(size, first.bytes().max(second.bytes()).trailing_zeros() as u8);
+                let slot = b.create_stack_slot(
+                    size,
+                    first.bytes().max(second.bytes()).trailing_zeros() as u8,
+                );
                 let address = b.ins().stack_addr(Type::I64, slot, 0);
                 b.ins().store(value, address, 0);
                 b.ins().store(high, address, offset);

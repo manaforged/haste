@@ -3,7 +3,15 @@ use std::str::Chars;
 
 use anyhow::{Result, anyhow, bail};
 
-const ESCAPES: [(char, char); 7] = [('n', '\n'), ('t', '\t'), ('r', '\r'), ('0', '\0'), ('\\', '\\'), ('\'', '\''), ('"', '"')];
+const ESCAPES: [(char, char); 7] = [
+    ('n', '\n'),
+    ('t', '\t'),
+    ('r', '\r'),
+    ('0', '\0'),
+    ('\\', '\\'),
+    ('\'', '\''),
+    ('"', '"'),
+];
 
 /// The value of a char literal, quotes included.
 pub fn char_value(text: &str) -> Result<char> {
@@ -12,20 +20,30 @@ pub fn char_value(text: &str) -> Result<char> {
         Err(out) => out,
     };
     let decoded = String::from_utf8(out).map_err(|error| anyhow!("bad char {text}: {error}"))?;
-    decoded.chars().next().ok_or_else(|| anyhow!("bad char {text}"))
+    decoded
+        .chars()
+        .next()
+        .ok_or_else(|| anyhow!("bad char {text}"))
 }
 
 /// The value of a byte literal, quotes included.
 pub fn byte_value(text: &str) -> Result<u8> {
     match unit(text)? {
         Ok(ch) => u8::try_from(ch).map_err(|error| anyhow!("bad byte {text}: {error}")),
-        Err(out) => out.first().copied().ok_or_else(|| anyhow!("bad byte {text}")),
+        Err(out) => out
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("bad byte {text}")),
     }
 }
 
 /// The unescaped character of a char or byte literal, or the bytes its escape decodes to.
 fn unit(text: &str) -> Result<std::result::Result<char, Vec<u8>>> {
-    let inner = text.trim_start_matches('b').strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')).ok_or_else(|| anyhow!("bad char literal {text}"))?;
+    let inner = text
+        .trim_start_matches('b')
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .ok_or_else(|| anyhow!("bad char literal {text}"))?;
     let mut chars = inner.chars().peekable();
     let mut out = Vec::new();
     match chars.next() {
@@ -41,9 +59,15 @@ pub fn string_bytes(text: &str) -> Result<Vec<u8>> {
     let text = text.strip_prefix(['b', 'c']).unwrap_or(text);
     if let Some(raw) = text.strip_prefix('r') {
         let hashes = raw.len() - raw.trim_start_matches('#').len();
-        return raw.get(hashes + 1..raw.len() - hashes - 1).map(|inner| inner.as_bytes().to_vec()).ok_or_else(|| anyhow!("bad raw string {text}"));
+        return raw
+            .get(hashes + 1..raw.len() - hashes - 1)
+            .map(|inner| inner.as_bytes().to_vec())
+            .ok_or_else(|| anyhow!("bad raw string {text}"));
     }
-    let inner = text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).ok_or_else(|| anyhow!("bad string literal {text}"))?;
+    let inner = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or_else(|| anyhow!("bad string literal {text}"))?;
     let mut out = Vec::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -57,7 +81,9 @@ pub fn string_bytes(text: &str) -> Result<Vec<u8>> {
 }
 
 fn escape(chars: &mut Peekable<Chars<'_>>, out: &mut Vec<u8>) -> Result<()> {
-    let Some(kind) = chars.next() else { bail!("escape at the end of a literal") };
+    let Some(kind) = chars.next() else {
+        bail!("escape at the end of a literal")
+    };
     match kind {
         '\n' | '\r' => {
             while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
@@ -69,12 +95,21 @@ fn escape(chars: &mut Peekable<Chars<'_>>, out: &mut Vec<u8>) -> Result<()> {
             out.push(u8::from_str_radix(&digits, 16)?);
         }
         'u' => {
-            let digits: String = chars.by_ref().skip(1).take_while(|ch| *ch != '}').filter(|ch| *ch != '_').collect();
-            let ch = char::from_u32(u32::from_str_radix(&digits, 16)?).ok_or_else(|| anyhow!("bad unicode escape"))?;
+            let digits: String = chars
+                .by_ref()
+                .skip(1)
+                .take_while(|ch| *ch != '}')
+                .filter(|ch| *ch != '_')
+                .collect();
+            let ch = char::from_u32(u32::from_str_radix(&digits, 16)?)
+                .ok_or_else(|| anyhow!("bad unicode escape"))?;
             out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
         }
         other => {
-            let &(_, ch) = ESCAPES.iter().find(|(name, _)| *name == other).ok_or_else(|| anyhow!("bad escape \\{other}"))?;
+            let &(_, ch) = ESCAPES
+                .iter()
+                .find(|(name, _)| *name == other)
+                .ok_or_else(|| anyhow!("bad escape \\{other}"))?;
             out.push(ch as u8);
         }
     }

@@ -87,15 +87,96 @@ macro_rules! target {
 
 /// Every target Haste knows, from `rustc 1.99.1 --print target-spec-json` and `--print cfg`.
 pub const TARGETS: &[Target] = &[
-    target!("x86_64-unknown-linux-gnu", X64, Linux, SysV, Elf, 8, "", "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
-    target!("aarch64-unknown-linux-gnu", Arm64, Linux, Aapcs64, Elf, 8, "", "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"),
-    target!("aarch64-apple-darwin", Arm64, Darwin, AppleArm64, MachO, 8, "_", "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"),
-    target!("x86_64-apple-darwin", X64, Darwin, SysV, MachO, 8, "_", "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
-    target!("x86_64-pc-windows-msvc", X64, Windows, Win64, Pe, 8, "", "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
-    target!("aarch64-pc-windows-msvc", Arm64, Windows, Aapcs64, Pe, 8, "", "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32"),
-    target!("wasm32-unknown-unknown", Wasm32, None, Wasm, Wasm, 4, "", "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"),
-    target!("wasm32-wasip1", Wasm32, Wasi, Wasm, Wasm, 4, "", "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"),
-    target!("riscv64gc-unknown-linux-gnu", Riscv64, Linux, Lp64d, Elf, 8, "", "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"),
+    target!(
+        "x86_64-unknown-linux-gnu",
+        X64,
+        Linux,
+        SysV,
+        Elf,
+        8,
+        "",
+        "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+    ),
+    target!(
+        "aarch64-unknown-linux-gnu",
+        Arm64,
+        Linux,
+        Aapcs64,
+        Elf,
+        8,
+        "",
+        "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
+    ),
+    target!(
+        "aarch64-apple-darwin",
+        Arm64,
+        Darwin,
+        AppleArm64,
+        MachO,
+        8,
+        "_",
+        "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
+    ),
+    target!(
+        "x86_64-apple-darwin",
+        X64,
+        Darwin,
+        SysV,
+        MachO,
+        8,
+        "_",
+        "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+    ),
+    target!(
+        "x86_64-pc-windows-msvc",
+        X64,
+        Windows,
+        Win64,
+        Pe,
+        8,
+        "",
+        "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+    ),
+    target!(
+        "aarch64-pc-windows-msvc",
+        Arm64,
+        Windows,
+        Aapcs64,
+        Pe,
+        8,
+        "",
+        "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32"
+    ),
+    target!(
+        "wasm32-unknown-unknown",
+        Wasm32,
+        None,
+        Wasm,
+        Wasm,
+        4,
+        "",
+        "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
+    ),
+    target!(
+        "wasm32-wasip1",
+        Wasm32,
+        Wasi,
+        Wasm,
+        Wasm,
+        4,
+        "",
+        "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
+    ),
+    target!(
+        "riscv64gc-unknown-linux-gnu",
+        Riscv64,
+        Linux,
+        Lp64d,
+        Elf,
+        8,
+        "",
+        "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
+    ),
 ];
 
 /// The catalog index of the machine this program runs on; another host does not compile.

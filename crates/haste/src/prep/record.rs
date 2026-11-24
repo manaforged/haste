@@ -178,8 +178,12 @@ pub(super) struct Arg {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub(super) enum Pass {
     Ignore,
-    Direct { regs: Vec<Reg> },
-    Pair { regs: Vec<Reg> },
+    Direct {
+        regs: Vec<Reg>,
+    },
+    Pair {
+        regs: Vec<Reg>,
+    },
     Cast {},
     Indirect {
         on_stack: bool,
@@ -238,12 +242,18 @@ pub(super) struct Parsed {
 impl Parsed {
     /// The manifest at `path`, with the identity of the file read.
     pub(super) fn read(path: &Path) -> Result<Parsed> {
-        let mut opened = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut opened =
+            std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
         let meta = opened.metadata()?;
         let mut text = String::new();
-        std::io::Read::read_to_string(&mut opened, &mut text).with_context(|| format!("reading {}", path.display()))?;
-        let library = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(Parsed { file: file_identity(&meta), library })
+        std::io::Read::read_to_string(&mut opened, &mut text)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let library =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Parsed {
+            file: file_identity(&meta),
+            library,
+        })
     }
 }
 
@@ -256,7 +266,8 @@ impl Library {
     /// The manifest of what the libraries in `dir` hold: the first library's, taken from `ahead` when that read the same file, with the records and statics of the units a second library beside it replaces taken from that one.
     pub(super) fn load(dir: &Path, ahead: Option<Parsed>) -> Result<Library> {
         let path = dir.join(files::manifest(files::LIBRARY));
-        let file = std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+        let file =
+            std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
         let mut library = match ahead {
             Some(parsed) if parsed.file == file_identity(&file) => parsed.library,
             _ => Library::read(&path)?,
@@ -271,7 +282,8 @@ impl Library {
     /// This manifest with `delta` over it: its records of the units `delta` replaces dropped and `delta`'s added after the rest, each type and static line kept while a unit `delta` does not replace uses it and taken from `delta` when it states one, and its facts kept where `delta` states none.
     fn layer(&mut self, delta: Library) {
         let replaced: HashSet<&str> = delta.replaces.iter().map(String::as_str).collect();
-        self.record.retain(|record| !replaced.contains(record.unit.as_str()));
+        self.record
+            .retain(|record| !replaced.contains(record.unit.as_str()));
         self.record.extend(delta.record);
         overlay(&mut self.statics, delta.statics, &replaced);
         overlay(&mut self.object, delta.object, &replaced);
@@ -322,10 +334,15 @@ impl Shared for Pointer {
 /// The lines of `base` that a unit not in `replaced` still uses, each replaced by the line of `delta` with its name, with every other line of `delta` after them.
 fn overlay<T: Shared>(base: &mut Vec<T>, delta: Vec<T>, replaced: &HashSet<&str>) {
     for line in base.iter_mut() {
-        line.used_by().retain(|unit| !replaced.contains(unit.as_str()));
+        line.used_by()
+            .retain(|unit| !replaced.contains(unit.as_str()));
     }
     base.retain_mut(|line| !line.used_by().is_empty());
-    let mut at: HashMap<String, usize> = base.iter().enumerate().map(|(index, line)| (line.name().to_owned(), index)).collect();
+    let mut at: HashMap<String, usize> = base
+        .iter()
+        .enumerate()
+        .map(|(index, line)| (line.name().to_owned(), index))
+        .collect();
     for mut line in delta {
         match at.get(line.name()) {
             Some(&index) => {

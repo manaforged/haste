@@ -24,9 +24,20 @@ impl<'a> Infer<'_, 'a> {
         if let Some(found) = cached {
             return Ok(found);
         }
-        if let Some(form) = self.generic((Form::Adt(item), args.len()), |infer, params| infer.lower_fields(item, params)) {
+        if let Some(form) = self.generic((Form::Adt(item), args.len()), |infer, params| {
+            infer.lower_fields(item, params)
+        }) {
             let args: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
-            let fields: Fields = form.iter().map(|variant| variant.iter().map(|&ty| self.instantiate(ty, &args)).collect()).collect::<Vec<Vec<Ty>>>().into();
+            let fields: Fields = form
+                .iter()
+                .map(|variant| {
+                    variant
+                        .iter()
+                        .map(|&ty| self.instantiate(ty, &args))
+                        .collect()
+                })
+                .collect::<Vec<Vec<Ty>>>()
+                .into();
             if let Some(key) = key {
                 self.cx.store.lookups.fields.insert(key, fields.clone());
             }
@@ -34,7 +45,8 @@ impl<'a> Infer<'_, 'a> {
         }
         let before = self.unsettled();
         let fields = self.lower_fields(item, args)?;
-        let closed = self.unsettled() == before && !fields.iter().flatten().any(|&ty| self.has_vars(ty));
+        let closed =
+            self.unsettled() == before && !fields.iter().flatten().any(|&ty| self.has_vars(ty));
         if let Some(key) = key.filter(|_| closed) {
             self.cx.store.lookups.fields.insert(key, fields.clone());
         }
@@ -48,12 +60,33 @@ impl<'a> Infer<'_, 'a> {
         }
         let def = self.cx.adt_def(item)?;
         let frame = self.adt_frame(item, &def.generics.params, args)?;
-        Ok(self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty).map(|ty| infer.substitute(ty))).collect()).collect::<Result<Vec<Vec<Ty>>>>())?.into())
+        Ok(self
+            .with_frame(frame, |infer| {
+                def.variants
+                    .iter()
+                    .map(|variant| {
+                        variant
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                infer
+                                    .lower_ty(&def.body, field.ty)
+                                    .map(|ty| infer.substitute(ty))
+                            })
+                            .collect()
+                    })
+                    .collect::<Result<Vec<Vec<Ty>>>>()
+            })?
+            .into())
     }
 
     /// The key that caches the field types of `item` at `args` across bodies, the ADT type with its variables filled in, and what it holds; no key when body state or an unbound inference variable could change the answer.
     fn cached_fields(&mut self, item: ItemRef, args: &[Ty]) -> (Option<Ty>, Option<Fields>) {
-        if !self.shared_here(item.declaring_body()) || args.iter().any(|&arg| self.has_vars(arg) || self.has_params(arg)) {
+        if !self.shared_here(item.declaring_body())
+            || args
+                .iter()
+                .any(|&arg| self.has_vars(arg) || self.has_params(arg))
+        {
             return (None, None);
         }
         let args: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
@@ -70,16 +103,34 @@ impl<'a> Infer<'_, 'a> {
             return Ok(found.first().and_then(|variant| variant.last()).copied());
         }
         let def = self.cx.adt_def(item)?;
-        let Some(last) = def.variants.first().and_then(|variant| variant.fields.last()) else {
+        let Some(last) = def
+            .variants
+            .first()
+            .and_then(|variant| variant.fields.last())
+        else {
             return Ok(None);
         };
         let frame = self.adt_frame(item, &def.generics.params, args)?;
-        self.with_frame(frame, |infer| infer.lower_ty(&def.body, last.ty).map(|ty| infer.substitute(ty))).map(Some)
+        self.with_frame(frame, |infer| {
+            infer
+                .lower_ty(&def.body, last.ty)
+                .map(|ty| infer.substitute(ty))
+        })
+        .map(Some)
     }
 
     /// Whether the struct `item` at `args` ends in an unsized field once each `sized` stand-in is an open variable, so a projection on it stays open and counts as sized.
     pub fn open_tail_unsized(&mut self, item: ItemRef, args: &[Ty], sized: Ty) -> Result<bool> {
-        let open: Vec<Ty> = args.iter().map(|&arg| if arg == sized { self.fresh(Kind::Var) } else { arg }).collect();
+        let open: Vec<Ty> = args
+            .iter()
+            .map(|&arg| {
+                if arg == sized {
+                    self.fresh(Kind::Var)
+                } else {
+                    arg
+                }
+            })
+            .collect();
         let tail = self.cx.types.adt(item, &open);
         self.is_unsized(tail)
     }
@@ -87,19 +138,29 @@ impl<'a> Infer<'_, 'a> {
     /// The unsized tail of `ty`, walking struct tail fields in this inference context, cached in the store when `ty` and its tail hold no variable or parameter and no quieted error arose.
     pub(in crate::sema) fn tail_ty(&mut self, ty: Ty) -> Result<Ty> {
         let ty = self.substitute(ty);
-        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { return Ok(ty) };
+        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else {
+            return Ok(ty);
+        };
         let cacheable = !self.cx.types.has_params(ty) && !self.cx.types.has_var_flag(ty);
         if cacheable && let Some(found) = self.cx.store.tails.get(&ty) {
             return Ok(found);
         }
         let before = self.cx.quiet_mark();
         let slice = self.cx.types.substs(args).to_vec();
-        let last = if self.cx.item(item).1.kind == ItemKind::Struct { self.adt_tail_field(item, &slice)? } else { None };
+        let last = if self.cx.item(item).1.kind == ItemKind::Struct {
+            self.adt_tail_field(item, &slice)?
+        } else {
+            None
+        };
         let found = match last {
             Some(last) => self.tail_ty(last)?,
             None => ty,
         };
-        if cacheable && !self.cx.types.has_params(found) && !self.cx.types.has_var_flag(found) && self.cx.quiet_mark() == before {
+        if cacheable
+            && !self.cx.types.has_params(found)
+            && !self.cx.types.has_var_flag(found)
+            && self.cx.quiet_mark() == before
+        {
             self.cx.store.tails.insert(ty, found);
         }
         Ok(found)
@@ -112,7 +173,12 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The frame of the struct, enum or union `item` with its type parameters `params` set to `args`, whose header supplies their bounds.
-    pub(super) fn adt_frame(&mut self, item: ItemRef, params: &[crate::body::sig::Generic], args: &[Ty]) -> Result<super::scope::Frame<'a>> {
+    pub(super) fn adt_frame(
+        &mut self,
+        item: ItemRef,
+        params: &[crate::body::sig::Generic],
+        args: &[Ty],
+    ) -> Result<super::scope::Frame<'a>> {
         let self_ty = Some(self.cx.types.adt(item, args));
         self.item_frame(item, (params, args), (self_ty, Some(item)))
     }
@@ -135,49 +201,95 @@ impl<'a> Infer<'_, 'a> {
     fn type_ctor(&mut self, arena: &Body, path: PathId) -> Result<Option<Ctor>> {
         let entry = arena.path(path);
         let ty = match (entry.qself, arena.list(entry.segments).last()) {
-            (Some((qself, Some(trait_path))), Some(&last)) => self.projection(arena, (qself, trait_path), last)?,
+            (Some((qself, Some(trait_path))), Some(&last)) => {
+                self.projection(arena, (qself, trait_path), last)?
+            }
             _ => self.named_ty(arena, path, entry.segments.len as usize, true)?,
         };
         let Kind::Adt(item, args) = self.cx.types.kind(self.resolve(ty)).clone() else {
             return Ok(None);
         };
-        Ok(matches!(self.cx.item(item).1.kind, ItemKind::Struct | ItemKind::Union).then_some((item, 0, args)))
+        Ok(matches!(
+            self.cx.item(item).1.kind,
+            ItemKind::Struct | ItemKind::Union
+        )
+        .then_some((item, 0, args)))
     }
 
     /// The struct, union or variant that `path` names directly, or an enum variant through a type alias.
     fn named_ctor(&mut self, arena: &Body, path: PathId, values: bool) -> Result<Option<Ctor>> {
         let (segments, absolute, dollar) = self.segments(arena, path);
-        let texts: Vec<&str> = segments.iter().map(|sym| self.cx.names.symbols.text(*sym)).collect();
+        let texts: Vec<&str> = segments
+            .iter()
+            .map(|sym| self.cx.names.symbols.text(*sym))
+            .collect();
         if texts.first() == Some(&"Self") {
             return self.self_ctor(&texts[1..]);
         }
-        let name_path = NamePath { segments: &segments, absolute, dollar };
-        let def = if values { self.value_item(arena, path).ok() } else { self.type_def(&name_path) };
+        let name_path = NamePath {
+            segments: &segments,
+            absolute,
+            dollar,
+        };
+        let def = if values {
+            self.value_item(arena, path).ok()
+        } else {
+            self.type_def(&name_path)
+        };
         let count = segments.len();
         match def {
-            Some(Def::Item(item)) if matches!(self.cx.item(item).1.kind, ItemKind::Struct | ItemKind::Union) => {
+            Some(Def::Item(item))
+                if matches!(
+                    self.cx.item(item).1.kind,
+                    ItemKind::Struct | ItemKind::Union
+                ) =>
+            {
                 let given = self.segment_args(arena, path, count)?;
                 let args = self.adt_args(item, given, true)?;
                 Ok(Some((item, 0, self.cx.types.intern_substs(&args))))
             }
             Some(Def::Variant(item, index)) => {
-                let on_enum = if count >= 2 { self.segment_args(arena, path, count - 1)? } else { Vec::new() };
-                let given = if on_enum.is_empty() { self.segment_args(arena, path, count)? } else { on_enum };
+                let on_enum = if count >= 2 {
+                    self.segment_args(arena, path, count - 1)?
+                } else {
+                    Vec::new()
+                };
+                let given = if on_enum.is_empty() {
+                    self.segment_args(arena, path, count)?
+                } else {
+                    on_enum
+                };
                 let args = self.adt_args(item, given, true)?;
                 let variant = self.cx.variant_position(item, index)?;
-                Ok(Some((item, variant as u32, self.cx.types.intern_substs(&args))))
+                Ok(Some((
+                    item,
+                    variant as u32,
+                    self.cx.types.intern_substs(&args),
+                )))
             }
             _ => self.alias_variant(arena, path, &segments),
         }
     }
 
     /// The variant that `Alias::Variant` names, when the type alias names an enum.
-    fn alias_variant(&mut self, arena: &Body, path: PathId, segments: &[Sym]) -> Result<Option<Ctor>> {
-        let Some((name, prefix)) = segments.split_last().filter(|(_, prefix)| !prefix.is_empty()) else {
+    fn alias_variant(
+        &mut self,
+        arena: &Body,
+        path: PathId,
+        segments: &[Sym],
+    ) -> Result<Option<Ctor>> {
+        let Some((name, prefix)) = segments
+            .split_last()
+            .filter(|(_, prefix)| !prefix.is_empty())
+        else {
             return Ok(None);
         };
         let (_, absolute, dollar) = self.segments(arena, path);
-        let Some(Def::Item(alias)) = self.type_def(&NamePath { segments: prefix, absolute, dollar }) else {
+        let Some(Def::Item(alias)) = self.type_def(&NamePath {
+            segments: prefix,
+            absolute,
+            dollar,
+        }) else {
             return Ok(None);
         };
         if self.cx.item(alias).1.kind != ItemKind::Type {
@@ -189,16 +301,21 @@ impl<'a> Infer<'_, 'a> {
             return Ok(None);
         };
         let name = self.cx.names.symbols.text(*name).to_string();
-        Ok(self.variant_named(item, &name)?.map(|variant| (item, variant, args)))
+        Ok(self
+            .variant_named(item, &name)?
+            .map(|variant| (item, variant, args)))
     }
 
     fn self_ctor(&mut self, rest: &[&str]) -> Result<Option<Ctor>> {
-        let Some(Kind::Adt(item, args)) = self.self_ty.map(|ty| self.cx.types.kind(ty).clone()) else {
+        let Some(Kind::Adt(item, args)) = self.self_ty.map(|ty| self.cx.types.kind(ty).clone())
+        else {
             return Ok(None);
         };
         match rest {
             [] => Ok(Some((item, 0, args))),
-            [name] => Ok(self.variant_named(item, name)?.map(|variant| (item, variant, args))),
+            [name] => Ok(self
+                .variant_named(item, name)?
+                .map(|variant| (item, variant, args))),
             _ => Ok(None),
         }
     }
@@ -206,7 +323,11 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn variant_named(&mut self, item: ItemRef, name: &str) -> Result<Option<u32>> {
         let def = self.cx.adt_def(item)?;
         let src = &self.cx.file(item).source;
-        Ok(def.variants.iter().position(|variant| src.text(variant.name) == name).map(|at| at as u32))
+        Ok(def
+            .variants
+            .iter()
+            .position(|variant| src.text(variant.name) == name)
+            .map(|at| at as u32))
     }
 
     /// The position of the field named `name` in variant `variant` of `item`: a field name, or an index for a tuple variant.
@@ -215,8 +336,15 @@ impl<'a> Infer<'_, 'a> {
         let src = &self.cx.file(item).source;
         let fields = &def.variants[variant as usize].fields;
         Ok(match name.parse::<usize>() {
-            Ok(index) if index < fields.len() && def.variants[variant as usize].shape == Shape::Tuple => Some(index as u32),
-            _ => fields.iter().position(|field| field.name.is_some_and(|at| plain(src.text(at)) == name)).map(|at| at as u32),
+            Ok(index)
+                if index < fields.len() && def.variants[variant as usize].shape == Shape::Tuple =>
+            {
+                Some(index as u32)
+            }
+            _ => fields
+                .iter()
+                .position(|field| field.name.is_some_and(|at| plain(src.text(at)) == name))
+                .map(|at| at as u32),
         })
     }
 
@@ -232,9 +360,17 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Infers the struct literal `expr`.
-    pub fn struct_expr(&mut self, expr: ExprId, path: PathId, (fields, base): (List, Option<ExprId>), expected: Option<Ty>) -> Result<Ty> {
+    pub fn struct_expr(
+        &mut self,
+        expr: ExprId,
+        path: PathId,
+        (fields, base): (List, Option<ExprId>),
+        expected: Option<Ty>,
+    ) -> Result<Ty> {
         let body = self.body;
-        let Some((item, variant, args)) = self.ctor(body, path, false)? else { bail!("struct literal of something that is not a struct") };
+        let Some((item, variant, args)) = self.ctor(body, path, false)? else {
+            bail!("struct literal of something that is not a struct")
+        };
         let adt = self.cx.types.intern(Kind::Adt(item, args));
         if let Some(expected) = expected {
             self.trial(|infer| Ok(infer.unifies(adt, expected).then_some(())))?;
@@ -244,7 +380,9 @@ impl<'a> Infer<'_, 'a> {
         for &init in body.list(fields) {
             let field = body.fields[init as usize];
             let name = plain(self.src.text(field.name));
-            let Some(index) = self.field_index(item, variant, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
+            let Some(index) = self.field_index(item, variant, name)? else {
+                bail!("no field `{name}` on {}", self.cx.name(item))
+            };
             let ty = tys[index as usize];
             self.out.inits.insert(field.value, index);
             self.call_arg(Some((item, &slice[..])), field.value, (ty, None), &mut None)?;
@@ -258,12 +396,22 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Infers `offset_of!(ty, fields)`: a `usize` whose value, the byte offset of the field path in `ty`, lowering reads.
-    pub fn offset_of(&mut self, expr: ExprId, ty: crate::body::TyId, fields: crate::body::List) -> Result<Ty> {
+    pub fn offset_of(
+        &mut self,
+        expr: ExprId,
+        ty: crate::body::TyId,
+        fields: crate::body::List,
+    ) -> Result<Ty> {
         let mut current = self.lower_ty(self.body, ty)?;
         if self.poly.is_some() && self.has_params(current) {
             return self.poly_offset_of(expr, current, fields);
         }
-        let segments: Vec<&'a str> = self.body.list(fields).iter().flat_map(|&at| self.src.text(at).split('.').map(plain)).collect();
+        let segments: Vec<&'a str> = self
+            .body
+            .list(fields)
+            .iter()
+            .flat_map(|&at| self.src.text(at).split('.').map(plain))
+            .collect();
         let (mut offset, mut at) = (0u64, 0usize);
         while at < segments.len() {
             let (used, step, field) = self.offset_step(current, &segments, at)?;
@@ -275,17 +423,27 @@ impl<'a> Infer<'_, 'a> {
         Ok(self.cx.types.prim(crate::names::Primitive::Usize))
     }
 
-    fn offset_step(&mut self, current: Ty, segments: &[&str], at: usize) -> Result<(usize, i32, Ty)> {
+    fn offset_step(
+        &mut self,
+        current: Ty,
+        segments: &[&str],
+        at: usize,
+    ) -> Result<(usize, i32, Ty)> {
         let resolved = self.resolve(current);
         if let Kind::Adt(item, args) = *self.cx.types.kind(resolved)
             && self.cx.item(item).1.kind == ItemKind::Enum
         {
             let variant_name = segments[at];
             let Some(&field_name) = segments.get(at + 1) else {
-                bail!("offset_of on enum {} needs a field after variant `{variant_name}`", self.cx.name(item));
+                bail!(
+                    "offset_of on enum {} needs a field after variant `{variant_name}`",
+                    self.cx.name(item)
+                );
             };
-            let (variant, index, field) = self.enum_field_at(item, args, variant_name, field_name)?;
-            let step = crate::sema::layout::field_offset(&*self.cx.layout(current)?, variant, index);
+            let (variant, index, field) =
+                self.enum_field_at(item, args, variant_name, field_name)?;
+            let step =
+                crate::sema::layout::field_offset(&*self.cx.layout(current)?, variant, index);
             return Ok((2, step, field));
         }
         let (index, field) = self.field_at(current, segments[at])?;
@@ -293,12 +451,21 @@ impl<'a> Infer<'_, 'a> {
         Ok((1, step, field))
     }
 
-    fn enum_field_at(&mut self, item: ItemRef, args: Substs, variant_name: &str, field_name: &str) -> Result<(u32, u32, Ty)> {
+    fn enum_field_at(
+        &mut self,
+        item: ItemRef,
+        args: Substs,
+        variant_name: &str,
+        field_name: &str,
+    ) -> Result<(u32, u32, Ty)> {
         let Some(variant) = self.variant_named(item, variant_name)? else {
             bail!("no variant `{variant_name}` on {}", self.cx.name(item));
         };
         let Some(index) = self.field_index(item, variant, field_name)? else {
-            bail!("no field `{field_name}` on {}::{variant_name}", self.cx.name(item));
+            bail!(
+                "no field `{field_name}` on {}::{variant_name}",
+                self.cx.name(item)
+            );
         };
         let slice = self.cx.types.substs(args).to_vec();
         let field = self.adt_fields(item, &slice)?[variant as usize][index as usize];
@@ -310,10 +477,17 @@ impl<'a> Infer<'_, 'a> {
             Kind::Tuple(items) => {
                 let index: u32 = name.parse()?;
                 let slice = self.cx.types.substs(items);
-                slice.get(index as usize).map(|&item| (index, item)).ok_or_else(|| anyhow::anyhow!("no field {index} on a tuple of {}", slice.len()))
+                slice
+                    .get(index as usize)
+                    .map(|&item| (index, item))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no field {index} on a tuple of {}", slice.len())
+                    })
             }
             Kind::Adt(item, args) => {
-                let Some(index) = self.field_index(item, 0, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
+                let Some(index) = self.field_index(item, 0, name)? else {
+                    bail!("no field `{name}` on {}", self.cx.name(item))
+                };
                 let slice = self.cx.types.substs(args).to_vec();
                 Ok((index, self.adt_fields(item, &slice)?[0][index as usize]))
             }
@@ -325,11 +499,15 @@ impl<'a> Infer<'_, 'a> {
     pub fn field_expr(&mut self, expr: ExprId, base: ExprId, name: &str) -> Result<Ty> {
         let found = self.expr(base, None)?;
         let ty = self.field_base(expr, found, name)?;
-        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("no field `{name}` on {}", self.show(ty)) };
+        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else {
+            bail!("no field `{name}` on {}", self.show(ty))
+        };
         if self.cx.item(item).1.kind == ItemKind::Enum {
             bail!("no field `{name}` on enum {}", self.cx.name(item));
         }
-        let Some(index) = self.field_index(item, 0, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
+        let Some(index) = self.field_index(item, 0, name)? else {
+            bail!("no field `{name}` on {}", self.cx.name(item))
+        };
         self.out.fields.insert(expr, index);
         let slice = self.cx.types.substs(args).to_vec();
         let field = self.adt_fields(item, &slice)?[0][index as usize];
@@ -356,24 +534,42 @@ pub fn is_ctor(cx: &super::super::Context<'_>, item: ItemRef) -> bool {
 
 /// The variant and the type arguments of the constructor function at `substs`.
 pub fn ctor_parts<'a>(cx: &super::super::Context<'_>, substs: &'a [Ty]) -> Result<(u32, &'a [Ty])> {
-    let Some((&marker, args)) = substs.split_last() else { bail!("a constructor function with no variant") };
-    let Kind::Value(variant) = *cx.types.kind(marker) else { bail!("a constructor function with no variant") };
+    let Some((&marker, args)) = substs.split_last() else {
+        bail!("a constructor function with no variant")
+    };
+    let Kind::Value(variant) = *cx.types.kind(marker) else {
+        bail!("a constructor function with no variant")
+    };
     Ok((u32::try_from(variant)?, args))
 }
 
 /// The typed form of the constructor function that `ctor_fn` names, which builds the variant from its parameters.
-pub fn ctor_typed(cx: &mut super::super::Context<'_>, item: ItemRef, substs: Substs) -> Result<super::Typed> {
+pub fn ctor_typed(
+    cx: &mut super::super::Context<'_>,
+    item: ItemRef,
+    substs: Substs,
+) -> Result<super::Typed> {
     let slice = cx.types.substs(substs).to_vec();
     let (variant, args) = ctor_parts(cx, &slice)?;
     let all = super::field_types(cx, item, args)?;
     let fields = &all[variant as usize];
     let locals = fields.iter().map(|&ty| super::Local { ty }).collect();
     let ret = cx.types.adt(item, args);
-    Ok(super::Typed { locals, params: (0..fields.len() as u32).collect(), ret: Some(ret), shape: super::Shape::Ctor(variant), ..super::Typed::default() })
+    Ok(super::Typed {
+        locals,
+        params: (0..fields.len() as u32).collect(),
+        ret: Some(ret),
+        shape: super::Shape::Ctor(variant),
+        ..super::Typed::default()
+    })
 }
 
 /// The field types of each variant of the struct, enum or union `item` at `args`.
-pub fn field_types(cx: &mut super::super::Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Fields> {
+pub fn field_types(
+    cx: &mut super::super::Context<'_>,
+    item: ItemRef,
+    args: &[Ty],
+) -> Result<Fields> {
     if args.iter().any(|&a| cx.types.has_var_flag(a)) {
         bail!("cannot compute fields of open inference variable outside Infer");
     }
@@ -393,11 +589,17 @@ pub fn maybe_unsized(cx: &mut super::super::Context<'_>, item: ItemRef) -> Resul
     let def = cx.adt_def(item)?;
     let src = &cx.file(item).source;
     let byte = cx.types.intern(Kind::Prim(crate::names::Primitive::U8));
-    let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
+    let stand_ins = [
+        cx.types.intern(Kind::Value(1)),
+        cx.types.intern(Kind::Slice(byte)),
+        byte,
+    ];
     let args: Vec<Ty> = super::scope::type_params(&def.generics.params)
         .map(|generic| match generic.kind {
             crate::body::sig::GenericKind::Const(_) => stand_ins[0],
-            _ if param_relaxes_sized(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
+            _ if param_relaxes_sized(&def.body, src, &def.generics.predicates, generic) => {
+                stand_ins[1]
+            }
             _ => stand_ins[2],
         })
         .collect();
@@ -405,24 +607,41 @@ pub fn maybe_unsized(cx: &mut super::super::Context<'_>, item: ItemRef) -> Resul
     let ty = cx.types.adt(item, &args);
     match cx.is_unsized(ty) {
         Err(_) if !any_relaxed => Ok(false),
-        Err(_) => super::detached(cx, item, |infer| infer.open_tail_unsized(item, &args, stand_ins[2])),
+        Err(_) => super::detached(cx, item, |infer| {
+            infer.open_tail_unsized(item, &args, stand_ins[2])
+        }),
         found => found,
     }
 }
 
-fn bound_relaxes_sized(arena: &Body, src: &crate::outline::source::Source, bound: &crate::body::Bound) -> bool {
+fn bound_relaxes_sized(
+    arena: &Body,
+    src: &crate::outline::source::Source,
+    bound: &crate::body::Bound,
+) -> bool {
     match *bound {
         crate::body::Bound::Trait { maybe: true, .. } => true,
         crate::body::Bound::Trait { path, .. } => arena
             .list(arena.path(path).segments)
             .last()
-            .is_some_and(|&seg| matches!(src.text(arena.segments[seg as usize].name), "PointeeSized" | "MetaSized")),
+            .is_some_and(|&seg| {
+                matches!(
+                    src.text(arena.segments[seg as usize].name),
+                    "PointeeSized" | "MetaSized"
+                )
+            }),
         _ => false,
     }
 }
 
-pub(in crate::sema) fn body_relaxes_sized(arena: &Body, src: &crate::outline::source::Source) -> bool {
-    arena.bounds.iter().any(|b| bound_relaxes_sized(arena, src, b))
+pub(in crate::sema) fn body_relaxes_sized(
+    arena: &Body,
+    src: &crate::outline::source::Source,
+) -> bool {
+    arena
+        .bounds
+        .iter()
+        .any(|b| bound_relaxes_sized(arena, src, b))
 }
 
 pub(in crate::sema) fn param_relaxes_sized(

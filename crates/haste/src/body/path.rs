@@ -26,7 +26,11 @@ impl Cursor<'_> {
             _ => style,
         };
         let start = self.at;
-        let qself = if self.punct("<") { Some(self.qself()?) } else { None };
+        let qself = if self.punct("<") {
+            Some(self.qself()?)
+        } else {
+            None
+        };
         let global = qself.is_none() && self.eat("::");
         let mut segments = Vec::new();
         if qself.is_some() {
@@ -40,13 +44,22 @@ impl Cursor<'_> {
             self.at += 2;
         }
         let segments = self.list(&segments);
-        Ok(self.push_path(Path { qself, global, start, segments }))
+        Ok(self.push_path(Path {
+            qself,
+            global,
+            start,
+            segments,
+        }))
     }
 
     fn qself(&mut self) -> Result<(super::TyId, Option<PathId>)> {
         self.expect("<")?;
         let ty = self.ty()?;
-        let as_trait = if self.eat_word("as") { Some(self.path(Style::Type)?) } else { None };
+        let as_trait = if self.eat_word("as") {
+            Some(self.path(Style::Type)?)
+        } else {
+            None
+        };
         self.expect(">")?;
         Ok((ty, as_trait))
     }
@@ -93,7 +106,11 @@ impl Cursor<'_> {
         }
         self.group();
         let inputs = self.comma_list(open, |cursor| Ok(cursor.ty()?.0))?;
-        let output = if self.eat("->") { Some(self.ty_no_bounds()?) } else { None };
+        let output = if self.eat("->") {
+            Some(self.ty_no_bounds()?)
+        } else {
+            None
+        };
         Ok(Args::Paren { inputs, output })
     }
 
@@ -115,7 +132,12 @@ impl Cursor<'_> {
     fn generic_arg(&mut self) -> Result<u32> {
         let arg = if let Some(lifetime) = self.lifetime() {
             GenericArg::Lifetime(lifetime)
-        } else if self.kind() == TokenKind::OpenBrace || matches!(self.kind(), TokenKind::Literal { .. }) || self.punct("-") || self.is_word("true") || self.is_word("false") {
+        } else if self.kind() == TokenKind::OpenBrace
+            || matches!(self.kind(), TokenKind::Literal { .. })
+            || self.punct("-")
+            || self.is_word("true")
+            || self.is_word("false")
+        {
             GenericArg::Const(self.const_arg()?)
         } else if is_name(self.kind()) && self.binding_ahead() {
             self.binding()?
@@ -157,18 +179,25 @@ impl Cursor<'_> {
     }
 
     fn assoc_after(&self, at: u32) -> bool {
-        (self.punct_at(at, "=") && !self.punct_at(at, "==")) || (self.punct_at(at, ":") && !self.punct_at(at, "::"))
+        (self.punct_at(at, "=") && !self.punct_at(at, "=="))
+            || (self.punct_at(at, ":") && !self.punct_at(at, "::"))
     }
 
     fn binding(&mut self) -> Result<GenericArg> {
         let name = self.name()?;
-        let args = if self.punct("<") { Some(self.angle()?) } else { None };
+        let args = if self.punct("<") {
+            Some(self.angle()?)
+        } else {
+            None
+        };
         if self.eat(":") {
             let bounds = self.bounds()?;
             return Ok(GenericArg::Constraint { name, bounds });
         }
         self.expect("=")?;
-        let ty = if self.kind() == TokenKind::OpenBrace || matches!(self.kind(), TokenKind::Literal { .. }) {
+        let ty = if self.kind() == TokenKind::OpenBrace
+            || matches!(self.kind(), TokenKind::Literal { .. })
+        {
             let value = self.const_arg()?;
             self.push_ty(Ty::Const(value))
         } else {
@@ -190,7 +219,15 @@ impl Cursor<'_> {
     }
 
     fn bound_start(&self) -> bool {
-        matches!(self.kind(), TokenKind::Lifetime { .. } | TokenKind::OpenParen | TokenKind::OpenBracket) || self.punct("?") || self.punct("~") || self.punct("::") || self.punct("<") || self.punct("$") || is_name(self.kind())
+        matches!(
+            self.kind(),
+            TokenKind::Lifetime { .. } | TokenKind::OpenParen | TokenKind::OpenBracket
+        ) || self.punct("?")
+            || self.punct("~")
+            || self.punct("::")
+            || self.punct("<")
+            || self.punct("$")
+            || is_name(self.kind())
     }
 
     fn bound(&mut self) -> Result<u32> {
@@ -241,6 +278,10 @@ impl Cursor<'_> {
             maybe = true;
         }
         let path = self.path(Style::Type)?;
-        Ok(Bound::Trait { path, maybe, constness })
+        Ok(Bound::Trait {
+            path,
+            maybe,
+            constness,
+        })
     }
 }

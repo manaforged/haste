@@ -30,28 +30,55 @@ pub(super) struct Binaries {
 
 impl Binaries {
     /// The keys of the scripts `scripts`, each a unit and its crate in `outline`; none while no script of them ran before, as a first run keeps nothing.
-    pub(super) fn new(workspace: &Workspace, outline: &Outline, scripts: &[(usize, usize)]) -> Binaries {
+    pub(super) fn new(
+        workspace: &Workspace,
+        outline: &Outline,
+        scripts: &[(usize, usize)],
+    ) -> Binaries {
         if !scripts.iter().any(|&(unit, _)| ran_before(workspace, unit)) {
-            return Binaries { keys: HashMap::default() };
+            return Binaries {
+                keys: HashMap::default(),
+            };
         }
         let target = crate::host_target();
-        let hashes = CrateHashes::compute(outline, crate::substrate::toolchain_key(workspace, &target), crate::substrate::target_hash(&target));
-        Binaries { keys: scripts.iter().map(|&(unit, krate)| (unit, closure_key(outline, &hashes, krate))).collect() }
+        let hashes = CrateHashes::compute(
+            outline,
+            crate::substrate::toolchain_key(workspace, &target),
+            crate::substrate::target_hash(&target),
+        );
+        Binaries {
+            keys: scripts
+                .iter()
+                .map(|&(unit, krate)| (unit, closure_key(outline, &hashes, krate)))
+                .collect(),
+        }
     }
 
     /// What the store holds for the script of `unit` under its key; the caller holds the unit's lock.
     pub(super) fn kept(&self, workspace: &Workspace, unit: usize) -> Kept {
         let dir = store::dir(workspace, unit);
-        let Some(key) = self.keys.get(&unit) else { return Kept::Missing };
+        let Some(key) = self.keys.get(&unit) else {
+            return Kept::Missing;
+        };
         if std::fs::read_to_string(dir.join(KEY)).ok().as_deref() != Some(key_text(*key).as_str()) {
             return Kept::Missing;
         }
         let executable = dir.join(EXECUTABLE);
-        if executable.is_file() { Kept::Executable(executable) } else { Kept::Failed }
+        if executable.is_file() {
+            Kept::Executable(executable)
+        } else {
+            Kept::Failed
+        }
     }
 
     /// Compiles the scripts `scripts`, each a unit and the crate of its `main`, ahead of time into the store in a detached process that outlives this one, so no run waits on the compile; the keeper lets go of this process's unit locks `locks`.
-    pub(super) fn keep_detached(&self, workspace: &Workspace, compilation: &mut Compilation, scripts: &[(usize, usize)], locks: &mut HashMap<usize, store::Lock>) -> anyhow::Result<()> {
+    pub(super) fn keep_detached(
+        &self,
+        workspace: &Workspace,
+        compilation: &mut Compilation,
+        scripts: &[(usize, usize)],
+        locks: &mut HashMap<usize, store::Lock>,
+    ) -> anyhow::Result<()> {
         if scripts.is_empty() {
             return Ok(());
         }
@@ -69,7 +96,14 @@ impl Binaries {
                 locks.clear();
                 let keeper = crate::image::fork_child(|| {
                     detach();
-                    let kept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scripts.iter().filter(|&&(unit, krate)| self.keep(workspace, compilation, unit, krate).is_err()).count()));
+                    let kept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scripts
+                            .iter()
+                            .filter(|&&(unit, krate)| {
+                                self.keep(workspace, compilation, unit, krate).is_err()
+                            })
+                            .count()
+                    }));
                     i32::from(!matches!(kept, Ok(0)))
                 });
                 i32::from(keeper.is_err())
@@ -82,15 +116,27 @@ impl Binaries {
     }
 
     /// Compiles the script of `unit`, whose `main` is in crate `krate`, ahead of time into the store under its key, or marks that it does not compile, holding the unit's lock.
-    fn keep(&self, workspace: &Workspace, compilation: &mut Compilation, unit: usize, krate: usize) -> std::io::Result<()> {
-        let Some(&key) = self.keys.get(&unit) else { return Ok(()) };
+    fn keep(
+        &self,
+        workspace: &Workspace,
+        compilation: &mut Compilation,
+        unit: usize,
+        krate: usize,
+    ) -> std::io::Result<()> {
+        let Some(&key) = self.keys.get(&unit) else {
+            return Ok(());
+        };
         let _lock = store::lock(workspace, unit)?;
         let dir = store::dir(workspace, unit);
         let executable = dir.join(EXECUTABLE);
         store::remove(&dir.join(KEY))?;
         store::remove(&executable)?;
         let staged = store::fresh(&executable);
-        let built = compilation.outline.main(krate).ok_or_else(|| anyhow::anyhow!("no `fn main`")).and_then(|main| crate::build::emit_main(workspace, compilation, main, &staged));
+        let built = compilation
+            .outline
+            .main(krate)
+            .ok_or_else(|| anyhow::anyhow!("no `fn main`"))
+            .and_then(|main| crate::build::emit_main(workspace, compilation, main, &staged));
         match built {
             Ok(()) => std::fs::rename(&staged, &executable)?,
             Err(_) => store::remove(&staged)?,
@@ -102,7 +148,12 @@ impl Binaries {
 /// Detaches this forked keeper from the session and from every pipe and socket it shares with its parent, so neither a terminal signal nor a reader waiting for end of file ties the two together.
 #[cfg(target_os = "linux")]
 fn detach() {
-    let shared: Vec<i32> = std::fs::read_dir("/dev/fd").map(|dir| dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok()).collect()).unwrap_or_default();
+    let shared: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .map(|dir| {
+            dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
     for fd in shared.into_iter().filter(|&fd| fd > 2) {
         // SAFETY: fstat writes only into the zeroed local `stat`; a descriptor that is not open fails without effect.
         let mode = unsafe {
@@ -136,7 +187,10 @@ fn detach() {
 /// Drops the executable of `unit`'s script after it failed, so later runs compile the script on demand and give their own verdict; the caller holds the unit's lock.
 pub(super) fn distrust(workspace: &Workspace, unit: usize) {
     if let Err(error) = store::remove(&store::dir(workspace, unit).join(EXECUTABLE)) {
-        eprintln!("cannot drop the executable of {}'s build script: {error}", super::package_name(workspace, unit));
+        eprintln!(
+            "cannot drop the executable of {}'s build script: {error}",
+            super::package_name(workspace, unit)
+        );
     }
 }
 
@@ -147,9 +201,14 @@ pub(super) fn ran_before(workspace: &Workspace, unit: usize) -> bool {
 
 /// Runs `script` from `executable` with `out` as its standard output, as the image runs a script's `main`; returns the exit status when it cannot start.
 pub(super) fn exec(executable: &Path, script: &Script, out: std::fs::File) -> i32 {
-    let Ok(log) = std::fs::File::create(&script.log) else { return 101 };
+    let Ok(log) = std::fs::File::create(&script.log) else {
+        return 101;
+    };
     let mut cmd = std::process::Command::new(executable);
-    cmd.current_dir(&script.dir).envs(script.vars.iter().map(|(key, value)| (key, value))).stdout(out).stderr(log);
+    cmd.current_dir(&script.dir)
+        .envs(script.vars.iter().map(|(key, value)| (key, value)))
+        .stdout(out)
+        .stderr(log);
     #[cfg(unix)]
     {
         let error = cmd.arg0("build-script-build").exec();

@@ -27,7 +27,9 @@ pub(super) fn eval_consts(func: &Function) -> Vec<Option<i64>> {
         let Some(res) = data.result else { continue };
         match data.op {
             Op::Const(imm) => consts[res.index()] = Some(imm),
-            Op::Convert(kind @ (Convert::Uextend | Convert::Sextend | Convert::Ireduce), x) => pending.push((res, kind, x)),
+            Op::Convert(kind @ (Convert::Uextend | Convert::Sextend | Convert::Ireduce), x) => {
+                pending.push((res, kind, x))
+            }
             _ => {}
         }
     }
@@ -37,7 +39,9 @@ pub(super) fn eval_consts(func: &Function) -> Vec<Option<i64>> {
         }
         let before = pending.len();
         pending.retain(|&(res, kind, x)| {
-            let Some(imm) = consts[x.index()] else { return true };
+            let Some(imm) = consts[x.index()] else {
+                return true;
+            };
             consts[res.index()] = Some(match kind {
                 Convert::Uextend => crate::fold::extend(imm, func.ty(x), false),
                 Convert::Sextend => crate::fold::extend(imm, func.ty(x), true),
@@ -59,10 +63,20 @@ pub(super) const PROMOTE_BOTH_PIECES: usize = 256;
 pub(super) const PROMOTE_ONE_PIECES: usize = 32;
 
 pub(super) fn copy_bytes_limit(consts: &[Option<i64>], len: Value, limit: u32) -> Option<u32> {
-    consts.get(len.index()).copied().flatten().and_then(|n| u32::try_from(n).ok()).filter(|&n| n <= limit)
+    consts
+        .get(len.index())
+        .copied()
+        .flatten()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n <= limit)
 }
 
-fn close_addr(open: &mut [bool], addrs: &[Option<(StackSlot, i64)>], param_roots: &[crate::mem::MemRoot], v: Value) {
+fn close_addr(
+    open: &mut [bool],
+    addrs: &[Option<(StackSlot, i64)>],
+    param_roots: &[crate::mem::MemRoot],
+    v: Value,
+) {
     if let Some((s, _)) = addrs[v.index()] {
         open[s.index()] = false;
     } else if let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(v.index()) {
@@ -70,7 +84,12 @@ fn close_addr(open: &mut [bool], addrs: &[Option<(StackSlot, i64)>], param_roots
     }
 }
 
-fn close_param_root(open: &mut [bool], addrs: &[Option<(StackSlot, i64)>], param_roots: &[crate::mem::MemRoot], v: Value) {
+fn close_param_root(
+    open: &mut [bool],
+    addrs: &[Option<(StackSlot, i64)>],
+    param_roots: &[crate::mem::MemRoot],
+    v: Value,
+) {
     if addrs[v.index()].is_none()
         && let Some(&crate::mem::MemRoot::Slot(s)) = param_roots.get(v.index())
     {
@@ -88,7 +107,11 @@ pub(super) const fn both_copy_bounds(blocks: usize) -> (u32, usize) {
 
 fn check_copy_open(
     open: &mut [bool],
-    (addrs, consts, param_roots): (&[Option<(StackSlot, i64)>], &[Option<i64>], &[crate::mem::MemRoot]),
+    (addrs, consts, param_roots): (
+        &[Option<(StackSlot, i64)>],
+        &[Option<i64>],
+        &[crate::mem::MemRoot],
+    ),
     (to, from, len): (Value, Value, Value),
     both_limit: u32,
 ) {
@@ -111,7 +134,11 @@ fn check_copy_open(
 
 fn update_open_for_inst(
     open: &mut [bool],
-    (addrs, consts, param_roots): (&[Option<(StackSlot, i64)>], &[Option<i64>], &[crate::mem::MemRoot]),
+    (addrs, consts, param_roots): (
+        &[Option<(StackSlot, i64)>],
+        &[Option<i64>],
+        &[crate::mem::MemRoot],
+    ),
     data: &crate::ir::InstData,
     both_limit: u32,
 ) {
@@ -125,15 +152,25 @@ fn update_open_for_inst(
             close_param_root(open, addrs, param_roots, to);
             close_param_root(open, addrs, param_roots, from);
         }
-        Op::Copy(to, from, len) => check_copy_open(open, (addrs, consts, param_roots), (to, from, len), both_limit),
-        Op::Binary(Binary::Iadd | Binary::Isub, a, b) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {
+        Op::Copy(to, from, len) => check_copy_open(
+            open,
+            (addrs, consts, param_roots),
+            (to, from, len),
+            both_limit,
+        ),
+        Op::Binary(Binary::Iadd | Binary::Isub, a, b)
+            if data.result.is_some_and(|r| addrs[r.index()].is_some()) =>
+        {
             if addrs[a.index()].is_some() && addrs[b.index()].is_some() {
                 close_addr(open, addrs, param_roots, a);
                 close_addr(open, addrs, param_roots, b);
             }
         }
-        Op::Convert(Convert::Bitcast, _) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {}
-        Op::Select(c, ..) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => close_addr(open, addrs, param_roots, c),
+        Op::Convert(Convert::Bitcast, _)
+            if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {}
+        Op::Select(c, ..) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {
+            close_addr(open, addrs, param_roots, c)
+        }
         _ => data.op.for_operands(|v| {
             if let Some((s, _)) = addrs[v.index()] {
                 open[s.index()] = false;
@@ -151,7 +188,12 @@ pub(super) fn copy_open_slots(
     let mut open = vec![true; func.slots.len()];
     let both_limit = both_copy_bounds(func.blocks.len()).0;
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        update_open_for_inst(&mut open, (addrs, consts, param_roots), &func.insts[inst.index()], both_limit);
+        update_open_for_inst(
+            &mut open,
+            (addrs, consts, param_roots),
+            &func.insts[inst.index()],
+            both_limit,
+        );
     }
     open
 }
@@ -199,7 +241,13 @@ pub(super) fn expand_copies(
             }
             out.extend_from_slice(&loads);
             out.extend_from_slice(&stores);
-            splits.push(CopySplit { block, original: inst, len, loads, stores });
+            splits.push(CopySplit {
+                block,
+                original: inst,
+                len,
+                loads,
+                stores,
+            });
         }
         func.blocks[block].insts = out;
     }
@@ -212,8 +260,15 @@ fn copy_bases(func: &Function, loads: &[Inst], stores: &[Inst]) -> Option<(Value
     }
     let mut ends = None;
     for (&load, &store) in loads.iter().zip(stores) {
-        let (Op::Load(from, lo), Some(word)) = (&func.insts[load.index()].op, func.insts[load.index()].result) else { return None };
-        let Op::Store(value, to, so) = func.insts[store.index()].op else { return None };
+        let (Op::Load(from, lo), Some(word)) = (
+            &func.insts[load.index()].op,
+            func.insts[load.index()].result,
+        ) else {
+            return None;
+        };
+        let Op::Store(value, to, so) = func.insts[store.index()].op else {
+            return None;
+        };
         if value != word || *lo != so || ends.is_some_and(|pair| pair != (to, *from)) {
             return None;
         }
@@ -227,19 +282,26 @@ pub(super) fn rejoin_copies(func: &mut Function, splits: &[CopySplit]) -> bool {
     for split in splits {
         let total = split.loads.len() + split.stores.len();
         let insts = &func.blocks[split.block].insts;
-        let Some(first) = split.loads.first() else { continue };
+        let Some(first) = split.loads.first() else {
+            continue;
+        };
         let Some(at) = insts.iter().position(|inst| inst == first) else {
             all_rejoined = false;
             continue;
         };
         let intact = insts.get(at..at + split.loads.len()) == Some(split.loads.as_slice())
             && insts.get(at + split.loads.len()..at + total) == Some(split.stores.as_slice());
-        let Some((to, from)) = intact.then(|| copy_bases(func, &split.loads, &split.stores)).flatten() else {
+        let Some((to, from)) = intact
+            .then(|| copy_bases(func, &split.loads, &split.stores))
+            .flatten()
+        else {
             all_rejoined = false;
             continue;
         };
         func.insts[split.original.index()].op = Op::Copy(to, from, split.len);
-        func.blocks[split.block].insts.splice(at..at + total, [split.original]);
+        func.blocks[split.block]
+            .insts
+            .splice(at..at + total, [split.original]);
     }
     all_rejoined
 }
@@ -251,7 +313,12 @@ fn splittable_slices(scan: &Scan) -> Vec<Vec<(i64, Type)>> {
         if scan.escaped[var.slot.index()] {
             continue;
         }
-        let item = (var.offset, var.offset + i64::from(access.ty.bytes()), access.ty, access.var);
+        let item = (
+            var.offset,
+            var.offset + i64::from(access.ty.bytes()),
+            access.ty,
+            access.var,
+        );
         let slot_list = &mut per_slot[var.slot.index()];
         if !slot_list.contains(&item) {
             slot_list.push(item);
@@ -351,7 +418,13 @@ fn emit_word_store_pieces(
     }
 }
 
-fn emit_split_store(func: &mut Function, (inst, val, ty): (Inst, Value, Type), (slot, off): (StackSlot, i64), pieces: &[(i64, Type)], out: &mut Vec<Inst>) {
+fn emit_split_store(
+    func: &mut Function,
+    (inst, val, ty): (Inst, Value, Type),
+    (slot, off): (StackSlot, i64),
+    pieces: &[(i64, Type)],
+    out: &mut Vec<Inst>,
+) {
     if ty == Type::I128 {
         let mid = pieces.partition_point(|&(s_off, _)| s_off < off + 8);
         let (lo_pieces, hi_pieces) = pieces.split_at(mid);
@@ -367,8 +440,22 @@ fn emit_split_store(func: &mut Function, (inst, val, ty): (Inst, Value, Type), (
         out.push(func.add(Op::Binary(Binary::Ushr, val, c64), Some(shifted)));
         let hi64 = func.value(Type::I64);
         out.push(func.add(Op::Convert(Convert::Ireduce, shifted), Some(hi64)));
-        emit_word_store_pieces(func, Some(inst), (lo64, Type::I64), (slot, off), lo_pieces, out);
-        emit_word_store_pieces(func, None, (hi64, Type::I64), (slot, off + 8), hi_pieces, out);
+        emit_word_store_pieces(
+            func,
+            Some(inst),
+            (lo64, Type::I64),
+            (slot, off),
+            lo_pieces,
+            out,
+        );
+        emit_word_store_pieces(
+            func,
+            None,
+            (hi64, Type::I64),
+            (slot, off + 8),
+            hi_pieces,
+            out,
+        );
         return;
     }
     let Some(base_ty) = int_for_bytes(ty.bytes()) else {
@@ -442,15 +529,27 @@ fn build_word_load(
     acc
 }
 
-fn emit_split_load(func: &mut Function, (inst, ty): (Inst, Type), (slot, off): (StackSlot, i64), pieces: &[(i64, Type)], out: &mut Vec<Inst>) {
+fn emit_split_load(
+    func: &mut Function,
+    (inst, ty): (Inst, Type),
+    (slot, off): (StackSlot, i64),
+    pieces: &[(i64, Type)],
+    out: &mut Vec<Inst>,
+) {
     if ty == Type::I128 {
         let mid = pieces.partition_point(|&(s_off, _)| s_off < off + 8);
         let (lo_pieces, hi_pieces) = pieces.split_at(mid);
-        let Some(lo64) = (!lo_pieces.is_empty()).then(|| build_word_load(func, None, Type::I64, (slot, off), lo_pieces, out)).flatten() else {
+        let Some(lo64) = (!lo_pieces.is_empty())
+            .then(|| build_word_load(func, None, Type::I64, (slot, off), lo_pieces, out))
+            .flatten()
+        else {
             out.push(inst);
             return;
         };
-        let Some(hi64) = (!hi_pieces.is_empty()).then(|| build_word_load(func, None, Type::I64, (slot, off + 8), hi_pieces, out)).flatten() else {
+        let Some(hi64) = (!hi_pieces.is_empty())
+            .then(|| build_word_load(func, None, Type::I64, (slot, off + 8), hi_pieces, out))
+            .flatten()
+        else {
             out.push(inst);
             return;
         };
@@ -468,7 +567,9 @@ fn emit_split_load(func: &mut Function, (inst, ty): (Inst, Type), (slot, off): (
         }
         return;
     }
-    if let Some(packed) = build_word_load(func, Some((inst, true)), base_ty, (slot, off), pieces, out) {
+    if let Some(packed) =
+        build_word_load(func, Some((inst, true)), base_ty, (slot, off), pieces, out)
+    {
         func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, packed);
         out.push(inst);
     } else {
@@ -492,7 +593,10 @@ pub(super) fn split(func: &mut Function, scan: &Scan) -> bool {
                 continue;
             };
             let ty = func.ty(touch.kind.value());
-            let Some(off) = touch.offset.filter(|_| is_splittable(ty) && !slot_slices[touch.slot.index()].is_empty()) else {
+            let Some(off) = touch
+                .offset
+                .filter(|_| is_splittable(ty) && !slot_slices[touch.slot.index()].is_empty())
+            else {
                 out.push(inst);
                 continue;
             };
@@ -502,7 +606,9 @@ pub(super) fn split(func: &mut Function, scan: &Scan) -> bool {
                 slot_slices[touch.slot.index()]
                     .iter()
                     .copied()
-                    .filter(|&(s_off, s_ty)| s_off >= off && s_off + i64::from(s_ty.bytes()) <= end),
+                    .filter(|&(s_off, s_ty)| {
+                        s_off >= off && s_off + i64::from(s_ty.bytes()) <= end
+                    }),
             );
             let mut cursor = off;
             let covered = !pieces.is_empty()
@@ -517,8 +623,12 @@ pub(super) fn split(func: &mut Function, scan: &Scan) -> bool {
                 continue;
             }
             match touch.kind {
-                Kind::Store(val) => emit_split_store(func, (inst, val, ty), (touch.slot, off), &pieces, &mut out),
-                Kind::Load(_) => emit_split_load(func, (inst, ty), (touch.slot, off), &pieces, &mut out),
+                Kind::Store(val) => {
+                    emit_split_store(func, (inst, val, ty), (touch.slot, off), &pieces, &mut out)
+                }
+                Kind::Load(_) => {
+                    emit_split_load(func, (inst, ty), (touch.slot, off), &pieces, &mut out)
+                }
             }
             changed = true;
         }

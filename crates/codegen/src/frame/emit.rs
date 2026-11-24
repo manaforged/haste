@@ -3,7 +3,12 @@ use crate::ir::{Function, Inst, Op, Value};
 use super::Emitter;
 
 /// Returns `(frame_offset, width_bytes)` when `inst` stores constant integer zero into a stack slot.
-pub(crate) fn stack_zero_store(func: &Function, slots: &[i32], inst: Inst, const_of: impl FnOnce(Value) -> Option<i64>) -> Option<(i32, u32)> {
+pub(crate) fn stack_zero_store(
+    func: &Function,
+    slots: &[i32],
+    inst: Inst,
+    const_of: impl FnOnce(Value) -> Option<i64>,
+) -> Option<(i32, u32)> {
     let Op::StackStore(val, slot, off) = func.insts[inst.index()].op else {
         return None;
     };
@@ -44,7 +49,11 @@ fn emit_zero_interval<'a, E: Emitter<'a>>(emit: &mut E, start: i32, stop: i32) {
     }
 }
 
-fn try_emit_zero_run<'a, E: Emitter<'a>>(emit: &mut E, insts: &[Inst], start: usize) -> Option<usize> {
+fn try_emit_zero_run<'a, E: Emitter<'a>>(
+    emit: &mut E,
+    insts: &[Inst],
+    start: usize,
+) -> Option<usize> {
     let first = emit.zero_stack_store(insts[start])?;
     let func = emit.func();
     let mut runs = vec![(first.0, first.0 + first.1 as i32)];
@@ -52,7 +61,8 @@ fn try_emit_zero_run<'a, E: Emitter<'a>>(emit: &mut E, insts: &[Inst], start: us
     while k < insts.len() {
         let inst = insts[k];
         let data = &func.insts[inst.index()];
-        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
+        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res))
+        {
             k += 1;
             continue;
         }
@@ -80,7 +90,10 @@ fn try_emit_zero_run<'a, E: Emitter<'a>>(emit: &mut E, insts: &[Inst], start: us
     Some(k)
 }
 
-pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: crate::ir::Block) -> Result<(), String> {
+pub(crate) fn emit_body<'a, E: Emitter<'a>>(
+    emit: &mut E,
+    block: crate::ir::Block,
+) -> Result<(), String> {
     emit.clear_flags();
     let func = emit.func();
     let insts = &func.blocks[block.index()].insts;
@@ -88,12 +101,16 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: crate::ir::Bloc
     while k < insts.len() {
         let inst = insts[k];
         let data = &func.insts[inst.index()];
-        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
+        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res))
+        {
             k += 1;
             continue;
         }
         if ahead <= k {
-            ahead = insts[k..].iter().position(|i| func.insts[i.index()].loc != 0).map_or(insts.len(), |at| k + at);
+            ahead = insts[k..]
+                .iter()
+                .position(|i| func.insts[i.index()].loc != 0)
+                .map_or(insts.len(), |at| k + at);
             loc = insts.get(ahead).map_or(loc, |i| func.insts[i.index()].loc);
             if loc == 0 {
                 loc = func.home_loc();
@@ -110,7 +127,10 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: crate::ir::Bloc
         emit.inst(inst)?;
         k += 1;
     }
-    if !insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator()) {
+    if !insts
+        .last()
+        .is_some_and(|inst| func.insts[inst.index()].op.is_terminator())
+    {
         emit.trap();
     }
     Ok(())

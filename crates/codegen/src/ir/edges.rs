@@ -40,7 +40,9 @@ impl Op {
             Op::Jump(block, _) => (Some(*block), None, &[][..]),
             Op::Brif(_, then, _, otherwise, _) => (Some(*then), Some(*otherwise), &[][..]),
             Op::BrTable(_, default, targets) => (Some(*default), None, &targets[..]),
-            Op::TryCall { normal, handler, .. } => (Some(*normal), Some(*handler), &[][..]),
+            Op::TryCall {
+                normal, handler, ..
+            } => (Some(*normal), Some(*handler), &[][..]),
             _ => (None, None, &[][..]),
         };
         first.into_iter().chain(second).chain(slice.iter().copied())
@@ -58,7 +60,9 @@ impl Op {
                 *default = f(*default);
                 targets.iter_mut().for_each(|target| *target = f(*target));
             }
-            Op::TryCall { normal, handler, .. } => {
+            Op::TryCall {
+                normal, handler, ..
+            } => {
                 *normal = f(*normal);
                 *handler = f(*handler);
             }
@@ -105,8 +109,15 @@ impl Op {
 
 impl Function {
     /// Calls `f` with the mutable argument list of each branch edge from `pred` to `target`.
-    pub(crate) fn for_edge_args_mut(&mut self, pred: Block, target: Block, mut f: impl FnMut(&mut Vec<Value>)) {
-        let Some(&last) = self.blocks[pred.index()].insts.last() else { return };
+    pub(crate) fn for_edge_args_mut(
+        &mut self,
+        pred: Block,
+        target: Block,
+        mut f: impl FnMut(&mut Vec<Value>),
+    ) {
+        let Some(&last) = self.blocks[pred.index()].insts.last() else {
+            return;
+        };
         self.insts[last.index()].op.for_edges_mut(|to, args| {
             if *to == target {
                 f(args);

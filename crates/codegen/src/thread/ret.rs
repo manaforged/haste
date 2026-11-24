@@ -19,22 +19,37 @@ pub(super) fn open_returns(func: &mut Function, pinned: &[bool]) -> Vec<Opened> 
     let mut opened = Vec::new();
     for index in 0..func.blocks.len() {
         let ret = Block(index as u32);
-        let [inst] = func.blocks[index].insts[..] else { continue };
-        let Op::Return(ref vals) = func.insts[inst.index()].op else { continue };
+        let [inst] = func.blocks[index].insts[..] else {
+            continue;
+        };
+        let Op::Return(ref vals) = func.insts[inst.index()].op else {
+            continue;
+        };
         let mut outside: Vec<Value> = Vec::new();
         for &value in vals {
             if owner[value.index()] != Some(ret) && !outside.contains(&value) {
                 outside.push(value);
             }
         }
-        let fed = outside.iter().any(|value| owner[value.index()].is_some_and(|block| super::dispatches(func, pinned, block)));
+        let fed = outside.iter().any(|value| {
+            owner[value.index()].is_some_and(|block| super::dispatches(func, pinned, block))
+        });
         let mut preds = cfg.preds_of(ret).to_vec();
         preds.sort_unstable();
         preds.dedup();
-        if pinned[index] || !fed || preds.is_empty() || preds.iter().any(|&pred| !matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..)))) {
+        if pinned[index]
+            || !fed
+            || preds.is_empty()
+            || preds
+                .iter()
+                .any(|&pred| !matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..))))
+        {
             continue;
         }
-        let fresh: Vec<Value> = outside.iter().map(|&value| func.value(func.ty(value))).collect();
+        let fresh: Vec<Value> = outside
+            .iter()
+            .map(|&value| func.value(func.ty(value)))
+            .collect();
         func.blocks[index].params.extend(&fresh);
         if let Op::Return(vals) = &mut func.insts[inst.index()].op {
             for value in vals.iter_mut() {
@@ -46,7 +61,11 @@ pub(super) fn open_returns(func: &mut Function, pinned: &[bool]) -> Vec<Opened> 
         for pred in preds {
             func.for_edge_args_mut(pred, ret, |args| args.extend(&outside));
         }
-        opened.push(Opened { block: ret, outside, fresh });
+        opened.push(Opened {
+            block: ret,
+            outside,
+            fresh,
+        });
     }
     if !opened.is_empty() {
         func.bump_cfg();
@@ -60,18 +79,28 @@ pub(super) fn close_returns(func: &mut Function, opened: &[Opened]) -> bool {
     let mut changed = false;
     for open in opened {
         let index = open.block.index();
-        let [inst] = func.blocks[index].insts[..] else { continue };
+        let [inst] = func.blocks[index].insts[..] else {
+            continue;
+        };
         let mut preds = cfg.preds_of(open.block).to_vec();
         preds.sort_unstable();
         preds.dedup();
         let base = func.blocks[index].params.len() - open.fresh.len();
         for (at, (&fresh, &outside)) in open.fresh.iter().zip(&open.outside).enumerate().rev() {
             let slot = base + at;
-            if func.blocks[index].params.get(slot) != Some(&fresh) || !preds.iter().all(|&pred| edge_args(func, pred, open.block).iter().all(|args| args.get(slot) == Some(&outside))) {
+            if func.blocks[index].params.get(slot) != Some(&fresh)
+                || !preds.iter().all(|&pred| {
+                    edge_args(func, pred, open.block)
+                        .iter()
+                        .all(|args| args.get(slot) == Some(&outside))
+                })
+            {
                 continue;
             }
             func.blocks[index].params.remove(slot);
-            func.insts[inst.index()].op.map_operands(|value| if value == fresh { outside } else { value });
+            func.insts[inst.index()]
+                .op
+                .map_operands(|value| if value == fresh { outside } else { value });
             for &pred in &preds {
                 func.for_edge_args_mut(pred, open.block, |args| {
                     args.remove(slot);

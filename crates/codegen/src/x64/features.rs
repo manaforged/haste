@@ -21,7 +21,13 @@ impl Features {
     /// The host CPU's features, detected once; `HASTE_X64_BASELINE=1` reports none.
     pub fn host() -> Self {
         static HOST: OnceLock<Features> = OnceLock::new();
-        *HOST.get_or_init(|| if std::env::var_os(BASELINE).is_some_and(|value| value == "1") { Self::default() } else { detect() })
+        *HOST.get_or_init(|| {
+            if std::env::var_os(BASELINE).is_some_and(|value| value == "1") {
+                Self::default()
+            } else {
+                detect()
+            }
+        })
     }
 }
 

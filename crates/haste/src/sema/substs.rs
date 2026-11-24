@@ -49,11 +49,15 @@ impl SubstsPool {
                 if let Some(cached) = self.singles.get(ty.0 as usize) {
                     return Substs(cached);
                 }
-                let id = Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))));
+                let id = Substs(handle(
+                    self.inner.intern(slice, |slice, _| Arc::from(slice)),
+                ));
                 self.singles.set(ty.0 as usize, id.0);
                 id
             }
-            _ => Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice)))),
+            _ => Substs(handle(
+                self.inner.intern(slice, |slice, _| Arc::from(slice)),
+            )),
         }
     }
 
@@ -71,7 +75,11 @@ impl SubstsPool {
         let slice = self.get(id);
         if let &[ty] = slice {
             let mapped = f(ty);
-            return if mapped == ty { id } else { self.intern(&[mapped]) };
+            return if mapped == ty {
+                id
+            } else {
+                self.intern(&[mapped])
+            };
         }
         for (idx, &ty) in slice.iter().enumerate() {
             let mapped = f(ty);
@@ -80,7 +88,8 @@ impl SubstsPool {
                     let mut buf = [Ty::NONE; 8];
                     buf[..idx].copy_from_slice(&slice[..idx]);
                     buf[idx] = mapped;
-                    for (slot, &rest) in buf[idx + 1..slice.len()].iter_mut().zip(&slice[idx + 1..]) {
+                    for (slot, &rest) in buf[idx + 1..slice.len()].iter_mut().zip(&slice[idx + 1..])
+                    {
                         *slot = f(rest);
                     }
                     return self.intern(&buf[..slice.len()]);
@@ -149,7 +158,9 @@ impl ItemListPool {
         if slice.is_empty() {
             return ItemList::EMPTY;
         }
-        ItemList(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))))
+        ItemList(handle(
+            self.inner.intern(slice, |slice, _| Arc::from(slice)),
+        ))
     }
 
     /// The slice of item references that `id` names.
@@ -212,7 +223,11 @@ impl<K: Ord, V> PackedMap<K, V> {
 
     /// Wraps an already strictly sorted vector of pairs without re-sorting.
     pub fn from_sorted(vec: Vec<(K, V)>) -> Self {
-        if vec.is_empty() { Self::default() } else { Self(vec.into_boxed_slice()) }
+        if vec.is_empty() {
+            Self::default()
+        } else {
+            Self(vec.into_boxed_slice())
+        }
     }
 
     /// The value stored under `key`, found by binary search.
@@ -229,7 +244,10 @@ impl<K: Ord, V> PackedMap<K, V> {
 
 impl<K: Copy, V> PackedMap<K, V> {
     /// Maps values in sorted order without re-sorting keys.
-    pub fn try_map_values<U, E>(&self, mut f: impl FnMut(&V) -> Result<U, E>) -> Result<PackedMap<K, U>, E> {
+    pub fn try_map_values<U, E>(
+        &self,
+        mut f: impl FnMut(&V) -> Result<U, E>,
+    ) -> Result<PackedMap<K, U>, E> {
         if self.0.is_empty() {
             return Ok(PackedMap::default());
         }

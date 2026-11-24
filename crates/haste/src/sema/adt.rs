@@ -2,7 +2,10 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use rustc_abi::{Align, FieldsShape, Integer, IntegerType, LayoutCalculator, NicheOptimizations, ReprFlags, ReprOptions, TargetDataLayout};
+use rustc_abi::{
+    Align, FieldsShape, Integer, IntegerType, LayoutCalculator, NicheOptimizations, ReprFlags,
+    ReprOptions, TargetDataLayout,
+};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_index::{Idx, IndexVec};
 
@@ -20,7 +23,20 @@ use super::ty::Kind;
 
 const REPR_INTS: [(&str, Primitive); 12] = {
     use Primitive::*;
-    [("u8", U8), ("u16", U16), ("u32", U32), ("u64", U64), ("u128", U128), ("usize", Usize), ("i8", I8), ("i16", I16), ("i32", I32), ("i64", I64), ("i128", I128), ("isize", Isize)]
+    [
+        ("u8", U8),
+        ("u16", U16),
+        ("u32", U32),
+        ("u64", U64),
+        ("u128", U128),
+        ("usize", Usize),
+        ("i8", I8),
+        ("i16", I16),
+        ("i32", I32),
+        ("i64", I64),
+        ("i128", I128),
+        ("isize", Isize),
+    ]
 };
 
 impl<'a> Context<'a> {
@@ -33,7 +49,10 @@ impl<'a> Context<'a> {
         let primitive = self.discriminant_primitive(item);
         let found: Arc<[i128]> = super::infer::discriminants(self, item, primitive)?.into();
         if self.quiet_mark() == before {
-            self.store.lookups.discriminants.insert(item, Arc::clone(&found));
+            self.store
+                .lookups
+                .discriminants
+                .insert(item, Arc::clone(&found));
         }
         Ok(found)
     }
@@ -51,7 +70,15 @@ impl<'a> Context<'a> {
         }
         self.store.lookups.reprs.get_or_insert_with(item, || {
             let mut repr = ReprOptions::default();
-            read_repr_words(src, repr_words(src, &entry.attrs, &self.outline.crates[item.krate as usize].env), &mut repr);
+            read_repr_words(
+                src,
+                repr_words(
+                    src,
+                    &entry.attrs,
+                    &self.outline.crates[item.krate as usize].env,
+                ),
+                &mut repr,
+            );
             repr
         })
     }
@@ -63,11 +90,19 @@ impl<'a> Context<'a> {
             return Vec::new();
         }
         let named = entry.attrs.iter().find_map(|attr| match *attr {
-            Attr::Other(at) if src.text(at) == "rustc_legacy_const_generics" && src.kind(at + 1) == rustc_lexer::TokenKind::OpenParen => Some(at),
+            Attr::Other(at)
+                if src.text(at) == "rustc_legacy_const_generics"
+                    && src.kind(at + 1) == rustc_lexer::TokenKind::OpenParen =>
+            {
+                Some(at)
+            }
             _ => None,
         });
         let Some(at) = named else { return Vec::new() };
-        split_commas(src, at + 2, src.pair(at + 1)).into_iter().filter_map(|(from, _)| src.text(from).parse().ok()).collect()
+        split_commas(src, at + 2, src.pair(at + 1))
+            .into_iter()
+            .filter_map(|(from, _)| src.text(from).parse().ok())
+            .collect()
     }
 
     /// The value of `#[lang = "..."]` on `item`.
@@ -77,10 +112,22 @@ impl<'a> Context<'a> {
             if entry.attrs.is_empty() {
                 return None;
             }
-            let at = active_attr_at(&self.outline.crates[item.krate as usize].env, src, &entry.attrs, "lang")?;
+            let at = active_attr_at(
+                &self.outline.crates[item.krate as usize].env,
+                src,
+                &entry.attrs,
+                "lang",
+            )?;
             return Some(src.text(at + 2).trim_matches('"'));
         }
-        let langs = self.lang_map.get_or_init(|| Arc::clone(self.store.lookups.lang_items.get_or_init(|| Arc::new(self.build_lang_map()))));
+        let langs = self.lang_map.get_or_init(|| {
+            Arc::clone(
+                self.store
+                    .lookups
+                    .lang_items
+                    .get_or_init(|| Arc::new(self.build_lang_map())),
+            )
+        });
         if !langs.may_contain(item) {
             return None;
         }
@@ -94,9 +141,21 @@ impl<'a> Context<'a> {
             for (file, entry) in tree.files.iter().enumerate() {
                 for &(at, bits) in &entry.items.marks {
                     if bits & lang_bit != 0
-                        && let Some(attr_tok) = active_attr_at(&tree.env, &entry.source, &entry.items.items[at as usize].attrs, "lang")
+                        && let Some(attr_tok) = active_attr_at(
+                            &tree.env,
+                            &entry.source,
+                            &entry.items.items[at as usize].attrs,
+                            "lang",
+                        )
                     {
-                        map.insert(ItemRef { krate: krate as u32, file: file as u32, item: at }, entry.source.text(attr_tok + 2).trim_matches('"').into());
+                        map.insert(
+                            ItemRef {
+                                krate: krate as u32,
+                                file: file as u32,
+                                item: at,
+                            },
+                            entry.source.text(attr_tok + 2).trim_matches('"').into(),
+                        );
                     }
                 }
             }
@@ -107,9 +166,15 @@ impl<'a> Context<'a> {
     /// The symbol that the foreign `item` links to: its `#[link_name]` with escapes read and without the leading `\u{1}` that asks for the name verbatim, else its own name.
     pub fn symbol_name(&self, item: ItemRef) -> Option<String> {
         let (src, entry) = self.item(item);
-        let Some(at) = self.attr_at(item, "link_name") else { return entry.name.map(|at| src.text(at).to_owned()) };
+        let Some(at) = self.attr_at(item, "link_name") else {
+            return entry.name.map(|at| src.text(at).to_owned());
+        };
         let text = src.literal_text(at + 2).ok().flatten()?;
-        Some(text.strip_prefix('\u{1}').map(str::to_owned).unwrap_or(text))
+        Some(
+            text.strip_prefix('\u{1}')
+                .map(str::to_owned)
+                .unwrap_or(text),
+        )
     }
 
     /// The value of `#[inline]` on `item`, returning `Some("")` for plain `#[inline]` without scanning attributes.
@@ -173,7 +238,11 @@ impl<'a> Context<'a> {
             return None;
         }
         let marks = &self.file(item).items.marks;
-        Some(marks.binary_search_by_key(&item.item, |(at, _)| *at).map_or(0, |pos| marks[pos].1))
+        Some(
+            marks
+                .binary_search_by_key(&item.item, |(at, _)| *at)
+                .map_or(0, |pos| marks[pos].1),
+        )
     }
 
     fn has_mark(&self, item: ItemRef, key: &str) -> bool {
@@ -216,7 +285,10 @@ impl<'a> Context<'a> {
             }
             bits & MARK_CFG_ATTR == 0
         } else {
-            !entry.attrs.iter().any(|attr| matches!(attr, Attr::CfgAttr(..)))
+            !entry
+                .attrs
+                .iter()
+                .any(|attr| matches!(attr, Attr::CfgAttr(..)))
         };
         if no_cfg {
             return entry.attrs.iter().find_map(|attr| match *attr {
@@ -226,10 +298,18 @@ impl<'a> Context<'a> {
         }
         let active = self.store.lookups.attrs.get_or_insert_with(item, || {
             let mut out = Vec::new();
-            collect_active_attrs(&self.outline.crates[item.krate as usize].env, &entry.attrs, &mut out);
+            collect_active_attrs(
+                &self.outline.crates[item.krate as usize].env,
+                &entry.attrs,
+                &mut out,
+            );
             ActiveAttrs::from_vec(out)
         });
-        active.as_slice().iter().copied().find(|&at| src.text(at) == key)
+        active
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|&at| src.text(at) == key)
     }
 
     /// The layout of the struct, enum or union `item` at `args`.
@@ -238,10 +318,21 @@ impl<'a> Context<'a> {
         let sized = !super::infer::maybe_unsized(self, item)?;
         let mut layouts = Vec::with_capacity(fields.len());
         for variant in fields.iter() {
-            layouts.push(variant.iter().map(|ty| self.layout(*ty)).collect::<Result<Vec<_>>>()?);
+            layouts.push(
+                variant
+                    .iter()
+                    .map(|ty| self.layout(*ty))
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
-        let refs: Vec<Vec<&Layout>> = layouts.iter().map(|variant| variant.iter().map(|layout| &**layout).collect()).collect();
-        let variants: IndexVec<Variant, IndexVec<Field, &&Layout>> = refs.iter().map(|variant| variant.iter().collect()).collect();
+        let refs: Vec<Vec<&Layout>> = layouts
+            .iter()
+            .map(|variant| variant.iter().map(|layout| &**layout).collect())
+            .collect();
+        let variants: IndexVec<Variant, IndexVec<Field, &&Layout>> = refs
+            .iter()
+            .map(|variant| variant.iter().collect())
+            .collect();
         let dl = super::layout::target()?;
         let calc = LayoutCalculator::new(dl);
         let repr = self.repr(item);
@@ -251,12 +342,18 @@ impl<'a> Context<'a> {
                 && let Kind::Array(elem_ty, len_ty) = *self.types.kind(fields[0][0])
             {
                 let elt_layout = self.layout(elem_ty)?;
-                let Some(count) = self.types.len(len_ty) else { bail!("simd array {} has unknown length", self.name(item)) };
-                return calc.layout_of_simd_type(elt_layout, count, repr.packed()).map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)));
+                let Some(count) = self.types.len(len_ty) else {
+                    bail!("simd array {} has unknown length", self.name(item))
+                };
+                return calc
+                    .layout_of_simd_type(elt_layout, count, repr.packed())
+                    .map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)));
             }
             let k = fields[0].len();
             let elt_layout = &layouts[0][0];
-            let mut out = calc.layout_of_simd_type(elt_layout, k as u64, repr.packed()).map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))?;
+            let mut out = calc
+                .layout_of_simd_type(elt_layout, k as u64, repr.packed())
+                .map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))?;
             out.fields = FieldsShape::Arbitrary {
                 offsets: (0..k).map(|i| elt_layout.size * (i as u64)).collect(),
                 in_memory_order: (0..k).map(Field::new).collect(),
@@ -266,11 +363,30 @@ impl<'a> Context<'a> {
         let result = match kind {
             ItemKind::Union => calc.layout_of_union(&repr, &variants),
             _ => {
-                let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Arc::from([0]) };
-                let niches = if matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned")) { NicheOptimizations::Disabled } else { NicheOptimizations::Enabled };
+                let discriminants = if kind == ItemKind::Enum {
+                    self.discriminants(item)?
+                } else {
+                    Arc::from([0])
+                };
+                let niches = if matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned")) {
+                    NicheOptimizations::Disabled
+                } else {
+                    NicheOptimizations::Enabled
+                };
                 let bits = Integer::from_attr(dl, repr.discr_type()).size();
-                let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), bits.truncate(value as u128)));
-                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, niches, |min, max| discr_range(dl, &repr, min.start, max.last), tagged, sized)
+                let tagged = discriminants
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &value)| (rustc_index::Idx::new(at), bits.truncate(value as u128)));
+                calc.layout_of_struct_or_enum(
+                    &repr,
+                    &variants,
+                    kind == ItemKind::Enum,
+                    niches,
+                    |min, max| discr_range(dl, &repr, min.start, max.last),
+                    tagged,
+                    sized,
+                )
             }
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))
@@ -286,15 +402,27 @@ fn read_repr_words(src: &Source, words: Vec<u32>, repr: &mut ReprOptions) {
             "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
             "packed" => repr.pack = Some(repr_align(src, from).unwrap_or(Align::ONE)),
             "align" => repr.align = repr_align(src, from).or(repr.align),
-            word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
+            word => {
+                repr.int = REPR_INTS
+                    .iter()
+                    .find(|(name, _)| *name == word)
+                    .map(|(_, int)| integer_type(*int))
+                    .or(repr.int)
+            }
         }
     }
 }
 
-fn visit_active_attrs<T>(env: &Env, attrs: &[Attr], f: &mut impl FnMut(u32) -> ControlFlow<T>) -> ControlFlow<T> {
+fn visit_active_attrs<T>(
+    env: &Env,
+    attrs: &[Attr],
+    f: &mut impl FnMut(u32) -> ControlFlow<T>,
+) -> ControlFlow<T> {
     for attr in attrs {
         match attr {
-            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => visit_active_attrs(env, inner, f)?,
+            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => {
+                visit_active_attrs(env, inner, f)?
+            }
             &Attr::Other(at) => f(at)?,
             _ => {}
         }
@@ -310,7 +438,13 @@ fn collect_active_attrs(env: &Env, attrs: &[Attr], out: &mut Vec<u32>) {
 }
 
 fn active_attr_at(env: &Env, src: &Source, attrs: &[Attr], key: &str) -> Option<u32> {
-    match visit_active_attrs(env, attrs, &mut |at| if src.text(at) == key { ControlFlow::Break(at) } else { ControlFlow::Continue(()) }) {
+    match visit_active_attrs(env, attrs, &mut |at| {
+        if src.text(at) == key {
+            ControlFlow::Break(at)
+        } else {
+            ControlFlow::Continue(())
+        }
+    }) {
         ControlFlow::Break(at) => Some(at),
         ControlFlow::Continue(()) => None,
     }
@@ -327,14 +461,22 @@ fn repr_align(src: &crate::outline::source::Source, at: u32) -> Option<Align> {
 
 /// The integer type that the `#[repr]` integer `int` names.
 pub(super) fn repr_primitive(int: IntegerType) -> Primitive {
-    REPR_INTS.iter().map(|(_, primitive)| *primitive).find(|primitive| integer_type(*primitive) == int).unwrap_or(Primitive::Isize)
+    REPR_INTS
+        .iter()
+        .map(|(_, primitive)| *primitive)
+        .find(|primitive| integer_type(*primitive) == int)
+        .unwrap_or(Primitive::Isize)
 }
 
 fn integer_type(primitive: Primitive) -> IntegerType {
     let (bits, signed) = super::ty::int_info(primitive).expect("repr integers are integers");
     match primitive {
         Primitive::Usize | Primitive::Isize => IntegerType::Pointer(signed),
-        _ => IntegerType::Fixed(Integer::from_size(rustc_abi::Size::from_bits(bits)).expect("a repr integer has a size"), signed),
+        _ => IntegerType::Fixed(
+            Integer::from_size(rustc_abi::Size::from_bits(bits))
+                .expect("a repr integer has a size"),
+            signed,
+        ),
     }
 }
 
@@ -345,7 +487,14 @@ fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: u128) 
         None => {}
     }
     let unsigned = Integer::fit_unsigned(max);
-    let signed = std::cmp::max(Integer::fit_signed(min), Integer::fit_signed(i128::try_from(max).unwrap_or(i128::MAX)));
+    let signed = std::cmp::max(
+        Integer::fit_signed(min),
+        Integer::fit_signed(i128::try_from(max).unwrap_or(i128::MAX)),
+    );
     let at_least = if repr.c() { Integer::I32 } else { Integer::I8 };
-    if min >= 0 { (std::cmp::max(unsigned, at_least), false) } else { (std::cmp::max(signed, at_least), true) }
+    if min >= 0 {
+        (std::cmp::max(unsigned, at_least), false)
+    } else {
+        (std::cmp::max(signed, at_least), true)
+    }
 }

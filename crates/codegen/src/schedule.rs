@@ -15,7 +15,10 @@ fn verify_stage(func: &Function, target: &crate::Target, stage: &str) {
 }
 
 use crate::ir::{Binary, Block, Domain, Function, Inst, IntCC, Op, Type, Value};
-use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
+use crate::{
+    Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch,
+    tailrec, thread, unroll,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -96,32 +99,87 @@ struct Plan<'t> {
 static INIT: &[Pass] = &[Pass::Fill, Pass::Fold, Pass::Merge];
 
 static QUICK_RULES: &[Rule] = &[
-    Rule { pass: Pass::Promote, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
-    Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
-    Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule {
+        pass: Pass::Promote,
+        reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::Fold,
+        reads: Domain::VALUES.union(Domain::CFG),
+    },
+    Rule {
+        pass: Pass::Merge,
+        reads: Domain::CFG.union(Domain::VALUES),
+    },
 ];
 static QUICK_FINISH: &[Pass] = &[Pass::Returns];
 
 static FULL_RULES: &[Rule] = &[
-    Rule { pass: Pass::Fill, reads: Domain::CFG.union(Domain::VALUES) },
-    Rule { pass: Pass::Promote, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
-    Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
-    Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
-    Rule { pass: Pass::Loads, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
-    Rule { pass: Pass::Cse, reads: Domain::CFG.union(Domain::VALUES) },
-    Rule { pass: Pass::Thread, reads: Domain::CFG.union(Domain::VALUES) },
-    Rule { pass: Pass::IfConv, reads: Domain::CFG.union(Domain::VALUES) },
-    Rule { pass: Pass::Rotate, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
-    Rule { pass: Pass::Unroll, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
-    Rule { pass: Pass::Licm, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
-    Rule { pass: Pass::Lsr, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule {
+        pass: Pass::Fill,
+        reads: Domain::CFG.union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::Promote,
+        reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::Fold,
+        reads: Domain::VALUES.union(Domain::CFG),
+    },
+    Rule {
+        pass: Pass::Merge,
+        reads: Domain::CFG.union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::Loads,
+        reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::Cse,
+        reads: Domain::CFG.union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::Thread,
+        reads: Domain::CFG.union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::IfConv,
+        reads: Domain::CFG.union(Domain::VALUES),
+    },
+    Rule {
+        pass: Pass::Rotate,
+        reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM),
+    },
+    Rule {
+        pass: Pass::Unroll,
+        reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM),
+    },
+    Rule {
+        pass: Pass::Licm,
+        reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM),
+    },
+    Rule {
+        pass: Pass::Lsr,
+        reads: Domain::CFG.union(Domain::VALUES),
+    },
 ];
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
 static INLINE_FINISH: &[Pass] = &[Pass::Returns];
 
-fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort, target: &crate::Target) -> Domain {
+fn run_pass(
+    func: &mut Function,
+    pass: Pass,
+    moves: promote::Moves,
+    effort: Effort,
+    target: &crate::Target,
+) -> Domain {
     let tracing = crate::trace::enabled();
-    let (before_blocks, before_insts) = if tracing { (func.blocks.len(), func.size()) } else { (0, 0) };
+    let (before_blocks, before_insts) = if tracing {
+        (func.blocks.len(), func.size())
+    } else {
+        (0, 0)
+    };
     let start = tracing.then(Instant::now);
     let changed = match pass {
         Pass::Fill => fill::run(func),
@@ -159,7 +217,14 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         verify_stage(func, target, pass.name());
     }
     if let Some(start) = start {
-        crate::trace::after_pass(pass, before_blocks, before_insts, changed, start.elapsed(), func);
+        crate::trace::after_pass(
+            pass,
+            before_blocks,
+            before_insts,
+            changed,
+            start.elapsed(),
+            func,
+        );
     }
     changed
 }
@@ -199,7 +264,12 @@ impl PassState {
 
 /// Returns whether any live instruction in `func.blocks` satisfies `pred`.
 pub(crate) fn has_live_op(func: &Function, mut pred: impl FnMut(&Op) -> bool) -> bool {
-    func.blocks.iter().any(|block| block.insts.iter().any(|&inst| pred(&func.insts[inst.index()].op)))
+    func.blocks.iter().any(|block| {
+        block
+            .insts
+            .iter()
+            .any(|&inst| pred(&func.insts[inst.index()].op))
+    })
 }
 
 fn has_small_cycle(func: &Function, entry: Block) -> bool {
@@ -239,7 +309,9 @@ fn has_small_cycle(func: &Function, entry: Block) -> bool {
 }
 
 fn detect_loops(func: &Function) -> bool {
-    let Some(entry) = func.entry else { return false };
+    let Some(entry) = func.entry else {
+        return false;
+    };
     if func.blocks.len() <= 1 {
         return func.successors(entry).any(|t| t == entry);
     }
@@ -255,7 +327,9 @@ fn should_run(func: &Function, pass: Pass, state: &mut PassState) -> bool {
         Pass::Fold => !state.fold_clean,
         Pass::Merge => multi && !state.merge_clean,
         Pass::Thread | Pass::IfConv | Pass::Returns => multi,
-        Pass::Switch => has_live_op(func, |op| matches!(op, Op::Select(..) | Op::Brif(..) | Op::BrTable(..))),
+        Pass::Switch => has_live_op(func, |op| {
+            matches!(op, Op::Select(..) | Op::Brif(..) | Op::BrTable(..))
+        }),
         Pass::Rotate | Pass::Unroll | Pass::Licm | Pass::Lsr => state.has_loops(func),
         Pass::Promote => !func.slots.is_empty(),
         Pass::Fill | Pass::Cse | Pass::Loads | Pass::TailRec => true,
@@ -335,7 +409,8 @@ fn strip_assumes(func: &mut Function) -> bool {
 pub(crate) fn is_condition(func: &Function, inst: Inst) -> bool {
     let data = &func.insts[inst.index()];
     matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))
-        || (matches!(data.op, Op::Binary(Binary::Band | Binary::Bor, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I8))
+        || (matches!(data.op, Op::Binary(Binary::Band | Binary::Bor, ..))
+            && data.result.is_some_and(|r| func.ty(r) == Type::I8))
 }
 
 fn has_sinkable_compare(func: &Function) -> bool {
@@ -367,17 +442,25 @@ pub(crate) fn sink_compares(func: &mut Function) -> bool {
         let mut at = 0;
         while at < block.insts.len() {
             let data = &func.insts[block.insts[at].index()];
-            let Some(cond) = data.result.filter(|c| uses[c.index()] == 1 && is_condition(func, block.insts[at])) else {
+            let Some(cond) = data
+                .result
+                .filter(|c| uses[c.index()] == 1 && is_condition(func, block.insts[at]))
+            else {
                 at += 1;
                 continue;
             };
             let reads = |inst: &crate::ir::Inst| {
                 let mut hit = false;
-                func.insts[inst.index()].op.for_operands(|v| hit |= v == cond);
+                func.insts[inst.index()]
+                    .op
+                    .for_operands(|v| hit |= v == cond);
                 hit
             };
             match block.insts[at + 1..].iter().position(reads) {
-                Some(gap) if gap > 0 && matches!(func.insts[block.insts[at + 1 + gap].index()].op, Op::Brif(c, ..) | Op::Select(c, ..) if c == cond) => {
+                Some(gap)
+                    if gap > 0
+                        && matches!(func.insts[block.insts[at + 1 + gap].index()].op, Op::Brif(c, ..) | Op::Select(c, ..) if c == cond) =>
+                {
                     let inst = block.insts.remove(at);
                     block.insts.insert(at + gap, inst);
                     moved = true;
@@ -430,7 +513,9 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
     if plan.moves == promote::Moves::Guided {
         return;
     }
-    if (plan.effort == Effort::Full || func.elide_drops) && func.elide_dead_unwind_drops_post_init(true) {
+    if (plan.effort == Effort::Full || func.elide_drops)
+        && func.elide_dead_unwind_drops_post_init(true)
+    {
         verify_stage(func, plan.target, "elide_dead_unwind_drops_late");
         *state = PassState::new();
         run_fixpoint(func, plan, state);
@@ -440,7 +525,9 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
         rerun_after_rewrite(func, plan, state);
     }
     if plan.effort == Effort::Full {
-        let wide_changed = (plan.target.arch == crate::Arch::X64 && crate::native::divide_by_word(func)) | crate::pairs::split(func);
+        let wide_changed = (plan.target.arch == crate::Arch::X64
+            && crate::native::divide_by_word(func))
+            | crate::pairs::split(func);
         if wide_changed {
             verify_stage(func, plan.target, "wide_split");
             rerun_after_rewrite(func, plan, state);
@@ -460,7 +547,11 @@ fn invert_unlikely_branches(func: &mut Function) {
     }
     let cold = crate::live::cold(func);
     let mut is_latch = vec![false; func.blocks.len()];
-    loops.list.iter().flat_map(|each| &each.latches).for_each(|l| is_latch[l.index()] = true);
+    loops
+        .list
+        .iter()
+        .flat_map(|each| &each.latches)
+        .for_each(|l| is_latch[l.index()] = true);
     let mut cands = Vec::new();
     for b in 0..func.blocks.len() {
         let block = Block(b as u32);
@@ -468,8 +559,12 @@ fn invert_unlikely_branches(func: &mut Function) {
         if depth == 0 {
             continue;
         }
-        let Some(&term) = func.blocks[b].insts.last() else { continue };
-        let Op::Brif(cond, then_b, _, else_b, _) = func.insts[term.index()].op else { continue };
+        let Some(&term) = func.blocks[b].insts.last() else {
+            continue;
+        };
+        let Op::Brif(cond, then_b, _, else_b, _) = func.insts[term.index()].op else {
+            continue;
+        };
         if then_b != else_b
             && !cold[then_b.index()]
             && !cold[else_b.index()]
@@ -489,21 +584,35 @@ fn invert_unlikely_branches(func: &mut Function) {
     for &i in func.blocks.iter().flat_map(|b| &b.insts) {
         let data = &func.insts[i.index()];
         data.op.for_operands(|v| uses[v.index()] += 1);
-        if let Some(r) = data.result { defs[r.index()] = Some(i); }
+        if let Some(r) = data.result {
+            defs[r.index()] = Some(i);
+        }
     }
-    let const_val = |func: &Function, v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
+    let const_val = |func: &Function, v: Value| {
+        defs[v.index()].and_then(|inst| match func.insts[inst.index()].op {
+            Op::Const(k) => Some(k),
+            _ => None,
+        })
+    };
     let mut changed = false;
     for (term, cond) in cands {
         if uses[cond.index()] != 1 {
             continue;
         }
-        let Some(cmp_inst) = defs[cond.index()] else { continue };
-        let Op::Icmp(IntCC::Equal, x, y) = func.insts[cmp_inst.index()].op else { continue };
-        if !matches!((const_val(func, x), const_val(func, y)), (Some(k), None) | (None, Some(k)) if k != 0 && k != 1) {
+        let Some(cmp_inst) = defs[cond.index()] else {
+            continue;
+        };
+        let Op::Icmp(IntCC::Equal, x, y) = func.insts[cmp_inst.index()].op else {
+            continue;
+        };
+        if !matches!((const_val(func, x), const_val(func, y)), (Some(k), None) | (None, Some(k)) if k != 0 && k != 1)
+        {
             continue;
         }
         func.insts[cmp_inst.index()].op = Op::Icmp(IntCC::NotEqual, x, y);
-        if let Op::Brif(_, ref mut t, ref mut ta, ref mut e, ref mut ea) = func.insts[term.index()].op {
+        if let Op::Brif(_, ref mut t, ref mut ta, ref mut e, ref mut ea) =
+            func.insts[term.index()].op
+        {
             std::mem::swap(t, e);
             std::mem::swap(ta, ea);
         }
@@ -519,7 +628,9 @@ fn run_backend_prep(func: &mut Function, plan: &Plan) {
         return;
     }
     if plan.effort == Effort::Full {
-        if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
+        if has_live_op(func, |op| {
+            matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))
+        }) {
             crate::algebra::compare_offsets(func);
         }
         sink::run(func, plan.moves == promote::Moves::Split);
@@ -554,7 +665,10 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
         verify_stage(func, target, "elide_dead_unwind_drops_early");
         state = PassState::new();
     }
-    if moves == promote::Moves::Split && plan.effort == Effort::Full && crate::loads::elide_early(func) {
+    if moves == promote::Moves::Split
+        && plan.effort == Effort::Full
+        && crate::loads::elide_early(func)
+    {
         verify_stage(func, target, "loads_elide_early");
         state.fold_clean = false;
         state.merge_clean = false;

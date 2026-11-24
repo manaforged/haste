@@ -10,15 +10,26 @@ impl Infer<'_, '_> {
     /// Infers struct literals, field reads, `match` and `let` conditions.
     pub fn data(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
-            Expr::Struct { path, fields, base, .. } => self.struct_expr(expr, path, (fields, base), expected),
+            Expr::Struct {
+                path, fields, base, ..
+            } => self.struct_expr(expr, path, (fields, base), expected),
             Expr::Field(base, name) => self.field_expr(expr, base, plain(self.src.text(name))),
             Expr::Match(scrutinee, arms) => self.match_expr(scrutinee, arms, expected),
             Expr::Let(pat, init) => self.let_expr(pat, init),
             Expr::Array(items) => self.array_expr(items, expected),
             Expr::Repeat(value, len) => self.repeat_expr(value, len, expected),
             Expr::Index(base, index) => self.index_expr(expr, base, index),
-            Expr::For { label, pat, iter, body } => self.for_expr(expr, pat, iter, (label, body)),
-            Expr::Range { from, to, inclusive } => self.range_expr(expr, (from, to), inclusive),
+            Expr::For {
+                label,
+                pat,
+                iter,
+                body,
+            } => self.for_expr(expr, pat, iter, (label, body)),
+            Expr::Range {
+                from,
+                to,
+                inclusive,
+            } => self.range_expr(expr, (from, to), inclusive),
             Expr::OffsetOf { ty, fields } => self.offset_of(expr, ty, fields),
             Expr::Underscore => Ok(expected.unwrap_or_else(|| self.fresh(Kind::Var))),
             ref other => bail!("unsupported expression {other:?}"),
@@ -46,7 +57,13 @@ impl Infer<'_, '_> {
         Ok(target)
     }
 
-    fn match_known(&mut self, scrutinee_ty: Ty, arms: List, target: Ty, before: bool) -> Result<Ty> {
+    fn match_known(
+        &mut self,
+        scrutinee_ty: Ty,
+        arms: List,
+        target: Ty,
+        before: bool,
+    ) -> Result<Ty> {
         let mut all_diverge = true;
         for &at in self.body.list(arms) {
             let arm = self.body.arms[at as usize];
@@ -55,10 +72,19 @@ impl Infer<'_, '_> {
             all_diverge &= diverges;
         }
         self.diverges = before || all_diverge;
-        Ok(if all_diverge { self.cx.types.intern(Kind::Never) } else { target })
+        Ok(if all_diverge {
+            self.cx.types.intern(Kind::Never)
+        } else {
+            target
+        })
     }
 
-    fn infer_arms(&mut self, scrutinee_ty: Ty, arms: List, expected: Option<Ty>) -> Result<(Vec<(ExprId, Ty)>, bool)> {
+    fn infer_arms(
+        &mut self,
+        scrutinee_ty: Ty,
+        arms: List,
+        expected: Option<Ty>,
+    ) -> Result<(Vec<(ExprId, Ty)>, bool)> {
         let mut hint = None;
         let mut all_diverge = true;
         let mut found_arms = Vec::new();
@@ -76,10 +102,17 @@ impl Infer<'_, '_> {
 
     pub(super) fn next_arm_hint(&mut self, hint: Option<Ty>, found: Ty) -> Result<Ty> {
         let Some(prev) = hint else { return Ok(found) };
-        Ok(self.branch_target(prev, found)?.or_else(|| self.probe(|infer| infer.join(prev, found).ok())).unwrap_or(prev))
+        Ok(self
+            .branch_target(prev, found)?
+            .or_else(|| self.probe(|infer| infer.join(prev, found).ok()))
+            .unwrap_or(prev))
     }
 
-    pub(super) fn merge_arms(&mut self, found_arms: &[(ExprId, Ty)], expected: Option<Ty>) -> Result<Ty> {
+    pub(super) fn merge_arms(
+        &mut self,
+        found_arms: &[(ExprId, Ty)],
+        expected: Option<Ty>,
+    ) -> Result<Ty> {
         let mut target = None;
         for &(_, found) in found_arms {
             if !self.is_never(found) {
@@ -99,7 +132,12 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn match_arm(&mut self, arm: Arm, scrutinee_ty: Ty, expected: Option<Ty>) -> Result<(Ty, bool)> {
+    fn match_arm(
+        &mut self,
+        arm: Arm,
+        scrutinee_ty: Ty,
+        expected: Option<Ty>,
+    ) -> Result<(Ty, bool)> {
         let depth = self.scopes.len();
         self.bind_pat(arm.pat, scrutinee_ty)?;
         if let Some(guard) = arm.guard {

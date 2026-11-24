@@ -56,14 +56,32 @@ pub fn parse(args: &[String]) -> Vec<Opt> {
     let mut opts = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
-        if let Some((flag, value)) = arg.split_once('=').filter(|(flag, _)| flag.starts_with("--")) {
-            opts.push(Opt { flag: flag.to_string(), value: Some(value.to_string()) });
+        if let Some((flag, value)) = arg
+            .split_once('=')
+            .filter(|(flag, _)| flag.starts_with("--"))
+        {
+            opts.push(Opt {
+                flag: flag.to_string(),
+                value: Some(value.to_string()),
+            });
         } else if VALUED.contains(&arg.as_str()) {
-            opts.push(Opt { flag: arg.clone(), value: rest.next().cloned() });
-        } else if let Some(short) = SHORT.iter().find(|short| arg.starts_with(**short) && arg.len() > short.len()) {
-            opts.push(Opt { flag: short.to_string(), value: Some(arg[short.len()..].to_string()) });
+            opts.push(Opt {
+                flag: arg.clone(),
+                value: rest.next().cloned(),
+            });
+        } else if let Some(short) = SHORT
+            .iter()
+            .find(|short| arg.starts_with(**short) && arg.len() > short.len())
+        {
+            opts.push(Opt {
+                flag: short.to_string(),
+                value: Some(arg[short.len()..].to_string()),
+            });
         } else {
-            opts.push(Opt { flag: arg.clone(), value: None });
+            opts.push(Opt {
+                flag: arg.clone(),
+                value: None,
+            });
         }
     }
     opts
@@ -71,7 +89,10 @@ pub fn parse(args: &[String]) -> Vec<Opt> {
 
 /// The value of the last `flag` option.
 pub fn last<'o>(opts: &'o [Opt], flag: &str) -> Option<&'o str> {
-    opts.iter().rev().find(|opt| opt.flag == flag).and_then(|opt| opt.value.as_deref())
+    opts.iter()
+        .rev()
+        .find(|opt| opt.flag == flag)
+        .and_then(|opt| opt.value.as_deref())
 }
 
 /// The value of the last `-C key=value` option for `key`.
@@ -98,7 +119,10 @@ pub fn prep(program: &str, opts: &[Opt], dir: &Path, phase: &str) -> Vec<String>
         line.extend(["-C", DEFAULT_CODEGEN_UNITS].map(String::from));
     }
     if let Some(cache) = codegen(opts, INCREMENTAL) {
-        line.extend(["-C".to_string(), format!("{INCREMENTAL}={}", Path::new(cache).join(phase).display())]);
+        line.extend([
+            "-C".to_string(),
+            format!("{INCREMENTAL}={}", Path::new(cache).join(phase).display()),
+        ]);
     }
     line
 }
@@ -107,6 +131,9 @@ fn dropped(opt: &Opt) -> bool {
     if DROPPED.contains(&opt.flag.as_str()) {
         return true;
     }
-    let key = opt.value.as_deref().and_then(|value| value.split('=').next());
+    let key = opt
+        .value
+        .as_deref()
+        .and_then(|value| value.split('=').next());
     opt.flag == "-C" && key.is_some_and(|key| DROPPED_CODEGEN.contains(&key))
 }

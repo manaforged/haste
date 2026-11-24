@@ -27,8 +27,18 @@ const BINARY: [(&str, BinOp, u8); 18] = [
     ("%", BinOp::Rem, 12),
 ];
 
-const COMPOUND: [(&str, BinOp); 10] =
-    [("<<=", BinOp::Shl), (">>=", BinOp::Shr), ("+=", BinOp::Add), ("-=", BinOp::Sub), ("*=", BinOp::Mul), ("/=", BinOp::Div), ("%=", BinOp::Rem), ("^=", BinOp::BitXor), ("&=", BinOp::BitAnd), ("|=", BinOp::BitOr)];
+const COMPOUND: [(&str, BinOp); 10] = [
+    ("<<=", BinOp::Shl),
+    (">>=", BinOp::Shr),
+    ("+=", BinOp::Add),
+    ("-=", BinOp::Sub),
+    ("*=", BinOp::Mul),
+    ("/=", BinOp::Div),
+    ("%=", BinOp::Rem),
+    ("^=", BinOp::BitXor),
+    ("&=", BinOp::BitAnd),
+    ("|=", BinOp::BitOr),
+];
 
 const CAST: u8 = 13;
 const LET_SCRUTINEE: u8 = 6;
@@ -62,14 +72,26 @@ impl Cursor<'_> {
             return self.range_from(None);
         }
         let lhs = self.binary(0)?;
-        if self.punct("..") { self.range_from(Some(lhs)) } else { Ok(lhs) }
+        if self.punct("..") {
+            self.range_from(Some(lhs))
+        } else {
+            Ok(lhs)
+        }
     }
 
     fn range_from(&mut self, from: Option<ExprId>) -> Result<ExprId> {
         let inclusive = self.punct("..=");
         self.at += if inclusive { 3 } else { 2 };
-        let to = if self.expr_start() { Some(self.binary(0)?) } else { None };
-        Ok(self.push_expr(Expr::Range { from, to, inclusive }))
+        let to = if self.expr_start() {
+            Some(self.binary(0)?)
+        } else {
+            None
+        };
+        Ok(self.push_expr(Expr::Range {
+            from,
+            to,
+            inclusive,
+        }))
     }
 
     fn binop(&self) -> Option<(usize, BinOp, u8)> {
@@ -82,12 +104,18 @@ impl Cursor<'_> {
         if COMPOUND.iter().any(|(text, _)| self.punct(text)) || self.punct("..") {
             return None;
         }
-        BINARY.iter().find(|(text, _, _)| self.punct(text)).map(|(text, op, prec)| (text.len(), *op, *prec))
+        BINARY
+            .iter()
+            .find(|(text, _, _)| self.punct(text))
+            .map(|(text, op, prec)| (text.len(), *op, *prec))
     }
 
     fn operator_ahead(&self) -> bool {
         use TokenKind::*;
-        matches!(self.kind(), Or | And | Eq | Bang | Lt | Gt | Caret | Plus | Minus | Star | Slash | Percent | Dot)
+        matches!(
+            self.kind(),
+            Or | And | Eq | Bang | Lt | Gt | Caret | Plus | Minus | Star | Slash | Percent | Dot
+        )
     }
 
     /// Parses binary operators that bind at least as tightly as `min`.
@@ -136,7 +164,8 @@ impl Cursor<'_> {
 
     fn ref_expr(&mut self) -> Result<ExprId> {
         self.at += 1;
-        let raw = self.is_word("raw") && (self.word_at(self.at + 1) == "const" || self.word_at(self.at + 1) == "mut");
+        let raw = self.is_word("raw")
+            && (self.word_at(self.at + 1) == "const" || self.word_at(self.at + 1) == "mut");
         if raw {
             self.at += 1;
         }
@@ -194,10 +223,16 @@ impl Cursor<'_> {
             let float = matches!(kind, rustc_lexer::LiteralKind::Float { .. });
             let mut out = expr;
             for part in text.split('.').filter(|part| !part.is_empty() || !float) {
-                let index = part.parse::<u32>().or_else(|_| self.fail("expected a tuple index"))?;
+                let index = part
+                    .parse::<u32>()
+                    .or_else(|_| self.fail("expected a tuple index"))?;
                 out = self.push_expr(Expr::TupleField(out, index));
             }
-            return if float && text.ends_with('.') { self.member(out) } else { Ok(out) };
+            return if float && text.ends_with('.') {
+                self.member(out)
+            } else {
+                Ok(out)
+            };
         }
         if self.eat_word("await") {
             return Ok(self.push_expr(Expr::Await(expr)));
@@ -218,15 +253,30 @@ impl Cursor<'_> {
             super::Args::Angle(list) => list,
             _ => super::List::default(),
         });
-        Ok(self.push_expr(Expr::Method { receiver: expr, name, args, params }))
+        Ok(self.push_expr(Expr::Method {
+            receiver: expr,
+            name,
+            args,
+            params,
+        }))
     }
 
     /// Whether the next token can start an expression.
     pub fn expr_start(&self) -> bool {
         match self.kind() {
-            TokenKind::Literal { .. } | TokenKind::Ident | TokenKind::RawIdent | TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::Lifetime { .. } => true,
+            TokenKind::Literal { .. }
+            | TokenKind::Ident
+            | TokenKind::RawIdent
+            | TokenKind::OpenParen
+            | TokenKind::OpenBracket
+            | TokenKind::Lifetime { .. } => true,
             TokenKind::OpenBrace => !self.no_struct,
-            _ => ["-", "!", "*", "&", "|", "<", "::", "..", "$", "#"].iter().any(|text| self.punct(text)) && !self.punct("=>"),
+            _ => {
+                ["-", "!", "*", "&", "|", "<", "::", "..", "$", "#"]
+                    .iter()
+                    .any(|text| self.punct(text))
+                    && !self.punct("=>")
+            }
         }
     }
 
@@ -282,7 +332,9 @@ impl Cursor<'_> {
         if self.kinded_block_ahead(word) {
             return self.kinded_block().map(Some);
         }
-        let closure_next = self.punct_at(self.at + 1, "|") || self.punct_at(self.at + 1, "||") || self.word_at(self.at + 1) == "move";
+        let closure_next = self.punct_at(self.at + 1, "|")
+            || self.punct_at(self.at + 1, "||")
+            || self.word_at(self.at + 1) == "move";
         if matches!(word, "move" | "static" | "const" | "async") && closure_next {
             return self.closure().map(Some);
         }
@@ -327,7 +379,8 @@ impl Cursor<'_> {
 
     fn block_kind_ahead(&self) -> bool {
         let next = self.at + 1;
-        self.kind_at(next) == TokenKind::OpenBrace || (self.word_at(next) == "move" && self.kind_at(next + 1) == TokenKind::OpenBrace)
+        self.kind_at(next) == TokenKind::OpenBrace
+            || (self.word_at(next) == "move" && self.kind_at(next + 1) == TokenKind::OpenBrace)
     }
 
     fn kinded_block(&mut self) -> Result<ExprId> {
@@ -376,12 +429,19 @@ impl Cursor<'_> {
         self.expansion = expr.as_ref().ok().copied();
         self.expansion_stmt = None;
         if let Ok(block) = expr
-            && let Expr::Block { stmts, tail: None, .. } = self.body.exprs[block.0 as usize]
+            && let Expr::Block {
+                stmts, tail: None, ..
+            } = self.body.exprs[block.0 as usize]
             && let &[stmt] = self.body.list(stmts)
             && let super::Stmt::Expr(value, true) = self.body.stmts[stmt as usize]
         {
             let none = self.list(&[]);
-            self.body.exprs[block.0 as usize] = Expr::Block { stmts: none, tail: Some(value), label: None, kind: BlockKind::Expansion };
+            self.body.exprs[block.0 as usize] = Expr::Block {
+                stmts: none,
+                tail: Some(value),
+                label: None,
+                kind: BlockKind::Expansion,
+            };
             self.expansion_stmt = Some(stmt);
         }
         expr
@@ -392,25 +452,43 @@ impl Cursor<'_> {
         let record = |cursor: &mut Self, attrs: Option<(u32, u32)>| {
             let field = cursor.field_init()?;
             if let Some((from, to)) = attrs {
-                cursor.body.attrs.push((super::Node::Field(field), from, to));
+                cursor
+                    .body
+                    .attrs
+                    .push((super::Node::Field(field), from, to));
             }
             Ok(field)
         };
         let (fields, rest) = self.struct_fields(record, |cursor| {
-            base = if cursor.done() { None } else { Some(cursor.expr()?) };
+            base = if cursor.done() {
+                None
+            } else {
+                Some(cursor.expr()?)
+            };
             Ok(())
         })?;
         let fields = self.list(&fields);
-        Ok(self.push_expr(Expr::Struct { path, fields, base, rest }))
+        Ok(self.push_expr(Expr::Struct {
+            path,
+            fields,
+            base,
+            rest,
+        }))
     }
 
     fn field_init(&mut self) -> Result<u32> {
         let name = self.at;
-        if !(matches!(self.kind(), TokenKind::Literal { .. }) || crate::body::cursor::is_name(self.kind())) {
+        if !(matches!(self.kind(), TokenKind::Literal { .. })
+            || crate::body::cursor::is_name(self.kind()))
+        {
             return self.fail("expected a field");
         }
         self.at += 1;
-        let value = if self.eat(":") { self.expr()? } else { self.name_path(name) };
+        let value = if self.eat(":") {
+            self.expr()?
+        } else {
+            self.name_path(name)
+        };
         self.body.fields.push(FieldInit { name, value });
         Ok(self.body.fields.len() as u32 - 1)
     }
@@ -419,7 +497,12 @@ impl Cursor<'_> {
         self.body.segments.push(super::Segment { name, args: None });
         let segment = self.body.segments.len() as u32 - 1;
         let segments = self.list(&[segment]);
-        let path = self.push_path(super::Path { qself: None, global: false, start: name, segments });
+        let path = self.push_path(super::Path {
+            qself: None,
+            global: false,
+            start: name,
+            segments,
+        });
         self.push_expr(Expr::Path(path))
     }
 
@@ -478,7 +561,15 @@ impl Cursor<'_> {
         self.at += 1;
         let cond = self.cond()?;
         let then = self.block_expr(None, BlockKind::Plain)?;
-        let otherwise = if self.eat_word("else") { Some(if self.is_word("if") { self.if_expr()? } else { self.block_expr(None, BlockKind::Plain)? }) } else { None };
+        let otherwise = if self.eat_word("else") {
+            Some(if self.is_word("if") {
+                self.if_expr()?
+            } else {
+                self.block_expr(None, BlockKind::Plain)?
+            })
+        } else {
+            None
+        };
         Ok(self.push_expr(Expr::If(cond, then, otherwise)))
     }
 
@@ -513,7 +604,12 @@ impl Cursor<'_> {
                 }
                 let iter = self.cond()?;
                 let body = self.block_expr(None, BlockKind::Plain)?;
-                Ok(self.push_expr(Expr::For { label, pat, iter, body }))
+                Ok(self.push_expr(Expr::For {
+                    label,
+                    pat,
+                    iter,
+                    body,
+                }))
             }
         }
     }
@@ -538,7 +634,11 @@ impl Cursor<'_> {
     fn arm(&mut self) -> Result<Option<u32>> {
         let attrs = self.skip_attrs()?;
         let pat = self.pat()?;
-        let guard = if self.eat_word("if") { Some(self.expr()?) } else { None };
+        let guard = if self.eat_word("if") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
         self.expect("=>")?;
         let (body, block_like) = self.stmt_expr()?;
         if !self.eat(",") && !block_like && !self.done() {
@@ -567,7 +667,11 @@ impl Cursor<'_> {
     fn jump_expr(&mut self) -> Result<ExprId> {
         let word = self.word();
         self.at += 1;
-        let value = if self.value_ahead() { Some(self.expr()?) } else { None };
+        let value = if self.value_ahead() {
+            Some(self.expr()?)
+        } else {
+            None
+        };
         Ok(self.push_expr(match (word, value) {
             ("return", value) => Expr::Return(value),
             ("yield", value) => Expr::Yield(value),
@@ -577,27 +681,64 @@ impl Cursor<'_> {
     }
 
     fn value_ahead(&self) -> bool {
-        !self.done() && self.expr_start() && !(self.kind() == TokenKind::OpenBrace && self.no_struct)
+        !self.done()
+            && self.expr_start()
+            && !(self.kind() == TokenKind::OpenBrace && self.no_struct)
     }
 
     fn break_expr(&mut self) -> Result<ExprId> {
         self.at += 1;
-        let label = if matches!(self.kind(), TokenKind::Lifetime { .. }) && !self.punct_at(self.at + 1, ":") { self.lifetime() } else { None };
-        let value = if self.value_ahead() { Some(self.expr()?) } else { None };
+        let label = if matches!(self.kind(), TokenKind::Lifetime { .. })
+            && !self.punct_at(self.at + 1, ":")
+        {
+            self.lifetime()
+        } else {
+            None
+        };
+        let value = if self.value_ahead() {
+            Some(self.expr()?)
+        } else {
+            None
+        };
         Ok(self.push_expr(Expr::Break(label, value)))
     }
 
     fn closure(&mut self) -> Result<ExprId> {
         let (capture, asynchronous) = self.closure_head();
-        let params = if self.eat("||") { Vec::new() } else { self.closure_params()? };
+        let params = if self.eat("||") {
+            Vec::new()
+        } else {
+            self.closure_params()?
+        };
         let params = self.list(&params);
-        let ret = if self.eat("->") { Some(self.ty_no_bounds()?) } else { None };
-        let body = if ret.is_some() { self.block_expr(None, BlockKind::Plain)? } else { self.expr()? };
+        let ret = if self.eat("->") {
+            Some(self.ty_no_bounds()?)
+        } else {
+            None
+        };
+        let body = if ret.is_some() {
+            self.block_expr(None, BlockKind::Plain)?
+        } else {
+            self.expr()?
+        };
         let (ret, body) = match asynchronous {
-            true => (None, self.push_expr(Expr::Block { stmts: super::List::default(), tail: Some(body), label: None, kind: BlockKind::Async })),
+            true => (
+                None,
+                self.push_expr(Expr::Block {
+                    stmts: super::List::default(),
+                    tail: Some(body),
+                    label: None,
+                    kind: BlockKind::Async,
+                }),
+            ),
             false => (ret, body),
         };
-        Ok(self.push_expr(Expr::Closure { params, ret, body, capture }))
+        Ok(self.push_expr(Expr::Closure {
+            params,
+            ret,
+            body,
+            capture,
+        }))
     }
 
     fn closure_head(&mut self) -> (bool, bool) {
@@ -616,7 +757,11 @@ impl Cursor<'_> {
         while !self.punct("|") {
             self.skip_attrs()?;
             let pat = self.pat_no_alt()?;
-            let ty = if self.eat(":") { Some(self.ty()?) } else { None };
+            let ty = if self.eat(":") {
+                Some(self.ty()?)
+            } else {
+                None
+            };
             self.body.params.push(Param { pat, ty });
             params.push(self.body.params.len() as u32 - 1);
             if !self.eat(",") {

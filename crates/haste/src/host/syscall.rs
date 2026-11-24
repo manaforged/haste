@@ -27,7 +27,10 @@ pub extern "C" fn run(words: &[usize; WORDS]) -> usize {
 }
 
 /// Fails every system call with `ENOSYS` on a host whose system calls this entry does not make.
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 pub extern "C" fn run(_words: &[usize; WORDS]) -> usize {
     (libc::ENOSYS as usize).wrapping_neg()
 }

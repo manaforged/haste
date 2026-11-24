@@ -52,16 +52,35 @@ fn indirect_type(ty: Ty<'_>) -> bool {
 
 fn inner<'tcx>(tcx: TyCtxt<'tcx>, env: TypingEnv<'tcx>, ty: Ty<'tcx>) -> Option<Vec<Ty<'tcx>>> {
     Some(match *ty.kind() {
-        ty::Bool | ty::Char | ty::Str | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Never | ty::FnDef(..) => Vec::new(),
+        ty::Bool
+        | ty::Char
+        | ty::Str
+        | ty::Int(_)
+        | ty::Uint(_)
+        | ty::Float(_)
+        | ty::Never
+        | ty::FnDef(..) => Vec::new(),
         ty::Closure(_, args) => args.as_closure().upvar_tys().to_vec(),
-        ty::Ref(_, inner, _) | ty::RawPtr(inner, _) | ty::Slice(inner) | ty::Array(inner, _) | ty::Pat(inner, _) => vec![inner],
+        ty::Ref(_, inner, _)
+        | ty::RawPtr(inner, _)
+        | ty::Slice(inner)
+        | ty::Array(inner, _)
+        | ty::Pat(inner, _) => vec![inner],
         ty::Tuple(items) => items.to_vec(),
-        ty::Adt(def, args) => def.all_fields().map(|field| tcx.normalize_erasing_regions(env, field.ty(tcx, args))).collect(),
+        ty::Adt(def, args) => def
+            .all_fields()
+            .map(|field| tcx.normalize_erasing_regions(env, field.ty(tcx, args)))
+            .collect(),
         _ => return None,
     })
 }
 
 /// One layout as text: size, alignment, passing form, field placement and variants with their tag encoding.
 pub fn print(layout: &LayoutData<FieldIdx, VariantIdx>) -> String {
-    print::layout((layout.size.bytes(), layout.align.abi.bytes()), &layout.backend_repr, &print::fields(&layout.fields), &layout.variants)
+    print::layout(
+        (layout.size.bytes(), layout.align.abi.bytes()),
+        &layout.backend_repr,
+        &print::fields(&layout.fields),
+        &layout.variants,
+    )
 }

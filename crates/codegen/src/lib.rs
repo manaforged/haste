@@ -6,25 +6,25 @@ mod asm_text;
 mod builder;
 pub(crate) mod cfg;
 mod color;
-mod coroutine;
 mod copy;
+mod coroutine;
 mod cse;
 mod drop_elide;
 mod emit;
 mod error;
-mod ir;
-mod memory;
-mod fold;
 mod facts;
 mod fill;
+mod fold;
 mod frame;
 mod ifconv;
+mod ir;
 mod licm;
 mod live;
-mod loopargs;
 mod loads;
+mod loopargs;
 mod lsr;
 pub(crate) mod mem;
+mod memory;
 mod merge;
 mod native;
 mod overalign;
@@ -36,8 +36,8 @@ mod returns;
 mod rotate;
 mod schedule;
 mod slp;
-mod split;
 mod spills;
+mod split;
 mod switch;
 mod tailrec;
 mod target;
@@ -50,7 +50,11 @@ mod wire;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
 macro_rules! value_op {
     () => {
-        fn value_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
+        fn value_op(
+            &mut self,
+            op: &Op,
+            result: impl Fn() -> Result<Value, String>,
+        ) -> Result<(), String> {
             match op {
                 Op::Unary(op, x) => self.unary(*op, *x, result()?),
                 Op::Binary(op, x, y) => self.binary(*op, *x, *y, result()?),
@@ -73,12 +77,19 @@ mod x64;
 
 pub use asm_text::{Assembly, assemble};
 pub use builder::{FunctionBuilder, Ins, Mark};
-pub use drop_elide::UnwindDrop;
-pub use ir::{AbiParam, ArgumentPurpose, AtomicOrd, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type, Value};
 pub use coroutine::Coroutine;
+pub use drop_elide::UnwindDrop;
 pub use error::{Error, ErrorKind};
+pub use ir::{
+    AbiParam, ArgumentPurpose, AtomicOrd, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst,
+    IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type,
+    Value,
+};
 pub use memory::{Arena, Memory};
-pub use reloc::{DictTierUp, FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
+pub use reloc::{
+    DictTierUp, FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc,
+    patch_reloc,
+};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
 pub use trace::{enabled as trace_enabled, missed_report, with_label as with_trace_label};
 
@@ -115,8 +126,20 @@ pub struct Code {
 
 impl Code {
     /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, relocations, and small loop ranges.
-    pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>, loops: Vec<Range<u32>>) -> Self {
-        Self { bytes, sites, relocs, loops, lines: Vec::new(), unwind_drops: Vec::new() }
+    pub fn from_parts(
+        bytes: Vec<u8>,
+        sites: Vec<Site>,
+        relocs: Vec<StencilReloc>,
+        loops: Vec<Range<u32>>,
+    ) -> Self {
+        Self {
+            bytes,
+            sites,
+            relocs,
+            loops,
+            lines: Vec::new(),
+            unwind_drops: Vec::new(),
+        }
     }
 
     /// Attaches frame-relative unwind drop descriptors to this `Code` buffer.
@@ -158,7 +181,14 @@ impl Code {
     /// Copies `bytes` into `out` and patches every relocation against `symbols`.
     pub fn patch(&self, symbols: &[u64], out: &mut [u8]) -> Result<(), Error> {
         if out.len() < self.bytes.len() {
-            return Err(Error::new(ErrorKind::Unsupported, format!("patch buffer too small: {} < {}", out.len(), self.bytes.len())));
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "patch buffer too small: {} < {}",
+                    out.len(),
+                    self.bytes.len()
+                ),
+            ));
         }
         out[..self.bytes.len()].copy_from_slice(&self.bytes);
         reloc::patch_bytes(&self.relocs, symbols, &mut out[..self.bytes.len()])
@@ -167,7 +197,13 @@ impl Code {
 
 impl Target {
     /// Encodes a call-table entry stub that loads `dict_addr` into the dictionary register and jumps to `body_exec`.
-    pub fn dict_entry_stub(&self, stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, Error> {
+    pub fn dict_entry_stub(
+        &self,
+        stub_exec: usize,
+        body_exec: usize,
+        dict_addr: usize,
+        tier_up: Option<DictTierUp>,
+    ) -> Result<Vec<u8>, Error> {
         let bytes = match self.arch {
             Arch::X64 => x64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
             Arch::Arm64 => arm64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
@@ -181,7 +217,10 @@ impl Target {
         match self.arch {
             Arch::X64 => Ok(x64::DICT_STUB_RELOCS),
             Arch::Arm64 => Ok(arm64::DICT_STUB_RELOCS),
-            other => Err(Error::new(ErrorKind::Unsupported, format!("no encoder for {other:?} yet"))),
+            other => Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("no encoder for {other:?} yet"),
+            )),
         }
     }
 }
@@ -239,7 +278,12 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     }
     native::lower(&mut func);
     overalign::lower(&mut func);
-    verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
+    verify::verify(&func, target).map_err(|message| {
+        Error::new(
+            ErrorKind::Verify,
+            format!("after simplification: {message}"),
+        )
+    })?;
     let code = match target.arch {
         Arch::X64 => x64::compile(&func, target),
         Arch::Arm64 => arm64::compile(&func, target),

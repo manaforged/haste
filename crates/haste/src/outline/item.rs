@@ -31,7 +31,11 @@ pub enum ProcKind {
 }
 
 /// Each procedural macro attribute with the kind of macro it makes its function.
-pub const PROC_MACROS: [(&str, ProcKind); 3] = [("proc_macro", ProcKind::Bang), ("proc_macro_attribute", ProcKind::Attribute), ("proc_macro_derive", ProcKind::Derive)];
+pub const PROC_MACROS: [(&str, ProcKind); 3] = [
+    ("proc_macro", ProcKind::Bang),
+    ("proc_macro_attribute", ProcKind::Attribute),
+    ("proc_macro_derive", ProcKind::Derive),
+];
 
 /// An item's visibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

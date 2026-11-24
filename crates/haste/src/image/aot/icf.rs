@@ -21,13 +21,34 @@ pub(super) struct PreSyms<'a> {
 impl PreSyms<'_> {
     fn translate(&self, sym: &SymbolSource) -> Result<Symbol> {
         Ok(match sym {
-            SymbolSource::Rodata(id) => Symbol::Rodata(self.rodata_offs.get(id.0 as usize).copied().flatten().context("missing rodata offset")?),
-            SymbolSource::StaticCell { index, .. } => self.static_syms.get(index).cloned().context("missing static cell")?,
-            SymbolSource::PromotedCell { owner, seq, .. } => self.promoted_syms.get(&(*owner, *seq)).cloned().context("missing promoted cell")?,
+            SymbolSource::Rodata(id) => Symbol::Rodata(
+                self.rodata_offs
+                    .get(id.0 as usize)
+                    .copied()
+                    .flatten()
+                    .context("missing rodata offset")?,
+            ),
+            SymbolSource::StaticCell { index, .. } => self
+                .static_syms
+                .get(index)
+                .cloned()
+                .context("missing static cell")?,
+            SymbolSource::PromotedCell { owner, seq, .. } => self
+                .promoted_syms
+                .get(&(*owner, *seq))
+                .cloned()
+                .context("missing promoted cell")?,
             SymbolSource::Host(host) => Symbol::Host(host.clone()),
             SymbolSource::Word(word) => Symbol::Word(*word),
-            SymbolSource::ThreadSlot(index) => Symbol::Word(self.thread_slots.get(index).copied().unwrap_or(*index as u64)),
-            SymbolSource::Slot(_) | SymbolSource::Vtable(_) => unreachable!("slots and vtables use structural ICF keys"),
+            SymbolSource::ThreadSlot(index) => Symbol::Word(
+                self.thread_slots
+                    .get(index)
+                    .copied()
+                    .unwrap_or(*index as u64),
+            ),
+            SymbolSource::Slot(_) | SymbolSource::Vtable(_) => {
+                unreachable!("slots and vtables use structural ICF keys")
+            }
         })
     }
 }
@@ -43,7 +64,11 @@ enum RelocTargetKey {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum FnIcfKey<'a> {
-    Direct(&'a [u8], Vec<(u32, RelocKind, RelocTargetKey)>, Vec<(i32, i32, RelocTargetKey, bool)>),
+    Direct(
+        &'a [u8],
+        Vec<(u32, RelocKind, RelocTargetKey)>,
+        Vec<(i32, i32, RelocTargetKey, bool)>,
+    ),
     Dict(usize, Vec<RelocTargetKey>),
 }
 
@@ -63,7 +88,11 @@ enum VtableSlotKey {
 }
 
 pub(super) fn foreign_sym(foreign_fns: &HashMap<usize, HostSymbol>, idx: usize) -> Symbol {
-    foreign_fns.get(&idx).map_or(Symbol::Host(HostSymbol::Abort), |host| Symbol::Host(host.clone()))
+    foreign_fns
+        .get(&idx)
+        .map_or(Symbol::Host(HostSymbol::Abort), |host| {
+            Symbol::Host(host.clone())
+        })
 }
 
 pub(super) fn alias_roots(functions: &[Option<AotFn>]) -> Vec<usize> {
@@ -80,7 +109,13 @@ pub(super) fn alias_roots(functions: &[Option<AotFn>]) -> Vec<usize> {
         .collect()
 }
 
-fn slot_reloc_key(self_idx: usize, (callee, direct): (usize, bool), state: &AotState, roots: &[usize], canon: &[usize]) -> RelocTargetKey {
+fn slot_reloc_key(
+    self_idx: usize,
+    (callee, direct): (usize, bool),
+    state: &AotState,
+    roots: &[usize],
+    canon: &[usize],
+) -> RelocTargetKey {
     let root = roots.get(callee).copied().unwrap_or(callee);
     if state.functions.get(root).and_then(Option::as_ref).is_some() {
         if root == self_idx {
@@ -101,7 +136,9 @@ fn sym_reloc_key(
     (roots, canon): (&[usize], &[usize]),
 ) -> Result<RelocTargetKey> {
     Ok(match sym {
-        SymbolSource::Slot(callee) => slot_reloc_key(self_idx, (*callee, direct), state, roots, canon),
+        SymbolSource::Slot(callee) => {
+            slot_reloc_key(self_idx, (*callee, direct), state, roots, canon)
+        }
         SymbolSource::Vtable(id) => RelocTargetKey::Vtable(*id),
         other => RelocTargetKey::Sym(pre.translate(other)?),
     })
@@ -120,13 +157,25 @@ fn direct_icf_key<'a>(
             RelocTargetKey::Sym(Symbol::Runtime(rt))
         } else {
             let direct = matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32);
-            sym_reloc_key(self_idx, (&relocs[reloc.symbol as usize], direct), state, pre, (roots, canon))?
+            sym_reloc_key(
+                self_idx,
+                (&relocs[reloc.symbol as usize], direct),
+                state,
+                pre,
+                (roots, canon),
+            )?
         };
         sig.push((reloc.offset, reloc.kind, target));
     }
     let mut drops = Vec::with_capacity(code.unwind_drops().len());
     for d in code.unwind_drops() {
-        let target = sym_reloc_key(self_idx, (&relocs[d.drop_sym as usize], true), state, pre, (roots, canon))?;
+        let target = sym_reloc_key(
+            self_idx,
+            (&relocs[d.drop_sym as usize], true),
+            state,
+            pre,
+            (roots, canon),
+        )?;
         drops.push((d.local_off, d.flag_off, target, d.indirect));
     }
     Ok(FnIcfKey::Direct(code.bytes(), sig, drops))
@@ -141,12 +190,23 @@ fn dict_icf_key<'a>(
 ) -> Result<FnIcfKey<'a>> {
     let mut sig = Vec::with_capacity(relocs.len());
     for sym in relocs {
-        sig.push(sym_reloc_key(self_idx, (sym, false), state, pre, (roots, canon))?);
+        sig.push(sym_reloc_key(
+            self_idx,
+            (sym, false),
+            state,
+            pre,
+            (roots, canon),
+        )?);
     }
     Ok(FnIcfKey::Dict(Arc::as_ptr(body) as usize, sig))
 }
 
-pub(super) fn fold_functions(state: &AotState, live_fns: &[bool], pre: &PreSyms<'_>, roots: &[usize]) -> Result<Vec<usize>> {
+pub(super) fn fold_functions(
+    state: &AotState,
+    live_fns: &[bool],
+    pre: &PreSyms<'_>,
+    roots: &[usize],
+) -> Result<Vec<usize>> {
     let mut canon = roots.to_vec();
     for _ in 0..5 {
         let mut seen: HashMap<FnIcfKey<'_>, usize> = HashMap::default();
@@ -157,8 +217,12 @@ pub(super) fn fold_functions(state: &AotState, live_fns: &[bool], pre: &PreSyms<
                 continue;
             }
             let key = match &state.functions[idx] {
-                Some(AotFn::Direct { code, relocs }) => direct_icf_key(idx, (code, relocs), state, pre, (roots, &prev))?,
-                Some(AotFn::Dict { body, relocs }) => dict_icf_key(idx, (body, relocs), state, pre, (roots, &prev))?,
+                Some(AotFn::Direct { code, relocs }) => {
+                    direct_icf_key(idx, (code, relocs), state, pre, (roots, &prev))?
+                }
+                Some(AotFn::Dict { body, relocs }) => {
+                    dict_icf_key(idx, (body, relocs), state, pre, (roots, &prev))?
+                }
                 Some(AotFn::Alias(_)) | None => continue,
             };
             let leader = *seen.entry(key).or_insert(idx);
@@ -183,10 +247,17 @@ enum RodataRef {
 type RodataKey<'a> = (&'a [u8], Vec<(u32, RodataRef)>);
 type VtablePlacement = (Vec<Option<u32>>, Vec<(u32, usize)>);
 
-fn emit_rodata_relocs(base: u32, resolved: &[(u32, RodataRef)], exe: &mut Executable, fn_relocs: &mut Vec<(u32, usize)>) {
+fn emit_rodata_relocs(
+    base: u32,
+    resolved: &[(u32, RodataRef)],
+    exe: &mut Executable,
+    fn_relocs: &mut Vec<(u32, usize)>,
+) {
     for &(reloc_off, target) in resolved {
         match target {
-            RodataRef::Rodata(child_off) => exe.pointer(true, base + reloc_off, Symbol::Rodata(child_off)),
+            RodataRef::Rodata(child_off) => {
+                exe.pointer(true, base + reloc_off, Symbol::Rodata(child_off))
+            }
             RodataRef::Fn(fn_idx) => fn_relocs.push((base + reloc_off, fn_idx)),
         }
     }
@@ -214,7 +285,15 @@ fn place_rodata_node<'a>(
     let mut resolved = Vec::with_capacity(entry.1.len());
     for reloc in &entry.1 {
         let target = match reloc.target {
-            RodataTarget::Rodata(child) => RodataRef::Rodata(place_rodata_node(child.0 as usize, state, rodata_offs, visiting, seen, fn_relocs, exe)?),
+            RodataTarget::Rodata(child) => RodataRef::Rodata(place_rodata_node(
+                child.0 as usize,
+                state,
+                rodata_offs,
+                visiting,
+                seen,
+                fn_relocs,
+                exe,
+            )?),
             RodataTarget::Fn(fn_idx) => RodataRef::Fn(fn_idx),
         };
         resolved.push((reloc.offset, target));
@@ -236,13 +315,25 @@ fn place_rodata_node<'a>(
     Ok(off)
 }
 
-pub(super) fn emit_rodata(state: &AotState, live: &AotReach, exe: &mut Executable) -> Result<(Vec<Option<u32>>, Vec<(u32, usize)>)> {
+pub(super) fn emit_rodata(
+    state: &AotState,
+    live: &AotReach,
+    exe: &mut Executable,
+) -> Result<(Vec<Option<u32>>, Vec<(u32, usize)>)> {
     let mut rodata_offs = vec![None; state.rodata.len()];
     let mut visiting = vec![false; state.rodata.len()];
     let mut seen: HashMap<RodataKey<'_>, u32> = HashMap::default();
     let mut fn_relocs = Vec::new();
     for &id in &live.rodata_order {
-        place_rodata_node(id, state, &mut rodata_offs, &mut visiting, &mut seen, &mut fn_relocs, exe)?;
+        place_rodata_node(
+            id,
+            state,
+            &mut rodata_offs,
+            &mut visiting,
+            &mut seen,
+            &mut fn_relocs,
+            exe,
+        )?;
     }
     Ok((rodata_offs, fn_relocs))
 }
@@ -282,7 +373,13 @@ struct VtableAlloc<'a> {
     canon: &'a [usize],
 }
 
-fn place_vtable_node(id: usize, state: &AotState, vmask: &VtableMask, alloc: &mut VtableAlloc<'_>, exe: &mut Executable) -> Result<u32> {
+fn place_vtable_node(
+    id: usize,
+    state: &AotState,
+    vmask: &VtableMask,
+    alloc: &mut VtableAlloc<'_>,
+    exe: &mut Executable,
+) -> Result<u32> {
     if let Some(off) = alloc.vtable_offs[id] {
         return Ok(off);
     }
@@ -303,7 +400,13 @@ fn place_vtable_node(id: usize, state: &AotState, vmask: &VtableMask, alloc: &mu
                     VtableSlotKey::Sym(foreign_sym(&state.foreign_fns, fn_idx))
                 }
             }
-            VtableEntry::Super(super_id) => VtableSlotKey::Super(place_vtable_node(super_id.0 as usize, state, vmask, alloc, exe)?),
+            VtableEntry::Super(super_id) => VtableSlotKey::Super(place_vtable_node(
+                super_id.0 as usize,
+                state,
+                vmask,
+                alloc,
+                exe,
+            )?),
         };
         key.push(slot_key);
     }
@@ -339,7 +442,13 @@ pub(super) fn alloc_vtables(
     Ok((alloc.vtable_offs, alloc.unique))
 }
 
-pub(super) fn emit_unwind_table(state: &AotState, live: &AotReach, (roots, canon): (&[usize], &[usize]), fn_offs: &[Option<u32>], exe: &mut Executable) {
+pub(super) fn emit_unwind_table(
+    state: &AotState,
+    live: &AotReach,
+    (roots, canon): (&[usize], &[usize]),
+    fn_offs: &[Option<u32>],
+    exe: &mut Executable,
+) {
     let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     let mut fns: Vec<(u32, u32, Vec<(i32, i32, u32, u32)>)> = Vec::new();
     for &idx in &live.order {
@@ -347,8 +456,12 @@ pub(super) fn emit_unwind_table(state: &AotState, live: &AotReach, (roots, canon
         if !seen.insert(leader) {
             continue;
         }
-        let Some(fn_start) = fn_offs.get(leader).copied().flatten() else { continue };
-        let Some(AotFn::Direct { code, relocs }) = &state.functions[leader] else { continue };
+        let Some(fn_start) = fn_offs.get(leader).copied().flatten() else {
+            continue;
+        };
+        let Some(AotFn::Direct { code, relocs }) = &state.functions[leader] else {
+            continue;
+        };
         if code.unwind_drops().is_empty() {
             continue;
         }

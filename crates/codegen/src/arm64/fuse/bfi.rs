@@ -5,7 +5,11 @@ use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, Op, Type, Value};
 
 fn width_mask(width: u8) -> u64 {
-    if u32::from(width) >= 64 { u64::MAX } else { (1_u64 << width) - 1 }
+    if u32::from(width) >= 64 {
+        u64::MAX
+    } else {
+        (1_u64 << width) - 1
+    }
 }
 
 fn cleared_field(mask: u64, ty_mask: u64) -> Option<(u8, u8)> {
@@ -32,7 +36,8 @@ fn val_fits_width(
     let (bits, ty_mask, need_mask) = (ty.bits(), ty.unsigned_max(), width_mask(width));
     match func.insts[inst.index()].op {
         Op::Binary(Binary::Band, a, b) => [a, b].into_iter().any(|mv| {
-            const_of(func, plan, mv, def).is_some_and(|c| (((c as u64) & ty_mask) & !need_mask) == 0)
+            const_of(func, plan, mv, def)
+                .is_some_and(|c| (((c as u64) & ty_mask) & !need_mask) == 0)
         }),
         Op::Convert(Convert::Uextend, inner) => {
             func.ty(inner).is_small_int() && func.ty(inner).bits() <= u32::from(width)
@@ -57,13 +62,16 @@ fn bfi_band_ishl(
         if plan.elided[mid.index()] {
             continue;
         }
-        let Some(imm) = const_of(func, plan, mv, def) else { continue };
+        let Some(imm) = const_of(func, plan, mv, def) else {
+            continue;
+        };
         if ((((imm as u64) & ty_mask) | low_mask) & ty_mask) != top_mask {
             continue;
         }
         let Some(mi) = def(mid) else { continue };
         if let Op::Binary(Binary::Ishl, src, amt) = func.insts[mi.index()].op
-            && const_of(func, plan, amt, def).is_some_and(|c| ((c as u32) & (bits - 1)) == u32::from(lsb))
+            && const_of(func, plan, amt, def)
+                .is_some_and(|c| ((c as u32) & (bits - 1)) == u32::from(lsb))
             && !plan.elided[src.index()]
         {
             return Some((src, Some(mid)));
@@ -81,20 +89,29 @@ fn bfi_rhs_plain(
 ) -> Option<(Value, Option<Value>)> {
     let (bits, ty_mask, need_mask) = (ty.bits(), ty.unsigned_max(), width_mask(width));
     match *b_op {
-        Op::Binary(Binary::Band, bx, by) if lsb == 0 => [(bx, by), (by, bx)].into_iter().find_map(|(src, mv)| {
-            const_of(func, plan, mv, def)
-                .is_some_and(|c| ((c as u64) & ty_mask) == need_mask)
-                .then_some((src, None))
-        }),
-        Op::Binary(Binary::Band, bx, by) if lsb > 0 => bfi_band_ishl(func, plan, (ty, lsb, width), (bx, by), def),
+        Op::Binary(Binary::Band, bx, by) if lsb == 0 => {
+            [(bx, by), (by, bx)].into_iter().find_map(|(src, mv)| {
+                const_of(func, plan, mv, def)
+                    .is_some_and(|c| ((c as u64) & ty_mask) == need_mask)
+                    .then_some((src, None))
+            })
+        }
+        Op::Binary(Binary::Band, bx, by) if lsb > 0 => {
+            bfi_band_ishl(func, plan, (ty, lsb, width), (bx, by), def)
+        }
         Op::Binary(Binary::Ishl, bx, by)
-            if lsb > 0 && const_of(func, plan, by, def).is_some_and(|c| ((c as u32) & (bits - 1)) == u32::from(lsb)) =>
+            if lsb > 0
+                && const_of(func, plan, by, def)
+                    .is_some_and(|c| ((c as u32) & (bits - 1)) == u32::from(lsb)) =>
         {
-            (u32::from(lsb) + u32::from(width) == bits || val_fits_width(func, plan, (ty, width), bx, def))
-                .then_some((bx, None))
+            (u32::from(lsb) + u32::from(width) == bits
+                || val_fits_width(func, plan, (ty, width), bx, def))
+            .then_some((bx, None))
         }
         Op::Convert(Convert::Uextend, inner)
-            if lsb == 0 && func.ty(inner).is_small_int() && func.ty(inner).bits() == u32::from(width) =>
+            if lsb == 0
+                && func.ty(inner).is_small_int()
+                && func.ty(inner).bits() == u32::from(width) =>
         {
             Some((inner, None))
         }
@@ -128,11 +145,17 @@ fn bfi_clear(
     ca: Value,
     def: &dyn Fn(Value) -> Option<Inst>,
 ) -> Option<(Value, u8, u8)> {
-    let Op::Binary(Binary::Band, x0, x1) = func.insts[def(ca)?.index()].op else { return None };
+    let Op::Binary(Binary::Band, x0, x1) = func.insts[def(ca)?.index()].op else {
+        return None;
+    };
     let ty_mask = ty.unsigned_max();
     for (a, mv) in [(x0, x1), (x1, x0)] {
-        let Some(imm) = const_of(func, plan, mv, def) else { continue };
-        let Some((lsb, width)) = cleared_field((imm as u64) & ty_mask, ty_mask) else { continue };
+        let Some(imm) = const_of(func, plan, mv, def) else {
+            continue;
+        };
+        let Some((lsb, width)) = cleared_field((imm as u64) & ty_mask, ty_mask) else {
+            continue;
+        };
         if !plan.elided[a.index()] && const_of(func, plan, a, def).is_none() {
             return Some((a, lsb, width));
         }
@@ -149,7 +172,13 @@ fn bfi_pair(
 ) -> Option<(Value, Value, Option<Value>, u8, u8)> {
     let (a, lsb, width) = bfi_clear(func, plan, ty, ca, def)?;
     let bi = def(cb)?;
-    let (b, mid) = bfi_rhs(func, plan, (ty, lsb, width), &func.insts[bi.index()].op, def)?;
+    let (b, mid) = bfi_rhs(
+        func,
+        plan,
+        (ty, lsb, width),
+        &func.insts[bi.index()].op,
+        def,
+    )?;
     Some((a, b, mid, lsb, width))
 }
 
@@ -171,7 +200,11 @@ pub(in crate::arm64) fn bfi_parts(
     if plan.elided[x.index()] == plan.elided[y.index()] {
         return None;
     }
-    let (ca, cb) = if plan.elided[x.index()] { (x, y) } else { (y, x) };
+    let (ca, cb) = if plan.elided[x.index()] {
+        (x, y)
+    } else {
+        (y, x)
+    };
     let (a, lsb, width) = bfi_clear(func, plan, ty, ca, def)?;
     (lsb == 0 && val_fits_width(func, plan, (ty, width), cb, def)).then_some((a, cb, 0, width))
 }
@@ -196,7 +229,9 @@ fn bfi_mid_root(
     (b_idx, apos, bpos, pos, res): (usize, usize, usize, usize, Value),
     (mid, src): (Value, Value),
 ) -> bool {
-    let Some((mb, mpos, _)) = def_entry(pos_of, mid) else { return false };
+    let Some((mb, mpos, _)) = def_entry(pos_of, mid) else {
+        return false;
+    };
     let def = |v| def_inst(pos_of, v);
     mb == b_idx
         && mpos < bpos
@@ -217,8 +252,12 @@ fn bfi_root(
 ) -> Option<Value> {
     let root = if plan.elided[val.index()] {
         let (_, _, uinst) = def_entry(pos_of, val)?;
-        let Op::Convert(Convert::Uextend, inner) = func.insts[uinst.index()].op else { return None };
-        if plan.elided[inner.index()] || (u32::from(width) > func.ty(inner).bits() && !zero_ext_loc(plan, inner)) {
+        let Op::Convert(Convert::Uextend, inner) = func.insts[uinst.index()].op else {
+            return None;
+        };
+        if plan.elided[inner.index()]
+            || (u32::from(width) > func.ty(inner).bits() && !zero_ext_loc(plan, inner))
+        {
             return None;
         }
         inner
@@ -226,8 +265,9 @@ fn bfi_root(
         val
     };
     let def = |v| def_inst(pos_of, v);
-    (const_of(func, plan, root, &def).is_none() && preserved(func, plan, b_idx, bpos, pos, Some(skip), root))
-        .then_some(root)
+    (const_of(func, plan, root, &def).is_none()
+        && preserved(func, plan, b_idx, bpos, pos, Some(skip), root))
+    .then_some(root)
 }
 
 fn try_fuse_bfi_unelided(
@@ -239,8 +279,12 @@ fn try_fuse_bfi_unelided(
 ) -> bool {
     let (ty, def) = (func.ty(res), |v| def_inst(pos_of, v));
     for (ca, cb) in [(x, y), (y, x)] {
-        let Some((apos, _)) = local_single(plan, info, b_idx, pos, ca) else { continue };
-        let Some((a, lsb, width)) = bfi_clear(func, plan, ty, ca, &def) else { continue };
+        let Some((apos, _)) = local_single(plan, info, b_idx, pos, ca) else {
+            continue;
+        };
+        let Some((a, lsb, width)) = bfi_clear(func, plan, ty, ca, &def) else {
+            continue;
+        };
         if lsb == 0
             && !plan.elided[cb.index()]
             && a != res
@@ -262,7 +306,9 @@ pub(super) fn try_fuse_bfi(
     (b_idx, pos, res): (usize, usize, Value),
     (op, x, y): (Binary, Value, Value),
 ) -> bool {
-    if !matches!(op, Binary::Bor | Binary::Bxor | Binary::Iadd) || !matches!(func.ty(res), Type::I32 | Type::I64) {
+    if !matches!(op, Binary::Bor | Binary::Bxor | Binary::Iadd)
+        || !matches!(func.ty(res), Type::I32 | Type::I64)
+    {
         return false;
     }
     if let Some((xpos, _)) = local_single(plan, info, b_idx, pos, x)
@@ -278,8 +324,11 @@ pub(super) fn try_fuse_bfi(
             && preserved(func, plan, b_idx, apos, pos, Some(bpos), a)
         {
             let rhs_ok = match mid_opt {
-                Some(mid) => bfi_mid_root(func, plan, pos_of, (b_idx, apos, bpos, pos, res), (mid, b)),
-                None => bfi_root(func, plan, pos_of, (b_idx, bpos, pos, apos, width), b).is_some_and(|r| r != res),
+                Some(mid) => {
+                    bfi_mid_root(func, plan, pos_of, (b_idx, apos, bpos, pos, res), (mid, b))
+                }
+                None => bfi_root(func, plan, pos_of, (b_idx, bpos, pos, apos, width), b)
+                    .is_some_and(|r| r != res),
             };
             if rhs_ok {
                 plan.elided[x.index()] = true;

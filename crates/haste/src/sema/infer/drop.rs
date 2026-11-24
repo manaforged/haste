@@ -46,7 +46,10 @@ impl Infer<'_, '_> {
     pub fn is_copy(&mut self, ty: Ty) -> Result<bool> {
         let ty = self.resolve(ty);
         Ok(match self.cx.types.kind(ty).clone() {
-            Kind::Ref(Mut::Mut, _) | Kind::Slice(_) | Kind::Dyn(..) | Kind::Prim(crate::names::Primitive::Str) => false,
+            Kind::Ref(Mut::Mut, _)
+            | Kind::Slice(_)
+            | Kind::Dyn(..)
+            | Kind::Prim(crate::names::Primitive::Str) => false,
             Kind::Tuple(items) => {
                 let items = self.cx.types.substs(items).to_vec();
                 self.all_copy(items.into_iter())?
@@ -54,7 +57,9 @@ impl Infer<'_, '_> {
             Kind::Array(inner, _) => self.is_copy(inner)?,
             Kind::Closure(..) => self.closure_is_copy(ty)?,
             Kind::Adt(..) => {
-                let Some(copy) = self.cx.lang_item("copy") else { bail!("core has no `Copy` trait") };
+                let Some(copy) = self.cx.lang_item("copy") else {
+                    bail!("core has no `Copy` trait")
+                };
                 self.select(copy, ty, &[])?.is_some()
             }
             Kind::Param(_) | Kind::Proj(_) => self.poly_is_copy(ty)?,
@@ -77,8 +82,14 @@ impl Infer<'_, '_> {
         let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty) else {
             return Ok(None);
         };
-        let here = self.instance.as_ref().is_some_and(|(item, args)| item == parent && args == substs);
-        let Some(closure) = here.then(|| self.out.closures.get(&crate::body::ExprId(*at))).flatten() else {
+        let here = self
+            .instance
+            .as_ref()
+            .is_some_and(|(item, args)| item == parent && args == substs);
+        let Some(closure) = here
+            .then(|| self.out.closures.get(&crate::body::ExprId(*at)))
+            .flatten()
+        else {
             return Ok(None);
         };
         let captures: Vec<_> = closure.captures.clone();
@@ -117,7 +128,9 @@ impl Infer<'_, '_> {
         if !adt_may_have_drop(self.cx, ty)? {
             return Ok(None);
         }
-        let Some(drop) = self.cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+        let Some(drop) = self.cx.lang_item("drop") else {
+            bail!("core has no `Drop` trait")
+        };
         self.select(drop, ty, &[])
     }
 
@@ -153,7 +166,13 @@ pub fn glue_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed> 
     let target = cx.types.intern(Kind::Ref(Mut::Mut, ty));
     let unit = cx.types.unit();
     let glue = detached(cx, item, |infer| infer.glue(item, ty))?;
-    Ok(Typed { locals: vec![Local { ty: target }], params: vec![0], ret: Some(unit), shape: Shape::Glue(glue), ..Typed::default() })
+    Ok(Typed {
+        locals: vec![Local { ty: target }],
+        params: vec![0],
+        ret: Some(unit),
+        shape: Shape::Glue(glue),
+        ..Typed::default()
+    })
 }
 
 fn has_uninferred_closure(cx: &Context<'_>, ty: Ty) -> bool {
@@ -185,7 +204,9 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
     }
     let before = cx.quiet_mark();
     let call = if needs_drop(cx, ty)? {
-        let Some(glue) = cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
+        let Some(glue) = cx.lang_item("drop_glue") else {
+            bail!("core has no drop glue")
+        };
         Some(Res::fn_of(&cx.types, glue, &[ty]))
     } else {
         None
@@ -201,12 +222,20 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
 }
 
 /// The drop glue calls for a closure body, reusing its parent's settled drop list when available.
-pub(super) fn closure_drop_calls(cx: &mut Context<'_>, typed: &Typed, info: &super::closure::ClosureInfo) -> Result<Vec<Res>> {
+pub(super) fn closure_drop_calls(
+    cx: &mut Context<'_>,
+    typed: &Typed,
+    info: &super::closure::ClosureInfo,
+) -> Result<Vec<Res>> {
     let Some(parent) = info.parent_drops.get() else {
         return drop_calls(cx, typed);
     };
     let mut drops = parent.to_vec();
-    for ty in typed.locals[info.typed.locals.len()..].iter().map(|local| local.ty).chain(typed.ret) {
+    for ty in typed.locals[info.typed.locals.len()..]
+        .iter()
+        .map(|local| local.ty)
+        .chain(typed.ret)
+    {
         if ty != Ty::NONE
             && let Some(call) = glue_call(cx, ty)?
             && !drops.contains(&call)
@@ -217,7 +246,11 @@ pub(super) fn closure_drop_calls(cx: &mut Context<'_>, typed: &Typed, info: &sup
     Ok(drops)
 }
 
-fn first_closure_info(cx: &Context<'_>, (parent, substs): (ItemRef, super::super::substs::Substs), typed: &Typed) -> Option<std::sync::Arc<super::closure::ClosureInfo>> {
+fn first_closure_info(
+    cx: &Context<'_>,
+    (parent, substs): (ItemRef, super::super::substs::Substs),
+    typed: &Typed,
+) -> Option<std::sync::Arc<super::closure::ClosureInfo>> {
     if !typed.has_closures() {
         return None;
     }
@@ -227,16 +260,27 @@ fn first_closure_info(cx: &Context<'_>, (parent, substs): (ItemRef, super::super
 }
 
 /// Records `typed.drops` on the shared closure metadata of `(parent, substs)`.
-pub(in crate::sema) fn record_parent_drops(cx: &Context<'_>, instance: (ItemRef, super::super::substs::Substs), typed: &Typed) {
+pub(in crate::sema) fn record_parent_drops(
+    cx: &Context<'_>,
+    instance: (ItemRef, super::super::substs::Substs),
+    typed: &Typed,
+) {
     if let Some(info) = first_closure_info(cx, instance, typed) {
-        let _ = info.parent_drops.set(typed.drops.clone().into_boxed_slice());
+        let _ = info
+            .parent_drops
+            .set(typed.drops.clone().into_boxed_slice());
     }
 }
 
 /// Marks the shared closure metadata of `(parent, substs)` as having laid out the parent body.
-pub(in crate::sema) fn mark_parent_laid(cx: &Context<'_>, instance: (ItemRef, super::super::substs::Substs), typed: &Typed) {
+pub(in crate::sema) fn mark_parent_laid(
+    cx: &Context<'_>,
+    instance: (ItemRef, super::super::substs::Substs),
+    typed: &Typed,
+) {
     if let Some(info) = first_closure_info(cx, instance, typed) {
-        info.parent_laid.store(true, std::sync::atomic::Ordering::Release);
+        info.parent_laid
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -246,7 +290,13 @@ pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
     let tables = scoped.ensure_tables(&cx.types);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut calls = Vec::new();
-    for ty in typed.locals.iter().map(|local| local.ty).chain(typed.ret).chain(tables.owned_tys()) {
+    for ty in typed
+        .locals
+        .iter()
+        .map(|local| local.ty)
+        .chain(typed.ret)
+        .chain(tables.owned_tys())
+    {
         if ty != Ty::NONE && seen.insert(ty) {
             calls.extend(glue_call(cx, ty)?);
         }
@@ -257,10 +307,15 @@ pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
 impl Infer<'_, '_> {
     /// The `Drop::drop` of `ty`'s own `Drop` impl, without the drops of its parts.
     pub(in crate::sema) fn own_drop(&mut self, ty: Ty) -> Result<Option<Res>> {
-        let Some((block, args)) = self.drop_impl(ty)? else { return Ok(None) };
+        let Some((block, args)) = self.drop_impl(ty)? else {
+            return Ok(None);
+        };
         let args: Vec<Ty> = args.into_iter().map(|arg| self.zonk(arg)).collect();
         let substs = self.cx.types.intern_substs(&args);
-        Ok(self.cx.member(block, "drop").map(|member| Res::Fn(member, substs)))
+        Ok(self
+            .cx
+            .member(block, "drop")
+            .map(|member| Res::Fn(member, substs)))
     }
 
     fn glue(&mut self, glue: ItemRef, ty: Ty) -> Result<Glue> {
@@ -273,20 +328,36 @@ impl Infer<'_, '_> {
             }
         }
         let resume = match self.coroutine_output(ty) {
-            Some(_) => self.cx.lang_item("poll").map(|poll| Res::fn_of(&self.cx.types, poll, &[ty])),
+            Some(_) => self
+                .cx
+                .lang_item("poll")
+                .map(|poll| Res::fn_of(&self.cx.types, poll, &[ty])),
             None => None,
         };
-        Ok(Glue { drop, parts, resume })
+        Ok(Glue {
+            drop,
+            parts,
+            resume,
+        })
     }
 
     /// The parts of `ty` that its drop glue drops after its own `Drop::drop`: fields, elements, or the value a `Box` owns.
     pub fn drop_parts(&mut self, ty: Ty) -> Result<Vec<Ty>> {
         Ok(match *self.cx.types.kind(ty) {
             _ if let Some(owned) = self.cx.boxed(ty) => vec![owned],
-            Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == ItemKind::Union => Vec::new(),
+            Kind::Adt(item, _)
+                if self.cx.lang(item) == Some("manually_drop")
+                    || self.cx.item(item).1.kind == ItemKind::Union =>
+            {
+                Vec::new()
+            }
             Kind::Adt(item, args) => {
                 let args = self.cx.types.substs(args).to_vec();
-                self.adt_fields(item, &args)?.iter().flatten().copied().collect()
+                self.adt_fields(item, &args)?
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect()
             }
             Kind::Tuple(items) => self.cx.types.substs(items).to_vec(),
             Kind::Closure(..) => self.closure_drop_parts(ty)?,
@@ -296,21 +367,33 @@ impl Infer<'_, '_> {
     }
 
     fn closure_drop_parts(&mut self, ty: Ty) -> Result<Vec<Ty>> {
-        let Some(&Kind::Tuple(items)) = self.closure_env(ty).map(|env| self.cx.types.kind(env)) else {
+        let Some(&Kind::Tuple(items)) = self.closure_env(ty).map(|env| self.cx.types.kind(env))
+        else {
             bail!("drop of a closure whose defining body was not inferred");
         };
         if self.coroutine_output(ty).is_none() {
             return Ok(self.cx.types.substs(items).to_vec());
         }
-        let Some(&Kind::Tuple(captures)) = self.cx.types.substs(items).last().map(|&env| self.cx.types.kind(env)) else {
+        let Some(&Kind::Tuple(captures)) = self
+            .cx
+            .types
+            .substs(items)
+            .last()
+            .map(|&env| self.cx.types.kind(env))
+        else {
             bail!("a coroutine with no captures tuple");
         };
         Ok(self.cx.types.substs(captures).to_vec())
     }
 }
 
-fn with_drop<T>(cx: &mut Context<'_>, run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>) -> Result<T> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+fn with_drop<T>(
+    cx: &mut Context<'_>,
+    run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>,
+) -> Result<T> {
+    let Some(anchor) = cx.lang_item("drop") else {
+        bail!("core has no `Drop` trait")
+    };
     detached(cx, anchor, run)
 }
 
@@ -320,7 +403,13 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
         return Ok(false);
     }
     match cx.types.kind(ty) {
-        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => return Ok(false),
+        Kind::Prim(_)
+        | Kind::Ref(..)
+        | Kind::Ptr(..)
+        | Kind::FnDef(..)
+        | Kind::FnPtr(..)
+        | Kind::Never
+        | Kind::Value(_) => return Ok(false),
         Kind::Dyn(..) => return Ok(true),
         _ => {}
     }
@@ -335,9 +424,14 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
 
 fn adt_may_have_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
     let Kind::Adt(def, _) = *cx.types.kind(ty) else {
-        return Ok(matches!(cx.types.kind(ty), Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)));
+        return Ok(matches!(
+            cx.types.kind(ty),
+            Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)
+        ));
     };
-    let Some(drop) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+    let Some(drop) = cx.lang_item("drop") else {
+        bail!("core has no `Drop` trait")
+    };
     let two;
     let one;
     let holders: &[u32] = if def.krate == drop.krate {
@@ -352,17 +446,21 @@ fn adt_may_have_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
 
 /// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    if ty == Ty::NONE || !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
+    if ty == Ty::NONE
+        || !matches!(
+            cx.types.kind(ty),
+            Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)
+        )
+    {
         return Ok(false);
     }
     let cacheable = !cx.types.has_var_flag(ty) && !cx.types.has_params(ty);
-    if cacheable
-        && let Some(known) = cx.store.lookups.own_drops.get(&ty)
-    {
+    if cacheable && let Some(known) = cx.store.lookups.own_drops.get(&ty) {
         return Ok(known);
     }
     let before = cx.quiet_mark();
-    let has = adt_may_have_drop(cx, ty)? && with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))?;
+    let has = adt_may_have_drop(cx, ty)?
+        && with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))?;
     if cacheable && cx.quiet_mark() == before {
         cx.store.lookups.own_drops.insert(ty, has);
     }

@@ -73,9 +73,16 @@ pub struct Call<'s> {
 impl<'s> Call<'s> {
     /// Splits the arguments `args` of a call in `src` whose template starts at token `template` into positional and named ones.
     pub fn new(src: &'s Source, template: u32, args: &[(u32, u32)]) -> Call<'s> {
-        let mut call = Call { src, mark: src.mark(template), positional: Vec::new(), named: Vec::new() };
+        let mut call = Call {
+            src,
+            mark: src.mark(template),
+            positional: Vec::new(),
+            named: Vec::new(),
+        };
         for &(from, to) in args {
-            let assigns = to > from + 2 && src.text(from + 1) == "=" && !(src.joint(from + 1) && src.text(from + 2) == "=");
+            let assigns = to > from + 2
+                && src.text(from + 1) == "="
+                && !(src.joint(from + 1) && src.text(from + 2) == "=");
             match assigns && src.kind(from) == rustc_lexer::TokenKind::Ident {
                 true => call.named.push((src.text(from), (from + 2, to))),
                 false => call.positional.push((from, to)),
@@ -99,13 +106,21 @@ pub fn expand(template: &str, call: &Call<'_>, krate: u32, out: &mut Tokens) -> 
                 counts.push(source_index(&mut sources, call, arg, &mut next)?);
             }
         }
-        values.push((hole.constructor, source_index(&mut sources, call, &hole.arg, &mut next)?));
+        values.push((
+            hole.constructor,
+            source_index(&mut sources, call, &hole.arg, &mut next)?,
+        ));
     }
     let bytes = encode(&pieces, values.len());
     write_call(out, krate, (&bytes, &sources, call), (&values, &counts))
 }
 
-fn source_index(sources: &mut Vec<Origin>, call: &Call<'_>, arg: &Arg, next: &mut usize) -> Result<usize> {
+fn source_index(
+    sources: &mut Vec<Origin>,
+    call: &Call<'_>,
+    arg: &Arg,
+    next: &mut usize,
+) -> Result<usize> {
     let source = match arg {
         Arg::Next => {
             *next += 1;
@@ -131,7 +146,12 @@ fn source_index(sources: &mut Vec<Origin>, call: &Call<'_>, arg: &Arg, next: &mu
     })
 }
 
-fn write_call(out: &mut Tokens, krate: u32, (bytes, sources, call): (&[u8], &[Origin], &Call<'_>), (values, counts): (&[(&str, usize)], &[usize])) -> Result<()> {
+fn write_call(
+    out: &mut Tokens,
+    krate: u32,
+    (bytes, sources, call): (&[u8], &[Origin], &Call<'_>),
+    (values, counts): (&[(&str, usize)], &[usize]),
+) -> Result<()> {
     out.lexed("match (");
     for source in sources {
         out.lexed("&");
@@ -152,10 +172,18 @@ fn write_call(out: &mut Tokens, krate: u32, (bytes, sources, call): (&[u8], &[Or
     crate_path(out, krate, "::fmt::Arguments::new");
     out.lexed(&format!("({}, &[", byte_string(bytes)));
     for &(constructor, at) in values {
-        crate_path(out, krate, &format!("::fmt::rt::Argument::{constructor}(args.{at}),"));
+        crate_path(
+            out,
+            krate,
+            &format!("::fmt::rt::Argument::{constructor}(args.{at}),"),
+        );
     }
     for &at in counts {
-        crate_path(out, krate, &format!("::fmt::rt::Argument::from_usize(args.{at}),"));
+        crate_path(
+            out,
+            krate,
+            &format!("::fmt::rt::Argument::from_usize(args.{at}),"),
+        );
     }
     out.lexed("]) } }");
     Ok(())
@@ -198,7 +226,12 @@ fn encode_hole(bytes: &mut Vec<u8>, hole: &Hole, count_at: &mut usize) {
     let mut flags = hole.flags;
     let precision = count_value(&hole.precision, count_at);
     let width = count_value(&hole.width, count_at);
-    flags |= if width.is_some() { WIDTH_SET } else { 0 } | if precision.is_some() { PRECISION_SET } else { 0 };
+    flags |= if width.is_some() { WIDTH_SET } else { 0 }
+        | if precision.is_some() {
+            PRECISION_SET
+        } else {
+            0
+        };
     if flags != DEFAULT_FLAGS {
         lead |= 1;
         fields.extend_from_slice(&flags.to_le_bytes());
@@ -237,7 +270,9 @@ fn parse(template: &str) -> Result<Vec<Piece>> {
                 text.push(c);
             }
             ('{', _) => {
-                let Some(end) = template[at..].find('}') else { bail!("a format template with an unclosed `{{`") };
+                let Some(end) = template[at..].find('}') else {
+                    bail!("a format template with an unclosed `{{`")
+                };
                 pieces.push(Piece::Text(std::mem::take(&mut text)));
                 pieces.push(Piece::Hole(hole(&template[at + 1..at + end])?));
                 while chars.peek().is_some_and(|&(next, _)| next <= at + end) {
@@ -255,7 +290,13 @@ fn parse(template: &str) -> Result<Vec<Piece>> {
 
 fn hole(inside: &str) -> Result<Hole> {
     let (arg, spec) = inside.split_once(':').unwrap_or((inside, ""));
-    let mut hole = Hole { arg: arg_ref(arg.trim()), constructor: "new_display", flags: DEFAULT_FLAGS, width: Count::Unset, precision: Count::Unset };
+    let mut hole = Hole {
+        arg: arg_ref(arg.trim()),
+        constructor: "new_display",
+        flags: DEFAULT_FLAGS,
+        width: Count::Unset,
+        precision: Count::Unset,
+    };
     let rest = fill_align(spec, &mut hole.flags);
     let rest = sign_flags(rest, &mut hole.flags);
     let (width, rest) = count(rest);
@@ -272,7 +313,10 @@ fn hole(inside: &str) -> Result<Hole> {
         }
         None => rest,
     };
-    let Some(&(_, constructor, flag)) = TRAITS.iter().find(|(spelling, ..)| *spelling == rest) else { bail!("the format trait `{rest}` is not known") };
+    let Some(&(_, constructor, flag)) = TRAITS.iter().find(|(spelling, ..)| *spelling == rest)
+    else {
+        bail!("the format trait `{rest}` is not known")
+    };
     (hole.constructor, hole.flags) = (constructor, hole.flags | flag);
     Ok(hole)
 }
@@ -280,12 +324,19 @@ fn hole(inside: &str) -> Result<Hole> {
 fn arg_ref(text: &str) -> Arg {
     match text {
         "" => Arg::Next,
-        _ => text.parse().map_or_else(|_| Arg::Name(text.to_string()), Arg::Index),
+        _ => text
+            .parse()
+            .map_or_else(|_| Arg::Name(text.to_string()), Arg::Index),
     }
 }
 
 fn fill_align<'t>(spec: &'t str, flags: &mut u32) -> &'t str {
-    let align = |c: char| ['<', '>', '^'].iter().position(|&known| known == c).map(|at| at as u32);
+    let align = |c: char| {
+        ['<', '>', '^']
+            .iter()
+            .position(|&known| known == c)
+            .map(|at| at as u32)
+    };
     let mut chars = spec.chars();
     let (first, second) = (chars.next(), chars.next());
     let (fill, align_at, skip) = match (first, second.and_then(align), first.and_then(align)) {
@@ -312,9 +363,13 @@ fn sign_flags<'t>(mut spec: &'t str, flags: &mut u32) -> &'t str {
 }
 
 fn count(spec: &str) -> (Count, &str) {
-    let digits = spec.find(|c: char| !c.is_ascii_digit()).unwrap_or(spec.len());
+    let digits = spec
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(spec.len());
     let word = match digits {
-        0 => spec.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(spec.len()),
+        0 => spec
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(spec.len()),
         _ => digits,
     };
     let (text, rest) = spec.split_at(word);

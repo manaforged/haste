@@ -61,7 +61,10 @@ impl AtomicOrd {
         if self.is_seq_cst() || other.is_seq_cst() {
             return Self::SeqCst;
         }
-        match (self.has_acquire() || other.has_acquire(), self.has_release() || other.has_release()) {
+        match (
+            self.has_acquire() || other.has_acquire(),
+            self.has_release() || other.has_release(),
+        ) {
             (false, false) => Self::Relaxed,
             (false, true) => Self::Release,
             (true, false) => Self::Acquire,

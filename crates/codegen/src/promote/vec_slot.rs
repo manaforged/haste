@@ -38,7 +38,10 @@ fn slot_homes(func: &Function, scan: &Scan) -> Vec<Vec<ChunkHome>> {
     for (slot_idx, off, bytes, ty) in vec_accesses {
         let slot_size = i64::from(func.slots[slot_idx].size);
         let end = off.checked_add(i64::from(bytes));
-        let valid_geom = off >= 0 && matches!(bytes, 8 | 16) && end.is_some_and(|e| e <= slot_size) && i32::try_from(off).is_ok();
+        let valid_geom = off >= 0
+            && matches!(bytes, 8 | 16)
+            && end.is_some_and(|e| e <= slot_size)
+            && i32::try_from(off).is_ok();
         let list = &mut slots[slot_idx];
         if !valid_geom {
             for chunk in list.iter_mut() {
@@ -59,7 +62,13 @@ fn slot_homes(func: &Function, scan: &Scan) -> Vec<Vec<ChunkHome>> {
             .count();
         if covering == 1
             && bytes == 8
-            && let Some(chunk) = list.iter_mut().find(|c| !c.invalid && c.bytes == 16 && off >= c.offset && end <= c.offset + 16 && (off - c.offset) % 8 == 0)
+            && let Some(chunk) = list.iter_mut().find(|c| {
+                !c.invalid
+                    && c.bytes == 16
+                    && off >= c.offset
+                    && end <= c.offset + 16
+                    && (off - c.offset) % 8 == 0
+            })
         {
             chunk.needs_split = true;
             chunk.uniform_scalar = None;
@@ -124,7 +133,13 @@ fn slot_homes(func: &Function, scan: &Scan) -> Vec<Vec<ChunkHome>> {
                 .map(|c| ChunkHome {
                     offset: c.offset,
                     bytes: c.bytes,
-                    home_vec: c.uniform_scalar.map(|lane| Type::Vec { lane, count: (c.bytes / lane.bytes()) as u8 }).unwrap_or(c.vec_ty),
+                    home_vec: c
+                        .uniform_scalar
+                        .map(|lane| Type::Vec {
+                            lane,
+                            count: (c.bytes / lane.bytes()) as u8,
+                        })
+                        .unwrap_or(c.vec_ty),
                 })
                 .collect();
             homes.sort_unstable_by_key(|h| h.offset);
@@ -133,7 +148,13 @@ fn slot_homes(func: &Function, scan: &Scan) -> Vec<Vec<ChunkHome>> {
         .collect()
 }
 
-fn bitcast_if_needed(func: &mut Function, val: Value, from: Type, to: Type, out: &mut Vec<Inst>) -> Value {
+fn bitcast_if_needed(
+    func: &mut Function,
+    val: Value,
+    from: Type,
+    to: Type,
+    out: &mut Vec<Inst>,
+) -> Value {
     if from == to {
         return val;
     }
@@ -195,7 +216,10 @@ pub(super) fn split(func: &mut Function, scan: &Scan) -> bool {
                 continue;
             };
             let end = off + i64::from(ty.bytes());
-            let Some(home) = homes[touch.slot.index()].iter().find(|h| off >= h.offset && end <= h.offset + i64::from(h.bytes)) else {
+            let Some(home) = homes[touch.slot.index()]
+                .iter()
+                .find(|h| off >= h.offset && end <= h.offset + i64::from(h.bytes))
+            else {
                 out.push(inst);
                 continue;
             };
@@ -205,13 +229,17 @@ pub(super) fn split(func: &mut Function, scan: &Scan) -> bool {
             }
             let chunk_off = home.offset as i32;
             if ty.is_vector() {
-                let lane_vec = Type::Vec { lane: Lane::I64, count: 2 };
+                let lane_vec = Type::Vec {
+                    lane: Lane::I64,
+                    count: 2,
+                };
                 let lane_idx = ((off - home.offset) / 8) as u8;
                 match touch.kind {
                     Kind::Load(_) => {
                         let vec_val = func.value(home.home_vec);
                         out.push(func.add(Op::StackLoad(touch.slot, chunk_off), Some(vec_val)));
-                        let src = bitcast_if_needed(func, vec_val, home.home_vec, lane_vec, &mut out);
+                        let src =
+                            bitcast_if_needed(func, vec_val, home.home_vec, lane_vec, &mut out);
                         let extracted = func.value(Type::I64);
                         out.push(func.add(Op::Extract(src, lane_idx), Some(extracted)));
                         func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, extracted);
@@ -219,7 +247,14 @@ pub(super) fn split(func: &mut Function, scan: &Scan) -> bool {
                     }
                     Kind::Store(val) => {
                         let scalar = bitcast_if_needed(func, val, ty, Type::I64, &mut out);
-                        emit_scalar_store(func, inst, scalar, (touch.slot, chunk_off), (home.home_vec, lane_vec, lane_idx), &mut out);
+                        emit_scalar_store(
+                            func,
+                            inst,
+                            scalar,
+                            (touch.slot, chunk_off),
+                            (home.home_vec, lane_vec, lane_idx),
+                            &mut out,
+                        );
                     }
                 }
                 changed = true;
@@ -229,11 +264,27 @@ pub(super) fn split(func: &mut Function, scan: &Scan) -> bool {
                 out.push(inst);
                 continue;
             };
-            let lane_vec = Type::Vec { lane, count: (home.bytes / lane.bytes()) as u8 };
+            let lane_vec = Type::Vec {
+                lane,
+                count: (home.bytes / lane.bytes()) as u8,
+            };
             let lane_idx = ((off - home.offset) / i64::from(lane.bytes())) as u8;
             match touch.kind {
-                Kind::Load(_) => emit_scalar_load(func, inst, (touch.slot, chunk_off), (home.home_vec, lane_vec, lane_idx), &mut out),
-                Kind::Store(val) => emit_scalar_store(func, inst, val, (touch.slot, chunk_off), (home.home_vec, lane_vec, lane_idx), &mut out),
+                Kind::Load(_) => emit_scalar_load(
+                    func,
+                    inst,
+                    (touch.slot, chunk_off),
+                    (home.home_vec, lane_vec, lane_idx),
+                    &mut out,
+                ),
+                Kind::Store(val) => emit_scalar_store(
+                    func,
+                    inst,
+                    val,
+                    (touch.slot, chunk_off),
+                    (home.home_vec, lane_vec, lane_idx),
+                    &mut out,
+                ),
             }
             changed = true;
         }

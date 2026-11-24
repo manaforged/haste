@@ -5,8 +5,16 @@ use super::{Access, accesses_at, collect_sret_info, resolve_slot, retarget_slot}
 
 /// Builds each frame slot of a coroutine that one block fills and then moves out whole straight into the move's target, so no copy stays to move through the coroutine's frame.
 pub(crate) fn build_in_place(func: &mut Function) -> bool {
-    let Some(entry) = func.entry else { return false };
-    let Some(keep) = func.coroutine.as_ref().map(|co| [co.resumes.as_slice(), co.done.as_slice()].concat()) else { return false };
+    let Some(entry) = func.entry else {
+        return false;
+    };
+    let Some(keep) = func
+        .coroutine
+        .as_ref()
+        .map(|co| [co.resumes.as_slice(), co.done.as_slice()].concat())
+    else {
+        return false;
+    };
     let mut changed = crate::merge::join_jumps(func, &keep);
     if changed {
         func.bump_cfg();
@@ -14,7 +22,10 @@ pub(crate) fn build_in_place(func: &mut Function) -> bool {
     while let Some((slot, to, inst)) = plan(func, entry) {
         hoist_addr(func, inst, to);
         retarget_slot(func, slot, to, &[]);
-        let gone = func.blocks.iter().position(|data| data.insts.contains(&inst));
+        let gone = func
+            .blocks
+            .iter()
+            .position(|data| data.insts.contains(&inst));
         if let Some(block) = gone {
             func.blocks[block].insts.retain(|&other| other != inst);
         }
@@ -34,12 +45,19 @@ fn plan(func: &Function, entry: Block) -> Option<(StackSlot, Value, Inst)> {
     let prov = Provenance::new(func, &cfg);
     for (at, data) in func.blocks.iter().enumerate() {
         for (pos, &inst) in data.insts.iter().enumerate() {
-            let Op::Move(to, from, bytes) = func.insts[inst.index()].op else { continue };
-            let Some(slot) = resolve_slot(func, &info.defs, from) else { continue };
-            if func.slots[slot.index()].size != bytes || resolve_base(func, &info, to) == Some(slot) {
+            let Op::Move(to, from, bytes) = func.insts[inst.index()].op else {
+                continue;
+            };
+            let Some(slot) = resolve_slot(func, &info.defs, from) else {
+                continue;
+            };
+            if func.slots[slot.index()].size != bytes || resolve_base(func, &info, to) == Some(slot)
+            {
                 continue;
             }
-            let Some(first) = writes_before(func, &info, (Block(at as u32), pos), slot) else { continue };
+            let Some(first) = writes_before(func, &info, (Block(at as u32), pos), slot) else {
+                continue;
+            };
             let target = prov.loc(to, 0, bytes);
             let clear = data.insts[first..pos].iter().all(|&other| {
                 let op = &func.insts[other.index()].op;
@@ -56,23 +74,46 @@ fn plan(func: &Function, entry: Block) -> Option<(StackSlot, Value, Inst)> {
 }
 
 /// The position of the first instruction of `block` that touches `slot`, when every touch of `slot` lies in `block` before `at`, writes it, and the move at `at` is its only read.
-fn writes_before(func: &Function, info: &super::SretUseInfo, (block, at): (Block, usize), slot: StackSlot) -> Option<usize> {
+fn writes_before(
+    func: &Function,
+    info: &super::SretUseInfo,
+    (block, at): (Block, usize),
+    slot: StackSlot,
+) -> Option<usize> {
     let insts = &func.blocks[block.index()].insts;
-    let mut roots: Vec<Value> = info.slot_addrs[slot.index()].iter().map(|&(_, _, value)| value).collect();
+    let mut roots: Vec<Value> = info.slot_addrs[slot.index()]
+        .iter()
+        .map(|&(_, _, value)| value)
+        .collect();
     roots.extend(func.insts.iter().filter_map(|data| match data.op {
         Op::StackAddr(found, offset) if found == slot && offset != 0 => data.result,
         _ => None,
     }));
     let accesses = accesses_at(func, info, roots, &[(block, insts[at])], Access::Write)?;
-    let direct = func.blocks.iter().enumerate().flat_map(|(index, data)| data.insts.iter().enumerate().map(move |(pos, &inst)| (Block(index as u32), pos, inst))).filter(|&(_, _, inst)| match func.insts[inst.index()].op {
-        Op::StackLoad(found, _) => found == slot,
-        Op::StackStore(_, found, _) => found == slot,
-        _ => false,
-    });
+    let direct = func
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(index, data)| {
+            data.insts
+                .iter()
+                .enumerate()
+                .map(move |(pos, &inst)| (Block(index as u32), pos, inst))
+        })
+        .filter(|&(_, _, inst)| match func.insts[inst.index()].op {
+            Op::StackLoad(found, _) => found == slot,
+            Op::StackStore(_, found, _) => found == slot,
+            _ => false,
+        });
     let mut first = at;
-    for (other, pos, inst) in direct.map(|(b, p, i)| (b, p, Some(i))).chain(accesses.into_iter().map(|(b, p)| (b, p, None))) {
+    for (other, pos, inst) in direct
+        .map(|(b, p, i)| (b, p, Some(i)))
+        .chain(accesses.into_iter().map(|(b, p)| (b, p, None)))
+    {
         let op = &func.insts[func.blocks[other.index()].insts[pos].index()].op;
-        let read = inst.is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::StackLoad(..))) || matches!(op, Op::Call { .. } | Op::TryCall { .. });
+        let read = inst
+            .is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::StackLoad(..)))
+            || matches!(op, Op::Call { .. } | Op::TryCall { .. });
         if other != block || pos >= at || read {
             return None;
         }
@@ -104,8 +145,15 @@ fn resolve_base(func: &Function, info: &super::SretUseInfo, value: Value) -> Opt
 }
 
 /// Whether `to` is defined before position `first` of `block`, or is a slot address `hoist_addr` can move there.
-fn addr_ready(func: &Function, info: &super::SretUseInfo, (block, first): (Block, usize), to: Value) -> bool {
-    let Some(def) = info.defs.get(to.index()).copied().flatten() else { return true };
+fn addr_ready(
+    func: &Function,
+    info: &super::SretUseInfo,
+    (block, first): (Block, usize),
+    to: Value,
+) -> bool {
+    let Some(def) = info.defs.get(to.index()).copied().flatten() else {
+        return true;
+    };
     let insts = &func.blocks[block.index()].insts;
     match insts.iter().position(|&inst| inst == def) {
         Some(pos) => pos < first || matches!(func.insts[def.index()].op, Op::StackAddr(..)),
@@ -115,8 +163,21 @@ fn addr_ready(func: &Function, info: &super::SretUseInfo, (block, first): (Block
 
 /// Moves the slot address `to` that the move `inst` targets to the start of its block when it is defined there after other uses would need it.
 fn hoist_addr(func: &mut Function, inst: Inst, to: Value) {
-    let Some(block) = func.blocks.iter().position(|data| data.insts.contains(&inst)) else { return };
-    let Some(def) = func.blocks[block].insts.iter().copied().find(|&other| func.insts[other.index()].result == Some(to)) else { return };
+    let Some(block) = func
+        .blocks
+        .iter()
+        .position(|data| data.insts.contains(&inst))
+    else {
+        return;
+    };
+    let Some(def) = func.blocks[block]
+        .insts
+        .iter()
+        .copied()
+        .find(|&other| func.insts[other.index()].result == Some(to))
+    else {
+        return;
+    };
     if matches!(func.insts[def.index()].op, Op::StackAddr(..)) {
         func.blocks[block].insts.retain(|&other| other != def);
         func.blocks[block].insts.insert(0, def);

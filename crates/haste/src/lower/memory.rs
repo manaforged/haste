@@ -15,12 +15,20 @@ use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
     /// Emits the memory and layout intrinsic `which` inline, and hands every other intrinsic to the value intrinsics.
-    pub(super) fn memory_intrinsic(&mut self, origin: &SiteOrigin, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    pub(super) fn memory_intrinsic(
+        &mut self,
+        origin: &SiteOrigin,
+        which: Intrinsic,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Option<Value>> {
         use Intrinsic::*;
         let ty = substs.first().copied();
         match (which, ty, args) {
             (SizeOf | AlignOf, Some(ty), _) => self.layout_const(which, ty).map(Some),
-            (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => self.value_layout(which == SizeOfVal, ty, pointer).map(Some),
+            (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => {
+                self.value_layout(which == SizeOfVal, ty, pointer).map(Some)
+            }
             (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(origin, which, ty).map(Some),
             (TypeName, Some(ty), _) => {
                 let name = crate::sema::infer::type_name(self.cx, ty);
@@ -43,14 +51,26 @@ impl Lower<'_, '_> {
                 self.discriminant_value(place, ty).map(Some)
             }
             (Atomic(atomic), Some(ty), _) => self.atomic(atomic, ty, substs, args),
-            (Unchecked(op), Some(ty), &[x, y]) => self.unchecked(op, (ty, substs.get(1).copied()), x, y).map(Some),
+            (Unchecked(op), Some(ty), &[x, y]) => self
+                .unchecked(op, (ty, substs.get(1).copied()), x, y)
+                .map(Some),
             (ThreeWayCompare, Some(ty), &[x, y]) => self.compare(ty, x, y).map(Some),
-            (RawPointer | Offset(_) | PtrMask | OffsetFrom(_) | Read | Write | VolatileRead | VolatileWrite | WriteBox | MemCopy(_) | WriteBytes | SliceElement, Some(_), _) => self.access_intrinsic(which, substs, args),
+            (
+                RawPointer | Offset(_) | PtrMask | OffsetFrom(_) | Read | Write | VolatileRead
+                | VolatileWrite | WriteBox | MemCopy(_) | WriteBytes | SliceElement,
+                Some(_),
+                _,
+            ) => self.access_intrinsic(which, substs, args),
             _ => self.value_intrinsic(which, substs, args).map(Some),
         }
     }
 
-    fn access_intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    fn access_intrinsic(
+        &mut self,
+        which: Intrinsic,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Option<Value>> {
         use Intrinsic::*;
         let ty = substs[0];
         match (which, args) {
@@ -61,23 +81,41 @@ impl Lower<'_, '_> {
             (Read, &[from]) => self.read_at(ty, from),
             (VolatileRead, &[from]) => self.volatile_read(ty, from),
             (Write, &[to, value]) => {
-                let at = Place { base: Base::Addr(to), offset: 0, repr: repr(self.cx, ty)? };
+                let at = Place {
+                    base: Base::Addr(to),
+                    offset: 0,
+                    repr: repr(self.cx, ty)?,
+                };
                 self.write(at, value);
                 Ok(None)
             }
             (VolatileWrite, &[to, value]) => self.volatile_write(ty, to, value).map(|()| None),
             (Write | VolatileWrite, &[_]) => Ok(None),
             (WriteBox, &[boxed, ..]) => self.write_box(ty, boxed, args.get(1).copied()).map(Some),
-            (MemCopy(_), &[from, to, count]) => self.copy_items(ty, (from, to), count).map(|()| None),
-            (WriteBytes, &[to, byte, count]) => self.write_bytes(ty, to, byte, count).map(|()| None),
+            (MemCopy(_), &[from, to, count]) => {
+                self.copy_items(ty, (from, to), count).map(|()| None)
+            }
+            (WriteBytes, &[to, byte, count]) => {
+                self.write_bytes(ty, to, byte, count).map(|()| None)
+            }
             (SliceElement, &[slice, index]) => self.slice_element(substs, slice, index).map(Some),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         }
     }
 
-    fn raw_pointer(&mut self, substs: &[Ty], data: Value, meta: Option<Value>) -> Result<Option<Value>> {
+    fn raw_pointer(
+        &mut self,
+        substs: &[Ty],
+        data: Value,
+        meta: Option<Value>,
+    ) -> Result<Option<Value>> {
         let ty = substs[0];
-        let data = match substs.get(1).copied().map(|from| repr(self.cx, from)).transpose()? {
+        let data = match substs
+            .get(1)
+            .copied()
+            .map(|from| repr(self.cx, from))
+            .transpose()?
+        {
             Some(Repr::Mem { .. }) => self.ins().load(Type::I64, data, 0),
             _ => data,
         };
@@ -87,7 +125,9 @@ impl Lower<'_, '_> {
         let (Kind::Ptr(_, pointee) | Kind::Ref(_, pointee)) = *self.cx.types.kind(ty) else {
             bail!("aggregate_raw_ptr into a type that is not a pointer");
         };
-        let Some(meta) = meta else { bail!("aggregate_raw_ptr into a wide pointer with no metadata") };
+        let Some(meta) = meta else {
+            bail!("aggregate_raw_ptr into a wide pointer with no metadata")
+        };
         let tail = self.cx.tail(pointee)?;
         let meta = match self.cx.types.kind(tail) {
             Kind::Dyn(..) => self.ins().load(Type::I64, meta, 0),
@@ -99,7 +139,11 @@ impl Lower<'_, '_> {
     fn write_box(&mut self, ty: Ty, boxed: Value, value: Option<Value>) -> Result<Value> {
         if let Some(value) = value {
             let data = self.box_data(boxed);
-            let at = Place { base: Base::Addr(data), offset: 0, repr: repr(self.cx, ty)? };
+            let at = Place {
+                base: Base::Addr(data),
+                offset: 0,
+                repr: repr(self.cx, ty)?,
+            };
             self.write(at, value);
         }
         Ok(boxed)
@@ -139,12 +183,20 @@ impl Lower<'_, '_> {
 
     fn layout_const(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {
         let layout = self.cx.layout(ty)?;
-        let value = if which == Intrinsic::SizeOf { layout.size.bytes() } else { layout.align.bytes() };
+        let value = if which == Intrinsic::SizeOf {
+            layout.size.bytes()
+        } else {
+            layout.align.bytes()
+        };
         Ok(self.ins().iconst(Type::I64, value as i64))
     }
 
     fn value_layout(&mut self, size: bool, ty: Ty, pointer: Value) -> Result<Value> {
-        let which = if size { Intrinsic::SizeOf } else { Intrinsic::AlignOf };
+        let which = if size {
+            Intrinsic::SizeOf
+        } else {
+            Intrinsic::AlignOf
+        };
         match self.cx.types.kind(ty).clone() {
             Kind::Slice(element) if size => {
                 let len = self.ins().load(Type::I64, pointer, 8);
@@ -167,14 +219,26 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn tail_layout(&mut self, size: bool, (ty, item, args): (Ty, crate::names::ItemRef, &[Ty]), pointer: Value) -> Result<Value> {
+    fn tail_layout(
+        &mut self,
+        size: bool,
+        (ty, item, args): (Ty, crate::names::ItemRef, &[Ty]),
+        pointer: Value,
+    ) -> Result<Value> {
         let layout = self.cx.layout(ty)?;
         let fields = crate::sema::infer::field_types(self.cx, item, args)?;
-        let Some((index, &field)) = fields.first().and_then(|fields| fields.iter().enumerate().last()) else { bail!("an unsized struct with no fields") };
+        let Some((index, &field)) = fields
+            .first()
+            .and_then(|fields| fields.iter().enumerate().last())
+        else {
+            bail!("an unsized struct with no fields")
+        };
         let offset = crate::sema::layout::field_offset(&layout, 0, index as u32);
         let field_align = self.value_layout(false, field, pointer)?;
         let own_align = self.ins().iconst(Type::I64, layout.align.bytes() as i64);
-        let wider = self.ins().icmp(IntCC::UnsignedGreaterThan, own_align, field_align);
+        let wider = self
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, own_align, field_align);
         let align = self.ins().select(wider, own_align, field_align);
         if !size {
             return Ok(align);
@@ -193,12 +257,17 @@ impl Lower<'_, '_> {
     }
 
     fn slice_element(&mut self, substs: &[Ty], slice: Value, index: Value) -> Result<Value> {
-        let Some(&element) = substs.get(2) else { bail!("slice_get_unchecked takes three type arguments") };
+        let Some(&element) = substs.get(2) else {
+            bail!("slice_get_unchecked takes three type arguments")
+        };
         let size = self.size(element)?;
         let data = self.ins().load(Type::I64, slice, 0);
         let bytes = self.ins().imul_imm(index, size);
         let address = self.ins().iadd(data, bytes);
-        if substs.first().is_some_and(|&item| matches!(self.cx.types.kind(item), Kind::Ref(..))) {
+        if substs
+            .first()
+            .is_some_and(|&item| matches!(self.cx.types.kind(item), Kind::Ref(..)))
+        {
             self.ins().assume(address);
         }
         Ok(address)
@@ -227,10 +296,16 @@ impl Lower<'_, '_> {
         let mut count = bytes;
         if shift != 0 {
             let by = self.ins().iconst(Type::I64, i64::from(shift));
-            count = if signed { self.ins().sshr(count, by) } else { self.ins().ushr(count, by) };
+            count = if signed {
+                self.ins().sshr(count, by)
+            } else {
+                self.ins().ushr(count, by)
+            };
         }
         if odd != 1 {
-            let inverse = (0..5).fold(odd, |x, _| x.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(x))));
+            let inverse = (0..5).fold(odd, |x, _| {
+                x.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(x)))
+            });
             let inverse = self.ins().iconst(Type::I64, inverse as i64);
             count = self.ins().imul(count, inverse);
         }
@@ -266,7 +341,9 @@ impl Lower<'_, '_> {
             Repr::Zst => Ok(None),
             Repr::Scalar(scalar) => Ok(Some(self.ins().volatile_load(scalar, from, 0))),
             Repr::Mem { .. } => {
-                let Some(slot) = self.slot(whole) else { return Ok(None) };
+                let Some(slot) = self.slot(whole) else {
+                    return Ok(None);
+                };
                 for (word, off) in self.volatile_chunks(ty)? {
                     let v = self.ins().volatile_load(word, from, off);
                     self.ins().stack_store(v, slot, off);
@@ -294,7 +371,11 @@ impl Lower<'_, '_> {
 
     fn read_at(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {
         let whole = repr(self.cx, ty)?;
-        let at = Place { base: Base::Addr(from), offset: 0, repr: whole };
+        let at = Place {
+            base: Base::Addr(from),
+            offset: 0,
+            repr: whole,
+        };
         let Repr::Mem { .. } = whole else {
             return Ok(self.read(at));
         };
@@ -312,7 +393,11 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         if size != 1 || self.b.is_const(count) {
-            let bytes = if size == 1 { count } else { self.ins().imul_imm(count, size) };
+            let bytes = if size == 1 {
+                count
+            } else {
+                self.ins().imul_imm(count, size)
+            };
             self.ins().copy(to, from, bytes);
             return Ok(());
         }
@@ -331,21 +416,37 @@ impl Lower<'_, '_> {
     }
 
     fn copy_small_or_bulk(&mut self, from: Value, to: Value, bytes: Value) {
-        let (small, big, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
-        let (ge8, lt8, ge4, lt4, nz) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
-        let is_small = self.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, bytes, 16);
+        let (small, big, done) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
+        let (ge8, lt8, ge4, lt4, nz) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
+        let is_small = self
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, bytes, 16);
         self.brif(is_small, (small, &[]), (big, &[]));
         self.enter(big);
         self.ins().copy(to, from, bytes);
         self.jump(done, &[]);
         self.enter(small);
-        let is_ge8 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bytes, 8);
+        let is_ge8 = self
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bytes, 8);
         self.brif(is_ge8, (ge8, &[]), (lt8, &[]));
         self.enter(ge8);
         self.copy_two_ends(Type::I64, 8, (from, to), bytes);
         self.jump(done, &[]);
         self.enter(lt8);
-        let is_ge4 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bytes, 4);
+        let is_ge4 = self
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bytes, 4);
         self.brif(is_ge4, (ge4, &[]), (lt4, &[]));
         self.enter(ge4);
         self.copy_two_ends(Type::I32, 4, (from, to), bytes);
@@ -357,9 +458,16 @@ impl Lower<'_, '_> {
         let last_off = self.ins().iadd_imm(bytes, -1);
         let one = self.ins().iconst(Type::I64, 1);
         let mid_off = self.ins().ushr(bytes, one);
-        let (src_mid, src_last) = (self.ins().iadd(from, mid_off), self.ins().iadd(from, last_off));
+        let (src_mid, src_last) = (
+            self.ins().iadd(from, mid_off),
+            self.ins().iadd(from, last_off),
+        );
         let (dst_mid, dst_last) = (self.ins().iadd(to, mid_off), self.ins().iadd(to, last_off));
-        let (b0, b1, b2) = (self.ins().load(Type::I8, from, 0), self.ins().load(Type::I8, src_mid, 0), self.ins().load(Type::I8, src_last, 0));
+        let (b0, b1, b2) = (
+            self.ins().load(Type::I8, from, 0),
+            self.ins().load(Type::I8, src_mid, 0),
+            self.ins().load(Type::I8, src_last, 0),
+        );
         self.ins().store(b0, to, 0);
         self.ins().store(b1, dst_mid, 0);
         self.ins().store(b2, dst_last, 0);
@@ -375,7 +483,12 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn call_libc(&mut self, symbol: RuntimeSymbol, args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
+    pub(super) fn call_libc(
+        &mut self,
+        symbol: RuntimeSymbol,
+        args: Vec<Value>,
+        ret: Option<Ty>,
+    ) -> Result<Option<Value>> {
         let usize_ty = self.cx.types.prim(Primitive::Usize);
         let code = self.ins().runtime(symbol);
         self.call_code(code, (vec![usize_ty; args.len()], ret), args)
@@ -396,8 +509,14 @@ impl Lower<'_, '_> {
         match self.b.const_int(count) {
             Some(0) => return Ok(self.ins().iconst(Type::I32, 0)),
             Some(1) => {
-                let (a0, b0) = (self.ins().load(Type::I8, x, 0), self.ins().load(Type::I8, y, 0));
-                let (u0, v0) = (self.ins().uextend(Type::I32, a0), self.ins().uextend(Type::I32, b0));
+                let (a0, b0) = (
+                    self.ins().load(Type::I8, x, 0),
+                    self.ins().load(Type::I8, y, 0),
+                );
+                let (u0, v0) = (
+                    self.ins().uextend(Type::I32, a0),
+                    self.ins().uextend(Type::I32, b0),
+                );
                 return Ok(self.ins().isub(u0, v0));
             }
             _ => {}
@@ -414,8 +533,14 @@ impl Lower<'_, '_> {
         self.brif(any, (nonempty, &[]), (done, &[zero]));
 
         self.enter(nonempty);
-        let (a0, b0) = (self.ins().load(Type::I8, x, 0), self.ins().load(Type::I8, y, 0));
-        let (u0, v0) = (self.ins().uextend(Type::I32, a0), self.ins().uextend(Type::I32, b0));
+        let (a0, b0) = (
+            self.ins().load(Type::I8, x, 0),
+            self.ins().load(Type::I8, y, 0),
+        );
+        let (u0, v0) = (
+            self.ins().uextend(Type::I32, a0),
+            self.ins().uextend(Type::I32, b0),
+        );
         let diff = self.ins().isub(u0, v0);
         let diff_nz = self.ins().icmp_imm(IntCC::NotEqual, diff, 0);
         self.brif(diff_nz, (done, &[diff]), (eq_first, &[]));
@@ -425,9 +550,14 @@ impl Lower<'_, '_> {
         self.brif(more, (tail, &[]), (done, &[zero]));
 
         self.enter(tail);
-        let (x1, y1, rem) = (self.ins().iadd_imm(x, 1), self.ins().iadd_imm(y, 1), self.ins().iadd_imm(count, -1));
+        let (x1, y1, rem) = (
+            self.ins().iadd_imm(x, 1),
+            self.ins().iadd_imm(y, 1),
+            self.ins().iadd_imm(count, -1),
+        );
         let int = self.cx.types.prim(Primitive::I32);
-        let Some(order) = self.call_libc(RuntimeSymbol::Memcmp, vec![x1, y1, rem], Some(int))? else {
+        let Some(order) = self.call_libc(RuntimeSymbol::Memcmp, vec![x1, y1, rem], Some(int))?
+        else {
             bail!("memcmp returned no value")
         };
         self.jump(done, &[order]);
@@ -437,7 +567,11 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn each(&mut self, count: Value, mut body: impl FnMut(&mut Self, Value)) {
-        let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let (head, inner, exit) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
         let index = self.b.append_block_param(head, Type::I64);
         let zero = self.ins().iconst(Type::I64, 0);
         self.jump(head, &[zero]);
@@ -451,10 +585,25 @@ impl Lower<'_, '_> {
         self.enter(exit);
     }
 
-    fn unchecked(&mut self, op: BinOp, (ty, by): (Ty, Option<Ty>), x: Value, y: Value) -> Result<Value> {
-        let Num::Int { ty: machine, signed } = self.num(ty)? else { bail!("unchecked {op:?} on a non-integer") };
+    fn unchecked(
+        &mut self,
+        op: BinOp,
+        (ty, by): (Ty, Option<Ty>),
+        x: Value,
+        y: Value,
+    ) -> Result<Value> {
+        let Num::Int {
+            ty: machine,
+            signed,
+        } = self.num(ty)?
+        else {
+            bail!("unchecked {op:?} on a non-integer")
+        };
         let y = match by.map(|by| self.num(by)).transpose()? {
-            Some(Num::Int { ty: from, signed: by_signed }) if from != machine => self.resize(y, (from, by_signed), machine),
+            Some(Num::Int {
+                ty: from,
+                signed: by_signed,
+            }) if from != machine => self.resize(y, (from, by_signed), machine),
             _ => y,
         };
         Ok(match (op, signed) {
@@ -469,7 +618,9 @@ impl Lower<'_, '_> {
     }
 
     fn compare(&mut self, ty: Ty, x: Value, y: Value) -> Result<Value> {
-        let Num::Int { signed, .. } = self.num(ty)? else { bail!("three_way_compare on a non-integer") };
+        let Num::Int { signed, .. } = self.num(ty)? else {
+            bail!("three_way_compare on a non-integer")
+        };
         let (less, greater) = match signed {
             true => (IntCC::SignedLessThan, IntCC::SignedGreaterThan),
             false => (IntCC::UnsignedLessThan, IntCC::UnsignedGreaterThan),

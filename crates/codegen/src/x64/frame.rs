@@ -49,7 +49,9 @@ impl Counter {
             self.int += 1;
             return match ty {
                 Type::F32 | Type::F64 if slot < WIN64_INT_ARGS.len() => Loc::Float(slot as u8),
-                Type::Vec { .. } if ty.bytes() == 8 && slot < WIN64_INT_ARGS.len() => Loc::Float(slot as u8),
+                Type::Vec { .. } if ty.bytes() == 8 && slot < WIN64_INT_ARGS.len() => {
+                    Loc::Float(slot as u8)
+                }
                 Type::F32 | Type::F64 => self.stack(WORD, WORD),
                 Type::Vec { .. } if ty.bytes() == 8 => self.stack(WORD, WORD),
                 Type::I128 | Type::Vec { .. } => self.stack(ty.bytes(), 16),
@@ -83,9 +85,32 @@ impl Counter {
 
 pub(super) fn classify(signature: &Signature, abi: CallAbi) -> Result<Abi, String> {
     let win64 = abi == CallAbi::Win64;
-    let mut params = Counter { int: 0, float: 0, stack: if win64 { 32 } else { 0 }, win64 };
-    let placed = signature.params.iter().map(|param| params.param(param.purpose, param.value_type)).collect();
-    let ints: &[Reg] = if signature.call_conv == CallConv::Internal { &[Reg::Rax, Reg::Rdx, Reg::Rcx, Reg::R8] } else { &INT_RETURNS };
-    let floats = if signature.call_conv == CallConv::Internal { 4 } else if win64 { 1 } else { FLOAT_RETURNS };
-    Ok(Abi { params: placed, returns: returns(signature, ints, floats)?, stack: round(params.stack, 16) })
+    let mut params = Counter {
+        int: 0,
+        float: 0,
+        stack: if win64 { 32 } else { 0 },
+        win64,
+    };
+    let placed = signature
+        .params
+        .iter()
+        .map(|param| params.param(param.purpose, param.value_type))
+        .collect();
+    let ints: &[Reg] = if signature.call_conv == CallConv::Internal {
+        &[Reg::Rax, Reg::Rdx, Reg::Rcx, Reg::R8]
+    } else {
+        &INT_RETURNS
+    };
+    let floats = if signature.call_conv == CallConv::Internal {
+        4
+    } else if win64 {
+        1
+    } else {
+        FLOAT_RETURNS
+    };
+    Ok(Abi {
+        params: placed,
+        returns: returns(signature, ints, floats)?,
+        stack: round(params.stack, 16),
+    })
 }

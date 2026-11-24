@@ -6,21 +6,21 @@ mod cargo;
 mod conv;
 mod driver;
 mod edit;
-mod ident;
-mod indirect;
-mod key;
-mod race;
-mod record;
-mod sources;
-mod statics;
 #[path = "../prep-driver/src/files.rs"]
 mod files;
 #[path = "../prep-driver/src/form.rs"]
 mod form;
+mod ident;
+mod indirect;
+mod key;
 #[path = "../prep-driver/src/print.rs"]
 mod print;
+mod race;
+mod record;
 #[path = "../prep-driver/src/source.rs"]
 mod source;
+mod sources;
+mod statics;
 
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
@@ -119,37 +119,73 @@ pub fn begin(workspace: &Workspace, targets: &Targets) -> Result<Started> {
     };
     let out = dir.join(RUSTC);
     let then = Snapshot::read(&out.join(bind::SNAPSHOT)).ok();
-    let sources = Sources::read(then.as_ref().map(|then| then.sources.paths()).unwrap_or_default());
+    let sources = Sources::read(
+        then.as_ref()
+            .map(|then| then.sources.paths())
+            .unwrap_or_default(),
+    );
     if let Some(mut then) = then.filter(|then| then.sources.same(&sources)) {
         then.sources = sources.clone();
         then.write(&out.join(bind::SNAPSHOT))?;
-        return Ok(Started { out, lock, sources, work: Work::Current });
+        return Ok(Started {
+            out,
+            lock,
+            sources,
+            work: Work::Current,
+        });
     }
     if sources.paths().is_empty() {
-        return Ok(Started { out, lock, sources, work: Work::Late });
+        return Ok(Started {
+            out,
+            lock,
+            sources,
+            work: Work::Late,
+        });
     }
     let (store, root, at) = (store(), root(workspace)?, out.clone());
     let build = std::thread::spawn(move || driver::run(toolchain, &store, &root, &at));
-    Ok(Started { out, lock, sources, work: Work::Early(build) })
+    Ok(Started {
+        out,
+        lock,
+        sources,
+        work: Work::Early(build),
+    })
 }
 
 impl Started {
     /// Finishes this prep once Haste loaded the build's sources into `outline`: keeps the library the driver built when it read those sources, else builds again from them, publishes it with a snapshot of them, and says what the library holds.
     pub fn end(self, outline: &Outline, workspace: &Workspace) -> Result<Counts> {
-        let Started { out, lock, sources, work } = self;
+        let Started {
+            out,
+            lock,
+            sources,
+            work,
+        } = self;
         match work {
             Work::Current => {}
-            Work::Early(build) => settle(&out, (sources, Some(joined(build))), (outline, workspace))?,
+            Work::Early(build) => {
+                settle(&out, (sources, Some(joined(build))), (outline, workspace))?
+            }
             Work::Late => settle(&out, (sources, None), (outline, workspace))?,
         }
         drop(lock);
-        let rustc = Bindings::read(&out, &Snapshot::take(outline, workspace), (outline, workspace), None)?.context("the prep driver's library does not match the sources")?;
-        Ok(Counts { records: rustc.len() })
+        let rustc = Bindings::read(
+            &out,
+            &Snapshot::take(outline, workspace),
+            (outline, workspace),
+            None,
+        )?
+        .context("the prep driver's library does not match the sources")?;
+        Ok(Counts {
+            records: rustc.len(),
+        })
     }
 
     /// Stops this prep when Haste cannot load the sources: waits for the driver build and drops what it made.
     pub fn cancel(self) {
-        let Work::Early(build) = self.work else { return };
+        let Work::Early(build) = self.work else {
+            return;
+        };
         if let Ok(fresh) = joined(build)
             && let Err(error) = std::fs::remove_dir_all(&fresh)
         {
@@ -160,11 +196,23 @@ impl Started {
 
 /// The directory the driver build `build` made, once it ends.
 fn joined(build: JoinHandle<Result<PathBuf>>) -> Result<PathBuf> {
-    build.join().map_err(|panic| anyhow::anyhow!("the prep build panicked: {}", crate::sync::panic_text(&*panic))).and_then(|built| built)
+    build
+        .join()
+        .map_err(|panic| {
+            anyhow::anyhow!(
+                "the prep build panicked: {}",
+                crate::sync::panic_text(&*panic)
+            )
+        })
+        .and_then(|built| built)
 }
 
 /// Publishes at `out` the library of the build in `built` when rustc read the sources that `outline` holds as `sources` says, else builds it again from the sources as they read now and publishes that unless one changed while the driver ran; each beside a snapshot of the sources.
-fn settle(out: &Path, (sources, built): (Sources, Option<Result<PathBuf>>), (outline, workspace): (&Outline, &Workspace)) -> Result<()> {
+fn settle(
+    out: &Path,
+    (sources, built): (Sources, Option<Result<PathBuf>>),
+    (outline, workspace): (&Outline, &Workspace),
+) -> Result<()> {
     let settled = sources.settled(outline, workspace)?;
     let (fresh, sources) = match built {
         Some(Ok(fresh)) if settled => (fresh, sources),
@@ -197,8 +245,14 @@ fn rebuild(out: &Path, (outline, workspace): (&Outline, &Workspace)) -> Result<(
 pub fn install(mut manifest: Manifest, args: &[String]) -> Result<()> {
     manifest.rustc.open()?;
     manifest.rustc.start(args)?;
-    let entries = manifest.entries.get_mut().map_err(|error| anyhow::anyhow!("vtable entries poisoned: {error}"))?;
-    entries.memory.reserve(ENTRY_BYTES).map_err(|error| anyhow::anyhow!("reserving vtable entry memory: {error:?}"))?;
+    let entries = manifest
+        .entries
+        .get_mut()
+        .map_err(|error| anyhow::anyhow!("vtable entries poisoned: {error}"))?;
+    entries
+        .memory
+        .reserve(ENTRY_BYTES)
+        .map_err(|error| anyhow::anyhow!("reserving vtable entry memory: {error:?}"))?;
     entries.memory.split(1, 0);
     if BOUND.set(manifest).is_err() {
         bail!("a prepped library is already bound");
@@ -225,7 +279,11 @@ pub fn decided() -> Option<Tally> {
 
 /// What binding decided for reached function `at`, when a manifest is installed and binding asked about it.
 pub fn why(reached: &Reached, at: usize) -> Option<String> {
-    BOUND.get()?.rustc.decision(reached.list[at].0).map(|decision| format!("{decision:?}"))
+    BOUND
+        .get()?
+        .rustc
+        .decision(reached.list[at].0)
+        .map(|decision| format!("{decision:?}"))
 }
 
 /// rustc's code for a reached function: its address, or a function in Haste's convention that calls it there.
@@ -242,16 +300,28 @@ pub fn bind(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<usize>
 /// The code that runs reached function `at` in rustc's code, when a manifest is installed and may bind it: rustc's own when its convention is Haste's, else an adapter to it.
 pub fn prepped(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<Prepped> {
     let (address, carries) = bound(cx, reached, at)?;
-    let Some(carries) = carries else { return Some(Prepped::Direct(address)) };
-    let Ok(typed) = &reached.list[at].1 else { return None };
+    let Some(carries) = carries else {
+        return Some(Prepped::Direct(address));
+    };
+    let Ok(typed) = &reached.list[at].1 else {
+        return None;
+    };
     let (params, ret) = signature(typed);
-    bridge::adapter(cx, (&params, ret), &carries, address).ok().map(Prepped::Adapter)
+    bridge::adapter(cx, (&params, ret), &carries, address)
+        .ok()
+        .map(Prepped::Adapter)
 }
 
 /// The address of rustc's code for reached function `at` and how its arguments reach it when any does not travel as Haste passes it, when a manifest is installed and may bind it.
-fn bound(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<(usize, Option<Vec<bridge::Carry>>)> {
+fn bound(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    at: usize,
+) -> Option<(usize, Option<Vec<bridge::Carry>>)> {
     let manifest = BOUND.get()?;
-    let (instance, Ok(typed)) = &reached.list[at] else { return None };
+    let (instance, Ok(typed)) = &reached.list[at] else {
+        return None;
+    };
     match manifest.rustc.decide(cx, *instance, typed) {
         (Decision::Bound(address), carries) => Some((address, carries)),
         _ => None,
@@ -272,38 +342,87 @@ pub fn vtable(cx: &mut Context<'_>, ty: Ty) -> Option<Arc<Vtable>> {
 }
 
 /// The address of a function in rustc's convention for vtable slot `method` that runs reached function `index` in Haste's convention through its call table entry, which `slots` places; made once per function and slot shape.
-pub fn entry(cx: &mut Context<'_>, slots: &dyn Slots, index: usize, method: &Method) -> Result<u64> {
-    let Some(manifest) = BOUND.get() else { bail!("a vtable entry with no bound library") };
+pub fn entry(
+    cx: &mut Context<'_>,
+    slots: &dyn Slots,
+    index: usize,
+    method: &Method,
+) -> Result<u64> {
+    let Some(manifest) = BOUND.get() else {
+        bail!("a vtable entry with no bound library")
+    };
     let key = (index, method.carries.clone());
-    if let Some(address) = manifest.entries.lock().ok().and_then(|entries| entries.placed.get(&key).copied()) {
+    if let Some(address) = manifest
+        .entries
+        .lock()
+        .ok()
+        .and_then(|entries| entries.placed.get(&key).copied())
+    {
         return Ok(address);
     }
-    let func = bridge::entry(cx, (&method.params, method.ret), &method.carries, slots.entry(index))?;
-    let compiled = haste_codegen::compile(func, &crate::host_target()).map_err(|error| anyhow::anyhow!("compiling a vtable entry: {error:?}"))?;
+    let func = bridge::entry(
+        cx,
+        (&method.params, method.ret),
+        &method.carries,
+        slots.entry(index),
+    )?;
+    let compiled = haste_codegen::compile(func, &crate::host_target())
+        .map_err(|error| anyhow::anyhow!("compiling a vtable entry: {error:?}"))?;
     if !compiled.relocs().is_empty() || !compiled.sites().is_empty() {
         bail!("a vtable entry whose code names addresses it is placed at");
     }
     let mut entries = crate::sync::lock(&manifest.entries);
-    let address = entries.memory.write(compiled.bytes()).map_err(|error| anyhow::anyhow!("placing a vtable entry: {error:?}"))? as u64;
+    let address = entries
+        .memory
+        .write(compiled.bytes())
+        .map_err(|error| anyhow::anyhow!("placing a vtable entry: {error:?}"))?
+        as u64;
     entries.placed.insert(key, address);
     Ok(address)
 }
 
 /// Calls rustc's code at `code` through a vtable slot or function pointer from Haste's code, with the Haste-convention argument values `values` of a call taking `params` and returning `ret`, each reaching rustc's convention as `carries` says, and returns the call's results.
-pub fn call_native(cx: &mut Context<'_>, b: &mut haste_codegen::FunctionBuilder<'_>, ((params, ret), carries): ((&[Ty], Option<Ty>), &[Carry]), (code, values): (haste_codegen::Value, &[haste_codegen::Value])) -> Result<Vec<haste_codegen::Value>> {
+pub fn call_native(
+    cx: &mut Context<'_>,
+    b: &mut haste_codegen::FunctionBuilder<'_>,
+    ((params, ret), carries): ((&[Ty], Option<Ty>), &[Carry]),
+    (code, values): (haste_codegen::Value, &[haste_codegen::Value]),
+) -> Result<Vec<haste_codegen::Value>> {
     let shapes = bridge::shapes(cx, (params, ret), carries)?;
     Ok(bridge::call_native(b, &shapes, code, values))
 }
 
 /// The manifest that `prep` stored for the build of `workspace` when one matches its key and the sources outside functions, read with what `ahead` read of it, or why it cannot be read, and whether it was built from the sources as they are now.
-pub fn load(outline: &Outline, workspace: &Workspace, ahead: Option<&mut Ahead>) -> Result<(Result<Option<Manifest>>, bool)> {
+pub fn load(
+    outline: &Outline,
+    workspace: &Workspace,
+    ahead: Option<&mut Ahead>,
+) -> Result<(Result<Option<Manifest>>, bool)> {
     if !SUPPORTED {
         return Ok((Ok(None), true));
     }
     let key = key(&outline.pins, workspace, toolchain()?)?;
-    let rustc = Bindings::read(&dir(key).join(RUSTC), &Snapshot::take(outline, workspace), (outline, workspace), ahead.and_then(Ahead::manifest));
-    let current = rustc.as_ref().is_ok_and(|rustc| rustc.as_ref().is_some_and(Bindings::current));
-    Ok((rustc.map(|rustc| rustc.map(|rustc| Manifest { rustc, entries: Mutex::new(Entries { memory: haste_codegen::Memory::default(), placed: HashMap::default() }) })), current))
+    let rustc = Bindings::read(
+        &dir(key).join(RUSTC),
+        &Snapshot::take(outline, workspace),
+        (outline, workspace),
+        ahead.and_then(Ahead::manifest),
+    );
+    let current = rustc
+        .as_ref()
+        .is_ok_and(|rustc| rustc.as_ref().is_some_and(Bindings::current));
+    Ok((
+        rustc.map(|rustc| {
+            rustc.map(|rustc| Manifest {
+                rustc,
+                entries: Mutex::new(Entries {
+                    memory: haste_codegen::Memory::default(),
+                    placed: HashMap::default(),
+                }),
+            })
+        }),
+        current,
+    ))
 }
 
 /// Starts `haste --release prep` on the build's member package in the background, unless a prep of the build runs now; it never waits for it.
@@ -319,8 +438,16 @@ pub fn refresh(outline: &Outline, workspace: &Workspace) -> Result<()> {
 /// The lock that one prep of the build in `dir` holds while it runs, waiting for it when `wait` is set, or none when another process holds it and `wait` is not set.
 #[cfg(unix)]
 fn lock(dir: &Path, wait: bool) -> Result<Option<std::fs::File>> {
-    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(LOCK))?;
-    let mode = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK))?;
+    let mode = if wait {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
     // SAFETY: the descriptor belongs to `file`, which lives across the call; flock only changes the lock the open file holds.
     let held = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), mode) } == 0;
     Ok(held.then_some(file))
@@ -335,7 +462,8 @@ fn lock(_dir: &Path, _wait: bool) -> Result<Option<std::fs::File>> {
 #[cfg(unix)]
 fn handed(dir: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::MetadataExt as _;
-    let input = std::fs::File::from(std::os::fd::AsFd::as_fd(&std::io::stdin()).try_clone_to_owned()?);
+    let input =
+        std::fs::File::from(std::os::fd::AsFd::as_fd(&std::io::stdin()).try_clone_to_owned()?);
     let (held, at) = (input.metadata(), std::fs::metadata(dir.join(LOCK)));
     let same = matches!((held, at), (Ok(held), Ok(at)) if held.is_file() && (held.dev(), held.ino()) == (at.dev(), at.ino()));
     Ok(same.then_some(input))
@@ -358,7 +486,13 @@ fn open(path: &Path) -> Result<()> {
     // SAFETY: dlerror takes no arguments and returns null or a message that stays valid until the next dynamic linker call on this thread.
     let reason = unsafe { libc::dlerror() };
     // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
-    let reason = if reason.is_null() { String::new() } else { unsafe { CStr::from_ptr(reason) }.to_string_lossy().into_owned() };
+    let reason = if reason.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(reason) }
+            .to_string_lossy()
+            .into_owned()
+    };
     bail!("loading {}: {reason}", path.display())
 }
 
@@ -369,15 +503,34 @@ fn open(path: &Path) -> Result<()> {
 }
 
 fn signature(typed: &Typed) -> (Vec<Ty>, Option<Ty>) {
-    (typed.params.iter().map(|&local| typed.locals[local as usize].ty).collect(), typed.ret)
+    (
+        typed
+            .params
+            .iter()
+            .map(|&local| typed.locals[local as usize].ty)
+            .collect(),
+        typed.ret,
+    )
 }
 
 /// The key of everything prepped code depends on besides the local sources: the manifest format, the driver, the toolchain, the target, the dependency graph by the pins of its crates, and the workspace.
 fn key(pins: &[Option<u64>], workspace: &Workspace, toolchain: &Toolchain) -> Result<u64> {
     let root = root(workspace)?;
     let triple = crate::graph::cfg::Target::host().triple;
-    let format = (ABI_VERSION, driver::sources(), cargo::SETTINGS, crate::profile());
-    Ok(rustc_hash::FxBuildHasher.hash_one((format, &toolchain.version, &toolchain.library, triple, pins, root)))
+    let format = (
+        ABI_VERSION,
+        driver::sources(),
+        cargo::SETTINGS,
+        crate::profile(),
+    );
+    Ok(rustc_hash::FxBuildHasher.hash_one((
+        format,
+        &toolchain.version,
+        &toolchain.library,
+        triple,
+        pins,
+        root,
+    )))
 }
 
 /// The pins of the crates of the build of `workspace`, which its outline holds before any source loads.
@@ -395,7 +548,11 @@ fn toolchain() -> Result<&'static Toolchain> {
 }
 
 fn root(workspace: &Workspace) -> Result<PathBuf> {
-    let member = workspace.graph.members.first().context("the workspace has no member package")?;
+    let member = workspace
+        .graph
+        .members
+        .first()
+        .context("the workspace has no member package")?;
     Ok(workspace.packages[*member].manifest.dir.clone())
 }
 

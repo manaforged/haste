@@ -52,16 +52,34 @@ impl Reached {
         self.index.values_mut().for_each(|at| *at = new_of[*at]);
         self.call_sites = CallSites::default();
         let states = &self.states;
-        recount_call_sites(len, |at| states[at] == ReachedEntry::Settled, &self.calls, &self.indirect, &self.pinned, &mut self.call_sites);
+        recount_call_sites(
+            len,
+            |at| states[at] == ReachedEntry::Settled,
+            &self.calls,
+            &self.indirect,
+            &self.pinned,
+            &mut self.call_sites,
+        );
     }
 }
 
 fn instance_key(cx: &Context<'_>, (item, substs): Instance) -> (ItemRef, Vec<u64>) {
-    (item, cx.types.substs(substs).iter().map(|&ty| type_id_key(cx.outline, &cx.types, ty)).collect())
+    (
+        item,
+        cx.types
+            .substs(substs)
+            .iter()
+            .map(|&ty| type_id_key(cx.outline, &cx.types, ty))
+            .collect(),
+    )
 }
 
 fn permute<T>(items: &mut Vec<T>, new_of: &[usize]) {
-    let mut tagged: Vec<(usize, T)> = std::mem::take(items).into_iter().enumerate().map(|(old, item)| (new_of[old], item)).collect();
+    let mut tagged: Vec<(usize, T)> = std::mem::take(items)
+        .into_iter()
+        .enumerate()
+        .map(|(old, item)| (new_of[old], item))
+        .collect();
     tagged.sort_unstable_by_key(|&(new, _)| new);
     items.extend(tagged.into_iter().map(|(_, item)| item));
 }

@@ -1,6 +1,9 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_load, is_atomic_barrier, is_rodata, may_alias, may_alias_at};
+use crate::mem::{
+    KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_load, is_atomic_barrier, is_rodata,
+    may_alias, may_alias_at,
+};
 use crate::merge::find;
 
 const MAX_MERGE_WALK: usize = 32;
@@ -49,7 +52,12 @@ pub(super) fn loc_immutable(func: &Function, loc: MemLoc) -> bool {
 }
 
 /// Whether `op` may overwrite `loc`, treating immutable `.rodata` and `Freeze` `ReadonlyParam` accesses as un-clobbered by calls, alien stores, or non-aliasing atomics.
-pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
+pub(super) fn clobbers_loc(
+    func: &Function,
+    (op, at): (&Op, Option<Inst>),
+    loc: MemLoc,
+    prov: &Provenance,
+) -> bool {
     if is_rodata(func, loc) {
         return false;
     }
@@ -59,7 +67,9 @@ pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: 
                 let w = prov.loc(addr, i64::from(off), func.ty(val).bytes());
                 w.root == loc.root && may_alias(w, loc, prov)
             }
-            Op::AtomicStore(val, addr, _) | Op::AtomicRmw(_, _, addr, val) | Op::AtomicCas(_, addr, _, val) => {
+            Op::AtomicStore(val, addr, _)
+            | Op::AtomicRmw(_, _, addr, val)
+            | Op::AtomicCas(_, addr, _, val) => {
                 let w = prov.loc(addr, 0, func.ty(val).bytes());
                 w.root == loc.root && may_alias(w, loc, prov)
             }
@@ -95,8 +105,15 @@ fn save_immutable_entries(
     saved
 }
 
-pub(super) fn invalidate_preserving(func: &Function, known: &mut KnownLoads, bases: &[(MemBase, MemRoot)], op: (&Op, Option<Inst>), prov: &Provenance) {
-    let saved = save_immutable_entries(func, known, bases, |loc| !clobbers_loc(func, op, loc, prov));
+pub(super) fn invalidate_preserving(
+    func: &Function,
+    known: &mut KnownLoads,
+    bases: &[(MemBase, MemRoot)],
+    op: (&Op, Option<Inst>),
+    prov: &Provenance,
+) {
+    let saved =
+        save_immutable_entries(func, known, bases, |loc| !clobbers_loc(func, op, loc, prov));
     known.invalidate(func, op, prov);
     for (loc, ty, val) in saved {
         known.remember(loc, ty, val);
@@ -114,7 +131,9 @@ pub(super) fn write_preserving(
     at: Option<Inst>,
 ) {
     let saved = save_immutable_entries(func, known, bases, |loc| {
-        matches!(loc.root, MemRoot::Global(_)) || wloc.root != loc.root || !may_alias_at(wloc, loc, prov, at)
+        matches!(loc.root, MemRoot::Global(_))
+            || wloc.root != loc.root
+            || !may_alias_at(wloc, loc, prov, at)
     });
     known.write_at(wloc, ty, value, prov, at);
     for (loc, ety, eval) in saved {
@@ -130,7 +149,15 @@ impl<'a> BlockWrites<'a> {
             for &inst in &block.insts {
                 let op = &func.insts[inst.index()].op;
                 if is_atomic_barrier(op)
-                    || matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. })
+                    || matches!(
+                        op,
+                        Op::Store(..)
+                            | Op::StackStore(..)
+                            | Op::Copy(..)
+                            | Op::Move(..)
+                            | Op::Call { .. }
+                            | Op::TryCall { .. }
+                    )
                 {
                     writes[b_idx].push(inst);
                 }
@@ -198,7 +225,10 @@ impl<'a> BlockWrites<'a> {
             return (KnownLoads::new(), Vec::new());
         }
         if let Some(pred) = self.cfg.single_pred(block) {
-            return (known_out[pred.index()].clone(), block_bases[pred.index()].clone());
+            return (
+                known_out[pred.index()].clone(),
+                block_bases[pred.index()].clone(),
+            );
         }
         let block_rank = self.rank[block.index()];
         let preds = self.cfg.preds_of(block);
@@ -217,14 +247,21 @@ impl<'a> BlockWrites<'a> {
             if known_out[pred.index()].is_empty() {
                 return (KnownLoads::new(), Vec::new());
             }
-            if min_pred.is_none_or(|p: Block| block_bases[pred.index()].len() < block_bases[p.index()].len()) {
+            if min_pred.is_none_or(|p: Block| {
+                block_bases[pred.index()].len() < block_bases[p.index()].len()
+            }) {
                 min_pred = Some(pred);
             }
         }
         if forward {
-            let Some(p0) = min_pred else { return (KnownLoads::new(), Vec::new()) };
+            let Some(p0) = min_pred else {
+                return (KnownLoads::new(), Vec::new());
+            };
             if reach_count == 1 {
-                return (known_out[p0.index()].clone(), block_bases[p0.index()].clone());
+                return (
+                    known_out[p0.index()].clone(),
+                    block_bases[p0.index()].clone(),
+                );
             }
             let mut out = KnownLoads::new();
             let mut out_bases = Vec::new();
@@ -263,7 +300,8 @@ impl<'a> BlockWrites<'a> {
         let mut work = Vec::new();
         let mut walked = 0_usize;
         for &pred in preds {
-            if self.cfg.reachable[pred.index()] && pred != dom && self.visit[pred.index()] != epoch {
+            if self.cfg.reachable[pred.index()] && pred != dom && self.visit[pred.index()] != epoch
+            {
                 self.visit[pred.index()] = epoch;
                 walked += 1;
                 if walked > MAX_MERGE_WALK {
@@ -277,13 +315,22 @@ impl<'a> BlockWrites<'a> {
             for &w in &self.writes[m.index()] {
                 let raw_op = &func.insts[w.index()].op;
                 let canon = canonical_write(raw_op, subst);
-                invalidate_preserving(func, &mut known, dom_bases, (canon.as_ref().unwrap_or(raw_op), Some(w)), self.prov);
+                invalidate_preserving(
+                    func,
+                    &mut known,
+                    dom_bases,
+                    (canon.as_ref().unwrap_or(raw_op), Some(w)),
+                    self.prov,
+                );
                 if known.is_empty() {
                     return (known, Vec::new());
                 }
             }
             for &pred in self.cfg.preds_of(m) {
-                if self.cfg.reachable[pred.index()] && pred != dom && self.visit[pred.index()] != epoch {
+                if self.cfg.reachable[pred.index()]
+                    && pred != dom
+                    && self.visit[pred.index()] != epoch
+                {
                     self.visit[pred.index()] = epoch;
                     walked += 1;
                     if walked > MAX_MERGE_WALK {

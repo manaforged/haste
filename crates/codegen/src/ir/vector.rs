@@ -24,13 +24,19 @@ impl Lane {
     }
 
     /// Width of one lane in bits.
-    pub const fn bits(self) -> u32 { self.bytes() * 8 }
+    pub const fn bits(self) -> u32 {
+        self.bytes() * 8
+    }
 
     /// Whether this lane holds a floating-point number.
-    pub const fn is_float(self) -> bool { matches!(self, Self::F32 | Self::F64) }
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
 
     /// Whether this lane holds an integer.
-    pub const fn is_int(self) -> bool { !self.is_float() }
+    pub const fn is_int(self) -> bool {
+        !self.is_float()
+    }
 
     /// The scalar IR type matching this lane.
     pub const fn to_type(self) -> Type {
@@ -71,7 +77,11 @@ impl Type {
     /// Whether `self` is a 32-byte power-of-two vector type of at most 16 lanes, which only a host with 256-bit registers holds in one register.
     pub const fn is_wide_vec(self) -> bool {
         match self {
-            Type::Vec { lane, count } => count.is_power_of_two() && count as usize <= MASK_LANES && lane.bytes() * (count as u32) == 32,
+            Type::Vec { lane, count } => {
+                count.is_power_of_two()
+                    && count as usize <= MASK_LANES
+                    && lane.bytes() * (count as u32) == 32
+            }
             _ => false,
         }
     }
@@ -79,8 +89,20 @@ impl Type {
     /// The 32-byte vector type that holds two 16-byte vectors of type `self`: twice its lanes, or four `I64` lanes in place of 32 byte lanes.
     pub const fn double_vec(self) -> Option<Type> {
         match self {
-            Type::Vec { lane, count } if lane.bytes() * (count as u32) == 16 && count.is_power_of_two() => {
-                Some(if count as usize * 2 <= MASK_LANES { Type::Vec { lane, count: count * 2 } } else { Type::Vec { lane: Lane::I64, count: 4 } })
+            Type::Vec { lane, count }
+                if lane.bytes() * (count as u32) == 16 && count.is_power_of_two() =>
+            {
+                Some(if count as usize * 2 <= MASK_LANES {
+                    Type::Vec {
+                        lane,
+                        count: count * 2,
+                    }
+                } else {
+                    Type::Vec {
+                        lane: Lane::I64,
+                        count: 4,
+                    }
+                })
             }
             _ => None,
         }
@@ -94,7 +116,10 @@ impl Type {
     /// The 16-byte vector type with the lanes of the 32-byte vector type `self`.
     pub const fn half_vec(self) -> Option<Type> {
         match self {
-            Type::Vec { lane, count } if self.is_wide_vec() => Some(Type::Vec { lane, count: count / 2 }),
+            Type::Vec { lane, count } if self.is_wide_vec() => Some(Type::Vec {
+                lane,
+                count: count / 2,
+            }),
             _ => None,
         }
     }
@@ -204,7 +229,9 @@ impl IntCC {
             IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => (false, false, false),
             IntCC::SignedLessThan | IntCC::UnsignedLessThan => (false, true, false),
             IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => (false, false, true),
-            IntCC::SignedGreaterThanOrEqual | IntCC::UnsignedGreaterThanOrEqual => (false, true, true),
+            IntCC::SignedGreaterThanOrEqual | IntCC::UnsignedGreaterThanOrEqual => {
+                (false, true, true)
+            }
         }
     }
 }
@@ -218,11 +245,26 @@ pub struct TinyArgs {
 
 impl TinyArgs {
     /// Constructs a 1-operand list.
-    pub const fn one(a: Value) -> Self { Self { args: [a, Value(0), Value(0)], len: 1 } }
+    pub const fn one(a: Value) -> Self {
+        Self {
+            args: [a, Value(0), Value(0)],
+            len: 1,
+        }
+    }
     /// Constructs a 2-operand list.
-    pub const fn two(a: Value, b: Value) -> Self { Self { args: [a, b, Value(0)], len: 2 } }
+    pub const fn two(a: Value, b: Value) -> Self {
+        Self {
+            args: [a, b, Value(0)],
+            len: 2,
+        }
+    }
     /// Constructs a 3-operand list.
-    pub const fn three(a: Value, b: Value, c: Value) -> Self { Self { args: [a, b, c], len: 3 } }
+    pub const fn three(a: Value, b: Value, c: Value) -> Self {
+        Self {
+            args: [a, b, c],
+            len: 3,
+        }
+    }
     /// Constructs a list from 1 to 3 values.
     pub fn from_slice(values: &[Value]) -> Option<Self> {
         match values {
@@ -233,9 +275,13 @@ impl TinyArgs {
         }
     }
     /// Returns the active operands.
-    pub fn as_slice(&self) -> &[Value] { &self.args[..usize::from(self.len)] }
+    pub fn as_slice(&self) -> &[Value] {
+        &self.args[..usize::from(self.len)]
+    }
     /// Returns mutable access to the active operands.
-    pub fn as_mut_slice(&mut self) -> &mut [Value] { &mut self.args[..usize::from(self.len)] }
+    pub fn as_mut_slice(&mut self) -> &mut [Value] {
+        &mut self.args[..usize::from(self.len)]
+    }
 }
 
 /// Bitset of IR facets invalidated or changed by a pass.
@@ -249,44 +295,66 @@ impl Domain {
     pub(crate) const MEM: Self = Self(4);
 
     /// Whether no facet bit is set.
-    pub(crate) const fn is_empty(self) -> bool { self.0 == 0 }
+    pub(crate) const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
     /// Whether any bit in `other` is set in `self`.
-    pub(crate) const fn contains(self, other: Self) -> bool { (self.0 & other.0) != 0 }
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
     /// Union of two domain bitsets.
-    pub(crate) const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 impl std::ops::BitOr for Domain {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 impl std::ops::BitOrAssign for Domain {
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
 impl std::ops::BitAnd for Domain {
     type Output = Self;
-    fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) }
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
 }
 
 /// Thread-safe cached CFG tied to a function's `cfg_rev`.
-pub(crate) struct CfgCache(pub(super) std::sync::Mutex<Option<(u32, std::sync::Arc<crate::cfg::Cfg>)>>);
+pub(crate) struct CfgCache(
+    pub(super) std::sync::Mutex<Option<(u32, std::sync::Arc<crate::cfg::Cfg>)>>,
+);
 
 impl Default for CfgCache {
-    fn default() -> Self { Self(std::sync::Mutex::new(None)) }
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
 }
 
 impl Clone for CfgCache {
-    fn clone(&self) -> Self { Self::default() }
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl PartialEq for CfgCache {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 impl Eq for CfgCache {}
 
 impl std::fmt::Debug for CfgCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("CfgCache") }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CfgCache")
+    }
 }
