@@ -1,7 +1,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use haste_codegen::{Code, CodeUnwindDrop, StencilReloc};
+use haste_codegen::{Code, CodeUnwindDrop, Site, StencilReloc};
 use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
 use crate::host::HostSymbol;
@@ -27,6 +27,7 @@ use super::Image;
 #[derive(Clone)]
 pub(super) struct AotCode {
     bytes: Vec<u8>,
+    sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
     loops: Vec<std::ops::Range<u32>>,
     lines: Vec<(u32, u64)>,
@@ -37,11 +38,16 @@ impl AotCode {
     pub(super) fn from_code(code: &Code) -> Arc<Self> {
         Arc::new(Self {
             bytes: code.bytes().to_vec(),
+            sites: code.sites().to_vec(),
             relocs: code.relocs().to_vec(),
             loops: code.loops().to_vec(),
             lines: code.lines().to_vec(),
             unwind_drops: code.unwind_drops().to_vec(),
         })
+    }
+
+    pub(super) fn sites(&self) -> &[Site] {
+        &self.sites
     }
 
     pub(super) fn loops(&self) -> &[std::ops::Range<u32>] {

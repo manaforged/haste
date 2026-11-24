@@ -179,6 +179,44 @@ pub(in crate::aot) fn emit_arm64_start_panic(
     addrs: SectionAddrs,
     out: &mut Buf,
 ) -> Result<()> {
+    if !c.win {
+        out.words(&[
+            0xA9BC_7BFD,
+            0x9100_03FD,
+            0xA901_53F3,
+            0xA902_5BF5,
+            0xA903_63F7,
+            0xD100_C3FF,
+            0xAA00_03F4,
+            0xAA01_03F6,
+        ]);
+        emit_arm64_unwind_state(c, addrs, out)?;
+        let no_state = arm64_fwd(0xB400_0000, out);
+        out.words(&[
+            0xAA00_03F3,
+            0xF940_0EC8,
+            0xAA14_03E0,
+            0xD63F_0100,
+            0xAA00_03F4,
+            0xAA01_03F5,
+            0xA900_7FF3,
+            0xF900_13FF,
+        ]);
+        emit_arm64_walk_call(c, addrs, true, out);
+        let uncaught = arm64_fwd(0xB400_0000, out);
+        out.words(&[
+            0xA901_5674,
+            0x9100_4260,
+            0xA941_77E9,
+            0xF940_13EA,
+            0x9100_015F,
+            0xD61F_0120,
+        ]);
+        arm64_here(&[no_state, uncaught], out);
+        c.call("abort", out)?;
+        out.u32(0xD420_0020);
+        return Ok(());
+    }
     out.words(&[
         0xA9BC_7BFD,
         0x9100_03FD,
@@ -200,32 +238,16 @@ pub(in crate::aot) fn emit_arm64_start_panic(
         0xA901_06E0,
         0xF900_02F3,
     ]);
-    emit_arm64_walk_call(c, addrs, out);
-    if c.win {
-        c.words_call(&[0x9100_C2E0, 0x5280_0021], "longjmp", out)?;
-    } else {
-        out.words(&[
-            0xA945_6AF9,
-            0xA946_72FB,
-            0x6D47_26E8,
-            0x6D48_2EEA,
-            0x6D49_36EC,
-            0x6D4A_3EEE,
-            0xF940_12FD,
-            0x9100_02FF,
-            0xF940_22E9,
-            0xA943_5EF6,
-            0xD61F_0120,
-        ]);
-    }
+    emit_arm64_walk_call(c, addrs, false, out);
+    c.words_call(&[0x9100_C2E0, 0x5280_0021], "longjmp", out)?;
     arm64_here(&[no_state, no_frame], out);
     c.call("abort", out)?;
     out.u32(0xD420_0020);
     Ok(())
 }
 
-fn emit_arm64_walk_call(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) {
-    out.words(&[0xAA1D_03E0, 0xAA17_03E1]);
+fn emit_arm64_walk_call(c: &Emit<'_>, addrs: SectionAddrs, ctx_sp: bool, out: &mut Buf) {
+    out.words(&[0xAA1D_03E0, if ctx_sp { 0x9100_03E1 } else { 0xAA17_03E1 }]);
     emit_arm64_adrp_add(c.at(out), addrs.text, 2, out);
     if addrs.unwind_table == 0 {
         out.u32(0xD280_0003);

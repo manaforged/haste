@@ -288,7 +288,10 @@ impl Emit<'_> {
     }
 
     pub(super) fn epilogue_body(&mut self) {
-        for (index, &reg) in self.frame.saves.iter().enumerate() {
+        for (index, &reg) in self.frame.saves[..self.frame.restore_saves]
+            .iter()
+            .enumerate()
+        {
             self.asm
                 .load(Size::Q, reg, self.frame_mem(save_offset(index)));
         }
@@ -677,6 +680,14 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
 
     fn put_exception(&mut self, value: Value) {
         self.put(value, Reg::Rax);
+    }
+
+    fn restore_try_saves(&mut self) {
+        let start = self.frame.restore_saves;
+        for (i, &reg) in self.frame.saves[start..].iter().enumerate() {
+            self.asm
+                .load(Size::Q, reg, self.frame_mem(save_offset(start + i)));
+        }
     }
 
     fn push_site(&mut self, site: Site) {

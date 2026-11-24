@@ -384,6 +384,41 @@ impl Lower<'_, '_> {
         let &[try_fn, data, catch_fn] = args else {
             bail!("catch_unwind takes three arguments")
         };
+        if crate::compile_target().os != haste_codegen::Os::Windows {
+            if !self.open {
+                return Ok(self.ins().iconst(Type::I32, 0));
+            }
+            let mut try_sig = Signature::new(CallConv::Native);
+            try_sig.params.push(AbiParam::new(Type::I64));
+            let try_sig = self.b.import_signature(try_sig);
+            let mut catch_sig = Signature::new(CallConv::Native);
+            catch_sig.params.push(AbiParam::new(Type::I64));
+            catch_sig.params.push(AbiParam::new(Type::I64));
+            let catch_sig = self.b.import_signature(catch_sig);
+            let normal = self.b.create_block();
+            let handler = self.b.create_block();
+            let done = self.b.create_block();
+            let payload = self.b.append_block_param(handler, Type::I64);
+            let res = self.b.append_block_param(done, Type::I32);
+            self.ins()
+                .try_call_indirect(try_sig, try_fn, &[data], normal, handler);
+            self.close();
+            self.enter(normal);
+            let zero = self.ins().iconst(Type::I32, 0);
+            self.jump(done, &[zero]);
+            self.enter(handler);
+            self.ins()
+                .call_indirect(catch_sig, catch_fn, &[data, payload]);
+            let (slot, restore) = match self.caller_loc_guard {
+                Some((slot, prev)) => (slot, prev),
+                None => (self.caller_loc_slot()?, self.ins().iconst(Type::I64, 0)),
+            };
+            self.ins().store(restore, slot, 0);
+            let one = self.ins().iconst(Type::I32, 1);
+            self.jump(done, &[one]);
+            self.enter(done);
+            return Ok(res);
+        }
         let res = self
             .call_host(
                 HostSymbol::CatchUnwind,

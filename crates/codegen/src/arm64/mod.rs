@@ -561,7 +561,7 @@ impl Emit<'_> {
         if self.framed {
             emit_save_pairs(
                 &mut self.asm,
-                &self.frame.saves,
+                &self.frame.saves[..self.frame.restore_saves],
                 0,
                 |asm, disp, a, b| match b {
                     Some(r0) => asm.ldp_offset(a, r0, FP, disp),
@@ -570,7 +570,7 @@ impl Emit<'_> {
             );
             emit_save_pairs(
                 &mut self.asm,
-                &self.frame.float_saves,
+                &self.frame.float_saves[..self.frame.restore_floats],
                 self.frame.saves.len(),
                 |asm, disp, a, b| match b {
                     Some(v0) => asm.fldp_offset(Vreg(a), Vreg(v0), FP, disp),
@@ -582,6 +582,27 @@ impl Emit<'_> {
             }
             self.asm.ldp_post(FP, LR, SP, 16);
         }
+    }
+
+    pub(super) fn restore_extra_saves(&mut self) {
+        emit_save_pairs(
+            &mut self.asm,
+            &self.frame.saves[self.frame.restore_saves..],
+            self.frame.restore_saves,
+            |asm, disp, a, b| match b {
+                Some(r0) => asm.ldp_offset(a, r0, FP, disp),
+                None => asm.load(Size::X, false, a, Mem::new(FP, disp)),
+            },
+        );
+        emit_save_pairs(
+            &mut self.asm,
+            &self.frame.float_saves[self.frame.restore_floats..],
+            self.frame.saves.len() + self.frame.restore_floats,
+            |asm, disp, a, b| match b {
+                Some(v0) => asm.fldp_offset(Vreg(a), Vreg(v0), FP, disp),
+                None => asm.vload(8, Vreg(a), Mem::new(FP, disp)),
+            },
+        );
     }
 
     fn epilogue(&mut self) {

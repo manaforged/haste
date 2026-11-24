@@ -88,6 +88,7 @@ impl Image {
             return self.apply_frozen_aot_group((cx, reached), group, rep, &slice, pass);
         }
         let unwind_drops = slice.decode_unwind_drops().ok()?;
+        let sites = slice.decode_sites().ok()?;
         for inst in &group.distinct {
             if self.backend.is_check() {
                 pass.record_size(inst.leader, slice.code().len() as u32, 0);
@@ -98,7 +99,11 @@ impl Image {
                 Ok(exec) => exec,
                 Err(e) => return Some(Err(item_err(cx, group.item, e))),
             };
-            self.register_jit_drops(exec, patched.len(), &unwind_drops, &inst.symbols);
+            self.register_jit_drops(
+                (exec, patched.len()),
+                (&unwind_drops, &sites),
+                &inst.symbols,
+            );
             self.store_instance(inst, exec);
             pass.record_size(inst.leader, patched.len() as u32, 0);
         }
@@ -282,9 +287,16 @@ impl Image {
         {
             bail!("dictionary body has non-runtime relocations");
         }
-        pass.memory
+        let exec = pass
+            .memory
             .write_patched(code, &[])
-            .map_err(|err| anyhow::anyhow!("{err}"))
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        self.register_jit_drops(
+            (exec, code.bytes().len()),
+            (code.unwind_drops(), code.sites()),
+            &[],
+        );
+        Ok(exec)
     }
 
     fn emit_dict_inst(

@@ -34,6 +34,7 @@ pub(super) fn emit_walk(arch: Arch, os: Os, out: &mut Buf) -> Result<()> {
 fn build_unwind_walk() -> Function {
     let mut sig = Signature::new(CallConv::Native);
     sig.params = vec![AbiParam::new(Type::I64); 4];
+    sig.returns = vec![AbiParam::new(Type::I64)];
     let mut func = Function::new(sig);
     let mut b = FunctionBuilder::new(&mut func);
     let mut drop_sig = Signature::new(CallConv::Native);
@@ -45,6 +46,11 @@ fn build_unwind_walk() -> Function {
     let init_done = b.create_block();
     let frame_loop = b.create_block();
     let load_caller = b.create_block();
+    let site_check = b.create_block();
+    let site_search = b.create_block();
+    let site_step = b.create_block();
+    let site_hi = b.create_block();
+    let site_hit = b.create_block();
     let check_stop = b.create_block();
     let drain_loop = b.create_block();
     let drain_check_mark = b.create_block();
@@ -74,7 +80,11 @@ fn build_unwind_walk() -> Function {
     let count = b.append_block_param(init_done, Type::I64);
     let fn_recs = b.append_block_param(init_done, Type::I64);
     let drops_base = b.append_block_param(init_done, Type::I64);
+    let site_count = b.append_block_param(init_done, Type::I64);
+    let sites_base = b.append_block_param(init_done, Type::I64);
     let fp = b.append_block_param(frame_loop, Type::I64);
+    let slo = b.append_block_param(site_search, Type::I64);
+    let shi = b.append_block_param(site_search, Type::I64);
     let limit_addr = b.append_block_param(drain_loop, Type::I64);
     let next_fp = b.append_block_param(drain_loop, Type::I64);
     let next_ret = b.append_block_param(drain_loop, Type::I64);
@@ -93,22 +103,36 @@ fn build_unwind_walk() -> Function {
     let mark = b.ins().load(Type::I64, frame_ptr, 8);
     let stop_fp = b.ins().load(Type::I64, frame_ptr, STOP_FP_OFFSET as i32);
     let zero = b.ins().iconst(Type::I64, 0);
+    let c1 = b.ins().iconst(Type::I64, 1);
     let c4 = b.ins().iconst(Type::I64, 4);
     let z8 = b.ins().iconst(Type::I8, 0);
     let one8 = b.ins().iconst(Type::I8, 1);
+    let two8 = b.ins().iconst(Type::I8, 2);
     let no_table = b.ins().icmp_imm(IntCC::Equal, table_ptr, 0);
-    b.ins()
-        .brif(no_table, init_done, &[zero, zero, zero], load_table, &[]);
+    b.ins().brif(
+        no_table,
+        init_done,
+        &[zero, zero, zero, zero, zero],
+        load_table,
+        &[],
+    );
 
     b.switch_to_block(load_table);
     let t_count = b.ins().load(Type::I64, table_ptr, 0);
-    let t_recs = b.ins().iadd_imm(table_ptr, 8);
+    let t_sites = b.ins().load(Type::I64, table_ptr, 8);
+    let t_sites_off = b.ins().load(Type::I64, table_ptr, 16);
+    let t_recs = b.ins().iadd_imm(table_ptr, 24);
     let fn_bytes = b.ins().ishl(t_count, c4);
     let t_drops = b.ins().iadd(t_recs, fn_bytes);
-    b.ins().jump(init_done, &[t_count, t_recs, t_drops]);
+    let t_sites_base = b.ins().iadd(table_ptr, t_sites_off);
+    b.ins().jump(
+        init_done,
+        &[t_count, t_recs, t_drops, t_sites, t_sites_base],
+    );
 
     b.switch_to_block(init_done);
-    let empty = b.ins().icmp_imm(IntCC::Equal, count, 0);
+    let any_entries = b.ins().bor(count, site_count);
+    let empty = b.ins().icmp_imm(IntCC::Equal, any_entries, 0);
     b.ins().brif(
         empty,
         drain_loop,
@@ -135,14 +159,58 @@ fn build_unwind_walk() -> Function {
         bad_fp,
         drain_loop,
         &[zero, zero, zero, one8],
-        check_stop,
+        site_check,
         &[],
     );
 
+    b.switch_to_block(site_check);
+    let has_sites = b.ins().icmp_imm(IntCC::NotEqual, site_count, 0);
+    let ret_in_text = b.ins().icmp(IntCC::UnsignedGreaterThan, ret_pc, text_base);
+    let try_sites = b.ins().band(has_sites, ret_in_text);
+    let ret_rel = b.ins().isub(ret_pc, text_base);
+    b.ins()
+        .brif(try_sites, site_search, &[zero, site_count], check_stop, &[]);
+
+    b.switch_to_block(site_search);
+    let s_more = b.ins().icmp(IntCC::UnsignedLessThan, slo, shi);
+    b.ins().brif(s_more, site_step, &[], check_stop, &[]);
+
+    b.switch_to_block(site_step);
+    let s_diff = b.ins().isub(shi, slo);
+    let s_half = b.ins().ushr(s_diff, c1);
+    let s_mid = b.ins().iadd(slo, s_half);
+    let s_off = b.ins().ishl(s_mid, c4);
+    let s_ptr = b.ins().iadd(sites_base, s_off);
+    let s_ret32 = b.ins().load(Type::I32, s_ptr, 0);
+    let s_ret = b.ins().uextend(Type::I64, s_ret32);
+    let s_below = b.ins().icmp(IntCC::UnsignedLessThan, ret_rel, s_ret);
+    b.ins()
+        .brif(s_below, site_search, &[slo, s_mid], site_hi, &[]);
+
+    b.switch_to_block(site_hi);
+    let s_above = b.ins().icmp(IntCC::UnsignedGreaterThan, ret_rel, s_ret);
+    let s_mid_p1 = b.ins().iadd_imm(s_mid, 1);
+    b.ins()
+        .brif(s_above, site_search, &[s_mid_p1, shi], site_hit, &[]);
+
+    b.switch_to_block(site_hit);
+    let h_rel32 = b.ins().load(Type::I32, s_ptr, 4);
+    let h_rel = b.ins().uextend(Type::I64, h_rel32);
+    let f_off32 = b.ins().load(Type::I32, s_ptr, 8);
+    let f_off = b.ins().uextend(Type::I64, f_off32);
+    let handler_pc = b.ins().iadd(text_base, h_rel);
+    let target_sp = b.ins().isub(caller_fp, f_off);
+    b.ins().store(handler_pc, frame_ptr, 16);
+    b.ins().store(caller_fp, frame_ptr, 24);
+    b.ins().store(target_sp, frame_ptr, STOP_FP_OFFSET as i32);
+    b.ins().jump(drain_loop, &[target_sp, zero, zero, two8]);
+
     b.switch_to_block(check_stop);
-    let at_stop = b
+    let has_stop = b.ins().icmp_imm(IntCC::NotEqual, stop_fp, 0);
+    let past_stop = b
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, caller_fp, stop_fp);
+    let at_stop = b.ins().band(has_stop, past_stop);
     b.ins().brif(
         at_stop,
         drain_loop,
@@ -239,7 +307,6 @@ fn build_unwind_walk() -> Function {
 
     b.switch_to_block(bsearch_step);
     let diff = b.ins().isub(hi, lo);
-    let c1 = b.ins().iconst(Type::I64, 1);
     let half = b.ins().ushr(diff, c1);
     let mid = b.ins().iadd(lo, half);
     let rec_off = b.ins().ishl(mid, c4);
@@ -303,6 +370,8 @@ fn build_unwind_walk() -> Function {
     b.ins().jump(drop_loop, &[next_idx]);
 
     b.switch_to_block(done);
-    b.ins().return_(&[]);
+    let caught = b.ins().icmp(IntCC::Equal, is_final, two8);
+    let ret = b.ins().uextend(Type::I64, caught);
+    b.ins().return_(&[ret]);
     func
 }

@@ -6,7 +6,7 @@ use crate::host::HostSymbol;
 use super::shims::{Emit, Shim, arm64_fwd, arm64_here, emit_arm64_adrp_add, patch_arm64_adrp_add};
 use super::{Buf, Plan, SectionAddrs, Symbol};
 
-pub(super) const UNWIND_STATE_BYTES: u64 = 16;
+pub(super) const UNWIND_STATE_BYTES: u64 = 32;
 pub(super) const FRAME_CACHE_BYTES: u64 = FRAME_CACHE_LIMIT as u64;
 
 #[derive(Clone, Copy, Default)]

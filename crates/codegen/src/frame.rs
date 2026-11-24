@@ -102,7 +102,9 @@ pub(crate) struct Frame<R> {
     pub scratch: i32,
     pub size: u32,
     pub saves: Vec<R>,
+    pub restore_saves: usize,
     pub float_saves: Vec<u8>,
+    pub restore_floats: usize,
     pub wide: bool,
     cursor: u32,
     outgoing: u32,
@@ -128,9 +130,22 @@ fn live_ops(func: &Function) -> impl Iterator<Item = &Op> {
         .map(|inst| &func.insts[inst.index()].op)
 }
 
-pub(crate) fn saved<R: Copy>(func: &Function, used: &[R], all: &[R]) -> Vec<R> {
+pub(crate) fn partition_saves<R: Copy + PartialEq>(
+    func: &Function,
+    used: &[R],
+    all: &[R],
+) -> (Vec<R>, usize) {
     let handles = live_ops(func).any(|op| matches!(op, Op::TryCall { .. }));
-    if handles { all.to_vec() } else { used.to_vec() }
+    if !handles {
+        return (used.to_vec(), used.len());
+    }
+    let mut out = used.to_vec();
+    for &reg in all {
+        if !used.contains(&reg) {
+            out.push(reg);
+        }
+    }
+    (out, used.len())
 }
 
 fn needs_frame<R>(func: &Function, frame: &Frame<R>, stack_params: bool, bracketed: bool) -> bool {
@@ -369,7 +384,7 @@ fn place_values<R: Copy + PartialEq>(
 
 pub(crate) fn layout<R: Copy + PartialEq>(
     func: &Function,
-    (saves, float_saves): (Vec<R>, Vec<u8>),
+    (saves, restore_saves, float_saves, restore_floats): (Vec<R>, usize, Vec<u8>, usize),
     (locations, shared, homed, elided, fused): (
         &[Location<R>],
         &[Option<u32>],
@@ -435,7 +450,9 @@ pub(crate) fn layout<R: Copy + PartialEq>(
         scratch,
         size,
         saves,
+        restore_saves,
         float_saves,
+        restore_floats,
         wide,
         cursor,
         outgoing,
@@ -453,14 +470,14 @@ pub(crate) struct Prepared<R> {
 
 fn build_frame<R: Copy + PartialEq>(
     func: &Function,
-    (saves, float_saves): (Vec<R>, Vec<u8>),
+    saves: (Vec<R>, usize, Vec<u8>, usize),
     plan: &Plan<R>,
     abi: &Abi<R>,
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<(Frame<R>, bool), String> {
     let frame = layout(
         func,
-        (saves, float_saves),
+        saves,
         (
             &plan.locations,
             &plan.shared,
@@ -483,8 +500,16 @@ pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<(), String> {
     let saves = std::mem::take(&mut frame.saves);
+    let restore_saves = frame.restore_saves;
     let float_saves = std::mem::take(&mut frame.float_saves);
-    (*frame, *framed) = build_frame(func, (saves, float_saves), plan, abi, &classify)?;
+    let restore_floats = frame.restore_floats;
+    (*frame, *framed) = build_frame(
+        func,
+        (saves, restore_saves, float_saves, restore_floats),
+        plan,
+        abi,
+        &classify,
+    )?;
     Ok(())
 }
 
@@ -568,9 +593,15 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
         &abi.params,
         &classify,
     );
-    let saves = saved(func, &plan.used, regs.saved);
-    let float_saves = saved(func, &plan.used_floats, regs.saved_float);
-    let (frame, framed) = build_frame(func, (saves, float_saves), &plan, &abi, &classify)?;
+    let (saves, restore_saves) = partition_saves(func, &plan.used, regs.saved);
+    let (float_saves, restore_floats) = partition_saves(func, &plan.used_floats, regs.saved_float);
+    let (frame, framed) = build_frame(
+        func,
+        (saves, restore_saves, float_saves, restore_floats),
+        &plan,
+        &abi,
+        &classify,
+    )?;
     Ok(Prepared {
         order,
         copied,

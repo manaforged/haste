@@ -458,6 +458,9 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn put_exception(&mut self, value: Value) {
         self.put(value, Reg(0));
     }
+    fn restore_try_saves(&mut self) {
+        self.restore_extra_saves();
+    }
     fn push_site(&mut self, site: Site) {
         self.sites.push(site);
     }
