@@ -764,36 +764,25 @@ mod unix_ipc {
             let root = Path::new("/tmp/sample-ws");
             let base = crate::config::Config::for_target(haste_codegen::Target::host());
             let k_base = socket_key_for(root, &base);
-            assert_ne!(
-                socket_key_for(
-                    root,
-                    &crate::config::Config {
-                        debug_info: !base.debug_info,
-                        ..base.clone()
-                    }
-                ),
-                k_base
-            );
-            assert_ne!(
-                socket_key_for(
-                    root,
-                    &crate::config::Config {
-                        x64_baseline: !base.x64_baseline,
-                        ..base.clone()
-                    }
-                ),
-                k_base
-            );
-            assert_ne!(
-                socket_key_for(
-                    root,
-                    &crate::config::Config {
-                        verify_passes: !base.verify_passes,
-                        ..base
-                    }
-                ),
-                k_base
-            );
+            let mut variants = [
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+            ];
+            variants[0].debug_info = !base.debug_info;
+            variants[1].symbols = !base.symbols;
+            variants[2].x64_baseline = !base.x64_baseline;
+            variants[3].fn_align = Some(128);
+            variants[4].use_substrate = !base.use_substrate;
+            variants[5].verify_passes = !base.verify_passes;
+            variants[6].verify_stencil = !base.verify_stencil;
+            for variant in &variants {
+                assert_ne!(socket_key_for(root, variant), k_base);
+            }
         }
     }
 }

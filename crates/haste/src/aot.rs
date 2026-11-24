@@ -13,6 +13,8 @@ mod patch;
 mod pe;
 mod plan;
 mod shims;
+#[cfg(test)]
+mod tests;
 mod tls;
 mod unwind;
 mod wide;

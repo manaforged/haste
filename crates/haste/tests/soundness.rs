@@ -1,44 +1,10 @@
-use std::path::{Path, PathBuf};
+mod common;
 
+use common::FixtureDir;
 use haste::{Compiler, ErrorKind};
 
-struct SoundnessFixture(PathBuf);
-
-impl SoundnessFixture {
-    fn new(name: &str, main_rs: &str) -> Self {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("haste-sound-{name}-{}", std::process::id()));
-        drop(std::fs::remove_dir_all(&dir));
-        std::fs::create_dir_all(dir.join("src")).expect("create fixture src");
-        std::fs::write(
-            dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"sound_{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-            ),
-        )
-        .expect("write Cargo.toml");
-        std::fs::write(
-            dir.join("Cargo.lock"),
-            format!("version = 4\n\n[[package]]\nname = \"sound_{name}\"\nversion = \"0.1.0\"\n"),
-        )
-        .expect("write Cargo.lock");
-        std::fs::write(dir.join("src/main.rs"), main_rs).expect("write main.rs");
-        Self(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for SoundnessFixture {
-    fn drop(&mut self) {
-        drop(std::fs::remove_dir_all(&self.0));
-    }
-}
-
 fn run_check(name: &str, src: &str) -> Result<(), haste::Error> {
-    let fixture = SoundnessFixture::new(name, src);
+    let fixture = FixtureDir::write_crate("sound", name, &format!("sound_{name}"), src);
     Compiler::builder()
         .jobs(1)
         .build()
@@ -46,9 +12,29 @@ fn run_check(name: &str, src: &str) -> Result<(), haste::Error> {
         .check(fixture.path())
 }
 
-fn check_fails(name: &str, src: &str) {
+fn check_fails(name: &str, src: &str) -> haste::Error {
     let err = run_check(name, src).expect_err("unsound program must be rejected");
     assert_eq!(err.kind(), ErrorKind::Compile);
+    err
+}
+
+fn check_fails_borrow(name: &str, src: &str) {
+    let fixture = FixtureDir::write_crate("sound", name, &format!("sound_{name}"), src);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_haste"))
+        .args(["build", "--jobs", "1"])
+        .arg(fixture.path())
+        .output()
+        .expect("run haste build");
+    assert!(!out.status.success(), "{name} should fail borrowck");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("error[borrow]:"),
+        "expected borrow diagnostic for {name}, got:\n{combined}"
+    );
 }
 
 fn check_passes(name: &str, src: &str) {
@@ -382,6 +368,80 @@ fn main() {
         0 => 0,
         1..=u128::MAX => 1,
     };
+}
+"#,
+    );
+}
+
+#[test]
+fn rejects_core_borrow_checker_violations() {
+    check_fails_borrow(
+        "use_after_move",
+        r#"
+fn main() {
+    let s = String::from("hi");
+    let _t = s;
+    let _ = s.len();
+}
+"#,
+    );
+    check_fails_borrow(
+        "branch_move",
+        r#"
+fn main() {
+    let s = String::from("hi");
+    if s.len() > 0 {
+        drop(s);
+    }
+    let _ = s.len();
+}
+"#,
+    );
+    check_fails_borrow(
+        "mut_shared_alias",
+        r#"
+fn main() {
+    let mut x = 1;
+    let r = &x;
+    let m = &mut x;
+    *m += 1;
+    let _ = *r;
+}
+"#,
+    );
+    check_fails_borrow(
+        "mutate_while_borrowed",
+        r#"
+fn main() {
+    let mut x = 1;
+    let r = &x;
+    x = 2;
+    let _ = *r;
+}
+"#,
+    );
+    check_fails_borrow(
+        "dangling_local_ref",
+        r#"
+fn bad() -> &'static i32 {
+    let x = 7;
+    &x
+}
+fn main() {
+    let _ = bad();
+}
+"#,
+    );
+    check_passes(
+        "nll_release_ok",
+        r#"
+fn main() {
+    let mut x = 1;
+    let r = &x;
+    let y = *r;
+    x = y + 1;
+    let m = &mut x;
+    *m += 1;
 }
 "#,
     );

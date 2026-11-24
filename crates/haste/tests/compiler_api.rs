@@ -1,29 +1,10 @@
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 use std::process::Command;
 
+use common::FixtureDir;
 use haste::{Compiler, ErrorKind};
-
-struct FixtureDir(PathBuf);
-
-impl FixtureDir {
-    fn new(name: &str) -> Self {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("haste-api-{name}-{}", std::process::id()));
-        drop(std::fs::remove_dir_all(&dir));
-        std::fs::create_dir_all(dir.join("src")).expect("create fixture src");
-        Self(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for FixtureDir {
-    fn drop(&mut self) {
-        drop(std::fs::remove_dir_all(&self.0));
-    }
-}
 
 #[test]
 fn builder_validates_target_jobs_and_conflicting_flags() {
@@ -94,19 +75,10 @@ fn missing_workspace_reports_io_error() {
 
 #[test]
 fn compiler_api_checks_runs_tests_and_emits_standalone_executable() {
-    let dir = FixtureDir::new("e2e");
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname = \"api_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .expect("write Cargo.toml");
-    std::fs::write(
-        dir.path().join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"api_fixture\"\nversion = \"0.1.0\"\n",
-    )
-    .expect("write Cargo.lock");
-    std::fs::write(
-        dir.path().join("src/main.rs"),
+    let dir = FixtureDir::write_crate(
+        "api",
+        "e2e",
+        "api_fixture",
         r#"
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -121,8 +93,7 @@ fn sanity_math() {
     assert_eq!(6 * 7, 42);
 }
 "#,
-    )
-    .expect("write main.rs");
+    );
 
     let compiler = Compiler::builder().jobs(2).build().expect("valid compiler");
     compiler.check(dir.path()).expect("check succeeds");
@@ -155,4 +126,164 @@ fn sanity_math() {
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
     assert!(stdout.contains("api-ok:"));
     assert!(stdout.contains("\"hello\""));
+}
+
+#[test]
+fn cli_run_isolates_argv_and_test_prints_panic_stderr() {
+    let dir = FixtureDir::write_crate(
+        "cli",
+        "argv_panic",
+        "cli_argv_panic",
+        r#"
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    println!("ARGS={}", args[1..].join("|"));
+}
+
+#[test]
+fn failing_assertion_reports_message() {
+    assert_eq!(2 + 2, 5, "custom_panic_marker_8472");
+}
+"#,
+    );
+    let haste = env!("CARGO_BIN_EXE_haste");
+
+    let run_out = Command::new(haste)
+        .args(["run"])
+        .arg(dir.path())
+        .args(["--release", "--", "--release", "alpha", "beta"])
+        .output()
+        .expect("run haste cli");
+    assert!(
+        run_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let stdout = String::from_utf8(run_out.stdout).expect("utf8 stdout");
+    assert_eq!(stdout.trim(), "ARGS=--release|alpha|beta");
+
+    let test_out = Command::new(haste)
+        .args(["test"])
+        .arg(dir.path())
+        .output()
+        .expect("run haste test cli");
+    assert!(!test_out.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&test_out.stdout),
+        String::from_utf8_lossy(&test_out.stderr)
+    );
+    assert!(
+        combined.contains("custom_panic_marker_8472"),
+        "expected panic message in test output, got:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+fn run_serve_cmd(haste: &str, verb: &str, dir: &std::path::Path) -> std::process::Output {
+    Command::new(haste)
+        .args(["serve", verb])
+        .arg(dir)
+        .output()
+        .expect("run haste serve control")
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_daemon_is_opt_in_and_serve_status_stop_controls_lifecycle() {
+    let dir = FixtureDir::write_crate(
+        "cli",
+        "daemon",
+        "cli_daemon_probe",
+        r#"
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    println!("DAEMON_ARGS={}", args[1..].join(","));
+}
+"#,
+    );
+    let haste = env!("CARGO_BIN_EXE_haste");
+
+    let plain = Command::new(haste)
+        .args(["build"])
+        .arg(dir.path())
+        .output()
+        .expect("plain build");
+    assert!(plain.status.success());
+
+    let status_before = run_serve_cmd(haste, "status", dir.path());
+    assert!(status_before.status.success());
+    let before_text = String::from_utf8_lossy(&status_before.stdout);
+    assert!(
+        before_text.contains("no active haste daemons"),
+        "plain build should not spawn daemon, got: {before_text}"
+    );
+
+    struct StopGuard<'a>(&'a str, &'a std::path::Path);
+    impl Drop for StopGuard<'_> {
+        fn drop(&mut self) {
+            drop(run_serve_cmd(self.0, "stop", self.1));
+        }
+    }
+    let _guard = StopGuard(haste, dir.path());
+
+    let daemon_run = Command::new(haste)
+        .env("HASTE_SERVE_IDLE_SECS", "30")
+        .args(["run", "--daemon"])
+        .arg(dir.path())
+        .args(["--", "one", "two"])
+        .output()
+        .expect("daemon run");
+    assert!(
+        daemon_run.status.success(),
+        "daemon run failed: {}",
+        String::from_utf8_lossy(&daemon_run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&daemon_run.stdout).trim(),
+        "DAEMON_ARGS=one,two"
+    );
+
+    let mut active_text = String::new();
+    for _ in 0..300 {
+        let status_active = run_serve_cmd(haste, "status", dir.path());
+        assert!(status_active.status.success());
+        active_text = String::from_utf8_lossy(&status_active.stdout).into_owned();
+        if active_text.contains("pid=") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        active_text.contains("pid="),
+        "expected running daemon, got: {active_text}"
+    );
+
+    let served_run = Command::new(haste)
+        .args(["run", "--daemon"])
+        .arg(dir.path())
+        .args(["--", "served_alpha", "served_beta"])
+        .output()
+        .expect("served daemon run");
+    assert!(
+        served_run.status.success(),
+        "served daemon run failed: {}",
+        String::from_utf8_lossy(&served_run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&served_run.stdout).trim(),
+        "DAEMON_ARGS=served_alpha,served_beta"
+    );
+
+    let stop = run_serve_cmd(haste, "stop", dir.path());
+    assert!(stop.status.success());
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("stopped pid="));
+
+    let status_after = run_serve_cmd(haste, "status", dir.path());
+    assert!(status_after.status.success());
+    let after_text = String::from_utf8_lossy(&status_after.stdout);
+    assert!(
+        after_text.contains("no active haste daemons"),
+        "daemon should be stopped, got: {after_text}"
+    );
 }

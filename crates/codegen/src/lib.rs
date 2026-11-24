@@ -301,37 +301,4 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn unpredictable_fn() -> (Function, Value) {
-        let mut sig = Signature::new(CallConv::Internal);
-        sig.params.push(AbiParam::new(Type::I64));
-        sig.returns.push(AbiParam::new(Type::I64));
-        let mut func = Function::new(sig);
-        let mut b = FunctionBuilder::new(&mut func);
-        let entry = b.create_block();
-        b.append_block_params_for_function_params(entry);
-        let p = b.block_params(entry)[0];
-        b.switch_to_block(entry);
-        let zero = b.ins().iconst(Type::I64, 0);
-        let cond = b.ins().icmp(IntCC::Equal, p, zero);
-        b.func.mark_unpredictable(cond);
-        let one = b.ins().iconst(Type::I64, 1);
-        let res = b.ins().select(cond, one, zero);
-        b.ins().return_(&[res]);
-        (func, cond)
-    }
-
-    #[test]
-    fn simplify_respects_explicit_target_arch() {
-        let x64 = Target::find("x86_64-unknown-linux-gnu").expect("x64 target");
-        let arm64 = Target::find("aarch64-apple-darwin").expect("arm64 target");
-        let (mut func_x64, cond_x64) = unpredictable_fn();
-        let (mut func_arm64, cond_arm64) = unpredictable_fn();
-        simplify(&mut func_x64, x64);
-        simplify(&mut func_arm64, arm64);
-        assert!(!func_x64.is_unpredictable(cond_x64));
-        assert!(func_arm64.is_unpredictable(cond_arm64));
-    }
-}
+mod tests;

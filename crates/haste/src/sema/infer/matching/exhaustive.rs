@@ -503,3 +503,47 @@ pub(super) fn decode_key_to_string(key: u128, prim: Primitive) -> String {
     };
     signed_val.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_key_to_string, encode_raw_int, int_key_domain, int_spec};
+    use crate::names::Primitive;
+
+    #[test]
+    fn int_key_encoding_preserves_signed_and_128_bit_order() {
+        assert_eq!(int_spec(Primitive::I8), Some((8, true)));
+        assert_eq!(int_spec(Primitive::U128), Some((128, false)));
+        assert_eq!(int_spec(Primitive::Bool), None);
+
+        assert_eq!(int_key_domain(Primitive::I8), Some((0, 255)));
+        assert_eq!(int_key_domain(Primitive::U128), Some((0, u128::MAX)));
+        assert_eq!(int_key_domain(Primitive::Char), Some((0, 0x10_FFFF)));
+
+        let i8_min = encode_raw_int((-128i8) as i128 as u128, Primitive::I8).expect("i8 min");
+        let i8_zero = encode_raw_int(0, Primitive::I8).expect("i8 zero");
+        let i8_max = encode_raw_int(127, Primitive::I8).expect("i8 max");
+        assert_eq!(i8_min, 0);
+        assert_eq!(i8_zero, 128);
+        assert_eq!(i8_max, 255);
+        assert_eq!(decode_key_to_string(i8_min, Primitive::I8), "-128");
+        assert_eq!(decode_key_to_string(i8_max, Primitive::I8), "127");
+
+        let i128_min = encode_raw_int(i128::MIN as u128, Primitive::I128).expect("i128 min");
+        let i128_max = encode_raw_int(i128::MAX as u128, Primitive::I128).expect("i128 max");
+        assert_eq!(i128_min, 0);
+        assert_eq!(i128_max, u128::MAX);
+        assert_eq!(
+            decode_key_to_string(i128_min, Primitive::I128),
+            i128::MIN.to_string()
+        );
+        assert_eq!(
+            decode_key_to_string(i128_max, Primitive::I128),
+            i128::MAX.to_string()
+        );
+        assert_eq!(
+            decode_key_to_string(u128::MAX, Primitive::U128),
+            u128::MAX.to_string()
+        );
+        assert_eq!(decode_key_to_string('a' as u128, Primitive::Char), "'a'");
+    }
+}

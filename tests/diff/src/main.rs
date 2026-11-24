@@ -1,3 +1,4 @@
+mod boundary;
 mod more;
 mod regressions;
 mod review;
@@ -716,7 +717,14 @@ fn main() {
         ("case_wide_tag", case_wide_tag),
         ("case_nonzero", case_nonzero),
     ];
-    for (name, case) in cases.iter().chain(more::CASES).chain(stencils::CASES).chain(regressions::CASES).chain(review::CASES) {
+    for (name, case) in cases
+        .iter()
+        .chain(boundary::CASES)
+        .chain(more::CASES)
+        .chain(stencils::CASES)
+        .chain(regressions::CASES)
+        .chain(review::CASES)
+    {
         for input in CASE_INPUTS {
             println!("{name} {input} {}", case(input));
         }
