@@ -171,6 +171,9 @@ impl Function {
                 .copied()
                 .unwrap_or(u.drop_sym);
         }
+        for s in &mut self.no_unwind_syms {
+            *s = remap.get(*s as usize).copied().unwrap_or(*s);
+        }
     }
 }
 

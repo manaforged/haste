@@ -184,18 +184,28 @@ impl Function {
 
     /// Removes frame-table unwind drop entries whose flag can never be active across a potentially-unwinding call.
     pub fn elide_dead_unwind_drops(&mut self, sym_may_unwind: impl FnMut(u32) -> bool) -> bool {
-        self.elide_dead_unwind_drops_inner(false, false, sym_may_unwind)
+        self.elide_with_no_unwind_syms(false, false, sym_may_unwind)
     }
 
     /// Post-optimization unwind-drop cleanup that preserves or re-emits entry zero-initialization for every surviving flag, optionally sinking entry zeros onto cold unwind-call frontiers.
     pub(crate) fn elide_dead_unwind_drops_post_init(&mut self, sink_zeros: bool) -> bool {
+        self.elide_with_no_unwind_syms(true, sink_zeros, |_| true)
+    }
+
+    fn elide_with_no_unwind_syms(
+        &mut self,
+        post_init: bool,
+        sink_zeros: bool,
+        mut sym_may_unwind: impl FnMut(u32) -> bool,
+    ) -> bool {
         if self.no_unwind_syms.is_empty() {
-            return self.elide_dead_unwind_drops_inner(true, sink_zeros, |_| true);
+            return self.elide_dead_unwind_drops_inner(post_init, sink_zeros, sym_may_unwind);
         }
         let mut no_unwind = std::mem::take(&mut self.no_unwind_syms);
         no_unwind.sort_unstable();
-        let changed = self.elide_dead_unwind_drops_inner(true, sink_zeros, |sym| {
-            no_unwind.binary_search(&sym).is_err()
+        no_unwind.dedup();
+        let changed = self.elide_dead_unwind_drops_inner(post_init, sink_zeros, |sym| {
+            no_unwind.binary_search(&sym).is_err() && sym_may_unwind(sym)
         });
         self.no_unwind_syms = no_unwind;
         changed
