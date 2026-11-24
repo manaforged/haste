@@ -136,11 +136,11 @@ impl Frame {
 fn build_frame(
     func: &mut Function,
     cfg: &Cfg,
-    resumes: &[Block],
+    spec: &Coroutine,
     spills: Vec<Value>,
     is_spill: &[bool],
 ) -> (Frame, Vec<SlotData>) {
-    let framed = slots::framed(func, cfg, resumes, is_spill);
+    let framed = slots::framed(func, cfg, (&spec.resumes, &spec.done), is_spill);
     let mut frame = Frame {
         size: 0,
         slots: vec![Home::Stack(StackSlot(0)); func.slots.len()],
@@ -216,7 +216,7 @@ pub(crate) fn split(func: &mut Function) {
     let spills = live_across_suspend(func, &cfg, &spec.resumes, &defs);
     let mut is_spill = vec![false; func.types.len()];
     spills.iter().for_each(|v| is_spill[v.index()] = true);
-    let (frame, mut stack) = build_frame(func, &cfg, &spec.resumes, spills, &is_spill);
+    let (frame, mut stack) = build_frame(func, &cfg, &spec, spills, &is_spill);
     let lazy = lazy::plan(func, &frame, &is_spill, &mut stack);
     func.slots = stack;
     for u in &mut func.unwind_drops {

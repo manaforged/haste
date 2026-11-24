@@ -138,27 +138,104 @@ fn step_addr_use(
     }
 }
 
-type SlotTrace = (Vec<bool>, Vec<bool>, Vec<Vec<(Block, Inst)>>);
+type SlotTrace = (Vec<bool>, Vec<bool>, Vec<bool>, Vec<Vec<(Block, Inst)>>);
+
+fn blocks_reaching_suspend(func: &Function, done: &[Block]) -> Vec<bool> {
+    let n = func.blocks.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut can_suspend = vec![false; n];
+    let mut stack = Vec::new();
+    for b in 0..n {
+        let blk = Block(b as u32);
+        if matches!(func.last(blk), Some(Op::Return(..))) && !done.contains(&blk) {
+            can_suspend[b] = true;
+            stack.push(b);
+        }
+        for succ in func.successors(blk) {
+            preds[succ.index()].push(b);
+        }
+    }
+    while let Some(b) = stack.pop() {
+        for &p in &preds[b] {
+            if !std::mem::replace(&mut can_suspend[p], true) {
+                stack.push(p);
+            }
+        }
+    }
+    can_suspend
+}
+
+fn slot_byte_mask(off: i32, bytes: u32, size: u32) -> Option<u128> {
+    if size == 0 || size > 128 || off < 0 {
+        return None;
+    }
+    let lo = off as u32;
+    let hi = lo.saturating_add(bytes).min(size);
+    if lo >= hi {
+        return Some(0);
+    }
+    let width = hi - lo;
+    let ones = if width == 128 {
+        u128::MAX
+    } else {
+        (1_u128 << width) - 1
+    };
+    Some(ones << lo)
+}
+
+fn full_byte_mask(size: u32) -> u128 {
+    if size == 0 {
+        0
+    } else if size >= 128 {
+        u128::MAX
+    } else {
+        (1_u128 << size) - 1
+    }
+}
+
+fn compute_read_masks(func: &Function, dense_of: &[u32], slots: usize) -> Vec<u128> {
+    let mut masks = vec![0_u128; slots];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[inst.index()];
+        if let Op::StackLoad(slot, off) = data.op
+            && let Some(res) = data.result
+        {
+            let s = dense_of[slot.index()] as usize;
+            let size = func.slots[slot.index()].size;
+            let bytes = func.types[res.index()].bytes();
+            if let Some(bits) = slot_byte_mask(off, bytes, size) {
+                masks[s] |= bits;
+            } else {
+                masks[s] = u128::MAX;
+            }
+        }
+    }
+    masks
+}
 
 fn trace_stack_addrs(
     func: &Function,
     (dense_of, raw_of): (&[u32], &[usize]),
     value_uses: &[Vec<(Block, Inst)>],
-    is_spill: &[bool],
+    (can_suspend, is_spill): (&[bool], &[bool]),
 ) -> SlotTrace {
     let slots = raw_of.len();
     let raw_escaped = Provenance::compute_with_spills(func, Some(is_spill)).addr_escaped_slots();
     let escaped: Vec<bool> = raw_of.iter().map(|&raw| raw_escaped[raw]).collect();
     let mut taken = vec![false; slots];
+    let mut taken_can_suspend = vec![false; slots];
     let mut extra_uses = vec![Vec::new(); slots];
     let mut addr_roots: Vec<Vec<usize>> = vec![Vec::new(); slots];
-    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &func.insts[inst.index()];
-        if let Op::StackAddr(slot, _) = data.op {
-            let d = dense_of[slot.index()] as usize;
-            taken[d] = true;
-            if let Some(res) = data.result {
-                addr_roots[d].push(res.index());
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            if let Op::StackAddr(slot, _) = data.op {
+                let d = dense_of[slot.index()] as usize;
+                taken[d] = true;
+                taken_can_suspend[d] |= can_suspend[b_idx];
+                if let Some(res) = data.result {
+                    addr_roots[d].push(res.index());
+                }
             }
         }
     }
@@ -189,7 +266,7 @@ fn trace_stack_addrs(
         }
     }
     propagate_alias_uses(func, dense_of, &slot_alias, &mut extra_uses);
-    (taken, escaped, extra_uses)
+    (taken, taken_can_suspend, escaped, extra_uses)
 }
 
 fn record_slot_read(
@@ -219,11 +296,16 @@ fn slot_effects(
     func: &Function,
     (dense_of, raw_of): (&[u32], &[usize]),
     value_uses: &[Vec<(Block, Inst)>],
-    is_spill: &[bool],
+    (can_suspend, is_spill): (&[bool], &[bool]),
 ) -> (Vec<bool>, SlotAnalysis) {
     let (slots, blocks) = (raw_of.len(), func.blocks.len());
-    let (taken, escaped, extra_uses) =
-        trace_stack_addrs(func, (dense_of, raw_of), value_uses, is_spill);
+    let (taken, taken_can_suspend, escaped, extra_uses) = trace_stack_addrs(
+        func,
+        (dense_of, raw_of),
+        value_uses,
+        (can_suspend, is_spill),
+    );
+    let read_masks = compute_read_masks(func, dense_of, slots);
     let mut reads = BitMatrix::new(blocks, slots);
     let mut writes = BitMatrix::new(blocks, slots);
     let mut touches = BitMatrix::new(blocks, slots);
@@ -231,8 +313,24 @@ fn slot_effects(
         .iter()
         .any(|list| !list.is_empty())
         .then(|| build_inst_pos(func));
+    let mut extra_min_pos: HashMap<(usize, usize), u32> = HashMap::default();
+    if let Some(inst_pos) = &inst_pos {
+        for (slot, list) in extra_uses.iter().enumerate() {
+            for &(block, inst) in list {
+                let b_idx = block.index();
+                if let Some(&pos) = inst_pos.get(&(b_idx, inst.index())) {
+                    extra_min_pos
+                        .entry((b_idx, slot))
+                        .and_modify(|cur| *cur = (*cur).min(pos))
+                        .or_insert(pos);
+                }
+            }
+        }
+    }
     let mut inst_touches: Vec<Vec<(u32, u32)>> = vec![Vec::new(); blocks];
+    let mut written: HashMap<usize, u128> = HashMap::default();
     for (b_idx, block) in func.blocks.iter().enumerate() {
+        written.clear();
         for (pos, &inst) in block.insts.iter().enumerate() {
             match func.insts[inst.index()].op {
                 Op::StackAddr(slot, _) | Op::StackLoad(slot, _) => {
@@ -242,17 +340,44 @@ fn slot_effects(
                 }
                 Op::StackStore(value, slot, off) => {
                     let s = dense_of[slot.index()] as usize;
-                    if off == 0
-                        && func.types[value.index()].bytes() >= func.slots[slot.index()].size
+                    if extra_min_pos
+                        .get(&(b_idx, s))
+                        .is_some_and(|&p| p < pos as u32)
+                        && !writes.get(b_idx, s)
                     {
-                        writes.set(b_idx, s);
-                        touches.set(b_idx, s);
-                    } else {
-                        record_slot_read(&mut reads, &writes, &mut touches, b_idx, s);
+                        reads.set(b_idx, s);
                     }
+                    let size = func.slots[slot.index()].size;
+                    let bytes = func.types[value.index()].bytes();
+                    if !writes.get(b_idx, s) && !reads.get(b_idx, s) {
+                        let required = if taken[s] {
+                            full_byte_mask(size)
+                        } else {
+                            read_masks[s]
+                        };
+                        if (off == 0 && bytes >= size)
+                            || (!taken[s] && size <= 128 && required == 0)
+                        {
+                            writes.set(b_idx, s);
+                        } else if let Some(bits) = slot_byte_mask(off, bytes, size) {
+                            let mask = written.entry(s).or_insert(0);
+                            *mask |= bits;
+                            if (*mask & required) == required {
+                                writes.set(b_idx, s);
+                            }
+                        } else {
+                            reads.set(b_idx, s);
+                        }
+                    }
+                    touches.set(b_idx, s);
                     inst_touches[b_idx].push((pos as u32, s as u32));
                 }
                 _ => {}
+            }
+        }
+        for (s, mask) in written.drain() {
+            if mask != 0 && !writes.get(b_idx, s) {
+                reads.set(b_idx, s);
             }
         }
     }
@@ -272,7 +397,7 @@ fn slot_effects(
         list.dedup();
     }
     (
-        taken,
+        taken_can_suspend,
         SlotAnalysis {
             escaped,
             reads,
@@ -405,7 +530,7 @@ fn active_coroutine_blocks(func: &Function, cfg: &Cfg, resumes: &[Block]) -> Vec
 pub(super) fn framed(
     func: &Function,
     cfg: &Cfg,
-    resumes: &[Block],
+    (resumes, done): (&[Block], &[Block]),
     is_spill: &[bool],
 ) -> FramedSlots {
     let (dense_of, raw_of) = dense_slot_map(func);
@@ -418,8 +543,14 @@ pub(super) fn framed(
             escaped: Vec::new(),
         };
     }
+    let can_suspend = blocks_reaching_suspend(func, done);
     let value_uses = collect_value_uses(func);
-    let (taken, analysis) = slot_effects(func, (&dense_of, &raw_of), &value_uses, is_spill);
+    let (taken_can_suspend, analysis) = slot_effects(
+        func,
+        (&dense_of, &raw_of),
+        &value_uses,
+        (&can_suspend, is_spill),
+    );
     let live_in = solve_backward_liveness(
         func,
         (0..blocks).map(|b| Block(b as u32)),
@@ -428,7 +559,7 @@ pub(super) fn framed(
     );
     let kept: Vec<bool> = (0..slots)
         .map(|at| {
-            (taken[at] && analysis.escaped[at])
+            (taken_can_suspend[at] && analysis.escaped[at])
                 || resumes.iter().any(|resume| live_in.get(resume.index(), at))
         })
         .collect();
