@@ -128,7 +128,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         defs,
         flags: None,
         last_cmp: None,
-        spills: crate::spills::SpillState::new(if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() }),
+        spills: crate::spills::SpillState::new(if full { crate::spills::pred_totals(func, &order, &copied) } else { Vec::new() }),
         next: None,
         copied,
         direct_calls: target.direct_calls,
@@ -252,7 +252,6 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.bind(self.blocks[block.index()]);
     }
     fn bind_entry(&mut self, block: Block) {
-        self.spills.bind_entry(block);
         if let Some(cache) = &mut self.tlv_cache {
             cache.live = cache.dom_known[block.index()];
         }
@@ -306,14 +305,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
-                self.carry_spills(self.next == Some(*block));
+                self.record_edge_spill(*block, self.spills.cache);
                 self.invalidate_spills();
                 emit_goto(self, *block, true);
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
-                self.carry_spills(then != otherwise && (self.next == Some(*then) || self.next == Some(*otherwise)));
                 self.invalidate_spills();
                 res
             }
@@ -760,4 +758,11 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn put_exception(&mut self, value: Value) { self.put(value, Reg(0)); }
     fn push_site(&mut self, site: Site) { self.sites.push(site); }
+    fn spill_cache(&self) -> crate::spills::SpillCache<Reg> { self.spills.cache }
+    fn set_spill_cache(&mut self, cache: crate::spills::SpillCache<Reg>) { self.spills.cache = cache; }
+    fn record_edge_spill(&mut self, target: Block, cache: crate::spills::SpillCache<Reg>) {
+        if !self.in_fast {
+            self.spills.record_edge(self.func.jump_target(target), cache);
+        }
+    }
 }

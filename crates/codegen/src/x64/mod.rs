@@ -136,7 +136,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         roots,
         pure_test,
         flags: None,
-        spills: crate::spills::SpillState::new(if full { crate::spills::sole_preds(func, &copied) } else { Vec::new() }),
+        spills: crate::spills::SpillState::new(if full { crate::spills::pred_totals(func, &order, &copied) } else { Vec::new() }),
         next: None,
         last_block,
         at_end: false,
@@ -279,7 +279,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn intake(&mut self, entry: Block) -> Result<(), String> { intake_params(self, entry) }
     fn set_next(&mut self, next: Option<Block>) { self.next = next; }
     fn bind_block(&mut self, block: Block) { self.invalidate_spills(); self.resume_spills(block); self.at_end = self.last_block == Some(block); self.asm.flags_overwritten(); self.asm.bind(self.blocks[block.index()]); }
-    fn bind_entry(&mut self, block: Block) { self.spills.bind_entry(block); self.at_end = self.last_block == Some(block); self.asm.bind(self.blocks[block.index()]); }
+    fn bind_entry(&mut self, block: Block) { self.at_end = self.last_block == Some(block); self.asm.bind(self.blocks[block.index()]); }
     fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> { self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]); Ok(()) }
     fn clear_flags(&mut self) { self.flags = None; }
@@ -326,13 +326,12 @@ impl<'a> Emitter<'a> for Emit<'a> {
                     return emit_body(self, *block);
                 }
                 emit_goto(self, *block, true);
-                self.carry_spills(self.next == Some(*block));
+                self.record_edge_spill(*block, self.spills.cache);
                 self.invalidate_spills();
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
-                self.carry_spills(then != otherwise && (self.next == Some(*then) || self.next == Some(*otherwise)));
                 self.invalidate_spills();
                 res
             }
@@ -708,5 +707,12 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn put_exception(&mut self, value: Value) { self.put(value, Reg::Rax); }
     fn push_site(&mut self, site: Site) { self.sites.push(site); }
+    fn spill_cache(&self) -> crate::spills::SpillCache<Reg> { self.spills.cache }
+    fn set_spill_cache(&mut self, cache: crate::spills::SpillCache<Reg>) { self.spills.cache = cache; }
+    fn record_edge_spill(&mut self, target: Block, cache: crate::spills::SpillCache<Reg>) {
+        if !self.in_fast {
+            self.spills.record_edge(self.func.jump_target(target), cache);
+        }
+    }
 }
 

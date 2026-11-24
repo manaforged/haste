@@ -534,6 +534,11 @@ fn hoist(
         }
         let head = block == each.head.index();
         let always_exec = always_executes_in_loop(cfg, each, blk);
+        let cold_call_blk = !always_exec && func.blocks[block].insts.iter().any(|&i| match &func.insts[i.index()].op {
+            Op::Call { .. } => func.pure_thread_cell_result(&func.insts[i.index()].op, |v| inv.zeros.get(v.index()) == Some(&true)).is_none(),
+            Op::TryCall { .. } | Op::Trap => true,
+            _ => false,
+        });
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut kept = Vec::with_capacity(insts.len());
         let mut head_prefix = head;
@@ -555,9 +560,13 @@ fn hoist(
             let replaces_single_use = matches!(op, Op::Insert(prev, ..) if hoisted_vec.contains(prev) && uses.as_ref().is_some_and(|u| u[prev.index()] == 1));
             let vec_call_block = mem.calls && res_ty.is_some_and(Type::is_vector);
             let vec_ok = !is_vec_mat || (!vec_call_block && (replaces_single_use || vec_live + hoisted_vecs < MAX_LOOP_VEC_LIVE));
-            let const_call_block = mem.calls && !always_exec && matches!(op, Op::Const(_));
+            let cheap_cold_op = mem.calls && !always_exec && match *op {
+                Op::Const(_) | Op::Convert(crate::ir::Convert::Ireduce | crate::ir::Convert::Uextend | crate::ir::Convert::Sextend, _) => true,
+                Op::Binary(crate::ir::Binary::Iadd | crate::ir::Binary::Isub, a, b) => inv.is_const.get(a.index()) == Some(&true) || inv.is_const.get(b.index()) == Some(&true),
+                _ => false,
+            };
             let movable = tc_res.is_some()
-                || (op.is_speculable() && !const_call_block && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
+                || (op.is_speculable() && !cold_call_blk && !cheap_cold_op && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
                 || mem.can_hoist_load(func, prov, head_prefix, inst)
                 || can_hoist_global_load(func, mem, prov, head_prefix, inst);
             let mut operands_invariant = true;

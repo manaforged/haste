@@ -45,6 +45,9 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn put_exception(&mut self, value: Value);
     fn push_site(&mut self, site: Site);
     fn tails(&mut self) -> &mut Tails<'a, L>;
+    fn spill_cache(&self) -> crate::spills::SpillCache<R>;
+    fn set_spill_cache(&mut self, cache: crate::spills::SpillCache<R>);
+    fn record_edge_spill(&mut self, target: Block, cache: crate::spills::SpillCache<R>);
     /// Places a branch island here when pending short branches near their range.
     fn island(&mut self) -> Result<(), String> { Ok(()) }
 }
@@ -177,6 +180,8 @@ fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     let label = push_stub(emit, cold.0, cold.1, StubKind::Plain);
     emit.branch_cond(condition, invert, label);
     emit.edge(hot.0, hot.1)?;
+    let cache = emit.spill_cache();
+    emit.record_edge_spill(hot.0, cache);
     emit_goto(emit, hot.0, true);
     Ok(true)
 }
@@ -283,6 +288,9 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit.edge(moved.0, moved.1)?;
     let target = emit.block_label(emit.func().jump_target(moved.0));
     emit.branch_cond(condition, !to_then, target);
+    let cache = emit.spill_cache();
+    emit.record_edge_spill(moved.0, cache);
+    emit.record_edge_spill(plain, cache);
     emit_goto(emit, plain, true);
     Ok(true)
 }
@@ -303,6 +311,8 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
             emit.prologue();
         }
         emit.edge(block, args)?;
+        let cache = emit.spill_cache();
+        emit.record_edge_spill(block, cache);
         emit_goto(emit, block, true);
         return Ok(());
     }
@@ -387,6 +397,8 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         let label = push_stub(emit, then.0, then.1, StubKind::Plain);
         emit.branch_cond(condition, false, label);
         emit.edge(otherwise.0, otherwise.1)?;
+        let cache = emit.spill_cache();
+        emit.record_edge_spill(otherwise.0, cache);
         emit_goto(emit, otherwise.0, true);
         return Ok(());
     }
@@ -399,27 +411,41 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     if !else_moves && (then_moves || falls(emit, then.0)) {
         let target = emit.block_label(emit.func().jump_target(otherwise.0));
         emit.branch_cond(condition, true, target);
+        let pre = emit.spill_cache();
+        emit.record_edge_spill(otherwise.0, pre);
         if then_moves {
             emit.edge(then.0, then.1)?;
         }
+        let post = emit.spill_cache();
+        emit.record_edge_spill(then.0, post);
         emit_goto(emit, then.0, true);
         return Ok(());
     }
     if !then_moves {
         let target = emit.block_label(emit.func().jump_target(then.0));
         emit.branch_cond(condition, false, target);
+        let pre = emit.spill_cache();
+        emit.record_edge_spill(then.0, pre);
         if else_moves {
             emit.edge(otherwise.0, otherwise.1)?;
         }
+        let post = emit.spill_cache();
+        emit.record_edge_spill(otherwise.0, post);
         emit_goto(emit, otherwise.0, true);
         return Ok(());
     }
     let other = emit.new_label();
     emit.branch_cond(condition, true, other);
+    let pre = emit.spill_cache();
     emit.edge(then.0, then.1)?;
+    let then_post = emit.spill_cache();
+    emit.record_edge_spill(then.0, then_post);
     emit_goto(emit, then.0, false);
+    emit.set_spill_cache(pre);
     emit.bind_label(other);
     emit.edge(otherwise.0, otherwise.1)?;
+    let else_post = emit.spill_cache();
+    emit.record_edge_spill(otherwise.0, else_post);
     emit_goto(emit, otherwise.0, true);
     Ok(())
 }

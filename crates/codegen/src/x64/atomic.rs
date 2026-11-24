@@ -58,8 +58,6 @@ impl Emit<'_> {
 
     pub(super) fn invalidate_disp(&mut self, disp: i32) { self.spills.invalidate_disp(disp); }
 
-    pub(super) fn carry_spills(&mut self, plain: bool) { self.spills.carry(plain && !self.in_fast); }
-
     pub(super) fn resume_spills(&mut self, block: Block) { self.spills.resume(block); }
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
@@ -473,6 +471,16 @@ impl Emit<'_> {
     /// Compares `x` with `y` and returns the flags condition under which `cc` holds.
     pub(super) fn cmp_flags(&mut self, cc: IntCC, x: Value, y: Value, live_flags: Option<(Value, Cond)>) -> Cond {
         let is_zero = |v: Value| self.const_of(v).is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 0);
+        let is_one = |v: Value| self.const_of(v).is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 1);
+        let bool_one_var = |a: Value, b: Value| {
+            if is_one(b) && self.plan.clean_bits[a.index()] <= 1 {
+                Some(a)
+            } else if is_one(a) && self.plan.clean_bits[b.index()] <= 1 {
+                Some(b)
+            } else {
+                None
+            }
+        };
         if self.ty(x) == Type::I128 {
             self.invalidate_spills();
             let cond = self.wide_icmp(cc, x, y);
@@ -482,6 +490,17 @@ impl Emit<'_> {
             && live_flags.is_some_and(|(val, fcc)| fcc == Cond::Ne && ((val == x && is_zero(y)) || (val == y && is_zero(x))))
         {
             int::cond(cc)
+        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some(bv) = bool_one_var(x, y)
+            && live_flags.is_some_and(|(val, fcc)| fcc == Cond::Ne && val == bv)
+        {
+            if cc == IntCC::Equal { Cond::Ne } else { Cond::E }
+        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some(bv) = bool_one_var(x, y)
+            && let Some(reg) = self.reg_of(bv).or_else(|| self.cached_spill(bv))
+        {
+            self.asm.test_sized(Size::of(self.ty(bv).bytes()), reg, reg);
+            if cc == IntCC::Equal { Cond::Ne } else { Cond::E }
         } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
             && let Some((a, b)) = self.elided_band_cmp(x, y)
         {

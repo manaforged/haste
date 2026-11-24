@@ -59,8 +59,6 @@ impl Emit<'_> {
 
     pub(super) fn invalidate_disp(&mut self, disp: i32) { self.spills.invalidate_disp(disp); }
 
-    pub(super) fn carry_spills(&mut self, plain: bool) { self.spills.carry(plain && !self.in_fast); }
-
     pub(super) fn resume_spills(&mut self, block: crate::ir::Block) { self.spills.resume(block); }
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {

@@ -2,27 +2,44 @@
 
 use crate::ir::{Block, Function, Op, Type};
 
-/// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
-pub(crate) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
-    let mut cloned = vec![false; func.blocks.len()];
-    for data in &func.blocks {
-        if let Some(&last) = data.insts.last()
+/// Exact incoming edge count for each block in `order`, or `u32::MAX` when spill-cache carry is disabled for that block.
+pub(crate) fn pred_totals(func: &Function, order: &[Block], copied: &[bool]) -> Vec<u32> {
+    let n = func.blocks.len();
+    let mut cloned = vec![false; n];
+    for &from in order {
+        if let Some(&last) = func.blocks[from.index()].insts.last()
             && copied.get(last.index()) == Some(&true)
             && let Op::Jump(head, _) = &func.insts[last.index()].op
         {
             cloned[head.index()] = true;
         }
     }
-    let mut preds: Vec<(u32, Option<Block>)> = vec![(0, None); func.blocks.len()];
-    for at in 0..func.blocks.len() {
-        let from = Block(at as u32);
+    let mut totals = vec![0_u32; n];
+    if let Some(entry) = func.entry {
+        totals[entry.index()] = u32::MAX;
+    }
+    for &from in order {
+        let fi = from.index();
+        if cloned[fi] {
+            totals[fi] = u32::MAX;
+        }
+        let disable_succs = cloned[fi]
+            || match func.last(from) {
+                Some(Op::BrTable(..) | Op::TryCall { .. }) => true,
+                Some(Op::Brif(_, then, _, otherwise, _)) => func.jump_target(*then) == func.jump_target(*otherwise),
+                _ => false,
+            };
         for next in func.successors(from) {
-            let entry = &mut preds[next.index()];
-            entry.0 += 1;
-            entry.1 = Some(from);
+            let target = func.jump_target(next);
+            let ti = target.index();
+            if disable_succs || target != next {
+                totals[ti] = u32::MAX;
+            } else if totals[ti] != u32::MAX {
+                totals[ti] += 1;
+            }
         }
     }
-    preds.into_iter().map(|(count, from)| from.filter(|from| count == 1 && !cloned[from.index()])).collect()
+    totals
 }
 
 /// Up to four slot displacements and the registers that hold them, newest first.
@@ -38,6 +55,17 @@ impl<R: Copy + PartialEq> SpillCache<R> {
     /// Forgets every entry.
     pub(crate) fn clear(&mut self) {
         self.0 = [None; 4];
+    }
+
+    /// Keeps only `(disp, reg)` entries present in both `self` and `other`.
+    pub(crate) fn intersect(&mut self, other: &Self) {
+        for entry in &mut self.0 {
+            if let Some(pair) = *entry
+                && !other.0.contains(&Some(pair))
+            {
+                *entry = None;
+            }
+        }
     }
 
     /// Forgets what `reg` held.
@@ -77,17 +105,25 @@ impl<R: Copy + PartialEq> SpillCache<R> {
     }
 }
 
-/// Per-block integer and float spill reload cache with single-predecessor fallthrough carry.
+/// Per-block integer and float spill reload cache with forward-join predecessor intersection.
 pub(crate) struct SpillState<R, F> {
     pub(crate) cache: SpillCache<R>,
     pub(crate) fspill: Option<(i32, F, Type)>,
-    carry: (Option<Block>, Option<SpillCache<R>>),
-    sole_pred: Vec<Option<Block>>,
+    pred_total: Vec<u32>,
+    pred_seen: Vec<u32>,
+    pred_cache: Vec<SpillCache<R>>,
 }
 
 impl<R: Copy + PartialEq, F: Copy + PartialEq> SpillState<R, F> {
-    pub(crate) fn new(sole_pred: Vec<Option<Block>>) -> Self {
-        Self { cache: SpillCache::new(), fspill: None, carry: (None, None), sole_pred }
+    pub(crate) fn new(pred_total: Vec<u32>) -> Self {
+        let n = pred_total.len();
+        Self {
+            cache: SpillCache::new(),
+            fspill: None,
+            pred_total,
+            pred_seen: vec![0; n],
+            pred_cache: vec![SpillCache::new(); n],
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -116,21 +152,32 @@ impl<R: Copy + PartialEq, F: Copy + PartialEq> SpillState<R, F> {
         }
     }
 
-    pub(crate) fn bind_entry(&mut self, block: Block) {
-        self.carry = (Some(block), None);
-    }
-
-    pub(crate) fn carry(&mut self, keep: bool) {
-        self.carry.1 = keep.then_some(self.cache);
+    pub(crate) fn record_edge(&mut self, target: Block, cache: SpillCache<R>) {
+        let bi = target.index();
+        let total = self.pred_total.get(bi).copied().unwrap_or(u32::MAX);
+        if total == u32::MAX || total == 0 {
+            return;
+        }
+        if self.pred_seen[bi] == 0 {
+            self.pred_cache[bi] = cache;
+        } else {
+            self.pred_cache[bi].intersect(&cache);
+        }
+        self.pred_seen[bi] += 1;
     }
 
     pub(crate) fn resume(&mut self, block: Block) {
-        if let (Some(from), Some(cache)) = self.carry
-            && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
+        let bi = block.index();
+        if let Some(&total) = self.pred_total.get(bi)
+            && total != u32::MAX
+            && total > 0
+            && self.pred_seen[bi] == total
         {
-            self.cache = cache;
+            self.cache = self.pred_cache[bi];
         }
-        self.carry = (Some(block), None);
+        if let Some(slot) = self.pred_total.get_mut(bi) {
+            *slot = u32::MAX;
+        }
     }
 
     pub(crate) fn record(&mut self, disp: i32, reg: R) {
