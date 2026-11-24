@@ -94,10 +94,19 @@ impl Checker<'_, '_> {
                 outer_live,
                 depth,
             ),
-            Expr::Loop { label, body } => {
-                self.check_loop(label, None, None, None, body, state, outer_live, depth)
-            }
+            Expr::Loop { label, body } => self.check_loop(
+                Some(expr),
+                label,
+                None,
+                None,
+                None,
+                body,
+                state,
+                outer_live,
+                depth,
+            ),
             Expr::While { label, cond, body } => self.check_loop(
+                None,
                 label,
                 Some(cond),
                 None,
@@ -234,7 +243,7 @@ impl Checker<'_, '_> {
                 )?;
             }
         }
-        self.check_expr(inner, state, true, outer_live, false, depth)
+        self.check_expr(inner, state, true, outer_live, true, depth)
     }
 
     fn check_assign_expr(
@@ -355,14 +364,14 @@ impl Checker<'_, '_> {
                     "cannot move out of a shared or mutable reference",
                 ));
             }
-            self.check_expr(inner, state, true, outer_live, false, depth)?;
+            self.check_expr(inner, state, true, outer_live, true, depth)?;
             if let Some(p) = self.root_place(expr) {
                 self.check_can_move(p.local, &p.steps, state)?;
                 self.push_partial_move(state, p.local, p.steps, Some(expr));
             }
             Ok(())
         } else {
-            self.check_expr(inner, state, op == UnOp::Deref, outer_live, false, depth)
+            self.check_expr(inner, state, op == UnOp::Deref, outer_live, true, depth)
         }
     }
 
@@ -379,7 +388,7 @@ impl Checker<'_, '_> {
         if !place_ctx && !self.ty_is_copy(self.expr_ty(expr)) {
             return Err(self.borrow_err(Some(expr), "cannot move out of index"));
         }
-        self.check_expr(a, state, true, outer_live, false, depth)?;
+        self.check_expr(a, state, true, outer_live, true, depth)?;
         self.check_expr(b, state, false, outer_live, true, depth)
     }
 
@@ -453,7 +462,7 @@ impl Checker<'_, '_> {
             }
             self.check_adt_drop_move(self.field_container_ty(expr, base))?;
         }
-        self.check_expr(base, state, true, outer_live, false, depth)
+        self.check_expr(base, state, true, outer_live, true, depth)
     }
 
     fn check_field_place(
@@ -650,11 +659,13 @@ impl Checker<'_, '_> {
         {
             let target_depth = self.breaks[idx].depth;
             if let Some(v) = val {
-                for src in self.expr_borrow_sources(v, state) {
+                let srcs = self.expr_borrow_sources(v, state);
+                for src in &srcs {
                     if self.escapes_depth(src.target, src.through_ref, target_depth) {
                         return Err(self.does_not_live_long_enough(Some(v), src.target));
                     }
                 }
+                self.breaks[idx].sources.extend(srcs);
             }
             self.breaks[idx].states.push(state.clone());
         }

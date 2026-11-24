@@ -16,6 +16,7 @@ pub(super) struct BorrowSource {
     pub(super) mutable: bool,
     pub(super) through_ref: bool,
     pub(super) env_only: bool,
+    pub(super) origin_only: bool,
 }
 
 impl BorrowSource {
@@ -26,6 +27,7 @@ impl BorrowSource {
             mutable: l.mutable,
             through_ref: l.through_ref,
             env_only: l.env_only,
+            origin_only: l.origin_only,
         }
     }
 
@@ -36,6 +38,7 @@ impl BorrowSource {
             mutable,
             through_ref: false,
             env_only,
+            origin_only: false,
         }
     }
 }
@@ -110,15 +113,13 @@ impl Checker<'_, '_> {
                     out.extend(self.expr_borrow_sources_inner(
                         ExprId(id),
                         state,
-                        allow_mut_ref_reborrow,
+                        true,
                         extend_depth,
                     ));
                 }
                 out
             }
-            Expr::Repeat(val, _) => {
-                self.expr_borrow_sources_inner(val, state, allow_mut_ref_reborrow, None)
-            }
+            Expr::Repeat(val, _) => self.expr_borrow_sources_inner(val, state, true, None),
             Expr::Struct { fields, base, .. } => {
                 let shared_fields = self.struct_shared_ref_fields(expr);
                 let field_ids: Vec<u32> = self.body.list(fields).to_vec();
@@ -127,12 +128,8 @@ impl Checker<'_, '_> {
                 for id in field_ids {
                     let field = self.body.fields[id as usize];
                     let is_shared = shared_fields.contains(self.src.text(field.name));
-                    let mut sources = self.expr_borrow_sources_inner(
-                        field.value,
-                        state,
-                        allow_mut_ref_reborrow,
-                        field_extend,
-                    );
+                    let mut sources =
+                        self.expr_borrow_sources_inner(field.value, state, true, field_extend);
                     if is_shared {
                         for s in &mut sources {
                             s.mutable = false;
@@ -201,6 +198,7 @@ impl Checker<'_, '_> {
                 }
                 dedup_sources(out)
             }
+            Expr::Loop { .. } => self.temp_sources.get(&expr).cloned().unwrap_or_default(),
             Expr::Closure { .. } => self.closure_borrow_sources(expr, state),
             Expr::Call(callee, args) => {
                 self.call_borrow_sources(expr, callee, args, state, extend_depth)
@@ -252,6 +250,7 @@ impl Checker<'_, '_> {
                 mutable: self.is_mut_ref_ty(self.local_ty(local)),
                 through_ref: true,
                 env_only: false,
+                origin_only: true,
             }];
         }
         let derefs_base = self.is_ref_ty(base_ty)
@@ -262,7 +261,36 @@ impl Checker<'_, '_> {
         }
         let unwrap_temp = matches!(*self.body.expr(expr), Expr::Index(..))
             || matches!(*self.body.expr(unwrapped_base), Expr::Method { .. });
-        self.unwrap_outer_container_loans(sources, state, unwrap_temp)
+        let is_deref = matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _));
+        let inner_static_res = self
+            .is_ref_ty(base_ty)
+            .then(|| (self.expr_ty(expr), is_deref));
+        self.unwrap_outer_container_loans_inner(sources, state, unwrap_temp, inner_static_res)
+    }
+
+    pub(super) fn origin_source_for(
+        &mut self,
+        local: u32,
+        ty: Ty,
+        mut base_steps: Vec<PlaceStep>,
+        env_only: bool,
+    ) -> Option<BorrowSource> {
+        if !(self.is_non_static_param(local) || self.is_active_closure_param(local))
+            || !self.ty_holds_borrow(ty)
+        {
+            return None;
+        }
+        if self.is_ref_ty(ty) {
+            base_steps.push(PlaceStep::Deref);
+        }
+        Some(BorrowSource {
+            target: local,
+            steps: base_steps,
+            mutable: self.is_mut_ref_ty(ty),
+            through_ref: true,
+            env_only,
+            origin_only: true,
+        })
     }
 
     pub(super) fn unwrap_outer_container_loans(
@@ -271,20 +299,34 @@ impl Checker<'_, '_> {
         state: &State,
         unwrap_temp: bool,
     ) -> Vec<BorrowSource> {
+        self.unwrap_outer_container_loans_inner(sources, state, unwrap_temp, None)
+    }
+
+    fn unwrap_outer_container_loans_inner(
+        &mut self,
+        sources: Vec<BorrowSource>,
+        state: &State,
+        unwrap_temp: bool,
+        inner_static_res: Option<(Ty, bool)>,
+    ) -> Vec<BorrowSource> {
         let targets: Vec<u32> = sources.iter().map(|s| s.target).collect();
         unwrap_container_loans(sources, state, |s| {
             if super::checks::is_temp_target(s.target).is_some() {
                 return unwrap_temp;
             }
+            if self.is_closure_param(s.target) {
+                return false;
+            }
+            if state_holds_other_target(&targets, s.target, state) {
+                return false;
+            }
+            if let Some((res_ty, is_deref)) = inner_static_res
+                && self.can_unwrap_inner_static_param(s, res_ty, is_deref)
+            {
+                return true;
+            }
             !self.from_caller(s.target, s.through_ref)
                 && self.ty_holds_borrow(self.local_ty(s.target))
-                && !targets.iter().any(|&other| {
-                    other != s.target
-                        && state
-                            .loans
-                            .iter()
-                            .any(|l| l.holder == Some(other) && l.target == s.target)
-                })
         })
     }
 
@@ -426,7 +468,7 @@ impl Checker<'_, '_> {
                         .map(BorrowSource::from_loan)
                 })
                 .collect();
-            if joined.is_empty() && self.returns_only_static {
+            if joined.is_empty() {
                 if self.is_non_static_param(*local) {
                     joined.push(BorrowSource {
                         target: *local,
@@ -434,6 +476,7 @@ impl Checker<'_, '_> {
                         mutable: self.is_mut_ref_ty(inner),
                         through_ref: true,
                         env_only: false,
+                        origin_only: true,
                     });
                 } else {
                     for outer in state.loans.iter().filter(|l| l.holder == Some(*local)) {
@@ -463,23 +506,13 @@ impl Checker<'_, '_> {
                 mutable: true,
                 through_ref: true,
                 env_only: false,
+                origin_only: false,
             });
-        } else if self.returns_only_static
-            && self.is_non_static_param(*local)
-            && self.ty_holds_borrow(self.local_ty(*local))
-            && !out.iter().any(|s| s.target == *local)
+        } else if !out.iter().any(|s| s.target == *local)
+            && let Some(src) =
+                self.origin_source_for(*local, self.local_ty(*local), Vec::new(), false)
         {
-            out.push(BorrowSource {
-                target: *local,
-                steps: if self.is_ref_ty(self.local_ty(*local)) {
-                    vec![PlaceStep::Deref]
-                } else {
-                    Vec::new()
-                },
-                mutable: self.is_mut_ref_ty(self.local_ty(*local)),
-                through_ref: true,
-                env_only: false,
-            });
+            out.push(src);
         }
         out
     }
@@ -602,6 +635,7 @@ impl Checker<'_, '_> {
                 mutable,
                 through_ref: false,
                 env_only: false,
+                origin_only: false,
             }];
             for l in existing {
                 out.push(BorrowSource {
@@ -640,6 +674,7 @@ impl Checker<'_, '_> {
                     mutable,
                     through_ref: true,
                     env_only: false,
+                    origin_only: false,
                 });
             }
             return dedup_sources(out);
@@ -650,6 +685,7 @@ impl Checker<'_, '_> {
             mutable,
             through_ref: true,
             env_only: false,
+            origin_only: false,
         }]
     }
 
@@ -668,6 +704,16 @@ impl Checker<'_, '_> {
             _ => false,
         }
     }
+}
+
+pub(super) fn state_holds_other_target(targets: &[u32], target: u32, state: &State) -> bool {
+    targets.iter().any(|&other| {
+        other != target
+            && state
+                .loans
+                .iter()
+                .any(|l| l.holder == Some(other) && l.target == target)
+    })
 }
 
 pub(super) fn unwrap_container_loans(

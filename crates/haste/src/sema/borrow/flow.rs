@@ -41,6 +41,7 @@ impl Checker<'_, '_> {
                 is_block: true,
                 depth: block_depth,
                 states: Vec::new(),
+                sources: Vec::new(),
             });
         }
         let ids: Vec<u32> = self.body.list(stmts).to_vec();
@@ -86,11 +87,19 @@ impl Checker<'_, '_> {
         }
         if label.is_some()
             && let Some(frame) = self.breaks.pop()
-            && !frame.states.is_empty()
-            && let Some(acc) =
-                merge_break_states((!state.diverged).then(|| state.clone()), frame.states)
         {
-            *state = acc;
+            if !frame.sources.is_empty() && !is_const {
+                let mut merged = self.temp_sources.remove(&expr_id).unwrap_or_default();
+                merged.extend(frame.sources);
+                self.temp_sources
+                    .insert(expr_id, super::propagate::dedup_sources(merged));
+            }
+            if !frame.states.is_empty()
+                && let Some(acc) =
+                    merge_break_states((!state.diverged).then(|| state.clone()), frame.states)
+            {
+                *state = acc;
+            }
         }
         Ok(())
     }
@@ -479,14 +488,14 @@ impl Checker<'_, '_> {
                     let id = self.next_temp_holder();
                     push_loan(
                         &mut arm_state.loans,
-                        p.local,
-                        p.steps.clone(),
-                        Some(id),
-                        false,
-                        p.through_ref,
-                        false,
-                        false,
-                        Some(scrut),
+                        Loan::new(
+                            p.local,
+                            p.steps.clone(),
+                            Some(id),
+                            false,
+                            p.through_ref,
+                            Some(scrut),
+                        ),
                     );
                     Some(id)
                 } else {
@@ -622,6 +631,7 @@ impl Checker<'_, '_> {
             .cloned()
             .collect();
         self.check_loop(
+            None,
             label,
             None,
             Some((pat, &item_sources)),
@@ -639,6 +649,7 @@ impl Checker<'_, '_> {
 
     pub(super) fn check_loop(
         &mut self,
+        expr_id: Option<ExprId>,
         label: Option<u32>,
         cond: Option<ExprId>,
         pat: Option<(PatId, &[BorrowSource])>,
@@ -674,6 +685,7 @@ impl Checker<'_, '_> {
             is_block: false,
             depth: loop_depth,
             states: Vec::new(),
+            sources: Vec::new(),
         });
         let mut iter_state = state.clone();
         self.with_let_extend(None, |this| -> Result<()> {
@@ -716,6 +728,13 @@ impl Checker<'_, '_> {
             Ok(())
         })?;
         let frame = self.breaks.pop().expect("loop pushed break frame");
+        if let Some(id) = expr_id
+            && !frame.sources.is_empty()
+            && self.const_depth == 0
+        {
+            self.temp_sources
+                .insert(id, super::propagate::dedup_sources(frame.sources));
+        }
         if infinite {
             match merge_break_states(None, frame.states) {
                 Some(acc) => *state = acc,

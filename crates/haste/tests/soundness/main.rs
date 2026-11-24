@@ -1,4 +1,6 @@
+#[path = "../common/mod.rs"]
 mod common;
+mod lifetimes;
 
 use common::FixtureDir;
 use haste::{Compiler, ErrorKind};
@@ -12,7 +14,7 @@ fn run_check(name: &str, src: &str) -> Result<(), haste::Error> {
         .check(fixture.path())
 }
 
-fn check_fails(name: &str, src: &str) -> haste::Error {
+pub(crate) fn check_fails(name: &str, src: &str) -> haste::Error {
     let err = run_check(name, src).expect_err("unsound program must be rejected");
     assert_eq!(err.kind(), ErrorKind::Compile);
     err
@@ -206,232 +208,6 @@ fn main() {
 }
 
 #[test]
-fn rejects_non_static_borrow_returned_as_static() {
-    check_fails(
-        "static_escape",
-        r#"
-fn leak(s: &str) -> &'static str { s }
-fn main() {
-    let local = String::from("hi");
-    println!("{}", leak(&local));
-}
-"#,
-    );
-    check_fails(
-        "static_escape_indirect",
-        r#"
-fn leak(s: &str) -> &'static str {
-    let alias = s;
-    alias
-}
-fn main() {
-    let local = String::from("hi");
-    println!("{}", leak(&local));
-}
-"#,
-    );
-    check_fails(
-        "static_escape_double_ref",
-        r#"
-struct S { x: i32 }
-fn leak(s: &S) -> &'static S {
-    let rr = &s;
-    *rr
-}
-fn main() {
-    let s = S { x: 1 };
-    println!("{}", leak(&s).x);
-}
-"#,
-    );
-    check_fails(
-        "static_escape_self_param",
-        r#"
-struct W<'a> { s: &'a str }
-impl<'a> W<'a> {
-    fn leak(other: Self) -> &'static str { other.s }
-}
-fn main() {
-    let local = String::from("hi");
-    let w = W { s: &local };
-    println!("{}", W::leak(w));
-}
-"#,
-    );
-    check_fails(
-        "static_escape_autoderef_double_ref",
-        r#"
-fn leak(s: &str) -> &'static str {
-    let rr = &s;
-    rr
-}
-fn main() {
-    let local = String::from("hi");
-    println!("{}", leak(&local));
-}
-"#,
-    );
-    check_fails(
-        "static_escape_local_struct_field",
-        r#"
-struct S { f: &'static str }
-fn leak() -> &'static str {
-    let local = String::from("dangling");
-    let s = S { f: &local };
-    s.f
-}
-fn main() {
-    println!("{}", leak());
-}
-"#,
-    );
-    check_fails(
-        "hrtb_outer_type_param_escape_identity",
-        r#"
-fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
-    let local = 9;
-    f(&local)
-}
-fn main() {
-    let dangling: &i32 = bad(|x| x);
-    println!("{dangling}");
-}
-"#,
-    );
-    check_fails(
-        "hrtb_outer_type_param_escape_option",
-        r#"
-fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
-    let local = 9;
-    f(&local)
-}
-fn main() {
-    let dangling: Option<&i32> = bad(|x| Some(x));
-    println!("{dangling:?}");
-}
-"#,
-    );
-    check_fails(
-        "copied_recv_alias_to_vec_escape",
-        r#"
-fn leak<'a>(xs: &[&'a str]) -> Vec<&'static str> {
-    let alias = xs;
-    alias.to_vec()
-}
-fn main() {
-    let local = String::from("dangling");
-    let s: &[&str] = &[&local];
-    let v: Vec<&'static str> = leak(s);
-    drop(local);
-    println!("{}", v[0]);
-}
-"#,
-    );
-    check_fails(
-        "copied_recv_elided_adt_clone_escape",
-        r#"
-#[derive(Clone)]
-struct Wrap<'a>(&'a str);
-fn leak(w: &Wrap) -> Wrap<'static> {
-    w.clone()
-}
-fn main() {
-    let local = String::from("dangling");
-    let w = Wrap(&local);
-    let leaked = leak(&w);
-    drop(local);
-    println!("{}", leaked.0);
-}
-"#,
-    );
-    check_fails(
-        "caller_lt_mixed_static_tuple_escape",
-        r#"
-fn leak<'a>(s: &'a str, f: impl FnOnce((&'static str, &'a str))) {
-    f((s, s));
-}
-fn main() {
-    let local = String::from("dangling");
-    leak(&local, |(s, _)| { let _: &'static str = s; });
-}
-"#,
-    );
-    check_fails(
-        "caller_lt_unrelated_lifetime_escape",
-        r#"
-fn stash<'a, 'b, F: FnMut(&'a i32)>(mut f: F, y: &'b i32) {
-    f(y);
-}
-fn main() {
-    let long = 1;
-    let mut out: &i32 = &long;
-    {
-        let short = 2;
-        stash(|r| out = r, &short);
-    }
-    println!("{out}");
-}
-"#,
-    );
-    check_fails(
-        "hrtb_outer_type_param_escape_match_bind",
-        r#"
-fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
-    let local = 9;
-    f(&local)
-}
-fn main() {
-    let dangling: &i32 = bad(|x| match x { y => y });
-    println!("{dangling}");
-}
-"#,
-    );
-    check_fails(
-        "hrtb_outer_type_param_escape_loop_break",
-        r#"
-fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
-    let local = 9;
-    f(&local)
-}
-fn main() {
-    let dangling: &i32 = bad(|x| loop { break x; });
-    println!("{dangling}");
-}
-"#,
-    );
-    check_fails(
-        "hrtb_outer_type_param_escape_generic_fn_item",
-        r#"
-fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
-    let local = 9;
-    f(&local)
-}
-fn id<T>(x: T) -> T { x }
-fn main() {
-    let dangling: &i32 = bad(id);
-    println!("{dangling}");
-}
-"#,
-    );
-    check_fails(
-        "copied_arg_vec_from_alias_escape",
-        r#"
-fn leak<'a>(xs: &[&'a str]) -> Vec<&'static str> {
-    let alias = xs;
-    Vec::from(alias)
-}
-fn main() {
-    let local = String::from("dangling");
-    let s: &[&str] = &[&local];
-    let v: Vec<&'static str> = leak(s);
-    drop(local);
-    println!("{}", v[0]);
-}
-"#,
-    );
-}
-
-#[test]
 fn accepts_valid_send_exhaustive_visibility_and_static_patterns() {
     check_passes(
         "valid_controls",
@@ -593,6 +369,81 @@ fn main() {
         Vec::from(xs)
     }
     let _ = vec_from_static(&["x", "y"]);
+
+    fn first_ref<'a>(s: &[&'a str]) -> &'a str {
+        s[0]
+    }
+    fn index_alias_static(xs: &[&'static str]) -> &'static str {
+        let a = xs;
+        a[0]
+    }
+    fn first_direct_static(xs: &[&'static str]) -> &'static str {
+        first_ref(xs)
+    }
+    fn first_alias_static(xs: &[&'static str]) -> &'static str {
+        let a = xs;
+        first_ref(a)
+    }
+    fn vec_index_static(xs: &Vec<&'static str>) -> &'static str {
+        xs[0]
+    }
+    let static_slice: &[&'static str] = &["a", "b"];
+    let static_vec: Vec<&'static str> = vec!["a", "b"];
+    let _ = index_alias_static(static_slice);
+    let _ = first_direct_static(static_slice);
+    let _ = first_alias_static(static_slice);
+    let _ = vec_index_static(&static_vec);
+
+    static STATIC_NUM: i32 = 7;
+    let _ = with_ref(|x| Some(x).map(|_| &STATIC_NUM));
+    let _ = with_ref(|x| {
+        let _k = loop {
+            break x;
+        };
+        &STATIC_NUM
+    });
+    let reassign_param = |mut x: &i32| {
+        let y = x;
+        x = &STATIC_NUM;
+        *y + *x
+    };
+    let _ = reassign_param(&5);
+
+    fn ok_mixed_tuple<'a>(s: &'a str, f: impl FnOnce((&'static str, &'a str))) {
+        f(("lit", s));
+    }
+    fn ok_nested_tuple<'a>(s: &'a str, f: impl FnOnce(((&'static str, &'a str), &'a str))) {
+        f((("lit", s), s));
+    }
+    fn ok_if_tuple<'a>(s: &'a str, f: impl FnOnce((&'static str, &'a str))) {
+        f(if true { ("lit", s) } else { ("a", s) });
+    }
+    fn ok_iter_map_deref(xs: &[&'static str]) -> Vec<&'static str> {
+        xs.iter().map(|s| *s).collect()
+    }
+    fn ok_first_map_deref(xs: &[&'static str]) -> Option<&'static str> {
+        xs.first().map(|s| *s)
+    }
+    struct StaticNode {
+        next: &'static StaticNode,
+    }
+    fn ok_static_node(x: &StaticNode) -> &'static StaticNode {
+        x.next
+    }
+    static NODE: StaticNode = StaticNode { next: &NODE };
+    let _ = ok_static_node(&NODE);
+    let _ = ok_iter_map_deref(static_slice);
+    let _ = ok_first_map_deref(static_slice);
+    let local_s = String::from("ok");
+    ok_mixed_tuple(&local_s, |(a, b)| {
+        let _ = (a.len(), b.len());
+    });
+    ok_nested_tuple(&local_s, |((a, b), c)| {
+        let _ = (a.len(), b.len(), c.len());
+    });
+    ok_if_tuple(&local_s, |(a, b)| {
+        let _ = (a.len(), b.len());
+    });
 }
 "#,
     );

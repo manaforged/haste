@@ -36,7 +36,31 @@ pub(super) struct Loan {
     through_ref: bool,
     two_phase: bool,
     env_only: bool,
+    origin_only: bool,
     site: Option<ExprId>,
+}
+
+impl Loan {
+    fn new(
+        target: u32,
+        steps: Vec<PlaceStep>,
+        holder: Option<u32>,
+        mutable: bool,
+        through_ref: bool,
+        site: Option<ExprId>,
+    ) -> Self {
+        Self {
+            target,
+            steps,
+            holder,
+            mutable,
+            through_ref,
+            two_phase: false,
+            env_only: false,
+            origin_only: false,
+            site,
+        }
+    }
 }
 
 impl PartialEq for Loan {
@@ -49,6 +73,7 @@ impl PartialEq for Loan {
             through_ref,
             two_phase,
             env_only,
+            origin_only,
             site: _,
         } = self;
         *target == other.target
@@ -58,6 +83,7 @@ impl PartialEq for Loan {
             && *through_ref == other.through_ref
             && *two_phase == other.two_phase
             && *env_only == other.env_only
+            && *origin_only == other.origin_only
     }
 }
 
@@ -99,6 +125,12 @@ struct BreakFrame {
     is_block: bool,
     depth: u32,
     states: Vec<State>,
+    sources: Vec<BorrowSource>,
+}
+
+struct ActiveClosure {
+    params: Vec<u32>,
+    ret_params: Vec<usize>,
 }
 
 struct Checker<'c, 'a> {
@@ -121,6 +153,7 @@ struct Checker<'c, 'a> {
     const_depth: u32,
     unsafe_depth: u32,
     closure_by_val_caps: Vec<u32>,
+    active_closures: Vec<ActiveClosure>,
     stmt_depth: u32,
     temp_scope_depth: u32,
     breaks: Vec<BreakFrame>,
@@ -251,7 +284,7 @@ pub(super) fn check(
         && sig.ret.is_some_and(|ret_ast| {
             let mut ret_lts = calls::Lifetimes::default();
             calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
-            checks::closure::sig_returns_only_static(sig, src, ret_ast, &ret_lts)
+            calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts)
         });
     let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
     let mut checker = Checker {
@@ -274,6 +307,7 @@ pub(super) fn check(
         const_depth: 0,
         unsafe_depth: u32::from(sig.is_unsafe),
         closure_by_val_caps: Vec::new(),
+        active_closures: Vec::new(),
         stmt_depth: 1,
         temp_scope_depth: 1,
         breaks: Vec::new(),
@@ -366,7 +400,7 @@ fn collect_pat_meta_for_local(
 }
 
 fn loan_conflicts_borrow(l: &Loan, local: u32, steps: &[PlaceStep]) -> bool {
-    l.target == local && steps_conflict(&l.steps, steps)
+    !l.origin_only && l.target == local && steps_conflict(&l.steps, steps)
 }
 
 fn loan_conflicts_assign(
@@ -376,7 +410,7 @@ fn loan_conflicts_assign(
     steps: &[PlaceStep],
     is_ref_local: bool,
 ) -> bool {
-    if l.target != local {
+    if l.origin_only || l.target != local {
         return false;
     }
     if !through_ref
@@ -451,7 +485,14 @@ impl Checker<'_, '_> {
             mutable: self.is_mut_ref_ty(ty),
             through_ref: self.ty_holds_borrow(ty),
             env_only: false,
+            origin_only: true,
         }
+    }
+
+    pub(super) fn is_active_closure_param(&self, local: u32) -> bool {
+        self.active_closures
+            .iter()
+            .any(|c| c.params.contains(&local))
     }
 
     pub(super) fn is_non_static_param(&self, local: u32) -> bool {
@@ -498,7 +539,7 @@ impl Checker<'_, '_> {
         declared.iter().all(|&p_lt| {
             req_lts
                 .iter()
-                .any(|&req| calls::lifetime_outlives(&sig, self.src, p_lt, req))
+                .all(|&req| calls::lifetime_outlives(&sig, self.src, p_lt, req))
         })
     }
 
@@ -541,7 +582,8 @@ impl Checker<'_, '_> {
             return effective >= depth;
         }
         !self.from_caller(target, through_ref)
-            && !(through_ref && self.is_ref_ty(self.local_ty(target)))
+            && !(through_ref
+                && (self.is_ref_ty(self.local_ty(target)) || self.is_closure_param(target)))
             && self.scope_depth.get(target as usize).copied().unwrap_or(0) >= depth
     }
 
@@ -600,15 +642,19 @@ impl Checker<'_, '_> {
     }
 
     fn check_return_escape(&mut self, expr: ExprId, state: &State) -> Result<()> {
-        if let Some(cached) = self.temp_sources.get(&expr).cloned() {
+        let had_cached = if let Some(cached) = self.temp_sources.get(&expr).cloned() {
             let site = self.return_diag_site(expr);
             self.check_return_sources(site, &cached)?;
-        }
+            true
+        } else {
+            false
+        };
         match *self.body.expr(expr) {
             Expr::Block {
                 kind: BlockKind::Const,
                 ..
             } => Ok(()),
+            Expr::Loop { .. } | Expr::Block { tail: None, .. } if had_cached => Ok(()),
             Expr::Paren(inner)
             | Expr::Block {
                 tail: Some(inner), ..
@@ -645,7 +691,16 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn check_return_sources(&self, expr: ExprId, sources: &[BorrowSource]) -> Result<()> {
+    fn check_return_sources(&mut self, expr: ExprId, sources: &[BorrowSource]) -> Result<()> {
+        if let Some(active) = self.active_closures.last_mut() {
+            for src in sources {
+                if let Some(idx) = active.params.iter().position(|&p| p == src.target)
+                    && !active.ret_params.contains(&idx)
+                {
+                    active.ret_params.push(idx);
+                }
+            }
+        }
         for src in sources {
             if self.is_escaping_return(src) {
                 return Err(self.borrow_err(

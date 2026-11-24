@@ -14,11 +14,12 @@ use crate::sema::ty::{Kind, Mut, Ty};
 use super::bind::push_loan;
 use super::places::PlaceStep;
 use super::propagate::BorrowSource;
-use super::{Checker, State, prune_moved_loans};
+use super::{Checker, Loan, State, prune_moved_loans};
 
 pub(super) use lifetimes::{
-    Lifetimes, ParamLifetimes, collect_ty_lifetimes, compute_param_lifetimes, is_owned_container,
-    is_prim_name, lifetime_outlives, pred_matches_name, receiver_has_any_named, ty_shares_name,
+    Lifetimes, ParamLifetimes, ast_ty_may_carry_elided_lt, collect_ty_lifetimes,
+    compute_param_lifetimes, lifetime_outlives, pred_matches_name, receiver_has_any_named,
+    sig_returns_only_static, sig_type_params, ty_shares_name,
 };
 
 impl Checker<'_, '_> {
@@ -92,8 +93,14 @@ impl Checker<'_, '_> {
                 outer_live,
                 depth,
             )?;
-            this.check_call_bounds(&arg_ids, sig.as_deref(), fn_item, has_self_arg, state)?;
-            this.check_callee_bound_args(callee, &arg_ids, state)?;
+            this.check_call_bounds(
+                &arg_ids,
+                &arg_sources,
+                sig.as_deref(),
+                fn_item,
+                has_self_arg,
+            )?;
+            this.check_callee_bound_args(callee, &arg_ids, &arg_sources, state)?;
             this.attach_call_out_sources(
                 expr,
                 &arg_ids,
@@ -231,7 +238,7 @@ impl Checker<'_, '_> {
             self.check_static_mut(receiver, derefs > 0)?;
         }
         let Some(mut p) = self.root_place(receiver) else {
-            self.check_expr(receiver, state, true, outer_live, false, depth)?;
+            self.check_expr(receiver, state, true, outer_live, true, depth)?;
             if self.ty_holds_borrow(self.expr_ty(receiver)) {
                 let recv_sources = self.expr_borrow_sources(receiver, state);
                 super::bind::push_source_loans_filtered(
@@ -257,7 +264,7 @@ impl Checker<'_, '_> {
         }
         if let Some(prefix_len) = p.raw_ptr_prefix {
             self.check_can_read(p.local, &p.steps[..prefix_len], state)?;
-            self.check_expr(receiver, state, true, outer_live, false, depth)?;
+            self.check_expr(receiver, state, true, outer_live, true, depth)?;
             return Ok(None);
         }
         let recv_is_mut_ref = self.is_mut_ref_ty(self.expr_ty(receiver));
@@ -281,20 +288,19 @@ impl Checker<'_, '_> {
             None
         };
         if !(deferred_recv.is_some() && self.expr_plain_local(receiver).is_some()) {
-            self.check_expr(receiver, state, true, outer_live, false, depth)?;
+            self.check_expr(receiver, state, true, outer_live, true, depth)?;
         }
         if mutability == Mut::Not || !p.through_ref || p.mut_ref_root || recv_is_mut_ref {
-            push_loan(
-                &mut state.loans,
+            let mut loan = Loan::new(
                 p.local,
                 p.steps,
                 Some(temp_id),
                 mutability == Mut::Mut,
                 p.through_ref,
-                mutability == Mut::Mut,
-                false,
                 Some(expr),
             );
+            loan.two_phase = mutability == Mut::Mut;
+            push_loan(&mut state.loans, loan);
         }
         Ok(deferred_recv)
     }
@@ -381,7 +387,7 @@ impl Checker<'_, '_> {
             self.check_borrow(local, through_ref, mut_ref_root, &steps, true, &check_state)?;
         }
         if !state.diverged {
-            self.check_call_bounds(&param_ids, sig.as_deref(), fn_item, false, state)?;
+            self.check_call_bounds(&param_ids, &arg_sources, sig.as_deref(), fn_item, false)?;
             self.attach_method_arg_sources(
                 expr,
                 receiver,

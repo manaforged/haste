@@ -1,5 +1,5 @@
 use crate::body::sig::{SelfKind, Signature};
-use crate::body::{Expr, ExprId, List, Ty as AstTy, TyId};
+use crate::body::{Expr, ExprId, List, Pat, Ty as AstTy, TyId, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::Item;
 use crate::outline::source::Source;
@@ -8,11 +8,12 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::calls::{
     Lifetimes, collect_ty_lifetimes, receiver_has_any_named, recv_is_by_ref, recv_ref_mut,
-    ty_shares_name,
+    sig_returns_only_static, ty_shares_name,
 };
 use super::super::checks;
+use super::super::places::PlaceStep;
 use super::super::{Checker, State};
-use super::{BorrowSource, dedup_sources, unwrap_container_loans};
+use super::{BorrowSource, dedup_sources, state_holds_other_target, unwrap_container_loans};
 
 struct SigFnFlags<'a> {
     fn_name: &'a str,
@@ -137,11 +138,6 @@ impl<'a> Checker<'_, 'a> {
         let Ok(sig) = self.cx.signature(fn_item) else {
             return Vec::new();
         };
-        let Some(ret_ast) = sig.ret else {
-            return Vec::new();
-        };
-        let (sig_src, sig_item) = self.cx.item(fn_item);
-        let ret_lts = self.collect_ret_lifetimes(fn_item, &sig, sig_src, ret_ast);
         let raw_args = self.body.list(args);
         let (receiver, arg_ids): (Option<ExprId>, Vec<u32>) =
             if receiver.is_none() && sig.receiver.is_some() && !raw_args.is_empty() {
@@ -149,6 +145,30 @@ impl<'a> Checker<'_, 'a> {
             } else {
                 (receiver, raw_args.to_vec())
             };
+        if sig.is_async {
+            let mut out = Vec::new();
+            if let Some(recv) = receiver {
+                if let Some(mutability) = self.typed.adjusts.get(&expr).and_then(|a| a.autoref) {
+                    out.extend(self.method_recv_borrow_sources(
+                        expr,
+                        recv,
+                        mutability == Mut::Mut,
+                        state,
+                    ));
+                } else {
+                    out.extend(self.expr_borrow_sources(recv, state));
+                }
+            }
+            for &arg in &arg_ids {
+                out.extend(self.expr_borrow_sources(ExprId(arg), state));
+            }
+            return self.finish_sig_sources(expr, out, false);
+        }
+        let Some(ret_ast) = sig.ret else {
+            return Vec::new();
+        };
+        let (sig_src, sig_item) = self.cx.item(fn_item);
+        let ret_lts = self.collect_ret_lifetimes(fn_item, &sig, sig_src, ret_ast);
         let flags = self.sig_fn_flags(fn_item, &sig);
         let ctx = SigCallCtx {
             expr,
@@ -224,7 +244,7 @@ impl<'a> Checker<'_, 'a> {
         state: &State,
     ) -> Vec<BorrowSource> {
         let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
-        if checks::closure::sig_returns_only_static(sig, sig_src, ctx.ret_ast, ret_lts) {
+        if sig_returns_only_static(sig, sig_src, ctx.ret_ast, ret_lts) {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -239,11 +259,14 @@ impl<'a> Checker<'_, 'a> {
                 continue;
             }
             if let AstTy::Ref { .. } = *sig.body.ty(param_ty) {
-                if self.returns_only_static {
-                    let arg_sources =
-                        self.expr_borrow_sources_inner(ExprId(arg), state, false, None);
-                    out.extend(self.copied_recv_sources(ExprId(arg), arg_sources, state, true));
-                }
+                let arg_sources = self.expr_borrow_sources_inner(ExprId(arg), state, false, None);
+                out.extend(self.copied_recv_sources(
+                    ctx.expr,
+                    ExprId(arg),
+                    arg_sources,
+                    state,
+                    true,
+                ));
                 continue;
             }
             if sig
@@ -259,13 +282,16 @@ impl<'a> Checker<'_, 'a> {
         if let Some(recv) = receiver
             && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))
         {
-            out.extend(self.sig_no_lt_recv_sources(sig, recv, arg_ids, &ctx.flags, state));
+            out.extend(
+                self.sig_no_lt_recv_sources(ctx.expr, sig, recv, arg_ids, &ctx.flags, state),
+            );
         }
         self.finish_sig_sources(ctx.expr, out, ctx.flags.is_by_ref)
     }
 
     fn sig_no_lt_recv_sources(
         &mut self,
+        call_expr: ExprId,
         sig: &Signature,
         recv: ExprId,
         arg_ids: &[u32],
@@ -274,10 +300,17 @@ impl<'a> Checker<'_, 'a> {
     ) -> Vec<BorrowSource> {
         let mut recv_sources =
             self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
+        let maps_inner_copy = (flags.is_iter_fn || flags.is_opt_fn)
+            && flags.fn_name == "map"
+            && arg_ids
+                .first()
+                .is_some_and(|&a| self.closure_copies_inner_ref(ExprId(a)));
         if ((flags.is_iter_fn || flags.is_opt_fn) && matches!(flags.fn_name, "copied" | "cloned"))
             || flags.is_owned_copy_fn
+            || maps_inner_copy
         {
             return self.copied_recv_sources(
+                call_expr,
                 recv,
                 recv_sources,
                 state,
@@ -340,6 +373,10 @@ impl<'a> Checker<'_, 'a> {
                         && matches!(sig.body.ty(pt), AstTy::Ref { lifetime: None, .. });
                     let mut arg_sources =
                         self.expr_borrow_sources_inner(ae, state, !inner_only, None);
+                    if inner_only {
+                        arg_sources =
+                            self.copied_recv_sources(ctx.expr, ae, arg_sources, state, true);
+                    }
                     if matches!(sig.body.ty(pt), AstTy::Ref { mutable: false, .. }) {
                         for s in &mut arg_sources {
                             s.mutable = false;
@@ -391,10 +428,20 @@ impl<'a> Checker<'_, 'a> {
                 self.is_ref_ty(self.local_ty(s.target))
             })
         } else if recv_creates_borrow {
-            if let Some(mutability) = self.typed.adjusts.get(&ctx.expr).and_then(|a| a.autoref) {
+            let srcs = if let Some(mutability) =
+                self.typed.adjusts.get(&ctx.expr).and_then(|a| a.autoref)
+            {
                 self.method_recv_borrow_sources(ctx.expr, recv, mutability == Mut::Mut, state)
             } else {
                 self.expr_borrow_sources(recv, state)
+            };
+            let inner_only = !ret_lts.has_elided
+                && matches!(sig.receiver, Some((SelfKind::Ref | SelfKind::RefMut, _)))
+                && sig.receiver_lifetime.is_none();
+            if inner_only {
+                self.copied_recv_sources(ctx.expr, recv, srcs, state, true)
+            } else {
+                srcs
             }
         } else {
             self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None)
@@ -411,6 +458,7 @@ impl<'a> Checker<'_, 'a> {
 
     fn copied_recv_sources(
         &mut self,
+        call_expr: ExprId,
         recv: ExprId,
         mut recv_sources: Vec<BorrowSource>,
         state: &State,
@@ -433,15 +481,14 @@ impl<'a> Checker<'_, 'a> {
             let r_ty = self.local_ty(r);
             cur == recv || self.is_ref_ty(r_ty) || self.ty_holds_closure(r_ty)
         });
+        let call_ty = self.expr_ty(call_expr);
         let targets: Vec<u32> = recv_sources.iter().map(|s| s.target).collect();
         let container_targets: Vec<u32> = recv_sources
             .iter()
             .filter(|s| {
-                if self.returns_only_static
-                    && self.is_non_static_param(s.target)
-                    && !self.param_inner_is_static(s.target)
-                {
-                    return false;
+                let held_by_other = state_holds_other_target(&targets, s.target, state);
+                if self.is_non_static_param(s.target) {
+                    return !held_by_other && self.can_unwrap_inner_static_param(s, call_ty, false);
                 }
                 if checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
                     return true;
@@ -459,13 +506,7 @@ impl<'a> Checker<'_, 'a> {
                 if !self.ty_holds_borrow(self.local_ty(s.target)) {
                     return false;
                 }
-                !targets.iter().any(|&other| {
-                    other != s.target
-                        && state
-                            .loans
-                            .iter()
-                            .any(|l| l.holder == Some(other) && l.target == s.target)
-                })
+                !held_by_other
             })
             .map(|s| s.target)
             .collect();
@@ -518,6 +559,43 @@ impl<'a> Checker<'_, 'a> {
         }
     }
 
+    fn closure_copies_inner_ref(&self, arg: ExprId) -> bool {
+        let cur = self.unwrap_parens(arg);
+        let Expr::Closure { params, body, .. } = *self.body.expr(cur) else {
+            return false;
+        };
+        let Some(closure) = self.typed.closures.get(&cur) else {
+            return false;
+        };
+        if closure.params.len() != 1 || !closure.captures.is_empty() {
+            return false;
+        }
+        let param_local = closure.params[0];
+        let param_ty = self.local_ty(param_local);
+        if !matches!(
+            *self.cx.types.kind(param_ty),
+            Kind::Ref(_, inner) if matches!(*self.cx.types.kind(inner), Kind::Ref(Mut::Not, _))
+        ) {
+            return false;
+        }
+        let body = self.unwrap_parens(body);
+        if let Expr::Unary(UnOp::Deref, inner) = *self.body.expr(body)
+            && self.expr_plain_local(inner) == Some(param_local)
+        {
+            return true;
+        }
+        let param_ids = self.body.list(params);
+        if param_ids.len() == 1
+            && let Pat::Ref { pat: inner_pat, .. } =
+                *self.body.pat(self.body.params[param_ids[0] as usize].pat)
+            && let Some(&bound) = self.typed.binds.get(&inner_pat)
+            && self.expr_plain_local(body) == Some(bound)
+        {
+            return true;
+        }
+        false
+    }
+
     fn iter_closure_ignores_param(&mut self, arg: ExprId, state: &State) -> bool {
         if self.fn_arg_returns_static(arg) {
             return true;
@@ -526,6 +604,13 @@ impl<'a> Checker<'_, 'a> {
         let Some(closure) = self.typed.closures.get(&cur).cloned() else {
             return false;
         };
+        if self
+            .closure_effects
+            .get(&cur)
+            .is_some_and(|eff| !eff.ret_params.is_empty())
+        {
+            return false;
+        }
         let Some(targets) = self.closure_ret_targets(cur, closure.ret, state) else {
             return false;
         };
@@ -551,5 +636,67 @@ impl<'a> Checker<'_, 'a> {
             }
         }
         dedup_sources(out)
+    }
+
+    fn leading_ref_depth(&self, mut ty: Ty) -> u32 {
+        let mut depth = 0;
+        while ty != Ty::NONE
+            && let Kind::Ref(_, inner) = *self.cx.types.kind(ty)
+        {
+            depth += 1;
+            ty = inner;
+        }
+        depth
+    }
+
+    fn ty_max_ref_depth(&self, ty: Ty) -> u32 {
+        if ty == Ty::NONE {
+            return 0;
+        }
+        match *self.cx.types.kind(ty) {
+            Kind::Ref(_, inner) => 1 + self.ty_max_ref_depth(inner),
+            Kind::Slice(inner) | Kind::Array(inner, _) | Kind::Pat(inner, ..) => {
+                self.ty_max_ref_depth(inner)
+            }
+            Kind::Tuple(items) | Kind::Adt(_, items) => self
+                .cx
+                .types
+                .substs(items)
+                .to_vec()
+                .into_iter()
+                .map(|t| self.ty_max_ref_depth(t))
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn can_unwrap_inner_static_param(
+        &mut self,
+        s: &BorrowSource,
+        res_ty: Ty,
+        is_deref: bool,
+    ) -> bool {
+        if !s.through_ref
+            || !self.is_non_static_param(s.target)
+            || !self.param_inner_is_static(s.target)
+            || !s.steps.iter().all(|st| matches!(st, PlaceStep::Deref))
+        {
+            return false;
+        }
+        let local_ty = self.local_ty(s.target);
+        if res_ty == local_ty {
+            return false;
+        }
+        let Kind::Ref(_, pointee) = *self.cx.types.kind(local_ty) else {
+            return false;
+        };
+        if !self.ty_holds_borrow(pointee) {
+            return false;
+        }
+        if is_deref && self.leading_ref_depth(res_ty) >= self.leading_ref_depth(local_ty) {
+            return false;
+        }
+        self.ty_max_ref_depth(res_ty) <= self.ty_max_ref_depth(pointee)
     }
 }

@@ -5,7 +5,7 @@ use crate::body::{Expr, ExprId};
 
 use super::super::places::{Place, PlaceStep, steps_conflict};
 use super::super::propagate::BorrowSource;
-use super::super::{Checker, State};
+use super::super::{Checker, Loan, State};
 use super::{push_loan, reset_local_binding};
 
 impl Checker<'_, '_> {
@@ -161,14 +161,14 @@ impl Checker<'_, '_> {
             )?;
             push_loan(
                 &mut state.loans,
-                bp.local,
-                bp.steps,
-                Some(tid),
-                true,
-                bp.through_ref,
-                false,
-                false,
-                Some(lhs),
+                Loan::new(
+                    bp.local,
+                    bp.steps,
+                    Some(tid),
+                    true,
+                    bp.through_ref,
+                    Some(lhs),
+                ),
             );
         }
         Ok(Some(tid))

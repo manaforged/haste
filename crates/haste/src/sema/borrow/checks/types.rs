@@ -56,7 +56,7 @@ impl Checker<'_, '_> {
             return false;
         };
         if let Some(info) = self.cx.closure(ty) {
-            return info.closure.captures.iter().any(|c| {
+            if info.closure.captures.iter().any(|c| {
                 c.by != By::Value
                     || self.ty_holds_borrow_inner(
                         info.typed
@@ -65,7 +65,18 @@ impl Checker<'_, '_> {
                             .map_or(Ty::NONE, |l| l.ty),
                         seen,
                     )
-            });
+            }) {
+                return true;
+            }
+            if info.closure.coroutine && self.cx.signature(parent).is_ok_and(|sig| sig.is_async) {
+                return info.typed.params.iter().any(|&p| {
+                    self.ty_holds_borrow_inner(
+                        info.typed.locals.get(p as usize).map_or(Ty::NONE, |l| l.ty),
+                        seen,
+                    )
+                });
+            }
+            return false;
         }
         if parent == self.item
             && let Some(closure) = self.typed.closures.get(&ExprId(at))

@@ -548,27 +548,7 @@ fn reset_local_binding(local: u32, init_val: bool, state: &mut State) {
     clear_rebound_loans(local, state);
 }
 
-pub(super) fn push_loan(
-    loans: &mut Vec<Loan>,
-    target: u32,
-    steps: Vec<PlaceStep>,
-    holder: Option<u32>,
-    mutable: bool,
-    through_ref: bool,
-    two_phase: bool,
-    env_only: bool,
-    site: Option<ExprId>,
-) {
-    let loan = Loan {
-        target,
-        steps,
-        holder,
-        mutable,
-        through_ref,
-        two_phase,
-        env_only,
-        site,
-    };
+pub(super) fn push_loan(loans: &mut Vec<Loan>, loan: Loan) {
     if !loans.contains(&loan) {
         loans.push(loan);
     }
@@ -596,21 +576,34 @@ pub(super) fn push_source_loans_filtered(
         if include(s) {
             push_loan(
                 loans,
-                s.target,
-                s.steps.clone(),
-                holder,
-                mutable_of(s),
-                s.through_ref,
-                two_phase,
-                s.env_only,
-                site,
+                Loan {
+                    target: s.target,
+                    steps: s.steps.clone(),
+                    holder,
+                    mutable: mutable_of(s),
+                    through_ref: s.through_ref,
+                    two_phase,
+                    env_only: s.env_only,
+                    origin_only: s.origin_only,
+                    site,
+                },
             );
         }
     }
 }
 
 fn clear_rebound_loans(local: u32, state: &mut State) {
-    state
-        .loans
-        .retain(|l| l.holder != Some(local) && l.target != local);
+    state.loans.retain_mut(|l| {
+        if l.holder == Some(local) {
+            return false;
+        }
+        if l.target == local {
+            if l.origin_only || l.through_ref {
+                l.origin_only = true;
+                return true;
+            }
+            return false;
+        }
+        true
+    });
 }
