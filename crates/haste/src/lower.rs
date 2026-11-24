@@ -1,5 +1,3 @@
-//! Lowering of inferred function bodies at concrete types to `haste-codegen` SSA.
-
 mod abi;
 mod adt;
 mod array;
@@ -24,33 +22,39 @@ mod promote;
 pub(crate) mod reloc;
 mod simd;
 mod slice_pat;
+mod slots;
 mod stencil;
+mod stmt;
 
-pub use expr::{can_inline_body, may_inline};
-pub use abi::{signature, signature_of};
-pub(crate) use abi::purpose_tag;
 pub(super) use abi::is_freeze_ty;
+pub(crate) use abi::purpose_tag;
+pub use abi::{signature, signature_of};
+pub use expr::{can_inline_body, may_inline};
 pub(crate) use object::VTABLE_HEADER;
 pub use plan::eval_footprint;
 pub use reloc::{RelocPlan, eval_relocs};
-pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil, warm_inline};
+pub use slots::{Slots, Word};
+pub use stencil::{
+    Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput,
+    SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil, warm_inline,
+};
 
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, ArgumentPurpose, Block, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
+use haste_codegen::{
+    Arch, ArgumentPurpose, Block, FunctionBuilder, Ins, Signature, StackSlot, Type, Value,
+};
 
-/// Whether `arch` is x86-64 or AArch64.
 pub(crate) fn arch_is_x64_or_arm64(arch: Arch) -> bool {
     matches!(arch, Arch::X64 | Arch::Arm64)
 }
 
-/// Whether the compilation target architecture is x86-64 or AArch64.
 pub(crate) fn host_is_x64_or_arm64() -> bool {
     arch_is_x64_or_arm64(crate::compile_target().arch)
 }
 
-use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
+use crate::body::{Body, ExprId};
 use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
@@ -58,80 +62,6 @@ use crate::sema::Context;
 use crate::sema::infer::{Shape, Typed};
 use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
-
-/// Where lowered code finds what it refers to: call table entries and constant data.
-pub trait Slots {
-    /// The address of the table entry that holds the code address of reached function `index`.
-    fn entry(&self, index: usize) -> i64;
-    /// The address of a 16-byte-aligned copy of `bytes` that lives as long as the program.
-    fn data(&self, bytes: &[u8]) -> i64;
-    /// The address of `len` zeroed, 16-byte-aligned bytes that each run of the program writes for itself.
-    fn zeroed(&self, len: usize) -> i64;
-    /// The address of a table of `words` that lives as long as the program, each `Word::Code` holding a code address once every function is compiled.
-    fn table(&self, words: &[Word]) -> i64;
-    /// The address of the zeroed, 16-byte-aligned cell of `size` bytes and one more that holds the value of the static whose initializer is reached function `index`, then whether it is filled.
-    fn cell(&self, index: usize, size: u32) -> i64;
-    /// Notes that lowering used `instance`, which was not reached, so a caller that reaches functions on demand can reach it and lower again.
-    fn want(&self, _instance: crate::sema::reach::Instance) {}
-    /// The count of unreached function instances recorded so far.
-    fn wanted_len(&self) -> usize {
-        0
-    }
-    /// The bodies that calls copy inline.
-    fn bodies(&self) -> &Bodies;
-    /// Whether call table entries live in the low 2 GiB address range.
-    fn low_entries(&self) -> bool {
-        false
-    }
-    /// Interns a read-only blob with optional intra-rodata relocations and returns its symbol id.
-    fn rodata(&self, bytes: &[u8], _relocs: &[RodataReloc]) -> RodataId {
-        self.data(bytes);
-        RodataId(0)
-    }
-    /// Interns read-only bytes for immutable static `index` without deduplicating across distinct statics.
-    fn static_rodata(&self, _index: usize, bytes: &[u8]) -> RodataId {
-        self.rodata(bytes, &[])
-    }
-    /// Whether calls may inline bodies through this image.
-    fn allow_inline(&self) -> bool {
-        true
-    }
-    /// Interns a vtable layout and returns its symbol id.
-    fn vtable_id(&self, _entries: &[VtableEntry]) -> VtableId {
-        VtableId(0)
-    }
-    /// Returns the entries of an interned vtable `id`, if available.
-    fn vtable_entries(&self, _id: VtableId) -> Option<Vec<VtableEntry>> {
-        None
-    }
-    /// Encodes `plan` into substrate bytes, toolchain items only when `is_sysroot`, or `None` when this image keeps no plans across builds.
-    fn encode_plan(&self, _cx: &Context<'_>, _reached: &Reached, _is_sysroot: bool, _plan: &RelocPlan) -> Option<Vec<u8>> {
-        None
-    }
-    /// Decodes plan bytes that `encode_plan` wrote, or `None` when they do not resolve in this image.
-    fn decode_plan(&self, _cx: &Context<'_>, _reached: &Reached, _is_sysroot: bool, _bytes: &[u8]) -> Option<RelocPlan> {
-        None
-    }
-    /// Resolves a symbolic relocation entry to its concrete 64-bit value in this image.
-    fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
-        match *sym {
-            SymbolSource::Slot(index) => self.entry(index) as u64,
-            SymbolSource::StaticCell { index, size } => self.cell(index, size) as u64,
-            SymbolSource::PromotedCell { size, .. } => self.zeroed(size as usize) as u64,
-            SymbolSource::Host(ref host) => host.host_addr().unwrap_or(0) as u64,
-            SymbolSource::Word(word) => word,
-            SymbolSource::ThreadSlot(index) => index as u64,
-            SymbolSource::Vtable(_) | SymbolSource::Rodata(_) => 0,
-        }
-    }
-}
-
-/// One machine word of a constant table: a number, or the code address of reached function `index`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Word {
-    Int(u64),
-    Code(usize),
-}
 
 /// How a value of one type travels: not at all, in one register, or as the address of its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +86,9 @@ impl Parts {
         let list = match self {
             Parts::Bytes => [None; 4],
             Parts::One(ty) => [Some((ty, 0)), None, None, None],
-            Parts::Pair(first, second, offset) => [Some((first, 0)), Some((second, offset)), None, None],
+            Parts::Pair(first, second, offset) => {
+                [Some((first, 0)), Some((second, offset)), None, None]
+            }
             Parts::Words(words, len) => {
                 let mut out = [None; 4];
                 for (slot, &word) in out.iter_mut().zip(&words[..usize::from(len)]) {
@@ -197,20 +129,44 @@ pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
     }
     let layout = cx.layout(ty)?;
     let size = layout.size.bytes() as u32;
-    Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.bytes().trailing_zeros() as u8, parts: abi::copied_parts(&layout) } })
+    Ok(if size == 0 {
+        Repr::Zst
+    } else {
+        Repr::Mem {
+            size,
+            align: layout.align.bytes().trailing_zeros() as u8,
+            parts: abi::copied_parts(&layout),
+        }
+    })
 }
 
 fn is_repr_c(cx: &Context<'_>, ty: Ty) -> bool {
-    matches!(cx.types.kind(ty), Kind::Adt(def, _) if cx.repr(*def).flags.contains(rustc_abi::ReprFlags::IS_C))
+    matches!(
+        cx.types.kind(ty),
+        Kind::Adt(def, _) if cx.repr(*def).flags.contains(rustc_abi::ReprFlags::IS_C)
+    )
 }
 
 /// The scalars that a memory value of `ty` crosses an internal call in, one register each, or none when it travels by address.
 pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
     Ok(match repr(cx, ty)? {
-        Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
-        Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
-        Repr::Mem { parts: parts @ Parts::Words(..), .. } if !is_repr_c(cx, ty) => Some(parts),
-        Repr::Mem { size, parts: Parts::Bytes | Parts::Pair(..), .. } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
+        Repr::Mem {
+            parts: parts @ Parts::One(_),
+            ..
+        } => Some(parts),
+        Repr::Mem {
+            parts: parts @ Parts::Pair(first, second, _),
+            ..
+        } if first != Type::I128 && second != Type::I128 => Some(parts),
+        Repr::Mem {
+            parts: parts @ Parts::Words(..),
+            ..
+        } if !is_repr_c(cx, ty) => Some(parts),
+        Repr::Mem {
+            size,
+            parts: Parts::Bytes | Parts::Pair(..),
+            ..
+        } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
             Parts::Bytes => None,
             parts => Some(parts),
         },
@@ -218,9 +174,11 @@ pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
     })
 }
 
-/// Whether `signature` returns its result through a first `StructReturn` pointer.
 fn indirect(signature: &Signature) -> bool {
-    signature.params.first().is_some_and(|param| param.purpose == ArgumentPurpose::StructReturn)
+    signature
+        .params
+        .first()
+        .is_some_and(|param| param.purpose == ArgumentPurpose::StructReturn)
 }
 
 #[derive(Clone, Copy)]
@@ -233,7 +191,6 @@ struct Loop {
     block: bool,
 }
 
-/// The inline state of one top-level lowering: the reached indexes being lowered, the callees whose inline decision rests on an open cycle, each with the stack depth that cycle reaches, and what the body being lowered copies.
 #[derive(Default)]
 pub(super) struct Inline {
     pub stack: Vec<usize>,
@@ -249,8 +206,10 @@ pub(super) struct Inline {
 impl Inline {
     pub(super) fn pop(&mut self, depth: usize) {
         self.stack.pop();
-        self.local.retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
-        self.local_meta.retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
+        self.local
+            .retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
+        self.local_meta
+            .retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
     }
 }
 
@@ -286,7 +245,6 @@ pub struct Lower<'l, 'a> {
     overflow_checks: bool,
     child_rodata: Vec<(RodataId, Option<Vec<u8>>)>,
     caller_loc_guard: Option<(Value, Value)>,
-    /// The statics whose read-only bytes are being built now, which a cycle of statics that point to each other reaches again.
     blob_statics: rustc_hash::FxHashSet<(ItemRef, crate::sema::substs::Substs)>,
 }
 
@@ -370,7 +328,10 @@ impl<'l, 'a> Lower<'l, 'a> {
     fn run(&mut self) -> Result<()> {
         let (prologue, start, _) = self.begin_entry()?;
         let filling = is_static(self.cx, self.reached.list[self.index].0.0);
-        if !filling && self.inline.stack.is_empty() && self.cx.track_caller(self.reached.list[self.index].0.0) {
+        if !filling
+            && self.inline.stack.is_empty()
+            && self.cx.track_caller(self.reached.list[self.index].0.0)
+        {
             self.enter_tracked_caller_loc()?;
         }
         let value = self.root_value()?;
@@ -384,11 +345,19 @@ impl<'l, 'a> Lower<'l, 'a> {
 
     fn declare_params(&mut self, entry: Block) -> Result<()> {
         let mut params = self.b.block_params(entry).to_vec().into_iter();
-        self.sret = if indirect(&self.b.func.signature) { params.next() } else { None };
+        self.sret = if indirect(&self.b.func.signature) {
+            params.next()
+        } else {
+            None
+        };
         for &local in &self.typed.params {
             self.declare_passed(local, &mut params)?;
             if let Some(&pat) = self.typed.unpacks.get(&local) {
-                self.bind_matched(pat, self.locals[local as usize], Some((moves::Root::Local(local), Vec::new())))?;
+                self.bind_matched(
+                    pat,
+                    self.locals[local as usize],
+                    Some((moves::Root::Local(local), Vec::new())),
+                )?;
                 self.commit_moves()?;
             }
         }
@@ -405,15 +374,24 @@ impl<'l, 'a> Lower<'l, 'a> {
             Shape::Asm(_) => bail!("global_asm function is assembled directly"),
             Shape::GlobalAlloc(shim) => self.global_alloc_body(shim.clone()),
             Shape::Anon(anon) => self.expr(anon.root),
-            Shape::Closure(closure) if closure.closure.coroutine => self.resume_root(closure.closure.body),
+            Shape::Closure(closure) if closure.closure.coroutine => {
+                self.resume_root(closure.closure.body)
+            }
             Shape::Closure(closure) => {
                 let root = closure.closure.body;
                 self.bind_captures()?;
                 self.expr(root)
             }
             Shape::Body => {
-                let Some(root) = self.body.root else { bail!("body has no root") };
-                match self.typed.closures.get(&root).is_some_and(|closure| closure.coroutine) {
+                let Some(root) = self.body.root else {
+                    bail!("body has no root")
+                };
+                match self
+                    .typed
+                    .closures
+                    .get(&root)
+                    .is_some_and(|closure| closure.coroutine)
+                {
                     true => self.closure(root),
                     false => self.expr(root),
                 }
@@ -423,7 +401,9 @@ impl<'l, 'a> Lower<'l, 'a> {
 
     fn glue_target(&mut self) -> Result<()> {
         let local = self.typed.params[0];
-        let Kind::Ref(_, ty) = *self.cx.types.kind(self.typed.locals[local as usize].ty) else { bail!("drop glue takes a reference") };
+        let Kind::Ref(_, ty) = *self.cx.types.kind(self.typed.locals[local as usize].ty) else {
+            bail!("drop glue takes a reference");
+        };
         let target = self.locals[local as usize].and_then(|place| self.read(place));
         self.glue_body(ty, target)
     }
@@ -440,7 +420,9 @@ impl<'l, 'a> Lower<'l, 'a> {
         let returns = !self.b.func.signature.returns.is_empty();
         let values = match (self.sret, value) {
             (Some(out), Some(value)) => {
-                let whole @ Repr::Mem { .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
+                let whole @ Repr::Mem { .. } = repr(self.cx, ret)? else {
+                    bail!("result pointer for a non-memory result");
+                };
                 self.copy(out, value, whole);
                 Some(Vec::new())
             }
@@ -464,7 +446,6 @@ impl<'l, 'a> Lower<'l, 'a> {
         repr(self.cx, self.typed.locals[local as usize].ty)
     }
 
-    /// The instruction cursor, in a block that nothing enters when the current one already ended.
     fn ins(&mut self) -> Ins<'_> {
         if !self.open {
             let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
@@ -485,28 +466,36 @@ impl<'l, 'a> Lower<'l, 'a> {
         }
     }
 
-    /// Moves the cursor to `block`, which code runs into only when some branch goes there.
     fn enter(&mut self, block: Block) {
         self.seal();
         self.b.switch_to_block(block);
         self.open = self.b.has_branch_to(block);
     }
 
-    /// Goes to `block` with `args`, when the cursor is in code that runs.
     fn jump(&mut self, block: Block, args: &[Value]) {
         if self.open {
             self.b.ins().jump(block, args);
         }
     }
 
-    /// Goes to `then` when `test` is nonzero and to `otherwise` when not, when the cursor is in code that runs.
-    fn brif(&mut self, test: Value, (then, then_args): (Block, &[Value]), (otherwise, else_args): (Block, &[Value])) {
+    fn brif(
+        &mut self,
+        test: Value,
+        (then, then_args): (Block, &[Value]),
+        (otherwise, else_args): (Block, &[Value]),
+    ) {
         if self.open {
-            self.b.ins().brif(test, then, then_args, otherwise, else_args);
+            self.b
+                .ins()
+                .brif(test, then, then_args, otherwise, else_args);
         }
     }
 
-    fn declare_passed(&mut self, local: u32, params: &mut impl Iterator<Item = Value>) -> Result<()> {
+    fn declare_passed(
+        &mut self,
+        local: u32,
+        params: &mut impl Iterator<Item = Value>,
+    ) -> Result<()> {
         self.declare(local, None)?;
         if let Some(place) = self.locals[local as usize] {
             self.store_passed(local, place, params)?;
@@ -514,8 +503,12 @@ impl<'l, 'a> Lower<'l, 'a> {
         Ok(())
     }
 
-    /// Stores into `place` the scalars or address that parameter `local` received from `params`, returning the last consumed `Value`.
-    pub(super) fn store_passed(&mut self, local: u32, place: place::Place, params: &mut impl Iterator<Item = Value>) -> Result<Option<Value>> {
+    pub(super) fn store_passed(
+        &mut self,
+        local: u32,
+        place: place::Place,
+        params: &mut impl Iterator<Item = Value>,
+    ) -> Result<Option<Value>> {
         let ty = self.typed.locals[local as usize].ty;
         let size = match place.repr {
             Repr::Mem { size, .. } => size,
@@ -541,20 +534,22 @@ impl<'l, 'a> Lower<'l, 'a> {
         Ok(last)
     }
 
-    /// Appends `value`, a value of `ty`, as it crosses a call: scalars loaded from memory when `passed_parts` names them.
     pub(super) fn push_passed(&mut self, ty: Ty, value: Value, out: &mut Vec<Value>) -> Result<()> {
         let Repr::Mem { size, .. } = repr(self.cx, ty)? else {
             out.push(value);
             return Ok(());
         };
         match passed_parts(self.cx, ty)? {
-            Some(parts) => out.extend(parts.scalars().map(|(machine, offset)| self.load_packed_part(value, offset, machine, size))),
+            Some(parts) => out.extend(
+                parts
+                    .scalars()
+                    .map(|(machine, offset)| self.load_packed_part(value, offset, machine, size)),
+            ),
             None => out.push(value),
         }
         Ok(())
     }
 
-    /// `value`, a result of `ty`, as the registers it returns in: the scalars loaded from its memory when `passed_parts` names them.
     pub(super) fn returned_values(&mut self, ty: Ty, value: Value) -> Result<Vec<Value>> {
         let mut out = Vec::new();
         self.push_passed(ty, value, &mut out)?;
@@ -575,9 +570,17 @@ impl<'l, 'a> Lower<'l, 'a> {
                 self.write(place::Place::slot(slot, repr), value);
             }
         }
-        if matches!(self.typed.shape, Shape::Body | Shape::Closure(_) | Shape::Anon(_)) {
+        if matches!(
+            self.typed.shape,
+            Shape::Body | Shape::Closure(_) | Shape::Anon(_)
+        ) {
             let place = slot.map(|slot| place::Place::slot(slot, repr));
-            self.own(moves::Root::Local(local), self.typed.locals[local as usize].ty, place, init)?;
+            self.own(
+                moves::Root::Local(local),
+                self.typed.locals[local as usize].ty,
+                place,
+                init,
+            )?;
         }
         Ok(())
     }
@@ -586,7 +589,10 @@ impl<'l, 'a> Lower<'l, 'a> {
     pub fn slot(&mut self, repr: Repr) -> Option<StackSlot> {
         match repr {
             Repr::Zst => None,
-            Repr::Scalar(ty) => Some(self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8)),
+            Repr::Scalar(ty) => Some(
+                self.b
+                    .create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8),
+            ),
             Repr::Mem { size, align, .. } => Some(self.b.create_stack_slot(size, align)),
         }
     }
@@ -595,7 +601,6 @@ impl<'l, 'a> Lower<'l, 'a> {
         self.typed.exprs[expr.0 as usize]
     }
 
-    /// The length that the array length `len` holds, which inference has made known.
     fn len(&self, len: Ty) -> Result<i64> {
         match self.cx.types.len(len) {
             Some(len) => Ok(len as i64),
@@ -605,162 +610,5 @@ impl<'l, 'a> Lower<'l, 'a> {
 
     fn repr_of(&mut self, expr: ExprId) -> Result<Repr> {
         repr(self.cx, self.ty_of(expr))
-    }
-
-    fn block(&mut self, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
-        let mark = self.owned.len();
-        for &stmt in self.body.list(stmts) {
-            self.stmt(self.body.stmts[stmt as usize])?;
-        }
-        let value = match tail {
-            Some(tail) => {
-                let value = self.expr(tail)?;
-                self.snapshot_before_drops(mark, tail, value)?
-            }
-            None => None,
-        };
-        self.end_scope(mark)?;
-        Ok(value)
-    }
-
-    /// Lowers the output of a macro call in expression position: its statements, then its tail, whose temporaries the enclosing statement drops.
-    fn expansion(&mut self, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
-        for &stmt in self.body.list(stmts) {
-            self.stmt(self.body.stmts[stmt as usize])?;
-        }
-        tail.map_or(Ok(None), |tail| self.expr(tail))
-    }
-
-    fn stmt(&mut self, stmt: Stmt) -> Result<()> {
-        let mark = self.owned.len();
-        match stmt {
-            Stmt::Let { pat, init, otherwise: None, .. } => self.let_stmt(pat, init)?,
-            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => {
-                self.extend_let(pat, init);
-                self.let_else(pat, init, otherwise)?;
-            }
-            Stmt::Expr(expr, _) => self.discard(expr)?,
-            Stmt::Item(..) | Stmt::Empty => {}
-            other => bail!("cannot lower statement {other:?} yet"),
-        }
-        self.end_statement(mark)?;
-        if let Stmt::Let { extend: true, .. } = stmt {
-            self.extend_owned(mark);
-        }
-        Ok(())
-    }
-
-    fn discard(&mut self, expr: ExprId) -> Result<()> {
-        let value = self.expr(expr)?;
-        if !self.open {
-            return Ok(());
-        }
-        let ty = self.ty_of(expr);
-        let repr = repr(self.cx, ty)?;
-        let place = value.map(|value| place::Place { base: place::Base::Addr(value), offset: 0, repr });
-        match (repr, place) {
-            (Repr::Scalar(_), _) => Ok(()),
-            (_, place) => self.glue(ty, place, reloc::TyOrigin::Expr(expr)),
-        }
-    }
-
-    fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
-        let Some(init) = init else {
-            return self.declare_binding(pat, false);
-        };
-        if self.open && self.uninit_call(init) && self.can_declare_uninit_val(pat) && !self.typed.coercions.contains_key(&init) {
-            return self.declare_binding(pat, true);
-        }
-        self.extend_let(pat, init);
-        let unboxed = self.moves_whole_box(pat, init)?;
-        let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };
-        if !self.open {
-            return Ok(());
-        }
-        let path = if unboxed { Some((moves::Root::Temp(init), Vec::new())) } else { self.scrutinee_path(init) };
-        self.bind_matched(pat, place, path)?;
-        self.commit_moves()
-    }
-
-    fn can_declare_uninit_val(&self, pat: PatId) -> bool {
-        match *self.body.pat(pat) {
-            Pat::Bind { sub: None, by_ref: false, .. } => !self.typed.pat_res.contains_key(&pat) && !self.typed.ref_binds.contains_key(&pat),
-            Pat::Wild => true,
-            Pat::Paren(inner) => self.can_declare_uninit_val(inner),
-            _ => false,
-        }
-    }
-
-    fn declare_binding(&mut self, pat: PatId, init: bool) -> Result<()> {
-        match *self.body.pat(pat) {
-            Pat::Bind { sub: None, .. } => match self.typed.binds.get(&pat) {
-                Some(&local) => self.declare_as(local, None, init),
-                None => bail!("an uninitialized binding with no local"),
-            },
-            Pat::Wild => Ok(()),
-            Pat::Paren(inner) => self.declare_binding(inner, init),
-            Pat::Tuple(items) => self.body.list(items).to_vec().into_iter().try_for_each(|item| self.declare_binding(PatId(item), init)),
-            _ => bail!("uninitialized `let` with a pattern"),
-        }
-    }
-
-    fn extend_let(&mut self, pat: PatId, init: ExprId) {
-        self.extend(init);
-        if self.pat_binds_ref(pat) {
-            self.extend_place(init);
-        }
-    }
-
-    fn pat_binds_ref(&self, pat: PatId) -> bool {
-        match *self.body.pat(pat) {
-            Pat::Bind { by_ref, sub, .. } => by_ref || self.typed.ref_binds.contains_key(&pat) || sub.is_some_and(|sub| self.pat_binds_ref(sub)),
-            Pat::Paren(inner) => self.pat_binds_ref(inner),
-            Pat::Tuple(list) | Pat::TupleStruct(_, list) | Pat::Slice(list) | Pat::Or(list) => {
-                self.body.list(list).iter().any(|&at| self.pat_binds_ref(PatId(at)))
-            }
-            Pat::Struct { fields, .. } => self.body.list(fields).iter().any(|&at| self.pat_binds_ref(self.body.field_pats[at as usize].pat)),
-            _ => false,
-        }
-    }
-
-    fn extend_place(&mut self, mut expr: ExprId) {
-        loop {
-            self.extended.insert(expr);
-            match *self.body.expr(expr) {
-                Expr::Paren(inner)
-                | Expr::Field(inner, _)
-                | Expr::TupleField(inner, _)
-                | Expr::Index(inner, _)
-                | Expr::Unary(crate::body::UnOp::Deref, inner) => expr = inner,
-                Expr::Block { stmts, tail: Some(tail), .. } if self.body.list(stmts).is_empty() => expr = tail,
-                _ => break,
-            }
-        }
-    }
-
-    fn extend(&mut self, expr: ExprId) {
-        match *self.body.expr(expr) {
-            Expr::Ref { expr: inner, .. } => {
-                self.extend_place(inner);
-                self.extend(inner);
-            }
-            Expr::Paren(inner) | Expr::Cast(inner, _) => self.extend(inner),
-            Expr::Block { tail: Some(tail), .. } => self.extend(tail),
-            Expr::If(_, then, otherwise) => {
-                self.extend(then);
-                if let Some(otherwise) = otherwise {
-                    self.extend(otherwise);
-                }
-            }
-            Expr::Match(_, arms) => self.body.list(arms).to_vec().into_iter().for_each(|at| self.extend(self.body.arms[at as usize].body)),
-            Expr::Call(callee, args)
-                if self.body.names_callee(callee) && matches!(self.typed.res.get(&callee), Some(crate::sema::infer::Res::Ctor(..))) =>
-            {
-                self.body.list(args).to_vec().into_iter().for_each(|arg| self.extend(ExprId(arg)));
-            }
-            Expr::Tuple(list) | Expr::Array(list) => self.body.list(list).to_vec().into_iter().for_each(|item| self.extend(ExprId(item))),
-            Expr::Struct { fields, .. } => self.body.list(fields).to_vec().into_iter().for_each(|at| self.extend(self.body.fields[at as usize].value)),
-            _ => {}
-        }
     }
 }
