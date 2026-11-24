@@ -32,6 +32,7 @@ pub(super) struct AotCode {
     loops: Vec<std::ops::Range<u32>>,
     lines: Vec<(u32, u64)>,
     unwind_drops: Vec<CodeUnwindDrop>,
+    saved_regs: u32,
 }
 
 impl AotCode {
@@ -43,7 +44,12 @@ impl AotCode {
             loops: code.loops().to_vec(),
             lines: code.lines().to_vec(),
             unwind_drops: code.unwind_drops().to_vec(),
+            saved_regs: code.saved_regs(),
         })
+    }
+
+    pub(super) fn saved_regs(&self) -> u32 {
+        self.saved_regs
     }
 
     pub(super) fn sites(&self) -> &[Site] {

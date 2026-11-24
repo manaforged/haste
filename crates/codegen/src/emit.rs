@@ -54,7 +54,6 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn park_spill(&mut self, value: Value, reg: ParkReg<R>);
     fn park_reload(&mut self, value: Value, reg: ParkReg<R>);
     fn put_exception(&mut self, value: Value);
-    fn restore_try_saves(&mut self);
     fn push_site(&mut self, site: Site);
     fn tails(&mut self) -> &mut Tails<'a, L>;
     fn spill_cache(&self) -> crate::spills::SpillCache<R>;
@@ -608,7 +607,6 @@ pub(crate) fn emit_try_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, 
         return Err("a try_call handler takes exactly the exception".to_owned());
     };
     emit.put_exception(exception);
-    emit.restore_try_saves();
     let handler_label = emit.block_label(handler);
     emit.jump_label(handler_label);
     let frame_offset = emit.frame().size;

@@ -195,7 +195,7 @@ impl SubstrateBuilder {
                 entry.unwind_off,
                 entry.unwind_len,
                 entry.last_used.unwrap_or(self.generation),
-                0,
+                entry.saved_regs,
             ] {
                 out.extend_from_slice(&field.to_le_bytes());
             }

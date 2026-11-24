@@ -101,7 +101,7 @@ impl Image {
             };
             self.register_jit_drops(
                 (exec, patched.len()),
-                (&unwind_drops, &sites),
+                (&unwind_drops, &sites, slice.saved_regs()),
                 &inst.symbols,
             );
             self.store_instance(inst, exec);
@@ -293,7 +293,7 @@ impl Image {
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         self.register_jit_drops(
             (exec, code.bytes().len()),
-            (code.unwind_drops(), code.sites()),
+            (code.unwind_drops(), code.sites(), code.saved_regs()),
             &[],
         );
         Ok(exec)

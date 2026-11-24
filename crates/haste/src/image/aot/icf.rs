@@ -69,6 +69,7 @@ enum FnIcfKey<'a> {
         Vec<(u32, RelocKind, RelocTargetKey)>,
         Vec<(i32, i32, RelocTargetKey, bool)>,
         Vec<(u32, u32, u32)>,
+        u32,
     ),
     Dict(usize, Vec<RelocTargetKey>),
 }
@@ -184,7 +185,13 @@ fn direct_icf_key<'a>(
         .iter()
         .map(|s| (s.ret, s.handler, s.frame_offset))
         .collect();
-    Ok(FnIcfKey::Direct(code.bytes(), sig, drops, sites))
+    Ok(FnIcfKey::Direct(
+        code.bytes(),
+        sig,
+        drops,
+        sites,
+        code.saved_regs(),
+    ))
 }
 
 fn dict_icf_key<'a>(
@@ -457,7 +464,7 @@ pub(super) fn emit_unwind_table(
 ) {
     let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     let mut seen_dict: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
-    let mut fns: Vec<(u32, u32, Vec<(i32, i32, u32, u32)>)> = Vec::new();
+    let mut fns: Vec<(u32, u32, u32, Vec<(i32, i32, u32, u32)>)> = Vec::new();
     let mut sites: Vec<(u32, u32, u32, u32)> = Vec::new();
     for &idx in &live.order {
         let leader = canon[roots[idx]];
@@ -472,19 +479,21 @@ pub(super) fn emit_unwind_table(
                 for s in code.sites() {
                     sites.push((fn_start + s.ret, fn_start + s.handler, s.frame_offset, 0));
                 }
-                if !code.unwind_drops().is_empty() {
-                    let mut drops = Vec::with_capacity(code.unwind_drops().len());
-                    for d in code.unwind_drops() {
-                        if let Some(&SymbolSource::Slot(callee_idx)) =
-                            relocs.get(d.drop_sym as usize)
-                            && let Some(drop_off) = fn_offs.get(callee_idx).copied().flatten()
-                        {
-                            drops.push((d.local_off, d.flag_off, drop_off, u32::from(d.indirect)));
-                        }
+                let mut drops = Vec::with_capacity(code.unwind_drops().len());
+                for d in code.unwind_drops() {
+                    if let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(d.drop_sym as usize)
+                        && let Some(drop_off) = fn_offs.get(callee_idx).copied().flatten()
+                    {
+                        drops.push((d.local_off, d.flag_off, drop_off, u32::from(d.indirect)));
                     }
-                    if !drops.is_empty() {
-                        fns.push((fn_start, fn_start + code.bytes().len() as u32, drops));
-                    }
+                }
+                if !drops.is_empty() || code.saved_regs() != 0 {
+                    fns.push((
+                        fn_start,
+                        fn_start + code.bytes().len() as u32,
+                        code.saved_regs(),
+                        drops,
+                    ));
                 }
             }
             Some(AotFn::Dict { body, .. }) => {
@@ -495,6 +504,14 @@ pub(super) fn emit_unwind_table(
                     for s in body.sites() {
                         sites.push((body_off + s.ret, body_off + s.handler, s.frame_offset, 0));
                     }
+                    if body.saved_regs() != 0 {
+                        fns.push((
+                            body_off,
+                            body_off + body.bytes().len() as u32,
+                            body.saved_regs(),
+                            Vec::new(),
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -503,22 +520,22 @@ pub(super) fn emit_unwind_table(
     if fns.is_empty() && sites.is_empty() {
         return;
     }
-    fns.sort_unstable_by_key(|&(start, _, _)| start);
+    fns.sort_unstable_by_key(|&(start, _, _, _)| start);
     sites.sort_unstable_by_key(|&(ret, _, _, _)| ret);
-    let total_drops: usize = fns.iter().map(|(_, _, d)| d.len()).sum();
-    let sites_off = 24 + (fns.len() + total_drops) * 16;
+    let total_drops: usize = fns.iter().map(|(_, _, _, d)| d.len()).sum();
+    let sites_off = 24 + fns.len() * 20 + total_drops * 16;
     let mut buf = Vec::with_capacity(sites_off + sites.len() * 16);
     buf.extend_from_slice(&(fns.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(sites.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(sites_off as u64).to_le_bytes());
     let mut cursor = 0u32;
-    for &(start, end, ref drops) in &fns {
-        for word in [start, end, cursor, drops.len() as u32] {
+    for &(start, end, saved_regs, ref drops) in &fns {
+        for word in [start, end, cursor, drops.len() as u32, saved_regs] {
             buf.extend_from_slice(&word.to_le_bytes());
         }
         cursor += drops.len() as u32;
     }
-    for (_, _, drops) in fns {
+    for (_, _, _, drops) in fns {
         for (local_off, flag_off, drop_off, ind) in drops {
             for word in [local_off as u32, flag_off as u32, drop_off, ind] {
                 buf.extend_from_slice(&word.to_le_bytes());

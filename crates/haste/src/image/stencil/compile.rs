@@ -177,7 +177,11 @@ impl Image {
             .memory
             .write(&patched)
             .map_err(|e| item_err(cx, item, e))?;
-        self.register_jit_drops((exec, patched.len()), (&unwind_drops, &sites), &symbols);
+        self.register_jit_drops(
+            (exec, patched.len()),
+            (&unwind_drops, &sites, slice.saved_regs()),
+            &symbols,
+        );
         self.publish(index, exec);
         pass.record_size(index, patched.len() as u32, 0);
         Ok(true)

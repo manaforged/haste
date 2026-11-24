@@ -29,14 +29,14 @@ impl Image {
     pub(super) fn register_jit_drops(
         &self,
         (exec, len): (usize, usize),
-        (drops, sites): (&[CodeUnwindDrop], &[Site]),
+        (drops, sites, saved_regs): (&[CodeUnwindDrop], &[Site], u32),
         symbols: &[u64],
     ) {
         crate::host::unwind::register_shared_drops(
             self.unwind_head,
             |bytes| lock(&self.shared).alloc(bytes).ok(),
             (exec, len),
-            (drops, sites),
+            (drops, sites, saved_regs),
             symbols,
         );
     }
@@ -50,7 +50,7 @@ impl Image {
         let exec = memory.write_patched(code, symbols)?;
         self.register_jit_drops(
             (exec, code.bytes().len()),
-            (code.unwind_drops(), code.sites()),
+            (code.unwind_drops(), code.sites(), code.saved_regs()),
             symbols,
         );
         Ok(exec)
@@ -382,7 +382,11 @@ impl Image {
             .write_patched(&jt.stencil, &entry.symbols)?;
         self.register_jit_drops(
             (exec, jt.stencil.bytes().len()),
-            (jt.stencil.unwind_drops(), jt.stencil.sites()),
+            (
+                jt.stencil.unwind_drops(),
+                jt.stencil.sites(),
+                jt.stencil.saved_regs(),
+            ),
             &entry.symbols,
         );
         self.pass

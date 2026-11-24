@@ -29,12 +29,18 @@ pub struct StencilSlice<'a> {
     pub(super) plan: &'a [u8],
     pub(super) loops: &'a [u8],
     pub(super) unwind_drops: &'a [u8],
+    pub(super) saved_regs: u32,
 }
 
 impl<'a> StencilSlice<'a> {
     /// Encoded machine code bytes.
     pub fn code(&self) -> &'a [u8] {
         self.code
+    }
+
+    /// Canonical bitmask of callee-saved registers saved in this stencil's prologue.
+    pub fn saved_regs(&self) -> u32 {
+        self.saved_regs
     }
 
     /// Serialized portable relocation plan bytes, empty when absent.
@@ -94,7 +100,8 @@ impl<'a> StencilSlice<'a> {
             self.decode_relocs()?,
             self.decode_loops()?,
         )
-        .with_unwind_drops(self.decode_unwind_drops()?))
+        .with_unwind_drops(self.decode_unwind_drops()?)
+        .with_saved_regs(self.saved_regs))
     }
 }
 

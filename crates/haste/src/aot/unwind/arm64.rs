@@ -181,12 +181,18 @@ pub(in crate::aot) fn emit_arm64_start_panic(
 ) -> Result<()> {
     if !c.win {
         out.words(&[
-            0xA9BC_7BFD,
+            0xA9BF_7BFD,
             0x9100_03FD,
-            0xA901_53F3,
-            0xA902_5BF5,
-            0xA903_63F7,
-            0xD100_C3FF,
+            0xD103_C3FF,
+            0xA903_53F3,
+            0xA904_5BF5,
+            0xA905_63F7,
+            0xA906_6BF9,
+            0xA907_73FB,
+            0x6D08_27E8,
+            0x6D09_2FEA,
+            0x6D0A_37EC,
+            0x6D0B_3FEE,
             0xAA00_03F4,
             0xAA01_03F6,
         ]);
@@ -200,7 +206,8 @@ pub(in crate::aot) fn emit_arm64_start_panic(
             0xAA00_03F4,
             0xAA01_03F5,
             0xA900_7FF3,
-            0xF900_13FF,
+            0x9100_C3E8,
+            0xA902_23FF,
         ]);
         emit_arm64_walk_call(c, addrs, true, out);
         let uncaught = arm64_fwd(0xB400_0000, out);
@@ -209,6 +216,15 @@ pub(in crate::aot) fn emit_arm64_start_panic(
             0x9100_4260,
             0xA941_77E9,
             0xF940_13EA,
+            0xA943_53F3,
+            0xA944_5BF5,
+            0xA945_63F7,
+            0xA946_6BF9,
+            0xA947_73FB,
+            0x6D48_27E8,
+            0x6D49_2FEA,
+            0x6D4A_37EC,
+            0x6D4B_3FEE,
             0x9100_015F,
             0xD61F_0120,
         ]);
