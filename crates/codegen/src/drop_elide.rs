@@ -213,7 +213,7 @@ impl Function {
             .collect();
         let folded = fold_known_flag_loads(self, entry, (&defs, &kinds, &slot_escaped, &mut slot_loaded));
         let narrowed = narrow_unwind_drops(self, entry, post_init, (&defs, &kinds, &addr_slot, &slot_escaped, &slot_loaded, &local_write_only));
-        let sunk_zeros = sink_zeros && sink_entry_zeros(self, entry, (&slot_escaped, &slot_loaded), &mut sym_may_unwind);
+        let sunk_zeros = sink_zeros && sink_entry_zeros(self, entry, &slot_escaped, &mut sym_may_unwind);
         self.unwind_drops.len() != before || folded || narrowed || sunk_zeros
     }
 }
@@ -221,7 +221,7 @@ impl Function {
 fn sink_entry_zeros(
     func: &mut Function,
     entry: Block,
-    (slot_escaped, slot_loaded): (&[bool], &[bool]),
+    slot_escaped: &[bool],
     sym_may_unwind: &mut impl FnMut(u32) -> bool,
 ) -> bool {
     let nslots = func.slots.len();
@@ -246,7 +246,7 @@ fn sink_entry_zeros(
     let mut remove = Vec::new();
     let mut insert: Vec<(Block, Value, StackSlot)> = Vec::new();
     for fi in 0..nslots {
-        if !is_flag[fi] || is_local[fi] || slot_escaped[fi] || slot_loaded[fi] {
+        if !is_flag[fi] || is_local[fi] || slot_escaped[fi] {
             continue;
         }
         let Some(zinst) = first[fi] else { continue };

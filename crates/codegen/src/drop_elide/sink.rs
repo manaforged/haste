@@ -115,11 +115,11 @@ pub(crate) fn sink_frontier(
     sink_frontier_with_calls(func, cfg, depths, (live_in, always_active, None, b, 4), in_r)
 }
 
-fn sink_frontier_with_calls(
+fn prune_sink_region(
     func: &Function,
     cfg: &Cfg,
     depths: &[u32],
-    (live_in, always_active, call_in_loop, b, max_frontier): (&[bool], Option<&[bool]>, Option<&[bool]>, Block, usize),
+    (live_in, always_active, call_in_loop, b): (&[bool], Option<&[bool]>, Option<&[bool]>, Block),
     in_r: &mut [bool],
 ) -> Option<Vec<Block>> {
     let n = func.blocks.len();
@@ -188,10 +188,47 @@ fn sink_frontier_with_calls(
             }
         }
     }
-    if !skipped_fast || frontier.is_empty() || frontier.len() > max_frontier {
+    if !skipped_fast || frontier.is_empty() {
         return None;
     }
     frontier.iter().all(|&t| target_ok(cfg, depths, always_active, call_in_loop, b, in_r, t)).then_some(frontier)
+}
+
+fn sink_frontier_with_calls(
+    func: &Function,
+    cfg: &Cfg,
+    depths: &[u32],
+    (live_in, always_active, call_in_loop, b, max_frontier): (&[bool], Option<&[bool]>, Option<&[bool]>, Block, usize),
+    in_r: &mut [bool],
+) -> Option<Vec<Block>> {
+    let mut frontier = prune_sink_region(func, cfg, depths, (live_in, always_active, call_in_loop, b), in_r)?;
+    if frontier.len() <= max_frontier {
+        return Some(frontier);
+    }
+    if in_r.iter().filter(|&&m| m).count() > 64 {
+        return None;
+    }
+    let mut cur = in_r.to_vec();
+    while frontier.len() > max_frontier {
+        let mut best: Option<(Vec<bool>, Vec<Block>)> = None;
+        for bi in 0..cur.len() {
+            if !cur[bi] || bi == b.index() {
+                continue;
+            }
+            let mut trial = cur.clone();
+            trial[bi] = false;
+            if let Some(tf) = prune_sink_region(func, cfg, depths, (live_in, always_active, call_in_loop, b), &mut trial)
+                && tf.len() < best.as_ref().map_or(frontier.len(), |(_, bf)| bf.len())
+            {
+                best = Some((trial, tf));
+            }
+        }
+        let Some((next_r, next_f)) = best else { return None };
+        cur = next_r;
+        frontier = next_f;
+    }
+    in_r.copy_from_slice(&cur);
+    Some(frontier)
 }
 
 pub(super) fn plan_flag_sink(
@@ -391,6 +428,7 @@ pub(super) fn plan_entry_zero_sink(
         match func.insts[i.index()].op {
             Op::Call { .. } if kinds[i.index()] == CalleeKind::MayUnwind => return None,
             Op::TryCall { .. } => return None,
+            Op::StackLoad(s, _) if s == flag => return None,
             Op::StackStore(_, s, 0) if s == flag => return Some(Vec::new()),
             Op::Return(..) | Op::Trap => return Some(Vec::new()),
             _ => {}
@@ -411,6 +449,11 @@ pub(super) fn plan_entry_zero_sink(
                     break;
                 }
                 Op::TryCall { .. } => {
+                    gen_b[bi] = true;
+                    clean_b[bi] = false;
+                    break;
+                }
+                Op::StackLoad(s, _) if s == flag => {
                     gen_b[bi] = true;
                     clean_b[bi] = false;
                     break;
