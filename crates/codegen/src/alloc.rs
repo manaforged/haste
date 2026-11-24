@@ -13,6 +13,7 @@ pub(crate) use hints::{rcpc2_atomic_site, rcpc2_delta_fits};
 pub(crate) use preserved::{
     cold_cached_frame, cold_thread_cell, is_preserved_call_op, used_preserved_leaf_regs,
 };
+pub(crate) use setup::BASE_WEIGHT;
 
 use crate::frame::{Abi, Loc};
 use crate::ir::{Block, FloatCC, Function, Inst, InstData, Op, Signature, StackSlot, Type, Value};

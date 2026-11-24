@@ -10,8 +10,8 @@ mod recolor;
 use choose::{choose_free, place_reuse_chain};
 pub(crate) use place::scratch_clobbers;
 use place::{
-    apply_demote, evict_slot, find_demote_free, find_relocate, leaf_park_cost, slot_accepts,
-    victim_slot_unweighted,
+    apply_demote, evict_slot, find_demote_free, find_relocate, leaf_park_cost, prefer_park,
+    slot_accepts, victim_slot_unweighted,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +95,7 @@ fn pool<F: Copy + PartialEq>(
     class: &Class<F>,
     live: &Live,
     pooled: &[bool],
+    hints: &Hints,
 ) -> Pool<F> {
     let regs: Vec<F> = class.saved.iter().chain(&class.leaf).copied().collect();
     let is_saved: Vec<bool> = regs.iter().map(|r| class.saved.contains(r)).collect();
@@ -146,7 +147,7 @@ fn pool<F: Copy + PartialEq>(
         {
             let ranges = live.ranges_of(value.index());
             if !ranges.is_empty()
-                && !crosses_call(live, value.index())
+                && (!crosses_call(live, value.index()) || prefer_park(live, hints, value.index()))
                 && !out.slot_clobbered(slot, ranges)
             {
                 out.kept[value.index()] = Some(reg);
@@ -657,7 +658,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(
     pooled: &[bool],
     hints: &Hints,
 ) -> (Vec<Option<F>>, Vec<F>) {
-    let pool = pool(func, class, live, pooled);
+    let pool = pool(func, class, live, pooled, hints);
     if let Some(weights) = hints.weights {
         return allocate_weighted(func, live, &pool, pooled, hints, weights);
     }
