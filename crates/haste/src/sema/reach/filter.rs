@@ -1,18 +1,21 @@
+mod layout;
+
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::body::sig::GenericKind;
-use crate::names::{ItemRef, Primitive};
+use crate::names::ItemRef;
 
 use super::super::Context;
 use super::super::impls::head;
-use super::super::infer::{LazyTables, Shape, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized, type_params};
+use super::super::infer::{LazyTables, Shape, Typed};
 use super::super::intrinsic::Intrinsic;
 use super::super::substs::Substs;
-use super::super::summary::{ConstHole, PolyObligation, PolySummary, poly_summary};
+use super::super::summary::{PolySummary, poly_summary};
 use super::super::ty::{Kind, Ty};
 use super::Instance;
+use layout::{concrete_ty_is_sized, local_sealed, propagate_callee_sized};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct SealInfo {
@@ -22,7 +25,11 @@ pub(super) struct SealInfo {
 }
 
 impl SealInfo {
-    const UNSEALED: Self = Self { sealed: false, params: 0, sized_mask: 0 };
+    const UNSEALED: Self = Self {
+        sealed: false,
+        params: 0,
+        sized_mask: 0,
+    };
 }
 
 #[derive(Default)]
@@ -52,7 +59,10 @@ impl ReachFilter {
         fresh
     }
 
-    pub(super) fn take_delta(&self, synced: &mut (usize, usize)) -> (Vec<(ItemRef, SealInfo)>, Vec<ItemRef>) {
+    pub(super) fn take_delta(
+        &self,
+        synced: &mut (usize, usize),
+    ) -> (Vec<(ItemRef, SealInfo)>, Vec<ItemRef>) {
         let sealed = if self.sealed_log.len() > synced.0 {
             let slice = self.sealed_log[synced.0..].to_vec();
             synced.0 = self.sealed_log.len();
@@ -95,19 +105,36 @@ impl ReachFilter {
         let Some(_) = self.compute_seal(cx, item, &mut stack) else {
             return SealInfo::UNSEALED;
         };
-        self.sealed_cache.get(&item).copied().unwrap_or(SealInfo::UNSEALED)
+        self.sealed_cache
+            .get(&item)
+            .copied()
+            .unwrap_or(SealInfo::UNSEALED)
     }
 
-    fn compute_seal(&mut self, cx: &mut Context<'_>, item: ItemRef, stack: &mut Vec<ItemRef>) -> Option<usize> {
+    fn compute_seal(
+        &mut self,
+        cx: &mut Context<'_>,
+        item: ItemRef,
+        stack: &mut Vec<ItemRef>,
+    ) -> Option<usize> {
         if let Some(&info) = self.sealed_cache.get(&item) {
             return info.sealed.then_some(usize::MAX);
         }
         if let Some(intrinsic) = cx.intrinsic(item) {
             let sealed = !matches!(intrinsic, Intrinsic::Transmute);
-            self.record_sealed(item, SealInfo { sealed, params: 0, sized_mask: 0 });
+            self.record_sealed(
+                item,
+                SealInfo {
+                    sealed,
+                    params: 0,
+                    sized_mask: 0,
+                },
+            );
             return sealed.then_some(usize::MAX);
         }
-        if !cx.outline.is_fixed(item.krate) || matches!(cx.lang(item), Some("drop_glue" | "clone_fn" | "poll")) {
+        if !cx.outline.is_fixed(item.krate)
+            || matches!(cx.lang(item), Some("drop_glue" | "clone_fn" | "poll"))
+        {
             self.record_sealed(item, SealInfo::UNSEALED);
             return None;
         }
@@ -137,11 +164,25 @@ impl ReachFilter {
             }
             return Some(dep);
         }
-        self.record_sealed(item, SealInfo { sealed: true, params: summary.param_count, sized_mask: req_sized });
+        self.record_sealed(
+            item,
+            SealInfo {
+                sealed: true,
+                params: summary.param_count,
+                sized_mask: req_sized,
+            },
+        );
         Some(usize::MAX)
     }
 
-    fn seal_callees(&mut self, cx: &mut Context<'_>, caller: ItemRef, summary: &PolySummary, stack: &mut Vec<ItemRef>, req_sized: &mut u64) -> Option<usize> {
+    fn seal_callees(
+        &mut self,
+        cx: &mut Context<'_>,
+        caller: ItemRef,
+        summary: &PolySummary,
+        stack: &mut Vec<ItemRef>,
+        req_sized: &mut u64,
+    ) -> Option<usize> {
         let mut dep = usize::MAX;
         for &(_, callee, callee_substs) in &summary.direct_calls {
             if cx.intrinsic(callee).is_some() {
@@ -157,20 +198,44 @@ impl ReachFilter {
             }
         }
         for &(_, hole_item, hole_substs) in &summary.call_holes {
-            dep = dep.min(self.call_hole_seal(cx, caller, hole_item, hole_substs, stack, req_sized)?);
+            dep = dep.min(self.call_hole_seal(
+                cx,
+                caller,
+                hole_item,
+                hole_substs,
+                stack,
+                req_sized,
+            )?);
         }
         Some(dep)
     }
 
-    fn call_hole_seal(&mut self, cx: &mut Context<'_>, caller: ItemRef, item: ItemRef, substs: Substs, stack: &mut Vec<ItemRef>, req_sized: &mut u64) -> Option<usize> {
+    fn call_hole_seal(
+        &mut self,
+        cx: &mut Context<'_>,
+        caller: ItemRef,
+        item: ItemRef,
+        substs: Substs,
+        stack: &mut Vec<ItemRef>,
+        req_sized: &mut u64,
+    ) -> Option<usize> {
         let tr = cx.owner_trait(item)?;
         if !cx.outline.is_fixed(tr.krate) {
             return None;
         }
         let tg = cx.trait_generics(tr).ok()?;
-        let count = 1 + tg.1.params.iter().filter(|g| g.kind != GenericKind::Lifetime).count();
+        let count = 1 + tg
+            .1
+            .params
+            .iter()
+            .filter(|g| g.kind != GenericKind::Lifetime)
+            .count();
         let slice = cx.types.substs(substs).to_vec();
-        if slice.len() < count || slice[1..count].iter().any(|&ty| self.ty_has_non_fixed(cx, ty)) {
+        if slice.len() < count
+            || slice[1..count]
+                .iter()
+                .any(|&ty| self.ty_has_non_fixed(cx, ty))
+        {
             return None;
         }
         if !ok_call_hole_head(cx, self, slice[0]) {
@@ -199,21 +264,37 @@ impl ReachFilter {
     }
 
     fn ty_has_non_fixed(&mut self, cx: &Context<'_>, ty: Ty) -> bool {
-        ty_has_non_fixed_memo(cx.outline, &cx.types, ty, Some((&mut self.ty_non_fixed, &mut self.substs_non_fixed)))
+        ty_has_non_fixed_memo(
+            cx.outline,
+            &cx.types,
+            ty,
+            Some((&mut self.ty_non_fixed, &mut self.substs_non_fixed)),
+        )
     }
 
     fn substs_has_non_fixed(&mut self, cx: &Context<'_>, substs: Substs) -> bool {
-        substs_has_non_fixed_memo(cx.outline, &cx.types, substs, Some((&mut self.ty_non_fixed, &mut self.substs_non_fixed)))
+        substs_has_non_fixed_memo(
+            cx.outline,
+            &cx.types,
+            substs,
+            Some((&mut self.ty_non_fixed, &mut self.substs_non_fixed)),
+        )
     }
 }
 
 fn ok_call_hole_head(cx: &Context<'_>, filter: &mut ReachFilter, ty: Ty) -> bool {
     match *cx.types.kind(ty) {
-        Kind::Prim(_) | Kind::Never | Kind::Ptr(..) | Kind::Slice(..) | Kind::Array(..) | Kind::FnPtr(..) => true,
+        Kind::Prim(_)
+        | Kind::Never
+        | Kind::Ptr(..)
+        | Kind::Slice(..)
+        | Kind::Array(..)
+        | Kind::FnPtr(..) => true,
         Kind::Ref(..) | Kind::Tuple(..) => !filter.ty_has_non_fixed(cx, ty),
         Kind::Adt(adt, _) => {
             cx.outline.is_fixed(adt.krate)
-                && ((cx.lang(adt) != Some("owned_box") && !cx.has_attr(adt, "fundamental")) || !filter.ty_has_non_fixed(cx, ty))
+                && ((cx.lang(adt) != Some("owned_box") && !cx.has_attr(adt, "fundamental"))
+                    || !filter.ty_has_non_fixed(cx, ty))
         }
         _ => false,
     }
@@ -235,170 +316,6 @@ fn fixed_holders(cx: &Context<'_>, root_tys: &[Ty], tr_krate: u32) -> Vec<u32> {
     holders
 }
 
-fn propagate_callee_sized(cx: &mut Context<'_>, caller: ItemRef, substs: Substs, mut mask: u64, req_sized: &mut u64) -> bool {
-    if mask == 0 {
-        return true;
-    }
-    let slice = cx.types.substs(substs).to_vec();
-    while mask != 0 {
-        let idx = mask.trailing_zeros() as usize;
-        mask &= mask - 1;
-        let Some(&arg) = slice.get(idx) else { return false };
-        if !ty_is_sized(cx, caller, arg, req_sized) {
-            return false;
-        }
-    }
-    true
-}
-
-fn local_sealed(cx: &mut Context<'_>, item: ItemRef, summary: &PolySummary) -> Option<u64> {
-    if !summary.projections.is_empty()
-        || !summary.obligations.iter().all(|o| matches!(o, PolyObligation::Prove { .. }))
-        || !summary.op_holes.is_empty()
-        || !summary.const_holes.iter().all(|h| matches!(h, ConstHole::Intrinsic { .. }))
-        || !summary.template.closures.is_empty()
-    {
-        return None;
-    }
-    let mut req_sized = 0u64;
-    for &ty in summary.layout_tys.iter().chain(&summary.drop_tys) {
-        if !layout_ty_infallible(cx, item, ty, &mut req_sized) {
-            return None;
-        }
-    }
-    Some(req_sized)
-}
-
-fn param_is_sized(cx: &mut Context<'_>, item: ItemRef, idx: u16) -> bool {
-    let Ok(sig) = cx.signature(item) else { return false };
-    let idx = usize::from(idx);
-    if let Some(owner) = cx.owner_impl(item) {
-        let Ok(h) = cx.impl_header(owner) else { return false };
-        let outer = type_params(&h.generics).count();
-        if idx < outer {
-            return !nth_param_relaxes(&h.body, &cx.impl_file(owner).source, &h.predicates, &h.generics, idx);
-        }
-        return !nth_param_relaxes(&sig.body, &cx.file(item).source, &sig.predicates, &sig.generics, idx - outer);
-    }
-    if let Some(tr) = cx.owner_trait(item) {
-        if idx == 0 {
-            return false;
-        }
-        let Ok(tg) = cx.trait_generics(tr) else { return false };
-        let outer = type_params(&tg.1.params).count();
-        if idx - 1 < outer {
-            return !nth_param_relaxes(&tg.0, &cx.file(tr).source, &tg.1.predicates, &tg.1.params, idx - 1);
-        }
-        return !nth_param_relaxes(&sig.body, &cx.file(item).source, &sig.predicates, &sig.generics, idx - 1 - outer);
-    }
-    !nth_param_relaxes(&sig.body, &cx.file(item).source, &sig.predicates, &sig.generics, idx)
-}
-
-fn nth_param_relaxes(
-    arena: &crate::body::Body,
-    src: &crate::outline::source::Source,
-    predicates: &[crate::body::sig::Predicate],
-    generics: &[crate::body::sig::Generic],
-    idx: usize,
-) -> bool {
-    type_params(generics).nth(idx).is_none_or(|g| param_relaxes_sized(arena, src, predicates, g))
-}
-
-fn require_param_sized(cx: &mut Context<'_>, item: ItemRef, idx: u16, req_sized: &mut u64) -> bool {
-    if param_is_sized(cx, item, idx) {
-        return true;
-    }
-    if idx < 64 {
-        *req_sized |= 1u64 << idx;
-        return true;
-    }
-    false
-}
-
-fn ty_is_sized(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: &mut u64) -> bool {
-    match *cx.types.kind(ty) {
-        Kind::Prim(p) => !matches!(p, Primitive::Str),
-        Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Array(..) => true,
-        Kind::Pat(inner, ..) => ty_is_sized(cx, item, inner, req_sized),
-        Kind::Slice(..) | Kind::Dyn(..) => false,
-        Kind::Param(idx) => require_param_sized(cx, item, idx, req_sized),
-        Kind::Tuple(elems) => cx.types.substs(elems).last().copied().is_none_or(|last| ty_is_sized(cx, item, last, req_sized)),
-        Kind::Adt(adt, args) => {
-            if !cx.outline.is_fixed(adt.krate) {
-                return false;
-            }
-            if !maybe_unsized(cx, adt).unwrap_or(true) {
-                return true;
-            }
-            cx.types.substs(args).to_vec().into_iter().all(|arg| ty_is_sized(cx, item, arg, req_sized))
-        }
-        _ => false,
-    }
-}
-
-fn concrete_ty_is_sized(cx: &mut Context<'_>, ty: Ty) -> bool {
-    match *cx.types.kind(ty) {
-        Kind::Prim(p) => !matches!(p, Primitive::Str),
-        Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Array(..) | Kind::Closure(..) => true,
-        Kind::Pat(inner, ..) => concrete_ty_is_sized(cx, inner),
-        Kind::Tuple(elems) => cx.types.substs(elems).last().copied().is_none_or(|last| concrete_ty_is_sized(cx, last)),
-        Kind::Adt(adt, _) => !maybe_unsized(cx, adt).unwrap_or(true),
-        _ => false,
-    }
-}
-
-fn layout_ty_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: &mut u64) -> bool {
-    match *cx.types.kind(ty) {
-        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never => true,
-        Kind::Param(idx) => require_param_sized(cx, item, idx, req_sized),
-        Kind::Slice(elem) => sized_layout_infallible(cx, item, elem, req_sized),
-        Kind::Array(elem, len) => matches!(cx.types.kind(len), Kind::Value(n) if *n <= 1 || !cx.types.has_params(elem)) && sized_layout_infallible(cx, item, elem, req_sized),
-        Kind::Pat(inner, ..) => !cx.types.has_params(inner) && sized_layout_infallible(cx, item, inner, req_sized),
-        Kind::Tuple(elems) => tuple_layout_infallible(cx, item, elems, req_sized),
-        Kind::Adt(adt, args) => adt_layout_infallible(cx, item, adt, args, req_sized),
-        _ => false,
-    }
-}
-
-fn sized_layout_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: &mut u64) -> bool {
-    ty_is_sized(cx, item, ty, req_sized) && layout_ty_infallible(cx, item, ty, req_sized)
-}
-
-fn tuple_layout_infallible(cx: &mut Context<'_>, item: ItemRef, elems: Substs, req_sized: &mut u64) -> bool {
-    let elems = cx.types.substs(elems).to_vec();
-    let non_last = elems.len().saturating_sub(1);
-    elems[..non_last].iter().all(|&e| ty_is_sized(cx, item, e, req_sized)) && elems.iter().all(|&e| layout_ty_infallible(cx, item, e, req_sized))
-}
-
-fn adt_layout_infallible(cx: &mut Context<'_>, item: ItemRef, adt: ItemRef, args: Substs, req_sized: &mut u64) -> bool {
-    if !cx.outline.is_fixed(adt.krate) {
-        return false;
-    }
-    let repr = cx.repr(adt);
-    if repr.flags.contains(rustc_abi::ReprFlags::IS_SIMD) || repr.pack.is_some() {
-        return false;
-    }
-    let Ok(def) = cx.adt_def(adt) else { return false };
-    if def.generics.params.iter().any(|g| matches!(g.kind, GenericKind::Const(_))) {
-        return false;
-    }
-    let any_relaxed = body_relaxes_sized(&def.body, &cx.file(adt).source);
-    let adt_unsized = any_relaxed && maybe_unsized(cx, adt).unwrap_or(true);
-    let src = &cx.file(adt).source;
-    let args = cx.types.substs(args).to_vec();
-    let type_params: Vec<_> = def.generics.params.iter().filter(|g| g.kind != GenericKind::Lifetime).collect();
-    for (i, &arg) in args.iter().enumerate() {
-        let param_relaxed = type_params.get(i).is_some_and(|g| param_relaxes_sized(&def.body, src, &def.generics.predicates, g));
-        if !adt_unsized && param_relaxed {
-            continue;
-        }
-        if !layout_ty_infallible(cx, item, arg, req_sized) || !ty_is_sized(cx, item, arg, req_sized) {
-            return false;
-        }
-    }
-    true
-}
-
 fn ty_has_non_fixed_memo(
     outline: &crate::outline::Outline,
     types: &super::super::ty::Types,
@@ -418,24 +335,67 @@ fn ty_has_non_fixed_memo(
     let res = match types.kind(ty) {
         Kind::Prim(_) | Kind::Never | Kind::Value(_) => false,
         Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => {
-            ty_has_non_fixed_memo(outline, types, *inner, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+            ty_has_non_fixed_memo(
+                outline,
+                types,
+                *inner,
+                memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+            )
         }
         Kind::Array(elem, count) => {
-            ty_has_non_fixed_memo(outline, types, *elem, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
-                || ty_has_non_fixed_memo(outline, types, *count, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+            ty_has_non_fixed_memo(
+                outline,
+                types,
+                *elem,
+                memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+            ) || ty_has_non_fixed_memo(
+                outline,
+                types,
+                *count,
+                memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+            )
         }
-        Kind::Tuple(args) => substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b))),
+        Kind::Tuple(args) => substs_has_non_fixed_memo(
+            outline,
+            types,
+            *args,
+            memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+        ),
         Kind::FnPtr(args, ret) => {
-            substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
-                || ty_has_non_fixed_memo(outline, types, *ret, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+            substs_has_non_fixed_memo(
+                outline,
+                types,
+                *args,
+                memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+            ) || ty_has_non_fixed_memo(
+                outline,
+                types,
+                *ret,
+                memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+            )
         }
         Kind::Adt(def, args) | Kind::FnDef(def, args) | Kind::Closure(def, args, _) => {
-            !outline.is_fixed(def.krate) || substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+            !outline.is_fixed(def.krate)
+                || substs_has_non_fixed_memo(
+                    outline,
+                    types,
+                    *args,
+                    memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+                )
         }
         Kind::Dyn(tr, args, assoc, auto) => {
             !outline.is_fixed(tr.krate)
-                || types.items(*assoc).iter().chain(types.items(*auto)).any(|d| !outline.is_fixed(d.krate))
-                || substs_has_non_fixed_memo(outline, types, *args, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)))
+                || types
+                    .items(*assoc)
+                    .iter()
+                    .chain(types.items(*auto))
+                    .any(|d| !outline.is_fixed(d.krate))
+                || substs_has_non_fixed_memo(
+                    outline,
+                    types,
+                    *args,
+                    memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+                )
         }
         Kind::Proj(_) | Kind::Param(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => true,
     };
@@ -466,7 +426,12 @@ fn substs_has_non_fixed_memo(
     }
     let mut res = false;
     for &ty in types.substs(substs) {
-        if ty_has_non_fixed_memo(outline, types, ty, memo.as_mut().map(|(a, b)| (&mut **a, &mut **b))) {
+        if ty_has_non_fixed_memo(
+            outline,
+            types,
+            ty,
+            memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
+        ) {
             res = true;
             break;
         }
@@ -480,7 +445,11 @@ fn substs_has_non_fixed_memo(
     res
 }
 
-pub(in crate::sema) fn substs_has_non_fixed_raw(outline: &crate::outline::Outline, types: &super::super::ty::Types, substs: Substs) -> bool {
+pub(in crate::sema) fn substs_has_non_fixed_raw(
+    outline: &crate::outline::Outline,
+    types: &super::super::ty::Types,
+    substs: Substs,
+) -> bool {
     substs_has_non_fixed_memo(outline, types, substs, None)
 }
 
@@ -494,10 +463,24 @@ pub(super) fn pre_collect_callees(
     let check_only = cx.store.lookups.skip_warm_sysroot_bodies;
     let caller_is_fixed = cx.outline.is_fixed(caller.0.krate);
     let prune_fixed = check_only && caller_is_fixed && !matches!(typed.shape, Shape::Glue(_));
-    let mut push = |item: ItemRef, substs: Substs| push_filtered_callee(cx, filter, prune_fixed, (item, substs), out);
+    let mut push = |item: ItemRef, substs: Substs| {
+        push_filtered_callee(cx, filter, prune_fixed, (item, substs), out)
+    };
     match &typed.tables {
-        LazyTables::Poly(poly) => push_poly_callees(typed, poly.calls(), poly.dynamic_calls(), include_fixed, &mut push),
-        LazyTables::CheckOnly(check) => push_poly_callees(typed, check.calls(), check.dynamic_calls(), include_fixed, &mut push),
+        LazyTables::Poly(poly) => push_poly_callees(
+            typed,
+            poly.calls(),
+            poly.dynamic_calls(),
+            include_fixed,
+            &mut push,
+        ),
+        LazyTables::CheckOnly(check) => push_poly_callees(
+            typed,
+            check.calls(),
+            check.dynamic_calls(),
+            include_fixed,
+            &mut push,
+        ),
         LazyTables::Eager(_) => {
             for (item, substs) in typed.calls() {
                 push(item, substs);
@@ -529,13 +512,21 @@ fn push_filtered_callee(
     out.push(((item, substs), sealed));
 }
 
-fn can_prune_fixed(cx: &mut Context<'_>, filter: &mut ReachFilter, (item, substs): Instance) -> bool {
+fn can_prune_fixed(
+    cx: &mut Context<'_>,
+    filter: &mut ReachFilter,
+    (item, substs): Instance,
+) -> bool {
     let info = filter.seal_info(cx, item);
     if !info.sealed {
         return false;
     }
     let slice = cx.types.substs(substs);
-    if slice.len() != usize::from(info.params) || slice.iter().any(|&ty| matches!(cx.types.kind(ty), Kind::Never | Kind::Dyn(..))) {
+    if slice.len() != usize::from(info.params)
+        || slice
+            .iter()
+            .any(|&ty| matches!(cx.types.kind(ty), Kind::Never | Kind::Dyn(..)))
+    {
         return false;
     }
     if info.sized_mask == 0 {
@@ -561,15 +552,26 @@ fn push_poly_callees(
     push: &mut impl FnMut(ItemRef, Substs),
 ) {
     if include_fixed {
-        for (item, substs) in all { push(item, substs); }
+        for (item, substs) in all {
+            push(item, substs);
+        }
     } else {
-        for (item, substs) in dynamic { push(item, substs); }
+        for (item, substs) in dynamic {
+            push(item, substs);
+        }
     }
     super::push_tail_calls(typed, &mut |(item, substs)| push(item, substs));
 }
 
-pub(super) fn commit_filter_caller(cx: &Context<'_>, filter: &mut ReachFilter, caller: Instance, typed: &Result<Arc<Typed>, String>) {
-    if let Ok(typed) = typed && matches!(typed.tables, LazyTables::Poly(_) | LazyTables::CheckOnly(_)) {
+pub(super) fn commit_filter_caller(
+    cx: &Context<'_>,
+    filter: &mut ReachFilter,
+    caller: Instance,
+    typed: &Result<Arc<Typed>, String>,
+) {
+    if let Ok(typed) = typed
+        && matches!(typed.tables, LazyTables::Poly(_) | LazyTables::CheckOnly(_))
+    {
         filter.seen_fixed_poly.insert(caller.0);
         if cx.outline.is_fixed(caller.0.krate) {
             filter.mark_seen_sealed(caller.0);
