@@ -7,7 +7,8 @@ use crate::ir::{Block, Function, Inst, Op, StackSlot};
 pub(super) use self::entry_zeros::{entry_first_zeros, sink_entry_zeros};
 pub(crate) use self::frontier::sink_frontier;
 use self::frontier::{
-    call_bounded_blocks, dominated_clean_region, sink_frontier_or_solo, solve_liveness,
+    call_bounded_blocks, dominated_clean_region, prune_redundant_frontier, sink_frontier_or_solo,
+    solve_liveness,
 };
 use super::{CalleeKind, FlagOp, classify_flag_op, store_clears_active};
 
@@ -79,13 +80,21 @@ pub(super) fn plan_flag_sink(
     let mut in_r = dominated_clean_region(func, cfg, b, live_in, |s| {
         block_is_flag_clean(func, kinds, s, flag)
     });
-    sink_frontier_or_solo(
+    let mut frontier = sink_frontier_or_solo(
         func,
         cfg,
         depths,
         (live_in, Some(always_active), Some(&call_bounded), b, 8),
         &mut in_r,
-    )
+    )?;
+    prune_redundant_frontier(
+        func,
+        cfg,
+        live_in,
+        |s| block_is_flag_clean(func, kinds, s, flag),
+        &mut frontier,
+    );
+    Some(frontier)
 }
 
 fn range_covers(w_off: i32, w_bytes: u32, off: i32, bytes: u32) -> bool {

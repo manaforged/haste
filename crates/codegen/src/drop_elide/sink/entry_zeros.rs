@@ -3,7 +3,8 @@ use crate::ir::{Block, Function, Inst, Op, StackSlot, Value};
 
 use super::super::{CalleeKind, FlagOp, classify_callee, classify_flag_op, store_clears_active};
 use super::frontier::{
-    call_bounded_blocks, dominated_clean_region, sink_frontier_or_solo, solve_liveness,
+    call_bounded_blocks, cycle_depths, dominated_clean_region, prune_redundant_frontier,
+    sink_frontier_or_solo, solve_liveness,
 };
 
 fn flag_always_zero(
@@ -73,6 +74,85 @@ pub(in super::super) fn entry_first_zeros(
     first
 }
 
+fn elide_redundant_flag_zeros(
+    func: &mut Function,
+    entry: Block,
+    defs: &[Option<Inst>],
+    (is_flag, is_local, slot_escaped): (&[bool], &[bool], &[bool]),
+) -> bool {
+    let n = func.blocks.len();
+    let nslots = func.slots.len();
+    let mut dead = vec![false; func.insts.len()];
+    let mut any = false;
+    for fi in 0..nslots {
+        if !is_flag[fi] || is_local[fi] || slot_escaped[fi] || func.slots[fi].size != 1 {
+            continue;
+        }
+        let flag = StackSlot(fi as u32);
+        let mut in_state = vec![0u8; n];
+        in_state[entry.index()] = 2;
+        let mut work = vec![(entry, false)];
+        while let Some((block, mut known_zero)) = work.pop() {
+            let mut stopped = false;
+            for &inst in &func.blocks[block.index()].insts {
+                match func.insts[inst.index()].op {
+                    Op::StackStore(v, s, off) if s == flag => {
+                        known_zero = off == 0 && store_clears_active(func, defs, v);
+                    }
+                    Op::Return(..) | Op::Trap => {
+                        stopped = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if stopped {
+                continue;
+            }
+            let bit = if known_zero { 1 } else { 2 };
+            for target in func.successors(block) {
+                if in_state[target.index()] & bit == 0 {
+                    in_state[target.index()] |= bit;
+                    work.push((target, known_zero));
+                }
+            }
+        }
+        for (bi, &st) in in_state.iter().enumerate() {
+            if st == 0 {
+                continue;
+            }
+            let mut known_zero = st == 1;
+            for &inst in &func.blocks[bi].insts {
+                if let Op::StackStore(v, s, off) = func.insts[inst.index()].op
+                    && s == flag
+                {
+                    if off == 0 && store_clears_active(func, defs, v) {
+                        if known_zero {
+                            dead[inst.index()] = true;
+                            any = true;
+                        }
+                        known_zero = true;
+                    } else {
+                        known_zero = false;
+                    }
+                }
+            }
+        }
+    }
+    if !any {
+        return false;
+    }
+    for (idx, &rm) in dead.iter().enumerate() {
+        if rm {
+            func.insts[idx].op = Op::Trap;
+        }
+    }
+    for block in &mut func.blocks {
+        block.insts.retain(|i| !dead[i.index()]);
+    }
+    true
+}
+
 pub(in super::super) fn sink_entry_zeros(
     func: &mut Function,
     entry: Block,
@@ -81,6 +161,18 @@ pub(in super::super) fn sink_entry_zeros(
 ) -> bool {
     let nslots = func.slots.len();
     let defs = crate::fold::defs(func);
+    let mut is_local = vec![false; nslots];
+    let mut is_flag = vec![false; nslots];
+    for u in &func.unwind_drops {
+        if u.local.index() < nslots {
+            is_local[u.local.index()] = true;
+        }
+        if u.flag.index() < nslots {
+            is_flag[u.flag.index()] = true;
+        }
+    }
+    let elided =
+        elide_redundant_flag_zeros(func, entry, &defs, (&is_flag, &is_local, slot_escaped));
     let kinds: Vec<CalleeKind> = func
         .insts
         .iter()
@@ -92,18 +184,14 @@ pub(in super::super) fn sink_entry_zeros(
         })
         .collect();
     let first = entry_first_zeros(func, &defs, entry, nslots);
-    let mut is_local = vec![false; nslots];
-    let mut is_flag = vec![false; nslots];
-    for u in &func.unwind_drops {
-        if u.local.index() < nslots {
-            is_local[u.local.index()] = true;
-        }
-        if u.flag.index() < nslots {
-            is_flag[u.flag.index()] = true;
-        }
-    }
     let cfg = func.cfg();
-    let depths = &cfg.loops().depths;
+    let depths = cycle_depths(func, &cfg);
+    let cold = crate::live::cold(func);
+    let call_bounded: Vec<bool> = call_bounded_blocks(func, &cfg, &kinds)
+        .into_iter()
+        .zip(&cold)
+        .map(|(bounded, &is_cold)| bounded && is_cold)
+        .collect();
     let mut remove = Vec::new();
     let mut insert: Vec<(Block, Value, StackSlot)> = Vec::new();
     for fi in 0..nslots {
@@ -116,9 +204,13 @@ pub(in super::super) fn sink_entry_zeros(
         let Op::StackStore(val, flag, 0) = func.insts[zinst.index()].op else {
             continue;
         };
-        let Some(frontier) =
-            plan_entry_zero_sink(func, &cfg, &defs, &kinds, depths, (entry, flag, zinst))
-        else {
+        let Some(frontier) = plan_entry_zero_sink(
+            func,
+            &cfg,
+            &defs,
+            (&kinds, &depths, &call_bounded),
+            (entry, flag, zinst),
+        ) else {
             continue;
         };
         remove.push(zinst);
@@ -127,7 +219,7 @@ pub(in super::super) fn sink_entry_zeros(
         }
     }
     if remove.is_empty() {
-        return false;
+        return elided;
     }
     for &i in &remove {
         func.insts[i.index()].op = Op::Trap;
@@ -146,8 +238,7 @@ fn plan_entry_zero_sink(
     func: &Function,
     cfg: &Cfg,
     defs: &[Option<Inst>],
-    kinds: &[CalleeKind],
-    depths: &[u32],
+    (kinds, depths, call_bounded): (&[CalleeKind], &[u32], &[bool]),
     (entry, flag, zinst): (Block, StackSlot, Inst),
 ) -> Option<Vec<Block>> {
     if cfg.pred_count(entry) != 0 {
@@ -194,19 +285,20 @@ fn plan_entry_zero_sink(
         return Some(Vec::new());
     }
     let (always_in, always_out) = flag_always_zero(func, defs, entry, flag);
-    let call_bounded = call_bounded_blocks(func, cfg, kinds);
     let mut in_r = dominated_clean_region(func, cfg, entry, &live_in, |s| clean_b[s.index()]);
-    sink_frontier_or_solo(
+    let mut frontier = sink_frontier_or_solo(
         func,
         cfg,
         depths,
         (
             &live_in,
             Some((&always_in, &always_out)),
-            Some(&call_bounded),
+            Some(call_bounded),
             entry,
             8,
         ),
         &mut in_r,
-    )
+    )?;
+    prune_redundant_frontier(func, cfg, &live_in, |s| clean_b[s.index()], &mut frontier);
+    Some(frontier)
 }
