@@ -1,29 +1,27 @@
-//! A workspace loaded once and kept: its `case_` functions and its binary's reach each built into one image, and its binary compiled on first call, each brought up to date after an edit.
-
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::graph::{self, Targets};
-use crate::image::{Image, Program};
-use crate::macros::Compilation;
-use crate::names::ItemRef;
-use crate::outline::{self, tree::Profile};
-use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
-use crate::sema::{self, Cache, Edited};
 use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::cli::{Failures, TestItem, case_items, error_kind, print_failures, print_test_report, test_items};
+use crate::cli::{Failures, test_items};
+use crate::graph::{self, Targets};
+use crate::image::Program;
+use crate::macros::Compilation;
+use crate::names::ItemRef;
+use crate::outline::{self, tree::Profile};
+use crate::sema::{self, Cache, Edited};
 
+mod batch;
+mod report;
 pub(crate) mod substrate;
 mod test_args;
 mod watch;
 
-use substrate::{SubstrateSlot, cache_with_substrate, export_pre_summaries, save_batch_substrate, save_jit_substrate};
-use test_args::{check_fn_items, map_tests, parse_test_args, select_test_roots, test_label};
+use batch::{Batch, BatchKind};
+use substrate::{cache_with_substrate, save_jit_substrate};
+use test_args::map_tests;
 use watch::{Stamp, Watch, body_edits, edits, paths, pre_stamps, stamps};
-
-include!("../../../tests/case_inputs.rs");
 
 /// A loaded workspace kept between requests: its compilation, the `case_` functions and the binary's reach once a request needs them, and the binary once a request runs it.
 pub struct Build {
@@ -35,64 +33,20 @@ pub struct Build {
     outline_span: sema::census::Span,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum BatchKind {
-    Cases,
-    Tests,
-    LibCheck,
-    MainCheck,
-    MainAot,
-}
-
-impl BatchKind {
-    fn mode(self) -> crate::image::ImageMode {
-        match self {
-            BatchKind::Cases | BatchKind::Tests => crate::image::ImageMode::Jit,
-            BatchKind::LibCheck | BatchKind::MainCheck => crate::image::ImageMode::Check,
-            BatchKind::MainAot => crate::image::ImageMode::Aot,
-        }
-    }
-
-    fn pick(self, workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
-        match self {
-            BatchKind::Cases => case_items(workspace, outline),
-            BatchKind::Tests => test_items(workspace, outline).into_iter().map(|t| t.item).collect(),
-            BatchKind::LibCheck => check_fn_items(workspace, outline, None),
-            BatchKind::MainCheck => check_fn_items(workspace, outline, main_item(workspace, outline).map(|m| m.krate as usize)),
-            BatchKind::MainAot => main_items(workspace, outline),
-        }
-    }
-}
-
-/// Root functions inferred and compiled ahead of time into one image: how to pick them, the inference store, their names and indexes, what they reach, and why each function that did not compile failed.
-struct Batch {
-    kind: BatchKind,
-    store: Option<Cache>,
-    labels: Vec<String>,
-    roots: Vec<usize>,
-    tests: Vec<(TestItem, Option<usize>)>,
-    reached: Reached,
-    image: Image,
-    broken: HashMap<usize, String>,
-    poly_failures: Vec<(ItemRef, String)>,
-    reach_span: sema::census::Span,
-    codegen_span: sema::census::Span,
-}
-
-fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, kind: BatchKind) -> (Vec<ItemRef>, Vec<Instance>) {
-    let items = kind.pick(workspace, outline);
-    let roots = items.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect();
-    (items, roots)
-}
-
 /// The `main` of the selected member binary or example (or the first member binary when neither `--bin` nor `--example` is set).
-pub(crate) fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
+pub(crate) fn main_item(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+) -> Option<ItemRef> {
     let sel = crate::selection();
     let (role, wanted) = match &sel.example {
         Some(name) => (outline::Role::Example, Some(name.as_str())),
         None => (outline::Role::Bin, sel.bin.as_deref()),
     };
-    let krate = outline.members(workspace).find(|&krate| outline.roots[krate].role == role && wanted.is_none_or(|name| outline.roots[krate].name == name))?;
+    let krate = outline.members(workspace).find(|&krate| {
+        outline.roots[krate].role == role
+            && wanted.is_none_or(|name| outline.roots[krate].name == name)
+    })?;
     outline.main(krate)
 }
 
@@ -111,353 +65,6 @@ fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Res
     main_item(workspace, outline).ok_or_else(missing_target_error)
 }
 
-fn batch_labels(cx: &mut sema::Context<'_>, kind: BatchKind, items: &[ItemRef]) -> Vec<String> {
-    items.iter().map(|&item| if kind == BatchKind::Tests { test_label(cx, item) } else { cx.name(item).to_owned() }).collect()
-}
-
-fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
-    main_item(workspace, outline).into_iter().collect()
-}
-
-fn check_poly_items(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> Vec<(ItemRef, String)> {
-    let mut out = Vec::new();
-    for &item in items {
-        if !sema::infer::is_concrete_fn(cx, item)
-            && let Err(err) = sema::summary::check_poly_item(cx, item)
-        {
-            out.push((item, err));
-        }
-    }
-    out
-}
-
-fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize], roots: &[usize]) {
-    let mut expanded = fresh.to_vec();
-    if crate::profile() == outline::tree::Profile::Release && !fresh.is_empty() && fresh.len() < reached.list.len() {
-        let mut dirty = vec![false; reached.list.len()];
-        for &at in fresh {
-            dirty[at] = true;
-        }
-        for _ in 0..3 {
-            let added: Vec<usize> = (0..reached.list.len())
-                .filter(|&u| !dirty[u] && reached.direct_calls(u).is_some_and(|callees| callees.iter().any(|&c| dirty[c])))
-                .collect();
-            if added.is_empty() {
-                break;
-            }
-            for u in added {
-                dirty[u] = true;
-                expanded.push(u);
-            }
-        }
-    }
-    expanded.iter().for_each(|at| drop(broken.remove(at)));
-    broken.extend(image.compile(cx, reached, &expanded));
-    if let &[start, main] = roots {
-        let mut tried: rustc_hash::FxHashSet<usize> = expanded.into_iter().collect();
-        loop {
-            let missing: Vec<usize> = image.missing_aot_targets([start, main], reached).into_iter().filter(|idx| !broken.contains_key(idx) && tried.insert(*idx)).collect();
-            if missing.is_empty() {
-                break;
-            }
-            broken.extend(image.compile(cx, reached, &missing));
-        }
-    }
-}
-
-fn finish_batch(
-    (kind, main): (BatchKind, Option<ItemRef>),
-    (cases, mut reached): (&[ItemRef], Reached),
-    drop_finals: bool,
-    substrate: Option<SubstrateSlot>,
-    (mut cx, reach_clock): (sema::Context<'_>, sema::census::Clock),
-) -> Result<Batch> {
-    let mode = kind.mode();
-    let reach_span = reach_clock.elapsed();
-    let codegen_clock = sema::census::Clock::now();
-    let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.as_ref());
-    let mut test_starts: Vec<Option<sema::reach::Instance>> = Vec::new();
-    let valid: Vec<ItemRef> = match kind {
-        BatchKind::Cases => cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect(),
-        BatchKind::Tests => {
-            let (valid, starts, _) = select_test_roots(&mut cx, cases);
-            test_starts = starts;
-            valid
-        }
-        BatchKind::LibCheck | BatchKind::MainCheck => cases.iter().copied().filter(|&item| sema::infer::is_concrete_fn(&mut cx, item)).collect(),
-        BatchKind::MainAot => Vec::new(),
-    };
-    let poly_failures = if matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck) {
-        check_poly_items(&mut cx, cases)
-    } else {
-        Vec::new()
-    };
-    let mut root_instances: Vec<sema::reach::Instance> = match main {
-        Some(main) => sema::reach::main_roots(&mut cx, main)?.to_vec(),
-        None => valid.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect(),
-    };
-    let extra_starts: Vec<sema::reach::Instance> = test_starts.iter().flatten().copied().collect();
-    let primary_len = root_instances.len();
-    root_instances.extend(extra_starts);
-    reached.canonicalize(&cx, &root_instances);
-    let roots: Vec<usize> = root_instances[..primary_len].iter().map(|inst| reached.index[inst]).collect();
-    let start_indices: Vec<Option<usize>> = test_starts.iter().map(|opt| opt.and_then(|inst| reached.index.get(&inst).copied())).collect();
-    if drop_finals {
-        cx.compact_for_oneshot_codegen();
-    }
-    let (mut image, broken) = if mode == crate::image::ImageMode::Aot && roots.len() == 2 {
-        Image::build_aot(&mut cx, &reached, [roots[0], roots[1]])?
-    } else {
-        Image::build(&mut cx, &reached, mode)?
-    };
-    let codegen_span = codegen_clock.elapsed();
-    let labels = batch_labels(&mut cx, kind, &valid);
-    let outline = cx.outline;
-    let mut store = cx.release().0;
-    save_batch_substrate((outline, &mut store), &mut image, (drop_finals, kind), substrate, pre_builder);
-    let tests = start_indices
-        .into_iter()
-        .map(|start| (TestItem { item: ItemRef { krate: 0, file: 0, item: 0 }, ignored: false, should_panic: false, expected: None }, start))
-        .collect();
-    Ok(Batch { kind, store: Some(store), labels, roots, tests, reached, image, broken, poly_failures, reach_span, codegen_span })
-}
-
-impl Batch {
-    /// Infers and compiles every root `kind` finds in `workspace` from nothing.
-    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, kind: BatchKind, drop_finals: bool) -> Result<Batch> {
-        let main = (kind == BatchKind::MainAot)
-            .then(|| {
-                let sel = crate::selection();
-                if sel.bin.is_some() || sel.example.is_some() {
-                    require_main(workspace, &compilation.outline)
-                } else {
-                    main_item(workspace, &compilation.outline).context("no binary or example target to emit (pass --bin NAME or --example NAME)")
-                }
-            })
-            .transpose()?;
-        Self::rooted(workspace, compilation, (kind, main), drop_finals)
-    }
-
-    /// Infers and compiles from nothing the roots `kind` finds in `workspace`, or the program whose `main` is `main`.
-    fn rooted(workspace: &graph::Workspace, compilation: &mut Compilation, (kind, main): (BatchKind, Option<ItemRef>), drop_finals: bool) -> Result<Batch> {
-        let mode = kind.mode();
-        let reach_clock = sema::census::Clock::now();
-        let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, kind) };
-        let (mut substrate, cache) = cache_with_substrate(workspace, mode != crate::image::ImageMode::Check);
-        let batch = crate::macros::reach_resolved_with_cache(
-            compilation,
-            cache,
-            |cx| match (kind, main) {
-                (BatchKind::MainAot, Some(main_ref)) => sema::reach::main_roots(cx, main_ref).map_or_else(|_| vec![(main_ref, sema::substs::Substs::EMPTY)], Into::into),
-                (BatchKind::Cases, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
-                (BatchKind::Tests, _) => select_test_roots(cx, &cases).2,
-                (BatchKind::LibCheck | BatchKind::MainCheck, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item)).collect(),
-                _ => root_insts.clone(),
-            },
-            |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, substrate.take(), (cx, reach_clock)),
-        )?;
-        crate::substrate::save_fixed_files(workspace, crate::host_target().triple, &compilation.outline);
-        Ok(batch)
-    }
-
-    /// Writes this ahead-of-time batch as a standalone executable to `path`, unless a function it reaches failed to compile.
-    fn write_aot(&mut self, compilation: &Compilation, path: &std::path::Path) -> Result<()> {
-        if !self.broken.is_empty() {
-            bail!("{} functions failed to compile", self.broken.len());
-        }
-        let store = self.store.take().context("the binary's inference store is in use")?;
-        let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
-        let exe = self.image.to_aot(&crate::host_target(), (self.roots[0], self.roots[1]), &mut cx, &self.reached);
-        self.store = Some(cx.release().0);
-        exe?.write(path)
-    }
-
-    fn again(&mut self, compilation: &Compilation, stale: &[(u32, u32)]) -> bool {
-        let Some(mut store) = self.store.take() else {
-            return false;
-        };
-        let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Files(stale));
-        let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
-        let fresh = reach_again(&mut cx, &mut self.reached, &touched);
-        if !cx.resolved() {
-            return false;
-        }
-        recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh, &self.roots);
-        self.store = Some(cx.release().0);
-        true
-    }
-
-    fn reload(&mut self, workspace: &graph::Workspace, compilation: &Compilation, crates: &[u32]) -> bool {
-        let Some(mut store) = self.store.take() else {
-            return false;
-        };
-        let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
-        let (mut cases, _) = batch_roots(workspace, &compilation.outline, self.kind);
-        let roots;
-        let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
-        let mut test_starts = Vec::new();
-        match self.kind {
-            BatchKind::Cases => {
-                cases.retain(|&item| sema::infer::is_case_sig(&mut cx, item));
-                roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
-            }
-            BatchKind::Tests => {
-                let (valid, starts, test_roots) = select_test_roots(&mut cx, &cases);
-                cases = valid;
-                test_starts = starts;
-                roots = test_roots;
-            }
-            BatchKind::LibCheck | BatchKind::MainCheck => {
-                self.poly_failures = check_poly_items(&mut cx, &cases);
-                cases.retain(|&item| sema::infer::is_concrete_fn(&mut cx, item));
-                roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
-            }
-            BatchKind::MainAot => {
-                let Some(&main) = cases.first() else { return false };
-                let Ok(pair) = sema::reach::main_roots(&mut cx, main) else { return false };
-                cases.clear();
-                roots = pair.to_vec();
-            }
-        }
-        let fresh = reach_anew(&mut cx, &mut self.reached, &touched, &roots);
-        if !cx.resolved() {
-            return false;
-        }
-        self.labels = batch_labels(&mut cx, self.kind, &cases);
-        self.roots = match self.kind {
-            BatchKind::Tests => cases.iter().map(|&item| self.reached.index[&(item, sema::substs::Substs::EMPTY)]).collect(),
-            _ => roots.iter().map(|root| self.reached.index[root]).collect(),
-        };
-        if self.kind == BatchKind::Tests {
-            let starts: Vec<Option<usize>> = test_starts.into_iter().map(|opt| opt.and_then(|s| self.reached.index.get(&s).copied())).collect();
-            self.tests = map_tests(&self.roots, &self.reached, &starts, test_items(workspace, &compilation.outline));
-        }
-        recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh, &self.roots);
-        self.store = Some(cx.release().0);
-        true
-    }
-
-    /// Sorts the roots into the failures of those that reach a function that did not infer or compile, and the rest by index and name.
-    fn sort(&self, outline: Option<&outline::Outline>) -> (Failures, Vec<(usize, &str)>) {
-        let mut failures = Failures::new();
-        let mut runnable = Vec::new();
-        for (&root, name) in self.roots.iter().zip(&self.labels) {
-            let closure = self.reached.closure(&[root]);
-            let found = closure.iter().rev().find_map(|&at| self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)).map(|err| (at, err)));
-            match found {
-                Some((at, error)) => {
-                    let loc = outline.map(|o| item_loc(o, self.reached.list[at].0.0)).unwrap_or_default();
-                    let msg = if error.starts_with(name.as_str()) { format!("{loc}{error}") } else { format!("{loc}{name}: {error}") };
-                    failures.entry(error_kind(error)).or_default().push(msg);
-                }
-                None => runnable.push((root, name.as_str())),
-            }
-        }
-        for &(item, ref error) in &self.poly_failures {
-            let loc = outline.map(|o| item_loc(o, item)).unwrap_or_default();
-            failures.entry(error_kind(error)).or_default().push(format!("{loc}{error}"));
-        }
-        (failures, runnable)
-    }
-
-    /// Why each function the roots reach did not type-check or compile, at the file and line of its item and with its type arguments, keyed by the kind of error.
-    fn failures(&self, cx: &sema::Context<'_>) -> Failures {
-        let mut failures = Failures::new();
-        for at in self.reached.closure(&self.roots) {
-            if let Some(error) = self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)) {
-                let (item, substs) = self.reached.list[at].0;
-                let (src, entry) = cx.item(item);
-                let substs: Vec<String> = cx.types.substs(substs).iter().map(|&ty| cx.type_text(ty, &|ty| ty)).collect();
-                failures.entry(error_kind(error)).or_default().push(format!("{}:{} {error} [{}]", src.path.display(), src.line(entry.start), substs.join(", ")));
-            }
-        }
-        failures
-    }
-
-    /// Prints what failed to build and how long building took, and returns 1 when anything failed.
-    fn check(&self, outline: &outline::Outline, built: Duration) -> i32 {
-        let (failures, _) = self.sort(Some(outline));
-        print_failures(&failures);
-        eprintln!("{} functions reached, {} failed, built in {:.1} ms", self.reached.list.len(), failures.values().map(Vec::len).sum::<usize>(), built.as_secs_f64() * 1e3);
-        i32::from(!failures.is_empty())
-    }
-
-    /// Runs every case or `#[test]` whose functions all compiled and returns 0 when all pass, else 101.
-    fn report(&self, outline: &outline::Outline, started: Instant, built: Duration, filters: &[String]) -> Result<i32> {
-        if self.kind == BatchKind::Tests {
-            return self.report_tests(outline, started, filters);
-        }
-        let (mut failures, runnable) = self.sort(Some(outline));
-        let statuses = self.image.run_cases(&runnable, &CASE_INPUTS)?;
-        for ((_, name), status) in runnable.iter().zip(statuses).filter(|(_, status)| *status != 0) {
-            failures.entry(format!("crashed with status {status}")).or_default().push((*name).to_owned());
-        }
-        print_failures(&failures);
-        let ms = |at: Duration| at.as_secs_f64() * 1e3;
-        eprintln!("cases {} found, {} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", self.labels.len(), runnable.len(), self.reached.list.len(), ms(built), ms(started.elapsed()));
-        Ok(if failures.is_empty() { 0 } else { 101 })
-    }
-
-    fn report_tests(&self, outline: &outline::Outline, started: Instant, filters: &[String]) -> Result<i32> {
-        let sel = crate::selection();
-        let args = parse_test_args(filters);
-        let ignored_only = sel.ignored_only || args.ignored_only;
-        let include_ignored = sel.include_ignored || args.include_ignored;
-        let matches = |name: &str, pat: &str| if args.exact { name == pat } else { name.contains(pat) };
-        let mut to_run = Vec::new();
-        let mut errs: Vec<String> = Vec::new();
-        let mut raw: Vec<(&str, &TestItem, Option<Result<(usize, Option<usize>), usize>>)> = Vec::new();
-        for ((&root, name), (meta, start)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
-            if (!args.filters.is_empty() && !args.filters.iter().any(|f| matches(name, f))) || args.skips.iter().any(|s| matches(name, s)) {
-                continue;
-            }
-            if ignored_only && !meta.ignored {
-                continue;
-            }
-            let skip = meta.ignored && !ignored_only && !include_ignored;
-            let check_roots: Vec<usize> = (*start).into_iter().chain(std::iter::once(root)).collect();
-            let outcome = if skip {
-                None
-            } else if let Some((at, err)) = self.reached.closure(&check_roots).iter().rev().find_map(|&at| self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)).map(|e| (at, e))) {
-                let idx = errs.len();
-                errs.push(format!("{}{err}", item_loc(outline, self.reached.list[at].0.0)));
-                Some(Err(idx))
-            } else {
-                if meta.expected.is_none() {
-                    to_run.push((root, *start, name.as_str()));
-                }
-                Some(Ok((root, *start)))
-            };
-            raw.push((name.as_str(), meta, outcome));
-        }
-        let mut ran = self.image.run_tests(&to_run)?.into_iter();
-        let mut entries: Vec<(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)> = Vec::with_capacity(raw.len());
-        for (name, meta, outcome) in raw {
-            let resolved = match outcome {
-                None => None,
-                Some(Err(idx)) => Some(Err(errs[idx].as_str())),
-                Some(Ok((root, start))) if meta.expected.is_some() => {
-                    let (status, stderr) = self.image.run_test_captured(root, start, name)?;
-                    Some(Ok((status, Some(stderr))))
-                }
-                Some(Ok(_)) => ran.next().map(|s| Ok((s, None))),
-            };
-            entries.push((name, meta, resolved));
-        }
-        Ok(print_test_report(&entries, started.elapsed()))
-    }
-}
-
-fn item_loc(outline: &outline::Outline, item: ItemRef) -> String {
-    let outer = item.body_owner();
-    let file = &outline.crates[outer.krate as usize].files[outer.file as usize];
-    let Some(entry) = file.items.items.get(outer.item as usize) else {
-        return format!("{} ", file.source.path.display());
-    };
-    let line = file.source.line(entry.start);
-    format!("{}:{line} ", file.source.path.display())
-}
-
 impl Build {
     /// Loads every crate of `workspace`, resolves its names and expands its macros, inferring and compiling nothing yet.
     pub fn load(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
@@ -471,7 +78,14 @@ impl Build {
             }
         }
         let outline_span = outline_clock.elapsed();
-        Ok(Build { compilation, cases: None, binary: None, program: None, stamps, outline_span })
+        Ok(Build {
+            compilation,
+            cases: None,
+            binary: None,
+            program: None,
+            stamps,
+            outline_span,
+        })
     }
 
     fn load_members(&mut self, workspace: &graph::Workspace) -> Result<()> {
@@ -498,7 +112,11 @@ impl Build {
         if self.cases.is_none() {
             self.load_members(workspace)?;
             let discovered = test_items(workspace, &self.compilation.outline);
-            let kind = if discovered.is_empty() { BatchKind::Cases } else { BatchKind::Tests };
+            let kind = if discovered.is_empty() {
+                BatchKind::Cases
+            } else {
+                BatchKind::Tests
+            };
             let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
             if kind == BatchKind::Tests {
                 let starts: Vec<Option<usize>> = batch.tests.iter().map(|(_, s)| *s).collect();
@@ -519,7 +137,11 @@ impl Build {
         self.compile_binary_with(workspace, true)
     }
 
-    fn compile_binary_with(&mut self, workspace: &graph::Workspace, drop_finals: bool) -> Result<()> {
+    fn compile_binary_with(
+        &mut self,
+        workspace: &graph::Workspace,
+        drop_finals: bool,
+    ) -> Result<()> {
         if self.binary.is_none() {
             let sel = crate::selection();
             let kind = if main_item(workspace, &self.compilation.outline).is_some() {
@@ -531,7 +153,12 @@ impl Build {
                 self.load_members(workspace)?;
                 BatchKind::LibCheck
             };
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, kind, drop_finals)?);
+            self.binary = Some(Batch::new(
+                workspace,
+                &mut self.compilation,
+                kind,
+                drop_finals,
+            )?);
         }
         Ok(())
     }
@@ -548,12 +175,19 @@ impl Build {
 
     /// Brings the build up to date with the local files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
     pub fn refresh(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-        let Ok((stale, crates)) = edits(workspace, &mut self.stamps, &mut self.compilation.outline) else {
+        let Ok((stale, crates)) = edits(workspace, &mut self.stamps, &mut self.compilation.outline)
+        else {
             return self.rebuild(workspace, targets);
         };
         let done = match (stale.is_empty(), crates.is_empty()) {
             (true, true) => return Ok(()),
-            (_, false) => self.reload(workspace, crates.into_iter().chain(stale.iter().map(|&(krate, _)| krate)).collect()),
+            (_, false) => self.reload(
+                workspace,
+                crates
+                    .into_iter()
+                    .chain(stale.iter().map(|&(krate, _)| krate))
+                    .collect(),
+            ),
             (false, true) => self.again(&stale),
         };
         if !done {
@@ -567,7 +201,10 @@ impl Build {
             program.forget(&self.compilation.outline, Edited::Files(stale));
         }
         let compilation = &self.compilation;
-        [&mut self.cases, &mut self.binary].into_iter().flatten().all(|batch| batch.again(compilation, stale))
+        [&mut self.cases, &mut self.binary]
+            .into_iter()
+            .flatten()
+            .all(|batch| batch.again(compilation, stale))
     }
 
     fn reload(&mut self, workspace: &graph::Workspace, edited: Vec<u32>) -> bool {
@@ -583,16 +220,23 @@ impl Build {
         }
         crates.sort_unstable();
         crates.dedup();
-        crates.iter().for_each(|&krate| self.compilation.names.reset(krate as usize));
+        crates
+            .iter()
+            .for_each(|&krate| self.compilation.names.reset(krate as usize));
         if crate::macros::resolve(&mut self.compilation).is_err() {
             return false;
         }
         if let Some(program) = self.program.take() {
             let store = program.into_store(&self.compilation.outline, Edited::Crates(&crates));
             let main = main_item(workspace, &self.compilation.outline);
-            self.program = main.and_then(|main| Program::new(&mut self.compilation, store, main).ok());
+            self.program =
+                main.and_then(|main| Program::new(&mut self.compilation, store, main).ok());
         }
-        let seen: HashMap<PathBuf, Stamp> = self.stamps.iter().map(|watch| (watch.path.clone(), watch.stamp)).collect();
+        let seen: HashMap<PathBuf, Stamp> = self
+            .stamps
+            .iter()
+            .map(|watch| (watch.path.clone(), watch.stamp))
+            .collect();
         self.stamps = stamps(workspace, &self.compilation.outline);
         for watch in &mut self.stamps {
             if let Some(&stamp) = seen.get(&watch.path) {
@@ -600,7 +244,10 @@ impl Build {
             }
         }
         let compilation = &self.compilation;
-        [&mut self.cases, &mut self.binary].into_iter().flatten().all(|batch| batch.reload(workspace, compilation, &crates))
+        [&mut self.cases, &mut self.binary]
+            .into_iter()
+            .flatten()
+            .all(|batch| batch.reload(workspace, compilation, &crates))
     }
 
     fn rebuild(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
@@ -616,36 +263,71 @@ impl Build {
     }
 
     /// Compiles `main` and `std::rt::lang_start` into an AOT `Image` and writes a standalone executable to `path`.
-    pub(crate) fn emit_executable(&mut self, workspace: &graph::Workspace, path: &std::path::Path, drop_finals: bool) -> Result<i32> {
+    pub(crate) fn emit_executable(
+        &mut self,
+        workspace: &graph::Workspace,
+        path: &std::path::Path,
+        drop_finals: bool,
+    ) -> Result<i32> {
         let started = Instant::now();
-        if self.binary.as_ref().is_none_or(|bin| bin.kind != BatchKind::MainAot) {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, drop_finals)?);
+        if self
+            .binary
+            .as_ref()
+            .is_none_or(|bin| bin.kind != BatchKind::MainAot)
+        {
+            self.binary = Some(Batch::new(
+                workspace,
+                &mut self.compilation,
+                BatchKind::MainAot,
+                drop_finals,
+            )?);
         }
-        if !self.binary.as_ref().context("the binary is not compiled")?.broken.is_empty() {
-            crate::cli::failure_lines(&self.failures()?).iter().for_each(|line| eprintln!("{line}"));
+        if !self
+            .binary
+            .as_ref()
+            .context("the binary is not compiled")?
+            .broken
+            .is_empty()
+        {
+            crate::cli::failure_lines(&self.failures()?)
+                .iter()
+                .for_each(|line| eprintln!("{line}"));
         }
         let bin = self.binary.as_mut().context("the binary is not compiled")?;
         bin.write_aot(&self.compilation, path)?;
-        eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "built {} ({} functions reached, {:.1} ms)",
+            path.display(),
+            bin.reached.list.len(),
+            started.elapsed().as_secs_f64() * 1e3
+        );
         Ok(0)
     }
 
     /// Runs every case or `#[test]` whose functions all compiled and returns 0 when all pass, else 101.
     pub fn report(&self, started: Instant, built: Duration, filters: &[String]) -> Result<i32> {
-        let Some(cases) = &self.cases else { bail!("the cases are not compiled") };
+        let Some(cases) = &self.cases else {
+            bail!("the cases are not compiled")
+        };
         cases.report(&self.compilation.outline, started, built, filters)
     }
 
     /// Prints what failed to build in the binary's reach and how long building took, and returns 1 when anything failed.
     pub fn check(&self, built: Duration) -> Result<i32> {
-        let Some(binary) = &self.binary else { bail!("the binary is not compiled") };
+        let Some(binary) = &self.binary else {
+            bail!("the binary is not compiled")
+        };
         Ok(binary.check(&self.compilation.outline, built))
     }
 
     /// Why each function the binary's `main` reaches did not type-check or compile, at the file and line of its item, keyed by the kind of error.
     pub fn failures(&mut self) -> Result<Failures> {
-        let Some(binary) = &mut self.binary else { bail!("the binary is not compiled") };
-        let Some(store) = binary.store.take() else { bail!("the binary has no inference store") };
+        let Some(binary) = &mut self.binary else {
+            bail!("the binary is not compiled")
+        };
+        let Some(store) = binary.store.take() else {
+            bail!("the binary has no inference store")
+        };
         let cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
         let failures = binary.failures(&cx);
         binary.store = Some(cx.release().0);
@@ -653,11 +335,31 @@ impl Build {
     }
 
     /// Writes the equivalence-class, hazard, origin, and code-size census of the compiled binary to `path`.
-    pub fn write_stats(&mut self, workspace: &graph::Workspace, graph: sema::census::Span, path: &std::path::Path) -> Result<()> {
-        let Some(binary) = &mut self.binary else { bail!("the binary is not compiled") };
-        let Some(store) = binary.store.take() else { bail!("the binary has no inference store") };
-        let timings = sema::census::Timings { graph, outline: self.outline_span, reach: binary.reach_span, codegen: binary.codegen_span };
-        let input = sema::census::CensusInput { workspace, reached: &binary.reached, code_sizes: binary.image.code_sizes(), compile_times: binary.image.compile_times(), timings };
+    pub fn write_stats(
+        &mut self,
+        workspace: &graph::Workspace,
+        graph: sema::census::Span,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        let Some(binary) = &mut self.binary else {
+            bail!("the binary is not compiled")
+        };
+        let Some(store) = binary.store.take() else {
+            bail!("the binary has no inference store")
+        };
+        let timings = sema::census::Timings {
+            graph,
+            outline: self.outline_span,
+            reach: binary.reach_span,
+            codegen: binary.codegen_span,
+        };
+        let input = sema::census::CensusInput {
+            workspace,
+            reached: &binary.reached,
+            code_sizes: binary.image.code_sizes(),
+            compile_times: binary.image.compile_times(),
+            timings,
+        };
         let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
         let result = sema::census::write_stats(&mut cx, input, path);
         binary.store = Some(cx.release().0);
@@ -680,13 +382,28 @@ impl Build {
 }
 
 /// Compiles the program whose `main` is `main` ahead of time and writes it as a standalone executable to `path`.
-pub(crate) fn emit_main(workspace: &graph::Workspace, compilation: &mut Compilation, main: ItemRef, path: &std::path::Path) -> Result<()> {
-    Batch::rooted(workspace, compilation, (BatchKind::MainAot, Some(main)), true)?.write_aot(compilation, path)
+pub(crate) fn emit_main(
+    workspace: &graph::Workspace,
+    compilation: &mut Compilation,
+    main: ItemRef,
+    path: &std::path::Path,
+) -> Result<()> {
+    Batch::rooted(
+        workspace,
+        compilation,
+        (BatchKind::MainAot, Some(main)),
+        true,
+    )?
+    .write_aot(compilation, path)
 }
 
 /// Runs the binary's `main` with `args` as argv, compiling each function on its first call, and, when prepared code is switched on, under the release profile calling prepped code where it can, racing a prep of what changed since the library was built.
 pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
-    let mut ahead = if crate::profile() == Profile::Release && crate::prep::prepared() { crate::prep::ahead(workspace, targets) } else { None };
+    let mut ahead = if crate::profile() == Profile::Release && crate::prep::prepared() {
+        crate::prep::ahead(workspace, targets)
+    } else {
+        None
+    };
     let status = run_loaded(workspace, targets, args, ahead.as_mut());
     if !matches!(status, Ok(0))
         && let Some(said) = ahead.as_mut().and_then(crate::prep::Ahead::rejected)
@@ -696,9 +413,18 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
     status
 }
 
-fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], ahead: Option<&mut crate::prep::Ahead>) -> Result<i32> {
+fn run_loaded(
+    workspace: &graph::Workspace,
+    targets: &Targets,
+    args: &[String],
+    ahead: Option<&mut crate::prep::Ahead>,
+) -> Result<i32> {
     let use_prep = crate::profile() == Profile::Release && crate::prep::prepared();
-    let mut compilation = if use_prep { crate::macros::load_eager(workspace, targets, &[])? } else { crate::macros::load_lazy(workspace, targets)? };
+    let mut compilation = if use_prep {
+        crate::macros::load_eager(workspace, targets, &[])?
+    } else {
+        crate::macros::load_lazy(workspace, targets)?
+    };
     let main = require_main(workspace, &compilation.outline)?;
     if use_prep {
         bind_prepped(workspace, &mut compilation, args, ahead);
@@ -721,11 +447,18 @@ fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], 
     status
 }
 
-/// Runs the binary's `main` with `args` as argv like `run_on_demand`, while it watches the local source files and swaps in the function bodies an edit changes.
-fn run_watched(workspace: &graph::Workspace, compilation: &mut Compilation, cache: Cache, main: ItemRef, args: &[String]) -> Result<i32> {
+fn run_watched(
+    workspace: &graph::Workspace,
+    compilation: &mut Compilation,
+    cache: Cache,
+    main: ItemRef,
+    args: &[String],
+) -> Result<i32> {
     let mut watched = stamps(workspace, &compilation.outline);
     let files = paths(&watched);
-    let mut reread = |compilation: &mut Compilation| body_edits(workspace, &mut watched, &mut compilation.outline);
+    let mut reread = |compilation: &mut Compilation| {
+        body_edits(workspace, &mut watched, &mut compilation.outline)
+    };
     let mut program = Program::new(compilation, cache, main)?;
     let status = program.run_watched(compilation, args, (files, &mut reread));
     std::mem::forget(program);
@@ -747,8 +480,12 @@ pub fn prep(workspace: &graph::Workspace, targets: &Targets) -> Result<crate::pr
     counts
 }
 
-/// Binds this process to what of the prepped library of the build still matches the sources, once the prep `ahead` races lands or its wait runs out, and starts a prep in the background when the library is missing or older than the sources; a build that cannot bind it compiles everything.
-fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation, args: &[String], mut ahead: Option<&mut crate::prep::Ahead>) {
+fn bind_prepped(
+    workspace: &graph::Workspace,
+    compilation: &mut Compilation,
+    args: &[String],
+    mut ahead: Option<&mut crate::prep::Ahead>,
+) {
     if let Some(ahead) = ahead.as_deref_mut() {
         ahead.wait();
     }
@@ -759,7 +496,9 @@ fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation, arg
     if !current && let Err(error) = crate::prep::refresh(&compilation.outline, workspace) {
         eprintln!("haste: not preparing in the background: {error:#}");
     }
-    if let Err(error) = manifest.and_then(|manifest| manifest.map_or(Ok(()), |manifest| crate::prep::install(manifest, args))) {
+    if let Err(error) = manifest.and_then(|manifest| {
+        manifest.map_or(Ok(()), |manifest| crate::prep::install(manifest, args))
+    }) {
         eprintln!("haste: running without prepped code: {error:#}");
     }
 }
