@@ -5,13 +5,15 @@ mod compact;
 mod consts;
 mod edges;
 mod flags;
+mod op;
 mod rodata;
 mod vector;
 
 pub use atomic::{AtomicOrd, AtomicRmwOp};
 pub(crate) use compact::{compact, compact_slots};
-pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
+pub(crate) use op::{Binary, BlockData, Convert, InstData, Op, SlotData, Unary};
 pub(crate) use vector::{CfgCache, Domain};
+pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
 
 /// The machine type of one value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -40,16 +42,24 @@ impl Type {
     }
 
     /// Width in bits.
-    pub const fn bits(self) -> u32 { self.bytes() * 8 }
+    pub const fn bits(self) -> u32 {
+        self.bytes() * 8
+    }
 
     /// Whether the type holds a scalar floating-point number.
-    pub const fn is_float(self) -> bool { matches!(self, Type::F32 | Type::F64) }
+    pub const fn is_float(self) -> bool {
+        matches!(self, Type::F32 | Type::F64)
+    }
 
     /// Whether the type is a SIMD register vector.
-    pub const fn is_vector(self) -> bool { matches!(self, Type::Vec { .. }) }
+    pub const fn is_vector(self) -> bool {
+        matches!(self, Type::Vec { .. })
+    }
 
     /// Whether a value of the type lives in a float register when it has one.
-    pub const fn in_float_register(self) -> bool { self.is_float() || self.is_vector() }
+    pub const fn in_float_register(self) -> bool {
+        self.is_float() || self.is_vector()
+    }
 
     /// The integer type `bytes` wide: 1, 2, 4 or 8.
     pub const fn int_of_bytes(bytes: i64) -> Option<Type> {
@@ -63,34 +73,51 @@ impl Type {
     }
 
     /// Whether the type holds an integer that fits in one general-purpose register.
-    pub const fn is_small_int(self) -> bool { matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64) }
+    pub const fn is_small_int(self) -> bool {
+        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    }
 
     /// The lane kind when `self` is a vector type.
     pub const fn lane(self) -> Option<Lane> {
-        match self { Type::Vec { lane, .. } => Some(lane), _ => None }
+        match self {
+            Type::Vec { lane, .. } => Some(lane),
+            _ => None,
+        }
     }
 
     /// The `(lane, count)` shape when `self` is a vector type.
     pub const fn vec_shape(self) -> Option<(Lane, u8)> {
-        match self { Type::Vec { lane, count } => Some((lane, count)), _ => None }
+        match self {
+            Type::Vec { lane, count } => Some((lane, count)),
+            _ => None,
+        }
     }
 
     /// Whether `self` is a valid 8-byte or 16-byte power-of-two vector type.
     pub const fn is_valid_vec(self) -> bool {
         match self {
-            Type::Vec { lane, count } => count.is_power_of_two() && matches!(lane.bytes() * (count as u32), 8 | 16),
+            Type::Vec { lane, count } => {
+                count.is_power_of_two() && matches!(lane.bytes() * (count as u32), 8 | 16)
+            }
             _ => false,
         }
     }
 
-    /// The largest unsigned value representable in `self`, clamped to 64 bits.
     pub(crate) fn unsigned_max(self) -> u64 {
         let bits = self.bits();
-        if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 }
+        if bits >= 64 {
+            u64::MAX
+        } else {
+            (1_u64 << bits) - 1
+        }
     }
 
     pub(crate) const fn sign_bit(self) -> i64 {
-        if matches!(self, Type::F64) { i64::MIN } else { 0x8000_0000 }
+        if matches!(self, Type::F64) {
+            i64::MIN
+        } else {
+            0x8000_0000
+        }
     }
 }
 
@@ -156,17 +183,35 @@ pub struct AbiParam {
 impl AbiParam {
     /// A plain value of `ty`.
     pub fn new(ty: Type) -> Self {
-        Self { value_type: ty, purpose: ArgumentPurpose::Normal, readonly: false, noalias: false, deref_bytes: 0 }
+        Self {
+            value_type: ty,
+            purpose: ArgumentPurpose::Normal,
+            readonly: false,
+            noalias: false,
+            deref_bytes: 0,
+        }
     }
 
     /// A value of `ty` with a special purpose.
     pub fn special(ty: Type, purpose: ArgumentPurpose) -> Self {
-        Self { value_type: ty, purpose, readonly: false, noalias: false, deref_bytes: 0 }
+        Self {
+            value_type: ty,
+            purpose,
+            readonly: false,
+            noalias: false,
+            deref_bytes: 0,
+        }
     }
 
     /// A C variadic argument of `ty`.
     pub fn variadic(ty: Type) -> Self {
-        Self { value_type: ty, purpose: ArgumentPurpose::Variadic, readonly: false, noalias: false, deref_bytes: 0 }
+        Self {
+            value_type: ty,
+            purpose: ArgumentPurpose::Variadic,
+            readonly: false,
+            noalias: false,
+            deref_bytes: 0,
+        }
     }
 
     /// Marks this parameter as pointing to immutable memory for the duration of the call.
@@ -204,7 +249,11 @@ pub struct Signature {
 impl Signature {
     /// An empty signature in `call_conv`.
     pub fn new(call_conv: CallConv) -> Self {
-        Self { params: Vec::new(), returns: Vec::new(), call_conv }
+        Self {
+            params: Vec::new(),
+            returns: Vec::new(),
+            call_conv,
+        }
     }
 }
 
@@ -229,7 +278,10 @@ impl IntCC {
     pub fn is_signed(self) -> bool {
         matches!(
             self,
-            IntCC::SignedLessThan | IntCC::SignedGreaterThanOrEqual | IntCC::SignedGreaterThan | IntCC::SignedLessThanOrEqual
+            IntCC::SignedLessThan
+                | IntCC::SignedGreaterThanOrEqual
+                | IntCC::SignedGreaterThan
+                | IntCC::SignedLessThanOrEqual
         )
     }
 }
@@ -244,266 +296,6 @@ pub enum FloatCC {
     LessThanOrEqual,
     GreaterThan,
     GreaterThanOrEqual,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
-pub(crate) enum Unary {
-    Ineg,
-    Bnot,
-    Bswap,
-    Bitrev,
-    Clz,
-    Ctz,
-    Popcnt,
-    Fneg,
-    Fabs,
-    Sqrt,
-    Floor,
-    Ceil,
-    Trunc,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
-pub(crate) enum Binary {
-    Iadd,
-    Isub,
-    Imul,
-    Sdiv,
-    Udiv,
-    Srem,
-    Urem,
-    Umulhi,
-    Smulhi,
-    Smin,
-    Smax,
-    Umin,
-    Umax,
-    Band,
-    Bor,
-    Bxor,
-    Ishl,
-    Ushr,
-    Sshr,
-    Rotl,
-    Rotr,
-    Iconcat,
-    Fadd,
-    Fsub,
-    Fmul,
-    Fdiv,
-    Fmin,
-    Fmax,
-    Fcopysign,
-    SaddSat,
-    UaddSat,
-    SsubSat,
-    UsubSat,
-    AvgRound,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Convert {
-    Uextend,
-    Sextend,
-    Ireduce,
-    Fpromote,
-    Fdemote,
-    FromSint,
-    FromUint,
-    ToSintSat,
-    ToUintSat,
-    Bitcast,
-    NarrowSat { signed: bool },
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum Op {
-    Const(i64),
-    SlotAddr(u32),
-    Symbol(u32),
-    Runtime(crate::reloc::RuntimeSymbol),
-    Unary(Unary, Value),
-    Binary(Binary, Value, Value),
-    Fma(Value, Value, Value),
-    Convert(Convert, Value),
-    Icmp(IntCC, Value, Value),
-    /// 1 when `x op y` (add, sub or mul, signed when the flag is set) fits the type of `x`, else 0.
-    Fits(Binary, bool, Value, Value),
-    Fcmp(FloatCC, Value, Value),
-    /// Selects lanes from two vectors using a static mask or dynamic byte indices.
-    Shuffle(Value, Value, ShuffleMask),
-    /// Extracts one scalar lane from a vector.
-    Extract(Value, u8),
-    /// Replaces one scalar lane in a vector.
-    Insert(Value, Value, u8),
-    /// Reduces a vector to a scalar value or byte-sign bitmask.
-    Reduce(ReduceOp, Value),
-    /// A target-specific vector instruction with 1 to 3 operands.
-    TargetOp(TargetOpId, TinyArgs),
-    Select(Value, Value, Value),
-    Load(Value, i32),
-    Store(Value, Value, i32),
-    VolatileLoad(Value, i32),
-    VolatileStore(Value, Value, i32),
-    StackAddr(StackSlot, i32),
-    StackLoad(StackSlot, i32),
-    StackStore(Value, StackSlot, i32),
-    AtomicLoad(Value, AtomicOrd),
-    AtomicStore(Value, Value, AtomicOrd),
-    AtomicRmw(AtomicRmwOp, AtomicOrd, Value, Value),
-    AtomicCas(AtomicOrd, Value, Value, Value),
-    Fence(AtomicOrd),
-    FramePointer,
-    /// Copies the number of bytes in the third value from the address in the second to the address in the first; the two may overlap.
-    Copy(Value, Value, Value),
-    /// Copies a value of this many bytes from the address in the second value to the address in the first; the two ranges are the same or disjoint.
-    Move(Value, Value, u32),
-    Call { sig: SigRef, callee: Value, args: Vec<Value>, results: Vec<Value> },
-    TryCall { sig: SigRef, callee: Value, args: Vec<Value>, normal: Block, handler: Block },
-    Jump(Block, Vec<Value>),
-    Brif(Value, Block, Vec<Value>, Block, Vec<Value>),
-    BrTable(Value, Block, Vec<Block>),
-    Return(Vec<Value>),
-    Trap,
-    Trapz(Value),
-    /// States that the value is nonzero wherever control reaches this; it emits nothing and the schedule drops it before encoding.
-    Assume(Value),
-}
-
-impl Op {
-    pub(crate) fn is_terminator(&self) -> bool {
-        matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::BrTable(..) | Op::Return(_) | Op::Trap)
-    }
-
-    /// Whether this instruction computes its result from its operands alone, cannot trap, and may run speculatively.
-    pub(crate) fn is_speculable(&self) -> bool {
-        match self {
-            Op::Binary(bin, ..) => !matches!(bin, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
-            Op::Const(_)
-            | Op::SlotAddr(_)
-            | Op::Symbol(_)
-            | Op::StackAddr(..)
-            | Op::Unary(..)
-            | Op::Convert(..)
-            | Op::Icmp(..)
-            | Op::Fits(..)
-            | Op::Fcmp(..)
-            | Op::Shuffle(..)
-            | Op::Extract(..)
-            | Op::Insert(..)
-            | Op::Reduce(..)
-            | Op::TargetOp(..)
-            | Op::Select(..)
-            | Op::Fma(..) => true,
-            _ => false,
-        }
-    }
-
-    /// Whether this instruction has no observable side effects and may be dropped when unused.
-    pub(crate) fn is_removable(&self) -> bool {
-        self.is_speculable() || matches!(self, Op::Binary(..) | Op::Runtime(_) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
-    }
-
-    /// Calls `f` with every value this instruction reads, once per read.
-    #[inline]
-    pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
-        match self {
-            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::VolatileLoad(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::VolatileStore(x, y, _) | Op::AtomicStore(x, y, _) | Op::AtomicRmw(_, _, x, y) | Op::Move(x, y, _) => { f(*x); f(*y); }
-            Op::Shuffle(a, b, mask) => {
-                f(*a);
-                f(*b);
-                if let ShuffleMask::Dyn(idx) = mask {
-                    f(*idx);
-                }
-            }
-            Op::TargetOp(_, args) => args.as_slice().iter().for_each(|arg| f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(_, c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
-                f(*c);
-                f(*x);
-                f(*y);
-            }
-            Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } => {
-                f(*callee);
-                args.iter().for_each(|arg| f(*arg));
-            }
-            Op::Jump(_, args) | Op::Return(args) => args.iter().for_each(|arg| f(*arg)),
-            Op::Brif(c, _, then, _, otherwise) => {
-                f(*c);
-                then.iter().chain(otherwise).for_each(|arg| f(*arg));
-            }
-            Op::BrTable(index, ..) => f(*index),
-        }
-    }
-
-    /// Replaces every value this instruction reads with `f` of it.
-    pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
-        match self {
-            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::VolatileLoad(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => {
-                *x = f(*x);
-            }
-            Op::Binary(_, x, y)
-            | Op::Icmp(_, x, y)
-            | Op::Fits(_, _, x, y)
-            | Op::Fcmp(_, x, y)
-            | Op::Insert(x, y, _)
-            | Op::Store(x, y, _)
-            | Op::VolatileStore(x, y, _)
-            | Op::AtomicStore(x, y, _)
-            | Op::AtomicRmw(_, _, x, y)
-            | Op::Move(x, y, _) => {
-                *x = f(*x);
-                *y = f(*y);
-            }
-            Op::Shuffle(a, b, mask) => {
-                *a = f(*a);
-                *b = f(*b);
-                if let ShuffleMask::Dyn(idx) = mask {
-                    *idx = f(*idx);
-                }
-            }
-            Op::TargetOp(_, args) => args.as_mut_slice().iter_mut().for_each(|arg| *arg = f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(_, c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
-                *c = f(*c);
-                *x = f(*x);
-                *y = f(*y);
-            }
-            Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } => {
-                *callee = f(*callee);
-                args.iter_mut().for_each(|arg| *arg = f(*arg));
-            }
-            Op::Jump(_, args) | Op::Return(args) => args.iter_mut().for_each(|arg| *arg = f(*arg)),
-            Op::Brif(c, _, then, _, otherwise) => {
-                *c = f(*c);
-                then.iter_mut().chain(otherwise.iter_mut()).for_each(|arg| *arg = f(*arg));
-            }
-            Op::BrTable(index, ..) => *index = f(*index),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct InstData {
-    pub op: Op,
-    pub result: Option<Value>,
-    /// The source place this instruction came from: file key in the high 32 bits, byte offset in the low 32; 0 when unknown.
-    pub loc: u64,
-}
-
-#[derive(Clone, Default, Debug)]
-pub(crate) struct BlockData {
-    pub params: Vec<Value>,
-    pub insts: Vec<Inst>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SlotData {
-    pub size: u32,
-    pub align_shift: u8,
 }
 
 /// One function body: blocks of instructions over typed values.
@@ -527,7 +319,6 @@ pub struct Function {
     pub(crate) unwind_drops: Vec<crate::UnwindDrop>,
     pub(crate) no_unwind_syms: Vec<u32>,
     pub(crate) elide_drops: bool,
-    /// The bytes at the start of this coroutine's own frame that no code outside the frame can address.
     pub(crate) frame_private: u32,
     pub(crate) cfg_rev: u32,
     pub(crate) cfg_cache: CfgCache,
@@ -536,7 +327,27 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), keep_fp: false, unwind_drops: Vec::new(), no_unwind_syms: Vec::new(), elide_drops: false, frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
+        Self {
+            signature,
+            types: Vec::new(),
+            blocks: Vec::new(),
+            insts: Vec::new(),
+            slots: Vec::new(),
+            sigs: Vec::new(),
+            entry: None,
+            coroutine: None,
+            self_slots: Vec::new(),
+            vtable_slots: Vec::new(),
+            rodata_bytes: Vec::new(),
+            value_flags: Vec::new(),
+            keep_fp: false,
+            unwind_drops: Vec::new(),
+            no_unwind_syms: Vec::new(),
+            elide_drops: false,
+            frame_private: 0,
+            cfg_rev: 0,
+            cfg_cache: CfgCache::default(),
+        }
     }
 
     pub(crate) fn bump_cfg(&mut self) {
@@ -545,7 +356,9 @@ impl Function {
 
     pub(crate) fn cfg(&self) -> std::sync::Arc<crate::cfg::Cfg> {
         let mut guard = self.cfg_cache.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((rev, cfg)) = &mut *guard && (*rev == self.cfg_rev || cfg.matches(self)) {
+        if let Some((rev, cfg)) = &mut *guard
+            && (*rev == self.cfg_rev || cfg.matches(self))
+        {
             *rev = self.cfg_rev;
             return std::sync::Arc::clone(cfg);
         }
@@ -577,7 +390,12 @@ impl Function {
     }
 
     pub(crate) fn block_has_call(&self, block: Block) -> bool {
-        self.blocks[block.index()].insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. }))
+        self.blocks[block.index()].insts.iter().any(|&i| {
+            matches!(
+                self.insts[i.index()].op,
+                Op::Call { .. } | Op::TryCall { .. }
+            )
+        })
     }
 
     /// Whether this function contains any `Call` or `TryCall` instruction.
@@ -596,7 +414,9 @@ impl Function {
     }
 
     /// Whether this function is an unsplit coroutine body.
-    pub fn is_coroutine(&self) -> bool { self.coroutine.is_some() }
+    pub fn is_coroutine(&self) -> bool {
+        self.coroutine.is_some()
+    }
 
     /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol, a slot address, or a load from either.
     pub fn symbol_call_sites(&self) -> Vec<(Block, usize, u32)> {
@@ -628,28 +448,31 @@ impl Function {
     }
 
     /// The type of `value`.
-    pub fn ty(&self, value: Value) -> Type { self.types[value.index()] }
+    pub fn ty(&self, value: Value) -> Type {
+        self.types[value.index()]
+    }
 
-    /// A new value of type `ty`, for an instruction to define.
-    pub(crate) fn value(&mut self, ty: Type) -> Value { self.types.push(ty); Value(self.types.len() as u32 - 1) }
+    pub(crate) fn value(&mut self, ty: Type) -> Value {
+        self.types.push(ty);
+        Value(self.types.len() as u32 - 1)
+    }
 
-    /// A new instruction outside every block that runs `op` and defines `result`.
     pub(crate) fn add(&mut self, op: Op, result: Option<Value>) -> Inst {
         self.insts.push(InstData { op, result, loc: 0 });
         Inst(self.insts.len() as u32 - 1)
     }
 
-    /// The operation of the last instruction of `block`.
     pub(crate) fn last(&self, block: Block) -> Option<&Op> {
-        self.blocks[block.index()].insts.last().map(|inst| &self.insts[inst.index()].op)
+        self.blocks[block.index()]
+            .insts
+            .last()
+            .map(|inst| &self.insts[inst.index()].op)
     }
 
-    /// The blocks the last instruction of `block` can go to.
     pub(crate) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + '_ {
         self.last(block).map(Op::targets).into_iter().flatten()
     }
 
-    /// The block that a jump to `block` ends in, past every block that only jumps on and carries no values.
     pub(crate) fn jump_target(&self, mut block: Block) -> Block {
         for _ in 0..self.blocks.len() {
             let data = &self.blocks[block.index()];
@@ -662,12 +485,15 @@ impl Function {
         block
     }
 
-    /// The source location of the first located instruction, which code with no location of its own reports.
     pub(crate) fn home_loc(&self) -> u64 {
-        self.blocks.iter().flat_map(|block| &block.insts).map(|inst| self.insts[inst.index()].loc).find(|&loc| loc != 0).unwrap_or(0)
+        self.blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .map(|inst| self.insts[inst.index()].loc)
+            .find(|&loc| loc != 0)
+            .unwrap_or(0)
     }
 
-    /// Inserts a constant in the entry block so loop-invariant register allocation can hoist it out of loops.
     pub(crate) fn entry_const(&mut self, imm: i64, ty: Type) -> Option<Value> {
         let entry = self.entry?;
         let val = self.value(ty);
@@ -687,7 +513,12 @@ impl Function {
         self.blocks
             .iter()
             .flat_map(|b| &b.insts)
-            .filter(|i| !matches!(self.insts[i.index()].op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::SlotAddr(_)))
+            .filter(|i| {
+                !matches!(
+                    self.insts[i.index()].op,
+                    Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::SlotAddr(_)
+                )
+            })
             .count()
     }
 
@@ -695,38 +526,52 @@ impl Function {
     pub fn can_inline(&self) -> bool {
         self.coroutine.is_none()
             && self.entry.is_some()
-            && !self.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(self.insts[i.index()].op, Op::TryCall { .. } | Op::FramePointer))
+            && !self.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                matches!(
+                    self.insts[i.index()].op,
+                    Op::TryCall { .. } | Op::FramePointer
+                )
+            })
     }
 
     /// Whether any instruction in this body returns to its caller.
     pub fn has_return(&self) -> bool {
-        self.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(self.insts[i.index()].op, Op::Return(_)))
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(self.insts[i.index()].op, Op::Return(_)))
     }
 
-    /// For each value, the block that defines it.
     pub(crate) fn def_blocks(&self) -> Vec<Option<Block>> {
         let mut defs = vec![None; self.types.len()];
         for (index, block) in self.blocks.iter().enumerate() {
             let here = Some(Block(index as u32));
-            block.params.iter().for_each(|value| defs[value.index()] = here);
+            block
+                .params
+                .iter()
+                .for_each(|value| defs[value.index()] = here);
             for inst in &block.insts {
-                crate::live::results(&self.insts[inst.index()]).for_each(|value| defs[value.index()] = here);
+                crate::live::results(&self.insts[inst.index()])
+                    .for_each(|value| defs[value.index()] = here);
             }
         }
         defs
     }
 
-    /// The number of instruction operand reads of each value.
     pub(crate) fn use_counts(&self) -> Vec<u32> {
         let mut uses = vec![0_u32; self.types.len()];
         for inst in self.blocks.iter().flat_map(|block| &block.insts) {
-            self.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
+            self.insts[inst.index()]
+                .op
+                .for_operands(|value| uses[value.index()] += 1);
         }
         uses
     }
 
-    /// Resolves each value derived from a stack slot plus constant offsets, returning `(slot_offsets, addr_insts)`.
-    pub(crate) fn slot_offsets(&self, eval_const: impl Fn(Value) -> Option<i64>) -> (Vec<Option<(StackSlot, i64)>>, Vec<(Inst, StackSlot)>) {
+    pub(crate) fn slot_offsets(
+        &self,
+        eval_const: impl Fn(Value) -> Option<i64>,
+    ) -> (Vec<Option<(StackSlot, i64)>>, Vec<(Inst, StackSlot)>) {
         let mut addrs = vec![None; self.types.len()];
         if self.slots.is_empty() {
             return (addrs, Vec::new());
@@ -753,13 +598,22 @@ impl Function {
             let before = adds.len();
             adds.retain(|&(inst, result, x, c)| {
                 let imm_of = |v: Value| consts[v.index()].or_else(|| eval_const(v));
-                let Some(((slot, base), imm)) = addrs[x.index()].zip(imm_of(c)).or_else(|| addrs[c.index()].zip(imm_of(x))) else { return true };
-                let Some(offset) = base.checked_add(imm) else { return true };
+                let Some(((slot, base), imm)) = addrs[x.index()]
+                    .zip(imm_of(c))
+                    .or_else(|| addrs[c.index()].zip(imm_of(x)))
+                else {
+                    return true;
+                };
+                let Some(offset) = base.checked_add(imm) else {
+                    return true;
+                };
                 addrs[result.index()] = Some((slot, offset));
                 addr_insts.push((inst, slot));
                 false
             });
-            if adds.len() == before { return (addrs, addr_insts); }
+            if adds.len() == before {
+                return (addrs, addr_insts);
+            }
         }
     }
 }
@@ -768,13 +622,27 @@ impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "function {:?}", self.signature)?;
         for (index, block) in self.blocks.iter().enumerate() {
-            let params: Vec<String> = block.params.iter().map(|v| format!("v{}: {:?}", v.0, self.ty(*v))).collect();
+            let params: Vec<String> = block
+                .params
+                .iter()
+                .map(|v| format!("v{}: {:?}", v.0, self.ty(*v)))
+                .collect();
             writeln!(f, "block{index}({}):", params.join(", "))?;
             for inst in &block.insts {
                 let data = &self.insts[inst.index()];
                 match data.result {
-                    Some(value) if self.is_unpredictable(value) => writeln!(f, "    v{}: {:?} = {:?} unpredictable", value.0, self.ty(value), data.op)?,
-                    Some(value) => writeln!(f, "    v{}: {:?} = {:?}", value.0, self.ty(value), data.op)?,
+                    Some(value) if self.is_unpredictable(value) => {
+                        writeln!(
+                            f,
+                            "    v{}: {:?} = {:?} unpredictable",
+                            value.0,
+                            self.ty(value),
+                            data.op
+                        )?;
+                    }
+                    Some(value) => {
+                        writeln!(f, "    v{}: {:?} = {:?}", value.0, self.ty(value), data.op)?;
+                    }
                     None => writeln!(f, "    {:?}", data.op)?,
                 }
             }

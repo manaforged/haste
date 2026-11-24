@@ -1,269 +1,30 @@
-use crate::cfg::Cfg;
+mod order;
+
+pub(crate) use order::{
+    cold, cold_and_detours, copied_tests, has_regular_call, order, quick_order,
+};
+
 use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, TargetOpId, Value};
 
 /// Whether the instruction at `pos` of `insts` takes the carry out of the `adc` or `sbb` just before it on the same operands, so it reads only the flags.
 pub(crate) fn carry_out_of_pair(func: &Function, insts: &[Inst], pos: usize) -> bool {
-    let Some(prev) = pos.checked_sub(1) else { return false };
-    match (&func.insts[insts[prev].index()].op, &func.insts[insts[pos].index()].op) {
-        (Op::TargetOp(TargetOpId::X64AddCarry, sum), Op::TargetOp(TargetOpId::X64AddCarryOut, out))
-        | (Op::TargetOp(TargetOpId::X64SubBorrow, sum), Op::TargetOp(TargetOpId::X64SubBorrowOut, out)) => sum.as_slice() == out.as_slice(),
-        _ => false,
-    }
-}
-
-pub(crate) fn cold(func: &Function) -> Vec<bool> {
-    let cfg = func.cfg();
-    cold_with(func, &cfg)
-}
-
-fn cold_with(func: &Function, cfg: &Cfg) -> Vec<bool> {
-    let mut cold = vec![true; func.blocks.len()];
-    let mut work = Vec::new();
-    for b in 0..func.blocks.len() {
-        let block = Block(b as u32);
-        if matches!(func.last(block), Some(Op::Return(_))) {
-            cold[b] = false;
-            work.push(block);
-        }
-    }
-    while let Some(block) = work.pop() {
-        for &pred in cfg.preds_of(block) {
-            if std::mem::replace(&mut cold[pred.index()], false) {
-                work.push(pred);
-            }
-        }
-    }
-    if let Some(entry) = func.entry {
-        cold[entry.index()] = false;
-    }
-    cold
-}
-
-pub(crate) fn has_regular_call(func: &Function, block: Block) -> bool {
-    func.blocks[block.index()].insts.iter().any(|&inst| match &func.insts[inst.index()].op {
-        Op::Call { callee, .. } | Op::TryCall { callee, .. } => !func.is_thread_cell(*callee),
-        _ => false,
-    })
-}
-
-fn has_caller_loc_call(func: &Function, zeros: &[bool], block: Block) -> bool {
-    !zeros.is_empty()
-        && func.blocks[block.index()]
-            .insts
-            .iter()
-            .any(|&inst| func.caller_loc_result(&func.insts[inst.index()].op, |v| zeros[v.index()]).is_some())
-}
-
-fn has_atomic_rmw(func: &Function, block: Block) -> bool {
-    func.blocks[block.index()].insts.iter().any(|&inst| matches!(func.insts[inst.index()].op, Op::AtomicCas(..) | Op::AtomicRmw(..)))
-}
-
-fn arm_has_atomic_call_detour(func: &Function, cfg: &Cfg, arm: Block, stop: Block) -> bool {
-    if !has_atomic_rmw(func, arm) {
+    let Some(prev) = pos.checked_sub(1) else {
         return false;
-    }
-    let mut visited = [arm; 16];
-    let mut len = 1;
-    let mut stack = vec![arm];
-    while let Some(cur) = stack.pop() {
-        for s in func.successors(cur) {
-            if s == stop || !cfg.dominates(arm, s) {
-                continue;
-            }
-            if has_regular_call(func, s) {
-                return true;
-            }
-            if len < visited.len() && !visited[..len].contains(&s) {
-                visited[len] = s;
-                len += 1;
-                stack.push(s);
-            }
-        }
-    }
-    false
-}
-
-fn arm_inevitably_calls(func: &Function, cfg: &Cfg, cold: &[bool], (root, cur, stop, depth): (Block, Block, Option<Block>, u8)) -> bool {
-    if has_regular_call(func, cur) {
-        return true;
-    }
-    if depth >= 3 {
-        return false;
-    }
-    match func.last(cur) {
-        Some(&Op::Jump(t, _)) if Some(t) != stop && t != cur && cfg.dominates(root, t) => {
-            cold[t.index()] || arm_inevitably_calls(func, cfg, cold, (root, t, stop, depth + 1))
-        }
-        Some(&Op::Brif(_, t, _, e, _)) if t != e => [t, e].into_iter().all(|s| {
-            Some(s) != stop && s != cur && cfg.dominates(root, s) && (cold[s.index()] || arm_inevitably_calls(func, cfg, cold, (root, s, stop, depth + 1)))
-        }),
+    };
+    match (
+        &func.insts[insts[prev].index()].op,
+        &func.insts[insts[pos].index()].op,
+    ) {
+        (
+            Op::TargetOp(TargetOpId::X64AddCarry, sum),
+            Op::TargetOp(TargetOpId::X64AddCarryOut, out),
+        )
+        | (
+            Op::TargetOp(TargetOpId::X64SubBorrow, sum),
+            Op::TargetOp(TargetOpId::X64SubBorrowOut, out),
+        ) => sum.as_slice() == out.as_slice(),
         _ => false,
     }
-}
-
-fn call_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops, cold: &[bool], is_latch: &[bool]) -> Vec<bool> {
-    let n = func.blocks.len();
-    let zeros = func.thread_cell_zeros();
-    let mut deferred = vec![false; n];
-    let mut is_head = vec![false; n];
-    loops.list.iter().for_each(|each| is_head[each.head.index()] = true);
-    let mut is_root = vec![false; n];
-    let mut any = false;
-    for b in 0..n {
-        let p = Block(b as u32);
-        let Some(&Op::Brif(_, then, _, otherwise, _)) = func.last(p) else { continue };
-        if then == otherwise {
-            continue;
-        }
-        for (arm, other) in [(then, otherwise), (otherwise, then)] {
-            let direct_rejoin = cfg.preds_of(other).iter().any(|&q| cfg.dominates(arm, q));
-            let jump_rejoin = !direct_rejoin
-                && matches!(func.last(other), Some(&Op::Jump(m, _)) if m != other && cfg.preds_of(m).iter().any(|&q| cfg.dominates(arm, q)));
-            let fast_ret = !direct_rejoin
-                && !jump_rejoin
-                && matches!(func.last(other), Some(Op::Return(_)))
-                && !has_regular_call(func, other)
-                && !has_caller_loc_call(func, &zeros, other);
-            let rejoins = direct_rejoin || jump_rejoin || fast_ret;
-            let stop = if direct_rejoin {
-                Some(other)
-            } else if let Some(&Op::Jump(m, _)) = func.last(other).filter(|_| jump_rejoin) {
-                Some(m)
-            } else {
-                None
-            };
-            let arm_calls = arm_inevitably_calls(func, cfg, cold, (arm, arm, stop, 0))
-                || (direct_rejoin && arm_has_atomic_call_detour(func, cfg, arm, other));
-            let colder = (arm_calls && (direct_rejoin || !has_regular_call(func, other)))
-                || (has_caller_loc_call(func, &zeros, arm) && (direct_rejoin || !has_caller_loc_call(func, &zeros, other)));
-            if Some(arm) == func.entry
-                || cold[arm.index()]
-                || cold[other.index()]
-                || is_head[arm.index()]
-                || is_latch[arm.index()]
-                || cfg.single_pred(arm) != Some(p)
-                || loops.depth_of(other) < loops.depth_of(arm)
-                || !colder
-                || !rejoins
-                || loops.list.iter().any(|l| l.body[b] && l.latches.iter().any(|&lt| cfg.dominates(arm, lt)))
-            {
-                continue;
-            }
-            is_root[arm.index()] = true;
-            any = true;
-        }
-    }
-    if any {
-        for b in 0..n {
-            let mut cur = Some(Block(b as u32));
-            while let Some(c) = cur {
-                if is_root[c.index()] {
-                    deferred[b] = true;
-                    break;
-                }
-                cur = cfg.idom[c.index()].filter(|&d| d != c);
-            }
-        }
-    }
-    deferred
-}
-
-/// Returns `(cold, deferred)` blocks for `func` using precomputed `cfg` and `loops`.
-pub(crate) fn cold_and_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::Loops) -> (Vec<bool>, Vec<bool>) {
-    let cold = cold_with(func, cfg);
-    let mut is_latch = vec![false; func.blocks.len()];
-    loops.list.iter().flat_map(|each| &each.latches).for_each(|latch| is_latch[latch.index()] = true);
-    let deferred = call_detours(func, cfg, loops, &cold, &is_latch);
-    (cold, deferred)
-}
-
-/// Fast reverse-postorder block layout for `Effort::Quick`, skipping CFG dominators, loops, and cold-block partitioning.
-pub(crate) fn quick_order(func: &Function) -> Vec<Block> {
-    let Some(entry) = func.entry else { return Vec::new() };
-    let n = func.blocks.len();
-    let mut visited = vec![false; n];
-    let mut post = Vec::with_capacity(n);
-    let mut stack = vec![(entry, false)];
-    while let Some((block, done)) = stack.pop() {
-        if done {
-            post.push(block);
-            continue;
-        }
-        if std::mem::replace(&mut visited[block.index()], true) {
-            continue;
-        }
-        stack.push((block, true));
-        for succ in func.successors(block) {
-            if !visited[succ.index()] {
-                stack.push((succ, false));
-            }
-        }
-    }
-    post.reverse();
-    post.retain(|block| *block == entry || !func.blocks[block.index()].insts.is_empty());
-    post.extend((0..n as u32).map(Block).filter(|b| !visited[b.index()] && !func.blocks[b.index()].insts.is_empty()));
-    post
-}
-
-pub(crate) fn order(func: &Function) -> Vec<Block> {
-    let Some(entry) = func.entry else { return Vec::new() };
-    let cfg = func.cfg();
-    let loops = cfg.loops();
-    let cold = cold_with(func, &cfg);
-    let mut is_latch = vec![false; func.blocks.len()];
-    loops.list.iter().flat_map(|each| &each.latches).for_each(|latch| is_latch[latch.index()] = true);
-    let deferred = call_detours(func, &cfg, loops, &cold, &is_latch);
-    let is_cold = |block: Block| cold[block.index()] || deferred[block.index()];
-    let mut visited = vec![false; func.blocks.len()];
-    let mut post = Vec::with_capacity(func.blocks.len());
-    let mut stack = vec![(entry, false)];
-    while let Some((block, done)) = stack.pop() {
-        if done {
-            post.push(block);
-            continue;
-        }
-        if std::mem::replace(&mut visited[block.index()], true) {
-            continue;
-        }
-        stack.push((block, true));
-        let mut succs: Vec<Block> = func.successors(block).filter(|succ| !visited[succ.index()]).collect();
-        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), loops.depth_of(succ), is_latch[succ.index()])));
-        for succ in succs {
-            stack.push((succ, false));
-        }
-    }
-    post.reverse();
-    let mut order = post;
-    let mut placed = vec![false; func.blocks.len()];
-    order.iter().for_each(|block| placed[block.index()] = true);
-    order.retain(|block| *block == entry || !func.blocks[block.index()].insts.is_empty());
-    order.extend((0..func.blocks.len() as u32).map(Block).filter(|block| !placed[block.index()] && !func.blocks[block.index()].insts.is_empty()));
-    let mut hot = Vec::with_capacity(order.len());
-    let mut cold = Vec::new();
-    for block in order {
-        if is_cold(block) {
-            cold.push(block);
-        } else {
-            hot.push(block);
-        }
-    }
-    hot.extend(cold);
-    hot
-}
-
-const TEST_LIMIT: usize = 4;
-
-pub(crate) fn copied_tests(func: &Function, order: &[Block]) -> Vec<bool> {
-    let rank = Cfg::ranks(order, func.blocks.len());
-    let mut copied = vec![false; func.insts.len()];
-    for (at, &latch) in order.iter().enumerate() {
-        let Some(&last) = func.blocks[latch.index()].insts.last() else { continue };
-        let Op::Jump(head, _) = func.insts[last.index()].op else { continue };
-        let insts = &func.blocks[head.index()].insts;
-        let calls = insts.iter().any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. }));
-        copied[last.index()] = rank[head.index()] < at && insts.len() <= TEST_LIMIT && !calls && matches!(func.last(head), Some(Op::Brif(..)));
-    }
-    copied
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,8 +54,13 @@ pub(crate) struct Elided<'a> {
     pub elided: &'a [bool],
 }
 
+fn is_elided(data: &InstData, eff: Elided<'_>) -> bool {
+    data.result
+        .is_some_and(|res| eff.elided.get(res.index()) == Some(&true))
+}
+
 pub(crate) fn for_effective_operands(data: &InstData, eff: Elided<'_>, mut f: impl FnMut(Value)) {
-    if data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
+    if is_elided(data, eff) {
         return;
     }
     let visit_mode = |mode: Sib, f: &mut dyn FnMut(Value)| {
@@ -303,15 +69,28 @@ pub(crate) fn for_effective_operands(data: &InstData, eff: Elided<'_>, mut f: im
         }
         f(mode.index);
     };
-    if let Some(mode) = data.result.and_then(|res| eff.sib.get(res.index()).copied().flatten()) {
+    if let Some(mode) = data
+        .result
+        .and_then(|res| eff.sib.get(res.index()).copied().flatten())
+    {
         visit_mode(mode, &mut f);
         return;
     }
-    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match eff.sib.get(addr.index()).copied().flatten() {
+    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match eff
+        .sib
+        .get(addr.index())
+        .copied()
+        .flatten()
+    {
         Some(mode) => visit_mode(mode, f),
         None => f(addr),
     };
-    let visit_atomic = |addr: Value, f: &mut dyn FnMut(Value)| match eff.atomic_base.get(addr.index()).copied().flatten() {
+    let visit_atomic = |addr: Value, f: &mut dyn FnMut(Value)| match eff
+        .atomic_base
+        .get(addr.index())
+        .copied()
+        .flatten()
+    {
         Some(base) => f(base),
         None => f(addr),
     };
@@ -366,12 +145,18 @@ impl Live {
     }
 
     pub(crate) fn total_len(&self, value: usize) -> u64 {
-        self.ranges_of(value).iter().map(|r| u64::from(r.end - r.start) + 1).sum::<u64>().max(1)
+        self.ranges_of(value)
+            .iter()
+            .map(|r| u64::from(r.end - r.start) + 1)
+            .sum::<u64>()
+            .max(1)
     }
 }
 
 pub(crate) fn overlaps(a: &[Range], b: &[Range]) -> bool {
-    let (Some(a_last), Some(b_last)) = (a.last(), b.last()) else { return false };
+    let (Some(a_last), Some(b_last)) = (a.last(), b.last()) else {
+        return false;
+    };
     if a_last.end < b[0].start || b_last.end < a[0].start {
         return false;
     }
@@ -392,7 +177,9 @@ pub(crate) fn overlaps(a: &[Range], b: &[Range]) -> bool {
 pub(crate) fn covers(outer: &[Range], inner: &[Range]) -> bool {
     inner.iter().all(|r| {
         let at = outer.partition_point(|o| o.end < r.start);
-        outer.get(at).is_some_and(|o| o.start <= r.start && r.end <= o.end)
+        outer
+            .get(at)
+            .is_some_and(|o| o.start <= r.start && r.end <= o.end)
     })
 }
 
@@ -406,7 +193,10 @@ impl BitMatrix {
     /// Allocates an all-zero matrix with `rows` rows and `cols` columns.
     pub(crate) fn new(rows: usize, cols: usize) -> Self {
         let words = cols.div_ceil(64);
-        Self { words, bits: vec![0; rows * words] }
+        Self {
+            words,
+            bits: vec![0; rows * words],
+        }
     }
 
     /// Returns the number of 64-bit words per row.
@@ -489,17 +279,29 @@ impl Iterator for SetBits<'_> {
 pub(crate) fn set_bits(words: &[u64]) -> SetBits<'_> {
     match words.split_first() {
         Some((&cur, rest)) => SetBits { rest, base: 0, cur },
-        None => SetBits { rest: &[], base: 0, cur: 0 },
+        None => SetBits {
+            rest: &[],
+            base: 0,
+            cur: 0,
+        },
     }
 }
 
 /// Solves backward block liveness `in[b] = gen_sets[b] | (union_succ(in) & !kill_sets[b])` to a fixpoint.
-pub(crate) fn solve_backward_liveness<I>(func: &Function, blocks: I, gen_sets: &BitMatrix, kill_sets: &BitMatrix) -> BitMatrix
+pub(crate) fn solve_backward_liveness<I>(
+    func: &Function,
+    blocks: I,
+    gen_sets: &BitMatrix,
+    kill_sets: &BitMatrix,
+) -> BitMatrix
 where
     I: Clone + DoubleEndedIterator<Item = Block>,
 {
     let words = gen_sets.words();
-    let mut live = BitMatrix { words, bits: vec![0; func.blocks.len() * words] };
+    let mut live = BitMatrix {
+        words,
+        bits: vec![0; func.blocks.len() * words],
+    };
     let mut out = vec![0_u64; words];
     let mut changed = words > 0;
     while changed {
@@ -508,7 +310,12 @@ where
             let idx = block.index();
             live.fill_succ_union(func, block, &mut out);
             let (gen_row, kill_row) = (gen_sets.row(idx), kill_sets.row(idx));
-            for ((dst, &g), (&o, &k)) in live.row_mut(idx).iter_mut().zip(gen_row).zip(out.iter().zip(kill_row)) {
+            for ((dst, &g), (&o, &k)) in live
+                .row_mut(idx)
+                .iter_mut()
+                .zip(gen_row)
+                .zip(out.iter().zip(kill_row))
+            {
                 let next = g | (o & !k);
                 changed |= *dst != next;
                 *dst = next;
@@ -521,10 +328,12 @@ where
 fn crossing(func: &Function, wanted: &[bool], eff: Elided<'_>) -> (Vec<Option<usize>>, Vec<Value>) {
     let mut location = vec![usize::MAX; func.types.len()];
     for (block, data) in func.blocks.iter().enumerate() {
-        data.params.iter().for_each(|param| location[param.index()] = block);
+        data.params
+            .iter()
+            .for_each(|param| location[param.index()] = block);
         for inst in &data.insts {
             let inst_data = &func.insts[inst.index()];
-            if !inst_data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
+            if !is_elided(inst_data, eff) {
                 results(inst_data).for_each(|result| location[result.index()] = block);
             }
         }
@@ -534,7 +343,10 @@ fn crossing(func: &Function, wanted: &[bool], eff: Elided<'_>) -> (Vec<Option<us
     for (block, data) in func.blocks.iter().enumerate() {
         for inst in &data.insts {
             for_effective_operands(&func.insts[inst.index()], eff, |value| {
-                if wanted[value.index()] && location[value.index()] != block && dense[value.index()].is_none() {
+                if wanted[value.index()]
+                    && location[value.index()] != block
+                    && dense[value.index()].is_none()
+                {
                     dense[value.index()] = Some(values.len());
                     values.push(value);
                 }
@@ -544,7 +356,12 @@ fn crossing(func: &Function, wanted: &[bool], eff: Elided<'_>) -> (Vec<Option<us
     (dense, values)
 }
 
-fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, eff: Elided<'_>) -> (BitMatrix, BitMatrix) {
+fn local_sets(
+    func: &Function,
+    dense: &[Option<usize>],
+    count: usize,
+    eff: Elided<'_>,
+) -> (BitMatrix, BitMatrix) {
     let blocks = func.blocks.len();
     let (mut uses, mut defs) = (BitMatrix::new(blocks, count), BitMatrix::new(blocks, count));
     for (block, data) in func.blocks.iter().enumerate() {
@@ -553,7 +370,7 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, eff: Elide
         }
         for inst in &data.insts {
             let inst = &func.insts[inst.index()];
-            if inst.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
+            if is_elided(inst, eff) {
                 continue;
             }
             for_effective_operands(inst, eff, |value| {
@@ -571,7 +388,13 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize, eff: Elide
     (uses, defs)
 }
 
-fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usize, eff: Elided<'_>) -> BitMatrix {
+fn live_in(
+    func: &Function,
+    order: &[Block],
+    dense: &[Option<usize>],
+    count: usize,
+    eff: Elided<'_>,
+) -> BitMatrix {
     let (uses, defs) = local_sets(func, dense, count, eff);
     solve_backward_liveness(func, order.iter().copied(), &uses, &defs)
 }
@@ -586,154 +409,237 @@ fn push_range(out: &mut [Vec<Range>], value: usize, start: u32, end: u32) {
     }
 }
 
-pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[bool], eff: Elided<'_>, preserved_tc: &[bool]) -> Live {
-    let count = func.types.len();
-    let (dense, crossing) = crossing(func, wanted, eff);
-    let live_in = live_in(func, order, &dense, crossing.len(), eff);
-    let mut per_val: Vec<Vec<Range>> = vec![Vec::new(); count];
-    let mut open: Vec<Option<(u32, u32)>> = vec![None; count];
-    let mut touched: Vec<usize> = Vec::new();
-    let mut defs = vec![0; count];
-    let (mut unwinds, mut calls, mut preserved_calls, mut sites) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut at = 0_u32;
-    let mut spans = vec![(0, 0); func.blocks.len()];
-    for &block in order {
-        let index = block.index();
-        let b_start = at;
-        for member in live_in.members(index) {
-            let v = crossing[member].index();
-            open[v] = Some((b_start, b_start));
-            touched.push(v);
+struct LiveScan<'a> {
+    wanted: &'a [bool],
+    eff: Elided<'a>,
+    per_val: Vec<Vec<Range>>,
+    open: Vec<Option<(u32, u32)>>,
+    touched: Vec<usize>,
+    defs: Vec<u32>,
+    unwinds: Vec<u32>,
+    calls: Vec<u32>,
+    preserved_calls: Vec<u32>,
+    sites: Vec<(Inst, Block)>,
+    at: u32,
+}
+
+impl<'a> LiveScan<'a> {
+    fn new(count: usize, wanted: &'a [bool], eff: Elided<'a>) -> Self {
+        Self {
+            wanted,
+            eff,
+            per_val: vec![Vec::new(); count],
+            open: vec![None; count],
+            touched: Vec::new(),
+            defs: vec![0; count],
+            unwinds: Vec::new(),
+            calls: Vec::new(),
+            preserved_calls: Vec::new(),
+            sites: Vec::new(),
+            at: 0,
         }
-        for &param in &func.blocks[index].params {
-            let p = param.index();
-            defs[p] = b_start;
-            if wanted[p] && open[p].is_none() {
-                open[p] = Some((b_start, b_start));
-                touched.push(p);
+    }
+
+    fn use_val(&mut self, value: Value, b_start: u32) {
+        let v = value.index();
+        if !self.wanted[v] {
+            return;
+        }
+        match self.open[v] {
+            Some((s, e)) => self.open[v] = Some((s, e.max(self.at))),
+            None => {
+                self.open[v] = Some((b_start, self.at));
+                self.touched.push(v);
             }
         }
-        let use_val = |value: Value, pos: u32, open: &mut [Option<(u32, u32)>], touched: &mut Vec<usize>| {
-            let v = value.index();
-            if !wanted[v] {
-                return;
-            }
-            match open[v] {
-                Some((s, e)) => open[v] = Some((s, e.max(pos))),
-                None => {
-                    open[v] = Some((b_start, pos));
-                    touched.push(v);
-                }
-            }
-        };
-        let def_val = |result: Value, pos: u32, primary: bool, defs: &mut [u32], open: &mut [Option<(u32, u32)>], touched: &mut Vec<usize>, per_val: &mut [Vec<Range>]| {
-            let r = result.index();
-            if primary {
-                defs[r] = pos;
-            }
-            if !wanted[r] {
-                return;
-            }
-            if let Some((s, e)) = open[r] {
-                if e < pos {
-                    push_range(per_val, r, s, e);
-                    open[r] = Some((pos, pos));
-                } else {
-                    open[r] = Some((s, e.max(pos)));
-                }
+    }
+
+    fn def_val(&mut self, result: Value, primary: bool) {
+        let r = result.index();
+        if primary {
+            self.defs[r] = self.at;
+        }
+        if !self.wanted[r] {
+            return;
+        }
+        if let Some((s, e)) = self.open[r] {
+            if e < self.at {
+                push_range(&mut self.per_val, r, s, e);
+                self.open[r] = Some((self.at, self.at));
             } else {
-                open[r] = Some((pos, pos));
-                touched.push(r);
+                self.open[r] = Some((s, e.max(self.at)));
             }
-        };
+        } else {
+            self.open[r] = Some((self.at, self.at));
+            self.touched.push(r);
+        }
+    }
+
+    fn scan_copied_head(&mut self, func: &Function, head: Block, args: &[Value], b_start: u32) {
+        let eff = self.eff;
+        self.at += 1;
+        for &arg in args {
+            self.use_val(arg, b_start);
+        }
+        self.at += 1;
+        for &param in &func.blocks[head.index()].params {
+            self.def_val(param, false);
+        }
+        for &h_inst in &func.blocks[head.index()].insts {
+            let h_data = &func.insts[h_inst.index()];
+            if is_elided(h_data, eff) {
+                continue;
+            }
+            self.at += 1;
+            for_effective_operands(h_data, eff, |v| self.use_val(v, b_start));
+            self.at += 1;
+            results(h_data).for_each(|r| self.def_val(r, false));
+        }
+    }
+
+    fn scan_call(
+        &mut self,
+        func: &Function,
+        block: Block,
+        insts: &[Inst],
+        place: usize,
+        preserved_tc: &[bool],
+        b_start: u32,
+    ) {
+        let inst = insts[place];
+        let data = &func.insts[inst.index()];
+        let eff = self.eff;
+        self.at += 1;
+        for_effective_operands(data, eff, |v| self.use_val(v, b_start));
+        self.at += 1;
+        results(data).for_each(|r| self.def_val(r, true));
+        if matches!(data.op, Op::TryCall { .. }) {
+            self.unwinds.push(self.at);
+        }
+        let traps = insts
+            .get(place + 1)
+            .is_some_and(|next| matches!(func.insts[next.index()].op, Op::Trap));
+        if preserved_tc.get(inst.index()) == Some(&true) {
+            self.preserved_calls.push(self.at);
+        } else if !(traps && matches!(data.op, Op::Call { .. })) {
+            self.calls.push(self.at);
+            self.sites.push((inst, block));
+        }
+    }
+
+    fn scan_insts(
+        &mut self,
+        func: &Function,
+        block: Block,
+        copied: &[bool],
+        preserved_tc: &[bool],
+        b_start: u32,
+    ) -> Option<Block> {
+        let eff = self.eff;
         let mut copied_head = None;
-        let insts = &func.blocks[index].insts;
+        let insts = &func.blocks[block.index()].insts;
         for (place, &inst) in insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
+            if is_elided(data, eff) {
                 continue;
             }
             if copied.get(inst.index()) == Some(&true)
                 && let Op::Jump(head, args) = &data.op
             {
-                at += 1;
-                for &arg in args {
-                    use_val(arg, at, &mut open, &mut touched);
-                }
-                at += 1;
-                for &param in &func.blocks[head.index()].params {
-                    def_val(param, at, false, &mut defs, &mut open, &mut touched, &mut per_val);
-                }
-                for &h_inst in &func.blocks[head.index()].insts {
-                    let h_data = &func.insts[h_inst.index()];
-                    if h_data.result.is_some_and(|res| eff.elided.get(res.index()) == Some(&true)) {
-                        continue;
-                    }
-                    at += 1;
-                    for_effective_operands(h_data, eff, |v| use_val(v, at, &mut open, &mut touched));
-                    at += 1;
-                    results(h_data).for_each(|r| def_val(r, at, false, &mut defs, &mut open, &mut touched, &mut per_val));
-                }
+                self.scan_copied_head(func, *head, args, b_start);
                 copied_head = Some(*head);
                 continue;
             }
             if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) {
-                at += 1;
-                for_effective_operands(data, eff, |v| use_val(v, at, &mut open, &mut touched));
-                at += 1;
-                results(data).for_each(|r| def_val(r, at, true, &mut defs, &mut open, &mut touched, &mut per_val));
-                if matches!(data.op, Op::TryCall { .. }) {
-                    unwinds.push(at);
-                }
-                let traps = insts.get(place + 1).is_some_and(|next| matches!(func.insts[next.index()].op, Op::Trap));
-                if preserved_tc.get(inst.index()) == Some(&true) {
-                    preserved_calls.push(at);
-                } else if !(traps && matches!(data.op, Op::Call { .. })) {
-                    calls.push(at);
-                    sites.push((inst, block));
-                }
+                self.scan_call(func, block, insts, place, preserved_tc, b_start);
                 continue;
             }
-            at += 1;
-            let flags_only = carry_out_of_pair(func, insts, place) && func.insts[insts[place - 1].index()].result.is_some_and(|sum| eff.elided.get(sum.index()) != Some(&true));
+            self.at += 1;
+            let flags_only = carry_out_of_pair(func, insts, place)
+                && func.insts[insts[place - 1].index()]
+                    .result
+                    .is_some_and(|sum| eff.elided.get(sum.index()) != Some(&true));
             if !flags_only {
-                for_effective_operands(data, eff, |v| use_val(v, at, &mut open, &mut touched));
+                for_effective_operands(data, eff, |v| self.use_val(v, b_start));
             }
-            at += 1;
-            results(data).for_each(|r| def_val(r, at, true, &mut defs, &mut open, &mut touched, &mut per_val));
+            self.at += 1;
+            results(data).for_each(|r| self.def_val(r, true));
         }
-        at += 1;
-        let b_end = at;
+        copied_head
+    }
+}
+
+pub(crate) fn live(
+    func: &Function,
+    order: &[Block],
+    copied: &[bool],
+    wanted: &[bool],
+    eff: Elided<'_>,
+    preserved_tc: &[bool],
+) -> Live {
+    let count = func.types.len();
+    let (dense, crossing) = crossing(func, wanted, eff);
+    let live_in = live_in(func, order, &dense, crossing.len(), eff);
+    let mut scan = LiveScan::new(count, wanted, eff);
+    let mut spans = vec![(0, 0); func.blocks.len()];
+    for &block in order {
+        let index = block.index();
+        let b_start = scan.at;
+        for member in live_in.members(index) {
+            let v = crossing[member].index();
+            scan.open[v] = Some((b_start, b_start));
+            scan.touched.push(v);
+        }
+        for &param in &func.blocks[index].params {
+            let p = param.index();
+            scan.defs[p] = b_start;
+            if wanted[p] && scan.open[p].is_none() {
+                scan.open[p] = Some((b_start, b_start));
+                scan.touched.push(p);
+            }
+        }
+        let copied_head = scan.scan_insts(func, block, copied, preserved_tc, b_start);
+        scan.at += 1;
+        let b_end = scan.at;
         spans[index] = (b_start, b_end);
         let exit_block = copied_head.unwrap_or(Block(index as u32));
         for next in func.successors(exit_block) {
             for member in live_in.members(next.index()) {
                 let v = crossing[member].index();
-                match open[v] {
-                    Some((s, _)) => open[v] = Some((s, b_end)),
+                match scan.open[v] {
+                    Some((s, _)) => scan.open[v] = Some((s, b_end)),
                     None => {
-                        open[v] = Some((b_start, b_end));
-                        touched.push(v);
+                        scan.open[v] = Some((b_start, b_end));
+                        scan.touched.push(v);
                     }
                 }
             }
         }
-        for v in touched.drain(..) {
-            if let Some((s, e)) = open[v].take() {
-                push_range(&mut per_val, v, s, e);
+        for v in scan.touched.drain(..) {
+            if let Some((s, e)) = scan.open[v].take() {
+                push_range(&mut scan.per_val, v, s, e);
             }
         }
-        at += 1;
+        scan.at += 1;
     }
     let mut ranges = Vec::new();
     let mut slice = Vec::with_capacity(count);
-    for list in per_val {
+    for list in scan.per_val {
         let off = ranges.len() as u32;
         let len = list.len() as u32;
         ranges.extend(list);
         slice.push((off, len));
     }
-    Live { ranges, slice, defs, unwinds, calls, preserved_calls, sites, spans }
+    Live {
+        ranges,
+        slice,
+        defs: scan.defs,
+        unwinds: scan.unwinds,
+        calls: scan.calls,
+        preserved_calls: scan.preserved_calls,
+        sites: scan.sites,
+        spans,
+    }
 }
 
 pub(crate) fn results(data: &InstData) -> impl Iterator<Item = Value> + '_ {
