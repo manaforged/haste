@@ -195,6 +195,14 @@ impl Emit<'_> {
         ) else {
             return false;
         };
+        if ty == Type::I64 && start > 0 && u32::from(start) + u32::from(len) == 32 {
+            self.raw(dst, src);
+            self.asm.shift_imm(Size::D, Shift::Shr, dst, start);
+            if self.plan.fused[result.index()] {
+                self.flags = Some((result, Cond::Ne));
+            }
+            return true;
+        }
         let size = if ty == Type::I32 { Size::D } else { Size::Q };
         let ctrl = i64::from(start) | (i64::from(len) << 8);
         let source = if (matches!(self.location(src), Location::Reg(_) | Location::Slot)
