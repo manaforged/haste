@@ -14,6 +14,22 @@ pub(super) use x64::{emit_x64_catch_unwind, emit_x64_start_panic};
 
 /// Byte offset of `stop_fp` inside the AOT `catch_unwind` frame record.
 pub(super) const STOP_FP_OFFSET: u32 = 0x20;
+/// Byte offset of the callee-saved register buffer pointer inside the AOT unwind context.
+pub(super) const REGS_PTR_OFFSET: u32 = 0x28;
+/// Byte size of one function record in the AOT unwind table (`start, end, drop_start, drop_count, saved_regs`).
+pub(crate) const UNWIND_FN_REC_BYTES: usize = 20;
+
+fn scale_fn_rec_index(
+    b: &mut FunctionBuilder<'_>,
+    idx: haste_codegen::Value,
+    c4: haste_codegen::Value,
+    c2: haste_codegen::Value,
+) -> haste_codegen::Value {
+    const _: () = assert!(UNWIND_FN_REC_BYTES == (1 << 4) + (1 << 2));
+    let b16 = b.ins().ishl(idx, c4);
+    let b4 = b.ins().ishl(idx, c2);
+    b.ins().iadd(b16, b4)
+}
 
 /// Compiles and appends the native frame-table unwind walker `fn(cur_fp, stop_fp, text_base, table_ptr)`.
 pub(super) fn emit_walk(arch: Arch, os: Os, out: &mut Buf) -> Result<()> {
@@ -109,7 +125,7 @@ fn build_unwind_walk() -> Function {
     let state_ptr = b.ins().load(Type::I64, frame_ptr, 0);
     let mark = b.ins().load(Type::I64, frame_ptr, 8);
     let stop_fp = b.ins().load(Type::I64, frame_ptr, STOP_FP_OFFSET as i32);
-    let raw_regs_ptr = b.ins().load(Type::I64, frame_ptr, 40);
+    let raw_regs_ptr = b.ins().load(Type::I64, frame_ptr, REGS_PTR_OFFSET as i32);
     let zero = b.ins().iconst(Type::I64, 0);
     let c1 = b.ins().iconst(Type::I64, 1);
     let c2 = b.ins().iconst(Type::I64, 2);
@@ -134,9 +150,7 @@ fn build_unwind_walk() -> Function {
     let t_sites = b.ins().load(Type::I64, table_ptr, 8);
     let t_sites_off = b.ins().load(Type::I64, table_ptr, 16);
     let t_recs = b.ins().iadd_imm(table_ptr, 24);
-    let fn_b16 = b.ins().ishl(t_count, c4);
-    let fn_b4 = b.ins().ishl(t_count, c2);
-    let fn_bytes = b.ins().iadd(fn_b16, fn_b4);
+    let fn_bytes = scale_fn_rec_index(&mut b, t_count, c4, c2);
     let t_drops = b.ins().iadd(t_recs, fn_bytes);
     let t_sites_base = b.ins().iadd(table_ptr, t_sites_off);
     b.ins().jump(
@@ -323,9 +337,7 @@ fn build_unwind_walk() -> Function {
     let diff = b.ins().isub(hi, lo);
     let half = b.ins().ushr(diff, c1);
     let mid = b.ins().iadd(lo, half);
-    let rec_off16 = b.ins().ishl(mid, c4);
-    let rec_off4 = b.ins().ishl(mid, c2);
-    let rec_off = b.ins().iadd(rec_off16, rec_off4);
+    let rec_off = scale_fn_rec_index(&mut b, mid, c4, c2);
     let rec_ptr = b.ins().iadd(fn_recs, rec_off);
     let start32 = b.ins().load(Type::I32, rec_ptr, 0);
     let fn_start = b.ins().uextend(Type::I64, start32);

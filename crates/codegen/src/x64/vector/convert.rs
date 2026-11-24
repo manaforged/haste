@@ -28,27 +28,15 @@ impl Emit<'_> {
         match (op, fl, tl) {
             (Convert::FromSint, Lane::I32, Lane::F32) => {
                 let src = self.fin(x, dst);
-                if self.features.avx {
-                    self.asm.vex_xmm(0b00001, 0b00, 0x5B, (dst, Xmm(0)), src);
-                } else {
-                    self.asm.sse(&[], &[0x0F, 0x5B], dst.0, src);
-                }
+                self.sse_or_vex_unary(&[], &[0x0F, 0x5B], dst, src);
             }
             (Convert::Fpromote, Lane::F32, Lane::F64) => {
                 let src = self.fin(x, dst);
-                if self.features.avx {
-                    self.asm.vex_xmm(0b00001, 0b00, 0x5A, (dst, Xmm(0)), src);
-                } else {
-                    self.asm.sse(&[], &[0x0F, 0x5A], dst.0, src);
-                }
+                self.sse_or_vex_unary(&[], &[0x0F, 0x5A], dst, src);
             }
             (Convert::Fdemote, Lane::F64, Lane::F32) => {
                 let src = self.fin(x, dst);
-                if self.features.avx {
-                    self.asm.vex_xmm(0b00001, 0b01, 0x5A, (dst, Xmm(0)), src);
-                } else {
-                    self.asm.sse(&[0x66], &[0x0F, 0x5A], dst.0, src);
-                }
+                self.sse_or_vex_unary(&[0x66], &[0x0F, 0x5A], dst, src);
             }
             (Convert::Uextend | Convert::Sextend, _, _)
                 if self.features.sse41 && fl.is_int() && tl.is_int() =>
@@ -64,13 +52,7 @@ impl Emit<'_> {
                 };
                 let base = if op == Convert::Sextend { 0x20 } else { 0x30 };
                 let src = self.fin(x, dst);
-                if self.features.avx {
-                    self.asm
-                        .vex_xmm(0b00010, 0b01, base + code, (dst, Xmm(0)), src);
-                } else {
-                    self.asm
-                        .sse(&[0x66], &[0x0F, 0x38, base + code], dst.0, src);
-                }
+                self.sse_or_vex_unary(&[0x66], &[0x0F, 0x38, base + code], dst, src);
             }
             (Convert::NarrowSat { signed }, Lane::I16, Lane::I8) => {
                 let src = self.fin(x, dst);

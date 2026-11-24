@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use haste_codegen::RelocKind;
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::aot::{Executable, Symbol};
+use crate::aot::{Executable, Symbol, UNWIND_FN_REC_BYTES};
 use crate::host::HostSymbol;
 use crate::lower::{RodataTarget, SymbolSource, VtableEntry, VtableId, Word};
 
@@ -466,6 +466,23 @@ pub(super) fn emit_unwind_table(
     let mut seen_dict: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     let mut fns: Vec<(u32, u32, u32, Vec<(i32, i32, u32, u32)>)> = Vec::new();
     let mut sites: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let push_fn = |base_off: u32,
+                   code: &AotCode,
+                   drops: Vec<(i32, i32, u32, u32)>,
+                   sites: &mut Vec<(u32, u32, u32, u32)>,
+                   fns: &mut Vec<(u32, u32, u32, Vec<(i32, i32, u32, u32)>)>| {
+        for s in code.sites() {
+            sites.push((base_off + s.ret, base_off + s.handler, s.frame_offset, 0));
+        }
+        if !drops.is_empty() || code.saved_regs() != 0 {
+            fns.push((
+                base_off,
+                base_off + code.bytes().len() as u32,
+                code.saved_regs(),
+                drops,
+            ));
+        }
+    };
     for &idx in &live.order {
         let leader = canon[roots[idx]];
         if !seen.insert(leader) {
@@ -476,9 +493,6 @@ pub(super) fn emit_unwind_table(
                 let Some(fn_start) = fn_offs.get(leader).copied().flatten() else {
                     continue;
                 };
-                for s in code.sites() {
-                    sites.push((fn_start + s.ret, fn_start + s.handler, s.frame_offset, 0));
-                }
                 let mut drops = Vec::with_capacity(code.unwind_drops().len());
                 for d in code.unwind_drops() {
                     if let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(d.drop_sym as usize)
@@ -487,31 +501,14 @@ pub(super) fn emit_unwind_table(
                         drops.push((d.local_off, d.flag_off, drop_off, u32::from(d.indirect)));
                     }
                 }
-                if !drops.is_empty() || code.saved_regs() != 0 {
-                    fns.push((
-                        fn_start,
-                        fn_start + code.bytes().len() as u32,
-                        code.saved_regs(),
-                        drops,
-                    ));
-                }
+                push_fn(fn_start, code, drops, &mut sites, &mut fns);
             }
             Some(AotFn::Dict { body, .. }) => {
                 let ptr = Arc::as_ptr(body) as usize;
                 if seen_dict.insert(ptr)
                     && let Some(&body_off) = dict_bodies.get(&ptr)
                 {
-                    for s in body.sites() {
-                        sites.push((body_off + s.ret, body_off + s.handler, s.frame_offset, 0));
-                    }
-                    if body.saved_regs() != 0 {
-                        fns.push((
-                            body_off,
-                            body_off + body.bytes().len() as u32,
-                            body.saved_regs(),
-                            Vec::new(),
-                        ));
-                    }
+                    push_fn(body_off, body, Vec::new(), &mut sites, &mut fns);
                 }
             }
             _ => {}
@@ -523,7 +520,7 @@ pub(super) fn emit_unwind_table(
     fns.sort_unstable_by_key(|&(start, _, _, _)| start);
     sites.sort_unstable_by_key(|&(ret, _, _, _)| ret);
     let total_drops: usize = fns.iter().map(|(_, _, _, d)| d.len()).sum();
-    let sites_off = 24 + fns.len() * 20 + total_drops * 16;
+    let sites_off = 24 + fns.len() * UNWIND_FN_REC_BYTES + total_drops * 16;
     let mut buf = Vec::with_capacity(sites_off + sites.len() * 16);
     buf.extend_from_slice(&(fns.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(sites.len() as u64).to_le_bytes());

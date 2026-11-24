@@ -5,7 +5,7 @@ use super::super::shims::{
     Emit, emit_rel_branch, emit_x64_unwind_state, x64_fwd32, x64_jcc, x64_patch8, x64_patch32,
 };
 use super::super::{Buf, SectionAddrs};
-use super::STOP_FP_OFFSET;
+use super::{REGS_PTR_OFFSET, STOP_FP_OFFSET};
 
 /// Emits the x86-64 `catch_unwind` runtime shim.
 pub(in crate::aot) fn emit_x64_catch_unwind(
@@ -258,10 +258,56 @@ pub(in crate::aot) fn emit_x64_start_panic(
         out.bytes(&[0x48, 0x85, 0xC0]);
         let no_state = x64_fwd32(&[0x0F, 0x84], out);
         out.bytes(&[
-            0x48, 0x89, 0xC3, 0x49, 0x8B, 0x46, 0x18, 0x4C, 0x89, 0xE7, 0xFF, 0xD0, 0x49, 0x89,
-            0xC6, 0x49, 0x89, 0xD7, 0x48, 0x89, 0x1C, 0x24, 0x48, 0xC7, 0x44, 0x24, 0x08, 0, 0, 0,
-            0, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0, 0x48, 0x8D, 0x44, 0x24, 0x30, 0x48, 0x89,
-            0x44, 0x24, 0x28,
+            0x48,
+            0x89,
+            0xC3,
+            0x49,
+            0x8B,
+            0x46,
+            0x18,
+            0x4C,
+            0x89,
+            0xE7,
+            0xFF,
+            0xD0,
+            0x49,
+            0x89,
+            0xC6,
+            0x49,
+            0x89,
+            0xD7,
+            0x48,
+            0x89,
+            0x1C,
+            0x24,
+            0x48,
+            0xC7,
+            0x44,
+            0x24,
+            0x08,
+            0,
+            0,
+            0,
+            0,
+            0x48,
+            0xC7,
+            0x44,
+            0x24,
+            STOP_FP_OFFSET as u8,
+            0,
+            0,
+            0,
+            0,
+            0x48,
+            0x8D,
+            0x44,
+            0x24,
+            0x30,
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            REGS_PTR_OFFSET as u8,
         ]);
         emit_x64_walk_call(c, addrs, true, out);
         out.bytes(&[0x48, 0x85, 0xC0]);

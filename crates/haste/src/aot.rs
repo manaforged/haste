@@ -19,6 +19,7 @@ mod wide;
 
 pub(super) use patch::{PatchCtx, Veneers, patch_code, plan_veneers};
 pub(super) use plan::{Plan, resolve_sym};
+pub(crate) use unwind::UNWIND_FN_REC_BYTES;
 
 pub(super) const ELF_BASE: u64 = 0x0040_0000;
 pub(super) const MACH_BASE: u64 = 0x1_0000_0000;

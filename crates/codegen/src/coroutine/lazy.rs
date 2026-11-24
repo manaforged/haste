@@ -15,9 +15,9 @@ pub(super) struct Lazy {
 }
 
 fn slot_in_bounds(func: &Function, slot: StackSlot, off: i64, bytes: u32) -> Option<i32> {
-    let off = i32::try_from(off).ok().filter(|&o| o >= 0)?;
-    let end = u64::from(off as u32).checked_add(u64::from(bytes))?;
-    (end <= u64::from(func.slots[slot.index()].size)).then_some(off)
+    crate::mem::in_range(off, bytes, func.slots[slot.index()].size)
+        .then(|| i32::try_from(off).ok())
+        .flatten()
 }
 
 fn scan_holders(

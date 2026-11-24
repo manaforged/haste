@@ -37,13 +37,16 @@ struct JitUnwindSite {
     frame_offset: usize,
 }
 
+const SAVED_REG_COUNT: usize = 18;
+type SavedRegs = [u64; SAVED_REG_COUNT];
+
 #[repr(C)]
 struct JitLand {
     handler_pc: usize,
     target_fp: usize,
     target_sp: usize,
     payload: *mut u8,
-    regs: [u64; 18],
+    regs: SavedRegs,
 }
 
 #[repr(C)]
@@ -139,7 +142,7 @@ pub(crate) fn register_shared_drops(
     }
 }
 
-fn lookup_jit_frame(call_pc: usize) -> Option<(&'static [JitUnwindDrop], u32)> {
+fn find_jit_node<T>(mut visit: impl FnMut(usize, &SharedUnwindNode) -> Option<T>) -> Option<T> {
     let head = JIT_UNWIND_HEAD.load(Ordering::Acquire);
     if head == 0 {
         return None;
@@ -149,14 +152,8 @@ fn lookup_jit_frame(call_pc: usize) -> Option<(&'static [JitUnwindDrop], u32)> {
         let mut cur = (*(head as *const AtomicUsize)).load(Ordering::Acquire);
         while cur != 0 {
             let node = &*(cur as *const SharedUnwindNode);
-            if node.start <= call_pc && call_pc < node.end {
-                let drops = if node.count > 0 {
-                    let ptr = (cur + size_of::<SharedUnwindNode>()) as *const JitUnwindDrop;
-                    std::slice::from_raw_parts(ptr, node.count)
-                } else {
-                    &[]
-                };
-                return Some((drops, node.saved_regs));
+            if let Some(hit) = visit(cur, node) {
+                return Some(hit);
             }
             cur = node.next;
         }
@@ -164,31 +161,36 @@ fn lookup_jit_frame(call_pc: usize) -> Option<(&'static [JitUnwindDrop], u32)> {
     None
 }
 
-fn lookup_jit_site(ret_pc: usize) -> Option<(usize, usize)> {
-    let head = JIT_UNWIND_HEAD.load(Ordering::Acquire);
-    if head == 0 {
-        return None;
-    }
-    // SAFETY: `head` and every linked `SharedUnwindNode` live in the active image's immutable shared arena.
-    unsafe {
-        let mut cur = (*(head as *const AtomicUsize)).load(Ordering::Acquire);
-        while cur != 0 {
-            let node = &*(cur as *const SharedUnwindNode);
-            if node.site_count > 0 && node.start <= ret_pc && ret_pc <= node.end {
-                let base =
-                    cur + size_of::<SharedUnwindNode>() + node.count * size_of::<JitUnwindDrop>();
-                let slice =
-                    std::slice::from_raw_parts(base as *const JitUnwindSite, node.site_count);
-                for s in slice {
-                    if s.ret_pc == ret_pc {
-                        return Some((s.handler_pc, s.frame_offset));
-                    }
-                }
-            }
-            cur = node.next;
+fn lookup_jit_frame(call_pc: usize) -> Option<(&'static [JitUnwindDrop], u32)> {
+    find_jit_node(|cur, node| {
+        if !(node.start <= call_pc && call_pc < node.end) {
+            return None;
         }
-    }
-    None
+        let drops = if node.count > 0 {
+            let ptr = (cur + size_of::<SharedUnwindNode>()) as *const JitUnwindDrop;
+            // SAFETY: `node.count` `JitUnwindDrop` entries immediately follow `node` in the arena.
+            unsafe { std::slice::from_raw_parts(ptr, node.count) }
+        } else {
+            &[]
+        };
+        Some((drops, node.saved_regs))
+    })
+}
+
+fn lookup_jit_site(ret_pc: usize) -> Option<(usize, usize)> {
+    find_jit_node(|cur, node| {
+        if !(node.site_count > 0 && node.start <= ret_pc && ret_pc <= node.end) {
+            return None;
+        }
+        let base = cur + size_of::<SharedUnwindNode>() + node.count * size_of::<JitUnwindDrop>();
+        // SAFETY: `node.site_count` `JitUnwindSite` entries follow the drops slice in the arena.
+        let slice =
+            unsafe { std::slice::from_raw_parts(base as *const JitUnwindSite, node.site_count) };
+        slice
+            .iter()
+            .find(|s| s.ret_pc == ret_pc)
+            .map(|s| (s.handler_pc, s.frame_offset))
+    })
 }
 
 /// Intrusive stack-allocated cleanup node linked onto the thread's unwind drop list while an owned value is live.
@@ -322,7 +324,7 @@ unsafe fn drain_drops_until(mark: *mut DropNode, limit_addr: usize) {
 ///
 /// # Safety
 /// `fp` must be a live JIT frame pointer matching the layout recorded for `call_pc`.
-unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize, regs: Option<&mut [u64; 18]>) {
+unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize, regs: Option<&mut SavedRegs>) {
     let Some((drops, saved_regs)) = lookup_jit_frame(call_pc) else {
         return;
     };
@@ -370,7 +372,7 @@ unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize, regs: Option<&mut [u64;
 unsafe fn unwind_jit_frames(
     (mut fp, mut ret_pc): (usize, usize),
     (stop_fp, mark): (usize, *mut DropNode),
-    mut regs: Option<&mut [u64; 18]>,
+    mut regs: Option<&mut SavedRegs>,
 ) -> Option<(usize, usize, usize)> {
     while fp != 0 && (stop_fp == 0 || fp < stop_fp) {
         // SAFETY: `fp` and `mark` bound active stack frames between the panic site and the catcher.

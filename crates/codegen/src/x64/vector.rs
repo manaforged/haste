@@ -27,6 +27,38 @@ pub(super) fn vec_alu_opcode(op: Binary, lane: Lane) -> Option<u8> {
     }
 }
 
+/// Whether `op` on `lane` supports an immediate or scalar-broadcast shift count in hardware.
+pub(super) fn uniform_shift_lane(op: Binary, lane: Lane) -> bool {
+    matches!(lane, Lane::I16 | Lane::I32) || (lane == Lane::I64 && op != Binary::Sshr)
+}
+
+/// Returns the scalar value broadcast across all `count` lanes of `v`, if `v` is a splat of a single `Insert`.
+pub(super) fn splat_source_of(
+    func: &crate::ir::Function,
+    defs: &[Option<crate::ir::Inst>],
+    v: Value,
+    count: u8,
+) -> Option<Value> {
+    let inst = defs.get(v.index()).copied().flatten()?;
+    let crate::ir::Op::Shuffle(a, _, crate::ir::ShuffleMask::Const(m)) =
+        &func.insts[inst.index()].op
+    else {
+        return None;
+    };
+    let c = usize::from(count);
+    if !m[..c]
+        .iter()
+        .all(|&idx| idx == m[0] && usize::from(idx) < c)
+    {
+        return None;
+    }
+    let a_inst = defs.get(a.index()).copied().flatten()?;
+    match func.insts[a_inst.index()].op {
+        crate::ir::Op::Insert(_, scalar, idx) if idx == m[0] => Some(scalar),
+        _ => None,
+    }
+}
+
 /// The `0F` opcode that shifts every lane of a `lane` vector by the count in the low quadword of its second operand.
 pub(super) fn shift_count_opcode(op: Binary, lane: Lane) -> u8 {
     match (op, lane) {
@@ -131,6 +163,28 @@ impl Emit<'_> {
             self.asm.movaps(dst, sx);
         }
         self.asm.sse(prefix, opcode, dst.0, sy);
+    }
+
+    pub(super) fn sse_or_vex_unary(&mut self, prefix: &[u8], opcode: &[u8], dst: Xmm, src: Xmm) {
+        let pp = match prefix {
+            [] => Some(0),
+            [0x66] => Some(1),
+            [0xF3] => Some(2),
+            [0xF2] => Some(3),
+            _ => None,
+        };
+        let map_opc = match opcode {
+            [0x0F, o] => Some((1, *o)),
+            [0x0F, 0x38, o] => Some((2, *o)),
+            _ => None,
+        };
+        if self.features.avx
+            && let (Some(pp), Some((map, opc))) = (pp, map_opc)
+        {
+            self.asm.vex_xmm(map, pp, opc, (dst, Xmm(0)), src);
+        } else {
+            self.asm.sse(prefix, opcode, dst.0, src);
+        }
     }
 
     pub(super) fn vex_packed_op(

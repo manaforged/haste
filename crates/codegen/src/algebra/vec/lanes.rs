@@ -408,16 +408,15 @@ fn merge_half_mulhi(cx: &mut RewriteCx, v0: Value, v1: Value) -> Option<Op> {
         lane: Lane::I16,
         count: 8,
     };
-    let wa = if cx.func.ty(sa) == wide_ty {
-        sa
-    } else {
-        cx.emit(wide_ty, Op::Convert(Convert::Bitcast, sa))
+    let bitcast_to = |cx: &mut RewriteCx, v: Value| {
+        if cx.func.ty(v) == wide_ty {
+            v
+        } else {
+            cx.emit(wide_ty, Op::Convert(Convert::Bitcast, v))
+        }
     };
-    let wb = if cx.func.ty(sb) == wide_ty {
-        sb
-    } else {
-        cx.emit(wide_ty, Op::Convert(Convert::Bitcast, sb))
-    };
+    let wa = bitcast_to(cx, sa);
+    let wb = bitcast_to(cx, sb);
     let out = cx.emit(wide_ty, Op::Binary(op, wa, wb));
     Some(Op::Convert(Convert::Bitcast, out))
 }

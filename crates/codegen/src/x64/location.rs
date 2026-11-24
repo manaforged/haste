@@ -14,7 +14,7 @@ use super::asm::{Alu, Asm, Mem, Reg, Rm, Shift, Size, Xmm};
 use crate::alloc::{Location, Plan};
 use crate::fold::fits_imm32;
 use crate::frame::{Emitter, Ext};
-use crate::ir::{Binary, Function, Inst, Lane, Op, ShuffleMask, Type, Value};
+use crate::ir::{Binary, Function, Inst, Op, ShuffleMask, Type, Value};
 use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -507,12 +507,11 @@ pub(super) fn elide_broadcast_inserts(
 }
 
 fn shift_imm_ok(func: &Function, op: Binary, x: Value, y: Value) -> bool {
-    if x == y {
-        return false;
-    }
-    func.ty(y).vec_shape().is_some_and(|(lane, _)| {
-        matches!(lane, Lane::I16 | Lane::I32) || (lane == Lane::I64 && op != Binary::Sshr)
-    })
+    x != y
+        && func
+            .ty(y)
+            .vec_shape()
+            .is_some_and(|(lane, _)| super::vector::uniform_shift_lane(op, lane))
 }
 
 pub(super) fn elide_shift_splats(
@@ -539,29 +538,21 @@ pub(super) fn elide_shift_splats(
         let Some((_, lanes)) = func.types[v].vec_shape() else {
             continue;
         };
-        let Some(def) = defs[v] else {
+        let Some(scalar) = super::vector::splat_source_of(func, defs, Value(v as u32), lanes)
+        else {
             continue;
         };
-        let Op::Shuffle(a, b, ShuffleMask::Const(m)) = func.insts[def.index()].op else {
-            continue;
-        };
-        let c = usize::from(lanes);
-        if !m[..c].iter().all(|&i| i == m[0] && usize::from(i) < c) {
-            continue;
-        }
-        let Some(a_inst) = defs[a.index()] else {
-            continue;
-        };
-        let Op::Insert(_, scalar, idx) = func.insts[a_inst.index()].op else {
-            continue;
-        };
-        if idx != m[0] || plan.const_of(scalar).is_none() {
+        if plan.const_of(scalar).is_none() {
             continue;
         }
         plan.elided[v] = true;
-        let a_reads = 1 + u32::from(b == a);
-        if uses[a.index()] == a_reads {
-            plan.elided[a.index()] = true;
+        if let Some(def) = defs[v]
+            && let Op::Shuffle(a, b, _) = func.insts[def.index()].op
+        {
+            let a_reads = 1 + u32::from(b == a);
+            if uses[a.index()] == a_reads {
+                plan.elided[a.index()] = true;
+            }
         }
     }
 }

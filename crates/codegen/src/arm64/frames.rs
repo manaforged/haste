@@ -112,25 +112,22 @@ pub(super) fn plan_tlv_cache(
     }
     let mut may_known = vec![false; func.blocks.len()];
     let mut work: Vec<usize> = Vec::new();
-    for b in 0..func.blocks.len() {
-        if has_tlv[b] && cfg.reachable[b] {
-            for succ in func.successors(crate::ir::Block(b as u32)) {
-                let si = succ.index();
-                if !may_known[si] {
-                    may_known[si] = true;
-                    work.push(si);
-                }
-            }
-        }
-    }
-    while let Some(u) = work.pop() {
-        for succ in func.successors(crate::ir::Block(u as u32)) {
+    let mut push_succs = |b: usize, work: &mut Vec<usize>| {
+        for succ in func.successors(crate::ir::Block(b as u32)) {
             let si = succ.index();
             if !may_known[si] {
                 may_known[si] = true;
                 work.push(si);
             }
         }
+    };
+    for b in 0..func.blocks.len() {
+        if has_tlv[b] && cfg.reachable[b] {
+            push_succs(b, &mut work);
+        }
+    }
+    while let Some(u) = work.pop() {
+        push_succs(u, &mut work);
     }
     let needs_zero = (0..func.blocks.len())
         .any(|b| has_tlv[b] && cfg.reachable[b] && !dom_known[b] && may_known[b]);

@@ -7,22 +7,23 @@ use super::frontier::{
     sink_frontier_or_solo, solve_liveness,
 };
 
-fn flag_always_zero(
+fn flag_zero_reach(
     func: &Function,
     defs: &[Option<Inst>],
     entry: Block,
     flag: StackSlot,
-) -> (Vec<bool>, Vec<bool>) {
+    entry_is_zero: bool,
+) -> (Vec<u8>, Vec<u8>) {
     let n = func.blocks.len();
     let (mut in_state, mut out_state) = (vec![0u8; n], vec![0u8; n]);
-    in_state[entry.index()] = 1;
-    let mut work = vec![(entry, false)];
-    while let Some((block, mut active)) = work.pop() {
+    in_state[entry.index()] = if entry_is_zero { 1 } else { 2 };
+    let mut work = vec![(entry, entry_is_zero)];
+    while let Some((block, mut known_zero)) = work.pop() {
         let mut stopped = false;
         for &inst in &func.blocks[block.index()].insts {
             match func.insts[inst.index()].op {
-                Op::StackStore(v, s, 0) if s == flag => {
-                    active = !store_clears_active(func, defs, v)
+                Op::StackStore(v, s, off) if s == flag => {
+                    known_zero = off == 0 && store_clears_active(func, defs, v);
                 }
                 Op::Return(..) | Op::Trap => {
                     stopped = true;
@@ -34,15 +35,25 @@ fn flag_always_zero(
         if stopped {
             continue;
         }
-        let bit = if active { 2 } else { 1 };
+        let bit = if known_zero { 1 } else { 2 };
         out_state[block.index()] |= bit;
         for target in func.successors(block) {
             if in_state[target.index()] & bit == 0 {
                 in_state[target.index()] |= bit;
-                work.push((target, active));
+                work.push((target, known_zero));
             }
         }
     }
+    (in_state, out_state)
+}
+
+fn flag_always_zero(
+    func: &Function,
+    defs: &[Option<Inst>],
+    entry: Block,
+    flag: StackSlot,
+) -> (Vec<bool>, Vec<bool>) {
+    let (in_state, out_state) = flag_zero_reach(func, defs, entry, flag, true);
     (
         in_state.iter().map(|&v| v == 1).collect(),
         out_state.iter().map(|&v| v == 1).collect(),
@@ -80,7 +91,6 @@ fn elide_redundant_flag_zeros(
     defs: &[Option<Inst>],
     (is_flag, is_local, slot_escaped): (&[bool], &[bool], &[bool]),
 ) -> bool {
-    let n = func.blocks.len();
     let nslots = func.slots.len();
     let mut dead = vec![false; func.insts.len()];
     let mut any = false;
@@ -89,34 +99,7 @@ fn elide_redundant_flag_zeros(
             continue;
         }
         let flag = StackSlot(fi as u32);
-        let mut in_state = vec![0u8; n];
-        in_state[entry.index()] = 2;
-        let mut work = vec![(entry, false)];
-        while let Some((block, mut known_zero)) = work.pop() {
-            let mut stopped = false;
-            for &inst in &func.blocks[block.index()].insts {
-                match func.insts[inst.index()].op {
-                    Op::StackStore(v, s, off) if s == flag => {
-                        known_zero = off == 0 && store_clears_active(func, defs, v);
-                    }
-                    Op::Return(..) | Op::Trap => {
-                        stopped = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            if stopped {
-                continue;
-            }
-            let bit = if known_zero { 1 } else { 2 };
-            for target in func.successors(block) {
-                if in_state[target.index()] & bit == 0 {
-                    in_state[target.index()] |= bit;
-                    work.push((target, known_zero));
-                }
-            }
-        }
+        let (in_state, _) = flag_zero_reach(func, defs, entry, flag, false);
         for (bi, &st) in in_state.iter().enumerate() {
             if st == 0 {
                 continue;

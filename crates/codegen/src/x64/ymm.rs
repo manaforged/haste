@@ -265,8 +265,7 @@ impl Emit<'_> {
         (x, y): (Value, Value),
         dst: Xmm,
     ) -> Result<(), String> {
-        let uniform =
-            matches!(lane, Lane::I16 | Lane::I32) || (lane == Lane::I64 && op != Binary::Sshr);
+        let uniform = super::vector::uniform_shift_lane(op, lane);
         if uniform && let Some(scalar) = self.splat_source(y, count) {
             let sx = self.fin(x, X0);
             if let Some(imm) = self.const_of(scalar) {

@@ -6,7 +6,9 @@ use super::super::shims::{
     emit_rel_branch,
 };
 use super::super::{Buf, SectionAddrs, tls};
-use super::STOP_FP_OFFSET;
+use super::{REGS_PTR_OFFSET, STOP_FP_OFFSET};
+
+const _: () = assert!(STOP_FP_OFFSET + 8 == REGS_PTR_OFFSET);
 
 fn arm64_patch_adr(at: usize, target: usize, out: &mut Buf) {
     let delta = (target as isize - at as isize) as u32;
@@ -207,7 +209,7 @@ pub(in crate::aot) fn emit_arm64_start_panic(
             0xAA01_03F5,
             0xA900_7FF3,
             0x9100_C3E8,
-            0xA902_23FF,
+            0xA900_23FF | ((STOP_FP_OFFSET / 8) << 15),
         ]);
         emit_arm64_walk_call(c, addrs, true, out);
         let uncaught = arm64_fwd(0xB400_0000, out);
