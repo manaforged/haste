@@ -364,9 +364,13 @@ pub enum Node {
 #[derive(Debug, Default)]
 pub struct Body {
     pub exprs: Vec<Expr>,
+    /// The first token of each expression, by `ExprId`.
+    pub expr_starts: Vec<u32>,
     /// The token just past each expression, by `ExprId`, from which `Source::origin` finds its place on disk.
     pub expr_ends: Vec<u32>,
     pub pats: Vec<Pat>,
+    /// Half-open token range `(start, end)` of each pattern, by `PatId`.
+    pub pat_spans: Vec<(u32, u32)>,
     pub tys: Vec<Ty>,
     pub paths: Vec<Path>,
     pub stmts: Vec<Stmt>,

@@ -668,7 +668,11 @@ pub fn exists(path: &Path) -> bool {
 /// Reads and scans the file at `path`.
 pub fn read(path: &Path) -> Result<File> {
     let source = match embedded(path) {
-        Some(text) => Source::parse(path.to_owned(), text.to_owned())?,
+        Some(text) => {
+            let mut src = Source::parse(path.to_owned(), text.to_owned())?;
+            src.origins = super::source::Origins::Read;
+            src
+        }
         None => Source::read(path)?,
     };
     let items = scan::scan(&source)?;

@@ -400,6 +400,7 @@ impl Infer<'_, '_> {
         }
         for (of, ty, args, bindings) in self.impl_param_bounds(block, args)? {
             if self.obligation_open(ty, &args) {
+                self.note_obligation_site(of, ty);
                 self.obligations.push((
                     of,
                     std::iter::once(ty).chain(args.iter().copied()).collect(),
@@ -455,6 +456,7 @@ impl Infer<'_, '_> {
         }
         let args = self.bound_args(of, arena, path, ty)?;
         if !self.compiler_trait(of) && self.obligation_open(ty, &args) {
+            self.note_obligation_site(of, ty);
             self.obligations.push((
                 of,
                 std::iter::once(ty).chain(args.iter().copied()).collect(),

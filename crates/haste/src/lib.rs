@@ -18,6 +18,7 @@ mod body;
 mod build;
 mod cli;
 pub(crate) mod config;
+pub(crate) mod diag;
 mod dump;
 mod graph;
 mod host;
@@ -44,6 +45,7 @@ pub(crate) const LIBRARY_ENV: &str = "HASTE_LIBRARY";
 
 pub use api::{Compiler, CompilerBuilder, Error, ErrorKind, Target};
 pub use cli::main;
+pub use diag::{Diagnostic, DiagnosticKind, Label, Span};
 
 /// Whether an optional environment variable value is enabled (non-empty and not `"0"`).
 fn parse_env_flag(value: Option<&std::ffi::OsStr>) -> bool {

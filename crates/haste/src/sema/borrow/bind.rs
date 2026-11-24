@@ -35,6 +35,7 @@ impl Checker<'_, '_> {
         &mut self,
         local: u32,
         sources: &[BorrowSource],
+        site: Option<ExprId>,
         state: &mut State,
     ) {
         if sources.is_empty() {
@@ -50,6 +51,7 @@ impl Checker<'_, '_> {
             Some(local),
             sources,
             false,
+            site.or(self.current_expr),
             |s| s.target != local,
             |s| s.mutable && (!s.through_ref || !is_shared_target(s.target)),
         );
@@ -134,6 +136,20 @@ impl Checker<'_, '_> {
     }
 
     fn bind_pat_ctx(
+        &mut self,
+        pat: PatId,
+        target: PatTarget<'_>,
+        state: &mut State,
+        ctx: PatCtx,
+    ) -> Result<()> {
+        let prev = self.current_pat;
+        self.current_pat = Some(pat);
+        let res = self.bind_pat_ctx_inner(pat, target, state, ctx);
+        self.current_pat = prev;
+        res
+    }
+
+    fn bind_pat_ctx_inner(
         &mut self,
         pat: PatId,
         target: PatTarget<'_>,
@@ -527,6 +543,7 @@ fn reset_local_binding(local: u32, init_val: bool, state: &mut State) {
     state.init[local as usize] = init_val;
     state.maybe_init[local as usize] = init_val;
     state.moved[local as usize] = false;
+    state.moved_at[local as usize] = None;
     state.partial_moves.retain(|m| m.local != local);
     clear_rebound_loans(local, state);
 }
@@ -540,6 +557,7 @@ pub(super) fn push_loan(
     through_ref: bool,
     two_phase: bool,
     env_only: bool,
+    site: Option<ExprId>,
 ) {
     let loan = Loan {
         target,
@@ -549,6 +567,7 @@ pub(super) fn push_loan(
         through_ref,
         two_phase,
         env_only,
+        site,
     };
     if !loans.contains(&loan) {
         loans.push(loan);
@@ -559,8 +578,9 @@ pub(super) fn push_source_loans(
     loans: &mut Vec<Loan>,
     holder: Option<u32>,
     sources: &[BorrowSource],
+    site: Option<ExprId>,
 ) {
-    push_source_loans_filtered(loans, holder, sources, false, |_| true, |s| s.mutable);
+    push_source_loans_filtered(loans, holder, sources, false, site, |_| true, |s| s.mutable);
 }
 
 pub(super) fn push_source_loans_filtered(
@@ -568,6 +588,7 @@ pub(super) fn push_source_loans_filtered(
     holder: Option<u32>,
     sources: &[BorrowSource],
     two_phase: bool,
+    site: Option<ExprId>,
     mut include: impl FnMut(&BorrowSource) -> bool,
     mut mutable_of: impl FnMut(&BorrowSource) -> bool,
 ) {
@@ -582,6 +603,7 @@ pub(super) fn push_source_loans_filtered(
                 s.through_ref,
                 two_phase,
                 s.env_only,
+                site,
             );
         }
     }

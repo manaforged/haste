@@ -26,6 +26,7 @@ impl Checker<'_, '_> {
             init: state.init.clone(),
             maybe_init: state.maybe_init.clone(),
             moved: state.moved.clone(),
+            moved_at: state.moved_at.clone(),
             partial_moves: state.partial_moves.clone(),
             loans: Vec::new(),
             diverged: false,
@@ -47,6 +48,7 @@ impl Checker<'_, '_> {
                     body_state.init[local as usize] = true;
                     body_state.maybe_init[local as usize] = true;
                     body_state.moved[local as usize] = false;
+                    body_state.moved_at[local as usize] = None;
                     fallback.push(self.param_fallback_source(local));
                 }
                 if let Err(err) = self.bind_pat(
@@ -210,6 +212,7 @@ impl Checker<'_, '_> {
                                     false,
                                     false,
                                     false,
+                                    self.current_expr,
                                 );
                             } else if cap.by == By::Mut && !closure.consumes {
                                 self.no_move_captures.push((local, steps));
@@ -231,18 +234,15 @@ impl Checker<'_, '_> {
                         {
                             for (steps, ..) in paths {
                                 self.check_can_move(local, &steps, state)?;
-                                self.push_partial_move(state, local, steps);
+                                self.push_partial_move(state, local, steps, Some(expr));
                             }
                         } else {
                             self.check_can_move(local, &[], state)?;
-                            if let Some(slot) = state.moved.get_mut(local as usize) {
-                                *slot = true;
-                            }
-                            state.partial_moves.retain(|m| m.local != local);
+                            self.mark_local_moved(state, local, Some(expr));
                         }
                     } else {
                         self.check_can_move(local, &cap_steps, state)?;
-                        self.push_partial_move(state, local, cap_steps);
+                        self.push_partial_move(state, local, cap_steps, Some(expr));
                     }
                 }
             }

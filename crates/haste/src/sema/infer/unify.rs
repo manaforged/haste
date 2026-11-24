@@ -243,9 +243,20 @@ impl Infer<'_, '_> {
     }
 
     fn clash_error(&self, Clash { a, b, cycle }: Clash) -> anyhow::Error {
+        let (sa, sb) = (self.show(a), self.show(b));
         match cycle {
-            true => anyhow::anyhow!("cyclic type: {} occurs in {}", self.show(a), self.show(b)),
-            false => anyhow::anyhow!("mismatched types: {} and {}", self.show(a), self.show(b)),
+            true => self.diag_expr(
+                crate::diag::DiagnosticKind::Type,
+                None,
+                format!("cyclic type: {sa} occurs in {sb}"),
+                "cyclic type of infinite size",
+            ),
+            false => self.diag_expr(
+                crate::diag::DiagnosticKind::Type,
+                None,
+                format!("mismatched types: `{sa}` and `{sb}`"),
+                format!("incompatible types `{sa}` and `{sb}`"),
+            ),
         }
     }
 
@@ -285,33 +296,43 @@ impl Infer<'_, '_> {
             (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => Action::FnPtr(*x, *y, *r, *s),
             _ => return Err(Clash { a, b, cycle: false }),
         };
-        let clash = || Clash { a, b, cycle: false };
+        let keep_cycle = |err: Clash| {
+            if err.cycle {
+                err
+            } else {
+                Clash { a, b, cycle: false }
+            }
+        };
         match action {
             Action::Bind(var, ty) => self.bind(var, ty),
-            Action::One(x, y) => self.unify_quiet(x, y).map_err(|_| clash()),
+            Action::One(x, y) => self.unify_quiet(x, y).map_err(keep_cycle),
             Action::Two(x0, y0, x1, y1) => self
                 .unify_quiet(x0, y0)
                 .and_then(|()| self.unify_quiet(x1, y1))
-                .map_err(|_| clash()),
-            Action::Substs(x, y) => self.unify_substs(x, y).map_err(|()| clash()),
+                .map_err(keep_cycle),
+            Action::Substs(x, y) => self.unify_substs(x, y).map_err(keep_cycle),
             Action::FnPtr(x, y, r, s) => self
                 .unify_substs(x, y)
-                .map_err(|()| clash())
-                .and_then(|()| self.unify_quiet(r, s).map_err(|_| clash())),
+                .map_err(keep_cycle)
+                .and_then(|()| self.unify_quiet(r, s).map_err(keep_cycle)),
         }
     }
 
-    fn unify_substs(&mut self, a: Substs, b: Substs) -> Result<(), ()> {
+    fn unify_substs(&mut self, a: Substs, b: Substs) -> Result<(), Clash> {
         if a == b {
             return Ok(());
         }
         let len = self.cx.types.substs(a).len();
         if len != self.cx.types.substs(b).len() {
-            return Err(());
+            return Err(Clash {
+                a: Ty::NONE,
+                b: Ty::NONE,
+                cycle: false,
+            });
         }
         for i in 0..len {
             let (x, y) = (self.cx.types.substs(a)[i], self.cx.types.substs(b)[i]);
-            self.unify_quiet(x, y).map_err(drop)?;
+            self.unify_quiet(x, y)?;
         }
         Ok(())
     }
@@ -381,6 +402,14 @@ impl Infer<'_, '_> {
 
     /// Coerces the value of `expr`, of type `found`, to `expected`, at each branch value it ends in, recording an array-to-slice unsizing.
     pub fn coerce_expr(&mut self, expr: ExprId, found: Ty, expected: Ty) -> Result<()> {
+        let prev = self.current_expr;
+        self.current_expr = Some(expr);
+        let res = self.coerce_expr_inner(expr, found, expected);
+        self.current_expr = prev;
+        res
+    }
+
+    fn coerce_expr_inner(&mut self, expr: ExprId, found: Ty, expected: Ty) -> Result<()> {
         if self.known(Some(expected)).is_none() {
             return self.coerce(found, expected);
         }

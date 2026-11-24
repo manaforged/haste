@@ -96,7 +96,7 @@ pub(in crate::sema) fn build_poly_summary(
         && matches!(typed.shape, super::Shape::Body)
         && let Err(err) = super::super::borrow::check(cx, item, (&body, &sig), src, &typed)
     {
-        return SummaryKind::BorrowError(format!("{}: {err:#}", cx.name(item)));
+        return SummaryKind::BorrowError(crate::diag::format_error(cx.name(item), &err));
     }
     finalize_summary(cx, typed, poly, clean, param_count)
 }

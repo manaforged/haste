@@ -234,7 +234,8 @@ pub(crate) fn print_failures(failures: &Failures) {
 }
 
 pub(crate) fn error_kind(text: &str) -> String {
-    let text = text.split_once(": ").map_or(text, |(_, rest)| rest);
+    let line = text.lines().next().unwrap_or(text);
+    let text = line.split_once(": ").map_or(line, |(_, rest)| rest);
     text.split([' ', '(', '`'])
         .take(4)
         .collect::<Vec<_>>()

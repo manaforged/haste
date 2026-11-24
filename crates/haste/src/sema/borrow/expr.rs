@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::{BinOp, BlockKind, Expr, ExprId, List, PatId, UnOp, jumps_to};
@@ -7,7 +7,7 @@ use crate::outline::item::ItemKind;
 use super::super::infer::Res;
 use super::super::ty::{Kind, Ty};
 use super::places::PlaceStep;
-use super::{Checker, PartialMove, State, merge_branch, prune_dead_loans, prune_moved_loans};
+use super::{Checker, State, merge_branch, prune_dead_loans, prune_moved_loans};
 
 impl Checker<'_, '_> {
     pub(super) fn check_expr(
@@ -22,7 +22,11 @@ impl Checker<'_, '_> {
         if state.diverged {
             return Ok(());
         }
-        self.check_expr_kind(expr, state, place_ctx, outer_live, value_used, depth)?;
+        let prev_expr = self.current_expr;
+        self.current_expr = Some(expr);
+        let res = self.check_expr_kind(expr, state, place_ctx, outer_live, value_used, depth);
+        self.current_expr = prev_expr;
+        res?;
         let expr_ty = self.expr_ty(expr);
         if expr_ty != Ty::NONE && matches!(*self.cx.types.kind(expr_ty), Kind::Never) {
             state.diverged = true;
@@ -168,20 +172,25 @@ impl Checker<'_, '_> {
                 self.check_can_read(*local, &[], state)?;
             } else {
                 self.check_can_move(*local, &[], state)?;
-                state.moved[*local as usize] = true;
-                state.partial_moves.retain(|m| m.local != *local);
+                self.mark_local_moved(state, *local, Some(expr));
             }
         } else if let Some(Res::Fn(item, _)) = self.typed.res.get(&expr)
             && self.cx.item(*item).1.kind == ItemKind::Static
         {
             if self.unsafe_depth == 0 && self.is_static_mut(*item) {
-                bail!(
-                    "use of mutable static `{}` is unsafe and requires unsafe function or block",
-                    self.cx.name(*item)
-                );
+                return Err(self.unsafe_err(
+                    Some(expr),
+                    format!(
+                        "use of mutable static `{}` is unsafe and requires unsafe function or block",
+                        self.cx.name(*item)
+                    ),
+                ));
             }
             if !place_ctx && !self.ty_is_copy(self.expr_ty(expr)) {
-                bail!("cannot move out of static item `{}`", self.cx.name(*item));
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!("cannot move out of static item `{}`", self.cx.name(*item)),
+                ));
             }
         }
         Ok(())
@@ -200,14 +209,17 @@ impl Checker<'_, '_> {
             self.check_union_place(inner)?;
         }
         if mutable && self.place_behind_shared_ref(inner) {
-            bail!("cannot borrow data in a `&` reference as mutable");
+            return Err(self.borrow_err(None, "cannot borrow data in a `&` reference as mutable"));
         }
         if mutable {
             self.check_static_mut(inner, false)?;
         }
         if let Some(p) = self.root_place(inner) {
             if mutable && p.behind_shared {
-                bail!("cannot borrow data in a `&` reference or `*const` pointer as mutable");
+                return Err(self.borrow_err(
+                    None,
+                    "cannot borrow data in a `&` reference or `*const` pointer as mutable",
+                ));
             }
             if let Some(prefix_len) = p.raw_ptr_prefix {
                 self.check_can_read(p.local, &p.steps[..prefix_len], state)?;
@@ -271,7 +283,7 @@ impl Checker<'_, '_> {
             };
             prune_dead_loans(state, &after_rhs);
             if self.place_behind_shared_ref(lhs) {
-                bail!("cannot assign to data in a `&` reference");
+                return Err(self.borrow_err(Some(lhs), "cannot assign to data in a `&` reference"));
             }
             self.check_static_mut(lhs, false)?;
             if let Some(p) = self.root_place(lhs) {
@@ -331,19 +343,22 @@ impl Checker<'_, '_> {
             && self.expr_ty(inner) != Ty::NONE
             && matches!(self.cx.types.kind(self.expr_ty(inner)), Kind::Ptr(..))
         {
-            bail!("dereference of raw pointer is unsafe and requires unsafe function or block");
+            return Err(self.unsafe_err(
+                Some(expr),
+                "dereference of raw pointer is unsafe and requires unsafe function or block",
+            ));
         }
         if op == UnOp::Deref && !place_ctx && !self.ty_is_copy(self.expr_ty(expr)) {
             if self.typed.derefs.contains_key(&(expr, 0)) || self.place_behind_ref_or_ptr(expr) {
-                bail!("cannot move out of a shared or mutable reference");
+                return Err(self.borrow_err(
+                    Some(expr),
+                    "cannot move out of a shared or mutable reference",
+                ));
             }
             self.check_expr(inner, state, true, outer_live, false, depth)?;
             if let Some(p) = self.root_place(expr) {
                 self.check_can_move(p.local, &p.steps, state)?;
-                state.partial_moves.push(PartialMove {
-                    local: p.local,
-                    steps: p.steps,
-                });
+                self.push_partial_move(state, p.local, p.steps, Some(expr));
             }
             Ok(())
         } else {
@@ -362,7 +377,7 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<()> {
         if !place_ctx && !self.ty_is_copy(self.expr_ty(expr)) {
-            bail!("cannot move out of index");
+            return Err(self.borrow_err(Some(expr), "cannot move out of index"));
         }
         self.check_expr(a, state, true, outer_live, false, depth)?;
         self.check_expr(b, state, false, outer_live, true, depth)
@@ -431,10 +446,10 @@ impl Checker<'_, '_> {
         }
         if moving {
             if self.place_behind_ref_or_ptr(expr) {
-                bail!("cannot move out of a reference");
+                return Err(self.borrow_err(Some(expr), "cannot move out of a reference"));
             }
             if self.static_root(expr).is_some() {
-                bail!("cannot move out of static item");
+                return Err(self.borrow_err(Some(expr), "cannot move out of static item"));
             }
             self.check_adt_drop_move(self.field_container_ty(expr, base))?;
         }
@@ -454,30 +469,35 @@ impl Checker<'_, '_> {
             if !moving {
                 self.check_can_read(p.local, prefix, state)?;
             } else if p.through_ref {
-                bail!(
-                    "cannot move out of `{}` which is behind a reference",
-                    self.local_name(p.local)
-                );
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "cannot move out of `{}` which is behind a reference",
+                        self.local_name(p.local)
+                    ),
+                ));
             } else {
                 self.check_can_move(p.local, prefix, state)?;
                 if prefix.is_empty() {
-                    state.moved[p.local as usize] = true;
-                    state.partial_moves.retain(|m| m.local != p.local);
+                    self.mark_local_moved(state, p.local, Some(expr));
                 } else {
-                    self.push_partial_move(state, p.local, prefix.to_vec());
+                    self.push_partial_move(state, p.local, prefix.to_vec(), Some(expr));
                 }
             }
         } else if !moving {
             self.check_can_read(p.local, &p.steps, state)?;
         } else if p.through_ref {
-            bail!(
-                "cannot move out of `{}` which is behind a reference",
-                self.local_name(p.local)
-            );
+            return Err(self.borrow_err(
+                Some(expr),
+                format!(
+                    "cannot move out of `{}` which is behind a reference",
+                    self.local_name(p.local)
+                ),
+            ));
         } else {
             self.check_adt_drop_move(self.field_container_ty(expr, base))?;
             self.check_can_move(p.local, &p.steps, state)?;
-            self.push_partial_move(state, p.local, p.steps);
+            self.push_partial_move(state, p.local, p.steps, Some(expr));
         }
         Ok(())
     }
@@ -582,10 +602,7 @@ impl Checker<'_, '_> {
             if let Some(v) = val {
                 for src in self.expr_borrow_sources(v, state) {
                     if self.escapes_depth(src.target, src.through_ref, target_depth) {
-                        bail!(
-                            "`{}` does not live long enough",
-                            self.local_name(src.target)
-                        );
+                        return Err(self.does_not_live_long_enough(Some(v), src.target));
                     }
                 }
             }

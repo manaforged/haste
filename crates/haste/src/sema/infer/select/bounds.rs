@@ -202,6 +202,7 @@ impl<'a> Infer<'_, 'a> {
                     self.store_selection(key, local_key, None, state);
                 }
                 if held && self.obligation_open(ty, args) {
+                    self.note_obligation_site(of, ty);
                     self.obligations.push((
                         of,
                         std::iter::once(ty).chain(args.iter().copied()).collect(),
@@ -225,12 +226,14 @@ impl<'a> Infer<'_, 'a> {
             let held = !self.applicable(of, ty, &args, depth + 1)?.is_empty()
                 || self.poly_may_implement(of, ty, &args)?;
             if held {
+                self.note_obligation_site(of, substs[0]);
                 self.obligations.push((of, substs));
             }
             return Ok(held);
         }
         let held = self.opaque_holds(of, &substs)?;
         if held.is_none() {
+            self.note_obligation_site(of, substs[0]);
             self.obligations.push((of, substs));
         }
         Ok(held != Some(false))

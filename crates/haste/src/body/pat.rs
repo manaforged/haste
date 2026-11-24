@@ -9,6 +9,7 @@ use crate::outline::source::opens;
 impl Cursor<'_> {
     /// Parses a pattern, with `|` alternatives.
     pub fn pat(&mut self) -> Result<PatId> {
+        let start = self.at;
         self.eat("|");
         let first = self.pat_no_alt()?;
         if !self.alt_ahead() {
@@ -20,7 +21,7 @@ impl Cursor<'_> {
             alternatives.push(self.pat_no_alt()?.0);
         }
         let list = self.list(&alternatives);
-        Ok(self.push_pat(Pat::Or(list)))
+        Ok(self.push_pat(start, Pat::Or(list)))
     }
 
     fn alt_ahead(&self) -> bool {
@@ -38,9 +39,10 @@ impl Cursor<'_> {
         if !(inclusive || self.punct("..")) {
             return Ok(pat);
         }
+        let start = self.pat_start_tok(pat);
         let from = match self.body.pats[pat.0 as usize] {
             Pat::Lit(from) => from,
-            Pat::Path(path) => self.push_expr(Expr::Path(path)),
+            Pat::Path(path) => self.push_expr(start, Expr::Path(path)),
             _ => return Ok(pat),
         };
         self.at += if inclusive { 3 } else { 2 };
@@ -49,11 +51,14 @@ impl Cursor<'_> {
         } else {
             None
         };
-        Ok(self.push_pat(Pat::Range {
-            from: Some(from),
-            to,
-            inclusive,
-        }))
+        Ok(self.push_pat(
+            start,
+            Pat::Range {
+                from: Some(from),
+                to,
+                inclusive,
+            },
+        ))
     }
 
     fn range_end_ahead(&self) -> bool {
@@ -71,32 +76,35 @@ impl Cursor<'_> {
         if matches!(self.kind(), TokenKind::Literal { .. }) || self.punct("-") {
             return self.lit_expr();
         }
+        let start = self.at;
         let path = self.path(Style::Expr)?;
-        Ok(self.push_expr(Expr::Path(path)))
+        Ok(self.push_expr(start, Expr::Path(path)))
     }
 
     fn lit_expr(&mut self) -> Result<super::ExprId> {
+        let start = self.at;
         let negative = self.eat("-");
         let lit = self.literal()?;
         Ok(if negative {
-            self.push_expr(Expr::Unary(UnOp::Neg, lit))
+            self.push_expr(start, Expr::Unary(UnOp::Neg, lit))
         } else {
             lit
         })
     }
 
     fn pat_start(&mut self) -> Result<PatId> {
+        let start = self.at;
         match self.kind() {
             TokenKind::OpenParen => return self.tuple_pat(),
             TokenKind::OpenBracket => {
                 let open = self.at;
                 self.group();
                 let list = self.comma_list(open, |cursor| Ok(cursor.pat()?.0))?;
-                return Ok(self.push_pat(Pat::Slice(list)));
+                return Ok(self.push_pat(start, Pat::Slice(list)));
             }
             TokenKind::Literal { .. } => {
                 let lit = self.literal()?;
-                return Ok(self.push_pat(Pat::Lit(lit)));
+                return Ok(self.push_pat(start, Pat::Lit(lit)));
             }
             _ => {}
         }
@@ -104,54 +112,65 @@ impl Cursor<'_> {
     }
 
     fn punct_pat(&mut self) -> Result<PatId> {
+        let start = self.at;
         if self.punct("-") {
             let lit = self.lit_expr()?;
-            return Ok(self.push_pat(Pat::Lit(lit)));
+            return Ok(self.push_pat(start, Pat::Lit(lit)));
         }
         if self.punct("&") {
             self.at += 1;
             let mutable = self.eat_word("mut");
             let inner = self.pat_no_alt()?;
-            return Ok(self.push_pat(Pat::Ref {
-                mutable,
-                pat: inner,
-            }));
+            return Ok(self.push_pat(
+                start,
+                Pat::Ref {
+                    mutable,
+                    pat: inner,
+                },
+            ));
         }
         if self.punct("..=") || self.punct("...") {
             self.at += 3;
             let to = self.range_bound()?;
-            return Ok(self.push_pat(Pat::Range {
-                from: None,
-                to: Some(to),
-                inclusive: true,
-            }));
+            return Ok(self.push_pat(
+                start,
+                Pat::Range {
+                    from: None,
+                    to: Some(to),
+                    inclusive: true,
+                },
+            ));
         }
         if self.eat("..") {
             if self.range_end_ahead() {
                 let to = self.range_bound()?;
-                return Ok(self.push_pat(Pat::Range {
-                    from: None,
-                    to: Some(to),
-                    inclusive: false,
-                }));
+                return Ok(self.push_pat(
+                    start,
+                    Pat::Range {
+                        from: None,
+                        to: Some(to),
+                        inclusive: false,
+                    },
+                ));
             }
-            return Ok(self.push_pat(Pat::Rest));
+            return Ok(self.push_pat(start, Pat::Rest));
         }
         if self.eat("!") {
-            return Ok(self.push_pat(Pat::Never));
+            return Ok(self.push_pat(start, Pat::Never));
         }
         self.word_pat()
     }
 
     fn word_pat(&mut self) -> Result<PatId> {
+        let start = self.at;
         match self.word() {
             "_" => {
                 self.at += 1;
-                return Ok(self.push_pat(Pat::Wild));
+                return Ok(self.push_pat(start, Pat::Wild));
             }
             "true" | "false" => {
                 let lit = self.literal()?;
-                return Ok(self.push_pat(Pat::Lit(lit)));
+                return Ok(self.push_pat(start, Pat::Lit(lit)));
             }
             "box" | "const" => {
                 if let Some(pat) = self.keyword_pat()? {
@@ -168,11 +187,12 @@ impl Cursor<'_> {
     }
 
     fn keyword_pat(&mut self) -> Result<Option<PatId>> {
+        let start = self.at;
         let next = self.at + 1;
         if self.is_word("const") && self.kind_at(next) == TokenKind::OpenBrace {
             self.at += 1;
-            let block = self.block_expr(None, super::BlockKind::Const)?;
-            return Ok(Some(self.push_pat(Pat::Lit(block))));
+            let block = self.block_expr_from(start, None, super::BlockKind::Const)?;
+            return Ok(Some(self.push_pat(start, Pat::Lit(block))));
         }
         let boxed = self.is_word("box")
             && (!self.word_at(next).is_empty()
@@ -186,7 +206,7 @@ impl Cursor<'_> {
         }
         self.at += 1;
         let inner = self.pat_no_alt()?;
-        Ok(Some(self.push_pat(Pat::Box(inner))))
+        Ok(Some(self.push_pat(start, Pat::Box(inner))))
     }
 
     fn path_continues(&self) -> bool {
@@ -202,6 +222,7 @@ impl Cursor<'_> {
     }
 
     fn bind_pat(&mut self) -> Result<PatId> {
+        let start = self.at;
         let by_ref = self.eat_word("ref");
         let mutable = self.eat_word("mut");
         let name = self.name()?;
@@ -211,42 +232,49 @@ impl Cursor<'_> {
         } else {
             None
         };
-        Ok(self.push_pat(Pat::Bind {
-            name,
-            by_ref,
-            mutable,
-            sub,
-        }))
+        Ok(self.push_pat(
+            start,
+            Pat::Bind {
+                name,
+                by_ref,
+                mutable,
+                sub,
+            },
+        ))
     }
 
     fn path_pat(&mut self) -> Result<PatId> {
+        let start = self.at;
         let path = self.path(Style::Expr)?;
         if self.punct("!") && opens(self.kind_at(self.at + 1)) {
             self.at += 1;
             let open = self.group();
             if let Some(&block) = self.config.calls.and_then(|calls| calls.get(&open)) {
                 let at = self.at;
+                let first_expr = self.body.expr_ends.len();
+                let first_pat = self.body.pat_spans.len();
                 let pat = self.inside(block, Self::pat);
                 self.at = at;
+                self.remap_expansion_spans(first_expr, first_pat, start);
                 return pat;
             }
-            return Ok(self.push_pat(Pat::Macro { path, open }));
+            return Ok(self.push_pat(start, Pat::Macro { path, open }));
         }
         match self.kind() {
             TokenKind::OpenParen => {
                 let open = self.group();
                 let list = self.comma_list(open, |cursor| Ok(cursor.pat()?.0))?;
-                Ok(self.push_pat(Pat::TupleStruct(path, list)))
+                Ok(self.push_pat(start, Pat::TupleStruct(path, list)))
             }
-            TokenKind::OpenBrace => self.struct_pat(path),
-            _ => Ok(self.push_pat(Pat::Path(path))),
+            TokenKind::OpenBrace => self.struct_pat(start, path),
+            _ => Ok(self.push_pat(start, Pat::Path(path))),
         }
     }
 
-    fn struct_pat(&mut self, path: super::PathId) -> Result<PatId> {
+    fn struct_pat(&mut self, start: u32, path: super::PathId) -> Result<PatId> {
         let (fields, rest) = self.struct_fields(|cursor, _| cursor.field_pat(), |_| Ok(()))?;
         let fields = self.list(&fields);
-        Ok(self.push_pat(Pat::Struct { path, fields, rest }))
+        Ok(self.push_pat(start, Pat::Struct { path, fields, rest }))
     }
 
     fn field_pat(&mut self) -> Result<u32> {
@@ -274,6 +302,7 @@ impl Cursor<'_> {
     }
 
     fn tuple_pat(&mut self) -> Result<PatId> {
+        let start = self.at;
         let open = self.group();
         let (pats, trailing) = self.inside(open, |cursor| {
             let mut pats = Vec::new();
@@ -288,10 +317,10 @@ impl Cursor<'_> {
             Ok((pats, trailing))
         })?;
         if pats.len() == 1 && !trailing && !matches!(self.body.pats[pats[0] as usize], Pat::Rest) {
-            return Ok(self.push_pat(Pat::Paren(PatId(pats[0]))));
+            return Ok(self.push_pat(start, Pat::Paren(PatId(pats[0]))));
         }
         let list = self.list(&pats);
-        Ok(self.push_pat(Pat::Tuple(list)))
+        Ok(self.push_pat(start, Pat::Tuple(list)))
     }
 
     /// Parses one literal token, or `true` or `false`.
@@ -304,7 +333,7 @@ impl Cursor<'_> {
             _ => return self.fail("expected a literal"),
         };
         self.at += 1;
-        Ok(self.push_expr(Expr::Lit(lit, at)))
+        Ok(self.push_expr(at, Expr::Lit(lit, at)))
     }
 }
 

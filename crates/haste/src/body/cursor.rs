@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_lexer::TokenKind;
 
 use crate::outline::source::Source;
@@ -155,12 +155,19 @@ impl<'a> Cursor<'a> {
         } else {
             "end".to_owned()
         };
-        let line = if self.src.is_empty() {
-            0
+        let tok = if self.src.is_empty() {
+            None
         } else {
-            self.src.line(self.at.min(self.src.len() - 1))
+            Some(self.at.min(self.src.len() - 1))
         };
-        bail!("{}:{line}: {what}, found `{near}`", self.src.path.display())
+        let span = tok.and_then(|t| crate::diag::Span::from_token(self.src, t));
+        let diag = crate::diag::Diagnostic::new(
+            crate::diag::DiagnosticKind::Syntax,
+            format!("{what}, found `{near}`"),
+        )
+        .with_span(span)
+        .with_primary_label(what);
+        Err(diag.into())
     }
 
     pub fn finish(&self) -> Result<()> {
@@ -226,15 +233,46 @@ impl<'a> Cursor<'a> {
         Ok(self.list(&ids))
     }
 
-    pub fn push_expr(&mut self, expr: super::Expr) -> ExprId {
+    pub fn push_expr(&mut self, start: u32, expr: super::Expr) -> ExprId {
         self.body.exprs.push(expr);
+        self.body.expr_starts.push(start);
         self.body.expr_ends.push(self.at);
         ExprId(self.body.exprs.len() as u32 - 1)
     }
 
-    pub fn push_pat(&mut self, pat: super::Pat) -> PatId {
+    pub fn expr_start_tok(&self, id: ExprId) -> u32 {
+        self.body.expr_span(id).map_or(self.at, |(s, _)| s)
+    }
+
+    pub fn push_pat(&mut self, start: u32, pat: super::Pat) -> PatId {
         self.body.pats.push(pat);
+        self.body.pat_spans.push((start, self.at));
         PatId(self.body.pats.len() as u32 - 1)
+    }
+
+    pub fn pat_start_tok(&self, id: PatId) -> u32 {
+        self.body.pat_span(id).map_or(self.at, |(s, _)| s)
+    }
+
+    /// Remaps macro-synthesized expression and pattern spans parsed since `(first_expr, first_pat)` to the invocation token `start`.
+    pub(super) fn remap_expansion_spans(
+        &mut self,
+        first_expr: usize,
+        first_pat: usize,
+        start: u32,
+    ) {
+        for idx in first_expr..self.body.expr_ends.len() {
+            let (s, e) = (self.body.expr_starts[idx], self.body.expr_ends[idx]);
+            if self.src.place(s) == 0 || self.src.place(e.saturating_sub(1)) == 0 {
+                self.body.expr_starts[idx] = start;
+                self.body.expr_ends[idx] = start + 1;
+            }
+        }
+        for slot in &mut self.body.pat_spans[first_pat..] {
+            if self.src.place(slot.0) == 0 || self.src.place(slot.1.saturating_sub(1)) == 0 {
+                *slot = (start, start + 1);
+            }
+        }
     }
 
     pub fn push_ty(&mut self, ty: super::Ty) -> TyId {

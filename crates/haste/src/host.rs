@@ -331,8 +331,9 @@ pub(crate) mod apple_args {
                 // SAFETY: guard points to live ARGC/ARGV backing `owned` for this scope.
                 let (argc, argv) = unsafe { (*get_argc(), *get_argv()) };
                 assert_eq!(argc, 2);
-                // SAFETY: argv[0] and argv[1] are live NUL-terminated strings in `owned`.
+                // SAFETY: argv[0] is a live NUL-terminated string in `owned`.
                 let first = unsafe { CStr::from_ptr(*argv) }.to_str().expect("utf8");
+                // SAFETY: argv[1] is a live NUL-terminated string in `owned`.
                 let second = unsafe { CStr::from_ptr(*argv.add(1)) }
                     .to_str()
                     .expect("utf8");

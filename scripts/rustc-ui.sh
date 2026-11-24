@@ -205,7 +205,7 @@ run_borrowck_one() {
     rel=$(rel_path "$file")
     mkdir -p "$work/rustc_out"
 
-    if grep -Eq '(^|[^[:alnum:]_])fn[[:space:]]+main[[:space:]]*\(' "$file"; then
+    if grep -Eq '^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?(unsafe[[:space:]]+)?fn[[:space:]]+main[[:space:]]*\(' "$file"; then
         crate_type="bin"
     fi
 
@@ -222,7 +222,14 @@ run_borrowck_one() {
     if is_crash "$h_status" "$work/haste.combined"; then
         printf 'CRASH\t%s\texit %s\n' "$rel" "$h_status" >"$res_file"
     elif [ "$h_status" -ne 0 ]; then
-        printf 'PASS\t%s\n' "$rel" >"$res_file"
+        if grep -q 'error\[borrow\]:' "$work/haste.combined"; then
+            printf 'PASS\t%s\n' "$rel" >"$res_file"
+        else
+            local reason
+            reason=$(grep -Em1 '^(error|Error)' "$work/haste.combined" || true)
+            reason=$(printf '%s' "$reason" | tr '\t' ' ' | cut -c1-120)
+            printf 'OTHER\t%s\t%s\n' "$rel" "${reason:-non-borrow error}" >"$res_file"
+        fi
     else
         printf 'FAIL\t%s\taccepted\n' "$rel" >"$res_file"
     fi
@@ -373,7 +380,7 @@ run_suite() {
         wait
     fi
 
-    local tested=0 skipped="$static_skipped" passed=0 failed=0 crashed=0
+    local tested=0 skipped="$static_skipped" passed=0 other_err=0 failed=0 crashed=0
     local kind name reason
     for ((i = 0; i < total; i++)); do
         IFS=$'\t' read -r kind name reason <"$suite_tmp/res/$i.res"
@@ -384,6 +391,11 @@ run_suite() {
             PASS)
                 tested=$((tested + 1))
                 passed=$((passed + 1))
+                ;;
+            OTHER)
+                tested=$((tested + 1))
+                other_err=$((other_err + 1))
+                printf '%s\t%s\tother-err: %s\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
             FAIL)
                 tested=$((tested + 1))
@@ -400,11 +412,12 @@ run_suite() {
 
     local rate
     rate=$(awk -v p="$passed" -v t="$tested" 'BEGIN { if (t > 0) printf "%.1f%%", (p * 100.0) / t; else printf "0.0%" }')
-    printf '| %s | %d | %d | %d | %d | %d | %s |\n' "$suite" "$tested" "$skipped" "$passed" "$failed" "$crashed" "$rate" >>"$tmp/summary.rows"
+    printf '| %s | %d | %d | %d | %d | %d | %d | %s |\n' "$suite" "$tested" "$skipped" "$passed" "$other_err" "$failed" "$crashed" "$rate" >>"$tmp/summary.rows"
 
     total_tested=$((total_tested + tested))
     total_skipped=$((total_skipped + skipped))
     total_passed=$((total_passed + passed))
+    total_other=$((total_other + other_err))
     total_failed=$((total_failed + failed))
     total_crashed=$((total_crashed + crashed))
 }
@@ -414,6 +427,7 @@ run_suite() {
 total_tested=0
 total_skipped=0
 total_passed=0
+total_other=0
 total_failed=0
 total_crashed=0
 
@@ -430,12 +444,12 @@ case "$mode" in
         ;;
 esac
 
-printf '| Suite | Tested | Skipped | Passed | Failed | Crashed | Pass Rate |\n'
-printf '| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n'
+printf '| Suite | Tested | Skipped | Passed | OtherErr | Failed | Crashed | Pass Rate |\n'
+printf '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n'
 cat "$tmp/summary.rows"
 if [ "$mode" = "all" ]; then
     total_rate=$(awk -v p="$total_passed" -v t="$total_tested" 'BEGIN { if (t > 0) printf "%.1f%%", (p * 100.0) / t; else printf "0.0%" }')
-    printf '| **total** | **%d** | **%d** | **%d** | **%d** | **%d** | **%s** |\n' "$total_tested" "$total_skipped" "$total_passed" "$total_failed" "$total_crashed" "$total_rate"
+    printf '| **total** | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | **%s** |\n' "$total_tested" "$total_skipped" "$total_passed" "$total_other" "$total_failed" "$total_crashed" "$total_rate"
 fi
 
 if [ -s "$tmp/failures.tsv" ]; then
@@ -445,4 +459,4 @@ if [ -s "$tmp/failures.tsv" ]; then
     done
 fi
 
-[ "$((total_failed + total_crashed))" -eq 0 ]
+[ "$((total_other + total_failed + total_crashed))" -eq 0 ]

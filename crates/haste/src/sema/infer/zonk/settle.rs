@@ -12,11 +12,21 @@ impl Infer<'_, '_> {
         self.settle_initial_passes()?;
         self.settle_final_passes()?;
         if let Some((of, substs)) = self.obligations.first() {
-            let ty = self.show(substs[0]);
-            anyhow::bail!(
-                "the trait bound `{ty}: {}` is not satisfied",
-                self.cx.name(*of)
-            );
+            let self_ty = substs[0];
+            let resolved = self.resolve(self_ty);
+            let site = self
+                .obligation_sites
+                .get(&(*of, self_ty))
+                .or_else(|| self.obligation_sites.get(&(*of, resolved)))
+                .copied();
+            let ty = self.show(self_ty);
+            let trait_name = self.cx.name(*of);
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Trait,
+                site,
+                format!("the trait bound `{ty}: {trait_name}` is not satisfied"),
+                format!("the trait `{trait_name}` is not implemented for `{ty}`"),
+            ));
         }
         Ok(())
     }

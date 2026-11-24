@@ -3,7 +3,7 @@ mod lifetimes;
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::{SelfKind, Signature};
@@ -42,9 +42,7 @@ impl Checker<'_, '_> {
                 if let Some(c) = closure {
                     if c.consumes {
                         self.check_can_move(c_local, &[], state)?;
-                        if let Some(slot) = state.moved.get_mut(c_local as usize) {
-                            *slot = true;
-                        }
+                        self.mark_local_moved(state, c_local, Some(expr));
                     } else if parent == self.item
                         && c.captures.iter().any(|cap| {
                             cap.by == By::Mut
@@ -66,13 +64,11 @@ impl Checker<'_, '_> {
         {
             if let Some(local) = self.expr_plain_local(ExprId(first)) {
                 self.check_can_move(local, &[], state)?;
-                if let Some(slot) = state.moved.get_mut(local as usize) {
-                    *slot = true;
-                }
+                self.mark_local_moved(state, local, Some(expr));
                 return Ok(());
             }
             if self.place_behind_ref_or_ptr(ExprId(first)) {
-                bail!("cannot move out of a reference");
+                return Err(self.borrow_err(Some(ExprId(first)), "cannot move out of a reference"));
             }
         }
         let fn_item = match self.callee_res(expr, Some(callee)) {
@@ -166,9 +162,12 @@ impl Checker<'_, '_> {
                 || fn_item.is_some_and(|it| self.cx.foreign(it) && !sig.is_some_and(|s| s.is_safe));
             if is_unsafe {
                 let name = fn_item.map_or("function", |it| self.cx.name(it));
-                bail!(
-                    "call to unsafe function `{name}` is unsafe and requires unsafe function or block"
-                );
+                return Err(self.unsafe_err(
+                    None,
+                    format!(
+                        "call to unsafe function `{name}` is unsafe and requires unsafe function or block"
+                    ),
+                ));
             }
         }
         Ok(())
@@ -239,6 +238,7 @@ impl Checker<'_, '_> {
                     Some(temp_id),
                     &recv_sources,
                     false,
+                    Some(expr),
                     |_| true,
                     |s| s.mutable && mutability == Mut::Mut,
                 );
@@ -249,7 +249,10 @@ impl Checker<'_, '_> {
             self.apply_deref_steps(expr, self.expr_ty(receiver), derefs, &mut p);
         }
         if mutability == Mut::Mut && p.behind_shared {
-            bail!("cannot borrow data in a `&` reference or `*const` pointer as mutable");
+            return Err(self.borrow_err(
+                Some(expr),
+                "cannot borrow data in a `&` reference or `*const` pointer as mutable",
+            ));
         }
         if let Some(prefix_len) = p.raw_ptr_prefix {
             self.check_can_read(p.local, &p.steps[..prefix_len], state)?;
@@ -289,6 +292,7 @@ impl Checker<'_, '_> {
                 p.through_ref,
                 mutability == Mut::Mut,
                 false,
+                Some(expr),
             );
         }
         Ok(deferred_recv)
@@ -308,7 +312,10 @@ impl Checker<'_, '_> {
             && (self.place_behind_shared_ref(receiver)
                 || self.is_shared_ref_or_ptr(self.expr_ty(receiver)))
         {
-            bail!("cannot borrow data in a `&` reference as mutable");
+            return Err(self.borrow_err(
+                Some(expr),
+                "cannot borrow data in a `&` reference as mutable",
+            ));
         }
         let temp_id = self.next_temp_holder();
         let deferred_recv = if let Some(mutability) = recv_borrow {
@@ -416,13 +423,13 @@ impl Checker<'_, '_> {
         }
         if cur != Ty::NONE && !self.ty_is_copy(cur) {
             if crossed_ref || self.place_behind_ref_or_ptr(receiver) {
-                bail!("cannot move out of a reference or deref");
+                return Err(self.borrow_err(Some(expr), "cannot move out of a reference or deref"));
             }
             if let Some(mut p) = self.root_place(receiver) {
                 self.apply_deref_steps(expr, self.expr_ty(receiver), derefs, &mut p);
                 self.check_expr(receiver, state, true, outer_live, false, depth)?;
                 self.check_can_move(p.local, &p.steps, state)?;
-                self.push_partial_move(state, p.local, p.steps);
+                self.push_partial_move(state, p.local, p.steps, Some(expr));
                 return Ok(());
             }
         }
@@ -455,7 +462,24 @@ impl Checker<'_, '_> {
         &mut self,
         arg: ExprId,
         param_ref: Option<Mut>,
-        deferred_mut_args: &mut Vec<(u32, Vec<PlaceStep>)>,
+        deferred_mut_args: &mut Vec<(ExprId, u32, Vec<PlaceStep>)>,
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<bool> {
+        let prev_expr = self.current_expr;
+        self.current_expr = Some(arg);
+        let res =
+            self.check_call_arg_inner(arg, param_ref, deferred_mut_args, state, outer_live, depth);
+        self.current_expr = prev_expr;
+        res
+    }
+
+    fn check_call_arg_inner(
+        &mut self,
+        arg: ExprId,
+        param_ref: Option<Mut>,
+        deferred_mut_args: &mut Vec<(ExprId, u32, Vec<PlaceStep>)>,
         state: &mut State,
         outer_live: &HashSet<u32>,
         depth: u32,
@@ -467,19 +491,11 @@ impl Checker<'_, '_> {
             && let Some(local) = self.expr_plain_local(arg)
         {
             if shared_reborrow {
-                self.check_not_moved(local, &[], state)?;
-                if state.loans.iter().any(|l| {
-                    super::loan_conflicts_borrow(l, local, &[]) && l.mutable && !l.two_phase
-                }) {
-                    bail!(
-                        "cannot use `{}` because it was mutably borrowed",
-                        self.local_name(local)
-                    );
-                }
+                self.check_can_read(local, &[], state)?;
                 return Ok(false);
             }
             self.check_can_read_inner(local, &[], state, true)?;
-            deferred_mut_args.push((local, Vec::new()));
+            deferred_mut_args.push((arg, local, Vec::new()));
             return Ok(true);
         }
         if self.is_mut_ref_ty(self.expr_ty(arg))
@@ -493,7 +509,7 @@ impl Checker<'_, '_> {
                 self.check_can_read(p.local, &p.steps, state)?;
             } else {
                 self.check_can_read_inner(p.local, &p.steps, state, true)?;
-                deferred_mut_args.push((p.local, p.steps.clone()));
+                deferred_mut_args.push((arg, p.local, p.steps.clone()));
                 is_deferred_mut = true;
             }
             self.check_expr(arg, state, true, outer_live, true, depth)?;
@@ -517,7 +533,7 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<Vec<Vec<BorrowSource>>> {
         let temp_id = self.next_temp_holder();
-        let mut deferred_mut_args: Vec<(u32, Vec<PlaceStep>)> = Vec::new();
+        let mut deferred_mut_args: Vec<(ExprId, u32, Vec<PlaceStep>)> = Vec::new();
         let mut arg_sources = Vec::with_capacity(arg_ids.len());
         let res = (|| -> Result<()> {
             for (idx, &id) in arg_ids.iter().enumerate() {
@@ -543,6 +559,7 @@ impl Checker<'_, '_> {
                     Some(temp_id),
                     &sources,
                     is_deferred_mut,
+                    Some(arg),
                     |_| true,
                     |s| s.mutable && !shared_reborrow,
                 );
@@ -553,15 +570,37 @@ impl Checker<'_, '_> {
                 super::prune_dead_loans(state, outer_live);
             }
             if !state.diverged {
-                for (local, steps) in deferred_mut_args {
-                    if state.loans.iter().any(|l| {
+                for (arg, local, steps) in deferred_mut_args {
+                    if let Some(loan) = state.loans.iter().find(|l| {
                         !(l.holder == Some(temp_id) && l.two_phase)
                             && super::loan_conflicts_borrow(l, local, &steps)
                     }) {
-                        bail!(
-                            "cannot use `{}` because it was mutably borrowed",
-                            self.local_name(local)
-                        );
+                        let (msg, primary, sec) = if loan.mutable {
+                            (
+                                format!(
+                                    "cannot use `{}` because it was mutably borrowed",
+                                    self.local_name(local)
+                                ),
+                                "use of borrowed value occurs here",
+                                "mutable borrow occurs here",
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "cannot borrow `{}` as mutable because it is also borrowed as immutable",
+                                    self.local_name(local)
+                                ),
+                                "mutable borrow occurs here",
+                                "immutable borrow occurs here",
+                            )
+                        };
+                        return Err(self.borrow_err_labeled(
+                            Some(arg),
+                            msg,
+                            primary,
+                            loan.site,
+                            sec,
+                        ));
                     }
                 }
             }

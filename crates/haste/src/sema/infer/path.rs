@@ -191,7 +191,12 @@ impl<'a> Infer<'_, 'a> {
         };
         match found {
             Some(binding) => Ok(binding.def),
-            None => bail!("cannot find value `{}`", self.spell(segments)),
+            None => Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Name,
+                None,
+                format!("cannot find value `{}` in this scope", self.spell(segments)),
+                "not found in this scope",
+            )),
         }
     }
 

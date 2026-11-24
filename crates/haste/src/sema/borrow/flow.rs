@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
@@ -109,10 +109,13 @@ impl Checker<'_, '_> {
                 .get(loc as usize)
                 .is_some_and(|&d| d < block_depth)
         }) {
-            bail!(
-                "attempt to use a non-constant value `{}` in a constant",
-                self.local_name(bad)
-            );
+            return Err(self.const_err(
+                None,
+                format!(
+                    "attempt to use a non-constant value `{}` in a constant",
+                    self.local_name(bad)
+                ),
+            ));
         }
         Ok(())
     }
@@ -265,10 +268,7 @@ impl Checker<'_, '_> {
             let tail_srcs = self.expr_borrow_sources_let(tail, state);
             for src in &tail_srcs {
                 if self.escapes_depth(src.target, src.through_ref, block_depth) {
-                    bail!(
-                        "`{}` does not live long enough",
-                        self.local_name(src.target)
-                    );
+                    return Err(self.does_not_live_long_enough(Some(tail), src.target));
                 }
             }
             if !tail_srcs.is_empty() && !is_const {
@@ -486,6 +486,7 @@ impl Checker<'_, '_> {
                         p.through_ref,
                         false,
                         false,
+                        Some(scrut),
                     );
                     Some(id)
                 } else {
@@ -547,7 +548,7 @@ impl Checker<'_, '_> {
                 if value_used {
                     for s in self.expr_borrow_sources_let(arm.body, &arm_state) {
                         if self.escapes_depth(s.target, s.through_ref, arm_depth) {
-                            bail!("`{}` does not live long enough", self.local_name(s.target));
+                            return Err(self.does_not_live_long_enough(Some(arm.body), s.target));
                         }
                         if !out_sources.contains(&s) {
                             out_sources.push(s);
@@ -586,7 +587,7 @@ impl Checker<'_, '_> {
             return None;
         }
         let id = self.next_temp_holder();
-        push_source_loans(&mut state.loans, Some(id), &sources);
+        push_source_loans(&mut state.loans, Some(id), &sources, Some(expr));
         Some(id)
     }
 
@@ -612,7 +613,7 @@ impl Checker<'_, '_> {
             None
         } else {
             let id = self.next_iter_holder();
-            push_source_loans(&mut state.loans, Some(id), &iter_sources);
+            push_source_loans(&mut state.loans, Some(id), &iter_sources, Some(iter));
             Some(id)
         };
         let item_sources: Vec<BorrowSource> = iter_sources

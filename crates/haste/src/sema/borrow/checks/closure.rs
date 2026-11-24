@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::body::sig::{GenericKind, Signature};
 use crate::body::{Args, Body, Bound, Expr, ExprId, GenericArg, List, Ty as AstTy, TyId};
@@ -277,10 +277,10 @@ impl Checker<'_, '_> {
                 if in_const && !self.is_non_promotable_temp(expr) {
                     continue;
                 }
-                bail!("`{}` does not live long enough", self.local_name(s.target));
+                return Err(self.does_not_live_long_enough(Some(expr), s.target));
             }
             if !self.from_caller(s.target, s.through_ref) {
-                bail!("`{}` does not live long enough", self.local_name(s.target));
+                return Err(self.does_not_live_long_enough(Some(expr), s.target));
             }
         }
         Ok(())
@@ -303,19 +303,29 @@ impl Checker<'_, '_> {
 
     fn check_closure_effects(
         &self,
+        expr: Option<ExprId>,
         eff: &ClosureEffects,
         req_fn: bool,
         req_fn_mut: bool,
         req_static: bool,
     ) -> Result<()> {
         if (req_fn || req_fn_mut) && eff.moves_capture {
-            bail!("cannot move out of a captured variable in an `Fn` or `FnMut` closure");
+            return Err(self.borrow_err(
+                expr,
+                "cannot move out of a captured variable in an `Fn` or `FnMut` closure",
+            ));
         }
         if req_fn && eff.mutates_capture {
-            bail!("cannot borrow captured variable as mutable in an `Fn` closure");
+            return Err(self.borrow_err(
+                expr,
+                "cannot borrow captured variable as mutable in an `Fn` closure",
+            ));
         }
         if req_static && eff.borrows_local {
-            bail!("closure may outlive the current function, but it borrows a local variable");
+            return Err(self.borrow_err(
+                expr,
+                "closure may outlive the current function, but it borrows a local variable",
+            ));
         }
         Ok(())
     }
@@ -339,9 +349,9 @@ impl Checker<'_, '_> {
             .iter()
             .any(|pl| hrtb_params.contains(&pl.param_idx) && !pl.derefs_past_outer_ref)
         {
-            bail!("borrowed data escapes outside of closure");
+            return Err(self.borrow_err(Some(expr), "borrowed data escapes outside of closure"));
         }
-        self.check_closure_effects(eff, req_fn, req_fn_mut, req_static)
+        self.check_closure_effects(Some(expr), eff, req_fn, req_fn_mut, req_static)
     }
 
     fn unwrap_expr(&self, mut expr: ExprId) -> ExprId {
@@ -491,6 +501,7 @@ impl Checker<'_, '_> {
                 src.through_ref,
                 false,
                 src.env_only,
+                Some(expr),
             );
         }
         self.closure_effects.insert(
@@ -535,7 +546,7 @@ impl Checker<'_, '_> {
     }
 
     pub(in super::super) fn check_coercion_vtables(&self) -> Result<()> {
-        for coercion in self.typed.coercions.values() {
+        for (&coercion_expr, coercion) in &self.typed.coercions {
             let Some(vtable) = coercion.vtable() else {
                 continue;
             };
@@ -552,7 +563,13 @@ impl Checker<'_, '_> {
                 continue;
             };
             let lang = self.cx.lang(of);
-            self.check_closure_effects(eff, lang == Some("fn"), lang == Some("fn_mut"), false)?;
+            self.check_closure_effects(
+                Some(coercion_expr),
+                eff,
+                lang == Some("fn"),
+                lang == Some("fn_mut"),
+                false,
+            )?;
         }
         Ok(())
     }

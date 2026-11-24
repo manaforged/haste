@@ -369,7 +369,12 @@ impl<'a> Infer<'_, 'a> {
     ) -> Result<Ty> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, false)? else {
-            bail!("struct literal of something that is not a struct")
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Type,
+                Some(expr),
+                "struct literal of something that is not a struct",
+                "not a struct",
+            ));
         };
         let adt = self.cx.types.intern(Kind::Adt(item, args));
         if let Some(expected) = expected {
@@ -381,7 +386,12 @@ impl<'a> Infer<'_, 'a> {
             let field = body.fields[init as usize];
             let name = plain(self.src.text(field.name));
             let Some(index) = self.field_index(item, variant, name)? else {
-                bail!("no field `{name}` on {}", self.cx.name(item))
+                return Err(self.diag_tok(
+                    crate::diag::DiagnosticKind::Name,
+                    field.name,
+                    format!("no field `{name}` on `{}`", self.cx.name(item)),
+                    "unknown field",
+                ));
             };
             let ty = tys[index as usize];
             self.out.inits.insert(field.value, index);
@@ -500,13 +510,28 @@ impl<'a> Infer<'_, 'a> {
         let found = self.expr(base, None)?;
         let ty = self.field_base(expr, found, name)?;
         let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else {
-            bail!("no field `{name}` on {}", self.show(ty))
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Name,
+                Some(expr),
+                format!("no field `{name}` on type `{}`", self.show(ty)),
+                "unknown field",
+            ));
         };
         if self.cx.item(item).1.kind == ItemKind::Enum {
-            bail!("no field `{name}` on enum {}", self.cx.name(item));
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Name,
+                Some(expr),
+                format!("no field `{name}` on enum `{}`", self.cx.name(item)),
+                "unknown field",
+            ));
         }
         let Some(index) = self.field_index(item, 0, name)? else {
-            bail!("no field `{name}` on {}", self.cx.name(item))
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Name,
+                Some(expr),
+                format!("no field `{name}` on type `{}`", self.cx.name(item)),
+                "unknown field",
+            ));
         };
         self.out.fields.insert(expr, index);
         let slice = self.cx.types.substs(args).to_vec();

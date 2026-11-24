@@ -94,7 +94,7 @@ fn typed_fresh(
             thaw::keep_laid(cx, *instance, &typed, unlaid, before);
             return Ok(typed);
         }
-        Err(error) => return Err(format!("{}: {error:#}", cx.name(instance.0))),
+        Err(error) => return Err(crate::diag::format_error(cx.name(instance.0), &error)),
         Ok(None) => {}
     }
     if let Some(result) = typed_once_poly(cx, instance, unlaid) {
@@ -102,7 +102,7 @@ fn typed_fresh(
     }
     let typed = Arc::new(
         infer_after_compiler_made(cx, instance.0, instance.1, None)
-            .map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?,
+            .map_err(|error| crate::diag::format_error(cx.name(instance.0), &error))?,
     );
     thaw::keep_laid(cx, *instance, &typed, unlaid, before);
     Ok(typed)

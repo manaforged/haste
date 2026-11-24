@@ -285,18 +285,11 @@ impl Build {
                 drop_finals,
             )?);
         }
-        if !self
-            .binary
-            .as_ref()
-            .context("the binary is not compiled")?
-            .broken
-            .is_empty()
-        {
-            crate::cli::failure_lines(&self.failures()?)
-                .iter()
-                .for_each(|line| eprintln!("{line}"));
-        }
         let bin = self.binary.as_mut().context("the binary is not compiled")?;
+        let failed = bin.print_diagnostics(&self.compilation.outline);
+        if failed > 0 {
+            bail!("{failed} functions failed to compile");
+        }
         bin.write_aot(&self.compilation, path)?;
         eprintln!(
             "built {} ({} functions reached, {:.1} ms)",

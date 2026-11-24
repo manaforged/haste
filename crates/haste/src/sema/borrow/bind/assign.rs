@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::{Expr, ExprId};
@@ -18,7 +18,7 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<()> {
         if self.place_behind_shared_ref(lhs) {
-            bail!("cannot assign to data in a `&` reference");
+            return Err(self.borrow_err(Some(lhs), "cannot assign to data in a `&` reference"));
         }
         self.check_static_mut(lhs, false)?;
         match *self.body.expr(lhs) {
@@ -101,7 +101,7 @@ impl Checker<'_, '_> {
                     })
                     .cloned()
                     .collect();
-                self.push_sources_for_local(p.local, &rebound, state);
+                self.push_sources_for_local(p.local, &rebound, self.current_expr, state);
             } else {
                 if !state.init[p.local as usize]
                     || state.moved[p.local as usize]
@@ -111,10 +111,13 @@ impl Checker<'_, '_> {
                             && union_prefix.starts_with(&m.steps)
                     })
                 {
-                    bail!(
-                        "assign to part of moved or uninitialized value `{}`",
-                        self.local_name(p.local)
-                    );
+                    return Err(self.borrow_err(
+                        Some(lhs),
+                        format!(
+                            "assign to part of moved or uninitialized value `{}`",
+                            self.local_name(p.local)
+                        ),
+                    ));
                 }
                 state
                     .partial_moves
@@ -139,7 +142,10 @@ impl Checker<'_, '_> {
             self.apply_deref_steps(lhs, self.expr_ty(base), autoderefs, &mut bp);
         }
         if bp.behind_shared {
-            bail!("cannot borrow data in a `&` reference or `*const` pointer as mutable");
+            return Err(self.borrow_err(
+                Some(lhs),
+                "cannot borrow data in a `&` reference or `*const` pointer as mutable",
+            ));
         }
         let tid = self.next_temp_holder();
         if let Some(prefix_len) = bp.raw_ptr_prefix {
@@ -162,6 +168,7 @@ impl Checker<'_, '_> {
                 bp.through_ref,
                 false,
                 false,
+                Some(lhs),
             );
         }
         Ok(Some(tid))

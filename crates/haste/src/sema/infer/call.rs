@@ -327,7 +327,12 @@ impl Infer<'_, '_> {
         match given.checked_sub(params) {
             Some(0) => Ok(0),
             Some(extra) if variadic => Ok(extra),
-            _ => bail!("call takes {params} arguments, {given} given"),
+            _ => Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Type,
+                None,
+                format!("call takes {params} arguments, {given} given"),
+                "unexpected number of arguments",
+            )),
         }
     }
 

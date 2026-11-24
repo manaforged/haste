@@ -30,18 +30,31 @@ const ITEM_WORDS: [&str; 12] = [
 impl Cursor<'_> {
     /// Parses the block that opens at the current token.
     pub fn block_expr(&mut self, label: Option<u32>, kind: BlockKind) -> Result<ExprId> {
+        self.block_expr_from(self.at, label, kind)
+    }
+
+    /// Parses the block that opens at the current token, recording `start` as its first token.
+    pub(super) fn block_expr_from(
+        &mut self,
+        start: u32,
+        label: Option<u32>,
+        kind: BlockKind,
+    ) -> Result<ExprId> {
         if self.kind() != TokenKind::OpenBrace {
             return self.fail("expected a block");
         }
         let open = self.group();
         let (stmts, tail) = self.inside(open, Cursor::stmts)?;
         let stmts = self.list(&stmts);
-        Ok(self.push_expr(Expr::Block {
-            stmts,
-            tail,
-            label,
-            kind,
-        }))
+        Ok(self.push_expr(
+            start,
+            Expr::Block {
+                stmts,
+                tail,
+                label,
+                kind,
+            },
+        ))
     }
 
     fn stmts(&mut self) -> Result<(Vec<u32>, Option<ExprId>)> {
