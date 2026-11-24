@@ -57,6 +57,19 @@ pub(crate) fn env_flag(name: &str) -> bool {
     parse_env_flag(std::env::var_os(name).as_deref())
 }
 
+/// Whether an optional environment variable value is enabled, falling back to `default` when unset.
+fn parse_env_flag_or(value: Option<&std::ffi::OsStr>, default: bool) -> bool {
+    match value {
+        Some(v) => parse_env_flag(Some(v)),
+        None => default,
+    }
+}
+
+/// Returns `env_flag(name)` when `name` is set in the environment, else `default`.
+pub(crate) fn env_flag_or(name: &str, default: bool) -> bool {
+    parse_env_flag_or(std::env::var_os(name).as_deref(), default)
+}
+
 /// Package, binary, and feature selection from the command line or builder.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub(crate) struct Selection {
@@ -188,6 +201,10 @@ mod tests {
         assert!(!parse_env_flag(Some(OsStr::new("0"))));
         assert!(parse_env_flag(Some(OsStr::new("1"))));
         assert!(parse_env_flag(Some(OsStr::new("true"))));
+        assert!(parse_env_flag_or(None, true));
+        assert!(!parse_env_flag_or(None, false));
+        assert!(!parse_env_flag_or(Some(OsStr::new("0")), true));
+        assert!(parse_env_flag_or(Some(OsStr::new("1")), false));
     }
 
     #[test]

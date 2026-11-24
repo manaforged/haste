@@ -115,7 +115,7 @@ struct Checker<'c, 'a> {
     no_move_captures: Vec<(u32, Vec<PlaceStep>)>,
     returns_borrow: bool,
     returns_only_static: bool,
-    param_is_static: Vec<bool>,
+    param_lts: calls::ParamLifetimes<'c>,
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
@@ -253,7 +253,7 @@ pub(super) fn check(
             calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
             checks::closure::sig_returns_only_static(sig, src, ret_ast, &ret_lts)
         });
-    let param_is_static = calls::compute_param_is_static(cx, item, sig, src, typed, n);
+    let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
     let mut checker = Checker {
         cx,
         item,
@@ -268,7 +268,7 @@ pub(super) fn check(
         no_move_captures: Vec::new(),
         returns_borrow: false,
         returns_only_static,
-        param_is_static,
+        param_lts,
         return_min_depth: 1,
         closure_depth: 0,
         const_depth: 0,
@@ -287,11 +287,16 @@ pub(super) fn check(
         current_pat: None,
     };
     for (idx, local) in typed.locals.iter().enumerate() {
-        if local.ty != Ty::NONE
-            && checker.ty_holds_borrow(local.ty)
-            && checker.ty_has_borrow_drop(local.ty)
-        {
-            checker.drop_locals.insert(idx as u32);
+        if local.ty != Ty::NONE {
+            if checker.ty_holds_borrow(local.ty) && checker.ty_has_borrow_drop(local.ty) {
+                checker.drop_locals.insert(idx as u32);
+            }
+            if checker.is_param.get(idx).copied().unwrap_or(false)
+                && let Kind::Ref(_, inner) = *checker.cx.types.kind(local.ty)
+                && !checker.ty_holds_borrow(inner)
+            {
+                checker.param_lts.inner_is_static[idx] = true;
+            }
         }
     }
     checker.returns_borrow = typed.ret.is_some_and(|ty| checker.ty_holds_borrow(ty));
@@ -452,10 +457,49 @@ impl Checker<'_, '_> {
     pub(super) fn is_non_static_param(&self, local: u32) -> bool {
         self.is_param.get(local as usize).copied().unwrap_or(false)
             && !self
-                .param_is_static
+                .param_lts
+                .is_static
                 .get(local as usize)
                 .copied()
                 .unwrap_or(false)
+    }
+
+    pub(super) fn param_inner_is_static(&self, local: u32) -> bool {
+        self.param_lts
+            .inner_is_static
+            .get(local as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn param_satisfies_caller_lt(&mut self, local: u32, req_lts: &[&str]) -> bool {
+        if !self.is_non_static_param(local) {
+            return true;
+        }
+        let slot = local as usize;
+        if self
+            .param_lts
+            .has_elided_lt
+            .get(slot)
+            .copied()
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        let Some(declared) = self.param_lts.named_lts.get(slot) else {
+            return false;
+        };
+        if declared.is_empty() {
+            return false;
+        }
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return false;
+        };
+        declared.iter().all(|&p_lt| {
+            req_lts
+                .iter()
+                .any(|&req| calls::lifetime_outlives(&sig, self.src, p_lt, req))
+        })
     }
 
     fn is_escaping_return(&self, src: &BorrowSource) -> bool {

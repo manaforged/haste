@@ -64,8 +64,8 @@ impl Config {
 
     /// Recomputes `debug_info` and `symbols` from `profile` and environment toggles.
     pub(crate) fn refresh_debug_flags(&mut self) {
-        self.debug_info = self.profile != Profile::Release || crate::env_flag("HASTE_DEBUG_INFO");
-        self.symbols = self.debug_info || crate::env_flag("HASTE_SYMBOLS");
+        self.debug_info = crate::env_flag_or("HASTE_DEBUG_INFO", self.profile != Profile::Release);
+        self.symbols = crate::env_flag_or("HASTE_SYMBOLS", self.debug_info);
     }
 
     /// Returns the active process configuration snapshot for the current thread.

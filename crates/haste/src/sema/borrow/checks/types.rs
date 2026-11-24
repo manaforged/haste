@@ -115,6 +115,7 @@ impl Checker<'_, '_> {
         let mod_path = self.cx.module_text(item);
         let Some(rest) = mod_path
             .strip_prefix("core::")
+            .or_else(|| mod_path.strip_prefix("alloc::"))
             .or_else(|| mod_path.strip_prefix("std::"))
         else {
             return false;

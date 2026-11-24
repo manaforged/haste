@@ -19,7 +19,7 @@ struct SigFnFlags<'a> {
     is_iter_fn: bool,
     is_opt_fn: bool,
     is_res_fn: bool,
-    is_clone_fn: bool,
+    is_owned_copy_fn: bool,
     is_by_ref: bool,
 }
 
@@ -193,24 +193,25 @@ impl<'a> Checker<'_, 'a> {
         let is_iter_fn = self.is_iter_mod(fn_item);
         let is_opt_fn = self.item_in_std_mod(fn_item, "option");
         let is_res_fn = self.item_in_std_mod(fn_item, "result");
-        let is_clone_fn = fn_name == "clone"
-            && recv_is_by_ref(sig)
-            && self
-                .cx
-                .owner_trait(fn_item)
-                .or_else(|| {
-                    self.cx
-                        .owner_impl(fn_item)
-                        .and_then(|b| self.cx.impl_trait(b))
-                })
-                .is_some_and(|tr| self.item_in_std_mod(tr, "clone"));
+        let is_owned_copy_fn = recv_is_by_ref(sig)
+            && ((fn_name == "clone"
+                && self
+                    .cx
+                    .owner_trait(fn_item)
+                    .or_else(|| {
+                        self.cx
+                            .owner_impl(fn_item)
+                            .and_then(|b| self.cx.impl_trait(b))
+                    })
+                    .is_some_and(|tr| self.item_in_std_mod(tr, "clone")))
+                || (fn_name == "to_vec" && self.item_in_std_mod(fn_item, "slice")));
         let is_by_ref = is_iter_fn && fn_name == "by_ref";
         SigFnFlags {
             fn_name,
             is_iter_fn,
             is_opt_fn,
             is_res_fn,
-            is_clone_fn,
+            is_owned_copy_fn,
             is_by_ref,
         }
     }
@@ -264,13 +265,13 @@ impl<'a> Checker<'_, 'a> {
         let mut recv_sources =
             self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
         if ((flags.is_iter_fn || flags.is_opt_fn) && matches!(flags.fn_name, "copied" | "cloned"))
-            || flags.is_clone_fn
+            || flags.is_owned_copy_fn
         {
             return self.copied_recv_sources(
                 recv,
                 recv_sources,
                 state,
-                flags.is_opt_fn || flags.is_clone_fn,
+                flags.is_opt_fn || flags.is_owned_copy_fn,
             );
         }
         let ignores_elem = (flags.is_iter_fn
@@ -426,6 +427,12 @@ impl<'a> Checker<'_, 'a> {
         let container_targets: Vec<u32> = recv_sources
             .iter()
             .filter(|s| {
+                if self.returns_only_static
+                    && self.is_non_static_param(s.target)
+                    && !self.param_inner_is_static(s.target)
+                {
+                    return false;
+                }
                 if checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
                     return true;
                 }

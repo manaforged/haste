@@ -285,6 +285,94 @@ fn main() {
 }
 "#,
     );
+    check_fails(
+        "hrtb_outer_type_param_escape_identity",
+        r#"
+fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
+    let local = 9;
+    f(&local)
+}
+fn main() {
+    let dangling: &i32 = bad(|x| x);
+    println!("{dangling}");
+}
+"#,
+    );
+    check_fails(
+        "hrtb_outer_type_param_escape_option",
+        r#"
+fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
+    let local = 9;
+    f(&local)
+}
+fn main() {
+    let dangling: Option<&i32> = bad(|x| Some(x));
+    println!("{dangling:?}");
+}
+"#,
+    );
+    check_fails(
+        "copied_recv_alias_to_vec_escape",
+        r#"
+fn leak<'a>(xs: &[&'a str]) -> Vec<&'static str> {
+    let alias = xs;
+    alias.to_vec()
+}
+fn main() {
+    let local = String::from("dangling");
+    let s: &[&str] = &[&local];
+    let v: Vec<&'static str> = leak(s);
+    drop(local);
+    println!("{}", v[0]);
+}
+"#,
+    );
+    check_fails(
+        "copied_recv_elided_adt_clone_escape",
+        r#"
+#[derive(Clone)]
+struct Wrap<'a>(&'a str);
+fn leak(w: &Wrap) -> Wrap<'static> {
+    w.clone()
+}
+fn main() {
+    let local = String::from("dangling");
+    let w = Wrap(&local);
+    let leaked = leak(&w);
+    drop(local);
+    println!("{}", leaked.0);
+}
+"#,
+    );
+    check_fails(
+        "caller_lt_mixed_static_tuple_escape",
+        r#"
+fn leak<'a>(s: &'a str, f: impl FnOnce((&'static str, &'a str))) {
+    f((s, s));
+}
+fn main() {
+    let local = String::from("dangling");
+    leak(&local, |(s, _)| { let _: &'static str = s; });
+}
+"#,
+    );
+    check_fails(
+        "caller_lt_unrelated_lifetime_escape",
+        r#"
+fn stash<'a, 'b, F: FnMut(&'a i32)>(mut f: F, y: &'b i32) {
+    f(y);
+}
+fn main() {
+    let long = 1;
+    let mut out: &i32 = &long;
+    {
+        let short = 2;
+        stash(|r| out = r, &short);
+    }
+    println!("{out}");
+}
+"#,
+    );
 }
 
 #[test]
@@ -317,6 +405,30 @@ enum Color {
 
 fn ok_static(s: &'static str) -> &'static str {
     s
+}
+
+mod dyn_super {
+    pub trait Base {
+        fn ping(&self) -> i32;
+    }
+    pub trait Sub: Base {
+        fn sub_ping(&self) -> i32;
+    }
+    pub struct Impl;
+    impl Base for Impl {
+        fn ping(&self) -> i32 {
+            7
+        }
+    }
+    impl Sub for Impl {
+        fn sub_ping(&self) -> i32 {
+            11
+        }
+    }
+}
+
+fn call_sub(s: &dyn dyn_super::Sub) -> i32 {
+    s.ping() + s.sub_ping()
 }
 
 fn main() {
@@ -368,6 +480,34 @@ fn main() {
         0 => 0,
         1..=u128::MAX => 1,
     };
+
+    let _ = call_sub(&dyn_super::Impl);
+
+    let sep = String::from(", ");
+    let joined = [1, 2]
+        .iter()
+        .map(|n| format!("{n}"))
+        .collect::<Vec<_>>()
+        .join(&sep);
+    let _ = joined.len();
+
+    fn with_ref<R>(f: impl FnOnce(&i32) -> R) -> R {
+        let local = 9;
+        f(&local)
+    }
+    let _ = with_ref(|x| *x + 1);
+
+    fn for_same_lt<'a>(s: &'a str, mut f: impl FnMut(&'a str)) {
+        f(s);
+    }
+    let mut seen = "";
+    for_same_lt("ok", |s| seen = s);
+    let _ = seen.len();
+
+    fn slice_static(xs: &[&'static str]) -> Vec<&'static str> {
+        xs.to_vec()
+    }
+    let _ = slice_static(&["a", "b"]);
 }
 "#,
     );

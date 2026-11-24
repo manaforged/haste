@@ -23,6 +23,7 @@ struct TraitCandidate {
     item: ItemRef,
     kind: SelfKind,
     bound: Option<Ty>,
+    dyn_step: Option<Ty>,
 }
 
 struct Pick {
@@ -234,10 +235,18 @@ impl<'a> Infer<'_, 'a> {
         (candidates, traits): (&[Candidate], &[TraitCandidate]),
         expected: Option<Ty>,
     ) -> Result<Option<Pick>> {
-        let (bounded, all_unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits
+        let (bounded, raw_unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits
             .iter()
             .partition(|candidate| candidate.bound.is_some());
         let step_ty = self.substitute(step);
+        let all_unbounded: Vec<TraitCandidate> = raw_unbounded
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .dyn_step
+                    .is_none_or(|dyn_ty| self.substitute(dyn_ty) == step_ty)
+            })
+            .collect();
         let is_var = matches!(self.cx.types.kind(self.resolve(step)), Kind::Var(_));
         let bounded_at: Vec<TraitCandidate> = bounded
             .iter()
@@ -392,6 +401,11 @@ impl<'a> Infer<'_, 'a> {
             self.unify(from, to)?;
         }
         substs.extend(given);
+        if (!self.projections.is_empty() || !self.obligations.is_empty())
+            && substs.iter().any(|&ty| self.has_vars(ty))
+        {
+            self.settle_projection_loop()?;
+        }
         self.bind_bounds(item, &substs)?;
         self.out
             .res

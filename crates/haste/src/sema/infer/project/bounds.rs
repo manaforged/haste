@@ -458,6 +458,13 @@ impl Infer<'_, '_> {
             return self.bind_callable(arena, (of, path), ty);
         }
         let args = self.bound_args(of, arena, path, ty)?;
+        if !self.compiler_trait(of)
+            && !self.has_vars(ty)
+            && !self.has_params(ty)
+            && args.iter().any(|&a| self.has_vars(a))
+        {
+            let _ = self.select(of, ty, &args)?;
+        }
         if (!self.compiler_trait(of) && self.obligation_open(ty, &args))
             || self.is_thread_auto_trait(of)
         {

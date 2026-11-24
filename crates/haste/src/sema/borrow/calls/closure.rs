@@ -135,6 +135,11 @@ impl Checker<'_, '_> {
             super::super::checks::is_temp_target(s.target).is_some()
                 || !self.from_caller(s.target, s.through_ref)
         });
+        let ret_params = if self.ty_holds_borrow(closure.ret) {
+            self.closure_ret_param_indices(body, &closure.params, &body_state)
+        } else {
+            Vec::new()
+        };
         self.record_closure_body_loans(
             expr,
             &closure.params,
@@ -142,8 +147,171 @@ impl Checker<'_, '_> {
             &body_state,
             state,
             (moves_capture, mutates_capture, borrows_local),
+            ret_params,
         );
         Ok(())
+    }
+
+    fn closure_ret_param_indices(
+        &mut self,
+        body: ExprId,
+        closure_params: &[u32],
+        body_state: &State,
+    ) -> Vec<usize> {
+        let mut probe_state = body_state.clone();
+        for &p in closure_params {
+            if self.ty_holds_borrow(self.local_ty(p)) {
+                push_loan(
+                    &mut probe_state.loans,
+                    p,
+                    Vec::new(),
+                    Some(p),
+                    false,
+                    true,
+                    false,
+                    false,
+                    None,
+                );
+            }
+        }
+        let mut ret_exprs = vec![body];
+        self.collect_closure_return_exprs(body, &mut ret_exprs, &mut probe_state, closure_params);
+        let mut out = Vec::new();
+        for ret_expr in ret_exprs {
+            if let Some(cached) = self.temp_sources.get(&ret_expr) {
+                for src in cached {
+                    if let Some(idx) = closure_params.iter().position(|&p| p == src.target)
+                        && !out.contains(&idx)
+                    {
+                        out.push(idx);
+                    }
+                }
+            }
+            for src in self.expr_borrow_sources(ret_expr, &probe_state) {
+                if let Some(idx) = closure_params.iter().position(|&p| p == src.target)
+                    && !out.contains(&idx)
+                {
+                    out.push(idx);
+                }
+            }
+        }
+        out
+    }
+
+    fn collect_closure_return_exprs(
+        &mut self,
+        expr: ExprId,
+        out: &mut Vec<ExprId>,
+        probe_state: &mut State,
+        closure_params: &[u32],
+    ) {
+        match *self.body.expr(expr) {
+            Expr::Closure { .. } => {}
+            Expr::Return(Some(val)) => {
+                out.push(val);
+                self.collect_closure_return_exprs(val, out, probe_state, closure_params);
+            }
+            Expr::Block { stmts, tail, .. } => {
+                for id in self.body.list(stmts).to_vec() {
+                    match self.body.stmts[id as usize] {
+                        Stmt::Let {
+                            pat,
+                            init,
+                            otherwise,
+                            ..
+                        } => {
+                            if let Some(e) = init {
+                                self.collect_closure_return_exprs(
+                                    e,
+                                    out,
+                                    probe_state,
+                                    closure_params,
+                                );
+                                let mut bound = HashSet::default();
+                                self.collect_pat_locals(pat, &mut bound);
+                                if !bound.is_empty() {
+                                    let srcs = self.expr_borrow_sources(e, probe_state);
+                                    for src in srcs {
+                                        if closure_params.contains(&src.target) {
+                                            for &local in &bound {
+                                                push_loan(
+                                                    &mut probe_state.loans,
+                                                    src.target,
+                                                    Vec::new(),
+                                                    Some(local),
+                                                    false,
+                                                    true,
+                                                    false,
+                                                    false,
+                                                    None,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(e) = otherwise {
+                                self.collect_closure_return_exprs(
+                                    e,
+                                    out,
+                                    probe_state,
+                                    closure_params,
+                                );
+                            }
+                        }
+                        Stmt::Expr(e, _) => {
+                            self.collect_closure_return_exprs(e, out, probe_state, closure_params)
+                        }
+                        Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
+                    }
+                }
+                if let Some(t) = tail {
+                    self.collect_closure_return_exprs(t, out, probe_state, closure_params);
+                }
+            }
+            Expr::If(c, t, e) => {
+                self.collect_closure_return_exprs(c, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(t, out, probe_state, closure_params);
+                if let Some(alt) = e {
+                    self.collect_closure_return_exprs(alt, out, probe_state, closure_params);
+                }
+            }
+            Expr::Match(scrut, arms) => {
+                self.collect_closure_return_exprs(scrut, out, probe_state, closure_params);
+                for id in self.body.list(arms).to_vec() {
+                    let arm = self.body.arms[id as usize];
+                    if let Some(g) = arm.guard {
+                        self.collect_closure_return_exprs(g, out, probe_state, closure_params);
+                    }
+                    self.collect_closure_return_exprs(arm.body, out, probe_state, closure_params);
+                }
+            }
+            Expr::Loop { body, .. } => {
+                self.collect_closure_return_exprs(body, out, probe_state, closure_params)
+            }
+            Expr::While { cond, body, .. } => {
+                self.collect_closure_return_exprs(cond, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(body, out, probe_state, closure_params);
+            }
+            Expr::For { iter, body, .. } => {
+                self.collect_closure_return_exprs(iter, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(body, out, probe_state, closure_params);
+            }
+            Expr::Paren(inner)
+            | Expr::Cast(inner, _)
+            | Expr::Try(inner)
+            | Expr::Await(inner)
+            | Expr::Unary(_, inner)
+            | Expr::Ref { expr: inner, .. }
+            | Expr::Field(inner, _) => {
+                self.collect_closure_return_exprs(inner, out, probe_state, closure_params)
+            }
+            Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) => {
+                self.collect_closure_return_exprs(a, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(b, out, probe_state, closure_params);
+            }
+            _ => {}
+        }
     }
 
     fn check_closure_captures(
