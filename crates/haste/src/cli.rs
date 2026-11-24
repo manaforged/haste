@@ -343,10 +343,22 @@ pub fn main() -> Result<()> {
         return Ok(print_meta(meta));
     }
     crate::sema::evaluate::install(crate::image::evaluator);
-    let (command, path, rest, stats_json, out) = match parse_invocation()? {
+    let (command, path, rest, stats_json, out, cfg) = match parse_invocation()? {
         Ok(parsed) => parsed,
         Err(meta) => return Ok(print_meta(meta)),
     };
+    crate::with_config(std::sync::Arc::new(cfg), || {
+        run_parsed(command, path, rest, stats_json, out)
+    })
+}
+
+fn run_parsed(
+    command: Command,
+    path: std::path::PathBuf,
+    rest: Vec<String>,
+    stats_json: Option<std::path::PathBuf>,
+    out: Option<std::path::PathBuf>,
+) -> Result<()> {
     match command {
         Command::Clean => return clean_cache(),
         Command::Debug(Query::Items) => return print_items(&path),
@@ -426,7 +438,7 @@ pub(crate) fn load_workspace(
     root: &std::path::Path,
     targets: &Targets,
 ) -> Result<graph::Workspace> {
-    let mut workspace = graph::load(root, targets, crate::selection())?;
+    let mut workspace = graph::load(root, targets, &crate::selection())?;
     workspace.merge(graph::load_sysroot(&graph::library()?, targets)?);
     crate::scripts::settle(&mut workspace, targets)?;
     Ok(workspace)
@@ -460,7 +472,7 @@ fn report(
     };
     let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
-        Command::Debug(Query::Graph) => graph::load(root, &targets, crate::selection())?,
+        Command::Debug(Query::Graph) => graph::load(root, &targets, &crate::selection())?,
         _ => load_workspace(root, &targets)?,
     };
     let graph_span = graph_clock.elapsed();

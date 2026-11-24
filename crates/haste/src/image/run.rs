@@ -43,14 +43,17 @@ impl Image {
             bail!("{name} has no start wrapper (slot {s})");
         }
         let (pid, mut stderr_pipe) = fork_piped(|writer| {
-            // SAFETY: writer is a live pipe write fd; dup2 redirects child stderr to it before running the test.
-            unsafe {
-                libc::dup2(
-                    std::os::fd::AsRawFd::as_raw_fd(&writer),
-                    libc::STDERR_FILENO,
-                )
-            };
-            drop(writer);
+            crate::host::unwind::set_jit_unwind_head(self.unwind_head);
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&writer);
+            if raw != libc::STDERR_FILENO {
+                // SAFETY: raw is a live pipe write fd distinct from STDERR_FILENO; dup2 redirects child stderr to it before running the test.
+                unsafe {
+                    libc::dup2(raw, libc::STDERR_FILENO);
+                }
+                drop(writer);
+            } else {
+                std::mem::forget(writer);
+            }
             if let Some(start) = start {
                 let status = self.enter_main((start, index), &[name.to_owned()]);
                 if status != 0 {
@@ -241,8 +244,8 @@ impl Image {
 fn silence_stderr() {
     // SAFETY: c"/dev/null" is a static NUL-terminated path, and O_WRONLY | O_CLOEXEC takes no mode argument.
     let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if null >= 0 {
-        // SAFETY: null is a valid open descriptor; dup2 redirects child stderr and close releases the duplicate.
+    if null >= 0 && null != libc::STDERR_FILENO {
+        // SAFETY: null is a valid open descriptor distinct from STDERR_FILENO; dup2 redirects child stderr and close releases the duplicate.
         unsafe {
             libc::dup2(null, libc::STDERR_FILENO);
             libc::close(null);

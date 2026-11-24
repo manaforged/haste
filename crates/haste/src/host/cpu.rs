@@ -163,8 +163,8 @@ mod arch {
 
     pub(super) fn control(register: u32) -> u64 {
         let enabled = __cpuid(1).ecx & OSXSAVE != 0;
-        // SAFETY: the OS set CR4.OSXSAVE, which `cpuid` leaf 1 reports, so `xgetbv` does not fault.
         if enabled {
+            // SAFETY: the OS set CR4.OSXSAVE, which `cpuid` leaf 1 reports, so `xgetbv` does not fault.
             unsafe { _xgetbv(register) }
         } else {
             0

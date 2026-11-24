@@ -136,14 +136,17 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         });
         lock(&self.shared.state).running += 1;
         let (job_slot, shared) = (Arc::clone(&slot), Arc::clone(&self.shared));
+        let cfg = crate::config();
         let in_host = crate::in_host_target();
         let job = move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                if in_host {
-                    crate::with_host_target(f)
-                } else {
-                    f()
-                }
+                crate::with_config(cfg, || {
+                    if in_host {
+                        crate::with_host_target(f)
+                    } else {
+                        f()
+                    }
+                })
             }));
             let ok = result.is_ok();
             *lock(&job_slot.value) = Some(result);

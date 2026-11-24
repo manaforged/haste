@@ -46,7 +46,7 @@ pub fn workspace_path(ws_hash: u64) -> PathBuf {
 
 /// Returns whether substrate caching is enabled (disabled when `HASTE_NO_SUBSTRATE=1`).
 pub fn enabled() -> bool {
-    !crate::env_flag("HASTE_NO_SUBSTRATE")
+    crate::with_cfg(|c| c.use_substrate)
 }
 
 /// Computes a 64-bit fingerprint for `target` and the running compiler binary.
@@ -54,6 +54,9 @@ pub fn target_hash(target: &Target) -> u64 {
     let mut hasher = FxHasher::default();
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
+    if target.arch == haste_codegen::Arch::X64 {
+        crate::with_cfg(|c| c.x64_baseline).hash(&mut hasher);
+    }
     hash_program(&mut hasher);
     hasher.finish()
 }

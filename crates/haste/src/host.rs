@@ -298,6 +298,9 @@ pub(crate) mod apple_args {
 
     impl Drop for Guard {
         fn drop(&mut self) {
+            if !self.prev_active {
+                ACTIVE.store(false, Ordering::Release);
+            }
             ARGC.store(self.prev_argc, Ordering::Release);
             ARGV.store(self.prev_argv, Ordering::Release);
             ACTIVE.store(self.prev_active, Ordering::Release);

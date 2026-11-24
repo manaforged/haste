@@ -26,7 +26,7 @@ pub const DICT_MIN_FANOUT: usize = 8;
 
 /// Whether `HASTE_VERIFY_STENCIL` asks for stencil instantiations to be checked against concrete lowering.
 pub fn verify_stencil() -> bool {
-    crate::env_flag("HASTE_VERIFY_STENCIL")
+    crate::with_cfg(|c| c.verify_stencil)
 }
 
 const DEFAULT_TIER_UP: u32 = 64;

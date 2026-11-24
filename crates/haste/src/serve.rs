@@ -654,8 +654,8 @@ mod unix_ipc {
     fn restore(saved: [RawFd; 3], received: &[RawFd]) {
         drop(std::io::stdout().flush());
         drop(std::io::stderr().flush());
-        // SAFETY: saved holds the duplicates of this process's own standard descriptors.
         for (&own, kept) in STDIO.iter().zip(saved) {
+            // SAFETY: saved holds the duplicates of this process's own standard descriptors.
             unsafe {
                 libc::dup2(kept, own);
             }
@@ -665,8 +665,8 @@ mod unix_ipc {
     }
 
     fn close_all(fds: &[RawFd]) {
-        // SAFETY: fds are descriptors this process owns and nothing else uses after this call.
         for &fd in fds {
+            // SAFETY: fds are descriptors this process owns and nothing else uses after this call.
             unsafe {
                 libc::close(fd);
             }

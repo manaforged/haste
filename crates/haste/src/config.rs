@@ -1,9 +1,8 @@
-//! Immutable build configuration snapshot hashed by daemon sockets and no-op stamps.
+//! Immutable build configuration owned per invocation and propagated across worker threads.
 
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 
-#[cfg(test)]
 use haste_codegen::Target;
 
 use crate::Selection;
@@ -12,14 +11,15 @@ use crate::outline::tree::Profile;
 /// Environment variable setting function alignment in bytes for standalone AOT executables.
 pub(crate) const FN_ALIGN_ENV: &str = "HASTE_FN_ALIGN";
 
-/// Resolved compilation configuration from CLI flags and behavioral `HASTE_*` environment variables.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Resolved compilation configuration from CLI flags or library builder and `HASTE_*` environment variables.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Config {
     pub jobs: usize,
     pub profile: Profile,
-    pub target_triple: &'static str,
+    pub target: &'static Target,
     pub selection: Selection,
     pub test_mode: bool,
+    pub daemon: bool,
     pub prepared: bool,
     pub debug_info: bool,
     pub symbols: bool,
@@ -31,34 +31,52 @@ pub(crate) struct Config {
     pub library: Option<OsString>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
 impl Config {
-    /// Captures the active process configuration from CLI selections and behavioral `HASTE_*` variables.
-    pub(crate) fn current() -> Self {
-        let profile = crate::profile();
-        let debug_info = profile != Profile::Release || crate::env_flag("HASTE_DEBUG_INFO");
-        let symbols = debug_info || crate::env_flag("HASTE_SYMBOLS");
-        Self {
-            jobs: crate::jobs(),
-            profile,
-            target_triple: crate::compile_target().triple,
-            selection: crate::selection().clone(),
-            test_mode: crate::test_mode(),
-            prepared: crate::prep::prepared(),
-            debug_info,
-            symbols,
+    /// Builds a default configuration populated from the current process environment.
+    pub(crate) fn from_env() -> Self {
+        let jobs = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let mut cfg = Self {
+            jobs,
+            profile: Profile::default(),
+            target: Target::host(),
+            selection: Selection::default(),
+            test_mode: false,
+            daemon: false,
+            prepared: false,
+            debug_info: false,
+            symbols: false,
             x64_baseline: crate::env_flag("HASTE_X64_BASELINE"),
             fn_align: parse_fn_align(std::env::var(FN_ALIGN_ENV).ok().as_deref()),
             use_substrate: !crate::env_flag("HASTE_NO_SUBSTRATE"),
             verify_passes: crate::env_flag("HASTE_VERIFY_PASSES"),
             verify_stencil: crate::env_flag("HASTE_VERIFY_STENCIL"),
             library: std::env::var_os(crate::LIBRARY_ENV),
-        }
+        };
+        cfg.refresh_debug_flags();
+        cfg
     }
 
-    /// Hashes every build-affecting field into `state` (excluding concurrency `jobs`).
+    /// Recomputes `debug_info` and `symbols` from `profile` and environment toggles.
+    pub(crate) fn refresh_debug_flags(&mut self) {
+        self.debug_info = self.profile != Profile::Release || crate::env_flag("HASTE_DEBUG_INFO");
+        self.symbols = self.debug_info || crate::env_flag("HASTE_SYMBOLS");
+    }
+
+    /// Returns the active process configuration snapshot for the current thread.
+    pub(crate) fn current() -> Self {
+        crate::with_cfg(Clone::clone)
+    }
+
+    /// Hashes every build-affecting field into `state` (excluding concurrency `jobs` and `daemon`).
     pub(crate) fn hash_cache_key(&self, state: &mut impl Hasher) {
         (self.profile == Profile::Release).hash(state);
-        self.target_triple.hash(state);
+        self.target.triple.hash(state);
         self.selection.hash(state);
         self.test_mode.hash(state);
         self.prepared.hash(state);
@@ -72,15 +90,16 @@ impl Config {
         self.library.hash(state);
     }
 
-    /// Returns the compilation target for this configuration.
+    /// Returns a deterministic test configuration targeting `target`.
     #[cfg(test)]
     pub(crate) fn for_target(target: &'static Target) -> Self {
         Self {
             jobs: 1,
             profile: Profile::Debug,
-            target_triple: target.triple,
+            target,
             selection: Selection::default(),
             test_mode: false,
+            daemon: false,
             prepared: false,
             debug_info: true,
             symbols: true,

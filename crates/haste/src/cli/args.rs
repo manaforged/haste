@@ -272,6 +272,7 @@ pub(super) type ParsedInvocation = (
     Vec<String>,
     Option<PathBuf>,
     Option<PathBuf>,
+    crate::config::Config,
 );
 
 fn parse_args_raw(
@@ -290,8 +291,9 @@ fn parse_args_raw(
         if args.peek().is_some() {
             anyhow::bail!("{}", usage());
         }
+        let cfg = crate::config::Config::from_env();
         return Ok(Ok((
-            (command, PathBuf::new(), Vec::new(), None, None),
+            (command, PathBuf::new(), Vec::new(), None, None, cfg),
             opts,
         )));
     }
@@ -360,7 +362,24 @@ fn parse_args_raw(
     };
     let stats_json = opts.stats.clone();
     let out = opts.out.clone();
-    Ok(Ok(((command, path, rest, stats_json, out), opts)))
+    let mut cfg = crate::config::Config::from_env();
+    if let Some(count) = opts.jobs {
+        cfg.jobs = count;
+    }
+    if opts.release {
+        cfg.profile = outline::tree::Profile::Release;
+    }
+    cfg.refresh_debug_flags();
+    cfg.daemon = opts.daemon;
+    cfg.prepared = opts.prepared;
+    if let Some(target) = opts.target {
+        cfg.target = target;
+    }
+    cfg.selection = opts.selection.clone();
+    cfg.test_mode = matches!(command, Command::Request(Request::Test))
+        || (matches!(command, Command::Serve(ServeAction::Run))
+            && crate::env_flag("HASTE_SERVE_TEST"));
+    Ok(Ok(((command, path, rest, stats_json, out, cfg), opts)))
 }
 
 pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
@@ -368,15 +387,6 @@ pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation,
         Ok(parsed) => parsed,
         Err(meta) => return Ok(Err(meta)),
     };
-    if let Some(count) = opts.jobs {
-        crate::set_jobs(count);
-    }
-    if opts.release {
-        crate::set_profile(outline::tree::Profile::Release);
-    }
-    if opts.daemon {
-        crate::set_daemon();
-    }
     if opts.prepared {
         crate::prep::set_prepared();
     }
@@ -388,16 +398,6 @@ pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation,
     }
     if opts.watch {
         crate::image::watch::enable();
-    }
-    if let Some(target) = opts.target {
-        crate::set_target(target);
-    }
-    crate::set_selection(opts.selection);
-    if matches!(inv.0, Command::Request(Request::Test))
-        || (matches!(inv.0, Command::Serve(ServeAction::Run))
-            && crate::env_flag("HASTE_SERVE_TEST"))
-    {
-        crate::set_test_mode();
     }
     Ok(Ok(inv))
 }
@@ -423,22 +423,25 @@ mod tests {
 
     #[test]
     fn run_parses_haste_flags_after_path_until_double_dash() {
-        let ((cmd, path, rest, _, _), opts) =
+        let ((cmd, path, rest, _, _, cfg), opts) =
             parse_strs(&["run", "examples/hello", "--release", "--", "--release", "x"])
                 .expect("valid invocation")
                 .expect("not meta");
         assert!(matches!(cmd, Command::Request(Request::Run)));
         assert_eq!(path, PathBuf::from("examples/hello"));
         assert!(opts.release);
+        assert_eq!(cfg.profile, outline::tree::Profile::Release);
         assert_eq!(rest, vec!["--release", "x"]);
     }
 
     #[test]
     fn run_passes_flags_after_double_dash_to_program_only() {
-        let ((_, _, rest, _, _), opts) = parse_strs(&["run", "examples/hello", "--", "--release"])
-            .expect("valid invocation")
-            .expect("not meta");
+        let ((_, _, rest, _, _, cfg), opts) =
+            parse_strs(&["run", "examples/hello", "--", "--release"])
+                .expect("valid invocation")
+                .expect("not meta");
         assert!(!opts.release);
+        assert_eq!(cfg.profile, outline::tree::Profile::Debug);
         assert_eq!(rest, vec!["--release"]);
     }
 
@@ -464,19 +467,19 @@ mod tests {
 
     #[test]
     fn parses_daemon_flag_and_serve_control_subcommands() {
-        let ((cmd, _, _, _, _), opts) = parse_strs(&["build", "--daemon", "examples/hello"])
+        let ((cmd, _, _, _, _, cfg), opts) = parse_strs(&["build", "--daemon", "examples/hello"])
             .expect("valid")
             .expect("not meta");
         assert!(matches!(cmd, Command::Request(Request::Build)));
-        assert!(opts.daemon);
+        assert!(opts.daemon && cfg.daemon);
 
-        let ((cmd, path, _, _, _), _) = parse_strs(&["serve", "status"])
+        let ((cmd, path, _, _, _, _), _) = parse_strs(&["serve", "status"])
             .expect("valid")
             .expect("not meta");
         assert!(matches!(cmd, Command::Serve(ServeAction::Status)));
         assert!(path.as_os_str().is_empty());
 
-        let ((cmd, path, _, _, _), _) = parse_strs(&["serve", "stop", "--all"])
+        let ((cmd, path, _, _, _, _), _) = parse_strs(&["serve", "stop", "--all"])
             .expect("valid")
             .expect("not meta");
         assert!(matches!(
@@ -485,7 +488,7 @@ mod tests {
         ));
         assert!(path.as_os_str().is_empty());
 
-        let ((cmd, path, _, _, _), _) = parse_strs(&["serve", "stop", "examples/hello"])
+        let ((cmd, path, _, _, _, _), _) = parse_strs(&["serve", "stop", "examples/hello"])
             .expect("valid")
             .expect("not meta");
         assert!(matches!(

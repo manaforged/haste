@@ -32,34 +32,16 @@ mod serve;
 mod substrate;
 mod sync;
 
-use std::sync::OnceLock;
+use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 /// How deep macro expansion, autoderef, trait selection and nested item frames go before failing, rustc's default `recursion_limit`.
 pub(crate) const RECURSION_LIMIT: usize = 128;
 
-pub use cli::main;
-
-static JOBS: OnceLock<usize> = OnceLock::new();
-
-/// How many processes or threads haste runs at once: the count `--jobs` set, else the cores this process may run on.
-fn jobs() -> usize {
-    *JOBS.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
-}
-
-/// Sets the job count once, before any work reads it.
-fn set_jobs(count: usize) {
-    _ = JOBS.set(count);
-}
-
-static PROFILE: OnceLock<outline::tree::Profile> = OnceLock::new();
-
-/// The build profile: the one `--release` set, else the debug profile.
-pub(crate) fn profile() -> outline::tree::Profile {
-    *PROFILE.get_or_init(outline::tree::Profile::default)
-}
-
 /// Environment variable naming an explicit Rust standard library `library/` source directory.
 pub(crate) const LIBRARY_ENV: &str = "HASTE_LIBRARY";
+
+pub use cli::main;
 
 /// Whether an optional environment variable value is enabled (non-empty and not `"0"`).
 fn parse_env_flag(value: Option<&std::ffi::OsStr>) -> bool {
@@ -71,23 +53,87 @@ pub(crate) fn env_flag(name: &str) -> bool {
     parse_env_flag(std::env::var_os(name).as_deref())
 }
 
-static TARGET: OnceLock<&'static haste_codegen::Target> = OnceLock::new();
+/// Package, binary, and feature selection from the command line or builder.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub package: Option<String>,
+    pub bin: Option<String>,
+    pub example: Option<String>,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub ignored_only: bool,
+    pub include_ignored: bool,
+}
 
 thread_local! {
-    static HOST_SCOPE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ACTIVE_CONFIG: RefCell<Option<Arc<config::Config>>> = const { RefCell::new(None) };
+    static HOST_SCOPE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Runs `f` with a borrowed reference to this thread's active `Config` without cloning the `Arc`.
+pub(crate) fn with_cfg<R>(f: impl FnOnce(&config::Config) -> R) -> R {
+    ACTIVE_CONFIG.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(Arc::new(config::Config::from_env()));
+        }
+        let guard = slot.borrow();
+        let cfg = guard
+            .as_ref()
+            .expect("invariant: ACTIVE_CONFIG initialized above");
+        f(cfg)
+    })
+}
+
+/// Returns a cloned handle to the active build `Config` for propagating across worker threads.
+pub(crate) fn config() -> Arc<config::Config> {
+    with_cfg(|_| {
+        ACTIVE_CONFIG.with(|slot| {
+            Arc::clone(
+                slot.borrow()
+                    .as_ref()
+                    .expect("invariant: ACTIVE_CONFIG initialized above"),
+            )
+        })
+    })
+}
+
+/// Runs `f` with `cfg` installed as the active build configuration for this thread and any `sync::scope` workers it spawns.
+pub(crate) fn with_config<R>(cfg: Arc<config::Config>, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<Arc<config::Config>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE_CONFIG.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let prev = ACTIVE_CONFIG.with(|slot| slot.borrow_mut().replace(cfg));
+    let _guard = Guard(prev);
+    f()
+}
+
+/// How many processes or threads haste runs at once.
+fn jobs() -> usize {
+    with_cfg(|c| c.jobs)
+}
+
+/// The build profile (`Debug` or `Release`).
+pub(crate) fn profile() -> outline::tree::Profile {
+    with_cfg(|c| c.profile)
 }
 
 /// Whether this thread is currently inside `with_host_target`.
 pub(crate) fn in_host_target() -> bool {
-    HOST_SCOPE.with(std::cell::Cell::get) > 0
+    HOST_SCOPE.with(Cell::get) > 0
 }
 
-/// The target being compiled for: the host target inside a host build-script/proc-macro scope on this thread, else the `--target` override, else the host target.
+/// The target being compiled for: the host target inside a host build-script/proc-macro scope on this thread, else the active config's target.
 pub(crate) fn compile_target() -> &'static haste_codegen::Target {
     if in_host_target() {
         return haste_codegen::Target::host();
     }
-    *TARGET.get_or_init(haste_codegen::Target::host)
+    with_cfg(|c| c.target)
 }
 
 /// Runs `f` with `compile_target()` pinned to the host target on this thread (for build scripts and proc macros).
@@ -103,68 +149,25 @@ pub(crate) fn with_host_target<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Sets the compilation target once, before any work reads it.
-fn set_target(target: &'static haste_codegen::Target) {
-    _ = TARGET.set(target);
-}
-
 /// The compilation target with the code generator's effort set by the build profile.
 pub(crate) fn host_target() -> haste_codegen::Target {
-    compile_target().effort(profile().into())
+    let target = compile_target();
+    target.effort(with_cfg(|c| c.profile).into())
 }
 
-/// Sets the build profile once, before any work reads it.
-fn set_profile(profile: outline::tree::Profile) {
-    _ = PROFILE.set(profile);
+/// The package, binary, and feature selection for the active run.
+pub(crate) fn selection() -> Selection {
+    with_cfg(|c| c.selection.clone())
 }
 
-/// Package, binary, and feature selection from the command line.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
-pub(crate) struct Selection {
-    pub package: Option<String>,
-    pub bin: Option<String>,
-    pub example: Option<String>,
-    pub features: Vec<String>,
-    pub all_features: bool,
-    pub no_default_features: bool,
-    pub ignored_only: bool,
-    pub include_ignored: bool,
-}
-
-static SELECTION: OnceLock<Selection> = OnceLock::new();
-
-/// The package, binary, and feature selection for this run.
-pub(crate) fn selection() -> &'static Selection {
-    SELECTION.get_or_init(Selection::default)
-}
-
-/// Sets the package, binary, and feature selection once, before any work reads it.
-fn set_selection(selection: Selection) {
-    _ = SELECTION.set(selection);
-}
-
-static TEST_MODE: OnceLock<bool> = OnceLock::new();
-
-/// Whether this invocation is running `haste test` (enabling `#[cfg(test)]` and member dev-dependencies).
+/// Whether the active invocation is running tests (enabling `#[cfg(test)]` and member dev-dependencies).
 pub(crate) fn test_mode() -> bool {
-    *TEST_MODE.get_or_init(|| false)
+    with_cfg(|c| c.test_mode)
 }
-
-/// Enables test mode once, before any workspace or outline loads.
-fn set_test_mode() {
-    _ = TEST_MODE.set(true);
-}
-
-static DAEMON: OnceLock<bool> = OnceLock::new();
 
 /// Whether `--daemon` opted into spawning a resident background `haste serve` daemon.
 pub(crate) fn daemon() -> bool {
-    *DAEMON.get_or_init(|| false)
-}
-
-/// Enables opt-in background daemon spawning once, before commands execute.
-fn set_daemon() {
-    _ = DAEMON.set(true);
+    with_cfg(|c| c.daemon)
 }
 
 #[cfg(test)]
@@ -206,5 +209,92 @@ mod tests {
         assert!(worker_seen);
         assert!(!outside);
         assert!(!in_host_target());
+    }
+
+    #[test]
+    fn concurrent_configs_stay_isolated_across_threads_and_workers() {
+        let host = haste_codegen::Target::host();
+        let cross = haste_codegen::TARGETS
+            .iter()
+            .find(|t| t.triple != host.triple)
+            .expect("non-host target exists");
+        let cfg_a = Arc::new(config::Config {
+            jobs: 2,
+            profile: outline::tree::Profile::Debug,
+            target: host,
+            selection: Selection {
+                features: vec!["alpha".to_owned()],
+                ..Selection::default()
+            },
+            ..config::Config::for_target(host)
+        });
+        let cfg_b = Arc::new(config::Config {
+            jobs: 7,
+            profile: outline::tree::Profile::Release,
+            target: cross,
+            selection: Selection {
+                features: vec!["beta".to_owned()],
+                ..Selection::default()
+            },
+            ..config::Config::for_target(cross)
+        });
+        let ready = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+        let (r2, d2, b2) = (Arc::clone(&ready), Arc::clone(&done), Arc::clone(&cfg_b));
+        let peer = std::thread::spawn(move || {
+            with_config(b2, || {
+                r2.wait();
+                let worker = crate::sync::scope(|s| {
+                    s.spawn(|| {
+                        (
+                            jobs(),
+                            profile(),
+                            compile_target().triple,
+                            selection().features,
+                        )
+                    })
+                    .join()
+                    .expect("worker b")
+                });
+                d2.wait();
+                worker
+            })
+        });
+        let seen_a = with_config(cfg_a, || {
+            ready.wait();
+            let worker = crate::sync::scope(|s| {
+                s.spawn(|| {
+                    (
+                        jobs(),
+                        profile(),
+                        compile_target().triple,
+                        selection().features,
+                    )
+                })
+                .join()
+                .expect("worker a")
+            });
+            done.wait();
+            worker
+        });
+        let seen_b = peer.join().expect("peer thread");
+        assert_eq!(
+            seen_a,
+            (
+                2,
+                outline::tree::Profile::Debug,
+                host.triple,
+                vec!["alpha".to_owned()]
+            )
+        );
+        assert_eq!(
+            seen_b,
+            (
+                7,
+                outline::tree::Profile::Release,
+                cross.triple,
+                vec!["beta".to_owned()]
+            )
+        );
     }
 }
