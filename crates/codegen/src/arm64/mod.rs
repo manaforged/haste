@@ -14,7 +14,7 @@ mod wide;
 
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
-use crate::alloc::{CallTarget, Location, Plan, Regs};
+use crate::alloc::{Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, IntCC, Op, SigRef, Type, Value};
@@ -102,10 +102,14 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
             crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, packing))?;
         }
     }
+    let tail_calls = if full { crate::frame::find_tail_calls(func, &plan, &abi, !target.direct_calls, &|sig| classify(sig, packing)) } else { Vec::new() };
     let lr = plan.locations.iter().any(|loc| matches!(loc, Location::Reg(LR)));
-    let bracket = !lr && crate::frame::brackets_calls(func, &frame, &abi);
+    let bracket = !lr && tail_calls.is_empty() && crate::frame::brackets_calls(func, &frame, &abi);
+    if !tail_calls.is_empty() && framed && !lr && !crate::frame::needs_frame_without_tails(func, &frame, &abi, &tail_calls) {
+        framed = false;
+    }
     framed = (framed || lr) && !bracket;
-    let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP], |_| false)).flatten();
+    let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP], |inst, _| crate::frame::is_tail(&tail_calls, inst))).flatten();
     let mut asm = Asm::default();
     let tlv_cache = (full && tlv_cells && framed).then(|| frames::plan_tlv_cache(func, &plan, &defs, &mut frame, &mut asm)).flatten();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -138,6 +142,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         lines: Vec::new(),
         in_fast: false,
         tails: Tails::new(),
+        tail_calls,
     };
     drive(emit, &order)
 }
@@ -201,6 +206,7 @@ pub(super) struct Emit<'a> {
     lines: Vec<(u32, u64)>,
     in_fast: bool,
     tails: Tails<'a, Label>,
+    tail_calls: Vec<bool>,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
@@ -208,6 +214,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] || matches!(self.plan.location(value), Location::Offset(..)) }
     fn zero_stack_store(&self, inst: Inst) -> Option<(i32, u32)> { crate::frame::stack_zero_store(self.func, &self.frame.slots, inst, |v| self.plan.const_of(v)) }
     fn emit_zero_frame(&mut self, offset: i32, bytes: u32) { self.asm.store(Size::of(bytes), self.frame_mem(offset), ZR); }
+    fn try_tail_call(&mut self, inst: Inst) -> Result<bool, String> { self.emit_tail_call(inst) }
 
     fn prologue(&mut self) {
         if !self.framed {
@@ -389,7 +396,7 @@ impl Emit<'_> {
         }
     }
 
-    fn epilogue(&mut self) {
+    pub(super) fn epilogue_body(&mut self) {
         if self.framed {
             emit_save_pairs(&mut self.asm, &self.frame.saves, 0, |asm, disp, a, b| match b {
                 Some(r0) => asm.ldp_offset(a, r0, FP, disp),
@@ -404,6 +411,10 @@ impl Emit<'_> {
             }
             self.asm.ldp_post(FP, LR, SP, 16);
         }
+    }
+
+    fn epilogue(&mut self) {
+        self.epilogue_body();
         self.asm.ret();
     }
 
@@ -678,55 +689,11 @@ impl Emit<'_> {
         self.move_to(to, value);
     }
 
-    fn clobber_call_spills(&mut self) {
+    pub(super) fn clobber_call_spills(&mut self) {
         for r in 0..19 { self.spills.clobber_reg(Reg(r)); }
         self.spills.clobber_reg(LR);
         self.spills.clear_fspill();
         self.asm.clear_anchor();
-    }
-
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
-        let sig_data = &self.func.sigs[sig.index()];
-        let abi = classify(sig_data, self.packing)?;
-        for ((arg, loc), param) in args.iter().zip(&abi.params).zip(&sig_data.params) {
-            if let Loc::Stack(offset) = *loc {
-                self.stack_argument(offset, param.purpose, *arg);
-            }
-        }
-        let direct = self.plan.through[callee.index()];
-        if !is_try {
-            let inlined = self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args);
-            if inlined {
-                self.clobber_regs(&[Reg(0), A, C, IP, Reg(17), LR]);
-                self.spills.clear_fspill();
-                self.asm.clear_anchor();
-                return Ok(abi);
-            }
-        }
-        let (target, extra) = if direct.is_none() {
-            match self.plan.reg_of(callee).filter(|&reg| !matches!(reg, A | C | IP | FP | LR | SP) && !abi.clobbers(reg)) {
-                Some(reg) => (reg, None),
-                None => (T, Some((callee, T))),
-            }
-        } else {
-            (T, None)
-        };
-        self.move_locs(args, &abi.params, extra);
-        match direct {
-            Some(CallTarget::Slot(sym)) => {
-                let reloc = self.asm.call_symbol(sym, self.direct_calls, T);
-                self.relocs.push(reloc);
-            }
-            Some(CallTarget::Abs(at)) => {
-                self.asm.mov_imm(T, i64::from(at));
-                self.asm.blr(T);
-            }
-            Some(CallTarget::Runtime(rt)) => self.relocs.push(self.asm.call_runtime(rt, self.direct_calls, T)),
-            Some(CallTarget::Symbol(sym)) => self.relocs.push(self.asm.call_direct_symbol(sym, self.direct_calls, T)),
-            None => self.asm.blr(target),
-        }
-        self.clobber_call_spills();
-        Ok(abi)
     }
 }
 

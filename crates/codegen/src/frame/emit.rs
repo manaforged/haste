@@ -104,6 +104,9 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: crate::ir::Bloc
             k = next_k;
             continue;
         }
+        if emit.try_tail_call(inst)? {
+            return Ok(());
+        }
         emit.inst(inst)?;
         k += 1;
     }

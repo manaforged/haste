@@ -1,7 +1,9 @@
 mod emit;
 mod shrink;
+mod tail;
 pub(crate) use emit::{emit_body, stack_zero_store};
 pub(crate) use shrink::{ShrinkWrap, shrink_wrap};
+pub(crate) use tail::{find_tail_calls, is_tail, needs_frame_without_tails};
 use emit::mark_line;
 
 use crate::alloc::{Location, Plan, Regs};
@@ -34,7 +36,7 @@ pub(crate) const fn save_offset(index: usize) -> i32 {
     -((WORD as i32) * (index as i32 + 1))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Loc<R> {
     Int(R),
     Pair(R, R),
@@ -633,6 +635,10 @@ pub(crate) trait Emitter<'a>: Sized {
     }
 
     fn emit_zero_frame(&mut self, _offset: i32, _bytes: u32) {}
+
+    fn try_tail_call(&mut self, _inst: Inst) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 fn entry_has_preds(func: &Function, order: &[Block], entry: Block) -> bool {

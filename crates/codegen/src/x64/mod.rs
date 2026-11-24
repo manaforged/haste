@@ -1,6 +1,7 @@
 mod asm;
 mod atomic;
 mod bits;
+mod call;
 mod features;
 mod float;
 mod frame;
@@ -20,7 +21,7 @@ use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 pub(crate) use ymm::host_avx2;
 use frame::{Abi, Loc, SAVED, SAVED_RBP, classify};
-use crate::alloc::{CallTarget, Location, Plan, Regs};
+use crate::alloc::{Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, TargetOpId, Type, Value};
@@ -98,7 +99,14 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     } else {
         (vec![None; func.types.len()], vec![false; func.types.len()])
     };
-    let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |op| preserve_tc && crate::alloc::is_preserved_call_op(func, op, &plan.through, &plan.locations, &plan.elided))).flatten();
+    let tail_calls = if full { crate::frame::find_tail_calls(func, &plan, &abi, true, &|sig| classify(sig, abi_kind)) } else { Vec::new() };
+    if !tail_calls.is_empty() && framed && !crate::frame::needs_frame_without_tails(func, &frame, &abi, &tail_calls) {
+        framed = false;
+    }
+    let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |inst, op| {
+        crate::frame::is_tail(&tail_calls, inst)
+            || (preserve_tc && crate::alloc::is_preserved_call_op(func, op, &plan.through, &plan.locations, &plan.elided))
+    })).flatten();
     let (base, bias) = if framed && !keeps { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
@@ -147,6 +155,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         flag_carry,
         carry_flags: None,
         tails: Tails::new(),
+        tail_calls,
     };
     drive(emit, &order)
 }
@@ -225,6 +234,7 @@ pub(super) struct Emit<'a> {
     flag_carry: Vec<bool>,
     carry_flags: Option<(bool, [Value; 3])>,
     tails: Tails<'a, Label>,
+    tail_calls: Vec<bool>,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
@@ -239,6 +249,10 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn emit_zero_frame(&mut self, offset: i32, bytes: u32) {
         let to = self.frame_mem(offset);
         if bytes == 8 { self.zero_to(to); } else { self.asm.store_imm_sized(Size::of(bytes), to, 0); }
+    }
+
+    fn try_tail_call(&mut self, inst: Inst) -> Result<bool, String> {
+        self.emit_tail_call(inst)
     }
 
     fn prologue(&mut self) {
@@ -417,7 +431,7 @@ impl Emit<'_> {
         }
     }
 
-    fn epilogue(&mut self) {
+    fn epilogue_body(&mut self) {
         for (index, &reg) in self.frame.saves.iter().enumerate() {
             self.asm.load(Size::Q, reg, self.frame_mem(save_offset(index)));
         }
@@ -425,7 +439,14 @@ impl Emit<'_> {
             self.asm.alu_imm(Alu::Add, Reg::Rsp, self.bias + 8);
         }
         self.asm.flags_overwritten();
-        self.asm.bytes(if self.framed && self.base == Reg::Rbp { &[0xC9, 0xC3] } else { &[0xC3] });
+        if self.framed && self.base == Reg::Rbp {
+            self.asm.bytes(&[0xC9]);
+        }
+    }
+
+    fn epilogue(&mut self) {
+        self.epilogue_body();
+        self.asm.bytes(&[0xC3]);
     }
 
     fn copy_to(&mut self, to: Mem, from: Mem, ty: Type, scratch: Xmm) {
@@ -614,94 +635,6 @@ impl Emit<'_> {
             Loc::Float(xmm) => self.fput(value, Xmm(xmm)),
             Loc::Stack(_) | Loc::Struct(..) => {}
         }
-    }
-
-    fn copy_struct(&mut self, pointer: Value, offset: u32, size: u32) {
-        self.raw(Reg::Rax, pointer);
-        let mut done = 0;
-        for (width, bytes) in [(Size::Q, 8), (Size::D, 4), (Size::W, 2), (Size::B, 1)] {
-            while size - done >= bytes {
-                self.asm.load(width, Reg::Rcx, Mem::new(Reg::Rax, done as i32));
-                self.asm.store(width, Mem::new(Reg::Rsp, (offset + done) as i32), Reg::Rcx);
-                done += bytes;
-            }
-        }
-        self.clobber_reg(Reg::Rcx);
-    }
-
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
-        let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
-        for (arg, loc) in args.iter().zip(&abi.params) {
-            match *loc {
-                Loc::Stack(offset) => self.move_to(Mem::new(Reg::Rsp, offset as i32), *arg),
-                Loc::Struct(offset, size) => self.copy_struct(*arg, offset, size),
-                _ => {}
-            }
-        }
-        let direct = self.plan.through[callee.index()];
-        if !is_try && (self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args)) {
-            self.clobber_call_spills();
-            return Ok(abi);
-        }
-        let cell = match direct {
-            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot, lookup)).map(|hit| (lookup, hit)),
-            _ => None,
-        };
-        if cell.is_some() {
-            self.clobber_reg(Reg::Rax);
-        }
-        let held = self.reg_of(callee).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
-        let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
-        if direct.is_none() && held.is_none() {
-            values.push(callee);
-            locs.push(Loc::Int(Reg::R11));
-        }
-        let float_count = self.move_locs(&values, &locs, Some(Reg::Rax));
-        let func = self.func;
-        self.leave_wide(&func.sigs[sig.index()].params);
-        if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
-            self.asm.mov_imm(Reg::Rax, float_count as i64);
-        }
-        self.asm.flags_overwritten();
-        if let Some((lookup, hit)) = cell {
-            let at = self.asm.call_pcrel32();
-            self.relocs.push(StencilReloc::symbol(at, lookup, crate::reloc::RelocKind::PcRel32));
-            self.asm.bind(hit);
-            self.clobber_call_spills();
-            return Ok(abi);
-        }
-        if self.inline_call(direct, args) {
-            self.clobber_call_spills();
-            return Ok(abi);
-        }
-        match direct {
-            Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
-            Some(CallTarget::Slot(sym)) => {
-                let reloc = self.asm.call_symbol(sym, self.direct_calls);
-                self.relocs.push(reloc);
-            }
-            Some(CallTarget::Runtime(rt)) if self.direct_calls => {
-                let at = self.asm.call_pcrel32();
-                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::PcRel32));
-            }
-            Some(CallTarget::Runtime(rt)) => {
-                let at = self.asm.mov_abs64(Reg::R11);
-                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::Abs64));
-                self.asm.call(Reg::R11);
-            }
-            Some(CallTarget::Symbol(sym)) if self.direct_calls => {
-                let at = self.asm.call_pcrel32();
-                self.relocs.push(StencilReloc::symbol(at, sym, crate::reloc::RelocKind::PcRel32));
-            }
-            Some(CallTarget::Symbol(sym)) => {
-                let at = self.asm.mov_abs64(Reg::R11);
-                self.relocs.push(StencilReloc::symbol(at, sym, crate::reloc::RelocKind::Abs64));
-                self.asm.call(Reg::R11);
-            }
-            None => self.asm.call(held.unwrap_or(Reg::R11)),
-        }
-        self.clobber_call_spills();
-        Ok(abi)
     }
 }
 

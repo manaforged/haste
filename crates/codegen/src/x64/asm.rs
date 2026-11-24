@@ -686,33 +686,32 @@ impl Asm {
     }
 
     /// `call` to relocation symbol `sym`: PC-relative when `direct`, else through its call table slot at a 32-bit absolute address.
-    pub fn call_symbol(&mut self, sym: u32, direct: bool) -> StencilReloc {
+    pub fn call_symbol(&mut self, sym: u32, direct: bool) -> StencilReloc { self.branch_symbol(sym, direct, false) }
+
+    /// `call` or `jmp` to relocation symbol `sym`: PC-relative when `direct`, else through its call table slot at a 32-bit absolute address.
+    pub fn branch_symbol(&mut self, sym: u32, direct: bool, tail: bool) -> StencilReloc {
         if direct {
-            let at = self.call_pcrel32();
-            return StencilReloc::symbol(at, sym, RelocKind::PcRel32);
+            return StencilReloc::symbol(self.branch_pcrel32(tail), sym, RelocKind::PcRel32);
         }
-        let at = self.call_slot_reloc();
-        StencilReloc::symbol(at, sym, RelocKind::Abs32)
+        StencilReloc::symbol(self.branch_slot_reloc(tail), sym, RelocKind::Abs32)
     }
 
-    /// `call` through the eight bytes at the 32-bit absolute address `at`.
-    pub fn call_absolute(&mut self, at: i32) {
+    pub fn branch_absolute(&mut self, at: i32, tail: bool) {
         self.flags_overwritten();
-        self.code.extend([0xFF, 0x14, 0x25]);
+        self.code.extend([0xFF, if tail { 0x24 } else { 0x14 }, 0x25]);
         self.code.extend(at.to_le_bytes());
     }
-
-    pub fn call_slot_reloc(&mut self) -> u32 {
+    pub fn branch_slot_reloc(&mut self, tail: bool) -> u32 {
         self.flags_overwritten();
-        self.code.extend([0xFF, 0x14, 0x25]);
+        self.code.extend([0xFF, if tail { 0x24 } else { 0x14 }, 0x25]);
         let at = self.pos();
         self.code.extend(0_u32.to_le_bytes());
         at
     }
-
-    pub fn call_pcrel32(&mut self) -> u32 {
+    pub fn call_pcrel32(&mut self) -> u32 { self.branch_pcrel32(false) }
+    pub fn branch_pcrel32(&mut self, tail: bool) -> u32 {
         self.flags_overwritten();
-        self.code.push(0xE8);
+        self.code.push(if tail { 0xE9 } else { 0xE8 });
         let at = self.pos();
         self.code.extend(0_u32.to_le_bytes());
         at
