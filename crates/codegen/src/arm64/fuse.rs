@@ -789,6 +789,6 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>, lse: bool) {
     bits::fuse_tst(func, plan, (&uses, &pos_of));
     fuse_fits(func, plan, &uses);
     ccmp::fuse_ccmp(func, plan, (&uses, &pos_of));
-    mem::fuse_relaxed_atomic_addrs(func, plan, (&uses, &pos_of));
+    mem::fuse_atomic_addrs(func, plan, lse, (&uses, &pos_of));
     mem::fuse_store_ireduce(func, plan, &uses);
 }

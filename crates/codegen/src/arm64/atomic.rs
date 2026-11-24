@@ -1,5 +1,6 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, IP, S, T};
+use crate::alloc::Location;
 use crate::ir::{AtomicOrd, AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -523,6 +524,25 @@ impl Emit<'_> {
         (addr, 0)
     }
 
+    fn rcpc2_target(&mut self, addr: Value) -> (Reg, i32) {
+        if let Location::Offset(base, disp) = self.plan.location(addr)
+            && (-256..=255).contains(&disp)
+        {
+            return (base, disp);
+        }
+        if let Location::Frame(slot, off) = self.plan.location(addr)
+            && let Some(disp) = self.frame.slots[slot.index()].checked_add(off)
+            && (-256..=255).contains(&disp)
+        {
+            return (FP, disp);
+        }
+        let (base, off) = self.relaxed_atomic_target(addr);
+        if off != 0 && (-256..=255).contains(&off) {
+            return (self.bits(base, C), off);
+        }
+        (self.bits(addr, C), 0)
+    }
+
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         let ty = match op {
             Op::AtomicStore(value, _, _) => self.ty(*value),
@@ -535,9 +555,18 @@ impl Emit<'_> {
         match op {
             Op::AtomicLoad(addr, ord) => {
                 if ord.has_acquire() {
-                    let at = self.bits(*addr, C);
                     let dst = self.dst(result()?);
-                    self.asm.load_acquire(size, dst, at);
+                    if self.lse && *ord == AtomicOrd::Acquire {
+                        let (base, disp) = self.rcpc2_target(*addr);
+                        if disp != 0 {
+                            self.asm.load_acquire_rcpc_off(size, dst, base, disp);
+                        } else {
+                            self.asm.load_acquire_rcpc(size, dst, base);
+                        }
+                    } else {
+                        let at = self.bits(*addr, C);
+                        self.asm.load_acquire(size, dst, at);
+                    }
                     self.put(result()?, dst);
                 } else {
                     let (base, off) = self.relaxed_atomic_target(*addr);
@@ -546,9 +575,19 @@ impl Emit<'_> {
             }
             Op::AtomicStore(value, addr, ord) => {
                 if ord.has_release() {
-                    let at = self.bits(*addr, C);
-                    let source = self.store_src(*value);
-                    self.asm.store_release(size, at, source);
+                    if self.lse && *ord == AtomicOrd::Release {
+                        let (base, disp) = self.rcpc2_target(*addr);
+                        let source = self.store_src(*value);
+                        if disp != 0 {
+                            self.asm.store_release_off(size, base, disp, source);
+                        } else {
+                            self.asm.store_release(size, base, source);
+                        }
+                    } else {
+                        let at = self.bits(*addr, C);
+                        let source = self.store_src(*value);
+                        self.asm.store_release(size, at, source);
+                    }
                 } else {
                     let (base, off) = self.relaxed_atomic_target(*addr);
                     self.store_at(*value, base, off);
