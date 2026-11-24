@@ -593,7 +593,7 @@ impl Pass {
             let preds = self.cfg.preds_of(phi.block);
             for (i, (pred, arg)) in preds.iter().zip(&phi.args).enumerate() {
                 if !preds[..i].contains(pred) {
-                    push_edge_arg(func, *pred, phi.block, *arg);
+                    func.push_edge_arg(*pred, phi.block, *arg);
                 }
             }
         }
@@ -640,24 +640,6 @@ impl Pass {
         for block in &mut func.blocks {
             block.insts.retain(|inst| !matches!(insts[inst.index()].op, Op::Store(value, ..) | Op::StackStore(value, ..) if unwritten.contains(&value)));
         }
-    }
-}
-
-fn push_edge_arg(func: &mut Function, pred: Block, target: Block, arg: Value) {
-    let Some(&inst) = func.blocks[pred.index()].insts.last() else {
-        return;
-    };
-    match &mut func.insts[inst.index()].op {
-        Op::Jump(block, args) if *block == target => args.push(arg),
-        Op::Brif(_, then, then_args, otherwise, else_args) => {
-            if *then == target {
-                then_args.push(arg);
-            }
-            if *otherwise == target {
-                else_args.push(arg);
-            }
-        }
-        _ => {}
     }
 }
 

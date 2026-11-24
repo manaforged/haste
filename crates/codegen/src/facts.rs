@@ -153,21 +153,6 @@ pub(super) fn compared_range(cc: IntCC, ty: Type, rhs: &Fact, taken: bool) -> Op
     Some(fact)
 }
 
-/// The order with its operands swapped: `k cc x` is `x (swapped cc) k`.
-pub(super) fn swapped(cc: IntCC) -> IntCC {
-    match cc {
-        IntCC::SignedLessThan => IntCC::SignedGreaterThan,
-        IntCC::SignedGreaterThan => IntCC::SignedLessThan,
-        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThanOrEqual,
-        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThanOrEqual,
-        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThan,
-        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThan,
-        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
-        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThanOrEqual,
-        other => other,
-    }
-}
-
 /// The range each value's definition proves, computed once in reverse postorder so that operands come before the values that read them.
 pub(crate) struct Ranges<'a> {
     defs: &'a [Option<Inst>],

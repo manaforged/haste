@@ -114,20 +114,7 @@ fn apply(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>
         }
         fresh.push((value, param));
     }
-    if let Some(&term) = func.blocks[last.index()].insts.last() {
-        match &mut func.insts[term.index()].op {
-            Op::Jump(_, to) => to.extend(&values),
-            Op::Brif(_, then, then_args, otherwise, else_args) => {
-                if *then == target {
-                    then_args.extend(&values);
-                }
-                if *otherwise == target {
-                    else_args.extend(&values);
-                }
-            }
-            _ => {}
-        }
-    }
+    func.for_edge_args_mut(last, target, |args| args.extend(&values));
     for &block in &blocks {
         for at in 0..func.blocks[block.index()].insts.len() {
             let inst = func.blocks[block.index()].insts[at];

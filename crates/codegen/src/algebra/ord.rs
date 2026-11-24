@@ -1,4 +1,3 @@
-use crate::cse::flip_int_cc;
 use crate::fold::{constant, extend, holds};
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
 
@@ -87,7 +86,7 @@ fn cmp_mask(cx: &RewriteCx, v: Value, (a, b, signed): (Value, Value, bool)) -> O
     if !matches!(raw_cc, IntCC::Equal | IntCC::NotEqual) && raw_cc.is_signed() != signed {
         return None;
     }
-    let cc = if (x, y) == (a, b) { raw_cc } else if (x, y) == (b, a) { flip_int_cc(raw_cc) } else { return None };
+    let cc = if (x, y) == (a, b) { raw_cc } else if (x, y) == (b, a) { raw_cc.swapped() } else { return None };
     Some(if invert { cc_mask(cc) ^ 7 } else { cc_mask(cc) })
 }
 
@@ -200,7 +199,7 @@ pub(in crate::algebra) fn three_way_non_zero(cx: &RewriteCx, v: Value) -> bool {
 
 pub(super) fn eval_three_way(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     let ty = cx.func.ty(x);
-    for (norm, expr_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+    for (norm, expr_val, c_val) in [(cc, x, y), (cc.swapped(), y, x)] {
         let Some(imm) = cx.sconst(c_val) else { continue };
         let Some(tw) = match_three_way(cx, expr_val, 0) else { continue };
         let b_lt = holds(norm, ty, tw.vals[0], imm);
@@ -405,7 +404,7 @@ fn eval_involution_pair(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Op
         return None;
     }
     if ux == Unary::Bnot {
-        return Some(Op::Icmp(flip_int_cc(cc), a, b));
+        return Some(Op::Icmp(cc.swapped(), a, b));
     }
     matches!(cc, IntCC::Equal | IntCC::NotEqual).then_some(Op::Icmp(cc, a, b))
 }
@@ -413,7 +412,7 @@ fn eval_involution_pair(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Op
 fn eval_involution_const(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     let ty = cx.func.ty(x);
     let eq_only = matches!(cc, IntCC::Equal | IntCC::NotEqual);
-    for (norm, expr_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+    for (norm, expr_val, c_val) in [(cc, x, y), (cc.swapped(), y, x)] {
         let Some(imm) = cx.sconst(c_val) else {
             continue;
         };
@@ -425,7 +424,7 @@ fn eval_involution_const(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> O
             && (eq_only || uop == Unary::Bnot)
         {
             let inv = apply_involution(uop, ty, imm);
-            let out_cc = if uop == Unary::Bnot { flip_int_cc(norm) } else { norm };
+            let out_cc = if uop == Unary::Bnot { norm.swapped() } else { norm };
             return Some(cmp_const_op(cx, ty, out_cc, a, inv));
         }
     }
@@ -433,7 +432,7 @@ fn eval_involution_const(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> O
 }
 
 pub(super) fn eval_unary_cmp(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
-    for (norm, expr_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+    for (norm, expr_val, c_val) in [(cc, x, y), (cc.swapped(), y, x)] {
         if let Some(imm) = cx.sconst(c_val)
             && let Some(op) = eval_count_cmp(cx, norm, expr_val, imm)
         {

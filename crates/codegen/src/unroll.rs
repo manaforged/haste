@@ -254,18 +254,7 @@ fn head_defs_dominated(func: &Function, cfg: &Cfg, (b, out_blk): (usize, usize),
 
 fn retarget_outside_pred(func: &mut Function, out_blk: usize, head: Block, guard: Block) {
     let Some(&last) = func.blocks[out_blk].insts.last() else { return };
-    match &mut func.insts[last.index()].op {
-        Op::Jump(target, _) if *target == head => *target = guard,
-        Op::Brif(_, then, _, otherwise, _) => {
-            if *then == head {
-                *then = guard;
-            }
-            if *otherwise == head {
-                *otherwise = guard;
-            }
-        }
-        _ => {}
-    }
+    func.insts[last.index()].op.map_targets(|b| if b == head { guard } else { b });
 }
 
 fn peel_jumps(func: &Function, mut blk: Block) -> Block {

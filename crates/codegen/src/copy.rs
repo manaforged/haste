@@ -205,22 +205,8 @@ fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32)
         let mut edges = Vec::new();
         let mut all = true;
         for &pred in info.preds_of(join) {
-            let found: Vec<(Edge, Option<Value>)> = match func.last(pred) {
-                Some(Op::Jump(target, args)) if *target == join => vec![(Edge::Jump, slot_arg(args))],
-                Some(Op::Brif(_, then, then_args, other, other_args)) => {
-                    let mut found = Vec::new();
-                    if *then == join {
-                        found.push((Edge::Then, slot_arg(then_args)));
-                    }
-                    if *other == join {
-                        found.push((Edge::Else, slot_arg(other_args)));
-                    }
-                    found
-                }
-                _ => vec![(Edge::Jump, None)],
-            };
-            for (edge, addr) in found {
-                match addr {
+            for (edge, args) in incoming_edges(func, pred, join) {
+                match args.and_then(slot_arg) {
                     Some(addr) if !edges.iter().any(|&(seen, kind, _)| seen == pred && kind == edge) => edges.push((pred, edge, addr)),
                     Some(_) => {}
                     None => all = false,
@@ -232,6 +218,23 @@ fn slot_return_joins(func: &Function, entry: Block, sret_ptr: Value, bytes: u32)
         }
     }
     splits
+}
+
+fn incoming_edges<'a>(func: &'a Function, pred: Block, join: Block) -> Vec<(Edge, Option<&'a [Value]>)> {
+    match func.last(pred) {
+        Some(Op::Jump(target, args)) if *target == join => vec![(Edge::Jump, Some(args.as_slice()))],
+        Some(Op::Brif(_, then, then_args, other, other_args)) => {
+            let mut found = Vec::new();
+            if *then == join {
+                found.push((Edge::Then, Some(then_args.as_slice())));
+            }
+            if *other == join {
+                found.push((Edge::Else, Some(other_args.as_slice())));
+            }
+            found
+        }
+        _ => vec![(Edge::Jump, None)],
+    }
 }
 
 /// One edge that `split_returns` gave its own copy to the return memory: the block holding the copy and its return, the branch edge sent to that block when it is new, the join it reached and the address it passed.

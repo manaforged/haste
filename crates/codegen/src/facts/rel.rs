@@ -2,7 +2,7 @@ use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Function, IntCC, Op, Type, Value};
 
 use super::backprop::Uppers;
-use super::{Fact, MAX_FACTS, MAX_RELS, Ranges, compared_range, decide, swapped, truth, unsigned_order};
+use super::{Fact, MAX_FACTS, MAX_RELS, Ranges, compared_range, decide, truth, unsigned_order};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -292,7 +292,7 @@ impl Path {
                 if let Some(fact) = compared_range(order, operand_ty, &right, taken) {
                     self.add_with_backprop(func, ranges, x, fact, 0);
                 }
-                if let Some(fact) = compared_range(swapped(order), operand_ty, &left, taken) {
+                if let Some(fact) = compared_range(order.swapped(), operand_ty, &left, taken) {
                     self.add_with_backprop(func, ranges, y, fact, 0);
                 }
             }

@@ -1,6 +1,6 @@
 use crate::ir::{Binary, Block, Convert, Function, IntCC, Op, Type, Value};
 
-use super::{Fact, Ranges, compared_range, swapped, unsigned_order};
+use super::{Fact, Ranges, compared_range, unsigned_order};
 
 /// The fact on an operand: its definition's range, or what one path knows about it.
 pub(super) type Of<'a> = &'a dyn Fn(Value) -> Fact;
@@ -138,7 +138,7 @@ fn cond_bounds(
     let ty = func.ty(p);
     let Some(order) = unsigned_order(cc, ty, left, right) else { return Some(None) };
     let np = compared_range(order, ty, right, taken).map_or_else(|| left.clone(), |b| left.clone().meet(&b));
-    let nq = compared_range(swapped(order), ty, left, taken).map_or_else(|| right.clone(), |b| right.clone().meet(&b));
+    let nq = compared_range(order.swapped(), ty, left, taken).map_or_else(|| right.clone(), |b| right.clone().meet(&b));
     (valid(&np) && valid(&nq)).then_some(Some((np, nq)))
 }
 

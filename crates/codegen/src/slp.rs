@@ -3,7 +3,6 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::ir::{Binary, Block, Convert, Function, Inst, Lane, Op, Type, Value};
-use crate::loads::for_edge_args_mut;
 use crate::mem::{Provenance, may_alias};
 use crate::unroll::{Emit, splat_in};
 
@@ -386,14 +385,14 @@ fn apply(func: &mut Function, block: Block, plan: &Plan) {
         vparams.push(p);
         for &pred in &preds {
             let mut lanes = Vec::new();
-            for_edge_args_mut(func, pred, block, |args| lanes = group.indices.iter().map(|&i| args[i]).collect());
+            func.for_edge_args_mut(pred, block, |args| lanes = group.indices.iter().map(|&i| args[i]).collect());
             let term = func.blocks[pred.index()].insts.pop().expect("pred has a terminator");
             let mut e = Emit { func, out: Vec::new() };
             let v = gather(&mut e, &lanes, ty);
             let out = e.out;
             func.blocks[pred.index()].insts.extend(out);
             func.blocks[pred.index()].insts.push(term);
-            for_edge_args_mut(func, pred, block, |args| args.push(v));
+            func.push_edge_arg(pred, block, v);
         }
     }
     let insts = func.blocks[b].insts.clone();
@@ -439,14 +438,14 @@ fn apply(func: &mut Function, block: Block, plan: &Plan) {
     }
     let mut dropped: Vec<usize> = plan.params.iter().flat_map(|g| g.indices.iter().copied()).collect();
     dropped.sort_unstable_by(|a, c| c.cmp(a));
-    for_edge_args_mut(func, block, block, |args| {
+    func.for_edge_args_mut(block, block, |args| {
         for &i in &dropped {
             args.remove(i);
         }
         args.extend(back.iter().copied());
     });
     for &pred in &preds {
-        for_edge_args_mut(func, pred, block, |args| {
+        func.for_edge_args_mut(pred, block, |args| {
             for &i in &dropped {
                 args.remove(i);
             }

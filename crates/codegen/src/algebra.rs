@@ -245,7 +245,7 @@ fn narrow_pair_icmp(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op>
 
 fn narrow_const_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     let ty = cx.func.ty(x);
-    for (norm, ext_v, c_v) in [(cc, x, y), (crate::cse::flip_int_cc(cc), y, x)] {
+    for (norm, ext_v, c_v) in [(cc, x, y), (cc.swapped(), y, x)] {
         let Some(c_imm) = cx.sconst(c_v) else { continue };
         match demanded(cx, ext_v, ty.unsigned_max(), 0) {
             Demand::Const(k) if res.is_some_and(|r| cx.func.ty(r) == Type::I8) => return Some(Op::Const(i64::from(holds(norm, ty, k as i64, c_imm)))),

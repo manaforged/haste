@@ -32,10 +32,10 @@ pub(crate) fn run(func: &mut Function, wanted: impl Fn(Block, Value) -> bool) ->
                 }
             }
             for &pred in &outside_preds {
-                pass(func, pred, each.head, value);
+                func.push_edge_arg(pred, each.head, value);
             }
             for &latch in &each.latches {
-                pass(func, latch, each.head, param);
+                func.push_edge_arg(latch, each.head, param);
             }
         }
     }
@@ -78,21 +78,4 @@ fn reads(func: &Function, (each, depths): (&Loop, &[u32]), wanted: &impl Fn(Valu
     found.sort_unstable();
     found.dedup();
     found
-}
-
-/// Appends `arg` to every edge from `from` to `head`.
-fn pass(func: &mut Function, from: Block, head: Block, arg: Value) {
-    let Some(&last) = func.blocks[from.index()].insts.last() else { return };
-    match &mut func.insts[last.index()].op {
-        Op::Jump(target, args) if *target == head => args.push(arg),
-        Op::Brif(_, then, then_args, otherwise, else_args) => {
-            if *then == head {
-                then_args.push(arg);
-            }
-            if *otherwise == head {
-                else_args.push(arg);
-            }
-        }
-        _ => {}
-    }
 }

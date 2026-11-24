@@ -13,7 +13,6 @@ mod sink;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, invalidate_preserving, record_base, write_preserving};
-pub(crate) use join::for_edge_args_mut;
 use join::{BlockClobber, JoinCtx, const_eq_for_ty, eligible_join_preds, for_edge_args, resolve_select_load, rodata_const, try_join_phi_forward};
 use remat::{FarCseGuard, SubwordAction, SubwordSlices, drop_covered_stores, drop_stores_if, resolve_subword_plan, sink_terminator_defs};
 
@@ -663,7 +662,7 @@ fn eliminate_affine_block_params(func: &mut Function) -> (bool, Option<Vec<(Valu
         };
         retain_mask(&mut func.blocks[b_idx].params);
         for pred_idx in 0..func.blocks.len() {
-            for_edge_args_mut(func, Block(pred_idx as u32), target, retain_mask);
+            func.for_edge_args_mut(Block(pred_idx as u32), target, retain_mask);
         }
     }
     if any_changed {

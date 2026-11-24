@@ -22,35 +22,6 @@ fn is_commutative_binary(op: Binary) -> bool {
     )
 }
 
-pub(crate) fn flip_int_cc(cc: IntCC) -> IntCC {
-    match cc {
-        IntCC::Equal | IntCC::NotEqual => cc,
-        IntCC::SignedLessThan => IntCC::SignedGreaterThan,
-        IntCC::SignedGreaterThan => IntCC::SignedLessThan,
-        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThanOrEqual,
-        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThanOrEqual,
-        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThan,
-        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThan,
-        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
-        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThanOrEqual,
-    }
-}
-
-fn invert_int_cc(cc: IntCC) -> IntCC {
-    match cc {
-        IntCC::Equal => IntCC::NotEqual,
-        IntCC::NotEqual => IntCC::Equal,
-        IntCC::SignedLessThan => IntCC::SignedGreaterThanOrEqual,
-        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThan,
-        IntCC::SignedGreaterThan => IntCC::SignedLessThanOrEqual,
-        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThan,
-        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThanOrEqual,
-        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThan,
-        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThanOrEqual,
-        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThan,
-    }
-}
-
 fn canonical_bound(cc: IntCC, v: i128, min: i128, max: i128, (lt, le, gt, ge): (IntCC, IntCC, IntCC, IntCC)) -> (IntCC, i128) {
     if cc == lt {
         if v == min + 1 {
@@ -91,7 +62,7 @@ fn canonical_bound(cc: IntCC, v: i128, min: i128, max: i128, (lt, le, gt, ge): (
 }
 
 fn canonical_icmp(cc: IntCC, x: Operand, y: Operand) -> (IntCC, Operand, Operand) {
-    let (cc, a, b) = if x > y { (flip_int_cc(cc), y, x) } else { (cc, x, y) };
+    let (cc, a, b) = if x > y { (cc.swapped(), y, x) } else { (cc, x, y) };
     let (Operand::Val(_), Operand::Imm(ity, imm)) = (a, b) else {
         return (cc, a, b);
     };
@@ -277,7 +248,7 @@ impl Table {
         let Op::Select(c, x, y) = *op else { return None };
         let (cond, sx, sy) = unwrap_bool_neg(&self.bool_neg, subst, c, x, y);
         let (cc, x_ty, ix, iy) = self.icmp_def[cond.index()]?;
-        let (inv_cc, ia, ib) = canonical_icmp(invert_int_cc(cc), operand(&self.consts, types, subst, ix), operand(&self.consts, types, subst, iy));
+        let (inv_cc, ia, ib) = canonical_icmp(cc.inverse(), operand(&self.consts, types, subst, ix), operand(&self.consts, types, subst, iy));
         let &inv_c = self.known.get(&Key::Icmp(inv_cc, x_ty, ia, ib))?;
         let key = Key::Select(Operand::Val(inv_c), operand(&self.consts, types, subst, sy), operand(&self.consts, types, subst, sx));
         self.known.get(&key).copied()
@@ -712,10 +683,10 @@ impl CmpEnv<'_> {
 pub(crate) fn cmp_proves(ty: Type, (mut hcc, mut hx, mut hy): (IntCC, EdgeVal, EdgeVal), (mut wcc, mut wx, mut wy): (IntCC, EdgeVal, EdgeVal)) -> bool {
     use IntCC::*;
     if let (EdgeVal::Const(a), EdgeVal::Const(b)) = (wx, wy) { return crate::fold::holds(wcc, ty, a, b); }
-    if matches!((hx, hy), (EdgeVal::Const(_), EdgeVal::Val(_))) { (hcc, hx, hy) = (flip_int_cc(hcc), hy, hx); }
-    if matches!((wx, wy), (EdgeVal::Const(_), EdgeVal::Val(_))) { (wcc, wx, wy) = (flip_int_cc(wcc), wy, wx); }
+    if matches!((hx, hy), (EdgeVal::Const(_), EdgeVal::Val(_))) { (hcc, hx, hy) = (hcc.swapped(), hy, hx); }
+    if matches!((wx, wy), (EdgeVal::Const(_), EdgeVal::Val(_))) { (wcc, wx, wy) = (wcc.swapped(), wy, wx); }
     let cc_ok = |h, w| h == w || matches!((h, w), (Equal, UnsignedLessThanOrEqual | UnsignedGreaterThanOrEqual | SignedLessThanOrEqual | SignedGreaterThanOrEqual) | (UnsignedLessThan, UnsignedLessThanOrEqual | NotEqual) | (UnsignedGreaterThan, UnsignedGreaterThanOrEqual | NotEqual) | (SignedLessThan, SignedLessThanOrEqual | NotEqual) | (SignedGreaterThan, SignedGreaterThanOrEqual | NotEqual));
-    if ((hx, hy) == (wx, wy) && cc_ok(hcc, wcc)) || ((hy, hx) == (wx, wy) && cc_ok(flip_int_cc(hcc), wcc)) { return true; }
+    if ((hx, hy) == (wx, wy) && cc_ok(hcc, wcc)) || ((hy, hx) == (wx, wy) && cc_ok(hcc.swapped(), wcc)) { return true; }
     let (EdgeVal::Val(hv), EdgeVal::Const(hc), EdgeVal::Val(wv), EdgeVal::Const(wc)) = (hx, hy, wx, wy) else { return false };
     if hv != wv { return false; }
     let (um, ch, cw) = (ty.unsigned_max(), crate::fold::extend(hc, ty, false) as u64, crate::fold::extend(wc, ty, false) as u64);

@@ -16,17 +16,7 @@ struct Test {
 /// Sends each edge out of the equal arm of a test into a later test of the same value straight to where those tests land for the arm's constant; returns whether it moved any edge.
 pub(super) fn run(func: &mut Function) -> bool {
     let cfg = func.cfg();
-    let mut defs = vec![None; func.types.len()];
-    let mut users = vec![0_u32; func.types.len()];
-    for block in &func.blocks {
-        for &inst in &block.insts {
-            let data = &func.insts[inst.index()];
-            if let Some(res) = data.result {
-                defs[res.index()] = Some(inst);
-            }
-            data.op.for_operands(|v| users[v.index()] += 1);
-        }
-    }
+    let (defs, users) = super::defs_and_uses(func);
     let tests: Vec<Option<Test>> = (0..func.blocks.len()).map(|b| test(func, &defs, &users, Block(b as u32))).collect();
     let mut moved = Vec::new();
     for (at, found) in tests.iter().enumerate() {
@@ -44,27 +34,7 @@ pub(super) fn run(func: &mut Function) -> bool {
             }
         }
     }
-    let mut changed = false;
-    for (pred, from, to) in moved {
-        let Some(&term) = func.blocks[pred.index()].insts.last() else { continue };
-        match &mut func.insts[term.index()].op {
-            Op::Jump(target, args) if *target == from && args.is_empty() => *target = to,
-            Op::Brif(_, then, then_args, other, other_args) => {
-                if *then == from && then_args.is_empty() {
-                    *then = to;
-                }
-                if *other == from && other_args.is_empty() {
-                    *other = to;
-                }
-            }
-            _ => continue,
-        }
-        changed = true;
-    }
-    if changed {
-        func.bump_cfg();
-    }
-    changed
+    super::retarget_empty_preds(func, &moved)
 }
 
 /// Where the tests from `block` on lead when `value` holds `constant`.

@@ -395,18 +395,10 @@ struct ConstEval<'a, 'b> {
 }
 
 impl<'a, 'b> ConstEval<'a, 'b> {
-    fn unwrap_expr(&self, body: &Body, mut expr: ExprId) -> ExprId {
-        loop {
-            match *body.expr(expr) {
-                Expr::Paren(inner) => expr = inner,
-                Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const | BlockKind::Expansion, .. }
-                    if body.list(stmts).is_empty() =>
-                {
-                    expr = tail;
-                }
-                _ => return expr,
-            }
-        }
+    fn unwrap_expr(&self, body: &Body, expr: ExprId) -> ExprId {
+        super::expr::unwrap_expr(body, expr, |kind, _| {
+            matches!(kind, BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const | BlockKind::Expansion)
+        })
     }
 
     fn unwrap_shuffle(&self, body: &Body, src: &Source, mut expr: ExprId) -> ExprId {

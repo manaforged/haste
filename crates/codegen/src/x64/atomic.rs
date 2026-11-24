@@ -511,7 +511,7 @@ impl Emit<'_> {
         } else {
             let size = Size::of(self.ty(x).bytes());
             let (cc, x, y) = if self.reg_of(x).is_none() && (self.reg_of(y).is_some() || self.imm_sized(x, size).is_some()) {
-                (crate::cse::flip_int_cc(cc), y, x)
+                (cc.swapped(), y, x)
             } else {
                 (cc, x, y)
             };

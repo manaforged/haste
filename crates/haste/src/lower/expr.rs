@@ -40,15 +40,11 @@ pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn supe
     resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, (limit, false)).is_ok_and(|(callee, _)| callee.is_some())
 }
 
-fn unwrap_expr(body: &Body, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
+pub(super) fn unwrap_expr(body: &Body, mut expr: ExprId, allow_block: impl Fn(crate::body::BlockKind, bool) -> bool) -> ExprId {
     loop {
         match *body.expr(expr) {
             Expr::Paren(inner) => expr = inner,
-            Expr::Block { stmts, tail: Some(inner), label: None, kind }
-                if body.list(stmts).is_empty()
-                    && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
-                        || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
-            {
+            Expr::Block { stmts, tail: Some(inner), label, kind } if body.list(stmts).is_empty() && allow_block(kind, label.is_some()) => {
                 expr = inner;
             }
             _ => return expr,
@@ -56,8 +52,14 @@ fn unwrap_expr(body: &Body, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
     }
 }
 
+fn unwrap_plain_expr(body: &Body, expr: ExprId, allow_unsafe: bool) -> ExprId {
+    unwrap_expr(body, expr, |kind, labeled| {
+        !labeled && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion) || (allow_unsafe && kind == crate::body::BlockKind::Unsafe))
+    })
+}
+
 pub(super) fn const_bool(body: &Body, expr: ExprId) -> Option<bool> {
-    match *body.expr(unwrap_expr(body, expr, false)) {
+    match *body.expr(unwrap_plain_expr(body, expr, false)) {
         Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
         _ => None,
     }
@@ -629,7 +631,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn unwrap_expr(&self, expr: ExprId, allow_unsafe: bool) -> ExprId {
-        unwrap_expr(self.body, expr, allow_unsafe)
+        unwrap_plain_expr(self.body, expr, allow_unsafe)
     }
 
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {

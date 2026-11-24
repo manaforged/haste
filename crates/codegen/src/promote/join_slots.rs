@@ -520,21 +520,9 @@ fn try_coalesce_param(func: &mut Function, cfg: &Cfg, addrs: &[Option<(StackSlot
     let s0 = slots[0];
     func.blocks[b].params.remove(pi);
     for blk in 0..nblocks {
-        let Some(&last) = func.blocks[blk].insts.last() else { continue };
-        match &mut func.insts[last.index()].op {
-            Op::Jump(target, args) if *target == block => {
-                args.remove(pi);
-            }
-            Op::Brif(_, then, then_args, else_b, else_args) => {
-                if *then == block {
-                    then_args.remove(pi);
-                }
-                if *else_b == block {
-                    else_args.remove(pi);
-                }
-            }
-            _ => {}
-        }
+        func.for_edge_args_mut(Block(blk as u32), block, |args| {
+            args.remove(pi);
+        });
     }
     let addr_inst = func.add(Op::StackAddr(s0, common_off), Some(param));
     func.blocks[b].insts.insert(0, addr_inst);

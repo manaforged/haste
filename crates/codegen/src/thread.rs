@@ -36,6 +36,33 @@ fn block_bit(block: Block) -> u64 {
     1 << (block.index() % 64)
 }
 
+pub(super) fn defs_and_uses(func: &Function) -> (Vec<Option<Inst>>, Vec<u32>) {
+    let mut defs = vec![None; func.types.len()];
+    let mut users = vec![0_u32; func.types.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            if let Some(res) = data.result {
+                defs[res.index()] = Some(inst);
+            }
+            data.op.for_operands(|v| users[v.index()] += 1);
+        }
+    }
+    (defs, users)
+}
+
+pub(super) fn retarget_empty_preds(func: &mut Function, moved: &[(Block, Block, Block)]) -> bool {
+    let mut changed = false;
+    for &(pred, from, to) in moved {
+        let Some(&term) = func.blocks[pred.index()].insts.last() else { continue };
+        changed |= func.insts[term.index()].op.retarget_empty(from, to);
+    }
+    if changed {
+        func.bump_cfg();
+    }
+    changed
+}
+
 fn note_use(uses: &mut Vec<u64>, block: Block, value: Value) {
     if uses.len() <= value.index() {
         uses.resize(value.index() + 1, 0);

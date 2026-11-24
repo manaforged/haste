@@ -716,13 +716,9 @@ fn apply_loop_split(func: &mut Function, each: &Loop, preds: &[Block], chosen: &
     }
     for &pred in preds {
         let is_back = each.body[pred.index()];
-        let Some(&term) = func.blocks[pred.index()].insts.last() else { continue };
-        let add = |args: &mut Vec<Value>| args.extend(pairs.iter().map(|&(v, v_loop)| if is_back { v_loop } else { v }));
-        match &mut func.insts[term.index()].op {
-            Op::Jump(target, args) if *target == each.head => add(args),
-            Op::Brif(_, t, ta, f, fa) => { if *t == each.head { add(ta); } if *f == each.head { add(fa); } }
-            _ => {}
-        }
+        func.for_edge_args_mut(pred, each.head, |args| {
+            args.extend(pairs.iter().map(|&(v, v_loop)| if is_back { v_loop } else { v }));
+        });
     }
 }
 

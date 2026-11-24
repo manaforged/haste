@@ -44,19 +44,7 @@ pub(super) fn open_returns(func: &mut Function, pinned: &[bool]) -> Vec<Opened> 
             }
         }
         for pred in preds {
-            let Some(&term) = func.blocks[pred.index()].insts.last() else { continue };
-            match &mut func.insts[term.index()].op {
-                Op::Jump(target, args) if *target == ret => args.extend(&outside),
-                Op::Brif(_, then, then_args, otherwise, otherwise_args) => {
-                    if *then == ret {
-                        then_args.extend(&outside);
-                    }
-                    if *otherwise == ret {
-                        otherwise_args.extend(&outside);
-                    }
-                }
-                _ => {}
-            }
+            func.for_edge_args_mut(pred, ret, |args| args.extend(&outside));
         }
         opened.push(Opened { block: ret, outside, fresh });
     }
@@ -85,19 +73,9 @@ pub(super) fn close_returns(func: &mut Function, opened: &[Opened]) -> bool {
             func.blocks[index].params.remove(slot);
             func.insts[inst.index()].op.map_operands(|value| if value == fresh { outside } else { value });
             for &pred in &preds {
-                let Some(&term) = func.blocks[pred.index()].insts.last() else { continue };
-                match &mut func.insts[term.index()].op {
-                    Op::Jump(target, args) if *target == open.block => drop(args.remove(slot)),
-                    Op::Brif(_, then, then_args, otherwise, otherwise_args) => {
-                        if *then == open.block {
-                            then_args.remove(slot);
-                        }
-                        if *otherwise == open.block {
-                            otherwise_args.remove(slot);
-                        }
-                    }
-                    _ => {}
-                }
+                func.for_edge_args_mut(pred, open.block, |args| {
+                    args.remove(slot);
+                });
             }
             changed = true;
         }

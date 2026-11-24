@@ -369,18 +369,7 @@ pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<B
     func.blocks.push(BlockData { params: pre_params, insts: vec![jump] });
     for pred in outside {
         let Some(&last) = func.blocks[pred.index()].insts.last() else { continue };
-        match &mut func.insts[last.index()].op {
-            Op::Jump(target, _) if *target == each.head => *target = pre,
-            Op::Brif(_, then, _, otherwise, _) => {
-                if *then == each.head {
-                    *then = pre;
-                }
-                if *otherwise == each.head {
-                    *otherwise = pre;
-                }
-            }
-            _ => {}
-        }
+        func.insts[last.index()].op.map_targets(|b| if b == each.head { pre } else { b });
     }
     func.bump_cfg();
     Some(pre)

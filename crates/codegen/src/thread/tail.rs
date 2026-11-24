@@ -233,7 +233,7 @@ pub(super) fn apply_ssa_repair(func: &mut Function, plan: &SsaRepairPlan, exit: 
         }
         for (ji, &j) in plan.joins.iter().enumerate() {
             if j == exit {
-                push_edge_arg(func, new_pred, j, new_v);
+                func.push_edge_arg(new_pred, j, new_v);
             }
             let mut seen_preds = Vec::new();
             for &pr in &orig_preds[ji] {
@@ -246,7 +246,7 @@ pub(super) fn apply_ssa_repair(func: &mut Function, plan: &SsaRepairPlan, exit: 
                 } else {
                     orig_v
                 };
-                push_edge_arg(func, pr, j, val);
+                func.push_edge_arg(pr, j, val);
             }
         }
     }
@@ -345,22 +345,6 @@ fn clone_block(func: &mut Function, src: Block, map: &mut Vec<(Value, Value)>, t
     }
     func.blocks.push(BlockData { params: Vec::new(), insts: new_insts });
     fresh_block
-}
-
-fn push_edge_arg(func: &mut Function, src: Block, dst: Block, arg: Value) {
-    let Some(&last) = func.blocks[src.index()].insts.last() else { return };
-    match &mut func.insts[last.index()].op {
-        Op::Jump(target, args) if *target == dst => args.push(arg),
-        Op::Brif(_, then, then_args, other, other_args) => {
-            if *then == dst {
-                then_args.push(arg);
-            }
-            if *other == dst {
-                other_args.push(arg);
-            }
-        }
-        _ => {}
-    }
 }
 
 struct CorrelatedPlan {

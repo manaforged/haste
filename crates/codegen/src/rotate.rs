@@ -324,19 +324,7 @@ fn rotate_one(func: &mut Function, cfg: &Cfg, each: &Loop, inner: bool) -> bool 
             if pred == plan.head {
                 continue;
             }
-            let Some(&last) = func.blocks[pred.index()].insts.last() else { continue };
-            match &mut func.insts[last.index()].op {
-                Op::Jump(t, args) if *t == plan.exit => args.extend_from_slice(&extra),
-                Op::Brif(_, t, ta, f, fa) => {
-                    if *t == plan.exit {
-                        ta.extend_from_slice(&extra);
-                    }
-                    if *f == plan.exit {
-                        fa.extend_from_slice(&extra);
-                    }
-                }
-                _ => {}
-            }
+            func.for_edge_args_mut(pred, plan.exit, |args| args.extend_from_slice(&extra));
         }
     }
     clone_guard_into(func, pre, &plan, &pre_args);
@@ -481,18 +469,11 @@ fn nest_one(func: &mut Function, cfg: &Cfg, plan: &NestPlan) {
             op.map_targets(|t| if t == head { outer } else { t });
             continue;
         }
-        match op {
-            Op::Jump(t, ta) if *t == head => drop_fixed(ta, plan.fixed),
-            Op::Brif(_, t, ta, f, fa) => {
-                if *t == head {
-                    drop_fixed(ta, plan.fixed);
-                }
-                if *f == head {
-                    drop_fixed(fa, plan.fixed);
-                }
+        op.for_edges_mut(|t, args| {
+            if *t == head {
+                drop_fixed(args, plan.fixed);
             }
-            _ => {}
-        }
+        });
     }
     let mut subst = identity(func.types.len());
     for (at, (&p, &q)) in params.iter().zip(&outer_params).enumerate() {

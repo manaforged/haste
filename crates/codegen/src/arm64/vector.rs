@@ -4,7 +4,6 @@ use super::vector_ops::{
     NEON_UMIN, NEON_USHL, NEON_USHL_1D,
 };
 use super::{A, C, D, Emit, S, V0, V1};
-use crate::cse::flip_int_cc;
 use crate::ir::{Binary, Convert, FloatCC, IntCC, Lane, Op, ShuffleMask, Type, Unary, Value};
 
 pub(super) const V2: Vreg = Vreg(2);
@@ -549,7 +548,7 @@ impl Emit<'_> {
         let zero_cmp = if self.is_vec_zero(y) {
             Some((x, cc))
         } else if self.is_vec_zero(x) {
-            Some((y, flip_int_cc(cc)))
+            Some((y, cc.swapped()))
         } else {
             None
         };

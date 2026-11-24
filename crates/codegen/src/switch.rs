@@ -8,7 +8,6 @@ mod tree;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
-use crate::cse::flip_int_cc;
 use crate::fold::{const_offset, extend};
 use crate::ir::{Binary, Block, Domain, Function, Inst, IntCC, Op, Type, Value};
 use bitmask::{build_runs, can_bitmask_runs, try_rewrite_expr};
@@ -141,7 +140,7 @@ pub(super) fn match_test(func: &Function, info: &Info, cond: Value, expected_val
     let Op::Icmp(raw_cc, a, b) = func.insts[cmp_inst.index()].op else { return None };
     let (lhs, raw_cc, imm) = match (info.consts.get(a.index()).copied().flatten(), info.consts.get(b.index()).copied().flatten()) {
         (_, Some(imm)) => (a, raw_cc, imm),
-        (Some(imm), None) => (b, flip_int_cc(raw_cc), imm),
+        (Some(imm), None) => (b, raw_cc.swapped(), imm),
         _ => return None,
     };
     let cc = if invert { raw_cc.inverse() } else { raw_cc };

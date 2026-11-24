@@ -8,6 +8,7 @@ use crate::outline::item::{Attr, Import, Item, ItemKind, Items, Leaf, Vis};
 use crate::outline::rules::{Frag, Meta, Op, Piece, Rule};
 use crate::outline::source::{Mark, Origins, Token};
 use crate::sema::summary::codec::{Cursor, write_u32, write_u32s};
+pub(super) use crate::sema::summary::codec::{read_str, write_str};
 use crate::substrate::{bytes_to_path, path_to_bytes};
 
 const BASE_KINDS: [Base; 4] = [Base::Binary, Base::Octal, Base::Decimal, Base::Hexadecimal];
@@ -58,17 +59,6 @@ pub(super) fn write_paths(out: &mut Vec<u8>, paths: &[PathBuf]) -> Option<()> {
         write_path(out, path)?;
     }
     Some(())
-}
-
-pub(super) fn write_str(out: &mut Vec<u8>, s: &str) -> Option<()> {
-    write_u32(out, u32::try_from(s.len()).ok()?);
-    out.extend_from_slice(s.as_bytes());
-    Some(())
-}
-
-pub(super) fn read_str<'a>(cur: &mut Cursor<'a>) -> Result<&'a str> {
-    let len = cur.count()?;
-    std::str::from_utf8(cur.take(len)?).context("invalid utf-8 string")
 }
 
 pub(super) fn write_path(out: &mut Vec<u8>, path: &std::path::Path) -> Option<()> {

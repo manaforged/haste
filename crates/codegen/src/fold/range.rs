@@ -25,7 +25,7 @@ fn cmp_const(func: &Function, state: &RangeState, v: Value) -> Option<(IntCC, Va
     }
     const_val(state, r)
         .map(|c| (cc, l, c))
-        .or_else(|| const_val(state, l).map(|c| (crate::cse::flip_int_cc(cc), r, c)))
+        .or_else(|| const_val(state, l).map(|c| (cc.swapped(), r, c)))
 }
 
 fn band_args(func: &Function, state: &RangeState, v: Value, eq_cc: IntCC) -> Option<(Value, Value)> {
@@ -460,7 +460,7 @@ fn cmp_operand_const(func: &Function, state: &RangeState, inst: Inst, res: Value
     let (cc, other) = if l == res {
         (cc, r)
     } else if r == res {
-        (crate::cse::flip_int_cc(cc), l)
+        (cc.swapped(), l)
     } else {
         return None;
     };

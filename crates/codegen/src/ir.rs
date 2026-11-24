@@ -232,22 +232,6 @@ impl IntCC {
             IntCC::SignedLessThan | IntCC::SignedGreaterThanOrEqual | IntCC::SignedGreaterThan | IntCC::SignedLessThanOrEqual
         )
     }
-
-    /// The comparison that holds exactly when this one does not.
-    pub fn inverse(self) -> Self {
-        match self {
-            IntCC::Equal => IntCC::NotEqual,
-            IntCC::NotEqual => IntCC::Equal,
-            IntCC::SignedLessThan => IntCC::SignedGreaterThanOrEqual,
-            IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThan,
-            IntCC::SignedGreaterThan => IntCC::SignedLessThanOrEqual,
-            IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThan,
-            IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThanOrEqual,
-            IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThan,
-            IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThanOrEqual,
-            IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThan,
-        }
-    }
 }
 
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.

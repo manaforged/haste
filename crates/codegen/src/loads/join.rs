@@ -187,20 +187,15 @@ pub(super) fn const_eq_for_ty(consts: &[Option<i64>], ty: Type, a: Value, b: Val
 }
 
 pub(super) fn for_edge_args(op: &Op, target: Block, mut f: impl FnMut(&[Value])) -> bool {
-    match op {
-        Op::Jump(b, args) if *b == target => f(args),
-        Op::Brif(_, t, ta, e, ea) => {
-            if *t == target {
-                f(ta);
+    if matches!(op, Op::Jump(..) | Op::Brif(..)) {
+        op.for_edges(|b, args| {
+            if b == target {
+                f(args);
             }
-            if *e == target {
-                f(ea);
-            }
-        }
-        _ if op.targets().any(|t| t == target) => return false,
-        _ => {}
+        });
+        return true;
     }
-    true
+    !op.targets().any(|t| t == target)
 }
 
 pub(super) fn eligible_join_preds(func: &Function, cfg: &Cfg, visited: &[bool], block: Block) -> Option<Vec<Block>> {
@@ -225,22 +220,6 @@ pub(super) fn eligible_join_preds(func: &Function, cfg: &Cfg, visited: &[bool], 
         }
     }
     (2..=8).contains(&unique.len()).then_some(unique)
-}
-
-pub(crate) fn for_edge_args_mut(func: &mut Function, pred: Block, target: Block, mut f: impl FnMut(&mut Vec<Value>)) {
-    let Some(&last) = func.blocks[pred.index()].insts.last() else { return };
-    match &mut func.insts[last.index()].op {
-        Op::Jump(b, args) if *b == target => f(args),
-        Op::Brif(_, t, ta, e, ea) => {
-            if *t == target {
-                f(ta);
-            }
-            if *e == target {
-                f(ea);
-            }
-        }
-        _ => {}
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -362,7 +341,7 @@ fn create_join_phi(
     join.def_blocks.resize(func.types.len(), Some(join_block));
     join.def_blocks[phi.index()] = Some(join_block);
     join.added_phis[join_block.index()] += 1;
-    vals.into_iter().for_each(|(p, v)| for_edge_args_mut(func, p, join_block, |a| a.push(v)));
+    vals.into_iter().for_each(|(p, v)| func.push_edge_arg(p, join_block, v));
     known.remember(loc, ty, phi);
     phi
 }

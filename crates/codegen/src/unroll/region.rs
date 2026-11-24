@@ -444,22 +444,6 @@ fn specialize_round_zero(func: &mut Function, rounds: &Rounds<'_>) {
     }
 }
 
-fn push_edge(func: &mut Function, pred: Block, target: Block, arg: Value) {
-    let Some(&term) = func.blocks[pred.index()].insts.last() else { return };
-    match &mut func.insts[term.index()].op {
-        Op::Jump(to, args) if *to == target => args.push(arg),
-        Op::Brif(_, then, then_args, otherwise, else_args) => {
-            if *then == target {
-                then_args.push(arg);
-            }
-            if *otherwise == target {
-                else_args.push(arg);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn resolve_idom(cfg: &Cfg, starts: &[Option<Value>], ends: &[Option<Value>], fallback: Value, mut cur: Block) -> Value {
     for _ in 0..cfg.idom.len() {
         if let Some(param) = starts[cur.index()] {
@@ -531,7 +515,7 @@ fn fill_phi_edges(func: &mut Function, after: &Cfg, phi: &[bool], resolve: &dyn 
         preds.sort_unstable();
         preds.dedup();
         for pred in preds {
-            push_edge(func, pred, target, resolve(pred));
+            func.push_edge_arg(pred, target, resolve(pred));
         }
     }
 }

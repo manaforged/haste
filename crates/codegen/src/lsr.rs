@@ -146,7 +146,7 @@ impl<'a> State<'a> {
 
 /// Reorients an integer comparison so `lhs` appears on the left-hand side when present.
 pub(crate) fn norm_cmp(cc: IntCC, a: Value, b: Value, lhs: Value) -> Option<(IntCC, Value)> {
-    if a == lhs { Some((cc, b)) } else if b == lhs { Some((crate::cse::flip_int_cc(cc), a)) } else { None }
+    if a == lhs { Some((cc, b)) } else if b == lhs { Some((cc.swapped(), a)) } else { None }
 }
 
 /// Returns the `idx`-th edge argument passed along `arm` of `pred`'s terminator.

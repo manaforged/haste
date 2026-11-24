@@ -1,4 +1,3 @@
-use crate::cse::flip_int_cc;
 use crate::facts::{Fact, Ranges, decide, deref_ptr, truth};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
@@ -287,7 +286,7 @@ pub(super) fn seed_edge(
         let eff = if taken { cc } else { cc.inverse() };
         let (lhs, ord, imm) = match (lookup_const(local_consts, cx.consts, x), lookup_const(local_consts, cx.consts, y)) {
             (None, Some(k)) => (x, eff, k),
-            (Some(k), None) => (y, flip_int_cc(eff), k),
+            (Some(k), None) => (y, eff.swapped(), k),
             _ => return,
         };
         let ty = func.ty(lhs);
@@ -378,7 +377,7 @@ fn eval_cmp_facts(func: &Function, cx: &ThreadCx<'_>, op: &Op, state: &EvalState
     }
     let (lhs, ord, imm2) = match (lookup_const(&state.local_consts, cx.consts, x), lookup_const(&state.local_consts, cx.consts, y)) {
         (None, Some(k)) => (x, cc, k),
-        (Some(k), None) => (y, flip_int_cc(cc), k),
+        (Some(k), None) => (y, cc.swapped(), k),
         _ => return None,
     };
     for &(v, v_ty, cc1, imm1) in &state.edge_cmps {

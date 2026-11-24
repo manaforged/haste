@@ -1,4 +1,3 @@
-use crate::cse::flip_int_cc;
 use crate::fold::{extend, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -155,7 +154,7 @@ fn fold_ord_select_cmp(cx: &mut RewriteCx, cond: Value, t: Value, f: Value) -> O
 
 fn opposite(cx: &RewriteCx, a: Value, b: Value) -> bool {
     let (Some(&Op::Icmp(ca, xa, ya)), Some(&Op::Icmp(cb, xb, yb))) = (cx.op(a), cx.op(b)) else { return false };
-    cx.func.ty(xa).is_small_int() && ((xa == xb && ya == yb && cb == ca.inverse()) || (xa == yb && ya == xb && cb == flip_int_cc(ca.inverse())))
+    cx.func.ty(xa).is_small_int() && ((xa == xb && ya == yb && cb == ca.inverse()) || (xa == yb && ya == xb && cb == ca.inverse().swapped()))
 }
 
 fn refuted_arm(cx: &RewriteCx, cond: Value, arm: Value, taken: bool) -> Option<Value> {
@@ -204,7 +203,7 @@ fn unwrap_cond_cmp(cx: &RewriteCx, mut raw: Value, mut taken: bool) -> Option<(I
 fn cond_upper_bound(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value)) -> Option<(Value, u64)> {
     let (ty, sign) = (cx.func.ty(a), 1_u64 << (cx.func.ty(a).bits() - 1));
     let non_neg = |v: Value| (cx.known(v).0 & sign) != 0;
-    for (norm, mut var, lim) in [(eff, a, b), (flip_int_cc(eff), b, a)] {
+    for (norm, mut var, lim) in [(eff, a, b), (eff.swapped(), b, a)] {
         if cx.sconst(var).is_some() { continue; }
         let (lim_hi, both_nn) = (ty.unsigned_max() & !cx.known(lim).0, non_neg(var) && non_neg(lim));
         let bound = match norm {
@@ -228,7 +227,7 @@ fn cond_upper_bound(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value)) -> Optio
 fn cond_proves_nonzero(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value), v: Value) -> bool {
     let ty = cx.func.ty(a);
     let sign = 1_u64 << (ty.bits() - 1);
-    [(eff, a, b), (flip_int_cc(eff), b, a)].into_iter().any(|(norm, var, lim)| {
+    [(eff, a, b), (eff.swapped(), b, a)].into_iter().any(|(norm, var, lim)| {
         let same = var == v || matches!(cx.op(var), Some(&Op::Convert(Convert::Uextend, inner)) if inner == v);
         same && match norm {
             IntCC::UnsignedGreaterThan => true,
@@ -360,7 +359,7 @@ fn invert_op(cx: &mut RewriteCx, bin: Binary, a: Value, b: Value) -> Op {
 
 fn eval_const_select_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Option<Op>> {
     let ty = cx.func.ty(x);
-    for (norm, sel_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+    for (norm, sel_val, c_val) in [(cc, x, y), (cc.swapped(), y, x)] {
         let (Some(c), Some(&Op::Select(raw_c1, t1, f1))) = (cx.sconst(c_val), cx.op(sel_val)) else { continue };
         let Some(c1) = bool_cond(cx, raw_c1) else { continue };
         let eval = |k: i64| crate::fold::holds(norm, ty, k, c);
@@ -417,7 +416,7 @@ pub(super) fn eval_select_zero_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: I
     let ty = cx.func.ty(x);
     if !ty.is_small_int() || !res.is_some_and(|r| cx.func.ty(r) == Type::I8) { return None; }
     if let Some(folded) = eval_const_select_cmp(cx, res, cc, x, y) { return Some(folded); }
-    for (norm, sel_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+    for (norm, sel_val, c_val) in [(cc, x, y), (cc.swapped(), y, x)] {
         let Some((k_u, want_match)) = cx.sconst(c_val).and_then(|k_s| cmp_target(norm, ty, k_s)) else { continue };
         let Some(&Op::Select(raw_cond, t_val, f_val)) = cx.op(sel_val) else { continue };
         let t_cmp = (k_u == 0).then(|| unwrap_cond_cmp(cx, raw_cond, true)).flatten();

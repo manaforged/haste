@@ -1,4 +1,3 @@
-use crate::cse::flip_int_cc;
 use crate::fold::{Before, extend, holds, known_bits, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
@@ -119,7 +118,7 @@ pub(super) fn before<'a>(cx: &'a RewriteCx) -> Before<'a> { Before { prefix: &cx
 pub(crate) fn non_null_cmp(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, known: &dyn Fn(Value) -> Option<i64>, at: Before, (cc, x, y): (IntCC, Value, Value)) -> Option<bool> {
     let ty = func.ty(x);
     if !ty.is_small_int() || ty.bits() < 32 { return None; }
-    [(cc, x, y), (flip_int_cc(cc), y, x)].into_iter().find_map(|(norm, val, rhs)| {
+    [(cc, x, y), (cc.swapped(), y, x)].into_iter().find_map(|(norm, val, rhs)| {
         null_test(norm, ty, known(rhs)?).filter(|_| non_null_at(func, def_of, known, at, val))
     })
 }
@@ -282,7 +281,7 @@ fn merge_icmps(cx: &RewriteCx, is_and: bool, (v1, neg1): (Value, bool), (v2, neg
     let aligned2 = if (x2, y2) == (x1, y1) {
         cc2
     } else if (y2, x2) == (x1, y1) {
-        crate::cse::flip_int_cc(cc2)
+        cc2.swapped()
     } else {
         return None;
     };
@@ -482,7 +481,7 @@ pub(super) fn eval_select(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: 
     if let Some(op) = ord::eval_three_way(cx, cc, x, y).or_else(|| ord::eval_complementary_cmp(cx, cc, x, y)).or_else(|| ord::eval_unary_cmp(cx, cc, x, y)) {
         return Some(Some(op));
     }
-    for (norm, val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+    for (norm, val, c_val) in [(cc, x, y), (cc.swapped(), y, x)] {
         if let Some(k) = cx.sconst(c_val)
             && let Some(out) = eval_one(cx, res, norm, val, k).or_else(|| eval_unit_cmp(cx, res, norm, val, k))
         {
@@ -520,7 +519,7 @@ fn peel_uext_i8(cx: &RewriteCx, v: Value) -> (Value, bool) {
 fn cmp_const(cx: &RewriteCx, v: Value) -> Option<(IntCC, Value, i64)> {
     let Op::Icmp(cc, l, r) = *cx.op(v)? else { return None };
     if !cx.func.ty(l).is_small_int() { return None; }
-    cx.sconst(r).map(|c| (cc, l, c)).or_else(|| cx.sconst(l).map(|c| (flip_int_cc(cc), r, c)))
+    cx.sconst(r).map(|c| (cc, l, c)).or_else(|| cx.sconst(l).map(|c| (cc.swapped(), r, c)))
 }
 
 fn emit_cmp_const(cx: &mut RewriteCx, cc: IntCC, lhs: Value, c: i64) -> Op {
@@ -579,7 +578,7 @@ pub(super) fn offset_self(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> 
 pub(super) fn strip_const_add(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     if cc.is_signed() { return None; }
     let ty = cx.func.ty(x);
-    for (norm, sum, c_v) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+    for (norm, sum, c_v) in [(cc, x, y), (cc.swapped(), y, x)] {
         let Some(c2) = cx.uconst(c_v, ty) else { continue };
         let Some(&Op::Binary(Binary::Iadd, p, q)) = cx.op(sum) else { continue };
         let Some((base, c1)) = [(p, q), (q, p)].into_iter().find_map(|(b, k)| cx.uconst(k, ty).map(|c| (b, c))) else { continue };

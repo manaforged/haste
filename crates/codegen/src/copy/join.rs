@@ -1,4 +1,4 @@
-use super::{Edge, collect_sret_info, move_to_sret_src, resolve_slot, retarget_edge};
+use super::{Edge, collect_sret_info, incoming_edges, move_to_sret_src, resolve_slot, retarget_edge};
 use crate::ir::{Block, BlockData, Function, Inst, Op, Value};
 
 /// A copy into the return memory that `hoist` moved from the head of a join onto each edge that reaches it.
@@ -23,22 +23,9 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
         let at = block.params.iter().position(|&p| p == param).unwrap_or(usize::MAX);
         let mut edges = Vec::new();
         for &pred in info.preds_of(join) {
-            let found = match func.last(pred) {
-                Some(Op::Jump(target, args)) if *target == join => vec![(Edge::Jump, args.get(at).copied())],
-                Some(Op::Brif(_, then, then_args, other, other_args)) => {
-                    let mut found = Vec::new();
-                    if *then == join {
-                        found.push((Edge::Then, then_args.get(at).copied()));
-                    }
-                    if *other == join {
-                        found.push((Edge::Else, other_args.get(at).copied()));
-                    }
-                    found
-                }
-                _ => vec![(Edge::Jump, None)],
-            };
-            for (edge, addr) in found {
-                edges.push((pred, edge, addr.filter(|&addr| resolve_slot(func, &info.defs, addr).is_some())));
+            for (edge, args) in incoming_edges(func, pred, join) {
+                let addr = args.and_then(|a| a.get(at).copied()).filter(|&addr| resolve_slot(func, &info.defs, addr).is_some());
+                edges.push((pred, edge, addr));
             }
         }
         if !edges.is_empty() && edges.iter().all(|&(.., addr)| addr.is_some()) && !plans.iter().any(|&(seen, ..)| seen == join) {

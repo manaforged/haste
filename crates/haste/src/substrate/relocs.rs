@@ -6,24 +6,21 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use rustc_hash::FxHashMap;
 
-use crate::body::{ExprId, PatId};
+use crate::body::ExprId;
 use crate::host::{HostSymbol, MathSymbol, X86Symbol};
 use crate::lower::reloc::{RelocPlan, RelocStep, SiteOrigin, TyOrigin};
 use crate::lower::{RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word};
-use crate::names::{ItemRef, Primitive};
+use crate::names::ItemRef;
 use crate::outline::Outline;
-use crate::sema::infer::SiteKey;
 use crate::sema::reach::Reached;
-use crate::sema::substs::{ProjDef, Substs};
-use crate::sema::summary::codec::{Cursor, FileIndex, ItemRecord, read_mut, write_u16, write_u32, write_u32s, write_u64, write_u128};
-use crate::sema::ty::{Kind, Mut, Ty, Types};
+use crate::sema::substs::Substs;
+use crate::sema::summary::codec::{
+    Cursor, FileIndex, ItemRecord, TyTable, read_site_key, read_str, read_substs, read_ty, write_site_key, write_str,
+    write_u16, write_u32, write_u32s, write_u64,
+};
+use crate::sema::ty::{Ty, Types};
 
 const PLAN_MAGIC: [u8; 4] = *b"HRP2";
-
-const PRIMS: [Primitive; 19] = [
-    Primitive::Bool, Primitive::Char, Primitive::Str, Primitive::I8, Primitive::I16, Primitive::I32, Primitive::I64, Primitive::I128, Primitive::Isize,
-    Primitive::U8, Primitive::U16, Primitive::U32, Primitive::U64, Primitive::U128, Primitive::Usize, Primitive::F16, Primitive::F32, Primitive::F64, Primitive::F128,
-];
 
 /// Encodes `plan` into workspace-invariant bytes, or `None` if any symbol or type leaves the allowed crate scope.
 pub fn encode_reloc_plan<F, FR, FV>(
@@ -50,9 +47,7 @@ where
         vtable_of: &mut vtable_of,
         item_map: HashMap::new(),
         items: Vec::new(),
-        ty_map: HashMap::new(),
-        ty_count: 0,
-        ty_buf: Vec::new(),
+        tys: TyTable::default(),
         rodata_map: HashMap::new(),
         rodatas: Vec::new(),
         vtable_map: HashMap::new(),
@@ -61,7 +56,7 @@ where
     let mut steps_buf = Vec::new();
     enc.write_plan(&mut steps_buf, plan)?;
 
-    let mut out = Vec::with_capacity(32 + enc.items.len() * (ItemRecord::LEN + 4) + enc.ty_buf.len() + steps_buf.len());
+    let mut out = Vec::with_capacity(32 + enc.items.len() * (ItemRecord::LEN + 4) + enc.tys.bytes().len() + steps_buf.len());
     out.extend_from_slice(&PLAN_MAGIC);
     out.push(u8::from(include_deps));
     write_u32(&mut out, u32::try_from(enc.items.len()).ok()?);
@@ -69,9 +64,9 @@ where
         record.write(&mut out);
         write_u32(&mut out, sub);
     }
-    write_u32(&mut out, enc.ty_count);
-    write_u32(&mut out, u32::try_from(enc.ty_buf.len()).ok()?);
-    out.extend_from_slice(&enc.ty_buf);
+    write_u32(&mut out, enc.tys.count());
+    write_u32(&mut out, u32::try_from(enc.tys.bytes().len()).ok()?);
+    out.extend_from_slice(enc.tys.bytes());
     write_u32(&mut out, u32::try_from(enc.rodatas.len()).ok()?);
     out.extend_from_slice(&enc.rodatas_bytes()?);
     write_u32(&mut out, u32::try_from(enc.vtables.len()).ok()?);
@@ -210,9 +205,7 @@ struct Encoder<'a, F, FR, FV> {
     vtable_of: &'a mut FV,
     item_map: HashMap<ItemRef, u32>,
     items: Vec<(ItemRecord, u32)>,
-    ty_map: HashMap<Ty, u32>,
-    ty_count: u32,
-    ty_buf: Vec<u8>,
+    tys: TyTable,
     rodata_map: HashMap<RodataId, u32>,
     rodatas: Vec<EncRodata>,
     vtable_map: HashMap<VtableId, u32>,
@@ -258,18 +251,7 @@ where
     }
 
     fn item_id(&mut self, item: ItemRef) -> Option<u32> {
-        if let Some(&idx) = self.item_map.get(&item) {
-            return Some(idx);
-        }
-        let (base, sub) = match item.outer() {
-            Some((outer, sub)) => (outer, sub.checked_add(1)?),
-            None => (item, 0),
-        };
-        let record = ItemRecord::of(self.outline, base, &mut *self.key_of)?;
-        let idx = u32::try_from(self.items.len()).ok()?;
-        self.items.push((record, sub));
-        self.item_map.insert(item, idx);
-        Some(idx)
+        intern_sub_item(self.outline, self.key_of, &mut self.item_map, &mut self.items, item)
     }
 
     fn reached_ref(&mut self, index: usize) -> Option<(u32, Vec<u32>)> {
@@ -278,58 +260,8 @@ where
     }
 
     fn substs_ids(&mut self, substs: Substs) -> Option<Vec<u32>> {
-        self.types.substs(substs).iter().map(|&ty| self.ty_id(ty)).collect()
-    }
-
-    fn ty_id(&mut self, ty: Ty) -> Option<u32> {
-        if ty == Ty::NONE {
-            return Some(u32::MAX);
-        }
-        if let Some(&idx) = self.ty_map.get(&ty) {
-            return Some(idx);
-        }
-        let mut rec = Vec::new();
-        match self.types.kind(ty).clone() {
-            Kind::Prim(p) => { rec.push(0); rec.push(u8::try_from(PRIMS.iter().position(|&x| x == p)?).ok()?); }
-            Kind::Never => rec.push(1),
-            Kind::Tuple(s) => { rec.push(2); write_u32s(&mut rec, &self.substs_ids(s)?); }
-            Kind::Ref(m, i) => { rec.push(3); rec.push(u8::from(m == Mut::Mut)); write_u32(&mut rec, self.ty_id(i)?); }
-            Kind::Ptr(m, i) => { rec.push(4); rec.push(u8::from(m == Mut::Mut)); write_u32(&mut rec, self.ty_id(i)?); }
-            Kind::Array(e, l) => { rec.push(5); write_u32(&mut rec, self.ty_id(e)?); write_u32(&mut rec, self.ty_id(l)?); }
-            Kind::Slice(e) => { rec.push(6); write_u32(&mut rec, self.ty_id(e)?); }
-            Kind::Adt(i, s) => { rec.push(7); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); }
-            Kind::FnDef(i, s) => { rec.push(8); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); }
-            Kind::FnPtr(p, r) => { rec.push(9); write_u32s(&mut rec, &self.substs_ids(p)?); write_u32(&mut rec, self.ty_id(r)?); }
-            Kind::Closure(i, s, idx) => { rec.push(10); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); write_u32(&mut rec, idx); }
-            Kind::Dyn(o, s, m, a) => {
-                rec.push(11);
-                write_u32(&mut rec, self.item_id(o)?);
-                write_u32s(&mut rec, &self.substs_ids(s)?);
-                let (m_vec, a_vec) = (self.types.items(m).to_vec(), self.types.items(a).to_vec());
-                let ms = m_vec.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
-                let aus = a_vec.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
-                write_u32s(&mut rec, &ms);
-                write_u32s(&mut rec, &aus);
-            }
-            Kind::Pat(b, range) => { let (lo, hi) = self.types.pat(range); rec.push(12); write_u32(&mut rec, self.ty_id(b)?); write_u128(&mut rec, lo); write_u128(&mut rec, hi); }
-            Kind::Value(v) => { rec.push(13); write_u128(&mut rec, v); }
-            Kind::Param(p) => { rec.push(14); write_u16(&mut rec, p); }
-            Kind::Proj(id) => {
-                let d = self.types.proj(id);
-                rec.push(15);
-                write_u32(&mut rec, self.item_id(d.of)?);
-                write_u32(&mut rec, self.ty_id(d.self_ty)?);
-                write_u32s(&mut rec, &self.substs_ids(d.args)?);
-                write_u32(&mut rec, self.item_id(d.assoc)?);
-                write_u32s(&mut rec, &self.substs_ids(d.own)?);
-            }
-            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
-        }
-        let idx = self.ty_count;
-        self.ty_count = idx.checked_add(1)?;
-        self.ty_buf.extend_from_slice(&rec);
-        self.ty_map.insert(ty, idx);
-        Some(idx)
+        let (outline, key_of, item_map, items) = (self.outline, &mut *self.key_of, &mut self.item_map, &mut self.items);
+        self.tys.substs_ids(self.types, substs, &mut |i| intern_sub_item(outline, key_of, item_map, items, i))
     }
 
     fn rodata_id(&mut self, id: RodataId) -> Option<u32> {
@@ -625,68 +557,29 @@ impl<'a> Decoder<'a> {
     }
 }
 
+fn intern_sub_item<F: FnMut(&Outline, ItemRef) -> Option<u64>>(
+    outline: &Outline,
+    key_of: &mut F,
+    item_map: &mut HashMap<ItemRef, u32>,
+    items: &mut Vec<(ItemRecord, u32)>,
+    item: ItemRef,
+) -> Option<u32> {
+    if let Some(&idx) = item_map.get(&item) {
+        return Some(idx);
+    }
+    let (base, sub) = match item.outer() {
+        Some((outer, sub)) => (outer, sub.checked_add(1)?),
+        None => (item, 0),
+    };
+    let record = ItemRecord::of(outline, base, key_of)?;
+    let idx = u32::try_from(items.len()).ok()?;
+    items.push((record, sub));
+    item_map.insert(item, idx);
+    Some(idx)
+}
+
 fn resolve_or_want(reached: &Reached, slots: &dyn Slots, instance: (ItemRef, Substs)) -> Option<usize> {
     reached.index.get(&instance).copied().filter(|&idx| !reached.is_untyped(idx)).or_else(|| { slots.want(instance); None })
-}
-
-fn ty_at(tys: &[Ty], id: u32) -> Result<Ty> {
-    if id == u32::MAX {
-        Ok(Ty::NONE)
-    } else {
-        tys.get(id as usize).copied().context("reloc plan ty out of bounds")
-    }
-}
-
-fn read_substs(cur: &mut Cursor<'_>, types: &Types, tys: &[Ty]) -> Result<Substs> {
-    let count = cur.count()?;
-    let mut ids = Vec::with_capacity(count);
-    for _ in 0..count {
-        ids.push(ty_at(tys, cur.u32()?)?);
-    }
-    Ok(types.intern_substs(&ids))
-}
-
-fn read_ty(cur: &mut Cursor<'_>, types: &Types, items: &[ItemRef], tys: &[Ty]) -> Result<Ty> {
-    let item_at = |id: u32| items.get(id as usize).copied().context("reloc plan item out of bounds");
-    let kind = match cur.u8()? {
-        0 => Kind::Prim(PRIMS.get(cur.u8()? as usize).copied().context("invalid prim tag")?),
-        1 => Kind::Never,
-        2 => Kind::Tuple(read_substs(cur, types, tys)?),
-        3 => Kind::Ref(read_mut(cur)?, ty_at(tys, cur.u32()?)?),
-        4 => Kind::Ptr(read_mut(cur)?, ty_at(tys, cur.u32()?)?),
-        5 => Kind::Array(ty_at(tys, cur.u32()?)?, ty_at(tys, cur.u32()?)?),
-        6 => Kind::Slice(ty_at(tys, cur.u32()?)?),
-        7 => Kind::Adt(item_at(cur.u32()?)?, read_substs(cur, types, tys)?),
-        8 => Kind::FnDef(item_at(cur.u32()?)?, read_substs(cur, types, tys)?),
-        9 => Kind::FnPtr(read_substs(cur, types, tys)?, ty_at(tys, cur.u32()?)?),
-        10 => Kind::Closure(item_at(cur.u32()?)?, read_substs(cur, types, tys)?, cur.u32()?),
-        11 => {
-            let (of, s) = (item_at(cur.u32()?)?, read_substs(cur, types, tys)?);
-            let m_count = cur.count()?;
-            let mut members = Vec::with_capacity(m_count);
-            for _ in 0..m_count {
-                members.push(item_at(cur.u32()?)?);
-            }
-            let a_count = cur.count()?;
-            let mut autos = Vec::with_capacity(a_count);
-            for _ in 0..a_count {
-                autos.push(item_at(cur.u32()?)?);
-            }
-            Kind::Dyn(of, s, types.intern_items(&members), types.intern_items(&autos))
-        }
-        12 => Kind::Pat(ty_at(tys, cur.u32()?)?, types.intern_pat((cur.u128()?, cur.u128()?))),
-        13 => Kind::Value(cur.u128()?),
-        14 => Kind::Param(cur.u16()?),
-        15 => Kind::Proj(types.intern_proj(ProjDef {
-            of: item_at(cur.u32()?)?,
-            self_ty: ty_at(tys, cur.u32()?)?,
-            args: read_substs(cur, types, tys)?,
-            assoc: item_at(cur.u32()?)?,
-            own: read_substs(cur, types, tys)?,
-        })),
-        _ => bail!("invalid reloc plan type tag"),
-    };
-    Ok(types.intern(kind))
 }
 
 fn write_host(out: &mut Vec<u8>, host: &HostSymbol) -> Option<()> {
@@ -741,55 +634,5 @@ fn read_host(cur: &mut Cursor<'_>) -> Result<HostSymbol> {
         20 => HostSymbol::DropPop,
         _ => bail!("invalid host symbol tag"),
     })
-}
-
-fn write_site_key(out: &mut Vec<u8>, s: SiteKey) {
-    match s {
-        SiteKey::ExprRes(e) => { out.push(0); write_u32(out, e.0); }
-        SiteKey::PatRes(p) => { out.push(1); write_u32(out, p.0); }
-        SiteKey::Deref(e, i) => { out.push(2); write_u32(out, e.0); write_u32(out, i); }
-        SiteKey::Operator(e) => { out.push(3); write_u32(out, e.0); }
-        SiteKey::TryBlock(e) => { out.push(4); write_u32(out, e.0); }
-        SiteKey::BoxFree(e) => { out.push(5); write_u32(out, e.0); }
-        SiteKey::ForInto(e) => { out.push(6); write_u32(out, e.0); }
-        SiteKey::ForNext(e) => { out.push(7); write_u32(out, e.0); }
-        SiteKey::TryBranch(e) => { out.push(8); write_u32(out, e.0); }
-        SiteKey::TryFrom(e) => { out.push(9); write_u32(out, e.0); }
-        SiteKey::AwaitInto(e) => { out.push(10); write_u32(out, e.0); }
-        SiteKey::AwaitPoll(e) => { out.push(11); write_u32(out, e.0); }
-        SiteKey::CoercionReify(e) => { out.push(12); write_u32(out, e.0); }
-        SiteKey::CoercionDeref(e, i) => { out.push(13); write_u32(out, e.0); write_u16(out, i); }
-    }
-}
-
-fn read_site_key(cur: &mut Cursor<'_>) -> Result<SiteKey> {
-    Ok(match cur.u8()? {
-        0 => SiteKey::ExprRes(ExprId(cur.u32()?)),
-        1 => SiteKey::PatRes(PatId(cur.u32()?)),
-        2 => SiteKey::Deref(ExprId(cur.u32()?), cur.u32()?),
-        3 => SiteKey::Operator(ExprId(cur.u32()?)),
-        4 => SiteKey::TryBlock(ExprId(cur.u32()?)),
-        5 => SiteKey::BoxFree(ExprId(cur.u32()?)),
-        6 => SiteKey::ForInto(ExprId(cur.u32()?)),
-        7 => SiteKey::ForNext(ExprId(cur.u32()?)),
-        8 => SiteKey::TryBranch(ExprId(cur.u32()?)),
-        9 => SiteKey::TryFrom(ExprId(cur.u32()?)),
-        10 => SiteKey::AwaitInto(ExprId(cur.u32()?)),
-        11 => SiteKey::AwaitPoll(ExprId(cur.u32()?)),
-        12 => SiteKey::CoercionReify(ExprId(cur.u32()?)),
-        13 => SiteKey::CoercionDeref(ExprId(cur.u32()?), cur.u16()?),
-        _ => bail!("invalid site key tag"),
-    })
-}
-
-fn write_str(out: &mut Vec<u8>, s: &str) -> Option<()> {
-    write_u32(out, u32::try_from(s.len()).ok()?);
-    out.extend_from_slice(s.as_bytes());
-    Some(())
-}
-
-fn read_str<'a>(cur: &mut Cursor<'a>) -> Result<&'a str> {
-    let len = cur.u32()? as usize;
-    std::str::from_utf8(cur.take(len)?).context("invalid utf-8 symbol")
 }
 

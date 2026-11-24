@@ -191,17 +191,7 @@ pub(super) fn pred_load_const(func: &Function, cx: &ThreadCx<'_>, state: &EvalSt
 /// Sends each edge into a block that reloads, tests and branches on a word its predecessor just stored as a constant straight to the side that constant takes; returns whether it moved any edge.
 pub(super) fn run(func: &mut Function) -> bool {
     let cfg = func.cfg();
-    let mut defs = vec![None; func.types.len()];
-    let mut users = vec![0_u32; func.types.len()];
-    for block in &func.blocks {
-        for &inst in &block.insts {
-            let data = &func.insts[inst.index()];
-            if let Some(res) = data.result {
-                defs[res.index()] = Some(inst);
-            }
-            data.op.for_operands(|v| users[v.index()] += 1);
-        }
-    }
+    let (defs, users) = super::defs_and_uses(func);
     let constant = |v: Value| match defs[v.index()].map(|inst: Inst| &func.insts[inst.index()].op) {
         Some(&Op::Const(imm)) => Some(imm),
         _ => None,
@@ -225,27 +215,7 @@ pub(super) fn run(func: &mut Function) -> bool {
             }
         }
     }
-    let mut changed = false;
-    for (pred, from, to) in moved {
-        let Some(&term) = func.blocks[pred.index()].insts.last() else { continue };
-        match &mut func.insts[term.index()].op {
-            Op::Jump(target, args) if *target == from && args.is_empty() => *target = to,
-            Op::Brif(_, then, then_args, other, other_args) => {
-                if *then == from && then_args.is_empty() {
-                    *then = to;
-                }
-                if *other == from && other_args.is_empty() {
-                    *other = to;
-                }
-            }
-            _ => continue,
-        }
-        changed = true;
-    }
-    if changed {
-        func.bump_cfg();
-    }
-    changed
+    super::retarget_empty_preds(func, &moved)
 }
 
 /// The reload `block` holds when it has no parameters, starts with a load read by the branch or one integer compare, subtract or xor with a constant that only the branch reads, holds nothing else but constants read only there, and branches without arguments.
