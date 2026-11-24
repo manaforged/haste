@@ -26,15 +26,19 @@ fn abs_out(out: Option<&Path>) -> Option<PathBuf> {
     out.map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_owned()))
 }
 
-fn stamp_path(root: &Path, out: Option<&Path>) -> PathBuf {
+fn stamp_path_for(root: &Path, out: Option<&Path>, cfg: &crate::config::Config) -> PathBuf {
     let mut hasher = FxHasher::default();
     NOOP_MAGIC.hash(&mut hasher);
     root.hash(&mut hasher);
     out.hash(&mut hasher);
-    (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
+    cfg.hash_cache_key(&mut hasher);
     crate::graph::store::home()
         .join("noop")
         .join(format!("{:016x}.stamp", hasher.finish()))
+}
+
+fn stamp_path(root: &Path, out: Option<&Path>) -> PathBuf {
+    stamp_path_for(root, out, &crate::config::Config::current())
 }
 
 fn compute_stamp(
@@ -44,15 +48,11 @@ fn compute_stamp(
     env_names: &[String],
 ) -> Option<u64> {
     let target = crate::host_target();
+    let cfg = crate::config::Config::current();
     let mut hasher = FxHasher::default();
     NOOP_MAGIC.hash(&mut hasher);
     super::target_hash(&target).hash(&mut hasher);
-    (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
-    super::enabled().hash(&mut hasher);
-    crate::prep::prepared().hash(&mut hasher);
-    crate::selection().hash(&mut hasher);
-    crate::test_mode().hash(&mut hasher);
-    std::env::var_os(crate::LIBRARY_ENV).hash(&mut hasher);
+    cfg.hash_cache_key(&mut hasher);
     std::env::var_os("CARGO_HOME").hash(&mut hasher);
     root.hash(&mut hasher);
     match out {
@@ -193,4 +193,45 @@ pub fn invalidate(root: &Path, out: Option<&Path>) {
     let croot = canonical_root(root);
     let aout = abs_out(out);
     drop(std::fs::remove_file(stamp_path(&croot, aout.as_deref())));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamp_paths_separate_features_targets_and_env_flags() {
+        let host = haste_codegen::Target::host();
+        let cross = haste_codegen::TARGETS
+            .iter()
+            .find(|t| t.triple != host.triple)
+            .expect("non-host target exists");
+        let root = Path::new("/tmp/sample-ws");
+        let base = crate::config::Config::for_target(host);
+        let p_base = stamp_path_for(root, None, &base);
+        let p_feat = stamp_path_for(
+            root,
+            None,
+            &crate::config::Config {
+                selection: crate::Selection {
+                    features: vec!["extra".to_owned()],
+                    ..crate::Selection::default()
+                },
+                ..base.clone()
+            },
+        );
+        let p_target = stamp_path_for(root, None, &crate::config::Config::for_target(cross));
+        let p_debug = stamp_path_for(
+            root,
+            None,
+            &crate::config::Config {
+                debug_info: !base.debug_info,
+                ..base
+            },
+        );
+        assert_ne!(p_base, p_feat);
+        assert_ne!(p_base, p_target);
+        assert_ne!(p_base, p_debug);
+        assert_ne!(p_feat, p_target);
+    }
 }

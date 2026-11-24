@@ -10,7 +10,7 @@ use crate::names::ItemRef;
 use crate::serve::Request;
 use crate::{outline, sema};
 
-use args::{Command, Meta, Query, parse_invocation, print_meta};
+use args::{Command, Meta, Query, ServeAction, parse_invocation, print_meta};
 use debug::{print_expanded, print_items, report_query};
 
 /// Metadata for a discovered `#[test]` function.
@@ -351,6 +351,22 @@ pub fn main() -> Result<()> {
         Command::Clean => return clean_cache(),
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),
+        Command::Serve(ServeAction::Status) => {
+            let filter = (!path.as_os_str().is_empty())
+                .then(|| std::path::absolute(&path))
+                .transpose()?;
+            return exit_status(crate::serve::status(filter.as_deref())?);
+        }
+        Command::Serve(ServeAction::Stop { all }) => {
+            let filter = if all {
+                None
+            } else if path.as_os_str().is_empty() {
+                Some(std::path::absolute(std::path::Path::new("."))?)
+            } else {
+                Some(std::path::absolute(&path)?)
+            };
+            return exit_status(crate::serve::stop(filter.as_deref())?);
+        }
         _ => {}
     }
     let root = std::path::absolute(path)?;
@@ -374,14 +390,19 @@ pub fn main() -> Result<()> {
     )?;
     if status == 0
         && cfg!(unix)
+        && crate::daemon()
         && can_serve(command, stats_json.as_deref())
         && let Command::Request(request) = command
     {
         crate::serve::spawn(&root, request, abs_out.as_deref());
     }
+    exit_status(status)
+}
+
+fn exit_status(status: i32) -> Result<()> {
     match status {
         0 => Ok(()),
-        status => std::process::exit(status),
+        code => std::process::exit(code),
     }
 }
 
@@ -452,7 +473,10 @@ fn report(
             stats_json.map(|path| (path, graph_span)),
             out,
         )?,
-        Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
+        Command::Serve(ServeAction::Run) => {
+            crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?
+        }
+        Command::Serve(_) => 0,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
         Command::Clean => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,

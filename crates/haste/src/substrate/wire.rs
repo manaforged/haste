@@ -194,12 +194,27 @@ pub(crate) fn read_u64(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn encode_reloc_kind(kind: RelocKind) -> u8 {
-    RELOC_KINDS
-        .iter()
-        .position(|&entry| entry == kind)
-        .map_or(u8::MAX, |at| at as u8)
+const fn encode_reloc_kind(kind: RelocKind) -> u8 {
+    match kind {
+        RelocKind::Abs32 => 0,
+        RelocKind::Abs64 => 1,
+        RelocKind::Arm64Movw64 => 2,
+        RelocKind::PcRel32 => 3,
+        RelocKind::Arm64Call26 => 4,
+        RelocKind::Arm64AdrpAdd => 5,
+        RelocKind::X64RipRel32 => 6,
+        RelocKind::ThreadOff32 => 7,
+        RelocKind::Arm64TlvCell => 8,
+    }
 }
+
+const _: () = {
+    let mut i = 0;
+    while i < RELOC_KINDS.len() {
+        assert!(encode_reloc_kind(RELOC_KINDS[i]) as usize == i);
+        i += 1;
+    }
+};
 
 fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
     RELOC_KINDS

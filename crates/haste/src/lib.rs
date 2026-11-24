@@ -16,6 +16,7 @@ mod aot;
 mod body;
 mod build;
 mod cli;
+pub(crate) mod config;
 mod dump;
 mod graph;
 mod host;
@@ -76,9 +77,14 @@ thread_local! {
     static HOST_SCOPE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether this thread is currently inside `with_host_target`.
+pub(crate) fn in_host_target() -> bool {
+    HOST_SCOPE.with(std::cell::Cell::get) > 0
+}
+
 /// The target being compiled for: the host target inside a host build-script/proc-macro scope on this thread, else the `--target` override, else the host target.
 pub(crate) fn compile_target() -> &'static haste_codegen::Target {
-    if HOST_SCOPE.with(std::cell::Cell::get) > 0 {
+    if in_host_target() {
         return haste_codegen::Target::host();
     }
     *TARGET.get_or_init(haste_codegen::Target::host)
@@ -149,6 +155,18 @@ fn set_test_mode() {
     _ = TEST_MODE.set(true);
 }
 
+static DAEMON: OnceLock<bool> = OnceLock::new();
+
+/// Whether `--daemon` opted into spawning a resident background `haste serve` daemon.
+pub(crate) fn daemon() -> bool {
+    *DAEMON.get_or_init(|| false)
+}
+
+/// Enables opt-in background daemon spawning once, before commands execute.
+fn set_daemon() {
+    _ = DAEMON.set(true);
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -166,31 +184,27 @@ mod tests {
     }
 
     #[test]
-    fn host_target_scope_is_thread_local() {
-        let host = haste_codegen::Target::host();
-        let cross = haste_codegen::TARGETS
-            .iter()
-            .find(|t| t.triple != host.triple)
-            .expect("non-host target exists");
-        set_target(cross);
+    fn host_target_scope_is_thread_local_and_propagates_to_sync_scope() {
         let entered = Arc::new(Barrier::new(2));
         let checked = Arc::new(Barrier::new(2));
         let (e2, c2) = (Arc::clone(&entered), Arc::clone(&checked));
         let other = std::thread::spawn(move || {
             e2.wait();
-            let seen = compile_target().triple;
+            let seen = in_host_target();
             c2.wait();
             seen
         });
-        let inside = with_host_target(|| {
+        let (inside, worker_seen) = with_host_target(|| {
             entered.wait();
-            let seen = compile_target().triple;
+            let worker = crate::sync::scope(|s| s.spawn(in_host_target).join().expect("worker"));
+            let here = in_host_target();
             checked.wait();
-            seen
+            (here, worker)
         });
         let outside = other.join().expect("peer thread completed");
-        assert_eq!(inside, host.triple);
-        assert_eq!(outside, cross.triple);
-        assert_eq!(compile_target().triple, cross.triple);
+        assert!(inside);
+        assert!(worker_seen);
+        assert!(!outside);
+        assert!(!in_host_target());
     }
 }

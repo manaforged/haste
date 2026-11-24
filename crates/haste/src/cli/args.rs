@@ -6,7 +6,7 @@ use crate::outline;
 use crate::serve::Request;
 
 const TOP_COMMANDS: [(Command, &str); 3] = [
-    (Command::Serve, "serve"),
+    (Command::Serve(ServeAction::Run), "serve"),
     (Command::Prep, "prep"),
     (Command::Clean, "clean"),
 ];
@@ -28,16 +28,23 @@ pub(super) fn usage() -> String {
         .map(|(_, name)| name)
         .collect();
     format!(
-        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ServeAction {
+    Run,
+    Status,
+    Stop { all: bool },
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Command {
     Request(Request),
-    Serve,
+    Serve(ServeAction),
     Prep,
     Clean,
     Debug(Query),
@@ -74,8 +81,23 @@ fn next_str(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Strin
         .map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy()))
 }
 
-fn parse(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Command> {
+fn parse(
+    args: &mut std::iter::Peekable<impl Iterator<Item = std::ffi::OsString>>,
+) -> Result<Command> {
     let word = next_str(args)?;
+    if word == "serve" {
+        return Ok(match args.peek().and_then(|raw| raw.to_str()) {
+            Some("status") => {
+                args.next();
+                Command::Serve(ServeAction::Status)
+            }
+            Some("stop") => {
+                args.next();
+                Command::Serve(ServeAction::Stop { all: false })
+            }
+            _ => Command::Serve(ServeAction::Run),
+        });
+    }
     if let Some((cmd, _)) = TOP_COMMANDS.into_iter().find(|(_, name)| *name == word) {
         return Ok(cmd);
     }
@@ -115,6 +137,8 @@ struct ParsedOpts {
     out: Option<PathBuf>,
     jobs: Option<usize>,
     release: bool,
+    daemon: bool,
+    all_daemons: bool,
     prepared: bool,
     prep_wait: Option<std::time::Duration>,
     perf_map: bool,
@@ -181,6 +205,14 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
             "--release" => {
                 args.next();
                 opts.release = true;
+            }
+            "--daemon" => {
+                args.next();
+                opts.daemon = true;
+            }
+            "--all" => {
+                args.next();
+                opts.all_daemons = true;
             }
             "--prepared" => {
                 args.next();
@@ -263,22 +295,42 @@ fn parse_args_raw(
             opts,
         )));
     }
-    let path = if matches!(
-        command,
-        Command::Request(_) | Command::Serve | Command::Prep
-    ) {
-        match args.peek().and_then(|raw| raw.to_str()) {
-            None | Some("--") => PathBuf::from("."),
-            Some(_) => PathBuf::from(args.next().with_context(usage)?),
+    let path = match command {
+        Command::Serve(ServeAction::Status | ServeAction::Stop { .. })
+        | Command::Request(_)
+        | Command::Serve(ServeAction::Run)
+        | Command::Prep => {
+            let default_path = if matches!(
+                command,
+                Command::Serve(ServeAction::Status | ServeAction::Stop { .. })
+            ) {
+                ""
+            } else {
+                "."
+            };
+            match args.peek().and_then(|raw| raw.to_str()) {
+                None | Some("--") => PathBuf::from(default_path),
+                Some(_) => PathBuf::from(args.next().with_context(usage)?),
+            }
         }
-    } else {
-        PathBuf::from(args.next().with_context(usage)?)
+        _ => PathBuf::from(args.next().with_context(usage)?),
     };
     if !matches!(command, Command::Debug(_))
         && let Some(meta) = consume_options(&mut args, &mut opts)?
     {
         return Ok(Err(meta));
     }
+    let command = match command {
+        Command::Serve(ServeAction::Stop { .. }) => Command::Serve(ServeAction::Stop {
+            all: opts.all_daemons,
+        }),
+        other => {
+            if opts.all_daemons {
+                anyhow::bail!("--all is only supported with `haste serve stop`");
+            }
+            other
+        }
+    };
     if !matches!(command, Command::Request(Request::Build))
         && (opts.stats.is_some() || opts.out.is_some())
     {
@@ -322,6 +374,9 @@ pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation,
     if opts.release {
         crate::set_profile(outline::tree::Profile::Release);
     }
+    if opts.daemon {
+        crate::set_daemon();
+    }
     if opts.prepared {
         crate::prep::set_prepared();
     }
@@ -339,7 +394,8 @@ pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation,
     }
     crate::set_selection(opts.selection);
     if matches!(inv.0, Command::Request(Request::Test))
-        || (matches!(inv.0, Command::Serve) && crate::env_flag("HASTE_SERVE_TEST"))
+        || (matches!(inv.0, Command::Serve(ServeAction::Run))
+            && crate::env_flag("HASTE_SERVE_TEST"))
     {
         crate::set_test_mode();
     }
@@ -404,5 +460,40 @@ mod tests {
             .is_err()
         );
         assert!(parse_strs(&["build", "--target", "wasm32-unknown-unknown", "-o", "out"]).is_err());
+    }
+
+    #[test]
+    fn parses_daemon_flag_and_serve_control_subcommands() {
+        let ((cmd, _, _, _, _), opts) = parse_strs(&["build", "--daemon", "examples/hello"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(matches!(cmd, Command::Request(Request::Build)));
+        assert!(opts.daemon);
+
+        let ((cmd, path, _, _, _), _) = parse_strs(&["serve", "status"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(matches!(cmd, Command::Serve(ServeAction::Status)));
+        assert!(path.as_os_str().is_empty());
+
+        let ((cmd, path, _, _, _), _) = parse_strs(&["serve", "stop", "--all"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(matches!(
+            cmd,
+            Command::Serve(ServeAction::Stop { all: true })
+        ));
+        assert!(path.as_os_str().is_empty());
+
+        let ((cmd, path, _, _, _), _) = parse_strs(&["serve", "stop", "examples/hello"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(matches!(
+            cmd,
+            Command::Serve(ServeAction::Stop { all: false })
+        ));
+        assert_eq!(path, PathBuf::from("examples/hello"));
+
+        assert!(parse_strs(&["build", "--all", "examples/hello"]).is_err());
     }
 }

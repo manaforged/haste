@@ -1,0 +1,168 @@
+//! Immutable build configuration snapshot hashed by daemon sockets and no-op stamps.
+
+use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
+
+#[cfg(test)]
+use haste_codegen::Target;
+
+use crate::Selection;
+use crate::outline::tree::Profile;
+
+/// Environment variable setting function alignment in bytes for standalone AOT executables.
+pub(crate) const FN_ALIGN_ENV: &str = "HASTE_FN_ALIGN";
+
+/// Resolved compilation configuration from CLI flags and behavioral `HASTE_*` environment variables.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Config {
+    pub jobs: usize,
+    pub profile: Profile,
+    pub target_triple: &'static str,
+    pub selection: Selection,
+    pub test_mode: bool,
+    pub prepared: bool,
+    pub debug_info: bool,
+    pub symbols: bool,
+    pub x64_baseline: bool,
+    pub fn_align: Option<u32>,
+    pub use_substrate: bool,
+    pub verify_passes: bool,
+    pub verify_stencil: bool,
+    pub library: Option<OsString>,
+}
+
+impl Config {
+    /// Captures the active process configuration from CLI selections and behavioral `HASTE_*` variables.
+    pub(crate) fn current() -> Self {
+        let profile = crate::profile();
+        let debug_info = profile != Profile::Release || crate::env_flag("HASTE_DEBUG_INFO");
+        let symbols = debug_info || crate::env_flag("HASTE_SYMBOLS");
+        Self {
+            jobs: crate::jobs(),
+            profile,
+            target_triple: crate::compile_target().triple,
+            selection: crate::selection().clone(),
+            test_mode: crate::test_mode(),
+            prepared: crate::prep::prepared(),
+            debug_info,
+            symbols,
+            x64_baseline: crate::env_flag("HASTE_X64_BASELINE"),
+            fn_align: parse_fn_align(std::env::var(FN_ALIGN_ENV).ok().as_deref()),
+            use_substrate: !crate::env_flag("HASTE_NO_SUBSTRATE"),
+            verify_passes: crate::env_flag("HASTE_VERIFY_PASSES"),
+            verify_stencil: crate::env_flag("HASTE_VERIFY_STENCIL"),
+            library: std::env::var_os(crate::LIBRARY_ENV),
+        }
+    }
+
+    /// Hashes every build-affecting field into `state` (excluding concurrency `jobs`).
+    pub(crate) fn hash_cache_key(&self, state: &mut impl Hasher) {
+        (self.profile == Profile::Release).hash(state);
+        self.target_triple.hash(state);
+        self.selection.hash(state);
+        self.test_mode.hash(state);
+        self.prepared.hash(state);
+        self.debug_info.hash(state);
+        self.symbols.hash(state);
+        self.x64_baseline.hash(state);
+        self.fn_align.hash(state);
+        self.use_substrate.hash(state);
+        self.verify_passes.hash(state);
+        self.verify_stencil.hash(state);
+        self.library.hash(state);
+    }
+
+    /// Returns the compilation target for this configuration.
+    #[cfg(test)]
+    pub(crate) fn for_target(target: &'static Target) -> Self {
+        Self {
+            jobs: 1,
+            profile: Profile::Debug,
+            target_triple: target.triple,
+            selection: Selection::default(),
+            test_mode: false,
+            prepared: false,
+            debug_info: true,
+            symbols: true,
+            x64_baseline: false,
+            fn_align: None,
+            use_substrate: true,
+            verify_passes: false,
+            verify_stencil: false,
+            library: None,
+        }
+    }
+}
+
+/// Parses a power-of-two function alignment (`>= 16`) from `HASTE_FN_ALIGN`.
+pub(crate) fn parse_fn_align(raw: Option<&str>) -> Option<u32> {
+    raw.and_then(|v| v.parse().ok())
+        .filter(|a: &u32| a.is_power_of_two() && *a >= 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::Hasher;
+
+    use rustc_hash::FxHasher;
+
+    use super::*;
+
+    fn key_of(cfg: &Config) -> u64 {
+        let mut h = FxHasher::default();
+        cfg.hash_cache_key(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn cache_key_distinguishes_every_behavioral_toggle() {
+        let base = Config::for_target(Target::host());
+        let base_key = key_of(&base);
+        let variants: Vec<Config> = vec![
+            Config {
+                profile: Profile::Release,
+                ..base.clone()
+            },
+            Config {
+                debug_info: !base.debug_info,
+                ..base.clone()
+            },
+            Config {
+                symbols: !base.symbols,
+                ..base.clone()
+            },
+            Config {
+                x64_baseline: !base.x64_baseline,
+                ..base.clone()
+            },
+            Config {
+                fn_align: Some(32),
+                ..base.clone()
+            },
+            Config {
+                use_substrate: !base.use_substrate,
+                ..base.clone()
+            },
+            Config {
+                verify_passes: !base.verify_passes,
+                ..base.clone()
+            },
+            Config {
+                verify_stencil: !base.verify_stencil,
+                ..base.clone()
+            },
+            Config {
+                selection: Selection {
+                    all_features: true,
+                    ..Selection::default()
+                },
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(key_of(&variant), base_key);
+        }
+        let different_jobs = Config { jobs: 99, ..base };
+        assert_eq!(key_of(&different_jobs), base_key);
+    }
+}

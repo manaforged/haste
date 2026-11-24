@@ -13,7 +13,6 @@ use super::super::Image;
 use super::{AotCode, AotFn, AotReach, AotState, AotStatic, icf, vdce};
 
 const FN_ALIGN: u32 = 64;
-const FN_ALIGN_ENV: &str = "HASTE_FN_ALIGN";
 
 fn want_debug_info() -> bool {
     crate::profile() != crate::outline::tree::Profile::Release
@@ -27,10 +26,7 @@ fn want_symbols() -> bool {
 fn fn_align_override() -> Option<u32> {
     static ALIGN: OnceLock<Option<u32>> = OnceLock::new();
     *ALIGN.get_or_init(|| {
-        std::env::var(FN_ALIGN_ENV)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|a: &u32| a.is_power_of_two() && *a >= 16)
+        crate::config::parse_fn_align(std::env::var(crate::config::FN_ALIGN_ENV).ok().as_deref())
     })
 }
 
