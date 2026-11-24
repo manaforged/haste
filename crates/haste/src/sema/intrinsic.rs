@@ -58,8 +58,6 @@ pub enum Intrinsic {
     AvgRound(Type),
     /// Unsigned byte pairwise maximum across two 16-byte vectors.
     Umaxp,
-    /// Signed saturating doubling multiply returning high half on `Type::Vec`.
-    Sqdmulh(Type),
     /// A target-specific SIMD instruction emitted via `TargetOpId`.
     TargetOp {
         id: TargetOpId,
@@ -197,24 +195,33 @@ const LLVM: &[(&str, Intrinsic)] = &[
     ),
     (
         "llvm.aarch64.neon.sqdmulh.v2i32",
-        Intrinsic::Sqdmulh(Type::Vec {
-            lane: Lane::I32,
-            count: 2,
-        }),
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64Sqdmulh,
+            ty: Type::Vec {
+                lane: Lane::I32,
+                count: 2,
+            },
+        },
     ),
     (
         "llvm.aarch64.neon.sqdmulh.v4i32",
-        Intrinsic::Sqdmulh(Type::Vec {
-            lane: Lane::I32,
-            count: 4,
-        }),
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64Sqdmulh,
+            ty: Type::Vec {
+                lane: Lane::I32,
+                count: 4,
+            },
+        },
     ),
     (
         "llvm.aarch64.neon.sqdmulh.v8i16",
-        Intrinsic::Sqdmulh(Type::Vec {
-            lane: Lane::I16,
-            count: 8,
-        }),
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64Sqdmulh,
+            ty: Type::Vec {
+                lane: Lane::I16,
+                count: 8,
+            },
+        },
     ),
     (
         "llvm.aarch64.crypto.sha256h",

@@ -218,6 +218,8 @@ pub enum TargetOpId {
     X64Pmaddwd256,
     /// `psadbw` on two 16-byte vectors: each quadword the sum of the absolute differences of its eight unsigned bytes.
     X64Psadbw,
+    /// NEON `sqdmulh`: signed saturating doubling multiply returning the high half of each lane.
+    Arm64Sqdmulh,
 }
 
 impl IntCC {

@@ -14,7 +14,7 @@ use super::asm::{Alu, Asm, Mem, Reg, Rm, Shift, Size, Xmm};
 use crate::alloc::{Location, Plan};
 use crate::fold::fits_imm32;
 use crate::frame::{Emitter, Ext};
-use crate::ir::{Function, Inst, Op, ShuffleMask, Type, Value};
+use crate::ir::{Binary, Function, Inst, Lane, Op, ShuffleMask, Type, Value};
 use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -502,6 +502,60 @@ pub(super) fn elide_broadcast_inserts(
         }
         if fuse::preserved(func, plan, block, start, end, &[], scalar) {
             plan.elided[v] = true;
+        }
+    }
+}
+
+pub(super) fn elide_shift_splats(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    defs: &[Option<Inst>],
+    (uses, use_of): (&[u32], &[Site]),
+) {
+    for (v, site) in use_of.iter().enumerate() {
+        if uses[v] != 1 || plan.elided[v] {
+            continue;
+        }
+        let Some((_, _, user)) = *site else {
+            continue;
+        };
+        let Op::Binary(op @ (Binary::Ishl | Binary::Ushr | Binary::Sshr), x, y) =
+            func.insts[user.index()].op
+        else {
+            continue;
+        };
+        if y.index() != v || x.index() == v {
+            continue;
+        }
+        let Some((lane, count)) = func.ty(y).vec_shape() else {
+            continue;
+        };
+        if !(matches!(lane, Lane::I16 | Lane::I32) || (lane == Lane::I64 && op != Binary::Sshr)) {
+            continue;
+        }
+        let Some(def) = defs[v] else {
+            continue;
+        };
+        let Op::Shuffle(a, b, ShuffleMask::Const(m)) = func.insts[def.index()].op else {
+            continue;
+        };
+        let c = usize::from(count);
+        if !m[..c].iter().all(|&i| i == m[0] && usize::from(i) < c) {
+            continue;
+        }
+        let Some(a_inst) = defs[a.index()] else {
+            continue;
+        };
+        let Op::Insert(_, scalar, idx) = func.insts[a_inst.index()].op else {
+            continue;
+        };
+        if idx != m[0] || plan.const_of(scalar).is_none() {
+            continue;
+        }
+        plan.elided[v] = true;
+        let a_reads = 1 + u32::from(b == a);
+        if uses[a.index()] == a_reads {
+            plan.elided[a.index()] = true;
         }
     }
 }

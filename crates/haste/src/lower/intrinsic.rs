@@ -72,7 +72,6 @@ impl Lower<'_, '_> {
             Intrinsic::BytePermute32 => self.byte_permute_32(args).map(Some),
             Intrinsic::AvgRound(ty) => self.avg_round_vec(ty, args).map(Some),
             Intrinsic::Umaxp => self.umaxp_vec(args).map(Some),
-            Intrinsic::Sqdmulh(ty) => self.sqdmulh_vec(ty, args).map(Some),
             Intrinsic::TargetOp { id, ty } => self.target_vector(id, ty, args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             Intrinsic::CompareBytes => self.compare_const_bytes(origin, substs, args),

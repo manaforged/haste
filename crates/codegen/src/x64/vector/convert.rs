@@ -28,15 +28,27 @@ impl Emit<'_> {
         match (op, fl, tl) {
             (Convert::FromSint, Lane::I32, Lane::F32) => {
                 let src = self.fin(x, dst);
-                self.asm.sse(&[], &[0x0F, 0x5B], dst.0, src);
+                if self.features.avx {
+                    self.asm.vex_xmm(0b00001, 0b00, 0x5B, (dst, Xmm(0)), src);
+                } else {
+                    self.asm.sse(&[], &[0x0F, 0x5B], dst.0, src);
+                }
             }
             (Convert::Fpromote, Lane::F32, Lane::F64) => {
                 let src = self.fin(x, dst);
-                self.asm.sse(&[], &[0x0F, 0x5A], dst.0, src);
+                if self.features.avx {
+                    self.asm.vex_xmm(0b00001, 0b00, 0x5A, (dst, Xmm(0)), src);
+                } else {
+                    self.asm.sse(&[], &[0x0F, 0x5A], dst.0, src);
+                }
             }
             (Convert::Fdemote, Lane::F64, Lane::F32) => {
                 let src = self.fin(x, dst);
-                self.asm.sse(&[0x66], &[0x0F, 0x5A], dst.0, src);
+                if self.features.avx {
+                    self.asm.vex_xmm(0b00001, 0b01, 0x5A, (dst, Xmm(0)), src);
+                } else {
+                    self.asm.sse(&[0x66], &[0x0F, 0x5A], dst.0, src);
+                }
             }
             (Convert::Uextend | Convert::Sextend, _, _)
                 if self.features.sse41 && fl.is_int() && tl.is_int() =>
@@ -52,25 +64,29 @@ impl Emit<'_> {
                 };
                 let base = if op == Convert::Sextend { 0x20 } else { 0x30 };
                 let src = self.fin(x, dst);
-                self.asm
-                    .sse(&[0x66], &[0x0F, 0x38, base + code], dst.0, src);
+                if self.features.avx {
+                    self.asm
+                        .vex_xmm(0b00010, 0b01, base + code, (dst, Xmm(0)), src);
+                } else {
+                    self.asm
+                        .sse(&[0x66], &[0x0F, 0x38, base + code], dst.0, src);
+                }
             }
             (Convert::NarrowSat { signed }, Lane::I16, Lane::I8) => {
-                self.fget(dst, x);
-                self.asm.sse(
+                let src = self.fin(x, dst);
+                self.sse_or_vex(
                     &[0x66],
                     &[0x0F, if signed { 0x63 } else { 0x67 }],
-                    dst.0,
-                    dst,
+                    (dst, src, src),
                 );
             }
             (Convert::NarrowSat { signed: true }, Lane::I32, Lane::I16) => {
-                self.fget(dst, x);
-                self.asm.sse(&[0x66], &[0x0F, 0x6B], dst.0, dst);
+                let src = self.fin(x, dst);
+                self.sse_or_vex(&[0x66], &[0x0F, 0x6B], (dst, src, src));
             }
             (Convert::NarrowSat { signed: false }, Lane::I32, Lane::I16) if self.features.sse41 => {
-                self.fget(dst, x);
-                self.asm.sse(&[0x66], &[0x0F, 0x38, 0x2B], dst.0, dst);
+                let src = self.fin(x, dst);
+                self.sse_or_vex(&[0x66], &[0x0F, 0x38, 0x2B], (dst, src, src));
             }
             (Convert::NarrowSat { signed: false }, Lane::I32, Lane::I16) => {
                 self.fget(dst, x);
