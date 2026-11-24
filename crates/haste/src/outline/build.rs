@@ -1,17 +1,31 @@
+mod expand;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use rustc_lexer::TokenKind;
 
+use super::derive;
 use super::item::{Attr, Item, ItemKind};
 use super::source::Source;
-use super::tree::{Crate, Decl, File, Files, Held, Impl, Macro, Module, State, Textual, View, Waiting, textual};
-use super::{derive, mbe, rules, scan};
+use super::tree::{
+    Crate, Decl, File, Files, Held, Impl, MemberBlock, Module, State, Textual, View,
+};
 
-/// The item kinds that an attribute macro can stand on.
-const ATTRIBUTED: [ItemKind; 9] = [ItemKind::Fn, ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::Impl, ItemKind::Trait, ItemKind::Const, ItemKind::Static, ItemKind::Type];
-/// Builtin attributes, which never name a macro; any other attribute is looked up as one.
+pub(crate) use expand::{path_text, spelled_fragment};
+
+const ATTRIBUTED: [ItemKind; 9] = [
+    ItemKind::Fn,
+    ItemKind::Struct,
+    ItemKind::Enum,
+    ItemKind::Union,
+    ItemKind::Impl,
+    ItemKind::Trait,
+    ItemKind::Const,
+    ItemKind::Static,
+    ItemKind::Type,
+];
 const INERT: &[&str] = &[
     "allow",
     "warn",
@@ -45,17 +59,10 @@ const INERT: &[&str] = &[
     "rustfmt",
     "clippy",
 ];
+
 /// Whether the attribute `name` is builtin, so it never names an attribute macro.
 pub(super) fn inert(name: &str) -> bool {
     INERT.contains(&name) || name.starts_with("rustc_")
-}
-const BUILTIN: [&str; 6] = ["include", "global_asm", "compile_error", "concat", "env", "asm"];
-
-/// What a macro lookup in a crate's exports found.
-enum Found {
-    Macro(Arc<Macro>),
-    NotYet(usize),
-    Missing,
 }
 
 /// What a loader sees of the other crates: the crates as they are, or, by crate, the views that a parallel load fixed for one level.
@@ -76,27 +83,46 @@ pub struct Loader<'a> {
     pub scope: Option<Arc<Textual>>,
 }
 
-/// The prelude crate among `deps` that a crate gets as its first `#[macro_use]` crate: std, else core.
 fn prelude_crates(deps: &[(String, usize)]) -> Vec<usize> {
     let named = |name: &str| deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
-    ["std", "core"].iter().find_map(|name| named(name)).into_iter().collect()
+    ["std", "core"]
+        .iter()
+        .find_map(|name| named(name))
+        .into_iter()
+        .collect()
 }
 
 fn has_impl_body(src: &Source, item: &Item) -> bool {
     match item.kind {
         ItemKind::Const => item.name.is_some_and(|name| src.text(name) == "_"),
-        ItemKind::Fn => item.body.is_some_and(|open| src.holds_word((open, src.pair(open)), "impl")),
+        ItemKind::Fn => item
+            .body
+            .is_some_and(|open| src.holds_word((open, src.pair(open)), "impl")),
         _ => false,
     }
 }
 
 impl<'a> Loader<'a> {
     /// A loader of crate `krate` into `out` that sees the other crates through `others`; a crate with nothing read yet first gets its prelude crate among `deps`.
-    pub fn new(krate: usize, cache: &'a Files, others: Others<'a>, deps: &'a [(String, usize)], out: &'a mut Crate) -> Loader<'a> {
+    pub fn new(
+        krate: usize,
+        cache: &'a Files,
+        others: Others<'a>,
+        deps: &'a [(String, usize)],
+        out: &'a mut Crate,
+    ) -> Loader<'a> {
         if out.modules.len() == 1 && out.files.is_empty() && out.macro_use.is_empty() {
             out.macro_use = prelude_crates(deps);
         }
-        Loader { krate, cache, others, deps, out, depth: 0, scope: None }
+        Loader {
+            krate,
+            cache,
+            others,
+            deps,
+            out,
+            depth: 0,
+            scope: None,
+        }
     }
 }
 
@@ -111,10 +137,20 @@ impl Loader<'_> {
     }
 
     fn macro_use_externs(&mut self) {
-        let Some(file) = self.out.modules.first().filter(|root| root.loaded()).map(|root| self.out.files[root.file].clone()) else {
+        let Some(file) = self
+            .out
+            .modules
+            .first()
+            .filter(|root| root.loaded())
+            .map(|root| self.out.files[root.file].clone())
+        else {
             return;
         };
-        let externs = file.items.items.iter().filter(|item| item.kind == ItemKind::ExternCrate && item.parent.is_none() && item.attrs.contains(&Attr::MacroUse));
+        let externs = file.items.items.iter().filter(|item| {
+            item.kind == ItemKind::ExternCrate
+                && item.parent.is_none()
+                && item.attrs.contains(&Attr::MacroUse)
+        });
         for item in externs {
             let name = file.source.text(item.start + 2);
             let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else {
@@ -133,7 +169,10 @@ impl Loader<'_> {
         };
         let (index, owner) = match decl {
             Decl::Inline { file, at } => (file, Some(at)),
-            Decl::File { candidates, by_attr } => match self.open(module, &candidates, by_attr) {
+            Decl::File {
+                candidates,
+                by_attr,
+            } => match self.open(module, &candidates, by_attr) {
                 Some(index) => (index, None),
                 None => return Ok(()),
             },
@@ -149,7 +188,10 @@ impl Loader<'_> {
     }
 
     fn open(&mut self, module: usize, candidates: &[PathBuf], by_attr: bool) -> Option<usize> {
-        let Some(found) = candidates.iter().find(|candidate| super::tree::exists(candidate)) else {
+        let Some(found) = candidates
+            .iter()
+            .find(|candidate| super::tree::exists(candidate))
+        else {
             self.out.missing.extend_from_slice(candidates);
             self.out.modules[module].state = State::Missing;
             return None;
@@ -175,7 +217,13 @@ impl Loader<'_> {
         Some(self.out.files.len() - 1)
     }
 
-    fn children(&mut self, file: &Arc<File>, index: usize, module: usize, owner: Option<u32>) -> Result<()> {
+    fn children(
+        &mut self,
+        file: &Arc<File>,
+        index: usize,
+        module: usize,
+        owner: Option<u32>,
+    ) -> Result<()> {
         for (at, item) in file.items.items.iter().enumerate() {
             if item.parent != owner || !self.out.env.enabled(&item.attrs) {
                 continue;
@@ -189,14 +237,21 @@ impl Loader<'_> {
         Ok(())
     }
 
-    fn module_item(&mut self, file: &Arc<File>, (index, module): (usize, usize), (at, item): (u32, &Item)) -> Result<()> {
+    fn module_item(
+        &mut self,
+        file: &Arc<File>,
+        (index, module): (usize, usize),
+        (at, item): (u32, &Item),
+    ) -> Result<()> {
         match item.kind {
             ItemKind::Mod => self.child(file, index, module, (at, item))?,
             ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at), item),
             ItemKind::MacroCall => self.call(file, module, at)?,
             ItemKind::Impl => self.impl_block(index, module, at, file)?,
             ItemKind::Trait => self.trait_block(index, module, at, file)?,
-            ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, (at, item))?,
+            ItemKind::Struct | ItemKind::Enum | ItemKind::Union => {
+                self.derive(file, module, (at, item))?;
+            }
             _ if has_impl_body(&file.source, item) => self.out.impl_bodies.push((index, at)),
             _ => {}
         }
@@ -210,21 +265,39 @@ impl Loader<'_> {
         let src = &file.source;
         for attr in &item.attrs {
             let Attr::Other(first) = *attr else { continue };
-            let absolute = src.kind(first) == TokenKind::Colon && src.kind(first + 1) == TokenKind::Colon && src.kind(first + 2) == TokenKind::Ident;
+            let absolute = src.kind(first) == TokenKind::Colon
+                && src.kind(first + 1) == TokenKind::Colon
+                && src.kind(first + 2) == TokenKind::Ident;
             if !absolute && inert(src.text(first)) {
                 continue;
             }
             let mut last = if absolute { first + 2 } else { first };
-            while src.kind(last + 1) == TokenKind::Colon && src.kind(last + 2) == TokenKind::Colon && src.kind(last + 3) == TokenKind::Ident {
+            while src.kind(last + 1) == TokenKind::Colon
+                && src.kind(last + 2) == TokenKind::Colon
+                && src.kind(last + 3) == TokenKind::Ident
+            {
                 last += 3;
             }
-            self.out.attributed.push(Held { file: file.clone(), owner: module, at, path: (first, last) });
+            self.out.attributed.push(Held {
+                file: file.clone(),
+                owner: module,
+                at,
+                path: (first, last),
+            });
         }
     }
 
     fn derive(&mut self, file: &Arc<File>, module: usize, (at, item): (u32, &Item)) -> Result<()> {
-        let (expanded, foreign) = derive::derived(&file.source, item, &self.out.env, (self.krate, self.deps));
-        self.out.derived.extend(foreign.into_iter().map(|path| Held { file: file.clone(), owner: module, at, path }));
+        let (expanded, foreign) =
+            derive::derived(&file.source, item, &self.out.env, (self.krate, self.deps));
+        self.out
+            .derived
+            .extend(foreign.into_iter().map(|path| Held {
+                file: file.clone(),
+                owner: module,
+                at,
+                path,
+            }));
         match expanded {
             Some(expanded) => self.splice(module, expanded, "derive", child_origin(file, 1, at)),
             None => Ok(()),
@@ -232,81 +305,96 @@ impl Loader<'_> {
     }
 
     fn impl_block(&mut self, index: usize, module: usize, at: u32, file: &Arc<File>) -> Result<()> {
-        self.out.impls.push(Impl { file: index, at, module, parts: Vec::new() });
-        self.members(file, super::tree::MemberBlock::Impl(self.out.impls.len() - 1), module, Some(at))
+        self.out.impls.push(Impl {
+            file: index,
+            at,
+            module,
+            parts: Vec::new(),
+        });
+        self.members(
+            file,
+            MemberBlock::Impl(self.out.impls.len() - 1),
+            module,
+            Some(at),
+        )
     }
 
-    fn trait_block(&mut self, index: usize, module: usize, at: u32, file: &Arc<File>) -> Result<()> {
-        if !file.items.items.iter().any(|item| item.parent == Some(at) && item.kind == ItemKind::MacroCall) {
+    fn trait_block(
+        &mut self,
+        index: usize,
+        module: usize,
+        at: u32,
+        file: &Arc<File>,
+    ) -> Result<()> {
+        if !file
+            .items
+            .items
+            .iter()
+            .any(|item| item.parent == Some(at) && item.kind == ItemKind::MacroCall)
+        {
             return Ok(());
         }
-        self.out.traits.push(Impl { file: index, at, module, parts: Vec::new() });
-        self.members(file, super::tree::MemberBlock::Trait(self.out.traits.len() - 1), module, Some(at))
+        self.out.traits.push(Impl {
+            file: index,
+            at,
+            module,
+            parts: Vec::new(),
+        });
+        self.members(
+            file,
+            MemberBlock::Trait(self.out.traits.len() - 1),
+            module,
+            Some(at),
+        )
     }
 
-    fn members(&mut self, file: &Arc<File>, block: super::tree::MemberBlock, module: usize, owner: Option<u32>) -> Result<()> {
-        for (at, item) in file.items.items.iter().enumerate() {
-            if item.parent == owner && item.kind == ItemKind::MacroCall && self.out.env.enabled(&item.attrs) {
-                self.member_call(file, block, module, at as u32)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn member_call(&mut self, file: &Arc<File>, block: super::tree::MemberBlock, module: usize, at: u32) -> Result<()> {
-        let item = &file.items.items[at as usize];
-        let (Some(name), Some(_)) = (item.name, item.body) else {
-            return Ok(());
-        };
-        let name = crate::names::plain(file.source.text(name));
-        let Some(definition) = self.lookup(file, item, name) else {
-            self.out.members.push((block, self.waiting(file, module, at)));
-            return Ok(());
-        };
-        self.member_at(file, block, module, at, &definition)
-    }
-
-    /// Expands the waiting macro call `call` in an impl or trait body with `definition`, in the textual scope it was written in.
-    pub fn expand_member(&mut self, block: super::tree::MemberBlock, call: Waiting, definition: &Macro) -> Result<()> {
-        self.scope = call.scope;
-        self.member_at(&call.file, block, call.owner, call.at, definition)
-    }
-
-    fn member_at(&mut self, file: &Arc<File>, block: super::tree::MemberBlock, module: usize, at: u32, definition: &Macro) -> Result<()> {
-        let Some((name, expanded)) = self.expand_call(file, at, definition) else {
-            return Ok(());
-        };
-        let Some(expanded) = self.scanned(expanded, name, child_origin(file, 2, at)) else {
-            return Ok(());
-        };
-        let parts = match block {
-            super::tree::MemberBlock::Impl(index) => &mut self.out.impls[index].parts,
-            super::tree::MemberBlock::Trait(index) => &mut self.out.traits[index].parts,
-        };
-        parts.push(self.out.files.len() - 1);
-        self.depth += 1;
-        let result = self.members(&expanded, block, module, None);
-        self.depth -= 1;
-        result
-    }
-
-    fn child(&mut self, file: &Arc<File>, index: usize, parent: usize, (at, item): (u32, &Item)) -> Result<()> {
-        let name = crate::names::plain(file.source.text(item.name.unwrap_or(item.start))).to_owned();
+    fn child(
+        &mut self,
+        file: &Arc<File>,
+        index: usize,
+        parent: usize,
+        (at, item): (u32, &Item),
+    ) -> Result<()> {
+        let name =
+            crate::names::plain(file.source.text(item.name.unwrap_or(item.start))).to_owned();
         let base = &self.out.modules[parent];
         let path = self.out.env.path(&item.attrs);
         let (decl, dir) = if item.body.is_some() {
-            (Decl::Inline { file: index, at }, base.dir.join(path.unwrap_or(&name)))
+            (
+                Decl::Inline { file: index, at },
+                base.dir.join(path.unwrap_or(&name)),
+            )
         } else {
             let candidates = match path {
                 Some(path) if base.item.is_some() => vec![base.dir.join(path)],
                 Some(path) => vec![file.source.beside(path)],
-                None => vec![base.dir.join(format!("{name}.rs")), base.dir.join(&name).join("mod.rs")],
+                None => vec![
+                    base.dir.join(format!("{name}.rs")),
+                    base.dir.join(&name).join("mod.rs"),
+                ],
             };
-            (Decl::File { candidates, by_attr: path.is_some() }, PathBuf::new())
+            (
+                Decl::File {
+                    candidates,
+                    by_attr: path.is_some(),
+                },
+                PathBuf::new(),
+            )
         };
         let macro_use = item.attrs.contains(&Attr::MacroUse);
         let inline = item.body.map(|_| at);
-        let child = Module { file: usize::MAX, item: inline, parent: Some(parent), name, dir, parts: Vec::new(), vis: item.vis, macro_use, state: State::Declared(decl), textual: self.scope.clone() };
+        let child = Module {
+            file: usize::MAX,
+            item: inline,
+            parent: Some(parent),
+            name,
+            dir,
+            parts: Vec::new(),
+            vis: item.vis,
+            macro_use,
+            state: State::Declared(decl),
+            textual: self.scope.clone(),
+        };
         self.out.modules.push(child);
         if macro_use {
             let module = self.out.modules.len() - 1;
@@ -315,271 +403,16 @@ impl Loader<'_> {
         }
         Ok(())
     }
-
-    fn define(&mut self, file: &Arc<File>, place: (u32, u32), item: &Item) {
-        let (Some(name), Some(open)) = (item.name, item.body) else {
-            return;
-        };
-        let builtin = item.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if file.source.text(*at) == "rustc_builtin_macro"));
-        if builtin {
-            return;
-        }
-        let parsed = if item.kind == ItemKind::Macro { rules::parse_macro(&file.source, open) } else { rules::parse(&file.source, open) };
-        match parsed {
-            Ok(rules) => {
-                let rules = if item.attrs.contains(&Attr::MacroExport(true)) { rules::local_inner(&file.source, rules) } else { rules };
-                let name = crate::names::plain(file.source.text(name)).to_owned();
-                let definition = Arc::new(Macro { file: file.clone(), rules, krate: self.krate });
-                self.out.defined.insert(place, definition.clone());
-                let public = item.kind == ItemKind::Macro && item.vis != super::item::Vis::Private;
-                if public || item.attrs.iter().any(|attr| matches!(attr, Attr::MacroExport(_))) {
-                    self.out.exports.insert(name.clone(), definition.clone());
-                }
-                if item.kind == ItemKind::MacroRules {
-                    self.scope = Some(Arc::new(Textual { name, def: definition, next: self.scope.take() }));
-                }
-            }
-            Err(error) => self.out.errors.push(format!("{error:#}")),
-        }
-    }
-
-    fn exported(&self, krate: usize, name: &str) -> Found {
-        let (exports, unsettled) = match self.others {
-            _ if krate == self.krate => (&self.out.exports, self.out.unsettled()),
-            Others::Crates(crates) => (&crates[krate].exports, crates[krate].unsettled()),
-            Others::Views(views) => match views.get(krate).and_then(Option::as_ref) {
-                Some(view) => (&view.exports, view.partial),
-                None => return Found::NotYet(krate),
-            },
-        };
-        match exports.get(name) {
-            Some(found) => Found::Macro(found.clone()),
-            None if unsettled => Found::NotYet(krate),
-            None => Found::Missing,
-        }
-    }
-
-    fn lookup(&mut self, file: &File, item: &Item, name: &str) -> Option<Arc<Macro>> {
-        if name == "cfg_select" {
-            return textual(self.scope.as_ref(), name).filter(|_| item.name == Some(item.start));
-        }
-        let crates = match self.qualified(file, item) {
-            Some(crates) => crates?,
-            None => {
-                if let Some(found) = textual(self.scope.as_ref(), name) {
-                    return Some(found);
-                }
-                self.out.macro_use.clone()
-            }
-        };
-        for krate in crates {
-            match self.exported(krate, name) {
-                Found::Macro(found) => return Some(found),
-                Found::NotYet(krate) => self.out.fallback.push(krate),
-                Found::Missing => {}
-            }
-        }
-        None
-    }
-
-    /// For a call through a path, the crates whose exports it names: `$crate::m!`, `crate::m!` or `dep::m!`. Longer paths resolve through names instead.
-    fn qualified(&self, file: &File, item: &Item) -> Option<Option<Vec<usize>>> {
-        let src = &file.source;
-        let first = item.start;
-        if src.kind(first) == TokenKind::Dollar {
-            return Some((item.name == Some(first + 4)).then(|| src.dollar(first).map(|krate| vec![krate as usize])).flatten());
-        }
-        if item.name == Some(first) || src.kind(first) == TokenKind::Colon {
-            return None;
-        }
-        if item.name != Some(first + 3) {
-            return Some(None);
-        }
-        Some(match src.text(first) {
-            "crate" | "self" | "super" => Some(vec![self.krate]),
-            segment => self.deps.iter().find(|(dep, _)| dep == segment).map(|(_, krate)| vec![*krate]),
-        })
-    }
-
-    /// Expands again the calls that found no definition, now that more modules are read.
-    pub fn retry(&mut self) -> Result<()> {
-        self.out.fallback.clear();
-        for call in std::mem::take(&mut self.out.deferred) {
-            self.scope = call.scope;
-            self.call(&call.file, call.owner, call.at)?;
-        }
-        for (block, call) in std::mem::take(&mut self.out.members) {
-            self.scope = call.scope;
-            self.member_call(&call.file, block, call.owner, call.at)?;
-        }
-        self.scope = None;
-        Ok(())
-    }
-
-    fn waiting(&self, file: &Arc<File>, owner: usize, at: u32) -> Waiting {
-        Waiting { file: file.clone(), owner, at, scope: self.scope.clone() }
-    }
-
-    fn call(&mut self, file: &Arc<File>, module: usize, at: u32) -> Result<()> {
-        let item = &file.items.items[at as usize];
-        let (Some(name), Some(open)) = (item.name, item.body) else {
-            return Ok(());
-        };
-        let name = crate::names::plain(file.source.text(name));
-        if name == "include" {
-            return self.include(file, module, open);
-        }
-        if name == "global_asm" {
-            self.out.global_asm.push(self.waiting(file, module, at));
-        }
-        if BUILTIN.contains(&name) {
-            return Ok(());
-        }
-        let Some(definition) = self.lookup(file, item, name) else {
-            if name == "cfg_select" {
-                return self.cfg_select(file, module, open);
-            }
-            self.out.deferred.push(self.waiting(file, module, at));
-            return Ok(());
-        };
-        self.expand_at(file, module, at, &definition)
-    }
-
-    /// Expands the waiting macro call `call` with `definition`, in the textual scope it was written in.
-    pub fn expand(&mut self, call: Waiting, definition: &Macro) -> Result<()> {
-        self.scope = call.scope;
-        self.expand_at(&call.file, call.owner, call.at, definition)
-    }
-
-    /// Adds `source`, the output of procedural macro `name`, to module `module` in the module's textual scope.
-    pub fn insert(&mut self, module: usize, source: Source, name: &str) -> Result<()> {
-        self.scope = self.out.modules[module].textual.clone();
-        let result = self.splice(module, Ok(source), name, 0);
-        self.scope = None;
-        result
-    }
-
-    /// The name and expansion by `definition` of the macro call item `at` of `file`, or none when it has no body or recursed too deep.
-    fn expand_call<'f>(&mut self, file: &'f Arc<File>, at: u32, definition: &Macro) -> Option<(&'f str, Result<Source>)> {
-        let item = &file.items.items[at as usize];
-        let (Some(name), Some(open)) = (item.name, item.body) else {
-            return None;
-        };
-        let name = crate::names::plain(file.source.text(name));
-        if self.depth >= crate::RECURSION_LIMIT {
-            self.out.errors.push(format!("{}: macro {name} recursed past {} levels", file.source.path.display(), crate::RECURSION_LIMIT));
-            return None;
-        }
-        Some((name, mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32), None)))
-    }
-
-    fn expand_at(&mut self, file: &Arc<File>, module: usize, at: u32, definition: &Macro) -> Result<()> {
-        let Some((name, expanded)) = self.expand_call(file, at, definition) else {
-            return Ok(());
-        };
-        self.splice(module, expanded, name, child_origin(file, 3, at))
-    }
-
-    fn cfg_select(&mut self, file: &Arc<File>, module: usize, open: u32) -> Result<()> {
-        let selected = match mbe::select(&file.source, open, &self.out.env) {
-            Ok(Some(selected)) => selected,
-            Ok(None) => return Ok(()),
-            Err(error) => {
-                self.out.errors.push(format!("cfg_select!: {error:#}"));
-                return Ok(());
-            }
-        };
-        self.splice(module, Ok(selected), "cfg_select", child_origin(file, 4, open))
-    }
-
-    fn include(&mut self, file: &Arc<File>, module: usize, open: u32) -> Result<()> {
-        let src = &file.source;
-        let path = path_text(src, (open + 1, src.pair(open)), &self.out.env).ok_or_else(|| anyhow::anyhow!("a path that is not a literal, `concat!` or `env!`"));
-        let source = path.and_then(|path| Source::read(&src.beside(&path)));
-        self.splice(module, source, "include", child_origin(file, 5, open))
-    }
-
-    fn scanned(&mut self, source: Result<Source>, name: &str, origin: u64) -> Option<Arc<File>> {
-        let expanded = source.and_then(|source| scan::scan(&source).map(|items| File::new_expanded(source, items, origin)));
-        match expanded {
-            Ok(expanded) => {
-                let expanded = Arc::new(expanded);
-                self.out.files.push(expanded.clone());
-                Some(expanded)
-            }
-            Err(error) => {
-                self.out.errors.push(format!("{name}!: {error:#}"));
-                None
-            }
-        }
-    }
-
-    fn splice(&mut self, module: usize, source: Result<Source>, name: &str, origin: u64) -> Result<()> {
-        let Some(expanded) = self.scanned(source, name, origin) else {
-            return Ok(());
-        };
-        let index = self.out.files.len() - 1;
-        self.out.modules[module].parts.push(index);
-        self.out.expansions += 1;
-        self.depth += 1;
-        let result = self.children(&expanded, index, module, None);
-        self.depth -= 1;
-        result
-    }
-}
-
-/// The text of the tokens from `from` up to `to` when they are a string literal or a `concat!`, `env!` or `stringify!` of them, inside the parentheses that a macro puts around an expression fragment.
-pub(crate) fn path_text(src: &Source, (from, to): (u32, u32), env: &super::tree::Env) -> Option<String> {
-    if to == from + 1 {
-        return src.literal_text(from).ok().flatten();
-    }
-    if src.text(from) == "(" && src.pair(from) == to - 1 {
-        return path_text(src, (from + 1, to - 1), env);
-    }
-    if to < from + 3 || src.text(from + 1) != "!" {
-        return None;
-    }
-    let parts = src.args(from + 2);
-    match src.text(from) {
-        "concat" => parts.into_iter().map(|range| path_text(src, range, env)).collect(),
-        "env" => env.var(&path_text(src, *parts.first()?, env)?),
-        "stringify" => Some(spelled_fragment(src, (from + 3, src.pair(from + 2)))),
-        _ => None,
-    }
-}
-
-/// Spells `from..to` without synthetic grouping parentheses inserted around `macro_rules!` expression fragments.
-pub(crate) fn spelled_fragment(src: &Source, (from, to): (u32, u32)) -> String {
-    if from >= to {
-        return String::new();
-    }
-    let mut skip = vec![0u8; (to - from) as usize];
-    for (op_from, op_to, frag) in src.opaques_in(from, to) {
-        if frag != super::rules::Frag::Expr {
-            continue;
-        }
-        let mut open = op_from;
-        while open + 1 < op_to && src.kind(open) == TokenKind::Pound && src.kind(open + 1) == TokenKind::OpenBracket {
-            open = src.pair(open + 1) + 1;
-        }
-        if open + 1 < op_to
-            && src.kind(open) == TokenKind::OpenParen
-            && src.pair(open) == op_to - 1
-            && src.origin(open).is_none()
-            && src.origin(op_to - 1).is_none()
-            && !src.joint(open)
-        {
-            skip[(open - from) as usize] = 1;
-            skip[(op_to - 1 - from) as usize] = 2;
-        }
-    }
-    src.spelled_with((from, to), |at| skip[(at - from) as usize])
 }
 
 fn child_dir(found: &Path, by_attr: bool, name: &str) -> PathBuf {
     let parent = found.parent().unwrap_or(Path::new("")).to_owned();
     let mod_rs = found.file_name().is_some_and(|file| file == "mod.rs");
-    if by_attr || mod_rs { parent } else { parent.join(name) }
+    if by_attr || mod_rs {
+        parent
+    } else {
+        parent.join(name)
+    }
 }
 
 fn child_origin(parent: &File, kind: u8, at: u32) -> u64 {

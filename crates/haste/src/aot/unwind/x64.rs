@@ -1,0 +1,330 @@
+use anyhow::Result;
+use haste_codegen::Arch;
+
+use super::super::shims::{
+    Emit, emit_rel_branch, emit_x64_unwind_state, x64_fwd32, x64_jcc, x64_patch8, x64_patch32,
+};
+use super::super::{Buf, SectionAddrs};
+use super::STOP_FP_OFFSET;
+
+/// Emits the x86-64 `catch_unwind` runtime shim.
+pub(in crate::aot) fn emit_x64_catch_unwind(
+    c: &Emit<'_>,
+    addrs: SectionAddrs,
+    out: &mut Buf,
+) -> Result<()> {
+    if !c.win && addrs.unwind_tls != 0 {
+        let disp0 = (addrs.unwind_tls as i64).wrapping_neg() as i32 as u32;
+        let disp8 = ((addrs.unwind_tls as i64).wrapping_neg() + 8) as i32 as u32;
+        out.bytes(&[
+            0x55, 0x48, 0x89, 0xE5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48,
+            0x83, 0xEC, 0x58,
+        ]);
+        out.bytes(&[0x64, 0x48, 0x8B, 0x04, 0x25]);
+        out.u32(disp0);
+        out.bytes(&[0x48, 0x89, 0x04, 0x24, 0x64, 0x48, 0x8B, 0x04, 0x25]);
+        out.u32(disp8);
+        out.bytes(&[
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            0x08,
+            0x48,
+            0x89,
+            0x6C,
+            0x24,
+            STOP_FP_OFFSET as u8,
+            0x48,
+            0x89,
+            0x74,
+            0x24,
+            0x30,
+            0x48,
+            0x89,
+            0x54,
+            0x24,
+            0x38,
+        ]);
+        let caught_lea = x64_fwd32(&[0x48, 0x8D, 0x05], out);
+        out.bytes(&[0x48, 0x89, 0x44, 0x24, 0x40, 0x64, 0x48, 0x89, 0x24, 0x25]);
+        out.u32(disp0);
+        out.bytes(&[
+            0x48, 0x89, 0xF8, 0x48, 0x89, 0xF7, 0xFF, 0xD0, 0x48, 0x8B, 0x04, 0x24, 0x64, 0x48,
+            0x89, 0x04, 0x25,
+        ]);
+        out.u32(disp0);
+        out.bytes(&[0x31, 0xC0, 0xC9, 0xC3]);
+        x64_patch32(caught_lea, out);
+        out.bytes(&[
+            0x4C, 0x89, 0xF7, 0x48, 0x8D, 0x74, 0x24, 0x10, 0x41, 0xFF, 0xD7, 0xB8, 1, 0, 0, 0,
+            0x48, 0x83, 0xC4, 0x58, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0x5D,
+            0xC3,
+        ]);
+        return Ok(());
+    }
+    let d: u8 = if c.win { 0x20 } else { 0 };
+    let frame: u32 = if c.win { 0x248 + u32::from(d) } else { 0x58 };
+    out.bytes(&[
+        0x55, 0x48, 0x89, 0xE5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    ]);
+    if c.win {
+        out.bytes(&[0x48, 0x81, 0xEC]);
+        out.u32(frame);
+        out.bytes(&[0x49, 0x89, 0xCC, 0x49, 0x89, 0xD6, 0x4D, 0x89, 0xC7]);
+    } else {
+        out.bytes(&[
+            0x48,
+            0x83,
+            0xEC,
+            frame as u8,
+            0x49,
+            0x89,
+            0xFC,
+            0x49,
+            0x89,
+            0xF6,
+            0x49,
+            0x89,
+            0xD7,
+        ]);
+    }
+    emit_x64_unwind_state(c, addrs, out)?;
+    let no_state = x64_jcc(&[0x48, 0x85, 0xC0], 0x74, out);
+    let call_try: &[u8] = if c.win {
+        &[0x4C, 0x89, 0xF1, 0x41, 0xFF, 0xD4]
+    } else {
+        &[0x4C, 0x89, 0xF7, 0x41, 0xFF, 0xD4]
+    };
+    if c.win {
+        out.bytes(&[
+            0x48,
+            0x89,
+            0xC3,
+            0x48,
+            0x8B,
+            0x03,
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            d,
+            0x48,
+            0x8B,
+            0x43,
+            0x08,
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            d + 8,
+            0x48,
+            0xC7,
+            0x44,
+            0x24,
+            d + 0x10,
+            0,
+            0,
+            0,
+            0,
+            0x48,
+            0xC7,
+            0x44,
+            0x24,
+            d + 0x18,
+            0,
+            0,
+            0,
+            0,
+            0x48,
+            0x89,
+            0x6C,
+            0x24,
+            d + STOP_FP_OFFSET as u8,
+            0x48,
+            0x8D,
+            0x44,
+            0x24,
+            d,
+            0x48,
+            0x89,
+            0x03,
+        ]);
+        c.bytes_call(
+            &[0x48, 0x8D, 0x4C, 0x24, d + 0x30, 0x31, 0xD2],
+            "_setjmp",
+            out,
+        )?;
+        let caught = x64_jcc(&[0x85, 0xC0], 0x75, out);
+        out.bytes(call_try);
+        let ok_zero = x64_jcc(&[0x48, 0x8B, 0x44, 0x24, d, 0x48, 0x89, 0x03], 0xEB, out);
+        x64_patch8(no_state, out);
+        out.bytes(call_try);
+        x64_patch8(ok_zero, out);
+        let done = x64_jcc(&[0x31, 0xC0], 0xEB, out);
+        x64_patch8(caught, out);
+        out.bytes(&[
+            0x4C,
+            0x89,
+            0xF1,
+            0x48,
+            0x8D,
+            0x54,
+            0x24,
+            d + 0x10,
+            0x41,
+            0xFF,
+            0xD7,
+            0xB8,
+            1,
+            0,
+            0,
+            0,
+        ]);
+        x64_patch8(done, out);
+        out.bytes(&[0x48, 0x81, 0xC4]);
+        out.u32(frame);
+    } else {
+        out.bytes(&[
+            0x48,
+            0x89,
+            0xC3,
+            0x48,
+            0x8B,
+            0x03,
+            0x48,
+            0x89,
+            0x04,
+            0x24,
+            0x48,
+            0x8B,
+            0x43,
+            0x08,
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            0x08,
+            0x48,
+            0x89,
+            0x6C,
+            0x24,
+            STOP_FP_OFFSET as u8,
+            0x4C,
+            0x89,
+            0x74,
+            0x24,
+            0x30,
+            0x4C,
+            0x89,
+            0x7C,
+            0x24,
+            0x38,
+        ]);
+        let caught_lea = x64_fwd32(&[0x48, 0x8D, 0x05], out);
+        out.bytes(&[0x48, 0x89, 0x44, 0x24, 0x40, 0x48, 0x89, 0x23]);
+        out.bytes(call_try);
+        let ok_zero = x64_jcc(&[0x48, 0x8B, 0x04, 0x24, 0x48, 0x89, 0x03], 0xEB, out);
+        x64_patch8(no_state, out);
+        out.bytes(call_try);
+        x64_patch8(ok_zero, out);
+        let done = x64_jcc(&[0x31, 0xC0], 0xEB, out);
+        x64_patch32(caught_lea, out);
+        out.bytes(&[
+            0x4C, 0x89, 0xF7, 0x48, 0x8D, 0x74, 0x24, 0x10, 0x41, 0xFF, 0xD7, 0xB8, 1, 0, 0, 0,
+        ]);
+        x64_patch8(done, out);
+        out.bytes(&[0x48, 0x83, 0xC4, frame as u8]);
+    }
+    out.bytes(&[
+        0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0x5D, 0xC3,
+    ]);
+    Ok(())
+}
+
+/// Emits the x86-64 `start_panic` runtime shim.
+pub(in crate::aot) fn emit_x64_start_panic(
+    c: &Emit<'_>,
+    addrs: SectionAddrs,
+    out: &mut Buf,
+) -> Result<()> {
+    out.bytes(&[
+        0x55, 0x48, 0x89, 0xE5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    ]);
+    out.bytes(if c.win {
+        &[0x48, 0x83, 0xEC, 0x28, 0x49, 0x89, 0xCC, 0x49, 0x89, 0xD6]
+    } else {
+        &[0x48, 0x83, 0xEC, 0x08, 0x49, 0x89, 0xFC, 0x49, 0x89, 0xF6]
+    });
+    emit_x64_unwind_state(c, addrs, out)?;
+    out.bytes(&[0x48, 0x85, 0xC0]);
+    let no_state = x64_fwd32(&[0x0F, 0x84], out);
+    out.bytes(&[0x48, 0x89, 0xC3, 0x4C, 0x8B, 0x3B, 0x4D, 0x85, 0xFF]);
+    let no_frame = x64_fwd32(&[0x0F, 0x84], out);
+    out.bytes(&[0x49, 0x8B, 0x07, 0x48, 0x89, 0x03, 0x49, 0x8B, 0x46, 0x18]);
+    out.bytes(if c.win {
+        &[0x4C, 0x89, 0xE1]
+    } else {
+        &[0x4C, 0x89, 0xE7]
+    });
+    out.bytes(&[
+        0xFF, 0xD0, 0x49, 0x89, 0x47, 0x10, 0x49, 0x89, 0x57, 0x18, 0x49, 0x89, 0x1F,
+    ]);
+    emit_x64_walk_call(c, addrs, out);
+    if c.win {
+        c.bytes_call(&[0x49, 0x8D, 0x4F, 0x30, 0xBA, 1, 0, 0, 0], "longjmp", out)?;
+    } else {
+        out.bytes(&[
+            0x49,
+            0x8B,
+            0x6F,
+            STOP_FP_OFFSET as u8,
+            0x4C,
+            0x89,
+            0xFC,
+            0x4D,
+            0x8B,
+            0x77,
+            0x30,
+            0x49,
+            0x8B,
+            0x47,
+            0x40,
+            0x4D,
+            0x8B,
+            0x7F,
+            0x38,
+            0xFF,
+            0xE0,
+        ]);
+    }
+    [no_state, no_frame]
+        .into_iter()
+        .for_each(|l| x64_patch32(l, out));
+    c.call("abort", out)?;
+    out.bytes(&[0x0F, 0x0B]);
+    Ok(())
+}
+
+fn emit_x64_walk_call(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) {
+    if c.win {
+        out.bytes(&[0x48, 0x89, 0xE9, 0x4C, 0x89, 0xFA, 0x4C, 0x8D, 0x05]);
+        out.u32(((addrs.text as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        if addrs.unwind_table == 0 {
+            out.bytes(&[0x45, 0x31, 0xC9]);
+        } else {
+            out.bytes(&[0x4C, 0x8D, 0x0D]);
+            out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        }
+    } else {
+        out.bytes(&[0x48, 0x89, 0xEF, 0x4C, 0x89, 0xFE, 0x48, 0x8D, 0x15]);
+        out.u32(((addrs.text as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        if addrs.unwind_table == 0 {
+            out.bytes(&[0x31, 0xC9]);
+        } else {
+            out.bytes(&[0x48, 0x8D, 0x0D]);
+            out.u32(((addrs.unwind_table as i64 - (c.at(out) as i64 + 4)) as i32) as u32);
+        }
+    }
+    emit_rel_branch(Arch::X64, true, c.at(out), addrs.unwind_walk, out);
+}
