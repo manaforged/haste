@@ -119,6 +119,17 @@ pub(crate) fn parse_fn_align(raw: Option<&str>) -> Option<u32> {
         .filter(|a: &u32| a.is_power_of_two() && *a >= 16)
 }
 
+/// Resolves a target triple against the supported catalog, formatting supported triples on error.
+pub(crate) fn find_target(triple: &str) -> anyhow::Result<&'static Target> {
+    Target::find(triple).ok_or_else(|| {
+        let known: Vec<&str> = haste_codegen::TARGETS.iter().map(|t| t.triple).collect();
+        anyhow::anyhow!(
+            "unknown target `{triple}`; supported targets: {}",
+            known.join(", ")
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::hash::Hasher;

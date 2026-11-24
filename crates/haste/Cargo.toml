@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+diff-harness = []
+
 [dependencies]
 anyhow = "1"
 haste-codegen = { path = "../codegen" }

@@ -13,6 +13,7 @@
 compile_error!("haste currently supports x86_64/aarch64 Linux, macOS, and Windows hosts");
 
 mod aot;
+mod api;
 mod body;
 mod build;
 mod cli;
@@ -41,6 +42,7 @@ pub(crate) const RECURSION_LIMIT: usize = 128;
 /// Environment variable naming an explicit Rust standard library `library/` source directory.
 pub(crate) const LIBRARY_ENV: &str = "HASTE_LIBRARY";
 
+pub use api::{Compiler, CompilerBuilder, Error, ErrorKind, Target};
 pub use cli::main;
 
 /// Whether an optional environment variable value is enabled (non-empty and not `"0"`).

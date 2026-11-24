@@ -7,7 +7,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 run_manifest "$dir" </dev/null >"$tmp/rustc.out" 2>"$tmp/rustc.err" &
 pid_rustc=$!
-build_haste </dev/null >"$tmp/build.err" 2>&1 || { cat "$tmp/build.err"; echo "engine did not build"; exit 2; }
+build_haste --features diff-harness </dev/null >"$tmp/build.err" 2>&1 || { cat "$tmp/build.err"; echo "engine did not build"; exit 2; }
 run_haste test "$dir" </dev/null >"$tmp/engine" 2>&1 &
 pid_engine=$!
 (env -u HASTE_VERIFY_STENCIL bash -c 'source scripts/cargo.sh && run_haste --release build -o "$1" "$2" && "$1"' _ "$tmp/aot_bin" "$dir") </dev/null >"$tmp/aot.out" 2>"$tmp/aot.err" &

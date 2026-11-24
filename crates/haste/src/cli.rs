@@ -428,7 +428,7 @@ fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     Ok(())
 }
 
-fn program_name(root: &std::path::Path) -> String {
+pub(crate) fn program_name(root: &std::path::Path) -> String {
     root.file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }

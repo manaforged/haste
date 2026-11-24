@@ -7,9 +7,12 @@ use crate::names::ItemRef;
 use crate::outline;
 use crate::sema;
 
-use super::batch::{Batch, BatchKind};
+use super::batch::Batch;
+#[cfg(feature = "diff-harness")]
+use super::batch::BatchKind;
 use super::test_args::parse_test_args;
 
+#[cfg(feature = "diff-harness")]
 include!("../../../../tests/case_inputs.rs");
 
 impl Batch {
@@ -95,12 +98,23 @@ impl Batch {
         &self,
         outline: &outline::Outline,
         started: Instant,
-        built: Duration,
+        _built: Duration,
         filters: &[String],
     ) -> Result<i32> {
-        if self.kind == BatchKind::Tests {
-            return self.report_tests(outline, started, filters);
+        #[cfg(feature = "diff-harness")]
+        if self.kind != BatchKind::Tests {
+            return self.report_cases(outline, started, _built);
         }
+        self.report_tests(outline, started, filters)
+    }
+
+    #[cfg(feature = "diff-harness")]
+    fn report_cases(
+        &self,
+        outline: &outline::Outline,
+        started: Instant,
+        built: Duration,
+    ) -> Result<i32> {
         let (mut failures, runnable) = self.sort(Some(outline));
         let statuses = self.image.run_cases(&runnable, &CASE_INPUTS)?;
         for ((_, name), status) in runnable

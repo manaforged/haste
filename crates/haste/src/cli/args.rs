@@ -241,15 +241,7 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
             "--target" => {
                 args.next();
                 let triple = next_str(args)?;
-                let target = haste_codegen::Target::find(&triple).with_context(|| {
-                    let known: Vec<&str> =
-                        haste_codegen::TARGETS.iter().map(|t| t.triple).collect();
-                    format!(
-                        "unknown target `{triple}`; supported targets: {}",
-                        known.join(", ")
-                    )
-                })?;
-                opts.target = Some(target);
+                opts.target = Some(crate::config::find_target(&triple)?);
             }
             "-o" | "--output" => {
                 args.next();

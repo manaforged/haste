@@ -112,11 +112,14 @@ impl Build {
         if self.cases.is_none() {
             self.load_members(workspace)?;
             let discovered = test_items(workspace, &self.compilation.outline);
+            #[cfg(feature = "diff-harness")]
             let kind = if discovered.is_empty() {
                 BatchKind::Cases
             } else {
                 BatchKind::Tests
             };
+            #[cfg(not(feature = "diff-harness"))]
+            let kind = BatchKind::Tests;
             let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
             if kind == BatchKind::Tests {
                 let starts: Vec<Option<usize>> = batch.tests.iter().map(|(_, s)| *s).collect();

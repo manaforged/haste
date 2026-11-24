@@ -10,6 +10,7 @@ use super::Image;
 
 impl Image {
     /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.
+    #[cfg(feature = "diff-harness")]
     pub fn run_cases(&self, cases: &[(usize, &str)], inputs: &[i64]) -> Result<Vec<i32>> {
         self.run_batch(cases, false, |_, address, name| {
             use std::io::Write;
