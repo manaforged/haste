@@ -286,7 +286,10 @@ impl<'a> PatchEnv<'a> {
                         format!("Arm64Call26 target {value:#x} out of range from {pc_va:#x}")
                     })?;
                 let delta = target as i64 - pc_va as i64;
-                let word = 0x9400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF);
+                let opcode = u32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]])
+                    & 0xFC00_0000;
+                debug_assert!(opcode == 0x9400_0000 || opcode == 0x1400_0000);
+                let word = opcode | (((delta >> 2) as u32) & 0x03FF_FFFF);
                 out[at..at + 4].copy_from_slice(&word.to_le_bytes());
             }
             RelocKind::PcRel32 => {

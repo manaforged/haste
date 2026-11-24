@@ -16,7 +16,11 @@ impl Asm {
         build: impl FnOnce(u32, RelocKind) -> StencilReloc,
     ) -> StencilReloc {
         if direct {
-            let at = self.bl_reloc();
+            let at = if tail {
+                self.b_reloc()
+            } else {
+                self.bl_reloc()
+            };
             return build(at, RelocKind::Arm64Call26);
         }
         let at = self.mov_symbol(scratch);
@@ -67,27 +71,38 @@ impl Asm {
         })
     }
 
-    /// Indirect JIT tail branch through call-table slot `sym`.
-    pub(in crate::arm64) fn tail_symbol(&mut self, sym: u32, scratch: Reg) -> StencilReloc {
-        self.emit_call_reloc(false, true, true, scratch, |at, kind| {
+    /// Direct `b` to `sym` when `direct`, else an indirect JIT tail branch through call-table slot `sym`.
+    pub(in crate::arm64) fn tail_symbol(
+        &mut self,
+        sym: u32,
+        direct: bool,
+        scratch: Reg,
+    ) -> StencilReloc {
+        self.emit_call_reloc(direct, true, true, scratch, |at, kind| {
             StencilReloc::symbol(at, sym, kind)
         })
     }
 
-    /// Indirect JIT tail branch to symbol `sym`.
-    pub(in crate::arm64) fn tail_direct_symbol(&mut self, sym: u32, scratch: Reg) -> StencilReloc {
-        self.emit_call_reloc(false, false, true, scratch, |at, kind| {
+    /// Direct `b` to symbol `sym` when `direct`, else an indirect JIT tail branch.
+    pub(in crate::arm64) fn tail_direct_symbol(
+        &mut self,
+        sym: u32,
+        direct: bool,
+        scratch: Reg,
+    ) -> StencilReloc {
+        self.emit_call_reloc(direct, false, true, scratch, |at, kind| {
             StencilReloc::symbol(at, sym, kind)
         })
     }
 
-    /// Indirect JIT tail branch to runtime helper `rt`.
+    /// Direct `b` to runtime helper `rt` when `direct`, else an indirect JIT tail branch.
     pub(in crate::arm64) fn tail_runtime(
         &mut self,
         rt: RuntimeSymbol,
+        direct: bool,
         scratch: Reg,
     ) -> StencilReloc {
-        self.emit_call_reloc(false, false, true, scratch, |at, kind| {
+        self.emit_call_reloc(direct, false, true, scratch, |at, kind| {
             StencilReloc::runtime(at, rt, kind)
         })
     }
@@ -193,15 +208,21 @@ impl Emit<'_> {
         }
         match direct {
             Some(CallTarget::Slot(sym)) => {
-                let reloc = self.asm.tail_symbol(sym, T);
+                let reloc = self.asm.tail_symbol(sym, self.direct_calls, T);
                 self.relocs.push(reloc);
             }
             Some(CallTarget::Abs(at)) => {
                 self.asm.mov_imm(T, i64::from(at));
                 self.asm.br(T);
             }
-            Some(CallTarget::Runtime(rt)) => self.relocs.push(self.asm.tail_runtime(rt, T)),
-            Some(CallTarget::Symbol(sym)) => self.relocs.push(self.asm.tail_direct_symbol(sym, T)),
+            Some(CallTarget::Runtime(rt)) => {
+                self.relocs
+                    .push(self.asm.tail_runtime(rt, self.direct_calls, T))
+            }
+            Some(CallTarget::Symbol(sym)) => {
+                self.relocs
+                    .push(self.asm.tail_direct_symbol(sym, self.direct_calls, T))
+            }
             None => self.asm.br(target),
         }
         self.invalidate_spills();
