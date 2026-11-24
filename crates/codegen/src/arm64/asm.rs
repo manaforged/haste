@@ -247,6 +247,11 @@ impl Asm {
         self.jump(0x1400_0000, label, Fixup::Branch);
     }
 
+    pub fn bl(&mut self, label: Label) {
+        self.clear_anchor();
+        self.jump(0x9400_0000, label, Fixup::Branch);
+    }
+
     pub fn bcond(&mut self, cond: Cond, label: Label) {
         self.jump_cond(Fixup::Cond, 0x5400_0000 | cond as u32, 0x5400_0000 | cond.invert() as u32, label);
     }

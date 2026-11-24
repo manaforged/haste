@@ -106,6 +106,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     framed = (framed || lr) && !bracket;
     let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP], |_| false)).flatten();
     let mut asm = Asm::default();
+    let tlv_cache = (full && tlv_cells && framed).then(|| frames::plan_tlv_cache(func, &plan, &defs, &mut frame, &mut asm)).flatten();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let emit = Emit {
         func,
@@ -127,6 +128,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         copied,
         direct_calls: target.direct_calls,
         tlv_cells,
+        tlv_cache,
         lse: target.os == Os::Darwin,
         sp_bias: 0,
         shrink,
@@ -189,6 +191,7 @@ pub(super) struct Emit<'a> {
     copied: Vec<bool>,
     direct_calls: bool,
     tlv_cells: bool,
+    tlv_cache: Option<frames::TlvCache>,
     lse: bool,
     sp_bias: i32,
     shrink: Option<ShrinkWrap>,
@@ -224,12 +227,29 @@ impl<'a> Emitter<'a> for Emit<'a> {
             Some(v0) => asm.fstp_offset(Vreg(a), Vreg(v0), FP, disp),
             None => asm.vstore(8, Mem::new(FP, disp), Vreg(a)),
         });
+        if let Some(slot) = self.tlv_cache.as_ref().map(|c| c.slot) {
+            let at = self.frame_mem(slot);
+            self.asm.store(Size::X, at, ZR);
+        }
     }
 
     fn intake(&mut self, entry: Block) -> Result<(), String> { intake_params(self, entry) }
     fn set_next(&mut self, next: Option<Block>) { self.next = next; }
-    fn bind_block(&mut self, block: Block) { self.invalidate_spills(); self.resume_spills(block); self.asm.bind(self.blocks[block.index()]); }
-    fn bind_entry(&mut self, block: Block) { self.spills.bind_entry(block); self.asm.bind(self.blocks[block.index()]); }
+    fn bind_block(&mut self, block: Block) {
+        self.invalidate_spills();
+        self.resume_spills(block);
+        if let Some(cache) = &mut self.tlv_cache {
+            cache.live = cache.dom_known[block.index()];
+        }
+        self.asm.bind(self.blocks[block.index()]);
+    }
+    fn bind_entry(&mut self, block: Block) {
+        self.spills.bind_entry(block);
+        if let Some(cache) = &mut self.tlv_cache {
+            cache.live = cache.dom_known[block.index()];
+        }
+        self.asm.bind(self.blocks[block.index()]);
+    }
     fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
     fn before_block_bind(&mut self, _block: Block) -> Result<(), String> { self.asm.maybe_island()?; Ok(()) }
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> { self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]); Ok(()) }

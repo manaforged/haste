@@ -252,11 +252,20 @@ pub(crate) struct Frame<R> {
     pub saves: Vec<R>,
     pub float_saves: Vec<u8>,
     pub wide: bool,
+    cursor: u32,
+    outgoing: u32,
 }
 
 impl<R> Frame<R> {
     pub(crate) fn edge_slot(&self, index: usize) -> i32 {
         self.scratch + (edge_bytes(self.wide) as usize * index) as i32
+    }
+
+    /// Reserves an additional `bytes`-aligned local slot above outgoing arguments and returns its frame-pointer offset.
+    pub(crate) fn add_slot(&mut self, bytes: u32) -> i32 {
+        self.cursor = round(self.cursor, bytes) + bytes;
+        self.size = round(self.cursor + self.outgoing, 16);
+        -(self.cursor as i32)
     }
 }
 
@@ -499,7 +508,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     if crate::trace::enabled() {
         crate::trace::on_frame(func, (&values, &slots), size);
     }
-    Ok(Frame { values, slots, scratch, size, saves, float_saves, wide })
+    Ok(Frame { values, slots, scratch, size, saves, float_saves, wide, cursor, outgoing })
 }
 
 pub(crate) struct Prepared<R> {

@@ -118,7 +118,43 @@ pub(super) fn emit_arm64_tlv_frame_cache(c: &Emit<'_>, alloc: bool, desc_va: u64
     }
 }
 
+const ARM64_NOP: u32 = 0xD503_201F;
+
+fn arm64_tlv_word(sym: &Symbol, addrs: SectionAddrs, existing: u32) -> Result<u32> {
+    if existing == ARM64_NOP {
+        return Ok(ARM64_NOP);
+    }
+    let rn = (existing >> 5) & 0x1F;
+    match *sym {
+        Symbol::Runtime(_) => {
+            ensure!(addrs.frame_tls != 0, "Arm64TlvCell without frame cache");
+            let bytes = (existing >> 10) & 0xFFF;
+            let total = addrs.frame_tls as u32 + bytes;
+            ensure!(total < 4096, "Arm64TlvCell frame offset {total} out of range");
+            Ok(arm64_add_imm(10, rn, total))
+        }
+        Symbol::Word(s) => {
+            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
+            let byte_off = addrs.thread_tls + s * 8;
+            ensure!(byte_off % 8 == 0 && byte_off < 32_768, "Arm64TlvCell offset {byte_off} out of range");
+            Ok(0xF940_0000u32 | (((byte_off as u32 / 8) & 0xFFF) << 10) | (rn << 5))
+        }
+        Symbol::Host(HostSymbol::ThreadCell) => {
+            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
+            ensure!(addrs.thread_tls % 8 == 0 && addrs.thread_tls < 32_768, "Arm64TlvCell offset out of range");
+            Ok(0xF940_0000u32 | (((addrs.thread_tls as u32 / 8) & 0xFFF) << 10) | (rn << 5))
+        }
+        ref other => bail!("Arm64TlvCell to {other:?}"),
+    }
+}
+
 pub(super) fn patch_thread_off32(sym: &Symbol, addrs: SectionAddrs, slot: &mut [u8]) -> Result<()> {
+    if addrs.tlv_desc != 0 {
+        let existing = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+        let word = arm64_tlv_word(sym, addrs, existing)?;
+        slot[..4].copy_from_slice(&word.to_le_bytes());
+        return Ok(());
+    }
     let addend = i64::from(i32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]));
     let word = match *sym {
         Symbol::Runtime(_) => {
@@ -143,27 +179,8 @@ pub(super) fn patch_thread_off32(sym: &Symbol, addrs: SectionAddrs, slot: &mut [
 pub(super) fn patch_arm64_tlv_cell(sym: &Symbol, addrs: SectionAddrs, pc_va: u64, slot: &mut [u8]) -> Result<()> {
     ensure!(addrs.tlv_desc != 0, "Arm64TlvCell without Mach-O TLV");
     patch_arm64_adrp_add(&mut slot[..8], pc_va, false, addrs.tlv_desc, false)?;
-    let word = match *sym {
-        Symbol::Runtime(_) => {
-            ensure!(addrs.frame_tls != 0, "Arm64TlvCell without frame cache");
-            let bytes = (u32::from_le_bytes([slot[16], slot[17], slot[18], slot[19]]) >> 10) & 0xFFF;
-            let total = addrs.frame_tls as u32 + bytes;
-            ensure!(total < 4096, "Arm64TlvCell frame offset {total} out of range");
-            arm64_add_imm(10, 0, total)
-        }
-        Symbol::Word(s) => {
-            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
-            let byte_off = addrs.thread_tls + s * 8;
-            ensure!(byte_off % 8 == 0 && byte_off < 32_768, "Arm64TlvCell offset {byte_off} out of range");
-            0xF940_0000u32 | (((byte_off as u32 / 8) & 0xFFF) << 10)
-        }
-        Symbol::Host(HostSymbol::ThreadCell) => {
-            ensure!(addrs.thread_tls != 0, "Arm64TlvCell without thread cell table");
-            ensure!(addrs.thread_tls % 8 == 0 && addrs.thread_tls < 32_768, "Arm64TlvCell offset out of range");
-            0xF940_0000u32 | (((addrs.thread_tls as u32 / 8) & 0xFFF) << 10)
-        }
-        ref other => bail!("Arm64TlvCell to {other:?}"),
-    };
+    let existing = u32::from_le_bytes([slot[16], slot[17], slot[18], slot[19]]);
+    let word = arm64_tlv_word(sym, addrs, existing)?;
     slot[16..20].copy_from_slice(&word.to_le_bytes());
     Ok(())
 }
