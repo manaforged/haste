@@ -232,10 +232,11 @@ fn narrow_call_needs_zext<R>(func: &Function, locations: &[Location<R>], census:
     needs
 }
 
-/// Computes which small integer values already have zero-extended upper bits in 64-bit registers.
-pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>], census: &Uses, call_zext: bool) -> Vec<bool> {
+/// Computes `(zero_ext, clean_bits)` where `clean_bits[v]` upper-bounds the active low bits of `v`'s 64-bit register value (`<= 64` when upper bits are zero, `65` when dirty).
+pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>], census: &Uses, call_zext: bool) -> (Vec<bool>, Vec<u8>) {
+    const DIRTY: u8 = 65;
     let count = func.types.len();
-    let (mut out, mut incoming) = (vec![false; count], vec![Some(Vec::new()); count]);
+    let (mut bits, mut incoming) = (vec![DIRTY; count], vec![Some(Vec::new()); count]);
     if let Some(entry) = func.entry {
         func.blocks[entry.index()].params.iter().for_each(|p| incoming[p.index()] = None);
     }
@@ -254,35 +255,33 @@ pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>],
     }
     let call_needs = call_zext.then(|| narrow_call_needs_zext(func, locations, census));
     for (v, ty) in func.types.iter().enumerate() {
+        if !ty.is_small_int() {
+            continue;
+        }
         let single_def = census.def_inst[v].is_some_and(|d| func.insts[d.index()].result == Some(Value(v as u32)));
         let narrow_call = call_needs.as_ref().is_some_and(|n| n[v])
             && matches!(ty, Type::I8 | Type::I16)
             && census.def_inst[v].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Call { .. }));
-        out[v] = ty.is_small_int() && (single_def || narrow_call || incoming[v].as_ref().is_some_and(|l| !l.is_empty()));
+        if narrow_call {
+            bits[v] = ty.bits() as u8;
+        } else if single_def || incoming[v].as_ref().is_some_and(|l| !l.is_empty()) {
+            bits[v] = 0;
+        }
     }
     let const_val = |v: Value| match locations[v.index()] {
         Location::Imm(imm) => Some(imm),
         _ => census.def_inst[v.index()].and_then(|d| match func.insts[d.index()].op { Op::Const(imm) => Some(imm), _ => None }),
     };
     let ty_mask = |ty: Type| if ty == Type::I64 { i64::MAX } else { (1_i64 << ty.bits()) - 1 };
-    let fits_mask = |v: Value, mask: i64| const_val(v).is_some_and(|m| (0..=mask).contains(&m));
-    let is_icmp = |v: Value| census.def_inst[v.index()].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Icmp(..)));
-    let is_cmp = |v: Value| is_icmp(v) || census.def_inst[v.index()].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Convert(Convert::Uextend, inner) if is_icmp(inner)));
-    let clean_bits = |out: &[bool], v: Value| -> Option<u32> {
-        let imm_bits = |x: i64| (x >= 0).then(|| 64 - (x as u64).leading_zeros());
-        if let Some(w) = const_val(v).and_then(imm_bits) {
-            return Some(w);
-        }
-        match census.def_inst[v.index()].map(|d| &func.insts[d.index()].op) {
-            Some(&Op::Convert(Convert::Uextend, inner)) => Some(func.types[inner.index()].bits()),
-            Some(&Op::Binary(Binary::Band, a, b)) => const_val(a)
-                .and_then(imm_bits)
-                .or_else(|| const_val(b).and_then(imm_bits))
-                .map(|w| w.min(func.types[v.index()].bits()))
-                .or_else(|| out[v.index()].then(|| func.types[v.index()].bits())),
-            _ => out[v.index()].then(|| func.types[v.index()].bits()),
+    let imm_bits = |imm: i64, ty: Type| {
+        if (0..=ty_mask(ty)).contains(&imm) {
+            (64 - (imm as u64).leading_zeros()) as u8
+        } else {
+            DIRTY
         }
     };
+    let is_icmp = |v: Value| census.def_inst[v.index()].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Icmp(..)));
+    let is_cmp = |v: Value| is_icmp(v) || census.def_inst[v.index()].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Convert(Convert::Uextend, inner) if is_icmp(inner)));
     let mut changed = true;
     while changed {
         changed = false;
@@ -292,44 +291,92 @@ pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>],
             if !ty.is_small_int() {
                 continue;
             }
-            let z = match func.insts[inst.index()].op {
-                Op::Const(imm) => (0..=ty_mask(ty)).contains(&imm),
-                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _) | Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => true,
-                Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Unary(Unary::Bitrev, _) => ty == Type::I32,
-                Op::Unary(Unary::Bswap, a) => ty == Type::I32 && out[a.index()],
-                Op::Select(_, a, b) => out[a.index()] && out[b.index()],
-                Op::Binary(Binary::Bor | Binary::Bxor, a, b) => ty == Type::I32 || (out[a.index()] && out[b.index()]),
-                Op::Binary(Binary::Iadd, a, b) => ty == Type::I32 && !is_cmp(a) && !is_cmp(b),
-                Op::Binary(Binary::Isub | Binary::Imul | Binary::Rotl | Binary::Rotr | Binary::Udiv | Binary::Urem | Binary::Umulhi | Binary::Umin | Binary::Umax | Binary::UaddSat | Binary::UsubSat | Binary::AvgRound, _, _) => ty == Type::I32,
-                Op::Binary(Binary::Ushr, a, _) => ty == Type::I32 || out[a.index()],
-                Op::Binary(Binary::Ishl, a, amt) => const_val(amt).is_some_and(|s| clean_bits(&out, a).is_some_and(|w| w + ((s as u32) & (ty.bits() - 1)) <= ty.bits())),
-                Op::Binary(Binary::Band, a, b) => ty == Type::I32 || (matches!(ty, Type::I8 | Type::I16) && (out[a.index()] || out[b.index()] || fits_mask(a, ty_mask(ty)) || fits_mask(b, ty_mask(ty)))),
-                Op::Convert(Convert::Ireduce, shifted) => {
-                    let (src_ty, dst_bits) = (func.types[shifted.index()], ty.bits());
-                    (call_zext && reg_reduce(func, locations, res, shifted))
-                        || clean_bits(&out, shifted).is_some_and(|w| w <= dst_bits)
-                        || (matches!(src_ty, Type::I64 | Type::I32)
-                            && census.def_inst[shifted.index()].is_some_and(|def| match func.insts[def.index()].op {
-                                Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => dst_bits >= 8,
-                                Op::Binary(Binary::Ushr, _, c) => const_val(c).is_some_and(|s| (0..i64::from(src_ty.bits())).contains(&s) && src_ty.bits() - (s as u32) <= dst_bits),
-                                _ => false,
-                            }))
+            let w = ty.bits() as u8;
+            let b = if let Some(imm) = const_val(res) {
+                imm_bits(imm, ty)
+            } else {
+                match func.insts[inst.index()].op {
+                    Op::Const(imm) => imm_bits(imm, ty),
+                    Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..) => w,
+                    Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => 1,
+                    Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => 7_u8.min(w),
+                    Op::Convert(Convert::Uextend, inner) => bits[inner.index()].min(func.types[inner.index()].bits() as u8),
+                    Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Unary(Unary::Bitrev, _) => if ty == Type::I32 { 32 } else { DIRTY },
+                    Op::Unary(Unary::Bswap, a) => if ty == Type::I32 && bits[a.index()] <= 32 { 32 } else { DIRTY },
+                    Op::Select(_, a, b) => bits[a.index()].max(bits[b.index()]),
+                    Op::Binary(Binary::Bor | Binary::Bxor, a, b) => {
+                        let m = bits[a.index()].max(bits[b.index()]);
+                        if ty == Type::I32 { m.min(32) } else { m }
+                    }
+                    Op::Binary(Binary::Iadd, a, b) => if ty == Type::I32 && !is_cmp(a) && !is_cmp(b) { 32 } else { DIRTY },
+                    Op::Binary(Binary::Isub | Binary::Imul | Binary::Rotl | Binary::Rotr | Binary::Udiv | Binary::Urem | Binary::Umulhi | Binary::Umin | Binary::Umax | Binary::UaddSat | Binary::UsubSat | Binary::AvgRound, _, _) => {
+                        if ty == Type::I32 { 32 } else { DIRTY }
+                    }
+                    Op::Binary(Binary::Ushr, a, c) => {
+                        let shift = const_val(c).map(|s| ((s as u32) & (ty.bits() - 1)) as u8);
+                        match ty {
+                            Type::I32 | Type::I64 => {
+                                let base = bits[a.index()].min(w);
+                                shift.map_or(base, |s| base.saturating_sub(s))
+                            }
+                            _ if bits[a.index()] <= w => shift.map_or(bits[a.index()], |s| bits[a.index()].saturating_sub(s)),
+                            _ => DIRTY,
+                        }
+                    }
+                    Op::Binary(Binary::Ishl, a, amt) => {
+                        if let Some(s) = const_val(amt) {
+                            let sh = ((s as u32) & (ty.bits() - 1)) as u8;
+                            if bits[a.index()].saturating_add(sh) <= w {
+                                bits[a.index()] + sh
+                            } else if ty == Type::I32 {
+                                32
+                            } else {
+                                DIRTY
+                            }
+                        } else if ty == Type::I32 {
+                            32
+                        } else {
+                            DIRTY
+                        }
+                    }
+                    Op::Binary(Binary::Band, a, b) => {
+                        let m = bits[a.index()].min(bits[b.index()]);
+                        match ty {
+                            Type::I32 => m.min(32),
+                            Type::I8 | Type::I16 => if m <= w { m } else { DIRTY },
+                            _ => m,
+                        }
+                    }
+                    Op::Convert(Convert::Ireduce, shifted) => {
+                        if bits[shifted.index()] <= w {
+                            bits[shifted.index()]
+                        } else if call_zext && reg_reduce(func, locations, res, shifted) {
+                            w
+                        } else {
+                            DIRTY
+                        }
+                    }
+                    _ => DIRTY,
                 }
-                _ => false,
             };
-            if out[res.index()] != z {
-                out[res.index()] = z;
+            let next = bits[res.index()].max(b);
+            if bits[res.index()] != next {
+                bits[res.index()] = next;
                 changed = true;
             }
         }
         for (p, list) in incoming.iter().enumerate() {
-            if out[p] && let Some(list) = list && !list.iter().all(|a| out[a.index()]) {
-                out[p] = false;
-                changed = true;
+            if let Some(list) = list && !list.is_empty() {
+                let next = list.iter().map(|a| bits[a.index()]).max().unwrap_or(DIRTY).max(bits[p]);
+                if bits[p] != next {
+                    bits[p] = next;
+                    changed = true;
+                }
             }
         }
     }
-    out
+    let out = func.types.iter().enumerate().map(|(v, ty)| ty.is_small_int() && bits[v] <= ty.bits() as u8).collect();
+    (out, bits)
 }
 
 /// The register each value is passed or returned in at a call or return, and the register a high product lands in.

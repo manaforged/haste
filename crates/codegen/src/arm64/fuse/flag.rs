@@ -521,13 +521,23 @@ pub(super) fn icmp_consumer(func: &Function, plan: &Plan<Reg>, tail: &[Inst], re
     flag_consumer(func, plan, tail, res, false).is_some()
 }
 
-pub(in super::super) fn zero_cmp_operand(plan: &Plan<Reg>, ty: Type, a: Value, b: Value) -> Option<Value> {
+pub(in super::super) fn zero_cmp_operand(plan: &Plan<Reg>, ty: Type, a: Value, b: Value) -> Option<(Value, bool)> {
     if !ty.is_small_int() {
         return None;
     }
-    let is_zero = |v: Value| plan.const_of(v).is_some_and(|imm| crate::fold::extend(imm, ty, false) == 0);
-    let val = if is_zero(b) { a } else if is_zero(a) { b } else { return None };
-    (!plan.elided[val.index()] && plan.const_of(val).is_none()).then_some(val)
+    let is_imm = |v: Value, k: i64| plan.const_of(v).is_some_and(|imm| crate::fold::extend(imm, ty, false) == k);
+    let (val, one) = if is_imm(b, 0) {
+        (a, false)
+    } else if is_imm(a, 0) {
+        (b, false)
+    } else if is_imm(b, 1) && plan.clean_bits[a.index()] <= 1 {
+        (a, true)
+    } else if is_imm(a, 1) && plan.clean_bits[b.index()] <= 1 {
+        (b, true)
+    } else {
+        return None;
+    };
+    (!plan.elided[val.index()] && plan.const_of(val).is_none()).then_some((val, one))
 }
 
 fn can_elide_cbz(
@@ -536,11 +546,13 @@ fn can_elide_cbz(
     (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
     (b_idx, pos, c_pos): (usize, usize, usize),
     val: Value,
+    one: bool,
 ) -> bool {
     if !preserved(func, plan, b_idx, pos, c_pos, None, val) {
         return false;
     }
-    if uses[val.index()] == 1
+    if !one
+        && uses[val.index()] == 1
         && let Some((vb, vpos, vinst)) = def_entry(pos_of, val)
         && vb == b_idx
         && let Op::Binary(Binary::Band, bx, by) = func.insts[vinst.index()].op
@@ -584,8 +596,8 @@ pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32
                 continue;
             };
             if is_branch
-                && let Some(val) = zero_val
-                && can_elide_cbz(func, plan, (uses, &pos_of), (b_idx, pos, pos + 1 + off), val)
+                && let Some((val, one)) = zero_val
+                && can_elide_cbz(func, plan, (uses, &pos_of), (b_idx, pos, pos + 1 + off), val, one)
             {
                 plan.fused[res.index()] = false;
                 plan.elided[res.index()] = true;

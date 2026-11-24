@@ -93,6 +93,7 @@ impl Emit<'_> {
     fn is_zext_within(&self, val: Value, expect_bits: u32, depth: u8) -> bool {
         if matches!(self.plan.location(val), Location::Float(_)) { return false; }
         let ty = self.ty(val);
+        if u32::from(self.plan.clean_bits[val.index()]) <= expect_bits { return true; }
         if self.plan.zero_ext[val.index()] && ty.bits() <= expect_bits { return true; }
         if let Location::Imm(imm) = self.plan.location(val) { return imm_within(imm, expect_bits); }
         let Some(inst) = (depth > 0).then(|| self.defs[val.index()]).flatten() else { return false };

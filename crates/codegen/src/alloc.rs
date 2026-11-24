@@ -110,6 +110,7 @@ pub(crate) struct Plan<R> {
     pub sib: Vec<Option<Sib>>,
     pub elided: Vec<bool>,
     pub zero_ext: Vec<bool>,
+    pub clean_bits: Vec<u8>,
     /// The summed block-weighted accesses of the register candidates left in stack slots.
     pub spill_cost: u64,
     pub hoist: hoist::Hoist<R>,
@@ -640,7 +641,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     consts(func, regs.absolute_calls, &mut locations);
     statics(func, &mut locations);
     let census = census(func);
-    let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
+    let (zero_ext, clean_bits) = hints::zero_ext(func, &locations, &census, regs.call_zext);
     let cfg = weighed.then(|| func.cfg());
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
     let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
@@ -706,7 +707,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let shared = webs.map_or_else(Vec::new, |webs| crate::color::share(func, &live, &locations, &deferred, &webs));
-    let zero_ext = if regs.call_zext && hints::has_reg_reduce(func, &locations) { hints::zero_ext(func, &locations, &census, true) } else { zero_ext };
+    let (zero_ext, clean_bits) = if regs.call_zext && hints::has_reg_reduce(func, &locations) { hints::zero_ext(func, &locations, &census, true) } else { (zero_ext, clean_bits) };
     if crate::trace::enabled() {
         crate::trace::on_alloc(func, &live, (0..count).filter(|&value| ints[value]).map(|value| (value, matches!(locations[value], Location::Slot))));
         if let (Some(loops), Some(blocks)) = (loops, blocks.as_deref()) {
@@ -716,7 +717,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     }
     let spill_cost = weights.map_or(0, |weights| (0..count).filter(|&v| (ints[v] || floats[v]) && matches!(locations[v], Location::Slot)).map(|v| weights[v]).sum());
     let hoist = if weighed { hoist::Hoist::new(func, &live, &locations) } else { hoist::Hoist::empty() };
-    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, spill_cost, hoist }
+    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext, clean_bits, spill_cost, hoist }
 }
 
 impl<R: Copy> Plan<R> {

@@ -509,9 +509,9 @@ impl Emit<'_> {
                 return;
             }
             if let Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs) = self.func.insts[inst.index()].op
-                && let Some(val) = fuse::zero_cmp_operand(&self.plan, self.ty(lhs), lhs, rhs)
+                && let Some((val, one)) = fuse::zero_cmp_operand(&self.plan, self.ty(lhs), lhs, rhs)
             {
-                return self.emit_cbz(val, (cc == IntCC::NotEqual) ^ invert, label);
+                return self.emit_cbz(val, (cc == IntCC::NotEqual) ^ one ^ invert, label);
             }
         }
         if let Some((value, cond)) = self.flags
