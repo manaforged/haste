@@ -36,7 +36,7 @@ const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 const OP_SCRATCH: [Reg; 3] = [D, S, T];
 const PRESERVED_CLOBBERS: [Reg; 2] = [Reg(0), LR];
 
-const fn make_regs(scratch_mask: fn(&Function, &Op) -> u8) -> Regs<Reg> {
+const fn make_regs(scratch_mask: fn(&Function, &Op) -> u8, atomic_addrs: crate::alloc::AtomicAddrMode) -> Regs<Reg> {
     Regs {
         saved: &SAVED,
         saved_float: &SAVED_FLOAT,
@@ -54,14 +54,15 @@ const fn make_regs(scratch_mask: fn(&Function, &Op) -> u8) -> Regs<Reg> {
         two_address: false,
         park: true,
         fold_sib: true,
+        atomic_addrs,
         call_zext: true,
         imm_store,
         high_product: None,
     }
 }
 
-const REGS: Regs<Reg> = make_regs(atomic::scratch_mask);
-const REGS_LSE: Regs<Reg> = make_regs(atomic::scratch_mask_lse);
+const REGS: Regs<Reg> = make_regs(atomic::scratch_mask, crate::alloc::AtomicAddrMode::None);
+const REGS_LSE: Regs<Reg> = make_regs(atomic::scratch_mask_lse, crate::alloc::AtomicAddrMode::Rcpc2);
 
 /// Zero stores from `xzr`; any other constant goes into a register first.
 fn imm_store(imm: i64) -> u64 {
@@ -451,6 +452,11 @@ impl Emit<'_> {
 
     fn emit_cbz(&mut self, val: Value, nonzero: bool, label: Label) {
         let bytes = self.ty(val).bytes();
+        if bytes < 4 && self.tst_small_zero(val) {
+            self.clear_flags();
+            self.asm.bcond(if nonzero { Cond::Ne } else { Cond::Eq }, label);
+            return;
+        }
         let reg = if bytes >= 4 { self.bits(val, A) } else { self.zext_src(val, A) };
         self.asm.cbz(nonzero, if bytes >= 8 { Size::X } else { Size::W }, reg, label);
     }

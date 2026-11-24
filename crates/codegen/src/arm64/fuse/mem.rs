@@ -733,21 +733,11 @@ fn narrow_store_ok(func: &Function, plan: &Plan<Reg>, uses: &[u32], (b_idx, pos,
 }
 
 pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, rcpc2: bool, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>])) {
-    const RCPC2_BIT: u8 = 16;
     let mut info: Vec<(u32, usize, usize, u8)> = vec![(0, usize::MAX, 0, 0); func.types.len()];
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for (pos, &inst) in block.insts.iter().enumerate() {
-            let data = &func.insts[inst.index()];
-            let hit = match (&data.op, data.result) {
-                (&Op::AtomicLoad(addr, ord), Some(r)) if !ord.has_acquire() => Some((addr, func.ty(r).bytes(), 0)),
-                (&Op::AtomicLoad(addr, crate::ir::AtomicOrd::Acquire), Some(r)) if rcpc2 => Some((addr, func.ty(r).bytes(), RCPC2_BIT)),
-                (&Op::AtomicStore(val, addr, ord), _) if !ord.has_release() && val != addr => Some((addr, func.ty(val).bytes(), 0)),
-                (&Op::AtomicStore(val, addr, crate::ir::AtomicOrd::Release), _) if rcpc2 && val != addr => Some((addr, func.ty(val).bytes(), RCPC2_BIT)),
-                _ => None,
-            };
-            if let Some((addr, bytes, extra)) = hit && matches!(bytes, 1 | 2 | 4 | 8) {
+            if let Some((addr, mask)) = crate::alloc::rcpc2_atomic_site(func, &func.insts[inst.index()], rcpc2) {
                 let entry = &mut info[addr.index()];
-                let mask = bytes as u8 | extra;
                 if entry.0 == 0 {
                     *entry = (1, b_idx, pos, mask);
                 } else if entry.1 == b_idx {
@@ -769,8 +759,7 @@ pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, rcpc2: bo
         let Some((base, delta)) = parse_sib_base_op(func, plan, pos_of, &func.insts[inst.index()].op) else { continue };
         if plan.elided[base.index()] || plan.sib[base.index()].is_some() { continue; }
         if count > 1 && plan.reg_of(base).is_none() && !matches!(plan.location(base), Location::Frame(..)) { continue; }
-        if (mask & RCPC2_BIT) != 0 && !(-256..=255).contains(&delta) { continue; }
-        if (mask & !RCPC2_BIT) != 0 && ![1u8, 2, 4, 8].into_iter().filter(|&b| (mask & b) != 0).all(|b| mem_imm_fits(delta, u32::from(b))) { continue; }
+        if delta == 0 || !crate::alloc::rcpc2_delta_fits(i64::from(delta), mask) { continue; }
         if preserved(func, plan, block, start, max_end, None, base) {
             plan.elided[v] = true;
         }

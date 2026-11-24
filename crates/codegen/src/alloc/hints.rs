@@ -1,9 +1,48 @@
 use crate::frame::{Abi, Loc};
-use crate::ir::{Binary, Block, Convert, Function, Op, Signature, TargetOpId, Type, Unary, Value};
+use crate::ir::{AtomicOrd, Binary, Block, Convert, Function, InstData, Op, Signature, TargetOpId, Type, Unary, Value};
 use crate::live::{Live, covers, overlaps};
 use crate::park::crosses_ranges;
 
 use super::{Location, Regs, Uses, registered};
+
+const RCPC2_BIT: u8 = 16;
+
+/// Extracts `(addr, mask)` for an ARM64 relaxed or RCPC2 acquire/release atomic memory site.
+pub(crate) fn rcpc2_atomic_site(func: &Function, data: &InstData, rcpc2: bool) -> Option<(Value, u8)> {
+    let (addr, bytes, extra) = match (&data.op, data.result) {
+        (&Op::AtomicLoad(addr, ord), Some(r)) if !ord.has_acquire() => (addr, func.ty(r).bytes(), 0),
+        (&Op::AtomicLoad(addr, AtomicOrd::Acquire), Some(r)) if rcpc2 => (addr, func.ty(r).bytes(), RCPC2_BIT),
+        (&Op::AtomicStore(val, addr, ord), _) if !ord.has_release() && val != addr => (addr, func.ty(val).bytes(), 0),
+        (&Op::AtomicStore(val, addr, AtomicOrd::Release), _) if rcpc2 && val != addr => (addr, func.ty(val).bytes(), RCPC2_BIT),
+        _ => return None,
+    };
+    matches!(bytes, 1 | 2 | 4 | 8).then_some((addr, bytes as u8 | extra))
+}
+
+/// Reports whether `delta` fits every ARM64 atomic offset encoded in `mask`.
+pub(crate) fn rcpc2_delta_fits(delta: i64, mask: u8) -> bool {
+    if (-256..=255).contains(&delta) {
+        return true;
+    }
+    if (mask & RCPC2_BIT) != 0 || delta < 0 {
+        return false;
+    }
+    [1_u8, 2, 4, 8].into_iter().filter(|&b| (mask & b) != 0).all(|b| delta % i64::from(b) == 0 && delta / i64::from(b) < 4096)
+}
+
+pub(super) fn rcpc2_atomic_uses(func: &Function) -> Vec<(u32, u8)> {
+    let mut info = vec![(0_u32, 0_u8); func.types.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            if let Some((addr, mask)) = rcpc2_atomic_site(func, &func.insts[inst.index()], true) {
+                let entry = &mut info[addr.index()];
+                entry.0 += 1;
+                entry.1 |= mask;
+            }
+        }
+    }
+    info
+}
 
 fn in_place(op: Binary) -> bool {
     matches!(
@@ -165,6 +204,34 @@ pub(super) fn has_reg_reduce<R: PartialEq>(func: &Function, locations: &[Locatio
     func.insts.iter().any(|data| matches!((&data.op, data.result), (&Op::Convert(Convert::Ireduce, src), Some(res)) if reg_reduce(func, locations, res, src)))
 }
 
+fn narrow_call_needs_zext<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<bool> {
+    let is_zero = |v: Value| match locations[v.index()] {
+        Location::Imm(0) => true,
+        _ => census.def_inst[v.index()].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Const(0))),
+    };
+    let mut needs = vec![false; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let op = &func.insts[inst.index()].op;
+        match op {
+            Op::Brif(cond, _, ta, _, ea) => {
+                for &v in ta.iter().chain(ea.iter()) {
+                    needs[v.index()] = true;
+                }
+                let _ = cond;
+            }
+            Op::Trapz(_) => {}
+            Op::Store(val, addr, _) | Op::AtomicStore(val, addr, _) | Op::VolatileStore(val, addr, _) => {
+                needs[addr.index()] = true;
+                let _ = val;
+            }
+            Op::StackStore(..) => {}
+            Op::Icmp(crate::ir::IntCC::Equal | crate::ir::IntCC::NotEqual, a, b) if is_zero(*a) || is_zero(*b) => {}
+            _ => op.for_operands(|v| needs[v.index()] = true),
+        }
+    }
+    needs
+}
+
 /// Computes which small integer values already have zero-extended upper bits in 64-bit registers.
 pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>], census: &Uses, call_zext: bool) -> Vec<bool> {
     let count = func.types.len();
@@ -185,9 +252,12 @@ pub(super) fn zero_ext<R: PartialEq>(func: &Function, locations: &[Location<R>],
             }
         });
     }
+    let call_needs = call_zext.then(|| narrow_call_needs_zext(func, locations, census));
     for (v, ty) in func.types.iter().enumerate() {
         let single_def = census.def_inst[v].is_some_and(|d| func.insts[d.index()].result == Some(Value(v as u32)));
-        let narrow_call = call_zext && matches!(ty, Type::I8 | Type::I16) && census.def_inst[v].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Call { .. }));
+        let narrow_call = call_needs.as_ref().is_some_and(|n| n[v])
+            && matches!(ty, Type::I8 | Type::I16)
+            && census.def_inst[v].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Call { .. }));
         out[v] = ty.is_small_int() && (single_def || narrow_call || incoming[v].as_ref().is_some_and(|l| !l.is_empty()));
     }
     let const_val = |v: Value| match locations[v.index()] {

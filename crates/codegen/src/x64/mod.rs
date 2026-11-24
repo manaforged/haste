@@ -46,6 +46,7 @@ const REGS: Regs<Reg> = Regs {
     two_address: true,
     park: true,
     fold_sib: true,
+    atomic_addrs: crate::alloc::AtomicAddrMode::Full,
     call_zext: false,
     imm_store,
     high_product: Some(Reg::Rdx),

@@ -537,7 +537,7 @@ impl Emit<'_> {
             return (FP, disp);
         }
         let (base, off) = self.relaxed_atomic_target(addr);
-        if off != 0 && (-256..=255).contains(&off) {
+        if base != addr && (-256..=255).contains(&off) {
             return (self.bits(base, C), off);
         }
         (self.bits(addr, C), 0)

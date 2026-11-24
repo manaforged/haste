@@ -5,6 +5,7 @@ pub(crate) mod hoist;
 mod preserved;
 pub(crate) mod walk;
 
+pub(crate) use hints::{rcpc2_atomic_site, rcpc2_delta_fits};
 pub(crate) use preserved::{cold_cached_frame, cold_thread_cell, is_preserved_call_op, used_preserved_leaf_regs};
 
 use crate::cfg::{Cfg, Loops};
@@ -13,6 +14,13 @@ use crate::frame::{Abi, Loc};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, InstData, Op, Signature, StackSlot, Type, Value};
 use crate::live::{Elided, Live, Sib, SibBase, live, results};
 use crate::park::{Class, Hints, ParkReg, allocate};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicAddrMode {
+    None,
+    Full,
+    Rcpc2,
+}
 
 pub(crate) struct Regs<R: 'static> {
     pub saved: &'static [R],
@@ -32,6 +40,7 @@ pub(crate) struct Regs<R: 'static> {
     pub two_address: bool,
     pub park: bool,
     pub fold_sib: bool,
+    pub atomic_addrs: AtomicAddrMode,
     /// The backend zero-extends 8- and 16-bit call results at the call, and 8- and 16-bit narrowing copies between two registers.
     pub call_zext: bool,
     /// The instructions that store a constant into a frame home.
@@ -381,14 +390,23 @@ pub(crate) fn atomic_elidable_addrs(func: &Function, defs: &[Option<Inst>], uses
     out
 }
 
-fn atomic_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, sib: &[Option<Sib>], elided: &mut [bool]) -> Vec<Option<Value>> {
+fn atomic_addrs<R>(func: &Function, mode: AtomicAddrMode, locations: &[Location<R>], census: &Uses, sib: &[Option<Sib>], elided: &mut [bool]) -> Vec<Option<Value>> {
     let count = func.types.len();
     let mut atomic_base = vec![None; count];
-    let atomic_uses = atomic_addr_uses(func);
+    let (full_uses, rcpc2_uses) = match mode {
+        AtomicAddrMode::None => return atomic_base,
+        AtomicAddrMode::Full => (atomic_addr_uses(func), Vec::new()),
+        AtomicAddrMode::Rcpc2 => (Vec::new(), hints::rcpc2_atomic_uses(func)),
+    };
     for (v, &def) in census.def_inst.iter().enumerate() {
         let Some(def_inst) = def else { continue };
-        if atomic_uses[v] == 0
-            || atomic_uses[v] != census.uses[v]
+        let (use_count, mask) = match mode {
+            AtomicAddrMode::Full => (full_uses[v], 0),
+            AtomicAddrMode::Rcpc2 => rcpc2_uses[v],
+            AtomicAddrMode::None => unreachable!(),
+        };
+        if use_count == 0
+            || use_count != census.uses[v]
             || elided[v]
             || sib[v].is_some()
             || func.types[v] != Type::I64
@@ -405,12 +423,15 @@ fn atomic_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, si
         if base.index() == v || i32::try_from(delta).is_err() || elided[base.index()] || sib[base.index()].is_some() || func.ty(base) != Type::I64 {
             continue;
         }
+        if mode == AtomicAddrMode::Rcpc2 && (delta == 0 || !rcpc2_delta_fits(delta, mask)) {
+            continue;
+        }
         match locations[base.index()] {
             Location::Slot => {
                 elided[v] = true;
                 atomic_base[v] = Some(base);
             }
-            Location::Frame(_, off) if (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(i64::from(off) + delta)) => {
+            Location::Frame(_, off) if mode == AtomicAddrMode::Full && (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(i64::from(off) + delta)) => {
                 elided[v] = true;
             }
             _ => {}
@@ -624,7 +645,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
     let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
     let (sib, mut elided) = if weighed && regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, loop_depths, regs.two_address) } else { (vec![None; count], vec![false; count]) };
-    let atomic_base = if weighed && regs.two_address { atomic_addrs(func, &locations, &census, &sib, &mut elided) } else { vec![None; count] };
+    let atomic_base = if weighed && regs.atomic_addrs != AtomicAddrMode::None { atomic_addrs(func, regs.atomic_addrs, &locations, &census, &sib, &mut elided) } else { vec![None; count] };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided, regs.constant_calls) } else { vec![None; count] };
     const_pairs(func, &census, &mut elided);
     let eff = Elided { sib: &sib, atomic_base: &atomic_base, elided: &elided };
