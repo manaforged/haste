@@ -11,7 +11,7 @@ use super::tokens::{
     read_str, read_u32s_map, read_vis, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str,
     write_usize, write_vis,
 };
-use super::wire::Tables;
+use super::wire::{Tables, opt_u32_le};
 
 const ORIGIN_KINDS: [Origin; 3] = [Origin::Item, Origin::Import, Origin::Glob];
 const DEF_BYTES: [usize; 4] = [8, 12, 16, 1];
@@ -390,16 +390,12 @@ fn read_deps(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(Sym, usize)>> {
 fn read_pending(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Pending>> {
     let pend_len = cur.count()?;
     let mut pending = Vec::with_capacity(pend_len);
-    let opt_at = |b: &[u8], at: usize| {
-        let v = u32_le(b, at);
-        (v != u32::MAX).then_some(v)
-    };
     for _ in 0..pend_len {
         let b = cur.take(20)?;
         let module = u32_le(b, 0);
         let file = u32_le(b, 4);
         let import = u32_le(b, 8);
-        let dollar = match opt_at(b, 12) {
+        let dollar = match opt_u32_le(b, 12) {
             Some(d) => Some(
                 *remap
                     .get(d as usize)
@@ -407,7 +403,7 @@ fn read_pending(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Pending>> {
             ),
             None => None,
         };
-        let name = opt_at(b, 16).map(Sym);
+        let name = opt_u32_le(b, 16).map(Sym);
         let segments = read_u32s_map(cur, Sym)?.into_boxed_slice();
         let absolute = cur.u8()? != 0;
         let vis = read_vis(cur)?;

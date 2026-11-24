@@ -6,7 +6,7 @@ use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
 use super::bind::{push_loan, push_source_loans};
 use super::propagate::BorrowSource;
 use super::{
-    BreakFrame, Checker, STMT_TEMP_OFFSET, State, is_temp_holder, join_moved, merge_branch,
+    BreakFrame, Checker, Loan, STMT_TEMP_OFFSET, State, is_temp_holder, join_moved, merge_branch,
     merge_states, prune_dead_loans, prune_moved_loans,
 };
 
@@ -706,10 +706,7 @@ impl Checker<'_, '_> {
                 for id in drop_temps {
                     iter_state.loans.retain(|l| l.holder != Some(id));
                 }
-                iter_state.loans.retain(|l| {
-                    l.holder
-                        .is_none_or(|h| is_temp_holder(Some(h)) || !loop_locals.contains(&h))
-                });
+                retain_non_loop_loans(&mut iter_state.loans, &loop_locals);
                 if iter_state.diverged {
                     break;
                 }
@@ -731,12 +728,14 @@ impl Checker<'_, '_> {
                 merge_states(state, &bs);
             }
         }
-        state.loans.retain(|l| {
-            l.holder
-                .is_none_or(|h| is_temp_holder(Some(h)) || !loop_locals.contains(&h))
-        });
+        retain_non_loop_loans(&mut state.loans, &loop_locals);
         Ok(())
     }
+}
+
+fn retain_non_loop_loans(loans: &mut Vec<Loan>, loop_locals: &HashSet<u32>) {
+    let keep = |h| is_temp_holder(Some(h)) || !loop_locals.contains(&h);
+    loans.retain(|l| l.holder.is_none_or(keep));
 }
 
 fn merge_break_states(mut merged: Option<State>, states: Vec<State>) -> Option<State> {

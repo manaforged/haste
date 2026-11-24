@@ -9,8 +9,12 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::sema::Context;
 use crate::sema::infer::{LazyTables, Typed};
 
-use super::filter::{ReachFilter, collect_filtered_callees, commit_filter_caller, pre_collect_callees};
-use super::{Instance, MAX_WORKER_BATCH, MIN_PARALLEL_WAVE, Reached, ReachedEntry, infer_entry, run_scoped};
+use super::filter::{
+    ReachFilter, collect_filtered_callees, commit_filter_caller, pre_collect_callees,
+};
+use super::{
+    Instance, MAX_WORKER_BATCH, MIN_PARALLEL_WAVE, Reached, ReachedEntry, infer_entry, run_scoped,
+};
 
 /// How many functions of a wave of `len` one worker takes at a time.
 pub(super) fn wave_batch(len: usize) -> usize {
@@ -27,7 +31,11 @@ pub(super) fn wave_workers(len: usize) -> usize {
 
 /// Infers on every core the functions of `indices` that are declared without a body, keeps each body whose inference asked for nothing and deferred no constant evaluation, and returns the indexes it kept; the others stay declared, so `infer_declared` infers them on their first call.
 pub fn infer_quiet(cx: &Context<'_>, reached: &mut Reached, indices: &[usize]) -> Vec<usize> {
-    let wave: Vec<usize> = indices.iter().copied().filter(|&at| reached.is_untyped(at)).collect();
+    let wave: Vec<usize> = indices
+        .iter()
+        .copied()
+        .filter(|&at| reached.is_untyped(at))
+        .collect();
     if wave.is_empty() {
         return Vec::new();
     }
@@ -35,10 +43,18 @@ pub fn infer_quiet(cx: &Context<'_>, reached: &mut Reached, indices: &[usize]) -
     let forks = (1..wave_workers(wave.len())).map(|_| cx.fork()).collect();
     let next = AtomicUsize::new(0);
     let (mut items, joined) = run_scoped(&mut own, forks, reached, (&wave, &next, false));
-    items.extend(joined.into_iter().flatten().flat_map(|(_, _, worker_items)| worker_items));
+    items.extend(
+        joined
+            .into_iter()
+            .flatten()
+            .flat_map(|(_, _, worker_items)| worker_items),
+    );
     items.sort_by_key(|item| item.pos);
     let mut kept = Vec::new();
-    for item in items.into_iter().filter(|item| !item.asked && !item.deferred) {
+    for item in items
+        .into_iter()
+        .filter(|item| !item.asked && !item.deferred)
+    {
         let at = wave[item.pos];
         reached.unlaid.extend(item.unlaid);
         reached.set_entry(at, ReachedEntry::Settled, item.typed);
@@ -47,7 +63,14 @@ pub fn infer_quiet(cx: &Context<'_>, reached: &mut Reached, indices: &[usize]) -
     kept
 }
 
-type WorkerResult = (usize, Instance, Result<Arc<Typed>, String>, Vec<String>, bool, bool);
+type WorkerResult = (
+    usize,
+    Instance,
+    Result<Arc<Typed>, String>,
+    Vec<String>,
+    bool,
+    bool,
+);
 
 struct WaveQueue {
     seen: HashMap<Instance, usize>,
@@ -83,13 +106,30 @@ pub(super) fn eval_deferred_list(cx: &mut Context<'_>, deferred: Vec<(Instance, 
     }
 }
 
-pub(super) fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>, force_commit: bool) -> Vec<usize> {
+pub(super) fn parallel_drain(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    wave: Vec<usize>,
+    force_commit: bool,
+) -> Vec<usize> {
     let workers = crate::jobs();
     let seen = std::mem::take(&mut reached.index);
     let filter = std::mem::take(&mut reached.filter);
     let instances: Vec<Instance> = reached.list.iter().map(|&(inst, _)| inst).collect();
     let queue: VecDeque<(usize, Instance)> = wave.iter().map(|&at| (at, instances[at])).collect();
-    let shared = (Mutex::new(WaveQueue { seen, filter, instances, queue, settled: Vec::new(), deferred_items: Vec::new(), active: 0, waiting: 0 }), Condvar::new());
+    let shared = (
+        Mutex::new(WaveQueue {
+            seen,
+            filter,
+            instances,
+            queue,
+            settled: Vec::new(),
+            deferred_items: Vec::new(),
+            active: 0,
+            waiting: 0,
+        }),
+        Condvar::new(),
+    );
     loop {
         let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
         let shared_ref = &shared;
@@ -107,7 +147,10 @@ pub(super) fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: 
                 })
                 .collect();
             wavefront_worker(cx, shared_ref, workers, force_commit);
-            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect::<Vec<_>>()
+            handles
+                .into_iter()
+                .map(|handle| handle.join().map_or(None, Some))
+                .collect::<Vec<_>>()
         });
         cx.in_parallel = false;
         let mut deferred = cx.take_deferred_evals();
@@ -184,7 +227,12 @@ fn drain_serial_tail(cx: &mut Context<'_>, q: &mut WaveQueue, force_commit: bool
     q.queue.is_empty()
 }
 
-fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Condvar), workers: usize, force_commit: bool) {
+fn wavefront_worker(
+    cx: &mut Context<'_>,
+    (mutex, cvar): &(Mutex<WaveQueue>, Condvar),
+    workers: usize,
+    force_commit: bool,
+) {
     let mut batch = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut results = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut item_callees = Vec::new();
@@ -201,7 +249,13 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             if active.2 > 0 {
                 q.active = q.active.saturating_sub(active.2);
                 active.2 = 0;
-                commit_worker_batch(cx, &mut q, &mut local_filter, &mut results, &mut pending_callees, force_commit);
+                commit_worker_batch(
+                    cx,
+                    &mut q,
+                    &mut local_filter,
+                    (&mut results, &mut pending_callees),
+                    force_commit,
+                );
             }
             while q.queue.is_empty() {
                 if q.active == 0 {
@@ -211,14 +265,18 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                     return;
                 }
                 q.waiting += 1;
-                q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+                q = cvar
+                    .wait(q)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 q.waiting -= 1;
             }
             let delta = sync_filter.then(|| q.filter.take_delta(&mut synced_len));
             batch.clear();
             let take = (q.queue.len() / (workers * 2).max(1)).clamp(1, MAX_WORKER_BATCH);
             for _ in 0..take {
-                let Some((at, instance)) = q.queue.pop_front() else { break };
+                let Some((at, instance)) = q.queue.pop_front() else {
+                    break;
+                };
                 let include_fixed = !q.filter.seen_fixed_poly.contains(&instance.0);
                 batch.push((at, instance, include_fixed));
             }
@@ -250,19 +308,29 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             let deferred = cx.deferred_evals.len() > before;
             let asked = cx.asks.count() > asks0;
             if !deferred && (force_commit || !asked) {
-                let first_fixed = include_fixed && !local_filter.seen_fixed_poly.contains(&instance.0);
+                let first_fixed =
+                    include_fixed && !local_filter.seen_fixed_poly.contains(&instance.0);
                 item_callees.clear();
-                pre_collect_callees(cx, &mut local_filter, (instance, &typed, first_fixed), &mut item_callees);
+                pre_collect_callees(
+                    cx,
+                    &mut local_filter,
+                    (instance, &typed, first_fixed),
+                    &mut item_callees,
+                );
                 for (callee, sealed) in item_callees.drain(..) {
                     if sealed {
-                        if !local_filter.seen_sealed_sysroot.contains(&callee.0) && batch_sealed.insert(callee.0) {
+                        if !local_filter.seen_sealed_sysroot.contains(&callee.0)
+                            && batch_sealed.insert(callee.0)
+                        {
                             pending_callees.push((callee, true));
                         }
                     } else if local_seen.insert(callee) {
                         pending_callees.push((callee, false));
                     }
                 }
-                if let Ok(t) = &typed && matches!(t.tables, LazyTables::Poly(_) | LazyTables::CheckOnly(_)) {
+                if let Ok(t) = &typed
+                    && matches!(t.tables, LazyTables::Poly(_) | LazyTables::CheckOnly(_))
+                {
                     local_filter.seen_fixed_poly.insert(instance.0);
                 }
             }
@@ -275,8 +343,7 @@ fn commit_worker_batch(
     cx: &Context<'_>,
     q: &mut WaveQueue,
     local_filter: &mut ReachFilter,
-    results: &mut Vec<WorkerResult>,
-    pending_callees: &mut Vec<(Instance, bool)>,
+    (results, pending_callees): (&mut Vec<WorkerResult>, &mut Vec<(Instance, bool)>),
     force_commit: bool,
 ) {
     local_filter.drain_to(&mut q.filter);

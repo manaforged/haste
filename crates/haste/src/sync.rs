@@ -1,7 +1,9 @@
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 use rustc_hash::FxHasher;
 
@@ -14,7 +16,11 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
-    payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("a panic with no message")
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic with no message")
 }
 
 pub(crate) fn into_inner<T>(mutex: Mutex<T>) -> T {
@@ -56,7 +62,10 @@ pub(crate) fn shard_index<Q: Hash + ?Sized, const SHARDS: usize>(key: &Q) -> usi
 }
 
 /// Evaluates `work` over `items` on worker threads, returning outputs in input order.
-pub(crate) fn parallel_map<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
+pub(crate) fn parallel_map<T: Send, R: Send>(
+    items: Vec<T>,
+    work: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
     let total = items.len();
     let workers = crate::jobs().min(total);
     if total < 2 || workers <= 1 {
@@ -96,20 +105,34 @@ pub(crate) struct Slab<T, const SLAB: usize, const SLABS: usize> {
 
 impl<T, const SLAB: usize, const SLABS: usize> Default for Slab<T, SLAB, SLABS> {
     fn default() -> Self {
-        Self { slabs: (0..SLABS).map(|_| OnceLock::new()).collect::<Vec<_>>().into_boxed_slice() }
+        Self {
+            slabs: (0..SLABS)
+                .map(|_| OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
     }
 }
 
 impl<T, const SLAB: usize, const SLABS: usize> Slab<T, SLAB, SLABS> {
     pub(crate) fn set(&self, index: usize, value: T) {
         assert!(index < SLAB * SLABS, "slab capacity exceeded");
-        let slab = self.slabs[index / SLAB].get_or_init(|| (0..SLAB).map(|_| OnceLock::new()).collect::<Vec<_>>().into_boxed_slice());
+        let slab = self.slabs[index / SLAB].get_or_init(|| {
+            (0..SLAB)
+                .map(|_| OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
         slab[index % SLAB].get_or_init(|| value);
     }
 
     #[inline]
     pub(crate) fn get(&self, index: usize) -> Option<&T> {
-        self.slabs.get(index / SLAB)?.get()?.get(index % SLAB)?.get()
+        self.slabs
+            .get(index / SLAB)?
+            .get()?
+            .get(index % SLAB)?
+            .get()
     }
 }
 
@@ -124,21 +147,33 @@ pub(crate) trait AtomicWord: Sized {
 impl AtomicWord for AtomicU8 {
     type Val = u8;
     const ZERO: u8 = 0;
-    fn new_zero() -> Self { Self::new(0) }
+    fn new_zero() -> Self {
+        Self::new(0)
+    }
     #[inline]
-    fn load_acquire(&self) -> u8 { self.load(Ordering::Acquire) }
+    fn load_acquire(&self) -> u8 {
+        self.load(Ordering::Acquire)
+    }
     #[inline]
-    fn store_release(&self, value: u8) { self.store(value, Ordering::Release) }
+    fn store_release(&self, value: u8) {
+        self.store(value, Ordering::Release)
+    }
 }
 
 impl AtomicWord for AtomicU32 {
     type Val = u32;
     const ZERO: u32 = 0;
-    fn new_zero() -> Self { Self::new(0) }
+    fn new_zero() -> Self {
+        Self::new(0)
+    }
     #[inline]
-    fn load_acquire(&self) -> u32 { self.load(Ordering::Acquire) }
+    fn load_acquire(&self) -> u32 {
+        self.load(Ordering::Acquire)
+    }
     #[inline]
-    fn store_release(&self, value: u32) { self.store(value, Ordering::Release) }
+    fn store_release(&self, value: u32) {
+        self.store(value, Ordering::Release)
+    }
 }
 
 pub(crate) struct AtomicSlab<A, const SLAB: usize, const SLABS: usize> {
@@ -147,7 +182,12 @@ pub(crate) struct AtomicSlab<A, const SLAB: usize, const SLABS: usize> {
 
 impl<A, const SLAB: usize, const SLABS: usize> Default for AtomicSlab<A, SLAB, SLABS> {
     fn default() -> Self {
-        Self { slabs: (0..SLABS).map(|_| OnceLock::new()).collect::<Vec<_>>().into_boxed_slice() }
+        Self {
+            slabs: (0..SLABS)
+                .map(|_| OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
     }
 }
 
@@ -163,13 +203,20 @@ impl<A: AtomicWord, const SLAB: usize, const SLABS: usize> AtomicSlab<A, SLAB, S
         if index >= SLAB * SLABS {
             return;
         }
-        let slab = self.slabs[index / SLAB].get_or_init(|| (0..SLAB).map(|_| A::new_zero()).collect::<Vec<_>>().into_boxed_slice());
+        let slab = self.slabs[index / SLAB].get_or_init(|| {
+            (0..SLAB)
+                .map(|_| A::new_zero())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
         slab[index % SLAB].store_release(value);
     }
 }
 
-pub(crate) type AtomicU8Slab<const SLAB: usize, const SLABS: usize> = AtomicSlab<AtomicU8, SLAB, SLABS>;
-pub(crate) type AtomicU32Slab<const SLAB: usize, const SLABS: usize> = AtomicSlab<AtomicU32, SLAB, SLABS>;
+pub(crate) type AtomicU8Slab<const SLAB: usize, const SLABS: usize> =
+    AtomicSlab<AtomicU8, SLAB, SLABS>;
+pub(crate) type AtomicU32Slab<const SLAB: usize, const SLABS: usize> =
+    AtomicSlab<AtomicU32, SLAB, SLABS>;
 
 #[derive(Default)]
 struct IndexTable {
@@ -205,7 +252,11 @@ impl IndexTable {
 
     fn insert(&mut self, hash: u64, id: u32, mut hash_of: impl FnMut(u32) -> u64) {
         if self.len * 4 >= self.entries.len() * 3 {
-            let next_cap = if self.entries.is_empty() { 16 } else { self.entries.len() * 2 };
+            let next_cap = if self.entries.is_empty() {
+                16
+            } else {
+                self.entries.len() * 2
+            };
             let mut next = vec![(0u32, 0u32); next_cap].into_boxed_slice();
             let mask = next_cap - 1;
             for &(entry_tag, entry_id) in &self.entries {
@@ -239,7 +290,9 @@ pub(crate) struct Interner<K, const SHARDS: usize, const SLAB: usize, const SLAB
     next: AtomicU32,
 }
 
-impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default for Interner<K, SHARDS, SLAB, SLABS> {
+impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default
+    for Interner<K, SHARDS, SLAB, SLABS>
+{
     fn default() -> Self {
         Self {
             cache: (0..INTERNER_CACHE).map(|_| AtomicU64::new(0)).collect(),
@@ -250,7 +303,9 @@ impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default for 
     }
 }
 
-impl<K: Eq + Hash, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Interner<K, SHARDS, SLAB, SLABS> {
+impl<K: Eq + Hash, const SHARDS: usize, const SLAB: usize, const SLABS: usize>
+    Interner<K, SHARDS, SLAB, SLABS>
+{
     /// The id of `key`, calling `make` with the new id under the shard's write lock, before the id is visible, when `key` is new.
     pub(crate) fn intern<Q>(&self, key: &Q, make: impl FnOnce(&Q, u32) -> K) -> u32
     where
@@ -264,13 +319,24 @@ impl<K: Eq + Hash, const SHARDS: usize, const SLAB: usize, const SLABS: usize> I
     /// The id of owned `key`, moving it into the slab without cloning when new and invoking `on_new` before publishing it.
     pub(crate) fn intern_owned(&self, key: K, on_new: impl FnOnce(&K, u32)) -> u32 {
         let hash = hash_key(&key);
-        self.intern_with(hash, key, |stored, key| stored == key, |key, id| {
-            on_new(&key, id);
-            key
-        })
+        self.intern_with(
+            hash,
+            key,
+            |stored, key| stored == key,
+            |key, id| {
+                on_new(&key, id);
+                key
+            },
+        )
     }
 
-    fn intern_with<T>(&self, hash: u64, key: T, eq: impl Fn(&K, &T) -> bool, make: impl FnOnce(T, u32) -> K) -> u32 {
+    fn intern_with<T>(
+        &self,
+        hash: u64,
+        key: T,
+        eq: impl Fn(&K, &T) -> bool,
+        make: impl FnOnce(T, u32) -> K,
+    ) -> u32 {
         let slot = &self.cache[(hash as usize) & (INTERNER_CACHE - 1)];
         let hi = hash >> 32;
         let packed = slot.load(Ordering::Acquire);

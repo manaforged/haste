@@ -23,6 +23,16 @@ struct SigFnFlags<'a> {
     is_by_ref: bool,
 }
 
+struct SigCallCtx<'a, 'b> {
+    expr: ExprId,
+    sig: &'b Signature,
+    sig_src: &'a Source,
+    sig_item: &'a Item,
+    ret_ast: TyId,
+    ret_lts: &'b Lifetimes<'a>,
+    flags: SigFnFlags<'a>,
+}
+
 impl<'a> Checker<'_, 'a> {
     pub(super) fn call_borrow_sources(
         &mut self,
@@ -140,25 +150,23 @@ impl<'a> Checker<'_, 'a> {
                 (receiver, raw_args.to_vec())
             };
         let flags = self.sig_fn_flags(fn_item, &sig);
+        let ctx = SigCallCtx {
+            expr,
+            sig: &sig,
+            sig_src,
+            sig_item,
+            ret_ast,
+            ret_lts: &ret_lts,
+            flags,
+        };
         if !ret_lts.has_elided && ret_lts.named.is_empty() {
-            return self.sig_sources_without_ret_lifetimes(
-                expr, &sig, sig_src, ret_ast, &ret_lts, receiver, &arg_ids, &flags, state,
-            );
+            return self.sig_sources_without_ret_lifetimes(&ctx, receiver, &arg_ids, state);
         }
-        let mut out = self.sig_arg_sources_with_lifetimes(&sig, sig_src, &ret_lts, &arg_ids, state);
+        let mut out = self.sig_arg_sources_with_lifetimes(&ctx, &arg_ids, state);
         if let Some(recv) = receiver {
-            out.extend(self.sig_recv_sources_with_lifetimes(
-                expr,
-                &sig,
-                sig_src,
-                sig_item,
-                &ret_lts,
-                recv,
-                flags.is_by_ref,
-                state,
-            ));
+            out.extend(self.sig_recv_sources_with_lifetimes(&ctx, recv, state));
         }
-        self.finish_sig_sources(expr, out, flags.is_by_ref)
+        self.finish_sig_sources(expr, out, ctx.flags.is_by_ref)
     }
 
     fn collect_ret_lifetimes(
@@ -207,23 +215,15 @@ impl<'a> Checker<'_, 'a> {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "decomposed helper receiving signature metadata and call inputs"
-    )]
     fn sig_sources_without_ret_lifetimes(
         &mut self,
-        expr: ExprId,
-        sig: &Signature,
-        sig_src: &'a Source,
-        ret_ast: TyId,
-        ret_lts: &Lifetimes<'a>,
+        ctx: &SigCallCtx<'a, '_>,
         receiver: Option<ExprId>,
         arg_ids: &[u32],
-        flags: &SigFnFlags<'a>,
         state: &State,
     ) -> Vec<BorrowSource> {
-        if checks::closure::sig_returns_only_static(sig, sig_src, ret_ast, ret_lts) {
+        let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
+        if checks::closure::sig_returns_only_static(sig, sig_src, ctx.ret_ast, ret_lts) {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -248,9 +248,9 @@ impl<'a> Checker<'_, 'a> {
         if let Some(recv) = receiver
             && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))
         {
-            out.extend(self.sig_no_lt_recv_sources(sig, recv, arg_ids, flags, state));
+            out.extend(self.sig_no_lt_recv_sources(sig, recv, arg_ids, &ctx.flags, state));
         }
-        self.finish_sig_sources(expr, out, flags.is_by_ref)
+        self.finish_sig_sources(ctx.expr, out, ctx.flags.is_by_ref)
     }
 
     fn sig_no_lt_recv_sources(
@@ -293,12 +293,11 @@ impl<'a> Checker<'_, 'a> {
 
     fn sig_arg_sources_with_lifetimes(
         &mut self,
-        sig: &Signature,
-        sig_src: &'a Source,
-        ret_lts: &Lifetimes<'a>,
+        ctx: &SigCallCtx<'a, '_>,
         arg_ids: &[u32],
         state: &State,
     ) -> Vec<BorrowSource> {
+        let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
         let allow_elided_param = !recv_is_by_ref(sig);
         let mut out = Vec::new();
         for (idx, &arg) in arg_ids.iter().enumerate() {
@@ -342,26 +341,18 @@ impl<'a> Checker<'_, 'a> {
         out
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "decomposed helper receiving receiver lifetime context and state"
-    )]
     fn sig_recv_sources_with_lifetimes(
         &mut self,
-        expr: ExprId,
-        sig: &Signature,
-        sig_src: &'a Source,
-        sig_item: &'a Item,
-        ret_lts: &Lifetimes<'a>,
+        ctx: &SigCallCtx<'a, '_>,
         recv: ExprId,
-        is_by_ref: bool,
         state: &State,
     ) -> Vec<BorrowSource> {
+        let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
         let recv_creates_borrow = match sig.receiver {
             Some((SelfKind::Ref | SelfKind::RefMut, _)) => {
                 ret_lts.has_elided
                     || (!ret_lts.named.is_empty()
-                        && receiver_has_any_named(sig_src, sig_item, &ret_lts.named))
+                        && receiver_has_any_named(sig_src, ctx.sig_item, &ret_lts.named))
             }
             Some((SelfKind::Typed(self_ty), _)) => {
                 let mut self_lts = Lifetimes::default();
@@ -373,8 +364,8 @@ impl<'a> Checker<'_, 'a> {
             None => false,
         };
         let recv_is_mut = recv_ref_mut(sig) == Some(Mut::Mut);
-        if is_by_ref {
-            self.by_ref_recv_sources(expr, recv, state)
+        if ctx.flags.is_by_ref {
+            self.by_ref_recv_sources(ctx.expr, recv, state)
         } else if recv_creates_borrow
             && !recv_is_mut
             && self.is_mut_ref_to_shared_ref(self.expr_ty(recv))
@@ -389,8 +380,8 @@ impl<'a> Checker<'_, 'a> {
                 self.is_ref_ty(self.local_ty(s.target))
             })
         } else if recv_creates_borrow {
-            if let Some(mutability) = self.typed.adjusts.get(&expr).and_then(|a| a.autoref) {
-                self.method_recv_borrow_sources(expr, recv, mutability == Mut::Mut, state)
+            if let Some(mutability) = self.typed.adjusts.get(&ctx.expr).and_then(|a| a.autoref) {
+                self.method_recv_borrow_sources(ctx.expr, recv, mutability == Mut::Mut, state)
             } else {
                 self.expr_borrow_sources(recv, state)
             }

@@ -135,6 +135,11 @@ fn call_passes_noalias(op: &Op, prov: &Provenance, p: u16) -> bool {
     }
 }
 
+fn retain_stores(bufs: &mut ScanBuf, mut keep: impl FnMut(MemLoc) -> bool) {
+    bufs.pending_stores.retain(|&(loc, _)| keep(loc));
+    bufs.const_stores.retain(|cs| keep(cs.loc));
+}
+
 fn pre_scan_op(
     func: &mut Function,
     state: &State<'_>,
@@ -145,10 +150,7 @@ fn pre_scan_op(
     if let Some((_, from, bytes)) = copy_len(&func.insts[inst.index()].op, state.consts) {
         if bytes > 0 {
             let read_loc = addr_loc(state.prov, state.subst, from, 0, bytes);
-            bufs.pending_stores
-                .retain(|&(ploc, _)| !may_alias(read_loc, ploc, state.prov));
-            bufs.const_stores
-                .retain(|cs| !may_alias(read_loc, cs.loc, state.prov));
+            retain_stores(bufs, |loc| !may_alias(read_loc, loc, state.prov));
         }
         return false;
     }
@@ -156,19 +158,14 @@ fn pre_scan_op(
     match func.insts[inst.index()].op {
         Op::Copy(_, from, _) => {
             let r = addr_loc(state.prov, state.subst, from, 0, u32::MAX);
-            let ok = |l: MemLoc| {
+            retain_stores(bufs, |l| {
                 l.base != r.base
                     && (l.root == MemRoot::Unknown || l.root != r.root)
                     && !may_alias(r, l, state.prov)
-            };
-            bufs.pending_stores.retain(|&(p, _)| ok(p));
-            bufs.const_stores.retain(|cs| ok(cs.loc));
+            });
         }
         Op::Trap | Op::Trapz(_) | Op::Assume(_) => {
-            bufs.pending_stores
-                .retain(|&(ploc, _)| slot_unescaped(state.prov, ploc));
-            bufs.const_stores
-                .retain(|cs| slot_unescaped(state.prov, cs.loc));
+            retain_stores(bufs, |loc| slot_unescaped(state.prov, loc));
         }
         Op::TryCall { .. } => {
             bufs.pending_stores.clear();
@@ -469,7 +466,7 @@ fn retain_stores_after_unknown(
     move_op: Option<&Op>,
 ) {
     let cop = move_op.unwrap_or(&func.insts[inst.index()].op);
-    let keep_fn = |ploc: MemLoc| match ploc.root {
+    retain_stores(bufs, |ploc| match ploc.root {
         MemRoot::Slot(s) => state.prov.slot_unescaped(s),
         MemRoot::CallerLoc => !matches!(cop, Op::Call { .. } | Op::TryCall { .. }),
         MemRoot::NoAliasParam(p) => {
@@ -478,9 +475,7 @@ fn retain_stores_after_unknown(
                 && state.prov.noalias_unescaped(p)
         }
         _ => false,
-    };
-    bufs.pending_stores.retain(|&(ploc, _)| keep_fn(ploc));
-    bufs.const_stores.retain(|cs| keep_fn(cs.loc));
+    });
 }
 
 fn handle_unknown(func: &mut Function, ctx: &mut ScanCtx<'_, '_, '_>, inst: Inst) -> Step {
@@ -497,12 +492,9 @@ fn handle_unknown(func: &mut Function, ctx: &mut ScanCtx<'_, '_, '_>, inst: Inst
                 .prune_on_write(func, ctx.state.prov, wloc, Some(inst));
             drop_covered_stores(func, ctx.bufs, ctx.guard, (wloc, true));
         }
-        ctx.bufs
-            .pending_stores
-            .retain(|&(ploc, _)| !may_alias_at(wloc, ploc, ctx.state.prov, Some(inst)));
-        ctx.bufs
-            .const_stores
-            .retain(|cs| !may_alias_at(wloc, cs.loc, ctx.state.prov, Some(inst)));
+        retain_stores(ctx.bufs, |loc| {
+            !may_alias_at(wloc, loc, ctx.state.prov, Some(inst))
+        });
         ctx.changed = true;
         return Step::SkipSync;
     }

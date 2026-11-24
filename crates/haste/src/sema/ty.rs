@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::names::{ItemRef, Primitive};
+use crate::names::{ItemRef, PRIMITIVES, Primitive};
 use crate::sync::{AtomicU8Slab, AtomicU32Slab, Interner};
 
 use super::substs::{
@@ -116,28 +116,6 @@ const TY_SHARDS: usize = 128;
 const TY_SLAB: usize = 65_536;
 const TY_SLABS: usize = 256;
 
-const ALL_PRIMITIVES: [Primitive; 19] = [
-    Primitive::Bool,
-    Primitive::Char,
-    Primitive::Str,
-    Primitive::I8,
-    Primitive::I16,
-    Primitive::I32,
-    Primitive::I64,
-    Primitive::I128,
-    Primitive::Isize,
-    Primitive::U8,
-    Primitive::U16,
-    Primitive::U32,
-    Primitive::U64,
-    Primitive::U128,
-    Primitive::Usize,
-    Primitive::F16,
-    Primitive::F32,
-    Primitive::F64,
-    Primitive::F128,
-];
-
 const UNIT_TY: Ty = Ty(19);
 const NEVER_TY: Ty = Ty(20);
 const VAR_BASE: u32 = 21;
@@ -177,9 +155,9 @@ impl Default for Types {
             items: ItemListPool::default(),
             pats: PatPool::default(),
         };
-        let fixed = ALL_PRIMITIVES
-            .into_iter()
-            .map(Kind::Prim)
+        let fixed = PRIMITIVES
+            .iter()
+            .map(|&(_, p)| Kind::Prim(p))
             .chain([Kind::Tuple(Substs::EMPTY), Kind::Never])
             .chain((0..FAST_VARS).map(Kind::Var))
             .chain((0..FAST_INT_VARS).map(Kind::IntVar))

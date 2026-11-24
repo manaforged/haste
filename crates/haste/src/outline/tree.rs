@@ -35,7 +35,12 @@ struct Bodies {
 
 impl Bodies {
     fn new(krate: u32, items: usize) -> Box<Bodies> {
-        Box::new(Bodies { krate, slots: (0..items).map(|_| OnceLock::new()).collect(), key: OnceLock::new(), next: OnceLock::new() })
+        Box::new(Bodies {
+            krate,
+            slots: (0..items).map(|_| OnceLock::new()).collect(),
+            key: OnceLock::new(),
+            next: OnceLock::new(),
+        })
     }
 
     fn of(&self, krate: u32) -> Option<&Bodies> {
@@ -80,12 +85,26 @@ pub struct Expansion {
 impl File {
     /// A file of `source` scanned to `items`, with no body expanded yet.
     pub fn new(source: Source, items: Items, expanded: bool) -> File {
-        File { source, items, expanded, expand_origin: 0, bodies: OnceLock::new(), index: OnceLock::new() }
+        File {
+            source,
+            items,
+            expanded,
+            expand_origin: 0,
+            bodies: OnceLock::new(),
+            index: OnceLock::new(),
+        }
     }
 
     /// An expanded file carrying deterministic callsite provenance `expand_origin`.
     pub fn new_expanded(source: Source, items: Items, expand_origin: u64) -> File {
-        File { source, items, expanded: true, expand_origin, bodies: OnceLock::new(), index: OnceLock::new() }
+        File {
+            source,
+            items,
+            expanded: true,
+            expand_origin,
+            bodies: OnceLock::new(),
+            index: OnceLock::new(),
+        }
     }
 
     /// The name index of this file, made by `build` on first use and kept.
@@ -104,7 +123,8 @@ impl File {
 
     /// Whether a pass already read the body of item `item` in crate `krate`.
     pub fn body_read(&self, krate: u32, item: u32) -> bool {
-        self.body_slot(krate, item).is_some_and(|slot| slot.get().is_some())
+        self.body_slot(krate, item)
+            .is_some_and(|slot| slot.get().is_some())
     }
 
     /// Records what reading the body of item `item` in crate `krate` found, unless a pass already did.
@@ -121,7 +141,9 @@ impl File {
 
     fn claim(&self, krate: u32) -> &Bodies {
         let items = self.items.items.len();
-        self.bodies.get_or_init(|| Bodies::new(krate, items)).claim(krate, items)
+        self.bodies
+            .get_or_init(|| Bodies::new(krate, items))
+            .claim(krate, items)
     }
 }
 
@@ -173,8 +195,14 @@ pub fn textual(mut scope: Option<&Arc<Textual>>, name: &str) -> Option<Arc<Macro
 /// Where the items of a declared module are.
 #[derive(Clone, Debug)]
 pub enum Decl {
-    Inline { file: usize, at: u32 },
-    File { candidates: Vec<PathBuf>, by_attr: bool },
+    Inline {
+        file: usize,
+        at: u32,
+    },
+    File {
+        candidates: Vec<PathBuf>,
+        by_attr: bool,
+    },
 }
 
 /// Whether a module's items are read.
@@ -282,7 +310,11 @@ impl Crate {
 
     /// The modules declared but not read yet.
     pub fn declared(&self) -> impl Iterator<Item = usize> + '_ {
-        self.modules.iter().enumerate().filter(|(_, module)| matches!(module.state, State::Declared(_))).map(|(at, _)| at)
+        self.modules
+            .iter()
+            .enumerate()
+            .filter(|(_, module)| matches!(module.state, State::Declared(_)))
+            .map(|(at, _)| at)
     }
 
     /// Whether some declared module is not read yet.
@@ -297,7 +329,10 @@ impl Crate {
 
     /// What a loader of another crate sees of this crate now.
     pub fn view(&self) -> View {
-        View { exports: self.exports.clone(), partial: self.unsettled() }
+        View {
+            exports: self.exports.clone(),
+            partial: self.unsettled(),
+        }
     }
 
     /// The files that may hold module `module` while a `mod` item without a body only declares it; empty otherwise.
@@ -321,7 +356,11 @@ impl Crate {
 
     /// The names of the item macro calls that no definition matched.
     pub fn unresolved(&self) -> Vec<String> {
-        let names = self.deferred.iter().filter_map(|call| call.file.items.items[call.at as usize].name.map(|name| call.file.source.text(name).to_owned()));
+        let names = self.deferred.iter().filter_map(|call| {
+            call.file.items.items[call.at as usize]
+                .name
+                .map(|name| call.file.source.text(name).to_owned())
+        });
         names.collect()
     }
 }
@@ -359,13 +398,31 @@ pub enum Profile {
 
 pub(crate) const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
 const RELEASE: [&str; 1] = ["ub_checks"];
-const OFF: [&str; 10] = ["test", "doc", "doctest", "miri", "rustfmt", "clippy", "windows", "wasm", "bootstrap", "docsrs"];
+const OFF: [&str; 10] = [
+    "test",
+    "doc",
+    "doctest",
+    "miri",
+    "rustfmt",
+    "clippy",
+    "windows",
+    "wasm",
+    "bootstrap",
+    "docsrs",
+];
 
 impl Env {
     /// The value `env!` gives variable `name`: what the build script or Cargo set for this crate, else the process environment's.
     pub fn var(&self, name: &str) -> Option<String> {
-        let set = self.script.iter().flat_map(|output| &output.vars).chain(&self.vars);
-        set.filter(|(key, _)| key == name).map(|(_, value)| value.clone()).next().or_else(|| std::env::var(name).ok())
+        let set = self
+            .script
+            .iter()
+            .flat_map(|output| &output.vars)
+            .chain(&self.vars);
+        set.filter(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .next()
+            .or_else(|| std::env::var(name).ok())
     }
 
     /// Whether `cfg` may hold here: true unless this environment rules it out.
@@ -401,9 +458,19 @@ impl Env {
         if name == "test" {
             return truth(self.test);
         }
-        if self.target.has_name(name) || self.profile().contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
+        if self.target.has_name(name)
+            || self.profile().contains(&name)
+            || self
+                .script
+                .as_ref()
+                .is_some_and(|set| set.names.contains(name))
+        {
             Truth::Yes
-        } else if self.known || matches!(name, "unix" | "windows") || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {
+        } else if self.known
+            || matches!(name, "unix" | "windows")
+            || OFF.contains(&name)
+            || (crate::profile() == Profile::Release && PROFILE.contains(&name))
+        {
             Truth::No
         } else {
             Truth::Unknown
@@ -413,9 +480,15 @@ impl Env {
     fn pair(&self, key: &str, value: &str) -> Truth {
         if key == "feature" {
             truth(self.features.contains(value))
-        } else if key.starts_with("target_") || matches!(key, "panic" | "fmt_debug" | "relocation_model") {
+        } else if key.starts_with("target_")
+            || matches!(key, "panic" | "fmt_debug" | "relocation_model")
+        {
             truth(self.target.has_pair(key, value))
-        } else if self.script.as_ref().is_some_and(|set| set.pairs.contains(&(key.to_owned(), value.to_owned()))) {
+        } else if self
+            .script
+            .as_ref()
+            .is_some_and(|set| set.pairs.contains(&(key.to_owned(), value.to_owned())))
+        {
             Truth::Yes
         } else if self.known {
             Truth::No
@@ -436,14 +509,30 @@ impl Env {
     /// The `#[path]` value in `attrs`, including one that `cfg_attr` may enable.
     pub fn path<'a>(&self, attrs: &'a [Attr]) -> Option<&'a str> {
         self.find_attr(attrs, Truth::Unknown, &|attr| {
-            if let Attr::Path(path) = attr { Some(path.as_str()) } else { None }
+            if let Attr::Path(path) = attr {
+                Some(path.as_str())
+            } else {
+                None
+            }
         })
     }
 
     /// The first value that `pick` finds in `attrs`, including in those of each `cfg_attr` whose condition is `least` or `Yes`.
-    pub fn find_attr<'a, T>(&self, attrs: &'a [Attr], least: Truth, pick: &impl Fn(&'a Attr) -> Option<T>) -> Option<T> {
+    pub fn find_attr<'a, T>(
+        &self,
+        attrs: &'a [Attr],
+        least: Truth,
+        pick: &impl Fn(&'a Attr) -> Option<T>,
+    ) -> Option<T> {
         attrs.iter().find_map(|attr| match attr {
-            Attr::CfgAttr(cfg, inner) if matches!((self.eval(cfg), least), (Truth::Yes, _) | (Truth::Unknown, Truth::Unknown)) => self.find_attr(inner, least, pick),
+            Attr::CfgAttr(cfg, inner)
+                if matches!(
+                    (self.eval(cfg), least),
+                    (Truth::Yes, _) | (Truth::Unknown, Truth::Unknown)
+                ) =>
+            {
+                self.find_attr(inner, least, pick)
+            }
             attr => pick(attr),
         })
     }
@@ -488,11 +577,19 @@ pub struct Files {
 const PER_WORKER: usize = 4;
 
 fn slot(slots: &Mutex<HashMap<PathBuf, Slot>>, path: &Path) -> Result<Slot> {
-    Ok(crate::sync::lock(slots).entry(path.to_owned()).or_default().clone())
+    Ok(crate::sync::lock(slots)
+        .entry(path.to_owned())
+        .or_default()
+        .clone())
 }
 
 fn fill(slot: &Slot, path: &Path) -> Result<Arc<File>, String> {
-    slot.get_or_init(|| read(path).map(Arc::new).map_err(|error| format!("{error:#}"))).clone()
+    slot.get_or_init(|| {
+        read(path)
+            .map(Arc::new)
+            .map_err(|error| format!("{error:#}"))
+    })
+    .clone()
 }
 
 impl Files {
@@ -538,14 +635,29 @@ impl Files {
 }
 
 /// The files that haste supplies itself, read from these paths: its `proc_macro` crate, which stands in for the toolchain's.
-const EMBEDDED: [(&str, &str); 3] =
-    [("/haste/proc_macro/lib.rs", include_str!("../../proc_macro/lib.rs")), ("/haste/proc_macro/lex.rs", include_str!("../../proc_macro/lex.rs")), ("/haste/proc_macro/literal.rs", include_str!("../../proc_macro/literal.rs"))];
+const EMBEDDED: [(&str, &str); 3] = [
+    (
+        "/haste/proc_macro/lib.rs",
+        include_str!("../../proc_macro/lib.rs"),
+    ),
+    (
+        "/haste/proc_macro/lex.rs",
+        include_str!("../../proc_macro/lex.rs"),
+    ),
+    (
+        "/haste/proc_macro/literal.rs",
+        include_str!("../../proc_macro/literal.rs"),
+    ),
+];
 
 /// The root file of the `proc_macro` crate that haste supplies.
 pub const PROC_MACRO_ROOT: &str = EMBEDDED[0].0;
 
 fn embedded(path: &Path) -> Option<&'static str> {
-    EMBEDDED.iter().find(|(at, _)| Path::new(at) == path).map(|(_, text)| *text)
+    EMBEDDED
+        .iter()
+        .find(|(at, _)| Path::new(at) == path)
+        .map(|(_, text)| *text)
 }
 
 /// Whether there is a file at `path`, on disk or among the files haste supplies.

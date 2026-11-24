@@ -4,6 +4,7 @@ use crate::graph::cfg::Cfg;
 use crate::outline::item::{Attr, Import, Item, ItemKind, Items, Leaf};
 use crate::sema::summary::codec::{Cursor, write_u32};
 
+use super::super::wire::opt_u32_le;
 use super::{read_str, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str, write_usize};
 
 const ITEM_KINDS: [ItemKind; 17] = [
@@ -197,10 +198,6 @@ pub(in super::super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
     let item_bytes = cur.take(item_count.checked_mul(30).context("items overflow")?)?;
     let mut items = Vec::with_capacity(item_count);
     let mut attr_indices = Vec::new();
-    let opt_at = |b: &[u8], at: usize| {
-        let v = u32_le(b, at);
-        (v != u32::MAX).then_some(v)
-    };
     for (idx, b) in item_bytes.chunks_exact(30).enumerate() {
         let kind = ITEM_KINDS
             .get(b[0] as usize)
@@ -213,14 +210,14 @@ pub(in super::super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
         }
         items.push(Item {
             kind,
-            name: opt_at(b, 2),
+            name: opt_u32_le(b, 2),
             vis,
             attrs: Vec::new(),
             lead: u32_le(b, 6),
             start: u32_le(b, 10),
             end: u32_le(b, 14),
-            body: opt_at(b, 18),
-            parent: opt_at(b, 22),
+            body: opt_u32_le(b, 18),
+            parent: opt_u32_le(b, 22),
         });
     }
     for idx in attr_indices {

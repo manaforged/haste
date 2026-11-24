@@ -51,11 +51,15 @@ impl Checker<'_, '_> {
                 self.check_assign_op_expr(expr, lhs, rhs, state, outer_live, depth)
             }
             Expr::Block {
+                kind: BlockKind::Async | BlockKind::AsyncMove,
+                ..
+            } => self.check_closure(expr, None, expr, state, depth),
+            Expr::Block {
                 kind,
                 stmts,
                 tail,
                 label,
-            } => self.check_block_expr(
+            } => self.check_block(
                 expr,
                 kind,
                 stmts,
@@ -289,31 +293,6 @@ impl Checker<'_, '_> {
             }
         }
         Ok(())
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "forwards block AST fields and checker context to check_block"
-    )]
-    fn check_block_expr(
-        &mut self,
-        expr: ExprId,
-        kind: BlockKind,
-        stmts: List,
-        tail: Option<ExprId>,
-        label: Option<u32>,
-        state: &mut State,
-        ctx: (bool, bool),
-        outer_live: &HashSet<u32>,
-        depth: u32,
-    ) -> Result<()> {
-        if matches!(kind, BlockKind::Async | BlockKind::AsyncMove) {
-            self.check_closure(expr, None, expr, state, depth)
-        } else {
-            self.check_block(
-                expr, kind, stmts, tail, label, state, ctx, outer_live, depth,
-            )
-        }
     }
 
     fn check_let_expr(

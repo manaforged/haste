@@ -13,7 +13,7 @@ use super::tokens::{
     read_opt_u32, read_path, read_paths, read_str, read_u32s_map, read_vis, u32_le, write_opt_u32,
     write_path, write_paths, write_str, write_usize, write_vis,
 };
-use super::wire::Tables;
+use super::wire::{Tables, opt_u32_le};
 
 fn write_waiting<'a>(out: &mut Vec<u8>, w: &'a Waiting, tables: &mut Tables<'a>) -> Option<()> {
     write_u32(out, tables.file(&w.file));
@@ -312,13 +312,9 @@ fn read_crate_files(cur: &mut Cursor<'_>, files: &[Arc<File>]) -> Result<Vec<Arc
 
 fn read_module(cur: &mut Cursor<'_>, textuals: &[Arc<Textual>]) -> Result<Module> {
     let b = cur.take(12)?;
-    let opt_at = |at: usize| {
-        let v = u32_le(b, at);
-        (v != u32::MAX).then_some(v)
-    };
-    let file = opt_at(0).map_or(usize::MAX, |v| v as usize);
-    let item = opt_at(4);
-    let parent = opt_at(8).map(|v| v as usize);
+    let file = opt_u32_le(b, 0).map_or(usize::MAX, |v| v as usize);
+    let item = opt_u32_le(b, 4);
+    let parent = opt_u32_le(b, 8).map(|v| v as usize);
     let name = read_str(cur)?.to_owned();
     let dir = read_path(cur)?;
     let parts = read_u32s_map(cur, |v| v as usize)?;

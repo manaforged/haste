@@ -1,91 +1,17 @@
-use std::path::PathBuf;
+mod args;
+mod debug;
+
 use std::time::Instant;
 
-use crate::graph::{self, Targets, cfg};
-use crate::names::{ItemRef, Names};
-use crate::serve::Request;
-use crate::{outline, sema};
 use anyhow::{Context, Result};
 
-fn print_graph(workspace: &graph::Workspace) {
-    for line in workspace.unit_lines() {
-        println!("{line}");
-    }
-}
+use crate::graph::{self, Targets, cfg};
+use crate::names::ItemRef;
+use crate::serve::Request;
+use crate::{outline, sema};
 
-fn print_outline(workspace: &graph::Workspace, outline: &outline::Outline) {
-    for (root, krate) in outline.roots.iter().zip(&outline.crates) {
-        let unit = &workspace.graph.units[root.unit];
-        let version = &workspace.packages[unit.package].locked.version;
-        let read = krate.files.iter().filter(|file| !file.expanded).map(|file| &file.source.path).chain(&krate.gated);
-        let mut files: Vec<String> = read.map(|path| path.display().to_string()).collect();
-        files.sort();
-        files.dedup();
-        for file in files {
-            println!("{:?} {} {version} {file}", unit.side, root.name);
-        }
-    }
-}
-
-fn print_items(path: &std::path::Path) -> Result<()> {
-    let file = outline::tree::Files::default().file(path)?;
-    for item in &file.items.items {
-        let name = item.name.map_or("", |at| file.source.text(at));
-        println!("{:?} {:?} {name} parent={:?} attrs={:?}", item.kind, item.vis, item.parent, item.attrs);
-    }
-    Ok(())
-}
-
-fn print_expanded(path: &std::path::Path) -> Result<()> {
-    let mut outline = outline::Outline::file(path, cfg::Target::host());
-    outline.load_all()?;
-    let krate = &outline.crates[0];
-    for file in krate.files.iter().filter(|file| file.expanded) {
-        println!("{}", file.source.text);
-    }
-    for error in &krate.errors {
-        eprintln!("error: {error}");
-    }
-    Ok(())
-}
-
-fn summary(outline: &outline::Outline) -> String {
-    let items: usize = outline.crates.iter().flat_map(|krate| &krate.files).map(|file| file.items.items.len()).sum();
-    let loaded: usize = outline.crates.iter().map(|krate| krate.modules.iter().filter(|module| module.loaded()).count()).sum();
-    let expansions: usize = outline.crates.iter().map(|krate| krate.expansions).sum();
-    let files = outline.crates.iter().flat_map(|krate| &krate.files).filter(|file| !file.expanded).count();
-    format!("{} crates {files} files {loaded} modules {items} items {expansions} expansions", outline.crates.len())
-}
-
-fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usize) -> Result<()> {
-    let started = Instant::now();
-    let compilation = crate::macros::load_eager(workspace, targets, &[])?;
-    let (outline, names) = (&compilation.outline, &compilation.names);
-    let elapsed = started.elapsed();
-    for error in outline.crates.iter().flat_map(|krate| &krate.errors) {
-        eprintln!("error: {error}");
-    }
-    let named = outline.roots.iter().zip(&outline.crates).flat_map(|(root, krate)| krate.unresolved().into_iter().map(move |name| format!("{}:{name}", root.name)));
-    let mut unresolved: Vec<String> = named.collect();
-    unresolved.sort();
-    unresolved.dedup();
-    eprintln!("unresolved macros {unresolved:?}");
-    let foreign: usize = outline.crates.iter().map(|krate| krate.foreign.len()).sum();
-    eprintln!("procedural macro calls {foreign}");
-    eprintln!("outline {} in {:.1} ms", summary(outline), elapsed.as_secs_f64() * 1e3);
-    report_names(outline, names, started);
-    print_outline(workspace, outline);
-    report_bodies(outline, threads);
-    Ok(())
-}
-
-fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-    let started = Instant::now();
-    let compilation = crate::macros::load_lazy(workspace, targets)?;
-    eprintln!("lazy {} cached {} in {:.1} ms", summary(&compilation.outline), compilation.outline.cache.len(), started.elapsed().as_secs_f64() * 1e3);
-    report_names(&compilation.outline, &compilation.names, started);
-    Ok(())
-}
+use args::{Command, Meta, Query, parse_invocation, print_meta};
+use debug::{print_expanded, print_items, report_query};
 
 /// Metadata for a discovered `#[test]` function.
 #[derive(Clone)]
@@ -96,7 +22,7 @@ pub(crate) struct TestItem {
     pub expected: Option<String>,
 }
 
-fn item_enabled(tree: &outline::tree::Crate, file_at: usize, mut at: usize) -> bool {
+fn item_enabled(tree: &outline::tree::Crate, file_at: usize, at: usize) -> bool {
     let items = &tree.files[file_at].items.items;
     let mut cur = Some(at);
     while let Some(idx) = cur {
@@ -109,28 +35,63 @@ fn item_enabled(tree: &outline::tree::Crate, file_at: usize, mut at: usize) -> b
         }
         cur = item.parent.map(|p| p as usize);
     }
-    let _ = &mut at;
     true
 }
 
-fn member_fns<'a>(workspace: &'a graph::Workspace, outline: &'a outline::Outline) -> impl Iterator<Item = (ItemRef, &'a outline::tree::Crate, &'a outline::tree::File, &'a outline::item::Item)> + 'a {
+fn member_fns<'a>(
+    workspace: &'a graph::Workspace,
+    outline: &'a outline::Outline,
+) -> impl Iterator<
+    Item = (
+        ItemRef,
+        &'a outline::tree::Crate,
+        &'a outline::tree::File,
+        &'a outline::item::Item,
+    ),
+> + 'a {
     outline.members(workspace).flat_map(move |krate| {
         let tree = &outline.crates[krate];
-        tree.files.iter().enumerate().flat_map(move |(file_at, file)| {
-            file.items.items.iter().enumerate().filter_map(move |(at, item)| {
-                (item.kind == outline::item::ItemKind::Fn && item.body.is_some() && item_enabled(tree, file_at, at))
-                    .then_some((ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 }, tree, file.as_ref(), item))
+        tree.files
+            .iter()
+            .enumerate()
+            .flat_map(move |(file_at, file)| {
+                file.items
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(at, item)| {
+                        (item.kind == outline::item::ItemKind::Fn
+                            && item.body.is_some()
+                            && item_enabled(tree, file_at, at))
+                        .then_some((
+                            ItemRef {
+                                krate: krate as u32,
+                                file: file_at as u32,
+                                item: at as u32,
+                            },
+                            tree,
+                            file.as_ref(),
+                            item,
+                        ))
+                    })
             })
-        })
     })
 }
 
-pub(crate) fn test_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<TestItem> {
+pub(crate) fn test_items(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+) -> Vec<TestItem> {
     member_fns(workspace, outline)
-        .filter(|(_, tree, file, item)| outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test"))
+        .filter(|(_, tree, file, item)| {
+            outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
+        })
         .map(|(item_ref, tree, file, item)| {
-            let should_panic = outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic");
-            let expected = should_panic.then(|| outline::attr::should_panic_expected(&file.source, &item.attrs, &tree.env)).flatten();
+            let should_panic =
+                outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "should_panic");
+            let expected = should_panic
+                .then(|| outline::attr::should_panic_expected(&file.source, &item.attrs, &tree.env))
+                .flatten();
             TestItem {
                 item: item_ref,
                 ignored: outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "ignore"),
@@ -145,7 +106,10 @@ fn panic_payload(stderr: &str) -> Option<&str> {
     let mut offset = 0;
     for line in stderr.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.starts_with("thread '") && trimmed.contains(" panicked at ") && trimmed.ends_with(':') {
+        if trimmed.starts_with("thread '")
+            && trimmed.contains(" panicked at ")
+            && trimmed.ends_with(':')
+        {
             let rest = &stderr[offset + line.len()..];
             let body = rest.split("\nnote: run with ").next().unwrap_or(rest);
             let body = body.split("\nstack backtrace:").next().unwrap_or(body);
@@ -161,7 +125,11 @@ pub(crate) fn print_test_report(
     entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
     elapsed: std::time::Duration,
 ) -> i32 {
-    println!("\nrunning {} test{}", entries.len(), if entries.len() == 1 { "" } else { "s" });
+    println!(
+        "\nrunning {} test{}",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" }
+    );
     let (mut passed, mut failed, mut ignored) = (0usize, 0usize, 0usize);
     let mut details: Vec<(&str, String)> = Vec::new();
     for &(name, meta, ref outcome) in entries {
@@ -173,11 +141,17 @@ pub(crate) fn print_test_report(
         match outcome {
             Ok((status, stderr)) => {
                 let expected_ok = match (&meta.expected, stderr) {
-                    (Some(exp), Some(err)) => panic_payload(err).is_some_and(|msg| msg.contains(exp.as_str())),
+                    (Some(exp), Some(err)) => {
+                        panic_payload(err).is_some_and(|msg| msg.contains(exp.as_str()))
+                    }
                     (Some(_), None) => false,
                     (None, _) => true,
                 };
-                let ok = if meta.should_panic { *status != 0 && expected_ok } else { *status == 0 };
+                let ok = if meta.should_panic {
+                    *status != 0 && expected_ok
+                } else {
+                    *status == 0
+                };
                 if ok {
                     println!("test {name} ... ok");
                     passed += 1;
@@ -185,7 +159,10 @@ pub(crate) fn print_test_report(
                     let msg = if meta.should_panic && *status == 0 {
                         "note: test did not panic as expected".to_owned()
                     } else if let Some(exp) = &meta.expected {
-                        format!("note: panic did not contain expected string `{exp}`\n{}", stderr.as_deref().unwrap_or("").trim())
+                        format!(
+                            "note: panic did not contain expected string `{exp}`\n{}",
+                            stderr.as_deref().unwrap_or("").trim()
+                        )
                     } else {
                         format!("exited with status {status}")
                     };
@@ -208,60 +185,74 @@ pub(crate) fn print_test_report(
         }
     }
     let verdict = if failed == 0 { "ok" } else { "FAILED" };
-    println!("\ntest result: {verdict}. {passed} passed; {failed} failed; {ignored} ignored; finished in {:.2}s\n", elapsed.as_secs_f64());
+    println!(
+        "\ntest result: {verdict}. {passed} passed; {failed} failed; {ignored} ignored; finished in {:.2}s\n",
+        elapsed.as_secs_f64()
+    );
     if failed == 0 { 0 } else { 101 }
 }
 
-pub(crate) fn lib_fn_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
-    member_fns(workspace, outline).map(|(item_ref, _, _, _)| item_ref).collect()
+pub(crate) fn lib_fn_items(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+) -> Vec<ItemRef> {
+    member_fns(workspace, outline)
+        .map(|(item_ref, _, _, _)| item_ref)
+        .collect()
 }
 
 pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
     member_fns(workspace, outline)
-        .filter(|(_, _, file, item)| item.name.is_some_and(|name| file.source.text(name).starts_with("case_")))
+        .filter(|(_, _, file, item)| {
+            item.name
+                .is_some_and(|name| file.source.text(name).starts_with("case_"))
+        })
         .map(|(item_ref, _, _, _)| item_ref)
         .collect()
 }
 
 pub(crate) type Failures = std::collections::BTreeMap<String, Vec<String>>;
 
-fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
-    let mut failures = Failures::new();
-    for &item in cases {
-        if let Err(error) = sema::infer::infer(cx, item, sema::substs::Substs::EMPTY) {
-            let text = format!("{error:#}");
-            let kind = text.split([' ', '(', '`']).take(3).collect::<Vec<_>>().join(" ");
-            failures.entry(kind).or_default().push(cx.name(item).to_owned());
-        }
+pub(crate) fn print_failures(failures: &Failures) {
+    for (error, items) in failures {
+        let names: Vec<&str> = items
+            .iter()
+            .take(3)
+            .filter_map(|item| item.split(':').next())
+            .collect();
+        eprintln!(
+            "{:>4} {error} [{}]\n       {}",
+            items.len(),
+            names.join(" "),
+            items[0].chars().take(300).collect::<String>()
+        );
     }
-    failures
 }
 
-/// Loads and resolves what a sema pass asked for, and returns the store for the next pass and whether the outline changed.
-fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-    let started = Instant::now();
-    let mut compilation = crate::macros::load_lazy(workspace, targets)?;
-    let load = started.elapsed();
-    let cases = case_items(workspace, &compilation.outline);
-    let mut passes = 0;
-    let failures = crate::macros::resolve_sema(&mut compilation, (sema::Cache::default(), crate::macros::load), |mut cx, last| {
-        passes += 1;
-        let failures = typeck_pass(&mut cx, &cases);
-        let settled = cx.resolved();
-        let released = cx.release();
-        Ok(if settled || last { Ok(failures) } else { Err(released) })
-    })?;
-    let failed: usize = failures.values().map(Vec::len).sum();
-    print_failures(&failures);
-    let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
-    eprintln!("typeck {} cases, {} passed, {failed} failed, {passes} passes, {}, load {:.1} ms, total {:.1} ms", cases.len(), cases.len() - failed, summary(&compilation.outline), ms(load), ms(started.elapsed()));
-    Ok(())
+pub(crate) fn error_kind(text: &str) -> String {
+    let text = text.split_once(": ").map_or(text, |(_, rest)| rest);
+    text.split([' ', '(', '`'])
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Each group of `failures`, largest first, as a count and kind line followed by one indented line per error.
+pub(crate) fn failure_lines(failures: &Failures) -> Vec<String> {
+    let mut groups: Vec<(&String, &Vec<String>)> = failures.iter().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    groups
+        .into_iter()
+        .flat_map(|(kind, errors)| {
+            std::iter::once(format!("{} {kind}", errors.len()))
+                .chain(errors.iter().map(|error| format!("    {error}")))
+        })
+        .collect()
 }
 
 fn report_cases(
     root: &std::path::Path,
-    workspace: &graph::Workspace,
-    targets: &Targets,
+    (workspace, targets): (&graph::Workspace, &Targets),
     (request, args): (Request, &[String]),
     stats: Option<(&std::path::Path, sema::census::Span)>,
     out: Option<&std::path::Path>,
@@ -273,7 +264,9 @@ fn report_cases(
     let mut build = crate::build::Build::load(workspace, targets)?;
     let result = match (request, out) {
         (Request::Build, Some(path)) => build.emit_executable(workspace, path, stats.is_none()),
-        (Request::Build, None) if stats.is_none() => build.compile_binary_oneshot(workspace).and_then(|()| build.check(started.elapsed())),
+        (Request::Build, None) if stats.is_none() => build
+            .compile_binary_oneshot(workspace)
+            .and_then(|()| build.check(started.elapsed())),
         _ => crate::serve::finish(&mut build, workspace, (request, out, args), started),
     };
     if let Some((path, graph_span)) = stats {
@@ -286,7 +279,13 @@ fn report_cases(
         match &result {
             Ok(0) => {
                 let watch_paths = build.watch_paths();
-                crate::substrate::noop::record(root, workspace, &watch_paths, out, build.reached_count());
+                crate::substrate::noop::record(
+                    root,
+                    workspace,
+                    &watch_paths,
+                    out,
+                    build.reached_count(),
+                );
             }
             _ => crate::substrate::noop::invalidate(root, out),
         }
@@ -295,335 +294,16 @@ fn report_cases(
     result
 }
 
-pub(crate) fn print_failures(failures: &Failures) {
-    for (error, items) in failures {
-        let names: Vec<&str> = items.iter().take(3).filter_map(|item| item.split(':').next()).collect();
-        eprintln!("{:>4} {error} [{}]\n       {}", items.len(), names.join(" "), items[0].chars().take(300).collect::<String>());
-    }
-}
-
-pub(crate) fn error_kind(text: &str) -> String {
-    let text = text.split_once(": ").map_or(text, |(_, rest)| rest);
-    text.split([' ', '(', '`']).take(4).collect::<Vec<_>>().join(" ")
-}
-
-fn parse_bodies(tree: &outline::tree::Crate) -> (usize, Vec<String>) {
-    let mut parsed = 0;
-    let mut errors = Vec::new();
-    for file in &tree.files {
-        for item in &file.items.items {
-            let Some(open) = item.body.filter(|_| item.kind == outline::item::ItemKind::Fn) else {
-                continue;
-            };
-            match crate::body::parse(&file.source, open, crate::body::Config::default()) {
-                Ok(_) => parsed += 1,
-                Err(error) => errors.push(format!("{error:#}")),
-            }
-        }
-    }
-    (parsed, errors)
-}
-
-fn report_bodies(outline: &outline::Outline, threads: usize) {
-    let started = Instant::now();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let results = std::sync::Mutex::new(Vec::new());
-    crate::sync::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                while let Some(tree) = outline.crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-                    let result = parse_bodies(tree);
-                    crate::sync::lock(&results).push(result);
-                }
-            });
-        }
-    });
-    let results = crate::sync::into_inner(results);
-    let parsed: usize = results.iter().map(|(parsed, _)| parsed).sum();
-    let errors: Vec<&String> = results.iter().flat_map(|(_, errors)| errors).collect();
-    for error in &errors {
-        eprintln!("body error: {error}");
-    }
-    eprintln!("bodies {parsed} parsed, {} failed in {:.1} ms", errors.len(), started.elapsed().as_secs_f64() * 1e3);
-}
-
-fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
-    let elapsed = started.elapsed();
-    let mut total = 0;
-    for (index, krate) in names.crates.iter().enumerate() {
-        total += krate.unresolved.len();
-        let tree = &outline.crates[index];
-        for entry in krate.unresolved.iter().take(3) {
-            let file = &tree.files[entry.file as usize];
-            let import = &file.items.imports[entry.import as usize];
-            let path: Vec<&str> = import.path.iter().map(|at| file.source.text(*at)).collect();
-            eprintln!("unresolved {} in {}: {}", outline.roots[index].name, file.source.path.display(), path.join("::"));
-        }
-    }
-    let bindings: usize = names.crates.iter().flat_map(|krate| &krate.scopes).map(|scope| scope.names.len()).sum();
-    eprintln!("names {bindings} names, {total} unresolved imports in {:.1} ms", elapsed.as_secs_f64() * 1e3);
-}
-
-/// Prints the root scope of each crate named `name`: every name with a flag per namespace, types, values and macros.
-fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
-    for (index, krate) in names.crates.iter().enumerate().filter(|(index, _)| outline.roots[*index].name == name) {
-        let mut keys: Vec<String> =
-            krate.scopes[0].names.iter().map(|(name, entry)| format!("{}:{}{}{}", names.symbols.text(*name), u8::from(entry.types.is_some()), u8::from(entry.values.is_some()), u8::from(entry.macros.is_some()))).collect();
-        keys.sort();
-        println!("scope {index} {}: {}", outline.roots[index].name, keys.join(" "));
-    }
-}
-
-const TOP_COMMANDS: [(Command, &str); 3] = [(Command::Serve, "serve"), (Command::Prep, "prep"), (Command::Clean, "clean")];
-
-fn usage() -> String {
-    let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().filter(|(cmd, _)| !matches!(cmd, Command::Clean)).map(|(_, name)| name)).collect();
-    let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
-    format!(
-        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
-        modes.join("|"),
-        queries.join("|"),
-    )
-}
-
-/// What the command line asks for.
-#[derive(Clone, Copy)]
-enum Command {
-    /// Build, test or run the workspace, through its server when one runs.
-    Request(Request),
-    /// Keep a build of the workspace in memory and answer requests.
-    Serve,
-    /// Prepare the code the binary reaches for the prepped library.
-    Prep,
-    /// Remove the haste cache directory.
-    Clean,
-    /// Print what one stage found.
-    Debug(Query),
-}
-
-/// What a debug command prints.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Query {
-    Graph,
-    Outline,
-    Lazy,
-    Typeck,
-    Scope,
-    Items,
-    Expand,
-    Failures,
-    /// Write the machine code of every function `main` reaches, with the rustc symbol each binds to.
-    Code,
-}
-
-const QUERIES: [(Query, &str); 9] = [(Query::Graph, "graph"), (Query::Outline, "outline"), (Query::Lazy, "lazy"), (Query::Typeck, "typeck"), (Query::Scope, "scope"), (Query::Items, "items"), (Query::Expand, "expand"), (Query::Failures, "failures"), (Query::Code, "code")];
-
-fn next_str(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<String> {
-    let raw = args.next().with_context(usage)?;
-    raw.into_string().map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy()))
-}
-
-fn parse(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Command> {
-    let word = next_str(args)?;
-    if let Some((cmd, _)) = TOP_COMMANDS.into_iter().find(|(_, name)| *name == word) {
-        return Ok(cmd);
-    }
-    if word == "debug" {
-        let name = next_str(args)?;
-        return QUERIES.into_iter().find(|(_, query)| *query == name).map(|(query, _)| Command::Debug(query)).with_context(usage);
-    }
-    Request::parse_mode(&word).map(Command::Request).with_context(usage)
-}
-
-#[derive(Clone, Copy)]
-enum Meta {
-    Version,
-    Help,
-}
-
-impl Meta {
-    fn from_flag(flag: &str) -> Option<Self> {
-        match flag {
-            "-V" | "--version" => Some(Self::Version),
-            "-h" | "--help" => Some(Self::Help),
-            _ => None,
-        }
-    }
-}
-
-fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
-    args: &mut std::iter::Peekable<I>,
-    selection: &mut crate::Selection,
-    stats: &mut Option<PathBuf>,
-    out: &mut Option<PathBuf>,
-) -> Result<Option<Meta>> {
-    while let Some(flag) = args.peek().and_then(|raw| raw.to_str()) {
-        if let Some(meta) = Meta::from_flag(flag) {
-            args.next();
-            return Ok(Some(meta));
-        }
-        match flag {
-            "-p" | "--package" => {
-                args.next();
-                selection.package = Some(next_str(args).context("--package takes a package name")?);
-            }
-            "--bin" => {
-                args.next();
-                selection.bin = Some(next_str(args).context("--bin takes a binary name")?);
-            }
-            "--example" => {
-                args.next();
-                selection.example = Some(next_str(args).context("--example takes an example name")?);
-            }
-            "-F" | "--features" => {
-                args.next();
-                let list = next_str(args).context("--features takes a feature list")?;
-                selection.features.extend(list.split([',', ' ']).filter(|s| !s.is_empty()).map(str::to_owned));
-            }
-            "--all-features" => {
-                args.next();
-                selection.all_features = true;
-            }
-            "--no-default-features" => {
-                args.next();
-                selection.no_default_features = true;
-            }
-            "--ignored" => {
-                args.next();
-                selection.ignored_only = true;
-            }
-            "--include-ignored" => {
-                args.next();
-                selection.include_ignored = true;
-            }
-            "--jobs" => {
-                args.next();
-                let count: usize = next_str(args)?.parse().context("--jobs takes a positive number")?;
-                crate::set_jobs(count.max(1));
-            }
-            "--release" => {
-                args.next();
-                crate::set_profile(outline::tree::Profile::Release);
-            }
-            "--prepared" => {
-                args.next();
-                crate::prep::set_prepared();
-            }
-            "--prep-wait" => {
-                args.next();
-                let millis: u64 = next_str(args)?.parse().context("--prep-wait takes a number of milliseconds")?;
-                crate::prep::set_wait(std::time::Duration::from_millis(millis));
-            }
-            "--perf-map" => {
-                args.next();
-                crate::image::perf::enable();
-            }
-            "--watch" => {
-                args.next();
-                crate::image::watch::enable();
-            }
-            "--stats-json" => {
-                args.next();
-                let value = args.next().context("--stats-json takes a file path")?;
-                *stats = Some(PathBuf::from(value));
-            }
-            "--target" => {
-                args.next();
-                let triple = next_str(args)?;
-                let target = haste_codegen::Target::find(&triple).with_context(|| {
-                    let known: Vec<&str> = haste_codegen::TARGETS.iter().map(|t| t.triple).collect();
-                    format!("unknown target `{triple}`; supported targets: {}", known.join(", "))
-                })?;
-                crate::set_target(target);
-            }
-            "-o" | "--output" => {
-                args.next();
-                let value = args.next().context("-o takes a file path")?;
-                *out = Some(PathBuf::from(value));
-            }
-            _ if flag == "--" => break,
-            _ if flag.starts_with('-') && flag != "-" => anyhow::bail!("unknown option `{flag}`\n{}", usage()),
-            _ => break,
-        }
-    }
-    Ok(None)
-}
-
-type ParsedInvocation = (Command, PathBuf, Vec<String>, Option<PathBuf>, Option<PathBuf>);
-
-fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
-    let mut args = std::env::args_os().skip(1).peekable();
-    let mut selection = crate::Selection::default();
-    let mut stats_json = None;
-    let mut out = None;
-    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
-        return Ok(Err(meta));
-    }
-    let command = parse(&mut args)?;
-    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
-        return Ok(Err(meta));
-    }
-    if matches!(command, Command::Clean) {
-        if args.peek().is_some() {
-            anyhow::bail!("{}", usage());
-        }
-        return Ok(Ok((command, PathBuf::new(), Vec::new(), None, None)));
-    }
-    let path = if matches!(command, Command::Request(_) | Command::Serve | Command::Prep) {
-        match args.peek().and_then(|raw| raw.to_str()) {
-            None | Some("--") => PathBuf::from("."),
-            Some(_) => PathBuf::from(args.next().with_context(usage)?),
-        }
-    } else {
-        PathBuf::from(args.next().with_context(usage)?)
-    };
-    if !matches!(command, Command::Request(Request::Run) | Command::Debug(_))
-        && let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)?
-    {
-        return Ok(Err(meta));
-    }
-    crate::set_selection(selection);
-    if matches!(command, Command::Request(Request::Test))
-        || (matches!(command, Command::Serve) && std::env::var_os("HASTE_SERVE_TEST").is_some_and(|v| v == "1"))
-    {
-        crate::set_test_mode();
-    }
-    if !matches!(command, Command::Request(Request::Build)) && (stats_json.is_some() || out.is_some()) {
-        anyhow::bail!("--stats-json and -o are only supported with `haste build`");
-    }
-    if crate::compile_target().triple != haste_codegen::Target::host().triple
-        && !(matches!(command, Command::Request(Request::Build)) && out.is_some())
-    {
-        anyhow::bail!("--target {} is only supported with `haste build -o`", crate::compile_target().triple);
-    }
-    if crate::image::watch::enabled() && !matches!(command, Command::Request(Request::Run)) {
-        anyhow::bail!("--watch is only supported with `haste run`");
-    }
-    let rest = args
-        .map(|raw| raw.into_string().map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy())))
-        .collect::<Result<Vec<String>>>()?;
-    let rest = match rest.split_first() {
-        Some((first, tail)) if first == "--" => tail.to_vec(),
-        _ => rest,
-    };
-    Ok(Ok((command, path, rest, stats_json, out)))
-}
-
 fn clean_cache() -> Result<()> {
     let home = crate::graph::store::home();
     match std::fs::remove_dir_all(&home) {
         Ok(()) => eprintln!("removed {}", home.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => eprintln!("cache {} is already empty", home.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("cache {} is already empty", home.display())
+        }
         Err(err) => return Err(err).with_context(|| format!("removing {}", home.display())),
     }
     Ok(())
-}
-
-fn print_meta(meta: Meta) {
-    match meta {
-        Meta::Version => println!("haste {}", env!("CARGO_PKG_VERSION")),
-        Meta::Help => println!("{}", usage()),
-    }
 }
 
 fn can_serve(command: Command, stats_json: Option<&std::path::Path>) -> bool {
@@ -634,7 +314,13 @@ fn can_serve(command: Command, stats_json: Option<&std::path::Path>) -> bool {
         && std::env::var_os("HASTE_NO_DAEMON").is_none_or(|v| v != "1")
 }
 
-fn try_serve(command: Command, root: &std::path::Path, stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>, argv: &[String]) -> Result<Option<i32>> {
+fn try_serve(
+    command: Command,
+    root: &std::path::Path,
+    stats_json: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+    argv: &[String],
+) -> Result<Option<i32>> {
     if !can_serve(command, stats_json) {
         return Ok(None);
     }
@@ -646,7 +332,10 @@ fn try_serve(command: Command, root: &std::path::Path, stats_json: Option<&std::
 
 /// Runs the haste command line.
 pub fn main() -> Result<()> {
-    if let Some(meta) = std::env::args_os().nth(1).and_then(|a| a.to_str().and_then(Meta::from_flag)) {
+    if let Some(meta) = std::env::args_os()
+        .nth(1)
+        .and_then(|a| a.to_str().and_then(Meta::from_flag))
+    {
         return Ok(print_meta(meta));
     }
     crate::sema::evaluate::install(crate::image::evaluator);
@@ -663,10 +352,22 @@ pub fn main() -> Result<()> {
     let root = std::path::absolute(path)?;
     let abs_out = out.as_deref().map(std::path::absolute).transpose()?;
     let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
-    if let Some(status) = try_serve(command, &root, stats_json.as_deref(), abs_out.as_deref(), &argv)? {
+    if let Some(status) = try_serve(
+        command,
+        &root,
+        stats_json.as_deref(),
+        abs_out.as_deref(),
+        &argv,
+    )? {
         std::process::exit(status);
     }
-    let status = report(command, &root, &argv, stats_json.as_deref(), abs_out.as_deref())?;
+    let status = report(
+        command,
+        &root,
+        &argv,
+        stats_json.as_deref(),
+        abs_out.as_deref(),
+    )?;
     if status == 0
         && cfg!(unix)
         && can_serve(command, stats_json.as_deref())
@@ -680,62 +381,39 @@ pub fn main() -> Result<()> {
     }
 }
 
-fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets), argv: &[String]) -> Result<()> {
-    match query {
-        Query::Graph => Ok(print_graph(workspace)),
-        Query::Outline => report_outline(workspace, targets, crate::jobs()),
-        Query::Lazy => report_lazy(workspace, targets),
-        Query::Typeck => report_typeck(workspace, targets),
-        Query::Scope => {
-            let name = argv.get(1).with_context(usage)?;
-            let compilation = crate::macros::load_eager(workspace, targets, &[])?;
-            print_scope(&compilation.outline, &compilation.names, name);
-            Ok(())
-        }
-        Query::Failures => report_failures(workspace, targets),
-        Query::Code => crate::dump::write(workspace, targets, std::path::Path::new(argv.get(1).with_context(usage)?)),
-        Query::Items | Query::Expand => Ok(()),
-    }
-}
-
-/// Builds the binary and prints every function its `main` reaches that did not type-check or compile, grouped by the kind of error, largest group first.
-fn report_failures(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-    let mut build = crate::build::Build::load(workspace, targets)?;
-    build.compile_binary(workspace)?;
-    let failures = build.failures()?;
-    failure_lines(&failures).iter().for_each(|line| println!("{line}"));
-    eprintln!("{} functions failed in {} groups", failures.values().map(Vec::len).sum::<usize>(), failures.len());
-    std::mem::forget(build);
-    Ok(())
-}
-
-/// Each group of `failures`, largest first, as a count and kind line followed by one indented line per error.
-pub(crate) fn failure_lines(failures: &Failures) -> Vec<String> {
-    let mut groups: Vec<(&String, &Vec<String>)> = failures.iter().collect();
-    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
-    groups.into_iter().flat_map(|(kind, errors)| std::iter::once(format!("{} {kind}", errors.len())).chain(errors.iter().map(|error| format!("    {error}")))).collect()
-}
-
 fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
     let counts = crate::build::prep(workspace, targets)?;
-    println!("{counts} in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "{counts} in {:.1} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
     Ok(())
 }
 
 fn program_name(root: &std::path::Path) -> String {
-    root.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+    root.file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
 /// Loads the workspace at `root` with the standard library merged in and the output of every build script settled.
-pub(crate) fn load_workspace(root: &std::path::Path, targets: &Targets) -> Result<graph::Workspace> {
+pub(crate) fn load_workspace(
+    root: &std::path::Path,
+    targets: &Targets,
+) -> Result<graph::Workspace> {
     let mut workspace = graph::load(root, targets, crate::selection())?;
     workspace.merge(graph::load_sysroot(&graph::library()?, targets)?);
     crate::scripts::settle(&mut workspace, targets)?;
     Ok(workspace)
 }
 
-fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>) -> Result<i32> {
+fn report(
+    command: Command,
+    root: &std::path::Path,
+    argv: &[String],
+    stats_json: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+) -> Result<i32> {
     let started = Instant::now();
     if matches!(command, Command::Request(Request::Build))
         && crate::substrate::noop::active(stats_json)
@@ -743,12 +421,18 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
     {
         let ms = started.elapsed().as_secs_f64() * 1e3;
         match out {
-            Some(path) => eprintln!("built {} ({reached} functions reached, {ms:.1} ms)", path.display()),
+            Some(path) => eprintln!(
+                "built {} ({reached} functions reached, {ms:.1} ms)",
+                path.display()
+            ),
             None => eprintln!("{reached} functions reached, 0 failed, built in {ms:.1} ms"),
         }
         return Ok(0);
     }
-    let targets = Targets { target: cfg::Target::of(crate::compile_target()), host: cfg::Target::host() };
+    let targets = Targets {
+        target: cfg::Target::of(crate::compile_target()),
+        host: cfg::Target::host(),
+    };
     let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
         Command::Debug(Query::Graph) => graph::load(root, &targets, crate::selection())?,
@@ -757,14 +441,25 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
     let graph_span = graph_clock.elapsed();
     let loaded = started.elapsed();
     let status = match command {
-        Command::Request(request) => report_cases(root, &workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)), out)?,
+        Command::Request(request) => report_cases(
+            root,
+            (&workspace, &targets),
+            (request, argv),
+            stats_json.map(|path| (path, graph_span)),
+            out,
+        )?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
         Command::Clean => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
     if !matches!(command, Command::Request(Request::Run)) {
-        eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
+        eprintln!(
+            "graph {} packages {} units in {:.1} ms",
+            workspace.packages.len(),
+            workspace.graph.units.len(),
+            loaded.as_secs_f64() * 1e3
+        );
     }
     Ok(status)
 }

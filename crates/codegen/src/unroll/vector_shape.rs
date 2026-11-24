@@ -1,5 +1,5 @@
 use super::memset::use_count;
-use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
+use crate::ir::{Binary, Convert, Function, Inst, InstData, IntCC, Op, Type, Unary, Value};
 
 /// Bytes, and so byte lanes, that one vector iteration covers.
 pub(super) const LANES: i64 = 16;
@@ -143,12 +143,15 @@ impl Scan<'_> {
         self.sums.iter().any(|s| s.idx == idx) || self.iv_sums.iter().any(|s| s.idx == idx)
     }
 
-    fn bound(&self, cond: Value) -> Option<(usize, Value)> {
-        let def = self
-            .body
+    fn def_of(&self, v: Value) -> Option<&InstData> {
+        self.body
             .iter()
             .map(|&i| &self.func.insts[i.index()])
-            .find(|d| d.result == Some(cond))?;
+            .find(|d| d.result == Some(v))
+    }
+
+    fn bound(&self, cond: Value) -> Option<(usize, Value)> {
+        let def = self.def_of(cond)?;
         let Op::Icmp(IntCC::UnsignedLessThan, at, limit) = def.op else {
             return None;
         };
@@ -168,11 +171,7 @@ impl Scan<'_> {
                 off,
             });
         }
-        let def = self
-            .body
-            .iter()
-            .map(|&i| &self.func.insts[i.index()])
-            .find(|d| d.result == Some(addr))?;
+        let def = self.def_of(addr)?;
         let Op::Binary(Binary::Iadd, x, y) = def.op else {
             return None;
         };
@@ -227,11 +226,7 @@ impl Scan<'_> {
         if matches!(self.kinds[v.index()], Some(Kind::Mask | Kind::Data)) {
             return Some(v);
         }
-        let def = self
-            .body
-            .iter()
-            .map(|&i| &self.func.insts[i.index()])
-            .find(|d| d.result == Some(v))?;
+        let def = self.def_of(v)?;
         let Op::Convert(Convert::Uextend, inner) = def.op else {
             return None;
         };
@@ -245,11 +240,7 @@ impl Scan<'_> {
         if let Some(idx) = self.stepped(v) {
             return Some((idx, 0));
         }
-        let def = self
-            .body
-            .iter()
-            .map(|&i| &self.func.insts[i.index()])
-            .find(|d| d.result == Some(v))?;
+        let def = self.def_of(v)?;
         match def.op {
             Op::Binary(Binary::Iadd, a, b) => [(a, b), (b, a)].into_iter().find_map(|(p, c)| {
                 let idx = self.stepped(p)?;
