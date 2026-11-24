@@ -156,7 +156,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         }
     }
     let tail_calls = if full {
-        crate::frame::find_tail_calls(func, &plan, &abi, true, &|sig| classify(sig, packing))
+        crate::frame::find_tail_calls(func, &plan, &abi, &|sig| classify(sig, packing))
     } else {
         Vec::new()
     };

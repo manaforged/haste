@@ -293,6 +293,49 @@ pub fn case_rev_licm_cold_latch(seed: i64) -> i64 {
     licm_cold_latch_inner(black_box(&mut st), black_box(limit))
 }
 
+struct CmpPanic(i64);
+
+impl PartialEq for CmpPanic {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Drop for CmpPanic {
+    fn drop(&mut self) {
+        if self.0 < 0 {
+            panic!("cmp drop");
+        }
+    }
+}
+
+#[inline(never)]
+fn cmp_drop_callee(a: CmpPanic, b: CmpPanic) -> bool {
+    a == b
+}
+
+#[inline(never)]
+fn cmp_drop_caller(trigger: bool, drops: &mut i64) -> bool {
+    let _g = TlsDropGuard(drops);
+    let a = CmpPanic(if trigger { -1 } else { 1 });
+    let b = CmpPanic(1);
+    cmp_drop_callee(a, b)
+}
+
+pub fn case_rev_cmp_drop_unwind(seed: i64) -> i64 {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut drops = 0_i64;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        black_box(cmp_drop_caller(black_box(true), &mut drops));
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    let mut ok_drops = 0_i64;
+    let eq = cmp_drop_caller(black_box(false), &mut ok_drops);
+    drops * 100 + i64::from(caught) * 10 + ok_drops * 1000 + i64::from(eq) + (seed & 3)
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_rev_bitmask_switch", case_rev_bitmask_switch),
     ("case_rev_u64_consts_and_ptr_cast", case_rev_u64_consts_and_ptr_cast),
@@ -301,4 +344,5 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_rev_arc_reborrow_and_refcell_unsize", case_rev_arc_reborrow_and_refcell_unsize),
     ("case_rev_thread_local_init_panic_drop", case_rev_thread_local_init_panic_drop),
     ("case_rev_licm_cold_latch", case_rev_licm_cold_latch),
+    ("case_rev_cmp_drop_unwind", case_rev_cmp_drop_unwind),
 ];

@@ -79,7 +79,17 @@ fn expr_avoids_normal_drop(body: &Body, expr: &Expr) -> bool {
         | Expr::Paren(_)
         | Expr::Cast(..) => true,
         Expr::Unary(op, _) => !matches!(op, UnOp::Deref),
-        Expr::Binary(op, ..) => !matches!(op, BinOp::And | BinOp::Or),
+        Expr::Binary(op, ..) => !matches!(
+            op,
+            BinOp::And
+                | BinOp::Or
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+        ),
         Expr::Struct { rest: false, .. } => true,
         Expr::Block {
             stmts,
@@ -101,9 +111,15 @@ fn all_params_moved(cx: &Context<'_>, body: &Body, typed: &Typed) -> bool {
     if !body.fn_params.is_empty() || typed.params.len() > 8 {
         return false;
     }
+    let mut call_callees = vec![false; body.exprs.len()];
+    for expr in &body.exprs {
+        if let Expr::Call(callee, _) = *expr {
+            call_callees[callee.0 as usize] = true;
+        }
+    }
     let mut moved = 0u16;
     for (idx, expr) in body.exprs.iter().enumerate() {
-        if !matches!(expr, Expr::Path(_)) {
+        if !matches!(expr, Expr::Path(_)) || call_callees[idx] {
             continue;
         }
         if let Some(Res::Local(local)) =
