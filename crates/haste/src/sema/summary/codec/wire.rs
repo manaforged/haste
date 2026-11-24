@@ -105,7 +105,10 @@ pub(crate) fn encode_prim(p: Primitive) -> Option<u8> {
 }
 
 pub(crate) fn decode_prim(raw: u8) -> Result<Primitive> {
-    PRIMITIVES.get(raw as usize).map(|&(_, prim)| prim).context("invalid primitive tag")
+    PRIMITIVES
+        .get(raw as usize)
+        .map(|&(_, prim)| prim)
+        .context("invalid primitive tag")
 }
 
 /// An append-only table of interned type nodes serialized into a byte buffer.
@@ -125,11 +128,25 @@ impl TyTable {
         &self.buf
     }
 
-    pub(crate) fn substs_ids(&mut self, types: &Types, substs: Substs, item_id: &mut impl FnMut(ItemRef) -> Option<u32>) -> Option<Vec<u32>> {
-        types.substs(substs).iter().map(|&ty| self.ty_id(types, ty, item_id)).collect()
+    pub(crate) fn substs_ids(
+        &mut self,
+        types: &Types,
+        substs: Substs,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<Vec<u32>> {
+        types
+            .substs(substs)
+            .iter()
+            .map(|&ty| self.ty_id(types, ty, item_id))
+            .collect()
     }
 
-    pub(crate) fn ty_id(&mut self, types: &Types, ty: Ty, item_id: &mut impl FnMut(ItemRef) -> Option<u32>) -> Option<u32> {
+    pub(crate) fn ty_id(
+        &mut self,
+        types: &Types,
+        ty: Ty,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<u32> {
         if ty == Ty::NONE {
             return Some(u32::MAX);
         }
@@ -137,7 +154,112 @@ impl TyTable {
             return Some(idx);
         }
         let mut rec = Vec::new();
-        match types.kind(ty).clone() {
+        self.encode_ty_kind(&mut rec, types, types.kind(ty).clone(), item_id)?;
+        let idx = self.count;
+        self.count = idx.checked_add(1)?;
+        self.buf.extend_from_slice(&rec);
+        self.map.insert(ty, idx);
+        Some(idx)
+    }
+
+    fn write_ty_ref(
+        &mut self,
+        rec: &mut Vec<u8>,
+        types: &Types,
+        ty: Ty,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<()> {
+        write_u32(rec, self.ty_id(types, ty, item_id)?);
+        Some(())
+    }
+
+    fn write_substs(
+        &mut self,
+        rec: &mut Vec<u8>,
+        types: &Types,
+        s: Substs,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<()> {
+        write_u32s(rec, &self.substs_ids(types, s, item_id)?);
+        Some(())
+    }
+
+    fn encode_ptr_ty(
+        &mut self,
+        rec: &mut Vec<u8>,
+        tag: u8,
+        m: Mut,
+        inner: Ty,
+        types: &Types,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<()> {
+        rec.push(tag);
+        rec.push(u8::from(m == Mut::Mut));
+        self.write_ty_ref(rec, types, inner, item_id)
+    }
+
+    fn encode_item_ty(
+        &mut self,
+        rec: &mut Vec<u8>,
+        tag: u8,
+        item: ItemRef,
+        substs: Substs,
+        types: &Types,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<()> {
+        rec.push(tag);
+        write_u32(rec, item_id(item)?);
+        self.write_substs(rec, types, substs, item_id)
+    }
+
+    fn encode_proj_ty(
+        &mut self,
+        rec: &mut Vec<u8>,
+        types: &Types,
+        d: ProjDef,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<()> {
+        rec.push(15);
+        write_u32(rec, item_id(d.of)?);
+        self.write_ty_ref(rec, types, d.self_ty, item_id)?;
+        self.write_substs(rec, types, d.args, item_id)?;
+        write_u32(rec, item_id(d.assoc)?);
+        self.write_substs(rec, types, d.own, item_id)
+    }
+
+    fn encode_item_kind(
+        &mut self,
+        rec: &mut Vec<u8>,
+        types: &Types,
+        kind: Kind,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<()> {
+        match kind {
+            Kind::Adt(i, s) => self.encode_item_ty(rec, 7, i, s, types, item_id)?,
+            Kind::FnDef(i, s) => self.encode_item_ty(rec, 8, i, s, types, item_id)?,
+            Kind::Closure(p, s, at) => {
+                self.encode_item_ty(rec, 10, p, s, types, item_id)?;
+                write_u32(rec, at);
+            }
+            Kind::Dyn(o, s, m, a) => {
+                self.encode_item_ty(rec, 11, o, s, types, item_id)?;
+                write_item_list(rec, types.items(m), item_id)?;
+                write_item_list(rec, types.items(a), item_id)?;
+            }
+            Kind::Proj(id) => self.encode_proj_ty(rec, types, types.proj(id), item_id)?,
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn encode_ty_kind(
+        &mut self,
+        rec: &mut Vec<u8>,
+        types: &Types,
+        kind: Kind,
+        item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+    ) -> Option<()> {
+        match kind {
             Kind::Prim(p) => {
                 rec.push(0);
                 rec.push(encode_prim(p)?);
@@ -145,167 +267,244 @@ impl TyTable {
             Kind::Never => rec.push(1),
             Kind::Tuple(s) => {
                 rec.push(2);
-                write_u32s(&mut rec, &self.substs_ids(types, s, item_id)?);
+                self.write_substs(rec, types, s, item_id)?;
             }
-            Kind::Ref(m, i) => {
-                rec.push(3);
-                rec.push(u8::from(m == Mut::Mut));
-                write_u32(&mut rec, self.ty_id(types, i, item_id)?);
-            }
-            Kind::Ptr(m, i) => {
-                rec.push(4);
-                rec.push(u8::from(m == Mut::Mut));
-                write_u32(&mut rec, self.ty_id(types, i, item_id)?);
-            }
+            Kind::Ref(m, i) => self.encode_ptr_ty(rec, 3, m, i, types, item_id)?,
+            Kind::Ptr(m, i) => self.encode_ptr_ty(rec, 4, m, i, types, item_id)?,
             Kind::Array(e, l) => {
                 rec.push(5);
-                write_u32(&mut rec, self.ty_id(types, e, item_id)?);
-                write_u32(&mut rec, self.ty_id(types, l, item_id)?);
+                self.write_ty_ref(rec, types, e, item_id)?;
+                self.write_ty_ref(rec, types, l, item_id)?;
             }
             Kind::Slice(e) => {
                 rec.push(6);
-                write_u32(&mut rec, self.ty_id(types, e, item_id)?);
-            }
-            Kind::Adt(i, s) => {
-                rec.push(7);
-                write_u32(&mut rec, item_id(i)?);
-                write_u32s(&mut rec, &self.substs_ids(types, s, item_id)?);
-            }
-            Kind::FnDef(i, s) => {
-                rec.push(8);
-                write_u32(&mut rec, item_id(i)?);
-                write_u32s(&mut rec, &self.substs_ids(types, s, item_id)?);
+                self.write_ty_ref(rec, types, e, item_id)?;
             }
             Kind::FnPtr(p, r) => {
                 rec.push(9);
-                write_u32s(&mut rec, &self.substs_ids(types, p, item_id)?);
-                write_u32(&mut rec, self.ty_id(types, r, item_id)?);
-            }
-            Kind::Closure(p, s, at) => {
-                rec.push(10);
-                write_u32(&mut rec, item_id(p)?);
-                write_u32s(&mut rec, &self.substs_ids(types, s, item_id)?);
-                write_u32(&mut rec, at);
-            }
-            Kind::Dyn(o, s, m, a) => {
-                rec.push(11);
-                write_u32(&mut rec, item_id(o)?);
-                write_u32s(&mut rec, &self.substs_ids(types, s, item_id)?);
-                let ms = types.items(m).iter().map(|&x| item_id(x)).collect::<Option<Vec<_>>>()?;
-                let aus = types.items(a).iter().map(|&x| item_id(x)).collect::<Option<Vec<_>>>()?;
-                write_u32s(&mut rec, &ms);
-                write_u32s(&mut rec, &aus);
+                self.write_substs(rec, types, p, item_id)?;
+                self.write_ty_ref(rec, types, r, item_id)?;
             }
             Kind::Pat(b, range) => {
                 let (lo, hi) = types.pat(range);
                 rec.push(12);
-                write_u32(&mut rec, self.ty_id(types, b, item_id)?);
-                write_u128(&mut rec, lo);
-                write_u128(&mut rec, hi);
+                self.write_ty_ref(rec, types, b, item_id)?;
+                write_u128(rec, lo);
+                write_u128(rec, hi);
             }
             Kind::Value(v) => {
                 rec.push(13);
-                write_u128(&mut rec, v);
+                write_u128(rec, v);
             }
             Kind::Param(p) => {
                 rec.push(14);
-                write_u16(&mut rec, p);
+                write_u16(rec, p);
             }
-            Kind::Proj(id) => {
-                let d = types.proj(id);
-                rec.push(15);
-                write_u32(&mut rec, item_id(d.of)?);
-                write_u32(&mut rec, self.ty_id(types, d.self_ty, item_id)?);
-                write_u32s(&mut rec, &self.substs_ids(types, d.args, item_id)?);
-                write_u32(&mut rec, item_id(d.assoc)?);
-                write_u32s(&mut rec, &self.substs_ids(types, d.own, item_id)?);
+            Kind::Adt(..)
+            | Kind::FnDef(..)
+            | Kind::Closure(..)
+            | Kind::Dyn(..)
+            | Kind::Proj(..) => {
+                self.encode_item_kind(rec, types, kind, item_id)?;
             }
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
         }
-        let idx = self.count;
-        self.count = idx.checked_add(1)?;
-        self.buf.extend_from_slice(&rec);
-        self.map.insert(ty, idx);
-        Some(idx)
+        Some(())
     }
+}
+
+fn write_item_list(
+    out: &mut Vec<u8>,
+    items: &[ItemRef],
+    item_id: &mut impl FnMut(ItemRef) -> Option<u32>,
+) -> Option<()> {
+    let ids = items
+        .iter()
+        .map(|&x| item_id(x))
+        .collect::<Option<Vec<_>>>()?;
+    write_u32s(out, &ids);
+    Some(())
 }
 
 fn ty_at(tys: &[Ty], id: u32) -> Result<Ty> {
     if id == u32::MAX {
         Ok(Ty::NONE)
     } else {
-        tys.get(id as usize).copied().context("ty ref out of bounds")
+        tys.get(id as usize)
+            .copied()
+            .context("ty ref out of bounds")
     }
+}
+
+fn read_ty_ref(cur: &mut Cursor<'_>, tys: &[Ty]) -> Result<Ty> {
+    ty_at(tys, cur.u32()?)
+}
+
+fn read_item_ref(cur: &mut Cursor<'_>, items: &[ItemRef]) -> Result<ItemRef> {
+    items
+        .get(cur.u32()? as usize)
+        .copied()
+        .context("item ref out of bounds")
+}
+
+fn read_item_list(cur: &mut Cursor<'_>, items: &[ItemRef]) -> Result<Vec<ItemRef>> {
+    let count = cur.count()?;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(read_item_ref(cur, items)?);
+    }
+    Ok(out)
 }
 
 pub(crate) fn read_substs(cur: &mut Cursor<'_>, types: &Types, tys: &[Ty]) -> Result<Substs> {
     let count = cur.count()?;
     let mut ids = Vec::with_capacity(count);
     for _ in 0..count {
-        ids.push(ty_at(tys, cur.u32()?)?);
+        ids.push(read_ty_ref(cur, tys)?);
     }
     Ok(types.intern_substs(&ids))
 }
 
-pub(crate) fn read_ty(cur: &mut Cursor<'_>, types: &Types, items: &[ItemRef], tys: &[Ty]) -> Result<Ty> {
-    let item_at = |id: u32| items.get(id as usize).copied().context("item ref out of bounds");
+fn read_dyn_kind(
+    cur: &mut Cursor<'_>,
+    types: &Types,
+    items: &[ItemRef],
+    tys: &[Ty],
+) -> Result<Kind> {
+    let of = read_item_ref(cur, items)?;
+    let s = read_substs(cur, types, tys)?;
+    let members = read_item_list(cur, items)?;
+    let autos = read_item_list(cur, items)?;
+    Ok(Kind::Dyn(
+        of,
+        s,
+        types.intern_items(&members),
+        types.intern_items(&autos),
+    ))
+}
+
+fn read_proj_kind(
+    cur: &mut Cursor<'_>,
+    types: &Types,
+    items: &[ItemRef],
+    tys: &[Ty],
+) -> Result<Kind> {
+    Ok(Kind::Proj(types.intern_proj(ProjDef {
+        of: read_item_ref(cur, items)?,
+        self_ty: read_ty_ref(cur, tys)?,
+        args: read_substs(cur, types, tys)?,
+        assoc: read_item_ref(cur, items)?,
+        own: read_substs(cur, types, tys)?,
+    })))
+}
+
+fn read_item_kind(
+    tag: u8,
+    cur: &mut Cursor<'_>,
+    types: &Types,
+    items: &[ItemRef],
+    tys: &[Ty],
+) -> Result<Kind> {
+    Ok(match tag {
+        7 => Kind::Adt(read_item_ref(cur, items)?, read_substs(cur, types, tys)?),
+        8 => Kind::FnDef(read_item_ref(cur, items)?, read_substs(cur, types, tys)?),
+        10 => Kind::Closure(
+            read_item_ref(cur, items)?,
+            read_substs(cur, types, tys)?,
+            cur.u32()?,
+        ),
+        11 => read_dyn_kind(cur, types, items, tys)?,
+        15 => read_proj_kind(cur, types, items, tys)?,
+        _ => bail!("invalid type node tag"),
+    })
+}
+
+pub(crate) fn read_ty(
+    cur: &mut Cursor<'_>,
+    types: &Types,
+    items: &[ItemRef],
+    tys: &[Ty],
+) -> Result<Ty> {
     let kind = match cur.u8()? {
         0 => Kind::Prim(decode_prim(cur.u8()?)?),
         1 => Kind::Never,
         2 => Kind::Tuple(read_substs(cur, types, tys)?),
-        3 => Kind::Ref(read_mut(cur)?, ty_at(tys, cur.u32()?)?),
-        4 => Kind::Ptr(read_mut(cur)?, ty_at(tys, cur.u32()?)?),
-        5 => Kind::Array(ty_at(tys, cur.u32()?)?, ty_at(tys, cur.u32()?)?),
-        6 => Kind::Slice(ty_at(tys, cur.u32()?)?),
-        7 => Kind::Adt(item_at(cur.u32()?)?, read_substs(cur, types, tys)?),
-        8 => Kind::FnDef(item_at(cur.u32()?)?, read_substs(cur, types, tys)?),
-        9 => Kind::FnPtr(read_substs(cur, types, tys)?, ty_at(tys, cur.u32()?)?),
-        10 => Kind::Closure(item_at(cur.u32()?)?, read_substs(cur, types, tys)?, cur.u32()?),
-        11 => {
-            let (of, s) = (item_at(cur.u32()?)?, read_substs(cur, types, tys)?);
-            let m_count = cur.count()?;
-            let mut members = Vec::with_capacity(m_count);
-            for _ in 0..m_count {
-                members.push(item_at(cur.u32()?)?);
-            }
-            let a_count = cur.count()?;
-            let mut autos = Vec::with_capacity(a_count);
-            for _ in 0..a_count {
-                autos.push(item_at(cur.u32()?)?);
-            }
-            Kind::Dyn(of, s, types.intern_items(&members), types.intern_items(&autos))
-        }
-        12 => Kind::Pat(ty_at(tys, cur.u32()?)?, types.intern_pat((cur.u128()?, cur.u128()?))),
+        3 => Kind::Ref(read_mut(cur)?, read_ty_ref(cur, tys)?),
+        4 => Kind::Ptr(read_mut(cur)?, read_ty_ref(cur, tys)?),
+        5 => Kind::Array(read_ty_ref(cur, tys)?, read_ty_ref(cur, tys)?),
+        6 => Kind::Slice(read_ty_ref(cur, tys)?),
+        9 => Kind::FnPtr(read_substs(cur, types, tys)?, read_ty_ref(cur, tys)?),
+        12 => Kind::Pat(
+            read_ty_ref(cur, tys)?,
+            types.intern_pat((cur.u128()?, cur.u128()?)),
+        ),
         13 => Kind::Value(cur.u128()?),
         14 => Kind::Param(cur.u16()?),
-        15 => Kind::Proj(types.intern_proj(ProjDef {
-            of: item_at(cur.u32()?)?,
-            self_ty: ty_at(tys, cur.u32()?)?,
-            args: read_substs(cur, types, tys)?,
-            assoc: item_at(cur.u32()?)?,
-            own: read_substs(cur, types, tys)?,
-        })),
-        _ => bail!("invalid type node tag"),
+        tag => read_item_kind(tag, cur, types, items, tys)?,
     };
     Ok(types.intern(kind))
 }
 
 pub(crate) fn write_site_key(out: &mut Vec<u8>, s: SiteKey) {
     match s {
-        SiteKey::ExprRes(e) => { out.push(0); write_u32(out, e.0); }
-        SiteKey::PatRes(p) => { out.push(1); write_u32(out, p.0); }
-        SiteKey::Deref(e, i) => { out.push(2); write_u32(out, e.0); write_u32(out, i); }
-        SiteKey::Operator(e) => { out.push(3); write_u32(out, e.0); }
-        SiteKey::TryBlock(e) => { out.push(4); write_u32(out, e.0); }
-        SiteKey::BoxFree(e) => { out.push(5); write_u32(out, e.0); }
-        SiteKey::ForInto(e) => { out.push(6); write_u32(out, e.0); }
-        SiteKey::ForNext(e) => { out.push(7); write_u32(out, e.0); }
-        SiteKey::TryBranch(e) => { out.push(8); write_u32(out, e.0); }
-        SiteKey::TryFrom(e) => { out.push(9); write_u32(out, e.0); }
-        SiteKey::AwaitInto(e) => { out.push(10); write_u32(out, e.0); }
-        SiteKey::AwaitPoll(e) => { out.push(11); write_u32(out, e.0); }
-        SiteKey::CoercionReify(e) => { out.push(12); write_u32(out, e.0); }
-        SiteKey::CoercionDeref(e, i) => { out.push(13); write_u32(out, e.0); write_u16(out, i); }
+        SiteKey::ExprRes(e) => {
+            out.push(0);
+            write_u32(out, e.0);
+        }
+        SiteKey::PatRes(p) => {
+            out.push(1);
+            write_u32(out, p.0);
+        }
+        SiteKey::Deref(e, i) => {
+            out.push(2);
+            write_u32(out, e.0);
+            write_u32(out, i);
+        }
+        SiteKey::Operator(e) => {
+            out.push(3);
+            write_u32(out, e.0);
+        }
+        SiteKey::TryBlock(e) => {
+            out.push(4);
+            write_u32(out, e.0);
+        }
+        SiteKey::BoxFree(e) => {
+            out.push(5);
+            write_u32(out, e.0);
+        }
+        SiteKey::ForInto(e) => {
+            out.push(6);
+            write_u32(out, e.0);
+        }
+        SiteKey::ForNext(e) => {
+            out.push(7);
+            write_u32(out, e.0);
+        }
+        SiteKey::TryBranch(e) => {
+            out.push(8);
+            write_u32(out, e.0);
+        }
+        SiteKey::TryFrom(e) => {
+            out.push(9);
+            write_u32(out, e.0);
+        }
+        SiteKey::AwaitInto(e) => {
+            out.push(10);
+            write_u32(out, e.0);
+        }
+        SiteKey::AwaitPoll(e) => {
+            out.push(11);
+            write_u32(out, e.0);
+        }
+        SiteKey::CoercionReify(e) => {
+            out.push(12);
+            write_u32(out, e.0);
+        }
+        SiteKey::CoercionDeref(e, i) => {
+            out.push(13);
+            write_u32(out, e.0);
+            write_u16(out, i);
+        }
     }
 }
 
