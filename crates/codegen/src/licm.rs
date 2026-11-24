@@ -533,3 +533,78 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     }
     dirty
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::FunctionBuilder;
+    use crate::ir::{AbiParam, CallConv, Signature};
+
+    fn cold_call_latch_loop() -> (Function, Block, Block) {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params = vec![AbiParam::new(Type::I64), AbiParam::new(Type::I64)];
+        sig.returns = vec![AbiParam::new(Type::I64)];
+        let mut callee_sig = Signature::new(CallConv::Internal);
+        callee_sig.params = vec![AbiParam::new(Type::I64), AbiParam::new(Type::I64)];
+        callee_sig.returns = vec![AbiParam::new(Type::I64)];
+        let mut func = Function::new(sig);
+        let mut b = FunctionBuilder::new(&mut func);
+        let pre = b.create_block();
+        let head = b.create_block();
+        let latch = b.create_block();
+        let exit = b.create_block();
+        b.append_block_params_for_function_params(pre);
+        let base = b.block_params(pre)[0];
+        let init_n = b.block_params(pre)[1];
+        let p = b.append_block_param(head, Type::I64);
+        let sig_ref = b.import_signature(callee_sig);
+
+        b.switch_to_block(pre);
+        let a1 = b.ins().iadd_imm(base, 8);
+        let a2 = b.ins().iadd_imm(base, 16);
+        b.ins().jump(head, &[init_n]);
+
+        b.switch_to_block(head);
+        b.ins().brif(p, latch, &[], exit, &[]);
+
+        b.switch_to_block(latch);
+        let callee = b.ins().symbol(0);
+        let call = b.ins().call_indirect(sig_ref, callee, &[a1, a2]);
+        let next = b.inst_results(call)[0];
+        b.ins().jump(head, &[next]);
+
+        b.switch_to_block(exit);
+        let out = b.ins().iadd_imm(p, 1);
+        b.ins().return_(&[out]);
+
+        func.entry = Some(pre);
+        (func, pre, latch)
+    }
+
+    #[test]
+    fn thread_and_licm_converge_without_latch_ping_pong() {
+        let (mut func, pre, latch) = cold_call_latch_loop();
+        let mut rounds = 0;
+        for _ in 0..8 {
+            let d1 = crate::thread::run(&mut func);
+            let d2 = run(&mut func);
+            if d1.is_empty() && d2.is_empty() {
+                break;
+            }
+            rounds += 1;
+        }
+        assert!(
+            rounds <= 2,
+            "thread <-> licm ping-ponged for {rounds} rounds"
+        );
+        let count_iadd = |blk: Block| {
+            func.blocks[blk.index()]
+                .insts
+                .iter()
+                .filter(|&&i| matches!(func.insts[i.index()].op, Op::Binary(Binary::Iadd, ..)))
+                .count()
+        };
+        assert_eq!(count_iadd(pre), 0);
+        assert_eq!(count_iadd(latch), 2);
+    }
+}

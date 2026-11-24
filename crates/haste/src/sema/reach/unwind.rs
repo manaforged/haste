@@ -226,3 +226,13 @@ pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec
     }
     may_unwind
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_cell_host_symbol_may_unwind() {
+        assert!(host_symbol_may_unwind(&HostSymbol::ThreadCell));
+    }
+}

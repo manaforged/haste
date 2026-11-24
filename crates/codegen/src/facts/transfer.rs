@@ -310,7 +310,7 @@ fn binary_bounds(
         }
         Binary::Urem => {
             let (dlo, dhi) = bounds(y);
-            (dlo == dhi && dlo > 0).then_some((0, dlo - 1))
+            (dlo == dhi && dlo > 0).then(|| (0, dlo - 1))
         }
         Binary::Imul => {
             let (a, b) = (bounds(x), bounds(y));
@@ -358,5 +358,5 @@ fn added_bounds(ty: Type, a: (u64, u64), b: (u64, u64)) -> Option<(u64, u64)> {
 fn wrapped_bounds(ty: Type, a: (u64, u64), k: (u64, u64)) -> Option<(u64, u64)> {
     let val = (k.0 == k.1 && k.0 > 0).then_some(k.0)?;
     let back = (ty.unsigned_max() - val) + 1;
-    (a.0 >= back).then_some((a.0 - back, a.1 - back))
+    (a.0 >= back).then(|| (a.0 - back, a.1 - back))
 }

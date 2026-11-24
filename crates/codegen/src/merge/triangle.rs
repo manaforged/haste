@@ -72,7 +72,7 @@ fn range_bounds(
             (key < u_max).then_some((key + 1, u_max))
         }
         IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => Some((0, key)),
-        IntCC::SignedLessThan | IntCC::UnsignedLessThan => (key > 0).then_some((0, key - 1)),
+        IntCC::SignedLessThan | IntCC::UnsignedLessThan => (key > 0).then(|| (0, key - 1)),
         _ => None,
     }
 }

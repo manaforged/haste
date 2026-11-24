@@ -583,3 +583,73 @@ fn unwind_flag_live_at_call(
     })
     .0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::FunctionBuilder;
+    use crate::ir::{AbiParam, CallConv, Signature, Type};
+
+    enum InitArg {
+        Zero,
+        Symbol(u32),
+    }
+
+    fn thread_cell_fn(init_arg: InitArg) -> Function {
+        let mut func = Function::new(Signature::new(CallConv::Internal));
+        let mut tc_sig = Signature::new(CallConv::Internal);
+        tc_sig.params = vec![
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::I64),
+        ];
+        tc_sig.returns = vec![AbiParam::new(Type::I64)];
+        let mut b = FunctionBuilder::new(&mut func);
+        let entry = b.create_block();
+        b.switch_to_block(entry);
+        let local = b.create_stack_slot(8, 3);
+        let flag = b.create_stack_slot(1, 0);
+        let sig_ref = b.import_signature(tc_sig);
+        let one = b.ins().iconst(Type::I8, 1);
+        let zero = b.ins().iconst(Type::I8, 0);
+        b.ins().stack_store(one, flag, 0);
+        let tc = b.ins().symbol(10);
+        b.func.mark_thread_cell(tc);
+        let slot = b.ins().iconst(Type::I64, 0);
+        let size = b.ins().iconst(Type::I64, 16);
+        let init = match init_arg {
+            InitArg::Zero => b.ins().iconst(Type::I64, 0),
+            InitArg::Symbol(sym) => b.ins().symbol(sym),
+        };
+        let _ = b.ins().call_indirect(sig_ref, tc, &[slot, size, init]);
+        b.ins().stack_store(zero, flag, 0);
+        b.ins().return_(&[]);
+        func.add_unwind_drop(UnwindDrop {
+            local,
+            local_off: 0,
+            flag,
+            drop_sym: 99,
+            indirect: false,
+        });
+        func.entry = Some(entry);
+        func
+    }
+
+    #[test]
+    fn thread_cell_panicking_init_preserves_unwind_drop() {
+        let mut func = thread_cell_fn(InitArg::Symbol(1));
+        func.elide_dead_unwind_drops(|sym| sym == 1);
+        assert_eq!(func.unwind_drops().len(), 1);
+    }
+
+    #[test]
+    fn thread_cell_zero_or_nounwind_init_elides_drop() {
+        let mut zero_fn = thread_cell_fn(InitArg::Zero);
+        zero_fn.elide_dead_unwind_drops(|_| true);
+        assert!(zero_fn.unwind_drops().is_empty());
+
+        let mut nounwind_fn = thread_cell_fn(InitArg::Symbol(2));
+        nounwind_fn.elide_dead_unwind_drops(|sym| sym != 2);
+        assert!(nounwind_fn.unwind_drops().is_empty());
+    }
+}

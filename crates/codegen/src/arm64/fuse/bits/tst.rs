@@ -39,7 +39,7 @@ fn peel_bit_op(
         }
         Op::Binary(Binary::Ishl, inner, amt) => {
             let k = (const_of(func, plan, amt, def)? as u32) & (bits - 1);
-            (u32::from(bit) >= k).then_some((inner, bit - k as u8))
+            (u32::from(bit) >= k).then(|| (inner, bit - k as u8))
         }
         Op::Convert(Convert::Uextend, inner) => {
             (u32::from(bit) < func.ty(inner).bits()).then_some((inner, bit))
