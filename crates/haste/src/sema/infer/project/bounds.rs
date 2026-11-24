@@ -371,7 +371,9 @@ impl Infer<'_, '_> {
                 for (ty, bound) in infer.typed_predicates(&sig.body, src, &sig.predicates) {
                     if infer
                         .bound_trait_at(&sig.body, bound, home)
-                        .is_some_and(|(of, _)| infer.compiler_trait(of))
+                        .is_some_and(|(of, _)| {
+                            infer.compiler_trait(of) && !infer.is_thread_auto_trait(of)
+                        })
                     {
                         continue;
                     }
@@ -430,7 +432,8 @@ impl Infer<'_, '_> {
                 {
                     let Some((of, path)) =
                         infer.bound_trait_at(arena, bound, home).filter(|&(of, _)| {
-                            !infer.compiler_trait(of) && !infer.is_callable_trait(of)
+                            (!infer.compiler_trait(of) || infer.is_thread_auto_trait(of))
+                                && !infer.is_callable_trait(of)
                         })
                     else {
                         continue;
@@ -455,7 +458,9 @@ impl Infer<'_, '_> {
             return self.bind_callable(arena, (of, path), ty);
         }
         let args = self.bound_args(of, arena, path, ty)?;
-        if !self.compiler_trait(of) && self.obligation_open(ty, &args) {
+        if (!self.compiler_trait(of) && self.obligation_open(ty, &args))
+            || self.is_thread_auto_trait(of)
+        {
             self.note_obligation_site(of, ty);
             self.obligations.push((
                 of,

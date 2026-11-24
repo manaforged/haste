@@ -114,6 +114,8 @@ struct Checker<'c, 'a> {
     names: Vec<Option<String>>,
     no_move_captures: Vec<(u32, Vec<PlaceStep>)>,
     returns_borrow: bool,
+    returns_only_static: bool,
+    param_is_static: Vec<bool>,
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
@@ -245,6 +247,13 @@ pub(super) fn check(
             }
         }
     }
+    let returns_only_static = !sig.is_async
+        && sig.ret.is_some_and(|ret_ast| {
+            let mut ret_lts = calls::Lifetimes::default();
+            calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
+            checks::closure::sig_returns_only_static(sig, src, ret_ast, &ret_lts)
+        });
+    let param_is_static = calls::compute_param_is_static(cx, item, sig, src, typed, n);
     let mut checker = Checker {
         cx,
         item,
@@ -258,6 +267,8 @@ pub(super) fn check(
         names,
         no_move_captures: Vec::new(),
         returns_borrow: false,
+        returns_only_static,
+        param_is_static,
         return_min_depth: 1,
         closure_depth: 0,
         const_depth: 0,
@@ -438,6 +449,15 @@ impl Checker<'_, '_> {
         }
     }
 
+    pub(super) fn is_non_static_param(&self, local: u32) -> bool {
+        self.is_param.get(local as usize).copied().unwrap_or(false)
+            && !self
+                .param_is_static
+                .get(local as usize)
+                .copied()
+                .unwrap_or(false)
+    }
+
     fn is_escaping_return(&self, src: &BorrowSource) -> bool {
         if checks::is_temp_target(src.target).is_some() {
             return !self.is_const_or_static_item();
@@ -536,6 +556,10 @@ impl Checker<'_, '_> {
     }
 
     fn check_return_escape(&mut self, expr: ExprId, state: &State) -> Result<()> {
+        if let Some(cached) = self.temp_sources.get(&expr).cloned() {
+            let site = self.return_diag_site(expr);
+            self.check_return_sources(site, &cached)?;
+        }
         match *self.body.expr(expr) {
             Expr::Block {
                 kind: BlockKind::Const,
@@ -559,20 +583,49 @@ impl Checker<'_, '_> {
                 Ok(())
             }
             _ => {
-                for src in self.expr_borrow_sources(expr, state) {
-                    if self.is_escaping_return(&src) {
-                        return Err(self.borrow_err(
-                            Some(expr),
-                            format!(
-                                "cannot return value referencing local variable `{}`",
-                                self.local_name(src.target)
-                            ),
-                        ));
-                    }
-                }
-                Ok(())
+                let sources = self.expr_borrow_sources(expr, state);
+                self.check_return_sources(expr, &sources)
             }
         }
+    }
+
+    fn return_diag_site(&self, mut expr: ExprId) -> ExprId {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner)
+                | Expr::Block {
+                    tail: Some(inner), ..
+                } => expr = inner,
+                _ => return expr,
+            }
+        }
+    }
+
+    fn check_return_sources(&self, expr: ExprId, sources: &[BorrowSource]) -> Result<()> {
+        for src in sources {
+            if self.is_escaping_return(src) {
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "cannot return value referencing local variable `{}`",
+                        self.local_name(src.target)
+                    ),
+                ));
+            }
+            if self.closure_depth == 0
+                && self.returns_only_static
+                && self.is_non_static_param(src.target)
+            {
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "borrowed data `{}` escapes outside of function: return type requires `'static` lifetime",
+                        self.local_name(src.target)
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_block_escape(

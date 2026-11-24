@@ -270,7 +270,7 @@ impl Checker<'_, '_> {
         out
     }
 
-    fn check_static_arg(&mut self, expr: ExprId, state: &State) -> Result<()> {
+    pub(in super::super) fn check_static_arg(&mut self, expr: ExprId, state: &State) -> Result<()> {
         let in_const = self.is_const_or_static_item();
         for s in self.expr_borrow_sources(expr, state) {
             if is_temp_target(s.target).is_some() {
@@ -279,7 +279,7 @@ impl Checker<'_, '_> {
                 }
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));
             }
-            if !self.from_caller(s.target, s.through_ref) {
+            if !self.from_caller(s.target, s.through_ref) || self.is_non_static_param(s.target) {
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));
             }
         }

@@ -17,7 +17,8 @@ use super::propagate::BorrowSource;
 use super::{Checker, State, prune_moved_loans};
 
 pub(super) use lifetimes::{
-    Lifetimes, collect_ty_lifetimes, receiver_has_any_named, ty_shares_name,
+    Lifetimes, collect_ty_lifetimes, compute_param_is_static, receiver_has_any_named,
+    ty_shares_name,
 };
 
 impl Checker<'_, '_> {

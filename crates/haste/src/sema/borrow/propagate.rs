@@ -227,6 +227,19 @@ impl Checker<'_, '_> {
         }
         let base_ty = self.expr_ty(base);
         let sources = self.expr_borrow_sources_inner(base, state, false, None);
+        if !sources.is_empty()
+            && sources
+                .iter()
+                .all(|s| self.from_caller(s.target, s.through_ref))
+            && self.is_static_field_read(expr, base)
+        {
+            return Vec::new();
+        }
+        if self.returns_only_static
+            && self.is_deref_of_static_container(expr, unwrapped_base, base_ty, &sources)
+        {
+            return Vec::new();
+        }
         if matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _))
             && sources.is_empty()
             && let Some(local) = self.expr_plain_local(unwrapped_base)
@@ -297,8 +310,95 @@ impl Checker<'_, '_> {
             .collect()
     }
 
+    fn is_static_field_read(&mut self, expr: ExprId, base: ExprId) -> bool {
+        if self.typed.derefs.contains_key(&(expr, 0)) {
+            return false;
+        }
+        let field_idx = match *self.body.expr(expr) {
+            Expr::Field(..) => match self.typed.fields.get(&expr).copied() {
+                Some(idx) => idx as usize,
+                None => return false,
+            },
+            Expr::TupleField(_, idx) => idx as usize,
+            _ => return false,
+        };
+        if self.is_mut_ref_ty(self.expr_ty(expr)) {
+            return false;
+        }
+        let mut base_ty = self.expr_ty(base);
+        while let Kind::Ref(_, inner) = *self.cx.types.kind(base_ty) {
+            base_ty = inner;
+        }
+        let Kind::Adt(adt_item, _) = *self.cx.types.kind(base_ty) else {
+            return false;
+        };
+        let Ok(def) = self.cx.adt_def(adt_item) else {
+            return false;
+        };
+        let Some(field) = def.variants.first().and_then(|v| v.fields.get(field_idx)) else {
+            return false;
+        };
+        let adt_src = &self.cx.file(adt_item).source;
+        matches!(
+            *def.body.ty(field.ty),
+            AstTy::Ref {
+                mutable: false,
+                lifetime: Some(lt),
+                ..
+            } if adt_src.text(lt) == "'static"
+        )
+    }
+
+    fn is_deref_of_static_container(
+        &mut self,
+        expr: ExprId,
+        unwrapped_base: ExprId,
+        base_ty: Ty,
+        sources: &[BorrowSource],
+    ) -> bool {
+        if !matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _))
+            || !matches!(
+                *self.body.expr(unwrapped_base),
+                Expr::Call(..) | Expr::Method { .. }
+            )
+            || sources.is_empty()
+        {
+            return false;
+        }
+        let Kind::Ref(crate::sema::ty::Mut::Not, res_pointee) =
+            *self.cx.types.kind(self.expr_ty(expr))
+        else {
+            return false;
+        };
+        if !matches!(
+            self.cx.types.kind(base_ty),
+            Kind::Ref(_, inner) if matches!(self.cx.types.kind(*inner), Kind::Ref(crate::sema::ty::Mut::Not, _))
+        ) {
+            return false;
+        }
+        sources.iter().all(|s| {
+            let local_ty = self.local_ty(s.target);
+            let Kind::Ref(_, pointee) = *self.cx.types.kind(local_ty) else {
+                return false;
+            };
+            if pointee == res_pointee {
+                return false;
+            }
+            let Kind::Adt(adt_item, args) = *self.cx.types.kind(pointee) else {
+                return false;
+            };
+            self.cx.types.substs(args).is_empty()
+                && self.cx.adt_def(adt_item).is_ok_and(|def| {
+                    !def.generics
+                        .params
+                        .iter()
+                        .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime)
+                })
+        })
+    }
+
     fn path_borrow_sources(
-        &self,
+        &mut self,
         expr: ExprId,
         state: &State,
         allow_mut_ref_reborrow: bool,
@@ -314,7 +414,7 @@ impl Checker<'_, '_> {
                     Some(crate::sema::infer::Coercion::Deref(..))
                 ))
         {
-            return state
+            let mut joined: Vec<BorrowSource> = state
                 .loans
                 .iter()
                 .filter(|l| l.holder == Some(*local))
@@ -326,6 +426,24 @@ impl Checker<'_, '_> {
                         .map(BorrowSource::from_loan)
                 })
                 .collect();
+            if joined.is_empty() && self.returns_only_static {
+                if self.is_non_static_param(*local) {
+                    joined.push(BorrowSource {
+                        target: *local,
+                        steps: vec![PlaceStep::Deref],
+                        mutable: self.is_mut_ref_ty(inner),
+                        through_ref: true,
+                        env_only: false,
+                    });
+                } else {
+                    for outer in state.loans.iter().filter(|l| l.holder == Some(*local)) {
+                        if self.is_non_static_param(outer.target) {
+                            joined.push(BorrowSource::from_loan(outer));
+                        }
+                    }
+                }
+            }
+            return joined;
         }
         let mut out: Vec<BorrowSource> = state
             .loans
@@ -343,6 +461,22 @@ impl Checker<'_, '_> {
                 target: *local,
                 steps: vec![PlaceStep::Deref],
                 mutable: true,
+                through_ref: true,
+                env_only: false,
+            });
+        } else if self.returns_only_static
+            && self.is_non_static_param(*local)
+            && self.ty_holds_borrow(self.local_ty(*local))
+            && !out.iter().any(|s| s.target == *local)
+        {
+            out.push(BorrowSource {
+                target: *local,
+                steps: if self.is_ref_ty(self.local_ty(*local)) {
+                    vec![PlaceStep::Deref]
+                } else {
+                    Vec::new()
+                },
+                mutable: self.is_mut_ref_ty(self.local_ty(*local)),
                 through_ref: true,
                 env_only: false,
             });

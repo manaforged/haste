@@ -231,10 +231,11 @@ impl<'a> Infer<'_, 'a> {
             absolute,
             dollar,
         };
+        let first_tok = Self::path_first_tok(arena, path);
         let def = if values {
             self.value_item(arena, path).ok()
         } else {
-            self.type_def(&name_path)
+            self.type_def_checked(&name_path, first_tok)?
         };
         let count = segments.len();
         match def {
@@ -285,11 +286,16 @@ impl<'a> Infer<'_, 'a> {
             return Ok(None);
         };
         let (_, absolute, dollar) = self.segments(arena, path);
-        let Some(Def::Item(alias)) = self.type_def(&NamePath {
-            segments: prefix,
-            absolute,
-            dollar,
-        }) else {
+        let first_tok = Self::path_first_tok(arena, path);
+        let Some(Def::Item(alias)) = self.type_def_checked(
+            &NamePath {
+                segments: prefix,
+                absolute,
+                dollar,
+            },
+            first_tok,
+        )?
+        else {
             return Ok(None);
         };
         if self.cx.item(alias).1.kind != ItemKind::Type {
@@ -350,7 +356,15 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type of a path that names the constructor `ctor`: the value of a unit variant, or the function item of a tuple variant.
     pub fn ctor_value(&mut self, (item, variant, args): Ctor) -> Result<(Ty, Res)> {
-        let shape = self.cx.adt_def(item)?.variants[variant as usize].shape;
+        let def = self.cx.adt_def(item)?;
+        let var = &def.variants[variant as usize];
+        let shape = var.shape;
+        let field_count = var.fields.len();
+        if self.cx.item(item).1.kind == ItemKind::Struct && shape == Shape::Tuple {
+            for idx in 0..field_count as u32 {
+                self.check_field_visible(item, idx, self.current_expr, None, &idx.to_string())?;
+            }
+        }
         let ty = match shape {
             Shape::Unit => self.cx.types.intern(Kind::Adt(item, args)),
             Shape::Tuple => ctor_fn(self.cx, (item, variant, args)),
@@ -382,6 +396,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let slice = self.cx.types.substs(args).to_vec();
         let tys = self.adt_fields(item, &slice)?[variant as usize].clone();
+        let mut seen_fields = vec![false; tys.len()];
         for &init in body.list(fields) {
             let field = body.fields[init as usize];
             let name = plain(self.src.text(field.name));
@@ -393,11 +408,27 @@ impl<'a> Infer<'_, 'a> {
                     "unknown field",
                 ));
             };
+            self.check_field_visible(item, index, Some(expr), Some(field.name), name)?;
+            seen_fields[index as usize] = true;
             let ty = tys[index as usize];
             self.out.inits.insert(field.value, index);
             self.call_arg(Some((item, &slice[..])), field.value, (ty, None), &mut None)?;
         }
         if let Some(base) = base {
+            for (idx, &seen) in seen_fields.iter().enumerate() {
+                if !seen {
+                    let fname = self
+                        .cx
+                        .adt_def(item)?
+                        .variants
+                        .get(variant as usize)
+                        .and_then(|v| v.fields.get(idx))
+                        .and_then(|f| f.name)
+                        .map(|n| plain(self.cx.file(item).source.text(n)).to_owned())
+                        .unwrap_or_else(|| idx.to_string());
+                    self.check_field_visible(item, idx as u32, Some(expr), None, &fname)?;
+                }
+            }
             let found = self.expr(base, Some(adt))?;
             self.coerce(found, adt)?;
         }
@@ -533,6 +564,7 @@ impl<'a> Infer<'_, 'a> {
                 "unknown field",
             ));
         };
+        self.check_field_visible(item, index, Some(expr), None, name)?;
         self.out.fields.insert(expr, index);
         let slice = self.cx.types.substs(args).to_vec();
         let field = self.adt_fields(item, &slice)?[0][index as usize];

@@ -30,7 +30,7 @@ jobs:
         run: |
           cargo check --locked -p haste
           cargo test --locked -p haste-codegen -p haste --lib
-          cargo test --locked -p haste --test compiler_api
+          cargo test --locked -p haste --test compiler_api --test soundness
       - name: Build haste
         run: cargo build --locked --release -p haste --features diff-harness
       - name: Run differential and probe suites

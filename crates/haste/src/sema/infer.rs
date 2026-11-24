@@ -159,6 +159,9 @@ pub struct Infer<'c, 'a> {
     pub(super) poly: Option<Box<poly::PolyState>>,
     current_expr: Option<ExprId>,
     obligation_sites: HashMap<(ItemRef, Ty), ExprId>,
+    captures_settled: bool,
+    auto_stack: Vec<(ItemRef, Ty)>,
+    matches: Vec<(ExprId, Ty, crate::body::List)>,
 }
 
 impl Drop for Infer<'_, '_> {
@@ -372,6 +375,9 @@ impl<'c, 'a> Infer<'c, 'a> {
             poly: None,
             current_expr: None,
             obligation_sites: HashMap::default(),
+            captures_settled: false,
+            auto_stack: Vec::new(),
+            matches: Vec::new(),
         }
     }
 

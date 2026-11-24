@@ -282,7 +282,7 @@ impl<'a> Checker<'_, 'a> {
                 && matches!(flags.fn_name, "map" | "and_then")
                 && arg_ids
                     .first()
-                    .is_some_and(|&a| self.fn_arg_returns_static(ExprId(a))));
+                    .is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state)));
         if ignores_elem {
             for s in &mut recv_sources {
                 s.env_only = true;

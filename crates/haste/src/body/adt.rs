@@ -12,6 +12,7 @@ use super::{Body, ExprId, TyId};
 pub enum FieldVis {
     Public,
     Crate,
+    Super,
     Private,
 }
 
@@ -189,12 +190,19 @@ impl Cursor<'_> {
             return FieldVis::Public;
         }
         let close = self.src.pair(self.at);
-        let is_self = close == self.at + 2 && self.src.text(self.at + 1) == "self";
-        self.group();
-        if is_self {
-            FieldVis::Private
+        let word = if close == self.at + 2 {
+            Some(self.src.text(self.at + 1))
+        } else if close == self.at + 3 && self.src.text(self.at + 1) == "in" {
+            Some(self.src.text(self.at + 2))
         } else {
-            FieldVis::Crate
-        }
+            None
+        };
+        let vis = match word {
+            Some("self") => FieldVis::Private,
+            Some("super") => FieldVis::Super,
+            _ => FieldVis::Crate,
+        };
+        self.group();
+        vis
     }
 }

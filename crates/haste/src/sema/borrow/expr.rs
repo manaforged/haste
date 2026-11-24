@@ -540,8 +540,58 @@ impl Checker<'_, '_> {
             .map(|&f| self.body.fields[f as usize].value.0)
             .collect();
         self.check_arg_list(&val_ids, None, None, false, state, outer_live, depth)?;
+        self.check_static_struct_fields(expr, &val_ids, state)?;
         if let Some(b) = base {
             self.check_fru_base(expr, fields, b, state, outer_live, depth)?;
+        }
+        Ok(())
+    }
+
+    fn check_static_struct_fields(
+        &mut self,
+        expr: ExprId,
+        val_ids: &[u32],
+        state: &State,
+    ) -> Result<()> {
+        let (adt_item, variant) = match self.typed.res.get(&expr).copied() {
+            Some(Res::Ctor(item, v, _)) => (item, v as usize),
+            _ => return Ok(()),
+        };
+        let Ok(def) = self.cx.adt_def(adt_item) else {
+            return Ok(());
+        };
+        let Some(var) = def.variants.get(variant) else {
+            return Ok(());
+        };
+        let adt_src = &self.cx.file(adt_item).source;
+        let static_indices: Vec<u32> = var
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                matches!(
+                    *def.body.ty(f.ty),
+                    crate::body::Ty::Ref {
+                        lifetime: Some(lt),
+                        ..
+                    } if adt_src.text(lt) == "'static"
+                )
+            })
+            .map(|(i, _)| i as u32)
+            .collect();
+        if static_indices.is_empty() {
+            return Ok(());
+        }
+        for &val_id in val_ids {
+            let val = ExprId(val_id);
+            if self
+                .typed
+                .inits
+                .get(&val)
+                .is_some_and(|idx| static_indices.contains(idx))
+            {
+                self.check_static_arg(val, state)?;
+            }
         }
         Ok(())
     }

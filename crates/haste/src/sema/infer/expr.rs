@@ -187,14 +187,16 @@ impl Infer<'_, '_> {
             {
                 let slice = self.cx.types.substs(args).to_vec();
                 let fields = self.adt_fields(item, &slice)?;
-                fields[0].get(index as usize).copied().ok_or_else(|| {
+                let field_ty = fields[0].get(index as usize).copied().ok_or_else(|| {
                     self.diag_expr(
                         crate::diag::DiagnosticKind::Name,
                         Some(expr),
                         format!("no field {index} on {}", self.cx.name(item)),
                         "unknown field",
                     )
-                })
+                })?;
+                self.check_field_visible(item, index, Some(expr), None, &index.to_string())?;
+                Ok(field_ty)
             }
             _ => Err(self.diag_expr(
                 crate::diag::DiagnosticKind::Name,

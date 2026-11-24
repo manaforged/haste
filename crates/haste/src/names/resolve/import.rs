@@ -31,8 +31,9 @@ pub(crate) fn visible(paths: &Paths<'_>, vis: Vis, home: ModRef, importer: ModRe
     match vis {
         Vis::Pub => true,
         _ if home.krate != importer.krate => false,
-        Vis::Private => paths.within(importer, home),
-        _ => true,
+        Vis::Private | Vis::SelfMod => paths.within(importer, home),
+        Vis::Super => paths.within(importer, paths.parent(home).unwrap_or(home)),
+        Vis::Crate | Vis::In(_) => true,
     }
 }
 
