@@ -506,40 +506,46 @@ pub(super) fn elide_broadcast_inserts(
     }
 }
 
+fn shift_imm_ok(func: &Function, op: Binary, x: Value, y: Value) -> bool {
+    if x == y {
+        return false;
+    }
+    func.ty(y).vec_shape().is_some_and(|(lane, _)| {
+        matches!(lane, Lane::I16 | Lane::I32) || (lane == Lane::I64 && op != Binary::Sshr)
+    })
+}
+
 pub(super) fn elide_shift_splats(
     func: &Function,
     plan: &mut Plan<Reg>,
     defs: &[Option<Inst>],
-    (uses, use_of): (&[u32], &[Site]),
+    uses: &[u32],
 ) {
-    for (v, site) in use_of.iter().enumerate() {
-        if uses[v] != 1 || plan.elided[v] {
+    let mut shift_uses = vec![0_u32; func.types.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            if let Op::Binary(op @ (Binary::Ishl | Binary::Ushr | Binary::Sshr), x, y) =
+                func.insts[inst.index()].op
+                && shift_imm_ok(func, op, x, y)
+            {
+                shift_uses[y.index()] += 1;
+            }
+        }
+    }
+    for (v, &count) in shift_uses.iter().enumerate() {
+        if count == 0 || count != uses[v] || plan.elided[v] {
             continue;
         }
-        let Some((_, _, user)) = *site else {
+        let Some((_, lanes)) = func.types[v].vec_shape() else {
             continue;
         };
-        let Op::Binary(op @ (Binary::Ishl | Binary::Ushr | Binary::Sshr), x, y) =
-            func.insts[user.index()].op
-        else {
-            continue;
-        };
-        if y.index() != v || x.index() == v {
-            continue;
-        }
-        let Some((lane, count)) = func.ty(y).vec_shape() else {
-            continue;
-        };
-        if !(matches!(lane, Lane::I16 | Lane::I32) || (lane == Lane::I64 && op != Binary::Sshr)) {
-            continue;
-        }
         let Some(def) = defs[v] else {
             continue;
         };
         let Op::Shuffle(a, b, ShuffleMask::Const(m)) = func.insts[def.index()].op else {
             continue;
         };
-        let c = usize::from(count);
+        let c = usize::from(lanes);
         if !m[..c].iter().all(|&i| i == m[0] && usize::from(i) < c) {
             continue;
         }

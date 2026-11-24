@@ -383,6 +383,9 @@ fn simplify_ireduce(cx: &mut RewriteCx, res: Option<Value>, dst: Type, x: Value)
 
 fn simplify_convert(cx: &mut RewriteCx, res: Option<Value>, kind: Convert, x: Value) -> Option<Op> {
     let (dst, src) = (cx.func.ty(res?), cx.func.ty(x));
+    if kind == Convert::Ireduce && dst.is_vector() {
+        return vec::simplify_vec_ireduce(cx, dst, x);
+    }
     if !dst.is_small_int() || !src.is_small_int() {
         return None;
     }
@@ -508,7 +511,9 @@ fn simplify_inst(
         }
         Op::Store(value, addr, off) => arith::fold_disp(cx, addr, off, cx.func.ty(value).bytes())
             .map(|(base, disp)| Op::Store(value, base, disp)),
-        ref op @ (Op::Reduce(..) | Op::TargetOp(..)) => vec::simplify_movemask(cx, &op.clone()),
+        ref op @ (Op::Reduce(..) | Op::TargetOp(..)) => {
+            vec::simplify_movemask(cx, res, &op.clone())
+        }
         _ => None,
     }
 }

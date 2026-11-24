@@ -18,6 +18,8 @@ pub(super) fn vec_alu_opcode(op: Binary, lane: Lane) -> Option<u8> {
         (Binary::Isub, Lane::I16) => Some(0xF9),
         (Binary::Isub, Lane::I32) => Some(0xFA),
         (Binary::Isub, Lane::I64) => Some(0xFB),
+        (Binary::Umulhi, Lane::I16) => Some(0xE4),
+        (Binary::Smulhi, Lane::I16) => Some(0xE5),
         (Binary::Band, _) => Some(0xDB),
         (Binary::Bor, _) => Some(0xEB),
         (Binary::Bxor, _) => Some(0xEF),
@@ -58,6 +60,8 @@ pub(super) fn is_commutative(op: Binary) -> bool {
         op,
         Binary::Iadd
             | Binary::Imul
+            | Binary::Umulhi
+            | Binary::Smulhi
             | Binary::Band
             | Binary::Bor
             | Binary::Bxor

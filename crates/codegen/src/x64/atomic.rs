@@ -52,8 +52,9 @@ pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
             | Binary::AvgRound
             | Binary::UaddSat
             | Binary::UsubSat,
+            x,
             ..,
-        ) => RDX,
+        ) if !func.ty(*x).is_vector() => RDX,
         Op::Binary(Binary::SaddSat | Binary::SsubSat, ..) => RDX | R11,
         Op::Unary(Unary::Bitrev, _) => RDX,
         Op::Unary(Unary::Floor | Unary::Ceil | Unary::Trunc, x) if func.ty(*x).is_float() => RDX,
