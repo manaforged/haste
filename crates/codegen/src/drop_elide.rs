@@ -24,7 +24,14 @@ fn def_op<'a>(func: &'a Function, defs: &[Option<Inst>], val: Value) -> Option<&
     defs.get(val.index()).copied().flatten().map(|i| &func.insts[i.index()].op)
 }
 
-pub(super) fn classify_callee(func: &Function, defs: &[Option<Inst>], callee: Value, sym_may_unwind: &mut impl FnMut(u32) -> bool) -> CalleeKind {
+pub(super) fn classify_callee(func: &Function, defs: &[Option<Inst>], callee: Value, args: &[Value], sym_may_unwind: &mut impl FnMut(u32) -> bool) -> CalleeKind {
+    if func.is_thread_cell(callee) {
+        return match args.get(2).and_then(|&init| def_op(func, defs, init)) {
+            Some(&Op::Const(0)) => CalleeKind::NoUnwind,
+            Some(&(Op::Symbol(sym) | Op::SlotAddr(sym))) if !sym_may_unwind(sym) => CalleeKind::NoUnwind,
+            _ => CalleeKind::MayUnwind,
+        };
+    }
     let sym = match def_op(func, defs, callee) {
         Some(&(Op::Symbol(sym) | Op::SlotAddr(sym))) => Some(sym),
         Some(&Op::Load(addr, 0)) => match def_op(func, defs, addr) {
@@ -166,8 +173,8 @@ impl Function {
             for &inst in &block.insts {
                 let op = &self.insts[inst.index()].op;
                 match op {
-                    Op::Call { callee, .. } => {
-                        let kind = classify_callee(self, &defs, *callee, &mut sym_may_unwind);
+                    Op::Call { callee, args, .. } => {
+                        let kind = classify_callee(self, &defs, *callee, args, &mut sym_may_unwind);
                         kinds[inst.index()] = kind;
                         any_unwind_call |= kind == CalleeKind::MayUnwind;
                     }
@@ -232,8 +239,8 @@ impl Function {
             }
             for block in &self.blocks {
                 for &inst in &block.insts {
-                    if let Op::Call { callee, .. } = self.insts[inst.index()].op {
-                        kinds[inst.index()] = classify_callee(self, &defs, callee, &mut sym_may_unwind);
+                    if let Op::Call { callee, ref args, .. } = self.insts[inst.index()].op {
+                        kinds[inst.index()] = classify_callee(self, &defs, callee, args, &mut sym_may_unwind);
                     }
                 }
             }

@@ -364,12 +364,7 @@ fn diamond_safe(func: &Function, cfg: &Cfg, (block, target): (Block, Block), (op
 }
 
 fn cheap_call_addr(func: &Function, defs: &[Option<Inst>], op: &Op) -> bool {
-    let is_const = |v: Value| defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_)));
-    match *op {
-        Op::StackAddr(..) => true,
-        Op::Binary(crate::ir::Binary::Iadd | crate::ir::Binary::Isub, a, b) => is_const(a) || is_const(b),
-        _ => false,
-    }
+    crate::licm::cheap_call_addr(op, |v| defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_))))
 }
 
 struct SinkInfo<'a> {

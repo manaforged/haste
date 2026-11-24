@@ -7,6 +7,7 @@ use crate::mem::{LoopMem, MemLoc, MemRoot, PromoteBase, PromoteCand, Provenance,
 use crate::merge::{find, identity, rename};
 
 mod reassoc;
+mod unswitch;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SymVal {
@@ -470,6 +471,22 @@ pub(crate) fn always_executes_in_loop(cfg: &Cfg, each: &Loop, blk: Block) -> boo
     each.latches.iter().all(|&latch| cfg::dominates(&cfg.idom, blk, latch))
 }
 
+pub(crate) fn cheap_call_addr(op: &Op, is_const: impl Fn(Value) -> bool) -> bool {
+    match *op {
+        Op::StackAddr(..) => true,
+        Op::Binary(crate::ir::Binary::Iadd | crate::ir::Binary::Isub, a, b) => is_const(a) || is_const(b),
+        _ => false,
+    }
+}
+
+fn dominates_all_exits(func: &Function, cfg: &Cfg, each: &Loop, blk: Block) -> bool {
+    (0..each.body.len()).all(|bi| {
+        !each.body[bi]
+            || !func.successors(Block(bi as u32)).any(|s| !is_in_loop(each, s))
+            || cfg::dominates(&cfg.idom, blk, Block(bi as u32))
+    })
+}
+
 fn loop_live_counts(func: &Function, each: &Loop, is_const: &[bool], home: &[Option<Block>]) -> (usize, usize, Vec<u32>) {
     let mut seen = vec![false; func.types.len()];
     let mut uses = vec![0_u32; func.types.len()];
@@ -534,11 +551,14 @@ fn hoist(
         }
         let head = block == each.head.index();
         let always_exec = always_executes_in_loop(cfg, each, blk);
-        let cold_call_blk = !always_exec && func.blocks[block].insts.iter().any(|&i| match &func.insts[i.index()].op {
-            Op::Call { .. } => func.pure_thread_cell_result(&func.insts[i.index()].op, |v| inv.zeros.get(v.index()) == Some(&true)).is_none(),
-            Op::TryCall { .. } | Op::Trap => true,
-            _ => false,
-        });
+        let has_reg_call = crate::live::has_regular_call(func, blk);
+        let cold_call_blk = (!always_exec || !dominates_all_exits(func, cfg, each, blk))
+            && (has_reg_call
+                || func.blocks[block].insts.iter().any(|&i| match &func.insts[i.index()].op {
+                    Op::Call { .. } => func.pure_thread_cell_result(&func.insts[i.index()].op, |v| inv.zeros.get(v.index()) == Some(&true)).is_none(),
+                    Op::TryCall { .. } | Op::Trap => true,
+                    _ => false,
+                }));
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut kept = Vec::with_capacity(insts.len());
         let mut head_prefix = head;
@@ -560,11 +580,9 @@ fn hoist(
             let replaces_single_use = matches!(op, Op::Insert(prev, ..) if hoisted_vec.contains(prev) && uses.as_ref().is_some_and(|u| u[prev.index()] == 1));
             let vec_call_block = mem.calls && res_ty.is_some_and(Type::is_vector);
             let vec_ok = !is_vec_mat || (!vec_call_block && (replaces_single_use || vec_live + hoisted_vecs < MAX_LOOP_VEC_LIVE));
-            let cheap_cold_op = mem.calls && !always_exec && match *op {
-                Op::Const(_) | Op::Convert(crate::ir::Convert::Ireduce | crate::ir::Convert::Uextend | crate::ir::Convert::Sextend, _) => true,
-                Op::Binary(crate::ir::Binary::Iadd | crate::ir::Binary::Isub, a, b) => inv.is_const.get(a.index()) == Some(&true) || inv.is_const.get(b.index()) == Some(&true),
-                _ => false,
-            };
+            let is_const = |v: Value| inv.is_const.get(v.index()) == Some(&true);
+            let cheap_cold_op = (has_reg_call && cheap_call_addr(op, is_const))
+                || (mem.calls && !always_exec && (cheap_call_addr(op, is_const) || matches!(op, Op::Const(_) | Op::Convert(crate::ir::Convert::Ireduce | crate::ir::Convert::Uextend | crate::ir::Convert::Sextend, _))));
             let movable = tc_res.is_some()
                 || (op.is_speculable() && !cold_call_blk && !cheap_cold_op && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
                 || mem.can_hoist_load(func, prov, head_prefix, inst)
@@ -614,116 +632,6 @@ fn loops_touch_memory(func: &Function, loops: &Loops) -> bool {
     func.blocks.iter().zip(&loops.depths).filter(|(_, depth)| **depth > 0).flat_map(|(block, _)| &block.insts).any(|inst| {
         matches!(func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..) | Op::Move(..) | Op::Copy(..))
     })
-}
-
-struct ExitTest {
-    head: Block,
-    entry: Block,
-    test: Block,
-    cond: Value,
-    exit_on_true: bool,
-    exit: Block,
-    exit_args: Vec<Value>,
-}
-
-fn exit_arm(each: &Loop, op: &Op) -> Option<(Value, bool, Block, Vec<Value>)> {
-    let Op::Brif(cond, then, then_args, otherwise, otherwise_args) = op else { return None };
-    match (is_in_loop(each, *then), is_in_loop(each, *otherwise)) {
-        (false, true) => Some((*cond, true, *then, then_args.clone())),
-        (true, false) => Some((*cond, false, *otherwise, otherwise_args.clone())),
-        _ => None,
-    }
-}
-
-fn exits_only_to(func: &Function, each: &Loop, block: Block, exit: Block, args: &[Value]) -> bool {
-    let stays_or_matches = |target: &Block, target_args: &[Value]| is_in_loop(each, *target) || (*target == exit && target_args == args);
-    match func.last(block) {
-        Some(Op::Jump(target, target_args)) => stays_or_matches(target, target_args.as_slice()),
-        Some(Op::Brif(_, then, then_args, otherwise, otherwise_args)) => {
-            stays_or_matches(then, then_args.as_slice()) && stays_or_matches(otherwise, otherwise_args.as_slice())
-        }
-        _ => false,
-    }
-}
-
-fn effect_free(func: &Function, block: Block) -> bool {
-    func.blocks[block.index()].insts.split_last().is_some_and(|(_, body)| {
-        body.iter().all(|inst| {
-            let op = &func.insts[inst.index()].op;
-            op.is_speculable() || matches!(op, Op::Load(..) | Op::StackLoad(..))
-        })
-    })
-}
-
-fn region_escapes(func: &Function, head: Block, exit: Block, region: &[bool], defs: &[Option<Block>]) -> bool {
-    let from_region = |v: Value| defs.get(v.index()).copied().flatten().is_some_and(|b| region[b.index()]);
-    let mut seen = vec![false; func.blocks.len()];
-    seen[exit.index()] = true;
-    let mut todo = vec![exit];
-    while let Some(block) = todo.pop() {
-        for &inst in &func.blocks[block.index()].insts {
-            let mut hit = false;
-            func.insts[inst.index()].op.for_operands(|v| hit |= from_region(v));
-            if hit {
-                return true;
-            }
-        }
-        for next in func.successors(block) {
-            if next != head && !std::mem::replace(&mut seen[next.index()], true) {
-                todo.push(next);
-            }
-        }
-    }
-    false
-}
-
-fn find_exit_test(func: &Function, cfg: &Cfg, each: &Loop, defs: &[Option<Block>]) -> Option<ExitTest> {
-    let entry = cfg::existing_preheader(func, cfg, each)?;
-    let invariant = |v: Value| defs.get(v.index()).copied().flatten().is_none_or(|b| !is_in_loop(each, b));
-    cfg.rpo.iter().copied().filter(|&b| is_in_loop(each, b)).find_map(|test| {
-        let (cond, exit_on_true, exit, exit_args) = exit_arm(each, func.last(test)?)?;
-        if !invariant(cond) || !exit_args.iter().all(|&v| invariant(v)) || !always_executes_in_loop(cfg, each, test) {
-            return None;
-        }
-        let region: Vec<bool> = (0..func.blocks.len())
-            .map(|b| Block(b as u32))
-            .map(|b| is_in_loop(each, b) && (b == test || !cfg.dominates(test, b)))
-            .collect();
-        let acyclic = |b: Block| b == test || func.successors(b).all(|next| !(region[next.index()] && cfg.dominates(next, b)));
-        let clean = (0..region.len())
-            .map(|b| Block(b as u32))
-            .filter(|b| region[b.index()])
-            .all(|b| acyclic(b) && effect_free(func, b) && exits_only_to(func, each, b, exit, &exit_args));
-        (clean && !region_escapes(func, each.head, exit, &region, defs)).then(|| ExitTest { head: each.head, entry, test, cond, exit_on_true, exit, exit_args })
-    })
-}
-
-fn unswitch(func: &mut Function) -> bool {
-    let mut changed = false;
-    for _ in 0..64 {
-        let cfg = func.cfg();
-        let defs = func.def_blocks();
-        let Some(found) = cfg.loops().list.iter().find_map(|each| find_exit_test(&*func, &cfg, each, &defs)) else {
-            break;
-        };
-        let ExitTest { head, entry, test, cond, exit_on_true, exit, exit_args } = found;
-        let (Some(&jump), Some(&branch)) = (func.blocks[entry.index()].insts.last(), func.blocks[test.index()].insts.last()) else {
-            break;
-        };
-        let Op::Jump(_, head_args) = &func.insts[jump.index()].op else { break };
-        let head_args = head_args.clone();
-        let Op::Brif(_, then, then_args, otherwise, otherwise_args) = &func.insts[branch.index()].op else { break };
-        let (stay, stay_args) = if exit_on_true { (*otherwise, otherwise_args.clone()) } else { (*then, then_args.clone()) };
-        func.insts[jump.index()].op = if exit_on_true {
-            Op::Brif(cond, exit, exit_args, head, head_args)
-        } else {
-            Op::Brif(cond, head, head_args, exit, exit_args)
-        };
-        func.insts[branch.index()].op = Op::Jump(stay, stay_args);
-        func.bump_cfg();
-        changed = true;
-    }
-    changed
 }
 
 /// Moves loop-invariant work of every natural loop that one jump enters out to the block that enters it, then tests each invariant exit there once.
@@ -787,7 +695,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if !made.is_empty() || dirty.contains(Domain::CFG) {
         func.bump_cfg();
     }
-    if unswitch(func) {
+    if unswitch::unswitch(func) {
         dirty |= Domain::CFG | Domain::VALUES;
     }
     if cfg::drop_bare_preheaders(func, &made) {

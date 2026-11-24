@@ -12,7 +12,7 @@ use super::Reached;
 
 /// Whether calling host symbol `host` may initiate or propagate a panic unwind.
 pub(crate) fn host_symbol_may_unwind(host: &HostSymbol) -> bool {
-    matches!(host, HostSymbol::StartPanic | HostSymbol::CatchUnwind | HostSymbol::FillOnce | HostSymbol::Dynamic(_))
+    matches!(host, HostSymbol::StartPanic | HostSymbol::CatchUnwind | HostSymbol::FillOnce | HostSymbol::ThreadCell | HostSymbol::Dynamic(_))
 }
 
 fn foreign_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {

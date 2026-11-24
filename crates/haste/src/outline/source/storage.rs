@@ -11,7 +11,7 @@ use crate::substrate::sysroot::tokens::{TOKEN_WIRE_LEN, decode_token_at, decode_
 
 use super::Token;
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "keeps backing allocation alive for SourceText::ptr")]
 enum TextOwner {
     Owned(Box<str>),
     Mapped(Arc<Backing>),

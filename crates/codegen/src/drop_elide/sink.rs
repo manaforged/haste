@@ -508,8 +508,8 @@ pub(super) fn sink_entry_zeros(
     let kinds: Vec<CalleeKind> = func
         .insts
         .iter()
-        .map(|data| match data.op {
-            Op::Call { callee, .. } => classify_callee(func, &defs, callee, sym_may_unwind),
+        .map(|data| match &data.op {
+            Op::Call { callee, args, .. } => classify_callee(func, &defs, *callee, args, sym_may_unwind),
             _ => CalleeKind::MayUnwind,
         })
         .collect();
