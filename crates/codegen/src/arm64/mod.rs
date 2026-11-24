@@ -347,7 +347,12 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 None => asm.vstore(8, Mem::new(FP, disp), Vreg(a)),
             },
         );
-        if let Some(slot) = self.tlv_cache.as_ref().map(|c| c.slot) {
+        if let Some(slot) = self
+            .tlv_cache
+            .as_ref()
+            .filter(|c| c.needs_zero)
+            .map(|c| c.slot)
+        {
             let at = self.frame_mem(slot);
             self.asm.store(Size::X, at, ZR);
         }
@@ -364,12 +369,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.resume_spills(block);
         if let Some(cache) = &mut self.tlv_cache {
             cache.live = cache.dom_known[block.index()];
+            cache.may_live = cache.may_known[block.index()];
         }
         self.asm.bind(self.blocks[block.index()]);
     }
     fn bind_entry(&mut self, block: Block) {
         if let Some(cache) = &mut self.tlv_cache {
             cache.live = cache.dom_known[block.index()];
+            cache.may_live = cache.may_known[block.index()];
         }
         self.asm.bind(self.blocks[block.index()]);
     }

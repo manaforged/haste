@@ -3,6 +3,7 @@ use rustc_hash::FxHashMap;
 use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Stmt, UnOp};
 use crate::host::HostSymbol;
 use crate::names::ItemRef;
+use crate::outline::item::ItemKind;
 use crate::sema::Context;
 use crate::sema::infer::{LazyTables, Res, Shape, SiteKey, Typed};
 use crate::sema::intrinsic::Intrinsic;
@@ -22,11 +23,38 @@ pub(crate) fn host_symbol_may_unwind(host: &HostSymbol) -> bool {
     )
 }
 
+fn extern_abi_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
+    let Some(parent) = cx.parent_item(item) else {
+        return true;
+    };
+    let (src, entry) = cx.item(parent);
+    if entry.kind != ItemKind::ExternBlock {
+        return true;
+    }
+    let Some(open) = entry.body else {
+        return true;
+    };
+    for tok in entry.start..open {
+        let text = src.text(tok);
+        if text.starts_with('"') && (text.contains("-unwind") || text == "\"Rust\"") {
+            return true;
+        }
+    }
+    false
+}
+
 fn foreign_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
-    cx.symbol_name(item)
+    let Some(host) = cx
+        .symbol_name(item)
         .as_deref()
         .and_then(|name| HostSymbol::resolve_for(name, true))
-        .is_none_or(|host| host_symbol_may_unwind(&host))
+    else {
+        return true;
+    };
+    match host {
+        HostSymbol::Dynamic(_) => extern_abi_may_unwind(cx, item),
+        _ => host_symbol_may_unwind(&host),
+    }
 }
 
 fn intrinsic_may_unwind(intr: Intrinsic) -> bool {
