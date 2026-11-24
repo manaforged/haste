@@ -27,7 +27,11 @@ fn read_cstr(bytes: &[u8], off: usize) -> &str {
     std::str::from_utf8(&bytes[off..end]).expect("utf8 cstr")
 }
 
-fn minimal_executable(target: &Target, import: &str, with_debug_line: bool) -> Executable {
+fn minimal_executable_with_imports(
+    target: &Target,
+    imports: &[(&str, Option<&str>)],
+    with_debug_line: bool,
+) -> Executable {
     let mut exe = Executable::new(target);
     let (stub, call_off, kind) = match target.arch {
         Arch::X64 => (vec![0xE8, 0, 0, 0, 0, 0xC3], 1u32, RelocKind::PcRel32),
@@ -46,22 +50,85 @@ fn minimal_executable(target: &Target, import: &str, with_debug_line: bool) -> E
     } else {
         Vec::new()
     };
-    let user_main = exe.function(&stub, 16, &[], &lines);
+    let mut user_code = Vec::new();
+    let mut call_sites = Vec::with_capacity(imports.len());
+    for _ in imports {
+        let site = user_code.len() as u32 + call_off;
+        user_code.extend_from_slice(&stub);
+        call_sites.push(site);
+    }
+    if user_code.is_empty() {
+        user_code.extend_from_slice(&stub);
+    }
+    let user_main = exe.function(&user_code, 16, &[], &lines);
     let ro = exe.rodata(b"hello\0", 8);
     let data = exe.data(&[0u8; 8], 8);
     let _bss = exe.bss(16, 8);
     exe.entry(lang_start, user_main);
-    exe.patch(
-        user_main + call_off,
-        kind,
-        Symbol::Host(HostSymbol::Dynamic(import.into())),
-    );
+    for (site, &(name, lib)) in call_sites.into_iter().zip(imports) {
+        exe.patch(
+            user_main + site,
+            kind,
+            Symbol::Host(HostSymbol::Dynamic {
+                name: name.into(),
+                lib: lib.map(Into::into),
+            }),
+        );
+    }
     exe.pointer(false, data, Symbol::Rodata(ro));
     exe.symbols(vec![
         (lang_start, "lang_start".to_owned()),
         (user_main, "main".to_owned()),
     ]);
     exe
+}
+
+fn minimal_executable(target: &Target, import: &str, with_debug_line: bool) -> Executable {
+    minimal_executable_with_imports(target, &[(import, None)], with_debug_line)
+}
+
+fn parse_pe_idata(bytes: &[u8]) -> Vec<(String, Vec<String>)> {
+    let pe_off = read_u32_at(bytes, 0x3C) as usize;
+    let nsec = read_u16(bytes, pe_off + 6) as usize;
+    let opt_size = read_u16(bytes, pe_off + 20) as usize;
+    let opt_off = pe_off + 24;
+    let import_dir_rva = read_u32_at(bytes, opt_off + 112 + 8);
+    let sec_base = opt_off + opt_size;
+    let mut idata_sec = None;
+    for i in 0..nsec {
+        let s = sec_base + i * 40;
+        if read_cstr(bytes, s) == ".idata" {
+            let rva = read_u32_at(bytes, s + 12);
+            let raw_off = read_u32_at(bytes, s + 20) as usize;
+            idata_sec = Some((rva, raw_off));
+            break;
+        }
+    }
+    let (idata_rva, idata_off) = idata_sec.expect(".idata section");
+    let rva_to_off = |rva: u32| idata_off + (rva - idata_rva) as usize;
+    let mut desc = rva_to_off(import_dir_rva);
+    let mut dll_imports = Vec::new();
+    loop {
+        let ilt_rva = read_u32_at(bytes, desc);
+        let name_rva = read_u32_at(bytes, desc + 12);
+        if ilt_rva == 0 && name_rva == 0 {
+            break;
+        }
+        let dll = read_cstr(bytes, rva_to_off(name_rva)).to_owned();
+        let mut syms = Vec::new();
+        let mut thunk = rva_to_off(ilt_rva);
+        loop {
+            let entry_val = read_u64(bytes, thunk);
+            if entry_val == 0 {
+                break;
+            }
+            syms.push(read_cstr(bytes, rva_to_off(entry_val as u32) + 2).to_owned());
+            thunk += 8;
+        }
+        dll_imports.push((dll, syms));
+        desc += 20;
+    }
+    dll_imports
 }
 
 fn elf_sections(bytes: &[u8]) -> Vec<(String, u64, usize, usize)> {
@@ -270,9 +337,10 @@ fn pe_structure_relocs_sections_entry_and_idata_import_directory() {
             Arch::X64 => 0x8664u16,
             Arch::Arm64 => 0xAA64u16,
         };
-        let bytes = minimal_executable(target, "GetLastError", false)
-            .encode()
-            .expect("emit PE32+");
+        let bytes =
+            minimal_executable_with_imports(target, &[("GetLastError", Some("kernel32"))], false)
+                .encode()
+                .expect("emit PE32+");
         assert_eq!(&bytes[0..2], b"MZ");
         let pe_off = read_u32_at(&bytes, 0x3C) as usize;
         assert_eq!(&bytes[pe_off..pe_off + 4], b"PE\0\0");
@@ -284,7 +352,6 @@ fn pe_structure_relocs_sections_entry_and_idata_import_directory() {
         assert_eq!(read_u16(&bytes, opt_off), 0x020B);
         let entry_rva = read_u32_at(&bytes, opt_off + 16);
         let image_base = read_u64(&bytes, opt_off + 24);
-        let import_dir_rva = read_u32_at(&bytes, opt_off + 112 + 8);
 
         let sec_base = opt_off + opt_size;
         let mut sections = Vec::with_capacity(nsec);
@@ -311,39 +378,174 @@ fn pe_structure_relocs_sections_entry_and_idata_import_directory() {
             "{} .data pointer relocation must target .rdata VA",
             target.triple
         );
-        let idata_sec = sections
-            .iter()
-            .find(|(n, ..)| n == ".idata")
-            .expect(".idata");
-        let rva_to_off = |rva: u32| idata_sec.3 + (rva - idata_sec.1) as usize;
-
-        let mut desc = rva_to_off(import_dir_rva);
-        let mut dll_imports: Vec<(String, Vec<String>)> = Vec::new();
-        loop {
-            let ilt_rva = read_u32_at(&bytes, desc);
-            let name_rva = read_u32_at(&bytes, desc + 12);
-            if ilt_rva == 0 && name_rva == 0 {
-                break;
-            }
-            let dll = read_cstr(&bytes, rva_to_off(name_rva)).to_owned();
-            let mut syms = Vec::new();
-            let mut thunk = rva_to_off(ilt_rva);
-            loop {
-                let entry_val = read_u64(&bytes, thunk);
-                if entry_val == 0 {
-                    break;
-                }
-                syms.push(read_cstr(&bytes, rva_to_off(entry_val as u32) + 2).to_owned());
-                thunk += 8;
-            }
-            dll_imports.push((dll, syms));
-            desc += 20;
-        }
+        let dll_imports = parse_pe_idata(&bytes);
         let (_, k32_syms) = dll_imports
             .iter()
             .find(|(dll, _)| dll == "kernel32.dll")
             .expect("kernel32.dll descriptor");
         assert!(k32_syms.iter().any(|s| s == "ExitProcess"));
         assert!(k32_syms.iter().any(|s| s == "GetLastError"));
+    }
+}
+
+#[test]
+fn pe_idata_maps_explicit_link_libraries_without_guessing_case() {
+    let cases = [
+        ("MessageBoxW", Some("user32"), "user32.dll"),
+        ("wsprintfA", Some("USER32.dll"), "user32.dll"),
+        ("RegOpenKeyExW", Some("advapi32"), "advapi32.dll"),
+        ("advapi_lower", Some("advapi32.lib"), "advapi32.dll"),
+        ("BCryptGenRandom", Some("bcrypt"), "bcrypt.dll"),
+        ("bcrypt_lower", Some("bcrypt.dll"), "bcrypt.dll"),
+        ("GetLastError", Some("kernel32"), "kernel32.dll"),
+        ("kernel_lower", Some("kernel32.dll"), "kernel32.dll"),
+        ("printf", Some("ucrtbase"), "ucrtbase.dll"),
+        ("UppercaseUcrt", Some("ucrt"), "ucrtbase.dll"),
+        ("OpenPrinterW", Some("winspool.drv"), "winspool.drv"),
+    ];
+    let imports: Vec<(&str, Option<&str>)> = cases.iter().map(|&(n, lib, _)| (n, lib)).collect();
+    for target in TARGETS.iter().filter(|t| t.format == Format::Pe) {
+        let bytes = minimal_executable_with_imports(target, &imports, false)
+            .encode()
+            .expect("emit PE32+");
+        let dll_imports = parse_pe_idata(&bytes);
+        for &(sym, _, expected_dll) in &cases {
+            let found = dll_imports
+                .iter()
+                .find(|(dll, _)| dll == expected_dll)
+                .unwrap_or_else(|| panic!("{} missing descriptor {expected_dll}", target.triple));
+            assert!(
+                found.1.iter().any(|s| s == sym),
+                "{} expected {sym} in {expected_dll}, got {:?}",
+                target.triple,
+                dll_imports
+            );
+            for (other_dll, other_syms) in &dll_imports {
+                if other_dll != expected_dll {
+                    assert!(
+                        !other_syms.iter().any(|s| s == sym),
+                        "{} mapped {sym} to wrong DLL {other_dll}",
+                        target.triple
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pe_end_to_end_compiler_emit_routes_std_and_explicit_link_attributes() {
+    let base = std::env::current_exe()
+        .expect("current test exe")
+        .parent()
+        .expect("test exe parent")
+        .to_path_buf();
+    let dir = base.join(format!("haste-pe-link-e2e-{}", std::process::id()));
+    drop(std::fs::remove_dir_all(&dir));
+    std::fs::create_dir_all(dir.join("src")).expect("create fixture src");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"pe_link_e2e\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        dir.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"pe_link_e2e\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.lock");
+    std::fs::write(
+        dir.join("src/main.rs"),
+        r#"
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW(hwnd: usize, text: *const u16, cap: *const u16, kind: u32) -> i32;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegCloseKey(key: usize) -> i32;
+}
+
+#[cfg_attr(target_os = "windows", link(name = "bcrypt", kind = "raw-dylib"))]
+extern "system" {
+    fn BCryptGenRandom(alg: usize, buf: *mut u8, len: u32, flags: u32) -> i32;
+}
+
+#[link(name = "kernel32", cfg(windows))]
+extern "system" {
+    fn lowercase_k32_sym() -> u32;
+}
+
+#[link(name = "ucrtbase")]
+extern "C" {
+    fn UppercaseUcrtSym() -> i32;
+}
+
+fn main() {
+    println!("hello windows");
+    let _ = std::net::TcpStream::connect("127.0.0.1:0");
+    let ptrs = [
+        MessageBoxW as usize,
+        RegCloseKey as usize,
+        BCryptGenRandom as usize,
+        lowercase_k32_sym as usize,
+        UppercaseUcrtSym as usize,
+    ];
+    let mut acc = 0usize;
+    for p in ptrs {
+        acc ^= p;
+    }
+    std::hint::black_box(acc);
+}
+"#,
+    )
+    .expect("write main.rs");
+
+    let out_bin = dir.join("pe-link-e2e.exe");
+    let compiler = crate::Compiler::builder()
+        .target("x86_64-pc-windows-msvc")
+        .jobs(2)
+        .build()
+        .expect("build windows cross compiler");
+    let emit_res = compiler.emit(&dir, &out_bin);
+    let bytes = emit_res
+        .as_ref()
+        .ok()
+        .map(|_| std::fs::read(&out_bin).expect("read PE32+"));
+    drop(std::fs::remove_dir_all(&dir));
+    emit_res.expect("emit Windows PE32+");
+    let bytes = bytes.expect("PE32+ bytes");
+    let dll_imports = parse_pe_idata(&bytes);
+
+    let assert_exclusive = |expected_dll: &str, sym: &str| {
+        let (_, syms) = dll_imports
+            .iter()
+            .find(|(dll, _)| dll == expected_dll)
+            .unwrap_or_else(|| panic!("missing {expected_dll} in {dll_imports:?}"));
+        assert!(
+            syms.iter().any(|s| s == sym),
+            "missing {sym} under {expected_dll} in {dll_imports:?}"
+        );
+        for (other_dll, other_syms) in &dll_imports {
+            if other_dll != expected_dll {
+                assert!(
+                    !other_syms.iter().any(|s| s == sym),
+                    "symbol {sym} leaked into wrong DLL {other_dll}"
+                );
+            }
+        }
+    };
+
+    for (dll, sym) in [
+        ("user32.dll", "MessageBoxW"),
+        ("advapi32.dll", "RegCloseKey"),
+        ("bcrypt.dll", "BCryptGenRandom"),
+        ("kernel32.dll", "lowercase_k32_sym"),
+        ("kernel32.dll", "ExitProcess"),
+        ("ucrtbase.dll", "UppercaseUcrtSym"),
+        ("ntdll.dll", "NtWriteFile"),
+        ("ws2_32.dll", "WSAStartup"),
+    ] {
+        assert_exclusive(dll, sym);
     }
 }

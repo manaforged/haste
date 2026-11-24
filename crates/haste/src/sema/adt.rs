@@ -177,6 +177,20 @@ impl<'a> Context<'a> {
         )
     }
 
+    /// The external library declared by `#[link(name = "...")]` on the `extern` block enclosing `item`, if any.
+    pub fn link_lib(&self, item: ItemRef) -> Option<String> {
+        let parent = self.parent_item(item)?;
+        let (src, entry) = self.item(parent);
+        if entry.kind != ItemKind::ExternBlock || entry.attrs.is_empty() {
+            return None;
+        }
+        crate::outline::attr::link_name(
+            src,
+            &entry.attrs,
+            &self.outline.crates[parent.krate as usize].env,
+        )
+    }
+
     /// The value of `#[inline]` on `item`, returning `Some("")` for plain `#[inline]` without scanning attributes.
     pub fn inline_attr(&self, item: ItemRef) -> Option<&'a str> {
         let (_, entry) = self.item(item);

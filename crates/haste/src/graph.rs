@@ -667,11 +667,20 @@ pub fn library() -> Result<PathBuf> {
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.
 pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
+    let sysroot_dir = library.join("sysroot");
+    let raw_dylib = targets.target.has_pair("target_os", "windows")
+        && std::fs::read_to_string(sysroot_dir.join("Cargo.toml"))
+            .is_ok_and(|text| text.contains("windows_raw_dylib"));
+    let features: &[&str] = if raw_dylib {
+        &["windows_raw_dylib"]
+    } else {
+        &[]
+    };
     let mut sysroot = load_filtered(
-        &library.join("sysroot"),
+        &sysroot_dir,
         targets,
         None,
-        &[],
+        features,
         (true, false),
         &["test"],
     )?;

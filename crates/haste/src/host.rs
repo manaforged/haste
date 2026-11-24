@@ -36,7 +36,10 @@ pub enum HostSymbol {
     DropPop,
     Math(MathSymbol),
     X86(X86Symbol),
-    Dynamic(Box<str>),
+    Dynamic {
+        name: Box<str>,
+        lib: Option<Box<str>>,
+    },
 }
 
 const DIRECT: &[HostSymbol] = &[
@@ -49,8 +52,8 @@ const DIRECT: &[HostSymbol] = &[
 ];
 
 impl HostSymbol {
-    /// Classifies `name` into a typed host symbol when the host links to it (or as a dynamic import when cross-compiling with `aot` true).
-    pub fn resolve_for(name: &str, aot: bool) -> Option<Self> {
+    /// Classifies `name` (with optional `#[link(name = "...")]` library `lib`) into a typed host symbol when the host links to it or when emitting AOT for a cross-target or declared library.
+    pub fn resolve_for_lib(name: &str, lib: Option<&str>, aot: bool) -> Option<Self> {
         if let Some(found) = DIRECT.iter().find(|sym| sym.link_name() == name) {
             return Some(found.clone());
         }
@@ -68,13 +71,26 @@ impl HostSymbol {
                 if let Some(math) = MathSymbol::from_name(name) {
                     return Some(Self::Math(math));
                 }
-                if aot && crate::compile_target().triple != haste_codegen::Target::host().triple {
-                    return Some(Self::Dynamic(name.into()));
+                let make_dynamic = || Self::Dynamic {
+                    name: name.into(),
+                    lib: lib.map(Into::into),
+                };
+                let target = crate::compile_target();
+                if aot
+                    && (target.triple != haste_codegen::Target::host().triple
+                        || (target.format == haste_codegen::Format::Pe && lib.is_some()))
+                {
+                    return Some(make_dynamic());
                 }
-                return dynamic(name).map(|_| Self::Dynamic(name.into()));
+                return dynamic(name).map(|_| make_dynamic());
             }
         };
         Some(built_in)
+    }
+
+    /// Classifies `name` into a typed host symbol when the host links to it (or as a dynamic import when cross-compiling with `aot` true).
+    pub fn resolve_for(name: &str, aot: bool) -> Option<Self> {
+        Self::resolve_for_lib(name, None, aot)
     }
 
     /// Classifies `name` into a typed host symbol when the host links to it.
@@ -110,7 +126,7 @@ impl HostSymbol {
             Self::DropPop => "__haste_drop_pop",
             Self::Math(math) => math.link_name(),
             Self::X86(x86) => x86.link_name(),
-            Self::Dynamic(name) => name,
+            Self::Dynamic { name, .. } => name,
         }
     }
 
@@ -137,7 +153,7 @@ impl HostSymbol {
             Self::DropPop => unwind::drop_pop as *const () as usize,
             Self::Math(math) => math.host_addr(),
             Self::X86(x86) => return x86.host_addr(),
-            Self::Dynamic(_) => return dynamic(self.link_name()),
+            Self::Dynamic { .. } => return dynamic(self.link_name()),
         })
     }
 }

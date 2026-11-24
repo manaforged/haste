@@ -435,7 +435,12 @@ fn read_host(cur: &mut Cursor<'_>) -> Result<HostSymbol> {
             HostSymbol::Math(MathSymbol::from_name(read_str(cur)?).context("unknown math symbol")?)
         }
         14 => HostSymbol::X86(X86Symbol::from_link(read_str(cur)?).context("unknown x86 symbol")?),
-        15 => HostSymbol::Dynamic(read_str(cur)?.into()),
+        15 => {
+            let name: Box<str> = read_str(cur)?.into();
+            let raw_lib = read_str(cur)?;
+            let lib = (!raw_lib.is_empty()).then(|| raw_lib.into());
+            HostSymbol::Dynamic { name, lib }
+        }
         16 => HostSymbol::CatchUnwind,
         17 => HostSymbol::StartPanic,
         18 => HostSymbol::PanicCleanup,

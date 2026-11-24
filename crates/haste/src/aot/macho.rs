@@ -139,7 +139,8 @@ fn build_dyld_info(
     if !plan.imports.is_empty() || tlv_in_seg.is_some() {
         bind.u8(if single_lib { 0x11 } else { 0x2E });
         bind.u8(0x51);
-        for (i, name) in plan.imports.iter().enumerate() {
+        for (i, imp) in plan.imports.iter().enumerate() {
+            let name = imp.name;
             bind.u8(0x40);
             bind.bytes(exe.target.symbol_prefix.as_bytes());
             bind.bytes(name.as_bytes());
@@ -318,10 +319,10 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let sym_offs: Vec<u32> = plan
         .imports
         .iter()
-        .map(|n| {
+        .map(|imp| {
             let o = strtab.len() as u32;
             strtab.extend_from_slice(exe.target.symbol_prefix.as_bytes());
-            strtab.extend_from_slice(n.as_bytes());
+            strtab.extend_from_slice(imp.name.as_bytes());
             strtab.push(0);
             o
         })

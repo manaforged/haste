@@ -14,7 +14,28 @@ enum Binding<'a> {
     Static(u64),
     DsoHandle,
     Shim(Shim),
-    Import(&'a str, Option<&'static str>),
+    Import {
+        name: &'a str,
+        elf_lib: Option<&'static str>,
+        link_lib: Option<&'a str>,
+    },
+}
+
+impl<'a> Binding<'a> {
+    const fn import(name: &'a str) -> Self {
+        Self::Import {
+            name,
+            elf_lib: None,
+            link_lib: None,
+        }
+    }
+}
+
+/// One external symbol imported by an AOT executable, paired with its optional `#[link(name = "...")]` library.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlanImport<'a> {
+    pub name: &'a str,
+    pub link_lib: Option<&'a str>,
 }
 
 const MATH: &[(MathSymbol, &str)] = {
@@ -122,7 +143,7 @@ fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
         FillOnce => Binding::Shim(Shim::FillOnce),
         ThreadCell => Binding::Shim(Shim::ThreadCell),
         DsoHandle => Binding::DsoHandle,
-        Abort => Binding::Import("abort", None),
+        Abort => Binding::import("abort"),
         StartPanic => Binding::Shim(Shim::StartPanic),
         PanicCleanup => Binding::Shim(Shim::PanicCleanup),
         DropPush => Binding::Shim(Shim::DropPush),
@@ -130,8 +151,16 @@ fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
         CatchUnwind => Binding::Shim(Shim::CatchUnwind),
         Math(MathSymbol::Powif32) => Binding::Shim(Shim::Wide(WideShim::Powi { f64: false })),
         Math(MathSymbol::Powif64) => Binding::Shim(Shim::Wide(WideShim::Powi { f64: true })),
-        Math(math) => Binding::Import(classify_math(*math)?, Some("libm.so.6")),
-        Dynamic(name) => Binding::Import(name, dynamic_lib(name)),
+        Math(math) => Binding::Import {
+            name: classify_math(*math)?,
+            elf_lib: Some("libm.so.6"),
+            link_lib: None,
+        },
+        Dynamic { name, lib } => Binding::Import {
+            name,
+            elf_lib: dynamic_lib(name),
+            link_lib: lib.as_deref(),
+        },
         X86(sym) => bail!(
             "AOT emission requires a compiled shim for {}",
             sym.link_name()
@@ -142,10 +171,10 @@ fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
 fn classify_runtime(rt: RuntimeSymbol) -> Result<Binding<'static>> {
     use RuntimeSymbol::*;
     Ok(match rt {
-        Memcpy => Binding::Import("memcpy", None),
-        Memmove => Binding::Import("memmove", None),
-        Memset => Binding::Import("memset", None),
-        Memcmp => Binding::Import("memcmp", None),
+        Memcpy => Binding::import("memcpy"),
+        Memmove => Binding::import("memmove"),
+        Memset => Binding::import("memset"),
+        Memcmp => Binding::import("memcmp"),
         Malloc => Binding::Shim(Shim::FrameAlloc),
         Free => Binding::Shim(Shim::FrameFree),
         other => Binding::Shim(Shim::Wide(WideShim::Runtime(other))),
@@ -167,7 +196,7 @@ fn classify<'a>(sym: &'a Symbol, addrs: SectionAddrs) -> Result<Binding<'a>> {
 pub(crate) struct Plan<'a> {
     pub(in crate::aot) shims: Vec<Shim>,
     shim_index: FxHashMap<Shim, usize>,
-    pub(crate) imports: Vec<&'a str>,
+    pub(crate) imports: Vec<PlanImport<'a>>,
     import_index: FxHashMap<&'a str, usize>,
     pub(crate) libs: BTreeSet<&'a str>,
 }
@@ -197,7 +226,7 @@ impl<'a> Plan<'a> {
         };
         extra_imports
             .iter()
-            .for_each(|&imp| plan.add_import(imp, None));
+            .for_each(|&imp| plan.add_import(imp, None, None));
         let total = exe.relocs.len() + exe.pointers.len();
         let workers = crate::jobs().min(total / 2048);
         if workers <= 1 {
@@ -284,20 +313,33 @@ impl<'a> Plan<'a> {
                 self.shims.push(shim);
                 shims::deps(shim)
                     .iter()
-                    .for_each(|&dep| self.add_import(dep, None));
+                    .for_each(|&dep| self.add_import(dep, None, None));
             }
-            Binding::Import(name, lib) => self.add_import(name, lib),
+            Binding::Import {
+                name,
+                elf_lib,
+                link_lib,
+            } => self.add_import(name, elf_lib, link_lib),
             _ => {}
         }
     }
 
-    fn add_import(&mut self, name: &'a str, lib: Option<&'static str>) {
-        if let Some(lib) = lib {
+    fn add_import(
+        &mut self,
+        name: &'a str,
+        elf_lib: Option<&'static str>,
+        link_lib: Option<&'a str>,
+    ) {
+        if let Some(lib) = elf_lib {
             self.libs.insert(lib);
         }
-        if !self.import_index.contains_key(name) {
+        if let Some(&idx) = self.import_index.get(name) {
+            if self.imports[idx].link_lib.is_none() && link_lib.is_some() {
+                self.imports[idx].link_lib = link_lib;
+            }
+        } else {
             self.import_index.insert(name, self.imports.len());
-            self.imports.push(name);
+            self.imports.push(PlanImport { name, link_lib });
         }
     }
 
@@ -349,7 +391,7 @@ impl<'a> Plan<'a> {
             Binding::Static(val) => (false, val),
             Binding::DsoHandle => (false, addrs.dso_handle),
             Binding::Shim(shim) => (false, base_va + shim_offs[self.shim_idx(shim)?] as u64),
-            Binding::Import(name, _) => (true, import_va(name)?),
+            Binding::Import { name, .. } => (true, import_va(name)?),
         })
     }
 }

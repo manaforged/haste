@@ -262,7 +262,11 @@ pub fn install(mut manifest: Manifest, args: &[String]) -> Result<()> {
 
 /// The address at which a library loaded into this process exports symbol `name`.
 fn exported(name: &str) -> Option<usize> {
-    HostSymbol::Dynamic(name.into()).host_addr()
+    HostSymbol::Dynamic {
+        name: name.into(),
+        lib: None,
+    }
+    .host_addr()
 }
 
 /// Flushes what rustc's code of the bound library wrote to standard output, once the program's `main` has returned.

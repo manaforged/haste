@@ -44,13 +44,13 @@ fn build_tables(plan: &Plan<'_>) -> ElfTables {
         .iter()
         .filter(|&&l| l != "libc.so.6")
         .for_each(|l| needed.push(push_str(l)));
-    let sym_offs: Vec<u32> = plan.imports.iter().map(|s| push_str(s)).collect();
+    let sym_offs: Vec<u32> = plan.imports.iter().map(|imp| push_str(imp.name)).collect();
     let nsyms = 1 + plan.imports.len();
     let nbucket = nsyms.next_power_of_two().max(4);
     let (mut buckets, mut chains) = (vec![0u32; nbucket], vec![0u32; nsyms]);
-    for (i, name) in plan.imports.iter().enumerate() {
+    for (i, imp) in plan.imports.iter().enumerate() {
         let idx = (i + 1) as u32;
-        let b = (elf_hash(name.as_bytes()) as usize) % nbucket;
+        let b = (elf_hash(imp.name.as_bytes()) as usize) % nbucket;
         chains[idx as usize] = buckets[b];
         buckets[b] = idx;
     }
@@ -296,11 +296,11 @@ fn build_prelude(
         .imports
         .iter()
         .enumerate()
-        .map(|(i, name)| {
+        .map(|(i, imp)| {
             (
                 stubs_off + i * stub_size,
                 stub_size,
-                push_name(strtab, &[name, "@plt"]),
+                push_name(strtab, &[imp.name, "@plt"]),
             )
         })
         .collect();

@@ -1,8 +1,11 @@
+use std::borrow::Cow;
+
 use anyhow::{Result, bail};
 use haste_codegen::{Arch, Os};
 
 use super::shims::{
-    arm64_adrp, emit_arm64_adrp_add, emit_shims, emit_stub, plan_shims, windows_deps,
+    KERNEL32_DLL, UCRTBASE_DLL, arm64_adrp, emit_arm64_adrp_add, emit_shims, emit_stub, plan_shims,
+    windows_deps,
 };
 use super::{
     Buf, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym,
@@ -23,62 +26,61 @@ const UNIX_ONLY_IMPORTS: &[&str] = &[
     "_longjmp",
 ];
 
-fn collect_pe_imports<'a>(plan: &Plan<'a>) -> Vec<&'a str> {
-    let mut imports = Vec::new();
-    let mut push = |name: &'a str| {
-        if !imports.contains(&name) {
-            imports.push(name);
+struct PeImport<'a> {
+    name: &'a str,
+    dll: Cow<'static, str>,
+}
+
+fn normalize_pe_dll(raw: &str) -> Cow<'static, str> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let stem = trimmed.strip_suffix(".lib").unwrap_or(&trimmed);
+    match stem {
+        "ucrt" | "ucrtbase" | "ucrtbase.dll" | "vcruntime" | "libcmt" => {
+            Cow::Borrowed(UCRTBASE_DLL)
+        }
+        "kernel32" | "kernel32.dll" => Cow::Borrowed(KERNEL32_DLL),
+        other if other.ends_with(".dll") || other.ends_with(".drv") || other.ends_with(".exe") => {
+            Cow::Owned(other.to_owned())
+        }
+        other => Cow::Owned(format!("{other}.dll")),
+    }
+}
+
+fn collect_pe_imports<'a>(plan: &Plan<'a>) -> Vec<PeImport<'a>> {
+    let mut imports: Vec<PeImport<'a>> = Vec::new();
+    let mut push_fixed = |name: &'a str, dll: &'static str| {
+        if !imports.iter().any(|imp| imp.name == name) {
+            imports.push(PeImport {
+                name,
+                dll: Cow::Borrowed(dll),
+            });
         }
     };
-    push("ExitProcess");
+    push_fixed("ExitProcess", KERNEL32_DLL);
     for &shim in &plan.shims {
-        for dep in windows_deps(shim) {
-            push(dep);
+        for (dep, dll) in windows_deps(shim) {
+            push_fixed(dep, dll);
         }
     }
-    for &name in &plan.imports {
-        if !UNIX_ONLY_IMPORTS.contains(&name) {
-            push(name);
+    for imp in &plan.imports {
+        let link_lib = imp.link_lib.map(str::trim).filter(|s| !s.is_empty());
+        if link_lib.is_none() && UNIX_ONLY_IMPORTS.contains(&imp.name) {
+            continue;
         }
+        if imports.iter().any(|existing| existing.name == imp.name) {
+            continue;
+        }
+        let dll = link_lib.map_or(Cow::Borrowed(UCRTBASE_DLL), normalize_pe_dll);
+        imports.push(PeImport {
+            name: imp.name,
+            dll,
+        });
     }
     imports
 }
 
-fn dll_for_import(name: &str) -> &'static str {
-    if name.starts_with("Nt") || name.starts_with("Rtl") || name.starts_with("Zw") {
-        return "ntdll.dll";
-    }
-    if name == "ProcessPrng" {
-        return "bcryptprimitives.dll";
-    }
-    if name.starts_with("WSA")
-        || matches!(
-            name,
-            "socket"
-                | "bind"
-                | "listen"
-                | "accept"
-                | "connect"
-                | "send"
-                | "recv"
-                | "closesocket"
-                | "setsockopt"
-                | "getsockopt"
-                | "select"
-                | "getaddrinfo"
-                | "freeaddrinfo"
-        )
-    {
-        return "ws2_32.dll";
-    }
-    if name.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
-        return "kernel32.dll";
-    }
-    "ucrtbase.dll"
-}
-
 struct ImportGroup<'a> {
-    dll: &'static str,
+    dll: Cow<'static, str>,
     entries: Vec<(usize, &'a str)>,
 }
 
@@ -90,16 +92,15 @@ struct IdataLayout<'a> {
     bytes: Vec<u8>,
 }
 
-fn build_idata<'a>(imports: &[&'a str], idata_rva: u32) -> IdataLayout<'a> {
+fn build_idata<'a>(imports: &[PeImport<'a>], idata_rva: u32) -> IdataLayout<'a> {
     let mut groups: Vec<ImportGroup<'a>> = Vec::new();
-    for (idx, &name) in imports.iter().enumerate() {
-        let dll = dll_for_import(name);
-        if let Some(group) = groups.iter_mut().find(|g| g.dll == dll) {
-            group.entries.push((idx, name));
+    for (idx, imp) in imports.iter().enumerate() {
+        if let Some(group) = groups.iter_mut().find(|g| g.dll == imp.dll) {
+            group.entries.push((idx, imp.name));
         } else {
             groups.push(ImportGroup {
-                dll,
-                entries: vec![(idx, name)],
+                dll: imp.dll.clone(),
+                entries: vec![(idx, imp.name)],
             });
         }
     }
@@ -239,7 +240,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
 
     let plan = Plan::collect(exe, &["ExitProcess"])?;
     let pe_imports = collect_pe_imports(&plan);
-    let pe_import_idx = |name: &str| pe_imports.iter().position(|&imp| imp == name);
+    let pe_import_idx = |name: &str| pe_imports.iter().position(|imp| imp.name == name);
     let stubs_in_text = 0usize;
     let start_in_text = (stubs_in_text + pe_imports.len() * stub_size).next_multiple_of(16);
     let tramp_in_text = (start_in_text + start_size).next_multiple_of(16);
