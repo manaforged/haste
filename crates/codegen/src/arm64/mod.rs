@@ -201,7 +201,7 @@ pub(super) struct Emit<'a> {
 
 impl<'a> Emitter<'a> for Emit<'a> {
     fn func(&self) -> &'a Function { self.func }
-    fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] }
+    fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] || matches!(self.plan.location(value), Location::Offset(..)) }
     fn zero_stack_store(&self, inst: Inst) -> Option<(i32, u32)> { crate::frame::stack_zero_store(self.func, &self.frame.slots, inst, |v| self.plan.const_of(v)) }
     fn emit_zero_frame(&mut self, offset: i32, bytes: u32) { self.asm.store(Size::of(bytes), self.frame_mem(offset), ZR); }
 

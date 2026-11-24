@@ -265,7 +265,7 @@ pub(super) fn fuse_mem_rmw(
                 _ => continue,
             };
             let ty = func.ty(val);
-            if !ty.is_small_int() || uses[val.index()] != 1 || plan.elided[val.index()] || plan.fused[val.index()] || plan.sib[val.index()].is_some() {
+            if !ty.is_small_int() || uses[val.index()] != 1 || plan.is_static(val) || plan.fused[val.index()] || plan.sib[val.index()].is_some() {
                 continue;
             }
             let Some((rb, rpos, rinst)) = pos_of[val.index()] else { continue };

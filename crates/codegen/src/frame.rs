@@ -136,6 +136,11 @@ fn alloc_scratch(busy: &mut Vec<bool>) -> usize {
     }
 }
 
+fn reads_home<R: Copy + PartialEq>(locations: &[Location<R>], values: &[i32], src: Value, dst: Value) -> bool {
+    same_home(locations, values, src, dst)
+        || matches!((locations[src.index()], locations[dst.index()]), (Location::Offset(x, _), Location::Reg(y)) if x == y)
+}
+
 pub(crate) fn edge_steps<R: Copy + PartialEq>(
     func: &Function,
     locations: &[Location<R>],
@@ -152,7 +157,7 @@ pub(crate) fn edge_steps<R: Copy + PartialEq>(
     let mut steps = Vec::with_capacity(pending.len());
     let mut busy = [Vec::new(), Vec::new(), Vec::new()];
     while !pending.is_empty() {
-        let read = |at: usize| pending.iter().enumerate().any(|(other, (source, _))| other != at && matches!(source, Source::Value(arg) if same_home(locations, values, *arg, pending[at].1)));
+        let read = |at: usize| pending.iter().enumerate().any(|(other, (source, _))| other != at && matches!(source, Source::Value(arg) if reads_home(locations, values, *arg, pending[at].1)));
         if let Some(at) = (0..pending.len()).find(|at| !read(*at)) {
             steps.push(match pending.remove(at) {
                 (Source::Value(arg), param) => Step::Move(arg, param),
@@ -406,7 +411,7 @@ fn collect_value_homes<R: Copy + PartialEq>(
     let mut shared_vals: Vec<(usize, usize)> = Vec::new();
     for v in order {
         let reg_unhomed = matches!(locations[v], Location::Reg(_) | Location::Float(_)) && homed.get(v) != Some(&true);
-        if !present[v] || elided.get(v) == Some(&true) || locations[v].is_static() || reg_unhomed {
+        if !present[v] || elided.get(v) == Some(&true) || locations[v].is_static() || matches!(locations[v], Location::Offset(..)) || reg_unhomed {
             continue;
         }
         let bytes = func.types[v].bytes();

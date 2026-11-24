@@ -1,8 +1,10 @@
 use crate::cfg::Loops;
 use crate::fold::fits_imm32;
-use crate::ir::{Binary, Function, IntCC, Op, Type, Value};
+use crate::frame::Abi;
+use crate::ir::{Binary, Function, IntCC, Op, Signature, Type, Value};
+use crate::live::{Live, covers, overlaps};
 
-use super::{Location, Uses};
+use super::{Location, Regs, Uses};
 
 const MAX_ARM64_LOOP_GP: usize = 18;
 const I64_CONST_MIN_HALVES: usize = 3;
@@ -279,4 +281,126 @@ fn addressed_images(func: &Function) -> Vec<bool> {
         }
     }
     folds
+}
+
+/// Promotes spilled `Iadd`/`Isub` of a live register and a single-instruction immediate into `Location::Offset(r, off)`.
+pub(super) fn promote_reg_offsets<R: Copy + PartialEq>(
+    func: &Function,
+    regs: &Regs<R>,
+    live: &Live,
+    census: &Uses,
+    (pairs, deferred): (&[Option<Value>], &[bool]),
+    classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
+    elided: &[bool],
+    locations: &mut [Location<R>],
+) {
+    let saved_index = |reg: R| {
+        regs.saved
+            .iter()
+            .position(|&s| s == reg)
+            .filter(|_| !regs.wide_scratch.contains(&reg) && !regs.op_scratch.contains(&reg) && !regs.preserved_clobbers.contains(&reg))
+    };
+    let mut owners: Vec<Vec<usize>> = vec![Vec::new(); regs.saved.len()];
+    for (w, loc) in locations.iter().enumerate() {
+        if let Location::Reg(r) = *loc
+            && let Some(idx) = saved_index(r)
+        {
+            owners[idx].push(w);
+        }
+    }
+    let mut call_sigs: Vec<Vec<usize>> = Vec::new();
+    let mut special_use: Vec<bool> = Vec::new();
+    let mut use_scratches: Vec<u8> = Vec::new();
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            let mask = (regs.scratch_mask)(func, &data.op);
+            if mask != 0 {
+                if use_scratches.is_empty() {
+                    use_scratches.resize(func.types.len(), 0);
+                }
+                data.op.for_operands(|v| use_scratches[v.index()] |= mask);
+            }
+            match &data.op {
+                Op::Call { sig, callee, args, .. } | Op::TryCall { sig, callee, args, .. } => {
+                    let s = sig.index();
+                    for v in std::iter::once(*callee).chain(args.iter().copied()) {
+                        if call_sigs.is_empty() {
+                            call_sigs.resize(func.types.len(), Vec::new());
+                        }
+                        if !call_sigs[v.index()].contains(&s) {
+                            call_sigs[v.index()].push(s);
+                        }
+                    }
+                }
+                op @ (Op::Return(_) | Op::Move(..) | Op::Copy(..)) => {
+                    op.for_operands(|v| {
+                        if special_use.is_empty() {
+                            special_use.resize(func.types.len(), false);
+                        }
+                        special_use[v.index()] = true;
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    for v in 0..func.types.len() {
+        if !matches!(locations[v], Location::Slot)
+            || elided[v]
+            || deferred[v]
+            || pairs[v].is_some()
+            || func.types[v] != Type::I64
+        {
+            continue;
+        }
+        let ranges = live.ranges_of(v);
+        if ranges.is_empty() {
+            continue;
+        }
+        let Some(inst) = census.def_inst[v] else { continue };
+        let (base, off) = match func.insts[inst.index()].op {
+            Op::Binary(Binary::Iadd, a, b) => match (locations[a.index()], locations[b.index()]) {
+                (_, Location::Imm(imm)) => (a, imm),
+                (Location::Imm(imm), _) => (b, imm),
+                _ => continue,
+            },
+            Op::Binary(Binary::Isub, a, b) => match locations[b.index()] {
+                Location::Imm(imm) => (a, imm.wrapping_neg()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if base.index() == v || elided[base.index()] || func.ty(base) != Type::I64 {
+            continue;
+        }
+        let Ok(off32) = i32::try_from(off) else { continue };
+        if !regs.two_address && crate::arm64::int::add_imm_parts(false, off).is_none() {
+            continue;
+        }
+        let Location::Reg(r) = locations[base.index()] else { continue };
+        let saved = saved_index(r);
+        let base_live = covers(live.ranges_of(base.index()), ranges);
+        let op_scratched = |v: usize, reg: R| {
+            let mask = use_scratches.get(v).copied().unwrap_or(0);
+            mask != 0 && regs.op_scratch.iter().enumerate().any(|(i, &s)| (mask >> i) & 1 != 0 && s == reg)
+        };
+        let ok = if base_live {
+            saved.is_some()
+                || (!regs.wide_scratch.contains(&r)
+                    && !regs.preserved_clobbers.contains(&r)
+                    && !op_scratched(v, r)
+                    && !special_use.get(v).copied().unwrap_or(false)
+                    && !crate::park::crosses_ranges(&live.unwinds, ranges)
+                    && call_sigs.get(v).is_none_or(|sigs| {
+                        sigs.iter().all(|&s| classify(&func.sigs[s]).is_ok_and(|abi| !abi.clobbers(r)))
+                    }))
+        } else {
+            saved.is_some_and(|idx| owners[idx].iter().all(|&w| w == base.index() || !overlaps(ranges, live.ranges_of(w))))
+        };
+        if !ok {
+            continue;
+        }
+        locations[v] = Location::Offset(r, off32);
+    }
 }

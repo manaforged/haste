@@ -27,9 +27,11 @@ impl<R: Copy + PartialEq> Hoist<R> {
         let mut live_in = vec![Vec::new(); func.blocks.len()];
         let mut everywhere = Vec::new();
         for (value, &loc) in locations.iter().enumerate() {
-            if !matches!(loc, Location::Reg(_) | Location::Float(_)) {
-                continue;
-            }
+            let loc = match loc {
+                Location::Reg(_) | Location::Float(_) => loc,
+                Location::Offset(r, _) => Location::Reg(r),
+                _ => continue,
+            };
             let ranges = if value < live.slice.len() { live.ranges_of(value) } else { &[] };
             if ranges.is_empty() {
                 everywhere.push(loc);
@@ -61,7 +63,7 @@ impl<R: Copy + PartialEq> Hoist<R> {
 
     fn clash(loc: Location<R>, other: Location<R>) -> bool {
         match (loc, other) {
-            (Location::Reg(a), Location::Reg(b)) => a == b,
+            (Location::Reg(a) | Location::Offset(a, _), Location::Reg(b) | Location::Offset(b, _)) => a == b,
             (Location::Float(a), Location::Float(b)) => a == b,
             _ => false,
         }

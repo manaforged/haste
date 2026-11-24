@@ -258,6 +258,11 @@ impl Emit<'_> {
         if let Some(reg) = self.reg_of(addr) {
             return Mem::new(reg, offset);
         }
+        if let Location::Offset(base, base_off) = self.location(addr)
+            && let Some(disp) = base_off.checked_add(offset)
+        {
+            return Mem::new(base, disp);
+        }
         if let Some(sym) = self.image_sym(addr) {
             return Mem::rip(sym, offset);
         }
@@ -292,7 +297,7 @@ impl Emit<'_> {
                 self.asm.mov_imm(reg, extend(imm, ty, ext));
                 self.clobber_reg(reg);
             }
-            Location::SlotAddr(_) | Location::Symbol(_) | Location::Frame(..) => self.raw(reg, value),
+            Location::SlotAddr(_) | Location::Symbol(_) | Location::Frame(..) | Location::Offset(..) => self.raw(reg, value),
             Location::Float(from) => {
                 self.asm.movq_out(reg, Xmm(from));
                 if full {
@@ -358,6 +363,7 @@ impl Emit<'_> {
                 let at = self.slot(slot, offset);
                 self.asm.lea(reg, at);
             }
+            Location::Offset(base, offset) => self.asm.lea(reg, Mem::new(base, offset)),
             Location::Reg(from) if from == reg => return,
             Location::Reg(from) => self.asm.mov(reg, from),
             Location::Float(from) => self.asm.movq_out(reg, Xmm(from)),
@@ -661,7 +667,7 @@ impl Emit<'_> {
                 let at = self.asm.store_slot_reloc(to);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
-            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => {
+            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) | Location::Offset(..) => {
                 self.raw(Reg::Rax, value);
                 self.asm.store(Size::Q, to, Reg::Rax);
             }

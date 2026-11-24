@@ -148,6 +148,11 @@ impl Emit<'_> {
         if let Some(reg) = self.plan.reg_of(addr) {
             return Mem::new(reg, offset);
         }
+        if let Location::Offset(base, base_off) = self.plan.location(addr)
+            && let Some(disp) = base_off.checked_add(offset)
+        {
+            return Mem::new(base, disp);
+        }
         if let Location::Frame(slot, base) = self.plan.location(addr)
             && let Some(disp) = self.frame.slots[slot.index()].checked_add(base).and_then(|disp| disp.checked_add(offset))
         {
@@ -174,6 +179,7 @@ impl Emit<'_> {
                 self.clobber_reg(reg);
             }
             Location::Frame(slot, offset) => self.slot_address(reg, slot, offset),
+            Location::Offset(base, offset) => self.add_const(reg, base, i64::from(offset)),
             Location::Reg(from) => {
                 if reg != from {
                     self.asm.mov(reg, from);
@@ -242,7 +248,7 @@ impl Emit<'_> {
                 self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed));
                 self.spills.clobber_reg(reg);
             }
-            Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => self.raw(reg, value),
+            Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) | Location::Offset(..) => self.raw(reg, value),
             Location::Reg(from) if full => {
                 if reg != from {
                     self.asm.mov(reg, from);
@@ -568,7 +574,7 @@ impl Emit<'_> {
         let ty = self.ty(value);
         match self.plan.location(value) {
             Location::Imm(0) => self.store_zero(to, slot_disp, ty),
-            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => {
+            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) | Location::Offset(..) => {
                 self.raw(IP, value);
                 self.asm.store(Size::X, to, IP);
                 self.finish_slot_store(slot_disp, ty, IP);

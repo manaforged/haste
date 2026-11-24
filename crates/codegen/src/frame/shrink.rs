@@ -30,7 +30,7 @@ fn pure_value<R: Copy + PartialEq>(
     }
     match plan.location(value) {
         Location::Imm(_) | Location::Symbol(_) | Location::SlotAddr(_) => true,
-        Location::Reg(r) => !frame.saves.contains(&r) && !clobbers.contains(&r),
+        Location::Reg(r) | Location::Offset(r, _) => !frame.saves.contains(&r) && !clobbers.contains(&r),
         Location::Float(f) => !frame.float_saves.contains(&f),
         Location::Slot | Location::Frame(..) => false,
     }

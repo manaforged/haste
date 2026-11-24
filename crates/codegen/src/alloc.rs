@@ -70,6 +70,7 @@ pub(crate) enum Location<R> {
     Reg(R),
     Float(u8),
     Frame(StackSlot, i32),
+    Offset(R, i32),
 }
 
 impl<R> Location<R> {
@@ -677,6 +678,9 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     }
     let (pairs, deferred) = pairs(func, &locations, &elided);
     let webs = blocks.as_deref().zip(partners.as_deref()).map(|edges| demote::webs(func, &live, edges, (eff, &deferred), regs.imm_store, &mut locations));
+    if weighed {
+        consts::promote_reg_offsets(func, regs, &live, &census, (&pairs, &deferred), classify, &elided, &mut locations);
+    }
     let parked = if park.is_some() { parked(func, &live, &locations, (regs.saved, regs.saved_float), classify) } else { Vec::new() };
     let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
@@ -696,7 +700,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
 
 impl<R: Copy> Plan<R> {
     pub(crate) fn location(&self, value: Value) -> Location<R> { self.locations[value.index()] }
-    pub(crate) fn is_static(&self, value: Value) -> bool { self.elided[value.index()] || self.location(value).is_static() }
+    pub(crate) fn is_static(&self, value: Value) -> bool { self.elided[value.index()] || self.location(value).is_static() || matches!(self.location(value), Location::Offset(..)) }
     pub(crate) fn const_of(&self, value: Value) -> Option<i64> { if let Location::Imm(imm) = self.location(value) { Some(imm) } else { None } }
     pub(crate) fn reg_of(&self, value: Value) -> Option<R> { if let Location::Reg(reg) = self.location(value) { Some(reg) } else { None } }
     pub(crate) fn parked_at(&self, inst: Inst) -> &[(Value, ParkReg<R>, bool)] {
