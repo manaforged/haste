@@ -15,7 +15,7 @@ pub fn active(stats: Option<&Path>) -> bool {
     super::enabled()
         && stats.is_none()
         && !crate::image::verify_stencil()
-        && std::env::var_os("HASTE_NO_NOOP").is_none_or(|v| v != "1")
+        && !crate::env_flag("HASTE_NO_NOOP")
 }
 
 fn canonical_root(root: &Path) -> PathBuf {
@@ -52,7 +52,7 @@ fn compute_stamp(
     crate::prep::prepared().hash(&mut hasher);
     crate::selection().hash(&mut hasher);
     crate::test_mode().hash(&mut hasher);
-    std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
+    std::env::var_os(crate::LIBRARY_ENV).hash(&mut hasher);
     std::env::var_os("CARGO_HOME").hash(&mut hasher);
     root.hash(&mut hasher);
     match out {

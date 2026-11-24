@@ -17,12 +17,11 @@ const FN_ALIGN_ENV: &str = "HASTE_FN_ALIGN";
 
 fn want_debug_info() -> bool {
     crate::profile() != crate::outline::tree::Profile::Release
-        || std::env::var_os("HASTE_DEBUG_INFO").is_some()
+        || crate::env_flag("HASTE_DEBUG_INFO")
 }
 
 fn want_symbols() -> bool {
-    want_debug_info()
-        || std::env::var_os("HASTE_SYMBOLS").is_some_and(|v| v != "0" && !v.is_empty())
+    want_debug_info() || crate::env_flag("HASTE_SYMBOLS")
 }
 
 fn fn_align_override() -> Option<u32> {

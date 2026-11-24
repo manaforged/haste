@@ -146,6 +146,12 @@ impl HostSymbol {
 static DSO_HANDLE: u8 = 0;
 
 fn dynamic(name: &str) -> Option<usize> {
+    #[cfg(target_vendor = "apple")]
+    match name {
+        "_NSGetArgc" => return Some(apple_args::get_argc as *const () as usize),
+        "_NSGetArgv" => return Some(apple_args::get_argv as *const () as usize),
+        _ => {}
+    }
     if let Some(address) = native::symbol(name) {
         return Some(address);
     }
@@ -236,4 +242,101 @@ extern "C" fn barrier(_option: u32) {
 
 extern "C" fn abort() -> ! {
     std::process::abort()
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) mod apple_args {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static ARGC: AtomicI32 = AtomicI32::new(0);
+    static ARGV: AtomicPtr<*mut libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
+
+    unsafe extern "C" {
+        fn _NSGetArgc() -> *mut libc::c_int;
+        fn _NSGetArgv() -> *mut *mut *mut libc::c_char;
+    }
+
+    pub(super) extern "C" fn get_argc() -> *mut libc::c_int {
+        if ACTIVE.load(Ordering::Acquire) {
+            ARGC.as_ptr()
+        } else {
+            // SAFETY: _NSGetArgc returns libdyld's static argc pointer.
+            unsafe { _NSGetArgc() }
+        }
+    }
+
+    pub(super) extern "C" fn get_argv() -> *mut *mut *mut libc::c_char {
+        if ACTIVE.load(Ordering::Acquire) {
+            ARGV.as_ptr()
+        } else {
+            // SAFETY: _NSGetArgv returns libdyld's static argv pointer.
+            unsafe { _NSGetArgv() }
+        }
+    }
+
+    /// Scoped override of `_NSGetArgc` / `_NSGetArgv` for JIT-executed programs on Apple hosts.
+    pub(crate) struct Guard {
+        prev_active: bool,
+        prev_argc: libc::c_int,
+        prev_argv: *mut *mut libc::c_char,
+    }
+
+    impl Guard {
+        pub(crate) fn install(argc: libc::c_int, argv: *mut *mut libc::c_char) -> Self {
+            let prev_active = ACTIVE.load(Ordering::Acquire);
+            let prev_argc = ARGC.swap(argc, Ordering::AcqRel);
+            let prev_argv = ARGV.swap(argv, Ordering::AcqRel);
+            ACTIVE.store(true, Ordering::Release);
+            Self {
+                prev_active,
+                prev_argc,
+                prev_argv,
+            }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARGC.store(self.prev_argc, Ordering::Release);
+            ARGV.store(self.prev_argv, Ordering::Release);
+            ACTIVE.store(self.prev_active, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::{CStr, CString};
+
+        use super::*;
+
+        #[test]
+        fn guard_overrides_and_restores_apple_argv() {
+            // SAFETY: get_argc returns libdyld's live static argc pointer.
+            let orig_argc = unsafe { *get_argc() };
+            let owned = [
+                CString::new("prog").expect("cstring"),
+                CString::new("--flag").expect("cstring"),
+            ];
+            let mut ptrs: Vec<*mut libc::c_char> = owned
+                .iter()
+                .map(|s| s.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect();
+            {
+                let _guard = Guard::install(owned.len() as libc::c_int, ptrs.as_mut_ptr());
+                // SAFETY: guard points to live ARGC/ARGV backing `owned` for this scope.
+                let (argc, argv) = unsafe { (*get_argc(), *get_argv()) };
+                assert_eq!(argc, 2);
+                // SAFETY: argv[0] and argv[1] are live NUL-terminated strings in `owned`.
+                let first = unsafe { CStr::from_ptr(*argv) }.to_str().expect("utf8");
+                let second = unsafe { CStr::from_ptr(*argv.add(1)) }
+                    .to_str()
+                    .expect("utf8");
+                assert_eq!((first, second), ("prog", "--flag"));
+            }
+            // SAFETY: guard dropped, restoring libdyld's static argc pointer.
+            assert_eq!(unsafe { *get_argc() }, orig_argc);
+        }
+    }
 }

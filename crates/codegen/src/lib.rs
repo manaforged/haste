@@ -208,6 +208,11 @@ impl Code {
     }
 }
 
+/// Whether environment variable `name` is set to a non-empty value other than `"0"`.
+pub(crate) fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 impl Target {
     /// Encodes a call-table entry stub that loads `dict_addr` into the dictionary register and jumps to `body_exec`.
     pub fn dict_entry_stub(
@@ -220,7 +225,6 @@ impl Target {
         let bytes = match self.arch {
             Arch::X64 => x64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
             Arch::Arm64 => arm64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
-            other => Err(format!("no encoder for {other:?} yet")),
         };
         bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
     }
@@ -230,19 +234,14 @@ impl Target {
         match self.arch {
             Arch::X64 => Ok(x64::DICT_STUB_RELOCS),
             Arch::Arm64 => Ok(arm64::DICT_STUB_RELOCS),
-            other => Err(Error::new(
-                ErrorKind::Unsupported,
-                format!("no encoder for {other:?} yet"),
-            )),
         }
     }
 }
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
-pub fn simplify(func: &mut Function, effort: Effort) {
-    let target = Target::host().effort(effort);
-    keep_honored_marks(func, &target);
-    schedule::run(func, promote::Moves::Guided, &target);
+pub fn simplify(func: &mut Function, target: &Target) {
+    keep_honored_marks(func, target);
+    schedule::run(func, promote::Moves::Guided, target);
     fold::compact(func);
 }
 
@@ -286,9 +285,6 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     if tracing {
         trace::on_compile_end(&func);
     }
-    if !matches!(target.arch, Arch::X64 | Arch::Arm64) {
-        copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
-    }
     native::lower(&mut func);
     overalign::lower(&mut func);
     verify::verify(&func, target).map_err(|message| {
@@ -300,7 +296,42 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     let code = match target.arch {
         Arch::X64 => x64::compile(&func, target),
         Arch::Arm64 => arm64::compile(&func, target),
-        other => Err(format!("no encoder for {other:?} yet")),
     };
     code.map_err(|message| Error::new(ErrorKind::Unsupported, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unpredictable_fn() -> (Function, Value) {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        let mut b = FunctionBuilder::new(&mut func);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        let p = b.block_params(entry)[0];
+        b.switch_to_block(entry);
+        let zero = b.ins().iconst(Type::I64, 0);
+        let cond = b.ins().icmp(IntCC::Equal, p, zero);
+        b.func.mark_unpredictable(cond);
+        let one = b.ins().iconst(Type::I64, 1);
+        let res = b.ins().select(cond, one, zero);
+        b.ins().return_(&[res]);
+        (func, cond)
+    }
+
+    #[test]
+    fn simplify_respects_explicit_target_arch() {
+        let x64 = Target::find("x86_64-unknown-linux-gnu").expect("x64 target");
+        let arm64 = Target::find("aarch64-apple-darwin").expect("arm64 target");
+        let (mut func_x64, cond_x64) = unpredictable_fn();
+        let (mut func_arm64, cond_arm64) = unpredictable_fn();
+        simplify(&mut func_x64, x64);
+        simplify(&mut func_arm64, arm64);
+        assert!(!func_x64.is_unpredictable(cond_x64));
+        assert!(func_arm64.is_unpredictable(cond_arm64));
+    }
 }

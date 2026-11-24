@@ -598,7 +598,7 @@ fn load_filtered(
 
 /// The standard library sources of the toolchain: `HASTE_LIBRARY`, the active `rustc` sysroot's `rust-src`, or the newest rustup toolchain with `rust-src` (preferring `stable-*`).
 pub fn library() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("HASTE_LIBRARY") {
+    if let Some(dir) = std::env::var_os(crate::LIBRARY_ENV) {
         return Ok(PathBuf::from(dir));
     }
     let sysroot_library = |root: &Path| {

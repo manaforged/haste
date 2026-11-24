@@ -11,7 +11,7 @@ use super::Image;
 impl Image {
     /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.
     pub fn run_cases(&self, cases: &[(usize, &str)], inputs: &[i64]) -> Result<Vec<i32>> {
-        self.run_batch(cases, |_, address, name| {
+        self.run_batch(cases, false, |_, address, name| {
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             // SAFETY: address is code that the encoder wrote for a native fn(i64) -> i64 signature, checked to be set before the fork.
@@ -111,7 +111,7 @@ impl Image {
             bail!("{name} has no start wrapper (slot {start})");
         }
         let starts: Vec<Option<usize>> = tests.iter().map(|&(_, start, _)| start).collect();
-        self.run_batch(&pairs, |pos, address, name| {
+        self.run_batch(&pairs, true, |pos, address, name| {
             if let Some(start) = starts[pos] {
                 let status = self.enter_main((start, pairs[pos].0), &[name.to_owned()]);
                 if status != 0 {
@@ -130,6 +130,7 @@ impl Image {
     fn run_batch(
         &self,
         items: &[(usize, &str)],
+        quiet_stderr: bool,
         invoke: impl Fn(usize, usize, &str) -> std::io::Result<()>,
     ) -> Result<Vec<i32>> {
         if let Some((_, name)) = items
@@ -141,7 +142,7 @@ impl Image {
         let mut statuses = vec![0; items.len()];
         let mut from = 0;
         while from < items.len() {
-            let (done, status) = self.run_from(from, &items[from..], &invoke)?;
+            let (done, status) = self.run_from(from, &items[from..], quiet_stderr, &invoke)?;
             if status == 0 {
                 break;
             }
@@ -157,10 +158,15 @@ impl Image {
         &self,
         offset: usize,
         items: &[(usize, &str)],
+        quiet_stderr: bool,
         invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>,
     ) -> Result<(usize, i32)> {
-        let (pid, mut progress) =
-            fork_piped(|progress| self.run_in_child(offset, items, invoke, progress))?;
+        let (pid, mut progress) = fork_piped(|progress| {
+            if quiet_stderr {
+                silence_stderr();
+            }
+            self.run_in_child(offset, items, invoke, progress)
+        })?;
         let mut done = Vec::new();
         std::io::Read::read_to_end(&mut progress, &mut done)?;
         Ok((done.len(), wait(pid)))
@@ -171,6 +177,7 @@ impl Image {
         &self,
         offset: usize,
         items: &[(usize, &str)],
+        _quiet_stderr: bool,
         invoke: &impl Fn(usize, usize, &str) -> std::io::Result<()>,
     ) -> Result<(usize, i32)> {
         for (i, &(index, name)) in items.iter().enumerate() {
@@ -216,12 +223,30 @@ impl Image {
         };
         let mut argv: Vec<*const u8> = owned.iter().map(|arg| arg.as_ptr().cast()).collect();
         argv.push(std::ptr::null());
+        #[cfg(target_vendor = "apple")]
+        let _args_guard = crate::host::apple_args::Guard::install(
+            owned.len() as libc::c_int,
+            argv.as_mut_ptr().cast(),
+        );
         // SAFETY: start is code that the encoder wrote, or a stub that compiles it, for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.
         let lang_start: extern "C" fn(usize, isize, *const *const u8, u8) -> isize =
             unsafe { std::mem::transmute::<usize, _>(start) };
         let status = lang_start(main, owned.len() as isize, argv.as_ptr(), 0) as i32;
         crate::prep::finish();
         status
+    }
+}
+
+#[cfg(unix)]
+fn silence_stderr() {
+    // SAFETY: c"/dev/null" is a static NUL-terminated path, and O_WRONLY | O_CLOEXEC takes no mode argument.
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if null >= 0 {
+        // SAFETY: null is a valid open descriptor; dup2 redirects child stderr and close releases the duplicate.
+        unsafe {
+            libc::dup2(null, libc::STDERR_FILENO);
+            libc::close(null);
+        }
     }
 }
 

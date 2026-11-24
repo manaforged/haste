@@ -44,7 +44,6 @@ pub fn assemble(text: &str, target: &Target, symbols: &[&str]) -> Result<Assembl
             symbols,
             crate::arm64::text::Text::new(target.direct_calls),
         ),
-        other => Err(format!("no assembler for {other:?} yet")),
     }
 }
 

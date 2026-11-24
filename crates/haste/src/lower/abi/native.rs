@@ -13,9 +13,9 @@ use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
 
 use super::super::place::Place;
-use super::super::{Lower, Parts, Repr, arch_is_x64_or_arm64, repr};
+use super::super::{Lower, Repr, arch_is_x64_or_arm64, repr};
 use super::provenance::apply_param_provenance;
-use super::{eightbytes, parts, simd_vec_type, sret_param, word_parts};
+use super::{eightbytes, simd_vec_type, sret_param, word_parts};
 
 type Passed = Vec<(Type, i32)>;
 
@@ -213,12 +213,6 @@ impl Lower<'_, '_> {
             } else {
                 NativePass::ByVal(size)
             }),
-            _ => match parts(&layout)? {
-                Parts::Bytes => {
-                    bail!("a {size}-byte aggregate across a native call is not supported yet")
-                }
-                found => Ok(NativePass::Direct(found.scalars().collect())),
-            },
         }
     }
 

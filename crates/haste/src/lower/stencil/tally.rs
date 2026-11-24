@@ -42,7 +42,7 @@ pub(super) fn tally(kind: Tally) {
 
 pub(in crate::lower) fn simplify_tallied(func: &mut Function, kind: Tally) {
     tally(kind);
-    haste_codegen::simplify(func, crate::profile().into());
+    haste_codegen::simplify(func, &crate::host_target());
 }
 
 pub(super) fn report() -> String {

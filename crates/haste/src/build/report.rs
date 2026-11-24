@@ -203,7 +203,17 @@ impl Batch {
                     let (status, stderr) = self.image.run_test_captured(root, start, name)?;
                     Some(Ok((status, Some(stderr))))
                 }
-                Some(Ok(_)) => ran.next().map(|s| Ok((s, None))),
+                Some(Ok((root, start))) => match ran.next() {
+                    Some(status) if status != 0 && !meta.should_panic => {
+                        let (cap_status, stderr) =
+                            self.image.run_test_captured(root, start, name)?;
+                        Some(Ok((
+                            if cap_status != 0 { cap_status } else { status },
+                            Some(stderr),
+                        )))
+                    }
+                    other => other.map(|s| Ok((s, None))),
+                },
             };
             entries.push((name, meta, resolved));
         }

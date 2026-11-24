@@ -12,9 +12,7 @@ const MAX_SPLIT: usize = 4;
 fn reg_budgets(arch: crate::target::Arch) -> (usize, usize) {
     match arch {
         crate::target::Arch::X64 => (5, 9),
-        crate::target::Arch::Arm64 | crate::target::Arch::Riscv64 | crate::target::Arch::Wasm32 => {
-            (usize::MAX, 0)
-        }
+        crate::target::Arch::Arm64 => (usize::MAX, 0),
     }
 }
 

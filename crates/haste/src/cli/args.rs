@@ -92,7 +92,7 @@ fn parse(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Command>
         .with_context(usage)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum Meta {
     Version,
     Help,
@@ -108,11 +108,23 @@ impl Meta {
     }
 }
 
+#[derive(Default)]
+struct ParsedOpts {
+    selection: crate::Selection,
+    stats: Option<PathBuf>,
+    out: Option<PathBuf>,
+    jobs: Option<usize>,
+    release: bool,
+    prepared: bool,
+    prep_wait: Option<std::time::Duration>,
+    perf_map: bool,
+    watch: bool,
+    target: Option<&'static haste_codegen::Target>,
+}
+
 fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
     args: &mut std::iter::Peekable<I>,
-    selection: &mut crate::Selection,
-    stats: &mut Option<PathBuf>,
-    out: &mut Option<PathBuf>,
+    opts: &mut ParsedOpts,
 ) -> Result<Option<Meta>> {
     while let Some(flag) = args.peek().and_then(|raw| raw.to_str()) {
         if let Some(meta) = Meta::from_flag(flag) {
@@ -122,21 +134,22 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
         match flag {
             "-p" | "--package" => {
                 args.next();
-                selection.package = Some(next_str(args).context("--package takes a package name")?);
+                opts.selection.package =
+                    Some(next_str(args).context("--package takes a package name")?);
             }
             "--bin" => {
                 args.next();
-                selection.bin = Some(next_str(args).context("--bin takes a binary name")?);
+                opts.selection.bin = Some(next_str(args).context("--bin takes a binary name")?);
             }
             "--example" => {
                 args.next();
-                selection.example =
+                opts.selection.example =
                     Some(next_str(args).context("--example takes an example name")?);
             }
             "-F" | "--features" => {
                 args.next();
                 let list = next_str(args).context("--features takes a feature list")?;
-                selection.features.extend(
+                opts.selection.features.extend(
                     list.split([',', ' '])
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned),
@@ -144,54 +157,54 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
             }
             "--all-features" => {
                 args.next();
-                selection.all_features = true;
+                opts.selection.all_features = true;
             }
             "--no-default-features" => {
                 args.next();
-                selection.no_default_features = true;
+                opts.selection.no_default_features = true;
             }
             "--ignored" => {
                 args.next();
-                selection.ignored_only = true;
+                opts.selection.ignored_only = true;
             }
             "--include-ignored" => {
                 args.next();
-                selection.include_ignored = true;
+                opts.selection.include_ignored = true;
             }
             "--jobs" => {
                 args.next();
                 let count: usize = next_str(args)?
                     .parse()
                     .context("--jobs takes a positive number")?;
-                crate::set_jobs(count.max(1));
+                opts.jobs = Some(count.max(1));
             }
             "--release" => {
                 args.next();
-                crate::set_profile(outline::tree::Profile::Release);
+                opts.release = true;
             }
             "--prepared" => {
                 args.next();
-                crate::prep::set_prepared();
+                opts.prepared = true;
             }
             "--prep-wait" => {
                 args.next();
                 let millis: u64 = next_str(args)?
                     .parse()
                     .context("--prep-wait takes a number of milliseconds")?;
-                crate::prep::set_wait(std::time::Duration::from_millis(millis));
+                opts.prep_wait = Some(std::time::Duration::from_millis(millis));
             }
             "--perf-map" => {
                 args.next();
-                crate::image::perf::enable();
+                opts.perf_map = true;
             }
             "--watch" => {
                 args.next();
-                crate::image::watch::enable();
+                opts.watch = true;
             }
             "--stats-json" => {
                 args.next();
                 let value = args.next().context("--stats-json takes a file path")?;
-                *stats = Some(PathBuf::from(value));
+                opts.stats = Some(PathBuf::from(value));
             }
             "--target" => {
                 args.next();
@@ -204,12 +217,12 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
                         known.join(", ")
                     )
                 })?;
-                crate::set_target(target);
+                opts.target = Some(target);
             }
             "-o" | "--output" => {
                 args.next();
                 let value = args.next().context("-o takes a file path")?;
-                *out = Some(PathBuf::from(value));
+                opts.out = Some(PathBuf::from(value));
             }
             _ if flag == "--" => break,
             _ if flag.starts_with('-') && flag != "-" => {
@@ -229,23 +242,26 @@ pub(super) type ParsedInvocation = (
     Option<PathBuf>,
 );
 
-pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
-    let mut args = std::env::args_os().skip(1).peekable();
-    let mut selection = crate::Selection::default();
-    let mut stats_json = None;
-    let mut out = None;
-    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
+fn parse_args_raw(
+    raw: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<std::result::Result<(ParsedInvocation, ParsedOpts), Meta>> {
+    let mut args = raw.into_iter().peekable();
+    let mut opts = ParsedOpts::default();
+    if let Some(meta) = consume_options(&mut args, &mut opts)? {
         return Ok(Err(meta));
     }
     let command = parse(&mut args)?;
-    if let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)? {
+    if let Some(meta) = consume_options(&mut args, &mut opts)? {
         return Ok(Err(meta));
     }
     if matches!(command, Command::Clean) {
         if args.peek().is_some() {
             anyhow::bail!("{}", usage());
         }
-        return Ok(Ok((command, PathBuf::new(), Vec::new(), None, None)));
+        return Ok(Ok((
+            (command, PathBuf::new(), Vec::new(), None, None),
+            opts,
+        )));
     }
     let path = if matches!(
         command,
@@ -258,32 +274,26 @@ pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation,
     } else {
         PathBuf::from(args.next().with_context(usage)?)
     };
-    if !matches!(command, Command::Request(Request::Run) | Command::Debug(_))
-        && let Some(meta) = consume_options(&mut args, &mut selection, &mut stats_json, &mut out)?
+    if !matches!(command, Command::Debug(_))
+        && let Some(meta) = consume_options(&mut args, &mut opts)?
     {
         return Ok(Err(meta));
     }
-    crate::set_selection(selection);
-    if matches!(command, Command::Request(Request::Test))
-        || (matches!(command, Command::Serve)
-            && std::env::var_os("HASTE_SERVE_TEST").is_some_and(|v| v == "1"))
-    {
-        crate::set_test_mode();
-    }
     if !matches!(command, Command::Request(Request::Build))
-        && (stats_json.is_some() || out.is_some())
+        && (opts.stats.is_some() || opts.out.is_some())
     {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
     }
-    if crate::compile_target().triple != haste_codegen::Target::host().triple
-        && !(matches!(command, Command::Request(Request::Build)) && out.is_some())
+    let effective_target = opts.target.unwrap_or_else(haste_codegen::Target::host);
+    if effective_target.triple != haste_codegen::Target::host().triple
+        && !(matches!(command, Command::Request(Request::Build)) && opts.out.is_some())
     {
         anyhow::bail!(
             "--target {} is only supported with `haste build -o`",
-            crate::compile_target().triple
+            effective_target.triple
         );
     }
-    if crate::image::watch::enabled() && !matches!(command, Command::Request(Request::Run)) {
+    if opts.watch && !matches!(command, Command::Request(Request::Run)) {
         anyhow::bail!("--watch is only supported with `haste run`");
     }
     let rest = args
@@ -296,12 +306,103 @@ pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation,
         Some((first, tail)) if first == "--" => tail.to_vec(),
         _ => rest,
     };
-    Ok(Ok((command, path, rest, stats_json, out)))
+    let stats_json = opts.stats.clone();
+    let out = opts.out.clone();
+    Ok(Ok(((command, path, rest, stats_json, out), opts)))
+}
+
+pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
+    let (inv, opts) = match parse_args_raw(std::env::args_os().skip(1))? {
+        Ok(parsed) => parsed,
+        Err(meta) => return Ok(Err(meta)),
+    };
+    if let Some(count) = opts.jobs {
+        crate::set_jobs(count);
+    }
+    if opts.release {
+        crate::set_profile(outline::tree::Profile::Release);
+    }
+    if opts.prepared {
+        crate::prep::set_prepared();
+    }
+    if let Some(wait) = opts.prep_wait {
+        crate::prep::set_wait(wait);
+    }
+    if opts.perf_map {
+        crate::image::perf::enable();
+    }
+    if opts.watch {
+        crate::image::watch::enable();
+    }
+    if let Some(target) = opts.target {
+        crate::set_target(target);
+    }
+    crate::set_selection(opts.selection);
+    if matches!(inv.0, Command::Request(Request::Test))
+        || (matches!(inv.0, Command::Serve) && crate::env_flag("HASTE_SERVE_TEST"))
+    {
+        crate::set_test_mode();
+    }
+    Ok(Ok(inv))
 }
 
 pub(super) fn print_meta(meta: Meta) {
     match meta {
         Meta::Version => println!("haste {}", env!("CARGO_PKG_VERSION")),
         Meta::Help => println!("{}", usage()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::*;
+
+    fn parse_strs(
+        args: &[&str],
+    ) -> Result<std::result::Result<(ParsedInvocation, ParsedOpts), Meta>> {
+        parse_args_raw(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn run_parses_haste_flags_after_path_until_double_dash() {
+        let ((cmd, path, rest, _, _), opts) =
+            parse_strs(&["run", "examples/hello", "--release", "--", "--release", "x"])
+                .expect("valid invocation")
+                .expect("not meta");
+        assert!(matches!(cmd, Command::Request(Request::Run)));
+        assert_eq!(path, PathBuf::from("examples/hello"));
+        assert!(opts.release);
+        assert_eq!(rest, vec!["--release", "x"]);
+    }
+
+    #[test]
+    fn run_passes_flags_after_double_dash_to_program_only() {
+        let ((_, _, rest, _, _), opts) = parse_strs(&["run", "examples/hello", "--", "--release"])
+            .expect("valid invocation")
+            .expect("not meta");
+        assert!(!opts.release);
+        assert_eq!(rest, vec!["--release"]);
+    }
+
+    #[test]
+    fn run_rejects_unknown_flag_after_path_without_double_dash() {
+        assert!(parse_strs(&["run", "examples/hello", "--unknown-flag"]).is_err());
+    }
+
+    #[test]
+    fn rejects_removed_unimplemented_targets() {
+        assert!(
+            parse_strs(&[
+                "build",
+                "--target",
+                "riscv64gc-unknown-linux-gnu",
+                "-o",
+                "out"
+            ])
+            .is_err()
+        );
+        assert!(parse_strs(&["build", "--target", "wasm32-unknown-unknown", "-o", "out"]).is_err());
     }
 }

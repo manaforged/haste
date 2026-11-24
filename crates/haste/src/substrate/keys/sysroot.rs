@@ -183,7 +183,7 @@ fn toolchain_key_for(
         }
     }
     let roots = sysroot_library_roots(workspace, &unit_indices);
-    if std::env::var_os("HASTE_LIBRARY").is_some() {
+    if std::env::var_os(crate::LIBRARY_ENV).is_some() {
         hash_sysroot_roots(roots, &mut hasher);
     } else {
         hash_fast_sysroot_roots(roots, &mut hasher);

@@ -165,7 +165,7 @@ mod unix_ipc {
         crate::prep::prepared().hash(&mut hasher);
         crate::selection().hash(&mut hasher);
         crate::test_mode().hash(&mut hasher);
-        std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
+        std::env::var_os(crate::LIBRARY_ENV).hash(&mut hasher);
         let abstract_name = cfg!(target_os = "linux");
         let name = match abstract_name {
             true => format!("haste/{:016x}", hasher.finish()),

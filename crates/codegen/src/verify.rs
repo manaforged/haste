@@ -8,9 +8,7 @@ use crate::ir::{
 /// Whether `HASTE_VERIFY_PASSES` is set to a non-zero value.
 pub(crate) fn verify_passes_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("HASTE_VERIFY_PASSES").is_some_and(|v| !v.is_empty() && v != "0")
-    })
+    *ENABLED.get_or_init(|| crate::env_flag("HASTE_VERIFY_PASSES"))
 }
 
 fn value_types<'a>(func: &'a Function, values: &'a [Value]) -> impl Iterator<Item = Type> + 'a {

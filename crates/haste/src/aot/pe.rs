@@ -235,7 +235,6 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let (machine, stub_size, start_size, tramp_size) = match arch {
         Arch::X64 => (0x8664_u16, 6usize, 19usize, 20usize),
         Arch::Arm64 => (0xAA64_u16, 12usize, 20usize, 24usize),
-        _ => bail!("unsupported PE arch {arch:?}"),
     };
 
     let plan = Plan::collect(exe, &["ExitProcess"])?;

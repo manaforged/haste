@@ -46,7 +46,7 @@ pub fn workspace_path(ws_hash: u64) -> PathBuf {
 
 /// Returns whether substrate caching is enabled (disabled when `HASTE_NO_SUBSTRATE=1`).
 pub fn enabled() -> bool {
-    std::env::var_os("HASTE_NO_SUBSTRATE").is_none_or(|v| v != "1")
+    !crate::env_flag("HASTE_NO_SUBSTRATE")
 }
 
 /// Computes a 64-bit fingerprint for `target` and the running compiler binary.

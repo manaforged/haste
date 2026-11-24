@@ -163,6 +163,10 @@ pub(crate) fn print_test_report(
                             "note: panic did not contain expected string `{exp}`\n{}",
                             stderr.as_deref().unwrap_or("").trim()
                         )
+                    } else if let Some(out) =
+                        stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        format!("{out}\n(exited with status {status})")
                     } else {
                         format!("exited with status {status}")
                     };
@@ -311,7 +315,7 @@ fn can_serve(command: Command, stats_json: Option<&std::path::Path>) -> bool {
         && stats_json.is_none()
         && !crate::image::watch::enabled()
         && crate::compile_target().triple == haste_codegen::Target::host().triple
-        && std::env::var_os("HASTE_NO_DAEMON").is_none_or(|v| v != "1")
+        && !crate::env_flag("HASTE_NO_DAEMON")
 }
 
 fn try_serve(

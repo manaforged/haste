@@ -109,7 +109,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         classify(sig, abi_kind)
     })?;
     let func = split.as_ref().unwrap_or(func);
-    let features = Features::host();
+    let features = Features::for_target(target);
     let (roots, pure_test) = if full {
         let dropped = |plan: &Plan<Reg>| {
             plan.elided

@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use haste_codegen::{Arch, Os};
 
 use super::shims::{emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
@@ -257,7 +257,6 @@ fn arch_layout(arch: Arch) -> Result<ArchLayout> {
             tramp_size: 24,
             machine: 183,
         },
-        _ => bail!("unsupported ELF arch {arch:?}"),
     })
 }
 
