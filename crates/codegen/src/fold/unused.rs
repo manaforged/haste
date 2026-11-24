@@ -34,7 +34,9 @@ fn removable_result(func: &Function, zeros: &[bool], data: &crate::ir::InstData)
     {
         return Some(res);
     }
-    (!zeros.is_empty()).then(|| func.pure_thread_cell_result(&data.op, |v| zeros[v.index()])).flatten()
+    (!zeros.is_empty())
+        .then(|| func.pure_thread_cell_result(&data.op, |v| zeros[v.index()]))
+        .flatten()
 }
 
 /// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
@@ -49,7 +51,8 @@ pub(super) fn dead(func: &mut Function) -> bool {
         keep.resize(len, true);
         for at in (0..len).rev() {
             let data = &func.insts[func.blocks[b].insts[at].index()];
-            let dead = removable_result(func, &zeros, data).is_some_and(|result| uses[result.index()] == 0);
+            let dead = removable_result(func, &zeros, data)
+                .is_some_and(|result| uses[result.index()] == 0);
             if dead {
                 keep[at] = false;
                 dropped = true;
@@ -67,7 +70,12 @@ pub(super) fn dead(func: &mut Function) -> bool {
 
 /// Drops each block parameter that nothing side-effecting or control-flow reads (including dead pure phi cycles), with its argument on every edge; parameters of `pinned` blocks stay.
 pub(super) fn run(func: &mut Function, pinned: &[bool]) -> bool {
-    if !func.blocks.iter().enumerate().any(|(b, d)| !pinned[b] && !d.params.is_empty()) {
+    if !func
+        .blocks
+        .iter()
+        .enumerate()
+        .any(|(b, d)| !pinned[b] && !d.params.is_empty())
+    {
         return false;
     }
     let nvals = func.types.len();
@@ -141,7 +149,11 @@ pub(super) fn run(func: &mut Function, pinned: &[bool]) -> bool {
         }
     }
     let dead = |param: &Value| !live[param.index()];
-    if !func.blocks.iter().any(|block| block.params.iter().any(dead)) {
+    if !func
+        .blocks
+        .iter()
+        .any(|block| block.params.iter().any(dead))
+    {
         return false;
     }
     let blocks = &func.blocks;
@@ -150,7 +162,9 @@ pub(super) fn run(func: &mut Function, pinned: &[bool]) -> bool {
         args.retain(|_| params.next().is_none_or(|param| live[param.index()]));
     };
     for block in blocks {
-        let Some(&last) = block.insts.last() else { continue };
+        let Some(&last) = block.insts.last() else {
+            continue;
+        };
         match &mut func.insts[last.index()].op {
             Op::Jump(target, args) => keep(args, *target),
             Op::Brif(_, then, then_args, otherwise, else_args) => {
@@ -171,7 +185,9 @@ pub(super) fn pinned(func: &Function, entry: Block) -> Vec<bool> {
     pinned[entry.index()] = true;
     for block in 0..func.blocks.len() as u32 {
         match func.last(Block(block)) {
-            Some(Op::TryCall { normal, handler, .. }) => (pinned[normal.index()], pinned[handler.index()]) = (true, true),
+            Some(Op::TryCall {
+                normal, handler, ..
+            }) => (pinned[normal.index()], pinned[handler.index()]) = (true, true),
             Some(Op::BrTable(_, d, t)) => {
                 pinned[d.index()] = true;
                 t.iter().for_each(|x| pinned[x.index()] = true);
@@ -184,7 +200,11 @@ pub(super) fn pinned(func: &Function, entry: Block) -> Vec<bool> {
 
 pub(super) fn drop_params(func: &mut Function, subst: &[Value]) -> bool {
     let gone = |param: &Value| subst[param.index()] != *param;
-    if !func.blocks.iter().any(|block| block.params.iter().any(gone)) {
+    if !func
+        .blocks
+        .iter()
+        .any(|block| block.params.iter().any(gone))
+    {
         return false;
     }
     let blocks = &func.blocks;
@@ -197,7 +217,9 @@ pub(super) fn drop_params(func: &mut Function, subst: &[Value]) -> bool {
         });
     };
     for block in blocks {
-        let Some(&last) = block.insts.last() else { continue };
+        let Some(&last) = block.insts.last() else {
+            continue;
+        };
         match &mut func.insts[last.index()].op {
             Op::Jump(target, args) => keep(args, *target),
             Op::Brif(_, then, then_args, otherwise, else_args) => {

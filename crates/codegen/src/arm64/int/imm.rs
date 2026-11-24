@@ -14,7 +14,10 @@ pub(crate) fn add_imm_parts(sub: bool, imm: i64) -> Option<(bool, u32)> {
 /// Splits `imm` into `(effective_sub, hi, lo)` for a two-instruction 24-bit `add`/`sub` immediate sequence.
 pub(crate) fn add_imm_split_parts(sub: bool, imm: i64) -> Option<(bool, u32, u32)> {
     let abs = imm.unsigned_abs();
-    let (hi, lo) = ((abs & ADD_IMM_HI_MASK) as u32, (abs & ADD_IMM_LO_MASK) as u32);
+    let (hi, lo) = (
+        (abs & ADD_IMM_HI_MASK) as u32,
+        (abs & ADD_IMM_LO_MASK) as u32,
+    );
     (abs < ADD_IMM_LIMIT && hi != 0 && lo != 0).then(|| (if imm < 0 { !sub } else { sub }, hi, lo))
 }
 
@@ -39,10 +42,21 @@ pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32
         return None;
     }
     let tz = elem.trailing_zeros();
-    let immr = if tz > 0 { (esize - tz) & (esize - 1) } else { ones - (!elem & mask).trailing_zeros() };
-    let (n, imms) = (u32::from(esize == 64), ((!(esize - 1) << 1) | (ones - 1)) & 0x3F);
+    let immr = if tz > 0 {
+        (esize - tz) & (esize - 1)
+    } else {
+        ones - (!elem & mask).trailing_zeros()
+    };
+    let (n, imms) = (
+        u32::from(esize == 64),
+        ((!(esize - 1) << 1) | (ones - 1)) & 0x3F,
+    );
     let pat = (1u64 << ones) - 1;
-    let mut decoded = if esize == 64 { pat.rotate_right(immr) } else { ((pat >> immr) | (pat << (esize - immr))) & mask };
+    let mut decoded = if esize == 64 {
+        pat.rotate_right(immr)
+    } else {
+        ((pat >> immr) | (pat << (esize - immr))) & mask
+    };
     let mut shift = esize;
     while shift < 64 {
         decoded |= decoded << shift;
