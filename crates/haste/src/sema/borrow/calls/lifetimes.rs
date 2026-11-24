@@ -160,27 +160,11 @@ pub(in super::super) struct ParamLifetimes<'s> {
 }
 
 pub(in super::super) fn is_prim_name(name: &str) -> bool {
-    matches!(
-        name,
-        "bool"
-            | "char"
-            | "str"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-            | "f32"
-            | "f64"
-            | "String"
-    )
+    crate::names::Primitive::named(name).is_some() || name == "String"
+}
+
+pub(in super::super) fn is_owned_container(name: &str) -> bool {
+    matches!(name, "Option" | "Result" | "Vec" | "Box")
 }
 
 pub(in super::super) fn pred_matches_name(
@@ -223,7 +207,9 @@ pub(in super::super) fn compute_param_lifetimes<'s>(
                 crate::body::sig::SelfKind::Ref | crate::body::sig::SelfKind::RefMut => {
                     if let Some(lt) = sig.receiver_lifetime {
                         let name = src.text(lt);
-                        info.is_static[slot] = lifetime_is_static(sig, src, name) && !impl_has_lt;
+                        let lt_static = lifetime_is_static(sig, src, name);
+                        info.is_static[slot] = lt_static;
+                        info.inner_is_static[slot] = !impl_has_lt || lt_static;
                         if name == "'_" {
                             info.has_elided_lt[slot] = true;
                         } else if name != "'static" {
@@ -232,8 +218,8 @@ pub(in super::super) fn compute_param_lifetimes<'s>(
                     } else {
                         info.is_static[slot] = false;
                         info.has_elided_lt[slot] = true;
+                        info.inner_is_static[slot] = !impl_has_lt;
                     }
-                    info.inner_is_static[slot] = !impl_has_lt;
                 }
                 crate::body::sig::SelfKind::Typed(ty) => {
                     record_param_ty(sig, src, ty, impl_has_lt, slot, &mut info);
@@ -304,12 +290,39 @@ pub(in super::super) fn lifetime_outlives(
     if a == b || a == "'static" {
         return true;
     }
-    sig.generics.iter().any(|g| {
-        g.kind == crate::body::sig::GenericKind::Lifetime
-            && src.text(g.name) == a
-            && (has_lifetime_bound(sig, src, g.bounds, b)
-                || has_lifetime_bound(sig, src, g.bounds, "'static"))
-    })
+    let mut visited = vec![a];
+    let mut cursor = 0;
+    while cursor < visited.len() {
+        let cur = visited[cursor];
+        cursor += 1;
+        let bound_lists = sig
+            .generics
+            .iter()
+            .filter(|g| {
+                g.kind == crate::body::sig::GenericKind::Lifetime && src.text(g.name) == cur
+            })
+            .map(|g| g.bounds)
+            .chain(
+                sig.predicates
+                    .iter()
+                    .filter(|p| p.lifetime.is_some_and(|lt| src.text(lt) == cur))
+                    .map(|p| p.bounds),
+            );
+        for bounds in bound_lists {
+            for &bound_id in sig.body.list(bounds) {
+                if let Bound::Lifetime(lt) = sig.body.bounds[bound_id as usize] {
+                    let next = src.text(lt);
+                    if next == b || next == "'static" {
+                        return true;
+                    }
+                    if !visited.contains(&next) {
+                        visited.push(next);
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn has_unbounded_type_param(
@@ -389,7 +402,7 @@ fn ast_ty_is_provably_static(
             if seg.args.is_none() && is_prim_name(name) {
                 return true;
             }
-            if matches!(name, "Option" | "Result" | "Vec" | "Box")
+            if is_owned_container(name)
                 && let Some(Args::Angle(args)) = seg.args
             {
                 return sig

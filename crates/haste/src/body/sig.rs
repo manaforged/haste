@@ -29,6 +29,7 @@ pub struct Generic {
 #[derive(Clone, Copy, Debug)]
 pub struct Predicate {
     pub ty: Option<TyId>,
+    pub lifetime: Option<u32>,
     pub bounds: List,
 }
 
@@ -175,10 +176,11 @@ impl Cursor<'_> {
     }
 
     fn predicate(&mut self) -> Result<Predicate> {
-        if self.lifetime().is_some() {
+        if let Some(lifetime) = self.lifetime() {
             self.expect(":")?;
             return Ok(Predicate {
                 ty: None,
+                lifetime: Some(lifetime),
                 bounds: self.bounds()?,
             });
         }
@@ -190,6 +192,7 @@ impl Cursor<'_> {
         self.expect(":")?;
         Ok(Predicate {
             ty: Some(ty),
+            lifetime: None,
             bounds: self.bounds()?,
         })
     }

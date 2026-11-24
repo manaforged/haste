@@ -230,21 +230,31 @@ impl<'a> Checker<'_, 'a> {
         let mut out = Vec::new();
         let mut param_matched_own_generic = false;
         for (idx, &arg) in arg_ids.iter().enumerate() {
-            if let Some(&(_, param_ty)) = sig.params.get(idx)
-                && !matches!(sig.body.ty(param_ty), AstTy::Ref { .. })
-                && (ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
-                    || ret_lts.names.contains(&"Self"))
-            {
-                if sig
-                    .generics
-                    .iter()
-                    .any(|g| ret_lts.names.contains(&sig_src.text(g.name)))
-                    && ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
-                {
-                    param_matched_own_generic = true;
-                }
-                out.extend(self.expr_borrow_sources(ExprId(arg), state));
+            let Some(&(_, param_ty)) = sig.params.get(idx) else {
+                continue;
+            };
+            let matches_ret = ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
+                || ret_lts.names.contains(&"Self");
+            if !matches_ret {
+                continue;
             }
+            if let AstTy::Ref { .. } = *sig.body.ty(param_ty) {
+                if self.returns_only_static {
+                    let arg_sources =
+                        self.expr_borrow_sources_inner(ExprId(arg), state, false, None);
+                    out.extend(self.copied_recv_sources(ExprId(arg), arg_sources, state, true));
+                }
+                continue;
+            }
+            if sig
+                .generics
+                .iter()
+                .any(|g| ret_lts.names.contains(&sig_src.text(g.name)))
+                && ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
+            {
+                param_matched_own_generic = true;
+            }
+            out.extend(self.expr_borrow_sources(ExprId(arg), state));
         }
         if let Some(recv) = receiver
             && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))

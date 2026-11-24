@@ -373,6 +373,62 @@ fn main() {
 }
 "#,
     );
+    check_fails(
+        "hrtb_outer_type_param_escape_match_bind",
+        r#"
+fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
+    let local = 9;
+    f(&local)
+}
+fn main() {
+    let dangling: &i32 = bad(|x| match x { y => y });
+    println!("{dangling}");
+}
+"#,
+    );
+    check_fails(
+        "hrtb_outer_type_param_escape_loop_break",
+        r#"
+fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
+    let local = 9;
+    f(&local)
+}
+fn main() {
+    let dangling: &i32 = bad(|x| loop { break x; });
+    println!("{dangling}");
+}
+"#,
+    );
+    check_fails(
+        "hrtb_outer_type_param_escape_generic_fn_item",
+        r#"
+fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
+    let local = 9;
+    f(&local)
+}
+fn id<T>(x: T) -> T { x }
+fn main() {
+    let dangling: &i32 = bad(id);
+    println!("{dangling}");
+}
+"#,
+    );
+    check_fails(
+        "copied_arg_vec_from_alias_escape",
+        r#"
+fn leak<'a>(xs: &[&'a str]) -> Vec<&'static str> {
+    let alias = xs;
+    Vec::from(alias)
+}
+fn main() {
+    let local = String::from("dangling");
+    let s: &[&str] = &[&local];
+    let v: Vec<&'static str> = leak(s);
+    drop(local);
+    println!("{}", v[0]);
+}
+"#,
+    );
 }
 
 #[test]
@@ -508,6 +564,35 @@ fn main() {
         xs.to_vec()
     }
     let _ = slice_static(&["a", "b"]);
+
+    struct StaticSelf<'a>(&'a str);
+    impl<'a> StaticSelf<'a> {
+        fn get(&'static self) -> &'static str {
+            self.0
+        }
+    }
+    static S_HOLD: StaticSelf<'static> = StaticSelf("ok");
+    let _ = S_HOLD.get();
+
+    fn stash_where<'a, 'b, F: FnMut(&'a i32)>(mut f: F, y: &'b i32)
+    where
+        'b: 'a,
+    {
+        f(y);
+    }
+    fn stash_trans<'a, 'b: 'a, 'c: 'b, F: FnMut(&'a i32)>(mut f: F, y: &'c i32) {
+        f(y);
+    }
+    let val = 5;
+    let mut got = 0;
+    stash_where(|r| got += *r, &val);
+    stash_trans(|r| got += *r, &val);
+    let _ = got;
+
+    fn vec_from_static(xs: &[&'static str]) -> Vec<&'static str> {
+        Vec::from(xs)
+    }
+    let _ = vec_from_static(&["x", "y"]);
 }
 "#,
     );

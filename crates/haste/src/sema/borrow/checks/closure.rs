@@ -6,7 +6,10 @@ use crate::outline::source::Source;
 use crate::sema::ty::Kind;
 
 use super::super::bind::push_loan;
-use super::super::calls::{Lifetimes, collect_ty_lifetimes, is_prim_name, pred_matches_name};
+use super::super::calls::{
+    Lifetimes, collect_ty_lifetimes, is_owned_container, is_prim_name, pred_matches_name,
+    ty_shares_name,
+};
 use super::super::places::{Place, PlaceStep};
 use super::super::propagate::{BorrowSource, dedup_sources};
 use super::super::{Checker, State, is_temp_holder};
@@ -319,7 +322,7 @@ impl Checker<'_, '_> {
         self.returns_only_static = saved_static;
         for s in sources {
             if is_temp_target(s.target).is_some() {
-                if in_const && !self.is_non_static_or_non_promotable(expr) {
+                if in_const && !self.is_non_promotable_temp(expr) {
                     continue;
                 }
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));
@@ -335,10 +338,6 @@ impl Checker<'_, '_> {
             }
         }
         Ok(())
-    }
-
-    fn is_non_static_or_non_promotable(&mut self, expr: ExprId) -> bool {
-        self.is_non_promotable_temp(expr)
     }
 
     pub(in super::super) fn fn_arg_returns_static(&mut self, arg: ExprId) -> bool {
@@ -428,17 +427,23 @@ impl Checker<'_, '_> {
         let sig_src = self.cx.item(f_item).0;
         let mut ret_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut ret_lts);
-        if sig_returns_only_static(&sig, sig_src, ret_ast, &ret_lts)
-            || (!ret_lts.has_elided && ret_lts.named.is_empty())
-        {
+        if sig_returns_only_static(&sig, sig_src, ret_ast, &ret_lts) {
             return false;
         }
+        let has_ret_lt = ret_lts.has_elided || !ret_lts.named.is_empty();
         hrtb_non_ret.iter().any(|&idx| {
             sig.params.get(idx).is_some_and(|&(_, pt)| {
-                let mut plts = Lifetimes::default();
-                collect_ty_lifetimes(&sig.body, sig_src, pt, &mut plts);
-                (ret_lts.has_elided && (plts.has_elided || !plts.named.is_empty()))
-                    || ret_lts.named.iter().any(|n| plts.named.contains(n))
+                if has_ret_lt {
+                    let mut plts = Lifetimes::default();
+                    collect_ty_lifetimes(&sig.body, sig_src, pt, &mut plts);
+                    if (ret_lts.has_elided && (plts.has_elided || !plts.named.is_empty()))
+                        || ret_lts.named.iter().any(|n| plts.named.contains(n))
+                    {
+                        return true;
+                    }
+                }
+                !matches!(sig.body.ty(pt), AstTy::Ref { .. })
+                    && ty_shares_name(&sig.body, sig_src, pt, &ret_lts.names)
             })
         })
     }
@@ -705,7 +710,7 @@ fn ast_ty_may_carry_elided_lt(
             if seg.args.is_none() && (is_prim_name(name) || outer_params.contains(&name)) {
                 return false;
             }
-            if matches!(name, "Option" | "Result" | "Vec" | "Box")
+            if is_owned_container(name)
                 && let Some(Args::Angle(args)) = seg.args
             {
                 return body

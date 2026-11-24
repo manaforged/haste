@@ -9,7 +9,7 @@ Use **haste** for fast local edit-run-test cycles, live hot-reloading, embeddabl
 - **Zero-linker 6-target AOT cross-compilation:** `haste --release build -o ./app --target TRIPLE` emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 and ARM64) with no external cross-linker.
 - **Spanned diagnostics and baseline safety checks:** Reports file, line, column, source snippets, and secondary labels while enforcing ownership/NLL borrow checking, non-`'static` borrow escapes, structural `Send`/`Sync` auto traits, match exhaustiveness, and module/field privacy on reached code.
 - **Competitive AOT codegen:** Across five standalone AOT compute kernels (`scripts/bench.sh`, bit-identical outputs), beats or matches both `rustc -C opt-level=3` and matched-flag `rustc -C opt-level=3 -C target-cpu=native -C panic=abort` on **3 of 5** workloads on both x86-64 and ARM64 (`sha256` **0.80x–0.83x**, `sieve` **0.88x–0.91x**, `sort` **0.99x–1.05x**, `scan` **0.94x–1.09x**, `fp_iter` **1.11x–1.16x** vs matched flags).
-- **Verified across layered suites:** Passes **49 unit tests** on macOS / **48** on Linux (`haste-codegen` passes/verifier/wire/targets + `haste` AOT/borrow/diagnostics/CLI), **12 integration tests** (`Compiler` API, CLI/daemon lifecycle, and soundness/borrowck), **136 differential functions** (× 9 inputs = **1,224** checks), **19 async functions** (× 9 = **171** checks), **3 proc-macro functions** (× 9 = **27** checks), and **21 standalone crate probes** (including `regex`, `clap` derive, `serde_json`, `toml`, `winnow`, and a 3-crate workspace; 20 JIT + `--release` AOT plus `so` JIT-only) cross-checked against `rustc` with `HASTE_VERIFY_PASSES=1`.
+- **Verified across layered suites:** Passes **52 unit tests** on macOS / **51** on Linux (`haste-codegen` passes/verifier/wire/targets + `haste` AOT/PE32+ link metadata/borrow/diagnostics/CLI), **12 integration tests** (`Compiler` API, CLI/daemon lifecycle, and soundness/borrowck), **136 differential functions** (× 9 inputs = **1,224** checks), **19 async functions** (× 9 = **171** checks), **3 proc-macro functions** (× 9 = **27** checks), and **21 standalone crate probes** (including `regex`, `clap` derive, `serde_json`, `toml`, `winnow`, and a 3-crate workspace; 20 JIT + `--release` AOT plus `so` JIT-only) cross-checked against `rustc` with `HASTE_VERIFY_PASSES=1`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline and module tour.
 
@@ -186,7 +186,7 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime tables 
 `tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites (built with `--features diff-harness`, keeping default `haste` builds free of internal test fixtures), and `tests/probes` holds standalone crates. `scripts/check.sh` compares `cargo run` against both `haste test` (JIT) and `haste --release build -o` (standalone AOT).
 
 ```bash
-cargo test --locked --workspace --lib                       # Unit tests (49 macOS / 48 Linux)
+cargo test --locked --workspace --lib                       # Unit tests (52 macOS / 51 Linux)
 cargo test --locked -p haste --test compiler_api --test soundness  # Integration tests (API, CLI/daemon, soundness, borrowck)
 bash scripts/check.sh                                       # Differential suite (jit+aot vs rustc)
 bash scripts/check.sh tests/async                           # Async suite (jit+aot)

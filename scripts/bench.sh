@@ -369,7 +369,7 @@ if suite in ("all", "build"):
     seed = int(time.time()) % 100_000
     h_check_edits, c_check_edits = [], []
     h_emit_edits, c_build_edits = [], []
-    h_daemon_edits = []
+    h_daemon_edits, c_daemon_check_edits = [], []
     for i in range(1, 4):
         write_edit(diff_main, orig_src, needle, seed + i * 10)
         h_check_edits.append(run_timed(haste_check_cmd, env=check_haste_env))
@@ -398,6 +398,7 @@ if suite in ("all", "build"):
             for i in range(4, 7):
                 write_edit(diff_main, orig_src, needle, seed + i * 10)
                 h_daemon_edits.append(run_timed(haste_daemon_cmd, env=daemon_haste_env))
+                c_daemon_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
         finally:
             stop_daemon()
             signal.signal(signal.SIGINT, prev_sigint)
@@ -412,7 +413,7 @@ if suite in ("all", "build"):
         ("Single-line edit (`haste build -o` vs `cargo build`)", h_emit_edit, c_build_edit),
     ]
     if h_daemon_edits:
-        rows.insert(0, ("Single-line edit (`haste build --daemon` vs `cargo check`)", median_of(h_daemon_edits), c_check_edit))
+        rows.insert(0, ("Single-line edit (`haste build --daemon` vs `cargo check`)", median_of(h_daemon_edits), median_of(c_daemon_check_edits)))
     rows.extend([
         ("Unchanged no-op (`haste build` vs `cargo check`)", h_check_noop, c_check_noop),
         ("Unchanged no-op (`haste build -o` vs `cargo build`)", h_emit_noop, c_build_noop),

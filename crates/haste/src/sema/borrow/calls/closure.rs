@@ -152,6 +152,56 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
+    fn push_probe_loan(probe_state: &mut State, target: u32, holder: u32) {
+        push_loan(
+            &mut probe_state.loans,
+            target,
+            Vec::new(),
+            Some(holder),
+            false,
+            true,
+            false,
+            false,
+            None,
+        );
+    }
+
+    fn record_ret_param_sources(
+        sources: &[BorrowSource],
+        closure_params: &[u32],
+        out: &mut Vec<usize>,
+    ) {
+        for src in sources {
+            if let Some(idx) = closure_params.iter().position(|&p| p == src.target)
+                && !out.contains(&idx)
+            {
+                out.push(idx);
+            }
+        }
+    }
+
+    fn bind_probe_pat(
+        &mut self,
+        pat: crate::body::PatId,
+        init: ExprId,
+        probe_state: &mut State,
+        closure_params: &[u32],
+    ) {
+        let mut bound = HashSet::default();
+        self.collect_pat_locals(pat, &mut bound);
+        if bound.is_empty() {
+            return;
+        }
+        let srcs = self.expr_borrow_sources(init, probe_state);
+        for src in srcs {
+            if closure_params.contains(&src.target) {
+                for &local in &bound {
+                    Self::push_probe_loan(probe_state, src.target, local);
+                }
+            }
+        }
+    }
+
     fn closure_ret_param_indices(
         &mut self,
         body: ExprId,
@@ -161,39 +211,24 @@ impl Checker<'_, '_> {
         let mut probe_state = body_state.clone();
         for &p in closure_params {
             if self.ty_holds_borrow(self.local_ty(p)) {
-                push_loan(
-                    &mut probe_state.loans,
-                    p,
-                    Vec::new(),
-                    Some(p),
-                    false,
-                    true,
-                    false,
-                    false,
-                    None,
-                );
+                Self::push_probe_loan(&mut probe_state, p, p);
             }
         }
         let mut ret_exprs = vec![body];
-        self.collect_closure_return_exprs(body, &mut ret_exprs, &mut probe_state, closure_params);
+        self.collect_closure_return_exprs(
+            body,
+            (true, false),
+            &mut ret_exprs,
+            &mut probe_state,
+            closure_params,
+        );
         let mut out = Vec::new();
         for ret_expr in ret_exprs {
             if let Some(cached) = self.temp_sources.get(&ret_expr) {
-                for src in cached {
-                    if let Some(idx) = closure_params.iter().position(|&p| p == src.target)
-                        && !out.contains(&idx)
-                    {
-                        out.push(idx);
-                    }
-                }
+                Self::record_ret_param_sources(cached, closure_params, &mut out);
             }
-            for src in self.expr_borrow_sources(ret_expr, &probe_state) {
-                if let Some(idx) = closure_params.iter().position(|&p| p == src.target)
-                    && !out.contains(&idx)
-                {
-                    out.push(idx);
-                }
-            }
+            let srcs = self.expr_borrow_sources(ret_expr, &probe_state);
+            Self::record_ret_param_sources(&srcs, closure_params, &mut out);
         }
         out
     }
@@ -201,17 +236,66 @@ impl Checker<'_, '_> {
     fn collect_closure_return_exprs(
         &mut self,
         expr: ExprId,
+        (in_tail, break_returns): (bool, bool),
         out: &mut Vec<ExprId>,
         probe_state: &mut State,
         closure_params: &[u32],
     ) {
+        let non_tail = (false, false);
         match *self.body.expr(expr) {
-            Expr::Closure { .. } => {}
-            Expr::Return(Some(val)) => {
-                out.push(val);
-                self.collect_closure_return_exprs(val, out, probe_state, closure_params);
+            Expr::Lit(..)
+            | Expr::Path(_)
+            | Expr::Closure { .. }
+            | Expr::Continue(_)
+            | Expr::Macro { .. }
+            | Expr::Underscore
+            | Expr::FormatArgs(_)
+            | Expr::OffsetOf { .. } => {}
+            Expr::Return(val) => {
+                if let Some(val) = val {
+                    out.push(val);
+                    self.collect_closure_return_exprs(
+                        val,
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
             }
-            Expr::Block { stmts, tail, .. } => {
+            Expr::Become(val) => {
+                out.push(val);
+                self.collect_closure_return_exprs(val, non_tail, out, probe_state, closure_params);
+            }
+            Expr::Break(_, val) => {
+                if let Some(val) = val {
+                    if in_tail || break_returns {
+                        out.push(val);
+                    }
+                    self.collect_closure_return_exprs(
+                        val,
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+            }
+            Expr::Yield(val) => {
+                if let Some(val) = val {
+                    self.collect_closure_return_exprs(
+                        val,
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+            }
+            Expr::Block {
+                stmts, tail, label, ..
+            } => {
+                let stmt_break = break_returns || (in_tail && label.is_some());
                 for id in self.body.list(stmts).to_vec() {
                     match self.body.stmts[id as usize] {
                         Stmt::Let {
@@ -223,79 +307,123 @@ impl Checker<'_, '_> {
                             if let Some(e) = init {
                                 self.collect_closure_return_exprs(
                                     e,
+                                    non_tail,
                                     out,
                                     probe_state,
                                     closure_params,
                                 );
-                                let mut bound = HashSet::default();
-                                self.collect_pat_locals(pat, &mut bound);
-                                if !bound.is_empty() {
-                                    let srcs = self.expr_borrow_sources(e, probe_state);
-                                    for src in srcs {
-                                        if closure_params.contains(&src.target) {
-                                            for &local in &bound {
-                                                push_loan(
-                                                    &mut probe_state.loans,
-                                                    src.target,
-                                                    Vec::new(),
-                                                    Some(local),
-                                                    false,
-                                                    true,
-                                                    false,
-                                                    false,
-                                                    None,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
+                                self.bind_probe_pat(pat, e, probe_state, closure_params);
                             }
                             if let Some(e) = otherwise {
                                 self.collect_closure_return_exprs(
                                     e,
+                                    (false, stmt_break),
                                     out,
                                     probe_state,
                                     closure_params,
                                 );
                             }
                         }
-                        Stmt::Expr(e, _) => {
-                            self.collect_closure_return_exprs(e, out, probe_state, closure_params)
-                        }
+                        Stmt::Expr(e, _) => self.collect_closure_return_exprs(
+                            e,
+                            (false, stmt_break),
+                            out,
+                            probe_state,
+                            closure_params,
+                        ),
                         Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
                     }
                 }
                 if let Some(t) = tail {
-                    self.collect_closure_return_exprs(t, out, probe_state, closure_params);
+                    self.collect_closure_return_exprs(
+                        t,
+                        (in_tail, stmt_break),
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
                 }
             }
             Expr::If(c, t, e) => {
-                self.collect_closure_return_exprs(c, out, probe_state, closure_params);
-                self.collect_closure_return_exprs(t, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(c, non_tail, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(
+                    t,
+                    (in_tail, break_returns),
+                    out,
+                    probe_state,
+                    closure_params,
+                );
                 if let Some(alt) = e {
-                    self.collect_closure_return_exprs(alt, out, probe_state, closure_params);
+                    self.collect_closure_return_exprs(
+                        alt,
+                        (in_tail, break_returns),
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
                 }
+            }
+            Expr::Let(pat, init) => {
+                self.collect_closure_return_exprs(init, non_tail, out, probe_state, closure_params);
+                self.bind_probe_pat(pat, init, probe_state, closure_params);
             }
             Expr::Match(scrut, arms) => {
-                self.collect_closure_return_exprs(scrut, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(
+                    scrut,
+                    non_tail,
+                    out,
+                    probe_state,
+                    closure_params,
+                );
                 for id in self.body.list(arms).to_vec() {
                     let arm = self.body.arms[id as usize];
+                    self.bind_probe_pat(arm.pat, scrut, probe_state, closure_params);
                     if let Some(g) = arm.guard {
-                        self.collect_closure_return_exprs(g, out, probe_state, closure_params);
+                        self.collect_closure_return_exprs(
+                            g,
+                            non_tail,
+                            out,
+                            probe_state,
+                            closure_params,
+                        );
                     }
-                    self.collect_closure_return_exprs(arm.body, out, probe_state, closure_params);
+                    self.collect_closure_return_exprs(
+                        arm.body,
+                        (in_tail, break_returns),
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
                 }
             }
-            Expr::Loop { body, .. } => {
-                self.collect_closure_return_exprs(body, out, probe_state, closure_params)
-            }
+            Expr::Loop { body, .. } => self.collect_closure_return_exprs(
+                body,
+                (false, in_tail),
+                out,
+                probe_state,
+                closure_params,
+            ),
             Expr::While { cond, body, .. } => {
-                self.collect_closure_return_exprs(cond, out, probe_state, closure_params);
-                self.collect_closure_return_exprs(body, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(cond, non_tail, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(body, non_tail, out, probe_state, closure_params);
             }
-            Expr::For { iter, body, .. } => {
-                self.collect_closure_return_exprs(iter, out, probe_state, closure_params);
-                self.collect_closure_return_exprs(body, out, probe_state, closure_params);
+            Expr::For {
+                pat, iter, body, ..
+            } => {
+                self.collect_closure_return_exprs(iter, non_tail, out, probe_state, closure_params);
+                self.bind_probe_pat(pat, iter, probe_state, closure_params);
+                self.collect_closure_return_exprs(body, non_tail, out, probe_state, closure_params);
+            }
+            Expr::Assign(lhs, rhs) | Expr::AssignOp(_, lhs, rhs) => {
+                self.collect_closure_return_exprs(lhs, non_tail, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(rhs, non_tail, out, probe_state, closure_params);
+                if let Some(local) = self.expr_plain_local(lhs) {
+                    for src in self.expr_borrow_sources(rhs, probe_state) {
+                        if closure_params.contains(&src.target) {
+                            Self::push_probe_loan(probe_state, src.target, local);
+                        }
+                    }
+                }
             }
             Expr::Paren(inner)
             | Expr::Cast(inner, _)
@@ -303,14 +431,108 @@ impl Checker<'_, '_> {
             | Expr::Await(inner)
             | Expr::Unary(_, inner)
             | Expr::Ref { expr: inner, .. }
-            | Expr::Field(inner, _) => {
-                self.collect_closure_return_exprs(inner, out, probe_state, closure_params)
+            | Expr::Field(inner, _)
+            | Expr::TupleField(inner, _) => self.collect_closure_return_exprs(
+                inner,
+                (in_tail, break_returns),
+                out,
+                probe_state,
+                closure_params,
+            ),
+            Expr::Binary(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) => {
+                self.collect_closure_return_exprs(a, non_tail, out, probe_state, closure_params);
+                self.collect_closure_return_exprs(b, non_tail, out, probe_state, closure_params);
             }
-            Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) => {
-                self.collect_closure_return_exprs(a, out, probe_state, closure_params);
-                self.collect_closure_return_exprs(b, out, probe_state, closure_params);
+            Expr::Call(callee, args) => {
+                self.collect_closure_return_exprs(
+                    callee,
+                    non_tail,
+                    out,
+                    probe_state,
+                    closure_params,
+                );
+                for id in self.body.list(args).to_vec() {
+                    self.collect_closure_return_exprs(
+                        ExprId(id),
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
             }
-            _ => {}
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                self.collect_closure_return_exprs(
+                    receiver,
+                    non_tail,
+                    out,
+                    probe_state,
+                    closure_params,
+                );
+                for id in self.body.list(params).to_vec() {
+                    self.collect_closure_return_exprs(
+                        ExprId(id),
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+            }
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for id in self.body.list(list).to_vec() {
+                    self.collect_closure_return_exprs(
+                        ExprId(id),
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+            }
+            Expr::Struct { fields, base, .. } => {
+                for id in self.body.list(fields).to_vec() {
+                    let val = self.body.fields[id as usize].value;
+                    self.collect_closure_return_exprs(
+                        val,
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+                if let Some(b) = base {
+                    self.collect_closure_return_exprs(
+                        b,
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+            }
+            Expr::Range { from, to, .. } => {
+                if let Some(f) = from {
+                    self.collect_closure_return_exprs(
+                        f,
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+                if let Some(t) = to {
+                    self.collect_closure_return_exprs(
+                        t,
+                        non_tail,
+                        out,
+                        probe_state,
+                        closure_params,
+                    );
+                }
+            }
         }
     }
 
