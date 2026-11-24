@@ -149,9 +149,12 @@ impl<'a> Reader<'a> {
     }
 
     fn slot_data(&mut self) -> Option<SlotData> {
+        let size = self.u32()?;
+        let flags = self.byte()?;
         Some(SlotData {
-            size: self.u32()?,
-            align_shift: self.byte()?,
+            size,
+            align_shift: flags & 0x7f,
+            poll_local: (flags & 0x80) != 0,
         })
     }
 

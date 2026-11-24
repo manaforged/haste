@@ -77,6 +77,7 @@ struct Frame {
     size: u32,
     slots: Vec<Home>,
     spills: HashMap<Value, i32>,
+    object_spills: Vec<Value>,
 }
 
 impl Frame {
@@ -133,27 +134,74 @@ impl Frame {
     }
 }
 
+fn entry_object_values(
+    func: &Function,
+    cfg: &Cfg,
+    old_entry: Block,
+    obj_param: usize,
+) -> Vec<Value> {
+    if !cfg.preds_of(old_entry).is_empty() {
+        return Vec::new();
+    }
+    let Some(&root) = func.blocks[old_entry.index()].params.get(obj_param) else {
+        return Vec::new();
+    };
+    let mut vals = vec![root];
+    let mut slots: Vec<StackSlot> = Vec::new();
+    for &inst in &func.blocks[old_entry.index()].insts {
+        let data = &func.insts[inst.index()];
+        match data.op {
+            Op::StackStore(v, slot, 0)
+                if vals.contains(&v) && func.slots[slot.index()].size == 8 =>
+            {
+                if !slots.contains(&slot) {
+                    slots.push(slot);
+                }
+            }
+            Op::StackStore(_, slot, _) | Op::StackAddr(slot, _) => {
+                slots.retain(|&s| s != slot);
+            }
+            Op::StackLoad(slot, 0) if slots.contains(&slot) => {
+                if let Some(res) = data.result
+                    && func.ty(res) == Type::I64
+                    && !vals.contains(&res)
+                {
+                    vals.push(res);
+                }
+            }
+            _ => {}
+        }
+    }
+    vals
+}
+
 fn build_frame(
     func: &mut Function,
     cfg: &Cfg,
     spec: &Coroutine,
-    spills: Vec<Value>,
+    (spills, object_spills): (Vec<Value>, Vec<Value>),
     is_spill: &[bool],
 ) -> (Frame, Vec<SlotData>) {
     let framed = slots::framed(func, cfg, (&spec.resumes, &spec.done), is_spill);
+    let has_obj = !object_spills.is_empty();
     let mut frame = Frame {
         size: 0,
         slots: vec![Home::Stack(StackSlot(0)); func.slots.len()],
         spills: HashMap::default(),
+        object_spills,
     };
     let mut stack = vec![SlotData {
-        size: 8,
+        size: if has_obj { 16 } else { 8 },
         align_shift: 3,
+        poll_local: true,
     }];
     let mut on_stack = vec![false; func.slots.len()];
     let (mut private, mut shared) = (Vec::new(), Vec::new());
     for (d, &raw_slot) in framed.raw_of.iter().enumerate() {
-        if framed.kept[d] && !func.is_unwind_slot(StackSlot(raw_slot as u32)) {
+        if framed.kept[d]
+            && !func.is_unwind_slot(StackSlot(raw_slot as u32))
+            && !func.slots[raw_slot].poll_local
+        {
             let data = &func.slots[raw_slot];
             let placed = if framed.escaped[d] {
                 &mut shared
@@ -211,13 +259,25 @@ pub(crate) fn split(func: &mut Function) {
         return;
     }
     fold_flags::run(func, &spec, old_entry);
+    lazy::localize_slot_addrs(func);
     let defs = func.def_blocks();
     let cfg = func.cfg();
-    let spills = live_across_suspend(func, &cfg, &spec.resumes, &defs);
+    let mut spills = live_across_suspend(func, &cfg, &spec.resumes, &defs);
+    let obj_vals = entry_object_values(func, &cfg, old_entry, spec.object);
+    let mut object_spills = Vec::new();
+    spills.retain(|v| {
+        if obj_vals.contains(v) {
+            object_spills.push(*v);
+            false
+        } else {
+            true
+        }
+    });
+    let has_obj_spill = !object_spills.is_empty();
     let mut is_spill = vec![false; func.types.len()];
     spills.iter().for_each(|v| is_spill[v.index()] = true);
-    let (frame, mut stack) = build_frame(func, &cfg, &spec, spills, &is_spill);
-    let lazy = lazy::plan(func, &frame, &is_spill, &mut stack);
+    let (frame, mut stack) = build_frame(func, &cfg, &spec, (spills, object_spills), &is_spill);
+    let lazy = lazy::plan(func, &spec, &frame, (&is_spill, &mut stack));
     func.slots = stack;
     for u in &mut func.unwind_drops {
         if let Home::Stack(slot) = frame.slots[u.local.index()] {
@@ -228,8 +288,12 @@ pub(crate) fn split(func: &mut Function) {
         }
     }
     let (anchor, orig_blocks) = (StackSlot(0), func.blocks.len());
-    let (init, init_fp, dispatch, disp_fp) =
-        entry(func, &spec, (old_entry, anchor), (frame.bytes(), lazy));
+    let (init, init_fp, dispatch, disp_fp) = entry(
+        func,
+        &spec,
+        (old_entry, anchor),
+        (frame.bytes(), lazy.as_ref(), has_obj_spill),
+    );
     func.bump_cfg();
     let split_cfg = func.cfg();
     let mut active_fp: Vec<Option<Value>> = vec![None; func.blocks.len()];
@@ -265,7 +329,7 @@ pub(crate) fn split(func: &mut Function) {
             );
         }
     }
-    if let Some(lazy) = lazy {
+    if let Some(lazy) = &lazy {
         lazy::settle(func, &spec, anchor, lazy, orig_blocks);
     }
     func.bump_cfg();
@@ -442,6 +506,21 @@ fn rewrite(
             if loaded.contains_key(&value) {
                 return;
             }
+            if frame.object_spills.contains(&value) {
+                let dom_live = cfg.reachable[block.index()]
+                    && defs[value.index()]
+                        .is_some_and(|def| def != block && cfg.dominates(def, block));
+                if dom_live {
+                    loaded.insert(value, value);
+                } else {
+                    loaded.insert(
+                        value,
+                        push(func, &mut insts, Op::StackLoad(anchor, 8), Some(Type::I64))
+                            .expect("a load has a result"),
+                    );
+                }
+                return;
+            }
             if let Some(&at) = frame.spills.get(&value) {
                 let dom_live = cfg.reachable[block.index()]
                     && defs[value.index()]
@@ -565,18 +644,22 @@ fn entry(
     func: &mut Function,
     spec: &Coroutine,
     (old_entry, anchor): (Block, StackSlot),
-    (size, lazy): (u32, Option<lazy::Lazy>),
+    (size, lazy, save_object): (u32, Option<&lazy::Lazy>, bool),
 ) -> (Block, Value, Block, Value) {
     let mut b = FunctionBuilder::new(func);
     let (params, state, fresh) = check_unresumed(&mut b, spec);
     let object = params[spec.object];
+    if lazy.is_some() || save_object {
+        b.ins().stack_store(object, anchor, 8);
+    }
     let (init, dispatch) = (b.create_block(), b.create_block());
     b.ins().brif(fresh, init, &[], dispatch, &[]);
     b.switch_to_block(init);
     let init_fp = if let Some(lazy) = lazy {
         let buf = b.ins().stack_addr(Type::I64, lazy.buf, 0);
         b.func.mark_frame_ptr(buf);
-        b.ins().stack_store(object, anchor, 8);
+        let one = b.ins().iconst(Type::I8, 1);
+        b.ins().stack_store(one, anchor, 16);
         buf
     } else {
         let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
@@ -602,6 +685,10 @@ fn entry(
     b.func.mark_unique_ptr(disp_fp);
     b.func.mark_frame_ptr(disp_fp);
     b.ins().stack_store(disp_fp, anchor, 0);
+    if lazy.is_some() {
+        let zero = b.ins().iconst(Type::I8, 0);
+        b.ins().stack_store(zero, anchor, 16);
+    }
     if spec.resumes.len() >= 2 {
         let idx = b
             .ins()

@@ -527,6 +527,7 @@ fn merge_slots(func: &mut Function, slots: &[StackSlot]) {
     func.slots[s0.index()].align_shift = slots
         .iter()
         .fold(0, |m, s| m.max(func.slots[s.index()].align_shift));
+    func.slots[s0.index()].poll_local = slots.iter().all(|s| func.slots[s.index()].poll_local);
     for data in &mut func.insts {
         match &mut data.op {
             Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _)

@@ -78,7 +78,11 @@ impl<'f> FunctionBuilder<'f> {
 
     /// Adds a frame area of `size` bytes aligned to `1 << align_shift`.
     pub fn create_stack_slot(&mut self, size: u32, align_shift: u8) -> StackSlot {
-        self.func.slots.push(SlotData { size, align_shift });
+        self.func.slots.push(SlotData {
+            size,
+            align_shift,
+            poll_local: false,
+        });
         StackSlot(self.func.slots.len() as u32 - 1)
     }
 

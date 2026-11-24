@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
-use crate::ir::{Binary, Block, Function, Inst, Op, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, Op, Value};
 use crate::live::{BitMatrix, set_bits, solve_backward_liveness};
 use crate::mem::Provenance;
 
@@ -292,12 +292,152 @@ fn build_inst_pos(func: &Function) -> HashMap<(usize, usize), u32> {
     inst_pos
 }
 
+fn push_if_unseen(v: Value, stamp: u32, seen: &mut [u32], work: &mut Vec<Value>) {
+    if std::mem::replace(&mut seen[v.index()], stamp) != stamp {
+        work.push(v);
+    }
+}
+
+fn addr_use_escapes_poll(
+    func: &Function,
+    (dense_of, taken, live_at_resume, slot_loads): (&[u32], &[bool], &[bool], &[Vec<Value>]),
+    (val, inst, stamp): (Value, Inst, u32),
+    (seen_val, seen_holder, work): (&mut [u32], &mut [u32], &mut Vec<Value>),
+) -> bool {
+    let data = &func.insts[inst.index()];
+    match &data.op {
+        Op::Load(addr, _) | Op::AtomicLoad(addr, _) | Op::Trapz(addr) => *addr != val,
+        Op::Store(stored, addr, _) | Op::AtomicStore(stored, addr, _) => {
+            *addr != val || *stored == val
+        }
+        Op::AtomicRmw(_, _, addr, stored) => *addr != val || *stored == val,
+        Op::AtomicCas(_, addr, exp, new) => *addr != val || *exp == val || *new == val,
+        Op::Move(..) | Op::Icmp(..) => false,
+        Op::Copy(_, _, len) => *len == val,
+        Op::Binary(Binary::Iadd, a, b) => {
+            if (*a == val) == (*b == val) {
+                return true;
+            }
+            if let Some(res) = data.result {
+                push_if_unseen(res, stamp, seen_val, work);
+            }
+            false
+        }
+        Op::Binary(Binary::Isub, a, b) => {
+            if *a != val || *b == val {
+                return true;
+            }
+            if let Some(res) = data.result {
+                push_if_unseen(res, stamp, seen_val, work);
+            }
+            false
+        }
+        Op::Convert(Convert::Bitcast, a) => {
+            if *a != val {
+                return true;
+            }
+            if let Some(res) = data.result {
+                push_if_unseen(res, stamp, seen_val, work);
+            }
+            false
+        }
+        Op::Select(cond, a, b) => {
+            if *cond == val && *a != val && *b != val {
+                return false;
+            }
+            if let Some(res) = data.result {
+                push_if_unseen(res, stamp, seen_val, work);
+            }
+            false
+        }
+        Op::Jump(target, args) => {
+            push_target_params(func, val, (*target, args), stamp, seen_val, work);
+            false
+        }
+        Op::Brif(_, t, t_args, f, f_args) => {
+            push_target_params(func, val, (*t, t_args), stamp, seen_val, work);
+            push_target_params(func, val, (*f, f_args), stamp, seen_val, work);
+            false
+        }
+        Op::StackStore(stored, dst, _) if *stored == val => {
+            let dst_d = dense_of[dst.index()] as usize;
+            if taken[dst_d] || live_at_resume[dst_d] || func.is_unwind_slot(*dst) {
+                return true;
+            }
+            if std::mem::replace(&mut seen_holder[dst_d], stamp) != stamp {
+                for &loaded in &slot_loads[dst_d] {
+                    push_if_unseen(loaded, stamp, seen_val, work);
+                }
+            }
+            false
+        }
+        _ => true,
+    }
+}
+
+fn slot_addrs_escape_poll(
+    func: &Function,
+    (dense_of, raw_of): (&[u32], &[usize]),
+    value_uses: &[Vec<(Block, Inst)>],
+    (taken, live_at_resume, is_spill): (&[bool], &[bool], &[bool]),
+) -> Vec<bool> {
+    let slots = raw_of.len();
+    let mut addr_roots: Vec<Vec<Value>> = vec![Vec::new(); slots];
+    let mut slot_loads: Vec<Vec<Value>> = vec![Vec::new(); slots];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            match data.op {
+                Op::StackAddr(slot, _) => addr_roots[dense_of[slot.index()] as usize].push(res),
+                Op::StackLoad(slot, _) => slot_loads[dense_of[slot.index()] as usize].push(res),
+                _ => {}
+            }
+        }
+    }
+    let mut escapes = vec![false; slots];
+    let mut seen_val = vec![0_u32; func.types.len()];
+    let mut seen_holder = vec![0_u32; slots];
+    let mut work = Vec::new();
+    for (s, roots) in addr_roots.iter().enumerate() {
+        if roots.is_empty() || live_at_resume[s] {
+            continue;
+        }
+        let stamp = (s + 1) as u32;
+        work.clear();
+        for &root in roots {
+            push_if_unseen(root, stamp, &mut seen_val, &mut work);
+        }
+        while let Some(val) = work.pop() {
+            if is_spill.get(val.index()).copied().unwrap_or(false) {
+                escapes[s] = true;
+                break;
+            }
+            for &(_, inst) in &value_uses[val.index()] {
+                if addr_use_escapes_poll(
+                    func,
+                    (dense_of, taken, live_at_resume, &slot_loads),
+                    (val, inst, stamp),
+                    (&mut seen_val, &mut seen_holder, &mut work),
+                ) {
+                    escapes[s] = true;
+                    break;
+                }
+            }
+            if escapes[s] {
+                break;
+            }
+        }
+    }
+    escapes
+}
+
 fn slot_effects(
     func: &Function,
     (dense_of, raw_of): (&[u32], &[usize]),
     value_uses: &[Vec<(Block, Inst)>],
     (can_suspend, is_spill): (&[bool], &[bool]),
-) -> (Vec<bool>, SlotAnalysis) {
+) -> (Vec<bool>, Vec<bool>, SlotAnalysis) {
     let (slots, blocks) = (raw_of.len(), func.blocks.len());
     let (taken, taken_can_suspend, escaped, extra_uses) = trace_stack_addrs(
         func,
@@ -397,6 +537,7 @@ fn slot_effects(
         list.dedup();
     }
     (
+        taken,
         taken_can_suspend,
         SlotAnalysis {
             escaped,
@@ -545,7 +686,7 @@ pub(super) fn framed(
     }
     let can_suspend = blocks_reaching_suspend(func, done);
     let value_uses = collect_value_uses(func);
-    let (taken_can_suspend, analysis) = slot_effects(
+    let (taken, taken_can_suspend, analysis) = slot_effects(
         func,
         (&dense_of, &raw_of),
         &value_uses,
@@ -557,10 +698,19 @@ pub(super) fn framed(
         &analysis.reads,
         &analysis.writes,
     );
+    let live_at_resume: Vec<bool> = (0..slots)
+        .map(|at| resumes.iter().any(|resume| live_in.get(resume.index(), at)))
+        .collect();
+    let escapes_poll = slot_addrs_escape_poll(
+        func,
+        (&dense_of, &raw_of),
+        &value_uses,
+        (&taken, &live_at_resume, is_spill),
+    );
     let kept: Vec<bool> = (0..slots)
         .map(|at| {
-            (taken_can_suspend[at] && analysis.escaped[at])
-                || resumes.iter().any(|resume| live_in.get(resume.index(), at))
+            !func.slots[raw_of[at]].poll_local
+                && (live_at_resume[at] || (taken_can_suspend[at] && escapes_poll[at]))
         })
         .collect();
     let before = written_before(func, slots, resumes, &analysis, &live_in);

@@ -15,7 +15,7 @@ pub(super) fn encode(func: &Function) -> Option<Vec<u8>> {
     w.raw(&func.value_flags);
     w.slice(&func.slots, |w, slot| {
         w.u32(slot.size);
-        w.byte(slot.align_shift);
+        w.byte(slot.align_shift | (u8::from(slot.poll_local) << 7));
     });
     w.slice(&func.sigs, Writer::signature);
     w.body(func);
