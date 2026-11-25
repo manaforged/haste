@@ -399,11 +399,16 @@ fn run(
         .map(|(script, _)| *script)
         .collect();
     if !compiled.is_empty() {
-        eprintln!(
-            "haste: running {} build script{}...",
-            compiled.len(),
-            if compiled.len() == 1 { "" } else { "s" }
-        );
+        let user_scripts = compiled
+            .iter()
+            .filter(|&&(unit, _)| !workspace.packages[workspace.graph.units[unit].package].sysroot)
+            .count();
+        if user_scripts > 0 {
+            eprintln!(
+                "haste: running {user_scripts} build script{}...",
+                if user_scripts == 1 { "" } else { "s" }
+            );
+        }
     }
     let mains: Vec<Option<crate::names::ItemRef>> = compiled
         .iter()

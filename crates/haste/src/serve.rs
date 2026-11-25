@@ -354,7 +354,15 @@ mod unix_ipc {
                 }
             });
         }
-        drop(cmd.spawn());
+        if let Ok(mut child) = cmd.spawn() {
+            let (_, sock, _, _) = address(root);
+            for _ in 0..200 {
+                if control::ping(&sock) || child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
     }
 
     fn idle_timeout_ms() -> Option<i32> {

@@ -495,7 +495,7 @@ fn report(
         Command::Clean => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
-    if !matches!(command, Command::Request(Request::Run)) {
+    if matches!(command, Command::Debug(Query::Graph)) {
         eprintln!(
             "graph {} packages {} units in {:.1} ms",
             workspace.packages.len(),

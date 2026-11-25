@@ -185,10 +185,25 @@ fn stop_record(_rec: &Record) -> bool {
     false
 }
 
+pub(super) fn ping(socket_name: &str) -> bool {
+    send_control(socket_name, PING_BYTE)
+}
+
 /// Stops active `haste serve` daemons matching `filter` (or all when `filter` is `None`).
 pub fn stop(filter: Option<&Path>) -> Result<i32> {
     let active = list_active(filter);
     if active.is_empty() {
+        if let Some(path) = filter {
+            let others = list_active(None).len();
+            if others > 0 {
+                println!(
+                    "no active haste daemon for {} ({others} other daemon{} active; pass PATH or --all)",
+                    path.display(),
+                    if others == 1 { "" } else { "s" }
+                );
+                return Ok(0);
+            }
+        }
         println!("no active haste daemons to stop");
         return Ok(0);
     }

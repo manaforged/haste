@@ -439,6 +439,25 @@ impl Batch {
         if !self.broken.is_empty() {
             bail!("{} functions failed to compile", self.broken.len());
         }
+        let reached_crates: HashSet<usize> = self
+            .reached
+            .list
+            .iter()
+            .map(|((item, _), _)| item.krate as usize)
+            .collect();
+        for krate_idx in reached_crates {
+            let krate = &compilation.outline.crates[krate_idx];
+            if let Some(script) = &krate.env.script
+                && let Some((_, lib)) = script
+                    .link_libs()
+                    .find(|(kind, _)| *kind == crate::graph::script::LinkKind::Static)
+            {
+                let name = &compilation.outline.roots[krate_idx].name;
+                bail!(
+                    "standalone AOT (-o) does not yet link static C archive `{lib}` from crate `{name}`; use `haste run` or `cargo build`"
+                );
+            }
+        }
         let store = self
             .store
             .take()

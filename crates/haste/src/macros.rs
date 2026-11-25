@@ -12,7 +12,7 @@ use crate::outline::Outline;
 use crate::outline::attr::{self, split_commas};
 use crate::outline::item::{Attr, ItemKind, ProcKind};
 use crate::outline::source::Source;
-use crate::outline::tree::PROC_MACRO_ROOT;
+use crate::outline::tree::{PROC_MACRO_ROOT, Profile};
 use crate::sema::reach::{Instance, Reached, reach_wave};
 use crate::sema::{Answer, Cache, Context};
 
@@ -72,7 +72,12 @@ fn load_with_sysroot(
         && crate::scripts::sysroot_scripts_settled(workspace);
     let sysroot_started = show_sysroot.then(std::time::Instant::now);
     if show_sysroot {
-        eprintln!("haste: indexing standard library (one-time)...");
+        let mode = if crate::profile() == Profile::Release {
+            "release"
+        } else {
+            "debug"
+        };
+        eprintln!("haste: indexing standard library ({mode}, one-time)...");
     }
     if !eager_all {
         if was_miss {
@@ -134,10 +139,8 @@ fn load_with_sysroot(
     if was_miss && crate::scripts::sysroot_scripts_settled(workspace) {
         crate::substrate::sysroot::save(workspace, targets, &compilation);
         if let Some(started) = sysroot_started {
-            eprintln!(
-                "haste: standard library cached in {:.1}s",
-                started.elapsed().as_secs_f64()
-            );
+            let secs = started.elapsed().as_secs_f64();
+            eprintln!("haste: standard library cached in {secs:.1}s");
         }
     }
     let errors = compilation.outline.local_errors(workspace);

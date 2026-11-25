@@ -30,7 +30,7 @@ pub(super) fn usage() -> String {
         .map(|(_, name)| name)
         .collect();
     format!(
-        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--ignored] [--include-ignored] [--target TRIPLE] [--jobs N] [--release] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -129,7 +129,15 @@ fn parse(
     }
     Request::parse_mode(&word)
         .map(|req| Ok(Command::Request(req)))
-        .with_context(usage)
+        .ok_or_else(|| {
+            if word == "check" {
+                anyhow::anyhow!(
+                    "unknown command `check` (did you mean `haste build`?); run `haste --help` for usage"
+                )
+            } else {
+                anyhow::anyhow!("unknown command `{word}`; run `haste --help` for usage")
+            }
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
