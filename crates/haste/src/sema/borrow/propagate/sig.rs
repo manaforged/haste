@@ -14,6 +14,16 @@ use super::super::checks;
 use super::super::{Checker, State};
 use super::{BorrowSource, dedup_sources, state_holds_other_target, unwrap_container_loans};
 
+pub(super) struct SigCall<'a, 'b> {
+    pub(super) expr: ExprId,
+    pub(super) fn_item: ItemRef,
+    pub(super) sig: &'b Signature,
+    pub(super) sig_src: &'a Source,
+    pub(super) sig_item: &'a Item,
+    pub(super) receiver: Option<ExprId>,
+    pub(super) arg_ids: &'b [u32],
+}
+
 struct SigFnFlags<'a> {
     fn_name: &'a str,
     is_iter_fn: bool,
@@ -33,14 +43,7 @@ struct SigCallCtx<'a, 'b> {
 }
 
 impl<'a> Checker<'_, 'a> {
-    pub(super) fn call_borrow_sources(
-        &mut self,
-        expr: ExprId,
-        callee: ExprId,
-        args: List,
-        state: &State,
-        extend_depth: Option<u32>,
-    ) -> Vec<BorrowSource> {
+    pub(super) fn call_sig_fn_item(&mut self, expr: ExprId, callee: ExprId) -> Option<ItemRef> {
         let res = if self.body.names_callee(callee) {
             self.typed
                 .res
@@ -51,19 +54,6 @@ impl<'a> Checker<'_, 'a> {
             self.typed.res.get(&expr).copied()
         };
         match res {
-            Some(Res::Ctor(..)) => {
-                let arg_ids: Vec<u32> = self.body.list(args).to_vec();
-                let mut out = Vec::new();
-                for id in arg_ids {
-                    out.extend(self.expr_borrow_sources_inner(
-                        ExprId(id),
-                        state,
-                        true,
-                        extend_depth,
-                    ));
-                }
-                dedup_sources(out)
-            }
             Some(Res::Fn(fn_item, _))
                 if !matches!(self.cx.types.kind(self.expr_ty(callee)), Kind::Closure(..))
                     && !self
@@ -72,30 +62,59 @@ impl<'a> Checker<'_, 'a> {
                         .and_then(|tr| self.cx.lang(tr))
                         .is_some_and(crate::sema::infer::is_callable_lang) =>
             {
-                self.sig_borrow_sources(expr, fn_item, None, args, state)
+                Some(fn_item)
             }
-            _ => {
-                let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
-                let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
-                let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee, ret_has_borrow);
-                let copies_inner_arg = self
-                    .closure_expr_of(callee)
-                    .is_some_and(|c| self.closure_copies_inner_ref(c));
-                let arg_ids: Vec<u32> = self.body.list(args).to_vec();
-                for (idx, id) in arg_ids.into_iter().enumerate() {
-                    if hrtb_non_ret.contains(&idx) {
-                        continue;
-                    }
-                    let arg = ExprId(id);
-                    if copies_inner_arg && idx == 0 {
-                        out.extend(self.copied_arg_borrow_sources(expr, arg, state));
-                    } else {
-                        out.extend(self.expr_borrow_sources_inner(arg, state, true, None));
-                    }
-                }
-                self.finish_sig_sources(expr, out, false)
+            _ => None,
+        }
+    }
+
+    pub(super) fn call_borrow_sources(
+        &mut self,
+        expr: ExprId,
+        callee: ExprId,
+        args: List,
+        state: &State,
+        extend_depth: Option<u32>,
+    ) -> Vec<BorrowSource> {
+        let ctor_res = if self.body.names_callee(callee) {
+            self.typed
+                .res
+                .get(&callee)
+                .or_else(|| self.typed.res.get(&expr))
+                .copied()
+        } else {
+            self.typed.res.get(&expr).copied()
+        };
+        if matches!(ctor_res, Some(Res::Ctor(..))) {
+            let arg_ids: Vec<u32> = self.body.list(args).to_vec();
+            let mut out = Vec::new();
+            for id in arg_ids {
+                out.extend(self.expr_borrow_sources_inner(ExprId(id), state, true, extend_depth));
+            }
+            return dedup_sources(out);
+        }
+        if let Some(fn_item) = self.call_sig_fn_item(expr, callee) {
+            return self.sig_borrow_sources(expr, fn_item, None, args, state);
+        }
+        let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
+        let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
+        let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee, ret_has_borrow);
+        let copies_inner_arg = self
+            .closure_expr_of(callee)
+            .is_some_and(|c| self.closure_copies_inner_ref(c));
+        let arg_ids: Vec<u32> = self.body.list(args).to_vec();
+        for (idx, id) in arg_ids.into_iter().enumerate() {
+            if hrtb_non_ret.contains(&idx) {
+                continue;
+            }
+            let arg = ExprId(id);
+            if copies_inner_arg && idx == 0 {
+                out.extend(self.copied_arg_borrow_sources(expr, arg, state));
+            } else {
+                out.extend(self.expr_borrow_sources_inner(arg, state, true, None));
             }
         }
+        self.finish_sig_sources(expr, out, false)
     }
 
     pub(super) fn method_borrow_sources(
@@ -133,6 +152,20 @@ impl<'a> Checker<'_, 'a> {
         self.place_to_sources(&p, mutable, state)
     }
 
+    pub(super) fn normalize_sig_args(
+        &self,
+        receiver: Option<ExprId>,
+        args: List,
+        sig: &Signature,
+    ) -> (Option<ExprId>, Vec<u32>) {
+        let raw_args = self.body.list(args);
+        if receiver.is_none() && sig.receiver.is_some() && !raw_args.is_empty() {
+            (Some(ExprId(raw_args[0])), raw_args[1..].to_vec())
+        } else {
+            (receiver, raw_args.to_vec())
+        }
+    }
+
     fn sig_borrow_sources(
         &mut self,
         expr: ExprId,
@@ -144,13 +177,7 @@ impl<'a> Checker<'_, 'a> {
         let Ok(sig) = self.cx.signature(fn_item) else {
             return Vec::new();
         };
-        let raw_args = self.body.list(args);
-        let (receiver, arg_ids): (Option<ExprId>, Vec<u32>) =
-            if receiver.is_none() && sig.receiver.is_some() && !raw_args.is_empty() {
-                (Some(ExprId(raw_args[0])), raw_args[1..].to_vec())
-            } else {
-                (receiver, raw_args.to_vec())
-            };
+        let (receiver, arg_ids) = self.normalize_sig_args(receiver, args, &sig);
         if sig.is_async {
             let mut out = Vec::new();
             if let Some(recv) = receiver {
@@ -174,25 +201,53 @@ impl<'a> Checker<'_, 'a> {
             return Vec::new();
         };
         let (sig_src, sig_item) = self.cx.item(fn_item);
-        let ret_lts = self.collect_ret_lifetimes(fn_item, &sig, sig_src, ret_ast);
-        let flags = self.sig_fn_flags(fn_item, &sig);
-        let ctx = SigCallCtx {
+        let call = SigCall {
             expr,
+            fn_item,
             sig: &sig,
             sig_src,
             sig_item,
+            receiver,
+            arg_ids: &arg_ids,
+        };
+        self.sig_sources_for_ret(&call, ret_ast, self.expr_ty(expr), state)
+    }
+
+    pub(super) fn sig_sources_for_ret(
+        &mut self,
+        call: &SigCall<'a, '_>,
+        ret_ast: TyId,
+        ret_ty: Ty,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        if ret_ty != Ty::NONE && !self.ty_holds_borrow(ret_ty) {
+            return Vec::new();
+        }
+        let ret_lts = self.collect_ret_lifetimes(call.fn_item, call.sig, call.sig_src, ret_ast);
+        let flags = self.sig_fn_flags(call.fn_item, call.sig);
+        let ctx = SigCallCtx {
+            expr: call.expr,
+            sig: call.sig,
+            sig_src: call.sig_src,
+            sig_item: call.sig_item,
             ret_ast,
             ret_lts: &ret_lts,
             flags,
         };
         if !ret_lts.has_elided && ret_lts.named.is_empty() {
-            return self.sig_sources_without_ret_lifetimes(&ctx, receiver, &arg_ids, state);
+            return self.sig_sources_without_ret_lifetimes(
+                &ctx,
+                call.receiver,
+                call.arg_ids,
+                ret_ty,
+                state,
+            );
         }
-        let mut out = self.sig_arg_sources_with_lifetimes(&ctx, &arg_ids, state);
-        if let Some(recv) = receiver {
-            out.extend(self.sig_recv_sources_with_lifetimes(&ctx, recv, state));
+        let mut srcs = self.sig_arg_sources_with_lifetimes(&ctx, call.arg_ids, state);
+        if let Some(recv) = call.receiver {
+            srcs.extend(self.sig_recv_sources_with_lifetimes(&ctx, recv, state));
         }
-        self.finish_sig_sources(expr, out, ctx.flags.is_by_ref)
+        self.finish_sources_for_ty(ret_ty, srcs, ctx.flags.is_by_ref)
     }
 
     fn collect_ret_lifetimes(
@@ -245,6 +300,7 @@ impl<'a> Checker<'_, 'a> {
         ctx: &SigCallCtx<'a, '_>,
         receiver: Option<ExprId>,
         arg_ids: &[u32],
+        ret_ty: Ty,
         state: &State,
     ) -> Vec<BorrowSource> {
         let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
@@ -283,7 +339,7 @@ impl<'a> Checker<'_, 'a> {
                 self.sig_no_lt_recv_sources(ctx.expr, sig, recv, arg_ids, &ctx.flags, state),
             );
         }
-        self.finish_sig_sources(ctx.expr, out, ctx.flags.is_by_ref)
+        self.finish_sources_for_ty(ret_ty, out, ctx.flags.is_by_ref)
     }
 
     fn sig_no_lt_recv_sources(
@@ -384,9 +440,7 @@ impl<'a> Checker<'_, 'a> {
                         self.expr_borrow_sources_inner(ae, state, true, None)
                     };
                     if matches!(sig.body.ty(pt), AstTy::Ref { mutable: false, .. }) {
-                        for s in &mut arg_sources {
-                            s.mutable = false;
-                        }
+                        arg_sources = super::clamp_mut(arg_sources, false);
                     }
                     out.extend(arg_sources);
                 }
@@ -585,7 +639,7 @@ impl<'a> Checker<'_, 'a> {
             srcs
         } else {
             let mut srcs = self.expr_borrow_sources_inner(recv, state, true, None);
-            if self.is_non_promotable_temp(recv) {
+            if self.is_non_promotable_borrow_temp(recv, true) {
                 srcs.push(BorrowSource::temp(self.temp_scope_depth, true, true));
             }
             srcs
@@ -684,10 +738,18 @@ impl<'a> Checker<'_, 'a> {
     fn finish_sig_sources(
         &mut self,
         expr: ExprId,
+        out: Vec<BorrowSource>,
+        keep_env_only: bool,
+    ) -> Vec<BorrowSource> {
+        self.finish_sources_for_ty(self.expr_ty(expr), out, keep_env_only)
+    }
+
+    fn finish_sources_for_ty(
+        &mut self,
+        ret_ty: Ty,
         mut out: Vec<BorrowSource>,
         keep_env_only: bool,
     ) -> Vec<BorrowSource> {
-        let ret_ty = self.expr_ty(expr);
         if !keep_env_only && ret_ty != Ty::NONE && !self.ty_holds_closure(ret_ty) {
             out.retain(|s| !s.env_only);
             for s in &mut out {

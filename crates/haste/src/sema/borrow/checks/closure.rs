@@ -127,18 +127,7 @@ impl Checker<'_, '_> {
     }
 
     fn callee_param_bounds(&mut self, callee: ExprId) -> Option<ParamBounds> {
-        let cur = self.unwrap_parens(callee);
-        let crate::sema::infer::Res::Local(local) = self.typed.res.get(&cur).copied()? else {
-            return None;
-        };
-        let pos = self.typed.params.iter().position(|&p| p == local)?;
-        let sig = self.cx.signature(self.item).ok()?;
-        let param_idx = if sig.receiver.is_some() {
-            pos.checked_sub(1)?
-        } else {
-            pos
-        };
-        let &(_, param_ty) = sig.params.get(param_idx)?;
+        let (sig, param_ty) = self.local_param_sig_ty(callee)?;
         Some(self.param_bound_reqs(&sig, self.src, param_ty))
     }
 
@@ -369,7 +358,10 @@ impl Checker<'_, '_> {
         let plain = self.expr_plain_local(expr);
         for s in sources {
             if is_temp_target(s.target).is_some() {
-                if in_const && !self.is_non_promotable_temp(expr) {
+                if in_const
+                    && self.temp_target_allowed(s.mutable)
+                    && !self.is_non_promotable_temp(expr)
+                {
                     continue;
                 }
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));

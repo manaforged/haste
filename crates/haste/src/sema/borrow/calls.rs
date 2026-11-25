@@ -1,3 +1,4 @@
+mod arg_refs;
 mod closure;
 mod lifetimes;
 mod return_lt;
@@ -8,7 +9,7 @@ use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::{SelfKind, Signature};
-use crate::body::{Body, ExprId, List, Ty as AstTy, TyId};
+use crate::body::{ExprId, List, TyId};
 use crate::sema::infer::{By, Res};
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -17,6 +18,7 @@ use super::places::PlaceStep;
 use super::propagate::BorrowSource;
 use super::{Checker, Loan, State, prune_moved_loans};
 
+pub(super) use arg_refs::{recv_is_by_ref, recv_ref_mut, sig_param_idx};
 pub(super) use closure::ActiveClosure;
 pub(super) use lifetimes::{
     Lifetimes, ParamLifetimes, ast_ty_may_carry_elided_lt, callable_param_inputs,
@@ -25,12 +27,20 @@ pub(super) use lifetimes::{
     sig_type_params, ty_shares_name,
 };
 
-struct ArgListCtx<'a> {
-    sig: Option<&'a Signature>,
-    fn_item: Option<crate::names::ItemRef>,
-    recv_sources: Option<&'a [BorrowSource]>,
-    callee_ty: Option<Ty>,
-    has_self_arg: bool,
+#[derive(Default)]
+pub(super) struct ArgListCtx<'a> {
+    pub(super) sig: Option<&'a Signature>,
+    pub(super) fn_item: Option<crate::names::ItemRef>,
+    pub(super) recv_sources: Option<&'a [BorrowSource]>,
+    pub(super) call_expr: Option<ExprId>,
+    pub(super) callee_ty: Option<Ty>,
+    pub(super) callee_expr: Option<ExprId>,
+    pub(super) ctor_res: Option<(crate::names::ItemRef, u32)>,
+    pub(super) call_res: Option<Res>,
+    pub(super) param_refs: Option<&'a [Option<Mut>]>,
+    pub(super) arg_tys: Option<&'a [Ty]>,
+    pub(super) expected_from_arg_tys: bool,
+    pub(super) has_self_arg: bool,
 }
 
 impl Checker<'_, '_> {
@@ -91,18 +101,31 @@ impl Checker<'_, '_> {
         let sig = self.callee_sig(expr, Some(callee));
         self.check_call_unsafe(fn_item, sig.as_deref())?;
         let callee_ty = self.expr_ty(callee);
-        let is_ctor = matches!(self.callee_res(expr, Some(callee)), Some(Res::Ctor(..)));
+        let call_res = self.callee_res(expr, Some(callee)).copied();
+        let (is_ctor, ctor_res) = match call_res {
+            Some(Res::Ctor(item, variant, _)) => (true, Some((item, variant))),
+            _ => (false, None),
+        };
         let call_extend = if is_ctor { self.let_extend_depth } else { None };
         let has_self_arg = sig.as_deref().is_some_and(|s| s.receiver.is_some());
+        let is_callable_method = fn_item.is_some_and(|it| self.is_callable_trait_method(it));
         self.with_let_extend(call_extend, |this| {
             let arg_sources = this.check_arg_list_sources(
                 &arg_ids,
                 &ArgListCtx {
-                    sig: sig.as_deref(),
-                    fn_item,
-                    recv_sources: None,
+                    sig: if is_callable_method {
+                        None
+                    } else {
+                        sig.as_deref()
+                    },
+                    fn_item: fn_item.filter(|_| !is_callable_method),
+                    call_expr: Some(expr),
                     callee_ty: Some(callee_ty),
-                    has_self_arg,
+                    callee_expr: Some(callee),
+                    ctor_res,
+                    call_res,
+                    has_self_arg: !is_callable_method && has_self_arg,
+                    ..ArgListCtx::default()
                 },
                 state,
                 outer_live,
@@ -119,6 +142,7 @@ impl Checker<'_, '_> {
             this.attach_call_out_sources(
                 expr,
                 &arg_ids,
+                &arg_sources,
                 sig.as_deref(),
                 fn_item,
                 has_self_arg,
@@ -126,36 +150,6 @@ impl Checker<'_, '_> {
             )?;
             this.apply_closure_call_loans(callee, &arg_ids, &arg_sources, state)
         })
-    }
-
-    fn callee_param_ref_mut(&self, callee_ty: Option<Ty>, idx: usize) -> Option<Mut> {
-        let mut ty = match callee_ty {
-            Some(t) if t != Ty::NONE => t,
-            _ => return None,
-        };
-        while let Kind::Ref(_, inner) = *self.cx.types.kind(ty) {
-            ty = inner;
-        }
-        let param_ty = match *self.cx.types.kind(ty) {
-            Kind::FnPtr(params, _) => self.cx.types.substs(params).get(idx).copied(),
-            Kind::Dyn(_, args, ..) => self.cx.types.substs(args).first().copied().and_then(|tup| {
-                match *self.cx.types.kind(tup) {
-                    Kind::Tuple(elems) => self.cx.types.substs(elems).get(idx).copied(),
-                    _ => None,
-                }
-            }),
-            Kind::Closure(_, _, at) => self
-                .typed
-                .closures
-                .get(&ExprId(at))
-                .and_then(|c| c.params.get(idx))
-                .map(|&l| self.local_ty(l)),
-            _ => None,
-        }?;
-        match *self.cx.types.kind(param_ty) {
-            Kind::Ref(m, _) => Some(m),
-            _ => None,
-        }
     }
 
     fn callee_res(&self, expr: ExprId, callee: Option<ExprId>) -> Option<&Res> {
@@ -362,7 +356,7 @@ impl Checker<'_, '_> {
             None
         };
         if state.diverged {
-            state.loans.retain(|l| l.holder != Some(temp_id));
+            self.release_temp_holder(state, temp_id);
             return Ok(());
         }
         let param_ids: Vec<u32> = self.body.list(params).to_vec();
@@ -380,7 +374,8 @@ impl Checker<'_, '_> {
             self.collect_live_expr(ExprId(id), &mut arg_live);
         }
         super::prune_dead_loans(state, &arg_live);
-        let fn_item = match self.typed.res.get(&expr).copied() {
+        let call_res = self.typed.res.get(&expr).copied();
+        let fn_item = match call_res {
             Some(Res::Fn(item, _)) => Some(item),
             _ => None,
         };
@@ -392,14 +387,15 @@ impl Checker<'_, '_> {
                 sig: sig.as_deref(),
                 fn_item,
                 recv_sources: Some(&recv_closure_sources),
-                callee_ty: None,
-                has_self_arg: false,
+                call_expr: Some(expr),
+                call_res,
+                ..ArgListCtx::default()
             },
             state,
             outer_live,
             depth,
         );
-        state.loans.retain(|l| l.holder != Some(temp_id));
+        self.release_temp_holder(state, temp_id);
         let arg_sources = res?;
         if !state.diverged
             && let Some((local, through_ref, mut_ref_root, steps)) = deferred_recv
@@ -414,6 +410,7 @@ impl Checker<'_, '_> {
                 expr,
                 receiver,
                 &param_ids,
+                &arg_sources,
                 recv_borrow == Some(Mut::Mut),
                 sig.as_deref(),
                 state,
@@ -465,12 +462,11 @@ impl Checker<'_, '_> {
         self.check_expr(receiver, state, false, outer_live, true, depth)
     }
 
-    pub(super) fn check_arg_list(
+    pub(super) fn check_arg_list_with_refs(
         &mut self,
         arg_ids: &[u32],
-        sig: Option<&Signature>,
-        callee_ty: Option<Ty>,
-        has_self_arg: bool,
+        param_refs: Option<&[Option<Mut>]>,
+        arg_tys: Option<&[Ty]>,
         state: &mut State,
         outer_live: &HashSet<u32>,
         depth: u32,
@@ -478,11 +474,33 @@ impl Checker<'_, '_> {
         self.check_arg_list_sources(
             arg_ids,
             &ArgListCtx {
-                sig,
-                fn_item: None,
-                recv_sources: None,
-                callee_ty,
-                has_self_arg,
+                param_refs,
+                arg_tys,
+                ..ArgListCtx::default()
+            },
+            state,
+            outer_live,
+            depth,
+        )
+        .map(|_| ())
+    }
+
+    pub(super) fn check_arg_list_expected_tys(
+        &mut self,
+        arg_ids: &[u32],
+        param_refs: &[Option<Mut>],
+        arg_tys: &[Ty],
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        self.check_arg_list_sources(
+            arg_ids,
+            &ArgListCtx {
+                param_refs: Some(param_refs),
+                arg_tys: Some(arg_tys),
+                expected_from_arg_tys: true,
+                ..ArgListCtx::default()
             },
             state,
             outer_live,
@@ -494,7 +512,8 @@ impl Checker<'_, '_> {
     fn check_call_arg(
         &mut self,
         arg: ExprId,
-        param_ref: Option<Mut>,
+        effective_ref: Option<Mut>,
+        expected_ty: Option<Ty>,
         deferred_mut_args: &mut Vec<(ExprId, u32, Vec<PlaceStep>)>,
         state: &mut State,
         outer_live: &HashSet<u32>,
@@ -502,8 +521,15 @@ impl Checker<'_, '_> {
     ) -> Result<bool> {
         let prev_expr = self.current_expr;
         self.current_expr = Some(arg);
-        let res =
-            self.check_call_arg_inner(arg, param_ref, deferred_mut_args, state, outer_live, depth);
+        let res = self.check_call_arg_inner(
+            arg,
+            effective_ref,
+            expected_ty,
+            deferred_mut_args,
+            state,
+            outer_live,
+            depth,
+        );
         self.current_expr = prev_expr;
         res
     }
@@ -511,15 +537,15 @@ impl Checker<'_, '_> {
     fn check_call_arg_inner(
         &mut self,
         arg: ExprId,
-        param_ref: Option<Mut>,
+        effective_ref: Option<Mut>,
+        expected_ty: Option<Ty>,
         deferred_mut_args: &mut Vec<(ExprId, u32, Vec<PlaceStep>)>,
         state: &mut State,
         outer_live: &HashSet<u32>,
         depth: u32,
     ) -> Result<bool> {
-        let shared_reborrow = param_ref == Some(Mut::Not);
-        let mut_reborrow = param_ref == Some(Mut::Mut)
-            || (param_ref.is_none() && self.typed.coercions.contains_key(&arg));
+        let shared_reborrow = effective_ref == Some(Mut::Not);
+        let mut_reborrow = effective_ref == Some(Mut::Mut);
         if self.is_mut_ref_ty(self.expr_ty(arg))
             && let Some(local) = self.expr_plain_local(arg)
         {
@@ -527,13 +553,18 @@ impl Checker<'_, '_> {
                 self.check_can_read(local, &[], state)?;
                 return Ok(false);
             }
-            self.check_can_read_inner(local, &[], state, true)?;
-            deferred_mut_args.push((arg, local, Vec::new()));
-            return Ok(true);
+            if mut_reborrow {
+                self.check_can_read_inner(local, &[], state, true)?;
+                deferred_mut_args.push((arg, local, Vec::new()));
+                return Ok(true);
+            }
+            self.check_can_move(local, &[], state)?;
+            self.mark_local_moved(state, local, Some(arg));
+            return Ok(false);
         }
         if self.is_mut_ref_ty(self.expr_ty(arg))
             && let Some(p) = self.root_place(arg)
-            && (shared_reborrow || (!p.behind_shared && (mut_reborrow || param_ref.is_none())))
+            && (shared_reborrow || (!p.behind_shared && mut_reborrow))
         {
             let mut is_deferred_mut = false;
             if let Some(prefix_len) = p.raw_ptr_prefix {
@@ -548,9 +579,14 @@ impl Checker<'_, '_> {
             self.check_expr(arg, state, true, outer_live, true, depth)?;
             return Ok(is_deferred_mut);
         }
+        if let crate::body::Expr::Tuple(list) = *self.body.expr(self.unwrap_parens(arg))
+            && let Some(elem_tys) = expected_ty.and_then(|t| self.peeled_tuple_elems(t))
+        {
+            self.check_tuple_with_expected_tys(arg, list, &elem_tys, state, outer_live, depth)?;
+            return Ok(false);
+        }
         let reborrow_mut_expr = self.is_mut_ref_ty(self.expr_ty(arg))
-            && (shared_reborrow
-                || ((mut_reborrow || param_ref.is_none()) && !self.place_behind_shared_ref(arg)));
+            && (shared_reborrow || (mut_reborrow && !self.place_behind_shared_ref(arg)));
         self.check_expr(arg, state, reborrow_mut_expr, outer_live, true, depth)?;
         Ok(false)
     }
@@ -659,16 +695,20 @@ impl Checker<'_, '_> {
         let res = (|| -> Result<()> {
             for (idx, &id) in arg_ids.iter().enumerate() {
                 let arg = ExprId(id);
-                let param_ref = ctx
-                    .sig
-                    .and_then(|s| param_ref_mut(s, idx, ctx.has_self_arg))
-                    .or_else(|| self.callee_param_ref_mut(ctx.callee_ty, idx));
-                let shared_reborrow = param_ref == Some(Mut::Not);
+                let cache_expr = self.unwrap_parens(arg);
+                let plain_local = self.expr_plain_local(cache_expr);
+                if plain_local.is_some() {
+                    self.temp_sources.remove(&cache_expr);
+                }
+                let effective_ref = self.resolve_call_arg_ref(ctx, idx, arg);
+                let expected_ty = self.resolve_call_arg_ty(ctx, idx, arg);
+                let shared_reborrow = effective_ref == Some(Mut::Not);
                 let added_origins =
                     self.push_closure_arg_param_origins(arg, idx, ctx, &arg_sources);
                 let arg_res = self.check_call_arg(
                     arg,
-                    param_ref,
+                    effective_ref,
+                    expected_ty,
                     &mut deferred_mut_args,
                     state,
                     outer_live,
@@ -682,6 +722,13 @@ impl Checker<'_, '_> {
                     break;
                 }
                 let sources = self.expr_borrow_sources(arg, state);
+                if effective_ref.is_none()
+                    && let Some(local) = plain_local
+                    && state.moved.get(local as usize).copied().unwrap_or(false)
+                    && !sources.is_empty()
+                {
+                    self.temp_sources.insert(cache_expr, sources.clone());
+                }
                 super::bind::push_source_loans_filtered(
                     &mut state.loans,
                     Some(temp_id),
@@ -734,51 +781,11 @@ impl Checker<'_, '_> {
             }
             Ok(())
         })();
-        state.loans.retain(|l| l.holder != Some(temp_id));
+        self.release_temp_holder(state, temp_id);
         res.map(|()| arg_sources)
-    }
-}
-
-pub(super) fn ast_ref_mut(body: &Body, mut ty: TyId) -> Option<Mut> {
-    while let AstTy::Paren(inner) = *body.ty(ty) {
-        ty = inner;
-    }
-    match *body.ty(ty) {
-        AstTy::Ref { mutable, .. } => Some(if mutable { Mut::Mut } else { Mut::Not }),
-        _ => None,
-    }
-}
-
-pub(super) fn recv_ref_mut(sig: &Signature) -> Option<Mut> {
-    match sig.receiver? {
-        (SelfKind::Ref, _) => Some(Mut::Not),
-        (SelfKind::RefMut, _) => Some(Mut::Mut),
-        (SelfKind::Typed(ty), _) => ast_ref_mut(&sig.body, ty),
-        (SelfKind::Value, _) => None,
-    }
-}
-
-pub(super) fn sig_param_idx(idx: usize, has_self_arg: bool) -> Option<usize> {
-    if has_self_arg {
-        idx.checked_sub(1)
-    } else {
-        Some(idx)
     }
 }
 
 fn non_env_sources(srcs: &[BorrowSource]) -> Vec<BorrowSource> {
     srcs.iter().filter(|s| !s.env_only).cloned().collect()
-}
-
-fn param_ref_mut(sig: &Signature, idx: usize, has_self_arg: bool) -> Option<Mut> {
-    if has_self_arg && idx == 0 {
-        return recv_ref_mut(sig);
-    }
-    sig.params
-        .get(sig_param_idx(idx, has_self_arg)?)
-        .and_then(|&(_, ty)| ast_ref_mut(&sig.body, ty))
-}
-
-pub(super) fn recv_is_by_ref(sig: &Signature) -> bool {
-    recv_ref_mut(sig).is_some()
 }

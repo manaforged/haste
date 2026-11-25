@@ -204,7 +204,7 @@ impl super::super::Checker<'_, '_> {
     ) -> anyhow::Result<()> {
         let mut elem_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, self.src, ty, &mut elem_lts);
-        if elem_lts.has_elided || elem_lts.named.is_empty() {
+        if elem_lts.named.is_empty() {
             return Ok(());
         }
         for src in sources {

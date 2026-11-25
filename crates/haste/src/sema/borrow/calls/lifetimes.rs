@@ -229,19 +229,31 @@ pub(in super::super) fn is_owned_container(name: &str) -> bool {
     matches!(name, "Option" | "Result" | "Vec" | "Box")
 }
 
+pub(in super::super) fn pred_matches_name_in(
+    body: &Body,
+    src: &Source,
+    pred: &crate::body::sig::Predicate,
+    name: &str,
+) -> bool {
+    pred.ty.is_some_and(|pt| match *body.ty(pt) {
+        AstTy::Path(path) => {
+            let p = body.path(path);
+            let segs = body.list(p.segments);
+            p.qself.is_none()
+                && segs.len() == 1
+                && src.text(body.segments[segs[0] as usize].name) == name
+        }
+        _ => false,
+    })
+}
+
 pub(in super::super) fn pred_matches_name(
     sig: &crate::body::sig::Signature,
     src: &Source,
     pred: &crate::body::sig::Predicate,
     name: &str,
 ) -> bool {
-    pred.ty.is_some_and(|pt| match *sig.body.ty(pt) {
-        AstTy::Path(path) => {
-            let segs = sig.body.list(sig.body.path(path).segments);
-            segs.len() == 1 && src.text(sig.body.segments[segs[0] as usize].name) == name
-        }
-        _ => false,
-    })
+    pred_matches_name_in(&sig.body, src, pred, name)
 }
 
 pub(in super::super) fn compute_param_lifetimes(

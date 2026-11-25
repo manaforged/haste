@@ -8,7 +8,7 @@ use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::places::{FieldKey, Place, PlaceStep, push_step};
-use super::propagate::BorrowSource;
+use super::propagate::{BorrowSource, TupleSources};
 use super::{Checker, Loan, State, merge_states};
 
 #[derive(Clone, Copy)]
@@ -28,6 +28,7 @@ struct PatTarget<'a> {
     scrut_place: Option<&'a Place>,
     pat_steps: &'a [PlaceStep],
     fallback_sources: &'a [BorrowSource],
+    elem_tuple: Option<&'a TupleSources>,
 }
 
 impl Checker<'_, '_> {
@@ -77,6 +78,7 @@ impl Checker<'_, '_> {
             scrut_place: None,
             pat_steps: &[],
             fallback_sources,
+            elem_tuple: None,
         };
         self.bind_pat_ctx(pat, target, state, ctx)
     }
@@ -105,6 +107,7 @@ impl Checker<'_, '_> {
             scrut_place,
             pat_steps,
             fallback_sources,
+            elem_tuple: None,
         };
         self.bind_pat_ctx(pat, target, state, ctx)
     }
@@ -131,6 +134,7 @@ impl Checker<'_, '_> {
             scrut_place,
             pat_steps: &[],
             fallback_sources: &[],
+            elem_tuple: None,
         };
         self.bind_pat_ctx(pat, target, state, ctx)
     }
@@ -167,6 +171,7 @@ impl Checker<'_, '_> {
             scrut_place: adjusted_place.as_ref(),
             pat_steps: adjusted_steps.as_slice(),
             fallback_sources: target.fallback_sources,
+            elem_tuple: (!crossed_ref).then_some(target.elem_tuple).flatten(),
         };
         match *self.body.pat(pat) {
             Pat::Bind { sub, .. } => self.bind_pat_bind(pat, sub, next, state, ctx),
@@ -262,6 +267,7 @@ impl Checker<'_, '_> {
             scrut_place: next_place.as_ref(),
             pat_steps: &next_steps,
             fallback_sources: &next_fallback,
+            elem_tuple: None,
         };
         self.bind_pat_ctx(inner, inner_target, state, ctx)
     }
@@ -299,14 +305,28 @@ impl Checker<'_, '_> {
             }
             _ => None,
         });
+        let tuple_fallback = if !is_ctor && elem_exprs.is_none() {
+            target
+                .elem_tuple
+                .cloned()
+                .or_else(|| {
+                    target
+                        .init
+                        .and_then(|e| self.expr_tuple_sources(e, state, true))
+                })
+                .filter(|ts| matches!(ts, TupleSources::Tuple(_)))
+        } else {
+            None
+        };
         let next_fallback = self.fallback_or_empty(
-            elem_exprs.is_none(),
+            elem_exprs.is_none() && tuple_fallback.is_none(),
             target.init,
             target.fallback_sources,
             state,
         );
         let pos_target = PatTarget {
             fallback_sources: &next_fallback,
+            elem_tuple: tuple_fallback.as_ref(),
             ..target
         };
         self.bind_positional_pat(&pat_ids, elem_exprs.as_deref(), pos_target, state, ctx)
@@ -331,6 +351,7 @@ impl Checker<'_, '_> {
                 scrut_place: target.scrut_place,
                 pat_steps: &next_steps,
                 fallback_sources: &next_fallback,
+                elem_tuple: None,
             };
             self.bind_pat_ctx(id, elem_target, state, ctx)?;
         }
@@ -390,6 +411,7 @@ impl Checker<'_, '_> {
                 scrut_place: target.scrut_place,
                 pat_steps: &next_steps,
                 fallback_sources: &next_fallback,
+                elem_tuple: None,
             };
             if let Err(err) = self.bind_pat_ctx(fp.pat, field_target, state, ctx) {
                 if has_base {
@@ -529,6 +551,11 @@ impl Checker<'_, '_> {
         state: &mut State,
         ctx: PatCtx,
     ) -> Result<()> {
+        let rest_pos = pat_ids.iter().position(|&id| self.is_rest_pat(PatId(id)));
+        let elem_tuples = match target.elem_tuple {
+            Some(TupleSources::Tuple(elems)) => Some(elems.as_slice()),
+            _ => None,
+        };
         let mut saw_rest = false;
         for (idx, &id) in pat_ids.iter().enumerate() {
             let p = PatId(id);
@@ -546,11 +573,26 @@ impl Checker<'_, '_> {
                     PlaceStep::Opaque(None)
                 },
             );
+            let tuple_idx = match rest_pos {
+                Some(r) if idx > r => {
+                    elem_tuples.and_then(|es| es.len().checked_sub(pat_ids.len() - idx))
+                }
+                _ => Some(idx),
+            };
+            let elem_ts = elem_tuples.and_then(|es| tuple_idx.and_then(|ti| es.get(ti)));
+            let mut split_sources = Vec::new();
+            let fallback_sources = if let Some(ts) = elem_ts {
+                ts.flatten_into(&mut split_sources);
+                split_sources.as_slice()
+            } else {
+                target.fallback_sources
+            };
             let elem_target = PatTarget {
                 init: sub_init,
                 scrut_place: target.scrut_place,
                 pat_steps: &next_steps,
-                fallback_sources: target.fallback_sources,
+                fallback_sources,
+                elem_tuple: elem_ts,
             };
             self.bind_pat_ctx(p, elem_target, state, ctx)?;
         }

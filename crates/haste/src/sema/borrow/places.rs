@@ -51,8 +51,11 @@ pub(super) fn steps_conflict(a: &[PlaceStep], b: &[PlaceStep]) -> bool {
             return false;
         }
         match (x, y) {
-            (PlaceStep::Opaque(Some(a)), PlaceStep::Opaque(Some(b))) if a != b => return true,
-            (PlaceStep::Opaque(None), _) | (_, PlaceStep::Opaque(None)) => return true,
+            (PlaceStep::Opaque(Some(a)), PlaceStep::Opaque(Some(b))) if a == b => {}
+            (PlaceStep::Opaque(_), _)
+            | (_, PlaceStep::Opaque(_))
+            | (PlaceStep::Union, _)
+            | (_, PlaceStep::Union) => return true,
             _ => {}
         }
     }
@@ -66,9 +69,8 @@ fn step_conflict(a: &PlaceStep, b: &PlaceStep) -> bool {
     match (a, b) {
         (PlaceStep::Union, _)
         | (_, PlaceStep::Union)
-        | (PlaceStep::Opaque(_), PlaceStep::Opaque(_)) => true,
-        (PlaceStep::Opaque(_), PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. })
-        | (PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. }, PlaceStep::Opaque(_)) => true,
+        | (PlaceStep::Opaque(_), _)
+        | (_, PlaceStep::Opaque(_)) => true,
         (
             PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. },
             PlaceStep::SliceElem { .. } | PlaceStep::SliceSub { .. },
@@ -604,7 +606,7 @@ mod tests {
         assert!(!steps_conflict(&[t0.clone()], &[t1]));
         assert!(steps_conflict(&[], &[fa.clone()]));
         assert!(steps_conflict(&[fa.clone()], &[fa.clone(), t0]));
-        assert!(steps_conflict(&[PlaceStep::Union], &[fb]));
+        assert!(steps_conflict(&[PlaceStep::Union], &[fb.clone()]));
         assert!(steps_conflict(
             &[PlaceStep::Opaque(Some(1))],
             &[PlaceStep::Opaque(Some(2))]
@@ -653,5 +655,17 @@ mod tests {
         assert!(!steps_conflict(&[tail1], &[tail2]));
         assert!(steps_conflict(&[dyn_head0], &[dyn_tail1]));
         assert!(steps_conflict(&[elem0], &[PlaceStep::Opaque(None)]));
+        assert!(steps_conflict(
+            &[PlaceStep::Deref, PlaceStep::Opaque(Some(1)), fa.clone()],
+            &[PlaceStep::Deref, fb.clone()]
+        ));
+        assert!(!steps_conflict(
+            &[PlaceStep::Deref, fa.clone()],
+            &[PlaceStep::Deref, fb.clone()]
+        ));
+        assert!(!steps_conflict(
+            &[PlaceStep::Opaque(Some(1)), fa],
+            &[PlaceStep::Opaque(Some(1)), fb]
+        ));
     }
 }

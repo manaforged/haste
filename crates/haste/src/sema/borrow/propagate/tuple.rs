@@ -1,8 +1,12 @@
-use crate::body::{Expr, ExprId};
+use crate::body::{Args, Body, Expr, ExprId, GenericArg, Ty as AstTy, TyId};
 use crate::lower::is_freeze_ty;
-use crate::sema::ty::Ty;
+use crate::names::plain;
+use crate::outline::source::Source;
+use crate::sema::infer::Res;
+use crate::sema::ty::{Kind, Ty};
 
 use super::super::{Checker, State};
+use super::sig::SigCall;
 use super::{BorrowSource, dedup_sources};
 
 #[derive(Clone, Debug)]
@@ -71,7 +75,7 @@ impl TupleSources {
     }
 }
 
-impl Checker<'_, '_> {
+impl<'a> Checker<'_, 'a> {
     pub(in super::super) fn expr_tuple_sources(
         &mut self,
         expr: ExprId,
@@ -79,6 +83,23 @@ impl Checker<'_, '_> {
         use_let_extend: bool,
     ) -> Option<TupleSources> {
         let cur = self.unwrap_parens(expr);
+        match *self.body.expr(cur) {
+            Expr::Path(_) => {
+                return self
+                    .expr_plain_local(cur)
+                    .and_then(|l| state.tuple_elem_sources.get(&l).cloned());
+            }
+            Expr::Call(..) | Expr::Method { .. } | Expr::Try(_) => {
+                return self.sig_tuple_sources(cur, state);
+            }
+            Expr::TupleField(base, idx) => {
+                return match self.expr_tuple_sources(base, state, use_let_extend) {
+                    Some(TupleSources::Tuple(elems)) => elems.into_iter().nth(idx as usize),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
         let ty = self.expr_ty(cur);
         if ty == Ty::NONE || !is_freeze_ty(self.cx, ty, 0) {
             return None;
@@ -113,10 +134,194 @@ impl Checker<'_, '_> {
                     .collect();
                 Some(TupleSources::Tuple(elems))
             }
-            Expr::Path(_) => self
-                .expr_plain_local(cur)
-                .and_then(|l| state.tuple_elem_sources.get(&l).cloned()),
             _ => None,
         }
     }
+
+    pub(super) fn tuple_field_sources(
+        &mut self,
+        base: ExprId,
+        index: u32,
+        state: &State,
+    ) -> Option<Vec<BorrowSource>> {
+        let TupleSources::Tuple(elems) = self.expr_tuple_sources(base, state, false)? else {
+            return None;
+        };
+        let elem = elems.get(index as usize)?;
+        let mut out = Vec::new();
+        elem.flatten_into(&mut out);
+        Some(dedup_sources(out))
+    }
+
+    fn sig_tuple_sources(&mut self, expr: ExprId, state: &State) -> Option<TupleSources> {
+        let mut cur = self.unwrap_parens(expr);
+        let peeled_try = if let Expr::Try(inner) = *self.body.expr(cur) {
+            cur = self.unwrap_parens(inner);
+            true
+        } else {
+            false
+        };
+        let (fn_item, receiver, args) = match *self.body.expr(cur) {
+            Expr::Call(callee, args) => (self.call_sig_fn_item(cur, callee)?, None, args),
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&cur).copied() else {
+                    return None;
+                };
+                if self.body.list(params).iter().any(|&id| {
+                    matches!(*self.body.expr(ExprId(id)), Expr::Closure { body, .. } if self.is_raw_ptr_deref(body))
+                }) {
+                    return None;
+                }
+                (fn_item, Some(receiver), params)
+            }
+            _ => return None,
+        };
+        let sig = self.cx.signature(fn_item).ok()?;
+        if sig.is_async {
+            return None;
+        }
+        let (sig_src, sig_item) = self.cx.item(fn_item);
+        let mut ret_ast = sig.ret?;
+        if peeled_try {
+            ret_ast = peel_try_ret_ast(self.cx, fn_item, &sig.body, sig_src, ret_ast)?;
+        }
+        ret_ast = unwrap_ast_parens(&sig.body, ret_ast);
+        if !matches!(*sig.body.ty(ret_ast), AstTy::Tuple(_)) {
+            return None;
+        }
+        let (receiver, arg_ids) = self.normalize_sig_args(receiver, args, &sig);
+        let call = SigCall {
+            expr: cur,
+            fn_item,
+            sig: &sig,
+            sig_src,
+            sig_item,
+            receiver,
+            arg_ids: &arg_ids,
+        };
+        Some(self.sig_ast_tuple_sources(&call, ret_ast, self.expr_ty(expr), state))
+    }
+
+    fn sig_ast_tuple_sources(
+        &mut self,
+        call: &SigCall<'a, '_>,
+        ret_ast: TyId,
+        mut ret_ty: Ty,
+        state: &State,
+    ) -> TupleSources {
+        let ret_ast = unwrap_ast_parens(&call.sig.body, ret_ast);
+        while ret_ty != Ty::NONE
+            && let Kind::Pat(inner, ..) = *self.cx.types.kind(ret_ty)
+        {
+            ret_ty = inner;
+        }
+        if let AstTy::Tuple(list) = *call.sig.body.ty(ret_ast) {
+            let ast_elems: Vec<u32> = call.sig.body.list(list).to_vec();
+            let elem_tys: Vec<Ty> = if ret_ty != Ty::NONE
+                && let Kind::Tuple(substs) = *self.cx.types.kind(ret_ty)
+                && self.cx.types.substs(substs).len() == ast_elems.len()
+            {
+                self.cx.types.substs(substs).to_vec()
+            } else {
+                Vec::new()
+            };
+            let elems = ast_elems
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    self.sig_ast_tuple_sources(
+                        call,
+                        TyId(id),
+                        elem_tys.get(i).copied().unwrap_or(Ty::NONE),
+                        state,
+                    )
+                })
+                .collect();
+            return TupleSources::Tuple(elems);
+        }
+        let sources = self.sig_sources_for_ret(call, ret_ast, ret_ty, state);
+        TupleSources::Leaf {
+            sources,
+            inner_ref: None,
+        }
+    }
+}
+
+fn unwrap_ast_parens(body: &Body, mut ty: TyId) -> TyId {
+    while let AstTy::Paren(inner) = *body.ty(ty) {
+        ty = inner;
+    }
+    ty
+}
+
+fn peel_try_ret_ast(
+    cx: &crate::sema::Context<'_>,
+    fn_item: crate::names::ItemRef,
+    body: &Body,
+    src: &Source,
+    ty: TyId,
+) -> Option<TyId> {
+    let ty = unwrap_ast_parens(body, ty);
+    let AstTy::Path(path_id) = *body.ty(ty) else {
+        return None;
+    };
+    let path = body.path(path_id);
+    if path.qself.is_some() {
+        return None;
+    }
+    let segs = body.list(path.segments);
+    let &seg_id = segs.last()?;
+    let seg = body.segments[seg_id as usize];
+    let name = plain(src.text(seg.name));
+    if !matches!(name, "Result" | "Option") {
+        return None;
+    }
+    let Some(Args::Angle(arg_list)) = seg.args else {
+        return None;
+    };
+    let mut ty_args = body
+        .list(arg_list)
+        .iter()
+        .filter_map(|&id| match body.args[id as usize] {
+            GenericArg::Ty(t) => Some(t),
+            _ => None,
+        });
+    let first = ty_args.next()?;
+    let has_second = ty_args.next().is_some();
+    if has_second {
+        let std_path = match segs.len() {
+            1 => {
+                let file = cx.file(fn_item);
+                let shadowed_type = file.items.items.iter().any(|it| {
+                    it.kind == crate::outline::item::ItemKind::Type
+                        && it.name.is_some_and(|n| plain(file.source.text(n)) == name)
+                });
+                let shadowed_import = file.items.imports.iter().any(|imp| {
+                    let imported = match imp.leaf {
+                        crate::outline::item::Leaf::Name(Some(a)) => Some(a),
+                        crate::outline::item::Leaf::Name(None) => imp.path.last().copied(),
+                        _ => None,
+                    };
+                    if !imported.is_some_and(|t| plain(file.source.text(t)) == name) {
+                        return false;
+                    }
+                    let root = imp.path.first().map(|&t| plain(file.source.text(t)));
+                    !matches!(root, Some("core" | "std"))
+                });
+                !shadowed_type && !shadowed_import
+            }
+            3 => {
+                let s0 = plain(src.text(body.segments[segs[0] as usize].name));
+                let s1 = plain(src.text(body.segments[segs[1] as usize].name));
+                matches!(s0, "core" | "std") && matches!(s1, "result" | "option")
+            }
+            _ => false,
+        };
+        if !std_path {
+            return None;
+        }
+    }
+    Some(first)
 }

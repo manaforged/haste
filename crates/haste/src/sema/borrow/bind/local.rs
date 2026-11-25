@@ -24,11 +24,11 @@ impl Checker<'_, '_> {
         if let Some(&ref_mut) = self.typed.ref_binds.get(&pat) {
             return self.bind_ref_local(local, ref_mut == Mut::Mut, target, state, ctx.behind_ref);
         }
+        if ctx.move_on_val && leaf_bind && !self.is_copy[local as usize] {
+            self.record_pat_move(local, target, state, ctx.behind_ref, ctx.in_drop_adt)?;
+        }
         if !ctx.move_only {
             self.bind_val_sources(local, target, state, ctx.behind_ref)?;
-        }
-        if ctx.move_on_val && leaf_bind && !self.is_copy[local as usize] {
-            self.record_pat_move(target, state, ctx.behind_ref, ctx.in_drop_adt)?;
         }
         Ok(())
     }
@@ -111,7 +111,11 @@ impl Checker<'_, '_> {
             let ts = self.expr_tuple_sources(e, state, true);
             state.set_tuple_sources(local, ts);
         } else {
-            state.set_tuple_sources(local, None);
+            let nested_ts = target
+                .elem_tuple
+                .filter(|ts| matches!(ts, super::super::propagate::TupleSources::Tuple(_)))
+                .cloned();
+            state.set_tuple_sources(local, nested_ts);
             if target.fallback_sources.is_empty() {
                 return Ok(());
             }
@@ -159,6 +163,7 @@ impl Checker<'_, '_> {
 
     fn record_pat_move(
         &self,
+        local: u32,
         target: PatTarget<'_>,
         state: &mut State,
         behind_ref: bool,
@@ -189,7 +194,7 @@ impl Checker<'_, '_> {
         for s in target.pat_steps {
             push_step(&mut full_steps, s.clone());
         }
-        self.check_can_move(place.local, &full_steps, state)?;
+        self.check_can_move_except(place.local, &full_steps, state, Some(local))?;
         if full_steps.is_empty() {
             self.mark_local_moved(state, place.local, target.init);
         } else {

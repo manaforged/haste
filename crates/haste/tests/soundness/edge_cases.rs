@@ -241,3 +241,551 @@ fn main() {
 "#,
     );
 }
+
+#[test]
+fn deref_field_conflict_and_box_disjoint() {
+    const PRELUDE: &str = "use std::ops::{Deref, DerefMut};\nstruct Target { x: i32 }\nstruct Boxed { flag: bool, inner: Target }\nimpl Deref for Boxed { type Target = Target; fn deref(&self) -> &Target { &self.inner } }\nimpl DerefMut for Boxed { fn deref_mut(&mut self) -> &mut Target { &mut self.inner } }\n";
+    crate::check_fails_borrow(
+        "deref_container_field_mutated_while_target_borrowed",
+        &format!(
+            "{PRELUDE}fn main() {{ let mut b = Boxed {{ flag: false, inner: Target {{ x: 1 }} }}; let r = &b.x; b.flag = true; let _ = *r; }}"
+        ),
+    );
+    crate::check_fails_borrow(
+        "deref_target_mutated_while_container_field_borrowed",
+        &format!(
+            "{PRELUDE}fn main() {{ let mut b = Boxed {{ flag: false, inner: Target {{ x: 1 }} }}; let r = &b.flag; b.x = 2; let _ = *r; }}"
+        ),
+    );
+
+    crate::check_passes(
+        "box_disjoint_field_mut_borrows",
+        r#"
+struct Pair {
+    a: i32,
+    b: i32,
+}
+fn main() {
+    let mut p = Box::new(Pair { a: 1, b: 2 });
+    let ra = &mut (*p).a;
+    let rb = &mut (*p).b;
+    *ra += *rb;
+}
+"#,
+    );
+}
+
+#[test]
+fn mut_temp_promotion_rules() {
+    crate::check_fails_borrow(
+        "rejects_returning_mut_ref_to_temp",
+        r#"
+fn bad<'a>() -> &'a mut u32 {
+    &mut 4
+}
+fn main() {
+    let _ = bad();
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_explicit_return_mut_ref_to_temp",
+        r#"
+fn bad() -> &'static mut u32 {
+    return &mut 4;
+}
+fn main() {
+    let _ = bad();
+}
+"#,
+    );
+
+    crate::check_passes(
+        "allows_shared_temp_promotion_zst_and_static_mut",
+        r#"
+static mut S_MUT: &'static mut u32 = &mut 4;
+fn ok() -> &'static u32 {
+    &4
+}
+fn ok_empty<'a>() -> &'a mut [u8; 0] {
+    &mut []
+}
+fn main() {
+    let _ = ok();
+    let _ = ok_empty();
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_mut_ref_to_unit_zst",
+        r#"
+fn bad<'a>() -> &'a mut () {
+    &mut ()
+}
+fn main() {
+    let _ = bad();
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_mut_ref_to_zst_struct",
+        r#"
+struct Z;
+fn bad<'a>() -> &'a mut Z {
+    &mut Z
+}
+fn main() {
+    let _ = bad();
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_mut_ref_through_overloaded_deref_temp",
+        r#"
+use std::ops::{Deref, DerefMut};
+struct Wrap(());
+impl Deref for Wrap {
+    type Target = ();
+    fn deref(&self) -> &() {
+        &self.0
+    }
+}
+impl DerefMut for Wrap {
+    fn deref_mut(&mut self) -> &mut () {
+        &mut self.0
+    }
+}
+fn bad<'a>() -> &'a mut () {
+    &mut *Wrap(())
+}
+fn main() {
+    let _ = bad();
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_const_nested_mut_temp",
+        r#"
+const C: &'static &'static mut u32 = &&mut 4;
+fn main() {
+    let _ = C;
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_static_mut_loop_temp",
+        r#"
+static mut S: &'static mut u32 = loop {
+    break &mut 4;
+};
+fn main() {
+    let _ = unsafe { &raw const S };
+}
+"#,
+    );
+}
+
+#[test]
+fn loop_move_and_mut_borrow_rules() {
+    crate::check_fails_borrow(
+        "rejects_move_in_loop_without_reinit",
+        r#"
+fn main() {
+    let mut s = String::from("a");
+    let mut i = 0;
+    while i < 2 {
+        drop(s);
+        i += 1;
+        if i == 1 {
+            continue;
+        }
+        s = String::from("b");
+    }
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_mut_ref_pushed_in_loop",
+        r#"
+fn main() {
+    let mut x = 1;
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < 2 {
+        let r = &mut x;
+        v.push(r);
+        i += 1;
+    }
+    let _ = v;
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_outer_mut_ref_moved_in_loop",
+        r#"
+fn main() {
+    let mut x = 1;
+    let mut v = Vec::new();
+    let r = &mut x;
+    let mut i = 0;
+    while i < 2 {
+        v.push(r);
+        i += 1;
+    }
+    let _ = v;
+}
+"#,
+    );
+
+    crate::check_passes(
+        "allows_reinit_and_non_escaping_mut_ref_in_loop",
+        r#"
+fn main() {
+    let mut s = String::from("a");
+    let mut v = 0;
+    let mut i = 0;
+    while i < 2 {
+        drop(s);
+        s = String::from("b");
+        let r = &mut v;
+        *r += 1;
+        i += 1;
+    }
+    let _ = (s, v);
+}
+"#,
+    );
+}
+
+#[test]
+fn match_self_guarded_arms_and_catchall_reborrow() {
+    crate::check_passes(
+        "allows_match_self_guarded_arms_then_catchall_mut",
+        r#"
+enum Cmd {
+    Build { path: String },
+    Test { filter: Option<String> },
+}
+impl Cmd {
+    fn update(&mut self, name: &str) {
+        match self {
+            Cmd::Build { path } if name == "build" => {
+                let _ = path;
+            }
+            Cmd::Test { filter } if name == "test" => {
+                let _ = filter;
+            }
+            s => {
+                *s = Cmd::Build {
+                    path: String::new(),
+                };
+            }
+        }
+    }
+}
+fn main() {
+    let mut c = Cmd::Test { filter: None };
+    c.update("other");
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_match_catchall_move_while_scrutinee_borrowed",
+        r#"
+enum Cmd {
+    Build { path: String },
+    Test { filter: Option<String> },
+}
+fn main() {
+    let mut c = Cmd::Test { filter: None };
+    let c_ref = &mut c;
+    let r = &*c_ref;
+    match c_ref {
+        s => {
+            *s = Cmd::Build {
+                path: String::new(),
+            };
+            let _ = r;
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn loop_liveness_opaque_and_jump_temp_cleanup() {
+    crate::check_fails_borrow(
+        "rejects_cross_iteration_opaque_borrow",
+        r#"
+fn main() {
+    let mut v = Vec::new();
+    v.push((1, 2));
+    v.push((3, 4));
+    let mut out: Option<&i32> = None;
+    let mut i = 0;
+    while i < 2 {
+        let (ref a, ref mut b) = v[i];
+        if i == 0 {
+            out = Some(a);
+        } else {
+            *b += 1;
+        }
+        i += 1;
+    }
+    let _ = out;
+}
+"#,
+    );
+
+    crate::check_fails_borrow(
+        "rejects_continue_before_rebind_while_borrowed",
+        r#"
+fn main() {
+    let mut x = 1;
+    let mut y = 2;
+    let mut r = &mut x;
+    let mut i = 0;
+    while i < 2 {
+        let _ = *r;
+        i += 1;
+        if i == 1 {
+            x += 1;
+            continue;
+        }
+        r = &mut y;
+    }
+}
+"#,
+    );
+
+    crate::check_passes(
+        "allows_break_killing_borrow_in_loop",
+        r#"
+fn main() {
+    let mut v = Vec::new();
+    v.push(1);
+    let mut i = 0;
+    loop {
+        let r = &v[0];
+        if i == 1 {
+            v.push(2);
+            break;
+        }
+        i += *r;
+    }
+}
+"#,
+    );
+
+    crate::check_passes(
+        "allows_jump_out_of_temp_holders_without_leaks",
+        r#"
+struct Guard<'a>(&'a mut i32);
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {}
+}
+fn get(x: &mut i32) -> Option<Guard<'_>> {
+    Some(Guard(x))
+}
+fn main() {
+    let mut x = 0;
+    while let Some(_g) = get(&mut x) {
+        break;
+    }
+    x += 1;
+    let _ = x;
+
+    let mut v = Vec::new();
+    let mut opt = Some(1);
+    loop {
+        v.push(match opt {
+            Some(n) => n,
+            None => break,
+        });
+        opt = None;
+    }
+    v.push(2);
+
+    'outer: loop {
+        for _x in &mut v {
+            continue 'outer;
+        }
+        break;
+    }
+    v.push(3);
+    let _ = v;
+}
+"#,
+    );
+}
+
+#[test]
+fn alias_and_callable_reborrow_rules() {
+    crate::check_passes(
+        "allows_type_alias_and_box_dyn_and_impl_fn_mut_reborrows",
+        r#"
+type MutRef<'a> = &'a mut i32;
+struct Wrap<'a>(MutRef<'a>);
+struct Named<'a> {
+    f: MutRef<'a>,
+}
+fn take_alias(x: MutRef<'_>) {
+    *x += 1;
+}
+fn call_impl(mut f: impl FnMut(&mut i32), r: &mut i32) {
+    f(r);
+    *r += 1;
+}
+struct Caller<F> {
+    f: F,
+}
+impl<F: FnMut(&mut i32)> Caller<F> {
+    fn run(&mut self, r: &mut i32) {
+        (self.f)(r);
+        *r += 1;
+    }
+}
+fn main() {
+    let mut x = 1;
+    let r = &mut x;
+    take_alias(r);
+    *r += 1;
+    let _w = Wrap { 0: r };
+    *r += 1;
+    let _n = Named { f: r };
+    *r += 1;
+    let mut b: Box<dyn FnMut(&mut i32)> = Box::new(|p: &mut i32| *p += 1);
+    b(r);
+    *r += 1;
+    call_impl(|p: &mut i32| *p += 1, r);
+    *r += 1;
+    let mut c = Caller { f: b };
+    c.run(r);
+    *r += 1;
+}
+"#,
+    );
+}
+
+#[test]
+fn jump_liveness_const_clamp_and_move_loans() {
+    crate::check_fails_borrow(
+        "rejects_for_iter_mutation_when_body_returns",
+        "fn f() -> i32 { let mut x = 1; let r = &x; for _ in { x += 1; [1] } { return 0; } *r }\nfn main() { let _ = f(); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_match_scrutinee_mutation_with_return_arm",
+        "fn main() { let mut x = 1; let r = &x; match { x += 1; Some(0) } { Some(_) => { let _ = *r; } None => return, } }",
+    );
+    crate::check_fails_borrow(
+        "rejects_const_struct_with_nested_mut_temp",
+        "struct Sh<'a> { f: &'a &'a mut u32 }\nconst C1: Sh<'static> = Sh { f: &&mut 4 };\nfn main() { let _ = C1; }",
+    );
+    crate::check_fails_borrow(
+        "rejects_const_fn_taking_mut_temp",
+        "const fn id(x: &'static u32) -> &'static u32 { x }\nconst C2: &'static u32 = id(&mut 4);\nfn main() { let _ = C2; }",
+    );
+    crate::check_fails_borrow(
+        "rejects_mutating_target_after_call_out_moved_src",
+        "fn put<T>(dst: &mut T, src: T) { *dst = src; }\nfn main() { let mut x = 1; let mut y = 2; let mut d = &mut x; let s = &mut y; put(&mut d, s); y += 1; *d += 1; }",
+    );
+    crate::check_passes(
+        "allows_break_from_index_lhs_without_temp_leak",
+        "fn main() { let mut v = Vec::new(); v.push(0); let mut opt = Some(0usize); loop { v[match opt { Some(i) => i, None => break }] = 1; opt = None; } v.push(2); let _ = v; }",
+    );
+    crate::check_fails_borrow(
+        "rejects_mutating_after_tuple_moved_mut_ref",
+        "fn main() { let mut x = 1; let r = &mut x; let t = (r,); x += 1; *t.0 += 1; }",
+    );
+    crate::check_fails_borrow(
+        "rejects_mutating_after_some_moved_mut_ref",
+        "fn main() { let mut x = 1; let r = &mut x; let o = Some(r); x += 1; *o.unwrap() += 1; }",
+    );
+}
+
+#[test]
+fn tuple_reborrow_slice_promo_and_split_returns() {
+    crate::check_passes(
+        "allows_tuple_reborrow_coercion_in_calls_and_annotated_lets",
+        r#"
+fn f(t: (&mut i32, &mut i32)) { *t.0 += 1; *t.1 += 1; }
+fn nested(t: ((&mut i32,), i32)) { *((t.0).0) += 1; }
+fn main() {
+    let (mut a, mut b) = (1, 2);
+    let (r1, r2) = (&mut a, &mut b);
+    f((r1, r2)); *r1 += 1; *r2 += 1;
+    nested(((r1,), 0)); *r1 += 1;
+    let _t: (&mut i32,) = (r1,); *r1 += 1;
+}
+"#,
+    );
+    crate::check_fails_borrow(
+        "rejects_unannotated_let_tuple_moving_mut_ref",
+        "fn main() { let mut x = 1; let r = &mut x; let _t = (r,); *r += 1; }",
+    );
+    crate::check_fails_borrow(
+        "rejects_generic_call_tuple_moving_mut_ref",
+        "fn g<T>(_: T) {} fn main() { let mut x = 1; let r = &mut x; g((r,)); *r += 1; }",
+    );
+    crate::check_fails_borrow(
+        "rejects_live_annotated_let_tuple_aliasing_mut_ref",
+        "fn main() { let mut x = 1; let r = &mut x; let _t: (&mut i32,) = (r,); *r += 1; *_t.0 += 1; }",
+    );
+    crate::check_passes(
+        "allows_empty_slice_full_range_promo_and_ref_method_field_index",
+        r#"
+struct Block { params: Vec<i32> }
+struct Func { blocks: Vec<Block> }
+struct Emit(Func);
+impl Emit { fn func(&self) -> &Func { &self.0 } }
+fn pick(opt: Option<&[u32]>) -> &[u32] { opt.map_or(&[][..], |s| s) }
+fn first_params(emit: &Emit) -> usize { emit.func().blocks[0].params.iter().count() }
+fn main() {
+    let e = Emit(Func { blocks: vec![Block { params: vec![1] }] });
+    let _ = (pick(None), first_params(&e));
+}
+"#,
+    );
+    crate::check_fails_borrow(
+        "rejects_mut_nonempty_slice_full_range_return",
+        "fn bad<'a>() -> &'a mut [u8] { &mut [1][..] }\nfn main() { let _ = bad(); }",
+    );
+    crate::check_passes(
+        "allows_tuple_return_lifetime_splitting_with_and_without_try",
+        r#"
+struct Frame<'a> { generics: Vec<(&'a str, u32)> }
+struct Cx<'a>(&'a str);
+impl<'a> Cx<'a> {
+    fn parent_frame<'s>(&mut self, substs: &'s [u32]) -> (Vec<(&'a str, u32)>, &'s [u32]) {
+        (vec![(self.0, 0)], substs)
+    }
+    fn parent_frame_res<'s>(&mut self, substs: &'s [u32]) -> Result<(Vec<(&'a str, u32)>, &'s [u32]), ()> {
+        Ok((vec![(self.0, 0)], substs))
+    }
+    fn frame(&mut self, substs: &[u32]) -> Frame<'a> {
+        let (generics, _rest) = self.parent_frame(substs);
+        Frame { generics }
+    }
+    fn frame_res(&mut self, substs: &[u32]) -> Result<Frame<'a>, ()> {
+        let (generics, _rest) = self.parent_frame_res(substs)?;
+        Ok(Frame { generics })
+    }
+}
+fn main() { let mut cx = Cx("ok"); let _ = (cx.frame(&[1]), cx.frame_res(&[1])); }
+"#,
+    );
+    crate::check_fails_borrow(
+        "rejects_returning_second_tuple_elem_borrowed_from_short_param",
+        "fn split<'a, 's>(a: &'a str, b: &'s str) -> (&'a str, &'s str) { (a, b) }\nfn bad<'a>(a: &'a str, b: &str) -> &'a str { let (_x, y) = split(a, b); y }\nfn main() { let _ = bad(\"a\", \"b\"); }",
+    );
+}
