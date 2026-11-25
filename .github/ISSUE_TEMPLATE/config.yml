@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Known limits & crate compatibility
+    url: https://github.com/manaforged/haste#limits
+    about: Check supported crates, platform caveats, and known limits before filing.
+  - name: Security vulnerability
+    url: https://github.com/manaforged/haste/security/advisories/new
+    about: Report security issues privately via GitHub Security Advisories.

@@ -1,0 +1,24 @@
+# haste
+
+> Standalone Rust compiler, in-memory JIT runner, and zero-linker AOT executable builder with no LLVM in the compiler binary and no per-project `target/` directory.
+
+## Install
+
+- Requires Rust 1.88+ with `rust-src`, plus a C compiler and `make` on macOS and Linux x86-64 GNU.
+- Do not use `cargo install haste` (unrelated crates.io package).
+- Command: `cargo install --git https://github.com/manaforged/haste haste`
+
+## Key Capabilities
+
+- Incremental edit checks: `8.4–9.0 ms` with `haste build --daemon` on Unix (`6.2x–7.4x` faster than one-shot `cargo check`); unchanged no-ops in `0.7–2.3 ms`.
+- In-memory execution & tests (Unix): `haste run`, `haste test` (including `#[tokio::test]`), and `haste run --watch` (live function hot-reload).
+- Zero-linker AOT & cross-compilation: `haste --release build --target <TRIPLE> -o <OUT>` for Linux/macOS/Windows x86-64 and ARM64.
+- Embeddable Rust library API: `haste::Compiler` / `CompilerBuilder`.
+
+## Docs
+
+- [README.md](README.md): quickstart, benchmarks, crate compatibility, limits, CLI reference, and environment variables.
+- [ARCHITECTURE.md](ARCHITECTURE.md): compiler pipeline, SSA passes, register allocator, cache substrates, and module layout.
+- [AGENTS.md](AGENTS.md): onboarding guide for coding agents.
+- [CONTRIBUTING.md](CONTRIBUTING.md): bug-report format and contribution policy.
+- [SECURITY.md](SECURITY.md): vulnerability reporting policy.

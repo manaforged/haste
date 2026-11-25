@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a compiler error, miscompile, crash, or CLI issue
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [Limits](https://github.com/manaforged/haste#limits) before filing.
+  - type: input
+    id: version
+    attributes:
+      label: haste version and platform
+      placeholder: "haste 0.0.0 (abc12345), macOS ARM64 / Linux x86_64, rustc 1.98.1"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and output
+      description: Exact `haste` command and full stdout/stderr.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Minimal `Cargo.toml`, `src/main.rs` (or `src/lib.rs`), and `Cargo.lock` if dependencies are involved.
+      render: rust
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior (vs rustc / cargo)
+      description: What `rustc` or `cargo` does on the same input.
+    validations:
+      required: false

@@ -10,7 +10,7 @@ rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/manaforged/haste"
 homepage = "https://github.com/manaforged/haste"
-keywords = ["compiler", "rust", "jit", "aot"]
+keywords = ["compiler", "rust", "jit", "aot", "hot-reload"]
 categories = ["compilers", "development-tools"]
 
 [workspace.lints.clippy]
