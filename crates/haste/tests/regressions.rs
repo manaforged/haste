@@ -475,4 +475,54 @@ fn cold_cache_dep_feature_fetches_in_workspace_dir() {
         stdout.contains("fake_dep 0.1.0|extra"),
         "expected fetched dep feature in graph output, got:\n{stdout}"
     );
+
+    let vend = FixtureDir::write_crate(
+        "haste-reg",
+        "cargo-vendor-offline",
+        "vendor_app",
+        "fn main() { println!(\"{}\", vdep::answer()); }\n",
+    );
+    std::fs::write(
+        vend.path().join("Cargo.toml"),
+        "[package]\nname = \"vendor_app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nvdep = \"1.2.3\"\n",
+    )
+    .expect("write vendor Cargo.toml");
+    std::fs::write(
+        vend.path().join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"vendor_app\"\nversion = \"0.1.0\"\ndependencies = [\n \"vdep\",\n]\n\n[[package]]\nname = \"vdep\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    )
+    .expect("write vendor Cargo.lock");
+    std::fs::create_dir_all(vend.path().join(".cargo")).expect("mkdir .cargo");
+    std::fs::write(
+        vend.path().join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"third_party/vendor\"\n",
+    )
+    .expect("write .cargo/config.toml");
+    let vdep_dir = vend.path().join("third_party/vendor/vdep");
+    std::fs::create_dir_all(vdep_dir.join("src")).expect("mkdir vdep");
+    std::fs::write(
+        vdep_dir.join("Cargo.toml"),
+        "[package]\nname = \"vdep\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
+    )
+    .expect("write vdep Cargo.toml");
+    std::fs::write(
+        vdep_dir.join("src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .expect("write vdep lib.rs");
+
+    let empty_home = vend.path().join("empty-home");
+    std::fs::create_dir_all(&empty_home).expect("mkdir empty-home");
+    let vout = Command::new(haste)
+        .env("CARGO_HOME", &empty_home)
+        .args(["run"])
+        .arg(vend.path())
+        .output()
+        .expect("run vendored crate offline");
+    assert!(
+        vout.status.success() && String::from_utf8_lossy(&vout.stdout).trim() == "42",
+        "ordinary cargo vendor (unversioned dir + .cargo/config.toml directory) must work offline; stdout={} stderr={}",
+        String::from_utf8_lossy(&vout.stdout),
+        String::from_utf8_lossy(&vout.stderr)
+    );
 }
