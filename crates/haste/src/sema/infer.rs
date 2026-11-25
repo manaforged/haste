@@ -104,6 +104,11 @@ pub enum Shape {
 }
 
 pub(super) type Name<'a> = (&'a str, u32);
+type LocalObligations = Box<[(ItemRef, Vec<Ty>)]>;
+type LocalSelectionKey = (ItemRef, Ty, Substs, Option<u32>, bool);
+type LocalSelectionValue = (Option<(super::impls::ImplRef, Substs)>, LocalObligations);
+type LocalProjectionKey = (ItemRef, Ty, Substs, crate::names::Sym, Substs, Option<u32>);
+type LocalProjectionValue = (Option<Ty>, LocalObligations);
 
 /// The inference of one body.
 pub struct Infer<'c, 'a> {
@@ -123,6 +128,13 @@ pub struct Infer<'c, 'a> {
     var_trail: Vec<(u32, Option<Ty>)>,
     diverge_trail: Vec<(u32, u32)>,
     trail_depth: u32,
+    trail_bases: Vec<usize>,
+    var_epoch: u64,
+    capture_epoch: u64,
+    pre_var_epoch: u64,
+    local_cache_epoch: u64,
+    local_closed_cache_epoch: u64,
+    local_cache_var_limit: usize,
     metadata: Vec<(Ty, Ty)>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
     projections: Vec<project::Projection>,
@@ -145,7 +157,7 @@ pub struct Infer<'c, 'a> {
     hidden: Vec<(u32, Ty)>,
     const_args: Vec<(String, (u128, (u32, bool)))>,
     selecting: Vec<u64>,
-    assoc_stack: Vec<(ItemRef, Ty, crate::body::PathId)>,
+    assoc_stack: Vec<(ItemRef, Ty, Substs, crate::body::PathId, Option<Ty>)>,
     cycle_hits: u32,
     frames: usize,
     evaluating: Vec<ItemRef>,
@@ -154,8 +166,10 @@ pub struct Infer<'c, 'a> {
         (ItemRef, Option<crate::names::Sym>, Option<u32>, Vec<u32>),
         Vec<crate::names::PerNs>,
     >,
-    local_selections: HashMap<(ItemRef, Ty, Substs), Option<(super::impls::ImplRef, Substs)>>,
-    local_projections: HashMap<(ItemRef, Ty, Substs, crate::names::Sym, Substs), Option<Ty>>,
+    local_selections: HashMap<LocalSelectionKey, LocalSelectionValue>,
+    local_closed_selections: HashMap<LocalSelectionKey, LocalSelectionValue>,
+    local_projections: HashMap<LocalProjectionKey, LocalProjectionValue>,
+    local_closed_projections: HashMap<LocalProjectionKey, LocalProjectionValue>,
     method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
     body_src: &'a Source,
@@ -217,17 +231,20 @@ pub(super) fn infer_after_compiler_made(
     let home = cx.module_of(item)?;
     let root = Some(item.body_owner());
     let args = cx.types.substs(substs).to_vec();
-    let mut infer = Infer::start(cx, (&body, &sig, src), home);
-    (infer.root, infer.instance, infer.method_hints) = (root, Some((item, substs)), method_hints);
-    let mut frame = infer.frame(item, &args)?;
-    (frame.src, frame.root) = (src, root);
-    infer.swap_frame(frame);
-    infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
-    infer.run(foreign)?;
-    if !foreign {
-        infer.check_const_body_overflow(item)?;
-    }
-    let mut typed = infer.finish()?;
+    let mut typed = {
+        let mut infer = Box::new(Infer::start(cx, (&body, &sig, src), home));
+        (infer.root, infer.instance, infer.method_hints) =
+            (root, Some((item, substs)), method_hints);
+        let mut frame = infer.frame(item, &args)?;
+        (frame.src, frame.root) = (src, root);
+        infer.swap_frame(frame);
+        infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
+        infer.run(foreign)?;
+        if !foreign {
+            infer.check_const_body_overflow(item)?;
+        }
+        (*infer).finish()?
+    };
     if foreign {
         super::global_asm::bind(cx, item, &mut typed);
     }
@@ -348,6 +365,13 @@ impl<'c, 'a> Infer<'c, 'a> {
             var_trail: Vec::new(),
             diverge_trail: Vec::new(),
             trail_depth: 0,
+            trail_bases: Vec::new(),
+            var_epoch: 0,
+            capture_epoch: 0,
+            pre_var_epoch: 0,
+            local_cache_epoch: 0,
+            local_closed_cache_epoch: 0,
+            local_cache_var_limit: 0,
             metadata,
             obligations,
             projections,
@@ -377,7 +401,9 @@ impl<'c, 'a> Infer<'c, 'a> {
             proved: rustc_hash::FxHashSet::default(),
             imports: HashMap::default(),
             local_selections: HashMap::default(),
+            local_closed_selections: HashMap::default(),
             local_projections: HashMap::default(),
+            local_closed_projections: HashMap::default(),
             method_hints: None,
             poly: None,
             body_src: src,

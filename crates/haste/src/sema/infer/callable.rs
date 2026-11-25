@@ -290,12 +290,12 @@ impl Infer<'_, '_> {
             self.rollback_vars(mark);
             return Ok(false);
         }
-        let args = self.bound_args(of, arena, path, ty)?;
-        if super::project::angle_args(arena, path).is_some()
-            && !self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth)?
-        {
-            self.rollback_vars(mark);
-            return Ok(false);
+        if super::project::angle_args(arena, path).is_some() {
+            let args = self.bound_args(of, arena, path, ty)?;
+            if !self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth)? {
+                self.rollback_vars(mark);
+                return Ok(false);
+            }
         }
         self.commit_vars(mark);
         Ok(true)

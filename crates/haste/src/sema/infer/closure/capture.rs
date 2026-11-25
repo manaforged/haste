@@ -181,10 +181,13 @@ impl<'a> Infer<'_, 'a> {
     }
 
     pub(in super::super) fn settle_captures(&mut self) -> Result<()> {
-        for (expr, uses, by_move, forced) in std::mem::take(&mut self.unsure) {
+        while !self.unsure.is_empty() {
+            let (expr, uses, by_move, forced) = self.unsure.remove(0);
             let (captures, consumes, _) = self.decide_captures(&uses, (by_move, &forced))?;
             if let Some(closure) = self.out.closures.get_mut(&expr) {
                 (closure.consumes, closure.captures) = (closure.coroutine || consumes, captures);
+                self.var_epoch += 1;
+                self.capture_epoch += 1;
             }
         }
         Ok(())

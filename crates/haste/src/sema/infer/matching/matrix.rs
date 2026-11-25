@@ -8,6 +8,14 @@ use super::exhaustive::{
     CtorKind, MAX_ARRAY_EXPAND, MPat, decode_key_to_string, int_key_domain, int_spec,
 };
 
+const MAX_RECURSIVE_ADT_DEPTH: usize = 16;
+
+#[derive(Clone)]
+struct Col {
+    ty: Ty,
+    seen: Vec<(ItemRef, Substs)>,
+}
+
 impl Infer<'_, '_> {
     pub(super) fn find_witness(
         &mut self,
@@ -15,32 +23,50 @@ impl Infer<'_, '_> {
         tys: &[Ty],
         budget: &mut u32,
     ) -> Option<Vec<String>> {
+        let cols: Vec<Col> = tys
+            .iter()
+            .map(|&ty| Col {
+                ty,
+                seen: Vec::new(),
+            })
+            .collect();
+        self.find_witness_cols(rows, &cols, budget)
+    }
+
+    fn find_witness_cols(
+        &mut self,
+        rows: &[Vec<MPat>],
+        cols: &[Col],
+        budget: &mut u32,
+    ) -> Option<Vec<String>> {
+        if rows.iter().any(|r| r.iter().all(is_wild)) {
+            return None;
+        }
         if *budget == 0 {
             return None;
         }
         *budget -= 1;
-        let (&first_ty, rest_tys) = match tys.split_first() {
+        let (first, rest_cols) = match cols.split_first() {
             Some(parts) => parts,
             None => return rows.is_empty().then(Vec::new),
         };
-        let ty = self.peel_match_ref(first_ty);
+        let ty = self.peel_match_ref(first.ty);
         if self.is_uninhabited(ty, 0) {
             return None;
         }
         let expanded = expand_col0_or(rows);
         let rows = expanded.as_slice();
         match *self.cx.types.kind(ty) {
-            Kind::Prim(Primitive::Bool) => self.witness_bool(rows, rest_tys, budget),
+            Kind::Prim(Primitive::Bool) => self.witness_bool(rows, rest_cols, budget),
             Kind::Prim(prim) if int_spec(prim).is_some() => {
-                self.witness_int(rows, prim, rest_tys, budget)
+                self.witness_int(rows, prim, rest_cols, budget)
             }
             Kind::Tuple(items) => {
                 let elems = self.cx.types.substs(items).to_vec();
                 self.witness_product(
                     rows,
-                    &CtorKind::Tuple(elems.len()),
-                    &elems,
-                    rest_tys,
+                    (&CtorKind::Tuple(elems.len()), &elems, &first.seen),
+                    rest_cols,
                     budget,
                     |parts| format!("({})", parts.join(", ")),
                 )
@@ -51,31 +77,32 @@ impl Infer<'_, '_> {
                     let elems = vec![elem; n];
                     self.witness_product(
                         rows,
-                        &CtorKind::Array(n),
-                        &elems,
-                        rest_tys,
+                        (&CtorKind::Array(n), &elems, &first.seen),
+                        rest_cols,
                         budget,
                         |parts| format!("[{}]", parts.join(", ")),
                     )
                 } else {
-                    self.witness_infinite(rows, rest_tys, budget)
+                    self.witness_infinite(rows, rest_cols, budget)
                 }
             }
-            Kind::Slice(elem) => self.witness_slice(rows, elem, rest_tys, budget),
-            Kind::Adt(item, args) => self.witness_adt(rows, item, args, rest_tys, budget),
-            _ => self.witness_infinite(rows, rest_tys, budget),
+            Kind::Slice(elem) => self.witness_slice(rows, (elem, &first.seen), rest_cols, budget),
+            Kind::Adt(item, args) => {
+                self.witness_adt(rows, (item, args, &first.seen), rest_cols, budget)
+            }
+            _ => self.witness_infinite(rows, rest_cols, budget),
         }
     }
 
     fn witness_bool(
         &mut self,
         rows: &[Vec<MPat>],
-        rest_tys: &[Ty],
+        rest_cols: &[Col],
         budget: &mut u32,
     ) -> Option<Vec<String>> {
         for b in [false, true] {
             let spec = specialize_ctor(rows, &CtorKind::Bool(b), 0);
-            if let Some(mut rest) = self.find_witness(&spec, rest_tys, budget) {
+            if let Some(mut rest) = self.find_witness_cols(&spec, rest_cols, budget) {
                 rest.push(b.to_string());
                 return Some(rest);
             }
@@ -87,7 +114,7 @@ impl Infer<'_, '_> {
         &mut self,
         rows: &[Vec<MPat>],
         prim: Primitive,
-        rest_tys: &[Ty],
+        rest_cols: &[Col],
         budget: &mut u32,
     ) -> Option<Vec<String>> {
         let (min, max) = int_key_domain(prim)?;
@@ -138,7 +165,7 @@ impl Infer<'_, '_> {
                     })
                     .map(|row| row[1..].to_vec())
                     .collect();
-                if let Some(mut rest) = self.find_witness(&spec, rest_tys, budget) {
+                if let Some(mut rest) = self.find_witness_cols(&spec, rest_cols, budget) {
                     rest.push(format_int_witness(seg_lo, seg_hi, prim));
                     return Some(rest);
                 }
@@ -150,18 +177,22 @@ impl Infer<'_, '_> {
     fn witness_product(
         &mut self,
         rows: &[Vec<MPat>],
-        ctor: &CtorKind,
-        field_tys: &[Ty],
-        rest_tys: &[Ty],
+        (ctor, field_tys, field_seen): (&CtorKind, &[Ty], &[(ItemRef, Substs)]),
+        rest_cols: &[Col],
         budget: &mut u32,
         format: impl FnOnce(&[String]) -> String,
     ) -> Option<Vec<String>> {
         let arity = field_tys.len();
         let spec = specialize_ctor(rows, ctor, arity);
-        let mut sub_tys = Vec::with_capacity(arity + rest_tys.len());
-        sub_tys.extend_from_slice(field_tys);
-        sub_tys.extend_from_slice(rest_tys);
-        let mut w = self.find_witness(&spec, &sub_tys, budget)?;
+        let mut sub_cols = Vec::with_capacity(arity + rest_cols.len());
+        for &ty in field_tys {
+            sub_cols.push(Col {
+                ty,
+                seen: field_seen.to_vec(),
+            });
+        }
+        sub_cols.extend_from_slice(rest_cols);
+        let mut w = self.find_witness_cols(&spec, &sub_cols, budget)?;
         let split = w.len() - arity;
         let mut parts: Vec<String> = w.drain(split..).collect();
         parts.reverse();
@@ -172,15 +203,22 @@ impl Infer<'_, '_> {
     fn witness_adt(
         &mut self,
         rows: &[Vec<MPat>],
-        item: ItemRef,
-        args: Substs,
-        rest_tys: &[Ty],
+        (item, args, seen): (ItemRef, Substs, &[(ItemRef, Substs)]),
+        rest_cols: &[Col],
         budget: &mut u32,
     ) -> Option<Vec<String>> {
         let kind = self.cx.item(item).1.kind;
         if kind == ItemKind::Union {
-            return self.witness_infinite(rows, rest_tys, budget);
+            return self.witness_infinite(rows, rest_cols, budget);
         }
+        let recursive = rows.iter().all(|r| matches!(r[0], MPat::Wild))
+            && (seen.contains(&(item, args))
+                || seen.iter().filter(|&&(i, _)| i == item).count() >= MAX_RECURSIVE_ADT_DEPTH);
+        if recursive {
+            return self.witness_infinite(rows, rest_cols, budget);
+        }
+        let mut next_seen = seen.to_vec();
+        next_seen.push((item, args));
         let slice = self.cx.types.substs(args).to_vec();
         let Ok(all_fields) = self.adt_fields(item, &slice) else {
             return None;
@@ -194,9 +232,8 @@ impl Infer<'_, '_> {
             let shape = def.variants.first().map(|v| v.shape);
             return self.witness_product(
                 rows,
-                &CtorKind::Struct(item),
-                &fields,
-                rest_tys,
+                (&CtorKind::Struct(item), &fields, &next_seen),
+                rest_cols,
                 budget,
                 |parts| format_ctor_witness(&adt_name, shape, parts),
             );
@@ -216,9 +253,8 @@ impl Infer<'_, '_> {
             let full = format!("{adt_name}::{v_name}");
             if let Some(w) = self.witness_product(
                 rows,
-                &CtorKind::Variant(item, v_idx),
-                &v_fields,
-                rest_tys,
+                (&CtorKind::Variant(item, v_idx), &v_fields, &next_seen),
+                rest_cols,
                 budget,
                 |parts| format_ctor_witness(&full, Some(shape), parts),
             ) {
@@ -226,7 +262,7 @@ impl Infer<'_, '_> {
             }
         }
         if self.is_foreign_non_exhaustive(item) {
-            return self.witness_infinite(rows, rest_tys, budget);
+            return self.witness_infinite(rows, rest_cols, budget);
         }
         None
     }
@@ -234,8 +270,8 @@ impl Infer<'_, '_> {
     fn witness_slice(
         &mut self,
         rows: &[Vec<MPat>],
-        elem: Ty,
-        rest_tys: &[Ty],
+        (elem, seen): (Ty, &[(ItemRef, Substs)]),
+        rest_cols: &[Col],
         budget: &mut u32,
     ) -> Option<Vec<String>> {
         let mut min_rest: Option<usize> = None;
@@ -259,7 +295,7 @@ impl Infer<'_, '_> {
         }
         let Some(k) = min_rest else {
             let def = specialize_default(rows);
-            if let Some(mut rest) = self.find_witness(&def, rest_tys, budget) {
+            if let Some(mut rest) = self.find_witness_cols(&def, rest_cols, budget) {
                 rest.push("[..]".to_owned());
                 return Some(rest);
             }
@@ -270,9 +306,15 @@ impl Infer<'_, '_> {
             .min(MAX_ARRAY_EXPAND as usize);
         for len in 0..split_len {
             let spec = specialize_slice_len(rows, len);
-            let mut sub_tys = vec![elem; len];
-            sub_tys.extend_from_slice(rest_tys);
-            if let Some(mut w) = self.find_witness(&spec, &sub_tys, budget) {
+            let mut sub_cols = vec![
+                Col {
+                    ty: elem,
+                    seen: seen.to_vec(),
+                };
+                len
+            ];
+            sub_cols.extend_from_slice(rest_cols);
+            if let Some(mut w) = self.find_witness_cols(&spec, &sub_cols, budget) {
                 let split = w.len() - len;
                 let mut parts: Vec<String> = w.drain(split..).collect();
                 parts.reverse();
@@ -287,12 +329,18 @@ impl Infer<'_, '_> {
             specialize_default(rows)
         };
         let mut open_tys = if open_cols <= MAX_ARRAY_EXPAND as usize {
-            vec![elem; open_cols]
+            vec![
+                Col {
+                    ty: elem,
+                    seen: seen.to_vec(),
+                };
+                open_cols
+            ]
         } else {
             Vec::new()
         };
-        open_tys.extend_from_slice(rest_tys);
-        if let Some(mut w) = self.find_witness(&open_rows, &open_tys, budget) {
+        open_tys.extend_from_slice(rest_cols);
+        if let Some(mut w) = self.find_witness_cols(&open_rows, &open_tys, budget) {
             if open_cols <= MAX_ARRAY_EXPAND as usize {
                 let split = w.len() - open_cols;
                 let mut parts: Vec<String> = w.drain(split..).collect();
@@ -314,15 +362,23 @@ impl Infer<'_, '_> {
     fn witness_infinite(
         &mut self,
         rows: &[Vec<MPat>],
-        rest_tys: &[Ty],
+        rest_cols: &[Col],
         budget: &mut u32,
     ) -> Option<Vec<String>> {
         let def = specialize_default(rows);
-        if let Some(mut rest) = self.find_witness(&def, rest_tys, budget) {
+        if let Some(mut rest) = self.find_witness_cols(&def, rest_cols, budget) {
             rest.push("_".to_owned());
             return Some(rest);
         }
         None
+    }
+}
+
+fn is_wild(pat: &MPat) -> bool {
+    match pat {
+        MPat::Wild => true,
+        MPat::Or(alts) => alts.iter().any(is_wild),
+        _ => false,
     }
 }
 

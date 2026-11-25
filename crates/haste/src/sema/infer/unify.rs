@@ -14,6 +14,29 @@ struct Clash {
     cycle: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct CacheState {
+    pub(super) quiet: (usize, usize),
+    pub(super) projections: usize,
+    pub(super) obligations: usize,
+    pub(super) cycle_hits: u32,
+    pub(super) pre_var_epoch: u64,
+    pub(super) capture_epoch: u64,
+    pub(super) vars_len: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct LocalTyInfo {
+    pub(super) var_limit: usize,
+    pub(super) has_ty_var: bool,
+}
+
+pub(super) fn replay_obligations(dst: &mut Vec<(ItemRef, Vec<Ty>)>, obs: &[(ItemRef, Vec<Ty>)]) {
+    if !obs.is_empty() {
+        dst.extend(obs.iter().cloned());
+    }
+}
+
 impl Infer<'_, '_> {
     pub(super) fn trial<T>(
         &mut self,
@@ -50,24 +73,48 @@ impl Infer<'_, '_> {
 
     pub(super) fn mark_vars(&mut self) -> (usize, usize) {
         self.trail_depth += 1;
+        self.trail_bases.push(self.vars.len());
         (self.vars.len(), self.var_trail.len())
     }
 
     pub(super) fn set_var(&mut self, index: usize, value: Option<Ty>) {
+        let prev = self.vars[index];
         if self.trail_depth > 0 {
-            self.var_trail.push((index as u32, self.vars[index]));
+            self.var_trail.push((index as u32, prev));
         }
         self.vars[index] = value;
+        if prev != value {
+            if index < self.local_cache_var_limit {
+                self.var_epoch += 1;
+            }
+            let base = self.trail_bases.last().copied().unwrap_or(self.vars.len());
+            if index < base {
+                self.pre_var_epoch += 1;
+            }
+        }
     }
 
     pub(super) fn rollback_vars(&mut self, (vars_len, trail_len): (usize, usize)) {
+        let mut restored_pre = false;
+        let mut invalidated = vars_len < self.local_cache_var_limit;
         while self.var_trail.len() > trail_len {
             let Some((index, prev)) = self.var_trail.pop() else {
                 break;
             };
-            if (index as usize) < vars_len {
-                self.vars[index as usize] = prev;
+            let idx = index as usize;
+            if idx < vars_len && self.vars[idx] != prev {
+                self.vars[idx] = prev;
+                restored_pre = true;
+                if idx < self.local_cache_var_limit {
+                    invalidated = true;
+                }
             }
+        }
+        if invalidated {
+            self.var_epoch += 1;
+        }
+        if restored_pre {
+            self.pre_var_epoch += 1;
         }
         while self
             .diverge_trail
@@ -84,6 +131,7 @@ impl Infer<'_, '_> {
         self.vars.truncate(vars_len);
         self.var_diverges.truncate(vars_len);
         self.trail_depth -= 1;
+        self.trail_bases.pop();
     }
 
     pub(super) fn commit_vars(&mut self, (_, trail_len): (usize, usize)) {
@@ -96,6 +144,7 @@ impl Infer<'_, '_> {
             self.diverge_trail.clear();
         }
         self.trail_depth -= 1;
+        self.trail_bases.pop();
         if self.trail_depth == 0 {
             self.var_trail.truncate(trail_len);
         }
@@ -133,6 +182,9 @@ impl Infer<'_, '_> {
     ) {
         for &(index, value) in updates {
             self.set_var(index as usize, value);
+        }
+        if base_len < self.local_cache_var_limit {
+            self.var_epoch += 1;
         }
         self.vars.truncate(base_len);
         self.var_diverges.truncate(base_len);
@@ -531,8 +583,30 @@ impl Infer<'_, '_> {
         )
     }
 
-    pub(super) fn cache_state(&self) -> (((usize, usize), usize, usize), u32) {
-        (self.unsettled(), self.cycle_hits)
+    pub(super) fn cache_state(&self) -> CacheState {
+        CacheState {
+            quiet: self.cx.quiet_mark(),
+            projections: self.projections.len(),
+            obligations: self.obligations.len(),
+            cycle_hits: self.cycle_hits,
+            pre_var_epoch: self.pre_var_epoch,
+            capture_epoch: self.capture_epoch,
+            vars_len: self.vars.len(),
+        }
+    }
+
+    pub(super) fn sync_local_cache(&mut self) {
+        if self.local_cache_epoch != self.var_epoch {
+            self.local_selections.clear();
+            self.local_projections.clear();
+            self.local_cache_var_limit = 0;
+            self.local_cache_epoch = self.var_epoch;
+        }
+        if self.local_closed_cache_epoch != self.capture_epoch {
+            self.local_closed_selections.clear();
+            self.local_closed_projections.clear();
+            self.local_closed_cache_epoch = self.capture_epoch;
+        }
     }
 
     pub(super) fn bodiless(&self) -> bool {

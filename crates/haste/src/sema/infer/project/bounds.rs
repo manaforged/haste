@@ -557,8 +557,15 @@ impl Infer<'_, '_> {
         (of, ty, args): (ItemRef, Ty, &[Ty]),
         depth: u32,
     ) -> Result<bool> {
-        let key = (of, self.resolve(ty), path);
+        let key = (
+            of,
+            self.resolve(ty),
+            self.substitute_substs(args),
+            path,
+            self.self_ty.map(|t| self.substitute(t)),
+        );
         if self.assoc_stack.len() >= 16 || self.assoc_stack.contains(&key) {
+            self.cycle_hits += 1;
             return Ok(false);
         }
         self.assoc_stack.push(key);

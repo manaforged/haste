@@ -9,6 +9,8 @@ use super::super::ty::{Kind, Mut, Ty};
 use super::select::Picked;
 use super::{Infer, Local, Res, Shape, Typed, detached};
 
+type CopySeen = rustc_hash::FxHashMap<Ty, Option<bool>>;
+
 impl Infer<'_, '_> {
     /// Whether dropping a value of `ty` runs code: a `Drop` impl of its own or of a part.
     pub fn needs_drop(&mut self, ty: Ty) -> Result<bool> {
@@ -54,27 +56,42 @@ impl Infer<'_, '_> {
 
     /// Whether `ty` is `Copy`: every part of a tuple, array or closure is, and a struct or enum has a `Copy` impl.
     pub fn is_copy(&mut self, ty: Ty) -> Result<bool> {
+        self.is_copy_seen(ty, &mut CopySeen::default())
+    }
+
+    fn is_copy_seen(&mut self, ty: Ty, seen: &mut CopySeen) -> Result<bool> {
         let ty = self.resolve(ty);
-        Ok(match self.cx.types.kind(ty).clone() {
+        if let Some(&entry) = seen.get(&ty) {
+            return Ok(entry.unwrap_or(false));
+        }
+        let kind = self.cx.types.kind(ty).clone();
+        match kind {
             Kind::Ref(Mut::Mut, _)
             | Kind::Slice(_)
             | Kind::Dyn(..)
-            | Kind::Prim(crate::names::Primitive::Str) => false,
+            | Kind::Prim(crate::names::Primitive::Str) => return Ok(false),
+            Kind::Param(_) | Kind::Proj(_) => return self.poly_is_copy(ty),
+            Kind::Tuple(_) | Kind::Array(..) | Kind::Closure(..) | Kind::Adt(..) => {}
+            _ => return Ok(true),
+        }
+        seen.insert(ty, None);
+        let copy = match kind {
             Kind::Tuple(items) => {
                 let items = self.cx.types.substs(items).to_vec();
-                self.all_copy(items.into_iter())?
+                self.all_copy_seen(items.into_iter(), seen)?
             }
-            Kind::Array(inner, _) => self.is_copy(inner)?,
-            Kind::Closure(..) => self.closure_is_copy(ty)?,
+            Kind::Array(inner, _) => self.is_copy_seen(inner, seen)?,
+            Kind::Closure(..) => self.closure_is_copy_seen(ty, seen)?,
             Kind::Adt(..) => {
                 let Some(copy) = self.cx.lang_item("copy") else {
                     bail!("core has no `Copy` trait")
                 };
                 self.select(copy, ty, &[])?.is_some()
             }
-            Kind::Param(_) | Kind::Proj(_) => self.poly_is_copy(ty)?,
             _ => true,
-        })
+        };
+        seen.insert(ty, Some(copy));
+        Ok(copy)
     }
 
     fn closure_env(&mut self, ty: Ty) -> Option<Ty> {
@@ -89,7 +106,7 @@ impl Infer<'_, '_> {
         env
     }
 
-    fn own_closure_is_copy(&mut self, ty: Ty) -> Result<Option<bool>> {
+    fn own_closure_is_copy_seen(&mut self, ty: Ty, seen: &mut CopySeen) -> Result<Option<bool>> {
         let ty = self.resolve(ty);
         let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty) else {
             return Ok(None);
@@ -111,7 +128,7 @@ impl Infer<'_, '_> {
             let copy = match cap.by {
                 super::closure::By::Ref => true,
                 super::closure::By::Mut => false,
-                super::closure::By::Value => self.is_copy(cap_ty)?,
+                super::closure::By::Value => self.is_copy_seen(cap_ty, seen)?,
             };
             if !copy {
                 return Ok(Some(false));
@@ -120,18 +137,22 @@ impl Infer<'_, '_> {
         Ok(Some(true))
     }
 
-    fn closure_is_copy(&mut self, ty: Ty) -> Result<bool> {
+    fn closure_is_copy_seen(&mut self, ty: Ty, seen: &mut CopySeen) -> Result<bool> {
         if self.coroutine_output(ty).is_some() {
             return Ok(false);
         }
         match self.closure_env(ty) {
-            Some(env) => self.is_copy(env),
-            None => Ok(self.own_closure_is_copy(ty)?.unwrap_or(false)),
+            Some(env) => self.is_copy_seen(env, seen),
+            None => Ok(self.own_closure_is_copy_seen(ty, seen)?.unwrap_or(false)),
         }
     }
 
-    fn all_copy(&mut self, mut tys: impl Iterator<Item = Ty>) -> Result<bool> {
-        tys.try_fold(true, |all, ty| Ok(all && self.is_copy(ty)?))
+    fn all_copy_seen(
+        &mut self,
+        mut tys: impl Iterator<Item = Ty>,
+        seen: &mut CopySeen,
+    ) -> Result<bool> {
+        tys.try_fold(true, |all, ty| Ok(all && self.is_copy_seen(ty, seen)?))
     }
 
     /// The `Drop` impl of `ty` itself.
