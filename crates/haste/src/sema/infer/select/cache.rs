@@ -239,9 +239,6 @@ impl<'a> Infer<'_, 'a> {
         if self.cx.types.is_ground(ty) {
             return true;
         }
-        if self.cx.types.has_closure(ty) {
-            return false;
-        }
         let ty = self.resolve(ty);
         if self.cx.types.is_ground(ty) {
             return true;
@@ -250,11 +247,21 @@ impl<'a> Infer<'_, 'a> {
             return false;
         }
         let kind = self.cx.types.kind(ty);
-        if matches!(
-            kind,
-            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)
-        ) {
+        if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
             return false;
+        }
+        if let Kind::Closure(parent, args, _) = *kind {
+            return self.instance != Some((parent, args))
+                && self
+                    .cx
+                    .closure(ty)
+                    .is_some_and(|c| !c.typed.exprs.is_empty())
+                && self
+                    .cx
+                    .types
+                    .substs(args)
+                    .iter()
+                    .all(|&item| self.closed_at(item, depth + 1));
         }
         kind.children(&self.cx.types)
             .all(|item| self.closed_at(item, depth + 1))
