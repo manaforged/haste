@@ -20,7 +20,6 @@ pub(super) struct CacheState {
     pub(super) projections: usize,
     pub(super) obligations: usize,
     pub(super) cycle_hits: u32,
-    pub(super) pre_var_epoch: u64,
     pub(super) capture_epoch: u64,
     pub(super) vars_len: usize,
 }
@@ -73,8 +72,13 @@ impl Infer<'_, '_> {
 
     pub(super) fn mark_vars(&mut self) -> (usize, usize) {
         self.trail_depth += 1;
-        self.trail_bases.push(self.vars.len());
         (self.vars.len(), self.var_trail.len())
+    }
+
+    fn note_var_touched(&mut self, index: usize) {
+        if let Some(top) = self.cache_min_var.last_mut() {
+            *top = (*top).min(index);
+        }
     }
 
     pub(super) fn set_var(&mut self, index: usize, value: Option<Ty>) {
@@ -87,15 +91,11 @@ impl Infer<'_, '_> {
             if index < self.local_cache_var_limit {
                 self.var_epoch += 1;
             }
-            let base = self.trail_bases.last().copied().unwrap_or(self.vars.len());
-            if index < base {
-                self.pre_var_epoch += 1;
-            }
+            self.note_var_touched(index);
         }
     }
 
     pub(super) fn rollback_vars(&mut self, (vars_len, trail_len): (usize, usize)) {
-        let mut restored_pre = false;
         let mut invalidated = vars_len < self.local_cache_var_limit;
         while self.var_trail.len() > trail_len {
             let Some((index, prev)) = self.var_trail.pop() else {
@@ -104,7 +104,7 @@ impl Infer<'_, '_> {
             let idx = index as usize;
             if idx < vars_len && self.vars[idx] != prev {
                 self.vars[idx] = prev;
-                restored_pre = true;
+                self.note_var_touched(idx);
                 if idx < self.local_cache_var_limit {
                     invalidated = true;
                 }
@@ -112,9 +112,6 @@ impl Infer<'_, '_> {
         }
         if invalidated {
             self.var_epoch += 1;
-        }
-        if restored_pre {
-            self.pre_var_epoch += 1;
         }
         while self
             .diverge_trail
@@ -131,7 +128,6 @@ impl Infer<'_, '_> {
         self.vars.truncate(vars_len);
         self.var_diverges.truncate(vars_len);
         self.trail_depth -= 1;
-        self.trail_bases.pop();
     }
 
     pub(super) fn commit_vars(&mut self, (_, trail_len): (usize, usize)) {
@@ -144,7 +140,6 @@ impl Infer<'_, '_> {
             self.diverge_trail.clear();
         }
         self.trail_depth -= 1;
-        self.trail_bases.pop();
         if self.trail_depth == 0 {
             self.var_trail.truncate(trail_len);
         }
@@ -583,16 +578,24 @@ impl Infer<'_, '_> {
         )
     }
 
-    pub(super) fn cache_state(&self) -> CacheState {
+    pub(super) fn begin_cache_state(&mut self) -> CacheState {
+        self.cache_min_var.push(usize::MAX);
         CacheState {
             quiet: self.cx.quiet_mark(),
             projections: self.projections.len(),
             obligations: self.obligations.len(),
             cycle_hits: self.cycle_hits,
-            pre_var_epoch: self.pre_var_epoch,
             capture_epoch: self.capture_epoch,
             vars_len: self.vars.len(),
         }
+    }
+
+    pub(super) fn end_cache_state(&mut self) -> usize {
+        let min_var = self.cache_min_var.pop().unwrap_or(usize::MAX);
+        if let Some(parent) = self.cache_min_var.last_mut() {
+            *parent = (*parent).min(min_var);
+        }
+        min_var
     }
 
     pub(super) fn sync_local_cache(&mut self) {

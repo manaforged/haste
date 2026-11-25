@@ -194,13 +194,11 @@ impl Infer<'_, '_> {
         {
             return Ok(found);
         }
-        let prev_bases = self.trail_bases.len();
-        self.trail_bases.push(self.vars.len());
-        let state = self.cache_state();
+        let state = self.begin_cache_state();
         let res = self.picked_alias_uncached(of, ty, args, (name, own));
-        self.trail_bases.truncate(prev_bases);
+        let min_var = self.end_cache_state();
         let res = res?;
-        self.store_projection(key, local_key, res, state);
+        self.store_projection(key, local_key, res, state, min_var);
         Ok(res)
     }
 
@@ -233,8 +231,9 @@ impl Infer<'_, '_> {
         local_key: Option<(LocalProjectionKey, usize)>,
         res: Option<Ty>,
         state: CacheState,
+        min_var: usize,
     ) {
-        let (global_ok, local_ok) = self.cache_check(state);
+        let (global_ok, local_ok) = self.cache_check(state, min_var);
         if global_ok && let Some(k) = key {
             if res.is_none_or(|t| self.closed(t)) {
                 let cached = res.map(|t| self.substitute(t));

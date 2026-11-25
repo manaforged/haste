@@ -33,9 +33,11 @@ impl<'a> Infer<'_, 'a> {
                 found.map(|(block, impl_args)| (block, self.cx.types.substs(impl_args).to_vec()))
             );
         }
-        let state = self.cache_state();
-        let picked = self.select_at(of, self_ty, args, 0)?;
-        self.store_selection(key, local_key, picked.as_ref(), state);
+        let state = self.begin_cache_state();
+        let picked = self.select_at(of, self_ty, args, 0);
+        let min_var = self.end_cache_state();
+        let picked = picked?;
+        self.store_selection(key, local_key, picked.as_ref(), state, min_var);
         Ok(picked)
     }
 

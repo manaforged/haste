@@ -29,6 +29,7 @@ impl<'a> Context<'a> {
         self.scope_traits_local.borrow_mut().clear();
         self.store.lookups.scope_traits.clear();
         self.store.lookups.reveals = table::Flight::default();
+        self.reveals_local.clear();
         self.store.lookups.futures.clear();
         self.store.lookups.forms.clear();
         self.aliases.clear();
@@ -74,6 +75,7 @@ impl<'a> Context<'a> {
             scope_traits_local: std::cell::RefCell::new(HashMap::default()),
             glues_local: HashMap::default(),
             drops_local: HashMap::default(),
+            reveals_local: HashMap::default(),
             ty_facts: HashMap::default(),
         }
     }
@@ -115,6 +117,7 @@ impl<'a> Context<'a> {
             scope_traits_local: std::cell::RefCell::new(HashMap::default()),
             glues_local: HashMap::default(),
             drops_local: HashMap::default(),
+            reveals_local: HashMap::default(),
             ty_facts: HashMap::default(),
         }
     }

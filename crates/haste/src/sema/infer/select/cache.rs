@@ -73,11 +73,11 @@ impl<'a> Infer<'_, 'a> {
         )
     }
 
-    pub(in super::super) fn cache_check(&self, state: CacheState) -> (bool, bool) {
+    pub(in super::super) fn cache_check(&self, state: CacheState, min_var: usize) -> (bool, bool) {
         let base_ok = self.cx.quiet_mark() == state.quiet
             && self.projections.len() == state.projections
             && self.cycle_hits == state.cycle_hits
-            && self.pre_var_epoch == state.pre_var_epoch
+            && min_var >= state.vars_len
             && self.capture_epoch == state.capture_epoch;
         (
             base_ok && self.obligations.len() == state.obligations,
@@ -117,8 +117,9 @@ impl<'a> Infer<'_, 'a> {
         local_key: Option<(LocalSelectionKey, usize)>,
         picked: Option<&Picked>,
         state: CacheState,
+        min_var: usize,
     ) {
-        let (global_ok, local_ok) = self.cache_check(state);
+        let (global_ok, local_ok) = self.cache_check(state, min_var);
         if global_ok && let Some(k) = key {
             let kept = match picked {
                 None => Some(None),

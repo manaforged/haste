@@ -188,23 +188,33 @@ impl<'a> Infer<'_, 'a> {
         if let Some(found) = self.cached_selection(key.as_ref(), local_key.as_ref()) {
             return Ok(found.is_some());
         }
-        let state = self.cache_state();
+        let state = self.begin_cache_state();
         self.selecting.push(query);
         let found = self.applicable(of, ty, args, depth + 1);
         self.selecting.pop();
-        match <[_; 1]>::try_from(found?) {
+        let found = match found {
+            Ok(found) => found,
+            Err(err) => {
+                self.end_cache_state();
+                return Err(err);
+            }
+        };
+        match <[_; 1]>::try_from(found) {
             Ok([(picked, vars)]) => {
                 self.adopt(vars);
-                let holds = self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth)?;
+                let holds = self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth);
+                let min_var = self.end_cache_state();
+                let holds = holds?;
                 if holds {
-                    self.store_selection(key, local_key, Some(&picked), state);
+                    self.store_selection(key, local_key, Some(&picked), state, min_var);
                 }
                 Ok(holds)
             }
             Err(found) => {
+                let min_var = self.end_cache_state();
                 let held = !found.is_empty();
                 if !held {
-                    self.store_selection(key, local_key, None, state);
+                    self.store_selection(key, local_key, None, state, min_var);
                 }
                 if held && self.obligation_open(ty, args) {
                     self.note_obligation_site(of, ty);
