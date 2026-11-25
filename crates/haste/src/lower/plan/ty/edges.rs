@@ -378,6 +378,22 @@ fn hash_drop_variants(
                 return Ok(());
             };
             mix.u64(layout.size.bytes());
+            if matches!(cx.types.kind(ty), Kind::Array(..))
+                && let Some(glue) = cx.lang_item("drop_glue")
+            {
+                let slice = cx.types.intern(Kind::Slice(elem));
+                let gs = cx.types.intern_substs(&[slice]);
+                hash_call_edge(
+                    cx,
+                    (reached, slots),
+                    inline,
+                    mix,
+                    caller,
+                    glue,
+                    gs,
+                    cycle_root,
+                )?;
+            }
             return hash_drop_tree_seen(
                 cx,
                 (reached, slots),

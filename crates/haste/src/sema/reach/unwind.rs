@@ -3,7 +3,6 @@ use rustc_hash::FxHashMap;
 use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Stmt, UnOp};
 use crate::host::HostSymbol;
 use crate::names::ItemRef;
-use crate::outline::item::ItemKind;
 use crate::sema::Context;
 use crate::sema::infer::{LazyTables, Res, Shape, SiteKey, Typed};
 use crate::sema::intrinsic::Intrinsic;
@@ -23,39 +22,30 @@ pub(crate) fn host_symbol_may_unwind(host: &HostSymbol) -> bool {
     )
 }
 
-fn extern_abi_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
-    let Some(parent) = cx.parent_item(item) else {
-        return true;
-    };
-    let (src, entry) = cx.item(parent);
-    if entry.kind != ItemKind::ExternBlock {
-        return true;
-    }
-    let Some(open) = entry.body else {
-        return true;
-    };
-    for tok in entry.start..open {
-        let text = src.text(tok);
-        if text.starts_with('"') && (text.contains("-unwind") || text == "\"Rust\"") {
-            return true;
-        }
-    }
-    false
+fn foreign_host_symbol(cx: &Context<'_>, item: ItemRef) -> Option<HostSymbol> {
+    let lib = cx.link_lib(item);
+    cx.symbol_name(item)
+        .as_deref()
+        .and_then(|name| HostSymbol::resolve_for_lib(name, lib.as_deref(), true))
 }
 
 fn foreign_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
-    let lib = cx.link_lib(item);
-    let Some(host) = cx
-        .symbol_name(item)
-        .as_deref()
-        .and_then(|name| HostSymbol::resolve_for_lib(name, lib.as_deref(), true))
-    else {
+    let Some(host) = foreign_host_symbol(cx, item) else {
         return true;
     };
     match host {
-        HostSymbol::Dynamic { .. } => extern_abi_may_unwind(cx, item),
+        HostSymbol::Dynamic { .. } => cx.extern_block_may_unwind(item),
         _ => host_symbol_may_unwind(&host),
     }
+}
+
+/// Whether foreign item `item` calls into dynamic native code whose ABI permits unwinding.
+pub(crate) fn foreign_dynamic_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
+    cx.extern_block_may_unwind(item)
+        && matches!(
+            foreign_host_symbol(cx, item),
+            None | Some(HostSymbol::Dynamic { .. })
+        )
 }
 
 fn intrinsic_may_unwind(intr: Intrinsic) -> bool {

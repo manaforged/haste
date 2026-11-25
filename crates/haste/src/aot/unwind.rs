@@ -16,6 +16,8 @@ pub(super) use x64::{emit_x64_catch_unwind, emit_x64_start_panic};
 pub(super) const STOP_FP_OFFSET: u32 = 0x20;
 /// Byte offset of the callee-saved register buffer pointer inside the AOT unwind context.
 pub(super) const REGS_PTR_OFFSET: u32 = 0x28;
+/// Byte offset of the active cleanup frame boundary inside the thread-local unwind state.
+const CLEANUP_FP_OFFSET: i32 = 32;
 /// Byte size of one function record in the AOT unwind table (`start, end, drop_start, drop_count, saved_regs`).
 pub(crate) const UNWIND_FN_REC_BYTES: usize = 20;
 
@@ -54,13 +56,15 @@ fn build_unwind_walk() -> Function {
     let mut func = Function::new(sig);
     let mut b = FunctionBuilder::new(&mut func);
     let mut drop_sig = Signature::new(CallConv::Native);
-    drop_sig.params = vec![AbiParam::new(Type::I64)];
+    drop_sig.params = vec![AbiParam::new(Type::I64), AbiParam::new(Type::I64)];
     let drop_sig = b.import_signature(drop_sig);
 
     let entry = b.create_block();
     let load_table = b.create_block();
     let init_done = b.create_block();
+    let empty_check = b.create_block();
     let frame_loop = b.create_block();
+    let check_double = b.create_block();
     let load_caller = b.create_block();
     let site_check = b.create_block();
     let site_search = b.create_block();
@@ -78,6 +82,8 @@ fn build_unwind_walk() -> Function {
     let drain_set_head = b.create_block();
     let drain_after_unlink = b.create_block();
     let drain_invoke = b.create_block();
+    let drain_invoke_wide = b.create_block();
+    let drain_invoke_call = b.create_block();
     let drain_done = b.create_block();
     let check_pc = b.create_block();
     let search_init = b.create_block();
@@ -89,12 +95,15 @@ fn build_unwind_walk() -> Function {
     let drop_step = b.create_block();
     let drop_run = b.create_block();
     let load_ind = b.create_block();
+    let load_wide = b.create_block();
     let do_call = b.create_block();
     let restore_init = b.create_block();
+    let restore_check = b.create_block();
     let restore_loop = b.create_block();
     let restore_step = b.create_block();
     let restore_copy = b.create_block();
     let done = b.create_block();
+    let abort_ret = b.create_block();
 
     b.append_block_params_for_function_params(entry);
     let count = b.append_block_param(init_done, Type::I64);
@@ -112,7 +121,10 @@ fn build_unwind_walk() -> Function {
     let lo = b.append_block_param(bsearch, Type::I64);
     let hi = b.append_block_param(bsearch, Type::I64);
     let idx = b.append_block_param(drop_loop, Type::I64);
+    let d_arg0 = b.append_block_param(drain_invoke_call, Type::I64);
+    let d_arg1 = b.append_block_param(drain_invoke_call, Type::I64);
     let arg = b.append_block_param(do_call, Type::I64);
+    let arg1 = b.append_block_param(do_call, Type::I64);
     let rmask = b.append_block_param(restore_loop, Type::I64);
     let rbit = b.append_block_param(restore_loop, Type::I64);
     let rk = b.append_block_param(restore_loop, Type::I64);
@@ -126,15 +138,24 @@ fn build_unwind_walk() -> Function {
     let mark = b.ins().load(Type::I64, frame_ptr, 8);
     let stop_fp = b.ins().load(Type::I64, frame_ptr, STOP_FP_OFFSET as i32);
     let raw_regs_ptr = b.ins().load(Type::I64, frame_ptr, REGS_PTR_OFFSET as i32);
+    let cleanup_fp = b.ins().load(Type::I64, state_ptr, CLEANUP_FP_OFFSET);
+    let my_fp = b.ins().get_frame_pointer(Type::I64);
     let zero = b.ins().iconst(Type::I64, 0);
     let c1 = b.ins().iconst(Type::I64, 1);
     let c2 = b.ins().iconst(Type::I64, 2);
     let c3 = b.ins().iconst(Type::I64, 3);
     let c4 = b.ins().iconst(Type::I64, 4);
+    let abort_bit = b
+        .ins()
+        .iconst(Type::I64, i64::from(haste_codegen::UNWIND_ABORT_BIT));
+    let reg_mask_bits = b
+        .ins()
+        .iconst(Type::I64, i64::from(!haste_codegen::UNWIND_ABORT_BIT));
     let z8 = b.ins().iconst(Type::I8, 0);
     let one8 = b.ins().iconst(Type::I8, 1);
     let two8 = b.ins().iconst(Type::I8, 2);
     let entry_has_stop = b.ins().icmp_imm(IntCC::NotEqual, stop_fp, 0);
+    let end_final = b.ins().select(entry_has_stop, two8, one8);
     let regs_ptr = b.ins().select(entry_has_stop, zero, raw_regs_ptr);
     let no_table = b.ins().icmp_imm(IntCC::Equal, table_ptr, 0);
     b.ins().brif(
@@ -161,35 +182,41 @@ fn build_unwind_walk() -> Function {
     b.switch_to_block(init_done);
     let any_entries = b.ins().bor(count, site_count);
     let empty = b.ins().icmp_imm(IntCC::Equal, any_entries, 0);
+    b.ins().brif(empty, empty_check, &[], frame_loop, &[cur_fp]);
+
+    b.switch_to_block(empty_check);
+    let empty_cleanup = b.ins().icmp_imm(IntCC::NotEqual, cleanup_fp, 0);
+    let no_stop = b.ins().icmp_imm(IntCC::Equal, stop_fp, 0);
+    let catcher_outside = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, stop_fp, cleanup_fp);
+    let no_inner_catcher = b.ins().bor(no_stop, catcher_outside);
+    let abort_empty = b.ins().band(empty_cleanup, no_inner_catcher);
     b.ins().brif(
-        empty,
+        abort_empty,
+        abort_ret,
+        &[],
         drain_loop,
-        &[zero, zero, zero, one8],
-        frame_loop,
-        &[cur_fp],
+        &[zero, zero, zero, end_final],
     );
 
     b.switch_to_block(frame_loop);
     let fp_zero = b.ins().icmp_imm(IntCC::Equal, fp, 0);
-    b.ins().brif(
-        fp_zero,
-        drain_loop,
-        &[zero, zero, zero, one8],
-        load_caller,
-        &[],
-    );
+    b.ins().brif(fp_zero, empty_check, &[], check_double, &[]);
+
+    b.switch_to_block(check_double);
+    let has_cleanup = b.ins().icmp_imm(IntCC::NotEqual, cleanup_fp, 0);
+    let past_cleanup = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, fp, cleanup_fp);
+    let double_panic = b.ins().band(has_cleanup, past_cleanup);
+    b.ins().brif(double_panic, abort_ret, &[], load_caller, &[]);
 
     b.switch_to_block(load_caller);
     let caller_fp = b.ins().load(Type::I64, fp, 0);
     let ret_pc = b.ins().load(Type::I64, fp, 8);
     let bad_fp = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, caller_fp, fp);
-    b.ins().brif(
-        bad_fp,
-        drain_loop,
-        &[zero, zero, zero, one8],
-        site_check,
-        &[],
-    );
+    b.ins().brif(bad_fp, empty_check, &[], site_check, &[]);
 
     b.switch_to_block(site_check);
     let has_sites = b.ins().icmp_imm(IntCC::NotEqual, site_count, 0);
@@ -242,7 +269,7 @@ fn build_unwind_walk() -> Function {
     b.ins().brif(
         at_stop,
         drain_loop,
-        &[zero, zero, zero, one8],
+        &[zero, zero, zero, two8],
         drain_loop,
         &[caller_fp, caller_fp, ret_pc, z8],
     );
@@ -267,14 +294,19 @@ fn build_unwind_walk() -> Function {
     b.ins().brif(stop_limit, drain_done, &[], drain_unlink, &[]);
 
     b.switch_to_block(drain_unlink);
-    let prev = b.ins().load(Type::I64, node, 8);
-    let next = b.ins().load(Type::I64, node, 16);
+    let prev = b
+        .ins()
+        .load(Type::I64, node, crate::host::unwind::DROP_NODE_PREV_OFF);
+    let next = b
+        .ins()
+        .load(Type::I64, node, crate::host::unwind::DROP_NODE_NEXT_OFF);
     let has_prev = b.ins().icmp_imm(IntCC::NotEqual, prev, 0);
     b.ins()
         .brif(has_prev, drain_set_prev, &[], drain_check_next, &[]);
 
     b.switch_to_block(drain_set_prev);
-    b.ins().store(next, prev, 16);
+    b.ins()
+        .store(next, prev, crate::host::unwind::DROP_NODE_NEXT_OFF);
     b.ins().jump(drain_check_next, &[]);
 
     b.switch_to_block(drain_check_next);
@@ -283,7 +315,8 @@ fn build_unwind_walk() -> Function {
         .brif(has_next, drain_set_next, &[], drain_set_head, &[]);
 
     b.switch_to_block(drain_set_next);
-    b.ins().store(prev, next, 8);
+    b.ins()
+        .store(prev, next, crate::host::unwind::DROP_NODE_PREV_OFF);
     b.ins().jump(drain_after_unlink, &[]);
 
     b.switch_to_block(drain_set_head);
@@ -291,10 +324,15 @@ fn build_unwind_walk() -> Function {
     b.ins().jump(drain_after_unlink, &[]);
 
     b.switch_to_block(drain_after_unlink);
-    b.ins().store(zero, node, 8);
-    b.ins().store(zero, node, 16);
+    b.ins()
+        .store(zero, node, crate::host::unwind::DROP_NODE_PREV_OFF);
+    b.ins()
+        .store(zero, node, crate::host::unwind::DROP_NODE_NEXT_OFF);
     let st = b.ins().load(Type::I8, node, 0);
-    let mask_clear = b.ins().iconst(Type::I8, !3_i64);
+    let mask_clear = b.ins().iconst(
+        Type::I8,
+        !i64::from(crate::host::unwind::DROP_ACTIVE | crate::host::unwind::DROP_LINKED),
+    );
     let st_cleared = b.ins().band(st, mask_clear);
     b.ins().store(st_cleared, node, 0);
     let is_active = b.ins().band(st, one8);
@@ -307,9 +345,33 @@ fn build_unwind_walk() -> Function {
     );
 
     b.switch_to_block(drain_invoke);
-    let node_fn = b.ins().load(Type::I64, node, 24);
-    let node_arg = b.ins().load(Type::I64, node, 32);
-    b.ins().call_indirect(drop_sig, node_fn, &[node_arg]);
+    let node_fn = b
+        .ins()
+        .load(Type::I64, node, crate::host::unwind::DROP_NODE_FN_OFF);
+    let node_arg = b
+        .ins()
+        .load(Type::I64, node, crate::host::unwind::DROP_NODE_ARG_OFF);
+    let wide_bit = b
+        .ins()
+        .iconst(Type::I8, i64::from(crate::host::unwind::DROP_WIDE));
+    let is_wide_node = b.ins().band(st, wide_bit);
+    b.ins().brif(
+        is_wide_node,
+        drain_invoke_wide,
+        &[],
+        drain_invoke_call,
+        &[node_arg, zero],
+    );
+
+    b.switch_to_block(drain_invoke_wide);
+    let node_wide0 = b.ins().load(Type::I64, node_arg, 0);
+    let node_wide1 = b.ins().load(Type::I64, node_arg, 8);
+    b.ins().jump(drain_invoke_call, &[node_wide0, node_wide1]);
+
+    b.switch_to_block(drain_invoke_call);
+    b.ins().store(my_fp, state_ptr, CLEANUP_FP_OFFSET);
+    b.ins().call_indirect(drop_sig, node_fn, &[d_arg0, d_arg1]);
+    b.ins().store(cleanup_fp, state_ptr, CLEANUP_FP_OFFSET);
     b.ins()
         .jump(drain_loop, &[limit_addr, next_fp, next_ret, is_final]);
 
@@ -385,27 +447,46 @@ fn build_unwind_walk() -> Function {
     let slot_ptr = b.ins().iadd(next_fp, local_off);
     let ind32 = b.ins().load(Type::I32, dptr, 12);
     let is_ind = b.ins().icmp_imm(IntCC::NotEqual, ind32, 0);
-    b.ins().brif(is_ind, load_ind, &[], do_call, &[slot_ptr]);
+    b.ins()
+        .brif(is_ind, load_ind, &[], do_call, &[slot_ptr, zero]);
 
     b.switch_to_block(load_ind);
     let deref_ptr = b.ins().load(Type::I64, slot_ptr, 0);
-    b.ins().jump(do_call, &[deref_ptr]);
+    let is_wide = b.ins().icmp_imm(
+        IntCC::Equal,
+        ind32,
+        i64::from(haste_codegen::UnwindArg::Wide.as_u8()),
+    );
+    b.ins()
+        .brif(is_wide, load_wide, &[], do_call, &[deref_ptr, zero]);
+
+    b.switch_to_block(load_wide);
+    let wide_meta = b.ins().load(Type::I64, slot_ptr, 8);
+    b.ins().jump(do_call, &[deref_ptr, wide_meta]);
 
     b.switch_to_block(do_call);
     let fn_off32 = b.ins().load(Type::I32, dptr, 8);
     let fn_off = b.ins().uextend(Type::I64, fn_off32);
     let drop_fn = b.ins().iadd(text_base, fn_off);
-    b.ins().call_indirect(drop_sig, drop_fn, &[arg]);
+    b.ins().store(my_fp, state_ptr, CLEANUP_FP_OFFSET);
+    b.ins().call_indirect(drop_sig, drop_fn, &[arg, arg1]);
+    b.ins().store(cleanup_fp, state_ptr, CLEANUP_FP_OFFSET);
     b.ins().jump(drop_loop, &[next_idx]);
 
     b.switch_to_block(restore_init);
+    let abort_flag = b.ins().band(fn_mask, abort_bit);
+    let hit_abort = b.ins().icmp_imm(IntCC::NotEqual, abort_flag, 0);
+    b.ins().brif(hit_abort, abort_ret, &[], restore_check, &[]);
+
+    b.switch_to_block(restore_check);
+    let clean_mask = b.ins().band(fn_mask, reg_mask_bits);
     let has_regs = b.ins().icmp_imm(IntCC::NotEqual, regs_ptr, 0);
-    let has_mask = b.ins().icmp_imm(IntCC::NotEqual, fn_mask, 0);
+    let has_mask = b.ins().icmp_imm(IntCC::NotEqual, clean_mask, 0);
     let do_restore = b.ins().band(has_regs, has_mask);
     b.ins().brif(
         do_restore,
         restore_loop,
-        &[fn_mask, zero, zero],
+        &[clean_mask, zero, zero],
         frame_loop,
         &[next_fp],
     );
@@ -443,5 +524,8 @@ fn build_unwind_walk() -> Function {
     let caught = b.ins().icmp(IntCC::Equal, is_final, two8);
     let ret = b.ins().uextend(Type::I64, caught);
     b.ins().return_(&[ret]);
+
+    b.switch_to_block(abort_ret);
+    b.ins().return_(&[zero]);
     func
 }

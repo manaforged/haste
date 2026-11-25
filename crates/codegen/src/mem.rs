@@ -90,6 +90,7 @@ pub(crate) struct Provenance {
     pub slot_offsets: Vec<Option<(StackSlot, i32)>>,
     pub unescaped_slots: Vec<bool>,
     pub addr_unescaped_slots: Vec<bool>,
+    pub unwind_target_slots: Vec<bool>,
     pub call_readonly_slots: Vec<bool>,
     pub return_only_slots: Vec<bool>,
     pub noalias_escaped: Vec<bool>,
@@ -140,6 +141,7 @@ impl Provenance {
         }
         prov.unescaped_slots = esc.unescaped;
         prov.addr_unescaped_slots = esc.addr_unescaped;
+        prov.unwind_target_slots = esc.unwind_target;
         prov.call_readonly_slots = esc.call_readonly;
         prov.return_only_slots = esc.return_only;
         prov.noalias_escaped = esc.noalias;
@@ -308,6 +310,14 @@ impl Provenance {
     /// Whether `slot`'s address never escapes to normal memory ops or calls, ignoring unwind-drop table reads.
     pub(crate) fn slot_addr_unescaped(&self, slot: StackSlot) -> bool {
         self.addr_unescaped_slots
+            .get(slot.index())
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether `slot`'s address is stored into an indirect/wide unwind-drop slot and therefore read on panic unwind.
+    pub(crate) fn slot_unwind_target(&self, slot: StackSlot) -> bool {
+        self.unwind_target_slots
             .get(slot.index())
             .copied()
             .unwrap_or(false)

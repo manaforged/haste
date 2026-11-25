@@ -6,7 +6,7 @@ use crate::ir::{
 mod decode;
 mod encode;
 
-const FORMAT: u8 = 7;
+const FORMAT: u8 = 8;
 
 macro_rules! table {
     ($name:ident: $ty:ident = [$($variant:ident),* $(,)?]) => {

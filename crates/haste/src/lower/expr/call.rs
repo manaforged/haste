@@ -331,6 +331,9 @@ impl Lower<'_, '_> {
             {
                 self.mark_if_fresh_alloc(&host, code);
             }
+            if crate::sema::reach::foreign_dynamic_may_unwind(self.cx, item) {
+                self.b.func.save_all_regs = true;
+            }
             return self.native_call(code, (params, callee.ret), values);
         }
         self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)
@@ -480,6 +483,9 @@ impl Lower<'_, '_> {
             .cx
             .track_caller(self.reached.list[self.index].0.0)
             .then_some(false);
+        if self.should_unwind() && self.body_may_unwind()? {
+            self.b.func.save_all_regs = true;
+        }
         self.with_caller_loc(clear, |this| {
             this.call_code(code, (params, Some(ret)), values)
         })

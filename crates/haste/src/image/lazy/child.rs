@@ -28,6 +28,40 @@ pub(super) struct Child {
     pub(super) failure: Option<(String, ItemRef)>,
 }
 
+#[cfg(unix)]
+fn high_fd_base() -> i32 {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rl` is a valid stack-allocated `rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return 512;
+    }
+    if rl.rlim_cur < 1024 {
+        let target = rl.rlim_max.min(1024);
+        if target > rl.rlim_cur {
+            rl.rlim_cur = target;
+            // SAFETY: raising soft `RLIMIT_NOFILE` within `rlim_max` in the forked child.
+            let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) };
+        }
+    }
+    (rl.rlim_cur.min(1024) as i32 - 32).max(256)
+}
+
+#[cfg(unix)]
+fn relocate_fd(fd: i32, min_fd: i32) -> i32 {
+    // SAFETY: `fd` is an open pipe fd owned by the forked child; `F_DUPFD_CLOEXEC` duplicates it above low user fds.
+    let moved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min_fd) };
+    if moved >= 0 {
+        // SAFETY: `moved` succeeded, so the original low `fd` is no longer needed.
+        unsafe { libc::close(fd) };
+        moved
+    } else {
+        fd
+    }
+}
+
 impl Jit {
     /// Forks a child that runs `body` on the image, with an output pipe when `piped`, and exits with the status `body` returns; returns the child's id.
     #[cfg(unix)]
@@ -47,17 +81,21 @@ impl Jit {
         };
         let image = &self.image;
         let pid = crate::image::fork_child(|| {
-            stub::connect(image.table, stubs, (ask[1], answer[0]));
-            crate::host::unwind::set_jit_unwind_head(image.unwind_head);
-            // SAFETY: the child closes the ends that only the compiler uses and owns the write end of its output pipe from here on.
-            let out = unsafe {
+            // SAFETY: the child closes the ends that only the compiler uses and relocates its own pipe ends above low user fds.
+            let (child_ask, child_answer, out) = unsafe {
                 libc::close(ask[0]);
                 libc::close(answer[1]);
-                out.map(|[read, write]| {
+                let min_fd = high_fd_base();
+                let child_ask = relocate_fd(ask[1], min_fd);
+                let child_answer = relocate_fd(answer[0], min_fd);
+                let out = out.map(|[read, write]| {
                     libc::close(read);
-                    std::fs::File::from_raw_fd(write)
-                })
+                    std::fs::File::from_raw_fd(relocate_fd(write, min_fd))
+                });
+                (child_ask, child_answer, out)
             };
+            stub::connect(image.table, stubs, (child_ask, child_answer));
+            crate::host::unwind::set_jit_unwind_head(image.unwind_head);
             body(image, out)
         })?;
         // SAFETY: the parent owns ask[0], answer[1] and the read end of the output pipe from here on, and closes the ends that only the child uses.

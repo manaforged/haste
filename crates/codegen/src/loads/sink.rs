@@ -297,7 +297,7 @@ fn is_full_slot_store(func: &Function, op: &Op, slot: StackSlot) -> bool {
 }
 
 fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenance) -> bool {
-    if prov.slot_is_escaped_at(slot, Some(inst)) {
+    if prov.slot_unwind_target(slot) || prov.slot_is_escaped_at(slot, Some(inst)) {
         return true;
     }
     let op = &func.insts[inst.index()].op;
@@ -340,7 +340,9 @@ fn slot_liveness_batch(
             while rem != 0 {
                 let i = rem.trailing_zeros() as usize;
                 rem &= rem - 1;
-                if prov.slot_is_escaped_at(batch[i], Some(inst)) {
+                if prov.slot_unwind_target(batch[i])
+                    || prov.slot_is_escaped_at(batch[i], Some(inst))
+                {
                     r_mask |= 1_u64 << i;
                 }
             }
@@ -538,6 +540,7 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
         for &inst in &func.blocks[b.index()].insts {
             if let Op::StackStore(_, slot, _) = func.insts[inst.index()].op
                 && !func.is_unwind_slot(slot)
+                && !prov.slot_unwind_target(slot)
                 && !prov.slot_is_escaped_at(slot, Some(inst))
             {
                 let idx = if slot_pos[slot.index()] == u32::MAX {

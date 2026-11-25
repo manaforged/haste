@@ -16,8 +16,8 @@ use super::place::{Base, Place};
 use super::reloc::{SiteOrigin, TyOrigin};
 use super::{Lower, repr};
 
-const DROP_LIST_ACTIVE_BIT: i64 = 1;
-const DROP_LIST_CLEAR_MASK: i64 = 0xFE;
+const DROP_LIST_ACTIVE_BIT: i64 = crate::host::unwind::DROP_ACTIVE as i64;
+const DROP_LIST_CLEAR_MASK: i64 = !(crate::host::unwind::DROP_ACTIVE) as u8 as i64;
 
 fn skips_fields(cx: &Context<'_>, item: ItemRef) -> bool {
     cx.lang(item) == Some("manually_drop") || cx.item(item).1.kind == ItemKind::Union

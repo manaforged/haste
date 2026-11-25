@@ -139,6 +139,8 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(
     fast_call: impl Fn(Inst, &Op) -> bool,
 ) -> Option<ShrinkWrap> {
     if !framed
+        || func.abort_on_unwind
+        || func.save_all_regs
         || func
             .signature
             .params

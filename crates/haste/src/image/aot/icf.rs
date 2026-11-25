@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use haste_codegen::RelocKind;
+use haste_codegen::{RelocKind, UnwindArg};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::aot::{Executable, Symbol, UNWIND_FN_REC_BYTES};
@@ -67,7 +67,7 @@ enum FnIcfKey<'a> {
     Direct(
         &'a [u8],
         Vec<(u32, RelocKind, RelocTargetKey)>,
-        Vec<(i32, i32, RelocTargetKey, bool)>,
+        Vec<(i32, i32, RelocTargetKey, UnwindArg)>,
         Vec<(u32, u32, u32)>,
         u32,
     ),
@@ -178,7 +178,7 @@ fn direct_icf_key<'a>(
             pre,
             (roots, canon),
         )?;
-        drops.push((d.local_off, d.flag_off, target, d.indirect));
+        drops.push((d.local_off, d.flag_off, target, d.arg));
     }
     let sites = code
         .sites()
@@ -498,7 +498,7 @@ pub(super) fn emit_unwind_table(
                     if let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(d.drop_sym as usize)
                         && let Some(drop_off) = fn_offs.get(callee_idx).copied().flatten()
                     {
-                        drops.push((d.local_off, d.flag_off, drop_off, u32::from(d.indirect)));
+                        drops.push((d.local_off, d.flag_off, drop_off, u32::from(d.arg.as_u8())));
                     }
                 }
                 push_fn(fn_start, code, drops, &mut sites, &mut fns);

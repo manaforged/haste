@@ -6,6 +6,37 @@ use narrow::{NarrowAnalysis, narrow_unwind_drops};
 use sink::sink_entry_zeros;
 pub(crate) use sink::sink_frontier;
 
+/// How an unwind drop passes its target slot address to the drop glue function.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnwindArg {
+    Direct = 0,
+    Indirect = 1,
+    Wide = 2,
+}
+
+impl UnwindArg {
+    /// Decodes a wire byte into an `UnwindArg`.
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Direct),
+            1 => Some(Self::Indirect),
+            2 => Some(Self::Wide),
+            _ => None,
+        }
+    }
+
+    /// Encodes this argument passing mode as a wire byte.
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Whether the slot stores a pointer (or wide pointer) loaded by the unwinder rather than the value itself.
+    pub const fn is_indirect(self) -> bool {
+        !matches!(self, Self::Direct)
+    }
+}
+
 /// One stack-allocated owned value dropped during panic unwinding when its 1-byte active flag is non-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnwindDrop {
@@ -13,7 +44,7 @@ pub struct UnwindDrop {
     pub local_off: i32,
     pub flag: StackSlot,
     pub drop_sym: u32,
-    pub indirect: bool,
+    pub arg: UnwindArg,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,6 +177,7 @@ impl Function {
 
     pub(crate) fn import_unwind_drops(&mut self, callee: &Function, slot_base: u32, sym_base: u32) {
         self.keep_fp |= callee.keep_fp;
+        self.save_all_regs |= callee.save_all_regs;
         self.elide_drops |= callee.elide_drops;
         for &sym in &callee.no_unwind_syms {
             self.no_unwind_syms.push(sym + sym_base);
@@ -156,7 +188,7 @@ impl Function {
                 local_off: u.local_off,
                 flag: StackSlot(u.flag.0 + slot_base),
                 drop_sym: u.drop_sym + sym_base,
-                indirect: u.indirect,
+                arg: u.arg,
             });
         }
     }
@@ -639,7 +671,7 @@ mod tests {
             local_off: 0,
             flag,
             drop_sym: 99,
-            indirect: false,
+            arg: UnwindArg::Direct,
         });
         func.entry = Some(entry);
         func

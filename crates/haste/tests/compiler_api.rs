@@ -287,3 +287,212 @@ fn main() {
         "daemon should be stopped, got: {after_text}"
     );
 }
+
+#[cfg(unix)]
+fn assert_aborts_jit_and_aot(haste: &str, name: &str, pkg: &str, source: &str) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = FixtureDir::write_crate("haste-rt", name, pkg, source);
+    let jit = Command::new(haste)
+        .args(["run"])
+        .arg(dir.path())
+        .output()
+        .expect("jit run");
+    assert!(
+        !jit.status.success(),
+        "{name} JIT unexpectedly exited 0: {}",
+        String::from_utf8_lossy(&jit.stdout)
+    );
+    let jit_out = String::from_utf8_lossy(&jit.stdout);
+    assert!(
+        jit_out.contains("before") && !jit_out.contains("survived"),
+        "{name} JIT unexpected stdout: {jit_out}"
+    );
+    assert!(
+        jit.status.signal() == Some(libc::SIGABRT)
+            || jit.status.code() == Some(128 + libc::SIGABRT),
+        "{name} JIT expected SIGABRT, got {:?}",
+        jit.status
+    );
+
+    let bin = dir.path().join("out_bin");
+    let build = Command::new(haste)
+        .args(["--release", "build", "-o"])
+        .arg(&bin)
+        .arg(dir.path())
+        .output()
+        .expect("aot build");
+    assert!(
+        build.status.success(),
+        "{name} AOT build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let aot = Command::new(&bin).output().expect("aot run");
+    assert!(
+        !aot.status.success(),
+        "{name} AOT unexpectedly exited 0: {}",
+        String::from_utf8_lossy(&aot.stdout)
+    );
+    let aot_out = String::from_utf8_lossy(&aot.stdout);
+    assert!(
+        aot_out.contains("before") && !aot_out.contains("survived"),
+        "{name} AOT unexpected stdout: {aot_out}"
+    );
+    assert_eq!(
+        aot.status.signal(),
+        Some(libc::SIGABRT),
+        "{name} AOT expected SIGABRT, got {:?}",
+        aot.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_unwind_abort_and_lazy_jit_close_fds() {
+    let haste = env!("CARGO_BIN_EXE_haste");
+    assert_aborts_jit_and_aot(
+        haste,
+        "extern-c-panic",
+        "extern_c_panic",
+        r#"
+use std::panic::catch_unwind;
+extern "C" fn cb() { panic!("in C abi"); }
+fn main() {
+    println!("before");
+    let r = catch_unwind(|| cb());
+    println!("survived {}", r.is_err());
+}
+"#,
+    );
+    assert_aborts_jit_and_aot(
+        haste,
+        "double-panic",
+        "double_panic",
+        r#"
+use std::panic::catch_unwind;
+struct Bomb;
+impl Drop for Bomb { fn drop(&mut self) { panic!("second"); } }
+fn main() {
+    println!("before");
+    let r = catch_unwind(|| { let _b = Bomb; panic!("first"); });
+    println!("survived {}", r.is_err());
+}
+"#,
+    );
+
+    assert_aborts_jit_and_aot(
+        haste,
+        "extern-c-tls-panic",
+        "extern_c_tls_panic",
+        r#"
+use std::panic::catch_unwind;
+thread_local! { static TL: u64 = panic!("tls init in extern C"); }
+#[inline(never)] fn slow() -> u64 { std::hint::black_box(7) }
+extern "C" fn cb(flag: bool) -> u64 {
+    let x = TL.with(|v| *v);
+    if flag { x + slow() } else { x }
+}
+fn main() {
+    println!("before");
+    let r = catch_unwind(|| cb(std::hint::black_box(false)));
+    println!("survived {}", r.is_err());
+}
+"#,
+    );
+
+    let cunwind = FixtureDir::write_crate(
+        "haste-rt",
+        "extern-cunwind-ok",
+        "extern_cunwind_ok",
+        r#"
+use std::panic::catch_unwind;
+extern "C-unwind" fn cb() { panic!("in C-unwind"); }
+fn main() {
+    let r = catch_unwind(|| cb());
+    println!("caught {}", r.is_err());
+}
+"#,
+    );
+    let cu_jit = Command::new(haste)
+        .args(["run"])
+        .arg(cunwind.path())
+        .output()
+        .expect("cunwind jit run");
+    assert!(
+        cu_jit.status.success(),
+        "C-unwind JIT failed: {}",
+        String::from_utf8_lossy(&cu_jit.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&cu_jit.stdout).trim(),
+        "caught true"
+    );
+
+    let dict_drop = FixtureDir::write_crate(
+        "haste-rt",
+        "dict-drop-rest",
+        "dict_drop_rest",
+        r#"
+struct D(u32);
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("drop {}", self.0);
+        if self.0 == 0 { panic!("d0"); }
+    }
+}
+fn run_arr<T>(a: [T; 3]) { drop(a); }
+fn main() {
+    let r = std::panic::catch_unwind(|| run_arr([D(0), D(1), D(2)]));
+    println!("caught {}", r.is_err());
+}
+"#,
+    );
+    let dd_out = Command::new(haste)
+        .env("HASTE_DICT_MIN_BYTES", "0")
+        .args(["run"])
+        .arg(dict_drop.path())
+        .output()
+        .expect("dict drop-rest run");
+    assert!(
+        dd_out.status.success(),
+        "dict drop-rest failed: {}",
+        String::from_utf8_lossy(&dd_out.stderr)
+    );
+    let dd_stdout = String::from_utf8_lossy(&dd_out.stdout);
+    assert!(
+        dd_stdout.contains("drop 0")
+            && dd_stdout.contains("drop 1")
+            && dd_stdout.contains("drop 2")
+            && dd_stdout.contains("caught true"),
+        "dict drop-rest skipped elements: {dd_stdout}"
+    );
+
+    let dir = FixtureDir::write_crate(
+        "haste-rt",
+        "close-fds",
+        "close_fds",
+        r#"
+extern "C" { fn close(fd: i32) -> i32; }
+#[inline(never)] fn late(x: u32) -> u32 { x + 1 }
+fn main() {
+    let mut fd = 3;
+    while fd < 256 {
+        unsafe { close(fd); }
+        fd += 1;
+    }
+    println!("{}", late(41));
+}
+"#,
+    );
+    let out = Command::new(haste)
+        .args(["run"])
+        .arg(dir.path())
+        .output()
+        .expect("lazy jit close fds run");
+    assert!(
+        out.status.success(),
+        "lazy JIT failed after closing fds 3..256: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
+}

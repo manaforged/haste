@@ -14,6 +14,19 @@ use crate::outline::source::Source;
 
 use super::{Alias, Context, reach, traits, ty};
 
+fn extern_abi_tokens_may_unwind(src: &Source, start: u32, end: u32) -> bool {
+    for tok in start..end {
+        if src.text(tok) == "extern" {
+            let next = src.text(tok + 1);
+            return matches!(
+                next,
+                "\"Rust\"" | "\"rust-call\"" | "\"rust-cold\"" | "\"rust-intrinsic\""
+            ) || (next.starts_with('"') && next.ends_with("-unwind\""));
+        }
+    }
+    true
+}
+
 impl<'a> Context<'a> {
     /// The source file and outline entry of `item`.
     #[inline]
@@ -120,6 +133,31 @@ impl<'a> Context<'a> {
             && self
                 .parent_item(item)
                 .is_some_and(|parent| self.item(parent).1.kind == ItemKind::ExternBlock)
+    }
+
+    /// Whether the `extern` block declaring foreign item `item` uses an unwinding ABI.
+    pub(crate) fn extern_block_may_unwind(&self, item: ItemRef) -> bool {
+        let Some(parent) = self.parent_item(item) else {
+            return true;
+        };
+        let (src, entry) = self.item(parent);
+        if entry.kind != ItemKind::ExternBlock {
+            return true;
+        }
+        let Some(open) = entry.body else {
+            return true;
+        };
+        extern_abi_tokens_may_unwind(src, entry.start, open)
+    }
+
+    /// Whether a Rust-defined function item's ABI allows unwinding across its boundary.
+    pub(crate) fn fn_abi_may_unwind(&self, item: ItemRef) -> bool {
+        let (src, entry) = self.item(item);
+        if entry.kind != ItemKind::Fn {
+            return true;
+        }
+        let end = entry.name.or(entry.body).unwrap_or(entry.end);
+        extern_abi_tokens_may_unwind(src, entry.start, end)
     }
 
     /// Whether `item` is a function, static or type declared in an `extern` block, or a bodyless float intrinsic with a host function, which the host links by name.

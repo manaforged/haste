@@ -327,6 +327,15 @@ impl Infer<'_, '_> {
                 parts.push(call);
             }
         }
+        if let Kind::Array(inner, _) = *self.cx.types.kind(ty)
+            && self.needs_drop(inner)?
+        {
+            let slice = self.cx.types.intern(Kind::Slice(inner));
+            let call = Res::fn_of(&self.cx.types, glue, &[slice]);
+            if !parts.contains(&call) {
+                parts.push(call);
+            }
+        }
         let resume = match self.coroutine_output(ty) {
             Some(_) => self
                 .cx

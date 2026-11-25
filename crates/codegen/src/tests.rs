@@ -550,7 +550,7 @@ fn wire_round_trip_preserves_rich_function_and_rejects_corrupt_bytes() {
             local_off: 4,
             flag,
             drop_sym: 3,
-            indirect: true,
+            arg: crate::UnwindArg::Indirect,
         });
 
         b.ins().stack_store(p[0], slot, 0);

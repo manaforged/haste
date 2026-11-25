@@ -186,7 +186,7 @@ impl<'a> Reader<'a> {
             local_off: self.i32()?,
             flag: self.slot()?,
             drop_sym: self.u32()?,
-            indirect: self.flag()?,
+            arg: crate::UnwindArg::from_u8(self.byte()?)?,
         })
     }
 
@@ -218,6 +218,8 @@ impl<'a> Reader<'a> {
         func.vtable_slots = self.read_vec(Self::vtable_slot)?;
         func.rodata_bytes = self.read_vec(Self::rodata_entry)?;
         func.keep_fp = self.flag()?;
+        func.abort_on_unwind = self.flag()?;
+        func.save_all_regs = self.flag()?;
         func.unwind_drops = self.read_vec(Self::unwind_drop)?;
         func.frame_private = self.u32()?;
         func.cfg_rev = self.u32()?;

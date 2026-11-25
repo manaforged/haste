@@ -39,7 +39,7 @@ pub(crate) fn find_tail_calls<R: Copy + PartialEq>(
     caller_abi: &Abi<R>,
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Vec<bool> {
-    if !func.unwind_drops.is_empty()
+    if func.needs_unwind_frame()
         || func.signature.params.iter().any(|p| {
             matches!(
                 p.purpose,
@@ -119,11 +119,11 @@ pub(crate) fn needs_frame_without_tails<R>(
     tail_calls: &[bool],
 ) -> bool {
     func.keep_fp
+        || func.needs_unwind_frame()
         || abi
             .params
             .iter()
             .any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)))
-        || !func.unwind_drops.is_empty()
         || frame.size > 0
         || !frame.saves.is_empty()
         || !frame.float_saves.is_empty()

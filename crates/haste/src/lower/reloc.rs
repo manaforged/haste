@@ -16,6 +16,7 @@ use super::object::build_vtable_id;
 use super::stencil::{RelocVec, SymbolSource};
 
 pub(super) const CLOSURE_ENV_STEP: u32 = u32::MAX - 1;
+pub(super) const SLICE_WRAP_STEP: u32 = u32::MAX - 2;
 
 #[derive(Clone, Debug)]
 pub(crate) enum TyOrigin {
@@ -606,6 +607,9 @@ fn step_ty(cx: &mut Context<'_>, parent: Ty, variant: u32, field: u32) -> Result
         return cx
             .closure_env(parent)
             .ok_or_else(|| anyhow::anyhow!("closure env step on non-closure"));
+    }
+    if variant == SLICE_WRAP_STEP {
+        return Ok(cx.types.intern(Kind::Slice(parent)));
     }
     match cx.types.kind(parent).clone() {
         Kind::Tuple(items) => cx

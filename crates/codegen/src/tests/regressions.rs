@@ -300,3 +300,164 @@ fn arm64_zext_sub_cmp_does_not_poison_last_cmp_for_equal() {
         "Equal after UnsignedLessThan on wrap_floor must re-compare with UXTB: {words:#x?}"
     );
 }
+
+#[test]
+fn abort_on_unwind_and_save_all_regs_set_saved_mask_and_round_trip_wire() {
+    let mut sig = Signature::new(CallConv::Internal);
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.returns.push(AbiParam::new(Type::I64));
+    let mut abort_fn = build_fn(sig.clone(), |b, p| {
+        let out = b.ins().iadd_imm(p[0], 1);
+        b.ins().return_(&[out]);
+    });
+    abort_fn.abort_on_unwind = true;
+
+    let mut save_fn = build_fn(sig, |b, p| {
+        let out = b.ins().iadd_imm(p[0], 2);
+        b.ins().return_(&[out]);
+    });
+    save_fn.save_all_regs = true;
+
+    for (orig, want_abort, want_save_all) in [(&abort_fn, true, false), (&save_fn, false, true)] {
+        let bytes = orig.encode().expect("wire encode succeeds");
+        let decoded = crate::Function::decode(&bytes).expect("wire decode succeeds");
+        assert_eq!(decoded.abort_on_unwind, want_abort);
+        assert_eq!(decoded.save_all_regs, want_save_all);
+    }
+
+    for (target, full_mask) in [
+        (full_arm64(), (1_u32 << 18) - 1),
+        (full_x64(), (1_u32 << 5) - 1),
+    ] {
+        let abort_code = compile(abort_fn.clone(), &target).expect("abort_on_unwind compiles");
+        assert_ne!(
+            abort_code.saved_regs() & crate::UNWIND_ABORT_BIT,
+            0,
+            "abort_on_unwind must set UNWIND_ABORT_BIT on {target:?}"
+        );
+        let save_code = compile(save_fn.clone(), &target).expect("save_all_regs compiles");
+        assert_eq!(
+            save_code.saved_regs() & full_mask,
+            full_mask,
+            "save_all_regs must save every callee-saved register on {target:?}"
+        );
+    }
+}
+
+#[test]
+fn loads_sink_preserves_stores_into_indirect_unwind_target_slot() {
+    let mut sig = Signature::new(CallConv::Internal);
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::new(Type::I8));
+    let mut callee_sig = Signature::new(CallConv::Internal);
+    callee_sig.params.push(AbiParam::new(Type::I64));
+
+    let mut func = crate::ir::Function::new(sig);
+    let mut b = crate::FunctionBuilder::new(&mut func);
+    let entry = b.create_block();
+    let panic_blk = b.create_block();
+    let ret_blk = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    let csig = b.import_signature(callee_sig);
+    let data_slot = b.create_stack_slot(16, 3);
+    let ptr_slot = b.create_stack_slot(8, 3);
+    let flag_slot = b.create_stack_slot(1, 0);
+
+    b.switch_to_block(entry);
+    let val = b.block_params(entry)[0];
+    let cond = b.block_params(entry)[1];
+    let zero = b.ins().iconst(Type::I8, 0);
+    b.ins().stack_store(zero, flag_slot, 0);
+    let base = b.ins().stack_addr(Type::I64, data_slot, 0);
+    b.ins().stack_store(val, data_slot, 0);
+    b.ins().stack_store(val, data_slot, 8);
+    b.ins().brif(cond, panic_blk, &[], ret_blk, &[]);
+
+    b.switch_to_block(panic_blk);
+    let elem1 = b.ins().iadd_imm(base, 8);
+    let one = b.ins().iconst(Type::I8, 1);
+    b.ins().stack_store(elem1, ptr_slot, 0);
+    b.ins().stack_store(one, flag_slot, 0);
+    let sym = b.ins().symbol(1);
+    let _ = b.ins().call_indirect(csig, sym, &[val]);
+    b.ins().stack_store(zero, flag_slot, 0);
+    b.ins().trap();
+
+    b.switch_to_block(ret_blk);
+    b.ins().return_(&[]);
+
+    func.add_unwind_drop(crate::UnwindDrop {
+        local: ptr_slot,
+        local_off: 0,
+        flag: flag_slot,
+        drop_sym: 2,
+        arg: crate::UnwindArg::Indirect,
+    });
+    func.entry = Some(entry);
+
+    let _ = crate::loads::run(&mut func, true, &full_x64());
+    let data_stores = func
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter())
+        .filter(|&&inst| matches!(func.insts[inst.index()].op, Op::StackStore(_, s, _) if s == data_slot))
+        .count();
+    assert_eq!(
+        data_stores, 2,
+        "loads::sink must not delete StackStores into an indirect unwind target slot"
+    );
+}
+
+#[test]
+fn x64_abort_on_unwind_does_not_shrink_wrap_thread_cell() {
+    let mut sig = Signature::new(CallConv::Internal);
+    sig.params.push(AbiParam::new(Type::I8));
+    sig.returns.push(AbiParam::new(Type::I64));
+    let mut tc_sig = Signature::new(CallConv::Internal);
+    tc_sig.params = vec![AbiParam::new(Type::I64); 3];
+    tc_sig.returns.push(AbiParam::new(Type::I64));
+    let mut slow_sig = Signature::new(CallConv::Internal);
+    slow_sig.returns.push(AbiParam::new(Type::I64));
+
+    let mut func = crate::ir::Function::new(sig);
+    let mut b = crate::FunctionBuilder::new(&mut func);
+    let entry = b.create_block();
+    let slow = b.create_block();
+    let fast = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    let tsig = b.import_signature(tc_sig);
+    let ssig = b.import_signature(slow_sig);
+
+    b.switch_to_block(entry);
+    let cond = b.block_params(entry)[0];
+    let tc = b.ins().symbol(1);
+    b.func.mark_thread_cell(tc);
+    let z = b.ins().iconst(Type::I64, 0);
+    let sz = b.ins().iconst(Type::I64, 8);
+    let init = b.ins().symbol(2);
+    let tc_call = b.ins().call_indirect(tsig, tc, &[z, sz, init]);
+    let ptr = b.inst_results(tc_call)[0];
+    let val = b.ins().load(Type::I64, ptr, 0);
+    b.ins().brif(cond, slow, &[], fast, &[]);
+
+    b.switch_to_block(slow);
+    let sfn = b.ins().symbol(3);
+    let s_call = b.ins().call_indirect(ssig, sfn, &[]);
+    let sres = b.inst_results(s_call)[0];
+    let sum = b.ins().iadd(val, sres);
+    b.ins().return_(&[sum]);
+
+    b.switch_to_block(fast);
+    b.ins().return_(&[val]);
+
+    func.abort_on_unwind = true;
+    func.keep_fp = true;
+    func.entry = Some(entry);
+
+    let code = compile(func, &full_x64()).expect("x64 abort_on_unwind compiles");
+    assert_eq!(
+        code.bytes().first().copied(),
+        Some(0x55),
+        "abort_on_unwind must establish frame prologue (`push rbp`) at function entry, not shrink-wrap"
+    );
+}

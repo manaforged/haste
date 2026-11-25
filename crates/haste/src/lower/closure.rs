@@ -209,12 +209,15 @@ impl Lower<'_, '_> {
         let body = self.cx.body(info.parent)?;
         let order = capture_drop_order(&body, &info.typed, &info.closure);
         let place = self.glue_place(info.env, target)?;
+        let mut droppable = Vec::new();
         for idx in order {
             let field_ty = fields[idx];
-            let part = self.part_place(place, info.env, (0, idx as u32))?;
-            self.glue(field_ty, Some(part), env_origin.clone().step(0, idx as u32))?;
+            if crate::sema::infer::needs_drop(self.cx, field_ty)? {
+                let part = self.part_place(place, info.env, (0, idx as u32))?;
+                droppable.push((idx as u32, field_ty, part));
+            }
         }
-        Ok(())
+        self.drop_guarded_list(&env_origin, 0, &droppable)
     }
 
     fn env_place(&mut self, local: u32, coroutine: bool) -> Result<(Place, Ty)> {

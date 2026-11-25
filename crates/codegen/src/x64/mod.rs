@@ -230,7 +230,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
 
 fn keeps_frame_pointer(func: &Function) -> bool {
     func.keep_fp
-        || !func.unwind_drops.is_empty()
+        || func.needs_unwind_frame()
         || func
             .blocks
             .iter()
