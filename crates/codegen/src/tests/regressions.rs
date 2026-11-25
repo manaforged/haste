@@ -502,3 +502,60 @@ fn arm64_dict_arg_not_clobbered_by_arg_cycle() {
         "arm64 arg_steps cycle break must not clobber Dict register x9; words={words:#x?}"
     );
 }
+
+#[test]
+fn algebra_factors_select_over_shared_binary_op() {
+    let mut sig = Signature::new(CallConv::Internal);
+    for ty in [Type::I8, Type::F64, Type::F64, Type::F64, Type::F64] {
+        sig.params.push(AbiParam::new(ty));
+    }
+    sig.returns.push(AbiParam::new(Type::F64));
+    let mut func = crate::ir::Function::new(sig);
+    let mut b = crate::FunctionBuilder::new(&mut func);
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    let [cond, acc, x, a, bb] = [0, 1, 2, 3, 4].map(|i| b.block_params(entry)[i]);
+    let p1 = b.ins().fmul(x, a);
+    let s1 = b.ins().fadd(acc, p1);
+    let p2 = b.ins().fmul(x, bb);
+    let s2 = b.ins().fadd(acc, p2);
+    let out = b.ins().select(cond, s1, s2);
+    b.ins().return_(&[out]);
+    func.entry = Some(entry);
+
+    crate::simplify(&mut func, &full_arm64());
+    let fadds = func
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter())
+        .filter(|&&i| {
+            matches!(
+                func.insts[i.index()].op,
+                Op::Binary(crate::ir::Binary::Fadd, _, _)
+            )
+        })
+        .count();
+    let fmuls = func
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter())
+        .filter(|&&i| {
+            matches!(
+                func.insts[i.index()].op,
+                Op::Binary(crate::ir::Binary::Fmul, _, _)
+            )
+        })
+        .count();
+    let sels = func
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter())
+        .filter(|&&i| matches!(func.insts[i.index()].op, Op::Select(..)))
+        .count();
+    assert_eq!(
+        (fadds, fmuls, sels),
+        (1, 1, 1),
+        "Select(c, Fadd(acc, Fmul(x, a)), Fadd(acc, Fmul(x, b))) must factor to 1 Fadd + 1 Fmul + 1 Select"
+    );
+}

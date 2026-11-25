@@ -203,14 +203,14 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime numbers
 | `sieve` (20x 4M primes) | 61.2 ms | 81.0 ms | **0.76x** | 80.9 ms | **0.76x** | exact match (`10840522878760`) |
 | `sort` (8x 500k quicksort + bsearch) | 180 ms | 182 ms | **0.99x** | 181 ms | **0.99x** | exact match (`1823227901928002215`) |
 | `scan` (1200x JSON byte scanner) | 110 ms | 104 ms | 1.05x | 107 ms | 1.02x | exact match (`2400205310288`) |
-| `fp_iter` (4096x f64 generic iterator) | 277 ms | 162 ms | 1.71x | 163 ms | 1.70x | exact match (`4733336957083238967`) |
+| `fp_iter` (4096x f64 generic iterator) | 135 ms | 162 ms | **0.83x** | 163 ms | **0.83x** | exact match (`4733336957083238967`) |
 
 ## Verify it yourself
 
 `tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites (built with `--features diff-harness`), and `tests/probes` holds standalone crate probes. `scripts/check.sh` compares `cargo run` against both `haste test` (JIT) and `haste --release build -o` (standalone AOT).
 
 ```bash
-cargo test --locked -p haste-codegen                                                 # 41 unit tests
+cargo test --locked -p haste-codegen                                                 # 42 unit tests
 cargo test --locked -p haste --lib                                                   # 30 unit tests on macOS, 29 on Linux, 28 on Windows
 cargo test --locked -p haste --test compiler_api --test soundness --test regressions # 33 integration tests on Unix (8 compiler_api, 21 soundness, 4 regressions; 30 on Windows)
 bash scripts/check.sh                                                                # 144 differential functions (x 9 inputs = 1,296 checks), JIT + AOT vs rustc
