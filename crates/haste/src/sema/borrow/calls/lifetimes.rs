@@ -90,6 +90,26 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
                 }
             }
         }
+        AstTy::Fn { params, ret, .. } => {
+            let mut fn_lts = Lifetimes::default();
+            for &t in body.list(params) {
+                collect_ty_lifetimes(body, src, TyId(t), &mut fn_lts);
+            }
+            if let Some(r) = ret {
+                collect_ty_lifetimes(body, src, r, &mut fn_lts);
+            }
+            out.saw_static |= fn_lts.saw_static;
+            for lt in fn_lts.named {
+                if !out.named.contains(&lt) {
+                    out.named.push(lt);
+                }
+            }
+            for name in fn_lts.names {
+                if !out.names.contains(&name) {
+                    out.names.push(name);
+                }
+            }
+        }
         AstTy::Slice(t)
         | AstTy::Array(t, _)
         | AstTy::Ptr { ty: t, .. }
@@ -165,6 +185,8 @@ pub(in super::super) struct ParamLifetimes<'s> {
     pub(in super::super) inner_is_static: Vec<bool>,
     pub(in super::super) named_lts: Vec<Vec<&'s str>>,
     pub(in super::super) has_elided_lt: Vec<bool>,
+    pub(in super::super) inner_named_lts: Vec<Vec<&'s str>>,
+    pub(in super::super) inner_has_elided_lt: Vec<bool>,
 }
 
 pub(in super::super) fn is_prim_name(name: &str) -> bool {
@@ -203,6 +225,8 @@ pub(in super::super) fn compute_param_lifetimes<'s>(
         inner_is_static: vec![false; n],
         named_lts: vec![Vec::new(); n],
         has_elided_lt: vec![false; n],
+        inner_named_lts: vec![Vec::new(); n],
+        inner_has_elided_lt: vec![false; n],
     };
     let impl_has_lt = impl_has_lifetime(cx, item);
     let mut cursor = 0usize;
@@ -228,6 +252,7 @@ pub(in super::super) fn compute_param_lifetimes<'s>(
                         info.has_elided_lt[slot] = true;
                         info.inner_is_static[slot] = !impl_has_lt;
                     }
+                    info.inner_has_elided_lt[slot] = impl_has_lt && !info.inner_is_static[slot];
                 }
                 crate::body::sig::SelfKind::Typed(ty) => {
                     record_param_ty(sig, src, ty, impl_has_lt, slot, &mut info);
@@ -251,6 +276,17 @@ pub(in super::super) fn compute_param_lifetimes<'s>(
     info
 }
 
+fn has_elided_or_unbounded_lt(
+    sig: &crate::body::sig::Signature,
+    src: &Source,
+    lts: &Lifetimes<'_>,
+    impl_has_lt: bool,
+) -> bool {
+    lts.has_elided
+        || (impl_has_lt && lts.names.contains(&"Self"))
+        || has_unbounded_type_param(sig, src, lts)
+}
+
 fn record_param_ty<'s>(
     sig: &crate::body::sig::Signature,
     src: &'s Source,
@@ -262,12 +298,15 @@ fn record_param_ty<'s>(
     let mut lts = Lifetimes::default();
     collect_ty_lifetimes(&sig.body, src, ty, &mut lts);
     info.is_static[slot] = param_ty_is_static(sig, src, &lts, impl_has_lt);
-    info.has_elided_lt[slot] = lts.has_elided
-        || (impl_has_lt && lts.names.contains(&"Self"))
-        || has_unbounded_type_param(sig, src, &lts);
+    info.has_elided_lt[slot] = has_elided_or_unbounded_lt(sig, src, &lts, impl_has_lt);
     info.named_lts[slot] = lts.named;
     if let AstTy::Ref { ty: inner, .. } = *sig.body.ty(ty) {
         info.inner_is_static[slot] = ast_ty_is_provably_static(sig, src, inner);
+        let mut inner_lts = Lifetimes::default();
+        collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
+        info.inner_has_elided_lt[slot] =
+            has_elided_or_unbounded_lt(sig, src, &inner_lts, impl_has_lt);
+        info.inner_named_lts[slot] = inner_lts.named;
     }
 }
 
@@ -502,29 +541,29 @@ pub(in super::super) fn sig_returns_only_static(
     !ast_ty_has_type_param(&sig.body, src, ret_ast, &type_params)
 }
 
-fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, params: &[&str]) -> bool {
+fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, type_params: &[&str]) -> bool {
     match *body.ty(ty_id) {
         AstTy::Ref { ty, .. }
         | AstTy::Ptr { ty, .. }
         | AstTy::Slice(ty)
         | AstTy::Array(ty, _)
         | AstTy::Paren(ty)
-        | AstTy::Pat(ty, _) => ast_ty_has_type_param(body, src, ty, params),
+        | AstTy::Pat(ty, _) => ast_ty_has_type_param(body, src, ty, type_params),
         AstTy::Tuple(list) => body
             .list(list)
             .iter()
-            .any(|&t| ast_ty_has_type_param(body, src, TyId(t), params)),
+            .any(|&t| ast_ty_has_type_param(body, src, TyId(t), type_params)),
         AstTy::Path(path_id) => {
             let p = body.path(path_id);
             if p.qself
-                .is_some_and(|(q, _)| ast_ty_has_type_param(body, src, q, params))
+                .is_some_and(|(q, _)| ast_ty_has_type_param(body, src, q, type_params))
             {
                 return true;
             }
             let segs = body.list(p.segments);
             if p.qself.is_none() && segs.len() == 1 {
                 let name = src.text(body.segments[segs[0] as usize].name);
-                if name == "Self" || params.contains(&name) {
+                if name == "Self" || type_params.contains(&name) {
                     return true;
                 }
             }
@@ -534,7 +573,7 @@ fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, params: &[&str]
                         .iter()
                         .any(|&a| match body.args[a as usize] {
                             GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                                ast_ty_has_type_param(body, src, t, params)
+                                ast_ty_has_type_param(body, src, t, type_params)
                             }
                             _ => false,
                         })
@@ -542,13 +581,128 @@ fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, params: &[&str]
                 Some(Args::Paren { inputs, output }) => {
                     body.list(inputs)
                         .iter()
-                        .any(|&t| ast_ty_has_type_param(body, src, TyId(t), params))
-                        || output.is_some_and(|o| ast_ty_has_type_param(body, src, o, params))
+                        .any(|&t| ast_ty_has_type_param(body, src, TyId(t), type_params))
+                        || output.is_some_and(|o| ast_ty_has_type_param(body, src, o, type_params))
                 }
                 _ => false,
             })
         }
+        AstTy::Fn { params, ret, .. } => {
+            body.list(params)
+                .iter()
+                .any(|&t| ast_ty_has_type_param(body, src, TyId(t), type_params))
+                || ret.is_some_and(|r| ast_ty_has_type_param(body, src, r, type_params))
+        }
         AstTy::Infer | AstTy::ImplTrait(..) | AstTy::DynTrait(..) => true,
         _ => false,
+    }
+}
+
+pub(in super::super) fn for_each_param_bound_list(
+    sig: &crate::body::sig::Signature,
+    src: &Source,
+    param_ty: TyId,
+    mut visit: impl FnMut(crate::body::List),
+) {
+    match *sig.body.ty(param_ty) {
+        AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) => visit(bounds),
+        AstTy::Ref { ty: inner, .. } => {
+            if let AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) = *sig.body.ty(inner) {
+                visit(bounds);
+            }
+        }
+        AstTy::Path(path) => {
+            let p = sig.body.path(path);
+            let segs = sig.body.list(p.segments);
+            if p.qself.is_none() && segs.len() == 1 {
+                let name = src.text(sig.body.segments[segs[0] as usize].name);
+                for g in &sig.generics {
+                    if g.kind == crate::body::sig::GenericKind::Type && src.text(g.name) == name {
+                        visit(g.bounds);
+                    }
+                }
+                for pred in &sig.predicates {
+                    if pred_matches_name(sig, src, pred, name) {
+                        visit(pred.bounds);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(in super::super) fn callable_param_inputs(
+    sig: &crate::body::sig::Signature,
+    src: &Source,
+    param_ty: TyId,
+) -> Vec<TyId> {
+    let mut inputs_out = Vec::new();
+    for_each_param_bound_list(sig, src, param_ty, |list| {
+        for &b_id in sig.body.list(list) {
+            if let Bound::Trait { path, .. } = sig.body.bounds[b_id as usize]
+                && let Some(&seg_id) = sig.body.list(sig.body.path(path).segments).last()
+                && let seg = sig.body.segments[seg_id as usize]
+                && matches!(src.text(seg.name), "Fn" | "FnMut" | "FnOnce")
+                && let Some(Args::Paren { inputs, .. }) = seg.args
+            {
+                inputs_out.extend(sig.body.list(inputs).iter().copied().map(TyId));
+            }
+        }
+    });
+    inputs_out
+}
+
+impl super::super::Checker<'_, '_> {
+    pub(in super::super) fn param_satisfies_caller_lt(
+        &mut self,
+        local: u32,
+        req_lts: &[&str],
+        peel_outer_ref: bool,
+    ) -> bool {
+        if !self.is_non_static_param(local) {
+            return true;
+        }
+        let slot = local as usize;
+        if peel_outer_ref && self.param_inner_is_static(local) {
+            return true;
+        }
+        let has_elided = if peel_outer_ref {
+            self.param_lts
+                .inner_has_elided_lt
+                .get(slot)
+                .copied()
+                .unwrap_or(true)
+        } else {
+            self.param_lts
+                .has_elided_lt
+                .get(slot)
+                .copied()
+                .unwrap_or(true)
+        };
+        if has_elided {
+            return false;
+        }
+        let declared = if peel_outer_ref {
+            self.param_lts.inner_named_lts.get(slot)
+        } else {
+            self.param_lts.named_lts.get(slot)
+        };
+        let Some(declared) = declared else {
+            return false;
+        };
+        if declared.is_empty() {
+            return false;
+        }
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return false;
+        };
+        let invariant = peel_outer_ref && self.is_mut_ref_ty(self.local_ty(local));
+        declared.iter().all(|&p_lt| {
+            req_lts.iter().all(|&req| {
+                lifetime_outlives(&sig, self.src, p_lt, req)
+                    && (!invariant || lifetime_outlives(&sig, self.src, req, p_lt))
+            })
+        })
     }
 }

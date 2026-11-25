@@ -2,6 +2,7 @@
 mod common;
 mod edge_cases;
 mod lifetimes;
+mod self_host;
 
 use common::FixtureDir;
 use haste::{Compiler, ErrorKind};

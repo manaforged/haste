@@ -11,7 +11,6 @@ use super::super::calls::{
     sig_returns_only_static, ty_shares_name,
 };
 use super::super::checks;
-use super::super::places::{PlaceStep, push_step};
 use super::super::{Checker, State};
 use super::{BorrowSource, dedup_sources, state_holds_other_target, unwrap_container_loans};
 
@@ -19,7 +18,6 @@ struct SigFnFlags<'a> {
     fn_name: &'a str,
     is_iter_fn: bool,
     is_opt_fn: bool,
-    is_res_fn: bool,
     is_owned_copy_fn: bool,
     is_by_ref: bool,
 }
@@ -220,7 +218,6 @@ impl<'a> Checker<'_, 'a> {
         let fn_name = self.cx.name(fn_item);
         let is_iter_fn = self.is_iter_mod(fn_item);
         let is_opt_fn = self.item_in_std_mod(fn_item, "option");
-        let is_res_fn = self.item_in_std_mod(fn_item, "result");
         let is_owned_copy_fn = recv_is_by_ref(sig)
             && ((fn_name == "clone"
                 && self
@@ -238,7 +235,6 @@ impl<'a> Checker<'_, 'a> {
             fn_name,
             is_iter_fn,
             is_opt_fn,
-            is_res_fn,
             is_owned_copy_fn,
             is_by_ref,
         }
@@ -318,12 +314,22 @@ impl<'a> Checker<'_, 'a> {
                 flags.is_opt_fn || flags.is_owned_copy_fn,
             );
         }
+        if flags.is_opt_fn
+            && flags.fn_name == "take"
+            && self
+                .typed
+                .adjusts
+                .get(&call_expr)
+                .is_some_and(|a| a.derefs > 0)
+        {
+            return self.guard_take_recv_sources(call_expr, recv, recv_sources, state);
+        }
         let ignores_elem = (flags.is_iter_fn
             && matches!(flags.fn_name, "map" | "filter_map" | "flat_map")
             && arg_ids
                 .first()
                 .is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state)))
-            || ((flags.is_opt_fn || flags.is_res_fn)
+            || (flags.is_opt_fn
                 && matches!(flags.fn_name, "map" | "and_then")
                 && arg_ids
                     .first()
@@ -456,7 +462,7 @@ impl<'a> Checker<'_, 'a> {
             )
     }
 
-    fn copied_recv_sources(
+    pub(super) fn copied_recv_sources(
         &mut self,
         call_expr: ExprId,
         recv: ExprId,
@@ -559,7 +565,7 @@ impl<'a> Checker<'_, 'a> {
         }
     }
 
-    fn copied_arg_borrow_sources(
+    pub(in super::super) fn copied_arg_borrow_sources(
         &mut self,
         call_expr: ExprId,
         arg: ExprId,
@@ -664,84 +670,5 @@ impl<'a> Checker<'_, 'a> {
             }
         }
         dedup_sources(out)
-    }
-
-    fn leading_ref_depth(&self, mut ty: Ty) -> u32 {
-        let mut depth = 0;
-        while ty != Ty::NONE
-            && let Kind::Ref(_, inner) = *self.cx.types.kind(ty)
-        {
-            depth += 1;
-            ty = inner;
-        }
-        depth
-    }
-
-    pub(super) fn ty_max_ref_depth(&self, ty: Ty) -> u32 {
-        if ty == Ty::NONE {
-            return 0;
-        }
-        match *self.cx.types.kind(ty) {
-            Kind::Ref(_, inner) => 1 + self.ty_max_ref_depth(inner),
-            Kind::Slice(inner) | Kind::Array(inner, _) | Kind::Pat(inner, ..) => {
-                self.ty_max_ref_depth(inner)
-            }
-            Kind::Tuple(items) | Kind::Adt(_, items) => self
-                .cx
-                .types
-                .substs(items)
-                .to_vec()
-                .into_iter()
-                .map(|t| self.ty_max_ref_depth(t))
-                .max()
-                .unwrap_or(0),
-            _ => 0,
-        }
-    }
-
-    pub(in super::super) fn can_unwrap_inner_static_param(
-        &mut self,
-        s: &BorrowSource,
-        res_ty: Ty,
-        is_deref: bool,
-    ) -> bool {
-        if !s.through_ref
-            || !self.is_non_static_param(s.target)
-            || !self.param_inner_is_static(s.target)
-            || !s.steps.iter().all(|st| matches!(st, PlaceStep::Deref))
-        {
-            return false;
-        }
-        let local_ty = self.local_ty(s.target);
-        if res_ty == local_ty {
-            return false;
-        }
-        let Kind::Ref(_, pointee) = *self.cx.types.kind(local_ty) else {
-            return false;
-        };
-        if !self.ty_holds_borrow(pointee) {
-            return false;
-        }
-        if is_deref && self.leading_ref_depth(res_ty) >= self.leading_ref_depth(local_ty) {
-            return false;
-        }
-        self.ty_max_ref_depth(res_ty) <= self.ty_max_ref_depth(pointee)
-    }
-
-    pub(in super::super) fn promote_param_behind_deref(
-        &self,
-        s: &BorrowSource,
-        is_cparam: bool,
-    ) -> BorrowSource {
-        let mut steps = s.steps.clone();
-        if self.is_ref_ty(self.local_ty(s.target)) {
-            push_step(&mut steps, PlaceStep::Deref);
-        }
-        BorrowSource {
-            steps,
-            through_ref: true,
-            origin_only: s.origin_only || !is_cparam,
-            ..s.clone()
-        }
     }
 }

@@ -106,7 +106,9 @@ impl Infer<'_, '_> {
         self.settle_captures()?;
         self.captures_settled = true;
         self.settle_obligations()?;
-        self.check_all_matches_exhaustive()
+        self.check_all_matches_exhaustive()?;
+        self.settle_projection_loop()?;
+        self.settle_obligations()
     }
 
     fn bound_vars(&self) -> usize {

@@ -1,5 +1,6 @@
 mod sig;
 mod tuple;
+mod unwrap;
 
 use rustc_hash::FxHashSet as HashSet;
 
@@ -229,9 +230,10 @@ impl Checker<'_, '_> {
         let base_ty = self.expr_ty(base);
         let sources = self.expr_borrow_sources_inner(base, state, false, None);
         if !sources.is_empty()
-            && sources
-                .iter()
-                .all(|s| self.from_caller(s.target, s.through_ref))
+            && sources.iter().all(|s| {
+                self.from_caller(s.target, s.through_ref)
+                    || (self.is_closure_param(s.target) && s.through_ref)
+            })
             && self.is_static_field_read(expr, base)
         {
             return Vec::new();
@@ -264,46 +266,7 @@ impl Checker<'_, '_> {
         }
         let unwrap_temp = matches!(*self.body.expr(expr), Expr::Index(..))
             || matches!(*self.body.expr(unwrapped_base), Expr::Method { .. });
-        let is_deref = matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _));
-        let inner_static_res = self
-            .is_ref_ty(base_ty)
-            .then(|| (self.expr_ty(expr), is_deref));
-        let targets: Vec<u32> = sources.iter().map(|s| s.target).collect();
-        let direct_targets: Vec<u32> = sources
-            .iter()
-            .filter(|s| !s.through_ref)
-            .map(|s| s.target)
-            .collect();
-        let expr_depth = self.ty_max_ref_depth(self.expr_ty(expr));
-        let mut direct_param_out = Vec::new();
-        let mut to_unwrap = Vec::new();
-        for s in sources {
-            let target_ty = self.local_ty(s.target);
-            if is_deref
-                && !s.through_ref
-                && self.is_param_local(s.target)
-                && !self.is_ref_ty(target_ty)
-                && self.ty_holds_borrow(target_ty)
-                && direct_targets.iter().all(|&t| t == s.target)
-                && !state_holds_other_target(&targets, s.target, state)
-                && expr_depth <= self.ty_max_ref_depth(target_ty)
-            {
-                for l in state.loans.iter().filter(|l| l.holder == Some(s.target)) {
-                    direct_param_out.push(BorrowSource::from_loan(l));
-                }
-                direct_param_out.push(self.promote_param_behind_deref(&s, false));
-            } else {
-                to_unwrap.push(s);
-            }
-        }
-        let mut out = self.unwrap_outer_container_loans_inner(
-            to_unwrap,
-            state,
-            unwrap_temp,
-            inner_static_res,
-        );
-        out.extend(direct_param_out);
-        dedup_sources(out)
+        self.finish_projected_borrow_sources(expr, base_ty, unwrap_temp, sources, state)
     }
 
     pub(super) fn origin_source_for(
@@ -340,7 +303,7 @@ impl Checker<'_, '_> {
         self.unwrap_outer_container_loans_inner(sources, state, unwrap_temp, None)
     }
 
-    fn unwrap_outer_container_loans_inner(
+    pub(super) fn unwrap_outer_container_loans_inner(
         &mut self,
         sources: Vec<BorrowSource>,
         state: &State,

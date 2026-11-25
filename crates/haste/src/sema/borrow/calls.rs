@@ -17,10 +17,19 @@ use super::propagate::BorrowSource;
 use super::{Checker, Loan, State, prune_moved_loans};
 
 pub(super) use lifetimes::{
-    Lifetimes, ParamLifetimes, ast_ty_may_carry_elided_lt, collect_ty_lifetimes,
-    compute_param_lifetimes, lifetime_outlives, pred_matches_name, receiver_has_any_named,
-    sig_returns_only_static, sig_type_params, ty_shares_name,
+    Lifetimes, ParamLifetimes, ast_ty_may_carry_elided_lt, callable_param_inputs,
+    collect_ty_lifetimes, compute_param_lifetimes, for_each_param_bound_list, lifetime_outlives,
+    pred_matches_name, receiver_has_any_named, sig_returns_only_static, sig_type_params,
+    ty_shares_name,
 };
+
+struct ArgListCtx<'a> {
+    sig: Option<&'a Signature>,
+    fn_item: Option<crate::names::ItemRef>,
+    recv_sources: Option<&'a [BorrowSource]>,
+    callee_ty: Option<Ty>,
+    has_self_arg: bool,
+}
 
 impl Checker<'_, '_> {
     pub(super) fn check_call(
@@ -86,9 +95,13 @@ impl Checker<'_, '_> {
         self.with_let_extend(call_extend, |this| {
             let arg_sources = this.check_arg_list_sources(
                 &arg_ids,
-                sig.as_deref(),
-                Some(callee_ty),
-                has_self_arg,
+                &ArgListCtx {
+                    sig: sig.as_deref(),
+                    fn_item,
+                    recv_sources: None,
+                    callee_ty: Some(callee_ty),
+                    has_self_arg,
+                },
                 state,
                 outer_live,
                 depth,
@@ -373,9 +386,13 @@ impl Checker<'_, '_> {
         self.check_call_unsafe(fn_item, sig.as_deref())?;
         let res = self.check_arg_list_sources(
             &param_ids,
-            sig.as_deref(),
-            None,
-            false,
+            &ArgListCtx {
+                sig: sig.as_deref(),
+                fn_item,
+                recv_sources: Some(&recv_closure_sources),
+                callee_ty: None,
+                has_self_arg: false,
+            },
             state,
             outer_live,
             depth,
@@ -458,9 +475,13 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         self.check_arg_list_sources(
             arg_ids,
-            sig,
-            callee_ty,
-            has_self_arg,
+            &ArgListCtx {
+                sig,
+                fn_item: None,
+                recv_sources: None,
+                callee_ty,
+                has_self_arg,
+            },
             state,
             outer_live,
             depth,
@@ -532,12 +553,100 @@ impl Checker<'_, '_> {
         Ok(false)
     }
 
+    fn push_closure_arg_param_origins(
+        &mut self,
+        arg: ExprId,
+        idx: usize,
+        ctx: &ArgListCtx<'_>,
+        arg_sources: &[Vec<BorrowSource>],
+    ) -> Vec<u32> {
+        let cur = self.unwrap_parens(arg);
+        let Some(params) = self.typed.closures.get(&cur).map(|c| c.params.clone()) else {
+            return Vec::new();
+        };
+        let mut added = Vec::new();
+        if params.len() == 1
+            && let Some(recv) = ctx.recv_sources
+            && ctx.fn_item.is_some_and(|it| {
+                self.is_iter_mod(it)
+                    || self.item_in_std_mod(it, "option")
+                    || self.item_in_std_mod(it, "result")
+            })
+        {
+            let origins = non_env_sources(recv);
+            if !origins.is_empty() {
+                self.closure_param_origins.insert(params[0], origins);
+                added.push(params[0]);
+            }
+            return added;
+        }
+        let Some(sig) = ctx.sig else { return added };
+        let Some(param_idx) = sig_param_idx(idx, ctx.has_self_arg) else {
+            return added;
+        };
+        let Some(&(_, param_ty)) = sig.params.get(param_idx) else {
+            return added;
+        };
+        let sig_src = ctx.fn_item.map_or(self.src, |it| self.cx.item(it).0);
+        let inputs = callable_param_inputs(sig, sig_src, param_ty);
+        for (c_idx, in_ty) in inputs.into_iter().enumerate() {
+            let Some(&c_local) = params.get(c_idx) else {
+                continue;
+            };
+            let mut in_lts = Lifetimes::default();
+            collect_ty_lifetimes(&sig.body, sig_src, in_ty, &mut in_lts);
+            if in_lts.has_elided || in_lts.named.is_empty() {
+                continue;
+            }
+            let ty_ties_to_in = |other_ty: TyId| -> bool {
+                let mut other_lts = Lifetimes::default();
+                collect_ty_lifetimes(&sig.body, sig_src, other_ty, &mut other_lts);
+                other_lts.named.iter().any(|&n| {
+                    in_lts
+                        .named
+                        .iter()
+                        .any(|&in_lt| n == in_lt || lifetime_outlives(sig, sig_src, n, in_lt))
+                }) || self.generic_param_ties_to_self(sig, sig_src, &other_lts, &in_lts)
+            };
+            let later_shares = sig
+                .params
+                .iter()
+                .skip(param_idx + 1)
+                .any(|&(_, later_ty)| ty_ties_to_in(later_ty));
+            if later_shares {
+                continue;
+            }
+            let mut origins = Vec::new();
+            if let Some(recv) = ctx.recv_sources
+                && ctx.fn_item.is_some_and(|it| {
+                    receiver_has_any_named(sig_src, self.cx.item(it).1, &in_lts.named)
+                })
+            {
+                origins.extend(non_env_sources(recv));
+            }
+            for (other_idx, srcs) in arg_sources.iter().enumerate() {
+                let Some(other_p) = sig_param_idx(other_idx, ctx.has_self_arg) else {
+                    continue;
+                };
+                let Some(&(_, other_ty)) = sig.params.get(other_p) else {
+                    continue;
+                };
+                if ty_ties_to_in(other_ty) {
+                    origins.extend(non_env_sources(srcs));
+                }
+            }
+            if !origins.is_empty() {
+                self.closure_param_origins.insert(c_local, origins);
+                added.push(c_local);
+            }
+        }
+        added
+    }
+
     fn check_arg_list_sources(
         &mut self,
         arg_ids: &[u32],
-        sig: Option<&Signature>,
-        callee_ty: Option<Ty>,
-        has_self_arg: bool,
+        ctx: &ArgListCtx<'_>,
         state: &mut State,
         outer_live: &HashSet<u32>,
         depth: u32,
@@ -548,18 +657,25 @@ impl Checker<'_, '_> {
         let res = (|| -> Result<()> {
             for (idx, &id) in arg_ids.iter().enumerate() {
                 let arg = ExprId(id);
-                let param_ref = sig
-                    .and_then(|s| param_ref_mut(s, idx, has_self_arg))
-                    .or_else(|| self.callee_param_ref_mut(callee_ty, idx));
+                let param_ref = ctx
+                    .sig
+                    .and_then(|s| param_ref_mut(s, idx, ctx.has_self_arg))
+                    .or_else(|| self.callee_param_ref_mut(ctx.callee_ty, idx));
                 let shared_reborrow = param_ref == Some(Mut::Not);
-                let is_deferred_mut = self.check_call_arg(
+                let added_origins =
+                    self.push_closure_arg_param_origins(arg, idx, ctx, &arg_sources);
+                let arg_res = self.check_call_arg(
                     arg,
                     param_ref,
                     &mut deferred_mut_args,
                     state,
                     outer_live,
                     depth,
-                )?;
+                );
+                for local in added_origins {
+                    self.closure_param_origins.remove(&local);
+                }
+                let is_deferred_mut = arg_res?;
                 if state.diverged {
                     break;
                 }
@@ -640,18 +756,24 @@ pub(super) fn recv_ref_mut(sig: &Signature) -> Option<Mut> {
     }
 }
 
-fn param_ref_mut(sig: &Signature, idx: usize, has_self_arg: bool) -> Option<Mut> {
+pub(super) fn sig_param_idx(idx: usize, has_self_arg: bool) -> Option<usize> {
     if has_self_arg {
-        if idx == 0 {
-            return recv_ref_mut(sig);
-        }
-        return sig
-            .params
-            .get(idx - 1)
-            .and_then(|&(_, ty)| ast_ref_mut(&sig.body, ty));
+        idx.checked_sub(1)
+    } else {
+        Some(idx)
+    }
+}
+
+fn non_env_sources(srcs: &[BorrowSource]) -> Vec<BorrowSource> {
+    srcs.iter().filter(|s| !s.env_only).cloned().collect()
+}
+
+fn param_ref_mut(sig: &Signature, idx: usize, has_self_arg: bool) -> Option<Mut> {
+    if has_self_arg && idx == 0 {
+        return recv_ref_mut(sig);
     }
     sig.params
-        .get(idx)
+        .get(sig_param_idx(idx, has_self_arg)?)
         .and_then(|&(_, ty)| ast_ref_mut(&sig.body, ty))
 }
 

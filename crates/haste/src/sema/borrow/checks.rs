@@ -365,4 +365,33 @@ impl Checker<'_, '_> {
             }
         }
     }
+
+    pub(super) fn check_coercion_vtables(&self) -> Result<()> {
+        for (&coercion_expr, coercion) in &self.typed.coercions {
+            let Some(vtable) = coercion.vtable() else {
+                continue;
+            };
+            let Kind::Closure(parent, _, at) = *self.cx.types.kind(vtable.ty) else {
+                continue;
+            };
+            if parent != self.item {
+                continue;
+            }
+            let Kind::Dyn(of, ..) = *self.cx.types.kind(vtable.object) else {
+                continue;
+            };
+            let Some(eff) = self.closure_effects.get(&ExprId(at)) else {
+                continue;
+            };
+            let lang = self.cx.lang(of);
+            self.check_closure_effects(
+                Some(coercion_expr),
+                eff,
+                lang == Some("fn"),
+                lang == Some("fn_mut"),
+                false,
+            )?;
+        }
+        Ok(())
+    }
 }

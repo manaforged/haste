@@ -7,8 +7,8 @@ use crate::sema::ty::Kind;
 
 use super::super::bind::push_loan;
 use super::super::calls::{
-    Lifetimes, ast_ty_may_carry_elided_lt, collect_ty_lifetimes, pred_matches_name,
-    sig_returns_only_static, sig_type_params, ty_shares_name,
+    Lifetimes, ast_ty_may_carry_elided_lt, collect_ty_lifetimes, for_each_param_bound_list,
+    sig_param_idx, sig_returns_only_static, sig_type_params, ty_shares_name,
 };
 use super::super::places::{Place, PlaceStep};
 use super::super::propagate::{BorrowSource, TupleSources, dedup_sources};
@@ -92,13 +92,8 @@ impl Checker<'_, '_> {
         let Some(sig) = sig else { return Ok(()) };
         let sig_src = fn_item.map_or(self.src, |item| self.cx.item(item).0);
         for (idx, &id) in arg_ids.iter().enumerate() {
-            let param_idx = if has_self_arg {
-                let Some(p) = idx.checked_sub(1) else {
-                    continue;
-                };
-                p
-            } else {
-                idx
+            let Some(param_idx) = sig_param_idx(idx, has_self_arg) else {
+                continue;
             };
             let Some(&(_, param_ty)) = sig.params.get(param_idx) else {
                 continue;
@@ -108,7 +103,7 @@ impl Checker<'_, '_> {
             let bounds = self.param_bound_reqs(sig, sig_src, param_ty);
             if bounds.req_static || ref_static {
                 let sources = arg_sources.get(idx).map_or(&[][..], Vec::as_slice);
-                self.check_caller_lt_sources(arg, sources, true, &[])?;
+                self.check_caller_lt_sources(arg, sources, true, &[], false)?;
             }
             if bounds.req_fn
                 || bounds.req_fn_mut
@@ -227,12 +222,18 @@ impl Checker<'_, '_> {
                 ..
             } = *self.body.expr(arg)
         {
-            return self.check_caller_lt_arg(inner, state, req.requires_static, &named);
+            return self.check_caller_lt_arg(inner, state, req.requires_static, &named, false);
         }
         if let Some(sources) = pre_sources {
-            return self.check_caller_lt_sources(arg, sources, req.requires_static, &named);
+            return self.check_caller_lt_sources(
+                arg,
+                sources,
+                req.requires_static,
+                &named,
+                req.outer_hrtb,
+            );
         }
-        self.check_caller_lt_arg(arg, state, req.requires_static, &named)
+        self.check_caller_lt_arg(arg, state, req.requires_static, &named, req.outer_hrtb)
     }
 
     fn check_caller_lt_tuple_sources(
@@ -253,14 +254,14 @@ impl Checker<'_, '_> {
             return Ok(());
         }
         let named: Vec<&str> = req.named_lts.iter().map(String::as_str).collect();
-        let srcs = ts.sources_for(req.outer_hrtb);
-        self.check_caller_lt_sources(expr, &srcs, req.requires_static, &named)
+        let (srcs, next_outer_hrtb) = ts.sources_for(req.outer_hrtb);
+        self.check_caller_lt_sources(expr, &srcs, req.requires_static, &named, next_outer_hrtb)
     }
 
     fn param_bound_reqs(&self, sig: &Signature, src: &Source, param_ty: TyId) -> ParamBounds {
         let mut out = ParamBounds::default();
         let outer_params = sig_type_params(sig, src);
-        let mut check_bounds = |list: List| {
+        let check_bounds = |list: List| {
             for &b_id in sig.body.list(list) {
                 match sig.body.bounds[b_id as usize] {
                     Bound::Lifetime(lt) if src.text(lt) == "'static" => out.req_static = true,
@@ -331,37 +332,12 @@ impl Checker<'_, '_> {
                 }
             }
         };
-        match *sig.body.ty(param_ty) {
-            AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) => check_bounds(bounds),
-            AstTy::Ref { ty: inner, .. } => {
-                if let AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) = *sig.body.ty(inner) {
-                    check_bounds(bounds);
-                }
-            }
-            AstTy::Path(path) => {
-                let p = sig.body.path(path);
-                let segs = sig.body.list(p.segments);
-                if p.qself.is_none() && segs.len() == 1 {
-                    let name = src.text(sig.body.segments[segs[0] as usize].name);
-                    for g in &sig.generics {
-                        if g.kind == GenericKind::Type && src.text(g.name) == name {
-                            check_bounds(g.bounds);
-                        }
-                    }
-                    for pred in &sig.predicates {
-                        if pred_matches_name(sig, src, pred, name) {
-                            check_bounds(pred.bounds);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        for_each_param_bound_list(sig, src, param_ty, check_bounds);
         out
     }
 
     pub(in super::super) fn check_static_arg(&mut self, expr: ExprId, state: &State) -> Result<()> {
-        self.check_caller_lt_arg(expr, state, true, &[])
+        self.check_caller_lt_arg(expr, state, true, &[], false)
     }
 
     fn check_caller_lt_arg(
@@ -370,12 +346,13 @@ impl Checker<'_, '_> {
         state: &State,
         requires_static: bool,
         req_named_lts: &[&str],
+        outer_hrtb: bool,
     ) -> Result<()> {
         let saved_static = self.returns_only_static;
         self.returns_only_static = true;
         let sources = self.expr_borrow_sources(expr, state);
         self.returns_only_static = saved_static;
-        self.check_caller_lt_sources(expr, &sources, requires_static, req_named_lts)
+        self.check_caller_lt_sources(expr, &sources, requires_static, req_named_lts, outer_hrtb)
     }
 
     fn check_caller_lt_sources(
@@ -384,8 +361,10 @@ impl Checker<'_, '_> {
         sources: &[BorrowSource],
         requires_static: bool,
         req_named_lts: &[&str],
+        outer_hrtb: bool,
     ) -> Result<()> {
         let in_const = self.is_const_or_static_item();
+        let plain = self.expr_plain_local(expr);
         for s in sources {
             if is_temp_target(s.target).is_some() {
                 if in_const && !self.is_non_promotable_temp(expr) {
@@ -393,11 +372,25 @@ impl Checker<'_, '_> {
                 }
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));
             }
+            if let Some(origins) = self.closure_param_origins.get(&s.target).cloned() {
+                self.check_caller_lt_sources(
+                    expr,
+                    &origins,
+                    requires_static,
+                    req_named_lts,
+                    outer_hrtb,
+                )?;
+                continue;
+            }
+            let peel_outer = outer_hrtb
+                && self.is_ref_ty(self.local_ty(s.target))
+                && (plain == Some(s.target) || s.through_ref);
             let lt_mismatch = if requires_static {
                 self.is_non_static_param(s.target)
+                    && !(peel_outer && self.param_inner_is_static(s.target))
             } else {
                 !req_named_lts.is_empty()
-                    && !self.param_satisfies_caller_lt(s.target, req_named_lts)
+                    && !self.param_satisfies_caller_lt(s.target, req_named_lts, peel_outer)
             };
             if !self.from_caller(s.target, s.through_ref) || lt_mismatch {
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));
@@ -421,7 +414,7 @@ impl Checker<'_, '_> {
         sig_returns_only_static(&sig, sig_src, ret_ast, &lts)
     }
 
-    fn check_closure_effects(
+    pub(super) fn check_closure_effects(
         &self,
         expr: Option<ExprId>,
         eff: &ClosureEffects,
@@ -626,9 +619,14 @@ impl Checker<'_, '_> {
             }
             if let Some(param_idx) = closure_params.iter().position(|&p| p == l.target) {
                 let target_ty = self.local_ty(l.target);
-                let copies_inner_ref = l.steps.as_slice() == [PlaceStep::Deref]
+                let copies_inner_ref = !l.steps.is_empty()
+                    && l.steps.iter().all(|s| matches!(s, PlaceStep::Deref))
                     && target_ty != crate::sema::ty::Ty::NONE
-                    && matches!(*self.cx.types.kind(target_ty), Kind::Ref(_, inner) if self.is_ref_ty(inner));
+                    && matches!(
+                        *self.cx.types.kind(target_ty),
+                        Kind::Ref(_, inner)
+                            if matches!(*self.cx.types.kind(inner), Kind::Ref(crate::sema::ty::Mut::Not, _))
+                    );
                 let derefs_past_outer_ref = l
                     .steps
                     .iter()
@@ -708,35 +706,6 @@ impl Checker<'_, '_> {
         } else {
             self.attach_closure_arg_param_loans(None, arg_ids, arg_sources, state)
         }
-    }
-
-    pub(in super::super) fn check_coercion_vtables(&self) -> Result<()> {
-        for (&coercion_expr, coercion) in &self.typed.coercions {
-            let Some(vtable) = coercion.vtable() else {
-                continue;
-            };
-            let Kind::Closure(parent, _, at) = *self.cx.types.kind(vtable.ty) else {
-                continue;
-            };
-            if parent != self.item {
-                continue;
-            }
-            let Kind::Dyn(of, ..) = *self.cx.types.kind(vtable.object) else {
-                continue;
-            };
-            let Some(eff) = self.closure_effects.get(&ExprId(at)) else {
-                continue;
-            };
-            let lang = self.cx.lang(of);
-            self.check_closure_effects(
-                Some(coercion_expr),
-                eff,
-                lang == Some("fn"),
-                lang == Some("fn_mut"),
-                false,
-            )?;
-        }
-        Ok(())
     }
 }
 

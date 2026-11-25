@@ -1,14 +1,18 @@
 use anyhow::Result;
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::{GenericKind, Signature};
 use crate::body::{Args, Bound, Expr, ExprId, GenericArg, Ty as AstTy, TyId};
+use crate::lower::is_freeze_ty;
 use crate::names::ItemRef;
+use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 use crate::sema::infer::{Coercion, Res};
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::calls::{
-    Lifetimes, collect_ty_lifetimes, recv_is_by_ref, recv_ref_mut, ty_shares_name,
+    Lifetimes, collect_ty_lifetimes, lifetime_outlives, pred_matches_name, recv_is_by_ref,
+    recv_ref_mut, ty_shares_name,
 };
 use super::super::propagate::{BorrowSource, unwrap_container_loans};
 use super::super::{Checker, State};
@@ -66,6 +70,8 @@ impl Checker<'_, '_> {
             if arg_ty != Ty::NONE && !self.ty_holds_borrow(arg_ty) {
                 continue;
             }
+            let mut is_fresh_ref = false;
+            let mut param_ty_info: Option<(ItemRef, TyId)> = None;
             if let Some(s) = sig
                 && let Some(item) = fn_item
                 && let Some(&(_, param_ty)) = s.params.get(idx)
@@ -73,7 +79,7 @@ impl Checker<'_, '_> {
                 let (sig_src, _) = self.cx.item(item);
                 let mut p_lts = Lifetimes::default();
                 collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
-                let is_fresh_ref = matches!(s.body.ty(param_ty), AstTy::Ref { lifetime: None, .. });
+                is_fresh_ref = matches!(s.body.ty(param_ty), AstTy::Ref { lifetime: None, .. });
                 let shares_self = p_lts.named.iter().any(|n| self_lts.named.contains(n))
                     || (!is_fresh_ref
                         && ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names))
@@ -81,8 +87,19 @@ impl Checker<'_, '_> {
                 if !shares_self {
                     continue;
                 }
+                param_ty_info = Some((item, param_ty));
             }
-            let arg_sources = self.expr_borrow_sources(arg, state);
+            let arg_sources = if let Some((item, param_ty)) = param_ty_info
+                && let Some(s) = sig
+                && let Some(filtered) =
+                    self.matching_adt_arg_sources(expr, arg, s, item, param_ty, &self_lts, state)
+            {
+                filtered
+            } else if is_fresh_ref {
+                self.copied_arg_borrow_sources(expr, arg, state)
+            } else {
+                self.expr_borrow_sources(arg, state)
+            };
             for s in self.unwrap_collection_arg_sources(arg, arg_ty, recv_ty, arg_sources, state) {
                 if !s.env_only || keep_env {
                     all_sources.push(s);
@@ -93,6 +110,186 @@ impl Checker<'_, '_> {
             state.set_tuple_sources(p.local, None);
         }
         self.propagate_assign_sources(&p, &all_sources, state)
+    }
+
+    fn matching_adt_arg_sources(
+        &mut self,
+        call_expr: ExprId,
+        arg: ExprId,
+        sig: &Signature,
+        fn_item: ItemRef,
+        param_ty: TyId,
+        self_lts: &Lifetimes<'_>,
+        state: &State,
+    ) -> Option<Vec<BorrowSource>> {
+        if self_lts.named.is_empty() {
+            return None;
+        }
+        let inner_param = match *sig.body.ty(param_ty) {
+            AstTy::Ref {
+                lifetime: None,
+                ty: inner,
+                ..
+            } => inner,
+            _ => param_ty,
+        };
+        let AstTy::Path(path_id) = *sig.body.ty(inner_param) else {
+            return None;
+        };
+        let sig_src = self.cx.item(fn_item).0;
+        let last_seg = *sig.body.list(sig.body.path(path_id).segments).last()?;
+        let seg_name = sig_src.text(sig.body.segments[last_seg as usize].name);
+        let Some(Args::Angle(angle)) = sig.body.segments[last_seg as usize].args else {
+            return None;
+        };
+        let mut arg_lts = Vec::new();
+        for &a in sig.body.list(angle) {
+            match sig.body.args[a as usize] {
+                GenericArg::Lifetime(lt) => arg_lts.push(sig_src.text(lt)),
+                GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                    let mut t_lts = Lifetimes::default();
+                    collect_ty_lifetimes(&sig.body, sig_src, t, &mut t_lts);
+                    if t_lts.has_elided || !t_lts.named.is_empty() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if arg_lts.len() < 2
+            || !arg_lts.iter().any(|&n| {
+                !self_lts
+                    .named
+                    .iter()
+                    .any(|&s_lt| n == s_lt || lifetime_outlives(sig, sig_src, n, s_lt))
+            })
+        {
+            return None;
+        }
+        let val_expr = match *self.body.expr(self.unwrap_parens(arg)) {
+            Expr::Ref {
+                raw: false,
+                expr: inner,
+                ..
+            } => self.unwrap_parens(inner),
+            _ => self.unwrap_parens(arg),
+        };
+        let (struct_expr, is_inline) = match *self.body.expr(val_expr) {
+            Expr::Struct { base: None, .. } => (val_expr, true),
+            _ => {
+                let local = self.expr_plain_local(val_expr)?;
+                let mut site = None;
+                for l in state.loans.iter().filter(|l| l.holder == Some(local)) {
+                    let s = l.site?;
+                    if site.is_some_and(|prev| prev != s) {
+                        return None;
+                    }
+                    site = Some(s);
+                }
+                let s = site?;
+                matches!(*self.body.expr(s), Expr::Struct { base: None, .. })
+                    .then_some((s, false))?
+            }
+        };
+        let Kind::Adt(adt_item, _) = *self.cx.types.kind(self.expr_ty(struct_expr)) else {
+            return None;
+        };
+        if self.cx.name(adt_item) != seg_name
+            || self.cx.file(fn_item).items.items.iter().any(|it| {
+                it.kind == ItemKind::Type
+                    && it
+                        .name
+                        .is_some_and(|n| self.cx.file(fn_item).source.text(n) == seg_name)
+            })
+        {
+            return None;
+        }
+        let def = self.cx.adt_def(adt_item).ok()?;
+        if def.variants.len() != 1
+            || !def.generics.predicates.is_empty()
+            || def
+                .generics
+                .params
+                .iter()
+                .any(|g| g.kind == GenericKind::Lifetime && g.bounds.len > 0)
+        {
+            return None;
+        }
+        let var = &def.variants[0];
+        let adt_src = &self.cx.file(adt_item).source;
+        let def_lts: Vec<&str> = def
+            .generics
+            .params
+            .iter()
+            .filter(|g| g.kind == GenericKind::Lifetime)
+            .map(|g| adt_src.text(g.name))
+            .collect();
+        let def_ty_params: Vec<&str> = def
+            .generics
+            .params
+            .iter()
+            .filter(|g| g.kind == GenericKind::Type)
+            .map(|g| adt_src.text(g.name))
+            .collect();
+        if def_lts.len() != arg_lts.len() {
+            return None;
+        }
+        let shared_def_lts: Vec<&str> = def_lts
+            .iter()
+            .zip(&arg_lts)
+            .filter(|(_, arg_lt)| {
+                self_lts
+                    .named
+                    .iter()
+                    .any(|&s_lt| **arg_lt == s_lt || lifetime_outlives(sig, sig_src, arg_lt, s_lt))
+            })
+            .map(|(&def_lt, _)| def_lt)
+            .collect();
+        let Expr::Struct { fields, .. } = *self.body.expr(struct_expr) else {
+            return None;
+        };
+        let field_ids: Vec<u32> = self.body.list(fields).to_vec();
+        let mut out = Vec::new();
+        for id in field_ids {
+            let field_expr = self.body.fields[id as usize];
+            let fname = self.src.text(field_expr.name);
+            let fdef = var
+                .fields
+                .iter()
+                .find(|f| f.name.is_some_and(|n| adt_src.text(n) == fname))?;
+            let mut f_lts = Lifetimes::default();
+            collect_ty_lifetimes(&def.body, adt_src, fdef.ty, &mut f_lts);
+            if f_lts.names.iter().any(|n| def_ty_params.contains(n)) {
+                return None;
+            }
+            if !f_lts.named.iter().any(|n| shared_def_lts.contains(n)) {
+                continue;
+            }
+            if !is_inline {
+                let mut used = HashSet::default();
+                self.collect_live_expr(field_expr.value, &mut used);
+                for local in used {
+                    if self.mutable.get(local as usize).copied().unwrap_or(true)
+                        || !is_freeze_ty(self.cx, self.local_ty(local), 0)
+                    {
+                        return None;
+                    }
+                }
+            }
+            let outer_non_shared_ref = matches!(
+                *def.body.ty(fdef.ty),
+                AstTy::Ref {
+                    lifetime: Some(lt),
+                    ..
+                } if !shared_def_lts.contains(&adt_src.text(lt))
+            );
+            if outer_non_shared_ref {
+                out.extend(self.copied_arg_borrow_sources(call_expr, field_expr.value, state));
+            } else {
+                out.extend(self.expr_borrow_sources(field_expr.value, state));
+            }
+        }
+        Some(out)
     }
 
     fn unwrap_collection_arg_sources(
@@ -203,40 +400,68 @@ impl Checker<'_, '_> {
         cur
     }
 
-    fn generic_param_ties_to_self(
+    pub(in super::super) fn generic_param_ties_to_self(
         &self,
         sig: &Signature,
         src: &Source,
         p_lts: &Lifetimes<'_>,
         self_lts: &Lifetimes<'_>,
     ) -> bool {
-        for g in &sig.generics {
-            let gname = src.text(g.name);
-            if !p_lts.names.contains(&gname) && !p_lts.named.contains(&gname) {
-                continue;
-            }
-            let mut b_lts = Lifetimes::default();
-            for &b_id in sig.body.list(g.bounds) {
-                if let Bound::Lifetime(lt) = sig.body.bounds[b_id as usize] {
-                    if self_lts.named.contains(&src.text(lt)) {
-                        return true;
-                    }
-                } else if let Bound::Trait { path, .. } = sig.body.bounds[b_id as usize] {
-                    for &seg in sig.body.list(sig.body.path(path).segments) {
-                        if let Some(Args::Angle(args)) = sig.body.segments[seg as usize].args {
-                            for &a in sig.body.list(args) {
-                                if let GenericArg::Binding { ty, .. } = sig.body.args[a as usize] {
-                                    collect_ty_lifetimes(&sig.body, src, ty, &mut b_lts);
+        let bounds_tie =
+            |bounds: crate::body::List| {
+                let mut b_lts = Lifetimes::default();
+                for &b_id in sig.body.list(bounds) {
+                    if let Bound::Lifetime(lt) = sig.body.bounds[b_id as usize] {
+                        let lt_name = src.text(lt);
+                        if self_lts.named.iter().any(|&s_lt| {
+                            lt_name == s_lt || lifetime_outlives(sig, src, lt_name, s_lt)
+                        }) {
+                            return true;
+                        }
+                    } else if let Bound::Trait { path, .. } = sig.body.bounds[b_id as usize] {
+                        for &seg in sig.body.list(sig.body.path(path).segments) {
+                            if let Some(Args::Angle(args)) = sig.body.segments[seg as usize].args {
+                                for &a in sig.body.list(args) {
+                                    match sig.body.args[a as usize] {
+                                        GenericArg::Lifetime(lt) => {
+                                            let lt_name = src.text(lt);
+                                            if self_lts.named.iter().any(|&s_lt| {
+                                                lt_name == s_lt
+                                                    || lifetime_outlives(sig, src, lt_name, s_lt)
+                                            }) {
+                                                return true;
+                                            }
+                                        }
+                                        GenericArg::Ty(ty) | GenericArg::Binding { ty, .. } => {
+                                            collect_ty_lifetimes(&sig.body, src, ty, &mut b_lts);
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                b_lts.names.iter().any(|n| self_lts.names.contains(n))
+                    || b_lts.named.iter().any(|n| {
+                        self_lts
+                            .named
+                            .iter()
+                            .any(|&s_lt| *n == s_lt || lifetime_outlives(sig, src, n, s_lt))
+                    })
+            };
+        for g in &sig.generics {
+            let gname = src.text(g.name);
+            if !p_lts.names.contains(&gname) && !p_lts.named.contains(&gname) {
+                continue;
             }
-            if b_lts.names.iter().any(|n| self_lts.names.contains(n))
-                || b_lts.named.iter().any(|n| self_lts.named.contains(n))
-            {
+            if bounds_tie(g.bounds) {
                 return true;
+            }
+            for pred in &sig.predicates {
+                if pred_matches_name(sig, src, pred, gname) && bounds_tie(pred.bounds) {
+                    return true;
+                }
             }
         }
         false

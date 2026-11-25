@@ -227,10 +227,15 @@ impl Checker<'_, '_> {
             _ => None,
         });
         let next_fallback = if inner_init.is_none() {
-            target
-                .init
-                .map(|e| self.expr_borrow_sources(e, state))
-                .unwrap_or_else(|| target.fallback_sources.to_vec())
+            if let Some(e) = target.init {
+                self.expr_borrow_sources(e, state)
+            } else {
+                let mut srcs = target.fallback_sources.to_vec();
+                for s in &mut srcs {
+                    push_step(&mut s.steps, PlaceStep::Deref);
+                }
+                srcs
+            }
         } else {
             Vec::new()
         };

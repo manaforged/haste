@@ -56,18 +56,18 @@ impl TupleSources {
         }
     }
 
-    pub(in super::super) fn sources_for(&self, outer_hrtb: bool) -> Vec<BorrowSource> {
+    pub(in super::super) fn sources_for(&self, outer_hrtb: bool) -> (Vec<BorrowSource>, bool) {
         if outer_hrtb
             && let Self::Leaf {
                 inner_ref: Some(inner),
                 ..
             } = self
         {
-            return inner.clone();
+            return (inner.clone(), false);
         }
         let mut flat = Vec::new();
         self.flatten_into(&mut flat);
-        flat
+        (flat, outer_hrtb)
     }
 }
 

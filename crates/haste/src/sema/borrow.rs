@@ -176,6 +176,7 @@ struct Checker<'c, 'a> {
     let_extend_depth: Option<u32>,
     temp_sources: HashMap<ExprId, Vec<BorrowSource>>,
     closure_effects: HashMap<ExprId, checks::ClosureEffects>,
+    closure_param_origins: HashMap<u32, Vec<BorrowSource>>,
     drop_cache: HashMap<Ty, bool>,
     drop_locals: HashSet<u32>,
     current_expr: Option<ExprId>,
@@ -330,6 +331,7 @@ pub(super) fn check(
         let_extend_depth: None,
         temp_sources: HashMap::default(),
         closure_effects: HashMap::default(),
+        closure_param_origins: HashMap::default(),
         drop_cache: HashMap::default(),
         drop_locals: HashSet::default(),
         current_expr: None,
@@ -343,6 +345,8 @@ pub(super) fn check(
             if checker.is_param.get(idx).copied().unwrap_or(false)
                 && let Kind::Ref(_, inner) = *checker.cx.types.kind(local.ty)
                 && !checker.ty_holds_borrow(inner)
+                && !checker.param_lts.inner_has_elided_lt[idx]
+                && checker.param_lts.inner_named_lts[idx].is_empty()
             {
                 checker.param_lts.inner_is_static[idx] = true;
             }
@@ -443,12 +447,28 @@ fn prune_moved_loans(state: &mut State) {
 }
 
 fn prune_dead_loans(state: &mut State, live: &HashSet<u32>) {
-    if !state.loans.is_empty() {
-        state.loans.retain(|l| {
-            l.holder
-                .is_none_or(|h| is_temp_holder(Some(h)) || live.contains(&h))
-        });
+    if state.loans.is_empty() {
+        return;
     }
+    let mut keep = live.clone();
+    loop {
+        let mut grew = false;
+        for l in &state.loans {
+            if l.holder
+                .is_none_or(|h| is_temp_holder(Some(h)) || keep.contains(&h))
+                && keep.insert(l.target)
+            {
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    state.loans.retain(|l| {
+        l.holder
+            .is_none_or(|h| is_temp_holder(Some(h)) || keep.contains(&h))
+    });
 }
 
 impl Checker<'_, '_> {
@@ -518,36 +538,6 @@ impl Checker<'_, '_> {
             .get(local as usize)
             .copied()
             .unwrap_or(false)
-    }
-
-    pub(super) fn param_satisfies_caller_lt(&mut self, local: u32, req_lts: &[&str]) -> bool {
-        if !self.is_non_static_param(local) {
-            return true;
-        }
-        let slot = local as usize;
-        if self
-            .param_lts
-            .has_elided_lt
-            .get(slot)
-            .copied()
-            .unwrap_or(true)
-        {
-            return false;
-        }
-        let Some(declared) = self.param_lts.named_lts.get(slot) else {
-            return false;
-        };
-        if declared.is_empty() {
-            return false;
-        }
-        let Ok(sig) = self.cx.signature(self.item) else {
-            return false;
-        };
-        declared.iter().all(|&p_lt| {
-            req_lts
-                .iter()
-                .all(|&req| calls::lifetime_outlives(&sig, self.src, p_lt, req))
-        })
     }
 
     fn is_escaping_return(&self, src: &BorrowSource) -> bool {
