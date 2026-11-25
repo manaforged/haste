@@ -18,8 +18,8 @@ pub(super) use bits::{
     Bfx, bfx_parts, conv_bfx_parts, extr_parts, single_bit_mask, unwrap_elided_tst,
 };
 pub(super) use cmp::{cmn_parts, cmn_sum_parts};
+pub(super) use flag::{cinc_operand, preserves_flags, zero_cmp_operand};
 use flag::{fuse_fits, fuse_icmp_flags, fuse_icmp_selects};
-pub(super) use flag::{preserves_flags, zero_cmp_operand};
 use mem::try_fuse_vec_op;
 pub(super) use mem::{encode_neon_movi, madd_parts, store_source};
 pub(super) use sign::sign_bit_test;
@@ -46,6 +46,13 @@ pub(super) fn const_of(
             Op::Const(imm) => Some(imm),
             _ => None,
         })
+}
+
+pub(super) fn elided_or_deferred(plan: &Plan<Reg>, data: &crate::ir::InstData) -> bool {
+    !matches!(data.op, Op::Call { .. } | Op::TryCall { .. })
+        && data
+            .result
+            .is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()])
 }
 
 pub(super) fn zero_ext_loc(plan: &Plan<Reg>, val: Value) -> bool {
@@ -307,7 +314,10 @@ pub(super) fn can_peel_uextend(
     let Op::Convert(Convert::Uextend, inner) = func.insts[uinst.index()].op else {
         return false;
     };
-    inner != res && ok(inner) && preserved(func, plan, b_idx, upos, end, skip, inner)
+    !plan.elided[inner.index()]
+        && inner != res
+        && ok(inner)
+        && preserved(func, plan, b_idx, upos, end, skip, inner)
 }
 
 fn peel_other_uextend(
@@ -506,9 +516,9 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>, lse: bool) {
     }
     vconst::elide_vec_consts(func, plan, &pos_of);
     fuse_icmp_selects(func, plan, (&uses, &pos_of));
-    fuse_icmp_flags(func, plan, &uses);
+    fuse_icmp_flags(func, plan, (&uses, &pos_of));
     bits::fuse_tst(func, plan, (&uses, &pos_of));
-    fuse_fits(func, plan, &uses);
+    fuse_fits(func, plan, (&uses, &pos_of));
     ccmp::fuse_ccmp(func, plan, (&uses, &pos_of));
     mem::fuse_atomic_addrs(func, plan, lse, (&uses, &pos_of));
     mem::fuse_store_ireduce(func, plan, &uses);

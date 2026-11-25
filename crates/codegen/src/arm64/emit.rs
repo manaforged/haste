@@ -90,11 +90,17 @@ impl Emit<'_> {
     }
 
     pub(super) fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
+        if let Some((value, cond)) = self.flags
+            && value == condition
+        {
+            self.asm
+                .bcond(if invert { cond.invert() } else { cond }, label);
+            return;
+        }
         if self.plan.elided[condition.index()]
             && let Some(inst) = self.defs[condition.index()]
         {
             if let Op::Icmp(cc, lhs, rhs) = self.func.insts[inst.index()].op
-                && !matches!(self.flags, Some((v, _)) if v == condition)
                 && let Some((val, bit, set)) =
                     fuse::sign_bit_test(self.func, &self.plan, (cc, lhs, rhs), &|v: Value| {
                         self.defs[v.index()]
@@ -135,13 +141,6 @@ impl Emit<'_> {
             {
                 return self.emit_cbz(val, (cc == IntCC::NotEqual) ^ one ^ invert, label);
             }
-        }
-        if let Some((value, cond)) = self.flags
-            && value == condition
-        {
-            self.asm
-                .bcond(if invert { cond.invert() } else { cond }, label);
-            return;
         }
         self.emit_cbz(condition, !invert, label);
     }

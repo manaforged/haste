@@ -124,7 +124,9 @@ fn collect_candidates(func: &Function, cfg: &Cfg, blocked: &[bool]) -> Vec<Candi
                 data.op.for_operands(|v| bad_use[v.index()] = true);
                 continue;
             }
-            if let (Op::Convert(Convert::Uextend, x), Some(res)) = (&data.op, data.result) {
+            if let (Op::Convert(Convert::Uextend, x), Some(res)) = (&data.op, data.result)
+                && func.ty(res) != Type::I128
+            {
                 uext_counts[x.index()] += 1;
                 if func.ty(res) == Type::I64 {
                     uext_has_64[x.index()] = true;
@@ -467,18 +469,21 @@ fn prune_candidates(
     }
 }
 
+fn int_convert_op(from_ty: Type, to_ty: Type) -> Convert {
+    if to_ty.bits() > from_ty.bits() {
+        Convert::Uextend
+    } else {
+        Convert::Ireduce
+    }
+}
+
 fn emit_convert(func: &mut Function, val: Value, to_ty: Type, extra: &mut Vec<Inst>) -> Value {
     let from_ty = func.ty(val);
     if from_ty == to_ty {
         return val;
     }
-    let conv = if from_ty.bits() < to_ty.bits() {
-        Convert::Uextend
-    } else {
-        Convert::Ireduce
-    };
     let res = func.value(to_ty);
-    extra.push(func.add(Op::Convert(conv, val), Some(res)));
+    extra.push(func.add(Op::Convert(int_convert_op(from_ty, to_ty), val), Some(res)));
     res
 }
 
@@ -629,7 +634,8 @@ fn rewrite_uses(
                     func.insts[inst.index()].op = Op::Trap;
                     continue;
                 }
-                func.insts[inst.index()].op = Op::Convert(Convert::Ireduce, p_wide);
+                let conv = int_convert_op(func.ty(p_wide), func.ty(res));
+                func.insts[inst.index()].op = Op::Convert(conv, p_wide);
             } else {
                 rewrite_icmp(
                     func,

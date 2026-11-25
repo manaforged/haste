@@ -1,6 +1,6 @@
 use super::super::asm::{Asm, Cond, Reg, Size, ZR};
 use super::super::{A, C, D, Emit, V0, V1};
-use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
+use crate::ir::{Binary, IntCC, Op, Type, Unary, Value};
 
 #[derive(Clone, Copy)]
 enum SelectOp {
@@ -46,25 +46,22 @@ impl Emit<'_> {
     }
 
     fn elided_icmp_of(&self, condition: Value) -> Option<(IntCC, Value, Value)> {
-        if !self.plan.elided[condition.index()] {
-            return None;
-        }
-        match self.func.insts[self.defs[condition.index()]?.index()].op {
-            Op::Icmp(cc, a, b) => Some((cc, a, b)),
-            Op::Convert(Convert::Uextend, inner) if self.plan.elided[inner.index()] => {
-                match self.func.insts[self.defs[inner.index()]?.index()].op {
-                    Op::Icmp(cc, a, b) => Some((cc, a, b)),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        super::super::fuse::cinc_operand(self.func, &self.plan, condition, &|v| {
+            self.defs[v.index()]
+        })
     }
 
     pub(in crate::arm64) fn preserves_flags(&self, op: &Op, result: Option<Value>) -> bool {
         matches!(*op, Op::Brif(..))
             || matches!(*op, Op::Select(cond, ..) | Op::Trapz(cond) if self.flags.is_some_and(|(v, _)| v == cond))
-            || super::super::fuse::preserves_flags(self.func, &self.plan, op, result, true)
+            || super::super::fuse::preserves_flags(
+                self.func,
+                &self.plan,
+                &|v| self.defs[v.index()],
+                op,
+                result,
+                true,
+            )
     }
 
     fn select_cond(&mut self, condition: Value) -> Cond {

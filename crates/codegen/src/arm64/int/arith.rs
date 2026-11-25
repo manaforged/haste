@@ -611,13 +611,18 @@ impl Emit<'_> {
         };
         if let Some(count) = self.plan.const_of(y) {
             let count = (count as u8) & (bits - 1);
-            if bits == 32 && op == Binary::Ushr && count != 0 {
+            if bits == 32 && matches!(op, Binary::Ishl | Binary::Ushr) {
                 let value = if peeled != x {
                     self.zext_src(peeled, A)
                 } else {
                     self.bits(x, A)
                 };
-                return self.asm.shift32_imm(false, dst, value, count);
+                if count == 0 {
+                    self.asm.extend(false, 4, dst, value);
+                } else {
+                    self.asm.shift32_imm(op == Binary::Ishl, dst, value, count);
+                }
+                return;
             }
             let value = if peeled != x {
                 self.zext_src(peeled, A)

@@ -189,21 +189,46 @@ fn bfx_shr(
     }
 }
 
+fn is_elided_peeled_uext(
+    func: &Function,
+    plan: &Plan<Reg>,
+    v: Value,
+    def: &dyn Fn(Value) -> Option<Inst>,
+) -> bool {
+    plan.elided[v.index()]
+        && def(v).is_some_and(|inst| {
+            matches!(
+                func.insts[inst.index()].op,
+                Op::Convert(Convert::Uextend, inner) if !plan.elided[inner.index()]
+            )
+        })
+}
+
+fn emit_src_ok(
+    func: &Function,
+    plan: &Plan<Reg>,
+    v: Value,
+    def: &dyn Fn(Value) -> Option<Inst>,
+) -> bool {
+    !plan.elided[v.index()] || is_elided_peeled_uext(func, plan, v, def)
+}
+
 fn band_mask_src(
     func: &Function,
     plan: &Plan<Reg>,
     band_val: Value,
     def: &dyn Fn(Value) -> Option<Inst>,
+    src_ok: &dyn Fn(Value) -> bool,
 ) -> Option<(Value, u32)> {
     let Op::Binary(Binary::Band, a, b) = func.insts[def(band_val)?.index()].op else {
         return None;
     };
-    if plan.elided[a.index()] || plan.elided[b.index()] {
-        return None;
-    }
     let mty = func.ty(band_val);
     let mask = mty.unsigned_max();
     [(a, b), (b, a)].into_iter().find_map(|(src, m_val)| {
+        if !src_ok(src) || plan.elided[m_val.index()] {
+            return None;
+        }
         let imm = const_of(func, plan, m_val, def)?;
         let w = low_mask_width((imm as u64) & mask, mask)?;
         Some((src, w))
@@ -216,21 +241,24 @@ fn bfx_shl(
     ty: Type,
     (x, y): (Value, Value),
     def: &dyn Fn(Value) -> Option<Inst>,
-    hooks: (&dyn Fn(Value) -> bool, &dyn Fn(Value) -> bool),
+    hooks: (
+        &dyn Fn(Value) -> bool,
+        &dyn Fn(Value) -> bool,
+        &dyn Fn(Value) -> bool,
+    ),
 ) -> Option<(Bfx, Value, Option<Value>)> {
-    let (mid_ok, inner_ok) = hooks;
+    let (mid_ok, inner_ok, src_ok) = hooks;
     if !mid_ok(x) {
         return None;
     }
-    let (bits, ty_mask) = (ty.bits(), ty.unsigned_max());
+    let bits = ty.bits();
     let shl_amt = (const_of(func, plan, y, def)? as u32) & (bits - 1);
     if shl_amt == 0 {
         return None;
     }
     match func.insts[def(x)?.index()].op {
-        Op::Binary(Binary::Band, a, b) => [(a, b), (b, a)].into_iter().find_map(|(src, m_val)| {
-            let imm = const_of(func, plan, m_val, def)?;
-            let w = low_mask_width((imm as u64) & ty_mask, ty_mask)?;
+        Op::Binary(Binary::Band, ..) => {
+            let (src, w) = band_mask_src(func, plan, x, def, src_ok)?;
             Some((
                 Bfx {
                     insert: true,
@@ -242,13 +270,13 @@ fn bfx_shl(
                 x,
                 None,
             ))
-        }),
+        }
         Op::Convert(conv @ (Convert::Uextend | Convert::Sextend), inner)
             if func.ty(inner).is_small_int() && func.ty(inner).bits() < bits =>
         {
             if conv == Convert::Uextend
                 && inner_ok(inner)
-                && let Some((src, w)) = band_mask_src(func, plan, inner, def)
+                && let Some((src, w)) = band_mask_src(func, plan, inner, def, src_ok)
             {
                 return Some((
                     Bfx {
@@ -262,7 +290,7 @@ fn bfx_shl(
                     Some(inner),
                 ));
             }
-            (!plan.elided[inner.index()]).then(|| {
+            src_ok(inner).then(|| {
                 (
                     Bfx {
                         insert: true,
@@ -286,16 +314,20 @@ fn bfx_match(
     (ty, op): (Type, Binary),
     pair: (Value, Value),
     def: &dyn Fn(Value) -> Option<Inst>,
-    hooks: (&dyn Fn(Value) -> bool, &dyn Fn(Value) -> bool),
+    hooks: (
+        &dyn Fn(Value) -> bool,
+        &dyn Fn(Value) -> bool,
+        &dyn Fn(Value) -> bool,
+    ),
 ) -> Option<(Bfx, Value, Option<Value>)> {
     if !ty.is_small_int() {
         return None;
     }
-    let (mid_ok, inner_ok) = hooks;
+    let (mid_ok, inner_ok, src_ok) = hooks;
     match op {
         Binary::Band => bfx_band(func, plan, ty, pair, def, mid_ok),
         Binary::Ushr | Binary::Sshr => bfx_shr(func, plan, (ty, op), pair, def, mid_ok),
-        Binary::Ishl => bfx_shl(func, plan, ty, pair, def, (mid_ok, inner_ok)),
+        Binary::Ishl => bfx_shl(func, plan, ty, pair, def, (mid_ok, inner_ok, src_ok)),
         _ => None,
     }
 }
@@ -309,7 +341,8 @@ pub(in crate::arm64) fn bfx_parts(
     def: &dyn Fn(Value) -> Option<Inst>,
 ) -> Option<Bfx> {
     let ok = |v: Value| plan.elided[v.index()];
-    bfx_match(func, plan, (ty, op), (x, y), def, (&ok, &ok)).map(|(bfx, _, _)| bfx)
+    let src_ok = |v: Value| emit_src_ok(func, plan, v, def);
+    bfx_match(func, plan, (ty, op), (x, y), def, (&ok, &ok, &src_ok)).map(|(bfx, _, _)| bfx)
 }
 
 fn check_bfx_src(
@@ -327,8 +360,10 @@ fn check_bfx_src(
     let ext_ok = |inner: Value| need <= func.ty(inner).bits() || zero_ext_loc(plan, inner);
     if let Some(band_v) = extra {
         let (_, bpos, _) = def_entry(pos_of, band_v)?;
-        return (bfx.src != res && preserved(func, plan, b_idx, bpos, pos, Some(spos), bfx.src))
-            .then_some(false);
+        return (!plan.elided[bfx.src.index()]
+            && bfx.src != res
+            && preserved(func, plan, b_idx, bpos, pos, Some(spos), bfx.src))
+        .then_some(false);
     }
     let peeled = !is_conv
         && can_peel_uextend(
@@ -338,7 +373,9 @@ fn check_bfx_src(
             (b_idx, spos, pos, Some(spos), res),
             (bfx.src, &ext_ok),
         );
-    if !peeled && !preserved(func, plan, b_idx, spos, pos, None, bfx.src) {
+    if !peeled
+        && (plan.elided[bfx.src.index()] || !preserved(func, plan, b_idx, spos, pos, None, bfx.src))
+    {
         return None;
     }
     Some(peeled)
@@ -347,27 +384,20 @@ fn check_bfx_src(
 pub(super) fn try_fuse_bfx(
     func: &Function,
     plan: &mut Plan<Reg>,
-    info @ (uses, pos_of): UseInfo<'_>,
+    info @ (_, pos_of): UseInfo<'_>,
     (b_idx, pos, res): (usize, usize, Value),
     (op, x, y): (Binary, Value, Value),
 ) -> bool {
     let def = |v| def_inst(pos_of, v);
-    let mid_ok = |v: Value| {
-        uses[v.index()] == 1
-            && !plan.elided[v.index()]
-            && def_entry(pos_of, v).is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos)
-    };
-    let inner_ok = |v: Value| {
-        uses[v.index()] == 1
-            && def_entry(pos_of, v).is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos)
-    };
+    let mid_ok = |v: Value| local_single(plan, info, b_idx, pos, v).is_some();
+    let src_ok = |v: Value| !plan.elided[v.index()];
     let Some((bfx, mid, extra)) = bfx_match(
         func,
         plan,
         (func.ty(res), op),
         (x, y),
         &def,
-        (&mid_ok, &inner_ok),
+        (&mid_ok, &mid_ok, &src_ok),
     ) else {
         return false;
     };
@@ -454,8 +484,9 @@ fn conv_bfx_band(
     (src_ty, signed): (Type, bool),
     (x, a, b): (Value, Value, Value),
     def: &dyn Fn(Value) -> Option<Inst>,
+    src_ok: &dyn Fn(Value) -> bool,
 ) -> Option<Bfx> {
-    if let Some((src, w)) = band_mask_src(func, plan, x, def) {
+    if let Some((src, w)) = band_mask_src(func, plan, x, def, src_ok) {
         return Some(Bfx {
             insert: false,
             signed: false,
@@ -476,6 +507,7 @@ fn conv_bfx_match(
     x: Value,
     def: &dyn Fn(Value) -> Option<Inst>,
     mid_ok: &dyn Fn(Value) -> bool,
+    src_ok: &dyn Fn(Value) -> bool,
 ) -> Option<Bfx> {
     if !matches!(dst_ty, Type::I16 | Type::I32 | Type::I64) || !mid_ok(x) {
         return None;
@@ -487,13 +519,14 @@ fn conv_bfx_match(
     let signed = conv == Convert::Sextend;
     let op = &func.insts[def(x)?.index()].op;
     if let Op::Binary(Binary::Band, a, b) = *op
-        && let Some(bfx) = conv_bfx_band(func, plan, (src_ty, signed), (x, a, b), def)
+        && let Some(bfx) = conv_bfx_band(func, plan, (src_ty, signed), (x, a, b), def, src_ok)
     {
         return Some(bfx);
     }
     if let Op::Binary(bop @ (Binary::Ushr | Binary::Sshr | Binary::Ishl), a, b) = *op {
         let ok = |v: Value| plan.elided[v.index()];
-        if let Some((bfx, _, _)) = bfx_match(func, plan, (src_ty, bop), (a, b), def, (&ok, &ok))
+        if let Some((bfx, _, _)) =
+            bfx_match(func, plan, (src_ty, bop), (a, b), def, (&ok, &ok, src_ok))
             && let Some(out) = adapt_conv_bfx(bfx, src_ty.bits(), signed)
         {
             return Some(out);
@@ -510,27 +543,8 @@ pub(in crate::arm64) fn conv_bfx_parts(
     def: &dyn Fn(Value) -> Option<Inst>,
 ) -> Option<Bfx> {
     let ok = |v: Value| plan.elided[v.index()];
-    conv_bfx_match(func, plan, (dst_ty, conv), x, def, &ok)
-}
-
-fn live_root_preserved(
-    func: &Function,
-    plan: &Plan<Reg>,
-    pos_of: PosMap<'_>,
-    (b_idx, start, end, skip, res): (usize, usize, usize, Option<usize>, Option<Value>),
-    val: Value,
-) -> bool {
-    let mut cur = val;
-    while plan.elided[cur.index()] {
-        let Some((_, _, inst)) = def_entry(pos_of, cur) else {
-            return false;
-        };
-        let Op::Convert(Convert::Uextend, inner) = func.insts[inst.index()].op else {
-            return false;
-        };
-        cur = inner;
-    }
-    res != Some(cur) && preserved(func, plan, b_idx, start, end, skip, cur)
+    let src_ok = |v: Value| emit_src_ok(func, plan, v, def);
+    conv_bfx_match(func, plan, (dst_ty, conv), x, def, &ok, &src_ok)
 }
 
 pub(super) fn try_fuse_conv_bfx(
@@ -545,7 +559,8 @@ pub(super) fn try_fuse_conv_bfx(
     };
     let def = |v| def_inst(pos_of, v);
     let ok = |v: Value| v == x;
-    let Some(bfx) = conv_bfx_match(func, plan, (func.ty(res), conv), x, &def, &ok) else {
+    let src_ok = |v: Value| !plan.elided[v.index()];
+    let Some(bfx) = conv_bfx_match(func, plan, (func.ty(res), conv), x, &def, &ok, &src_ok) else {
         return false;
     };
     let is_uext = !bfx.signed;
@@ -564,13 +579,9 @@ pub(super) fn try_fuse_conv_bfx(
             (bfx.src, &ext_ok),
         );
     if !peeled
-        && !live_root_preserved(
-            func,
-            plan,
-            pos_of,
-            (b_idx, xpos, pos, None, Some(res)),
-            bfx.src,
-        )
+        && (plan.elided[bfx.src.index()]
+            || bfx.src == res
+            || !preserved(func, plan, b_idx, xpos, pos, None, bfx.src))
     {
         return false;
     }

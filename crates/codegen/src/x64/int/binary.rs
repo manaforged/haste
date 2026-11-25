@@ -589,7 +589,10 @@ impl Emit<'_> {
                 need_ext
                     || (count == 0
                         && ty == Type::I32
-                        && matches!(op, Binary::Ushr | Binary::Rotl | Binary::Rotr)
+                        && matches!(
+                            op,
+                            Binary::Ishl | Binary::Ushr | Binary::Rotl | Binary::Rotr
+                        )
                         && !self.plan.zero_ext[x.index()]),
             );
             if count != 0 {

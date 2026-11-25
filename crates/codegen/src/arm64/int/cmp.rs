@@ -58,13 +58,14 @@ impl Emit<'_> {
             self.last_cmp = None;
             return true;
         }
-        let reg = if self.is_zext_sub_cmp(lhs, cc, raw) {
+        let zext_sub = !signed && self.is_zext_sub_cmp(lhs, cc, raw);
+        let reg = if zext_sub {
             self.bits(lhs, A)
         } else {
             self.cmp_arg(lhs, A, bytes, signed)
         };
         self.asm.add_imm(sub, true, size, ZR, reg, imm);
-        self.last_cmp = Some((size, lhs, rhs, signed));
+        self.last_cmp = (!zext_sub).then_some((size, lhs, rhs, signed));
         true
     }
 
@@ -348,7 +349,7 @@ impl Emit<'_> {
                     self.shift_by(Binary::Ushr, (val, amt), self.ty(x).bits() as u8, dst);
                 } else if self.plan.zero_ext[result.index()]
                     && self.ty(result).bits() < 32
-                    && !self.is_zext_within(x, self.ty(result).bits(), 4)
+                    && u32::from(self.plan.clean_bits[x.index()]) > self.ty(result).bits()
                 {
                     let src = self.bits(x, A);
                     self.asm.extend(false, self.ty(result).bytes(), dst, src);

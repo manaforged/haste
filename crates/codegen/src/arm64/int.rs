@@ -10,15 +10,6 @@ use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
 pub(crate) use imm::{add_imm_parts, add_imm_split_parts, encode_bitmask_imm};
 
-fn imm_within(imm: i64, bits: u32) -> bool {
-    let mask = if bits >= 64 {
-        u64::MAX
-    } else {
-        (1_u64 << bits) - 1
-    };
-    imm >= 0 && (imm as u64) <= mask
-}
-
 pub(super) fn cond(cc: IntCC) -> Cond {
     match cc {
         IntCC::Equal => Cond::Eq,
@@ -60,142 +51,10 @@ pub(super) fn alu_of(op: Binary) -> Option<Alu> {
 }
 
 impl Emit<'_> {
-    fn ushr_zext_within(
-        &self,
-        bits: u32,
-        (a, amt): (Value, Value),
-        expect_bits: u32,
-        d: u8,
-    ) -> bool {
-        if bits <= 32 && bits <= expect_bits {
-            return true;
-        }
-        if bits >= 32
-            && let Some(s) = self.plan.const_of(amt)
-            && bits - ((s as u32) & (bits - 1)) <= expect_bits
-        {
-            return true;
-        }
-        self.is_zext_within(a, expect_bits, d)
-    }
-
-    fn ishl_zext_within(
-        &self,
-        bits: u32,
-        (a, amt): (Value, Value),
-        expect_bits: u32,
-        d: u8,
-    ) -> bool {
-        let Some(s) = self.plan.const_of(amt) else {
-            return bits == 32 && expect_bits >= 32;
-        };
-        let shift = (s as u32) & (bits - 1);
-        expect_bits > shift && self.is_zext_within(a, expect_bits - shift, d)
-    }
-
-    fn bin_zext_within(
-        &self,
-        op: Binary,
-        (a, b): (Value, Value),
-        (bits, expect_bits, d): (u32, u32, u8),
-    ) -> bool {
-        let w32 = bits == 32 && expect_bits >= 32;
-        match op {
-            Binary::Ushr => self.ushr_zext_within(bits, (a, b), expect_bits, d),
-            Binary::Ishl => self.ishl_zext_within(bits, (a, b), expect_bits, d),
-            Binary::Umin
-            | Binary::Umax
-            | Binary::Udiv
-            | Binary::Urem
-            | Binary::Umulhi
-            | Binary::UaddSat
-            | Binary::UsubSat
-            | Binary::AvgRound => bits <= 32 && bits <= expect_bits,
-            Binary::Iadd | Binary::Isub | Binary::Imul | Binary::Rotl | Binary::Rotr => w32,
-            Binary::Bor | Binary::Bxor => {
-                w32 || (self.is_zext_within(a, expect_bits, d)
-                    && self.is_zext_within(b, expect_bits, d))
-            }
-            Binary::Band => {
-                w32 || self.is_zext_within(a, expect_bits, d)
-                    || self.is_zext_within(b, expect_bits, d)
-            }
-            _ => false,
-        }
-    }
-
-    fn unary_zext_within(
-        &self,
-        op: Unary,
-        a: Value,
-        (bits, expect_bits, d): (u32, u32, u8),
-    ) -> bool {
-        match op {
-            Unary::Clz | Unary::Ctz | Unary::Popcnt => expect_bits >= 7,
-            Unary::Bswap if bits == 16 && expect_bits >= 16 => self.is_zext_within(a, 16, d),
-            Unary::Bswap | Unary::Ineg | Unary::Bnot => bits == 32 && expect_bits >= 32,
-            _ => false,
-        }
-    }
-
-    fn op_zext_within(&self, op: &Op, ty: Type, expect_bits: u32, d: u8) -> bool {
-        let bits = ty.bits();
-        match *op {
-            Op::Const(imm) => imm_within(imm, expect_bits),
-            Op::Load(..)
-            | Op::VolatileLoad(..)
-            | Op::StackLoad(..)
-            | Op::AtomicLoad(..)
-            | Op::AtomicRmw(..)
-            | Op::AtomicCas(..) => bits <= expect_bits,
-            Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => expect_bits >= 1,
-            Op::Extract(..) | Op::Reduce(..) => ty.is_small_int() && bits <= expect_bits,
-            Op::Unary(u, a) => self.unary_zext_within(u, a, (bits, expect_bits, d)),
-            Op::Binary(b, x, y) => self.bin_zext_within(b, (x, y), (bits, expect_bits, d)),
-            Op::Select(_, a, b) => {
-                self.is_zext_within(a, expect_bits, d) && self.is_zext_within(b, expect_bits, d)
-            }
-            Op::Convert(Convert::Uextend, inner) => {
-                self.ty(inner).bits() <= expect_bits || self.is_zext_within(inner, expect_bits, d)
-            }
-            Op::Convert(Convert::Ireduce, inner) => {
-                self.is_zext_within(inner, expect_bits.min(bits), d)
-            }
-            _ => false,
-        }
-    }
-
-    fn is_zext_within(&self, val: Value, expect_bits: u32, depth: u8) -> bool {
-        if matches!(self.plan.location(val), Location::Float(_)) {
-            return false;
-        }
-        let ty = self.ty(val);
-        if u32::from(self.plan.clean_bits[val.index()]) <= expect_bits {
-            return true;
-        }
-        if self.plan.zero_ext[val.index()] && ty.bits() <= expect_bits {
-            return true;
-        }
-        if let Location::Imm(imm) = self.plan.location(val) {
-            return imm_within(imm, expect_bits);
-        }
-        let Some(inst) = (depth > 0).then(|| self.defs[val.index()]).flatten() else {
-            return false;
-        };
-        self.op_zext_within(
-            &self.func.insts[inst.index()].op,
-            ty,
-            expect_bits,
-            depth - 1,
-        )
-    }
-
     pub(super) fn is_zext_reg(&self, val: Value) -> bool {
         !self.plan.elided[val.index()]
             && matches!(self.plan.location(val), Location::Reg(_) | Location::Slot)
-            && (self.plan.zero_ext[val.index()]
-                || (self.defs[val.index()].is_some()
-                    && self.is_zext_within(val, self.ty(val).bits(), 4)))
+            && self.plan.zero_ext[val.index()]
     }
 
     pub(super) fn zext_src(&mut self, val: Value, scratch: Reg) -> Reg {
@@ -363,20 +222,8 @@ impl Emit<'_> {
         Some((self.peel_uextend(b), shift, count))
     }
 
-    fn cinc_operand(&self, val: Value) -> Option<(IntCC, Value, Value)> {
-        if !self.plan.elided[val.index()] {
-            return None;
-        }
-        match self.func.insts[self.defs[val.index()]?.index()].op {
-            Op::Icmp(cc, a, b) => Some((cc, a, b)),
-            Op::Convert(Convert::Uextend, inner) if self.plan.elided[inner.index()] => {
-                match self.func.insts[self.defs[inner.index()]?.index()].op {
-                    Op::Icmp(cc, a, b) => Some((cc, a, b)),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+    pub(super) fn cinc_operand(&self, val: Value) -> Option<(IntCC, Value, Value)> {
+        super::fuse::cinc_operand(self.func, &self.plan, val, &|v| self.defs[v.index()])
     }
 
     fn const_imm(&self, val: Value) -> Option<i64> {

@@ -1,3 +1,5 @@
+mod regressions;
+
 use crate::ir::{Binary, Op, StackSlot, Type};
 use crate::promote::Moves;
 use crate::{

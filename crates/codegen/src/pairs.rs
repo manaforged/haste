@@ -174,6 +174,9 @@ impl Splitter<'_> {
         let ok = widenable(self.func);
         self.split_at = vec![Vec::new(); self.func.blocks.len()];
         for block in 0..self.func.blocks.len() {
+            if self.func.blocks[block].insts.is_empty() {
+                continue;
+            }
             let params = self.func.blocks[block].params.clone();
             if !params.iter().any(|&p| self.func.ty(p) == Type::I128) {
                 continue;

@@ -460,6 +460,37 @@ fn verify_ssa(func: &Function) -> Result<(), String> {
     Ok(())
 }
 
+fn check_int_convert(
+    func: &Function,
+    kind: Convert,
+    x: Value,
+    result: Option<Value>,
+) -> Result<(), String> {
+    let src = func.ty(x);
+    let Some(dst) = result.map(|r| func.ty(r)) else {
+        return Err(format!("{kind:?} requires a result"));
+    };
+    let widths =
+        if (src.is_small_int() || src == Type::I128) && (dst.is_small_int() || dst == Type::I128) {
+            Some((src.bits(), dst.bits()))
+        } else if let (Some((sl, sn)), Some((dl, dn))) = (src.vec_shape(), dst.vec_shape()) {
+            (sn == dn && sl.is_int() && dl.is_int()).then_some((sl.bits(), dl.bits()))
+        } else {
+            None
+        };
+    let ok = widths.is_some_and(|(sb, db)| {
+        if matches!(kind, Convert::Ireduce) {
+            db < sb
+        } else {
+            db > sb
+        }
+    });
+    if !ok {
+        return Err(format!("{kind:?} cannot convert {src:?} to {dst:?}"));
+    }
+    Ok(())
+}
+
 fn op(func: &Function, op: &Op, result: Option<Value>) -> Result<(), String> {
     match op {
         Op::Brif(cond, ..) | Op::Trapz(cond) if func.ty(*cond) == Type::I128 => {
@@ -468,6 +499,9 @@ fn op(func: &Function, op: &Op, result: Option<Value>) -> Result<(), String> {
         Op::Select(cond, x, y) => select_check(func, *cond, *x, *y, result),
         Op::Unary(kind, x) => unary(func, *kind, *x, result),
         Op::Binary(kind, x, y) => binary(func, *kind, *x, *y, result),
+        Op::Convert(kind @ (Convert::Uextend | Convert::Sextend | Convert::Ireduce), x) => {
+            check_int_convert(func, *kind, *x, result)
+        }
         Op::Convert(Convert::NarrowSat { .. }, x) => {
             let src = func.ty(*x);
             let Some(dst) = result.map(|r| func.ty(r)) else {
