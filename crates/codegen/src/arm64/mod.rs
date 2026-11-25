@@ -140,16 +140,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let func = split.as_ref().unwrap_or(func);
     let defs = crate::fold::defs(func);
     if full {
-        let dropped = |plan: &crate::alloc::Plan<Reg>| {
-            plan.elided
-                .iter()
-                .chain(&plan.fused)
-                .filter(|&&e| e)
-                .count()
-        };
-        let dropped_before = dropped(&plan);
+        let dropped_before = plan.dropped_count();
         fuse::fuse(func, &mut plan, lse);
-        if dropped(&plan) != dropped_before {
+        if plan.dropped_count() != dropped_before {
             crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| {
                 classify(sig, packing)
             })?;

@@ -5,7 +5,9 @@ mod tail;
 use emit::mark_line;
 pub(crate) use emit::{emit_body, stack_zero_store};
 pub(crate) use shrink::{ShrinkWrap, shrink_wrap};
-pub(crate) use steps::{ArgStep, EdgeScratch, Step, arg_steps, edge_steps, reg_steps, same_home};
+pub(crate) use steps::{
+    ArgStep, EdgeScratch, Step, arg_steps, edge_steps, loc_targets, reg_steps, same_home,
+};
 pub(crate) use tail::{find_tail_calls, is_tail, needs_frame_without_tails};
 
 use crate::alloc::{Location, Plan, Regs};

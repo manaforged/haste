@@ -201,16 +201,8 @@ pub(in crate::x64) fn unwrap_shift_mask(
         return y;
     };
     let mask = u64::from(bits - 1);
-    let const_val = |v: Value| {
-        plan.const_of(v).or_else(|| {
-            defs[v.index()].and_then(|i| match func.insts[i.index()].op {
-                Op::Const(imm) => Some(imm),
-                _ => None,
-            })
-        })
-    };
     let Some(raw) = [(a, b), (b, a)].into_iter().find_map(|(raw, m)| {
-        let imm = const_val(m)?;
+        let imm = plan.const_or_def(func, |x| defs[x.index()], m)?;
         ((imm as u64 & mask) == mask).then_some(raw)
     }) else {
         return y;
@@ -259,14 +251,9 @@ pub(in crate::x64) fn unwrap_shift_mask(
 
 fn adc_cc_ok(func: &Function, plan: &Plan<Reg>, cc: IntCC, a: Value, b: Value) -> bool {
     func.ty(a).is_small_int()
-        && (matches!(
-            cc,
-            IntCC::UnsignedLessThan
-                | IntCC::UnsignedGreaterThan
-                | IntCC::UnsignedLessThanOrEqual
-                | IntCC::UnsignedGreaterThanOrEqual
-        ) || (matches!(cc, IntCC::Equal | IntCC::NotEqual)
-            && (is_zero_const(func, plan, a) || is_zero_const(func, plan, b))))
+        && (cc.is_unsigned()
+            || (matches!(cc, IntCC::Equal | IntCC::NotEqual)
+                && (is_zero_const(func, plan, a) || is_zero_const(func, plan, b))))
 }
 
 pub(in crate::x64::location) fn adc_parts(

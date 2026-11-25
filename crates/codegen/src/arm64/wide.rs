@@ -319,10 +319,8 @@ impl Emit<'_> {
             }
             _ => {}
         }
-        let alu = match op {
-            Binary::Band => Alu::And,
-            Binary::Bor => Alu::Orr,
-            _ => Alu::Eor,
+        let Some(alu) = super::int::alu_of(op) else {
+            return dst;
         };
         if let Some(bm) = rhs_c.and_then(|v| encode_bitmask_imm(v as u64, true)) {
             self.load_half(high, dst, lhs);
@@ -567,19 +565,6 @@ impl Emit<'_> {
         eq
     }
 
-    fn icmp_order(cc: IntCC) -> (bool, Cond) {
-        match cc {
-            IntCC::SignedLessThan => (false, Cond::Lt),
-            IntCC::SignedGreaterThanOrEqual => (false, Cond::Ge),
-            IntCC::SignedGreaterThan => (true, Cond::Lt),
-            IntCC::SignedLessThanOrEqual => (true, Cond::Ge),
-            IntCC::UnsignedLessThan => (false, Cond::Lo),
-            IntCC::UnsignedGreaterThanOrEqual => (false, Cond::Hs),
-            IntCC::UnsignedGreaterThan => (true, Cond::Lo),
-            _ => (true, Cond::Hs),
-        }
-    }
-
     pub(super) fn wide_icmp(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
         let cond = self.wide_icmp_inner(cc, x, y);
         self.invalidate_spills();
@@ -590,17 +575,14 @@ impl Emit<'_> {
         if matches!(cc, IntCC::Equal | IntCC::NotEqual) {
             return self.wide_icmp_eq(cc, x, y);
         }
-        let (swap, cond) = Self::icmp_order(cc);
+        let (swap, base_cc) = cc.ordered();
         let (a, b) = if swap { (y, x) } else { (x, y) };
         let (ca, cb) = (self.known_halves(a), self.known_halves(b));
         if ca.1 == Some(0) && cb.1 == Some(0) {
             self.cmp64(false, a, (b, cb.0));
-            return match cond {
-                Cond::Lt => Cond::Lo,
-                Cond::Ge => Cond::Hs,
-                _ => cond,
-            };
+            return super::int::cond(base_cc.as_unsigned());
         }
+        let cond = super::int::cond(base_cc);
         if cb.0 == Some(0) {
             self.cmp64(true, a, (b, cb.1));
             return cond;

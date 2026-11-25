@@ -25,20 +25,6 @@ pub(super) fn cond(cc: IntCC) -> Cond {
     }
 }
 
-pub(super) fn swap_cond(c: Cond) -> Cond {
-    match c {
-        Cond::Lt => Cond::Gt,
-        Cond::Le => Cond::Ge,
-        Cond::Gt => Cond::Lt,
-        Cond::Ge => Cond::Le,
-        Cond::Lo => Cond::Hi,
-        Cond::Ls => Cond::Hs,
-        Cond::Hi => Cond::Lo,
-        Cond::Hs => Cond::Ls,
-        other => other,
-    }
-}
-
 pub(super) fn alu_of(op: Binary) -> Option<Alu> {
     match op {
         Binary::Iadd => Some(Alu::Add),

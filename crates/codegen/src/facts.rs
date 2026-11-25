@@ -98,21 +98,10 @@ impl Fact {
     }
 }
 
-/// The unsigned comparison that agrees with `cc` on operands below the sign bit.
-pub(super) fn as_unsigned(cc: IntCC) -> IntCC {
-    match cc {
-        IntCC::SignedLessThan => IntCC::UnsignedLessThan,
-        IntCC::SignedGreaterThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
-        IntCC::SignedGreaterThan => IntCC::UnsignedGreaterThan,
-        IntCC::SignedLessThanOrEqual => IntCC::UnsignedLessThanOrEqual,
-        other => other,
-    }
-}
-
 /// `cc` as the unsigned order that agrees with it on `x` and `y`: itself when unsigned, its unsigned twin when both sit below the sign bit of `ty`.
 pub(super) fn unsigned_order(cc: IntCC, ty: Type, x: &Fact, y: &Fact) -> Option<IntCC> {
     match cc.is_signed() {
-        true if x.non_negative(ty) && y.non_negative(ty) => Some(as_unsigned(cc)),
+        true if x.non_negative(ty) && y.non_negative(ty) => Some(cc.as_unsigned()),
         true => None,
         false => Some(cc),
     }

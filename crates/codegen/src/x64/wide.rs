@@ -19,19 +19,6 @@ fn half((lo, hi): (Option<i64>, Option<i64>), high: bool) -> Option<i64> {
     if high { hi } else { lo }
 }
 
-fn icmp_order(cc: IntCC) -> (bool, Cond) {
-    match cc {
-        IntCC::SignedLessThan => (false, Cond::L),
-        IntCC::SignedGreaterThanOrEqual => (false, Cond::Ge),
-        IntCC::SignedGreaterThan => (true, Cond::L),
-        IntCC::SignedLessThanOrEqual => (true, Cond::Ge),
-        IntCC::UnsignedLessThan => (false, Cond::B),
-        IntCC::UnsignedGreaterThanOrEqual => (false, Cond::Ae),
-        IntCC::UnsignedGreaterThan => (true, Cond::B),
-        _ => (true, Cond::Ae),
-    }
-}
-
 impl WideCtx<Reg> for Emit<'_> {
     fn wide_ctx(&self) -> (&Function, &Plan<Reg>, &[Option<Inst>]) {
         (self.func, &self.plan, &self.defs)
@@ -310,12 +297,9 @@ impl Emit<'_> {
             _ => {}
         }
         self.load_half(high, reg, lhs);
-        let alu = match op {
-            Binary::Band => Alu::And,
-            Binary::Bor => Alu::Or,
-            _ => Alu::Xor,
-        };
-        self.alu_rhs_half(alu, (high, reg), (rhs, rhs_c));
+        if let Some(alu) = super::int::alu_of(op) {
+            self.alu_rhs_half(alu, (high, reg), (rhs, rhs_c));
+        }
     }
 
     fn wide_shift_const(&mut self, op: Binary, k: u8) {
@@ -596,11 +580,11 @@ impl Emit<'_> {
         if matches!(cc, IntCC::Equal | IntCC::NotEqual) {
             return self.wide_icmp_eq(cc, x, y);
         }
-        let (swap, cond) = icmp_order(cc);
+        let (swap, base_cc) = cc.ordered();
         let (a, b) = if swap { (y, x) } else { (x, y) };
         let (ca, cb) = (self.known_halves(a), self.known_halves(b));
-        if ca == (Some(0), Some(0)) && matches!(cond, Cond::B | Cond::Ae) {
-            let eq = if cond == Cond::B {
+        if ca == (Some(0), Some(0)) && base_cc.is_unsigned() {
+            let eq = if base_cc == IntCC::UnsignedLessThan {
                 IntCC::NotEqual
             } else {
                 IntCC::Equal
@@ -610,12 +594,9 @@ impl Emit<'_> {
         if ca.1 == Some(0) && cb.1 == Some(0) {
             self.load_half(false, Reg::Rax, a);
             self.alu_rhs_half(Alu::Cmp, (false, Reg::Rax), (b, cb.0));
-            return match cond {
-                Cond::L => Cond::B,
-                Cond::Ge => Cond::Ae,
-                other => other,
-            };
+            return super::int::cond(base_cc.as_unsigned());
         }
+        let cond = super::int::cond(base_cc);
         if cb.0 == Some(0) {
             self.load_half(true, Reg::Rdx, a);
             self.alu_rhs_half(Alu::Cmp, (true, Reg::Rdx), (b, cb.1));

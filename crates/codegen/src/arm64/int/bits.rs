@@ -1,6 +1,6 @@
 use super::super::asm::{Alu, Cond, Reg, Size, ZR};
 use super::super::fuse::{Bfx, unwrap_elided_tst};
-use super::{A, C, Emit, add_imm_parts, cond, encode_bitmask_imm, swap_cond};
+use super::{A, C, Emit, add_imm_parts, cond, encode_bitmask_imm};
 use crate::alloc::{Location, Plan};
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, Function, IntCC, Op, Type, Value};
@@ -84,7 +84,7 @@ impl Emit<'_> {
     ) -> Option<Cond> {
         let (val, raw, c) = match (self.plan.const_of(y), self.plan.const_of(x)) {
             (Some(raw), _) => (x, raw, cond(cc)),
-            (None, Some(raw)) => (y, raw, swap_cond(cond(cc))),
+            (None, Some(raw)) => (y, raw, cond(cc.swapped())),
             (None, None) => return None,
         };
         if self.plan.elided[val.index()] {
@@ -173,7 +173,7 @@ impl Emit<'_> {
         }
         self.last_cmp = None;
         Some(if swapped {
-            swap_cond(cond(cc))
+            cond(cc.swapped())
         } else {
             cond(cc)
         })
@@ -247,7 +247,7 @@ impl Emit<'_> {
                 self.plan
                     .const_of(a)
                     .and_then(|v| ccmp_imm_parts(ty, cc, v))
-                    .map(|p| (b, p, swap_cond(cond(cc))))
+                    .map(|p| (b, p, cond(cc.swapped())))
             });
         let out = imm_pick.map_or_else(|| cond(cc), |(_, _, c)| c);
         let nzcv = nzcv_for_false(if is_or { out.invert() } else { out });

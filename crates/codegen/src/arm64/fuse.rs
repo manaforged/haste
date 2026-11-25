@@ -41,11 +41,7 @@ pub(super) fn const_of(
     val: Value,
     def: impl Fn(Value) -> Option<Inst>,
 ) -> Option<i64> {
-    plan.const_of(val)
-        .or_else(|| match func.insts[def(val)?.index()].op {
-            Op::Const(imm) => Some(imm),
-            _ => None,
-        })
+    plan.const_or_def(func, def, val)
 }
 
 pub(super) fn elided_or_deferred(plan: &Plan<Reg>, data: &crate::ir::InstData) -> bool {

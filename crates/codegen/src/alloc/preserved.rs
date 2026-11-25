@@ -1,7 +1,22 @@
-use crate::ir::{Function, Op, Value};
+use crate::ir::{Function, Inst, Op, Value};
 use crate::reloc::{FRAME_CACHE_LIMIT, RuntimeSymbol};
 
-use super::{CallTarget, Location, Regs};
+use super::{CallTarget, Location, Plan, Regs};
+
+/// Resolves the TLS cell symbol for `slot`, falling back to `lookup` when zero.
+pub(crate) fn thread_cell_target<R: Copy>(
+    func: &Function,
+    plan: &Plan<R>,
+    defs: &[Option<Inst>],
+    slot: Value,
+    lookup: u32,
+) -> Option<u32> {
+    match defs[slot.index()].map(|inst| &func.insts[inst.index()].op) {
+        Some(&Op::Symbol(slot_sym)) => Some(slot_sym),
+        _ if plan.const_of(slot) == Some(0) => Some(lookup),
+        _ => None,
+    }
+}
 
 /// Returns `(lookup, [slot, size, init])` when a non-try `ThreadCell` call has static arguments eligible for inline TLS with register-preserving cold miss stub.
 pub(crate) fn cold_thread_cell<R>(

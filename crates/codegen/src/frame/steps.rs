@@ -221,3 +221,22 @@ pub(crate) fn arg_steps<T: Copy + PartialEq>(
     steps.extend(loads.into_iter().map(|(val, dst)| ArgStep::Load(val, dst)));
     steps
 }
+
+/// Splits ABI argument/return locations into float registers, integer registers, and wide pairs.
+pub(crate) fn loc_targets<R: Copy>(
+    values: &[Value],
+    locs: &[super::Loc<R>],
+) -> (Vec<(Value, u8)>, Vec<(Value, R)>, Vec<(Value, R, R)>) {
+    let mut floats = Vec::new();
+    let mut ints = Vec::new();
+    let mut pairs = Vec::new();
+    for (&val, &loc) in values.iter().zip(locs) {
+        match loc {
+            super::Loc::Float(f) => floats.push((val, f)),
+            super::Loc::Int(r) => ints.push((val, r)),
+            super::Loc::Pair(low, high) => pairs.push((val, low, high)),
+            super::Loc::Stack(_) | super::Loc::Struct(..) => {}
+        }
+    }
+    (floats, ints, pairs)
+}

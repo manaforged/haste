@@ -7,7 +7,7 @@ use crate::alloc::{Location, Plan};
 use crate::emit::{Backend, Tails, emit_goto};
 use crate::frame::{
     ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, ShrinkWrap, Step, arg_steps, edge_steps,
-    reg_steps,
+    loc_targets, reg_steps,
 };
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, IntCC, Op, SigRef, Value};
 use crate::park::ParkReg;
@@ -216,31 +216,10 @@ impl Emit<'_> {
         locs: &[Loc],
         extra: Option<(Value, Reg)>,
     ) {
-        let float_targets: Vec<(Value, u8)> = values
-            .iter()
-            .zip(locs)
-            .filter_map(|(&val, &loc)| {
-                if let Loc::Float(v) = loc {
-                    Some((val, v))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let (float_targets, mut int_targets, pair_targets) = loc_targets(values, locs);
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
             self.emit_float_arg_step(step, true);
         }
-        let mut int_targets: Vec<(Value, Reg)> = values
-            .iter()
-            .zip(locs)
-            .filter_map(|(&val, &loc)| {
-                if let Loc::Int(reg) = loc {
-                    Some((val, reg))
-                } else {
-                    None
-                }
-            })
-            .collect();
         int_targets.extend(extra);
         for step in arg_steps(&int_targets, |v| self.plan.reg_of(v)) {
             match step {
@@ -259,11 +238,9 @@ impl Emit<'_> {
                 ArgStep::Load(val, dst) => self.raw(dst, val),
             }
         }
-        for (&val, &loc) in values.iter().zip(locs) {
-            if let Loc::Pair(low, high) = loc {
-                self.raw(low, val);
-                self.high(high, val);
-            }
+        for (val, low, high) in pair_targets {
+            self.raw(low, val);
+            self.high(high, val);
         }
     }
 

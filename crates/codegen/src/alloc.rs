@@ -12,7 +12,8 @@ pub(crate) mod walk;
 pub(crate) use addr::{atomic_elidable_addrs, iadd_sub_const};
 pub(crate) use hints::{rcpc2_atomic_site, rcpc2_delta_fits};
 pub(crate) use preserved::{
-    cold_cached_frame, cold_thread_cell, is_preserved_call_op, used_preserved_leaf_regs,
+    cold_cached_frame, cold_thread_cell, is_preserved_call_op, thread_cell_target,
+    used_preserved_leaf_regs,
 };
 pub(crate) use setup::BASE_WEIGHT;
 
@@ -573,6 +574,29 @@ impl<R: Copy> Plan<R> {
         } else {
             None
         }
+    }
+
+    /// Returns the immediate value of `value` from its allocated location or defining `Const`.
+    pub(crate) fn const_or_def(
+        &self,
+        func: &Function,
+        def: impl FnOnce(Value) -> Option<Inst>,
+        value: Value,
+    ) -> Option<i64> {
+        self.const_of(value)
+            .or_else(|| match func.insts[def(value)?.index()].op {
+                Op::Const(imm) => Some(imm),
+                _ => None,
+            })
+    }
+
+    /// Number of values eliminated from register allocation by elision or fusion.
+    pub(crate) fn dropped_count(&self) -> usize {
+        self.elided
+            .iter()
+            .chain(&self.fused)
+            .filter(|&&e| e)
+            .count()
     }
 }
 
