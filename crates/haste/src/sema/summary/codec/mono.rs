@@ -141,7 +141,7 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
 
     fn write_verdict(&mut self, out: &mut Vec<u8>, kind: &SummaryKind) -> Option<()> {
         match kind {
-            SummaryKind::Poly(_) | SummaryKind::BorrowError(_) => return None,
+            SummaryKind::Poly(_) | SummaryKind::Error(_) => return None,
             SummaryKind::MonomorphicFallback => out.push(0),
             SummaryKind::MonomorphicHints(hints) => {
                 out.push(1);

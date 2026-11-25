@@ -101,11 +101,134 @@ impl<'a> Infer<'_, 'a> {
             Ok((value & mask(int.0), int))
         });
         match (folded, width) {
+            (Err(error), _) if evaluate::is_const_arithmetic_error(&error) => Err(error),
             (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => {
                 let interned = self.cx.types.intern_substs(substs);
                 self.run_instance(&(item, interned), int, error)
             }
             (found, _) => found,
+        }
+    }
+
+    pub(super) fn check_const_body_overflow(&mut self, item: ItemRef) -> Result<()> {
+        if !matches!(
+            self.cx.item(item).1.kind,
+            ItemKind::Const | ItemKind::Static
+        ) {
+            return Ok(());
+        }
+        let Some(root) = self.body.root else {
+            return Ok(());
+        };
+        let body = self.body;
+        self.check_const_expr_overflow(body, root)
+    }
+
+    fn check_const_expr_overflow(&mut self, arena: &Body, expr: ExprId) -> Result<()> {
+        let want = self
+            .out
+            .exprs
+            .get(expr.0 as usize)
+            .copied()
+            .filter(|&ty| ty != Ty::NONE)
+            .and_then(|ty| self.int_of(self.resolve(ty)));
+        if let Some(int) = want {
+            match self.const_typed(arena, expr, int) {
+                Ok(_) => return Ok(()),
+                Err(err) if evaluate::is_const_arithmetic_error(&err) => {
+                    return Err(self.diag_expr(
+                        crate::diag::DiagnosticKind::Type,
+                        Some(expr),
+                        err.to_string(),
+                        "evaluation of constant value failed",
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        match *arena.expr(expr) {
+            Expr::Paren(inner) | Expr::Unary(_, inner) | Expr::Cast(inner, _) => {
+                self.check_const_expr_overflow(arena, inner)
+            }
+            Expr::Ref { expr: inner, .. } => self.check_const_expr_overflow(arena, inner),
+            Expr::Binary(_, lhs, rhs) => {
+                self.check_const_expr_overflow(arena, lhs)?;
+                self.check_const_expr_overflow(arena, rhs)
+            }
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for &id in arena.list(list) {
+                    self.check_const_expr_overflow(arena, ExprId(id))?;
+                }
+                Ok(())
+            }
+            Expr::Repeat(val, _) => self.check_const_expr_overflow(arena, val),
+            Expr::Struct { fields, base, .. } => {
+                for &id in arena.list(fields) {
+                    self.check_const_expr_overflow(arena, arena.fields[id as usize].value)?;
+                }
+                if let Some(base) = base {
+                    self.check_const_expr_overflow(arena, base)?;
+                }
+                Ok(())
+            }
+            Expr::Call(callee, args) => {
+                self.check_const_expr_overflow(arena, callee)?;
+                for &id in arena.list(args) {
+                    self.check_const_expr_overflow(arena, ExprId(id))?;
+                }
+                Ok(())
+            }
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                self.check_const_expr_overflow(arena, receiver)?;
+                for &id in arena.list(params) {
+                    self.check_const_expr_overflow(arena, ExprId(id))?;
+                }
+                Ok(())
+            }
+            Expr::Block { stmts, tail, .. } => {
+                for &id in arena.list(stmts) {
+                    match arena.stmts[id as usize] {
+                        crate::body::Stmt::Let {
+                            init, otherwise, ..
+                        } => {
+                            if let Some(e) = init {
+                                self.check_const_expr_overflow(arena, e)?;
+                            }
+                            if let Some(e) = otherwise {
+                                self.check_const_expr_overflow(arena, e)?;
+                            }
+                        }
+                        crate::body::Stmt::Expr(e, _) => {
+                            self.check_const_expr_overflow(arena, e)?
+                        }
+                        crate::body::Stmt::Item(..)
+                        | crate::body::Stmt::Macro { .. }
+                        | crate::body::Stmt::Empty => {}
+                    }
+                }
+                if let Some(tail) = tail {
+                    self.check_const_expr_overflow(arena, tail)?;
+                }
+                Ok(())
+            }
+            Expr::If(cond, then, otherwise) => {
+                self.check_const_expr_overflow(arena, cond)?;
+                self.check_const_expr_overflow(arena, then)?;
+                if let Some(alt) = otherwise {
+                    self.check_const_expr_overflow(arena, alt)?;
+                }
+                Ok(())
+            }
+            Expr::Match(scrut, arms) => {
+                self.check_const_expr_overflow(arena, scrut)?;
+                for &id in arena.list(arms) {
+                    self.check_const_expr_overflow(arena, arena.arms[id as usize].body)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -346,6 +469,7 @@ impl<'a> Infer<'_, 'a> {
             return Ok(param);
         }
         let (value, (bits, _)) = match self.const_defaulted(arena, expr, USIZE) {
+            Err(error) if evaluate::is_const_arithmetic_error(&error) => return Err(error),
             Err(error) => self.run_anon(arena, expr, error)?,
             found => found?,
         };

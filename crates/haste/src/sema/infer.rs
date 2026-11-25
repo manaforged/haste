@@ -220,6 +220,9 @@ pub(super) fn infer_after_compiler_made(
     infer.swap_frame(frame);
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
     infer.run(foreign)?;
+    if !foreign {
+        infer.check_const_body_overflow(item)?;
+    }
     let mut typed = infer.finish()?;
     if foreign {
         super::global_asm::bind(cx, item, &mut typed);

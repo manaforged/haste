@@ -21,6 +21,12 @@ impl Infer<'_, '_> {
         }
     }
 
+    pub(in super::super) fn poly_fell_back(&self) -> bool {
+        self.poly
+            .as_ref()
+            .is_none_or(|poly| poly.phase == PolyPhase::Fallback)
+    }
+
     pub(in super::super) fn init_poly_env(&mut self, item: ItemRef) -> Result<()> {
         if self.cx.owner_trait(item).is_some()
             && self.cx.owner_impl(item).is_none()

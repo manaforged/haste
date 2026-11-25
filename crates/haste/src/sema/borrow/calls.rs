@@ -1,5 +1,6 @@
 mod closure;
 mod lifetimes;
+mod return_lt;
 
 use std::sync::Arc;
 
@@ -16,11 +17,12 @@ use super::places::PlaceStep;
 use super::propagate::BorrowSource;
 use super::{Checker, Loan, State, prune_moved_loans};
 
+pub(super) use closure::ActiveClosure;
 pub(super) use lifetimes::{
     Lifetimes, ParamLifetimes, ast_ty_may_carry_elided_lt, callable_param_inputs,
     collect_ty_lifetimes, compute_param_lifetimes, for_each_param_bound_list, lifetime_outlives,
-    pred_matches_name, receiver_has_any_named, sig_returns_only_static, sig_type_params,
-    ty_shares_name,
+    pred_matches_name, receiver_has_any_named, sig_return_named_lifetimes, sig_returns_only_static,
+    sig_type_params, ty_shares_name,
 };
 
 struct ArgListCtx<'a> {

@@ -5,8 +5,8 @@ use crate::names::{Def, ItemRef};
 use crate::outline::item::ItemKind;
 
 use super::super::super::evaluate::{
-    CONST_METHODS, ConstMethod, Int, OVERFLOW_OPS, OverflowOp, convert, fold, int_method,
-    overflowing_op, signed,
+    CONST_METHODS, ConstMethod, Int, OVERFLOW_OPS, OverflowOp, const_arithmetic_error, convert,
+    fold, int_method, is_signed_min, overflowing_op, signed,
 };
 use super::super::super::intrinsic::Intrinsic;
 use super::super::super::ty::{Kind, Ty, int_info, mask};
@@ -248,7 +248,22 @@ impl<'a> Infer<'_, 'a> {
     ) -> Result<(u128, Option<Int>)> {
         let (value, ty) = self.const_eval(arena, inner, want)?;
         let value = match op {
-            UnOp::Neg => value.wrapping_neg(),
+            UnOp::Neg => {
+                if let Some((bits, true)) = ty {
+                    if matches!(arena.expr(inner), Expr::Lit(..)) {
+                        if value > (1_u128 << (bits - 1)) {
+                            return Err(const_arithmetic_error(
+                                "literal out of range for signed integer in a constant",
+                            ));
+                        }
+                    } else if is_signed_min(value, bits) {
+                        return Err(const_arithmetic_error(
+                            "attempt to negate with overflow in a constant",
+                        ));
+                    }
+                }
+                value.wrapping_neg()
+            }
             UnOp::Not => !value,
             UnOp::Deref => bail!("a dereference in a constant"),
         };

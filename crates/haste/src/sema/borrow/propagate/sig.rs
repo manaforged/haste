@@ -262,10 +262,6 @@ impl<'a> Checker<'_, 'a> {
             if !matches_ret {
                 continue;
             }
-            if let AstTy::Ref { .. } = *sig.body.ty(param_ty) {
-                out.extend(self.copied_arg_borrow_sources(ctx.expr, ExprId(arg), state));
-                continue;
-            }
             if sig
                 .generics
                 .iter()
@@ -273,6 +269,10 @@ impl<'a> Checker<'_, 'a> {
                 && ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
             {
                 param_matched_own_generic = true;
+            }
+            if let AstTy::Ref { .. } = *sig.body.ty(param_ty) {
+                out.extend(self.copied_arg_borrow_sources(ctx.expr, ExprId(arg), state));
+                continue;
             }
             out.extend(self.expr_borrow_sources(ExprId(arg), state));
         }
@@ -450,6 +450,23 @@ impl<'a> Checker<'_, 'a> {
                 srcs
             }
         } else {
+            if recv_is_by_ref(sig) {
+                let adj = self.typed.adjusts.get(&ctx.expr);
+                let mut pointee = self.expr_ty(recv);
+                for _ in 0..adj.map_or(0, |a| a.derefs) {
+                    if let Kind::Ref(_, inner) = *self.cx.types.kind(pointee) {
+                        pointee = inner;
+                    }
+                }
+                if adj.and_then(|a| a.autoref).is_none()
+                    && let Kind::Ref(_, inner) = *self.cx.types.kind(pointee)
+                {
+                    pointee = inner;
+                }
+                if self.ty_is_borrow_free(pointee) {
+                    return Vec::new();
+                }
+            }
             self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None)
         }
     }
@@ -494,7 +511,17 @@ impl<'a> Checker<'_, 'a> {
             .filter(|s| {
                 let held_by_other = state_holds_other_target(&targets, s.target, state);
                 if self.is_non_static_param(s.target) {
-                    return !held_by_other && self.can_unwrap_inner_static_param(s, call_ty, false);
+                    if held_by_other {
+                        return false;
+                    }
+                    if !unwrap
+                        && Some(s.target) == root
+                        && let Kind::Ref(_, pointee) = *self.cx.types.kind(self.local_ty(s.target))
+                        && self.ty_is_borrow_free(pointee)
+                    {
+                        return true;
+                    }
+                    return self.can_unwrap_inner_static_param(s, call_ty, false);
                 }
                 if checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
                     return true;

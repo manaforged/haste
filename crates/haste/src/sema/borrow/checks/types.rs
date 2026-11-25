@@ -16,6 +16,13 @@ impl Checker<'_, '_> {
         self.ty_holds_borrow_inner(ty, &mut seen)
     }
 
+    pub(in super::super) fn ty_is_borrow_free(&mut self, ty: Ty) -> bool {
+        ty != Ty::NONE
+            && !self.cx.types.has_params(ty)
+            && !self.cx.types.has_projs(ty)
+            && !self.ty_holds_borrow(ty)
+    }
+
     fn ty_holds_borrow_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
         if ty == Ty::NONE || !seen.insert(ty) {
             return false;

@@ -60,35 +60,53 @@ pub(in crate::sema) fn build_poly_summary(
     {
         return SummaryKind::MonomorphicFallback;
     }
+    let is_user = !cx.outline.is_fixed(item.krate);
     let src = cx.body_src(item);
     let mut infer = Infer::start(cx, (&body, &sig, src), home);
     if infer.init_poly_for_item(item, param_count).is_err() {
         return SummaryKind::MonomorphicFallback;
     }
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
-    if infer.run(false).is_err() {
-        return fallback_kind(
-            infer
-                .poly
-                .take()
-                .map(|poly| poly.method_traits)
-                .unwrap_or_default(),
-        );
+    if let Err(err) = infer.run(false) {
+        let fell_back = infer.poly_fell_back();
+        let hints = infer
+            .poly
+            .take()
+            .map(|poly| poly.method_traits)
+            .unwrap_or_default();
+        drop(infer);
+        if is_user && !fell_back {
+            return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
+        }
+        return fallback_kind(hints);
+    }
+    if is_user
+        && !infer.poly_fell_back()
+        && let Err(err) = infer.check_const_body_overflow(item)
+    {
+        drop(infer);
+        return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
     }
     let pre_hints = infer
         .poly
         .as_ref()
         .map(|poly| poly.method_traits.clone())
         .unwrap_or_default();
-    let Ok((mut typed, poly, clean)) = infer.finish_poly() else {
-        return fallback_kind(pre_hints);
+    let (mut typed, poly, clean) = match infer.finish_poly() {
+        Ok(ok) => ok,
+        Err((err, fell_back)) => {
+            if is_user && !fell_back {
+                return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
+            }
+            return fallback_kind(pre_hints);
+        }
     };
     if cx.quiet_mark() != before
         || (!typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err())
     {
         return fallback_kind(poly.map(|poly| poly.method_traits).unwrap_or(pre_hints));
     }
-    if !cx.outline.is_fixed(item.krate)
+    if is_user
         && clean
         && poly
             .as_ref()
@@ -96,7 +114,7 @@ pub(in crate::sema) fn build_poly_summary(
         && matches!(typed.shape, super::Shape::Body)
         && let Err(err) = super::super::borrow::check(cx, item, (&body, &sig), src, &typed)
     {
-        return SummaryKind::BorrowError(crate::diag::format_error(cx.name(item), &err));
+        return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
     }
     finalize_summary(cx, typed, poly, clean, param_count)
 }

@@ -637,6 +637,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     pub(super) fn const_item(&mut self, item: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
+        self.bind_bounds(item, &outer)?;
         let ty = self.fn_types(item, &outer)?.1;
         Ok((ty, Res::fn_of(&self.cx.types, item, &outer)))
     }

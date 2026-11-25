@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::{GenericKind, Signature};
 use crate::body::{Args, Bound, Expr, ExprId, List, Ty as AstTy, TyId};
@@ -78,6 +79,7 @@ pub(in super::super) struct ClosureEffects {
     pub(in super::super) outer_loans: Vec<(u32, BorrowSource)>,
     pub(in super::super) param_loans: Vec<ClosureParamLoan>,
     pub(in super::super) ret_params: Vec<usize>,
+    pub(in super::super) ret_targets: Option<(HashSet<u32>, HashSet<u32>)>,
 }
 
 impl Checker<'_, '_> {
@@ -606,7 +608,7 @@ impl Checker<'_, '_> {
         body_state: &State,
         state: &mut State,
         (moves_capture, mutates_capture, borrows_local): (bool, bool, bool),
-        ret_params: Vec<usize>,
+        (ret_params, ret_targets): (Vec<usize>, Option<(HashSet<u32>, HashSet<u32>)>),
     ) {
         let mut outer_loans = Vec::new();
         let mut param_loans = Vec::new();
@@ -675,6 +677,7 @@ impl Checker<'_, '_> {
                 outer_loans,
                 param_loans,
                 ret_params,
+                ret_targets,
             },
         );
     }

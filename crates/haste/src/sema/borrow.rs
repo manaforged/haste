@@ -20,6 +20,7 @@ use super::Context;
 use super::infer::Typed;
 use super::ty::{Kind, Mut, Ty};
 
+use calls::ActiveClosure;
 use places::{PlaceStep, steps_conflict};
 use propagate::{BorrowSource, TupleSources};
 
@@ -143,11 +144,6 @@ struct BreakFrame {
     sources: Vec<BorrowSource>,
 }
 
-struct ActiveClosure {
-    params: Vec<u32>,
-    ret_params: Vec<usize>,
-}
-
 struct Checker<'c, 'a> {
     cx: &'c mut Context<'a>,
     item: ItemRef,
@@ -162,7 +158,8 @@ struct Checker<'c, 'a> {
     no_move_captures: Vec<(u32, Vec<PlaceStep>)>,
     returns_borrow: bool,
     returns_only_static: bool,
-    param_lts: calls::ParamLifetimes<'c>,
+    ret_named_lts: Vec<&'c str>,
+    param_lts: calls::ParamLifetimes,
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
@@ -296,12 +293,18 @@ pub(super) fn check(
             }
         }
     }
-    let returns_only_static = !sig.is_async
-        && sig.ret.is_some_and(|ret_ast| {
-            let mut ret_lts = calls::Lifetimes::default();
-            calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
-            calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts)
-        });
+    let (returns_only_static, ret_named_lts) = if !sig.is_async
+        && let Some(ret_ast) = sig.ret
+    {
+        let mut ret_lts = calls::Lifetimes::default();
+        calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
+        (
+            calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts),
+            calls::sig_return_named_lifetimes(sig, src, ret_ast, &ret_lts),
+        )
+    } else {
+        (false, Vec::new())
+    };
     let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
     let mut checker = Checker {
         cx,
@@ -317,6 +320,7 @@ pub(super) fn check(
         no_move_captures: Vec::new(),
         returns_borrow: false,
         returns_only_static,
+        ret_named_lts,
         param_lts,
         return_min_depth: 1,
         closure_depth: 0,
@@ -671,7 +675,8 @@ impl Checker<'_, '_> {
             }
             _ => {
                 let sources = self.expr_borrow_sources(expr, state);
-                self.check_return_sources(expr, &sources)
+                self.check_return_sources(expr, &sources)?;
+                self.check_return_tuple_named_lt(expr, state)
             }
         }
     }
@@ -695,6 +700,11 @@ impl Checker<'_, '_> {
                     && !active.ret_params.contains(&idx)
                 {
                     active.ret_params.push(idx);
+                }
+                if src.origin_only {
+                    active.ret_orig.insert(src.target);
+                } else {
+                    active.ret_real.insert(src.target);
                 }
             }
         }
@@ -720,6 +730,7 @@ impl Checker<'_, '_> {
                     ),
                 ));
             }
+            self.check_return_named_lt(expr, src)?;
         }
         Ok(())
     }

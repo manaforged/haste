@@ -277,7 +277,16 @@ impl Infer<'_, '_> {
                 Kind::Adt(..) => self
                     .overloaded_deref(ty, mutability)?
                     .map(|(res, target)| (target, Some(res))),
-                Kind::Param(_) | Kind::Proj(_) => {
+                Kind::Param(_) => {
+                    let found = self
+                        .overloaded_deref(ty, mutability)?
+                        .map(|(res, target)| (target, Some(res)));
+                    if found.is_some() {
+                        self.poly_fallback();
+                    }
+                    found
+                }
+                Kind::Proj(_) => {
                     self.poly_fallback();
                     self.overloaded_deref(ty, mutability)?
                         .map(|(res, target)| (target, Some(res)))

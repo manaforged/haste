@@ -8,7 +8,14 @@ use crate::sema::ty::{Kind, Ty};
 use super::super::bind::push_loan;
 use super::super::places::{FieldKey, PlaceStep};
 use super::super::propagate::{BorrowSource, dedup_sources};
-use super::super::{ActiveClosure, Checker, Loan, State};
+use super::super::{Checker, Loan, State};
+
+pub(in super::super) struct ActiveClosure {
+    pub(in super::super) params: Vec<u32>,
+    pub(in super::super) ret_params: Vec<usize>,
+    pub(in super::super) ret_real: HashSet<u32>,
+    pub(in super::super) ret_orig: HashSet<u32>,
+}
 
 impl Checker<'_, '_> {
     pub(in super::super) fn check_closure(
@@ -90,6 +97,8 @@ impl Checker<'_, '_> {
         self.active_closures.push(ActiveClosure {
             params: closure.params.clone(),
             ret_params: Vec::new(),
+            ret_real: HashSet::default(),
+            ret_orig: HashSet::default(),
         });
         let init_moved = body_state.moved.clone();
         let init_partial = body_state.partial_moves.clone();
@@ -147,8 +156,8 @@ impl Checker<'_, '_> {
             super::super::checks::is_temp_target(s.target).is_some()
                 || !self.from_caller(s.target, s.through_ref)
         });
-        let ret_params = if let Some((_, inner_caps)) = async_inner {
-            closure
+        let (ret_params, ret_targets) = if let Some((_, inner_caps)) = async_inner {
+            let params = closure
                 .params
                 .iter()
                 .enumerate()
@@ -159,9 +168,13 @@ impl Checker<'_, '_> {
                             .is_some_and(|bs| inner_caps.iter().any(|c| bs.contains(c)))
                 })
                 .map(|(i, _)| i)
-                .collect()
+                .collect();
+            (params, None)
+        } else if let Some(a) = active {
+            let targets = (!closure.coroutine).then_some((a.ret_real, a.ret_orig));
+            (a.ret_params, targets)
         } else {
-            active.map(|a| a.ret_params).unwrap_or_default()
+            (Vec::new(), None)
         };
         self.record_closure_body_loans(
             expr,
@@ -170,7 +183,7 @@ impl Checker<'_, '_> {
             &body_state,
             state,
             (moves_capture, mutates_capture, borrows_local),
-            ret_params,
+            (ret_params, ret_targets),
         );
         Ok(())
     }
@@ -373,6 +386,13 @@ impl Checker<'_, '_> {
     ) -> Option<(HashSet<u32>, HashSet<u32>)> {
         if !self.ty_holds_borrow(ret_ty) {
             return Some((HashSet::default(), HashSet::default()));
+        }
+        if let Some(ret_targets) = self
+            .closure_effects
+            .get(&expr)
+            .and_then(|eff| eff.ret_targets.as_ref())
+        {
+            return Some(ret_targets.clone());
         }
         let Expr::Closure { body, .. } = *self.body.expr(expr) else {
             return None;
