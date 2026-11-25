@@ -3,7 +3,7 @@ mod local;
 
 use anyhow::Result;
 
-use crate::body::{Expr, ExprId, List, Pat, PatId};
+use crate::body::{BlockKind, Expr, ExprId, List, Pat, PatId};
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -423,7 +423,7 @@ impl Checker<'_, '_> {
     }
 
     fn apply_pat_derefs(
-        &self,
+        &mut self,
         pat: PatId,
         unwrapped_init: Option<ExprId>,
         scrut_place: Option<&Place>,
@@ -437,9 +437,36 @@ impl Checker<'_, '_> {
         }
         let mut crossed_ref = false;
         let mut cur = unwrapped_init.map_or(Ty::NONE, |e| self.expr_ty(e));
+        let mut init_expr = unwrapped_init;
         for _ in 0..derefs {
+            if adjusted_place.is_none()
+                && let Some(e) = init_expr
+                && let Expr::Ref {
+                    mutable,
+                    raw: false,
+                    expr: inner,
+                } = *self.body.expr(e)
+            {
+                crossed_ref = true;
+                init_expr = Some(self.unwrap_parens(inner));
+                if let Some(mut place) = self.root_place(inner) {
+                    if !mutable {
+                        place.behind_shared = true;
+                        place.mut_ref_root = false;
+                    } else if !place.reborrows_shared_field && !place.behind_shared {
+                        place.mut_ref_root = true;
+                    }
+                    adjusted_place = Some(place);
+                }
+                cur = if cur != Ty::NONE {
+                    self.builtin_deref_ty(cur).unwrap_or(Ty::NONE)
+                } else {
+                    Ty::NONE
+                };
+                continue;
+            }
             if let Some(ref mut place) = adjusted_place
-                && let Some(e) = unwrapped_init
+                && let Some(e) = init_expr
                 && self.place_behind_shared_ref(e)
             {
                 mark_place_behind_shared(place);
@@ -531,6 +558,21 @@ impl Checker<'_, '_> {
         }
         expr
     }
+
+    pub(super) fn unwrap_parens_and_empty_blocks(&self, mut expr: ExprId) -> ExprId {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Block {
+                    kind: BlockKind::Plain,
+                    stmts,
+                    tail: Some(tail),
+                    label: None,
+                } if stmts.len == 0 => expr = tail,
+                _ => return expr,
+            }
+        }
+    }
 }
 
 fn mark_place_behind_shared(place: &mut Place) {
@@ -545,7 +587,31 @@ fn reset_local_binding(local: u32, init_val: bool, state: &mut State) {
     state.moved[local as usize] = false;
     state.moved_at[local as usize] = None;
     state.partial_moves.retain(|m| m.local != local);
+    state.set_tuple_sources(local, None);
     clear_rebound_loans(local, state);
+}
+
+impl Loan {
+    pub(super) fn new(
+        target: u32,
+        steps: Vec<PlaceStep>,
+        holder: Option<u32>,
+        mutable: bool,
+        through_ref: bool,
+        site: Option<ExprId>,
+    ) -> Self {
+        Self {
+            target,
+            steps,
+            holder,
+            mutable,
+            through_ref,
+            two_phase: false,
+            env_only: false,
+            origin_only: false,
+            site,
+        }
+    }
 }
 
 pub(super) fn push_loan(loans: &mut Vec<Loan>, loan: Loan) {

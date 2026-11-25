@@ -1,4 +1,5 @@
 mod sig;
+mod tuple;
 
 use rustc_hash::FxHashSet as HashSet;
 
@@ -8,6 +9,8 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::places::{PlaceStep, steps_conflict};
 use super::{Checker, Loan, State};
+
+pub(super) use tuple::TupleSources;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BorrowSource {
@@ -265,7 +268,42 @@ impl Checker<'_, '_> {
         let inner_static_res = self
             .is_ref_ty(base_ty)
             .then(|| (self.expr_ty(expr), is_deref));
-        self.unwrap_outer_container_loans_inner(sources, state, unwrap_temp, inner_static_res)
+        let targets: Vec<u32> = sources.iter().map(|s| s.target).collect();
+        let direct_targets: Vec<u32> = sources
+            .iter()
+            .filter(|s| !s.through_ref)
+            .map(|s| s.target)
+            .collect();
+        let expr_depth = self.ty_max_ref_depth(self.expr_ty(expr));
+        let mut direct_param_out = Vec::new();
+        let mut to_unwrap = Vec::new();
+        for s in sources {
+            let target_ty = self.local_ty(s.target);
+            if is_deref
+                && !s.through_ref
+                && self.is_param_local(s.target)
+                && !self.is_ref_ty(target_ty)
+                && self.ty_holds_borrow(target_ty)
+                && direct_targets.iter().all(|&t| t == s.target)
+                && !state_holds_other_target(&targets, s.target, state)
+                && expr_depth <= self.ty_max_ref_depth(target_ty)
+            {
+                for l in state.loans.iter().filter(|l| l.holder == Some(s.target)) {
+                    direct_param_out.push(BorrowSource::from_loan(l));
+                }
+                direct_param_out.push(self.promote_param_behind_deref(&s, false));
+            } else {
+                to_unwrap.push(s);
+            }
+        }
+        let mut out = self.unwrap_outer_container_loans_inner(
+            to_unwrap,
+            state,
+            unwrap_temp,
+            inner_static_res,
+        );
+        out.extend(direct_param_out);
+        dedup_sources(out)
     }
 
     pub(super) fn origin_source_for(
@@ -314,9 +352,6 @@ impl Checker<'_, '_> {
             if super::checks::is_temp_target(s.target).is_some() {
                 return unwrap_temp;
             }
-            if self.is_closure_param(s.target) {
-                return false;
-            }
             if state_holds_other_target(&targets, s.target, state) {
                 return false;
             }
@@ -324,6 +359,9 @@ impl Checker<'_, '_> {
                 && self.can_unwrap_inner_static_param(s, res_ty, is_deref)
             {
                 return true;
+            }
+            if self.is_closure_param(s.target) || self.is_param_local(s.target) {
+                return false;
             }
             !self.from_caller(s.target, s.through_ref)
                 && self.ty_holds_borrow(self.local_ty(s.target))

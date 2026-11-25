@@ -268,6 +268,9 @@ impl Checker<'_, '_> {
             return Ok(None);
         }
         let recv_is_mut_ref = self.is_mut_ref_ty(self.expr_ty(receiver));
+        if mutability == Mut::Mut {
+            state.set_tuple_sources(p.local, None);
+        }
         let deferred_recv = if mutability == Mut::Mut {
             self.check_can_read_inner(p.local, &p.steps, state, true)?;
             Some((

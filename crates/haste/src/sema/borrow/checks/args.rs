@@ -89,6 +89,9 @@ impl Checker<'_, '_> {
                 }
             }
         }
+        if !all_sources.is_empty() {
+            state.set_tuple_sources(p.local, None);
+        }
         self.propagate_assign_sources(&p, &all_sources, state)
     }
 

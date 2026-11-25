@@ -91,6 +91,7 @@ impl Checker<'_, '_> {
             union_prefix.is_empty(),
         )?;
         self.check_assign_escape(&p, sources, state)?;
+        state.set_tuple_sources(p.local, None);
         if !p.through_ref && !p.through_deref && (p.local as usize) < state.init.len() {
             if union_prefix.is_empty() {
                 reset_local_binding(p.local, true, state);
@@ -122,7 +123,10 @@ impl Checker<'_, '_> {
                 state
                     .partial_moves
                     .retain(|m| !(m.local == p.local && steps_conflict(&m.steps, union_prefix)));
+                self.push_sources_for_local(p.local, sources, self.current_expr, state);
             }
+        } else if !p.through_ref && (p.local as usize) < state.init.len() {
+            self.push_sources_for_local(p.local, sources, self.current_expr, state);
         }
         Ok(())
     }

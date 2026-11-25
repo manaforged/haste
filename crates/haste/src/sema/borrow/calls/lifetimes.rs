@@ -267,7 +267,7 @@ fn record_param_ty<'s>(
         || has_unbounded_type_param(sig, src, &lts);
     info.named_lts[slot] = lts.named;
     if let AstTy::Ref { ty: inner, .. } = *sig.body.ty(ty) {
-        info.inner_is_static[slot] = ast_ty_is_provably_static(sig, src, inner, impl_has_lt);
+        info.inner_is_static[slot] = ast_ty_is_provably_static(sig, src, inner);
     }
 }
 
@@ -375,29 +375,23 @@ fn param_ty_is_static(
     !has_unbounded_type_param(sig, src, lts)
 }
 
-fn ast_ty_is_provably_static(
-    sig: &crate::body::sig::Signature,
-    src: &Source,
-    ty: TyId,
-    impl_has_lt: bool,
-) -> bool {
+fn ast_ty_is_provably_static(sig: &crate::body::sig::Signature, src: &Source, ty: TyId) -> bool {
     match *sig.body.ty(ty) {
         AstTy::Never | AstTy::Ptr { .. } => true,
         AstTy::Paren(t) | AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Pat(t, _) => {
-            ast_ty_is_provably_static(sig, src, t, impl_has_lt)
+            ast_ty_is_provably_static(sig, src, t)
         }
         AstTy::Tuple(list) => sig
             .body
             .list(list)
             .iter()
-            .all(|&t| ast_ty_is_provably_static(sig, src, TyId(t), impl_has_lt)),
+            .all(|&t| ast_ty_is_provably_static(sig, src, TyId(t))),
         AstTy::Ref {
             mutable: false,
             lifetime: Some(lt),
             ty: inner,
         } => {
-            lifetime_is_static(sig, src, src.text(lt))
-                && ast_ty_is_provably_static(sig, src, inner, impl_has_lt)
+            lifetime_is_static(sig, src, src.text(lt)) && ast_ty_is_provably_static(sig, src, inner)
         }
         AstTy::Path(path_id) => {
             let p = sig.body.path(path_id);
@@ -419,7 +413,7 @@ fn ast_ty_is_provably_static(
                     .iter()
                     .all(|&a| match sig.body.args[a as usize] {
                         GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                            ast_ty_is_provably_static(sig, src, t, impl_has_lt)
+                            ast_ty_is_provably_static(sig, src, t)
                         }
                         GenericArg::Lifetime(lt) => lifetime_is_static(sig, src, src.text(lt)),
                         GenericArg::Const(_) => true,

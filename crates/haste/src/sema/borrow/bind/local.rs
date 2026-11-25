@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::body::{Expr, PatId};
 use crate::sema::ty::Mut;
 
-use super::super::places::{PlaceStep, push_step};
+use super::super::places::push_step;
 use super::super::propagate::BorrowSource;
 use super::super::{Checker, State};
 use super::{PatCtx, PatTarget};
@@ -64,6 +64,9 @@ impl Checker<'_, '_> {
                     state,
                 )?;
             }
+            if is_mut {
+                state.set_tuple_sources(full_place.local, None);
+            }
             self.place_to_sources(&full_place, is_mut, state)
         } else {
             let is_ref_init = target.init.is_some_and(|e| {
@@ -105,27 +108,42 @@ impl Checker<'_, '_> {
             self.check_mut_ref_local_move(local, e, state)?;
             let sources = self.expr_borrow_sources_let(e, state);
             self.push_sources_for_local(local, &sources, Some(e), state);
-        } else if !target.fallback_sources.is_empty() {
-            if behind_ref && self.is_copy[local as usize] {
-                let mut inner: Vec<BorrowSource> = target
-                    .fallback_sources
-                    .iter()
-                    .flat_map(|s| {
-                        state
-                            .loans
-                            .iter()
-                            .filter(move |l| l.holder == Some(s.target))
-                            .map(BorrowSource::from_loan)
-                    })
-                    .collect();
-                if inner.is_empty() && self.ty_holds_borrow(self.local_ty(local)) {
-                    for s in target.fallback_sources {
-                        if self.is_closure_param(s.target)
-                            && self.is_ref_ty(self.local_ty(s.target))
+            let ts = self.expr_tuple_sources(e, state, true);
+            state.set_tuple_sources(local, ts);
+        } else {
+            state.set_tuple_sources(local, None);
+            if target.fallback_sources.is_empty() {
+                return Ok(());
+            }
+            if behind_ref
+                && self.is_copy[local as usize]
+                && let Some(place) = target.scrut_place
+            {
+                let local_ty = self.local_ty(local);
+                let holds_borrow = self.ty_holds_borrow(local_ty);
+                let mut inner = Vec::new();
+                for s in target.fallback_sources {
+                    let is_deref_container = (s.target == place.local && !place.through_ref)
+                        || (place.through_ref
+                            && (s.target == place.local
+                                || state.loans.iter().any(|l| {
+                                    l.holder == Some(place.local) && l.target == s.target
+                                })));
+                    if !is_deref_container {
+                        inner.push(s.clone());
+                        continue;
+                    }
+                    for l in state.loans.iter().filter(|l| l.holder == Some(s.target)) {
+                        inner.push(BorrowSource::from_loan(l));
+                    }
+                    if holds_borrow {
+                        let target_ty = self.local_ty(s.target);
+                        let is_cparam = self.is_closure_param(s.target);
+                        if (is_cparam || self.is_non_static_param(s.target))
+                            && self.ty_holds_borrow(target_ty)
+                            && !self.can_unwrap_inner_static_param(s, local_ty, false)
                         {
-                            let mut steps = s.steps.clone();
-                            push_step(&mut steps, PlaceStep::Deref);
-                            inner.push(BorrowSource { steps, ..s.clone() });
+                            inner.push(self.promote_param_behind_deref(s, is_cparam));
                         }
                     }
                 }

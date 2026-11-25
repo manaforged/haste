@@ -115,6 +115,7 @@ impl Checker<'_, '_> {
         }
         if p.through_ref {
             for holder in targets {
+                state.set_tuple_sources(holder, None);
                 if self.ty_holds_borrow(self.local_ty(holder)) {
                     super::bind::push_source_loans_filtered(
                         &mut state.loans,

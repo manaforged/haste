@@ -554,4 +554,161 @@ fn main() {
 }
 "#,
     );
+    check_fails(
+        "static_escape_byref_match_non_ref_param",
+        r#"
+fn leak(x: (&i32,)) -> &'static i32 {
+    match &x {
+        (y,) => *y,
+    }
+}
+fn main() {
+    let l = 9;
+    let _ = leak((&l,));
+}
+"#,
+    );
+    check_fails(
+        "async_closure_early_return_local_escape",
+        r#"
+fn bad() {
+    let _f = async || {
+        let local = 5;
+        if true {
+            return &local;
+        }
+        &0
+    };
+}
+fn main() {
+    bad();
+}
+"#,
+    );
+    check_fails(
+        "closure_non_static_vec_borrow_escape",
+        r#"
+fn main() {
+    let get = |v: &Vec<&u8>| -> &u8 { v[0] };
+    let r;
+    {
+        let local = 1u8;
+        let v = vec![&local];
+        r = get(&v);
+    }
+    println!("{r}");
+}
+"#,
+    );
+    check_fails(
+        "bound_mixed_tuple_mutated_escape",
+        r#"
+fn leak<'a>(s: &'a str, f: impl FnOnce((&'static str, &'a str))) {
+    let mut t = ("lit", s);
+    t.0 = s;
+    f(t);
+}
+fn main() {
+    let local = String::from("dangling");
+    leak(&local, |(a, _)| {
+        let _: &'static str = a;
+    });
+}
+"#,
+    );
+    check_fails(
+        "bound_mixed_tuple_branch_join_escape",
+        r#"
+fn leak<'a>(s: &'a str, c: bool, f: impl FnOnce((&'static str, &'a str))) {
+    let mut t = (s, s);
+    if c {
+        t = ("lit", s);
+    }
+    f(t);
+}
+fn main() {
+    let local = String::from("dangling");
+    leak(&local, false, |(a, _)| {
+        let _: &'static str = a;
+    });
+}
+"#,
+    );
+    check_fails(
+        "bound_mixed_tuple_ref_mut_escape",
+        r#"
+fn leak<'a>(s: &'a str, f: impl FnOnce((&'static str, &'a str))) {
+    let mut t = ("lit", s);
+    let (ref mut a, _) = t;
+    *a = s;
+    f(t);
+}
+fn main() {
+    let local = String::from("dangling");
+    leak(&local, |(a, _)| {
+        let _: &'static str = a;
+    });
+}
+"#,
+    );
+    check_fails(
+        "async_closure_captures_arg_escape",
+        r#"
+fn bad<R>(f: impl FnOnce(&i32) -> R) -> R {
+    let local = 9;
+    f(&local)
+}
+fn main() {
+    let _fut = bad(async |x| *x);
+}
+"#,
+    );
+    check_fails(
+        "closure_fake_static_param_escape",
+        r#"
+fn leak<'a>(s: &'a str) -> &'static str {
+    let c = |p: &&'static str| -> &'static str { *p };
+    c(&s)
+}
+fn main() {
+    let x = String::from("dangling");
+    let r = leak(x.as_str());
+    drop(x);
+    println!("{r}");
+}
+"#,
+    );
+    check_fails(
+        "iter_map_fake_static_param_escape",
+        r#"
+fn main() {
+    let out: Vec<&'static str>;
+    {
+        let local = String::from("dangling");
+        let v = vec![(local.as_str(), 1u8)];
+        out = v.iter().map(|p: &(&'static str, u8)| p.0).collect();
+    }
+    println!("{}", out[0]);
+}
+"#,
+    );
+    check_fails(
+        "byref_match_sibling_static_and_non_static_escape",
+        r#"
+fn leak<'a>(x: &'a (&'a i32,), sp: &'static &'static i32, cond: bool) -> &'static i32 {
+    let tup = (&**sp,);
+    let r = if cond { x } else { &tup };
+    match r {
+        &(y,) => y,
+    }
+}
+fn main() {
+    static N: i32 = 1;
+    static R: &i32 = &N;
+    let local = 9;
+    let t = (&local,);
+    let _ = leak(&t, &R, true);
+}
+"#,
+    );
 }

@@ -1,5 +1,6 @@
 #[path = "../common/mod.rs"]
 mod common;
+mod edge_cases;
 mod lifetimes;
 
 use common::FixtureDir;
@@ -442,6 +443,81 @@ fn main() {
         let _ = (a.len(), b.len(), c.len());
     });
     ok_if_tuple(&local_s, |(a, b)| {
+        let _ = (a.len(), b.len());
+    });
+    fn ok_bound_mixed_tuple<'a>(s: &'a str, f: impl FnOnce((&'static str, &'a str))) {
+        let t = ("lit", s);
+        f(t);
+    }
+    fn ok_bound_nested_tuple<'a>(s: &'a str, f: impl FnOnce(((&'static str, &'a str), &'a str))) {
+        let t = (("lit", s), s);
+        f(t);
+    }
+    ok_bound_mixed_tuple(&local_s, |(a, b)| {
+        let _ = (a.len(), b.len());
+    });
+    ok_bound_nested_tuple(&local_s, |((a, b), c)| {
+        let _ = (a.len(), b.len(), c.len());
+    });
+    let get_static_elem = |v: &Vec<&'static u8>| -> &'static u8 { v[0] };
+    let r_static;
+    {
+        let v = vec![&1u8];
+        r_static = get_static_elem(&v);
+    }
+    let _ = *r_static;
+    let out_static: Vec<&'static str>;
+    {
+        let v = vec![("a", 1u8)];
+        out_static = v.iter().map(|p: &(&'static str, u8)| p.0).collect();
+    }
+    let _ = out_static.len();
+    fn ok_byref_match_tup<'a>(x: (&'a i32,)) -> &'a i32 {
+        match &x {
+            &(y,) => y,
+        }
+    }
+    fn ok_byref_match_nested<'a>(x: (&'a &'a i32,)) -> &'a i32 {
+        match &x {
+            (&y,) => y,
+        }
+    }
+    fn ok_byref_match_ergo<'a>(x: (&'a i32,)) -> &'a i32 {
+        match &x {
+            (y,) => *y,
+        }
+    }
+    let n_ok = 42;
+    let r_ok = &n_ok;
+    let _ = ok_byref_match_tup((&n_ok,));
+    let _ = ok_byref_match_nested((&r_ok,));
+    let _ = ok_byref_match_ergo((&n_ok,));
+
+    fn ok_sync_async_closure<Fut>(f: impl FnOnce(&i32) -> Fut) -> Fut {
+        let local = 9;
+        f(&local)
+    }
+    let _fut = ok_sync_async_closure(|_x: &i32| async move { 42 });
+
+    fn ok_for_loop_reassigned_tuple(mut f: impl FnMut((&&'static str, &'static str))) {
+        static S: &str = "lit";
+        for mut t in [(&S, "lit")] {
+            f(t);
+            let local: &'static str = "a";
+            t = (&local, "lit");
+            let _ = t;
+        }
+    }
+    ok_for_loop_reassigned_tuple(|(a, b)| {
+        let _ = (a.len(), b.len());
+    });
+
+    fn ok_bound_tuple_outer_hrtb<'a>(r: &'a str, f: impl FnOnce((&&'static str, &'a str))) {
+        let s: &'static str = "lit";
+        let t = (&s, r);
+        f(t);
+    }
+    ok_bound_tuple_outer_hrtb(&local_s, |(a, b)| {
         let _ = (a.len(), b.len());
     });
 }

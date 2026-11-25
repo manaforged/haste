@@ -21,7 +21,7 @@ use super::infer::Typed;
 use super::ty::{Kind, Mut, Ty};
 
 use places::{PlaceStep, steps_conflict};
-use propagate::BorrowSource;
+use propagate::{BorrowSource, TupleSources};
 
 const TEMP_HOLDER_BASE: u32 = u32::MAX - 65_536;
 const ITER_HOLDER_BASE: u32 = TEMP_HOLDER_BASE - 65_536;
@@ -38,29 +38,6 @@ pub(super) struct Loan {
     env_only: bool,
     origin_only: bool,
     site: Option<ExprId>,
-}
-
-impl Loan {
-    fn new(
-        target: u32,
-        steps: Vec<PlaceStep>,
-        holder: Option<u32>,
-        mutable: bool,
-        through_ref: bool,
-        site: Option<ExprId>,
-    ) -> Self {
-        Self {
-            target,
-            steps,
-            holder,
-            mutable,
-            through_ref,
-            two_phase: false,
-            env_only: false,
-            origin_only: false,
-            site,
-        }
-    }
 }
 
 impl PartialEq for Loan {
@@ -117,7 +94,45 @@ struct State {
     moved_at: Vec<Option<ExprId>>,
     partial_moves: Vec<PartialMove>,
     loans: Vec<Loan>,
+    tuple_elem_sources: HashMap<u32, TupleSources>,
     diverged: bool,
+}
+
+impl State {
+    fn new(init: Vec<bool>) -> Self {
+        let n = init.len();
+        Self {
+            maybe_init: init.clone(),
+            init,
+            moved: vec![false; n],
+            moved_at: vec![None; n],
+            partial_moves: Vec::new(),
+            loans: Vec::new(),
+            tuple_elem_sources: HashMap::default(),
+            diverged: false,
+        }
+    }
+
+    pub(super) fn for_closure(outer: &Self) -> Self {
+        Self {
+            init: outer.init.clone(),
+            maybe_init: outer.maybe_init.clone(),
+            moved: outer.moved.clone(),
+            moved_at: outer.moved_at.clone(),
+            partial_moves: outer.partial_moves.clone(),
+            loans: Vec::new(),
+            tuple_elem_sources: HashMap::default(),
+            diverged: false,
+        }
+    }
+
+    pub(super) fn set_tuple_sources(&mut self, local: u32, srcs: Option<TupleSources>) {
+        if let Some(ts) = srcs {
+            self.tuple_elem_sources.insert(local, ts);
+        } else {
+            self.tuple_elem_sources.remove(&local);
+        }
+    }
 }
 
 struct BreakFrame {
@@ -334,15 +349,7 @@ pub(super) fn check(
         }
     }
     checker.returns_borrow = typed.ret.is_some_and(|ty| checker.ty_holds_borrow(ty));
-    let mut state = State {
-        maybe_init: init.clone(),
-        init,
-        moved: vec![false; n],
-        moved_at: vec![None; n],
-        partial_moves: Vec::new(),
-        loans: Vec::new(),
-        diverged: false,
-    };
+    let mut state = State::new(init);
     let param_offset = usize::from(sig.receiver.is_some());
     for (idx, &pat) in body.fn_params.iter().enumerate() {
         let fallback = typed
@@ -775,6 +782,8 @@ fn merge_states(dst: &mut State, other: &State) {
             dst.loans.push(l.clone());
         }
     }
+    dst.tuple_elem_sources
+        .retain(|k, ts| other.tuple_elem_sources.get(k).is_some_and(|o| ts.merge(o)));
 }
 
 fn merge_branch(out: &mut State, a: &State, b: &State) {

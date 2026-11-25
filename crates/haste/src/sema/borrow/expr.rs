@@ -242,6 +242,9 @@ impl Checker<'_, '_> {
                     state,
                 )?;
             }
+            if mutable {
+                state.set_tuple_sources(p.local, None);
+            }
         }
         self.check_expr(inner, state, true, outer_live, true, depth)
     }
@@ -262,8 +265,14 @@ impl Checker<'_, '_> {
         if !state.diverged {
             self.check_mut_ref_reborrow(lhs, rhs, state)?;
             let sources = self.expr_borrow_sources(rhs, state);
+            let tuple_srcs = self
+                .expr_plain_local(lhs)
+                .and_then(|l| self.expr_tuple_sources(rhs, state, false).map(|ts| (l, ts)));
             prune_dead_loans(state, &after_rhs);
             self.assign_place(lhs, &sources, state, outer_live, depth)?;
+            if let Some((local, ts)) = tuple_srcs {
+                state.set_tuple_sources(local, Some(ts));
+            }
             prune_moved_loans(state);
         }
         Ok(())
@@ -306,6 +315,7 @@ impl Checker<'_, '_> {
                     state,
                     false,
                 )?;
+                state.set_tuple_sources(p.local, None);
                 if !sources.is_empty() {
                     self.propagate_assign_sources(&p, &sources, state)?;
                 }

@@ -11,7 +11,7 @@ use super::super::calls::{
     sig_returns_only_static, sig_type_params, ty_shares_name,
 };
 use super::super::places::{Place, PlaceStep};
-use super::super::propagate::{BorrowSource, dedup_sources};
+use super::super::propagate::{BorrowSource, TupleSources, dedup_sources};
 use super::super::{Checker, Loan, State, is_temp_holder};
 use super::is_temp_target;
 
@@ -187,12 +187,12 @@ impl Checker<'_, '_> {
         pre_sources: Option<&[BorrowSource]>,
         state: &State,
     ) -> Result<()> {
-        let arg = self.unwrap_parens(expr);
+        let arg = self.unwrap_parens_and_empty_blocks(expr);
         if !req.elems.is_empty() {
             match *self.body.expr(arg) {
                 Expr::Tuple(aexprs) if aexprs.len as usize == req.elems.len() => {
-                    let elems: Vec<u32> = self.body.list(aexprs).to_vec();
-                    for (elem_req, elem_id) in req.elems.iter().zip(elems) {
+                    for (elem_req, elem_id) in req.elems.iter().zip(self.body.list(aexprs).to_vec())
+                    {
                         if let Some(er) = elem_req {
                             self.check_caller_lt_req(ExprId(elem_id), er, None, state)?;
                         }
@@ -203,12 +203,18 @@ impl Checker<'_, '_> {
                     self.check_caller_lt_req(then, req, None, state)?;
                     return self.check_caller_lt_req(alt, req, None, state);
                 }
-                Expr::Block {
-                    stmts,
-                    tail: Some(t),
-                    ..
-                } if stmts.len == 0 => {
-                    return self.check_caller_lt_req(t, req, None, state);
+                Expr::Path(_) => {
+                    if let Some(local) = self.expr_plain_local(arg)
+                        && let Some(ts) = state
+                            .tuple_elem_sources
+                            .get(&local)
+                            .filter(|ts| {
+                                matches!(ts, TupleSources::Tuple(e) if e.len() == req.elems.len())
+                            })
+                            .cloned()
+                    {
+                        return self.check_caller_lt_tuple_sources(arg, req, &ts);
+                    }
                 }
                 _ => {}
             }
@@ -227,6 +233,28 @@ impl Checker<'_, '_> {
             return self.check_caller_lt_sources(arg, sources, req.requires_static, &named);
         }
         self.check_caller_lt_arg(arg, state, req.requires_static, &named)
+    }
+
+    fn check_caller_lt_tuple_sources(
+        &mut self,
+        expr: ExprId,
+        req: &CallerLtReq,
+        ts: &TupleSources,
+    ) -> Result<()> {
+        if !req.elems.is_empty()
+            && let TupleSources::Tuple(elems) = ts
+            && elems.len() == req.elems.len()
+        {
+            for (elem_req, elem_ts) in req.elems.iter().zip(elems) {
+                if let Some(er) = elem_req {
+                    self.check_caller_lt_tuple_sources(expr, er, elem_ts)?;
+                }
+            }
+            return Ok(());
+        }
+        let named: Vec<&str> = req.named_lts.iter().map(String::as_str).collect();
+        let srcs = ts.sources_for(req.outer_hrtb);
+        self.check_caller_lt_sources(expr, &srcs, req.requires_static, &named)
     }
 
     fn param_bound_reqs(&self, sig: &Signature, src: &Source, param_ty: TyId) -> ParamBounds {

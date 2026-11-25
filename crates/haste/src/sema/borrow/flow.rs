@@ -719,7 +719,7 @@ impl Checker<'_, '_> {
                 for id in drop_temps {
                     iter_state.loans.retain(|l| l.holder != Some(id));
                 }
-                retain_non_loop_loans(&mut iter_state.loans, &loop_locals);
+                retain_non_loop_state(&mut iter_state, &loop_locals);
                 if iter_state.diverged {
                     break;
                 }
@@ -748,14 +748,17 @@ impl Checker<'_, '_> {
                 merge_states(state, &bs);
             }
         }
-        retain_non_loop_loans(&mut state.loans, &loop_locals);
+        retain_non_loop_state(state, &loop_locals);
         Ok(())
     }
 }
 
-fn retain_non_loop_loans(loans: &mut Vec<Loan>, loop_locals: &HashSet<u32>) {
+fn retain_non_loop_state(state: &mut State, loop_locals: &HashSet<u32>) {
     let keep = |h| is_temp_holder(Some(h)) || !loop_locals.contains(&h);
-    loans.retain(|l| l.holder.is_none_or(keep));
+    state.loans.retain(|l| l.holder.is_none_or(keep));
+    state
+        .tuple_elem_sources
+        .retain(|k, _| !loop_locals.contains(k));
 }
 
 fn merge_break_states(mut merged: Option<State>, states: Vec<State>) -> Option<State> {
