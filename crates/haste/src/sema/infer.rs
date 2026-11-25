@@ -57,6 +57,7 @@ use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
 use crate::body::{Body, ExprId, PatId};
+use crate::diag::{Diagnostic, DiagnosticKind, Span};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
@@ -157,7 +158,9 @@ pub struct Infer<'c, 'a> {
     local_projections: HashMap<(ItemRef, Ty, Substs, crate::names::Sym, Substs), Option<Ty>>,
     method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
+    body_src: &'a Source,
     current_expr: Option<ExprId>,
+    current_pat: Option<PatId>,
     obligation_sites: HashMap<(ItemRef, Ty), ExprId>,
     captures_settled: bool,
     auto_stack: Vec<(ItemRef, Ty)>,
@@ -376,7 +379,9 @@ impl<'c, 'a> Infer<'c, 'a> {
             local_projections: HashMap::default(),
             method_hints: None,
             poly: None,
+            body_src: src,
             current_expr: None,
+            current_pat: None,
             obligation_sites: HashMap::default(),
             captures_settled: false,
             auto_stack: Vec::new(),
@@ -393,12 +398,12 @@ impl<'c, 'a> Infer<'c, 'a> {
     }
 
     fn diag_span(
-        kind: crate::diag::DiagnosticKind,
-        span: Option<crate::diag::Span>,
+        kind: DiagnosticKind,
+        span: Option<Span>,
         msg: impl Into<String>,
         label: impl Into<String>,
     ) -> anyhow::Error {
-        let mut diag = crate::diag::Diagnostic::new(kind, msg).with_span(span);
+        let mut diag = Diagnostic::new(kind, msg).with_span(span);
         let label = label.into();
         if !label.is_empty() {
             diag = diag.with_primary_label(label);
@@ -408,29 +413,83 @@ impl<'c, 'a> Infer<'c, 'a> {
 
     pub(super) fn diag_expr(
         &self,
-        kind: crate::diag::DiagnosticKind,
+        kind: DiagnosticKind,
         expr: Option<ExprId>,
         msg: impl Into<String>,
         label: impl Into<String>,
     ) -> anyhow::Error {
         let span = expr
             .or(self.current_expr)
-            .and_then(|id| crate::diag::Span::from_expr(self.src, self.body, id));
+            .and_then(|id| Span::from_expr(self.body_src, self.body, id));
         Self::diag_span(kind, span, msg, label)
     }
 
     pub(super) fn diag_tok(
         &self,
-        kind: crate::diag::DiagnosticKind,
+        kind: DiagnosticKind,
         tok: u32,
+        msg: impl Into<String>,
+        label: impl Into<String>,
+    ) -> anyhow::Error {
+        Self::diag_span(kind, Span::from_token(self.body_src, tok), msg, label)
+    }
+
+    pub(super) fn diag_pat(
+        &self,
+        kind: DiagnosticKind,
+        pat: PatId,
         msg: impl Into<String>,
         label: impl Into<String>,
     ) -> anyhow::Error {
         Self::diag_span(
             kind,
-            crate::diag::Span::from_token(self.src, tok),
+            Span::from_pat(self.body_src, self.body, pat),
             msg,
             label,
+        )
+    }
+
+    pub(super) fn diag_arity(
+        &self,
+        expr: Option<ExprId>,
+        want: usize,
+        got: usize,
+    ) -> anyhow::Error {
+        self.diag_expr(
+            DiagnosticKind::Type,
+            expr,
+            format!("call takes {want} arguments, {got} given"),
+            "unexpected number of arguments",
+        )
+    }
+
+    pub(super) fn diag_deref_limit(&self, expr: ExprId, found: Ty) -> anyhow::Error {
+        self.diag_expr(
+            DiagnosticKind::Type,
+            Some(expr),
+            format!(
+                "reached the recursion limit while dereferencing {}",
+                self.show(found)
+            ),
+            "dereference recursion limit exceeded",
+        )
+    }
+
+    pub(super) fn diag_not_callable(&self, expr: ExprId, found: Ty) -> anyhow::Error {
+        self.diag_expr(
+            DiagnosticKind::Type,
+            Some(expr),
+            format!("calling `{}` is not supported", self.show(found)),
+            "call expression requires function",
+        )
+    }
+
+    pub(super) fn diag_unknown_field(&self, tok: u32, item: ItemRef, name: &str) -> anyhow::Error {
+        self.diag_tok(
+            DiagnosticKind::Name,
+            tok,
+            format!("no field `{name}` on `{}`", self.cx.name(item)),
+            "unknown field",
         )
     }
 }

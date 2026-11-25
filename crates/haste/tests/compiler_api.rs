@@ -496,3 +496,87 @@ fn main() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
 }
+
+#[test]
+fn reports_spanned_diagnostics_for_call_op_index_and_pat_errors() {
+    let haste = env!("CARGO_BIN_EXE_haste");
+    let cases = [
+        (
+            "diag-call-arity",
+            "diag_call_arity",
+            "fn f(a: i32, b: i32) -> i32 { a + b }\nfn main() { let _ = f(1); }\n",
+            "error[type]:",
+            "call takes 2 arguments, 1 given",
+        ),
+        (
+            "diag-not-callable",
+            "diag_not_callable",
+            "fn main() { let x = 5i32; let _ = x(); }\n",
+            "error[type]:",
+            "calling `i32` is not supported",
+        ),
+        (
+            "diag-bad-index",
+            "diag_bad_index",
+            "fn main() { let x = 5i32; let _ = x[0]; }\n",
+            "error[type]:",
+            "cannot index",
+        ),
+        (
+            "diag-bad-op",
+            "diag_bad_op",
+            "struct S;\nfn main() { let _ = S + S; }\n",
+            "error[type]:",
+            "unsupported operator",
+        ),
+        (
+            "diag-pat-field",
+            "diag_pat_field",
+            "struct S { a: i32 }\nfn main() { let S { nope } = S { a: 1 }; let _ = nope; }\n",
+            "error[name]:",
+            "no field `nope` on `S`",
+        ),
+        (
+            "diag-or-pat",
+            "diag_or_pat",
+            "enum E { A(i32), B }\nfn main() { match E::B { E::A(x) | E::B => { let _ = x; } } }\n",
+            "error[name]:",
+            "bind different names",
+        ),
+        (
+            "diag-deferred-shift",
+            "diag_deferred_shift",
+            "fn make<T>() -> T { loop {} }\nfn main() { let x = make(); let _ = x << true; let _: i32 = x; }\n",
+            "error[type]:",
+            "unsupported shift",
+        ),
+        (
+            "diag-named-variant-pat",
+            "diag_named_variant_pat",
+            "enum E { A { x: i32 }, B }\nfn main() { match E::B { E::A => {} E::B => {} } }\n",
+            "error[type]:",
+            "expected struct pattern with named fields",
+        ),
+    ];
+    for (dir_name, pkg, src, kind, msg) in cases {
+        let dir = FixtureDir::write_crate("haste-diag", dir_name, pkg, src);
+        let out = Command::new(haste)
+            .args(["build", "--jobs", "1"])
+            .arg(dir.path())
+            .output()
+            .expect("run haste build");
+        assert!(!out.status.success(), "{dir_name} unexpectedly compiled");
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains(kind)
+                && combined.contains(msg)
+                && combined.contains("--> ")
+                && combined.contains('^'),
+            "{dir_name}: expected spanned diagnostic ({kind} / {msg}), got:\n{combined}"
+        );
+    }
+}

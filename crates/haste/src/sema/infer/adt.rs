@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::body::adt::Shape;
 use crate::body::{Body, ExprId, List, PathId};
+use crate::diag::DiagnosticKind;
 use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, Sym, plain};
 use crate::outline::item::ItemKind;
@@ -368,7 +369,24 @@ impl<'a> Infer<'_, 'a> {
         let ty = match shape {
             Shape::Unit => self.cx.types.intern(Kind::Adt(item, args)),
             Shape::Tuple => ctor_fn(self.cx, (item, variant, args)),
-            Shape::Named => bail!("`{}` needs its fields named", self.cx.name(item)),
+            Shape::Named => {
+                let msg = format!("`{}` needs its fields named", self.cx.name(item));
+                return Err(if let Some(pat) = self.current_pat {
+                    self.diag_pat(
+                        DiagnosticKind::Type,
+                        pat,
+                        msg,
+                        "expected struct pattern with named fields",
+                    )
+                } else {
+                    self.diag_expr(
+                        DiagnosticKind::Type,
+                        None,
+                        msg,
+                        "expected struct literal with named fields",
+                    )
+                });
+            }
         };
         Ok((ty, Res::Ctor(item, variant, args)))
     }
@@ -384,7 +402,7 @@ impl<'a> Infer<'_, 'a> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, false)? else {
             return Err(self.diag_expr(
-                crate::diag::DiagnosticKind::Type,
+                DiagnosticKind::Type,
                 Some(expr),
                 "struct literal of something that is not a struct",
                 "not a struct",
@@ -401,12 +419,7 @@ impl<'a> Infer<'_, 'a> {
             let field = body.fields[init as usize];
             let name = plain(self.src.text(field.name));
             let Some(index) = self.field_index(item, variant, name)? else {
-                return Err(self.diag_tok(
-                    crate::diag::DiagnosticKind::Name,
-                    field.name,
-                    format!("no field `{name}` on `{}`", self.cx.name(item)),
-                    "unknown field",
-                ));
+                return Err(self.diag_unknown_field(field.name, item, name));
             };
             self.check_field_visible(item, index, Some(expr), Some(field.name), name)?;
             seen_fields[index as usize] = true;
@@ -542,7 +555,7 @@ impl<'a> Infer<'_, 'a> {
         let ty = self.field_base(expr, found, name)?;
         let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else {
             return Err(self.diag_expr(
-                crate::diag::DiagnosticKind::Name,
+                DiagnosticKind::Name,
                 Some(expr),
                 format!("no field `{name}` on type `{}`", self.show(ty)),
                 "unknown field",
@@ -550,7 +563,7 @@ impl<'a> Infer<'_, 'a> {
         };
         if self.cx.item(item).1.kind == ItemKind::Enum {
             return Err(self.diag_expr(
-                crate::diag::DiagnosticKind::Name,
+                DiagnosticKind::Name,
                 Some(expr),
                 format!("no field `{name}` on enum `{}`", self.cx.name(item)),
                 "unknown field",
@@ -558,7 +571,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let Some(index) = self.field_index(item, 0, name)? else {
             return Err(self.diag_expr(
-                crate::diag::DiagnosticKind::Name,
+                DiagnosticKind::Name,
                 Some(expr),
                 format!("no field `{name}` on type `{}`", self.cx.name(item)),
                 "unknown field",

@@ -106,7 +106,7 @@ pub(in crate::aot) fn emit_arm64_catch_unwind(
             0x9100_C3E0,
             0xAA1F_03E1,
         ]);
-        c.call("_setjmp", out)?;
+        c.call("_setjmpex", out)?;
         let caught = arm64_fwd(0x3500_0000, out);
         let ok_zero = arm64_jcc(
             &[0xAA16_03E0, 0xD63F_0280, 0xF940_03E8, 0xF900_0268],

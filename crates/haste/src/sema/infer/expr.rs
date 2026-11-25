@@ -357,7 +357,7 @@ impl Infer<'_, '_> {
         {
             return self.call_once_of(expr, callee_ty, (params, ret), args);
         }
-        bail!("calling {} is not supported yet", self.show(callee_ty))
+        Err(self.diag_not_callable(expr, callee_ty))
     }
 
     fn passed_args(

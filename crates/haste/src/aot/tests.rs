@@ -549,3 +549,132 @@ fn main() {
         assert_exclusive(dll, sym);
     }
 }
+
+#[test]
+fn pe_shims_patch_rip_relative_into_data_and_route_msvcrt_imports() {
+    for target in TARGETS.iter().filter(|t| t.format == Format::Pe) {
+        let mut exe = minimal_executable_with_imports(target, &[("atexit", None)], false);
+        let (kind, call_off) = match target.arch {
+            Arch::X64 => (RelocKind::PcRel32, 1u32),
+            Arch::Arm64 => (RelocKind::Arm64Call26, 0u32),
+        };
+        let stub: &[u8] = match target.arch {
+            Arch::X64 => &[0xE8, 0, 0, 0, 0, 0xC3],
+            Arch::Arm64 => &[0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6],
+        };
+        let mut code = Vec::new();
+        let mut sites = Vec::new();
+        for _ in 0..3 {
+            sites.push(code.len() as u32 + call_off);
+            code.extend_from_slice(stub);
+        }
+        let caller = exe.function(&code, 16, &[], &[]);
+        exe.patch(
+            caller + sites[0],
+            kind,
+            Symbol::Host(HostSymbol::ThreadCell),
+        );
+        exe.patch(
+            caller + sites[1],
+            kind,
+            Symbol::Host(HostSymbol::CatchUnwind),
+        );
+        exe.patch(
+            caller + sites[2],
+            kind,
+            Symbol::Host(HostSymbol::StartPanic),
+        );
+        let bytes = exe.encode().expect("emit PE32+ with shims");
+
+        let dll_imports = parse_pe_idata(&bytes);
+        let msvcrt = dll_imports
+            .iter()
+            .find(|(dll, _)| dll == "msvcrt.dll")
+            .unwrap_or_else(|| panic!("{} missing msvcrt.dll in {dll_imports:?}", target.triple));
+        let setjmp_sym = if target.arch == Arch::Arm64 {
+            "_setjmpex"
+        } else {
+            "_setjmp"
+        };
+        for sym in [setjmp_sym, "longjmp", "atexit"] {
+            assert!(
+                msvcrt.1.iter().any(|s| s == sym),
+                "{} expected {sym} in msvcrt.dll, got {dll_imports:?}",
+                target.triple
+            );
+            assert!(
+                !dll_imports
+                    .iter()
+                    .any(|(d, syms)| d != "msvcrt.dll" && syms.iter().any(|s| s == sym)),
+                "{} leaked {sym} outside msvcrt.dll",
+                target.triple
+            );
+        }
+
+        let pe_off = read_u32_at(&bytes, 0x3C) as usize;
+        let nsec = read_u16(&bytes, pe_off + 6) as usize;
+        let opt_size = read_u16(&bytes, pe_off + 20) as usize;
+        let opt_off = pe_off + 24;
+        let image_base = read_u64(&bytes, opt_off + 24);
+        let sec_base = opt_off + opt_size;
+        let mut text = (0u32, 0usize, 0usize);
+        let mut data = (0u32, 0u32);
+        for i in 0..nsec {
+            let s = sec_base + i * 40;
+            match read_cstr(&bytes, s) {
+                ".text" => {
+                    text = (
+                        read_u32_at(&bytes, s + 12),
+                        read_u32_at(&bytes, s + 20) as usize,
+                        read_u32_at(&bytes, s + 8) as usize,
+                    );
+                }
+                ".data" => data = (read_u32_at(&bytes, s + 12), read_u32_at(&bytes, s + 8)),
+                _ => {}
+            }
+        }
+        let data_start = image_base + u64::from(data.0);
+        let data_end = data_start + u64::from(data.1);
+        let text_bytes = &bytes[text.1..text.1 + text.2];
+        if target.arch == Arch::X64 {
+            let lea_r13 = text_bytes
+                .windows(3)
+                .position(|w| w == [0x4C, 0x8D, 0x2D])
+                .expect("ThreadCell lea r13, [rip + disp32]");
+            let disp = i32::from_le_bytes(
+                text_bytes[lea_r13 + 3..lea_r13 + 7]
+                    .try_into()
+                    .expect("disp32"),
+            );
+            let target_va = (image_base + u64::from(text.0) + (lea_r13 + 7) as u64)
+                .wrapping_add_signed(i64::from(disp));
+            assert!(
+                (data_start..data_end).contains(&target_va),
+                "x64 ThreadCell thread_key VA 0x{target_va:x} outside .data [0x{data_start:x}..0x{data_end:x})"
+            );
+        } else {
+            let words: Vec<u32> = text_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("word")))
+                .collect();
+            let at = words
+                .windows(2)
+                .position(|pair| {
+                    (pair[0] & 0x9F00_001F) == 0x9000_0015 && (pair[1] & 0xFFC0_03FF) == 0x9100_02B5
+                })
+                .expect("ARM64 ThreadCell adrp x21 + add x21, x21, #imm12");
+            let adrp = words[at];
+            let add = words[at + 1];
+            let imm_lo = (adrp >> 29) & 3;
+            let imm_hi = (adrp >> 5) & 0x7_FFFF;
+            let imm21 = (((imm_hi << 2) | imm_lo) as i32) << 11 >> 11;
+            let pc_va = image_base + u64::from(text.0) + (at * 4) as u64;
+            let page = (pc_va & !0xFFF).wrapping_add_signed(i64::from(imm21) << 12);
+            let target_va = page + u64::from((add >> 10) & 0xFFF);
+            assert!(
+                (data_start..data_end).contains(&target_va),
+                "arm64 ThreadCell thread_key VA 0x{target_va:x} outside .data [0x{data_start:x}..0x{data_end:x})"
+            );
+        }
+    }
+}

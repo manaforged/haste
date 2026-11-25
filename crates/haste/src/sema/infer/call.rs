@@ -78,13 +78,10 @@ impl Infer<'_, '_> {
                 None => self.deref_step(expr, steps, ty)?,
             };
             let Some(next) = next else {
-                bail!("calling {} is not supported yet", self.show(found))
+                return Err(self.diag_not_callable(expr, found));
             };
             if steps + 1 >= crate::RECURSION_LIMIT as u32 {
-                bail!(
-                    "reached the recursion limit while dereferencing {}",
-                    self.show(found)
-                );
+                return Err(self.diag_deref_limit(expr, found));
             }
             (ty, steps) = (self.resolve(next), steps + 1);
         }
@@ -175,11 +172,7 @@ impl Infer<'_, '_> {
             None => false,
         };
         if args.len() < params.len() || (!variadic && args.len() != params.len()) {
-            bail!(
-                "call takes {} arguments, {} given",
-                params.len(),
-                args.len()
-            );
+            return Err(self.diag_arity(None, params.len(), args.len()));
         }
         for (&arg, &param) in args.iter().zip(params) {
             self.call_arg(def, ExprId(arg), (param, None), &mut None)?;
@@ -327,12 +320,7 @@ impl Infer<'_, '_> {
         match given.checked_sub(params) {
             Some(0) => Ok(0),
             Some(extra) if variadic => Ok(extra),
-            _ => Err(self.diag_expr(
-                crate::diag::DiagnosticKind::Type,
-                None,
-                format!("call takes {params} arguments, {given} given"),
-                "unexpected number of arguments",
-            )),
+            _ => Err(self.diag_arity(None, params, given)),
         }
     }
 

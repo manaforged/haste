@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::body::{BinOp, Expr, ExprId, UnOp};
+use crate::diag::DiagnosticKind;
 use crate::names::{ItemRef, Primitive};
 
 use super::super::super::summary::OpCheck;
@@ -41,7 +42,12 @@ impl Infer<'_, '_> {
         }
         let name = if op == UnOp::Not { "not" } else { "neg" };
         let Some((of, method)) = self.operator_impl((name, name), ty, &[])? else {
-            bail!("unsupported unary {op:?} on {}", self.show(ty))
+            return Err(self.diag_expr(
+                DiagnosticKind::Type,
+                Some(expr),
+                format!("unsupported unary {op:?} on {}", self.show(ty)),
+                "cannot apply unary operator",
+            ));
         };
         self.out
             .operators
@@ -179,7 +185,7 @@ impl Infer<'_, '_> {
         }
         if matches!(op, BinOp::Shl | BinOp::Shr) {
             self.hint_scalar_var(left, expected)?;
-            return self.shift(left, right);
+            return self.shift(expr, left, right);
         }
         self.unify(left, right)?;
         if !is_compare(op) {
@@ -311,7 +317,12 @@ impl Infer<'_, '_> {
             bail!("{op:?} has no operator trait")
         };
         let Some((of, method)) = self.operator_impl((lang, name), left, &[right])? else {
-            bail!("unsupported operator {op:?} on {}", self.show(left))
+            return Err(self.diag_expr(
+                DiagnosticKind::Type,
+                Some(expr),
+                format!("unsupported operator {op:?} on {}", self.show(left)),
+                "cannot apply binary operator",
+            ));
         };
         self.out
             .operators
@@ -358,9 +369,14 @@ impl Infer<'_, '_> {
         Ok(bool_ty)
     }
 
-    fn shift(&mut self, left: Ty, right: Ty) -> Result<Ty> {
+    fn shift(&mut self, expr: ExprId, left: Ty, right: Ty) -> Result<Ty> {
         if !self.is_int(left) || !self.is_int(right) {
-            bail!("unsupported shift on {}", self.show(left));
+            return Err(self.diag_expr(
+                DiagnosticKind::Type,
+                Some(expr),
+                format!("unsupported shift on {}", self.show(left)),
+                "shift operands must be integers",
+            ));
         }
         Ok(left)
     }

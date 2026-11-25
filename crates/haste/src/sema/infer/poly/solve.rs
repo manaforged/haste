@@ -449,11 +449,7 @@ impl Infer<'_, '_> {
         };
         let arg_ids = self.body.list(args).to_vec();
         if arg_ids.len() != params.len() {
-            bail!(
-                "call takes {} arguments, {} given",
-                params.len(),
-                arg_ids.len()
-            );
+            return Err(self.diag_arity(Some(expr), params.len(), arg_ids.len()));
         }
         for (&arg, &param) in arg_ids.iter().zip(&params) {
             self.call_arg(None, ExprId(arg), (param, None), &mut None)?;

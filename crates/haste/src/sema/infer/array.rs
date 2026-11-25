@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::body::{ExprId, List};
+use crate::diag::DiagnosticKind;
 use crate::names::Primitive;
 
 use super::super::ty::{Kind, Ty};
@@ -89,14 +90,16 @@ impl Infer<'_, '_> {
                 },
             };
             let Some(next) = next else {
-                bail!("cannot index {} by {}", self.show(found), self.show(at))
+                return Err(self.diag_expr(
+                    DiagnosticKind::Type,
+                    Some(expr),
+                    format!("cannot index {} by {}", self.show(found), self.show(at)),
+                    "cannot be indexed by this type",
+                ));
             };
             (step, steps) = (self.resolve(next), steps + 1);
             if steps as usize == crate::RECURSION_LIMIT {
-                bail!(
-                    "reached the recursion limit while dereferencing {}",
-                    self.show(found)
-                );
+                return Err(self.diag_deref_limit(expr, found));
             }
         }
     }

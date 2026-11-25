@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::body::sig::Predicate;
 use crate::body::{Body, PathId, TyId};
+use crate::diag::DiagnosticKind;
 use crate::names::{ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
@@ -506,11 +507,16 @@ impl Infer<'_, '_> {
             ));
         }
         if !self.bindings_hold(arena, path, (of, ty, &args))? {
-            bail!(
-                "{} does not give the associated types that a bound of `{}` binds",
-                self.show(ty),
-                self.cx.name(of)
-            );
+            return Err(self.diag_expr(
+                DiagnosticKind::Trait,
+                None,
+                format!(
+                    "{} does not give the associated types that a bound of `{}` binds",
+                    self.show(ty),
+                    self.cx.name(of)
+                ),
+                "associated type mismatch",
+            ));
         }
         self.bind_constraints((arena, home), (of, path, &args), ty, enforce)
     }
