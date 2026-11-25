@@ -1,84 +1,100 @@
-# Haste Architecture
+# haste architecture
 
-Haste is a clean-room Rust compiler, JIT engine, and standalone AOT compiler with no LLVM dependency. Its thesis is that Rust does not have to choose between sub-second incremental builds and `-O3` runtime throughput:
+haste is a standalone Rust compiler, JIT runner, and ahead-of-time executable builder with no LLVM dependency and no `target/` directory. Edit-loop speed comes from skipping unreached external work, memory-mapping cached artifacts, and recompiling only changed functions in a resident daemon. Release throughput comes from a dedicated block-parameter SSA IR, a domain-tracked pass scheduler, linear-scan register allocation with call-site parking and loop-header live-range splitting, and native x86-64 and ARM64 encoders coupled to direct ELF, Mach-O, and PE32+ emitters.
 
-1. **Fast builds come from skipping unused work and caching settled sysroot state.** Instead of compiling every dependency crate end-to-end into bitcode and object files, Haste resolves workspace metadata, expands macros, and runs wave-based lazy reachability from binary or test entry points—type-checking and lowering only reached monomorphizations. Settled standard-library outlines, macros, and name scopes live in a persistent disk cache (`HSTSYS01` in `substrate/sysroot.rs`), eliminating 896-file stdlib re-parsing on one-shot CLI builds.
-2. **Release throughput comes from a dedicated SSA IR, demand-driven pass scheduler, and native machine-code backends.** Debug and JIT builds run a compact `QUICK_RULES` pass set (`schedule.rs`), while `--release` runs the full `FULL_RULES` fixed-point pipeline—scalar promotion, range/relational bounds-check elimination, load/store coalescing, LICM, unrolling, vectorization, live-range splitting at loop headers, and target-native instruction fusion—before emitting machine code and executable binaries directly without an external linker.
+## Workspace layout
 
-## Workspace Layout
+- [`crates/haste/`](crates/haste/): build graph, parallel outline and macro frontend, memory-mapped substrate cache, type/trait solver, borrow checker, SSA lowering, JIT runtime, `serve` daemon, and standalone AOT executable emitters.
+- [`crates/codegen/`](crates/codegen/): target-independent SSA IR, fixed-point optimization scheduler, register allocator, dual-mapped executable memory arenas, and native `x64` / `arm64` encoders.
+- [`crates/haste/proc_macro/`](crates/haste/proc_macro/): in-image `proc_macro` crate used to execute procedural macros inside forked worker processes.
+- [`crates/haste/prep-driver/`](crates/haste/prep-driver/): x86-64 Linux `rustc_private` driver used by `haste prep` and `--prepared`.
 
-- [`crates/haste/src/`](crates/haste/src/) — build graph, parallel outline/macro frontend, persistent substrate cache, type inference, borrow checker, SSA lowering, JIT runtime, `serve` daemon, and standalone AOT executable emitters.
-- [`crates/codegen/src/`](crates/codegen/src/) — target-independent SSA IR, demand-driven optimization pipeline, register allocator, and native `x64` / `arm64` encoders.
+## Compilation pipeline
 
----
+### 1. Build graph and build scripts
 
-## 1. Whole-Workspace Lazy Reachability & Persistent Sysroot Cache
+[`crates/haste/src/graph/`](crates/haste/src/graph/) (`manifest.rs`, `lock.rs`, `features.rs`, `cfg.rs`, `script.rs`, `store.rs`) parses `Cargo.toml` and `Cargo.lock` and merges the workspace with the active toolchain's `rust-src` standard library. It resolves target `cfg` predicates, unifies features, and runs `build.rs` scripts through [`crates/haste/src/scripts.rs`](crates/haste/src/scripts.rs). When a workspace lacks `Cargo.lock`, `graph.rs` runs `cargo generate-lockfile`. When locked registry or git crates are missing locally, it runs `cargo fetch`. Settled `build.rs` outputs live under `$HASTE_HOME` (`~/.cache/haste`).
 
-1. **Build graph & `build.rs` execution ([`graph/`](crates/haste/src/graph/))**
-   `manifest.rs`, `lock.rs`, `features.rs`, `cfg.rs`, `script.rs`, and `store.rs` parse `Cargo.toml` / `Cargo.lock`, resolve target `cfg` predicates and feature unification, and execute `build.rs` scripts, caching outputs in `$HASTE_HOME` (`~/.cache/haste`).
+### 2. Parallel outline, macro expansion, and name resolution
 
-2. **Parallel outline, macro expansion & name resolution ([`outline/`](crates/haste/src/outline/), [`macros.rs`](crates/haste/src/macros.rs), [`names/`](crates/haste/src/names/))**
-   - `outline/parallel.rs` and `outline/scan.rs` lex and scan crate sources in parallel, pruning disabled `cfg` subtrees (`outline/attr.rs`, `outline/tree.rs`) without building full ASTs for unreached bodies.
-   - `outline/mbe.rs` and `macros.rs` expand `macro_rules!` and procedural macros; `names/{collect,resolve,path,want}.rs` build module/item scopes on demand.
+[`crates/haste/src/outline/`](crates/haste/src/outline/) (`parallel.rs`, `scan.rs`, `attr.rs`, `tree.rs`) scans crate source trees in parallel using `ra-ap-rustc_lexer` and prunes disabled `cfg` subtrees before parsing function bodies. Symbols are interned once in a lock-free lookup cache backed by a sharded `RwLock` `Symbols` table ([`crates/haste/src/names.rs`](crates/haste/src/names.rs)). Declarative macros (`outline/mbe.rs`) and procedural macros ([`crates/haste/src/macros.rs`](crates/haste/src/macros.rs), [`crates/haste/src/image/expand.rs`](crates/haste/src/image/expand.rs)) expand in forked worker children backed by `proc_macro`, while [`crates/haste/src/names/`](crates/haste/src/names/) resolves module and item scopes on demand.
 
-3. **Persistent sysroot & workspace substrate ([`substrate/`](crates/haste/src/substrate/))**
-   - [`substrate/sysroot.rs`](crates/haste/src/substrate/sysroot.rs) (`names.rs`, `tokens.rs`, `wire.rs`) serializes settled sysroot crate outlines, macro definitions, and resolved name scopes (`HSTSYS01`), skipping 896-file stdlib re-parsing on one-shot invocations.
-   - [`substrate/noop.rs`](crates/haste/src/substrate/noop.rs) performs a fast timestamp/digest check to skip unchanged workspaces (~25 ms no-op builds).
-   - [`serve.rs`](crates/haste/src/serve.rs) keeps the workspace loaded in memory and answers incremental `build`, `test`, and `run` requests, rebuilding only items affected by edited files.
+### 3. Persistent sysroot and three-tier substrate cache
 
-4. **Wave-based lazy reachability ([`sema/reach.rs`](crates/haste/src/sema/reach.rs))**
-   - `reach/{wave,filter,order}.rs` start from `main`, `#[test]`, or `case_*` roots and discover callees in parallel waves.
-   - Each reached monomorphization is keyed by `Instance = (ItemRef, Substs)` (16 bytes) and tracked through `Declared` → `Enqueued` → `Blocked` → `Settled`. Unreached functions in dependencies and the standard library are never type-checked or lowered.
+On the first run for a toolchain, `macros.rs` indexes `rust-src` and writes a binary sysroot cache (`HSTSYS01` in [`crates/haste/src/substrate/sysroot.rs`](crates/haste/src/substrate/sysroot.rs)). Later CLI runs map that cache instead of re-parsing `core`, `alloc`, and `std`.
 
----
+Compiled artifacts live in three chained `HSTSUB01` memory-mapped substrate files ([`crates/haste/src/substrate.rs`](crates/haste/src/substrate.rs), [`crates/haste/src/substrate/keys.rs`](crates/haste/src/substrate/keys.rs)):
 
-## 2. Type Inference, Borrow Checking & Stencil/Dictionary Lowering
+1. **Toolchain layer** (`toolchain/<hash>.substrate`): compiled standard library items and summaries keyed by toolchain and target fingerprint.
+2. **Dependency layer** (`deps/<hash>.substrate`): compiled registry and git dependency items keyed by lockfile dependency graph and active features.
+3. **Workspace layer** (`workspace/<hash>.substrate`): compiled workspace items for fast cold starts.
 
-1. **Typed HIR & cross-crate summaries ([`sema/`](crates/haste/src/sema/))**
-   - `sema/infer/` runs bidirectional type inference, method/autoderef resolution, closure capture inference, and pattern typing, backed by trait resolution (`sema/traits.rs`), layout computation (`sema/layout.rs`), and `const fn` evaluation (`sema/evaluate.rs`).
-   - Cross-crate items serialize compact frozen summaries (`sema/summary/{codec,frozen,inst,thaw}.rs`) so callers instantiate generic signatures and layouts without re-running full crate inference.
+[`crates/haste/src/substrate/noop.rs`](crates/haste/src/substrate/noop.rs) records watched source, manifest, and environment stamps so unchanged `haste build` invocations exit in under 3 ms. With `--daemon` or `haste serve`, [`crates/haste/src/serve.rs`](crates/haste/src/serve.rs) keeps the workspace, type cache, and JIT image resident over a Unix socket and incrementally updates only changed files or crates via `Build::refresh` ([`crates/haste/src/build.rs`](crates/haste/src/build.rs)).
 
-2. **Borrow checker ([`sema/borrow.rs`](crates/haste/src/sema/borrow.rs))**
-   Local workspace bodies are checked for initialization, use-after-move (across branches and loops), binding mutability, disjoint struct-field loans (`FieldKey::Named` / `FieldKey::Tuple`), NLL-style shared/mutable aliasing conflicts, and dangling local reference returns.
+### 4. Member checking, lazy reachability, type inference, and borrow checking
 
-3. **SSA lowering, stencils & JIT tier-up ([`lower/`](crates/haste/src/lower/), [`image/`](crates/haste/src/image/))**
-   - `lower/` translates typed bodies into `haste_codegen` SSA IR, handling `async`/`await` coroutines (`lower/coroutine.rs`), explicit `Drop` elaboration (`lower/drop.rs`), and portable/target SIMD (`lower/simd/`).
-   - **Dictionary/stencil sharing ([`lower/stencil.rs`](crates/haste/src/lower/stencil.rs)):** Generic bodies above `HASTE_DICT_MIN_BYTES` (default `512`) with fanout ≥ `HASTE_DICT_MIN_FANOUT` (default `8`) can lower once as a dictionary-passing stencil keyed by a 128-bit structural `FootprintId` (`stencil/{splice,persist,cycles}.rs`).
-   - **JIT tier-up ([`image/stencil_jit.rs`](crates/haste/src/image/stencil_jit.rs)):** In JIT mode, hot dictionary instances specialize to concrete monomorphized machine code after `HASTE_JIT_TIER_UP` (default `64`) calls.
+`build`, `run`, `test`, and `build -o` check every concrete and polymorphic function in the selected member crate(s) before running or emitting code (`check_member_items` in [`crates/haste/src/build/batch.rs`](crates/haste/src/build/batch.rs), `check_poly_item` in [`crates/haste/src/sema/summary.rs`](crates/haste/src/sema/summary.rs)). Across external dependencies and the standard library, wave-based reachability ([`crates/haste/src/sema/reach.rs`](crates/haste/src/sema/reach.rs)) starts from `main`, `#[test]`, or `case_*` roots and parses bodies into dense arenas ([`crates/haste/src/body.rs`](crates/haste/src/body.rs)) only for reached `Instance = (ItemRef, Substs)` pairs.
 
----
+Semantic analysis ([`crates/haste/src/sema/`](crates/haste/src/sema/)) covers:
 
-## 3. Direct SSA IR & Optimization Pipeline ([`crates/codegen/src/`](crates/codegen/src/))
+- Bidirectional type inference, method/autoderef resolution, closure captures, and layout calculation (`infer.rs`, `traits.rs`, `impls.rs`, `layout.rs`).
+- Structural `Send` / `Sync` auto traits, concrete and generic trait bounds, match exhaustiveness (`sema/infer/matching/exhaustive.rs`), module/item/field privacy, and checked `const` / `static` evaluation (`evaluate.rs`).
+- Ownership, initialization, use-after-move across branches and loops, binding mutability, disjoint named/tuple field loans, NLL shared/mutable aliasing, non-`'static` borrow escapes, and named-lifetime return subtyping (`borrow.rs`).
+- Multi-label spanned diagnostic rendering (`diag.rs`) and compact frozen cross-crate polymorphic summaries (`summary/`).
 
-[`lib.rs`](crates/codegen/src/lib.rs) splits coroutines (`coroutine.rs`), verifies IR invariants (`verify.rs`), runs the demand-driven optimizer (`schedule.rs`), lowers wide/runtime helpers (`native.rs`, `overalign.rs`), and invokes the target encoder.
+### 5. SSA lowering, generic stencils, and JIT tier-up
 
-### Demand-Driven Pass Scheduler (`schedule.rs`)
+[`crates/haste/src/lower/`](crates/haste/src/lower/) lowers typed bodies into `haste-codegen` SSA IR (`FunctionBuilder`), elaborating `async`/`await` state machines (`coroutine.rs`), drop scopes (`drop.rs`), and portable or target-specific SIMD (`simd.rs`).
 
-`schedule::run` tracks dirty `Domain` flags (`CFG`, `MEM`, `VALUES`) so passes re-run only when an earlier pass invalidates a domain they read:
+[`crates/haste/src/lower/stencil.rs`](crates/haste/src/lower/stencil.rs) computes a 128-bit structural `FootprintId` over each generic body's lowered layout, ABI, inlining, and unwind footprint. Generic bodies larger than `HASTE_DICT_MIN_BYTES` (default `512`) with at least `HASTE_DICT_MIN_FANOUT` (default `8`) instantiations can share one dictionary-passing template across monomorphizations instead of re-compiling each specialization. In JIT mode, [`crates/haste/src/image/stencil_jit.rs`](crates/haste/src/image/stencil_jit.rs) tracks call counts and specializes hot dictionary functions into concrete machine code once calls pass `HASTE_JIT_TIER_UP` (default `64`).
 
-- **Debug / JIT (`Effort::Quick`):** `Fill` → `Promote` → `Fold` → `Merge` → `Cse` → `Returns`.
-- **Release (`Effort::Full`):** Adds the full loop, memory, and control-flow optimization suite:
-  - **Scalar & algebraic simplification:** `fold.rs` (`fold/{exits,range,unused,vector}.rs`), `algebra.rs` (`algebra/{bits,cond,icmp,ord,ovf,select,sum,vec}.rs`), `cse.rs`, and `merge.rs` (short-circuit compare folding).
-  - **Memory & scalar promotion:** `promote.rs` (`promote/{box_fwd,cold_copy,join_slots,vec_slot}.rs`), `promote_subword.rs`, and `loads.rs` (`loads/{elide,coalesce,dom,join,pack,regroup,remat,sink}.rs`) guided by escape and frame alias analysis (`mem/{escape,frame,loop_mem}.rs`).
-  - **Range & relational fact propagation ([`facts/`](crates/codegen/src/facts/)):** `facts/{backprop,exits,live,loops,rel,transfer}.rs` track integer intervals, excluded constants (`MAX_NOT=32`), and symbolic inequalities (`MAX_FACTS=64`, `MAX_RELS=64`) so `fold/range.rs` eliminates redundant slice bounds and overflow traps.
-  - **Loop & control-flow transforms:** `rotate.rs`, `licm.rs` (`licm/reassoc.rs`), `lsr.rs` (`lsr/lftr.rs`), `unroll.rs` (`unroll/region.rs`), `ifconv.rs`, `thread.rs` (jump threading), `tailrec.rs`, `slp.rs` (superword-level parallelism), and `switch.rs` (`switch/{bitmask,lut,member,select,tree}.rs`).
+### 6. SSA IR, optimization scheduler, and register allocation
 
-### Register Allocation & Live-Range Shaping
+[`crates/codegen/src/lib.rs`](crates/codegen/src/lib.rs) splits coroutines (`coroutine.rs`), verifies SSA and CFG dominance invariants (`verify.rs`), runs the demand-driven optimizer (`schedule.rs`), lowers wide integer and runtime helpers (`native.rs`, `overalign.rs`), and invokes the target backend.
 
-- **Loop-header live-range splitting ([`loopargs.rs`](crates/codegen/src/loopargs.rs)):** Passes loop-invariant values read inside a loop as explicit block parameters at the loop header so their inner-loop live range can stay in a register independent of outer-loop call pressure.
-- **Allocator & parking ([`alloc/`](crates/codegen/src/alloc/), [`park/`](crates/codegen/src/park/)):** Weighted register allocation (`park/{choose,place,recolor}.rs`, `alloc/{demote,hints,hoist,walk}.rs`, `color.rs`) balances callee-saved registers against park slots across calls, performs copy coalescing, and resolves back-edge parallel copies/slot swaps cleanly.
-- **IR serialization ([`wire.rs`](crates/codegen/src/wire.rs)):** Binary `Function::encode` / `Function::decode` persists compiled stencils and substrate artifacts without re-lowering.
+[`crates/codegen/src/schedule.rs`](crates/codegen/src/schedule.rs) tracks 3-bit `Domain` (`CFG | MEM | VALUES`) dirty flags so passes re-run only when an earlier pass dirties a domain they read:
 
----
+- **Debug / JIT (`Effort::Quick`):** runs `Promote`, `Fold`, and `Merge` fixed-point rules followed by `Returns` cleanup (after `Fill`, `Fold`, `Merge` initialization).
+- **Release (`Effort::Full`):** adds `Loads`, `Cse`, `Thread`, `IfConv`, `Rotate`, `Unroll`, `Licm`, and `Lsr` to the fixed-point loop, finishing with `Switch`, `Returns`, and `TailRec`. Key components:
+  - Scalar and algebraic simplification: `fold.rs`, `algebra.rs`, `cse.rs`, and `merge.rs`.
+  - Stack promotion and memory forwarding: `promote.rs`, `promote_subword.rs`, and `loads.rs` guided by escape and frame alias analysis (`mem/`).
+  - Range and relational fact propagation: `facts/` tracks integer intervals, excluded constants (`MAX_NOT = 32`), and symbolic inequalities (`MAX_FACTS = 64`, `MAX_RELS = 64`) so `fold/range.rs` removes redundant bounds and overflow traps.
+  - Loop and control-flow passes: `rotate.rs`, `licm.rs`, `lsr.rs`, `unroll.rs`, `ifconv.rs`, `thread.rs`, `tailrec.rs`, `slp.rs`, and `switch.rs`.
+  - Unwind drop elision: `drop_elide.rs`.
 
-## 4. Native Backends & Zero-Linker Executable Emitters
+Before register allocation, [`crates/codegen/src/loopargs.rs`](crates/codegen/src/loopargs.rs) lifts loop-invariant reads into explicit loop-header block parameters so inner-loop values keep registers independently of outer call pressure. [`crates/codegen/src/alloc.rs`](crates/codegen/src/alloc.rs) and [`crates/codegen/src/park.rs`](crates/codegen/src/park.rs) perform weighted linear-scan allocation, balance callee-saved registers against targeted spill/reload parking across calls, coalesce copies, and resolve edge copies. [`crates/codegen/src/frame.rs`](crates/codegen/src/frame.rs) shrink-wraps prologues and epilogues. [`crates/codegen/src/wire.rs`](crates/codegen/src/wire.rs) serializes and deserializes compiled IR for substrate storage.
 
-1. **Machine-code encoders**
-   - **x86-64 ([`crates/codegen/src/x64/`](crates/codegen/src/x64/)):** Encodes SSE2 baseline and runtime-detected AVX/AVX2 (`features.rs`, `ymm.rs`, `vector*.rs`), 128-bit/wide arithmetic (`wide.rs`), and memory/addressing/product fusion (`location/fuse.rs`).
-   - **ARM64 ([`crates/codegen/src/arm64/`](crates/codegen/src/arm64/)):** Encodes AArch64 scalar, NEON (`vector*.rs`), and target fusion (`fuse/{bfi,bits,ccmp,flag,mem,shift,sign,vconst}.rs`) including bitfield insert, shifted operands, and `ccmp` chains.
+### 7. Execution backends and native executable emitters
 
-2. **Zero-linker AOT executables ([`crates/haste/src/aot/`](crates/haste/src/aot/))**
-   `aot.rs` assembles `.text`, `.rodata`, `.data`, and `.bss` directly into runnable binaries—with optional DWARF `.debug_line` tables (`aot/dwarf.rs`) and runtime shims (`aot/shims.rs`)—for all six supported targets (`--target TRIPLE`) without invoking an external linker:
-   - **ELF** ([`aot/elf.rs`](crates/haste/src/aot/elf.rs)): `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
-   - **Mach-O** ([`aot/macho.rs`](crates/haste/src/aot/macho.rs)): `aarch64-apple-darwin`, `x86_64-apple-darwin`
-   - **PE32+** ([`aot/pe.rs`](crates/haste/src/aot/pe.rs)): `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`
+- **JIT and hot-reload ([`crates/haste/src/image/`](crates/haste/src/image/), [`crates/codegen/src/memory.rs`](crates/codegen/src/memory.rs)):** JIT code writes into dual-mapped writable/executable memory arenas (`mach_vm_remap` on macOS, dual `mmap` on Unix). Functions compile on first call inside forked child processes (`image/lazy.rs`), and `haste run --watch` (`image/watch.rs`) uses `kqueue` or `inotify` to patch modified function bodies into the live process.
+- **Native CPU encoders ([`crates/codegen/src/x64/`](crates/codegen/src/x64/), [`crates/codegen/src/arm64/`](crates/codegen/src/arm64/)):** Emit x86-64 (baseline SSE2 or runtime CPUID-detected LZCNT/BMI/POPCNT/SSE4.1/AVX/AVX2/FMA) and ARM64 (AArch64 scalar, NEON, and bitfield/shifted/conditional-compare fusion) machine code directly.
+- **Zero-linker AOT emitters ([`crates/haste/src/aot/`](crates/haste/src/aot/), [`crates/haste/src/image/aot/`](crates/haste/src/image/aot/)):** [`image/aot/icf.rs`](crates/haste/src/image/aot/icf.rs) and [`image/aot/vdce.rs`](crates/haste/src/image/aot/vdce.rs) run identical code folding and virtual dead-code elimination. [`aot.rs`](crates/haste/src/aot.rs) then emits standalone ELF (`aot/elf.rs`), Mach-O with `__thread_vars` TLV descriptors and ad-hoc `codesign` on macOS (`aot/macho.rs`, `aot/tls.rs`), and PE32+ (`aot/pe.rs`) binaries with native unwind tables (`aot/unwind.rs`), runtime shims (`aot/shims.rs`), and optional DWARF `.debug_line` tables (`aot/dwarf.rs`).
+- **Prepared mode ([`crates/haste/src/prep.rs`](crates/haste/src/prep.rs)):** On x86-64 Linux, `haste prep` invokes `prep-driver` with `RUSTC_BOOTSTRAP=1` to precompile dependency instances for `haste --release --prepared run`.
+
+## Internal debugging and tuning variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HASTE_NO_SUBSTRATE` | Unset (`0`) | Set to `1` to bypass cached sysroot, dependency, and workspace substrates. |
+| `HASTE_DICT_MIN_BYTES` | `512` | Minimum lowered generic body size in bytes before dictionary lowering applies. |
+| `HASTE_DICT_MIN_FANOUT` | `8` | Minimum monomorphization fanout before sharing a dictionary body. |
+| `HASTE_JIT_TIER_UP` | `64` | Call threshold before a hot dictionary function specializes in JIT (`0` disables tier-up). |
+| `HASTE_VERIFY_STENCIL` | Unset (`0`) | Set to `1` to cross-check stencil instantiations against concrete lowering. |
+| `HASTE_VERIFY_PASSES` | Unset (`0`) | Set to `1` to run the SSA and dominance verifier after every mutating codegen pass. |
+| `HASTE_TRACE` | Unset (`0`) | Function substring filter (`1` matches all) for printing codegen pass summaries. |
+| `HASTE_TRACE_IR` | Unset (`0`) | Set to `1` with `HASTE_TRACE` to dump final IR at end of compile, or `passes` to dump full IR after each changing pass. |
+| `HASTE_MISSED` | Unset (`0`) | Set to `1` to print aggregated codegen pass timings and stencil cache counters. |
+| `HASTE_SERVE_IDLE_SECS` | `120` | Idle shutdown timeout in seconds for spawned `--daemon` workers. |
+
+## References and design influences
+
+- **Iterative dominance (`crates/codegen/src/cfg.rs`):** Cooper, Harvey, and Kennedy (2001), *A Simple, Fast Dominance Algorithm*.
+- **Block-parameter SSA and on-demand promotion (`crates/codegen/src/ir.rs`, `promote.rs`):** Block-parameter SSA (Kelsey 1995; Appel 1998) with demand-driven SSA construction in the spirit of Braun et al. (2013), *Simple and Efficient Construction of Static Single Assignment Form* (CC 2013).
+- **Linear-scan register allocation and out-of-SSA copy resolution (`crates/codegen/src/park.rs`, `alloc.rs`, `frame.rs`):** Poletto and Sarkar (1999), *Linear Scan Register Allocation* (TOPLAS); Wimmer and Franz (2010), *Linear Scan Register Allocation on SSA Form* (CGO 2010); Boissinot et al. (2009), *Revisiting Out-of-SSA Translation for Correctness, Code Quality, and Efficiency* (CGO 2009).
+- **Shrink-wrapping (`crates/codegen/src/frame.rs`):** Fred C. Chow (1988), *Minimizing Register Usage Penalty at Procedure Calls* (PLDI 1988).
+- **Division by invariant integers via multiplication (`crates/codegen/src/algebra.rs`):** Granlund and Montgomery (1994), *Division by Invariant Integers using Multiplication* (PLDI 1994).
+- **Superword-level parallelism (`crates/codegen/src/slp.rs`):** Larsen and Amarasinghe (2000), *Exploiting Superword Level Parallelism with Multimedia Instruction Sets* (PLDI 2000).
+- **Dictionary passing and stencil instantiation (`crates/haste/src/lower/stencil.rs`, `image/stencil_jit.rs`):** Hall et al. (1996), *Type Classes in Haskell* (TOPLAS); Xu and Kjolstad (2021), *Copy-and-Patch Compilation* (OOPSLA 2021).
+- **Identical Code Folding (`crates/haste/src/image/aot/icf.rs`):** Tallam et al. (2010), *Safe ICF: Pointer Safe and Unwinding Aware Identical Code Folding in the Gold Linker*.
+- **Non-Lexical Lifetimes (`crates/haste/src/sema/borrow.rs`):** Rust RFC 2094 (*Non-Lexical Lifetimes*).
+- **Match exhaustiveness (`crates/haste/src/sema/infer/matching/exhaustive.rs`):** Luc Maranget (2007), *Warnings for Pattern Matching* (JFP 2007).

@@ -13,7 +13,15 @@ if [ "$start" -ge "$end" ]; then
 fi
 work="${CARGO_TARGET_DIR:-target}/fuzz.$$"
 mkdir -p "$work"
-trap 'rm -rf "$work"' EXIT
+keep_work="${HASTE_FUZZ_KEEP:-0}"
+cleanup() {
+    if [ "$keep_work" = "1" ]; then
+        echo "kept fuzz workdir: $work" >&2
+    else
+        rm -rf "$work"
+    fi
+}
+trap cleanup EXIT
 
 build_haste </dev/null >"$work/build.err" 2>&1 || {
     cat "$work/build.err"
@@ -30,7 +38,7 @@ python3 scripts/fuzz_gen.py "$start" "$end" "$work/src"
 mkdir -p "$work/out"
 
 run_with_timeout() {
-    perl -e 'alarm shift; exec @ARGV' "$@"
+    perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' "$@"
 }
 
 for f in "$work/src"/*.rs; do
@@ -45,7 +53,10 @@ for f in "$work/src"/*.rs; do
         rustc --edition 2021 -O -o "$c/bin_rustc" "$f" >"$c/rustc.err" 2>&1
         rc=$?
         if [ "$rc" -ne 0 ]; then
-            echo "$n | rustc=FAIL($rc)" >"$c/fail"
+            {
+                echo "$n | rustc=FAIL($rc)"
+                head -n 8 "$c/rustc.err"
+            } >"$c/fail"
             exit 0
         fi
         run_with_timeout 30 "$c/bin_rustc" >"$c/rustc.out" 2>"$c/rustc.run.err"
@@ -68,12 +79,35 @@ for f in "$work/src"/*.rs; do
         else
             ar=1
         fi
+        rs=same
         js=same
         as=same
+        [ "$rr" -eq 0 ] && [ "$rdc" -eq 0 ] && [ "$rdr" -eq 0 ] && cmp -s "$c/rustc.out" "$c/rustc_dbg.out" || rs=DIFF
         [ "$rdc" -eq 0 ] && [ "$rdr" -eq 0 ] && [ "$jr" -eq 0 ] && cmp -s "$c/rustc_dbg.out" "$c/jit.out" || js=DIFF
         [ "$rr" -eq 0 ] && [ "$ab" -eq 0 ] && [ "$ar" -eq 0 ] && cmp -s "$c/rustc.out" "$c/aot.out" || as=DIFF
-        if [ "$js" != same ] || [ "$as" != same ]; then
-            echo "$n | jit=rc$jr $js | aot=build$ab/rc$ar $as" >"$c/fail"
+        if [ "$rs" != same ] || [ "$js" != same ] || [ "$as" != same ]; then
+            {
+                echo "$n | rustc=rc$rr/dbg$rdr $rs | jit=rc$jr $js | aot=build$ab/rc$ar $as"
+                if [ "$rs" != same ]; then
+                    diff -u "$c/rustc.out" "$c/rustc_dbg.out" 2>/dev/null | head -n 8 || true
+                fi
+                if [ "$js" != same ]; then
+                    if [ "$jr" -ne 0 ]; then
+                        tail -n 6 "$c/jit.err" 2>/dev/null || true
+                    else
+                        diff -u "$c/rustc_dbg.out" "$c/jit.out" 2>/dev/null | head -n 8 || true
+                    fi
+                fi
+                if [ "$as" != same ]; then
+                    if [ "$ab" -ne 0 ]; then
+                        tail -n 6 "$c/aot.build" 2>/dev/null || true
+                    elif [ "$ar" -ne 0 ]; then
+                        tail -n 6 "$c/aot.run.err" 2>/dev/null || true
+                    else
+                        diff -u "$c/rustc.out" "$c/aot.out" 2>/dev/null | head -n 8 || true
+                    fi
+                fi
+            } >"$c/fail"
         fi
     ) &
     while [ "$(jobs -r | wc -l)" -ge "$jobs" ]; do
