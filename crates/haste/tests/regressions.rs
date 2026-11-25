@@ -316,3 +316,112 @@ fn main() {
         );
     }
 }
+
+#[test]
+fn run_test_and_aot_reject_uncalled_errors_and_cli_help_is_per_subcommand() {
+    let haste = env!("CARGO_BIN_EXE_haste");
+
+    let global_help = Command::new(haste)
+        .arg("--help")
+        .output()
+        .expect("global help");
+    let build_help = Command::new(haste)
+        .args(["build", "--help"])
+        .output()
+        .expect("build help");
+    let run_help = Command::new(haste)
+        .args(["run", "--help"])
+        .output()
+        .expect("run help");
+    let test_help = Command::new(haste)
+        .args(["test", "--help"])
+        .output()
+        .expect("test help");
+    let version = Command::new(haste)
+        .arg("--version")
+        .output()
+        .expect("version");
+    assert!(
+        global_help.status.success()
+            && build_help.status.success()
+            && run_help.status.success()
+            && test_help.status.success()
+            && version.status.success()
+    );
+    let g = String::from_utf8_lossy(&global_help.stdout);
+    let b = String::from_utf8_lossy(&build_help.stdout);
+    let r = String::from_utf8_lossy(&run_help.stdout);
+    let t = String::from_utf8_lossy(&test_help.stdout);
+    assert!(g.contains("Commands:") && b.contains("Usage: haste build") && b != g);
+    assert!(r.contains("Usage: haste run") && r.contains("--watch") && r != b);
+    assert!(t.contains("Usage: haste test") && t.contains("--ignored") && t != r);
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("haste "));
+
+    let broken = FixtureDir::write_crate(
+        "haste-reg",
+        "uncalled-errors",
+        "uncalled_errors",
+        r#"
+#[allow(dead_code)]
+fn bad_type() -> i32 {
+    "not an int"
+}
+
+#[allow(dead_code)]
+fn bad_move() {
+    let s = String::from("hi");
+    drop(s);
+    println!("{s}");
+}
+
+fn main() {
+    println!("SHOULD_NOT_RUN");
+}
+
+#[test]
+fn passing_test() {
+    println!("TEST_SHOULD_NOT_RUN");
+}
+"#,
+    );
+
+    let run_out = Command::new(haste)
+        .args(["run"])
+        .arg(broken.path())
+        .output()
+        .expect("haste run broken");
+    assert!(
+        !run_out.status.success(),
+        "haste run must refuse code with uncalled errors; stdout={} stderr={}",
+        String::from_utf8_lossy(&run_out.stdout),
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&run_out.stdout).contains("SHOULD_NOT_RUN"));
+
+    let test_out = Command::new(haste)
+        .args(["test"])
+        .arg(broken.path())
+        .output()
+        .expect("haste test broken");
+    assert!(
+        !test_out.status.success(),
+        "haste test must refuse code with uncalled errors; stdout={} stderr={}",
+        String::from_utf8_lossy(&test_out.stdout),
+        String::from_utf8_lossy(&test_out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&test_out.stdout).contains("TEST_SHOULD_NOT_RUN"));
+
+    let aot_bin = broken.path().join("should_not_exist");
+    let aot_out = Command::new(haste)
+        .args(["build", "-o"])
+        .arg(&aot_bin)
+        .arg(broken.path())
+        .output()
+        .expect("haste build -o broken");
+    assert!(
+        !aot_out.status.success() && !aot_bin.exists(),
+        "haste build -o must refuse code with uncalled errors; stdout={} stderr={}",
+        String::from_utf8_lossy(&aot_out.stdout),
+        String::from_utf8_lossy(&aot_out.stderr)
+    );
+}

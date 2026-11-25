@@ -398,6 +398,13 @@ fn run(
         .filter(|(_, kept)| !matches!(kept, Kept::Executable(_)))
         .map(|(script, _)| *script)
         .collect();
+    if !compiled.is_empty() {
+        eprintln!(
+            "haste: running {} build script{}...",
+            compiled.len(),
+            if compiled.len() == 1 { "" } else { "s" }
+        );
+    }
     let mains: Vec<Option<crate::names::ItemRef>> = compiled
         .iter()
         .map(|(_, krate)| outline.main(*krate))

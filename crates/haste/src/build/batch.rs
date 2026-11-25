@@ -68,8 +68,57 @@ pub(super) struct Batch {
     pub(super) image: Image,
     pub(super) broken: HashMap<usize, String>,
     pub(super) poly_failures: Vec<(ItemRef, String)>,
+    pub(super) member_errors: Vec<String>,
     pub(super) reach_span: sema::census::Span,
     pub(super) codegen_span: sema::census::Span,
+}
+
+/// Type-checks and borrow-checks every concrete and polymorphic function in the target member crate(s) without emitting code.
+pub(super) fn check_member_items(
+    workspace: &graph::Workspace,
+    compilation: &mut Compilation,
+    cache: Cache,
+    target: Option<usize>,
+) -> Result<(Cache, Vec<String>)> {
+    super::load_members(workspace, compilation)?;
+    let items = check_fn_items(workspace, &compilation.outline, target);
+    let roots: Vec<Instance> = items
+        .iter()
+        .copied()
+        .map(|item| (item, sema::substs::Substs::EMPTY))
+        .collect();
+    let (store, diagnostics) = crate::macros::reach_resolved_with_cache(
+        compilation,
+        cache,
+        |cx| {
+            roots
+                .iter()
+                .copied()
+                .filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item))
+                .collect()
+        },
+        |mut cx, reached| {
+            let poly = check_poly_items(&mut cx, &items);
+            let mut out = Vec::new();
+            let mut seen = HashSet::default();
+            let mut record = |item: ItemRef, error: &str| {
+                let msg = Batch::format_entry(Some(cx.outline), item, None, error);
+                if seen.insert(msg.clone()) {
+                    out.push(msg);
+                }
+            };
+            for ((item, _), res) in &reached.list {
+                if let Err(err) = res {
+                    record(*item, err);
+                }
+            }
+            for &(item, ref err) in &poly {
+                record(item, err);
+            }
+            Ok((cx.release().0, out))
+        },
+    )?;
+    Ok((store, diagnostics))
 }
 
 fn batch_roots(
@@ -268,6 +317,7 @@ fn finish_batch(
         image,
         broken,
         poly_failures,
+        member_errors: Vec::new(),
         reach_span,
         codegen_span,
     })
@@ -308,8 +358,35 @@ impl Batch {
         } else {
             batch_roots(workspace, &compilation.outline, kind)
         };
-        let (mut substrate, cache) =
+        let (mut substrate, mut cache) =
             cache_with_substrate(workspace, mode != crate::image::ImageMode::Check);
+        if matches!(kind, BatchKind::Tests | BatchKind::MainAot) {
+            let target = match kind {
+                BatchKind::MainAot => main.map(|m| m.krate as usize),
+                _ => None,
+            };
+            let (checked_cache, member_errors) =
+                check_member_items(workspace, compilation, cache, target)?;
+            cache = checked_cache;
+            if !member_errors.is_empty() {
+                let reached = Reached::default();
+                let image = Image::create(&reached, crate::image::ImageMode::Check, (0, 0, 1))?;
+                return Ok(Batch {
+                    kind,
+                    store: Some(cache),
+                    labels: Vec::new(),
+                    roots: Vec::new(),
+                    tests: Vec::new(),
+                    reached,
+                    image,
+                    broken: HashMap::default(),
+                    poly_failures: Vec::new(),
+                    member_errors,
+                    reach_span: reach_clock.elapsed(),
+                    codegen_span: sema::census::Span::default(),
+                });
+            }
+        }
         let batch = crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
@@ -356,6 +433,9 @@ impl Batch {
         compilation: &Compilation,
         path: &std::path::Path,
     ) -> Result<()> {
+        if !self.member_errors.is_empty() {
+            bail!("{}", self.member_errors.join("\n"));
+        }
         if !self.broken.is_empty() {
             bail!("{} functions failed to compile", self.broken.len());
         }
@@ -374,7 +454,14 @@ impl Batch {
         exe?.write(path)
     }
 
+    fn needs_member_recheck(&self) -> bool {
+        !self.member_errors.is_empty() || matches!(self.kind, BatchKind::Tests | BatchKind::MainAot)
+    }
+
     pub(super) fn again(&mut self, compilation: &Compilation, stale: &[(u32, u32)]) -> bool {
+        if self.needs_member_recheck() {
+            return false;
+        }
         let Some(mut store) = self.store.take() else {
             return false;
         };
@@ -405,6 +492,9 @@ impl Batch {
         compilation: &Compilation,
         crates: &[u32],
     ) -> bool {
+        if self.needs_member_recheck() {
+            return false;
+        }
         let Some(mut store) = self.store.take() else {
             return false;
         };

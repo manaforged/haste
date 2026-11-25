@@ -1,5 +1,6 @@
 mod args;
 mod debug;
+mod help;
 
 use std::time::Instant;
 

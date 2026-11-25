@@ -29,6 +29,7 @@ pub struct Build {
     cases: Option<Batch>,
     binary: Option<Batch>,
     program: Option<Program>,
+    run_checked: bool,
     stamps: Vec<Watch>,
     outline_span: sema::census::Span,
 }
@@ -65,6 +66,42 @@ fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Res
     main_item(workspace, outline).ok_or_else(missing_target_error)
 }
 
+pub(super) fn load_members(
+    workspace: &graph::Workspace,
+    compilation: &mut Compilation,
+) -> Result<()> {
+    let members: Vec<usize> = compilation.outline.members(workspace).collect();
+    let mut loaded_more = false;
+    for member in members {
+        if compilation.outline.crates[member].partial() {
+            compilation.outline.load_crate(member)?;
+            loaded_more = true;
+        }
+    }
+    if loaded_more {
+        crate::macros::resolve(compilation)?;
+        let errors = compilation.outline.local_errors(workspace);
+        if !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("\n"));
+        }
+    }
+    Ok(())
+}
+
+fn check_and_print_member_items(
+    workspace: &graph::Workspace,
+    compilation: &mut Compilation,
+    cache: Cache,
+    target: Option<usize>,
+) -> Result<std::result::Result<Cache, i32>> {
+    let (cache, diags) = batch::check_member_items(workspace, compilation, cache, target)?;
+    if diags.is_empty() {
+        return Ok(Ok(cache));
+    }
+    report::print_formatted_diagnostics(&diags);
+    Ok(Err(101))
+}
+
 impl Build {
     /// Loads every crate of `workspace`, resolves its names and expands its macros, inferring and compiling nothing yet.
     pub fn load(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
@@ -83,28 +120,14 @@ impl Build {
             cases: None,
             binary: None,
             program: None,
+            run_checked: false,
             stamps,
             outline_span,
         })
     }
 
     fn load_members(&mut self, workspace: &graph::Workspace) -> Result<()> {
-        let members: Vec<usize> = self.compilation.outline.members(workspace).collect();
-        let mut loaded_more = false;
-        for member in members {
-            if self.compilation.outline.crates[member].partial() {
-                self.compilation.outline.load_crate(member)?;
-                loaded_more = true;
-            }
-        }
-        if loaded_more {
-            crate::macros::resolve(&mut self.compilation)?;
-            let errors = self.compilation.outline.local_errors(workspace);
-            if !errors.is_empty() {
-                anyhow::bail!("{}", errors.join("\n"));
-            }
-        }
-        Ok(())
+        load_members(workspace, &mut self.compilation)
     }
 
     /// Infers and compiles the `#[test]` or `case_` functions unless that is done.
@@ -200,6 +223,7 @@ impl Build {
     }
 
     fn again(&mut self, stale: &[(u32, u32)]) -> bool {
+        self.run_checked = false;
         if let Some(program) = &mut self.program {
             program.forget(&self.compilation.outline, Edited::Files(stale));
         }
@@ -211,6 +235,7 @@ impl Build {
     }
 
     fn reload(&mut self, workspace: &graph::Workspace, edited: Vec<u32>) -> bool {
+        self.run_checked = false;
         let mut crates: Vec<u32> = Vec::new();
         for krate in edited {
             if crates.contains(&krate) {
@@ -364,15 +389,35 @@ impl Build {
 
     /// Runs the binary's `main` with `args` as argv in a forked child, compiling each function on its first call and keeping that code for the next run.
     pub fn run(&mut self, workspace: &graph::Workspace, args: &[String]) -> Result<i32> {
-        let program = match self.program.take() {
-            Some(program) => program,
-            None => {
-                let main = require_main(workspace, &self.compilation.outline)?;
-                let (_, cache) = cache_with_substrate(workspace, true);
-                Program::new(&mut self.compilation, cache, main)?
+        let main = require_main(workspace, &self.compilation.outline)?;
+        let target = Some(main.krate as usize);
+        if self.program.is_some() {
+            if !self.run_checked {
+                let (_, cache) = cache_with_substrate(workspace, false);
+                if let Err(code) =
+                    check_and_print_member_items(workspace, &mut self.compilation, cache, target)?
+                {
+                    return Ok(code);
+                }
+                self.run_checked = true;
             }
-        };
-        let program = self.program.insert(program);
+            let Some(mut program) = self.program.take() else {
+                bail!("program missing");
+            };
+            let status = program.run(&mut self.compilation, args);
+            self.program = Some(program);
+            return status;
+        }
+        let (_, cache) = cache_with_substrate(workspace, true);
+        let cache =
+            match check_and_print_member_items(workspace, &mut self.compilation, cache, target)? {
+                Ok(cache) => cache,
+                Err(code) => return Ok(code),
+            };
+        self.run_checked = true;
+        let program = self
+            .program
+            .insert(Program::new(&mut self.compilation, cache, main)?);
         program.run(&mut self.compilation, args)
     }
 }
@@ -426,6 +471,18 @@ fn run_loaded(
         bind_prepped(workspace, &mut compilation, args, ahead);
     }
     let (slot, cache) = cache_with_substrate(workspace, true);
+    let cache = match check_and_print_member_items(
+        workspace,
+        &mut compilation,
+        cache,
+        Some(main.krate as usize),
+    )? {
+        Ok(cache) => cache,
+        Err(code) => {
+            std::mem::forget(compilation);
+            return Ok(code);
+        }
+    };
     let status = match crate::image::watch::enabled() {
         true => run_watched(workspace, &mut compilation, cache, main, args),
         false => {
