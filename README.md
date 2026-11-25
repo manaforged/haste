@@ -1,53 +1,53 @@
 # haste
 
-haste is a standalone Rust compiler, JIT runner, and executable builder with no LLVM dependency and no `target/` directory.
+haste is a standalone Rust compiler and JIT runner that runs, tests, and builds Rust crates with no LLVM dependency and no `target/` directory.
 
-You can run binaries and `#[test]` suites in memory (`haste run`, `haste test`), hot-reload edited functions into a running process (`haste run --watch`), or emit native ELF, Mach-O, and PE32+ executables directly without an external cross-linker (`haste build -o`). Plain `haste` commands run one-shot and leave no background daemon (`66.3 ms` on macOS ARM64 and `94.2 ms` on Linux x86-64 for a single-line edit check in `tests/diff`, or `0.7–2.3 ms` when nothing changed). Sub-20 ms edit checks (`8.4–9.0 ms`, `6.2x–7.4x` faster than `cargo check`) require opting into the background workspace daemon with `--daemon` (`haste build --daemon`) or `haste serve`. On the first run for a toolchain, `haste` performs a one-time index of the `rust-src` standard library and logs progress to stderr (`haste: indexing standard library (one-time)...`).
+Run binaries and `#[test]` suites in memory on Unix (`haste run`, `haste test`), hot-reload edited functions into a running process (`haste run --watch`), or emit native ELF, Mach-O, and PE32+ executables directly without an external cross-linker (`haste build -o`). Plain `haste` commands run one-shot and leave no background daemon.
 
-```bash
-haste run examples/hello -- --your-arg
-haste --release build -o ./hello examples/hello
-```
-
-haste is experimental (`version = "0.0.0"` in `Cargo.toml`, no tagged release yet). Commands, flags, and the library API may change. See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline, SSA optimization passes, register allocator, memory-mapped cache layers, and module layout.
+haste is experimental (`version = "0.0.0"` in `Cargo.toml`, no tagged release yet). Install it from this repository with `--git`, not `cargo install haste` (which installs an unrelated benchmarking crate on crates.io). See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline, SSA optimization passes, register allocator, memory-mapped cache layers, and module layout.
 
 ## Install and quickstart
 
-haste requires Rust 1.88 or newer with the `rust-src` component:
+Prerequisites: Rust 1.88 or newer with the `rust-src` component, plus a C compiler and `make` on macOS and Linux x86-64 GNU (required to build `tikv-jemallocator` from source).
 
 ```bash
 rustup component add rust-src
 cargo install --git https://github.com/manaforged/haste haste
+haste --version # prints: haste 0.0.0 (<commit>)
 ```
 
-To build from a local checkout instead:
+Try it on a standalone crate from any directory (the first run for a toolchain performs a one-time index of `rust-src` and logs `haste: indexing standard library (one-time)...` to stderr):
+
+```bash
+cargo new --bin haste-demo
+
+# Unix: run in memory via JIT (prints: Hello, world!)
+haste run haste-demo -- --your-arg
+
+# Windows (or any platform): emit and run a standalone native AOT executable
+haste --release build -o ./haste-demo-bin haste-demo
+./haste-demo-bin
+
+# Cross-compile a Linux x86-64 ELF binary from macOS (or vice versa) without a cross-linker
+haste --release build --target x86_64-unknown-linux-gnu -o ./haste-demo-linux haste-demo
+```
+
+To opt in to the resident workspace daemon on Unix for sub-20 ms edit checks (`8.4–9.0 ms` in `tests/diff`, `6.2x–7.4x` faster than `cargo check`), pass `--daemon` and pass the same workspace path to `serve status` and `serve stop`:
+
+```bash
+haste build --daemon haste-demo
+haste serve status haste-demo
+haste serve stop haste-demo
+```
+
+To watch and hot-reload edited functions on Unix, run `haste run --watch <path>` on a long-running crate (such as a loop or server); `haste` patches changed functions on their next call in the running process.
+
+To build from a local checkout instead of `cargo install --git`:
 
 ```bash
 cargo build --release -p haste
 ./target/release/haste --version
-```
-
-`haste --version` (or `-V`) prints the compiler version and embedded short commit hash (for example `haste 0.0.0 (abc12345)`).
-
-Run, hot-reload, build, and cross-compile `examples/hello`:
-
-```bash
-# 1. Run via JIT (one-shot; no target/ directory or daemon created)
-haste run examples/hello -- --your-arg
-
-# 2. Hot-reload changed functions into a running process
-haste run --watch examples/hello
-
-# 3. Emit a standalone native AOT executable
-haste --release build -o ./hello examples/hello
-
-# 4. Cross-compile a Linux x86-64 ELF binary from macOS (or vice versa) without a cross-linker
-haste --release build --target x86_64-unknown-linux-gnu -o ./hello-linux examples/hello
-
-# 5. Opt in to the resident workspace daemon for sub-20 ms edit checks
-haste build --daemon examples/hello
-haste serve status
-haste serve stop
+./target/release/haste run examples/hello -- --your-arg
 ```
 
 If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` automatically. If locked registry or git crates are missing locally, `haste` runs `cargo fetch` automatically. Build scripts (`build.rs`), declarative and procedural macros, `const fn`, `async`/`await`, generics, trait objects, SIMD, and C FFI run inside `haste`, with cached outputs stored under `~/.cache/haste`.
@@ -212,7 +212,7 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime numbers
 ```bash
 cargo test --locked -p haste-codegen                                                 # 41 unit tests
 cargo test --locked -p haste --lib                                                   # 30 unit tests on macOS, 29 on Linux, 28 on Windows
-cargo test --locked -p haste --test compiler_api --test soundness --test regressions # 32 integration tests on Unix (8 compiler_api, 21 soundness, 3 regressions; 30 on Windows)
+cargo test --locked -p haste --test compiler_api --test soundness --test regressions # 33 integration tests on Unix (8 compiler_api, 21 soundness, 4 regressions; 30 on Windows)
 bash scripts/check.sh                                                                # 144 differential functions (x 9 inputs = 1,296 checks), JIT + AOT vs rustc
 bash scripts/check.sh tests/async                                                    # 19 async functions (x 9 inputs = 171 checks), JIT + AOT vs rustc
 bash scripts/check.sh tests/proc-macro                                               # 3 proc-macro functions (x 9 inputs = 27 checks), JIT + AOT vs rustc

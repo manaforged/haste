@@ -79,21 +79,23 @@ fn cargo_home() -> Result<PathBuf> {
     home.context("no CARGO_HOME or HOME")
 }
 
-fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
-    Ok(std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
+fn read_subdirs(entries: std::fs::ReadDir) -> Vec<PathBuf> {
+    entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.is_dir())
-        .collect())
+        .collect()
+}
+
+fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(read_subdirs(
+        std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?,
+    ))
 }
 
 fn registry_dirs() -> Result<Vec<PathBuf>> {
     let dir = cargo_home()?.join("registry/src");
     match std::fs::read_dir(&dir) {
-        Ok(entries) => Ok(entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir())
-            .collect()),
+        Ok(entries) => Ok(read_subdirs(entries)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err).with_context(|| format!("reading {}", dir.display())),
     }
@@ -190,23 +192,21 @@ fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
 
 fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = patches_in(&dir.join(MANIFEST_FILE), dir)?;
-    for at in dir.ancestors() {
-        let config = [".cargo/config.toml", ".cargo/config"]
-            .map(|leaf| at.join(leaf))
+    let find_cfg = |base: &Path, leaves: [&str; 2]| {
+        leaves
             .into_iter()
-            .find(|path| path.is_file());
-        if let Some(config) = config {
+            .map(|leaf| base.join(leaf))
+            .find(|p| p.is_file())
+    };
+    for at in dir.ancestors() {
+        if let Some(config) = find_cfg(at, [".cargo/config.toml", ".cargo/config"]) {
             paths.extend(patches_in(&config, at)?);
         }
     }
-    if let Ok(home) = cargo_home() {
-        let config = ["config.toml", "config"]
-            .map(|leaf| home.join(leaf))
-            .into_iter()
-            .find(|path| path.is_file());
-        if let Some(config) = config {
-            paths.extend(patches_in(&config, &home)?);
-        }
+    if let Ok(home) = cargo_home()
+        && let Some(config) = find_cfg(&home, ["config.toml", "config"])
+    {
+        paths.extend(patches_in(&config, &home)?);
     }
     Ok(paths)
 }
@@ -250,6 +250,7 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
 fn run_cargo(manifest_dir: &Path, args: &[&str]) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
     let out = std::process::Command::new(cargo)
+        .current_dir(manifest_dir)
         .args(args)
         .args(["--quiet", "--manifest-path"])
         .arg(manifest_dir.join(MANIFEST_FILE))
@@ -600,56 +601,58 @@ fn load_filtered(
             None => bail!("{} is not in {LOCK_FILE}", root.display()),
         }
     }
-    let mut graph = features::resolve(
-        &packages,
-        targets,
-        &members,
-        features,
-        default_features,
-        all_features,
-    )?;
-    let is_external = |pkg: &Package| pkg.locked.is_registry() || pkg.locked.git().is_some();
-    if allow_fetch
-        && graph
-            .units
-            .iter()
-            .any(|u| missing[u.package].is_some() && is_external(&packages[u.package]))
-    {
-        eprintln!("haste: fetching missing dependencies with `cargo fetch`...");
-        if let Err(fetch_err) = run_cargo(&top, &["fetch", "--locked"]) {
-            let first = graph
-                .units
-                .iter()
-                .find_map(|u| missing[u.package].as_ref())
-                .map(|e| format!("{e:#}"))
-                .unwrap_or_default();
-            bail!("{first} (automatic `cargo fetch` failed: {fetch_err:#})");
-        }
-        let fresh_regs = registries_with_vendor(&top)?;
-        let retry_idxs: Vec<usize> = missing
-            .iter()
-            .enumerate()
-            .filter(|&(idx, err)| err.is_some() && is_external(&packages[idx]))
-            .map(|(idx, _)| idx)
-            .collect();
-        let retry_entries: Vec<Locked> = retry_idxs
-            .iter()
-            .map(|&idx| packages[idx].locked.clone())
-            .collect();
-        let (reloaded, retry_missing) = load_packages(retry_entries, &fresh_regs, &paths)?;
-        for ((idx, pkg), err) in retry_idxs.into_iter().zip(reloaded).zip(retry_missing) {
-            (packages[idx], missing[idx]) = (pkg, err);
-        }
-        resolve_deps(&mut packages);
-        graph = features::resolve(
-            &packages,
+    let resolve = |pkgs: &[Package]| {
+        features::resolve(
+            pkgs,
             targets,
             &members,
             features,
             default_features,
             all_features,
-        )?;
-    }
+        )
+    };
+    let is_external = |pkg: &Package| pkg.locked.is_registry() || pkg.locked.git().is_some();
+    let resolved = resolve(&packages);
+    let needs_fetch = match &resolved {
+        Ok(graph) => graph
+            .units
+            .iter()
+            .any(|u| missing[u.package].is_some() && is_external(&packages[u.package])),
+        Err(_) => missing
+            .iter()
+            .enumerate()
+            .any(|(idx, err)| err.is_some() && is_external(&packages[idx])),
+    };
+    let graph = if allow_fetch && needs_fetch {
+        eprintln!("haste: fetching missing dependencies with `cargo fetch`...");
+        if let Err(fetch_err) = run_cargo(&top, &["fetch", "--locked"]) {
+            let first = match &resolved {
+                Ok(graph) => graph
+                    .units
+                    .iter()
+                    .find_map(|u| missing[u.package].as_ref())
+                    .map(|e| format!("{e:#}")),
+                Err(err) => Some(format!("{err:#}")),
+            }
+            .unwrap_or_default();
+            bail!("{first} (automatic `cargo fetch` failed: {fetch_err:#})");
+        }
+        let fresh_regs = registries_with_vendor(&top)?;
+        let (retry_idxs, retry_entries): (Vec<usize>, Vec<Locked>) = missing
+            .iter()
+            .enumerate()
+            .filter(|&(idx, err)| err.is_some() && is_external(&packages[idx]))
+            .map(|(idx, _)| (idx, packages[idx].locked.clone()))
+            .unzip();
+        let (reloaded, retry_missing) = load_packages(retry_entries, &fresh_regs, &paths)?;
+        for ((idx, pkg), err) in retry_idxs.into_iter().zip(reloaded).zip(retry_missing) {
+            (packages[idx], missing[idx]) = (pkg, err);
+        }
+        resolve_deps(&mut packages);
+        resolve(&packages)?
+    } else {
+        resolved?
+    };
     for unit in &graph.units {
         if let Some(err) = missing[unit.package].take() {
             return Err(err);
