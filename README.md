@@ -67,7 +67,7 @@ If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` autom
 | Procedural macros (`derive`, attribute, function-like) | Supported (JIT + AOT) | `tests/proc-macro`, `tests/probes/pc` (some rustc-internal span/hygiene edge cases fail) |
 | Crates bundling native C static archives (`lib*.a`, e.g. `ring`, `tikv-jemalloc-sys`) | Unsupported in AOT | `haste build -o` emits dynamic system/C imports only; `haste build .` checks `haste`'s 42-package workspace (0 failed functions), and JIT loads `build.rs` archives via a generated shared library |
 | `reqwest` / `openssl-sys` | Untested | Not covered in `tests/probes` |
-| `#[tokio::test]` / custom test harnesses | Unsupported | `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` tests only |
+| `#[tokio::test]` (`current_thread`, `multi_thread`, `LocalSet`, `start_paused`) | Supported (JIT) | `haste test` expands `#[tokio::test]` and runs async tests; custom `harness = false` test runners remain unsupported |
 | Nightly `#![feature(...)]` crates | Unsupported | Stable syntax and stdlib only |
 
 ## Embedding haste as a library
@@ -228,7 +228,7 @@ bash scripts/rustc-ui.sh                                                        
 - **Incomplete borrow-checker and nightly coverage:** Full Polonius borrow checking, some `tests/ui/borrowck` and higher-ranked (`for<'a>`) lifetime edge cases, and nightly `#![feature(...)]` attributes are not yet supported. Keep `cargo check` or `rustc` in CI for complete toolchain verification across unreached dependency code, nightly attributes, and Polonius/HRTB edge cases.
 - **External dependencies stay lazy:** `haste` checks every concrete and generic function in the selected member crate before running or emitting code, while external crates and `std` are only parsed and inferred along reached paths.
 - **Static C archives in standalone AOT:** `haste build .` type-checks and lowers `haste`'s own multi-crate workspace (42 lockfile packages, including `tikv-jemalloc-sys`, with 0 failed functions), whereas `haste build -o` does not yet link native static C archives (`lib*.a`, such as `tikv-jemalloc-sys` or `ring`).
-- **Test harnesses and proc-macro edge cases:** `haste test` runs synchronous `fn()` and `fn() -> Result<(), E>` tests, not custom harnesses or `#[tokio::test]`, and procedural macros that rely on rustc-private span or hygiene internals can fail.
+- **Test harnesses and proc-macro edge cases:** `haste test` runs `#[test]` and `#[tokio::test]` functions (`fn()` and `fn() -> Result<(), E>`), not custom `harness = false` runners, and procedural macros that rely on rustc-private span or hygiene internals can fail.
 - **Platform, unwinding, and debug info caveats:** Windows runtime execution and emitted PE32+ executables are experimental (`serve`, `--daemon`, and `--watch` require Unix). `haste prep` and `--prepared` are x86-64 Linux only and compile an internal `rustc_private` driver with `RUSTC_BOOTSTRAP=1`. Standalone AOT executables emit symbol tables (`HASTE_SYMBOLS`) and DWARF `.debug_line` (`HASTE_DEBUG_INFO`), not full `.debug_info` variable/type DIEs. In `--release` builds without `catch_unwind` or threads, out-of-bounds indexing and divide-by-zero emit hardware traps instead of unwinding, and panicking across `extern "C"` frames aborts (`extern "C-unwind"` unwinds). On macOS, Hardened Runtime or App Sandbox restrictions can block dual-mapped `mach_vm_remap` JIT pages.
 
 ## Contributing

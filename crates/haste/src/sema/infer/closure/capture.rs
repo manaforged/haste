@@ -106,6 +106,7 @@ impl<'a> Infer<'_, 'a> {
                 drop_at = Some((out.len(), ty));
             }
             out.push(step);
+            ty = self.substitute(ty);
             ty = step_field_ty(self.cx, ty, step)?;
         }
         let ty = self.resolve_opt(ty);

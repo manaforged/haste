@@ -110,6 +110,7 @@ impl Infer<'_, '_> {
         self.settle_operators(true)?;
         self.settle_projection_loop()?;
         self.settle_casts(true)?;
+        self.settle_offsets()?;
         self.settle_captures()?;
         self.captures_settled = true;
         self.settle_obligations()?;
