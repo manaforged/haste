@@ -171,7 +171,9 @@ mod unix_ipc {
 
     fn socket_name_for(key: u64) -> String {
         if cfg!(target_os = "linux") {
-            format!("haste/{key:016x}")
+            // SAFETY: geteuid takes no arguments and reads the process's effective user id.
+            let uid = unsafe { libc::geteuid() };
+            format!("haste/{uid}/{key:016x}")
         } else {
             std::env::temp_dir()
                 .join(format!("haste-{key:016x}.sock"))

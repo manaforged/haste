@@ -38,7 +38,17 @@ impl Lower<'_, '_> {
             let mark = self.owned.len();
             self.bind_matched(arm.pat, place, from.clone())?;
             if let Some(guard) = arm.guard {
-                let Some(ok) = self.expr(guard)? else {
+                let outer_pending = std::mem::take(&mut self.pending);
+                let guard_mark = self.owned.len();
+                let ok = self.expr(guard)?;
+                self.end_scope(guard_mark)?;
+                if !self.open {
+                    self.owned.truncate(mark);
+                    self.enter(next);
+                    continue;
+                }
+                self.pending = outer_pending;
+                let Some(ok) = ok else {
                     bail!("guard with no value");
                 };
                 self.guard_pass(ok, mark, next);

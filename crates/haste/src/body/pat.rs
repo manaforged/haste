@@ -327,7 +327,11 @@ impl Cursor<'_> {
     pub fn literal(&mut self) -> Result<super::ExprId> {
         let at = self.at;
         let lit = match self.kind() {
-            TokenKind::Literal { kind, .. } => lit_kind(kind),
+            TokenKind::Literal { kind, suffix_start } => {
+                let text = self.src.text(at);
+                let suffix = text.get(suffix_start as usize..).unwrap_or("");
+                lit_kind(kind, suffix)
+            }
             TokenKind::Ident if self.src.text(at) == "true" => Lit::Bool(true),
             TokenKind::Ident if self.src.text(at) == "false" => Lit::Bool(false),
             _ => return self.fail("expected a literal"),
@@ -337,9 +341,16 @@ impl Cursor<'_> {
     }
 }
 
-fn lit_kind(kind: rustc_lexer::LiteralKind) -> Lit {
+/// Supported floating-point literal type suffixes.
+pub const FLOAT_SUFFIXES: [&str; 4] = ["f16", "f32", "f64", "f128"];
+
+fn lit_kind(kind: rustc_lexer::LiteralKind, suffix: &str) -> Lit {
     use rustc_lexer::LiteralKind as Kind;
     match kind {
+        Kind::Int {
+            base: rustc_lexer::Base::Decimal,
+            ..
+        } if FLOAT_SUFFIXES.contains(&suffix) => Lit::Float,
         Kind::Int { .. } => Lit::Int,
         Kind::Float { .. } => Lit::Float,
         Kind::Char { .. } => Lit::Char,

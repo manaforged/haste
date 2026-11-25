@@ -53,6 +53,12 @@ impl OptArena {
         }
     }
 
+    fn seal(&mut self) {
+        if let Some(arena) = &mut self.0 {
+            arena.seal();
+        }
+    }
+
     fn is_low(&self) -> bool {
         self.0.as_ref().is_some_and(Arena::is_low)
     }
@@ -69,6 +75,7 @@ pub struct Image {
     stubs: Memory,
     shared: Mutex<OptArena>,
     unwind_head: usize,
+    stub_lock: usize,
     state: Mutex<OptArena>,
     tables: Mutex<HashMap<Vec<Word>, i64>>,
     fixups: Mutex<HashMap<usize, Vec<usize>>>,
@@ -253,24 +260,27 @@ impl Image {
         mode: ImageMode,
         (shared_bytes, state_bytes, table_slots): (usize, usize, usize),
     ) -> Result<Image> {
-        let (shared, unwind_head, low, table, state, capacity) = if mode == ImageMode::Jit {
-            let capacity = reached.list.len().max(table_slots);
-            let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
-            let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
-            let mut shared = Arena::shared(shared_bytes)?;
-            let unwind_head = shared.alloc(size_of::<AtomicUsize>())?;
-            crate::host::unwind::set_jit_unwind_head(unwind_head);
-            (
-                OptArena(Some(shared)),
-                unwind_head,
-                OptArena(Some(low)),
-                table,
-                OptArena(Some(Arena::private(state_bytes)?)),
-                capacity,
-            )
-        } else {
-            (OptArena(None), 0, OptArena(None), 0, OptArena(None), 0)
-        };
+        let (shared, unwind_head, stub_lock, low, table, state, capacity) =
+            if mode == ImageMode::Jit {
+                let capacity = reached.list.len().max(table_slots);
+                let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
+                let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
+                let mut shared = Arena::shared(shared_bytes)?;
+                let unwind_head = shared.alloc(size_of::<AtomicUsize>())?;
+                let stub_lock = shared.alloc(size_of::<std::sync::atomic::AtomicU32>())?;
+                crate::host::unwind::set_jit_unwind_head(unwind_head);
+                (
+                    OptArena(Some(shared)),
+                    unwind_head,
+                    stub_lock,
+                    OptArena(Some(low)),
+                    table,
+                    OptArena(Some(Arena::private(state_bytes)?)),
+                    capacity,
+                )
+            } else {
+                (OptArena(None), 0, 0, OptArena(None), 0, OptArena(None), 0)
+            };
         Ok(Image {
             table,
             _low: low,
@@ -281,6 +291,7 @@ impl Image {
             stubs: Memory::default(),
             shared: Mutex::new(shared),
             unwind_head,
+            stub_lock,
             state: Mutex::new(state),
             tables: Mutex::default(),
             fixups: Mutex::default(),

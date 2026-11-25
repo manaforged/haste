@@ -499,7 +499,7 @@ pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
 }
 
 /// Prepares `func`; when a loop reads a value that spilled, splits it at that loop's header, keeps the splits whose parameter then gets a register, and returns the split copy with its preparation when it leaves less weighted spill traffic than the unsplit one.
-pub(crate) fn prepare_split<R: Copy + PartialEq>(
+pub(crate) fn prepare_split<R: Copy + PartialEq + std::fmt::Debug>(
     func: &Function,
     regs: &Regs<R>,
     (weighed, preserve_tc): (bool, bool),
@@ -554,7 +554,7 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
     })
 }
 
-pub(crate) fn prepare<R: Copy + PartialEq>(
+pub(crate) fn prepare<R: Copy + PartialEq + std::fmt::Debug>(
     func: &Function,
     regs: &Regs<R>,
     (weighed, preserve_tc): (bool, bool),
@@ -577,7 +577,7 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
         (&order, &copied, weighed, preserve_tc),
         &abi.params,
         &classify,
-    );
+    )?;
     let (saves, gp_mask) = ordered_saves(
         if func.save_all_regs {
             regs.saved

@@ -143,17 +143,10 @@ impl Emit<'_> {
         };
         let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
         let direct = self.plan.through[callee.index()];
-        let arg_uses = |r: Reg| {
-            abi.params.iter().any(|l| match *l {
-                Loc::Int(p) => p == r,
-                Loc::Pair(lo, hi) => lo == r || hi == r,
-                _ => false,
-            })
-        };
         let held = self.reg_of(*callee).filter(|&reg| {
             !matches!(reg, Reg::Rax | Reg::Rcx | Reg::Rbp | Reg::Rsp)
                 && !self.frame.saves.contains(&reg)
-                && !arg_uses(reg)
+                && !abi.clobbers(reg)
         });
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {

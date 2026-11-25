@@ -94,38 +94,6 @@ pub(in crate::arm64) fn madd_parts(
     None
 }
 
-fn is_mem_barrier(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Store(..)
-            | Op::StackStore(..)
-            | Op::Call { .. }
-            | Op::TryCall { .. }
-            | Op::VolatileLoad(..)
-            | Op::VolatileStore(..)
-            | Op::AtomicLoad(..)
-            | Op::AtomicStore(..)
-            | Op::AtomicRmw(..)
-            | Op::AtomicCas(..)
-            | Op::Fence(..)
-            | Op::Copy(..)
-            | Op::Move(..)
-            | Op::Trap
-            | Op::Trapz(..)
-    )
-}
-
-fn is_sload_barrier(op: &Op) -> bool {
-    is_mem_barrier(op)
-        || matches!(
-            op,
-            Op::Binary(
-                Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem,
-                ..
-            )
-        )
-}
-
 fn sload_addr_preserved(
     func: &Function,
     plan: &Plan<Reg>,
@@ -162,7 +130,7 @@ fn can_elide_sload(
     sload_addr_preserved(func, plan, (b_idx, lpos, cpos), op)
         && !func.blocks[b_idx].insts[lpos + 1..cpos]
             .iter()
-            .any(|&i| is_sload_barrier(&func.insts[i.index()].op))
+            .any(|&i| func.insts[i.index()].op.is_load_barrier())
 }
 
 pub(super) fn try_fuse_sload_extend(

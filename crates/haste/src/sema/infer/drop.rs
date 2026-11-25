@@ -24,17 +24,27 @@ impl Infer<'_, '_> {
             self.cx.drops_local.insert(ty, known);
             return Ok(known);
         }
-        if self.cx.drop_stack.contains(&ty) {
+        if let Some(pos) = self.cx.drop_stack.iter().position(|&t| t == ty) {
+            self.cx.drop_cycle_at = self.cx.drop_cycle_at.min(pos);
             return Ok(false);
         }
         let before = self.cx.quiet_mark();
+        let saved_cycle = self.cx.drop_cycle_at;
+        self.cx.drop_cycle_at = usize::MAX;
+        let depth = self.cx.drop_stack.len();
         self.cx.drop_stack.push(ty);
         let result = self.parts_need_drop(ty);
         self.cx.drop_stack.pop();
+        let sub_cycle = self.cx.drop_cycle_at;
+        self.cx.drop_cycle_at = saved_cycle.min(if sub_cycle < depth {
+            sub_cycle
+        } else {
+            usize::MAX
+        });
         let needs = result?;
         if self.cx.quiet_mark() == before
             && !self.has_vars(ty)
-            && (needs || (self.cx.drop_stack.is_empty() && !has_uninferred_closure(self.cx, ty)))
+            && (needs || (sub_cycle >= depth && !has_uninferred_closure(self.cx, ty)))
         {
             self.cx.store.lookups.drops.insert(ty, needs);
             self.cx.drops_local.insert(ty, needs);
@@ -72,8 +82,10 @@ impl Infer<'_, '_> {
             return Some(env);
         }
         let saved = std::mem::take(&mut self.cx.drop_stack);
+        let saved_cycle = std::mem::replace(&mut self.cx.drop_cycle_at, usize::MAX);
         let env = self.cx.ensure_closure(ty).map(|info| info.env);
         self.cx.drop_stack = saved;
+        self.cx.drop_cycle_at = saved_cycle;
         env
     }
 

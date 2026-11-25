@@ -162,7 +162,14 @@ impl Lower<'_, '_> {
         fail: Option<Block>,
     ) -> Result<Option<(Place, Option<(Value, Value)>, Option<usize>)>> {
         if let Kind::Array(_, len_ty) = *self.cx.types.kind(ty) {
-            let Some(at) = place else { return Ok(None) };
+            let at = match place {
+                Some(at) => at,
+                None => Place {
+                    base: Base::Addr(self.address_or_dangling(None, ty)?),
+                    offset: 0,
+                    repr: Repr::Zst,
+                },
+            };
             return Ok(Some((at, None, Some(self.len(len_ty)? as usize))));
         }
         let Some((data, len)) = self.data_len(place, ty)? else {

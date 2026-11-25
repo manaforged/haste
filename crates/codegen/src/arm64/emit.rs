@@ -12,6 +12,8 @@ use crate::frame::{
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, IntCC, Op, SigRef, Value};
 use crate::park::ParkReg;
 
+const ARG_SCRATCH: Reg = C;
+
 impl Emit<'_> {
     pub(super) fn trap_target(&mut self) -> Label {
         *self.trap_label.get_or_insert_with(|| self.asm.label())
@@ -247,11 +249,11 @@ impl Emit<'_> {
                     self.clobber_reg(dst);
                 }
                 ArgStep::Save(src) => {
-                    self.asm.mov(A, src);
-                    self.clobber_reg(A);
+                    self.asm.mov(ARG_SCRATCH, src);
+                    self.clobber_reg(ARG_SCRATCH);
                 }
                 ArgStep::Restore(dst) => {
-                    self.asm.mov(dst, A);
+                    self.asm.mov(dst, ARG_SCRATCH);
                     self.clobber_reg(dst);
                 }
                 ArgStep::Load(val, dst) => self.raw(dst, val),
@@ -302,11 +304,11 @@ impl Emit<'_> {
                     self.clobber_reg(dst);
                 }
                 ArgStep::Save(src) => {
-                    self.asm.mov(A, src);
-                    self.clobber_reg(A);
+                    self.asm.mov(ARG_SCRATCH, src);
+                    self.clobber_reg(ARG_SCRATCH);
                 }
                 ArgStep::Restore(dst) => {
-                    self.asm.extend(false, width(dst), dst, A);
+                    self.asm.extend(false, width(dst), dst, ARG_SCRATCH);
                     self.clobber_reg(dst);
                 }
                 ArgStep::Load(..) => {}

@@ -1,5 +1,4 @@
 use super::super::{const_of, def_entry, def_inst, local_single, preserved};
-use super::is_mem_barrier;
 use crate::alloc::Plan;
 use crate::arm64::asm::Reg;
 use crate::ir::{Binary, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
@@ -249,7 +248,7 @@ fn try_fuse_insert_loads(
     let min_pos = lo.pos.min(hi.pos);
     if func.blocks[b_idx].insts[min_pos + 1..pos]
         .iter()
-        .any(|&i| is_mem_barrier(&func.insts[i.index()].op))
+        .any(|&i| func.insts[i.index()].op.is_mem_barrier())
     {
         return false;
     }

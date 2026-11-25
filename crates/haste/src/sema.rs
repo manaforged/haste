@@ -57,6 +57,8 @@ pub struct Context<'a> {
     pub(super) eval_errors: Table<reach::Instance, String>,
     pub(super) eval_stack: Vec<reach::Instance>,
     pub(super) drop_stack: Vec<ty::Ty>,
+    pub(super) drop_cycle_at: usize,
+    pub(super) discr_visiting: Vec<ItemRef>,
     pub(super) form_stack: Vec<(infer::Form, usize)>,
     global_asm: Option<Arc<global_asm::Table>>,
     langs: Option<Arc<traits::Langs>>,

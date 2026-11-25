@@ -18,6 +18,7 @@ use super::{Lower, repr};
 
 const DROP_LIST_ACTIVE_BIT: i64 = crate::host::unwind::DROP_ACTIVE as i64;
 const DROP_LIST_CLEAR_MASK: i64 = !(crate::host::unwind::DROP_ACTIVE) as u8 as i64;
+const MAX_UNWIND_ARRAY_PARTS: i64 = 64;
 
 fn skips_fields(cx: &Context<'_>, item: ItemRef) -> bool {
     cx.lang(item) == Some("manually_drop") || cx.item(item).1.kind == ItemKind::Union
@@ -118,7 +119,12 @@ impl Lower<'_, '_> {
     fn single_variant_fields(&mut self, ty: Ty) -> Result<Option<Vec<Ty>>> {
         Ok(match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => Some(self.cx.types.substs(items).to_vec()),
-            Kind::Array(element, len) => Some(vec![element; self.len(len)? as usize]),
+            Kind::Array(element, len) => {
+                let n = self.len(len)?;
+                (0..=MAX_UNWIND_ARRAY_PARTS)
+                    .contains(&n)
+                    .then(|| vec![element; n as usize])
+            }
             Kind::Adt(..) => match self.adt_variants(ty)? {
                 Some(variants) => (variants.len() == 1).then(|| variants[0].clone()),
                 None => Some(Vec::new()),
@@ -431,9 +437,11 @@ impl Lower<'_, '_> {
         ty: Ty,
         place: Option<Place>,
     ) -> Result<()> {
+        if let Kind::Array(element, len) = *self.cx.types.kind(ty) {
+            return self.open_drop_array(at, path, (ty, element, len), place);
+        }
         let variants: Fields = match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
-            Kind::Array(element, len) => vec![vec![element; self.len(len)? as usize]].into(),
             Kind::Adt(..) => match self.adt_variants(ty)? {
                 Some(variants) => variants,
                 None => return Ok(()),
@@ -449,6 +457,59 @@ impl Lower<'_, '_> {
                 lower.drop_path(at, &sub, field_ty, part)
             },
         )
+    }
+
+    fn drop_array_run(
+        &mut self,
+        element: Ty,
+        base: Value,
+        (cursor, end, stride): (i64, i64, i64),
+        origin: TyOrigin,
+    ) -> Result<()> {
+        if end > cursor {
+            let start = self.ins().iadd_imm(base, cursor * stride);
+            let count = self.ins().iconst(Type::I64, end - cursor);
+            self.drop_elements(element, start, count, origin)?;
+        }
+        Ok(())
+    }
+
+    fn open_drop_array(
+        &mut self,
+        at: usize,
+        path: &[(u32, u32)],
+        (ty, element, len): (Ty, Ty, Ty),
+        place: Option<Place>,
+    ) -> Result<()> {
+        let total = self.len(len)?;
+        if total <= 0 || !needs_drop(self.cx, element)? {
+            return Ok(());
+        }
+        let mut tracked: Vec<u32> = self.owned[at]
+            .parts
+            .iter()
+            .filter(|part| part.path.len() > path.len() && part.path.starts_with(path))
+            .map(|part| part.path[path.len()].1)
+            .filter(|&idx| i64::from(idx) < total)
+            .collect();
+        tracked.sort_unstable();
+        tracked.dedup();
+        let stride = self.cx.layout(element)?.size.bytes() as i64;
+        let base = self.address_or_dangling(place, ty)?;
+        let origin = TyOrigin::from_root(self.owned[at].root, self.typed).stepped(path);
+        let mut cursor = 0_i64;
+        for idx in tracked {
+            let idx64 = i64::from(idx);
+            self.drop_array_run(element, base, (cursor, idx64, stride), origin.clone())?;
+            let part = place
+                .map(|p| self.part_place(p, ty, (0, idx)))
+                .transpose()?;
+            let mut sub = path.to_vec();
+            sub.push((0, idx));
+            self.drop_path(at, &sub, element, part)?;
+            cursor = idx64 + 1;
+        }
+        self.drop_array_run(element, base, (cursor, total, stride), origin)
     }
 
     fn each_field(

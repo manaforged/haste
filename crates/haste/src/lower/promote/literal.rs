@@ -263,6 +263,12 @@ impl Lower<'_, '_> {
         let reloc_start = relocs.len();
         self.write_blob(scope, (item, elem), at, (out, relocs), depth)?;
         let item_relocs: Vec<RodataReloc> = relocs[reloc_start..].to_vec();
+        if stride == 0 && item_relocs.is_empty() {
+            return Some(());
+        }
+        if at.checked_add(count.checked_mul(stride)?)? > out.len() {
+            return None;
+        }
         for index in 1..count {
             let dst = at + index * stride;
             out.copy_within(at..at + stride, dst);

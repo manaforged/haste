@@ -165,6 +165,7 @@ pub struct Infer<'c, 'a> {
     captures_settled: bool,
     auto_stack: Vec<(ItemRef, Ty)>,
     matches: Vec<(ExprId, Ty, crate::body::List)>,
+    active_discr: Option<(ItemRef, Vec<Option<i128>>, Vec<bool>)>,
 }
 
 impl Drop for Infer<'_, '_> {
@@ -386,6 +387,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             captures_settled: false,
             auto_stack: Vec::new(),
             matches: Vec::new(),
+            active_discr: None,
         }
     }
 

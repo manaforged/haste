@@ -267,7 +267,7 @@ impl Infer<'_, '_> {
                 Some(primitive) => self.cx.types.prim(primitive),
                 None => numeric(false).unwrap_or_else(|| self.fresh(Kind::IntVar)),
             },
-            Lit::Float => match ["f16", "f32", "f64", "f128"]
+            Lit::Float => match crate::body::FLOAT_SUFFIXES
                 .iter()
                 .find(|suffix| text.ends_with(*suffix))
             {

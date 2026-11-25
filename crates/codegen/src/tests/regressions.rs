@@ -461,3 +461,44 @@ fn x64_abort_on_unwind_does_not_shrink_wrap_thread_cell() {
         "abort_on_unwind must establish frame prologue (`push rbp`) at function entry, not shrink-wrap"
     );
 }
+
+#[test]
+fn arm64_dict_arg_not_clobbered_by_arg_cycle() {
+    let mut sig = Signature::new(CallConv::Internal);
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::special(
+        Type::I64,
+        crate::ir::ArgumentPurpose::Dict,
+    ));
+    sig.returns.push(AbiParam::new(Type::I64));
+
+    let mut func = crate::ir::Function::new(sig.clone());
+    let mut b = crate::FunctionBuilder::new(&mut func);
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    let csig = b.import_signature(sig);
+    b.switch_to_block(entry);
+    let p0 = b.block_params(entry)[0];
+    let p1 = b.block_params(entry)[1];
+    let dict = b.block_params(entry)[2];
+    let sym = b.ins().symbol(1);
+    let call = b.ins().call_indirect(csig, sym, &[p1, p0, dict]);
+    let res = b.inst_results(call)[0];
+    let out = b.ins().iadd_imm(res, 1);
+    b.ins().return_(&[out]);
+    func.entry = Some(entry);
+
+    let code = compile(func, &full_arm64()).expect("arm64 dict cycle compiles");
+    let words: Vec<u32> = code
+        .bytes()
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mov_x9_x0 = 0xAA00_03E9;
+    let mov_x9_x1 = 0xAA01_03E9;
+    assert!(
+        !words.contains(&mov_x9_x0) && !words.contains(&mov_x9_x1),
+        "arm64 arg_steps cycle break must not clobber Dict register x9; words={words:#x?}"
+    );
+}

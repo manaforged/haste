@@ -304,7 +304,7 @@ impl Jit {
             }
             Err(Stop::Asked) => return false,
         };
-        self.reply(id, reply);
+        self.reply(id, index, reply);
         true
     }
 

@@ -684,7 +684,10 @@ pub fn parse_int(text: &str) -> Result<(u128, Option<Primitive>)> {
     let suffix = if suffix.is_empty() {
         None
     } else {
-        Some(Primitive::named(suffix).ok_or_else(|| anyhow::anyhow!("bad suffix {suffix}"))?)
+        let prim = Primitive::named(suffix)
+            .filter(|prim| crate::sema::ty::int_info(*prim).is_some())
+            .ok_or_else(|| anyhow::anyhow!("invalid integer literal suffix `{suffix}`"))?;
+        Some(prim)
     };
     Ok((value, suffix))
 }

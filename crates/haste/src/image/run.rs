@@ -147,7 +147,7 @@ impl Image {
         let mut from = 0;
         while from < items.len() {
             let (done, status) = self.run_from(from, &items[from..], quiet_stderr, &invoke)?;
-            if status == 0 {
+            if status == 0 && done >= items.len() - from {
                 break;
             }
             let crashed = (from + done).min(items.len() - 1);
@@ -285,7 +285,7 @@ pub(crate) fn interrupted(_status: i32) -> bool {
 #[cfg(unix)]
 pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
     std::io::Write::flush(&mut std::io::stdout())?;
-    // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
+    // SAFETY: stdout is flushed, no active scope jobs run during fork (any worker pool threads are parked idle and forked children bypass the pool via `std::process::id() != self.pid`), and the child exits via `_exit`.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         bail!("fork failed: {}", std::io::Error::last_os_error());

@@ -452,6 +452,10 @@ if [ "$mode" = "all" ]; then
     printf '| **total** | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | **%s** |\n' "$total_tested" "$total_skipped" "$total_passed" "$total_other" "$total_failed" "$total_crashed" "$total_rate"
 fi
 
+if [ -n "${HASTE_UI_TSV:-}" ] && [ -f "$tmp/failures.tsv" ]; then
+    cp "$tmp/failures.tsv" "$HASTE_UI_TSV"
+fi
+
 if [ -s "$tmp/failures.tsv" ]; then
     printf '\n### Top 10 Failing Tests\n\n'
     head -n 10 "$tmp/failures.tsv" | while IFS=$'\t' read -r f_suite f_name f_reason; do

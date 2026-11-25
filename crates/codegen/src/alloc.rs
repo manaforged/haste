@@ -6,6 +6,7 @@ mod hints;
 pub(crate) mod hoist;
 mod preserved;
 mod setup;
+pub(crate) mod verify;
 pub(crate) mod walk;
 
 pub(crate) use addr::{atomic_elidable_addrs, iadd_sub_const};
@@ -288,13 +289,13 @@ fn spill_cost<R>(
     })
 }
 
-pub(crate) fn plan<R: Copy + PartialEq>(
+pub(crate) fn plan<R: Copy + PartialEq + std::fmt::Debug>(
     func: &Function,
     regs: &Regs<R>,
     (order, copied, weighed, preserve_tc): (&[Block], &[bool], bool, bool),
     params: &[Loc<R>],
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
-) -> Plan<R> {
+) -> Result<Plan<R>, String> {
     let count = func.types.len();
     let mut locations = vec![Location::Slot; count];
     fold::consts(func, regs.absolute_calls, &mut locations);
@@ -509,7 +510,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     } else {
         hoist::Hoist::empty()
     };
-    Plan {
+    let plan = Plan {
         locations,
         fused,
         used,
@@ -526,7 +527,11 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         clean_bits,
         spill_cost,
         hoist,
+    };
+    if crate::verify::verify_passes_enabled() {
+        verify::verify_plan(func, &live, &plan, regs, (order, copied, &copies))?;
     }
+    Ok(plan)
 }
 
 impl<R: Copy> Plan<R> {

@@ -387,7 +387,9 @@ pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
 pub(crate) const PANIC_BOUNDS_CHECK: &str = "panic_bounds_check";
 
 pub(crate) fn unwind_enabled(cx: &Context<'_>, reached: &Reached) -> bool {
-    crate::profile() != crate::outline::tree::Profile::Release || reached.has_catch_unwind(cx)
+    crate::profile() != crate::outline::tree::Profile::Release
+        || reached.is_incremental()
+        || reached.has_catch_unwind(cx)
 }
 
 /// Infers declared function `index` when it has no body yet, and returns whether it did.

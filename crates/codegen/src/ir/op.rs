@@ -182,6 +182,38 @@ impl Op {
             )
     }
 
+    pub(crate) fn is_mem_barrier(&self) -> bool {
+        matches!(
+            self,
+            Op::Store(..)
+                | Op::StackStore(..)
+                | Op::Copy(..)
+                | Op::Move(..)
+                | Op::Fence(..)
+                | Op::Call { .. }
+                | Op::TryCall { .. }
+                | Op::VolatileLoad(..)
+                | Op::VolatileStore(..)
+                | Op::AtomicLoad(..)
+                | Op::AtomicStore(..)
+                | Op::AtomicRmw(..)
+                | Op::AtomicCas(..)
+                | Op::Trap
+                | Op::Trapz(..)
+        )
+    }
+
+    pub(crate) fn is_load_barrier(&self) -> bool {
+        self.is_mem_barrier()
+            || matches!(
+                self,
+                Op::Binary(
+                    Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem,
+                    ..
+                )
+            )
+    }
+
     #[inline]
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {

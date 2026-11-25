@@ -37,31 +37,6 @@ pub(super) fn preserved(
     )
 }
 
-pub(super) fn may_barrier_mem(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Store(..)
-            | Op::StackStore(..)
-            | Op::Copy(..)
-            | Op::Move(..)
-            | Op::Fence(..)
-            | Op::Call { .. }
-            | Op::TryCall { .. }
-            | Op::VolatileLoad(..)
-            | Op::VolatileStore(..)
-            | Op::AtomicLoad(..)
-            | Op::AtomicStore(..)
-            | Op::AtomicRmw(..)
-            | Op::AtomicCas(..)
-            | Op::Trap
-            | Op::Trapz(..)
-            | Op::Binary(
-                Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem,
-                ..
-            )
-    )
-}
-
 pub(in crate::x64) fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
     crate::alloc::iadd_sub_const(op, |v| plan.const_of(v))
 }

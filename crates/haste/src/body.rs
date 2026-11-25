@@ -6,6 +6,7 @@ pub(crate) mod cursor;
 mod expr;
 pub mod literal;
 mod pat;
+pub use pat::FLOAT_SUFFIXES;
 mod path;
 pub mod sig;
 mod stmt;

@@ -182,19 +182,12 @@ impl Emit<'_> {
         };
         let abi = classify(&self.func.sigs[sig.index()], self.packing)?;
         let direct = self.plan.through[callee.index()];
-        let arg_uses = |r: Reg| {
-            abi.params.iter().any(|l| match *l {
-                Loc::Int(p) => p == r,
-                Loc::Pair(lo, hi) => lo == r || hi == r,
-                _ => false,
-            })
-        };
         let (target, extra) = if direct.is_none() {
             match self.plan.reg_of(*callee).filter(|&reg| {
                 matches!(reg, D | S | T | Reg(14) | Reg(15))
                     && !matches!(reg, A | C | IP | FP | LR | SP)
                     && !self.frame.saves.contains(&reg)
-                    && !arg_uses(reg)
+                    && !abi.clobbers(reg)
             }) {
                 Some(reg) => (reg, None),
                 None => (T, Some((*callee, T))),

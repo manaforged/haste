@@ -73,6 +73,9 @@ impl Jit {
         let Some(stubs) = self.image.stubs.span() else {
             bail!("no stub memory");
         };
+        self.image.stubs.seal();
+        self.image.pass.memory.seal();
+        crate::sync::lock(&self.image.shared).seal();
         let (ask, answer) = (crate::image::pipe()?, crate::image::pipe()?);
         let out = if piped {
             Some(crate::image::pipe()?)
@@ -94,7 +97,12 @@ impl Jit {
                 });
                 (child_ask, child_answer, out)
             };
-            stub::connect(image.table, stubs, (child_ask, child_answer));
+            stub::connect(
+                image.table,
+                stubs,
+                (child_ask, child_answer),
+                image.stub_lock,
+            );
             crate::host::unwind::set_jit_unwind_head(image.unwind_head);
             body(image, out)
         })?;
@@ -225,21 +233,20 @@ impl Jit {
     }
 
     #[cfg(unix)]
-    pub(super) fn reply(&mut self, id: usize, code: usize) {
+    pub(super) fn reply(&mut self, id: usize, index: usize, code: usize) {
         let Some(child) = self.children[id].as_mut() else {
             return;
         };
-        if child
-            .answers
-            .write_all(&(code as u64).to_le_bytes())
-            .is_err()
-        {
+        let mut frame = [0u8; 16];
+        frame[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        frame[8..].copy_from_slice(&(code as u64).to_le_bytes());
+        if child.answers.write_all(&frame).is_err() {
             child.asks = None;
         }
     }
 
     #[cfg(not(unix))]
-    pub(super) fn reply(&mut self, _id: usize, _code: usize) {}
+    pub(super) fn reply(&mut self, _id: usize, _index: usize, _code: usize) {}
 
     #[cfg(unix)]
     pub(super) fn reap(&mut self) -> Vec<(usize, Ended)> {

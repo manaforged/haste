@@ -295,7 +295,7 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn drop_elements(
+    pub(super) fn drop_elements(
         &mut self,
         inner: Ty,
         data: Value,
