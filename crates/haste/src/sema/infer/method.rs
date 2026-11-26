@@ -432,14 +432,13 @@ impl<'a> Infer<'_, 'a> {
             ));
         }
         let hints = self.expected_inputs(&types[1..], ret, expected);
-        for ((arg, param), hint) in given.into_iter().zip(types.into_iter().skip(1)).zip(hints) {
-            self.call_arg(
-                Some((item, &substs[..])),
-                ExprId(arg),
-                (param, hint),
-                &mut None,
-            )?;
-        }
+        self.call_args_ordered(
+            &given,
+            &types[1..],
+            &hints,
+            Some((item, &substs[..])),
+            &mut None,
+        )?;
         Ok(ret)
     }
 }

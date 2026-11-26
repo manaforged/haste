@@ -293,21 +293,33 @@ impl Infer<'_, '_> {
         let hints = self.expected_inputs(&params, ret, expected);
         let value_count = params.len();
         let def_ref = def.as_ref().map(|(item, substs)| (*item, &substs[..]));
-        for (&arg, (&param, &hint)) in args[..value_count].iter().zip(params.iter().zip(&hints)) {
-            if !self.is_deferred_closure_arg(ExprId(arg)) {
-                self.call_arg(def_ref, ExprId(arg), (param, hint), &mut held)?;
-            }
-        }
-        self.release_obligation(&mut held)?;
-        for (&arg, (&param, &hint)) in args[..value_count].iter().zip(params.iter().zip(&hints)) {
-            if self.is_deferred_closure_arg(ExprId(arg)) {
-                self.call_arg(def_ref, ExprId(arg), (param, hint), &mut held)?;
-            }
-        }
+        self.call_args_ordered(&args[..value_count], &params, &hints, def_ref, &mut held)?;
         for &arg in &args[args.len() - extra..] {
             self.expr(ExprId(arg), None)?;
         }
         Ok(ret)
+    }
+
+    pub(super) fn call_args_ordered(
+        &mut self,
+        args: &[u32],
+        params: &[Ty],
+        hints: &[Option<Ty>],
+        def: Option<(ItemRef, &[Ty])>,
+        held: &mut Option<(ItemRef, Vec<Ty>)>,
+    ) -> Result<()> {
+        for (&arg, (&param, &hint)) in args.iter().zip(params.iter().zip(hints)) {
+            if !self.is_deferred_closure_arg(ExprId(arg)) {
+                self.call_arg(def, ExprId(arg), (param, hint), held)?;
+            }
+        }
+        self.release_obligation(held)?;
+        for (&arg, (&param, &hint)) in args.iter().zip(params.iter().zip(hints)) {
+            if self.is_deferred_closure_arg(ExprId(arg)) {
+                self.call_arg(def, ExprId(arg), (param, hint), held)?;
+            }
+        }
+        Ok(())
     }
 
     fn is_deferred_closure_arg(&self, expr: ExprId) -> bool {
