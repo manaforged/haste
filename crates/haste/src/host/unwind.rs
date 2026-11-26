@@ -67,6 +67,48 @@ struct SharedUnwindNode {
 
 static JIT_UNWIND_HEAD: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(unix)]
+pub(crate) const PANIC_SENTINEL_LEN: usize = 40;
+
+#[cfg(unix)]
+static PANIC_STDERR_SENTINEL: std::sync::OnceLock<[u8; PANIC_SENTINEL_LEN]> =
+    std::sync::OnceLock::new();
+
+/// Registers a per-child sentinel written to `STDERR_FILENO` at panic entry before `Drop` guards run.
+#[cfg(unix)]
+pub(crate) fn set_panic_stderr_sentinel(sentinel: [u8; PANIC_SENTINEL_LEN]) {
+    let _ = PANIC_STDERR_SENTINEL.set(sentinel);
+}
+
+#[cfg(unix)]
+fn emit_panic_stderr_sentinel() {
+    if CLEANUP_FP.get() != 0 {
+        return;
+    }
+    let Some(sentinel) = PANIC_STDERR_SENTINEL.get() else {
+        return;
+    };
+    let mut written = 0;
+    while written < sentinel.len() {
+        // SAFETY: `sentinel[written..]` is a valid slice in static memory and `STDERR_FILENO` is fd 2.
+        let n = unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                sentinel.as_ptr().add(written).cast(),
+                sentinel.len() - written,
+            )
+        };
+        if n > 0 {
+            written += n as usize;
+        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
 /// Points this process's JIT unwind walker at the active image's shared unwind-list head.
 pub(crate) fn set_jit_unwind_head(head: usize) {
     if head != 0 {
@@ -479,6 +521,8 @@ extern "C" fn start_panic_inner(
     caller_ret_pc: usize,
     land_out: *mut JitLand,
 ) -> u32 {
+    #[cfg(unix)]
+    emit_panic_stderr_sentinel();
     let frame = CURRENT_FRAME.get();
     // SAFETY: `payload_vtable` points to a valid `dyn BoxMeUp` vtable; `frame` (if non-null) is live on stack.
     unsafe {

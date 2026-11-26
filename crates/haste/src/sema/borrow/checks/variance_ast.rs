@@ -2,9 +2,12 @@ use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::GenericKind;
 use crate::body::{Args, Body, Bound, GenericArg, PathId, Ty as AstTy, TyId};
-use crate::names::{ItemRef, plain};
+use crate::names::path::Path as NamePath;
+use crate::names::{Def, ItemRef, Ns, plain};
+use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 use crate::sema::Context;
+use crate::sema::body_scope::{BodyPath, outside};
 use crate::sema::ty::{Kind, Ty};
 
 use super::super::calls::lifetimes::{
@@ -61,8 +64,51 @@ pub(in super::super) fn is_interior_mut_name(name: &str) -> bool {
     )
 }
 
+fn is_interior_mut_adt(cx: &Context<'_>, item: ItemRef) -> bool {
+    matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned"))
+        || is_interior_mut_name(cx.plain_name(item))
+}
+
+fn resolve_ast_type_path(
+    cx: &mut Context<'_>,
+    scope: Option<ItemRef>,
+    body: &Body,
+    src: &Source,
+    path_id: PathId,
+) -> Option<ItemRef> {
+    if body.path(path_id).qself.is_some() {
+        return None;
+    }
+    let scope = scope?;
+    let home = cx.module_of(scope).ok()?;
+    let (segs, absolute, dollar) =
+        crate::sema::infer::segments(&cx.names.symbols, src, body, path_id);
+    let name_path = NamePath {
+        segments: &segs,
+        absolute,
+        dollar,
+    };
+    let root = scope.body_owner();
+    let from = scope.outer().map(|(_, at)| at);
+    let def = match cx.local_path(home, Some((root, from)), &name_path, Ns::Types) {
+        Some(BodyPath::Def(def)) => Some(def),
+        Some(BodyPath::Variant(_)) => None,
+        Some(BodyPath::Outside(skip)) => cx
+            .paths(home.krate)
+            .resolve(&outside(&name_path, skip), home),
+        None => cx
+            .body_use_path((root, home), &name_path, from)
+            .or_else(|| cx.paths(home.krate).resolve(&name_path, home)),
+    };
+    match def {
+        Some(Def::Item(item)) => Some(item),
+        _ => None,
+    }
+}
+
 struct InvWalk<'a, 'b> {
-    cx: &'b Context<'a>,
+    cx: &'b mut Context<'a>,
+    scope: Option<ItemRef>,
     body: &'b Body,
     src: &'b Source,
     seen_adts: &'b mut HashSet<ItemRef>,
@@ -81,17 +127,19 @@ impl InvWalk<'_, '_> {
 }
 
 pub(in super::super) fn collect_ast_invariant_lifetimes(
-    cx: &Context<'_>,
+    cx: &mut Context<'_>,
+    scope: Option<ItemRef>,
     body: &Body,
     src: &Source,
     ty_id: TyId,
     hint_ty: Option<Ty>,
 ) -> InvariantLifetimes {
-    collect_ast_invariant_lifetimes_mode(cx, body, src, ty_id, hint_ty, false)
+    collect_ast_invariant_lifetimes_mode(cx, scope, body, src, ty_id, hint_ty, false)
 }
 
 pub(in super::super) fn collect_ast_invariant_lifetimes_mode(
-    cx: &Context<'_>,
+    cx: &mut Context<'_>,
+    scope: Option<ItemRef>,
     body: &Body,
     src: &Source,
     ty_id: TyId,
@@ -102,6 +150,7 @@ pub(in super::super) fn collect_ast_invariant_lifetimes_mode(
     let mut seen_adts = HashSet::default();
     let mut walk = InvWalk {
         cx,
+        scope,
         body,
         src,
         seen_adts: &mut seen_adts,
@@ -113,14 +162,14 @@ pub(in super::super) fn collect_ast_invariant_lifetimes_mode(
 }
 
 fn adt_invariant_param_mask(
-    cx: &Context<'_>,
+    cx: &mut Context<'_>,
     adt_item: ItemRef,
     seen_adts: &mut HashSet<ItemRef>,
 ) -> Vec<(GenericKind, bool)> {
-    let Some(def) = cx.store().adts.get(&adt_item) else {
+    let Ok(def) = cx.adt_def(adt_item) else {
         return Vec::new();
     };
-    let adt_src = &cx.file(adt_item).source;
+    let adt_src = cx.item(adt_item).0;
     let params: Vec<(GenericKind, &str)> = def
         .generics
         .params
@@ -135,6 +184,7 @@ fn adt_invariant_param_mask(
     let mut field_names = Vec::new();
     let mut walk = InvWalk {
         cx,
+        scope: Some(adt_item),
         body: &def.body,
         src: adt_src,
         seen_adts,
@@ -158,6 +208,61 @@ fn adt_invariant_param_mask(
             (kind, inv)
         })
         .collect()
+}
+
+fn alias_invariant_info(
+    cx: &mut Context<'_>,
+    alias_item: ItemRef,
+    seen_adts: &mut HashSet<ItemRef>,
+) -> (InvariantLifetimes, Vec<(GenericKind, bool)>) {
+    let Ok(def) = cx.alias_def(alias_item) else {
+        return (InvariantLifetimes::default(), Vec::new());
+    };
+    let alias_src = cx.item(alias_item).0;
+    let params: Vec<(GenericKind, &str)> = def
+        .generics
+        .1
+        .params
+        .iter()
+        .filter(|g| matches!(g.kind, GenericKind::Lifetime | GenericKind::Type))
+        .map(|g| (g.kind, alias_src.text(g.name)))
+        .collect();
+    if !seen_adts.insert(alias_item) {
+        return (
+            InvariantLifetimes::default(),
+            params.into_iter().map(|(k, _)| (k, false)).collect(),
+        );
+    }
+    let mut body_inv = InvariantLifetimes::default();
+    let mut body_names = Vec::new();
+    let mut walk = InvWalk {
+        cx,
+        scope: Some(alias_item),
+        body: &def.arena,
+        src: alias_src,
+        seen_adts,
+        out: &mut body_inv,
+        inv_names: Some(&mut body_names),
+    };
+    collect_ast_invariant_rec(&mut walk, def.ty, None, false, false);
+    seen_adts.remove(&alias_item);
+    let mask = params
+        .iter()
+        .map(|&(kind, name)| {
+            let inv = match kind {
+                GenericKind::Lifetime => body_inv.named.iter().any(|n| n == name),
+                GenericKind::Type => body_names.iter().any(|n| n == name),
+                _ => false,
+            };
+            (kind, inv)
+        })
+        .collect();
+    let fixed_inv = InvariantLifetimes {
+        saw_static: body_inv.saw_static,
+        has_elided: body_inv.has_elided,
+        named: Vec::new(),
+    };
+    (fixed_inv, mask)
 }
 
 fn peel_hint_ty(cx: &Context<'_>, hint_ty: Option<Ty>) -> Option<Ty> {
@@ -188,12 +293,12 @@ fn collect_ast_invariant_rec(
             collect_ast_invariant_rec(walk, inner, inner_hint, in_inv, in_owned);
         }
         AstTy::Tuple(list) => {
-            let elem_hints = hint_ty.and_then(|t| match *walk.cx.types.kind(t) {
-                Kind::Tuple(substs) => Some(walk.cx.types.substs(substs)),
+            let elem_hints: Option<Vec<Ty>> = hint_ty.and_then(|t| match *walk.cx.types.kind(t) {
+                Kind::Tuple(substs) => Some(walk.cx.types.substs(substs).to_vec()),
                 _ => None,
             });
             for (idx, &t) in walk.body.list(list).iter().enumerate() {
-                let eh = elem_hints.and_then(|s| s.get(idx).copied());
+                let eh = elem_hints.as_ref().and_then(|s| s.get(idx).copied());
                 collect_ast_invariant_rec(walk, TyId(t), eh, in_inv, in_owned);
             }
         }
@@ -312,27 +417,42 @@ fn collect_path_invariant(
     if in_inv && p.qself.is_none() && segs.len() == 1 && last_seg.args.is_none() {
         walk.push_name(last_name);
     }
-    let adt_info = hint_ty.and_then(|t| match *walk.cx.types.kind(t) {
-        Kind::Adt(item, substs) => Some((item, walk.cx.types.substs(substs))),
+    let adt_info: Option<(ItemRef, Vec<Ty>)> = hint_ty.and_then(|t| match *walk.cx.types.kind(t) {
+        Kind::Adt(item, substs) => Some((item, walk.cx.types.substs(substs).to_vec())),
         _ => None,
     });
+    let resolved_item = resolve_ast_type_path(walk.cx, walk.scope, walk.body, walk.src, path_id);
+    let is_alias = resolved_item.is_some_and(|it| walk.cx.item(it).1.kind == ItemKind::Type);
     let mut arg_mode: Option<Vec<(GenericKind, bool)>> = None;
-    let next_inv = if in_inv
-        || is_interior_mut_name(last_name)
-        || adt_info.is_some_and(|(it, _)| {
-            matches!(walk.cx.lang(it), Some("unsafe_cell" | "unsafe_pinned"))
-        }) {
-        true
-    } else if is_owned_container(last_name) {
-        false
-    } else if let Some((adt_item, _)) = adt_info {
-        let mask = adt_invariant_param_mask(walk.cx, adt_item, walk.seen_adts);
+    let (next_inv, next_owned) = if is_alias && let Some(alias_item) = resolved_item {
+        let (alias_inv, mask) = alias_invariant_info(walk.cx, alias_item, walk.seen_adts);
+        walk.out.saw_static |= alias_inv.saw_static;
+        walk.out.has_elided |= alias_inv.has_elided;
         if mask.iter().any(|&(_, inv)| inv) {
             arg_mode = Some(mask);
         }
-        false
+        (in_inv, false)
     } else {
-        false
+        let adt_item = adt_info.as_ref().map(|(it, _)| *it).or(resolved_item);
+        let owned = is_owned_container(last_name)
+            || adt_item.is_some_and(|it| is_owned_container(walk.cx.plain_name(it)));
+        let inv = if in_inv
+            || is_interior_mut_name(last_name)
+            || adt_item.is_some_and(|it| is_interior_mut_adt(walk.cx, it))
+        {
+            true
+        } else if owned {
+            false
+        } else if let Some(it) = adt_item {
+            let mask = adt_invariant_param_mask(walk.cx, it, walk.seen_adts);
+            if mask.iter().any(|&(_, inv)| inv) {
+                arg_mode = Some(mask);
+            }
+            false
+        } else {
+            false
+        };
+        (inv, owned)
     };
     let Some(Args::Angle(arg_list)) = last_seg.args else {
         if arg_mode
@@ -345,7 +465,6 @@ fn collect_path_invariant(
     };
     let mut lt_idx = 0usize;
     let mut ty_idx = 0usize;
-    let next_owned = is_owned_container(last_name);
     for &arg_id in walk.body.list(arg_list) {
         match walk.body.args[arg_id as usize] {
             GenericArg::Lifetime(lt) => {
@@ -357,7 +476,13 @@ fn collect_path_invariant(
             }
             GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
                 let is_inv = next_inv || mask_nth_is_inv(&arg_mode, GenericKind::Type, ty_idx);
-                let sub_hint = adt_info.and_then(|(_, substs)| substs.get(ty_idx).copied());
+                let sub_hint = (!is_alias)
+                    .then(|| {
+                        adt_info
+                            .as_ref()
+                            .and_then(|(_, substs)| substs.get(ty_idx).copied())
+                    })
+                    .flatten();
                 ty_idx += 1;
                 collect_ast_invariant_rec(walk, t, sub_hint, is_inv, next_owned);
             }

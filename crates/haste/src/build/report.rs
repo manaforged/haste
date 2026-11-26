@@ -5,7 +5,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 #[cfg(feature = "diff-harness")]
 use crate::cli::print_failures;
-use crate::cli::{Failures, TestItem, error_kind, print_test_report};
+use crate::cli::{Failures, TestItem, TestRun, error_kind, print_test_report};
 use crate::names::ItemRef;
 use crate::outline;
 use crate::sema;
@@ -588,7 +588,7 @@ impl Batch {
             };
             raw.push((name.as_str(), meta, outcome));
         }
-        let mut entries: Vec<(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)> =
+        let mut entries: Vec<(&str, &TestItem, Option<Result<TestRun, &str>>)> =
             Vec::with_capacity(raw.len());
         for (name, meta, outcome) in raw {
             let env = outline.crates[meta.item.krate as usize].env.vars.as_slice();
@@ -597,10 +597,10 @@ impl Batch {
                 Some(Err(idx)) => Some(Err(errs[idx].as_str())),
                 Some(Ok((root, start))) => {
                     let nocapture = args.nocapture && meta.expected.is_none();
-                    let (status, out) = self
+                    let run = self
                         .image
                         .run_test_captured(root, start, name, env, nocapture)?;
-                    Some(Ok((status, (!out.is_empty()).then_some(out))))
+                    Some(Ok(run))
                 }
             };
             entries.push((name, meta, resolved));

@@ -36,6 +36,7 @@ pub enum Role {
     Bin,
     Example,
     Test,
+    Bench,
     Script,
 }
 

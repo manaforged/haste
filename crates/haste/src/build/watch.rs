@@ -70,7 +70,8 @@ pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp
             .iter()
             .chain(pkg.manifest.bins.iter().map(|(_, p)| p))
             .chain(pkg.manifest.examples.iter().map(|(_, p)| p))
-            .chain(pkg.manifest.tests.iter().map(|(_, p)| p));
+            .chain(pkg.manifest.tests.iter().map(|(_, p)| p))
+            .chain(pkg.manifest.benches.iter().map(|(_, p)| p));
         for path in roots {
             if path.is_file() {
                 out.insert(path.clone(), stamp(path));

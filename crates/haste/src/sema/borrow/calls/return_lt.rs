@@ -402,6 +402,7 @@ impl super::super::Checker<'_, '_> {
         let ret_ast = sig.ret?;
         Some(collect_ast_invariant_lifetimes(
             self.cx,
+            Some(self.item),
             &sig.body,
             self.src,
             ret_ast,

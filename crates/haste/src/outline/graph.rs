@@ -45,11 +45,12 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                 role: Role::Bin,
             });
             roots.extend(bins);
-            if let Some(wanted) = crate::selection().example.as_deref() {
+            let sel = crate::selection();
+            if sel.all_targets || sel.example.is_some() {
                 let examples = manifest
                     .examples
                     .iter()
-                    .filter(|(name, _)| name == wanted)
+                    .filter(|(name, _)| sel.example.as_deref().is_none_or(|wanted| name == wanted))
                     .map(|(name, path)| Root {
                         unit,
                         name: name.clone(),
@@ -58,7 +59,15 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                     });
                 roots.extend(examples);
             }
-            let sel = crate::selection();
+            if sel.all_targets {
+                let benches = manifest.benches.iter().map(|(name, path)| Root {
+                    unit,
+                    name: name.clone(),
+                    path: path.clone(),
+                    role: Role::Bench,
+                });
+                roots.extend(benches);
+            }
             if crate::test_mode()
                 && !sel.lib
                 && !sel.bins
@@ -172,7 +181,7 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
             let package = &workspace.packages[unit.package];
             let include_dev = (crate::test_mode()
                 && workspace.graph.members.contains(&unit.package))
-                || matches!(root.role, Role::Example | Role::Test);
+                || matches!(root.role, Role::Example | Role::Test | Role::Bench);
             let normal = unit.deps.iter().filter(|(_, _, kind)| {
                 if root.role == Role::Script {
                     *kind == Kind::Build
@@ -196,8 +205,10 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
                     libs.get(dep).map(|&lib| (extern_name(key, *dep, lib), lib))
                 })
                 .collect();
-            if matches!(root.role, Role::Bin | Role::Example | Role::Test)
-                && let Some(&lib) = libs.get(&root.unit)
+            if matches!(
+                root.role,
+                Role::Bin | Role::Example | Role::Test | Role::Bench
+            ) && let Some(&lib) = libs.get(&root.unit)
             {
                 deps.push((roots[lib].name.clone(), lib));
             }
@@ -262,7 +273,7 @@ pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outli
             let is_member = workspace.graph.members.contains(&package);
             let test = crate::test_mode()
                 && is_member
-                && (root.role == Role::Test
+                && (matches!(root.role, Role::Test | Role::Bench)
                     || (matches!(root.role, Role::Lib | Role::Bin) && !is_test_dep[at]));
             root_crate(workspace, targets, root, test)
         })

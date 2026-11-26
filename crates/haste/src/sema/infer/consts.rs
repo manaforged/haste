@@ -393,7 +393,10 @@ impl<'a> Infer<'_, 'a> {
         };
         let constant = self.cx.item(item).1.kind != ItemKind::Fn;
         if constant && self.evaluating.contains(&item) {
-            bail!("the constant {} depends on itself", self.cx.name(item));
+            return Err(evaluate::const_arithmetic_error(format!(
+                "cycle detected when evaluating `{}`",
+                self.cx.name(item)
+            )));
         }
         self.evaluating.extend(constant.then_some(item));
         let found = self.with_item_frame(item, substs, |infer| run(infer, &body, root));
@@ -549,6 +552,15 @@ impl<'a> Infer<'_, 'a> {
             }
         }
         self.active_discr = saved;
+        let mut seen = rustc_hash::FxHashSet::default();
+        for &value in &values {
+            if !seen.insert(value) {
+                bail!(
+                    "discriminant value `{value}` assigned more than once in {}",
+                    self.cx.name(item)
+                );
+            }
+        }
         Ok(values)
     }
 

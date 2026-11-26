@@ -363,7 +363,7 @@ impl Infer<'_, '_> {
         Ok(true)
     }
 
-    fn check_trait_impl_block(&mut self, block: ImplRef) -> Result<()> {
+    pub(in super::super) fn check_trait_impl_block(&mut self, block: ImplRef) -> Result<()> {
         if let Some(poly) = &mut self.poly
             && (poly.skip_compat || !poly.checked_impls.insert(block))
         {

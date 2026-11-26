@@ -50,6 +50,9 @@ impl Reached {
             edges.iter_mut().for_each(|at| *at = new_of[*at]);
         }
         self.index.values_mut().for_each(|at| *at = new_of[*at]);
+        self.crate_errors
+            .iter_mut()
+            .for_each(|at| *at = new_of[*at]);
         self.call_sites = CallSites::default();
         let states = &self.states;
         recount_call_sites(

@@ -65,7 +65,7 @@ pub(super) fn check_item_trait_impls(
     Ok(())
 }
 
-pub(super) fn check_trait_impl_block(cx: &mut Context<'_>, block: ImplRef) -> Result<()> {
+pub(in super::super) fn check_trait_impl_block(cx: &mut Context<'_>, block: ImplRef) -> Result<()> {
     if !block_is_user(cx, block) {
         return Ok(());
     }
@@ -145,6 +145,17 @@ fn check_impl_method_compat(
         else {
             return Ok(None);
         };
+        let of = infer.cx.impl_trait(block);
+        let impl_params: Vec<Ty> = impl_params
+            .into_iter()
+            .map(|ty| normalize_block_proj(infer, block, of, self_ty, ty, 8))
+            .collect();
+        let impl_ret = normalize_block_proj(infer, block, of, self_ty, impl_ret, 8);
+        let trait_params: Vec<Ty> = trait_params
+            .into_iter()
+            .map(|ty| normalize_block_proj(infer, block, of, self_ty, ty, 8))
+            .collect();
+        let trait_ret = normalize_block_proj(infer, block, of, self_ty, trait_ret, 8);
         Ok(compare_method_sigs(
             infer,
             name,
@@ -253,6 +264,123 @@ fn method_param_span(cx: &Context<'_>, item: ItemRef, sig: &Signature, idx: usiz
     Span::from_token(src, entry.name.unwrap_or(entry.start))
 }
 
+fn normalize_block_proj(
+    infer: &mut Infer<'_, '_>,
+    block: ImplRef,
+    of: Option<ItemRef>,
+    self_ty: Ty,
+    ty: Ty,
+    depth: u8,
+) -> Ty {
+    if depth == 0 {
+        return ty;
+    }
+    let ty = infer.resolve(ty);
+    match *infer.cx.types.kind(ty) {
+        Kind::Proj(proj_id) => {
+            let proj = infer.cx.types.proj(proj_id);
+            let norm_self =
+                normalize_block_proj(infer, block, of, self_ty, proj.self_ty, depth - 1);
+            let own: Vec<Ty> = infer
+                .cx
+                .types
+                .substs(proj.own)
+                .to_vec()
+                .into_iter()
+                .map(|t| normalize_block_proj(infer, block, of, self_ty, t, depth - 1))
+                .collect();
+            if of == Some(proj.of) && norm_self == self_ty {
+                let assoc_name = infer.cx.plain_name(proj.assoc).to_owned();
+                if let Ok(Some(resolved)) = infer.impl_alias(block, (&assoc_name, &own)) {
+                    return normalize_block_proj(infer, block, of, self_ty, resolved, depth - 1);
+                }
+            }
+            ty
+        }
+        Kind::Ref(m, inner) => {
+            let next = normalize_block_proj(infer, block, of, self_ty, inner, depth - 1);
+            if next == inner {
+                ty
+            } else {
+                infer.cx.types.intern(Kind::Ref(m, next))
+            }
+        }
+        Kind::Ptr(m, inner) => {
+            let next = normalize_block_proj(infer, block, of, self_ty, inner, depth - 1);
+            if next == inner {
+                ty
+            } else {
+                infer.cx.types.intern(Kind::Ptr(m, next))
+            }
+        }
+        Kind::Slice(inner) => {
+            let next = normalize_block_proj(infer, block, of, self_ty, inner, depth - 1);
+            if next == inner {
+                ty
+            } else {
+                infer.cx.types.intern(Kind::Slice(next))
+            }
+        }
+        Kind::Array(elem, len) => {
+            let next = normalize_block_proj(infer, block, of, self_ty, elem, depth - 1);
+            if next == elem {
+                ty
+            } else {
+                infer.cx.types.intern(Kind::Array(next, len))
+            }
+        }
+        Kind::Tuple(substs) => {
+            let orig = infer.cx.types.substs(substs).to_vec();
+            let next: Vec<Ty> = orig
+                .iter()
+                .map(|&t| normalize_block_proj(infer, block, of, self_ty, t, depth - 1))
+                .collect();
+            if next == orig {
+                ty
+            } else {
+                let s = infer.cx.types.intern_substs(&next);
+                infer.cx.types.intern(Kind::Tuple(s))
+            }
+        }
+        Kind::Adt(item, substs) => {
+            let orig = infer.cx.types.substs(substs).to_vec();
+            let next: Vec<Ty> = orig
+                .iter()
+                .map(|&t| normalize_block_proj(infer, block, of, self_ty, t, depth - 1))
+                .collect();
+            if next == orig {
+                ty
+            } else {
+                let s = infer.cx.types.intern_substs(&next);
+                infer.cx.types.intern(Kind::Adt(item, s))
+            }
+        }
+        Kind::FnPtr(params, ret) => {
+            let orig = infer.cx.types.substs(params).to_vec();
+            let next_p: Vec<Ty> = orig
+                .iter()
+                .map(|&t| normalize_block_proj(infer, block, of, self_ty, t, depth - 1))
+                .collect();
+            let next_r = normalize_block_proj(infer, block, of, self_ty, ret, depth - 1);
+            if next_p == orig && next_r == ret {
+                ty
+            } else {
+                let s = infer.cx.types.intern_substs(&next_p);
+                infer.cx.types.intern(Kind::FnPtr(s, next_r))
+            }
+        }
+        Kind::Pat(inner, range) => {
+            let next = normalize_block_proj(infer, block, of, self_ty, inner, depth - 1);
+            if next == inner {
+                ty
+            } else {
+                infer.cx.types.intern(Kind::Pat(next, range))
+            }
+        }
+        _ => ty,
+    }
+}
+
 fn types_compatible(infer: &Infer<'_, '_>, a: Ty, b: Ty) -> bool {
     let a = infer.resolve(a);
     let b = infer.resolve(b);
@@ -260,8 +388,17 @@ fn types_compatible(infer: &Infer<'_, '_>, a: Ty, b: Ty) -> bool {
         return true;
     }
     match (*infer.cx.types.kind(a), *infer.cx.types.kind(b)) {
-        (Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Proj(_), _)
-        | (_, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Proj(_)) => true,
+        (Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_), _)
+        | (_, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) => true,
+        (Kind::Proj(pa), Kind::Proj(pb)) => {
+            let pa = infer.cx.types.proj(pa);
+            let pb = infer.cx.types.proj(pb);
+            pa.of == pb.of
+                && pa.assoc == pb.assoc
+                && types_compatible(infer, pa.self_ty, pb.self_ty)
+                && substs_compatible(infer, pa.args, pb.args)
+                && substs_compatible(infer, pa.own, pb.own)
+        }
         (Kind::Prim(pa), Kind::Prim(pb)) => pa == pb,
         (Kind::Never, Kind::Never) => true,
         (Kind::Param(ia), Kind::Param(ib)) => ia == ib,

@@ -74,7 +74,8 @@ impl Checker<'_, '_> {
             let Some(&(_, dst_ast)) = sig.params.get(dst_idx) else {
                 continue;
             };
-            let Some(dst) = self.call_out_dst(sig, fn_src, dst_ast, ExprId(dst_id), state) else {
+            let Some(dst) = self.call_out_dst(sig, fn_item, fn_src, dst_ast, ExprId(dst_id), state)
+            else {
                 continue;
             };
             for (src_idx, &src_id) in param_args.iter().enumerate() {
@@ -99,6 +100,7 @@ impl Checker<'_, '_> {
     fn call_out_dst(
         &mut self,
         sig: &Signature,
+        fn_item: Option<crate::names::ItemRef>,
         fn_src: &Source,
         dst_ast: TyId,
         dst_arg: ExprId,
@@ -110,7 +112,15 @@ impl Checker<'_, '_> {
                 mutable: true,
                 ty: dst_inner,
                 ..
-            } => self.call_out_mut_ref_dst(sig, fn_src, dst_ast, dst_inner, dst_arg, arg_unwrapped),
+            } => self.call_out_mut_ref_dst(
+                sig,
+                fn_item,
+                fn_src,
+                dst_ast,
+                dst_inner,
+                dst_arg,
+                arg_unwrapped,
+            ),
             AstTy::Ref {
                 mutable: false,
                 ty: dst_inner,
@@ -123,6 +133,7 @@ impl Checker<'_, '_> {
             _ => {
                 let dst_inv = collect_ast_invariant_lifetimes(
                     self.cx,
+                    fn_item,
                     &sig.body,
                     fn_src,
                     dst_ast,
@@ -139,6 +150,7 @@ impl Checker<'_, '_> {
     fn call_out_mut_ref_dst(
         &mut self,
         sig: &Signature,
+        fn_item: Option<crate::names::ItemRef>,
         fn_src: &Source,
         dst_ast: TyId,
         dst_inner: TyId,
@@ -159,7 +171,14 @@ impl Checker<'_, '_> {
             _ => return None,
         };
         let dst_ty = self.local_ty(place.local);
-        let inner_inv = collect_ast_invariant_lifetimes(self.cx, &sig.body, fn_src, dst_ast, None);
+        let inner_inv = collect_ast_invariant_lifetimes(
+            self.cx,
+            fn_item,
+            &sig.body,
+            fn_src,
+            dst_ast,
+            Some(self.expr_ty(dst_arg)),
+        );
         if self.ty_holds_borrow(dst_ty)
             || self.ty_has_borrow_interior_mut(dst_ty)
             || !inner_inv.is_empty()

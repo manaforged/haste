@@ -39,9 +39,10 @@ fn item_enabled(tree: &outline::tree::Crate, file_at: usize, at: usize) -> bool 
     true
 }
 
-fn crate_fns<'a>(
+fn crate_items<'a>(
     krate: usize,
     tree: &'a outline::tree::Crate,
+    include_consts: bool,
 ) -> impl Iterator<
     Item = (
         ItemRef,
@@ -59,10 +60,10 @@ fn crate_fns<'a>(
                 .iter()
                 .enumerate()
                 .filter_map(move |(at, item)| {
-                    (item.kind == outline::item::ItemKind::Fn
-                        && item.body.is_some()
-                        && item_enabled(tree, file_at, at))
-                    .then_some((
+                    let match_kind = (item.kind == outline::item::ItemKind::Fn
+                        && item.body.is_some())
+                        || (include_consts && item.kind == outline::item::ItemKind::Const);
+                    (match_kind && item_enabled(tree, file_at, at)).then_some((
                         ItemRef {
                             krate: krate as u32,
                             file: file_at as u32,
@@ -74,6 +75,20 @@ fn crate_fns<'a>(
                     ))
                 })
         })
+}
+
+fn crate_fns<'a>(
+    krate: usize,
+    tree: &'a outline::tree::Crate,
+) -> impl Iterator<
+    Item = (
+        ItemRef,
+        &'a outline::tree::Crate,
+        &'a outline::tree::File,
+        &'a outline::item::Item,
+    ),
+> + 'a {
+    crate_items(krate, tree, false)
 }
 
 fn member_fns<'a>(
@@ -163,6 +178,14 @@ pub(crate) fn test_items(
 /// Internal `run_test_captured` exit status indicating a test unwound via a Rust panic.
 pub(crate) const TEST_PANICKED_STATUS: i32 = -101;
 
+/// Outcome of running a single `#[test]` function.
+pub(crate) struct TestRun {
+    pub status: i32,
+    pub output: Option<String>,
+    pub panic_msg: Option<String>,
+}
+
+#[cfg(unix)]
 fn is_panic_header(line: &str) -> bool {
     let Some((head, loc)) = line.rsplit_once(" panicked at ") else {
         return false;
@@ -193,7 +216,8 @@ fn is_panic_header(line: &str) -> bool {
     )
 }
 
-fn panic_payload(stderr: &str) -> Option<&str> {
+#[cfg(unix)]
+pub(crate) fn panic_payload(stderr: &str) -> Option<&str> {
     let mut last_rest = None;
     let mut offset = 0;
     for line in stderr.split_inclusive('\n') {
@@ -223,7 +247,7 @@ fn should_panic_non_panic_msg(status: i32, stderr: Option<&str>) -> String {
 
 /// Formats and prints standard Rust test output and returns 0 when all tests pass, else 101.
 pub(crate) fn print_test_report(
-    entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
+    entries: &[(&str, &TestItem, Option<Result<TestRun, &str>>)],
     elapsed: std::time::Duration,
     show_output: bool,
     filtered_out: usize,
@@ -243,45 +267,49 @@ pub(crate) fn print_test_report(
             continue;
         };
         match outcome {
-            Ok((status, stderr)) => {
-                let panicked = *status == TEST_PANICKED_STATUS;
-                let expected_ok = match (&meta.expected, stderr) {
-                    (Some(exp), Some(err)) => {
-                        panic_payload(err).is_some_and(|msg| msg.contains(exp.as_str()))
-                    }
+            Ok(run) => {
+                let panicked = run.status == TEST_PANICKED_STATUS;
+                let expected_ok = match (&meta.expected, &run.panic_msg) {
+                    (Some(exp), Some(msg)) => msg.contains(exp.as_str()),
                     (Some(_), None) => false,
                     (None, _) => true,
                 };
                 let ok = if meta.should_panic {
                     panicked && expected_ok
                 } else {
-                    *status == 0
+                    run.status == 0
                 };
                 if ok {
                     println!("test {name} ... ok");
                     if show_output
-                        && let Some(out) =
-                            stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                        && let Some(out) = run
+                            .output
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                     {
                         successes.push((name, out));
                     }
                     passed += 1;
                 } else {
                     let msg = if meta.should_panic && !panicked {
-                        should_panic_non_panic_msg(*status, stderr.as_deref())
+                        should_panic_non_panic_msg(run.status, run.output.as_deref())
                     } else if let Some(exp) = &meta.expected {
                         format!(
                             "note: panic did not contain expected string `{exp}`\n{}",
-                            stderr.as_deref().unwrap_or("").trim()
+                            run.output.as_deref().unwrap_or("").trim()
                         )
-                    } else if let Some(out) =
-                        stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    } else if let Some(out) = run
+                        .output
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
                     {
                         out.to_owned()
                     } else if panicked {
                         "test panicked".to_owned()
                     } else {
-                        format!("exited with status {status}")
+                        format!("exited with status {}", run.status)
                     };
                     println!("test {name} ... FAILED");
                     details.push((name, msg));
@@ -319,7 +347,9 @@ pub(crate) fn lib_fn_items(
     workspace: &graph::Workspace,
     outline: &outline::Outline,
 ) -> Vec<ItemRef> {
-    member_fns(workspace, outline)
+    outline
+        .members(workspace)
+        .flat_map(|krate| crate_items(krate, &outline.crates[krate], true))
         .map(|(item_ref, _, _, _)| item_ref)
         .collect()
 }

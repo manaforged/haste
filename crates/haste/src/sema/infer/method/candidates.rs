@@ -313,6 +313,7 @@ impl Infer<'_, '_> {
         args: Vec<Ty>,
         selected: Picked,
     ) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        self.check_trait_impl_block(selected.0)?;
         if self.poly.is_some() && (self.has_params(self_ty) || self.any_has_params(&args)) {
             let substs: Vec<Ty> = std::iter::once(self_ty).chain(args).collect();
             self.obligations.push((candidate.of, substs.clone()));
