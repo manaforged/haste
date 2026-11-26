@@ -1,3 +1,6 @@
+mod exhaustive;
+mod matrix;
+
 use anyhow::{Result, bail};
 
 use crate::body::{Arm, Expr, ExprId, List, PatId};
@@ -40,9 +43,12 @@ impl Infer<'_, '_> {
         let scrutinee_ty = self.expr(scrutinee, None)?;
         let before = std::mem::replace(&mut self.diverges, false);
         if let Some(target) = self.known(expected) {
-            return self.match_known(scrutinee_ty, arms, target, before);
+            let out = self.match_known(scrutinee_ty, arms, target, before)?;
+            self.matches.push((scrutinee, scrutinee_ty, arms));
+            return Ok(out);
         }
         let (found_arms, all_diverge) = self.infer_arms(scrutinee_ty, arms, expected)?;
+        self.matches.push((scrutinee, scrutinee_ty, arms));
         self.diverges = before || all_diverge;
         if all_diverge {
             return Ok(self.cx.types.intern(Kind::Never));

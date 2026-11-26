@@ -157,6 +157,11 @@ pub struct Infer<'c, 'a> {
     local_projections: HashMap<(ItemRef, Ty, Substs, crate::names::Sym, Substs), Option<Ty>>,
     method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
+    current_expr: Option<ExprId>,
+    obligation_sites: HashMap<(ItemRef, Ty), ExprId>,
+    captures_settled: bool,
+    auto_stack: Vec<(ItemRef, Ty)>,
+    matches: Vec<(ExprId, Ty, crate::body::List)>,
 }
 
 impl Drop for Infer<'_, '_> {
@@ -368,7 +373,62 @@ impl<'c, 'a> Infer<'c, 'a> {
             local_projections: HashMap::default(),
             method_hints: None,
             poly: None,
+            current_expr: None,
+            obligation_sites: HashMap::default(),
+            captures_settled: false,
+            auto_stack: Vec::new(),
+            matches: Vec::new(),
         }
+    }
+
+    pub(super) fn note_obligation_site(&mut self, of: ItemRef, self_ty: Ty) {
+        if let Some(expr) = self.current_expr {
+            let resolved = self.resolve(self_ty);
+            self.obligation_sites.entry((of, resolved)).or_insert(expr);
+            self.obligation_sites.entry((of, self_ty)).or_insert(expr);
+        }
+    }
+
+    fn diag_span(
+        kind: crate::diag::DiagnosticKind,
+        span: Option<crate::diag::Span>,
+        msg: impl Into<String>,
+        label: impl Into<String>,
+    ) -> anyhow::Error {
+        let mut diag = crate::diag::Diagnostic::new(kind, msg).with_span(span);
+        let label = label.into();
+        if !label.is_empty() {
+            diag = diag.with_primary_label(label);
+        }
+        diag.into()
+    }
+
+    pub(super) fn diag_expr(
+        &self,
+        kind: crate::diag::DiagnosticKind,
+        expr: Option<ExprId>,
+        msg: impl Into<String>,
+        label: impl Into<String>,
+    ) -> anyhow::Error {
+        let span = expr
+            .or(self.current_expr)
+            .and_then(|id| crate::diag::Span::from_expr(self.src, self.body, id));
+        Self::diag_span(kind, span, msg, label)
+    }
+
+    pub(super) fn diag_tok(
+        &self,
+        kind: crate::diag::DiagnosticKind,
+        tok: u32,
+        msg: impl Into<String>,
+        label: impl Into<String>,
+    ) -> anyhow::Error {
+        Self::diag_span(
+            kind,
+            crate::diag::Span::from_token(self.src, tok),
+            msg,
+            label,
+        )
     }
 }
 
@@ -483,7 +543,9 @@ pub fn discriminants(
     detached(cx, item, |infer| infer.discriminants(item, primitive))
 }
 
-pub use zonk::{is_case_sig, is_concrete_fn, is_copy, test_sig};
+#[cfg(feature = "diff-harness")]
+pub use zonk::is_case_sig;
+pub use zonk::{is_concrete_fn, is_copy, test_sig};
 
 /// The return type of the non-generic function `item`.
 pub fn return_type(cx: &mut Context<'_>, item: ItemRef) -> Result<Ty> {

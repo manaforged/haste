@@ -3,7 +3,7 @@ mod local;
 
 use anyhow::Result;
 
-use crate::body::{Expr, ExprId, List, Pat, PatId};
+use crate::body::{BlockKind, Expr, ExprId, List, Pat, PatId};
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -35,6 +35,7 @@ impl Checker<'_, '_> {
         &mut self,
         local: u32,
         sources: &[BorrowSource],
+        site: Option<ExprId>,
         state: &mut State,
     ) {
         if sources.is_empty() {
@@ -50,6 +51,7 @@ impl Checker<'_, '_> {
             Some(local),
             sources,
             false,
+            site.or(self.current_expr),
             |s| s.target != local,
             |s| s.mutable && (!s.through_ref || !is_shared_target(s.target)),
         );
@@ -138,6 +140,20 @@ impl Checker<'_, '_> {
         pat: PatId,
         target: PatTarget<'_>,
         state: &mut State,
+        ctx: PatCtx,
+    ) -> Result<()> {
+        let prev = self.current_pat;
+        self.current_pat = Some(pat);
+        let res = self.bind_pat_ctx_inner(pat, target, state, ctx);
+        self.current_pat = prev;
+        res
+    }
+
+    fn bind_pat_ctx_inner(
+        &mut self,
+        pat: PatId,
+        target: PatTarget<'_>,
+        state: &mut State,
         mut ctx: PatCtx,
     ) -> Result<()> {
         let unwrapped_init = target.init.map(|e| self.unwrap_parens(e));
@@ -211,10 +227,15 @@ impl Checker<'_, '_> {
             _ => None,
         });
         let next_fallback = if inner_init.is_none() {
-            target
-                .init
-                .map(|e| self.expr_borrow_sources(e, state))
-                .unwrap_or_else(|| target.fallback_sources.to_vec())
+            if let Some(e) = target.init {
+                self.expr_borrow_sources(e, state)
+            } else {
+                let mut srcs = target.fallback_sources.to_vec();
+                for s in &mut srcs {
+                    push_step(&mut s.steps, PlaceStep::Deref);
+                }
+                srcs
+            }
         } else {
             Vec::new()
         };
@@ -407,7 +428,7 @@ impl Checker<'_, '_> {
     }
 
     fn apply_pat_derefs(
-        &self,
+        &mut self,
         pat: PatId,
         unwrapped_init: Option<ExprId>,
         scrut_place: Option<&Place>,
@@ -421,9 +442,36 @@ impl Checker<'_, '_> {
         }
         let mut crossed_ref = false;
         let mut cur = unwrapped_init.map_or(Ty::NONE, |e| self.expr_ty(e));
+        let mut init_expr = unwrapped_init;
         for _ in 0..derefs {
+            if adjusted_place.is_none()
+                && let Some(e) = init_expr
+                && let Expr::Ref {
+                    mutable,
+                    raw: false,
+                    expr: inner,
+                } = *self.body.expr(e)
+            {
+                crossed_ref = true;
+                init_expr = Some(self.unwrap_parens(inner));
+                if let Some(mut place) = self.root_place(inner) {
+                    if !mutable {
+                        place.behind_shared = true;
+                        place.mut_ref_root = false;
+                    } else if !place.reborrows_shared_field && !place.behind_shared {
+                        place.mut_ref_root = true;
+                    }
+                    adjusted_place = Some(place);
+                }
+                cur = if cur != Ty::NONE {
+                    self.builtin_deref_ty(cur).unwrap_or(Ty::NONE)
+                } else {
+                    Ty::NONE
+                };
+                continue;
+            }
             if let Some(ref mut place) = adjusted_place
-                && let Some(e) = unwrapped_init
+                && let Some(e) = init_expr
                 && self.place_behind_shared_ref(e)
             {
                 mark_place_behind_shared(place);
@@ -515,6 +563,21 @@ impl Checker<'_, '_> {
         }
         expr
     }
+
+    pub(super) fn unwrap_parens_and_empty_blocks(&self, mut expr: ExprId) -> ExprId {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Block {
+                    kind: BlockKind::Plain,
+                    stmts,
+                    tail: Some(tail),
+                    label: None,
+                } if stmts.len == 0 => expr = tail,
+                _ => return expr,
+            }
+        }
+    }
 }
 
 fn mark_place_behind_shared(place: &mut Place) {
@@ -527,29 +590,36 @@ fn reset_local_binding(local: u32, init_val: bool, state: &mut State) {
     state.init[local as usize] = init_val;
     state.maybe_init[local as usize] = init_val;
     state.moved[local as usize] = false;
+    state.moved_at[local as usize] = None;
     state.partial_moves.retain(|m| m.local != local);
+    state.set_tuple_sources(local, None);
     clear_rebound_loans(local, state);
 }
 
-pub(super) fn push_loan(
-    loans: &mut Vec<Loan>,
-    target: u32,
-    steps: Vec<PlaceStep>,
-    holder: Option<u32>,
-    mutable: bool,
-    through_ref: bool,
-    two_phase: bool,
-    env_only: bool,
-) {
-    let loan = Loan {
-        target,
-        steps,
-        holder,
-        mutable,
-        through_ref,
-        two_phase,
-        env_only,
-    };
+impl Loan {
+    pub(super) fn new(
+        target: u32,
+        steps: Vec<PlaceStep>,
+        holder: Option<u32>,
+        mutable: bool,
+        through_ref: bool,
+        site: Option<ExprId>,
+    ) -> Self {
+        Self {
+            target,
+            steps,
+            holder,
+            mutable,
+            through_ref,
+            two_phase: false,
+            env_only: false,
+            origin_only: false,
+            site,
+        }
+    }
+}
+
+pub(super) fn push_loan(loans: &mut Vec<Loan>, loan: Loan) {
     if !loans.contains(&loan) {
         loans.push(loan);
     }
@@ -559,8 +629,9 @@ pub(super) fn push_source_loans(
     loans: &mut Vec<Loan>,
     holder: Option<u32>,
     sources: &[BorrowSource],
+    site: Option<ExprId>,
 ) {
-    push_source_loans_filtered(loans, holder, sources, false, |_| true, |s| s.mutable);
+    push_source_loans_filtered(loans, holder, sources, false, site, |_| true, |s| s.mutable);
 }
 
 pub(super) fn push_source_loans_filtered(
@@ -568,6 +639,7 @@ pub(super) fn push_source_loans_filtered(
     holder: Option<u32>,
     sources: &[BorrowSource],
     two_phase: bool,
+    site: Option<ExprId>,
     mut include: impl FnMut(&BorrowSource) -> bool,
     mut mutable_of: impl FnMut(&BorrowSource) -> bool,
 ) {
@@ -575,20 +647,34 @@ pub(super) fn push_source_loans_filtered(
         if include(s) {
             push_loan(
                 loans,
-                s.target,
-                s.steps.clone(),
-                holder,
-                mutable_of(s),
-                s.through_ref,
-                two_phase,
-                s.env_only,
+                Loan {
+                    target: s.target,
+                    steps: s.steps.clone(),
+                    holder,
+                    mutable: mutable_of(s),
+                    through_ref: s.through_ref,
+                    two_phase,
+                    env_only: s.env_only,
+                    origin_only: s.origin_only,
+                    site,
+                },
             );
         }
     }
 }
 
 fn clear_rebound_loans(local: u32, state: &mut State) {
-    state
-        .loans
-        .retain(|l| l.holder != Some(local) && l.target != local);
+    state.loans.retain_mut(|l| {
+        if l.holder == Some(local) {
+            return false;
+        }
+        if l.target == local {
+            if l.origin_only || l.through_ref {
+                l.origin_only = true;
+                return true;
+            }
+            return false;
+        }
+        true
+    });
 }

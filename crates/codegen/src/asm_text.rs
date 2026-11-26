@@ -1,8 +1,56 @@
 //! An assembler for the text of module-level `global_asm!` blocks: the directives `.text`, `.p2align`, `.globl` and labels, and each target's instruction subset.
 
+use rustc_hash::FxHashMap as HashMap;
+
 use crate::Code;
 use crate::reloc::StencilReloc;
 use crate::target::{Arch, Target};
+
+/// Tracks local numeric labels (`0:`, `1:`, `2:`, ...) for forward (`Nf`) and backward (`Nb`) branches.
+pub(crate) struct LocalLabels<L> {
+    bound: HashMap<u32, L>,
+    pending: HashMap<u32, L>,
+}
+
+impl<L> Default for LocalLabels<L> {
+    fn default() -> Self {
+        Self {
+            bound: HashMap::default(),
+            pending: HashMap::default(),
+        }
+    }
+}
+
+impl<L: Copy> LocalLabels<L> {
+    pub(crate) fn target(
+        &mut self,
+        id: u32,
+        forward: bool,
+        new_label: impl FnOnce() -> L,
+    ) -> Result<L, String> {
+        if forward {
+            Ok(*self.pending.entry(id).or_insert_with(new_label))
+        } else {
+            self.bound
+                .get(&id)
+                .copied()
+                .ok_or_else(|| format!("local label `{id}b` is not defined"))
+        }
+    }
+
+    pub(crate) fn define(&mut self, id: u32, new_label: impl FnOnce() -> L) -> L {
+        let label = self.pending.remove(&id).unwrap_or_else(new_label);
+        self.bound.insert(id, label);
+        label
+    }
+
+    pub(crate) fn finish(self) -> Result<(), String> {
+        if let Some(&id) = self.pending.keys().next() {
+            return Err(format!("local label `{id}f` is never defined"));
+        }
+        Ok(())
+    }
+}
 
 /// Machine code assembled from `global_asm!` text, with the byte offset of each label it defines.
 #[derive(Clone, Debug)]
@@ -20,6 +68,8 @@ pub(crate) trait Encoder {
     fn pos(&self) -> u32;
     /// Emits one no-op padding instruction.
     fn pad(&mut self);
+    /// Defines a local numeric label (`0:`, `1:`, `2:`, ...) at the current offset.
+    fn define_local(&mut self, id: u32);
     /// Encodes one instruction from its mnemonic and its operands split at top-level commas.
     fn instruction(
         &mut self,
@@ -44,7 +94,6 @@ pub fn assemble(text: &str, target: &Target, symbols: &[&str]) -> Result<Assembl
             symbols,
             crate::arm64::text::Text::new(target.direct_calls),
         ),
-        other => Err(format!("no assembler for {other:?} yet")),
     }
 }
 
@@ -69,6 +118,13 @@ fn statement(
     symbol: &Symbols<'_>,
 ) -> Result<(), String> {
     if let Some(name) = line.strip_suffix(':') {
+        if !name.is_empty() && name.chars().all(|ch| ch.is_ascii_digit()) {
+            let id = name
+                .parse::<u32>()
+                .map_err(|_| format!("local label `{name}` is out of range"))?;
+            encoder.define_local(id);
+            return Ok(());
+        }
         let name = symbol_name(name)?;
         if labels.iter().any(|(seen, _)| seen == name) {
             return Err(format!("label `{name}` is defined twice"));
@@ -162,4 +218,80 @@ pub(crate) fn integer(text: &str) -> Result<i64, String> {
     };
     let magnitude = magnitude.map_err(|_| format!("`{text}` is not an integer"))?;
     Ok(if negative { -magnitude } else { magnitude })
+}
+
+/// Parses a local numeric branch target like `2f` (forward) or `2b` (backward).
+pub(crate) fn local_target(text: &str) -> Option<(u32, bool)> {
+    let (digits, forward) = if let Some(digits) = text.strip_suffix('f') {
+        (digits, true)
+    } else if let Some(digits) = text.strip_suffix('b') {
+        (digits, false)
+    } else {
+        return None;
+    };
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok().map(|id| (id, forward))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arm64_assembles_fp_pairs_zero_store_and_local_branch() {
+        let target = Target::find("aarch64-apple-darwin").expect("arm64 target");
+        let words = |asm: &str| -> Vec<u32> {
+            assemble(asm, target, &["inner"])
+                .expect("arm64 global_asm must assemble")
+                .code
+                .bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        assert_eq!(words("stp d8, d9, [sp, #112]\n"), vec![0x6D07_27E8]);
+        assert_eq!(words("ldp d8, d9, [sp, #112]\n"), vec![0x6D47_27E8]);
+        assert_eq!(words("str xzr, [sp]\n"), vec![0xF900_03FF]);
+        assert_eq!(words("ldr x9, [sp, #8]\n"), vec![0xF940_07E9]);
+        let loop_words = words("1:\ncbz x9, 1b\ncbz x9, 2f\n2:\nret\n");
+        assert_eq!(loop_words[0], 0xB400_0009);
+        assert_eq!(loop_words[1], 0xB400_0029);
+        assert!(assemble("str x0, [sp, #40000]\n", target, &[]).is_err());
+        assert!(assemble("str x0, [sp, #300]\n", target, &[]).is_err());
+    }
+
+    #[test]
+    fn x64_assembles_qword_zero_store_test_and_local_branch() {
+        let target = Target::find("x86_64-unknown-linux-gnu").expect("x64 target");
+        let bytes = |asm: &str| -> Vec<u8> {
+            assemble(asm, target, &["inner"])
+                .expect("x64 global_asm must assemble")
+                .code
+                .bytes
+        };
+        assert_eq!(
+            bytes("mov qword ptr [rsp], 0\n"),
+            vec![0x48, 0xC7, 0x04, 0x24, 0, 0, 0, 0]
+        );
+        assert_eq!(bytes("test r11, r11\n"), vec![0x4D, 0x85, 0xDB]);
+        let out = assemble(
+            ".globl tramp\ntramp:\n1:\ntest r11, r11\njz 2f\njmp 1b\n2:\nret\n",
+            target,
+            &[],
+        )
+        .expect("x64 local branches must assemble");
+        assert_eq!(out.labels, vec![("tramp".to_owned(), 0)]);
+    }
+
+    #[test]
+    fn rejects_unresolved_local_labels_on_both_arches() {
+        let arm = Target::find("aarch64-apple-darwin").expect("arm64 target");
+        assert!(assemble("cbz x9, 2f\n", arm, &[]).is_err());
+        assert!(assemble("cbz x9, 2b\n", arm, &[]).is_err());
+        let x64 = Target::find("x86_64-unknown-linux-gnu").expect("x64 target");
+        assert!(assemble("jz 2f\n", x64, &[]).is_err());
+        assert!(assemble("jz 2b\n", x64, &[]).is_err());
+    }
 }

@@ -3,8 +3,6 @@
 pub enum Arch {
     X64,
     Arm64,
-    Wasm32,
-    Riscv64,
 }
 
 /// An operating system family, which decides the host layer and the C library.
@@ -13,8 +11,6 @@ pub enum Os {
     Linux,
     Darwin,
     Windows,
-    Wasi,
-    None,
 }
 
 /// A platform C calling convention.
@@ -24,8 +20,6 @@ pub enum CallAbi {
     Aapcs64,
     AppleArm64,
     Win64,
-    Wasm,
-    Lp64d,
 }
 
 /// An executable file format.
@@ -34,7 +28,6 @@ pub enum Format {
     Elf,
     MachO,
     Pe,
-    Wasm,
 }
 
 /// How much work the code generator spends on each function.
@@ -147,36 +140,6 @@ pub const TARGETS: &[Target] = &[
         "",
         "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32"
     ),
-    target!(
-        "wasm32-unknown-unknown",
-        Wasm32,
-        None,
-        Wasm,
-        Wasm,
-        4,
-        "",
-        "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
-    ),
-    target!(
-        "wasm32-wasip1",
-        Wasm32,
-        Wasi,
-        Wasm,
-        Wasm,
-        4,
-        "",
-        "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"
-    ),
-    target!(
-        "riscv64gc-unknown-linux-gnu",
-        Riscv64,
-        Linux,
-        Lp64d,
-        Elf,
-        8,
-        "",
-        "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
-    ),
 ];
 
 /// The catalog index of the machine this program runs on; another host does not compile.
@@ -192,8 +155,6 @@ const HOST: usize = 3;
 const HOST: usize = 4;
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
 const HOST: usize = 5;
-#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
-const HOST: usize = 8;
 
 impl Target {
     /// The target named by `triple`.

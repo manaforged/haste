@@ -121,7 +121,12 @@ impl<'a> Infer<'_, 'a> {
             return self.unsize_bound_holds(arena, (of, path), ty);
         }
         if self.compiler_decides(of, ty) {
-            return Ok(self.compiler_holds(of, ty));
+            let held = self.compiler_holds(of, ty);
+            if held && self.is_thread_auto_trait(of) && self.has_vars(ty) {
+                self.note_obligation_site(of, ty);
+                self.obligations.push((of, vec![ty]));
+            }
+            return Ok(held);
         }
         let kind = self.cx.types.kind(self.resolve(ty));
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
@@ -202,6 +207,7 @@ impl<'a> Infer<'_, 'a> {
                     self.store_selection(key, local_key, None, state);
                 }
                 if held && self.obligation_open(ty, args) {
+                    self.note_obligation_site(of, ty);
                     self.obligations.push((
                         of,
                         std::iter::once(ty).chain(args.iter().copied()).collect(),
@@ -225,12 +231,14 @@ impl<'a> Infer<'_, 'a> {
             let held = !self.applicable(of, ty, &args, depth + 1)?.is_empty()
                 || self.poly_may_implement(of, ty, &args)?;
             if held {
+                self.note_obligation_site(of, substs[0]);
                 self.obligations.push((of, substs));
             }
             return Ok(held);
         }
         let held = self.opaque_holds(of, &substs)?;
         if held.is_none() {
+            self.note_obligation_site(of, substs[0]);
             self.obligations.push((of, substs));
         }
         Ok(held != Some(false))
@@ -309,11 +317,21 @@ impl<'a> Infer<'_, 'a> {
         Some(held)
     }
 
+    pub(in super::super) fn is_thread_auto_trait(&self, of: ItemRef) -> bool {
+        self.cx.lang(of) == Some("sync")
+            || (self.cx.is_auto_trait(of)
+                && self.cx.outline.is_sysroot(of.krate)
+                && self.cx.name(of) == "Send")
+    }
+
     pub(in super::super) fn compiler_trait(&self, of: ItemRef) -> bool {
         self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of)
     }
 
     pub(in crate::sema) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
+        if self.is_thread_auto_trait(of) {
+            return self.thread_auto_holds(of, ty);
+        }
         let Some(lang) = self.cx.lang(of) else {
             return true;
         };
@@ -390,6 +408,122 @@ impl<'a> Infer<'_, 'a> {
         self.parts(ty)
             .into_iter()
             .all(|part| self.unpin_holds(of, part, seen))
+    }
+
+    pub(in super::super) fn thread_auto_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
+        let ty = self.resolve(ty);
+        if self.auto_stack.contains(&(of, ty)) {
+            self.cycle_hits += 1;
+            return true;
+        }
+        if self.auto_stack.len() >= crate::RECURSION_LIMIT {
+            self.cycle_hits += 1;
+            return true;
+        }
+        match *self.cx.types.kind(ty) {
+            Kind::Prim(_)
+            | Kind::Never
+            | Kind::FnDef(..)
+            | Kind::FnPtr(..)
+            | Kind::Value(_)
+            | Kind::Var(_)
+            | Kind::IntVar(_)
+            | Kind::FloatVar(_)
+            | Kind::Param(_)
+            | Kind::Proj(_) => true,
+            Kind::Ptr(..) => false,
+            Kind::Ref(Mut::Not, inner) => match self.cx.lang_item("sync") {
+                Some(sync_of) => self.thread_auto_holds(sync_of, inner),
+                None => true,
+            },
+            Kind::Ref(Mut::Mut, inner)
+            | Kind::Array(inner, _)
+            | Kind::Slice(inner)
+            | Kind::Pat(inner, _) => self.thread_auto_holds(of, inner),
+            Kind::Dyn(object, _, _, autos) => {
+                object == of
+                    || self.cx.types.items(autos).contains(&of)
+                    || self
+                        .implied_traits(vec![object])
+                        .is_ok_and(|traits| traits.contains(&of))
+            }
+            Kind::Tuple(_) => {
+                self.auto_stack.push((of, ty));
+                let holds = self
+                    .parts(ty)
+                    .into_iter()
+                    .all(|part| self.thread_auto_holds(of, part));
+                self.auto_stack.pop();
+                holds
+            }
+            Kind::Closure(parent, _, at) => self.closure_auto_holds(of, ty, parent, at),
+            Kind::Adt(item, args) => self.adt_auto_holds(of, ty, item, args),
+        }
+    }
+
+    fn closure_auto_holds(&mut self, of: ItemRef, ty: Ty, parent: ItemRef, at: u32) -> bool {
+        self.auto_stack.push((of, ty));
+        let holds = if self.instance.is_some_and(|(cur, _)| cur == parent) {
+            let Some(captures) = self
+                .out
+                .closures
+                .get(&crate::body::ExprId(at))
+                .map(|c| c.captures.clone())
+            else {
+                self.auto_stack.pop();
+                return true;
+            };
+            captures.into_iter().all(|cap| {
+                let local_ty = self.resolve(self.out.locals[cap.local as usize].ty);
+                let cap_ty = cap.ty(self.cx, local_ty).unwrap_or(local_ty);
+                let held = match cap.by {
+                    super::super::By::Ref => self.cx.types.intern(Kind::Ref(Mut::Not, cap_ty)),
+                    super::super::By::Mut => self.cx.types.intern(Kind::Ref(Mut::Mut, cap_ty)),
+                    super::super::By::Value => cap_ty,
+                };
+                self.thread_auto_holds(of, held)
+            })
+        } else if let Some(info) = self.cx.ensure_closure(ty) {
+            self.thread_auto_holds(of, info.env)
+        } else {
+            true
+        };
+        self.auto_stack.pop();
+        holds
+    }
+
+    fn adt_auto_holds(
+        &mut self,
+        of: ItemRef,
+        ty: Ty,
+        item: ItemRef,
+        args: super::super::super::substs::Substs,
+    ) -> bool {
+        let holders = self.holders(of, ty, &[]);
+        if self.cx.negative_impl(of, Head::Adt(item), &holders) {
+            return false;
+        }
+        self.auto_stack.push((of, ty));
+        let holds = if self
+            .cx
+            .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders)
+        {
+            if self.has_vars(ty) || self.has_params(ty) {
+                true
+            } else {
+                self.select(of, ty, &[])
+                    .is_ok_and(|picked| picked.is_some())
+            }
+        } else if self.cx.lang(item) == Some("phantom_data") {
+            let inner = self.cx.types.substs(args).first().copied();
+            inner.is_none_or(|t| self.thread_auto_holds(of, t))
+        } else {
+            self.parts(ty)
+                .into_iter()
+                .all(|part| self.thread_auto_holds(of, part))
+        };
+        self.auto_stack.pop();
+        holds
     }
 
     pub(in super::super) fn bound_trait_at(

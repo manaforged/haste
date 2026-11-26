@@ -8,7 +8,7 @@ use crate::sema::ty::{Kind, Ty};
 use super::super::bind::push_loan;
 use super::super::places::{FieldKey, PlaceStep};
 use super::super::propagate::{BorrowSource, dedup_sources};
-use super::super::{Checker, State};
+use super::super::{ActiveClosure, Checker, Loan, State};
 
 impl Checker<'_, '_> {
     pub(in super::super) fn check_closure(
@@ -22,35 +22,35 @@ impl Checker<'_, '_> {
         let Some(closure) = self.typed.closures.get(&expr).cloned() else {
             return Ok(());
         };
-        let mut body_state = State {
-            init: state.init.clone(),
-            maybe_init: state.maybe_init.clone(),
-            moved: state.moved.clone(),
-            partial_moves: state.partial_moves.clone(),
-            loans: Vec::new(),
-            diverged: false,
-        };
+        let mut body_state = State::for_closure(state);
         let saved_no_move = self.no_move_captures.clone();
         if let Err(err) = self.check_closure_captures(expr, &closure, state, &mut body_state) {
             self.no_move_captures = saved_no_move;
             return Err(err);
         }
+        let mut param_bound: Vec<HashSet<u32>> = Vec::new();
         let closure_depth = depth + 1;
         if let Some(params) = params {
             let param_ids: Vec<u32> = self.body.list(params).to_vec();
             for (idx, p_id) in param_ids.into_iter().enumerate() {
+                let param = self.body.params[p_id as usize];
+                let mut bound = HashSet::default();
+                self.collect_pat_locals(param.pat, &mut bound);
                 let mut fallback = Vec::new();
                 if let Some(&local) = closure.params.get(idx)
                     && (local as usize) < body_state.init.len()
                 {
+                    bound.insert(local);
                     self.scope_depth[local as usize] = closure_depth;
                     body_state.init[local as usize] = true;
                     body_state.maybe_init[local as usize] = true;
                     body_state.moved[local as usize] = false;
+                    body_state.moved_at[local as usize] = None;
                     fallback.push(self.param_fallback_source(local));
                 }
+                param_bound.push(bound);
                 if let Err(err) = self.bind_pat(
-                    self.body.params[p_id as usize].pat,
+                    param.pat,
                     None,
                     None,
                     &[],
@@ -75,9 +75,22 @@ impl Checker<'_, '_> {
             .map(|c| c.local)
             .collect();
         let saved_by_val = std::mem::replace(&mut self.closure_by_val_caps, next_by_val);
-        self.returns_borrow = self.ty_holds_borrow(closure.ret);
+        let async_inner = (body != expr)
+            .then(|| self.typed.closures.get(&body))
+            .flatten()
+            .filter(|inner| inner.coroutine)
+            .map(|inner| {
+                let caps: Vec<u32> = inner.captures.iter().map(|c| c.local).collect();
+                (inner.ret, caps)
+            });
+        self.returns_borrow =
+            self.ty_holds_borrow(async_inner.as_ref().map_or(closure.ret, |(r, _)| *r));
         self.return_min_depth = closure_depth;
         self.closure_depth = closure_depth;
+        self.active_closures.push(ActiveClosure {
+            params: closure.params.clone(),
+            ret_params: Vec::new(),
+        });
         let init_moved = body_state.moved.clone();
         let init_partial = body_state.partial_moves.clone();
         let empty = HashSet::default();
@@ -112,6 +125,7 @@ impl Checker<'_, '_> {
             }
             Ok(())
         });
+        let active = self.active_closures.pop();
         (
             self.returns_borrow,
             self.return_min_depth,
@@ -133,6 +147,22 @@ impl Checker<'_, '_> {
             super::super::checks::is_temp_target(s.target).is_some()
                 || !self.from_caller(s.target, s.through_ref)
         });
+        let ret_params = if let Some((_, inner_caps)) = async_inner {
+            closure
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| {
+                    inner_caps.contains(p)
+                        || param_bound
+                            .get(*i)
+                            .is_some_and(|bs| inner_caps.iter().any(|c| bs.contains(c)))
+                })
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            active.map(|a| a.ret_params).unwrap_or_default()
+        };
         self.record_closure_body_loans(
             expr,
             &closure.params,
@@ -140,6 +170,7 @@ impl Checker<'_, '_> {
             &body_state,
             state,
             (moves_capture, mutates_capture, borrows_local),
+            ret_params,
         );
         Ok(())
     }
@@ -181,6 +212,9 @@ impl Checker<'_, '_> {
             };
             match cap.by {
                 By::Ref | By::Mut => {
+                    if cap.by == By::Mut {
+                        state.set_tuple_sources(local, None);
+                    }
                     let is_mut_ref = self.is_mut_ref_ty(self.local_ty(local));
                     for (steps, is_mut, through_ref, mut_ref_root) in
                         self.closure_capture_info(expr, cap.by, local)
@@ -203,13 +237,7 @@ impl Checker<'_, '_> {
                             {
                                 push_loan(
                                     &mut body_state.loans,
-                                    local,
-                                    steps,
-                                    None,
-                                    false,
-                                    false,
-                                    false,
-                                    false,
+                                    Loan::new(local, steps, None, false, false, self.current_expr),
                                 );
                             } else if cap.by == By::Mut && !closure.consumes {
                                 self.no_move_captures.push((local, steps));
@@ -231,18 +259,15 @@ impl Checker<'_, '_> {
                         {
                             for (steps, ..) in paths {
                                 self.check_can_move(local, &steps, state)?;
-                                self.push_partial_move(state, local, steps);
+                                self.push_partial_move(state, local, steps, Some(expr));
                             }
                         } else {
                             self.check_can_move(local, &[], state)?;
-                            if let Some(slot) = state.moved.get_mut(local as usize) {
-                                *slot = true;
-                            }
-                            state.partial_moves.retain(|m| m.local != local);
+                            self.mark_local_moved(state, local, Some(expr));
                         }
                     } else {
                         self.check_can_move(local, &cap_steps, state)?;
-                        self.push_partial_move(state, local, cap_steps);
+                        self.push_partial_move(state, local, cap_steps, Some(expr));
                     }
                 }
             }
@@ -258,11 +283,16 @@ impl Checker<'_, '_> {
         let Some(closure) = self.typed.closures.get(&expr).cloned() else {
             return Vec::new();
         };
-        let ret_targets = self.closure_ret_targets(expr, closure.ret, state);
+        let ret_sets = self.closure_ret_target_sets(expr, closure.ret, state);
         let capture_env_only = |target: u32| {
-            ret_targets
+            ret_sets
                 .as_ref()
-                .is_some_and(|set| !set.contains(&target))
+                .is_some_and(|(real, orig)| !real.contains(&target) && !orig.contains(&target))
+        };
+        let capture_origin_only = |target: u32| {
+            ret_sets
+                .as_ref()
+                .is_some_and(|(real, orig)| !real.contains(&target) && orig.contains(&target))
         };
         let mut out = Vec::new();
         for cap in &closure.captures {
@@ -284,20 +314,44 @@ impl Checker<'_, '_> {
                         mutable: true,
                         through_ref: true,
                         env_only: capture_env_only(cap.local),
+                        origin_only: false,
                     });
+                } else if let Some(src) = self.origin_source_for(
+                    cap.local,
+                    cap_ty,
+                    cap_steps,
+                    capture_env_only(cap.local),
+                ) {
+                    out.push(src);
                 }
             } else {
-                for (steps, is_mut, through_ref, _) in
+                let real_ret = ret_sets
+                    .as_ref()
+                    .is_none_or(|(real, _)| real.contains(&cap.local));
+                let origin_ret = capture_origin_only(cap.local);
+                for (steps, is_mut, through_ref, reborrows_shared) in
                     self.closure_capture_info(expr, cap.by, cap.local)
                 {
                     if steps.starts_with(&cap_steps) {
+                        let keep_origin = origin_ret || (reborrows_shared && !real_ret);
                         out.push(BorrowSource {
                             target: cap.local,
-                            steps,
+                            steps: steps.clone(),
                             mutable: is_mut,
                             through_ref,
-                            env_only: capture_env_only(cap.local),
+                            env_only: keep_origin || capture_env_only(cap.local),
+                            origin_only: false,
                         });
+                        if keep_origin {
+                            out.push(BorrowSource {
+                                target: cap.local,
+                                steps,
+                                mutable: false,
+                                through_ref,
+                                env_only: false,
+                                origin_only: true,
+                            });
+                        }
                     }
                 }
             }
@@ -311,33 +365,50 @@ impl Checker<'_, '_> {
         dedup_sources(out)
     }
 
+    fn closure_ret_target_sets(
+        &mut self,
+        expr: ExprId,
+        ret_ty: Ty,
+        state: &State,
+    ) -> Option<(HashSet<u32>, HashSet<u32>)> {
+        if !self.ty_holds_borrow(ret_ty) {
+            return Some((HashSet::default(), HashSet::default()));
+        }
+        let Expr::Closure { body, .. } = *self.body.expr(expr) else {
+            return None;
+        };
+        let srcs = if let Some(cached) = self.temp_sources.get(&body)
+            && !self.expr_has_return(body)
+        {
+            cached.clone()
+        } else {
+            let mut inner_locals = HashSet::default();
+            if !self.can_analyze_closure_ret(body, &mut inner_locals) {
+                return None;
+            }
+            self.expr_borrow_sources(body, state)
+        };
+        let mut real = HashSet::default();
+        let mut orig = HashSet::default();
+        for s in srcs {
+            if s.origin_only {
+                orig.insert(s.target);
+            } else {
+                real.insert(s.target);
+            }
+        }
+        Some((real, orig))
+    }
+
     pub(in super::super) fn closure_ret_targets(
         &mut self,
         expr: ExprId,
         ret_ty: Ty,
         state: &State,
     ) -> Option<HashSet<u32>> {
-        if !self.ty_holds_borrow(ret_ty) {
-            return Some(HashSet::default());
-        }
-        let Expr::Closure { body, .. } = *self.body.expr(expr) else {
-            return None;
-        };
-        if let Some(cached) = self.temp_sources.get(&body)
-            && !self.expr_has_return(body)
-        {
-            return Some(cached.iter().map(|s| s.target).collect());
-        }
-        let mut inner_locals = HashSet::default();
-        if !self.can_analyze_closure_ret(body, &mut inner_locals) {
-            return None;
-        }
-        let targets = self
-            .expr_borrow_sources(body, state)
-            .into_iter()
-            .map(|s| s.target)
-            .collect();
-        Some(targets)
+        let (mut real, orig) = self.closure_ret_target_sets(expr, ret_ty, state)?;
+        real.extend(orig);
+        Some(real)
     }
 
     fn can_analyze_closure_ret(&mut self, expr: ExprId, inner_locals: &mut HashSet<u32>) -> bool {

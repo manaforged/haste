@@ -588,3 +588,70 @@ impl Checker<'_, '_> {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FieldKey, PlaceStep, steps_conflict};
+
+    #[test]
+    fn steps_conflict_handles_fields_prefixes_slices_and_unions() {
+        let fa = PlaceStep::Field(FieldKey::Named("a".to_owned()));
+        let fb = PlaceStep::Field(FieldKey::Named("b".to_owned()));
+        let t0 = PlaceStep::Field(FieldKey::Tuple(0));
+        let t1 = PlaceStep::Field(FieldKey::Tuple(1));
+
+        assert!(!steps_conflict(&[fa.clone()], &[fb.clone()]));
+        assert!(!steps_conflict(&[t0.clone()], &[t1]));
+        assert!(steps_conflict(&[], &[fa.clone()]));
+        assert!(steps_conflict(&[fa.clone()], &[fa.clone(), t0]));
+        assert!(steps_conflict(&[PlaceStep::Union], &[fb]));
+        assert!(steps_conflict(
+            &[PlaceStep::Opaque(Some(1))],
+            &[PlaceStep::Opaque(Some(2))]
+        ));
+
+        let elem0 = PlaceStep::SliceElem {
+            offset: 0,
+            min_len: 3,
+            from_end: false,
+            array_len: Some(3),
+        };
+        let elem2 = PlaceStep::SliceElem {
+            offset: 2,
+            min_len: 3,
+            from_end: false,
+            array_len: Some(3),
+        };
+        let tail1 = PlaceStep::SliceElem {
+            offset: 1,
+            min_len: 3,
+            from_end: true,
+            array_len: Some(3),
+        };
+        let tail2 = PlaceStep::SliceElem {
+            offset: 2,
+            min_len: 3,
+            from_end: true,
+            array_len: Some(3),
+        };
+        let dyn_head0 = PlaceStep::SliceElem {
+            offset: 0,
+            min_len: 1,
+            from_end: false,
+            array_len: None,
+        };
+        let dyn_tail1 = PlaceStep::SliceElem {
+            offset: 1,
+            min_len: 1,
+            from_end: true,
+            array_len: None,
+        };
+        assert!(!steps_conflict(&[elem0.clone()], &[elem2.clone()]));
+        assert!(!steps_conflict(&[elem2.clone()], &[elem0.clone()]));
+        assert!(steps_conflict(&[elem2.clone()], &[tail1.clone()]));
+        assert!(steps_conflict(&[tail1.clone()], &[elem2]));
+        assert!(!steps_conflict(&[tail1], &[tail2]));
+        assert!(steps_conflict(&[dyn_head0], &[dyn_tail1]));
+        assert!(steps_conflict(&[elem0], &[PlaceStep::Opaque(None)]));
+    }
+}

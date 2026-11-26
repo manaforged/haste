@@ -441,9 +441,29 @@ impl<'a> Context<'a> {
 
     /// Whether any impl of trait `of` in crates `holders` may match a self type with head `head`.
     pub fn has_trait_impl_for_head(&mut self, of: ItemRef, head: Head, holders: &[u32]) -> bool {
+        self.has_trait_impl_for_head_inner(of, head, holders, true)
+    }
+
+    /// Whether any non-blanket impl of trait `of` in crates `holders` targets self head `head`.
+    pub fn has_specific_trait_impl_for_head(
+        &mut self,
+        of: ItemRef,
+        head: Head,
+        holders: &[u32],
+    ) -> bool {
+        self.has_trait_impl_for_head_inner(of, head, holders, false)
+    }
+
+    fn has_trait_impl_for_head_inner(
+        &mut self,
+        of: ItemRef,
+        head: Head,
+        holders: &[u32],
+        include_blanket: bool,
+    ) -> bool {
         self.any_holder(holders, Some(head), Some(of), |index| {
             index.traits.get(&of).is_some_and(|bucket| {
-                !bucket.blanket.is_empty()
+                (include_blanket && !bucket.blanket.is_empty())
                     || bucket
                         .by_head
                         .get(&head)

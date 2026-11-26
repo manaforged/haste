@@ -396,18 +396,44 @@ impl<'a> Context<'a> {
                     dollar,
                 },
             ),
-            _ => self.path_member(
-                home,
-                paths.resolve(
-                    &NamePath {
-                        segments: head,
-                        absolute,
-                        dollar,
-                    },
-                    home,
-                )?,
-                leaf,
-            ),
+            _ => {
+                let target = if self.outline.crates[home.krate as usize].env.fixed
+                    || dollar.is_some_and(|k| self.outline.is_sysroot(k))
+                {
+                    paths.resolve(
+                        &NamePath {
+                            segments: head,
+                            absolute,
+                            dollar,
+                        },
+                        home,
+                    )?
+                } else {
+                    paths
+                        .resolve_visible(
+                            &NamePath {
+                                segments: head,
+                                absolute,
+                                dollar,
+                            },
+                            home,
+                        )
+                        .ok()??
+                };
+                let mut found = self.path_member(home, target, leaf);
+                if let Def::Module(target_mod) = target
+                    && !self.outline.crates[home.krate as usize].env.fixed
+                    && !dollar.is_some_and(|k| self.outline.is_sysroot(k))
+                {
+                    let keep = |b: Binding| {
+                        crate::names::resolve::visible(&paths, b.vis, target_mod, home)
+                    };
+                    found.types = found.types.filter(|&b| keep(b));
+                    found.values = found.values.filter(|&b| keep(b));
+                    found.macros = found.macros.filter(|&b| keep(b));
+                }
+                found
+            }
         };
         (entry.types.is_some() || entry.values.is_some()).then_some((name.is_some(), entry))
     }

@@ -473,9 +473,10 @@ fn write_host(out: &mut Vec<u8>, host: &HostSymbol) -> Option<()> {
             out.push(14);
             write_str(out, x.link_name())?;
         }
-        HostSymbol::Dynamic(s) => {
+        HostSymbol::Dynamic { name, lib } => {
             out.push(15);
-            write_str(out, s)?;
+            write_str(out, name)?;
+            write_str(out, lib.as_deref().unwrap_or(""))?;
         }
         HostSymbol::CatchUnwind => out.push(16),
         HostSymbol::StartPanic => out.push(17),

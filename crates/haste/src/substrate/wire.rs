@@ -180,19 +180,21 @@ pub(super) fn encode_unwind_drops(drops: &[CodeUnwindDrop], out: &mut Vec<u8>) {
     }
 }
 
+#[inline]
 pub(crate) fn read_u32(data: &[u8], at: usize) -> u32 {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&data[at..at + 4]);
     u32::from_le_bytes(bytes)
 }
 
+#[inline]
 pub(crate) fn read_u64(data: &[u8], at: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&data[at..at + 8]);
     u64::from_le_bytes(bytes)
 }
 
-fn encode_reloc_kind(kind: RelocKind) -> u8 {
+const fn encode_reloc_kind(kind: RelocKind) -> u8 {
     match kind {
         RelocKind::Abs32 => 0,
         RelocKind::Abs64 => 1,
@@ -206,9 +208,31 @@ fn encode_reloc_kind(kind: RelocKind) -> u8 {
     }
 }
 
+const _: () = {
+    let mut i = 0;
+    while i < RELOC_KINDS.len() {
+        assert!(encode_reloc_kind(RELOC_KINDS[i]) as usize == i);
+        i += 1;
+    }
+};
+
 fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
     RELOC_KINDS
         .get(raw as usize)
         .copied()
         .ok_or_else(|| anyhow!("unknown relocation kind"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reloc_kind_round_trips_every_variant() {
+        for &kind in &RELOC_KINDS {
+            let encoded = encode_reloc_kind(kind);
+            assert_eq!(decode_reloc_kind(encoded).expect("valid kind"), kind);
+        }
+        assert!(decode_reloc_kind(RELOC_KINDS.len() as u8).is_err());
+    }
 }

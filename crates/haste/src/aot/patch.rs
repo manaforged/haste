@@ -347,9 +347,9 @@ fn partition_relocs(sorted: &[&CodeReloc], workers: usize) -> Vec<(usize, usize,
 pub(crate) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8]) -> Result<()> {
     let mut stub_vas = Vec::with_capacity(ctx.plan.imports.len());
     let mut got_vas = Vec::with_capacity(ctx.plan.imports.len());
-    for &name in &ctx.plan.imports {
-        stub_vas.push((ctx.stub_va)(name)?);
-        got_vas.push((ctx.got_va)(name)?);
+    for imp in &ctx.plan.imports {
+        stub_vas.push((ctx.stub_va)(imp.name)?);
+        got_vas.push((ctx.got_va)(imp.name)?);
     }
     let env = PatchEnv {
         text_va: ctx.text_va,

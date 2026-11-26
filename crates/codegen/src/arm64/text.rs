@@ -1,5 +1,5 @@
-use super::asm::{Asm, FP, LR, Reg, SP, Size, Vreg};
-use crate::asm_text::{Encoder, Symbols, integer};
+use super::asm::{Asm, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
+use crate::asm_text::{Encoder, LocalLabels, Symbols, integer, local_target};
 use crate::reloc::StencilReloc;
 
 const IP1: Reg = Reg(17);
@@ -11,6 +11,7 @@ pub(crate) struct Text {
     asm: Asm,
     relocs: Vec<StencilReloc>,
     direct: bool,
+    locals: LocalLabels<Label>,
 }
 
 #[derive(Clone, Copy)]
@@ -23,9 +24,12 @@ enum Address {
 enum Operand {
     X(Reg),
     Sp,
+    Zr,
+    D(Vreg),
     Q(Vreg),
     Imm(i64),
     Symbol(u32),
+    Local(u32, bool),
     Addr(Address),
 }
 
@@ -36,7 +40,12 @@ impl Text {
             asm: Asm::default(),
             relocs: Vec::new(),
             direct,
+            locals: LocalLabels::default(),
         }
+    }
+
+    fn local_label(&mut self, id: u32, forward: bool) -> Result<Label, String> {
+        self.locals.target(id, forward, || self.asm.label())
     }
 
     fn pair(&mut self, mnemonic: &str, operands: &[Operand]) -> Result<bool, String> {
@@ -80,6 +89,22 @@ impl Text {
                 ],
             ) => self.asm.ldp_offset(*a, *b, *base, scaled(*offset, 8)?),
             (
+                false,
+                [
+                    Operand::D(a),
+                    Operand::D(b),
+                    Operand::Addr(Address::Offset(base, offset)),
+                ],
+            ) => self.asm.fstp_offset(*a, *b, *base, scaled(*offset, 8)?),
+            (
+                true,
+                [
+                    Operand::D(a),
+                    Operand::D(b),
+                    Operand::Addr(Address::Offset(base, offset)),
+                ],
+            ) => self.asm.fldp_offset(*a, *b, *base, scaled(*offset, 8)?),
+            (
                 _,
                 [
                     Operand::Q(a),
@@ -113,6 +138,37 @@ impl Text {
                 base(*src)?,
                 add_imm(*imm)?,
             ),
+            (
+                "str",
+                [
+                    Operand::X(src),
+                    Operand::Addr(Address::Offset(base, offset)),
+                ],
+            ) => {
+                self.asm
+                    .store(Size::X, Mem::new(*base, disp(*offset)?), *src);
+            }
+            ("str", [Operand::Zr, Operand::Addr(Address::Offset(base, offset))]) => {
+                self.asm.store(Size::X, Mem::new(*base, disp(*offset)?), ZR);
+            }
+            (
+                "ldr",
+                [
+                    Operand::X(dst),
+                    Operand::Addr(Address::Offset(base, offset)),
+                ],
+            ) => {
+                self.asm
+                    .load(Size::X, false, *dst, Mem::new(*base, disp(*offset)?));
+            }
+            ("cbz" | "cbnz", [Operand::X(reg), Operand::Local(id, forward)]) => {
+                let label = self.local_label(*id, *forward)?;
+                self.asm.cbz(mnemonic == "cbnz", Size::X, *reg, label);
+            }
+            ("b", [Operand::Local(id, forward)]) => {
+                let label = self.local_label(*id, *forward)?;
+                self.asm.b(label);
+            }
             ("bl", [Operand::Symbol(sym)]) => {
                 let reloc = self.asm.call_symbol(*sym, self.direct, IP1);
                 self.relocs.push(reloc);
@@ -123,6 +179,18 @@ impl Text {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+}
+
+fn disp(offset: i64) -> Result<i32, String> {
+    let fits =
+        (offset >= 0 && offset % 8 == 0 && offset / 8 < 4096) || (-256..=255).contains(&offset);
+    if fits {
+        Ok(offset as i32)
+    } else {
+        Err(format!(
+            "offset {offset} does not fit direct 64-bit load/store encoding"
+        ))
     }
 }
 
@@ -160,10 +228,12 @@ fn register(text: &str) -> Option<Operand> {
     };
     match text {
         "sp" => Some(Operand::Sp),
+        "xzr" => Some(Operand::Zr),
         "fp" => Some(Operand::X(FP)),
         "lr" => Some(Operand::X(LR)),
         _ => index("x", 31)
             .map(|number| Operand::X(Reg(number)))
+            .or_else(|| index("d", 32).map(|number| Operand::D(Vreg(number))))
             .or_else(|| index("q", 32).map(|number| Operand::Q(Vreg(number)))),
     }
 }
@@ -199,6 +269,9 @@ fn operand(text: &str, symbol: &Symbols<'_>) -> Result<Operand, String> {
     if text.starts_with('[') {
         return address(text).map(Operand::Addr);
     }
+    if let Some((id, forward)) = local_target(text) {
+        return Ok(Operand::Local(id, forward));
+    }
     match register(text) {
         Some(reg) => Ok(reg),
         None => integer(text).map(Operand::Imm),
@@ -212,6 +285,11 @@ impl Encoder for Text {
 
     fn pad(&mut self) {
         self.asm.word(0xD503_201F);
+    }
+
+    fn define_local(&mut self, id: u32) {
+        let label = self.locals.define(id, || self.asm.label());
+        self.asm.bind(label);
     }
 
     fn instruction(
@@ -231,6 +309,7 @@ impl Encoder for Text {
     }
 
     fn finish(self) -> Result<(Vec<u8>, Vec<StencilReloc>), String> {
+        self.locals.finish()?;
         Ok((self.asm.finish()?, self.relocs))
     }
 }

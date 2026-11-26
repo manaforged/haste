@@ -36,7 +36,10 @@ pub enum HostSymbol {
     DropPop,
     Math(MathSymbol),
     X86(X86Symbol),
-    Dynamic(Box<str>),
+    Dynamic {
+        name: Box<str>,
+        lib: Option<Box<str>>,
+    },
 }
 
 const DIRECT: &[HostSymbol] = &[
@@ -49,8 +52,8 @@ const DIRECT: &[HostSymbol] = &[
 ];
 
 impl HostSymbol {
-    /// Classifies `name` into a typed host symbol when the host links to it (or as a dynamic import when cross-compiling with `aot` true).
-    pub fn resolve_for(name: &str, aot: bool) -> Option<Self> {
+    /// Classifies `name` (with optional `#[link(name = "...")]` library `lib`) into a typed host symbol when the host links to it or when emitting AOT for a cross-target or declared library.
+    pub fn resolve_for_lib(name: &str, lib: Option<&str>, aot: bool) -> Option<Self> {
         if let Some(found) = DIRECT.iter().find(|sym| sym.link_name() == name) {
             return Some(found.clone());
         }
@@ -68,13 +71,26 @@ impl HostSymbol {
                 if let Some(math) = MathSymbol::from_name(name) {
                     return Some(Self::Math(math));
                 }
-                if aot && crate::compile_target().triple != haste_codegen::Target::host().triple {
-                    return Some(Self::Dynamic(name.into()));
+                let make_dynamic = || Self::Dynamic {
+                    name: name.into(),
+                    lib: lib.map(Into::into),
+                };
+                let target = crate::compile_target();
+                if aot
+                    && (target.triple != haste_codegen::Target::host().triple
+                        || (target.format == haste_codegen::Format::Pe && lib.is_some()))
+                {
+                    return Some(make_dynamic());
                 }
-                return dynamic(name).map(|_| Self::Dynamic(name.into()));
+                return dynamic(name).map(|_| make_dynamic());
             }
         };
         Some(built_in)
+    }
+
+    /// Classifies `name` into a typed host symbol when the host links to it (or as a dynamic import when cross-compiling with `aot` true).
+    pub fn resolve_for(name: &str, aot: bool) -> Option<Self> {
+        Self::resolve_for_lib(name, None, aot)
     }
 
     /// Classifies `name` into a typed host symbol when the host links to it.
@@ -110,7 +126,7 @@ impl HostSymbol {
             Self::DropPop => "__haste_drop_pop",
             Self::Math(math) => math.link_name(),
             Self::X86(x86) => x86.link_name(),
-            Self::Dynamic(name) => name,
+            Self::Dynamic { name, .. } => name,
         }
     }
 
@@ -137,7 +153,7 @@ impl HostSymbol {
             Self::DropPop => unwind::drop_pop as *const () as usize,
             Self::Math(math) => math.host_addr(),
             Self::X86(x86) => return x86.host_addr(),
-            Self::Dynamic(_) => return dynamic(self.link_name()),
+            Self::Dynamic { .. } => return dynamic(self.link_name()),
         })
     }
 }
@@ -146,6 +162,12 @@ impl HostSymbol {
 static DSO_HANDLE: u8 = 0;
 
 fn dynamic(name: &str) -> Option<usize> {
+    #[cfg(target_vendor = "apple")]
+    match name {
+        "_NSGetArgc" => return Some(apple_args::get_argc as *const () as usize),
+        "_NSGetArgv" => return Some(apple_args::get_argv as *const () as usize),
+        _ => {}
+    }
     if let Some(address) = native::symbol(name) {
         return Some(address);
     }
@@ -236,4 +258,105 @@ extern "C" fn barrier(_option: u32) {
 
 extern "C" fn abort() -> ! {
     std::process::abort()
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) mod apple_args {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static ARGC: AtomicI32 = AtomicI32::new(0);
+    static ARGV: AtomicPtr<*mut libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
+
+    unsafe extern "C" {
+        fn _NSGetArgc() -> *mut libc::c_int;
+        fn _NSGetArgv() -> *mut *mut *mut libc::c_char;
+    }
+
+    pub(super) extern "C" fn get_argc() -> *mut libc::c_int {
+        if ACTIVE.load(Ordering::Acquire) {
+            ARGC.as_ptr()
+        } else {
+            // SAFETY: _NSGetArgc returns libdyld's static argc pointer.
+            unsafe { _NSGetArgc() }
+        }
+    }
+
+    pub(super) extern "C" fn get_argv() -> *mut *mut *mut libc::c_char {
+        if ACTIVE.load(Ordering::Acquire) {
+            ARGV.as_ptr()
+        } else {
+            // SAFETY: _NSGetArgv returns libdyld's static argv pointer.
+            unsafe { _NSGetArgv() }
+        }
+    }
+
+    /// Scoped override of `_NSGetArgc` / `_NSGetArgv` for JIT-executed programs on Apple hosts.
+    pub(crate) struct Guard {
+        prev_active: bool,
+        prev_argc: libc::c_int,
+        prev_argv: *mut *mut libc::c_char,
+    }
+
+    impl Guard {
+        pub(crate) fn install(argc: libc::c_int, argv: *mut *mut libc::c_char) -> Self {
+            let prev_active = ACTIVE.load(Ordering::Acquire);
+            let prev_argc = ARGC.swap(argc, Ordering::AcqRel);
+            let prev_argv = ARGV.swap(argv, Ordering::AcqRel);
+            ACTIVE.store(true, Ordering::Release);
+            Self {
+                prev_active,
+                prev_argc,
+                prev_argv,
+            }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.prev_active {
+                ACTIVE.store(false, Ordering::Release);
+            }
+            ARGC.store(self.prev_argc, Ordering::Release);
+            ARGV.store(self.prev_argv, Ordering::Release);
+            ACTIVE.store(self.prev_active, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::{CStr, CString};
+
+        use super::*;
+
+        #[test]
+        fn guard_overrides_and_restores_apple_argv() {
+            // SAFETY: get_argc returns libdyld's live static argc pointer.
+            let orig_argc = unsafe { *get_argc() };
+            let owned = [
+                CString::new("prog").expect("cstring"),
+                CString::new("--flag").expect("cstring"),
+            ];
+            let mut ptrs: Vec<*mut libc::c_char> = owned
+                .iter()
+                .map(|s| s.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect();
+            {
+                let _guard = Guard::install(owned.len() as libc::c_int, ptrs.as_mut_ptr());
+                // SAFETY: guard points to live ARGC/ARGV backing `owned` for this scope.
+                let (argc, argv) = unsafe { (*get_argc(), *get_argv()) };
+                assert_eq!(argc, 2);
+                // SAFETY: argv[0] is a live NUL-terminated string in `owned`.
+                let first = unsafe { CStr::from_ptr(*argv) }.to_str().expect("utf8");
+                // SAFETY: argv[1] is a live NUL-terminated string in `owned`.
+                let second = unsafe { CStr::from_ptr(*argv.add(1)) }
+                    .to_str()
+                    .expect("utf8");
+                assert_eq!((first, second), ("prog", "--flag"));
+            }
+            // SAFETY: guard dropped, restoring libdyld's static argc pointer.
+            assert_eq!(unsafe { *get_argc() }, orig_argc);
+        }
+    }
 }

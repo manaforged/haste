@@ -335,10 +335,10 @@ pub fn open(path: &Path, mode: libc::c_int) -> Result<*mut c_void> {
         }
         // SAFETY: dlerror takes no arguments and returns null or a message that stays valid until the next dynamic linker call on this thread.
         let reason = unsafe { libc::dlerror() };
-        // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
         let reason = if reason.is_null() {
             String::new()
         } else {
+            // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
             unsafe { CStr::from_ptr(reason) }
                 .to_string_lossy()
                 .into_owned()

@@ -33,6 +33,67 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
     parts
 }
 
+/// Returns the library name declared by an active `#[link(name = "...")]` attribute (ignoring `kind = "static"` and failing `cfg(...)` clauses).
+pub fn link_name(src: &Source, attrs: &[Attr], env: &Env) -> Option<String> {
+    for attr in attrs {
+        match attr {
+            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => {
+                if let Some(found) = link_name(src, inner, env) {
+                    return Some(found);
+                }
+            }
+            &Attr::Other(at) if attr_is_named(src, at, "link") => {
+                let end = path_end(src, at, src.len());
+                if src.kind(end) != TokenKind::OpenParen {
+                    continue;
+                }
+                let close = src.pair(end);
+                let mut name = None;
+                let mut skip = false;
+                for (from, to) in split_commas(src, end + 1, close) {
+                    if from >= to {
+                        continue;
+                    }
+                    let key = src.text(from);
+                    if key == "cfg" && from + 1 < to && src.kind(from + 1) == TokenKind::OpenParen {
+                        if cfg_of(src, from + 1)
+                            .ok()
+                            .is_none_or(|c| env.eval(&c) != Truth::Yes)
+                        {
+                            skip = true;
+                            break;
+                        }
+                    } else if from + 2 < to && src.kind(from + 1) == TokenKind::Eq {
+                        let val = src
+                            .literal_text(from + 2)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| unquote(src.text(from + 2)));
+                        match key {
+                            "name" => {
+                                let trimmed = val.trim();
+                                if !trimmed.is_empty() {
+                                    name = Some(trimmed.to_owned());
+                                }
+                            }
+                            "kind" if !matches!(val.as_str(), "dylib" | "raw-dylib") => {
+                                skip = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !skip && let Some(found) = name {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Returns the `expected` string of `#[should_panic(expected = "...")]` or `#[should_panic = "..."]`, if present.
 pub fn should_panic_expected(src: &Source, attrs: &[Attr], env: &Env) -> Option<String> {
     for attr in attrs {
@@ -290,4 +351,76 @@ pub fn marks(src: &Source, attrs: &[Attr]) -> u16 {
         bits |= super::item::MARK_CFG_ATTR;
     }
     bits
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use haste_codegen::Target;
+
+    use super::*;
+    use crate::outline::scan::scan;
+
+    fn parse_first_link(src_text: &str, triple: &str) -> Option<String> {
+        let src = Source::parse(PathBuf::from("test.rs"), src_text.to_owned()).expect("lex");
+        let items = scan(&src).expect("scan");
+        let target = crate::graph::cfg::Target::of(Target::find(triple).expect("target"));
+        let env = Env {
+            target,
+            features: std::collections::BTreeSet::new(),
+            script: None,
+            known: true,
+            vars: Vec::new(),
+            release: false,
+            fixed: false,
+            test: false,
+        };
+        link_name(&src, &items.items[0].attrs, &env)
+    }
+
+    #[test]
+    fn link_name_handles_raw_dylib_cfg_attr_cfg_clause_static_and_empty() {
+        let win = "x86_64-pc-windows-msvc";
+        let lin = "x86_64-unknown-linux-gnu";
+        assert_eq!(
+            parse_first_link(r#"#[link(name = "user32")] extern "system" {}"#, win).as_deref(),
+            Some("user32")
+        );
+        assert_eq!(
+            parse_first_link(
+                r#"#[cfg_attr(target_os = "windows", link(name = "bcrypt", kind = "raw-dylib"))] extern "system" {}"#,
+                win,
+            )
+            .as_deref(),
+            Some("bcrypt")
+        );
+        assert_eq!(
+            parse_first_link(
+                r#"#[cfg_attr(target_os = "windows", link(name = "bcrypt", kind = "raw-dylib"))] extern "system" {}"#,
+                lin,
+            ),
+            None
+        );
+        assert_eq!(
+            parse_first_link(
+                r#"#[link(name = "foo", kind = "static")] #[link(name = "advapi32")] extern "system" {}"#,
+                win,
+            )
+            .as_deref(),
+            Some("advapi32")
+        );
+        assert_eq!(
+            parse_first_link(
+                r#"#[link(name = "unix_only", cfg(unix))] #[link(name = "win_only", cfg(windows))] extern "C" {}"#,
+                win,
+            )
+            .as_deref(),
+            Some("win_only")
+        );
+        assert_eq!(
+            parse_first_link(r#"#[link(name = "   ")] extern "C" {}"#, win),
+            None
+        );
+    }
 }

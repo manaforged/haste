@@ -305,6 +305,15 @@ impl Infer<'_, '_> {
         let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         let (pats, rest) = rest_split(self.body, list)?;
+        if self.cx.item(item).1.kind == ItemKind::Struct {
+            for at in 0..pats.len() {
+                let Some(index) = position(at, pats.len(), rest, fields.len()) else {
+                    continue;
+                };
+                let pat_tok = self.body.pat_span(pats[at]).map(|(s, _)| s);
+                self.check_field_visible(item, index as u32, None, pat_tok, &index.to_string())?;
+            }
+        }
         self.positional(&pats, rest, &fields, mode)
     }
 
@@ -330,6 +339,7 @@ impl Infer<'_, '_> {
             let Some(index) = self.field_index(item, variant, name)? else {
                 bail!("no field `{name}` on {}", self.cx.name(item))
             };
+            self.check_field_visible(item, index, None, Some(field.name), name)?;
             self.out.field_pats.insert(field.pat, index);
             self.pat(field.pat, fields[index as usize], mode)?;
         }

@@ -14,15 +14,19 @@ haste_bin="${HASTE_BIN:-${CARGO_TARGET_DIR:-target}/release/haste}"
 cache_dir="${CARGO_TARGET_DIR:-target}/bench-cache"
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cargo_tmp="${CARGO_TARGET_DIR:-target}/bench-tmp-$$"
+mkdir -p "$cargo_tmp"
+trap 'rm -rf "$tmp" "$cargo_tmp"' EXIT
 
 echo "Host: $(uname -s) $(uname -m) | $(rustc --version)"
 echo
 
 if [ "$suite" = "all" ] || [ "$suite" = "build" ]; then
-    cp -R examples/hello "$tmp/hello"
-    cp -R tests/diff "$tmp/diff"
-    cp tests/case_inputs.rs "$tmp/case_inputs.rs"
+    cp -R examples/hello "$cargo_tmp/hello"
+    mkdir -p "$cargo_tmp/diff"
+    cp tests/diff/Cargo.toml tests/diff/Cargo.lock "$cargo_tmp/diff/"
+    cp -R tests/diff/src "$cargo_tmp/diff/src"
+    cp tests/case_inputs.rs "$cargo_tmp/case_inputs.rs"
 fi
 
 if [ "$suite" = "all" ] || [ "$suite" = "compute" ]; then
@@ -194,6 +198,43 @@ fn bench_scan() -> u64 {
     total
 }
 
+fn weighted_reduce<I, F>(iter: I, mut f: F) -> f64
+where
+    I: Iterator<Item = (usize, f64)>,
+    F: FnMut(usize, f64) -> f64,
+{
+    iter.fold(0.0f64, |acc, (idx, v)| acc + f(idx, v))
+}
+
+fn bench_fp_iter() -> u64 {
+    const N: usize = 65_536;
+    let mut xs = Vec::with_capacity(N);
+    let mut ys = Vec::with_capacity(N);
+    for i in 0..N {
+        let t = (i as f64 + 1.0) * 0.000125;
+        xs.push(t * 1.125 - 0.5);
+        ys.push(1.0 / (1.0 + t * t));
+    }
+    let mut total = 0.0f64;
+    for round in 0..64usize {
+        let scale = 1.0 + (round as f64) * 0.015625;
+        let zipped = xs
+            .iter()
+            .zip(ys.iter())
+            .enumerate()
+            .filter(|(i, _)| (i & 3) != 3)
+            .map(|(i, (&a, &b))| (i, (a * b + 0.25) / (1.0 + (a * a))));
+        let part = weighted_reduce(zipped, |idx, val| {
+            let w = if (idx & 1) == 0 { scale } else { -0.5 * scale };
+            val * w
+        });
+        total += part;
+        let slot = round * 13 % N;
+        xs[slot] = xs[slot] * 0.999_938_964_843_75 + 0.000_244_140_625;
+    }
+    total.to_bits()
+}
+
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "all".to_owned());
     let out = match arg.as_str() {
@@ -201,26 +242,44 @@ fn main() {
         "sieve" => bench_sieve(),
         "sort" => bench_sort(),
         "scan" => bench_scan(),
-        _ => bench_sha256() ^ bench_sieve() ^ bench_sort() ^ bench_scan(),
+        "fp_iter" => bench_fp_iter(),
+        _ => bench_sha256() ^ bench_sieve() ^ bench_sort() ^ bench_scan() ^ bench_fp_iter(),
     };
     println!("{out}");
 }
 EOF
 fi
 
-python3 - "$tmp" "$haste_bin" "$suite" "$cache_dir" <<'PYEOF'
+python3 - "$tmp" "$haste_bin" "$suite" "$cache_dir" "$cargo_tmp" <<'PYEOF'
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-tmp, haste_bin, suite, cache_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+tmp, haste_bin, suite, cache_dir, cargo_tmp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 run_cold = os.environ.get("HASTE_BENCH_COLD", "1") != "0"
 rounds = max(1, int(os.environ.get("HASTE_BENCH_ROUNDS", "5")))
-cold_haste_env = {**os.environ, "HASTE_HOME": os.path.join(tmp, "haste_home")}
 warm_haste_env = dict(os.environ)
 cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")}
+
+def isolated_haste_env(tag):
+    if not run_cold:
+        return warm_haste_env
+    return {**os.environ, "HASTE_HOME": os.path.join(tmp, f"haste_home_{tag}")}
+
+def cargo_cmd(sub, target_dir, manifest=None):
+    cmd = ["cargo", sub, "--quiet", "--locked"]
+    if manifest is not None:
+        cmd.extend(["--manifest-path", manifest])
+    cmd.extend(["--target-dir", target_dir])
+    return cmd
+
+def median_of(vals):
+    s = sorted(vals)
+    return s[len(s) // 2]
 
 def run_timed(cmd, env=None):
     t0 = time.perf_counter()
@@ -228,24 +287,21 @@ def run_timed(cmd, env=None):
     return (time.perf_counter() - t0) * 1000.0
 
 def median_ms(n, cmd, env=None):
-    times = sorted(run_timed(cmd, env=env) for _ in range(n))
-    return times[len(times) // 2]
+    return median_of(run_timed(cmd, env=env) for _ in range(n))
 
 def median_ms_checked(n, cmd, env=None):
+    warm = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=True)
+    out = warm.stdout.strip()
     times = []
-    out = None
     for _ in range(n):
         t0 = time.perf_counter()
         res = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=True)
         times.append((time.perf_counter() - t0) * 1000.0)
         val = res.stdout.strip()
-        if out is None:
-            out = val
-        elif val != out:
+        if val != out:
             print(f"NONDETERMINISTIC output for {cmd}: {out!r} vs {val!r}", file=sys.stderr)
             sys.exit(1)
-    times.sort()
-    return times[len(times) // 2], out
+    return median_of(times), out
 
 def fmt_ms(ms):
     if ms >= 1000.0:
@@ -254,114 +310,189 @@ def fmt_ms(ms):
         return f"{round(ms)} ms"
     return f"{ms:.1f} ms"
 
+def print_build_table(title, rows, has_prev):
+    if has_prev:
+        print()
+    print(title)
+    print()
+    print("| Benchmark | haste | cargo | Speedup |")
+    print("| --- | ---: | ---: | ---: |")
+    for label, h_ms, c_ms in rows:
+        speedup = f"{c_ms / max(h_ms, 1e-6):.1f}x"
+        print(f"| {label} | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {speedup} |")
+
+def write_edit(path, orig_src, needle, value):
+    new_src = orig_src.replace(needle, f"(x + {value})", 1)
+    assert new_src != orig_src, f"failed to mutate {path}"
+    path.write_text(new_src)
+
 sections = 0
 
 if suite in ("all", "build"):
-    hello_dir = os.path.join(tmp, "hello")
-    diff_dir = os.path.join(tmp, "diff")
+    hello_dir = os.path.join(cargo_tmp, "hello")
+    diff_dir = os.path.join(cargo_tmp, "diff")
     diff_manifest = os.path.join(diff_dir, "Cargo.toml")
     diff_main = Path(diff_dir) / "src" / "main.rs"
-    cargo_target = os.path.join(tmp, "cargo_target")
-    haste_env = cold_haste_env if run_cold else warm_haste_env
-    haste_build_cmd = [haste_bin, "build", diff_dir]
-    cargo_build_cmd = ["cargo", "build", "--quiet", "--locked", "--manifest-path", diff_manifest, "--target-dir", cargo_target]
+    case_count = sum(
+        len(re.findall(r'"case_[a-zA-Z0-9_]+"', p.read_text()))
+        for p in (Path(diff_dir) / "src").glob("*.rs")
+    )
+    cargo_check_target = os.path.join(cargo_tmp, "cargo_check_target")
+    cargo_build_target = os.path.join(cargo_tmp, "cargo_build_target")
+    haste_out_bin = os.path.join(cargo_tmp, "diff_haste_out")
+    check_haste_env = isolated_haste_env("check")
+    emit_haste_env = isolated_haste_env("emit")
+    daemon_haste_env = isolated_haste_env("daemon")
+    haste_check_cmd = [haste_bin, "build", diff_dir]
+    haste_daemon_cmd = [haste_bin, "build", "--daemon", diff_dir]
+    haste_emit_cmd = [haste_bin, "build", "-o", haste_out_bin, diff_dir]
+    cargo_check_cmd = cargo_cmd("check", cargo_check_target, diff_manifest)
+    cargo_build_cmd = cargo_cmd("build", cargo_build_target, diff_manifest)
 
     if run_cold:
-        subprocess.run([haste_bin, "build", hello_dir], env=haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        for env in (check_haste_env, emit_haste_env, daemon_haste_env):
+            subprocess.run([haste_bin, "build", hello_dir], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-    h_diff_cold = run_timed(haste_build_cmd, env=haste_env)
-    c_diff_cold = run_timed(cargo_build_cmd, env=cargo_env)
-    h_diff_noop = median_ms(5, haste_build_cmd, env=haste_env)
-    c_diff_noop = median_ms(5, cargo_build_cmd, env=cargo_env)
+    h_check_cold = run_timed(haste_check_cmd, env=check_haste_env)
+    c_check_cold = run_timed(cargo_check_cmd, env=cargo_env)
+    h_emit_cold = run_timed(haste_emit_cmd, env=emit_haste_env)
+    c_build_cold = run_timed(cargo_build_cmd, env=cargo_env)
+
+    h_check_noop = median_ms(5, haste_check_cmd, env=check_haste_env)
+    c_check_noop = median_ms(5, cargo_check_cmd, env=cargo_env)
+    h_emit_noop = median_ms(5, haste_emit_cmd, env=emit_haste_env)
+    c_build_noop = median_ms(5, cargo_build_cmd, env=cargo_env)
 
     orig_src = diff_main.read_text()
     needle = "(x + 3)"
     assert needle in orig_src, f"expected {needle!r} in {diff_main}"
     seed = int(time.time()) % 100_000
-    prev_src = orig_src
-    h_edits = []
-    c_edits = []
+    h_check_edits, c_check_edits = [], []
+    h_emit_edits, c_build_edits = [], []
+    h_daemon_edits, c_daemon_check_edits = [], []
     for i in range(1, 4):
-        new_src = orig_src.replace(needle, f"(x + {seed + i * 10})", 1)
-        assert new_src != prev_src
-        diff_main.write_text(new_src)
-        prev_src = new_src
-        h_edits.append(run_timed(haste_build_cmd, env=haste_env))
-        c_edits.append(run_timed(cargo_build_cmd, env=cargo_env))
-    h_diff_edit = sorted(h_edits)[1]
-    c_diff_edit = sorted(c_edits)[1]
+        write_edit(diff_main, orig_src, needle, seed + i * 10)
+        h_check_edits.append(run_timed(haste_check_cmd, env=check_haste_env))
+        c_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
+        h_emit_edits.append(run_timed(haste_emit_cmd, env=emit_haste_env))
+        c_build_edits.append(run_timed(cargo_build_cmd, env=cargo_env))
+    if os.name == "posix":
+        def stop_daemon():
+            subprocess.run([haste_bin, "serve", "stop", diff_dir], env=daemon_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        prev_sigint = signal.getsignal(signal.SIGINT)
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        def on_signal(signum, _frame):
+            stop_daemon()
+            sys.exit(128 + signum)
+        signal.signal(signal.SIGINT, on_signal)
+        signal.signal(signal.SIGTERM, on_signal)
+        try:
+            subprocess.run(haste_daemon_cmd, env=daemon_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            for _ in range(100):
+                st = subprocess.run([haste_bin, "serve", "status", diff_dir], env=daemon_haste_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                if "pid=" in st.stdout:
+                    break
+                time.sleep(0.1)
+            else:
+                sys.exit("haste serve daemon did not become ready")
+            for i in range(4, 7):
+                write_edit(diff_main, orig_src, needle, seed + i * 10)
+                h_daemon_edits.append(run_timed(haste_daemon_cmd, env=daemon_haste_env))
+                c_daemon_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
+        finally:
+            stop_daemon()
+            signal.signal(signal.SIGINT, prev_sigint)
+            signal.signal(signal.SIGTERM, prev_sigterm)
+    h_check_edit = median_of(h_check_edits)
+    c_check_edit = median_of(c_check_edits)
+    h_emit_edit = median_of(h_emit_edits)
+    c_build_edit = median_of(c_build_edits)
 
-    print("### Build Speed (`tests/diff`, 129 fns)")
-    print()
-    print("| Benchmark | haste | cargo | Speedup |")
-    print("| --- | ---: | ---: | ---: |")
-    for label, h_ms, c_ms in (
-        ("Single-line code edit rebuild", h_diff_edit, c_diff_edit),
-        ("Unchanged no-op build", h_diff_noop, c_diff_noop),
-        ("Cold debug build", h_diff_cold, c_diff_cold),
-    ):
-        speedup = f"{c_ms / max(h_ms, 1e-6):.1f}x"
-        print(f"| {label} | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {speedup} |")
+    rows = [
+        ("Single-line edit (`haste build` vs `cargo check`)", h_check_edit, c_check_edit),
+        ("Single-line edit (`haste build -o` vs `cargo build`)", h_emit_edit, c_build_edit),
+    ]
+    if h_daemon_edits:
+        rows.insert(0, ("Single-line edit (`haste build --daemon` vs `cargo check`)", median_of(h_daemon_edits), median_of(c_daemon_check_edits)))
+    rows.extend([
+        ("Unchanged no-op (`haste build` vs `cargo check`)", h_check_noop, c_check_noop),
+        ("Unchanged no-op (`haste build -o` vs `cargo build`)", h_emit_noop, c_build_noop),
+        ("Cold debug (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
+        ("Cold debug (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
+    ])
+    print_build_table(f"### Build Speed (`tests/diff`, {case_count} fns)", rows, sections > 0)
     sections += 1
 
 if suite in ("all", "self"):
     haste_self_cmd = [haste_bin, "build", "."]
     if run_cold:
-        self_haste_env = cold_haste_env
-        self_cargo_target = os.path.join(tmp, "self_cargo_target")
-        cargo_self_cmd = ["cargo", "build", "--quiet", "--locked", "--target-dir", self_cargo_target]
+        self_haste_env = isolated_haste_env("self")
+        self_cargo_check_target = os.path.join(cargo_tmp, "self_cargo_check_target")
+        self_cargo_build_target = os.path.join(cargo_tmp, "self_cargo_build_target")
+        cargo_self_check_cmd = cargo_cmd("check", self_cargo_check_target)
+        cargo_self_build_cmd = cargo_cmd("build", self_cargo_build_target)
         h_self_cold = run_timed(haste_self_cmd, env=self_haste_env)
-        c_self_cold = run_timed(cargo_self_cmd, env=cargo_env)
+        c_self_check_cold = run_timed(cargo_self_check_cmd, env=cargo_env)
+        c_self_build_cold = run_timed(cargo_self_build_cmd, env=cargo_env)
     else:
         self_haste_env = warm_haste_env
-        self_cargo_target = os.path.join(cache_dir, "self_cargo")
-        os.makedirs(self_cargo_target, exist_ok=True)
-        cargo_self_cmd = ["cargo", "build", "--quiet", "--locked", "--target-dir", self_cargo_target]
-        p_h = subprocess.Popen(haste_self_cmd, env=self_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        p_c = subprocess.Popen(cargo_self_cmd, env=cargo_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if p_h.wait() != 0 or p_c.wait() != 0:
+        self_cargo_check_target = os.path.join(cache_dir, "self_cargo_check")
+        self_cargo_build_target = os.path.join(cache_dir, "self_cargo")
+        os.makedirs(self_cargo_check_target, exist_ok=True)
+        os.makedirs(self_cargo_build_target, exist_ok=True)
+        cargo_self_check_cmd = cargo_cmd("check", self_cargo_check_target)
+        cargo_self_build_cmd = cargo_cmd("build", self_cargo_build_target)
+        procs = [
+            subprocess.Popen(haste_self_cmd, env=self_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+            subprocess.Popen(cargo_self_check_cmd, env=cargo_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+            subprocess.Popen(cargo_self_build_cmd, env=cargo_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        ]
+        if any(p.wait() != 0 for p in procs):
             sys.exit(1)
         h_self_cold = None
-        c_self_cold = None
+        c_self_check_cold = None
+        c_self_build_cold = None
     h_self_noop = median_ms(5, haste_self_cmd, env=self_haste_env)
-    c_self_noop = median_ms(5, cargo_self_cmd, env=cargo_env)
+    c_self_check_noop = median_ms(5, cargo_self_check_cmd, env=cargo_env)
+    c_self_build_noop = median_ms(5, cargo_self_build_cmd, env=cargo_env)
 
-    if sections:
-        print()
-    print("### Self-Host Build Speed (`.`)")
-    print()
-    print("| Benchmark | haste | cargo | Speedup |")
-    print("| --- | ---: | ---: | ---: |")
     self_rows = []
     if h_self_cold is not None:
-        self_rows.append(("Cold debug build", h_self_cold, c_self_cold))
-    self_rows.append(("Unchanged no-op build", h_self_noop, c_self_noop))
-    for label, h_ms, c_ms in self_rows:
-        speedup = f"{c_ms / max(h_ms, 1e-6):.1f}x"
-        print(f"| {label} | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {speedup} |")
+        self_rows.append(("Cold debug (`haste build` vs `cargo check`)", h_self_cold, c_self_check_cold))
+        self_rows.append(("Cold debug (`haste build` vs `cargo build`)", h_self_cold, c_self_build_cold))
+    self_rows.append(("Unchanged no-op (`haste build` vs `cargo check`)", h_self_noop, c_self_check_noop))
+    self_rows.append(("Unchanged no-op (`haste build` vs `cargo build`)", h_self_noop, c_self_build_noop))
+    print_build_table("### Self-Host Build Speed (`.`)", self_rows, sections > 0)
     sections += 1
 
 if suite in ("all", "compute"):
     compute_dir = os.path.join(tmp, "compute")
     compute_haste = os.path.join(tmp, "compute_haste")
     compute_rustc = os.path.join(tmp, "compute_rustc")
-    p_h = subprocess.Popen([haste_bin, "--release", "build", "-o", compute_haste, compute_dir], env=warm_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    p_r = subprocess.Popen(["rustc", "-C", "opt-level=3", "--edition=2021", os.path.join(compute_dir, "src", "main.rs"), "-o", compute_rustc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if p_h.wait() != 0 or p_r.wait() != 0:
+    compute_rustc_matched = os.path.join(tmp, "compute_rustc_matched")
+    src_main = os.path.join(compute_dir, "src", "main.rs")
+    procs = [
+        subprocess.Popen([haste_bin, "--release", "build", "-o", compute_haste, compute_dir], env=warm_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        subprocess.Popen(["rustc", "-C", "opt-level=3", "--edition=2021", src_main, "-o", compute_rustc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        subprocess.Popen(["rustc", "-C", "opt-level=3", "-C", "target-cpu=native", "-C", "panic=abort", "--edition=2021", src_main, "-o", compute_rustc_matched], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+    ]
+    if any(p.wait() != 0 for p in procs):
         sys.exit(1)
 
     if sections:
         print()
-    print(f"### AOT Codegen Runtime (`haste --release` vs `rustc -C opt-level=3`, median of {rounds})")
+    print(f"### AOT Codegen Runtime (`haste --release` vs `rustc`, median of {rounds}, warmed)")
     print()
-    print("| Workload | haste --release | rustc -O3 | Ratio | Output |")
-    print("| --- | ---: | ---: | ---: | --- |")
-    for work in ("sha256", "sieve", "sort", "scan"):
+    print("| Workload | haste --release | rustc -O3 | vs -O3 | rustc -O3 native+abort | vs matched | Output |")
+    print("| --- | ---: | ---: | ---: | ---: | ---: | --- |")
+    for work in ("sha256", "sieve", "sort", "scan", "fp_iter"):
         h_ms, h_out = median_ms_checked(rounds, [compute_haste, work])
         c_ms, c_out = median_ms_checked(rounds, [compute_rustc, work])
-        if h_out != c_out:
-            print(f"MISMATCH on {work}: haste={h_out} rustc={c_out}", file=sys.stderr)
+        m_ms, m_out = median_ms_checked(rounds, [compute_rustc_matched, work])
+        if h_out != c_out or h_out != m_out:
+            print(f"MISMATCH on {work}: haste={h_out} rustc={c_out} matched={m_out}", file=sys.stderr)
             sys.exit(1)
-        ratio = f"{h_ms / max(c_ms, 1e-6):.2f}x"
-        print(f"| `{work}` | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {ratio} | exact match (`{h_out}`) |")
+        r_default = f"{h_ms / max(c_ms, 1e-6):.2f}x"
+        r_matched = f"{h_ms / max(m_ms, 1e-6):.2f}x"
+        print(f"| `{work}` | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {r_default} | {fmt_ms(m_ms)} | {r_matched} | exact match (`{h_out}`) |")
 PYEOF

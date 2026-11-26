@@ -1,5 +1,5 @@
 use crate::body::sig::{SelfKind, Signature};
-use crate::body::{Expr, ExprId, List, Ty as AstTy, TyId};
+use crate::body::{Expr, ExprId, List, Pat, Ty as AstTy, TyId, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::Item;
 use crate::outline::source::Source;
@@ -8,18 +8,17 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::calls::{
     Lifetimes, collect_ty_lifetimes, receiver_has_any_named, recv_is_by_ref, recv_ref_mut,
-    ty_shares_name,
+    sig_returns_only_static, ty_shares_name,
 };
 use super::super::checks;
 use super::super::{Checker, State};
-use super::{BorrowSource, dedup_sources, unwrap_container_loans};
+use super::{BorrowSource, dedup_sources, state_holds_other_target, unwrap_container_loans};
 
 struct SigFnFlags<'a> {
     fn_name: &'a str,
     is_iter_fn: bool,
     is_opt_fn: bool,
-    is_res_fn: bool,
-    is_clone_fn: bool,
+    is_owned_copy_fn: bool,
     is_by_ref: bool,
 }
 
@@ -79,12 +78,20 @@ impl<'a> Checker<'_, 'a> {
                 let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
                 let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
                 let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee, ret_has_borrow);
+                let copies_inner_arg = self
+                    .closure_expr_of(callee)
+                    .is_some_and(|c| self.closure_copies_inner_ref(c));
                 let arg_ids: Vec<u32> = self.body.list(args).to_vec();
                 for (idx, id) in arg_ids.into_iter().enumerate() {
                     if hrtb_non_ret.contains(&idx) {
                         continue;
                     }
-                    out.extend(self.expr_borrow_sources_inner(ExprId(id), state, true, None));
+                    let arg = ExprId(id);
+                    if copies_inner_arg && idx == 0 {
+                        out.extend(self.copied_arg_borrow_sources(expr, arg, state));
+                    } else {
+                        out.extend(self.expr_borrow_sources_inner(arg, state, true, None));
+                    }
                 }
                 self.finish_sig_sources(expr, out, false)
             }
@@ -137,11 +144,6 @@ impl<'a> Checker<'_, 'a> {
         let Ok(sig) = self.cx.signature(fn_item) else {
             return Vec::new();
         };
-        let Some(ret_ast) = sig.ret else {
-            return Vec::new();
-        };
-        let (sig_src, sig_item) = self.cx.item(fn_item);
-        let ret_lts = self.collect_ret_lifetimes(fn_item, &sig, sig_src, ret_ast);
         let raw_args = self.body.list(args);
         let (receiver, arg_ids): (Option<ExprId>, Vec<u32>) =
             if receiver.is_none() && sig.receiver.is_some() && !raw_args.is_empty() {
@@ -149,6 +151,30 @@ impl<'a> Checker<'_, 'a> {
             } else {
                 (receiver, raw_args.to_vec())
             };
+        if sig.is_async {
+            let mut out = Vec::new();
+            if let Some(recv) = receiver {
+                if let Some(mutability) = self.typed.adjusts.get(&expr).and_then(|a| a.autoref) {
+                    out.extend(self.method_recv_borrow_sources(
+                        expr,
+                        recv,
+                        mutability == Mut::Mut,
+                        state,
+                    ));
+                } else {
+                    out.extend(self.expr_borrow_sources(recv, state));
+                }
+            }
+            for &arg in &arg_ids {
+                out.extend(self.expr_borrow_sources(ExprId(arg), state));
+            }
+            return self.finish_sig_sources(expr, out, false);
+        }
+        let Some(ret_ast) = sig.ret else {
+            return Vec::new();
+        };
+        let (sig_src, sig_item) = self.cx.item(fn_item);
+        let ret_lts = self.collect_ret_lifetimes(fn_item, &sig, sig_src, ret_ast);
         let flags = self.sig_fn_flags(fn_item, &sig);
         let ctx = SigCallCtx {
             expr,
@@ -192,25 +218,24 @@ impl<'a> Checker<'_, 'a> {
         let fn_name = self.cx.name(fn_item);
         let is_iter_fn = self.is_iter_mod(fn_item);
         let is_opt_fn = self.item_in_std_mod(fn_item, "option");
-        let is_res_fn = self.item_in_std_mod(fn_item, "result");
-        let is_clone_fn = fn_name == "clone"
-            && recv_is_by_ref(sig)
-            && self
-                .cx
-                .owner_trait(fn_item)
-                .or_else(|| {
-                    self.cx
-                        .owner_impl(fn_item)
-                        .and_then(|b| self.cx.impl_trait(b))
-                })
-                .is_some_and(|tr| self.item_in_std_mod(tr, "clone"));
+        let is_owned_copy_fn = recv_is_by_ref(sig)
+            && ((fn_name == "clone"
+                && self
+                    .cx
+                    .owner_trait(fn_item)
+                    .or_else(|| {
+                        self.cx
+                            .owner_impl(fn_item)
+                            .and_then(|b| self.cx.impl_trait(b))
+                    })
+                    .is_some_and(|tr| self.item_in_std_mod(tr, "clone")))
+                || (fn_name == "to_vec" && self.item_in_std_mod(fn_item, "slice")));
         let is_by_ref = is_iter_fn && fn_name == "by_ref";
         SigFnFlags {
             fn_name,
             is_iter_fn,
             is_opt_fn,
-            is_res_fn,
-            is_clone_fn,
+            is_owned_copy_fn,
             is_by_ref,
         }
     }
@@ -223,38 +248,47 @@ impl<'a> Checker<'_, 'a> {
         state: &State,
     ) -> Vec<BorrowSource> {
         let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
-        if checks::closure::sig_returns_only_static(sig, sig_src, ctx.ret_ast, ret_lts) {
+        if sig_returns_only_static(sig, sig_src, ctx.ret_ast, ret_lts) {
             return Vec::new();
         }
         let mut out = Vec::new();
         let mut param_matched_own_generic = false;
         for (idx, &arg) in arg_ids.iter().enumerate() {
-            if let Some(&(_, param_ty)) = sig.params.get(idx)
-                && !matches!(sig.body.ty(param_ty), AstTy::Ref { .. })
-                && (ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
-                    || ret_lts.names.contains(&"Self"))
-            {
-                if sig
-                    .generics
-                    .iter()
-                    .any(|g| ret_lts.names.contains(&sig_src.text(g.name)))
-                    && ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
-                {
-                    param_matched_own_generic = true;
-                }
-                out.extend(self.expr_borrow_sources(ExprId(arg), state));
+            let Some(&(_, param_ty)) = sig.params.get(idx) else {
+                continue;
+            };
+            let matches_ret = ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
+                || ret_lts.names.contains(&"Self");
+            if !matches_ret {
+                continue;
             }
+            if let AstTy::Ref { .. } = *sig.body.ty(param_ty) {
+                out.extend(self.copied_arg_borrow_sources(ctx.expr, ExprId(arg), state));
+                continue;
+            }
+            if sig
+                .generics
+                .iter()
+                .any(|g| ret_lts.names.contains(&sig_src.text(g.name)))
+                && ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
+            {
+                param_matched_own_generic = true;
+            }
+            out.extend(self.expr_borrow_sources(ExprId(arg), state));
         }
         if let Some(recv) = receiver
             && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))
         {
-            out.extend(self.sig_no_lt_recv_sources(sig, recv, arg_ids, &ctx.flags, state));
+            out.extend(
+                self.sig_no_lt_recv_sources(ctx.expr, sig, recv, arg_ids, &ctx.flags, state),
+            );
         }
         self.finish_sig_sources(ctx.expr, out, ctx.flags.is_by_ref)
     }
 
     fn sig_no_lt_recv_sources(
         &mut self,
+        call_expr: ExprId,
         sig: &Signature,
         recv: ExprId,
         arg_ids: &[u32],
@@ -263,26 +297,43 @@ impl<'a> Checker<'_, 'a> {
     ) -> Vec<BorrowSource> {
         let mut recv_sources =
             self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
+        let maps_inner_copy = (flags.is_iter_fn || flags.is_opt_fn)
+            && flags.fn_name == "map"
+            && arg_ids
+                .first()
+                .is_some_and(|&a| self.closure_copies_inner_ref(ExprId(a)));
         if ((flags.is_iter_fn || flags.is_opt_fn) && matches!(flags.fn_name, "copied" | "cloned"))
-            || flags.is_clone_fn
+            || flags.is_owned_copy_fn
+            || maps_inner_copy
         {
             return self.copied_recv_sources(
+                call_expr,
                 recv,
                 recv_sources,
                 state,
-                flags.is_opt_fn || flags.is_clone_fn,
+                flags.is_opt_fn || flags.is_owned_copy_fn,
             );
+        }
+        if flags.is_opt_fn
+            && flags.fn_name == "take"
+            && self
+                .typed
+                .adjusts
+                .get(&call_expr)
+                .is_some_and(|a| a.derefs > 0)
+        {
+            return self.guard_take_recv_sources(call_expr, recv, recv_sources, state);
         }
         let ignores_elem = (flags.is_iter_fn
             && matches!(flags.fn_name, "map" | "filter_map" | "flat_map")
             && arg_ids
                 .first()
                 .is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state)))
-            || ((flags.is_opt_fn || flags.is_res_fn)
+            || (flags.is_opt_fn
                 && matches!(flags.fn_name, "map" | "and_then")
                 && arg_ids
                     .first()
-                    .is_some_and(|&a| self.fn_arg_returns_static(ExprId(a))));
+                    .is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state)));
         if ignores_elem {
             for s in &mut recv_sources {
                 s.env_only = true;
@@ -327,8 +378,11 @@ impl<'a> Checker<'_, 'a> {
                 if matched {
                     let inner_only = !ret_lts.has_elided
                         && matches!(sig.body.ty(pt), AstTy::Ref { lifetime: None, .. });
-                    let mut arg_sources =
-                        self.expr_borrow_sources_inner(ae, state, !inner_only, None);
+                    let mut arg_sources = if inner_only {
+                        self.copied_arg_borrow_sources(ctx.expr, ae, state)
+                    } else {
+                        self.expr_borrow_sources_inner(ae, state, true, None)
+                    };
                     if matches!(sig.body.ty(pt), AstTy::Ref { mutable: false, .. }) {
                         for s in &mut arg_sources {
                             s.mutable = false;
@@ -380,10 +434,20 @@ impl<'a> Checker<'_, 'a> {
                 self.is_ref_ty(self.local_ty(s.target))
             })
         } else if recv_creates_borrow {
-            if let Some(mutability) = self.typed.adjusts.get(&ctx.expr).and_then(|a| a.autoref) {
+            let srcs = if let Some(mutability) =
+                self.typed.adjusts.get(&ctx.expr).and_then(|a| a.autoref)
+            {
                 self.method_recv_borrow_sources(ctx.expr, recv, mutability == Mut::Mut, state)
             } else {
                 self.expr_borrow_sources(recv, state)
+            };
+            let inner_only = !ret_lts.has_elided
+                && matches!(sig.receiver, Some((SelfKind::Ref | SelfKind::RefMut, _)))
+                && sig.receiver_lifetime.is_none();
+            if inner_only {
+                self.copied_recv_sources(ctx.expr, recv, srcs, state, true)
+            } else {
+                srcs
             }
         } else {
             self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None)
@@ -398,8 +462,9 @@ impl<'a> Checker<'_, 'a> {
             )
     }
 
-    fn copied_recv_sources(
+    pub(super) fn copied_recv_sources(
         &mut self,
+        call_expr: ExprId,
         recv: ExprId,
         mut recv_sources: Vec<BorrowSource>,
         state: &State,
@@ -422,10 +487,15 @@ impl<'a> Checker<'_, 'a> {
             let r_ty = self.local_ty(r);
             cur == recv || self.is_ref_ty(r_ty) || self.ty_holds_closure(r_ty)
         });
+        let call_ty = self.expr_ty(call_expr);
         let targets: Vec<u32> = recv_sources.iter().map(|s| s.target).collect();
         let container_targets: Vec<u32> = recv_sources
             .iter()
             .filter(|s| {
+                let held_by_other = state_holds_other_target(&targets, s.target, state);
+                if self.is_non_static_param(s.target) {
+                    return !held_by_other && self.can_unwrap_inner_static_param(s, call_ty, false);
+                }
                 if checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
                     return true;
                 }
@@ -442,13 +512,7 @@ impl<'a> Checker<'_, 'a> {
                 if !self.ty_holds_borrow(self.local_ty(s.target)) {
                     return false;
                 }
-                !targets.iter().any(|&other| {
-                    other != s.target
-                        && state
-                            .loans
-                            .iter()
-                            .any(|l| l.holder == Some(other) && l.target == s.target)
-                })
+                !held_by_other
             })
             .map(|s| s.target)
             .collect();
@@ -501,6 +565,71 @@ impl<'a> Checker<'_, 'a> {
         }
     }
 
+    pub(in super::super) fn copied_arg_borrow_sources(
+        &mut self,
+        call_expr: ExprId,
+        arg: ExprId,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        let cur = self.unwrap_parens(arg);
+        if let Expr::Ref {
+            raw: false,
+            expr: inner,
+            ..
+        } = *self.body.expr(cur)
+        {
+            return self.expr_borrow_sources(inner, state);
+        }
+        let arg_sources = self.expr_borrow_sources_inner(arg, state, false, None);
+        self.copied_recv_sources(call_expr, arg, arg_sources, state, true)
+    }
+
+    fn closure_copies_inner_ref(&mut self, arg: ExprId) -> bool {
+        let cur = self.unwrap_parens(arg);
+        let Expr::Closure { params, body, .. } = *self.body.expr(cur) else {
+            return false;
+        };
+        let Some((param_local, ret_ty)) = self
+            .typed
+            .closures
+            .get(&cur)
+            .filter(|c| c.params.len() == 1 && c.captures.is_empty())
+            .map(|c| (c.params[0], c.ret))
+        else {
+            return false;
+        };
+        let param_ty = self.local_ty(param_local);
+        let Kind::Ref(_, inner_ty) = *self.cx.types.kind(param_ty) else {
+            return false;
+        };
+        let body = self.unwrap_parens_and_empty_blocks(body);
+        if matches!(*self.cx.types.kind(inner_ty), Kind::Ref(Mut::Not, _)) {
+            if let Expr::Unary(UnOp::Deref, inner) = *self.body.expr(body)
+                && self.expr_plain_local(inner) == Some(param_local)
+            {
+                return true;
+            }
+            let param_ids = self.body.list(params);
+            if param_ids.len() == 1
+                && let Pat::Ref { pat: inner_pat, .. } =
+                    *self.body.pat(self.body.params[param_ids[0] as usize].pat)
+                && let Some(&bound) = self.typed.binds.get(&inner_pat)
+                && self.expr_plain_local(body) == Some(bound)
+            {
+                return true;
+            }
+        }
+        if matches!(
+            *self.body.expr(body),
+            Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _)
+                if self.expr_plain_local(base) == Some(param_local)
+        ) && self.ty_is_copy(ret_ty)
+        {
+            return true;
+        }
+        false
+    }
+
     fn iter_closure_ignores_param(&mut self, arg: ExprId, state: &State) -> bool {
         if self.fn_arg_returns_static(arg) {
             return true;
@@ -509,6 +638,13 @@ impl<'a> Checker<'_, 'a> {
         let Some(closure) = self.typed.closures.get(&cur).cloned() else {
             return false;
         };
+        if self
+            .closure_effects
+            .get(&cur)
+            .is_some_and(|eff| !eff.ret_params.is_empty())
+        {
+            return false;
+        }
         let Some(targets) = self.closure_ret_targets(cur, closure.ret, state) else {
             return false;
         };

@@ -112,11 +112,14 @@ impl Build {
         if self.cases.is_none() {
             self.load_members(workspace)?;
             let discovered = test_items(workspace, &self.compilation.outline);
+            #[cfg(feature = "diff-harness")]
             let kind = if discovered.is_empty() {
                 BatchKind::Cases
             } else {
                 BatchKind::Tests
             };
+            #[cfg(not(feature = "diff-harness"))]
+            let kind = BatchKind::Tests;
             let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
             if kind == BatchKind::Tests {
                 let starts: Vec<Option<usize>> = batch.tests.iter().map(|(_, s)| *s).collect();
@@ -282,18 +285,11 @@ impl Build {
                 drop_finals,
             )?);
         }
-        if !self
-            .binary
-            .as_ref()
-            .context("the binary is not compiled")?
-            .broken
-            .is_empty()
-        {
-            crate::cli::failure_lines(&self.failures()?)
-                .iter()
-                .for_each(|line| eprintln!("{line}"));
-        }
         let bin = self.binary.as_mut().context("the binary is not compiled")?;
+        let failed = bin.print_diagnostics(&self.compilation.outline);
+        if failed > 0 {
+            bail!("{failed} functions failed to compile");
+        }
         bin.write_aot(&self.compilation, path)?;
         eprintln!(
             "built {} ({} functions reached, {:.1} ms)",

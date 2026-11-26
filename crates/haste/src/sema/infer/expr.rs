@@ -14,7 +14,11 @@ use super::{Breaks, Infer, Res};
 impl Infer<'_, '_> {
     /// Infers `expr`, with the type the context expects when it knows one.
     pub fn expr(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
-        let ty = self.expr_kind(expr, expected)?;
+        let prev = self.current_expr;
+        self.current_expr = Some(expr);
+        let res = self.expr_kind(expr, expected);
+        self.current_expr = prev;
+        let ty = res?;
         if self.is_never(ty) {
             self.diverges = true;
         }
@@ -183,12 +187,23 @@ impl Infer<'_, '_> {
             {
                 let slice = self.cx.types.substs(args).to_vec();
                 let fields = self.adt_fields(item, &slice)?;
-                fields[0]
-                    .get(index as usize)
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("no field {index} on {}", self.cx.name(item)))
+                let field_ty = fields[0].get(index as usize).copied().ok_or_else(|| {
+                    self.diag_expr(
+                        crate::diag::DiagnosticKind::Name,
+                        Some(expr),
+                        format!("no field {index} on {}", self.cx.name(item)),
+                        "unknown field",
+                    )
+                })?;
+                self.check_field_visible(item, index, Some(expr), None, &index.to_string())?;
+                Ok(field_ty)
             }
-            _ => bail!("no field {index} on {}", self.show(ty)),
+            _ => Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Name,
+                Some(expr),
+                format!("no field {index} on {}", self.show(ty)),
+                "unknown field",
+            )),
         }
     }
 

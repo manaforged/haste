@@ -19,7 +19,7 @@ pub(crate) fn host_symbol_may_unwind(host: &HostSymbol) -> bool {
             | HostSymbol::CatchUnwind
             | HostSymbol::FillOnce
             | HostSymbol::ThreadCell
-            | HostSymbol::Dynamic(_)
+            | HostSymbol::Dynamic { .. }
     )
 }
 
@@ -44,15 +44,16 @@ fn extern_abi_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
 }
 
 fn foreign_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
+    let lib = cx.link_lib(item);
     let Some(host) = cx
         .symbol_name(item)
         .as_deref()
-        .and_then(|name| HostSymbol::resolve_for(name, true))
+        .and_then(|name| HostSymbol::resolve_for_lib(name, lib.as_deref(), true))
     else {
         return true;
     };
     match host {
-        HostSymbol::Dynamic(_) => extern_abi_may_unwind(cx, item),
+        HostSymbol::Dynamic { .. } => extern_abi_may_unwind(cx, item),
         _ => host_symbol_may_unwind(&host),
     }
 }

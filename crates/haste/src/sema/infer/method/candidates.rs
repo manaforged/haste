@@ -48,21 +48,22 @@ impl Infer<'_, '_> {
         let bounded = self.bound_candidates(name, steps)?;
         let mut extra_scoped = Vec::new();
         let current = self.current_trait();
-        for local in self
-            .body_traits()
-            .into_iter()
-            .chain(
-                steps
-                    .iter()
-                    .filter_map(|&step| match *self.cx.types.kind(step) {
-                        Kind::Dyn(of, ..) => Some(of),
-                        _ => None,
-                    }),
-            )
-            .chain(current)
-        {
+        for local in self.body_traits().into_iter().chain(current) {
             if !in_scope.contains(&local) && !extra_scoped.contains(&local) {
                 extra_scoped.push(local);
+            }
+        }
+        let mut dyn_scoped: Vec<(ItemRef, Ty)> = Vec::new();
+        for &step in steps {
+            if let Kind::Dyn(of, ..) = *self.cx.types.kind(step) {
+                for implied in self.implied_traits(vec![of])? {
+                    if !in_scope.contains(&implied)
+                        && !extra_scoped.contains(&implied)
+                        && !dyn_scoped.contains(&(implied, step))
+                    {
+                        dyn_scoped.push((implied, step));
+                    }
+                }
             }
         }
         let mut extra_bounded = Vec::new();
@@ -94,6 +95,7 @@ impl Infer<'_, '_> {
                     item,
                     kind,
                     bound: Some(param),
+                    dyn_step: None,
                 });
             }
             if at < scoped_len {
@@ -102,8 +104,24 @@ impl Infer<'_, '_> {
                     item,
                     kind,
                     bound: None,
+                    dyn_step: None,
                 });
             }
+        }
+        for (of, step) in dyn_scoped {
+            let Some(item) = self.cx.trait_member(of, name) else {
+                continue;
+            };
+            let Some((kind, _)) = self.cx.signature(item)?.receiver else {
+                continue;
+            };
+            found.push(TraitCandidate {
+                of,
+                item,
+                kind,
+                bound: None,
+                dyn_step: Some(step),
+            });
         }
         Ok(found)
     }
@@ -221,6 +239,7 @@ impl Infer<'_, '_> {
             item: method,
             kind,
             bound: None,
+            dyn_step: None,
         };
         let found = match self.try_trait(candidate, receiver, true)? {
             None if pending => self.pending_trait(candidate, receiver)?,

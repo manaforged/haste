@@ -209,6 +209,9 @@ impl<'a> Context<'a> {
 
     /// The `#[global_allocator]` static item in the crate graph, when one is defined.
     pub fn global_allocator(&self) -> Option<ItemRef> {
+        if crate::in_host_target() {
+            return None;
+        }
         if let Some(cached) = *read_lock(&self.store.lookups.state.global_allocator) {
             return cached;
         }

@@ -23,6 +23,7 @@ struct TraitCandidate {
     item: ItemRef,
     kind: SelfKind,
     bound: Option<Ty>,
+    dyn_step: Option<Ty>,
 }
 
 struct Pick {
@@ -191,15 +192,21 @@ impl<'a> Infer<'_, 'a> {
 
     fn no_method(&self, last: Ty, found: Ty, (name, at): (&str, u32)) -> anyhow::Error {
         match self.cx.types.kind(last) {
-            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => {
-                anyhow::anyhow!(
-                    "the type of the receiver of `{name}` must be known here ({}:{}:{})",
-                    self.src.path.display(),
-                    self.src.line(at),
-                    self.src.column(at)
-                )
-            }
-            _ => anyhow::anyhow!("no method `{name}` on {}", self.show(found)),
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => self.diag_tok(
+                crate::diag::DiagnosticKind::Type,
+                at,
+                format!("type annotations needed: cannot resolve receiver type for `{name}`"),
+                "cannot infer type for receiver",
+            ),
+            _ => self.diag_tok(
+                crate::diag::DiagnosticKind::Name,
+                at,
+                format!(
+                    "no method named `{name}` found for type `{}`",
+                    self.show(found)
+                ),
+                "method not found",
+            ),
         }
     }
 
@@ -228,10 +235,18 @@ impl<'a> Infer<'_, 'a> {
         (candidates, traits): (&[Candidate], &[TraitCandidate]),
         expected: Option<Ty>,
     ) -> Result<Option<Pick>> {
-        let (bounded, all_unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits
+        let (bounded, raw_unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits
             .iter()
             .partition(|candidate| candidate.bound.is_some());
         let step_ty = self.substitute(step);
+        let all_unbounded: Vec<TraitCandidate> = raw_unbounded
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .dyn_step
+                    .is_none_or(|dyn_ty| self.substitute(dyn_ty) == step_ty)
+            })
+            .collect();
         let is_var = matches!(self.cx.types.kind(self.resolve(step)), Kind::Var(_));
         let bounded_at: Vec<TraitCandidate> = bounded
             .iter()
@@ -386,6 +401,11 @@ impl<'a> Infer<'_, 'a> {
             self.unify(from, to)?;
         }
         substs.extend(given);
+        if (!self.projections.is_empty() || !self.obligations.is_empty())
+            && substs.iter().any(|&ty| self.has_vars(ty))
+        {
+            self.settle_projection_loop()?;
+        }
         self.bind_bounds(item, &substs)?;
         self.out
             .res
@@ -399,12 +419,17 @@ impl<'a> Infer<'_, 'a> {
         let (types, ret) = self.fn_types(item, &substs)?;
         let given = self.body.list(params).to_vec();
         if given.len() + 1 != types.len() {
-            bail!(
-                "{} takes {} arguments, {} given",
-                self.cx.name(item),
-                types.len() - 1,
-                given.len()
-            );
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Type,
+                Some(expr),
+                format!(
+                    "`{}` takes {} arguments, {} given",
+                    self.cx.name(item),
+                    types.len() - 1,
+                    given.len()
+                ),
+                "unexpected number of arguments",
+            ));
         }
         let hints = self.expected_inputs(&types[1..], ret, expected);
         for ((arg, param), hint) in given.into_iter().zip(types.into_iter().skip(1)).zip(hints) {

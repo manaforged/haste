@@ -32,7 +32,7 @@ build_haste() {
         rustflags="${rustflags:+$rustflags }-C link-arg=-fuse-ld=mold"
     fi
     [ -z "$command" ] && [ -x "$bin" ] && prev="$bin.prev.$$" && { cp -p "$bin" "$prev" 2>/dev/null || prev=; }
-    if ! CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}" RUSTFLAGS="$rustflags" run_locked Cargo.lock build --release -p haste; then
+    if ! CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}" RUSTFLAGS="$rustflags" run_locked Cargo.lock build --release -p haste "$@"; then
         [ -n "$prev" ] && rm -f "$prev"
         return 1
     fi

@@ -304,6 +304,14 @@ fn try_build_plan(
         return None;
     }
 
+    if blocks.iter().skip(1).any(|&b| {
+        cfg.preds_of(b)
+            .iter()
+            .any(|&p| cfg.reachable[p.index()] && !in_r[p.index()])
+    }) {
+        return None;
+    }
+
     let mut exits: Vec<(Block, Block)> = Vec::new();
     for (idx, &b) in blocks.iter().enumerate() {
         if let Some((t, _)) = &decided[idx] {

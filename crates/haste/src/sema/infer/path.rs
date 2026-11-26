@@ -101,9 +101,17 @@ impl<'a> Infer<'_, 'a> {
         })
     }
 
+    pub(super) fn path_first_tok(arena: &Body, path: PathId) -> Option<u32> {
+        arena
+            .list(arena.path(path).segments)
+            .first()
+            .map(|&s| arena.segments[s as usize].name)
+    }
+
     fn value_named(&mut self, arena: &Body, path: PathId) -> Result<Def> {
         let (segments, absolute, dollar) = self.segments(arena, path);
-        let found = self.value_def(&segments, absolute, dollar);
+        let first_tok = Self::path_first_tok(arena, path);
+        let found = self.value_def_at(&segments, absolute, dollar, first_tok);
         let [name] = segments[..] else {
             return found;
         };
@@ -138,6 +146,16 @@ impl<'a> Infer<'_, 'a> {
         segments: &[Sym],
         absolute: bool,
         dollar: Option<u32>,
+    ) -> Result<Def> {
+        self.value_def_at(segments, absolute, dollar, None)
+    }
+
+    fn value_def_at(
+        &mut self,
+        segments: &[Sym],
+        absolute: bool,
+        dollar: Option<u32>,
+        tok: Option<u32>,
     ) -> Result<Def> {
         let (segments, inside) = match self.local_def(
             &NamePath {
@@ -182,16 +200,130 @@ impl<'a> Infer<'_, 'a> {
                 dollar,
             };
             let head = if inside {
-                self.type_def(&path)
+                self.type_def_checked(&path, tok)?
             } else {
-                self.cx.paths(self.home.krate).resolve(&path, self.home)
+                self.resolve_path_visible(&path, tok)?
             };
-            head.map(|def| self.cx.path_member(self.home, def, *last))
-                .and_then(|entry| entry.values)
+            let binding = head
+                .map(|def| self.cx.path_member(self.home, def, *last))
+                .and_then(|entry| entry.values);
+            if let (Some(Def::Module(target_mod)), Some(b)) = (head, binding)
+                && !self.cx.outline.crates[self.home.krate as usize].env.fixed
+                && !dollar.is_some_and(|k| self.cx.outline.is_sysroot(k))
+                && !self.item_binding_visible(b.vis, target_mod, tok)
+            {
+                let name = self.cx.names.symbols.text(*last).to_owned();
+                return Err(self.privacy_err(&name, tok));
+            }
+            binding
         };
         match found {
             Some(binding) => Ok(binding.def),
-            None => bail!("cannot find value `{}`", self.spell(segments)),
+            None => Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Name,
+                None,
+                format!("cannot find value `{}` in this scope", self.spell(segments)),
+                "not found in this scope",
+            )),
+        }
+    }
+
+    fn item_binding_visible(
+        &mut self,
+        vis: crate::outline::item::Vis,
+        target_mod: crate::names::ModRef,
+        tok: Option<u32>,
+    ) -> bool {
+        let paths = self.cx.paths(self.home.krate);
+        if crate::names::resolve::visible(&paths, vis, target_mod, self.home) {
+            return true;
+        }
+        if let Some(macro_home) = self.macro_home_of(tok) {
+            let mpaths = self.cx.paths(macro_home.krate);
+            return crate::names::resolve::visible(&mpaths, vis, target_mod, macro_home);
+        }
+        false
+    }
+
+    fn privacy_err(&self, name: &str, tok: Option<u32>) -> anyhow::Error {
+        let msg = format!("item `{name}` is private");
+        if self.current_expr.is_none()
+            && let Some(t) = tok
+        {
+            return self.diag_tok(crate::diag::DiagnosticKind::Privacy, t, msg, "private item");
+        }
+        self.diag_expr(
+            crate::diag::DiagnosticKind::Privacy,
+            None,
+            msg,
+            "private item",
+        )
+    }
+
+    fn resolve_path_visible(
+        &mut self,
+        path: &NamePath<'_>,
+        tok: Option<u32>,
+    ) -> Result<Option<Def>> {
+        if self.cx.outline.crates[self.home.krate as usize].env.fixed
+            || path.dollar.is_some_and(|k| self.cx.outline.is_sysroot(k))
+        {
+            return Ok(self.cx.paths(self.home.krate).resolve(path, self.home));
+        }
+        match self
+            .cx
+            .paths(self.home.krate)
+            .resolve_visible(path, self.home)
+        {
+            Ok(def) => Ok(def),
+            Err(priv_sym) => {
+                if let Some(macro_home) = self.macro_home_of(tok)
+                    && let Ok(def) = self
+                        .cx
+                        .paths(macro_home.krate)
+                        .resolve_visible(path, macro_home)
+                {
+                    return Ok(def);
+                }
+                let name = self.cx.names.symbols.text(priv_sym).to_owned();
+                Err(self.privacy_err(&name, tok))
+            }
+        }
+    }
+
+    pub(super) fn type_def_checked(
+        &mut self,
+        path: &NamePath<'_>,
+        tok: Option<u32>,
+    ) -> Result<Option<Def>> {
+        if path.segments.len() <= 1 {
+            return Ok(self.type_def(path));
+        }
+        match self.local_def(path, Ns::Types) {
+            Some(Ok(def)) => Ok(Some(def)),
+            Some(Err(skip)) => self.resolve_path_visible(&outside(path, skip), tok),
+            None => {
+                if !path.absolute
+                    && let Some(first) = path.segments.first()
+                    && let Some(binding) = self.body_use(*first).types
+                {
+                    let mut def = binding.def;
+                    for segment in &path.segments[1..] {
+                        let Some(next) = self.cx.path_member(self.home, def, *segment).types else {
+                            return Ok(None);
+                        };
+                        if let Def::Module(target_mod) = def
+                            && !self.item_binding_visible(next.vis, target_mod, tok)
+                        {
+                            let name = self.cx.names.symbols.text(*segment).to_owned();
+                            return Err(self.privacy_err(&name, tok));
+                        }
+                        def = next.def;
+                    }
+                    return Ok(Some(def));
+                }
+                self.resolve_path_visible(path, tok)
+            }
         }
     }
 

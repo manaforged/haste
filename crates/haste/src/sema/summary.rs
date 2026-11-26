@@ -136,7 +136,9 @@ pub(super) fn typed_once_poly(
             let typed =
                 match super::infer::infer_with_hints(cx, instance.0, instance.1, Some(hints)) {
                     Ok(typed) => Arc::new(typed),
-                    Err(error) => return Some(Err(format!("{}: {error:#}", cx.name(instance.0)))),
+                    Err(error) => {
+                        return Some(Err(crate::diag::format_error(cx.name(instance.0), &error)));
+                    }
                 };
             thaw::keep_laid(cx, *instance, &typed, unlaid, m_before);
             return Some(Ok(typed));
@@ -487,15 +489,15 @@ fn instantiate_summary(
         typed.ensure_tables(&cx.types);
         let body = match cx.body(instance.0) {
             Ok(b) => b,
-            Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))),
+            Err(e) => return Some(Err(crate::diag::format_error(cx.name(instance.0), &e))),
         };
         let sig = match cx.signature(instance.0) {
             Ok(s) => s,
-            Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))),
+            Err(e) => return Some(Err(crate::diag::format_error(cx.name(instance.0), &e))),
         };
         let src = cx.body_src(instance.0);
         if let Err(err) = super::borrow::check(cx, instance.0, (&body, &sig), src, &typed) {
-            return Some(Err(format!("{}: {err:#}", cx.name(instance.0))));
+            return Some(Err(crate::diag::format_error(cx.name(instance.0), &err)));
         }
     }
     record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before);

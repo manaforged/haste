@@ -24,15 +24,12 @@ fn config() -> &'static Config {
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty() && s != "0");
-        let trace_ir = std::env::var("HASTE_TRACE_IR")
-            .ok()
+        let trace_ir_raw = std::env::var("HASTE_TRACE_IR").ok();
+        let trace_ir = trace_ir_raw
+            .as_deref()
             .is_some_and(|s| !s.is_empty() && s != "0");
-        let trace_passes = std::env::var("HASTE_TRACE_IR")
-            .ok()
-            .is_some_and(|s| s == "passes");
-        let missed = std::env::var("HASTE_MISSED")
-            .ok()
-            .is_some_and(|s| !s.is_empty() && s != "0");
+        let trace_passes = trace_ir_raw.as_deref() == Some("passes");
+        let missed = crate::env_flag("HASTE_MISSED");
         Config {
             trace,
             trace_ir,

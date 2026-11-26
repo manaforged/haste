@@ -74,10 +74,7 @@ const SIMPLE_TOKENS: [TokenKind; 38] = [
     TokenKind::CloseBracket,
 ];
 
-#[inline]
-pub(super) fn u32_le(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-}
+pub(super) use crate::substrate::read_u32 as u32_le;
 
 pub(super) fn read_u32s_map<T>(
     cur: &mut Cursor<'_>,

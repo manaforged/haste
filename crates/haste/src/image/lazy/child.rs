@@ -45,9 +45,10 @@ impl Jit {
         } else {
             None
         };
-        stub::connect(self.image.table, stubs, (ask[1], answer[0]));
         let image = &self.image;
         let pid = crate::image::fork_child(|| {
+            stub::connect(image.table, stubs, (ask[1], answer[0]));
+            crate::host::unwind::set_jit_unwind_head(image.unwind_head);
             // SAFETY: the child closes the ends that only the compiler uses and owns the write end of its output pipe from here on.
             let out = unsafe {
                 libc::close(ask[0]);

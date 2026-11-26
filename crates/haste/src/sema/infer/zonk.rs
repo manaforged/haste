@@ -380,6 +380,7 @@ pub fn is_copy(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<bool> {
 }
 
 /// Whether `item` is a non-generic synchronous `fn(i64) -> i64` suitable as a JIT test case.
+#[cfg(feature = "diff-harness")]
 pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
     let Ok(sig) = cx.signature(item) else {
         return false;

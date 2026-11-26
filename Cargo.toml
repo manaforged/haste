@@ -12,3 +12,7 @@ repository = "https://github.com/manaforged/haste"
 homepage = "https://github.com/manaforged/haste"
 keywords = ["compiler", "rust", "jit", "aot"]
 categories = ["compilers", "development-tools"]
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"

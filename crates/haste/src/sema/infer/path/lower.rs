@@ -461,11 +461,15 @@ impl<'a> Infer<'_, 'a> {
         if let Some(ty) = self.scoped_ty(&segments)? {
             return Ok(ty);
         }
-        let def = self.type_def(&NamePath {
-            segments: &segments,
-            absolute,
-            dollar,
-        });
+        let first_tok = Self::path_first_tok(arena, path);
+        let def = self.type_def_checked(
+            &NamePath {
+                segments: &segments,
+                absolute,
+                dollar,
+            },
+            first_tok,
+        )?;
         let def = match (def, &segments[..]) {
             (Some(Def::Module(_)), [name]) => crate::names::Symbols::primitive(*name)
                 .map(Def::Primitive)

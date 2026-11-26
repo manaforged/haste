@@ -1,5 +1,9 @@
 //! A resident build of one workspace that answers `build`, `test` and `run` requests over a Unix socket: an abstract one on Linux, which leaves no file behind, else one in the temporary directory.
 
+mod control;
+
+pub use control::{status, stop};
+
 #[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -155,25 +159,29 @@ pub use unix_ipc::{ask, serve, spawn};
 mod unix_ipc {
     use super::*;
 
-    fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
+    fn socket_key_for(root: &std::path::Path, cfg: &crate::config::Config) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
         root.hash(&mut hasher);
         crate::graph::store::home().hash(&mut hasher);
         crate::graph::store::program().hash(&mut hasher);
-        (crate::profile() == Profile::Release).hash(&mut hasher);
-        crate::prep::prepared().hash(&mut hasher);
-        crate::selection().hash(&mut hasher);
-        crate::test_mode().hash(&mut hasher);
-        std::env::var_os("HASTE_LIBRARY").hash(&mut hasher);
-        let abstract_name = cfg!(target_os = "linux");
-        let name = match abstract_name {
-            true => format!("haste/{:016x}", hasher.finish()),
-            false => std::env::temp_dir()
-                .join(format!("haste-{:016x}.sock", hasher.finish()))
+        cfg.hash_cache_key(&mut hasher);
+        hasher.finish()
+    }
+
+    fn socket_name_for(key: u64) -> String {
+        if cfg!(target_os = "linux") {
+            format!("haste/{key:016x}")
+        } else {
+            std::env::temp_dir()
+                .join(format!("haste-{key:016x}.sock"))
                 .to_string_lossy()
-                .into_owned(),
-        };
+                .into_owned()
+        }
+    }
+
+    pub(super) fn sockaddr_from_name(name: &str) -> (libc::sockaddr_un, libc::socklen_t) {
+        let abstract_name = cfg!(target_os = "linux");
         // SAFETY: sockaddr_un is plain data, and all zero bytes are a valid value.
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -185,6 +193,29 @@ mod unix_ipc {
         let len =
             std::mem::offset_of!(libc::sockaddr_un, sun_path) + skip + name.len().min(room - skip);
         (addr, len as libc::socklen_t)
+    }
+
+    fn address(root: &std::path::Path) -> (String, String, libc::sockaddr_un, libc::socklen_t) {
+        let key = socket_key_for(root, &crate::config::Config::current());
+        let key_hex = format!("{key:016x}");
+        let name = socket_name_for(key);
+        let (addr, len) = sockaddr_from_name(&name);
+        (key_hex, name, addr, len)
+    }
+
+    pub(super) fn connect_name(name: &str) -> Result<Option<RawFd>> {
+        let (addr, len) = sockaddr_from_name(name);
+        connect_addr(&addr, len)
+    }
+
+    fn connect_addr(addr: &libc::sockaddr_un, len: libc::socklen_t) -> Result<Option<RawFd>> {
+        let fd = socket()?;
+        // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
+        if unsafe { libc::connect(fd, (&raw const *addr).cast(), len) } != 0 || !same_user(fd) {
+            close_all(&[fd]);
+            return Ok(None);
+        }
+        Ok(Some(fd))
     }
 
     fn socket() -> Result<RawFd> {
@@ -235,14 +266,8 @@ mod unix_ipc {
 
     /// A socket connected to the server of `root`, or none when no server answers.
     fn connect(root: &std::path::Path) -> Result<Option<RawFd>> {
-        let fd = socket()?;
-        let (addr, len) = address(root);
-        // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
-        if unsafe { libc::connect(fd, (&raw const addr).cast(), len) } != 0 || !same_user(fd) {
-            close_all(&[fd]);
-            return Ok(None);
-        }
-        Ok(Some(fd))
+        let (_, _, addr, len) = address(root);
+        connect_addr(&addr, len)
     }
 
     /// Sends `request`, optional `out` path, and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
@@ -367,13 +392,28 @@ mod unix_ipc {
         }
     }
 
-    /// Loads `workspace` once, then answers requests until the process is killed or `HASTE_SERVE_IDLE_SECS` elapses, loading it again when its lock file or a local manifest changes.
+    struct SocketGuard {
+        fd: RawFd,
+        addr: libc::sockaddr_un,
+    }
+
+    impl Drop for SocketGuard {
+        fn drop(&mut self) {
+            unlink_addr(&self.addr);
+            close_all(&[self.fd]);
+        }
+    }
+
+    /// Loads `workspace` once, then answers requests until stopped or `HASTE_SERVE_IDLE_SECS` elapses, loading it again when its lock file or a local manifest changes.
     pub fn serve(
         workspace: &mut graph::Workspace,
         targets: &Targets,
         root: &std::path::Path,
     ) -> Result<()> {
+        let (key_hex, sock_name, addr, _) = address(root);
         let listener = listen(root)?;
+        let _socket = SocketGuard { fd: listener, addr };
+        let _reg = control::Registration::create(&key_hex, root, &sock_name)?;
         let started = Instant::now();
         let manifests = Served::manifests(workspace, root);
         let watched = watched_stamps(workspace);
@@ -402,20 +442,10 @@ mod unix_ipc {
             started.elapsed().as_secs_f64() * 1e3
         );
         loop {
-            if let Some(timeout_ms) = idle_ms {
-                match wait_connection(listener, timeout_ms) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        unlink_addr(&address(root).0);
-                        close_all(&[listener]);
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        unlink_addr(&address(root).0);
-                        close_all(&[listener]);
-                        return Err(err);
-                    }
-                }
+            if let Some(timeout_ms) = idle_ms
+                && !wait_connection(listener, timeout_ms)?
+            {
+                return Ok(());
             }
             // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
             let fd = unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -428,6 +458,15 @@ mod unix_ipc {
                 continue;
             }
             let status = match receive(fd) {
+                Ok((control::PING_BYTE, fds)) => {
+                    close_all(&fds);
+                    0
+                }
+                Ok((control::STOP_BYTE, fds)) => {
+                    close_all(&fds);
+                    drop(conn.write_all(&0_i32.to_le_bytes()));
+                    return Ok(());
+                }
                 Ok((byte, fds)) => match read_payload(&mut conn) {
                     Ok((out, args)) => answer(
                         &mut build,
@@ -480,7 +519,7 @@ mod unix_ipc {
 
     fn listen(root: &std::path::Path) -> Result<RawFd> {
         let fd = socket()?;
-        let (addr, len) = address(root);
+        let (_, _, addr, len) = address(root);
         let answered = connect(root)?.inspect(|fd| close_all(&[*fd])).is_some();
         if !answered {
             unlink_addr(&addr);
@@ -615,8 +654,8 @@ mod unix_ipc {
     fn restore(saved: [RawFd; 3], received: &[RawFd]) {
         drop(std::io::stdout().flush());
         drop(std::io::stderr().flush());
-        // SAFETY: saved holds the duplicates of this process's own standard descriptors.
         for (&own, kept) in STDIO.iter().zip(saved) {
+            // SAFETY: saved holds the duplicates of this process's own standard descriptors.
             unsafe {
                 libc::dup2(kept, own);
             }
@@ -626,8 +665,8 @@ mod unix_ipc {
     }
 
     fn close_all(fds: &[RawFd]) {
-        // SAFETY: fds are descriptors this process owns and nothing else uses after this call.
         for &fd in fds {
+            // SAFETY: fds are descriptors this process owns and nothing else uses after this call.
             unsafe {
                 libc::close(fd);
             }
@@ -714,5 +753,36 @@ mod unix_ipc {
         fds.iter()
             .try_for_each(|&fd| crate::image::close_on_exec(fd).map(drop))?;
         Ok((data[0], fds))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn socket_key_changes_for_behavioral_env_toggles() {
+            let root = Path::new("/tmp/sample-ws");
+            let base = crate::config::Config::for_target(haste_codegen::Target::host());
+            let k_base = socket_key_for(root, &base);
+            let mut variants = [
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+                base.clone(),
+            ];
+            variants[0].debug_info = !base.debug_info;
+            variants[1].symbols = !base.symbols;
+            variants[2].x64_baseline = !base.x64_baseline;
+            variants[3].fn_align = Some(128);
+            variants[4].use_substrate = !base.use_substrate;
+            variants[5].verify_passes = !base.verify_passes;
+            variants[6].verify_stencil = !base.verify_stencil;
+            for variant in &variants {
+                assert_ne!(socket_key_for(root, variant), k_base);
+            }
+        }
     }
 }

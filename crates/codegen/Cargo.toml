@@ -12,3 +12,6 @@ homepage.workspace = true
 [dependencies]
 libc = "0.2"
 rustc-hash = "2"
+
+[lints]
+workspace = true

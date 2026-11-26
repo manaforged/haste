@@ -12,11 +12,28 @@ impl Infer<'_, '_> {
         self.settle_initial_passes()?;
         self.settle_final_passes()?;
         if let Some((of, substs)) = self.obligations.first() {
-            let ty = self.show(substs[0]);
-            anyhow::bail!(
-                "the trait bound `{ty}: {}` is not satisfied",
-                self.cx.name(*of)
-            );
+            let self_ty = substs[0];
+            let resolved = self.resolve(self_ty);
+            let site = self
+                .obligation_sites
+                .get(&(*of, self_ty))
+                .or_else(|| self.obligation_sites.get(&(*of, resolved)))
+                .copied();
+            let ty = self.show(self_ty);
+            let trait_name = self.cx.name(*of);
+            let label = if self.is_thread_auto_trait(*of) && trait_name == "Send" {
+                format!("`{ty}` cannot be sent between threads safely")
+            } else if self.is_thread_auto_trait(*of) && trait_name == "Sync" {
+                format!("`{ty}` cannot be shared between threads safely")
+            } else {
+                format!("the trait `{trait_name}` is not implemented for `{ty}`")
+            };
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Trait,
+                site,
+                format!("the trait bound `{ty}: {trait_name}` is not satisfied"),
+                label,
+            ));
         }
         Ok(())
     }
@@ -86,7 +103,12 @@ impl Infer<'_, '_> {
         self.settle_operators(true)?;
         self.settle_projection_loop()?;
         self.settle_casts(true)?;
-        self.settle_captures()
+        self.settle_captures()?;
+        self.captures_settled = true;
+        self.settle_obligations()?;
+        self.check_all_matches_exhaustive()?;
+        self.settle_projection_loop()?;
+        self.settle_obligations()
     }
 
     fn bound_vars(&self) -> usize {
@@ -186,6 +208,14 @@ impl Infer<'_, '_> {
 
     fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
         let self_ty = self.resolve(substs[0]);
+        if self.is_thread_auto_trait(of) {
+            if !self.captures_settled {
+                return Ok(false);
+            }
+            if self.poly.is_some() && self.has_params(self_ty) {
+                return Ok(self.thread_auto_holds(of, self_ty));
+            }
+        }
         if let Some(done) = self.step_var_obligation(of, self_ty, substs)? {
             return Ok(done);
         }

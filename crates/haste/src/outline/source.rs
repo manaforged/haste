@@ -665,6 +665,64 @@ impl Source {
             + 1
     }
 
+    /// Resolves token range `start_tok..end_tok` (half-open) to `(path, text, start_byte, end_byte, from_macro)`.
+    pub(crate) fn token_byte_span(
+        &self,
+        start_tok: u32,
+        end_tok: u32,
+    ) -> Option<(&Path, &str, u32, u32, bool)> {
+        if self.is_empty() || start_tok >= self.len() {
+            return None;
+        }
+        let max_tok = self.len().saturating_sub(1);
+        let first_tok = start_tok;
+        let last_tok = end_tok.saturating_sub(1).max(first_tok).min(max_tok);
+        let (s_layer, s_local) = self.layer(first_tok);
+        let (e_layer, e_local) = self.layer(last_tok);
+        let (s_start, s_raw_len) = s_layer.tokens.raw_span(s_local)?;
+        let s_len = s_raw_len & !JOINT;
+        let e_span = e_layer.tokens.raw_span(e_local);
+        if first_tok >= self.offset && matches!(s_layer.origins, Origins::Copied(_)) {
+            let base = self.base.as_deref()?;
+            let sb = self.origin(first_tok)?;
+            let text_len = base.source.text.len() as u32;
+            let sb = sb.min(text_len);
+            let same_line_end = self.origin(last_tok).zip(e_span).and_then(|(eb, (_, el))| {
+                let eb_clamped = eb.min(text_len);
+                let end = eb.saturating_add(el & !JOINT).min(text_len);
+                (eb >= sb
+                    && !base.source.text.as_bytes()[sb as usize..eb_clamped as usize]
+                        .contains(&b'\n'))
+                .then_some(end)
+            });
+            let end_byte = same_line_end
+                .unwrap_or_else(|| sb.saturating_add(s_len).min(text_len))
+                .max(sb);
+            return Some((&base.source.path, &base.source.text, sb, end_byte, true));
+        }
+        if matches!(s_layer.origins, Origins::Copied(_)) {
+            return None;
+        }
+        let text_len = s_layer.text.len() as u32;
+        let end_byte = if std::ptr::eq(s_layer, e_layer)
+            && let Some((e_start, e_raw_len)) = e_span
+        {
+            e_start.saturating_add(e_raw_len & !JOINT)
+        } else if let Some(eb) = self.origin(last_tok)
+            && let Some((_, el)) = e_span
+            && eb >= s_start
+            && !s_layer.text.as_bytes()[s_start.min(text_len) as usize..eb.min(text_len) as usize]
+                .contains(&b'\n')
+        {
+            eb.saturating_add(el & !JOINT)
+        } else {
+            s_start.saturating_add(s_len)
+        }
+        .min(text_len);
+        let start_byte = s_start.min(end_byte);
+        Some((&s_layer.path, &s_layer.text, start_byte, end_byte, false))
+    }
+
     /// The number of tokens, those of the base included.
     pub fn len(&self) -> u32 {
         self.offset + self.tokens.len() as u32

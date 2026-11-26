@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+diff-harness = []
+
 [dependencies]
 anyhow = "1"
 haste-codegen = { path = "../codegen" }
@@ -26,3 +30,6 @@ rustc_lexer = { package = "ra-ap-rustc_lexer", version = "0.180", default-featur
 
 [target.'cfg(any(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"), target_os = "macos"))'.dependencies]
 tikv-jemallocator = "=0.7.0"
+
+[lints]
+workspace = true

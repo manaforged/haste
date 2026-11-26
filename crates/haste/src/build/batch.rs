@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::cli::{TestItem, case_items, test_items};
+#[cfg(feature = "diff-harness")]
+use crate::cli::case_items;
+use crate::cli::{TestItem, test_items};
 use crate::graph;
 use crate::image::Image;
 use crate::macros::Compilation;
@@ -18,6 +20,7 @@ use super::{main_item, require_main};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum BatchKind {
+    #[cfg(feature = "diff-harness")]
     Cases,
     Tests,
     LibCheck,
@@ -28,7 +31,9 @@ pub(super) enum BatchKind {
 impl BatchKind {
     fn mode(self) -> crate::image::ImageMode {
         match self {
-            BatchKind::Cases | BatchKind::Tests => crate::image::ImageMode::Jit,
+            #[cfg(feature = "diff-harness")]
+            BatchKind::Cases => crate::image::ImageMode::Jit,
+            BatchKind::Tests => crate::image::ImageMode::Jit,
             BatchKind::LibCheck | BatchKind::MainCheck => crate::image::ImageMode::Check,
             BatchKind::MainAot => crate::image::ImageMode::Aot,
         }
@@ -36,6 +41,7 @@ impl BatchKind {
 
     fn pick(self, workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
         match self {
+            #[cfg(feature = "diff-harness")]
             BatchKind::Cases => case_items(workspace, outline),
             BatchKind::Tests => test_items(workspace, outline)
                 .into_iter()
@@ -173,6 +179,7 @@ fn finish_batch(
     let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.as_ref());
     let mut test_starts: Vec<Option<sema::reach::Instance>> = Vec::new();
     let valid: Vec<ItemRef> = match kind {
+        #[cfg(feature = "diff-harness")]
         BatchKind::Cases => cases
             .iter()
             .copied()
@@ -312,6 +319,7 @@ impl Batch {
                         |_| vec![(main_ref, sema::substs::Substs::EMPTY)],
                         Into::into,
                     ),
+                #[cfg(feature = "diff-harness")]
                 (BatchKind::Cases, _) => root_insts
                     .iter()
                     .copied()
@@ -410,6 +418,7 @@ impl Batch {
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
         let mut test_starts = Vec::new();
         match self.kind {
+            #[cfg(feature = "diff-harness")]
             BatchKind::Cases => {
                 cases.retain(|&item| sema::infer::is_case_sig(&mut cx, item));
                 roots = cases

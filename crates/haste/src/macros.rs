@@ -684,60 +684,64 @@ fn expand(
     bound: &[Call],
     inputs: &[Vec<String>],
 ) -> Result<Vec<Option<Result<String, String>>>> {
-    let pair = entries(&mut compilation.outline)?;
-    let mut preload_roots = Vec::with_capacity(bound.len() + 1);
-    preload_roots.push(pair[0].krate as usize);
-    preload_roots.extend(bound.iter().map(|(call, ..)| call.krate as usize));
-    preload_macro_crates(compilation, &preload_roots)?;
-    let (mut demand, mut roots) = match compilation.expander.take() {
-        Some(kept) if kept.matches(&compilation.outline) => (kept.jit, kept.roots),
-        _ => {
-            let mut cache = Cache::default();
-            if let Some(sub) = &compilation.substrate {
-                cache.set_substrate(Some(std::sync::Arc::clone(sub)));
+    crate::with_host_target(|| {
+        let pair = entries(&mut compilation.outline)?;
+        let mut preload_roots = Vec::with_capacity(bound.len() + 1);
+        preload_roots.push(pair[0].krate as usize);
+        preload_roots.extend(bound.iter().map(|(call, ..)| call.krate as usize));
+        preload_macro_crates(compilation, &preload_roots)?;
+        let (mut demand, mut roots) = match compilation.expander.take() {
+            Some(kept) if kept.matches(&compilation.outline) => (kept.jit, kept.roots),
+            _ => {
+                let mut cache = Cache::default();
+                if let Some(sub) = &compilation.substrate {
+                    cache.set_substrate(Some(std::sync::Arc::clone(sub)));
+                }
+                (Jit::new(cache)?, Vec::new())
             }
-            (Jit::new(cache)?, Vec::new())
+        };
+        let mut env_by_caller: HashMap<usize, Vec<(String, String)>> = HashMap::default();
+        for &(_, _, caller) in bound {
+            env_by_caller
+                .entry(caller)
+                .or_insert_with(|| caller_vars(&compilation.outline, caller));
         }
-    };
-    let mut env_by_caller: HashMap<usize, Vec<(String, String)>> = HashMap::default();
-    for &(_, _, caller) in bound {
-        env_by_caller
-            .entry(caller)
-            .or_insert_with(|| caller_vars(&compilation.outline, caller));
-    }
-    let entry = pair.map(|item| demand.declare((item, crate::sema::substs::Substs::EMPTY)));
-    let jobs: Vec<Job<'_>> = bound
-        .iter()
-        .zip(inputs)
-        .map(|(&(call, kind, caller), texts)| Job {
-            entry: entry[usize::from(kind == ProcKind::Attribute)],
-            run: demand.declare((call, crate::sema::substs::Substs::EMPTY)),
-            texts: texts.iter().map(|text| text.as_bytes()).collect(),
-            vars: env_by_caller.get(&caller).map_or(&[], Vec::as_slice),
-            group: (caller, call.krate),
-        })
-        .collect();
-    let ask = |compilation: &mut Compilation, asks: Requests| {
-        Ok(if compilation.names.load(&mut compilation.outline, asks)? {
-            Answer::Names
-        } else {
-            Answer::Nothing
-        })
-    };
-    let ran = run_macros(compilation, &mut demand, &jobs, &ask);
-    drop(jobs);
-    let ran = ran?;
-    roots.push(pair[0].krate as usize);
-    roots.extend(bound.iter().map(|(call, ..)| call.krate as usize));
-    compilation.expander = Some(Expander::new(&compilation.outline, demand, roots));
-    Ok(ran
-        .into_iter()
-        .map(|result| {
-            result.map(|result| {
-                result.and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))
+        let entry = pair.map(|item| demand.declare((item, crate::sema::substs::Substs::EMPTY)));
+        let jobs: Vec<Job<'_>> = bound
+            .iter()
+            .zip(inputs)
+            .map(|(&(call, kind, caller), texts)| Job {
+                entry: entry[usize::from(kind == ProcKind::Attribute)],
+                run: demand.declare((call, crate::sema::substs::Substs::EMPTY)),
+                texts: texts.iter().map(|text| text.as_bytes()).collect(),
+                vars: env_by_caller.get(&caller).map_or(&[], Vec::as_slice),
+                group: (caller, call.krate),
             })
-        })
-        .collect())
+            .collect();
+        let ask = |compilation: &mut Compilation, asks: Requests| {
+            Ok(if compilation.names.load(&mut compilation.outline, asks)? {
+                Answer::Names
+            } else {
+                Answer::Nothing
+            })
+        };
+        let ran = run_macros(compilation, &mut demand, &jobs, &ask);
+        drop(jobs);
+        let ran = ran?;
+        roots.push(pair[0].krate as usize);
+        roots.extend(bound.iter().map(|(call, ..)| call.krate as usize));
+        compilation.expander = Some(Expander::new(&compilation.outline, demand, roots));
+        Ok(ran
+            .into_iter()
+            .map(|result| {
+                result.map(|result| {
+                    result.and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|error| error.to_string())
+                    })
+                })
+            })
+            .collect())
+    })
 }
 
 fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {

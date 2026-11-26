@@ -1,5 +1,5 @@
-use super::asm::{Alu, Asm, Mem, Reg, Size, Xmm};
-use crate::asm_text::{Encoder, Symbols, integer};
+use super::asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
+use crate::asm_text::{Encoder, LocalLabels, Symbols, integer, local_target};
 use crate::reloc::StencilReloc;
 
 const REGS: [(&str, Reg); 16] = [
@@ -26,6 +26,7 @@ pub(crate) struct Text {
     asm: Asm,
     relocs: Vec<StencilReloc>,
     direct: bool,
+    locals: LocalLabels<Label>,
 }
 
 #[derive(Clone, Copy)]
@@ -35,6 +36,7 @@ enum Operand {
     Mem(Mem),
     Imm(i32),
     Symbol(u32),
+    Local(u32, bool),
 }
 
 impl Text {
@@ -44,14 +46,23 @@ impl Text {
             asm: Asm::default(),
             relocs: Vec::new(),
             direct,
+            locals: LocalLabels::default(),
         }
+    }
+
+    fn local_label(&mut self, id: u32, forward: bool) -> Result<Label, String> {
+        self.locals.target(id, forward, || self.asm.label())
     }
 
     fn data(&mut self, mnemonic: &str, operands: &[Operand]) -> bool {
         match (mnemonic, operands) {
             ("mov", [Operand::Reg(dst), Operand::Reg(src)]) => self.asm.mov(*dst, *src),
             ("mov", [Operand::Mem(dst), Operand::Reg(src)]) => self.asm.store(Size::Q, *dst, *src),
+            ("mov", [Operand::Mem(dst), Operand::Imm(imm)]) => {
+                self.asm.store_imm_sized(Size::Q, *dst, *imm)
+            }
             ("mov", [Operand::Reg(dst), Operand::Mem(src)]) => self.asm.load(Size::Q, *dst, *src),
+            ("test", [Operand::Reg(a), Operand::Reg(b)]) => self.asm.test(*a, *b),
             ("movdqu", [Operand::Mem(dst), Operand::Xmm(src)]) => {
                 self.asm.sse(&[0xF3], &[0x0F, 0x7F], src.0, *dst)
             }
@@ -69,7 +80,7 @@ impl Text {
         true
     }
 
-    fn control(&mut self, mnemonic: &str, operands: &[Operand]) -> bool {
+    fn control(&mut self, mnemonic: &str, operands: &[Operand]) -> Result<bool, String> {
         match (mnemonic, operands) {
             ("push", [Operand::Reg(reg)]) => self.asm.push(*reg),
             ("pop", [Operand::Reg(reg)]) => self.asm.pop(*reg),
@@ -79,10 +90,22 @@ impl Text {
             }
             ("call", [Operand::Reg(reg)]) => self.asm.call(*reg),
             ("jmp", [Operand::Reg(reg)]) => self.asm.jmp_reg(*reg),
+            ("jmp", [Operand::Local(id, forward)]) => {
+                let label = self.local_label(*id, *forward)?;
+                self.asm.jmp(label);
+            }
+            ("jz" | "je", [Operand::Local(id, forward)]) => {
+                let label = self.local_label(*id, *forward)?;
+                self.asm.jcc(Cond::E, label);
+            }
+            ("jnz" | "jne", [Operand::Local(id, forward)]) => {
+                let label = self.local_label(*id, *forward)?;
+                self.asm.jcc(Cond::Ne, label);
+            }
             ("ret", []) => self.asm.bytes(&[0xC3]),
-            _ => return false,
+            _ => return Ok(false),
         }
-        true
+        Ok(true)
     }
 }
 
@@ -108,11 +131,15 @@ fn operand(text: &str, symbol: &Symbols<'_>) -> Result<Operand, String> {
     if text.starts_with('{') {
         return symbol(text).map(Operand::Symbol);
     }
-    if let Some(inner) = text
+    let mem_text = text.strip_prefix("qword ptr ").map_or(text, str::trim);
+    if let Some(inner) = mem_text
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
         return memory(inner).map(Operand::Mem);
+    }
+    if let Some((id, forward)) = local_target(text) {
+        return Ok(Operand::Local(id, forward));
     }
     if let Some(reg) = register(text) {
         return Ok(Operand::Reg(reg));
@@ -138,6 +165,11 @@ impl Encoder for Text {
         self.asm.bytes(&[0x90]);
     }
 
+    fn define_local(&mut self, id: u32) {
+        let label = self.locals.define(id, || self.asm.label());
+        self.asm.bind(label);
+    }
+
     fn instruction(
         &mut self,
         mnemonic: &str,
@@ -148,13 +180,14 @@ impl Encoder for Text {
             .iter()
             .map(|text| operand(text, symbol))
             .collect::<Result<Vec<_>, _>>()?;
-        if self.data(mnemonic, &operands) || self.control(mnemonic, &operands) {
+        if self.data(mnemonic, &operands) || self.control(mnemonic, &operands)? {
             return Ok(());
         }
         Err(format!("unsupported x86-64 instruction form `{mnemonic}`"))
     }
 
     fn finish(self) -> Result<(Vec<u8>, Vec<StencilReloc>), String> {
+        self.locals.finish()?;
         Ok((self.asm.finish()?, self.relocs))
     }
 }

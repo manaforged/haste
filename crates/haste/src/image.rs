@@ -497,9 +497,10 @@ pub(super) fn resolve_host_symbol(
     aot: bool,
 ) -> Result<(HostSymbol, usize), String> {
     let name = cx.symbol_name(item);
+    let lib = cx.link_lib(item);
     let resolved = name
         .as_deref()
-        .and_then(|n| HostSymbol::resolve_for(n, aot))
+        .and_then(|n| HostSymbol::resolve_for_lib(n, lib.as_deref(), aot))
         .and_then(|sym| {
             if aot {
                 Some((sym, 0))

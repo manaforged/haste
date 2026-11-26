@@ -2,7 +2,7 @@ mod args;
 pub(super) mod closure;
 mod types;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::{Expr, ExprId, List, UnOp};
@@ -43,7 +43,7 @@ impl Checker<'_, '_> {
             if t_depth >= min_depth
                 && (check_locals.contains(&holder) || outer_live.contains(&holder))
             {
-                bail!("temporary value dropped while borrowed");
+                return Err(self.borrow_err(l.site, "temporary value dropped while borrowed"));
             }
         }
         Ok(())
@@ -83,7 +83,7 @@ impl Checker<'_, '_> {
                 if is_temp_target(s.target).is_some()
                     || (!self.from_caller(s.target, s.through_ref) && !allowed_ref)
                 {
-                    bail!("`{}` does not live long enough", self.local_name(s.target));
+                    return Err(self.does_not_live_long_enough(None, s.target));
                 }
             }
         }
@@ -109,18 +109,20 @@ impl Checker<'_, '_> {
                             .unwrap_or(0)
                             >= self.closure_depth)
                 {
-                    bail!("borrowed data escapes outside of closure");
+                    return Err(self.borrow_err(None, "borrowed data escapes outside of closure"));
                 }
             }
         }
         if p.through_ref {
             for holder in targets {
+                state.set_tuple_sources(holder, None);
                 if self.ty_holds_borrow(self.local_ty(holder)) {
                     super::bind::push_source_loans_filtered(
                         &mut state.loans,
                         Some(holder),
                         sources,
                         false,
+                        self.current_expr,
                         |s| s.target != holder,
                         |s| s.mutable,
                     );
@@ -139,7 +141,7 @@ impl Checker<'_, '_> {
         if !sources.is_empty() {
             self.check_assign_escape(p, sources, state)?;
             if !p.through_ref {
-                self.push_sources_for_local(p.local, sources, state);
+                self.push_sources_for_local(p.local, sources, self.current_expr, state);
             }
         }
         Ok(())
@@ -155,15 +157,21 @@ impl Checker<'_, '_> {
             && src_local != dst_local
             && self.is_mut_ref_ty(self.local_ty(dst_local))
             && self.is_mut_ref_ty(self.local_ty(src_local))
-            && state
+            && let Some(loan) = state
                 .loans
                 .iter()
-                .any(|l| loan_conflicts_borrow(l, src_local, &[]))
+                .find(|l| loan_conflicts_borrow(l, src_local, &[]))
         {
-            bail!(
-                "cannot move out of `{}` because it is borrowed",
-                self.local_name(src_local)
-            );
+            return Err(self.borrow_err_labeled(
+                Some(src),
+                format!(
+                    "cannot move out of `{}` because it is borrowed",
+                    self.local_name(src_local)
+                ),
+                "move out of borrowed value occurs here",
+                loan.site,
+                "borrow occurs here",
+            ));
         }
         Ok(())
     }
@@ -182,7 +190,10 @@ impl Checker<'_, '_> {
 
     pub(super) fn check_adt_drop_move(&mut self, ty: Ty) -> Result<()> {
         if self.ty_has_own_drop(ty) {
-            bail!("cannot move out of type which implements the `Drop` trait");
+            return Err(self.borrow_err(
+                None,
+                "cannot move out of type which implements the `Drop` trait",
+            ));
         }
         Ok(())
     }
@@ -261,11 +272,12 @@ impl Checker<'_, '_> {
                     self.check_adt_drop_move(adt_ty)?;
                 }
                 if behind_ref {
-                    bail!("cannot move out of a shared or mutable reference");
+                    return Err(self
+                        .borrow_err(Some(b), "cannot move out of a shared or mutable reference"));
                 }
                 self.check_can_move(p.local, &steps, state)?;
                 if !p.through_ref {
-                    self.push_partial_move(state, p.local, steps);
+                    self.push_partial_move(state, p.local, steps, Some(b));
                 }
             }
         }
@@ -328,7 +340,10 @@ impl Checker<'_, '_> {
             if cont != Ty::NONE
                 && matches!(self.cx.types.kind(cont), Kind::Adt(item, _) if self.cx.item(*item).1.kind == ItemKind::Union)
             {
-                bail!("access to union field is unsafe and requires unsafe function or block");
+                return Err(self.unsafe_err(
+                    Some(expr),
+                    "access to union field is unsafe and requires unsafe function or block",
+                ));
             }
         }
         Ok(())
@@ -349,5 +364,34 @@ impl Checker<'_, '_> {
                 _ => return Ok(()),
             }
         }
+    }
+
+    pub(super) fn check_coercion_vtables(&self) -> Result<()> {
+        for (&coercion_expr, coercion) in &self.typed.coercions {
+            let Some(vtable) = coercion.vtable() else {
+                continue;
+            };
+            let Kind::Closure(parent, _, at) = *self.cx.types.kind(vtable.ty) else {
+                continue;
+            };
+            if parent != self.item {
+                continue;
+            }
+            let Kind::Dyn(of, ..) = *self.cx.types.kind(vtable.object) else {
+                continue;
+            };
+            let Some(eff) = self.closure_effects.get(&ExprId(at)) else {
+                continue;
+            };
+            let lang = self.cx.lang(of);
+            self.check_closure_effects(
+                Some(coercion_expr),
+                eff,
+                lang == Some("fn"),
+                lang == Some("fn_mut"),
+                false,
+            )?;
+        }
+        Ok(())
     }
 }

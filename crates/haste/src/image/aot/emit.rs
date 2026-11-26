@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use haste_codegen::{RelocKind, Target};
@@ -13,30 +13,9 @@ use super::super::Image;
 use super::{AotCode, AotFn, AotReach, AotState, AotStatic, icf, vdce};
 
 const FN_ALIGN: u32 = 64;
-const FN_ALIGN_ENV: &str = "HASTE_FN_ALIGN";
 
-fn want_debug_info() -> bool {
-    crate::profile() != crate::outline::tree::Profile::Release
-        || std::env::var_os("HASTE_DEBUG_INFO").is_some()
-}
-
-fn want_symbols() -> bool {
-    want_debug_info()
-        || std::env::var_os("HASTE_SYMBOLS").is_some_and(|v| v != "0" && !v.is_empty())
-}
-
-fn fn_align_override() -> Option<u32> {
-    static ALIGN: OnceLock<Option<u32>> = OnceLock::new();
-    *ALIGN.get_or_init(|| {
-        std::env::var(FN_ALIGN_ENV)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|a: &u32| a.is_power_of_two() && *a >= 16)
-    })
-}
-
-fn place(exe: &mut Executable, code: &AotCode, debug_info: bool) -> u32 {
-    let align = fn_align_override().unwrap_or(if code.loops().is_empty() {
+fn place(exe: &mut Executable, code: &AotCode, debug_info: bool, fn_align: Option<u32>) -> u32 {
+    let align = fn_align.unwrap_or(if code.loops().is_empty() {
         16
     } else {
         FN_ALIGN
@@ -103,7 +82,7 @@ impl SymTable<'_> {
 fn emit_dict_bodies(
     state: &AotState,
     order: &[usize],
-    debug_info: bool,
+    (debug_info, fn_align): (bool, Option<u32>),
     exe: &mut Executable,
 ) -> Result<HashMap<usize, u32>> {
     let mut dict_bodies: HashMap<usize, u32> = HashMap::default();
@@ -115,7 +94,7 @@ fn emit_dict_bodies(
         if dict_bodies.contains_key(&key) {
             continue;
         }
-        let off = place(exe, body, debug_info);
+        let off = place(exe, body, debug_info, fn_align);
         for reloc in body.relocs() {
             let rt = reloc
                 .as_runtime()
@@ -186,7 +165,7 @@ fn patch_pending_relocs(
 fn emit_functions(
     state: &AotState,
     live: &AotReach,
-    (target, debug_info): (&Target, bool),
+    (target, debug_info, fn_align): (&Target, bool, Option<u32>),
     (syms, dict_bodies): (&SymTable<'_>, &HashMap<usize, u32>),
     (roots, canon): (&[usize], &[usize]),
     exe: &mut Executable,
@@ -198,7 +177,7 @@ fn emit_functions(
         if fn_offs[leader].is_none() {
             fn_offs[leader] = match &state.functions[leader] {
                 Some(AotFn::Direct { code, relocs }) => {
-                    let off = place(exe, code, debug_info);
+                    let off = place(exe, code, debug_info, fn_align);
                     pending.push((off, code, relocs.as_slice()));
                     Some(off)
                 }
@@ -300,7 +279,8 @@ impl Image {
         reached: &crate::sema::reach::Reached,
     ) -> Result<Executable> {
         let state = lock(self.aot().context("image has no AOT recording")?);
-        let debug_info = want_debug_info();
+        let (debug_info, symbols, fn_align) =
+            crate::with_cfg(|c| (c.debug_info, c.symbols, c.fn_align));
         let (live, vmask) = vdce::VtableMask::converge(cx, reached, &state.vtables, |vmask| {
             let live = AotReach::collect(&state, [lang_start, user_main], vmask);
             let counts = (live.order.len(), live.vtable_order.len());
@@ -343,11 +323,11 @@ impl Image {
             promoted_syms: &promoted_syms,
             thread_slots: &thread_slots,
         };
-        let dict_bodies = emit_dict_bodies(&state, &live.order, debug_info, &mut exe)?;
+        let dict_bodies = emit_dict_bodies(&state, &live.order, (debug_info, fn_align), &mut exe)?;
         let fn_offs = emit_functions(
             &state,
             &live,
-            (target, debug_info),
+            (target, debug_info, fn_align),
             (&syms, &dict_bodies),
             (&roots, &canon),
             &mut exe,
@@ -389,7 +369,7 @@ impl Image {
                     .collect(),
             );
         }
-        if want_symbols() {
+        if symbols {
             let mut named: HashMap<u32, usize> = HashMap::default();
             for &index in &live.order {
                 if let Some(off) = fn_offs[index] {

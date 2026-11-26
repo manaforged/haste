@@ -41,39 +41,49 @@ const PTHREAD_DEPS: &[&str] = &[
     "calloc",
     "sched_yield",
 ];
-const WIN_TLS_DEPS: &[&str] = &[
-    "TlsAlloc",
-    "TlsGetValue",
-    "TlsSetValue",
-    "calloc",
-    "SwitchToThread",
+pub(super) const KERNEL32_DLL: &str = "kernel32.dll";
+pub(super) const UCRTBASE_DLL: &str = "ucrtbase.dll";
+
+const WIN_TLS_DEPS: &[(&str, &str)] = &[
+    ("TlsAlloc", KERNEL32_DLL),
+    ("TlsGetValue", KERNEL32_DLL),
+    ("TlsSetValue", KERNEL32_DLL),
+    ("calloc", UCRTBASE_DLL),
+    ("SwitchToThread", KERNEL32_DLL),
 ];
 
-fn collect_deps(
+fn collect_deps<T: Copy>(
     shim: Shim,
-    tls: &[&'static str],
-    mem: (&'static str, &'static str, &'static str),
-    jmp: Option<(&'static str, &'static str)>,
-) -> Vec<&'static str> {
+    tls: &[T],
+    mem: (T, T, T),
+    jmp: Option<(T, T)>,
+    crt: impl Fn(&'static str) -> T,
+) -> Vec<T> {
     let (alloc_aligned, yield_fn, free_fn) = mem;
     match shim {
-        Shim::Alloc => vec!["malloc", alloc_aligned],
-        Shim::AllocZeroed => vec!["calloc", alloc_aligned, "memset"],
+        Shim::Alloc => vec![crt("malloc"), alloc_aligned],
+        Shim::AllocZeroed => vec![crt("calloc"), alloc_aligned, crt("memset")],
         Shim::Dealloc | Shim::FrameFree => vec![free_fn],
-        Shim::FrameAlloc => vec!["malloc"],
-        Shim::Realloc => vec!["realloc", "malloc", alloc_aligned, "memcpy", free_fn],
+        Shim::FrameAlloc => vec![crt("malloc")],
+        Shim::Realloc => vec![
+            crt("realloc"),
+            crt("malloc"),
+            alloc_aligned,
+            crt("memcpy"),
+            free_fn,
+        ],
         Shim::FillOnce => vec![yield_fn],
         Shim::ThreadCell => tls
             .iter()
             .copied()
-            .chain(["memcpy", "free", alloc_aligned, "memset"])
+            .chain([crt("memcpy"), crt("free"), alloc_aligned, crt("memset")])
             .collect(),
         Shim::CatchUnwind => tls.iter().copied().chain(jmp.map(|j| j.0)).collect(),
         Shim::StartPanic => tls
             .iter()
             .copied()
             .chain(jmp.map(|j| j.1))
-            .chain(["abort"])
+            .chain([crt("abort")])
             .collect(),
         Shim::DropPush | Shim::DropPop => tls.to_vec(),
         _ => Vec::new(),
@@ -86,22 +96,29 @@ pub(super) fn deps(shim: Shim) -> Vec<&'static str> {
         PTHREAD_DEPS,
         ("posix_memalign", "sched_yield", "free"),
         None,
+        |s| s,
     )
 }
 
-pub(super) fn windows_deps(shim: Shim) -> Vec<&'static str> {
+pub(super) fn windows_deps(shim: Shim) -> Vec<(&'static str, &'static str)> {
+    let ucrt = |s: &'static str| (s, UCRTBASE_DLL);
     match shim {
-        Shim::Alloc => vec!["_aligned_malloc"],
-        Shim::AllocZeroed => vec!["_aligned_malloc", "memset"],
-        Shim::Dealloc => vec!["_aligned_free"],
-        Shim::Realloc => vec!["_aligned_realloc"],
-        Shim::FrameAlloc => vec!["malloc"],
-        Shim::FrameFree => vec!["free"],
+        Shim::Alloc => vec![ucrt("_aligned_malloc")],
+        Shim::AllocZeroed => vec![ucrt("_aligned_malloc"), ucrt("memset")],
+        Shim::Dealloc => vec![ucrt("_aligned_free")],
+        Shim::Realloc => vec![ucrt("_aligned_realloc")],
+        Shim::FrameAlloc => vec![ucrt("malloc")],
+        Shim::FrameFree => vec![ucrt("free")],
         _ => collect_deps(
             shim,
             WIN_TLS_DEPS,
-            ("_aligned_malloc", "SwitchToThread", "free"),
-            Some(("_setjmp", "longjmp")),
+            (
+                ucrt("_aligned_malloc"),
+                ("SwitchToThread", KERNEL32_DLL),
+                ucrt("free"),
+            ),
+            Some((ucrt("_setjmp"), ucrt("longjmp"))),
+            ucrt,
         ),
     }
 }

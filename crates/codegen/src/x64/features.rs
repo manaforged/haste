@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 const BASELINE: &str = "HASTE_X64_BASELINE";
 
 /// The instruction-set extensions past the x86-64 baseline that emitted code may use.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(super) struct Features {
     pub lzcnt: bool,
     pub bmi1: bool,
@@ -22,12 +22,21 @@ impl Features {
     pub fn host() -> Self {
         static HOST: OnceLock<Features> = OnceLock::new();
         *HOST.get_or_init(|| {
-            if std::env::var_os(BASELINE).is_some_and(|value| value == "1") {
+            if crate::env_flag(BASELINE) {
                 Self::default()
             } else {
                 detect()
             }
         })
+    }
+
+    /// Optional x86-64 features enabled for `target`: host CPU features when compiling natively, else baseline SSE2.
+    pub fn for_target(target: &crate::Target) -> Self {
+        if target.triple == crate::Target::host().triple {
+            Self::host()
+        } else {
+            Self::default()
+        }
     }
 }
 
@@ -51,4 +60,27 @@ fn detect() -> Features {
 #[cfg(not(target_arch = "x86_64"))]
 fn detect() -> Features {
     Features::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Features;
+    use crate::{Arch, TARGETS, Target};
+
+    #[test]
+    fn cross_x64_target_uses_baseline_features() {
+        let host = Target::host();
+        let cross = TARGETS
+            .iter()
+            .find(|t| t.arch == Arch::X64 && t.triple != host.triple)
+            .expect("catalog has a non-host x86_64 target");
+        assert_eq!(Features::for_target(cross), Features::default());
+    }
+
+    #[test]
+    fn unimplemented_targets_are_absent() {
+        assert!(Target::find("riscv64gc-unknown-linux-gnu").is_none());
+        assert!(Target::find("wasm32-unknown-unknown").is_none());
+        assert!(Target::find("wasm32-wasip1").is_none());
+    }
 }

@@ -1,6 +1,7 @@
 //! Function bodies parsed into an arena of expressions, patterns and types, over the outline's tokens.
 
 pub mod adt;
+mod control;
 pub(crate) mod cursor;
 mod expr;
 pub mod literal;
@@ -27,6 +28,12 @@ impl Body {
         &self.exprs[id.0 as usize]
     }
 
+    /// Half-open token range `(start, end)` of expression `id`.
+    pub fn expr_span(&self, id: ExprId) -> Option<(u32, u32)> {
+        let idx = id.0 as usize;
+        Some((*self.expr_starts.get(idx)?, *self.expr_ends.get(idx)?))
+    }
+
     /// Whether the resolution of call callee `id` names the function the call runs, which is false for a method call whose result is called.
     pub fn names_callee(&self, id: ExprId) -> bool {
         !matches!(self.expr(id), Expr::Method { .. })
@@ -35,6 +42,11 @@ impl Body {
     /// The pattern `id`.
     pub fn pat(&self, id: PatId) -> &Pat {
         &self.pats[id.0 as usize]
+    }
+
+    /// Half-open token range `(start, end)` of pattern `id`.
+    pub fn pat_span(&self, id: PatId) -> Option<(u32, u32)> {
+        self.pat_spans.get(id.0 as usize).copied()
     }
 
     /// Whether the parameter pattern `id` is a plain name or `_`, which binds the argument without taking it apart.

@@ -86,19 +86,7 @@ impl Infer<'_, '_> {
         let Some(index) = self.field_index(item, 0, field)? else {
             return Ok(false);
         };
-        let vis = self
-            .cx
-            .adt_def(item)?
-            .variants
-            .first()
-            .and_then(|v| v.fields.get(index as usize))
-            .map(|f| f.vis);
-        match vis {
-            Some(crate::body::adt::FieldVis::Public) => Ok(true),
-            Some(crate::body::adt::FieldVis::Crate) => Ok(self.home.krate == item.krate),
-            Some(crate::body::adt::FieldVis::Private) => self.sees_private(item),
-            None => Ok(false),
-        }
+        self.field_visible(item, index, None)
     }
 
     /// The type that step `step` of the autoderef of `expr` reaches from `ty` through `Deref::deref`, recorded on `(expr, step)`; `None` when `ty` has no `Deref` impl.
@@ -169,9 +157,111 @@ impl Infer<'_, '_> {
     }
 
     fn sees_private(&mut self, item: crate::names::ItemRef) -> Result<bool> {
+        self.sees_private_from(self.home, item)
+    }
+
+    fn sees_private_from(
+        &mut self,
+        from: crate::names::ModRef,
+        item: crate::names::ItemRef,
+    ) -> Result<bool> {
         let module = self.cx.module_of(item)?;
-        Ok(self.home.krate == module.krate
-            && self.cx.paths(self.home.krate).within(self.home, module))
+        Ok(from.krate == module.krate && self.cx.paths(from.krate).within(from, module))
+    }
+
+    pub(super) fn macro_home_of(&mut self, tok: Option<u32>) -> Option<crate::names::ModRef> {
+        let tok = tok?;
+        let crate::outline::source::Mark::Home { krate, file, item } = self.src.mark(tok)? else {
+            return None;
+        };
+        self.cx
+            .module_of(crate::names::ItemRef { krate, file, item })
+            .ok()
+    }
+
+    fn field_visible_from(
+        &mut self,
+        from: crate::names::ModRef,
+        item: crate::names::ItemRef,
+        vis: crate::body::adt::FieldVis,
+    ) -> Result<bool> {
+        match vis {
+            crate::body::adt::FieldVis::Public => Ok(true),
+            crate::body::adt::FieldVis::Crate => Ok(from.krate == item.krate),
+            crate::body::adt::FieldVis::Super => {
+                let module = self.cx.module_of(item)?;
+                if from.krate != module.krate {
+                    return Ok(false);
+                }
+                let paths = self.cx.paths(from.krate);
+                let parent = paths.parent(module).unwrap_or(module);
+                Ok(paths.within(from, parent))
+            }
+            crate::body::adt::FieldVis::Private => self.sees_private_from(from, item),
+        }
+    }
+
+    pub(super) fn field_visible(
+        &mut self,
+        item: crate::names::ItemRef,
+        index: u32,
+        tok: Option<u32>,
+    ) -> Result<bool> {
+        if self.cx.item(item).1.kind == ItemKind::Enum || self.cx.foreign(item) {
+            return Ok(true);
+        }
+        let Some(vis) = self
+            .cx
+            .adt_def(item)?
+            .variants
+            .first()
+            .and_then(|v| v.fields.get(index as usize))
+            .map(|f| f.vis)
+        else {
+            return Ok(false);
+        };
+        if self.field_visible_from(self.home, item, vis)? {
+            return Ok(true);
+        }
+        if let Some(macro_home) = self.macro_home_of(tok) {
+            return self.field_visible_from(macro_home, item, vis);
+        }
+        Ok(false)
+    }
+
+    pub(super) fn check_field_visible(
+        &mut self,
+        item: crate::names::ItemRef,
+        index: u32,
+        site: Option<ExprId>,
+        tok: Option<u32>,
+        field_name: &str,
+    ) -> Result<()> {
+        if self.cx.outline.crates[self.home.krate as usize].env.fixed {
+            return Ok(());
+        }
+        let check_tok = tok.or_else(|| site.and_then(|e| self.body.expr_span(e).map(|(s, _)| s)));
+        if self.field_visible(item, index, check_tok)? {
+            return Ok(());
+        }
+        let msg = format!(
+            "field `{field_name}` of struct `{}` is private",
+            self.cx.name(item)
+        );
+        if let Some(t) = tok {
+            return Err(self.diag_tok(
+                crate::diag::DiagnosticKind::Privacy,
+                t,
+                msg,
+                "private field",
+            ));
+        }
+        Err(self.diag_expr(
+            crate::diag::DiagnosticKind::Privacy,
+            site,
+            msg,
+            "private field",
+        ))
     }
 
     pub(super) fn overloaded_deref(

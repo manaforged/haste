@@ -56,7 +56,7 @@ impl Checker<'_, '_> {
             return false;
         };
         if let Some(info) = self.cx.closure(ty) {
-            return info.closure.captures.iter().any(|c| {
+            if info.closure.captures.iter().any(|c| {
                 c.by != By::Value
                     || self.ty_holds_borrow_inner(
                         info.typed
@@ -65,7 +65,18 @@ impl Checker<'_, '_> {
                             .map_or(Ty::NONE, |l| l.ty),
                         seen,
                     )
-            });
+            }) {
+                return true;
+            }
+            if info.closure.coroutine && self.cx.signature(parent).is_ok_and(|sig| sig.is_async) {
+                return info.typed.params.iter().any(|&p| {
+                    self.ty_holds_borrow_inner(
+                        info.typed.locals.get(p as usize).map_or(Ty::NONE, |l| l.ty),
+                        seen,
+                    )
+                });
+            }
+            return false;
         }
         if parent == self.item
             && let Some(closure) = self.typed.closures.get(&ExprId(at))
@@ -111,12 +122,16 @@ impl Checker<'_, '_> {
         }
     }
 
+    fn strip_std_prefix<'a>(mod_path: &'a str) -> Option<&'a str> {
+        mod_path
+            .strip_prefix("core::")
+            .or_else(|| mod_path.strip_prefix("alloc::"))
+            .or_else(|| mod_path.strip_prefix("std::"))
+    }
+
     pub(in super::super) fn item_in_std_mod(&mut self, item: ItemRef, submod: &str) -> bool {
         let mod_path = self.cx.module_text(item);
-        let Some(rest) = mod_path
-            .strip_prefix("core::")
-            .or_else(|| mod_path.strip_prefix("std::"))
-        else {
+        let Some(rest) = Self::strip_std_prefix(&mod_path) else {
             return false;
         };
         rest == submod
@@ -124,7 +139,15 @@ impl Checker<'_, '_> {
     }
 
     pub(in super::super) fn is_iter_mod(&mut self, item: ItemRef) -> bool {
-        self.item_in_std_mod(item, "iter")
+        if self.item_in_std_mod(item, "iter") {
+            return true;
+        }
+        Self::strip_std_prefix(&self.cx.module_text(item)).is_some()
+            && self
+                .cx
+                .owner_trait(item)
+                .or_else(|| self.cx.owner_impl(item).and_then(|b| self.cx.impl_trait(b)))
+                .is_some_and(|tr| self.item_in_std_mod(tr, "iter"))
     }
 
     pub(in super::super) fn ty_has_borrow_drop(&mut self, ty: Ty) -> bool {

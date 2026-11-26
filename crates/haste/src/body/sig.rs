@@ -29,6 +29,7 @@ pub struct Generic {
 #[derive(Clone, Copy, Debug)]
 pub struct Predicate {
     pub ty: Option<TyId>,
+    pub lifetime: Option<u32>,
     pub bounds: List,
 }
 
@@ -47,6 +48,7 @@ pub struct Signature {
     pub body: Body,
     pub generics: Vec<Generic>,
     pub receiver: Option<(SelfKind, bool)>,
+    pub receiver_lifetime: Option<u32>,
     pub params: Vec<(PatId, TyId)>,
     pub ret: Option<TyId>,
     pub predicates: Vec<Predicate>,
@@ -174,10 +176,11 @@ impl Cursor<'_> {
     }
 
     fn predicate(&mut self) -> Result<Predicate> {
-        if self.lifetime().is_some() {
+        if let Some(lifetime) = self.lifetime() {
             self.expect(":")?;
             return Ok(Predicate {
                 ty: None,
+                lifetime: Some(lifetime),
                 bounds: self.bounds()?,
             });
         }
@@ -189,17 +192,20 @@ impl Cursor<'_> {
         self.expect(":")?;
         Ok(Predicate {
             ty: Some(ty),
+            lifetime: None,
             bounds: self.bounds()?,
         })
     }
 
-    fn receiver(&mut self) -> Result<Option<(SelfKind, bool)>> {
+    fn receiver(&mut self) -> Result<Option<(SelfKind, bool, Option<u32>)>> {
         let at = self.at;
         let reference = self.punct("&");
-        if reference {
+        let lifetime = if reference {
             self.at += 1;
-            self.lifetime();
-        }
+            self.lifetime()
+        } else {
+            None
+        };
         let mutable = self.eat_word("mut");
         if !self.is_word("self") || self.punct_at(self.at + 1, "::") {
             self.at = at;
@@ -212,7 +218,7 @@ impl Cursor<'_> {
             _ if self.eat(":") => SelfKind::Typed(self.ty()?),
             _ => SelfKind::Value,
         };
-        Ok(Some((kind, mutable && !reference)))
+        Ok(Some((kind, mutable && !reference, lifetime)))
     }
 
     fn fn_params(&mut self, sig: &mut Signature) -> Result<()> {
@@ -246,7 +252,8 @@ impl Cursor<'_> {
             Ok(0)
         })?;
         sig.params = params;
-        sig.receiver = receiver;
+        sig.receiver = receiver.map(|(kind, mutable, _)| (kind, mutable));
+        sig.receiver_lifetime = receiver.and_then(|(_, _, lt)| lt);
         sig.variadic = variadic;
         sig.param_starts = starts;
         Ok(())

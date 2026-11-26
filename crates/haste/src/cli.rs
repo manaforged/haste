@@ -10,7 +10,7 @@ use crate::names::ItemRef;
 use crate::serve::Request;
 use crate::{outline, sema};
 
-use args::{Command, Meta, Query, parse_invocation, print_meta};
+use args::{Command, Meta, Query, ServeAction, parse_invocation, print_meta};
 use debug::{print_expanded, print_items, report_query};
 
 /// Metadata for a discovered `#[test]` function.
@@ -163,6 +163,10 @@ pub(crate) fn print_test_report(
                             "note: panic did not contain expected string `{exp}`\n{}",
                             stderr.as_deref().unwrap_or("").trim()
                         )
+                    } else if let Some(out) =
+                        stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        format!("{out}\n(exited with status {status})")
                     } else {
                         format!("exited with status {status}")
                     };
@@ -230,7 +234,8 @@ pub(crate) fn print_failures(failures: &Failures) {
 }
 
 pub(crate) fn error_kind(text: &str) -> String {
-    let text = text.split_once(": ").map_or(text, |(_, rest)| rest);
+    let line = text.lines().next().unwrap_or(text);
+    let text = line.split_once(": ").map_or(line, |(_, rest)| rest);
     text.split([' ', '(', '`'])
         .take(4)
         .collect::<Vec<_>>()
@@ -311,7 +316,7 @@ fn can_serve(command: Command, stats_json: Option<&std::path::Path>) -> bool {
         && stats_json.is_none()
         && !crate::image::watch::enabled()
         && crate::compile_target().triple == haste_codegen::Target::host().triple
-        && std::env::var_os("HASTE_NO_DAEMON").is_none_or(|v| v != "1")
+        && !crate::env_flag("HASTE_NO_DAEMON")
 }
 
 fn try_serve(
@@ -339,14 +344,42 @@ pub fn main() -> Result<()> {
         return Ok(print_meta(meta));
     }
     crate::sema::evaluate::install(crate::image::evaluator);
-    let (command, path, rest, stats_json, out) = match parse_invocation()? {
+    let (command, path, rest, stats_json, out, cfg) = match parse_invocation()? {
         Ok(parsed) => parsed,
         Err(meta) => return Ok(print_meta(meta)),
     };
+    crate::with_config(std::sync::Arc::new(cfg), || {
+        run_parsed(command, path, rest, stats_json, out)
+    })
+}
+
+fn run_parsed(
+    command: Command,
+    path: std::path::PathBuf,
+    rest: Vec<String>,
+    stats_json: Option<std::path::PathBuf>,
+    out: Option<std::path::PathBuf>,
+) -> Result<()> {
     match command {
         Command::Clean => return clean_cache(),
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),
+        Command::Serve(ServeAction::Status) => {
+            let filter = (!path.as_os_str().is_empty())
+                .then(|| std::path::absolute(&path))
+                .transpose()?;
+            return exit_status(crate::serve::status(filter.as_deref())?);
+        }
+        Command::Serve(ServeAction::Stop { all }) => {
+            let filter = if all {
+                None
+            } else if path.as_os_str().is_empty() {
+                Some(std::path::absolute(std::path::Path::new("."))?)
+            } else {
+                Some(std::path::absolute(&path)?)
+            };
+            return exit_status(crate::serve::stop(filter.as_deref())?);
+        }
         _ => {}
     }
     let root = std::path::absolute(path)?;
@@ -370,14 +403,19 @@ pub fn main() -> Result<()> {
     )?;
     if status == 0
         && cfg!(unix)
+        && crate::daemon()
         && can_serve(command, stats_json.as_deref())
         && let Command::Request(request) = command
     {
         crate::serve::spawn(&root, request, abs_out.as_deref());
     }
+    exit_status(status)
+}
+
+fn exit_status(status: i32) -> Result<()> {
     match status {
         0 => Ok(()),
-        status => std::process::exit(status),
+        code => std::process::exit(code),
     }
 }
 
@@ -391,7 +429,7 @@ fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     Ok(())
 }
 
-fn program_name(root: &std::path::Path) -> String {
+pub(crate) fn program_name(root: &std::path::Path) -> String {
     root.file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
@@ -401,7 +439,7 @@ pub(crate) fn load_workspace(
     root: &std::path::Path,
     targets: &Targets,
 ) -> Result<graph::Workspace> {
-    let mut workspace = graph::load(root, targets, crate::selection())?;
+    let mut workspace = graph::load(root, targets, &crate::selection())?;
     workspace.merge(graph::load_sysroot(&graph::library()?, targets)?);
     crate::scripts::settle(&mut workspace, targets)?;
     Ok(workspace)
@@ -435,7 +473,7 @@ fn report(
     };
     let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
-        Command::Debug(Query::Graph) => graph::load(root, &targets, crate::selection())?,
+        Command::Debug(Query::Graph) => graph::load(root, &targets, &crate::selection())?,
         _ => load_workspace(root, &targets)?,
     };
     let graph_span = graph_clock.elapsed();
@@ -448,7 +486,10 @@ fn report(
             stats_json.map(|path| (path, graph_span)),
             out,
         )?,
-        Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
+        Command::Serve(ServeAction::Run) => {
+            crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?
+        }
+        Command::Serve(_) => 0,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
         Command::Clean => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,

@@ -1,13 +1,14 @@
 mod bind;
 mod calls;
 mod checks;
+mod diag;
 mod expr;
 mod flow;
 mod liveness;
 mod places;
 mod propagate;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::body::{BlockKind, Body, Expr, ExprId, Pat, PatId};
@@ -20,13 +21,13 @@ use super::infer::Typed;
 use super::ty::{Kind, Mut, Ty};
 
 use places::{PlaceStep, steps_conflict};
-use propagate::BorrowSource;
+use propagate::{BorrowSource, TupleSources};
 
 const TEMP_HOLDER_BASE: u32 = u32::MAX - 65_536;
 const ITER_HOLDER_BASE: u32 = TEMP_HOLDER_BASE - 65_536;
 pub(super) const STMT_TEMP_OFFSET: u32 = 10_000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(super) struct Loan {
     target: u32,
     steps: Vec<PlaceStep>,
@@ -35,22 +36,103 @@ pub(super) struct Loan {
     through_ref: bool,
     two_phase: bool,
     env_only: bool,
+    origin_only: bool,
+    site: Option<ExprId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl PartialEq for Loan {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            target,
+            steps,
+            holder,
+            mutable,
+            through_ref,
+            two_phase,
+            env_only,
+            origin_only,
+            site: _,
+        } = self;
+        *target == other.target
+            && *steps == other.steps
+            && *holder == other.holder
+            && *mutable == other.mutable
+            && *through_ref == other.through_ref
+            && *two_phase == other.two_phase
+            && *env_only == other.env_only
+            && *origin_only == other.origin_only
+    }
+}
+
+impl Eq for Loan {}
+
+#[derive(Clone, Debug)]
 struct PartialMove {
     local: u32,
     steps: Vec<PlaceStep>,
+    site: Option<ExprId>,
 }
+
+impl PartialEq for PartialMove {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            local,
+            steps,
+            site: _,
+        } = self;
+        *local == other.local && *steps == other.steps
+    }
+}
+
+impl Eq for PartialMove {}
 
 #[derive(Clone, Debug)]
 struct State {
     init: Vec<bool>,
     maybe_init: Vec<bool>,
     moved: Vec<bool>,
+    moved_at: Vec<Option<ExprId>>,
     partial_moves: Vec<PartialMove>,
     loans: Vec<Loan>,
+    tuple_elem_sources: HashMap<u32, TupleSources>,
     diverged: bool,
+}
+
+impl State {
+    fn new(init: Vec<bool>) -> Self {
+        let n = init.len();
+        Self {
+            maybe_init: init.clone(),
+            init,
+            moved: vec![false; n],
+            moved_at: vec![None; n],
+            partial_moves: Vec::new(),
+            loans: Vec::new(),
+            tuple_elem_sources: HashMap::default(),
+            diverged: false,
+        }
+    }
+
+    pub(super) fn for_closure(outer: &Self) -> Self {
+        Self {
+            init: outer.init.clone(),
+            maybe_init: outer.maybe_init.clone(),
+            moved: outer.moved.clone(),
+            moved_at: outer.moved_at.clone(),
+            partial_moves: outer.partial_moves.clone(),
+            loans: Vec::new(),
+            tuple_elem_sources: HashMap::default(),
+            diverged: false,
+        }
+    }
+
+    pub(super) fn set_tuple_sources(&mut self, local: u32, srcs: Option<TupleSources>) {
+        if let Some(ts) = srcs {
+            self.tuple_elem_sources.insert(local, ts);
+        } else {
+            self.tuple_elem_sources.remove(&local);
+        }
+    }
 }
 
 struct BreakFrame {
@@ -58,6 +140,12 @@ struct BreakFrame {
     is_block: bool,
     depth: u32,
     states: Vec<State>,
+    sources: Vec<BorrowSource>,
+}
+
+struct ActiveClosure {
+    params: Vec<u32>,
+    ret_params: Vec<usize>,
 }
 
 struct Checker<'c, 'a> {
@@ -73,11 +161,14 @@ struct Checker<'c, 'a> {
     names: Vec<Option<String>>,
     no_move_captures: Vec<(u32, Vec<PlaceStep>)>,
     returns_borrow: bool,
+    returns_only_static: bool,
+    param_lts: calls::ParamLifetimes<'c>,
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
     unsafe_depth: u32,
     closure_by_val_caps: Vec<u32>,
+    active_closures: Vec<ActiveClosure>,
     stmt_depth: u32,
     temp_scope_depth: u32,
     breaks: Vec<BreakFrame>,
@@ -85,8 +176,11 @@ struct Checker<'c, 'a> {
     let_extend_depth: Option<u32>,
     temp_sources: HashMap<ExprId, Vec<BorrowSource>>,
     closure_effects: HashMap<ExprId, checks::ClosureEffects>,
+    closure_param_origins: HashMap<u32, Vec<BorrowSource>>,
     drop_cache: HashMap<Ty, bool>,
     drop_locals: HashSet<u32>,
+    current_expr: Option<ExprId>,
+    current_pat: Option<PatId>,
 }
 
 /// Whether `ty` is `Copy` in `item`, resolving closures declared inside `typed` directly and defaulting conservatively to `false`.
@@ -202,6 +296,13 @@ pub(super) fn check(
             }
         }
     }
+    let returns_only_static = !sig.is_async
+        && sig.ret.is_some_and(|ret_ast| {
+            let mut ret_lts = calls::Lifetimes::default();
+            calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
+            calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts)
+        });
+    let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
     let mut checker = Checker {
         cx,
         item,
@@ -215,11 +316,14 @@ pub(super) fn check(
         names,
         no_move_captures: Vec::new(),
         returns_borrow: false,
+        returns_only_static,
+        param_lts,
         return_min_depth: 1,
         closure_depth: 0,
         const_depth: 0,
         unsafe_depth: u32::from(sig.is_unsafe),
         closure_by_val_caps: Vec::new(),
+        active_closures: Vec::new(),
         stmt_depth: 1,
         temp_scope_depth: 1,
         breaks: Vec::new(),
@@ -227,26 +331,29 @@ pub(super) fn check(
         let_extend_depth: None,
         temp_sources: HashMap::default(),
         closure_effects: HashMap::default(),
+        closure_param_origins: HashMap::default(),
         drop_cache: HashMap::default(),
         drop_locals: HashSet::default(),
+        current_expr: None,
+        current_pat: None,
     };
     for (idx, local) in typed.locals.iter().enumerate() {
-        if local.ty != Ty::NONE
-            && checker.ty_holds_borrow(local.ty)
-            && checker.ty_has_borrow_drop(local.ty)
-        {
-            checker.drop_locals.insert(idx as u32);
+        if local.ty != Ty::NONE {
+            if checker.ty_holds_borrow(local.ty) && checker.ty_has_borrow_drop(local.ty) {
+                checker.drop_locals.insert(idx as u32);
+            }
+            if checker.is_param.get(idx).copied().unwrap_or(false)
+                && let Kind::Ref(_, inner) = *checker.cx.types.kind(local.ty)
+                && !checker.ty_holds_borrow(inner)
+                && !checker.param_lts.inner_has_elided_lt[idx]
+                && checker.param_lts.inner_named_lts[idx].is_empty()
+            {
+                checker.param_lts.inner_is_static[idx] = true;
+            }
         }
     }
     checker.returns_borrow = typed.ret.is_some_and(|ty| checker.ty_holds_borrow(ty));
-    let mut state = State {
-        maybe_init: init.clone(),
-        init,
-        moved: vec![false; n],
-        partial_moves: Vec::new(),
-        loans: Vec::new(),
-        diverged: false,
-    };
+    let mut state = State::new(init);
     let param_offset = usize::from(sig.receiver.is_some());
     for (idx, &pat) in body.fn_params.iter().enumerate() {
         let fallback = typed
@@ -304,7 +411,7 @@ fn collect_pat_meta_for_local(
 }
 
 fn loan_conflicts_borrow(l: &Loan, local: u32, steps: &[PlaceStep]) -> bool {
-    l.target == local && steps_conflict(&l.steps, steps)
+    !l.origin_only && l.target == local && steps_conflict(&l.steps, steps)
 }
 
 fn loan_conflicts_assign(
@@ -314,7 +421,7 @@ fn loan_conflicts_assign(
     steps: &[PlaceStep],
     is_ref_local: bool,
 ) -> bool {
-    if l.target != local {
+    if l.origin_only || l.target != local {
         return false;
     }
     if !through_ref
@@ -340,12 +447,28 @@ fn prune_moved_loans(state: &mut State) {
 }
 
 fn prune_dead_loans(state: &mut State, live: &HashSet<u32>) {
-    if !state.loans.is_empty() {
-        state.loans.retain(|l| {
-            l.holder
-                .is_none_or(|h| is_temp_holder(Some(h)) || live.contains(&h))
-        });
+    if state.loans.is_empty() {
+        return;
     }
+    let mut keep = live.clone();
+    loop {
+        let mut grew = false;
+        for l in &state.loans {
+            if l.holder
+                .is_none_or(|h| is_temp_holder(Some(h)) || keep.contains(&h))
+                && keep.insert(l.target)
+            {
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    state.loans.retain(|l| {
+        l.holder
+            .is_none_or(|h| is_temp_holder(Some(h)) || keep.contains(&h))
+    });
 }
 
 impl Checker<'_, '_> {
@@ -389,7 +512,32 @@ impl Checker<'_, '_> {
             mutable: self.is_mut_ref_ty(ty),
             through_ref: self.ty_holds_borrow(ty),
             env_only: false,
+            origin_only: true,
         }
+    }
+
+    pub(super) fn is_active_closure_param(&self, local: u32) -> bool {
+        self.active_closures
+            .iter()
+            .any(|c| c.params.contains(&local))
+    }
+
+    pub(super) fn is_non_static_param(&self, local: u32) -> bool {
+        self.is_param.get(local as usize).copied().unwrap_or(false)
+            && !self
+                .param_lts
+                .is_static
+                .get(local as usize)
+                .copied()
+                .unwrap_or(false)
+    }
+
+    pub(super) fn param_inner_is_static(&self, local: u32) -> bool {
+        self.param_lts
+            .inner_is_static
+            .get(local as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     fn is_escaping_return(&self, src: &BorrowSource) -> bool {
@@ -431,12 +579,33 @@ impl Checker<'_, '_> {
             return effective >= depth;
         }
         !self.from_caller(target, through_ref)
-            && !(through_ref && self.is_ref_ty(self.local_ty(target)))
+            && !(through_ref
+                && (self.is_ref_ty(self.local_ty(target)) || self.is_closure_param(target)))
             && self.scope_depth.get(target as usize).copied().unwrap_or(0) >= depth
     }
 
-    pub(super) fn push_partial_move(&self, state: &mut State, local: u32, steps: Vec<PlaceStep>) {
-        let pm = PartialMove { local, steps };
+    pub(super) fn mark_local_moved(&self, state: &mut State, local: u32, site: Option<ExprId>) {
+        if let Some(slot) = state.moved.get_mut(local as usize) {
+            *slot = true;
+        }
+        if let Some(slot) = state.moved_at.get_mut(local as usize) {
+            *slot = site.or(self.current_expr);
+        }
+        state.partial_moves.retain(|m| m.local != local);
+    }
+
+    pub(super) fn push_partial_move(
+        &self,
+        state: &mut State,
+        local: u32,
+        steps: Vec<PlaceStep>,
+        site: Option<ExprId>,
+    ) {
+        let pm = PartialMove {
+            local,
+            steps,
+            site: site.or(self.current_expr),
+        };
         if !state.partial_moves.contains(&pm) {
             state.partial_moves.push(pm);
         }
@@ -448,10 +617,13 @@ impl Checker<'_, '_> {
                 mr = true;
             }
             if bs || (!mr && !self.is_static_mut(item)) {
-                bail!(
-                    "cannot borrow or assign to immutable static item `{}`",
-                    self.cx.name(item)
-                );
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "cannot borrow or assign to immutable static item `{}`",
+                        self.cx.name(item)
+                    ),
+                ));
             }
         }
         Ok(())
@@ -466,169 +638,20 @@ impl Checker<'_, '_> {
         self.bind_pat_param(pat, fallback, state)
     }
 
-    fn check_not_moved(&self, local: u32, steps: &[PlaceStep], state: &State) -> Result<()> {
-        if !state.init.get(local as usize).copied().unwrap_or(true)
-            || state.moved.get(local as usize).copied().unwrap_or(false)
-            || state
-                .partial_moves
-                .iter()
-                .any(|m| m.local == local && steps_conflict(&m.steps, steps))
-        {
-            bail!(
-                "use of moved or uninitialized value `{}`",
-                self.local_name(local)
-            );
-        }
-        Ok(())
-    }
-
-    fn check_can_read(&self, local: u32, steps: &[PlaceStep], state: &State) -> Result<()> {
-        self.check_can_read_inner(local, steps, state, false)
-    }
-
-    fn check_can_read_inner(
-        &self,
-        local: u32,
-        steps: &[PlaceStep],
-        state: &State,
-        allow_shared: bool,
-    ) -> Result<()> {
-        self.check_not_moved(local, steps, state)?;
-        if state.loans.iter().any(|l| {
-            loan_conflicts_borrow(l, local, steps) && l.mutable && (allow_shared || !l.two_phase)
-        }) {
-            bail!(
-                "cannot use `{}` because it was mutably borrowed",
-                self.local_name(local)
-            );
-        }
-        Ok(())
-    }
-
-    fn check_can_move(&self, local: u32, steps: &[PlaceStep], state: &State) -> Result<()> {
-        self.check_not_moved(local, steps, state)?;
-        if self
-            .no_move_captures
-            .iter()
-            .any(|(l, s)| *l == local && steps_conflict(s, steps))
-        {
-            bail!(
-                "cannot move out of `{}` in a captured closure",
-                self.local_name(local)
-            );
-        }
-        if state
-            .loans
-            .iter()
-            .any(|l| loan_conflicts_borrow(l, local, steps))
-        {
-            bail!(
-                "cannot move out of `{}` because it is borrowed",
-                self.local_name(local)
-            );
-        }
-        Ok(())
-    }
-
-    fn check_can_mutate(
-        &self,
-        local: u32,
-        through_ref: bool,
-        mut_ref_root: bool,
-        behind_shared: bool,
-        steps: &[PlaceStep],
-        state: &State,
-        init_ok: bool,
-    ) -> Result<()> {
-        if behind_shared {
-            bail!("cannot assign to data in a `&` reference or `*const` pointer");
-        }
-        if !mut_ref_root
-            && !self.mutable.get(local as usize).copied().unwrap_or(true)
-            && !(init_ok
-                && !state
-                    .maybe_init
-                    .get(local as usize)
-                    .copied()
-                    .unwrap_or(true))
-        {
-            bail!(
-                "cannot assign to immutable variable `{}`",
-                self.local_name(local)
-            );
-        }
-        let is_ref_local = self.is_ref_ty(self.local_ty(local));
-        if state
-            .loans
-            .iter()
-            .any(|l| loan_conflicts_assign(l, local, through_ref, steps, is_ref_local))
-        {
-            bail!(
-                "cannot assign to `{}` because it is borrowed",
-                self.local_name(local)
-            );
-        }
-        Ok(())
-    }
-
-    fn check_borrow(
-        &self,
-        local: u32,
-        _through_ref: bool,
-        mut_ref_root: bool,
-        steps: &[PlaceStep],
-        mutable: bool,
-        state: &State,
-    ) -> Result<()> {
-        self.check_not_moved(local, steps, state)?;
-        if mutable && !mut_ref_root && !self.mutable.get(local as usize).copied().unwrap_or(true) {
-            bail!(
-                "cannot borrow `{}` as mutable, as it is not declared as mutable",
-                self.local_name(local)
-            );
-        }
-        if mutable
-            && state
-                .loans
-                .iter()
-                .any(|l| loan_conflicts_borrow(l, local, steps) && l.mutable)
-        {
-            bail!(
-                "cannot borrow `{}` as mutable more than once at a time",
-                self.local_name(local)
-            );
-        }
-        if mutable
-            && state
-                .loans
-                .iter()
-                .any(|l| loan_conflicts_borrow(l, local, steps))
-        {
-            bail!(
-                "cannot borrow `{}` as mutable because it is also borrowed as immutable",
-                self.local_name(local)
-            );
-        }
-        if !mutable
-            && state
-                .loans
-                .iter()
-                .any(|l| loan_conflicts_borrow(l, local, steps) && l.mutable && !l.two_phase)
-        {
-            bail!(
-                "cannot borrow `{}` as immutable because it is also borrowed as mutable",
-                self.local_name(local)
-            );
-        }
-        Ok(())
-    }
-
     fn check_return_escape(&mut self, expr: ExprId, state: &State) -> Result<()> {
+        let had_cached = if let Some(cached) = self.temp_sources.get(&expr).cloned() {
+            let site = self.return_diag_site(expr);
+            self.check_return_sources(site, &cached)?;
+            true
+        } else {
+            false
+        };
         match *self.body.expr(expr) {
             Expr::Block {
                 kind: BlockKind::Const,
                 ..
             } => Ok(()),
+            Expr::Loop { .. } | Expr::Block { tail: None, .. } if had_cached => Ok(()),
             Expr::Paren(inner)
             | Expr::Block {
                 tail: Some(inner), ..
@@ -647,17 +670,58 @@ impl Checker<'_, '_> {
                 Ok(())
             }
             _ => {
-                for src in self.expr_borrow_sources(expr, state) {
-                    if self.is_escaping_return(&src) {
-                        bail!(
-                            "cannot return value referencing local variable `{}`",
-                            self.local_name(src.target)
-                        );
-                    }
-                }
-                Ok(())
+                let sources = self.expr_borrow_sources(expr, state);
+                self.check_return_sources(expr, &sources)
             }
         }
+    }
+
+    fn return_diag_site(&self, mut expr: ExprId) -> ExprId {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner)
+                | Expr::Block {
+                    tail: Some(inner), ..
+                } => expr = inner,
+                _ => return expr,
+            }
+        }
+    }
+
+    fn check_return_sources(&mut self, expr: ExprId, sources: &[BorrowSource]) -> Result<()> {
+        if let Some(active) = self.active_closures.last_mut() {
+            for src in sources {
+                if let Some(idx) = active.params.iter().position(|&p| p == src.target)
+                    && !active.ret_params.contains(&idx)
+                {
+                    active.ret_params.push(idx);
+                }
+            }
+        }
+        for src in sources {
+            if self.is_escaping_return(src) {
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "cannot return value referencing local variable `{}`",
+                        self.local_name(src.target)
+                    ),
+                ));
+            }
+            if self.closure_depth == 0
+                && self.returns_only_static
+                && self.is_non_static_param(src.target)
+            {
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "borrowed data `{}` escapes outside of function: return type requires `'static` lifetime",
+                        self.local_name(src.target)
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_block_escape(
@@ -672,7 +736,7 @@ impl Checker<'_, '_> {
                 && outer_live.contains(&holder)
                 && self.escapes_depth(l.target, l.through_ref, block_depth)
             {
-                bail!("`{}` does not live long enough", self.local_name(l.target));
+                return Err(self.does_not_live_long_enough(l.site, l.target));
             }
         }
         Ok(())
@@ -689,6 +753,11 @@ fn join_moved(dst: &mut State, other: &State) {
     for (d, &o) in dst.moved.iter_mut().zip(&other.moved) {
         *d |= o;
     }
+    for (d, &o) in dst.moved_at.iter_mut().zip(&other.moved_at) {
+        if d.is_none() {
+            *d = o;
+        }
+    }
     for pm in &other.partial_moves {
         if !dst.partial_moves.contains(pm) {
             dst.partial_moves.push(pm.clone());
@@ -703,6 +772,8 @@ fn merge_states(dst: &mut State, other: &State) {
             dst.loans.push(l.clone());
         }
     }
+    dst.tuple_elem_sources
+        .retain(|k, ts| other.tuple_elem_sources.get(k).is_some_and(|o| ts.merge(o)));
 }
 
 fn merge_branch(out: &mut State, a: &State, b: &State) {

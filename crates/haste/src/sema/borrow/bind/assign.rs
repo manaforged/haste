@@ -1,11 +1,11 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::{Expr, ExprId};
 
 use super::super::places::{Place, PlaceStep, steps_conflict};
 use super::super::propagate::BorrowSource;
-use super::super::{Checker, State};
+use super::super::{Checker, Loan, State};
 use super::{push_loan, reset_local_binding};
 
 impl Checker<'_, '_> {
@@ -18,7 +18,7 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<()> {
         if self.place_behind_shared_ref(lhs) {
-            bail!("cannot assign to data in a `&` reference");
+            return Err(self.borrow_err(Some(lhs), "cannot assign to data in a `&` reference"));
         }
         self.check_static_mut(lhs, false)?;
         match *self.body.expr(lhs) {
@@ -91,6 +91,7 @@ impl Checker<'_, '_> {
             union_prefix.is_empty(),
         )?;
         self.check_assign_escape(&p, sources, state)?;
+        state.set_tuple_sources(p.local, None);
         if !p.through_ref && !p.through_deref && (p.local as usize) < state.init.len() {
             if union_prefix.is_empty() {
                 reset_local_binding(p.local, true, state);
@@ -101,7 +102,7 @@ impl Checker<'_, '_> {
                     })
                     .cloned()
                     .collect();
-                self.push_sources_for_local(p.local, &rebound, state);
+                self.push_sources_for_local(p.local, &rebound, self.current_expr, state);
             } else {
                 if !state.init[p.local as usize]
                     || state.moved[p.local as usize]
@@ -111,15 +112,21 @@ impl Checker<'_, '_> {
                             && union_prefix.starts_with(&m.steps)
                     })
                 {
-                    bail!(
-                        "assign to part of moved or uninitialized value `{}`",
-                        self.local_name(p.local)
-                    );
+                    return Err(self.borrow_err(
+                        Some(lhs),
+                        format!(
+                            "assign to part of moved or uninitialized value `{}`",
+                            self.local_name(p.local)
+                        ),
+                    ));
                 }
                 state
                     .partial_moves
                     .retain(|m| !(m.local == p.local && steps_conflict(&m.steps, union_prefix)));
+                self.push_sources_for_local(p.local, sources, self.current_expr, state);
             }
+        } else if !p.through_ref && (p.local as usize) < state.init.len() {
+            self.push_sources_for_local(p.local, sources, self.current_expr, state);
         }
         Ok(())
     }
@@ -139,7 +146,10 @@ impl Checker<'_, '_> {
             self.apply_deref_steps(lhs, self.expr_ty(base), autoderefs, &mut bp);
         }
         if bp.behind_shared {
-            bail!("cannot borrow data in a `&` reference or `*const` pointer as mutable");
+            return Err(self.borrow_err(
+                Some(lhs),
+                "cannot borrow data in a `&` reference or `*const` pointer as mutable",
+            ));
         }
         let tid = self.next_temp_holder();
         if let Some(prefix_len) = bp.raw_ptr_prefix {
@@ -155,13 +165,14 @@ impl Checker<'_, '_> {
             )?;
             push_loan(
                 &mut state.loans,
-                bp.local,
-                bp.steps,
-                Some(tid),
-                true,
-                bp.through_ref,
-                false,
-                false,
+                Loan::new(
+                    bp.local,
+                    bp.steps,
+                    Some(tid),
+                    true,
+                    bp.through_ref,
+                    Some(lhs),
+                ),
             );
         }
         Ok(Some(tid))

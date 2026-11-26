@@ -13,6 +13,8 @@ mod patch;
 mod pe;
 mod plan;
 mod shims;
+#[cfg(test)]
+mod tests;
 mod tls;
 mod unwind;
 mod wide;
@@ -214,7 +216,6 @@ impl Executable {
             (Format::Elf, Arch::X64 | Arch::Arm64) => elf::emit(self, (lang_start, user_main)),
             (Format::MachO, Arch::X64 | Arch::Arm64) => macho::emit(self, (lang_start, user_main)),
             (Format::Pe, Arch::X64 | Arch::Arm64) => pe::emit(self, (lang_start, user_main)),
-            (format, arch) => bail!("AOT emission does not support {format:?} on {arch:?}"),
         }
     }
 

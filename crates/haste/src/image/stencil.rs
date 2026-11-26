@@ -24,9 +24,9 @@ pub const DICT_MIN_BYTES: usize = 512;
 /// Minimum distinct relocation vectors before sharing a dictionary body.
 pub const DICT_MIN_FANOUT: usize = 8;
 
-/// Whether `HASTE_VERIFY_STENCIL=1` asks for stencil instantiations to be checked against concrete lowering.
+/// Whether `HASTE_VERIFY_STENCIL` asks for stencil instantiations to be checked against concrete lowering.
 pub fn verify_stencil() -> bool {
-    std::env::var_os("HASTE_VERIFY_STENCIL").is_some_and(|v| v == "1")
+    crate::with_cfg(|c| c.verify_stencil)
 }
 
 const DEFAULT_TIER_UP: u32 = 64;

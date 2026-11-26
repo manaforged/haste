@@ -566,6 +566,43 @@ impl<'a> Paths<'a> {
         Some(def)
     }
 
+    /// Resolves every segment of `path` in the type namespace from `at`, returning `Err(segment)` when a module member is private to `at`.
+    pub fn resolve_visible(&self, path: &Path<'_>, at: ModRef) -> Result<Option<Def>, Sym> {
+        let Some((first, rest)) = path.segments.split_first() else {
+            return Ok(None);
+        };
+        let Some(first_binding) = self.first(*first, at, path).types else {
+            return Ok(None);
+        };
+        let mut def = first_binding.def;
+        for segment in rest {
+            match (*segment, def) {
+                (SUPER, Def::Module(current)) => {
+                    let Some(parent) = self.parent(current) else {
+                        return Ok(None);
+                    };
+                    def = Def::Module(parent);
+                }
+                (_, Def::Module(current)) => {
+                    let Some(binding) = self.member(def, *segment).types else {
+                        return Ok(None);
+                    };
+                    if !super::resolve::visible(self, binding.vis, current, at) {
+                        return Err(*segment);
+                    }
+                    def = binding.def;
+                }
+                _ => {
+                    let Some(binding) = self.member(def, *segment).types else {
+                        return Ok(None);
+                    };
+                    def = binding.def;
+                }
+            }
+        }
+        Ok(Some(def))
+    }
+
     fn first_guarded(
         &self,
         word: Sym,
@@ -634,6 +671,16 @@ impl<'a> Paths<'a> {
         for segment in rest {
             match (*segment, def) {
                 (SUPER, Def::Module(current)) => def = Def::Module(self.parent(current)?),
+                (_, Def::Module(current)) => {
+                    let binding = self.member(def, *segment).types?;
+                    if !super::resolve::visible(self, binding.vis, current, at) {
+                        return None;
+                    }
+                    if binding.origin == Origin::Glob {
+                        guard = ImportGuard::None;
+                    }
+                    def = binding.def;
+                }
                 _ => {
                     let binding = self.member(def, *segment).types?;
                     if binding.origin == Origin::Glob {

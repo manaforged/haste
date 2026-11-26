@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
@@ -41,6 +41,7 @@ impl Checker<'_, '_> {
                 is_block: true,
                 depth: block_depth,
                 states: Vec::new(),
+                sources: Vec::new(),
             });
         }
         let ids: Vec<u32> = self.body.list(stmts).to_vec();
@@ -86,11 +87,19 @@ impl Checker<'_, '_> {
         }
         if label.is_some()
             && let Some(frame) = self.breaks.pop()
-            && !frame.states.is_empty()
-            && let Some(acc) =
-                merge_break_states((!state.diverged).then(|| state.clone()), frame.states)
         {
-            *state = acc;
+            if !frame.sources.is_empty() && !is_const {
+                let mut merged = self.temp_sources.remove(&expr_id).unwrap_or_default();
+                merged.extend(frame.sources);
+                self.temp_sources
+                    .insert(expr_id, super::propagate::dedup_sources(merged));
+            }
+            if !frame.states.is_empty()
+                && let Some(acc) =
+                    merge_break_states((!state.diverged).then(|| state.clone()), frame.states)
+            {
+                *state = acc;
+            }
         }
         Ok(())
     }
@@ -109,10 +118,13 @@ impl Checker<'_, '_> {
                 .get(loc as usize)
                 .is_some_and(|&d| d < block_depth)
         }) {
-            bail!(
-                "attempt to use a non-constant value `{}` in a constant",
-                self.local_name(bad)
-            );
+            return Err(self.const_err(
+                None,
+                format!(
+                    "attempt to use a non-constant value `{}` in a constant",
+                    self.local_name(bad)
+                ),
+            ));
         }
         Ok(())
     }
@@ -265,10 +277,7 @@ impl Checker<'_, '_> {
             let tail_srcs = self.expr_borrow_sources_let(tail, state);
             for src in &tail_srcs {
                 if self.escapes_depth(src.target, src.through_ref, block_depth) {
-                    bail!(
-                        "`{}` does not live long enough",
-                        self.local_name(src.target)
-                    );
+                    return Err(self.does_not_live_long_enough(Some(tail), src.target));
                 }
             }
             if !tail_srcs.is_empty() && !is_const {
@@ -479,13 +488,14 @@ impl Checker<'_, '_> {
                     let id = self.next_temp_holder();
                     push_loan(
                         &mut arm_state.loans,
-                        p.local,
-                        p.steps.clone(),
-                        Some(id),
-                        false,
-                        p.through_ref,
-                        false,
-                        false,
+                        Loan::new(
+                            p.local,
+                            p.steps.clone(),
+                            Some(id),
+                            false,
+                            p.through_ref,
+                            Some(scrut),
+                        ),
                     );
                     Some(id)
                 } else {
@@ -547,7 +557,7 @@ impl Checker<'_, '_> {
                 if value_used {
                     for s in self.expr_borrow_sources_let(arm.body, &arm_state) {
                         if self.escapes_depth(s.target, s.through_ref, arm_depth) {
-                            bail!("`{}` does not live long enough", self.local_name(s.target));
+                            return Err(self.does_not_live_long_enough(Some(arm.body), s.target));
                         }
                         if !out_sources.contains(&s) {
                             out_sources.push(s);
@@ -586,7 +596,7 @@ impl Checker<'_, '_> {
             return None;
         }
         let id = self.next_temp_holder();
-        push_source_loans(&mut state.loans, Some(id), &sources);
+        push_source_loans(&mut state.loans, Some(id), &sources, Some(expr));
         Some(id)
     }
 
@@ -612,7 +622,7 @@ impl Checker<'_, '_> {
             None
         } else {
             let id = self.next_iter_holder();
-            push_source_loans(&mut state.loans, Some(id), &iter_sources);
+            push_source_loans(&mut state.loans, Some(id), &iter_sources, Some(iter));
             Some(id)
         };
         let item_sources: Vec<BorrowSource> = iter_sources
@@ -621,6 +631,7 @@ impl Checker<'_, '_> {
             .cloned()
             .collect();
         self.check_loop(
+            None,
             label,
             None,
             Some((pat, &item_sources)),
@@ -638,6 +649,7 @@ impl Checker<'_, '_> {
 
     pub(super) fn check_loop(
         &mut self,
+        expr_id: Option<ExprId>,
         label: Option<u32>,
         cond: Option<ExprId>,
         pat: Option<(PatId, &[BorrowSource])>,
@@ -673,6 +685,7 @@ impl Checker<'_, '_> {
             is_block: false,
             depth: loop_depth,
             states: Vec::new(),
+            sources: Vec::new(),
         });
         let mut iter_state = state.clone();
         self.with_let_extend(None, |this| -> Result<()> {
@@ -706,7 +719,7 @@ impl Checker<'_, '_> {
                 for id in drop_temps {
                     iter_state.loans.retain(|l| l.holder != Some(id));
                 }
-                retain_non_loop_loans(&mut iter_state.loans, &loop_locals);
+                retain_non_loop_state(&mut iter_state, &loop_locals);
                 if iter_state.diverged {
                     break;
                 }
@@ -715,6 +728,13 @@ impl Checker<'_, '_> {
             Ok(())
         })?;
         let frame = self.breaks.pop().expect("loop pushed break frame");
+        if let Some(id) = expr_id
+            && !frame.sources.is_empty()
+            && self.const_depth == 0
+        {
+            self.temp_sources
+                .insert(id, super::propagate::dedup_sources(frame.sources));
+        }
         if infinite {
             match merge_break_states(None, frame.states) {
                 Some(acc) => *state = acc,
@@ -728,14 +748,17 @@ impl Checker<'_, '_> {
                 merge_states(state, &bs);
             }
         }
-        retain_non_loop_loans(&mut state.loans, &loop_locals);
+        retain_non_loop_state(state, &loop_locals);
         Ok(())
     }
 }
 
-fn retain_non_loop_loans(loans: &mut Vec<Loan>, loop_locals: &HashSet<u32>) {
+fn retain_non_loop_state(state: &mut State, loop_locals: &HashSet<u32>) {
     let keep = |h| is_temp_holder(Some(h)) || !loop_locals.contains(&h);
-    loans.retain(|l| l.holder.is_none_or(keep));
+    state.loans.retain(|l| l.holder.is_none_or(keep));
+    state
+        .tuple_elem_sources
+        .retain(|k, _| !loop_locals.contains(k));
 }
 
 fn merge_break_states(mut merged: Option<State>, states: Vec<State>) -> Option<State> {

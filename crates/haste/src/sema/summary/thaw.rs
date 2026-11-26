@@ -82,7 +82,7 @@ pub(in crate::sema) fn warm_body(
         && let Err(err) = cx.body(item)
         && cx.quiet_mark() != before
     {
-        return Err(format!("{}: {err:#}", cx.name(item)));
+        return Err(crate::diag::format_error(cx.name(item), &err));
     }
     Ok(())
 }
