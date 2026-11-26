@@ -91,14 +91,18 @@ pub(crate) fn test_items(
         .filter(|(item_ref, tree, file, item)| {
             if has_target_filter {
                 let root = &outline.roots[item_ref.krate as usize];
-                let matches_lib = sel.lib && root.role == outline::Role::Lib;
+                let pkg = &workspace.packages[workspace.graph.units[root.unit].package];
+                let is_lib_root = root.role == outline::Role::Lib
+                    || (root.role == outline::Role::Test
+                        && pkg.manifest.lib.as_deref() == Some(root.path.as_path()));
+                let matches_lib = sel.lib && is_lib_root;
                 let matches_bins = sel.bins && root.role == outline::Role::Bin;
                 let matches_bin = bin_name
                     .as_deref()
                     .is_some_and(|n| root.role == outline::Role::Bin && root.name == n);
-                let matches_test = test_name
-                    .as_deref()
-                    .is_some_and(|n| root.role == outline::Role::Test && root.name == n);
+                let matches_test = test_name.as_deref().is_some_and(|n| {
+                    root.role == outline::Role::Test && !is_lib_root && root.name == n
+                });
                 if !(matches_lib || matches_bins || matches_bin || matches_test) {
                     return false;
                 }

@@ -38,7 +38,7 @@ haste --release build -o ./haste-demo-bin haste-demo
 ./haste-demo-bin
 ```
 
-If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` automatically. If locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless `CARGO_NET_OFFLINE=true` or `[net] offline = true` is set. Dependency lookup matches `Cargo.lock` `source` URLs against `.cargo/config.toml` `[source.*]` / `replace-with` entries, honors `cargo vendor` offline, and verifies `.cargo-checksum.json` hashes when present.
+If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` automatically. If locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless `CARGO_NET_OFFLINE=true` or `[net] offline = true` is set. Dependency lookup matches `Cargo.lock` `source` URLs against `.cargo/config.toml` `[source.*]` / `replace-with` entries, honors `cargo vendor` offline, and verifies `.cargo-checksum.json` package hashes when present.
 
 ### Incremental daemon
 
