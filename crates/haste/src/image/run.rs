@@ -33,6 +33,7 @@ impl Image {
         index: usize,
         start: Option<usize>,
         name: &str,
+        env: &[(String, String)],
     ) -> Result<(i32, String)> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
@@ -44,6 +45,10 @@ impl Image {
             bail!("{name} has no start wrapper (slot {s})");
         }
         let (pid, mut stderr_pipe) = fork_piped(|writer| {
+            for (key, value) in env {
+                // SAFETY: single-threaded forked child process before invoking test function.
+                unsafe { std::env::set_var(key, value) };
+            }
             crate::host::unwind::set_jit_unwind_head(self.unwind_head);
             let raw = std::os::fd::AsRawFd::as_raw_fd(&writer);
             if raw != libc::STDERR_FILENO {
@@ -80,6 +85,7 @@ impl Image {
         index: usize,
         start: Option<usize>,
         name: &str,
+        _env: &[(String, String)],
     ) -> Result<(i32, String)> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
@@ -105,17 +111,25 @@ impl Image {
         Ok((if panicked { 101 } else { 0 }, String::new()))
     }
 
-    /// Runs each `#[test]` function `(index, start_index, name)` in a forked child and returns each test's exit status (0 for pass, non-zero for panic/Err).
-    pub fn run_tests(&self, tests: &[(usize, Option<usize>, &str)]) -> Result<Vec<i32>> {
-        let pairs: Vec<(usize, &str)> = tests.iter().map(|&(idx, _, name)| (idx, name)).collect();
-        if let Some((_, Some(start), name)) = tests
-            .iter()
-            .find(|(_, start, _)| start.is_some_and(|s| self.slot(s).load(Ordering::Acquire) == 0))
-        {
+    /// Runs each `#[test]` function `(index, start_index, name, env)` in a forked child and returns each test's exit status (0 for pass, non-zero for panic/Err).
+    pub fn run_tests(
+        &self,
+        tests: &[(usize, Option<usize>, &str, &[(String, String)])],
+    ) -> Result<Vec<i32>> {
+        let pairs: Vec<(usize, &str)> =
+            tests.iter().map(|&(idx, _, name, _)| (idx, name)).collect();
+        if let Some((_, Some(start), name, _)) = tests.iter().find(|(_, start, _, _)| {
+            start.is_some_and(|s| self.slot(s).load(Ordering::Acquire) == 0)
+        }) {
             bail!("{name} has no start wrapper (slot {start})");
         }
-        let starts: Vec<Option<usize>> = tests.iter().map(|&(_, start, _)| start).collect();
+        let starts: Vec<Option<usize>> = tests.iter().map(|&(_, start, _, _)| start).collect();
+        let envs: Vec<&[(String, String)]> = tests.iter().map(|&(_, _, _, env)| env).collect();
         self.run_batch(&pairs, true, |pos, address, name| {
+            for (key, value) in envs[pos] {
+                // SAFETY: single-threaded forked child process before invoking test function.
+                unsafe { std::env::set_var(key, value) };
+            }
             if let Some(start) = starts[pos] {
                 let status = self.enter_main((start, pairs[pos].0), &[name.to_owned()]);
                 if status != 0 {

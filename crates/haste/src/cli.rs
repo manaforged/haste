@@ -454,6 +454,18 @@ fn report(
     out: Option<&std::path::Path>,
 ) -> Result<i32> {
     let started = Instant::now();
+    if let Some(path) = out {
+        if path.is_dir() {
+            anyhow::bail!("output path `{}` is a directory", path.display());
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory `{}`", parent.display()))?;
+        }
+    }
     if matches!(command, Command::Request(Request::Build))
         && crate::substrate::noop::active(stats_json)
         && let Some(reached) = crate::substrate::noop::try_hit(root, out)

@@ -48,11 +48,13 @@ impl BatchKind {
                 .map(|t| t.item)
                 .collect(),
             BatchKind::LibCheck => check_fn_items(workspace, outline, None),
-            BatchKind::MainCheck => check_fn_items(
-                workspace,
-                outline,
-                main_item(workspace, outline).map(|m| m.krate as usize),
-            ),
+            BatchKind::MainCheck => {
+                let sel = crate::selection();
+                let target = (sel.package.is_some() || sel.bin.is_some() || sel.example.is_some())
+                    .then(|| main_item(workspace, outline).map(|m| m.krate as usize))
+                    .flatten();
+                check_fn_items(workspace, outline, target)
+            }
             BatchKind::MainAot => main_items(workspace, outline),
         }
     }
@@ -471,6 +473,7 @@ impl Batch {
         );
         self.store = Some(cx.release().0);
         exe?.write(path)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     fn needs_member_recheck(&self) -> bool {

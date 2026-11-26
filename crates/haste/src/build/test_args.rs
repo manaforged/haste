@@ -13,6 +13,7 @@ pub(super) struct TestArgs<'a> {
     pub(super) filters: Vec<&'a str>,
     pub(super) skips: Vec<&'a str>,
     pub(super) exact: bool,
+    pub(super) list: bool,
     pub(super) ignored_only: bool,
     pub(super) include_ignored: bool,
 }
@@ -22,6 +23,7 @@ pub(super) fn parse_test_args(args: &[String]) -> TestArgs<'_> {
         filters: Vec::new(),
         skips: Vec::new(),
         exact: false,
+        list: false,
         ignored_only: false,
         include_ignored: false,
     };
@@ -31,6 +33,8 @@ pub(super) fn parse_test_args(args: &[String]) -> TestArgs<'_> {
             continue;
         } else if arg == "--exact" {
             parsed.exact = true;
+        } else if arg == "--list" {
+            parsed.list = true;
         } else if arg == "--ignored" {
             parsed.ignored_only = true;
         } else if arg == "--include-ignored" {

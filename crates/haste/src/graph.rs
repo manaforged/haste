@@ -423,8 +423,14 @@ fn load_filtered(
     (default_features, all_features): (bool, bool),
     (omit_root_deps, allow_fetch): (&[&str], bool),
 ) -> Result<Workspace> {
+    if !root.exists() {
+        bail!("path does not exist: {}", root.display());
+    }
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
-    let root = canonical.as_path();
+    let root = canonical
+        .ancestors()
+        .find(|dir| dir.join(MANIFEST_FILE).is_file())
+        .unwrap_or(canonical.as_path());
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
     let root_names = match package {
@@ -532,7 +538,14 @@ fn load_filtered(
 /// The standard library sources of the toolchain: `HASTE_LIBRARY`, the active `rustc` sysroot's `rust-src`, or the newest rustup toolchain with `rust-src` (preferring `stable-*`).
 pub fn library() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os(crate::LIBRARY_ENV) {
-        return Ok(PathBuf::from(dir));
+        let path = PathBuf::from(dir);
+        if !path.join("sysroot").is_dir() {
+            anyhow::bail!(
+                "HASTE_LIBRARY `{}` does not contain a `sysroot` directory (expected rust-src library dir)",
+                path.display()
+            );
+        }
+        return Ok(path);
     }
     let sysroot_library = |root: &Path| {
         let dir = root.join("lib/rustlib/src/rust/library");

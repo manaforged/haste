@@ -226,6 +226,18 @@ impl Batch {
                 name.contains(pat)
             }
         };
+        if args.list {
+            for ((_, name), (meta, _)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
+                if (!args.filters.is_empty() && !args.filters.iter().any(|f| matches(name, f)))
+                    || args.skips.iter().any(|s| matches(name, s))
+                    || (ignored_only && !meta.ignored)
+                {
+                    continue;
+                }
+                println!("{name}: test");
+            }
+            return Ok(0);
+        }
         let mut to_run = Vec::new();
         let mut errs: Vec<String> = Vec::new();
         let mut raw: Vec<(
@@ -264,7 +276,8 @@ impl Batch {
                 Some(Err(idx))
             } else {
                 if meta.expected.is_none() {
-                    to_run.push((root, *start, name.as_str()));
+                    let env = outline.crates[meta.item.krate as usize].env.vars.as_slice();
+                    to_run.push((root, *start, name.as_str(), env));
                 }
                 Some(Ok((root, *start)))
             };
@@ -274,17 +287,18 @@ impl Batch {
         let mut entries: Vec<(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)> =
             Vec::with_capacity(raw.len());
         for (name, meta, outcome) in raw {
+            let env = outline.crates[meta.item.krate as usize].env.vars.as_slice();
             let resolved = match outcome {
                 None => None,
                 Some(Err(idx)) => Some(Err(errs[idx].as_str())),
                 Some(Ok((root, start))) if meta.expected.is_some() => {
-                    let (status, stderr) = self.image.run_test_captured(root, start, name)?;
+                    let (status, stderr) = self.image.run_test_captured(root, start, name, env)?;
                     Some(Ok((status, Some(stderr))))
                 }
                 Some(Ok((root, start))) => match ran.next() {
                     Some(status) if status != 0 && !meta.should_panic => {
                         let (cap_status, stderr) =
-                            self.image.run_test_captured(root, start, name)?;
+                            self.image.run_test_captured(root, start, name, env)?;
                         Some(Ok((
                             if cap_status != 0 { cap_status } else { status },
                             Some(stderr),

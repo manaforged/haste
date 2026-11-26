@@ -216,6 +216,9 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
                 args.next();
                 opts.selection.all_features = true;
             }
+            "--workspace" => {
+                args.next();
+            }
             "--no-default-features" => {
                 args.next();
                 opts.selection.no_default_features = true;

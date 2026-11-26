@@ -21,11 +21,16 @@ use super::{Driver, Ended, Jit, Reread, entries, serve};
 pub struct Program {
     jit: Jit,
     entry: (usize, usize),
+    env: Vec<(String, String)>,
 }
 
 impl Program {
     /// The binary whose `main` is `main`, inferring on from `store`, with nothing compiled yet.
     pub fn new(compilation: &mut Compilation, store: Cache, main: ItemRef) -> Result<Program> {
+        let env = compilation.outline.crates[main.krate as usize]
+            .env
+            .vars
+            .clone();
         let (mut entries, store) = entries(compilation, (store, &[Some(main)]))?;
         let roots = entries
             .pop()
@@ -36,6 +41,7 @@ impl Program {
         Ok(Program {
             jit,
             entry: (start, main),
+            env,
         })
     }
 
@@ -67,6 +73,7 @@ impl Program {
         let mut run = Run {
             entry: self.entry,
             args,
+            env: &self.env,
             reread,
             status: None,
         };
@@ -108,6 +115,7 @@ impl Program {
 struct Run<'a, 'r> {
     entry: (usize, usize),
     args: &'a [String],
+    env: &'a [(String, String)],
     reread: Option<Reread<'r>>,
     status: Option<i32>,
 }
@@ -115,8 +123,14 @@ struct Run<'a, 'r> {
 impl Driver for Run<'_, '_> {
     fn start(&mut self, demand: &mut Jit) -> Result<()> {
         if self.status.is_none() && demand.children.is_empty() {
-            let (entry, args) = (self.entry, self.args);
-            demand.fork(false, |image, _| image.enter_main(entry, args))?;
+            let (entry, args, env) = (self.entry, self.args, self.env);
+            demand.fork(false, |image, _| {
+                for (key, value) in env {
+                    // SAFETY: single-threaded forked child process before invoking user `main`.
+                    unsafe { std::env::set_var(key, value) };
+                }
+                image.enter_main(entry, args)
+            })?;
         }
         Ok(())
     }
