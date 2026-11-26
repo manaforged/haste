@@ -13,6 +13,7 @@ use crate::outline::{self, tree::Profile};
 use crate::sema::{self, Cache, Edited};
 
 mod batch;
+mod json_diag;
 mod report;
 pub(crate) mod substrate;
 mod test_args;
@@ -115,7 +116,7 @@ fn check_and_print_member_items(
     if diags.is_empty() {
         return Ok(Ok(cache));
     }
-    report::print_formatted_diagnostics(&diags);
+    report::print_formatted_diagnostics(Some(&compilation.outline), &diags);
     Ok(Err(101))
 }
 
@@ -144,7 +145,7 @@ pub(crate) fn emit_early_json_error(err: &anyhow::Error) -> bool {
     }
     let text = format!("{err:#}");
     let diags = report::split_error_diagnostics(&text);
-    report::print_formatted_diagnostics(&diags);
+    report::print_formatted_diagnostics(None, &diags);
     crate::diag::print_build_finished(false);
     true
 }

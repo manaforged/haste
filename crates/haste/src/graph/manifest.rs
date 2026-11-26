@@ -306,6 +306,42 @@ pub fn read(dir: &Path, workspace: Option<&Table>) -> Result<Manifest> {
     manifest_of(dir, &root, workspace)
 }
 
+/// Reads the package manifest enclosing `file`, inheriting any `[workspace]` fields from an ancestor manifest.
+pub fn read_for_file(file: &Path) -> Option<Manifest> {
+    let abs = std::path::absolute(file).ok()?;
+    let norm = normalize(&abs);
+    let start = if norm.is_dir() {
+        norm.as_path()
+    } else {
+        norm.parent()?
+    };
+    let mut pkg_dir = None;
+    let mut ws_table = None;
+    for dir in start.ancestors() {
+        let candidate = dir.join(super::MANIFEST_FILE);
+        if !candidate.is_file() {
+            continue;
+        }
+        if pkg_dir.is_none()
+            && std::fs::read_to_string(&candidate)
+                .ok()
+                .and_then(|s| toml::from_str::<Table>(&s).ok())
+                .is_some_and(|t| t.contains_key("package"))
+        {
+            pkg_dir = Some(dir.to_path_buf());
+        }
+        if ws_table.is_none()
+            && let Ok(Some(ws)) = workspace_of(dir)
+        {
+            ws_table = Some(ws);
+            if pkg_dir.is_some() {
+                break;
+            }
+        }
+    }
+    read(&pkg_dir?, ws_table.as_ref()).ok()
+}
+
 /// Reads the `[workspace]` table of the manifest at `dir/Cargo.toml`, if it has one, with its dependency paths made absolute.
 pub fn workspace_of(dir: &Path) -> Result<Option<Table>> {
     let path = dir.join(super::MANIFEST_FILE);

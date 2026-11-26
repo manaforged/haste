@@ -35,6 +35,8 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                 name,
                 path,
                 role: Role::Lib,
+                edition: manifest.edition.clone(),
+                proc_macro: manifest.proc_macro,
             });
         }
         if needed.is_none() && workspace.graph.members.contains(&entry.package) {
@@ -43,6 +45,8 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                 name: name.clone(),
                 path: path.clone(),
                 role: Role::Bin,
+                edition: manifest.edition.clone(),
+                proc_macro: false,
             });
             roots.extend(bins);
             let sel = crate::selection();
@@ -56,6 +60,8 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                         name: name.clone(),
                         path: path.clone(),
                         role: Role::Example,
+                        edition: manifest.edition.clone(),
+                        proc_macro: false,
                     });
                 roots.extend(examples);
             }
@@ -65,6 +71,8 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                     name: name.clone(),
                     path: path.clone(),
                     role: Role::Bench,
+                    edition: manifest.edition.clone(),
+                    proc_macro: false,
                 });
                 roots.extend(benches);
             }
@@ -83,6 +91,8 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                         name: name.clone(),
                         path: path.clone(),
                         role: Role::Test,
+                        edition: manifest.edition.clone(),
+                        proc_macro: false,
                     });
                 roots.extend(tests);
             }
@@ -93,6 +103,8 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                 name: "build_script_build".to_owned(),
                 path: path.clone(),
                 role: Role::Script,
+                edition: manifest.edition.clone(),
+                proc_macro: false,
             });
         }
     }
@@ -254,6 +266,8 @@ pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outli
                         name: root.name.clone(),
                         path: root.path.clone(),
                         role: Role::Test,
+                        edition: root.edition.clone(),
+                        proc_macro: root.proc_macro,
                     },
                     deps[at].clone(),
                 )
