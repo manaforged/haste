@@ -1,12 +1,16 @@
 mod args;
+mod call_out;
 pub(super) mod closure;
+mod drop_ptr;
 mod types;
+mod variance;
+mod variance_ast;
 
 use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::body::sig::{Generic, Predicate, Signature};
-use crate::body::{Body, Bound, Expr, ExprId, List, Pat, PatId, UnOp};
+use crate::body::{Body, Bound, Expr, ExprId, List, Pat, PatId, TyId, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
@@ -17,12 +21,17 @@ use crate::sema::ty::{Kind, Ty};
 use super::bind::push_source_loans;
 use super::places::{FieldKey, Place, PlaceStep, push_step};
 use super::propagate::BorrowSource;
-use super::{Checker, PartialMove, State, is_temp_holder, loan_conflicts_borrow, merge_states};
+use super::{
+    Checker, PartialMove, State, is_temp_holder, loan_conflicts_borrow, merge_states,
+    prune_moved_loans,
+};
 
 pub(super) const TEMP_TARGET_BASE: u32 = u32::MAX - 262_144;
 
 pub(super) use closure::ClosureEffects;
 pub(in crate::sema) use types::is_copy_ty;
+pub(super) use variance::VarianceMeta;
+pub(super) use variance_ast::{InvariantLifetimes, collect_ast_invariant_lifetimes};
 
 fn trait_has_static_supertrait(
     cx: &mut Context<'_>,
@@ -225,6 +234,24 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
+    pub(super) fn finish_let_stmt(
+        &mut self,
+        pat: PatId,
+        ann_ty: Option<TyId>,
+        init: Option<ExprId>,
+        stmt_temp_depth: u32,
+        state: &mut State,
+        after_live: &HashSet<u32>,
+    ) -> Result<()> {
+        self.record_let_annotation(pat, ann_ty, init, state)?;
+        let mut bound = HashSet::default();
+        self.collect_pat_locals(pat, &mut bound);
+        let bound_vec: Vec<u32> = bound.into_iter().collect();
+        self.check_stmt_temp_escape(state, stmt_temp_depth, &bound_vec, after_live)?;
+        prune_moved_loans(state);
+        Ok(())
+    }
+
     pub(super) fn check_assign_escape(
         &mut self,
         p: &Place,
@@ -234,78 +261,39 @@ impl Checker<'_, '_> {
         if sources.is_empty() {
             return Ok(());
         }
+        let is_ptr = self.is_mut_ptr_ty(self.local_ty(p.local));
         let mut targets: Vec<u32> = if p.through_ref {
             state
                 .loans
                 .iter()
-                .filter(|l| l.holder == Some(p.local) && l.mutable)
+                .filter(|l| {
+                    l.holder == Some(p.local)
+                        && (l.mutable
+                            || is_ptr
+                            || self.ty_has_borrow_interior_mut(self.local_ty(l.target)))
+                })
                 .map(|l| l.target)
                 .collect()
         } else {
             Vec::new()
         };
         if p.through_ref
+            && is_ptr
+            && let Some(ptr_tgts) = state.ptr_targets.get(&p.local)
+        {
+            for &t in ptr_tgts {
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
+        }
+        if p.through_ref
             && (!self.is_param_local(p.local) || self.closure_depth > 0)
             && !targets.contains(&p.local)
         {
             targets.push(p.local);
         }
-        if (p.through_ref || p.through_deref)
-            && (self.is_param_local(p.local) || targets.iter().any(|&t| self.is_param_local(t)))
-        {
-            for s in sources {
-                let allowed_ref = self.is_ref_ty(self.local_ty(s.target))
-                    && (s.through_ref || self.is_closure_param(s.target));
-                if is_temp_target(s.target).is_some()
-                    || (!self.from_caller(s.target, s.through_ref) && !allowed_ref)
-                {
-                    return Err(self.does_not_live_long_enough(None, s.target));
-                }
-            }
-        }
-        if self.closure_depth > 0
-            && self.scope_depth.get(p.local as usize).copied().unwrap_or(0) < self.closure_depth
-        {
-            for s in sources {
-                let is_cparam = self.is_closure_param(s.target);
-                let cparam_borrow = is_cparam && self.ty_holds_borrow(self.local_ty(s.target));
-                let allowed_ref =
-                    self.is_ref_ty(self.local_ty(s.target)) && (s.through_ref || is_cparam);
-                if is_temp_target(s.target).is_some()
-                    || (!s.through_ref
-                        && !self.is_ref_ty(self.local_ty(s.target))
-                        && self.closure_by_val_caps.contains(&s.target))
-                    || (!self.from_caller(s.target, s.through_ref)
-                        && !allowed_ref
-                        && !cparam_borrow
-                        && self
-                            .scope_depth
-                            .get(s.target as usize)
-                            .copied()
-                            .unwrap_or(0)
-                            >= self.closure_depth)
-                {
-                    return Err(self.borrow_err(None, "borrowed data escapes outside of closure"));
-                }
-            }
-        }
-        if p.through_ref {
-            for holder in targets {
-                state.set_tuple_sources(holder, None);
-                if self.ty_holds_borrow(self.local_ty(holder)) {
-                    super::bind::push_source_loans_filtered(
-                        &mut state.loans,
-                        Some(holder),
-                        sources,
-                        false,
-                        self.current_expr,
-                        |s| s.target != holder,
-                        |s| s.mutable,
-                    );
-                }
-            }
-        }
-        Ok(())
+        self.check_target_write_escape(p, &targets, sources, state)
     }
 
     pub(super) fn propagate_assign_sources(

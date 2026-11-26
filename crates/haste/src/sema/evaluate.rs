@@ -4,10 +4,12 @@ use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 
-use crate::body::BinOp;
+use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, PatId, Stmt};
 
 use super::Context;
+use super::infer::Res;
 use super::reach::Instance;
+use super::substs::Substs;
 use super::ty::mask;
 
 /// The width and signedness of an integer type.
@@ -92,6 +94,235 @@ pub fn install(make: Make) {
     MAKE.get_or_init(|| make);
 }
 
+#[derive(Default)]
+struct ConstCycleState {
+    visiting: Vec<(Instance, bool)>,
+    closed: Vec<Instance>,
+    min_back: usize,
+}
+
+thread_local! {
+    static CONST_CYCLE: std::cell::RefCell<ConstCycleState> = const {
+        std::cell::RefCell::new(ConstCycleState {
+            visiting: Vec::new(),
+            closed: Vec::new(),
+            min_back: usize::MAX,
+        })
+    };
+}
+
+pub(super) struct ConstCycleFrame {
+    instance: Instance,
+    depth: usize,
+    saved_min: usize,
+}
+
+impl Drop for ConstCycleFrame {
+    fn drop(&mut self) {
+        CONST_CYCLE.with(|cell| {
+            let mut st = cell.borrow_mut();
+            st.visiting.pop();
+            let child_min = st.min_back;
+            st.min_back = self.saved_min.min(child_min);
+            if child_min >= self.depth && !st.closed.contains(&self.instance) {
+                st.closed.push(self.instance);
+            }
+            if st.visiting.is_empty() {
+                st.closed.clear();
+                st.min_back = usize::MAX;
+            }
+        });
+    }
+}
+
+pub(super) fn const_cycle_active() -> bool {
+    CONST_CYCLE.with(|cell| !cell.borrow().visiting.is_empty())
+}
+
+pub(super) fn const_cycle_top() -> Option<Instance> {
+    CONST_CYCLE.with(|cell| cell.borrow().visiting.last().map(|&(it, _)| it))
+}
+
+pub(super) fn enter_const_cycle(
+    cx: &Context<'_>,
+    instance: Instance,
+    is_const: bool,
+) -> std::result::Result<Option<ConstCycleFrame>, String> {
+    CONST_CYCLE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if let Some(pos) = st.visiting.iter().position(|&(it, _)| it == instance) {
+            if is_const {
+                return Err(format!(
+                    "cycle detected when evaluating `{}`",
+                    cx.name(instance.0)
+                ));
+            }
+            if let Some(&(bad, _)) = st.visiting[pos + 1..].iter().find(|(_, c)| *c) {
+                return Err(format!(
+                    "cycle detected when evaluating `{}`",
+                    cx.name(bad.0)
+                ));
+            }
+            st.min_back = st.min_back.min(pos);
+            return Ok(None);
+        }
+        if st.closed.contains(&instance) || st.visiting.len() >= crate::RECURSION_LIMIT {
+            return Ok(None);
+        }
+        let depth = st.visiting.len();
+        let saved_min = std::mem::replace(&mut st.min_back, usize::MAX);
+        st.visiting.push((instance, is_const));
+        Ok(Some(ConstCycleFrame {
+            instance,
+            depth,
+            saved_min,
+        }))
+    })
+}
+
+pub(super) fn collect_body_const_deps(
+    cx: &Context<'_>,
+    body: &Body,
+    get_res: impl Fn(ExprId) -> Option<Res>,
+    get_op: impl Fn(ExprId) -> Option<Res>,
+    get_pat: impl Fn(PatId) -> Option<Res>,
+) -> Vec<(Option<ExprId>, crate::names::ItemRef, Substs)> {
+    let (exprs, pats) = active_const_nodes(body);
+    let mut out = Vec::new();
+    for id in exprs {
+        let res = match *body.expr(id) {
+            Expr::Path(_) => get_res(id).filter(
+                |r| matches!(r, Res::Fn(item, _) if cx.item(*item).1.kind == crate::outline::item::ItemKind::Const),
+            ),
+            Expr::Call(callee, _) => get_res(id).or_else(|| get_res(callee)),
+            Expr::Method { .. } => get_res(id),
+            Expr::Unary(..) | Expr::Binary(..) | Expr::AssignOp(..) => get_op(id),
+            _ => None,
+        };
+        if let Some(Res::Fn(item, substs)) = res {
+            out.push((Some(id), item, substs));
+        }
+    }
+    for pat in pats {
+        if let Some(Res::Fn(item, substs)) = get_pat(pat)
+            && cx.item(item).1.kind == crate::outline::item::ItemKind::Const
+        {
+            out.push((None, item, substs));
+        }
+    }
+    out
+}
+
+fn active_const_nodes(body: &Body) -> (Vec<ExprId>, Vec<PatId>) {
+    let Some(root) = body.root else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut stack = vec![root];
+    let (mut exprs, mut pats) = (Vec::new(), Vec::new());
+    while let Some(id) = stack.pop() {
+        exprs.push(id);
+        push_active_children(body, id, &mut stack, &mut pats);
+    }
+    exprs.sort_by_key(|id| id.0);
+    pats.sort_by_key(|id| id.0);
+    (exprs, pats)
+}
+
+fn push_active_children(body: &Body, id: ExprId, stack: &mut Vec<ExprId>, pats: &mut Vec<PatId>) {
+    match *body.expr(id) {
+        Expr::Unary(_, a)
+        | Expr::Field(a, _)
+        | Expr::TupleField(a, _)
+        | Expr::Cast(a, _)
+        | Expr::Ref { expr: a, .. }
+        | Expr::Loop { body: a, .. }
+        | Expr::Try(a)
+        | Expr::Await(a)
+        | Expr::Become(a)
+        | Expr::Paren(a) => stack.push(a),
+        Expr::Return(a) | Expr::Break(_, a) | Expr::Yield(a) => stack.extend(a),
+        Expr::Binary(_, a, b)
+        | Expr::Assign(a, b)
+        | Expr::AssignOp(_, a, b)
+        | Expr::Index(a, b)
+        | Expr::Repeat(a, b)
+        | Expr::While {
+            cond: a, body: b, ..
+        } => stack.extend([a, b]),
+        Expr::Let(pat, expr) => {
+            pats.push(pat);
+            stack.push(expr);
+        }
+        Expr::For {
+            pat, iter, body: b, ..
+        } => {
+            pats.push(pat);
+            stack.extend([iter, b]);
+        }
+        Expr::If(a, b, c) => {
+            stack.extend([a, b]);
+            stack.extend(c);
+        }
+        Expr::Range { from, to, .. } => stack.extend(from.into_iter().chain(to)),
+        Expr::Call(callee, args) => {
+            stack.push(callee);
+            stack.extend(body.list(args).iter().map(|&x| ExprId(x)));
+        }
+        Expr::Method {
+            receiver, params, ..
+        } => {
+            stack.push(receiver);
+            stack.extend(body.list(params).iter().map(|&x| ExprId(x)));
+        }
+        Expr::Tuple(list) | Expr::Array(list) => {
+            stack.extend(body.list(list).iter().map(|&x| ExprId(x)));
+        }
+        Expr::Struct { fields, base, .. } => {
+            stack.extend(base);
+            stack.extend(
+                body.list(fields)
+                    .iter()
+                    .map(|&idx| body.fields[idx as usize].value),
+            );
+        }
+        Expr::Match(scrut, arms) => {
+            stack.push(scrut);
+            for &idx in body.list(arms) {
+                let arm = body.arms[idx as usize];
+                pats.push(arm.pat);
+                stack.extend(arm.guard);
+                stack.push(arm.body);
+            }
+        }
+        Expr::Block {
+            stmts, tail, kind, ..
+        } if !matches!(
+            kind,
+            BlockKind::Async | BlockKind::AsyncMove | BlockKind::Gen
+        ) =>
+        {
+            stack.extend(tail);
+            for &stmt_id in body.list(stmts) {
+                match body.stmts[stmt_id as usize] {
+                    Stmt::Let {
+                        pat,
+                        init,
+                        otherwise,
+                        ..
+                    } => {
+                        pats.push(pat);
+                        stack.extend(init);
+                        stack.extend(otherwise);
+                    }
+                    Stmt::Expr(expr, _) => stack.push(expr),
+                    Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The value of the integer constant `instance`, `bits` wide, from running its body once per pass; a constant whose evaluation needs its own value is an error.
 pub fn run(cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128> {
     if let Some(value) = cx.store.evaluated.get(instance) {
@@ -105,7 +336,9 @@ pub fn run(cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128>
         bail!("constant evaluation deferred");
     }
     if cx.eval_stack.contains(instance) {
-        bail!("the constant {} depends on itself", cx.name(instance.0));
+        let msg = format!("the constant {} depends on itself", cx.name(instance.0));
+        cx.eval_errors.insert(*instance, msg.clone());
+        return Err(const_arithmetic_error(msg));
     }
     cx.eval_stack.push(*instance);
     let mut runner = match cx.store.runner.take() {

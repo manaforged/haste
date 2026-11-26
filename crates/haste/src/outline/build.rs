@@ -6,11 +6,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use rustc_lexer::TokenKind;
 
+use super::attr::split_commas;
 use super::derive;
 use super::item::{Attr, Item, ItemKind};
-use super::source::Source;
+use super::scan::syntax_error;
+use super::source::{Origins, Source};
 use super::tree::{
-    Crate, Decl, File, Files, Held, Impl, MemberBlock, Module, State, Textual, View,
+    Crate, Decl, Env, File, Files, Held, Impl, MemberBlock, Module, State, Textual, Truth, View,
 };
 
 pub(crate) use expand::{path_text, spelled_fragment};
@@ -81,6 +83,7 @@ pub struct Loader<'a> {
     pub out: &'a mut Crate,
     pub depth: usize,
     pub scope: Option<Arc<Textual>>,
+    edition_2024: Option<bool>,
 }
 
 fn prelude_crates(deps: &[(String, usize)]) -> Vec<usize> {
@@ -122,6 +125,7 @@ impl<'a> Loader<'a> {
             out,
             depth: 0,
             scope: None,
+            edition_2024: None,
         }
     }
 }
@@ -209,6 +213,7 @@ impl Loader<'_> {
             self.out.modules[module].state = State::Gated;
             return None;
         }
+        self.check_file_2024(&file, false);
         let entry = &mut self.out.modules[module];
         if entry.parent.is_some() {
             entry.dir = child_dir(found, by_attr, &entry.name);
@@ -224,6 +229,10 @@ impl Loader<'_> {
         module: usize,
         owner: Option<u32>,
     ) -> Result<()> {
+        if file.expanded && owner.is_none() {
+            let unmarked_only = matches!(file.source.origins, Origins::Copied(_));
+            self.check_file_2024(file, unmarked_only);
+        }
         for (at, item) in file.items.items.iter().enumerate() {
             if item.parent != owner || !self.out.env.enabled(&item.attrs) {
                 continue;
@@ -422,4 +431,138 @@ fn child_origin(parent: &File, kind: u8, at: u32) -> u64 {
     kind.hash(&mut hasher);
     at.hash(&mut hasher);
     hasher.finish().max(1)
+}
+
+impl Loader<'_> {
+    fn is_edition_2024(&mut self) -> bool {
+        if let Some(flag) = self.edition_2024 {
+            return flag;
+        }
+        let flag = !self.out.env.fixed && manifest_is_2024(&self.out.env.vars);
+        self.edition_2024 = Some(flag);
+        flag
+    }
+
+    fn check_file_2024(&mut self, file: &File, unmarked_only: bool) {
+        if !self.is_edition_2024() {
+            return;
+        }
+        super::scan::check_edition_2024_source(
+            &file.source,
+            unmarked_only,
+            &mut |from, to, errors| {
+                check_attr_2024(&file.source, &self.out.env, unmarked_only, from, to, errors);
+            },
+            &mut self.out.errors,
+        );
+    }
+}
+
+fn manifest_is_2024(vars: &[(String, String)]) -> bool {
+    let manifest_path = vars
+        .iter()
+        .find(|(k, _)| k == "CARGO_MANIFEST_PATH")
+        .map(|(_, v)| PathBuf::from(v))
+        .or_else(|| {
+            vars.iter()
+                .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
+                .map(|(_, d)| Path::new(d).join("Cargo.toml"))
+        });
+    let Some(path) = manifest_path else {
+        return false;
+    };
+    edition_from_manifest(&path).unwrap_or(false)
+}
+
+fn edition_from_manifest(path: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let root = toml::from_str::<toml::Table>(&text).ok()?;
+    let edition = root.get("package")?.as_table()?.get("edition")?;
+    if let Some(ed) = edition.as_str() {
+        return Some(ed == "2024");
+    }
+    let inherited = edition
+        .as_table()
+        .and_then(|t| t.get("workspace"))
+        .and_then(toml::Value::as_bool)
+        == Some(true);
+    if !inherited {
+        return Some(false);
+    }
+    for dir in path.parent()?.ancestors().skip(1) {
+        let ws_path = dir.join("Cargo.toml");
+        let Ok(ws_text) = std::fs::read_to_string(&ws_path) else {
+            continue;
+        };
+        let Ok(ws_root) = toml::from_str::<toml::Table>(&ws_text) else {
+            continue;
+        };
+        if let Some(ws) = ws_root.get("workspace").and_then(toml::Value::as_table) {
+            return Some(
+                ws.get("package")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|p| p.get("edition"))
+                    .and_then(toml::Value::as_str)
+                    == Some("2024"),
+            );
+        }
+    }
+    Some(false)
+}
+
+fn check_attr_2024(
+    src: &Source,
+    env: &Env,
+    unmarked_only: bool,
+    from: u32,
+    to: u32,
+    errors: &mut Vec<String>,
+) {
+    if from >= to || (unmarked_only && src.mark(from).is_some()) {
+        return;
+    }
+    let mut after = from;
+    while after < to
+        && matches!(
+            src.kind(after),
+            TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon
+        )
+    {
+        after += 1;
+    }
+    if after == from {
+        return;
+    }
+    if after == from + 1 && src.kind(from) == TokenKind::Ident {
+        let name = src.text(from);
+        if name == "unsafe" && after < to && src.kind(after) == TokenKind::OpenParen {
+            return;
+        }
+        if name == "cfg_attr" && after < to && src.kind(after) == TokenKind::OpenParen {
+            let parts = split_commas(src, after + 1, src.pair(after));
+            if let Some(&(first, last)) = parts.first() {
+                let cond: String = (first..last)
+                    .map(|tok| src.text(tok))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if let Ok(cfg) = crate::graph::cfg::parse(&cond)
+                    && env.eval(&cfg) == Truth::Yes
+                {
+                    for &(f, t) in &parts[1..] {
+                        check_attr_2024(src, env, unmarked_only, f, t, errors);
+                    }
+                }
+            }
+            return;
+        }
+        if matches!(name, "no_mangle" | "export_name" | "link_section") {
+            errors.push(syntax_error(
+                src,
+                from,
+                after,
+                "unsafe attribute used without unsafe",
+                "usage of unsafe attribute",
+            ));
+        }
+    }
 }

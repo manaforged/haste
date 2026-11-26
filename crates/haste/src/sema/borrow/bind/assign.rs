@@ -48,6 +48,19 @@ impl Checker<'_, '_> {
         if let Some(p) = self.root_place(lhs) {
             self.assign_root_place(lhs, p, sources, state, outer_live, depth)
         } else {
+            if !sources.is_empty()
+                && let Expr::Unary(crate::body::UnOp::Deref, ptr_expr) =
+                    *self.body.expr(self.unwrap_parens(lhs))
+                && self.is_mut_ptr_ty(self.expr_ty(ptr_expr))
+            {
+                let mut targets = Vec::new();
+                self.collect_ptr_targets_expr(ptr_expr, state, &mut targets);
+                self.check_expr(lhs, state, true, outer_live, false, depth)?;
+                if !targets.is_empty() {
+                    self.check_ptr_deref_write(&targets, sources, state)?;
+                }
+                return Ok(());
+            }
             self.check_expr(lhs, state, true, outer_live, false, depth)
         }
     }

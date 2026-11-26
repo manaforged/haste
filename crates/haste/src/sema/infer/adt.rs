@@ -135,7 +135,13 @@ impl<'a> Infer<'_, 'a> {
         let tail = self.cx.types.adt(item, &open);
         self.is_unsized(tail)
     }
+}
 
+thread_local! {
+    static TAIL_VISITING: std::cell::RefCell<Vec<Ty>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl<'a> Infer<'_, 'a> {
     /// The unsized tail of `ty`, walking struct tail fields in this inference context, cached in the store when `ty` and its tail hold no variable or parameter and no quieted error arose.
     pub(in crate::sema) fn tail_ty(&mut self, ty: Ty) -> Result<Ty> {
         let ty = self.substitute(ty);
@@ -146,6 +152,12 @@ impl<'a> Infer<'_, 'a> {
         if cacheable && let Some(found) = self.cx.store.tails.get(&ty) {
             return Ok(found);
         }
+        let Some(_guard) = super::super::layout::try_enter_acyclic(&TAIL_VISITING, ty) else {
+            return Err(anyhow::anyhow!(
+                "recursive type `{}` has infinite size",
+                self.show(ty)
+            ));
+        };
         let before = self.cx.quiet_mark();
         let slice = self.cx.types.substs(args).to_vec();
         let last = if self.cx.item(item).1.kind == ItemKind::Struct {
@@ -478,7 +490,7 @@ impl<'a> Infer<'_, 'a> {
                 self.compute_offset_of(expr, current, fields)?;
             }
         }
-        Ok(())
+        self.check_deferred_transmutes()
     }
 
     fn compute_offset_of(
@@ -605,6 +617,7 @@ impl<'a> Infer<'_, 'a> {
             ));
         };
         self.check_field_visible(item, index, Some(expr), None, name)?;
+        self.check_union_field(expr, item)?;
         self.out.fields.insert(expr, index);
         let slice = self.cx.types.substs(args).to_vec();
         let field = self.adt_fields(item, &slice)?[0][index as usize];

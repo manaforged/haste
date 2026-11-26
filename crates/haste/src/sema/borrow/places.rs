@@ -203,6 +203,10 @@ impl Checker<'_, '_> {
         ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Mut, _))
     }
 
+    pub(super) fn is_mut_ptr_ty(&self, ty: Ty) -> bool {
+        ty != Ty::NONE && matches!(self.cx.types.kind(ty), Kind::Ptr(Mut::Mut, _))
+    }
+
     pub(super) fn is_shared_ref_or_ptr(&self, ty: Ty) -> bool {
         ty != Ty::NONE
             && matches!(

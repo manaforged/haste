@@ -1,10 +1,19 @@
-use crate::body::{Expr, ExprId, Ty as AstTy, TyId};
+use anyhow::Result;
+
+use crate::body::{Args, BlockKind, Body, Bound, Expr, ExprId, GenericArg, Ty as AstTy, TyId};
 use crate::outline::source::Source;
+use crate::sema::infer::Res;
 use crate::sema::ty::Kind;
 
-use super::lifetimes::{Lifetimes, collect_ty_lifetimes, lifetime_outlives_in_headers, owned_lts};
+use super::super::checks::{InvariantLifetimes, collect_ast_invariant_lifetimes, is_temp_target};
+use super::super::places::PlaceStep;
+use super::super::propagate::BorrowSource;
+use super::lifetimes::{
+    LT_STATIC, Lifetimes, collect_ty_lifetimes, is_owned_container, is_prim_name,
+    lifetime_is_static, lifetime_outlives_in_headers, owned_lts,
+};
 
-fn lifetime_outlives_in_item(
+pub(in super::super) fn lifetime_outlives_in_item(
     cx: &mut crate::sema::Context<'_>,
     item: crate::names::ItemRef,
     sig: &crate::body::sig::Signature,
@@ -33,6 +42,110 @@ fn lifetime_outlives_in_item(
     }
 }
 
+pub(super) fn ast_ty_is_provably_static(
+    sig: &crate::body::sig::Signature,
+    src: &Source,
+    ty: TyId,
+) -> bool {
+    ast_ty_is_provably_static_in(&sig.body, src, Some((sig, src)), ty)
+}
+
+pub(in super::super) fn ast_ty_is_provably_static_in(
+    body: &Body,
+    src: &Source,
+    sig: Option<(&crate::body::sig::Signature, &Source)>,
+    ty: TyId,
+) -> bool {
+    let lt_static = |lt: &str| match sig {
+        Some((s, s_src)) => lifetime_is_static(s, s_src, lt),
+        None => lt == LT_STATIC,
+    };
+    match *body.ty(ty) {
+        AstTy::Never => true,
+        AstTy::Ptr { ty: t, .. }
+        | AstTy::Paren(t)
+        | AstTy::Slice(t)
+        | AstTy::Array(t, _)
+        | AstTy::Pat(t, _) => ast_ty_is_provably_static_in(body, src, sig, t),
+        AstTy::Tuple(list) => body
+            .list(list)
+            .iter()
+            .all(|&t| ast_ty_is_provably_static_in(body, src, sig, TyId(t))),
+        AstTy::Ref {
+            lifetime: Some(lt),
+            ty: inner,
+            ..
+        } => lt_static(src.text(lt)) && ast_ty_is_provably_static_in(body, src, sig, inner),
+        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
+            let bounds = body.list(list);
+            let has_static = bounds.iter().any(|&b_id| {
+                matches!(body.bounds[b_id as usize], Bound::Lifetime(lt) if lt_static(src.text(lt)))
+            });
+            has_static
+                && bounds.iter().all(|&b_id| match body.bounds[b_id as usize] {
+                    Bound::Lifetime(lt) => lt_static(src.text(lt)),
+                    Bound::Trait { path, .. } => {
+                        body.list(body.path(path).segments).iter().all(|&s_id| {
+                            match body.segments[s_id as usize].args {
+                                None => true,
+                                Some(Args::Angle(args)) => {
+                                    body.list(args)
+                                        .iter()
+                                        .all(|&a| match body.args[a as usize] {
+                                            GenericArg::Ty(t)
+                                            | GenericArg::Binding { ty: t, .. } => {
+                                                ast_ty_is_provably_static_in(body, src, sig, t)
+                                            }
+                                            GenericArg::Lifetime(lt) => lt_static(src.text(lt)),
+                                            GenericArg::Const(_) => true,
+                                            GenericArg::Constraint { .. } => false,
+                                        })
+                                }
+                                _ => false,
+                            }
+                        })
+                    }
+                    Bound::Use(_) => true,
+                })
+        }
+        AstTy::Path(path_id) => {
+            let p = body.path(path_id);
+            let segs = body.list(p.segments);
+            if p.qself.is_some() || segs.is_empty() {
+                return false;
+            }
+            if segs[..segs.len() - 1]
+                .iter()
+                .any(|&s| body.segments[s as usize].args.is_some())
+            {
+                return false;
+            }
+            let seg = body.segments[segs[segs.len() - 1] as usize];
+            let name = crate::names::plain(src.text(seg.name));
+            if seg.args.is_none() && is_prim_name(name) {
+                return true;
+            }
+            if is_owned_container(name)
+                && let Some(Args::Angle(args)) = seg.args
+            {
+                return body
+                    .list(args)
+                    .iter()
+                    .all(|&a| match body.args[a as usize] {
+                        GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                            ast_ty_is_provably_static_in(body, src, sig, t)
+                        }
+                        GenericArg::Lifetime(lt) => lt_static(src.text(lt)),
+                        GenericArg::Const(_) => true,
+                        GenericArg::Constraint { .. } => false,
+                    });
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 impl super::super::Checker<'_, '_> {
     pub(in super::super) fn param_satisfies_caller_lt(
         &mut self,
@@ -43,7 +156,7 @@ impl super::super::Checker<'_, '_> {
         self.param_satisfies_lt_mode(local, req_lts, peel_outer_ref, true)
     }
 
-    fn param_satisfies_lt_mode(
+    pub(in super::super) fn param_satisfies_lt_mode(
         &mut self,
         local: u32,
         req_lts: &[&str],
@@ -93,7 +206,7 @@ impl super::super::Checker<'_, '_> {
         src: &super::super::propagate::BorrowSource,
         req: &[&str],
         ret_mut_inner: Option<&[&str]>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         if self.closure_depth != 0
             || req.is_empty()
             || src.env_only
@@ -167,7 +280,7 @@ impl super::super::Checker<'_, '_> {
         &mut self,
         expr: ExprId,
         src: &super::super::propagate::BorrowSource,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         if self.closure_depth != 0 || self.ret_named_lts.is_empty() {
             return Ok(());
         }
@@ -195,13 +308,25 @@ impl super::super::Checker<'_, '_> {
         Some(owned_lts(lts.named))
     }
 
+    fn ret_invariant_lts(&mut self) -> Option<InvariantLifetimes> {
+        let sig = self.cx.signature(self.item).ok()?;
+        let ret_ast = sig.ret?;
+        Some(collect_ast_invariant_lifetimes(
+            self.cx,
+            &sig.body,
+            self.src,
+            ret_ast,
+            self.typed.ret,
+        ))
+    }
+
     fn check_tuple_elem_lts(
         &mut self,
         sig: &crate::body::sig::Signature,
         site: ExprId,
         ty: TyId,
-        sources: &[super::super::propagate::BorrowSource],
-    ) -> anyhow::Result<()> {
+        sources: &[BorrowSource],
+    ) -> Result<()> {
         let mut elem_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, self.src, ty, &mut elem_lts);
         if elem_lts.named.is_empty() {
@@ -219,7 +344,7 @@ impl super::super::Checker<'_, '_> {
         site: ExprId,
         ty: TyId,
         ts: &super::super::propagate::TupleSources,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         match (sig.body.ty(ty), ts) {
             (AstTy::Tuple(ret_elems), super::super::propagate::TupleSources::Tuple(elems)) => {
                 let ret_ids: Vec<TyId> = sig
@@ -247,7 +372,7 @@ impl super::super::Checker<'_, '_> {
         &mut self,
         expr: ExprId,
         state: &super::super::State,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         if self.closure_depth != 0 || self.ret_named_lts.is_empty() {
             return Ok(());
         }
@@ -276,6 +401,272 @@ impl super::super::Checker<'_, '_> {
             && let Some(ts) = state.tuple_elem_sources.get(&local).cloned()
         {
             self.check_tuple_sources_lts(&sig, expr, ret_ast, &ts)?;
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn check_return_escape(
+        &mut self,
+        expr: ExprId,
+        state: &super::super::State,
+    ) -> Result<()> {
+        let had_cached = if let Some(cached) = self.temp_sources.get(&expr).cloned() {
+            let site = self.return_diag_site(expr);
+            self.check_return_sources(site, &cached)?;
+            true
+        } else {
+            false
+        };
+        match *self.body.expr(expr) {
+            Expr::Block {
+                kind: BlockKind::Const,
+                ..
+            } => Ok(()),
+            Expr::Loop { .. } | Expr::Block { tail: None, .. } if had_cached => Ok(()),
+            Expr::Paren(inner)
+            | Expr::Block {
+                tail: Some(inner), ..
+            } => self.check_return_escape(inner, state),
+            Expr::If(_, then, otherwise) => {
+                self.check_return_escape(then, state)?;
+                if let Some(alt) = otherwise {
+                    self.check_return_escape(alt, state)?;
+                }
+                Ok(())
+            }
+            Expr::Match(_, arms) => {
+                for id in self.body.list(arms).to_vec() {
+                    self.check_return_escape(self.body.arms[id as usize].body, state)?;
+                }
+                Ok(())
+            }
+            _ => {
+                let sources = self.expr_borrow_sources(expr, state);
+                self.check_return_sources(expr, &sources)?;
+                self.check_return_tuple_named_lt(expr, state)
+            }
+        }
+    }
+
+    fn return_diag_site(&self, mut expr: ExprId) -> ExprId {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner)
+                | Expr::Block {
+                    tail: Some(inner), ..
+                } => expr = inner,
+                _ => return expr,
+            }
+        }
+    }
+
+    pub(in super::super) fn check_return_sources(
+        &mut self,
+        expr: ExprId,
+        sources: &[BorrowSource],
+    ) -> Result<()> {
+        let expr_depth = self.ty_max_ref_depth(self.expr_ty(expr));
+        for src in sources {
+            let target_ty = self.local_ty(src.target);
+            let inner = if target_ty != crate::sema::ty::Ty::NONE {
+                match *self.cx.types.kind(target_ty) {
+                    Kind::Ref(_, inner) => Some(inner),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let past_outer = src.origin_only
+                && inner.is_some_and(|i| {
+                    self.ty_holds_non_dyn_borrow(i) && expr_depth <= self.ty_max_ref_depth(i)
+                });
+            if let Some(active) = self.active_closures.last_mut() {
+                if !past_outer
+                    && let Some(idx) = active.params.iter().position(|&p| p == src.target)
+                    && !active.ret_params.contains(&idx)
+                {
+                    active.ret_params.push(idx);
+                }
+                if src.origin_only {
+                    active.ret_orig.insert(src.target);
+                } else {
+                    active.ret_real.insert(src.target);
+                }
+            }
+        }
+        for src in sources {
+            if self.is_escaping_return(src) {
+                if is_temp_target(src.target).is_some() {
+                    return Err(self.does_not_live_long_enough(Some(expr), src.target));
+                }
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "cannot return value referencing local variable `{}`",
+                        self.local_name(src.target)
+                    ),
+                ));
+            }
+            if self.closure_depth == 0
+                && self.returns_only_static
+                && self.is_non_static_param(src.target)
+            {
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "borrowed data `{}` escapes outside of function: return type requires `'static` lifetime",
+                        self.local_name(src.target)
+                    ),
+                ));
+            }
+            self.check_return_named_lt(expr, src)?;
+        }
+        if self.closure_depth == 0 && self.returns_only_static {
+            self.check_return_static_local_args(expr)?;
+        }
+        if self.closure_depth == 0 && self.returns_invariant {
+            self.check_return_invariant_expr(expr, sources)?;
+        }
+        Ok(())
+    }
+
+    fn check_return_static_local_args(&mut self, mut expr: ExprId) -> Result<()> {
+        expr = self.unwrap_parens(expr);
+        match *self.body.expr(expr) {
+            Expr::Cast(inner, _) | Expr::Ref { expr: inner, .. } => {
+                self.check_return_static_local_args(inner)
+            }
+            Expr::Block {
+                kind,
+                tail: Some(tail),
+                ..
+            } if kind != BlockKind::Const => self.check_return_static_local_args(tail),
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for id in self.body.list(list).to_vec() {
+                    self.check_return_static_local_args(ExprId(id))?;
+                }
+                Ok(())
+            }
+            Expr::Struct { fields, base, .. } => {
+                for id in self.body.list(fields).to_vec() {
+                    self.check_return_static_local_args(self.body.fields[id as usize].value)?;
+                }
+                if let Some(b) = base {
+                    self.check_return_static_local_args(b)?;
+                }
+                Ok(())
+            }
+            Expr::Call(callee, args) => {
+                let is_wrapper = matches!(
+                    self.typed
+                        .res
+                        .get(&callee)
+                        .or_else(|| self.typed.res.get(&expr)),
+                    Some(Res::Ctor(..))
+                ) || (self.cx.boxed(self.expr_ty(expr)).is_some()
+                    && self
+                        .call_sig_fn_item(expr, callee)
+                        .is_some_and(|it| self.cx.name(it) == "new"));
+                if is_wrapper {
+                    for id in self.body.list(args).to_vec() {
+                        self.check_return_static_local_args(ExprId(id))?;
+                    }
+                }
+                Ok(())
+            }
+            Expr::Path(_) => {
+                if let Some(local) = self.expr_plain_local(expr)
+                    && self.is_non_static_param(local)
+                {
+                    return Err(self.borrow_err(
+                        Some(expr),
+                        format!(
+                            "borrowed data `{}` escapes outside of function: return type requires `'static` lifetime",
+                            self.local_name(local)
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn check_return_invariant_expr(
+        &mut self,
+        expr: ExprId,
+        sources: &[BorrowSource],
+    ) -> Result<()> {
+        let Some(ret_inv) = self.ret_invariant_lts() else {
+            return Ok(());
+        };
+        let req_static = ret_inv.is_only_static();
+        if !req_static && ret_inv.named.is_empty() {
+            return Ok(());
+        }
+        let whole_sources: Vec<BorrowSource> = sources
+            .iter()
+            .filter(|s| {
+                !s.steps
+                    .iter()
+                    .any(|st| matches!(st, PlaceStep::Field(..) | PlaceStep::SliceElem { .. }))
+            })
+            .cloned()
+            .collect();
+        for s in &whole_sources {
+            if self.is_param_local(s.target) {
+                let target_ty = self.local_ty(s.target);
+                let is_inv_src = self.param_has_invariant_lt(s.target, false)
+                    || (self.is_mut_ref_ty(target_ty)
+                        && self.expr_plain_local(expr) == Some(s.target));
+                if is_inv_src {
+                    self.check_local_place_invariant_fit(
+                        Some(expr),
+                        s.target,
+                        false,
+                        req_static,
+                        &ret_inv.named,
+                    )?;
+                } else if req_static {
+                    self.check_sources_fit_invariant_lts(
+                        Some(expr),
+                        std::slice::from_ref(s),
+                        true,
+                        &[],
+                    )?;
+                }
+            }
+        }
+        if let Some(local) = self.expr_plain_local(expr) {
+            self.check_local_place_invariant_fit(
+                Some(expr),
+                local,
+                false,
+                req_static,
+                &ret_inv.named,
+            )?;
+        }
+        if let Some(inner_ref) = match *self.body.expr(self.unwrap_parens(expr)) {
+            Expr::Ref { expr: inner, .. } => self.root_place(inner),
+            _ => None,
+        } && inner_ref.through_ref
+            && inner_ref.steps.len() == 1
+            && matches!(inner_ref.steps[0], PlaceStep::Deref)
+        {
+            let target_ty = self.local_ty(inner_ref.local);
+            let inner_pointee = match *self.cx.types.kind(target_ty) {
+                Kind::Ref(_, p) => p,
+                _ => crate::sema::ty::Ty::NONE,
+            };
+            if self.is_mut_ref_ty(target_ty) || self.ty_has_borrow_interior_mut(inner_pointee) {
+                self.check_local_place_invariant_fit(
+                    Some(expr),
+                    inner_ref.local,
+                    false,
+                    req_static,
+                    &ret_inv.named,
+                )?;
+            }
         }
         Ok(())
     }

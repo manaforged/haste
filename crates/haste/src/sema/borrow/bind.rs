@@ -210,6 +210,9 @@ impl Checker<'_, '_> {
                     self.is_param[local as usize] = true;
                 }
                 self.scope_depth[local as usize] = ctx.scope_depth;
+                if (local as usize) < self.variance.decl_seq.len() {
+                    self.variance.decl_seq[local as usize] = self.next_decl_seq();
+                }
                 reset_local_binding(local, ctx.init_val, state);
             }
             if ctx.init_val {
@@ -643,6 +646,7 @@ fn reset_local_binding(local: u32, init_val: bool, state: &mut State) {
     state.moved_at[local as usize] = None;
     state.partial_moves.retain(|m| m.local != local);
     state.set_tuple_sources(local, None);
+    state.ptr_targets.remove(&local);
     clear_rebound_loans(local, state);
 }
 

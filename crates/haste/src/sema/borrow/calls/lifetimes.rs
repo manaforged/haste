@@ -138,10 +138,10 @@ fn merge_fn_lifetimes<'s>(fn_lts: Lifetimes<'s>, out: &mut Lifetimes<'s>) {
     }
 }
 
-pub(super) const LT_STATIC: &str = "'static";
-pub(super) const LT_ELIDED: &str = "'_";
+pub(in super::super) const LT_STATIC: &str = "'static";
+pub(in super::super) const LT_ELIDED: &str = "'_";
 
-pub(super) fn is_named_lt(name: &str) -> bool {
+pub(in super::super) fn is_named_lt(name: &str) -> bool {
     name != LT_ELIDED && name != LT_STATIC
 }
 
@@ -239,7 +239,29 @@ pub(in super::super) fn is_prim_name(name: &str) -> bool {
 }
 
 pub(in super::super) fn is_owned_container(name: &str) -> bool {
-    matches!(name, "Option" | "Result" | "Vec" | "Box")
+    matches!(
+        name,
+        "Option"
+            | "Result"
+            | "Vec"
+            | "Box"
+            | "Cell"
+            | "UnsafeCell"
+            | "RefCell"
+            | "OnceCell"
+            | "OnceLock"
+            | "Mutex"
+            | "RwLock"
+            | "SyncUnsafeCell"
+            | "UnsafePinned"
+            | "PhantomData"
+            | "ManuallyDrop"
+            | "Pin"
+            | "Rc"
+            | "Arc"
+            | "NonNull"
+            | "Unique"
+    )
 }
 
 pub(in super::super) fn pred_matches_name_in(
@@ -385,7 +407,7 @@ fn record_param_ty(
             info.has_elided_lt[slot] = false;
             info.named_lts[slot] = vec![src.text(lt).to_owned()];
         }
-        info.inner_is_static[slot] = ast_ty_is_provably_static(sig, src, inner);
+        info.inner_is_static[slot] = super::return_lt::ast_ty_is_provably_static(sig, src, inner);
         let mut inner_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
         info.inner_has_elided_lt[slot] =
@@ -394,7 +416,11 @@ fn record_param_ty(
     }
 }
 
-fn lifetime_is_static(sig: &crate::body::sig::Signature, src: &Source, name: &str) -> bool {
+pub(in super::super) fn lifetime_is_static(
+    sig: &crate::body::sig::Signature,
+    src: &Source,
+    name: &str,
+) -> bool {
     lifetime_outlives(sig, src, name, "'static")
 }
 
@@ -503,57 +529,6 @@ fn param_ty_is_static(
     !has_unbounded_type_param(sig, src, lts, static_names)
 }
 
-fn ast_ty_is_provably_static(sig: &crate::body::sig::Signature, src: &Source, ty: TyId) -> bool {
-    match *sig.body.ty(ty) {
-        AstTy::Never | AstTy::Ptr { .. } => true,
-        AstTy::Paren(t) | AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Pat(t, _) => {
-            ast_ty_is_provably_static(sig, src, t)
-        }
-        AstTy::Tuple(list) => sig
-            .body
-            .list(list)
-            .iter()
-            .all(|&t| ast_ty_is_provably_static(sig, src, TyId(t))),
-        AstTy::Ref {
-            mutable: false,
-            lifetime: Some(lt),
-            ty: inner,
-        } => {
-            lifetime_is_static(sig, src, src.text(lt)) && ast_ty_is_provably_static(sig, src, inner)
-        }
-        AstTy::Path(path_id) => {
-            let p = sig.body.path(path_id);
-            let segs = sig.body.list(p.segments);
-            if p.qself.is_some() || segs.len() != 1 {
-                return false;
-            }
-            let seg = sig.body.segments[segs[0] as usize];
-            let name = src.text(seg.name);
-            if seg.args.is_none() && is_prim_name(name) {
-                return true;
-            }
-            if is_owned_container(name)
-                && let Some(Args::Angle(args)) = seg.args
-            {
-                return sig
-                    .body
-                    .list(args)
-                    .iter()
-                    .all(|&a| match sig.body.args[a as usize] {
-                        GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                            ast_ty_is_provably_static(sig, src, t)
-                        }
-                        GenericArg::Lifetime(lt) => lifetime_is_static(sig, src, src.text(lt)),
-                        GenericArg::Const(_) => true,
-                        GenericArg::Constraint { .. } => false,
-                    });
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
 pub(in super::super) fn ast_ty_may_carry_elided_lt(
     body: &Body,
     src: &Source,
@@ -642,6 +617,41 @@ pub(in super::super) fn sig_return_named_lifetimes<'s>(
     lts.named.clone()
 }
 
+fn path_args_have_type_param(
+    body: &Body,
+    src: &Source,
+    path_id: crate::body::PathId,
+    type_params: &[&str],
+) -> bool {
+    let p = body.path(path_id);
+    if p.qself
+        .is_some_and(|(q, _)| ast_ty_has_type_param(body, src, q, type_params))
+    {
+        return true;
+    }
+    body.list(p.segments)
+        .iter()
+        .any(|&s| match body.segments[s as usize].args {
+            Some(Args::Angle(args)) => {
+                body.list(args)
+                    .iter()
+                    .any(|&a| match body.args[a as usize] {
+                        GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                            ast_ty_has_type_param(body, src, t, type_params)
+                        }
+                        _ => false,
+                    })
+            }
+            Some(Args::Paren { inputs, output }) => {
+                body.list(inputs)
+                    .iter()
+                    .any(|&t| ast_ty_has_type_param(body, src, TyId(t), type_params))
+                    || output.is_some_and(|o| ast_ty_has_type_param(body, src, o, type_params))
+            }
+            _ => false,
+        })
+}
+
 pub(in super::super) fn ast_ty_has_type_param(
     body: &Body,
     src: &Source,
@@ -661,11 +671,6 @@ pub(in super::super) fn ast_ty_has_type_param(
             .any(|&t| ast_ty_has_type_param(body, src, TyId(t), type_params)),
         AstTy::Path(path_id) => {
             let p = body.path(path_id);
-            if p.qself
-                .is_some_and(|(q, _)| ast_ty_has_type_param(body, src, q, type_params))
-            {
-                return true;
-            }
             let segs = body.list(p.segments);
             if p.qself.is_none() && segs.len() == 1 {
                 let name = src.text(body.segments[segs[0] as usize].name);
@@ -673,25 +678,7 @@ pub(in super::super) fn ast_ty_has_type_param(
                     return true;
                 }
             }
-            segs.iter().any(|&s| match body.segments[s as usize].args {
-                Some(Args::Angle(args)) => {
-                    body.list(args)
-                        .iter()
-                        .any(|&a| match body.args[a as usize] {
-                            GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                                ast_ty_has_type_param(body, src, t, type_params)
-                            }
-                            _ => false,
-                        })
-                }
-                Some(Args::Paren { inputs, output }) => {
-                    body.list(inputs)
-                        .iter()
-                        .any(|&t| ast_ty_has_type_param(body, src, TyId(t), type_params))
-                        || output.is_some_and(|o| ast_ty_has_type_param(body, src, o, type_params))
-                }
-                _ => false,
-            })
+            path_args_have_type_param(body, src, path_id, type_params)
         }
         AstTy::Fn { params, ret, .. } => {
             body.list(params)
@@ -699,7 +686,17 @@ pub(in super::super) fn ast_ty_has_type_param(
                 .any(|&t| ast_ty_has_type_param(body, src, TyId(t), type_params))
                 || ret.is_some_and(|r| ast_ty_has_type_param(body, src, r, type_params))
         }
-        AstTy::Infer | AstTy::ImplTrait(..) | AstTy::DynTrait(..) => true,
+        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
+            let has_static = body.list(list).iter().any(|&b_id| {
+                matches!(body.bounds[b_id as usize], Bound::Lifetime(lt) if src.text(lt) == LT_STATIC)
+            });
+            !has_static
+                || body.list(list).iter().any(|&b_id| {
+                    matches!(body.bounds[b_id as usize], Bound::Trait { path, .. }
+                        if path_args_have_type_param(body, src, path, type_params))
+                })
+        }
+        AstTy::Infer => true,
         _ => false,
     }
 }

@@ -8,11 +8,11 @@ use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 use crate::sema::infer::{Coercion, Res};
-use crate::sema::ty::{Kind, Mut, Ty};
+use crate::sema::ty::{Kind, Ty};
 
+use super::super::calls::lifetimes::collect_ty_lifetimes;
 use super::super::calls::{
-    Lifetimes, collect_ty_lifetimes, lifetime_outlives, pred_matches_name, recv_is_by_ref,
-    recv_ref_mut, ty_shares_name,
+    Lifetimes, lifetime_outlives, pred_matches_name, recv_is_by_ref, ty_shares_name,
 };
 use super::super::propagate::{BorrowSource, unwrap_container_loans};
 use super::super::{Checker, State};
@@ -32,23 +32,28 @@ impl Checker<'_, '_> {
         let Some(mut p) = self.root_place(receiver) else {
             return Ok(());
         };
-        let adjust = self.typed.adjusts.get(&expr).copied();
-        let derefs = adjust.map_or(0, |a| a.derefs);
-        if derefs > 0 {
-            self.apply_deref_steps(expr, self.expr_ty(receiver), derefs, &mut p);
-        } else if adjust.and_then(|a| a.autoref).is_none()
-            && self.is_mut_ref_ty(self.expr_ty(receiver))
-            && sig.is_some_and(recv_is_by_ref)
-        {
-            self.apply_deref_steps(expr, self.expr_ty(receiver), 1, &mut p);
-        }
         let self_ty = self.method_self_ty(expr, receiver, sig);
         let recv_ty = if self_ty != Ty::NONE {
             self_ty
         } else {
             self.local_ty(p.local)
         };
-        if (!recv_mut && !self.ty_holds_closure(recv_ty)) || !self.ty_holds_borrow(recv_ty) {
+        let recv_interior_mut = self.ty_has_borrow_interior_mut(recv_ty);
+        let adjust = self.typed.adjusts.get(&expr).copied();
+        let derefs = adjust.map_or(0, |a| a.derefs);
+        let recv_expr_ty = self.expr_ty(receiver);
+        if derefs > 0 {
+            self.apply_deref_steps(expr, recv_expr_ty, derefs, &mut p);
+        } else if adjust.and_then(|a| a.autoref).is_none()
+            && (self.is_mut_ref_ty(recv_expr_ty)
+                || (self.is_ref_ty(recv_expr_ty) && recv_interior_mut))
+            && sig.is_some_and(recv_is_by_ref)
+        {
+            self.apply_deref_steps(expr, recv_expr_ty, 1, &mut p);
+        }
+        if (!recv_mut && !self.ty_holds_closure(recv_ty) && !recv_interior_mut)
+            || (!self.ty_holds_borrow(recv_ty) && !recv_interior_mut)
+        {
             return Ok(());
         }
         let fn_item = match self.typed.res.get(&expr).copied() {
@@ -69,6 +74,22 @@ impl Checker<'_, '_> {
             let arg = ExprId(id);
             let arg_ty = self.expr_ty(arg);
             if arg_ty != Ty::NONE && !self.ty_holds_borrow(arg_ty) {
+                if recv_interior_mut
+                    && let Some(src_local) = self.expr_plain_local(arg)
+                    && let Some(s) = sig
+                    && let Some(&(_, param_ty)) = s.params.get(idx)
+                    && let Some(item) = fn_item
+                {
+                    let sig_src = self.cx.item(item).0;
+                    let mut p_lts = Lifetimes::default();
+                    collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
+                    let shares = p_lts.named.iter().any(|n| self_lts.named.contains(n))
+                        || ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names)
+                        || self.generic_param_ties_to_self(s, sig_src, &p_lts, &self_lts);
+                    if shares {
+                        self.check_local_place_fits_target(arg, &p, src_local, state)?;
+                    }
+                }
                 continue;
             }
             let pairs: Vec<(Option<TyId>, ExprId, bool)> = if let Some(s) = sig
@@ -90,6 +111,9 @@ impl Checker<'_, '_> {
             for (param_ty_opt, ae, use_pre) in pairs {
                 let ae_ty = self.expr_ty(ae);
                 if ae_ty != Ty::NONE && !self.ty_holds_borrow(ae_ty) {
+                    if recv_interior_mut && let Some(src_local) = self.expr_plain_local(ae) {
+                        self.check_local_place_fits_target(ae, &p, src_local, state)?;
+                    }
                     continue;
                 }
                 let mut is_fresh_ref = false;
@@ -119,6 +143,9 @@ impl Checker<'_, '_> {
                         || self.generic_param_ties_to_self(s, sig_src, &p_lts, &self_lts);
                     if !shares_self {
                         continue;
+                    }
+                    if recv_interior_mut && let Some(src_local) = self.expr_plain_local(ae) {
+                        self.check_local_place_fits_target(ae, &p, src_local, state)?;
                     }
                     param_ty_info = Some((item, param_ty));
                 }
@@ -502,139 +529,5 @@ impl Checker<'_, '_> {
             }
         }
         false
-    }
-
-    pub(in super::super) fn attach_call_out_sources(
-        &mut self,
-        expr: ExprId,
-        arg_ids: &[u32],
-        arg_sources: &[Vec<BorrowSource>],
-        sig: Option<&Signature>,
-        fn_item: Option<crate::names::ItemRef>,
-        has_self_arg: bool,
-        state: &mut State,
-    ) -> Result<()> {
-        let Some(sig) = sig else { return Ok(()) };
-        if has_self_arg && !arg_ids.is_empty() {
-            let recv_mut = recv_ref_mut(sig) == Some(Mut::Mut);
-            let recv_expr = match *self.body.expr(ExprId(arg_ids[0])) {
-                Expr::Ref {
-                    mutable: true,
-                    raw: false,
-                    expr: inner,
-                } => inner,
-                _ => ExprId(arg_ids[0]),
-            };
-            self.attach_method_arg_sources(
-                expr,
-                recv_expr,
-                &arg_ids[1..],
-                arg_sources.get(1..).unwrap_or(&[]),
-                recv_mut,
-                Some(sig),
-                state,
-            )?;
-        }
-        let param_args = if has_self_arg {
-            arg_ids.get(1..).unwrap_or(&[])
-        } else {
-            arg_ids
-        };
-        let param_arg_sources = if has_self_arg {
-            arg_sources.get(1..).unwrap_or(&[])
-        } else {
-            arg_sources
-        };
-        if param_args.len() < 2 || sig.params.len() < 2 {
-            return Ok(());
-        }
-        let fn_src = fn_item.map_or(self.src, |item| self.cx.item(item).0);
-        for (dst_idx, &dst_id) in param_args.iter().enumerate() {
-            let Some(&(_, dst_ast)) = sig.params.get(dst_idx) else {
-                continue;
-            };
-            let AstTy::Ref {
-                mutable: true,
-                ty: dst_inner,
-                ..
-            } = *sig.body.ty(dst_ast)
-            else {
-                continue;
-            };
-            let dst_expr = match *self.body.expr(ExprId(dst_id)) {
-                Expr::Ref {
-                    mutable: true,
-                    raw: false,
-                    expr,
-                } => expr,
-                _ => continue,
-            };
-            let Some(p) = self.root_place(dst_expr) else {
-                continue;
-            };
-            let dst_ty = self.expr_ty(dst_expr);
-            if !self.ty_holds_borrow(if dst_ty != Ty::NONE {
-                dst_ty
-            } else {
-                self.local_ty(p.local)
-            }) {
-                continue;
-            }
-            for (src_idx, &src_id) in param_args.iter().enumerate() {
-                if src_idx == dst_idx {
-                    continue;
-                }
-                let Some(&(_, src_ast)) = sig.params.get(src_idx) else {
-                    continue;
-                };
-                if self.sig_params_share_lt_or_ty(sig, fn_src, dst_inner, src_ast) {
-                    let src_expr = match (*sig.body.ty(src_ast), *self.body.expr(ExprId(src_id))) {
-                        (
-                            AstTy::Ref {
-                                lifetime: None,
-                                mutable: true,
-                                ty: src_inner,
-                            },
-                            Expr::Ref {
-                                mutable: true,
-                                raw: false,
-                                expr,
-                            },
-                        ) if !matches!(*sig.body.ty(dst_inner), AstTy::Ref { .. })
-                            && self
-                                .sig_params_share_lt_or_ty(sig, fn_src, dst_inner, src_inner) =>
-                        {
-                            expr
-                        }
-                        _ => ExprId(src_id),
-                    };
-                    let sources = if src_expr == ExprId(src_id)
-                        && let Some(pre) = param_arg_sources.get(src_idx)
-                    {
-                        pre.clone()
-                    } else {
-                        self.expr_borrow_sources(src_expr, state)
-                    };
-                    self.propagate_assign_sources(&p, &sources, state)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn sig_params_share_lt_or_ty(&self, sig: &Signature, src: &Source, a: TyId, b: TyId) -> bool {
-        let mut lts_a = Lifetimes::default();
-        let mut lts_b = Lifetimes::default();
-        collect_ty_lifetimes(&sig.body, src, a, &mut lts_a);
-        collect_ty_lifetimes(&sig.body, src, b, &mut lts_b);
-        if lts_a.named.iter().any(|n| lts_b.named.contains(n)) {
-            return true;
-        }
-        sig.generics.iter().any(|g| {
-            g.kind == GenericKind::Type && {
-                let name = src.text(g.name);
-                lts_a.names.contains(&name) && lts_b.names.contains(&name)
-            }
-        })
     }
 }

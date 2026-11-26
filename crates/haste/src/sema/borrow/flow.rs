@@ -210,12 +210,7 @@ impl Checker<'_, '_> {
         });
         self.temp_scope_depth = saved_temp_scope;
         bind_res?;
-        let mut bound = HashSet::default();
-        self.collect_pat_locals(pat, &mut bound);
-        let bound_vec: Vec<u32> = bound.into_iter().collect();
-        self.check_stmt_temp_escape(state, stmt_temp_depth, &bound_vec, after_live)?;
-        prune_moved_loans(state);
-        Ok(())
+        self.finish_let_stmt(pat, ann_ty, init, stmt_temp_depth, state, after_live)
     }
 
     fn check_expr_stmt(
@@ -771,6 +766,7 @@ impl Checker<'_, '_> {
         let Some(mut next_state) = merged_next else {
             return Ok(None);
         };
+        self.check_drop_order(loop_depth, &next_state)?;
         retain_non_loop_state(&mut next_state, loop_locals);
         self.check_block_escape(loop_depth, &next_state, outer_live)?;
         for loan in &mut next_state.loans {

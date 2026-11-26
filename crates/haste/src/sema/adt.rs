@@ -225,6 +225,15 @@ impl<'a> Context<'a> {
         self.has_attr(item, "thread_local")
     }
 
+    /// Whether the static `item` is declared `static mut`.
+    pub(in crate::sema) fn is_static_mut(&self, item: ItemRef) -> bool {
+        let (src, entry) = self.item(item);
+        entry.kind == ItemKind::Static
+            && entry
+                .name
+                .is_some_and(|name| name > entry.start && src.text(name - 1) == "mut")
+    }
+
     /// Whether arithmetic overflow checks are enabled for crate `krate`.
     pub fn overflow_checks(&self, krate: u32) -> bool {
         self.outline.crates[krate as usize].env.overflow_checks()

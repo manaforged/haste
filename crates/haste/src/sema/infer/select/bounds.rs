@@ -586,8 +586,24 @@ impl<'a> Infer<'_, 'a> {
             }
             ok
         } else if let Some(info) = self.cx.ensure_closure(ty) {
-            let (h, child_dep) = self.thread_auto_holds_dep(of, info.env);
+            let (mut h, child_dep) = self.thread_auto_holds_dep(of, info.env);
             dep = child_dep;
+            if h && info.closure.coroutine {
+                for local in &info.typed.locals {
+                    if local.ty == Ty::NONE
+                        || self.cx.types.has_params(local.ty)
+                        || self.cx.types.has_var_flag(local.ty)
+                    {
+                        continue;
+                    }
+                    let (lh, ldep) = self.thread_auto_holds_dep(of, local.ty);
+                    if !lh {
+                        h = false;
+                        break;
+                    }
+                    dep = dep.min(ldep);
+                }
+            }
             h
         } else {
             true
