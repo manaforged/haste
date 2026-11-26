@@ -138,6 +138,7 @@ const SYSCALL_CLOBBERS: [&str; 2] = ["rcx", "r11"];
 enum Instruction<'a> {
     Barrier,
     Fence,
+    ThreadPointer,
     Trap,
     Syscall,
     LockNot(u32),
@@ -165,6 +166,7 @@ pub fn asm(
     match instruction(&text) {
         Some(Instruction::Barrier) => asm_barrier(src, operands, out),
         Some(Instruction::Fence) => asm_fence(src, operands, out),
+        Some(Instruction::ThreadPointer) => asm_thread_pointer(src, operands, out),
         Some(Instruction::Trap) => {
             out.lexed("{ core::intrinsics::abort() }");
             Ok(())
@@ -189,6 +191,11 @@ fn instruction(text: &str) -> Option<Instruction<'_>> {
     match words.as_slice() {
         all if all.iter().all(|word| placeholder(word)) => Some(Instruction::Barrier),
         ["dsb", "sy", "isb"] | ["dmb" | "dsb", _] | ["isb"] => Some(Instruction::Fence),
+        ["mrs", dst, "tpidrro_el0"] | ["mov", dst, "fs:[0]"]
+            if placeholder(dst.trim_end_matches(',')) =>
+        {
+            Some(Instruction::ThreadPointer)
+        }
         ["brk", _] | ["udf", _] | ["ud2"] | ["int", _] => Some(Instruction::Trap),
         ["syscall"] => Some(Instruction::Syscall),
         ["lock", "not", width, "ptr", "[{0}]"] => Some(Instruction::LockNot(memory_bits(width)?)),
@@ -268,6 +275,27 @@ fn asm_fence(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> 
         }
     }
     out.lexed("::core::sync::atomic::fence(::core::sync::atomic::Ordering::SeqCst)");
+    Ok(())
+}
+
+fn asm_thread_pointer(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
+    let mut target = None;
+    for &(from, to) in args.iter().filter(|(from, _)| src.text(*from) != "options") {
+        let op = operand(src, (from, to))?;
+        match (op.input, op.output, target) {
+            (None, Some(output), None) => target = Some(output),
+            _ => bail!(
+                "a thread-pointer read takes one output operand, not `{}`",
+                src.spelled((from, to))
+            ),
+        }
+    }
+    let Some((from, to)) = target else {
+        bail!("a thread-pointer read names no output")
+    };
+    out.lexed("{ unsafe extern \"C\" { fn pthread_self() -> usize; } ");
+    out.copy_range(src, from, to);
+    out.lexed(" = pthread_self(); }");
     Ok(())
 }
 

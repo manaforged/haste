@@ -261,6 +261,30 @@ impl<'a> Infer<'_, 'a> {
             .copied()
             .filter(|candidate| !shadowed(&bounded_at, candidate.of, step_ty))
             .collect();
+        if self.receiver_param.is_some() && !bounded.is_empty() {
+            for autoref in [None, Some(Mut::Not), Some(Mut::Mut)] {
+                if autoref.is_some() && is_var {
+                    continue;
+                }
+                let adjusted = autoref.map_or(step, |mutability| {
+                    self.cx.types.intern(Kind::Ref(mutability, step))
+                });
+                if let Some(pick) = self.trial(|infer| {
+                    let Some(pick) = infer.probe_traits(&bounded, (adjusted, autoref), true)?
+                    else {
+                        return Ok(None);
+                    };
+                    if all_unbounded.is_empty()
+                        || wanted.is_none_or(|wanted| infer.fits_expected(&pick, wanted))
+                    {
+                        return Ok(Some(pick));
+                    }
+                    Ok(None)
+                })? {
+                    return Ok(Some(pick));
+                }
+            }
+        }
         for autoref in [None, Some(Mut::Not), Some(Mut::Mut)] {
             if autoref.is_some() && is_var {
                 continue;
@@ -431,15 +455,12 @@ impl<'a> Infer<'_, 'a> {
                 "unexpected number of arguments",
             ));
         }
-        let hints = self.expected_inputs(&types[1..], ret, expected);
-        for ((arg, param), hint) in given.into_iter().zip(types.into_iter().skip(1)).zip(hints) {
-            self.call_arg(
-                Some((item, &substs[..])),
-                ExprId(arg),
-                (param, hint),
-                &mut None,
-            )?;
-        }
+        self.call_args_ordered(
+            &given,
+            (&types[1..], ret, expected),
+            Some((item, &substs[..])),
+            &mut None,
+        )?;
         Ok(ret)
     }
 }

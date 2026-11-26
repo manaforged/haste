@@ -1,15 +1,17 @@
 mod lex;
 mod storage;
-use lex::{is_trivia, lex, pair_up};
+mod tokens;
+use lex::{lex, pair_up};
 pub use storage::{SourceText, SourceTokens};
+pub use tokens::Tokens;
 
 use super::{rules::Frag, tree::File};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;
-use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
+use rustc_lexer::TokenKind;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 /// One non-trivia token, with the index of its matching delimiter when it opens or closes a group.
@@ -110,6 +112,7 @@ pub struct Source {
     pub outputs: Outputs,
     /// Where the tokens of this layer lie in the file at `path` as read from disk.
     pub origins: Origins,
+    pub(crate) line_starts: OnceLock<Vec<u32>>,
 }
 
 /// Where the tokens of a source lie in the file at its path as read from disk: every token where it is, or the listed tokens, by index, at the byte offsets of the tokens a macro copied them from.
@@ -141,168 +144,6 @@ impl Outputs {
         let found = kept.entry(key).or_insert_with(|| Box::new(output));
         // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
         Ok(unsafe { &*std::ptr::from_ref::<Source>(found) })
-    }
-}
-
-/// Tokens being written by a macro expansion, copied from other sources without lexing them again.
-#[derive(Default)]
-pub struct Tokens {
-    text: String,
-    tokens: Vec<Token>,
-    marks: Vec<(u32, Mark)>,
-    opaque: Vec<(u32, u32, Frag)>,
-    origins: Vec<(u32, u32)>,
-}
-
-fn is_punct_kind(kind: TokenKind) -> bool {
-    !matches!(
-        kind,
-        TokenKind::Ident
-            | TokenKind::RawIdent
-            | TokenKind::Literal { .. }
-            | TokenKind::Lifetime { .. }
-            | TokenKind::RawLifetime
-    )
-}
-
-impl Tokens {
-    fn append(&mut self, kind: TokenKind, text: &str, joint: bool) {
-        let start = self.text.len() as u32;
-        self.text.push_str(text);
-        let joint = joint && is_punct_kind(kind);
-        if !joint {
-            self.text.push(' ');
-        }
-        self.tokens
-            .push(Token::new(kind, start, text.len() as u32, joint));
-    }
-
-    /// Copies token `at` of `src`, with its spacing and its origin mark.
-    pub fn copy(&mut self, src: &Source, at: u32) {
-        let (layer, local) = src.layer(at);
-        self.copy_local(layer, local, layer.own_mark(local as u32));
-    }
-
-    /// Copies token `at` of `src` with its spacing, marked as coming from `mark`.
-    pub fn copy_marked(&mut self, src: &Source, at: u32, mark: Option<Mark>) {
-        let (layer, local) = src.layer(at);
-        self.copy_local(layer, local, mark);
-    }
-
-    fn copy_local(&mut self, layer: &Source, local: usize, mark: Option<Mark>) {
-        let token = layer.tokens.at(local).expect("token index in bounds");
-        if let Some(mark) = mark {
-            self.marks.push((self.tokens.len() as u32, mark));
-        }
-        self.append(
-            token.kind,
-            &layer.text[token.start as usize..token.end() as usize],
-            token.joint(),
-        );
-    }
-
-    /// Writes the name `name`, marked as coming from `mark`.
-    pub fn ident(&mut self, name: &str, mark: Option<Mark>) {
-        if let Some(mark) = mark {
-            self.marks.push((self.tokens.len() as u32, mark));
-        }
-        self.append(TokenKind::Ident, name, false);
-    }
-
-    /// Writes `$crate` for the crate `krate`.
-    pub fn dollar_crate(&mut self, krate: u32) {
-        self.marks
-            .push((self.tokens.len() as u32, Mark::Crate(krate)));
-        self.append(TokenKind::Dollar, "$", true);
-        self.append(TokenKind::Ident, "crate", false);
-    }
-
-    /// Lexes `text`, a short piece that a metavariable expression or a builtin macro made, and writes its tokens.
-    pub fn lexed(&mut self, text: &str) {
-        let mut at = 0;
-        let mut tokens = tokenize(text, FrontmatterAllowed::No).peekable();
-        while let Some(token) = tokens.next() {
-            let piece = &text[at..at + token.len as usize];
-            at += token.len as usize;
-            if !is_trivia(token.kind) {
-                let joint = tokens.peek().is_some_and(|next| !is_trivia(next.kind));
-                self.append(token.kind, piece, joint);
-            }
-        }
-    }
-
-    /// Ends the last token's spacing, so it never joins the next one.
-    pub fn space(&mut self) {
-        if let Some(last) = self.tokens.last_mut().filter(|last| last.joint()) {
-            last.set_joint(false);
-            self.text.push(' ');
-        }
-    }
-
-    /// The written tokens as a source with the name `path`.
-    pub fn finish(self, path: PathBuf) -> Result<Source> {
-        let mut tokens = self.tokens;
-        pair_up(&mut tokens, &path)?;
-        Ok(Source {
-            path,
-            text: self.text.into(),
-            tokens: tokens.into(),
-            marks: self.marks,
-            opaque: self.opaque,
-            base: None,
-            offset: 0,
-            outputs: Outputs::default(),
-            origins: Origins::Copied(self.origins),
-        })
-    }
-
-    /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
-    pub fn finish_over(self, base: Arc<File>) -> Result<Source> {
-        if base.source.base.is_some() {
-            bail!("a layered source cannot be the base of another");
-        }
-        let mut source = self.finish(base.source.path.clone())?;
-        source.offset = base.source.len();
-        source.base = Some(base);
-        Ok(source)
-    }
-
-    /// The number of tokens written so far.
-    pub fn len(&self) -> u32 {
-        self.tokens.len() as u32
-    }
-
-    /// Copies tokens `from..to` of `src`, keeping their spacing, origin marks, places on disk and opaque sub-ranges.
-    pub fn copy_range(&mut self, src: &Source, from: u32, to: u32) {
-        let base = self.len();
-        for at in from..to {
-            if let Some(origin) = src.origin(at) {
-                self.origins.push((self.len(), origin));
-            }
-            self.copy(src, at);
-        }
-        for (op_from, op_to, frag) in src.opaques_in(from, to) {
-            self.opaque
-                .push((base + (op_from - from), base + (op_to - from), frag));
-        }
-    }
-
-    /// Marks the tokens written since `from` as one opaque fragment of kind `frag`.
-    pub fn opaque_from(&mut self, from: u32, frag: Frag) {
-        let to = self.len();
-        if from >= to {
-            return;
-        }
-        let slot = self.opaque.partition_point(|&(start, _, _)| start < from);
-        if self
-            .opaque
-            .get(slot)
-            .is_some_and(|&(start, _, _)| start == from)
-        {
-            self.opaque[slot] = (from, to, frag);
-        } else {
-            self.opaque.insert(slot, (from, to, frag));
-        }
     }
 }
 
@@ -375,6 +216,7 @@ impl Source {
             offset: 0,
             outputs: Outputs::default(),
             origins: Origins::Copied(Vec::new()),
+            line_starts: OnceLock::new(),
         })
     }
 
@@ -649,28 +491,56 @@ impl Source {
             .map_or(src.text.len() as u32, |(start, _)| start)
     }
 
+    /// Byte offsets of every `\n` in this layer's text, computed once on first lookup.
+    pub(crate) fn line_starts(&self) -> &[u32] {
+        self.line_starts.get_or_init(|| {
+            let mut starts = Vec::new();
+            let bytes = self.text.as_bytes();
+            let mut i = 0;
+            while let Some(rel) = bytes[i..].iter().position(|&b| b == b'\n') {
+                let nl = i + rel;
+                starts.push(nl as u32);
+                i = nl + 1;
+            }
+            starts
+        })
+    }
+
+    /// One-based `(line, column)` of byte offset `byte` in this layer's text.
+    pub(crate) fn line_col_at(&self, byte: usize) -> (usize, usize) {
+        let mut byte = byte.min(self.text.len());
+        while byte > 0 && !self.text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        let newlines = self.line_starts();
+        let line_idx = newlines.partition_point(|&nl| (nl as usize) < byte);
+        let line_start = if line_idx == 0 {
+            0
+        } else {
+            newlines[line_idx - 1] as usize + 1
+        };
+        let col = self.text[line_start..byte].chars().count() + 1;
+        (line_idx + 1, col)
+    }
+
     /// The line of token `at` in the text of its layer, counting from one.
     pub fn line(&self, at: u32) -> usize {
         let (src, _) = self.layer(at);
-        src.text[..self.byte(at) as usize].matches('\n').count() + 1
+        src.line_col_at(self.byte(at) as usize).0
     }
 
     /// The column of token `at` in its line, counting characters from one.
     pub fn column(&self, at: u32) -> usize {
         let (src, _) = self.layer(at);
-        let before = &src.text[..self.byte(at) as usize];
-        before[before.rfind('\n').map_or(0, |newline| newline + 1)..]
-            .chars()
-            .count()
-            + 1
+        src.line_col_at(self.byte(at) as usize).1
     }
 
-    /// Resolves token range `start_tok..end_tok` (half-open) to `(path, text, start_byte, end_byte, from_macro)`.
+    /// Resolves token range `start_tok..end_tok` (half-open) to `(layer, start_byte, end_byte, from_macro)`.
     pub(crate) fn token_byte_span(
         &self,
         start_tok: u32,
         end_tok: u32,
-    ) -> Option<(&Path, &str, u32, u32, bool)> {
+    ) -> Option<(&Source, u32, u32, bool)> {
         if self.is_empty() || start_tok >= self.len() {
             return None;
         }
@@ -698,7 +568,7 @@ impl Source {
             let end_byte = same_line_end
                 .unwrap_or_else(|| sb.saturating_add(s_len).min(text_len))
                 .max(sb);
-            return Some((&base.source.path, &base.source.text, sb, end_byte, true));
+            return Some((&base.source, sb, end_byte, true));
         }
         if matches!(s_layer.origins, Origins::Copied(_)) {
             return None;
@@ -720,7 +590,7 @@ impl Source {
         }
         .min(text_len);
         let start_byte = s_start.min(end_byte);
-        Some((&s_layer.path, &s_layer.text, start_byte, end_byte, false))
+        Some((s_layer, start_byte, end_byte, false))
     }
 
     /// The number of tokens, those of the base included.

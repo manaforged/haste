@@ -4,7 +4,7 @@ use rustc_hash::FxHashSet as HashSet;
 use crate::body::sig::{GenericKind, Signature};
 use crate::body::{Args, Bound, Expr, ExprId, List, Ty as AstTy, TyId};
 use crate::outline::source::Source;
-use crate::sema::ty::Kind;
+use crate::sema::ty::{Kind, Ty};
 
 use super::super::bind::push_loan;
 use super::super::calls::{
@@ -15,6 +15,7 @@ use super::super::places::{Place, PlaceStep};
 use super::super::propagate::{BorrowSource, TupleSources, dedup_sources};
 use super::super::{Checker, Loan, State, is_temp_holder};
 use super::is_temp_target;
+use super::types::has_nested_hrtb_ref;
 
 #[derive(Clone)]
 struct CallerLtReq {
@@ -58,7 +59,7 @@ struct ParamBounds {
     req_fn: bool,
     req_fn_mut: bool,
     req_static: bool,
-    hrtb_params: Vec<usize>,
+    hrtb_params: Vec<(usize, bool)>,
     hrtb_non_ret: Vec<usize>,
     caller_lt_params: Vec<CallerLtParam>,
 }
@@ -142,7 +143,7 @@ impl Checker<'_, '_> {
         if ret_has_borrow {
             bounds.hrtb_non_ret
         } else {
-            bounds.hrtb_params
+            bounds.hrtb_params.into_iter().map(|(i, _)| i).collect()
         }
     }
 
@@ -304,8 +305,13 @@ impl Checker<'_, '_> {
                                     let is_hrtb = (in_lts.has_elided && in_lts.named.is_empty())
                                         || outer_named_hrtb.is_some();
                                     if is_hrtb {
-                                        if !out.hrtb_params.contains(&p_idx) {
-                                            out.hrtb_params.push(p_idx);
+                                        let nested = has_nested_hrtb_ref(sig, src, TyId(in_ty));
+                                        if let Some(entry) =
+                                            out.hrtb_params.iter_mut().find(|(i, _)| *i == p_idx)
+                                        {
+                                            entry.1 |= nested;
+                                        } else {
+                                            out.hrtb_params.push((p_idx, nested));
                                         }
                                         let ret_uses_hrtb = outer_named_hrtb
                                             .map_or(out_elided, |name| {
@@ -346,6 +352,15 @@ impl Checker<'_, '_> {
         self.check_caller_lt_sources(expr, &sources, requires_static, req_named_lts, outer_hrtb)
     }
 
+    fn source_peeled_outer_ref(&mut self, expr: ExprId, s: &BorrowSource) -> bool {
+        let c_ty = self.local_ty(s.target);
+        let e_ty = self.expr_ty(expr);
+        self.is_ref_ty(c_ty)
+            && e_ty != Ty::NONE
+            && (s.steps.iter().any(|st| matches!(st, PlaceStep::Deref))
+                || self.ty_max_ref_depth(e_ty) < self.ty_max_ref_depth(c_ty))
+    }
+
     fn check_caller_lt_sources(
         &mut self,
         expr: ExprId,
@@ -356,6 +371,7 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         let in_const = self.is_const_or_static_item();
         let plain = self.expr_plain_local(expr);
+        let expr_depth = self.ty_max_ref_depth(self.expr_ty(expr));
         for s in sources {
             if is_temp_target(s.target).is_some() {
                 if in_const
@@ -367,18 +383,29 @@ impl Checker<'_, '_> {
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));
             }
             if let Some(origins) = self.closure_param_origins.get(&s.target).cloned() {
+                let peeled = outer_hrtb || self.source_peeled_outer_ref(expr, s);
                 self.check_caller_lt_sources(
                     expr,
                     &origins,
                     requires_static,
                     req_named_lts,
-                    outer_hrtb,
+                    peeled,
                 )?;
                 continue;
             }
-            let peel_outer = outer_hrtb
-                && self.is_ref_ty(self.local_ty(s.target))
-                && (plain == Some(s.target) || s.through_ref);
+            let target_ty = self.local_ty(s.target);
+            let peel_by_origin = (outer_hrtb || s.origin_only)
+                && self.is_ref_ty(target_ty)
+                && matches!(
+                    *self.cx.types.kind(target_ty),
+                    Kind::Ref(_, pointee)
+                        if self.expr_ty(expr) != Ty::NONE
+                            && expr_depth <= self.ty_max_ref_depth(pointee)
+                );
+            let peel_outer = peel_by_origin
+                || (outer_hrtb
+                    && self.is_ref_ty(target_ty)
+                    && (plain == Some(s.target) || s.through_ref));
             let lt_mismatch = if requires_static {
                 self.is_non_static_param(s.target)
                     && !(peel_outer && self.param_inner_is_static(s.target))
@@ -395,7 +422,8 @@ impl Checker<'_, '_> {
 
     pub(in super::super) fn fn_arg_returns_static(&mut self, arg: ExprId) -> bool {
         let arg = self.unwrap_parens(arg);
-        let Some(crate::sema::infer::Res::Fn(f_item, _)) = self.typed.res.get(&arg).copied() else {
+        let Some(crate::sema::infer::Res::Fn(f_item, substs)) = self.typed.res.get(&arg).copied()
+        else {
             return false;
         };
         let Ok(sig) = self.cx.signature(f_item) else {
@@ -405,7 +433,18 @@ impl Checker<'_, '_> {
         let sig_src = self.cx.item(f_item).0;
         let mut lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut lts);
-        sig_returns_only_static(&sig, sig_src, ret_ast, &lts)
+        if sig_returns_only_static(&sig, sig_src, ret_ast, &lts) {
+            return true;
+        }
+        if !sig.is_async && !lts.has_elided && lts.named.is_empty() {
+            let args = self.cx.types.substs(substs).to_vec();
+            if let Ok((_, ret_ty)) = crate::sema::infer::detached(self.cx, self.item, |infer| {
+                infer.fn_types(f_item, &args)
+            }) {
+                return !self.ty_holds_non_dyn_borrow(ret_ty);
+            }
+        }
+        false
     }
 
     pub(super) fn check_closure_effects(
@@ -443,7 +482,7 @@ impl Checker<'_, '_> {
         req_fn: bool,
         req_fn_mut: bool,
         req_static: bool,
-        hrtb_params: &[usize],
+        hrtb_params: &[(usize, bool)],
         hrtb_non_ret: &[usize],
     ) -> Result<()> {
         let Some(c_expr) = self.closure_expr_of(expr) else {
@@ -455,11 +494,11 @@ impl Checker<'_, '_> {
         let Some(eff) = self.closure_effects.get(&c_expr) else {
             return Ok(());
         };
-        if eff
-            .param_loans
-            .iter()
-            .any(|pl| hrtb_params.contains(&pl.param_idx) && !pl.derefs_past_outer_ref)
-            || eff.ret_params.iter().any(|p| hrtb_non_ret.contains(p))
+        if eff.param_loans.iter().any(|pl| {
+            hrtb_params
+                .iter()
+                .any(|&(idx, nested)| idx == pl.param_idx && (nested || !pl.derefs_past_outer_ref))
+        }) || eff.ret_params.iter().any(|p| hrtb_non_ret.contains(p))
         {
             return Err(self.borrow_err(Some(expr), "borrowed data escapes outside of closure"));
         }
@@ -613,20 +652,8 @@ impl Checker<'_, '_> {
             }
             if let Some(param_idx) = closure_params.iter().position(|&p| p == l.target) {
                 let target_ty = self.local_ty(l.target);
-                let copies_inner_ref = !l.steps.is_empty()
-                    && l.steps.iter().all(|s| matches!(s, PlaceStep::Deref))
-                    && target_ty != crate::sema::ty::Ty::NONE
-                    && matches!(
-                        *self.cx.types.kind(target_ty),
-                        Kind::Ref(_, inner)
-                            if matches!(*self.cx.types.kind(inner), Kind::Ref(crate::sema::ty::Mut::Not, _))
-                    );
-                let derefs_past_outer_ref = l
-                    .steps
-                    .iter()
-                    .filter(|s| matches!(s, PlaceStep::Deref))
-                    .count()
-                    >= 2;
+                let (copies_inner_ref, derefs_past_outer_ref) =
+                    self.closure_param_loan_flags(target_ty, &l.steps);
                 param_loans.push(ClosureParamLoan {
                     param_idx,
                     holder,

@@ -88,6 +88,19 @@ impl Infer<'_, '_> {
         if let Some((member, args)) = self.inherent_member(owner, name)? {
             return self.member_value(member, args, given);
         }
+        if let Kind::Adt(item, substs) = *self.cx.types.kind(self.resolve(owner))
+            && self.cx.item(item).1.kind == ItemKind::Enum
+            && let Ok(def) = self.cx.adt_def(item)
+        {
+            let src = self.cx.item(item).0;
+            if let Some(variant) = def
+                .variants
+                .iter()
+                .position(|v| plain(src.text(v.name)) == name)
+            {
+                return self.ctor_value((item, variant as u32, substs));
+            }
+        }
         if let Kind::Dyn(of, args, members, _) = *self.cx.types.kind(owner)
             && self.cx.trait_member(of, name).is_some()
         {

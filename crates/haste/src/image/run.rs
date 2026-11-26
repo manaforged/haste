@@ -26,13 +26,15 @@ impl Image {
         })
     }
 
-    /// Runs a single `#[test]` function in a forked child with stderr captured, returning `(exit_status, stderr)`.
+    /// Runs a single `#[test]` function in a forked child, capturing stdout and stderr unless `nocapture` is true.
     #[cfg(unix)]
     pub fn run_test_captured(
         &self,
         index: usize,
         start: Option<usize>,
         name: &str,
+        env: &[(String, String)],
+        nocapture: bool,
     ) -> Result<(i32, String)> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
@@ -43,17 +45,30 @@ impl Image {
         {
             bail!("{name} has no start wrapper (slot {s})");
         }
-        let (pid, mut stderr_pipe) = fork_piped(|writer| {
+        let (pid, mut output_pipe) = fork_piped(|writer| {
+            for (key, value) in env {
+                // SAFETY: single-threaded forked child process before invoking test function.
+                unsafe { std::env::set_var(key, value) };
+            }
             crate::host::unwind::set_jit_unwind_head(self.unwind_head);
-            let raw = std::os::fd::AsRawFd::as_raw_fd(&writer);
-            if raw != libc::STDERR_FILENO {
-                // SAFETY: raw is a live pipe write fd distinct from STDERR_FILENO; dup2 redirects child stderr to it before running the test.
-                unsafe {
-                    libc::dup2(raw, libc::STDERR_FILENO);
-                }
+            if nocapture {
                 drop(writer);
             } else {
-                std::mem::forget(writer);
+                let raw = std::os::fd::AsRawFd::as_raw_fd(&writer);
+                // SAFETY: raw is a live pipe write fd; dup2 redirects child stdout and stderr to it before running the test.
+                unsafe {
+                    if raw != libc::STDOUT_FILENO {
+                        libc::dup2(raw, libc::STDOUT_FILENO);
+                    }
+                    if raw != libc::STDERR_FILENO {
+                        libc::dup2(raw, libc::STDERR_FILENO);
+                    }
+                }
+                if raw != libc::STDOUT_FILENO && raw != libc::STDERR_FILENO {
+                    drop(writer);
+                } else {
+                    std::mem::forget(writer);
+                }
             }
             if let Some(start) = start {
                 let status = self.enter_main((start, index), &[name.to_owned()]);
@@ -68,9 +83,9 @@ impl Image {
             }
             Ok::<(), std::io::Error>(())
         })?;
-        let mut stderr = Vec::new();
-        std::io::Read::read_to_end(&mut stderr_pipe, &mut stderr)?;
-        Ok((wait(pid), String::from_utf8_lossy(&stderr).into_owned()))
+        let mut output = Vec::new();
+        std::io::Read::read_to_end(&mut output_pipe, &mut output)?;
+        Ok((wait(pid), String::from_utf8_lossy(&output).into_owned()))
     }
 
     /// Runs a single `#[test]` function in-process on non-Unix platforms, returning `(exit_status, stderr)`.
@@ -80,6 +95,8 @@ impl Image {
         index: usize,
         start: Option<usize>,
         name: &str,
+        _env: &[(String, String)],
+        _nocapture: bool,
     ) -> Result<(i32, String)> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
@@ -105,32 +122,7 @@ impl Image {
         Ok((if panicked { 101 } else { 0 }, String::new()))
     }
 
-    /// Runs each `#[test]` function `(index, start_index, name)` in a forked child and returns each test's exit status (0 for pass, non-zero for panic/Err).
-    pub fn run_tests(&self, tests: &[(usize, Option<usize>, &str)]) -> Result<Vec<i32>> {
-        let pairs: Vec<(usize, &str)> = tests.iter().map(|&(idx, _, name)| (idx, name)).collect();
-        if let Some((_, Some(start), name)) = tests
-            .iter()
-            .find(|(_, start, _)| start.is_some_and(|s| self.slot(s).load(Ordering::Acquire) == 0))
-        {
-            bail!("{name} has no start wrapper (slot {start})");
-        }
-        let starts: Vec<Option<usize>> = tests.iter().map(|&(_, start, _)| start).collect();
-        self.run_batch(&pairs, true, |pos, address, name| {
-            if let Some(start) = starts[pos] {
-                let status = self.enter_main((start, pairs[pos].0), &[name.to_owned()]);
-                if status != 0 {
-                    std::process::exit(status);
-                }
-            } else {
-                // SAFETY: address is code that the encoder wrote for a native fn() signature, checked to be set before the fork.
-                let test_fn: extern "C" fn() =
-                    unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
-                test_fn();
-            }
-            Ok(())
-        })
-    }
-
+    #[cfg(feature = "diff-harness")]
     fn run_batch(
         &self,
         items: &[(usize, &str)],
@@ -157,7 +149,7 @@ impl Image {
         Ok(statuses)
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "diff-harness"))]
     fn run_from(
         &self,
         offset: usize,
@@ -176,7 +168,7 @@ impl Image {
         Ok((done.len(), wait(pid)))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), feature = "diff-harness"))]
     fn run_from(
         &self,
         offset: usize,
@@ -193,7 +185,7 @@ impl Image {
         Ok((items.len(), 0))
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "diff-harness"))]
     fn run_in_child(
         &self,
         offset: usize,
@@ -241,7 +233,7 @@ impl Image {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "diff-harness"))]
 fn silence_stderr() {
     // SAFETY: c"/dev/null" is a static NUL-terminated path, and O_WRONLY | O_CLOEXEC takes no mode argument.
     let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
@@ -291,6 +283,7 @@ pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
         bail!("fork failed: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
+        super::statics::reset_after_fork();
         #[cfg(target_os = "linux")]
         // SAFETY: PR_SET_DUMPABLE with 0 only clears this child's dumpable flag, so a crash dumps no core of the whole compiler.
         unsafe {

@@ -1,6 +1,6 @@
 [package]
 name = "haste"
-description = "A Rust compiler and execution engine for running, testing, and building workspaces without a target/ directory"
+description = "Standalone Rust compiler, JIT runner, and zero-linker AOT builder with no LLVM and no per-project target/ directory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

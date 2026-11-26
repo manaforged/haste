@@ -193,6 +193,12 @@ impl Infer<'_, '_> {
         if self.compiler_trait(of) {
             return Ok(self.compiler_holds(of, from));
         }
+        if self.poly.is_some()
+            && (self.has_params(from) || self.any_has_params(given))
+            && self.poly_holds_in_env(of, from, given)?
+        {
+            return Ok(true);
+        }
         if !self.is_callable_trait(of) {
             return Ok(self.compiler_impl(of, from) || self.select(of, from, given)?.is_some());
         }

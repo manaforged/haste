@@ -18,7 +18,7 @@ mod workers;
 pub(super) use backend::ImageBackend;
 pub use backend::ImageMode;
 pub use expand::{Job, run_macros};
-pub use lazy::{Driver, Ended, Jit, Program, entries, evaluator, serve};
+pub use lazy::{Driver, Ended, Jit, Program, ReloadError, entries, evaluator, serve};
 pub(crate) use run::interrupted;
 #[cfg(unix)]
 pub(crate) use run::{close_on_exec, fork_child, pipe, wait};
@@ -318,7 +318,7 @@ impl Image {
     }
 
     pub(super) fn compile_target(&self) -> haste_codegen::Target {
-        let base = if self.backend.is_fast_jit() {
+        let base = if self.backend.is_fast_jit() || self.backend.is_optimized_jit() {
             haste_codegen::Target::host().effort(haste_codegen::Effort::Quick)
         } else {
             crate::host_target()
@@ -483,7 +483,10 @@ impl Image {
     }
 
     pub(super) fn is_fast_lazy(&self) -> bool {
-        matches!(self.backend, ImageBackend::LazyJit { fast: true })
+        matches!(
+            self.backend,
+            ImageBackend::LazyJit { fast: true, .. } | ImageBackend::LazyJit { optimize: true, .. }
+        )
     }
 
     fn compile_one(

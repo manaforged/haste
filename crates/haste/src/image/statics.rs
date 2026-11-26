@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,7 +31,57 @@ struct ThreadState {
     filling: Vec<usize>,
 }
 
+const FAST_SLOTS: usize = 32;
+
+static MAIN_TP: AtomicUsize = AtomicUsize::new(0);
+static MAIN_CELLS: [AtomicUsize; FAST_SLOTS] = [const { AtomicUsize::new(0) }; FAST_SLOTS];
+
+/// Clears the main-thread fast TLS cache after `fork` so a child never inherits parent image cells.
+#[cfg(unix)]
+pub(super) fn reset_after_fork() {
+    MAIN_TP.store(0, Ordering::Relaxed);
+    for cell in &MAIN_CELLS {
+        cell.store(0, Ordering::Relaxed);
+    }
+    FAST_CELLS.with(|cells| {
+        // SAFETY: called in a freshly forked single-threaded child before any JIT code runs.
+        unsafe { *cells.get() = [0; FAST_SLOTS] };
+    });
+    THREAD_STATE.with(|state| state.set(std::ptr::null_mut()));
+}
+
+#[inline(always)]
+fn current_tp() -> usize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let tp: usize;
+        // SAFETY: reading the read-only user thread-pointer register has no side effects.
+        unsafe {
+            std::arch::asm!("mrs {}, tpidrro_el0", out(reg) tp, options(nomem, nostack, preserves_flags));
+        }
+        tp & !7
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let tp: usize;
+        // SAFETY: fs:[0] holds the current thread's self-pointer in the Linux x86-64 TLS ABI.
+        unsafe {
+            std::arch::asm!("mov {}, fs:[0]", out(reg) tp, options(nostack, readonly, preserves_flags));
+        }
+        tp
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )))]
+    {
+        0
+    }
+}
+
 thread_local! {
+    static FAST_CELLS: std::cell::UnsafeCell<[usize; FAST_SLOTS]> =
+        const { std::cell::UnsafeCell::new([0; FAST_SLOTS]) };
     static THREAD_STATE: std::cell::Cell<*mut ThreadState> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
@@ -82,6 +132,22 @@ pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
 
 /// The calling thread's cell of `size` zeroed bytes for the `#[thread_local]` static with thread slot `slot`.
 pub(crate) extern "C" fn thread_cell(slot: usize, size: usize, init_slot: usize) -> usize {
+    let tp = current_tp();
+    if slot < FAST_SLOTS && tp != 0 && tp == MAIN_TP.load(Ordering::Relaxed) {
+        let cell = MAIN_CELLS[slot].load(Ordering::Relaxed);
+        if cell != 0 {
+            return cell;
+        }
+    }
+    if slot < FAST_SLOTS {
+        let cell = FAST_CELLS.with(|cells| {
+            // SAFETY: FAST_CELLS is thread-local and only read here while no mutable reference exists.
+            unsafe { (*cells.get())[slot] }
+        });
+        if cell != 0 {
+            return cell;
+        }
+    }
     let cell = {
         let state = thread_state();
         if let Some(&cell) = state.cells.get(slot)
@@ -91,6 +157,23 @@ pub(crate) extern "C" fn thread_cell(slot: usize, size: usize, init_slot: usize)
         }
         new_cell(state, slot, size)
     };
+    if slot < FAST_SLOTS {
+        FAST_CELLS.with(|cells| {
+            // SAFETY: FAST_CELLS is thread-local and no other reference to this slot is live.
+            unsafe { (*cells.get())[slot] = cell };
+        });
+        if tp != 0 {
+            let main = MAIN_TP.load(Ordering::Relaxed);
+            if main == tp
+                || (main == 0
+                    && MAIN_TP
+                        .compare_exchange(0, tp, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok())
+            {
+                MAIN_CELLS[slot].store(cell, Ordering::Release);
+            }
+        }
+    }
     if init_slot != 0 {
         // SAFETY: init_slot points to the 8-byte function slot holding this static's zero-arg initializer.
         let code = unsafe { *(init_slot as *const usize) };

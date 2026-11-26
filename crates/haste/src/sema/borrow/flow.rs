@@ -404,6 +404,10 @@ impl Checker<'_, '_> {
                     scope_depth,
                     drop_temps,
                 )?;
+                let mut rhs_live = then_live.clone();
+                rhs_live.extend(else_live.iter().copied());
+                self.collect_live_expr(b, &mut rhs_live);
+                prune_dead_loans(then_state, &rhs_live);
                 let mut rhs_else = then_state.clone();
                 self.check_cond_for_branches(
                     b,

@@ -163,6 +163,7 @@ struct Checker<'c, 'a> {
     returns_only_static: bool,
     ret_named_lts: Vec<&'c str>,
     param_lts: calls::ParamLifetimes,
+    static_type_params: Vec<u16>,
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
@@ -275,7 +276,8 @@ pub(super) fn check(
     } else {
         (false, Vec::new())
     };
-    let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
+    let (static_type_params, static_names) = checks::compute_static_type_params(cx, item, sig, src);
+    let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, (n, &static_names));
     let mut checker = Checker {
         cx,
         item,
@@ -292,6 +294,7 @@ pub(super) fn check(
         returns_only_static,
         ret_named_lts,
         param_lts,
+        static_type_params,
         return_min_depth: 1,
         closure_depth: 0,
         const_depth: 0,
@@ -329,14 +332,7 @@ pub(super) fn check(
     }
     checker.returns_borrow = typed.ret.is_some_and(|ty| checker.ty_holds_borrow(ty));
     let mut state = State::new(init);
-    let param_offset = usize::from(sig.receiver.is_some());
-    for (idx, &pat) in body.fn_params.iter().enumerate() {
-        let fallback = typed
-            .params
-            .get(param_offset + idx)
-            .map(|&pl| vec![checker.param_fallback_source(pl)]);
-        checker.bind_pat_param(pat, fallback.as_deref().unwrap_or(&[]), &mut state)?;
-    }
+    checker.bind_fn_params(sig, &mut state)?;
     let empty_live = HashSet::default();
     let root_place_ctx = checker.is_mut_ref_ty(checker.expr_ty(root))
         && typed.ret.is_some_and(|r| checker.is_mut_ref_ty(r));
@@ -680,9 +676,24 @@ impl Checker<'_, '_> {
     }
 
     fn check_return_sources(&mut self, expr: ExprId, sources: &[BorrowSource]) -> Result<()> {
-        if let Some(active) = self.active_closures.last_mut() {
-            for src in sources {
-                if let Some(idx) = active.params.iter().position(|&p| p == src.target)
+        let expr_depth = self.ty_max_ref_depth(self.expr_ty(expr));
+        for src in sources {
+            let target_ty = self.local_ty(src.target);
+            let inner = if target_ty != Ty::NONE {
+                match *self.cx.types.kind(target_ty) {
+                    Kind::Ref(_, inner) => Some(inner),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let past_outer = src.origin_only
+                && inner.is_some_and(|i| {
+                    self.ty_holds_non_dyn_borrow(i) && expr_depth <= self.ty_max_ref_depth(i)
+                });
+            if let Some(active) = self.active_closures.last_mut() {
+                if !past_outer
+                    && let Some(idx) = active.params.iter().position(|&p| p == src.target)
                     && !active.ret_params.contains(&idx)
                 {
                     active.ret_params.push(idx);

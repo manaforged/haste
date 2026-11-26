@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+mod cache;
 pub mod cfg;
 mod features;
 pub mod lock;
@@ -10,6 +11,7 @@ pub mod manifest;
 pub mod script;
 pub mod store;
 
+use cache::{SourceCatalog, patch_paths, source_dir, subdirs};
 use lock::Locked;
 use manifest::{Kind, Manifest};
 
@@ -72,104 +74,10 @@ pub struct Workspace {
     pub graph: Graph,
 }
 
-fn cargo_home() -> Result<PathBuf> {
-    let home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
-    home.context("no CARGO_HOME or HOME")
-}
-
-fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
-    Ok(std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_dir())
-        .collect())
-}
-
-fn registry_dirs() -> Result<Vec<PathBuf>> {
-    let dir = cargo_home()?.join("registry/src");
-    match std::fs::read_dir(&dir) {
-        Ok(entries) => Ok(entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir())
-            .collect()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err).with_context(|| format!("reading {}", dir.display())),
-    }
-}
-
-fn registries_with_vendor(top: &Path) -> Result<Vec<PathBuf>> {
-    let mut dirs = registry_dirs()?;
-    dirs.insert(0, top.join("vendor"));
-    Ok(dirs)
-}
-
-fn source_dir(
-    locked: &Locked,
-    registries: &[PathBuf],
-    paths: &BTreeMap<String, PathBuf>,
-) -> Result<PathBuf> {
-    if let Some((url, commit)) = locked.git() {
-        return git_dir(&locked.name, url, commit);
-    }
-    if !locked.is_registry() {
-        return paths
-            .get(&locked.name)
-            .cloned()
-            .with_context(|| format!("no path for local package {}", locked.name));
-    }
-    let leaf = format!("{}-{}", locked.name, locked.version);
-    registries
-        .iter()
-        .map(|dir| dir.join(&leaf))
-        .find(|dir| dir.is_dir())
-        .with_context(|| format!("{leaf} is not in the registry source cache"))
-}
-
-fn git_dir(name: &str, url: &str, commit: &str) -> Result<PathBuf> {
-    let repo = url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(".git");
-    let short = commit.get(..7).unwrap_or(commit);
-    let checkouts = subdirs(&cargo_home()?.join("git/checkouts"))?;
-    let mine = checkouts.into_iter().filter(|dir| {
-        dir.file_name()
-            .is_some_and(|leaf| leaf.to_string_lossy().starts_with(&format!("{repo}-")))
-    });
-    mine.map(|dir| dir.join(short))
-        .filter(|dir| dir.is_dir())
-        .find_map(|root| find_package(&root, name))
-        .with_context(|| format!("{name} at {short} is not in the git checkouts of {url}"))
-}
-
-fn find_package(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut stack = vec![root.to_owned()];
-    while let Some(dir) = stack.pop() {
-        if manifest_name(&dir).as_deref() == Some(name) {
-            return Some(dir);
-        }
-        let skip = |path: &PathBuf| {
-            path.file_name()
-                .is_some_and(|leaf| leaf == "target" || leaf.to_string_lossy().starts_with('.'))
-        };
-        stack.extend(
-            subdirs(&dir)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|path| !skip(path)),
-        );
-    }
-    None
-}
-
 pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
 pub(crate) const LOCK_FILE: &str = "Cargo.lock";
 
-fn manifest_name(dir: &Path) -> Option<String> {
+pub(super) fn manifest_name(dir: &Path) -> Option<String> {
     let table: toml::Table =
         toml::from_str(&std::fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?).ok()?;
     Some(table.get("package")?.get("name")?.as_str()?.to_owned())
@@ -186,46 +94,6 @@ fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
         }
     }
     Ok(None)
-}
-
-fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = patches_in(&dir.join(MANIFEST_FILE), dir)?;
-    for at in dir.ancestors() {
-        let config = [".cargo/config.toml", ".cargo/config"]
-            .map(|leaf| at.join(leaf))
-            .into_iter()
-            .find(|path| path.is_file());
-        if let Some(config) = config {
-            paths.extend(patches_in(&config, at)?);
-        }
-    }
-    if let Ok(home) = cargo_home() {
-        let config = ["config.toml", "config"]
-            .map(|leaf| home.join(leaf))
-            .into_iter()
-            .find(|path| path.is_file());
-        if let Some(config) = config {
-            paths.extend(patches_in(&config, &home)?);
-        }
-    }
-    Ok(paths)
-}
-
-fn patches_in(file: &Path, base: &Path) -> Result<Vec<PathBuf>> {
-    let table: toml::Table = toml::from_str(&std::fs::read_to_string(file)?)
-        .with_context(|| format!("parsing {}", file.display()))?;
-    let patches = table
-        .get("patch")
-        .and_then(toml::Value::as_table)
-        .into_iter()
-        .flat_map(|patch| patch.values());
-    let entries = patches
-        .filter_map(toml::Value::as_table)
-        .flat_map(|source| source.values());
-    Ok(entries
-        .filter_map(|entry| entry.get("path")?.as_str())
-        .map(|path| manifest::normalize(&base.join(path)))
-        .collect())
 }
 
 fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<PathBuf> {
@@ -250,6 +118,7 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
 fn run_cargo(manifest_dir: &Path, args: &[&str]) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
     let out = std::process::Command::new(cargo)
+        .current_dir(manifest_dir)
         .args(args)
         .args(["--quiet", "--manifest-path"])
         .arg(manifest_dir.join(MANIFEST_FILE))
@@ -410,10 +279,10 @@ pub(crate) fn load(
 
 fn load_package(
     entry: Locked,
-    registries: &[PathBuf],
+    catalog: &SourceCatalog,
     paths: &BTreeMap<String, PathBuf>,
 ) -> Result<(Package, Option<anyhow::Error>)> {
-    match source_dir(&entry, registries, paths) {
+    match source_dir(&entry, catalog, paths) {
         Ok(dir) => {
             let owner = if entry.is_registry() {
                 None
@@ -451,10 +320,10 @@ fn load_package(
 
 fn load_packages(
     locked: Vec<Locked>,
-    registries: &[PathBuf],
+    catalog: &SourceCatalog,
     paths: &BTreeMap<String, PathBuf>,
 ) -> Result<(Vec<Package>, Vec<Option<anyhow::Error>>)> {
-    let results = crate::sync::parallel_map(locked, |entry| load_package(entry, registries, paths));
+    let results = crate::sync::parallel_map(locked, |entry| load_package(entry, catalog, paths));
     let mut packages = Vec::with_capacity(results.len());
     let mut missing = Vec::with_capacity(results.len());
     for res in results {
@@ -554,8 +423,14 @@ fn load_filtered(
     (default_features, all_features): (bool, bool),
     (omit_root_deps, allow_fetch): (&[&str], bool),
 ) -> Result<Workspace> {
+    if !root.exists() {
+        bail!("path does not exist: {}", root.display());
+    }
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
-    let root = canonical.as_path();
+    let root = canonical
+        .ancestors()
+        .find(|dir| dir.join(MANIFEST_FILE).is_file())
+        .unwrap_or(canonical.as_path());
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
     let root_names = match package {
@@ -572,9 +447,9 @@ fn load_filtered(
         .filter(|e| !e.is_registry())
         .map(|e| e.name.clone())
         .collect();
-    let registries = registries_with_vendor(&top)?;
+    let catalog = SourceCatalog::load(&top)?;
     let paths = local_paths(root, &top, workspace.as_ref(), &wanted_local)?;
-    let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
+    let (mut packages, mut missing) = load_packages(locked, &catalog, &paths)?;
     if !omit_root_deps.is_empty() {
         for pkg in packages
             .iter_mut()
@@ -600,56 +475,58 @@ fn load_filtered(
             None => bail!("{} is not in {LOCK_FILE}", root.display()),
         }
     }
-    let mut graph = features::resolve(
-        &packages,
-        targets,
-        &members,
-        features,
-        default_features,
-        all_features,
-    )?;
-    let is_external = |pkg: &Package| pkg.locked.is_registry() || pkg.locked.git().is_some();
-    if allow_fetch
-        && graph
-            .units
-            .iter()
-            .any(|u| missing[u.package].is_some() && is_external(&packages[u.package]))
-    {
-        eprintln!("haste: fetching missing dependencies with `cargo fetch`...");
-        if let Err(fetch_err) = run_cargo(&top, &["fetch", "--locked"]) {
-            let first = graph
-                .units
-                .iter()
-                .find_map(|u| missing[u.package].as_ref())
-                .map(|e| format!("{e:#}"))
-                .unwrap_or_default();
-            bail!("{first} (automatic `cargo fetch` failed: {fetch_err:#})");
-        }
-        let fresh_regs = registries_with_vendor(&top)?;
-        let retry_idxs: Vec<usize> = missing
-            .iter()
-            .enumerate()
-            .filter(|&(idx, err)| err.is_some() && is_external(&packages[idx]))
-            .map(|(idx, _)| idx)
-            .collect();
-        let retry_entries: Vec<Locked> = retry_idxs
-            .iter()
-            .map(|&idx| packages[idx].locked.clone())
-            .collect();
-        let (reloaded, retry_missing) = load_packages(retry_entries, &fresh_regs, &paths)?;
-        for ((idx, pkg), err) in retry_idxs.into_iter().zip(reloaded).zip(retry_missing) {
-            (packages[idx], missing[idx]) = (pkg, err);
-        }
-        resolve_deps(&mut packages);
-        graph = features::resolve(
-            &packages,
+    let resolve = |pkgs: &[Package]| {
+        features::resolve(
+            pkgs,
             targets,
             &members,
             features,
             default_features,
             all_features,
-        )?;
-    }
+        )
+    };
+    let is_external = |pkg: &Package| pkg.locked.is_registry() || pkg.locked.git().is_some();
+    let resolved = resolve(&packages);
+    let needs_fetch = match &resolved {
+        Ok(graph) => graph
+            .units
+            .iter()
+            .any(|u| missing[u.package].is_some() && is_external(&packages[u.package])),
+        Err(_) => missing
+            .iter()
+            .enumerate()
+            .any(|(idx, err)| err.is_some() && is_external(&packages[idx])),
+    };
+    let graph = if allow_fetch && !catalog.offline && needs_fetch {
+        eprintln!("haste: fetching missing dependencies with `cargo fetch`...");
+        if let Err(fetch_err) = run_cargo(&top, &["fetch", "--locked"]) {
+            let first = match &resolved {
+                Ok(graph) => graph
+                    .units
+                    .iter()
+                    .find_map(|u| missing[u.package].as_ref())
+                    .map(|e| format!("{e:#}")),
+                Err(err) => Some(format!("{err:#}")),
+            }
+            .unwrap_or_default();
+            bail!("{first} (automatic `cargo fetch` failed: {fetch_err:#})");
+        }
+        let fresh_catalog = SourceCatalog::load(&top)?;
+        let (retry_idxs, retry_entries): (Vec<usize>, Vec<Locked>) = missing
+            .iter()
+            .enumerate()
+            .filter(|&(idx, err)| err.is_some() && is_external(&packages[idx]))
+            .map(|(idx, _)| (idx, packages[idx].locked.clone()))
+            .unzip();
+        let (reloaded, retry_missing) = load_packages(retry_entries, &fresh_catalog, &paths)?;
+        for ((idx, pkg), err) in retry_idxs.into_iter().zip(reloaded).zip(retry_missing) {
+            (packages[idx], missing[idx]) = (pkg, err);
+        }
+        resolve_deps(&mut packages);
+        resolve(&packages)?
+    } else {
+        resolved?
+    };
     for unit in &graph.units {
         if let Some(err) = missing[unit.package].take() {
             return Err(err);
@@ -661,7 +538,14 @@ fn load_filtered(
 /// The standard library sources of the toolchain: `HASTE_LIBRARY`, the active `rustc` sysroot's `rust-src`, or the newest rustup toolchain with `rust-src` (preferring `stable-*`).
 pub fn library() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os(crate::LIBRARY_ENV) {
-        return Ok(PathBuf::from(dir));
+        let path = PathBuf::from(dir);
+        if !path.join("sysroot").is_dir() {
+            anyhow::bail!(
+                "HASTE_LIBRARY `{}` does not contain a `sysroot` directory (expected rust-src library dir)",
+                path.display()
+            );
+        }
+        return Ok(path);
     }
     let sysroot_library = |root: &Path| {
         let dir = root.join("lib/rustlib/src/rust/library");

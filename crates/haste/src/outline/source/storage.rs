@@ -215,24 +215,36 @@ impl SourceTokens {
     }
 
     /// Returns token `index` in O(1), decoding only that 14-byte record from mmap when lazy.
-    #[inline]
+    #[inline(always)]
     pub fn at(&self, index: usize) -> Option<Token> {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.get(index).copied(),
-            TokensRepr::Lazy {
-                ptr,
-                byte_len,
-                count,
-                ..
-            } => {
-                if index >= *count {
-                    return None;
-                }
-                // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
-                let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
-                Some(decode_token_at(bytes, index * TOKEN_WIRE_LEN))
-            }
+            TokensRepr::Lazy { .. } => self.at_lazy(index),
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn at_lazy(&self, index: usize) -> Option<Token> {
+        let TokensRepr::Lazy {
+            ptr,
+            byte_len,
+            count,
+            decoded,
+            ..
+        } = &self.0
+        else {
+            unreachable!()
+        };
+        if let Some(tokens) = decoded.get() {
+            return tokens.get(index).copied();
+        }
+        if index >= *count {
+            return None;
+        }
+        // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
+        let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
+        Some(decode_token_at(bytes, index * TOKEN_WIRE_LEN))
     }
 
     /// Returns `(start, raw_len)` of token `index` in O(1) without decoding its `TokenKind`.

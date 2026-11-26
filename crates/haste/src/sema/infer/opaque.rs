@@ -556,11 +556,16 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> R
     if let Some(future) = async_future(cx, item, substs)? {
         return Ok(future);
     }
+    if let Some(&ret) = cx.reveals_local.get(&(item, substs)) {
+        return Ok(ret);
+    }
     if let Some(typed) = cx.store.finals.get(&(item, substs)) {
         super::closure::register(cx, (item, substs), &typed);
-        return typed
+        let ret = typed
             .ret
-            .ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)));
+            .ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))?;
+        cx.reveals_local.insert((item, substs), ret);
+        return Ok(ret);
     }
     let reveals = cx.store.lookups.reveals.clone();
     reveals.run(
@@ -572,9 +577,11 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> R
             cx.store.lookups.provisional_rets.remove(&(item, substs));
             let typed = typed.map_err(|msg| anyhow!("{msg}"))?;
             super::closure::register(cx, (item, substs), &typed);
-            typed
+            let ret = typed
                 .ret
-                .ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))
+                .ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))?;
+            cx.reveals_local.insert((item, substs), ret);
+            Ok(ret)
         },
         |cx| {
             if let Some(future) = async_future(cx, item, substs)? {

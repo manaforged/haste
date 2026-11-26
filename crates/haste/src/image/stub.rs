@@ -269,7 +269,42 @@ fn ask(_index: usize) -> std::io::Result<usize> {
     Err(std::io::Error::other("lazy JIT stubs require Unix"))
 }
 
+#[cfg(unix)]
+fn errno_ptr() -> *mut libc::c_int {
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: `__error` returns the current thread's writable `errno` slot.
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    // SAFETY: `__errno_location` returns the current thread's writable `errno` slot.
+    unsafe {
+        libc::__errno_location()
+    }
+}
+
+#[cfg(unix)]
+struct ErrnoGuard(libc::c_int);
+
+#[cfg(unix)]
+impl ErrnoGuard {
+    fn save() -> Self {
+        // SAFETY: `errno_ptr()` points to this thread's valid `errno` slot.
+        Self(unsafe { *errno_ptr() })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ErrnoGuard {
+    fn drop(&mut self) {
+        // SAFETY: `errno_ptr()` points to this thread's valid `errno` slot.
+        unsafe { *errno_ptr() = self.0 };
+    }
+}
+
 extern "C" fn resolve(index: usize) -> usize {
+    #[cfg(unix)]
+    let _errno = ErrnoGuard::save();
     let tier_up = index & (TIER_UP_BIT as usize) != 0;
     if !tier_up && let Some(code) = compiled(index) {
         return code;

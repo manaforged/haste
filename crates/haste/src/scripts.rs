@@ -399,11 +399,16 @@ fn run(
         .map(|(script, _)| *script)
         .collect();
     if !compiled.is_empty() {
-        eprintln!(
-            "haste: running {} build script{}...",
-            compiled.len(),
-            if compiled.len() == 1 { "" } else { "s" }
-        );
+        let user_scripts = compiled
+            .iter()
+            .filter(|&&(unit, _)| !workspace.packages[workspace.graph.units[unit].package].sysroot)
+            .count();
+        if user_scripts > 0 {
+            eprintln!(
+                "haste: running {user_scripts} build script{}...",
+                if user_scripts == 1 { "" } else { "s" }
+            );
+        }
     }
     let mains: Vec<Option<crate::names::ItemRef>> = compiled
         .iter()
@@ -417,8 +422,18 @@ fn run(
     };
     let (entries, store) = image::entries(&mut compilation, (cache, &mains))?;
     let mut demand = Jit::new(store)?;
-    demand.set_fast(true);
-    demand.set_ahead(true);
+    let has_build_deps = compiled.iter().any(|&(unit, _)| {
+        workspace.graph.units[unit]
+            .deps
+            .iter()
+            .any(|&(_, _, kind)| kind == Kind::Build)
+    });
+    if has_build_deps {
+        demand.set_optimize(true);
+    } else {
+        demand.set_fast(true);
+    }
+    demand.set_ahead(!has_build_deps);
     let mut unit_set = HashSet::default();
     for &(unit, _) in &scripts {
         unit_set.insert(unit);

@@ -580,3 +580,163 @@ fn reports_spanned_diagnostics_for_call_op_index_and_pat_errors() {
         );
     }
 }
+
+#[test]
+fn compiler_check_and_emit_return_diagnostics_with_source_location() {
+    let dir = FixtureDir::write_crate(
+        "api-diag",
+        "check_emit",
+        "api_diag_check_emit",
+        "fn main() {\n    let value: i32 = \"bad\";\n}\n",
+    );
+    let compiler = Compiler::builder().jobs(1).build().expect("valid compiler");
+
+    let check_err = compiler
+        .check(dir.path())
+        .expect_err("type error must fail check");
+    assert_eq!(check_err.kind(), ErrorKind::Compile);
+    let check_msg = check_err.to_string();
+    assert!(
+        check_msg.contains("error[type]:")
+            && check_msg.contains("src/main.rs:2:")
+            && check_msg != "compilation failed",
+        "expected formatted check diagnostic with source location, got:\n{check_msg}"
+    );
+
+    let bin = dir
+        .path()
+        .join(format!("api_diag_out{}", std::env::consts::EXE_SUFFIX));
+    let emit_err = compiler
+        .emit(dir.path(), &bin)
+        .expect_err("type error must fail emit");
+    assert_eq!(emit_err.kind(), ErrorKind::Compile);
+    let emit_msg = emit_err.to_string();
+    assert!(
+        emit_msg.contains("error[type]:") && emit_msg.contains("src/main.rs:2:"),
+        "expected formatted emit diagnostic with source location, got:\n{emit_msg}"
+    );
+}
+
+#[test]
+fn compiler_test_filters_match_cli_behavior() {
+    let dir = FixtureDir::write_crate(
+        "api-filter",
+        "test_filter",
+        "api_test_filter",
+        r#"
+unsafe extern "C" {
+    fn haste_nonexistent_test_symbol_49123();
+}
+
+#[test]
+fn selected_passing_test() {
+    assert_eq!(2 + 2, 4);
+}
+
+#[test]
+fn unselected_broken_test() {
+    unsafe {
+        haste_nonexistent_test_symbol_49123();
+    }
+}
+"#,
+    );
+    let haste = env!("CARGO_BIN_EXE_haste");
+    let cli_out = Command::new(haste)
+        .args(["test"])
+        .arg(dir.path())
+        .args(["--", "selected_passing_test"])
+        .output()
+        .expect("run haste test cli");
+    assert!(
+        cli_out.status.success(),
+        "cli filtered test failed: {}",
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+
+    let compiler = Compiler::builder().jobs(1).build().expect("valid compiler");
+    let status = compiler
+        .test(dir.path(), &["selected_passing_test".to_owned()])
+        .expect("filtered Compiler::test must skip unselected broken test");
+    assert_eq!(status, 0);
+
+    let err = compiler
+        .test(dir.path(), &["unselected_broken_test".to_owned()])
+        .expect_err("selecting broken test must return Compile error");
+    assert_eq!(err.kind(), ErrorKind::Compile);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("haste_nonexistent_test_symbol_49123") && msg.contains("src/main.rs:"),
+        "expected formatted compile diagnostic with source location, got:\n{msg}"
+    );
+}
+
+fn write_worktree_test_fixture(name: &str) -> FixtureDir {
+    let dir = FixtureDir::new("tmpdir-wt", name);
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"shared_wt_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        dir.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"shared_wt_pkg\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.lock");
+    std::fs::write(dir.path().join("src/lib.rs"), "").expect("write src/lib.rs");
+    std::fs::create_dir_all(dir.path().join("tests")).expect("create tests dir");
+    std::fs::write(
+        dir.path().join("tests/shared_it.rs"),
+        "#[test]\nfn prints_target_tmpdir() {\n    println!(\"TARGET_TMPDIR={}\", env!(\"CARGO_TARGET_TMPDIR\"));\n}\n",
+    )
+    .expect("write tests/shared_it.rs");
+    dir
+}
+
+fn read_target_tmpdir(haste: &str, dir: &std::path::Path) -> PathBuf {
+    let out = Command::new(haste)
+        .args(["test"])
+        .arg(dir)
+        .args(["--", "--show-output"])
+        .output()
+        .expect("run haste test");
+    assert!(
+        out.status.success(),
+        "haste test failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("TARGET_TMPDIR="))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("missing TARGET_TMPDIR line in:\n{stdout}"))
+}
+
+#[test]
+fn integration_test_target_tmpdir_is_isolated_per_worktree() {
+    let wt_a = write_worktree_test_fixture("wt_a");
+    let wt_b = write_worktree_test_fixture("wt_b");
+    let haste = env!("CARGO_BIN_EXE_haste");
+
+    let tmp_a1 = read_target_tmpdir(haste, wt_a.path());
+    let tmp_b = read_target_tmpdir(haste, wt_b.path());
+    let tmp_a2 = read_target_tmpdir(haste, wt_a.path());
+
+    assert_ne!(
+        tmp_a1, tmp_b,
+        "two worktrees must not share CARGO_TARGET_TMPDIR"
+    );
+    assert_eq!(
+        tmp_a1, tmp_a2,
+        "CARGO_TARGET_TMPDIR must be deterministic per worktree"
+    );
+    assert!(tmp_a1.is_dir() && tmp_b.is_dir());
+    let expected_root = std::env::temp_dir().join("haste-target-tmp");
+    assert!(tmp_a1.starts_with(&expected_root));
+    assert!(tmp_b.starts_with(&expected_root));
+
+    drop(std::fs::remove_dir_all(&tmp_a1));
+    drop(std::fs::remove_dir_all(&tmp_b));
+}

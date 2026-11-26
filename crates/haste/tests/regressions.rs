@@ -425,3 +425,104 @@ fn passing_test() {
         String::from_utf8_lossy(&aot_out.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn cold_cache_dep_feature_fetches_in_workspace_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let haste = env!("CARGO_BIN_EXE_haste");
+    let proj = FixtureDir::write_crate("haste-reg", "cold-fetch", "cold_fetch", "fn main() {}\n");
+    std::fs::write(
+        proj.path().join("Cargo.toml"),
+        "[package]\nname = \"cold_fetch\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nfake_dep = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        proj.path().join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"cold_fetch\"\nversion = \"0.1.0\"\ndependencies = [\n \"fake_dep\",\n]\n\n[[package]]\nname = \"fake_dep\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    )
+    .expect("write Cargo.lock");
+
+    let cargo_home = proj.path().join("empty-cargo-home");
+    std::fs::create_dir_all(&cargo_home).expect("create cargo home");
+    let expected_cwd = std::fs::canonicalize(proj.path()).expect("canonical proj");
+    let wrapper = proj.path().join("fake-cargo.sh");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"$(pwd -P)\" != \"{}\" ]; then\n  echo \"wrong cwd: $(pwd -P)\" >&2\n  exit 42\nfi\ndir=\"$CARGO_HOME/registry/src/test-reg/fake_dep-0.1.0\"\nmkdir -p \"$dir/src\"\nprintf '[package]\\nname = \"fake_dep\"\\nversion = \"0.1.0\"\\nedition = \"2021\"\\n\\n[features]\\nextra = []\\n' > \"$dir/Cargo.toml\"\nprintf 'pub fn ok() {{}}\\n' > \"$dir/src/lib.rs\"\n",
+        expected_cwd.display()
+    );
+    std::fs::write(&wrapper, script).expect("write fake cargo");
+    let mut perms = std::fs::metadata(&wrapper).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, perms).expect("chmod");
+
+    let out = Command::new(haste)
+        .current_dir(std::env::temp_dir())
+        .env("CARGO", &wrapper)
+        .env("CARGO_HOME", &cargo_home)
+        .args(["-F", "fake_dep/extra", "debug", "graph"])
+        .arg(proj.path())
+        .output()
+        .expect("run haste debug graph");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "cold-cache -F dep/feature must fetch in project cwd; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("fake_dep 0.1.0|extra"),
+        "expected fetched dep feature in graph output, got:\n{stdout}"
+    );
+
+    let vend = FixtureDir::write_crate(
+        "haste-reg",
+        "cargo-vendor-offline",
+        "vendor_app",
+        "fn main() { println!(\"{}\", vdep::answer()); }\n",
+    );
+    std::fs::write(
+        vend.path().join("Cargo.toml"),
+        "[package]\nname = \"vendor_app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nvdep = \"1.2.3\"\n",
+    )
+    .expect("write vendor Cargo.toml");
+    std::fs::write(
+        vend.path().join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"vendor_app\"\nversion = \"0.1.0\"\ndependencies = [\n \"vdep\",\n]\n\n[[package]]\nname = \"vdep\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    )
+    .expect("write vendor Cargo.lock");
+    std::fs::create_dir_all(vend.path().join(".cargo")).expect("mkdir .cargo");
+    std::fs::write(
+        vend.path().join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"third_party/vendor\"\n",
+    )
+    .expect("write .cargo/config.toml");
+    let vdep_dir = vend.path().join("third_party/vendor/vdep");
+    std::fs::create_dir_all(vdep_dir.join("src")).expect("mkdir vdep");
+    std::fs::write(
+        vdep_dir.join("Cargo.toml"),
+        "[package]\nname = \"vdep\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
+    )
+    .expect("write vdep Cargo.toml");
+    std::fs::write(
+        vdep_dir.join("src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .expect("write vdep lib.rs");
+
+    let empty_home = vend.path().join("empty-home");
+    std::fs::create_dir_all(&empty_home).expect("mkdir empty-home");
+    let vout = Command::new(haste)
+        .env("CARGO_HOME", &empty_home)
+        .args(["run"])
+        .arg(vend.path())
+        .output()
+        .expect("run vendored crate offline");
+    assert!(
+        vout.status.success() && String::from_utf8_lossy(&vout.stdout).trim() == "42",
+        "ordinary cargo vendor (unversioned dir + .cargo/config.toml directory) must work offline; stdout={} stderr={}",
+        String::from_utf8_lossy(&vout.stdout),
+        String::from_utf8_lossy(&vout.stderr)
+    );
+}

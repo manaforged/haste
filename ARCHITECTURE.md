@@ -13,7 +13,7 @@ haste is a standalone Rust compiler, JIT runner, and ahead-of-time executable bu
 
 ### 1. Build graph and build scripts
 
-[`crates/haste/src/graph/`](crates/haste/src/graph/) (`manifest.rs`, `lock.rs`, `features.rs`, `cfg.rs`, `script.rs`, `store.rs`) parses `Cargo.toml` and `Cargo.lock` and merges the workspace with the active toolchain's `rust-src` standard library. It resolves target `cfg` predicates, unifies features, and runs `build.rs` scripts through [`crates/haste/src/scripts.rs`](crates/haste/src/scripts.rs). When a workspace lacks `Cargo.lock`, `graph.rs` runs `cargo generate-lockfile`. When locked registry or git crates are missing locally, it runs `cargo fetch`. Settled `build.rs` outputs live under `$HASTE_HOME` (`~/.cache/haste`).
+[`crates/haste/src/graph/`](crates/haste/src/graph/) (`manifest.rs`, `lock.rs`, `features.rs`, `cfg.rs`, `script.rs`, `store.rs`) parses `Cargo.toml` and `Cargo.lock` and merges the workspace with the active toolchain's `rust-src` standard library. It resolves target `cfg` predicates, unifies features, and runs `build.rs` scripts through [`crates/haste/src/scripts.rs`](crates/haste/src/scripts.rs). When a workspace lacks `Cargo.lock`, `graph.rs` runs `cargo generate-lockfile`. When locked registry or git crates are missing locally, it runs `cargo fetch --locked`. Settled `build.rs` outputs live under `$HASTE_HOME` (`~/.cache/haste`).
 
 ### 2. Parallel outline, macro expansion, and name resolution
 
@@ -40,7 +40,7 @@ Semantic analysis ([`crates/haste/src/sema/`](crates/haste/src/sema/)) covers:
 - Bidirectional type inference, method/autoderef resolution, closure captures, and layout calculation (`infer.rs`, `traits.rs`, `impls.rs`, `layout.rs`).
 - Structural `Send` / `Sync` auto traits, concrete and generic trait bounds, match exhaustiveness (`sema/infer/matching/exhaustive.rs`), module/item/field privacy, and checked `const` / `static` evaluation (`evaluate.rs`).
 - Ownership, initialization, use-after-move across branches and loops, binding mutability, disjoint named/tuple field loans, NLL shared/mutable aliasing, non-`'static` borrow escapes, and named-lifetime return subtyping (`borrow.rs`).
-- Multi-label spanned diagnostic rendering (`diag.rs`) and compact frozen cross-crate polymorphic summaries (`summary/`).
+- Multi-label spanned diagnostic rendering ([`crates/haste/src/diag.rs`](crates/haste/src/diag.rs)) and compact frozen cross-crate polymorphic summaries (`summary/`).
 
 ### 5. SSA lowering, generic stencils, and JIT tier-up
 

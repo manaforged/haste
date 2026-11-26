@@ -442,6 +442,18 @@ impl Lower<'_, '_> {
                     }
                     return Ok(res);
                 }
+                if caller_tracked
+                    && callee_tracked
+                    && self.caller_loc_guard.is_none()
+                    && self.inline.stack.is_empty()
+                {
+                    let code = self.code_of(index, origin);
+                    return self.with_cold_tracked_caller_loc(|this| {
+                        let sig = this.b.import_signature(signature);
+                        let call = this.ins().call_indirect(sig, code, values);
+                        Ok(this.b.inst_results(call).to_vec())
+                    });
+                }
                 track_site = (caller_tracked != callee_tracked).then_some(wants_track);
                 self.code_of(index, origin)
             }

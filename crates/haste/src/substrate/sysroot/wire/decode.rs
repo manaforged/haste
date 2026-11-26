@@ -496,6 +496,7 @@ fn read_file(
         offset,
         outputs: Outputs::default(),
         origins,
+        line_starts: std::sync::OnceLock::new(),
     };
     let mut file = File::new(source, items, expanded);
     file.expand_origin = expand_origin;

@@ -66,18 +66,42 @@ pub(crate) fn parallel_map<T: Send, R: Send>(
     items: Vec<T>,
     work: impl Fn(T) -> R + Sync,
 ) -> Vec<R> {
+    use std::cell::UnsafeCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SyncSlice<T>(Box<[UnsafeCell<Option<T>>]>);
+    // SAFETY: Each index in `0..len` is claimed by at most one worker via `AtomicUsize::fetch_add`.
+    unsafe impl<T: Send> Sync for SyncSlice<T> {}
+    impl<T> SyncSlice<T> {
+        unsafe fn take(&self, idx: usize) -> Option<T> {
+            // SAFETY: Caller guarantees `idx < self.0.len()` and exclusive access to `idx`.
+            unsafe { (*self.0[idx].get()).take() }
+        }
+    }
+
     let total = items.len();
     let workers = crate::jobs().min(total);
     if total < 2 || workers <= 1 {
         return items.into_iter().map(work).collect();
     }
-    let queue = Mutex::new(items.into_iter().enumerate());
+    let slots = SyncSlice(
+        items
+            .into_iter()
+            .map(|item| UnsafeCell::new(Some(item)))
+            .collect(),
+    );
+    let next = AtomicUsize::new(0);
     let worker = || {
         let mut local = Vec::new();
         loop {
-            let next = lock(&queue).next();
-            let Some((idx, item)) = next else { break };
-            local.push((idx, work(item)));
+            let idx = next.fetch_add(1, Ordering::Relaxed);
+            if idx >= total {
+                break;
+            }
+            // SAFETY: `idx < total` is uniquely claimed by this thread via `fetch_add`.
+            if let Some(item) = unsafe { slots.take(idx) } {
+                local.push((idx, work(item)));
+            }
         }
         local
     };
@@ -92,11 +116,11 @@ pub(crate) fn parallel_map<T: Send, R: Send>(
         }
         all
     });
-    let mut slots: Vec<Option<R>> = (0..total).map(|_| None).collect();
+    let mut out: Vec<Option<R>> = (0..total).map(|_| None).collect();
     for (idx, res) in chunks {
-        slots[idx] = Some(res);
+        out[idx] = Some(res);
     }
-    slots.into_iter().flatten().collect()
+    out.into_iter().flatten().collect()
 }
 
 pub(crate) struct Slab<T, const SLAB: usize, const SLABS: usize> {

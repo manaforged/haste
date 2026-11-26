@@ -291,11 +291,11 @@ impl Loader<'_> {
             return None;
         };
         let name = crate::names::plain(file.source.text(name));
-        if self.depth >= crate::RECURSION_LIMIT {
+        let limit = crate_recursion_limit(self.out);
+        if self.depth >= limit {
             self.out.errors.push(format!(
-                "{}: macro {name} recursed past {} levels",
+                "{}: macro {name} recursed past {limit} levels",
                 file.source.path.display(),
-                crate::RECURSION_LIMIT
             ));
             return None;
         }
@@ -438,4 +438,23 @@ pub(crate) fn spelled_fragment(src: &Source, (from, to): (u32, u32)) -> String {
         }
     }
     src.spelled_with((from, to), |at| skip[(at - from) as usize])
+}
+
+const MAX_RECURSION_LIMIT: usize = 4096;
+
+fn crate_recursion_limit(krate: &super::Crate) -> usize {
+    let Some(root) = krate.files.first() else {
+        return crate::RECURSION_LIMIT;
+    };
+    let src = &root.source;
+    for attr in &root.items.inner {
+        if let super::Attr::Other(at) = *attr
+            && src.text(at) == "recursion_limit"
+            && src.text(at + 1) == "="
+            && let Ok(n) = src.text(at + 2).trim_matches('"').parse::<usize>()
+        {
+            return n.min(MAX_RECURSION_LIMIT);
+        }
+    }
+    crate::RECURSION_LIMIT
 }

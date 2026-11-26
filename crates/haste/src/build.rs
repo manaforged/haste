@@ -63,6 +63,23 @@ fn missing_target_error() -> anyhow::Error {
 }
 
 fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Result<ItemRef> {
+    let sel = crate::selection();
+    if sel.bin.is_none() && sel.example.is_none() {
+        let bins: Vec<usize> = outline
+            .members(workspace)
+            .filter(|&k| outline.roots[k].role == outline::Role::Bin && outline.main(k).is_some())
+            .collect();
+        if bins.len() > 1 {
+            let names: Vec<&str> = bins
+                .iter()
+                .map(|&k| outline.roots[k].name.as_str())
+                .collect();
+            bail!(
+                "multiple binary targets found ({}); pass `-p <PKG>` or `--bin <NAME>`",
+                names.join(", ")
+            );
+        }
+    }
     main_item(workspace, outline).ok_or_else(missing_target_error)
 }
 
@@ -132,6 +149,15 @@ impl Build {
 
     /// Infers and compiles the `#[test]` or `case_` functions unless that is done.
     pub fn compile_cases(&mut self, workspace: &graph::Workspace) -> Result<()> {
+        self.compile_cases_filtered(workspace, &[])
+    }
+
+    /// Infers and compiles matching `#[test]` or `case_` functions unless that is done.
+    pub fn compile_cases_filtered(
+        &mut self,
+        workspace: &graph::Workspace,
+        filters: &[String],
+    ) -> Result<()> {
         if self.cases.is_none() {
             self.load_members(workspace)?;
             let discovered = test_items(workspace, &self.compilation.outline);
@@ -143,7 +169,8 @@ impl Build {
             };
             #[cfg(not(feature = "diff-harness"))]
             let kind = BatchKind::Tests;
-            let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
+            let mut batch =
+                Batch::new_filtered(workspace, &mut self.compilation, kind, false, filters)?;
             if kind == BatchKind::Tests {
                 let starts: Vec<Option<usize>> = batch.tests.iter().map(|(_, s)| *s).collect();
                 batch.tests = map_tests(&batch.roots, &batch.reached, &starts, discovered);
@@ -341,6 +368,20 @@ impl Build {
         Ok(binary.check(&self.compilation.outline, built))
     }
 
+    fn batch_diagnostics(&self, batch: Option<&Batch>) -> Option<String> {
+        batch.and_then(|batch| batch.formatted_diagnostics(&self.compilation.outline))
+    }
+
+    /// Formatted diagnostics from the compiled binary batch, if any failed.
+    pub(crate) fn binary_diagnostics(&self) -> Option<String> {
+        self.batch_diagnostics(self.binary.as_ref())
+    }
+
+    /// Formatted diagnostics from the compiled test or case batch, if any failed.
+    pub(crate) fn cases_diagnostics(&self) -> Option<String> {
+        self.batch_diagnostics(self.cases.as_ref())
+    }
+
     /// Why each function the binary's `main` reaches did not type-check or compile, at the file and line of its item, keyed by the kind of error.
     pub fn failures(&mut self) -> Result<Failures> {
         let Some(binary) = &mut self.binary else {
@@ -433,7 +474,7 @@ pub(crate) fn emit_main(
         workspace,
         compilation,
         (BatchKind::MainAot, Some(main)),
-        true,
+        (true, &[]),
     )?
     .write_aot(compilation, path)
 }
@@ -510,7 +551,34 @@ fn run_watched(
     let mut watched = stamps(workspace, &compilation.outline);
     let files = paths(&watched);
     let mut reread = |compilation: &mut Compilation| {
-        body_edits(workspace, &mut watched, &mut compilation.outline)
+        let stale = body_edits(workspace, &mut watched, &mut compilation.outline)
+            .map_err(crate::image::ReloadError::Restart)?;
+        if stale.is_empty() {
+            return Ok(stale);
+        }
+        let syntax_errors = compilation.outline.local_errors(workspace);
+        if !syntax_errors.is_empty() {
+            eprintln!("{}", syntax_errors.join("\n"));
+            return Err(crate::image::ReloadError::Compile(
+                "syntax error in edited file".to_owned(),
+            ));
+        }
+        let (_, errors) = batch::check_member_items(
+            workspace,
+            compilation,
+            Cache::default(),
+            Some(main.krate as usize),
+        )
+        .map_err(|e| crate::image::ReloadError::Compile(format!("{e:#}")))?;
+        if !errors.is_empty() {
+            for err in &errors {
+                eprintln!("{err}");
+            }
+            return Err(crate::image::ReloadError::Compile(
+                "compile error in edited file".to_owned(),
+            ));
+        }
+        Ok(stale)
     };
     let mut program = Program::new(compilation, cache, main)?;
     let status = program.run_watched(compilation, args, (files, &mut reread));

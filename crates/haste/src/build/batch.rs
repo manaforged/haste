@@ -48,11 +48,13 @@ impl BatchKind {
                 .map(|t| t.item)
                 .collect(),
             BatchKind::LibCheck => check_fn_items(workspace, outline, None),
-            BatchKind::MainCheck => check_fn_items(
-                workspace,
-                outline,
-                main_item(workspace, outline).map(|m| m.krate as usize),
-            ),
+            BatchKind::MainCheck => {
+                let sel = crate::selection();
+                let target = (sel.package.is_some() || sel.bin.is_some() || sel.example.is_some())
+                    .then(|| main_item(workspace, outline).map(|m| m.krate as usize))
+                    .flatten();
+                check_fn_items(workspace, outline, target)
+            }
             BatchKind::MainAot => main_items(workspace, outline),
         }
     }
@@ -77,9 +79,11 @@ pub(super) struct Batch {
 pub(super) fn check_member_items(
     workspace: &graph::Workspace,
     compilation: &mut Compilation,
-    cache: Cache,
+    mut cache: Cache,
     target: Option<usize>,
 ) -> Result<(Cache, Vec<String>)> {
+    let prev_warm = cache.warm_sysroot_bodies();
+    cache.set_warm_sysroot_bodies(false);
     super::load_members(workspace, compilation)?;
     let items = check_fn_items(workspace, &compilation.outline, target);
     let roots: Vec<Instance> = items
@@ -87,7 +91,7 @@ pub(super) fn check_member_items(
         .copied()
         .map(|item| (item, sema::substs::Substs::EMPTY))
         .collect();
-    let (store, diagnostics) = crate::macros::reach_resolved_with_cache(
+    let (store, mut out, mut seen) = crate::macros::reach_resolved_with_cache(
         compilation,
         cache,
         |cx| {
@@ -97,28 +101,32 @@ pub(super) fn check_member_items(
                 .filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item))
                 .collect()
         },
-        |mut cx, reached| {
-            let poly = check_poly_items(&mut cx, &items);
+        |cx, reached| {
             let mut out = Vec::new();
             let mut seen = HashSet::default();
-            let mut record = |item: ItemRef, error: &str| {
-                let msg = Batch::format_entry(Some(cx.outline), item, None, error);
-                if seen.insert(msg.clone()) {
-                    out.push(msg);
-                }
-            };
             for ((item, _), res) in &reached.list {
                 if let Err(err) = res {
-                    record(*item, err);
+                    let msg = Batch::format_entry(Some(cx.outline), *item, None, err);
+                    if seen.insert(msg.clone()) {
+                        out.push(msg);
+                    }
                 }
             }
-            for &(item, ref err) in &poly {
-                record(item, err);
-            }
-            Ok((cx.release().0, out))
+            Ok((cx.release().0, out, seen))
         },
     )?;
-    Ok((store, diagnostics))
+    let (mut store, poly) = check_poly_resolved(compilation, store, &items)?;
+    if prev_warm {
+        store.clear_finals();
+        store.set_warm_sysroot_bodies(true);
+    }
+    for &(item, ref err) in &poly {
+        let msg = Batch::format_entry(Some(&compilation.outline), item, None, err);
+        if seen.insert(msg.clone()) {
+            out.push(msg);
+        }
+    }
+    Ok((store, out))
 }
 
 fn batch_roots(
@@ -161,6 +169,25 @@ fn check_poly_items(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> Vec<(ItemR
         }
     }
     out
+}
+
+fn check_poly_resolved(
+    compilation: &mut Compilation,
+    store: Cache,
+    items: &[ItemRef],
+) -> Result<(Cache, Vec<(ItemRef, String)>)> {
+    let mut pending = items.to_vec();
+    crate::macros::resolve_sema(compilation, (store, crate::macros::load), |mut cx, last| {
+        let failures = check_poly_items(&mut cx, &pending);
+        let settled = cx.resolved();
+        let released = cx.release();
+        if settled || last || failures.is_empty() {
+            Ok(Ok((released.0, failures)))
+        } else {
+            pending = failures.into_iter().map(|(item, _)| item).collect();
+            Ok(Err(released))
+        }
+    })
 }
 
 fn recompile(
@@ -218,7 +245,7 @@ fn recompile(
 fn finish_batch(
     (kind, main): (BatchKind, Option<ItemRef>),
     (cases, mut reached): (&[ItemRef], Reached),
-    drop_finals: bool,
+    (drop_finals, test_filters): (bool, &[String]),
     substrate: Option<SubstrateSlot>,
     (mut cx, reach_clock): (sema::Context<'_>, sema::census::Clock),
 ) -> Result<Batch> {
@@ -235,7 +262,7 @@ fn finish_batch(
             .filter(|&item| sema::infer::is_case_sig(&mut cx, item))
             .collect(),
         BatchKind::Tests => {
-            let (valid, starts, _) = select_test_roots(&mut cx, cases);
+            let (valid, starts, _) = select_test_roots(&mut cx, cases, test_filters);
             test_starts = starts;
             valid
         }
@@ -246,11 +273,7 @@ fn finish_batch(
             .collect(),
         BatchKind::MainAot => Vec::new(),
     };
-    let poly_failures = if matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck) {
-        check_poly_items(&mut cx, cases)
-    } else {
-        Vec::new()
-    };
+    let poly_failures = Vec::new();
     let mut root_instances: Vec<sema::reach::Instance> = match main {
         Some(main) => sema::reach::main_roots(&mut cx, main)?.to_vec(),
         None => valid
@@ -330,6 +353,16 @@ impl Batch {
         kind: BatchKind,
         drop_finals: bool,
     ) -> Result<Batch> {
+        Self::new_filtered(workspace, compilation, kind, drop_finals, &[])
+    }
+
+    pub(super) fn new_filtered(
+        workspace: &graph::Workspace,
+        compilation: &mut Compilation,
+        kind: BatchKind,
+        drop_finals: bool,
+        test_filters: &[String],
+    ) -> Result<Batch> {
         let main = (kind == BatchKind::MainAot)
             .then(|| {
                 let sel = crate::selection();
@@ -342,14 +375,19 @@ impl Batch {
                 }
             })
             .transpose()?;
-        Self::rooted(workspace, compilation, (kind, main), drop_finals)
+        Self::rooted(
+            workspace,
+            compilation,
+            (kind, main),
+            (drop_finals, test_filters),
+        )
     }
 
     pub(super) fn rooted(
         workspace: &graph::Workspace,
         compilation: &mut Compilation,
         (kind, main): (BatchKind, Option<ItemRef>),
-        drop_finals: bool,
+        (drop_finals, test_filters): (bool, &[String]),
     ) -> Result<Batch> {
         let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
@@ -387,7 +425,7 @@ impl Batch {
                 });
             }
         }
-        let batch = crate::macros::reach_resolved_with_cache(
+        let mut batch = crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
             |cx| match (kind, main) {
@@ -402,7 +440,7 @@ impl Batch {
                     .copied()
                     .filter(|&(item, _)| sema::infer::is_case_sig(cx, item))
                     .collect(),
-                (BatchKind::Tests, _) => select_test_roots(cx, &cases).2,
+                (BatchKind::Tests, _) => select_test_roots(cx, &cases, test_filters).2,
                 (BatchKind::LibCheck | BatchKind::MainCheck, _) => root_insts
                     .iter()
                     .copied()
@@ -414,12 +452,19 @@ impl Batch {
                 finish_batch(
                     (kind, main),
                     (&cases, reached),
-                    drop_finals,
+                    (drop_finals, test_filters),
                     substrate.take(),
                     (cx, reach_clock),
                 )
             },
         )?;
+        if matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck)
+            && let Some(store) = batch.store.take()
+        {
+            let (store, poly_failures) = check_poly_resolved(compilation, store, &cases)?;
+            batch.store = Some(store);
+            batch.poly_failures = poly_failures;
+        }
         crate::substrate::save_fixed_files(
             workspace,
             crate::host_target().triple,
@@ -439,6 +484,36 @@ impl Batch {
         if !self.broken.is_empty() {
             bail!("{} functions failed to compile", self.broken.len());
         }
+        let reached_crates: HashSet<usize> = self
+            .reached
+            .list
+            .iter()
+            .map(|((item, _), _)| item.krate as usize)
+            .collect();
+        let mut has_static_archive = None;
+        for krate_idx in reached_crates {
+            let krate = &compilation.outline.crates[krate_idx];
+            if let Some(script) = &krate.env.script
+                && let Some((_, lib)) = script
+                    .link_libs()
+                    .find(|(kind, _)| *kind == crate::graph::script::LinkKind::Static)
+            {
+                let name = compilation.outline.roots[krate_idx].name.as_str();
+                has_static_archive = Some((lib.to_owned(), name.to_owned()));
+                break;
+            }
+        }
+        let native_bundle = if let Some((lib, name)) = has_static_archive {
+            if cfg!(unix) && crate::compile_target() == haste_codegen::Target::host() {
+                crate::host::native::bundle(&compilation.outline)?
+            } else {
+                bail!(
+                    "cross-target standalone AOT (-o) does not yet link static C archive `{lib}` from crate `{name}`; build on the target host or use `cargo build`"
+                );
+            }
+        } else {
+            None
+        };
         let store = self
             .store
             .take()
@@ -451,7 +526,12 @@ impl Batch {
             &self.reached,
         );
         self.store = Some(cx.release().0);
-        exe?.write(path)
+        let mut exe = exe?;
+        if let Some(bundle) = native_bundle {
+            exe.extra_libs.push(bundle.to_string_lossy().into_owned());
+        }
+        exe.write(path)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     fn needs_member_recheck(&self) -> bool {
@@ -517,7 +597,7 @@ impl Batch {
                     .collect();
             }
             BatchKind::Tests => {
-                let (valid, starts, test_roots) = select_test_roots(&mut cx, &cases);
+                let (valid, starts, test_roots) = select_test_roots(&mut cx, &cases, &[]);
                 cases = valid;
                 test_starts = starts;
                 roots = test_roots;

@@ -78,6 +78,7 @@ pub struct Context<'a> {
     scope_traits_local: std::cell::RefCell<HashMap<ModRef, Arc<[ItemRef]>>>,
     pub(super) glues_local: HashMap<ty::Ty, Option<infer::Res>>,
     pub(super) drops_local: HashMap<ty::Ty, bool>,
+    pub(super) reveals_local: HashMap<reach::Instance, ty::Ty>,
     pub(crate) ty_facts: HashMap<ty::Ty, u128>,
 }
 

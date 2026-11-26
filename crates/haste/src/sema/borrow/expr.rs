@@ -429,6 +429,7 @@ impl Checker<'_, '_> {
             if !state.diverged {
                 let before_rhs = state.clone();
                 let mut rhs_state = state.clone();
+                prune_dead_loans(&mut rhs_state, &after_a);
                 self.check_expr(b, &mut rhs_state, false, outer_live, true, depth)?;
                 merge_branch(state, &before_rhs, &rhs_state);
             }
@@ -645,12 +646,16 @@ impl Checker<'_, '_> {
             .map(|&f| self.body.fields[f as usize].value.0)
             .collect();
         let (field_refs, field_tys) = self.struct_field_ref_muts(expr, &field_ids);
+        let mut fields_live = outer_live.clone();
+        if let Some(b) = base {
+            self.collect_live_expr(b, &mut fields_live);
+        }
         self.check_arg_list_expected_tys(
             &val_ids,
             &field_refs,
             &field_tys,
             state,
-            outer_live,
+            &fields_live,
             depth,
         )?;
         self.check_static_struct_fields(expr, &val_ids, state)?;

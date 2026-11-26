@@ -10,32 +10,64 @@ fn is_name(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Ident | TokenKind::RawIdent)
 }
 
-const OPERATORS: [&str; 24] = [
-    "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=",
-    "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", "..",
-];
-
-fn glued(src: &Source, at: u32, operator: &str) -> bool {
-    operator.char_indices().all(|(index, ch)| {
-        let token = at + index as u32;
-        let last = index + 1 == operator.len();
-        token < src.len()
-            && src.text(token).len() == 1
-            && src.text(token).starts_with(ch)
-            && (last || src.joint(token))
-    })
+fn single_byte(src: &Source, at: u32) -> Option<u8> {
+    let text = src.text(at).as_bytes();
+    (text.len() == 1).then_some(text[0])
 }
 
 /// The end of the token tree that starts at `at`.
 pub(super) fn tree(src: &Source, at: u32) -> u32 {
-    if opens(src.kind(at)) {
+    let kind = src.kind(at);
+    if opens(kind) {
         return src.pair(at) + 1;
     }
-    if !src.joint(at) {
+    if !src.joint(at) || at + 1 >= src.len() {
         return at + 1;
     }
-    let operator = OPERATORS.iter().find(|operator| glued(src, at, operator));
-    at + operator.map_or(1, |operator| operator.len() as u32)
+    let Some(b0) = single_byte(src, at) else {
+        return at + 1;
+    };
+    let Some(b1) = single_byte(src, at + 1) else {
+        return at + 1;
+    };
+    let len = match (b0, b1) {
+        (b'<', b'<') | (b'>', b'>')
+            if src.joint(at + 1)
+                && at + 2 < src.len()
+                && single_byte(src, at + 2) == Some(b'=') =>
+        {
+            3
+        }
+        (b'.', b'.')
+            if src.joint(at + 1)
+                && at + 2 < src.len()
+                && matches!(single_byte(src, at + 2), Some(b'.' | b'=')) =>
+        {
+            3
+        }
+        (b':', b':')
+        | (b'-', b'>')
+        | (b'=', b'>')
+        | (b'=', b'=')
+        | (b'!', b'=')
+        | (b'<', b'=')
+        | (b'>', b'=')
+        | (b'&', b'&')
+        | (b'|', b'|')
+        | (b'+', b'=')
+        | (b'-', b'=')
+        | (b'*', b'=')
+        | (b'/', b'=')
+        | (b'%', b'=')
+        | (b'^', b'=')
+        | (b'&', b'=')
+        | (b'|', b'=')
+        | (b'<', b'<')
+        | (b'>', b'>')
+        | (b'.', b'.') => 2,
+        _ => 1,
+    };
+    at + len
 }
 
 fn is_pair(src: &Source, at: u32, first: TokenKind, second: TokenKind) -> bool {
@@ -311,7 +343,12 @@ fn long(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
     match frag {
         Frag::Item => scan::item_end(src, at).ok(),
         Frag::Meta => Some(meta(src, at, end)),
-        Frag::Expr | Frag::Stmt => Some(expr(src, at, end)),
+        Frag::Expr => Some(expr(src, at, end)),
+        Frag::Stmt => Some(if src.kind(at) == TokenKind::Semi {
+            at + 1
+        } else {
+            expr(src, at, end)
+        }),
         Frag::Ty | Frag::Path => Some(until(src, at, end, Stop::Ty)),
         Frag::Pat => Some(until(src, at, end, Stop::Pat)),
         _ => Some(until(src, at, end, Stop::PatParam)),

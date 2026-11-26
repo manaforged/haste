@@ -71,41 +71,75 @@ impl Checker<'_, '_> {
             if arg_ty != Ty::NONE && !self.ty_holds_borrow(arg_ty) {
                 continue;
             }
-            let mut is_fresh_ref = false;
-            let mut param_ty_info: Option<(ItemRef, TyId)> = None;
-            if let Some(s) = sig
-                && let Some(item) = fn_item
+            let pairs: Vec<(Option<TyId>, ExprId, bool)> = if let Some(s) = sig
                 && let Some(&(_, param_ty)) = s.params.get(idx)
             {
-                let (sig_src, _) = self.cx.item(item);
-                let mut p_lts = Lifetimes::default();
-                collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
-                is_fresh_ref = matches!(s.body.ty(param_ty), AstTy::Ref { lifetime: None, .. });
-                let shares_self = p_lts.named.iter().any(|n| self_lts.named.contains(n))
-                    || (!is_fresh_ref
-                        && ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names))
-                    || self.generic_param_ties_to_self(s, sig_src, &p_lts, &self_lts);
-                if !shares_self {
+                match (s.body.ty(param_ty), *self.body.expr(arg)) {
+                    (AstTy::Tuple(ptys), Expr::Tuple(aexprs)) if ptys.len == aexprs.len => s
+                        .body
+                        .list(*ptys)
+                        .iter()
+                        .zip(self.body.list(aexprs))
+                        .map(|(&pt, &ae)| (Some(TyId(pt)), ExprId(ae), false))
+                        .collect(),
+                    _ => vec![(Some(param_ty), arg, true)],
+                }
+            } else {
+                vec![(None, arg, true)]
+            };
+            for (param_ty_opt, ae, use_pre) in pairs {
+                let ae_ty = self.expr_ty(ae);
+                if ae_ty != Ty::NONE && !self.ty_holds_borrow(ae_ty) {
                     continue;
                 }
-                param_ty_info = Some((item, param_ty));
-            }
-            let arg_sources = if let Some((item, param_ty)) = param_ty_info
-                && let Some(s) = sig
-                && let Some(filtered) =
-                    self.matching_adt_arg_sources(expr, arg, s, item, param_ty, &self_lts, state)
-            {
-                filtered
-            } else if is_fresh_ref {
-                self.copied_arg_borrow_sources(expr, arg, state)
-            } else if let Some(pre) = pre_arg_sources.get(idx) {
-                pre.clone()
-            } else {
-                self.expr_borrow_sources(arg, state)
-            };
-            for s in self.unwrap_collection_arg_sources(arg, arg_ty, recv_ty, arg_sources, state) {
-                if !s.env_only || keep_env {
-                    all_sources.push(s);
+                let mut is_fresh_ref = false;
+                let mut param_ty_info: Option<(ItemRef, TyId)> = None;
+                let mut arg_keep_env = keep_env;
+                if let Some(s) = sig
+                    && let Some(item) = fn_item
+                    && let Some(param_ty) = param_ty_opt
+                {
+                    let (sig_src, _) = self.cx.item(item);
+                    let mut p_lts = Lifetimes::default();
+                    collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
+                    is_fresh_ref = matches!(s.body.ty(param_ty), AstTy::Ref { lifetime: None, .. });
+                    if let AstTy::ImplTrait(_, bounds) = *s.body.ty(param_ty) {
+                        let has_lt = s.body.list(bounds).iter().any(|&b| {
+                            matches!(s.body.bounds[b as usize], Bound::Lifetime(lt)
+                                if self_lts.named.contains(&sig_src.text(lt))
+                                    || sig_src.text(lt) == "'static")
+                        });
+                        if !has_lt {
+                            arg_keep_env = false;
+                        }
+                    }
+                    let shares_self = p_lts.named.iter().any(|n| self_lts.named.contains(n))
+                        || (!is_fresh_ref
+                            && ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names))
+                        || self.generic_param_ties_to_self(s, sig_src, &p_lts, &self_lts);
+                    if !shares_self {
+                        continue;
+                    }
+                    param_ty_info = Some((item, param_ty));
+                }
+                let arg_sources = if let Some((item, param_ty)) = param_ty_info
+                    && let Some(s) = sig
+                    && let Some(filtered) =
+                        self.matching_adt_arg_sources(expr, ae, s, item, param_ty, &self_lts, state)
+                {
+                    filtered
+                } else if is_fresh_ref {
+                    self.copied_arg_borrow_sources(expr, ae, state)
+                } else if use_pre && let Some(pre) = pre_arg_sources.get(idx) {
+                    pre.clone()
+                } else {
+                    self.expr_borrow_sources(ae, state)
+                };
+                for s in self.unwrap_collection_arg_sources(ae, ae_ty, recv_ty, arg_sources, state)
+                {
+                    if !s.env_only || arg_keep_env {
+                        all_sources.push(s);
+                    }
                 }
             }
         }

@@ -456,10 +456,37 @@ impl<'a> Infer<'_, 'a> {
         ty: crate::body::TyId,
         fields: crate::body::List,
     ) -> Result<Ty> {
-        let mut current = self.lower_ty(self.body, ty)?;
+        let current = self.lower_ty(self.body, ty)?;
+        let current = self.substitute(current);
         if self.poly.is_some() && self.has_params(current) {
             return self.poly_offset_of(expr, current, fields);
         }
+        if self.has_vars(current) {
+            self.deferred_offsets.push((expr, current, fields));
+            return Ok(self.cx.types.prim(crate::names::Primitive::Usize));
+        }
+        self.compute_offset_of(expr, current, fields)?;
+        Ok(self.cx.types.prim(crate::names::Primitive::Usize))
+    }
+
+    pub(super) fn settle_offsets(&mut self) -> Result<()> {
+        for (expr, current, fields) in std::mem::take(&mut self.deferred_offsets) {
+            let current = self.zonk(current);
+            if self.poly.is_some() && self.has_params(current) {
+                self.poly_offset_of(expr, current, fields)?;
+            } else {
+                self.compute_offset_of(expr, current, fields)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compute_offset_of(
+        &mut self,
+        expr: ExprId,
+        mut current: Ty,
+        fields: crate::body::List,
+    ) -> Result<()> {
         let segments: Vec<&'a str> = self
             .body
             .list(fields)
@@ -474,7 +501,7 @@ impl<'a> Infer<'_, 'a> {
             at += used;
         }
         self.out.offsets.insert(expr, offset);
-        Ok(self.cx.types.prim(crate::names::Primitive::Usize))
+        Ok(())
     }
 
     fn offset_step(
@@ -483,7 +510,7 @@ impl<'a> Infer<'_, 'a> {
         segments: &[&str],
         at: usize,
     ) -> Result<(usize, i32, Ty)> {
-        let resolved = self.resolve(current);
+        let resolved = self.substitute(current);
         if let Kind::Adt(item, args) = *self.cx.types.kind(resolved)
             && self.cx.item(item).1.kind == ItemKind::Enum
         {
@@ -497,11 +524,11 @@ impl<'a> Infer<'_, 'a> {
             let (variant, index, field) =
                 self.enum_field_at(item, args, variant_name, field_name)?;
             let step =
-                crate::sema::layout::field_offset(&*self.cx.layout(current)?, variant, index);
+                crate::sema::layout::field_offset(&*self.cx.layout(resolved)?, variant, index);
             return Ok((2, step, field));
         }
-        let (index, field) = self.field_at(current, segments[at])?;
-        let step = crate::sema::layout::field_offset(&*self.cx.layout(current)?, 0, index);
+        let (index, field) = self.field_at(resolved, segments[at])?;
+        let step = crate::sema::layout::field_offset(&*self.cx.layout(resolved)?, 0, index);
         Ok((1, step, field))
     }
 
@@ -582,7 +609,8 @@ impl<'a> Infer<'_, 'a> {
         let slice = self.cx.types.substs(args).to_vec();
         let field = self.adt_fields(item, &slice)?[0][index as usize];
         if !self.has_vars(ty) && !self.has_params(ty) {
-            drop(self.cx.layout(ty));
+            let sub = self.substitute(ty);
+            drop(self.cx.layout(sub));
         }
         Ok(field)
     }

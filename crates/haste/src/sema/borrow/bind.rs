@@ -20,6 +20,7 @@ struct PatCtx {
     in_drop_adt: bool,
     is_param: bool,
     move_only: bool,
+    steps_match_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +73,7 @@ impl Checker<'_, '_> {
             in_drop_adt: false,
             is_param: true,
             move_only: false,
+            steps_match_fallback: true,
         };
         let target = PatTarget {
             init: None,
@@ -101,6 +103,7 @@ impl Checker<'_, '_> {
             in_drop_adt: false,
             is_param: false,
             move_only: false,
+            steps_match_fallback: init.is_none() && scrut_place.is_none(),
         };
         let target = PatTarget {
             init,
@@ -128,6 +131,7 @@ impl Checker<'_, '_> {
             in_drop_adt: false,
             is_param: false,
             move_only: true,
+            steps_match_fallback: false,
         };
         let target = PatTarget {
             init,
@@ -234,6 +238,8 @@ impl Checker<'_, '_> {
         let next_fallback = if inner_init.is_none() {
             if let Some(e) = target.init {
                 self.expr_borrow_sources(e, state)
+            } else if ctx.steps_match_fallback {
+                target.fallback_sources.to_vec()
             } else {
                 let mut srcs = target.fallback_sources.to_vec();
                 for s in &mut srcs {
@@ -594,7 +600,9 @@ impl Checker<'_, '_> {
                 fallback_sources,
                 elem_tuple: elem_ts,
             };
-            self.bind_pat_ctx(p, elem_target, state, ctx)?;
+            let mut elem_ctx = ctx;
+            elem_ctx.steps_match_fallback &= elem_ts.is_none() && sub_init.is_none();
+            self.bind_pat_ctx(p, elem_target, state, elem_ctx)?;
         }
         Ok(())
     }

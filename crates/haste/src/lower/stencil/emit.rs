@@ -107,7 +107,10 @@ pub(super) fn run_with_cycle(
             if func.is_coroutine() {
                 haste_codegen::split_coroutine(&mut func);
             }
-            if !func.unwind_drops().is_empty() && slots.allow_inline() {
+            if !func.unwind_drops().is_empty()
+                && slots.allow_inline()
+                && crate::profile() == crate::outline::tree::Profile::Release
+            {
                 func.enable_drop_elision();
                 for (sym, src) in relocs.iter().enumerate() {
                     if !sym_may_unwind(cx, reached, Some(src)) {

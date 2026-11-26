@@ -237,6 +237,77 @@ impl<'a> Infer<'_, 'a> {
         found
     }
 
+    pub(in super::super) fn ensure_coroutine(&mut self, ty: Ty) -> bool {
+        let ty = self.resolve(ty);
+        if self.coroutine_output(ty).is_some() {
+            return true;
+        }
+        let Kind::Closure(parent, substs, at) = *self.cx.types.kind(ty) else {
+            return false;
+        };
+        if self
+            .cx
+            .ensure_closure(ty)
+            .is_some_and(|info| info.closure.coroutine)
+        {
+            return true;
+        }
+        let (Ok(sig), Ok(body)) = (self.cx.signature(parent), self.cx.body(parent)) else {
+            return false;
+        };
+        let is_async_root = sig.is_async && body.root == Some(ExprId(at));
+        let is_async_block = (at as usize) < body.exprs.len()
+            && matches!(
+                body.expr(ExprId(at)),
+                Expr::Block {
+                    kind: crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove,
+                    ..
+                }
+            );
+        if !is_async_root && !is_async_block {
+            return false;
+        }
+        let is_returned_block = is_async_block
+            && (body.root == Some(ExprId(at))
+                || matches!(
+                    body.root.map(|root| body.expr(root)),
+                    Some(Expr::Block {
+                        kind: crate::body::BlockKind::Plain,
+                        tail: Some(tail),
+                        ..
+                    }) if *tail == ExprId(at)
+                ));
+        if !is_async_root && !is_returned_block {
+            return false;
+        }
+        let args = self.cx.types.substs(substs).to_vec();
+        let Ok(frame) = self.frame(parent, &args) else {
+            return false;
+        };
+        let output = self
+            .with_frame(frame, |infer| {
+                if is_async_root {
+                    match sig.ret {
+                        Some(ret_ty) => infer.lower_ty(&sig.body, ret_ty).map(Some),
+                        None => Ok(Some(infer.cx.types.unit())),
+                    }
+                } else {
+                    let bindings = infer.ret_bindings(&sig)?;
+                    Ok(bindings.into_iter().find_map(|(of, name, out)| {
+                        (infer.cx.lang(of) == Some("future_trait") && name == "Output")
+                            .then_some(out)
+                    }))
+                }
+            })
+            .ok()
+            .flatten();
+        if let Some(output) = output {
+            self.cx.store.lookups.futures.insert(ty, output);
+            return true;
+        }
+        false
+    }
+
     pub(super) fn coroutine_output(&self, ty: Ty) -> Option<Ty> {
         let Kind::Closure(parent, substs, at) = self.cx.types.kind(self.resolve(ty)) else {
             return None;
@@ -282,6 +353,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn awaited(&mut self, expr: ExprId, found: Ty) -> Result<Ty> {
+        self.ensure_coroutine(found);
         let (into_future, future) = self.lang_call("into_future", found)?;
         let Some(future_trait) = self.cx.lang_item("future_trait") else {
             bail!("core has no `Future`")
@@ -311,6 +383,7 @@ impl<'a> Infer<'_, 'a> {
         future: Ty,
     ) -> Result<(ItemRef, Vec<Ty>)> {
         let future = self.resolve(future);
+        self.ensure_coroutine(future);
         if self.compiler_impl(of, future) || self.object_holds(of, future, &[]) == Some(true) {
             return Ok((poll, vec![future]));
         }

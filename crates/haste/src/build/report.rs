@@ -18,12 +18,31 @@ use super::test_args::parse_test_args;
 #[cfg(feature = "diff-harness")]
 include!("../../../../tests/case_inputs.rs");
 
+fn format_diagnostic(diag: &str) -> String {
+    if crate::diag::is_rendered(diag) {
+        diag.to_owned()
+    } else {
+        format!("error: {diag}")
+    }
+}
+
+pub(super) fn format_diagnostics(diagnostics: &[String]) -> Option<String> {
+    (!diagnostics.is_empty()).then(|| {
+        diagnostics
+            .iter()
+            .map(|diag| format_diagnostic(diag))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    })
+}
+
 pub(super) fn print_formatted_diagnostics(diagnostics: &[String]) {
     for diag in diagnostics {
+        let rendered = format_diagnostic(diag);
         if crate::diag::is_rendered(diag) {
-            eprintln!("{diag}\n");
+            eprintln!("{rendered}\n");
         } else {
-            eprintln!("error: {diag}");
+            eprintln!("{rendered}");
         }
     }
 }
@@ -125,6 +144,11 @@ impl Batch {
         failed_items
     }
 
+    pub(super) fn formatted_diagnostics(&self, outline: &outline::Outline) -> Option<String> {
+        let (diagnostics, _) = self.collect_diagnostics(outline);
+        format_diagnostics(&diagnostics)
+    }
+
     pub(super) fn failures(&self, cx: &sema::Context<'_>) -> Failures {
         let mut failures = Failures::new();
         for at in self.reached.closure(&self.roots) {
@@ -219,14 +243,15 @@ impl Batch {
         let args = parse_test_args(filters);
         let ignored_only = sel.ignored_only || args.ignored_only;
         let include_ignored = sel.include_ignored || args.include_ignored;
-        let matches = |name: &str, pat: &str| {
-            if args.exact {
-                name == pat
-            } else {
-                name.contains(pat)
+        if args.list {
+            for ((_, name), (meta, _)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
+                if !args.matches_name(name) || (ignored_only && !meta.ignored) {
+                    continue;
+                }
+                println!("{name}: test");
             }
-        };
-        let mut to_run = Vec::new();
+            return Ok(0);
+        }
         let mut errs: Vec<String> = Vec::new();
         let mut raw: Vec<(
             &str,
@@ -234,9 +259,7 @@ impl Batch {
             Option<Result<(usize, Option<usize>), usize>>,
         )> = Vec::new();
         for ((&root, name), (meta, start)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
-            if (!args.filters.is_empty() && !args.filters.iter().any(|f| matches(name, f)))
-                || args.skips.iter().any(|s| matches(name, s))
-            {
+            if !args.matches_name(name) {
                 continue;
             }
             if ignored_only && !meta.ignored {
@@ -263,39 +286,32 @@ impl Batch {
                 ));
                 Some(Err(idx))
             } else {
-                if meta.expected.is_none() {
-                    to_run.push((root, *start, name.as_str()));
-                }
                 Some(Ok((root, *start)))
             };
             raw.push((name.as_str(), meta, outcome));
         }
-        let mut ran = self.image.run_tests(&to_run)?.into_iter();
         let mut entries: Vec<(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)> =
             Vec::with_capacity(raw.len());
         for (name, meta, outcome) in raw {
+            let env = outline.crates[meta.item.krate as usize].env.vars.as_slice();
             let resolved = match outcome {
                 None => None,
                 Some(Err(idx)) => Some(Err(errs[idx].as_str())),
-                Some(Ok((root, start))) if meta.expected.is_some() => {
-                    let (status, stderr) = self.image.run_test_captured(root, start, name)?;
-                    Some(Ok((status, Some(stderr))))
+                Some(Ok((root, start))) => {
+                    let nocapture = args.nocapture && meta.expected.is_none();
+                    let (status, out) = self
+                        .image
+                        .run_test_captured(root, start, name, env, nocapture)?;
+                    Some(Ok((status, (!out.is_empty()).then_some(out))))
                 }
-                Some(Ok((root, start))) => match ran.next() {
-                    Some(status) if status != 0 && !meta.should_panic => {
-                        let (cap_status, stderr) =
-                            self.image.run_test_captured(root, start, name)?;
-                        Some(Ok((
-                            if cap_status != 0 { cap_status } else { status },
-                            Some(stderr),
-                        )))
-                    }
-                    other => other.map(|s| Ok((s, None))),
-                },
             };
             entries.push((name, meta, resolved));
         }
-        Ok(print_test_report(&entries, started.elapsed()))
+        Ok(print_test_report(
+            &entries,
+            started.elapsed(),
+            args.show_output,
+        ))
     }
 }
 

@@ -44,6 +44,8 @@ pub enum Intrinsic {
     Unreachable,
     /// `assume`, a condition the optimizer may take as true.
     Assume,
+    /// `core::intrinsics::ub_checks` / `core::ub_checks::check_language_ub` folded to false in host tool JIT.
+    UbChecks,
     CallerLocation,
     Cpuid,
     /// `FnPtr::addr`, the address of a function pointer.
@@ -553,8 +555,15 @@ impl Context<'_> {
         if is_core {
             match name {
                 "__cpuid_count" => return Some(Intrinsic::Cpuid),
-                "unreachable_unchecked" if crate::profile() == Profile::Release => {
+                "unreachable_unchecked"
+                    if crate::profile() == Profile::Release || crate::in_host_target() =>
+                {
                     return Some(Intrinsic::Unreachable);
+                }
+                "ub_checks" | "check_language_ub" | "check_library_ub"
+                    if crate::in_host_target() =>
+                {
+                    return Some(Intrinsic::UbChecks);
                 }
                 _ => {}
             }

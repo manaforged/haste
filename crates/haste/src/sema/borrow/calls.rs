@@ -21,10 +21,10 @@ use super::{Checker, Loan, State, prune_moved_loans};
 pub(super) use arg_refs::{recv_is_by_ref, recv_ref_mut, sig_param_idx};
 pub(super) use closure::ActiveClosure;
 pub(super) use lifetimes::{
-    Lifetimes, ParamLifetimes, ast_ty_may_carry_elided_lt, callable_param_inputs,
-    collect_ty_lifetimes, compute_param_lifetimes, for_each_param_bound_list, lifetime_outlives,
-    pred_matches_name, receiver_has_any_named, sig_return_named_lifetimes, sig_returns_only_static,
-    sig_type_params, ty_shares_name,
+    Lifetimes, ParamLifetimes, ast_ty_has_type_param, ast_ty_may_carry_elided_lt,
+    callable_param_inputs, collect_ty_lifetimes, compute_param_lifetimes,
+    for_each_param_bound_list, lifetime_outlives, pred_matches_name, receiver_has_any_named,
+    sig_return_named_lifetimes, sig_returns_only_static, sig_type_params, ty_shares_name,
 };
 
 #[derive(Default)]
@@ -106,18 +106,14 @@ impl Checker<'_, '_> {
             Some(Res::Ctor(item, variant, _)) => (true, Some((item, variant))),
             _ => (false, None),
         };
-        let call_extend = if is_ctor { self.let_extend_depth } else { None };
+        let call_extend = is_ctor.then_some(self.let_extend_depth).flatten();
         let has_self_arg = sig.as_deref().is_some_and(|s| s.receiver.is_some());
         let is_callable_method = fn_item.is_some_and(|it| self.is_callable_trait_method(it));
         self.with_let_extend(call_extend, |this| {
             let arg_sources = this.check_arg_list_sources(
                 &arg_ids,
                 &ArgListCtx {
-                    sig: if is_callable_method {
-                        None
-                    } else {
-                        sig.as_deref()
-                    },
+                    sig: (!is_callable_method).then(|| sig.as_deref()).flatten(),
                     fn_item: fn_item.filter(|_| !is_callable_method),
                     call_expr: Some(expr),
                     callee_ty: Some(callee_ty),
@@ -215,10 +211,9 @@ impl Checker<'_, '_> {
         let adjust = self.typed.adjusts.get(&expr).copied();
         adjust.and_then(|m| m.autoref).or_else(|| {
             let sig = self.callee_sig(expr, None);
-            let is_by_val = adjust.map_or(0, |a| a.derefs) == 0
-                && sig
-                    .as_deref()
-                    .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
+            let is_by_val = sig
+                .as_deref()
+                .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
             (!is_by_val && self.is_mut_ref_ty(self.expr_ty(receiver))).then(|| {
                 if sig
                     .as_deref()
@@ -327,9 +322,10 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<()> {
         let recv_borrow = self.method_recv_borrow(expr, receiver);
+        let derefs = self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs);
         if recv_borrow == Some(Mut::Mut)
             && (self.place_behind_shared_ref(receiver)
-                || self.is_shared_ref_or_ptr(self.expr_ty(receiver)))
+                || (derefs > 0 && self.is_shared_ref_or_ptr(self.expr_ty(receiver))))
         {
             return Err(self.borrow_err(
                 Some(expr),
@@ -459,7 +455,7 @@ impl Checker<'_, '_> {
                 return Ok(());
             }
         }
-        self.check_expr(receiver, state, false, outer_live, true, depth)
+        self.check_expr(receiver, state, crossed_ref, outer_live, true, depth)
     }
 
     pub(super) fn check_arg_list_with_refs(
@@ -612,13 +608,15 @@ impl Checker<'_, '_> {
             })
         {
             let origins = non_env_sources(recv);
-            if !origins.is_empty() {
+            if !origins.is_empty() || self.is_by_val_map_fn(ctx.fn_item) {
                 self.closure_param_origins.insert(params[0], origins);
                 added.push(params[0]);
             }
             return added;
         }
-        let Some(sig) = ctx.sig else { return added };
+        let Some(sig) = ctx.sig else {
+            return self.mark_closure_arg_static_params(ctx.callee_expr, idx, &params);
+        };
         let Some(param_idx) = sig_param_idx(idx, ctx.has_self_arg) else {
             return added;
         };
@@ -689,6 +687,12 @@ impl Checker<'_, '_> {
         outer_live: &HashSet<u32>,
         depth: u32,
     ) -> Result<Vec<Vec<BorrowSource>>> {
+        let mut after_arg = vec![HashSet::default(); arg_ids.len()];
+        let mut live = outer_live.clone();
+        for pos in (0..arg_ids.len()).rev() {
+            after_arg[pos] = live.clone();
+            self.collect_live_expr(ExprId(arg_ids[pos]), &mut live);
+        }
         let temp_id = self.next_temp_holder();
         let mut deferred_mut_args: Vec<(ExprId, u32, Vec<PlaceStep>)> = Vec::new();
         let mut arg_sources = Vec::with_capacity(arg_ids.len());
@@ -711,7 +715,7 @@ impl Checker<'_, '_> {
                     expected_ty,
                     &mut deferred_mut_args,
                     state,
-                    outer_live,
+                    &after_arg[idx],
                     depth,
                 );
                 for local in added_origins {
@@ -740,6 +744,9 @@ impl Checker<'_, '_> {
                 );
                 arg_sources.push(sources);
                 prune_moved_loans(state);
+                if ctx.call_expr.is_none() && idx + 1 < arg_ids.len() {
+                    super::prune_dead_loans(state, &after_arg[idx]);
+                }
             }
             if !state.diverged && !deferred_mut_args.is_empty() {
                 super::prune_dead_loans(state, outer_live);

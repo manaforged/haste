@@ -122,16 +122,20 @@ impl<'a> Infer<'_, 'a> {
         (param, expectation): (Ty, Option<Ty>),
         held: &mut Option<(ItemRef, Vec<Ty>)>,
     ) -> Result<()> {
-        let callable = match *self.cx.types.kind(self.resolve(param)) {
-            Kind::Ref(_, pointee) => pointee,
-            _ => param,
-        };
-        let (hint, bound) = match callee {
-            Some(c) => (
-                self.closure_hint(c, arg, param)?,
-                self.callable_hint(c, callable)?,
-            ),
-            None => (None, None),
+        let mut callable_vars = Vec::new();
+        self.collect_param_vars(param, &mut callable_vars);
+        let (hint, bounds) = match callee {
+            Some(c) => {
+                let hint = self.closure_hint(c, arg, param)?;
+                let mut bounds = Vec::new();
+                for var in callable_vars {
+                    if let Some((of, bound)) = self.callable_hint(c, var)? {
+                        bounds.push((var, of, bound));
+                    }
+                }
+                (hint, bounds)
+            }
+            None => (None, Vec::new()),
         };
         let closure = self.is_closure(arg);
         let propagate = closure
@@ -141,9 +145,29 @@ impl<'a> Infer<'_, 'a> {
         let found = self.expr(arg, Some(hint.or(usable).unwrap_or(param)))?;
         self.release_if_fits(held, found, param)?;
         self.coerce_arg((arg, found, closure), param, expectation)?;
-        match bound {
-            Some((of, bound)) => self.tie_callable_bound(of, callable, bound),
-            None => Ok(()),
+        for (var, of, bound) in bounds {
+            self.tie_callable_bound(of, var, bound)?;
+        }
+        Ok(())
+    }
+
+    fn collect_param_vars(&self, ty: Ty, out: &mut Vec<Ty>) {
+        let ty = self.resolve(ty);
+        match *self.cx.types.kind(ty) {
+            Kind::Var(_) => {
+                if !out.contains(&ty) {
+                    out.push(ty);
+                }
+            }
+            Kind::Ref(_, inner) | Kind::Slice(inner) | Kind::Array(inner, _) => {
+                self.collect_param_vars(inner, out);
+            }
+            Kind::Adt(_, substs) | Kind::Tuple(substs) => {
+                for &arg in self.cx.types.substs(substs) {
+                    self.collect_param_vars(arg, out);
+                }
+            }
+            _ => {}
         }
     }
 

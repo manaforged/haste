@@ -110,11 +110,16 @@ impl Lexer {
         self.at += 2;
         let from = self.at;
         self.eat_while(|ch| ch != '\n');
+        let end = if self.at > from + 1 && self.chars[self.at - 1] == '\r' {
+            self.at - 1
+        } else {
+            self.at
+        };
         match kind {
             (Some('/'), next) if next != Some('/') => {
-                doc(self.chars[from + 1..self.at].iter().collect(), false, trees)
+                doc(self.chars[from + 1..end].iter().collect(), false, trees)
             }
-            (Some('!'), _) => doc(self.chars[from + 1..self.at].iter().collect(), true, trees),
+            (Some('!'), _) => doc(self.chars[from + 1..end].iter().collect(), true, trees),
             _ => {}
         }
     }

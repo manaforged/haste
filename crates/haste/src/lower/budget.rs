@@ -25,7 +25,7 @@ struct Budget {
 
 const DEBUG_BUDGET: Budget = Budget {
     insts: 30,
-    inline_insts: 30,
+    inline_insts: 60,
     always: 100,
     exprs: 20,
     outline: 30,
@@ -216,9 +216,9 @@ fn body_budget(
             let max_exprs = if release {
                 1200
             } else if env_release {
-                400
+                60
             } else {
-                200
+                40
             };
             let inst_limit = if release || env_release {
                 budget.inline_insts
@@ -260,7 +260,9 @@ fn inlinable_item(
         return None;
     }
     let env = &cx.outline.crates[item.krate as usize].env;
-    if !inlinable(env) || crate::prep::bind(cx, reached, index).is_some() {
+    if (!inlinable(env) && !crate::in_host_target())
+        || crate::prep::bind(cx, reached, index).is_some()
+    {
         return None;
     }
     Some((*item, *substs, hint))

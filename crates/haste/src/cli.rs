@@ -83,8 +83,30 @@ pub(crate) fn test_items(
     workspace: &graph::Workspace,
     outline: &outline::Outline,
 ) -> Vec<TestItem> {
+    let sel = crate::selection();
+    let test_name = sel.test.as_deref().map(|n| n.replace('-', "_"));
+    let bin_name = sel.bin.as_deref().map(|n| n.replace('-', "_"));
+    let has_target_filter = sel.lib || sel.bins || test_name.is_some() || bin_name.is_some();
     member_fns(workspace, outline)
-        .filter(|(_, tree, file, item)| {
+        .filter(|(item_ref, tree, file, item)| {
+            if has_target_filter {
+                let root = &outline.roots[item_ref.krate as usize];
+                let pkg = &workspace.packages[workspace.graph.units[root.unit].package];
+                let is_lib_root = root.role == outline::Role::Lib
+                    || (root.role == outline::Role::Test
+                        && pkg.manifest.lib.as_deref() == Some(root.path.as_path()));
+                let matches_lib = sel.lib && is_lib_root;
+                let matches_bins = sel.bins && root.role == outline::Role::Bin;
+                let matches_bin = bin_name
+                    .as_deref()
+                    .is_some_and(|n| root.role == outline::Role::Bin && root.name == n);
+                let matches_test = test_name.as_deref().is_some_and(|n| {
+                    root.role == outline::Role::Test && !is_lib_root && root.name == n
+                });
+                if !(matches_lib || matches_bins || matches_bin || matches_test) {
+                    return false;
+                }
+            }
             outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
         })
         .map(|(item_ref, tree, file, item)| {
@@ -125,6 +147,7 @@ fn panic_payload(stderr: &str) -> Option<&str> {
 pub(crate) fn print_test_report(
     entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
     elapsed: std::time::Duration,
+    show_output: bool,
 ) -> i32 {
     println!(
         "\nrunning {} test{}",
@@ -133,6 +156,7 @@ pub(crate) fn print_test_report(
     );
     let (mut passed, mut failed, mut ignored) = (0usize, 0usize, 0usize);
     let mut details: Vec<(&str, String)> = Vec::new();
+    let mut successes: Vec<(&str, &str)> = Vec::new();
     for &(name, meta, ref outcome) in entries {
         let Some(outcome) = outcome else {
             println!("test {name} ... ignored");
@@ -155,6 +179,12 @@ pub(crate) fn print_test_report(
                 };
                 if ok {
                     println!("test {name} ... ok");
+                    if show_output
+                        && let Some(out) =
+                            stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        successes.push((name, out));
+                    }
                     passed += 1;
                 } else {
                     let msg = if meta.should_panic && *status == 0 {
@@ -167,7 +197,7 @@ pub(crate) fn print_test_report(
                     } else if let Some(out) =
                         stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
                     {
-                        format!("{out}\n(exited with status {status})")
+                        out.to_owned()
                     } else {
                         format!("exited with status {status}")
                     };
@@ -181,6 +211,12 @@ pub(crate) fn print_test_report(
                 details.push((name, (*err).to_owned()));
                 failed += 1;
             }
+        }
+    }
+    if !successes.is_empty() {
+        println!("\nsuccesses:\n");
+        for (name, out) in &successes {
+            println!("---- {name} output ----\n{out}\n");
         }
     }
     if !details.is_empty() {
@@ -273,6 +309,12 @@ fn report_cases(
         (Request::Build, None) if stats.is_none() => build
             .compile_binary_oneshot(workspace)
             .and_then(|()| build.check(started.elapsed())),
+        (Request::Test, None) => {
+            let filters = args.get(1..).unwrap_or(&[]);
+            build
+                .compile_cases_filtered(workspace, filters)
+                .and_then(|()| build.report(started, started.elapsed(), filters))
+        }
         _ => crate::serve::finish(&mut build, workspace, (request, out, args), started),
     };
     if let Some((path, graph_span)) = stats {
@@ -454,6 +496,18 @@ fn report(
     out: Option<&std::path::Path>,
 ) -> Result<i32> {
     let started = Instant::now();
+    if let Some(path) = out {
+        if path.is_dir() {
+            anyhow::bail!("output path `{}` is a directory", path.display());
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory `{}`", parent.display()))?;
+        }
+    }
     if matches!(command, Command::Request(Request::Build))
         && crate::substrate::noop::active(stats_json)
         && let Some(reached) = crate::substrate::noop::try_hit(root, out)
@@ -495,7 +549,7 @@ fn report(
         Command::Clean => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
-    if !matches!(command, Command::Request(Request::Run)) {
+    if matches!(command, Command::Debug(Query::Graph)) {
         eprintln!(
             "graph {} packages {} units in {:.1} ms",
             workspace.packages.len(),

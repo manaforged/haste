@@ -30,7 +30,7 @@ pub(super) fn usage() -> String {
         .map(|(_, name)| name)
         .collect();
     format!(
-        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--target TRIPLE] [--jobs N] [--release] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--ignored] [--include-ignored] [--target TRIPLE] [--jobs N] [--release] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -129,7 +129,15 @@ fn parse(
     }
     Request::parse_mode(&word)
         .map(|req| Ok(Command::Request(req)))
-        .with_context(usage)
+        .ok_or_else(|| {
+            if word == "check" {
+                anyhow::anyhow!(
+                    "unknown command `check` (did you mean `haste build`?); run `haste --help` for usage"
+                )
+            } else {
+                anyhow::anyhow!("unknown command `{word}`; run `haste --help` for usage")
+            }
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +203,19 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
                 opts.selection.example =
                     Some(next_str(args).context("--example takes an example name")?);
             }
+            "--test" => {
+                args.next();
+                opts.selection.test =
+                    Some(next_str(args).context("--test takes a test target name")?);
+            }
+            "--lib" => {
+                args.next();
+                opts.selection.lib = true;
+            }
+            "--bins" => {
+                args.next();
+                opts.selection.bins = true;
+            }
             "-F" | "--features" => {
                 args.next();
                 let list = next_str(args).context("--features takes a feature list")?;
@@ -207,6 +228,9 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
             "--all-features" => {
                 args.next();
                 opts.selection.all_features = true;
+            }
+            "--workspace" => {
+                args.next();
             }
             "--no-default-features" => {
                 args.next();

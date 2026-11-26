@@ -261,7 +261,7 @@ impl<'a> Context<'a> {
         };
         let imports = self.body_index(file).imports.get(*first)?;
         let (_, entry) = imports.iter().filter(held).find_map(|&import| {
-            self.import_entry((root, home), &paths, (file, import), Some(word))
+            self.import_entry((root, home), &paths, (file, import), Some(word), &[], 0)
         })?;
         let binding = if more.is_empty() {
             entry.get(ns)
@@ -291,6 +291,16 @@ impl<'a> Context<'a> {
         word: Option<Sym>,
         (here, hidden): (Option<u32>, &[u32]),
     ) -> Vec<PerNs> {
+        self.body_imports_depth((root, home), word, (here, hidden), 0)
+    }
+
+    fn body_imports_depth(
+        &self,
+        (root, home): (ItemRef, ModRef),
+        word: Option<Sym>,
+        (here, hidden): (Option<u32>, &[u32]),
+        depth: u8,
+    ) -> Vec<PerNs> {
         let Some(found) = self.expansion(root) else {
             return Vec::new();
         };
@@ -319,7 +329,7 @@ impl<'a> Context<'a> {
             {
                 continue;
             }
-            match self.import_entry((root, home), &paths, (file, import), word) {
+            match self.import_entry((root, home), &paths, (file, import), word, hidden, depth) {
                 Some((true, entry)) => out.push(entry),
                 Some((false, entry)) => globs.push(entry),
                 None => {}
@@ -335,17 +345,21 @@ impl<'a> Context<'a> {
         paths: &Paths<'_>,
         (file, import): (&File, u32),
         word: Option<Sym>,
+        hidden: &[u32],
+        depth: u8,
     ) -> Option<(bool, PerNs)> {
-        let (segments, absolute, dollar, name) = import_parts(file, import, &self.names.symbols);
+        let (segments, raw_absolute, dollar, name) =
+            import_parts(file, import, &self.names.symbols);
         let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
         let absolute = paths
             .use_path(NamePath {
                 segments,
-                absolute,
+                absolute: raw_absolute,
                 dollar,
             })
             .absolute;
-        let from = file.items.items[file.items.imports[import as usize].item as usize].parent;
+        let import_item = file.items.imports[import as usize].item;
+        let from = file.items.items[import_item as usize].parent;
         let (head, leaf) = match (name, segments.split_last(), word) {
             (None, _, Some(word)) => (segments, word),
             (Some(_), Some((&leaf, head)), _) => (head, leaf),
@@ -397,29 +411,26 @@ impl<'a> Context<'a> {
                 },
             ),
             _ => {
+                let head_path = NamePath {
+                    segments: head,
+                    absolute,
+                    dollar,
+                };
                 let target = if self.outline.crates[home.krate as usize].env.fixed
                     || dollar.is_some_and(|k| self.outline.is_sysroot(k))
                 {
-                    paths.resolve(
-                        &NamePath {
-                            segments: head,
-                            absolute,
-                            dollar,
-                        },
-                        home,
-                    )?
+                    paths.resolve(&head_path, home)
                 } else {
-                    paths
-                        .resolve_visible(
-                            &NamePath {
-                                segments: head,
-                                absolute,
-                                dollar,
-                            },
-                            home,
-                        )
-                        .ok()??
-                };
+                    paths.resolve_visible(&head_path, home).ok().flatten()
+                }
+                .or_else(|| {
+                    if raw_absolute || dollar.is_some() || depth >= 8 {
+                        return None;
+                    }
+                    let mut next = hidden.to_vec();
+                    next.push(import_item);
+                    self.body_use_head((root, home), head, from, &next, depth + 1)
+                })?;
                 let mut found = self.path_member(home, target, leaf);
                 if let Def::Module(target_mod) = target
                     && !self.outline.crates[home.krate as usize].env.fixed
@@ -514,9 +525,23 @@ impl<'a> Context<'a> {
         path: &NamePath<'_>,
         here: Option<u32>,
     ) -> Option<Def> {
-        let (first, rest) = path.segments.split_first().filter(|_| !path.absolute)?;
+        if path.absolute {
+            return None;
+        }
+        self.body_use_head((root, home), path.segments, here, &[], 0)
+    }
+
+    fn body_use_head(
+        &self,
+        (root, home): (ItemRef, ModRef),
+        segments: &[Sym],
+        here: Option<u32>,
+        hidden: &[u32],
+        depth: u8,
+    ) -> Option<Def> {
+        let (first, rest) = segments.split_first()?;
         let binding = self
-            .body_imports((root, home), Some(*first), (here, &[]))
+            .body_imports_depth((root, home), Some(*first), (here, hidden), depth)
             .into_iter()
             .find_map(|entry| entry.types)?;
         rest.iter().try_fold(binding.def, |def, segment| {

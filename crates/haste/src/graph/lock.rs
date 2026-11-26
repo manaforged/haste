@@ -9,6 +9,7 @@ pub struct Locked {
     pub name: String,
     pub version: semver::Version,
     pub source: Option<String>,
+    pub checksum: Option<String>,
     #[serde(default)]
     pub dependencies: Vec<String>,
 }

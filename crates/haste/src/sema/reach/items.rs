@@ -124,7 +124,7 @@ fn lay_out_ty(cx: &mut Context<'_>, ty: Ty) -> anyhow::Result<()> {
 }
 
 /// Computes the layout of each ADT, tuple and array type that lowering `typed` reads, so the names those layouts need are asked for while inference can still retry.
-pub(in crate::sema) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
+pub(crate) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
     if let Shape::Closure(body) = &typed.shape
         && body.parent_laid
     {

@@ -18,8 +18,9 @@ mod wave;
 
 pub(super) use collect::run_scoped;
 pub use collect::{reach_again, reach_anew, reach_wave};
+pub(crate) use items::lay_out;
 pub(crate) use items::typed_once;
-pub(super) use items::{infer_entry, is_inferring, lay_out};
+pub(super) use items::{infer_entry, is_inferring};
 pub(crate) use unwind::{foreign_dynamic_may_unwind, host_symbol_may_unwind};
 pub use wave::infer_quiet;
 

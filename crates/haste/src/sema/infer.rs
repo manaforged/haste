@@ -23,7 +23,7 @@ mod path;
 mod pattern;
 pub(super) mod poly;
 mod project;
-mod scope;
+pub(super) mod scope;
 mod select;
 mod stmt;
 mod tables;
@@ -128,10 +128,9 @@ pub struct Infer<'c, 'a> {
     var_trail: Vec<(u32, Option<Ty>)>,
     diverge_trail: Vec<(u32, u32)>,
     trail_depth: u32,
-    trail_bases: Vec<usize>,
+    cache_min_var: Vec<usize>,
     var_epoch: u64,
     capture_epoch: u64,
-    pre_var_epoch: u64,
     local_cache_epoch: u64,
     local_closed_cache_epoch: u64,
     local_cache_var_limit: usize,
@@ -141,6 +140,7 @@ pub struct Infer<'c, 'a> {
     opaques: Vec<opaque::Opaque>,
     operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
     casts: Vec<(ExprId, Ty, Ty)>,
+    deferred_offsets: Vec<(ExprId, Ty, crate::body::List)>,
     param_origins: Vec<(u32, &'a str)>,
     receiver_param: Option<&'a str>,
     try_blocks: Vec<(ExprId, Ty)>,
@@ -178,7 +178,10 @@ pub struct Infer<'c, 'a> {
     obligation_sites: HashMap<(ItemRef, Ty), ExprId>,
     captures_settled: bool,
     auto_stack: Vec<(ItemRef, Ty)>,
+    auto_provisional: HashMap<(ItemRef, Ty), usize>,
+    auto_dep: usize,
     matches: Vec<(ExprId, Ty, crate::body::List)>,
+    uninhabited: HashMap<Ty, bool>,
     active_discr: Option<(ItemRef, Vec<Option<i128>>, Vec<bool>)>,
 }
 
@@ -365,10 +368,9 @@ impl<'c, 'a> Infer<'c, 'a> {
             var_trail: Vec::new(),
             diverge_trail: Vec::new(),
             trail_depth: 0,
-            trail_bases: Vec::new(),
+            cache_min_var: Vec::new(),
             var_epoch: 0,
             capture_epoch: 0,
-            pre_var_epoch: 0,
             local_cache_epoch: 0,
             local_closed_cache_epoch: 0,
             local_cache_var_limit: 0,
@@ -378,6 +380,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             opaques,
             operands,
             casts: Vec::new(),
+            deferred_offsets: Vec::new(),
             param_origins: Vec::new(),
             receiver_param: None,
             try_blocks,
@@ -412,7 +415,10 @@ impl<'c, 'a> Infer<'c, 'a> {
             obligation_sites: HashMap::default(),
             captures_settled: false,
             auto_stack: Vec::new(),
+            auto_provisional: HashMap::default(),
+            auto_dep: usize::MAX,
             matches: Vec::new(),
+            uninhabited: HashMap::default(),
             active_discr: None,
         }
     }
@@ -576,21 +582,29 @@ impl Infer<'_, '_> {
     }
 
     fn type_param_named(&self, arena: &Body, ty: crate::body::TyId) -> Option<usize> {
-        let crate::body::Ty::Path(path) = *arena.ty(ty) else {
-            return None;
-        };
-        let path = arena.path(path);
-        let &[segment] = arena.list(path.segments) else {
-            return None;
-        };
-        let segment = &arena.segments[segment as usize];
-        if path.qself.is_some() || segment.args.is_some() {
-            return None;
+        match *arena.ty(ty) {
+            crate::body::Ty::ImplTrait(at, _) => {
+                let key = self.src.text(at);
+                self.generics
+                    .iter()
+                    .position(|(generic, _)| scope::same_param(generic, key))
+            }
+            crate::body::Ty::Path(path) => {
+                let path = arena.path(path);
+                let &[segment] = arena.list(path.segments) else {
+                    return None;
+                };
+                let segment = &arena.segments[segment as usize];
+                if path.qself.is_some() || segment.args.is_some() {
+                    return None;
+                }
+                let name = self.src.text(segment.name);
+                self.generics
+                    .iter()
+                    .position(|(generic, _)| *generic == name)
+            }
+            _ => None,
         }
-        let name = self.src.text(segment.name);
-        self.generics
-            .iter()
-            .position(|(generic, _)| *generic == name)
     }
 
     fn param_pat(&mut self, arena: &Body, pat: PatId, ty: Ty, own: Option<PatId>) -> Result<u32> {
@@ -675,6 +689,7 @@ pub(super) fn detached_summary<T>(
         offset: 0,
         outputs: Default::default(),
         origins: crate::outline::source::Origins::Read,
+        line_starts: std::sync::OnceLock::new(),
     });
     let home = cx.module_of(item).unwrap_or(ModRef {
         krate: item.krate,

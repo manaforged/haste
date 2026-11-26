@@ -279,115 +279,35 @@ fn main() {
 fn mut_temp_promotion_rules() {
     crate::check_fails_borrow(
         "rejects_returning_mut_ref_to_temp",
-        r#"
-fn bad<'a>() -> &'a mut u32 {
-    &mut 4
-}
-fn main() {
-    let _ = bad();
-}
-"#,
+        "fn bad<'a>() -> &'a mut u32 { &mut 4 }\nfn main() { let _ = bad(); }",
     );
-
     crate::check_fails_borrow(
         "rejects_explicit_return_mut_ref_to_temp",
-        r#"
-fn bad() -> &'static mut u32 {
-    return &mut 4;
-}
-fn main() {
-    let _ = bad();
-}
-"#,
+        "fn bad() -> &'static mut u32 { return &mut 4; }\nfn main() { let _ = bad(); }",
     );
-
     crate::check_passes(
         "allows_shared_temp_promotion_zst_and_static_mut",
-        r#"
-static mut S_MUT: &'static mut u32 = &mut 4;
-fn ok() -> &'static u32 {
-    &4
-}
-fn ok_empty<'a>() -> &'a mut [u8; 0] {
-    &mut []
-}
-fn main() {
-    let _ = ok();
-    let _ = ok_empty();
-}
-"#,
+        "static mut S_MUT: &'static mut u32 = &mut 4;\nfn ok() -> &'static u32 { &4 }\nfn ok_empty<'a>() -> &'a mut [u8; 0] { &mut [] }\nfn main() { let _ = ok(); let _ = ok_empty(); }",
     );
-
     crate::check_fails_borrow(
         "rejects_mut_ref_to_unit_zst",
-        r#"
-fn bad<'a>() -> &'a mut () {
-    &mut ()
-}
-fn main() {
-    let _ = bad();
-}
-"#,
+        "fn bad<'a>() -> &'a mut () { &mut () }\nfn main() { let _ = bad(); }",
     );
-
     crate::check_fails_borrow(
         "rejects_mut_ref_to_zst_struct",
-        r#"
-struct Z;
-fn bad<'a>() -> &'a mut Z {
-    &mut Z
-}
-fn main() {
-    let _ = bad();
-}
-"#,
+        "struct Z;\nfn bad<'a>() -> &'a mut Z { &mut Z }\nfn main() { let _ = bad(); }",
     );
-
     crate::check_fails_borrow(
         "rejects_mut_ref_through_overloaded_deref_temp",
-        r#"
-use std::ops::{Deref, DerefMut};
-struct Wrap(());
-impl Deref for Wrap {
-    type Target = ();
-    fn deref(&self) -> &() {
-        &self.0
-    }
-}
-impl DerefMut for Wrap {
-    fn deref_mut(&mut self) -> &mut () {
-        &mut self.0
-    }
-}
-fn bad<'a>() -> &'a mut () {
-    &mut *Wrap(())
-}
-fn main() {
-    let _ = bad();
-}
-"#,
+        "use std::ops::{Deref, DerefMut};\nstruct Wrap(());\nimpl Deref for Wrap { type Target = (); fn deref(&self) -> &() { &self.0 } }\nimpl DerefMut for Wrap { fn deref_mut(&mut self) -> &mut () { &mut self.0 } }\nfn bad<'a>() -> &'a mut () { &mut *Wrap(()) }\nfn main() { let _ = bad(); }",
     );
-
     crate::check_fails_borrow(
         "rejects_const_nested_mut_temp",
-        r#"
-const C: &'static &'static mut u32 = &&mut 4;
-fn main() {
-    let _ = C;
-}
-"#,
+        "const C: &'static &'static mut u32 = &&mut 4;\nfn main() { let _ = C; }",
     );
-
     crate::check_fails_borrow(
         "rejects_static_mut_loop_temp",
-        r#"
-static mut S: &'static mut u32 = loop {
-    break &mut 4;
-};
-fn main() {
-    let _ = unsafe { &raw const S };
-}
-"#,
+        "static mut S: &'static mut u32 = loop { break &mut 4; };\nfn main() { let _ = unsafe { &raw const S }; }",
     );
 }
 
@@ -787,5 +707,73 @@ fn main() { let mut cx = Cx("ok"); let _ = (cx.frame(&[1]), cx.frame_res(&[1]));
     crate::check_fails_borrow(
         "rejects_returning_second_tuple_elem_borrowed_from_short_param",
         "fn split<'a, 's>(a: &'a str, b: &'s str) -> (&'a str, &'s str) { (a, b) }\nfn bad<'a>(a: &'a str, b: &str) -> &'a str { let (_x, y) = split(a, b); y }\nfn main() { let _ = bad(\"a\", \"b\"); }",
+    );
+}
+
+#[test]
+fn tuple_pattern_inner_ref_escape_rules() {
+    crate::check_passes(
+        "allows_filter_tuple_pat_reading_inner_ref_field",
+        "use std::collections::HashSet;\nstruct Disk { device: String }\nstruct Storage { volumes: Vec<Disk> }\nimpl Storage { fn counted(&self) -> Vec<(usize, &Disk)> { let mut seen = HashSet::new(); self.volumes.iter().enumerate().filter(|(_, volume)| seen.insert(volume.device.as_str())).collect() } fn counted_pat(&self) -> Vec<(usize, &Disk)> { let mut seen = HashSet::new(); self.volumes.iter().enumerate().filter(|&(_, volume)| seen.insert(volume.device.as_str())).collect() } }\nfn main() { let st = Storage { volumes: vec![Disk { device: String::from(\"nvme0\") }] }; let _ = (st.counted().len(), st.counted_pat().len()); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_filter_tuple_pat_escaping_owned_string",
+        "use std::collections::HashSet;\nfn main() { let xs = vec![String::from(\"a\")]; let mut seen = HashSet::new(); let _: Vec<_> = xs.into_iter().enumerate().filter(|(_, s)| seen.insert(s.as_str())).collect(); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_filter_tuple_pat_escaping_boxed_string",
+        "use std::collections::HashSet;\nfn main() { let xs = vec![Box::new(String::from(\"a\"))]; let mut seen = HashSet::new(); let _: Vec<_> = xs.into_iter().enumerate().filter(|(_, b)| seen.insert(b.as_str())).collect(); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_filter_tuple_pat_boxed_ref_outliving_vec",
+        "use std::collections::HashSet;\nfn main() { let mut seen = HashSet::new(); let xs = vec![Box::new(String::from(\"a\"))]; let _ = xs.iter().enumerate().filter(|(_, b)| seen.insert(b.as_str())).count(); drop(xs); let _ = seen.len(); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_filter_tuple_pat_escaping_mut_inner_ref",
+        "use std::collections::HashSet;\nfn main() { let mut a = String::from(\"a\"); let xs: Vec<&mut String> = vec![&mut a]; let mut seen = HashSet::new(); let _: Vec<_> = xs.into_iter().enumerate().filter(|(_, s)| seen.insert(s.as_str())).collect(); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_nested_hrtb_tuple_pat_escape",
+        "fn bad(f: impl FnOnce(&(usize, &u8))) { let local = 9u8; f(&(0, &local)); }\nfn main() { let mut out = &0u8; bad(|(_, r)| out = *r); println!(\"{out}\"); }",
+    );
+}
+
+#[test]
+fn downcast_replace_and_static_closure_cloned_handles() {
+    crate::check_passes(
+        "allows_downcast_mut_replace_and_restamp_monomorphized",
+        "use std::any::Any;\n#[derive(Clone, Copy)] struct Hooks<'a>(&'a str);\nstruct Slot { value: Box<dyn Any> }\nstruct Rt { slot: Slot, key: u32 }\nfn live_slot(rt: &mut Rt, _k: u32) -> &mut Slot { &mut rt.slot }\nfn restamp(rt: &mut Rt, k: u32) { rt.key = k; }\nfn set_val<T: 'static>(rt: &mut Rt, key: u32, value: T) -> T { let current = live_slot(rt, key).value.downcast_mut::<T>().expect(\"type\"); let old = core::mem::replace(current, value); restamp(rt, key); old }\nfn main() { let mut rt1 = Rt { slot: Slot { value: Box::new(\"a\") }, key: 1 }; let _ = set_val(&mut rt1, 2, \"b\"); let mut rt2 = Rt { slot: Slot { value: Box::new(Hooks(\"a\")) }, key: 1 }; let _ = set_val(&mut rt2, 2, Hooks(\"b\")); }",
+    );
+    crate::check_passes(
+        "allows_static_closures_capturing_cloned_and_copied_handles",
+        "use std::cell::{Cell, RefCell};\nuse std::rc::Rc;\nuse std::sync::Arc;\n#[derive(Clone, Copy)] struct Handle<'a>(&'a str);\nstruct Item { handle: Handle<'static>, label: &'static str, cb: Arc<dyn Fn()> }\nstruct Bound { count: Rc<dyn Fn() -> usize> }\nstruct VList<'a> { _cx: &'a str, bound: Option<Bound> }\nstruct TableCol(&'static str);\nimpl TableCol { fn new(a: &'static str, _b: &'static str) -> Self { Self(a) } }\nstruct TableState<Row>(std::marker::PhantomData<Row>);\nimpl<Row> TableState<Row> { fn row_eq_fn(&self) -> Option<Rc<dyn Fn(&Row, &Row) -> bool>> { None } }\nmod row_sealed { pub trait Sealed<T>: 'static {} }\ntrait RowRender<T>: row_sealed::Sealed<T> + 'static { fn run(&self) -> usize; }\nstruct BoundStrip<T, R>(std::marker::PhantomData<T>, R);\nimpl<T, R> BoundStrip<T, R> { fn runner(&self) -> Rc<dyn Fn()> where R: Clone + RowRender<T> { let r = self.1.clone(); Rc::new(move || { let _ = r.run(); }) } }\n#[derive(Clone)] struct DummyRender;\nimpl<T: 'static> row_sealed::Sealed<T> for DummyRender {}\nimpl<T: 'static> RowRender<T> for DummyRender { fn run(&self) -> usize { 1 } }\nfn spawn(_: impl FnOnce() + 'static) {}\nfn fixed(ids: &[&'static str]) -> Vec<TableCol> { ids.iter().map(|&id| TableCol::new(id, id)).collect() }\nfn follow_bound(v: &VList<'_>) { let count = v.bound.as_ref().map(|bound| Rc::clone(&bound.count)); spawn(move || { let _n = count.as_ref().map_or(0, |c| c()); }); }\nfn build_row<Row: 'static>(state: &TableState<Row>) { let eq = state.row_eq_fn(); spawn(move || { let _eq = eq.clone(); }); }\nfn bound_strip<T, R>(spec: &BoundStrip<T, R>) where T: 'static, R: RowRender<T> + Clone { let runner = spec.runner(); spawn(move || runner()); }\nfn main() { let item = Item { handle: Handle(\"h\"), label: \"l\", cb: Arc::new(|| {}) }; let r = &item; let h1 = r.handle.clone(); let h2 = r.label; let h3 = Arc::clone(&r.cb); let state = RefCell::new(Item { handle: Handle(\"s\"), label: \"sl\", cb: Arc::new(|| {}) }); let h4 = state.borrow().handle.clone(); let items = vec![Handle(\"v\")]; for &h5 in &items { spawn(move || { let _v = h5; }); } let cell = Cell::new(Handle(\"c\")); let c_ref = &cell; let h6 = c_ref.get(); spawn(move || { let _ = (h1, h2, h4, h6); h3(); }); let _ = fixed(&[\"a\"]); let vl = VList { _cx: \"x\", bound: None }; follow_bound(&vl); let ts: TableState<u32> = TableState(std::marker::PhantomData); build_row(&ts); let bs: BoundStrip<u32, DummyRender> = BoundStrip(std::marker::PhantomData, DummyRender); bound_strip(&bs); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_mem_replace_on_non_static_mut_ref_param",
+        "fn bad<'a>(rt: &'a mut &'a str, val: &'a str) -> &'static str { core::mem::replace(rt, val) }\nfn main() { let mut s = String::from(\"x\"); let mut r = s.as_str(); let _ = bad(&mut r, \"y\"); drop(s); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_downcast_mut_ref_escaping_without_replace",
+        "fn bad(rt: &mut Box<dyn std::any::Any>) -> &'static mut &'static str { rt.downcast_mut::<&'static str>().expect(\"bad\") }\nfn main() { let mut b: Box<dyn std::any::Any> = Box::new(\"x\"); let _ = bad(&mut b); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_static_closure_capturing_cloned_borrowed_str",
+        "fn spawn(_: impl FnOnce() + 'static) {}\nfn main() { let s = String::from(\"x\"); let r = s.as_str().clone(); spawn(move || println!(\"{r}\")); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_static_closure_capturing_copied_borrowed_handle",
+        "#[derive(Clone, Copy)] struct Handle<'a>(&'a str);\nfn spawn(_: impl FnOnce() + 'static) {}\nfn main() { let s = String::from(\"x\"); let items = vec![Handle(s.as_str())]; for &h in &items { spawn(move || { let _v = h.0; }); } }",
+    );
+    crate::check_fails_borrow(
+        "rejects_borrowed_slice_iter_map_to_static",
+        "fn spawn(_: impl FnOnce() + 'static) {}\nfn bad(ids: &[&str]) { let cols: Vec<_> = ids.iter().map(|&id| id).collect(); spawn(move || { let _c = cols; }); }\nfn main() { let s = String::from(\"a\"); bad(&[s.as_str()]); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_static_closure_capturing_borrowed_option_map_clone",
+        "use std::rc::Rc;\nstruct Bound<'a> { s: Rc<&'a str> }\nfn spawn(_: impl FnOnce() + 'static) {}\nfn bad(b: Option<&Bound<'_>>) { let c = b.map(|bound| Rc::clone(&bound.s)); spawn(move || { let _c = c; }); }\nfn main() { let s = String::from(\"a\"); let b = Bound { s: Rc::new(s.as_str()) }; bad(Some(&b)); }",
+    );
+    crate::check_fails_borrow(
+        "rejects_static_closure_with_non_static_trait_bound",
+        "trait NonStatic { fn as_str(&self) -> &str; }\nstruct Wrap<R>(R);\nfn spawn(_: impl FnOnce() + 'static) {}\nfn bad<R: NonStatic>(spec: &Wrap<R>) { let s = spec.0.as_str(); spawn(move || { let _s = s; }); }\nstruct S<'a>(&'a str);\nimpl NonStatic for S<'_> { fn as_str(&self) -> &str { self.0 } }\nfn main() { let local = String::from(\"a\"); let w = Wrap(S(local.as_str())); bad(&w); }",
     );
 }

@@ -97,7 +97,7 @@ impl Header {
 }
 
 /// The bounds that a header puts on its type parameter `name`: those on the parameter, then those of the where predicates on it.
-pub(super) fn named_bounds(
+pub(in crate::sema) fn named_bounds(
     arena: &Body,
     src: &Source,
     (generics, predicates): (&[Generic], &[Predicate]),

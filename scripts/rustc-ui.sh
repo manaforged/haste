@@ -478,42 +478,31 @@ run_suite() {
     local kind name reason
     for ((i = 0; i < total; i++)); do
         IFS=$'\t' read -r kind name reason <"$suite_tmp/res/$i.res"
+        if [ "$kind" = "SKIP" ]; then
+            s_other=$((s_other + 1))
+            continue
+        fi
+        ran=$((ran + 1))
+        if [ -n "${cand_lines[$i]:-}" ]; then
+            located_ran=$((located_ran + 1))
+        fi
         case "$kind" in
-            SKIP)
-                s_other=$((s_other + 1))
-                ;;
             PASS)
-                ran=$((ran + 1))
                 passed=$((passed + 1))
-                if [ -n "${cand_lines[$i]:-}" ]; then
-                    located_ran=$((located_ran + 1))
-                fi
                 if [ "${reason:-0}" = "1" ]; then
                     line_matched=$((line_matched + 1))
                 fi
                 ;;
             OTHER)
-                ran=$((ran + 1))
                 other_err=$((other_err + 1))
-                if [ -n "${cand_lines[$i]:-}" ]; then
-                    located_ran=$((located_ran + 1))
-                fi
                 printf '%s\t%s\tother-err: %s\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
             FAIL)
-                ran=$((ran + 1))
                 failed=$((failed + 1))
-                if [ -n "${cand_lines[$i]:-}" ]; then
-                    located_ran=$((located_ran + 1))
-                fi
                 printf '%s\t%s\t%s\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
             CRASH)
-                ran=$((ran + 1))
                 crashed=$((crashed + 1))
-                if [ -n "${cand_lines[$i]:-}" ]; then
-                    located_ran=$((located_ran + 1))
-                fi
                 printf '%s\t%s\t%s (crash)\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
         esac

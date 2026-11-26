@@ -19,6 +19,7 @@ impl<'a> Context<'a> {
         self.store.finals.clear();
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
+        self.store.lookups.auto_traits.clear();
         self.store.lookups.projections.clear();
         self.store.lookups.trait_calls.clear();
         self.store.lookups.assoc_types.clear();
@@ -29,6 +30,7 @@ impl<'a> Context<'a> {
         self.scope_traits_local.borrow_mut().clear();
         self.store.lookups.scope_traits.clear();
         self.store.lookups.reveals = table::Flight::default();
+        self.reveals_local.clear();
         self.store.lookups.futures.clear();
         self.store.lookups.forms.clear();
         self.aliases.clear();
@@ -74,6 +76,7 @@ impl<'a> Context<'a> {
             scope_traits_local: std::cell::RefCell::new(HashMap::default()),
             glues_local: HashMap::default(),
             drops_local: HashMap::default(),
+            reveals_local: HashMap::default(),
             ty_facts: HashMap::default(),
         }
     }
@@ -115,6 +118,7 @@ impl<'a> Context<'a> {
             scope_traits_local: std::cell::RefCell::new(HashMap::default()),
             glues_local: HashMap::default(),
             drops_local: HashMap::default(),
+            reveals_local: HashMap::default(),
             ty_facts: HashMap::default(),
         }
     }
@@ -203,5 +207,15 @@ impl<'a> Context<'a> {
     ) {
         self.store.lookups.selections.insert(key, picked);
         self.selections_local.borrow_mut().insert(key, picked);
+    }
+
+    /// The cached ground `Send`/`Sync` auto-trait outcome for `key`.
+    pub(crate) fn auto_trait(&self, key: &(ItemRef, ty::Ty)) -> Option<bool> {
+        self.store.lookups.auto_traits.get(key)
+    }
+
+    /// Caches `holds` as the ground `Send`/`Sync` auto-trait outcome for `key`.
+    pub(crate) fn set_auto_trait(&self, key: (ItemRef, ty::Ty), holds: bool) {
+        self.store.lookups.auto_traits.insert(key, holds);
     }
 }

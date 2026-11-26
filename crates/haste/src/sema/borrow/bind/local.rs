@@ -9,6 +9,45 @@ use super::super::{Checker, State};
 use super::{PatCtx, PatTarget};
 
 impl Checker<'_, '_> {
+    pub(in super::super) fn bind_fn_params(
+        &mut self,
+        sig: &crate::body::sig::Signature,
+        state: &mut State,
+    ) -> Result<()> {
+        let param_offset = usize::from(sig.receiver.is_some());
+        for (idx, &pat) in self.body.fn_params.iter().enumerate() {
+            let fallback = self
+                .typed
+                .params
+                .get(param_offset + idx)
+                .map(|&pl| vec![self.param_fallback_source(pl)]);
+            if let crate::body::Pat::Tuple(plist) = *self.body.pat(pat)
+                && let Some(&(_, param_ty)) = sig.params.get(idx)
+                && let crate::body::Ty::Tuple(tlist) = *sig.body.ty(param_ty)
+                && plist.len == tlist.len
+            {
+                for (&p_id, &t_id) in self.body.list(plist).iter().zip(sig.body.list(tlist)) {
+                    let mut lts = super::super::calls::Lifetimes::default();
+                    super::super::calls::collect_ty_lifetimes(
+                        &sig.body,
+                        self.src,
+                        crate::body::TyId(t_id),
+                        &mut lts,
+                    );
+                    let elem_fb = if !lts.has_elided && lts.named.is_empty() && lts.saw_static {
+                        &[][..]
+                    } else {
+                        fallback.as_deref().unwrap_or(&[])
+                    };
+                    self.bind_pat_param(PatId(p_id), elem_fb, state)?;
+                }
+            } else {
+                self.bind_pat_param(pat, fallback.as_deref().unwrap_or(&[]), state)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_local_init(
         &mut self,
         pat: PatId,
@@ -22,15 +61,31 @@ impl Checker<'_, '_> {
             return Ok(());
         }
         if let Some(&ref_mut) = self.typed.ref_binds.get(&pat) {
-            return self.bind_ref_local(local, ref_mut == Mut::Mut, target, state, ctx.behind_ref);
+            return self.bind_ref_local(local, ref_mut == Mut::Mut, target, state, ctx);
         }
         if ctx.move_on_val && leaf_bind && !self.is_copy[local as usize] {
             self.record_pat_move(local, target, state, ctx.behind_ref, ctx.in_drop_adt)?;
         }
         if !ctx.move_only {
-            self.bind_val_sources(local, target, state, ctx.behind_ref)?;
+            self.bind_val_sources(local, target, state, ctx)?;
         }
         Ok(())
+    }
+
+    fn fallback_sources_with_steps(
+        &self,
+        target: PatTarget<'_>,
+        steps_match_fallback: bool,
+    ) -> Vec<BorrowSource> {
+        let mut sources = target.fallback_sources.to_vec();
+        if steps_match_fallback && !target.pat_steps.is_empty() {
+            for s in &mut sources {
+                for step in target.pat_steps {
+                    push_step(&mut s.steps, step.clone());
+                }
+            }
+        }
+        sources
     }
 
     fn bind_ref_local(
@@ -39,7 +94,7 @@ impl Checker<'_, '_> {
         is_mut: bool,
         target: PatTarget<'_>,
         state: &mut State,
-        behind_ref: bool,
+        ctx: PatCtx,
     ) -> Result<()> {
         let sources = if let Some(place) = target.scrut_place {
             let mut full_place = place.clone();
@@ -74,12 +129,11 @@ impl Checker<'_, '_> {
             });
             let mut sources = match target.init {
                 Some(e) => self.place_borrow_sources(e, is_mut, state, self.let_extend_depth),
-                None => target
-                    .fallback_sources
-                    .iter()
-                    .map(|s| {
-                        let mut s = s.clone();
-                        if !behind_ref && !self.is_ref_ty(self.local_ty(s.target)) {
+                None => self
+                    .fallback_sources_with_steps(target, ctx.steps_match_fallback)
+                    .into_iter()
+                    .map(|mut s| {
+                        if !ctx.behind_ref && !self.is_ref_ty(self.local_ty(s.target)) {
                             s.through_ref = false;
                         }
                         s
@@ -102,7 +156,7 @@ impl Checker<'_, '_> {
         local: u32,
         target: PatTarget<'_>,
         state: &mut State,
-        behind_ref: bool,
+        ctx: PatCtx,
     ) -> Result<()> {
         if let Some(e) = target.init {
             self.check_mut_ref_local_move(local, e, state)?;
@@ -119,46 +173,69 @@ impl Checker<'_, '_> {
             if target.fallback_sources.is_empty() {
                 return Ok(());
             }
-            if behind_ref
+            if ctx.behind_ref
                 && self.is_copy[local as usize]
                 && let Some(place) = target.scrut_place
             {
-                let local_ty = self.local_ty(local);
-                let holds_borrow = self.ty_holds_borrow(local_ty);
-                let mut inner = Vec::new();
-                for s in target.fallback_sources {
-                    let is_deref_container = (s.target == place.local && !place.through_ref)
-                        || (place.through_ref
-                            && (s.target == place.local
-                                || state.loans.iter().any(|l| {
-                                    l.holder == Some(place.local) && l.target == s.target
-                                })));
-                    if !is_deref_container {
-                        inner.push(s.clone());
-                        continue;
-                    }
-                    for l in state.loans.iter().filter(|l| l.holder == Some(s.target)) {
-                        inner.push(BorrowSource::from_loan(l));
-                    }
-                    if holds_borrow {
-                        let target_ty = self.local_ty(s.target);
-                        let is_cparam = self.is_closure_param(s.target);
-                        if (is_cparam || self.is_non_static_param(s.target))
-                            && self.ty_holds_borrow(target_ty)
-                            && !self.can_unwrap_inner_static_param(s, local_ty, false)
-                        {
-                            inner.push(self.promote_param_behind_deref(s, is_cparam));
-                        }
-                    }
-                }
-                if !inner.is_empty() {
-                    self.push_sources_for_local(local, &inner, None, state);
-                }
+                let fallback = self.fallback_sources_with_steps(target, ctx.steps_match_fallback);
+                self.bind_copy_behind_ref_place(local, &fallback, place, state);
             } else {
-                self.push_sources_for_local(local, target.fallback_sources, None, state);
+                let mut sources =
+                    self.fallback_sources_with_steps(target, ctx.steps_match_fallback);
+                if ctx.behind_ref && self.is_copy[local as usize] && !ctx.is_param {
+                    let local_ty = self.local_ty(local);
+                    sources = self.unwrap_outer_container_loans_inner(
+                        sources,
+                        state,
+                        true,
+                        Some((local_ty, true)),
+                    );
+                }
+                self.push_sources_for_local(local, &sources, None, state);
             }
         }
         Ok(())
+    }
+
+    fn bind_copy_behind_ref_place(
+        &mut self,
+        local: u32,
+        fallback_sources: &[BorrowSource],
+        place: &super::super::places::Place,
+        state: &mut State,
+    ) {
+        let local_ty = self.local_ty(local);
+        let holds_borrow = self.ty_holds_borrow(local_ty);
+        let mut inner = Vec::new();
+        for s in fallback_sources {
+            let is_deref_container = (s.target == place.local && !place.through_ref)
+                || (place.through_ref
+                    && (s.target == place.local
+                        || state
+                            .loans
+                            .iter()
+                            .any(|l| l.holder == Some(place.local) && l.target == s.target)));
+            if !is_deref_container {
+                inner.push(s.clone());
+                continue;
+            }
+            for l in state.loans.iter().filter(|l| l.holder == Some(s.target)) {
+                inner.push(BorrowSource::from_loan(l));
+            }
+            if holds_borrow {
+                let target_ty = self.local_ty(s.target);
+                let is_cparam = self.is_closure_param(s.target);
+                if (is_cparam || self.is_non_static_param(s.target))
+                    && self.ty_holds_borrow(target_ty)
+                    && !self.can_unwrap_inner_static_param(s, local_ty, false)
+                {
+                    inner.push(self.promote_param_behind_deref(s, is_cparam));
+                }
+            }
+        }
+        if !inner.is_empty() {
+            self.push_sources_for_local(local, &inner, None, state);
+        }
     }
 
     fn record_pat_move(

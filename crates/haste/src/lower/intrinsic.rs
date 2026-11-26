@@ -65,6 +65,7 @@ impl Lower<'_, '_> {
     ) -> Result<Option<Value>> {
         match which {
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
+            Intrinsic::UbChecks => Ok(Some(self.ins().iconst(Type::I8, 0))),
             Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => self.cpuid(args).map(Some),
             Intrinsic::FnAddr => Ok(args.first().copied()),
@@ -189,10 +190,22 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn caller_loc_slot(&mut self) -> Result<Value> {
+        if let Some(val) = self.cached_caller_loc {
+            return Ok(val);
+        }
         const CALLER_LOC_SLOT: i64 = 0;
         const CALLER_LOC_CELL_BYTES: i64 = 8;
         let slot = self.ins().iconst(Type::I64, CALLER_LOC_SLOT);
-        self.call_thread_cell(slot, CALLER_LOC_CELL_BYTES, None)
+        let val = self.call_thread_cell(slot, CALLER_LOC_CELL_BYTES, None)?;
+        if self.open
+            && self.resume.is_none()
+            && self.inline.stack.is_empty()
+            && self.prologue_block.is_some()
+            && self.b.current_block() == self.prologue_block
+        {
+            self.cached_caller_loc = Some(val);
+        }
+        Ok(val)
     }
 
     pub(super) fn current_site_location(&mut self) -> Result<Value> {
@@ -214,17 +227,8 @@ impl Lower<'_, '_> {
                 }
             }
             loc => {
-                let mut byte = (loc as u32 as usize).min(root.text.len());
-                while byte > 0 && !root.text.is_char_boundary(byte) {
-                    byte -= 1;
-                }
-                let before = &root.text[..byte];
-                let line = before.matches('\n').count() as u32 + 1;
-                let col = before[before.rfind('\n').map_or(0, |n| n + 1)..]
-                    .chars()
-                    .count() as u32
-                    + 1;
-                (line, col)
+                let (line, col) = root.line_col_at(loc as u32 as usize);
+                (line as u32, col as u32)
             }
         };
         let mut file = root.path.display().to_string().into_bytes();
@@ -347,6 +351,24 @@ impl Lower<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn with_cold_tracked_caller_loc<T>(
+        &mut self,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let slot_id = self.ins().iconst(Type::I64, 0);
+        let slot = self.call_thread_cell(slot_id, 8, None)?;
+        let prev = self.ins().load(Type::I64, slot, 0);
+        let has = self.ins().icmp_imm(IntCC::NotEqual, prev, 0);
+        let own = self.current_site_location()?;
+        let cur = self.ins().select(has, prev, own);
+        self.ins().store(cur, slot, 0);
+        let res = run(self)?;
+        if self.open {
+            self.ins().store(prev, slot, 0);
+        }
+        Ok(res)
     }
 
     pub(super) fn with_caller_loc<T>(

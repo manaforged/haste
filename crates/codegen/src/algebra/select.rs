@@ -53,7 +53,55 @@ pub(super) fn simplify_select(
     }
     ord::fold_ord_select_cmp(cx, inner, t, f)
         .or_else(|| factor_select_add(cx, inner, t, f))
+        .or_else(|| factor_select_binary(cx, inner, t, f))
         .or_else(|| (inner != cond || (t, f) != given).then_some(Op::Select(inner, t, f)))
+}
+
+fn factor_select_binary(cx: &mut RewriteCx, cond: Value, t: Value, f: Value) -> Option<Op> {
+    if !cx.single_use(t) || !cx.single_use(f) {
+        return None;
+    }
+    let (&Op::Binary(op_t, tl, tr), &Op::Binary(op_f, fl, fr)) = (cx.op(t)?, cx.op(f)?) else {
+        return None;
+    };
+    if op_t != op_f {
+        return None;
+    }
+    let ty = cx.func.ty(t);
+    let comm = matches!(
+        op_t,
+        Binary::Iadd
+            | Binary::Imul
+            | Binary::Band
+            | Binary::Bor
+            | Binary::Bxor
+            | Binary::Fadd
+            | Binary::Fmul
+    );
+    if !comm && !matches!(op_t, Binary::Isub | Binary::Fsub) {
+        return None;
+    }
+    if cx.func.ty(tl) != ty || cx.func.ty(tr) != ty {
+        return None;
+    }
+    let (common, a, b, lhs_common) = if tl == fl {
+        (tl, tr, fr, true)
+    } else if tr == fr {
+        (tr, tl, fl, false)
+    } else if comm && tl == fr {
+        (tl, tr, fl, true)
+    } else if comm && tr == fl {
+        (tr, tl, fr, true)
+    } else {
+        return None;
+    };
+    let sel_op = factor_select_binary(cx, cond, a, b).unwrap_or(Op::Select(cond, a, b));
+    let sel = cx.emit(ty, sel_op);
+    Some(if lhs_common {
+        Op::Binary(op_t, common, sel)
+    } else {
+        Op::Binary(op_t, sel, common)
+    })
 }
 
 fn match_acc_delta(cx: &RewriteCx, ty: Type, cand: Value, acc: Value) -> Option<(Binary, Value)> {

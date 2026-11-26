@@ -47,6 +47,13 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
             }
         }
         AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
+            let has_static = body.list(list).iter().any(|&b_id| {
+                matches!(body.bounds[b_id as usize], Bound::Lifetime(lt) if src.text(lt) == LT_STATIC)
+            });
+            if has_static {
+                out.saw_static = true;
+                return;
+            }
             for &b_id in body.list(list) {
                 match body.bounds[b_id as usize] {
                     Bound::Lifetime(lt) => push_lt(src.text(lt), out),
@@ -72,17 +79,7 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
             if let Some(r) = ret {
                 collect_ty_lifetimes(body, src, r, &mut fn_lts);
             }
-            out.saw_static |= fn_lts.saw_static;
-            for lt in fn_lts.named {
-                if !out.named.contains(&lt) {
-                    out.named.push(lt);
-                }
-            }
-            for name in fn_lts.names {
-                if !out.names.contains(&name) {
-                    out.names.push(name);
-                }
-            }
+            merge_fn_lifetimes(fn_lts, out);
         }
         AstTy::Slice(t)
         | AstTy::Array(t, _)
@@ -114,14 +111,30 @@ fn collect_segment_args_lifetimes<'s>(
             }
         }
         Some(Args::Paren { inputs, output }) => {
+            let mut fn_lts = Lifetimes::default();
             for &t in body.list(inputs) {
-                collect_ty_lifetimes(body, src, TyId(t), out);
+                collect_ty_lifetimes(body, src, TyId(t), &mut fn_lts);
             }
             if let Some(o) = output {
-                collect_ty_lifetimes(body, src, o, out);
+                collect_ty_lifetimes(body, src, o, &mut fn_lts);
             }
+            merge_fn_lifetimes(fn_lts, out);
         }
         Some(Args::ReturnType) | None => {}
+    }
+}
+
+fn merge_fn_lifetimes<'s>(fn_lts: Lifetimes<'s>, out: &mut Lifetimes<'s>) {
+    out.saw_static |= fn_lts.saw_static;
+    for lt in fn_lts.named {
+        if !out.named.contains(&lt) {
+            out.named.push(lt);
+        }
+    }
+    for name in fn_lts.names {
+        if !out.names.contains(&name) {
+            out.names.push(name);
+        }
     }
 }
 
@@ -262,7 +275,7 @@ pub(in super::super) fn compute_param_lifetimes(
     sig: &crate::body::sig::Signature,
     src: &Source,
     typed: &crate::sema::infer::Typed,
-    n: usize,
+    (n, static_names): (usize, &[String]),
 ) -> ParamLifetimes {
     let mut info = ParamLifetimes {
         is_static: vec![true; n],
@@ -305,7 +318,7 @@ pub(in super::super) fn compute_param_lifetimes(
                     info.inner_has_elided_lt[slot] = !info.inner_is_static[slot] && impl_has_elided;
                 }
                 crate::body::sig::SelfKind::Typed(ty) => {
-                    record_param_ty(sig, src, ty, impl_has_lt, slot, &mut info);
+                    record_param_ty(sig, src, ty, (impl_has_lt, static_names), slot, &mut info);
                 }
                 crate::body::sig::SelfKind::Value => {
                     info.is_static[slot] = !impl_has_lt;
@@ -320,7 +333,14 @@ pub(in super::super) fn compute_param_lifetimes(
         if let Some(&local) = typed.params.get(cursor)
             && (local as usize) < n
         {
-            record_param_ty(sig, src, param_ty, impl_has_lt, local as usize, &mut info);
+            record_param_ty(
+                sig,
+                src,
+                param_ty,
+                (impl_has_lt, static_names),
+                local as usize,
+                &mut info,
+            );
         }
         cursor += 1;
     }
@@ -332,24 +352,26 @@ fn has_elided_or_unbounded_lt(
     src: &Source,
     lts: &Lifetimes<'_>,
     impl_has_lt: bool,
+    static_names: &[String],
 ) -> bool {
     lts.has_elided
         || (impl_has_lt && lts.names.contains(&"Self"))
-        || has_unbounded_type_param(sig, src, lts)
+        || has_unbounded_type_param(sig, src, lts, static_names)
 }
 
 fn record_param_ty(
     sig: &crate::body::sig::Signature,
     src: &Source,
     ty: TyId,
-    impl_has_lt: bool,
+    (impl_has_lt, static_names): (bool, &[String]),
     slot: usize,
     info: &mut ParamLifetimes,
 ) {
     let mut lts = Lifetimes::default();
     collect_ty_lifetimes(&sig.body, src, ty, &mut lts);
-    info.is_static[slot] = param_ty_is_static(sig, src, &lts, impl_has_lt);
-    info.has_elided_lt[slot] = has_elided_or_unbounded_lt(sig, src, &lts, impl_has_lt);
+    info.is_static[slot] = param_ty_is_static(sig, src, &lts, impl_has_lt, static_names);
+    info.has_elided_lt[slot] =
+        has_elided_or_unbounded_lt(sig, src, &lts, impl_has_lt, static_names);
     info.named_lts[slot] = owned_lts(lts.named);
     if let AstTy::Ref {
         lifetime,
@@ -367,23 +389,9 @@ fn record_param_ty(
         let mut inner_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
         info.inner_has_elided_lt[slot] =
-            has_elided_or_unbounded_lt(sig, src, &inner_lts, impl_has_lt);
+            has_elided_or_unbounded_lt(sig, src, &inner_lts, impl_has_lt, static_names);
         info.inner_named_lts[slot] = owned_lts(inner_lts.named);
     }
-}
-
-fn has_lifetime_bound(
-    sig: &crate::body::sig::Signature,
-    src: &Source,
-    bounds: crate::body::List,
-    target: &str,
-) -> bool {
-    sig.body.list(bounds).iter().any(|&b| {
-        matches!(
-            sig.body.bounds[b as usize],
-            Bound::Lifetime(lt) if src.text(lt) == target
-        )
-    })
 }
 
 fn lifetime_is_static(sig: &crate::body::sig::Signature, src: &Source, name: &str) -> bool {
@@ -465,22 +473,13 @@ fn has_unbounded_type_param(
     sig: &crate::body::sig::Signature,
     src: &Source,
     lts: &Lifetimes<'_>,
+    static_names: &[String],
 ) -> bool {
-    let bounded_static = |name: &str| {
-        sig.generics.iter().any(|g| {
-            g.kind == crate::body::sig::GenericKind::Type
-                && src.text(g.name) == name
-                && has_lifetime_bound(sig, src, g.bounds, "'static")
-        }) || sig.predicates.iter().any(|p| {
-            pred_matches_name(sig, src, p, name)
-                && has_lifetime_bound(sig, src, p.bounds, "'static")
-        })
-    };
     lts.names.iter().any(|&name| {
         sig.generics
             .iter()
             .any(|g| g.kind == crate::body::sig::GenericKind::Type && src.text(g.name) == name)
-            && !bounded_static(name)
+            && !static_names.iter().any(|s| s == name)
     })
 }
 
@@ -489,6 +488,7 @@ fn param_ty_is_static(
     src: &Source,
     lts: &Lifetimes<'_>,
     impl_has_lt: bool,
+    static_names: &[String],
 ) -> bool {
     if lts.has_elided || (impl_has_lt && lts.names.contains(&"Self")) {
         return false;
@@ -500,7 +500,7 @@ fn param_ty_is_static(
     {
         return false;
     }
-    !has_unbounded_type_param(sig, src, lts)
+    !has_unbounded_type_param(sig, src, lts, static_names)
 }
 
 fn ast_ty_is_provably_static(sig: &crate::body::sig::Signature, src: &Source, ty: TyId) -> bool {
@@ -642,7 +642,12 @@ pub(in super::super) fn sig_return_named_lifetimes<'s>(
     lts.named.clone()
 }
 
-fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, type_params: &[&str]) -> bool {
+pub(in super::super) fn ast_ty_has_type_param(
+    body: &Body,
+    src: &Source,
+    ty_id: TyId,
+    type_params: &[&str],
+) -> bool {
     match *body.ty(ty_id) {
         AstTy::Ref { ty, .. }
         | AstTy::Ptr { ty, .. }

@@ -201,6 +201,7 @@ pub(super) struct Lookups {
         (ItemRef, ty::Ty, super::substs::Substs),
         Option<(impls::ImplRef, super::substs::Substs)>,
     >,
+    pub(super) auto_traits: Table<(ItemRef, ty::Ty), bool>,
     pub(super) projections: Table<
         (
             ItemRef,
@@ -261,6 +262,7 @@ impl Lookups {
         self.type_defs.clear();
         self.trait_calls.clear();
         self.assoc_types.clear();
+        self.auto_traits.clear();
     }
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
@@ -346,6 +348,7 @@ impl Lookups {
         self.trait_calls.clear();
         self.assoc_types.clear();
         self.type_defs.clear();
+        self.auto_traits.clear();
         *guard = loaded;
     }
 }
@@ -388,6 +391,16 @@ impl Cache {
     /// Controls whether warm `.substrate` sysroot lookups eagerly parse bodies for macro expansion.
     pub fn set_warm_sysroot_bodies(&mut self, warm: bool) {
         self.lookups.skip_warm_sysroot_bodies = !warm;
+    }
+
+    /// Whether warm `.substrate` sysroot lookups eagerly parse bodies for lowering.
+    pub fn warm_sysroot_bodies(&self) -> bool {
+        !self.lookups.skip_warm_sysroot_bodies
+    }
+
+    /// Drops cached final function outcomes while keeping resolved types, lookups, and summaries.
+    pub fn clear_finals(&mut self) {
+        self.finals.clear();
     }
 
     /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
@@ -581,6 +594,7 @@ impl Lookups {
             .retain(|key, _| !edited.touches_crate(key.0.0.krate));
         self.trait_defs.retain(|item, _| !mine(*item));
         self.selections.clear();
+        self.auto_traits.clear();
         self.projections.clear();
         *write_lock(&self.state.global_allocator) = None;
         self.trait_calls.clear();

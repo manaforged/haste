@@ -73,11 +73,11 @@ impl<'a> Infer<'_, 'a> {
         )
     }
 
-    pub(in super::super) fn cache_check(&self, state: CacheState) -> (bool, bool) {
+    pub(in super::super) fn cache_check(&self, state: CacheState, min_var: usize) -> (bool, bool) {
         let base_ok = self.cx.quiet_mark() == state.quiet
             && self.projections.len() == state.projections
             && self.cycle_hits == state.cycle_hits
-            && self.pre_var_epoch == state.pre_var_epoch
+            && min_var >= state.vars_len
             && self.capture_epoch == state.capture_epoch;
         (
             base_ok && self.obligations.len() == state.obligations,
@@ -117,8 +117,9 @@ impl<'a> Infer<'_, 'a> {
         local_key: Option<(LocalSelectionKey, usize)>,
         picked: Option<&Picked>,
         state: CacheState,
+        min_var: usize,
     ) {
-        let (global_ok, local_ok) = self.cache_check(state);
+        let (global_ok, local_ok) = self.cache_check(state, min_var);
         if global_ok && let Some(k) = key {
             let kept = match picked {
                 None => Some(None),
@@ -238,9 +239,6 @@ impl<'a> Infer<'_, 'a> {
         if self.cx.types.is_ground(ty) {
             return true;
         }
-        if self.cx.types.has_closure(ty) {
-            return false;
-        }
         let ty = self.resolve(ty);
         if self.cx.types.is_ground(ty) {
             return true;
@@ -249,11 +247,21 @@ impl<'a> Infer<'_, 'a> {
             return false;
         }
         let kind = self.cx.types.kind(ty);
-        if matches!(
-            kind,
-            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)
-        ) {
+        if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
             return false;
+        }
+        if let Kind::Closure(parent, args, _) = *kind {
+            return self.instance != Some((parent, args))
+                && self
+                    .cx
+                    .closure(ty)
+                    .is_some_and(|c| !c.typed.exprs.is_empty())
+                && self
+                    .cx
+                    .types
+                    .substs(args)
+                    .iter()
+                    .all(|&item| self.closed_at(item, depth + 1));
         }
         kind.children(&self.cx.types)
             .all(|item| self.closed_at(item, depth + 1))
