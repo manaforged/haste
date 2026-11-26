@@ -461,32 +461,28 @@ fn read_file(
     remap: &[u32],
 ) -> Result<File> {
     let path = read_path(cur)?;
-    let (text, tokens) = match cur.u8()? {
+    let text = match cur.u8()? {
         1 => {
             let text_len = cur.u32()? as usize;
-            let tok_count = cur.u32()? as usize;
-            let disk = Arc::new(DiskSource::new(path.clone(), text_len, tok_count));
-            (
-                SourceText::disk(Arc::clone(&disk)),
-                SourceTokens::disk(disk),
-            )
+            let tail = read_str(cur)?.to_owned().into_boxed_str();
+            let disk = Arc::new(DiskSource::new(path.clone(), text_len, tail));
+            SourceText::disk(disk)
         }
         0 => {
             let text_len = cur.count()?;
             let text_start = file_off + cur.pos;
             cur.take(text_len)?;
             let text_end = file_off + cur.pos;
-            let text = SourceText::mapped_trusted(Arc::clone(backing), text_start, text_end)?;
-            let tok_count = cur.u32()? as usize;
-            let tok_bytes = cur.count()?;
-            let tok_start = file_off + cur.pos;
-            cur.take(tok_bytes)?;
-            let tok_end = file_off + cur.pos;
-            let tokens = SourceTokens::compact(Arc::clone(backing), tok_start, tok_end, tok_count)?;
-            (text, tokens)
+            SourceText::mapped_trusted(Arc::clone(backing), text_start, text_end)?
         }
         _ => bail!("invalid sysroot file storage tag"),
     };
+    let tok_count = cur.u32()? as usize;
+    let tok_bytes = cur.count()?;
+    let tok_start = file_off + cur.pos;
+    cur.take(tok_bytes)?;
+    let tok_end = file_off + cur.pos;
+    let tokens = SourceTokens::compact(Arc::clone(backing), tok_start, tok_end, tok_count)?;
     let marks = read_marks(cur, remap)?;
     let opaque_len = cur.count()?;
     let opaque_bytes = cur.take(opaque_len.checked_mul(9).context("opaque overflow")?)?;

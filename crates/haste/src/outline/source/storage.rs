@@ -11,33 +11,33 @@ use crate::substrate::Backing;
 use crate::substrate::sysroot::tokens::decode_compact_tokens;
 
 use super::Token;
-use super::lex::{lex, pair_up};
 
-/// Lazily reads and lexes an unmodified on-disk source file once, sharing both text and tokens.
+/// Lazily reads an unmodified on-disk source file's text (plus optional lexed doc-comment tail) without re-lexing.
 pub(crate) struct DiskSource {
     path: PathBuf,
     text_len: usize,
-    tok_count: usize,
-    loaded: OnceLock<(Box<str>, Vec<Token>)>,
+    tail: Box<str>,
+    loaded: OnceLock<Box<str>>,
 }
 
 impl DiskSource {
-    pub(crate) fn new(path: PathBuf, text_len: usize, tok_count: usize) -> Self {
+    pub(crate) fn new(path: PathBuf, text_len: usize, tail: Box<str>) -> Self {
         Self {
             path,
             text_len,
-            tok_count,
+            tail,
             loaded: OnceLock::new(),
         }
     }
 
-    fn load(&self) -> &(Box<str>, Vec<Token>) {
+    fn load(&self) -> &str {
         self.loaded.get_or_init(|| {
             let mut text =
                 std::fs::read_to_string(&self.path).expect("readable cached sysroot file");
-            let mut tokens = lex(&mut text);
-            pair_up(&mut tokens, &self.path).expect("balanced cached sysroot file");
-            (text.into_boxed_str(), tokens)
+            if !self.tail.is_empty() {
+                text.push_str(&self.tail);
+            }
+            text.into_boxed_str()
         })
     }
 }
@@ -94,7 +94,7 @@ impl SourceText {
                 // SAFETY: `ptr..ptr + len` is a valid immutable UTF-8 slice kept alive by `_backing`.
                 unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(*ptr, *len)) }
             }
-            TextRepr::Disk(disk) => &disk.load().0,
+            TextRepr::Disk(disk) => disk.load(),
         }
     }
 
@@ -202,7 +202,6 @@ enum TokensRepr {
         count: usize,
         decoded: OnceLock<Vec<Token>>,
     },
-    Disk(Arc<DiskSource>),
 }
 
 // SAFETY: `TokensRepr::Compact::ptr` points into immutable read-only bytes kept alive by `_backing`.
@@ -210,7 +209,7 @@ unsafe impl Send for TokensRepr {}
 // SAFETY: `TokensRepr` exposes only immutable reads and synchronized `OnceLock` initialization.
 unsafe impl Sync for TokensRepr {}
 
-/// Source token stream stored eagerly, decoded lazily from compact cache bytes, or lexed on demand from disk.
+/// Source token stream stored eagerly or decoded lazily from compact cache bytes.
 pub struct SourceTokens(TokensRepr);
 
 impl SourceTokens {
@@ -235,18 +234,12 @@ impl SourceTokens {
         }))
     }
 
-    /// Creates a lazy token stream backed by an unmodified on-disk source file.
-    pub(crate) fn disk(source: Arc<DiskSource>) -> Self {
-        Self(TokensRepr::Disk(source))
-    }
-
-    /// Returns the number of tokens without forcing lazy decoding or disk reads.
+    /// Returns the number of tokens without forcing lazy decoding.
     #[inline]
     pub fn len(&self) -> usize {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.len(),
             TokensRepr::Compact { count, .. } => *count,
-            TokensRepr::Disk(disk) => disk.tok_count,
         }
     }
 
@@ -255,7 +248,7 @@ impl SourceTokens {
     pub fn at(&self, index: usize) -> Option<Token> {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.get(index).copied(),
-            TokensRepr::Compact { .. } | TokensRepr::Disk(_) => self.as_slice().get(index).copied(),
+            TokensRepr::Compact { .. } => self.as_slice().get(index).copied(),
         }
     }
 
@@ -265,7 +258,7 @@ impl SourceTokens {
         self.at(index).map(|t| (t.start, t.raw().0))
     }
 
-    /// Returns the decoded token slice, decoding or reading on first access if backed lazily.
+    /// Returns the decoded token slice, decoding on first access if backed lazily.
     #[inline]
     pub fn as_slice(&self) -> &[Token] {
         match &self.0 {
@@ -281,7 +274,6 @@ impl SourceTokens {
                 let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
                 decode_compact_tokens(bytes, *count).expect("valid sysroot compact token stream")
             }),
-            TokensRepr::Disk(disk) => &disk.load().1,
         }
     }
 }
@@ -324,15 +316,6 @@ impl fmt::Debug for SourceTokens {
                 } else {
                     f.debug_struct("CompactTokens")
                         .field("count", count)
-                        .finish()
-                }
-            }
-            TokensRepr::Disk(disk) => {
-                if let Some((_, tokens)) = disk.loaded.get() {
-                    fmt::Debug::fmt(tokens, f)
-                } else {
-                    f.debug_struct("DiskTokens")
-                        .field("count", &disk.tok_count)
                         .finish()
                 }
             }

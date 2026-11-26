@@ -20,7 +20,7 @@ diff-harness = []
 anyhow = "1"
 haste-codegen = { path = "../codegen" }
 libc = "0.2"
-miniz_oxide = "0.9"
+lz4_flex = "0.13"
 rustc-hash = "2"
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
