@@ -117,14 +117,18 @@ impl Infer<'_, '_> {
                     if def.variants.is_empty() {
                         return !self.is_foreign_non_exhaustive(item);
                     }
+                    if self.is_foreign_non_exhaustive(item)
+                        || def.variants.iter().any(|v| v.fields.is_empty())
+                    {
+                        return false;
+                    }
                     let slice = self.cx.types.substs(args).to_vec();
                     let Ok(fields) = self.adt_fields(item, &slice) else {
                         return false;
                     };
-                    !self.is_foreign_non_exhaustive(item)
-                        && fields
-                            .iter()
-                            .all(|vf| vf.iter().any(|&f| self.is_uninhabited(f, depth + 1)))
+                    fields
+                        .iter()
+                        .all(|vf| vf.iter().any(|&f| self.is_uninhabited(f, depth + 1)))
                 } else if kind == ItemKind::Struct {
                     let slice = self.cx.types.substs(args).to_vec();
                     let Ok(fields) = self.adt_fields(item, &slice) else {
