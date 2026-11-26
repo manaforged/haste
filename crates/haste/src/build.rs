@@ -356,12 +356,15 @@ impl Build {
             bail!("{failed} functions failed to compile");
         }
         bin.write_aot(&self.compilation, path)?;
-        eprintln!(
-            "built {} ({} functions reached, {:.1} ms)",
-            path.display(),
-            bin.reached.list.len(),
-            started.elapsed().as_secs_f64() * 1e3
-        );
+        let sel = crate::selection();
+        if !sel.quiet && sel.message_format != crate::MessageFormat::Json {
+            eprintln!(
+                "built {} ({} functions reached, {:.1} ms)",
+                path.display(),
+                bin.reached.list.len(),
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(0)
     }
 

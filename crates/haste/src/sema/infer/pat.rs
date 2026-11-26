@@ -392,6 +392,7 @@ impl Infer<'_, '_> {
         self.unify(ty, adt)?;
         let slice = self.cx.types.substs(args).to_vec();
         let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
+        let is_union = self.cx.item(item).1.kind == ItemKind::Union;
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         for &at in body.list(list) {
             let field = body.field_pats[at as usize];
@@ -401,6 +402,14 @@ impl Infer<'_, '_> {
                 return Err(self.diag_unknown_field(field.name, item, name));
             };
             self.check_field_visible(item, index, None, Some(field.name), name)?;
+            if is_union && !self.cx.outline.is_sysroot(self.home.krate) && !self.in_unsafe_ctx() {
+                return Err(self.diag_tok(
+                    DiagnosticKind::Unsafe,
+                    field.name,
+                    "access to union field is unsafe and requires unsafe function or block",
+                    "access to union field",
+                ));
+            }
             self.out.field_pats.insert(field.pat, index);
             self.pat(field.pat, fields[index as usize], mode)?;
         }

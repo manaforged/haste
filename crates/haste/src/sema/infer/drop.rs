@@ -59,6 +59,43 @@ impl Infer<'_, '_> {
         self.is_copy_seen(ty, &mut CopySeen::default())
     }
 
+    pub(super) fn copy_impl_holds(&mut self, block: crate::sema::impls::ImplRef) -> Result<bool> {
+        let Some(copy) = self.cx.lang_item("copy") else {
+            return Ok(true);
+        };
+        if self.cx.impl_trait(block) != Some(copy) {
+            return Ok(true);
+        }
+        let Some(self_ty) = self.self_ty.map(|ty| self.resolve(ty)) else {
+            return Ok(true);
+        };
+        let Kind::Adt(item, args) = *self.cx.types.kind(self_ty) else {
+            return Ok(true);
+        };
+        if self.cx.outline.is_sysroot(item.krate) {
+            return Ok(true);
+        }
+        if !self.has_vars(self_ty) && self.drop_impl(self_ty)?.is_some() {
+            return Ok(false);
+        }
+        let slice = self.cx.types.substs(args).to_vec();
+        let Ok(fields) = self.adt_fields(item, &slice) else {
+            return Ok(true);
+        };
+        for field in fields.iter().flatten().copied() {
+            let field = self.resolve(field);
+            if self.has_vars(field) {
+                if !self.has_params(field) {
+                    self.note_obligation_site(copy, field);
+                    self.obligations.push((copy, vec![field]));
+                }
+            } else if (!self.has_params(field) || self.poly.is_some()) && !self.is_copy(field)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn is_copy_seen(&mut self, ty: Ty, seen: &mut CopySeen) -> Result<bool> {
         let ty = self.resolve(ty);
         if let Some(&entry) = seen.get(&ty) {
@@ -82,25 +119,20 @@ impl Infer<'_, '_> {
             }
             Kind::Array(inner, _) => self.is_copy_seen(inner, seen)?,
             Kind::Closure(..) => self.closure_is_copy_seen(ty, seen)?,
-            Kind::Adt(item, args) => {
+            Kind::Adt(item, _) => {
                 let Some(copy) = self.cx.lang_item("copy") else {
                     bail!("core has no `Copy` trait")
                 };
                 if self.select(copy, ty, &[])?.is_none() {
                     false
                 } else if !self.cx.outline.is_sysroot(item.krate)
-                    && !self.cx.types.has_params(ty)
-                    && !self.cx.types.has_var_flag(ty)
+                    && !self.has_params(ty)
+                    && !self.has_vars(ty)
                 {
-                    let has_drop = self
-                        .cx
-                        .lang_item("drop")
-                        .and_then(|d| self.select(d, ty, &[]).ok())
-                        .flatten()
-                        .is_some();
-                    if has_drop {
+                    let concrete = self.substitute(ty);
+                    if self.drop_impl(concrete)?.is_some() {
                         false
-                    } else {
+                    } else if let Kind::Adt(item, args) = self.cx.types.kind(concrete).clone() {
                         let args_vec = self.cx.types.substs(args).to_vec();
                         if let Ok(fields) = self.adt_fields(item, &args_vec) {
                             let tys: Vec<Ty> = fields.iter().flatten().copied().collect();
@@ -108,6 +140,8 @@ impl Infer<'_, '_> {
                         } else {
                             true
                         }
+                    } else {
+                        true
                     }
                 } else {
                     true
@@ -451,6 +485,195 @@ impl Infer<'_, '_> {
             bail!("a coroutine with no captures tuple");
         };
         Ok(self.cx.types.substs(captures).to_vec())
+    }
+}
+
+pub(super) enum CoroutineSource<'a> {
+    Infer(&'a super::zonk::InferOut),
+    Typed(&'a super::BodyTables, &'a [Local]),
+}
+
+impl CoroutineSource<'_> {
+    fn bind(&self, pat: crate::body::PatId) -> Option<u32> {
+        match self {
+            Self::Infer(out) => out.binds.get(&pat).copied(),
+            Self::Typed(tables, _) => tables.syntax.binds.get(&pat).copied(),
+        }
+    }
+
+    fn local_ty(&self, local: u32) -> Option<Ty> {
+        let locals = match self {
+            Self::Infer(out) => &out.locals[..],
+            Self::Typed(_, locals) => locals,
+        };
+        locals.get(local as usize).map(|l| l.ty)
+    }
+
+    fn await_ty(&self, id: crate::body::ExprId) -> Option<Ty> {
+        match self {
+            Self::Infer(out) => out.awaits.get(&id).map(|a| a.future),
+            Self::Typed(tables, _) => tables.awaits.get(&id).map(|a| a.future),
+        }
+    }
+
+    fn for_ty(&self, id: crate::body::ExprId) -> Option<Ty> {
+        match self {
+            Self::Infer(out) => out.fors.get(&id).map(|f| f.iter),
+            Self::Typed(tables, _) => tables.fors.get(&id).map(|f| f.iter),
+        }
+    }
+}
+
+pub(super) fn coroutine_body_tys(
+    body: &crate::body::Body,
+    src: CoroutineSource<'_>,
+    root: crate::body::ExprId,
+) -> Vec<Ty> {
+    let (mut tys, mut exprs) = (Vec::new(), vec![root]);
+    while let Some(id) = exprs.pop() {
+        visit_coroutine_expr((body, &src, root), id, &mut tys, &mut exprs);
+    }
+    tys
+}
+
+fn visit_coroutine_expr(
+    (body, src, root): (
+        &crate::body::Body,
+        &CoroutineSource<'_>,
+        crate::body::ExprId,
+    ),
+    id: crate::body::ExprId,
+    tys: &mut Vec<Ty>,
+    exprs: &mut Vec<crate::body::ExprId>,
+) {
+    use crate::body::{BlockKind, Expr, ExprId, Stmt};
+    match *body.expr(id) {
+        Expr::Closure { body: inner, .. } if id == root => exprs.push(inner),
+        Expr::Closure { .. } => {}
+        Expr::Block { kind, .. }
+            if id != root && matches!(kind, BlockKind::Async | BlockKind::AsyncMove) => {}
+        Expr::Block { stmts, tail, .. } => {
+            for &s in body.list(stmts) {
+                match body.stmts[s as usize] {
+                    Stmt::Let {
+                        pat,
+                        init,
+                        otherwise,
+                        ..
+                    } => {
+                        push_pat_bind_tys(body, src, pat, tys);
+                        exprs.extend(init);
+                        exprs.extend(otherwise);
+                    }
+                    Stmt::Expr(e, _) => exprs.push(e),
+                    Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
+                }
+            }
+            exprs.extend(tail);
+        }
+        Expr::Await(e) => {
+            tys.extend(src.await_ty(id));
+            exprs.push(e);
+        }
+        Expr::For {
+            pat,
+            iter,
+            body: blk,
+            ..
+        } => {
+            tys.extend(src.for_ty(id));
+            push_pat_bind_tys(body, src, pat, tys);
+            exprs.extend([iter, blk]);
+        }
+        Expr::Let(pat, init) => {
+            push_pat_bind_tys(body, src, pat, tys);
+            exprs.push(init);
+        }
+        Expr::Match(scrut, arms) => {
+            exprs.push(scrut);
+            for &arm_id in body.list(arms) {
+                let arm = body.arms[arm_id as usize];
+                push_pat_bind_tys(body, src, arm.pat, tys);
+                exprs.extend(arm.guard);
+                exprs.push(arm.body);
+            }
+        }
+        Expr::Paren(a)
+        | Expr::Unary(_, a)
+        | Expr::Cast(a, _)
+        | Expr::Field(a, _)
+        | Expr::TupleField(a, _)
+        | Expr::Try(a)
+        | Expr::Become(a)
+        | Expr::Ref { expr: a, .. }
+        | Expr::Loop { body: a, .. } => exprs.push(a),
+        Expr::Yield(opt) | Expr::Return(opt) | Expr::Break(_, opt) => exprs.extend(opt),
+        Expr::Binary(_, a, b)
+        | Expr::Assign(a, b)
+        | Expr::AssignOp(_, a, b)
+        | Expr::Index(a, b)
+        | Expr::Repeat(a, b)
+        | Expr::While {
+            cond: a, body: b, ..
+        } => exprs.extend([a, b]),
+        Expr::Range { from, to, .. } => exprs.extend(from.into_iter().chain(to)),
+        Expr::If(c, t, o) => exprs.extend([Some(c), Some(t), o].into_iter().flatten()),
+        Expr::Call(callee, list)
+        | Expr::Method {
+            receiver: callee,
+            params: list,
+            ..
+        } => {
+            exprs.push(callee);
+            exprs.extend(body.list(list).iter().copied().map(ExprId));
+        }
+        Expr::Tuple(list) | Expr::Array(list) => {
+            exprs.extend(body.list(list).iter().copied().map(ExprId));
+        }
+        Expr::Struct { fields, base, .. } => {
+            exprs.extend(
+                body.list(fields)
+                    .iter()
+                    .map(|&f| body.fields[f as usize].value),
+            );
+            exprs.extend(base);
+        }
+        _ => {}
+    }
+}
+
+fn push_pat_bind_tys(
+    body: &crate::body::Body,
+    src: &CoroutineSource<'_>,
+    root: crate::body::PatId,
+    tys: &mut Vec<Ty>,
+) {
+    use crate::body::{Pat, PatId};
+    let mut stack = vec![root];
+    while let Some(pat) = stack.pop() {
+        if let Some(local) = src.bind(pat)
+            && let Some(ty) = src.local_ty(local)
+        {
+            tys.push(ty);
+        }
+        match *body.pat(pat) {
+            Pat::Bind { sub: Some(sub), .. }
+            | Pat::Ref { pat: sub, .. }
+            | Pat::Box(sub)
+            | Pat::Paren(sub)
+            | Pat::Deref(sub) => stack.push(sub),
+            Pat::Tuple(l) | Pat::Slice(l) | Pat::Or(l) | Pat::TupleStruct(_, l) => {
+                stack.extend(body.list(l).iter().copied().map(PatId));
+            }
+            Pat::Struct { fields, .. } => {
+                stack.extend(
+                    body.list(fields)
+                        .iter()
+                        .map(|&f| body.field_pats[f as usize].pat),
+                );
+            }
+            _ => {}
+        }
     }
 }
 

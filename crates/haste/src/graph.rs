@@ -161,7 +161,16 @@ pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
                 root.display()
             )
         })?;
-    run_cargo(manifest_dir, &["generate-lockfile"])?;
+    let sel = crate::selection();
+    if sel.locked {
+        bail!("{LOCK_FILE} is missing and --locked was passed");
+    }
+    let args: &[&str] = if sel.offline {
+        &["generate-lockfile", "--offline"]
+    } else {
+        &["generate-lockfile"]
+    };
+    run_cargo(manifest_dir, args)?;
     root.ancestors()
         .find(|dir| dir.join(LOCK_FILE).is_file())
         .map(Path::to_owned)
@@ -455,6 +464,14 @@ fn load_graph_packages(
     Ok((paths, packages, missing))
 }
 
+fn resync_lockfile(top: &Path, offline: bool) -> Result<Vec<Locked>> {
+    if crate::selection().locked {
+        bail!("{LOCK_FILE} needs to be updated but --locked was passed");
+    }
+    sync_lockfile(top, offline)?;
+    lock::read(&top.join(LOCK_FILE))
+}
+
 fn load_synced_packages(
     (root, top, workspace): (&Path, &Path, Option<&toml::Table>),
     (root_names, omit_root_deps, allow_fetch): (&[String], &[&str], bool),
@@ -473,8 +490,7 @@ fn load_synced_packages(
         );
     }
     if missing_root_in_lock(root_names, &raw_locked) {
-        sync_lockfile(top, catalog.offline)?;
-        raw_locked = lock::read(&top.join(LOCK_FILE))?;
+        raw_locked = resync_lockfile(top, catalog.offline)?;
     }
     let (paths, packages, missing) = load_graph_packages(
         (root, top, workspace),
@@ -489,8 +505,7 @@ fn load_synced_packages(
     if !lockfile_dirty(top, &raw_locked, &packages, &missing, &member_set)? {
         return Ok((paths, packages, missing));
     }
-    sync_lockfile(top, catalog.offline)?;
-    raw_locked = lock::read(&top.join(LOCK_FILE))?;
+    raw_locked = resync_lockfile(top, catalog.offline)?;
     load_graph_packages(
         (root, top, workspace),
         (raw_locked, root_names, omit_root_deps),

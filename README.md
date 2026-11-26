@@ -68,15 +68,15 @@ Emit a Linux x86-64 ELF binary from macOS (or macOS/Windows executables from Lin
 haste --release build --target x86_64-unknown-linux-gnu -o ./haste-demo-linux haste-demo
 ```
 
-Pure-Rust executables are zero-linker and standalone. Linux ELF binaries are non-PIE and target glibc, Windows PE32+ binaries are non-PIE and import CRT shims from `ucrtbase.dll` and `msvcrt.dll`, and Linux→macOS ARM64 cross-builds are unsigned until codesigned on macOS (`codesign --force --sign -`). Crates linking native static C archives (`lib*.a`) work on native Unix via a host-local shared helper under `$HASTE_HOME/native/`, not across `--target` triples.
+Pure-Rust executables are zero-linker and standalone. Linux ELF binaries are non-PIE and target glibc, Windows PE32+ binaries are non-PIE and import CRT shims from `ucrtbase.dll` and `msvcrt.dll`, and Linux→macOS cross-builds (both ARM64 and x86-64) are unsigned until `codesign`ed on macOS (`codesign --force --sign -`). Crates linking native static C archives (`lib*.a`) work on native Unix via a host-local shared helper under `$HASTE_HOME/native/`, not across `--target` triples.
 
 ## Benchmarks
 
-Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on your machine (pass `--long` for 4x compute iterations).
+Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on your machine (pass `--long` for 4x compute iterations). By default, `scripts/bench.sh` runs with `HASTE_BENCH_COLD=1`, which isolates `HASTE_HOME` per suite, warms the stdlib index once on `examples/hello`, and prints `Cold debug` rows instead of `Warm cache` (set `HASTE_BENCH_COLD=0` to reuse your existing `$HASTE_HOME`).
 
-### Build speed (`tests/diff`, warm toolchain cache)
+### Build speed (`tests/diff`, measured with warm toolchain cache)
 
-Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check`; one-shot `haste build` pays process startup (`0.6x–0.9x` on small edits), while unchanged no-ops exit in `0.7–2.3 ms` (`5.3x–11.0x`).
+Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check`; one-shot `haste build` pays process startup (`0.6x–0.9x` on small edits), while unchanged no-ops exit in `0.7–2.3 ms` (`5.3x–11.0x`). The table below was recorded with `HASTE_BENCH_COLD=0` (`Warm cache`); default `HASTE_BENCH_COLD=1` emits `Cold debug` rows for cold per-crate builds.
 
 | Benchmark | Platform | haste | cargo | Speedup |
 | --- | --- | ---: | ---: | ---: |
@@ -104,7 +104,7 @@ On a larger real workspace (`340` crates, `45` build scripts, `17,521` functions
 
 ### AOT codegen runtime (`haste --release` vs `rustc`, baseline-subtracted median of 5, warmed)
 
-Compute benchmarks subtract each compiler's warmed empty-main startup baseline (median of 7) and verify bit-identical outputs across `haste --release`, stock `rustc -C opt-level=3`, and matched-flag `rustc -C opt-level=3 -C target-cpu=native -C panic=abort`. In `--release` AOT builds (`haste --release build -o`), bounds, divide-by-zero, and signed `MIN / -1` division-overflow checks lower to hardware traps unless `catch_unwind` or `std::thread::{spawn, spawn_unchecked, spawn_scoped, scope}` is reached (while `haste --release test` and JIT always keep unwinding enabled, and integer `+`/`-`/`*` wrap in `--release`).
+The compute tables below show baseline-subtracted `net` times (`scripts/bench.sh` prints both `net` and `raw` times as `<net> (raw <raw>)`), subtracting each compiler's warmed empty-main startup baseline (median of 7) and verifying bit-identical outputs across `haste --release`, stock `rustc -C opt-level=3`, and matched-flag `rustc -C opt-level=3 -C target-cpu=native -C panic=abort`. In `--release` AOT builds (`haste --release build -o`), bounds, divide-by-zero, and signed `MIN / -1` division-overflow checks lower to hardware traps unless `catch_unwind` or `std::thread::{spawn, spawn_unchecked, spawn_scoped, scope}` is reached (while `haste --release test` and JIT always keep unwinding enabled, and integer `+`/`-`/`*` wrap in `--release`).
 
 #### Linux x86-64 (`rustc 1.99.1`, empty-main baseline: 0.2 ms across all three)
 
@@ -129,21 +129,21 @@ Compute benchmarks subtract each compiler's warmed empty-main startup baseline (
 ### Upstream `rust-lang/rust` UI suite (`scripts/rustc-ui.sh`, macOS ARM64)
 
 - `scripts/rustc-ui.sh --borrowck`: **292 / 344 (84.9%)** of the filtered `Ran` subset emit `error[borrow]:` (**276 / 344**, `80.2%`, match a `src/{main,lib}.rs` span line against an expected `//~ ERROR` annotation, checking first match).
-- `scripts/rustc-ui.sh --all` (pass suite, JIT mode): **3,820 / 4,168 (91.7%)** of the filtered `Ran` subset pass after skipping files with `#![feature(`, `aux-build`, `compile-flags`, `revisions`, `only-`/`ignore-`, `edition:2015`, external `extern crate`, or failures under `rustc --edition=2021`. This count includes `//@ check-pass` and `//@ build-pass` build checks alongside `//@ run-pass` tests, and was run in JIT mode (`--aot` is not enabled by default).
+- `scripts/rustc-ui.sh --all` (pass suite, JIT mode): **3,820 / 4,168 (91.7%)** of the filtered `Ran` subset pass after skipping files with `#![feature(`, `aux-build`, `compile-flags`, `revisions`, `only-`/`ignore-`, `edition:2015`, external `extern crate`, `//@ check-pass`/`//@ build-pass` files without `fn main(` (unless marked `//@ run-pass`), or failures under `rustc --edition=2021`. This count includes `//@ check-pass` and `//@ build-pass` build checks containing `fn main(` alongside `//@ run-pass` tests, and was run in JIT mode (`--aot` is not enabled by default).
 
 ## Crate compatibility
 
-`scripts/probes.sh` cross-checks real crates against `rustc` in both JIT and `--release` AOT modes:
+`scripts/probes.sh` cross-checks the probes under `tests/probes/` against `rustc` in both JIT and `--release` AOT modes (`tests/probes/so` is JIT-only). The bundled `tests/probes/` suite covers `serde`/`serde_json`, `clap`, `regex`, `toml`, `winnow`, multi-crate workspaces, and local proc-macros (`tests/probes/pc`), while `rusqlite`, `#[tokio::test]`, `prost`, `uuid`, and `chrono` were verified in external test crates rather than bundled in `tests/probes/`:
 
 | Crate or workload | Status | Notes |
 | --- | --- | --- |
 | Pure-Rust multi-crate workspaces (`[workspace.dependencies]`, path crates) | Supported (JIT + AOT) | `tests/probes/ws` |
 | `serde` (`derive`) + `serde_json` (`raw_value`), `toml` (`0.8`) | Supported (JIT + AOT) | `tests/probes/sj`, `tests/probes/fp`, `tests/probes/ws` |
 | `clap` (`4.x`, `derive`), `regex` (`1.x`), `winnow` (`0.7`) | Supported (JIT + AOT) | `tests/probes/cd`, `tests/probes/rx`, `tests/probes/wn` |
-| `#[tokio::test]` (`current_thread`, `multi_thread`, `LocalSet`, `start_paused`) | Supported (JIT) | Verified on 9-test Tokio suite; `harness = false` unsupported |
+| `#[tokio::test]` (`current_thread`, `multi_thread`, `LocalSet`, `start_paused`) | Supported (JIT) | Verified in external 9-test Tokio suite (not bundled in `tests/probes/`); `harness = false` unsupported |
 | Procedural macros (`derive`, attribute, function-like) | Supported (JIT + AOT) | `tests/proc-macro`, `tests/probes/pc` |
-| `rusqlite` (`0.32`, `bundled` C `libsqlite3.a`) | Supported (JIT + host-local Unix AOT) | Links cached `$HASTE_HOME/native/*.so` shared helper via `CC -shared` |
-| `prost` (`0.13`), `uuid` (`1.x`), `chrono` (`0.4`) | Supported (JIT + AOT) | Live-verified |
+| `rusqlite` (`0.32`, `bundled` C `libsqlite3.a`) | Supported (JIT + host-local Unix AOT) | Verified in external test crate (not bundled in `tests/probes/`); links cached `$HASTE_HOME/native/*.so` shared helper via `CC -shared` |
+| `prost` (`0.13`), `uuid` (`1.x`), `chrono` (`0.4`) | Supported (JIT + AOT) | Verified in external test crates (not bundled in `tests/probes/`) |
 | Crates bundling static C archives (`lib*.a`, e.g. `rusqlite` `bundled`, `tikv-jemalloc-sys`) | JIT + host-local Unix AOT (`build -o`); cross-target AOT errors | Host-local `$HASTE_HOME/native/` shared helper (not standalone); see [Limits](#limits) |
 | `reqwest` / `openssl-sys` | Untested | Not covered in `tests/probes` |
 | Nightly `#![feature(...)]` crates | Unsupported | Stable syntax and stdlib only |
@@ -177,7 +177,7 @@ compiler.emit("./my-app", "./out-bin")?;
 - **Static C archives in AOT (`build -o`):** Pure-Rust executables are zero-linker and standalone. Crates that link native static C archives (`lib*.a`, such as `rusqlite` `bundled`) compile a cached shared helper via `CC -shared` under `$HASTE_HOME/native/` on native Unix (`haste build .` checks `haste`'s own 42-package workspace including `tikv-jemalloc-sys`, 0 failed functions). Those binaries depend on that host-local shared helper rather than being portable standalone executables, and cross-target `haste build -o --target <TRIPLE>` rejects static C archives rather than emitting an incomplete binary.
 - **Test harnesses, doctests, and proc-macro edge cases:** `haste test` runs `#[test]` and `#[tokio::test]` functions (`fn()` and `fn() -> Result<(), E>`), skipping doctests (`--doc` is unsupported) and custom `harness = false` runners; procedural macros relying on rustc-private span or hygiene internals can fail. Under JIT (`haste run` and `haste test`), `std::env::current_exe()` resolves to the `haste` binary rather than a standalone target or test binary, so self-spawning tests (`Command::new(current_exe())`) fail under JIT; use `haste build -o` or `cargo test` for those.
 - **Unsandboxed `build.rs` and proc-macro execution:** Both the CLI and `Compiler::check` execute `build.rs` scripts and procedural macros with the invoking user's privileges. Untrusted or customer-submitted repositories require isolated, resource-limited workers without service credentials. See [SECURITY.md](SECURITY.md).
-- **Platform and executable format limits:** Supported hosts and AOT `--target` triples are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`. Linux ELF binaries are non-PIE and target glibc; Linux→macOS ARM64 cross-builds are unsigned until codesigned on macOS (`codesign --force --sign -`); Windows PE32+ emission is experimental, non-PIE, and imports CRT shims from `ucrtbase.dll` and `msvcrt.dll`. JIT `run`/`test`, `serve`, `--daemon`, and `--watch` require Unix; `prep` / `--prepared` are Linux x86-64 only (using `RUSTC_BOOTSTRAP=1`). On macOS, Hardened Runtime or App Sandbox restrictions can block dual-mapped `mach_vm_remap` JIT pages.
+- **Platform and executable format limits:** Supported hosts and AOT `--target` triples are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`. Linux ELF binaries are non-PIE and target glibc; Linux→macOS cross-builds (both ARM64 and x86-64) are unsigned until `codesign`ed on macOS (`codesign --force --sign -`); Windows PE32+ emission is experimental, non-PIE, and imports CRT shims from `ucrtbase.dll` and `msvcrt.dll`. JIT `run`/`test`, `serve`, `--daemon`, and `--watch` require Unix; `prep` / `--prepared` are Linux x86-64 only (using `RUSTC_BOOTSTRAP=1`). On macOS, Hardened Runtime or App Sandbox restrictions can block dual-mapped `mach_vm_remap` JIT pages.
 - **Debug info, unwinding, and traps:** `haste` emits DWARF `.debug_line` (`HASTE_DEBUG_INFO`) on Linux ELF only (no `.debug_info` variable/type DIEs). Mach-O emits `LC_UUID`, `LC_FUNCTION_STARTS`, and a symbol table without DWARF `.debug_line`; Windows PE32+ omits `.pdata` unwind tables and PDBs. In `--release` AOT builds (`haste --release build -o`), bounds, divide-by-zero, and signed `MIN / -1` division-overflow panics lower to hardware traps unless `catch_unwind` or `std::thread::{spawn, spawn_unchecked, spawn_scoped, scope}` is reached (while `haste --release test` and JIT always keep unwinding enabled, and integer `+`/`-`/`*` wrap in `--release`). Panicking across `extern "C"` aborts (`extern "C-unwind"` unwinds).
 
 ## Commands, options, and environment

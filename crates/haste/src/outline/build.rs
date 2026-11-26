@@ -105,6 +105,56 @@ fn has_impl_body(src: &Source, item: &Item) -> bool {
     }
 }
 
+fn definitely_enabled(env: &Env, attrs: &[Attr]) -> bool {
+    attrs.iter().all(|attr| match attr {
+        Attr::Cfg(cfg) => env.eval(cfg) == Truth::Yes,
+        Attr::CfgAttr(cfg, inner) => match env.eval(cfg) {
+            Truth::No => true,
+            Truth::Yes => definitely_enabled(env, inner),
+            Truth::Unknown => false,
+        },
+        _ => true,
+    })
+}
+
+fn is_compile_error(
+    src: &Source,
+    item: &Item,
+    scope: Option<&Arc<Textual>>,
+    deps: &[(String, usize)],
+    krate: usize,
+) -> bool {
+    let Some(name_tok) = item.name else {
+        return false;
+    };
+    if crate::names::plain(src.text(name_tok)) != "compile_error" {
+        return false;
+    }
+    if name_tok == item.start {
+        return super::tree::textual(scope, "compile_error").is_none();
+    }
+    if name_tok == item.start + 3 && src.kind(item.start + 1) == TokenKind::Colon {
+        return matches!(src.text(item.start), "core" | "std");
+    }
+    if name_tok == item.start + 5
+        && src.kind(item.start) == TokenKind::Colon
+        && src.kind(item.start + 1) == TokenKind::Colon
+    {
+        return matches!(src.text(item.start + 2), "core" | "std");
+    }
+    if name_tok == item.start + 4
+        && src.kind(item.start) == TokenKind::Dollar
+        && let Some(target) = src.dollar(item.start)
+    {
+        let target = target as usize;
+        return target == krate
+            || deps
+                .iter()
+                .any(|(dep, at)| *at == target && matches!(dep.as_str(), "core" | "std"));
+    }
+    false
+}
+
 impl<'a> Loader<'a> {
     /// A loader of crate `krate` into `out` that sees the other crates through `others`; a crate with nothing read yet first gets its prelude crate among `deps`.
     pub fn new(
@@ -255,7 +305,11 @@ impl Loader<'_> {
         match item.kind {
             ItemKind::Mod => self.child(file, index, module, (at, item))?,
             ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at), item),
-            ItemKind::MacroCall => self.call(file, module, at)?,
+            ItemKind::MacroCall => {
+                if !self.emit_compile_error(file, item) {
+                    self.call(file, module, at)?;
+                }
+            }
             ItemKind::Impl => self.impl_block(index, module, at, file)?,
             ItemKind::Trait => self.trait_block(index, module, at, file)?,
             ItemKind::Struct | ItemKind::Enum | ItemKind::Union => {
@@ -320,6 +374,7 @@ impl Loader<'_> {
             module,
             parts: Vec::new(),
         });
+        self.check_member_compile_errors(file, Some(at));
         self.members(
             file,
             MemberBlock::Impl(self.out.impls.len() - 1),
@@ -349,12 +404,57 @@ impl Loader<'_> {
             module,
             parts: Vec::new(),
         });
+        self.check_member_compile_errors(file, Some(at));
         self.members(
             file,
             MemberBlock::Trait(self.out.traits.len() - 1),
             module,
             Some(at),
         )
+    }
+
+    fn check_member_compile_errors(&mut self, file: &File, owner: Option<u32>) {
+        for item in &file.items.items {
+            if item.parent == owner
+                && item.kind == ItemKind::MacroCall
+                && self.out.env.enabled(&item.attrs)
+            {
+                let _ = self.emit_compile_error(file, item);
+            }
+        }
+    }
+
+    fn emit_compile_error(&mut self, file: &File, item: &Item) -> bool {
+        let Some(open) = item.body else {
+            return false;
+        };
+        if !definitely_enabled(&self.out.env, &item.attrs)
+            || !definitely_enabled(&self.out.env, &file.items.inner)
+            || !is_compile_error(
+                &file.source,
+                item,
+                self.scope.as_ref(),
+                self.deps,
+                self.krate,
+            )
+        {
+            return false;
+        }
+        let args = file.source.args(open);
+        let msg = match args.as_slice() {
+            [arg] => path_text(&file.source, *arg, &self.out.env)
+                .unwrap_or_else(|| spelled_fragment(&file.source, *arg)),
+            [] => "compile_error! requires a string argument".to_owned(),
+            _ => spelled_fragment(&file.source, (open + 1, file.source.pair(open))),
+        };
+        self.out.errors.push(syntax_error(
+            &file.source,
+            item.start,
+            item.end,
+            &msg,
+            "compile_error!",
+        ));
+        true
     }
 
     fn child(

@@ -41,13 +41,7 @@ impl<'a> Infer<'_, 'a> {
         let home = frame.home;
         let mut wanted = Vec::new();
         for (generic, &arg) in type_params(&header.generics).zip(impl_args) {
-            wanted.extend(
-                header
-                    .body
-                    .list(generic.bounds)
-                    .iter()
-                    .map(|&bound| (arg, bound)),
-            );
+            wanted.extend(header.body.list(generic.bounds).iter().map(|&b| (arg, b)));
         }
         self.with_frame(frame, |infer| {
             if infer.sets_unsized_param(block, &header, (impl_args, home))? {
@@ -68,7 +62,7 @@ impl<'a> Infer<'_, 'a> {
                     }
                 }
             }
-            Ok(true)
+            infer.copy_impl_holds(block)
         })
     }
 
@@ -122,7 +116,9 @@ impl<'a> Infer<'_, 'a> {
         }
         if self.compiler_decides(of, ty) {
             let held = self.compiler_holds(of, ty);
-            if held && self.is_thread_auto_trait(of) && self.has_vars(ty) {
+            let defer_closure = !self.captures_settled
+                && matches!(self.cx.types.kind(self.resolve(ty)), Kind::Closure(..));
+            if held && self.is_thread_auto_trait(of) && (self.has_vars(ty) || defer_closure) {
                 self.note_obligation_site(of, ty);
                 self.obligations.push((of, vec![ty]));
             }
@@ -163,13 +159,18 @@ impl<'a> Infer<'_, 'a> {
     }
 
     pub(in crate::sema) fn compiler_decides(&self, of: ItemRef, ty: Ty) -> bool {
-        let by_impl = matches!(
-            self.cx.types.kind(self.resolve(ty)),
-            Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_)
-        ) && self
-            .cx
-            .lang(of)
-            .is_some_and(|lang| matches!(lang, "copy" | "clone"));
+        let resolved = self.resolve(ty);
+        let lang = self.cx.lang(of);
+        let user_concrete_copy = lang == Some("copy")
+            && matches!(self.cx.types.kind(resolved), Kind::Adt(item, _) if !self.cx.outline.is_sysroot(item.krate))
+            && !self.has_vars(resolved)
+            && !self.has_params(resolved);
+        let by_impl = !user_concrete_copy
+            && matches!(
+                self.cx.types.kind(resolved),
+                Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_)
+            )
+            && lang.is_some_and(|l| matches!(l, "copy" | "clone"));
         self.compiler_trait(of) && !by_impl
     }
 
@@ -222,10 +223,8 @@ impl<'a> Infer<'_, 'a> {
                 }
                 if held && self.obligation_open(ty, args) {
                     self.note_obligation_site(of, ty);
-                    self.obligations.push((
-                        of,
-                        std::iter::once(ty).chain(args.iter().copied()).collect(),
-                    ));
+                    let list: Vec<Ty> = std::iter::once(ty).chain(args.iter().copied()).collect();
+                    self.obligations.push((of, list));
                 }
                 Ok(held)
             }
@@ -267,28 +266,21 @@ impl<'a> Infer<'_, 'a> {
         let Kind::Dyn(object, parts, members, _) = *self.cx.types.kind(self.resolve(ty)) else {
             return None;
         };
-        let given = super::super::super::ty::object_parts(
-            self.cx.types.substs(parts),
-            self.cx.types.items(members),
-        )
-        .0
-        .to_vec();
+        let (p, m) = (self.cx.types.substs(parts), self.cx.types.items(members));
+        let given = super::super::super::ty::object_parts(p, m).0.to_vec();
         let same_family = (self.is_sync_callable_trait(object) && self.is_sync_callable_trait(of))
             || (self.is_async_callable_trait(object) && self.is_async_callable_trait(of));
         if object != of && same_family {
             if !self
                 .implied_traits(vec![object])
-                .is_ok_and(|traits| traits.contains(&of))
+                .is_ok_and(|t| t.contains(&of))
                 || given.len() != args.len()
             {
                 return Some(false);
             }
             let held = self.trial(|infer| {
-                Ok(given
-                    .iter()
-                    .zip(args)
-                    .all(|(found, wanted)| infer.unifies(*found, *wanted))
-                    .then_some(()))
+                let ok = given.iter().zip(args).all(|(a, b)| infer.unifies(*a, *b));
+                Ok(ok.then_some(()))
             });
             return Some(matches!(held, Ok(Some(()))));
         }
@@ -297,8 +289,8 @@ impl<'a> Infer<'_, 'a> {
             .ok()?;
         let matching: Vec<Vec<Ty>> = bounds
             .into_iter()
-            .filter(|(bound, substs)| *bound == of && substs.len() == args.len() + 1)
-            .map(|(_, substs)| substs)
+            .filter(|(b, s)| *b == of && s.len() == args.len() + 1)
+            .map(|(_, s)| s)
             .collect();
         if matching.is_empty() {
             return Some(false);
@@ -308,7 +300,7 @@ impl<'a> Infer<'_, 'a> {
             if matching[0][1..]
                 .iter()
                 .zip(args)
-                .all(|(&found, &wanted)| self.unifies(found, wanted))
+                .all(|(&a, &b)| self.unifies(a, b))
             {
                 self.commit_vars(mark);
                 return Some(true);
@@ -317,22 +309,20 @@ impl<'a> Infer<'_, 'a> {
             return Some(false);
         }
         let held = matching.iter().any(|substs| {
-            matches!(
-                self.trial(|infer| {
-                    Ok(substs[1..]
-                        .iter()
-                        .zip(args)
-                        .all(|(&found, &wanted)| infer.unifies(found, wanted))
-                        .then_some(()))
-                }),
-                Ok(Some(()))
-            )
+            let ok = self.trial(|infer| {
+                Ok(substs[1..]
+                    .iter()
+                    .zip(args)
+                    .all(|(&a, &b)| infer.unifies(a, b))
+                    .then_some(()))
+            });
+            matches!(ok, Ok(Some(())))
         });
         Some(held)
     }
 
     pub(in super::super) fn is_thread_auto_trait(&self, of: ItemRef) -> bool {
-        self.cx.lang(of) == Some("sync")
+        matches!(self.cx.lang(of), Some("sync" | "unpin"))
             || (self.cx.is_auto_trait(of)
                 && self.cx.outline.is_sysroot(of.krate)
                 && self.cx.name(of) == "Send")
@@ -360,13 +350,22 @@ impl<'a> Infer<'_, 'a> {
             {
                 self.poly_sized(ty)
             }
+            Kind::Adt(item, _)
+                if lang == "copy"
+                    && !self.cx.outline.is_sysroot(item.krate)
+                    && !self.has_vars(ty)
+                    && !self.has_params(ty) =>
+            {
+                !self.cx.foreign(*item)
+                    && !self.is_unsized(ty).unwrap_or(false)
+                    && self.is_copy(ty).unwrap_or(false)
+            }
             Kind::Adt(item, _) if SIZED_ONLY.contains(&lang) => {
                 !self.cx.foreign(*item) && !self.is_unsized(ty).unwrap_or(false)
             }
             Kind::Tuple(_) | Kind::Array(..) if matches!(lang, "copy" | "clone") => {
                 self.parts_hold(of, ty)
             }
-            _ if lang == "unpin" => self.unpin_holds(of, ty, &mut Vec::new()),
             _ => true,
         }
     }
@@ -376,8 +375,7 @@ impl<'a> Infer<'_, 'a> {
             if self.compiler_decides(of, part) {
                 self.compiler_holds(of, part)
             } else {
-                self.select(of, part, &[])
-                    .is_ok_and(|picked| picked.is_some())
+                self.select(of, part, &[]).is_ok_and(|p| p.is_some())
             }
         })
     }
@@ -389,11 +387,24 @@ impl<'a> Infer<'_, 'a> {
             Kind::Adt(item, args) => {
                 let args = self.cx.types.substs(args).to_vec();
                 self.adt_fields(item, &args)
-                    .map(|fields| fields.iter().flatten().copied().collect())
+                    .map(|f| f.iter().flatten().copied().collect())
                     .unwrap_or_default()
             }
             _ => Vec::new(),
         }
+    }
+
+    fn dyn_holds_auto(
+        &mut self,
+        of: ItemRef,
+        object: ItemRef,
+        autos: super::super::super::substs::ItemList,
+    ) -> bool {
+        object == of
+            || self.cx.types.items(autos).contains(&of)
+            || self
+                .implied_traits(vec![object])
+                .is_ok_and(|t| t.contains(&of))
     }
 
     fn unpin_holds(&mut self, of: ItemRef, ty: Ty, seen: &mut Vec<Ty>) -> bool {
@@ -402,27 +413,24 @@ impl<'a> Infer<'_, 'a> {
             return true;
         }
         match *self.cx.types.kind(ty) {
-            Kind::Closure(..) => return !self.ensure_coroutine(ty),
-            Kind::Adt(item, _) => {
-                let holders = self.holders(of, ty, &[]);
-                if self.cx.negative_impl(of, Head::Adt(item), &holders) {
-                    return false;
-                }
-                if !self.has_vars(ty)
-                    && !self.has_params(ty)
-                    && self.probe(|infer| {
-                        infer
-                            .select(of, ty, &[])
-                            .is_ok_and(|picked| picked.is_some())
-                    })
-                {
-                    return true;
-                } else if (self.has_vars(ty) || self.has_params(ty))
-                    && self
-                        .select(of, ty, &[])
-                        .is_ok_and(|picked| picked.is_some())
-                {
-                    return true;
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return true,
+            Kind::Param(_) | Kind::Proj(_) => {
+                return !self.root_is_user()
+                    || (self.poly.is_some()
+                        && self.poly_holds_in_env(of, ty, &[]).unwrap_or(false));
+            }
+            Kind::Slice(inner) | Kind::Pat(inner, _) => {
+                seen.push(ty);
+                return self.unpin_holds(of, inner, seen);
+            }
+            Kind::Dyn(object, _, _, autos) => return self.dyn_holds_auto(of, object, autos),
+            Kind::Closure(parent, substs, at) => {
+                return !self.ensure_coroutine(ty)
+                    && self.closure_unpin_holds(of, ty, (parent, substs, at), seen);
+            }
+            Kind::Adt(item, args) => {
+                if let Some(explicit) = self.adt_explicit_unpin(of, ty, item, args, seen) {
+                    return explicit;
                 }
             }
             Kind::Tuple(_) | Kind::Array(..) => {}
@@ -434,7 +442,77 @@ impl<'a> Infer<'_, 'a> {
             .all(|part| self.unpin_holds(of, part, seen))
     }
 
+    fn adt_explicit_unpin(
+        &mut self,
+        of: ItemRef,
+        ty: Ty,
+        item: ItemRef,
+        args: super::super::super::substs::Substs,
+        seen: &mut Vec<Ty>,
+    ) -> Option<bool> {
+        let holders = self.holders(of, ty, &[]);
+        if self.cx.lang(item) == Some("unsafe_pinned")
+            || (self.cx.outline.is_sysroot(item.krate) && self.cx.name(item) == "PhantomPinned")
+            || self.cx.negative_impl(of, Head::Adt(item), &holders)
+        {
+            return Some(false);
+        }
+        if self.cx.boxed(ty).is_some() {
+            return Some(true);
+        }
+        if self
+            .cx
+            .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders)
+        {
+            let holds = self.has_vars(ty)
+                || self.probe(|infer| infer.select(of, ty, &[]).is_ok_and(|p| p.is_some()));
+            return Some(holds);
+        }
+        if self.cx.lang(item) == Some("phantom_data") {
+            seen.push(ty);
+            let first = self.cx.types.substs(args).first().copied();
+            return Some(first.is_none_or(|t| self.unpin_holds(of, t, seen)));
+        }
+        None
+    }
+
+    fn closure_unpin_holds(
+        &mut self,
+        of: ItemRef,
+        ty: Ty,
+        (parent, substs, at): (ItemRef, super::super::super::substs::Substs, u32),
+        seen: &mut Vec<Ty>,
+    ) -> bool {
+        seen.push(ty);
+        if self.instance == Some((parent, substs)) {
+            if !self.captures_settled {
+                return true;
+            }
+            let Some(captures) = self
+                .out
+                .closures
+                .get(&crate::body::ExprId(at))
+                .map(|c| c.captures.clone())
+            else {
+                return true;
+            };
+            return captures.into_iter().all(|cap| {
+                cap.by != super::super::By::Value || {
+                    let local_ty = self.resolve(self.out.locals[cap.local as usize].ty);
+                    let cap_ty = cap.ty(self.cx, local_ty).unwrap_or(local_ty);
+                    self.unpin_holds(of, cap_ty, seen)
+                }
+            });
+        }
+        self.cx
+            .ensure_closure(ty)
+            .is_none_or(|info| self.unpin_holds(of, info.env, seen))
+    }
+
     pub(in super::super) fn thread_auto_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
+        if self.cx.lang(of) == Some("unpin") {
+            return self.unpin_holds(of, ty, &mut Vec::new());
+        }
         let (holds, dep) = self.thread_auto_holds_dep(of, ty);
         self.auto_dep = self.auto_dep.min(dep);
         if self.auto_stack.is_empty() {
@@ -520,19 +598,11 @@ impl<'a> Infer<'_, 'a> {
             | Kind::Array(inner, _)
             | Kind::Slice(inner)
             | Kind::Pat(inner, _) => self.thread_auto_holds_dep(of, inner),
-            Kind::Dyn(object, _, _, autos) => {
-                let holds = object == of
-                    || self.cx.types.items(autos).contains(&of)
-                    || self
-                        .implied_traits(vec![object])
-                        .is_ok_and(|traits| traits.contains(&of));
-                (holds, usize::MAX)
-            }
+            Kind::Dyn(object, _, _, autos) => (self.dyn_holds_auto(of, object, autos), usize::MAX),
             Kind::Tuple(_) => {
                 let my_depth = self.auto_stack.len();
                 self.auto_stack.push((of, ty));
-                let mut dep = usize::MAX;
-                let mut holds = true;
+                let (mut dep, mut holds) = (usize::MAX, true);
                 for part in self.parts(ty) {
                     let (ok, child_dep) = self.thread_auto_holds_dep(of, part);
                     if !ok {
@@ -544,7 +614,9 @@ impl<'a> Infer<'_, 'a> {
                 self.auto_stack.pop();
                 self.finish_auto_node((of, ty), cacheable, my_depth, holds, dep)
             }
-            Kind::Closure(parent, _, at) => self.closure_auto_holds(of, ty, parent, at),
+            Kind::Closure(parent, substs, at) => {
+                self.closure_auto_holds(of, ty, (parent, substs, at))
+            }
             Kind::Adt(item, args) => self.adt_auto_holds(of, ty, item, args, cacheable),
         }
     }
@@ -553,21 +625,16 @@ impl<'a> Infer<'_, 'a> {
         &mut self,
         of: ItemRef,
         ty: Ty,
-        parent: ItemRef,
-        at: u32,
+        (parent, substs, at): (ItemRef, super::super::super::substs::Substs, u32),
     ) -> (bool, usize) {
         self.auto_stack.push((of, ty));
         let mut dep = usize::MAX;
-        let holds = if self.instance.is_some_and(|(cur, _)| cur == parent) {
-            let Some(captures) = self
-                .out
-                .closures
-                .get(&crate::body::ExprId(at))
-                .map(|c| c.captures.clone())
-            else {
+        let (mut holds, extra_tys) = if self.instance == Some((parent, substs)) {
+            let Some(c) = self.out.closures.get(&crate::body::ExprId(at)) else {
                 self.auto_stack.pop();
                 return (true, usize::MAX);
             };
+            let (captures, is_cor, cor_body) = (c.captures.clone(), c.coroutine, c.body);
             let mut ok = true;
             for cap in captures {
                 let local_ty = self.resolve(self.out.locals[cap.local as usize].ty);
@@ -584,30 +651,53 @@ impl<'a> Infer<'_, 'a> {
                 }
                 dep = dep.min(child_dep);
             }
-            ok
+            let extra = if ok && is_cor {
+                super::super::drop::coroutine_body_tys(
+                    self.body,
+                    super::super::drop::CoroutineSource::Infer(&self.out),
+                    cor_body,
+                )
+            } else {
+                Vec::new()
+            };
+            (ok, extra)
         } else if let Some(info) = self.cx.ensure_closure(ty) {
-            let (mut h, child_dep) = self.thread_auto_holds_dep(of, info.env);
+            let (h, child_dep) = self.thread_auto_holds_dep(of, info.env);
             dep = child_dep;
-            if h && info.closure.coroutine {
-                for local in &info.typed.locals {
-                    if local.ty == Ty::NONE
-                        || self.cx.types.has_params(local.ty)
-                        || self.cx.types.has_var_flag(local.ty)
-                    {
-                        continue;
-                    }
-                    let (lh, ldep) = self.thread_auto_holds_dep(of, local.ty);
-                    if !lh {
-                        h = false;
-                        break;
-                    }
-                    dep = dep.min(ldep);
+            let extra = if h && info.closure.coroutine {
+                if !matches!(info.typed.tables, super::super::LazyTables::CheckOnly(_))
+                    && let Ok(body) = self.cx.body(info.parent)
+                {
+                    let scoped = info.typed.scoped(&self.cx.types);
+                    super::super::drop::coroutine_body_tys(
+                        &body,
+                        super::super::drop::CoroutineSource::Typed(&**scoped, &scoped.locals),
+                        info.closure.body,
+                    )
+                } else {
+                    info.typed.locals.iter().map(|l| l.ty).collect()
                 }
-            }
-            h
+            } else {
+                Vec::new()
+            };
+            (h, extra)
         } else {
-            true
+            (true, Vec::new())
         };
+        if holds {
+            for raw in extra_tys {
+                let lt = self.resolve(raw);
+                if lt == Ty::NONE {
+                    continue;
+                }
+                let (lh, ldep) = self.thread_auto_holds_dep(of, lt);
+                if !lh {
+                    holds = false;
+                    break;
+                }
+                dep = dep.min(ldep);
+            }
+        }
         self.auto_stack.pop();
         (holds, if holds { dep } else { usize::MAX })
     }
@@ -638,13 +728,9 @@ impl<'a> Infer<'_, 'a> {
                     (true, usize::MAX)
                 } else {
                     let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
-                    let ok = self.probe(|infer| {
-                        infer
-                            .select(of, ty, &[])
-                            .is_ok_and(|picked| picked.is_some())
-                    });
-                    let child_dep = std::mem::replace(&mut self.auto_dep, saved_dep);
-                    (ok, child_dep)
+                    let ok =
+                        self.probe(|infer| infer.select(of, ty, &[]).is_ok_and(|p| p.is_some()));
+                    (ok, std::mem::replace(&mut self.auto_dep, saved_dep))
                 }
             } else if self.cx.lang(item) == Some("phantom_data") {
                 match self.cx.types.substs(args).first().copied() {
@@ -652,8 +738,7 @@ impl<'a> Infer<'_, 'a> {
                     None => (true, usize::MAX),
                 }
             } else {
-                let mut dep = usize::MAX;
-                let mut ok = true;
+                let (mut dep, mut ok) = (usize::MAX, true);
                 for part in self.parts(ty) {
                     let (h, child_dep) = self.thread_auto_holds_dep(of, part);
                     if !h {

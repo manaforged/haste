@@ -46,6 +46,20 @@ impl Writer {
             Builtin::Assert => builtin::assert(src, &src.args(open), site.krate, out),
             Builtin::Asm => self.asm(cx, run, open, out)?,
             Builtin::Panic | Builtin::Unreachable => self.panic(cx, run, site, out),
+            Builtin::CompileError => {
+                let msg = src
+                    .args(open)
+                    .first()
+                    .and_then(|&(a, _)| src.literal_text(a).ok().flatten())
+                    .unwrap_or_else(|| {
+                        (input.0..input.1)
+                            .map(|at| src.text(at))
+                            .collect::<String>()
+                            .trim()
+                            .to_owned()
+                    });
+                bail!("{msg}");
+            }
         }
         Ok(true)
     }

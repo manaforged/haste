@@ -241,7 +241,7 @@ impl SourceCatalog {
             sources,
             default_vendor: vendor.is_dir().then_some(vendor),
             registry_dirs: registry_dirs()?,
-            offline: env_offline() || cfg_offline,
+            offline: env_offline() || cfg_offline || crate::selection().offline,
             rustflags: rustflags.unwrap_or_default(),
             env: env_map.into_iter().map(|(k, (v, f))| (k, v, f)).collect(),
         })
@@ -529,10 +529,11 @@ fn checksum_matches(dir: &Path, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
     };
-    let Ok(text) = std::fs::read_to_string(dir.join(".cargo-checksum.json")) else {
-        return false;
-    };
-    JsonCursor::new(&text).read_package().flatten().as_deref() == Some(expected)
+    match std::fs::read_to_string(dir.join(".cargo-checksum.json")) {
+        Ok(text) => JsonCursor::new(&text).read_package().flatten().as_deref() == Some(expected),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => dir.join(".cargo-ok").is_file(),
+        Err(_) => false,
+    }
 }
 
 fn find_in_dir(locked: &Locked, dir: &Path) -> Option<PathBuf> {
@@ -764,6 +765,32 @@ directory = "vendor-corp"
         };
         assert!(find_in_dir(&locked_match, &base).is_some());
         assert!(find_in_dir(&locked_wrong, &base).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cargo_ok_fallback_when_checksum_json_missing_and_strict_when_present() {
+        let base = std::env::temp_dir().join(format!("haste-chk-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("dup-1.0.0");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        assert!(!checksum_matches(&dir, Some("aaaa")));
+        std::fs::write(dir.join(".cargo-ok"), r#"{"v":1}"#).expect("write ok");
+        assert!(checksum_matches(&dir, Some("aaaa")));
+        std::fs::write(dir.join(".cargo-checksum.json"), "{bad").expect("write bad json");
+        assert!(!checksum_matches(&dir, Some("aaaa")));
+        std::fs::write(
+            dir.join(".cargo-checksum.json"),
+            r#"{"files":{},"package":"bbbb"}"#,
+        )
+        .expect("write wrong json");
+        assert!(!checksum_matches(&dir, Some("aaaa")));
+        std::fs::write(
+            dir.join(".cargo-checksum.json"),
+            r#"{"files":{},"package":"aaaa"}"#,
+        )
+        .expect("write good json");
+        assert!(checksum_matches(&dir, Some("aaaa")));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

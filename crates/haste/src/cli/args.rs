@@ -86,6 +86,7 @@ fn next_str(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Strin
 
 fn parse(
     args: &mut std::iter::Peekable<impl Iterator<Item = std::ffi::OsString>>,
+    opts: &mut ParsedOpts,
 ) -> Result<std::result::Result<Command, Meta>> {
     let word = next_str(args)?;
     if word == "serve" {
@@ -129,6 +130,7 @@ fn parse(
             .with_context(usage);
     }
     if word == "check" {
+        opts.check_alias = true;
         return Ok(Ok(Command::Request(Request::Build)));
     }
     Request::parse_mode(&word)
@@ -175,6 +177,7 @@ struct ParsedOpts {
     perf_map: bool,
     watch: bool,
     target: Option<&'static haste_codegen::Target>,
+    check_alias: bool,
 }
 
 fn split_flag(flag: &str) -> (&str, Option<&str>) {
@@ -438,6 +441,9 @@ fn validate_command_opts(command: Command, opts: &ParsedOpts) -> Result<Command>
             other
         }
     };
+    if opts.check_alias && opts.out.is_some() {
+        anyhow::bail!("cannot use -o/--output with 'haste check'; use 'haste build -o'");
+    }
     if !matches!(command, Command::Request(Request::Build))
         && (opts.stats.is_some() || opts.out.is_some())
     {
@@ -504,7 +510,7 @@ fn parse_args_raw(
     if let Some(meta) = consume_options(&mut args, &mut opts)? {
         return Ok(Err(meta));
     }
-    let command = match parse(&mut args)? {
+    let command = match parse(&mut args, &mut opts)? {
         Ok(cmd) => cmd,
         Err(meta) => return Ok(Err(meta)),
     };
@@ -692,5 +698,28 @@ mod tests {
             help_text(Some(HelpTopic::Test))
         );
         assert!(version_string().starts_with("haste "));
+    }
+
+    #[test]
+    fn check_alias_rejects_output_flag() {
+        for args in [
+            &["check", "-o", "out"][..],
+            &["check", "--output", "out"],
+            &["check", "examples/hello", "-o=out"],
+            &["-o", "out", "check"],
+        ] {
+            let err = parse_strs(args).err().expect("check with -o must error");
+            assert!(
+                err.to_string()
+                    .contains("cannot use -o/--output with 'haste check'; use 'haste build -o'"),
+                "unexpected error for {args:?}: {err:#}"
+            );
+        }
+        let ((cmd, _, _, _, out, _), opts) = parse_strs(&["check", "examples/hello"])
+            .expect("plain check succeeds")
+            .expect("not meta");
+        assert!(matches!(cmd, Command::Request(Request::Build)));
+        assert!(opts.check_alias);
+        assert!(out.is_none());
     }
 }

@@ -422,3 +422,72 @@ pub(in super::super) fn operator_trait(op: BinOp) -> Option<(&'static str, &'sta
         .find(|(each, ..)| *each == op)
         .map(|&(_, lang, name)| (lang, name))
 }
+
+impl Infer<'_, '_> {
+    pub(super) fn check_packed_ref(&mut self, mut cur: ExprId, field_ty: Ty) -> Result<()> {
+        let field_ty = self.resolve(field_ty);
+        let (has_vars, has_params) = (self.has_vars(field_ty), self.has_params(field_ty));
+        let field_align = (!has_vars && !has_params)
+            .then(|| self.substitute(field_ty))
+            .and_then(|sub| self.cx.layout(sub).ok().map(|l| l.align.bytes()));
+        loop {
+            match *self.body.expr(cur) {
+                Expr::Paren(inner) => cur = inner,
+                Expr::Index(base, _)
+                    if self.out.autoderefs.get(&cur).copied().unwrap_or(0) == 0
+                        && matches!(
+                            self.cx
+                                .types
+                                .kind(self.resolve(self.out.exprs[base.0 as usize])),
+                            Kind::Array(..)
+                        ) =>
+                {
+                    cur = base
+                }
+                Expr::Field(base, _) | Expr::TupleField(base, _) => {
+                    let steps = self.out.autoderefs.get(&cur).copied().unwrap_or(0);
+                    if let Some(cont_ty) = self.field_container_for_ref(cur, base, steps)
+                        && let Kind::Adt(item, _) = *self.cx.types.kind(cont_ty)
+                        && let Some(pack) = self.cx.repr(item).pack
+                    {
+                        if has_params && self.poly.is_some() {
+                            self.poly_fallback();
+                        }
+                        if field_align.is_some_and(|align| align > pack.bytes()) {
+                            let msg = "reference to packed field is unaligned";
+                            return Err(self.diag_expr(
+                                crate::diag::DiagnosticKind::Type,
+                                None,
+                                msg,
+                                msg,
+                            ));
+                        }
+                    }
+                    if steps > 0 {
+                        break;
+                    }
+                    cur = base;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn field_container_for_ref(&mut self, expr: ExprId, base: ExprId, steps: u32) -> Option<Ty> {
+        let mut ty = self.resolve(*self.out.exprs.get(base.0 as usize)?);
+        for step in 0..steps {
+            if let Some(&Res::Fn(method, substs)) = self.out.derefs.get(&(expr, step)) {
+                let slice = self.cx.types.substs(substs).to_vec();
+                let ret = self.fn_types(method, &slice).ok()?.1;
+                let Kind::Ref(_, target) = *self.cx.types.kind(self.resolve(ret)) else {
+                    return None;
+                };
+                ty = self.resolve(target);
+            } else {
+                ty = self.resolve(self.builtin_deref(ty)?);
+            }
+        }
+        Some(ty)
+    }
+}
