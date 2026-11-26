@@ -260,7 +260,8 @@ fn inlinable_item(
         return None;
     }
     let env = &cx.outline.crates[item.krate as usize].env;
-    if !inlinable(env) || crate::prep::bind(cx, reached, index).is_some() {
+    let host_inline = crate::in_host_target() && matches!(hint, Hint::Inline | Hint::Always);
+    if (!inlinable(env) && !host_inline) || crate::prep::bind(cx, reached, index).is_some() {
         return None;
     }
     Some((*item, *substs, hint))
