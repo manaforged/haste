@@ -199,7 +199,12 @@ pub(super) fn check_fn_items(
         for (file_at, file) in tree.files.iter().enumerate() {
             let items = &file.items.items;
             for (at, item) in items.iter().enumerate() {
-                if item.kind != ItemKind::Fn || item.body.is_none() {
+                let is_fn = item.kind == ItemKind::Fn && item.body.is_some();
+                let is_impl_const = item.kind == ItemKind::Const
+                    && item
+                        .parent
+                        .is_some_and(|p| items[p as usize].kind == ItemKind::Impl);
+                if !is_fn && !is_impl_const {
                     continue;
                 }
                 if !item.parent.is_some_and(|p| {

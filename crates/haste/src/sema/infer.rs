@@ -1,4 +1,5 @@
 mod adt;
+mod adt_check;
 mod alloc;
 mod array;
 mod assign;
@@ -32,6 +33,7 @@ mod zonk;
 
 pub use adt::{Fields, field_types, maybe_unsized};
 pub(in crate::sema) use adt::{body_relaxes_sized, param_relaxes_sized};
+pub(in crate::sema) use adt_check::{check_union_concrete_fields, check_union_fields};
 pub use alloc::GlobalAllocShim;
 pub(in crate::sema) use callable::callable_method_name;
 pub(crate) use callable::is_callable_lang;
@@ -258,6 +260,9 @@ pub(super) fn infer_after_compiler_made(
         && !cx.outline.crates[item.krate as usize].env.fixed
         && matches!(typed.shape, Shape::Body)
     {
+        if let Some(block) = cx.owner_impl(item) {
+            poly::check_trait_impl_block(cx, block)?;
+        }
         super::borrow::check(cx, item, (&body, &sig), src, &typed)?;
     }
     settle(cx, (item, substs), typed)

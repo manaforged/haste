@@ -109,6 +109,72 @@ struct TestChildPipes {
     panic_r: i32,
     panic_w: i32,
     stdio: Option<((i32, i32), (i32, i32))>,
+    sentinel: Option<[u8; crate::host::unwind::PANIC_SENTINEL_LEN]>,
+}
+
+#[cfg(unix)]
+fn panic_sentinel() -> [u8; crate::host::unwind::PANIC_SENTINEL_LEN] {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut hi_hasher = RandomState::new().build_hasher();
+    hi_hasher.write_u64(seq);
+    let mut lo_hasher = RandomState::new().build_hasher();
+    lo_hasher.write_u64(seq ^ 0x9e37_79b9_7f4a_7c15);
+    let (hi, lo) = (hi_hasher.finish(), lo_hasher.finish());
+    let mut out = [0u8; crate::host::unwind::PANIC_SENTINEL_LEN];
+    out[..6].copy_from_slice(b"\x00HPNC:");
+    let hex = b"0123456789abcdef";
+    for i in 0..16 {
+        let shift = (15 - i) * 4;
+        out[6 + i] = hex[((hi >> shift) & 0xf) as usize];
+        out[22 + i] = hex[((lo >> shift) & 0xf) as usize];
+    }
+    out[38] = b':';
+    out[39] = 0;
+    out
+}
+
+#[cfg(unix)]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(unix)]
+fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+#[cfg(unix)]
+fn extract_panic_msg(stderr: &[u8], sentinel: &[u8]) -> Option<String> {
+    let end = rfind_subslice(stderr, sentinel)?;
+    let before = &stderr[..end];
+    let start = rfind_subslice(before, sentinel).map_or(0, |pos| pos + sentinel.len());
+    let text = String::from_utf8_lossy(&before[start..]);
+    crate::cli::panic_payload(&text).map(str::to_owned)
+}
+
+#[cfg(unix)]
+fn strip_sentinel(buf: &mut Vec<u8>, sentinel: &[u8]) {
+    if sentinel.is_empty() || find_subslice(buf, sentinel).is_none() {
+        return;
+    }
+    let mut cleaned = Vec::with_capacity(buf.len());
+    let mut rest = buf.as_slice();
+    while let Some(pos) = find_subslice(rest, sentinel) {
+        cleaned.extend_from_slice(&rest[..pos]);
+        rest = &rest[pos + sentinel.len()..];
+    }
+    cleaned.extend_from_slice(rest);
+    *buf = cleaned;
 }
 
 #[cfg(unix)]
@@ -147,6 +213,9 @@ impl Image {
             unsafe { std::env::set_var(key, value) };
         }
         crate::host::unwind::set_jit_unwind_head(self.unwind_head);
+        if let Some(sentinel) = pipes.sentinel {
+            crate::host::unwind::set_panic_stderr_sentinel(sentinel);
+        }
         if let Some(((_, ow), (_, ew))) = pipes.stdio {
             // SAFETY: `ow` and `ew` are live pipe write descriptors belonging to this child.
             unsafe { redirect_stdio(ow, ew) };
@@ -192,7 +261,7 @@ impl Image {
         name: &str,
         env: &[(String, String)],
         nocapture: bool,
-    ) -> Result<(i32, String)> {
+    ) -> Result<crate::cli::TestRun> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
             bail!("{name} has no code");
@@ -206,6 +275,7 @@ impl Image {
         let stdio = (!nocapture)
             .then(|| Ok::<_, std::io::Error>((std::io::pipe()?, std::io::pipe()?)))
             .transpose()?;
+        let sentinel = (!nocapture).then(panic_sentinel);
         let pipes = TestChildPipes {
             panic_r: panic_read.as_raw_fd(),
             panic_w: panic_write.as_raw_fd(),
@@ -215,6 +285,7 @@ impl Image {
                     (er.as_raw_fd(), ew.as_raw_fd()),
                 )
             }),
+            sentinel,
         };
         let pid = fork_child(|| self.run_test_child((index, start, address), (name, env), pipes))?;
         drop(panic_write);
@@ -231,15 +302,28 @@ impl Image {
             drain_pipes(&mut [(panic_read, &mut panic_buf)])?;
         }
         let raw_status = wait(pid);
-        let status = if panic_buf == PANIC_MARKER {
+        let panicked = panic_buf == PANIC_MARKER;
+        let panic_msg = match (panicked, &sentinel) {
+            (true, Some(marker)) => extract_panic_msg(&stderr_buf, marker),
+            _ => None,
+        };
+        if let Some(marker) = &sentinel {
+            strip_sentinel(&mut stderr_buf, marker);
+        }
+        let status = if panicked {
             crate::cli::TEST_PANICKED_STATUS
         } else {
             raw_status
         };
-        Ok((status, combine_test_output(stdout_buf, &stderr_buf)))
+        let combined = combine_test_output(stdout_buf, &stderr_buf);
+        Ok(crate::cli::TestRun {
+            status,
+            output: (!combined.is_empty()).then_some(combined),
+            panic_msg,
+        })
     }
 
-    /// Runs a single `#[test]` function in-process on non-Unix platforms, returning `(exit_status, stderr)`.
+    /// Runs a single `#[test]` function in-process on non-Unix platforms.
     #[cfg(not(unix))]
     pub fn run_test_captured(
         &self,
@@ -248,7 +332,7 @@ impl Image {
         name: &str,
         _env: &[(String, String)],
         _nocapture: bool,
-    ) -> Result<(i32, String)> {
+    ) -> Result<crate::cli::TestRun> {
         let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
             bail!("{name} has no code");
@@ -263,14 +347,22 @@ impl Image {
             } else {
                 status
             };
-            return Ok((status, String::new()));
+            return Ok(crate::cli::TestRun {
+                status,
+                output: None,
+                panic_msg: None,
+            });
         }
         let status = if invoke_unit_test(address) {
             crate::cli::TEST_PANICKED_STATUS
         } else {
             0
         };
-        Ok((status, String::new()))
+        Ok(crate::cli::TestRun {
+            status,
+            output: None,
+            panic_msg: None,
+        })
     }
 
     #[cfg(feature = "diff-harness")]

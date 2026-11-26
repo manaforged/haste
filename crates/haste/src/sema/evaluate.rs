@@ -94,6 +94,11 @@ pub fn install(make: Make) {
     MAKE.get_or_init(|| make);
 }
 
+/// Whether a runner of constant items has been installed.
+pub(in crate::sema) fn is_installed() -> bool {
+    MAKE.get().is_some()
+}
+
 #[derive(Default)]
 struct ConstCycleState {
     visiting: Vec<(Instance, bool)>,

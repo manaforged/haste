@@ -10,6 +10,7 @@ use super::infer::{Res, Typed};
 use super::substs::Substs;
 
 mod collect;
+mod crate_check;
 pub(in crate::sema) mod filter;
 mod items;
 mod order;
@@ -64,6 +65,7 @@ pub struct Reached {
     indirect: Vec<Vec<usize>>,
     call_sites: super::infer::CallSites,
     pinned: Vec<bool>,
+    pub(in crate::sema::reach) crate_errors: Vec<usize>,
     pub(in crate::sema::reach) states: Vec<ReachedEntry>,
     untyped_count: usize,
     pub(in crate::sema::reach) filter: ReachFilter,
@@ -209,6 +211,7 @@ impl Reached {
         let (mut stack, mut found) = (
             roots
                 .iter()
+                .chain(self.crate_errors.iter())
                 .rev()
                 .map(|&root| (root, false))
                 .collect::<Vec<_>>(),
@@ -282,6 +285,31 @@ impl Reached {
                 }
             })
             .collect()
+    }
+
+    pub(in crate::sema::reach) fn clear_crate_errors(&mut self) {
+        self.crate_errors.clear();
+    }
+
+    pub(in crate::sema::reach) fn note_crate_error(&mut self, at: usize) {
+        if !self.crate_errors.contains(&at) {
+            self.crate_errors.push(at);
+        }
+    }
+
+    pub(in crate::sema::reach) fn record_crate_error(&mut self, instance: Instance, error: String) {
+        let at = match self.index.get(&instance).copied() {
+            Some(at) => {
+                self.set_entry(at, ReachedEntry::Settled, Err(error));
+                at
+            }
+            None => {
+                let at = self.push_entry(instance, ReachedEntry::Settled);
+                self.list[at].1 = Err(error);
+                at
+            }
+        };
+        self.note_crate_error(at);
     }
 
     /// The index of `instance`, and whether it is new: a new one is listed without its body until `infer_declared` infers it.

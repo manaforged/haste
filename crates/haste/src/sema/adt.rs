@@ -369,6 +369,45 @@ impl<'a> Context<'a> {
         let calc = LayoutCalculator::new(dl);
         let repr = self.repr(item);
         let kind = self.item(item).1.kind;
+        if repr.transparent() {
+            if kind == ItemKind::Enum && layouts.len() != 1 {
+                bail!(
+                    "transparent enum {} needs exactly one variant, but has {}",
+                    self.name(item),
+                    layouts.len()
+                );
+            }
+            if let Some(variant) = layouts.first() {
+                let non_1zst = variant
+                    .iter()
+                    .filter(|layout| {
+                        layout.size.bytes() != 0
+                            || layout.align.bytes() != 1
+                            || matches!(
+                                layout.backend_repr,
+                                rustc_abi::BackendRepr::Memory { sized: false }
+                            )
+                    })
+                    .count();
+                if non_1zst > 1 {
+                    let what = match kind {
+                        ItemKind::Enum => "enum",
+                        ItemKind::Union => "union",
+                        _ => "struct",
+                    };
+                    bail!(
+                        "transparent {what} {} cannot have more than one non-zero-sized field",
+                        self.name(item),
+                    );
+                }
+            }
+        }
+        if kind == ItemKind::Union
+            && !self.outline.is_sysroot(item.krate)
+            && let Some(union_fields) = fields.first()
+        {
+            super::infer::check_union_concrete_fields(self, item, union_fields)?;
+        }
         if repr.simd() && kind == ItemKind::Struct && fields.len() == 1 && !fields[0].is_empty() {
             if fields[0].len() == 1
                 && let Kind::Array(elem_ty, len_ty) = *self.types.kind(fields[0][0])

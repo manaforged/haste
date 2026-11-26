@@ -69,6 +69,7 @@ fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
         files.extend(pkg.manifest.bins.iter().map(|(_, path)| path.clone()));
         files.extend(pkg.manifest.examples.iter().map(|(_, path)| path.clone()));
         files.extend(pkg.manifest.tests.iter().map(|(_, path)| path.clone()));
+        files.extend(pkg.manifest.benches.iter().map(|(_, path)| path.clone()));
     }
     files.sort();
     files.dedup();

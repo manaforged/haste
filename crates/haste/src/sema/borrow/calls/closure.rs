@@ -187,7 +187,10 @@ impl Checker<'_, '_> {
         });
         let init_moved = body_state.moved.clone();
         let init_partial = body_state.partial_moves.clone();
-        let empty = HashSet::default();
+        let mut cap_live = HashSet::default();
+        for cap in &closure.captures {
+            cap_live.insert(cap.local);
+        }
         let res = self.with_let_extend(None, |this| {
             if let Expr::Block {
                 kind,
@@ -205,11 +208,11 @@ impl Checker<'_, '_> {
                     label,
                     &mut body_state,
                     (false, true),
-                    &empty,
+                    &cap_live,
                     depth,
                 )
             } else {
-                this.check_expr(body, &mut body_state, false, &empty, true, closure_depth)
+                this.check_expr(body, &mut body_state, false, &cap_live, true, closure_depth)
             }
         });
         self.no_move_captures = saved_no_move;

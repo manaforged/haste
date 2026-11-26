@@ -52,6 +52,7 @@ pub fn reach_wave(
     if !extra.is_empty() {
         settled.extend(drain_wave(cx, reached, extra, force_commit));
     }
+    super::crate_check::check_local_crate_items(cx, reached, roots, force_commit);
     reached.link(&settled);
 }
 
@@ -162,6 +163,7 @@ pub fn reach_anew(
     if !extra.is_empty() {
         found.extend(drain_wave(cx, reached, extra, true));
     }
+    super::crate_check::check_local_crate_items(cx, reached, roots, true);
     reached.pin_roots(roots);
     reached.link(&found);
     found

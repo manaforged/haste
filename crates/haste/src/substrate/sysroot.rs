@@ -33,12 +33,13 @@ struct CrateIdentity {
     deps: Vec<(String, u32)>,
 }
 
-const ROLES: [Role; 5] = [
+const ROLES: [Role; 6] = [
     Role::Lib,
     Role::Bin,
     Role::Example,
     Role::Test,
     Role::Script,
+    Role::Bench,
 ];
 
 fn role_tag(role: Role) -> u8 {

@@ -72,7 +72,14 @@ impl Checker<'_, '_> {
 
     fn record_param_inv_slot(&mut self, local: u32, body: &Body, src: &Source, param_ty: TyId) {
         let lty = self.local_ty(local);
-        let inv = collect_ast_invariant_lifetimes(self.cx, body, src, param_ty, Some(lty));
+        let inv = collect_ast_invariant_lifetimes(
+            self.cx,
+            Some(self.item),
+            body,
+            src,
+            param_ty,
+            Some(lty),
+        );
         self.variance.param_inv_lts[local as usize] = inv;
         if let AstTy::Ref {
             mutable, ty: inner, ..
@@ -85,7 +92,13 @@ impl Checker<'_, '_> {
                 })
                 .flatten();
             let inner_inv = collect_ast_invariant_lifetimes_mode(
-                self.cx, body, src, inner, inner_hint, mutable,
+                self.cx,
+                Some(self.item),
+                body,
+                src,
+                inner,
+                inner_hint,
+                mutable,
             );
             self.variance.param_inner_inv_lts[local as usize] = inner_inv;
         }
@@ -138,7 +151,14 @@ impl Checker<'_, '_> {
             return Ok(());
         };
         let lty = self.local_ty(local);
-        let inv = collect_ast_invariant_lifetimes(self.cx, self.body, self.src, ty_id, Some(lty));
+        let inv = collect_ast_invariant_lifetimes(
+            self.cx,
+            Some(self.item),
+            self.body,
+            self.src,
+            ty_id,
+            Some(lty),
+        );
         let full_static =
             ast_ty_is_provably_static_in(self.body, self.src, Some((&sig, self.src)), ty_id);
         let mut inner_static_ref = false;
@@ -156,7 +176,13 @@ impl Checker<'_, '_> {
                 })
                 .flatten();
             let inner_inv = collect_ast_invariant_lifetimes_mode(
-                self.cx, self.body, self.src, ann_inner, inner_hint, mutable,
+                self.cx,
+                Some(self.item),
+                self.body,
+                self.src,
+                ann_inner,
+                inner_hint,
+                mutable,
             );
             inner_static_ref = inner_inv.is_only_static();
             inner_inv

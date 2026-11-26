@@ -2,6 +2,8 @@ mod compat;
 mod env;
 mod solve;
 
+pub(super) use compat::check_trait_impl_block;
+
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};

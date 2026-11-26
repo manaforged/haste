@@ -560,7 +560,9 @@ impl Infer<'_, '_> {
             return Ok(());
         }
         let kind = self.cx.item(item).1.kind;
-        if !matches!(kind, ItemKind::Const | ItemKind::Fn) || self.cx.item(item).1.body.is_none() {
+        if !matches!(kind, ItemKind::Const | ItemKind::Fn)
+            || (kind == ItemKind::Fn && self.cx.item(item).1.body.is_none())
+        {
             return Ok(());
         }
         let Some(_frame) = super::super::evaluate::enter_const_cycle(
@@ -609,6 +611,9 @@ impl Infer<'_, '_> {
         }
         let sig = self.cx.signature(item)?;
         let body = self.cx.body(item)?;
+        if body.root.is_none() {
+            return Ok(());
+        }
         let src = self.cx.body_src(item);
         let home = self.cx.module_of(item)?;
         let args = self.cx.types.substs(substs).to_vec();

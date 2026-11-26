@@ -63,6 +63,7 @@ pub struct Manifest {
     pub bins: Vec<(String, PathBuf)>,
     pub examples: Vec<(String, PathBuf)>,
     pub tests: Vec<(String, PathBuf)>,
+    pub benches: Vec<(String, PathBuf)>,
     pub features: BTreeMap<String, Vec<String>>,
     pub deps: Vec<Dep>,
 }
@@ -419,6 +420,7 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
         bins: bins_of(dir, &name, root, package),
         examples: targets_of(dir, root, package, ("example", "autoexamples", "examples")),
         tests: targets_of(dir, root, package, ("test", "autotests", "tests")),
+        benches: targets_of(dir, root, package, ("bench", "autobenches", "benches")),
         features: features_of(root),
         deps: all_deps(&scope, root)?,
         name,
