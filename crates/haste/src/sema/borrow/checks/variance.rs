@@ -658,11 +658,18 @@ impl Checker<'_, '_> {
                 }
                 return Err(self.does_not_live_long_enough(site, s.target));
             }
-            if !self.from_caller(s.target, s.through_ref) {
-                return Err(self.does_not_live_long_enough(site, s.target));
-            }
             let target_ty = self.local_ty(s.target);
             let target_kind = self.cx.types.kind(target_ty).clone();
+            let static_reborrow = s.through_ref
+                && !self
+                    .is_param
+                    .get(s.target as usize)
+                    .copied()
+                    .unwrap_or(false)
+                && matches!(target_kind, Kind::Ref(crate::sema::ty::Mut::Not, _));
+            if !self.from_caller(s.target, s.through_ref) && !static_reborrow {
+                return Err(self.does_not_live_long_enough(site, s.target));
+            }
             let peel = s.steps.iter().any(|st| matches!(st, PlaceStep::Deref))
                 && matches!(
                     target_kind,

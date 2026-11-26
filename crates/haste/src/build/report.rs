@@ -216,7 +216,7 @@ fn format_short_diagnostic(diag: &str) -> String {
     }
 }
 
-fn push_json_str(out: &mut String, s: &str) {
+pub(super) fn push_json_str(out: &mut String, s: &str) {
     use std::fmt::Write as _;
     out.push('"');
     for ch in s.chars() {
@@ -287,17 +287,6 @@ fn file_span_byte_range(
     })
 }
 
-fn find_manifest_path(file: &str) -> Option<String> {
-    let mut dir = std::path::Path::new(file).parent()?;
-    loop {
-        let candidate = dir.join("Cargo.toml");
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-        dir = dir.parent()?;
-    }
-}
-
 fn push_json_span(out: &mut String, span: &ParsedSpan<'_>) {
     use std::fmt::Write as _;
     let cs = span.col_start.max(1);
@@ -330,62 +319,16 @@ fn push_json_child(out: &mut String, level: &str, message: &str) {
     out.push_str(",\"spans\":[],\"children\":[],\"rendered\":null}");
 }
 
-fn push_json_package_header(out: &mut String, file: Option<&str>) {
-    let raw = file
-        .and_then(find_manifest_path)
-        .unwrap_or_else(|| "Cargo.toml".to_owned());
-    let abs = std::path::absolute(&raw).unwrap_or_else(|_| std::path::PathBuf::from(&raw));
-    let manifest = abs.to_string_lossy().into_owned();
-    let dir = abs
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| ".".to_owned(), |p| p.to_string_lossy().into_owned());
-    let table = std::fs::read_to_string(&manifest)
-        .ok()
-        .and_then(|s| toml::from_str::<toml::Table>(&s).ok());
-    let pkg = table.as_ref().and_then(|t| t.get("package")?.as_table());
-    let str_key = |k: &str| pkg.and_then(|p| p.get(k)?.as_str());
-    let name = str_key("name")
-        .map(str::to_owned)
-        .or_else(|| {
-            std::path::Path::new(&dir)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "unknown".to_owned());
-    let version = str_key("version").unwrap_or("0.0.0");
-    let edition = str_key("edition").unwrap_or("2021");
-    let src_path = file.map_or_else(|| format!("{dir}/src/lib.rs"), str::to_owned);
-    let kind = if src_path.ends_with("main.rs")
-        || src_path.contains("/bin/")
-        || src_path.contains("\\bin\\")
-    {
-        "bin"
-    } else {
-        "lib"
-    };
-    let package_id = format!("{name} {version} (path+file://{dir})");
-    for (prefix, val) in [
-        (",\"package_id\":", package_id.as_str()),
-        (",\"manifest_path\":", manifest.as_str()),
-        (",\"target\":{\"kind\":[", kind),
-        ("],\"crate_types\":[", kind),
-        ("],\"name\":", name.as_str()),
-        (",\"src_path\":", src_path.as_str()),
-        (",\"edition\":", edition),
-    ] {
-        out.push_str(prefix);
-        push_json_str(out, val);
-    }
-    out.push_str(",\"doc\":true,\"doctest\":true,\"test\":true}");
-}
-
-fn format_json_diagnostic(diag: &str) -> String {
+fn format_json_diagnostic(outline: Option<&outline::Outline>, diag: &str) -> String {
     let parsed = parse_diagnostic(diag);
     let rendered = format!("{}\n", format_diagnostic(diag));
     let mut out = String::with_capacity(diag.len() + 512);
     out.push_str("{\"reason\":\"compiler-message\"");
-    push_json_package_header(&mut out, parsed.spans.first().map(|s| s.file));
+    super::json_diag::push_json_package_header(
+        &mut out,
+        outline,
+        parsed.spans.first().map(|s| s.file),
+    );
     out.push_str(",\"message\":{\"$message_type\":\"diagnostic\",\"level\":\"error\",\"code\":");
     match parsed.code {
         Some(code) => {
@@ -456,15 +399,18 @@ pub(super) fn split_error_diagnostics(text: &str) -> Vec<String> {
     out
 }
 
-pub(super) fn print_formatted_diagnostics(diagnostics: &[String]) {
+pub(super) fn print_formatted_diagnostics(
+    outline: Option<&outline::Outline>,
+    diagnostics: &[String],
+) {
     let fmt = crate::selection().message_format;
     for diag in diagnostics {
         match fmt {
             crate::MessageFormat::Human => print_human_diagnostic(diag),
             crate::MessageFormat::Short => eprintln!("{}", format_short_diagnostic(diag)),
-            crate::MessageFormat::Json => println!("{}", format_json_diagnostic(diag)),
+            crate::MessageFormat::Json => println!("{}", format_json_diagnostic(outline, diag)),
             crate::MessageFormat::JsonRenderDiagnostics => {
-                println!("{}", format_json_diagnostic(diag));
+                println!("{}", format_json_diagnostic(outline, diag));
                 print_human_diagnostic(diag);
             }
         }
@@ -564,7 +510,7 @@ impl Batch {
 
     pub(super) fn print_diagnostics(&self, outline: &outline::Outline) -> usize {
         let (diagnostics, failed_items) = self.collect_diagnostics(outline);
-        print_formatted_diagnostics(&diagnostics);
+        print_formatted_diagnostics(Some(outline), &diagnostics);
         failed_items
     }
 
@@ -663,7 +609,7 @@ impl Batch {
         filters: &[String],
     ) -> Result<i32> {
         if !self.member_errors.is_empty() {
-            print_formatted_diagnostics(&self.member_errors);
+            print_formatted_diagnostics(Some(outline), &self.member_errors);
             crate::diag::print_build_finished(false);
             return Ok(101);
         }
@@ -784,14 +730,55 @@ mod tests {
     }
 
     #[test]
-    fn json_diagnostic_includes_package_id_manifest_and_target() {
-        let json = format_json_diagnostic("error[syntax]: expected `)`\n --> src/main.rs:1:10");
-        assert!(json.contains("\"reason\":\"compiler-message\""));
-        assert!(json.contains("\"package_id\":\""));
-        assert!(json.contains("\"manifest_path\":\""));
-        assert!(json.contains("\"target\":{\"kind\":[\"bin\"],\"crate_types\":[\"bin\"],"));
-        let plain = format_json_diagnostic("package `missing` is not in Cargo.lock");
-        assert!(plain.contains("\"package_id\":\""));
+    fn json_diagnostic_matches_cargo_metadata_for_integration_test_and_lib() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let api_test = manifest_dir.join("tests/compiler_api.rs");
+        let diag = format!("error[type]: mismatch\n --> {}:1:1", api_test.display());
+        let json = format_json_diagnostic(None, &diag);
+        let expected_id = format!(
+            "\"package_id\":\"path+file://{}#0.0.0\"",
+            manifest_dir.display()
+        );
+        assert!(
+            json.contains(&expected_id),
+            "unexpected package_id in:\n{json}"
+        );
+        assert!(
+            json.contains("\"target\":{\"kind\":[\"test\"],\"crate_types\":[\"bin\"],\"name\":\"compiler_api\","),
+            "unexpected target in:\n{json}"
+        );
+        assert!(
+            json.contains("\"edition\":\"2024\""),
+            "expected 2024 edition in:\n{json}"
+        );
+        assert!(
+            json.contains("\"doc\":false,\"doctest\":false,\"test\":true}"),
+            "unexpected target flags in:\n{json}"
+        );
+
+        let codegen_dir = manifest_dir.parent().expect("crates dir").join("codegen");
+        let codegen_lib = codegen_dir.join("src/lib.rs");
+        let cg_diag = format!("error[type]: mismatch\n --> {}:1:1", codegen_lib.display());
+        let cg_json = format_json_diagnostic(None, &cg_diag);
+        let cg_id = format!(
+            "\"package_id\":\"path+file://{}#haste-codegen@0.0.0\"",
+            codegen_dir.display()
+        );
+        assert!(
+            cg_json.contains(&cg_id),
+            "unexpected codegen id in:\n{cg_json}"
+        );
+        assert!(
+            cg_json.contains("\"target\":{\"kind\":[\"lib\"],\"crate_types\":[\"lib\"],\"name\":\"haste_codegen\","),
+            "unexpected codegen target in:\n{cg_json}"
+        );
+        assert!(
+            cg_json.contains("\"edition\":\"2024\""),
+            "expected 2024 edition in:\n{cg_json}"
+        );
+
+        let plain = format_json_diagnostic(None, "package `missing` is not in Cargo.lock");
+        assert!(plain.contains("\"package_id\":\"path+file://"));
         assert!(plain.contains("\"spans\":[]"));
     }
 }

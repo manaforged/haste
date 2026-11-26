@@ -47,6 +47,8 @@ pub struct Root {
     pub name: String,
     pub path: PathBuf,
     pub role: Role,
+    pub edition: String,
+    pub proc_macro: bool,
 }
 
 /// The module trees of every crate in a workspace graph, read as far as lookups needed them.
@@ -109,6 +111,8 @@ impl Outline {
             name: String::new(),
             path: path.to_owned(),
             role: Role::Lib,
+            edition: "2021".to_owned(),
+            proc_macro: false,
         };
         let krate = Crate {
             env: Env {
