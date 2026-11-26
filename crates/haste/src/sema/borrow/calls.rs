@@ -2,6 +2,7 @@ mod arg_refs;
 mod closure;
 pub(super) mod lifetimes;
 pub(super) mod return_lt;
+mod static_ty;
 
 use std::sync::Arc;
 

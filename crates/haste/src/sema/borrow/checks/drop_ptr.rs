@@ -7,7 +7,9 @@ use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::ty::{Kind, Ty};
 
-use super::super::places::Place;
+use super::super::bind::push_source_loans_filtered;
+use super::super::places::{Place, PlaceStep};
+use super::super::propagate::BorrowSource;
 use super::super::{Checker, State, is_temp_holder};
 use super::is_temp_target;
 
@@ -269,6 +271,129 @@ impl Checker<'_, '_> {
                             .unwrap_or(0));
             if target_drops_first {
                 return Err(self.does_not_live_long_enough(l.site, l.target));
+            }
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn check_target_write_escape(
+        &mut self,
+        p: &Place,
+        targets: &[u32],
+        sources: &[BorrowSource],
+        state: &mut State,
+    ) -> Result<()> {
+        let param_target =
+            self.is_param_local(p.local) || targets.iter().any(|&t| self.is_param_local(t));
+        self.check_sources_against_targets(
+            p.through_ref || p.through_deref,
+            param_target,
+            self.scope_depth.get(p.local as usize).copied().unwrap_or(0) < self.closure_depth,
+            sources,
+        )?;
+        let has_field = p
+            .steps
+            .iter()
+            .any(|st| matches!(st, PlaceStep::Field(..) | PlaceStep::SliceElem { .. }));
+        if !p.through_ref {
+            return self.check_sources_fit_target(
+                self.current_expr,
+                p.local,
+                false,
+                has_field,
+                sources,
+            );
+        }
+        if self.is_param_local(p.local) {
+            self.check_sources_fit_target(self.current_expr, p.local, true, has_field, sources)?;
+        }
+        self.apply_write_to_targets(Some(p.local), has_field, targets, sources, state)
+    }
+
+    pub(in super::super) fn check_ptr_deref_write(
+        &mut self,
+        targets: &[u32],
+        sources: &[BorrowSource],
+        state: &mut State,
+    ) -> Result<()> {
+        let param_target = targets.iter().any(|&t| self.is_param_local(t));
+        let closure_target = self.closure_depth > 0
+            && targets.iter().any(|&t| {
+                self.scope_depth.get(t as usize).copied().unwrap_or(0) < self.closure_depth
+            });
+        self.check_sources_against_targets(true, param_target, closure_target, sources)?;
+        self.apply_write_to_targets(None, false, targets, sources, state)
+    }
+
+    fn check_sources_against_targets(
+        &mut self,
+        deref_write: bool,
+        param_target: bool,
+        closure_target: bool,
+        sources: &[BorrowSource],
+    ) -> Result<()> {
+        if deref_write && param_target {
+            for s in sources {
+                let allowed_ref = self.is_ref_ty(self.local_ty(s.target))
+                    && (s.through_ref || self.is_closure_param(s.target));
+                if is_temp_target(s.target).is_some()
+                    || (!self.from_caller(s.target, s.through_ref) && !allowed_ref)
+                {
+                    return Err(self.does_not_live_long_enough(None, s.target));
+                }
+            }
+        }
+        if self.closure_depth > 0 && closure_target {
+            for s in sources {
+                let is_cparam = self.is_closure_param(s.target);
+                let cparam_borrow = is_cparam && self.ty_holds_borrow(self.local_ty(s.target));
+                let allowed_ref =
+                    self.is_ref_ty(self.local_ty(s.target)) && (s.through_ref || is_cparam);
+                if is_temp_target(s.target).is_some()
+                    || (!s.through_ref
+                        && !self.is_ref_ty(self.local_ty(s.target))
+                        && self.closure_by_val_caps.contains(&s.target))
+                    || (!self.from_caller(s.target, s.through_ref)
+                        && !allowed_ref
+                        && !cparam_borrow
+                        && self
+                            .scope_depth
+                            .get(s.target as usize)
+                            .copied()
+                            .unwrap_or(0)
+                            >= self.closure_depth)
+                {
+                    return Err(self.borrow_err(None, "borrowed data escapes outside of closure"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_write_to_targets(
+        &mut self,
+        root_local: Option<u32>,
+        root_has_field: bool,
+        targets: &[u32],
+        sources: &[BorrowSource],
+        state: &mut State,
+    ) -> Result<()> {
+        for &holder in targets {
+            let is_root = root_local == Some(holder);
+            let peel = is_root && self.is_ref_ty(self.local_ty(holder));
+            let holder_field = if is_root { root_has_field } else { false };
+            self.check_sources_fit_target(self.current_expr, holder, peel, holder_field, sources)?;
+            state.set_tuple_sources(holder, None);
+            if self.ty_holds_borrow(self.local_ty(holder)) {
+                push_source_loans_filtered(
+                    &mut state.loans,
+                    Some(holder),
+                    sources,
+                    false,
+                    self.current_expr,
+                    |s| s.target != holder,
+                    |s| s.mutable,
+                );
             }
         }
         Ok(())

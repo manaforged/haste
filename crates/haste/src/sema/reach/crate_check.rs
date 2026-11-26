@@ -9,14 +9,15 @@ use crate::outline::item::{Item, ItemKind};
 use crate::outline::tree::Crate;
 use crate::sema::Context;
 use crate::sema::evaluate;
-use crate::sema::infer::{Typed, check_union_fields, type_params};
+use crate::sema::impls::ImplRef;
+use crate::sema::infer::{Infer, Typed, check_union_fields, type_params};
 use crate::sema::substs::Substs;
 use crate::sema::summary::expected_param_count;
 use crate::sema::ty::Ty;
 
 use super::{Instance, Reached, ReachedEntry, typed_once};
 
-/// Validates local crate constants (evaluation and cycles) and ADTs (union fields, `#[repr(transparent)]`, enum discriminants).
+/// Validates local crate constants, statics, trait impls, and ADTs.
 pub(super) fn check_local_crate_items(
     cx: &mut Context<'_>,
     reached: &mut Reached,
@@ -26,17 +27,23 @@ pub(super) fn check_local_crate_items(
     reached.clear_crate_errors();
     let crates = local_crates(cx, roots);
     let mut items = Vec::new();
+    let mut impls = Vec::new();
     for krate in crates {
         collect_crate_items(cx, krate, &mut items);
+        collect_crate_impls(cx, krate, &mut impls);
     }
     for (item, kind) in items {
         match kind {
             ItemKind::Const => check_const_item(cx, reached, item, force_commit),
+            ItemKind::Static => check_static_item(cx, reached, item, force_commit),
             ItemKind::Enum | ItemKind::Union | ItemKind::Struct => {
                 check_adt_item(cx, reached, item, kind, force_commit);
             }
             _ => {}
         }
+    }
+    for (block, item) in impls {
+        check_impl_block(cx, reached, block, item, force_commit);
     }
 }
 
@@ -64,7 +71,11 @@ fn collect_crate_items(cx: &Context<'_>, krate: u32, out: &mut Vec<(ItemRef, Ite
         for (at, entry) in items.iter().enumerate() {
             if !matches!(
                 entry.kind,
-                ItemKind::Const | ItemKind::Enum | ItemKind::Union | ItemKind::Struct
+                ItemKind::Const
+                    | ItemKind::Static
+                    | ItemKind::Enum
+                    | ItemKind::Union
+                    | ItemKind::Struct
             ) {
                 continue;
             }
@@ -80,6 +91,22 @@ fn collect_crate_items(cx: &Context<'_>, krate: u32, out: &mut Vec<(ItemRef, Ite
                 entry.kind,
             ));
         }
+    }
+}
+
+fn collect_crate_impls(cx: &Context<'_>, krate: u32, out: &mut Vec<(ImplRef, ItemRef)>) {
+    let tree = &cx.outline.crates[krate as usize];
+    for (index, entry) in tree.impls.iter().enumerate() {
+        let block = ImplRef::Module {
+            krate,
+            index: index as u32,
+        };
+        let item = ItemRef {
+            krate,
+            file: entry.file as u32,
+            item: entry.at,
+        };
+        out.push((block, item));
     }
 }
 
@@ -193,6 +220,41 @@ fn const_eval_bits(cx: &mut Context<'_>, ret: Option<Ty>) -> Option<u32> {
     None
 }
 
+fn check_static_item(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    item: ItemRef,
+    force_commit: bool,
+) {
+    let asks0 = cx.asks.count();
+    if let Err(err) = Infer::check_static_item_sync(cx, item)
+        && (force_commit || cx.asks.count() == asks0)
+    {
+        reached.record_crate_error(
+            (item, Substs::EMPTY),
+            crate::diag::format_error(cx.name(item), &err),
+        );
+    }
+}
+
+fn check_impl_block(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    block: ImplRef,
+    item: ItemRef,
+    force_commit: bool,
+) {
+    let asks0 = cx.asks.count();
+    if let Err(err) = Infer::check_local_trait_impl(cx, block)
+        && (force_commit || cx.asks.count() == asks0)
+    {
+        reached.record_crate_error(
+            (item, Substs::EMPTY),
+            crate::diag::format_error(cx.name(item), &err),
+        );
+    }
+}
+
 fn check_adt_item(
     cx: &mut Context<'_>,
     reached: &mut Reached,
@@ -218,9 +280,9 @@ fn check_adt_inner(cx: &mut Context<'_>, item: ItemRef, kind: ItemKind) -> Resul
     if kind == ItemKind::Union {
         check_union_fields(cx, item)?;
     }
-    if cx.repr(item).transparent() {
+    if !cx.foreign(item) {
         let def = cx.adt_def(item)?;
-        if kind == ItemKind::Enum && def.variants.len() != 1 {
+        if cx.repr(item).transparent() && kind == ItemKind::Enum && def.variants.len() != 1 {
             bail!(
                 "transparent enum {} needs exactly one variant, but has {}",
                 cx.name(item),
@@ -229,6 +291,7 @@ fn check_adt_inner(cx: &mut Context<'_>, item: ItemRef, kind: ItemKind) -> Resul
         }
         if type_params(&def.generics.params).next().is_none() {
             cx.adt_layout(item, &[])?;
+            Infer::check_item_dyn_object_safety(cx, item)?;
         }
     }
     Ok(())

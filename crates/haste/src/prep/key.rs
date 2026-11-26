@@ -147,7 +147,7 @@ impl Keys {
                 &self.list(cx, &cx.types.substs(args).to_vec())?,
             ),
             Kind::Closure(..) => self.closure(cx, ty)?,
-            Kind::FnPtr(params, ret) => form::fn_ptr(
+            Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => form::fn_ptr(
                 &self.types(cx, &cx.types.substs(params).to_vec())?,
                 &self.ty(cx, ret)?,
             ),

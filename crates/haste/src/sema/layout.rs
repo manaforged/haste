@@ -268,7 +268,7 @@ impl Context<'_> {
         Ok(Some(match self.types.kind(ty).clone() {
             Kind::Prim(prim) if prim != Primitive::Str => primitive(dl, prim)?,
             Kind::Never => Layout::never_type(dl),
-            Kind::FnPtr(..) => Layout::scalar(dl, pointer_scalar(dl, true)),
+            Kind::FnPtr(..) | Kind::UnsafeFnPtr(..) => Layout::scalar(dl, pointer_scalar(dl, true)),
             Kind::Ref(_, pointee) => self.pointer(dl, true, pointee)?,
             Kind::Ptr(_, pointee) => self.pointer(dl, false, pointee)?,
             Kind::Pat(base, range) => {

@@ -92,7 +92,9 @@ impl<'a> Infer<'_, 'a> {
             .is_some_and(|ret| self.resolve(ret) == expected);
         let expected = self.ret_sig.filter(|_| own_ret).unwrap_or(expected);
         match *self.cx.types.kind(expected) {
-            Kind::FnPtr(inputs, output) => Some((self.cx.types.substs(inputs).to_vec(), output)),
+            Kind::FnPtr(inputs, output) | Kind::UnsafeFnPtr(inputs, output) => {
+                Some((self.cx.types.substs(inputs).to_vec(), output))
+            }
             Kind::Dyn(of, parts, members, _) if self.is_callable_trait(of) => {
                 let (first, output) = {
                     let (given, mut bound) = super::super::super::ty::object_parts(
@@ -215,7 +217,10 @@ impl<'a> Infer<'_, 'a> {
         expectation: Option<Ty>,
     ) -> Result<()> {
         let reified = expectation.is_some_and(|wanted| {
-            matches!(self.cx.types.kind(self.resolve(wanted)), Kind::FnPtr(..))
+            matches!(
+                self.cx.types.kind(self.resolve(wanted)),
+                Kind::FnPtr(..) | Kind::UnsafeFnPtr(..)
+            )
         });
         match expectation.filter(|_| !closure || reified) {
             Some(wanted) if self.coerces_to(found, wanted) => {
@@ -246,7 +251,9 @@ impl<'a> Infer<'_, 'a> {
                 let args = self.cx.types.substs(substs).to_vec();
                 self.fn_types(item, &args)?
             }
-            Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret),
+            Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => {
+                (self.cx.types.substs(params).to_vec(), ret)
+            }
             Kind::Param(_) | Kind::Proj(_) => {
                 let Some(sig) = self.poly_fn_sig(ty) else {
                     return Ok(None);
@@ -257,7 +264,9 @@ impl<'a> Infer<'_, 'a> {
                 .opaque_sig(ty)
                 .map(|sig| self.cx.types.kind(sig).clone())
             {
-                Some(Kind::FnPtr(params, ret)) => (self.cx.types.substs(params).to_vec(), ret),
+                Some(Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret)) => {
+                    (self.cx.types.substs(params).to_vec(), ret)
+                }
                 _ => return Ok(None),
             },
             _ => return Ok(None),

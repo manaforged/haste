@@ -583,6 +583,7 @@ impl<'a> Infer<'_, 'a> {
             | Kind::Never
             | Kind::FnDef(..)
             | Kind::FnPtr(..)
+            | Kind::UnsafeFnPtr(..)
             | Kind::Value(_)
             | Kind::Var(_)
             | Kind::IntVar(_)

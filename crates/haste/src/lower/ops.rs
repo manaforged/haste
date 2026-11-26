@@ -43,7 +43,10 @@ impl Lower<'_, '_> {
                 ty,
                 signed: int_info(*primitive).is_some_and(|(_, signed)| signed),
             },
-            (Kind::Ref(..) | Kind::Ptr(..) | Kind::FnPtr(..), Some(Type::I64)) => Num::Int {
+            (
+                Kind::Ref(..) | Kind::Ptr(..) | Kind::FnPtr(..) | Kind::UnsafeFnPtr(..),
+                Some(Type::I64),
+            ) => Num::Int {
                 ty: Type::I64,
                 signed: false,
             },

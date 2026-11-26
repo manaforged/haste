@@ -4,17 +4,20 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::body::sig::Signature;
 use crate::body::{Body, Expr, ExprId, PatId, Ty as AstTy, TyId};
 use crate::outline::source::Source;
+use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Ty};
 
-use super::super::bind::push_source_loans_filtered;
 use super::super::calls::lifetimes::{LT_STATIC, lifetime_is_static};
-use super::super::calls::return_lt::{ast_ty_is_provably_static_in, lifetime_outlives_in_item};
-use super::super::places::{Place, PlaceStep};
+use super::super::calls::return_lt::{
+    ast_ref_dyn_requires_static, ast_ty_is_provably_static_in, lifetime_outlives_in_item,
+};
+use super::super::places::PlaceStep;
 use super::super::propagate::BorrowSource;
 use super::super::{Checker, State};
 use super::is_temp_target;
 use super::variance_ast::{
-    InvariantLifetimes, collect_ast_invariant_lifetimes, collect_ast_invariant_lifetimes_mode,
+    ContraLifetimes, InvariantLifetimes, Variance, VarianceLifetimes, collect_ast_variance,
+    collect_ast_variance_mode, collect_fn_item_variance,
 };
 
 pub(in super::super) struct VarianceMeta {
@@ -23,8 +26,11 @@ pub(in super::super) struct VarianceMeta {
     pub(in super::super) local_static_inv: Vec<bool>,
     pub(in super::super) local_static_ann: Vec<bool>,
     pub(in super::super) local_inv_lts: HashMap<u32, Vec<String>>,
+    pub(in super::super) local_contra_lts: HashMap<u32, ContraLifetimes>,
     pub(in super::super) param_inv_lts: Vec<InvariantLifetimes>,
     pub(in super::super) param_inner_inv_lts: Vec<InvariantLifetimes>,
+    pub(in super::super) param_contra_lts: Vec<ContraLifetimes>,
+    pub(in super::super) param_inner_contra_lts: Vec<ContraLifetimes>,
     pub(in super::super) interior_mut_cache: HashMap<Ty, bool>,
 }
 
@@ -36,8 +42,11 @@ impl VarianceMeta {
             local_static_inv: vec![false; n],
             local_static_ann: vec![false; n],
             local_inv_lts: HashMap::default(),
+            local_contra_lts: HashMap::default(),
             param_inv_lts: vec![InvariantLifetimes::default(); n],
             param_inner_inv_lts: vec![InvariantLifetimes::default(); n],
+            param_contra_lts: vec![ContraLifetimes::default(); n],
+            param_inner_contra_lts: vec![ContraLifetimes::default(); n],
             interior_mut_cache: HashMap::default(),
         }
     }
@@ -72,15 +81,9 @@ impl Checker<'_, '_> {
 
     fn record_param_inv_slot(&mut self, local: u32, body: &Body, src: &Source, param_ty: TyId) {
         let lty = self.local_ty(local);
-        let inv = collect_ast_invariant_lifetimes(
-            self.cx,
-            Some(self.item),
-            body,
-            src,
-            param_ty,
-            Some(lty),
-        );
-        self.variance.param_inv_lts[local as usize] = inv;
+        let var = collect_ast_variance(self.cx, Some(self.item), body, src, param_ty, Some(lty));
+        self.variance.param_inv_lts[local as usize] = var.inv;
+        self.variance.param_contra_lts[local as usize] = var.contra;
         if let AstTy::Ref {
             mutable, ty: inner, ..
         } = *body.ty(param_ty)
@@ -91,16 +94,22 @@ impl Checker<'_, '_> {
                     _ => None,
                 })
                 .flatten();
-            let inner_inv = collect_ast_invariant_lifetimes_mode(
+            let init_var = if mutable {
+                Variance::Invariant
+            } else {
+                Variance::Covariant
+            };
+            let inner_var = collect_ast_variance_mode(
                 self.cx,
                 Some(self.item),
                 body,
                 src,
                 inner,
                 inner_hint,
-                mutable,
+                init_var,
             );
-            self.variance.param_inner_inv_lts[local as usize] = inner_inv;
+            self.variance.param_inner_inv_lts[local as usize] = inner_var.inv;
+            self.variance.param_inner_contra_lts[local as usize] = inner_var.contra;
         }
     }
 
@@ -113,6 +122,19 @@ impl Checker<'_, '_> {
             &self.variance.param_inner_inv_lts
         } else {
             &self.variance.param_inv_lts
+        };
+        slice.get(local as usize)
+    }
+
+    pub(in super::super) fn param_contra_slot(
+        &self,
+        local: u32,
+        peel: bool,
+    ) -> Option<&ContraLifetimes> {
+        let slice = if peel {
+            &self.variance.param_inner_contra_lts
+        } else {
+            &self.variance.param_contra_lts
         };
         slice.get(local as usize)
     }
@@ -138,10 +160,31 @@ impl Checker<'_, '_> {
         {
             self.record_ptr_targets(local, e, state);
         }
+        let has_concrete_ann =
+            ann_ty.is_some_and(|ty_id| !matches!(*self.body.ty(ty_id), AstTy::Infer));
+        if !has_concrete_ann {
+            if let Some(e) = init
+                && bound.len() == 1
+                && let Some(&local) = bound.iter().next()
+            {
+                let src_var = self.expr_variance_lts(e);
+                if !src_var.contra.is_empty() {
+                    self.variance.local_contra_lts.insert(local, src_var.contra);
+                }
+                if src_var.inv.is_only_static()
+                    && let Some(slot) = self.variance.local_static_inv.get_mut(local as usize)
+                {
+                    *slot = true;
+                } else if !src_var.inv.named.is_empty() {
+                    self.variance.local_inv_lts.insert(local, src_var.inv.named);
+                }
+            }
+            return Ok(());
+        }
         let Some(ty_id) = ann_ty else {
             return Ok(());
         };
-        if matches!(*self.body.ty(ty_id), AstTy::Infer) || bound.len() != 1 {
+        if bound.len() != 1 {
             return Ok(());
         }
         let Some(&local) = bound.iter().next() else {
@@ -151,7 +194,7 @@ impl Checker<'_, '_> {
             return Ok(());
         };
         let lty = self.local_ty(local);
-        let inv = collect_ast_invariant_lifetimes(
+        let var = collect_ast_variance(
             self.cx,
             Some(self.item),
             self.body,
@@ -159,8 +202,12 @@ impl Checker<'_, '_> {
             ty_id,
             Some(lty),
         );
+        let inv = var.inv;
+        let contra = var.contra;
         let full_static =
             ast_ty_is_provably_static_in(self.body, self.src, Some((&sig, self.src)), ty_id);
+        let ref_dyn_static =
+            ast_ref_dyn_requires_static(self.body, self.src, Some((&sig, self.src)), ty_id);
         let mut inner_static_ref = false;
         let check_inv = if let AstTy::Ref {
             mutable,
@@ -175,15 +222,21 @@ impl Checker<'_, '_> {
                     _ => None,
                 })
                 .flatten();
-            let inner_inv = collect_ast_invariant_lifetimes_mode(
+            let init_var = if mutable {
+                Variance::Invariant
+            } else {
+                Variance::Covariant
+            };
+            let inner_inv = collect_ast_variance_mode(
                 self.cx,
                 Some(self.item),
                 self.body,
                 self.src,
                 ann_inner,
                 inner_hint,
-                mutable,
-            );
+                init_var,
+            )
+            .inv;
             inner_static_ref = inner_inv.is_only_static();
             inner_inv
         } else {
@@ -201,8 +254,15 @@ impl Checker<'_, '_> {
                 .local_inv_lts
                 .insert(local, check_inv.named.clone());
         }
+        if !contra.is_empty() {
+            self.variance.local_contra_lts.insert(local, contra.clone());
+        }
         if let Some(e) = init {
-            self.check_let_init_variance(ty_id, e, full_static, &check_inv, state)?;
+            if ref_dyn_static {
+                let sources = self.expr_borrow_sources_let(e, state);
+                self.check_ref_dyn_static_pointee(e, &sources)?;
+            }
+            self.check_let_init_variance(ty_id, e, full_static, &check_inv, &contra, state)?;
         }
         Ok(())
     }
@@ -213,8 +273,12 @@ impl Checker<'_, '_> {
         init: ExprId,
         full_static: bool,
         inv: &InvariantLifetimes,
+        contra: &ContraLifetimes,
         state: &State,
     ) -> Result<()> {
+        if !contra.is_empty() {
+            self.check_expr_contra_fit(init, contra)?;
+        }
         let unwrapped = self.unwrap_parens(init);
         if let (
             AstTy::Ref { lifetime, .. },
@@ -278,6 +342,175 @@ impl Checker<'_, '_> {
                 req_static,
                 &inv.named,
             )?;
+        } else {
+            let src_var = self.expr_variance_lts(init);
+            if !src_var.inv.is_empty() {
+                self.check_inv_against_req(Some(init), 0, &src_var.inv, req_static, &inv.named)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn target_contra_req(
+        &self,
+        target_local: u32,
+        peel_target_ref: bool,
+    ) -> ContraLifetimes {
+        if !peel_target_ref && let Some(c) = self.variance.local_contra_lts.get(&target_local) {
+            return c.clone();
+        }
+        if self.is_param_local(target_local)
+            && let Some(c) = self.param_contra_slot(target_local, peel_target_ref)
+        {
+            return c.clone();
+        }
+        ContraLifetimes::default()
+    }
+
+    pub(in super::super) fn expr_variance_lts(&mut self, expr: ExprId) -> VarianceLifetimes {
+        let unwrapped = self.unwrap_parens_and_empty_blocks(expr);
+        match *self.body.expr(unwrapped) {
+            Expr::Cast(inner, _) => self.expr_variance_lts(inner),
+            Expr::Path(_) => {
+                if let Some(local) = self.expr_plain_local(unwrapped) {
+                    let mut out = VarianceLifetimes::default();
+                    if self.is_param_local(local) {
+                        if let Some(inv) = self.param_inv_slot(local, false) {
+                            out.inv = inv.clone();
+                        }
+                        if let Some(contra) = self.param_contra_slot(local, false) {
+                            out.contra = contra.clone();
+                        }
+                    } else {
+                        out.inv.saw_static = self
+                            .variance
+                            .local_static_inv
+                            .get(local as usize)
+                            .copied()
+                            .unwrap_or(false);
+                        if let Some(lts) = self.variance.local_inv_lts.get(&local) {
+                            out.inv.named = lts.clone();
+                        }
+                        if let Some(contra) = self.variance.local_contra_lts.get(&local) {
+                            out.contra = contra.clone();
+                        }
+                    }
+                    return out;
+                }
+                if let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&unwrapped).copied() {
+                    return collect_fn_item_variance(self.cx, fn_item);
+                }
+                VarianceLifetimes::default()
+            }
+            _ => VarianceLifetimes::default(),
+        }
+    }
+
+    pub(in super::super) fn check_contra_against_req(
+        &mut self,
+        site: Option<ExprId>,
+        err_local: Option<u32>,
+        src: &ContraLifetimes,
+        dst: &ContraLifetimes,
+    ) -> Result<()> {
+        if src.is_empty() || src.is_only_hrtb() || dst.is_empty() {
+            return Ok(());
+        }
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return Ok(());
+        };
+        let reject = |this: &Self| {
+            match err_local {
+            Some(local) => this.does_not_live_long_enough(site, local),
+            None => this.borrow_err(
+                site,
+                "lifetime may not live long enough: function pointer parameter lifetime is contravariant",
+            ),
+        }
+        };
+        if src.saw_static {
+            let ok = if src.is_only_static() {
+                !dst.has_hrtb
+                    && dst
+                        .named
+                        .iter()
+                        .all(|lt| lifetime_is_static(&sig, self.src, lt))
+            } else {
+                dst.saw_static
+                    || dst
+                        .named
+                        .iter()
+                        .any(|lt| lifetime_is_static(&sig, self.src, lt))
+            };
+            if !ok {
+                return Err(reject(self));
+            }
+        }
+        for src_lt in &src.named {
+            let ok = dst.saw_static
+                || dst.named.iter().any(|dst_lt| {
+                    lifetime_outlives_in_item(self.cx, self.item, &sig, self.src, dst_lt, src_lt)
+                });
+            if !ok {
+                return Err(reject(self));
+            }
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn check_expr_contra_fit(
+        &mut self,
+        expr: ExprId,
+        dst: &ContraLifetimes,
+    ) -> Result<()> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let src_var = self.expr_variance_lts(expr);
+        let err_local = self.expr_plain_local(self.unwrap_parens_and_empty_blocks(expr));
+        self.check_contra_against_req(Some(expr), err_local, &src_var.contra, dst)
+    }
+
+    pub(in super::super) fn check_assign_variance(
+        &mut self,
+        lhs: ExprId,
+        rhs: ExprId,
+        state: &State,
+    ) -> Result<()> {
+        let Some(p) = self.root_place(lhs) else {
+            return Ok(());
+        };
+        let has_field = p
+            .steps
+            .iter()
+            .any(|st| matches!(st, PlaceStep::Field(..) | PlaceStep::SliceElem { .. }));
+        if has_field {
+            return Ok(());
+        }
+        let dst_contra = self.target_contra_req(p.local, p.through_ref);
+        if !dst_contra.is_empty() {
+            self.check_expr_contra_fit(rhs, &dst_contra)?;
+        }
+        if p.through_ref {
+            let targets: Vec<u32> = state
+                .loans
+                .iter()
+                .filter(|l| l.holder == Some(p.local) && l.mutable)
+                .map(|l| l.target)
+                .collect();
+            for t in targets {
+                let t_contra = self.target_contra_req(t, false);
+                if !t_contra.is_empty() {
+                    self.check_expr_contra_fit(rhs, &t_contra)?;
+                }
+            }
+        } else if p.steps.is_empty() && dst_contra.is_empty() && !self.is_param_local(p.local) {
+            let src_var = self.expr_variance_lts(rhs);
+            if !src_var.contra.is_empty() {
+                self.variance
+                    .local_contra_lts
+                    .insert(p.local, src_var.contra);
+            }
         }
         Ok(())
     }
@@ -461,129 +694,6 @@ impl Checker<'_, '_> {
                 } else if !self.param_satisfies_lt_mode(s.target, &req_refs, peel, false) {
                     return Err(self.does_not_live_long_enough(site, s.target));
                 }
-            }
-        }
-        Ok(())
-    }
-
-    pub(in super::super) fn check_target_write_escape(
-        &mut self,
-        p: &Place,
-        targets: &[u32],
-        sources: &[BorrowSource],
-        state: &mut State,
-    ) -> Result<()> {
-        let param_target =
-            self.is_param_local(p.local) || targets.iter().any(|&t| self.is_param_local(t));
-        self.check_sources_against_targets(
-            p.through_ref || p.through_deref,
-            param_target,
-            self.scope_depth.get(p.local as usize).copied().unwrap_or(0) < self.closure_depth,
-            sources,
-        )?;
-        let has_field = p
-            .steps
-            .iter()
-            .any(|st| matches!(st, PlaceStep::Field(..) | PlaceStep::SliceElem { .. }));
-        if !p.through_ref {
-            return self.check_sources_fit_target(
-                self.current_expr,
-                p.local,
-                false,
-                has_field,
-                sources,
-            );
-        }
-        if self.is_param_local(p.local) {
-            self.check_sources_fit_target(self.current_expr, p.local, true, has_field, sources)?;
-        }
-        self.apply_write_to_targets(Some(p.local), has_field, targets, sources, state)
-    }
-
-    pub(in super::super) fn check_ptr_deref_write(
-        &mut self,
-        targets: &[u32],
-        sources: &[BorrowSource],
-        state: &mut State,
-    ) -> Result<()> {
-        let param_target = targets.iter().any(|&t| self.is_param_local(t));
-        let closure_target = self.closure_depth > 0
-            && targets.iter().any(|&t| {
-                self.scope_depth.get(t as usize).copied().unwrap_or(0) < self.closure_depth
-            });
-        self.check_sources_against_targets(true, param_target, closure_target, sources)?;
-        self.apply_write_to_targets(None, false, targets, sources, state)
-    }
-
-    fn check_sources_against_targets(
-        &mut self,
-        deref_write: bool,
-        param_target: bool,
-        closure_target: bool,
-        sources: &[BorrowSource],
-    ) -> Result<()> {
-        if deref_write && param_target {
-            for s in sources {
-                let allowed_ref = self.is_ref_ty(self.local_ty(s.target))
-                    && (s.through_ref || self.is_closure_param(s.target));
-                if is_temp_target(s.target).is_some()
-                    || (!self.from_caller(s.target, s.through_ref) && !allowed_ref)
-                {
-                    return Err(self.does_not_live_long_enough(None, s.target));
-                }
-            }
-        }
-        if self.closure_depth > 0 && closure_target {
-            for s in sources {
-                let is_cparam = self.is_closure_param(s.target);
-                let cparam_borrow = is_cparam && self.ty_holds_borrow(self.local_ty(s.target));
-                let allowed_ref =
-                    self.is_ref_ty(self.local_ty(s.target)) && (s.through_ref || is_cparam);
-                if is_temp_target(s.target).is_some()
-                    || (!s.through_ref
-                        && !self.is_ref_ty(self.local_ty(s.target))
-                        && self.closure_by_val_caps.contains(&s.target))
-                    || (!self.from_caller(s.target, s.through_ref)
-                        && !allowed_ref
-                        && !cparam_borrow
-                        && self
-                            .scope_depth
-                            .get(s.target as usize)
-                            .copied()
-                            .unwrap_or(0)
-                            >= self.closure_depth)
-                {
-                    return Err(self.borrow_err(None, "borrowed data escapes outside of closure"));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_write_to_targets(
-        &mut self,
-        root_local: Option<u32>,
-        root_has_field: bool,
-        targets: &[u32],
-        sources: &[BorrowSource],
-        state: &mut State,
-    ) -> Result<()> {
-        for &holder in targets {
-            let is_root = root_local == Some(holder);
-            let peel = is_root && self.is_ref_ty(self.local_ty(holder));
-            let holder_field = if is_root { root_has_field } else { false };
-            self.check_sources_fit_target(self.current_expr, holder, peel, holder_field, sources)?;
-            state.set_tuple_sources(holder, None);
-            if self.ty_holds_borrow(self.local_ty(holder)) {
-                push_source_loans_filtered(
-                    &mut state.loans,
-                    Some(holder),
-                    sources,
-                    false,
-                    self.current_expr,
-                    |s| s.target != holder,
-                    |s| s.mutable,
-                );
             }
         }
         Ok(())

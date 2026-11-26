@@ -19,7 +19,11 @@ pub fn cloned_tuple(cx: &Context<'_>, ty: Ty) -> Option<Ty> {
 pub fn compiler_clone(cx: &Context<'_>, ty: Ty) -> bool {
     matches!(
         cx.types.kind(ty),
-        Kind::Tuple(_) | Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)
+        Kind::Tuple(_)
+            | Kind::Closure(..)
+            | Kind::FnDef(..)
+            | Kind::FnPtr(..)
+            | Kind::UnsafeFnPtr(..)
     )
 }
 
@@ -56,7 +60,10 @@ impl Infer<'_, '_> {
         match self.cx.lang(of) {
             Some("clone") => compiler_clone(self.cx, self.resolve(ty)),
             Some("future_trait") => self.coroutine_output(ty).is_some(),
-            Some("fn_ptr_trait") => matches!(self.cx.types.kind(self.resolve(ty)), Kind::FnPtr(..)),
+            Some("fn_ptr_trait") => matches!(
+                self.cx.types.kind(self.resolve(ty)),
+                Kind::FnPtr(..) | Kind::UnsafeFnPtr(..)
+            ),
             _ => false,
         }
     }

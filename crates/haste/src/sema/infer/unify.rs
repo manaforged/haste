@@ -340,7 +340,8 @@ impl Infer<'_, '_> {
             {
                 Action::Substs(*x, *y)
             }
-            (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => Action::FnPtr(*x, *y, *r, *s),
+            (Kind::FnPtr(x, r), Kind::FnPtr(y, s))
+            | (Kind::UnsafeFnPtr(x, r), Kind::UnsafeFnPtr(y, s)) => Action::FnPtr(*x, *y, *r, *s),
             _ => return Err(Clash { a, b, cycle: false }),
         };
         let keep_cycle = |err: Clash| {
@@ -413,6 +414,9 @@ impl Infer<'_, '_> {
                 Some((a, b))
             }
             (&Kind::Ref(from, a), &Kind::Ptr(to, b)) if from == to => Some((a, b)),
+            (&Kind::FnPtr(p, r), &Kind::UnsafeFnPtr(..)) => {
+                Some((self.cx.types.intern(Kind::UnsafeFnPtr(p, r)), expected))
+            }
             _ => None,
         }
     }

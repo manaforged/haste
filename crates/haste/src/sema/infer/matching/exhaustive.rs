@@ -40,6 +40,35 @@ impl Infer<'_, '_> {
         for (scrutinee, scrutinee_ty, arms) in matches {
             self.check_match_exhaustive(scrutinee, scrutinee_ty, arms)?;
         }
+        let let_pats = std::mem::take(&mut self.let_pats);
+        for (pat, pat_ty) in let_pats {
+            self.check_let_irrefutable(pat, pat_ty)?;
+        }
+        Ok(())
+    }
+
+    fn check_let_irrefutable(&mut self, pat: PatId, pat_ty: Ty) -> Result<()> {
+        if self.cx.outline.crates[self.home.krate as usize].env.fixed {
+            return Ok(());
+        }
+        let ty = self.peel_match_ref(pat_ty);
+        if matches!(
+            *self.cx.types.kind(ty),
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Param(_) | Kind::Proj(_)
+        ) {
+            return Ok(());
+        }
+        let rows = vec![vec![self.lower_match_pat(pat, ty)]];
+        let mut budget = MAX_BUDGET;
+        if let Some(mut witness) = self.find_witness(&rows, &[ty], &mut budget) {
+            let missing = witness.pop().unwrap_or_else(|| "_".to_owned());
+            return Err(self.diag_pat(
+                DiagnosticKind::Exhaustive,
+                pat,
+                format!("refutable pattern in local binding: `{missing}` not covered"),
+                format!("pattern `{missing}` not covered"),
+            ));
+        }
         Ok(())
     }
 

@@ -522,7 +522,7 @@ impl<'a> Infer<'_, 'a> {
                 item.hash(hasher);
                 self.hash_list(self.cx.types.substs(*items), hasher, seen);
             }
-            Kind::FnPtr(params, ret) => {
+            Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => {
                 self.hash_list(self.cx.types.substs(*params), hasher, seen);
                 self.hash_canonical(*ret, hasher, seen);
             }

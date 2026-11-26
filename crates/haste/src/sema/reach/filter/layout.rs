@@ -151,6 +151,7 @@ fn ty_is_sized(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: &mut u64)
         | Kind::Ptr(..)
         | Kind::FnDef(..)
         | Kind::FnPtr(..)
+        | Kind::UnsafeFnPtr(..)
         | Kind::Never
         | Kind::Array(..) => true,
         Kind::Pat(inner, ..) => ty_is_sized(cx, item, inner, req_sized),
@@ -186,6 +187,7 @@ pub(super) fn concrete_ty_is_sized(cx: &mut Context<'_>, ty: Ty) -> bool {
         | Kind::Ptr(..)
         | Kind::FnDef(..)
         | Kind::FnPtr(..)
+        | Kind::UnsafeFnPtr(..)
         | Kind::Array(..)
         | Kind::Closure(..) => true,
         Kind::Pat(inner, ..) => concrete_ty_is_sized(cx, inner),
@@ -207,6 +209,7 @@ fn layout_ty_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty, req_sized: 
         | Kind::Ptr(..)
         | Kind::FnDef(..)
         | Kind::FnPtr(..)
+        | Kind::UnsafeFnPtr(..)
         | Kind::Never => true,
         Kind::Param(idx) => require_param_sized(cx, item, idx, req_sized),
         Kind::Slice(elem) => sized_layout_infallible(cx, item, elem, req_sized),

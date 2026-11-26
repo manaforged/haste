@@ -138,6 +138,13 @@ impl Infer<'_, '_> {
                 self.infer_call_args(args, &params, None)?;
                 Ok(Some(ret))
             }
+            Kind::UnsafeFnPtr(params, ret) => {
+                self.check_unsafe_fn_ptr_call(step.0)?;
+                self.record_call_steps(step, false)?;
+                let params = self.cx.types.substs(params).to_vec();
+                self.infer_call_args(args, &params, None)?;
+                Ok(Some(ret))
+            }
             Kind::Param(_) | Kind::Proj(_) if self.poly.is_some() => {
                 if let Some((method, ..)) = self.poly_callable_target(ty) {
                     self.record_call_steps(
@@ -642,6 +649,18 @@ impl Infer<'_, '_> {
                 .unwrap_or_else(|| u32::from(self.sig.is_unsafe))
                 > 0
         })
+    }
+
+    pub(super) fn check_unsafe_fn_ptr_call(&self, expr: ExprId) -> Result<()> {
+        if self.cx.outline.is_sysroot(self.home.krate) || self.in_unsafe_ctx() {
+            return Ok(());
+        }
+        Err(self.diag_expr(
+            crate::diag::DiagnosticKind::Unsafe,
+            Some(expr),
+            "call to unsafe function is unsafe and requires unsafe function or block",
+            "call to unsafe function",
+        ))
     }
 
     pub(super) fn check_union_field(&self, expr: ExprId, item: ItemRef) -> Result<()> {

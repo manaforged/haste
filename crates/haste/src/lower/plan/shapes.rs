@@ -223,7 +223,8 @@ pub(super) fn hash_untuple_shape(
             if let Some(boxed) = cx.boxed(inner) {
                 inner = boxed;
             }
-            if let Kind::FnPtr(params, ret) = *cx.types.kind(inner) {
+            if let Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) = *cx.types.kind(inner)
+            {
                 let params = cx.types.substs(params).to_vec();
                 let sig = signature_of(cx, Some(ret), params)?;
                 hash_sig(mix, &sig);

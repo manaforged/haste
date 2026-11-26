@@ -102,13 +102,32 @@ impl Infer<'_, '_> {
                 }
             }
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
+                if self.fn_item_is_unsafe(item) {
+                    return Err(self.diag_expr(
+                        crate::diag::DiagnosticKind::Type,
+                        None,
+                        format!(
+                            "mismatched types: cannot coerce unsafe function `{}` to safe function pointer `{}`",
+                            self.cx.name(item),
+                            self.show(expected),
+                        ),
+                        "expected safe function pointer, found unsafe function",
+                    ));
+                }
                 let args = self.cx.types.substs(substs).to_vec();
                 let wanted = self.cx.types.substs(params).to_vec();
                 let have = self.fn_types(item, &args)?;
                 self.unify_fn(have, (wanted, ret))?;
                 Ok(Some(Coercion::Reify(Res::Fn(item, substs))))
             }
-            (Kind::Closure(..), Kind::FnPtr(params, ret)) => {
+            (Kind::FnDef(item, substs), Kind::UnsafeFnPtr(params, ret)) => {
+                let args = self.cx.types.substs(substs).to_vec();
+                let wanted = self.cx.types.substs(params).to_vec();
+                let have = self.fn_types(item, &args)?;
+                self.unify_fn(have, (wanted, ret))?;
+                Ok(Some(Coercion::Reify(Res::Fn(item, substs))))
+            }
+            (Kind::Closure(..), Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret)) => {
                 let wanted = self.cx.types.substs(params).to_vec();
                 self.reify_closure(found, (wanted, ret))
             }
@@ -495,10 +514,25 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn fn_def_ptr(&mut self, item: ItemRef, substs: super::super::substs::Substs) -> Result<Ty> {
+    fn fn_item_is_unsafe(&mut self, item: ItemRef) -> bool {
+        let sig = self.cx.signature(item).ok();
+        sig.as_deref().is_some_and(|s| s.is_unsafe)
+            || (self.cx.foreign(item) && !sig.as_deref().is_some_and(|s| s.is_safe))
+    }
+
+    fn fn_def_ptr(
+        &mut self,
+        item: ItemRef,
+        substs: super::super::substs::Substs,
+        force_unsafe: bool,
+    ) -> Result<Ty> {
         let slice = self.cx.types.substs(substs).to_vec();
         let (params, ret) = self.fn_types(item, &slice)?;
-        Ok(self.cx.types.fn_ptr(&params, ret))
+        Ok(if force_unsafe || self.fn_item_is_unsafe(item) {
+            self.cx.types.unsafe_fn_ptr(&params, ret)
+        } else {
+            self.cx.types.fn_ptr(&params, ret)
+        })
     }
 
     fn non_cap_closure_sig(&mut self, ty: Ty) -> Result<Option<(Vec<Ty>, Ty)>> {
@@ -511,22 +545,29 @@ impl Infer<'_, '_> {
         let (a, b) = (self.resolve(a), self.resolve(b));
         let (a_kind, b_kind) = (self.cx.types.kind(a).clone(), self.cx.types.kind(b).clone());
         match (&a_kind, &b_kind) {
-            (Kind::FnDef(..), Kind::FnPtr(..)) => Ok(Some(b)),
-            (Kind::FnPtr(..), Kind::FnDef(..)) => Ok(Some(a)),
-            (Kind::Closure(..), Kind::FnPtr(..)) => Ok(self.non_cap_closure_sig(a)?.map(|_| b)),
-            (Kind::FnPtr(..), Kind::Closure(..)) => Ok(self.non_cap_closure_sig(b)?.map(|_| a)),
-            (Kind::FnDef(item, substs), Kind::FnDef(..)) if a_kind != b_kind => {
-                self.fn_def_ptr(*item, *substs).map(Some)
+            (Kind::FnPtr(..), Kind::UnsafeFnPtr(..)) => Ok(Some(b)),
+            (Kind::UnsafeFnPtr(..), Kind::FnPtr(..)) => Ok(Some(a)),
+            (Kind::FnDef(..), Kind::FnPtr(..) | Kind::UnsafeFnPtr(..)) => Ok(Some(b)),
+            (Kind::FnPtr(..) | Kind::UnsafeFnPtr(..), Kind::FnDef(..)) => Ok(Some(a)),
+            (Kind::Closure(..), Kind::FnPtr(..) | Kind::UnsafeFnPtr(..)) => {
+                Ok(self.non_cap_closure_sig(a)?.map(|_| b))
+            }
+            (Kind::FnPtr(..) | Kind::UnsafeFnPtr(..), Kind::Closure(..)) => {
+                Ok(self.non_cap_closure_sig(b)?.map(|_| a))
+            }
+            (Kind::FnDef(item, substs), Kind::FnDef(other, _)) if a_kind != b_kind => {
+                let is_unsafe = self.fn_item_is_unsafe(*other);
+                self.fn_def_ptr(*item, *substs, is_unsafe).map(Some)
             }
             (Kind::FnDef(item, substs), Kind::Closure(..)) => Ok(self
                 .non_cap_closure_sig(b)?
                 .is_some()
-                .then(|| self.fn_def_ptr(*item, *substs))
+                .then(|| self.fn_def_ptr(*item, *substs, false))
                 .transpose()?),
             (Kind::Closure(..), Kind::FnDef(item, substs)) => Ok(self
                 .non_cap_closure_sig(a)?
                 .is_some()
-                .then(|| self.fn_def_ptr(*item, *substs))
+                .then(|| self.fn_def_ptr(*item, *substs, false))
                 .transpose()?),
             (Kind::Closure(..), Kind::Closure(..)) if a_kind != b_kind => {
                 let (Some((in_a, out_a)), Some((in_b, out_b))) =
@@ -643,6 +684,10 @@ impl Infer<'_, '_> {
                 | (Kind::Array(..), Kind::Array(..))
                 | (Kind::Slice(_), Kind::Slice(_))
                 | (Kind::FnPtr(..), Kind::FnPtr(..))
+                | (
+                    Kind::UnsafeFnPtr(..),
+                    Kind::UnsafeFnPtr(..) | Kind::FnPtr(..)
+                )
                 | (Kind::Never, _)
                 | (
                     Kind::Var(_),
@@ -651,11 +696,15 @@ impl Infer<'_, '_> {
                         | Kind::Array(..)
                         | Kind::Slice(_)
                         | Kind::FnPtr(..)
+                        | Kind::UnsafeFnPtr(..)
                 )
         );
         if structural {
             self.unify(f, t)?;
             return self.settle_pending();
+        }
+        if matches!((fk, tk), (Kind::FnPtr(..), Kind::UnsafeFnPtr(..))) {
+            return self.coerce(f, t);
         }
         if let (Kind::Ref(m1, _), Kind::Ref(m2, _)) = (fk, tk)
             && (*m1 == *m2 || *m2 == Mut::Not)

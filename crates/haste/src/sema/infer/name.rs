@@ -21,6 +21,11 @@ pub fn type_name(cx: &mut Context<'_>, ty: Ty) -> String {
             names(cx, cx.types.substs(params).to_vec()).join(", "),
             returns(cx, ret)
         ),
+        Kind::UnsafeFnPtr(params, ret) => format!(
+            "unsafe fn({}){}",
+            names(cx, cx.types.substs(params).to_vec()).join(", "),
+            returns(cx, ret)
+        ),
         Kind::Closure(item, ..) => format!("{}::{{{{closure}}}}", def_path(cx, item)),
         Kind::Dyn(of, args, members, autos) => dyn_name(
             cx,

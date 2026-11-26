@@ -50,18 +50,18 @@ pub fn rest_split(body: &Body, list: List) -> Result<(Vec<PatId>, Option<usize>)
 impl Infer<'_, '_> {
     /// Checks pattern `pat` against a value of type `ty` and binds its names.
     pub fn bind_pat(&mut self, pat: PatId, ty: Ty) -> Result<()> {
-        self.pat(pat, ty, Mode::Value)
+        self.pat(pat, ty, Mode::Value, None)
     }
 
-    fn pat(&mut self, pat: PatId, ty: Ty, mode: Mode) -> Result<()> {
+    fn pat(&mut self, pat: PatId, ty: Ty, mode: Mode, pack: Option<u64>) -> Result<()> {
         let prev = self.current_pat.replace(pat);
-        let res = self.pat_inner(pat, ty, mode);
+        let res = self.pat_inner(pat, ty, mode, pack);
         self.current_pat = prev;
         res
     }
 
-    fn pat_inner(&mut self, pat: PatId, ty: Ty, mode: Mode) -> Result<()> {
-        let (ty, mode) = self.peel(pat, ty, mode);
+    fn pat_inner(&mut self, pat: PatId, ty: Ty, mode: Mode, pack: Option<u64>) -> Result<()> {
+        let (ty, mode, pack) = self.peel(pat, ty, mode, pack);
         self.out.pats.insert(pat, ty);
         match *self.body.pat(pat) {
             Pat::Bind {
@@ -69,24 +69,26 @@ impl Infer<'_, '_> {
                 mutable,
                 by_ref,
                 sub,
-            } => self.bind_name(pat, (name, mutable, by_ref), sub, (ty, mode)),
+            } => self.bind_name(pat, (name, mutable, by_ref), sub, (ty, mode, pack)),
             Pat::Wild | Pat::Rest => Ok(()),
-            Pat::Paren(inner) => self.pat(inner, ty, mode),
+            Pat::Paren(inner) => self.pat(inner, ty, mode, pack),
             Pat::Lit(expr) => self.value_pat(expr, ty),
             Pat::Range { from, to, .. } => from
                 .into_iter()
                 .chain(to)
                 .try_for_each(|end| self.value_pat(end, ty)),
-            Pat::Tuple(list) => self.tuple_pat(pat, list, ty, mode),
-            Pat::Slice(list) => self.slice_pat(pat, list, ty, mode),
+            Pat::Tuple(list) => self.tuple_pat(pat, list, ty, mode, pack),
+            Pat::Slice(list) => self.slice_pat(pat, list, ty, mode, pack),
             Pat::Ref {
                 mutable,
                 pat: inner,
             } => self.ref_pat(inner, mutable, ty),
             Pat::Path(path) => self.path_pat(pat, path, (ty, mode)),
-            Pat::TupleStruct(path, list) => self.variant_pat(pat, path, ty, (list, mode)),
-            Pat::Struct { path, fields, .. } => self.struct_pat(pat, path, ty, (fields, mode)),
-            Pat::Or(list) => self.or_pat(pat, list, ty, mode),
+            Pat::TupleStruct(path, list) => self.variant_pat(pat, path, ty, (list, mode, pack)),
+            Pat::Struct { path, fields, .. } => {
+                self.struct_pat(pat, path, ty, (fields, mode, pack))
+            }
+            Pat::Or(list) => self.or_pat(pat, list, ty, mode, pack),
             ref other => Err(self.diag_pat(
                 DiagnosticKind::Type,
                 pat,
@@ -101,7 +103,7 @@ impl Infer<'_, '_> {
         pat: PatId,
         (name, mutable, by_ref): (u32, bool, bool),
         sub: Option<PatId>,
-        (ty, mode): (Ty, Mode),
+        (ty, mode, pack): (Ty, Mode, Option<u64>),
     ) -> Result<()> {
         self.check_ident_2024(name)?;
         if !mutable
@@ -118,6 +120,9 @@ impl Infer<'_, '_> {
             (false, Mode::Ref(mutability)) => Some(mutability),
             (false, Mode::Value) => None,
         };
+        if let (Some(_), Some(pack_bytes)) = (reference, pack) {
+            self.check_packed_pat_ref(pat, ty, pack_bytes)?;
+        }
         let local_ty = match reference {
             Some(mutability) => {
                 self.out.ref_binds.insert(pat, mutability);
@@ -128,7 +133,30 @@ impl Infer<'_, '_> {
         let local = self.new_local(local_ty);
         self.out.binds.insert(pat, local);
         self.scope_name(name, local);
-        sub.map_or(Ok(()), |sub| self.pat(sub, ty, mode))
+        sub.map_or(Ok(()), |sub| self.pat(sub, ty, mode, pack))
+    }
+
+    fn combine_pack(&self, outer: Option<u64>, item: crate::names::ItemRef) -> Option<u64> {
+        match (outer, self.cx.repr(item).pack.map(|a| a.bytes())) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn check_packed_pat_ref(&mut self, pat: PatId, ty: Ty, pack_bytes: u64) -> Result<()> {
+        let resolved = self.resolve(ty);
+        let (has_vars, has_params) = (self.has_vars(resolved), self.has_params(resolved));
+        if has_params && self.poly.is_some() {
+            self.poly_fallback();
+        }
+        let field_align = (!has_vars && !has_params)
+            .then(|| self.substitute(resolved))
+            .and_then(|sub| self.cx.layout(sub).ok().map(|l| l.align.bytes()));
+        if field_align.is_some_and(|align| align > pack_bytes) {
+            let msg = "reference to packed field is unaligned";
+            return Err(self.diag_pat(DiagnosticKind::Type, pat, msg, msg));
+        }
+        Ok(())
     }
 
     /// Puts `local` in scope under the name at token `name`, without its `r#` prefix.
@@ -149,10 +177,16 @@ impl Infer<'_, '_> {
             pointee,
         ));
         self.unify(ty, reference)?;
-        self.pat(inner, pointee, Mode::Value)
+        self.pat(inner, pointee, Mode::Value, None)
     }
 
-    fn peel(&mut self, pat: PatId, ty: Ty, mode: Mode) -> (Ty, Mode) {
+    fn peel(
+        &mut self,
+        pat: PatId,
+        ty: Ty,
+        mode: Mode,
+        pack: Option<u64>,
+    ) -> (Ty, Mode, Option<u64>) {
         let keeps = match *self.body.pat(pat) {
             Pat::Bind { .. }
             | Pat::Path(_)
@@ -168,12 +202,13 @@ impl Infer<'_, '_> {
             _ => false,
         };
         if keeps {
-            return (ty, mode);
+            return (ty, mode, pack);
         }
-        self.peel_refs(pat, ty, mode)
+        let (ty, mode, derefs) = self.peel_refs(pat, ty, mode);
+        (ty, mode, if derefs > 0 { None } else { pack })
     }
 
-    fn peel_refs(&mut self, pat: PatId, mut ty: Ty, mut mode: Mode) -> (Ty, Mode) {
+    fn peel_refs(&mut self, pat: PatId, mut ty: Ty, mut mode: Mode) -> (Ty, Mode, u32) {
         let mut derefs = 0;
         while let Kind::Ref(mutability, inner) = *self.cx.types.kind(self.resolve(ty)) {
             mode = match mode {
@@ -186,10 +221,17 @@ impl Infer<'_, '_> {
         if derefs > 0 {
             self.out.pat_derefs.insert(pat, derefs);
         }
-        (self.resolve(ty), mode)
+        (self.resolve(ty), mode, derefs)
     }
 
-    fn tuple_pat(&mut self, pat: PatId, list: List, ty: Ty, mode: Mode) -> Result<()> {
+    fn tuple_pat(
+        &mut self,
+        pat: PatId,
+        list: List,
+        ty: Ty,
+        mode: Mode,
+        pack: Option<u64>,
+    ) -> Result<()> {
         let (pats, rest) = rest_split(self.body, list)?;
         let items = match (self.cx.types.kind(ty).clone(), rest) {
             (Kind::Tuple(items), _) => self.cx.types.substs(items).to_vec(),
@@ -208,10 +250,17 @@ impl Infer<'_, '_> {
                 ));
             }
         };
-        self.positional(pat, &pats, rest, &items, mode)
+        self.positional(pat, &pats, rest, &items, (mode, pack))
     }
 
-    fn slice_pat(&mut self, pat: PatId, list: List, ty: Ty, mode: Mode) -> Result<()> {
+    fn slice_pat(
+        &mut self,
+        pat: PatId,
+        list: List,
+        ty: Ty,
+        mode: Mode,
+        pack: Option<u64>,
+    ) -> Result<()> {
         let (pats, rest) = rest_split(self.body, list)?;
         let given = pats.len() - usize::from(rest.is_some());
         let element = self.slice_element(pat, ty, given, rest.is_some())?;
@@ -221,7 +270,7 @@ impl Infer<'_, '_> {
             } else {
                 element
             };
-            self.pat(pat, item, mode)?;
+            self.pat(pat, item, mode, pack)?;
         }
         Ok(())
     }
@@ -284,7 +333,7 @@ impl Infer<'_, '_> {
         pats: &[PatId],
         rest: Option<usize>,
         items: &[Ty],
-        mode: Mode,
+        (mode, pack): (Mode, Option<u64>),
     ) -> Result<()> {
         let given = pats.len() - usize::from(rest.is_some());
         if given > items.len() || (rest.is_none() && given != items.len()) {
@@ -299,7 +348,7 @@ impl Infer<'_, '_> {
             let Some(index) = position(at, pats.len(), rest, items.len()) else {
                 continue;
             };
-            self.pat(pat, items[index], mode)?;
+            self.pat(pat, items[index], mode, pack)?;
         }
         Ok(())
     }
@@ -343,7 +392,7 @@ impl Infer<'_, '_> {
         pat: PatId,
         path: PathId,
         ty: Ty,
-        (list, mode): (List, Mode),
+        (list, mode, pack): (List, Mode, Option<u64>),
     ) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, true)? else {
@@ -369,7 +418,8 @@ impl Infer<'_, '_> {
                 self.check_field_visible(item, index as u32, None, pat_tok, &index.to_string())?;
             }
         }
-        self.positional(pat, &pats, rest, &fields, mode)
+        let field_pack = self.combine_pack(pack, item);
+        self.positional(pat, &pats, rest, &fields, (mode, field_pack))
     }
 
     fn struct_pat(
@@ -377,7 +427,7 @@ impl Infer<'_, '_> {
         pat: PatId,
         path: PathId,
         ty: Ty,
-        (list, mode): (List, Mode),
+        (list, mode, pack): (List, Mode, Option<u64>),
     ) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, false)? else {
@@ -393,6 +443,7 @@ impl Infer<'_, '_> {
         let slice = self.cx.types.substs(args).to_vec();
         let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
         let is_union = self.cx.item(item).1.kind == ItemKind::Union;
+        let field_pack = self.combine_pack(pack, item);
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         for &at in body.list(list) {
             let field = body.field_pats[at as usize];
@@ -411,16 +462,23 @@ impl Infer<'_, '_> {
                 ));
             }
             self.out.field_pats.insert(field.pat, index);
-            self.pat(field.pat, fields[index as usize], mode)?;
+            self.pat(field.pat, fields[index as usize], mode, field_pack)?;
         }
         Ok(())
     }
 
-    fn or_pat(&mut self, pat: PatId, list: List, ty: Ty, mode: Mode) -> Result<()> {
+    fn or_pat(
+        &mut self,
+        pat: PatId,
+        list: List,
+        ty: Ty,
+        mode: Mode,
+        pack: Option<u64>,
+    ) -> Result<()> {
         let depth = self.scopes.len();
         let mut first: Option<Vec<(super::Name, u32)>> = None;
         for &alt in self.body.list(list) {
-            self.pat(PatId(alt), ty, mode)?;
+            self.pat(PatId(alt), ty, mode, pack)?;
             let bound = self.scopes.split_off(depth);
             match &first {
                 None => first = Some(bound),

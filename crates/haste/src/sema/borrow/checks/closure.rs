@@ -102,6 +102,21 @@ impl Checker<'_, '_> {
                 continue;
             };
             let arg = ExprId(id);
+            let param_var = super::collect_ast_variance(
+                self.cx,
+                fn_item,
+                &sig.body,
+                sig_src,
+                param_ty,
+                Some(self.expr_ty(arg)),
+            );
+            if param_var.contra.has_hrtb {
+                let hrtb_req = super::ContraLifetimes {
+                    has_hrtb: true,
+                    ..Default::default()
+                };
+                self.check_expr_contra_fit(arg, &hrtb_req)?;
+            }
             let ref_static = matches!(*sig.body.ty(param_ty), AstTy::Ref { lifetime: Some(lt), .. } if sig_src.text(lt) == "'static");
             let bounds = self.param_bound_reqs(sig, sig_src, param_ty);
             if bounds.req_static || ref_static {

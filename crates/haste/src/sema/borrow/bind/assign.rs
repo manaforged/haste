@@ -12,22 +12,26 @@ impl Checker<'_, '_> {
     pub(in super::super) fn assign_place(
         &mut self,
         lhs: ExprId,
+        rhs: Option<ExprId>,
         sources: &[BorrowSource],
         state: &mut State,
         outer_live: &HashSet<u32>,
         depth: u32,
     ) -> Result<()> {
+        if let Some(rhs_expr) = rhs {
+            self.check_assign_variance(lhs, rhs_expr, state)?;
+        }
         if self.place_behind_shared_ref(lhs) {
             return Err(self.borrow_err(Some(lhs), "cannot assign to data in a `&` reference"));
         }
         self.check_static_mut(lhs, false)?;
         match *self.body.expr(lhs) {
             Expr::Paren(inner) => {
-                return self.assign_place(inner, sources, state, outer_live, depth);
+                return self.assign_place(inner, None, sources, state, outer_live, depth);
             }
             Expr::Tuple(list) | Expr::Array(list) => {
                 for elem in self.body.list(list).to_vec() {
-                    self.assign_place(ExprId(elem), &[], state, outer_live, depth)?;
+                    self.assign_place(ExprId(elem), None, &[], state, outer_live, depth)?;
                 }
                 return Ok(());
             }
@@ -35,6 +39,7 @@ impl Checker<'_, '_> {
                 for f in self.body.list(fields).to_vec() {
                     self.assign_place(
                         self.body.fields[f as usize].value,
+                        None,
                         &[],
                         state,
                         outer_live,

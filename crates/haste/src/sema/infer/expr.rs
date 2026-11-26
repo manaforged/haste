@@ -31,12 +31,20 @@ impl Infer<'_, '_> {
             self.diverges = true;
         }
         self.out.exprs[expr.0 as usize] = ty;
+        if self.root_is_user()
+            && let Kind::Adt(item, args) = *self.cx.types.kind(self.resolve(ty))
+        {
+            self.check_adt_bounds(Some(expr), item, args)?;
+        }
         if let Some(item) = root_static {
             let static_ty = expected.map(|t| self.resolve(t)).unwrap_or(ty);
             self.check_static_sync(expr, item, static_ty)?;
         }
         if cycle_frame.is_some() {
             self.check_const_deps(expr)?;
+        }
+        if is_root && self.root_is_user() {
+            self.check_body_user_types()?;
         }
         Ok(ty)
     }
@@ -110,7 +118,7 @@ impl Infer<'_, '_> {
     fn cast_hint(&self, inner: ExprId, target: Ty) -> Result<Option<Ty>> {
         let target = self.resolve(target);
         let kind = self.cx.types.kind(target);
-        if matches!(kind, Kind::FnPtr(..)) {
+        if matches!(kind, Kind::FnPtr(..) | Kind::UnsafeFnPtr(..)) {
             return Ok(Some(target));
         }
         let (prim, hint_ty) = match *kind {
@@ -191,6 +199,7 @@ impl Infer<'_, '_> {
         }
         if !raw {
             self.check_packed_ref(inner, ty)?;
+            self.check_static_mut_ref(inner, mutable)?;
         }
         let mutability = if mutable { Mut::Mut } else { Mut::Not };
         let kind = if raw {
@@ -299,6 +308,16 @@ impl Infer<'_, '_> {
                 stmts,
                 tail,
                 label: None,
+                kind: BlockKind::Const,
+            } => {
+                let ty = self.block(stmts, tail, expected)?;
+                self.check_inline_const(expr, ty)?;
+                Ok(ty)
+            }
+            Expr::Block {
+                stmts,
+                tail,
+                label: None,
                 ..
             } => self.block(stmts, tail, expected),
             Expr::Block {
@@ -395,6 +414,10 @@ impl Infer<'_, '_> {
                 )
             }
             Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret, None),
+            Kind::UnsafeFnPtr(params, ret) => {
+                self.check_unsafe_fn_ptr_call(expr)?;
+                (self.cx.types.substs(params).to_vec(), ret, None)
+            }
             Kind::Adt(..) => return self.overloaded_call(expr, found, args),
             _ => return self.other_call(expr, found, callee_ty, args),
         };

@@ -37,6 +37,7 @@ pub enum Kind {
     Adt(ItemRef, Substs),
     FnDef(ItemRef, Substs),
     FnPtr(Substs, Ty),
+    UnsafeFnPtr(Substs, Ty),
     /// The closure expression `2` of the body of `0` at type arguments `1`.
     Closure(ItemRef, Substs, u32),
     /// A trait object of the trait `0`: its trait arguments, then the type bound to each associated type in `2`, with the sorted auto traits `3`.
@@ -79,7 +80,9 @@ impl Kind {
             | Kind::Slice(inner)
             | Kind::Pat(inner, ..) => (Some(*inner), &[], &[]),
             Kind::Array(inner, len) => (Some(*inner), std::slice::from_ref(len), &[]),
-            Kind::FnPtr(params, ret) => (Some(*ret), types.substs(*params), &[]),
+            Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => {
+                (Some(*ret), types.substs(*params), &[])
+            }
             Kind::Proj(id) => {
                 let proj = types.proj(*id);
                 (
@@ -374,6 +377,12 @@ impl Types {
         self.intern(Kind::FnPtr(substs, ret))
     }
 
+    /// The unsafe function pointer type `unsafe fn(params) -> ret`.
+    pub fn unsafe_fn_ptr(&self, params: &[Ty], ret: Ty) -> Ty {
+        let substs = self.intern_substs(params);
+        self.intern(Kind::UnsafeFnPtr(substs, ret))
+    }
+
     /// The type `bool`.
     pub fn bool(&self) -> Ty {
         Ty(0)
@@ -542,6 +551,14 @@ pub(in crate::sema) fn try_map_children<S, E>(
                 return Ok(ty);
             }
             Kind::FnPtr(m_params, m_ret)
+        }
+        Kind::UnsafeFnPtr(params, ret) => {
+            let m_params = try_map_substs(state, params, types_of, f)?;
+            let m_ret = f(state, ret)?;
+            if m_params == params && m_ret == ret {
+                return Ok(ty);
+            }
+            Kind::UnsafeFnPtr(m_params, m_ret)
         }
         Kind::Pat(base, range) => {
             let mapped = f(state, base)?;

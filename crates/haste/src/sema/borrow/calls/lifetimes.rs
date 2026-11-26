@@ -601,6 +601,19 @@ pub(in super::super) fn sig_returns_only_static(
     if sig.is_async || lts.has_elided || !lts.named.is_empty() || !lts.saw_static {
         return false;
     }
+    let mut peeled = ret_ast;
+    while let AstTy::Paren(inner) = *sig.body.ty(peeled) {
+        peeled = inner;
+    }
+    if let AstTy::Fn { params, ret, .. } = *sig.body.ty(peeled) {
+        let mut ret_only = Lifetimes::default();
+        if let Some(r) = ret {
+            collect_ty_lifetimes(&sig.body, src, r, &mut ret_only);
+        }
+        if !ret_only.saw_static || !sig.body.list(params).is_empty() {
+            return false;
+        }
+    }
     let type_params = sig_type_params(sig, src);
     !ast_ty_has_type_param(&sig.body, src, ret_ast, &type_params)
 }

@@ -112,6 +112,8 @@ impl Infer<'_, '_> {
             let before = self.diverges;
             self.expr(otherwise, None)?;
             self.diverges = before;
+        } else {
+            self.let_pats.push((pat, ty));
         }
         self.bind_pat(pat, ty)
     }

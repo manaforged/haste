@@ -482,7 +482,8 @@ impl Lower<'_, '_> {
                 values,
             );
         }
-        let Kind::FnPtr(params, ret) = *self.cx.types.kind(ty) else {
+        let (Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret)) = *self.cx.types.kind(ty)
+        else {
             bail!("cannot lower calls through values yet")
         };
         let Some(code) = code else { return Ok(None) };
