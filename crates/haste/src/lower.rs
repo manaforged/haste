@@ -245,6 +245,8 @@ pub struct Lower<'l, 'a> {
     overflow_checks: bool,
     child_rodata: Vec<(RodataId, Option<Vec<u8>>)>,
     caller_loc_guard: Option<(Value, Value)>,
+    prologue_block: Option<Block>,
+    cached_caller_loc: Option<Value>,
     blob_statics: rustc_hash::FxHashSet<(ItemRef, crate::sema::substs::Substs)>,
 }
 
@@ -294,6 +296,8 @@ impl<'l, 'a> Lower<'l, 'a> {
             overflow_checks,
             child_rodata: Vec::new(),
             caller_loc_guard: None,
+            prologue_block: None,
+            cached_caller_loc: None,
             blob_statics: rustc_hash::FxHashSet::default(),
         }
     }
@@ -307,6 +311,7 @@ impl<'l, 'a> Lower<'l, 'a> {
         }
         self.b.switch_to_block(entry);
         let (prologue, start) = (self.b.create_block(), self.b.create_block());
+        self.prologue_block = Some(prologue);
         self.jump(prologue, &[]);
         self.b.switch_to_block(start);
         self.moved = self.moved_paths()?;

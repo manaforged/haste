@@ -189,8 +189,26 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn caller_loc_slot(&mut self) -> Result<Value> {
+        if let Some(val) = self.cached_caller_loc {
+            return Ok(val);
+        }
         const CALLER_LOC_SLOT: i64 = 0;
         const CALLER_LOC_CELL_BYTES: i64 = 8;
+        if self.open
+            && self.resume.is_none()
+            && self.inline.stack.is_empty()
+            && let Some(prologue) = self.prologue_block
+        {
+            let saved = self.b.current_block();
+            self.b.switch_to_block(prologue);
+            let slot = self.ins().iconst(Type::I64, CALLER_LOC_SLOT);
+            let val = self.call_thread_cell(slot, CALLER_LOC_CELL_BYTES, None)?;
+            if let Some(prev) = saved {
+                self.b.switch_to_block(prev);
+            }
+            self.cached_caller_loc = Some(val);
+            return Ok(val);
+        }
         let slot = self.ins().iconst(Type::I64, CALLER_LOC_SLOT);
         self.call_thread_cell(slot, CALLER_LOC_CELL_BYTES, None)
     }

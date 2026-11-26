@@ -31,7 +31,11 @@ struct ThreadState {
     filling: Vec<usize>,
 }
 
+const FAST_SLOTS: usize = 32;
+
 thread_local! {
+    static FAST_CELLS: std::cell::UnsafeCell<[usize; FAST_SLOTS]> =
+        const { std::cell::UnsafeCell::new([0; FAST_SLOTS]) };
     static THREAD_STATE: std::cell::Cell<*mut ThreadState> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
@@ -82,6 +86,15 @@ pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
 
 /// The calling thread's cell of `size` zeroed bytes for the `#[thread_local]` static with thread slot `slot`.
 pub(crate) extern "C" fn thread_cell(slot: usize, size: usize, init_slot: usize) -> usize {
+    if slot < FAST_SLOTS {
+        let cell = FAST_CELLS.with(|cells| {
+            // SAFETY: FAST_CELLS is thread-local and only read here while no mutable reference exists.
+            unsafe { (*cells.get())[slot] }
+        });
+        if cell != 0 {
+            return cell;
+        }
+    }
     let cell = {
         let state = thread_state();
         if let Some(&cell) = state.cells.get(slot)
@@ -91,6 +104,12 @@ pub(crate) extern "C" fn thread_cell(slot: usize, size: usize, init_slot: usize)
         }
         new_cell(state, slot, size)
     };
+    if slot < FAST_SLOTS {
+        FAST_CELLS.with(|cells| {
+            // SAFETY: FAST_CELLS is thread-local and no other reference to this slot is live.
+            unsafe { (*cells.get())[slot] = cell };
+        });
+    }
     if init_slot != 0 {
         // SAFETY: init_slot points to the 8-byte function slot holding this static's zero-arg initializer.
         let code = unsafe { *(init_slot as *const usize) };
