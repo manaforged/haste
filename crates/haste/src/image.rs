@@ -485,10 +485,7 @@ impl Image {
     pub(super) fn is_fast_lazy(&self) -> bool {
         matches!(
             self.backend,
-            ImageBackend::LazyJit {
-                fast: true,
-                optimize: false
-            }
+            ImageBackend::LazyJit { fast: true, .. } | ImageBackend::LazyJit { optimize: true, .. }
         )
     }
 
