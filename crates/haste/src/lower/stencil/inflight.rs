@@ -10,7 +10,9 @@ pub(super) struct InFlight {
 
 impl Default for InFlight {
     fn default() -> Self {
-        Self { shards: std::array::from_fn(|_| Mutex::new(FxHashMap::default())) }
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(FxHashMap::default())),
+        }
     }
 }
 

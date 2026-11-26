@@ -25,7 +25,10 @@ const ARCHIVE_MAGIC: &[u8; 8] = b"!<arch>\n";
 const MEMBER_HEADER: usize = 60;
 const INDEX_NAMES: [(&[u8], usize); 2] = [(b"/ ", 4), (b"/SYM64/", 8)];
 
-static LOADED: RwLock<Loaded> = RwLock::new(Loaded { libraries: Vec::new(), symbols: None });
+static LOADED: RwLock<Loaded> = RwLock::new(Loaded {
+    libraries: Vec::new(),
+    symbols: None,
+});
 
 /// What this process loaded: each library by archive path or name, and the name and address of each symbol of a loaded archive.
 struct Loaded {
@@ -44,20 +47,35 @@ struct Libraries {
 impl Libraries {
     /// The path of each archive and the name of each dynamic library.
     fn names(&self) -> Vec<String> {
-        self.archives.iter().map(|archive| archive.display().to_string()).chain(self.dynamic.iter().map(|(_, name)| name.clone())).collect()
+        self.archives
+            .iter()
+            .map(|archive| archive.display().to_string())
+            .chain(self.dynamic.iter().map(|(_, name)| name.clone()))
+            .collect()
     }
 }
 
 /// Loads the libraries that the build scripts of the crates in `outline` link and that this process has not loaded yet.
 pub fn load(outline: &Outline) -> Result<()> {
     let mut libraries = libraries(outline)?;
-    let mut loaded = LOADED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    libraries.archives.retain(|archive| !loaded.libraries.contains(&archive.display().to_string()));
-    libraries.dynamic.retain(|(_, name)| !loaded.libraries.contains(name));
+    let mut loaded = LOADED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    libraries
+        .archives
+        .retain(|archive| !loaded.libraries.contains(&archive.display().to_string()));
+    libraries
+        .dynamic
+        .retain(|(_, name)| !loaded.libraries.contains(name));
     if libraries.archives.is_empty() && libraries.dynamic.is_empty() {
         return Ok(());
     }
-    let symbols = open_libraries(&libraries).with_context(|| format!("loading the native libraries {}", libraries.names().join(", ")))?;
+    let symbols = open_libraries(&libraries).with_context(|| {
+        format!(
+            "loading the native libraries {}",
+            libraries.names().join(", ")
+        )
+    })?;
     loaded.symbols.get_or_insert_default().extend(symbols);
     loaded.libraries.extend(libraries.names());
     Ok(())
@@ -72,18 +90,26 @@ pub fn symbol(name: &str) -> Option<usize> {
 fn libraries(outline: &Outline) -> Result<Libraries> {
     let mut wanted = Vec::new();
     let mut libraries = Libraries::default();
-    for script in outline.crates.iter().filter_map(|krate| krate.env.script.as_ref()) {
+    for script in outline
+        .crates
+        .iter()
+        .filter_map(|krate| krate.env.script.as_ref())
+    {
         let own: Vec<PathBuf> = script.search_dirs().map(PathBuf::from).collect();
         for (kind, name) in script.link_libs() {
             match kind {
                 LinkKind::Static => wanted.push((own.clone(), name.to_owned())),
-                LinkKind::Dynamic | LinkKind::Framework => libraries.dynamic.push((kind, name.to_owned())),
+                LinkKind::Dynamic | LinkKind::Framework => {
+                    libraries.dynamic.push((kind, name.to_owned()))
+                }
             }
         }
         libraries.search.extend(own);
     }
     for (own, name) in wanted {
-        libraries.archives.push(archive(&own, &libraries.search, &name)?);
+        libraries
+            .archives
+            .push(archive(&own, &libraries.search, &name)?);
     }
     libraries.archives.sort();
     libraries.archives.dedup();
@@ -115,13 +141,20 @@ fn distinct(archives: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 /// The archive `lib{name}.a` in the search directories of the script that asked for it, `own`, or else in those of every script.
 fn archive(own: &[PathBuf], search: &[PathBuf], name: &str) -> Result<PathBuf> {
     let file = format!("lib{name}.a");
-    own.iter().chain(search).map(|dir| dir.join(&file)).find(|path| path.is_file()).with_context(|| format!("no {file} in the build scripts' search directories"))
+    own.iter()
+        .chain(search)
+        .map(|dir| dir.join(&file))
+        .find(|path| path.is_file())
+        .with_context(|| format!("no {file} in the build scripts' search directories"))
 }
 
 /// Links `libraries` into the store unless it holds them, opens the result, and reads its table of static symbols.
 fn open_libraries(libraries: &Libraries) -> Result<HashMap<Box<str>, usize>> {
     let mut stamps = Vec::new();
-    libraries.archives.iter().for_each(|archive| store::walk(archive, &mut stamps));
+    libraries
+        .archives
+        .iter()
+        .for_each(|archive| store::walk(archive, &mut stamps));
     let key = rustc_hash::FxBuildHasher.hash_one((stamps, libraries, store::program()));
     let path = store::home().join("native").join(format!("{key:016x}.so"));
     if !path.is_file() {
@@ -143,12 +176,18 @@ fn link(libraries: &Libraries, path: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut names = Vec::new();
     for archive in &libraries.archives {
-        names.extend(index(archive).with_context(|| format!("reading the symbol index of {}", archive.display()))?);
+        names.extend(
+            index(archive)
+                .with_context(|| format!("reading the symbol index of {}", archive.display()))?,
+        );
     }
     let mut thread_locals = rustc_hash::FxHashSet::default();
     if !cfg!(target_vendor = "apple") {
         for archive in &libraries.archives {
-            thread_locals.extend(elf::thread_locals(archive).with_context(|| format!("reading the members of {}", archive.display()))?);
+            thread_locals.extend(
+                elf::thread_locals(archive)
+                    .with_context(|| format!("reading the members of {}", archive.display()))?,
+            );
         }
     }
     names.retain(|name| is_identifier(name) && !thread_locals.contains(name));
@@ -158,12 +197,28 @@ fn link(libraries: &Libraries, path: &Path) -> Result<()> {
     store::write_new(&source, &table_source(&names))?;
     let fresh = store::fresh(path);
     let mut command = Command::new(tool("CC"));
-    command.args(["-shared", "-fPIC", "-fno-builtin", "-w", "-o"]).arg(&fresh).arg(&source);
-    command.args(libraries.search.iter().map(|dir| format!("-L{}", dir.display())));
-    command.args(whole(&libraries.archives)).args(needed(&libraries.dynamic));
-    let ran = command.stdin(Stdio::null()).output().with_context(|| format!("running {command:?}"))?;
+    command
+        .args(["-shared", "-fPIC", "-fno-builtin", "-w", "-o"])
+        .arg(&fresh)
+        .arg(&source);
+    command.args(
+        libraries
+            .search
+            .iter()
+            .map(|dir| format!("-L{}", dir.display())),
+    );
+    command
+        .args(whole(&libraries.archives))
+        .args(needed(&libraries.dynamic));
+    let ran = command
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("running {command:?}"))?;
     if !ran.status.success() {
-        bail!("linking native libraries failed: {}", String::from_utf8_lossy(&ran.stderr));
+        bail!(
+            "linking native libraries failed: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
     }
     std::fs::rename(&fresh, path)?;
     Ok(())
@@ -172,11 +227,17 @@ fn link(libraries: &Libraries, path: &Path) -> Result<()> {
 /// The linker arguments that take every member of each of `archives`, used or not, since compiled code asks for symbols only as it runs; on ELF the first of two members that define one symbol wins, as linking only the members a program uses would pick one.
 fn whole(archives: &[PathBuf]) -> Vec<String> {
     if cfg!(target_vendor = "apple") {
-        let mut args: Vec<String> = archives.iter().map(|archive| format!("-Wl,-force_load,{}", archive.display())).collect();
+        let mut args: Vec<String> = archives
+            .iter()
+            .map(|archive| format!("-Wl,-force_load,{}", archive.display()))
+            .collect();
         args.extend(["-undefined".to_owned(), "dynamic_lookup".to_owned()]);
         return args;
     }
-    let mut args = vec!["-Wl,--allow-multiple-definition".to_owned(), "-Wl,--whole-archive".to_owned()];
+    let mut args = vec![
+        "-Wl,--allow-multiple-definition".to_owned(),
+        "-Wl,--whole-archive".to_owned(),
+    ];
     args.extend(archives.iter().map(|archive| archive.display().to_string()));
     args.push("-Wl,--no-whole-archive".to_owned());
     args
@@ -200,17 +261,28 @@ fn needed(dynamic: &[(LinkKind, String)]) -> Vec<String> {
 }
 
 fn is_identifier(name: &str) -> bool {
-    name.bytes().next().is_some_and(|first| !first.is_ascii_digit()) && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    name.bytes()
+        .next()
+        .is_some_and(|first| !first.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// A C source whose exported arrays hold the name and address of each of `names`, which may be hidden from the dynamic linker.
 fn table_source(names: &[String]) -> String {
-    let mut source: String = names.iter().map(|name| format!("extern char {name}[];\n")).collect();
+    let mut source: String = names
+        .iter()
+        .map(|name| format!("extern char {name}[];\n"))
+        .collect();
     source.push_str(&format!("const char *const {NAMES}[] = {{\n"));
     source.extend(names.iter().map(|name| format!("\"{name}\",\n")));
     source.push_str(&format!("0}};\nvoid *const {ADDRESSES}[] = {{\n"));
     source.extend(names.iter().map(|name| format!("{name},\n")));
-    source.push_str(&format!("0}};\nconst unsigned long {COUNT} = {};\n", names.len()));
+    source.push_str(&format!(
+        "0}};\nconst unsigned long {COUNT} = {};\n",
+        names.len()
+    ));
     source
 }
 
@@ -223,13 +295,32 @@ fn index(path: &Path) -> Result<Vec<String>> {
     if magic != ARCHIVE_MAGIC {
         bail!("not an archive");
     }
-    let Some(&(_, width)) = INDEX_NAMES.iter().find(|(name, _)| header.starts_with(name)) else { return Ok(Vec::new()) };
+    let Some(&(_, width)) = INDEX_NAMES
+        .iter()
+        .find(|(name, _)| header.starts_with(name))
+    else {
+        return Ok(Vec::new());
+    };
     let size: usize = std::str::from_utf8(&header[48..58])?.trim().parse()?;
     let mut body = vec![0u8; size];
     file.read_exact(&mut body)?;
-    let count = body.get(..width).map(|bytes| bytes.iter().fold(0usize, |count, byte| count << 8 | usize::from(*byte))).context("a short symbol index")?;
-    let strings = body.get(width * (count + 1)..).context("a short symbol index")?;
-    Ok(strings.split(|byte| *byte == 0).filter(|name| !name.is_empty()).take(count).map(|name| String::from_utf8_lossy(name).into_owned()).collect())
+    let count = body
+        .get(..width)
+        .map(|bytes| {
+            bytes
+                .iter()
+                .fold(0usize, |count, byte| count << 8 | usize::from(*byte))
+        })
+        .context("a short symbol index")?;
+    let strings = body
+        .get(width * (count + 1)..)
+        .context("a short symbol index")?;
+    Ok(strings
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .take(count)
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect())
 }
 
 /// Opens the library at `path` with its symbols global and its references bound by `mode`, `RTLD_LAZY` or `RTLD_NOW`, so it serves every foreign symbol it exports, and returns its handle.
@@ -245,7 +336,13 @@ pub fn open(path: &Path, mode: libc::c_int) -> Result<*mut c_void> {
         // SAFETY: dlerror takes no arguments and returns null or a message that stays valid until the next dynamic linker call on this thread.
         let reason = unsafe { libc::dlerror() };
         // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
-        let reason = if reason.is_null() { String::new() } else { unsafe { CStr::from_ptr(reason) }.to_string_lossy().into_owned() };
+        let reason = if reason.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(reason) }
+                .to_string_lossy()
+                .into_owned()
+        };
         bail!("loading {}: {reason}", path.display())
     }
     #[cfg(windows)]
@@ -260,7 +357,11 @@ pub fn open(path: &Path, mode: libc::c_int) -> Result<*mut c_void> {
         if !handle.is_null() {
             return Ok(handle);
         }
-        bail!("loading {}: {}", path.display(), std::io::Error::last_os_error())
+        bail!(
+            "loading {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )
     }
 }
 
@@ -285,7 +386,11 @@ fn find(handle: *mut c_void, name: &str) -> Result<*const c_void> {
 
 /// The name and address of each static symbol in the table of the library `handle`.
 fn table(handle: *mut c_void) -> Result<HashMap<Box<str>, usize>> {
-    let (names, addresses, count) = (find(handle, NAMES)?.cast::<*const libc::c_char>(), find(handle, ADDRESSES)?.cast::<usize>(), find(handle, COUNT)?.cast::<libc::c_ulong>());
+    let (names, addresses, count) = (
+        find(handle, NAMES)?.cast::<*const libc::c_char>(),
+        find(handle, ADDRESSES)?.cast::<usize>(),
+        find(handle, COUNT)?.cast::<libc::c_ulong>(),
+    );
     // SAFETY: the table source defines count as an unsigned long, initialized before dlopen returned.
     let count = usize::try_from(unsafe { *count })?;
     let mut symbols = HashMap::default();

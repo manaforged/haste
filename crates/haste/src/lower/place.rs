@@ -1,8 +1,11 @@
+mod deref;
+mod eval;
+
 use anyhow::{Result, bail};
 use haste_codegen::{StackSlot, Type, Value};
 
-use crate::body::{BlockKind, Expr, ExprId, List, UnOp};
-use crate::sema::infer::{Adjust, Coercion, Res};
+use crate::body::{BlockKind, Expr, ExprId, UnOp};
+use crate::sema::infer::{Coercion, Res};
 use crate::sema::ty::{Kind, Ty};
 
 use super::{Lower, Parts, Repr, repr};
@@ -25,12 +28,20 @@ pub struct Place {
 impl Place {
     /// The start of frame slot `slot`.
     pub fn slot(slot: StackSlot, repr: Repr) -> Place {
-        Place { base: Base::Slot(slot), offset: 0, repr }
+        Place {
+            base: Base::Slot(slot),
+            offset: 0,
+            repr,
+        }
     }
 
     /// The place `offset` bytes further on, holding a value of `repr`.
     pub fn at(self, offset: i32, repr: Repr) -> Place {
-        Place { base: self.base, offset: self.offset + offset, repr }
+        Place {
+            base: self.base,
+            offset: self.offset + offset,
+            repr,
+        }
     }
 }
 
@@ -39,7 +50,9 @@ impl Lower<'_, '_> {
     pub fn read(&mut self, place: Place) -> Option<Value> {
         match (place.repr, place.base) {
             (Repr::Zst, _) => None,
-            (Repr::Scalar(ty), Base::Slot(slot)) => Some(self.ins().stack_load(ty, slot, place.offset)),
+            (Repr::Scalar(ty), Base::Slot(slot)) => {
+                Some(self.ins().stack_load(ty, slot, place.offset))
+            }
             (Repr::Scalar(ty), Base::Addr(addr)) => Some(self.ins().load(ty, addr, place.offset)),
             (Repr::Mem { .. }, _) => Some(self.address(place)),
         }
@@ -47,7 +60,15 @@ impl Lower<'_, '_> {
 
     /// Reads `place` of type `ty`; a sized `Unique` comes back in a fresh frame slot, its pointer marked as owning a heap allocation.
     pub fn read_typed(&mut self, place: Place, ty: Ty) -> Option<Value> {
-        if !matches!(place.repr, Repr::Mem { size: 8, parts: Parts::One(Type::I64), .. }) || !self.cx.is_unique(ty) {
+        if !matches!(
+            place.repr,
+            Repr::Mem {
+                size: 8,
+                parts: Parts::One(Type::I64),
+                ..
+            }
+        ) || !self.cx.is_unique(ty)
+        {
             return self.read(place);
         }
         let pointer = self.read(place.at(0, Repr::Scalar(Type::I64)))?;
@@ -72,87 +93,6 @@ impl Lower<'_, '_> {
                 self.copy(to, value, place.repr);
             }
         }
-    }
-
-    /// The place that the dereference `expr` of `operand` names: through a pointer, through the pointer that a `Box` holds, or through the reference that `Deref::deref` returns.
-    fn deref_place(&mut self, expr: ExprId, operand: ExprId) -> Result<Option<Place>> {
-        let place = self.place_or_temp(operand)?;
-        Ok(self.deref_step((expr, 0), place, self.ty_of(operand))?.map(|(place, _)| place))
-    }
-
-    /// The place and type that dereference step `step` of `expr` reaches from `place` of type `ty`: through the `Deref` call inference picked, or the builtin dereference.
-    pub(super) fn deref_step(&mut self, (expr, step): (ExprId, u32), place: Option<Place>, ty: Ty) -> Result<Option<(Place, Ty)>> {
-        match self.typed.derefs.get(&(expr, step)).copied() {
-            Some(Res::Fn(item, substs)) => {
-                let receiver = self.address_or_dangling(place, ty)?;
-                let Some(pointer) = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Deref(expr, step)), item, substs, vec![receiver])? else { return Ok(None) };
-                let index = self.reached_index(item, substs)?;
-                let ret = self.reached.list[index].1.as_ref().ok().and_then(|callee| callee.ret);
-                let Some(Kind::Ref(_, target)) = ret.map(|ret| self.cx.types.kind(ret).clone()) else { bail!("`{}` returns no reference", self.cx.name(item)) };
-                Ok(Some((self.pointee_place(pointer, target)?, target)))
-            }
-            Some(_) => bail!("a dereference through something that is not a function"),
-            None => place.map(|place| self.step_in(place, ty)).transpose(),
-        }
-    }
-
-    /// The pointer that the value `value` of the reference, raw pointer or `Box` type `ty` holds, and its pointee.
-    pub(super) fn builtin_pointer(&mut self, value: Value, ty: Ty) -> Result<(Value, Ty)> {
-        match self.cx.types.kind(ty).clone() {
-            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => Ok((value, pointee)),
-            _ if let Some(pointee) = self.cx.boxed(ty) => {
-                let pointer = if self.cx.is_unsized(pointee)? {
-                    value
-                } else {
-                    let data = self.box_data(value);
-                    self.b.func.mark_unique_ptr(data);
-                    data
-                };
-                Ok((pointer, pointee))
-            }
-            other => bail!("dereference of {other:?}"),
-        }
-    }
-
-    /// The reference that the deref coercion `steps` reaches from the reference `pointer`, one builtin dereference or `Deref::deref` call per step.
-    pub(super) fn deref_coerced(&mut self, expr: ExprId, mut pointer: Value, steps: Vec<(Ty, Option<Res>)>) -> Result<Option<Value>> {
-        for (idx, (ty, res)) in steps.into_iter().enumerate() {
-            pointer = match res {
-                Some(Res::Fn(item, substs)) => match self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::CoercionDeref(expr, idx as u16)), item, substs, vec![pointer])? {
-                    Some(next) => next,
-                    None => return Ok(None),
-                },
-                Some(_) => bail!("a deref coercion through something that is not a function"),
-                None => {
-                    let place = self.pointee_place(pointer, ty)?;
-                    let Some(value) = self.read(place) else { bail!("a pointer with no value") };
-                    self.builtin_pointer(value, ty)?.0
-                }
-            };
-        }
-        Ok(Some(pointer))
-    }
-
-    /// The address that the value `value` of the sized pointer type `ty` holds, whether a reference, a raw pointer, or a smart pointer such as `Box` or `Rc`.
-    pub(super) fn sized_pointer(&mut self, value: Value, ty: Ty) -> Value {
-        let is_scalar = matches!(self.cx.types.kind(ty), Kind::Ref(..) | Kind::Ptr(..))
-            || matches!(repr(self.cx, ty), Ok(Repr::Scalar(_)));
-        let data = if is_scalar { value } else { self.box_data(value) };
-        if self.cx.boxed(ty).is_some() {
-            self.b.func.mark_unique_ptr(data);
-        }
-        data
-    }
-
-    /// The data pointer that the value `boxed` of a `Box` of a sized type holds.
-    pub(super) fn box_data(&mut self, boxed: Value) -> Value {
-        self.ins().load(Type::I64, boxed, 0)
-    }
-
-    /// The place that `pointer` to `pointee` names, which for a slice or `str` is the wide pointer itself.
-    pub(super) fn pointee_place(&mut self, pointer: Value, pointee: Ty) -> Result<Place> {
-        let repr = if self.cx.is_unsized(pointee)? { super::ops::WIDE } else { repr(self.cx, pointee)? };
-        Ok(Place { base: Base::Addr(pointer), offset: 0, repr })
     }
 
     /// The address of `place`.
@@ -189,7 +129,9 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Local(local)) => Ok(self.locals[*local as usize]),
-                Some(&Res::Fn(item, substs)) if super::is_static(self.cx, item) => self.static_place((item, substs), self.ty_of(expr)).map(Some),
+                Some(&Res::Fn(item, substs)) if super::is_static(self.cx, item) => self
+                    .static_place((item, substs), self.ty_of(expr))
+                    .map(Some),
                 _ => Ok(None),
             },
             Expr::Unary(UnOp::Deref, operand) => self.deref_place(expr, operand),
@@ -203,7 +145,6 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// The expression that `expr` only wraps: the inside of parentheses, or the tail of a macro expansion with no statements.
     pub(super) fn transparent(&self, expr: ExprId) -> Option<ExprId> {
         transparent_in(self.body, expr)
     }
@@ -247,7 +188,11 @@ impl Lower<'_, '_> {
         let place = match (repr, value) {
             (Repr::Mem { .. }, Some(addr)) if !copy_mem => {
                 if let Some((slot, offset)) = self.b.func.stack_addr_of(addr) {
-                    Some(Place { base: Base::Slot(slot), offset, repr })
+                    Some(Place {
+                        base: Base::Slot(slot),
+                        offset,
+                        repr,
+                    })
                 } else if crate::sema::infer::needs_drop(self.cx, expr_ty)? {
                     self.slot(repr).map(|slot| {
                         let place = Place::slot(slot, repr);
@@ -255,7 +200,11 @@ impl Lower<'_, '_> {
                         place
                     })
                 } else {
-                    Some(Place { base: Base::Addr(addr), offset: 0, repr })
+                    Some(Place {
+                        base: Base::Addr(addr),
+                        offset: 0,
+                        repr,
+                    })
                 }
             }
             (_, Some(value)) => self.slot(repr).map(|slot| {
@@ -265,7 +214,8 @@ impl Lower<'_, '_> {
             }),
             _ => None,
         };
-        if self.open && (place.is_some() || (repr == Repr::Zst && !self.is_uncaptured_local(expr))) {
+        if self.open && (place.is_some() || (repr == Repr::Zst && !self.is_uncaptured_local(expr)))
+        {
             self.own(super::moves::Root::Temp(expr), expr_ty, place, true)?;
         }
         Ok(place)
@@ -288,8 +238,11 @@ impl Lower<'_, '_> {
         self.part_place(place, ty, (0, index)).map(Some)
     }
 
-    /// The place of `base` and its type, after the dereferences that inference recorded on `expr`.
-    pub(super) fn autoderef_place(&mut self, expr: ExprId, base: ExprId) -> Result<Option<(Place, Ty)>> {
+    pub(super) fn autoderef_place(
+        &mut self,
+        expr: ExprId,
+        base: ExprId,
+    ) -> Result<Option<(Place, Ty)>> {
         let Some(mut place) = self.place_or_temp(base)? else {
             return Ok(None);
         };
@@ -303,15 +256,12 @@ impl Lower<'_, '_> {
         Ok(Some((place, ty)))
     }
 
-    /// The place that the reference, raw pointer or `Box` of type `ty` at `place` points at, and its pointee type.
-    fn step_in(&mut self, place: Place, ty: Ty) -> Result<(Place, Ty)> {
-        let Some(value) = self.read(place) else { bail!("a pointer with no value") };
-        let (pointer, inner) = self.builtin_pointer(value, ty)?;
-        Ok((self.pointee_place(pointer, inner)?, inner))
-    }
-
-    /// The place of field `index` of variant `variant` of the tuple or ADT `ty`, or of element `index` of the array `ty`, at `place`.
-    pub(super) fn part_place(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
+    pub(super) fn part_place(
+        &mut self,
+        place: Place,
+        ty: Ty,
+        (variant, index): (u32, u32),
+    ) -> Result<Place> {
         match *self.cx.types.kind(ty) {
             Kind::Array(element, _) => {
                 let stride = self.cx.layout(element)?.size.bytes() as i32;
@@ -326,236 +276,17 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// Lowers the tuple expression `expr` into a new frame slot and returns its address.
-    pub fn tuple(&mut self, expr: ExprId, list: List) -> Result<Option<Value>> {
-        if let Some(addr) = self.const_rodata_expr(expr)? {
-            return Ok(Some(addr));
-        }
-        self.tuple_of(self.ty_of(expr), list)
-    }
-
-    /// Whether the current body mutates, mutably lends, or `ref mut` binds `expr`.
-    pub(super) fn expr_lent_mutably(&self, expr: ExprId) -> bool {
-        if self.typed.ref_binds.values().any(|binding| *binding == crate::sema::ty::Mut::Mut) {
-            return true;
-        }
-        (0..self.body.exprs.len() as u32).map(ExprId).any(|at| match *self.body.expr(at) {
-            Expr::Assign(lhs, _) => self.place_reaches_assign(lhs, expr),
-            Expr::AssignOp(_, lhs, _) | Expr::Ref { mutable: true, expr: lhs, .. } => self.place_reaches(lhs, expr),
-            Expr::Method { receiver, .. } => {
-                self.typed.adjusts.get(&at).is_some_and(|adjust| adjust.autoref == Some(crate::sema::ty::Mut::Mut)) && self.place_reaches(receiver, expr)
-            }
-            _ => false,
-        })
-    }
-
-    fn place_reaches_assign(&self, lhs: ExprId, target: ExprId) -> bool {
-        match *self.body.expr(lhs) {
-            Expr::Paren(inner) => self.place_reaches_assign(inner, target),
-            Expr::Tuple(items) => self.body.list(items).iter().any(|&at| self.place_reaches_assign(ExprId(at), target)),
-            _ => self.place_reaches(lhs, target),
-        }
-    }
-
-    fn place_reaches(&self, root: ExprId, target: ExprId) -> bool {
-        let mut cur = root;
-        loop {
-            if cur == target {
-                return true;
-            }
-            if let Some(inner) = self.transparent(cur) {
-                cur = inner;
-                continue;
-            }
-            match *self.body.expr(cur) {
-                Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _) => cur = base,
-                Expr::Block { tail: Some(tail), label: None, .. } => cur = tail,
-                Expr::Block { label: Some(_), .. } | Expr::Loop { .. } => return true,
-                Expr::If(_, then, otherwise) => return self.place_reaches(then, target) || otherwise.is_some_and(|alt| self.place_reaches(alt, target)),
-                Expr::Match(_, arms) => return self.body.list(arms).iter().any(|&at| self.place_reaches(self.body.arms[at as usize].body, target)),
-                _ => return false,
-            }
-        }
-    }
-
-    /// Copies `addr` into a fresh frame slot when `repr` lives in memory, returning the snapshot address.
-    pub(super) fn snapshot_repr(&mut self, repr: Repr, addr: Value) -> Value {
-        let Some(slot) = self.slot(repr) else {
-            return addr;
-        };
-        let dst = self.address(Place::slot(slot, repr));
-        self.copy(dst, addr, repr);
-        dst
-    }
-
-    /// Snapshots a memory result of `expr` before drops in `self.owned[mark..]` run.
-    pub(super) fn snapshot_before_drops(&mut self, mark: usize, expr: ExprId, value: Option<Value>) -> Result<Option<Value>> {
-        let Some(addr) = value else {
-            return Ok(None);
-        };
-        if !self.open || self.owned.len() <= mark {
-            return Ok(Some(addr));
-        }
-        let repr = self.coerced_repr(expr, self.typed.coercions.get(&expr))?;
-        Ok(Some(if matches!(repr, Repr::Mem { .. }) { self.snapshot_repr(repr, addr) } else { addr }))
-    }
-
-    /// Whether `expr` names a whole local whose type needs drop, so reading it by value moves it and nothing reads it again before it is reinitialized.
-    fn moved_local(&mut self, expr: ExprId) -> Result<bool> {
-        if let Some(inner) = self.transparent(expr) {
-            return self.moved_local(inner);
-        }
-        let local = matches!(self.body.expr(expr), Expr::Path(_)) && matches!(self.typed.res.get(&expr), Some(Res::Local(_)));
-        Ok(local && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))?)
-    }
-
-    /// Records a move out of `expr`'s place when its type needs drop.
-    pub(super) fn move_from_expr(&mut self, expr: ExprId) -> Result<()> {
-        if !self.open || !crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
-            return Ok(());
-        }
-        if let Some((root, path)) = self.move_path(expr) {
-            self.moved_out(root, &path)?;
-        }
-        Ok(())
-    }
-
-    /// Evaluates `expr` by value, records its move, and snapshots a `Repr::Mem` place expression into a fresh frame slot.
-    pub(super) fn eval_operand(&mut self, expr: ExprId) -> Result<Option<Value>> {
-        self.operand(expr, false)
-    }
-
-    /// Evaluates `expr` as `eval_operand` does, but passes a moved local in place when `last` says no later operand of the same call can reinitialize it.
-    pub(super) fn operand(&mut self, expr: ExprId, last: bool) -> Result<Option<Value>> {
-        let in_place = last && self.moved_local(expr)?;
-        let value = self.expr(expr)?;
-        self.move_from_expr(expr)?;
-        let Some(addr) = value else {
-            return Ok(None);
-        };
-        let coerced = self.typed.coercions.get(&expr);
-        let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_) | Coercion::Field { .. }));
-        if !self.open || !self.may_alias_place(expr) || fresh_coercion || (in_place && coerced.is_none()) {
-            return Ok(Some(addr));
-        }
-        let repr = self.coerced_repr(expr, coerced)?;
-        Ok(Some(if matches!(repr, Repr::Mem { .. }) { self.snapshot_repr(repr, addr) } else { addr }))
-    }
-
-    /// Lowers the expressions `list` into a new frame slot as a tuple of type `ty`, and returns its value.
-    pub(super) fn tuple_of(&mut self, ty: Ty, list: List) -> Result<Option<Value>> {
-        let whole = repr(self.cx, ty)?;
-        let Kind::Tuple(items) = *self.cx.types.kind(ty) else { bail!("a tuple of a type that is not a tuple") };
-        let items = self.cx.types.substs(items).to_vec();
-        let slot = self.slot(whole);
-        let unwind = self.wants_field_unwind()?;
-        let mut guards = Vec::new();
-        for (index, item) in self.body.list(list).to_vec().into_iter().enumerate() {
-            let field_ty = items[index];
-            let field = repr(self.cx, field_ty)?;
-            let offset = self.field_offset(ty, index as u32)?;
-            let part = slot.map(|slot| Place::slot(slot, whole).at(offset, field));
-            if !self.eval_and_write_part(part, field_ty, ExprId(item), unwind, &mut guards)? {
-                return Ok(None);
-            }
-        }
-        self.disarm_owned_guards(guards);
-        Ok(slot.and_then(|slot| self.read(Place::slot(slot, whole))))
-    }
-
-    pub(super) fn push_arg_guard(&mut self, expr: ExprId, value: Option<Value>, guards: &mut Vec<usize>) -> Result<()> {
-        let ty = match self.typed.coercions.get(&expr) {
-            Some(Coercion::Field { target, .. }) => *target,
-            _ => self.ty_of(expr),
-        };
-        if !self.open || !crate::sema::infer::needs_drop(self.cx, ty)? {
-            return Ok(());
-        }
-        let whole = repr(self.cx, ty)?;
-        let place = match (whole, value) {
-            (Repr::Zst, _) | (_, None) => None,
-            (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr: whole }),
-            (Repr::Scalar(Type::I64), Some(val)) if self.typed.coercions.get(&expr).is_some_and(Coercion::widens) => {
-                Some(Place { base: Base::Addr(val), offset: 0, repr: whole })
-            }
-            (Repr::Scalar(_), Some(val)) => self.spill(Some(val), ty)?,
-        };
-        if let Some(guard) = self.push_owned_guard(ty, place, expr)? {
-            guards.push(guard);
-        }
-        Ok(())
-    }
-
-    pub(super) fn eval_guarded_args(
-        &mut self,
-        args: List,
-        mut values: Vec<Value>,
-        mut guards: Vec<usize>,
-        check_const: bool,
-    ) -> Result<Vec<Value>> {
-        let list = self.body.list(args).to_vec();
-        let unwind = self.wants_field_unwind()?;
-        for (index, &arg) in list.iter().enumerate() {
-            let expr = ExprId(arg);
-            if check_const && self.typed.const_args.contains(&expr) {
-                continue;
-            }
-            let last = index + 1 == list.len();
-            let value = self.operand(expr, last)?;
-            if !self.open {
-                return Ok(values);
-            }
-            if unwind && !last {
-                self.push_arg_guard(expr, value, &mut guards)?;
-            }
-            values.extend(value);
-        }
-        self.disarm_owned_guards(guards);
-        Ok(values)
-    }
-
-    /// Lowers the compiler-made `Clone::clone` of a tuple: each field of the referenced tuple cloned through its call in `calls`, into a new tuple.
-    pub fn clone_body(&mut self, calls: Vec<Res>) -> Result<Option<Value>> {
-        let (Some(ty), Some(local)) = (self.typed.ret, self.typed.params.first().copied()) else { bail!("a compiler-made clone with no parameter or result") };
-        let Some(source) = self.locals[local as usize].and_then(|place| self.read(place)) else { bail!("a compiler-made clone with no source") };
-        let mut values = Vec::new();
-        for (index, call) in calls.into_iter().enumerate() {
-            let Res::Fn(item, substs) = call else { bail!("a field clone that is not a call") };
-            let offset = self.field_offset(ty, index as u32)?;
-            let field = self.ins().iadd_imm(source, i64::from(offset));
-            values.push(self.invoke(super::reloc::SiteOrigin::ShapeClone(index as u16), item, substs, vec![field])?);
-        }
-        match crate::sema::infer::cloned_tuple(self.cx, ty) {
-            Some(tuple) => self.tuple_from(tuple, values),
-            None => {
-                let whole = repr(self.cx, ty)?;
-                Ok(self.read(Place { base: Base::Addr(source), offset: 0, repr: whole }))
-            }
-        }
-    }
-
-    fn tuple_from(&mut self, ty: Ty, values: Vec<Option<Value>>) -> Result<Option<Value>> {
-        let whole = repr(self.cx, ty)?;
-        let Kind::Tuple(items) = *self.cx.types.kind(ty) else { bail!("a tuple of a type that is not a tuple") };
-        let items = self.cx.types.substs(items).to_vec();
-        let slot = self.slot(whole);
-        for (index, value) in values.into_iter().enumerate() {
-            let field = repr(self.cx, items[index])?;
-            let offset = self.field_offset(ty, index as u32)?;
-            if let (Some(slot), Some(value)) = (slot, value) {
-                self.write(Place::slot(slot, whole).at(offset, field), value);
-            }
-        }
-        Ok(slot.map(|slot| self.read(Place::slot(slot, whole))).flatten())
-    }
-
     /// Lowers `&inner` to the address of `inner`'s place, and tells the optimizer that a reference made from a raw pointer is not null unless the borrow is `raw`.
     pub fn reference(&mut self, inner: ExprId, raw: bool) -> Result<Option<Value>> {
         let place = self.place_or_temp(inner)?;
         let ty = self.ty_of(inner);
         let address = self.address_or_dangling(place, ty)?;
         if !raw && place.is_some() && self.derefs_raw(inner) {
-            let pointer = if self.cx.is_unsized(ty)? { self.ins().load(Type::I64, address, 0) } else { address };
+            let pointer = if self.cx.is_unsized(ty)? {
+                self.ins().load(Type::I64, address, 0)
+            } else {
+                address
+            };
             self.ins().assume(pointer);
         }
         Ok(Some(address))
@@ -563,8 +294,13 @@ impl Lower<'_, '_> {
 
     fn derefs_raw(&self, expr: ExprId) -> bool {
         match *self.body.expr(expr) {
-            Expr::Unary(UnOp::Deref, operand) => self.typed.derefs.get(&(expr, 0)).is_none() && matches!(self.cx.types.kind(self.ty_of(operand)), Kind::Ptr(..)),
-            _ => self.transparent(expr).is_some_and(|inner| self.derefs_raw(inner)),
+            Expr::Unary(UnOp::Deref, operand) => {
+                self.typed.derefs.get(&(expr, 0)).is_none()
+                    && matches!(self.cx.types.kind(self.ty_of(operand)), Kind::Ptr(..))
+            }
+            _ => self
+                .transparent(expr)
+                .is_some_and(|inner| self.derefs_raw(inner)),
         }
     }
 
@@ -578,105 +314,17 @@ impl Lower<'_, '_> {
             }
         }
     }
-
-    /// The receiver of a method call after `adjust`: read through its references, then borrowed or read.
-    pub fn receiver(&mut self, (expr, receiver): (ExprId, ExprId), adjust: Adjust) -> Result<Option<Value>> {
-        if adjust == (Adjust { derefs: 0, autoref: None }) {
-            return self.eval_operand(receiver);
-        }
-        let mut place = self.place_or_temp(receiver)?;
-        let mut ty = self.ty_of(receiver);
-        for step in 0..adjust.derefs {
-            if let Kind::Array(_, len) = *self.cx.types.kind(ty) {
-                let Some(_) = adjust.autoref else { bail!("a slice receiver by value") };
-                let data = self.address_or_dangling(place, ty)?;
-                let len = self.len(len)?;
-                return Ok(Some(self.wide_pointer(data, len)));
-            }
-            let Some((inner_place, inner)) = self.deref_step((expr, step), place, ty)? else {
-                return Ok(None);
-            };
-            (place, ty) = (Some(inner_place), inner);
-        }
-        match adjust.autoref {
-            Some(_) => self.address_or_dangling(place, ty).map(Some),
-            None => Ok(place.and_then(|place| {
-                self.read(place).map(|val| if matches!(place.repr, Repr::Mem { .. }) { self.snapshot_repr(place.repr, val) } else { val })
-            })),
-        }
-    }
-    /// Applies a single-pointer widening coercion `coercion` to `value` of type `from_ty`.
-    pub(super) fn apply_leaf_coercion(&mut self, expr: ExprId, value: Value, from_ty: Ty, coercion: &Coercion) -> Result<Option<Value>> {
-        match coercion {
-            Coercion::Len(len) => {
-                let data = self.sized_pointer(value, from_ty);
-                let len = self.len(*len)?;
-                Ok(Some(self.wide_pointer(data, len)))
-            }
-            Coercion::Vtable(vtable) => {
-                let data = self.sized_pointer(value, from_ty);
-                let table = self.vtable(expr, vtable)?;
-                Ok(Some(self.wide(data, table)))
-            }
-            Coercion::Upcast(slot) => Ok(Some(self.upcast(value, *slot, from_ty)?)),
-            _ => Ok(Some(value)),
-        }
-    }
-
-    /// Applies widening coercion `inner` to the unsized field inside struct `from_ty` to build `to_ty`.
-    pub(super) fn coerce_struct(&mut self, expr: ExprId, value: Value, from_ty: Ty, to_ty: Ty, inner: &Coercion) -> Result<Option<Value>> {
-        if from_ty == to_ty {
-            return Ok(Some(value));
-        }
-        let from_repr = repr(self.cx, from_ty)?;
-        if matches!(from_repr, Repr::Scalar(Type::I64)) {
-            return self.apply_leaf_coercion(expr, value, from_ty, inner);
-        }
-        let (Kind::Adt(item, from_s), Kind::Adt(item2, to_s)) = (self.cx.types.kind(from_ty).clone(), self.cx.types.kind(to_ty).clone()) else {
-            return self.apply_leaf_coercion(expr, value, from_ty, inner);
-        };
-        if item != item2 {
-            return self.apply_leaf_coercion(expr, value, from_ty, inner);
-        }
-        let from_args = self.cx.types.substs(from_s).to_vec();
-        let to_args = self.cx.types.substs(to_s).to_vec();
-        let from_fields = crate::sema::infer::field_types(self.cx, item, &from_args)?;
-        let to_fields = crate::sema::infer::field_types(self.cx, item, &to_args)?;
-        let (Some(ff), Some(tf)) = (from_fields.first(), to_fields.first()) else {
-            return self.apply_leaf_coercion(expr, value, from_ty, inner);
-        };
-        let to_repr = repr(self.cx, to_ty)?;
-        let Some(slot) = self.slot(to_repr) else { return Ok(None) };
-        let src_place = Place { base: Base::Addr(value), offset: 0, repr: from_repr };
-        let dst_place = Place::slot(slot, to_repr);
-        for (i, (&f_ty, &t_ty)) in ff.iter().zip(tf.iter()).enumerate() {
-            let f_repr = repr(self.cx, f_ty)?;
-            let t_repr = repr(self.cx, t_ty)?;
-            if matches!(t_repr, Repr::Zst) {
-                continue;
-            }
-            let f_off = self.field_offset(from_ty, i as u32)?;
-            let t_off = self.field_offset(to_ty, i as u32)?;
-            let field_val = self.read(src_place.at(f_off, f_repr));
-            let out_val = if f_ty == t_ty {
-                field_val
-            } else if let Some(v) = field_val {
-                self.coerce_struct(expr, v, f_ty, t_ty, inner)?
-            } else {
-                None
-            };
-            if let Some(v) = out_val {
-                self.write(dst_place.at(t_off, t_repr), v);
-            }
-        }
-        Ok(self.read(dst_place))
-    }
 }
 
 pub(super) fn transparent_in(body: &crate::body::Body, expr: ExprId) -> Option<ExprId> {
     match *body.expr(expr) {
         Expr::Paren(inner) => Some(inner),
-        Expr::Block { stmts, tail, label: None, kind: BlockKind::Expansion } if body.list(stmts).is_empty() => tail,
+        Expr::Block {
+            stmts,
+            tail,
+            label: None,
+            kind: BlockKind::Expansion,
+        } if body.list(stmts).is_empty() => tail,
         _ => None,
     }
 }

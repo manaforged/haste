@@ -15,8 +15,13 @@ impl Function {
         }
         let size = usize::try_from(ty.bytes()).ok()?;
         let mut raw = [0_u8; 8];
-        raw.get_mut(..size)?.copy_from_slice(self.rodata_slice(sym, start, size)?);
+        raw.get_mut(..size)?
+            .copy_from_slice(self.rodata_slice(sym, start, size)?);
         let bits = u64::from_le_bytes(raw) as i64;
-        Some(if ty.is_small_int() { crate::fold::extend(bits, ty, true) } else { bits })
+        Some(if ty.is_small_int() {
+            crate::fold::extend(bits, ty, true)
+        } else {
+            bits
+        })
     }
 }

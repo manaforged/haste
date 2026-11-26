@@ -30,9 +30,17 @@ impl SegKey {
             for (slot, sym) in inline.iter_mut().zip(segments) {
                 *slot = sym.0;
             }
-            return Self { inline, len: segments.len() as u8, overflow: None };
+            return Self {
+                inline,
+                len: segments.len() as u8,
+                overflow: None,
+            };
         }
-        Self { inline, len: u8::MAX, overflow: Some(Arc::from(segments)) }
+        Self {
+            inline,
+            len: u8::MAX,
+            overflow: Some(Arc::from(segments)),
+        }
     }
 }
 
@@ -40,14 +48,18 @@ impl SegKey {
 pub(super) struct RunnerSlot(std::sync::Mutex<Option<Box<dyn super::evaluate::Evaluate>>>);
 
 impl RunnerSlot {
-    pub(super) fn take(&self) -> Option<Box<dyn super::evaluate::Evaluate>> { crate::sync::lock(&self.0).take() }
+    pub(super) fn take(&self) -> Option<Box<dyn super::evaluate::Evaluate>> {
+        crate::sync::lock(&self.0).take()
+    }
     pub(super) fn put(&self, runner: Box<dyn super::evaluate::Evaluate>) {
         let mut guard = crate::sync::lock(&self.0);
         if guard.is_none() {
             *guard = Some(runner);
         }
     }
-    pub(super) fn clear(&self) { *crate::sync::lock(&self.0) = None; }
+    pub(super) fn clear(&self) {
+        *crate::sync::lock(&self.0) = None;
+    }
 }
 
 /// What Sema keeps between passes over a growing outline: interned types and parsed headers and bodies.
@@ -128,7 +140,13 @@ impl LangMap {
             bloom[w1] |= m1;
             bloom[w2] |= m2;
         }
-        Self { map, bloom, crates_lo, crates_hi, any_high }
+        Self {
+            map,
+            bloom,
+            crates_lo,
+            crates_hi,
+            any_high,
+        }
     }
 
     #[inline]
@@ -179,10 +197,31 @@ pub(super) struct Lookups {
     pub(super) scope_traits: Table<ModRef, Arc<[ItemRef]>>,
     pub(super) type_defs: Table<(TypeScope, SegKey), crate::names::Def>,
     pub(super) impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
-    pub(super) selections: Table<(ItemRef, ty::Ty, super::substs::Substs), Option<(impls::ImplRef, super::substs::Substs)>>,
-    pub(super) projections: Table<(ItemRef, ty::Ty, super::substs::Substs, crate::names::Sym, super::substs::Substs), Option<ty::Ty>>,
+    pub(super) selections: Table<
+        (ItemRef, ty::Ty, super::substs::Substs),
+        Option<(impls::ImplRef, super::substs::Substs)>,
+    >,
+    pub(super) projections: Table<
+        (
+            ItemRef,
+            ty::Ty,
+            super::substs::Substs,
+            crate::names::Sym,
+            super::substs::Substs,
+        ),
+        Option<ty::Ty>,
+    >,
     pub(super) trait_calls: Table<(ItemRef, super::substs::Substs), infer::Res>,
-    pub(super) assoc_types: Table<(ItemRef, ty::Ty, super::substs::Substs, ItemRef, super::substs::Substs), ty::Ty>,
+    pub(super) assoc_types: Table<
+        (
+            ItemRef,
+            ty::Ty,
+            super::substs::Substs,
+            ItemRef,
+            super::substs::Substs,
+        ),
+        ty::Ty,
+    >,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
     pub(super) verdicts: Table<ItemRef, ()>,
     pub(super) fresh_summaries: Table<ItemRef, (bool, u64, Box<[u8]>)>,
@@ -209,11 +248,14 @@ impl Lookups {
     }
 
     fn reset_after_names(&mut self, outline: &Outline) {
-        self.heads.retain(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
-        self.selections.retain(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
+        self.heads
+            .retain(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
+        self.selections
+            .retain(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
         self.projections.retain(|_, found| found.is_some());
         self.forms.retain(|_, found| found.is_some());
-        self.scope_traits.retain(|home, _| outline.is_fixed(home.krate));
+        self.scope_traits
+            .retain(|home, _| outline.is_fixed(home.krate));
         self.reveals.clear();
         self.provisional_rets.clear();
         self.type_defs.clear();
@@ -225,7 +267,11 @@ impl Lookups {
         if matches!(answer, Some(Answer::Names)) {
             self.reset_after_names(outline);
         }
-        let loaded: Vec<crate::outline::tree::CrateExtent> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
+        let loaded: Vec<crate::outline::tree::CrateExtent> = outline
+            .crates
+            .iter()
+            .map(crate::outline::tree::Crate::extent)
+            .collect();
         let mut guard = write_lock(&self.state.loaded);
         if *guard == loaded {
             return;
@@ -242,16 +288,30 @@ impl Lookups {
         let reset_sysroot = extent_changed(Outline::is_sysroot);
         let reset_fixed = reset_sysroot || extent_changed(Outline::is_fixed);
         if same_len {
-            self.modules.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
-            self.owners.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
-            self.scope_traits.retain(|home, _| guard.get(home.krate as usize) == loaded.get(home.krate as usize));
+            self.modules
+                .retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
+            self.owners
+                .retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
+            self.scope_traits.retain(|home, _| {
+                guard.get(home.krate as usize) == loaded.get(home.krate as usize)
+            });
             self.heads.retain(|holder, _| match *holder {
                 impls::Holder::Crate(k) => guard.get(k as usize) == loaded.get(k as usize),
-                impls::Holder::Body(item) => guard.get(item.krate as usize) == loaded.get(item.krate as usize),
+                impls::Holder::Body(item) => {
+                    guard.get(item.krate as usize) == loaded.get(item.krate as usize)
+                }
             });
-            self.summaries.retain_keys(|item| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
-            if guard.iter().zip(&loaded).any(|(a, b)| a.consumed != b.consumed) {
-                self.discriminants.retain(|item, _| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
+            self.summaries.retain_keys(|item| {
+                guard.get(item.krate as usize) == loaded.get(item.krate as usize)
+            });
+            if guard
+                .iter()
+                .zip(&loaded)
+                .any(|(a, b)| a.consumed != b.consumed)
+            {
+                self.discriminants.retain(|item, _| {
+                    guard.get(item.krate as usize) == loaded.get(item.krate as usize)
+                });
                 self.glues.clear();
             }
         } else {
@@ -265,7 +325,8 @@ impl Lookups {
             self.summaries = table::Flight::default();
             self.glues.clear();
         }
-        if self.lang_items.get().is_some() && lang_files_changed(outline, &guard, &loaded, same_len) {
+        if self.lang_items.get().is_some() && lang_files_changed(outline, &guard, &loaded, same_len)
+        {
             self.lang_items = Arc::new(std::sync::OnceLock::new());
         }
         if reset_sysroot {
@@ -276,8 +337,10 @@ impl Lookups {
             self.file_index = Arc::new(std::sync::OnceLock::new());
             self.fresh_summaries.clear();
             self.fresh_instances.clear();
-            self.has_new_sysroot_summaries.store(false, Ordering::Relaxed);
-            self.has_new_sysroot_instances.store(false, Ordering::Relaxed);
+            self.has_new_sysroot_summaries
+                .store(false, Ordering::Relaxed);
+            self.has_new_sysroot_instances
+                .store(false, Ordering::Relaxed);
         }
         *write_lock(&self.state.global_allocator) = None;
         self.trait_calls.clear();
@@ -311,7 +374,9 @@ fn lang_files_changed(
 impl Cache {
     /// Returns the reconciled file index for `outline`, building it lazily on first use.
     pub(crate) fn file_index(&self, outline: &Outline) -> &summary::codec::FileIndex {
-        self.lookups.file_index.get_or_init(|| Arc::new(summary::codec::FileIndex::build(outline)))
+        self.lookups
+            .file_index
+            .get_or_init(|| Arc::new(summary::codec::FileIndex::build(outline)))
     }
 
     /// Attaches a frozen sysroot substrate to serve pre-computed `PolySummary` entries.
@@ -327,8 +392,13 @@ impl Cache {
 
     /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
     pub fn has_new_sysroot_summaries(&self) -> bool {
-        self.lookups.has_new_sysroot_summaries.load(Ordering::Relaxed)
-            || self.lookups.has_new_sysroot_instances.load(Ordering::Relaxed)
+        self.lookups
+            .has_new_sysroot_summaries
+            .load(Ordering::Relaxed)
+            || self
+                .lookups
+                .has_new_sysroot_instances
+                .load(Ordering::Relaxed)
     }
 
     /// Whether each type is structurally `Unpin`, with the depth its answer looked below it.
@@ -354,24 +424,37 @@ impl Cache {
         mut deps: Option<&mut crate::substrate::SubstrateBuilder>,
     ) -> Result<()> {
         let mut err = None;
-        self.lookups.fresh_summaries.retain(|_, (is_sysroot, key, bytes)| {
-            if err.is_some() {
-                return true;
-            }
-            let target = if *is_sysroot { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
-            if let Some(builder) = target
-                && let Err(e) = builder.add_summary(*key, bytes)
-            {
-                err = Some(e);
-                return true;
-            }
-            false
-        });
+        self.lookups
+            .fresh_summaries
+            .retain(|_, (is_sysroot, key, bytes)| {
+                if err.is_some() {
+                    return true;
+                }
+                let target = if *is_sysroot {
+                    toolchain.as_deref_mut()
+                } else {
+                    deps.as_deref_mut()
+                };
+                if let Some(builder) = target
+                    && let Err(e) = builder.add_summary(*key, bytes)
+                {
+                    err = Some(e);
+                    return true;
+                }
+                false
+            });
         if let Some(e) = err {
             return Err(e);
         }
-        self.lookups.has_new_sysroot_summaries.store(false, Ordering::Relaxed);
-        summary::frozen::export_sysroot_instances(&self.lookups.fresh_instances, &self.lookups.has_new_sysroot_instances, toolchain, deps)
+        self.lookups
+            .has_new_sysroot_summaries
+            .store(false, Ordering::Relaxed);
+        summary::frozen::export_sysroot_instances(
+            &self.lookups.fresh_instances,
+            &self.lookups.has_new_sysroot_instances,
+            toolchain,
+            deps,
+        )
     }
 
     /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
@@ -393,42 +476,77 @@ impl Cache {
     pub fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
         let mine = |item: ItemRef| edited.holds(item.krate, item.file);
         let block_kept = |block: &impls::ImplRef| match *block {
-            impls::ImplRef::Module { krate, index } => {
-                outline.crates[krate as usize].impls.get(index as usize).is_some_and(|entry| !edited.holds(krate, entry.file as u32) && !entry.parts.iter().any(|&part| edited.holds(krate, part as u32)))
-            }
+            impls::ImplRef::Module { krate, index } => outline.crates[krate as usize]
+                .impls
+                .get(index as usize)
+                .is_some_and(|entry| {
+                    !edited.holds(krate, entry.file as u32)
+                        && !entry
+                            .parts
+                            .iter()
+                            .any(|&part| edited.holds(krate, part as u32))
+                }),
             impls::ImplRef::Body(item) => !mine(item),
         };
         self.signatures.retain(|item, _| !mine(*item));
         self.bodies.retain(|item, _| !mine(*item));
         self.adts.retain(|item, _| !mine(*item));
         self.headers.retain(|block, _| block_kept(block));
-        let mut naming = Naming { types: &self.types, mine: &mine, memo: HashMap::default() };
+        let mut naming = Naming {
+            types: &self.types,
+            mine: &mine,
+            memo: HashMap::default(),
+        };
         self.finals.retain(|instance, _| !naming.touches(instance));
         self.layouts.retain(|ty, _| !naming.names(*ty));
         self.tails.retain(|ty, _| !naming.names(*ty));
         self.closures.retain(|ty, _| !naming.names(*ty));
-        self.evaluated.retain(|instance, _| !naming.touches(instance));
+        self.evaluated
+            .retain(|instance, _| !naming.touches(instance));
         self.runner.clear();
-        self.lookups.forget_edited(edited, &mut naming, &mine, &block_kept);
+        self.lookups
+            .forget_edited(edited, &mut naming, &mine, &block_kept);
     }
 
     /// Drops what the store keeps about what `edited` holds and returns the indexes of the instances in `list` that it touched.
-    pub fn invalidate<'l>(&mut self, outline: &Outline, list: impl Iterator<Item = &'l reach::Instance>, edited: Edited<'_>) -> Vec<usize> {
+    pub fn invalidate<'l>(
+        &mut self,
+        outline: &Outline,
+        list: impl Iterator<Item = &'l reach::Instance>,
+        edited: Edited<'_>,
+    ) -> Vec<usize> {
         let touched = self.touched(list, edited);
         self.forget(outline, edited);
         touched
     }
 
     /// The indexes of the instances in `list` that are functions `edited` holds or take a type that names one of its items.
-    pub fn touched<'l>(&self, list: impl Iterator<Item = &'l reach::Instance>, edited: Edited<'_>) -> Vec<usize> {
+    pub fn touched<'l>(
+        &self,
+        list: impl Iterator<Item = &'l reach::Instance>,
+        edited: Edited<'_>,
+    ) -> Vec<usize> {
         let mine = |item: ItemRef| edited.holds(item.krate, item.file);
-        let mut naming = Naming { types: &self.types, mine: &mine, memo: HashMap::default() };
-        list.enumerate().filter(|(_, instance)| naming.touches(instance)).map(|(at, _)| at).collect()
+        let mut naming = Naming {
+            types: &self.types,
+            mine: &mine,
+            memo: HashMap::default(),
+        };
+        list.enumerate()
+            .filter(|(_, instance)| naming.touches(instance))
+            .map(|(at, _)| at)
+            .collect()
     }
 }
 
 impl Lookups {
-    fn forget_edited<F: Fn(ItemRef) -> bool>(&mut self, edited: Edited<'_>, naming: &mut Naming<'_, F>, mine: &F, block_kept: &dyn Fn(&impls::ImplRef) -> bool) {
+    fn forget_edited<F: Fn(ItemRef) -> bool>(
+        &mut self,
+        edited: Edited<'_>,
+        naming: &mut Naming<'_, F>,
+        mine: &F,
+        block_kept: &dyn Fn(&impls::ImplRef) -> bool,
+    ) {
         self.drops.retain(|ty, _| !naming.names(*ty));
         self.own_drops.retain(|ty, _| !naming.names(*ty));
         self.unpins.retain(|ty, _| !naming.names(*ty));
@@ -440,20 +558,27 @@ impl Lookups {
                 infer::Form::Adt(item) | infer::Form::Fn(item) => !mine(item),
                 infer::Form::Impl(block) => block_kept(&block),
             };
-            own && found.iter().flat_map(|types| types.iter().flatten()).all(|&ty| !naming.names(ty))
+            own && found
+                .iter()
+                .flat_map(|types| types.iter().flatten())
+                .all(|&ty| !naming.names(ty))
         });
         self.reveals.retain(|instance| !naming.touches(instance));
-        self.provisional_rets.retain(|instance, _| !naming.touches(instance));
+        self.provisional_rets
+            .retain(|instance, _| !naming.touches(instance));
         self.futures.retain(|ty, _| !naming.names(*ty));
         self.impl_traits.retain(|block, _| block_kept(block));
         self.heads.retain(|holder, _| match *holder {
             impls::Holder::Crate(krate) => !edited.touches_crate(krate),
             impls::Holder::Body(item) => !mine(item),
         });
-        self.modules.retain(|krate, _| !edited.touches_crate(*krate));
+        self.modules
+            .retain(|krate, _| !edited.touches_crate(*krate));
         self.owners.retain(|krate, _| !edited.touches_crate(*krate));
-        self.scope_traits.retain(|home, _| !edited.touches_crate(home.krate));
-        self.type_defs.retain(|key, _| !edited.touches_crate(key.0.0.krate));
+        self.scope_traits
+            .retain(|home, _| !edited.touches_crate(home.krate));
+        self.type_defs
+            .retain(|key, _| !edited.touches_crate(key.0.0.krate));
         self.trait_defs.retain(|item, _| !mine(*item));
         self.selections.clear();
         self.projections.clear();
@@ -468,7 +593,12 @@ impl Lookups {
             self.lang_items = Arc::new(std::sync::OnceLock::new());
         }
         let mut langs = write_lock(&self.state.langs);
-        if langs.as_ref().is_some_and(|found| found.crates.iter().any(|&krate| edited.touches_crate(krate))) {
+        if langs.as_ref().is_some_and(|found| {
+            found
+                .crates
+                .iter()
+                .any(|&krate| edited.touches_crate(krate))
+        }) {
             *langs = None;
         }
     }
@@ -516,7 +646,10 @@ impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
         }
         let kind = self.types.kind(ty);
         let own = match kind {
-            ty::Kind::Adt(item, _) | ty::Kind::FnDef(item, _) | ty::Kind::Closure(item, ..) | ty::Kind::Dyn(item, ..) => (self.mine)(*item),
+            ty::Kind::Adt(item, _)
+            | ty::Kind::FnDef(item, _)
+            | ty::Kind::Closure(item, ..)
+            | ty::Kind::Dyn(item, ..) => (self.mine)(*item),
             ty::Kind::Proj(id) => {
                 let def = self.types.proj(*id);
                 (self.mine)(def.of) || (self.mine)(def.assoc)

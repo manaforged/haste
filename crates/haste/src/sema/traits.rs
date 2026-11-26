@@ -87,14 +87,22 @@ impl<'a> Context<'a> {
         }
         let (src, entry) = self.item(item);
         let name = entry.name.ok_or_else(|| anyhow!("trait has no name"))?;
-        let parsed = Arc::new(sig::generics(src, name + 1, entry.body.unwrap_or(entry.end))?);
-        self.store.lookups.trait_defs.insert(item, Arc::clone(&parsed));
+        let parsed = Arc::new(sig::generics(
+            src,
+            name + 1,
+            entry.body.unwrap_or(entry.end),
+        )?);
+        self.store
+            .lookups
+            .trait_defs
+            .insert(item, Arc::clone(&parsed));
         Ok(parsed)
     }
 
     /// The trait whose member `item` is.
     pub fn owner_trait(&self, item: ItemRef) -> Option<ItemRef> {
-        self.parent_item(item).filter(|parent| self.item(*parent).1.kind == ItemKind::Trait)
+        self.parent_item(item)
+            .filter(|parent| self.item(*parent).1.kind == ItemKind::Trait)
     }
 
     /// The member of trait `of` named `name`.
@@ -124,7 +132,12 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 let sig = self.signature(member)?;
-                let callable = fixed && sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none() && !super::infer::detached(self, member, |infer| infer.needs_sized_self(member))?;
+                let callable = fixed
+                    && sig.receiver.is_some()
+                    && super::infer::type_params(&sig.generics).next().is_none()
+                    && !super::infer::detached(self, member, |infer| {
+                        infer.needs_sized_self(member)
+                    })?;
                 methods.push(callable.then_some(member));
             }
         }
@@ -144,7 +157,11 @@ impl<'a> Context<'a> {
     }
 
     fn is_generic_trait(&mut self, of: ItemRef) -> Result<bool> {
-        Ok(super::infer::type_params(&self.trait_generics(of)?.1.params).next().is_some())
+        Ok(
+            super::infer::type_params(&self.trait_generics(of)?.1.params)
+                .next()
+                .is_some(),
+        )
     }
 
     /// The traits in scope in module `home`, returned as a shared slice from a per-context cache.
@@ -153,14 +170,21 @@ impl<'a> Context<'a> {
             return Arc::clone(known);
         }
         if let Some(known) = self.store.lookups.scope_traits.get(&home) {
-            self.scope_traits_local.borrow_mut().insert(home, Arc::clone(&known));
+            self.scope_traits_local
+                .borrow_mut()
+                .insert(home, Arc::clone(&known));
             return known;
         }
         let before = self.quiet_mark();
         let found: Arc<[ItemRef]> = self.paths(home.krate).traits_in(home).into();
         if self.quiet_mark() == before {
-            self.store.lookups.scope_traits.insert(home, Arc::clone(&found));
-            self.scope_traits_local.borrow_mut().insert(home, Arc::clone(&found));
+            self.store
+                .lookups
+                .scope_traits
+                .insert(home, Arc::clone(&found));
+            self.scope_traits_local
+                .borrow_mut()
+                .insert(home, Arc::clone(&found));
         }
         found
     }
@@ -169,14 +193,18 @@ impl<'a> Context<'a> {
     pub fn specializable(&self, block: crate::sema::impls::ImplRef) -> bool {
         self.members(block).into_iter().any(|member| {
             let (src, entry) = self.item(member);
-            entry.name.is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "default"))
+            entry
+                .name
+                .is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "default"))
         })
     }
 
     /// Whether trait `item` is an auto trait, which every type implements unless an impl says otherwise.
     pub fn is_auto_trait(&self, item: ItemRef) -> bool {
         let (src, entry) = self.item(item);
-        entry.name.is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "auto"))
+        entry
+            .name
+            .is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "auto"))
     }
 
     /// The `#[global_allocator]` static item in the crate graph, when one is defined.
@@ -191,12 +219,21 @@ impl<'a> Context<'a> {
                 continue;
             }
             for (file, entry) in tree.files.iter().enumerate() {
-                for &(at, _) in entry.items.marks.iter().filter(|(_, bits)| bits & wanted != 0) {
+                for &(at, _) in entry
+                    .items
+                    .marks
+                    .iter()
+                    .filter(|(_, bits)| bits & wanted != 0)
+                {
                     let meta = &entry.items.items[at as usize];
                     if meta.kind != ItemKind::Static || !tree.env.enabled(&meta.attrs) {
                         continue;
                     }
-                    let item = ItemRef { krate: krate as u32, file: file as u32, item: at };
+                    let item = ItemRef {
+                        krate: krate as u32,
+                        file: file as u32,
+                        item: at,
+                    };
                     if self.has_attr(item, "global_allocator") {
                         found = Some(item);
                         break;
@@ -236,24 +273,29 @@ impl<'a> Context<'a> {
         let langs = match &self.langs {
             Some(langs) => langs,
             None => {
-                let loaded = if let Some(langs) = read_lock(&self.store.lookups.state.langs).as_ref() {
-                    Arc::clone(langs)
-                } else {
-                    let built = Arc::new(self.lang_table());
-                    let mut guard = write_lock(&self.store.lookups.state.langs);
-                    Arc::clone(guard.get_or_insert(built))
-                };
+                let loaded =
+                    if let Some(langs) = read_lock(&self.store.lookups.state.langs).as_ref() {
+                        Arc::clone(langs)
+                    } else {
+                        let built = Arc::new(self.lang_table());
+                        let mut guard = write_lock(&self.store.lookups.state.langs);
+                        Arc::clone(guard.get_or_insert(built))
+                    };
                 self.langs.insert(loaded)
             }
         };
         if !langs.partial.is_empty() {
-            self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
+            self.asks
+                .crates
+                .borrow_mut()
+                .extend(langs.partial.iter().copied());
         }
         langs.get(name)
     }
 
     fn lang_table(&self) -> Langs {
-        let (mut table, mut partial, crates) = (HashMap::default(), Vec::new(), self.primitive_holders());
+        let (mut table, mut partial, crates) =
+            (HashMap::default(), Vec::new(), self.primitive_holders());
         let wanted = mark("lang") | mark("panic_handler");
         for &krate in crates.iter() {
             let tree = &self.outline.crates[krate as usize];
@@ -262,11 +304,23 @@ impl<'a> Context<'a> {
                 partial.push(krate);
             }
             for (file, entry) in tree.files.iter().enumerate() {
-                for &(at, _) in entry.items.marks.iter().filter(|(_, bits)| bits & wanted != 0) {
-                    let item = ItemRef { krate, file: file as u32, item: at };
+                for &(at, _) in entry
+                    .items
+                    .marks
+                    .iter()
+                    .filter(|(_, bits)| bits & wanted != 0)
+                {
+                    let item = ItemRef {
+                        krate,
+                        file: file as u32,
+                        item: at,
+                    };
                     if let Some(lang) = self.lang(item) {
                         table.insert(lang.to_owned(), item);
-                    } else if std && entry.items.items[at as usize].kind == ItemKind::Fn && self.has_attr(item, "panic_handler") {
+                    } else if std
+                        && entry.items.items[at as usize].kind == ItemKind::Fn
+                        && self.has_attr(item, "panic_handler")
+                    {
                         table.insert(PANIC_HANDLER.to_owned(), item);
                     }
                 }
@@ -284,6 +338,11 @@ impl<'a> Context<'a> {
             table.get("owned_box").copied(),
             table.get("manually_drop").copied(),
         ];
-        Langs { table, partial, crates, hot }
+        Langs {
+            table,
+            partial,
+            crates,
+            hot,
+        }
     }
 }

@@ -42,7 +42,10 @@ impl InlineKey {
         let mut out = [0u8; WIRE_LEN];
         out[..8].copy_from_slice(&((self.footprint >> 64) as u64).to_le_bytes());
         out[8..12].copy_from_slice(&self.limit.to_le_bytes());
-        out[12] = LOW * u8::from(self.low) | SOLE * u8::from(self.sole) | PRESENT * u8::from(shape.is_some()) | RETURNS * u8::from(returns);
+        out[12] = LOW * u8::from(self.low)
+            | SOLE * u8::from(self.sole)
+            | PRESENT * u8::from(shape.is_some())
+            | RETURNS * u8::from(returns);
         out[13] = height;
         out[14..].copy_from_slice(&size.to_le_bytes());
         out
@@ -52,7 +55,13 @@ impl InlineKey {
         if bytes.len() != WIRE_LEN {
             return None;
         }
-        let shape = (bytes[12] & PRESENT != 0).then(|| (bytes[12] & RETURNS != 0, bytes[13], u16::from_le_bytes([bytes[14], bytes[15]])));
+        let shape = (bytes[12] & PRESENT != 0).then(|| {
+            (
+                bytes[12] & RETURNS != 0,
+                bytes[13],
+                u16::from_le_bytes([bytes[14], bytes[15]]),
+            )
+        });
         (self.encode(shape).as_slice() == bytes).then_some(shape)
     }
 }
@@ -64,7 +73,10 @@ impl Substrate {
         let mut found = None;
         let mut layer = Some(self);
         while let Some(substrate) = layer {
-            for shape in substrate.local_instance_candidates(item, footprint).filter_map(|bytes| key.decode(bytes)) {
+            for shape in substrate
+                .local_instance_candidates(item, footprint)
+                .filter_map(|bytes| key.decode(bytes))
+            {
                 if found.is_some_and(|prior| prior != shape) {
                     return None;
                 }
@@ -81,7 +93,10 @@ impl Substrate {
         let head = key.body_head();
         let mut layer = Some(self);
         while let Some(substrate) = layer {
-            if let Some(body) = substrate.local_instance_candidates(item, footprint).find_map(|bytes| bytes.strip_prefix(head.as_slice())) {
+            if let Some(body) = substrate
+                .local_instance_candidates(item, footprint)
+                .find_map(|bytes| bytes.strip_prefix(head.as_slice()))
+            {
                 return Some(body);
             }
             layer = substrate.parent.as_deref();

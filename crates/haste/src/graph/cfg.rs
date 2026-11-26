@@ -35,14 +35,24 @@ impl Target {
 
     /// The cfgs of `target`, from its catalog entry: the lines before `[internal]` are what Cargo sees.
     pub fn of(target: &haste_codegen::Target) -> Self {
-        let mut cfg = Target { triple: target.triple.to_owned(), ..Target::default() };
+        let mut cfg = Target {
+            triple: target.triple.to_owned(),
+            ..Target::default()
+        };
         let mut internal = false;
-        for line in target.cfg.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for line in target
+            .cfg
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             if line == "[internal]" {
                 internal = true;
                 continue;
             }
-            let pair = line.split_once('=').map(|(key, value)| (key.to_owned(), value.trim_matches('"').to_owned()));
+            let pair = line
+                .split_once('=')
+                .map(|(key, value)| (key.to_owned(), value.trim_matches('"').to_owned()));
             match (pair, internal) {
                 (Some(pair), false) => _ = cfg.pairs.insert(pair),
                 (Some(pair), true) => _ = cfg.internal.insert(pair),
@@ -71,7 +81,10 @@ impl Target {
 
     /// Whether a `[target.KEY.dependencies]` table applies: KEY is a triple or `cfg(...)`.
     pub fn matches_key(&self, key: &str) -> Result<bool> {
-        match key.strip_prefix("cfg(").and_then(|rest| rest.strip_suffix(')')) {
+        match key
+            .strip_prefix("cfg(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
             Some(inner) => Ok(self.holds(&parse(inner)?)),
             None => Ok(key == self.triple),
         }
@@ -137,11 +150,15 @@ pub fn parse(text: &str) -> Result<Cfg> {
 }
 
 fn predicate(lexemes: &[Lexeme], at: &mut usize) -> Result<Cfg> {
-    let Some(Lexeme::Ident(name)) = lexemes.get(*at) else { bail!("expected a cfg name") };
+    let Some(Lexeme::Ident(name)) = lexemes.get(*at) else {
+        bail!("expected a cfg name")
+    };
     *at += 1;
     match lexemes.get(*at) {
         Some(Lexeme::Equals) => {
-            let Some(Lexeme::Text(value)) = lexemes.get(*at + 1) else { bail!("expected a string after {name} =") };
+            let Some(Lexeme::Text(value)) = lexemes.get(*at + 1) else {
+                bail!("expected a string after {name} =")
+            };
             *at += 2;
             Ok(Cfg::KeyValue(name.clone(), value.clone()))
         }
@@ -151,7 +168,11 @@ fn predicate(lexemes: &[Lexeme], at: &mut usize) -> Result<Cfg> {
             match name.as_str() {
                 "all" => Ok(Cfg::All(inner)),
                 "any" => Ok(Cfg::Any(inner)),
-                "not" => inner.into_iter().next().map(|cfg| Cfg::Not(Box::new(cfg))).ok_or_else(|| anyhow!("not() is empty")),
+                "not" => inner
+                    .into_iter()
+                    .next()
+                    .map(|cfg| Cfg::Not(Box::new(cfg)))
+                    .ok_or_else(|| anyhow!("not() is empty")),
                 other => bail!("unknown cfg operator {other}"),
             }
         }

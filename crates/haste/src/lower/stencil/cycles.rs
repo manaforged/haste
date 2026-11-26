@@ -7,8 +7,8 @@ use crate::sema::infer::Shape;
 use crate::sema::reach::Reached;
 use crate::sync::{read_lock, write_lock};
 
-use super::Bodies;
 use super::super::plan::closure_calls_uncached;
+use super::Bodies;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CycleState {
@@ -38,15 +38,30 @@ struct TarjanRun {
 }
 
 impl TarjanRun {
-    fn enter(&mut self, u: usize, (edges, self_loop, complete): (Vec<usize>, bool, bool)) -> (usize, usize, Vec<usize>) {
+    fn enter(
+        &mut self,
+        u: usize,
+        (edges, self_loop, complete): (Vec<usize>, bool, bool),
+    ) -> (usize, usize, Vec<usize>) {
         self.clock += 1;
-        let info = NodeInfo { index: self.clock, low: self.clock, on_stack: true, self_loop, complete };
+        let info = NodeInfo {
+            index: self.clock,
+            low: self.clock,
+            on_stack: true,
+            self_loop,
+            complete,
+        };
         self.nodes.insert(u, info);
         self.stack.push(u);
         (u, 0, edges)
     }
 
-    fn finish(&mut self, u: usize, parent: Option<usize>, cyclic: &mut FxHashMap<usize, CycleState>) {
+    fn finish(
+        &mut self,
+        u: usize,
+        parent: Option<usize>,
+        cyclic: &mut FxHashMap<usize, CycleState>,
+    ) {
         let u_info = self.nodes[&u];
         if u_info.low == u_info.index {
             self.pop_scc(u, cyclic);
@@ -100,7 +115,10 @@ impl Bodies {
         if reached.is_untyped(root) {
             return false;
         }
-        let mut view = CycleView { shared: &self.cyclic, found: FxHashMap::default() };
+        let mut view = CycleView {
+            shared: &self.cyclic,
+            found: FxHashMap::default(),
+        };
         if super::super::may_inline(cx, reached, root) {
             tarjan_from(cx, reached, &mut view, root);
         } else {
@@ -115,7 +133,9 @@ impl Bodies {
                 }
             }
         }
-        shared.get(&root).is_some_and(|&st| st != CycleState::Acyclic)
+        shared
+            .get(&root)
+            .is_some_and(|&st| st != CycleState::Acyclic)
     }
 }
 
@@ -132,7 +152,11 @@ impl CycleView<'_> {
 }
 
 fn tarjan_from(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, root: usize) {
-    let mut run = TarjanRun { nodes: FxHashMap::default(), stack: Vec::new(), clock: 0 };
+    let mut run = TarjanRun {
+        nodes: FxHashMap::default(),
+        stack: Vec::new(),
+        clock: 0,
+    };
     let mut frames = vec![run.enter(root, node_edges(cx, reached, cyclic, root))];
     while let Some(top) = frames.last_mut() {
         let u = top.0;
@@ -148,7 +172,13 @@ fn tarjan_from(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'
 
 type Frames = Vec<(usize, usize, Vec<usize>)>;
 
-fn step_edge(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (run, frames): (&mut TarjanRun, &mut Frames), (u, v): (usize, usize)) {
+fn step_edge(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    cyclic: &mut CycleView<'_>,
+    (run, frames): (&mut TarjanRun, &mut Frames),
+    (u, v): (usize, usize),
+) {
     if cyclic.is_done(v) {
         return;
     }
@@ -165,18 +195,35 @@ fn step_edge(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>
     frames.push(run.enter(v, node_edges(cx, reached, cyclic, v)));
 }
 
-fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, u: usize) -> (Vec<usize>, bool, bool) {
-    let mut info = NodeInfo { index: 0, low: 0, on_stack: false, self_loop: false, complete: true };
+fn node_edges(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    cyclic: &mut CycleView<'_>,
+    u: usize,
+) -> (Vec<usize>, bool, bool) {
+    let mut info = NodeInfo {
+        index: 0,
+        low: 0,
+        on_stack: false,
+        self_loop: false,
+        complete: true,
+    };
     let mut edges = Vec::new();
-    let closure = matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
+    let closure =
+        matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
     if let Some(slice) = reached.direct_calls(u).filter(|_| !closure) {
         for &v in slice {
             scan_callee(cx, reached, cyclic, (u, v), (&mut info, &mut edges));
         }
         return (edges, info.self_loop, info.complete);
     }
-    let Ok(typed) = &reached.list[u].1 else { return (edges, false, true) };
-    let calls = closure.then(|| closure_calls_uncached(cx, typed)).flatten().unwrap_or_else(|| typed.calls().collect());
+    let Ok(typed) = &reached.list[u].1 else {
+        return (edges, false, true);
+    };
+    let calls = closure
+        .then(|| closure_calls_uncached(cx, typed))
+        .flatten()
+        .unwrap_or_else(|| typed.calls().collect());
     for (item, substs) in calls {
         if cx.intrinsic(item).is_some() {
             continue;
@@ -189,9 +236,16 @@ fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_
     (edges, info.self_loop, info.complete)
 }
 
-fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (u, v): (usize, usize), (info, edges): (&mut NodeInfo, &mut Vec<usize>)) {
+fn scan_callee(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    cyclic: &mut CycleView<'_>,
+    (u, v): (usize, usize),
+    (info, edges): (&mut NodeInfo, &mut Vec<usize>),
+) {
     if v == u {
-        info.self_loop |= !matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
+        info.self_loop |=
+            !matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
         return;
     }
     if own_glue(cx, reached, (u, v)) {
@@ -213,7 +267,8 @@ fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'
 
 /// Whether `v` is glue of closure `u`'s own type, which `u` can name but never reach while it runs.
 fn own_glue(cx: &Context<'_>, reached: &Reached, (u, v): (usize, usize)) -> bool {
-    let closure = matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
+    let closure =
+        matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
     let glue = matches!(&reached.list[v].1, Ok(typed) if matches!(typed.shape, Shape::Glue(_)));
     let own = |index: usize| cx.types.substs(reached.list[index].0.1).first().copied();
     closure && glue && own(u).is_some() && own(u) == own(v)

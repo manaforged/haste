@@ -10,16 +10,34 @@ use crate::live::{Elided, for_effective_operands, results};
 pub(super) type Copies<'f> = Zip<Iter<'f, Value>, Iter<'f, Value>>;
 
 /// Each instruction in block order, with the weight of its block.
-pub(super) fn weighted<'f>(func: &'f Function, blocks: &'f [u64]) -> impl Iterator<Item = (u64, &'f InstData)> + 'f {
-    func.blocks.iter().enumerate().flat_map(move |(at, data)| data.insts.iter().map(move |inst| (blocks[at], &func.insts[inst.index()])))
+pub(super) fn weighted<'f>(
+    func: &'f Function,
+    blocks: &'f [u64],
+) -> impl Iterator<Item = (u64, &'f InstData)> + 'f {
+    func.blocks.iter().enumerate().flat_map(move |(at, data)| {
+        data.insts
+            .iter()
+            .map(move |inst| (blocks[at], &func.insts[inst.index()]))
+    })
 }
 
 /// Calls `visit` for each block edge in block order with its source block, the source's weight (1 without weights), its target and its copies.
-pub(super) fn edge_copies<'f>(func: &'f Function, blocks: Option<&[u64]>, mut visit: impl FnMut(Block, u64, Block, Copies<'f>)) {
+pub(super) fn edge_copies<'f>(
+    func: &'f Function,
+    blocks: Option<&[u64]>,
+    mut visit: impl FnMut(Block, u64, Block, Copies<'f>),
+) {
     for (at, data) in func.blocks.iter().enumerate() {
         let (src, weight) = (Block(at as u32), blocks.map_or(1, |w| w[at]));
         for inst in &data.insts {
-            terminator_edges(&func.insts[inst.index()].op, |target, args| visit(src, weight, target, func.blocks[target.index()].params.iter().zip(args)));
+            terminator_edges(&func.insts[inst.index()].op, |target, args| {
+                visit(
+                    src,
+                    weight,
+                    target,
+                    func.blocks[target.index()].params.iter().zip(args),
+                )
+            });
         }
     }
 }
@@ -57,20 +75,37 @@ pub(super) fn weights(func: &Function, blocks: &[u64], eff: Elided<'_>) -> Vec<u
     weight
 }
 
-pub(super) fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], blocks: Option<&[u64]>) -> (Option<Vec<Vec<Value>>>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
+pub(super) fn edge_hints(
+    func: &Function,
+    cfg: Option<&Cfg>,
+    order: &[Block],
+    blocks: Option<&[u64]>,
+) -> (
+    Option<Vec<Vec<Value>>>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+) {
     let rank = cfg.is_none().then(|| Cfg::ranks(order, func.blocks.len()));
     let is_back = |src: Block, target: Block| match (cfg, rank.as_deref()) {
         (Some(cfg), _) => cfg.reachable[src.index()] && cfg.dominates(target, src),
-        (None, Some(rank)) => rank[src.index()] != usize::MAX && rank[target.index()] <= rank[src.index()],
+        (None, Some(rank)) => {
+            rank[src.index()] != usize::MAX && rank[target.index()] <= rank[src.index()]
+        }
         (None, None) => target.index() <= src.index(),
     };
     let mut incoming = vec![0_u32; func.types.len()];
     if let Some(entry) = func.entry {
-        func.blocks[entry.index()].params.iter().for_each(|p| incoming[p.index()] += 1);
+        func.blocks[entry.index()]
+            .params
+            .iter()
+            .for_each(|p| incoming[p.index()] += 1);
     }
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Op::TryCall { handler, .. } = func.insts[inst.index()].op {
-            func.blocks[handler.index()].params.iter().for_each(|p| incoming[p.index()] += 1);
+            func.blocks[handler.index()]
+                .params
+                .iter()
+                .for_each(|p| incoming[p.index()] += 1);
         }
     }
     let mut copied = vec![0_u32; func.types.len()];
@@ -91,12 +126,20 @@ pub(super) fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], bl
     let mut edge_args = Vec::new();
     let mut out = cfg.is_some().then(|| vec![Vec::new(); func.types.len()]);
     for (back, _, p, a) in edges {
-        if (back || incoming[p] == 1 || uses[a] == copied[a]) && !back_args.contains(&(p, a)) { back_args.push((p, a)); }
-        if cfg.is_some() && !back && !edge_args.contains(&(p, a)) { edge_args.push((p, a)); }
+        if (back || incoming[p] == 1 || uses[a] == copied[a]) && !back_args.contains(&(p, a)) {
+            back_args.push((p, a));
+        }
+        if cfg.is_some() && !back && !edge_args.contains(&(p, a)) {
+            edge_args.push((p, a));
+        }
         if let Some(partners) = out.as_mut() {
             let (pv, av) = (Value(p as u32), Value(a as u32));
-            if !partners[p].contains(&av) { partners[p].push(av); }
-            if !partners[a].contains(&pv) { partners[a].push(pv); }
+            if !partners[p].contains(&av) {
+                partners[p].push(av);
+            }
+            if !partners[a].contains(&pv) {
+                partners[a].push(pv);
+            }
         }
     }
     (out, back_args, edge_args)
@@ -104,5 +147,9 @@ pub(super) fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], bl
 
 /// Calls `visit` with the source, target, parameter and argument of every block-edge copy whose parameter and argument differ.
 pub(crate) fn for_edge_copies(func: &Function, mut visit: impl FnMut(Block, Block, Value, Value)) {
-    edge_copies(func, None, |src, _, target, copies| copies.filter(|(param, arg)| param != arg).for_each(|(&param, &arg)| visit(src, target, param, arg)));
+    edge_copies(func, None, |src, _, target, copies| {
+        copies
+            .filter(|(param, arg)| param != arg)
+            .for_each(|(&param, &arg)| visit(src, target, param, arg))
+    });
 }

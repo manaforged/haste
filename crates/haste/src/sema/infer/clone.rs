@@ -17,7 +17,10 @@ pub fn cloned_tuple(cx: &Context<'_>, ty: Ty) -> Option<Ty> {
 
 /// Whether the compiler implements `Clone` for `ty`, a tuple, a closure, a function item or a function pointer, with no impl to select.
 pub fn compiler_clone(cx: &Context<'_>, ty: Ty) -> bool {
-    matches!(cx.types.kind(ty), Kind::Tuple(_) | Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..))
+    matches!(
+        cx.types.kind(ty),
+        Kind::Tuple(_) | Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)
+    )
 }
 
 /// The typed form of the `Clone::clone` that the compiler writes for the tuple, closure, function item or function pointer `ty`: one `&ty` parameter, and the clone of each field.
@@ -30,12 +33,21 @@ pub fn clone_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed>
     };
     let source = cx.types.intern(Kind::Ref(Mut::Not, ty));
     let calls = detached(cx, item, |infer| {
-        fields.iter().map(|&field| {
-            let substs = infer.cx.types.intern_substs(&[field]);
-            infer.trait_call(item, substs)
-        }).collect::<Result<Vec<_>>>()
+        fields
+            .iter()
+            .map(|&field| {
+                let substs = infer.cx.types.intern_substs(&[field]);
+                infer.trait_call(item, substs)
+            })
+            .collect::<Result<Vec<_>>>()
     })?;
-    Ok(Typed { locals: vec![Local { ty: source }], params: vec![0], ret: Some(ty), shape: Shape::Clone(calls), ..Typed::default() })
+    Ok(Typed {
+        locals: vec![Local { ty: source }],
+        params: vec![0],
+        ret: Some(ty),
+        shape: Shape::Clone(calls),
+        ..Typed::default()
+    })
 }
 
 impl Infer<'_, '_> {

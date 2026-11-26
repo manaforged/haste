@@ -22,11 +22,19 @@ const OK_MARK: &str = "+";
 
 /// The directory of the store: `$HASTE_HOME`, else `$XDG_CACHE_HOME/haste`, else `$HOME/.cache/haste` (or `%LOCALAPPDATA%\haste` on Windows).
 pub(crate) fn home() -> PathBuf {
-    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
     let home = var("HASTE_HOME")
         .or_else(|| var("XDG_CACHE_HOME").map(|cache| cache.join("haste")))
         .or_else(|| var("LOCALAPPDATA").map(|cache| cache.join("haste")))
-        .or_else(|| var("HOME").or_else(|| var("USERPROFILE")).map(|home| home.join(".cache/haste")));
+        .or_else(|| {
+            var("HOME")
+                .or_else(|| var("USERPROFILE"))
+                .map(|home| home.join(".cache/haste"))
+        });
     home.unwrap_or_else(|| std::env::temp_dir().join("haste"))
 }
 
@@ -46,8 +54,14 @@ impl Expansion {
     pub fn new((pin, caller): (u64, u64), name: &str, texts: &[String]) -> Expansion {
         let program = program();
         let key = rustc_hash::FxBuildHasher.hash_one((pin, caller, name, texts, program));
-        let inputs = format!("{pin:016x}:{caller:016x} {program:?} {name}\0{}", texts.join("\0"));
-        Expansion { path: home().join("macros").join(format!("{key:016x}")), inputs }
+        let inputs = format!(
+            "{pin:016x}:{caller:016x} {program:?} {name}\0{}",
+            texts.join("\0")
+        );
+        Expansion {
+            path: home().join("macros").join(format!("{key:016x}")),
+            inputs,
+        }
     }
 
     /// What this call printed, or why it failed, when a run kept it for the same inputs.
@@ -71,7 +85,10 @@ impl Expansion {
             return remove(&self.path);
         };
         std::fs::create_dir_all(self.path.parent().unwrap_or(&self.path))?;
-        write_new(&self.path, &format!("{OK_MARK}{}\n{}{output}", self.inputs.len(), self.inputs))
+        write_new(
+            &self.path,
+            &format!("{OK_MARK}{}\n{}{output}", self.inputs.len(), self.inputs),
+        )
     }
 }
 
@@ -83,7 +100,11 @@ pub(crate) fn meta_stamp(meta: &std::fs::Metadata) -> (u64, i128) {
     #[cfg(unix)]
     let nanos = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
     #[cfg(not(unix))]
-    let nanos = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i128);
+    let nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as i128);
     (meta.len(), nanos)
 }
 
@@ -103,15 +124,35 @@ pub(crate) fn program() -> FileStamp {
 pub fn dir(workspace: &Workspace, unit: usize) -> PathBuf {
     let entry = &workspace.graph.units[unit];
     let package = &workspace.packages[entry.package];
-    let side = if entry.side == Side::Host { "host" } else { "target" };
-    let profile = if crate::profile() == crate::outline::tree::Profile::Release { "release" } else { "debug" };
+    let side = if entry.side == Side::Host {
+        "host"
+    } else {
+        "target"
+    };
+    let profile = if crate::profile() == crate::outline::tree::Profile::Release {
+        "release"
+    } else {
+        "debug"
+    };
     let features: Vec<&str> = entry.features.iter().map(String::as_str).collect();
-    let key = rustc_hash::FxBuildHasher.hash_one((package.manifest.dir.as_path(), side, profile, features.join(",")));
-    root().join(format!("{}-{}-{key:016x}", package.locked.name, package.locked.version))
+    let key = rustc_hash::FxBuildHasher.hash_one((
+        package.manifest.dir.as_path(),
+        side,
+        profile,
+        features.join(","),
+    ));
+    root().join(format!(
+        "{}-{}-{key:016x}",
+        package.locked.name, package.locked.version
+    ))
 }
 
 /// The kept result of `unit`'s script when it succeeded with `vars` under this program and no watched file or variable changed since.
-pub fn kept(workspace: &Workspace, unit: usize, vars: &[(String, String)]) -> Option<Result<Output, String>> {
+pub fn kept(
+    workspace: &Workspace,
+    unit: usize,
+    vars: &[(String, String)],
+) -> Option<Result<Output, String>> {
     let dir = dir(workspace, unit);
     let stamp = std::fs::read_to_string(dir.join(STAMP)).ok()?;
     let mut lines = stamp.lines();
@@ -121,15 +162,26 @@ pub fn kept(workspace: &Workspace, unit: usize, vars: &[(String, String)]) -> Op
     if dir.join(FAILED).exists() {
         return None;
     }
-    std::fs::read_to_string(dir.join(OUTPUT)).ok().map(|text| Ok(Output::parse(&text)))
+    std::fs::read_to_string(dir.join(OUTPUT))
+        .ok()
+        .map(|text| Ok(Output::parse(&text)))
 }
 
 /// Keeps what `unit`'s script printed when it ran with `vars`, with the files and variables it watches as they are now.
-pub fn keep(workspace: &Workspace, unit: usize, vars: &[(String, String)], text: &str) -> io::Result<()> {
+pub fn keep(
+    workspace: &Workspace,
+    unit: usize,
+    vars: &[(String, String)],
+    text: &str,
+) -> io::Result<()> {
     let dir = dir(workspace, unit);
     remove(&dir.join(FAILED))?;
     write_new(&dir.join(OUTPUT), text)?;
-    stamp(&dir, vars, &Watched::of(workspace, unit, &Output::parse(text)))
+    stamp(
+        &dir,
+        vars,
+        &Watched::of(workspace, unit, &Output::parse(text)),
+    )
 }
 
 /// Clears any stale cached build-script stamp after a failed run so the next build retries immediately.
@@ -142,7 +194,12 @@ pub fn clear_failure(workspace: &Workspace, unit: usize) -> io::Result<()> {
 
 fn stamp(dir: &Path, vars: &[(String, String)], watched: &Watched) -> io::Result<()> {
     let mut stamp = format!("{}\n{}\n", inputs_hash(vars), watched.hash());
-    stamp.extend(watched.files.iter().map(|path| format!("f {}\n", path.display())));
+    stamp.extend(
+        watched
+            .files
+            .iter()
+            .map(|path| format!("f {}\n", path.display())),
+    );
     stamp.extend(watched.vars.iter().map(|name| format!("e {name}\n")));
     write_new(&dir.join(STAMP), &stamp)
 }
@@ -207,7 +264,11 @@ pub struct Lock {
 pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
     let dir = dir(workspace, unit);
     std::fs::create_dir_all(&dir)?;
-    let file = File::options().create(true).truncate(false).write(true).open(dir.join("lock"))?;
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("lock"))?;
     #[cfg(unix)]
     // SAFETY: the descriptor belongs to `file`, which stays open for the call; flock only reads it.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
@@ -225,12 +286,35 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
             event: *mut core::ffi::c_void,
         }
         unsafe extern "system" {
-            fn LockFileEx(file: *mut core::ffi::c_void, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32;
+            fn LockFileEx(
+                file: *mut core::ffi::c_void,
+                flags: u32,
+                reserved: u32,
+                low: u32,
+                high: u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
         }
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
-        let mut overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() };
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: std::ptr::null_mut(),
+        };
         // SAFETY: file.as_raw_handle() is a live open file handle and overlapped is a live zeroed struct.
-        if unsafe { LockFileEx(file.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK, 0, u32::MAX, u32::MAX, &raw mut overlapped) } == 0 {
+        if unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &raw mut overlapped,
+            )
+        } == 0
+        {
             return Err(io::Error::last_os_error());
         }
     }
@@ -238,7 +322,10 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
 }
 
 fn replace_with(path: &Path, stage: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = fresh(path);
@@ -250,7 +337,10 @@ fn replace_with(path: &Path, stage: impl FnOnce(&Path) -> io::Result<()>) -> io:
 }
 
 /// Atomically streams output written by `write` to `path` via a unique sibling temporary file and rename.
-pub fn write_new_with(path: &Path, write: impl FnOnce(&mut io::BufWriter<File>) -> io::Result<()>) -> io::Result<()> {
+pub fn write_new_with(
+    path: &Path,
+    write: impl FnOnce(&mut io::BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
     replace_with(path, |tmp| {
         let mut writer = io::BufWriter::with_capacity(256 * 1024, File::create(tmp)?);
         write(&mut writer)?;
@@ -277,7 +367,10 @@ pub(crate) fn replace_symlink(target: &std::ffi::OsStr, path: &Path) -> io::Resu
 /// Atomically replaces symlink `path` with a link pointing to `target`.
 #[cfg(not(unix))]
 pub(crate) fn replace_symlink(_target: &std::ffi::OsStr, _path: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "symlinks require Unix"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symlinks require Unix",
+    ))
 }
 
 /// The path this process writes `path` at before it renames the file into place, so no reader sees it half written.
@@ -290,7 +383,10 @@ pub(crate) fn fresh(path: &Path) -> PathBuf {
 fn inputs_hash(vars: &[(String, String)]) -> String {
     let mut sorted: Vec<&(String, String)> = vars.iter().collect();
     sorted.sort();
-    format!("{:016x}", rustc_hash::FxBuildHasher.hash_one((sorted, program())))
+    format!(
+        "{:016x}",
+        rustc_hash::FxBuildHasher.hash_one((sorted, program()))
+    )
 }
 
 /// The files and environment variables whose change makes a script run again.
@@ -305,18 +401,28 @@ impl Watched {
         let package = &workspace.packages[workspace.graph.units[unit].package];
         let manifest = &package.manifest;
         let local = package.locked.source.is_none();
-        let mut files: Vec<PathBuf> = output.watched.iter().map(|path| manifest.dir.join(path)).collect();
+        let mut files: Vec<PathBuf> = output
+            .watched
+            .iter()
+            .map(|path| manifest.dir.join(path))
+            .collect();
         if output.watched.is_empty() && output.watched_vars.is_empty() && local {
             files.push(manifest.dir.clone());
         }
         if local && let Some(build) = &manifest.build {
             build_script_inputs(&manifest.dir, build, &mut files);
         }
-        Watched { files, vars: output.watched_vars.clone() }
+        Watched {
+            files,
+            vars: output.watched_vars.clone(),
+        }
     }
 
     fn read<'t>(lines: impl Iterator<Item = &'t str>) -> Watched {
-        let mut watched = Watched { files: Vec::new(), vars: Vec::new() };
+        let mut watched = Watched {
+            files: Vec::new(),
+            vars: Vec::new(),
+        };
         for line in lines {
             match line.split_at_checked(2) {
                 Some(("f ", path)) => watched.files.push(PathBuf::from(path)),
@@ -333,8 +439,12 @@ impl Watched {
         for path in &self.files {
             walk(path, &mut stamps);
         }
-        let vars: Vec<Option<std::ffi::OsString>> = self.vars.iter().map(std::env::var_os).collect();
-        format!("{:016x}", rustc_hash::FxBuildHasher.hash_one((stamps, vars)))
+        let vars: Vec<Option<std::ffi::OsString>> =
+            self.vars.iter().map(std::env::var_os).collect();
+        format!(
+            "{:016x}",
+            rustc_hash::FxBuildHasher.hash_one((stamps, vars))
+        )
     }
 }
 
@@ -354,19 +464,28 @@ fn build_script_inputs(manifest_dir: &Path, build_path: &Path, into: &mut Vec<Pa
     };
     let mut extras: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs") && path.is_file())
+        .filter(|path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("rs") && path.is_file()
+        })
         .collect();
     extras.sort();
     into.extend(extras);
 }
 
 /// Stamps of all build-script sources, `cargo:rerun-if-changed` paths, and `cargo:rerun-if-env-changed` values for local packages in `workspace`.
-pub(crate) fn watched_stamps(workspace: &Workspace) -> (Vec<(PathBuf, u64, i128)>, Vec<(String, Option<std::ffi::OsString>)>) {
+pub(crate) fn watched_stamps(
+    workspace: &Workspace,
+) -> (
+    Vec<(PathBuf, u64, i128)>,
+    Vec<(String, Option<std::ffi::OsString>)>,
+) {
     let mut files = Vec::new();
     let mut vars = Vec::new();
     for (unit, entry) in workspace.graph.units.iter().enumerate() {
         let package = &workspace.packages[entry.package];
-        let Some(build) = &package.manifest.build else { continue };
+        let Some(build) = &package.manifest.build else {
+            continue;
+        };
         if !package.local() {
             continue;
         }
@@ -386,7 +505,10 @@ pub(crate) fn watched_stamps(workspace: &Workspace) -> (Vec<(PathBuf, u64, i128)
     for path in &files {
         walk(path, &mut stamps);
     }
-    let env_vals = vars.into_iter().map(|name| (name.clone(), std::env::var_os(&name))).collect();
+    let env_vals = vars
+        .into_iter()
+        .map(|name| (name.clone(), std::env::var_os(&name)))
+        .collect();
     (stamps, env_vals)
 }
 
@@ -404,9 +526,16 @@ pub(crate) fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i128)>) {
     let Ok(entries) = std::fs::read_dir(path) else {
         return;
     };
-    let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
     children.sort();
-    for child in children.iter().filter(|child| !matches!(child.file_name().and_then(|name| name.to_str()), Some("target" | ".git"))) {
+    for child in children.iter().filter(|child| {
+        !matches!(
+            child.file_name().and_then(|name| name.to_str()),
+            Some("target" | ".git")
+        )
+    }) {
         walk(child, into);
     }
 }

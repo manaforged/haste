@@ -19,16 +19,34 @@ struct Splitter<'f> {
 
 /// Splits the 128-bit values of `func` into 64-bit halves; reports whether it changed the body.
 pub(crate) fn split(func: &mut Function) -> bool {
-    if !func.blocks.iter().flat_map(|b| &b.insts).any(|i| func.insts[i.index()].result.is_some_and(|r| func.ty(r) == Type::I128)) {
+    if !func.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        func.insts[i.index()]
+            .result
+            .is_some_and(|r| func.ty(r) == Type::I128)
+    }) {
         return false;
     }
     let cfg = func.cfg();
-    if func.blocks.iter().enumerate().any(|(b, data)| !cfg.reachable[b] && !data.insts.is_empty()) {
+    if func
+        .blocks
+        .iter()
+        .enumerate()
+        .any(|(b, data)| !cfg.reachable[b] && !data.insts.is_empty())
+    {
         return false;
     }
     let rpo = cfg.rpo.clone();
     let chained = chained(func);
-    let mut splitter = Splitter { defs: crate::fold::defs(func), func, halves: HashMap::default(), alias: HashMap::default(), offsets: HashMap::default(), chained, split_at: Vec::new(), insts: Vec::new() };
+    let mut splitter = Splitter {
+        defs: crate::fold::defs(func),
+        func,
+        halves: HashMap::default(),
+        alias: HashMap::default(),
+        offsets: HashMap::default(),
+        chained,
+        split_at: Vec::new(),
+        insts: Vec::new(),
+    };
     splitter.split_params();
     for block in rpo {
         splitter.block(block);
@@ -41,18 +59,26 @@ fn chained(func: &Function) -> Vec<bool> {
     let mut ok = vec![false; func.types.len()];
     let has_add = func.blocks.iter().flat_map(|b| &b.insts).any(|&inst| {
         let data = &func.insts[inst.index()];
-        matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I128)
+        matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..))
+            && data.result.is_some_and(|r| func.ty(r) == Type::I128)
     });
     if !has_add {
         return ok;
     }
     let uses = func.use_counts();
     for block in &func.blocks {
-        let local: Vec<Value> = block.insts.iter().filter_map(|&inst| func.insts[inst.index()].result).collect();
+        let local: Vec<Value> = block
+            .insts
+            .iter()
+            .filter_map(|&inst| func.insts[inst.index()].result)
+            .collect();
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            if matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I128) {
-                data.op.for_operands(|v| ok[v.index()] = uses[v.index()] == 1 && local.contains(&v));
+            if matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..))
+                && data.result.is_some_and(|r| func.ty(r) == Type::I128)
+            {
+                data.op
+                    .for_operands(|v| ok[v.index()] = uses[v.index()] == 1 && local.contains(&v));
             }
         }
     }
@@ -94,8 +120,10 @@ impl Splitter<'_> {
 
     fn bin(&mut self, op: Binary, x: Value, y: Value) -> Value {
         match (op, self.word(x), self.word(y)) {
-            (Binary::Iadd | Binary::Bor | Binary::Bxor, Some(0), _) | (Binary::Imul, _, Some(0)) => y,
-            (Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor, _, Some(0)) | (Binary::Imul, Some(0), _) => x,
+            (Binary::Iadd | Binary::Bor | Binary::Bxor, Some(0), _)
+            | (Binary::Imul, _, Some(0)) => y,
+            (Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor, _, Some(0))
+            | (Binary::Imul, Some(0), _) => x,
             _ => self.emit(Op::Binary(op, x, y), Type::I64),
         }
     }
@@ -121,7 +149,8 @@ impl Splitter<'_> {
     fn const_low(&self, v: Value) -> Option<i64> {
         match self.func.insts[self.defs.get(v.index()).copied().flatten()?.index()].op {
             Op::Const(imm) => Some(imm),
-            Op::Binary(Binary::Iconcat, lo, _) | Op::Convert(Convert::Uextend | Convert::Sextend, lo) => self.const_low(lo),
+            Op::Binary(Binary::Iconcat, lo, _)
+            | Op::Convert(Convert::Uextend | Convert::Sextend, lo) => self.const_low(lo),
             _ => None,
         }
     }
@@ -157,7 +186,9 @@ impl Splitter<'_> {
                 } else if ok[block] {
                     let (lo, hi) = (self.func.value(Type::I64), self.func.value(Type::I64));
                     kept.extend([lo, hi]);
-                    let joined = self.func.add(Op::Binary(Binary::Iconcat, lo, hi), Some(param));
+                    let joined = self
+                        .func
+                        .add(Op::Binary(Binary::Iconcat, lo, hi), Some(param));
                     self.insts.push(joined);
                     self.defs[param.index()] = Some(joined);
                     self.halves.insert(param, (lo, hi));
@@ -167,10 +198,16 @@ impl Splitter<'_> {
                     self.halves.insert(param, pair);
                 }
             }
-            self.split_at[block] = params.iter().map(|&p| ok[block] && self.func.ty(p) == Type::I128).collect();
+            self.split_at[block] = params
+                .iter()
+                .map(|&p| ok[block] && self.func.ty(p) == Type::I128)
+                .collect();
             self.func.blocks[block].params = kept;
             let body = std::mem::take(&mut self.func.blocks[block].insts);
-            self.func.blocks[block].insts = std::mem::take(&mut self.insts).into_iter().chain(body).collect();
+            self.func.blocks[block].insts = std::mem::take(&mut self.insts)
+                .into_iter()
+                .chain(body)
+                .collect();
         }
     }
 
@@ -179,7 +216,8 @@ impl Splitter<'_> {
         self.insts = Vec::with_capacity(old.len());
         for inst in old {
             let mut data = self.func.insts[inst.index()].clone();
-            data.op.map_operands(|v| self.alias.get(&v).copied().unwrap_or(v));
+            data.op
+                .map_operands(|v| self.alias.get(&v).copied().unwrap_or(v));
             data.op = self.read(data.op, data.result);
             self.func.insts[inst.index()] = data.clone();
             self.insts.push(inst);
@@ -273,7 +311,11 @@ impl Splitter<'_> {
             }
             Op::Binary(op @ (Binary::Iadd | Binary::Isub), a, b) => {
                 let ((a, ka), (b, kb)) = (self.terms(a), self.terms(b));
-                let (pair, k) = if op == Binary::Iadd { (self.add(a, b), ka.wrapping_add(kb)) } else { (self.sub(a, b), ka.wrapping_sub(kb)) };
+                let (pair, k) = if op == Binary::Iadd {
+                    (self.add(a, b), ka.wrapping_add(kb))
+                } else {
+                    (self.sub(a, b), ka.wrapping_sub(kb))
+                };
                 if k != 0 && self.chained.get(result.index()).copied().unwrap_or(false) {
                     self.offsets.insert(result, k);
                     return pair;
@@ -281,22 +323,37 @@ impl Splitter<'_> {
                 self.settle(pair, k)
             }
             Op::Binary(Binary::Imul, a, b) => self.mul(a, b),
-            Op::Binary(op @ (Binary::Ushr | Binary::Sshr | Binary::Ishl), a, k) if self.const_low(k).is_some() => {
+            Op::Binary(op @ (Binary::Ushr | Binary::Sshr | Binary::Ishl), a, k)
+                if self.const_low(k).is_some() =>
+            {
                 let shift = (self.const_low(k).unwrap_or(0) & 127) as u32;
                 let pair = self.pair(a);
                 self.shift(op, pair, shift)
             }
             Op::Binary(op @ (Binary::Ushr | Binary::Sshr | Binary::Ishl), a, k) => {
-                let amount = if self.func.ty(k) == Type::I128 { self.pair(k).0 } else { self.to_word(k, false) };
+                let amount = if self.func.ty(k) == Type::I128 {
+                    self.pair(k).0
+                } else {
+                    self.to_word(k, false)
+                };
                 let pair = self.pair(a);
                 self.shift_by(op, pair, amount)
             }
             Op::Select(c, a, b) => {
                 let ((al, ah), (bl, bh)) = (self.pair(a), self.pair(b));
-                (self.emit(Op::Select(c, al, bl), Type::I64), self.emit(Op::Select(c, ah, bh), Type::I64))
+                (
+                    self.emit(Op::Select(c, al, bl), Type::I64),
+                    self.emit(Op::Select(c, ah, bh), Type::I64),
+                )
             }
-            Op::Load(addr, at) => (self.emit(Op::Load(addr, at), Type::I64), self.emit(Op::Load(addr, at + 8), Type::I64)),
-            Op::StackLoad(slot, at) => (self.emit(Op::StackLoad(slot, at), Type::I64), self.emit(Op::StackLoad(slot, at + 8), Type::I64)),
+            Op::Load(addr, at) => (
+                self.emit(Op::Load(addr, at), Type::I64),
+                self.emit(Op::Load(addr, at + 8), Type::I64),
+            ),
+            Op::StackLoad(slot, at) => (
+                self.emit(Op::StackLoad(slot, at), Type::I64),
+                self.emit(Op::StackLoad(slot, at + 8), Type::I64),
+            ),
             _ => self.extract(result),
         }
     }
@@ -305,13 +362,27 @@ impl Splitter<'_> {
         if self.func.ty(x) == Type::I64 {
             return x;
         }
-        self.emit(Op::Convert(if signed { Convert::Sextend } else { Convert::Uextend }, x), Type::I64)
+        self.emit(
+            Op::Convert(
+                if signed {
+                    Convert::Sextend
+                } else {
+                    Convert::Uextend
+                },
+                x,
+            ),
+            Type::I64,
+        )
     }
 
     /// The halves of `v` with its constant halves taken out, and the 128-bit constant that still has to be added to them.
     fn terms(&mut self, v: Value) -> (Pair, i128) {
         let mut k = self.offsets.remove(&v).unwrap_or(0);
-        let (mut lo, mut hi) = self.halves.get(&v).copied().unwrap_or_else(|| self.extract(v));
+        let (mut lo, mut hi) = self
+            .halves
+            .get(&v)
+            .copied()
+            .unwrap_or_else(|| self.extract(v));
         if let Some(c) = self.word(lo).filter(|&c| c != 0) {
             k = k.wrapping_add(i128::from(c as u64));
             lo = self.konst(0);
@@ -379,38 +450,68 @@ impl Splitter<'_> {
             let carried = self.bin(Binary::Ushr, carried, back);
             let high = self.bin(Binary::Ishl, hi, small);
             let high = self.bin(Binary::Bor, high, carried);
-            return (self.emit(Op::Select(big, zero, low), Type::I64), self.emit(Op::Select(big, low, high), Type::I64));
+            return (
+                self.emit(Op::Select(big, zero, low), Type::I64),
+                self.emit(Op::Select(big, low, high), Type::I64),
+            );
         }
         let high = self.bin(op, hi, small);
         let carried = self.bin_imm(Binary::Ishl, hi, 1);
         let carried = self.bin(Binary::Ishl, carried, back);
         let low = self.bin(Binary::Ushr, lo, small);
         let low = self.bin(Binary::Bor, low, carried);
-        let fill = if op == Binary::Sshr { self.bin_imm(Binary::Sshr, hi, 63) } else { zero };
-        (self.emit(Op::Select(big, high, low), Type::I64), self.emit(Op::Select(big, fill, high), Type::I64))
+        let fill = if op == Binary::Sshr {
+            self.bin_imm(Binary::Sshr, hi, 63)
+        } else {
+            zero
+        };
+        (
+            self.emit(Op::Select(big, high, low), Type::I64),
+            self.emit(Op::Select(big, fill, high), Type::I64),
+        )
     }
 
     fn shift(&mut self, op: Binary, (lo, hi): Pair, shift: u32) -> Pair {
-        let fill = |this: &mut Self| if op == Binary::Sshr { this.bin_imm(Binary::Sshr, hi, 63) } else { this.konst(0) };
+        let fill = |this: &mut Self| {
+            if op == Binary::Sshr {
+                this.bin_imm(Binary::Sshr, hi, 63)
+            } else {
+                this.konst(0)
+            }
+        };
         match (op, shift) {
             (_, 0) => (lo, hi),
             (Binary::Ishl, 64..) => {
-                let high = if shift == 64 { lo } else { self.bin_imm(Binary::Ishl, lo, i64::from(shift - 64)) };
+                let high = if shift == 64 {
+                    lo
+                } else {
+                    self.bin_imm(Binary::Ishl, lo, i64::from(shift - 64))
+                };
                 (self.konst(0), high)
             }
             (Binary::Ishl, _) => {
                 let high = self.bin_imm(Binary::Ishl, hi, i64::from(shift));
                 let carried = self.bin_imm(Binary::Ushr, lo, i64::from(64 - shift));
-                (self.bin_imm(Binary::Ishl, lo, i64::from(shift)), self.bin(Binary::Bor, high, carried))
+                (
+                    self.bin_imm(Binary::Ishl, lo, i64::from(shift)),
+                    self.bin(Binary::Bor, high, carried),
+                )
             }
             (_, 64..) => {
-                let low = if shift == 64 { hi } else { self.bin_imm(op, hi, i64::from(shift - 64)) };
+                let low = if shift == 64 {
+                    hi
+                } else {
+                    self.bin_imm(op, hi, i64::from(shift - 64))
+                };
                 (low, fill(self))
             }
             _ => {
                 let low = self.bin_imm(Binary::Ushr, lo, i64::from(shift));
                 let carried = self.bin_imm(Binary::Ishl, hi, i64::from(64 - shift));
-                (self.bin(Binary::Bor, low, carried), self.bin_imm(op, hi, i64::from(shift)))
+                (
+                    self.bin(Binary::Bor, low, carried),
+                    self.bin_imm(op, hi, i64::from(shift)),
+                )
             }
         }
     }
@@ -420,8 +521,12 @@ impl Splitter<'_> {
 fn halves_cc(cc: IntCC) -> (IntCC, IntCC) {
     match cc {
         IntCC::UnsignedLessThan | IntCC::SignedLessThan => (IntCC::UnsignedLessThan, strict(cc)),
-        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual => (IntCC::UnsignedLessThanOrEqual, strict(cc)),
-        IntCC::UnsignedGreaterThan | IntCC::SignedGreaterThan => (IntCC::UnsignedGreaterThan, strict(cc)),
+        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual => {
+            (IntCC::UnsignedLessThanOrEqual, strict(cc))
+        }
+        IntCC::UnsignedGreaterThan | IntCC::SignedGreaterThan => {
+            (IntCC::UnsignedGreaterThan, strict(cc))
+        }
         _ => (IntCC::UnsignedGreaterThanOrEqual, strict(cc)),
     }
 }
@@ -430,7 +535,9 @@ fn strict(cc: IntCC) -> IntCC {
     match cc {
         IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedLessThan,
         IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual => IntCC::SignedLessThan,
-        IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedGreaterThan,
+        IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => {
+            IntCC::UnsignedGreaterThan
+        }
         _ => IntCC::SignedGreaterThan,
     }
 }

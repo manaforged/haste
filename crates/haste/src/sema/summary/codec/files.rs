@@ -18,7 +18,12 @@ impl FileIndex {
     /// Builds the map over every loaded file of every fixed crate in `outline`.
     pub fn build(outline: &Outline) -> Self {
         let mut files = HashMap::default();
-        for (krate, tree) in outline.crates.iter().enumerate().filter(|(_, tree)| tree.env.fixed) {
+        for (krate, tree) in outline
+            .crates
+            .iter()
+            .enumerate()
+            .filter(|(_, tree)| tree.env.fixed)
+        {
             for file in 0..tree.files.len() as u32 {
                 if let Some(key) = crate::substrate::file_key(outline, krate as u32, file) {
                     files.entry(key).or_insert((krate as u32, file));
@@ -29,9 +34,18 @@ impl FileIndex {
     }
 
     /// Resolves `record` to its `ItemRef` in this workspace, or `None` when it is body-local, its file is absent or `key_of` disagrees with its key.
-    pub(crate) fn resolve(&self, outline: &Outline, record: ItemRecord, key_of: impl FnOnce(&Outline, ItemRef) -> Option<u64>) -> Option<ItemRef> {
+    pub(crate) fn resolve(
+        &self,
+        outline: &Outline,
+        record: ItemRecord,
+        key_of: impl FnOnce(&Outline, ItemRef) -> Option<u64>,
+    ) -> Option<ItemRef> {
         let &(krate, file) = self.files.get(&record.file)?;
-        let item = ItemRef { krate, file, item: record.item };
+        let item = ItemRef {
+            krate,
+            file,
+            item: record.item,
+        };
         (item.outer().is_none() && key_of(outline, item)? == record.key).then_some(item)
     }
 }
@@ -49,10 +63,18 @@ impl ItemRecord {
     pub(crate) const LEN: usize = 20;
 
     /// The record of `item`, or `None` when `key_of` or its file key gives none.
-    pub(crate) fn of(outline: &Outline, item: ItemRef, key_of: impl FnOnce(&Outline, ItemRef) -> Option<u64>) -> Option<Self> {
+    pub(crate) fn of(
+        outline: &Outline,
+        item: ItemRef,
+        key_of: impl FnOnce(&Outline, ItemRef) -> Option<u64>,
+    ) -> Option<Self> {
         let key = key_of(outline, item)?;
         let file = crate::substrate::file_key(outline, item.krate, item.file)?;
-        Some(Self { file, item: item.item, key })
+        Some(Self {
+            file,
+            item: item.item,
+            key,
+        })
     }
 
     /// Appends this record to `out`.
@@ -64,7 +86,11 @@ impl ItemRecord {
 
     /// Reads one record from `cur`.
     pub(crate) fn read(cur: &mut Cursor<'_>) -> Result<Self> {
-        Ok(Self { file: cur.u64()?, item: cur.u32()?, key: cur.u64()? })
+        Ok(Self {
+            file: cur.u64()?,
+            item: cur.u32()?,
+            key: cur.u64()?,
+        })
     }
 }
 
@@ -73,11 +99,21 @@ pub(super) fn write_items(out: &mut Vec<u8>, items: &[ItemRecord]) {
     items.iter().for_each(|record| record.write(out));
 }
 
-pub(super) fn read_items(cur: &mut Cursor<'_>, outline: &Outline, index: &FileIndex) -> Result<Option<Vec<ItemRef>>> {
+pub(super) fn read_items(
+    cur: &mut Cursor<'_>,
+    outline: &Outline,
+    index: &FileIndex,
+) -> Result<Option<Vec<ItemRef>>> {
     let item_count = cur.u32()? as usize;
     let mut items = Vec::with_capacity(item_count);
     for _ in 0..item_count {
-        let Some(item) = index.resolve(outline, ItemRecord::read(cur)?, crate::substrate::sysroot_item_key) else { return Ok(None) };
+        let Some(item) = index.resolve(
+            outline,
+            ItemRecord::read(cur)?,
+            crate::substrate::sysroot_item_key,
+        ) else {
+            return Ok(None);
+        };
         items.push(item);
     }
     Ok(Some(items))

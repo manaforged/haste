@@ -154,7 +154,11 @@ mod load {
     }
 
     /// Each lane of `values` rounded as the `roundps` immediate `imm` selects, with the current rounding mode taken as round to nearest even.
-    pub(super) fn round<const N: usize, T: Copy + Into<f64>>(values: [T; N], imm: i32, back: fn(f64) -> T) -> [T; N] {
+    pub(super) fn round<const N: usize, T: Copy + Into<f64>>(
+        values: [T; N],
+        imm: i32,
+        back: fn(f64) -> T,
+    ) -> [T; N] {
         values.map(|value| {
             let value: f64 = value.into();
             back(match if imm & 4 != 0 { 0 } else { imm & 3 } {
@@ -184,12 +188,24 @@ mod load {
 
     /// Each float lane of `a` compared with the same lane of `b` by the predicate `imm`, as all ones when it holds and zero when not.
     pub(super) fn compare<const N: usize>(a: [f32; N], b: [f32; N], imm: i8) -> [u32; N] {
-        std::array::from_fn(|lane| if holds(a[lane].into(), b[lane].into(), imm) { u32::MAX } else { 0 })
+        std::array::from_fn(|lane| {
+            if holds(a[lane].into(), b[lane].into(), imm) {
+                u32::MAX
+            } else {
+                0
+            }
+        })
     }
 
     /// Each double lane of `a` compared with the same lane of `b` by the predicate `imm`, as all ones when it holds and zero when not.
     pub(super) fn compare_double<const N: usize>(a: [f64; N], b: [f64; N], imm: i8) -> [u64; N] {
-        std::array::from_fn(|lane| if holds(a[lane], b[lane], imm) { u64::MAX } else { 0 })
+        std::array::from_fn(|lane| {
+            if holds(a[lane], b[lane], imm) {
+                u64::MAX
+            } else {
+                0
+            }
+        })
     }
 
     /// The 256-bit integer vector at `at`.
@@ -202,7 +218,10 @@ mod load {
     /// The low 128 bits of `value` with the round constant `rcon` added to the two words that `aeskeygenassist` rotates.
     #[target_feature(enable = "aes")]
     pub(super) fn key_assist(value: __m128i, rcon: u8) -> __m128i {
-        _mm_xor_si128(_mm_aeskeygenassist_si128::<0>(value), _mm_set_epi32(i32::from(rcon), 0, i32::from(rcon), 0))
+        _mm_xor_si128(
+            _mm_aeskeygenassist_si128::<0>(value),
+            _mm_set_epi32(i32::from(rcon), 0, i32::from(rcon), 0),
+        )
     }
 
     /// The carry-less product of the halves of `a` and `b` that bits 0 and 4 of `imm` select.

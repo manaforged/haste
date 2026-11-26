@@ -140,8 +140,22 @@ pub(super) fn code(index: usize, slot: usize) -> Vec<u8> {
 #[cfg(target_arch = "aarch64")]
 pub(super) fn code(index: usize, slot: usize) -> Vec<u8> {
     let index = index as u32;
-    let words = [0x5800_0151, 0xF940_0231, 0x10FF_FFD0, 0xEB10_023F, 0x5400_0081, 0xD280_0010 | (index & 0xFFFF) << 5, 0xF2A0_0010 | (index >> 16) << 5, 0x5800_00B1, 0xD61F_0220, 0xD503_201F];
-    let mut bytes: Vec<u8> = words.iter().flat_map(|word: &u32| word.to_le_bytes()).collect();
+    let words = [
+        0x5800_0151,
+        0xF940_0231,
+        0x10FF_FFD0,
+        0xEB10_023F,
+        0x5400_0081,
+        0xD280_0010 | (index & 0xFFFF) << 5,
+        0xF2A0_0010 | (index >> 16) << 5,
+        0x5800_00B1,
+        0xD61F_0220,
+        0xD503_201F,
+    ];
+    let mut bytes: Vec<u8> = words
+        .iter()
+        .flat_map(|word: &u32| word.to_le_bytes())
+        .collect();
     bytes.extend((slot as u64).to_le_bytes());
     bytes.extend((haste_stub_entry as *const () as usize as u64).to_le_bytes());
     bytes
@@ -159,15 +173,23 @@ pub(super) fn connect(table: usize, stubs: std::ops::Range<usize>, (ask, answer)
 /// The code that slot `index` holds when it is no longer a stub.
 fn compiled(index: usize) -> Option<usize> {
     // SAFETY: TABLE is the call table, which holds a slot for every index a stub carries and stays mapped for the life of the process.
-    let code = unsafe { (*(TABLE.load(Ordering::Acquire) as *const AtomicUsize).add(index)).load(Ordering::Acquire) };
-    (!(STUBS_FROM.load(Ordering::Acquire)..STUBS_TO.load(Ordering::Acquire)).contains(&code)).then_some(code)
+    let code = unsafe {
+        (*(TABLE.load(Ordering::Acquire) as *const AtomicUsize).add(index)).load(Ordering::Acquire)
+    };
+    (!(STUBS_FROM.load(Ordering::Acquire)..STUBS_TO.load(Ordering::Acquire)).contains(&code))
+        .then_some(code)
 }
 
 /// Requests the compiler for the code of slot `index`: writes the index and reads the code address, which is zero when the function has none.
 #[cfg(unix)]
 fn ask(index: usize) -> std::io::Result<usize> {
     // SAFETY: ASK and ANSWER are pipe ends this process holds for the life of the program; ManuallyDrop keeps them open.
-    let (mut ask, mut answer) = unsafe { (ManuallyDrop::new(std::fs::File::from_raw_fd(ASK.load(Ordering::Acquire))), ManuallyDrop::new(std::fs::File::from_raw_fd(ANSWER.load(Ordering::Acquire)))) };
+    let (mut ask, mut answer) = unsafe {
+        (
+            ManuallyDrop::new(std::fs::File::from_raw_fd(ASK.load(Ordering::Acquire))),
+            ManuallyDrop::new(std::fs::File::from_raw_fd(ANSWER.load(Ordering::Acquire))),
+        )
+    };
     ask.write_all(&(index as u64).to_le_bytes())?;
     let mut code = [0; 8];
     answer.read_exact(&mut code)?;

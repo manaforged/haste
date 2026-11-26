@@ -1,30 +1,23 @@
-use std::sync::Arc;
-
 use anyhow::{Result, bail};
-use haste_codegen::{Block, Signature, Type, Value};
+use haste_codegen::{Type, Value};
 
-use crate::body::{Body, Expr, ExprId, List, UnOp};
+use crate::body::{Body, Expr, ExprId, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
 use crate::sema::infer::{Coercion, Res, SiteKey};
 use crate::sema::reach::Reached;
 use crate::sema::substs::Substs;
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::ty::Kind;
 
 pub(super) use super::budget::inline_limit;
 use super::place::Place;
-use super::reloc::{RelocStep, SiteOrigin, TyOrigin};
-use super::stencil::{Form, InlinedCallee, LowerMode, SymbolSource, resolve_inline};
-use super::{Loop, Lower, Parts, Repr, repr};
+use super::reloc::{SiteOrigin, TyOrigin};
+use super::stencil::resolve_inline;
+use super::{Lower, Parts, Repr};
 
-const BOX_ZEROED_MIN: u32 = 64;
-
-/// What a call runs: code at an address, or reached function `index`, which may be copied inline.
-enum Callee {
-    Code(Value),
-    Reached(usize, SiteOrigin),
-}
+mod call;
+mod flow;
 
 /// Whether a call may try to copy reached function `index` inline.
 pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool {
@@ -32,23 +25,42 @@ pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool
 }
 
 /// Whether reached function `index` lowers to a body small and copyable enough to inline.
-pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn super::Slots, index: usize) -> bool {
+pub fn can_inline_body(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    slots: &dyn super::Slots,
+    index: usize,
+) -> bool {
     if !slots.allow_inline() {
         return false;
     }
-    let Some(limit) = inline_limit(cx, reached, index) else { return false };
-    resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, (limit, false)).is_ok_and(|(callee, _)| callee.is_some())
+    let Some(limit) = inline_limit(cx, reached, index) else {
+        return false;
+    };
+    resolve_inline(
+        cx,
+        (reached, slots),
+        &mut super::Inline::default(),
+        index,
+        (limit, false),
+    )
+    .is_ok_and(|(callee, _)| callee.is_some())
 }
 
-fn unwrap_expr(body: &Body, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
+pub(super) fn unwrap_expr(
+    body: &Body,
+    mut expr: ExprId,
+    allow_block: impl Fn(crate::body::BlockKind, bool) -> bool,
+) -> ExprId {
     loop {
         match *body.expr(expr) {
             Expr::Paren(inner) => expr = inner,
-            Expr::Block { stmts, tail: Some(inner), label: None, kind }
-                if body.list(stmts).is_empty()
-                    && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
-                        || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
-            {
+            Expr::Block {
+                stmts,
+                tail: Some(inner),
+                label,
+                kind,
+            } if body.list(stmts).is_empty() && allow_block(kind, label.is_some()) => {
                 expr = inner;
             }
             _ => return expr,
@@ -56,8 +68,18 @@ fn unwrap_expr(body: &Body, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
     }
 }
 
+fn unwrap_plain_expr(body: &Body, expr: ExprId, allow_unsafe: bool) -> ExprId {
+    unwrap_expr(body, expr, |kind, labeled| {
+        !labeled
+            && (matches!(
+                kind,
+                crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion
+            ) || (allow_unsafe && kind == crate::body::BlockKind::Unsafe))
+    })
+}
+
 pub(super) fn const_bool(body: &Body, expr: ExprId) -> Option<bool> {
-    match *body.expr(unwrap_expr(body, expr, false)) {
+    match *body.expr(unwrap_plain_expr(body, expr, false)) {
         Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
         _ => None,
     }
@@ -83,7 +105,10 @@ impl Lower<'_, '_> {
         let typed = self.typed;
         match (typed.coercions.get(&expr), value) {
             _ if !self.open => Ok(None),
-            (Some(coercion @ (Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_))), Some(value)) => {
+            (
+                Some(coercion @ (Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_))),
+                Some(value),
+            ) => {
                 let coercion = coercion.clone();
                 self.apply_leaf_coercion(expr, value, self.ty_of(expr), &coercion)
             }
@@ -91,10 +116,15 @@ impl Lower<'_, '_> {
                 let (target, inner) = (*target, inner.as_ref().clone());
                 self.coerce_struct(expr, value, self.ty_of(expr), target, &inner)
             }
-            (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(expr, value, steps.clone()),
+            (Some(Coercion::Deref(steps, _)), Some(value)) => {
+                self.deref_coerced(expr, value, steps.clone())
+            }
             (Some(&Coercion::Reify(Res::Fn(item, substs))), _) => {
                 let index = self.reached_index(item, substs)?;
-                Ok(Some(self.code_of(index, SiteOrigin::Table(SiteKey::CoercionReify(expr)))))
+                Ok(Some(self.code_of(
+                    index,
+                    SiteOrigin::Table(SiteKey::CoercionReify(expr)),
+                )))
             }
             _ => Ok(value),
         }
@@ -112,17 +142,25 @@ impl Lower<'_, '_> {
             Expr::AssignOp(op, lhs, rhs) => self.assign(expr, (lhs, rhs), Some(op)),
             Expr::Cast(inner, _) => self.cast(expr, inner),
             Expr::Call(callee, args) => self.call(expr, callee, args),
-            Expr::Method { receiver, params, .. } => self.method(expr, receiver, params),
+            Expr::Method {
+                receiver, params, ..
+            } => self.method(expr, receiver, params),
             Expr::OffsetOf { .. } => {
-                let Some(&offset) = self.typed.offsets.get(&expr) else { bail!("offset_of with no offset") };
-                Ok(Some(self.int_const(haste_codegen::Type::I64, u128::from(offset))))
+                let Some(&offset) = self.typed.offsets.get(&expr) else {
+                    bail!("offset_of with no offset")
+                };
+                Ok(Some(
+                    self.int_const(haste_codegen::Type::I64, u128::from(offset)),
+                ))
             }
             _ => self.memory(expr),
         }
     }
 
     fn deref_read(&mut self, expr: ExprId, operand: ExprId) -> Result<Option<Value>> {
-        if self.cx.boxed(self.ty_of(operand)).is_some() && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
+        if self.cx.boxed(self.ty_of(operand)).is_some()
+            && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))?
+        {
             return self.move_out_of_box(expr, operand);
         }
         let place = self.place_of(expr)?;
@@ -130,20 +168,32 @@ impl Lower<'_, '_> {
     }
 
     fn move_out_of_box(&mut self, expr: ExprId, operand: ExprId) -> Result<Option<Value>> {
-        let Some((root, path)) = self.scrutinee_path(operand) else { bail!("moving out of a `Box` behind a reference") };
+        let Some((root, path)) = self.scrutinee_path(operand) else {
+            bail!("moving out of a `Box` behind a reference")
+        };
         let boxed = self.ty_of(operand);
-        let Some(Res::Fn(free, substs)) = crate::sema::infer::drop_fn(self.cx, boxed)? else { bail!("`Box` has no `Drop` impl") };
+        let Some(Res::Fn(free, substs)) = crate::sema::infer::drop_fn(self.cx, boxed)? else {
+            bail!("`Box` has no `Drop` impl")
+        };
         let owner = self.place_or_temp(operand)?;
-        let contents = self.deref_step((expr, 0), owner, boxed)?.map(|(place, _)| place);
+        let contents = self
+            .deref_step((expr, 0), owner, boxed)?
+            .map(|(place, _)| place);
         let value = match contents {
             Some(place) if matches!(place.repr, Repr::Mem { .. }) => {
                 let read = self.read(place);
-                self.spill(read, self.ty_of(expr))?.and_then(|copy| self.read(copy))
+                self.spill(read, self.ty_of(expr))?
+                    .and_then(|copy| self.read(copy))
             }
             place => place.and_then(|place| self.read(place)),
         };
         let target = self.address_or_dangling(owner, boxed)?;
-        self.invoke(SiteOrigin::DropFn(TyOrigin::Expr(operand)), free, substs, vec![target])?;
+        self.invoke(
+            SiteOrigin::DropFn(TyOrigin::Expr(operand)),
+            free,
+            substs,
+            vec![target],
+        )?;
         self.moved_out(root, &path)?;
         Ok(value)
     }
@@ -152,11 +202,19 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Tuple(list) => self.tuple(expr, list),
             Expr::Closure { .. } => self.closure(expr),
-            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner)? => match self.materialize_const_expr(inner, (false, true))? {
-                Some(addr) => Ok(Some(addr)),
-                None => self.promoted(inner),
-            },
-            Expr::Ref { expr: inner, raw, .. } => self.reference(inner, raw),
+            Expr::Ref {
+                expr: inner,
+                mutable: false,
+                raw: false,
+            } if self.promotable(inner)? => {
+                match self.materialize_const_expr(inner, (false, true))? {
+                    Some(addr) => Ok(Some(addr)),
+                    None => self.promoted(inner),
+                }
+            }
+            Expr::Ref {
+                expr: inner, raw, ..
+            } => self.reference(inner, raw),
             Expr::TupleField(..) => self.field_value(expr),
             _ => self.flow(expr),
         }
@@ -164,13 +222,41 @@ impl Lower<'_, '_> {
 
     fn flow(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match *self.body.expr(expr) {
-            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, stmts, tail),
-            Expr::Block { kind: crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove, .. } => self.closure(expr),
+            Expr::Block {
+                stmts,
+                tail,
+                label: None,
+                kind: crate::body::BlockKind::Try,
+            } => self.try_block(expr, stmts, tail),
+            Expr::Block {
+                kind: crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove,
+                ..
+            } => self.closure(expr),
             Expr::Await(inner) => self.await_expr(expr, inner),
-            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Expansion } => self.expansion(stmts, tail),
-            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Const } => self.const_block(expr, stmts, tail),
-            Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail),
-            Expr::Block { stmts, tail, label: Some(label), .. } => self.labeled_block(expr, (stmts, tail), label),
+            Expr::Block {
+                stmts,
+                tail,
+                label: None,
+                kind: crate::body::BlockKind::Expansion,
+            } => self.expansion(stmts, tail),
+            Expr::Block {
+                stmts,
+                tail,
+                label: None,
+                kind: crate::body::BlockKind::Const,
+            } => self.const_block(expr, stmts, tail),
+            Expr::Block {
+                stmts,
+                tail,
+                label: None,
+                ..
+            } => self.block(stmts, tail),
+            Expr::Block {
+                stmts,
+                tail,
+                label: Some(label),
+                ..
+            } => self.labeled_block(expr, (stmts, tail), label),
             Expr::If(cond, then, otherwise) => self.if_expr(expr, cond, then, otherwise),
             Expr::While { cond, body, label } => self.while_expr(cond, body, label),
             Expr::Loop { body, label } => self.loop_expr(expr, body, label),
@@ -196,7 +282,12 @@ impl Lower<'_, '_> {
                 None => self.repeat(expr, value),
             },
             Expr::Index(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
-            Expr::For { label, pat, iter, body } => self.for_expr(expr, pat, iter, (label, body)),
+            Expr::For {
+                label,
+                pat,
+                iter,
+                body,
+            } => self.for_expr(expr, pat, iter, (label, body)),
             Expr::Try(inner) => self.try_expr(expr, inner),
             Expr::Range { from, to, .. } => self.range(expr, from, to),
             ref other => bail!("cannot lower expression {other:?} yet"),
@@ -205,7 +296,9 @@ impl Lower<'_, '_> {
 
     fn field_value(&mut self, expr: ExprId) -> Result<Option<Value>> {
         let ty = self.ty_of(expr);
-        let value = self.place_of(expr)?.and_then(|place| self.read_typed(place, ty));
+        let value = self
+            .place_of(expr)?
+            .and_then(|place| self.read_typed(place, ty));
         if let Some((root, path)) = self.move_path(expr)
             && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))?
         {
@@ -225,10 +318,18 @@ impl Lower<'_, '_> {
             }
             Some(&Res::Fn(item, substs)) => self.item_path(expr, item, substs),
             Some(&Res::Const(value)) => {
-                let (Kind::Value(bits), Repr::Scalar(machine)) = (self.cx.types.kind(value).clone(), self.repr_of(expr)?) else { bail!("a const parameter whose value is not known") };
+                let (Kind::Value(bits), Repr::Scalar(machine)) =
+                    (self.cx.types.kind(value).clone(), self.repr_of(expr)?)
+                else {
+                    bail!("a const parameter whose value is not known")
+                };
                 Ok(Some(self.int_const(machine, bits)))
             }
-            Some(Res::Ctor(..)) if matches!(self.cx.types.kind(self.ty_of(expr)), Kind::FnDef(..)) => Ok(None),
+            Some(Res::Ctor(..))
+                if matches!(self.cx.types.kind(self.ty_of(expr)), Kind::FnDef(..)) =>
+            {
+                Ok(None)
+            }
             Some(&Res::Ctor(_, variant, _)) => match self.const_rodata_expr(expr)? {
                 Some(addr) => Ok(Some(addr)),
                 None => self.construct(self.ty_of(expr), variant, Vec::new(), None),
@@ -257,542 +358,16 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// The frame slot that branches write a value of `repr` into for the block they join, when it is a small value made of scalars; other values cross the edge in their carrier.
     pub(super) fn join_slot(&mut self, repr: Repr) -> Option<Place> {
         match repr {
-            Repr::Mem { parts, .. } if parts != Parts::Bytes => self.slot(repr).map(|slot| Place::slot(slot, repr)),
+            Repr::Mem { parts, .. } if parts != Parts::Bytes => {
+                self.slot(repr).map(|slot| Place::slot(slot, repr))
+            }
             _ => None,
         }
     }
 
-    fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
-        if self.body.list(args).is_empty() && super::array::is_maybe_uninit_fn(self.cx, self.typed, expr, callee) {
-            if !self.open {
-                return Ok(None);
-            }
-            let whole = repr(self.cx, self.ty_of(expr))?;
-            return Ok(self.slot(whole).and_then(|slot| self.read(Place::slot(slot, whole))));
-        }
-        if let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) {
-            if let Some(res) = self.try_box_new_zeroed(expr, item, args)? {
-                return Ok(Some(res));
-            }
-            return self.call_value((expr, callee), (item, substs), args);
-        }
-        let named = self.typed.res.get(&callee).filter(|_| self.body.names_callee(callee));
-        let (item, substs) = match named.copied() {
-            Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => return self.pointer_call(expr, callee, args),
-            Some(Res::Fn(item, substs)) => (item, substs),
-            Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
-            _ => return self.pointer_call(expr, callee, args),
-        };
-        if let Some(res) = self.named_fn_call((expr, callee), (item, substs), args)? {
-            return Ok(res);
-        }
-        let values = self.args(args, Vec::new())?;
-        self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values)
-    }
-
-    fn named_fn_call(
-        &mut self,
-        (expr, callee): (ExprId, ExprId),
-        (item, substs): (ItemRef, Substs),
-        args: List,
-    ) -> Result<Option<Option<Value>>> {
-        if let Some(res) = self.try_box_new_zeroed(expr, item, args)? {
-            return Ok(Some(Some(res)));
-        }
-        if !self.tupled_closure_call(item, substs) {
-            return Ok(None);
-        }
-        let arg_list = self.body.list(args).to_vec();
-        let [f_expr, tuple_expr] = arg_list.as_slice() else { bail!("tupled closure call expects 2 arguments") };
-        let f_expr = ExprId(*f_expr);
-        let values = self.callee_env(f_expr, true)?;
-        let guards = self.guard_consumed_callee(f_expr, &values, true)?;
-        let mut values = values;
-        self.untuple_arg_guarded(ExprId(*tuple_expr), &mut values, guards)?;
-        self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values).map(Some)
-    }
-
-    fn try_box_new_zeroed(&mut self, expr: ExprId, item: ItemRef, args: List) -> Result<Option<Value>> {
-        if !self.open || self.cx.global_allocator().is_some() || self.cx.name(item) != "new" || self.cx.outline.roots[item.krate as usize].name != "alloc" {
-            return Ok(None);
-        }
-        let &[arg] = self.body.list(args) else { return Ok(None) };
-        let arg = ExprId(arg);
-        let box_ty = self.ty_of(expr);
-        let Some(inner_ty) = self.cx.boxed(box_ty) else { return Ok(None) };
-        if inner_ty != self.ty_of(arg) || self.typed.coercions.contains_key(&arg) {
-            return Ok(None);
-        }
-        let Repr::Mem { size, align, .. } = repr(self.cx, inner_ty)? else { return Ok(None) };
-        if size <= BOX_ZEROED_MIN || align >= 63 || !self.box_repr_ptr(box_ty)? || !self.is_zero_init_expr(arg)? {
-            return Ok(None);
-        }
-        let size_val = self.ins().iconst(Type::I64, i64::from(size));
-        let align_val = self.ins().iconst(Type::I64, 1_i64 << align);
-        let Some(ptr) = self.call_host(crate::host::HostSymbol::AllocZeroed, &[size_val, align_val], Some(Type::I64)) else {
-            return Ok(None);
-        };
-        self.ins().trapz(ptr);
-        self.received(box_ty, &[(Type::I64, 0)], &[ptr])
-    }
-
-    fn box_repr_ptr(&mut self, box_ty: Ty) -> Result<bool> {
-        Ok(matches!(
-            repr(self.cx, box_ty)?,
-            Repr::Scalar(Type::I64) | Repr::Mem { size: 8, parts: Parts::One(Type::I64), .. }
-        ))
-    }
-
-    fn is_zero_init_expr(&mut self, expr: ExprId) -> Result<bool> {
-        if self.typed.coercions.contains_key(&expr) {
-            return Ok(false);
-        }
-        let e = self.unwrap_expr(expr, true);
-        if self.typed.coercions.contains_key(&e) {
-            return Ok(false);
-        }
-        match *self.body.expr(e) {
-            Expr::Lit(..) => self.literal_is_zero(e),
-            Expr::Repeat(val, _) => self.is_zero_init_expr(val),
-            Expr::Array(items) | Expr::Tuple(items) => self.all_zero_init(items),
-            Expr::Struct { fields, base: None, rest: false, .. } => self.struct_zero_init(e, fields),
-            _ => Ok(false),
-        }
-    }
-
-    fn all_zero_init(&mut self, items: List) -> Result<bool> {
-        for item in self.body.list(items).to_vec() {
-            if !self.is_zero_init_expr(ExprId(item))? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn struct_zero_init(&mut self, expr: ExprId, fields: List) -> Result<bool> {
-        let Kind::Adt(adt, _) = *self.cx.types.kind(self.ty_of(expr)) else { return Ok(false) };
-        if self.cx.item(adt).1.kind != ItemKind::Struct {
-            return Ok(false);
-        }
-        for at in self.body.list(fields).to_vec() {
-            let val = self.body.fields[at as usize].value;
-            if !self.is_zero_init_expr(val)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn method(&mut self, expr: ExprId, receiver: ExprId, params: List) -> Result<Option<Value>> {
-        let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) else { bail!("method call has no resolution") };
-        let Some(&adjust) = self.typed.adjusts.get(&expr) else { bail!("method call has no receiver adjustment") };
-        let first = self.receiver((expr, receiver), adjust)?;
-        if let Some(result) = self.try_write_fmt(expr, item, substs, first, params)? {
-            return Ok(Some(result));
-        }
-        if !self.open {
-            return Ok(None);
-        }
-        let mut guards = Vec::new();
-        if adjust == (crate::sema::infer::Adjust { derefs: 0, autoref: None })
-            && !self.body.list(params).is_empty()
-            && self.wants_field_unwind()?
-        {
-            self.push_arg_guard(receiver, first, &mut guards)?;
-        }
-        if self.tupled_closure_call(item, substs) {
-            let param_list = self.body.list(params).to_vec();
-            let [tuple_expr] = param_list.as_slice() else { bail!("tupled closure method expects 1 argument") };
-            let closure_ty = self.cx.types.substs(substs)[0];
-            let mut values = if self.cx.closure_takes_env(closure_ty) { first.into_iter().collect() } else { Vec::new() };
-            self.untuple_arg_guarded(ExprId(*tuple_expr), &mut values, guards)?;
-            return self.invoke(SiteOrigin::Table(SiteKey::ExprRes(expr)), item, substs, values);
-        }
-        let values = self.eval_guarded_args(params, first.into_iter().collect(), guards, true)?;
-        self.invoke(SiteOrigin::Table(SiteKey::ExprRes(expr)), item, substs, values)
-    }
-
-    pub(super) fn args(&mut self, args: List, values: Vec<Value>) -> Result<Vec<Value>> {
-        self.eval_guarded_args(args, values, Vec::new(), true)
-    }
-
-    pub(super) fn invoke(&mut self, origin: SiteOrigin, item: ItemRef, substs: Substs, values: Vec<Value>) -> Result<Option<Value>> {
-        if !self.open {
-            return Ok(None);
-        }
-        if let Some(which) = self.cx.intrinsic(item) {
-            return self.intrinsic(&origin, which, &self.cx.types.substs(substs).to_vec(), &values);
-        }
-        let index = self.reached_index(item, substs)?;
-        let callee = self.reached.typed(index, self.cx.name(item))?;
-        let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
-        if self.cx.foreign(item) {
-            if callee.ret.map_or(Ok(true), |ret| repr(self.cx, ret).map(|r| r == Repr::Zst))? {
-                match self.cx.symbol_name(item).as_deref() {
-                    Some(n) if crate::host::HostSymbol::resolve(n) == Some(crate::host::HostSymbol::Noop) => return Ok(None),
-                    Some("llvm.aarch64.isb") => { self.ins().fence(haste_codegen::AtomicOrd::Isb); return Ok(None); }
-                    Some("llvm.aarch64.dmb") => { self.ins().fence(haste_codegen::AtomicOrd::SeqCst); return Ok(None); }
-                    _ => {}
-                }
-            }
-            let code = self.code_of(index, origin);
-            if let Some(host) = self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve) {
-                self.mark_if_fresh_alloc(&host, code);
-            }
-            return self.native_call(code, (params, callee.ret), values);
-        }
-        self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)
-    }
-
-    fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
-        let in_loop = self.loops.iter().any(|frame| !frame.block);
-        let Some(limit) = super::budget::caller_inline_limit(self.cx, self.reached, (self.index, index), in_loop) else {
-            return Ok(None);
-        };
-        let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, false))?;
-        self.cycle_root = self.cycle_root.min(cycle);
-        let Some(found) = callee.filter(|found| self.inline.host.takes(self.cx, self.reached, index, found) && (self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty())) else { return Ok(None) };
-        if !self.inline.host.compact || found.form != Form::Dense {
-            return Ok(Some(found));
-        }
-        let (compact, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, true))?;
-        self.cycle_root = self.cycle_root.min(cycle);
-        Ok(compact.filter(|found| self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty()))
-    }
-
-    fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Result<Vec<Value>> {
-        if !self.open {
-            let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
-            self.b.switch_to_block(dead);
-        }
-        let sym_base = self.relocs.len() as u32;
-        self.relocs.extend(inlined.relocs.iter().cloned());
-        self.reloc_plan.push(RelocStep::SiteInline { origin, plan: Arc::clone(&inlined.reloc_plan) });
-        Ok(match self.mode {
-            LowerMode::Stencil => self.b.inline_shifted(&inlined.body, values, sym_base),
-            LowerMode::Dict => {
-                let Some(dict) = self.dict_param else { bail!("dictionary parameter is not set") };
-                self.b.inline_dict(&inlined.body, values, dict, sym_base)
-            }
-        })
-    }
-
-    /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
-    fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
-        let caller_tracked = self.cx.track_caller(self.reached.list[self.index].0.0);
-        let mut track_site: Option<bool> = None;
-        let code = match callee {
-            Callee::Code(code) => code,
-            Callee::Reached(index, origin) => {
-                let callee_tracked = self.cx.track_caller(self.reached.list[index].0.0);
-                let wants_track = !caller_tracked && callee_tracked;
-                if let Some(inlined) = self.slots.allow_inline().then(|| self.inline_callee(index)).transpose()?.flatten() {
-                    if caller_tracked && !callee_tracked && inlined.body.has_calls() {
-                        return self.with_caller_loc(Some(false), |this| this.emit_inlined(&inlined, origin, values));
-                    }
-                    let (was_open, caller_blk, from_blk) = (self.open, self.b.current_block(), self.b.block_count());
-                    let res = self.emit_inlined(&inlined, origin, values)?;
-                    if wants_track && was_open {
-                        self.wrap_inlined_caller_loc(caller_blk, from_blk, self.b.block_count().saturating_sub(1))?;
-                    }
-                    return Ok(res);
-                }
-                track_site = (caller_tracked != callee_tracked).then_some(wants_track);
-                self.code_of(index, origin)
-            }
-        };
-        self.with_caller_loc(track_site, |this| {
-            let sig = this.b.import_signature(signature);
-            let call = this.ins().call_indirect(sig, code, values);
-            Ok(this.b.inst_results(call).to_vec())
-        })
-    }
-
-    fn pointer_call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
-        let (code, ty) = match self.typed.autoderefs.contains_key(&expr) {
-            true => match self.autoderef_place(expr, callee)? {
-                Some((place, ty)) => (self.read(place), ty),
-                None => return Ok(None),
-            },
-            false => (self.expr(callee)?, self.ty_of(callee)),
-        };
-        if let Kind::FnDef(item, substs) = *self.cx.types.kind(ty) {
-            let values = self.args(args, Vec::new())?;
-            return self.invoke(SiteOrigin::PointerFnDef { expr, callee }, item, substs, values);
-        }
-        let Kind::FnPtr(params, ret) = *self.cx.types.kind(ty) else { bail!("cannot lower calls through values yet") };
-        let Some(code) = code else { return Ok(None) };
-        let params = self.cx.types.substs(params).to_vec();
-        let values = self.args(args, Vec::new())?;
-        if !self.open {
-            return Ok(None);
-        }
-        let clear = self.cx.track_caller(self.reached.list[self.index].0.0).then_some(false);
-        self.with_caller_loc(clear, |this| this.call_code(code, (params, Some(ret)), values))
-    }
-
-    /// The index of the reached instance of `item` at `substs`.
-    pub(super) fn reached_index(&self, item: ItemRef, substs: Substs) -> Result<usize> {
-        match self.try_reached_index(item, substs)? {
-            Some(index) => Ok(index),
-            None => bail!("a use of `{}` that was not reached", self.cx.name(item)),
-        }
-    }
-
-    /// The code address of reached function `index`, read from its call table entry.
-    pub(super) fn code_of(&mut self, index: usize, origin: SiteOrigin) -> Value {
-        let table = self.emit_slot(SymbolSource::Slot(index), origin);
-        self.ins().load(Type::I64, table, 0)
-    }
-
-    /// Calls the generated code at `code`, which takes `params` and returns `ret`, with the values of its arguments that are not zero-sized.
-    pub(super) fn call_code(&mut self, code: Value, types: (Vec<Ty>, Option<Ty>), values: Vec<Value>) -> Result<Option<Value>> {
-        self.call_with(Callee::Code(code), types, values)
-    }
-
-    fn call_with(&mut self, callee: Callee, (params, ret): (Vec<Ty>, Option<Ty>), values: Vec<Value>) -> Result<Option<Value>> {
-        let signature = super::signature_of(self.cx, ret, params.iter().copied())?;
-        let mut values = self.pass_all(&params, values)?;
-        let result = ret.map(|ret| repr(self.cx, ret)).transpose()?.unwrap_or(Repr::Zst);
-        let out = if super::indirect(&signature) { self.slot(result) } else { None };
-        if let Some(out) = out {
-            let address = self.ins().stack_addr(Type::I64, out, 0);
-            values.insert(0, address);
-        }
-        let results = self.emit_call(callee, signature, &values)?;
-        let Some(ret) = ret else { return Ok(None) };
-        if matches!(self.cx.types.kind(ret), Kind::Never) {
-            self.ins().trap();
-            self.close();
-            return Ok(None);
-        }
-        if let Some(out) = out {
-            return Ok(Some(self.ins().stack_addr(Type::I64, out, 0)));
-        }
-        let parts: Vec<(Type, i32)> = super::passed_parts(self.cx, ret)?.into_iter().flat_map(Parts::scalars).collect();
-        self.received(ret, &parts, &results)
-    }
-
-    /// The argument `values` of a call that takes `params`, as they cross it: zero-sized parameters take no value, and memory values in `passed_parts` expand into their scalar registers.
-    pub(super) fn pass_all(&mut self, params: &[Ty], values: Vec<Value>) -> Result<Vec<Value>> {
-        let mut values = values.into_iter();
-        let mut passed = Vec::new();
-        for &param in params {
-            if repr(self.cx, param)? == Repr::Zst {
-                continue;
-            }
-            let Some(value) = values.next() else { break };
-            self.push_passed(param, value, &mut passed)?;
-        }
-        passed.extend(values);
-        Ok(passed)
-    }
-
-    pub(super) fn branch_value(&mut self, value: Option<Value>, join: Block) {
-        if self.open {
-            let args: Vec<Value> = value.into_iter().collect();
-            let args = if self.b.block_params(join).is_empty() { Vec::new() } else { args };
-            self.jump(join, &args);
-            self.close();
-        }
-    }
-
-    /// The block that the branches of `expr` join, and where each leaves its value: the join's parameter, or the slot of `join_slot`.
-    pub(super) fn join_block(&mut self, expr: ExprId) -> Result<(Block, Option<Value>, Option<Place>)> {
-        let join = self.b.create_block();
-        let repr = self.repr_of(expr)?;
-        let slot = self.join_slot(repr);
-        let joined = Self::carrier(repr).filter(|_| slot.is_none()).map(|ty| self.b.append_block_param(join, ty));
-        Ok((join, joined, slot))
-    }
-
-    /// Goes to `join` with `value`, written into `slot` first when the join takes it there.
-    pub(super) fn branch_into(&mut self, value: Option<Value>, (join, slot): (Block, Option<Place>)) {
-        match (slot, value) {
-            (Some(place), Some(value)) if self.open => {
-                self.write(place, value);
-                self.branch_value(None, join);
-            }
-            _ => self.branch_value(value, join),
-        }
-    }
-
-    /// The value that the branches left at `join`, once the cursor is there.
-    pub(super) fn joined(&mut self, joined: Option<Value>, slot: Option<Place>) -> Option<Value> {
-        match slot {
-            Some(place) => self.read(place),
-            None => joined,
-        }
-    }
-
     pub(super) fn unwrap_expr(&self, expr: ExprId, allow_unsafe: bool) -> ExprId {
-        unwrap_expr(self.body, expr, allow_unsafe)
-    }
-
-    fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
-        if let Some(taken) = const_bool(self.body, cond) {
-            return if taken {
-                self.expr(then)
-            } else {
-                match otherwise {
-                    Some(otherwise) => self.expr(otherwise),
-                    None => Ok(None),
-                }
-            };
-        }
-        let mark = self.owned.len();
-        let Some(test) = self.expr(cond)? else {
-            return Ok(None);
-        };
-        if !self.cond_has_let(cond) {
-            self.end_statement(mark)?;
-        }
-        let cond_end = self.owned.len();
-        let (then_block, else_block) = (self.b.create_block(), self.b.create_block());
-        let (join, joined, slot) = match otherwise {
-            Some(_) => self.join_block(expr)?,
-            None => (self.b.create_block(), None, None),
-        };
-        self.brif(test, (then_block, &[]), (else_block, &[]));
-        let cond_owned = self.owned[mark..cond_end].to_vec();
-        self.enter(then_block);
-        let value = self.expr(then)?;
-        let value = self.snapshot_before_drops(mark, then, value)?;
-        if self.open {
-            self.end_scope(mark)?;
-        } else {
-            self.owned.truncate(mark);
-        }
-        self.branch_into(value, (join, slot));
-        let else_mark = self.owned.len();
-        self.owned.extend(cond_owned);
-        self.enter(else_block);
-        self.drop_to(else_mark)?;
-        self.owned.truncate(else_mark);
-        let value = match otherwise {
-            Some(otherwise) => {
-                let value = self.expr(otherwise)?;
-                self.snapshot_before_drops(else_mark, otherwise, value)?
-            }
-            None => None,
-        };
-        if self.open {
-            self.end_scope(else_mark)?;
-        } else {
-            self.owned.truncate(else_mark);
-        }
-        self.branch_into(value, (join, slot));
-        self.enter(join);
-        Ok(self.joined(joined, slot))
-    }
-
-    fn while_expr(&mut self, cond: ExprId, body: ExprId, label: Option<u32>) -> Result<Option<Value>> {
-        let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
-        self.jump(head, &[]);
-        self.enter(head);
-        let depth = self.owned.len();
-        let test = self.expr(cond)?;
-        if self.open && !self.cond_has_let(cond) {
-            self.end_statement(depth)?;
-        }
-        if let Some(test) = test {
-            let fail = self.b.create_block();
-            self.brif(test, (inner, &[]), (fail, &[]));
-            self.enter(fail);
-            self.drop_to(depth)?;
-            self.jump(exit, &[]);
-        }
-        self.enter(inner);
-        self.loop_body((head, exit, depth), label, body)
-    }
-
-    fn cond_has_let(&self, expr: ExprId) -> bool {
-        match *self.body.expr(expr) {
-            Expr::Let(..) => true,
-            Expr::Paren(inner) => self.cond_has_let(inner),
-            Expr::Binary(crate::body::BinOp::And | crate::body::BinOp::Or, lhs, rhs) => self.cond_has_let(lhs) || self.cond_has_let(rhs),
-            _ => false,
-        }
-    }
-
-    fn labeled_block(&mut self, expr: ExprId, (stmts, tail): (List, Option<ExprId>), label: u32) -> Result<Option<Value>> {
-        let exit = self.b.create_block();
-        let value = self.value_slot(expr)?;
-        self.loops.push(Loop { head: exit, exit, value, depth: self.owned.len(), label: Some(label), block: true });
-        let output = self.block(stmts, tail);
-        self.loops.pop();
-        if let (Some(output), Some(place)) = (output?, value)
-            && self.open
-        {
-            self.write(place, output);
-        }
-        self.branch_value(None, exit);
-        self.enter(exit);
-        Ok(value.and_then(|place| self.read(place)))
-    }
-
-    /// The frame slot that the `break`s of the loop or block `expr` leave its value in: the value itself when `join_slot` holds it, else its carrier.
-    pub(super) fn value_slot(&mut self, expr: ExprId) -> Result<Option<Place>> {
-        let repr = self.repr_of(expr)?;
-        if let Some(place) = self.join_slot(repr) {
-            return Ok(Some(place));
-        }
-        let held = Self::carrier(repr).map_or(Repr::Zst, Repr::Scalar);
-        Ok(self.slot(held).map(|slot| Place::slot(slot, held)))
-    }
-
-    fn loop_expr(&mut self, expr: ExprId, body: ExprId, label: Option<u32>) -> Result<Option<Value>> {
-        let (head, exit) = (self.b.create_block(), self.b.create_block());
-        let value = self.value_slot(expr)?;
-        self.jump(head, &[]);
-        self.enter(head);
-        let depth = self.owned.len();
-        self.loops.push(Loop { head, exit, value, depth, label, block: false });
-        let result = self.expr(body);
-        self.loops.pop();
-        result?;
-        self.branch_value(None, head);
-        self.enter(exit);
-        Ok(value.and_then(|place| self.read(place)))
-    }
-
-    fn jump_target(&self, label: Option<u32>) -> Option<Loop> {
-        self.loops.iter().rev().find(|frame| crate::body::jumps_to(self.src, (frame.label, frame.block), label)).copied()
-    }
-
-    fn break_expr(&mut self, label: Option<u32>, value: Option<ExprId>) -> Result<Option<Value>> {
-        let Some(Loop { exit, value: slot, depth, .. }) = self.jump_target(label) else { bail!("`break` outside a loop") };
-        let value = match value {
-            Some(expr) => {
-                let value = self.expr(expr)?;
-                self.snapshot_before_drops(depth, expr, value)?
-            }
-            None => None,
-        };
-        if let (Some(value), Some(place)) = (value, slot) {
-            self.write(place, value);
-        }
-        self.drop_to(depth)?;
-        self.branch_value(None, exit);
-        Ok(None)
-    }
-
-    fn continue_expr(&mut self, label: Option<u32>) -> Result<Option<Value>> {
-        let Some(Loop { head, depth, .. }) = self.jump_target(label) else { bail!("`continue` outside a loop") };
-        self.drop_to(depth)?;
-        self.branch_value(None, head);
-        Ok(None)
-    }
-
-    fn return_expr(&mut self, value: Option<ExprId>) -> Result<Option<Value>> {
-        let value = match value {
-            Some(value) => self.expr(value)?,
-            None => None,
-        };
-        self.finish(value)?;
-        Ok(None)
+        unwrap_plain_expr(self.body, expr, allow_unsafe)
     }
 }

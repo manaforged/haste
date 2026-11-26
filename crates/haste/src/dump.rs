@@ -14,7 +14,8 @@ use crate::sema::substs::Substs;
 
 /// The file `write` makes in the directory it is given.
 const FILE: &str = "code.tsv";
-const HEADER: &str = "index\tmodule\tname\tdefinition\ttype_args\tinline_callees\tbytes\tcode\trelocations\n";
+const HEADER: &str =
+    "index\tmodule\tname\tdefinition\ttype_args\tinline_callees\tbytes\tcode\trelocations\n";
 const NONE: &str = "-";
 const DATA: &str = "data";
 const RUNTIME: &str = "runtime";
@@ -30,8 +31,13 @@ struct Compiled {
 /// Compiles each function the binary's `main` reaches under the current profile on its own, and writes its identity (module, name, definition site, type argument count) and its machine code to `code.tsv` in `dir`.
 pub fn write(workspace: &Workspace, targets: &Targets, dir: &Path) -> Result<()> {
     let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
-    let main = crate::build::main_item(workspace, &compilation.outline).context("no member binary has a `main`")?;
-    let text = crate::macros::reach_resolved(&mut compilation, |_| vec![(main, Substs::EMPTY)], |mut cx, reached| table(&mut cx, &reached))?;
+    let main = crate::build::main_item(workspace, &compilation.outline)
+        .context("no member binary has a `main`")?;
+    let text = crate::macros::reach_resolved(
+        &mut compilation,
+        |_| vec![(main, Substs::EMPTY)],
+        |mut cx, reached| table(&mut cx, &reached),
+    )?;
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join(FILE), text)?;
     std::mem::forget(compilation);
@@ -43,12 +49,19 @@ fn table(cx: &mut Context<'_>, reached: &Reached) -> Result<String> {
     let mut compiled = Vec::new();
     let mut failed = 0;
     for index in 0..reached.list.len() {
-        let ((item, _), Ok(_)) = &reached.list[index] else { continue };
+        let ((item, _), Ok(_)) = &reached.list[index] else {
+            continue;
+        };
         if cx.foreign(*item) {
             continue;
         }
         match compile(cx, reached, &image, index) {
-            Ok((code, relocations)) => compiled.push(Compiled { index, inline: inline_callees(cx, reached, index), code, relocations }),
+            Ok((code, relocations)) => compiled.push(Compiled {
+                index,
+                inline: inline_callees(cx, reached, index),
+                code,
+                relocations,
+            }),
             Err(error) => {
                 failed += 1;
                 eprintln!("code: {}: {error:#}", cx.name(*item));
@@ -59,18 +72,37 @@ fn table(cx: &mut Context<'_>, reached: &Reached) -> Result<String> {
     for one in &compiled {
         row(cx, reached, one, &mut text)?;
     }
-    eprintln!("code {} compiled, {failed} failed, {} reached", compiled.len(), reached.list.len());
+    eprintln!(
+        "code {} compiled, {failed} failed, {} reached",
+        compiled.len(),
+        reached.list.len()
+    );
     Ok(text)
 }
 
-fn compile(cx: &mut Context<'_>, reached: &Reached, image: &Image, index: usize) -> Result<(Vec<u8>, String)> {
+fn compile(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    image: &Image,
+    index: usize,
+) -> Result<(Vec<u8>, String)> {
     let out = crate::lower::lower_stencil(cx, reached, image, index)?;
     let name = cx.symbol_text(reached.list[index].0);
-    let code = haste_codegen::with_trace_label(&name, || haste_codegen::compile(out.func, &crate::host_target()))?;
+    let code = haste_codegen::with_trace_label(&name, || {
+        haste_codegen::compile(out.func, &crate::host_target())
+    })?;
     let mut relocations = String::new();
     for reloc in code.relocs() {
         match reloc.symbol_index().and_then(|at| out.relocs.get(at)) {
-            Some(SymbolSource::Slot(callee)) => write!(relocations, "{}:{callee}/{} ", reloc.offset, reached.list.get(*callee).map_or(NONE, |((item, _), _)| cx.name(*item)))?,
+            Some(SymbolSource::Slot(callee)) => write!(
+                relocations,
+                "{}:{callee}/{} ",
+                reloc.offset,
+                reached
+                    .list
+                    .get(*callee)
+                    .map_or(NONE, |((item, _), _)| cx.name(*item))
+            )?,
             Some(_) => write!(relocations, "{}:{DATA} ", reloc.offset)?,
             None => write!(relocations, "{}:{RUNTIME} ", reloc.offset)?,
         }
@@ -80,8 +112,13 @@ fn compile(cx: &mut Context<'_>, reached: &Reached, image: &Image, index: usize)
 
 /// How many functions that reached function `index` calls lowering may copy inline into it.
 fn inline_callees(cx: &mut Context<'_>, reached: &Reached, index: usize) -> usize {
-    let callees: Vec<usize> = calls(cx, &reached.list[index].1).filter_map(|instance| reached.index.get(&instance).copied()).collect();
-    callees.into_iter().filter(|&callee| crate::lower::may_inline(cx, reached, callee)).count()
+    let callees: Vec<usize> = calls(cx, &reached.list[index].1)
+        .filter_map(|instance| reached.index.get(&instance).copied())
+        .collect();
+    callees
+        .into_iter()
+        .filter(|&callee| crate::lower::may_inline(cx, reached, callee))
+        .count()
 }
 
 fn row(cx: &mut Context<'_>, reached: &Reached, one: &Compiled, text: &mut String) -> Result<()> {
@@ -89,7 +126,14 @@ fn row(cx: &mut Context<'_>, reached: &Reached, one: &Compiled, text: &mut Strin
     let module = cx.module_text(item);
     let args = cx.types.substs(substs).len();
     let definition = place(cx, item).unwrap_or_else(|| NONE.to_owned());
-    write!(text, "{}\t{module}\t{}\t{definition}\t{args}\t{}\t{}\t", one.index, cx.name(item), one.inline, one.code.len())?;
+    write!(
+        text,
+        "{}\t{module}\t{}\t{definition}\t{args}\t{}\t{}\t",
+        one.index,
+        cx.name(item),
+        one.inline,
+        one.code.len()
+    )?;
     for byte in &one.code {
         write!(text, "{byte:02x}")?;
     }
@@ -103,5 +147,6 @@ fn place(cx: &Context<'_>, item: crate::names::ItemRef) -> Option<String> {
     let name = entry.name?;
     let span = source.span(name, name);
     let lo = (span.as_ptr() as usize).checked_sub(source.text.as_ptr() as usize)?;
-    (item.outer().is_none() && source.base.is_none() && lo + span.len() <= source.text.len()).then(|| format!("{}:{lo}", source.path.display()))
+    (item.outer().is_none() && source.base.is_none() && lo + span.len() <= source.text.len())
+        .then(|| format!("{}:{lo}", source.path.display()))
 }

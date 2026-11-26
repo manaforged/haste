@@ -38,10 +38,14 @@ pub(crate) struct Moves(Vec<(u32, u32)>);
 impl Moves {
     fn of(fixups: &[Fixup], short: &[bool]) -> Self {
         let mut removed = 0;
-        let ends = fixups.iter().zip(short).filter(|(_, short)| **short).map(|(fixup, _)| {
-            removed += fixup.disp.opcode_len() + 2;
-            (fixup.at + 4, removed)
-        });
+        let ends = fixups
+            .iter()
+            .zip(short)
+            .filter(|(_, short)| **short)
+            .map(|(fixup, _)| {
+                removed += fixup.disp.opcode_len() + 2;
+                (fixup.at + 4, removed)
+            });
         Self(ends.collect())
     }
 
@@ -58,23 +62,32 @@ impl Moves {
             site.ret = self.map(site.ret);
             site.handler = self.map(site.handler);
         }
-        relocs.iter_mut().for_each(|reloc| reloc.offset = self.map(reloc.offset));
+        relocs
+            .iter_mut()
+            .for_each(|reloc| reloc.offset = self.map(reloc.offset));
     }
 }
 
 impl Asm {
     fn place(&self, label: Label) -> Result<u32, String> {
-        self.labels[label.0 as usize].ok_or_else(|| "a jump to a label that was never placed".to_owned())
+        self.labels[label.0 as usize]
+            .ok_or_else(|| "a jump to a label that was never placed".to_owned())
     }
 
     fn reaches(&self, fixup: &Fixup, moves: &Moves) -> bool {
-        let Ok(target) = self.place(fixup.label) else { return false };
+        let Ok(target) = self.place(fixup.label) else {
+            return false;
+        };
         i8::try_from(i64::from(moves.map(target)) - i64::from(moves.map(fixup.at + 4))).is_ok()
     }
 
     /// Rewrites each `jmp` and `jcc` whose target lies within a signed byte in its two-byte form, and returns where earlier offsets moved.
     pub fn relax(&mut self) -> Moves {
-        let mut short: Vec<bool> = self.fixups.iter().map(|fixup| matches!(fixup.disp, Disp::Jmp | Disp::Jcc)).collect();
+        let mut short: Vec<bool> = self
+            .fixups
+            .iter()
+            .map(|fixup| matches!(fixup.disp, Disp::Jmp | Disp::Jcc))
+            .collect();
         let moves = loop {
             let moves = Moves::of(&self.fixups, &short);
             let mut grew = false;
@@ -93,16 +106,32 @@ impl Asm {
         for (fixup, _) in self.fixups.iter().zip(&short).filter(|(_, short)| **short) {
             let start = (fixup.at - fixup.disp.opcode_len()) as usize;
             code.extend_from_slice(&self.code[from..start]);
-            code.extend([if fixup.disp == Disp::Jmp { 0xEB } else { self.code[start + 1] - 0x10 }, 0]);
+            code.extend([
+                if fixup.disp == Disp::Jmp {
+                    0xEB
+                } else {
+                    self.code[start + 1] - 0x10
+                },
+                0,
+            ]);
             from = fixup.at as usize + 4;
         }
         code.extend_from_slice(&self.code[from..]);
         self.code = code;
         for (fixup, &short) in self.fixups.iter_mut().zip(&short) {
-            (fixup.at, fixup.disp) = if short { (moves.map(fixup.at + 4) - 1, Disp::Short) } else { (moves.map(fixup.at), fixup.disp) };
+            (fixup.at, fixup.disp) = if short {
+                (moves.map(fixup.at + 4) - 1, Disp::Short)
+            } else {
+                (moves.map(fixup.at), fixup.disp)
+            };
         }
-        self.labels.iter_mut().flatten().for_each(|at| *at = moves.map(*at));
-        self.table_fixups.iter_mut().for_each(|(at, _, _)| *at = moves.map(*at));
+        self.labels
+            .iter_mut()
+            .flatten()
+            .for_each(|at| *at = moves.map(*at));
+        self.table_fixups
+            .iter_mut()
+            .for_each(|(at, _, _)| *at = moves.map(*at));
         self.tail = None;
         moves
     }
@@ -112,7 +141,8 @@ impl Asm {
             let relative = i64::from(self.place(label)?) - i64::from(at + disp.width());
             let at = at as usize;
             if disp == Disp::Short {
-                self.code[at] = i8::try_from(relative).map_err(|_| "a short jump out of range")? as u8;
+                self.code[at] =
+                    i8::try_from(relative).map_err(|_| "a short jump out of range")? as u8;
             } else {
                 self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
             }

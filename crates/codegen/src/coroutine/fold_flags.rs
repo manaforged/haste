@@ -22,7 +22,11 @@ impl SlotVal {
     }
 }
 
-fn find_pin_slot(func: &Function, spec: &Coroutine, old_entry: Block) -> Option<(Option<StackSlot>, Vec<bool>)> {
+fn find_pin_slot(
+    func: &Function,
+    spec: &Coroutine,
+    old_entry: Block,
+) -> Option<(Option<StackSlot>, Vec<bool>)> {
     let entry_obj = *func.blocks[old_entry.index()].params.get(spec.object)?;
     let mut obj_params = vec![false; func.types.len()];
     obj_params[entry_obj.index()] = true;
@@ -47,7 +51,9 @@ fn find_pin_slot(func: &Function, spec: &Coroutine, old_entry: Block) -> Option<
                         pin_slot = None;
                         break;
                     }
-                    Op::StackStore(v, s, off) if s == slot && (off != 0 || !obj_params[v.index()]) => {
+                    Op::StackStore(v, s, off)
+                        if s == slot && (off != 0 || !obj_params[v.index()]) =>
+                    {
                         pin_slot = None;
                         break;
                     }
@@ -90,7 +96,12 @@ impl StateFlow {
     }
 }
 
-fn find_suspend_edges(func: &Function, spec: &Coroutine, old_entry: Block, consts: &[Option<i64>]) -> Option<Vec<Option<usize>>> {
+fn find_suspend_edges(
+    func: &Function,
+    spec: &Coroutine,
+    old_entry: Block,
+    consts: &[Option<i64>],
+) -> Option<Vec<Option<usize>>> {
     let (_, is_obj) = find_pin_slot(func, spec, old_entry)?;
     let n = func.blocks.len();
     let mut blk_set: Vec<Option<StateFlow>> = vec![None; n];
@@ -224,13 +235,22 @@ fn collect_scalar_slots(func: &Function) -> (Vec<u32>, usize) {
     (dense, count)
 }
 
-fn eval_op(func: &Function, op: &Op, res_ty: crate::ir::Type, lookup: impl Fn(Value) -> Option<i64>) -> Option<i64> {
+fn eval_op(
+    func: &Function,
+    op: &Op,
+    res_ty: crate::ir::Type,
+    lookup: impl Fn(Value) -> Option<i64>,
+) -> Option<i64> {
     match *op {
         Op::Const(k) => Some(k),
-        Op::Binary(bin, a, b) => constant(bin, lookup(a)?, lookup(b)?).map(|k| extend(k, res_ty, false)),
+        Op::Binary(bin, a, b) => {
+            constant(bin, lookup(a)?, lookup(b)?).map(|k| extend(k, res_ty, false))
+        }
         Op::Icmp(cc, a, b) => Some(i64::from(holds(cc, func.ty(a), lookup(a)?, lookup(b)?))),
         Op::Convert(Convert::Uextend, a) => Some(extend(lookup(a)?, func.ty(a), false)),
-        Op::Convert(Convert::Sextend, a) => Some(extend(extend(lookup(a)?, func.ty(a), true), res_ty, false)),
+        Op::Convert(Convert::Sextend, a) => {
+            Some(extend(extend(lookup(a)?, func.ty(a), true), res_ty, false))
+        }
         Op::Convert(Convert::Ireduce, a) => Some(extend(lookup(a)?, res_ty, false)),
         _ => None,
     }
@@ -247,11 +267,15 @@ fn step_slot_inst(
     match data.op {
         Op::StackStore(v, s, 0) if dense[s.index()] != u32::MAX => {
             let t = dense[s.index()] as usize;
-            let c = local_consts.get(&v).copied().or_else(|| global_consts[v.index()]);
+            let c = local_consts
+                .get(&v)
+                .copied()
+                .or_else(|| global_consts[v.index()]);
             state[t] = c.map_or(SlotVal::Varying, SlotVal::Const);
         }
         Op::StackLoad(s, 0) if dense[s.index()] != u32::MAX => {
-            if let (Some(res), SlotVal::Const(k)) = (data.result, state[dense[s.index()] as usize]) {
+            if let (Some(res), SlotVal::Const(k)) = (data.result, state[dense[s.index()] as usize])
+            {
                 let k = extend(k, func.ty(res), false);
                 if rewrite {
                     func.insts[inst.index()].op = Op::Const(k);
@@ -260,15 +284,28 @@ fn step_slot_inst(
             }
         }
         Op::Brif(cond, t, ref t_args, f, ref f_args) if rewrite => {
-            if let Some(c) = local_consts.get(&cond).copied().or_else(|| global_consts[cond.index()]) {
-                let (dst, args) = if c != 0 { (t, t_args.clone()) } else { (f, f_args.clone()) };
+            if let Some(c) = local_consts
+                .get(&cond)
+                .copied()
+                .or_else(|| global_consts[cond.index()])
+            {
+                let (dst, args) = if c != 0 {
+                    (t, t_args.clone())
+                } else {
+                    (f, f_args.clone())
+                };
                 func.insts[inst.index()].op = Op::Jump(dst, args);
                 return true;
             }
         }
         _ => {
             if let Some(res) = data.result
-                && let Some(k) = eval_op(func, &data.op, func.ty(res), |v| local_consts.get(&v).copied().or_else(|| global_consts[v.index()]))
+                && let Some(k) = eval_op(func, &data.op, func.ty(res), |v| {
+                    local_consts
+                        .get(&v)
+                        .copied()
+                        .or_else(|| global_consts[v.index()])
+                })
             {
                 local_consts.insert(res, k);
             }
@@ -307,11 +344,20 @@ pub(super) fn run(func: &mut Function, spec: &Coroutine, old_entry: Block) {
         local_consts.clear();
         let insts = func.blocks[bi].insts.clone();
         for inst in insts {
-            step_slot_inst(func, (&dense, &global_consts), (&mut state, &mut local_consts), inst, false);
+            step_slot_inst(
+                func,
+                (&dense, &global_consts),
+                (&mut state, &mut local_consts),
+                inst,
+                false,
+            );
         }
         let mut targets: Vec<Block> = Vec::new();
         if let Some(&Op::Brif(cond, t, _, f, _)) = func.last(b)
-            && let Some(c) = local_consts.get(&cond).copied().or_else(|| global_consts[cond.index()])
+            && let Some(c) = local_consts
+                .get(&cond)
+                .copied()
+                .or_else(|| global_consts[cond.index()])
         {
             targets.push(if c != 0 { t } else { f });
         } else {
@@ -346,7 +392,13 @@ pub(super) fn run(func: &mut Function, spec: &Coroutine, old_entry: Block) {
         local_consts.clear();
         let insts = func.blocks[bi].insts.clone();
         for inst in insts {
-            cfg_changed |= step_slot_inst(func, (&dense, &global_consts), (&mut state, &mut local_consts), inst, true);
+            cfg_changed |= step_slot_inst(
+                func,
+                (&dense, &global_consts),
+                (&mut state, &mut local_consts),
+                inst,
+                true,
+            );
         }
     }
     if cfg_changed {

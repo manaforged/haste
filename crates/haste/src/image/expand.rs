@@ -22,11 +22,21 @@ type One = extern "C" fn(usize, *const u8, usize, *mut usize);
 type Two = extern "C" fn(usize, *const u8, usize, *const u8, usize, *mut usize);
 
 /// Runs the jobs in children forked on `demand`, one child per group and at most one per core, answering what inference asks with `ask`, and gives each job's output text or why it has none, or `None` when it did not run; the jobs after a crash run in a new child.
-pub fn run_macros(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
+pub fn run_macros(
+    compilation: &mut Compilation,
+    demand: &mut Jit,
+    jobs: &[Job<'_>],
+    ask: Answerer<'_>,
+) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
     crate::with_host_target(|| run_macros_inner(compilation, demand, jobs, ask))
 }
 
-fn run_macros_inner(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
+fn run_macros_inner(
+    compilation: &mut Compilation,
+    demand: &mut Jit,
+    jobs: &[Job<'_>],
+    ask: Answerer<'_>,
+) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
     let mut parts: Vec<Vec<usize>> = Vec::new();
     let mut groups = rustc_hash::FxHashMap::default();
     for (at, job) in jobs.iter().enumerate() {
@@ -36,7 +46,13 @@ fn run_macros_inner(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job
         });
         parts[part].push(at);
     }
-    let mut shares = Shares { jobs, next: vec![0; parts.len()], parts, running: Vec::new(), results: jobs.iter().map(|_| None).collect() };
+    let mut shares = Shares {
+        jobs,
+        next: vec![0; parts.len()],
+        parts,
+        running: Vec::new(),
+        results: jobs.iter().map(|_| None).collect(),
+    };
     demand.set_fast(true);
     demand.set_ahead(true);
     serve(compilation, ask, demand, &mut shares)?;
@@ -65,11 +81,17 @@ impl Driver for Shares<'_, '_> {
             if self.running.len() >= crate::jobs() {
                 break;
             }
-            if self.running.iter().any(|&(_, running)| running == part) || self.left(part).next().is_none() {
+            if self.running.iter().any(|&(_, running)| running == part)
+                || self.left(part).next().is_none()
+            {
                 continue;
             }
             let todo: Vec<&Job<'_>> = self.left(part).map(|at| &self.jobs[at]).collect();
-            let id = demand.fork(true, |image, out| out.map_or(1, |out| i32::from(image.macros_in_child(&todo, out).is_err())))?;
+            let id = demand.fork(true, |image, out| {
+                out.map_or(1, |out| {
+                    i32::from(image.macros_in_child(&todo, out).is_err())
+                })
+            })?;
             self.running.push((id, part));
         }
         Ok(())
@@ -91,7 +113,10 @@ impl Driver for Shares<'_, '_> {
             if ended.status == 0 {
                 bail!("the macro child exited before its last job");
             }
-            let crashed = ended.failure.map_or_else(|| format!("the procedural macro crashed with status {}", ended.status), |(error, _)| error);
+            let crashed = ended.failure.map_or_else(
+                || format!("the procedural macro crashed with status {}", ended.status),
+                |(error, _)| error,
+            );
             self.results[job] = (!super::interrupted(ended.status)).then_some(Err(crashed));
             self.next[part] += 1;
         }
@@ -108,7 +133,10 @@ impl Image {
             }
         }
         for job in jobs {
-            let (entry, run) = (self.slot(job.entry).load(Ordering::Acquire), self.slot(job.run).load(Ordering::Acquire));
+            let (entry, run) = (
+                self.slot(job.entry).load(Ordering::Acquire),
+                self.slot(job.run).load(Ordering::Acquire),
+            );
             let mut result = [0usize; 2];
             match job.texts[..] {
                 [one] => {
@@ -119,7 +147,14 @@ impl Image {
                 [attr, item] => {
                     // SAFETY: entry is the code of `__haste_expand2`, or a stub that compiles it, whose native signature is this one, and run is the code of a `fn(TokenStream, TokenStream) -> TokenStream`.
                     let call: Two = unsafe { std::mem::transmute::<usize, Two>(entry) };
-                    call(run, attr.as_ptr(), attr.len(), item.as_ptr(), item.len(), result.as_mut_ptr());
+                    call(
+                        run,
+                        attr.as_ptr(),
+                        attr.len(),
+                        item.as_ptr(),
+                        item.len(),
+                        result.as_mut_ptr(),
+                    );
                 }
                 _ => return Err(std::io::Error::other("a macro job takes one or two texts")),
             }

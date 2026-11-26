@@ -1,6 +1,6 @@
+use super::Emit;
 use super::asm::{Vl, Xmm};
 use super::float::{X0, X1, X2};
-use super::Emit;
 use crate::ir::{Binary, Convert, Lane, Op, Value};
 
 /// `pmuludq`: the unsigned 64-bit product of the low 32 bits of each 64-bit lane.
@@ -18,7 +18,8 @@ impl Emit<'_> {
     /// Shifts every lane of `src` by `imm` into `dst`, where `ext` selects the shift.
     pub(super) fn pshift_into(&mut self, ext: u8, lane_bytes: u32, dst: Xmm, src: Xmm, imm: u8) {
         if self.features.avx {
-            self.asm.vex_pshift_imm(Vl::X, ext, lane_bytes, dst, src, imm);
+            self.asm
+                .vex_pshift_imm(Vl::X, ext, lane_bytes, dst, src, imm);
             return;
         }
         if dst != src {
@@ -31,8 +32,17 @@ impl Emit<'_> {
         vals.iter().any(|&v| self.xmm_of(v) == Some(dst))
     }
 
-    pub(super) fn fins<const N: usize>(&mut self, dst: Xmm, tied: bool, vals: [Value; N], rest: &[Value]) -> [Xmm; N] {
-        debug_assert!(!tied || rest.is_empty(), "a tied operand overwrites dst before rest is read");
+    pub(super) fn fins<const N: usize>(
+        &mut self,
+        dst: Xmm,
+        tied: bool,
+        vals: [Value; N],
+        rest: &[Value],
+    ) -> [Xmm; N] {
+        debug_assert!(
+            !tied || rest.is_empty(),
+            "a tied operand overwrites dst before rest is read"
+        );
         let mut free = (!tied && !self.lives(dst, &vals) && !self.lives(dst, rest)).then_some(dst);
         let mut spare = [X1, X0, X2].into_iter().filter(|&xmm| xmm != dst);
         let mut regs = [dst; N];
@@ -43,7 +53,9 @@ impl Emit<'_> {
             } else if let Some(home) = self.xmm_of(v).filter(|&xmm| !tied || xmm != dst) {
                 home
             } else {
-                let Some(to) = free.take().or_else(|| spare.next()) else { unreachable!() };
+                let Some(to) = free.take().or_else(|| spare.next()) else {
+                    unreachable!()
+                };
                 self.fget(to, v);
                 to
             };
@@ -65,13 +77,19 @@ impl Emit<'_> {
     }
 
     fn high_zero(&self, v: Value, depth: u8) -> bool {
-        let Some(inst) = self.defs.get(v.index()).copied().flatten() else { return false };
+        let Some(inst) = self.defs.get(v.index()).copied().flatten() else {
+            return false;
+        };
         match &self.func.insts[inst.index()].op {
             Op::Convert(Convert::Uextend, _) => true,
-            Op::Binary(Binary::Band, a, b) => [*a, *b]
-                .into_iter()
-                .any(|side| self.splat_const(side).is_some_and(|imm| imm as u64 <= u64::from(u32::MAX)) || (depth > 0 && self.high_zero(side, depth - 1))),
-            Op::Binary(Binary::Ushr, _, amount) => self.splat_const(*amount).is_some_and(|imm| imm & 63 >= i64::from(HALF)),
+            Op::Binary(Binary::Band, a, b) => [*a, *b].into_iter().any(|side| {
+                self.splat_const(side)
+                    .is_some_and(|imm| imm as u64 <= u64::from(u32::MAX))
+                    || (depth > 0 && self.high_zero(side, depth - 1))
+            }),
+            Op::Binary(Binary::Ushr, _, amount) => self
+                .splat_const(*amount)
+                .is_some_and(|imm| imm & 63 >= i64::from(HALF)),
             _ => false,
         }
     }
@@ -101,9 +119,11 @@ impl Emit<'_> {
         let src = self.fin(x, dst);
         if from == Lane::I64 {
             if self.features.avx {
-                self.asm.vex_xmm_imm(0b00001, 0b01, PSHUFD, (dst, Xmm(0)), src, EVEN_DWORDS);
+                self.asm
+                    .vex_xmm_imm(0b00001, 0b01, PSHUFD, (dst, Xmm(0)), src, EVEN_DWORDS);
             } else {
-                self.asm.sse_imm(&[0x66], &[0x0F, PSHUFD], dst.0, src, EVEN_DWORDS);
+                self.asm
+                    .sse_imm(&[0x66], &[0x0F, PSHUFD], dst.0, src, EVEN_DWORDS);
             }
             return;
         }

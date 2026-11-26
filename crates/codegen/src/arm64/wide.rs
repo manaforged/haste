@@ -9,14 +9,24 @@ const F: Reg = WIDE_SCRATCH[1];
 use crate::wide::{WideCtx, half_score};
 
 impl WideCtx<Reg> for Emit<'_> {
-    fn wide_ctx(&self) -> (&crate::ir::Function, &crate::alloc::Plan<Reg>, &[Option<crate::ir::Inst>]) {
+    fn wide_ctx(
+        &self,
+    ) -> (
+        &crate::ir::Function,
+        &crate::alloc::Plan<Reg>,
+        &[Option<crate::ir::Inst>],
+    ) {
         (self.func, &self.plan, &self.defs)
     }
 }
 
 impl Emit<'_> {
     fn load_half(&mut self, high: bool, reg: Reg, value: Value) {
-        let half = if high { self.known_halves(value).1 } else { self.const_halves(value).0 };
+        let half = if high {
+            self.known_halves(value).1
+        } else {
+            self.const_halves(value).0
+        };
         if let Some(imm) = half {
             self.asm.mov_imm(reg, imm);
             self.clobber_reg(reg);
@@ -28,7 +38,11 @@ impl Emit<'_> {
     }
 
     fn load_half_reg(&mut self, high: bool, scratch: Reg, value: Value) -> Reg {
-        let half = if high { self.known_halves(value).1 } else { self.const_halves(value).0 };
+        let half = if high {
+            self.known_halves(value).1
+        } else {
+            self.const_halves(value).0
+        };
         if half == Some(0) {
             ZR
         } else {
@@ -71,20 +85,30 @@ impl Emit<'_> {
                 self.put_halves(result, (ZR, D));
             }
             Unary::Ineg => {
-                let (a, d) = (self.load_half_reg(false, A, x), self.load_half_reg(true, D, x));
+                let (a, d) = (
+                    self.load_half_reg(false, A, x),
+                    self.load_half_reg(true, D, x),
+                );
                 self.asm.alu(Alu::Subs, Size::X, A, ZR, a);
                 self.asm.alu(Alu::Sbc, Size::X, D, ZR, d);
                 self.put_halves(result, (A, D));
             }
             Unary::Bnot => {
-                let (a, d) = (self.load_half_reg(false, A, x), self.load_half_reg(true, D, x));
+                let (a, d) = (
+                    self.load_half_reg(false, A, x),
+                    self.load_half_reg(true, D, x),
+                );
                 self.asm.alu(Alu::Orn, Size::X, A, ZR, a);
                 self.asm.alu(Alu::Orn, Size::X, D, ZR, d);
                 self.put_halves(result, (A, D));
             }
             Unary::Bswap | Unary::Bitrev => {
                 self.halves(x, (A, D));
-                let bits = if op == Unary::Bswap { Bits::Rev } else { Bits::Rbit };
+                let bits = if op == Unary::Bswap {
+                    Bits::Rev
+                } else {
+                    Bits::Rbit
+                };
                 self.asm.bits(bits, C, D);
                 self.asm.bits(bits, D, A);
                 self.put_halves(result, (C, D));
@@ -108,7 +132,13 @@ impl Emit<'_> {
         Ok(())
     }
 
-    pub(super) fn wide_binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
+    pub(super) fn wide_binary(
+        &mut self,
+        op: Binary,
+        x: Value,
+        y: Value,
+        result: Value,
+    ) -> Result<(), String> {
         match op {
             Binary::Iadd | Binary::Isub => self.wide_add_sub(op == Binary::Isub, x, y, result),
             Binary::Band | Binary::Bor | Binary::Bxor => self.wide_bitwise(op, (x, y), result),
@@ -146,7 +176,13 @@ impl Emit<'_> {
         half_score(c, false) + lo_imm + hi_imm
     }
 
-    fn wide_add_sub_zero_lo(&mut self, sub: bool, lhs: Value, (rhs, rhs_hi): (Value, Option<i64>), result: Value) {
+    fn wide_add_sub_zero_lo(
+        &mut self,
+        sub: bool,
+        lhs: Value,
+        (rhs, rhs_hi): (Value, Option<i64>),
+        result: Value,
+    ) {
         let a = self.load_half_reg(false, A, lhs);
         let d = if rhs_hi == Some(0) {
             self.load_half_reg(true, D, lhs)
@@ -157,14 +193,24 @@ impl Emit<'_> {
         } else {
             let d_lhs = self.load_half_reg(true, D, lhs);
             let s_rhs = self.load_half_reg(true, S, rhs);
-            self.asm.alu(if sub { Alu::Sub } else { Alu::Add }, Size::X, D, d_lhs, s_rhs);
+            self.asm.alu(
+                if sub { Alu::Sub } else { Alu::Add },
+                Size::X,
+                D,
+                d_lhs,
+                s_rhs,
+            );
             D
         };
         self.put_halves(result, (a, d));
     }
 
     fn wide_add_sub(&mut self, sub: bool, x: Value, y: Value, result: Value) {
-        let (lhs, rhs) = if !sub && self.add_rhs_score(x) > self.add_rhs_score(y) { (y, x) } else { (x, y) };
+        let (lhs, rhs) = if !sub && self.add_rhs_score(x) > self.add_rhs_score(y) {
+            (y, x)
+        } else {
+            (x, y)
+        };
         let (rhs_lo, rhs_hi) = self.known_halves(rhs);
         if rhs_lo == Some(0) {
             self.wide_add_sub_zero_lo(sub, lhs, (rhs, rhs_hi), result);
@@ -178,7 +224,13 @@ impl Emit<'_> {
             self.asm.add_imm(eff_sub, true, Size::X, A, a_lhs, imm);
         } else {
             let c_rhs = self.load_half_reg(false, C, rhs);
-            self.asm.alu(if sub { Alu::Subs } else { Alu::Adds }, Size::X, A, a_lhs, c_rhs);
+            self.asm.alu(
+                if sub { Alu::Subs } else { Alu::Adds },
+                Size::X,
+                A,
+                a_lhs,
+                c_rhs,
+            );
         }
         let (high_op, s_rhs) = match rhs_hi {
             Some(0) => (if sub { Alu::Sbc } else { Alu::Adc }, ZR),
@@ -238,15 +290,27 @@ impl Emit<'_> {
         }
     }
 
-    fn wide_bitwise_half(&mut self, (op, high): (Binary, bool), (x, cx): (Value, Option<i64>), (y, cy): (Value, Option<i64>), (dst, tmp): (Reg, Reg)) -> Reg {
-        let ((lhs, lhs_c), (rhs, rhs_c)) = if Self::bitwise_score(cx) > Self::bitwise_score(cy) { ((y, cy), (x, cx)) } else { ((x, cx), (y, cy)) };
+    fn wide_bitwise_half(
+        &mut self,
+        (op, high): (Binary, bool),
+        (x, cx): (Value, Option<i64>),
+        (y, cy): (Value, Option<i64>),
+        (dst, tmp): (Reg, Reg),
+    ) -> Reg {
+        let ((lhs, lhs_c), (rhs, rhs_c)) = if Self::bitwise_score(cx) > Self::bitwise_score(cy) {
+            ((y, cy), (x, cx))
+        } else {
+            ((x, cx), (y, cy))
+        };
         match (op, rhs_c) {
             (Binary::Band, Some(0)) => return ZR,
             (Binary::Bor, Some(-1)) => {
                 self.asm.mov_imm(dst, -1);
                 return dst;
             }
-            (Binary::Bor | Binary::Bxor, Some(0)) | (Binary::Band, Some(-1)) => return self.load_half_reg(high, dst, lhs),
+            (Binary::Bor | Binary::Bxor, Some(0)) | (Binary::Band, Some(-1)) => {
+                return self.load_half_reg(high, dst, lhs);
+            }
             (Binary::Bxor, Some(-1)) if lhs_c == Some(-1) => return ZR,
             (Binary::Bxor, Some(-1)) => {
                 self.load_half(high, dst, lhs);
@@ -274,7 +338,11 @@ impl Emit<'_> {
     fn wide_rotate(&mut self, op: Binary, x: Value, y: Value) -> (Reg, Reg) {
         self.halves(x, (A, D));
         if let Some(k) = self.shift_const(y) {
-            let r = if op == Binary::Rotl { (128 - k) & 127 } else { k };
+            let r = if op == Binary::Rotl {
+                (128 - k) & 127
+            } else {
+                k
+            };
             if r == 0 {
                 return (A, D);
             }
@@ -286,7 +354,11 @@ impl Emit<'_> {
             self.asm.extr(Size::X, S, lo, hi, s);
             return (C, S);
         }
-        let (first, second) = if op == Binary::Rotl { (Binary::Ishl, Binary::Ushr) } else { (Binary::Ushr, Binary::Ishl) };
+        let (first, second) = if op == Binary::Rotl {
+            (Binary::Ishl, Binary::Ushr)
+        } else {
+            (Binary::Ushr, Binary::Ishl)
+        };
         self.raw(C, y);
         self.asm.fmov_in(true, V0, A);
         self.asm.fmov_in(true, V1, D);
@@ -369,7 +441,17 @@ impl Emit<'_> {
                 self.asm.lsl_imm(S, D, 1);
                 self.asm.alu(Alu::Lslv, Size::X, S, S, E);
                 self.asm.alu(Alu::Orr, Size::X, T, T, S);
-                self.asm.alu(if op == Binary::Sshr { Alu::Asrv } else { Alu::Lsrv }, Size::X, S, D, C);
+                self.asm.alu(
+                    if op == Binary::Sshr {
+                        Alu::Asrv
+                    } else {
+                        Alu::Lsrv
+                    },
+                    Size::X,
+                    S,
+                    D,
+                    C,
+                );
                 (T, S)
             }
         };
@@ -394,7 +476,10 @@ impl Emit<'_> {
         (A, D)
     }
 
-    fn eq_all_ones_other((x, cx): (Value, (Option<i64>, Option<i64>)), (y, cy): (Value, (Option<i64>, Option<i64>))) -> Option<Value> {
+    fn eq_all_ones_other(
+        (x, cx): (Value, (Option<i64>, Option<i64>)),
+        (y, cy): (Value, (Option<i64>, Option<i64>)),
+    ) -> Option<Value> {
         if cx == (Some(-1), Some(-1)) {
             Some(y)
         } else if cy == (Some(-1), Some(-1)) {
@@ -416,7 +501,13 @@ impl Emit<'_> {
         }
     }
 
-    fn xor_half_diff(&mut self, high: bool, (x, cx): (Value, Option<i64>), (y, cy): (Value, Option<i64>), (dst, tmp): (Reg, Reg)) {
+    fn xor_half_diff(
+        &mut self,
+        high: bool,
+        (x, cx): (Value, Option<i64>),
+        (y, cy): (Value, Option<i64>),
+        (dst, tmp): (Reg, Reg),
+    ) {
         if cx == Some(0) {
             self.load_half(high, dst, y);
         } else if cy == Some(0) {
@@ -435,10 +526,17 @@ impl Emit<'_> {
     }
 
     fn wide_icmp_eq(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
-        let eq = if cc == IntCC::Equal { Cond::Eq } else { Cond::Ne };
+        let eq = if cc == IntCC::Equal {
+            Cond::Eq
+        } else {
+            Cond::Ne
+        };
         let (cx, cy) = (self.known_halves(x), self.known_halves(y));
         if let Some(val) = Self::eq_all_ones_other((x, cx), (y, cy)) {
-            let (a, d) = (self.load_half_reg(false, A, val), self.load_half_reg(true, D, val));
+            let (a, d) = (
+                self.load_half_reg(false, A, val),
+                self.load_half_reg(true, D, val),
+            );
             self.asm.alu(Alu::And, Size::X, A, a, d);
             self.asm.add_imm(false, true, Size::X, ZR, A, 1);
             return eq;
@@ -448,12 +546,17 @@ impl Emit<'_> {
         if lo_same && hi_same {
             self.asm.alu(Alu::Subs, Size::X, ZR, ZR, ZR);
         } else if lo_same || hi_same {
-            let (high, (hx, hy)) = if hi_same { (false, (cx.0, cy.0)) } else { (true, (cx.1, cy.1)) };
-            let (lhs, rhs, r_imm) = if hy.is_some_and(|v| add_imm_parts(true, v).is_some()) || hx.is_none() {
-                (x, y, hy)
+            let (high, (hx, hy)) = if hi_same {
+                (false, (cx.0, cy.0))
             } else {
-                (y, x, hx)
+                (true, (cx.1, cy.1))
             };
+            let (lhs, rhs, r_imm) =
+                if hy.is_some_and(|v| add_imm_parts(true, v).is_some()) || hx.is_none() {
+                    (x, y, hy)
+                } else {
+                    (y, x, hx)
+                };
             self.cmp64(high, lhs, (rhs, r_imm));
         } else {
             self.xor_half_diff(false, (x, cx.0), (y, cy.0), (A, C));

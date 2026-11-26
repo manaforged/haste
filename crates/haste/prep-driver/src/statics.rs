@@ -12,7 +12,14 @@ pub fn facts(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Value> {
         return None;
     }
     let env = TypingEnv::fully_monomorphized();
-    let ty = tcx.normalize_erasing_regions(env, ty::Unnormalized::new_wip(tcx.type_of(def_id).instantiate_identity().skip_normalization()));
+    let ty = tcx.normalize_erasing_regions(
+        env,
+        ty::Unnormalized::new_wip(
+            tcx.type_of(def_id)
+                .instantiate_identity()
+                .skip_normalization(),
+        ),
+    );
     Some(json!({
         STATIC: key(tcx, def_id)?,
         "symbol": tcx.symbol_name(Instance::mono(tcx, def_id)).name,
@@ -29,5 +36,8 @@ fn key(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
     let parent = tcx.parent(def_id);
     let first = tcx.def_key(def_id).disambiguated_data.disambiguator == 0;
     (first && matches!(tcx.def_kind(parent), DefKind::Fn | DefKind::AssocFn)).then_some(())?;
-    Some(crate::source::nested(&crate::key::def(tcx, parent)?, tcx.item_name(def_id).as_str()))
+    Some(crate::source::nested(
+        &crate::key::def(tcx, parent)?,
+        tcx.item_name(def_id).as_str(),
+    ))
 }

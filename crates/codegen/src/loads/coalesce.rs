@@ -20,9 +20,25 @@ pub(super) struct ConstStore {
 pub(super) fn is_pure_scan_op(op: &Op) -> bool {
     matches!(
         op,
-        Op::Const(_) | Op::Binary(..) | Op::Unary(..) | Op::Icmp(..) | Op::Fcmp(..) | Op::Convert(..) | Op::Select(..)
-            | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) | Op::Runtime(_) | Op::Jump(..) | Op::Brif(..)
-            | Op::BrTable(..) | Op::Fits(..) | Op::Insert(..) | Op::Extract(..) | Op::Shuffle(..) | Op::TargetOp(..)
+        Op::Const(_)
+            | Op::Binary(..)
+            | Op::Unary(..)
+            | Op::Icmp(..)
+            | Op::Fcmp(..)
+            | Op::Convert(..)
+            | Op::Select(..)
+            | Op::StackAddr(..)
+            | Op::Symbol(_)
+            | Op::SlotAddr(_)
+            | Op::Runtime(_)
+            | Op::Jump(..)
+            | Op::Brif(..)
+            | Op::BrTable(..)
+            | Op::Fits(..)
+            | Op::Insert(..)
+            | Op::Extract(..)
+            | Op::Shuffle(..)
+            | Op::TargetOp(..)
     )
 }
 
@@ -43,7 +59,11 @@ fn store_base(prov: &Provenance, subst: &[Value], op: &Op, loc: MemLoc) -> Optio
         (&Op::Store(_, addr, _), MemBase::Global(_)) => {
             let a = find(subst, addr);
             let (eff_val, _) = prov.affine.get(a.index()).copied().unwrap_or((a, 0));
-            prov.symbol_defs.get(eff_val.index()).copied().flatten().map(|_| StoreBase::Addr(eff_val))
+            prov.symbol_defs
+                .get(eff_val.index())
+                .copied()
+                .flatten()
+                .map(|_| StoreBase::Addr(eff_val))
         }
         _ => None,
     }
@@ -66,7 +86,10 @@ fn canonical_wide_imm(wide_ty: Type, wide_imm: u64) -> i64 {
     }
 }
 
-fn find_coalesce_slice(const_stores: &[ConstStore], target_idx: usize) -> Option<(Vec<usize>, i64, Type)> {
+fn find_coalesce_slice(
+    const_stores: &[ConstStore],
+    target_idx: usize,
+) -> Option<(Vec<usize>, i64, Type)> {
     let target = const_stores[target_idx];
     let mut same: Vec<(usize, i64, u32)> = const_stores
         .iter()
@@ -89,7 +112,9 @@ fn find_coalesce_slice(const_stores: &[ConstStore], target_idx: usize) -> Option
     let contig = &same[l..=r];
     let t_rel = pos - l;
     for target_w in [8_i64, 4, 2] {
-        let Some(wide_ty) = Type::int_of_bytes(target_w) else { continue };
+        let Some(wide_ty) = Type::int_of_bytes(target_w) else {
+            continue;
+        };
         for a in 0..=t_rel {
             let lo = contig[a].1;
             if i32::try_from(lo).is_err() {
@@ -100,7 +125,11 @@ fn find_coalesce_slice(const_stores: &[ConstStore], target_idx: usize) -> Option
             }
             for b in t_rel..contig.len() {
                 if b > a && contig[b].1 + i64::from(contig[b].2) - lo == target_w {
-                    return Some((contig[a..=b].iter().map(|&(idx, _, _)| idx).collect(), lo, wide_ty));
+                    return Some((
+                        contig[a..=b].iter().map(|&(idx, _, _)| idx).collect(),
+                        lo,
+                        wide_ty,
+                    ));
                 }
             }
         }
@@ -108,7 +137,13 @@ fn find_coalesce_slice(const_stores: &[ConstStore], target_idx: usize) -> Option
     None
 }
 
-fn collect_coalesce_bytes(func: &mut Function, bufs: &mut ScanBuf, indices: &[usize], lo: i64, fallback: StoreBase) -> (u64, StoreBase) {
+fn collect_coalesce_bytes(
+    func: &mut Function,
+    bufs: &mut ScanBuf,
+    indices: &[usize],
+    lo: i64,
+    fallback: StoreBase,
+) -> (u64, StoreBase) {
     let mut wide_imm = 0_u64;
     let mut chosen = fallback;
     let mut min_kept = usize::MAX;
@@ -127,7 +162,8 @@ fn collect_coalesce_bytes(func: &mut Function, bufs: &mut ScanBuf, indices: &[us
             }
         }
     }
-    bufs.pending_stores.retain(|&(_, kidx)| !drop_kept.contains(&kidx));
+    bufs.pending_stores
+        .retain(|&(_, kidx)| !drop_kept.contains(&kidx));
     let mut rm = vec![false; bufs.const_stores.len()];
     for &idx in indices {
         rm[idx] = true;
@@ -156,8 +192,22 @@ fn emit_wide_const_store(
         StoreBase::Slot(s) => Op::StackStore(c_val, s, lo_i32),
         StoreBase::Addr(a) => Op::Store(c_val, a, lo_i32),
     };
-    super::dom::write_preserving(func, known, bases, loc, wide_ty, c_val, state.prov, Some(inst));
-    bufs.const_stores.push(ConstStore { loc, imm: wide_imm, kept_idx: bufs.kept.len(), base: chosen });
+    super::dom::write_preserving(
+        func,
+        known,
+        bases,
+        loc,
+        wide_ty,
+        c_val,
+        state.prov,
+        Some(inst),
+    );
+    bufs.const_stores.push(ConstStore {
+        loc,
+        imm: wide_imm,
+        kept_idx: bufs.kept.len(),
+        base: chosen,
+    });
     loc
 }
 
@@ -183,7 +233,11 @@ fn try_patch_const_store(
         cs.loc.base == loc.base
             && cs.loc.size > loc.size
             && cs.loc.offset <= loc.offset
-            && cs.loc.offset.checked_add(i64::from(cs.loc.size)).is_some_and(|e| loc_end <= e)
+            && cs
+                .loc
+                .offset
+                .checked_add(i64::from(cs.loc.size))
+                .is_some_and(|e| loc_end <= e)
             && cs.kept_idx < bufs.kept.len()
             && bufs.kept[cs.kept_idx].is_some()
     })?;
@@ -197,7 +251,14 @@ fn try_patch_const_store(
     let shift = (loc.offset - cs.loc.offset) * 8;
     let width_mask = (1_u64 << (loc.size * 8)) - 1;
     let wide_imm = (cs.imm & !(width_mask << shift)) | ((imm & width_mask) << shift);
-    Some(emit_wide_const_store(func, state, known, bases, bufs, (inst, cs.loc, cs.base, wide_ty, wide_imm)))
+    Some(emit_wide_const_store(
+        func,
+        state,
+        known,
+        bases,
+        bufs,
+        (inst, cs.loc, cs.base, wide_ty, wide_imm),
+    ))
 }
 
 pub(super) fn try_coalesce_store(
@@ -208,7 +269,10 @@ pub(super) fn try_coalesce_store(
     bufs: &mut ScanBuf,
     (inst, loc, ty, value, track): (Inst, MemLoc, Type, Value, bool),
 ) -> Option<MemLoc> {
-    if track && let Some(patched) = try_patch_const_store(func, state, known, bases, bufs, (inst, loc, ty, value)) {
+    if track
+        && let Some(patched) =
+            try_patch_const_store(func, state, known, bases, bufs, (inst, loc, ty, value))
+    {
         return Some(patched);
     }
     retain_const_stores(state.prov, &mut bufs.const_stores, loc);
@@ -218,9 +282,21 @@ pub(super) fn try_coalesce_store(
     let imm = state.consts[value.index()].and_then(|v| masked_imm(ty, v))?;
     let base = store_base(state.prov, state.subst, &func.insts[inst.index()].op, loc)?;
     let new_idx = bufs.const_stores.len();
-    bufs.const_stores.push(ConstStore { loc, imm, kept_idx: bufs.kept.len(), base });
+    bufs.const_stores.push(ConstStore {
+        loc,
+        imm,
+        kept_idx: bufs.kept.len(),
+        base,
+    });
     let (indices, lo, wide_ty) = find_coalesce_slice(&bufs.const_stores, new_idx)?;
     let (wide_imm, chosen) = collect_coalesce_bytes(func, bufs, &indices, lo, base);
     let wide_loc = MemLoc::new(loc.root, loc.base, lo, wide_ty.bytes());
-    Some(emit_wide_const_store(func, state, known, bases, bufs, (inst, wide_loc, chosen, wide_ty, wide_imm)))
+    Some(emit_wide_const_store(
+        func,
+        state,
+        known,
+        bases,
+        bufs,
+        (inst, wide_loc, chosen, wide_ty, wide_imm),
+    ))
 }

@@ -9,18 +9,27 @@ use crate::error::{Error, Result};
 /// The calling convention rustc lowered `instance` to: its convention, each argument and the return with their type, size, alignment and passing mode, and whether the return goes through a hidden pointer; and the types of the arguments and the return.
 pub fn of<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<(Value, Vec<Ty<'tcx>>)> {
     let input = TypingEnv::fully_monomorphized().as_query_input((instance, ty::List::empty()));
-    tcx.fn_abi_of_instance(input).map(|abi| describe(tcx, abi)).map_err(|error| Error(format!("{error:?}")))
+    tcx.fn_abi_of_instance(input)
+        .map(|abi| describe(tcx, abi))
+        .map_err(|error| Error(format!("{error:?}")))
 }
 
 /// The calling convention of a call through a function pointer of type `pointer`, as `of` describes one.
 pub fn of_pointer<'tcx>(tcx: TyCtxt<'tcx>, pointer: Ty<'tcx>) -> Result<(Value, Vec<Ty<'tcx>>)> {
     let sig = pointer.fn_sig(tcx);
     let input = TypingEnv::fully_monomorphized().as_query_input((sig, ty::List::empty()));
-    tcx.fn_abi_of_fn_ptr(input).map(|abi| describe(tcx, abi)).map_err(|error| Error(format!("{error:?}")))
+    tcx.fn_abi_of_fn_ptr(input)
+        .map(|abi| describe(tcx, abi))
+        .map_err(|error| Error(format!("{error:?}")))
 }
 
 fn describe<'tcx>(tcx: TyCtxt<'tcx>, abi: &FnAbi<'tcx, Ty<'tcx>>) -> (Value, Vec<Ty<'tcx>>) {
-    let types = abi.args.iter().chain([&abi.ret]).map(|one| one.layout.ty).collect();
+    let types = abi
+        .args
+        .iter()
+        .chain([&abi.ret])
+        .map(|one| one.layout.ty)
+        .collect();
     let value = json!({
         "conv": format!("{:?}", abi.conv),
         "variadic": abi.c_variadic,
@@ -46,12 +55,18 @@ fn arg<'tcx>(tcx: TyCtxt<'tcx>, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> Value {
 fn mode<'tcx>(dl: &TargetDataLayout, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> Value {
     match &arg.mode {
         PassMode::Ignore => json!({ "kind": "ignore" }),
-        PassMode::Direct(attrs) => json!({ "kind": "direct", "regs": regs(dl, &arg.layout.backend_repr), "attrs": [flags(attrs)] }),
+        PassMode::Direct(attrs) => {
+            json!({ "kind": "direct", "regs": regs(dl, &arg.layout.backend_repr), "attrs": [flags(attrs)] })
+        }
         PassMode::Pair(first, second) => {
             json!({ "kind": "pair", "regs": regs(dl, &arg.layout.backend_repr), "attrs": [flags(first), flags(second)] })
         }
         PassMode::Cast { pad_i32, cast } => cast_mode(*pad_i32, cast),
-        PassMode::Indirect { attrs, meta_attrs, on_stack } => {
+        PassMode::Indirect {
+            attrs,
+            meta_attrs,
+            on_stack,
+        } => {
             json!({ "kind": "indirect", "on_stack": on_stack, "unsized": meta_attrs.is_some(), "attrs": [flags(attrs)] })
         }
     }
@@ -74,7 +89,9 @@ fn regs(dl: &TargetDataLayout, repr: &BackendRepr) -> Value {
         BackendRepr::ScalarPair { a, b, b_offset } => {
             json!([{ "class": class(dl, a), "offset": 0 }, { "class": class(dl, b), "offset": b_offset.bytes() }])
         }
-        BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => json!([{ "class": "vector", "offset": 0 }]),
+        BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => {
+            json!([{ "class": "vector", "offset": 0 }])
+        }
         BackendRepr::Memory { .. } => json!([]),
     }
 }

@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
-use crate::names::{ItemRef, Primitive};
+use crate::names::{ItemRef, PRIMITIVES, Primitive};
 use crate::sync::{AtomicU8Slab, AtomicU32Slab, Interner};
 
-use super::substs::{ItemList, ItemListPool, PatPool, PatRange, ProjDef, ProjId, ProjPool, Substs, SubstsPool};
+use super::substs::{
+    ItemList, ItemListPool, PatPool, PatRange, ProjDef, ProjId, ProjPool, Substs, SubstsPool,
+};
 
 /// An interned type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -52,31 +54,54 @@ pub enum Kind {
 }
 
 /// The trait arguments of a trait object's types `args`, and the types bound to its associated types `members`.
-pub fn object_parts<'k>(args: &'k [Ty], members: &'k [ItemRef]) -> (&'k [Ty], impl Iterator<Item = (ItemRef, Ty)> + 'k) {
+pub fn object_parts<'k>(
+    args: &'k [Ty],
+    members: &'k [ItemRef],
+) -> (&'k [Ty], impl Iterator<Item = (ItemRef, Ty)> + 'k) {
     let (trait_args, bound) = args.split_at(args.len() - members.len());
-    (trait_args, members.iter().copied().zip(bound.iter().copied()))
+    (
+        trait_args,
+        members.iter().copied().zip(bound.iter().copied()),
+    )
 }
 
 impl Kind {
     /// The types directly inside this shape.
     pub fn children<'a>(&'a self, types: &'a Types) -> impl Iterator<Item = Ty> + 'a {
         let (first, items, extra): (Option<Ty>, &[Ty], &[Ty]) = match self {
-            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Closure(_, items, _) | Kind::Dyn(_, items, ..) => (None, types.substs(*items), &[]),
-            Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => (Some(*inner), &[], &[]),
+            Kind::Tuple(items)
+            | Kind::Adt(_, items)
+            | Kind::FnDef(_, items)
+            | Kind::Closure(_, items, _)
+            | Kind::Dyn(_, items, ..) => (None, types.substs(*items), &[]),
+            Kind::Ref(_, inner)
+            | Kind::Ptr(_, inner)
+            | Kind::Slice(inner)
+            | Kind::Pat(inner, ..) => (Some(*inner), &[], &[]),
             Kind::Array(inner, len) => (Some(*inner), std::slice::from_ref(len), &[]),
             Kind::FnPtr(params, ret) => (Some(*ret), types.substs(*params), &[]),
             Kind::Proj(id) => {
                 let proj = types.proj(*id);
-                (Some(proj.self_ty), types.substs(proj.args), types.substs(proj.own))
+                (
+                    Some(proj.self_ty),
+                    types.substs(proj.args),
+                    types.substs(proj.own),
+                )
             }
             _ => (None, &[], &[]),
         };
-        first.into_iter().chain(items.iter().copied()).chain(extra.iter().copied())
+        first
+            .into_iter()
+            .chain(items.iter().copied())
+            .chain(extra.iter().copied())
     }
 
     /// Whether a value of this shape has no size known before it runs, so a pointer to it carries metadata.
     pub fn is_unsized(&self) -> bool {
-        matches!(self, Kind::Slice(_) | Kind::Prim(Primitive::Str) | Kind::Dyn(..))
+        matches!(
+            self,
+            Kind::Slice(_) | Kind::Prim(Primitive::Str) | Kind::Dyn(..)
+        )
     }
 }
 
@@ -90,28 +115,6 @@ const FLAG_SET: u8 = 0x80;
 const TY_SHARDS: usize = 128;
 const TY_SLAB: usize = 65_536;
 const TY_SLABS: usize = 256;
-
-const ALL_PRIMITIVES: [Primitive; 19] = [
-    Primitive::Bool,
-    Primitive::Char,
-    Primitive::Str,
-    Primitive::I8,
-    Primitive::I16,
-    Primitive::I32,
-    Primitive::I64,
-    Primitive::I128,
-    Primitive::Isize,
-    Primitive::U8,
-    Primitive::U16,
-    Primitive::U32,
-    Primitive::U64,
-    Primitive::U128,
-    Primitive::Usize,
-    Primitive::F16,
-    Primitive::F32,
-    Primitive::F64,
-    Primitive::F128,
-];
 
 const UNIT_TY: Ty = Ty(19);
 const NEVER_TY: Ty = Ty(20);
@@ -152,9 +155,9 @@ impl Default for Types {
             items: ItemListPool::default(),
             pats: PatPool::default(),
         };
-        let fixed = ALL_PRIMITIVES
-            .into_iter()
-            .map(Kind::Prim)
+        let fixed = PRIMITIVES
+            .iter()
+            .map(|&(_, p)| Kind::Prim(p))
             .chain([Kind::Tuple(Substs::EMPTY), Kind::Never])
             .chain((0..FAST_VARS).map(Kind::Var))
             .chain((0..FAST_INT_VARS).map(Kind::IntVar))
@@ -194,7 +197,9 @@ fn fast_ty(kind: &Kind) -> Option<Ty> {
         Kind::IntVar(index) if index < FAST_INT_VARS => Some(Ty(INT_VAR_BASE + index)),
         Kind::FloatVar(index) if index < FAST_FLOAT_VARS => Some(Ty(FLOAT_VAR_BASE + index)),
         Kind::Value(bits) if bits < u128::from(FAST_VALUES) => Some(Ty(VALUE_BASE + bits as u32)),
-        Kind::Param(index) if u32::from(index) < FAST_PARAMS => Some(Ty(PARAM_BASE + u32::from(index))),
+        Kind::Param(index) if u32::from(index) < FAST_PARAMS => {
+            Some(Ty(PARAM_BASE + u32::from(index)))
+        }
         _ => None,
     }
 }
@@ -247,11 +252,17 @@ impl Types {
 
     #[inline]
     fn flags_of(&self, ty: Ty) -> u8 {
-        if ty == Ty::NONE { FLAG_NONE } else { self.flags.get(ty.0 as usize).unwrap_or(0) & !FLAG_SET }
+        if ty == Ty::NONE {
+            FLAG_NONE
+        } else {
+            self.flags.get(ty.0 as usize).unwrap_or(0) & !FLAG_SET
+        }
     }
 
     fn substs_flags(&self, substs: Substs) -> u8 {
-        self.substs(substs).iter().fold(0, |acc, &ty| acc | self.flags_of(ty))
+        self.substs(substs)
+            .iter()
+            .fold(0, |acc, &ty| acc | self.flags_of(ty))
     }
 
     /// Whether `ty` contains any rigid `Param` or `Proj` at any depth.
@@ -289,12 +300,21 @@ impl Types {
             Kind::Param(_) => FLAG_PARAM,
             Kind::Proj(id) => {
                 let proj = self.proj(*id);
-                let sub = self.flags_of(proj.self_ty) | self.substs_flags(proj.args) | self.substs_flags(proj.own);
+                let sub = self.flags_of(proj.self_ty)
+                    | self.substs_flags(proj.args)
+                    | self.substs_flags(proj.own);
                 FLAG_PARAM | FLAG_PROJ | (sub & (FLAG_VAR | FLAG_CLOSURE | FLAG_NONE))
             }
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => FLAG_VAR,
-            Kind::Closure(..) => FLAG_CLOSURE | kind.children(self).fold(0, |acc, child| acc | self.flags_of(child)),
-            other => other.children(self).fold(0, |acc, child| acc | self.flags_of(child)),
+            Kind::Closure(..) => {
+                FLAG_CLOSURE
+                    | kind
+                        .children(self)
+                        .fold(0, |acc, child| acc | self.flags_of(child))
+            }
+            other => other
+                .children(self)
+                .fold(0, |acc, child| acc | self.flags_of(child)),
         }
     }
 
@@ -316,7 +336,8 @@ impl Types {
 
     fn intern_slow(&self, kind: Kind) -> Ty {
         Ty(self.inner.intern_owned(kind, |kind, id| {
-            self.flags.set(id as usize, self.kind_flags(kind) | FLAG_SET);
+            self.flags
+                .set(id as usize, self.kind_flags(kind) | FLAG_SET);
         }))
     }
 
@@ -403,7 +424,11 @@ pub(in crate::sema) fn try_map_substs<S, E>(
     match copied {
         SliceCopy::One(ty) => {
             let mapped = f(state, ty)?;
-            Ok(if mapped == ty { id } else { types_of(state).intern_substs(&[mapped]) })
+            Ok(if mapped == ty {
+                id
+            } else {
+                types_of(state).intern_substs(&[mapped])
+            })
         }
         SliceCopy::Small(mut buf, len) => {
             let mut changed = false;
@@ -414,7 +439,11 @@ pub(in crate::sema) fn try_map_substs<S, E>(
                     changed = true;
                 }
             }
-            Ok(if changed { types_of(state).intern_substs(&buf[..len]) } else { id })
+            Ok(if changed {
+                types_of(state).intern_substs(&buf[..len])
+            } else {
+                id
+            })
         }
         SliceCopy::Large(mut vec) => {
             let mut changed = false;
@@ -425,7 +454,11 @@ pub(in crate::sema) fn try_map_substs<S, E>(
                     changed = true;
                 }
             }
-            Ok(if changed { types_of(state).intern_substs(&vec) } else { id })
+            Ok(if changed {
+                types_of(state).intern_substs(&vec)
+            } else {
+                id
+            })
         }
     }
 }
@@ -440,59 +473,81 @@ pub(in crate::sema) fn try_map_children<S, E>(
     let next = match *types_of(state).kind(ty) {
         Kind::Tuple(items) => {
             let mapped = try_map_substs(state, items, types_of, f)?;
-            if mapped == items { return Ok(ty); }
+            if mapped == items {
+                return Ok(ty);
+            }
             Kind::Tuple(mapped)
         }
         Kind::Ref(mutable, inner) => {
             let mapped = f(state, inner)?;
-            if mapped == inner { return Ok(ty); }
+            if mapped == inner {
+                return Ok(ty);
+            }
             Kind::Ref(mutable, mapped)
         }
         Kind::Ptr(mutable, inner) => {
             let mapped = f(state, inner)?;
-            if mapped == inner { return Ok(ty); }
+            if mapped == inner {
+                return Ok(ty);
+            }
             Kind::Ptr(mutable, mapped)
         }
         Kind::Array(inner, len) => {
             let m_inner = f(state, inner)?;
             let m_len = f(state, len)?;
-            if m_inner == inner && m_len == len { return Ok(ty); }
+            if m_inner == inner && m_len == len {
+                return Ok(ty);
+            }
             Kind::Array(m_inner, m_len)
         }
         Kind::Slice(inner) => {
             let mapped = f(state, inner)?;
-            if mapped == inner { return Ok(ty); }
+            if mapped == inner {
+                return Ok(ty);
+            }
             Kind::Slice(mapped)
         }
         Kind::Adt(item, args) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
-            if mapped == args { return Ok(ty); }
+            if mapped == args {
+                return Ok(ty);
+            }
             Kind::Adt(item, mapped)
         }
         Kind::FnDef(item, args) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
-            if mapped == args { return Ok(ty); }
+            if mapped == args {
+                return Ok(ty);
+            }
             Kind::FnDef(item, mapped)
         }
         Kind::Closure(parent, args, at) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
-            if mapped == args { return Ok(ty); }
+            if mapped == args {
+                return Ok(ty);
+            }
             Kind::Closure(parent, mapped, at)
         }
         Kind::Dyn(of, args, members, autos) => {
             let mapped = try_map_substs(state, args, types_of, f)?;
-            if mapped == args { return Ok(ty); }
+            if mapped == args {
+                return Ok(ty);
+            }
             Kind::Dyn(of, mapped, members, autos)
         }
         Kind::FnPtr(params, ret) => {
             let m_params = try_map_substs(state, params, types_of, f)?;
             let m_ret = f(state, ret)?;
-            if m_params == params && m_ret == ret { return Ok(ty); }
+            if m_params == params && m_ret == ret {
+                return Ok(ty);
+            }
             Kind::FnPtr(m_params, m_ret)
         }
         Kind::Pat(base, range) => {
             let mapped = f(state, base)?;
-            if mapped == base { return Ok(ty); }
+            if mapped == base {
+                return Ok(ty);
+            }
             Kind::Pat(mapped, range)
         }
         Kind::Proj(id) => {
@@ -503,7 +558,12 @@ pub(in crate::sema) fn try_map_children<S, E>(
             if self_ty == def.self_ty && args == def.args && own == def.own {
                 return Ok(ty);
             }
-            Kind::Proj(types_of(state).intern_proj(ProjDef { self_ty, args, own, ..def }))
+            Kind::Proj(types_of(state).intern_proj(ProjDef {
+                self_ty,
+                args,
+                own,
+                ..def
+            }))
         }
         _ => return Ok(ty),
     };
@@ -512,7 +572,11 @@ pub(in crate::sema) fn try_map_children<S, E>(
 
 /// The value with the low `bits` bits set: the mask of an integer that wide.
 pub fn mask(bits: u32) -> u128 {
-    if bits == 128 { u128::MAX } else { (1 << bits) - 1 }
+    if bits == 128 {
+        u128::MAX
+    } else {
+        (1 << bits) - 1
+    }
 }
 
 /// The width in bits and signedness of an integer primitive, with `isize` and `usize` at 64 bits.

@@ -93,26 +93,64 @@ impl Cursor<'_> {
     fn generic_param(&mut self) -> Result<Generic> {
         let start = self.at;
         if let Some(name) = self.lifetime() {
-            let bounds = if self.eat(":") { self.bounds()? } else { List::default() };
-            return Ok(Generic { name, kind: GenericKind::Lifetime, bounds, default: None, span: (start, self.at) });
+            let bounds = if self.eat(":") {
+                self.bounds()?
+            } else {
+                List::default()
+            };
+            return Ok(Generic {
+                name,
+                kind: GenericKind::Lifetime,
+                bounds,
+                default: None,
+                span: (start, self.at),
+            });
         }
         if self.eat_word("const") {
             let name = self.name()?;
             self.expect(":")?;
             let ty = self.ty()?;
             let span = (start, self.at);
-            let default = if self.eat("=") { Some(self.const_default()?) } else { None };
-            return Ok(Generic { name, kind: GenericKind::Const(ty), bounds: List::default(), default, span });
+            let default = if self.eat("=") {
+                Some(self.const_default()?)
+            } else {
+                None
+            };
+            return Ok(Generic {
+                name,
+                kind: GenericKind::Const(ty),
+                bounds: List::default(),
+                default,
+                span,
+            });
         }
         let name = self.name()?;
-        let bounds = if self.eat(":") { self.bounds()? } else { List::default() };
+        let bounds = if self.eat(":") {
+            self.bounds()?
+        } else {
+            List::default()
+        };
         let span = (start, self.at);
-        let default = if self.eat("=") { Some(self.ty()?) } else { None };
-        Ok(Generic { name, kind: GenericKind::Type, bounds, default, span })
+        let default = if self.eat("=") {
+            Some(self.ty()?)
+        } else {
+            None
+        };
+        Ok(Generic {
+            name,
+            kind: GenericKind::Type,
+            bounds,
+            default,
+            span,
+        })
     }
 
     fn const_default(&mut self) -> Result<TyId> {
-        let value = if self.kind() == TokenKind::OpenBrace { self.block_expr(None, super::BlockKind::Plain)? } else { self.unary_operand()? };
+        let value = if self.kind() == TokenKind::OpenBrace {
+            self.block_expr(None, super::BlockKind::Plain)?
+        } else {
+            self.unary_operand()?
+        };
         Ok(self.push_ty(super::Ty::Const(value)))
     }
 
@@ -122,7 +160,11 @@ impl Cursor<'_> {
         if !self.eat_word("where") {
             return Ok(predicates);
         }
-        while !self.done() && self.kind() != TokenKind::OpenBrace && !self.punct(";") && !self.punct("=") {
+        while !self.done()
+            && self.kind() != TokenKind::OpenBrace
+            && !self.punct(";")
+            && !self.punct("=")
+        {
             predicates.push(self.predicate()?);
             if !self.eat(",") {
                 break;
@@ -134,7 +176,10 @@ impl Cursor<'_> {
     fn predicate(&mut self) -> Result<Predicate> {
         if self.lifetime().is_some() {
             self.expect(":")?;
-            return Ok(Predicate { ty: None, bounds: self.bounds()? });
+            return Ok(Predicate {
+                ty: None,
+                bounds: self.bounds()?,
+            });
         }
         if self.is_word("for") && self.punct_at(self.at + 1, "<") {
             self.at += 1;
@@ -142,7 +187,10 @@ impl Cursor<'_> {
         }
         let ty = self.ty()?;
         self.expect(":")?;
-        Ok(Predicate { ty: Some(ty), bounds: self.bounds()? })
+        Ok(Predicate {
+            ty: Some(ty),
+            bounds: self.bounds()?,
+        })
     }
 
     fn receiver(&mut self) -> Result<Option<(SelfKind, bool)>> {
@@ -231,12 +279,25 @@ pub fn signature(src: &Source, from: u32, to: u32, config: super::Config<'_>) ->
     cursor.fn_params(&mut sig)?;
     for ty in &cursor.body.tys[first..] {
         if let super::Ty::ImplTrait(name, bounds) = *ty {
-            sig.generics.push(Generic { name, kind: GenericKind::Type, bounds, default: None, span: (name, name + 1) });
+            sig.generics.push(Generic {
+                name,
+                kind: GenericKind::Type,
+                bounds,
+                default: None,
+                span: (name, name + 1),
+            });
         }
     }
     let ret_first = cursor.body.tys.len();
-    sig.ret = if cursor.eat("->") { Some(cursor.ty()?) } else { None };
-    sig.opaque = is_async || cursor.body.tys[ret_first..].iter().any(|ty| matches!(ty, super::Ty::ImplTrait(..)));
+    sig.ret = if cursor.eat("->") {
+        Some(cursor.ty()?)
+    } else {
+        None
+    };
+    sig.opaque = is_async
+        || cursor.body.tys[ret_first..]
+            .iter()
+            .any(|ty| matches!(ty, super::Ty::ImplTrait(..)));
     sig.is_async = is_async;
     sig.is_unsafe = is_unsafe;
     sig.is_safe = is_safe;
@@ -249,10 +310,21 @@ pub fn signature(src: &Source, from: u32, to: u32, config: super::Config<'_>) ->
 pub fn generics(src: &Source, at: u32, to: u32) -> Result<(Body, Generics)> {
     let mut cursor = Cursor::new(src, at, to);
     let params = cursor.generic_params()?;
-    let supers = if cursor.eat(":") { cursor.bounds()? } else { List::default() };
+    let supers = if cursor.eat(":") {
+        cursor.bounds()?
+    } else {
+        List::default()
+    };
     let predicates = cursor.where_clause()?;
     let supers = cursor.with_self_bounds(supers, &predicates);
-    Ok((cursor.body, Generics { params, predicates, supers }))
+    Ok((
+        cursor.body,
+        Generics {
+            params,
+            predicates,
+            supers,
+        },
+    ))
 }
 
 impl Cursor<'_> {
@@ -260,18 +332,32 @@ impl Cursor<'_> {
     fn with_self_bounds(&mut self, supers: List, predicates: &[Predicate]) -> List {
         let mut bounds = self.body.list(supers).to_vec();
         let before = bounds.len();
-        for predicate in predicates.iter().filter(|predicate| predicate.ty.is_some_and(|ty| self.is_self_ty(ty))) {
+        for predicate in predicates
+            .iter()
+            .filter(|predicate| predicate.ty.is_some_and(|ty| self.is_self_ty(ty)))
+        {
             bounds.extend_from_slice(self.body.list(predicate.bounds));
         }
-        if bounds.len() == before { supers } else { self.list(&bounds) }
+        if bounds.len() == before {
+            supers
+        } else {
+            self.list(&bounds)
+        }
     }
 
     fn is_self_ty(&self, ty: TyId) -> bool {
-        let super::Ty::Path(path) = *self.body.ty(ty) else { return false };
+        let super::Ty::Path(path) = *self.body.ty(ty) else {
+            return false;
+        };
         let path = self.body.path(path);
-        let [only] = self.body.list(path.segments) else { return false };
+        let [only] = self.body.list(path.segments) else {
+            return false;
+        };
         let segment = &self.body.segments[*only as usize];
-        path.qself.is_none() && !path.global && segment.args.is_none() && self.src.text(segment.name) == "Self"
+        path.qself.is_none()
+            && !path.global
+            && segment.args.is_none()
+            && self.src.text(segment.name) == "Self"
     }
 }
 
@@ -297,18 +383,38 @@ pub fn impl_header(src: &Source, from: u32, to: u32) -> Result<ImplHeader> {
     cursor.eat_word("const");
     let negative = cursor.eat("!");
     let first = cursor.ty_no_bounds()?;
-    let (trait_ref, self_ty) = if cursor.eat_word("for") { (Some(first), cursor.ty_no_bounds()?) } else { (None, first) };
+    let (trait_ref, self_ty) = if cursor.eat_word("for") {
+        (Some(first), cursor.ty_no_bounds()?)
+    } else {
+        (None, first)
+    };
     let predicates = cursor.where_clause()?;
-    Ok(ImplHeader { body: cursor.body, generics, negative, trait_ref, self_ty, predicates })
+    Ok(ImplHeader {
+        body: cursor.body,
+        generics,
+        negative,
+        trait_ref,
+        self_ty,
+        predicates,
+    })
 }
 
 /// Parses the type of the constant item whose name is token `name` with `config`, as the return type of a header with no parameters.
-pub fn const_signature(src: &Source, name: u32, to: u32, config: super::Config<'_>) -> Result<Signature> {
+pub fn const_signature(
+    src: &Source,
+    name: u32,
+    to: u32,
+    config: super::Config<'_>,
+) -> Result<Signature> {
     let mut cursor = Cursor::new(src, name + 1, to);
     cursor.config = config;
     cursor.expect(":")?;
     let ret = cursor.ty()?;
-    Ok(Signature { body: cursor.body, ret: Some(ret), ..Signature::default() })
+    Ok(Signature {
+        body: cursor.body,
+        ret: Some(ret),
+        ..Signature::default()
+    })
 }
 
 /// The token after the `=` of the constant or static item whose name is token `name`, searching no further than `to`.

@@ -55,7 +55,10 @@ impl HostSymbol {
             return Some(found.clone());
         }
         let built_in = match name {
-            "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.x86.avx.vzeroupper" | "llvm.aarch64.hint" => Self::Noop,
+            "__rust_no_alloc_shim_is_unstable_v2"
+            | "llvm.x86.sse2.pause"
+            | "llvm.x86.avx.vzeroupper"
+            | "llvm.aarch64.hint" => Self::Noop,
             "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => Self::Barrier,
             "llvm.x86.xgetbv" => Self::ExtendedState,
             "__rust_alloc_error_handler" => Self::Abort,
@@ -157,9 +160,17 @@ fn dynamic(name: &str) -> Option<usize> {
     {
         unsafe extern "system" {
             fn GetModuleHandleA(module_name: *const i8) -> *mut core::ffi::c_void;
-            fn GetProcAddress(module: *mut core::ffi::c_void, proc_name: *const i8) -> *const core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                proc_name: *const i8,
+            ) -> *const core::ffi::c_void;
         }
-        for module_name in [std::ptr::null(), c"ucrtbase.dll".as_ptr(), c"kernel32.dll".as_ptr(), c"msvcrt.dll".as_ptr()] {
+        for module_name in [
+            std::ptr::null(),
+            c"ucrtbase.dll".as_ptr(),
+            c"kernel32.dll".as_ptr(),
+            c"msvcrt.dll".as_ptr(),
+        ] {
             // SAFETY: module_name is null or a static NUL-terminated DLL name; name is a live NUL-terminated CString.
             let module = unsafe { GetModuleHandleA(module_name) };
             if module.is_null() {
@@ -203,7 +214,13 @@ extern "C" fn dealloc(pointer: *mut u8, size: usize, align: usize) {
 
 extern "C" fn realloc(pointer: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8 {
     // SAFETY: compiled code grows or shrinks a block that the shims allocated with this layout.
-    unsafe { std::alloc::realloc(pointer, Layout::from_size_align_unchecked(size, align), new_size) }
+    unsafe {
+        std::alloc::realloc(
+            pointer,
+            Layout::from_size_align_unchecked(size, align),
+            new_size,
+        )
+    }
 }
 
 extern "C" fn nothing() {}

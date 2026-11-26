@@ -25,7 +25,10 @@ impl Layouts {
     fn window(&self, end: End, bytes: u32) -> impl Iterator<Item = (i64, Type)> + '_ {
         end.into_iter().flat_map(move |(slot, base)| {
             let limit = base + i64::from(bytes);
-            self.spans[slot].iter().filter(move |(at, ty)| *at >= base && at + i64::from(ty.bytes()) <= limit).map(move |(at, ty)| (at - base, *ty))
+            self.spans[slot]
+                .iter()
+                .filter(move |(at, ty)| *at >= base && at + i64::from(ty.bytes()) <= limit)
+                .map(move |(at, ty)| (at - base, *ty))
         })
     }
 
@@ -45,8 +48,13 @@ impl Layouts {
 
     /// Copies into `target` the accesses inside `source` that do not overlap any existing access in `target`, and tells whether it copied any.
     fn adopt(&mut self, target: End, source: End, bytes: u32) -> bool {
-        let Some((slot, base)) = target else { return false };
-        let existing: Vec<(i64, i64)> = self.window(target, bytes).map(|(at, ty)| (at, at + i64::from(ty.bytes()))).collect();
+        let Some((slot, base)) = target else {
+            return false;
+        };
+        let existing: Vec<(i64, i64)> = self
+            .window(target, bytes)
+            .map(|(at, ty)| (at, at + i64::from(ty.bytes())))
+            .collect();
         let found: Vec<(i64, Type)> = self
             .window(source, bytes)
             .filter(|&(at, ty)| {
@@ -63,11 +71,18 @@ impl Layouts {
 
     /// The pieces that copy `bytes` bytes from `from` to `to`: the accesses of either end where they do not overlap, and words between them; none when neither end has an access there.
     pub(crate) fn pieces(&self, to: End, from: End, bytes: u32) -> Option<Vec<(Type, u32)>> {
-        let mut found: Vec<(i64, Type)> = self.window(to, bytes).chain(self.window(from, bytes)).collect();
+        let mut found: Vec<(i64, Type)> = self
+            .window(to, bytes)
+            .chain(self.window(from, bytes))
+            .collect();
         if found.is_empty() {
             return None;
         }
-        if let Some((_, ty)) = found.iter().copied().find(|&(at, ty)| at == 0 && ty.is_vector() && ty.bytes() == bytes) {
+        if let Some((_, ty)) = found
+            .iter()
+            .copied()
+            .find(|&(at, ty)| at == 0 && ty.is_vector() && ty.bytes() == bytes)
+        {
             return Some(vec![(ty, 0)]);
         }
         found.sort_unstable_by_key(|(at, ty)| (*at, std::cmp::Reverse(ty.is_vector()), ty.bytes()));
@@ -89,5 +104,9 @@ impl Layouts {
 /// Appends the words that copy the bytes from offset `start` to offset `end`.
 fn gap(pieces: &mut Vec<(Type, u32)>, start: i64, end: i64) {
     let base = start as u32;
-    pieces.extend(crate::copy::words((end - start) as u32).into_iter().map(|(ty, at)| (ty, at + base)));
+    pieces.extend(
+        crate::copy::words((end - start) as u32)
+            .into_iter()
+            .map(|(ty, at)| (ty, at + base)),
+    );
 }

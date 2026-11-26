@@ -195,7 +195,14 @@ pub struct Typed {
 
 impl Default for Typed {
     fn default() -> Self {
-        Self { tables: LazyTables::Eager(BodyTables::empty()), locals: Vec::new(), params: Vec::new(), ret: None, drops: Vec::new(), shape: Shape::default() }
+        Self {
+            tables: LazyTables::Eager(BodyTables::empty()),
+            locals: Vec::new(),
+            params: Vec::new(),
+            ret: None,
+            drops: Vec::new(),
+            shape: Shape::default(),
+        }
     }
 }
 
@@ -213,7 +220,9 @@ impl std::ops::Deref for Typed {
 
 impl std::ops::DerefMut for Typed {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let LazyTables::Eager(tables) = &mut self.tables else { unreachable!() };
+        let LazyTables::Eager(tables) = &mut self.tables else {
+            unreachable!()
+        };
         Arc::make_mut(tables)
     }
 }
@@ -222,7 +231,11 @@ fn non_vtable_coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Re
     match coercion.leaf() {
         Coercion::Reify(res) => Box::new(std::iter::once(res)),
         Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
-        Coercion::Vtable(_) | Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) | Coercion::Field { .. } => Box::new(std::iter::empty()),
+        Coercion::Vtable(_)
+        | Coercion::Len(_)
+        | Coercion::Autos
+        | Coercion::Upcast(_)
+        | Coercion::Field { .. } => Box::new(std::iter::empty()),
     }
 }
 
@@ -234,15 +247,46 @@ fn coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
 }
 
 fn direct_body_calls(t: &BodyTables) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
-    let loops = t.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
-    let tries = t.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
-    let awaits = t.awaits.values().flat_map(|each| [&each.into_future, &each.poll]);
-    let direct = t.res.values().chain(t.pat_res.values()).chain(t.derefs.values()).chain(t.operators.values()).chain(t.try_blocks.values()).chain(t.box_frees.values());
-    direct.chain(loops).chain(tries).chain(awaits).filter_map(res_fn)
+    let loops = t
+        .fors
+        .values()
+        .flat_map(|each| [&each.into_iter, &each.next]);
+    let tries = t
+        .tries
+        .values()
+        .flat_map(|each| [&each.branch, &each.from_residual]);
+    let awaits = t
+        .awaits
+        .values()
+        .flat_map(|each| [&each.into_future, &each.poll]);
+    let direct = t
+        .res
+        .values()
+        .chain(t.pat_res.values())
+        .chain(t.derefs.values())
+        .chain(t.operators.values())
+        .chain(t.try_blocks.values())
+        .chain(t.box_frees.values());
+    direct
+        .chain(loops)
+        .chain(tries)
+        .chain(awaits)
+        .filter_map(res_fn)
 }
 
-fn body_calls(t: &BodyTables, include_vtable: bool) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
-    let coerced = t.coercions.values().flat_map(if include_vtable { coercion_calls } else { non_vtable_coercion_calls }).filter_map(res_fn);
+fn body_calls(
+    t: &BodyTables,
+    include_vtable: bool,
+) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+    let coerced = t
+        .coercions
+        .values()
+        .flat_map(if include_vtable {
+            coercion_calls
+        } else {
+            non_vtable_coercion_calls
+        })
+        .filter_map(res_fn);
     direct_body_calls(t).chain(coerced)
 }
 
@@ -250,19 +294,38 @@ fn visit_eager_edges(t: &BodyTables, on_edge: &mut impl FnMut(ItemRef, Substs, b
     direct_body_calls(t).for_each(|(item, substs)| on_edge(item, substs, false));
     for coercion in t.coercions.values() {
         let ind = matches!(coercion.leaf(), Coercion::Reify(_) | Coercion::Vtable(_));
-        coercion_calls(coercion).filter_map(res_fn).for_each(|(item, substs)| on_edge(item, substs, ind));
+        coercion_calls(coercion)
+            .filter_map(res_fn)
+            .for_each(|(item, substs)| on_edge(item, substs, ind));
     }
 }
 
-fn visit_summary_edges(summary: &PolySummary, resolved: &[(SiteKey, ItemRef, Substs)], on_edge: &mut impl FnMut(ItemRef, Substs, bool)) {
-    let has_vtable = summary.template.coercions.values().any(|c| c.vtable().is_some());
-    let has_reify = !has_vtable && summary.template.coercions.values().any(|c| matches!(c, Coercion::Reify(_)));
+fn visit_summary_edges(
+    summary: &PolySummary,
+    resolved: &[(SiteKey, ItemRef, Substs)],
+    on_edge: &mut impl FnMut(ItemRef, Substs, bool),
+) {
+    let has_vtable = summary
+        .template
+        .coercions
+        .values()
+        .any(|c| c.vtable().is_some());
+    let has_reify = !has_vtable
+        && summary
+            .template
+            .coercions
+            .values()
+            .any(|c| matches!(c, Coercion::Reify(_)));
     for &(item, substs) in &summary.fixed_calls {
         let ind = has_vtable || (has_reify && summary.template.coercions.values().any(|c| matches!(c, Coercion::Reify(Res::Fn(ci, cs)) if (*ci, *cs) == (item, substs))));
         on_edge(item, substs, ind);
     }
     for &(key, item, substs) in resolved {
-        on_edge(item, substs, has_vtable || matches!(key, SiteKey::CoercionReify(_)));
+        on_edge(
+            item,
+            substs,
+            has_vtable || matches!(key, SiteKey::CoercionReify(_)),
+        );
     }
 }
 
@@ -303,7 +366,9 @@ impl Typed {
     pub fn raw_coercions_and_exprs(&self, types: &Types) -> (&PackedMap<ExprId, Coercion>, &[Ty]) {
         let tables = match &self.tables {
             LazyTables::Eager(tables) => tables,
-            LazyTables::Poly(poly) if !poly.summary.template.coercions.is_empty() => poly.ensure_tables(types),
+            LazyTables::Poly(poly) if !poly.summary.template.coercions.is_empty() => {
+                poly.ensure_tables(types)
+            }
             LazyTables::Poly(poly) => &poly.summary.template,
             LazyTables::CheckOnly(check) => &check.summary.template,
         };
@@ -329,7 +394,9 @@ impl Typed {
                 Some(tables) => std::borrow::Cow::Owned(self.with_tables(tables)),
                 None => std::borrow::Cow::Borrowed(self),
             },
-            LazyTables::CheckOnly(_) => std::borrow::Cow::Owned(self.with_tables(BodyTables::empty())),
+            LazyTables::CheckOnly(_) => {
+                std::borrow::Cow::Owned(self.with_tables(BodyTables::empty()))
+            }
         }
     }
 
@@ -363,7 +430,11 @@ impl Typed {
     /// The inferred type of expression `expr`, or `Ty::NONE` if absent.
     pub fn expr_ty(&self, types: &Types, expr: ExprId) -> Ty {
         match &self.tables {
-            LazyTables::Eager(tables) => tables.exprs.get(expr.0 as usize).copied().unwrap_or(Ty::NONE),
+            LazyTables::Eager(tables) => tables
+                .exprs
+                .get(expr.0 as usize)
+                .copied()
+                .unwrap_or(Ty::NONE),
             LazyTables::Poly(poly) => poly.expr_ty(types, expr),
             LazyTables::CheckOnly(_) => panic!("check-only Typed has no expr_ty"),
         }
@@ -417,7 +488,12 @@ impl Typed {
     pub fn for_iter(&self, types: &Types, expr: ExprId) -> Option<Ty> {
         match &self.tables {
             LazyTables::Eager(tables) => tables.fors.get(&expr).map(|f| f.iter),
-            LazyTables::Poly(poly) => poly.summary.template.fors.get(&expr).map(|f| poly.sub_ty(types, f.iter)),
+            LazyTables::Poly(poly) => poly
+                .summary
+                .template
+                .fors
+                .get(&expr)
+                .map(|f| poly.sub_ty(types, f.iter)),
             LazyTables::CheckOnly(_) => panic!("check-only Typed has no for_iter"),
         }
     }
@@ -426,7 +502,12 @@ impl Typed {
     pub fn await_future(&self, types: &Types, expr: ExprId) -> Option<Ty> {
         match &self.tables {
             LazyTables::Eager(tables) => tables.awaits.get(&expr).map(|a| a.future),
-            LazyTables::Poly(poly) => poly.summary.template.awaits.get(&expr).map(|a| poly.sub_ty(types, a.future)),
+            LazyTables::Poly(poly) => poly
+                .summary
+                .template
+                .awaits
+                .get(&expr)
+                .map(|a| poly.sub_ty(types, a.future)),
             LazyTables::CheckOnly(_) => panic!("check-only Typed has no await_future"),
         }
     }
@@ -462,12 +543,24 @@ impl Typed {
 
     /// Visits all semantic callees of this body excluding `Coercion::Vtable` method and super edges.
     pub fn non_vtable_callees(&self, types: &Types, mut on_callee: impl FnMut(ItemRef, Substs)) {
-        for (item, substs) in self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn) {
+        for (item, substs) in self
+            .drops
+            .iter()
+            .chain(shape_calls(&self.shape))
+            .filter_map(res_fn)
+        {
             on_callee(item, substs);
         }
         match &self.tables {
             LazyTables::Eager(t) => body_calls(t, false).for_each(|(i, s)| on_callee(i, s)),
-            LazyTables::Poly(poly) if poly.summary.template.coercions.values().any(|c| c.vtable().is_some()) => {
+            LazyTables::Poly(poly)
+                if poly
+                    .summary
+                    .template
+                    .coercions
+                    .values()
+                    .any(|c| c.vtable().is_some()) =>
+            {
                 body_calls(poly.ensure_tables(types), false).for_each(|(i, s)| on_callee(i, s));
             }
             LazyTables::Poly(poly) => poly.calls().for_each(|(i, s)| on_callee(i, s)),
@@ -476,7 +569,10 @@ impl Typed {
     }
 
     /// Collects all reached callee indices and indirect (`Vtable` / `Reify`) target indices for `Reached::link`.
-    pub fn collect_link_edges(&self, index: &HashMap<(ItemRef, Substs), usize>) -> (Vec<usize>, Vec<usize>) {
+    pub fn collect_link_edges(
+        &self,
+        index: &HashMap<(ItemRef, Substs), usize>,
+    ) -> (Vec<usize>, Vec<usize>) {
         let (mut calls, mut indirect) = (Vec::new(), Vec::new());
         let mut push = |item: ItemRef, substs: Substs, ind: bool| {
             if let Some(&id) = index.get(&(item, substs)) {
@@ -488,15 +584,27 @@ impl Typed {
         };
         match &self.tables {
             LazyTables::Eager(t) => {
-                self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn).for_each(|(i, s)| push(i, s, false));
+                self.drops
+                    .iter()
+                    .chain(shape_calls(&self.shape))
+                    .filter_map(res_fn)
+                    .for_each(|(i, s)| push(i, s, false));
                 visit_eager_edges(t, &mut push);
             }
             LazyTables::Poly(poly) => {
-                self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn).for_each(|(i, s)| push(i, s, false));
+                self.drops
+                    .iter()
+                    .chain(shape_calls(&self.shape))
+                    .filter_map(res_fn)
+                    .for_each(|(i, s)| push(i, s, false));
                 visit_summary_edges(&poly.summary, &poly.resolved_calls, &mut push);
             }
             LazyTables::CheckOnly(check) => {
-                self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn).for_each(|(i, s)| push(i, s, false));
+                self.drops
+                    .iter()
+                    .chain(shape_calls(&self.shape))
+                    .filter_map(res_fn)
+                    .for_each(|(i, s)| push(i, s, false));
                 visit_summary_edges(&check.summary, &check.resolved_calls, &mut push);
             }
         }
@@ -530,17 +638,32 @@ impl CallSites {
 
     fn shift(&mut self, at: usize, (calls, indirect): (&[Vec<usize>], &[Vec<usize>]), add: bool) {
         for &c in &calls[at] {
-            self.direct[c] = if add { self.direct[c] + 1 } else { self.direct[c] - 1 };
+            self.direct[c] = if add {
+                self.direct[c] + 1
+            } else {
+                self.direct[c] - 1
+            };
         }
         for &c in &indirect[at] {
-            self.indirect[c] = if add { self.indirect[c] + 1 } else { self.indirect[c] - 1 };
+            self.indirect[c] = if add {
+                self.indirect[c] + 1
+            } else {
+                self.indirect[c] - 1
+            };
         }
         self.counted[at] = add;
     }
 }
 
 /// Brings `out` to the saturating (`0 / 1 / >=2`) direct call-site counts of the settled entries, clamping pinned roots and indirect targets to `2`, recounting only entries whose settled state changed.
-pub fn recount_call_sites(len: usize, settled: impl Fn(usize) -> bool, calls: &[Vec<usize>], indirect: &[Vec<usize>], pinned: &[bool], out: &mut CallSites) {
+pub fn recount_call_sites(
+    len: usize,
+    settled: impl Fn(usize) -> bool,
+    calls: &[Vec<usize>],
+    indirect: &[Vec<usize>],
+    pinned: &[bool],
+    out: &mut CallSites,
+) {
     out.direct.resize(len, 0);
     out.indirect.resize(len, 0);
     out.counted.resize(len, false);
@@ -551,5 +674,11 @@ pub fn recount_call_sites(len: usize, settled: impl Fn(usize) -> bool, calls: &[
         }
     }
     out.sites.clear();
-    out.sites.extend((0..len).map(|c| if pinned.get(c) == Some(&true) || out.indirect[c] > 0 { 2 } else { out.direct[c].min(2) as u8 }));
+    out.sites.extend((0..len).map(|c| {
+        if pinned.get(c) == Some(&true) || out.indirect[c] > 0 {
+            2
+        } else {
+            out.direct[c].min(2) as u8
+        }
+    }));
 }

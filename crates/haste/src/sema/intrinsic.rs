@@ -171,23 +171,131 @@ pub enum Atomic {
 
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: &[(&str, Intrinsic)] = &[
-    ("llvm.x86.ssse3.pshuf.b.128", Intrinsic::ShuffleDyn { tbl: false }),
+    (
+        "llvm.x86.ssse3.pshuf.b.128",
+        Intrinsic::ShuffleDyn { tbl: false },
+    ),
     ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute32),
-    ("llvm.x86.sse2.pavg.b", Intrinsic::AvgRound(Type::Vec { lane: Lane::I8, count: 16 })),
-    ("llvm.x86.sse2.pavg.w", Intrinsic::AvgRound(Type::Vec { lane: Lane::I16, count: 8 })),
+    (
+        "llvm.x86.sse2.pavg.b",
+        Intrinsic::AvgRound(Type::Vec {
+            lane: Lane::I8,
+            count: 16,
+        }),
+    ),
+    (
+        "llvm.x86.sse2.pavg.w",
+        Intrinsic::AvgRound(Type::Vec {
+            lane: Lane::I16,
+            count: 8,
+        }),
+    ),
     ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::Umaxp),
-    ("llvm.aarch64.neon.tbl1.v16i8", Intrinsic::ShuffleDyn { tbl: true }),
-    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I32, count: 2 })),
-    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I32, count: 4 })),
-    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I16, count: 8 })),
-    ("llvm.aarch64.crypto.sha256h", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
-    ("llvm.aarch64.crypto.sha256h2", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H2, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
-    ("llvm.aarch64.crypto.sha256su0", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256Su0, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
-    ("llvm.aarch64.crypto.sha256su1", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256Su1, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
-    ("llvm.aarch64.crypto.aese", Intrinsic::TargetOp { id: TargetOpId::Arm64AesE, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
-    ("llvm.aarch64.crypto.aesd", Intrinsic::TargetOp { id: TargetOpId::Arm64AesD, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
-    ("llvm.aarch64.crypto.aesmc", Intrinsic::TargetOp { id: TargetOpId::Arm64AesMc, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
-    ("llvm.aarch64.crypto.aesimc", Intrinsic::TargetOp { id: TargetOpId::Arm64AesImc, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    (
+        "llvm.aarch64.neon.tbl1.v16i8",
+        Intrinsic::ShuffleDyn { tbl: true },
+    ),
+    (
+        "llvm.aarch64.neon.sqdmulh.v2i32",
+        Intrinsic::Sqdmulh(Type::Vec {
+            lane: Lane::I32,
+            count: 2,
+        }),
+    ),
+    (
+        "llvm.aarch64.neon.sqdmulh.v4i32",
+        Intrinsic::Sqdmulh(Type::Vec {
+            lane: Lane::I32,
+            count: 4,
+        }),
+    ),
+    (
+        "llvm.aarch64.neon.sqdmulh.v8i16",
+        Intrinsic::Sqdmulh(Type::Vec {
+            lane: Lane::I16,
+            count: 8,
+        }),
+    ),
+    (
+        "llvm.aarch64.crypto.sha256h",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64Sha256H,
+            ty: Type::Vec {
+                lane: Lane::I32,
+                count: 4,
+            },
+        },
+    ),
+    (
+        "llvm.aarch64.crypto.sha256h2",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64Sha256H2,
+            ty: Type::Vec {
+                lane: Lane::I32,
+                count: 4,
+            },
+        },
+    ),
+    (
+        "llvm.aarch64.crypto.sha256su0",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64Sha256Su0,
+            ty: Type::Vec {
+                lane: Lane::I32,
+                count: 4,
+            },
+        },
+    ),
+    (
+        "llvm.aarch64.crypto.sha256su1",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64Sha256Su1,
+            ty: Type::Vec {
+                lane: Lane::I32,
+                count: 4,
+            },
+        },
+    ),
+    (
+        "llvm.aarch64.crypto.aese",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64AesE,
+            ty: Type::Vec {
+                lane: Lane::I8,
+                count: 16,
+            },
+        },
+    ),
+    (
+        "llvm.aarch64.crypto.aesd",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64AesD,
+            ty: Type::Vec {
+                lane: Lane::I8,
+                count: 16,
+            },
+        },
+    ),
+    (
+        "llvm.aarch64.crypto.aesmc",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64AesMc,
+            ty: Type::Vec {
+                lane: Lane::I8,
+                count: 16,
+            },
+        },
+    ),
+    (
+        "llvm.aarch64.crypto.aesimc",
+        Intrinsic::TargetOp {
+            id: TargetOpId::Arm64AesImc,
+            ty: Type::Vec {
+                lane: Lane::I8,
+                count: 16,
+            },
+        },
+    ),
 ];
 
 const NAMES: &[(&str, Intrinsic)] = {
@@ -335,16 +443,40 @@ const NAMES: &[(&str, Intrinsic)] = {
         ("simd_imax", Simd(self::Simd::Pair(LanePair::Max))),
         ("simd_fmin", Simd(self::Simd::Pair(LanePair::Min))),
         ("simd_fmax", Simd(self::Simd::Pair(LanePair::Max))),
-        ("simd_minimum_number_nsz", Simd(self::Simd::Pair(LanePair::Min))),
-        ("simd_maximum_number_nsz", Simd(self::Simd::Pair(LanePair::Max))),
-        ("simd_saturating_add", Simd(self::Simd::Pair(LanePair::SaturatingAdd))),
-        ("simd_saturating_sub", Simd(self::Simd::Pair(LanePair::SaturatingSub))),
+        (
+            "simd_minimum_number_nsz",
+            Simd(self::Simd::Pair(LanePair::Min)),
+        ),
+        (
+            "simd_maximum_number_nsz",
+            Simd(self::Simd::Pair(LanePair::Max)),
+        ),
+        (
+            "simd_saturating_add",
+            Simd(self::Simd::Pair(LanePair::SaturatingAdd)),
+        ),
+        (
+            "simd_saturating_sub",
+            Simd(self::Simd::Pair(LanePair::SaturatingSub)),
+        ),
         ("simd_fma", Simd(self::Simd::Fma)),
         ("simd_relaxed_fma", Simd(self::Simd::Fma)),
-        ("simd_reduce_add_ordered", Simd(self::Simd::Sum { mul: false })),
-        ("simd_reduce_add_unordered", Simd(self::Simd::Sum { mul: false })),
-        ("simd_reduce_mul_ordered", Simd(self::Simd::Sum { mul: true })),
-        ("simd_reduce_mul_unordered", Simd(self::Simd::Sum { mul: true })),
+        (
+            "simd_reduce_add_ordered",
+            Simd(self::Simd::Sum { mul: false }),
+        ),
+        (
+            "simd_reduce_add_unordered",
+            Simd(self::Simd::Sum { mul: false }),
+        ),
+        (
+            "simd_reduce_mul_ordered",
+            Simd(self::Simd::Sum { mul: true }),
+        ),
+        (
+            "simd_reduce_mul_unordered",
+            Simd(self::Simd::Sum { mul: true }),
+        ),
         ("simd_masked_load", Simd(self::Simd::MaskedLoad)),
         ("simd_masked_store", Simd(self::Simd::MaskedStore)),
         ("simd_add", Simd(self::Simd::Lanewise(BinOp::Add))),
@@ -400,8 +532,13 @@ impl Context<'_> {
                 }
             }
         }
-        let marked = has_attrs && entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"));
-        let is_core = self.outline.is_sysroot(item.krate) && self.outline.roots[item.krate as usize].name == "core";
+        let marked = has_attrs
+            && entry
+                .attrs
+                .iter()
+                .any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"));
+        let is_core = self.outline.is_sysroot(item.krate)
+            && self.outline.roots[item.krate as usize].name == "core";
         if !marked && !is_core {
             return None;
         }
@@ -409,16 +546,29 @@ impl Context<'_> {
         if is_core {
             match name {
                 "__cpuid_count" => return Some(Intrinsic::Cpuid),
-                "unreachable_unchecked" if crate::profile() == Profile::Release => return Some(Intrinsic::Unreachable),
+                "unreachable_unchecked" if crate::profile() == Profile::Release => {
+                    return Some(Intrinsic::Unreachable);
+                }
                 _ => {}
             }
         }
-        marked.then(|| NAMES.iter().find(|(known, _)| *known == name).map(|(_, which)| *which)).flatten()
+        marked
+            .then(|| {
+                NAMES
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|(_, which)| *which)
+            })
+            .flatten()
     }
 
     /// Whether the function `item` carries `#[rustc_intrinsic]`.
     pub fn rustc_intrinsic(&self, item: ItemRef) -> bool {
         let (src, entry) = self.item(item);
-        entry.kind == ItemKind::Fn && entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"))
+        entry.kind == ItemKind::Fn
+            && entry
+                .attrs
+                .iter()
+                .any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"))
     }
 }

@@ -1,25 +1,32 @@
 pub mod codec;
+mod eval;
 pub(super) mod frozen;
 mod inst;
+mod prepare;
 pub(super) mod thaw;
 
 pub use inst::{PolyCheck, PolyInst};
 
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::body::{BinOp, Body, Expr, ExprId, UnOp};
+use crate::body::{BinOp, ExprId};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 
 use super::Context;
-use super::infer::{BodyTables, Coercion, Infer, LazyTables, Local, Res, Shape, SiteKey, Typed};
+use super::infer::{BodyTables, LazyTables, Local, Res, Shape, SiteKey, Typed};
 use super::reach::Instance;
 use super::substs::{ProjId, Substs};
-use super::ty::{Kind, Ty, Types, object_parts};
-use inst::{InstOutcome, TyFolder, fold_substs, fold_ty, instantiate_pure};
+use super::ty::{Kind, Ty};
+use eval::{
+    SubState, check_const_holes, check_obligations, eval_offset_holes, eval_projections,
+    resolve_instance_calls, sub_ty,
+};
+use inst::{InstOutcome, instantiate_pure};
+use prepare::{is_aggregate, lay_out_fixed, prepare_summary};
 
 /// How generic sema summarizes one function item: a reusable polymorphic summary, monomorphic inference with bounded-trait method hints, or plain monomorphic fallback.
 #[derive(Clone, Debug)]
@@ -74,31 +81,37 @@ pub struct PolySummary {
 /// A deferred trait or callable obligation recorded in `O` of a `PolySummary`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolyObligation {
-    Prove { of: ItemRef, self_ty: Ty, args: Substs },
-    Call { expr: ExprId, found: Ty, tuple: Ty },
+    Prove {
+        of: ItemRef,
+        self_ty: Ty,
+        args: Substs,
+    },
+    Call {
+        expr: ExprId,
+        found: Ty,
+        tuple: Ty,
+    },
 }
 
 /// A parameter-dependent constant, `offset_of!`, or type-metadata intrinsic hole in `C` of a `PolySummary`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConstHole {
     Value(Ty),
-    OffsetOf { expr: ExprId, steps: Box<[(Ty, u32)]> },
-    Intrinsic { item: ItemRef, substs: Substs },
+    OffsetOf {
+        expr: ExprId,
+        steps: Box<[(Ty, u32)]>,
+    },
+    Intrinsic {
+        item: ItemRef,
+        substs: Substs,
+    },
 }
 
-struct SubState<'a> {
-    args: &'a [Ty],
-    projs: HashMap<ProjId, Ty>,
-    tys: HashMap<Ty, Ty>,
-}
-
-impl<'a> SubState<'a> {
-    fn new(args: &'a [Ty]) -> Self {
-        Self { args, projs: HashMap::default(), tys: HashMap::default() }
-    }
-}
-
-pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Option<Result<Arc<Typed>, String>> {
+pub(super) fn typed_once_poly(
+    cx: &mut Context<'_>,
+    instance: &Instance,
+    unlaid: &mut Vec<String>,
+) -> Option<Result<Arc<Typed>, String>> {
     let before = cx.quiet_mark();
     let (item, substs) = *instance;
     if !eligible(cx, item, substs) {
@@ -120,10 +133,11 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
         Ok(SummaryKind::BorrowError(err)) => return Some(Err(err)),
         Ok(SummaryKind::MonomorphicHints(hints)) => {
             let m_before = cx.quiet_mark();
-            let typed = match super::infer::infer_with_hints(cx, instance.0, instance.1, Some(hints)) {
-                Ok(typed) => Arc::new(typed),
-                Err(error) => return Some(Err(format!("{}: {error:#}", cx.name(instance.0)))),
-            };
+            let typed =
+                match super::infer::infer_with_hints(cx, instance.0, instance.1, Some(hints)) {
+                    Ok(typed) => Arc::new(typed),
+                    Err(error) => return Some(Err(format!("{}: {error:#}", cx.name(instance.0)))),
+                };
             thaw::keep_laid(cx, *instance, &typed, unlaid, m_before);
             return Some(Ok(typed));
         }
@@ -139,14 +153,17 @@ fn cached_poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySu
     if let Some(kind) = cx.store.lookups.summaries.get_ready(&item) {
         return match kind {
             SummaryKind::Poly(summary) => Some(summary),
-            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback | SummaryKind::BorrowError(_) => None,
+            SummaryKind::MonomorphicHints(_)
+            | SummaryKind::MonomorphicFallback
+            | SummaryKind::BorrowError(_) => None,
         };
     }
     frozen::frozen_summary(cx, item)
 }
 
 fn has_summary_body(entry: &crate::outline::item::Item) -> bool {
-    (entry.kind == ItemKind::Fn && entry.body.is_some()) || (entry.kind == ItemKind::Const && entry.name.is_some())
+    (entry.kind == ItemKind::Fn && entry.body.is_some())
+        || (entry.kind == ItemKind::Const && entry.name.is_some())
 }
 
 pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
@@ -177,7 +194,12 @@ pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<Po
 fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
     let slice = cx.types.substs(substs);
     let is_fixed = cx.outline.is_fixed(item.krate);
-    if (slice.is_empty() && !is_fixed) || cx.types.substs_have_params(substs) || slice.iter().any(|&ty| matches!(cx.types.kind(ty), Kind::Never)) {
+    if (slice.is_empty() && !is_fixed)
+        || cx.types.substs_have_params(substs)
+        || slice
+            .iter()
+            .any(|&ty| matches!(cx.types.kind(ty), Kind::Never))
+    {
         return false;
     }
     let (_, entry) = cx.item(item);
@@ -196,12 +218,19 @@ pub fn check_poly_item(cx: &mut Context<'_>, item: ItemRef) -> Result<(), String
     if !has_summary_body(entry) || cx.foreign(item) || cx.outline.is_fixed(item.krate) {
         return Ok(());
     }
-    let Some(expected) = expected_param_count(cx, item) else { return Ok(()) };
+    let Some(expected) = expected_param_count(cx, item) else {
+        return Ok(());
+    };
     if expected == 0 || expected > u16::MAX as usize {
         return Ok(());
     }
     let summaries = cx.store.lookups.summaries.clone();
-    let built = summaries.run(cx, item, |cx| Ok(load_summary(cx, item, expected as u16)), |_| Ok(SummaryKind::MonomorphicFallback));
+    let built = summaries.run(
+        cx,
+        item,
+        |cx| Ok(load_summary(cx, item, expected as u16)),
+        |_| Ok(SummaryKind::MonomorphicFallback),
+    );
     match built {
         Ok(SummaryKind::BorrowError(err)) => Err(err),
         _ => Ok(()),
@@ -223,7 +252,10 @@ pub(super) fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Optio
 }
 
 fn load_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
-    let Some(summary) = frozen::frozen_summary(cx, item) else { return thaw::frozen_verdict(cx, item).unwrap_or_else(|| build_summary(cx, item, param_count)) };
+    let Some(summary) = frozen::frozen_summary(cx, item) else {
+        return thaw::frozen_verdict(cx, item)
+            .unwrap_or_else(|| build_summary(cx, item, param_count));
+    };
     lay_out_fixed(cx, &summary);
     SummaryKind::Poly(summary)
 }
@@ -235,7 +267,9 @@ fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> Summa
         thaw::settle_verdict(cx, item, before, &built);
         return built;
     };
-    let Some(summary) = Arc::get_mut(&mut arc) else { return SummaryKind::MonomorphicFallback };
+    let Some(summary) = Arc::get_mut(&mut arc) else {
+        return SummaryKind::MonomorphicFallback;
+    };
     if prepare_summary(cx, item, summary).is_err() {
         let fallback = SummaryKind::MonomorphicFallback;
         thaw::settle_verdict(cx, item, before, &fallback);
@@ -246,170 +280,16 @@ fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> Summa
     kind
 }
 
-fn prepare_summary(cx: &mut Context<'_>, item: ItemRef, summary: &mut PolySummary) -> Result<()> {
-    for c in summary.template.coercions.values() {
-        if let Some(vt) = c.vtable()
-            && (cx.types.has_params(vt.ty) || cx.types.has_params(vt.object))
-        {
-            bail!("parametric vtable coercion");
-        }
-    }
-    extract_call_holes(cx, summary);
-    if !summary.template.operators.is_empty() {
-        let body = cx.body(item)?;
-        summary.op_holes = extract_op_holes(cx, &body, &summary.template);
-    }
-    extract_drops_and_tys(cx, summary)
-}
-
-fn extract_call_holes(cx: &Context<'_>, summary: &mut PolySummary) {
-    let types = &cx.types;
-    let tpl = &summary.template;
-    let call_obs: HashSet<ExprId> = summary.obligations.iter().filter_map(|o| match *o {
-        PolyObligation::Call { expr, .. } => Some(expr),
-        _ => None,
-    }).collect();
-    let mut fixed = Vec::new();
-    let mut direct = Vec::new();
-    let mut holes = Vec::new();
-    let mut push = |key: SiteKey, r: Res| {
-        if let Res::Fn(i, s) = r {
-            if !types.substs_have_params(s) {
-                fixed.push((i, s));
-            } else if cx.owner_trait(i).is_none() {
-                direct.push((key, i, s));
-            } else {
-                holes.push((key, i, s));
-            }
-        }
-    };
-    for &(id, r) in tpl.res.as_slice() {
-        if !call_obs.contains(&id) {
-            push(SiteKey::ExprRes(id), r);
-        }
-    }
-    tpl.pat_res.as_slice().iter().for_each(|&(id, r)| push(SiteKey::PatRes(id), r));
-    tpl.derefs.as_slice().iter().for_each(|&((id, step), r)| push(SiteKey::Deref(id, step), r));
-    for &(id, r) in tpl.operators.as_slice() {
-        if !matches!(r, Res::Fn(i, s) if types.substs_have_params(s) && cx.owner_trait(i).is_some()) {
-            push(SiteKey::Operator(id), r);
-        }
-    }
-    tpl.try_blocks.as_slice().iter().for_each(|&(id, r)| push(SiteKey::TryBlock(id), r));
-    for &(id, r) in tpl.box_frees.as_slice() {
-        if !call_obs.contains(&id) {
-            push(SiteKey::BoxFree(id), r);
-        }
-    }
-    for &(id, ref f) in tpl.fors.as_slice() {
-        push(SiteKey::ForInto(id), f.into_iter);
-        push(SiteKey::ForNext(id), f.next);
-    }
-    for &(id, ref t) in tpl.tries.as_slice() {
-        push(SiteKey::TryBranch(id), t.branch);
-        push(SiteKey::TryFrom(id), t.from_residual);
-    }
-    for &(id, ref a) in tpl.awaits.as_slice() {
-        push(SiteKey::AwaitInto(id), a.into_future);
-        push(SiteKey::AwaitPoll(id), a.poll);
-    }
-    for &(id, ref c) in tpl.coercions.as_slice() {
-        match c {
-            Coercion::Reify(r) => push(SiteKey::CoercionReify(id), *r),
-            Coercion::Deref(steps, _) => steps.iter().enumerate().for_each(|(idx, &(_, r))| {
-                if let Some(r) = r {
-                    push(SiteKey::CoercionDeref(id, idx as u16), r);
-                }
-            }),
-            _ => {}
-        }
-    }
-    for &(_, ref c) in tpl.coercions.as_slice() {
-        if let Some(vt) = c.vtable() {
-            for r in vt.calls() {
-                if let Res::Fn(i, s) = r {
-                    fixed.push((*i, *s));
-                }
-            }
-        }
-    }
-    summary.fixed_calls = fixed.into_boxed_slice();
-    summary.direct_calls = direct.into_boxed_slice();
-    summary.call_holes = holes.into_boxed_slice();
-}
-
-fn extract_op_holes(cx: &Context<'_>, body: &Body, tpl: &BodyTables) -> Box<[(ExprId, OpCheck, Res)]> {
-    let types = &cx.types;
-    tpl.operators
-        .as_slice()
-        .iter()
-        .filter(|&&(_, r)| matches!(r, Res::Fn(i, s) if types.substs_have_params(s) && cx.owner_trait(i).is_some()))
-        .map(|&(expr, r)| {
-            let check = match *body.expr(expr) {
-                Expr::Unary(op, operand) if op != UnOp::Deref => OpCheck::Unary(tpl.exprs[operand.0 as usize]),
-                Expr::Binary(op, lhs, rhs) => OpCheck::Binary(op, tpl.exprs[lhs.0 as usize], tpl.exprs[rhs.0 as usize]),
-                Expr::AssignOp(op, lhs, rhs) => OpCheck::AssignOp(op, tpl.exprs[lhs.0 as usize], tpl.exprs[rhs.0 as usize]),
-                Expr::Index(_, idx) => {
-                    let step = match r {
-                        Res::Fn(_, s) => types.substs(s).first().copied(),
-                        _ => None,
-                    };
-                    OpCheck::Index(step, tpl.exprs[idx.0 as usize])
-                }
-                _ => OpCheck::Never,
-            };
-            (expr, check, r)
-        })
-        .collect()
-}
-
-fn is_aggregate(cx: &Context<'_>, ty: Ty) -> bool {
-    ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..))
-}
-
-fn has_closure(types: &Types, ty: Ty) -> bool {
-    let kind = types.kind(ty);
-    matches!(kind, Kind::Closure(..)) || kind.children(types).any(|child| has_closure(types, child))
-}
-
-fn owned_tys(summary: &PolySummary) -> impl Iterator<Item = Ty> + '_ {
-    summary.locals.iter().map(|l| l.ty).chain(summary.ret).chain(summary.template.owned_tys())
-}
-
-fn lay_out_fixed(cx: &mut Context<'_>, summary: &PolySummary) {
-    let fixed = frozen::closure_free(summary).then(|| owned_tys(summary));
-    for ty in fixed.into_iter().flatten() {
-        if is_aggregate(cx, ty) && !cx.types.has_params(ty) && !cx.types.has_var_flag(ty) { cx.layout(ty).ok(); }
-    }
-}
-
-fn record_drop_ty(cx: &mut Context<'_>, ty: Ty, fixed_drops: &mut Vec<Res>, drop_tys: &mut Vec<Ty>) -> Result<()> {
-    if cx.types.has_var_flag(ty) || has_closure(&cx.types, ty) { return Ok(()); }
-    if !cx.types.has_params(ty) {
-        if is_aggregate(cx, ty) { cx.layout(ty).ok(); }
-        fixed_drops.extend(super::infer::glue_call(cx, ty)?);
-    } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
-        drop_tys.push(ty);
-    }
-    Ok(())
-}
-
-fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Result<()> {
-    let mut seen = HashSet::default();
-    let (mut fixed_drops, mut drop_tys, mut parametric_tys) = (Vec::new(), Vec::new(), Vec::new());
-    for ty in owned_tys(summary) {
-        if ty == Ty::NONE || !seen.insert(ty) { continue; }
-        record_drop_ty(cx, ty, &mut fixed_drops, &mut drop_tys)?;
-        if cx.types.has_params(ty) { parametric_tys.push(ty); }
-    }
-    summary.fixed_drops = fixed_drops.into_boxed_slice();
-    summary.drop_tys = drop_tys.into_boxed_slice();
-    summary.parametric_tys = parametric_tys.into_boxed_slice();
-    Ok(())
-}
-
-fn record_instantiated(cx: &mut Context<'_>, instance: Instance, layouts: &[Ty], typed: &Arc<Typed>, unlaid: &mut Vec<String>, before: (usize, usize)) -> bool {
-    let laid = lay_out_instantiated(cx, layouts, typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
+fn record_instantiated(
+    cx: &mut Context<'_>,
+    instance: Instance,
+    layouts: &[Ty],
+    typed: &Arc<Typed>,
+    unlaid: &mut Vec<String>,
+    before: (usize, usize),
+) -> bool {
+    let laid = lay_out_instantiated(cx, layouts, typed)
+        .map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
     let clean = laid.is_ok() && cx.quiet_mark() == before;
     if clean {
         cx.store.finals.insert(instance, Arc::clone(typed));
@@ -418,59 +298,160 @@ fn record_instantiated(cx: &mut Context<'_>, instance: Instance, layouts: &[Ty],
 }
 
 fn is_pure_summary(summary: &PolySummary) -> bool {
-    summary.projections.is_empty() && summary.obligations.is_empty() && summary.call_holes.is_empty() && summary.op_holes.is_empty() && summary.const_holes.is_empty() && frozen::closure_free(summary)
+    summary.projections.is_empty()
+        && summary.obligations.is_empty()
+        && summary.call_holes.is_empty()
+        && summary.op_holes.is_empty()
+        && summary.const_holes.is_empty()
+        && frozen::closure_free(summary)
 }
 
 fn is_zero_hole_mono(summary: &PolySummary) -> bool {
-    summary.param_count == 0 && summary.direct_calls.is_empty() && summary.drop_tys.is_empty() && summary.parametric_tys.is_empty() && is_pure_summary(summary)
+    summary.param_count == 0
+        && summary.direct_calls.is_empty()
+        && summary.drop_tys.is_empty()
+        && summary.parametric_tys.is_empty()
+        && is_pure_summary(summary)
 }
 
-fn detached_outcome(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, concrete_args: &[Ty], check_only: bool) -> Option<InstOutcome> {
+fn detached_outcome(
+    cx: &mut Context<'_>,
+    instance: Instance,
+    summary: &Arc<PolySummary>,
+    concrete_args: &[Ty],
+    check_only: bool,
+) -> Option<InstOutcome> {
     super::infer::detached_summary(cx, instance.0, |infer| {
         let mut sub = SubState::new(concrete_args);
         eval_projections(infer, &mut sub, &summary.projections)?;
         let call_overrides = check_obligations(infer, &mut sub, &summary.obligations)?;
-        let offset_overrides = if check_only { Vec::new() } else { eval_offset_holes(infer, &mut sub, &summary.const_holes)? };
+        let offset_overrides = if check_only {
+            Vec::new()
+        } else {
+            eval_offset_holes(infer, &mut sub, &summary.const_holes)?
+        };
         check_const_holes(infer, &mut sub, &summary.const_holes)?;
-        let (resolved_calls, builtin_ops) = resolve_instance_calls(infer, &mut sub, summary, &call_overrides, check_only)?;
-        let ret = summary.ret.map(|ty| sub_ty(infer, &mut sub, ty)).transpose()?;
-        let layouts = summary.layout_tys.iter().map(|&ty| sub_ty(infer, &mut sub, ty)).collect::<Result<Vec<_>>>()?;
-        let drop_tys = summary.drop_tys.iter().map(|&ty| sub_ty(infer, &mut sub, ty)).collect::<Result<Vec<_>>>()?;
+        let (resolved_calls, builtin_ops) =
+            resolve_instance_calls(infer, &mut sub, summary, &call_overrides, check_only)?;
+        let ret = summary
+            .ret
+            .map(|ty| sub_ty(infer, &mut sub, ty))
+            .transpose()?;
+        let layouts = summary
+            .layout_tys
+            .iter()
+            .map(|&ty| sub_ty(infer, &mut sub, ty))
+            .collect::<Result<Vec<_>>>()?;
+        let drop_tys = summary
+            .drop_tys
+            .iter()
+            .map(|&ty| sub_ty(infer, &mut sub, ty))
+            .collect::<Result<Vec<_>>>()?;
         if check_only {
-            return Ok(InstOutcome::CheckOnly(PolyCheck { summary: Arc::clone(summary), resolved_calls }, ret, layouts, drop_tys));
+            return Ok(InstOutcome::CheckOnly(
+                PolyCheck {
+                    summary: Arc::clone(summary),
+                    resolved_calls,
+                },
+                ret,
+                layouts,
+                drop_tys,
+            ));
         }
-        let locals = summary.locals.iter().map(|local| Ok(Local { ty: sub_ty(infer, &mut sub, local.ty)? })).collect::<Result<Vec<_>>>()?;
+        let locals = summary
+            .locals
+            .iter()
+            .map(|local| {
+                Ok(Local {
+                    ty: sub_ty(infer, &mut sub, local.ty)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut projs: Vec<_> = sub.projs.into_iter().collect();
         projs.sort_unstable_by_key(|&(id, _)| id.0);
         let inst = PolyInst {
-            args: instance.1, summary: Arc::clone(summary), projs: projs.into_boxed_slice(), resolved_calls,
-            builtin_ops, call_overrides: call_overrides.into_boxed_slice(), offset_overrides: offset_overrides.into_boxed_slice(), materialized: OnceLock::new(),
+            args: instance.1,
+            summary: Arc::clone(summary),
+            projs: projs.into_boxed_slice(),
+            resolved_calls,
+            builtin_ops,
+            call_overrides: call_overrides.into_boxed_slice(),
+            offset_overrides: offset_overrides.into_boxed_slice(),
+            materialized: OnceLock::new(),
         };
         Ok(InstOutcome::Full(inst, locals, ret, layouts, drop_tys))
     })
     .ok()
 }
 
-fn settle_outcome(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, outcome: InstOutcome) -> Option<(Arc<Typed>, Vec<Ty>)> {
+fn settle_outcome(
+    cx: &mut Context<'_>,
+    instance: Instance,
+    summary: &Arc<PolySummary>,
+    outcome: InstOutcome,
+) -> Option<(Arc<Typed>, Vec<Ty>)> {
     match outcome {
         InstOutcome::CheckOnly(check, ret, layouts, drop_tys) => {
             let drops = instantiate_drops(cx, &summary.fixed_drops, &drop_tys).ok()?;
-            Some((Arc::new(Typed { tables: LazyTables::CheckOnly(Box::new(check)), locals: Vec::new(), params: Vec::new(), ret, drops, shape: Shape::Body }), layouts))
+            Some((
+                Arc::new(Typed {
+                    tables: LazyTables::CheckOnly(Box::new(check)),
+                    locals: Vec::new(),
+                    params: Vec::new(),
+                    ret,
+                    drops,
+                    shape: Shape::Body,
+                }),
+                layouts,
+            ))
         }
         InstOutcome::Full(poly_inst, locals, ret, layouts, _) if !frozen::closure_free(summary) => {
-            let raw = Typed { tables: LazyTables::Eager(Arc::new(poly_inst.materialize(&cx.types))), locals, params: summary.params.to_vec(), ret, drops: Vec::new(), shape: Shape::Body };
-            Some((Arc::new(super::infer::settle(cx, instance, raw).ok()?), layouts))
+            let raw = Typed {
+                tables: LazyTables::Eager(Arc::new(poly_inst.materialize(&cx.types))),
+                locals,
+                params: summary.params.to_vec(),
+                ret,
+                drops: Vec::new(),
+                shape: Shape::Body,
+            };
+            Some((
+                Arc::new(super::infer::settle(cx, instance, raw).ok()?),
+                layouts,
+            ))
         }
         InstOutcome::Full(poly_inst, locals, ret, layouts, drop_tys) => {
             let drops = instantiate_drops(cx, &summary.fixed_drops, &drop_tys).ok()?;
-            Some((Arc::new(Typed { tables: LazyTables::Poly(Box::new(poly_inst)), locals, params: summary.params.to_vec(), ret, drops, shape: Shape::Body }), layouts))
+            Some((
+                Arc::new(Typed {
+                    tables: LazyTables::Poly(Box::new(poly_inst)),
+                    locals,
+                    params: summary.params.to_vec(),
+                    ret,
+                    drops,
+                    shape: Shape::Body,
+                }),
+                layouts,
+            ))
         }
     }
 }
 
-fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, unlaid: &mut Vec<String>, before: (usize, usize)) -> Option<Result<Arc<Typed>, String>> {
+fn instantiate_summary(
+    cx: &mut Context<'_>,
+    instance: Instance,
+    summary: &Arc<PolySummary>,
+    unlaid: &mut Vec<String>,
+    before: (usize, usize),
+) -> Option<Result<Arc<Typed>, String>> {
     if is_zero_hole_mono(summary) {
-        let typed = Arc::new(Typed { tables: LazyTables::Eager(Arc::clone(&summary.template)), locals: summary.locals.to_vec(), params: summary.params.to_vec(), ret: summary.ret, drops: summary.fixed_drops.to_vec(), shape: Shape::Body });
+        let typed = Arc::new(Typed {
+            tables: LazyTables::Eager(Arc::clone(&summary.template)),
+            locals: summary.locals.to_vec(),
+            params: summary.params.to_vec(),
+            ret: summary.ret,
+            drops: summary.fixed_drops.to_vec(),
+            shape: Shape::Body,
+        });
         record_instantiated(cx, instance, &summary.layout_tys, &typed, unlaid, before);
         return Some(Ok(typed));
     }
@@ -478,22 +459,40 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
     if concrete_args.len() != usize::from(summary.param_count) {
         return None;
     }
-    if let Some((poly_inst, locals, ret, concrete_layouts, drops)) = frozen::frozen_instance(cx, instance, summary) {
-        let typed = Arc::new(Typed { tables: LazyTables::Poly(Box::new(poly_inst)), locals, params: summary.params.to_vec(), ret, drops, shape: Shape::Body });
+    if let Some((poly_inst, locals, ret, concrete_layouts, drops)) =
+        frozen::frozen_instance(cx, instance, summary)
+    {
+        let typed = Arc::new(Typed {
+            tables: LazyTables::Poly(Box::new(poly_inst)),
+            locals,
+            params: summary.params.to_vec(),
+            ret,
+            drops,
+            shape: Shape::Body,
+        });
         record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before);
         return Some(Ok(typed));
     }
-    let check_only = cx.store.lookups.skip_warm_sysroot_bodies && cx.outline.is_fixed(instance.0.krate) && frozen::closure_free(summary);
+    let check_only = cx.store.lookups.skip_warm_sysroot_bodies
+        && cx.outline.is_fixed(instance.0.krate)
+        && frozen::closure_free(summary);
     let outcome = if is_pure_summary(summary) {
         instantiate_pure(&cx.types, instance.1, summary, check_only)
     } else {
-        frozen::try_cached_instantiate(cx, instance, summary, check_only).or_else(|| detached_outcome(cx, instance, summary, &concrete_args, check_only))?
+        frozen::try_cached_instantiate(cx, instance, summary, check_only)
+            .or_else(|| detached_outcome(cx, instance, summary, &concrete_args, check_only))?
     };
     let (typed, concrete_layouts) = settle_outcome(cx, instance, summary, outcome)?;
     if !cx.outline.is_fixed(instance.0.krate) && matches!(typed.shape, Shape::Body) {
         typed.ensure_tables(&cx.types);
-        let body = match cx.body(instance.0) { Ok(b) => b, Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))) };
-        let sig = match cx.signature(instance.0) { Ok(s) => s, Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))) };
+        let body = match cx.body(instance.0) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))),
+        };
+        let sig = match cx.signature(instance.0) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(format!("{}: {e:#}", cx.name(instance.0)))),
+        };
         let src = cx.body_src(instance.0);
         if let Err(err) = super::borrow::check(cx, instance.0, (&body, &sig), src, &typed) {
             return Some(Err(format!("{}: {err:#}", cx.name(instance.0))));
@@ -507,61 +506,15 @@ fn instantiate_drops(cx: &mut Context<'_>, fixed: &[Res], concrete_tys: &[Ty]) -
     let mut drops = fixed.to_vec();
     let mut seen = HashSet::default();
     for &ty in concrete_tys {
-        if ty != Ty::NONE && seen.insert(ty) && let Some(call) = super::infer::glue_call(cx, ty)? && !drops.contains(&call) {
+        if ty != Ty::NONE
+            && seen.insert(ty)
+            && let Some(call) = super::infer::glue_call(cx, ty)?
+            && !drops.contains(&call)
+        {
             drops.push(call);
         }
     }
     Ok(drops)
-}
-
-type ResolvedSites = (Box<[(SiteKey, ItemRef, Substs)]>, Box<[ExprId]>);
-
-fn resolve_instance_calls(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, summary: &PolySummary, calls: &[CallOverride], check_only: bool) -> Result<ResolvedSites> {
-    let mut resolved = Vec::with_capacity(summary.direct_calls.len() + summary.call_holes.len() + summary.op_holes.len() + calls.len());
-    for &(key, item, substs) in &summary.direct_calls {
-        let mapped = sub_substs(infer, sub, substs)?;
-        resolved.push((key, item, mapped));
-    }
-    for &(key, item, substs) in &summary.call_holes {
-        let mapped = sub_substs(infer, sub, substs)?;
-        if let Res::Fn(ri, rs) = infer.trait_call(item, mapped)? {
-            resolved.push((key, ri, rs));
-        }
-    }
-    let mut builtin_ops = Vec::new();
-    for &(expr, check, ref r) in &summary.op_holes {
-        let concrete_check = sub_op_check(infer, sub, check)?;
-        if infer.is_builtin_op(concrete_check) {
-            if !check_only {
-                builtin_ops.push(expr);
-            }
-        } else if let Res::Fn(ri, rs) = sub_res(infer, sub, r)? {
-            resolved.push((SiteKey::Operator(expr), ri, rs));
-        }
-    }
-    for ov in calls {
-        if let Some(Res::Fn(ri, rs)) = ov.res {
-            resolved.push((SiteKey::ExprRes(ov.expr), ri, rs));
-        }
-        if let Some(Res::Fn(ri, rs)) = ov.box_free {
-            resolved.push((SiteKey::BoxFree(ov.expr), ri, rs));
-        }
-    }
-    if !check_only {
-        resolved.sort_unstable_by_key(|&(key, ..)| key);
-        builtin_ops.sort_unstable();
-    }
-    Ok((resolved.into_boxed_slice(), builtin_ops.into_boxed_slice()))
-}
-
-fn sub_op_check(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, check: OpCheck) -> Result<OpCheck> {
-    Ok(match check {
-        OpCheck::Unary(ty) => OpCheck::Unary(sub_ty(infer, sub, ty)?),
-        OpCheck::Binary(op, l, r) => OpCheck::Binary(op, sub_ty(infer, sub, l)?, sub_ty(infer, sub, r)?),
-        OpCheck::AssignOp(op, l, r) => OpCheck::AssignOp(op, sub_ty(infer, sub, l)?, sub_ty(infer, sub, r)?),
-        OpCheck::Index(step, idx) => OpCheck::Index(step.map(|s| sub_ty(infer, sub, s)).transpose()?, sub_ty(infer, sub, idx)?),
-        OpCheck::Never => OpCheck::Never,
-    })
 }
 
 fn lay_out_instantiated(cx: &mut Context<'_>, layouts: &[Ty], typed: &Typed) -> Result<()> {
@@ -572,227 +525,6 @@ fn lay_out_instantiated(cx: &mut Context<'_>, layouts: &[Ty], typed: &Typed) -> 
     }
     if typed.has_closures() {
         super::reach::lay_out(cx, typed)?;
-    }
-    Ok(())
-}
-
-fn eval_projections(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, projections: &[ProjId]) -> Result<()> {
-    for &proj_id in projections {
-        eval_one_proj(infer, sub, proj_id)?;
-    }
-    Ok(())
-}
-
-fn eval_one_proj(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, proj_id: ProjId) -> Result<Ty> {
-    if let Some(&cached) = sub.projs.get(&proj_id) {
-        return Ok(cached);
-    }
-    let def = infer.cx.types.proj(proj_id);
-    let self_ty = sub_ty(infer, sub, def.self_ty)?;
-    let trait_args = sub_substs_vec(infer, sub, def.args)?;
-    let own_args = sub_substs_vec(infer, sub, def.own)?;
-    let trait_substs = infer.cx.types.intern_substs(&trait_args);
-    let own_substs = infer.cx.types.intern_substs(&own_args);
-    let cacheable = !infer.has_vars(self_ty)
-        && !infer.cx.types.has_params(self_ty)
-        && !infer.cx.types.substs_have_params(trait_substs)
-        && !infer.cx.types.substs(trait_substs).iter().any(|&ty| infer.has_vars(ty))
-        && !infer.cx.types.substs_have_params(own_substs)
-        && !infer.cx.types.substs(own_substs).iter().any(|&ty| infer.has_vars(ty));
-    let key = (def.of, self_ty, trait_substs, def.assoc, own_substs);
-    if cacheable && let Some(cached) = infer.cx.store.lookups.assoc_types.get(&key) {
-        sub.projs.insert(proj_id, cached);
-        return Ok(cached);
-    }
-    let before = infer.cx.quiet_mark();
-    let name = infer.cx.name(def.assoc).to_string();
-    let Some(value) = infer.picked_alias(def.of, self_ty, &trait_args, (&name, &own_args))? else { bail!("unnormalized projection `{name}` on {}", infer.show(self_ty)) };
-    infer.settle_projections()?;
-    let zonked = infer.zonk(value);
-    if infer.cx.types.has_params(zonked) || infer.has_vars(zonked) || matches!(infer.cx.types.kind(zonked), Kind::Never) {
-        bail!("projection `{name}` did not resolve to a concrete type");
-    }
-    if cacheable && infer.cx.quiet_mark() == before {
-        infer.cx.store.lookups.assoc_types.insert(key, zonked);
-    }
-    sub.projs.insert(proj_id, zonked);
-    Ok(zonked)
-}
-
-struct SummaryFolder<'a, 'b, 'c, 'd> {
-    infer: &'a mut Infer<'b, 'c>,
-    sub: &'a mut SubState<'d>,
-}
-
-impl TyFolder for SummaryFolder<'_, '_, '_, '_> {
-    type Error = anyhow::Error;
-    fn types(&self) -> &Types {
-        &self.infer.cx.types
-    }
-    fn args(&self) -> &[Ty] {
-        self.sub.args
-    }
-    fn get_cached(&self, ty: Ty) -> Option<Ty> {
-        self.sub.tys.get(&ty).copied()
-    }
-    fn set_cached(&mut self, ty: Ty, mapped: Ty) {
-        self.sub.tys.insert(ty, mapped);
-    }
-    fn param_oob(&self, idx: u16) -> Self::Error {
-        anyhow::anyhow!("param {idx} out of bounds")
-    }
-    fn fold_proj(&mut self, proj_id: ProjId) -> Result<Ty> {
-        eval_one_proj(self.infer, self.sub, proj_id)
-    }
-}
-
-fn sub_ty(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, ty: Ty) -> Result<Ty> {
-    fold_ty(&mut SummaryFolder { infer, sub }, ty)
-}
-
-fn sub_substs(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, substs: Substs) -> Result<Substs> {
-    fold_substs(&mut SummaryFolder { infer, sub }, substs)
-}
-
-fn sub_substs_vec(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, substs: Substs) -> Result<Vec<Ty>> {
-    let raw = infer.cx.types.substs(substs).to_vec();
-    raw.into_iter().map(|ty| sub_ty(infer, sub, ty)).collect()
-}
-
-fn sub_res(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, res: &Res) -> Result<Res> {
-    match *res {
-        Res::Local(local) => Ok(Res::Local(local)),
-        Res::Const(ty) => Ok(Res::Const(sub_ty(infer, sub, ty)?)),
-        Res::Ctor(item, variant, args) => Ok(Res::Ctor(item, variant, sub_substs(infer, sub, args)?)),
-        Res::Fn(item, args) => {
-            let mapped = sub_substs(infer, sub, args)?;
-            infer.trait_call(item, mapped)
-        }
-    }
-}
-
-fn check_obligations(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, obligations: &[PolyObligation]) -> Result<Vec<CallOverride>> {
-    let mut calls = Vec::new();
-    for obligation in obligations {
-        match *obligation {
-            PolyObligation::Prove { of, self_ty, args } => {
-                let concrete_self = sub_ty(infer, sub, self_ty)?;
-                let concrete_args = sub_substs_vec(infer, sub, args)?;
-                if !concrete_holds(infer, of, concrete_self, &concrete_args)? {
-                    bail!("concrete obligation `{}` failed for {}", infer.cx.name(of), infer.show(concrete_self));
-                }
-            }
-            PolyObligation::Call { expr, found, tuple } => {
-                let concrete_found = sub_ty(infer, sub, found)?;
-                let concrete_tuple = sub_ty(infer, sub, tuple)?;
-                calls.push(resolve_call_override(infer, expr, concrete_found, concrete_tuple)?);
-            }
-        }
-    }
-    Ok(calls)
-}
-
-fn concrete_holds(infer: &mut Infer<'_, '_>, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-    if infer.compiler_decides(of, self_ty) {
-        return Ok(infer.compiler_holds(of, self_ty));
-    }
-    if infer.compiler_impl(of, self_ty) || infer.object_holds(of, self_ty, args) == Some(true) {
-        return Ok(true);
-    }
-    if infer.is_callable_trait(of) && matches!(infer.cx.types.kind(self_ty), Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
-        return infer.check_callable_obligation(of, self_ty, args);
-    }
-    Ok(infer.select(of, self_ty, args)?.is_some())
-}
-
-fn resolve_call_override(infer: &mut Infer<'_, '_>, expr: ExprId, found: Ty, tuple: Ty) -> Result<CallOverride> {
-    let (mut ty, mut steps) = (found, 0u32);
-    while !matches!(infer.cx.types.kind(ty), Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Ptr(..))
-        && let Some(inner) = infer.builtin_deref(ty)
-    {
-        (ty, steps) = (inner, steps + 1);
-    }
-    let autoderefs = (steps > 0).then_some(steps);
-    match infer.cx.types.kind(ty).clone() {
-        Kind::Closure(..) => {
-            let Some(call_once) = infer.cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
-            let res = Some(Res::fn_of(&infer.cx.types, call_once, &[ty, tuple]));
-            Ok(CallOverride { expr, res, autoderefs, overloaded: false, box_free: None })
-        }
-        Kind::FnDef(item, substs) => {
-            let res = Some(infer.trait_call(item, substs)?);
-            Ok(CallOverride { expr, res, autoderefs, overloaded: false, box_free: None })
-        }
-        Kind::FnPtr(..) => Ok(CallOverride { expr, res: None, autoderefs, overloaded: false, box_free: None }),
-        Kind::Dyn(of, parts, members, _) if infer.is_callable_trait(of) => resolve_dyn_call(infer, (expr, found, ty), (of, parts, members), autoderefs),
-        Kind::Adt(..) => resolve_overloaded_call(infer, expr, found, tuple),
-        _ => bail!("unsupported concrete callable {}", infer.show(ty)),
-    }
-}
-
-fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, super::substs::ItemList), autoderefs: Option<u32>) -> Result<CallOverride> {
-    let dyn_tuple = *object_parts(infer.cx.types.substs(parts), infer.cx.types.items(members)).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
-    let name = super::infer::callable_method_name(infer.cx.lang(of));
-    let box_free = matches!(name, "call_once" | "async_call_once")
-        .then(|| resolve_box_free(infer, found, autoderefs))
-        .transpose()?;
-    let Some(method) = infer.cx.trait_member(of, name) else { bail!("missing `{name}`") };
-    let res = Some(Res::fn_of(&infer.cx.types, method, &[ty, dyn_tuple]));
-    Ok(CallOverride { expr, res, autoderefs, overloaded: false, box_free })
-}
-
-fn resolve_box_free(infer: &mut Infer<'_, '_>, found: Ty, autoderefs: Option<u32>) -> Result<Res> {
-    if infer.cx.boxed(found).is_none() || autoderefs != Some(1) {
-        bail!("`dyn FnOnce` called by value without `Box`");
-    }
-    infer.own_drop(found)?.ok_or_else(|| anyhow::anyhow!("`Box` has no `Drop` impl"))
-}
-
-fn resolve_overloaded_call(infer: &mut Infer<'_, '_>, expr: ExprId, found: Ty, tuple: Ty) -> Result<CallOverride> {
-    let (mut ty, mut steps) = (found, 0u32);
-    loop {
-        if let Some(method) = infer.callable_impl(ty, tuple)? {
-            let substs = infer.cx.types.intern_substs(&[ty, tuple]);
-            let res = Some(infer.trait_call(method, substs)?);
-            return Ok(CallOverride { expr, res, autoderefs: (steps > 0).then_some(steps), overloaded: true, box_free: None });
-        }
-        let Some(inner) = infer.builtin_deref(ty) else { bail!("{} is not callable", infer.show(found)) };
-        (ty, steps) = (inner, steps + 1);
-    }
-}
-
-fn eval_offset_holes(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, holes: &[ConstHole]) -> Result<Vec<(ExprId, u64)>> {
-    let mut out = Vec::new();
-    for hole in holes {
-        let ConstHole::OffsetOf { expr, steps } = hole else { continue };
-        let mut offset = 0u64;
-        for &(step_ty, index) in &**steps {
-            let concrete = sub_ty(infer, sub, step_ty)?;
-            let layout = infer.cx.layout(concrete)?;
-            offset += super::layout::field_offset(&layout, 0, index) as u64;
-        }
-        out.push((*expr, offset));
-    }
-    Ok(out)
-}
-
-fn check_const_holes(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, holes: &[ConstHole]) -> Result<()> {
-    for hole in holes {
-        match *hole {
-            ConstHole::Value(ty) => {
-                let concrete = sub_ty(infer, sub, ty)?;
-                if !matches!(infer.cx.types.kind(concrete), Kind::Value(_)) {
-                    bail!("const hole did not resolve to value");
-                }
-            }
-            ConstHole::Intrinsic { substs, .. } => {
-                let concrete = sub_substs(infer, sub, substs)?;
-                if infer.cx.types.substs_have_params(concrete) {
-                    bail!("intrinsic hole retained parameters");
-                }
-            }
-            ConstHole::OffsetOf { .. } => {}
-        }
     }
     Ok(())
 }

@@ -32,10 +32,17 @@ fn stamp_path(root: &Path, out: Option<&Path>) -> PathBuf {
     root.hash(&mut hasher);
     out.hash(&mut hasher);
     (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
-    crate::graph::store::home().join("noop").join(format!("{:016x}.stamp", hasher.finish()))
+    crate::graph::store::home()
+        .join("noop")
+        .join(format!("{:016x}.stamp", hasher.finish()))
 }
 
-fn compute_stamp(root: &Path, out: Option<&Path>, paths: &[PathBuf], env_names: &[String]) -> Option<u64> {
+fn compute_stamp(
+    root: &Path,
+    out: Option<&Path>,
+    paths: &[PathBuf],
+    env_names: &[String],
+) -> Option<u64> {
     let target = crate::host_target();
     let mut hasher = FxHasher::default();
     NOOP_MAGIC.hash(&mut hasher);
@@ -104,7 +111,12 @@ fn decode_stamp_file(data: &[u8]) -> Option<(u64, usize, Vec<PathBuf>, Vec<Strin
     (pos == data.len()).then_some((stamp, reached, paths, envs))
 }
 
-fn encode_stamp_file(stamp: u64, reached: usize, paths: &[PathBuf], envs: &[String]) -> Option<Vec<u8>> {
+fn encode_stamp_file(
+    stamp: u64,
+    reached: usize,
+    paths: &[PathBuf],
+    envs: &[String],
+) -> Option<Vec<u8>> {
     let path_count = u32::try_from(paths.len()).ok()?;
     let env_count = u32::try_from(envs.len()).ok()?;
     let mut out = Vec::with_capacity(HEADER_LEN + paths.len() * 48 + envs.len() * 16);
@@ -144,7 +156,13 @@ pub fn try_hit(root: &Path, out: Option<&Path>) -> Option<usize> {
 }
 
 /// Records the workspace no-op stamp after a `0 failed` build succeeds.
-pub fn record(root: &Path, workspace: &crate::graph::Workspace, build_paths: &[PathBuf], out: Option<&Path>, reached: usize) {
+pub fn record(
+    root: &Path,
+    workspace: &crate::graph::Workspace,
+    build_paths: &[PathBuf],
+    out: Option<&Path>,
+    reached: usize,
+) {
     if reached == 0 {
         return;
     }
@@ -159,9 +177,14 @@ pub fn record(root: &Path, workspace: &crate::graph::Workspace, build_paths: &[P
     let mut envs: Vec<String> = watched_vars.into_iter().map(|(name, _)| name).collect();
     envs.sort();
     envs.dedup();
-    let Some(stamp) = compute_stamp(&croot, aout.as_deref(), &paths, &envs) else { return };
+    let Some(stamp) = compute_stamp(&croot, aout.as_deref(), &paths, &envs) else {
+        return;
+    };
     if let Some(encoded) = encode_stamp_file(stamp, reached, &paths, &envs) {
-        drop(crate::graph::store::write_new_bytes(&stamp_path(&croot, aout.as_deref()), &encoded));
+        drop(crate::graph::store::write_new_bytes(
+            &stamp_path(&croot, aout.as_deref()),
+            &encoded,
+        ));
     }
 }
 

@@ -14,11 +14,23 @@ struct Reads {
 
 impl Reads {
     fn new(values: usize) -> Self {
-        Self { first: vec![usize::MAX; values], last: vec![0; values], count: vec![0; values], local: vec![false; values], touched: Vec::new() }
+        Self {
+            first: vec![usize::MAX; values],
+            last: vec![0; values],
+            count: vec![0; values],
+            local: vec![false; values],
+            touched: Vec::new(),
+        }
     }
 
     fn fill(&mut self, func: &Function, block: usize) {
-        let Self { first, last, count, local, touched } = self;
+        let Self {
+            first,
+            last,
+            count,
+            local,
+            touched,
+        } = self;
         for value in touched.drain(..) {
             let at = value.index();
             (first[at], last[at], count[at], local[at]) = (usize::MAX, 0, 0, false);
@@ -59,22 +71,39 @@ fn feeds(func: &Function) -> Vec<Vec<Value>> {
 }
 
 /// The position after which the pure op at `at` can move so that the block parameter it updates dies before the update is born.
-fn target(func: &Function, (insts, uses, defs, params): (&[Inst], &[u32], &[Option<Inst>], &[Value]), (reads, feeds): (&Reads, &[Vec<Value>]), at: usize) -> Option<usize> {
+fn target(
+    func: &Function,
+    (insts, uses, defs, params): (&[Inst], &[u32], &[Option<Inst>], &[Value]),
+    (reads, feeds): (&Reads, &[Vec<Value>]),
+    at: usize,
+) -> Option<usize> {
     let inst = insts[at];
     let data = &func.insts[inst.index()];
     let result = data.result?;
-    if !is_pure_sinkable(func, &data.op, result) || insts.get(at + 1).is_some_and(|&next| is_fits_paired(func, inst, next)) {
+    if !is_pure_sinkable(func, &data.op, result)
+        || insts
+            .get(at + 1)
+            .is_some_and(|&next| is_fits_paired(func, inst, next))
+    {
         return None;
     }
     let mut operands = Vec::with_capacity(2);
     data.op.for_operands(|value| operands.push(value));
-    let dying = operands.iter().copied().find(|&value| params.contains(&value) && feeds[result.index()].contains(&value) && reads.dies_after(uses, value, at))?;
+    let dying = operands.iter().copied().find(|&value| {
+        params.contains(&value)
+            && feeds[result.index()].contains(&value)
+            && reads.dies_after(uses, value, at)
+    })?;
     let last = reads.last[dying.index()];
     if last + 1 >= insts.len() || last >= reads.first[result.index()] {
         return None;
     }
     let stays = |value: Value| {
-        value == dying || is_static_def(func, defs, value) || !reads.local[value.index()] || uses[value.index()] > reads.count[value.index()] || reads.last[value.index()] > last
+        value == dying
+            || is_static_def(func, defs, value)
+            || !reads.local[value.index()]
+            || uses[value.index()] > reads.count[value.index()]
+            || reads.last[value.index()] > last
     };
     operands.iter().all(|&value| stays(value)).then_some(last)
 }
@@ -89,7 +118,19 @@ pub(super) fn after_last_read(func: &mut Function, uses: &[u32], defs: &[Option<
         }
         reads.fill(func, block);
         for at in (0..func.blocks[block].insts.len() - 1).rev() {
-            let Some(last) = target(func, (&func.blocks[block].insts, uses, defs, &func.blocks[block].params), (&reads, &feeds), at) else { continue };
+            let Some(last) = target(
+                func,
+                (
+                    &func.blocks[block].insts,
+                    uses,
+                    defs,
+                    &func.blocks[block].params,
+                ),
+                (&reads, &feeds),
+                at,
+            ) else {
+                continue;
+            };
             let moved = func.blocks[block].insts.remove(at);
             func.blocks[block].insts.insert(last, moved);
             reads.fill(func, block);

@@ -30,14 +30,22 @@ struct CrateIdentity {
     deps: Vec<(String, u32)>,
 }
 
-const ROLES: [Role; 5] = [Role::Lib, Role::Bin, Role::Example, Role::Test, Role::Script];
+const ROLES: [Role; 5] = [
+    Role::Lib,
+    Role::Bin,
+    Role::Example,
+    Role::Test,
+    Role::Script,
+];
 
 fn role_tag(role: Role) -> u8 {
     ROLES.iter().position(|&r| r == role).unwrap_or(0) as u8
 }
 
 fn sysroot_crate_order(workspace: &Workspace, outline: &Outline) -> Vec<usize> {
-    let mut crates: Vec<usize> = (0..outline.crates.len()).filter(|&k| outline.is_sysroot(k as u32)).collect();
+    let mut crates: Vec<usize> = (0..outline.crates.len())
+        .filter(|&k| outline.is_sysroot(k as u32))
+        .collect();
     crates.sort_unstable_by(|&a, &b| {
         let ra = &outline.roots[a];
         let rb = &outline.roots[b];
@@ -45,19 +53,36 @@ fn sysroot_crate_order(workspace: &Workspace, outline: &Outline) -> Vec<usize> {
         let ub = &workspace.graph.units[rb.unit];
         let pa = &workspace.packages[ua.package].locked.name;
         let pb = &workspace.packages[ub.package].locked.name;
-        (ra.name.as_str(), matches!(ua.side, Side::Host), pa.as_str(), role_tag(ra.role), a)
-            .cmp(&(rb.name.as_str(), matches!(ub.side, Side::Host), pb.as_str(), role_tag(rb.role), b))
+        (
+            ra.name.as_str(),
+            matches!(ua.side, Side::Host),
+            pa.as_str(),
+            role_tag(ra.role),
+            a,
+        )
+            .cmp(&(
+                rb.name.as_str(),
+                matches!(ub.side, Side::Host),
+                pb.as_str(),
+                role_tag(rb.role),
+                b,
+            ))
     });
     crates
 }
 
-fn identity_of(workspace: &Workspace, outline: &Outline, krate: usize, to_local: &[Option<u32>]) -> Option<CrateIdentity> {
+fn identity_of(
+    workspace: &Workspace,
+    outline: &Outline,
+    krate: usize,
+    to_local: &[Option<u32>],
+) -> Option<CrateIdentity> {
     let root = &outline.roots[krate];
     let unit = &workspace.graph.units[root.unit];
     let pkg = &workspace.packages[unit.package];
     let mut deps = Vec::with_capacity(outline.deps[krate].len());
     for (name, dep) in &outline.deps[krate] {
-        deps.push((name.clone(), (*to_local.get(*dep)? )?));
+        deps.push((name.clone(), (*to_local.get(*dep)?)?));
     }
     Some(CrateIdentity {
         unit_name: root.name.clone(),
@@ -70,7 +95,11 @@ fn identity_of(workspace: &Workspace, outline: &Outline, krate: usize, to_local:
     })
 }
 
-fn match_crates(identities: &[CrateIdentity], workspace: &Workspace, outline: &Outline) -> Option<Vec<usize>> {
+fn match_crates(
+    identities: &[CrateIdentity],
+    workspace: &Workspace,
+    outline: &Outline,
+) -> Option<Vec<usize>> {
     let local = sysroot_crate_order(workspace, outline);
     if local.len() != identities.len() {
         return None;
@@ -96,7 +125,11 @@ fn is_sysroot_cache(path: &Path) -> bool {
 }
 
 /// Attempts to load cached settled sysroot crates into `outline` and return their `Symbols` and `Names`.
-pub(crate) fn try_load(workspace: &Workspace, targets: &Targets, outline: &mut Outline) -> Option<(Symbols, Vec<(usize, NamesCrate)>)> {
+pub(crate) fn try_load(
+    workspace: &Workspace,
+    targets: &Targets,
+    outline: &mut Outline,
+) -> Option<(Symbols, Vec<(usize, NamesCrate)>)> {
     if !super::enabled() {
         return None;
     }
@@ -132,7 +165,9 @@ pub(crate) fn save(workspace: &Workspace, targets: &Targets, compilation: &Compi
     let Some(bytes) = wire::encode_sysroot(key, workspace, compilation, &sysroot_crates) else {
         return;
     };
-    if let Err(error) = crate::graph::store::write_new_with(&path, |writer| writer.write_all(&bytes)) {
+    if let Err(error) =
+        crate::graph::store::write_new_with(&path, |writer| writer.write_all(&bytes))
+    {
         eprintln!("haste: cannot save sysroot cache: {error:#}");
         return;
     }

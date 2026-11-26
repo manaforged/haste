@@ -5,7 +5,10 @@ use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
 
 use super::bind::{push_loan, push_source_loans};
 use super::propagate::BorrowSource;
-use super::{BreakFrame, Checker, STMT_TEMP_OFFSET, State, is_temp_holder, join_moved, merge_branch, merge_states, prune_dead_loans, prune_moved_loans};
+use super::{
+    BreakFrame, Checker, Loan, STMT_TEMP_OFFSET, State, is_temp_holder, join_moved, merge_branch,
+    merge_states, prune_dead_loans, prune_moved_loans,
+};
 
 impl Checker<'_, '_> {
     pub(super) fn check_block(
@@ -28,12 +31,7 @@ impl Checker<'_, '_> {
             self.unsafe_depth += 1;
         }
         if is_const {
-            let ids_check: Vec<u32> = self.body.list(stmts).to_vec();
-            let (c_before, _, c_tail) = self.block_liveness(&ids_check, tail, &HashSet::default());
-            let live_in = c_before.first().unwrap_or(&c_tail);
-            if let Some(&bad) = live_in.iter().find(|&&loc| self.scope_depth.get(loc as usize).is_some_and(|&d| d < block_depth)) {
-                bail!("attempt to use a non-constant value `{}` in a constant", self.local_name(bad));
-            }
+            self.check_const_block_locals(stmts, tail, block_depth)?;
             self.const_depth += 1;
         }
         let update_stmt_depth = !matches!(kind, BlockKind::Expansion | BlockKind::Unsafe);
@@ -53,97 +51,27 @@ impl Checker<'_, '_> {
                     break;
                 }
                 prune_dead_loans(state, &before_stmt[pos]);
-                match this.body.stmts[stmt_id as usize] {
-                    Stmt::Let { pat, ty, init, otherwise, extend, .. } => {
-                        if update_stmt_depth && !extend {
-                            this.stmt_depth = block_depth;
-                        }
-                        let let_stmt_depth = this.stmt_depth;
-                        let saved_temp_scope = this.temp_scope_depth;
-                        let stmt_temp_depth = block_depth + STMT_TEMP_OFFSET;
-                        if init.is_some() {
-                            this.temp_scope_depth = if extend { let_stmt_depth } else { stmt_temp_depth };
-                        }
-                        let is_wild = matches!(*this.body.pat(pat), Pat::Wild);
-                        let destructures = !matches!(
-                            *this.body.pat(pat),
-                            Pat::Bind { by_ref: false, sub: None, .. } | Pat::Wild
-                        );
-                        let pat_depth = if extend { let_stmt_depth } else { block_depth };
-                        if let Some(e) = init {
-                            let reborrow_mut = (ty.is_some() || this.typed.coercions.contains_key(&e))
-                                && this.is_mut_ref_ty(this.expr_ty(e));
-                            this.with_let_extend((!is_wild).then_some(pat_depth), |inner| {
-                                inner.check_expr(e, state, destructures || is_wild || reborrow_mut, &after_stmt[pos], !is_wild, block_depth)
-                            })?;
-                        }
-                        if let Some(e) = otherwise {
-                            let mut alt = state.clone();
-                            this.with_let_extend(None, |inner| {
-                                inner.check_expr(e, &mut alt, false, &after_stmt[pos], false, block_depth)
-                            })?;
-                        }
-                        this.stmt_depth = let_stmt_depth;
-                        let scrut_place = init.and_then(|e| this.root_place(e));
-                        let bind_res = this.with_let_extend(init.map(|_| pat_depth), |inner| {
-                            inner.bind_pat(
-                                pat,
-                                init,
-                                scrut_place.as_ref(),
-                                &[],
-                                &[],
-                                state,
-                                (init.is_some(), destructures, pat_depth),
-                            )
-                        });
-                        this.temp_scope_depth = saved_temp_scope;
-                        bind_res?;
-                        let mut bound = HashSet::default();
-                        this.collect_pat_locals(pat, &mut bound);
-                        let bound_vec: Vec<u32> = bound.into_iter().collect();
-                        this.check_stmt_temp_escape(state, stmt_temp_depth, &bound_vec, &after_stmt[pos])?;
-                        prune_moved_loans(state);
-                    }
-                    Stmt::Expr(e, semi) => {
-                        if update_stmt_depth {
-                            this.stmt_depth = block_depth;
-                        }
-                        let saved_temp_scope = this.temp_scope_depth;
-                        let stmt_temp_depth = block_depth + STMT_TEMP_OFFSET;
-                        if semi {
-                            this.temp_scope_depth = stmt_temp_depth;
-                        }
-                        this.check_expr(e, state, false, &after_stmt[pos], !semi, block_depth)?;
-                        this.temp_scope_depth = saved_temp_scope;
-                        if semi {
-                            this.check_stmt_temp_escape(state, stmt_temp_depth, &[], &after_stmt[pos])?;
-                            prune_moved_loans(state);
-                        }
-                    }
-                    Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
-                }
+                this.check_block_stmt(
+                    stmt_id,
+                    state,
+                    &after_stmt[pos],
+                    block_depth,
+                    update_stmt_depth,
+                )?;
             }
             Ok(())
         })?;
         if let Some(t) = tail
             && !state.diverged
         {
-            if update_stmt_depth {
-                self.stmt_depth = block_depth;
-            }
-            prune_dead_loans(state, &tail_live);
-            self.check_expr(t, state, place_ctx, outer_live, value_used, block_depth)?;
-            if value_used && !state.diverged {
-                let tail_srcs = self.expr_borrow_sources_let(t, state);
-                for src in &tail_srcs {
-                    if self.escapes_depth(src.target, src.through_ref, block_depth) {
-                        bail!("`{}` does not live long enough", self.local_name(src.target));
-                    }
-                }
-                if !tail_srcs.is_empty() && !is_const {
-                    self.temp_sources.insert(expr_id, tail_srcs);
-                }
-            }
+            self.check_block_tail(
+                expr_id,
+                t,
+                state,
+                (place_ctx, value_used),
+                (outer_live, &tail_live),
+                (block_depth, update_stmt_depth, is_const),
+            )?;
         }
         if is_const {
             self.const_depth -= 1;
@@ -159,16 +87,192 @@ impl Checker<'_, '_> {
         if label.is_some()
             && let Some(frame) = self.breaks.pop()
             && !frame.states.is_empty()
+            && let Some(acc) =
+                merge_break_states((!state.diverged).then(|| state.clone()), frame.states)
         {
-            let mut merged: Option<State> = (!state.diverged).then(|| state.clone());
-            for bs in frame.states {
-                match &mut merged {
-                    Some(acc) => merge_states(acc, &bs),
-                    None => merged = Some(bs),
+            *state = acc;
+        }
+        Ok(())
+    }
+
+    fn check_const_block_locals(
+        &self,
+        stmts: List,
+        tail: Option<ExprId>,
+        block_depth: u32,
+    ) -> Result<()> {
+        let ids_check: Vec<u32> = self.body.list(stmts).to_vec();
+        let (c_before, _, c_tail) = self.block_liveness(&ids_check, tail, &HashSet::default());
+        let live_in = c_before.first().unwrap_or(&c_tail);
+        if let Some(&bad) = live_in.iter().find(|&&loc| {
+            self.scope_depth
+                .get(loc as usize)
+                .is_some_and(|&d| d < block_depth)
+        }) {
+            bail!(
+                "attempt to use a non-constant value `{}` in a constant",
+                self.local_name(bad)
+            );
+        }
+        Ok(())
+    }
+
+    fn check_block_stmt(
+        &mut self,
+        stmt_id: u32,
+        state: &mut State,
+        after_live: &HashSet<u32>,
+        block_depth: u32,
+        update_stmt_depth: bool,
+    ) -> Result<()> {
+        match self.body.stmts[stmt_id as usize] {
+            Stmt::Let {
+                pat,
+                ty,
+                init,
+                otherwise,
+                extend,
+                ..
+            } => self.check_let_stmt(
+                (pat, ty.is_some(), init, otherwise, extend),
+                state,
+                after_live,
+                block_depth,
+                update_stmt_depth,
+            ),
+            Stmt::Expr(e, semi) => {
+                self.check_expr_stmt(e, semi, state, after_live, block_depth, update_stmt_depth)
+            }
+            Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => Ok(()),
+        }
+    }
+
+    fn check_let_stmt(
+        &mut self,
+        (pat, has_ty, init, otherwise, extend): (PatId, bool, Option<ExprId>, Option<ExprId>, bool),
+        state: &mut State,
+        after_live: &HashSet<u32>,
+        block_depth: u32,
+        update_stmt_depth: bool,
+    ) -> Result<()> {
+        if update_stmt_depth && !extend {
+            self.stmt_depth = block_depth;
+        }
+        let let_stmt_depth = self.stmt_depth;
+        let saved_temp_scope = self.temp_scope_depth;
+        let stmt_temp_depth = block_depth + STMT_TEMP_OFFSET;
+        if init.is_some() {
+            self.temp_scope_depth = if extend {
+                let_stmt_depth
+            } else {
+                stmt_temp_depth
+            };
+        }
+        let is_wild = matches!(*self.body.pat(pat), Pat::Wild);
+        let destructures = !matches!(
+            *self.body.pat(pat),
+            Pat::Bind {
+                by_ref: false,
+                sub: None,
+                ..
+            } | Pat::Wild
+        );
+        let pat_depth = if extend { let_stmt_depth } else { block_depth };
+        if let Some(e) = init {
+            let reborrow_mut = (has_ty || self.typed.coercions.contains_key(&e))
+                && self.is_mut_ref_ty(self.expr_ty(e));
+            self.with_let_extend((!is_wild).then_some(pat_depth), |inner| {
+                inner.check_expr(
+                    e,
+                    state,
+                    destructures || is_wild || reborrow_mut,
+                    after_live,
+                    !is_wild,
+                    block_depth,
+                )
+            })?;
+        }
+        if let Some(e) = otherwise {
+            let mut alt = state.clone();
+            self.with_let_extend(None, |inner| {
+                inner.check_expr(e, &mut alt, false, after_live, false, block_depth)
+            })?;
+        }
+        self.stmt_depth = let_stmt_depth;
+        let scrut_place = init.and_then(|e| self.root_place(e));
+        let bind_res = self.with_let_extend(init.map(|_| pat_depth), |inner| {
+            inner.bind_pat(
+                pat,
+                init,
+                scrut_place.as_ref(),
+                &[],
+                &[],
+                state,
+                (init.is_some(), destructures, pat_depth),
+            )
+        });
+        self.temp_scope_depth = saved_temp_scope;
+        bind_res?;
+        let mut bound = HashSet::default();
+        self.collect_pat_locals(pat, &mut bound);
+        let bound_vec: Vec<u32> = bound.into_iter().collect();
+        self.check_stmt_temp_escape(state, stmt_temp_depth, &bound_vec, after_live)?;
+        prune_moved_loans(state);
+        Ok(())
+    }
+
+    fn check_expr_stmt(
+        &mut self,
+        expr: ExprId,
+        semi: bool,
+        state: &mut State,
+        after_live: &HashSet<u32>,
+        block_depth: u32,
+        update_stmt_depth: bool,
+    ) -> Result<()> {
+        if update_stmt_depth {
+            self.stmt_depth = block_depth;
+        }
+        let saved_temp_scope = self.temp_scope_depth;
+        let stmt_temp_depth = block_depth + STMT_TEMP_OFFSET;
+        if semi {
+            self.temp_scope_depth = stmt_temp_depth;
+        }
+        self.check_expr(expr, state, false, after_live, !semi, block_depth)?;
+        self.temp_scope_depth = saved_temp_scope;
+        if semi {
+            self.check_stmt_temp_escape(state, stmt_temp_depth, &[], after_live)?;
+            prune_moved_loans(state);
+        }
+        Ok(())
+    }
+
+    fn check_block_tail(
+        &mut self,
+        expr_id: ExprId,
+        tail: ExprId,
+        state: &mut State,
+        (place_ctx, value_used): (bool, bool),
+        (outer_live, tail_live): (&HashSet<u32>, &HashSet<u32>),
+        (block_depth, update_stmt_depth, is_const): (u32, bool, bool),
+    ) -> Result<()> {
+        if update_stmt_depth {
+            self.stmt_depth = block_depth;
+        }
+        prune_dead_loans(state, tail_live);
+        self.check_expr(tail, state, place_ctx, outer_live, value_used, block_depth)?;
+        if value_used && !state.diverged {
+            let tail_srcs = self.expr_borrow_sources_let(tail, state);
+            for src in &tail_srcs {
+                if self.escapes_depth(src.target, src.through_ref, block_depth) {
+                    bail!(
+                        "`{}` does not live long enough",
+                        self.local_name(src.target)
+                    );
                 }
             }
-            if let Some(acc) = merged {
-                *state = acc;
+            if !tail_srcs.is_empty() && !is_const {
+                self.temp_sources.insert(expr_id, tail_srcs);
             }
         }
         Ok(())
@@ -195,10 +299,25 @@ impl Checker<'_, '_> {
         let mut else_state = state.clone();
         let mut drop_temps = Vec::new();
         self.with_let_extend(None, |this| {
-            this.check_cond_for_branches(cond, &mut then_state, &mut else_state, &then_live, &else_live, depth + 1, &mut drop_temps)
+            this.check_cond_for_branches(
+                cond,
+                &mut then_state,
+                &mut else_state,
+                &then_live,
+                &else_live,
+                depth + 1,
+                &mut drop_temps,
+            )
         })?;
         prune_dead_loans(&mut then_state, &then_live);
-        self.check_expr(then, &mut then_state, place_ctx, outer_live, value_used, depth)?;
+        self.check_expr(
+            then,
+            &mut then_state,
+            place_ctx,
+            outer_live,
+            value_used,
+            depth,
+        )?;
         let mut out_sources = Vec::new();
         if value_used && !then_state.diverged {
             out_sources.extend(self.expr_borrow_sources_let(then, &then_state));
@@ -209,7 +328,14 @@ impl Checker<'_, '_> {
         }
         if let Some(alt) = otherwise {
             prune_dead_loans(&mut else_state, &else_live);
-            self.check_expr(alt, &mut else_state, place_ctx, outer_live, value_used, depth)?;
+            self.check_expr(
+                alt,
+                &mut else_state,
+                place_ctx,
+                outer_live,
+                value_used,
+                depth,
+            )?;
             if value_used && !else_state.diverged {
                 for s in self.expr_borrow_sources_let(alt, &else_state) {
                     if !out_sources.contains(&s) {
@@ -236,9 +362,15 @@ impl Checker<'_, '_> {
         drop_temps: &mut Vec<u32>,
     ) -> Result<()> {
         match *self.body.expr(cond) {
-            Expr::Paren(inner) => {
-                self.check_cond_for_branches(inner, then_state, else_state, then_live, else_live, scope_depth, drop_temps)
-            }
+            Expr::Paren(inner) => self.check_cond_for_branches(
+                inner,
+                then_state,
+                else_state,
+                then_live,
+                else_live,
+                scope_depth,
+                drop_temps,
+            ),
             Expr::Let(pat, init) => {
                 let mut both_live = then_live.clone();
                 both_live.extend(else_live);
@@ -248,12 +380,36 @@ impl Checker<'_, '_> {
                     drop_temps.push(temp_id);
                 }
                 let scrut_place = self.root_place(init);
-                self.bind_pat(pat, Some(init), scrut_place.as_ref(), &[], &[], then_state, (true, true, scope_depth))
+                self.bind_pat(
+                    pat,
+                    Some(init),
+                    scrut_place.as_ref(),
+                    &[],
+                    &[],
+                    then_state,
+                    (true, true, scope_depth),
+                )
             }
             Expr::Binary(BinOp::And, a, b) => {
-                self.check_cond_for_branches(a, then_state, else_state, then_live, else_live, scope_depth, drop_temps)?;
+                self.check_cond_for_branches(
+                    a,
+                    then_state,
+                    else_state,
+                    then_live,
+                    else_live,
+                    scope_depth,
+                    drop_temps,
+                )?;
                 let mut rhs_else = then_state.clone();
-                self.check_cond_for_branches(b, then_state, &mut rhs_else, then_live, else_live, scope_depth, drop_temps)?;
+                self.check_cond_for_branches(
+                    b,
+                    then_state,
+                    &mut rhs_else,
+                    then_live,
+                    else_live,
+                    scope_depth,
+                    drop_temps,
+                )?;
                 if !rhs_else.diverged && !else_state.diverged {
                     merge_states(else_state, &rhs_else);
                 } else if else_state.diverged && !rhs_else.diverged {
@@ -288,7 +444,9 @@ impl Checker<'_, '_> {
                 self.collect_live_expr(g, &mut match_live);
             }
         }
-        self.with_let_extend(None, |this| this.check_expr(scrut, state, true, &match_live, true, depth))?;
+        self.with_let_extend(None, |this| {
+            this.check_expr(scrut, state, true, &match_live, true, depth)
+        })?;
         let scrut_temp = self.hold_drop_temp(scrut, state);
         let scrut_place = self.root_place(scrut);
         let arm_depth = depth + 1;
@@ -319,7 +477,16 @@ impl Checker<'_, '_> {
                     && self.pat_inspects_scrut(arm.pat)
                 {
                     let id = self.next_temp_holder();
-                    push_loan(&mut arm_state.loans, p.local, p.steps.clone(), Some(id), false, p.through_ref, false, false);
+                    push_loan(
+                        &mut arm_state.loans,
+                        p.local,
+                        p.steps.clone(),
+                        Some(id),
+                        false,
+                        p.through_ref,
+                        false,
+                        false,
+                    );
                     Some(id)
                 } else {
                     None
@@ -329,7 +496,15 @@ impl Checker<'_, '_> {
                 let mut guard_else = arm_state.clone();
                 let mut g_temps = Vec::new();
                 self.with_let_extend(None, |this| {
-                    this.check_cond_for_branches(g, &mut arm_state, &mut guard_else, &guard_live, &match_live, arm_depth, &mut g_temps)
+                    this.check_cond_for_branches(
+                        g,
+                        &mut arm_state,
+                        &mut guard_else,
+                        &guard_live,
+                        &match_live,
+                        arm_depth,
+                        &mut g_temps,
+                    )
                 })?;
                 if let Some(gt) = guard_temp {
                     arm_state.loans.retain(|l| l.holder != Some(gt));
@@ -339,14 +514,34 @@ impl Checker<'_, '_> {
                     join_moved(&mut fallthrough_state, &guard_else);
                 }
                 if !arm_state.diverged {
-                    self.bind_pat_moves(arm.pat, Some(scrut), scrut_place.as_ref(), &mut arm_state, arm_depth)?;
+                    self.bind_pat_moves(
+                        arm.pat,
+                        Some(scrut),
+                        scrut_place.as_ref(),
+                        &mut arm_state,
+                        arm_depth,
+                    )?;
                 }
-                self.check_expr(arm.body, &mut arm_state, place_ctx, outer_live, value_used, arm_depth)?;
+                self.check_expr(
+                    arm.body,
+                    &mut arm_state,
+                    place_ctx,
+                    outer_live,
+                    value_used,
+                    arm_depth,
+                )?;
                 for id in g_temps {
                     arm_state.loans.retain(|l| l.holder != Some(id));
                 }
             } else {
-                self.check_expr(arm.body, &mut arm_state, place_ctx, outer_live, value_used, arm_depth)?;
+                self.check_expr(
+                    arm.body,
+                    &mut arm_state,
+                    place_ctx,
+                    outer_live,
+                    value_used,
+                    arm_depth,
+                )?;
             }
             if !arm_state.diverged {
                 if value_used {
@@ -420,8 +615,21 @@ impl Checker<'_, '_> {
             push_source_loans(&mut state.loans, Some(id), &iter_sources);
             Some(id)
         };
-        let item_sources: Vec<BorrowSource> = iter_sources.iter().filter(|s| !s.env_only).cloned().collect();
-        self.check_loop(label, None, Some((pat, &item_sources)), iter_temp, body, state, outer_live, depth)?;
+        let item_sources: Vec<BorrowSource> = iter_sources
+            .iter()
+            .filter(|s| !s.env_only)
+            .cloned()
+            .collect();
+        self.check_loop(
+            label,
+            None,
+            Some((pat, &item_sources)),
+            iter_temp,
+            body,
+            state,
+            outer_live,
+            depth,
+        )?;
         if let Some(id) = iter_temp {
             state.loans.retain(|l| l.holder != Some(id));
         }
@@ -473,18 +681,32 @@ impl Checker<'_, '_> {
                 let mut drop_temps = Vec::new();
                 if let Some(c) = cond {
                     let mut cond_dummy = iter_state.clone();
-                    this.check_cond_for_branches(c, &mut iter_state, &mut cond_dummy, &loop_live, outer_live, loop_depth, &mut drop_temps)?;
+                    this.check_cond_for_branches(
+                        c,
+                        &mut iter_state,
+                        &mut cond_dummy,
+                        &loop_live,
+                        outer_live,
+                        loop_depth,
+                        &mut drop_temps,
+                    )?;
                 }
                 if let Some((p, sources)) = pat {
-                    this.bind_pat(p, None, None, &[], sources, &mut iter_state, (true, true, loop_depth))?;
+                    this.bind_pat(
+                        p,
+                        None,
+                        None,
+                        &[],
+                        sources,
+                        &mut iter_state,
+                        (true, true, loop_depth),
+                    )?;
                 }
                 this.check_expr(body, &mut iter_state, false, &loop_live, false, loop_depth)?;
                 for id in drop_temps {
                     iter_state.loans.retain(|l| l.holder != Some(id));
                 }
-                iter_state
-                    .loans
-                    .retain(|l| l.holder.is_none_or(|h| is_temp_holder(Some(h)) || !loop_locals.contains(&h)));
+                retain_non_loop_loans(&mut iter_state.loans, &loop_locals);
                 if iter_state.diverged {
                     break;
                 }
@@ -494,14 +716,7 @@ impl Checker<'_, '_> {
         })?;
         let frame = self.breaks.pop().expect("loop pushed break frame");
         if infinite {
-            let mut merged: Option<State> = None;
-            for bs in frame.states {
-                match &mut merged {
-                    Some(acc) => merge_states(acc, &bs),
-                    None => merged = Some(bs),
-                }
-            }
-            match merged {
+            match merge_break_states(None, frame.states) {
                 Some(acc) => *state = acc,
                 None => state.diverged = true,
             }
@@ -513,9 +728,22 @@ impl Checker<'_, '_> {
                 merge_states(state, &bs);
             }
         }
-        state
-            .loans
-            .retain(|l| l.holder.is_none_or(|h| is_temp_holder(Some(h)) || !loop_locals.contains(&h)));
+        retain_non_loop_loans(&mut state.loans, &loop_locals);
         Ok(())
     }
+}
+
+fn retain_non_loop_loans(loans: &mut Vec<Loan>, loop_locals: &HashSet<u32>) {
+    let keep = |h| is_temp_holder(Some(h)) || !loop_locals.contains(&h);
+    loans.retain(|l| l.holder.is_none_or(keep));
+}
+
+fn merge_break_states(mut merged: Option<State>, states: Vec<State>) -> Option<State> {
+    for bs in states {
+        match &mut merged {
+            Some(acc) => merge_states(acc, &bs),
+            None => merged = Some(bs),
+        }
+    }
+    merged
 }

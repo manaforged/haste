@@ -1,8 +1,8 @@
 use super::super::asm::Reg;
 use super::bits::UseInfo;
 use super::{
-    alu_shift, can_peel_uextend, const_of, def_entry, def_inst, fits_width, local_single, peel_other_uextend,
-    preserved, shift_parts, shift_uext_ok, zero_ext_loc,
+    alu_shift, can_peel_uextend, const_of, def_entry, def_inst, fits_width, local_single,
+    peel_other_uextend, preserved, shift_parts, shift_uext_ok, zero_ext_loc,
 };
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, InstData, Op, Type, Unary, Value};
@@ -21,7 +21,8 @@ fn multi_shift_binary(
     alu_shift(logical, ty, sop, imm)?;
     let other = if y == shift_val { x } else { y };
     let def = |v| def_inst(pos_of, v);
-    (!plan.elided[other.index()] && const_of(func, plan, other, &def).is_none()).then_some(Some(other))
+    (!plan.elided[other.index()] && const_of(func, plan, other, &def).is_none())
+        .then_some(Some(other))
 }
 
 fn multi_shift_icmp(
@@ -55,16 +56,32 @@ fn multi_shift_consumer(
         return None;
     }
     match ud.op {
-        Op::Binary(alu_op @ (Binary::Band | Binary::Bor | Binary::Bxor | Binary::Iadd | Binary::Isub), x, y) => {
-            (func.ty(u_res) == ty)
-                .then(|| multi_shift_binary(func, plan, pos_of, (ty, sop, imm), (shift_val, alu_op, x, y)))
-                .flatten()
+        Op::Binary(
+            alu_op @ (Binary::Band | Binary::Bor | Binary::Bxor | Binary::Iadd | Binary::Isub),
+            x,
+            y,
+        ) => (func.ty(u_res) == ty)
+            .then(|| {
+                multi_shift_binary(
+                    func,
+                    plan,
+                    pos_of,
+                    (ty, sop, imm),
+                    (shift_val, alu_op, x, y),
+                )
+            })
+            .flatten(),
+        Op::Unary(Unary::Bnot, x) if x == shift_val && func.ty(u_res) == ty => {
+            alu_shift(true, ty, sop, imm).map(|_| None)
         }
-        Op::Unary(Unary::Bnot, x) if x == shift_val && func.ty(u_res) == ty => alu_shift(true, ty, sop, imm).map(|_| None),
-        Op::Unary(Unary::Ineg, x) if x == shift_val && matches!(ty, Type::I32 | Type::I64) && func.ty(u_res) == ty => {
+        Op::Unary(Unary::Ineg, x)
+            if x == shift_val && matches!(ty, Type::I32 | Type::I64) && func.ty(u_res) == ty =>
+        {
             alu_shift(false, ty, sop, imm).map(|_| None)
         }
-        Op::Icmp(_, a, b) => multi_shift_icmp(func, plan, pos_of, (ty, sop, imm), (shift_val, a, b)),
+        Op::Icmp(_, a, b) => {
+            multi_shift_icmp(func, plan, pos_of, (ty, sop, imm), (shift_val, a, b))
+        }
         _ => None,
     }
 }
@@ -92,7 +109,11 @@ fn find_two_shift_uses(
         found[count] = Some((u_pos, ud.result?, other));
         count += 1;
     }
-    if count == 2 { Some([found[0]?, found[1]?]) } else { None }
+    if count == 2 {
+        Some([found[0]?, found[1]?])
+    } else {
+        None
+    }
 }
 
 pub(super) fn try_fuse_multi_shift(
@@ -102,19 +123,33 @@ pub(super) fn try_fuse_multi_shift(
     (b_idx, spos, shift_val): (usize, usize, Value),
     op: &Op,
 ) -> bool {
-    if uses[shift_val.index()] != 2 || plan.elided[shift_val.index()] || plan.deferred[shift_val.index()] || plan.is_static(shift_val) {
+    if uses[shift_val.index()] != 2
+        || plan.elided[shift_val.index()]
+        || plan.deferred[shift_val.index()]
+        || plan.is_static(shift_val)
+    {
         return false;
     }
-    let Some((sop, b, imm)) = shift_parts(op, plan) else { return false };
+    let Some((sop, b, imm)) = shift_parts(op, plan) else {
+        return false;
+    };
     let ty = func.ty(shift_val);
     if !ty.is_small_int() {
         return false;
     }
-    let Some([(u1_pos, u1_res, o1), (u2_pos, u2_res, o2)]) = find_two_shift_uses(func, plan, pos_of, (b_idx, spos, shift_val), (ty, sop, imm)) else {
+    let Some([(u1_pos, u1_res, o1), (u2_pos, u2_res, o2)]) =
+        find_two_shift_uses(func, plan, pos_of, (b_idx, spos, shift_val), (ty, sop, imm))
+    else {
         return false;
     };
     let shift_ok = |inner: Value| shift_uext_ok(func, plan, ty.bits(), (sop, imm), inner);
-    let peeled = can_peel_uextend(func, plan, info, (b_idx, spos, u2_pos, Some(spos), shift_val), (b, &shift_ok));
+    let peeled = can_peel_uextend(
+        func,
+        plan,
+        info,
+        (b_idx, spos, u2_pos, Some(spos), shift_val),
+        (b, &shift_ok),
+    );
     if !peeled && (plan.elided[b.index()] || !preserved(func, plan, b_idx, spos, u2_pos, None, b)) {
         return false;
     }
@@ -147,10 +182,12 @@ fn high_bits_zero(
     }
     let Some(inst) = def(val) else { return false };
     match func.insts[inst.index()].op {
-        Op::Convert(Convert::Uextend, inner) => func.ty(inner).is_small_int() && func.ty(inner).bits() <= u_bits,
-        Op::Binary(Binary::Band, a, b) => [a, b].into_iter().any(|mv| {
-            const_of(func, plan, mv, &def).is_some_and(fits_u)
-        }),
+        Op::Convert(Convert::Uextend, inner) => {
+            func.ty(inner).is_small_int() && func.ty(inner).bits() <= u_bits
+        }
+        Op::Binary(Binary::Band, a, b) => [a, b]
+            .into_iter()
+            .any(|mv| const_of(func, plan, mv, &def).is_some_and(fits_u)),
         Op::Binary(Binary::Ushr, _, amt) => const_of(func, plan, amt, &def)
             .is_some_and(|c| ((c as u32) & (ty_bits - 1)) >= ty_bits - u_bits),
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => true,
@@ -165,13 +202,21 @@ fn try_fuse_bnot_uext(
     (b_idx, npos, pos, res, op): (usize, usize, usize, Value, Binary),
     (other, neg, inner): (Value, Value, Value),
 ) -> bool {
-    let Some((upos, uinst)) = local_single(plan, info, b_idx, npos, inner) else { return false };
-    let Op::Convert(Convert::Uextend, u_inner) = func.insts[uinst.index()].op else { return false };
-    if u_inner == res || plan.elided[u_inner.index()] || !matches!(plan.location(u_inner), Location::Reg(_) | Location::Slot) {
+    let Some((upos, uinst)) = local_single(plan, info, b_idx, npos, inner) else {
+        return false;
+    };
+    let Op::Convert(Convert::Uextend, u_inner) = func.insts[uinst.index()].op else {
+        return false;
+    };
+    if u_inner == res
+        || plan.elided[u_inner.index()]
+        || !matches!(plan.location(u_inner), Location::Reg(_) | Location::Slot)
+    {
         return false;
     }
     let ok = zero_ext_loc(plan, u_inner)
-        || (op == Binary::Band && high_bits_zero(func, plan, pos_of, other, func.ty(u_inner).bits()));
+        || (op == Binary::Band
+            && high_bits_zero(func, plan, pos_of, other, func.ty(u_inner).bits()));
     if !ok || !preserved(func, plan, b_idx, upos, pos, Some(npos), u_inner) {
         return false;
     }
@@ -189,20 +234,32 @@ fn try_fuse_bnot_elided_shift(
     (other, neg, inner): (Value, Value, Value),
 ) -> bool {
     let ty = func.ty(res);
-    let Some((sb, spos, sinst)) = def_entry(pos_of, inner) else { return false };
+    let Some((sb, spos, sinst)) = def_entry(pos_of, inner) else {
+        return false;
+    };
     if sb != b_idx || spos >= npos {
         return false;
     }
-    let Some((sop, b, imm)) = shift_parts(&func.insts[sinst.index()].op, plan) else { return false };
+    let Some((sop, b, imm)) = shift_parts(&func.insts[sinst.index()].op, plan) else {
+        return false;
+    };
     if alu_shift(true, ty, sop, imm).is_none() {
         return false;
     }
     let root = if !plan.elided[b.index()] {
         b
     } else {
-        let Some((ub, upos, uinst)) = def_entry(pos_of, b) else { return false };
-        let Op::Convert(Convert::Uextend, u_inner) = func.insts[uinst.index()].op else { return false };
-        if ub != b_idx || upos >= spos || plan.elided[u_inner.index()] || !shift_uext_ok(func, plan, ty.bits(), (sop, imm), u_inner) {
+        let Some((ub, upos, uinst)) = def_entry(pos_of, b) else {
+            return false;
+        };
+        let Op::Convert(Convert::Uextend, u_inner) = func.insts[uinst.index()].op else {
+            return false;
+        };
+        if ub != b_idx
+            || upos >= spos
+            || plan.elided[u_inner.index()]
+            || !shift_uext_ok(func, plan, ty.bits(), (sop, imm), u_inner)
+        {
             return false;
         }
         u_inner
@@ -222,8 +279,12 @@ fn try_fuse_bnot_shift(
     (b_idx, npos, pos, res, ty): (usize, usize, usize, Value, Type),
     (other, neg, inner): (Value, Value, Value),
 ) -> bool {
-    let Some((spos, sinst)) = local_single(plan, info, b_idx, npos, inner) else { return false };
-    let Some((sop, b, imm)) = shift_parts(&func.insts[sinst.index()].op, plan) else { return false };
+    let Some((spos, sinst)) = local_single(plan, info, b_idx, npos, inner) else {
+        return false;
+    };
+    let Some((sop, b, imm)) = shift_parts(&func.insts[sinst.index()].op, plan) else {
+        return false;
+    };
     if alu_shift(true, ty, sop, imm).is_none() || b == res {
         return false;
     }
@@ -265,17 +326,37 @@ pub(super) fn try_fuse_bnot(
         if plan.elided[other.index()] {
             continue;
         }
-        let Some((npos, ninst)) = local_single(plan, info, b_idx, pos, neg) else { continue };
-        let Op::Unary(Unary::Bnot, inner) = func.insts[ninst.index()].op else { continue };
+        let Some((npos, ninst)) = local_single(plan, info, b_idx, pos, neg) else {
+            continue;
+        };
+        let Op::Unary(Unary::Bnot, inner) = func.insts[ninst.index()].op else {
+            continue;
+        };
         if plan.elided[inner.index()] {
-            if try_fuse_bnot_elided_shift(func, plan, info, (b_idx, npos, pos, res), (other, neg, inner)) {
+            if try_fuse_bnot_elided_shift(
+                func,
+                plan,
+                info,
+                (b_idx, npos, pos, res),
+                (other, neg, inner),
+            ) {
                 return true;
             }
             continue;
         }
-        if try_fuse_bnot_shift(func, plan, info, (b_idx, npos, pos, res, ty), (other, neg, inner))
-            || try_fuse_bnot_uext(func, plan, info, (b_idx, npos, pos, res, op), (other, neg, inner))
-        {
+        if try_fuse_bnot_shift(
+            func,
+            plan,
+            info,
+            (b_idx, npos, pos, res, ty),
+            (other, neg, inner),
+        ) || try_fuse_bnot_uext(
+            func,
+            plan,
+            info,
+            (b_idx, npos, pos, res, op),
+            (other, neg, inner),
+        ) {
             return true;
         }
         if preserved(func, plan, b_idx, npos, pos, None, inner) {

@@ -1,0 +1,344 @@
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+
+use crate::graph::{self, Targets, cfg};
+use crate::names::{ItemRef, Names};
+use crate::{outline, sema};
+
+use super::args::{Query, usage};
+use super::{Failures, case_items, failure_lines, print_failures};
+
+fn print_graph(workspace: &graph::Workspace) {
+    for line in workspace.unit_lines() {
+        println!("{line}");
+    }
+}
+
+fn print_outline(workspace: &graph::Workspace, outline: &outline::Outline) {
+    for (root, krate) in outline.roots.iter().zip(&outline.crates) {
+        let unit = &workspace.graph.units[root.unit];
+        let version = &workspace.packages[unit.package].locked.version;
+        let read = krate
+            .files
+            .iter()
+            .filter(|file| !file.expanded)
+            .map(|file| &file.source.path)
+            .chain(&krate.gated);
+        let mut files: Vec<String> = read.map(|path| path.display().to_string()).collect();
+        files.sort();
+        files.dedup();
+        for file in files {
+            println!("{:?} {} {version} {file}", unit.side, root.name);
+        }
+    }
+}
+
+pub(super) fn print_items(path: &std::path::Path) -> Result<()> {
+    let file = outline::tree::Files::default().file(path)?;
+    for item in &file.items.items {
+        let name = item.name.map_or("", |at| file.source.text(at));
+        println!(
+            "{:?} {:?} {name} parent={:?} attrs={:?}",
+            item.kind, item.vis, item.parent, item.attrs
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn print_expanded(path: &std::path::Path) -> Result<()> {
+    let mut outline = outline::Outline::file(path, cfg::Target::host());
+    outline.load_all()?;
+    let krate = &outline.crates[0];
+    for file in krate.files.iter().filter(|file| file.expanded) {
+        println!("{}", file.source.text);
+    }
+    for error in &krate.errors {
+        eprintln!("error: {error}");
+    }
+    Ok(())
+}
+
+fn summary(outline: &outline::Outline) -> String {
+    let items: usize = outline
+        .crates
+        .iter()
+        .flat_map(|krate| &krate.files)
+        .map(|file| file.items.items.len())
+        .sum();
+    let loaded: usize = outline
+        .crates
+        .iter()
+        .map(|krate| {
+            krate
+                .modules
+                .iter()
+                .filter(|module| module.loaded())
+                .count()
+        })
+        .sum();
+    let expansions: usize = outline.crates.iter().map(|krate| krate.expansions).sum();
+    let files = outline
+        .crates
+        .iter()
+        .flat_map(|krate| &krate.files)
+        .filter(|file| !file.expanded)
+        .count();
+    format!(
+        "{} crates {files} files {loaded} modules {items} items {expansions} expansions",
+        outline.crates.len()
+    )
+}
+
+fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usize) -> Result<()> {
+    let started = Instant::now();
+    let compilation = crate::macros::load_eager(workspace, targets, &[])?;
+    let (outline, names) = (&compilation.outline, &compilation.names);
+    let elapsed = started.elapsed();
+    for error in outline.crates.iter().flat_map(|krate| &krate.errors) {
+        eprintln!("error: {error}");
+    }
+    let named = outline
+        .roots
+        .iter()
+        .zip(&outline.crates)
+        .flat_map(|(root, krate)| {
+            krate
+                .unresolved()
+                .into_iter()
+                .map(move |name| format!("{}:{name}", root.name))
+        });
+    let mut unresolved: Vec<String> = named.collect();
+    unresolved.sort();
+    unresolved.dedup();
+    eprintln!("unresolved macros {unresolved:?}");
+    let foreign: usize = outline.crates.iter().map(|krate| krate.foreign.len()).sum();
+    eprintln!("procedural macro calls {foreign}");
+    eprintln!(
+        "outline {} in {:.1} ms",
+        summary(outline),
+        elapsed.as_secs_f64() * 1e3
+    );
+    report_names(outline, names, started);
+    print_outline(workspace, outline);
+    report_bodies(outline, threads);
+    Ok(())
+}
+
+fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
+    let compilation = crate::macros::load_lazy(workspace, targets)?;
+    eprintln!(
+        "lazy {} cached {} in {:.1} ms",
+        summary(&compilation.outline),
+        compilation.outline.cache.len(),
+        started.elapsed().as_secs_f64() * 1e3
+    );
+    report_names(&compilation.outline, &compilation.names, started);
+    Ok(())
+}
+
+fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
+    let mut failures = Failures::new();
+    for &item in cases {
+        if let Err(error) = sema::infer::infer(cx, item, sema::substs::Substs::EMPTY) {
+            let text = format!("{error:#}");
+            let kind = text
+                .split([' ', '(', '`'])
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            failures
+                .entry(kind)
+                .or_default()
+                .push(cx.name(item).to_owned());
+        }
+    }
+    failures
+}
+
+fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
+    let mut compilation = crate::macros::load_lazy(workspace, targets)?;
+    let load = started.elapsed();
+    let cases = case_items(workspace, &compilation.outline);
+    let mut passes = 0;
+    let failures = crate::macros::resolve_sema(
+        &mut compilation,
+        (sema::Cache::default(), crate::macros::load),
+        |mut cx, last| {
+            passes += 1;
+            let failures = typeck_pass(&mut cx, &cases);
+            let settled = cx.resolved();
+            let released = cx.release();
+            Ok(if settled || last {
+                Ok(failures)
+            } else {
+                Err(released)
+            })
+        },
+    )?;
+    let failed: usize = failures.values().map(Vec::len).sum();
+    print_failures(&failures);
+    let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
+    eprintln!(
+        "typeck {} cases, {} passed, {failed} failed, {passes} passes, {}, load {:.1} ms, total {:.1} ms",
+        cases.len(),
+        cases.len() - failed,
+        summary(&compilation.outline),
+        ms(load),
+        ms(started.elapsed())
+    );
+    Ok(())
+}
+
+fn parse_bodies(tree: &outline::tree::Crate) -> (usize, Vec<String>) {
+    let mut parsed = 0;
+    let mut errors = Vec::new();
+    for file in &tree.files {
+        for item in &file.items.items {
+            let Some(open) = item
+                .body
+                .filter(|_| item.kind == outline::item::ItemKind::Fn)
+            else {
+                continue;
+            };
+            match crate::body::parse(&file.source, open, crate::body::Config::default()) {
+                Ok(_) => parsed += 1,
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+    }
+    (parsed, errors)
+}
+
+fn report_bodies(outline: &outline::Outline, threads: usize) {
+    let started = Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(Vec::new());
+    crate::sync::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                while let Some(tree) = outline
+                    .crates
+                    .get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    let result = parse_bodies(tree);
+                    crate::sync::lock(&results).push(result);
+                }
+            });
+        }
+    });
+    let results = crate::sync::into_inner(results);
+    let parsed: usize = results.iter().map(|(parsed, _)| parsed).sum();
+    let errors: Vec<&String> = results.iter().flat_map(|(_, errors)| errors).collect();
+    for error in &errors {
+        eprintln!("body error: {error}");
+    }
+    eprintln!(
+        "bodies {parsed} parsed, {} failed in {:.1} ms",
+        errors.len(),
+        started.elapsed().as_secs_f64() * 1e3
+    );
+}
+
+fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
+    let elapsed = started.elapsed();
+    let mut total = 0;
+    for (index, krate) in names.crates.iter().enumerate() {
+        total += krate.unresolved.len();
+        let tree = &outline.crates[index];
+        for entry in krate.unresolved.iter().take(3) {
+            let file = &tree.files[entry.file as usize];
+            let import = &file.items.imports[entry.import as usize];
+            let path: Vec<&str> = import.path.iter().map(|at| file.source.text(*at)).collect();
+            eprintln!(
+                "unresolved {} in {}: {}",
+                outline.roots[index].name,
+                file.source.path.display(),
+                path.join("::")
+            );
+        }
+    }
+    let bindings: usize = names
+        .crates
+        .iter()
+        .flat_map(|krate| &krate.scopes)
+        .map(|scope| scope.names.len())
+        .sum();
+    eprintln!(
+        "names {bindings} names, {total} unresolved imports in {:.1} ms",
+        elapsed.as_secs_f64() * 1e3
+    );
+}
+
+fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
+    for (index, krate) in names
+        .crates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| outline.roots[*index].name == name)
+    {
+        let mut keys: Vec<String> = krate.scopes[0]
+            .names
+            .iter()
+            .map(|(name, entry)| {
+                format!(
+                    "{}:{}{}{}",
+                    names.symbols.text(*name),
+                    u8::from(entry.types.is_some()),
+                    u8::from(entry.values.is_some()),
+                    u8::from(entry.macros.is_some())
+                )
+            })
+            .collect();
+        keys.sort();
+        println!(
+            "scope {index} {}: {}",
+            outline.roots[index].name,
+            keys.join(" ")
+        );
+    }
+}
+
+fn report_failures(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let mut build = crate::build::Build::load(workspace, targets)?;
+    build.compile_binary(workspace)?;
+    let failures = build.failures()?;
+    failure_lines(&failures)
+        .iter()
+        .for_each(|line| println!("{line}"));
+    eprintln!(
+        "{} functions failed in {} groups",
+        failures.values().map(Vec::len).sum::<usize>(),
+        failures.len()
+    );
+    std::mem::forget(build);
+    Ok(())
+}
+
+pub(super) fn report_query(
+    query: Query,
+    (workspace, targets): (&graph::Workspace, &Targets),
+    argv: &[String],
+) -> Result<()> {
+    match query {
+        Query::Graph => Ok(print_graph(workspace)),
+        Query::Outline => report_outline(workspace, targets, crate::jobs()),
+        Query::Lazy => report_lazy(workspace, targets),
+        Query::Typeck => report_typeck(workspace, targets),
+        Query::Scope => {
+            let name = argv.get(1).with_context(usage)?;
+            let compilation = crate::macros::load_eager(workspace, targets, &[])?;
+            print_scope(&compilation.outline, &compilation.names, name);
+            Ok(())
+        }
+        Query::Failures => report_failures(workspace, targets),
+        Query::Code => crate::dump::write(
+            workspace,
+            targets,
+            std::path::Path::new(argv.get(1).with_context(usage)?),
+        ),
+        Query::Items | Query::Expand => Ok(()),
+    }
+}

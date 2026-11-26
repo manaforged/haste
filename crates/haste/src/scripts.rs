@@ -36,7 +36,15 @@ fn settle_inner(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
     let mut dag = ScriptDag::new(workspace);
     let mut ran = known(workspace);
     let mut kept_queue = dag.initial_ready(workspace);
-    drain_kept(workspace, targets, &mut dag, &mut kept_queue, &mut ran, &mut failed, None);
+    drain_kept(
+        workspace,
+        targets,
+        &mut dag,
+        &mut kept_queue,
+        &mut ran,
+        &mut failed,
+        None,
+    );
     loop {
         let mut ready = dag.ready_build_units(workspace, &failed);
         if ready.is_empty() {
@@ -52,15 +60,36 @@ fn settle_inner(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
                 kept_queue.push_back(unit);
             }
         }
-        drain_kept(workspace, targets, &mut dag, &mut kept_queue, &mut ran, &mut failed, Some(&mut locks));
-        let mut wave: Vec<usize> = ready.into_iter().filter(|unit| workspace.graph.units[*unit].script.is_none() && !failed.contains(unit)).collect();
+        drain_kept(
+            workspace,
+            targets,
+            &mut dag,
+            &mut kept_queue,
+            &mut ran,
+            &mut failed,
+            Some(&mut locks),
+        );
+        let mut wave: Vec<usize> = ready
+            .into_iter()
+            .filter(|unit| workspace.graph.units[*unit].script.is_none() && !failed.contains(unit))
+            .collect();
         if wave.is_empty() {
             continue;
         }
-        wave.sort_by_key(|&unit| std::cmp::Reverse((dag.build_users[unit].len(), dag.links_users[unit].len())));
+        wave.sort_by_key(|&unit| {
+            std::cmp::Reverse((dag.build_users[unit].len(), dag.links_users[unit].len()))
+        });
         let outcome = run(workspace, targets, &wave, &dag, &mut locks, &mut ran)?;
         drop(locks);
-        finish_wave(workspace, &wave, outcome, &mut dag, &mut ran, &mut failed, &mut kept_queue);
+        finish_wave(
+            workspace,
+            &wave,
+            outcome,
+            &mut dag,
+            &mut ran,
+            &mut failed,
+            &mut kept_queue,
+        );
     }
 }
 
@@ -77,8 +106,13 @@ impl ScriptDag {
     fn new(workspace: &Workspace) -> Self {
         let units = &workspace.graph.units;
         let n = units.len();
-        let is_script: Vec<bool> = units.iter().map(|entry| workspace.packages[entry.package].manifest.build.is_some()).collect();
-        let script_units: Vec<usize> = (0..n).filter(|&u| is_script[u] && units[u].script.is_none()).collect();
+        let is_script: Vec<bool> = units
+            .iter()
+            .map(|entry| workspace.packages[entry.package].manifest.build.is_some())
+            .collect();
+        let script_units: Vec<usize> = (0..n)
+            .filter(|&u| is_script[u] && units[u].script.is_none())
+            .collect();
         let mut build_deps = vec![Vec::new(); n];
         let mut build_users = vec![Vec::new(); n];
         let mut links_users = vec![Vec::new(); n];
@@ -99,7 +133,10 @@ impl ScriptDag {
                     && dep != unit
                     && is_script[dep]
                     && units[dep].script.is_none()
-                    && workspace.packages[units[dep].package].manifest.links.is_some()
+                    && workspace.packages[units[dep].package]
+                        .manifest
+                        .links
+                        .is_some()
                     && seen_links.insert(dep)
                 {
                     links_users[dep].push(unit);
@@ -107,13 +144,23 @@ impl ScriptDag {
                 }
             }
         }
-        Self { build_deps, build_users, links_users, build_rem, links_rem, script_units }
+        Self {
+            build_deps,
+            build_users,
+            links_users,
+            build_rem,
+            links_rem,
+            script_units,
+        }
     }
 
     fn initial_ready(&self, workspace: &Workspace) -> VecDeque<usize> {
         let mut ready = VecDeque::new();
         for &unit in &self.script_units {
-            if workspace.graph.units[unit].script.is_none() && self.build_rem[unit] == 0 && self.links_rem[unit] == 0 {
+            if workspace.graph.units[unit].script.is_none()
+                && self.build_rem[unit] == 0
+                && self.links_rem[unit] == 0
+            {
                 ready.push_back(unit);
             }
         }
@@ -134,16 +181,30 @@ impl ScriptDag {
         if ready.is_empty() { pending } else { ready }
     }
 
-    fn finish_unit(&mut self, workspace: &Workspace, failed: &HashSet<usize>, unit: usize, kept_queue: &mut VecDeque<usize>) {
+    fn finish_unit(
+        &mut self,
+        workspace: &Workspace,
+        failed: &HashSet<usize>,
+        unit: usize,
+        kept_queue: &mut VecDeque<usize>,
+    ) {
         for &user in &self.build_users[unit] {
             self.build_rem[user] = self.build_rem[user].saturating_sub(1);
-            if self.build_rem[user] == 0 && self.links_rem[user] == 0 && workspace.graph.units[user].script.is_none() && !failed.contains(&user) {
+            if self.build_rem[user] == 0
+                && self.links_rem[user] == 0
+                && workspace.graph.units[user].script.is_none()
+                && !failed.contains(&user)
+            {
                 kept_queue.push_back(user);
             }
         }
         for &user in &self.links_users[unit] {
             self.links_rem[user] = self.links_rem[user].saturating_sub(1);
-            if self.build_rem[user] == 0 && self.links_rem[user] == 0 && workspace.graph.units[user].script.is_none() && !failed.contains(&user) {
+            if self.build_rem[user] == 0
+                && self.links_rem[user] == 0
+                && workspace.graph.units[user].script.is_none()
+                && !failed.contains(&user)
+            {
                 kept_queue.push_back(user);
             }
         }
@@ -169,7 +230,9 @@ fn drain_kept(
             continue;
         }
         let unit_vars = vars(workspace, targets, unit, ran);
-        let Some(kept) = store::kept(workspace, unit, &unit_vars) else { continue };
+        let Some(kept) = store::kept(workspace, unit, &unit_vars) else {
+            continue;
+        };
         match kept {
             Ok(output) => {
                 let output = Arc::new(output);
@@ -210,7 +273,9 @@ fn finish_wave(
         }
     }
     for (unit, failure) in errors {
-        let retried = failure.broken.is_some_and(|at| wave_set.contains(&at) && workspace.graph.units[at].script.is_some());
+        let retried = failure
+            .broken
+            .is_some_and(|at| wave_set.contains(&at) && workspace.graph.units[at].script.is_some());
         if !retried {
             give_up(workspace, unit, &failure, failed);
             dag.finish_unit(workspace, failed, unit, kept_queue);
@@ -247,26 +312,48 @@ struct Failure {
 
 impl From<String> for Failure {
     fn from(error: String) -> Failure {
-        Failure { error, broken: None, interrupted: false }
+        Failure {
+            error,
+            broken: None,
+            interrupted: false,
+        }
     }
 }
 
 /// The script outputs that units already have.
 fn known(workspace: &Workspace) -> Ran {
     let units = workspace.graph.units.iter().enumerate();
-    units.filter_map(|(unit, entry)| Some((unit, entry.script.clone()?))).collect()
+    units
+        .filter_map(|(unit, entry)| Some((unit, entry.script.clone()?)))
+        .collect()
 }
 
 /// The `DEP_<links>_<key>` variables that the `links` dependencies of `unit` printed, from `ran` in this run.
 fn metadata(workspace: &Workspace, unit: usize, ran: &Ran) -> Vec<(String, String)> {
-    let deps = workspace.graph.units[unit].deps.iter().filter(|(_, _, kind)| *kind == Kind::Normal).map(|(_, dep, _)| *dep);
-    let linked = deps.filter_map(|dep| Some((workspace.packages[workspace.graph.units[dep].package].manifest.links.as_deref()?, ran.get(&dep)?)));
-    linked.flat_map(|(links, output)| script::dep_vars(links, output)).collect()
+    let deps = workspace.graph.units[unit]
+        .deps
+        .iter()
+        .filter(|(_, _, kind)| *kind == Kind::Normal)
+        .map(|(_, dep, _)| *dep);
+    let linked = deps.filter_map(|dep| {
+        Some((
+            workspace.packages[workspace.graph.units[dep].package]
+                .manifest
+                .links
+                .as_deref()?,
+            ran.get(&dep)?,
+        ))
+    });
+    linked
+        .flat_map(|(links, output)| script::dep_vars(links, output))
+        .collect()
 }
 
 /// The name of the package of `unit`.
 fn package_name(workspace: &Workspace, unit: usize) -> &str {
-    &workspace.packages[workspace.graph.units[unit].package].locked.name
+    &workspace.packages[workspace.graph.units[unit].package]
+        .locked
+        .name
 }
 
 type Ran = rustc_hash::FxHashMap<usize, Arc<Output>>;
@@ -279,15 +366,42 @@ enum Start {
 }
 
 /// Builds and runs the scripts of the units `units`, each from its kept executable while its crates hash the same, else in children that compile each function on its first call, keeping the executable of each script that ran before.
-fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDag, locks: &mut HashMap<usize, store::Lock>, ran: &mut Ran) -> Result<Outcome> {
-    let host_targets = Targets { target: targets.host.clone(), host: targets.host.clone() };
+fn run(
+    workspace: &Workspace,
+    targets: &Targets,
+    units: &[usize],
+    dag: &ScriptDag,
+    locks: &mut HashMap<usize, store::Lock>,
+    ran: &mut Ran,
+) -> Result<Outcome> {
+    let host_targets = Targets {
+        target: targets.host.clone(),
+        host: targets.host.clone(),
+    };
     let mut compilation = crate::macros::load_eager(workspace, &host_targets, units)?;
     let outline = &compilation.outline;
-    let scripts: Vec<(usize, usize)> = outline.roots.iter().enumerate().filter(|(_, root)| root.role == Role::Script).map(|(krate, root)| (root.unit, krate)).collect();
+    let scripts: Vec<(usize, usize)> = outline
+        .roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| root.role == Role::Script)
+        .map(|(krate, root)| (root.unit, krate))
+        .collect();
     let binaries = Binaries::new(workspace, outline, &scripts);
-    let kept: Vec<Kept> = scripts.iter().map(|&(unit, _)| binaries.kept(workspace, unit)).collect();
-    let compiled: Vec<(usize, usize)> = scripts.iter().zip(&kept).filter(|(_, kept)| !matches!(kept, Kept::Executable(_))).map(|(script, _)| *script).collect();
-    let mains: Vec<Option<crate::names::ItemRef>> = compiled.iter().map(|(_, krate)| outline.main(*krate)).collect();
+    let kept: Vec<Kept> = scripts
+        .iter()
+        .map(|&(unit, _)| binaries.kept(workspace, unit))
+        .collect();
+    let compiled: Vec<(usize, usize)> = scripts
+        .iter()
+        .zip(&kept)
+        .filter(|(_, kept)| !matches!(kept, Kept::Executable(_)))
+        .map(|(script, _)| *script)
+        .collect();
+    let mains: Vec<Option<crate::names::ItemRef>> = compiled
+        .iter()
+        .map(|(_, krate)| outline.main(*krate))
+        .collect();
     let owners = outline.roots.iter().map(|root| root.unit).collect();
     let (slot, cache) = if sysroot_scripts_settled(workspace) {
         crate::build::substrate::cache_with_toolchain_substrate(workspace)
@@ -304,9 +418,17 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
     }
     let mut entries_map: HashMap<usize, Result<Start, String>> = HashMap::default();
     for (&(unit, _), entry) in compiled.iter().zip(entries) {
-        entries_map.insert(unit, entry.map(|pair| Start::Jit(pair.map(|root| demand.declare(root)))));
+        entries_map.insert(
+            unit,
+            entry.map(|pair| Start::Jit(pair.map(|root| demand.declare(root)))),
+        );
     }
-    let missing: HashSet<usize> = scripts.iter().zip(&kept).filter(|(_, kept)| matches!(kept, Kept::Missing)).map(|(&(unit, _), _)| unit).collect();
+    let missing: HashSet<usize> = scripts
+        .iter()
+        .zip(&kept)
+        .filter(|(_, kept)| matches!(kept, Kept::Missing))
+        .map(|(&(unit, _), _)| unit)
+        .collect();
     for (&(unit, _), kept) in scripts.iter().zip(kept) {
         if let Kept::Executable(path) = kept {
             entries_map.insert(unit, Ok(Start::Executable(path)));
@@ -318,7 +440,10 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
     let mut active_build_rem = HashMap::default();
     for &(unit, _) in &scripts {
         let lrem = dag.links_rem[unit];
-        let brem = dag.build_deps[unit].iter().filter(|dep| unit_set.contains(dep)).count();
+        let brem = dag.build_deps[unit]
+            .iter()
+            .filter(|dep| unit_set.contains(dep))
+            .count();
         wave_links_rem.insert(unit, lrem);
         active_build_rem.insert(unit, brem);
         if lrem == 0 && brem == 0 {
@@ -345,12 +470,30 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
         reran: HashSet::default(),
         executables: HashSet::default(),
     };
-    image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;
+    image::serve(
+        &mut compilation,
+        &crate::macros::load,
+        &mut demand,
+        &mut driver,
+    )?;
     if let Some(slot) = slot {
-        crate::build::substrate::save_jit_substrate(&compilation.outline, demand.store(), demand.image(), slot);
+        crate::build::substrate::save_jit_substrate(
+            &compilation.outline,
+            demand.store(),
+            demand.image(),
+            slot,
+        );
     }
     let Runs { outcome, reran, .. } = driver;
-    let rerun: Vec<(usize, usize)> = scripts.into_iter().filter(|(unit, _)| reran.contains(unit) && outcome.iter().any(|(at, result)| at == unit && result.is_ok())).collect();
+    let rerun: Vec<(usize, usize)> = scripts
+        .into_iter()
+        .filter(|(unit, _)| {
+            reran.contains(unit)
+                && outcome
+                    .iter()
+                    .any(|(at, result)| at == unit && result.is_ok())
+        })
+        .collect();
     if let Err(error) = binaries.keep_detached(workspace, &mut compilation, &rerun, locks) {
         eprintln!("cannot keep the executables of build scripts: {error}");
     }
@@ -378,7 +521,12 @@ struct Runs<'w, 'l> {
 
 impl Runs<'_, '_> {
     fn next(&mut self) -> Option<(usize, Result<Start, String>)> {
-        let unit = self.ready.pop_front().or_else(|| self.running.is_empty().then(|| (!self.waiting.is_empty()).then(|| self.waiting.remove(0))).flatten())?;
+        let unit = self.ready.pop_front().or_else(|| {
+            self.running
+                .is_empty()
+                .then(|| (!self.waiting.is_empty()).then(|| self.waiting.remove(0)))
+                .flatten()
+        })?;
         let entry = self.entries.remove(&unit)?;
         Some((unit, entry))
     }
@@ -419,14 +567,23 @@ impl Driver for Runs<'_, '_> {
             if self.missing.contains(&unit) && binary::ran_before(self.workspace, unit) {
                 self.reran.insert(unit);
             }
-            let script = entry.map_err(Failure::from).and_then(|start| Ok((job(self.workspace, self.targets, unit, &start, &self.ran)?, start)));
+            let script = entry.map_err(Failure::from).and_then(|start| {
+                Ok((
+                    job(self.workspace, self.targets, unit, &start, &self.ran)?,
+                    start,
+                ))
+            });
             match script {
                 Ok((script, start)) => {
                     let id = match &start {
-                        Start::Jit(_) => demand.fork(true, |image, out| out.map_or(101, |out| image.enter_script(&script, out)))?,
+                        Start::Jit(_) => demand.fork(true, |image, out| {
+                            out.map_or(101, |out| image.enter_script(&script, out))
+                        })?,
                         Start::Executable(path) => {
                             self.executables.insert(unit);
-                            demand.fork(true, |_, out| out.map_or(101, |out| binary::exec(path, &script, out)))?
+                            demand.fork(true, |_, out| {
+                                out.map_or(101, |out| binary::exec(path, &script, out))
+                            })?
                         }
                     };
                     self.running.push((id, unit, script));
@@ -446,16 +603,33 @@ impl Driver for Runs<'_, '_> {
         };
         let (_, unit, script) = self.running.swap_remove(at);
         let result = match (ended.status, ended.failure) {
-            (0, _) => String::from_utf8(ended.bytes).map(|text| finished(self.workspace, unit, &script, &text)).map_err(|error| Failure::from(format!("printed output that is not UTF-8: {error}"))),
-            (_, Some((error, item))) => Err(Failure { error: format!("does not build: {error}"), broken: self.owners.get(item.krate as usize).copied(), interrupted: false }),
-            (status, None) => Err(Failure { interrupted: crate::image::interrupted(status), ..Failure::from(format!("exited with status {status}; its errors are in {}", script.log.display())) }),
+            (0, _) => String::from_utf8(ended.bytes)
+                .map(|text| finished(self.workspace, unit, &script, &text))
+                .map_err(|error| {
+                    Failure::from(format!("printed output that is not UTF-8: {error}"))
+                }),
+            (_, Some((error, item))) => Err(Failure {
+                error: format!("does not build: {error}"),
+                broken: self.owners.get(item.krate as usize).copied(),
+                interrupted: false,
+            }),
+            (status, None) => Err(Failure {
+                interrupted: crate::image::interrupted(status),
+                ..Failure::from(format!(
+                    "exited with status {status}; its errors are in {}",
+                    script.log.display()
+                ))
+            }),
         };
         let result = result.map_err(|failure| {
             if !self.executables.contains(&unit) {
                 return failure;
             }
             binary::distrust(self.workspace, unit);
-            Failure { interrupted: true, ..failure }
+            Failure {
+                interrupted: true,
+                ..failure
+            }
         });
         if let Ok(output) = &result {
             self.ran.insert(unit, output.clone());
@@ -469,12 +643,21 @@ impl Driver for Runs<'_, '_> {
 /// The output of a script that exited cleanly, kept in the store for later runs.
 fn finished(workspace: &Workspace, unit: usize, job: &Script, text: &str) -> Arc<Output> {
     if let Err(error) = store::keep(workspace, unit, &job.vars, text) {
-        eprintln!("cannot keep the output of {}'s build script: {error}", package_name(workspace, unit));
+        eprintln!(
+            "cannot keep the output of {}'s build script: {error}",
+            package_name(workspace, unit)
+        );
     }
     Arc::new(Output::parse(text))
 }
 
-fn job(workspace: &Workspace, targets: &Targets, unit: usize, start: &Start, ran: &Ran) -> Result<Script, Failure> {
+fn job(
+    workspace: &Workspace,
+    targets: &Targets,
+    unit: usize,
+    start: &Start,
+    ran: &Ran,
+) -> Result<Script, Failure> {
     let entry = match start {
         Start::Jit([start, main]) => (*start, *main),
         Start::Executable(_) => (0, 0),
@@ -484,5 +667,10 @@ fn job(workspace: &Workspace, targets: &Targets, unit: usize, start: &Start, ran
     made.map_err(|error| Failure::from(format!("cannot make {}: {error}", dir.display())))?;
     let vars = script::script_vars(workspace, targets, unit, &metadata(workspace, unit, ran));
     let package = &workspace.packages[workspace.graph.units[unit].package].manifest;
-    Ok(Script { entry, vars, dir: package.dir.clone(), log: dir.join("stderr") })
+    Ok(Script {
+        entry,
+        vars,
+        dir: package.dir.clone(),
+        log: dir.join("stderr"),
+    })
 }

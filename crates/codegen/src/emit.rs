@@ -1,8 +1,8 @@
+use crate::Site;
 use crate::alloc::{Location, Plan, Regs};
 use crate::frame::{Abi, Emitter, Frame, Loc, ShrinkWrap};
 use crate::ir::{Binary, Block, Function, Inst, Op, SigRef, Value};
 use crate::park::ParkReg;
-use crate::Site;
 use std::ops::Range;
 
 const LOOP_SPAN: u32 = 256;
@@ -14,9 +14,14 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn abi(&self) -> &Abi<R>;
     fn shrink(&self) -> Option<&ShrinkWrap>;
     fn in_fast(&self) -> bool;
-    fn is_fast(&self, block: Block) -> bool { self.shrink().is_some_and(|s| s.fast[block.index()]) }
+    fn is_fast(&self, block: Block) -> bool {
+        self.shrink().is_some_and(|s| s.fast[block.index()])
+    }
     fn is_split_ret(&self, block: Block) -> bool {
-        self.in_fast() && self.shrink().is_some_and(|s| s.split_ret[self.func().jump_target(block).index()])
+        self.in_fast()
+            && self
+                .shrink()
+                .is_some_and(|s| s.split_ret[self.func().jump_target(block).index()])
     }
     fn exits_fast(&self, block: Block) -> bool {
         self.in_fast() && !self.is_fast(block) && !self.is_split_ret(block)
@@ -35,7 +40,13 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn jump_label(&mut self, label: L);
     fn branch_cond(&mut self, condition: Value, invert: bool, label: L);
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String>;
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi<R>, String>;
+    fn arguments(
+        &mut self,
+        sig: SigRef,
+        callee: Value,
+        args: &[Value],
+        is_try: bool,
+    ) -> Result<Abi<R>, String>;
     fn store_locs(&mut self, values: &[Value], locs: &[Loc<R>]);
     fn store_loc(&mut self, value: Value, loc: Loc<R>);
     fn load_incoming(&mut self, value: Value, offset: u32);
@@ -49,7 +60,9 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn set_spill_cache(&mut self, cache: crate::spills::SpillCache<R>);
     fn record_edge_spill(&mut self, target: Block, cache: crate::spills::SpillCache<R>);
     /// Places a branch island here when pending short branches near their range.
-    fn island(&mut self) -> Result<(), String> { Ok(()) }
+    fn island(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -73,7 +86,10 @@ pub(crate) struct Tails<'a, L> {
 
 impl<L> Tails<'_, L> {
     pub(crate) fn new() -> Self {
-        Self { stubs: Vec::new(), cold: None }
+        Self {
+            stubs: Vec::new(),
+            cold: None,
+        }
     }
 
     fn colder(&mut self, func: &Function, condition: Value, edge: Block, other: Block) -> bool {
@@ -83,10 +99,12 @@ impl<L> Tails<'_, L> {
         }
         let cfg = func.cfg();
         let loops = cfg.loops();
-        let branches = |from: &&Block| {
-            matches!(func.last(**from), Some(Op::Brif(test, a, _, b, _)) if *test == condition && ((*a == edge && *b == other) || (*a == other && *b == edge)))
+        let branches = |from: &&Block| matches!(func.last(**from), Some(Op::Brif(test, a, _, b, _)) if *test == condition && ((*a == edge && *b == other) || (*a == other && *b == edge)));
+        let leaves = |from: &Block| {
+            loops.list.iter().any(|each| {
+                each.body[from.index()] && each.body[other.index()] && !each.body[edge.index()]
+            })
         };
-        let leaves = |from: &Block| loops.list.iter().any(|each| each.body[from.index()] && each.body[other.index()] && !each.body[edge.index()]);
         let mut froms = cfg.preds_of(other).iter().filter(branches).peekable();
         froms.peek().is_some() && froms.all(leaves)
     }
@@ -102,9 +120,20 @@ pub(crate) fn loop_spans(func: &Function, order: &[Block], starts: &[u32]) -> Ve
     loops
         .list
         .iter()
-        .filter(|each| each.body.iter().zip(&loops.depths).all(|(inside, depth)| !inside || *depth <= each.depth))
+        .filter(|each| {
+            each.body
+                .iter()
+                .zip(&loops.depths)
+                .all(|(inside, depth)| !inside || *depth <= each.depth)
+        })
         .filter_map(|each| {
-            let spans = || each.body.iter().zip(&placed).filter(|(inside, _)| **inside).filter_map(|(_, span)| span.clone());
+            let spans = || {
+                each.body
+                    .iter()
+                    .zip(&placed)
+                    .filter(|(inside, _)| **inside)
+                    .filter_map(|(_, span)| span.clone())
+            };
             let start = spans().map(|span| span.start).min()?;
             let end = spans().map(|span| span.end).max()?;
             (end - start <= LOOP_SPAN).then_some(start..end)
@@ -112,8 +141,15 @@ pub(crate) fn loop_spans(func: &Function, order: &[Block], starts: &[u32]) -> Ve
         .collect()
 }
 
-pub(crate) fn intake_params<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E, entry: Block) -> Result<(), String> {
-    let params = emit.func().blocks[entry.index()].params.iter().copied().zip(emit.abi().params.clone());
+pub(crate) fn intake_params<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    entry: Block,
+) -> Result<(), String> {
+    let params = emit.func().blocks[entry.index()]
+        .params
+        .iter()
+        .copied()
+        .zip(emit.abi().params.clone());
     let (registers, memory): (Vec<_>, Vec<_>) = params.partition(|(value, _)| {
         let plan = emit.plan();
         plan.reg_of(*value).is_some() || plan.float_of(*value).is_some()
@@ -128,7 +164,11 @@ pub(crate) fn intake_params<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, 
     Ok(())
 }
 
-pub(crate) fn emit_goto<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E, block: Block, last: bool) {
+pub(crate) fn emit_goto<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    block: Block,
+    last: bool,
+) {
     let target = emit.func().jump_target(block);
     if last && (emit.next_block() == Some(block) || emit.next_block() == Some(target)) {
         return;
@@ -144,17 +184,42 @@ fn push_stub<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     kind: StubKind,
 ) -> L {
     let label = emit.new_label();
-    emit.tails().stubs.push(Stub { label, block, args, kind });
+    emit.tails().stubs.push(Stub {
+        label,
+        block,
+        args,
+        kind,
+    });
     label
 }
 
 fn falls<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &E, block: Block) -> bool {
-    emit.next_block().is_some_and(|next| next == block || next == emit.func().jump_target(block))
+    emit.next_block()
+        .is_some_and(|next| next == block || next == emit.func().jump_target(block))
 }
 
-/// Whether `block` closes a loop by branching back to its header.
 fn is_latch(func: &Function, block: Block) -> bool {
-    func.cfg().loops().list.iter().any(|each| each.latches.contains(&block))
+    func.cfg()
+        .loops()
+        .list
+        .iter()
+        .any(|each| each.latches.contains(&block))
+}
+
+fn emit_plain_stub_branch<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    invert: bool,
+    stub: (Block, &'a [Value]),
+    hot: (Block, &'a [Value]),
+) -> Result<(), String> {
+    let label = push_stub(emit, stub.0, stub.1, StubKind::Plain);
+    emit.branch_cond(condition, invert, label);
+    emit.edge(hot.0, hot.1)?;
+    let cache = emit.spill_cache();
+    emit.record_edge_spill(hot.0, cache);
+    emit_goto(emit, hot.0, true);
+    Ok(())
 }
 
 fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
@@ -167,26 +232,24 @@ fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         return Ok(false);
     }
     let func = emit.func();
-    let (cold, hot, hot_moves, invert) = if then_moves && emit.tails().colder(func, condition, then.0, otherwise.0) {
-        (then, otherwise, else_moves, false)
-    } else if else_moves && emit.tails().colder(func, condition, otherwise.0, then.0) {
-        (otherwise, then, then_moves, true)
-    } else {
-        return Ok(false);
-    };
+    let (cold, hot, hot_moves, invert) =
+        if then_moves && emit.tails().colder(func, condition, then.0, otherwise.0) {
+            (then, otherwise, else_moves, false)
+        } else if else_moves && emit.tails().colder(func, condition, otherwise.0, then.0) {
+            (otherwise, then, then_moves, true)
+        } else {
+            return Ok(false);
+        };
     if !hot_moves && !falls(emit, hot.0) {
         return Ok(false);
     }
-    let label = push_stub(emit, cold.0, cold.1, StubKind::Plain);
-    emit.branch_cond(condition, invert, label);
-    emit.edge(hot.0, hot.1)?;
-    let cache = emit.spill_cache();
-    emit.record_edge_spill(hot.0, cache);
-    emit_goto(emit, hot.0, true);
+    emit_plain_stub_branch(emit, condition, invert, cold, hot)?;
     Ok(true)
 }
 
-pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E) -> Result<(), String> {
+pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+) -> Result<(), String> {
     for stub in std::mem::take(&mut emit.tails().stubs) {
         emit.island()?;
         emit.clear_flags();
@@ -221,11 +284,22 @@ fn simple_move_val<R: Copy + PartialEq>(func: &Function, plan: &Plan<R>, v: Valu
         && (func.ty(v).is_small_int() || func.ty(v).is_float())
 }
 
-fn hoistable_move<R: Copy + PartialEq>(func: &Function, plan: &Plan<R>, arg: Value, param: Value) -> bool {
+fn hoistable_move<R: Copy + PartialEq>(
+    func: &Function,
+    plan: &Plan<R>,
+    arg: Value,
+    param: Value,
+) -> bool {
     simple_move_val(func, plan, arg)
         && simple_move_val(func, plan, param)
-        && matches!(plan.locations[arg.index()], Location::Reg(_) | Location::Float(_) | Location::Slot)
-        && matches!(plan.locations[param.index()], Location::Reg(_) | Location::Float(_))
+        && matches!(
+            plan.locations[arg.index()],
+            Location::Reg(_) | Location::Float(_) | Location::Slot
+        )
+        && matches!(
+            plan.locations[param.index()],
+            Location::Reg(_) | Location::Float(_)
+        )
 }
 
 fn hoist_common_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
@@ -238,22 +312,37 @@ fn hoist_common_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         return Ok(false);
     }
     let (func, plan, frame) = (emit.func(), emit.plan(), emit.frame());
-    let then_steps = crate::frame::edge_steps(func, &plan.locations, &frame.values, then.1, &func.blocks[then.0.index()].params);
-    let else_steps = crate::frame::edge_steps(func, &plan.locations, &frame.values, otherwise.1, &func.blocks[otherwise.0.index()].params);
+    let then_steps = crate::frame::edge_steps(
+        func,
+        &plan.locations,
+        &frame.values,
+        then.1,
+        &func.blocks[then.0.index()].params,
+    );
+    let else_steps = crate::frame::edge_steps(
+        func,
+        &plan.locations,
+        &frame.values,
+        otherwise.1,
+        &func.blocks[otherwise.0.index()].params,
+    );
     if then_steps.is_empty() || then_steps.len() != else_steps.len() {
         return Ok(false);
     }
-    let same = then_steps.iter().zip(&else_steps).all(|(ts, es)| match (ts, es) {
-        (crate::frame::Step::Move(ta, tp), crate::frame::Step::Move(ea, ep)) => {
-            plan.same_home(frame, *ta, *ea)
-                && plan.same_home(frame, *tp, *ep)
-                && func.ty(*ta).bytes() == func.ty(*ea).bytes()
-                && func.ty(*tp).bytes() == func.ty(*ep).bytes()
-                && hoistable_move(func, plan, *ta, *tp)
-                && plan.hoist.reads_free(plan.locations[tp.index()], condition)
-        }
-        _ => false,
-    });
+    let same = then_steps
+        .iter()
+        .zip(&else_steps)
+        .all(|(ts, es)| match (ts, es) {
+            (crate::frame::Step::Move(ta, tp), crate::frame::Step::Move(ea, ep)) => {
+                plan.same_home(frame, *ta, *ea)
+                    && plan.same_home(frame, *tp, *ep)
+                    && func.ty(*ta).bytes() == func.ty(*ea).bytes()
+                    && func.ty(*tp).bytes() == func.ty(*ep).bytes()
+                    && hoistable_move(func, plan, *ta, *tp)
+                    && plan.hoist.reads_free(plan.locations[tp.index()], condition)
+            }
+            _ => false,
+        });
     if !same {
         return Ok(false);
     }
@@ -261,7 +350,6 @@ fn hoist_common_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     Ok(true)
 }
 
-/// Runs the moves of a back edge to loop head `moved` whose other edge leaves that loop ahead of the branch, when each copies a register or stack home into a register that neither `plain` nor the condition reads, so the branch reaches `moved` without a jump of its own.
 fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
@@ -271,7 +359,10 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     if emit.in_fast() || falls(emit, moved.0) {
         return Ok(false);
     }
-    let closes = emit.func().cfg().loops().list.iter().any(|each| each.head == moved.0 && !each.body.get(plain.index()).copied().unwrap_or(true));
+    let closes =
+        emit.func().cfg().loops().list.iter().any(|each| {
+            each.head == moved.0 && !each.body.get(plain.index()).copied().unwrap_or(true)
+        });
     if !closes {
         return Ok(false);
     }
@@ -280,7 +371,9 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     let hoistable = moved.1.iter().zip(params).all(|(&arg, &param)| {
         plan.same_home(frame, arg, param)
             || (hoistable_move(func, plan, arg, param)
-                && plan.hoist.free(plan.locations[param.index()], plain, condition))
+                && plan
+                    .hoist
+                    .free(plan.locations[param.index()], plain, condition))
     });
     if !hoistable {
         return Ok(false);
@@ -295,145 +388,116 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     Ok(true)
 }
 
-pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+#[derive(Clone, Copy)]
+enum FastDest {
+    Fast,
+    SplitRet,
+    Slow,
+}
+
+fn fast_dest<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &E,
+    block: Block,
+) -> FastDest {
+    if emit.is_fast(block) {
+        FastDest::Fast
+    } else if emit.is_split_ret(block) {
+        FastDest::SplitRet
+    } else {
+        FastDest::Slow
+    }
+}
+
+fn emit_const_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    known: i64,
+    then: (Block, &'a [Value]),
+    otherwise: (Block, &'a [Value]),
+) -> Result<(), String> {
+    let (block, args) = if crate::fold::extend(known, emit.func().ty(condition), false) != 0 {
+        then
+    } else {
+        otherwise
+    };
+    if emit.is_split_ret(block) {
+        emit.edge(block, args)?;
+        return emit.fast_ret(block);
+    }
+    if emit.exits_fast(block) {
+        emit.prologue();
+    }
+    emit.edge(block, args)?;
+    let cache = emit.spill_cache();
+    emit.record_edge_spill(block, cache);
+    emit_goto(emit, block, true);
+    Ok(())
+}
+
+fn emit_fast_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    then: (Block, &'a [Value]),
+    otherwise: (Block, &'a [Value]),
+) -> Result<bool, String> {
+    let pair = (fast_dest(emit, then.0), fast_dest(emit, otherwise.0));
+    let (stub, stub_kind, invert, inline, inline_kind) = match pair {
+        (FastDest::Fast, FastDest::Fast) => return Ok(false),
+        (FastDest::Slow, dest) => (then, StubKind::Prologue, false, otherwise, dest),
+        (dest, FastDest::Slow) => (otherwise, StubKind::Prologue, true, then, dest),
+        (FastDest::SplitRet, dest) => (then, StubKind::FastRet, false, otherwise, dest),
+        (FastDest::Fast, FastDest::SplitRet) => {
+            if !falls(emit, then.0) && !emit.plan().moves(emit.func(), emit.frame(), then.0, then.1)
+            {
+                let target = emit.block_label(emit.func().jump_target(then.0));
+                emit.branch_cond(condition, false, target);
+                emit.edge(otherwise.0, otherwise.1)?;
+                emit.fast_ret(otherwise.0)?;
+                return Ok(true);
+            }
+            (otherwise, StubKind::FastRet, true, then, FastDest::Fast)
+        }
+    };
+    let label = push_stub(emit, stub.0, stub.1, stub_kind);
+    emit.branch_cond(condition, invert, label);
+    if matches!(inline_kind, FastDest::Slow) {
+        emit.prologue();
+    }
+    emit.edge(inline.0, inline.1)?;
+    if matches!(inline_kind, FastDest::SplitRet) {
+        emit.fast_ret(inline.0)?;
+    } else {
+        emit_goto(emit, inline.0, true);
+    }
+    Ok(true)
+}
+
+fn emit_direct_branch<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    invert: bool,
+    direct: Block,
+    (fall, fall_moves): ((Block, &'a [Value]), bool),
+) -> Result<(), String> {
+    let target = emit.block_label(emit.func().jump_target(direct));
+    emit.branch_cond(condition, invert, target);
+    let pre = emit.spill_cache();
+    emit.record_edge_spill(direct, pre);
+    if fall_moves {
+        emit.edge(fall.0, fall.1)?;
+    }
+    let post = emit.spill_cache();
+    emit.record_edge_spill(fall.0, post);
+    emit_goto(emit, fall.0, true);
+    Ok(())
+}
+
+fn emit_dual_move_branch<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
     then: (Block, &'a [Value]),
     otherwise: (Block, &'a [Value]),
 ) -> Result<(), String> {
-    if let Some(known) = emit.plan().const_of(condition) {
-        let (block, args) = if crate::fold::extend(known, emit.func().ty(condition), false) != 0 { then } else { otherwise };
-        if emit.is_split_ret(block) {
-            emit.edge(block, args)?;
-            return emit.fast_ret(block);
-        }
-        if emit.exits_fast(block) {
-            emit.prologue();
-        }
-        emit.edge(block, args)?;
-        let cache = emit.spill_cache();
-        emit.record_edge_spill(block, cache);
-        emit_goto(emit, block, true);
-        return Ok(());
-    }
-    if emit.in_fast() {
-        #[derive(Clone, Copy)]
-        enum Dest { Fast, SplitRet, Slow }
-        let kind = |b: Block| if emit.is_fast(b) { Dest::Fast } else if emit.is_split_ret(b) { Dest::SplitRet } else { Dest::Slow };
-        match (kind(then.0), kind(otherwise.0)) {
-            (Dest::Fast, Dest::Fast) => {}
-            (Dest::Slow, Dest::Fast) => {
-                let label = push_stub(emit, then.0, then.1, StubKind::Prologue);
-                emit.branch_cond(condition, false, label);
-                emit.edge(otherwise.0, otherwise.1)?;
-                emit_goto(emit, otherwise.0, true);
-                return Ok(());
-            }
-            (Dest::Fast, Dest::Slow) => {
-                let label = push_stub(emit, otherwise.0, otherwise.1, StubKind::Prologue);
-                emit.branch_cond(condition, true, label);
-                emit.edge(then.0, then.1)?;
-                emit_goto(emit, then.0, true);
-                return Ok(());
-            }
-            (Dest::Slow, Dest::SplitRet) => {
-                let label = push_stub(emit, then.0, then.1, StubKind::Prologue);
-                emit.branch_cond(condition, false, label);
-                emit.edge(otherwise.0, otherwise.1)?;
-                return emit.fast_ret(otherwise.0);
-            }
-            (Dest::SplitRet, Dest::Slow) => {
-                let label = push_stub(emit, otherwise.0, otherwise.1, StubKind::Prologue);
-                emit.branch_cond(condition, true, label);
-                emit.edge(then.0, then.1)?;
-                return emit.fast_ret(then.0);
-            }
-            (Dest::Slow, Dest::Slow) => {
-                let label = push_stub(emit, then.0, then.1, StubKind::Prologue);
-                emit.branch_cond(condition, false, label);
-                emit.prologue();
-                emit.edge(otherwise.0, otherwise.1)?;
-                emit_goto(emit, otherwise.0, true);
-                return Ok(());
-            }
-            (Dest::SplitRet, Dest::Fast) => {
-                let label = push_stub(emit, then.0, then.1, StubKind::FastRet);
-                emit.branch_cond(condition, false, label);
-                emit.edge(otherwise.0, otherwise.1)?;
-                emit_goto(emit, otherwise.0, true);
-                return Ok(());
-            }
-            (Dest::Fast, Dest::SplitRet) => {
-                if !falls(emit, then.0) && !emit.plan().moves(emit.func(), emit.frame(), then.0, then.1) {
-                    let target = emit.block_label(emit.func().jump_target(then.0));
-                    emit.branch_cond(condition, false, target);
-                    emit.edge(otherwise.0, otherwise.1)?;
-                    return emit.fast_ret(otherwise.0);
-                }
-                let label = push_stub(emit, otherwise.0, otherwise.1, StubKind::FastRet);
-                emit.branch_cond(condition, true, label);
-                emit.edge(then.0, then.1)?;
-                emit_goto(emit, then.0, true);
-                return Ok(());
-            }
-            (Dest::SplitRet, Dest::SplitRet) => {
-                let label = push_stub(emit, then.0, then.1, StubKind::FastRet);
-                emit.branch_cond(condition, false, label);
-                emit.edge(otherwise.0, otherwise.1)?;
-                return emit.fast_ret(otherwise.0);
-            }
-        }
-    }
-    let mut then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
-    let mut else_moves = emit.plan().moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
-    if then_moves && else_moves && hoist_common_moves(emit, condition, then, otherwise)? {
-        then_moves = false;
-        else_moves = false;
-    }
-    if set_aside(emit, condition, (then, then_moves), (otherwise, else_moves))? {
-        return Ok(());
-    }
-    if then_moves && !else_moves && !emit.in_fast() && falls(emit, otherwise.0) && is_latch(emit.func(), otherwise.0) {
-        let label = push_stub(emit, then.0, then.1, StubKind::Plain);
-        emit.branch_cond(condition, false, label);
-        emit.edge(otherwise.0, otherwise.1)?;
-        let cache = emit.spill_cache();
-        emit.record_edge_spill(otherwise.0, cache);
-        emit_goto(emit, otherwise.0, true);
-        return Ok(());
-    }
-    if then_moves && !else_moves && hoist_moves(emit, condition, (then, true), otherwise.0)? {
-        return Ok(());
-    }
-    if else_moves && !then_moves && hoist_moves(emit, condition, (otherwise, false), then.0)? {
-        return Ok(());
-    }
-    if !else_moves && (then_moves || falls(emit, then.0)) {
-        let target = emit.block_label(emit.func().jump_target(otherwise.0));
-        emit.branch_cond(condition, true, target);
-        let pre = emit.spill_cache();
-        emit.record_edge_spill(otherwise.0, pre);
-        if then_moves {
-            emit.edge(then.0, then.1)?;
-        }
-        let post = emit.spill_cache();
-        emit.record_edge_spill(then.0, post);
-        emit_goto(emit, then.0, true);
-        return Ok(());
-    }
-    if !then_moves {
-        let target = emit.block_label(emit.func().jump_target(then.0));
-        emit.branch_cond(condition, false, target);
-        let pre = emit.spill_cache();
-        emit.record_edge_spill(then.0, pre);
-        if else_moves {
-            emit.edge(otherwise.0, otherwise.1)?;
-        }
-        let post = emit.spill_cache();
-        emit.record_edge_spill(otherwise.0, post);
-        emit_goto(emit, otherwise.0, true);
-        return Ok(());
-    }
     let other = emit.new_label();
     emit.branch_cond(condition, true, other);
     let pre = emit.spill_cache();
@@ -450,6 +514,52 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     Ok(())
 }
 
+pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    then: (Block, &'a [Value]),
+    otherwise: (Block, &'a [Value]),
+) -> Result<(), String> {
+    if let Some(known) = emit.plan().const_of(condition) {
+        return emit_const_brif(emit, condition, known, then, otherwise);
+    }
+    if emit.in_fast() && emit_fast_brif(emit, condition, then, otherwise)? {
+        return Ok(());
+    }
+    let mut then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
+    let mut else_moves = emit
+        .plan()
+        .moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
+    if then_moves && else_moves && hoist_common_moves(emit, condition, then, otherwise)? {
+        then_moves = false;
+        else_moves = false;
+    }
+    if set_aside(emit, condition, (then, then_moves), (otherwise, else_moves))? {
+        return Ok(());
+    }
+    if then_moves
+        && !else_moves
+        && !emit.in_fast()
+        && falls(emit, otherwise.0)
+        && is_latch(emit.func(), otherwise.0)
+    {
+        return emit_plain_stub_branch(emit, condition, false, then, otherwise);
+    }
+    if then_moves && !else_moves && hoist_moves(emit, condition, (then, true), otherwise.0)? {
+        return Ok(());
+    }
+    if else_moves && !then_moves && hoist_moves(emit, condition, (otherwise, false), then.0)? {
+        return Ok(());
+    }
+    if !else_moves && (then_moves || falls(emit, then.0)) {
+        return emit_direct_branch(emit, condition, true, otherwise.0, (then, then_moves));
+    }
+    if !then_moves {
+        return emit_direct_branch(emit, condition, false, then.0, (otherwise, else_moves));
+    }
+    emit_dual_move_branch(emit, condition, then, otherwise)
+}
+
 pub(crate) fn emit_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     inst: crate::ir::Inst,
@@ -457,7 +567,13 @@ pub(crate) fn emit_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     args: &[Value],
     results: &[Value],
 ) -> Result<(), String> {
-    let parked: Vec<_> = emit.plan().parked_at(inst).iter().filter(|(value, _, _)| !emit.plan().elided[value.index()]).copied().collect();
+    let parked: Vec<_> = emit
+        .plan()
+        .parked_at(inst)
+        .iter()
+        .filter(|(value, _, _)| !emit.plan().elided[value.index()])
+        .copied()
+        .collect();
     for &(value, reg, _) in &parked {
         emit.park_spill(value, reg);
         emit.plan_mut().locations[value.index()] = Location::Slot;
@@ -494,12 +610,22 @@ pub(crate) fn emit_try_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, 
     let handler_label = emit.block_label(handler);
     emit.jump_label(handler_label);
     let frame_offset = emit.frame().size;
-    emit.push_site(Site { ret, handler: pad, frame_offset });
+    emit.push_site(Site {
+        ret,
+        handler: pad,
+        frame_offset,
+    });
     Ok(())
 }
 
 /// Whether `val` keeps its register or shared slot across instructions `start + 1..end` of block `b_idx` that `skip` does not pass over, so a fused use at `end` can still read it; false when the span exceeds `max_span`.
-pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, regs): (&Plan<R>, &Regs<R>), (b_idx, start, end, max_span): (usize, usize, usize, usize), skip: impl Fn(usize) -> bool, val: Value) -> bool {
+pub(crate) fn preserved<R: Copy + PartialEq + 'static>(
+    func: &Function,
+    (plan, regs): (&Plan<R>, &Regs<R>),
+    (b_idx, start, end, max_span): (usize, usize, usize, usize),
+    skip: impl Fn(usize) -> bool,
+    val: Value,
+) -> bool {
     if plan.elided[val.index()] {
         return false;
     }
@@ -513,7 +639,9 @@ pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, r
         Location::Reg(reg) => (Some(reg), None, None),
         Location::Float(f) => (None, Some(f), None),
         Location::Slot => {
-            let Some(id) = plan.shared.get(val.index()).copied().flatten() else { return true };
+            let Some(id) = plan.shared.get(val.index()).copied().flatten() else {
+                return true;
+            };
             (None, None, Some(id))
         }
         _ => return false,
@@ -521,16 +649,26 @@ pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, r
     let clobbers = |r: Value| {
         reg.is_some_and(|reg| plan.reg_of(r) == Some(reg))
             || freg.is_some_and(|f| plan.float_of(r) == Some(f))
-            || slot_id.is_some_and(|id| matches!(plan.location(r), Location::Slot) && plan.shared.get(r.index()).copied().flatten() == Some(id))
+            || slot_id.is_some_and(|id| {
+                matches!(plan.location(r), Location::Slot)
+                    && plan.shared.get(r.index()).copied().flatten() == Some(id)
+            })
     };
     for pos in (start + 1..end).filter(|&pos| !skip(pos)) {
         let data = &func.insts[func.blocks[b_idx].insts[pos].index()];
-        if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
+        if data
+            .result
+            .is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()])
+        {
             continue;
         }
-        if ((reg.is_some() || freg.is_some()) && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
+        if ((reg.is_some() || freg.is_some())
+            && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
             || reg.is_some_and(|reg| regs.scratches(func, data, reg))
-            || data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(clobbers)
+            || data
+                .result
+                .and_then(|r| plan.pairs[r.index()])
+                .is_some_and(clobbers)
             || crate::live::results(data).any(clobbers)
         {
             return false;
@@ -548,7 +686,9 @@ pub(crate) fn zero_cmp_band<R>(
     (lhs, rhs): (Value, Value),
     is_zero: impl Fn(Value) -> bool,
 ) -> Option<(Value, usize, Value, Value)> {
-    let masked = is_zero(rhs).then_some(lhs).or_else(|| is_zero(lhs).then_some(rhs))?;
+    let masked = is_zero(rhs)
+        .then_some(lhs)
+        .or_else(|| is_zero(lhs).then_some(rhs))?;
     if uses[masked.index()] != 1 || plan.elided[masked.index()] {
         return None;
     }

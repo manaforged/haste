@@ -88,12 +88,19 @@ fn memory_error(message: String) -> Error {
 impl Memory {
     fn reserve_at(&mut self, len: usize) -> Result<(usize, usize), Error> {
         let owner = this_process();
-        let taken = self.chunks.last_mut().filter(|chunk| chunk.owner == owner).and_then(|chunk| Some((chunk.bump.take(len)?, chunk.write, chunk.exec)));
+        let taken = self
+            .chunks
+            .last_mut()
+            .filter(|chunk| chunk.owner == owner)
+            .and_then(|chunk| Some((chunk.bump.take(len)?, chunk.write, chunk.exec)));
         match taken {
             Some((at, write, exec)) => Ok((write + at, exec + at)),
-            None if self.sealed => Err(memory_error("the code window of this worker is full".to_owned())),
+            None if self.sealed => Err(memory_error(
+                "the code window of this worker is full".to_owned(),
+            )),
             None => {
-                self.chunks.push(map(len.max(CHUNK).next_multiple_of(page()), owner)?);
+                self.chunks
+                    .push(map(len.max(CHUNK).next_multiple_of(page()), owner)?);
                 self.reserve_at(len)
             }
         }
@@ -120,11 +127,18 @@ impl Memory {
     }
 
     /// Reserves up to `max_len` bytes, builds bytes knowing the executable address, and writes them.
-    pub fn write_with(&mut self, max_len: usize, build: impl FnOnce(usize) -> Result<Vec<u8>, Error>) -> Result<usize, Error> {
+    pub fn write_with(
+        &mut self,
+        max_len: usize,
+        build: impl FnOnce(usize) -> Result<Vec<u8>, Error>,
+    ) -> Result<usize, Error> {
         let (write, exec) = self.reserve_at(max_len)?;
         let bytes = build(exec)?;
         if bytes.len() > max_len {
-            return Err(memory_error(format!("write_with built {} bytes, exceeding reserved {max_len}", bytes.len())));
+            return Err(memory_error(format!(
+                "write_with built {} bytes, exceeding reserved {max_len}",
+                bytes.len()
+            )));
         }
         // SAFETY: write..write + bytes.len() is inside this chunk's writable mapping and bytes does not overlap it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), write as *mut u8, bytes.len()) };
@@ -134,13 +148,16 @@ impl Memory {
 
     /// Maps a chunk of `size` bytes now, so that processes forked after this call write into the same pages.
     pub fn reserve(&mut self, size: usize) -> Result<(), Error> {
-        self.chunks.push(map(size.next_multiple_of(page()), this_process())?);
+        self.chunks
+            .push(map(size.next_multiple_of(page()), this_process())?);
         Ok(())
     }
 
     /// The addresses that the code of the last chunk runs at.
     pub fn span(&self) -> Option<std::ops::Range<usize>> {
-        self.chunks.last().map(|chunk| chunk.exec..chunk.exec + chunk.bump.size)
+        self.chunks
+            .last()
+            .map(|chunk| chunk.exec..chunk.exec + chunk.bump.size)
     }
 
     /// Stops writing into the last chunk, whose free space forked workers filled, so that the next write maps a new chunk.
@@ -163,7 +180,13 @@ impl Memory {
     pub fn merge(&mut self, mut other: Memory) {
         self.chunks.append(&mut other.chunks);
         let owner = this_process();
-        let best = self.chunks.iter().enumerate().filter(|(_, chunk)| chunk.owner == owner).max_by_key(|(_, chunk)| chunk.bump.remaining()).map(|(index, _)| index);
+        let best = self
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, chunk)| chunk.owner == owner)
+            .max_by_key(|(_, chunk)| chunk.bump.remaining())
+            .map(|(index, _)| index);
         if let Some(best) = best {
             let last = self.chunks.len() - 1;
             self.chunks.swap(best, last);
@@ -199,18 +222,30 @@ pub struct Arena {
 impl Arena {
     /// Maps `size` bytes of shared memory, which the kernel backs only where they are written.
     pub fn shared(size: usize) -> Result<Arena, Error> {
-        Ok(Arena::over(map_data(size, Sharing::Shared)?, size, Sharing::Shared))
+        Ok(Arena::over(
+            map_data(size, Sharing::Shared)?,
+            size,
+            Sharing::Shared,
+        ))
     }
 
     /// Maps `size` bytes that each forked process holds its own copy of, which the kernel backs only where they are written.
     pub fn private(size: usize) -> Result<Arena, Error> {
-        Ok(Arena::over(map_data(size, Sharing::Private)?, size, Sharing::Private))
+        Ok(Arena::over(
+            map_data(size, Sharing::Private)?,
+            size,
+            Sharing::Private,
+        ))
     }
 
     /// Maps `size` bytes of shared memory below 2 GiB when an address there is free, so code reaches it with a 32-bit absolute address.
     pub fn low(size: usize) -> Result<Arena, Error> {
         let base = LOW_HINTS.into_iter().find_map(|hint| map_low(size, hint));
-        Ok(Arena::over(base.map_or_else(|| map_data(size, Sharing::Shared), Ok)?, size, Sharing::Shared))
+        Ok(Arena::over(
+            base.map_or_else(|| map_data(size, Sharing::Shared), Ok)?,
+            size,
+            Sharing::Shared,
+        ))
     }
 
     /// Whether the entire initial mapping of this arena lies below 2 GiB.
@@ -219,7 +254,13 @@ impl Arena {
     }
 
     fn over(base: usize, size: usize, sharing: Sharing) -> Arena {
-        Arena { base, bump: Bump::new(size), split: false, sharing, maps: vec![(base, size)] }
+        Arena {
+            base,
+            bump: Bump::new(size),
+            split: false,
+            sharing,
+            maps: vec![(base, size)],
+        }
     }
 
     /// The address of `len` zeroed bytes aligned to 16, in a new mapping when this one is full and no worker shares it.
@@ -228,7 +269,10 @@ impl Arena {
             return Ok(self.base + at);
         }
         if self.split {
-            return Err(memory_error(format!("shared memory is full: {len} bytes past {} of {}", self.bump.used, self.bump.size)));
+            return Err(memory_error(format!(
+                "shared memory is full: {len} bytes past {} of {}",
+                self.bump.used, self.bump.size
+            )));
         }
         self.remap(self.bump.size.max(len.next_multiple_of(page())))?;
         self.alloc(len)
@@ -267,7 +311,14 @@ impl Drop for Arena {
 }
 
 /// Addresses `Arena::low` tries in turn, each well above the null page and the start of a non-relocated program.
-const LOW_HINTS: [usize; 6] = [0x1000_0000, 0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 0x6000_0000];
+const LOW_HINTS: [usize; 6] = [
+    0x1000_0000,
+    0x2000_0000,
+    0x3000_0000,
+    0x4000_0000,
+    0x5000_0000,
+    0x6000_0000,
+];
 
 #[cfg(unix)]
 fn unmap(base: usize, size: usize) {
@@ -310,7 +361,16 @@ const NO_REPLACE: i32 = 0;
 fn map_low(size: usize, hint: usize) -> Option<usize> {
     let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | NO_REPLACE;
     // SAFETY: without MAP_FIXED the kernel never replaces an existing mapping, so the new mapping touches no existing memory.
-    let base = unsafe { libc::mmap(hint as *mut libc::c_void, size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+    let base = unsafe {
+        libc::mmap(
+            hint as *mut libc::c_void,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            flags,
+            -1,
+            0,
+        )
+    };
     if base as usize == hint && hint + size <= 1 << 31 {
         return Some(hint);
     }
@@ -323,7 +383,14 @@ fn map_low(size: usize, hint: usize) -> Option<usize> {
 #[cfg(target_os = "windows")]
 fn map_low(size: usize, hint: usize) -> Option<usize> {
     // SAFETY: VirtualAlloc with a hint returns a fresh region or null without replacing existing memory.
-    let base = unsafe { win::VirtualAlloc(hint as *mut std::ffi::c_void, size, win::MEM_COMMIT | win::MEM_RESERVE, win::PAGE_READWRITE) };
+    let base = unsafe {
+        win::VirtualAlloc(
+            hint as *mut std::ffi::c_void,
+            size,
+            win::MEM_COMMIT | win::MEM_RESERVE,
+            win::PAGE_READWRITE,
+        )
+    };
     if base as usize == hint && hint + size <= 1 << 31 {
         return Some(hint);
     }
@@ -335,11 +402,28 @@ fn map_low(size: usize, hint: usize) -> Option<usize> {
 
 #[cfg(unix)]
 fn map_data(size: usize, sharing: Sharing) -> Result<usize, Error> {
-    let flags = if sharing == Sharing::Private { libc::MAP_PRIVATE } else { libc::MAP_SHARED } | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+    let flags = if sharing == Sharing::Private {
+        libc::MAP_PRIVATE
+    } else {
+        libc::MAP_SHARED
+    } | libc::MAP_ANONYMOUS
+        | libc::MAP_NORESERVE;
     // SAFETY: a new anonymous mapping touches no existing memory.
-    let base = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            flags,
+            -1,
+            0,
+        )
+    };
     if base == libc::MAP_FAILED {
-        return Err(memory_error(format!("mmap: {}", std::io::Error::last_os_error())));
+        return Err(memory_error(format!(
+            "mmap: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(base as usize)
 }
@@ -347,9 +431,19 @@ fn map_data(size: usize, sharing: Sharing) -> Result<usize, Error> {
 #[cfg(target_os = "windows")]
 fn map_data(size: usize, _sharing: Sharing) -> Result<usize, Error> {
     // SAFETY: VirtualAlloc with a null address allocates fresh private read/write memory.
-    let base = unsafe { win::VirtualAlloc(std::ptr::null_mut(), size, win::MEM_COMMIT | win::MEM_RESERVE, win::PAGE_READWRITE) };
+    let base = unsafe {
+        win::VirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            win::MEM_COMMIT | win::MEM_RESERVE,
+            win::PAGE_READWRITE,
+        )
+    };
     if base.is_null() {
-        return Err(memory_error(format!("VirtualAlloc: {}", std::io::Error::last_os_error())));
+        return Err(memory_error(format!(
+            "VirtualAlloc: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(base as usize)
 }
@@ -359,9 +453,21 @@ fn views(size: usize) -> Result<(usize, usize), Error> {
     let hi = ((size as u64) >> 32) as u32;
     let lo = size as u32;
     // SAFETY: anonymous pagefile-backed section with valid size; views are distinct RW and RX mappings (W^X).
-    let section = unsafe { win::CreateFileMappingW(win::INVALID_HANDLE_VALUE, std::ptr::null_mut(), win::PAGE_EXECUTE_READWRITE, hi, lo, std::ptr::null()) };
+    let section = unsafe {
+        win::CreateFileMappingW(
+            win::INVALID_HANDLE_VALUE,
+            std::ptr::null_mut(),
+            win::PAGE_EXECUTE_READWRITE,
+            hi,
+            lo,
+            std::ptr::null(),
+        )
+    };
     if section.is_null() {
-        return Err(memory_error(format!("CreateFileMappingW: {}", std::io::Error::last_os_error())));
+        return Err(memory_error(format!(
+            "CreateFileMappingW: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     // SAFETY: section is a valid file mapping handle of length `size`.
     let write = unsafe { win::MapViewOfFile(section, win::FILE_MAP_WRITE, 0, 0, size) };
@@ -372,7 +478,15 @@ fn views(size: usize) -> Result<(usize, usize), Error> {
         return Err(memory_error(format!("MapViewOfFile(RW): {err}")));
     }
     // SAFETY: section is a valid file mapping handle of length `size`.
-    let exec = unsafe { win::MapViewOfFile(section, win::FILE_MAP_READ | win::FILE_MAP_EXECUTE, 0, 0, size) };
+    let exec = unsafe {
+        win::MapViewOfFile(
+            section,
+            win::FILE_MAP_READ | win::FILE_MAP_EXECUTE,
+            0,
+            0,
+            size,
+        )
+    };
     let err = std::io::Error::last_os_error();
     // SAFETY: section is a valid open handle; existing mapped views keep the section alive.
     unsafe { win::CloseHandle(section) };
@@ -397,22 +511,50 @@ mod win {
     pub const FILE_MAP_EXECUTE: u32 = 0x0020;
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        pub fn VirtualAlloc(addr: *mut std::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut std::ffi::c_void;
+        pub fn VirtualAlloc(
+            addr: *mut std::ffi::c_void,
+            size: usize,
+            kind: u32,
+            protect: u32,
+        ) -> *mut std::ffi::c_void;
         pub fn VirtualFree(addr: *mut std::ffi::c_void, size: usize, kind: u32) -> i32;
-        pub fn CreateFileMappingW(file: *mut std::ffi::c_void, attrs: *mut std::ffi::c_void, protect: u32, max_hi: u32, max_lo: u32, name: *const u16) -> *mut std::ffi::c_void;
-        pub fn MapViewOfFile(mapping: *mut std::ffi::c_void, access: u32, off_hi: u32, off_lo: u32, bytes: usize) -> *mut std::ffi::c_void;
+        pub fn CreateFileMappingW(
+            file: *mut std::ffi::c_void,
+            attrs: *mut std::ffi::c_void,
+            protect: u32,
+            max_hi: u32,
+            max_lo: u32,
+            name: *const u16,
+        ) -> *mut std::ffi::c_void;
+        pub fn MapViewOfFile(
+            mapping: *mut std::ffi::c_void,
+            access: u32,
+            off_hi: u32,
+            off_lo: u32,
+            bytes: usize,
+        ) -> *mut std::ffi::c_void;
         pub fn UnmapViewOfFile(base: *const std::ffi::c_void) -> i32;
         pub fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         pub fn GetCurrentProcessId() -> u32;
         pub fn GetCurrentProcess() -> *mut std::ffi::c_void;
-        pub fn FlushInstructionCache(process: *mut std::ffi::c_void, base: *const std::ffi::c_void, size: usize) -> i32;
+        pub fn FlushInstructionCache(
+            process: *mut std::ffi::c_void,
+            base: *const std::ffi::c_void,
+            size: usize,
+        ) -> i32;
     }
 }
 
 /// Maps a chunk of `size` bytes as two views of the same pages, each shared with forked processes.
 fn map(size: usize, owner: i32) -> Result<Chunk, Error> {
     let (write, exec) = views(size)?;
-    Ok(Chunk { write, exec, len: size, bump: Bump::new(size), owner })
+    Ok(Chunk {
+        write,
+        exec,
+        len: size,
+        bump: Bump::new(size),
+        owner,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -420,7 +562,10 @@ fn views(size: usize) -> Result<(usize, usize), Error> {
     // SAFETY: the name is a static NUL-terminated string; memfd_create makes an anonymous file with no path.
     let fd = unsafe { libc::memfd_create(c"haste-code".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
-        return Err(memory_error(format!("memfd_create: {}", std::io::Error::last_os_error())));
+        return Err(memory_error(format!(
+            "memfd_create: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     let mapped = file_views(fd, size);
     // SAFETY: fd is the descriptor opened above; the mappings keep the object alive after it closes.
@@ -432,14 +577,27 @@ fn views(size: usize) -> Result<(usize, usize), Error> {
 fn file_views(fd: i32, size: usize) -> Result<(usize, usize), Error> {
     // SAFETY: fd is an open shared memory object that this process owns.
     if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
-        return Err(memory_error(format!("ftruncate: {}", std::io::Error::last_os_error())));
+        return Err(memory_error(format!(
+            "ftruncate: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     let view = |prot| {
         // SAFETY: a new shared mapping of the whole object touches no existing memory.
         let base = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, libc::MAP_SHARED, fd, 0) };
-        if base == libc::MAP_FAILED { Err(memory_error(format!("mmap: {}", std::io::Error::last_os_error()))) } else { Ok(base as usize) }
+        if base == libc::MAP_FAILED {
+            Err(memory_error(format!(
+                "mmap: {}",
+                std::io::Error::last_os_error()
+            )))
+        } else {
+            Ok(base as usize)
+        }
     };
-    Ok((view(libc::PROT_READ | libc::PROT_WRITE)?, view(libc::PROT_READ | libc::PROT_EXEC)?))
+    Ok((
+        view(libc::PROT_READ | libc::PROT_WRITE)?,
+        view(libc::PROT_READ | libc::PROT_EXEC)?,
+    ))
 }
 
 /// Darwin runs no code from a shared file mapping, so the executable view is a second mapping of anonymous memory, remapped in the kernel; both views stay shared across `fork`.
@@ -447,16 +605,44 @@ fn file_views(fd: i32, size: usize) -> Result<(usize, usize), Error> {
 fn views(size: usize) -> Result<(usize, usize), Error> {
     use mach::*;
     let check = |what: &str, code: i32| {
-        if code == 0 { Ok(()) } else { Err(memory_error(format!("{what}: kernel error {code}"))) }
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(memory_error(format!("{what}: kernel error {code}")))
+        }
     };
     let (mut write, mut exec, mut current, mut max) = (0_u64, 0_u64, 0, 0);
     // SAFETY: each call takes this task's own port and the addresses it hands back; the remap aliases only the region just allocated.
     unsafe {
         let task = mach_task_self_;
-        check("mach_vm_allocate", mach_vm_allocate(task, &mut write, size as u64, VM_FLAGS_ANYWHERE))?;
-        check("mach_vm_inherit", mach_vm_inherit(task, write, size as u64, VM_INHERIT_SHARE))?;
-        check("mach_vm_remap", mach_vm_remap(task, &mut exec, size as u64, 0, VM_FLAGS_ANYWHERE, task, write, 0, &mut current, &mut max, VM_INHERIT_SHARE))?;
-        check("mach_vm_protect", mach_vm_protect(task, exec, size as u64, 0, VM_PROT_READ | VM_PROT_EXECUTE))?;
+        check(
+            "mach_vm_allocate",
+            mach_vm_allocate(task, &mut write, size as u64, VM_FLAGS_ANYWHERE),
+        )?;
+        check(
+            "mach_vm_inherit",
+            mach_vm_inherit(task, write, size as u64, VM_INHERIT_SHARE),
+        )?;
+        check(
+            "mach_vm_remap",
+            mach_vm_remap(
+                task,
+                &mut exec,
+                size as u64,
+                0,
+                VM_FLAGS_ANYWHERE,
+                task,
+                write,
+                0,
+                &mut current,
+                &mut max,
+                VM_INHERIT_SHARE,
+            ),
+        )?;
+        check(
+            "mach_vm_protect",
+            mach_vm_protect(task, exec, size as u64, 0, VM_PROT_READ | VM_PROT_EXECUTE),
+        )?;
     }
     Ok((write as usize, exec as usize))
 }
@@ -471,9 +657,30 @@ mod mach {
         pub static mach_task_self_: u32;
         pub fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
         pub fn mach_vm_inherit(task: u32, address: u64, size: u64, inherit: u32) -> i32;
-        pub fn mach_vm_protect(task: u32, address: u64, size: u64, set_maximum: u32, protection: i32) -> i32;
-        #[allow(clippy::too_many_arguments, reason = "the declaration mirrors the eleven-argument Mach call")]
-        pub fn mach_vm_remap(target: u32, address: *mut u64, size: u64, mask: u64, flags: i32, source: u32, source_address: u64, copy: u32, current: *mut i32, max: *mut i32, inherit: u32) -> i32;
+        pub fn mach_vm_protect(
+            task: u32,
+            address: u64,
+            size: u64,
+            set_maximum: u32,
+            protection: i32,
+        ) -> i32;
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "the declaration mirrors the eleven-argument Mach call"
+        )]
+        pub fn mach_vm_remap(
+            target: u32,
+            address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: i32,
+            source: u32,
+            source_address: u64,
+            copy: u32,
+            current: *mut i32,
+            max: *mut i32,
+            inherit: u32,
+        ) -> i32;
         pub fn sys_icache_invalidate(start: *mut std::ffi::c_void, len: usize);
     }
 }
@@ -496,7 +703,11 @@ fn flush(exec: usize, len: usize) {
     #[cfg(target_os = "windows")]
     // SAFETY: exec..exec + len is code memory this process maps.
     unsafe {
-        win::FlushInstructionCache(win::GetCurrentProcess(), exec as *const std::ffi::c_void, len);
+        win::FlushInstructionCache(
+            win::GetCurrentProcess(),
+            exec as *const std::ffi::c_void,
+            len,
+        );
     }
     let _ = (exec, len);
 }

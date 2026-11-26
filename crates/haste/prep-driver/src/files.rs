@@ -25,11 +25,21 @@ pub fn stamp(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     #[cfg(unix)]
     {
-        Some(format!("{}.{}.{}.{}", meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.size()))
+        Some(format!(
+            "{}.{}.{}.{}",
+            meta.ino(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.size()
+        ))
     }
     #[cfg(not(unix))]
     {
-        let nanos = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+        let nanos = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
         Some(format!("0.{nanos}.{}", meta.len()))
     }
 }

@@ -28,7 +28,9 @@ pub struct LockedDep<'a> {
 impl Locked {
     /// Whether the package comes from crates.io.
     pub fn is_registry(&self) -> bool {
-        self.source.as_deref().is_some_and(|source| source.starts_with("registry+") || source.starts_with("sparse+"))
+        self.source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("registry+") || source.starts_with("sparse+"))
     }
 
     /// The repository URL and commit of a package from git.
@@ -43,7 +45,9 @@ impl Locked {
         self.dependencies.iter().map(|line| {
             let mut words = line.split_whitespace();
             let name = words.next().unwrap_or_default();
-            let version = words.next().and_then(|text| semver::Version::parse(text).ok());
+            let version = words
+                .next()
+                .and_then(|text| semver::Version::parse(text).ok());
             LockedDep { name, version }
         })
     }
@@ -51,7 +55,9 @@ impl Locked {
 
 /// Reads `Cargo.lock` at `path`.
 pub fn read(path: &Path) -> Result<Vec<Locked>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let lock: LockFile = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let lock: LockFile =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(lock.package)
 }

@@ -84,19 +84,41 @@ impl Function {
     }
 
     /// Result value of `op` when it is a zero-initialized `ThreadCell` lookup with no user-visible memory effects.
-    pub(crate) fn pure_thread_cell_result(&self, op: &super::Op, is_zero: impl Fn(Value) -> bool) -> Option<Value> {
+    pub(crate) fn pure_thread_cell_result(
+        &self,
+        op: &super::Op,
+        is_zero: impl Fn(Value) -> bool,
+    ) -> Option<Value> {
         match op {
-            super::Op::Call { callee, args, results, .. }
-                if self.is_thread_cell(*callee) && args.get(2).is_some_and(|&v| is_zero(v)) => results.first().copied(),
+            super::Op::Call {
+                callee,
+                args,
+                results,
+                ..
+            } if self.is_thread_cell(*callee) && args.get(2).is_some_and(|&v| is_zero(v)) => {
+                results.first().copied()
+            }
             _ => None,
         }
     }
 
     /// Result value and constant slot index of `op` when it is a `ThreadCell` lookup.
-    pub(crate) fn thread_cell_slot(&self, op: &super::Op, const_val: impl Fn(Value) -> Option<i64>) -> Option<(Value, u32)> {
+    pub(crate) fn thread_cell_slot(
+        &self,
+        op: &super::Op,
+        const_val: impl Fn(Value) -> Option<i64>,
+    ) -> Option<(Value, u32)> {
         match op {
-            super::Op::Call { callee, args, results, .. } if self.is_thread_cell(*callee) => {
-                let slot = args.first().and_then(|&v| const_val(v)).and_then(|k| u32::try_from(k).ok())?;
+            super::Op::Call {
+                callee,
+                args,
+                results,
+                ..
+            } if self.is_thread_cell(*callee) => {
+                let slot = args
+                    .first()
+                    .and_then(|&v| const_val(v))
+                    .and_then(|k| u32::try_from(k).ok())?;
                 Some((*results.first()?, slot))
             }
             _ => None,
@@ -104,12 +126,23 @@ impl Function {
     }
 
     /// Result value of `op` when it looks up the internal `#[track_caller]` cell (`slot == 0`, `init == 0`).
-    pub(crate) fn caller_loc_result(&self, op: &super::Op, is_zero: impl Fn(Value) -> bool) -> Option<Value> {
+    pub(crate) fn caller_loc_result(
+        &self,
+        op: &super::Op,
+        is_zero: impl Fn(Value) -> bool,
+    ) -> Option<Value> {
         match op {
-            super::Op::Call { callee, args, results, .. }
-                if self.is_thread_cell(*callee)
-                    && args.first().is_some_and(|&v| is_zero(v))
-                    && args.get(2).is_some_and(|&v| is_zero(v)) => results.first().copied(),
+            super::Op::Call {
+                callee,
+                args,
+                results,
+                ..
+            } if self.is_thread_cell(*callee)
+                && args.first().is_some_and(|&v| is_zero(v))
+                && args.get(2).is_some_and(|&v| is_zero(v)) =>
+            {
+                results.first().copied()
+            }
             _ => None,
         }
     }
@@ -121,7 +154,9 @@ impl Function {
 
     /// Drops every image-address mark, for targets that cannot reach data relative to the program counter.
     pub(crate) fn forget_image_addrs(&mut self) {
-        self.value_flags.iter_mut().for_each(|bits| *bits &= !IMAGE_ADDR);
+        self.value_flags
+            .iter_mut()
+            .for_each(|bits| *bits &= !IMAGE_ADDR);
     }
 
     /// Whether `value` is a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
@@ -136,12 +171,16 @@ impl Function {
 
     /// Drops every unpredictable mark, for targets where a branch beats a conditional move.
     pub(crate) fn forget_unpredictable(&mut self) {
-        self.value_flags.iter_mut().for_each(|bits| *bits &= !UNPREDICTABLE);
+        self.value_flags
+            .iter_mut()
+            .for_each(|bits| *bits &= !UNPREDICTABLE);
     }
 
     /// Whether any value carries the unpredictable mark.
     pub(crate) fn has_unpredictable(&self) -> bool {
-        self.value_flags.iter().any(|&bits| bits & UNPREDICTABLE != 0)
+        self.value_flags
+            .iter()
+            .any(|&bits| bits & UNPREDICTABLE != 0)
     }
 
     /// The marks on `value`.

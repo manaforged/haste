@@ -100,7 +100,9 @@ struct Parser<'a> {
 fn slots(pieces: &[Piece], into: &mut Vec<u32>) {
     for piece in pieces {
         match piece {
-            Piece::Var(_, _, slot) | Piece::Meta(Meta::Ignore(slot) | Meta::Count(slot)) => into.extend(*slot),
+            Piece::Var(_, _, slot) | Piece::Meta(Meta::Ignore(slot) | Meta::Count(slot)) => {
+                into.extend(*slot)
+            }
             Piece::Group(_, inner) => slots(inner, into),
             Piece::Repeat(.., names) => into.extend_from_slice(names),
             Piece::Token(_) | Piece::Crate(_) | Piece::CratePath | Piece::Meta(_) => {}
@@ -167,7 +169,10 @@ impl<'a> Parser<'a> {
             out.push(Piece::Crate(fixed));
             return Ok(next + 1);
         }
-        if self.matcher && self.src.kind(next + 1) == TokenKind::Colon && is_name(self.src.kind(next + 2)) {
+        if self.matcher
+            && self.src.kind(next + 1) == TokenKind::Colon
+            && is_name(self.src.kind(next + 2))
+        {
             let frag = frag(self.src.text(next + 2))?;
             out.push(Piece::Var(next, Some(frag), self.slot(next)));
             return Ok(next + 3);
@@ -180,7 +185,9 @@ impl<'a> Parser<'a> {
         let name = open + 1;
         let args = name + 1;
         let variable = (self.src.kind(args + 1) == TokenKind::Dollar).then_some(args + 2);
-        let depth = (matches!(self.src.kind(args + 1), TokenKind::Literal { .. })).then(|| self.src.text(args + 1).parse().unwrap_or(0)).unwrap_or(0);
+        let depth = (matches!(self.src.kind(args + 1), TokenKind::Literal { .. }))
+            .then(|| self.src.text(args + 1).parse().unwrap_or(0))
+            .unwrap_or(0);
         let src = self.src;
         match (src.text(name), variable) {
             ("ignore", Some(variable)) => Ok(Meta::Ignore(self.slot(variable))),
@@ -188,7 +195,10 @@ impl<'a> Parser<'a> {
             ("index", _) => Ok(Meta::Index(depth)),
             ("len", _) => Ok(Meta::Len(depth)),
             ("concat", _) => Ok(Meta::Concat(self.concat_parts(args))),
-            (other, _) => bail!("{}: unknown metavariable expression {other}", self.src.path.display()),
+            (other, _) => bail!(
+                "{}: unknown metavariable expression {other}",
+                self.src.path.display()
+            ),
         }
     }
 
@@ -213,12 +223,19 @@ impl<'a> Parser<'a> {
             return Ok((None, op, at + 1));
         }
         let mut last = at;
-        while self.src.joint(last) && op_of(self.src.kind(last + 1)).is_none() && last + 1 < self.src.len() {
+        while self.src.joint(last)
+            && op_of(self.src.kind(last + 1)).is_none()
+            && last + 1 < self.src.len()
+        {
             last += 1;
         }
         match op_of(self.src.kind(last + 1)) {
             Some(op) => Ok((Some((at, last)), op, last + 2)),
-            None => bail!("{}: repetition without an operator at byte {}", self.src.path.display(), self.src.byte(at)),
+            None => bail!(
+                "{}: repetition without an operator at byte {}",
+                self.src.path.display(),
+                self.src.byte(at)
+            ),
         }
     }
 }
@@ -232,14 +249,23 @@ fn frag(name: &str) -> Result<Frag> {
 
 /// The rules of a `#[macro_export(local_inner_macros)]` macro, whose transcribers call each macro named by one word as `$crate::name!`.
 pub fn local_inner(src: &Source, rules: Vec<Rule>) -> Vec<Rule> {
-    rules.into_iter().map(|rule| Rule { matcher: rule.matcher, body: qualified(src, rule.body), slots: rule.slots }).collect()
+    rules
+        .into_iter()
+        .map(|rule| Rule {
+            matcher: rule.matcher,
+            body: qualified(src, rule.body),
+            slots: rule.slots,
+        })
+        .collect()
 }
 
 fn qualified(src: &Source, pieces: Vec<Piece>) -> Vec<Piece> {
     let mut out = Vec::with_capacity(pieces.len());
     for (at, piece) in pieces.iter().enumerate() {
-        let after_path = at > 0 && matches!(pieces[at - 1], Piece::Token(token) if src.text(token) == ":");
-        let called = matches!(pieces.get(at + 1), Some(Piece::Token(bang)) if src.text(*bang) == "!");
+        let after_path =
+            at > 0 && matches!(pieces[at - 1], Piece::Token(token) if src.text(token) == ":");
+        let called =
+            matches!(pieces.get(at + 1), Some(Piece::Token(bang)) if src.text(*bang) == "!");
         if let Piece::Token(name) = piece
             && called
             && !after_path
@@ -250,7 +276,9 @@ fn qualified(src: &Source, pieces: Vec<Piece>) -> Vec<Piece> {
         }
         out.push(match piece.clone() {
             Piece::Group(open, inner) => Piece::Group(open, qualified(src, inner)),
-            Piece::Repeat(inner, sep, op, names) => Piece::Repeat(qualified(src, inner), sep, op, names),
+            Piece::Repeat(inner, sep, op, names) => {
+                Piece::Repeat(qualified(src, inner), sep, op, names)
+            }
             other => other,
         });
     }
@@ -267,11 +295,19 @@ pub fn parse_macro(src: &Source, open: u32) -> Result<Vec<Rule>> {
 
 /// The rule whose matcher opens at `matcher` and whose transcriber opens at `body`, with each metavariable name given its slot.
 fn rule(src: &Source, matcher: u32, body: u32) -> Result<Rule> {
-    let mut parser = Parser { src, matcher: true, names: Vec::new() };
+    let mut parser = Parser {
+        src,
+        matcher: true,
+        names: Vec::new(),
+    };
     let matcher = parser.pieces(matcher + 1, src.pair(matcher))?;
     parser.matcher = false;
     let body = parser.pieces(body + 1, src.pair(body))?;
-    Ok(Rule { matcher, body, slots: parser.names.len() })
+    Ok(Rule {
+        matcher,
+        body,
+        slots: parser.names.len(),
+    })
 }
 
 /// Parses the rules of a `macro_rules!` body that opens at token `open`.
@@ -283,7 +319,11 @@ pub fn parse(src: &Source, open: u32) -> Result<Vec<Rule>> {
         let arrow = src.pair(at) + 1;
         let body = arrow + 2;
         if !opens(src.kind(at)) || src.kind(arrow) != TokenKind::Eq || !opens(src.kind(body)) {
-            bail!("{}: malformed macro rule at byte {}", src.path.display(), src.byte(at));
+            bail!(
+                "{}: malformed macro rule at byte {}",
+                src.path.display(),
+                src.byte(at)
+            );
         }
         rules.push(rule(src, at, body)?);
         at = src.pair(body) + 1;

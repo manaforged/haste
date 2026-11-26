@@ -17,7 +17,11 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
                 start = at + 1;
             }
             TokenKind::Lt if angles > 0 || at == start || turbofish(src, at) => angles += 1,
-            TokenKind::Gt if angles > 0 && !(src.kind(at - 1) == TokenKind::Minus && src.joint(at - 1)) => angles -= 1,
+            TokenKind::Gt
+                if angles > 0 && !(src.kind(at - 1) == TokenKind::Minus && src.joint(at - 1)) =>
+            {
+                angles -= 1
+            }
             kind if opens(kind) => at = src.pair(at),
             _ => {}
         }
@@ -40,7 +44,10 @@ pub fn should_panic_expected(src: &Source, attrs: &[Attr], env: &Env) -> Option<
             }
             &Attr::Other(at) if attr_is_named(src, at, "should_panic") => {
                 let mut end = at;
-                while matches!(src.kind(end), TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon) {
+                while matches!(
+                    src.kind(end),
+                    TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon
+                ) {
                     end += 1;
                 }
                 if src.kind(end) == TokenKind::Eq {
@@ -49,7 +56,10 @@ pub fn should_panic_expected(src: &Source, attrs: &[Attr], env: &Env) -> Option<
                 if src.kind(end) == TokenKind::OpenParen {
                     let close = src.pair(end);
                     for (from, to) in split_commas(src, end + 1, close) {
-                        if from + 2 < to && src.text(from) == "expected" && src.kind(from + 1) == TokenKind::Eq {
+                        if from + 2 < to
+                            && src.text(from) == "expected"
+                            && src.kind(from + 1) == TokenKind::Eq
+                        {
                             return Some(unquote(src.text(from + 2)));
                         }
                     }
@@ -64,7 +74,9 @@ pub fn should_panic_expected(src: &Source, attrs: &[Attr], env: &Env) -> Option<
 /// Whether `attrs` contains an attribute named `wanted` (bare or under a standard prelude path), directly or via an active `cfg_attr`.
 pub fn has_attr(src: &Source, attrs: &[Attr], env: &Env, wanted: &str) -> bool {
     attrs.iter().any(|attr| match attr {
-        Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => has_attr(src, inner, env, wanted),
+        Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => {
+            has_attr(src, inner, env, wanted)
+        }
         &Attr::Other(at) => attr_is_named(src, at, wanted),
         _ => false,
     })
@@ -72,7 +84,10 @@ pub fn has_attr(src: &Source, attrs: &[Attr], env: &Env, wanted: &str) -> bool {
 
 fn attr_is_named(src: &Source, from: u32, wanted: &str) -> bool {
     let mut end = from;
-    while matches!(src.kind(end), TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon) {
+    while matches!(
+        src.kind(end),
+        TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon
+    ) {
         end += 1;
     }
     let mut at = from;
@@ -81,7 +96,15 @@ fn attr_is_named(src: &Source, from: u32, wanted: &str) -> bool {
     }
     match end - at {
         1 => src.text(at) == wanted,
-        10 => matches!(src.text(at), "core" | "std") && src.text(at + 3) == "prelude" && matches!(src.text(at + 6), "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024") && src.text(at + 9) == wanted,
+        10 => {
+            matches!(src.text(at), "core" | "std")
+                && src.text(at + 3) == "prelude"
+                && matches!(
+                    src.text(at + 6),
+                    "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024"
+                )
+                && src.text(at + 9) == wanted
+        }
         _ => false,
     }
 }
@@ -91,8 +114,18 @@ pub fn repr_words(src: &Source, attrs: &[Attr], env: &Env) -> Vec<u32> {
     let mut words = Vec::new();
     for attr in attrs {
         match attr {
-            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => words.extend(repr_words(src, inner, env)),
-            &Attr::Other(at) if src.text(at) == "repr" && src.kind(at + 1) == TokenKind::OpenParen => words.extend(split_commas(src, at + 2, src.pair(at + 1)).into_iter().map(|(from, _)| from)),
+            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => {
+                words.extend(repr_words(src, inner, env))
+            }
+            &Attr::Other(at)
+                if src.text(at) == "repr" && src.kind(at + 1) == TokenKind::OpenParen =>
+            {
+                words.extend(
+                    split_commas(src, at + 2, src.pair(at + 1))
+                        .into_iter()
+                        .map(|(from, _)| from),
+                )
+            }
             _ => {}
         }
     }
@@ -100,7 +133,10 @@ pub fn repr_words(src: &Source, attrs: &[Attr], env: &Env) -> Vec<u32> {
 }
 
 fn turbofish(src: &Source, at: u32) -> bool {
-    at >= 2 && src.kind(at - 1) == TokenKind::Colon && src.kind(at - 2) == TokenKind::Colon && src.joint(at - 2)
+    at >= 2
+        && src.kind(at - 1) == TokenKind::Colon
+        && src.kind(at - 2) == TokenKind::Colon
+        && src.joint(at - 2)
 }
 
 fn unquote(text: &str) -> String {
@@ -111,7 +147,10 @@ fn unquote(text: &str) -> String {
 }
 
 fn joined(src: &Source, from: u32, to: u32) -> String {
-    (from..to).map(|at| src.text(at)).collect::<Vec<_>>().join(" ")
+    (from..to)
+        .map(|at| src.text(at))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn cfg_of(src: &Source, open: u32) -> Result<cfg::Cfg> {
@@ -129,19 +168,33 @@ fn cfg_attr(src: &Source, open: u32) -> Result<Attr> {
         return Ok(Attr::Other(open));
     };
     let text = joined(src, first, last);
-    let predicate = cfg::parse(&text).with_context(|| format!("{}: cfg_attr({text}, ..)", src.path.display()))?;
-    let inner = parts[1..].iter().map(|&(from, to)| content(src, from, to)).collect::<Result<Vec<_>>>()?;
+    let predicate = cfg::parse(&text)
+        .with_context(|| format!("{}: cfg_attr({text}, ..)", src.path.display()))?;
+    let inner = parts[1..]
+        .iter()
+        .map(|&(from, to)| content(src, from, to))
+        .collect::<Result<Vec<_>>>()?;
     Ok(Attr::CfgAttr(predicate, inner))
 }
 
 fn path_end(src: &Source, mut at: u32, to: u32) -> u32 {
-    while at < to && matches!(src.kind(at), TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon) {
+    while at < to
+        && matches!(
+            src.kind(at),
+            TokenKind::Ident | TokenKind::RawIdent | TokenKind::Colon
+        )
+    {
         at += 1;
     }
     at
 }
 
-const FLAGS: [(&str, Attr); 4] = [("macro_use", Attr::MacroUse), ("no_std", Attr::NoStd), ("no_core", Attr::NoCore), ("no_implicit_prelude", Attr::NoImplicitPrelude)];
+const FLAGS: [(&str, Attr); 4] = [
+    ("macro_use", Attr::MacroUse),
+    ("no_std", Attr::NoStd),
+    ("no_core", Attr::NoCore),
+    ("no_implicit_prelude", Attr::NoImplicitPrelude),
+];
 
 /// Whether the attribute tokens `from..to` start with `derive(...)` or `derive_const(...)`, bare or under a standard prelude path.
 pub fn is_derive_at(src: &Source, from: u32, to: u32) -> bool {
@@ -155,7 +208,15 @@ pub fn is_derive_at(src: &Source, from: u32, to: u32) -> bool {
     }
     match end - at {
         1 => matches!(src.text(at), "derive" | "derive_const"),
-        10 => matches!(src.text(at), "core" | "std") && src.text(at + 3) == "prelude" && matches!(src.text(at + 6), "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024") && matches!(src.text(at + 9), "derive" | "derive_const"),
+        10 => {
+            matches!(src.text(at), "core" | "std")
+                && src.text(at + 3) == "prelude"
+                && matches!(
+                    src.text(at + 6),
+                    "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024"
+                )
+                && matches!(src.text(at + 9), "derive" | "derive_const")
+        }
         _ => false,
     }
 }
@@ -176,8 +237,14 @@ pub fn content(src: &Source, from: u32, to: u32) -> Result<Attr> {
         ("cfg", TokenKind::OpenParen) => Attr::Cfg(cfg_of(src, after)?),
         ("cfg_attr", TokenKind::OpenParen) => cfg_attr(src, after)?,
         ("path", TokenKind::Eq) if after + 1 < to => Attr::Path(unquote(src.text(after + 1))),
-        ("macro_export", next) => Attr::MacroExport(next == TokenKind::OpenParen && joined(src, after + 1, src.pair(after)).contains("local_inner_macros")),
-        _ => FLAGS.iter().find(|(name, _)| *name == path).map_or(Attr::Other(from), |(_, attr)| attr.clone()),
+        ("macro_export", next) => Attr::MacroExport(
+            next == TokenKind::OpenParen
+                && joined(src, after + 1, src.pair(after)).contains("local_inner_macros"),
+        ),
+        _ => FLAGS
+            .iter()
+            .find(|(name, _)| *name == path)
+            .map_or(Attr::Other(from), |(_, attr)| attr.clone()),
     })
 }
 

@@ -115,7 +115,11 @@ impl Cursor<'_> {
         let lifetime = self.lifetime();
         let mutable = self.eat_word("mut");
         let ty = self.ty_no_bounds()?;
-        Ok(self.push_ty(Ty::Ref { lifetime, mutable, ty }))
+        Ok(self.push_ty(Ty::Ref {
+            lifetime,
+            mutable,
+            ty,
+        }))
     }
 
     fn paren_ty(&mut self) -> Result<TyId> {
@@ -143,7 +147,11 @@ impl Cursor<'_> {
         let open = self.at;
         let (element, len) = self.inside(open, |cursor| {
             let element = cursor.ty()?;
-            let len = if cursor.eat(";") { Some(cursor.expr()?) } else { None };
+            let len = if cursor.eat(";") {
+                Some(cursor.expr()?)
+            } else {
+                None
+            };
             Ok((element, len))
         })?;
         Ok(self.push_ty(match len {
@@ -158,8 +166,16 @@ impl Cursor<'_> {
         self.at = open;
         let mut variadic = false;
         let params = self.comma_list(open, |cursor| cursor.fn_param(&mut variadic))?;
-        let ret = if self.eat("->") { Some(self.ty_no_bounds()?) } else { None };
-        Ok(self.push_ty(Ty::Fn { params, ret, variadic }))
+        let ret = if self.eat("->") {
+            Some(self.ty_no_bounds()?)
+        } else {
+            None
+        };
+        Ok(self.push_ty(Ty::Fn {
+            params,
+            ret,
+            variadic,
+        }))
     }
 
     fn fn_qualifiers(&mut self) -> Result<()> {
@@ -181,7 +197,9 @@ impl Cursor<'_> {
             *variadic = true;
             return Ok(self.push_ty(Ty::Infer).0);
         }
-        let named = (self.ident() || self.word() == "_") && self.punct_at(self.at + 1, ":") && !self.punct_at(self.at + 1, "::");
+        let named = (self.ident() || self.word() == "_")
+            && self.punct_at(self.at + 1, ":")
+            && !self.punct_at(self.at + 1, "::");
         if named {
             self.at += 2;
         }

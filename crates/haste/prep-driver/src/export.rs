@@ -3,7 +3,9 @@ use std::sync::OnceLock;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::attrs::Linkage;
 use rustc_middle::bug;
-use rustc_middle::middle::exported_symbols::{ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel};
+use rustc_middle::middle::exported_symbols::{
+    ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
+};
 use rustc_middle::mono::{CodegenUnit, MonoItem, MonoItemData, MonoItemPartitions, Visibility};
 use rustc_middle::query::LocalCrate;
 use rustc_middle::ty::TyCtxt;
@@ -49,8 +51,15 @@ fn partition_statics(tcx: TyCtxt<'_>, key: ()) -> MonoItemPartitions<'_> {
 
 fn repartition(tcx: TyCtxt<'_>, key: (), exported: Exported) -> MonoItemPartitions<'_> {
     let base = (base().queries.collect_and_partition_mono_items)(tcx, key);
-    let units: Vec<CodegenUnit<'_>> = base.codegen_units.iter().map(|unit| exported_unit(unit, exported)).collect();
-    MonoItemPartitions { codegen_units: tcx.arena.alloc_from_iter(units), all_mono_items: base.all_mono_items }
+    let units: Vec<CodegenUnit<'_>> = base
+        .codegen_units
+        .iter()
+        .map(|unit| exported_unit(unit, exported))
+        .collect();
+    MonoItemPartitions {
+        codegen_units: tcx.arena.alloc_from_iter(units),
+        all_mono_items: base.all_mono_items,
+    }
 }
 
 fn exported_unit<'tcx>(unit: &CodegenUnit<'tcx>, exported: Exported) -> CodegenUnit<'tcx> {
@@ -60,7 +69,8 @@ fn exported_unit<'tcx>(unit: &CodegenUnit<'tcx>, exported: Exported) -> CodegenU
         copy.make_primary();
     }
     for (item, data) in unit.items() {
-        copy.items_mut().insert(*item, exported_item(item, *data, exported));
+        copy.items_mut()
+            .insert(*item, exported_item(item, *data, exported));
     }
     copy.compute_size_estimate();
     copy
@@ -75,18 +85,36 @@ fn exported_item(item: &MonoItem<'_>, data: MonoItemData, exported: Exported) ->
         (MonoItem::Static(_), _) => data.linkage,
         _ => return data,
     };
-    MonoItemData { linkage, visibility: Visibility::Default, ..data }
+    MonoItemData {
+        linkage,
+        visibility: Visibility::Default,
+        ..data
+    }
 }
 
-fn exported<'tcx>(tcx: TyCtxt<'tcx>, krate: LocalCrate) -> &'tcx [(ExportedSymbol<'tcx>, SymbolExportInfo)] {
+fn exported<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    krate: LocalCrate,
+) -> &'tcx [(ExportedSymbol<'tcx>, SymbolExportInfo)] {
     let base = (base().queries.exported_generic_symbols)(tcx, krate);
-    let info = SymbolExportInfo { level: SymbolExportLevel::Rust, kind: SymbolExportKind::Text, used: false, rustc_std_internal_symbol: false };
+    let info = SymbolExportInfo {
+        level: SymbolExportLevel::Rust,
+        kind: SymbolExportKind::Text,
+        used: false,
+        rustc_std_internal_symbol: false,
+    };
     let mut seen = FxHashSet::default();
     let units = tcx.collect_and_partition_mono_items(()).codegen_units;
-    let instances = units.iter().flat_map(|unit| unit.items().keys()).filter_map(|item| match item {
-        MonoItem::Fn(instance) => Some(*instance),
-        _ => None,
-    });
-    let added: Vec<_> = instances.filter(|instance| seen.insert(*instance)).map(|instance| (ExportedSymbol::NoDefId(tcx.symbol_name(instance)), info)).collect();
+    let instances = units
+        .iter()
+        .flat_map(|unit| unit.items().keys())
+        .filter_map(|item| match item {
+            MonoItem::Fn(instance) => Some(*instance),
+            _ => None,
+        });
+    let added: Vec<_> = instances
+        .filter(|instance| seen.insert(*instance))
+        .map(|instance| (ExportedSymbol::NoDefId(tcx.symbol_name(instance)), info))
+        .collect();
     tcx.arena.alloc_from_iter(base.iter().copied().chain(added))
 }

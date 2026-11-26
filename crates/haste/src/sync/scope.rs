@@ -23,7 +23,11 @@ struct Pool {
 static POOL: OnceLock<Pool> = OnceLock::new();
 
 fn pool() -> &'static Pool {
-    POOL.get_or_init(|| Pool { pid: std::process::id(), queue: Mutex::default(), ready: Condvar::new() })
+    POOL.get_or_init(|| Pool {
+        pid: std::process::id(),
+        queue: Mutex::default(),
+        ready: Condvar::new(),
+    })
 }
 
 impl Pool {
@@ -57,7 +61,10 @@ impl Pool {
                 continue;
             }
             queue.waiting += 1;
-            queue = self.ready.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue = self
+                .ready
+                .wait(queue)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             queue.waiting -= 1;
         }
     }
@@ -103,7 +110,11 @@ impl<'scope, T> Handle<'scope, T> {
             if let Some(result) = value.take() {
                 break result;
             }
-            value = self.slot.filled.wait(value).unwrap_or_else(std::sync::PoisonError::into_inner);
+            value = self
+                .slot
+                .filled
+                .wait(value)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         };
         if result.is_err() {
             lock(&self.shared.state).joined_panics += 1;
@@ -119,7 +130,10 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         F: FnOnce() -> T + Send + 'scope,
         T: Send + 'scope,
     {
-        let slot = Arc::new(Slot { value: Mutex::new(None), filled: Condvar::new() });
+        let slot = Arc::new(Slot {
+            value: Mutex::new(None),
+            filled: Condvar::new(),
+        });
         lock(&self.shared.state).running += 1;
         let (job_slot, shared) = (Arc::clone(&slot), Arc::clone(&self.shared));
         let job = move || {
@@ -137,9 +151,14 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         };
         let job: Box<dyn FnOnce() -> bool + Send + 'scope> = Box::new(job);
         // SAFETY: `scope` waits until `running` is zero before it returns or unwinds, and a job lowers `running` only after it dropped `f` and its own hold on the slot, so nothing borrowed for 'scope outlives the scope.
-        let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() -> bool + Send + 'scope>, Job>(job) };
+        let job: Job =
+            unsafe { std::mem::transmute::<Box<dyn FnOnce() -> bool + Send + 'scope>, Job>(job) };
         pool().submit(job);
-        Handle { slot, shared: Arc::clone(&self.shared), scope: PhantomData }
+        Handle {
+            slot,
+            shared: Arc::clone(&self.shared),
+            scope: PhantomData,
+        }
     }
 }
 
@@ -149,7 +168,11 @@ impl Drop for Wait {
     fn drop(&mut self) {
         let mut state = lock(&self.0.state);
         while state.running > 0 {
-            state = self.0.done.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = self
+                .0
+                .done
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 }
@@ -159,7 +182,11 @@ pub(crate) fn scope<'env, F, T>(f: F) -> T
 where
     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
 {
-    let scope = Scope { shared: Arc::new(Shared::default()), scope: PhantomData, env: PhantomData };
+    let scope = Scope {
+        shared: Arc::new(Shared::default()),
+        scope: PhantomData,
+        env: PhantomData,
+    };
     let wait = Wait(Arc::clone(&scope.shared));
     let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
     drop(wait);

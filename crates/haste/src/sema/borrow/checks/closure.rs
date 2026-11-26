@@ -52,20 +52,34 @@ impl Checker<'_, '_> {
         let sig_src = fn_item.map_or(self.src, |item| self.cx.item(item).0);
         for (idx, &id) in arg_ids.iter().enumerate() {
             let param_idx = if has_self_arg {
-                let Some(p) = idx.checked_sub(1) else { continue };
+                let Some(p) = idx.checked_sub(1) else {
+                    continue;
+                };
                 p
             } else {
                 idx
             };
-            let Some(&(_, param_ty)) = sig.params.get(param_idx) else { continue };
+            let Some(&(_, param_ty)) = sig.params.get(param_idx) else {
+                continue;
+            };
             let arg = ExprId(id);
             let ref_static = matches!(*sig.body.ty(param_ty), AstTy::Ref { lifetime: Some(lt), .. } if sig_src.text(lt) == "'static");
             let bounds = self.param_bound_reqs(sig, sig_src, param_ty);
             if bounds.req_static || ref_static {
                 self.check_static_arg(arg, state)?;
             }
-            if bounds.req_fn || bounds.req_fn_mut || bounds.req_static || !bounds.hrtb_params.is_empty() {
-                self.check_closure_arg_reqs(arg, bounds.req_fn, bounds.req_fn_mut, bounds.req_static, &bounds.hrtb_params)?;
+            if bounds.req_fn
+                || bounds.req_fn_mut
+                || bounds.req_static
+                || !bounds.hrtb_params.is_empty()
+            {
+                self.check_closure_arg_reqs(
+                    arg,
+                    bounds.req_fn,
+                    bounds.req_fn_mut,
+                    bounds.req_static,
+                    &bounds.hrtb_params,
+                )?;
             }
         }
         Ok(())
@@ -78,27 +92,50 @@ impl Checker<'_, '_> {
         };
         let pos = self.typed.params.iter().position(|&p| p == local)?;
         let sig = self.cx.signature(self.item).ok()?;
-        let param_idx = if sig.receiver.is_some() { pos.checked_sub(1)? } else { pos };
+        let param_idx = if sig.receiver.is_some() {
+            pos.checked_sub(1)?
+        } else {
+            pos
+        };
         let &(_, param_ty) = sig.params.get(param_idx)?;
         Some(self.param_bound_reqs(&sig, self.src, param_ty))
     }
 
-    pub(in super::super) fn callee_hrtb_non_ret_params(&mut self, callee: ExprId, ret_has_borrow: bool) -> Vec<usize> {
+    pub(in super::super) fn callee_hrtb_non_ret_params(
+        &mut self,
+        callee: ExprId,
+        ret_has_borrow: bool,
+    ) -> Vec<usize> {
         let Some(bounds) = self.callee_param_bounds(callee) else {
             return Vec::new();
         };
-        if ret_has_borrow { bounds.hrtb_non_ret } else { bounds.hrtb_params }
+        if ret_has_borrow {
+            bounds.hrtb_non_ret
+        } else {
+            bounds.hrtb_params
+        }
     }
 
-    pub(in super::super) fn check_callee_bound_args(&mut self, callee: ExprId, arg_ids: &[u32], state: &State) -> Result<()> {
+    pub(in super::super) fn check_callee_bound_args(
+        &mut self,
+        callee: ExprId,
+        arg_ids: &[u32],
+        state: &State,
+    ) -> Result<()> {
         let Some(bounds) = self.callee_param_bounds(callee) else {
             return Ok(());
         };
         for (p_idx, outer_elided) in bounds.caller_lt_params {
-            let Some(&id) = arg_ids.get(p_idx) else { continue };
+            let Some(&id) = arg_ids.get(p_idx) else {
+                continue;
+            };
             let arg = self.unwrap_parens(ExprId(id));
             let check_expr = if outer_elided
-                && let Expr::Ref { raw: false, expr: inner, .. } = *self.body.expr(arg)
+                && let Expr::Ref {
+                    raw: false,
+                    expr: inner,
+                    ..
+                } = *self.body.expr(arg)
             {
                 inner
             } else {
@@ -131,7 +168,9 @@ impl Checker<'_, '_> {
                                 _ => false,
                             };
                             if is_callable && let Some(Args::Paren { inputs, output }) = seg.args {
-                                let out_elided = output.is_some_and(|out_ty| ast_ty_may_carry_elided_lt(&sig.body, src, out_ty));
+                                let out_elided = output.is_some_and(|out_ty| {
+                                    ast_ty_may_carry_elided_lt(&sig.body, src, out_ty)
+                                });
                                 let mut out_lts = Lifetimes::default();
                                 if let Some(out_ty) = output {
                                     collect_ty_lifetimes(&sig.body, src, out_ty, &mut out_lts);
@@ -139,28 +178,50 @@ impl Checker<'_, '_> {
                                 for (p_idx, &in_ty) in sig.body.list(inputs).iter().enumerate() {
                                     let mut in_lts = Lifetimes::default();
                                     collect_ty_lifetimes(&sig.body, src, TyId(in_ty), &mut in_lts);
-                                    let outer_elided = matches!(*sig.body.ty(TyId(in_ty)), AstTy::Ref { lifetime: None, .. });
+                                    let outer_elided = matches!(
+                                        *sig.body.ty(TyId(in_ty)),
+                                        AstTy::Ref { lifetime: None, .. }
+                                    );
                                     let outer_named_hrtb = match *sig.body.ty(TyId(in_ty)) {
-                                        AstTy::Ref { lifetime: Some(lt), .. } => {
+                                        AstTy::Ref {
+                                            lifetime: Some(lt), ..
+                                        } => {
                                             let name = src.text(lt);
-                                            (name != "'static" && !sig.generics.iter().any(|g| g.kind == GenericKind::Lifetime && src.text(g.name) == name)).then_some(name)
+                                            (name != "'static"
+                                                && !sig.generics.iter().any(|g| {
+                                                    g.kind == GenericKind::Lifetime
+                                                        && src.text(g.name) == name
+                                                }))
+                                            .then_some(name)
                                         }
                                         _ => None,
                                     };
                                     let has_caller_lt = in_lts.saw_static
                                         || in_lts.named.iter().any(|&lt| {
-                                            sig.generics.iter().any(|g| g.kind == GenericKind::Lifetime && src.text(g.name) == lt)
+                                            sig.generics.iter().any(|g| {
+                                                g.kind == GenericKind::Lifetime
+                                                    && src.text(g.name) == lt
+                                            })
                                         });
                                     let outer_hrtb = outer_elided || outer_named_hrtb.is_some();
-                                    if has_caller_lt && !out.caller_lt_params.iter().any(|&(idx, _)| idx == p_idx) {
+                                    if has_caller_lt
+                                        && !out
+                                            .caller_lt_params
+                                            .iter()
+                                            .any(|&(idx, _)| idx == p_idx)
+                                    {
                                         out.caller_lt_params.push((p_idx, outer_hrtb));
                                     }
-                                    let is_hrtb = (outer_elided && in_lts.named.is_empty()) || outer_named_hrtb.is_some();
+                                    let is_hrtb = (outer_elided && in_lts.named.is_empty())
+                                        || outer_named_hrtb.is_some();
                                     if is_hrtb {
                                         if !out.hrtb_params.contains(&p_idx) {
                                             out.hrtb_params.push(p_idx);
                                         }
-                                        let ret_uses_hrtb = outer_named_hrtb.map_or(out_elided, |name| out_lts.named.contains(&name));
+                                        let ret_uses_hrtb = outer_named_hrtb
+                                            .map_or(out_elided, |name| {
+                                                out_lts.named.contains(&name)
+                                            });
                                         if !ret_uses_hrtb && !out.hrtb_non_ret.contains(&p_idx) {
                                             out.hrtb_non_ret.push(p_idx);
                                         }
@@ -195,7 +256,9 @@ impl Checker<'_, '_> {
                             && let AstTy::Path(pp) = *sig.body.ty(pty)
                         {
                             let psegs = sig.body.list(sig.body.path(pp).segments);
-                            if psegs.len() == 1 && src.text(sig.body.segments[psegs[0] as usize].name) == name {
+                            if psegs.len() == 1
+                                && src.text(sig.body.segments[psegs[0] as usize].name) == name
+                            {
                                 check_bounds(pred.bounds);
                             }
                         }
@@ -225,8 +288,12 @@ impl Checker<'_, '_> {
 
     pub(in super::super) fn fn_arg_returns_static(&mut self, arg: ExprId) -> bool {
         let arg = self.unwrap_parens(arg);
-        let Some(crate::sema::infer::Res::Fn(f_item, _)) = self.typed.res.get(&arg).copied() else { return false };
-        let Ok(sig) = self.cx.signature(f_item) else { return false };
+        let Some(crate::sema::infer::Res::Fn(f_item, _)) = self.typed.res.get(&arg).copied() else {
+            return false;
+        };
+        let Ok(sig) = self.cx.signature(f_item) else {
+            return false;
+        };
         let Some(ret_ast) = sig.ret else { return false };
         let sig_src = self.cx.item(f_item).0;
         let mut lts = Lifetimes::default();
@@ -234,7 +301,13 @@ impl Checker<'_, '_> {
         sig_returns_only_static(&sig, sig_src, ret_ast, &lts)
     }
 
-    fn check_closure_effects(&self, eff: &ClosureEffects, req_fn: bool, req_fn_mut: bool, req_static: bool) -> Result<()> {
+    fn check_closure_effects(
+        &self,
+        eff: &ClosureEffects,
+        req_fn: bool,
+        req_fn_mut: bool,
+        req_static: bool,
+    ) -> Result<()> {
         if (req_fn || req_fn_mut) && eff.moves_capture {
             bail!("cannot move out of a captured variable in an `Fn` or `FnMut` closure");
         }
@@ -255,9 +328,17 @@ impl Checker<'_, '_> {
         req_static: bool,
         hrtb_params: &[usize],
     ) -> Result<()> {
-        let Some(c_expr) = self.closure_expr_of(expr) else { return Ok(()) };
-        let Some(eff) = self.closure_effects.get(&c_expr) else { return Ok(()) };
-        if eff.param_loans.iter().any(|pl| hrtb_params.contains(&pl.param_idx) && !pl.derefs_past_outer_ref) {
+        let Some(c_expr) = self.closure_expr_of(expr) else {
+            return Ok(());
+        };
+        let Some(eff) = self.closure_effects.get(&c_expr) else {
+            return Ok(());
+        };
+        if eff
+            .param_loans
+            .iter()
+            .any(|pl| hrtb_params.contains(&pl.param_idx) && !pl.derefs_past_outer_ref)
+        {
             bail!("borrowed data escapes outside of closure");
         }
         self.check_closure_effects(eff, req_fn, req_fn_mut, req_static)
@@ -295,8 +376,12 @@ impl Checker<'_, '_> {
         state: &mut State,
     ) -> Result<()> {
         for (idx, &id) in arg_ids.iter().enumerate() {
-            let Some(c_expr) = self.closure_expr_of(ExprId(id)) else { continue };
-            let Some(eff) = self.closure_effects.get(&c_expr).cloned() else { continue };
+            let Some(c_expr) = self.closure_expr_of(ExprId(id)) else {
+                continue;
+            };
+            let Some(eff) = self.closure_effects.get(&c_expr).cloned() else {
+                continue;
+            };
             if eff.param_loans.is_empty() {
                 continue;
             }
@@ -307,7 +392,8 @@ impl Checker<'_, '_> {
                 .cloned()
                 .collect();
             for (other_idx, &other_id) in arg_ids.iter().enumerate() {
-                if other_idx != idx && self.closure_expr_of(ExprId(other_id)).is_none()
+                if other_idx != idx
+                    && self.closure_expr_of(ExprId(other_id)).is_none()
                     && let Some(srcs) = arg_sources.get(other_idx)
                 {
                     outer_sources.extend(srcs.iter().filter(|s| !s.env_only).cloned());
@@ -372,7 +458,12 @@ impl Checker<'_, '_> {
                 let copies_inner_ref = l.steps.as_slice() == [PlaceStep::Deref]
                     && target_ty != crate::sema::ty::Ty::NONE
                     && matches!(*self.cx.types.kind(target_ty), Kind::Ref(_, inner) if self.is_ref_ty(inner));
-                let derefs_past_outer_ref = l.steps.iter().filter(|s| matches!(s, PlaceStep::Deref)).count() >= 2;
+                let derefs_past_outer_ref = l
+                    .steps
+                    .iter()
+                    .filter(|s| matches!(s, PlaceStep::Deref))
+                    .count()
+                    >= 2;
                 param_loans.push(ClosureParamLoan {
                     param_idx,
                     holder,
@@ -380,13 +471,27 @@ impl Checker<'_, '_> {
                     derefs_past_outer_ref,
                 });
             } else if is_temp_target(l.target).is_none()
-                && self.scope_depth.get(l.target as usize).copied().unwrap_or(0) < closure_depth
+                && self
+                    .scope_depth
+                    .get(l.target as usize)
+                    .copied()
+                    .unwrap_or(0)
+                    < closure_depth
             {
                 outer_loans.push((holder, BorrowSource::from_loan(l)));
             }
         }
         for (holder, src) in &outer_loans {
-            push_loan(&mut state.loans, src.target, src.steps.clone(), Some(*holder), src.mutable, src.through_ref, false, src.env_only);
+            push_loan(
+                &mut state.loans,
+                src.target,
+                src.steps.clone(),
+                Some(*holder),
+                src.mutable,
+                src.through_ref,
+                false,
+                src.env_only,
+            );
         }
         self.closure_effects.insert(
             expr,
@@ -431,13 +536,21 @@ impl Checker<'_, '_> {
 
     pub(in super::super) fn check_coercion_vtables(&self) -> Result<()> {
         for coercion in self.typed.coercions.values() {
-            let Some(vtable) = coercion.vtable() else { continue };
-            let Kind::Closure(parent, _, at) = *self.cx.types.kind(vtable.ty) else { continue };
+            let Some(vtable) = coercion.vtable() else {
+                continue;
+            };
+            let Kind::Closure(parent, _, at) = *self.cx.types.kind(vtable.ty) else {
+                continue;
+            };
             if parent != self.item {
                 continue;
             }
-            let Kind::Dyn(of, ..) = *self.cx.types.kind(vtable.object) else { continue };
-            let Some(eff) = self.closure_effects.get(&ExprId(at)) else { continue };
+            let Kind::Dyn(of, ..) = *self.cx.types.kind(vtable.object) else {
+                continue;
+            };
+            let Some(eff) = self.closure_effects.get(&ExprId(at)) else {
+                continue;
+            };
             let lang = self.cx.lang(of);
             self.check_closure_effects(eff, lang == Some("fn"), lang == Some("fn_mut"), false)?;
         }
@@ -448,16 +561,42 @@ impl Checker<'_, '_> {
 fn is_prim_name(name: &str) -> bool {
     matches!(
         name,
-        "bool" | "char" | "str" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "f32" | "f64" | "String"
+        "bool"
+            | "char"
+            | "str"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "String"
     )
 }
 
 fn ast_ty_may_carry_elided_lt(body: &Body, src: &Source, ty_id: TyId) -> bool {
     match *body.ty(ty_id) {
         AstTy::Never | AstTy::Ptr { .. } => false,
-        AstTy::Paren(t) | AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Pat(t, _) => ast_ty_may_carry_elided_lt(body, src, t),
-        AstTy::Tuple(list) => body.list(list).iter().any(|&t| ast_ty_may_carry_elided_lt(body, src, TyId(t))),
-        AstTy::Ref { lifetime: Some(lt), ty, .. } if src.text(lt) == "'static" => ast_ty_may_carry_elided_lt(body, src, ty),
+        AstTy::Paren(t) | AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Pat(t, _) => {
+            ast_ty_may_carry_elided_lt(body, src, t)
+        }
+        AstTy::Tuple(list) => body
+            .list(list)
+            .iter()
+            .any(|&t| ast_ty_may_carry_elided_lt(body, src, TyId(t))),
+        AstTy::Ref {
+            lifetime: Some(lt),
+            ty,
+            ..
+        } if src.text(lt) == "'static" => ast_ty_may_carry_elided_lt(body, src, ty),
         AstTy::Path(path_id) => {
             let p = body.path(path_id);
             let segs = body.list(p.segments);
@@ -472,12 +611,17 @@ fn ast_ty_may_carry_elided_lt(body: &Body, src: &Source, ty_id: TyId) -> bool {
             if matches!(name, "Option" | "Result" | "Vec" | "Box")
                 && let Some(Args::Angle(args)) = seg.args
             {
-                return body.list(args).iter().any(|&a| match body.args[a as usize] {
-                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => ast_ty_may_carry_elided_lt(body, src, t),
-                    GenericArg::Lifetime(lt) => src.text(lt) != "'static",
-                    GenericArg::Const(_) => false,
-                    GenericArg::Constraint { .. } => true,
-                });
+                return body
+                    .list(args)
+                    .iter()
+                    .any(|&a| match body.args[a as usize] {
+                        GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                            ast_ty_may_carry_elided_lt(body, src, t)
+                        }
+                        GenericArg::Lifetime(lt) => src.text(lt) != "'static",
+                        GenericArg::Const(_) => false,
+                        GenericArg::Constraint { .. } => true,
+                    });
             }
             true
         }
@@ -485,7 +629,12 @@ fn ast_ty_may_carry_elided_lt(body: &Body, src: &Source, ty_id: TyId) -> bool {
     }
 }
 
-pub(in super::super) fn sig_returns_only_static(sig: &Signature, src: &Source, ret_ast: TyId, lts: &Lifetimes) -> bool {
+pub(in super::super) fn sig_returns_only_static(
+    sig: &Signature,
+    src: &Source,
+    ret_ast: TyId,
+    lts: &Lifetimes,
+) -> bool {
     if lts.has_elided || !lts.named.is_empty() || !lts.saw_static {
         return false;
     }
@@ -500,13 +649,21 @@ pub(in super::super) fn sig_returns_only_static(sig: &Signature, src: &Source, r
 
 fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, params: &[&str]) -> bool {
     match *body.ty(ty_id) {
-        AstTy::Ref { ty, .. } | AstTy::Ptr { ty, .. } | AstTy::Slice(ty) | AstTy::Array(ty, _) | AstTy::Paren(ty) | AstTy::Pat(ty, _) => {
-            ast_ty_has_type_param(body, src, ty, params)
-        }
-        AstTy::Tuple(list) => body.list(list).iter().any(|&t| ast_ty_has_type_param(body, src, TyId(t), params)),
+        AstTy::Ref { ty, .. }
+        | AstTy::Ptr { ty, .. }
+        | AstTy::Slice(ty)
+        | AstTy::Array(ty, _)
+        | AstTy::Paren(ty)
+        | AstTy::Pat(ty, _) => ast_ty_has_type_param(body, src, ty, params),
+        AstTy::Tuple(list) => body
+            .list(list)
+            .iter()
+            .any(|&t| ast_ty_has_type_param(body, src, TyId(t), params)),
         AstTy::Path(path_id) => {
             let p = body.path(path_id);
-            if p.qself.is_some_and(|(q, _)| ast_ty_has_type_param(body, src, q, params)) {
+            if p.qself
+                .is_some_and(|(q, _)| ast_ty_has_type_param(body, src, q, params))
+            {
                 return true;
             }
             let segs = body.list(p.segments);
@@ -517,12 +674,20 @@ fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, params: &[&str]
                 }
             }
             segs.iter().any(|&s| match body.segments[s as usize].args {
-                Some(Args::Angle(args)) => body.list(args).iter().any(|&a| match body.args[a as usize] {
-                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => ast_ty_has_type_param(body, src, t, params),
-                    _ => false,
-                }),
+                Some(Args::Angle(args)) => {
+                    body.list(args)
+                        .iter()
+                        .any(|&a| match body.args[a as usize] {
+                            GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                                ast_ty_has_type_param(body, src, t, params)
+                            }
+                            _ => false,
+                        })
+                }
                 Some(Args::Paren { inputs, output }) => {
-                    body.list(inputs).iter().any(|&t| ast_ty_has_type_param(body, src, TyId(t), params))
+                    body.list(inputs)
+                        .iter()
+                        .any(|&t| ast_ty_has_type_param(body, src, TyId(t), params))
                         || output.is_some_and(|o| ast_ty_has_type_param(body, src, o, params))
                 }
                 _ => false,

@@ -1,3 +1,5 @@
+mod settle;
+
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -82,7 +84,9 @@ impl InferOut {
 }
 
 pub(super) fn take_out() -> InferOut {
-    OUT_POOL.with(|pool| pool.borrow_mut().pop()).unwrap_or_default()
+    OUT_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default()
 }
 
 pub(super) fn recycle_out(out: &mut InferOut) {
@@ -113,9 +117,27 @@ impl Infer<'_, '_> {
             return ty;
         }
         match self.cx.types.kind(ty) {
-            Kind::IntVar(_) => if fall_back { self.cx.types.prim(Primitive::I32) } else { ty },
-            Kind::FloatVar(_) => if fall_back { self.cx.types.prim(Primitive::F64) } else { ty },
-            Kind::Var(_) => if fall_back { self.cx.types.unit() } else { ty },
+            Kind::IntVar(_) => {
+                if fall_back {
+                    self.cx.types.prim(Primitive::I32)
+                } else {
+                    ty
+                }
+            }
+            Kind::FloatVar(_) => {
+                if fall_back {
+                    self.cx.types.prim(Primitive::F64)
+                } else {
+                    ty
+                }
+            }
+            Kind::Var(_) => {
+                if fall_back {
+                    self.cx.types.unit()
+                } else {
+                    ty
+                }
+            }
             _ => {
                 let Ok(mapped) = super::super::ty::try_map_children::<_, std::convert::Infallible>(
                     self,
@@ -128,7 +150,11 @@ impl Infer<'_, '_> {
         }
     }
 
-    pub(super) fn map_substs(&mut self, id: super::super::substs::Substs, mut f: impl FnMut(&mut Self, Ty) -> Ty) -> super::super::substs::Substs {
+    pub(super) fn map_substs(
+        &mut self,
+        id: super::super::substs::Substs,
+        mut f: impl FnMut(&mut Self, Ty) -> Ty,
+    ) -> super::super::substs::Substs {
         let Ok(mapped) = super::super::ty::try_map_substs::<_, std::convert::Infallible>(
             self,
             id,
@@ -138,88 +164,15 @@ impl Infer<'_, '_> {
         mapped
     }
 
-    fn settle_all(&mut self) -> Result<()> {
-        self.settle_initial_passes()?;
-        self.settle_final_passes()?;
-        if let Some((of, substs)) = self.obligations.first() {
-            let ty = self.show(substs[0]);
-            anyhow::bail!("the trait bound `{ty}: {}` is not satisfied", self.cx.name(*of));
-        }
-        Ok(())
-    }
-
-    pub(super) fn settle_projection_loop(&mut self) -> Result<()> {
-        for _ in 0..crate::RECURSION_LIMIT {
-            let before = (self.projections.len(), self.obligations.len(), self.bound_vars());
-            self.settle_projections()?;
-            self.settle_obligations()?;
-            let stalled = self.projections.len() >= before.0
-                && self.obligations.len() >= before.1
-                && self.bound_vars() == before.2;
-            if self.obligations.is_empty() || stalled {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn settle_initial_passes(&mut self) -> Result<()> {
-        self.settle_projection_loop()?;
-        self.settle_opaques(true)?;
-        self.settle_awaits()?;
-        self.settle_operators(false)?;
-        self.settle_projection_loop()?;
-        self.settle_casts(false)
-    }
-
-    /// Gives each cast pointee that still has unresolved variables the pointee of the value cast, or records a widening coercion when the target unsizes it.
-    fn settle_casts(&mut self, final_pass: bool) -> Result<()> {
-        for (inner, found, target) in std::mem::take(&mut self.casts) {
-            let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else { continue };
-            if !self.has_vars(open) {
-                continue;
-            }
-            match *self.cx.types.kind(self.resolve(found)) {
-                Kind::Var(_) if !final_pass => self.casts.push((inner, found, target)),
-                Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => {
-                    if matches!(self.cx.types.kind(self.resolve(open)), Kind::Var(_)) || self.probe(|infer| infer.unifies(open, pointee)) {
-                        self.unify(open, pointee)?;
-                    } else if !self.out.coercions.contains_key(&inner)
-                        && let Some(coercion) = self.coercion(found, target)?
-                    {
-                        self.out.coercions.insert(inner, coercion);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn settle_final_passes(&mut self) -> Result<()> {
-        self.fall_back_residuals()?;
-        self.settle_projection_loop()?;
-        self.fall_back_operands()?;
-        self.fall_back_numbers()?;
-        self.fall_back_diverging()?;
-        self.settle_obligations()?;
-        self.settle_operators(true)?;
-        self.settle_projection_loop()?;
-        self.settle_casts(true)?;
-        self.settle_captures()
-    }
-
-    fn bound_vars(&self) -> usize {
-        self.vars.iter().filter(|slot| slot.is_some()).count()
-    }
-
     pub(super) fn finish(mut self) -> Result<Typed> {
         self.settle_all()?;
         self.ensure_no_type_vars()?;
         self.pack_typed()
     }
 
-    pub(super) fn finish_poly(mut self) -> Result<(Typed, Option<Box<super::poly::PolyState>>, bool)> {
+    pub(super) fn finish_poly(
+        mut self,
+    ) -> Result<(Typed, Option<Box<super::poly::PolyState>>, bool)> {
         self.settle_all()?;
         let clean = self.shared_here(None) && self.backlog() == 0 && !self.has_unbound_out_vars();
         let typed = self.pack_typed()?;
@@ -235,60 +188,11 @@ impl Infer<'_, '_> {
         let exprs = self.out.exprs.iter().copied().filter(|&ty| ty != Ty::NONE);
         let locals = self.out.locals.iter().map(|local| local.ty);
         let pats = self.out.pats.values().copied();
-        exprs.chain(locals).chain(pats).chain(self.out.ret).any(|ty| self.has_vars_seen(ty, &mut seen))
-    }
-
-    fn fall_back_numbers(&mut self) -> Result<()> {
-        let exprs = self.out.exprs.iter().copied().filter(|&ty| ty != Ty::NONE && self.cx.types.has_var_flag(ty));
-        let locals = self.out.locals.iter().map(|local| local.ty).filter(|&ty| self.cx.types.has_var_flag(ty));
-        let roots: Vec<Ty> = exprs.chain(locals).collect();
-        if roots.is_empty() {
-            return Ok(());
-        }
-        self.fall_back_in(roots)
-    }
-
-    /// Gives each integer and float variable inside `stack` its fallback type, `i32` or `f64`.
-    pub(super) fn fall_back_in(&mut self, mut stack: Vec<Ty>) -> Result<()> {
-        let mut seen = HashSet::default();
-        while let Some(ty) = stack.pop() {
-            if !self.cx.types.has_var_flag(ty) {
-                continue;
-            }
-            let ty = self.resolve(ty);
-            if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
-                continue;
-            }
-            let fallback = match self.cx.types.kind(ty) {
-                Kind::IntVar(_) => Primitive::I32,
-                Kind::FloatVar(_) => Primitive::F64,
-                kind => {
-                    stack.extend(kind.children(&self.cx.types));
-                    continue;
-                }
-            };
-            let prim = self.cx.types.prim(fallback);
-            self.unify(ty, prim)?;
-        }
-        Ok(())
-    }
-
-    /// Gives each `?` whose residual is still unknown the residual of the function's own `Try` type, the one `From` impl a generic body could use.
-    fn fall_back_residuals(&mut self) -> Result<()> {
-        let Some(of) = self.cx.lang_item("Try") else { return Ok(()) };
-        let calls: Vec<Res> = self.out.tries.values().map(|each| each.from_residual).collect();
-        for call in calls {
-            let Res::Fn(_, substs) = call else { continue };
-            let &[ret, residual] = self.cx.types.substs(substs) else { continue };
-            if self.has_vars(ret) || !self.has_vars(residual) {
-                continue;
-            }
-            let own = self.project(of, ret, Vec::new(), "Residual")?;
-            if self.probe(|infer| infer.unifies(own, residual)) {
-                self.unify(own, residual)?;
-            }
-        }
-        Ok(())
+        exprs
+            .chain(locals)
+            .chain(pats)
+            .chain(self.out.ret)
+            .any(|ty| self.has_vars_seen(ty, &mut seen))
     }
 
     fn pack_syntax(&mut self) -> Arc<SyntaxTables> {
@@ -327,7 +231,10 @@ impl Infer<'_, '_> {
         self.zonk_locals_and_closures();
         let syntax = self.pack_syntax();
         let mut raw_exprs = std::mem::take(&mut self.out.exprs);
-        let exprs: Box<[Ty]> = raw_exprs.drain(..).map(|ty| if ty == Ty::NONE { ty } else { self.zonk(ty) }).collect();
+        let exprs: Box<[Ty]> = raw_exprs
+            .drain(..)
+            .map(|ty| if ty == Ty::NONE { ty } else { self.zonk(ty) })
+            .collect();
         self.out.exprs = raw_exprs;
         let mut raw_pats = std::mem::take(&mut self.out.pats);
         let pats = PackedMap::pack(raw_pats.drain().map(|(pat, ty)| (pat, self.zonk(ty))));
@@ -368,14 +275,28 @@ impl Infer<'_, '_> {
             try_blocks,
             box_frees,
         };
-        Ok(Typed { tables: super::LazyTables::Eager(Arc::new(tables)), locals, params, ret, drops: Vec::new(), shape: Shape::default() })
+        Ok(Typed {
+            tables: super::LazyTables::Eager(Arc::new(tables)),
+            locals,
+            params,
+            ret,
+            drops: Vec::new(),
+            shape: Shape::default(),
+        })
     }
 
-    fn drain_res_field<K: Copy + Ord + std::hash::Hash>(&mut self, field: fn(&mut InferOut) -> &mut HashMap<K, Res>) -> Result<PackedMap<K, Res>> {
+    fn drain_res_field<K: Copy + Ord + std::hash::Hash>(
+        &mut self,
+        field: fn(&mut InferOut) -> &mut HashMap<K, Res>,
+    ) -> Result<PackedMap<K, Res>> {
         self.drain_mapped(field, Self::zonk_res)
     }
 
-    fn drain_mapped<K: Copy + Ord + std::hash::Hash, V>(&mut self, field: fn(&mut InferOut) -> &mut HashMap<K, V>, map_fn: fn(&mut Self, V) -> Result<V>) -> Result<PackedMap<K, V>> {
+    fn drain_mapped<K: Copy + Ord + std::hash::Hash, V>(
+        &mut self,
+        field: fn(&mut InferOut) -> &mut HashMap<K, V>,
+        map_fn: fn(&mut Self, V) -> Result<V>,
+    ) -> Result<PackedMap<K, V>> {
         let raw: Vec<(K, V)> = field(&mut self.out).drain().collect();
         if raw.is_empty() {
             return Ok(PackedMap::default());
@@ -388,198 +309,31 @@ impl Infer<'_, '_> {
     }
 
     fn zonk_for(&mut self, each: For) -> Result<For> {
-        Ok(For { into_iter: self.zonk_res(each.into_iter)?, next: self.zonk_res(each.next)?, iter: self.zonk(each.iter), option: self.zonk(each.option), some: each.some })
+        Ok(For {
+            into_iter: self.zonk_res(each.into_iter)?,
+            next: self.zonk_res(each.next)?,
+            iter: self.zonk(each.iter),
+            option: self.zonk(each.option),
+            some: each.some,
+        })
     }
 
     fn zonk_await(&mut self, each: Awaited) -> Result<Awaited> {
-        Ok(Awaited { into_future: self.zonk_res(each.into_future)?, future: self.zonk(each.future), poll: self.zonk_res(each.poll)?, polled: self.zonk(each.polled) })
+        Ok(Awaited {
+            into_future: self.zonk_res(each.into_future)?,
+            future: self.zonk(each.future),
+            poll: self.zonk_res(each.poll)?,
+            polled: self.zonk(each.polled),
+        })
     }
 
     fn zonk_try(&mut self, each: Tried) -> Result<Tried> {
-        Ok(Tried { branch: self.zonk_res(each.branch)?, from_residual: self.zonk_res(each.from_residual)?, flow: self.zonk(each.flow), ..each })
-    }
-
-    pub(super) fn settle_obligations(&mut self) -> Result<()> {
-        let limit = self.obligations.len().saturating_add(crate::RECURSION_LIMIT);
-        let mut steps = 0;
-        let mut at = 0;
-        while at < self.obligations.len() && steps < limit {
-            steps += 1;
-            let (of, substs) = self.obligations[at].clone();
-            if self.step_obligation(of, &substs)? {
-                self.obligations.swap_remove(at);
-            } else {
-                at += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
-        let self_ty = self.resolve(substs[0]);
-        if let Some(done) = self.step_var_obligation(of, self_ty, substs)? {
-            return Ok(done);
-        }
-        let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
-        let closed_key = (!self.has_vars(self_ty) && known).then(|| self.closed_obligation_key(of, substs));
-        if closed_key.is_some_and(|key| self.proved.contains(&key)) {
-            return Ok(true);
-        }
-        if self.poly.is_some() && closed_key.is_some() && self.any_has_params(substs) {
-            return self.poly_settle_obligation(of, self_ty, &substs[1..]);
-        }
-        let done = ((!known || self.any_has_params(substs)) && self.assume(of, substs)?)
-            || self.settled_by_impl(of, self_ty, &substs[1..])?;
-        if done && self.trail_depth == 0 && let Some(key) = closed_key {
-            self.proved.insert(key);
-        }
-        Ok(done)
-    }
-
-    fn closed_obligation_key(&mut self, of: ItemRef, substs: &[Ty]) -> (ItemRef, Substs) {
-        let resolved: Vec<Ty> = substs.iter().map(|&ty| self.substitute(ty)).collect();
-        (of, self.cx.types.intern_substs(&resolved))
-    }
-
-    fn step_var_obligation(&mut self, of: ItemRef, self_ty: Ty, substs: &[Ty]) -> Result<Option<bool>> {
-        match self.cx.types.kind(self_ty) {
-            Kind::Var(_) => {
-                let held = self.opaque_holds(of, substs)?;
-                Ok(Some(held == Some(true) || (held.is_none() && self.callable_opaque_holds(of, self_ty, &substs[1..])?)))
-            }
-            Kind::IntVar(_) | Kind::FloatVar(_) => Ok(Some(self.opaque_holds(of, substs)? == Some(true) || self.settled_num_var(of, self_ty, &substs[1..])?)),
-            _ => Ok(None),
-        }
-    }
-
-    fn settled_num_var(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-        let settled = self.trial(|infer| {
-            Ok(infer
-                .select(of, self_ty, args)?
-                .filter(|_| !infer.has_vars(self_ty))
-                .map(|_| ()))
-        })?;
-        Ok(settled.is_some())
-    }
-
-    fn settled_by_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-        Ok(self.builtin_obligation_holds(of, self_ty, args)? || self.select(of, self_ty, args)?.is_some())
-    }
-
-    fn builtin_obligation_holds(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-        if !self.has_vars(self_ty) {
-            if self.cx.lang(of) == Some("unsize") {
-                return Ok(args.first().is_some_and(|&to| !self.has_vars(to)) && self.unsize_holds(of, self_ty, args[0])?);
-            }
-            if self.compiler_decides(of, self_ty) {
-                return Ok(self.compiler_holds(of, self_ty));
-            }
-            if self.compiler_impl(of, self_ty)
-                || matches!(self.cx.lang(of), Some("discriminant_kind" | "bikeshed_guaranteed_no_drop"))
-                || self.object_holds(of, self_ty, args) == Some(true)
-            {
-                return Ok(true);
-            }
-        }
-        self.callable_obligation_holds(of, self_ty, args)
-    }
-
-    fn callable_obligation_holds(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-        self.check_callable_obligation(of, self_ty, args)
-    }
-
-    fn fall_back_diverging(&mut self) -> Result<()> {
-        let unit = self.cx.types.unit();
-        for index in 0..self.var_diverges.len() {
-            if self.var_diverges[index] && index < self.vars.len() && self.vars[index].is_none() {
-                let var = self.cx.types.intern(Kind::Var(index as u32));
-                self.unify(var, unit)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn ensure_no_type_vars(&self) -> Result<()> {
-        let mut seen = HashSet::default();
-        let tys = self
-            .out
-            .exprs
-            .iter()
-            .copied()
-            .filter(|&ty| ty != Ty::NONE)
-            .chain(self.out.locals.iter().map(|local| local.ty))
-            .chain(self.out.closures.values().map(|closure| closure.ret))
-            .chain(self.out.pats.values().copied())
-            .chain(self.out.ret);
-        for ty in tys {
-            self.check_no_type_vars(ty, &mut seen)?;
-        }
-        self.ensure_no_table_vars(&mut seen)
-    }
-
-    fn ensure_no_table_vars(&self, seen: &mut HashSet<Ty>) -> Result<()> {
-        for map in [&self.out.res, &self.out.operators, &self.out.try_blocks, &self.out.box_frees] {
-            for res in map.values() {
-                self.check_res_vars(res, seen)?;
-            }
-        }
-        for res in self.out.pat_res.values().chain(self.out.derefs.values()) {
-            self.check_res_vars(res, seen)?;
-        }
-        self.ensure_no_flow_vars(seen)
-    }
-
-    fn ensure_no_flow_vars(&self, seen: &mut HashSet<Ty>) -> Result<()> {
-        for each in self.out.fors.values() {
-            self.check_res_vars(&each.into_iter, seen)?;
-            self.check_res_vars(&each.next, seen)?;
-            self.check_no_type_vars(each.iter, seen)?;
-            self.check_no_type_vars(each.option, seen)?;
-        }
-        for each in self.out.awaits.values() {
-            self.check_res_vars(&each.into_future, seen)?;
-            self.check_res_vars(&each.poll, seen)?;
-            self.check_no_type_vars(each.future, seen)?;
-            self.check_no_type_vars(each.polled, seen)?;
-        }
-        for each in self.out.tries.values() {
-            self.check_res_vars(&each.branch, seen)?;
-            self.check_res_vars(&each.from_residual, seen)?;
-            self.check_no_type_vars(each.flow, seen)?;
-        }
-        Ok(())
-    }
-
-    fn check_no_type_vars(&self, ty: Ty, seen: &mut HashSet<Ty>) -> Result<()> {
-        if !self.cx.types.has_var_flag(ty) {
-            return Ok(());
-        }
-        let ty = self.resolve(ty);
-        if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
-            return Ok(());
-        }
-        match self.cx.types.kind(ty) {
-            Kind::Var(_) => anyhow::bail!("type annotations needed"),
-            kind => {
-                for child in kind.children(&self.cx.types) {
-                    self.check_no_type_vars(child, seen)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn check_res_vars(&self, res: &Res, seen: &mut HashSet<Ty>) -> Result<()> {
-        match res {
-            Res::Fn(_, substs) | Res::Ctor(_, _, substs) => {
-                for &ty in self.cx.types.substs(*substs) {
-                    self.check_no_type_vars(ty, seen)?;
-                }
-                Ok(())
-            }
-            Res::Const(ty) => self.check_no_type_vars(*ty, seen),
-            _ => Ok(()),
-        }
+        Ok(Tried {
+            branch: self.zonk_res(each.branch)?,
+            from_residual: self.zonk_res(each.from_residual)?,
+            flow: self.zonk(each.flow),
+            ..each
+        })
     }
 
     pub(super) fn zonk_res(&mut self, res: Res) -> Result<Res> {
@@ -588,13 +342,18 @@ impl Infer<'_, '_> {
                 let mapped = self.map_substs(substs, Self::zonk);
                 self.trait_call(item, mapped)
             }
-            Res::Ctor(item, variant, args) => Ok(Res::Ctor(item, variant, self.map_substs(args, Self::zonk))),
+            Res::Ctor(item, variant, args) => {
+                Ok(Res::Ctor(item, variant, self.map_substs(args, Self::zonk)))
+            }
             Res::Const(value) => Ok(Res::Const(self.zonk(value))),
             other => Ok(other),
         }
     }
+
     pub(super) fn init_poly_for_item(&mut self, item: ItemRef, param_count: u16) -> Result<()> {
-        let args: Vec<Ty> = (0..param_count).map(|idx| self.cx.types.intern(Kind::Param(idx))).collect();
+        let args: Vec<Ty> = (0..param_count)
+            .map(|idx| self.cx.types.intern(Kind::Param(idx)))
+            .collect();
         let substs = self.cx.types.intern_substs(&args);
         let root = Some(item.body_owner());
         (self.root, self.instance) = (root, Some((item, substs)));
@@ -622,8 +381,17 @@ pub fn is_copy(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<bool> {
 
 /// Whether `item` is a non-generic synchronous `fn(i64) -> i64` suitable as a JIT test case.
 pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
-    let Ok(sig) = cx.signature(item) else { return false };
-    if sig.params.len() != 1 || sig.ret.is_none() || sig.receiver.is_some() || sig.is_async || sig.variadic || sig.opaque || scope::type_params(&sig.generics).next().is_some() {
+    let Ok(sig) = cx.signature(item) else {
+        return false;
+    };
+    if sig.params.len() != 1
+        || sig.ret.is_none()
+        || sig.receiver.is_some()
+        || sig.is_async
+        || sig.variadic
+        || sig.opaque
+        || scope::type_params(&sig.generics).next().is_some()
+    {
         return false;
     }
     let i64_ty = cx.types.prim(Primitive::I64);
@@ -639,7 +407,13 @@ pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
 /// Whether `item` is a non-generic synchronous zero-argument `#[test]` function (`fn()` or `fn() -> T`), returning `Some(returns_unit)`.
 pub fn test_sig(cx: &mut Context<'_>, item: ItemRef) -> Option<bool> {
     let sig = cx.signature(item).ok()?;
-    if !sig.params.is_empty() || sig.receiver.is_some() || sig.is_async || sig.variadic || sig.opaque || scope::type_params(&sig.generics).next().is_some() {
+    if !sig.params.is_empty()
+        || sig.receiver.is_some()
+        || sig.is_async
+        || sig.variadic
+        || sig.opaque
+        || scope::type_params(&sig.generics).next().is_some()
+    {
         return None;
     }
     let unit = cx.types.unit();
@@ -653,6 +427,8 @@ pub fn test_sig(cx: &mut Context<'_>, item: ItemRef) -> Option<bool> {
 
 /// Whether `item` is a non-generic function suitable as a root for `haste build`.
 pub fn is_concrete_fn(cx: &mut Context<'_>, item: ItemRef) -> bool {
-    let Ok(sig) = cx.signature(item) else { return false };
+    let Ok(sig) = cx.signature(item) else {
+        return false;
+    };
     !sig.variadic && super::super::summary::expected_param_count(cx, item) == Some(0)
 }

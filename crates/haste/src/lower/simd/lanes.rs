@@ -11,8 +11,15 @@ use super::{Lanes, vec_type};
 
 impl Lower<'_, '_> {
     /// Emits the SIMD intrinsic `op` that has no operator of its own, using `Type::Vec` ops where supported.
-    pub(super) fn lane_intrinsic(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
-        let Some(&vector) = substs.first() else { bail!("a SIMD intrinsic with no vector") };
+    pub(super) fn lane_intrinsic(
+        &mut self,
+        op: Simd,
+        substs: &[Ty],
+        args: &[Value],
+    ) -> Result<Option<Value>> {
+        let Some(&vector) = substs.first() else {
+            bail!("a SIMD intrinsic with no vector")
+        };
         let lanes = self.lanes(vector)?;
         if let Some(value) = self.vec_lane_intrinsic(op, &lanes, args)? {
             return Ok(Some(value));
@@ -24,22 +31,51 @@ impl Lower<'_, '_> {
             return Ok(Some(value));
         }
         Ok(Some(match (op, args) {
-            (Simd::Unary(unary), &[x]) => self.scalar_map(&lanes, &[x], |lower, num, vals| lower.lane_unary(unary, num, vals[0]))?,
-            (Simd::Pair(pair), &[x, y]) => self.scalar_map(&lanes, &[x, y], |lower, num, vals| lower.lane_pair(pair, num, (vals[0], vals[1])))?,
-            (Simd::Fma, &[x, y, z]) => self.scalar_map(&lanes, &[x, y, z], |lower, num, vals| lower.lane_fma(num, vals))?,
-            (Simd::Sum { mul }, &[x, ref start @ ..]) => self.lane_sum(&lanes, x, (start.first().copied(), mul))?,
-            (Simd::MaskedLoad, &[mask, pointer, fallback]) => self.masked(substs, mask, pointer, Some(fallback))?,
+            (Simd::Unary(unary), &[x]) => self.scalar_map(&lanes, &[x], |lower, num, vals| {
+                lower.lane_unary(unary, num, vals[0])
+            })?,
+            (Simd::Pair(pair), &[x, y]) => {
+                self.scalar_map(&lanes, &[x, y], |lower, num, vals| {
+                    lower.lane_pair(pair, num, (vals[0], vals[1]))
+                })?
+            }
+            (Simd::Fma, &[x, y, z]) => {
+                self.scalar_map(&lanes, &[x, y, z], |lower, num, vals| {
+                    lower.lane_fma(num, vals)
+                })?
+            }
+            (Simd::Sum { mul }, &[x, ref start @ ..]) => {
+                self.lane_sum(&lanes, x, (start.first().copied(), mul))?
+            }
+            (Simd::MaskedLoad, &[mask, pointer, fallback]) => {
+                self.masked(substs, mask, pointer, Some(fallback))?
+            }
             (Simd::MaskedStore, &[mask, pointer, values]) => {
                 self.masked_store(substs, mask, pointer, values)?;
                 return Ok(None);
             }
-            (Simd::Unary(_) | Simd::Pair(_) | Simd::Fma | Simd::Sum { .. } | Simd::MaskedLoad | Simd::MaskedStore, _) => bail!("SIMD intrinsic {op:?} takes other arguments"),
+            (
+                Simd::Unary(_)
+                | Simd::Pair(_)
+                | Simd::Fma
+                | Simd::Sum { .. }
+                | Simd::MaskedLoad
+                | Simd::MaskedStore,
+                _,
+            ) => bail!("SIMD intrinsic {op:?} takes other arguments"),
             _ => return Ok(None),
         }))
     }
 
-    pub(super) fn vec_lane_intrinsic(&mut self, op: Simd, lanes: &Lanes, args: &[Value]) -> Result<Option<Value>> {
-        let Some(vec_ty) = vec_type(lanes) else { return Ok(None) };
+    pub(super) fn vec_lane_intrinsic(
+        &mut self,
+        op: Simd,
+        lanes: &Lanes,
+        args: &[Value],
+    ) -> Result<Option<Value>> {
+        let Some(vec_ty) = vec_type(lanes) else {
+            return Ok(None);
+        };
         match (op, args) {
             (Simd::Unary(unary), &[x]) => {
                 let v = self.ins().load(vec_ty, x, 0);
@@ -59,15 +95,35 @@ impl Lower<'_, '_> {
                 let (a, b) = (self.ins().load(vec_ty, x, 0), self.ins().load(vec_ty, y, 0));
                 let max = pair == LanePair::Max;
                 let out = match lanes.num {
-                    Num::Float(_) => if max { self.ins().fmax(a, b) } else { self.ins().fmin(a, b) },
-                    Num::Int { signed: true, .. } => if max { self.ins().smax(a, b) } else { self.ins().smin(a, b) },
-                    Num::Int { signed: false, .. } => if max { self.ins().umax(a, b) } else { self.ins().umin(a, b) },
+                    Num::Float(_) => {
+                        if max {
+                            self.ins().fmax(a, b)
+                        } else {
+                            self.ins().fmin(a, b)
+                        }
+                    }
+                    Num::Int { signed: true, .. } => {
+                        if max {
+                            self.ins().smax(a, b)
+                        } else {
+                            self.ins().smin(a, b)
+                        }
+                    }
+                    Num::Int { signed: false, .. } => {
+                        if max {
+                            self.ins().umax(a, b)
+                        } else {
+                            self.ins().umin(a, b)
+                        }
+                    }
                     Num::Bool => bail!("SIMD {pair:?} on boolean lane"),
                 };
                 Ok(Some(self.store_vec(out, vec_ty.bytes())))
             }
             (Simd::Pair(pair @ (LanePair::SaturatingAdd | LanePair::SaturatingSub)), &[x, y]) => {
-                let Num::Int { signed, .. } = lanes.num else { bail!("SIMD {pair:?} on non-integer lane") };
+                let Num::Int { signed, .. } = lanes.num else {
+                    bail!("SIMD {pair:?} on non-integer lane")
+                };
                 let (a, b) = (self.ins().load(vec_ty, x, 0), self.ins().load(vec_ty, y, 0));
                 let out = match (pair, signed) {
                     (LanePair::SaturatingAdd, true) => self.ins().sadd_sat(a, b),
@@ -77,22 +133,54 @@ impl Lower<'_, '_> {
                 };
                 Ok(Some(self.store_vec(out, vec_ty.bytes())))
             }
-            (Simd::Fma, &[a, b, c]) if matches!(vec_ty, Type::Vec { lane: Lane::F32, count: 2 | 4 } | Type::Vec { lane: Lane::F64, count: 1 | 2 }) => {
-                let op_ty = if vec_ty == (Type::Vec { lane: Lane::F64, count: 1 }) { Type::F64 } else { vec_ty };
-                let (va, vb, vc) = (self.ins().load(op_ty, a, 0), self.ins().load(op_ty, b, 0), self.ins().load(op_ty, c, 0));
+            (Simd::Fma, &[a, b, c])
+                if matches!(
+                    vec_ty,
+                    Type::Vec {
+                        lane: Lane::F32,
+                        count: 2 | 4
+                    } | Type::Vec {
+                        lane: Lane::F64,
+                        count: 1 | 2
+                    }
+                ) =>
+            {
+                let op_ty = if vec_ty
+                    == (Type::Vec {
+                        lane: Lane::F64,
+                        count: 1,
+                    }) {
+                    Type::F64
+                } else {
+                    vec_ty
+                };
+                let (va, vb, vc) = (
+                    self.ins().load(op_ty, a, 0),
+                    self.ins().load(op_ty, b, 0),
+                    self.ins().load(op_ty, c, 0),
+                );
                 let out = self.ins().fma(va, vb, vc);
                 Ok(Some(self.store_vec(out, op_ty.bytes())))
             }
             (Simd::Sum { mul }, &[x, ref start @ ..]) => {
                 let v = self.ins().load(vec_ty, x, 0);
-                self.vec_sum(lanes, vec_ty, v, (start.first().copied(), mul)).map(Some)
+                self.vec_sum(lanes, vec_ty, v, (start.first().copied(), mul))
+                    .map(Some)
             }
             _ => Ok(None),
         }
     }
 
-    pub(super) fn vec_sum(&mut self, lanes: &Lanes, vec_ty: Type, v: Value, (start, mul): (Option<Value>, bool)) -> Result<Value> {
-        let Some((lane, count)) = vec_ty.vec_shape() else { bail!("vec_sum requires a vector type") };
+    pub(super) fn vec_sum(
+        &mut self,
+        lanes: &Lanes,
+        vec_ty: Type,
+        v: Value,
+        (start, mul): (Option<Value>, bool),
+    ) -> Result<Value> {
+        let Some((lane, count)) = vec_ty.vec_shape() else {
+            bail!("vec_sum requires a vector type")
+        };
         let op = if mul { BinOp::Mul } else { BinOp::Add };
         if !mul && lane.is_int() {
             let sum = self.ins().reduce(ReduceOp::Add, v);
@@ -113,7 +201,14 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn ordered_float_sum(&mut self, lanes: &Lanes, count: u8, vec: Value, init: Value, mul: bool) -> Result<Value> {
+    fn ordered_float_sum(
+        &mut self,
+        lanes: &Lanes,
+        count: u8,
+        vec: Value,
+        init: Value,
+        mul: bool,
+    ) -> Result<Value> {
         let op = if mul { BinOp::Mul } else { BinOp::Add };
         let step = |lower: &mut Self, acc: Value, lane_idx: u8| {
             let val = lower.ins().extract(vec, lane_idx);
@@ -135,7 +230,13 @@ impl Lower<'_, '_> {
         }
     }
 
-    pub(super) fn tree_reduce_vec(&mut self, mul: bool, float: bool, count: u8, mut vec: Value) -> Value {
+    pub(super) fn tree_reduce_vec(
+        &mut self,
+        mul: bool,
+        float: bool,
+        count: u8,
+        mut vec: Value,
+    ) -> Value {
         let mut step = count / 2;
         while step > 0 {
             let s = usize::from(step);
@@ -152,7 +253,12 @@ impl Lower<'_, '_> {
         self.ins().extract(vec, 0)
     }
 
-    fn scalar_map(&mut self, lanes: &Lanes, inputs: &[Value], mut each: impl FnMut(&mut Self, Num, &[Value]) -> Result<Value>) -> Result<Value> {
+    fn scalar_map(
+        &mut self,
+        lanes: &Lanes,
+        inputs: &[Value],
+        mut each: impl FnMut(&mut Self, Num, &[Value]) -> Result<Value>,
+    ) -> Result<Value> {
         let (_, address) = self.lanes_slot(*lanes);
         let size = i64::from(lanes.size);
         let num = lanes.num;
@@ -193,7 +299,8 @@ impl Lower<'_, '_> {
         let counted = match op {
             LaneUnary::Ctlz => {
                 let zeros = self.ins().clz(value);
-                self.ins().iadd_imm(zeros, -i64::from(wide.bits() - ty.bits()))
+                self.ins()
+                    .iadd_imm(zeros, -i64::from(wide.bits() - ty.bits()))
             }
             _ => self.ins().popcnt(value),
         };
@@ -204,14 +311,22 @@ impl Lower<'_, '_> {
         match (op, num) {
             (LanePair::SaturatingAdd, Num::Int { ty, signed }) => {
                 if ty != Type::I128 {
-                    Ok(if signed { self.ins().sadd_sat(x, y) } else { self.ins().uadd_sat(x, y) })
+                    Ok(if signed {
+                        self.ins().sadd_sat(x, y)
+                    } else {
+                        self.ins().uadd_sat(x, y)
+                    })
                 } else {
                     self.saturating(BinOp::Add, (ty, signed), x, y)
                 }
             }
             (LanePair::SaturatingSub, Num::Int { ty, signed }) => {
                 if ty != Type::I128 {
-                    Ok(if signed { self.ins().ssub_sat(x, y) } else { self.ins().usub_sat(x, y) })
+                    Ok(if signed {
+                        self.ins().ssub_sat(x, y)
+                    } else {
+                        self.ins().usub_sat(x, y)
+                    })
                 } else {
                     self.saturating(BinOp::Sub, (ty, signed), x, y)
                 }
@@ -219,7 +334,16 @@ impl Lower<'_, '_> {
             (LanePair::Min, Num::Float(_)) => Ok(self.ins().fmin(x, y)),
             (LanePair::Max, Num::Float(_)) => Ok(self.ins().fmax(x, y)),
             (LanePair::Min | LanePair::Max, Num::Int { .. }) => {
-                let wins = self.apply(if op == LanePair::Min { BinOp::Lt } else { BinOp::Gt }, num, (x, y), num)?;
+                let wins = self.apply(
+                    if op == LanePair::Min {
+                        BinOp::Lt
+                    } else {
+                        BinOp::Gt
+                    },
+                    num,
+                    (x, y),
+                    num,
+                )?;
                 Ok(self.ins().select(wins, x, y))
             }
             _ => bail!("SIMD {op:?} on a lane it does not take"),
@@ -227,12 +351,21 @@ impl Lower<'_, '_> {
     }
 
     fn lane_fma(&mut self, num: Num, lanes: &[Value]) -> Result<Value> {
-        let Num::Float(_) = num else { bail!("`simd_fma` on a lane that is not a float") };
-        let &[a, b, c] = lanes else { bail!("`simd_fma` takes three arguments") };
+        let Num::Float(_) = num else {
+            bail!("`simd_fma` on a lane that is not a float")
+        };
+        let &[a, b, c] = lanes else {
+            bail!("`simd_fma` takes three arguments")
+        };
         Ok(self.ins().fma(a, b, c))
     }
 
-    fn lane_sum(&mut self, lanes: &Lanes, x: Value, (start, mul): (Option<Value>, bool)) -> Result<Value> {
+    fn lane_sum(
+        &mut self,
+        lanes: &Lanes,
+        x: Value,
+        (start, mul): (Option<Value>, bool),
+    ) -> Result<Value> {
         let op = if mul { BinOp::Mul } else { BinOp::Add };
         let initial = match start {
             Some(start) => start,
@@ -241,18 +374,31 @@ impl Lower<'_, '_> {
         let size = i64::from(lanes.size);
         let num = lanes.num;
         let machine = lanes.machine;
-        let out = self.emit_lane_loop(i64::from(start.is_none()), lanes.count, &[initial], |lower, idx, acc| {
-            let offset = lower.ins().imul_imm(idx, size);
-            let at = lower.ins().iadd(x, offset);
-            let value = lower.ins().load(machine, at, 0);
-            let next = lower.lane_op(op, num, (acc[0], value), machine)?;
-            Ok(vec![next])
-        })?;
+        let out = self.emit_lane_loop(
+            i64::from(start.is_none()),
+            lanes.count,
+            &[initial],
+            |lower, idx, acc| {
+                let offset = lower.ins().imul_imm(idx, size);
+                let at = lower.ins().iadd(x, offset);
+                let value = lower.ins().load(machine, at, 0);
+                let next = lower.lane_op(op, num, (acc[0], value), machine)?;
+                Ok(vec![next])
+            },
+        )?;
         Ok(out[0])
     }
 
-    fn masked(&mut self, substs: &[Ty], mask: Value, pointer: Value, fallback: Option<Value>) -> Result<Value> {
-        let (&[mask_ty, _, vector, ..], Some(fallback)) = (substs, fallback) else { bail!("`simd_masked_load` takes three types") };
+    fn masked(
+        &mut self,
+        substs: &[Ty],
+        mask: Value,
+        pointer: Value,
+        fallback: Option<Value>,
+    ) -> Result<Value> {
+        let (&[mask_ty, _, vector, ..], Some(fallback)) = (substs, fallback) else {
+            bail!("`simd_masked_load` takes three types")
+        };
         let (from, to) = (self.lanes(mask_ty)?, self.lanes(vector)?);
         let (_, address) = self.vector_slot(vector)?;
         let (from_size, to_size) = (i64::from(from.size), i64::from(to.size));
@@ -274,8 +420,16 @@ impl Lower<'_, '_> {
         Ok(address)
     }
 
-    fn masked_store(&mut self, substs: &[Ty], mask: Value, pointer: Value, values: Value) -> Result<()> {
-        let &[mask_ty, _, vector, ..] = substs else { bail!("`simd_masked_store` takes three types") };
+    fn masked_store(
+        &mut self,
+        substs: &[Ty],
+        mask: Value,
+        pointer: Value,
+        values: Value,
+    ) -> Result<()> {
+        let &[mask_ty, _, vector, ..] = substs else {
+            bail!("`simd_masked_store` takes three types")
+        };
         let (from, to) = (self.lanes(mask_ty)?, self.lanes(vector)?);
         let (_, spare) = self.vector_slot(vector)?;
         let (from_size, to_size) = (i64::from(from.size), i64::from(to.size));

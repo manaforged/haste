@@ -13,7 +13,14 @@ const CALL_ONCE: &str = "call_once";
 const CALLS_BY_REFERENCE: [&str; 2] = ["call", "call_mut"];
 
 /// The item kinds whose definitions a key names: functions, statics, and the types and traits a key's types name.
-const NAMED: [ItemKind; 6] = [ItemKind::Fn, ItemKind::Static, ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::Trait];
+const NAMED: [ItemKind; 6] = [
+    ItemKind::Fn,
+    ItemKind::Static,
+    ItemKind::Struct,
+    ItemKind::Enum,
+    ItemKind::Union,
+    ItemKind::Trait,
+];
 
 /// A closure type by its typeck root, the root's type arguments, and its place among the root's closures in the order their expressions end, with their count.
 pub(super) struct ClosureAt {
@@ -36,14 +43,20 @@ pub(super) fn identity(outline: &Outline, item: ItemRef) -> Option<String> {
     }
     let mut segments = vec![file.source.text(entry.name?).to_owned()];
     let mut holder = entry.parent;
-    if let Some(parent) = holder.and_then(|parent| file.items.items.get(parent as usize)).filter(|parent| matches!(parent.kind, ItemKind::Impl | ItemKind::Trait)) {
+    if let Some(parent) = holder
+        .and_then(|parent| file.items.items.get(parent as usize))
+        .filter(|parent| matches!(parent.kind, ItemKind::Impl | ItemKind::Trait))
+    {
         segments.push(file.source.spelled((parent.start, parent.body?)));
         holder = parent.parent;
     }
     if let Some(parent) = holder {
         (file.items.items.get(parent as usize)?.kind == ItemKind::Mod).then_some(())?;
     }
-    let at = krate.modules.iter().position(|module| module.file == item.file as usize && module.item == holder)?;
+    let at = krate
+        .modules
+        .iter()
+        .position(|module| module.file == item.file as usize && module.item == holder)?;
     let mut path = vec![outline.roots[item.krate as usize].name.replace('-', "_")];
     path.extend(super::key::module_path(krate, at));
     path.extend(segments.into_iter().rev());
@@ -52,19 +65,29 @@ pub(super) fn identity(outline: &Outline, item: ItemRef) -> Option<String> {
 
 /// The closure that closure type `ty` is, when its root holds no coroutine or inline constant.
 pub(super) fn closure(cx: &mut Context<'_>, ty: Ty) -> Option<ClosureAt> {
-    let Kind::Closure(root, outer, at) = *cx.types.kind(ty) else { return None };
+    let Kind::Closure(root, outer, at) = *cx.types.kind(ty) else {
+        return None;
+    };
     let outer = cx.types.substs(outer).to_vec();
     let body = cx.body(root).ok()?;
     let mut ends = Vec::new();
     for (index, expr) in body.exprs.iter().enumerate() {
         match expr {
             Expr::Closure { .. } => ends.push(index as u32),
-            Expr::Block { kind: BlockKind::Async | BlockKind::AsyncMove | BlockKind::Const, .. } => return None,
+            Expr::Block {
+                kind: BlockKind::Async | BlockKind::AsyncMove | BlockKind::Const,
+                ..
+            } => return None,
             _ => {}
         }
     }
     let order = ends.iter().position(|&end| end == at)?;
-    Some(ClosureAt { root, outer, order, count: ends.len() })
+    Some(ClosureAt {
+        root,
+        outer,
+        order,
+        count: ends.len(),
+    })
 }
 
 /// Whether the call method `item` of a closure runs it by value, or none when `item` is no closure call method.

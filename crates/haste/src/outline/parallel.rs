@@ -34,9 +34,17 @@ type Task = (usize, Crate, Vec<Option<Arc<View>>>);
 type Lock = (Mutex<Board>, Condvar);
 
 /// Loads every module of each crate where `selected[krate]` is true on `workers` threads.
-pub(super) fn load_selected(outline: &mut Outline, workers: usize, selected: &[bool]) -> Result<()> {
+pub(super) fn load_selected(
+    outline: &mut Outline,
+    workers: usize,
+    selected: &[bool],
+) -> Result<()> {
     let board = Board::new(std::mem::take(&mut outline.crates), selected);
-    let shared = Shared { cache: &outline.cache, deps: &outline.deps, reads: reads(&outline.deps) };
+    let shared = Shared {
+        cache: &outline.cache,
+        deps: &outline.deps,
+        reads: reads(&outline.deps),
+    };
     let lock: Lock = (Mutex::new(board), Condvar::new());
     crate::sync::scope(|scope| {
         for _ in 1..workers {
@@ -45,33 +53,64 @@ pub(super) fn load_selected(outline: &mut Outline, workers: usize, selected: &[b
         work(&lock, &shared);
     });
     let board = crate::sync::into_inner(lock.0);
-    outline.crates = board.crates.into_iter().map(Option::unwrap_or_default).collect();
+    outline.crates = board
+        .crates
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect();
     board.failed.map_or(Ok(()), |(_, error)| Err(error))
 }
 
 /// The crates that each crate's loader may read the exports of: every crate its dependencies reach.
 fn reads(deps: &[Vec<(String, usize)>]) -> Vec<Vec<usize>> {
-    let edges: Vec<Vec<usize>> = deps.iter().map(|each| each.iter().map(|(_, dep)| *dep).collect()).collect();
-    let reach = |krate: usize| -> Vec<usize> { dependents_of(&edges, &mut vec![false; deps.len()], [krate]).into_iter().filter(|&other| other != krate).collect() };
+    let edges: Vec<Vec<usize>> = deps
+        .iter()
+        .map(|each| each.iter().map(|(_, dep)| *dep).collect())
+        .collect();
+    let reach = |krate: usize| -> Vec<usize> {
+        dependents_of(&edges, &mut vec![false; deps.len()], [krate])
+            .into_iter()
+            .filter(|&other| other != krate)
+            .collect()
+    };
     (0..deps.len()).map(reach).collect()
 }
 
 impl Board {
     fn new(crates: Vec<Crate>, selected: &[bool]) -> Board {
-        let views = crates.iter().map(|tree| vec![Arc::new(tree.view())]).collect();
-        let done = crates.iter().enumerate().map(|(at, tree)| !selected.get(at).copied().unwrap_or(false) || !tree.partial()).collect();
-        Board { crates: crates.into_iter().map(Some).collect(), views, done, running: 0, failed: None }
+        let views = crates
+            .iter()
+            .map(|tree| vec![Arc::new(tree.view())])
+            .collect();
+        let done = crates
+            .iter()
+            .enumerate()
+            .map(|(at, tree)| !selected.get(at).copied().unwrap_or(false) || !tree.partial())
+            .collect();
+        Board {
+            crates: crates.into_iter().map(Some).collect(),
+            views,
+            done,
+            running: 0,
+            failed: None,
+        }
     }
 
     /// The view of crate `other` that crate `krate` reads at its next level, as the serial order shows it: after the same level for a lower crate, after the level before for a higher one; none until `other` gets there.
     fn shown(&self, krate: usize, other: usize) -> Option<&Arc<View>> {
         let views = &self.views[other];
         let at = self.views[krate].len() - 1 + usize::from(other < krate);
-        views.get(at).or_else(|| views.last().filter(|_| self.done[other]))
+        views
+            .get(at)
+            .or_else(|| views.last().filter(|_| self.done[other]))
     }
 
     fn ready(&self, krate: usize, reads: &[usize]) -> bool {
-        !self.done[krate] && self.crates[krate].is_some() && reads.iter().all(|&other| self.shown(krate, other).is_some())
+        !self.done[krate]
+            && self.crates[krate].is_some()
+            && reads
+                .iter()
+                .all(|&other| self.shown(krate, other).is_some())
     }
 
     /// Takes out the ready crate at the lowest level, the lowest crate first, with the views it reads.
@@ -132,7 +171,10 @@ fn next(lock: &Lock, shared: &Shared) -> Option<Task> {
             return Some(task);
         }
         if board.running == 0 {
-            board.failed = Some(((usize::MAX, usize::MAX), anyhow!("crate loading stalled with modules left to read")));
+            board.failed = Some((
+                (usize::MAX, usize::MAX),
+                anyhow!("crate loading stalled with modules left to read"),
+            ));
             lock.1.notify_all();
             return None;
         }
@@ -141,9 +183,18 @@ fn next(lock: &Lock, shared: &Shared) -> Option<Task> {
 }
 
 /// Reads the modules of crate `krate` that are declared now, in order, seeing the other crates through `seen`.
-fn level(shared: &Shared, krate: usize, holder: &mut Crate, seen: &[Option<Arc<View>>]) -> Result<()> {
+fn level(
+    shared: &Shared,
+    krate: usize,
+    holder: &mut Crate,
+    seen: &[Option<Arc<View>>],
+) -> Result<()> {
     let modules: Vec<usize> = holder.declared().collect();
-    let paths: Vec<PathBuf> = modules.iter().flat_map(|&module| holder.unread_files(module)).cloned().collect();
+    let paths: Vec<PathBuf> = modules
+        .iter()
+        .flat_map(|&module| holder.unread_files(module))
+        .cloned()
+        .collect();
     shared.cache.read_all(&paths);
     let deps = &shared.deps[krate];
     for module in modules {

@@ -11,9 +11,9 @@ use crate::outline::Outline;
 use crate::outline::item::ItemKind;
 use crate::outline::tree::File;
 
+use super::files::FIELD;
 use super::ident::identity;
 use super::key::{Place, on_disk};
-use super::files::FIELD;
 use super::sources::{FILE, Sources};
 
 const FUNCTION: &str = "fn";
@@ -50,10 +50,16 @@ impl Snapshot {
     pub(super) fn take(outline: &Outline, workspace: &Workspace) -> Snapshot {
         let mut snapshot = Snapshot::default();
         let mut rest = Vec::new();
-        for krate in (0..outline.crates.len()).filter(|&krate| outline.package(workspace, krate).local()) {
+        for krate in
+            (0..outline.crates.len()).filter(|&krate| outline.package(workspace, krate).local())
+        {
             for (index, file) in outline.crates[krate].files.iter().enumerate() {
                 let (functions, cut) = snapshot.file(outline, (krate, index), file);
-                rest.push((file.source.path.clone(), outside(&file.source.text, cut), functions));
+                rest.push((
+                    file.source.path.clone(),
+                    outside(&file.source.text, cut),
+                    functions,
+                ));
             }
         }
         snapshot.rest = FxBuildHasher.hash_one(&rest);
@@ -61,25 +67,53 @@ impl Snapshot {
     }
 
     /// Adds the named items of `file` and returns the text of functions whose identity is not unique, which joins the rest, with the byte ranges of the functions it holds apart.
-    fn file(&mut self, outline: &Outline, (krate, index): (usize, usize), file: &File) -> (Vec<String>, Vec<std::ops::Range<usize>>) {
+    fn file(
+        &mut self,
+        outline: &Outline,
+        (krate, index): (usize, usize),
+        file: &File,
+    ) -> (Vec<String>, Vec<std::ops::Range<usize>>) {
         let (text, mut doubled, mut cut) = (file.source.text.as_str(), Vec::new(), Vec::new());
-        let Some((name, read)) = on_disk(&file.source.path, text) else { return (vec![text.to_owned()], cut) };
+        let Some((name, read)) = on_disk(&file.source.path, text) else {
+            return (vec![text.to_owned()], cut);
+        };
         for at in 0..file.items.items.len() {
-            let item = ItemRef { krate: krate as u32, file: index as u32, item: at as u32 };
-            let Some((path, lo)) = identity(outline, item).zip(name_offset(file, at).filter(|&lo| (lo as usize) < read)) else { continue };
-            let place = Place { file: name.clone(), lo };
+            let item = ItemRef {
+                krate: krate as u32,
+                file: index as u32,
+                item: at as u32,
+            };
+            let Some((path, lo)) = identity(outline, item)
+                .zip(name_offset(file, at).filter(|&lo| (lo as usize) < read))
+            else {
+                continue;
+            };
+            let place = Place {
+                file: name.clone(),
+                lo,
+            };
             if file.items.items[at].kind != ItemKind::Fn {
                 self.items.insert(path, place);
                 continue;
             }
-            let Some(range) = range(file, at) else { continue };
-            let function = Function { hash: FxBuildHasher.hash_one(&text[range.clone()]), place, start: range.start as u32, end: range.end as u32 };
+            let Some(range) = range(file, at) else {
+                continue;
+            };
+            let function = Function {
+                hash: FxBuildHasher.hash_one(&text[range.clone()]),
+                place,
+                start: range.start as u32,
+                end: range.end as u32,
+            };
             if self.functions.insert(path.clone(), function).is_some() {
                 doubled.push(path);
             }
             cut.push(range);
         }
-        let doubled = doubled.into_iter().filter_map(|path| self.functions.remove(&path)).map(|function| text[function.start as usize..function.end as usize].to_owned());
+        let doubled = doubled
+            .into_iter()
+            .filter_map(|path| self.functions.remove(&path))
+            .map(|function| text[function.start as usize..function.end as usize].to_owned());
         (doubled.collect(), cut)
     }
 
@@ -90,37 +124,61 @@ impl Snapshot {
         }
         let mut changed = Changed::default();
         for (path, function) in &earlier.functions {
-            if self.functions.get(path).is_none_or(|now| now.hash != function.hash) {
-                changed.ranges.push((function.place.file.clone(), function.start, function.end));
+            if self
+                .functions
+                .get(path)
+                .is_none_or(|now| now.hash != function.hash)
+            {
+                changed
+                    .ranges
+                    .push((function.place.file.clone(), function.start, function.end));
                 changed.crates.insert(crate_of(path).to_owned());
             }
         }
-        changed.crates.extend(self.functions.keys().filter(|path| !earlier.functions.contains_key(*path)).map(|path| crate_of(path).to_owned()));
+        changed.crates.extend(
+            self.functions
+                .keys()
+                .filter(|path| !earlier.functions.contains_key(*path))
+                .map(|path| crate_of(path).to_owned()),
+        );
         Some(changed)
     }
 
     /// Where the item named `identity` was when this snapshot was taken.
     pub(super) fn place(&self, identity: &str) -> Option<&Place> {
-        self.functions.get(identity).map(|function| &function.place).or_else(|| self.items.get(identity))
+        self.functions
+            .get(identity)
+            .map(|function| &function.place)
+            .or_else(|| self.items.get(identity))
     }
 
     /// Writes this snapshot to `path`.
     pub(super) fn write(&self, path: &Path) -> Result<()> {
         let mut text = format!("{REST}{FIELD}{:016x}\n", self.rest);
         for (name, function) in &self.functions {
-            let Function { hash, place, start, end } = function;
+            let Function {
+                hash,
+                place,
+                start,
+                end,
+            } = function;
             text.push_str(&format!("{FUNCTION}{FIELD}{hash:016x}{FIELD}{}{FIELD}{}{FIELD}{start}{FIELD}{end}{FIELD}{name}\n", place.file, place.lo));
         }
         for (name, place) in &self.items {
-            text.push_str(&format!("{ITEM}{FIELD}{}{FIELD}{}{FIELD}{name}\n", place.file, place.lo));
+            text.push_str(&format!(
+                "{ITEM}{FIELD}{}{FIELD}{}{FIELD}{name}\n",
+                place.file, place.lo
+            ));
         }
         text.push_str(&self.sources.lines());
-        crate::graph::store::write_new(path, &text).with_context(|| format!("writing {}", path.display()))
+        crate::graph::store::write_new(path, &text)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     /// The snapshot written at `path`.
     pub(super) fn read(path: &Path) -> Result<Snapshot> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut snapshot = Snapshot::default();
         for line in text.lines() {
             if snapshot.line(line).is_none() {
@@ -136,11 +194,27 @@ impl Snapshot {
         match fields.as_slice() {
             [REST, hash] => self.rest = u64::from_str_radix(hash, 16).ok()?,
             [FUNCTION, hash, file, _, _, _, name] => {
-                let place = Place { file: (*file).to_owned(), lo: number(3)? };
-                let function = Function { hash: u64::from_str_radix(hash, 16).ok()?, place, start: number(4)?, end: number(5)? };
+                let place = Place {
+                    file: (*file).to_owned(),
+                    lo: number(3)?,
+                };
+                let function = Function {
+                    hash: u64::from_str_radix(hash, 16).ok()?,
+                    place,
+                    start: number(4)?,
+                    end: number(5)?,
+                };
                 self.functions.insert((*name).to_owned(), function);
             }
-            [ITEM, file, _, name] => _ = self.items.insert((*name).to_owned(), Place { file: (*file).to_owned(), lo: number(2)? }),
+            [ITEM, file, _, name] => {
+                _ = self.items.insert(
+                    (*name).to_owned(),
+                    Place {
+                        file: (*file).to_owned(),
+                        lo: number(2)?,
+                    },
+                )
+            }
             [FILE, rest @ ..] => self.sources.line(rest)?,
             _ => return None,
         }

@@ -60,7 +60,13 @@ impl Context<'_> {
 /// Gives the foreign function `item` the shape of the `global_asm!` block that defines its symbol, which calls each function the block's `sym` operands name.
 pub(super) fn bind(cx: &mut Context<'_>, item: ItemRef, typed: &mut Typed) {
     if let Some(block) = cx.global_asm(item) {
-        typed.shape = Shape::Asm(block.symbols.iter().map(|&(_, callee)| Res::Fn(callee, Substs::EMPTY)).collect());
+        typed.shape = Shape::Asm(
+            block
+                .symbols
+                .iter()
+                .map(|&(_, callee)| Res::Fn(callee, Substs::EMPTY))
+                .collect(),
+        );
     }
 }
 
@@ -73,7 +79,10 @@ fn table(cx: &mut Context<'_>) -> Table {
             let block = match block(cx, krate as u32, call) {
                 Ok(block) => Arc::new(block),
                 Err(error) => {
-                    table.unread.push(format!("{}: global_asm!: {error:#}", call.file.source.path.display()));
+                    table.unread.push(format!(
+                        "{}: global_asm!: {error:#}",
+                        call.file.source.path.display()
+                    ));
                     continue;
                 }
             };
@@ -94,12 +103,19 @@ fn globals(text: &str) -> impl Iterator<Item = &str> {
 
 fn block(cx: &mut Context<'_>, krate: u32, call: &Waiting) -> Result<Block> {
     let src = &call.file.source;
-    let Some(open) = call.file.items.items[call.at as usize].body else { bail!("no arguments") };
-    let home = ModRef { krate, module: call.owner as u32 };
+    let Some(open) = call.file.items.items[call.at as usize].body else {
+        bail!("no arguments")
+    };
+    let home = ModRef {
+        krate,
+        module: call.owner as u32,
+    };
     let args = src.args(open);
     let mut lines = Vec::new();
     for &range in &args {
-        let Some(line) = cx.template_text(home, src, range)? else { break };
+        let Some(line) = cx.template_text(home, src, range)? else {
+            break;
+        };
         lines.push(line);
     }
     if lines.is_empty() {
@@ -110,7 +126,10 @@ fn block(cx: &mut Context<'_>, krate: u32, call: &Waiting) -> Result<Block> {
         let (name, path) = operand(src, range, symbols.len())?;
         symbols.push((name, sym_target(cx, home, src, path)?));
     }
-    Ok(Block { text: lines.join("\n"), symbols })
+    Ok(Block {
+        text: lines.join("\n"),
+        symbols,
+    })
 }
 
 /// The name of the `sym` operand at `from..to`, its position `index` when it has none, and the tokens of its path.
@@ -121,19 +140,46 @@ fn operand(src: &Source, (from, to): (u32, u32), index: usize) -> Result<(String
     if to > from + 3 && src.kind(from + 1) == TokenKind::Eq && src.text(from + 2) == "sym" {
         return Ok((plain(src.text(from)).to_owned(), (from + 3, to)));
     }
-    bail!("only `sym` operands are supported, not `{}`", spell(src, (from, to)))
+    bail!(
+        "only `sym` operands are supported, not `{}`",
+        spell(src, (from, to))
+    )
 }
 
 /// The function that the path at `from..to` names in the value namespace of module `home`.
-fn sym_target(cx: &Context<'_>, home: ModRef, src: &Source, (from, to): (u32, u32)) -> Result<ItemRef> {
+fn sym_target(
+    cx: &Context<'_>,
+    home: ModRef,
+    src: &Source,
+    (from, to): (u32, u32),
+) -> Result<ItemRef> {
     let paths = cx.paths(home.krate);
-    let words = (from..to).filter(|&at| matches!(src.kind(at), TokenKind::Ident | TokenKind::RawIdent));
-    let segments: Vec<_> = words.map(|at| paths.symbols.intern(plain(src.text(at)))).collect();
-    let dollar = if src.kind(from) == TokenKind::Dollar { src.dollar(from) } else { None };
-    let path = Path { segments: &segments, absolute: src.kind(from) == TokenKind::Colon, dollar };
+    let words =
+        (from..to).filter(|&at| matches!(src.kind(at), TokenKind::Ident | TokenKind::RawIdent));
+    let segments: Vec<_> = words
+        .map(|at| paths.symbols.intern(plain(src.text(at))))
+        .collect();
+    let dollar = if src.kind(from) == TokenKind::Dollar {
+        src.dollar(from)
+    } else {
+        None
+    };
+    let path = Path {
+        segments: &segments,
+        absolute: src.kind(from) == TokenKind::Colon,
+        dollar,
+    };
     let found = match segments.split_last() {
         Some((last, [])) => paths.first(*last, home, &path).values,
-        Some((last, prefix)) => paths.resolve(&Path { segments: prefix, ..path }, home).and_then(|owner| paths.member(owner, *last).values),
+        Some((last, prefix)) => paths
+            .resolve(
+                &Path {
+                    segments: prefix,
+                    ..path
+                },
+                home,
+            )
+            .and_then(|owner| paths.member(owner, *last).values),
         None => None,
     };
     match found.map(|binding| binding.def) {

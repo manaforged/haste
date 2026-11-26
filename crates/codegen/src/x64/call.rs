@@ -1,6 +1,6 @@
 use super::asm::{Mem, Reg, Size};
-use super::{Abi, Emit};
 use super::frame::classify;
+use super::{Abi, Emit};
 use crate::CallAbi;
 use crate::alloc::CallTarget;
 use crate::frame::{Loc, is_tail};
@@ -13,8 +13,10 @@ impl Emit<'_> {
         let mut done = 0;
         for (width, bytes) in [(Size::Q, 8), (Size::D, 4), (Size::W, 2), (Size::B, 1)] {
             while size - done >= bytes {
-                self.asm.load(width, Reg::Rcx, Mem::new(Reg::Rax, done as i32));
-                self.asm.store(width, Mem::new(Reg::Rsp, (offset + done) as i32), Reg::Rcx);
+                self.asm
+                    .load(width, Reg::Rcx, Mem::new(Reg::Rax, done as i32));
+                self.asm
+                    .store(width, Mem::new(Reg::Rsp, (offset + done) as i32), Reg::Rcx);
                 done += bytes;
             }
         }
@@ -37,27 +39,37 @@ impl Emit<'_> {
             }
             Some(CallTarget::Runtime(rt)) if self.direct_calls => {
                 let at = self.asm.branch_pcrel32(tail);
-                self.relocs.push(StencilReloc::runtime(at, rt, RelocKind::PcRel32));
+                self.relocs
+                    .push(StencilReloc::runtime(at, rt, RelocKind::PcRel32));
             }
             Some(CallTarget::Runtime(rt)) => {
                 let at = self.asm.mov_abs64(Reg::R11);
-                self.relocs.push(StencilReloc::runtime(at, rt, RelocKind::Abs64));
+                self.relocs
+                    .push(StencilReloc::runtime(at, rt, RelocKind::Abs64));
                 emit_reg(&mut self.asm, Reg::R11);
             }
             Some(CallTarget::Symbol(sym)) if self.direct_calls => {
                 let at = self.asm.branch_pcrel32(tail);
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::PcRel32));
+                self.relocs
+                    .push(StencilReloc::symbol(at, sym, RelocKind::PcRel32));
             }
             Some(CallTarget::Symbol(sym)) => {
                 let at = self.asm.mov_abs64(Reg::R11);
-                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs64));
+                self.relocs
+                    .push(StencilReloc::symbol(at, sym, RelocKind::Abs64));
                 emit_reg(&mut self.asm, Reg::R11);
             }
             None => emit_reg(&mut self.asm, held.unwrap_or(Reg::R11)),
         }
     }
 
-    pub(super) fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
+    pub(super) fn arguments(
+        &mut self,
+        sig: SigRef,
+        callee: Value,
+        args: &[Value],
+        is_try: bool,
+    ) -> Result<Abi, String> {
         let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
         for (arg, loc) in args.iter().zip(&abi.params) {
             match *loc {
@@ -67,18 +79,24 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
-        if !is_try && (self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args)) {
+        if !is_try && (self.thread_cell_cold(callee, args) || self.cached_frame_cold(callee, args))
+        {
             self.clobber_call_spills();
             return Ok(abi);
         }
         let cell = match direct {
-            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot, lookup)).map(|hit| (lookup, hit)),
+            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args
+                .first()
+                .and_then(|&slot| self.thread_cell_hit(slot, lookup))
+                .map(|hit| (lookup, hit)),
             _ => None,
         };
         if cell.is_some() {
             self.clobber_reg(Reg::Rax);
         }
-        let held = self.reg_of(callee).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
+        let held = self
+            .reg_of(callee)
+            .filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {
             values.push(callee);
@@ -87,13 +105,19 @@ impl Emit<'_> {
         let float_count = self.move_locs(&values, &locs, Some(Reg::Rax));
         let func = self.func;
         self.leave_wide(&func.sigs[sig.index()].params);
-        if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
+        if self.abi_kind == CallAbi::SysV
+            && self.func.sigs[sig.index()]
+                .params
+                .iter()
+                .any(|param| param.purpose == ArgumentPurpose::Variadic)
+        {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
         }
         self.asm.flags_overwritten();
         if let Some((lookup, hit)) = cell {
             let at = self.asm.call_pcrel32();
-            self.relocs.push(StencilReloc::symbol(at, lookup, RelocKind::PcRel32));
+            self.relocs
+                .push(StencilReloc::symbol(at, lookup, RelocKind::PcRel32));
             self.asm.bind(hit);
             self.clobber_call_spills();
             return Ok(abi);
@@ -111,7 +135,10 @@ impl Emit<'_> {
         if !is_tail(&self.tail_calls, inst) {
             return Ok(false);
         }
-        let Op::Call { sig, callee, args, .. } = &self.func.insts[inst.index()].op else {
+        let Op::Call {
+            sig, callee, args, ..
+        } = &self.func.insts[inst.index()].op
+        else {
             return Ok(false);
         };
         let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
@@ -123,9 +150,11 @@ impl Emit<'_> {
                 _ => false,
             })
         };
-        let held = self
-            .reg_of(*callee)
-            .filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx | Reg::Rbp | Reg::Rsp) && !self.frame.saves.contains(&reg) && !arg_uses(reg));
+        let held = self.reg_of(*callee).filter(|&reg| {
+            !matches!(reg, Reg::Rax | Reg::Rcx | Reg::Rbp | Reg::Rsp)
+                && !self.frame.saves.contains(&reg)
+                && !arg_uses(reg)
+        });
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {
             values.push(*callee);
@@ -134,7 +163,12 @@ impl Emit<'_> {
         let float_count = self.move_locs(&values, &locs, Some(Reg::Rax));
         let func = self.func;
         self.leave_wide(&func.sigs[sig.index()].params);
-        if self.abi_kind == CallAbi::SysV && func.sigs[sig.index()].params.iter().any(|p| p.purpose == ArgumentPurpose::Variadic) {
+        if self.abi_kind == CallAbi::SysV
+            && func.sigs[sig.index()]
+                .params
+                .iter()
+                .any(|p| p.purpose == ArgumentPurpose::Variadic)
+        {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
         }
         if !self.in_fast {

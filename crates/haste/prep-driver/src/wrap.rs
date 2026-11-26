@@ -80,9 +80,13 @@ pub fn main(args: Vec<String>) -> ExitCode {
     rustc_driver::install_ice_hook(BUG_URL, |_| ());
     let args = compiler_args(args);
     let Some((opts, unit)) = plan(&args) else {
-        return rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&args, &mut Plain));
+        return rustc_driver::catch_with_exit_code(|| {
+            rustc_driver::run_compiler(&args, &mut Plain)
+        });
     };
-    let phase = std::env::var(PHASE).ok().and_then(|name| Phase::ALL.into_iter().find(|phase| phase.name() == name));
+    let phase = std::env::var(PHASE)
+        .ok()
+        .and_then(|name| Phase::ALL.into_iter().find(|phase| phase.name() == name));
     match phase {
         Some(phase) => compile(&args, &opts, unit, phase),
         None => prep(&args, unit),
@@ -122,7 +126,11 @@ fn prep(args: &[String], unit: Unit) -> ExitCode {
 
 /// Starts this driver again on `args` to run the prep compile `phase` alone.
 fn spawn(args: &[String], phase: Phase) -> std::io::Result<std::process::Child> {
-    std::process::Command::new(std::env::current_exe()?).args(args).env(PHASE, phase.name()).stdin(std::process::Stdio::null()).spawn()
+    std::process::Command::new(std::env::current_exe()?)
+        .args(args)
+        .env(PHASE, phase.name())
+        .stdin(std::process::Stdio::null())
+        .spawn()
 }
 
 /// Runs the prep compile `phase` of the crate that `opts` builds.
@@ -131,7 +139,9 @@ fn compile(args: &[String], opts: &[Opt], unit: Unit, phase: Phase) -> ExitCode 
     match phase {
         Phase::Release => {
             let released = args::prep(program, opts, &unit.dir.join(RELEASE), phase.name());
-            rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&released, &mut Released))
+            rustc_driver::catch_with_exit_code(|| {
+                rustc_driver::run_compiler(&released, &mut Released)
+            })
         }
         Phase::Exported => {
             let exported = args::prep(program, opts, &unit.dir, phase.name());
@@ -142,7 +152,11 @@ fn compile(args: &[String], opts: &[Opt], unit: Unit, phase: Phase) -> ExitCode 
 }
 
 fn compiler_args(mut args: Vec<String>) -> Vec<String> {
-    let wrapped = args.get(1).is_some_and(|arg| Path::new(arg).file_stem().is_some_and(|stem| stem == "rustc"));
+    let wrapped = args.get(1).is_some_and(|arg| {
+        Path::new(arg)
+            .file_stem()
+            .is_some_and(|stem| stem == "rustc")
+    });
     if wrapped {
         args.remove(0);
     }
@@ -163,20 +177,37 @@ fn plan(args: &[String]) -> Option<(Vec<Opt>, Unit)> {
 }
 
 fn prepped(opts: &[Opt], name: &str) -> bool {
-    let printing = opts.iter().any(|opt| opt.flag == "--print" || opt.flag == "-vV" || opt.flag == "-V");
-    let proc_macro = opts.iter().any(|opt| opt.flag == "--crate-type" && opt.value.as_deref() == Some("proc-macro"));
-    let input = opts.iter().any(|opt| opt.value.is_none() && !opt.flag.starts_with('-'));
+    let printing = opts
+        .iter()
+        .any(|opt| opt.flag == "--print" || opt.flag == "-vV" || opt.flag == "-V");
+    let proc_macro = opts
+        .iter()
+        .any(|opt| opt.flag == "--crate-type" && opt.value.as_deref() == Some("proc-macro"));
+    let input = opts
+        .iter()
+        .any(|opt| opt.value.is_none() && !opt.flag.starts_with('-'));
     input && !printing && !proc_macro && !name.starts_with("build_script_")
 }
 
 fn keep_outputs(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-        if name.ends_with(".o") || name == record::MANIFEST || name == record::LINK || name == RELEASE {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".o")
+            || name == record::MANIFEST
+            || name == record::LINK
+            || name == RELEASE
+        {
             continue;
         }
-        if path.is_dir() { std::fs::remove_dir_all(&path)? } else { std::fs::remove_file(&path)? }
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?
+        } else {
+            std::fs::remove_file(&path)?
+        }
     }
     Ok(())
 }

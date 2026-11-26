@@ -73,35 +73,63 @@ pub struct Workspace {
 }
 
 fn cargo_home() -> Result<PathBuf> {
-    let home = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
     home.context("no CARGO_HOME or HOME")
 }
 
 fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
-    Ok(std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?.filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| path.is_dir()).collect())
+    Ok(std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect())
 }
 
 fn registry_dirs() -> Result<Vec<PathBuf>> {
     subdirs(&cargo_home()?.join("registry/src"))
 }
 
-fn source_dir(locked: &Locked, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<PathBuf> {
+fn source_dir(
+    locked: &Locked,
+    registries: &[PathBuf],
+    paths: &BTreeMap<String, PathBuf>,
+) -> Result<PathBuf> {
     if let Some((url, commit)) = locked.git() {
         return git_dir(&locked.name, url, commit);
     }
     if !locked.is_registry() {
-        return paths.get(&locked.name).cloned().with_context(|| format!("no path for local package {}", locked.name));
+        return paths
+            .get(&locked.name)
+            .cloned()
+            .with_context(|| format!("no path for local package {}", locked.name));
     }
     let leaf = format!("{}-{}", locked.name, locked.version);
-    registries.iter().map(|dir| dir.join(&leaf)).find(|dir| dir.is_dir()).with_context(|| format!("{leaf} is not in the registry source cache"))
+    registries
+        .iter()
+        .map(|dir| dir.join(&leaf))
+        .find(|dir| dir.is_dir())
+        .with_context(|| format!("{leaf} is not in the registry source cache"))
 }
 
 fn git_dir(name: &str, url: &str, commit: &str) -> Result<PathBuf> {
-    let repo = url.trim_end_matches('/').rsplit('/').next().unwrap_or_default().trim_end_matches(".git");
+    let repo = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".git");
     let short = commit.get(..7).unwrap_or(commit);
     let checkouts = subdirs(&cargo_home()?.join("git/checkouts"))?;
-    let mine = checkouts.into_iter().filter(|dir| dir.file_name().is_some_and(|leaf| leaf.to_string_lossy().starts_with(&format!("{repo}-"))));
-    mine.map(|dir| dir.join(short)).filter(|dir| dir.is_dir()).find_map(|root| find_package(&root, name)).with_context(|| format!("{name} at {short} is not in the git checkouts of {url}"))
+    let mine = checkouts.into_iter().filter(|dir| {
+        dir.file_name()
+            .is_some_and(|leaf| leaf.to_string_lossy().starts_with(&format!("{repo}-")))
+    });
+    mine.map(|dir| dir.join(short))
+        .filter(|dir| dir.is_dir())
+        .find_map(|root| find_package(&root, name))
+        .with_context(|| format!("{name} at {short} is not in the git checkouts of {url}"))
 }
 
 fn find_package(root: &Path, name: &str) -> Option<PathBuf> {
@@ -110,8 +138,16 @@ fn find_package(root: &Path, name: &str) -> Option<PathBuf> {
         if manifest_name(&dir).as_deref() == Some(name) {
             return Some(dir);
         }
-        let skip = |path: &PathBuf| path.file_name().is_some_and(|leaf| leaf == "target" || leaf.to_string_lossy().starts_with('.'));
-        stack.extend(subdirs(&dir).unwrap_or_default().into_iter().filter(|path| !skip(path)));
+        let skip = |path: &PathBuf| {
+            path.file_name()
+                .is_some_and(|leaf| leaf == "target" || leaf.to_string_lossy().starts_with('.'))
+        };
+        stack.extend(
+            subdirs(&dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|path| !skip(path)),
+        );
     }
     None
 }
@@ -120,13 +156,17 @@ pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
 pub(crate) const LOCK_FILE: &str = "Cargo.lock";
 
 fn manifest_name(dir: &Path) -> Option<String> {
-    let table: toml::Table = toml::from_str(&std::fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?).ok()?;
+    let table: toml::Table =
+        toml::from_str(&std::fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?).ok()?;
     Some(table.get("package")?.get("name")?.as_str()?.to_owned())
 }
 
 /// The root directory and `[workspace]` table of the nearest manifest at or above `dir` that has one, which a local or git package inherits from.
 fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
-    for at in dir.ancestors().filter(|at| at.join(MANIFEST_FILE).is_file()) {
+    for at in dir
+        .ancestors()
+        .filter(|at| at.join(MANIFEST_FILE).is_file())
+    {
         if let Some(workspace) = manifest::workspace_of(at)? {
             return Ok(Some((at.to_owned(), workspace)));
         }
@@ -137,13 +177,19 @@ fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
 fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = patches_in(&dir.join(MANIFEST_FILE), dir)?;
     for at in dir.ancestors() {
-        let config = [".cargo/config.toml", ".cargo/config"].map(|leaf| at.join(leaf)).into_iter().find(|path| path.is_file());
+        let config = [".cargo/config.toml", ".cargo/config"]
+            .map(|leaf| at.join(leaf))
+            .into_iter()
+            .find(|path| path.is_file());
         if let Some(config) = config {
             paths.extend(patches_in(&config, at)?);
         }
     }
     if let Ok(home) = cargo_home() {
-        let config = ["config.toml", "config"].map(|leaf| home.join(leaf)).into_iter().find(|path| path.is_file());
+        let config = ["config.toml", "config"]
+            .map(|leaf| home.join(leaf))
+            .into_iter()
+            .find(|path| path.is_file());
         if let Some(config) = config {
             paths.extend(patches_in(&config, &home)?);
         }
@@ -152,17 +198,36 @@ fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn patches_in(file: &Path, base: &Path) -> Result<Vec<PathBuf>> {
-    let table: toml::Table = toml::from_str(&std::fs::read_to_string(file)?).with_context(|| format!("parsing {}", file.display()))?;
-    let patches = table.get("patch").and_then(toml::Value::as_table).into_iter().flat_map(|patch| patch.values());
-    let entries = patches.filter_map(toml::Value::as_table).flat_map(|source| source.values());
-    Ok(entries.filter_map(|entry| entry.get("path")?.as_str()).map(|path| manifest::normalize(&base.join(path))).collect())
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(file)?)
+        .with_context(|| format!("parsing {}", file.display()))?;
+    let patches = table
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|patch| patch.values());
+    let entries = patches
+        .filter_map(toml::Value::as_table)
+        .flat_map(|source| source.values());
+    Ok(entries
+        .filter_map(|entry| entry.get("path")?.as_str())
+        .map(|path| manifest::normalize(&base.join(path)))
+        .collect())
 }
 
 fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<PathBuf> {
-    let listed = workspace.and_then(|ws| ws.get(key)).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str);
+    let listed = workspace
+        .and_then(|ws| ws.get(key))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str);
     listed
         .flat_map(|member| match member.strip_suffix("/*") {
-            Some(parent) => subdirs(&top.join(parent)).unwrap_or_default().into_iter().filter(|dir| dir.join(MANIFEST_FILE).is_file()).collect(),
+            Some(parent) => subdirs(&top.join(parent))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|dir| dir.join(MANIFEST_FILE).is_file())
+                .collect(),
             None => vec![top.join(member)],
         })
         .collect()
@@ -172,32 +237,64 @@ pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
     if let Some(found) = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file()) {
         return Ok(found.to_owned());
     }
-    let manifest_dir = root.ancestors().find(|dir| dir.join(MANIFEST_FILE).is_file()).with_context(|| format!("no {LOCK_FILE} or {MANIFEST_FILE} at or above {}", root.display()))?;
+    let manifest_dir = root
+        .ancestors()
+        .find(|dir| dir.join(MANIFEST_FILE).is_file())
+        .with_context(|| {
+            format!(
+                "no {LOCK_FILE} or {MANIFEST_FILE} at or above {}",
+                root.display()
+            )
+        })?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
     let out = std::process::Command::new(cargo)
         .args(["generate-lockfile", "--quiet", "--manifest-path"])
         .arg(manifest_dir.join(MANIFEST_FILE))
         .output()
-        .with_context(|| format!("no {LOCK_FILE} at or above {} and failed to run `cargo generate-lockfile`", root.display()))?;
+        .with_context(|| {
+            format!(
+                "no {LOCK_FILE} at or above {} and failed to run `cargo generate-lockfile`",
+                root.display()
+            )
+        })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("`cargo generate-lockfile` failed: {}", stderr.trim());
     }
-    root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file()).map(Path::to_owned).with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
+    root.ancestors()
+        .find(|dir| dir.join(LOCK_FILE).is_file())
+        .map(Path::to_owned)
+        .with_context(|| format!("no {LOCK_FILE} at or above {}", root.display()))
 }
 
 /// The lock file, workspace manifest, root manifest, and every local package's manifest and build script.
 pub(crate) fn manifest_paths(workspace: &Workspace, root: &Path) -> Vec<PathBuf> {
     let top = workspace_root(root).unwrap_or_else(|_| root.to_owned());
-    let head = [top.join(LOCK_FILE), top.join(MANIFEST_FILE), root.join(MANIFEST_FILE)];
-    let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| std::iter::once(package.manifest.dir.join(MANIFEST_FILE)).chain(package.manifest.build.clone()));
+    let head = [
+        top.join(LOCK_FILE),
+        top.join(MANIFEST_FILE),
+        root.join(MANIFEST_FILE),
+    ];
+    let local = workspace
+        .packages
+        .iter()
+        .filter(|package| package.local())
+        .flat_map(|package| {
+            std::iter::once(package.manifest.dir.join(MANIFEST_FILE))
+                .chain(package.manifest.build.clone())
+        });
     let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
     paths.sort();
     paths.dedup();
     paths
 }
 
-fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>, wanted: &BTreeSet<String>) -> Result<BTreeMap<String, PathBuf>> {
+fn local_paths(
+    root: &Path,
+    top: &Path,
+    workspace: Option<&toml::Table>,
+    wanted: &BTreeSet<String>,
+) -> Result<BTreeMap<String, PathBuf>> {
     let mut paths = BTreeMap::new();
     let mut seen_ws = BTreeSet::from([top.to_owned()]);
     let mut stack = vec![root.to_owned()];
@@ -228,17 +325,43 @@ fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>, wanted:
 }
 
 fn resolve_deps(packages: &mut [Package]) {
-    let index: BTreeMap<(String, semver::Version), usize> = packages.iter().enumerate().map(|(at, package)| ((package.locked.name.clone(), package.locked.version.clone()), at)).collect();
+    let index: BTreeMap<(String, semver::Version), usize> = packages
+        .iter()
+        .enumerate()
+        .map(|(at, package)| {
+            (
+                (package.locked.name.clone(), package.locked.version.clone()),
+                at,
+            )
+        })
+        .collect();
     for at in 0..packages.len() {
-        let locked: Vec<(String, Option<semver::Version>)> = packages[at].locked.deps().map(|dep| (dep.name.to_owned(), dep.version)).collect();
+        let locked: Vec<(String, Option<semver::Version>)> = packages[at]
+            .locked
+            .deps()
+            .map(|dep| (dep.name.to_owned(), dep.version))
+            .collect();
         let candidates = |name: &str| -> Vec<usize> {
-            let named = index.iter().filter(|((locked_name, _), _)| locked_name == name);
-            named.filter(|((_, version), _)| locked.iter().any(|(dep, want)| dep == name && want.as_ref().is_none_or(|want| want == version))).map(|(_, at)| *at).collect()
+            let named = index
+                .iter()
+                .filter(|((locked_name, _), _)| locked_name == name);
+            named
+                .filter(|((_, version), _)| {
+                    locked.iter().any(|(dep, want)| {
+                        dep == name && want.as_ref().is_none_or(|want| want == version)
+                    })
+                })
+                .map(|(_, at)| *at)
+                .collect()
         };
         let mut resolved = BTreeMap::new();
         for dep in &packages[at].manifest.deps {
             let found = candidates(&dep.package);
-            let pick = found.iter().copied().find(|at| dep.req.as_ref().is_none_or(|req| req.matches(&packages[*at].locked.version)));
+            let pick = found.iter().copied().find(|at| {
+                dep.req
+                    .as_ref()
+                    .is_none_or(|req| req.matches(&packages[*at].locked.version))
+            });
             if let Some(pick) = pick.or_else(|| found.first().copied()) {
                 resolved.insert(dep.key.clone(), pick);
             }
@@ -248,26 +371,68 @@ fn resolve_deps(packages: &mut [Package]) {
 }
 
 /// Reads the package at `root` from its workspace's `Cargo.lock` and manifests and resolves its graph for `targets` using `selection`.
-pub(crate) fn load(root: &Path, targets: &Targets, selection: &crate::Selection) -> Result<Workspace> {
+pub(crate) fn load(
+    root: &Path,
+    targets: &Targets,
+    selection: &crate::Selection,
+) -> Result<Workspace> {
     let features: Vec<&str> = selection.features.iter().map(String::as_str).collect();
-    load_filtered(root, targets, selection.package.as_deref(), &features, (!selection.no_default_features, selection.all_features), &[])
+    load_filtered(
+        root,
+        targets,
+        selection.package.as_deref(),
+        &features,
+        (!selection.no_default_features, selection.all_features),
+        &[],
+    )
 }
 
-fn load_package(entry: Locked, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Package, Option<anyhow::Error>)> {
+fn load_package(
+    entry: Locked,
+    registries: &[PathBuf],
+    paths: &BTreeMap<String, PathBuf>,
+) -> Result<(Package, Option<anyhow::Error>)> {
     match source_dir(&entry, registries, paths) {
         Ok(dir) => {
-            let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
+            let owner = if entry.is_registry() {
+                None
+            } else {
+                owning_workspace(&dir)?
+            };
             let manifest = manifest::read(&dir, owner.as_ref().map(|(_, ws)| ws))?;
-            Ok((Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false }, None))
+            Ok((
+                Package {
+                    locked: entry,
+                    manifest,
+                    resolved: BTreeMap::new(),
+                    sysroot: false,
+                },
+                None,
+            ))
         }
         Err(err) => {
-            let manifest = manifest::Manifest { name: entry.name.clone(), ..manifest::Manifest::default() };
-            Ok((Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false }, Some(err)))
+            let manifest = manifest::Manifest {
+                name: entry.name.clone(),
+                ..manifest::Manifest::default()
+            };
+            Ok((
+                Package {
+                    locked: entry,
+                    manifest,
+                    resolved: BTreeMap::new(),
+                    sysroot: false,
+                },
+                Some(err),
+            ))
         }
     }
 }
 
-fn load_packages(locked: Vec<Locked>, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Vec<Package>, Vec<Option<anyhow::Error>>)> {
+fn load_packages(
+    locked: Vec<Locked>,
+    registries: &[PathBuf],
+    paths: &BTreeMap<String, PathBuf>,
+) -> Result<(Vec<Package>, Vec<Option<anyhow::Error>>)> {
     let results = crate::sync::parallel_map(locked, |entry| load_package(entry, registries, paths));
     let mut packages = Vec::with_capacity(results.len());
     let mut missing = Vec::with_capacity(results.len());
@@ -279,26 +444,48 @@ fn load_packages(locked: Vec<Locked>, registries: &[PathBuf], paths: &BTreeMap<S
     Ok((packages, missing))
 }
 
-fn root_package_names(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Result<Vec<String>> {
+fn root_package_names(
+    root: &Path,
+    top: &Path,
+    workspace: Option<&toml::Table>,
+) -> Result<Vec<String>> {
     if manifest_name(root).is_none() && root == top && workspace.is_some() {
         let mut dirs = member_dirs(top, workspace, "default-members");
         if dirs.is_empty() {
             dirs = member_dirs(top, workspace, "members");
         }
-        return Ok(dirs.into_iter().filter_map(|dir| manifest_name(&dir)).collect());
+        return Ok(dirs
+            .into_iter()
+            .filter_map(|dir| manifest_name(&dir))
+            .collect());
     }
     let owner = owning_workspace(root)?;
-    Ok(vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name])
+    Ok(vec![
+        manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name,
+    ])
 }
 
-fn mark_reachable_deps(locked: &[Locked], by_name: &BTreeMap<&str, Vec<usize>>, (idx, omit): (usize, &[&str]), keep: &mut [bool], stack: &mut Vec<usize>) {
+fn mark_reachable_deps(
+    locked: &[Locked],
+    by_name: &BTreeMap<&str, Vec<usize>>,
+    (idx, omit): (usize, &[&str]),
+    keep: &mut [bool],
+    stack: &mut Vec<usize>,
+) {
     for dep in locked[idx].deps() {
         if omit.contains(&dep.name) {
             continue;
         }
-        let Some(cands) = by_name.get(dep.name) else { continue };
+        let Some(cands) = by_name.get(dep.name) else {
+            continue;
+        };
         for &cand in cands {
-            if !keep[cand] && dep.version.as_ref().is_none_or(|v| *v == locked[cand].version) {
+            if !keep[cand]
+                && dep
+                    .version
+                    .as_ref()
+                    .is_none_or(|v| *v == locked[cand].version)
+            {
                 keep[cand] = true;
                 stack.push(cand);
             }
@@ -306,7 +493,11 @@ fn mark_reachable_deps(locked: &[Locked], by_name: &BTreeMap<&str, Vec<usize>>, 
     }
 }
 
-fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String], omit_root_deps: &[&str]) -> Vec<Locked> {
+fn prune_unreachable_locked(
+    locked: Vec<Locked>,
+    root_names: &[String],
+    omit_root_deps: &[&str],
+) -> Vec<Locked> {
     let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (idx, entry) in locked.iter().enumerate() {
         by_name.entry(entry.name.as_str()).or_default().push(idx);
@@ -320,10 +511,18 @@ fn prune_unreachable_locked(locked: Vec<Locked>, root_names: &[String], omit_roo
         }
     }
     while let Some(idx) = stack.pop() {
-        let omit = if !locked[idx].is_registry() && root_names.contains(&locked[idx].name) { omit_root_deps } else { &[] };
+        let omit = if !locked[idx].is_registry() && root_names.contains(&locked[idx].name) {
+            omit_root_deps
+        } else {
+            &[]
+        };
         mark_reachable_deps(&locked, &by_name, (idx, omit), &mut keep, &mut stack);
     }
-    locked.into_iter().enumerate().filter_map(|(idx, entry)| keep[idx].then_some(entry)).collect()
+    locked
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| keep[idx].then_some(entry))
+        .collect()
 }
 
 fn load_filtered(
@@ -342,22 +541,37 @@ fn load_filtered(
         Some(name) => vec![name.to_owned()],
         None => root_package_names(root, &top, workspace.as_ref())?,
     };
-    let locked = prune_unreachable_locked(lock::read(&top.join(LOCK_FILE))?, &root_names, omit_root_deps);
-    let wanted_local: BTreeSet<String> = locked.iter().filter(|e| !e.is_registry()).map(|e| e.name.clone()).collect();
+    let locked = prune_unreachable_locked(
+        lock::read(&top.join(LOCK_FILE))?,
+        &root_names,
+        omit_root_deps,
+    );
+    let wanted_local: BTreeSet<String> = locked
+        .iter()
+        .filter(|e| !e.is_registry())
+        .map(|e| e.name.clone())
+        .collect();
     let mut registries = registry_dirs()?;
     registries.insert(0, top.join("vendor"));
     let paths = local_paths(root, &top, workspace.as_ref(), &wanted_local)?;
     let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
     if !omit_root_deps.is_empty() {
-        for pkg in packages.iter_mut().filter(|p| !p.locked.is_registry() && root_names.contains(&p.locked.name)) {
-            pkg.manifest.deps.retain(|dep| !omit_root_deps.contains(&dep.package.as_str()));
+        for pkg in packages
+            .iter_mut()
+            .filter(|p| !p.locked.is_registry() && root_names.contains(&p.locked.name))
+        {
+            pkg.manifest
+                .deps
+                .retain(|dep| !omit_root_deps.contains(&dep.package.as_str()));
         }
     }
     resolve_deps(&mut packages);
     let members: Vec<usize> = packages
         .iter()
         .enumerate()
-        .filter(|(_, package)| !package.locked.is_registry() && root_names.contains(&package.locked.name))
+        .filter(|(_, package)| {
+            !package.locked.is_registry() && root_names.contains(&package.locked.name)
+        })
         .map(|(at, _)| at)
         .collect();
     if members.is_empty() {
@@ -366,7 +580,14 @@ fn load_filtered(
             None => bail!("{} is not in {LOCK_FILE}", root.display()),
         }
     }
-    let graph = features::resolve(&packages, targets, &members, features, default_features, all_features)?;
+    let graph = features::resolve(
+        &packages,
+        targets,
+        &members,
+        features,
+        default_features,
+        all_features,
+    )?;
     for unit in &graph.units {
         if let Some(err) = missing[unit.package].take() {
             return Err(err);
@@ -386,14 +607,23 @@ pub fn library() -> Result<PathBuf> {
     };
     let home = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|home| PathBuf::from(home).join(".rustup")));
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".rustup"))
+        });
     if std::env::var_os("RUSTC").is_none()
         && let Some(ref rustup_home) = home
     {
         let active = std::env::var("RUSTUP_TOOLCHAIN").ok().or_else(|| {
             let text = std::fs::read_to_string(rustup_home.join("settings.toml")).ok()?;
             text.lines().find_map(|line| {
-                let rest = line.trim().strip_prefix("default_toolchain")?.trim().strip_prefix('=')?.trim();
+                let rest = line
+                    .trim()
+                    .strip_prefix("default_toolchain")?
+                    .trim()
+                    .strip_prefix('=')?
+                    .trim();
                 Some(rest.trim_matches('"').to_owned())
             })
         });
@@ -404,7 +634,9 @@ pub fn library() -> Result<PathBuf> {
         }
     }
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
-    if let Ok(output) = std::process::Command::new(rustc).args(["--print", "sysroot"]).output()
+    if let Ok(output) = std::process::Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
         && output.status.success()
         && let Ok(text) = std::str::from_utf8(&output.stdout)
         && let Some(dir) = sysroot_library(Path::new(text.trim()))
@@ -414,11 +646,19 @@ pub fn library() -> Result<PathBuf> {
     if let Some(toolchains) = home.map(|home| home.join("toolchains"))
         && let Ok(entries) = std::fs::read_dir(&toolchains)
     {
-        let mut found: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
+        let mut found: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
         found.sort();
         found.reverse();
-        let stable = found.iter().filter(|dir| dir.file_name().is_some_and(|name| name.to_string_lossy().starts_with("stable-")));
-        if let Some(dir) = stable.chain(found.iter()).find_map(|dir| sysroot_library(dir)) {
+        let stable = found.iter().filter(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("stable-"))
+        });
+        if let Some(dir) = stable
+            .chain(found.iter())
+            .find_map(|dir| sysroot_library(dir))
+        {
             return Ok(dir);
         }
     }
@@ -427,8 +667,18 @@ pub fn library() -> Result<PathBuf> {
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.
 pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
-    let mut sysroot = load_filtered(&library.join("sysroot"), targets, None, &[], (true, false), &["test"])?;
-    sysroot.packages.iter_mut().for_each(|package| package.sysroot = true);
+    let mut sysroot = load_filtered(
+        &library.join("sysroot"),
+        targets,
+        None,
+        &[],
+        (true, false),
+        &["test"],
+    )?;
+    sysroot
+        .packages
+        .iter_mut()
+        .for_each(|package| package.sysroot = true);
     Ok(sysroot)
 }
 
@@ -455,9 +705,18 @@ impl Workspace {
             .iter()
             .map(|unit| {
                 let package = &self.packages[unit.package].locked;
-                let side = if unit.side == Side::Host { "host" } else { "target" };
+                let side = if unit.side == Side::Host {
+                    "host"
+                } else {
+                    "target"
+                };
                 let features: Vec<&str> = unit.features.iter().map(String::as_str).collect();
-                format!("{side} {} {}|{}", package.name, package.version, features.join(","))
+                format!(
+                    "{side} {} {}|{}",
+                    package.name,
+                    package.version,
+                    features.join(",")
+                )
             })
             .collect();
         lines.sort();

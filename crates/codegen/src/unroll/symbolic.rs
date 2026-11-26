@@ -12,15 +12,24 @@ pub(super) fn tagged(imm: i64) -> bool {
 }
 
 fn tag(sym: u32, off: i64) -> Option<i64> {
-    (sym < 1 << SYM_BITS && (0..1 << OFF_BITS).contains(&off)).then(|| (TAG << SHIFT) | (i64::from(sym) << OFF_BITS) | off)
+    (sym < 1 << SYM_BITS && (0..1 << OFF_BITS).contains(&off))
+        .then(|| (TAG << SHIFT) | (i64::from(sym) << OFF_BITS) | off)
 }
 
 fn split(imm: i64) -> (i64, i64) {
-    ((imm >> OFF_BITS) & ((1 << SYM_BITS) - 1), imm & ((1 << OFF_BITS) - 1))
+    (
+        (imm >> OFF_BITS) & ((1 << SYM_BITS) - 1),
+        imm & ((1 << OFF_BITS) - 1),
+    )
 }
 
 /// Evaluates `op` like `evaluate_wrapped`, and also tracks symbol addresses moved by constants so loops over read-only tables get a trip count.
-pub(super) fn evaluate(func: &Function, op: &Op, ty: Type, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
+pub(super) fn evaluate(
+    func: &Function,
+    op: &Op,
+    ty: Type,
+    known: &dyn Fn(Value) -> Option<i64>,
+) -> Option<i64> {
     if let Op::Symbol(sym) = *op {
         return tag(sym, 0);
     }
@@ -34,7 +43,11 @@ pub(super) fn evaluate(func: &Function, op: &Op, ty: Type, known: &dyn Fn(Value)
         return func.rodata_read(sym as u32, at.checked_add(i64::from(off))?, ty);
     }
     if pointer {
-        return if ty == Type::I64 || matches!(op, Op::Icmp(..)) { address(op, known) } else { None };
+        return if ty == Type::I64 || matches!(op, Op::Icmp(..)) {
+            address(op, known)
+        } else {
+            None
+        };
     }
     evaluate_wrapped(func, op, ty, known).filter(|&imm| !tagged(imm))
 }

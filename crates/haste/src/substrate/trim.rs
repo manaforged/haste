@@ -22,20 +22,45 @@ impl SubstrateBuilder {
     pub(super) fn evict_unneeded_stencils(&mut self) -> Result<()> {
         let current = self.current_consumer();
         let floor = retain_live(&mut self.consumers, current);
-        let need = self.stencils.iter().map(PendingStencil::cost).sum::<usize>();
+        let need = self
+            .stencils
+            .iter()
+            .map(PendingStencil::cost)
+            .sum::<usize>();
         add(Tally::TrimStencils, self.stencils.len());
         add(Tally::TrimNeedBytes, need);
-        add(Tally::TrimBaseBytes, self.summaries.iter().map(|s| aligned8(s.len as usize)).sum::<usize>() + self.instances.iter().map(|i| aligned8(i.len as usize)).sum::<usize>());
+        add(
+            Tally::TrimBaseBytes,
+            self.summaries
+                .iter()
+                .map(|s| aligned8(s.len as usize))
+                .sum::<usize>()
+                + self
+                    .instances
+                    .iter()
+                    .map(|i| aligned8(i.len as usize))
+                    .sum::<usize>(),
+        );
         let before = self.stencils.len();
-        self.stencils.retain(|s| s.last_used.is_none_or(|g| g >= floor));
+        self.stencils
+            .retain(|s| s.last_used.is_none_or(|g| g >= floor));
         add(Tally::TrimDropped, before - self.stencils.len());
-        add(Tally::TrimKeptBytes, self.stencils.iter().map(PendingStencil::cost).sum::<usize>());
+        add(
+            Tally::TrimKeptBytes,
+            self.stencils
+                .iter()
+                .map(PendingStencil::cost)
+                .sum::<usize>(),
+        );
         if self.stencils.len() == before {
             return Ok(());
         }
         let old = std::mem::take(&mut self.blob);
         let mut repack = |off: &mut u32, len: &mut u32| -> Result<()> {
-            (*off, *len) = push_aligned_blob(&mut self.blob, &old[*off as usize..*off as usize + *len as usize])?;
+            (*off, *len) = push_aligned_blob(
+                &mut self.blob,
+                &old[*off as usize..*off as usize + *len as usize],
+            )?;
             Ok(())
         };
         for s in &mut self.summaries {

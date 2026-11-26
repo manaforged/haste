@@ -36,8 +36,13 @@ pub(super) enum OverflowOp {
     Shr,
 }
 
-pub(super) const OVERFLOW_OPS: [(&str, OverflowOp); 5] =
-    [("overflowing_add", OverflowOp::Add), ("overflowing_sub", OverflowOp::Sub), ("overflowing_mul", OverflowOp::Mul), ("overflowing_shl", OverflowOp::Shl), ("overflowing_shr", OverflowOp::Shr)];
+pub(super) const OVERFLOW_OPS: [(&str, OverflowOp); 5] = [
+    ("overflowing_add", OverflowOp::Add),
+    ("overflowing_sub", OverflowOp::Sub),
+    ("overflowing_mul", OverflowOp::Mul),
+    ("overflowing_shl", OverflowOp::Shl),
+    ("overflowing_shr", OverflowOp::Shr),
+];
 
 pub(super) const CONST_METHODS: [(&str, ConstMethod); 9] = [
     ("ilog", ConstMethod::Ilog),
@@ -131,23 +136,37 @@ fn ilog(value: u128, base: u128) -> u128 {
     log
 }
 
-pub(super) fn int_method(method: ConstMethod, x: u128, args: &[u128], int: Int) -> Result<(u128, Int)> {
+pub(super) fn int_method(
+    method: ConstMethod,
+    x: u128,
+    args: &[u128],
+    int: Int,
+) -> Result<(u128, Int)> {
     let arg = args.first().copied();
     match (method, arg) {
-        (ConstMethod::Ilog | ConstMethod::Ilog2 | ConstMethod::Ilog10, _) => int_log(method, x, arg, int).map(|log| (log, (32, false))),
+        (ConstMethod::Ilog | ConstMethod::Ilog2 | ConstMethod::Ilog10, _) => {
+            int_log(method, x, arg, int).map(|log| (log, (32, false)))
+        }
         (ConstMethod::Pow, Some(exp)) => Ok((x.wrapping_pow(exp as u32) & mask(int.0), int)),
         (ConstMethod::Pow, None) => bail!("`pow` in a constant has no exponent"),
         _ => Ok((int_bits(method, x & mask(int.0), int.0), (32, false))),
     }
 }
 
-fn int_log(method: ConstMethod, x: u128, base: Option<u128>, (bits, is_signed): Int) -> Result<u128> {
+fn int_log(
+    method: ConstMethod,
+    x: u128,
+    base: Option<u128>,
+    (bits, is_signed): Int,
+) -> Result<u128> {
     if x == 0 || (is_signed && signed(x, bits) < 0) {
         bail!("the logarithm of a value that is not positive in a constant");
     }
     Ok(match (method, base) {
         (ConstMethod::Ilog2, _) => u128::from(127 - x.leading_zeros()),
-        (ConstMethod::Ilog, Some(base)) if !(is_signed && signed(base, bits) < 2) && base >= 2 => ilog(x, base),
+        (ConstMethod::Ilog, Some(base)) if !(is_signed && signed(base, bits) < 2) && base >= 2 => {
+            ilog(x, base)
+        }
         (ConstMethod::Ilog, _) => bail!("a logarithm of base below 2 in a constant"),
         _ => ilog(x, 10),
     })
@@ -168,7 +187,11 @@ pub(super) fn signed(value: u128, bits: u32) -> i128 {
 }
 
 pub(super) fn convert(value: u128, from: Int, to: Int) -> u128 {
-    let value = if from.1 { signed(value, from.0) as u128 } else { value };
+    let value = if from.1 {
+        signed(value, from.0) as u128
+    } else {
+        value
+    };
     value & mask(to.0)
 }
 
@@ -177,7 +200,9 @@ pub(super) fn fold(op: BinOp, x: u128, y: u128, (bits, is_signed): Int) -> Resul
         bail!("a division by zero in a constant");
     }
     Ok(match op {
-        BinOp::Div | BinOp::Rem | BinOp::Shr if is_signed => fold_signed(op, signed(x, bits), y, bits),
+        BinOp::Div | BinOp::Rem | BinOp::Shr if is_signed => {
+            fold_signed(op, signed(x, bits), y, bits)
+        }
         BinOp::Div | BinOp::Rem | BinOp::Shr => fold_unsigned(op, x, y),
         BinOp::Add => x.wrapping_add(y),
         BinOp::Sub => x.wrapping_sub(y),
@@ -206,16 +231,31 @@ fn fold_unsigned(op: BinOp, x: u128, y: u128) -> u128 {
     }
 }
 
-pub(super) fn overflowing_op(op: OverflowOp, x: u128, y: u128, (bits, is_signed): Int) -> (u128, bool) {
+pub(super) fn overflowing_op(
+    op: OverflowOp,
+    x: u128,
+    y: u128,
+    (bits, is_signed): Int,
+) -> (u128, bool) {
     let (xm, ym, shift) = (x & mask(bits), y & mask(bits), (y & 0xffff_ffff) as u32);
     match op {
         OverflowOp::Shl => (x.wrapping_shl(shift % bits) & mask(bits), shift >= bits),
         OverflowOp::Shr if !is_signed => (xm.wrapping_shr(shift % bits), shift >= bits),
-        OverflowOp::Shr => ((signed(x, bits).wrapping_shr(shift % bits) as u128) & mask(bits), shift >= bits),
+        OverflowOp::Shr => (
+            (signed(x, bits).wrapping_shr(shift % bits) as u128) & mask(bits),
+            shift >= bits,
+        ),
         _ if is_signed => signed_overflow(op, x, y, bits),
         OverflowOp::Add => {
             let (sum, over128) = xm.overflowing_add(ym);
-            (sum & mask(bits), if bits == 128 { over128 } else { sum > mask(bits) })
+            (
+                sum & mask(bits),
+                if bits == 128 {
+                    over128
+                } else {
+                    sum > mask(bits)
+                },
+            )
         }
         OverflowOp::Sub => (xm.wrapping_sub(ym) & mask(bits), xm < ym),
         OverflowOp::Mul => {

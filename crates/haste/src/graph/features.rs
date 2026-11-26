@@ -24,8 +24,15 @@ struct Resolver<'a> {
 
 fn implicit(package: &Package, key: &str) -> bool {
     let manifest = &package.manifest;
-    let optional = manifest.deps.iter().any(|dep| dep.optional && dep.key == key);
-    let explicit = manifest.features.values().flatten().any(|value| value.strip_prefix("dep:") == Some(key));
+    let optional = manifest
+        .deps
+        .iter()
+        .any(|dep| dep.optional && dep.key == key);
+    let explicit = manifest
+        .features
+        .values()
+        .flatten()
+        .any(|value| value.strip_prefix("dep:") == Some(key));
     optional && !explicit
 }
 
@@ -35,7 +42,10 @@ fn has_feature(package: &Package, name: &str) -> bool {
 
 fn unknown_feature(packages: &[Package], members: &[usize], feature: &str) -> anyhow::Error {
     if members.len() == 1 {
-        anyhow::anyhow!("package `{}` does not have feature `{feature}`", packages[members[0]].manifest.name)
+        anyhow::anyhow!(
+            "package `{}` does not have feature `{feature}`",
+            packages[members[0]].manifest.name
+        )
     } else {
         anyhow::anyhow!("none of the selected packages have feature `{feature}`")
     }
@@ -44,18 +54,33 @@ fn unknown_feature(packages: &[Package], members: &[usize], feature: &str) -> an
 fn validate_features(packages: &[Package], members: &[usize], features: &[&str]) -> Result<()> {
     for &feature in features {
         if let Some((pkg_or_dep, sub)) = feature.split_once('/') {
-            if let Some(&member) = members.iter().find(|&&m| packages[m].manifest.name == pkg_or_dep) {
+            if let Some(&member) = members
+                .iter()
+                .find(|&&m| packages[m].manifest.name == pkg_or_dep)
+            {
                 if !has_feature(&packages[member], sub) {
-                    bail!("package `{}` does not have feature `{sub}`", packages[member].manifest.name);
+                    bail!(
+                        "package `{}` does not have feature `{sub}`",
+                        packages[member].manifest.name
+                    );
                 }
                 continue;
             }
-            let targets: Vec<usize> = members.iter().filter_map(|&m| packages[m].resolved.get(pkg_or_dep).copied()).collect();
+            let targets: Vec<usize> = members
+                .iter()
+                .filter_map(|&m| packages[m].resolved.get(pkg_or_dep).copied())
+                .collect();
             if targets.is_empty() {
                 return Err(unknown_feature(packages, members, feature));
             }
-            if !targets.iter().any(|&target| has_feature(&packages[target], sub)) {
-                bail!("package `{}` does not have feature `{sub}`", packages[targets[0]].manifest.name);
+            if !targets
+                .iter()
+                .any(|&target| has_feature(&packages[target], sub))
+            {
+                bail!(
+                    "package `{}` does not have feature `{sub}`",
+                    packages[targets[0]].manifest.name
+                );
             }
         } else if !members.iter().any(|&m| has_feature(&packages[m], feature)) {
             return Err(unknown_feature(packages, members, feature));
@@ -70,12 +95,23 @@ impl Resolver<'_> {
             return *unit;
         }
         let unit = self.units.len();
-        self.units.push(Unit { package, side, features: BTreeSet::new(), deps: Vec::new(), script: None });
+        self.units.push(Unit {
+            package,
+            side,
+            features: BTreeSet::new(),
+            deps: Vec::new(),
+            script: None,
+        });
         self.by_key.insert((package, side), unit);
         self.enabled.push(BTreeSet::new());
         self.want.push(BTreeMap::new());
-        let required: Vec<String> = self.applicable(unit).filter(|dep| !dep.optional).map(|dep| dep.key.clone()).collect();
-        self.queue.extend(required.into_iter().map(|key| (unit, Step::Dep(key))));
+        let required: Vec<String> = self
+            .applicable(unit)
+            .filter(|dep| !dep.optional)
+            .map(|dep| dep.key.clone())
+            .collect();
+        self.queue
+            .extend(required.into_iter().map(|key| (unit, Step::Dep(key))));
         unit
     }
 
@@ -83,7 +119,8 @@ impl Resolver<'_> {
         let Unit { package, side, .. } = self.units[unit];
         let target = self.targets.of(side);
         let manifest = &self.packages[package].manifest;
-        let dev = (crate::test_mode() || crate::selection().example.is_some()) && self.members.contains(&package);
+        let dev = (crate::test_mode() || crate::selection().example.is_some())
+            && self.members.contains(&package);
         let used = move |dep: &&Dep| match dep.kind {
             Kind::Normal => true,
             Kind::Build => manifest.build.is_some(),
@@ -92,9 +129,10 @@ impl Resolver<'_> {
         let host_target = &self.targets.host;
         let is_std = manifest.name == "std";
         manifest.deps.iter().filter(used).filter(move |dep| {
-            dep.platform
-                .as_deref()
-                .is_none_or(|key| target.matches_key(key).unwrap_or(false) || (is_std && host_target.matches_key(key).unwrap_or(false)))
+            dep.platform.as_deref().is_none_or(|key| {
+                target.matches_key(key).unwrap_or(false)
+                    || (is_std && host_target.matches_key(key).unwrap_or(false))
+            })
         })
     }
 
@@ -120,8 +158,13 @@ impl Resolver<'_> {
         let Some((key, feature)) = value.split_once('/') else {
             return self.queue.push_back((unit, Step::Feature(value)));
         };
-        let (key, weak) = key.strip_suffix('?').map_or((key, false), |key| (key, true));
-        self.want[unit].entry(key.to_owned()).or_default().push(feature.to_owned());
+        let (key, weak) = key
+            .strip_suffix('?')
+            .map_or((key, false), |key| (key, true));
+        self.want[unit]
+            .entry(key.to_owned())
+            .or_default()
+            .push(feature.to_owned());
         if weak {
             return self.flush(unit, key);
         }
@@ -137,9 +180,18 @@ impl Resolver<'_> {
             return;
         }
         let wanted = self.want[unit].get(key).cloned().unwrap_or_default();
-        let children: Vec<usize> = self.units[unit].deps.iter().filter(|(dep_key, _, _)| dep_key == key).map(|(_, child, _)| *child).collect();
+        let children: Vec<usize> = self.units[unit]
+            .deps
+            .iter()
+            .filter(|(dep_key, _, _)| dep_key == key)
+            .map(|(_, child, _)| *child)
+            .collect();
         for child in children {
-            self.queue.extend(wanted.iter().map(|feature| (child, Step::Feature(feature.clone()))));
+            self.queue.extend(
+                wanted
+                    .iter()
+                    .map(|feature| (child, Step::Feature(feature.clone()))),
+            );
         }
     }
 
@@ -149,18 +201,31 @@ impl Resolver<'_> {
         }
         let side = self.units[unit].side;
         let package = self.units[unit].package;
-        let matches: Vec<Dep> = self.applicable(unit).filter(|dep| dep.key == key).cloned().collect();
+        let matches: Vec<Dep> = self
+            .applicable(unit)
+            .filter(|dep| dep.key == key)
+            .cloned()
+            .collect();
         for dep in matches {
             let Some(target) = self.packages[package].resolved.get(&dep.key).copied() else {
                 continue;
             };
-            let host = side == Side::Host || dep.kind == Kind::Build || self.packages[target].manifest.proc_macro;
+            let host = side == Side::Host
+                || dep.kind == Kind::Build
+                || self.packages[target].manifest.proc_macro;
             let child = self.unit(target, if host { Side::Host } else { Side::Target });
-            self.units[unit].deps.push((dep.key.clone(), child, dep.kind));
+            self.units[unit]
+                .deps
+                .push((dep.key.clone(), child, dep.kind));
             if dep.default_features {
-                self.queue.push_back((child, Step::Feature("default".to_owned())));
+                self.queue
+                    .push_back((child, Step::Feature("default".to_owned())));
             }
-            self.queue.extend(dep.features.iter().map(|feature| (child, Step::Feature(feature.clone()))));
+            self.queue.extend(
+                dep.features
+                    .iter()
+                    .map(|feature| (child, Step::Feature(feature.clone()))),
+            );
         }
         self.flush(unit, &key);
     }
@@ -176,33 +241,75 @@ impl Resolver<'_> {
 }
 
 /// Resolves the features of every unit reachable from `members`, as Cargo's resolver 2 does for `normal` and `build` edges.
-pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str], default_features: bool, all_features: bool) -> Result<Graph> {
+pub fn resolve(
+    packages: &[Package],
+    targets: &super::Targets,
+    members: &[usize],
+    features: &[&str],
+    default_features: bool,
+    all_features: bool,
+) -> Result<Graph> {
     validate_features(packages, members, features)?;
-    let mut resolver = Resolver { packages, targets, members, units: Vec::new(), by_key: BTreeMap::new(), enabled: Vec::new(), want: Vec::new(), queue: VecDeque::new() };
+    let mut resolver = Resolver {
+        packages,
+        targets,
+        members,
+        units: Vec::new(),
+        by_key: BTreeMap::new(),
+        enabled: Vec::new(),
+        want: Vec::new(),
+        queue: VecDeque::new(),
+    };
     for member in members {
         let unit = resolver.unit(*member, Side::Target);
         if default_features {
-            resolver.queue.push_back((unit, Step::Feature("default".to_owned())));
+            resolver
+                .queue
+                .push_back((unit, Step::Feature("default".to_owned())));
         }
         let package = &packages[*member];
         if all_features {
-            resolver.queue.extend(package.manifest.features.keys().cloned().map(|name| (unit, Step::Feature(name))));
             resolver.queue.extend(
-                package.manifest.deps.iter().filter(|dep| implicit(package, &dep.key)).map(|dep| (unit, Step::Feature(dep.key.clone()))),
+                package
+                    .manifest
+                    .features
+                    .keys()
+                    .cloned()
+                    .map(|name| (unit, Step::Feature(name))),
+            );
+            resolver.queue.extend(
+                package
+                    .manifest
+                    .deps
+                    .iter()
+                    .filter(|dep| implicit(package, &dep.key))
+                    .map(|dep| (unit, Step::Feature(dep.key.clone()))),
             );
         }
         for &feature in features {
             if let Some((pkg_or_dep, sub)) = feature.split_once('/') {
                 if package.manifest.name == pkg_or_dep {
-                    resolver.queue.push_back((unit, Step::Feature(sub.to_owned())));
-                } else if package.manifest.deps.iter().any(|dep| dep.key == pkg_or_dep) {
+                    resolver
+                        .queue
+                        .push_back((unit, Step::Feature(sub.to_owned())));
+                } else if package
+                    .manifest
+                    .deps
+                    .iter()
+                    .any(|dep| dep.key == pkg_or_dep)
+                {
                     resolver.value(unit, feature.to_owned());
                 }
             } else {
-                resolver.queue.push_back((unit, Step::Feature(feature.to_owned())));
+                resolver
+                    .queue
+                    .push_back((unit, Step::Feature(feature.to_owned())));
             }
         }
     }
     resolver.run();
-    Ok(Graph { units: resolver.units, members: members.to_vec() })
+    Ok(Graph {
+        units: resolver.units,
+        members: members.to_vec(),
+    })
 }

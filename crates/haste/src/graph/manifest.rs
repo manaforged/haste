@@ -12,7 +12,13 @@ pub enum Kind {
     Dev,
 }
 
-const KIND_TABLES: [(&str, Kind); 5] = [("dependencies", Kind::Normal), ("build-dependencies", Kind::Build), ("build_dependencies", Kind::Build), ("dev-dependencies", Kind::Dev), ("dev_dependencies", Kind::Dev)];
+const KIND_TABLES: [(&str, Kind); 5] = [
+    ("dependencies", Kind::Normal),
+    ("build-dependencies", Kind::Build),
+    ("build_dependencies", Kind::Build),
+    ("dev-dependencies", Kind::Dev),
+    ("dev_dependencies", Kind::Dev),
+];
 
 /// One dependency declaration.
 #[derive(Clone, Debug)]
@@ -66,17 +72,27 @@ fn text<'a>(table: &'a Table, key: &str) -> Option<&'a str> {
 }
 
 fn flag(table: &Table, keys: &[&str]) -> Option<bool> {
-    keys.iter().find_map(|key| table.get(*key).and_then(Value::as_bool))
+    keys.iter()
+        .find_map(|key| table.get(*key).and_then(Value::as_bool))
 }
 
 fn strings(value: Option<&Value>) -> Vec<String> {
-    let items = value.and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    items.iter().filter_map(Value::as_str).map(str::to_owned).collect()
+    let items = value
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 fn merged(spec: &Value, workspace: Option<&Table>, key: &str) -> Table {
     let mut table = match spec {
-        Value::String(req) => Table::from_iter([("version".to_owned(), Value::String(req.clone()))]),
+        Value::String(req) => {
+            Table::from_iter([("version".to_owned(), Value::String(req.clone()))])
+        }
         Value::Table(table) => table.clone(),
         _ => Table::new(),
     };
@@ -87,7 +103,10 @@ fn merged(spec: &Value, workspace: Option<&Table>, key: &str) -> Table {
         let mut inherited = merged(base, None, key);
         let mut all = strings(inherited.get("features"));
         all.extend(extra);
-        inherited.insert("features".to_owned(), Value::Array(all.into_iter().map(Value::String).collect()));
+        inherited.insert(
+            "features".to_owned(),
+            Value::Array(all.into_iter().map(Value::String).collect()),
+        );
         if let Some(optional) = table.get("optional") {
             inherited.insert("optional".to_owned(), optional.clone());
         }
@@ -101,9 +120,18 @@ struct Scope<'a> {
     workspace: Option<&'a Table>,
 }
 
-fn dep(scope: &Scope<'_>, key: &str, spec: &Value, kind: Kind, platform: Option<&str>) -> Result<Dep> {
+fn dep(
+    scope: &Scope<'_>,
+    key: &str,
+    spec: &Value,
+    kind: Kind,
+    platform: Option<&str>,
+) -> Result<Dep> {
     let table = merged(spec, scope.workspace, key);
-    let req = text(&table, "version").map(semver::VersionReq::parse).transpose().with_context(|| format!("version of {key}"))?;
+    let req = text(&table, "version")
+        .map(semver::VersionReq::parse)
+        .transpose()
+        .with_context(|| format!("version of {key}"))?;
     Ok(Dep {
         key: key.to_owned(),
         package: text(&table, "package").unwrap_or(key).to_owned(),
@@ -117,7 +145,12 @@ fn dep(scope: &Scope<'_>, key: &str, spec: &Value, kind: Kind, platform: Option<
     })
 }
 
-fn deps_of(scope: &Scope<'_>, table: &Table, platform: Option<&str>, into: &mut Vec<Dep>) -> Result<()> {
+fn deps_of(
+    scope: &Scope<'_>,
+    table: &Table,
+    platform: Option<&str>,
+    into: &mut Vec<Dep>,
+) -> Result<()> {
     for (name, kind) in KIND_TABLES {
         let Some(entries) = table.get(name).and_then(Value::as_table) else {
             continue;
@@ -132,7 +165,11 @@ fn deps_of(scope: &Scope<'_>, table: &Table, platform: Option<&str>, into: &mut 
 fn all_deps(scope: &Scope<'_>, root: &Table) -> Result<Vec<Dep>> {
     let mut deps = Vec::new();
     deps_of(scope, root, None, &mut deps)?;
-    let targets = root.get("target").and_then(Value::as_table).into_iter().flatten();
+    let targets = root
+        .get("target")
+        .and_then(Value::as_table)
+        .into_iter()
+        .flatten();
     for (platform, table) in targets {
         if let Some(table) = table.as_table() {
             deps_of(scope, table, Some(platform), &mut deps)?;
@@ -142,8 +179,14 @@ fn all_deps(scope: &Scope<'_>, root: &Table) -> Result<Vec<Dep>> {
 }
 
 fn features_of(root: &Table) -> BTreeMap<String, Vec<String>> {
-    let table = root.get("features").and_then(Value::as_table).into_iter().flatten();
-    table.map(|(name, values)| (name.clone(), strings(Some(values)))).collect()
+    let table = root
+        .get("features")
+        .and_then(Value::as_table)
+        .into_iter()
+        .flatten();
+    table
+        .map(|(name, values)| (name.clone(), strings(Some(values))))
+        .collect()
 }
 
 fn build_script(dir: &Path, package: &Table) -> Option<PathBuf> {
@@ -156,18 +199,35 @@ fn build_script(dir: &Path, package: &Table) -> Option<PathBuf> {
 
 fn lib_of(dir: &Path, root: &Table) -> (Option<PathBuf>, bool) {
     let lib = root.get("lib").and_then(Value::as_table);
-    let proc_macro = lib.and_then(|lib| flag(lib, &["proc-macro", "proc_macro"])).unwrap_or(false);
-    let path = lib.and_then(|lib| text(lib, "path")).map(|path| dir.join(path));
+    let proc_macro = lib
+        .and_then(|lib| flag(lib, &["proc-macro", "proc_macro"]))
+        .unwrap_or(false);
+    let path = lib
+        .and_then(|lib| text(lib, "path"))
+        .map(|path| dir.join(path));
     let path = path.or_else(|| Some(dir.join("src/lib.rs")).filter(|path| path.is_file()));
     (path, proc_macro)
 }
 
-fn targets_of(dir: &Path, root: &Table, package: &Table, (table_key, auto_key, folder): (&str, &str, &str)) -> Vec<(String, PathBuf)> {
-    let listed = root.get(table_key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_table);
+fn targets_of(
+    dir: &Path,
+    root: &Table,
+    package: &Table,
+    (table_key, auto_key, folder): (&str, &str, &str),
+) -> Vec<(String, PathBuf)> {
+    let listed = root
+        .get(table_key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_table);
     let mut found: Vec<(String, PathBuf)> = listed
         .filter_map(|entry| {
             let target_name = text(entry, "name")?.to_owned();
-            let path = text(entry, "path").map_or_else(|| dir.join(format!("{folder}/{target_name}.rs")), |path| dir.join(path));
+            let path = text(entry, "path").map_or_else(
+                || dir.join(format!("{folder}/{target_name}.rs")),
+                |path| dir.join(path),
+            );
             Some((target_name, path))
         })
         .collect();
@@ -211,48 +271,79 @@ fn bins_of(dir: &Path, name: &str, root: &Table, package: &Table) -> Vec<(String
 /// Reads the manifest at `dir/Cargo.toml`, inheriting from `workspace` (the root's `[workspace]` table).
 pub fn read(dir: &Path, workspace: Option<&Table>) -> Result<Manifest> {
     let path = dir.join(super::MANIFEST_FILE);
-    let text_of = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let root: Table = toml::from_str(&text_of).with_context(|| format!("parsing {}", path.display()))?;
+    let text_of =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let root: Table =
+        toml::from_str(&text_of).with_context(|| format!("parsing {}", path.display()))?;
     manifest_of(dir, &root, workspace)
 }
 
 /// Reads the `[workspace]` table of the manifest at `dir/Cargo.toml`, if it has one, with its dependency paths made absolute.
 pub fn workspace_of(dir: &Path) -> Result<Option<Table>> {
     let path = dir.join(super::MANIFEST_FILE);
-    let root: Table = toml::from_str(&std::fs::read_to_string(&path)?).with_context(|| format!("parsing {}", path.display()))?;
+    let root: Table = toml::from_str(&std::fs::read_to_string(&path)?)
+        .with_context(|| format!("parsing {}", path.display()))?;
     let Some(mut workspace) = root.get("workspace").and_then(Value::as_table).cloned() else {
         return Ok(None);
     };
-    let deps = workspace.get_mut("dependencies").and_then(Value::as_table_mut).into_iter().flat_map(|deps| deps.iter_mut());
+    let deps = workspace
+        .get_mut("dependencies")
+        .and_then(Value::as_table_mut)
+        .into_iter()
+        .flat_map(|deps| deps.iter_mut());
     for entry in deps.filter_map(|(_, spec)| spec.as_table_mut()) {
         let Some(relative) = entry.get("path").and_then(Value::as_str) else {
             continue;
         };
-        let absolute = normalize(&dir.join(relative)).to_string_lossy().into_owned();
+        let absolute = normalize(&dir.join(relative))
+            .to_string_lossy()
+            .into_owned();
         entry.insert("path".to_owned(), Value::String(absolute));
     }
     Ok(Some(workspace))
 }
 
 fn edition_of(package: &Table, workspace: Option<&Table>) -> String {
-    let inherited = || workspace.and_then(|ws| ws.get("package")).and_then(Value::as_table).and_then(|package| text(package, "edition"));
-    text(package, "edition").or_else(inherited).unwrap_or("2015").to_owned()
+    let inherited = || {
+        workspace
+            .and_then(|ws| ws.get("package"))
+            .and_then(Value::as_table)
+            .and_then(|package| text(package, "edition"))
+    };
+    text(package, "edition")
+        .or_else(inherited)
+        .unwrap_or("2015")
+        .to_owned()
 }
 
 fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Manifest> {
     let empty = Table::new();
-    let package = root.get("package").and_then(Value::as_table).unwrap_or(&empty);
-    let workspace_deps = workspace.and_then(|ws| ws.get("dependencies")).and_then(Value::as_table);
-    let name = text(package, "name").context("manifest has no package name")?.to_owned();
+    let package = root
+        .get("package")
+        .and_then(Value::as_table)
+        .unwrap_or(&empty);
+    let workspace_deps = workspace
+        .and_then(|ws| ws.get("dependencies"))
+        .and_then(Value::as_table);
+    let name = text(package, "name")
+        .context("manifest has no package name")?
+        .to_owned();
     let (lib, proc_macro) = lib_of(dir, root);
-    let scope = Scope { dir, workspace: workspace_deps };
+    let scope = Scope {
+        dir,
+        workspace: workspace_deps,
+    };
     Ok(Manifest {
         dir: dir.to_owned(),
         edition: edition_of(package, workspace),
         links: text(package, "links").map(str::to_owned),
         build: build_script(dir, package),
         lib,
-        lib_name: root.get("lib").and_then(Value::as_table).and_then(|lib| text(lib, "name")).map(str::to_owned),
+        lib_name: root
+            .get("lib")
+            .and_then(Value::as_table)
+            .and_then(|lib| text(lib, "name"))
+            .map(str::to_owned),
         proc_macro,
         bins: bins_of(dir, &name, root, package),
         examples: targets_of(dir, root, package, ("example", "autoexamples", "examples")),

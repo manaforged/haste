@@ -6,8 +6,12 @@ pub(super) fn adjoin(func: &mut Function) {
         let mut insts = std::mem::take(&mut func.blocks[block].insts);
         let mut at = 0;
         while at < insts.len() {
-            let pair = operands(func, insts[at], &[Binary::Imul])
-                .and_then(|low| insts.iter().position(|&inst| operands(func, inst, &[Binary::Umulhi, Binary::Smulhi]).is_some_and(|high| high == low || high == (low.1, low.0))));
+            let pair = operands(func, insts[at], &[Binary::Imul]).and_then(|low| {
+                insts.iter().position(|&inst| {
+                    operands(func, inst, &[Binary::Umulhi, Binary::Smulhi])
+                        .is_some_and(|high| high == low || high == (low.1, low.0))
+                })
+            });
             match pair {
                 Some(high) if high > at => {
                     let moved = insts.remove(high);
@@ -39,11 +43,18 @@ fn follow_carries(func: &Function, insts: &mut Vec<Inst>) {
         Op::TargetOp(op, args) if *op == id => Some(*args),
         _ => None,
     };
-    for (sum, out) in [(TargetOpId::X64AddCarry, TargetOpId::X64AddCarryOut), (TargetOpId::X64SubBorrow, TargetOpId::X64SubBorrowOut)] {
+    for (sum, out) in [
+        (TargetOpId::X64AddCarry, TargetOpId::X64AddCarryOut),
+        (TargetOpId::X64SubBorrow, TargetOpId::X64SubBorrowOut),
+    ] {
         let mut at = 0;
         while at < insts.len() {
             let args: Option<TinyArgs> = carry(insts[at], sum);
-            match args.and_then(|args| insts.iter().position(|&inst| carry(inst, out) == Some(args))) {
+            match args.and_then(|args| {
+                insts
+                    .iter()
+                    .position(|&inst| carry(inst, out) == Some(args))
+            }) {
                 Some(after) if after > at + 1 => {
                     let moved = insts.remove(after);
                     insts.insert(at + 1, moved);

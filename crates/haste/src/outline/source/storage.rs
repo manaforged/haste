@@ -7,11 +7,16 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result, bail};
 
 use crate::substrate::Backing;
-use crate::substrate::sysroot::tokens::{TOKEN_WIRE_LEN, decode_token_at, decode_tokens_slice, token_raw_span_at};
+use crate::substrate::sysroot::tokens::{
+    TOKEN_WIRE_LEN, decode_token_at, decode_tokens_slice, token_raw_span_at,
+};
 
 use super::Token;
 
-#[allow(dead_code, reason = "keeps backing allocation alive for SourceText::ptr")]
+#[allow(
+    dead_code,
+    reason = "keeps backing allocation alive for SourceText::ptr"
+)]
 enum TextOwner {
     Owned(Box<str>),
     Mapped(Arc<Backing>),
@@ -34,14 +39,25 @@ impl SourceText {
     pub fn owned(text: String) -> Self {
         let boxed = text.into_boxed_str();
         let (ptr, len) = (boxed.as_ptr(), boxed.len());
-        Self { ptr, len, _owner: TextOwner::Owned(boxed) }
+        Self {
+            ptr,
+            len,
+            _owner: TextOwner::Owned(boxed),
+        }
     }
 
     /// Creates zero-copy mapped source text from trusted cache bytes `backing[start..end]` after checking bounds.
     pub fn mapped_trusted(backing: Arc<Backing>, start: usize, end: usize) -> Result<Self> {
-        let slice = backing.as_slice().get(start..end).context("mapped source text out of bounds")?;
+        let slice = backing
+            .as_slice()
+            .get(start..end)
+            .context("mapped source text out of bounds")?;
         let (ptr, len) = (slice.as_ptr(), slice.len());
-        Ok(Self { ptr, len, _owner: TextOwner::Mapped(backing) })
+        Ok(Self {
+            ptr,
+            len,
+            _owner: TextOwner::Mapped(backing),
+        })
     }
 
     /// Returns the source text as a string slice.
@@ -169,13 +185,24 @@ impl SourceTokens {
 
     /// Creates a lazy token stream backed by `backing[start..end]` after validating bounds and wire length.
     pub fn lazy(backing: Arc<Backing>, start: usize, end: usize, count: usize) -> Result<Self> {
-        let expected = count.checked_mul(TOKEN_WIRE_LEN).context("token stream overflow")?;
-        let slice = backing.as_slice().get(start..end).context("lazy source tokens out of bounds")?;
+        let expected = count
+            .checked_mul(TOKEN_WIRE_LEN)
+            .context("token stream overflow")?;
+        let slice = backing
+            .as_slice()
+            .get(start..end)
+            .context("lazy source tokens out of bounds")?;
         if slice.len() != expected {
             bail!("lazy source tokens byte length mismatch");
         }
         let (ptr, byte_len) = (slice.as_ptr(), slice.len());
-        Ok(Self(TokensRepr::Lazy { _backing: backing, ptr, byte_len, count, decoded: OnceLock::new() }))
+        Ok(Self(TokensRepr::Lazy {
+            _backing: backing,
+            ptr,
+            byte_len,
+            count,
+            decoded: OnceLock::new(),
+        }))
     }
 
     /// Returns the number of tokens without forcing lazy decoding.
@@ -192,7 +219,12 @@ impl SourceTokens {
     pub fn at(&self, index: usize) -> Option<Token> {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.get(index).copied(),
-            TokensRepr::Lazy { ptr, byte_len, count, .. } => {
+            TokensRepr::Lazy {
+                ptr,
+                byte_len,
+                count,
+                ..
+            } => {
                 if index >= *count {
                     return None;
                 }
@@ -208,7 +240,12 @@ impl SourceTokens {
     pub fn raw_span(&self, index: usize) -> Option<(u32, u32)> {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.get(index).map(|t| (t.start, t.raw().0)),
-            TokensRepr::Lazy { ptr, byte_len, count, .. } => {
+            TokensRepr::Lazy {
+                ptr,
+                byte_len,
+                count,
+                ..
+            } => {
                 if index >= *count {
                     return None;
                 }
@@ -224,7 +261,13 @@ impl SourceTokens {
     pub fn as_slice(&self) -> &[Token] {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.as_slice(),
-            TokensRepr::Lazy { ptr, byte_len, count, decoded, .. } => decoded.get_or_init(|| {
+            TokensRepr::Lazy {
+                ptr,
+                byte_len,
+                count,
+                decoded,
+                ..
+            } => decoded.get_or_init(|| {
                 // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
                 let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
                 decode_tokens_slice(bytes, *count).expect("valid sysroot token stream")

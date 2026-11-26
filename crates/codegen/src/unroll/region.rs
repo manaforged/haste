@@ -1,5 +1,10 @@
 use super::symbolic::{evaluate, tagged};
-use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, MAX_FP_FULL_INSTS, MAX_FP_FULL_TRIPS, MAX_VEC_FULL_TRIPS, block_has_float, block_has_libcall_mem, block_has_vec, collect_global_consts, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
+use super::{
+    MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, MAX_FP_FULL_INSTS,
+    MAX_FP_FULL_TRIPS, MAX_VEC_FULL_TRIPS, block_has_float, block_has_libcall_mem, block_has_vec,
+    collect_global_consts, edge_args, eval_block, has_bad_non_term, meet, outside_const_params,
+    push_params_map, remap_val,
+};
 use crate::cfg::{Cfg, Loop};
 use crate::ir::{Block, BlockData, Function, Op, Value};
 
@@ -44,9 +49,15 @@ impl Rounds<'_> {
     }
 
     fn image(&self, round: usize, target: Block) -> Block {
-        let Some(at) = self.region.at(target) else { return target };
+        let Some(at) = self.region.at(target) else {
+            return target;
+        };
         let round = round + usize::from(at == 0);
-        if round > self.backs { target } else { self.block(round, at) }
+        if round > self.backs {
+            target
+        } else {
+            self.block(round, at)
+        }
     }
 
     fn contains(&self, block: Block) -> bool {
@@ -70,8 +81,14 @@ fn takes_args(func: &Function, pred: Block) -> bool {
 
 fn shape(func: &Function, cfg: &Cfg, each: &Loop) -> Option<Region> {
     let head = each.head;
-    let blocks: Vec<Block> = cfg.rpo.iter().copied().filter(|&block| inside(each, block)).collect();
-    if blocks.len() != each.size || blocks.len() > MAX_CHAIN_BLOCKS || blocks.first() != Some(&head) {
+    let blocks: Vec<Block> = cfg
+        .rpo
+        .iter()
+        .copied()
+        .filter(|&block| inside(each, block))
+        .collect();
+    if blocks.len() != each.size || blocks.len() > MAX_CHAIN_BLOCKS || blocks.first() != Some(&head)
+    {
         return None;
     }
     for &block in &blocks {
@@ -84,13 +101,23 @@ fn shape(func: &Function, cfg: &Cfg, each: &Loop) -> Option<Region> {
         }
     }
     let params = func.blocks[head.index()].params.len();
-    if !each.latches.iter().all(|&latch| edge_args(func, latch, head).is_some_and(|args| args.len() == params)) {
+    if !each
+        .latches
+        .iter()
+        .all(|&latch| edge_args(func, latch, head).is_some_and(|args| args.len() == params))
+    {
         return None;
     }
     let open = blocks
         .iter()
         .enumerate()
-        .map(|(at, &block)| at > 0 && cfg.preds_of(block).iter().any(|pred| blocks[at..].contains(pred)))
+        .map(|(at, &block)| {
+            at > 0
+                && cfg
+                    .preds_of(block)
+                    .iter()
+                    .any(|pred| blocks[at..].contains(pred))
+        })
         .collect();
     Some(Region { blocks, open })
 }
@@ -106,12 +133,23 @@ fn meet_known(acc: &mut Option<Vec<Option<i64>>>, vals: &[Option<i64>]) {
     }
 }
 
-fn record_block_consts(func: &Function, block: Block, step: &mut Step, at: usize, env: &[Option<i64>]) {
-    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else { return };
+fn record_block_consts(
+    func: &Function,
+    block: Block,
+    step: &mut Step,
+    at: usize,
+    env: &[Option<i64>],
+) {
+    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else {
+        return;
+    };
     let mut row = Vec::with_capacity(body.len());
     for &inst in body {
         let data = &func.insts[inst.index()];
-        let imm = data.result.and_then(|res| env[res.index()]).filter(|&imm| !tagged(imm));
+        let imm = data
+            .result
+            .and_then(|res| env[res.index()])
+            .filter(|&imm| !tagged(imm));
         if imm.is_none() && !matches!(data.op, Op::Const(_)) {
             step.residual += 1;
         }
@@ -163,8 +201,14 @@ fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Opt
         next: None,
     };
     for (at, &block) in region.blocks.iter().enumerate() {
-        let Some(given) = incoming[at].take() else { continue };
-        let given = if region.open[at] { vec![None; func.blocks[block.index()].params.len()] } else { given };
+        let Some(given) = incoming[at].take() else {
+            continue;
+        };
+        let given = if region.open[at] {
+            vec![None; func.blocks[block.index()].params.len()]
+        } else {
+            given
+        };
         out.reached[at] = true;
         eval_block(func, block.index(), &given, env, evaluate);
         record_block_consts(func, block, &mut out, at, env);
@@ -177,12 +221,38 @@ fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Opt
     out
 }
 
-fn prove(func: &Function, region: &Region, init: Vec<Option<i64>>, global_consts: &[Option<i64>]) -> Option<Proof> {
-    let has_mem = region.blocks.iter().any(|&b| block_has_libcall_mem(func, b.index()));
-    let has_fp = region.blocks.iter().any(|&b| block_has_float(func, b.index()));
-    let has_vec = region.blocks.iter().any(|&b| block_has_vec(func, b.index()));
-    let max_trips = if has_mem { 4 } else if has_fp { MAX_FP_FULL_TRIPS } else if has_vec { MAX_VEC_FULL_TRIPS } else { MAX_CHAIN_TRIPS };
-    let max_insts = if has_fp { MAX_FP_FULL_INSTS } else { MAX_CHAIN_UNROLLED_INSTS };
+fn prove(
+    func: &Function,
+    region: &Region,
+    init: Vec<Option<i64>>,
+    global_consts: &[Option<i64>],
+) -> Option<Proof> {
+    let has_mem = region
+        .blocks
+        .iter()
+        .any(|&b| block_has_libcall_mem(func, b.index()));
+    let has_fp = region
+        .blocks
+        .iter()
+        .any(|&b| block_has_float(func, b.index()));
+    let has_vec = region
+        .blocks
+        .iter()
+        .any(|&b| block_has_vec(func, b.index()));
+    let max_trips = if has_mem {
+        4
+    } else if has_fp {
+        MAX_FP_FULL_TRIPS
+    } else if has_vec {
+        MAX_VEC_FULL_TRIPS
+    } else {
+        MAX_CHAIN_TRIPS
+    };
+    let max_insts = if has_fp {
+        MAX_FP_FULL_INSTS
+    } else {
+        MAX_CHAIN_UNROLLED_INSTS
+    };
     let mut heads = vec![init];
     let mut steps = Vec::new();
     let mut total_residual = 0_usize;
@@ -196,7 +266,9 @@ fn prove(func: &Function, region: &Region, init: Vec<Option<i64>>, global_consts
         }
         let next = cur.next.clone();
         steps.push(cur);
-        let Some(next) = next else { return Some(Proof { heads, steps }) };
+        let Some(next) = next else {
+            return Some(Proof { heads, steps });
+        };
         if next == *params {
             return None;
         }
@@ -215,11 +287,17 @@ fn live_outs(func: &Function, cfg: &Cfg, each: &Loop) -> Vec<LiveOut> {
         }
         for inst in &data.insts {
             func.insts[inst.index()].op.for_operands(|value| {
-                let Some(def) = defs[value.index()].filter(|&def| inside(each, def)) else { return };
+                let Some(def) = defs[value.index()].filter(|&def| inside(each, def)) else {
+                    return;
+                };
                 match live.iter().position(|out| out.value == value) {
                     Some(at) if live[at].users.contains(&user) => {}
                     Some(at) => live[at].users.push(user),
-                    None => live.push(LiveOut { value, def, users: vec![user] }),
+                    None => live.push(LiveOut {
+                        value,
+                        def,
+                        users: vec![user],
+                    }),
                 }
             });
         }
@@ -242,7 +320,11 @@ fn multi_pred(cfg: &Cfg, block: Block) -> bool {
     false
 }
 
-fn collect_post(cfg: &Cfg, users: &[Block], in_region: &dyn Fn(Block) -> bool) -> (Vec<bool>, Vec<bool>) {
+fn collect_post(
+    cfg: &Cfg,
+    users: &[Block],
+    in_region: &dyn Fn(Block) -> bool,
+) -> (Vec<bool>, Vec<bool>) {
     let n = cfg.reachable.len();
     let mut post = vec![false; n];
     let mut exits = vec![false; n];
@@ -291,7 +373,12 @@ fn idf_hits_set(cfg: &Cfg, block: Block, in_s: &[bool], in_region: &dyn Fn(Block
     false
 }
 
-fn post_exit_phis(cfg: &Cfg, users: &[Block], force_exits: bool, in_region: &dyn Fn(Block) -> bool) -> Vec<bool> {
+fn post_exit_phis(
+    cfg: &Cfg,
+    users: &[Block],
+    force_exits: bool,
+    in_region: &dyn Fn(Block) -> bool,
+) -> Vec<bool> {
     let (post, exits) = collect_post(cfg, users, in_region);
     let n = post.len();
     let mut in_s = exits.clone();
@@ -301,7 +388,9 @@ fn post_exit_phis(cfg: &Cfg, users: &[Block], force_exits: bool, in_region: &dyn
             phi[idx] = true;
         }
     }
-    let candidates: Vec<usize> = (0..n).filter(|&i| post[i] && !phi[i] && multi_pred(cfg, Block(i as u32))).collect();
+    let candidates: Vec<usize> = (0..n)
+        .filter(|&i| post[i] && !phi[i] && multi_pred(cfg, Block(i as u32)))
+        .collect();
     if candidates.is_empty() {
         return phi;
     }
@@ -327,8 +416,12 @@ fn repairable(func: &Function, cfg: &Cfg, each: &Loop, out: &LiveOut) -> bool {
             continue;
         }
         let preds = cfg.preds_of(Block(idx as u32));
-        let has_pred = preds.iter().any(|&p| cfg.reachable.get(p.index()).copied().unwrap_or(false));
-        let all_ok = preds.iter().all(|&p| !cfg.reachable.get(p.index()).copied().unwrap_or(false) || takes_args(func, p));
+        let has_pred = preds
+            .iter()
+            .any(|&p| cfg.reachable.get(p.index()).copied().unwrap_or(false));
+        let all_ok = preds.iter().all(|&p| {
+            !cfg.reachable.get(p.index()).copied().unwrap_or(false) || takes_args(func, p)
+        });
         if !has_pred || !all_ok {
             return false;
         }
@@ -336,9 +429,17 @@ fn repairable(func: &Function, cfg: &Cfg, each: &Loop, out: &LiveOut) -> bool {
     true
 }
 
-fn pin(func: &mut Function, head: Block, params: &[Value], known: &[Option<i64>], map: &mut Vec<(Value, Value)>) {
+fn pin(
+    func: &mut Function,
+    head: Block,
+    params: &[Value],
+    known: &[Option<i64>],
+    map: &mut Vec<(Value, Value)>,
+) {
     for (&param, known) in params.iter().zip(known) {
-        let Some(imm) = known.filter(|&imm| !tagged(imm)) else { continue };
+        let Some(imm) = known.filter(|&imm| !tagged(imm)) else {
+            continue;
+        };
         let value = func.value(func.ty(param));
         let inst = func.add(Op::Const(imm), Some(value));
         func.blocks[head.index()].insts.push(inst);
@@ -353,7 +454,9 @@ fn clone_body_consts(
     consts: &[Option<i64>],
     map: &mut Vec<(Value, Value)>,
 ) {
-    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else { return };
+    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else {
+        return;
+    };
     let body = body.to_vec();
     for (pos, orig) in body.into_iter().enumerate() {
         let mut op = match consts.get(pos).copied().flatten() {
@@ -379,7 +482,13 @@ fn decide_term(op: Op, decided: Option<bool>) -> Op {
     }
 }
 
-fn clone_round_block(func: &mut Function, rounds: &Rounds<'_>, round: usize, at: usize, map: &mut Vec<(Value, Value)>) {
+fn clone_round_block(
+    func: &mut Function,
+    rounds: &Rounds<'_>,
+    round: usize,
+    at: usize,
+    map: &mut Vec<(Value, Value)>,
+) {
     let to = rounds.block(round, at);
     let step = &rounds.steps[round];
     if !step.reached[at] {
@@ -389,7 +498,9 @@ fn clone_round_block(func: &mut Function, rounds: &Rounds<'_>, round: usize, at:
     }
     let block = rounds.region.blocks[at];
     clone_body_consts(func, block, to, &step.consts[at], map);
-    let Some(&term) = func.blocks[block.index()].insts.last() else { return };
+    let Some(&term) = func.blocks[block.index()].insts.last() else {
+        return;
+    };
     let mut op = decide_term(func.insts[term.index()].op.clone(), step.decided[at]);
     op.map_operands(|value| remap_val(map, value));
     op.map_targets(|target| rounds.image(round, target));
@@ -404,11 +515,23 @@ fn clone_rounds(func: &mut Function, rounds: &Rounds<'_>) -> Vec<Vec<(Value, Val
         let mut map = Vec::new();
         for (at, &block) in blocks.iter().enumerate() {
             let params = func.blocks[block.index()].params.clone();
-            let fresh: Vec<Value> = params.iter().map(|&param| func.value(func.ty(param))).collect();
+            let fresh: Vec<Value> = params
+                .iter()
+                .map(|&param| func.value(func.ty(param)))
+                .collect();
             push_params_map(&mut map, &params, &fresh);
-            func.blocks.push(BlockData { params: fresh, insts: Vec::new() });
+            func.blocks.push(BlockData {
+                params: fresh,
+                insts: Vec::new(),
+            });
             if at == 0 {
-                pin(func, rounds.block(round, 0), &params, &rounds.heads[round], &mut map);
+                pin(
+                    func,
+                    rounds.block(round, 0),
+                    &params,
+                    &rounds.heads[round],
+                    &mut map,
+                );
             }
         }
         maps.push(map);
@@ -426,7 +549,11 @@ fn specialize_round_zero(func: &mut Function, rounds: &Rounds<'_>) {
     let step = &rounds.steps[0];
     for (at, &block) in rounds.region.blocks.iter().enumerate() {
         if let Some(&term) = func.blocks[block.index()].insts.last() {
-            let decided = if step.reached[at] { step.decided[at] } else { None };
+            let decided = if step.reached[at] {
+                step.decided[at]
+            } else {
+                None
+            };
             let mut op = decide_term(func.insts[term.index()].op.clone(), decided);
             op.map_targets(|target| rounds.image(0, target));
             func.insts[term.index()].op = op;
@@ -444,23 +571,13 @@ fn specialize_round_zero(func: &mut Function, rounds: &Rounds<'_>) {
     }
 }
 
-fn push_edge(func: &mut Function, pred: Block, target: Block, arg: Value) {
-    let Some(&term) = func.blocks[pred.index()].insts.last() else { return };
-    match &mut func.insts[term.index()].op {
-        Op::Jump(to, args) if *to == target => args.push(arg),
-        Op::Brif(_, then, then_args, otherwise, else_args) => {
-            if *then == target {
-                then_args.push(arg);
-            }
-            if *otherwise == target {
-                else_args.push(arg);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn resolve_idom(cfg: &Cfg, starts: &[Option<Value>], ends: &[Option<Value>], fallback: Value, mut cur: Block) -> Value {
+fn resolve_idom(
+    cfg: &Cfg,
+    starts: &[Option<Value>],
+    ends: &[Option<Value>],
+    fallback: Value,
+    mut cur: Block,
+) -> Value {
     for _ in 0..cfg.idom.len() {
         if let Some(param) = starts[cur.index()] {
             return param;
@@ -468,7 +585,9 @@ fn resolve_idom(cfg: &Cfg, starts: &[Option<Value>], ends: &[Option<Value>], fal
         if let Some(def) = ends[cur.index()] {
             return def;
         }
-        let Some(parent) = cfg.idom[cur.index()].filter(|&p| p != cur) else { break };
+        let Some(parent) = cfg.idom[cur.index()].filter(|&p| p != cur) else {
+            break;
+        };
         cur = parent;
     }
     fallback
@@ -485,7 +604,9 @@ fn rewrite_users(func: &mut Function, cfg: &Cfg, out: &LiveOut, resolve: &dyn Fn
         }
         for at in 0..func.blocks[user.index()].insts.len() {
             let inst = func.blocks[user.index()].insts[at];
-            func.insts[inst.index()].op.map_operands(|value| if value == out.value { new } else { value });
+            func.insts[inst.index()]
+                .op
+                .map_operands(|value| if value == out.value { new } else { value });
         }
     }
 }
@@ -499,8 +620,15 @@ fn collect_active_ends(
     let mut ends = vec![None; after.reachable.len()];
     let mut active = 0_usize;
     let mut only = out.value;
-    let Some(at) = rounds.region.at(out.def) else { return (ends, 0, out.value) };
-    if after.reachable.get(out.def.index()).copied().unwrap_or(false) {
+    let Some(at) = rounds.region.at(out.def) else {
+        return (ends, 0, out.value);
+    };
+    if after
+        .reachable
+        .get(out.def.index())
+        .copied()
+        .unwrap_or(false)
+    {
         ends[out.def.index()] = Some(out.value);
         active += 1;
     }
@@ -516,7 +644,12 @@ fn collect_active_ends(
     (ends, active, only)
 }
 
-fn fill_phi_edges(func: &mut Function, after: &Cfg, phi: &[bool], resolve: &dyn Fn(Block) -> Value) {
+fn fill_phi_edges(
+    func: &mut Function,
+    after: &Cfg,
+    phi: &[bool],
+    resolve: &dyn Fn(Block) -> Value,
+) {
     for (idx, &need) in phi.iter().enumerate() {
         if !need {
             continue;
@@ -531,12 +664,18 @@ fn fill_phi_edges(func: &mut Function, after: &Cfg, phi: &[bool], resolve: &dyn 
         preds.sort_unstable();
         preds.dedup();
         for pred in preds {
-            push_edge(func, pred, target, resolve(pred));
+            func.push_edge_arg(pred, target, resolve(pred));
         }
     }
 }
 
-fn repair_one(func: &mut Function, after: &Cfg, rounds: &Rounds<'_>, out: &LiveOut, maps: &[Vec<(Value, Value)>]) {
+fn repair_one(
+    func: &mut Function,
+    after: &Cfg,
+    rounds: &Rounds<'_>,
+    out: &LiveOut,
+    maps: &[Vec<(Value, Value)>],
+) {
     let (ends, active, only) = collect_active_ends(after, rounds, out, maps);
     if active == 0 {
         return;
@@ -554,28 +693,57 @@ fn repair_one(func: &mut Function, after: &Cfg, rounds: &Rounds<'_>, out: &LiveO
             starts[idx] = Some(param);
         }
     }
-    rewrite_users(func, after, out, &|user| resolve_idom(after, &starts, &ends, out.value, user));
-    fill_phi_edges(func, after, &phi, &|pred| resolve_idom(after, &starts, &ends, out.value, pred));
+    rewrite_users(func, after, out, &|user| {
+        resolve_idom(after, &starts, &ends, out.value, user)
+    });
+    fill_phi_edges(func, after, &phi, &|pred| {
+        resolve_idom(after, &starts, &ends, out.value, pred)
+    });
 }
 
-fn rebind(func: &mut Function, after: &Cfg, rounds: &Rounds<'_>, live: &[LiveOut], maps: &[Vec<(Value, Value)>]) {
+fn rebind(
+    func: &mut Function,
+    after: &Cfg,
+    rounds: &Rounds<'_>,
+    live: &[LiveOut],
+    maps: &[Vec<(Value, Value)>],
+) {
     for out in live {
         repair_one(func, after, rounds, out, maps);
     }
 }
 
 pub(super) fn unroll(func: &mut Function, cfg: &Cfg, each: &Loop) -> bool {
-    let Some(entry) = func.entry else { return false };
-    let Some(region) = shape(func, cfg, each) else { return false };
+    let Some(entry) = func.entry else {
+        return false;
+    };
+    let Some(region) = shape(func, cfg, each) else {
+        return false;
+    };
     let global_consts = &collect_global_consts(func, cfg, evaluate);
-    let Some(init) = outside_const_params(func, cfg, each.head, &each.latches, global_consts) else { return false };
-    let Some(proof) = prove(func, &region, init, global_consts) else { return false };
+    let Some(init) = outside_const_params(func, cfg, each.head, &each.latches, global_consts)
+    else {
+        return false;
+    };
+    let Some(proof) = prove(func, &region, init, global_consts) else {
+        return false;
+    };
     let backs = proof.heads.len() - 1;
-    let live = if backs == 0 { Vec::new() } else { live_outs(func, cfg, each) };
+    let live = if backs == 0 {
+        Vec::new()
+    } else {
+        live_outs(func, cfg, each)
+    };
     if !live.iter().all(|out| repairable(func, cfg, each, out)) {
         return false;
     }
-    let rounds = Rounds { region: &region, base: func.blocks.len(), backs, heads: &proof.heads, steps: &proof.steps };
+    let rounds = Rounds {
+        region: &region,
+        base: func.blocks.len(),
+        backs,
+        heads: &proof.heads,
+        steps: &proof.steps,
+    };
     let maps = clone_rounds(func, &rounds);
     specialize_round_zero(func, &rounds);
     func.bump_cfg();

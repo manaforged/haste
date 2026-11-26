@@ -24,7 +24,9 @@ pub struct Symbols {
 
 impl std::fmt::Debug for Symbols {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Symbols").field("len", &self.inner.len()).finish()
+        f.debug_struct("Symbols")
+            .field("len", &self.inner.len())
+            .finish()
     }
 }
 
@@ -40,8 +42,14 @@ const FIXED: [&str; 4] = ["crate", "self", "super", "_"];
 
 impl Default for Symbols {
     fn default() -> Symbols {
-        let symbols = Symbols { inner: Interner::default() };
-        for name in FIXED.iter().copied().chain(PRIMITIVES.iter().map(|(name, _)| *name)) {
+        let symbols = Symbols {
+            inner: Interner::default(),
+        };
+        for name in FIXED
+            .iter()
+            .copied()
+            .chain(PRIMITIVES.iter().map(|(name, _)| *name))
+        {
             symbols.intern(name);
         }
         symbols
@@ -87,8 +95,16 @@ const INNER_BITS: u32 = 16;
 impl ItemRef {
     /// Item `index` of those declared in the body of `self`.
     pub fn inner(self, index: u32) -> ItemRef {
-        assert!(self.item < INNER >> INNER_BITS && index < 1 << INNER_BITS, "item {} of a body in item {} does not fit an ItemRef", index, self.item);
-        ItemRef { item: INNER | self.item << INNER_BITS | index, ..self }
+        assert!(
+            self.item < INNER >> INNER_BITS && index < 1 << INNER_BITS,
+            "item {} of a body in item {} does not fit an ItemRef",
+            index,
+            self.item
+        );
+        ItemRef {
+            item: INNER | self.item << INNER_BITS | index,
+            ..self
+        }
     }
 
     /// The function whose body declares `self`, when a body declares it.
@@ -104,7 +120,13 @@ impl ItemRef {
     /// The item whose body declares `self`, and the index of `self` there, when a body declares it.
     pub fn outer(self) -> Option<(ItemRef, u32)> {
         let at = self.item & !INNER;
-        (self.item & INNER != 0).then_some((ItemRef { item: at >> INNER_BITS, ..self }, at & ((1 << INNER_BITS) - 1)))
+        (self.item & INNER != 0).then_some((
+            ItemRef {
+                item: at >> INNER_BITS,
+                ..self
+            },
+            at & ((1 << INNER_BITS) - 1),
+        ))
     }
 }
 
@@ -166,7 +188,10 @@ pub(crate) const PRIMITIVES: [(&str, Primitive); 19] = [
 impl Primitive {
     /// The primitive type spelled `name`.
     pub fn named(name: &str) -> Option<Primitive> {
-        PRIMITIVES.iter().find(|(spelled, _)| *spelled == name).map(|(_, primitive)| *primitive)
+        PRIMITIVES
+            .iter()
+            .find(|(spelled, _)| *spelled == name)
+            .map(|(_, primitive)| *primitive)
     }
 }
 
@@ -292,7 +317,11 @@ pub struct Crate {
 impl Crate {
     /// Whether the imports that can bind `name` in `module` resolve: in an eager crate all do, elsewhere those a lookup asked for.
     pub fn wants(&self, module: u32, name: Sym) -> bool {
-        self.eager || self.wanted.get(&module).is_some_and(|names| names.contains(&name))
+        self.eager
+            || self
+                .wanted
+                .get(&module)
+                .is_some_and(|names| names.contains(&name))
     }
 
     /// Whether every import of `module` resolves: in an eager crate, or once a lookup asked for its whole scope.
@@ -302,7 +331,11 @@ impl Crate {
 
     pub(crate) fn index_pending(&mut self, index: usize, pending: &collect::Pending) {
         match pending.name {
-            Some(name) => self.named.entry((pending.module, name)).or_default().push(index),
+            Some(name) => self
+                .named
+                .entry((pending.module, name))
+                .or_default()
+                .push(index),
             None => self.globs.entry(pending.module).or_default().push(index),
         }
     }
@@ -312,8 +345,16 @@ impl Crate {
         self.globs.clear();
         for index in 0..self.pending.len() {
             match self.pending[index].name {
-                Some(name) => self.named.entry((self.pending[index].module, name)).or_default().push(index),
-                None => self.globs.entry(self.pending[index].module).or_default().push(index),
+                Some(name) => self
+                    .named
+                    .entry((self.pending[index].module, name))
+                    .or_default()
+                    .push(index),
+                None => self
+                    .globs
+                    .entry(self.pending[index].module)
+                    .or_default()
+                    .push(index),
             }
         }
     }
@@ -327,9 +368,24 @@ pub struct Names {
 
 impl Names {
     /// Path resolution in crate `krate` of `outline`, over the finished scopes.
-    pub fn paths<'a>(&'a self, outline: &'a crate::outline::Outline, krate: u32) -> path::Paths<'a> {
+    pub fn paths<'a>(
+        &'a self,
+        outline: &'a crate::outline::Outline,
+        krate: u32,
+    ) -> path::Paths<'a> {
         let entry = &self.crates[krate as usize];
-        path::Paths { krate, trees: &outline.crates, done: &self.crates, scopes: &entry.scopes, deps: &entry.deps, edition_2015: entry.edition_2015, prelude: entry.prelude, externs: &entry.externs, symbols: &self.symbols, demands: None }
+        path::Paths {
+            krate,
+            trees: &outline.crates,
+            done: &self.crates,
+            scopes: &entry.scopes,
+            deps: &entry.deps,
+            edition_2015: entry.edition_2015,
+            prelude: entry.prelude,
+            externs: &entry.externs,
+            symbols: &self.symbols,
+            demands: None,
+        }
     }
 }
 

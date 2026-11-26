@@ -22,13 +22,22 @@ pub(crate) fn compact(func: &mut Function) {
     let mut insts = Vec::with_capacity(live);
     let mut blocks = std::mem::take(&mut func.blocks);
     for block in &mut blocks {
-        block.params.iter_mut().for_each(|param| *param = take(*param));
+        block
+            .params
+            .iter_mut()
+            .for_each(|param| *param = take(*param));
         for inst in &mut block.insts {
             let slot = &mut func.insts[inst.index()];
-            let mut data = InstData { op: std::mem::replace(&mut slot.op, Op::Trap), result: slot.result, loc: slot.loc };
+            let mut data = InstData {
+                op: std::mem::replace(&mut slot.op, Op::Trap),
+                result: slot.result,
+                loc: slot.loc,
+            };
             data.result = data.result.map(&mut take);
             if let Op::Call { results, .. } = &mut data.op {
-                results.iter_mut().for_each(|result| *result = take(*result));
+                results
+                    .iter_mut()
+                    .for_each(|result| *result = take(*result));
             }
             data.op.map_operands(&mut take);
             insts.push(data);
@@ -57,7 +66,9 @@ pub(crate) fn compact_slots(func: &mut Function) {
     for block in &func.blocks {
         for &inst in &block.insts {
             match func.insts[inst.index()].op {
-                Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) => used[s.index()] = true,
+                Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) => {
+                    used[s.index()] = true
+                }
                 _ => {}
             }
         }
@@ -79,10 +90,12 @@ pub(crate) fn compact_slots(func: &mut Function) {
     }
     for data in &mut func.insts {
         match &mut data.op {
-            Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) => match map[s.index()] {
-                Some(new_s) => *s = new_s,
-                None => data.op = Op::Trap,
-            },
+            Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) => {
+                match map[s.index()] {
+                    Some(new_s) => *s = new_s,
+                    None => data.op = Op::Trap,
+                }
+            }
             _ => {}
         }
     }
@@ -107,7 +120,9 @@ fn compact_blocks(func: &mut Function) {
         blocks.push(block);
     }
     let renumber = |block: Block| map[block.index()].unwrap_or(Block(0));
-    func.insts.iter_mut().for_each(|data| data.op.map_targets(renumber));
+    func.insts
+        .iter_mut()
+        .for_each(|data| data.op.map_targets(renumber));
     func.entry = func.entry.map(renumber);
     func.blocks = blocks;
     func.bump_cfg();

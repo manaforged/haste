@@ -49,7 +49,9 @@ pub(crate) fn set_jit_unwind_head(head: usize) {
 /// Clears the active JIT unwind-list head if it still matches `head`.
 pub(crate) fn clear_jit_unwind_head(head: usize) {
     if head != 0 {
-        JIT_UNWIND_HEAD.compare_exchange(head, 0, Ordering::AcqRel, Ordering::Relaxed).ok();
+        JIT_UNWIND_HEAD
+            .compare_exchange(head, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .ok();
     }
 }
 
@@ -69,7 +71,12 @@ pub(crate) fn register_shared_drops(
         .iter()
         .filter_map(|d| {
             let slot = *symbols.get(d.drop_sym as usize)? as usize;
-            (slot != 0).then_some(JitUnwindDrop { local_off: d.local_off, flag_off: d.flag_off, drop_slot: slot, indirect: usize::from(d.indirect) })
+            (slot != 0).then_some(JitUnwindDrop {
+                local_off: d.local_off,
+                flag_off: d.flag_off,
+                drop_slot: slot,
+                indirect: usize::from(d.indirect),
+            })
         })
         .collect();
     if resolved.is_empty() {
@@ -92,7 +99,8 @@ pub(crate) fn register_shared_drops(
         let mut old = (*head_atom).load(Ordering::Acquire);
         loop {
             (*node).next = old;
-            match (*head_atom).compare_exchange_weak(old, mem, Ordering::AcqRel, Ordering::Acquire) {
+            match (*head_atom).compare_exchange_weak(old, mem, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => break,
                 Err(cur) => old = cur,
             }
@@ -264,7 +272,11 @@ unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize) {
             }
             *flag_ptr = 0;
             let slot_ptr = fp.wrapping_add_signed(d.local_off as isize);
-            let arg = if d.indirect != 0 { *(slot_ptr as *const *mut u8) } else { slot_ptr as *mut u8 };
+            let arg = if d.indirect != 0 {
+                *(slot_ptr as *const *mut u8)
+            } else {
+                slot_ptr as *mut u8
+            };
             let drop_addr = *(d.drop_slot as *const usize);
             if drop_addr != 0 {
                 let drop_fn: extern "C" fn(*mut u8) = std::mem::transmute::<usize, _>(drop_addr);
@@ -307,7 +319,13 @@ pub extern "C" fn catch_unwind(
 ) -> i32 {
     let prev = CURRENT_FRAME.get();
     let drops = CURRENT_DROPS.get();
-    let mut frame = UnwindFrame { prev, drops, stop_fp: 0, env: JmpBuf([0; 64]), payload: std::ptr::null_mut() };
+    let mut frame = UnwindFrame {
+        prev,
+        drops,
+        stop_fp: 0,
+        env: JmpBuf([0; 64]),
+        payload: std::ptr::null_mut(),
+    };
     frame.stop_fp = &raw const frame as usize;
     CURRENT_FRAME.set(&raw mut frame);
     // SAFETY: frame.env is a live 512-byte 16-aligned jmp_buf on this stack frame.
@@ -321,7 +339,12 @@ pub extern "C" fn catch_unwind(
     }
 }
 
-extern "C" fn start_panic_inner(payload_data: usize, payload_vtable: usize, caller_fp: usize, caller_ret_pc: usize) -> u32 {
+extern "C" fn start_panic_inner(
+    payload_data: usize,
+    payload_vtable: usize,
+    caller_fp: usize,
+    caller_ret_pc: usize,
+) -> u32 {
     let frame = CURRENT_FRAME.get();
     if frame.is_null() {
         std::process::abort();
@@ -330,7 +353,8 @@ extern "C" fn start_panic_inner(payload_data: usize, payload_vtable: usize, call
     unsafe {
         CURRENT_FRAME.set((*frame).prev);
         let take_box_ptr = *(payload_vtable as *const usize).add(3);
-        let take_box: extern "C" fn(usize) -> FatPtr = std::mem::transmute::<usize, _>(take_box_ptr);
+        let take_box: extern "C" fn(usize) -> FatPtr =
+            std::mem::transmute::<usize, _>(take_box_ptr);
         let boxed = take_box(payload_data);
         (*frame).payload = Box::into_raw(Box::new(boxed)).cast::<u8>();
         drain_jit_frames(caller_fp, caller_ret_pc, (*frame).stop_fp, (*frame).drops);

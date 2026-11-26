@@ -1,6 +1,6 @@
+use super::Emit;
 use super::asm::{Alu, Cond, Group3, Reg, Rm, Shift, Size, Xmm};
 use super::vector::vec_prefix;
-use super::Emit;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, Lane, Type, Unary, Value};
 
@@ -20,7 +20,12 @@ const F32_ONE: i64 = 0x3F80_0000;
 pub(super) const POOL: [u8; 13] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// The float compares whose one condition a branch can read from the flags `ucomis` sets; equality needs two.
-pub(super) const BRANCHES: [FloatCC; 4] = [FloatCC::LessThan, FloatCC::LessThanOrEqual, FloatCC::GreaterThan, FloatCC::GreaterThanOrEqual];
+pub(super) const BRANCHES: [FloatCC; 4] = [
+    FloatCC::LessThan,
+    FloatCC::LessThanOrEqual,
+    FloatCC::GreaterThan,
+    FloatCC::GreaterThanOrEqual,
+];
 
 pub(super) fn scalar(ty: Type) -> u8 {
     if ty == Type::F64 { 0xF2 } else { 0xF3 }
@@ -38,7 +43,12 @@ impl Emit<'_> {
     }
 
     fn bit_sign(&mut self, ty: Type, toggle: bool, reg: Reg) {
-        self.asm.bt_imm(if ty == Type::F64 { Size::Q } else { Size::D }, if toggle { 7 } else { 6 }, reg, ty.bits() as u8 - 1);
+        self.asm.bt_imm(
+            if ty == Type::F64 { Size::Q } else { Size::D },
+            if toggle { 7 } else { 6 },
+            reg,
+            ty.bits() as u8 - 1,
+        );
     }
 
     pub(super) fn float_unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
@@ -75,7 +85,11 @@ impl Emit<'_> {
 
     /// Rounds the float in `dst` by `op` without SSE4.1: through a 64-bit integer below the magnitude where every float is whole, then the sign of the input, using rax, rcx, rdx, xmm1 and xmm2.
     pub(super) fn round_baseline(&mut self, op: Unary, ty: Type, dst: Xmm) {
-        let (size, whole, one) = if ty == Type::F64 { (Size::Q, F64_WHOLE, F64_ONE) } else { (Size::D, F32_WHOLE, F32_ONE) };
+        let (size, whole, one) = if ty == Type::F64 {
+            (Size::Q, F64_WHOLE, F64_ONE)
+        } else {
+            (Size::D, F32_WHOLE, F32_ONE)
+        };
         let done = self.asm.label();
         self.asm.movq_out(Reg::Rax, dst);
         self.asm.mov(Reg::Rcx, Reg::Rax);
@@ -126,7 +140,13 @@ impl Emit<'_> {
         self.fput(result, dst);
     }
 
-    pub(super) fn float_binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
+    pub(super) fn float_binary(
+        &mut self,
+        op: Binary,
+        x: Value,
+        y: Value,
+        result: Value,
+    ) -> Result<(), String> {
         let ty = self.ty(x);
         let opcode = match op {
             Binary::Fadd => 0x58,
@@ -191,22 +211,44 @@ impl Emit<'_> {
         self.fput(result, dst);
     }
 
-    pub(super) fn fma(&mut self, a: Value, b: Value, c: Value, result: Value) -> Result<(), String> {
+    pub(super) fn fma(
+        &mut self,
+        a: Value,
+        b: Value,
+        c: Value,
+        result: Value,
+    ) -> Result<(), String> {
         let ty = self.ty(a);
         let (is_vec, is_f64, lane) = match ty {
             Type::F32 => (false, false, Lane::F32),
             Type::F64 => (false, true, Lane::F64),
-            Type::Vec { lane: Lane::F32, count: 2 | 4 } => (true, false, Lane::F32),
-            Type::Vec { lane: Lane::F64, count: 2 } => (true, true, Lane::F64),
+            Type::Vec {
+                lane: Lane::F32,
+                count: 2 | 4,
+            } => (true, false, Lane::F32),
+            Type::Vec {
+                lane: Lane::F64,
+                count: 2,
+            } => (true, true, Lane::F64),
             other => return Err(format!("Fma of {other:?}")),
         };
         if self.features.fma && self.features.avx {
             self.fma_vex([a, b, c], result, is_vec, is_f64);
             return Ok(());
         }
-        let prefix: &[u8] = if is_vec { vec_prefix(lane) } else { &[scalar(ty)] };
+        let prefix: &[u8] = if is_vec {
+            vec_prefix(lane)
+        } else {
+            &[scalar(ty)]
+        };
         self.fget(X0, a);
-        let sse_arg = |this: &mut Self, v| if is_vec { this.fin(v, X1).into() } else { this.foperand(v, X1) };
+        let sse_arg = |this: &mut Self, v| {
+            if is_vec {
+                this.fin(v, X1).into()
+            } else {
+                this.foperand(v, X1)
+            }
+        };
         let mul_src = sse_arg(self, b);
         self.asm.sse(prefix, &[0x0F, 0x59], X0.0, mul_src);
         let add_src = sse_arg(self, c);
@@ -259,20 +301,28 @@ impl Emit<'_> {
         self.asm.setcc(cond, Reg::Rax);
         if matches!(cc, FloatCC::Equal | FloatCC::NotEqual) {
             let equal = cc == FloatCC::Equal;
-            self.asm.setcc(if equal { Cond::Np } else { Cond::P }, Reg::Rcx);
-            self.asm.alu32(if equal { Alu::And } else { Alu::Or }, Reg::Rax, Reg::Rcx);
+            self.asm
+                .setcc(if equal { Cond::Np } else { Cond::P }, Reg::Rcx);
+            self.asm
+                .alu32(if equal { Alu::And } else { Alu::Or }, Reg::Rax, Reg::Rcx);
         }
         self.asm.load(Size::B, Reg::Rax, Reg::Rax);
         self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
         self.put(result, Reg::Rax);
     }
 
-    pub(super) fn float_convert(&mut self, op: Convert, x: Value, result: Value) -> Result<(), String> {
+    pub(super) fn float_convert(
+        &mut self,
+        op: Convert,
+        x: Value,
+        result: Value,
+    ) -> Result<(), String> {
         let to = self.ty(result);
         match op {
             Convert::Fpromote | Convert::Fdemote => {
                 let (dst, source) = (self.fdst(result), self.foperand(x, X1));
-                self.asm.sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], dst.0, source);
+                self.asm
+                    .sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], dst.0, source);
                 self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
@@ -296,7 +346,11 @@ impl Emit<'_> {
             Convert::ToSintSat | Convert::ToUintSat if to != Type::I128 => {
                 self.widen_to_double(x);
                 let signed = op == Convert::ToSintSat;
-                if signed { self.to_signed() } else { self.to_unsigned() }
+                if signed {
+                    self.to_signed()
+                } else {
+                    self.to_unsigned()
+                }
                 self.clamp(to, signed);
                 self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
                 self.clobber_xmms(&[X0, X1, X2]);
@@ -323,7 +377,10 @@ impl Emit<'_> {
                 self.zero_xmm(dst);
             } else {
                 self.get(Reg::Rax, x, Ext::Zero);
-                let wide = to != Type::F32 && self.const_of(x).is_none_or(|c| (c as u64) > u64::from(u32::MAX));
+                let wide = to != Type::F32
+                    && self
+                        .const_of(x)
+                        .is_none_or(|c| (c as u64) > u64::from(u32::MAX));
                 self.emit_mov_xmm_gpr(dst, Reg::Rax, wide);
                 self.clobber_xmm(dst);
             }
@@ -392,7 +449,12 @@ impl Emit<'_> {
 
     /// Converts the double in xmm0 to a saturated u64 in rax, with NaN as zero.
     pub(super) fn to_unsigned(&mut self) {
-        let (positive, big, max, done) = (self.asm.label(), self.asm.label(), self.asm.label(), self.asm.label());
+        let (positive, big, max, done) = (
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+        );
         self.zero_xmm(X1);
         self.ucomi(Type::F64, X0, X1);
         self.asm.jcc(Cond::A, positive);
@@ -438,4 +500,3 @@ impl Emit<'_> {
         }
     }
 }
-

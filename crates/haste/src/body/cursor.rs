@@ -25,8 +25,10 @@ pub fn is_name(kind: TokenKind) -> bool {
 }
 
 pub const RESERVED: [&str; 38] = [
-    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
-    "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn",
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
+    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
+    "while", "async", "await", "dyn",
 ];
 
 /// The keywords that can lead a path.
@@ -34,7 +36,16 @@ pub const PATH_KEYWORDS: [&str; 4] = ["crate", "self", "Self", "super"];
 
 impl<'a> Cursor<'a> {
     pub fn new(src: &'a Source, at: u32, end: u32) -> Cursor<'a> {
-        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, config: super::Config::default(), expansion: None, expansion_stmt: None }
+        Cursor {
+            src,
+            at,
+            end: end.min(src.len()),
+            body: Body::default(),
+            no_struct: false,
+            config: super::Config::default(),
+            expansion: None,
+            expansion_stmt: None,
+        }
     }
 
     /// Whether the outer attributes at `attrs` hold a `#[cfg]` that the environment turns off.
@@ -43,12 +54,17 @@ impl<'a> Cursor<'a> {
             return false;
         };
         let mut parsed = Vec::new();
-        crate::outline::attr::attrs(self.src, from, false, &mut parsed).is_ok() && !env.enabled(&parsed)
+        crate::outline::attr::attrs(self.src, from, false, &mut parsed).is_ok()
+            && !env.enabled(&parsed)
     }
 
     #[inline]
     pub fn kind_at(&self, at: u32) -> TokenKind {
-        if at < self.end { self.src.kind(at) } else { TokenKind::Eof }
+        if at < self.end {
+            self.src.kind(at)
+        } else {
+            TokenKind::Eof
+        }
     }
 
     #[inline]
@@ -62,7 +78,11 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn word_at(&self, at: u32) -> &'a str {
-        if is_name(self.kind_at(at)) { self.src.text(at) } else { "" }
+        if is_name(self.kind_at(at)) {
+            self.src.text(at)
+        } else {
+            ""
+        }
     }
 
     pub fn word(&self) -> &'a str {
@@ -130,13 +150,25 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn fail<T>(&self, what: &str) -> Result<T> {
-        let near = if self.at < self.end { self.src.text(self.at).to_owned() } else { "end".to_owned() };
-        let line = if self.src.is_empty() { 0 } else { self.src.line(self.at.min(self.src.len() - 1)) };
+        let near = if self.at < self.end {
+            self.src.text(self.at).to_owned()
+        } else {
+            "end".to_owned()
+        };
+        let line = if self.src.is_empty() {
+            0
+        } else {
+            self.src.line(self.at.min(self.src.len() - 1))
+        };
         bail!("{}:{line}: {what}, found `{near}`", self.src.path.display())
     }
 
     pub fn finish(&self) -> Result<()> {
-        if self.done() { Ok(()) } else { self.fail("expected the end") }
+        if self.done() {
+            Ok(())
+        } else {
+            self.fail("expected the end")
+        }
     }
 
     pub fn group(&mut self) -> u32 {
@@ -161,15 +193,26 @@ impl<'a> Cursor<'a> {
     pub fn list(&mut self, ids: &[u32]) -> List {
         let start = self.body.ids.len() as u32;
         self.body.ids.extend_from_slice(ids);
-        List { start, len: ids.len() as u32 }
+        List {
+            start,
+            len: ids.len() as u32,
+        }
     }
 
-    pub fn comma_list(&mut self, open: u32, mut item: impl FnMut(&mut Self) -> Result<u32>) -> Result<List> {
+    pub fn comma_list(
+        &mut self,
+        open: u32,
+        mut item: impl FnMut(&mut Self) -> Result<u32>,
+    ) -> Result<List> {
         self.kept_list(open, |cursor| item(cursor).map(Some))
     }
 
     /// The comma-separated items inside the group at `open`, keeping those that `item` returns.
-    pub fn kept_list(&mut self, open: u32, mut item: impl FnMut(&mut Self) -> Result<Option<u32>>) -> Result<List> {
+    pub fn kept_list(
+        &mut self,
+        open: u32,
+        mut item: impl FnMut(&mut Self) -> Result<Option<u32>>,
+    ) -> Result<List> {
         let ids = self.inside(open, |cursor| {
             let mut ids = Vec::new();
             while !cursor.done() {
@@ -205,7 +248,11 @@ impl<'a> Cursor<'a> {
     }
 
     /// The fields of the brace group at the cursor that the configuration keeps, each read by `field` with its attributes, and whether a `..` ends them, after which `rest` reads what follows.
-    pub fn struct_fields(&mut self, mut field: impl FnMut(&mut Self, Option<(u32, u32)>) -> Result<u32>, rest: impl FnOnce(&mut Self) -> Result<()>) -> Result<(Vec<u32>, bool)> {
+    pub fn struct_fields(
+        &mut self,
+        mut field: impl FnMut(&mut Self, Option<(u32, u32)>) -> Result<u32>,
+        rest: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<(Vec<u32>, bool)> {
         let open = self.group();
         self.inside(open, |cursor| {
             let mut fields = Vec::new();
@@ -241,7 +288,10 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn lifetime(&mut self) -> Option<u32> {
-        if matches!(self.kind(), TokenKind::Lifetime { .. } | TokenKind::RawLifetime) {
+        if matches!(
+            self.kind(),
+            TokenKind::Lifetime { .. } | TokenKind::RawLifetime
+        ) {
             self.at += 1;
             return Some(self.at - 1);
         }
@@ -293,7 +343,9 @@ pub(crate) fn punct_in(src: &Source, (at, end): (u32, u32), text: &str) -> bool 
     let last = at + bytes.len() as u32 - 1;
     last < end
         && bytes.iter().zip(at..).all(|(&byte, here)| {
-            src.token_at(here).is_some_and(|tok| Some(tok.kind) == punct_kind(byte) && (here == last || tok.joint()))
+            src.token_at(here).is_some_and(|tok| {
+                Some(tok.kind) == punct_kind(byte) && (here == last || tok.joint())
+            })
         })
 }
 

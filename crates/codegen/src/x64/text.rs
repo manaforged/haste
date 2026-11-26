@@ -40,7 +40,11 @@ enum Operand {
 impl Text {
     /// An empty encoder whose `call {sym}` is PC-relative when `direct`, else through the call table slot.
     pub(crate) fn new(direct: bool) -> Self {
-        Self { asm: Asm::default(), relocs: Vec::new(), direct }
+        Self {
+            asm: Asm::default(),
+            relocs: Vec::new(),
+            direct,
+        }
     }
 
     fn data(&mut self, mnemonic: &str, operands: &[Operand]) -> bool {
@@ -48,10 +52,18 @@ impl Text {
             ("mov", [Operand::Reg(dst), Operand::Reg(src)]) => self.asm.mov(*dst, *src),
             ("mov", [Operand::Mem(dst), Operand::Reg(src)]) => self.asm.store(Size::Q, *dst, *src),
             ("mov", [Operand::Reg(dst), Operand::Mem(src)]) => self.asm.load(Size::Q, *dst, *src),
-            ("movdqu", [Operand::Mem(dst), Operand::Xmm(src)]) => self.asm.sse(&[0xF3], &[0x0F, 0x7F], src.0, *dst),
-            ("movdqu", [Operand::Xmm(dst), Operand::Mem(src)]) => self.asm.sse(&[0xF3], &[0x0F, 0x6F], dst.0, *src),
-            ("add", [Operand::Reg(dst), Operand::Imm(imm)]) => self.asm.alu_imm(Alu::Add, *dst, *imm),
-            ("sub", [Operand::Reg(dst), Operand::Imm(imm)]) => self.asm.alu_imm(Alu::Sub, *dst, *imm),
+            ("movdqu", [Operand::Mem(dst), Operand::Xmm(src)]) => {
+                self.asm.sse(&[0xF3], &[0x0F, 0x7F], src.0, *dst)
+            }
+            ("movdqu", [Operand::Xmm(dst), Operand::Mem(src)]) => {
+                self.asm.sse(&[0xF3], &[0x0F, 0x6F], dst.0, *src)
+            }
+            ("add", [Operand::Reg(dst), Operand::Imm(imm)]) => {
+                self.asm.alu_imm(Alu::Add, *dst, *imm)
+            }
+            ("sub", [Operand::Reg(dst), Operand::Imm(imm)]) => {
+                self.asm.alu_imm(Alu::Sub, *dst, *imm)
+            }
             _ => return false,
         }
         true
@@ -75,7 +87,9 @@ impl Text {
 }
 
 fn register(text: &str) -> Option<Reg> {
-    REGS.iter().find(|(name, _)| *name == text).map(|&(_, reg)| reg)
+    REGS.iter()
+        .find(|(name, _)| *name == text)
+        .map(|&(_, reg)| reg)
 }
 
 fn memory(inner: &str) -> Result<Mem, String> {
@@ -85,7 +99,8 @@ fn memory(inner: &str) -> Result<Mem, String> {
         None => (inner, 0),
     };
     let base = register(base).ok_or_else(|| format!("`[{inner}]` is not `[register + offset]`"))?;
-    let disp = i32::try_from(disp).map_err(|_| format!("the offset of `[{inner}]` does not fit 32 bits"))?;
+    let disp = i32::try_from(disp)
+        .map_err(|_| format!("the offset of `[{inner}]` does not fit 32 bits"))?;
     Ok(Mem::new(base, disp))
 }
 
@@ -93,16 +108,25 @@ fn operand(text: &str, symbol: &Symbols<'_>) -> Result<Operand, String> {
     if text.starts_with('{') {
         return symbol(text).map(Operand::Symbol);
     }
-    if let Some(inner) = text.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+    if let Some(inner) = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
         return memory(inner).map(Operand::Mem);
     }
     if let Some(reg) = register(text) {
         return Ok(Operand::Reg(reg));
     }
-    if let Some(index) = text.strip_prefix("xmm").and_then(|index| index.parse::<u8>().ok()).filter(|&index| index < 16) {
+    if let Some(index) = text
+        .strip_prefix("xmm")
+        .and_then(|index| index.parse::<u8>().ok())
+        .filter(|&index| index < 16)
+    {
         return Ok(Operand::Xmm(Xmm(index)));
     }
-    i32::try_from(integer(text)?).map(Operand::Imm).map_err(|_| format!("`{text}` does not fit 32 bits"))
+    i32::try_from(integer(text)?)
+        .map(Operand::Imm)
+        .map_err(|_| format!("`{text}` does not fit 32 bits"))
 }
 
 impl Encoder for Text {
@@ -114,8 +138,16 @@ impl Encoder for Text {
         self.asm.bytes(&[0x90]);
     }
 
-    fn instruction(&mut self, mnemonic: &str, operands: &[&str], symbol: &Symbols<'_>) -> Result<(), String> {
-        let operands = operands.iter().map(|text| operand(text, symbol)).collect::<Result<Vec<_>, _>>()?;
+    fn instruction(
+        &mut self,
+        mnemonic: &str,
+        operands: &[&str],
+        symbol: &Symbols<'_>,
+    ) -> Result<(), String> {
+        let operands = operands
+            .iter()
+            .map(|text| operand(text, symbol))
+            .collect::<Result<Vec<_>, _>>()?;
         if self.data(mnemonic, &operands) || self.control(mnemonic, &operands) {
             return Ok(());
         }

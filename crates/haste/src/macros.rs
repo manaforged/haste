@@ -48,13 +48,22 @@ impl Expander {
 impl Compilation {
     /// Drops the macro expander only when the macro crate graph changed, keeping compiled macro code across settle phases.
     pub fn settle(&mut self) {
-        if self.expander.as_ref().is_some_and(|kept| !kept.matches(&self.outline)) {
+        if self
+            .expander
+            .as_ref()
+            .is_some_and(|kept| !kept.matches(&self.outline))
+        {
             self.expander = None;
         }
     }
 }
 
-fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize], eager_all: bool) -> Result<Compilation> {
+fn load_with_sysroot(
+    workspace: &Workspace,
+    targets: &Targets,
+    scripts: &[usize],
+    eager_all: bool,
+) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, scripts);
     let cached = crate::substrate::sysroot::try_load(workspace, targets, &mut outline);
     let was_miss = cached.is_none();
@@ -71,16 +80,34 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
             if eager_all {
                 !sysroot || was_miss
             } else {
-                (was_miss && sysroot) || workspace.graph.members.contains(&workspace.graph.units[outline.roots[krate].unit].package)
+                (was_miss && sysroot)
+                    || workspace
+                        .graph
+                        .members
+                        .contains(&workspace.graph.units[outline.roots[krate].unit].package)
             }
         })
         .collect();
     outline.load_selected(&selected)?;
     let names = Names::new_with(workspace, &outline, cached);
-    let has_proc_macro = outline.roots.iter().any(|root| root.path.as_os_str() == PROC_MACRO_ROOT);
-    let macro_slot = has_proc_macro.then(|| crate::with_host_target(|| crate::build::substrate::open_batch_substrate(workspace))).flatten();
-    let substrate = macro_slot.as_ref().and_then(crate::build::substrate::SubstrateSlot::top);
-    let mut compilation = Compilation { outline, names, expander: None, substrate };
+    let has_proc_macro = outline
+        .roots
+        .iter()
+        .any(|root| root.path.as_os_str() == PROC_MACRO_ROOT);
+    let macro_slot = has_proc_macro
+        .then(|| {
+            crate::with_host_target(|| crate::build::substrate::open_batch_substrate(workspace))
+        })
+        .flatten();
+    let substrate = macro_slot
+        .as_ref()
+        .and_then(crate::build::substrate::SubstrateSlot::top);
+    let mut compilation = Compilation {
+        outline,
+        names,
+        expander: None,
+        substrate,
+    };
     for (krate, &on) in selected.iter().enumerate() {
         if on {
             compilation.names.crates[krate].set_eager();
@@ -88,7 +115,14 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
     }
     resolve(&mut compilation)?;
     if let (Some(slot), Some(expander)) = (macro_slot, &compilation.expander) {
-        crate::with_host_target(|| crate::build::substrate::save_jit_substrate(&compilation.outline, expander.jit.store(), expander.jit.image(), slot));
+        crate::with_host_target(|| {
+            crate::build::substrate::save_jit_substrate(
+                &compilation.outline,
+                expander.jit.store(),
+                expander.jit.image(),
+                slot,
+            )
+        });
     }
     if was_miss && crate::scripts::sysroot_scripts_settled(workspace) {
         crate::substrate::sysroot::save(workspace, targets, &compilation);
@@ -102,7 +136,11 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
 }
 
 /// Loads every module of every crate, with the build scripts of the units `scripts`, resolves every import and expands every procedural macro call, then drops the macro expander.
-pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Result<Compilation> {
+pub fn load_eager(
+    workspace: &Workspace,
+    targets: &Targets,
+    scripts: &[usize],
+) -> Result<Compilation> {
     load_with_sysroot(workspace, targets, scripts, true)
 }
 
@@ -112,17 +150,34 @@ pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation
 }
 
 /// Reaches from the instances `roots` gives, answering what each pass asks for until a pass settles or nothing new can load, then hands that pass's context and what it reached to `finish`.
-pub fn reach_resolved<R>(compilation: &mut Compilation, roots: impl Fn(&mut Context<'_>) -> Vec<Instance>, finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
+pub fn reach_resolved<R>(
+    compilation: &mut Compilation,
+    roots: impl Fn(&mut Context<'_>) -> Vec<Instance>,
+    finish: impl FnOnce(Context<'_>, Reached) -> Result<R>,
+) -> Result<R> {
     reach_with(compilation, Cache::default(), (roots, load), finish)
 }
 
 /// Reaches from `roots` using an existing `cache`, answering what each pass asks for until a pass settles or nothing new can load.
-pub fn reach_resolved_with_cache<R>(compilation: &mut Compilation, cache: Cache, roots: impl Fn(&mut Context<'_>) -> Vec<Instance>, finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
+pub fn reach_resolved_with_cache<R>(
+    compilation: &mut Compilation,
+    cache: Cache,
+    roots: impl Fn(&mut Context<'_>) -> Vec<Instance>,
+    finish: impl FnOnce(Context<'_>, Reached) -> Result<R>,
+) -> Result<R> {
     reach_with(compilation, cache, (roots, load), finish)
 }
 
 /// Reaches from `roots` as `reach_resolved` does, answering each pass's asks with `ask`, which says whether anything new loaded.
-fn reach_with<R>(compilation: &mut Compilation, cache: Cache, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Compilation, Requests) -> Result<Answer>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
+fn reach_with<R>(
+    compilation: &mut Compilation,
+    cache: Cache,
+    (roots, ask): (
+        impl Fn(&mut Context<'_>) -> Vec<Instance>,
+        impl Fn(&mut Compilation, Requests) -> Result<Answer>,
+    ),
+    finish: impl FnOnce(Context<'_>, Reached) -> Result<R>,
+) -> Result<R> {
     let mut finish = Some(finish);
     let mut reached = Reached::default();
     resolve_sema(compilation, (cache, ask), |mut cx, last| {
@@ -136,14 +191,22 @@ fn reach_with<R>(compilation: &mut Compilation, cache: Cache, (roots, ask): (imp
 }
 
 /// Runs `pass` on a context over `store`, answering with `ask` what it asked for, until it gives a result: `pass` returns its result, or the released context to answer and run again, and learns whether the last answer loaded nothing new. Drops the macro expander at the end.
-pub fn resolve_sema<R>(compilation: &mut Compilation, asking: (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>), pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
+pub fn resolve_sema<R>(
+    compilation: &mut Compilation,
+    asking: (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>),
+    pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>,
+) -> Result<R> {
     let done = answer_passes(compilation, asking, pass);
     compilation.settle();
     done
 }
 
 /// Answers the asks a pass released with `ask` and drops from the store it released what the answer made stale.
-pub fn answer(compilation: &mut Compilation, ask: impl Fn(&mut Compilation, Requests) -> Result<Answer>, (mut kept, asks): (Cache, Requests)) -> (Cache, Result<Answer>) {
+pub fn answer(
+    compilation: &mut Compilation,
+    ask: impl Fn(&mut Compilation, Requests) -> Result<Answer>,
+    (mut kept, asks): (Cache, Requests),
+) -> (Cache, Result<Answer>) {
     let answer = ask(compilation, asks);
     if let Ok(answer) = &answer {
         kept.forget_after(&compilation.outline, *answer);
@@ -151,10 +214,17 @@ pub fn answer(compilation: &mut Compilation, ask: impl Fn(&mut Compilation, Requ
     (kept, answer)
 }
 
-fn answer_passes<R>(compilation: &mut Compilation, (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>), mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
+fn answer_passes<R>(
+    compilation: &mut Compilation,
+    (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>),
+    mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>,
+) -> Result<R> {
     let mut last = false;
     loop {
-        let (kept, asks) = match pass(Context::new(&compilation.outline, &compilation.names, store), last)? {
+        let (kept, asks) = match pass(
+            Context::new(&compilation.outline, &compilation.names, store),
+            last,
+        )? {
             Ok(done) => return Ok(done),
             Err(released) => released,
         };
@@ -166,7 +236,10 @@ fn answer_passes<R>(compilation: &mut Compilation, (mut store, ask): (Cache, imp
 
 /// Settles names, then expands every procedural macro call they bind and settles again, until no call is left to bind, then drops the macro expander.
 pub fn resolve(compilation: &mut Compilation) -> Result<()> {
-    let done = compilation.names.resolve(&mut compilation.outline).and_then(|()| expand_bound(compilation).map(drop));
+    let done = compilation
+        .names
+        .resolve(&mut compilation.outline)
+        .and_then(|()| expand_bound(compilation).map(drop));
     compilation.settle();
     done
 }
@@ -184,8 +257,14 @@ fn expand_bound(compilation: &mut Compilation) -> Result<bool> {
             continue;
         }
         changed = true;
-        let inputs: Vec<Vec<String>> = bound.iter().map(|call| inputs(&compilation.outline, call)).collect();
-        let calls: Vec<Call> = bound.iter().map(|call| (call.run, call.kind, call.krate)).collect();
+        let inputs: Vec<Vec<String>> = bound
+            .iter()
+            .map(|call| inputs(&compilation.outline, call))
+            .collect();
+        let calls: Vec<Call> = bound
+            .iter()
+            .map(|call| (call.run, call.kind, call.krate))
+            .collect();
         let outputs = run(compilation, &calls, &inputs)?;
         apply(compilation, &bound, outputs)?;
         compilation.names.resolve(&mut compilation.outline)?;
@@ -203,13 +282,20 @@ pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<Answer> {
             .iter()
             .map(|(run, _)| {
                 let file = &compilation.outline.crates[run.krate as usize].files[run.file as usize];
-                let kind = crate::names::collect::proc_kind(&file.source, &file.items.items[run.item as usize]).map_or(ProcKind::Bang, |(_, kind)| kind);
+                let kind = crate::names::collect::proc_kind(
+                    &file.source,
+                    &file.items.items[run.item as usize],
+                )
+                .map_or(ProcKind::Bang, |(_, kind)| kind);
                 (*run, kind, usize::MAX)
             })
             .collect();
         let inputs: Vec<Vec<String>> = procs.iter().map(|(_, text)| vec![text.clone()]).collect();
         let outputs = run(compilation, &calls, &inputs)?;
-        compilation.outline.procs.extend(procs.iter().cloned().zip(outputs));
+        compilation
+            .outline
+            .procs
+            .extend(procs.iter().cloned().zip(outputs));
     }
     let more = compilation.names.load(&mut compilation.outline, asks)?;
     let expanded = expand_bound(compilation)?;
@@ -221,19 +307,35 @@ pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<Answer> {
 }
 
 /// Adds each call's output to its module, parsing outputs in parallel before sequential AST insertion, takes out replaced items, and resets stale crates.
-fn apply(compilation: &mut Compilation, bound: &[Bound], outputs: Vec<Result<String, String>>) -> Result<()> {
+fn apply(
+    compilation: &mut Compilation,
+    bound: &[Bound],
+    outputs: Vec<Result<String, String>>,
+) -> Result<()> {
     let Compilation { outline, names, .. } = compilation;
-    let to_parse: Vec<(std::path::PathBuf, Result<String, String>)> =
-        bound.iter().zip(outputs).map(|(call, output)| (site_path(&call.site), output)).collect();
-    let parsed = crate::sync::parallel_map(to_parse, |(path, output)| output.and_then(|text| Source::parse(path, text).map_err(|error| format!("{error:#}"))));
+    let to_parse: Vec<(std::path::PathBuf, Result<String, String>)> = bound
+        .iter()
+        .zip(outputs)
+        .map(|(call, output)| (site_path(&call.site), output))
+        .collect();
+    let parsed = crate::sync::parallel_map(to_parse, |(path, output)| {
+        output.and_then(|text| Source::parse(path, text).map_err(|error| format!("{error:#}")))
+    });
     let mut by_crate: HashMap<usize, Vec<(usize, Source, String)>> = HashMap::default();
     let mut stale = Vec::new();
     for (call, parsed) in bound.iter().zip(parsed) {
         let name = macro_name(outline, call.run);
         match parsed {
-            Ok(source) => by_crate.entry(call.krate).or_default().push((call.site.module(), source, name)),
+            Ok(source) => {
+                by_crate
+                    .entry(call.krate)
+                    .or_default()
+                    .push((call.site.module(), source, name))
+            }
             Err(error) => {
-                outline.crates[call.krate].errors.push(format!("{name}: {error}"));
+                outline.crates[call.krate]
+                    .errors
+                    .push(format!("{name}: {error}"));
                 continue;
             }
         }
@@ -261,7 +363,8 @@ fn site_path(site: &Site) -> std::path::PathBuf {
 fn macro_name(outline: &Outline, run: ItemRef) -> String {
     let file = &outline.crates[run.krate as usize].files[run.file as usize];
     let item = &file.items.items[run.item as usize];
-    item.name.map_or_else(String::new, |name| file.source.text(name).to_owned())
+    item.name
+        .map_or_else(String::new, |name| file.source.text(name).to_owned())
 }
 
 /// The texts a call runs on: the tokens between a bang call's delimiters; the item under a derive without its `#[derive]` attributes; or an attribute's arguments and the item without that attribute.
@@ -269,29 +372,72 @@ fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
     match &call.site {
         Site::Bang(waiting) => {
             let item = &waiting.file.items.items[waiting.at as usize];
-            vec![item.body.map_or_else(String::new, |open| bang_input(&outline.deps[call.krate], call.krate, &waiting.file.source, open))]
+            vec![item.body.map_or_else(String::new, |open| {
+                bang_input(
+                    &outline.deps[call.krate],
+                    call.krate,
+                    &waiting.file.source,
+                    open,
+                )
+            })]
         }
-        Site::Derive(held) => vec![derive_input(&held.file.source, &held.file.items.items[held.at as usize], &outline.crates[call.krate].env)],
+        Site::Derive(held) => vec![derive_input(
+            &held.file.source,
+            &held.file.items.items[held.at as usize],
+            &outline.crates[call.krate].env,
+        )],
         Site::Attribute(held) => {
             let src = &held.file.source;
             let after = held.path.1 + 1;
-            let args = if matches!(src.text(after), "(" | "[" | "{") { inside(src, after) } else { String::new() };
-            vec![args, item_text(src, &held.file.items.items[held.at as usize], &|path| path != held.path.0, None)]
+            let args = if matches!(src.text(after), "(" | "[" | "{") {
+                inside(src, after)
+            } else {
+                String::new()
+            };
+            vec![
+                args,
+                item_text(
+                    src,
+                    &held.file.items.items[held.at as usize],
+                    &|path| path != held.path.0,
+                    None,
+                ),
+            ]
         }
     }
 }
 
 /// The text of `item` as a procedural derive macro receives it: without its `#[derive]` attributes or cfg-disabled fields and variants.
-pub(crate) fn derive_input(src: &Source, item: &crate::outline::item::Item, env: &crate::outline::tree::Env) -> String {
-    item_text(src, item, &|path| !crate::outline::attr::is_derive_at(src, path, src.pair(path - 1)), Some(&|attrs| env.enabled(attrs)))
+pub(crate) fn derive_input(
+    src: &Source,
+    item: &crate::outline::item::Item,
+    env: &crate::outline::tree::Env,
+) -> String {
+    item_text(
+        src,
+        item,
+        &|path| !crate::outline::attr::is_derive_at(src, path, src.pair(path - 1)),
+        Some(&|attrs| env.enabled(attrs)),
+    )
 }
 
 /// The tokens between the delimiter that opens at `open` and its pair, as a function-like macro of crate `krate`, whose dependencies are `deps`, receives them: with each `$crate` a `macro_rules!` wrote spelled as a path to its crate.
-pub(crate) fn bang_input(deps: &[(String, usize)], krate: usize, src: &Source, open: u32) -> String {
+pub(crate) fn bang_input(
+    deps: &[(String, usize)],
+    krate: usize,
+    src: &Source,
+    open: u32,
+) -> String {
     let close = src.pair(open);
     let (mut parts, mut from) = (Vec::new(), open + 1);
     for at in open + 1..close {
-        let Some(path) = src.dollar(at).filter(|_| at >= from).and_then(|named| crate_path(deps, krate, named as usize)) else { continue };
+        let Some(path) = src
+            .dollar(at)
+            .filter(|_| at >= from)
+            .and_then(|named| crate_path(deps, krate, named as usize))
+        else {
+            continue;
+        };
         if at > from {
             parts.push(src.span(from, at - 1).to_owned());
         }
@@ -309,17 +455,28 @@ fn crate_path(deps: &[(String, usize)], krate: usize, named: usize) -> Option<St
     if named == krate {
         return Some("crate".to_owned());
     }
-    deps.iter().find(|(_, dep)| *dep == named).map(|(name, _)| format!("::{name}"))
+    deps.iter()
+        .find(|(_, dep)| *dep == named)
+        .map(|(name, _)| format!("::{name}"))
 }
 
 /// The tokens between the delimiter that opens at `open` and its pair.
 fn inside(src: &Source, open: u32) -> String {
     let close = src.pair(open);
-    if close > open + 1 { src.span(open + 1, close - 1).to_owned() } else { String::new() }
+    if close > open + 1 {
+        src.span(open + 1, close - 1).to_owned()
+    } else {
+        String::new()
+    }
 }
 
 /// The text of `item` with the outer attributes whose path starts at a token that `keep` rejects left out, and, as a derive sees it, the fields or variants whose attributes `enabled` rejects.
-fn item_text(src: &Source, item: &crate::outline::item::Item, keep: &dyn Fn(u32) -> bool, enabled: Option<&dyn Fn(&[Attr]) -> bool>) -> String {
+fn item_text(
+    src: &Source,
+    item: &crate::outline::item::Item,
+    keep: &dyn Fn(u32) -> bool,
+    enabled: Option<&dyn Fn(&[Attr]) -> bool>,
+) -> String {
     let mut parts = Vec::new();
     let mut at = item.lead;
     while at < item.start && src.text(at) == "#" {
@@ -329,8 +486,16 @@ fn item_text(src: &Source, item: &crate::outline::item::Item, keep: &dyn Fn(u32)
         }
         at = close + 1;
     }
-    match item.body.zip(enabled).and_then(|(open, enabled)| Some((open, configured(src, open, enabled)?))) {
-        Some((open, members)) => parts.extend([src.span(at, open).to_owned(), members, src.span(src.pair(open), item.end - 1).to_owned()]),
+    match item
+        .body
+        .zip(enabled)
+        .and_then(|(open, enabled)| Some((open, configured(src, open, enabled)?)))
+    {
+        Some((open, members)) => parts.extend([
+            src.span(at, open).to_owned(),
+            members,
+            src.span(src.pair(open), item.end - 1).to_owned(),
+        ]),
         None => parts.push(src.span(at, item.end - 1).to_owned()),
     }
     parts.join(" ")
@@ -339,31 +504,68 @@ fn item_text(src: &Source, item: &crate::outline::item::Item, keep: &dyn Fn(u32)
 /// The members inside the delimiter that opens at `open` whose attributes `enabled` accepts, or none when it accepts them all.
 fn configured(src: &Source, open: u32, enabled: &dyn Fn(&[Attr]) -> bool) -> Option<String> {
     let (mut kept, mut dropped) = (Vec::new(), false);
-    for (from, to) in split_commas(src, open + 1, src.pair(open)).into_iter().filter(|(from, to)| from < to) {
+    for (from, to) in split_commas(src, open + 1, src.pair(open))
+        .into_iter()
+        .filter(|(from, to)| from < to)
+    {
         let mut attrs = Vec::new();
         attr::attrs(src, from, false, &mut attrs).ok()?;
-        if enabled(&attrs) { kept.push(src.spelled((from, to))) } else { dropped = true }
+        if enabled(&attrs) {
+            kept.push(src.spelled((from, to)))
+        } else {
+            dropped = true
+        }
     }
     dropped.then(|| kept.join(" , "))
 }
 
 /// The two entry functions of haste's `proc_macro` crate, reading its root first if it is only declared.
 fn entries(outline: &mut Outline) -> Result<[ItemRef; 2]> {
-    let Some(krate) = outline.roots.iter().position(|root| root.path.as_os_str() == PROC_MACRO_ROOT) else { bail!("no `proc_macro` crate in the graph") };
+    let Some(krate) = outline
+        .roots
+        .iter()
+        .position(|root| root.path.as_os_str() == PROC_MACRO_ROOT)
+    else {
+        bail!("no `proc_macro` crate in the graph")
+    };
     outline.load(krate, 0)?;
     let tree = &outline.crates[krate];
-    let Some(file) = tree.files.iter().position(|file| !file.expanded && file.source.path.as_os_str() == PROC_MACRO_ROOT) else { bail!("`proc_macro` is not read") };
+    let Some(file) = tree
+        .files
+        .iter()
+        .position(|file| !file.expanded && file.source.path.as_os_str() == PROC_MACRO_ROOT)
+    else {
+        bail!("`proc_macro` is not read")
+    };
     let items = &tree.files[file].items.items;
-    let find = |name: &str| items.iter().position(|item| item.kind == ItemKind::Fn && item.parent.is_none() && item.name.is_some_and(|at| tree.files[file].source.text(at) == name));
-    let [Some(one), Some(two)] = ENTRIES.map(find) else { bail!("`proc_macro` has no entry functions") };
-    Ok([one, two].map(|item| ItemRef { krate: krate as u32, file: file as u32, item: item as u32 }))
+    let find = |name: &str| {
+        items.iter().position(|item| {
+            item.kind == ItemKind::Fn
+                && item.parent.is_none()
+                && item
+                    .name
+                    .is_some_and(|at| tree.files[file].source.text(at) == name)
+        })
+    };
+    let [Some(one), Some(two)] = ENTRIES.map(find) else {
+        bail!("`proc_macro` has no entry functions")
+    };
+    Ok([one, two].map(|item| ItemRef {
+        krate: krate as u32,
+        file: file as u32,
+        item: item as u32,
+    }))
 }
 
 /// A procedural macro call: the macro function, its kind, and the crate that calls it, `usize::MAX` for a call in a function body.
 type Call = (ItemRef, ProcKind, usize);
 
 /// The output of each call `bound` on its `inputs`, or why it failed: the result the store kept for a macro of a pinned crate, else from running it, kept when it ran.
-fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
+fn run(
+    compilation: &mut Compilation,
+    bound: &[Call],
+    inputs: &[Vec<String>],
+) -> Result<Vec<Result<String, String>>> {
     let outline = &compilation.outline;
     let keys: Vec<Option<store::Expansion>> = bound
         .iter()
@@ -376,9 +578,14 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
                 pin
             } else {
                 use std::hash::BuildHasher as _;
-                rustc_hash::FxBuildHasher.hash_one((0x6c6f_6361_6c5f_7069_u64, caller_vars(outline, caller)))
+                rustc_hash::FxBuildHasher
+                    .hash_one((0x6c6f_6361_6c5f_7069_u64, caller_vars(outline, caller)))
             };
-            Some(store::Expansion::new((macro_pin, caller_pin), &macro_name(outline, call), texts))
+            Some(store::Expansion::new(
+                (macro_pin, caller_pin),
+                &macro_name(outline, call),
+                texts,
+            ))
         })
         .collect();
     let mut results: Vec<Option<Result<String, String>>> = vec![None; keys.len()];
@@ -391,27 +598,43 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
     for (at, kept) in crate::sync::parallel_map(checks, |(at, key)| (at, key.kept())) {
         results[at] = kept;
     }
-    let missing: Vec<usize> = (0..bound.len()).filter(|&at| results[at].is_none()).collect();
+    let missing: Vec<usize> = (0..bound.len())
+        .filter(|&at| results[at].is_none())
+        .collect();
     if !missing.is_empty() {
         let calls: Vec<Call> = missing.iter().map(|&at| bound[at]).collect();
         let texts: Vec<Vec<String>> = missing.iter().map(|&at| inputs[at].clone()).collect();
-        for (at, result) in missing.into_iter().zip(expand(compilation, &calls, &texts)?) {
+        for (at, result) in missing
+            .into_iter()
+            .zip(expand(compilation, &calls, &texts)?)
+        {
             if let (Some(ran), Some(key)) = (&result, &keys[at])
                 && let Err(error) = key.keep(ran)
             {
-                eprintln!("cannot keep the output of {}: {error}", macro_name(&compilation.outline, bound[at].0));
+                eprintln!(
+                    "cannot keep the output of {}: {error}",
+                    macro_name(&compilation.outline, bound[at].0)
+                );
             }
             results[at] = result;
         }
     }
-    Ok(results.into_iter().map(|result| result.unwrap_or_else(|| Err("no output".to_owned()))).collect())
+    Ok(results
+        .into_iter()
+        .map(|result| result.unwrap_or_else(|| Err("no output".to_owned())))
+        .collect())
 }
 
 fn caller_vars(outline: &Outline, caller: usize) -> Vec<(String, String)> {
-    let Some(tree) = outline.crates.get(caller) else { return Vec::new() };
+    let Some(tree) = outline.crates.get(caller) else {
+        return Vec::new();
+    };
     let env = &tree.env;
     let mut vars = Vec::with_capacity(env.vars.len() + 2);
-    vars.push(("CARGO_CRATE_NAME".to_owned(), outline.roots[caller].name.clone()));
+    vars.push((
+        "CARGO_CRATE_NAME".to_owned(),
+        outline.roots[caller].name.clone(),
+    ));
     vars.extend(env.vars.iter().cloned());
     if let Some(script) = &env.script {
         vars.extend(script.vars.iter().cloned());
@@ -440,7 +663,9 @@ fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Resul
             }
         }
     }
-    let selected: Vec<bool> = (0..n).map(|k| seen[k] && compilation.outline.crates[k].partial()).collect();
+    let selected: Vec<bool> = (0..n)
+        .map(|k| seen[k] && compilation.outline.crates[k].partial())
+        .collect();
     if !selected.iter().any(|&on| on) {
         return Ok(());
     }
@@ -454,7 +679,11 @@ fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Resul
 }
 
 /// Runs each call `bound` on its `inputs` in children that compile each function on its first call; `None` for a call that did not run. The macro expander keeps its code and inference while its macro crate graph is unchanged.
-fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Option<Result<String, String>>>> {
+fn expand(
+    compilation: &mut Compilation,
+    bound: &[Call],
+    inputs: &[Vec<String>],
+) -> Result<Vec<Option<Result<String, String>>>> {
     let pair = entries(&mut compilation.outline)?;
     let mut preload_roots = Vec::with_capacity(bound.len() + 1);
     preload_roots.push(pair[0].krate as usize);
@@ -472,7 +701,9 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
     };
     let mut env_by_caller: HashMap<usize, Vec<(String, String)>> = HashMap::default();
     for &(_, _, caller) in bound {
-        env_by_caller.entry(caller).or_insert_with(|| caller_vars(&compilation.outline, caller));
+        env_by_caller
+            .entry(caller)
+            .or_insert_with(|| caller_vars(&compilation.outline, caller));
     }
     let entry = pair.map(|item| demand.declare((item, crate::sema::substs::Substs::EMPTY)));
     let jobs: Vec<Job<'_>> = bound
@@ -486,14 +717,27 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
             group: (caller, call.krate),
         })
         .collect();
-    let ask = |compilation: &mut Compilation, asks: Requests| Ok(if compilation.names.load(&mut compilation.outline, asks)? { Answer::Names } else { Answer::Nothing });
+    let ask = |compilation: &mut Compilation, asks: Requests| {
+        Ok(if compilation.names.load(&mut compilation.outline, asks)? {
+            Answer::Names
+        } else {
+            Answer::Nothing
+        })
+    };
     let ran = run_macros(compilation, &mut demand, &jobs, &ask);
     drop(jobs);
     let ran = ran?;
     roots.push(pair[0].krate as usize);
     roots.extend(bound.iter().map(|(call, ..)| call.krate as usize));
     compilation.expander = Some(Expander::new(&compilation.outline, demand, roots));
-    Ok(ran.into_iter().map(|result| result.map(|result| result.and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string())))).collect())
+    Ok(ran
+        .into_iter()
+        .map(|result| {
+            result.map(|result| {
+                result.and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))
+            })
+        })
+        .collect())
 }
 
 fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {
@@ -526,9 +770,22 @@ fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {
         outline.deps[krate].hash(&mut hasher);
         let holder = &outline.crates[krate];
         let extent = holder.extent();
-        (extent.files, extent.impls, extent.impl_bodies, extent.consumed, extent.partial, holder.expansions).hash(&mut hasher);
+        (
+            extent.files,
+            extent.impls,
+            extent.impl_bodies,
+            extent.consumed,
+            extent.partial,
+            holder.expansions,
+        )
+            .hash(&mut hasher);
         for file in &holder.files {
-            (std::sync::Arc::as_ptr(file) as usize, file.items.items.len(), file.source.text.len()).hash(&mut hasher);
+            (
+                std::sync::Arc::as_ptr(file) as usize,
+                file.items.items.len(),
+                file.source.text.len(),
+            )
+                .hash(&mut hasher);
         }
     }
     hasher.finish()

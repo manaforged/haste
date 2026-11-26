@@ -44,7 +44,11 @@ impl Watcher {
     /// Watches each file of `paths` that exists now.
     pub fn new(paths: Vec<PathBuf>) -> Result<Watcher> {
         let (queue, files) = open(&paths)?;
-        Ok(Watcher { paths, queue, files })
+        Ok(Watcher {
+            paths,
+            queue,
+            files,
+        })
     }
 
     /// The descriptor to poll for a change.
@@ -56,11 +60,21 @@ impl Watcher {
     pub fn settle(&mut self) -> Result<()> {
         loop {
             drain(&self.queue);
-            let mut fd = libc::pollfd { fd: self.queue.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let mut fd = libc::pollfd {
+                fd: self.queue.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
             // SAFETY: fd is one live pollfd entry.
             match unsafe { libc::poll(&mut fd, 1, QUIET_MS) } {
                 0 => break,
-                ready if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted => bail!("poll failed: {}", std::io::Error::last_os_error()),
+                ready
+                    if ready < 0
+                        && std::io::Error::last_os_error().kind()
+                            != std::io::ErrorKind::Interrupted =>
+                {
+                    bail!("poll failed: {}", std::io::Error::last_os_error())
+                }
                 _ => {}
             }
         }
@@ -115,7 +129,11 @@ fn open(paths: &[PathBuf]) -> Result<(OwnedFd, Vec<OwnedFd>)> {
             ident: fd as libc::uintptr_t,
             filter: libc::EVFILT_VNODE,
             flags: libc::EV_ADD | libc::EV_CLEAR,
-            fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_ATTRIB,
+            fflags: libc::NOTE_WRITE
+                | libc::NOTE_EXTEND
+                | libc::NOTE_DELETE
+                | libc::NOTE_RENAME
+                | libc::NOTE_ATTRIB,
             data: 0,
             udata: std::ptr::null_mut(),
         });
@@ -123,7 +141,17 @@ fn open(paths: &[PathBuf]) -> Result<(OwnedFd, Vec<OwnedFd>)> {
         files.push(unsafe { OwnedFd::from_raw_fd(fd) });
     }
     // SAFETY: changes is a live array of changes.len() kevent entries, and the call reads no events back.
-    if unsafe { libc::kevent(raw, changes.as_ptr(), changes.len() as libc::c_int, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+    if unsafe {
+        libc::kevent(
+            raw,
+            changes.as_ptr(),
+            changes.len() as libc::c_int,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    } < 0
+    {
         bail!("kevent: {}", std::io::Error::last_os_error());
     }
     Ok((queue, files))
@@ -134,10 +162,22 @@ fn open(paths: &[PathBuf]) -> Result<(OwnedFd, Vec<OwnedFd>)> {
 fn drain(queue: &OwnedFd) {
     // SAFETY: kevent is plain data, and all zero bytes, with a null udata, are a valid value.
     let mut events: [libc::kevent; DRAIN_EVENTS] = unsafe { std::mem::zeroed() };
-    let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     loop {
         // SAFETY: events is a live array of DRAIN_EVENTS kevent entries, and now is a zero timeout, so the call does not block.
-        let taken = unsafe { libc::kevent(queue.as_raw_fd(), std::ptr::null(), 0, events.as_mut_ptr(), DRAIN_EVENTS as libc::c_int, &now) };
+        let taken = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                DRAIN_EVENTS as libc::c_int,
+                &now,
+            )
+        };
         if taken < DRAIN_EVENTS as libc::c_int {
             break;
         }
@@ -154,7 +194,11 @@ fn open(paths: &[PathBuf]) -> Result<(OwnedFd, Vec<OwnedFd>)> {
     }
     // SAFETY: raw is the new inotify descriptor, which this OwnedFd owns from here on.
     let queue = unsafe { OwnedFd::from_raw_fd(raw) };
-    let mask = libc::IN_MODIFY | libc::IN_CLOSE_WRITE | libc::IN_ATTRIB | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+    let mask = libc::IN_MODIFY
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_ATTRIB
+        | libc::IN_DELETE_SELF
+        | libc::IN_MOVE_SELF;
     for path in paths.iter().filter_map(|path| c_path(path)) {
         // SAFETY: raw is a live inotify descriptor and path is a NUL-terminated C string; a file that is gone just fails.
         unsafe { libc::inotify_add_watch(raw, path.as_ptr(), mask) };

@@ -58,7 +58,10 @@ const BUILTINS: [(&str, Builtin); 21] = [
 impl Builtin {
     /// The builtin that the `#[rustc_builtin_macro]` definition named `name` stands for.
     pub fn named(name: &str) -> Option<Builtin> {
-        BUILTINS.iter().find(|(known, _)| *known == name).map(|(_, builtin)| *builtin)
+        BUILTINS
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, builtin)| *builtin)
     }
 }
 
@@ -66,7 +69,10 @@ impl Context<'_> {
     /// The builtin that the macro `item` is, when its definition is `#[rustc_builtin_macro]`.
     pub fn builtin(&self, item: ItemRef) -> Option<Builtin> {
         let (src, entry) = self.item(item);
-        let marked = entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_builtin_macro"));
+        let marked = entry
+            .attrs
+            .iter()
+            .any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_builtin_macro"));
         Builtin::named(src.text(entry.name?)).filter(|_| marked)
     }
 }
@@ -103,7 +109,13 @@ pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
     match args.get(1) {
         None => {
             crate_path(out, krate, "::panicking::panic");
-            out.lexed(&format!("({:?})", format!("assertion failed: {}", crate::outline::build::spelled_fragment(src, (from, to)))));
+            out.lexed(&format!(
+                "({:?})",
+                format!(
+                    "assertion failed: {}",
+                    crate::outline::build::spelled_fragment(src, (from, to))
+                )
+            ));
         }
         Some(&(rest, _)) => {
             crate_path(out, krate, "::panic::panic_2021!");
@@ -130,12 +142,26 @@ enum Instruction<'a> {
     Syscall,
     LockNot(u32),
     Divide(u32),
-    Crc32 { bits: u32, poly: u32, crc: &'a str, data: &'a str },
+    Crc32 {
+        bits: u32,
+        poly: u32,
+        crc: &'a str,
+        data: &'a str,
+    },
 }
 
 /// The expansion of an `asm!` whose `templates` the call spells before its `operands`: an optimization barrier when they hold no instruction, a call of the host's system call entry for one `syscall`, an atomic invert for one `lock not` of memory, and a wide division for one `div`.
-pub fn asm(src: &Source, templates: &[String], operands: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
-    let text = templates.iter().map(|template| strip_comments(template)).collect::<Vec<_>>().join("\n");
+pub fn asm(
+    src: &Source,
+    templates: &[String],
+    operands: &[(u32, u32)],
+    out: &mut Tokens,
+) -> Result<()> {
+    let text = templates
+        .iter()
+        .map(|template| strip_comments(template))
+        .collect::<Vec<_>>()
+        .join("\n");
     match instruction(&text) {
         Some(Instruction::Barrier) => asm_barrier(src, operands, out),
         Some(Instruction::Fence) => asm_fence(src, operands, out),
@@ -146,7 +172,12 @@ pub fn asm(src: &Source, templates: &[String], operands: &[(u32, u32)], out: &mu
         Some(Instruction::Syscall) => asm_syscall(src, operands, out),
         Some(Instruction::LockNot(bits)) => asm_lock_not(src, operands, bits, out),
         Some(Instruction::Divide(bits)) => asm_divide(src, operands, bits, out),
-        Some(Instruction::Crc32 { bits, poly, crc, data }) => asm_crc32(src, operands, (bits, poly, crc, data), out),
+        Some(Instruction::Crc32 {
+            bits,
+            poly,
+            crc,
+            data,
+        }) => asm_crc32(src, operands, (bits, poly, crc, data), out),
         None => bail!("inline assembly `{}` is not supported", text.trim()),
     }
 }
@@ -168,7 +199,12 @@ fn instruction(text: &str) -> Option<Instruction<'_>> {
     }
 }
 
-fn crc32_instruction<'a>(op: &str, dst: &'a str, src1: &'a str, src2: &'a str) -> Option<Instruction<'a>> {
+fn crc32_instruction<'a>(
+    op: &str,
+    dst: &'a str,
+    src1: &'a str,
+    src2: &'a str,
+) -> Option<Instruction<'a>> {
     let (bits, poly) = match op {
         "crc32b" => (8, 0xEDB8_8320),
         "crc32h" => (16, 0xEDB8_8320),
@@ -181,11 +217,19 @@ fn crc32_instruction<'a>(op: &str, dst: &'a str, src1: &'a str, src2: &'a str) -
         _ => return None,
     };
     let strip = |tok: &'a str| -> Option<&'a str> {
-        let inner = tok.trim_end_matches(',').strip_prefix('{')?.strip_suffix('}')?;
+        let inner = tok
+            .trim_end_matches(',')
+            .strip_prefix('{')?
+            .strip_suffix('}')?;
         Some(inner.split(':').next().unwrap_or(inner))
     };
     let (d, s1, s2) = (strip(dst)?, strip(src1)?, strip(src2)?);
-    (d == s1).then_some(Instruction::Crc32 { bits, poly, crc: d, data: s2 })
+    (d == s1).then_some(Instruction::Crc32 {
+        bits,
+        poly,
+        crc: d,
+        data: s2,
+    })
 }
 
 /// The bits of the memory operand size `width`.
@@ -200,9 +244,13 @@ fn memory_bits(width: &str) -> Option<u32> {
 /// The expansion of an `asm!` whose templates hold only comments and placeholders and whose operands only read or keep their places: an optimization barrier with no effect.
 fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
     for &(from, to) in args {
-        let reads = matches!(src.text(from), "in" | "inout") && !(from..to).any(|at| punct_in(src, (at, to), "=>"));
+        let reads = matches!(src.text(from), "in" | "inout")
+            && !(from..to).any(|at| punct_in(src, (at, to), "=>"));
         if !reads && src.text(from) != "options" {
-            bail!("inline assembly operand `{}` is not supported", src.spelled((from, to)));
+            bail!(
+                "inline assembly operand `{}` is not supported",
+                src.spelled((from, to))
+            );
         }
     }
     out.lexed("()");
@@ -213,7 +261,10 @@ fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()
 fn asm_fence(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
     for &(from, to) in args {
         if src.text(from) != "options" {
-            bail!("inline assembly operand `{}` is not supported", src.spelled((from, to)));
+            bail!(
+                "inline assembly operand `{}` is not supported",
+                src.spelled((from, to))
+            );
         }
     }
     out.lexed("::core::sync::atomic::fence(::core::sync::atomic::Ordering::SeqCst)");
@@ -222,7 +273,9 @@ fn asm_fence(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> 
 
 /// The general register `name` names without its size prefix, as `ax` for `rax` and `eax`.
 fn base_register(name: &str) -> &str {
-    name.strip_prefix(['r', 'e']).filter(|rest| GENERAL_REGISTERS.contains(rest)).unwrap_or(name)
+    name.strip_prefix(['r', 'e'])
+        .filter(|rest| GENERAL_REGISTERS.contains(rest))
+        .unwrap_or(name)
 }
 
 /// The x86 general registers that a size prefix widens.
@@ -235,17 +288,27 @@ fn asm_lock_not(src: &Source, args: &[(u32, u32)], bits: u32, out: &mut Tokens) 
         let operand = operand(src, (from, to))?;
         match (operand.input, operand.output, address) {
             (Some(input), None, None) => address = Some(input),
-            _ => bail!("a `lock not` takes one address operand, not `{}`", src.spelled((from, to))),
+            _ => bail!(
+                "a `lock not` takes one address operand, not `{}`",
+                src.spelled((from, to))
+            ),
         }
     }
-    let Some((from, to)) = address else { bail!("a `lock not` names no address") };
+    let Some((from, to)) = address else {
+        bail!("a `lock not` names no address")
+    };
     out.lexed("{ let __haste_cell = (");
     out.copy_range(src, from, to);
     out.lexed(&format!(") as *const ::core::sync::atomic::AtomicU{bits}; (*__haste_cell).fetch_xor(!0, ::core::sync::atomic::Ordering::SeqCst); }}"));
     Ok(())
 }
 
-fn asm_crc32(src: &Source, args: &[(u32, u32)], (bits, poly, crc_name, data_name): (u32, u32, &str, &str), out: &mut Tokens) -> Result<()> {
+fn asm_crc32(
+    src: &Source,
+    args: &[(u32, u32)],
+    (bits, poly, crc_name, data_name): (u32, u32, &str, &str),
+    out: &mut Tokens,
+) -> Result<()> {
     let mut named: Vec<(Option<&str>, Operand)> = Vec::new();
     for &(from, to) in args.iter().filter(|(from, _)| src.text(*from) != "options") {
         if from + 2 <= to && src.text(from + 1) == "=" {
@@ -258,12 +321,21 @@ fn asm_crc32(src: &Source, args: &[(u32, u32)], (bits, poly, crc_name, data_name
         if let Ok(pos) = key.parse::<usize>() {
             return named.get(pos).map(|(_, op)| op);
         }
-        named.iter().find(|(n, _)| *n == Some(key)).map(|(_, op)| op)
+        named
+            .iter()
+            .find(|(n, _)| *n == Some(key))
+            .map(|(_, op)| op)
     };
-    let crc_op = find(crc_name).ok_or_else(|| anyhow::anyhow!("crc32 missing operand `{crc_name}`"))?;
-    let data_op = find(data_name).ok_or_else(|| anyhow::anyhow!("crc32 missing operand `{data_name}`"))?;
-    let crc_in = crc_op.input.ok_or_else(|| anyhow::anyhow!("crc32 `{crc_name}` has no input"))?;
-    let data_in = data_op.input.ok_or_else(|| anyhow::anyhow!("crc32 `{data_name}` has no input"))?;
+    let crc_op =
+        find(crc_name).ok_or_else(|| anyhow::anyhow!("crc32 missing operand `{crc_name}`"))?;
+    let data_op =
+        find(data_name).ok_or_else(|| anyhow::anyhow!("crc32 missing operand `{data_name}`"))?;
+    let crc_in = crc_op
+        .input
+        .ok_or_else(|| anyhow::anyhow!("crc32 `{crc_name}` has no input"))?;
+    let data_in = data_op
+        .input
+        .ok_or_else(|| anyhow::anyhow!("crc32 `{data_name}` has no input"))?;
     out.lexed("{ let mut __haste_crc: u32 = (");
     out.copy_range(src, crc_in.0, crc_in.1);
     out.lexed(") as u32; let mut __haste_data: u64 = (");
@@ -292,15 +364,25 @@ fn asm_divide(src: &Source, args: &[(u32, u32)], bits: u32, out: &mut Tokens) ->
         };
         *slot = Some(operand);
     }
-    let (Some(divisor), Some(high), Some(low)) = (divisor, high, low) else { bail!("a `div` needs a divisor and `dx` and `ax` operands") };
+    let (Some(divisor), Some(high), Some(low)) = (divisor, high, low) else {
+        bail!("a `div` needs a divisor and `dx` and `ax` operands")
+    };
     out.lexed("{");
-    for (name, operand) in [("__haste_high", &high), ("__haste_low", &low), ("__haste_by", &divisor)] {
-        let Some((from, to)) = operand.input else { bail!("a `div` reads its `{}` operand", operand.register) };
+    for (name, operand) in [
+        ("__haste_high", &high),
+        ("__haste_low", &low),
+        ("__haste_by", &divisor),
+    ] {
+        let Some((from, to)) = operand.input else {
+            bail!("a `div` reads its `{}` operand", operand.register)
+        };
         out.lexed(&format!("let {name} = ("));
         out.copy_range(src, from, to);
         out.lexed(&format!(") as u{};", bits * 2));
     }
-    out.lexed(&format!("let __haste_wide = (__haste_high << {bits}) | __haste_low;"));
+    out.lexed(&format!(
+        "let __haste_wide = (__haste_high << {bits}) | __haste_low;"
+    ));
     for (operand, op) in [(&low, "/"), (&high, "%")] {
         if let Some((from, to)) = operand.output {
             out.copy_range(src, from, to);
@@ -321,24 +403,45 @@ struct Operand {
 /// The operand `in`, `out`, `lateout`, `inout` or `inlateout` that spans `from` to `to`, a `_` place writing nowhere.
 fn operand(src: &Source, (from, to): (u32, u32)) -> Result<Operand> {
     let open = from + 1;
-    let named = src.literal_text(open + 1)?.unwrap_or_else(|| src.text(open + 1).to_owned());
-    let register = Some(named).filter(|_| src.text(open) == "(").ok_or_else(|| anyhow::anyhow!("inline assembly operand `{}` names no register", src.spelled((from, to))))?;
+    let named = src
+        .literal_text(open + 1)?
+        .unwrap_or_else(|| src.text(open + 1).to_owned());
+    let register = Some(named)
+        .filter(|_| src.text(open) == "(")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "inline assembly operand `{}` names no register",
+                src.spelled((from, to))
+            )
+        })?;
     let rest = (src.pair(open) + 1, to);
     let mut arrow = None;
     let mut at = rest.0;
     while at < rest.1 && arrow.is_none() {
         arrow = punct_in(src, (at, rest.1), "=>").then_some(at);
-        at = if matches!(src.text(at), "(" | "[" | "{") { src.pair(at) + 1 } else { at + 1 };
+        at = if matches!(src.text(at), "(" | "[" | "{") {
+            src.pair(at) + 1
+        } else {
+            at + 1
+        };
     }
-    let place = |(from, to): (u32, u32)| (src.text(from) != "_" || to != from + 1).then_some((from, to));
+    let place =
+        |(from, to): (u32, u32)| (src.text(from) != "_" || to != from + 1).then_some((from, to));
     let (input, output) = match (src.text(from), arrow) {
         ("in", None) => (Some(rest), None),
         ("out" | "lateout", None) => (None, place(rest)),
         ("inout" | "inlateout", None) => (Some(rest), Some(rest)),
         ("inout" | "inlateout", Some(arrow)) => (Some((rest.0, arrow)), place((arrow + 2, rest.1))),
-        _ => bail!("inline assembly operand `{}` is not supported", src.spelled((from, to))),
+        _ => bail!(
+            "inline assembly operand `{}` is not supported",
+            src.spelled((from, to))
+        ),
     };
-    Ok(Operand { register, input, output })
+    Ok(Operand {
+        register,
+        input,
+        output,
+    })
 }
 
 /// The expansion of an `asm!` that runs one `syscall` with its operands in the x86-64 Linux system call registers: a call of the host's system call entry, whose result the `rax` output takes.
@@ -351,11 +454,15 @@ fn asm_syscall(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()
             continue;
         }
         let operand = operand(src, (from, to))?;
-        let slot = SYSCALL_REGISTERS.iter().position(|register| *register == operand.register);
+        let slot = SYSCALL_REGISTERS
+            .iter()
+            .position(|register| *register == operand.register);
         match (slot, operand.output) {
             (Some(0), written) => output = written,
             (_, Some(_)) => bail!("a `syscall` writes only `rax`, not `{}`", operand.register),
-            (None, None) if SYSCALL_CLOBBERS.contains(&operand.register.as_str()) && operand.input.is_none() => {}
+            (None, None)
+                if SYSCALL_CLOBBERS.contains(&operand.register.as_str())
+                    && operand.input.is_none() => {}
             (None, None) => bail!("a `syscall` reads no `{}`", operand.register),
             (Some(_), None) => {}
         }
@@ -380,7 +487,11 @@ fn asm_syscall(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()
         out.copy_range(src, from, to);
         out.lexed(" = ::core::mem::transmute(__haste_ret);");
     }
-    out.lexed(if diverges { "::core::hint::unreachable_unchecked() }" } else { "}" });
+    out.lexed(if diverges {
+        "::core::hint::unreachable_unchecked() }"
+    } else {
+        "}"
+    });
     Ok(())
 }
 
@@ -412,6 +523,9 @@ pub fn format_literal(template: &str, krate: u32, out: &mut Tokens) -> bool {
         return false;
     }
     crate_path(out, krate, "::fmt::Arguments::from_str");
-    out.lexed(&format!("({:?})", template.replace("{{", "{").replace("}}", "}")));
+    out.lexed(&format!(
+        "({:?})",
+        template.replace("{{", "{").replace("}}", "}")
+    ));
     true
 }

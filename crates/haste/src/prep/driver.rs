@@ -71,19 +71,40 @@ fn binary(toolchain: &Toolchain, store: &Path) -> Result<PathBuf> {
 }
 
 /// Builds the package at `package` in release with the driver as rustc's wrapper, links every function instance of its crate graph into one library, or only the units rebuilt since the library `out` names into a second one beside a link to it, and leaves the libraries and their manifests in a new directory beside `out`, which it returns; the build and the driver's units stay beside `out`, so the next run rebuilds only what changed.
-pub(super) fn run(toolchain: &Toolchain, store: &Path, package: &Path, out: &Path) -> Result<PathBuf> {
+pub(super) fn run(
+    toolchain: &Toolchain,
+    store: &Path,
+    package: &Path,
+    out: &Path,
+) -> Result<PathBuf> {
     let driver = binary(toolchain, store)?;
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
     let fresh = out.with_extension(format!("{}.{stamp}", std::process::id()));
     let (units, target) = (out.with_extension(UNITS), out.with_extension(TARGET));
     std::fs::create_dir_all(&units)?;
     std::fs::create_dir_all(&fresh)?;
     let mut build = cargo::release(toolchain, &package.join(CARGO_MANIFEST), &target);
     cargo::settled(&mut build);
-    build.env(WRAPPER, &driver).env(files::PREP_DIR, &units).current_dir(package);
-    cargo::output(&mut build).with_context(|| format!("building {} with the prep driver", package.display()))?;
-    let base = out.canonicalize().ok().filter(|base| base.join(files::UNITS).is_file());
-    cargo::output(Command::new(&driver).arg(LINK).arg(&units).arg(&fresh).args(base)).context("linking the prep library")?;
+    build
+        .env(WRAPPER, &driver)
+        .env(files::PREP_DIR, &units)
+        .current_dir(package);
+    cargo::output(&mut build)
+        .with_context(|| format!("building {} with the prep driver", package.display()))?;
+    let base = out
+        .canonicalize()
+        .ok()
+        .filter(|base| base.join(files::UNITS).is_file());
+    cargo::output(
+        Command::new(&driver)
+            .arg(LINK)
+            .arg(&units)
+            .arg(&fresh)
+            .args(base),
+    )
+    .context("linking the prep library")?;
     Ok(fresh)
 }
 
@@ -93,13 +114,26 @@ pub(super) fn publish(fresh: &Path, out: &Path) -> Result<()> {
     if out.is_dir() && before.is_none() {
         std::fs::remove_dir_all(out)?;
     }
-    crate::graph::store::replace_symlink(fresh.file_name().context("a prep directory with no name")?, out)?;
-    let (Some(parent), Some(stem)) = (out.parent(), out.file_name()) else { return Ok(()) };
-    let kept = [Some(fresh.to_path_buf()), before.map(|before| parent.join(before))];
+    crate::graph::store::replace_symlink(
+        fresh.file_name().context("a prep directory with no name")?,
+        out,
+    )?;
+    let (Some(parent), Some(stem)) = (out.parent(), out.file_name()) else {
+        return Ok(());
+    };
+    let kept = [
+        Some(fresh.to_path_buf()),
+        before.map(|before| parent.join(before)),
+    ];
     for entry in std::fs::read_dir(parent)? {
         let path = entry?.path();
-        let sibling = path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(&format!("{}.", stem.to_string_lossy())));
-        let shared = [UNITS, TARGET].iter().any(|kept| path == out.with_extension(kept));
+        let sibling = path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with(&format!("{}.", stem.to_string_lossy()))
+        });
+        let shared = [UNITS, TARGET]
+            .iter()
+            .any(|kept| path == out.with_extension(kept));
         if sibling && path.is_dir() && !shared && !kept.iter().flatten().any(|kept| *kept == path) {
             std::fs::remove_dir_all(&path)?;
         }

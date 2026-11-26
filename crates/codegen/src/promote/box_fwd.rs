@@ -11,8 +11,16 @@ use super::join_slots::resolve_addrs;
 use super::subword::eval_consts;
 
 enum WriteKind {
-    Scalar { val: Value, off: i32 },
-    Memset { sig: SigRef, byte: Value, len: Value, off: i64 },
+    Scalar {
+        val: Value,
+        off: i32,
+    },
+    Memset {
+        sig: SigRef,
+        byte: Value,
+        len: Value,
+        off: i64,
+    },
 }
 
 struct SlotWrite {
@@ -63,7 +71,15 @@ impl Env {
         let defs = defs(func);
         let cfg = func.cfg();
         let rank = Cfg::ranks(&cfg.rpo, func.blocks.len());
-        Self { consts, addrs, addr_insts, addr_slot, defs, cfg, rank }
+        Self {
+            consts,
+            addrs,
+            addr_insts,
+            addr_slot,
+            defs,
+            cfg,
+            rank,
+        }
     }
 }
 
@@ -81,7 +97,9 @@ pub(super) fn run(func: &mut Function) -> bool {
 fn forward_one(func: &mut Function) -> bool {
     let env = Env::new(func);
     for slot in copied_slots(func, &env) {
-        let Some(plan) = find_plan(func, &env, slot) else { continue };
+        let Some(plan) = find_plan(func, &env, slot) else {
+            continue;
+        };
         apply_plan(func, &env, plan);
         return true;
     }
@@ -107,7 +125,12 @@ fn copied_slots(func: &Function, env: &Env) -> Vec<StackSlot> {
 
 fn find_plan(func: &Function, env: &Env, slot: StackSlot) -> Option<Plan> {
     let size = func.slots[slot.index()].size;
-    let mut st = Collect { slot, size, writes: Vec::new(), copy: None };
+    let mut st = Collect {
+        slot,
+        size,
+        writes: Vec::new(),
+        copy: None,
+    };
     for (b_idx, block) in func.blocks.iter().enumerate() {
         let b = Block(b_idx as u32);
         for (pos, &inst) in block.insts.iter().enumerate() {
@@ -126,8 +149,13 @@ fn find_plan(func: &Function, env: &Env, slot: StackSlot) -> Option<Plan> {
     if !ok || nonconst_values(env, &st.writes) > 4 {
         return None;
     }
-    st.writes.sort_unstable_by_key(|w| (env.rank[w.block.index()], w.pos));
-    Some(Plan { slot, writes: st.writes, copy })
+    st.writes
+        .sort_unstable_by_key(|w| (env.rank[w.block.index()], w.pos));
+    Some(Plan {
+        slot,
+        writes: st.writes,
+        copy,
+    })
 }
 
 fn nonconst_values(env: &Env, writes: &[SlotWrite]) -> usize {
@@ -149,7 +177,9 @@ fn visit_inst(func: &Function, env: &Env, at: (Block, usize, Inst), st: &mut Col
     }
     match op {
         &Op::StackStore(val, s, off) if s == st.slot => push_scalar(func, env, at, (val, off), st),
-        &Op::Store(val, ptr, off) if is_slot(env, ptr, st.slot) => push_ptr_store(func, env, at, (val, ptr, off), st),
+        &Op::Store(val, ptr, off) if is_slot(env, ptr, st.slot) => {
+            push_ptr_store(func, env, at, (val, ptr, off), st)
+        }
         Op::Call { sig, args, .. } if is_memset(func, env, op, st.slot) => {
             push_memset(env, at, *sig, args, st)
         }
@@ -161,9 +191,13 @@ fn visit_inst(func: &Function, env: &Env, at: (Block, usize, Inst), st: &mut Col
 
 fn visit_move_or_copy(env: &Env, at: (Block, usize, Inst), op: &Op, st: &mut Collect) -> bool {
     match *op {
-        Op::Move(dst, src, bytes) if is_slot(env, src, st.slot) => {
-            set_copy(env, at, dst, bytes == st.size && env.addrs[src.index()] == Some((st.slot, 0)), st)
-        }
+        Op::Move(dst, src, bytes) if is_slot(env, src, st.slot) => set_copy(
+            env,
+            at,
+            dst,
+            bytes == st.size && env.addrs[src.index()] == Some((st.slot, 0)),
+            st,
+        ),
         Op::Copy(dst, src, len) if is_slot(env, src, st.slot) => {
             let exact = !is_slot(env, len, st.slot)
                 && env.addrs[src.index()] == Some((st.slot, 0))
@@ -177,7 +211,9 @@ fn visit_move_or_copy(env: &Env, at: (Block, usize, Inst), op: &Op, st: &mut Col
 fn addr_inst_ok(op: &Op, env: &Env, slot: StackSlot) -> bool {
     match op {
         Op::Select(cond, _, _) => !is_slot(env, *cond, slot),
-        Op::StackAddr(..) | Op::Binary(Binary::Iadd | Binary::Isub, ..) | Op::Convert(Convert::Bitcast, _) => true,
+        Op::StackAddr(..)
+        | Op::Binary(Binary::Iadd | Binary::Isub, ..)
+        | Op::Convert(Convert::Bitcast, _) => true,
         _ => false,
     }
 }
@@ -192,7 +228,13 @@ fn op_uses_slot(op: &Op, env: &Env, slot: StackSlot) -> bool {
     hit
 }
 
-fn push_scalar(func: &Function, env: &Env, at: (Block, usize, Inst), (val, off): (Value, i32), st: &mut Collect) -> bool {
+fn push_scalar(
+    func: &Function,
+    env: &Env,
+    at: (Block, usize, Inst),
+    (val, off): (Value, i32),
+    st: &mut Collect,
+) -> bool {
     if is_slot(env, val, st.slot) || off < 0 {
         return false;
     }
@@ -202,7 +244,12 @@ fn push_scalar(func: &Function, env: &Env, at: (Block, usize, Inst), (val, off):
     if end > i64::from(st.size) {
         return false;
     }
-    st.writes.push(SlotWrite { block: at.0, pos: at.1, inst: at.2, kind: WriteKind::Scalar { val, off } });
+    st.writes.push(SlotWrite {
+        block: at.0,
+        pos: at.1,
+        inst: at.2,
+        kind: WriteKind::Scalar { val, off },
+    });
     true
 }
 
@@ -213,41 +260,95 @@ fn push_ptr_store(
     (val, ptr, off): (Value, Value, i32),
     st: &mut Collect,
 ) -> bool {
-    let Some((_, base)) = env.addrs[ptr.index()] else { return false };
-    let Some(total) = base.checked_add(i64::from(off)).and_then(|v| i32::try_from(v).ok()) else {
+    let Some((_, base)) = env.addrs[ptr.index()] else {
+        return false;
+    };
+    let Some(total) = base
+        .checked_add(i64::from(off))
+        .and_then(|v| i32::try_from(v).ok())
+    else {
         return false;
     };
     push_scalar(func, env, at, (val, total), st)
 }
 
 fn is_memset(func: &Function, env: &Env, op: &Op, slot: StackSlot) -> bool {
-    let Op::Call { callee, args, results, .. } = op else { return false };
+    let Op::Call {
+        callee,
+        args,
+        results,
+        ..
+    } = op
+    else {
+        return false;
+    };
     if args.len() != 3 || !results.is_empty() || !is_slot(env, args[0], slot) {
         return false;
     }
-    let Some(def) = env.defs[callee.index()] else { return false };
-    matches!(func.insts[def.index()].op, Op::Runtime(RuntimeSymbol::Memset))
+    let Some(def) = env.defs[callee.index()] else {
+        return false;
+    };
+    matches!(
+        func.insts[def.index()].op,
+        Op::Runtime(RuntimeSymbol::Memset)
+    )
 }
 
-fn push_memset(env: &Env, at: (Block, usize, Inst), sig: SigRef, args: &[Value], st: &mut Collect) -> bool {
+fn push_memset(
+    env: &Env,
+    at: (Block, usize, Inst),
+    sig: SigRef,
+    args: &[Value],
+    st: &mut Collect,
+) -> bool {
     let (ptr, byte, len) = (args[0], args[1], args[2]);
     if is_slot(env, byte, st.slot) || is_slot(env, len, st.slot) {
         return false;
     }
-    let Some((_, base)) = env.addrs[ptr.index()] else { return false };
-    let Some(len_bytes) = env.consts[len.index()] else { return false };
-    if base < 0 || len_bytes < 0 || base.checked_add(len_bytes).is_none_or(|end| end > i64::from(st.size)) {
+    let Some((_, base)) = env.addrs[ptr.index()] else {
+        return false;
+    };
+    let Some(len_bytes) = env.consts[len.index()] else {
+        return false;
+    };
+    if base < 0
+        || len_bytes < 0
+        || base
+            .checked_add(len_bytes)
+            .is_none_or(|end| end > i64::from(st.size))
+    {
         return false;
     }
-    st.writes.push(SlotWrite { block: at.0, pos: at.1, inst: at.2, kind: WriteKind::Memset { sig, byte, len, off: base } });
+    st.writes.push(SlotWrite {
+        block: at.0,
+        pos: at.1,
+        inst: at.2,
+        kind: WriteKind::Memset {
+            sig,
+            byte,
+            len,
+            off: base,
+        },
+    });
     true
 }
 
-fn set_copy(env: &Env, at: (Block, usize, Inst), dst: Value, valid: bool, st: &mut Collect) -> bool {
+fn set_copy(
+    env: &Env,
+    at: (Block, usize, Inst),
+    dst: Value,
+    valid: bool,
+    st: &mut Collect,
+) -> bool {
     if !valid || is_slot(env, dst, st.slot) || st.copy.is_some() {
         return false;
     }
-    st.copy = Some(SlotCopy { block: at.0, pos: at.1, inst: at.2, dst });
+    st.copy = Some(SlotCopy {
+        block: at.0,
+        pos: at.1,
+        inst: at.2,
+        dst,
+    });
     true
 }
 
@@ -276,10 +377,14 @@ fn apply_plan(func: &mut Function, env: &Env, plan: Plan) {
     let mut emitted = Vec::with_capacity(plan.writes.len() * 3);
     let mut removed = HashSet::default();
     let mut operand_seeds = Vec::new();
-    func.insts[plan.copy.inst.index()].op.for_operands(|v| operand_seeds.push(v));
+    func.insts[plan.copy.inst.index()]
+        .op
+        .for_operands(|v| operand_seeds.push(v));
     for w in &plan.writes {
         removed.insert(w.inst);
-        func.insts[w.inst.index()].op.for_operands(|v| operand_seeds.push(v));
+        func.insts[w.inst.index()]
+            .op
+            .for_operands(|v| operand_seeds.push(v));
         emit_write(func, env, w, plan.copy.dst, &mut emitted);
     }
     for b_idx in 0..func.blocks.len() {
@@ -302,24 +407,45 @@ fn emit_write(func: &mut Function, env: &Env, w: &SlotWrite, dst: Value, out: &m
             };
             out.push(func.add(op, None));
         }
-        WriteKind::Memset { sig, byte, len, off } => {
+        WriteKind::Memset {
+            sig,
+            byte,
+            len,
+            off,
+        } => {
             let ptr = emit_dst_ptr(func, env, dst, off, out);
             let b = remat_const(func, env, byte, out);
             let l = remat_const(func, env, len, out);
             let callee = func.value(crate::ir::Type::I64);
             out.push(func.add(Op::Runtime(RuntimeSymbol::Memset), Some(callee)));
-            out.push(func.add(Op::Call { sig, callee, args: vec![ptr, b, l], results: Vec::new() }, None));
+            out.push(func.add(
+                Op::Call {
+                    sig,
+                    callee,
+                    args: vec![ptr, b, l],
+                    results: Vec::new(),
+                },
+                None,
+            ));
         }
     }
 }
 
 fn dst_slot_off(env: &Env, dst: Value, off: i64) -> Option<(StackSlot, i32)> {
     let (d_slot, d_base) = env.addrs[dst.index()]?;
-    let total = d_base.checked_add(off).and_then(|v| i32::try_from(v).ok())?;
+    let total = d_base
+        .checked_add(off)
+        .and_then(|v| i32::try_from(v).ok())?;
     Some((d_slot, total))
 }
 
-fn emit_dst_ptr(func: &mut Function, env: &Env, dst: Value, off: i64, out: &mut Vec<Inst>) -> Value {
+fn emit_dst_ptr(
+    func: &mut Function,
+    env: &Env,
+    dst: Value,
+    off: i64,
+    out: &mut Vec<Inst>,
+) -> Value {
     if off == 0 {
         return dst;
     }
@@ -337,8 +463,12 @@ fn emit_dst_ptr(func: &mut Function, env: &Env, dst: Value, off: i64, out: &mut 
 }
 
 fn remat_const(func: &mut Function, env: &Env, v: Value, out: &mut Vec<Inst>) -> Value {
-    let Some(def) = env.defs[v.index()] else { return v };
-    let Op::Const(imm) = func.insts[def.index()].op else { return v };
+    let Some(def) = env.defs[v.index()] else {
+        return v;
+    };
+    let Op::Const(imm) = func.insts[def.index()].op else {
+        return v;
+    };
     let fresh = func.value(func.ty(v));
     out.push(func.add(Op::Const(imm), Some(fresh)));
     fresh
@@ -350,7 +480,9 @@ fn cleanup_dead(func: &mut Function, env: &Env, slot: StackSlot, seeds: &[Value]
     for &(inst, s) in &env.addr_insts {
         if s == slot {
             cand.insert(inst);
-            func.insts[inst.index()].op.for_operands(|v| all_seeds.push(v));
+            func.insts[inst.index()]
+                .op
+                .for_operands(|v| all_seeds.push(v));
         }
     }
     for v in all_seeds {
@@ -369,7 +501,10 @@ fn drop_unused(func: &mut Function, cand: &HashSet<Inst>) -> bool {
     for b_idx in 0..func.blocks.len() {
         let before = func.blocks[b_idx].insts.len();
         func.blocks[b_idx].insts.retain(|inst| {
-            !cand.contains(inst) || func.insts[inst.index()].result.is_none_or(|r| uses[r.index()] > 0)
+            !cand.contains(inst)
+                || func.insts[inst.index()]
+                    .result
+                    .is_none_or(|r| uses[r.index()] > 0)
         });
         dropped |= func.blocks[b_idx].insts.len() < before;
     }

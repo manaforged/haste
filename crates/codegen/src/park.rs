@@ -9,7 +9,10 @@ mod place;
 mod recolor;
 use choose::{choose_free, place_reuse_chain};
 pub(crate) use place::scratch_clobbers;
-use place::{apply_demote, evict_slot, find_demote_free, find_relocate, leaf_park_cost, slot_accepts, victim_slot_unweighted};
+use place::{
+    apply_demote, evict_slot, find_demote_free, find_relocate, leaf_park_cost, slot_accepts,
+    victim_slot_unweighted,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkReg<R> {
@@ -81,15 +84,33 @@ pub(super) fn crosses_call(live: &Live, value: usize) -> bool {
 }
 
 pub(crate) fn parks(live: &Live, hints: &Hints, value: usize) -> bool {
-    hints.park.is_some() && hints.weights.is_some_and(|w| leaf_park_cost(live, hints, value).is_some_and(|c| c < w[value]))
+    hints.park.is_some()
+        && hints
+            .weights
+            .is_some_and(|w| leaf_park_cost(live, hints, value).is_some_and(|c| c < w[value]))
 }
 
-fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, pooled: &[bool]) -> Pool<F> {
+fn pool<F: Copy + PartialEq>(
+    func: &Function,
+    class: &Class<F>,
+    live: &Live,
+    pooled: &[bool],
+) -> Pool<F> {
     let regs: Vec<F> = class.saved.iter().chain(&class.leaf).copied().collect();
     let is_saved: Vec<bool> = regs.iter().map(|r| class.saved.contains(r)).collect();
-    let locked_arrivals: Vec<F> = class.arrivals.iter().flatten().copied().filter(|reg| class.leaf.contains(reg)).collect();
+    let locked_arrivals: Vec<F> = class
+        .arrivals
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|reg| class.leaf.contains(reg))
+        .collect();
     let arrival_lock: Vec<bool> = regs.iter().map(|r| locked_arrivals.contains(r)).collect();
-    let clobbers: Vec<Vec<Range>> = class.clobbers.iter().map(|(_, ranges)| ranges.clone()).collect();
+    let clobbers: Vec<Vec<Range>> = class
+        .clobbers
+        .iter()
+        .map(|(_, ranges)| ranges.clone())
+        .collect();
     let slot_clobber: Vec<u8> = regs
         .iter()
         .enumerate()
@@ -114,7 +135,9 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
         clobbers,
         slot_clobber,
     };
-    let entry = func.entry.map_or(&[][..], |entry| &func.blocks[entry.index()].params[..]);
+    let entry = func
+        .entry
+        .map_or(&[][..], |entry| &func.blocks[entry.index()].params[..]);
     for (value, arrival) in entry.iter().zip(&class.arrivals) {
         if let [reg] = arrival[..]
             && let Some(slot) = out.slot_of(reg)
@@ -122,14 +145,19 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
             && pooled[value.index()]
         {
             let ranges = live.ranges_of(value.index());
-            if !ranges.is_empty() && !crosses_call(live, value.index()) && !out.slot_clobbered(slot, ranges) {
+            if !ranges.is_empty()
+                && !crosses_call(live, value.index())
+                && !out.slot_clobbered(slot, ranges)
+            {
                 out.kept[value.index()] = Some(reg);
             }
         }
     }
     for (v, entry) in class.passed.iter().enumerate() {
         out.passed[v] = entry.filter(|(reg, _)| {
-            out.slot_of(*reg).is_some_and(|slot| !out.is_saved[slot] && !out.slot_clobbered(slot, live.ranges_of(v)))
+            out.slot_of(*reg).is_some_and(|slot| {
+                !out.is_saved[slot] && !out.slot_clobbered(slot, live.ranges_of(v))
+            })
         });
     }
     out
@@ -144,7 +172,10 @@ pub(super) fn slot_free<F: Copy + PartialEq>(
     start: u32,
     kept_reg: Option<F>,
 ) -> bool {
-    slot_accepts(pool, s, ranges, start, kept_reg) && holders.iter().all(|&other| !overlaps(live.ranges_of(other), ranges))
+    slot_accepts(pool, s, ranges, start, kept_reg)
+        && holders
+            .iter()
+            .all(|&other| !overlaps(live.ranges_of(other), ranges))
 }
 
 pub(super) struct SlotSet {
@@ -153,7 +184,9 @@ pub(super) struct SlotSet {
 
 impl SlotSet {
     fn new(count: usize) -> Self {
-        Self { slots: vec![Vec::new(); count] }
+        Self {
+            slots: vec![Vec::new(); count],
+        }
     }
 
     pub(super) fn is_empty(&self, s: usize) -> bool {
@@ -202,7 +235,14 @@ impl SlotSet {
         }
     }
 
-    pub(super) fn free<F: Copy + PartialEq>(&self, pool: &Pool<F>, s: usize, ranges: &[Range], start: u32, kept_reg: Option<F>) -> bool {
+    pub(super) fn free<F: Copy + PartialEq>(
+        &self,
+        pool: &Pool<F>,
+        s: usize,
+        ranges: &[Range],
+        start: u32,
+        kept_reg: Option<F>,
+    ) -> bool {
         slot_accepts(pool, s, ranges, start, kept_reg) && !self.has_overlap(s, ranges)
     }
 
@@ -225,7 +265,11 @@ impl SlotSet {
     }
 }
 
-fn back_partner_map(count: usize, pooled: &[bool], back_args: &[(usize, usize)]) -> Vec<Vec<usize>> {
+fn back_partner_map(
+    count: usize,
+    pooled: &[bool],
+    back_args: &[(usize, usize)],
+) -> Vec<Vec<usize>> {
     let mut map = vec![Vec::new(); count];
     for &(param, arg) in back_args {
         if pooled[param] && pooled[arg] {
@@ -250,11 +294,24 @@ struct Priority {
     value: usize,
 }
 
-fn value_priority(weights: &[u64], live: &Live, remat: &[bool], start: u32, value: usize) -> Priority {
+fn value_priority(
+    weights: &[u64],
+    live: &Live,
+    remat: &[bool],
+    start: u32,
+    value: usize,
+) -> Priority {
     let weight = weights[value];
     let len = live.total_len(value).max(4);
     let density = (u128::from(weight) << 24) / u128::from(len);
-    Priority { density, weight, non_remat: !remat[value], start: Reverse(start), tie: Reverse(value), value }
+    Priority {
+        density,
+        weight,
+        non_remat: !remat[value],
+        start: Reverse(start),
+        tie: Reverse(value),
+        value,
+    }
 }
 
 const MAX_REQUEUE: u8 = 8;
@@ -278,14 +335,28 @@ impl BackIndex {
         pairs.dedup();
         let mut entries: Vec<(u32, u32, usize, usize, bool)> = pairs
             .into_iter()
-            .filter_map(|(target, partner, is_param)| live.bounds(target).map(|(s, e)| (s, e, target, partner, is_param)))
+            .filter_map(|(target, partner, is_param)| {
+                live.bounds(target)
+                    .map(|(s, e)| (s, e, target, partner, is_param))
+            })
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
-        let chunk_max = entries.chunks(RES_CHUNK).map(|c| c.iter().map(|e| e.1).max().unwrap_or(0)).collect();
+        let chunk_max = entries
+            .chunks(RES_CHUNK)
+            .map(|c| c.iter().map(|e| e.1).max().unwrap_or(0))
+            .collect();
         Self { entries, chunk_max }
     }
 
-    fn fill<F: Copy + PartialEq>(&self, homes: &[Option<F>], live: &Live, (value, start, end, ranges): (usize, u32, u32, &[Range]), check_order: bool, limit: usize, reserved: &mut Vec<F>) {
+    fn fill<F: Copy + PartialEq>(
+        &self,
+        homes: &[Option<F>],
+        live: &Live,
+        (value, start, end, ranges): (usize, u32, u32, &[Range]),
+        check_order: bool,
+        limit: usize,
+        reserved: &mut Vec<F>,
+    ) {
         reserved.clear();
         let bound = self.entries.partition_point(|e| e.0 <= end);
         for (c, chunk) in self.entries[..bound].chunks(RES_CHUNK).enumerate() {
@@ -369,10 +440,16 @@ fn try_place_weighted<'a, F: Copy + PartialEq>(
     (hints, weights): (&Hints, &[u64]),
     (back_partners, reverse_reuse, back_index): (&[Vec<usize>], &[Option<Value>], &BackIndex),
     (slots, homes): (&mut SlotSet, &mut [Option<F>]),
-    (reserved, scratch_holders, query_ranges): (&mut Vec<F>, &mut Vec<Vec<usize>>, &mut Vec<(usize, &'a [Range])>),
+    (reserved, scratch_holders, query_ranges): (
+        &mut Vec<F>,
+        &mut Vec<Vec<usize>>,
+        &mut Vec<(usize, &'a [Range])>,
+    ),
     (value, want): (usize, Option<usize>),
 ) -> (bool, Vec<usize>) {
-    let Some((start, end)) = live.bounds(value) else { return (false, Vec::new()) };
+    let Some((start, end)) = live.bounds(value) else {
+        return (false, Vec::new());
+    };
     let ranges = live.ranges_of(value);
     let wide_val = func.types[value].bytes() > 8;
     let needs_saved = crosses_call(live, value);
@@ -380,9 +457,29 @@ fn try_place_weighted<'a, F: Copy + PartialEq>(
     if needs_saved && wide_val && !can_park {
         return (false, Vec::new());
     }
-    let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slots.free(pool, s, ranges, start, pool.kept[value]));
-    back_index.fill(homes, live, (value, start, end, ranges), false, pool.regs.len(), reserved);
-    fill_scratch_holders(slots, homes, live, hints, &back_partners[value], reverse_reuse, value, query_ranges, scratch_holders);
+    let has_free_saved = needs_saved
+        && !wide_val
+        && (0..pool.regs.len())
+            .any(|s| pool.is_saved[s] && slots.free(pool, s, ranges, start, pool.kept[value]));
+    back_index.fill(
+        homes,
+        live,
+        (value, start, end, ranges),
+        false,
+        pool.regs.len(),
+        reserved,
+    );
+    fill_scratch_holders(
+        slots,
+        homes,
+        live,
+        hints,
+        &back_partners[value],
+        reverse_reuse,
+        value,
+        query_ranges,
+        scratch_holders,
+    );
     let mut chosen = choose_free(
         pool,
         scratch_holders,
@@ -393,14 +490,34 @@ fn try_place_weighted<'a, F: Copy + PartialEq>(
         reverse_reuse,
         reserved,
         |s| !slots.is_empty(s),
-        (value, start, end, wide_val, needs_saved, can_park, has_free_saved),
+        (
+            value,
+            start,
+            end,
+            wide_val,
+            needs_saved,
+            can_park,
+            has_free_saved,
+        ),
     );
     if want.is_some_and(|s| chosen != Some(s)) {
         return (false, Vec::new());
     }
     let mut dropped = Vec::new();
     if chosen.is_none()
-        && let Some(demote) = find_relocate(func, pool, slots, homes, live, hints, &back_partners[value], reserved, weights, (ranges, start, value), (needs_saved, can_park, wide_val))
+        && let Some(demote) = find_relocate(
+            func,
+            pool,
+            slots,
+            homes,
+            live,
+            hints,
+            &back_partners[value],
+            reserved,
+            weights,
+            (ranges, start, value),
+            (needs_saved, can_park, wide_val),
+        )
     {
         chosen = Some(demote.slot);
         dropped = apply_demote(pool, live, None, slots, homes, &demote);
@@ -413,7 +530,14 @@ fn try_place_weighted<'a, F: Copy + PartialEq>(
     (true, dropped)
 }
 
-fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &Pool<F>, pooled: &[bool], hints: &Hints, weights: &[u64]) -> (Vec<Option<F>>, Vec<F>) {
+fn allocate_weighted<F: Copy + PartialEq>(
+    func: &Function,
+    live: &Live,
+    pool: &Pool<F>,
+    pooled: &[bool],
+    hints: &Hints,
+    weights: &[u64],
+) -> (Vec<Option<F>>, Vec<F>) {
     let mut homes = vec![None; pooled.len()];
     let mut slots = SlotSet::new(pool.regs.len());
     let mut remat = vec![false; pooled.len()];
@@ -508,15 +632,31 @@ fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &P
             }
         }
     }
-    let join = recolor::Join { func, live, pool, hints, back_partners: &back_partners, reverse_reuse: &reverse_reuse };
+    let join = recolor::Join {
+        func,
+        live,
+        pool,
+        hints,
+        back_partners: &back_partners,
+        reverse_reuse: &reverse_reuse,
+    };
     join.join_args(hints.back_args, &mut slots, &mut homes);
     join.join_args(hints.edge_args, &mut slots, &mut homes);
     join.share_copies(&mut slots, &mut homes);
-    let used = (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !slots.is_empty(s)).map(|s| pool.regs[s]).collect();
+    let used = (0..pool.regs.len())
+        .filter(|&s| pool.is_saved[s] && !slots.is_empty(s))
+        .map(|s| pool.regs[s])
+        .collect();
     (homes, used)
 }
 
-pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
+pub(crate) fn allocate<F: Copy + PartialEq>(
+    func: &Function,
+    live: &Live,
+    class: &Class<F>,
+    pooled: &[bool],
+    hints: &Hints,
+) -> (Vec<Option<F>>, Vec<F>) {
     let pool = pool(func, class, live, pooled);
     if let Some(weights) = hints.weights {
         return allocate_weighted(func, live, &pool, pooled, hints, weights);
@@ -553,10 +693,27 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         if needs_saved && wide_val && !can_park {
             continue;
         }
-        let suits_direct = |s: usize| if needs_saved { pool.is_saved[s] && !wide_val } else { !wide_val || !pool.is_saved[s] };
+        let suits_direct = |s: usize| {
+            if needs_saved {
+                pool.is_saved[s] && !wide_val
+            } else {
+                !wide_val || !pool.is_saved[s]
+            }
+        };
         let suits_any = |s: usize| suits_direct(s) || (can_park && !pool.is_saved[s]);
-        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&pool, s, &holders[s], live, ranges, start, None));
-        back_index.fill(&homes, live, (value, start, end, ranges), true, pool.regs.len(), &mut reserved);
+        let has_free_saved = needs_saved
+            && !wide_val
+            && (0..pool.regs.len()).any(|s| {
+                pool.is_saved[s] && slot_free(&pool, s, &holders[s], live, ranges, start, None)
+            });
+        back_index.fill(
+            &homes,
+            live,
+            (value, start, end, ranges),
+            true,
+            pool.regs.len(),
+            &mut reserved,
+        );
         let mut chosen = choose_free(
             &pool,
             &holders,
@@ -567,22 +724,61 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
             &[],
             &reserved,
             |s| used.contains(&pool.regs[s]),
-            (value, start, end, wide_val, needs_saved, can_park, has_free_saved),
+            (
+                value,
+                start,
+                end,
+                wide_val,
+                needs_saved,
+                can_park,
+                has_free_saved,
+            ),
         );
         if chosen.is_none() {
             let demote = (!wide_val)
-                .then(|| find_demote_free(&pool, &slots, live, hints, &reserved, (ranges, start, value)))
+                .then(|| {
+                    find_demote_free(
+                        &pool,
+                        &slots,
+                        live,
+                        hints,
+                        &reserved,
+                        (ranges, start, value),
+                    )
+                })
                 .flatten();
             let victim = if demote.is_some() {
                 None
             } else {
-                victim_slot_unweighted(&pool, &slots, &homes, live, &back_partners[value], (start, end, value), suits_any)
+                victim_slot_unweighted(
+                    &pool,
+                    &slots,
+                    &homes,
+                    live,
+                    &back_partners[value],
+                    (start, end, value),
+                    suits_any,
+                )
             };
             if let Some(demote) = demote {
-                apply_demote(&pool, live, Some(&mut holders), &mut slots, &mut homes, &demote);
+                apply_demote(
+                    &pool,
+                    live,
+                    Some(&mut holders),
+                    &mut slots,
+                    &mut homes,
+                    &demote,
+                );
                 chosen = Some(demote.slot);
             } else if let Some(v) = victim {
-                evict_slot(Some(&mut holders[v.slot]), &mut slots, v.slot, &mut homes, live, ranges);
+                evict_slot(
+                    Some(&mut holders[v.slot]),
+                    &mut slots,
+                    v.slot,
+                    &mut homes,
+                    live,
+                    ranges,
+                );
                 chosen = Some(v.slot);
             }
         }

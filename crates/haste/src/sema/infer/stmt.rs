@@ -16,13 +16,20 @@ impl Infer<'_, '_> {
         self.items.truncate(items);
         self.block_uses.truncate(uses);
         let ty = result?;
-        let ty = if tail.is_none() && self.diverges { self.cx.types.intern(Kind::Never) } else { ty };
+        let ty = if tail.is_none() && self.diverges {
+            self.cx.types.intern(Kind::Never)
+        } else {
+            ty
+        };
         self.diverges |= diverges;
         Ok(ty)
     }
 
     fn declare_items(&mut self, stmts: List) {
-        let Some((root, found)) = self.root.and_then(|root| Some((root, self.cx.expansion(root)?))) else {
+        let Some((root, found)) = self
+            .root
+            .and_then(|root| Some((root, self.cx.expansion(root)?)))
+        else {
             return;
         };
         let (src, items) = (&found.file.source, &found.file.items.items);
@@ -35,13 +42,19 @@ impl Infer<'_, '_> {
                     self.block_uses.push(at as u32);
                 }
                 if let Some(name) = items[at].name {
-                    self.items.push((crate::names::plain(src.text(name)), root.inner(at as u32)));
+                    self.items
+                        .push((crate::names::plain(src.text(name)), root.inner(at as u32)));
                 }
             }
         }
     }
 
-    fn block_inner(&mut self, stmts: List, tail: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {
+    fn block_inner(
+        &mut self,
+        stmts: List,
+        tail: Option<ExprId>,
+        expected: Option<Ty>,
+    ) -> Result<Ty> {
         for &stmt in self.body.list(stmts) {
             self.stmt(self.body.stmts[stmt as usize])?;
         }
@@ -53,7 +66,13 @@ impl Infer<'_, '_> {
 
     fn stmt(&mut self, stmt: Stmt) -> Result<()> {
         match stmt {
-            Stmt::Let { pat, ty, init, otherwise, .. } => self.let_stmt(pat, ty, init, otherwise),
+            Stmt::Let {
+                pat,
+                ty,
+                init,
+                otherwise,
+                ..
+            } => self.let_stmt(pat, ty, init, otherwise),
             Stmt::Expr(expr, semi) => {
                 let ty = self.expr(expr, None)?;
                 if !semi {
@@ -67,7 +86,13 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn let_stmt(&mut self, pat: PatId, ty: Option<crate::body::TyId>, init: Option<ExprId>, otherwise: Option<ExprId>) -> Result<()> {
+    fn let_stmt(
+        &mut self,
+        pat: PatId,
+        ty: Option<crate::body::TyId>,
+        init: Option<ExprId>,
+        otherwise: Option<ExprId>,
+    ) -> Result<()> {
         let declared = match ty {
             Some(ty) => Some(self.lower_ty(self.body, ty)?),
             None => None,

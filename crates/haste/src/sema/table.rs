@@ -17,13 +17,17 @@ pub struct Table<K, V> {
 
 impl<K, V> Clone for Table<K, V> {
     fn clone(&self) -> Self {
-        Self { shards: Arc::clone(&self.shards) }
+        Self {
+            shards: Arc::clone(&self.shards),
+        }
     }
 }
 
 impl<K, V> Default for Table<K, V> {
     fn default() -> Self {
-        Self { shards: (0..SHARDS).map(|_| CachePadded::default()).collect() }
+        Self {
+            shards: (0..SHARDS).map(|_| CachePadded::default()).collect(),
+        }
     }
 }
 
@@ -135,13 +139,20 @@ pub(super) struct Flight<K, V> {
 
 impl<K, V> Clone for Flight<K, V> {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
 impl<K, V> Default for Flight<K, V> {
     fn default() -> Self {
-        Self { inner: Arc::new(FlightInner { slots: Table::default(), waits: Mutex::new(FxHashMap::default()) }) }
+        Self {
+            inner: Arc::new(FlightInner {
+                slots: Table::default(),
+                waits: Mutex::new(FxHashMap::default()),
+            }),
+        }
     }
 }
 
@@ -233,7 +244,13 @@ impl<K, V> Flight<K, V> {
 }
 
 impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
-    pub(super) fn run(&self, cx: &mut super::Context<'_>, key: K, compute: impl FnOnce(&mut super::Context<'_>) -> Result<V>, on_cycle: impl FnOnce(&mut super::Context<'_>) -> Result<V>) -> Result<V> {
+    pub(super) fn run(
+        &self,
+        cx: &mut super::Context<'_>,
+        key: K,
+        compute: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
+        on_cycle: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
+    ) -> Result<V> {
         let me = std::thread::current().id();
         loop {
             match self.acquire(&key, me) {
@@ -241,7 +258,12 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
                 Step::Cycle => return on_cycle(cx),
                 Step::Retry => continue,
                 Step::Compute(slot) => {
-                    let mut guard = FlightGuard { flight: self, key: key.clone(), slot: Arc::clone(&slot), done: false };
+                    let mut guard = FlightGuard {
+                        flight: self,
+                        key: key.clone(),
+                        slot: Arc::clone(&slot),
+                        done: false,
+                    };
                     let before = cx.quiet_mark();
                     let result = compute(cx);
                     guard.done = true;
@@ -260,8 +282,15 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
         if let Some(slot) = self.inner.slots.get(key) {
             return self.wait_or_cycle(&slot, me);
         }
-        let fresh = Arc::new(Slot { ready_val: OnceLock::new(), state: Mutex::new(SlotState::Running(me)), ready: Condvar::new() });
-        let slot = self.inner.slots.get_or_insert_with(key.clone(), || Arc::clone(&fresh));
+        let fresh = Arc::new(Slot {
+            ready_val: OnceLock::new(),
+            state: Mutex::new(SlotState::Running(me)),
+            ready: Condvar::new(),
+        });
+        let slot = self
+            .inner
+            .slots
+            .get_or_insert_with(key.clone(), || Arc::clone(&fresh));
         if Arc::ptr_eq(&slot, &fresh) {
             return Step::Compute(fresh);
         }
@@ -283,7 +312,10 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
         }
         let wait = WaitGuard { flight: self, me };
         while matches!(*guard, SlotState::Running(_)) {
-            guard = slot.ready.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = slot
+                .ready
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         let step = match &*guard {
             SlotState::Ready(value) => Step::Ready(value.clone()),

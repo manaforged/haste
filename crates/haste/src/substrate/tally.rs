@@ -34,11 +34,34 @@ pub(crate) enum Tally {
 }
 
 const TALLY_NAMES: [&str; 25] = [
-    "lookup", "hit", "hit_lowered", "miss_unportable", "miss_unkeyed", "miss_absent", "miss_plan", "miss_other", "freeze_deferred", "freeze_skipped",
-    "freeze_planless", "save_offered", "trim_stencils", "trim_dropped", "trim_base_bytes", "trim_need_bytes", "trim_kept_bytes", "footprint_us", "lookup_us", "miss_lower_us",
-    "meta_lookup", "meta_hit", "meta_miss", "meta_stored", "meta_mismatch",
+    "lookup",
+    "hit",
+    "hit_lowered",
+    "miss_unportable",
+    "miss_unkeyed",
+    "miss_absent",
+    "miss_plan",
+    "miss_other",
+    "freeze_deferred",
+    "freeze_skipped",
+    "freeze_planless",
+    "save_offered",
+    "trim_stencils",
+    "trim_dropped",
+    "trim_base_bytes",
+    "trim_need_bytes",
+    "trim_kept_bytes",
+    "footprint_us",
+    "lookup_us",
+    "miss_lower_us",
+    "meta_lookup",
+    "meta_hit",
+    "meta_miss",
+    "meta_stored",
+    "meta_mismatch",
 ];
-static TALLIES: [AtomicUsize; TALLY_NAMES.len()] = [const { AtomicUsize::new(0) }; TALLY_NAMES.len()];
+static TALLIES: [AtomicUsize; TALLY_NAMES.len()] =
+    [const { AtomicUsize::new(0) }; TALLY_NAMES.len()];
 
 /// Counts one `kind` event.
 pub(crate) fn tally(kind: Tally) {

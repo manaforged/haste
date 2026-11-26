@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Block, IntCC, Type, Value};
 
-use crate::body::{BlockKind, Body, Expr, ExprId, List, Lit, Pat, PatId, UnOp};
 use crate::body::literal::{byte_value, char_value};
+use crate::body::{BlockKind, Body, Expr, ExprId, List, Lit, Pat, PatId, UnOp};
 use crate::names::Primitive;
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
@@ -16,12 +16,17 @@ use super::place::{Base, Place};
 use super::{Lower, Repr, host_is_x64_or_arm64, repr};
 
 fn bitwise_elem(cx: &mut Context<'_>, ty: Ty) -> Option<(Primitive, usize)> {
-    let Kind::Prim(prim) = *cx.types.kind(ty) else { return None };
+    let Kind::Prim(prim) = *cx.types.kind(ty) else {
+        return None;
+    };
     let bytes = bitwise_prim_bytes(prim).filter(|&b| b <= 4)?;
     (cx.layout(ty).ok()?.size.bytes() == bytes as u64).then_some((prim, bytes))
 }
 
-fn wide_match_window(vals: &[Option<u64>], elem_bytes: usize) -> Option<(usize, Type, u64, u64, bool)> {
+fn wide_match_window(
+    vals: &[Option<u64>],
+    elem_bytes: usize,
+) -> Option<(usize, Type, u64, u64, bool)> {
     let elem_bits = elem_bytes * 8;
     let elem_mask = u64::MAX >> (64 - elem_bits);
     for (w_bytes, load_ty) in [(8, Type::I64), (4, Type::I32), (2, Type::I16)] {
@@ -30,7 +35,8 @@ fn wide_match_window(vals: &[Option<u64>], elem_bytes: usize) -> Option<(usize, 
             continue;
         }
         let m = vals[..k].iter().filter(|v| v.is_some()).count();
-        let ok = m == k || (elem_bytes == 1 && ((w_bytes == 4 && m >= 3) || (w_bytes == 8 && m >= 5)));
+        let ok =
+            m == k || (elem_bytes == 1 && ((w_bytes == 4 && m >= 3) || (w_bytes == 8 && m >= 5)));
         if !ok {
             continue;
         }
@@ -47,17 +53,27 @@ fn wide_match_window(vals: &[Option<u64>], elem_bytes: usize) -> Option<(usize, 
     None
 }
 
-fn eval_lit_expr(cx: &Context<'_>, (body, src, typed): (&Body, &Source, &Typed), expr: ExprId, prim: Primitive) -> Option<u64> {
+fn eval_lit_expr(
+    cx: &Context<'_>,
+    (body, src, typed): (&Body, &Source, &Typed),
+    expr: ExprId,
+    prim: Primitive,
+) -> Option<u64> {
     if typed.coercions.contains_key(&expr) {
         return None;
     }
     match *body.expr(expr) {
         Expr::Paren(inner) => eval_lit_expr(cx, (body, src, typed), inner, prim),
-        Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } if body.list(stmts).is_empty() => {
-            eval_lit_expr(cx, (body, src, typed), tail, prim)
-        }
+        Expr::Block {
+            stmts,
+            tail: Some(tail),
+            label: None,
+            kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const,
+        } if body.list(stmts).is_empty() => eval_lit_expr(cx, (body, src, typed), tail, prim),
         Expr::Unary(UnOp::Neg, inner) if !typed.operators.contains_key(&expr) => {
-            let (bits, true) = int_info(prim)? else { return None };
+            let (bits, true) = int_info(prim)? else {
+                return None;
+            };
             let v = eval_lit_expr(cx, (body, src, typed), inner, prim)?;
             Some((u128::from(v).wrapping_neg() & mask(bits)) as u64)
         }
@@ -65,15 +81,32 @@ fn eval_lit_expr(cx: &Context<'_>, (body, src, typed): (&Body, &Source, &Typed),
     }
 }
 
-fn eval_lit_atom(cx: &Context<'_>, (body, src, typed): (&Body, &Source, &Typed), expr: ExprId, prim: Primitive) -> Option<u64> {
+fn eval_lit_atom(
+    cx: &Context<'_>,
+    (body, src, typed): (&Body, &Source, &Typed),
+    expr: ExprId,
+    prim: Primitive,
+) -> Option<u64> {
     match *body.expr(expr) {
         Expr::Lit(Lit::Bool(v), _) if prim == Primitive::Bool => Some(u64::from(v)),
-        Expr::Lit(Lit::Byte, at) if prim == Primitive::U8 => byte_value(src.text(at)).ok().map(u64::from),
-        Expr::Lit(Lit::Char, at) if prim == Primitive::Char => char_value(src.text(at)).ok().map(|c| u64::from(u32::from(c))),
-        Expr::Lit(Lit::Int, at) => int_info(prim).and_then(|(bits, _)| parse_int(src.text(at)).ok().map(|(v, _)| (v & mask(bits)) as u64)),
+        Expr::Lit(Lit::Byte, at) if prim == Primitive::U8 => {
+            byte_value(src.text(at)).ok().map(u64::from)
+        }
+        Expr::Lit(Lit::Char, at) if prim == Primitive::Char => char_value(src.text(at))
+            .ok()
+            .map(|c| u64::from(u32::from(c))),
+        Expr::Lit(Lit::Int, at) => int_info(prim).and_then(|(bits, _)| {
+            parse_int(src.text(at))
+                .ok()
+                .map(|(v, _)| (v & mask(bits)) as u64)
+        }),
         Expr::Path(_) => {
-            let Some(&Res::Const(val_ty)) = typed.res.get(&expr) else { return None };
-            let Kind::Value(v) = *cx.types.kind(val_ty) else { return None };
+            let Some(&Res::Const(val_ty)) = typed.res.get(&expr) else {
+                return None;
+            };
+            let Kind::Value(v) = *cx.types.kind(val_ty) else {
+                return None;
+            };
             let (bits, _) = int_info(prim)?;
             Some((v & mask(bits)) as u64)
         }
@@ -83,7 +116,12 @@ fn eval_lit_atom(cx: &Context<'_>, (body, src, typed): (&Body, &Source, &Typed),
 
 impl Lower<'_, '_> {
     /// The items of slice pattern `pat` that match an element of the array or slice at `place`, each with that element's place; branches to `fail` first when a slice's length cannot match.
-    pub(super) fn slice_parts(&mut self, (pat, list): (PatId, List), place: Option<Place>, fail: Option<Block>) -> Result<Vec<(PatId, Option<Place>)>> {
+    pub(super) fn slice_parts(
+        &mut self,
+        (pat, list): (PatId, List),
+        place: Option<Place>,
+        fail: Option<Block>,
+    ) -> Result<Vec<(PatId, Option<Place>)>> {
         let ty = self.pat_ty(pat)?;
         let element = match *self.cx.types.kind(ty) {
             Kind::Array(element, _) | Kind::Slice(element) => element,
@@ -91,7 +129,9 @@ impl Lower<'_, '_> {
         };
         let (pats, rest) = rest_split(self.body, list)?;
         let count = pats.len();
-        let Some((base, slice_pair, array_len)) = self.slice_target(place, ty, (count, rest.is_some()), fail)? else {
+        let Some((base, slice_pair, array_len)) =
+            self.slice_target(place, ty, (count, rest.is_some()), fail)?
+        else {
             return Ok(Vec::new());
         };
         let stride = self.cx.layout(element)?.size.bytes();
@@ -99,27 +139,57 @@ impl Lower<'_, '_> {
         let mut tested = vec![false; count];
         let mut suffix_base = None;
         if let Some(fail_blk) = fail {
-            suffix_base = self.coalesce_slice((&pats, rest), (element, stride), (base, slice_pair, array_len), (&mut tested, fail_blk))?;
+            suffix_base = self.coalesce_slice(
+                (&pats, rest),
+                (element, stride),
+                (base, slice_pair, array_len),
+                (&mut tested, fail_blk),
+            )?;
         }
-        self.collect_slice_parts((&pats, rest), (element, elem_repr, stride), (base, slice_pair, array_len, suffix_base), (&tested, fail))
+        self.collect_slice_parts(
+            (&pats, rest),
+            (element, elem_repr, stride),
+            (base, slice_pair, array_len, suffix_base),
+            (&tested, fail),
+        )
     }
 
-    fn slice_target(&mut self, place: Option<Place>, ty: Ty, (count, has_rest): (usize, bool), fail: Option<Block>) -> Result<Option<(Place, Option<(Value, Value)>, Option<usize>)>> {
+    fn slice_target(
+        &mut self,
+        place: Option<Place>,
+        ty: Ty,
+        (count, has_rest): (usize, bool),
+        fail: Option<Block>,
+    ) -> Result<Option<(Place, Option<(Value, Value)>, Option<usize>)>> {
         if let Kind::Array(_, len_ty) = *self.cx.types.kind(ty) {
             let Some(at) = place else { return Ok(None) };
             return Ok(Some((at, None, Some(self.len(len_ty)? as usize))));
         }
-        let Some((data, len)) = self.data_len(place, ty)? else { return Ok(None) };
+        let Some((data, len)) = self.data_len(place, ty)? else {
+            return Ok(None);
+        };
         let min_len = count - usize::from(has_rest);
         if let Some(fail) = fail
             && (!has_rest || min_len > 0)
         {
             let given = self.ins().iconst(Type::I64, min_len as i64);
-            let cc = if has_rest { IntCC::UnsignedGreaterThanOrEqual } else { IntCC::Equal };
+            let cc = if has_rest {
+                IntCC::UnsignedGreaterThanOrEqual
+            } else {
+                IntCC::Equal
+            };
             let ok = self.ins().icmp(cc, len, given);
             self.pass(ok, fail);
         }
-        Ok(Some((Place { base: Base::Addr(data), offset: 0, repr: Repr::Zst }, Some((data, len)), None)))
+        Ok(Some((
+            Place {
+                base: Base::Addr(data),
+                offset: 0,
+                repr: Repr::Zst,
+            },
+            Some((data, len)),
+            None,
+        )))
     }
 
     fn coalesce_slice(
@@ -129,41 +199,71 @@ impl Lower<'_, '_> {
         (base, slice_pair, array_len): (Place, Option<(Value, Value)>, Option<usize>),
         (tested, fail): (&mut [bool], Block),
     ) -> Result<Option<Place>> {
-        let Some((prim, elem_bytes)) = bitwise_elem(self.cx, element) else { return Ok(None) };
+        let Some((prim, elem_bytes)) = bitwise_elem(self.cx, element) else {
+            return Ok(None);
+        };
         if !host_is_x64_or_arm64() || stride != elem_bytes as u64 {
             return Ok(None);
         }
         let pre_end = rest.unwrap_or(pats.len());
-        self.coalesce_run(&pats[..pre_end], (prim, elem_bytes), base, (&mut tested[..pre_end], fail));
-        let Some(split) = rest.filter(|&s| s + 1 < pats.len()) else { return Ok(None) };
+        self.coalesce_run(
+            &pats[..pre_end],
+            (prim, elem_bytes),
+            base,
+            (&mut tested[..pre_end], fail),
+        );
+        let Some(split) = rest.filter(|&s| s + 1 < pats.len()) else {
+            return Ok(None);
+        };
         let suffix = &pats[split + 1..];
         let suffix_base = if let Some(total) = array_len {
             let start_off = ((total - suffix.len()) as u64 * stride) as i32;
             base.at(start_off, Repr::Zst)
         } else if let Some((data, len)) = slice_pair
-            && suffix.iter().filter(|&&p| self.pat_scalar_bits(p, prim).is_some()).count() >= 2
+            && suffix
+                .iter()
+                .filter(|&&p| self.pat_scalar_bits(p, prim).is_some())
+                .count()
+                >= 2
         {
             let idx = self.ins().iadd_imm(len, -(suffix.len() as i64));
             self.element_place(data, idx, element)?
         } else {
             return Ok(None);
         };
-        self.coalesce_run(suffix, (prim, elem_bytes), suffix_base, (&mut tested[split + 1..], fail));
+        self.coalesce_run(
+            suffix,
+            (prim, elem_bytes),
+            suffix_base,
+            (&mut tested[split + 1..], fail),
+        );
         Ok(slice_pair.map(|_| suffix_base))
     }
 
-    fn coalesce_run(&mut self, pats: &[PatId], (prim, elem_bytes): (Primitive, usize), base: Place, (tested, fail): (&mut [bool], Block)) {
-        let vals: Vec<Option<u64>> = pats.iter().map(|&p| self.pat_scalar_bits(p, prim)).collect();
+    fn coalesce_run(
+        &mut self,
+        pats: &[PatId],
+        (prim, elem_bytes): (Primitive, usize),
+        base: Place,
+        (tested, fail): (&mut [bool], Block),
+    ) {
+        let vals: Vec<Option<u64>> = pats
+            .iter()
+            .map(|&p| self.pat_scalar_bits(p, prim))
+            .collect();
         if vals.iter().filter(|v| v.is_some()).count() < 2 {
             return;
         }
         let mut i = 0;
         while i < pats.len() {
-            let Some((k, load_ty, exp, mask_val, masked)) = vals[i].and_then(|_| wide_match_window(&vals[i..], elem_bytes)) else {
+            let Some((k, load_ty, exp, mask_val, masked)) =
+                vals[i].and_then(|_| wide_match_window(&vals[i..], elem_bytes))
+            else {
                 i += 1;
                 continue;
             };
-            let Some(mut word) = self.read(base.at((i * elem_bytes) as i32, Repr::Scalar(load_ty))) else {
+            let Some(mut word) = self.read(base.at((i * elem_bytes) as i32, Repr::Scalar(load_ty)))
+            else {
                 i += 1;
                 continue;
             };
@@ -188,12 +288,17 @@ impl Lower<'_, '_> {
                 return None;
             }
             match *self.body.pat(pat) {
-                Pat::Paren(inner) | Pat::Bind { sub: Some(inner), .. } if !self.typed.pat_res.contains_key(&pat) => pat = inner,
+                Pat::Paren(inner)
+                | Pat::Bind {
+                    sub: Some(inner), ..
+                } if !self.typed.pat_res.contains_key(&pat) => pat = inner,
                 Pat::Lit(expr) if !self.typed.pat_res.contains_key(&pat) => {
                     return eval_lit_expr(self.cx, (self.body, self.src, self.typed), expr, prim);
                 }
                 Pat::Path(_) | Pat::Bind { sub: None, .. } => {
-                    let Some(&Res::Fn(item, substs)) = self.typed.pat_res.get(&pat) else { return None };
+                    let Some(&Res::Fn(item, substs)) = self.typed.pat_res.get(&pat) else {
+                        return None;
+                    };
                     if self.cx.item(item).1.kind != ItemKind::Const {
                         return None;
                     }
@@ -203,8 +308,16 @@ impl Lower<'_, '_> {
                         return None;
                     }
                     let const_body = self.cx.body(source).ok()?;
-                    let (Some(root), const_src) = (const_body.root, self.cx.body_src(source)) else { return None };
-                    return eval_lit_expr(self.cx, (&const_body, const_src, &const_typed), root, prim);
+                    let (Some(root), const_src) = (const_body.root, self.cx.body_src(source))
+                    else {
+                        return None;
+                    };
+                    return eval_lit_expr(
+                        self.cx,
+                        (&const_body, const_src, &const_typed),
+                        root,
+                        prim,
+                    );
                 }
                 _ => return None,
             }
@@ -213,14 +326,19 @@ impl Lower<'_, '_> {
 
     fn skip_slice_elem(&self, sub: PatId, testing: bool) -> bool {
         if !testing {
-            return matches!(*self.body.pat(sub), Pat::Wild | Pat::Lit(..) | Pat::Range { .. });
+            return matches!(
+                *self.body.pat(sub),
+                Pat::Wild | Pat::Lit(..) | Pat::Range { .. }
+            );
         }
         if self.typed.pat_derefs(sub) != 0 || self.typed.pat_res.contains_key(&sub) {
             return false;
         }
         match *self.body.pat(sub) {
             Pat::Wild | Pat::Bind { sub: None, .. } => true,
-            Pat::Bind { sub: Some(inner), .. } => matches!(*self.body.pat(inner), Pat::Rest),
+            Pat::Bind {
+                sub: Some(inner), ..
+            } => matches!(*self.body.pat(inner), Pat::Rest),
             _ => false,
         }
     }
@@ -229,7 +347,12 @@ impl Lower<'_, '_> {
         &mut self,
         (pats, rest): (&[PatId], Option<usize>),
         (element, elem_repr, stride): (Ty, Repr, u64),
-        (base, slice_pair, array_len, mut suffix_base): (Place, Option<(Value, Value)>, Option<usize>, Option<Place>),
+        (base, slice_pair, array_len, mut suffix_base): (
+            Place,
+            Option<(Value, Value)>,
+            Option<usize>,
+            Option<Place>,
+        ),
         (tested, fail): (&[bool], Option<Block>),
     ) -> Result<Vec<(PatId, Option<Place>)>> {
         let count = pats.len();
@@ -245,7 +368,12 @@ impl Lower<'_, '_> {
                 }
                 continue;
             }
-            let elem_place = self.slice_elem_place((at, pats, rest), (element, elem_repr, stride), (base, slice_pair, array_len, &mut suffix_base), (tested, fail.is_some()))?;
+            let elem_place = self.slice_elem_place(
+                (at, pats, rest),
+                (element, elem_repr, stride),
+                (base, slice_pair, array_len, &mut suffix_base),
+                (tested, fail.is_some()),
+            )?;
             found.push((sub, Some(elem_place)));
         }
         Ok(found)
@@ -255,15 +383,26 @@ impl Lower<'_, '_> {
         &mut self,
         (at, pats, rest): (usize, &[PatId], Option<usize>),
         (element, elem_repr, stride): (Ty, Repr, u64),
-        (base, slice_pair, array_len, suffix_base): (Place, Option<(Value, Value)>, Option<usize>, &mut Option<Place>),
+        (base, slice_pair, array_len, suffix_base): (
+            Place,
+            Option<(Value, Value)>,
+            Option<usize>,
+            &mut Option<Place>,
+        ),
         (tested, testing): (&[bool], bool),
     ) -> Result<Place> {
         let count = pats.len();
         if let (Some(split), None) = (rest, array_len)
             && at > split
         {
-            let Some((data, len)) = slice_pair else { bail!("slice pattern missing slice data") };
-            let kept = pats[split + 1..].iter().enumerate().filter(|&(j, &p)| !tested[split + 1 + j] && !self.skip_slice_elem(p, testing)).count();
+            let Some((data, len)) = slice_pair else {
+                bail!("slice pattern missing slice data")
+            };
+            let kept = pats[split + 1..]
+                .iter()
+                .enumerate()
+                .filter(|&(j, &p)| !tested[split + 1 + j] && !self.skip_slice_elem(p, testing))
+                .count();
             if suffix_base.is_none() && kept >= 2 {
                 let idx = self.ins().iadd_imm(len, -((count - 1 - split) as i64));
                 *suffix_base = Some(self.element_place(data, idx, element)?);
@@ -291,17 +430,37 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn rest_place(&mut self, sub: PatId, base: Place, len: Option<Value>, (split, given): (usize, usize)) -> Result<Place> {
+    fn rest_place(
+        &mut self,
+        sub: PatId,
+        base: Place,
+        len: Option<Value>,
+        (split, given): (usize, usize),
+    ) -> Result<Place> {
         let ty = self.pat_ty(sub)?;
-        let (Kind::Array(element, _) | Kind::Slice(element)) = *self.cx.types.kind(ty) else { bail!("the rest of a slice pattern is not an array or slice") };
+        let (Kind::Array(element, _) | Kind::Slice(element)) = *self.cx.types.kind(ty) else {
+            bail!("the rest of a slice pattern is not an array or slice")
+        };
         let stride = self.cx.layout(element)?.size.bytes() as i64;
         if let Kind::Array(..) = self.cx.types.kind(ty) {
             return Ok(base.at((stride * split as i64) as i32, repr(self.cx, ty)?));
         }
         let data = self.address(base);
-        let start = if split == 0 { data } else { self.ins().iadd_imm(data, stride * split as i64) };
+        let start = if split == 0 {
+            data
+        } else {
+            self.ins().iadd_imm(data, stride * split as i64)
+        };
         let len = len.unwrap_or_else(|| self.ins().iconst(Type::I64, 0));
-        let left = if given == 0 { len } else { self.ins().iadd_imm(len, -(given as i64)) };
-        Ok(Place { base: Base::Addr(self.wide(start, left)), offset: 0, repr: WIDE })
+        let left = if given == 0 {
+            len
+        } else {
+            self.ins().iadd_imm(len, -(given as i64))
+        };
+        Ok(Place {
+            base: Base::Addr(self.wide(start, left)),
+            offset: 0,
+            repr: WIDE,
+        })
     }
 }

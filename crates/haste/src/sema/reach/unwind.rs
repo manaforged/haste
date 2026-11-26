@@ -12,7 +12,14 @@ use super::Reached;
 
 /// Whether calling host symbol `host` may initiate or propagate a panic unwind.
 pub(crate) fn host_symbol_may_unwind(host: &HostSymbol) -> bool {
-    matches!(host, HostSymbol::StartPanic | HostSymbol::CatchUnwind | HostSymbol::FillOnce | HostSymbol::ThreadCell | HostSymbol::Dynamic(_))
+    matches!(
+        host,
+        HostSymbol::StartPanic
+            | HostSymbol::CatchUnwind
+            | HostSymbol::FillOnce
+            | HostSymbol::ThreadCell
+            | HostSymbol::Dynamic(_)
+    )
 }
 
 fn foreign_may_unwind(cx: &Context<'_>, item: ItemRef) -> bool {
@@ -31,7 +38,12 @@ enum BodyScan {
     IndirectCalls(Vec<ExprId>),
 }
 
-fn scan_body_ops(cx: &mut Context<'_>, source: ItemRef, overflow_checks: bool, cache: &mut FxHashMap<(ItemRef, bool), BodyScan>) -> bool {
+fn scan_body_ops(
+    cx: &mut Context<'_>,
+    source: ItemRef,
+    overflow_checks: bool,
+    cache: &mut FxHashMap<(ItemRef, bool), BodyScan>,
+) -> bool {
     let entry = cache.entry((source, overflow_checks)).or_insert_with(|| {
         let Ok(body) = cx.body(source) else {
             return BodyScan::Unwinds;
@@ -39,10 +51,16 @@ fn scan_body_ops(cx: &mut Context<'_>, source: ItemRef, overflow_checks: bool, c
         let mut calls = Vec::new();
         for (idx, expr) in body.exprs.iter().enumerate() {
             match expr {
-                Expr::FormatArgs(_) | Expr::Index(..) | Expr::Macro { .. } => return BodyScan::Unwinds,
+                Expr::FormatArgs(_) | Expr::Index(..) | Expr::Macro { .. } => {
+                    return BodyScan::Unwinds;
+                }
                 Expr::Binary(op, ..) | Expr::AssignOp(op, ..)
                     if matches!(op, BinOp::Div | BinOp::Rem)
-                        || (overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::Shr)) =>
+                        || (overflow_checks
+                            && matches!(
+                                op,
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::Shr
+                            )) =>
                 {
                     return BodyScan::Unwinds;
                 }
@@ -56,7 +74,13 @@ fn scan_body_ops(cx: &mut Context<'_>, source: ItemRef, overflow_checks: bool, c
     matches!(entry, BodyScan::Unwinds)
 }
 
-fn has_indirect_call(cx: &mut Context<'_>, source: ItemRef, overflow_checks: bool, typed: &Typed, cache: &mut FxHashMap<(ItemRef, bool), BodyScan>) -> bool {
+fn has_indirect_call(
+    cx: &mut Context<'_>,
+    source: ItemRef,
+    overflow_checks: bool,
+    typed: &Typed,
+    cache: &mut FxHashMap<(ItemRef, bool), BodyScan>,
+) -> bool {
     if scan_body_ops(cx, source, overflow_checks, cache) {
         return true;
     }
@@ -70,9 +94,16 @@ fn has_indirect_call(cx: &mut Context<'_>, source: ItemRef, overflow_checks: boo
         return true;
     };
     for &expr in calls {
-        let Expr::Call(callee, _) = body.exprs[expr.0 as usize] else { continue };
-        let direct = matches!(typed.site_res(&cx.types, SiteKey::ExprRes(expr)), Some(Res::Fn(..) | Res::Ctor(..)))
-            || matches!(typed.site_res(&cx.types, SiteKey::ExprRes(callee)), Some(Res::Fn(..) | Res::Ctor(..)));
+        let Expr::Call(callee, _) = body.exprs[expr.0 as usize] else {
+            continue;
+        };
+        let direct = matches!(
+            typed.site_res(&cx.types, SiteKey::ExprRes(expr)),
+            Some(Res::Fn(..) | Res::Ctor(..))
+        ) || matches!(
+            typed.site_res(&cx.types, SiteKey::ExprRes(callee)),
+            Some(Res::Fn(..) | Res::Ctor(..))
+        );
         if !direct {
             return true;
         }
@@ -87,7 +118,11 @@ enum ItemUnwind {
     Foreign(bool),
 }
 
-fn item_unwind(cx: &Context<'_>, item: ItemRef, cache: &mut FxHashMap<ItemRef, ItemUnwind>) -> ItemUnwind {
+fn item_unwind(
+    cx: &Context<'_>,
+    item: ItemRef,
+    cache: &mut FxHashMap<ItemRef, ItemUnwind>,
+) -> ItemUnwind {
     *cache.entry(item).or_insert_with(|| {
         if let Some(intr) = cx.intrinsic(item) {
             ItemUnwind::Intrinsic(intrinsic_may_unwind(intr))

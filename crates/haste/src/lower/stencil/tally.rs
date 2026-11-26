@@ -20,8 +20,19 @@ pub(in crate::lower) enum Tally {
 }
 
 const NAMES: [&str; 13] = [
-    "template_hit", "template_miss", "template_simplify", "template_raced", "unstored_cycle", "unstored_deferred", "devirt_simplify", "trim_partial", "trim_full", "compact_retry", "compact_fit",
-    "template_disk", "template_stale",
+    "template_hit",
+    "template_miss",
+    "template_simplify",
+    "template_raced",
+    "unstored_cycle",
+    "unstored_deferred",
+    "devirt_simplify",
+    "trim_partial",
+    "trim_full",
+    "compact_retry",
+    "compact_fit",
+    "template_disk",
+    "template_stale",
 ];
 static COUNTS: [AtomicUsize; NAMES.len()] = [const { AtomicUsize::new(0) }; NAMES.len()];
 

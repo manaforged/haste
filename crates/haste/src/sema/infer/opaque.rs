@@ -43,17 +43,27 @@ impl<'a> Infer<'_, 'a> {
 
     pub(super) fn is_pending_opaque(&self, ty: Ty) -> bool {
         let ty = self.resolve(ty);
-        self.opaques.iter().any(|opaque| self.resolve(opaque.ret) == ty)
+        self.opaques
+            .iter()
+            .any(|opaque| self.resolve(opaque.ret) == ty)
     }
 
     /// The trait bounds of the pending `impl Trait` return value `ty` and the supertrait bounds they imply, each with `Self` first.
     pub(super) fn opaque_bounds(&mut self, ty: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
-        let bounds = self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).map(|opaque| opaque.bounds.clone()).unwrap_or_default();
+        let bounds = self
+            .opaques
+            .iter()
+            .find(|opaque| self.resolve(opaque.ret) == ty)
+            .map(|opaque| opaque.bounds.clone())
+            .unwrap_or_default();
         self.expand_super_bounds(bounds)
     }
 
     /// Expands `bounds` with all supertrait bounds they transitively imply, keeping `Self` first in each entry.
-    pub(super) fn expand_super_bounds(&mut self, mut bounds: Vec<(ItemRef, Vec<Ty>)>) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+    pub(super) fn expand_super_bounds(
+        &mut self,
+        mut bounds: Vec<(ItemRef, Vec<Ty>)>,
+    ) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut at = 0;
         while at < bounds.len() {
             let (of, substs) = bounds[at].clone();
@@ -78,7 +88,12 @@ impl<'a> Infer<'_, 'a> {
 
     /// Ties `substs` of trait `of`, whose `Self` is a pending `impl Trait` value, to the one bound of it of that trait: whether they unify, or none when it has no one such bound.
     pub(super) fn opaque_holds(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Option<bool>> {
-        let held: Vec<Vec<Ty>> = self.opaque_bounds(self.resolve(substs[0]))?.into_iter().filter(|(bound, _)| *bound == of).map(|(_, types)| types).collect();
+        let held: Vec<Vec<Ty>> = self
+            .opaque_bounds(self.resolve(substs[0]))?
+            .into_iter()
+            .filter(|(bound, _)| *bound == of)
+            .map(|(_, types)| types)
+            .collect();
         if held.is_empty()
             && substs.len() == 1
             && let Some(iter_trait) = self.into_iter_blanket_trait(of)
@@ -86,7 +101,13 @@ impl<'a> Infer<'_, 'a> {
             return self.opaque_holds(iter_trait, substs);
         }
         let [types] = &held[..] else { return Ok(None) };
-        let tied = self.trial(|infer| Ok(substs.iter().zip(types).all(|(&a, &b)| infer.unifies(a, b)).then_some(())))?;
+        let tied = self.trial(|infer| {
+            Ok(substs
+                .iter()
+                .zip(types)
+                .all(|(&a, &b)| infer.unifies(a, b))
+                .then_some(()))
+        })?;
         Ok(Some(tied.is_some()))
     }
 
@@ -97,7 +118,13 @@ impl<'a> Infer<'_, 'a> {
         }
         let mut at = 0;
         while at < self.opaques.len() {
-            let Opaque { item, substs, ret, output, .. } = self.opaques[at].clone();
+            let Opaque {
+                item,
+                substs,
+                ret,
+                output,
+                ..
+            } = self.opaques[at].clone();
             if !force && substs.iter().any(|ty| self.has_vars(*ty)) {
                 at += 1;
                 continue;
@@ -142,7 +169,9 @@ impl<'a> Infer<'_, 'a> {
         if self.poly.is_some() {
             return;
         }
-        let (Some(own), Some(own_ret)) = (self.instance, self.out.ret) else { return };
+        let (Some(own), Some(own_ret)) = (self.instance, self.out.ret) else {
+            return;
+        };
         if matches!(self.cx.types.kind(self.resolve(own_ret)), Kind::Var(_)) {
             return;
         }
@@ -167,19 +196,47 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn share_ready_closures(&mut self, own: (ItemRef, Substs)) {
-        let locals: Vec<Local> = self.out.locals.clone().into_iter().map(|local| Local { ty: self.zonk(local.ty) }).collect();
+        let locals: Vec<Local> = self
+            .out
+            .locals
+            .clone()
+            .into_iter()
+            .map(|local| Local {
+                ty: self.zonk(local.ty),
+            })
+            .collect();
         let mut closures = self.out.closures.clone();
-        closures.values_mut().for_each(|closure| closure.ret = self.zonk(closure.ret));
+        closures
+            .values_mut()
+            .for_each(|closure| closure.ret = self.zonk(closure.ret));
         let ready = |closure: &Closure| {
-            let held = closure.params.iter().copied().chain(closure.captures.iter().map(|capture| capture.local));
-            !held.map(|local| locals[local as usize].ty).chain([closure.ret]).any(|ty| self.has_vars(ty))
+            let held = closure
+                .params
+                .iter()
+                .copied()
+                .chain(closure.captures.iter().map(|capture| capture.local));
+            !held
+                .map(|local| locals[local as usize].ty)
+                .chain([closure.ret])
+                .any(|ty| self.has_vars(ty))
         };
         closures.retain(|_, closure| ready(closure));
         if closures.is_empty() {
             return;
         }
-        let tables = super::LazyTables::Eager(std::sync::Arc::new(BodyTables { closures: PackedMap::pack(closures), ..BodyTables::default() }));
-        super::closure::register(self.cx, own, &Typed { tables, locals, ..Typed::default() });
+        let tables = super::LazyTables::Eager(std::sync::Arc::new(BodyTables {
+            closures: PackedMap::pack(closures),
+            ..BodyTables::default()
+        }));
+        super::closure::register(
+            self.cx,
+            own,
+            &Typed {
+                tables,
+                locals,
+                ..Typed::default()
+            },
+        );
     }
 
     /// Holds the hidden type of each `impl Trait` in this function's return type to its bounds, tying the associated types they name, as `Output = T`, and their trait arguments, which rustc reads to infer the body.
@@ -193,7 +250,10 @@ impl<'a> Infer<'_, 'a> {
                 crate::body::Ty::ImplTrait(token, bounds) if token == at => Some(bounds),
                 _ => None,
             });
-            for &bound in bounds.map(|bounds| sig.body.list(bounds)).unwrap_or_default() {
+            for &bound in bounds
+                .map(|bounds| sig.body.list(bounds))
+                .unwrap_or_default()
+            {
                 let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else {
                     continue;
                 };
@@ -202,7 +262,8 @@ impl<'a> Infer<'_, 'a> {
                 }
                 let args = self.bound_args(of, &sig.body, path, hidden)?;
                 self.bindings_hold(&sig.body, path, (of, hidden, &args))?;
-                self.obligations.push((of, std::iter::once(hidden).chain(args).collect()));
+                self.obligations
+                    .push((of, std::iter::once(hidden).chain(args).collect()));
             }
         }
         Ok(())
@@ -213,14 +274,26 @@ impl<'a> Infer<'_, 'a> {
         self.opaques
             .iter()
             .find(|opaque| self.resolve(opaque.ret) == ty)
-            .and_then(|opaque| opaque.output.or_else(|| opaque.bindings.iter().find(|(of, name, _)| self.cx.lang(*of) == Some("future_trait") && name == "Output").map(|&(_, _, out)| out)))
+            .and_then(|opaque| {
+                opaque.output.or_else(|| {
+                    opaque
+                        .bindings
+                        .iter()
+                        .find(|(of, name, _)| {
+                            self.cx.lang(*of) == Some("future_trait") && name == "Output"
+                        })
+                        .map(|&(_, _, out)| out)
+                })
+            })
     }
 
     /// The supertraits of `of` in vtable order, each paired with whether `of`'s parameters uniquely fix its type arguments.
     pub(in crate::sema) fn vtable_traits(&mut self, of: ItemRef) -> Result<Vec<(ItemRef, bool)>> {
         let traits = self.implied_traits(vec![of])?;
         let count = super::scope::type_params(&self.cx.trait_generics(of)?.1.params).count();
-        let initial: Vec<_> = (0..=count).map(|at| self.cx.types.intern(Kind::Value(at as u128))).collect();
+        let initial: Vec<_> = (0..=count)
+            .map(|at| self.cx.types.intern(Kind::Value(at as u128)))
+            .collect();
         let bounds = self.expand_super_bounds(vec![(of, initial)])?;
         Ok(traits
             .into_iter()
@@ -236,9 +309,16 @@ impl<'a> Infer<'_, 'a> {
 
     /// The associated type `name` of trait `of` that a bound of the pending `impl Trait` return `ty` fixes.
     pub(super) fn opaque_binding(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
-        let bindings = self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).map(|opaque| opaque.bindings.clone()).unwrap_or_default();
+        let bindings = self
+            .opaques
+            .iter()
+            .find(|opaque| self.resolve(opaque.ret) == ty)
+            .map(|opaque| opaque.bindings.clone())
+            .unwrap_or_default();
         for (bound_of, bound_name, out) in bindings {
-            if bound_name == name && (bound_of == of || self.implied_traits(vec![bound_of])?.contains(&of)) {
+            if bound_name == name
+                && (bound_of == of || self.implied_traits(vec![bound_of])?.contains(&of))
+            {
                 return Ok(Some(out));
             }
         }
@@ -255,40 +335,74 @@ impl<'a> Infer<'_, 'a> {
 
     /// The function pointer type of the `Fn` bound on the pending `impl Trait` return value `ty`.
     pub(super) fn opaque_sig(&self, ty: Ty) -> Option<Ty> {
-        self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).and_then(|opaque| opaque.sig)
+        self.opaques
+            .iter()
+            .find(|opaque| self.resolve(opaque.ret) == ty)
+            .and_then(|opaque| opaque.sig)
     }
 
     /// Unifies the parameter types of a callable `impl Trait` return signature `sig` with the `Args` tuple in `args` when `of` is a callable trait.
-    pub(super) fn tie_callable_opaque(&mut self, of: ItemRef, sig: Ty, args: &[Ty]) -> Result<Option<bool>> {
+    pub(super) fn tie_callable_opaque(
+        &mut self,
+        of: ItemRef,
+        sig: Ty,
+        args: &[Ty],
+    ) -> Result<Option<bool>> {
         if !self.is_sync_callable_trait(of) {
             return Ok(None);
         }
-        let Kind::FnPtr(params, _) = *self.cx.types.kind(sig) else { return Ok(None) };
-        let Some(&tuple) = args.first() else { return Ok(None) };
-        let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(tuple)) else { return Ok(None) };
+        let Kind::FnPtr(params, _) = *self.cx.types.kind(sig) else {
+            return Ok(None);
+        };
+        let Some(&tuple) = args.first() else {
+            return Ok(None);
+        };
+        let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(tuple)) else {
+            return Ok(None);
+        };
         let params = self.cx.types.substs(params).to_vec();
         let inputs = self.cx.types.substs(inputs).to_vec();
         if params.len() != inputs.len() {
             return Ok(Some(false));
         }
         let mark = self.mark_vars();
-        if params.into_iter().zip(inputs).all(|(p, i)| self.unify(p, i).is_ok()) {
+        if params
+            .into_iter()
+            .zip(inputs)
+            .all(|(p, i)| self.unify(p, i).is_ok())
+        {
             return Ok(Some(true));
         }
         self.rollback_vars(mark);
         Ok(Some(false))
     }
 
-    pub(super) fn callable_opaque_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Result<bool> {
-        let Some(sig) = self.opaque_sig(self.resolve(ty)) else { return Ok(false) };
-        if let Some(held) = self.tie_callable_opaque(of, sig, args)? { return Ok(held); }
-        let Ok([(_, vars)]) = <[_; 1]>::try_from(self.applicable(of, sig, args, 0)?) else { return Ok(false) };
+    pub(super) fn callable_opaque_holds(
+        &mut self,
+        of: ItemRef,
+        ty: Ty,
+        args: &[Ty],
+    ) -> Result<bool> {
+        let Some(sig) = self.opaque_sig(self.resolve(ty)) else {
+            return Ok(false);
+        };
+        if let Some(held) = self.tie_callable_opaque(of, sig, args)? {
+            return Ok(held);
+        }
+        let Ok([(_, vars)]) = <[_; 1]>::try_from(self.applicable(of, sig, args, 0)?) else {
+            return Ok(false);
+        };
         self.adopt(vars);
         Ok(true)
     }
 
     /// The callable trait and function pointer type that the first callable bound among `bounds` in `arena` spells, read through `frame`.
-    pub(super) fn first_callable_bound(&mut self, frame: Frame<'a>, arena: &Body, bounds: Vec<u32>) -> Result<Option<(ItemRef, Ty)>> {
+    pub(super) fn first_callable_bound(
+        &mut self,
+        frame: Frame<'a>,
+        arena: &Body,
+        bounds: Vec<u32>,
+    ) -> Result<Option<(ItemRef, Ty)>> {
         let home = frame.home;
         self.with_frame(frame, |infer| {
             for bound in bounds {
@@ -301,11 +415,17 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The callable trait and function pointer type that a callable bound on the outer parameter `name` spells in a header of the frame.
-    pub(super) fn header_callable_bound(&mut self, name: &str, _home: ModRef) -> Result<Option<(ItemRef, Ty)>> {
+    pub(super) fn header_callable_bound(
+        &mut self,
+        name: &str,
+        _home: ModRef,
+    ) -> Result<Option<(ItemRef, Ty)>> {
         for (header, src, home) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
             for bound in super::scope::named_bounds(arena, src, (generics, predicates), name) {
-                if let Some(hint) = self.in_source_home(src, home, |infer| infer.callable_bound(arena, home, bound))? {
+                if let Some(hint) = self
+                    .in_source_home(src, home, |infer| infer.callable_bound(arena, home, bound))?
+                {
                     return Ok(Some(hint));
                 }
             }
@@ -320,7 +440,8 @@ impl<'a> Infer<'_, 'a> {
 
     /// The function pointer type that an `impl Fn(A) -> B` return type of `sig` spells in the current frame.
     pub(super) fn ret_fn_sig(&mut self, sig: &Signature) -> Result<Option<Ty>> {
-        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else {
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret))
+        else {
             return Ok(None);
         };
         for &bound in sig.body.list(bounds) {
@@ -334,8 +455,13 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The trait bounds other than sync `Fn` that an `impl Trait` return type of `sig` spells in the current frame, each with `ret` as `Self`.
-    pub(super) fn ret_bounds(&mut self, sig: &Signature, ret: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
-        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else {
+    pub(super) fn ret_bounds(
+        &mut self,
+        sig: &Signature,
+        ret: Ty,
+    ) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret))
+        else {
             return Ok(Vec::new());
         };
         let mut found = Vec::new();
@@ -354,7 +480,8 @@ impl<'a> Infer<'_, 'a> {
 
     /// The associated type bindings that an `impl Trait` return type of `sig` spells in the current frame.
     pub(super) fn ret_bindings(&mut self, sig: &Signature) -> Result<Vec<(ItemRef, String, Ty)>> {
-        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else {
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret))
+        else {
             return Ok(Vec::new());
         };
         let mut found = Vec::new();
@@ -372,7 +499,12 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The callable trait and `FnPtr` signature that `bound` in `arena` spells from `home`.
-    pub(super) fn callable_bound(&mut self, arena: &Body, home: ModRef, bound: u32) -> Result<Option<(ItemRef, Ty)>> {
+    pub(super) fn callable_bound(
+        &mut self,
+        arena: &Body,
+        home: ModRef,
+        bound: u32,
+    ) -> Result<Option<(ItemRef, Ty)>> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(None);
         };
@@ -394,15 +526,28 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The inputs and output that the angle form `FnOnce<(A, B), Output = R>` of callable trait `of` names, once its argument tuple is known.
-    fn angle_sig(&mut self, arena: &Body, (of, path): (ItemRef, PathId)) -> Result<Option<(Vec<Ty>, Ty)>> {
+    fn angle_sig(
+        &mut self,
+        arena: &Body,
+        (of, path): (ItemRef, PathId),
+    ) -> Result<Option<(Vec<Ty>, Ty)>> {
         let self_ty = self.fresh(Kind::Var);
         let Some(&tuple) = self.bound_args(of, arena, path, self_ty)?.first() else {
             return Ok(None);
         };
-        let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(tuple)) else { return Ok(None) };
+        let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(tuple)) else {
+            return Ok(None);
+        };
         let inputs = self.cx.types.substs(inputs).to_vec();
-        let output = self.path_bindings(arena, path)?.into_iter().find(|(name, _)| name == "Output").map(|(_, ty)| ty);
-        Ok(Some((inputs, output.unwrap_or_else(|| self.fresh(Kind::Var)))))
+        let output = self
+            .path_bindings(arena, path)?
+            .into_iter()
+            .find(|(name, _)| name == "Output")
+            .map(|(_, ty)| ty);
+        Ok(Some((
+            inputs,
+            output.unwrap_or_else(|| self.fresh(Kind::Var)),
+        )))
     }
 }
 
@@ -413,7 +558,9 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> R
     }
     if let Some(typed) = cx.store.finals.get(&(item, substs)) {
         super::closure::register(cx, (item, substs), &typed);
-        return typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)));
+        return typed
+            .ret
+            .ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)));
     }
     let reveals = cx.store.lookups.reveals.clone();
     reveals.run(
@@ -425,7 +572,9 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> R
             cx.store.lookups.provisional_rets.remove(&(item, substs));
             let typed = typed.map_err(|msg| anyhow!("{msg}"))?;
             super::closure::register(cx, (item, substs), &typed);
-            typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))
+            typed
+                .ret
+                .ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))
         },
         |cx| {
             if let Some(future) = async_future(cx, item, substs)? {
@@ -435,7 +584,10 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> R
                 return Ok(found);
             }
             OPAQUE_CYCLED.set(true);
-            Err(anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item)))
+            Err(anyhow!(
+                "the `impl Trait` return type of `{}` depends on itself",
+                cx.name(item)
+            ))
         },
     )
 }
@@ -445,7 +597,10 @@ fn async_future(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<O
     if !cx.signature(item)?.is_async {
         return Ok(None);
     }
-    let root = cx.body(item)?.root.ok_or_else(|| anyhow!("`{}` has no body", cx.name(item)))?;
+    let root = cx
+        .body(item)?
+        .root
+        .ok_or_else(|| anyhow!("`{}` has no body", cx.name(item)))?;
     Ok(Some(cx.types.intern(Kind::Closure(item, substs, root.0))))
 }
 
@@ -454,11 +609,24 @@ pub(super) fn opaque_definer(cx: &Context<'_>, alias: ItemRef) -> Option<ItemRef
     let (src, entry) = cx.item(alias);
     let name = crate::names::plain(src.text(entry.name?));
     let items = &cx.file(alias).items.items;
-    let definers = items.iter().enumerate().filter(|(_, item)| item.kind == crate::outline::item::ItemKind::Fn).map(|(at, _)| ItemRef { item: at as u32, ..alias });
-    definers.into_iter().find(|&candidate| cx.attr_at(candidate, "define_opaque").is_some_and(|at| src.text(at + 2) == name))
+    let definers = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.kind == crate::outline::item::ItemKind::Fn)
+        .map(|(at, _)| ItemRef {
+            item: at as u32,
+            ..alias
+        });
+    definers.into_iter().find(|&candidate| {
+        cx.attr_at(candidate, "define_opaque")
+            .is_some_and(|at| src.text(at + 2) == name)
+    })
 }
 
 fn holds_closure(cx: &Context<'_>, ty: Ty, (item, args): (ItemRef, Substs)) -> bool {
     let kind = cx.types.kind(ty);
-    matches!(kind, Kind::Closure(parent, substs, _) if *parent == item && *substs == args) || kind.children(&cx.types).any(|child| holds_closure(cx, child, (item, args)))
+    matches!(kind, Kind::Closure(parent, substs, _) if *parent == item && *substs == args)
+        || kind
+            .children(&cx.types)
+            .any(|child| holds_closure(cx, child, (item, args)))
 }

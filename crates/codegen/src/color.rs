@@ -15,18 +15,30 @@ pub(crate) struct Webs {
 impl Webs {
     /// One web per value of `count` values.
     pub(crate) fn new(count: usize) -> Self {
-        Webs { root: (0..count).collect(), members: vec![Vec::new(); count] }
+        Webs {
+            root: (0..count).collect(),
+            members: vec![Vec::new(); count],
+        }
     }
 
     fn members(&self, root: usize) -> &[usize] {
-        if self.members[root].is_empty() { std::slice::from_ref(&self.root[root]) } else { &self.members[root] }
+        if self.members[root].is_empty() {
+            std::slice::from_ref(&self.root[root])
+        } else {
+            &self.members[root]
+        }
     }
 
     /// Whether the webs of `a` and `b` are one web or can join: together they stay small and hold no two values live at once.
     pub(crate) fn fits(&self, live: &Live, a: usize, b: usize) -> bool {
         let (left, right) = (self.members(self.root[a]), self.members(self.root[b]));
         self.root[a] == self.root[b]
-            || (left.len() + right.len() <= MAX_WEB && left.iter().all(|&x| right.iter().all(|&y| !overlaps(live.ranges_of(x), live.ranges_of(y)))))
+            || (left.len() + right.len() <= MAX_WEB
+                && left.iter().all(|&x| {
+                    right
+                        .iter()
+                        .all(|&y| !overlaps(live.ranges_of(x), live.ranges_of(y)))
+                }))
     }
 
     /// Joins the webs of `a` and `b`.
@@ -35,7 +47,11 @@ impl Webs {
         if keep == gone {
             return;
         }
-        let moved = if self.members[gone].is_empty() { vec![gone] } else { std::mem::take(&mut self.members[gone]) };
+        let moved = if self.members[gone].is_empty() {
+            vec![gone]
+        } else {
+            std::mem::take(&mut self.members[gone])
+        };
         if self.members[keep].is_empty() {
             self.members[keep].push(keep);
         }
@@ -45,24 +61,53 @@ impl Webs {
 }
 
 /// Whether `value` takes a frame home that a web may share: it lives in the frame, is not kept alone, and is live somewhere.
-pub(crate) fn shareable<R>(live: &Live, locations: &[Location<R>], alone: &[bool], value: usize) -> bool {
+pub(crate) fn shareable<R>(
+    live: &Live,
+    locations: &[Location<R>],
+    alone: &[bool],
+    value: usize,
+) -> bool {
     !alone[value] && matches!(locations[value], Location::Slot) && live.bounds(value).is_some()
 }
 
-pub(crate) fn share<R>(func: &Function, live: &Live, locations: &[Location<R>], alone: &[bool], webs: &Webs) -> Vec<Option<u32>> {
+pub(crate) fn share<R>(
+    func: &Function,
+    live: &Live,
+    locations: &[Location<R>],
+    alone: &[bool],
+    webs: &Webs,
+) -> Vec<Option<u32>> {
     let memory = |value: usize| shareable(live, locations, alone, value);
     let span = |root: usize| {
-        webs.members(root).iter().filter(|&&value| memory(value)).filter_map(|&value| live.bounds(value)).reduce(|(start, end), (s, e)| (start.min(s), end.max(e)))
+        webs.members(root)
+            .iter()
+            .filter(|&&value| memory(value))
+            .filter_map(|&value| live.bounds(value))
+            .reduce(|(start, end), (s, e)| (start.min(s), end.max(e)))
     };
-    let mut units: Vec<(u32, u32, usize)> = (0..locations.len()).filter(|&value| webs.root[value] == value).filter_map(|root| span(root).map(|(start, end)| (start, end, root))).collect();
+    let mut units: Vec<(u32, u32, usize)> = (0..locations.len())
+        .filter(|&value| webs.root[value] == value)
+        .filter_map(|root| span(root).map(|(start, end)| (start, end, root)))
+        .collect();
     units.sort_unstable();
     let mut homes = vec![None; locations.len()];
     let mut sizes: Vec<u32> = Vec::new();
     let mut holders: Vec<Vec<usize>> = Vec::new();
     for (start, _, root) in units {
-        let members: Vec<usize> = webs.members(root).iter().copied().filter(|&value| memory(value)).collect();
+        let members: Vec<usize> = webs
+            .members(root)
+            .iter()
+            .copied()
+            .filter(|&value| memory(value))
+            .collect();
         let size = round(func.types[root].bytes(), WORD);
-        let clear = |list: &[usize]| list.iter().all(|&other| members.iter().all(|&value| !overlaps(live.ranges_of(other), live.ranges_of(value))));
+        let clear = |list: &[usize]| {
+            list.iter().all(|&other| {
+                members
+                    .iter()
+                    .all(|&value| !overlaps(live.ranges_of(other), live.ranges_of(value)))
+            })
+        };
         let mut chosen = None;
         for (home, list) in holders.iter_mut().enumerate() {
             if sizes[home] != size {

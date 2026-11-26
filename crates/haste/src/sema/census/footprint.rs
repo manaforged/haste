@@ -13,7 +13,10 @@ use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
 use super::calls::{collect_calls, hash_control_and_coercions};
-use super::digest::{Digest, Mix, TraitFacts, hash_num_tag, hash_repr, hash_signature, hash_unsized_kind, inline_flags, outer_shape_digest};
+use super::digest::{
+    Digest, Mix, TraitFacts, hash_num_tag, hash_repr, hash_signature, hash_unsized_kind,
+    inline_flags, outer_shape_digest,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct Edge {
@@ -73,7 +76,16 @@ pub(super) struct HashBins {
 
 impl HashBins {
     fn new() -> Self {
-        Self { k: Mix::new(1), d: Mix::new(2), d_slots: 0, niche: Mix::new(3), offset: Mix::new(4), assoc_abi: Mix::new(5), spec_callee: Mix::new(6), reflection: Mix::new(7) }
+        Self {
+            k: Mix::new(1),
+            d: Mix::new(2),
+            d_slots: 0,
+            niche: Mix::new(3),
+            offset: Mix::new(4),
+            assoc_abi: Mix::new(5),
+            spec_callee: Mix::new(6),
+            reflection: Mix::new(7),
+        }
     }
 }
 
@@ -95,7 +107,8 @@ pub(super) fn analyze_all(cx: &mut Context<'_>, reached: &Reached) -> Vec<Instan
             out.push(InstanceRecord::default());
             continue;
         }
-        let (k_inline, d_inline, reflection, d_slots) = resolve_inline(index, &bases, &mut memo, &mut visiting_set);
+        let (k_inline, d_inline, reflection, d_slots) =
+            resolve_inline(index, &bases, &mut memo, &mut visiting_set);
         out.push(InstanceRecord {
             valid: true,
             foreign: base.foreign,
@@ -116,7 +129,12 @@ pub(super) fn analyze_all(cx: &mut Context<'_>, reached: &Reached) -> Vec<Instan
     out
 }
 
-fn resolve_inline(index: usize, bases: &[BaseRecord], memo: &mut [Option<InlineMemo>], visiting_set: &mut FxHashSet<usize>) -> InlineMemo {
+fn resolve_inline(
+    index: usize,
+    bases: &[BaseRecord],
+    memo: &mut [Option<InlineMemo>],
+    visiting_set: &mut FxHashSet<usize>,
+) -> InlineMemo {
     if let Some(found) = memo[index] {
         return found;
     }
@@ -158,12 +176,36 @@ fn resolve_inline(index: usize, bases: &[BaseRecord], memo: &mut [Option<InlineM
 }
 
 fn empty_base() -> BaseRecord {
-    BaseRecord { valid: false, foreign: false, generic: false, inlined: false, expr_count: 0, outer_shape: Digest::default(), k_base: Digest::default(), d_base: Digest::default(), d_slots: 0, niche: Digest::default(), offset: Digest::default(), assoc_abi: Digest::default(), spec_callee: Digest::default(), reflection: Digest::default(), edges: Vec::new() }
+    BaseRecord {
+        valid: false,
+        foreign: false,
+        generic: false,
+        inlined: false,
+        expr_count: 0,
+        outer_shape: Digest::default(),
+        k_base: Digest::default(),
+        d_base: Digest::default(),
+        d_slots: 0,
+        niche: Digest::default(),
+        offset: Digest::default(),
+        assoc_abi: Digest::default(),
+        spec_callee: Digest::default(),
+        reflection: Digest::default(),
+        edges: Vec::new(),
+    }
 }
 
-fn analyze_base(cx: &mut Context<'_>, reached: &Reached, index: usize, inlined: bool, facts: &mut TraitFacts) -> BaseRecord {
+fn analyze_base(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    index: usize,
+    inlined: bool,
+    facts: &mut TraitFacts,
+) -> BaseRecord {
     let ((item, substs), result) = &reached.list[index];
-    let Ok(typed) = result else { return empty_base() };
+    let Ok(typed) = result else {
+        return empty_base();
+    };
     let typed = typed.scoped(&cx.types);
     let typed: &Typed = &typed;
     let generic = !substs.is_empty();
@@ -172,9 +214,20 @@ fn analyze_base(cx: &mut Context<'_>, reached: &Reached, index: usize, inlined: 
         k.byte(0xff);
         k.item(*item);
         d.item(*item);
-        return BaseRecord { valid: true, foreign: true, generic, k_base: k.finish(), d_base: d.finish(), ..empty_base() };
+        return BaseRecord {
+            valid: true,
+            foreign: true,
+            generic,
+            k_base: k.finish(),
+            d_base: d.finish(),
+            ..empty_base()
+        };
     }
-    let outer_shape = if generic { outer_shape_digest(cx, *substs) } else { Digest::default() };
+    let outer_shape = if generic {
+        outer_shape_digest(cx, *substs)
+    } else {
+        Digest::default()
+    };
     let source = match &typed.shape {
         Shape::Closure(closure) => closure.parent,
         _ => *item,
@@ -235,7 +288,9 @@ pub(super) fn hash_type_use(cx: &mut Context<'_>, ty: Ty, bins: &mut HashBins) {
                 hash_repr(&er, &mut bins.k);
             }
         }
-        Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if cx.is_unsized(pointee).unwrap_or(false) => {
+        Kind::Ref(_, pointee) | Kind::Ptr(_, pointee)
+            if cx.is_unsized(pointee).unwrap_or(false) =>
+        {
             bins.k.byte(2);
             hash_unsized_kind(cx, pointee, &mut bins.k);
         }
@@ -247,7 +302,13 @@ pub(super) fn hash_type_use(cx: &mut Context<'_>, ty: Ty, bins: &mut HashBins) {
     }
 }
 
-fn hash_enum_encoding(cx: &mut Context<'_>, item: ItemRef, ty: Ty, repr: &Repr, bins: &mut HashBins) {
+fn hash_enum_encoding(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    ty: Ty,
+    repr: &Repr,
+    bins: &mut HashBins,
+) {
     let Ok(layout) = cx.layout(ty) else { return };
     hash_repr(repr, &mut bins.niche);
     bins.niche.u64(layout.size.bytes());
@@ -263,7 +324,12 @@ fn hash_enum_encoding(cx: &mut Context<'_>, item: ItemRef, ty: Ty, repr: &Repr, 
             bins.niche.byte(1);
             bins.niche.usize(index.index());
         }
-        Variants::Multiple { tag, tag_encoding, tag_field, .. } => {
+        Variants::Multiple {
+            tag,
+            tag_encoding,
+            tag_field,
+            ..
+        } => {
             let offset = layout.fields.offset(tag_field.index()).bytes() as i32;
             let tag_bytes = target().map_or(0, |dl| tag.size(dl).bytes());
             let signed = matches!(tag.primitive(), AbiPrim::Int(_, true));
@@ -278,7 +344,12 @@ fn hash_enum_encoding(cx: &mut Context<'_>, item: ItemRef, ty: Ty, repr: &Repr, 
     }
 }
 
-fn hash_tag_encoding(cx: &mut Context<'_>, item: ItemRef, encoding: &TagEncoding<crate::sema::layout::Variant>, bins: &mut HashBins) {
+fn hash_tag_encoding(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    encoding: &TagEncoding<crate::sema::layout::Variant>,
+    bins: &mut HashBins,
+) {
     match encoding {
         TagEncoding::Direct => {
             bins.k.byte(0);
@@ -292,7 +363,11 @@ fn hash_tag_encoding(cx: &mut Context<'_>, item: ItemRef, encoding: &TagEncoding
                 }
             }
         }
-        TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+        TagEncoding::Niche {
+            untagged_variant,
+            niche_variants,
+            niche_start,
+        } => {
             for out in [&mut bins.k, &mut bins.niche] {
                 out.byte(1);
                 out.usize(untagged_variant.index());
@@ -312,24 +387,34 @@ fn hash_header(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, bins: &mut Ha
     };
     bins.k.flag(static_item);
     bins.k.flag(cx.overflow_checks(source.krate));
-    let sig = if static_item { lower::signature_of(cx, None, []) } else { lower::signature(cx, typed) };
+    let sig = if static_item {
+        lower::signature_of(cx, None, [])
+    } else {
+        lower::signature(cx, typed)
+    };
     if let Ok(sig) = sig {
         hash_signature(&sig, &mut bins.k);
     }
     for &param in &typed.params {
         let ty = typed.locals[param as usize].ty;
         hash_type_use(cx, ty, bins);
-        bins.k.byte(lower::passed_parts(cx, ty).ok().flatten().map_or(0, |parts| match parts {
-            lower::Parts::One(_) => 1,
-            lower::Parts::Pair(..) => 2,
-            lower::Parts::Bytes => 3,
-            lower::Parts::Words(_, len) => 3 + len,
-        }));
+        bins.k.byte(
+            lower::passed_parts(cx, ty)
+                .ok()
+                .flatten()
+                .map_or(0, |parts| match parts {
+                    lower::Parts::One(_) => 1,
+                    lower::Parts::Pair(..) => 2,
+                    lower::Parts::Bytes => 3,
+                    lower::Parts::Words(_, len) => 3 + len,
+                }),
+        );
     }
     if let Some(ret) = typed.ret {
         hash_type_use(cx, ret, bins);
         bins.k.flag(matches!(cx.types.kind(ret), Kind::Never));
-        bins.k.flag(lower::passed_parts(cx, ret).ok().flatten().is_some());
+        bins.k
+            .flag(lower::passed_parts(cx, ret).ok().flatten().is_some());
     }
     hash_shape_kind(cx, typed, bins);
 }
@@ -439,12 +524,20 @@ fn body_arena(cx: &mut Context<'_>, item: ItemRef, typed: &Typed) -> Option<Aren
     cx.body(source).ok().map(Arena::Body)
 }
 
-fn hash_body_ast(cx: &mut Context<'_>, reached: &Reached, item: ItemRef, typed: &Typed, bins: &mut HashBins) {
+fn hash_body_ast(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    item: ItemRef,
+    typed: &Typed,
+    bins: &mut HashBins,
+) {
     bins.k.usize(typed.exprs.len());
     for &ty in &typed.exprs {
         hash_type_use(cx, ty, bins);
     }
-    let Some(arena) = body_arena(cx, item, typed) else { return };
+    let Some(arena) = body_arena(cx, item, typed) else {
+        return;
+    };
     let body = arena.body();
     for (idx, expr) in body.exprs.iter().enumerate() {
         hash_expr_site(cx, (reached, body, typed), (ExprId(idx as u32), expr), bins);
@@ -454,14 +547,23 @@ fn hash_body_ast(cx: &mut Context<'_>, reached: &Reached, item: ItemRef, typed: 
     }
 }
 
-fn hash_expr_site(cx: &mut Context<'_>, (reached, body, typed): (&Reached, &Body, &Typed), (id, expr): (ExprId, &Expr), bins: &mut HashBins) {
-    let Some(&expr_ty) = typed.exprs.get(id.0 as usize) else { return };
+fn hash_expr_site(
+    cx: &mut Context<'_>,
+    (reached, body, typed): (&Reached, &Body, &Typed),
+    (id, expr): (ExprId, &Expr),
+    bins: &mut HashBins,
+) {
+    let Some(&expr_ty) = typed.exprs.get(id.0 as usize) else {
+        return;
+    };
     if expr_ty == Ty::NONE {
         return;
     }
     match *expr {
         Expr::Unary(op, operand) if op != UnOp::Deref => hash_operand_num(cx, typed, operand, bins),
-        Expr::Binary(_, lhs, rhs) | Expr::AssignOp(_, lhs, rhs) if !typed.operators.contains_key(&id) => {
+        Expr::Binary(_, lhs, rhs) | Expr::AssignOp(_, lhs, rhs)
+            if !typed.operators.contains_key(&id) =>
+        {
             hash_operand_num(cx, typed, lhs, bins);
             hash_operand_num(cx, typed, rhs, bins);
         }
@@ -475,11 +577,16 @@ fn hash_expr_site(cx: &mut Context<'_>, (reached, body, typed): (&Reached, &Body
             }
         }
         Expr::Field(base, _) => {
-            if let (Some(&field_idx), Some(container)) = (typed.fields.get(&id), autoderef_ty(cx, reached, typed, id, base)) {
+            if let (Some(&field_idx), Some(container)) = (
+                typed.fields.get(&id),
+                autoderef_ty(cx, reached, typed, id, base),
+            ) {
                 hash_field_at(cx, container, 0, field_idx, bins);
             }
         }
-        Expr::Struct { fields, .. } => hash_struct_lit(cx, (body, typed), (id, expr_ty, fields), bins),
+        Expr::Struct { fields, .. } => {
+            hash_struct_lit(cx, (body, typed), (id, expr_ty, fields), bins)
+        }
         Expr::Call(callee, list) => {
             if let Some(Res::Ctor(_, variant, _)) = typed.res.get(&callee) {
                 for idx in 0..body.list(list).len() {
@@ -497,7 +604,12 @@ fn hash_operand_num(cx: &mut Context<'_>, typed: &Typed, expr: ExprId, bins: &mu
     }
 }
 
-fn hash_struct_lit(cx: &mut Context<'_>, (body, typed): (&Body, &Typed), (id, container, fields): (ExprId, Ty, crate::body::List), bins: &mut HashBins) {
+fn hash_struct_lit(
+    cx: &mut Context<'_>,
+    (body, typed): (&Body, &Typed),
+    (id, container, fields): (ExprId, Ty, crate::body::List),
+    bins: &mut HashBins,
+) {
     let variant = match typed.res.get(&id) {
         Some(Res::Ctor(_, v, _)) => *v,
         _ => 0,
@@ -510,15 +622,24 @@ fn hash_struct_lit(cx: &mut Context<'_>, (body, typed): (&Body, &Typed), (id, co
     }
 }
 
-fn hash_pat_site(cx: &mut Context<'_>, (body, typed): (&Body, &Typed), (id, pat): (PatId, &Pat), bins: &mut HashBins) {
-    let Some(&ty) = typed.pats.get(&id) else { return };
+fn hash_pat_site(
+    cx: &mut Context<'_>,
+    (body, typed): (&Body, &Typed),
+    (id, pat): (PatId, &Pat),
+    bins: &mut HashBins,
+) {
+    let Some(&ty) = typed.pats.get(&id) else {
+        return;
+    };
     let variant = match typed.pat_res.get(&id) {
         Some(Res::Ctor(_, v, _)) => *v,
         _ => 0,
     };
     match *pat {
         Pat::Range { .. } => hash_num_tag(cx, ty, &mut bins.k),
-        Pat::Tuple(items) | Pat::TupleStruct(_, items) => hash_tuple_pat_fields(cx, body, (ty, variant), items, bins),
+        Pat::Tuple(items) | Pat::TupleStruct(_, items) => {
+            hash_tuple_pat_fields(cx, body, (ty, variant), items, bins)
+        }
         Pat::Struct { fields, .. } => {
             for &at in body.list(fields) {
                 let sub = body.field_pats[at as usize].pat;
@@ -531,7 +652,13 @@ fn hash_pat_site(cx: &mut Context<'_>, (body, typed): (&Body, &Typed), (id, pat)
     }
 }
 
-fn autoderef_ty(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, expr: ExprId, base: ExprId) -> Option<Ty> {
+fn autoderef_ty(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    typed: &Typed,
+    expr: ExprId,
+    base: ExprId,
+) -> Option<Ty> {
     let mut ty = *typed.exprs.get(base.0 as usize)?;
     if ty == Ty::NONE {
         return None;
@@ -541,7 +668,9 @@ fn autoderef_ty(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, expr: Ex
         if let Some(Res::Fn(item, substs)) = typed.derefs.get(&(expr, step)) {
             let idx = *reached.index.get(&(*item, *substs))?;
             let ret = reached.list[idx].1.as_ref().ok()?.ret?;
-            let Kind::Ref(_, target_ty) = *cx.types.kind(ret) else { return None };
+            let Kind::Ref(_, target_ty) = *cx.types.kind(ret) else {
+                return None;
+            };
             ty = target_ty;
         } else {
             ty = match cx.types.kind(ty).clone() {
@@ -553,14 +682,24 @@ fn autoderef_ty(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, expr: Ex
     Some(ty)
 }
 
-fn hash_tuple_pat_fields(cx: &mut Context<'_>, body: &Body, (ty, variant): (Ty, u32), items: crate::body::List, bins: &mut HashBins) {
+fn hash_tuple_pat_fields(
+    cx: &mut Context<'_>,
+    body: &Body,
+    (ty, variant): (Ty, u32),
+    items: crate::body::List,
+    bins: &mut HashBins,
+) {
     let subs = body.list(items);
-    let rest_at = subs.iter().position(|&p| matches!(body.pat(PatId(p)), Pat::Rest));
+    let rest_at = subs
+        .iter()
+        .position(|&p| matches!(body.pat(PatId(p)), Pat::Rest));
     let total = match *cx.types.kind(ty) {
         Kind::Tuple(ts) => cx.types.substs(ts).len(),
         Kind::Adt(item, args) => {
             let slice = cx.types.substs(args).to_vec();
-            field_types(cx, item, &slice).map_or(subs.len(), |v| v.get(variant as usize).map_or(subs.len(), Vec::len))
+            field_types(cx, item, &slice).map_or(subs.len(), |v| {
+                v.get(variant as usize).map_or(subs.len(), Vec::len)
+            })
         }
         _ => subs.len(),
     };
@@ -577,7 +716,13 @@ fn hash_tuple_pat_fields(cx: &mut Context<'_>, body: &Body, (ty, variant): (Ty, 
     }
 }
 
-pub(super) fn hash_field_at(cx: &mut Context<'_>, container: Ty, variant: u32, field_idx: u32, bins: &mut HashBins) {
+pub(super) fn hash_field_at(
+    cx: &mut Context<'_>,
+    container: Ty,
+    variant: u32,
+    field_idx: u32,
+    bins: &mut HashBins,
+) {
     if let Ok(layout) = cx.layout(container) {
         let off = field_offset(&layout, variant, field_idx);
         bins.k.i32(off);

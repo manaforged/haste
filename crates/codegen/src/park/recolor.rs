@@ -22,18 +22,29 @@ impl<F: Copy + PartialEq> Join<'_, F> {
         let at = |q: usize| !except.contains(&q) && homes.get(q).copied().flatten() == Some(reg);
         let reuse = reuse_pair(self.hints, self.reverse_reuse, value);
         self.back_partners[value].iter().any(|&q| at(q))
-            || self.hints.partners.is_some_and(|m| m[value].iter().any(|q| at(q.index())))
+            || self
+                .hints
+                .partners
+                .is_some_and(|m| m[value].iter().any(|q| at(q.index())))
             || (self.hints.two_address && reuse.into_iter().flatten().any(|q| at(q.index())))
             || self.pool.passed[value].is_some_and(|(r, _)| r == reg)
     }
 
     fn suits(&self, value: usize, from: usize, to: usize) -> bool {
         let saved = &self.pool.is_saved;
-        !(self.func.types[value].bytes() > 8 && saved[to]) && (saved[to] || !saved[from] || !crosses_call(self.live, value))
+        !(self.func.types[value].bytes() > 8 && saved[to])
+            && (saved[to] || !saved[from] || !crosses_call(self.live, value))
     }
 
-    fn rehome(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), value: usize, partner: usize) -> bool {
-        let Some(to) = homes[partner].and_then(|reg| self.pool.slot_of(reg)) else { return false };
+    fn rehome(
+        &self,
+        (slots, homes): (&mut SlotSet, &mut [Option<F>]),
+        value: usize,
+        partner: usize,
+    ) -> bool {
+        let Some(to) = homes[partner].and_then(|reg| self.pool.slot_of(reg)) else {
+            return false;
+        };
         let chain = self.chain(homes, value);
         self.move_group((slots, homes), &chain, to, partner)
     }
@@ -45,8 +56,15 @@ impl<F: Copy + PartialEq> Join<'_, F> {
         while self.hints.two_address && at < chain.len() && chain.len() < CHAIN {
             let next = chain[at];
             at += 1;
-            for q in reuse_pair(self.hints, self.reverse_reuse, next).into_iter().flatten().map(|q| q.index()) {
-                if !chain.contains(&q) && homes.get(q).copied().flatten().is_some() && homes[q] == homes[value] {
+            for q in reuse_pair(self.hints, self.reverse_reuse, next)
+                .into_iter()
+                .flatten()
+                .map(|q| q.index())
+            {
+                if !chain.contains(&q)
+                    && homes.get(q).copied().flatten().is_some()
+                    && homes[q] == homes[value]
+                {
                     chain.push(q);
                 }
             }
@@ -55,18 +73,35 @@ impl<F: Copy + PartialEq> Join<'_, F> {
     }
 
     /// Moves `value` into register slot `to` when it fits there and leaves no copy with a partner other than `partner` behind.
-    fn move_to(&self, homes: (&mut SlotSet, &mut [Option<F>]), value: usize, to: usize, partner: usize) -> bool {
+    fn move_to(
+        &self,
+        homes: (&mut SlotSet, &mut [Option<F>]),
+        value: usize,
+        to: usize,
+        partner: usize,
+    ) -> bool {
         self.move_group(homes, &[value], to, partner)
     }
 
     /// Moves every value of `group`, which share one register, into register slot `to` when each fits there and none leaves a copy behind with a value outside the group other than `partner`.
-    fn move_group(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), group: &[usize], to: usize, partner: usize) -> bool {
-        let Some(from_reg) = homes[group[0]] else { return false };
-        let Some(from) = self.pool.slot_of(from_reg) else { return false };
+    fn move_group(
+        &self,
+        (slots, homes): (&mut SlotSet, &mut [Option<F>]),
+        group: &[usize],
+        to: usize,
+        partner: usize,
+    ) -> bool {
+        let Some(from_reg) = homes[group[0]] else {
+            return false;
+        };
+        let Some(from) = self.pool.slot_of(from_reg) else {
+            return false;
+        };
         let except: Vec<usize> = group.iter().copied().chain([partner]).collect();
         let fits = |value: usize| {
-            self.live.bounds(value).is_some_and(|(start, _)| slots.free(self.pool, to, self.live.ranges_of(value), start, None))
-                && self.pool.kept[value].is_none()
+            self.live.bounds(value).is_some_and(|(start, _)| {
+                slots.free(self.pool, to, self.live.ranges_of(value), start, None)
+            }) && self.pool.kept[value].is_none()
                 && !self.keeps_copy(homes, value, &except, from_reg)
                 && self.suits(value, from, to)
         };
@@ -83,16 +118,31 @@ impl<F: Copy + PartialEq> Join<'_, F> {
     }
 
     /// Moves the one value that holds `partner`'s register during `value` to another free register, then `value` into that register; undoes the first move when the second fails.
-    fn evict(&self, (slots, homes): (&mut SlotSet, &mut [Option<F>]), value: usize, partner: usize) -> bool {
-        let Some(to) = homes[partner].and_then(|reg| self.pool.slot_of(reg)) else { return false };
+    fn evict(
+        &self,
+        (slots, homes): (&mut SlotSet, &mut [Option<F>]),
+        value: usize,
+        partner: usize,
+    ) -> bool {
+        let Some(to) = homes[partner].and_then(|reg| self.pool.slot_of(reg)) else {
+            return false;
+        };
         let mut blockers = Vec::new();
         slots.collect_overlaps(to, self.live.ranges_of(value), &mut blockers);
         blockers.dedup();
-        let [blocker] = blockers[..] else { return false };
+        let [blocker] = blockers[..] else {
+            return false;
+        };
         if blocker == partner || blocker == value {
             return false;
         }
-        let Some(old) = (0..self.pool.regs.len()).find(|&other| other != to && homes[value] != Some(self.pool.regs[other]) && self.move_to((&mut *slots, &mut *homes), blocker, other, usize::MAX)) else { return false };
+        let Some(old) = (0..self.pool.regs.len()).find(|&other| {
+            other != to
+                && homes[value] != Some(self.pool.regs[other])
+                && self.move_to((&mut *slots, &mut *homes), blocker, other, usize::MAX)
+        }) else {
+            return false;
+        };
         if self.move_to((&mut *slots, &mut *homes), value, to, partner) {
             return true;
         }
@@ -110,7 +160,14 @@ impl<F: Copy + PartialEq> Join<'_, F> {
         out
     }
 
-    fn collect_swap(&self, holders_from: &[usize], holders_to: &[usize], (from, to): (usize, usize), seed: &[usize], anchor: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+    fn collect_swap(
+        &self,
+        holders_from: &[usize],
+        holders_to: &[usize],
+        (from, to): (usize, usize),
+        seed: &[usize],
+        anchor: usize,
+    ) -> Option<(Vec<usize>, Vec<usize>)> {
         let (mut move_from, mut move_to) = (seed.to_vec(), Vec::new());
         let (mut fi, mut ti) = (0, 0);
         while fi < move_from.len() || ti < move_to.len() {
@@ -142,14 +199,21 @@ impl<F: Copy + PartialEq> Join<'_, F> {
         let ok = |list: &[usize], src: usize, dst: usize| {
             list.iter().all(|&h| {
                 self.pool.kept[h].is_none()
-                    && self.live.bounds(h).is_some_and(|(start, _)| slot_accepts(self.pool, dst, self.live.ranges_of(h), start, None))
+                    && self.live.bounds(h).is_some_and(|(start, _)| {
+                        slot_accepts(self.pool, dst, self.live.ranges_of(h), start, None)
+                    })
                     && self.suits(h, src, dst)
             })
         };
         (ok(&move_from, from, to) && ok(&move_to, to, from)).then_some((move_from, move_to))
     }
 
-    fn swap_delta(&self, homes: &[Option<F>], (slot_a, slot_b): (usize, usize), (move_a, move_b): (&[usize], &[usize])) -> i128 {
+    fn swap_delta(
+        &self,
+        homes: &[Option<F>],
+        (slot_a, slot_b): (usize, usize),
+        (move_a, move_b): (&[usize], &[usize]),
+    ) -> i128 {
         let (reg_a, reg_b) = (self.pool.regs[slot_a], self.pool.regs[slot_b]);
         let moved = |v: usize| move_a.contains(&v) || move_b.contains(&v);
         let pair_weight = |u: usize, v: usize| self.hints.weights.map_or(1, |w| w[u].min(w[v]));
@@ -158,7 +222,9 @@ impl<F: Copy + PartialEq> Join<'_, F> {
             if moved(q) {
                 return;
             }
-            let Some(reg_q) = homes.get(q).copied().flatten() else { return };
+            let Some(reg_q) = homes.get(q).copied().flatten() else {
+                return;
+            };
             let w = i128::from(pair_weight(v, q));
             if reg_q == new_v {
                 delta -= w;
@@ -178,7 +244,10 @@ impl<F: Copy + PartialEq> Join<'_, F> {
                     }
                 }
                 if self.hints.two_address {
-                    for q in reuse_pair(self.hints, self.reverse_reuse, v).into_iter().flatten() {
+                    for q in reuse_pair(self.hints, self.reverse_reuse, v)
+                        .into_iter()
+                        .flatten()
+                    {
                         account(v, q.index(), old_v, new_v);
                     }
                 }
@@ -187,15 +256,28 @@ impl<F: Copy + PartialEq> Join<'_, F> {
         delta
     }
 
-    fn swap_slots(&self, slots: &mut SlotSet, homes: &mut [Option<F>], (slot_a, slot_b): (usize, usize), (param, arg): (usize, usize)) -> bool {
+    fn swap_slots(
+        &self,
+        slots: &mut SlotSet,
+        homes: &mut [Option<F>],
+        (slot_a, slot_b): (usize, usize),
+        (param, arg): (usize, usize),
+    ) -> bool {
         if slot_a == slot_b {
             return false;
         }
         let holders_a = Self::slot_holders(slots, slot_a);
         let holders_b = Self::slot_holders(slots, slot_b);
         let mut best: Option<(i128, usize, usize, Vec<usize>, Vec<usize>)> = None;
-        let mut consider = |from: usize, to: usize, holders_from: &[usize], holders_to: &[usize], seed: &[usize], anchor: usize| {
-            if let Some((move_from, move_to)) = self.collect_swap(holders_from, holders_to, (from, to), seed, anchor) {
+        let mut consider = |from: usize,
+                            to: usize,
+                            holders_from: &[usize],
+                            holders_to: &[usize],
+                            seed: &[usize],
+                            anchor: usize| {
+            if let Some((move_from, move_to)) =
+                self.collect_swap(holders_from, holders_to, (from, to), seed, anchor)
+            {
                 let delta = self.swap_delta(homes, (from, to), (&move_from, &move_to));
                 if delta < 0 && best.as_ref().is_none_or(|b| delta < b.0) {
                     best = Some((delta, from, to, move_from, move_to));
@@ -212,7 +294,9 @@ impl<F: Copy + PartialEq> Join<'_, F> {
             }
             consider(from, to, h_from, h_to, &[val], partner);
         }
-        let Some((_, from, to, move_from, move_to)) = best else { return false };
+        let Some((_, from, to, move_from, move_to)) = best else {
+            return false;
+        };
         for &h in &move_from {
             slots.remove(from, self.live.ranges_of(h), h);
         }
@@ -229,7 +313,12 @@ impl<F: Copy + PartialEq> Join<'_, F> {
     }
 
     /// Gives each edge argument of `args` and its parameter one register when one of them can take the other's without losing another copy, in list order.
-    pub(super) fn join_args(&self, args: &[(usize, usize)], slots: &mut SlotSet, homes: &mut [Option<F>]) {
+    pub(super) fn join_args(
+        &self,
+        args: &[(usize, usize)],
+        slots: &mut SlotSet,
+        homes: &mut [Option<F>],
+    ) {
         let is_back = std::ptr::eq(args, self.hints.back_args);
         for &(param, arg) in args {
             if param == arg || homes[param].is_none() || homes[param] == homes[arg] {

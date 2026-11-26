@@ -21,7 +21,10 @@ pub enum ErrorKind {
 
 impl Error {
     pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Error {
-        Error { kind, message: message.into() }
+        Error {
+            kind,
+            message: message.into(),
+        }
     }
 
     /// What kind of failure this is.

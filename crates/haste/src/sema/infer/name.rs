@@ -4,8 +4,8 @@ use crate::names::ItemRef;
 use super::super::Context;
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty, object_parts};
-use super::detached;
 use super::callable::{ASYNC_CALLABLE, CALLABLE};
+use super::detached;
 
 /// The name that `std::any::type_name` gives `ty`, spelled as rustc spells it: each item by its full path, lifetimes as `'_`, and trailing type arguments that equal their defaults left out.
 pub fn type_name(cx: &mut Context<'_>, ty: Ty) -> String {
@@ -16,9 +16,18 @@ pub fn type_name(cx: &mut Context<'_>, ty: Ty) -> String {
             let args = names(cx, cx.types.substs(args).to_vec());
             format!("{}{}", def_path(cx, item), angled(&args))
         }
-        Kind::FnPtr(params, ret) => format!("fn({}){}", names(cx, cx.types.substs(params).to_vec()).join(", "), returns(cx, ret)),
+        Kind::FnPtr(params, ret) => format!(
+            "fn({}){}",
+            names(cx, cx.types.substs(params).to_vec()).join(", "),
+            returns(cx, ret)
+        ),
         Kind::Closure(item, ..) => format!("{}::{{{{closure}}}}", def_path(cx, item)),
-        Kind::Dyn(of, args, members, autos) => dyn_name(cx, (of, args), &cx.types.items(members).to_vec(), &cx.types.items(autos).to_vec()),
+        Kind::Dyn(of, args, members, autos) => dyn_name(
+            cx,
+            (of, args),
+            &cx.types.items(members).to_vec(),
+            &cx.types.items(autos).to_vec(),
+        ),
         _ => shape_name(cx, ty),
     }
 }
@@ -28,9 +37,19 @@ fn shape_name(cx: &mut Context<'_>, ty: Ty) -> String {
     match cx.types.kind(ty).clone() {
         Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
         Kind::Never => "!".to_owned(),
-        Kind::Ref(mutable, inner) => format!("&{}{}", if mutable == Mut::Mut { "mut " } else { "" }, type_name(cx, inner)),
-        Kind::Ptr(mutable, inner) => format!("*{} {}", if mutable == Mut::Mut { "mut" } else { "const" }, type_name(cx, inner)),
-        Kind::Array(element, len) => format!("[{}; {}]", type_name(cx, element), type_name(cx, len)),
+        Kind::Ref(mutable, inner) => format!(
+            "&{}{}",
+            if mutable == Mut::Mut { "mut " } else { "" },
+            type_name(cx, inner)
+        ),
+        Kind::Ptr(mutable, inner) => format!(
+            "*{} {}",
+            if mutable == Mut::Mut { "mut" } else { "const" },
+            type_name(cx, inner)
+        ),
+        Kind::Array(element, len) => {
+            format!("[{}; {}]", type_name(cx, element), type_name(cx, len))
+        }
         Kind::Slice(element) => format!("[{}]", type_name(cx, element)),
         Kind::Value(bits) => bits.to_string(),
         _ => cx.type_text(ty, &|ty| ty),
@@ -43,7 +62,10 @@ fn def_path(cx: &mut Context<'_>, item: ItemRef) -> String {
     if let Some((outer, _)) = item.outer() {
         return format!("{}::{name}", def_path(cx, outer));
     }
-    let module = cx.module_of(item).map_or_else(|_| cx.outline.roots[item.krate as usize].name.clone(), |at| cx.outline.module_path(at));
+    let module = cx.module_of(item).map_or_else(
+        |_| cx.outline.roots[item.krate as usize].name.clone(),
+        |at| cx.outline.module_path(at),
+    );
     format!("{module}::{name}")
 }
 
@@ -52,7 +74,11 @@ fn names(cx: &mut Context<'_>, tys: Vec<Ty>) -> Vec<String> {
 }
 
 fn angled(parts: &[String]) -> String {
-    if parts.is_empty() { String::new() } else { format!("<{}>", parts.join(", ")) }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", parts.join(", "))
+    }
 }
 
 fn tuple_name(cx: &mut Context<'_>, items: Substs) -> String {
@@ -73,7 +99,13 @@ fn returns(cx: &mut Context<'_>, ret: Ty) -> String {
 
 fn adt_name(cx: &mut Context<'_>, item: ItemRef, args: Substs) -> String {
     let args = cx.types.substs(args).to_vec();
-    let lifetimes = cx.adt_def(item).map_or(0, |def| def.generics.params.iter().filter(|param| param.kind == GenericKind::Lifetime).count());
+    let lifetimes = cx.adt_def(item).map_or(0, |def| {
+        def.generics
+            .params
+            .iter()
+            .filter(|param| param.kind == GenericKind::Lifetime)
+            .count()
+    });
     let shown = shown_args(cx, item, &args);
     let mut parts: Vec<String> = std::iter::repeat_n("'_".to_owned(), lifetimes).collect();
     parts.extend(names(cx, args[..shown].to_vec()));
@@ -90,21 +122,45 @@ fn shown_args(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> usize {
 }
 
 fn is_default(cx: &mut Context<'_>, item: ItemRef, args: &[Ty], at: usize) -> bool {
-    let has_default = cx.adt_def(item).is_ok_and(|def| def.generics.params.iter().filter(|param| param.kind != GenericKind::Lifetime).nth(at).is_some_and(|param| param.default.is_some()));
-    has_default && detached(cx, item, |infer| infer.adt_args(item, args[..at].to_vec(), false)).is_ok_and(|filled| filled.get(at) == Some(&args[at]))
+    let has_default = cx.adt_def(item).is_ok_and(|def| {
+        def.generics
+            .params
+            .iter()
+            .filter(|param| param.kind != GenericKind::Lifetime)
+            .nth(at)
+            .is_some_and(|param| param.default.is_some())
+    });
+    has_default
+        && detached(cx, item, |infer| {
+            infer.adt_args(item, args[..at].to_vec(), false)
+        })
+        .is_ok_and(|filled| filled.get(at) == Some(&args[at]))
 }
 
-fn dyn_name(cx: &mut Context<'_>, (of, args): (ItemRef, Substs), members: &[ItemRef], autos: &[ItemRef]) -> String {
+fn dyn_name(
+    cx: &mut Context<'_>,
+    (of, args): (ItemRef, Substs),
+    members: &[ItemRef],
+    autos: &[ItemRef],
+) -> String {
     let all = cx.types.substs(args).to_vec();
     let (trait_args, bound) = object_parts(&all, members);
     let bound: Vec<(ItemRef, Ty)> = bound.collect();
     let mut text = format!("dyn {}", def_path(cx, of));
-    if cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang) || ASYNC_CALLABLE.contains(&lang)) {
-        let inputs = match trait_args.first().map(|&tuple| cx.types.kind(tuple).clone()) {
+    if cx
+        .lang(of)
+        .is_some_and(|lang| CALLABLE.contains(&lang) || ASYNC_CALLABLE.contains(&lang))
+    {
+        let inputs = match trait_args
+            .first()
+            .map(|&tuple| cx.types.kind(tuple).clone())
+        {
             Some(Kind::Tuple(items)) => names(cx, cx.types.substs(items).to_vec()),
             _ => Vec::new(),
         };
-        let output = bound.first().map_or_else(String::new, |&(_, ty)| returns(cx, ty));
+        let output = bound
+            .first()
+            .map_or_else(String::new, |&(_, ty)| returns(cx, ty));
         text.push_str(&format!("({}){output}", inputs.join(", ")));
     } else {
         let mut parts = names(cx, trait_args.to_vec());

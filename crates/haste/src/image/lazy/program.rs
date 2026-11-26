@@ -27,10 +27,16 @@ impl Program {
     /// The binary whose `main` is `main`, inferring on from `store`, with nothing compiled yet.
     pub fn new(compilation: &mut Compilation, store: Cache, main: ItemRef) -> Result<Program> {
         let (mut entries, store) = entries(compilation, (store, &[Some(main)]))?;
-        let roots = entries.pop().unwrap_or_else(|| Err("no `main`".to_owned())).map_err(|error| anyhow!(error))?;
+        let roots = entries
+            .pop()
+            .unwrap_or_else(|| Err("no `main`".to_owned()))
+            .map_err(|error| anyhow!(error))?;
         let mut jit = Jit::new(store)?;
         let [start, main] = roots.map(|root| jit.declare(root));
-        Ok(Program { jit, entry: (start, main) })
+        Ok(Program {
+            jit,
+            entry: (start, main),
+        })
     }
 
     /// Runs `main` with `args` as argv in a forked child, compiling each function it calls that has no code yet, and returns its exit status.
@@ -39,7 +45,12 @@ impl Program {
     }
 
     /// Runs `main` like `run` while it watches the files at `paths`, and on each change points the functions whose bodies `reread` finds changed back at their stubs, so the running child compiles each again on its next call.
-    pub fn run_watched(&mut self, compilation: &mut Compilation, args: &[String], (paths, reread): (Vec<std::path::PathBuf>, Reread<'_>)) -> Result<i32> {
+    pub fn run_watched(
+        &mut self,
+        compilation: &mut Compilation,
+        args: &[String],
+        (paths, reread): (Vec<std::path::PathBuf>, Reread<'_>),
+    ) -> Result<i32> {
         self.jit.watcher = Some(super::super::watch::Watcher::new(paths)?);
         let status = self.run_with(compilation, args, Some(reread));
         self.jit.watcher = None;
@@ -47,18 +58,33 @@ impl Program {
     }
 
     /// Runs `main` with `args` as argv, asking `reread` what changed when a watched file changes.
-    fn run_with(&mut self, compilation: &mut Compilation, args: &[String], reread: Option<Reread<'_>>) -> Result<i32> {
-        let mut run = Run { entry: self.entry, args, reread, status: None };
+    fn run_with(
+        &mut self,
+        compilation: &mut Compilation,
+        args: &[String],
+        reread: Option<Reread<'_>>,
+    ) -> Result<i32> {
+        let mut run = Run {
+            entry: self.entry,
+            args,
+            reread,
+            status: None,
+        };
         let served = serve(compilation, &crate::macros::load, &mut self.jit, &mut run);
         compilation.settle();
         served?;
         if haste_codegen::trace_enabled() {
-            eprintln!("compiled {} of {} functions declared", self.jit.compiled.len(), self.jit.reached.list.len());
+            eprintln!(
+                "compiled {} of {} functions declared",
+                self.jit.compiled.len(),
+                self.jit.reached.list.len()
+            );
             if let Some(counts) = crate::prep::decided() {
                 eprintln!("prep {counts}");
             }
         }
-        run.status.ok_or_else(|| anyhow!("the program did not start"))
+        run.status
+            .ok_or_else(|| anyhow!("the program did not start"))
     }
 
     /// Takes back the code and inference of the functions that the bodies `edited` touch, so that the next run compiles them again.
@@ -104,7 +130,9 @@ impl Driver for Run<'_, '_> {
     }
 
     fn edited(&mut self, compilation: &mut Compilation) -> Result<Vec<(u32, u32)>, String> {
-        self.reread.as_mut().map_or(Ok(Vec::new()), |reread| reread(compilation))
+        self.reread
+            .as_mut()
+            .map_or(Ok(Vec::new()), |reread| reread(compilation))
     }
 }
 
@@ -132,7 +160,15 @@ const EVAL_TABLE_SLOTS: usize = 1 << 16;
 
 /// Makes the runner of constant items that the type checker installs: a demand of its own, whose functions compile on their first call.
 pub fn evaluator() -> Result<Box<dyn Evaluate>> {
-    Ok(Box::new(Jit::create(Cache::default(), (EVAL_SHARED_BYTES, EVAL_STATE_BYTES, EVAL_CODE_BYTES, EVAL_TABLE_SLOTS))?))
+    Ok(Box::new(Jit::create(
+        Cache::default(),
+        (
+            EVAL_SHARED_BYTES,
+            EVAL_STATE_BYTES,
+            EVAL_CODE_BYTES,
+            EVAL_TABLE_SLOTS,
+        ),
+    )?))
 }
 
 impl Evaluate for Jit {
@@ -141,7 +177,9 @@ impl Evaluate for Jit {
             let (entry, wide) = (self.declare(*instance), bits > 64);
             let mut once = Once(None);
             self.strict = false;
-            let ran = self.fork(true, |image, out| image.evaluate_in_child(entry, wide, out)).and_then(|_| self.pump(cx, &mut once, None));
+            let ran = self
+                .fork(true, |image, out| image.evaluate_in_child(entry, wide, out))
+                .and_then(|_| self.pump(cx, &mut once, None));
             self.strict = true;
             self.kill_children();
             if ran?.is_some() {
@@ -155,8 +193,15 @@ impl Evaluate for Jit {
 /// The value that the child running a constant wrote, or why it wrote none.
 fn value_of(ended: Option<Ended>) -> Result<u128> {
     match ended {
-        Some(Ended { failure: Some((error, _)), .. }) => bail!("{error}"),
-        Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|bytes| anyhow!("it gave no value: {} bytes, not 16", bytes.len()))?)),
+        Some(Ended {
+            failure: Some((error, _)),
+            ..
+        }) => bail!("{error}"),
+        Some(Ended {
+            status: 0, bytes, ..
+        }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(
+            |bytes| anyhow!("it gave no value: {} bytes, not 16", bytes.len()),
+        )?)),
         #[cfg(unix)]
         Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => {
             bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time")
@@ -171,7 +216,16 @@ impl Image {
     #[cfg(unix)]
     fn evaluate_in_child(&self, entry: usize, wide: bool, out: Option<std::fs::File>) -> i32 {
         let Some(mut out) = out else { return 1 };
-        let limit = libc::itimerval { it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, it_value: libc::timeval { tv_sec: EVALUATION_SECONDS as _, tv_usec: 0 } };
+        let limit = libc::itimerval {
+            it_interval: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            it_value: libc::timeval {
+                tv_sec: EVALUATION_SECONDS as _,
+                tv_usec: 0,
+            },
+        };
         // SAFETY: setitimer arms only this child's virtual timer, from a live itimerval.
         unsafe { libc::setitimer(libc::ITIMER_VIRTUAL, &limit, std::ptr::null_mut()) };
         let address = self.slot(entry).load(Ordering::Acquire);
@@ -179,7 +233,9 @@ impl Image {
         let value = unsafe {
             match wide {
                 true => std::mem::transmute::<usize, extern "C" fn() -> u128>(address)(),
-                false => u128::from(std::mem::transmute::<usize, extern "C" fn() -> u64>(address)()),
+                false => u128::from(std::mem::transmute::<usize, extern "C" fn() -> u64>(
+                    address,
+                )()),
             }
         };
         i32::from(out.write_all(&value.to_le_bytes()).is_err())

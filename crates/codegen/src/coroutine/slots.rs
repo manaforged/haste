@@ -24,7 +24,9 @@ fn dense_slot_map(func: &Function) -> (Vec<u32>, Vec<usize>) {
     let mut referenced = vec![false; func.slots.len()];
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         match func.insts[inst.index()].op {
-            Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) => referenced[s.index()] = true,
+            Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) => {
+                referenced[s.index()] = true
+            }
             _ => {}
         }
     }
@@ -44,7 +46,9 @@ fn collect_value_uses(func: &Function) -> Vec<Vec<(Block, Inst)>> {
     for (b_idx, block) in func.blocks.iter().enumerate() {
         let block_id = Block(b_idx as u32);
         for &inst in &block.insts {
-            func.insts[inst.index()].op.for_operands(|value| uses[value.index()].push((block_id, inst)));
+            func.insts[inst.index()]
+                .op
+                .for_operands(|value| uses[value.index()].push((block_id, inst)));
         }
     }
     uses
@@ -68,7 +72,12 @@ fn push_target_params(
     }
 }
 
-fn propagate_alias_uses(func: &Function, dense_of: &[u32], slot_alias: &[Vec<usize>], extra_uses: &mut [Vec<(Block, Inst)>]) {
+fn propagate_alias_uses(
+    func: &Function,
+    dense_of: &[u32],
+    slot_alias: &[Vec<usize>],
+    extra_uses: &mut [Vec<(Block, Inst)>],
+) {
     if !slot_alias.iter().any(|srcs| !srcs.is_empty()) {
         return;
     }
@@ -118,7 +127,9 @@ fn step_addr_use(
                 slot_alias[dst_d].push(slot);
             }
         }
-        Op::Jump(target, args) => push_target_params(func, val, (*target, args), stamp, queued, work),
+        Op::Jump(target, args) => {
+            push_target_params(func, val, (*target, args), stamp, queued, work)
+        }
         Op::Brif(_, t, t_args, f, f_args) => {
             push_target_params(func, val, (*t, t_args), stamp, queued, work);
             push_target_params(func, val, (*f, f_args), stamp, queued, work);
@@ -129,7 +140,12 @@ fn step_addr_use(
 
 type SlotTrace = (Vec<bool>, Vec<bool>, Vec<Vec<(Block, Inst)>>);
 
-fn trace_stack_addrs(func: &Function, (dense_of, raw_of): (&[u32], &[usize]), value_uses: &[Vec<(Block, Inst)>], is_spill: &[bool]) -> SlotTrace {
+fn trace_stack_addrs(
+    func: &Function,
+    (dense_of, raw_of): (&[u32], &[usize]),
+    value_uses: &[Vec<(Block, Inst)>],
+    is_spill: &[bool],
+) -> SlotTrace {
     let slots = raw_of.len();
     let raw_escaped = Provenance::compute_with_spills(func, Some(is_spill)).addr_escaped_slots();
     let escaped: Vec<bool> = raw_of.iter().map(|&raw| raw_escaped[raw]).collect();
@@ -162,7 +178,13 @@ fn trace_stack_addrs(func: &Function, (dense_of, raw_of): (&[u32], &[usize]), va
         while let Some(val) = work.pop() {
             for &(block, inst) in &value_uses[val.index()] {
                 extra_uses[slot].push((block, inst));
-                step_addr_use(func, dense_of, (slot, val, inst), stamp, (&mut slot_alias, &mut queued, &mut work));
+                step_addr_use(
+                    func,
+                    dense_of,
+                    (slot, val, inst),
+                    stamp,
+                    (&mut slot_alias, &mut queued, &mut work),
+                );
             }
         }
     }
@@ -170,7 +192,13 @@ fn trace_stack_addrs(func: &Function, (dense_of, raw_of): (&[u32], &[usize]), va
     (taken, escaped, extra_uses)
 }
 
-fn record_slot_read(reads: &mut BitMatrix, writes: &BitMatrix, touches: &mut BitMatrix, b_idx: usize, slot: usize) {
+fn record_slot_read(
+    reads: &mut BitMatrix,
+    writes: &BitMatrix,
+    touches: &mut BitMatrix,
+    b_idx: usize,
+    slot: usize,
+) {
     if !writes.get(b_idx, slot) {
         reads.set(b_idx, slot);
     }
@@ -187,13 +215,22 @@ fn build_inst_pos(func: &Function) -> HashMap<(usize, usize), u32> {
     inst_pos
 }
 
-fn slot_effects(func: &Function, (dense_of, raw_of): (&[u32], &[usize]), value_uses: &[Vec<(Block, Inst)>], is_spill: &[bool]) -> (Vec<bool>, SlotAnalysis) {
+fn slot_effects(
+    func: &Function,
+    (dense_of, raw_of): (&[u32], &[usize]),
+    value_uses: &[Vec<(Block, Inst)>],
+    is_spill: &[bool],
+) -> (Vec<bool>, SlotAnalysis) {
     let (slots, blocks) = (raw_of.len(), func.blocks.len());
-    let (taken, escaped, extra_uses) = trace_stack_addrs(func, (dense_of, raw_of), value_uses, is_spill);
+    let (taken, escaped, extra_uses) =
+        trace_stack_addrs(func, (dense_of, raw_of), value_uses, is_spill);
     let mut reads = BitMatrix::new(blocks, slots);
     let mut writes = BitMatrix::new(blocks, slots);
     let mut touches = BitMatrix::new(blocks, slots);
-    let inst_pos = extra_uses.iter().any(|list| !list.is_empty()).then(|| build_inst_pos(func));
+    let inst_pos = extra_uses
+        .iter()
+        .any(|list| !list.is_empty())
+        .then(|| build_inst_pos(func));
     let mut inst_touches: Vec<Vec<(u32, u32)>> = vec![Vec::new(); blocks];
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for (pos, &inst) in block.insts.iter().enumerate() {
@@ -205,7 +242,9 @@ fn slot_effects(func: &Function, (dense_of, raw_of): (&[u32], &[usize]), value_u
                 }
                 Op::StackStore(value, slot, off) => {
                     let s = dense_of[slot.index()] as usize;
-                    if off == 0 && func.types[value.index()].bytes() >= func.slots[slot.index()].size {
+                    if off == 0
+                        && func.types[value.index()].bytes() >= func.slots[slot.index()].size
+                    {
                         writes.set(b_idx, s);
                         touches.set(b_idx, s);
                     } else {
@@ -232,10 +271,25 @@ fn slot_effects(func: &Function, (dense_of, raw_of): (&[u32], &[usize]), value_u
         list.sort_by_key(|&(pos, _)| pos);
         list.dedup();
     }
-    (taken, SlotAnalysis { escaped, reads, writes, touches, inst_touches })
+    (
+        taken,
+        SlotAnalysis {
+            escaped,
+            reads,
+            writes,
+            touches,
+            inst_touches,
+        },
+    )
 }
 
-fn written_before(func: &Function, slots: usize, resumes: &[Block], analysis: &SlotAnalysis, live_in: &BitMatrix) -> BitMatrix {
+fn written_before(
+    func: &Function,
+    slots: usize,
+    resumes: &[Block],
+    analysis: &SlotAnalysis,
+    live_in: &BitMatrix,
+) -> BitMatrix {
     let blocks = func.blocks.len();
     let mut before = BitMatrix::new(blocks, slots);
     let words = before.words();
@@ -291,7 +345,9 @@ fn block_conflicts(
     let mut out_row = vec![0_u64; words];
     live_in.fill_succ_union(func, Block(b_idx as u32), &mut out_row);
     let (bef_row, tch_row) = (before.row(b_idx), analysis.touches.row(b_idx));
-    let mut live: Vec<u64> = (0..words).map(|w| kept_mask[w] & out_row[w] & (bef_row[w] | tch_row[w])).collect();
+    let mut live: Vec<u64> = (0..words)
+        .map(|w| kept_mask[w] & out_row[w] & (bef_row[w] | tch_row[w]))
+        .collect();
     add_clique(conflicts, &live);
     let block = &func.blocks[b_idx];
     let mut end = touches.len();
@@ -346,16 +402,36 @@ fn active_coroutine_blocks(func: &Function, cfg: &Cfg, resumes: &[Block]) -> Vec
     active
 }
 
-pub(super) fn framed(func: &Function, cfg: &Cfg, resumes: &[Block], is_spill: &[bool]) -> FramedSlots {
+pub(super) fn framed(
+    func: &Function,
+    cfg: &Cfg,
+    resumes: &[Block],
+    is_spill: &[bool],
+) -> FramedSlots {
     let (dense_of, raw_of) = dense_slot_map(func);
     let (slots, blocks) = (raw_of.len(), func.blocks.len());
     if slots == 0 {
-        return FramedSlots { raw_of, kept: Vec::new(), conflicts: BitMatrix::new(0, 0), escaped: Vec::new() };
+        return FramedSlots {
+            raw_of,
+            kept: Vec::new(),
+            conflicts: BitMatrix::new(0, 0),
+            escaped: Vec::new(),
+        };
     }
     let value_uses = collect_value_uses(func);
     let (taken, analysis) = slot_effects(func, (&dense_of, &raw_of), &value_uses, is_spill);
-    let live_in = solve_backward_liveness(func, (0..blocks).map(|b| Block(b as u32)), &analysis.reads, &analysis.writes);
-    let kept: Vec<bool> = (0..slots).map(|at| (taken[at] && analysis.escaped[at]) || resumes.iter().any(|resume| live_in.get(resume.index(), at))).collect();
+    let live_in = solve_backward_liveness(
+        func,
+        (0..blocks).map(|b| Block(b as u32)),
+        &analysis.reads,
+        &analysis.writes,
+    );
+    let kept: Vec<bool> = (0..slots)
+        .map(|at| {
+            (taken[at] && analysis.escaped[at])
+                || resumes.iter().any(|resume| live_in.get(resume.index(), at))
+        })
+        .collect();
     let before = written_before(func, slots, resumes, &analysis, &live_in);
     let mut conflicts = BitMatrix::new(slots, slots);
     let mut kept_mask = vec![0_u64; conflicts.words()];
@@ -372,9 +448,20 @@ pub(super) fn framed(func: &Function, cfg: &Cfg, resumes: &[Block], is_spill: &[
     let active = active_coroutine_blocks(func, cfg, resumes);
     for (b_idx, &is_active) in active.iter().enumerate() {
         if is_active {
-            block_conflicts((func, &raw_of), b_idx, &kept_mask, (&analysis, &live_in, &before), &mut conflicts);
+            block_conflicts(
+                (func, &raw_of),
+                b_idx,
+                &kept_mask,
+                (&analysis, &live_in, &before),
+                &mut conflicts,
+            );
         }
     }
     symmetrize_conflicts(&mut conflicts, slots);
-    FramedSlots { raw_of, kept, conflicts, escaped: analysis.escaped }
+    FramedSlots {
+        raw_of,
+        kept,
+        conflicts,
+        escaped: analysis.escaped,
+    }
 }

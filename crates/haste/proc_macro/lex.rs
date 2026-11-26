@@ -11,7 +11,10 @@ struct Lexer {
 
 /// The token trees that `src` writes, or why it does not lex.
 pub(crate) fn stream(src: &str) -> Result<TokenStream, String> {
-    let mut lexer = Lexer { chars: src.chars().collect(), at: 0 };
+    let mut lexer = Lexer {
+        chars: src.chars().collect(),
+        at: 0,
+    };
     let mut open: Vec<(Delimiter, Vec<TokenTree>)> = Vec::new();
     let mut trees = Vec::new();
     while let Some(ch) = lexer.trivia(&mut trees) {
@@ -22,12 +25,17 @@ pub(crate) fn stream(src: &str) -> Result<TokenStream, String> {
             }
             ')' | ']' | '}' => {
                 lexer.at += 1;
-                let Some((delim, outer)) = open.pop() else { return Err(format!("unexpected `{ch}`")) };
+                let Some((delim, outer)) = open.pop() else {
+                    return Err(format!("unexpected `{ch}`"));
+                };
                 if delim != delimiter(ch) {
                     return Err(format!("mismatched closing `{ch}`"));
                 }
                 let inner = std::mem::replace(&mut trees, outer);
-                trees.push(TokenTree::Group(Group::new(delim, TokenStream { trees: inner })));
+                trees.push(TokenTree::Group(Group::new(
+                    delim,
+                    TokenStream { trees: inner },
+                )));
             }
             _ => lexer.token(ch, &mut trees)?,
         }
@@ -59,8 +67,15 @@ fn doc(text: String, inner: bool, trees: &mut Vec<TokenTree>) {
     if inner {
         trees.push(TokenTree::Punct(Punct::new('!', Spacing::Alone)));
     }
-    let body = vec![TokenTree::Ident(Ident::new("doc", Span::call_site())), TokenTree::Punct(Punct::new('=', Spacing::Alone)), TokenTree::Literal(Literal::string(&text))];
-    trees.push(TokenTree::Group(Group::new(Delimiter::Bracket, TokenStream { trees: body })));
+    let body = vec![
+        TokenTree::Ident(Ident::new("doc", Span::call_site())),
+        TokenTree::Punct(Punct::new('=', Spacing::Alone)),
+        TokenTree::Literal(Literal::string(&text)),
+    ];
+    trees.push(TokenTree::Group(Group::new(
+        Delimiter::Bracket,
+        TokenStream { trees: body },
+    )));
 }
 
 impl Lexer {
@@ -96,7 +111,9 @@ impl Lexer {
         let from = self.at;
         self.eat_while(|ch| ch != '\n');
         match kind {
-            (Some('/'), next) if next != Some('/') => doc(self.chars[from + 1..self.at].iter().collect(), false, trees),
+            (Some('/'), next) if next != Some('/') => {
+                doc(self.chars[from + 1..self.at].iter().collect(), false, trees)
+            }
             (Some('!'), _) => doc(self.chars[from + 1..self.at].iter().collect(), true, trees),
             _ => {}
         }
@@ -114,9 +131,15 @@ impl Lexer {
                 _ => self.at += 1,
             }
         }
-        let body = || self.chars[from + 1..self.at.saturating_sub(2).max(from + 1)].iter().collect();
+        let body = || {
+            self.chars[from + 1..self.at.saturating_sub(2).max(from + 1)]
+                .iter()
+                .collect()
+        };
         match kind {
-            (Some('*'), next) if next != Some('*') && next != Some('/') => doc(body(), false, trees),
+            (Some('*'), next) if next != Some('*') && next != Some('/') => {
+                doc(body(), false, trees)
+            }
             (Some('!'), _) => doc(body(), true, trees),
             _ => {}
         }
@@ -135,7 +158,11 @@ impl Lexer {
             '\'' => self.quote(from, trees)?,
             ch if OPERATORS.contains(ch) => {
                 self.at += 1;
-                let spacing = if self.peek(0).is_some_and(|next| OPERATORS.contains(next)) { Spacing::Joint } else { Spacing::Alone };
+                let spacing = if self.peek(0).is_some_and(|next| OPERATORS.contains(next)) {
+                    Spacing::Joint
+                } else {
+                    Spacing::Alone
+                };
                 trees.push(TokenTree::Punct(Punct::new(ch, spacing)));
             }
             _ => return Err(format!("unknown start of token `{ch}`")),
@@ -144,14 +171,20 @@ impl Lexer {
     }
 
     fn ident(&mut self) -> Ident {
-        let raw = self.peek(0) == Some('r') && self.peek(1) == Some('#') && self.peek(2).is_some_and(ident_start);
+        let raw = self.peek(0) == Some('r')
+            && self.peek(1) == Some('#')
+            && self.peek(2).is_some_and(ident_start);
         if raw {
             self.at += 2;
         }
         let from = self.at;
         self.eat_while(ident_continue);
         let name = self.text(from);
-        if raw { Ident::new_raw(&name, Span::call_site()) } else { Ident::new(&name, Span::call_site()) }
+        if raw {
+            Ident::new_raw(&name, Span::call_site())
+        } else {
+            Ident::new(&name, Span::call_site())
+        }
     }
 
     fn prefixed(&mut self, ch: char) -> Result<Option<Literal>, String> {
@@ -186,7 +219,10 @@ impl Lexer {
     }
 
     fn raw(&mut self, from: usize) -> Result<Literal, String> {
-        let hashes = self.chars[self.at..].iter().take_while(|ch| **ch == '#').count();
+        let hashes = self.chars[self.at..]
+            .iter()
+            .take_while(|ch| **ch == '#')
+            .count();
         self.at += hashes;
         if self.peek(0) != Some('"') {
             return Err("malformed raw string".to_owned());
@@ -217,7 +253,10 @@ impl Lexer {
 
     fn number(&mut self) -> Literal {
         let from = self.at;
-        let radix = matches!((self.peek(0), self.peek(1)), (Some('0'), Some('x' | 'o' | 'b')));
+        let radix = matches!(
+            (self.peek(0), self.peek(1)),
+            (Some('0'), Some('x' | 'o' | 'b'))
+        );
         if radix {
             self.at += 2;
             self.eat_while(|ch| ch.is_ascii_hexdigit() || ch == '_');
@@ -229,13 +268,18 @@ impl Lexer {
     }
 
     fn decimal_tail(&mut self) {
-        let fraction = self.peek(0) == Some('.') && self.peek(1).is_none_or(|next| next != '.' && !ident_start(next));
+        let fraction = self.peek(0) == Some('.')
+            && self
+                .peek(1)
+                .is_none_or(|next| next != '.' && !ident_start(next));
         if fraction {
             self.at += 1;
             self.eat_while(|ch| ch.is_ascii_digit() || ch == '_');
         }
-        let signed = matches!(self.peek(1), Some('+' | '-')) && self.peek(2).is_some_and(|ch| ch.is_ascii_digit());
-        let exponent = matches!(self.peek(0), Some('e' | 'E')) && (signed || self.peek(1).is_some_and(|ch| ch.is_ascii_digit()));
+        let signed = matches!(self.peek(1), Some('+' | '-'))
+            && self.peek(2).is_some_and(|ch| ch.is_ascii_digit());
+        let exponent = matches!(self.peek(0), Some('e' | 'E'))
+            && (signed || self.peek(1).is_some_and(|ch| ch.is_ascii_digit()));
         if exponent {
             self.at += if signed { 2 } else { 1 };
             self.eat_while(|ch| ch.is_ascii_digit() || ch == '_');

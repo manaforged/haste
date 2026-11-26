@@ -25,9 +25,15 @@ fn find_global_alloc_trait(cx: &Context<'_>, core_krate: u32) -> Option<ItemRef>
         for (at, item) in entry.items.items.iter().enumerate() {
             if item.kind == ItemKind::Trait
                 && tree.env.enabled(&item.attrs)
-                && item.name.is_some_and(|name| entry.source.text(name) == "GlobalAlloc")
+                && item
+                    .name
+                    .is_some_and(|name| entry.source.text(name) == "GlobalAlloc")
             {
-                return Some(ItemRef { krate: core_krate, file: file as u32, item: at as u32 });
+                return Some(ItemRef {
+                    krate: core_krate,
+                    file: file as u32,
+                    item: at as u32,
+                });
             }
         }
     }
@@ -35,7 +41,12 @@ fn find_global_alloc_trait(cx: &Context<'_>, core_krate: u32) -> Option<ItemRef>
 }
 
 /// Synthesizes the typed shim body for `__rust_alloc`, `__rust_alloc_zeroed`, `__rust_dealloc`, or `__rust_realloc` forwarding to `#[global_allocator]`.
-pub fn global_alloc_typed(cx: &mut Context<'_>, item: ItemRef, op: GlobalAllocOp, alloc_static: ItemRef) -> Result<Typed> {
+pub fn global_alloc_typed(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    op: GlobalAllocOp,
+    alloc_static: ItemRef,
+) -> Result<Typed> {
     let (param_tys, ret_ty) = detached(cx, item, |infer| infer.fn_types(item, &[]))?;
     let alloc_ty = detached(cx, alloc_static, |infer| infer.fn_types(alloc_static, &[]))?.1;
     let Some(layout_item) = cx.lang_item("alloc_layout") else {
@@ -54,6 +65,18 @@ pub fn global_alloc_typed(cx: &mut Context<'_>, item: ItemRef, op: GlobalAllocOp
     })?;
     let locals: Vec<Local> = param_tys.iter().map(|&ty| Local { ty }).collect();
     let params: Vec<u32> = (0..locals.len() as u32).collect();
-    let shim = GlobalAllocShim { op, allocator: Res::Fn(alloc_static, Substs::EMPTY), method, alloc_ty, layout_ty };
-    Ok(Typed { locals, params, ret: Some(ret_ty), shape: Shape::GlobalAlloc(shim), ..Typed::default() })
+    let shim = GlobalAllocShim {
+        op,
+        allocator: Res::Fn(alloc_static, Substs::EMPTY),
+        method,
+        alloc_ty,
+        layout_ty,
+    };
+    Ok(Typed {
+        locals,
+        params,
+        ret: Some(ret_ty),
+        shape: Shape::GlobalAlloc(shim),
+        ..Typed::default()
+    })
 }

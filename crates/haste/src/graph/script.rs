@@ -21,7 +21,13 @@ pub struct Output {
 
 impl Output {
     /// The build-script cfg and env fields included in cache keys.
-    pub fn key_parts(&self) -> (&BTreeSet<String>, &BTreeSet<(String, String)>, &[(String, String)]) {
+    pub fn key_parts(
+        &self,
+    ) -> (
+        &BTreeSet<String>,
+        &BTreeSet<(String, String)>,
+        &[(String, String)],
+    ) {
         (&self.names, &self.pairs, &self.vars)
     }
 }
@@ -46,7 +52,11 @@ pub enum LinkKind {
     Framework,
 }
 
-const LINK_KINDS: [(&str, LinkKind); 3] = [("static", LinkKind::Static), ("dylib", LinkKind::Dynamic), ("framework", LinkKind::Framework)];
+const LINK_KINDS: [(&str, LinkKind); 3] = [
+    ("static", LinkKind::Static),
+    ("dylib", LinkKind::Dynamic),
+    ("framework", LinkKind::Framework),
+];
 
 const SEARCH_KINDS: [&str; 5] = ["native", "all", "crate", "dependency", "framework"];
 
@@ -87,7 +97,10 @@ impl Output {
             let Some((key, value)) = body.split_once('=') else {
                 continue;
             };
-            let directive = DIRECTIVES.iter().find(|(known, _)| *known == key).map(|(_, directive)| *directive);
+            let directive = DIRECTIVES
+                .iter()
+                .find(|(known, _)| *known == key)
+                .map(|(_, directive)| *directive);
             match directive {
                 Some(directive) => output.apply(directive, value),
                 None if legacy => output.metadata.push((key.to_owned(), value.to_owned())),
@@ -100,11 +113,24 @@ impl Output {
     fn apply(&mut self, directive: Directive, value: &str) {
         match directive {
             Directive::Cfg => match value.split_once('=') {
-                Some((key, quoted)) => _ = self.pairs.insert((key.trim().to_owned(), quoted.trim().trim_matches('"').to_owned())),
+                Some((key, quoted)) => {
+                    _ = self.pairs.insert((
+                        key.trim().to_owned(),
+                        quoted.trim().trim_matches('"').to_owned(),
+                    ))
+                }
                 None => _ = self.names.insert(value.trim().to_owned()),
             },
-            Directive::Env => self.vars.extend(value.split_once('=').map(|(key, value)| (key.to_owned(), value.to_owned()))),
-            Directive::Metadata => self.metadata.extend(value.split_once('=').map(|(key, value)| (key.to_owned(), value.to_owned()))),
+            Directive::Env => self.vars.extend(
+                value
+                    .split_once('=')
+                    .map(|(key, value)| (key.to_owned(), value.to_owned())),
+            ),
+            Directive::Metadata => self.metadata.extend(
+                value
+                    .split_once('=')
+                    .map(|(key, value)| (key.to_owned(), value.to_owned())),
+            ),
             Directive::LinkLib => self.libs.push(value.to_owned()),
             Directive::LinkSearch => self.search.push(value.to_owned()),
             Directive::Watch => self.watched.push(value.to_owned()),
@@ -116,10 +142,18 @@ impl Output {
     /// Each `rustc-link-lib` library as its kind and name, without modifiers or a new name; a library without a kind links dynamically.
     pub fn link_libs(&self) -> impl Iterator<Item = (LinkKind, &str)> {
         self.libs.iter().map(|spec| {
-            let (kind, name) = spec.split_once('=').map_or((LinkKind::Dynamic, spec.as_str()), |(kind, name)| {
-                let kind = kind.split_once(':').map_or(kind, |(kind, _)| kind);
-                (LINK_KINDS.iter().find(|(known, _)| *known == kind).map_or(LinkKind::Dynamic, |(_, kind)| *kind), name)
-            });
+            let (kind, name) =
+                spec.split_once('=')
+                    .map_or((LinkKind::Dynamic, spec.as_str()), |(kind, name)| {
+                        let kind = kind.split_once(':').map_or(kind, |(kind, _)| kind);
+                        (
+                            LINK_KINDS
+                                .iter()
+                                .find(|(known, _)| *known == kind)
+                                .map_or(LinkKind::Dynamic, |(_, kind)| *kind),
+                            name,
+                        )
+                    });
             (kind, name.split_once(':').map_or(name, |(name, _)| name))
         })
     }
@@ -134,14 +168,21 @@ impl Output {
 }
 
 fn out_dir(workspace: &Workspace, unit: usize) -> String {
-    super::store::dir(workspace, unit).join("out").display().to_string()
+    super::store::dir(workspace, unit)
+        .join("out")
+        .display()
+        .to_string()
 }
 
 /// The variables `env!` reads in the crates of `unit`: Cargo's package variables and, when the package has a build script, its `OUT_DIR`.
 pub fn crate_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
     let mut vars = package_vars(workspace, unit);
     vars.push(("CARGO".to_owned(), tool("CARGO")));
-    if workspace.packages[workspace.graph.units[unit].package].manifest.build.is_some() {
+    if workspace.packages[workspace.graph.units[unit].package]
+        .manifest
+        .build
+        .is_some()
+    {
         vars.push(("OUT_DIR".to_owned(), out_dir(workspace, unit)));
     }
     vars
@@ -160,21 +201,62 @@ pub fn package_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)>
         ("CARGO_PKG_VERSION_PATCH", version.patch.to_string()),
         ("CARGO_PKG_VERSION_PRE", version.pre.to_string()),
         ("CARGO_MANIFEST_DIR", manifest.dir.display().to_string()),
-        ("CARGO_MANIFEST_PATH", manifest.dir.join("Cargo.toml").display().to_string()),
+        (
+            "CARGO_MANIFEST_PATH",
+            manifest.dir.join("Cargo.toml").display().to_string(),
+        ),
     ];
-    vars.extend(["AUTHORS", "DESCRIPTION", "HOMEPAGE", "REPOSITORY", "LICENSE", "LICENSE_FILE", "README", "RUST_VERSION"].map(|key| (key, String::new())));
-    vars.into_iter().map(|(key, value)| (if key.starts_with("CARGO_") { key.to_owned() } else { format!("CARGO_PKG_{key}") }, value)).collect()
+    vars.extend(
+        [
+            "AUTHORS",
+            "DESCRIPTION",
+            "HOMEPAGE",
+            "REPOSITORY",
+            "LICENSE",
+            "LICENSE_FILE",
+            "README",
+            "RUST_VERSION",
+        ]
+        .map(|key| (key, String::new())),
+    );
+    vars.into_iter()
+        .map(|(key, value)| {
+            (
+                if key.starts_with("CARGO_") {
+                    key.to_owned()
+                } else {
+                    format!("CARGO_PKG_{key}")
+                },
+                value,
+            )
+        })
+        .collect()
 }
 
 /// The variables Cargo sets when it runs the build script of `unit`, given the metadata its dependencies' scripts printed.
-pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metadata: &[(String, String)]) -> Vec<(String, String)> {
+pub fn script_vars(
+    workspace: &Workspace,
+    targets: &Targets,
+    unit: usize,
+    metadata: &[(String, String)],
+) -> Vec<(String, String)> {
     let entry = &workspace.graph.units[unit];
     let manifest = &workspace.packages[entry.package].manifest;
     let target = targets.of(entry.side);
     let mut vars = package_vars(workspace, unit);
-    vars.extend(entry.features.iter().map(|feature| (format!("CARGO_FEATURE_{}", upper(feature)), "1".to_owned())));
+    vars.extend(
+        entry
+            .features
+            .iter()
+            .map(|feature| (format!("CARGO_FEATURE_{}", upper(feature)), "1".to_owned())),
+    );
     vars.extend(cfg_vars(target));
-    vars.extend(manifest.links.iter().map(|links| ("CARGO_MANIFEST_LINKS".to_owned(), links.clone())));
+    vars.extend(
+        manifest
+            .links
+            .iter()
+            .map(|links| ("CARGO_MANIFEST_LINKS".to_owned(), links.clone())),
+    );
     vars.extend(metadata.iter().cloned());
     let release = crate::profile() == crate::outline::tree::Profile::Release;
     let fixed = [
@@ -184,7 +266,10 @@ pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metada
         ("NUM_JOBS", crate::jobs().to_string()),
         ("OPT_LEVEL", if release { "3" } else { "0" }.to_owned()),
         ("DEBUG", if release { "false" } else { "true" }.to_owned()),
-        ("PROFILE", if release { "release" } else { "debug" }.to_owned()),
+        (
+            "PROFILE",
+            if release { "release" } else { "debug" }.to_owned(),
+        ),
         ("CARGO", tool("CARGO")),
         ("RUSTC", tool("RUSTC")),
         ("RUSTDOC", tool("RUSTDOC")),
@@ -196,7 +281,16 @@ pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metada
 
 /// `DEP_<LINKS>_<KEY>` for each metadata pair that the script of a dependency with `links` printed.
 pub fn dep_vars(links: &str, output: &Output) -> Vec<(String, String)> {
-    output.metadata.iter().map(|(key, value)| (format!("DEP_{}_{}", upper(links), upper(key)), value.clone())).collect()
+    output
+        .metadata
+        .iter()
+        .map(|(key, value)| {
+            (
+                format!("DEP_{}_{}", upper(links), upper(key)),
+                value.clone(),
+            )
+        })
+        .collect()
 }
 
 /// The program that the variable `name` names, else the program named as the variable in lower case, as Cargo finds `CC` or `RUSTC`.
@@ -222,6 +316,10 @@ fn cfg_vars(target: &super::cfg::Target) -> Vec<(String, String)> {
     for (key, value) in &target.pairs {
         joined.entry(key).or_default().push(value);
     }
-    vars.extend(joined.into_iter().map(|(key, values)| (format!("CARGO_CFG_{}", upper(key)), values.join(","))));
+    vars.extend(
+        joined
+            .into_iter()
+            .map(|(key, values)| (format!("CARGO_CFG_{}", upper(key)), values.join(","))),
+    );
     vars
 }

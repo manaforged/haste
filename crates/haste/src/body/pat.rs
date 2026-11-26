@@ -44,12 +44,27 @@ impl Cursor<'_> {
             _ => return Ok(pat),
         };
         self.at += if inclusive { 3 } else { 2 };
-        let to = if self.range_end_ahead() { Some(self.range_bound()?) } else { None };
-        Ok(self.push_pat(Pat::Range { from: Some(from), to, inclusive }))
+        let to = if self.range_end_ahead() {
+            Some(self.range_bound()?)
+        } else {
+            None
+        };
+        Ok(self.push_pat(Pat::Range {
+            from: Some(from),
+            to,
+            inclusive,
+        }))
     }
 
     fn range_end_ahead(&self) -> bool {
-        matches!(self.kind(), TokenKind::Literal { .. }) || self.punct("-") || self.ident() || self.punct("::") || self.punct("<") || super::cursor::PATH_KEYWORDS.iter().any(|word| self.is_word(word))
+        matches!(self.kind(), TokenKind::Literal { .. })
+            || self.punct("-")
+            || self.ident()
+            || self.punct("::")
+            || self.punct("<")
+            || super::cursor::PATH_KEYWORDS
+                .iter()
+                .any(|word| self.is_word(word))
     }
 
     fn range_bound(&mut self) -> Result<super::ExprId> {
@@ -63,7 +78,11 @@ impl Cursor<'_> {
     fn lit_expr(&mut self) -> Result<super::ExprId> {
         let negative = self.eat("-");
         let lit = self.literal()?;
-        Ok(if negative { self.push_expr(Expr::Unary(UnOp::Neg, lit)) } else { lit })
+        Ok(if negative {
+            self.push_expr(Expr::Unary(UnOp::Neg, lit))
+        } else {
+            lit
+        })
     }
 
     fn pat_start(&mut self) -> Result<PatId> {
@@ -93,17 +112,28 @@ impl Cursor<'_> {
             self.at += 1;
             let mutable = self.eat_word("mut");
             let inner = self.pat_no_alt()?;
-            return Ok(self.push_pat(Pat::Ref { mutable, pat: inner }));
+            return Ok(self.push_pat(Pat::Ref {
+                mutable,
+                pat: inner,
+            }));
         }
         if self.punct("..=") || self.punct("...") {
             self.at += 3;
             let to = self.range_bound()?;
-            return Ok(self.push_pat(Pat::Range { from: None, to: Some(to), inclusive: true }));
+            return Ok(self.push_pat(Pat::Range {
+                from: None,
+                to: Some(to),
+                inclusive: true,
+            }));
         }
         if self.eat("..") {
             if self.range_end_ahead() {
                 let to = self.range_bound()?;
-                return Ok(self.push_pat(Pat::Range { from: None, to: Some(to), inclusive: false }));
+                return Ok(self.push_pat(Pat::Range {
+                    from: None,
+                    to: Some(to),
+                    inclusive: false,
+                }));
             }
             return Ok(self.push_pat(Pat::Rest));
         }
@@ -144,7 +174,13 @@ impl Cursor<'_> {
             let block = self.block_expr(None, super::BlockKind::Const)?;
             return Ok(Some(self.push_pat(Pat::Lit(block))));
         }
-        let boxed = self.is_word("box") && (!self.word_at(next).is_empty() || matches!(self.kind_at(next), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::Literal { .. }) || self.punct_at(next, "&"));
+        let boxed = self.is_word("box")
+            && (!self.word_at(next).is_empty()
+                || matches!(
+                    self.kind_at(next),
+                    TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::Literal { .. }
+                )
+                || self.punct_at(next, "&"));
         if !boxed {
             return Ok(None);
         }
@@ -155,7 +191,14 @@ impl Cursor<'_> {
 
     fn path_continues(&self) -> bool {
         let next = self.at + 1;
-        self.punct_at(next, "::") || self.punct_at(next, "!") || self.punct_at(next, "..") || matches!(self.kind_at(next), TokenKind::OpenParen | TokenKind::OpenBrace) || self.punct_at(next, "<")
+        self.punct_at(next, "::")
+            || self.punct_at(next, "!")
+            || self.punct_at(next, "..")
+            || matches!(
+                self.kind_at(next),
+                TokenKind::OpenParen | TokenKind::OpenBrace
+            )
+            || self.punct_at(next, "<")
     }
 
     fn bind_pat(&mut self) -> Result<PatId> {
@@ -168,7 +211,12 @@ impl Cursor<'_> {
         } else {
             None
         };
-        Ok(self.push_pat(Pat::Bind { name, by_ref, mutable, sub }))
+        Ok(self.push_pat(Pat::Bind {
+            name,
+            by_ref,
+            mutable,
+            sub,
+        }))
     }
 
     fn path_pat(&mut self) -> Result<PatId> {
@@ -202,15 +250,24 @@ impl Cursor<'_> {
     }
 
     fn field_pat(&mut self) -> Result<u32> {
-        let shorthand = !(matches!(self.kind(), TokenKind::Literal { .. } | TokenKind::Ident | TokenKind::RawIdent) && self.punct_at(self.at + 1, ":") && !self.punct_at(self.at + 1, "::"));
+        let shorthand = !(matches!(
+            self.kind(),
+            TokenKind::Literal { .. } | TokenKind::Ident | TokenKind::RawIdent
+        ) && self.punct_at(self.at + 1, ":")
+            && !self.punct_at(self.at + 1, "::"));
         let field = if shorthand {
             let pat = self.bind_pat()?;
-            let Pat::Bind { name, .. } = self.body.pats[pat.0 as usize] else { unreachable!() };
+            let Pat::Bind { name, .. } = self.body.pats[pat.0 as usize] else {
+                unreachable!()
+            };
             FieldPat { name, pat }
         } else {
             let name = self.at;
             self.at += 2;
-            FieldPat { name, pat: self.pat()? }
+            FieldPat {
+                name,
+                pat: self.pat()?,
+            }
         };
         self.body.field_pats.push(field);
         Ok(self.body.field_pats.len() as u32 - 1)

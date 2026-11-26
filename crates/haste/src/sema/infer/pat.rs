@@ -31,7 +31,12 @@ pub fn rest_split(body: &Body, list: List) -> Result<(Vec<PatId>, Option<usize>)
         Pat::Bind { sub: Some(sub), .. } => matches!(body.pat(sub), Pat::Rest),
         _ => false,
     };
-    let rests: Vec<usize> = pats.iter().enumerate().filter(|(_, pat)| is_rest(**pat)).map(|(at, _)| at).collect();
+    let rests: Vec<usize> = pats
+        .iter()
+        .enumerate()
+        .filter(|(_, pat)| is_rest(**pat))
+        .map(|(at, _)| at)
+        .collect();
     match rests[..] {
         [] => Ok((pats, None)),
         [at] => Ok((pats, Some(at))),
@@ -49,14 +54,25 @@ impl Infer<'_, '_> {
         let (ty, mode) = self.peel(pat, ty, mode);
         self.out.pats.insert(pat, ty);
         match *self.body.pat(pat) {
-            Pat::Bind { name, mutable, by_ref, sub } => self.bind_name(pat, (name, mutable, by_ref), sub, (ty, mode)),
+            Pat::Bind {
+                name,
+                mutable,
+                by_ref,
+                sub,
+            } => self.bind_name(pat, (name, mutable, by_ref), sub, (ty, mode)),
             Pat::Wild | Pat::Rest => Ok(()),
             Pat::Paren(inner) => self.pat(inner, ty, mode),
             Pat::Lit(expr) => self.value_pat(expr, ty),
-            Pat::Range { from, to, .. } => from.into_iter().chain(to).try_for_each(|end| self.value_pat(end, ty)),
+            Pat::Range { from, to, .. } => from
+                .into_iter()
+                .chain(to)
+                .try_for_each(|end| self.value_pat(end, ty)),
             Pat::Tuple(list) => self.tuple_pat(list, ty, mode),
             Pat::Slice(list) => self.slice_pat(list, ty, mode),
-            Pat::Ref { mutable, pat: inner } => self.ref_pat(inner, mutable, ty),
+            Pat::Ref {
+                mutable,
+                pat: inner,
+            } => self.ref_pat(inner, mutable, ty),
             Pat::Path(path) => self.path_pat(pat, path, (ty, mode)),
             Pat::TupleStruct(path, list) => self.variant_pat(pat, path, ty, (list, mode)),
             Pat::Struct { path, fields, .. } => self.struct_pat(pat, path, ty, (fields, mode)),
@@ -65,7 +81,13 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn bind_name(&mut self, pat: PatId, (name, mutable, by_ref): (u32, bool, bool), sub: Option<PatId>, (ty, mode): (Ty, Mode)) -> Result<()> {
+    fn bind_name(
+        &mut self,
+        pat: PatId,
+        (name, mutable, by_ref): (u32, bool, bool),
+        sub: Option<PatId>,
+        (ty, mode): (Ty, Mode),
+    ) -> Result<()> {
         if !mutable
             && !by_ref
             && sub.is_none()
@@ -95,7 +117,8 @@ impl Infer<'_, '_> {
 
     /// Puts `local` in scope under the name at token `name`, without its `r#` prefix.
     pub(super) fn scope_name(&mut self, name: u32, local: u32) {
-        self.scopes.push(((plain(self.src.text(name)), self.src.scope(name).0), local));
+        self.scopes
+            .push(((plain(self.src.text(name)), self.src.scope(name).0), local));
     }
 
     fn value_pat(&mut self, expr: crate::body::ExprId, ty: Ty) -> Result<()> {
@@ -105,15 +128,27 @@ impl Infer<'_, '_> {
 
     fn ref_pat(&mut self, inner: PatId, mutable: bool, ty: Ty) -> Result<()> {
         let pointee = self.fresh(Kind::Var);
-        let reference = self.cx.types.intern(Kind::Ref(if mutable { Mut::Mut } else { Mut::Not }, pointee));
+        let reference = self.cx.types.intern(Kind::Ref(
+            if mutable { Mut::Mut } else { Mut::Not },
+            pointee,
+        ));
         self.unify(ty, reference)?;
         self.pat(inner, pointee, Mode::Value)
     }
 
     fn peel(&mut self, pat: PatId, ty: Ty, mode: Mode) -> (Ty, Mode) {
         let keeps = match *self.body.pat(pat) {
-            Pat::Bind { .. } | Pat::Path(_) | Pat::Wild | Pat::Rest | Pat::Ref { .. } | Pat::Paren(_) | Pat::Or(_) => true,
-            Pat::Lit(expr) => matches!(self.body.expr(expr), Expr::Lit(Lit::Str | Lit::ByteStr | Lit::CStr, _)),
+            Pat::Bind { .. }
+            | Pat::Path(_)
+            | Pat::Wild
+            | Pat::Rest
+            | Pat::Ref { .. }
+            | Pat::Paren(_)
+            | Pat::Or(_) => true,
+            Pat::Lit(expr) => matches!(
+                self.body.expr(expr),
+                Expr::Lit(Lit::Str | Lit::ByteStr | Lit::CStr, _)
+            ),
             _ => false,
         };
         if keeps {
@@ -158,7 +193,11 @@ impl Infer<'_, '_> {
         let given = pats.len() - usize::from(rest.is_some());
         let element = self.slice_element(ty, given, rest.is_some())?;
         for (at, &pat) in pats.iter().enumerate() {
-            let item = if Some(at) == rest { self.rest_ty(ty, element, given) } else { element };
+            let item = if Some(at) == rest {
+                self.rest_ty(ty, element, given)
+            } else {
+                element
+            };
             self.pat(pat, item, mode)?;
         }
         Ok(())
@@ -181,11 +220,16 @@ impl Infer<'_, '_> {
             _ => bail!("slice pattern on {}", self.show(ty)),
         };
         let resolved_len = self.resolve(len);
-        if matches!(self.cx.types.kind(resolved_len), Kind::Param(_) | Kind::Proj(_)) {
+        if matches!(
+            self.cx.types.kind(resolved_len),
+            Kind::Param(_) | Kind::Proj(_)
+        ) {
             self.poly_fallback();
         }
         match self.cx.types.len(resolved_len) {
-            Some(len) if given as u64 > len || (!rest && given as u64 != len) => bail!("pattern has {given} elements, the array has {len}"),
+            Some(len) if given as u64 > len || (!rest && given as u64 != len) => {
+                bail!("pattern has {given} elements, the array has {len}")
+            }
             Some(_) => Ok(element),
             None if !rest => {
                 let known = self.cx.types.intern(Kind::Value(given as u128));
@@ -195,7 +239,13 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn positional(&mut self, pats: &[PatId], rest: Option<usize>, items: &[Ty], mode: Mode) -> Result<()> {
+    fn positional(
+        &mut self,
+        pats: &[PatId],
+        rest: Option<usize>,
+        items: &[Ty],
+        mode: Mode,
+    ) -> Result<()> {
         let given = pats.len() - usize::from(rest.is_some());
         if given > items.len() || (rest.is_none() && given != items.len()) {
             bail!("pattern has {given} fields, the type has {}", items.len());
@@ -221,16 +271,34 @@ impl Infer<'_, '_> {
         matches!(res, Res::Fn(item, _) if self.cx.item(*item).1.kind == ItemKind::Const)
     }
 
-    fn named_value(&mut self, pat: PatId, (found, res): (Ty, Res), ty: Ty, mode: Mode) -> Result<()> {
-        let peeled = if self.is_const(&res) { ty } else { self.peel_refs(pat, ty, mode).0 };
+    fn named_value(
+        &mut self,
+        pat: PatId,
+        (found, res): (Ty, Res),
+        ty: Ty,
+        mode: Mode,
+    ) -> Result<()> {
+        let peeled = if self.is_const(&res) {
+            ty
+        } else {
+            self.peel_refs(pat, ty, mode).0
+        };
         self.out.pats.insert(pat, peeled);
         self.out.pat_res.insert(pat, res);
         self.unify(peeled, found)
     }
 
-    fn variant_pat(&mut self, pat: PatId, path: PathId, ty: Ty, (list, mode): (List, Mode)) -> Result<()> {
+    fn variant_pat(
+        &mut self,
+        pat: PatId,
+        path: PathId,
+        ty: Ty,
+        (list, mode): (List, Mode),
+    ) -> Result<()> {
         let body = self.body;
-        let Some((item, variant, args)) = self.ctor(body, path, true)? else { bail!("pattern path is not a tuple constructor") };
+        let Some((item, variant, args)) = self.ctor(body, path, true)? else {
+            bail!("pattern path is not a tuple constructor")
+        };
         let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
         let slice = self.cx.types.substs(args).to_vec();
@@ -240,9 +308,17 @@ impl Infer<'_, '_> {
         self.positional(&pats, rest, &fields, mode)
     }
 
-    fn struct_pat(&mut self, pat: PatId, path: PathId, ty: Ty, (list, mode): (List, Mode)) -> Result<()> {
+    fn struct_pat(
+        &mut self,
+        pat: PatId,
+        path: PathId,
+        ty: Ty,
+        (list, mode): (List, Mode),
+    ) -> Result<()> {
         let body = self.body;
-        let Some((item, variant, args)) = self.ctor(body, path, false)? else { bail!("struct pattern of something that is not a struct") };
+        let Some((item, variant, args)) = self.ctor(body, path, false)? else {
+            bail!("struct pattern of something that is not a struct")
+        };
         let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
         let slice = self.cx.types.substs(args).to_vec();
@@ -251,7 +327,9 @@ impl Infer<'_, '_> {
         for &at in body.list(list) {
             let field = body.field_pats[at as usize];
             let name = plain(self.src.text(field.name));
-            let Some(index) = self.field_index(item, variant, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
+            let Some(index) = self.field_index(item, variant, name)? else {
+                bail!("no field `{name}` on {}", self.cx.name(item))
+            };
             self.out.field_pats.insert(field.pat, index);
             self.pat(field.pat, fields[index as usize], mode)?;
         }
@@ -277,14 +355,27 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn merge_alt(&mut self, names: &[(super::Name, u32)], bound: Vec<(super::Name, u32)>) -> Result<()> {
+    fn merge_alt(
+        &mut self,
+        names: &[(super::Name, u32)],
+        bound: Vec<(super::Name, u32)>,
+    ) -> Result<()> {
         if names.len() != bound.len() {
             bail!("the alternatives of an or-pattern bind different names");
         }
         for (name, local) in bound {
-            let Some(&(_, kept)) = names.iter().find(|(other, _)| *other == name) else { bail!("`{}` is not bound in every alternative", name.0) };
-            self.unify(self.out.locals[local as usize].ty, self.out.locals[kept as usize].ty)?;
-            self.out.binds.values_mut().filter(|at| **at == local).for_each(|at| *at = kept);
+            let Some(&(_, kept)) = names.iter().find(|(other, _)| *other == name) else {
+                bail!("`{}` is not bound in every alternative", name.0)
+            };
+            self.unify(
+                self.out.locals[local as usize].ty,
+                self.out.locals[kept as usize].ty,
+            )?;
+            self.out
+                .binds
+                .values_mut()
+                .filter(|at| **at == local)
+                .for_each(|at| *at = kept);
         }
         Ok(())
     }
@@ -299,13 +390,18 @@ impl Infer<'_, '_> {
                 };
                 (item, at as u32)
             }
-            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Struct => (item, 0),
+            Some(crate::names::Def::Item(item))
+                if self.cx.item(item).1.kind == ItemKind::Struct =>
+            {
+                (item, 0)
+            }
             Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => {
                 return self.const_item(item, Vec::new()).map(Some);
             }
             _ => return Ok(None),
         };
-        if self.cx.adt_def(item)?.variants[variant as usize].shape != crate::body::adt::Shape::Unit {
+        if self.cx.adt_def(item)?.variants[variant as usize].shape != crate::body::adt::Shape::Unit
+        {
             return Ok(None);
         }
         let args = self.adt_args(item, Vec::new(), true)?;

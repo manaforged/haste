@@ -55,10 +55,16 @@ pub struct AdtDef {
 
 impl AdtDef {
     /// Drops the variants and fields whose attributes `enabled` rejects, as `#[cfg]` configures them out.
-    pub fn configure(&mut self, src: &Source, enabled: &dyn Fn(&[crate::outline::item::Attr]) -> bool) {
+    pub fn configure(
+        &mut self,
+        src: &Source,
+        enabled: &dyn Fn(&[crate::outline::item::Attr]) -> bool,
+    ) {
         let kept = |at: Option<u32>| {
             let mut attrs = Vec::new();
-            at.is_none_or(|at| crate::outline::attr::attrs(src, at, false, &mut attrs).is_ok() && enabled(&attrs))
+            at.is_none_or(|at| {
+                crate::outline::attr::attrs(src, at, false, &mut attrs).is_ok() && enabled(&attrs)
+            })
         };
         self.variants.retain(|variant| kept(variant.attrs));
         for variant in &mut self.variants {
@@ -68,7 +74,9 @@ impl AdtDef {
 
     /// The position among the variants that are configured in of the variant whose declaration index is `index`.
     pub fn position(&self, index: u32) -> Option<usize> {
-        self.variants.iter().position(|variant| variant.index == index)
+        self.variants
+            .iter()
+            .position(|variant| variant.index == index)
     }
 }
 
@@ -83,16 +91,35 @@ pub fn adt(src: &Source, name: u32, to: u32, is_enum: bool) -> Result<AdtDef> {
         let mut variants = Vec::new();
         cursor.comma_list(open, |cursor| {
             let index = variants.len() as u32;
-            variants.push(VariantDef { index, ..cursor.variant()? });
+            variants.push(VariantDef {
+                index,
+                ..cursor.variant()?
+            });
             Ok(0)
         })?;
         variants
     } else {
         let (shape, fields) = cursor.fields()?;
         predicates.extend(cursor.where_span(&mut wheres)?);
-        vec![VariantDef { name, shape, fields, discriminant: None, attrs: None, index: 0 }]
+        vec![VariantDef {
+            name,
+            shape,
+            fields,
+            discriminant: None,
+            attrs: None,
+            index: 0,
+        }]
     };
-    Ok(AdtDef { body: cursor.body, generics: Generics { params, predicates, ..Default::default() }, variants, wheres })
+    Ok(AdtDef {
+        body: cursor.body,
+        generics: Generics {
+            params,
+            predicates,
+            ..Default::default()
+        },
+        variants,
+        wheres,
+    })
 }
 
 impl Cursor<'_> {
@@ -110,8 +137,19 @@ impl Cursor<'_> {
         self.visibility();
         let name = self.name()?;
         let (shape, fields) = self.fields()?;
-        let discriminant = if self.eat("=") { Some(self.expr()?) } else { None };
-        Ok(VariantDef { name, shape, fields, discriminant, attrs, index: 0 })
+        let discriminant = if self.eat("=") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(VariantDef {
+            name,
+            shape,
+            fields,
+            discriminant,
+            attrs,
+            index: 0,
+        })
     }
 
     fn fields(&mut self) -> Result<(Shape, Vec<FieldDef>)> {
@@ -132,7 +170,12 @@ impl Cursor<'_> {
             } else {
                 None
             };
-            fields.push(FieldDef { name, ty: cursor.ty()?, vis, attrs });
+            fields.push(FieldDef {
+                name,
+                ty: cursor.ty()?,
+                vis,
+                attrs,
+            });
             Ok(0)
         })?;
         Ok((shape, fields))
@@ -148,6 +191,10 @@ impl Cursor<'_> {
         let close = self.src.pair(self.at);
         let is_self = close == self.at + 2 && self.src.text(self.at + 1) == "self";
         self.group();
-        if is_self { FieldVis::Private } else { FieldVis::Crate }
+        if is_self {
+            FieldVis::Private
+        } else {
+            FieldVis::Crate
+        }
     }
 }

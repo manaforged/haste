@@ -3,11 +3,14 @@ mod storage;
 use lex::{is_trivia, lex, pair_up};
 pub use storage::{SourceText, SourceTokens};
 
-use std::{path::{Path, PathBuf}, sync::{Arc, Mutex}};
 use super::{rules::Frag, tree::File};
 use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap;
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 /// One non-trivia token, with the index of its matching delimiter when it opens or closes a group.
 #[derive(Clone, Copy, Debug)]
@@ -23,7 +26,12 @@ const JOINT: u32 = 1 << 31;
 
 impl Token {
     fn new(kind: TokenKind, start: u32, len: u32, joint: bool) -> Token {
-        let mut token = Token { kind, start, len, pair: u32::MAX };
+        let mut token = Token {
+            kind,
+            start,
+            len,
+            pair: u32::MAX,
+        };
         token.set_joint(joint);
         token
     }
@@ -44,7 +52,12 @@ impl Token {
     }
 
     pub(crate) fn from_raw(kind: TokenKind, start: u32, len: u32, pair: u32) -> Token {
-        Token { kind, start, len, pair }
+        Token {
+            kind,
+            start,
+            len,
+            pair,
+        }
     }
 
     pub(crate) fn raw(self) -> (u32, u32) {
@@ -55,7 +68,13 @@ impl Token {
 /// Whether `kind` is a doc comment, and whether it documents the enclosing item.
 pub fn doc(kind: TokenKind) -> Option<bool> {
     match kind {
-        TokenKind::LineComment { doc_style: Some(style) } | TokenKind::BlockComment { doc_style: Some(style), .. } => Some(style == rustc_lexer::DocStyle::Inner),
+        TokenKind::LineComment {
+            doc_style: Some(style),
+        }
+        | TokenKind::BlockComment {
+            doc_style: Some(style),
+            ..
+        } => Some(style == rustc_lexer::DocStyle::Inner),
         _ => None,
     }
 }
@@ -111,7 +130,9 @@ impl Outputs {
     pub fn get(&self, key: (u32, u32, u32)) -> Result<Option<&Source>> {
         let kept = crate::sync::lock(&self.0);
         // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
-        Ok(kept.get(&key).map(|found| unsafe { &*std::ptr::from_ref::<Source>(found) }))
+        Ok(kept
+            .get(&key)
+            .map(|found| unsafe { &*std::ptr::from_ref::<Source>(found) }))
     }
 
     /// Keeps `output` for the call `key`, or the output another caller kept first.
@@ -134,7 +155,14 @@ pub struct Tokens {
 }
 
 fn is_punct_kind(kind: TokenKind) -> bool {
-    !matches!(kind, TokenKind::Ident | TokenKind::RawIdent | TokenKind::Literal { .. } | TokenKind::Lifetime { .. } | TokenKind::RawLifetime)
+    !matches!(
+        kind,
+        TokenKind::Ident
+            | TokenKind::RawIdent
+            | TokenKind::Literal { .. }
+            | TokenKind::Lifetime { .. }
+            | TokenKind::RawLifetime
+    )
 }
 
 impl Tokens {
@@ -145,7 +173,8 @@ impl Tokens {
         if !joint {
             self.text.push(' ');
         }
-        self.tokens.push(Token::new(kind, start, text.len() as u32, joint));
+        self.tokens
+            .push(Token::new(kind, start, text.len() as u32, joint));
     }
 
     /// Copies token `at` of `src`, with its spacing and its origin mark.
@@ -165,7 +194,11 @@ impl Tokens {
         if let Some(mark) = mark {
             self.marks.push((self.tokens.len() as u32, mark));
         }
-        self.append(token.kind, &layer.text[token.start as usize..token.end() as usize], token.joint());
+        self.append(
+            token.kind,
+            &layer.text[token.start as usize..token.end() as usize],
+            token.joint(),
+        );
     }
 
     /// Writes the name `name`, marked as coming from `mark`.
@@ -178,7 +211,8 @@ impl Tokens {
 
     /// Writes `$crate` for the crate `krate`.
     pub fn dollar_crate(&mut self, krate: u32) {
-        self.marks.push((self.tokens.len() as u32, Mark::Crate(krate)));
+        self.marks
+            .push((self.tokens.len() as u32, Mark::Crate(krate)));
         self.append(TokenKind::Dollar, "$", true);
         self.append(TokenKind::Ident, "crate", false);
     }
@@ -209,7 +243,17 @@ impl Tokens {
     pub fn finish(self, path: PathBuf) -> Result<Source> {
         let mut tokens = self.tokens;
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: self.text.into(), tokens: tokens.into(), marks: self.marks, opaque: self.opaque, base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(self.origins) })
+        Ok(Source {
+            path,
+            text: self.text.into(),
+            tokens: tokens.into(),
+            marks: self.marks,
+            opaque: self.opaque,
+            base: None,
+            offset: 0,
+            outputs: Outputs::default(),
+            origins: Origins::Copied(self.origins),
+        })
     }
 
     /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
@@ -238,7 +282,8 @@ impl Tokens {
             self.copy(src, at);
         }
         for (op_from, op_to, frag) in src.opaques_in(from, to) {
-            self.opaque.push((base + (op_from - from), base + (op_to - from), frag));
+            self.opaque
+                .push((base + (op_from - from), base + (op_to - from), frag));
         }
     }
 
@@ -249,7 +294,11 @@ impl Tokens {
             return;
         }
         let slot = self.opaque.partition_point(|&(start, _, _)| start < from);
-        if self.opaque.get(slot).is_some_and(|&(start, _, _)| start == from) {
+        if self
+            .opaque
+            .get(slot)
+            .is_some_and(|&(start, _, _)| start == from)
+        {
             self.opaque[slot] = (from, to, frag);
         } else {
             self.opaque.insert(slot, (from, to, frag));
@@ -267,10 +316,18 @@ pub fn file_key(path: &Path) -> u32 {
 
 /// Whether `kind` opens a delimited group: `(`, `[` or `{`.
 pub fn opens(kind: TokenKind) -> bool {
-    matches!(kind, TokenKind::OpenParen | TokenKind::OpenBrace | TokenKind::OpenBracket)
+    matches!(
+        kind,
+        TokenKind::OpenParen | TokenKind::OpenBrace | TokenKind::OpenBracket
+    )
 }
 
-fn layer_opaques(entries: &[(u32, u32, Frag)], (low, high): (u32, u32), shift: u32, out: &mut Vec<(u32, u32, Frag)>) {
+fn layer_opaques(
+    entries: &[(u32, u32, Frag)],
+    (low, high): (u32, u32),
+    shift: u32,
+    out: &mut Vec<(u32, u32, Frag)>,
+) {
     let start = entries.partition_point(|&(s, _, _)| s < low);
     for &(s, e, frag) in &entries[start..] {
         if s >= high {
@@ -308,7 +365,17 @@ impl Source {
         let mut text = text;
         let mut tokens = lex(&mut text);
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: text.into(), tokens: tokens.into(), marks: Vec::new(), opaque: Vec::new(), base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(Vec::new()) })
+        Ok(Source {
+            path,
+            text: text.into(),
+            tokens: tokens.into(),
+            marks: Vec::new(),
+            opaque: Vec::new(),
+            base: None,
+            offset: 0,
+            outputs: Outputs::default(),
+            origins: Origins::Copied(Vec::new()),
+        })
     }
 
     #[inline]
@@ -334,7 +401,9 @@ impl Source {
         }
         let ((first, start), (last, end)) = (self.layer(from), self.layer(to - 1));
         if std::ptr::eq(first, last) {
-            let (Some((f_start, _)), Some((l_start, l_len))) = (first.tokens.raw_span(start), last.tokens.raw_span(end)) else {
+            let (Some((f_start, _)), Some((l_start, l_len))) =
+                (first.tokens.raw_span(start), last.tokens.raw_span(end))
+            else {
                 return false;
             };
             let span = &first.text[f_start as usize..(l_start + (l_len & !JOINT)) as usize];
@@ -366,10 +435,14 @@ impl Source {
         let last = if std::ptr::eq(src, to_src) {
             to_local
         } else {
-            let clamped = to.min(self.offset.saturating_sub(1)).saturating_sub(src.offset) as usize;
+            let clamped = to
+                .min(self.offset.saturating_sub(1))
+                .saturating_sub(src.offset) as usize;
             clamped.min(src.tokens.len().saturating_sub(1))
         };
-        let (Some((f_start, _)), Some((l_start, l_len))) = (src.tokens.raw_span(first), src.tokens.raw_span(last)) else {
+        let (Some((f_start, _)), Some((l_start, l_len))) =
+            (src.tokens.raw_span(first), src.tokens.raw_span(last))
+        else {
             return "";
         };
         let (start, end) = (f_start as usize, (l_start + (l_len & !JOINT)) as usize);
@@ -383,7 +456,9 @@ impl Source {
     #[inline]
     pub fn kind(&self, at: u32) -> TokenKind {
         let (src, local) = self.layer(at);
-        src.tokens.at(local).map_or(TokenKind::Eof, |token| token.kind)
+        src.tokens
+            .at(local)
+            .map_or(TokenKind::Eof, |token| token.kind)
     }
 
     #[inline]
@@ -401,9 +476,20 @@ impl Source {
     pub fn literal_text(&self, at: u32) -> Result<Option<String>> {
         let text = self.text(at);
         Ok(match self.kind(at) {
-            TokenKind::Literal { kind: rustc_lexer::LiteralKind::Str { .. } | rustc_lexer::LiteralKind::RawStr { .. }, .. } => Some(String::from_utf8(crate::body::literal::string_bytes(text)?)?),
-            TokenKind::Literal { kind: rustc_lexer::LiteralKind::Char { .. }, .. } => Some(crate::body::literal::char_value(text)?.to_string()),
-            TokenKind::Literal { kind: rustc_lexer::LiteralKind::Int { .. } | rustc_lexer::LiteralKind::Float { .. }, suffix_start } => Some(text[..suffix_start as usize].to_owned()),
+            TokenKind::Literal {
+                kind: rustc_lexer::LiteralKind::Str { .. } | rustc_lexer::LiteralKind::RawStr { .. },
+                ..
+            } => Some(String::from_utf8(crate::body::literal::string_bytes(
+                text,
+            )?)?),
+            TokenKind::Literal {
+                kind: rustc_lexer::LiteralKind::Char { .. },
+                ..
+            } => Some(crate::body::literal::char_value(text)?.to_string()),
+            TokenKind::Literal {
+                kind: rustc_lexer::LiteralKind::Int { .. } | rustc_lexer::LiteralKind::Float { .. },
+                suffix_start,
+            } => Some(text[..suffix_start as usize].to_owned()),
             TokenKind::Ident if matches!(text, "true" | "false") => Some(text.to_owned()),
             _ => None,
         })
@@ -413,7 +499,9 @@ impl Source {
     #[inline]
     pub fn pair(&self, at: u32) -> u32 {
         let (src, local) = self.layer(at);
-        src.tokens.at(local).map_or(at, |token| token.pair + (at - local as u32))
+        src.tokens
+            .at(local)
+            .map_or(at, |token| token.pair + (at - local as u32))
     }
 
     /// The tokens from `from` up to `to` as `stringify!` spells them.
@@ -422,7 +510,11 @@ impl Source {
     }
 
     /// Spells `from..to` with `skip(at)` returning `0` to emit, `1` to drop an opening wrapper, or `2` to drop a closing wrapper while preserving trailing whitespace.
-    pub(crate) fn spelled_with(&self, (from, to): (u32, u32), mut skip: impl FnMut(u32) -> u8) -> String {
+    pub(crate) fn spelled_with(
+        &self,
+        (from, to): (u32, u32),
+        mut skip: impl FnMut(u32) -> u8,
+    ) -> String {
         let mut text = String::new();
         let mut pending_space = false;
         for at in from..to {
@@ -448,7 +540,9 @@ impl Source {
     #[inline]
     pub fn joint(&self, at: u32) -> bool {
         let (src, local) = self.layer(at);
-        src.tokens.raw_span(local).is_some_and(|(_, raw_len)| raw_len & JOINT != 0)
+        src.tokens
+            .raw_span(local)
+            .is_some_and(|(_, raw_len)| raw_len & JOINT != 0)
     }
 
     /// The crate that the `$crate` starting at token `at` names, when a macro wrote it.
@@ -486,7 +580,10 @@ impl Source {
             return None;
         }
         let (src, local) = self.layer(at);
-        let found = src.opaque.binary_search_by_key(&(local as u32), |&(start, _, _)| start).ok()?;
+        let found = src
+            .opaque
+            .binary_search_by_key(&(local as u32), |&(start, _, _)| start)
+            .ok()?;
         let (_, end, frag) = src.opaque[found];
         Some((end + (at - local as u32), frag))
     }
@@ -500,16 +597,29 @@ impl Source {
         if from < self.offset
             && let Some(base) = &self.base
         {
-            layer_opaques(&base.source.opaque, (from, to.min(self.offset)), 0, &mut found);
+            layer_opaques(
+                &base.source.opaque,
+                (from, to.min(self.offset)),
+                0,
+                &mut found,
+            );
         }
         if to > self.offset {
-            layer_opaques(&self.opaque, (from.saturating_sub(self.offset), to - self.offset), self.offset, &mut found);
+            layer_opaques(
+                &self.opaque,
+                (from.saturating_sub(self.offset), to - self.offset),
+                self.offset,
+                &mut found,
+            );
         }
         found
     }
 
     fn own_mark(&self, local: u32) -> Option<Mark> {
-        self.marks.binary_search_by_key(&local, |(token, _)| *token).ok().map(|found| self.marks[found].1)
+        self.marks
+            .binary_search_by_key(&local, |(token, _)| *token)
+            .ok()
+            .map(|found| self.marks[found].1)
     }
 
     /// The byte offset in the file at `path`, as read from disk, of token `at` or of the token a macro copied it from.
@@ -517,19 +627,26 @@ impl Source {
         let (src, local) = self.layer(at);
         match &src.origins {
             Origins::Read => src.tokens.raw_span(local).map(|(start, _)| start),
-            Origins::Copied(copied) => copied.binary_search_by_key(&(local as u32), |&(token, _)| token).ok().map(|found| copied[found].1),
+            Origins::Copied(copied) => copied
+                .binary_search_by_key(&(local as u32), |&(token, _)| token)
+                .ok()
+                .map(|found| copied[found].1),
         }
     }
 
     /// The source place of token `at` for debug line tables: `file_key(path)` in the high 32 bits and the disk byte offset in the low 32, or 0 when the token lies nowhere on disk.
     pub fn place(&self, at: u32) -> u64 {
-        self.origin(at).map_or(0, |byte| u64::from(file_key(&self.path)) << 32 | u64::from(byte))
+        self.origin(at).map_or(0, |byte| {
+            u64::from(file_key(&self.path)) << 32 | u64::from(byte)
+        })
     }
 
     /// The byte offset of token `at` in the text of its layer.
     pub fn byte(&self, at: u32) -> u32 {
         let (src, local) = self.layer(at);
-        src.tokens.raw_span(local).map_or(src.text.len() as u32, |(start, _)| start)
+        src.tokens
+            .raw_span(local)
+            .map_or(src.text.len() as u32, |(start, _)| start)
     }
 
     /// The line of token `at` in the text of its layer, counting from one.
@@ -542,7 +659,10 @@ impl Source {
     pub fn column(&self, at: u32) -> usize {
         let (src, _) = self.layer(at);
         let before = &src.text[..self.byte(at) as usize];
-        before[before.rfind('\n').map_or(0, |newline| newline + 1)..].chars().count() + 1
+        before[before.rfind('\n').map_or(0, |newline| newline + 1)..]
+            .chars()
+            .count()
+            + 1
     }
 
     /// The number of tokens, those of the base included.

@@ -24,7 +24,13 @@ struct Run {
 
 /// Regroups field copies into moves when some block stores enough loaded values to be worth it.
 pub(super) fn run(func: &mut Function, prov: Option<&Provenance>) -> bool {
-    if !func.blocks.iter().any(|b| b.insts.iter().filter(|&&i| matches!(func.insts[i.index()].op, Op::Store(..))).count() >= MIN_PIECES) {
+    if !func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .filter(|&&i| matches!(func.insts[i.index()].op, Op::Store(..)))
+            .count()
+            >= MIN_PIECES
+    }) {
         return false;
     }
     let defs = defs(func);
@@ -39,7 +45,14 @@ pub(super) fn run(func: &mut Function, prov: Option<&Provenance>) -> bool {
 }
 
 fn worth(func: &Function, defs: &[Option<Inst>]) -> bool {
-    func.blocks.iter().any(|block| block.insts.iter().filter(|inst| loaded_store(func, defs, **inst).is_some()).count() >= MIN_PIECES)
+    func.blocks.iter().any(|block| {
+        block
+            .insts
+            .iter()
+            .filter(|inst| loaded_store(func, defs, **inst).is_some())
+            .count()
+            >= MIN_PIECES
+    })
 }
 
 fn defs(func: &Function) -> Vec<Option<Inst>> {
@@ -76,11 +89,26 @@ fn regroup(func: &mut Function, prov: &Provenance, cfg: &Cfg, defs: &[Option<Ins
     changed
 }
 
-fn loaded_store(func: &Function, defs: &[Option<Inst>], inst: Inst) -> Option<(Value, i64, Value, i64, u32, Inst)> {
-    let Op::Store(value, dst, off) = func.insts[inst.index()].op else { return None };
+fn loaded_store(
+    func: &Function,
+    defs: &[Option<Inst>],
+    inst: Inst,
+) -> Option<(Value, i64, Value, i64, u32, Inst)> {
+    let Op::Store(value, dst, off) = func.insts[inst.index()].op else {
+        return None;
+    };
     let load = defs.get(value.index()).copied().flatten()?;
-    let Op::Load(src, src_off) = func.insts[load.index()].op else { return None };
-    Some((dst, i64::from(off), src, i64::from(src_off), func.ty(value).bytes(), load))
+    let Op::Load(src, src_off) = func.insts[load.index()].op else {
+        return None;
+    };
+    Some((
+        dst,
+        i64::from(off),
+        src,
+        i64::from(src_off),
+        func.ty(value).bytes(),
+        load,
+    ))
 }
 
 fn find(func: &Function, prov: &Provenance, chain: &[Block], defs: &[Option<Inst>]) -> Option<Run> {
@@ -88,14 +116,26 @@ fn find(func: &Function, prov: &Provenance, chain: &[Block], defs: &[Option<Inst
     let mut run: Option<Run> = None;
     for (at, inst) in func.blocks[block.index()].insts.iter().enumerate() {
         if let Some((dst, off, src, src_off, bytes, load)) = loaded_store(func, defs, *inst) {
-            let piece = Piece { at, off, bytes, load };
+            let piece = Piece {
+                at,
+                off,
+                bytes,
+                load,
+            };
             match run.as_mut() {
-                Some(open) if open.dst == dst && open.src == src && open.delta == src_off - off => open.pieces.push(piece),
+                Some(open) if open.dst == dst && open.src == src && open.delta == src_off - off => {
+                    open.pieces.push(piece)
+                }
                 _ => {
                     if let Some(done) = run.take().filter(|done| valid(func, prov, chain, done)) {
                         return Some(done);
                     }
-                    run = Some(Run { dst, src, delta: src_off - off, pieces: vec![piece] });
+                    run = Some(Run {
+                        dst,
+                        src,
+                        delta: src_off - off,
+                        pieces: vec![piece],
+                    });
                 }
             }
             continue;
@@ -128,7 +168,11 @@ fn valid(func: &Function, prov: &Provenance, chain: &[Block], run: &Run) -> bool
     if run.pieces.len() < MIN_PIECES {
         return false;
     }
-    let Some((lo, bytes)) = span(run).filter(|(_, bytes)| (MIN_BYTES..=crate::copy::MOVE_INLINE).contains(bytes)) else { return false };
+    let Some((lo, bytes)) =
+        span(run).filter(|(_, bytes)| (MIN_BYTES..=crate::copy::MOVE_INLINE).contains(bytes))
+    else {
+        return false;
+    };
     let dst = prov.loc(run.dst, lo, bytes);
     let src = prov.loc(run.src, lo + run.delta, bytes);
     if may_alias(dst, src, prov) {
@@ -137,15 +181,40 @@ fn valid(func: &Function, prov: &Provenance, chain: &[Block], run: &Run) -> bool
     let last = chain.len() - 1;
     let first = run.pieces.first().map_or(0, |piece| piece.at);
     let end = run.pieces.last().map_or(0, |piece| piece.at);
-    let reads_dst = func.blocks[chain[last].index()].insts[first..end].iter().any(|inst| match func.insts[inst.index()].op {
-        Op::Load(addr, off) => func.insts[inst.index()].result.is_some_and(|value| may_alias(prov.loc(addr, i64::from(off), func.ty(value).bytes()), dst, prov)),
-        _ => false,
-    });
-    !reads_dst && run.pieces.iter().all(|piece| unclobbered(func, prov, chain, piece.load, end, src))
+    let reads_dst = func.blocks[chain[last].index()].insts[first..end]
+        .iter()
+        .any(|inst| match func.insts[inst.index()].op {
+            Op::Load(addr, off) => func.insts[inst.index()].result.is_some_and(|value| {
+                may_alias(
+                    prov.loc(addr, i64::from(off), func.ty(value).bytes()),
+                    dst,
+                    prov,
+                )
+            }),
+            _ => false,
+        });
+    !reads_dst
+        && run
+            .pieces
+            .iter()
+            .all(|piece| unclobbered(func, prov, chain, piece.load, end, src))
 }
 
-fn unclobbered(func: &Function, prov: &Provenance, chain: &[Block], load: Inst, end: usize, src: MemLoc) -> bool {
-    let Some((from, pos)) = chain.iter().enumerate().find_map(|(index, block)| func.blocks[block.index()].insts.iter().position(|inst| *inst == load).map(|pos| (index, pos))) else {
+fn unclobbered(
+    func: &Function,
+    prov: &Provenance,
+    chain: &[Block],
+    load: Inst,
+    end: usize,
+    src: MemLoc,
+) -> bool {
+    let Some((from, pos)) = chain.iter().enumerate().find_map(|(index, block)| {
+        func.blocks[block.index()]
+            .insts
+            .iter()
+            .position(|inst| *inst == load)
+            .map(|pos| (index, pos))
+    }) else {
         return false;
     };
     let last = chain.len() - 1;
@@ -153,22 +222,40 @@ fn unclobbered(func: &Function, prov: &Provenance, chain: &[Block], load: Inst, 
         let insts = &func.blocks[chain[index].index()].insts;
         let lo = if index == from { pos + 1 } else { 0 };
         let hi = if index == last { end } else { insts.len() };
-        lo >= hi || !insts[lo..hi].iter().any(|inst| clobbers_loc(func, (&func.insts[inst.index()].op, None), src, prov))
+        lo >= hi
+            || !insts[lo..hi]
+                .iter()
+                .any(|inst| clobbers_loc(func, (&func.insts[inst.index()].op, None), src, prov))
     })
 }
 
 fn apply(func: &mut Function, block: Block, run: Run) {
-    let Some((lo, bytes)) = span(&run) else { return };
+    let Some((lo, bytes)) = span(&run) else {
+        return;
+    };
     let end = run.pieces.last().map_or(0, |piece| piece.at);
     let mut added = Vec::new();
     let dst = offset(func, &mut added, run.dst, lo);
     let src = offset(func, &mut added, run.src, lo + run.delta);
     let last = func.blocks[block.index()].insts[end];
     func.insts[last.index()].op = Op::Move(dst, src, bytes);
-    let stores: Vec<usize> = run.pieces.iter().map(|piece| piece.at).filter(|at| *at != end).collect();
+    let stores: Vec<usize> = run
+        .pieces
+        .iter()
+        .map(|piece| piece.at)
+        .filter(|at| *at != end)
+        .collect();
     let insts = &mut func.blocks[block.index()].insts;
-    let mut kept: Vec<Inst> = insts.iter().enumerate().filter(|(at, _)| !stores.contains(at)).map(|(_, inst)| *inst).collect();
-    let at = kept.iter().position(|inst| *inst == last).unwrap_or(kept.len());
+    let mut kept: Vec<Inst> = insts
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| !stores.contains(at))
+        .map(|(_, inst)| *inst)
+        .collect();
+    let at = kept
+        .iter()
+        .position(|inst| *inst == last)
+        .unwrap_or(kept.len());
     kept.splice(at..at, added);
     *insts = kept;
 }

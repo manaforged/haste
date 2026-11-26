@@ -1,5 +1,6 @@
 mod carry;
 mod decided;
+mod edges;
 mod eval;
 mod loop_spec;
 mod ret;
@@ -8,19 +9,14 @@ mod stored;
 mod tail;
 mod widen;
 
-use crate::fold::extend;
-use crate::ir::{Block, Domain, Function, Inst, InstData, IntCC, Op, Value};
+use crate::ir::{Block, Domain, Function, Inst, InstData, Op, Value};
 
+use self::edges::{split_select_branches, thread_br_table, thread_brif, thread_jump};
 pub(crate) use self::eval::is_bool_val;
-use self::eval::{
-    EdgeSeed, EvalState, ThreadCx, bind, cmp_implies, eval_cond_truth, eval_op, fact_of, lookup, lookup_const,
-    step_inst,
-};
+use self::eval::{EvalState, ThreadCx, eval_op, lookup};
 
 const MAX_DISP_INSTS: usize = 10;
 const MAX_JUMP_DISP_INSTS: usize = 5;
-const MAX_CHAIN: usize = 8;
-const MAX_BRIF_SPEC_OPS: usize = 4;
 
 struct Eval {
     chosen_target: Block,
@@ -36,6 +32,35 @@ fn block_bit(block: Block) -> u64 {
     1 << (block.index() % 64)
 }
 
+pub(super) fn defs_and_uses(func: &Function) -> (Vec<Option<Inst>>, Vec<u32>) {
+    let mut defs = vec![None; func.types.len()];
+    let mut users = vec![0_u32; func.types.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            if let Some(res) = data.result {
+                defs[res.index()] = Some(inst);
+            }
+            data.op.for_operands(|v| users[v.index()] += 1);
+        }
+    }
+    (defs, users)
+}
+
+pub(super) fn retarget_empty_preds(func: &mut Function, moved: &[(Block, Block, Block)]) -> bool {
+    let mut changed = false;
+    for &(pred, from, to) in moved {
+        let Some(&term) = func.blocks[pred.index()].insts.last() else {
+            continue;
+        };
+        changed |= func.insts[term.index()].op.retarget_empty(from, to);
+    }
+    if changed {
+        func.bump_cfg();
+    }
+    changed
+}
+
 fn note_use(uses: &mut Vec<u64>, block: Block, value: Value) {
     if uses.len() <= value.index() {
         uses.resize(value.index() + 1, 0);
@@ -48,7 +73,10 @@ fn outside_uses(func: &Function) -> Vec<u64> {
     let mut home = vec![u32::MAX; func.types.len()];
     for (index, block) in func.blocks.iter().enumerate() {
         let id = index as u32;
-        block.params.iter().for_each(|param| home[param.index()] = id);
+        block
+            .params
+            .iter()
+            .for_each(|param| home[param.index()] = id);
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
             data.op.for_operands(|v| {
@@ -64,113 +92,13 @@ fn outside_uses(func: &Function) -> Vec<u64> {
     uses
 }
 
-fn step_block(
-    func: &Function,
-    cx: &ThreadCx<'_>,
-    pred: Option<Block>,
-    cur: Block,
-    cur_args: &[Value],
-    state: &mut EvalState,
-) -> Option<(Block, Vec<Value>, bool)> {
-    let block = &func.blocks[cur.index()];
-    if cur_args.len() != block.params.len() || !(1..=MAX_DISP_INSTS).contains(&block.insts.len()) {
-        return None;
-    }
-    let (&last, body) = block.insts.split_last()?;
-    if !matches!(func.insts[last.index()].op, Op::Brif(..) | Op::Jump(..) | Op::BrTable(..)) {
-        return None;
-    }
-    bind(cx, state, &block.params, cur_args);
-    for &inst in body {
-        step_inst(func, cx, pred, inst, state)?;
-    }
-    let (next_b, raw_args, resolved_branch): (Block, &[Value], bool) = match &func.insts[last.index()].op {
-        Op::Brif(cond, then_b, then_args, else_b, else_args) => {
-            let cond_val = lookup(&state.map, *cond);
-            let (nb, args) = if eval_cond_truth(func, cx, state, cond_val)? { (*then_b, then_args) } else { (*else_b, else_args) };
-            (nb, args, true)
-        }
-        Op::Jump(target, args) => (*target, args, false),
-        Op::BrTable(index, default, targets) => {
-            let idx_val = lookup(&state.map, *index);
-            let next_b = if let Some(c) = lookup_const(&state.local_consts, cx.consts, idx_val) {
-                crate::fold::table_target(extend(c, func.ty(idx_val), false) as u64, *default, targets)
-            } else if let Some(u) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, idx_val).and_then(|f| f.exact()) {
-                crate::fold::table_target(u, *default, targets)
-            } else if targets.iter().all(|&t| t == *default) {
-                *default
-            } else {
-                let ty = func.ty(idx_val);
-                let fits_default = ty.is_small_int()
-                    && (targets.len() as u64) <= ty.unsigned_max()
-                    && state.edge_cmps.iter().any(|&(v, v_ty, cc1, imm1)| {
-                        v == idx_val && cmp_implies(v_ty, cc1, imm1, IntCC::UnsignedGreaterThanOrEqual, targets.len() as i64) == Some(true)
-                    });
-                if fits_default { *default } else { return None }
-            };
-            (next_b, &[], true)
-        }
-        _ => return None,
-    };
-    if next_b == cur {
-        return None;
-    }
-    let next_args: Vec<Value> = raw_args.iter().map(|&v| lookup(&state.map, v)).collect();
-    Some((next_b, next_args, resolved_branch))
-}
-
 fn redefines(func: &Function, block: Block, held: &[Value]) -> bool {
-    !held.is_empty() && func.blocks[block.index()].insts.iter().filter_map(|inst| func.insts[inst.index()].result).any(|result| held.contains(&result))
-}
-
-fn marks(state: &EvalState) -> (usize, usize, usize) {
-    (state.map.len(), state.local_ops.len(), state.local_consts.len())
-}
-
-fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>], (pred, disp): (Option<Block>, Block), incoming: &[Value], seed: EdgeSeed) -> Option<Eval> {
-    if func.blocks[disp.index()].params.is_empty() && matches!(seed, EdgeSeed::None) && !(pred.is_some() && stored::body_has_load(func, disp)) {
-        return None;
-    }
-    let mut state = EvalState::default();
-    state.seed(func, cx, disp, seed);
-    if let Some(p) = pred {
-        state.seed_pred(func, cx, p, disp);
-    }
-    let seeded = state.seeded();
-    if redefines(func, disp, &seeded) {
-        return None;
-    }
-    let first = step_block(func, cx, pred, disp, incoming, &mut state)?;
-    let mut visited = vec![disp];
-    let mut stops = vec![(first, marks(&state))];
-    while let Some(((next_b, next_args, resolved), _)) = stops.last() {
-        if visited.len() >= MAX_CHAIN || cx.pinned[next_b.index()] || visited.contains(next_b) || redefines(func, *next_b, &seeded) {
-            break;
-        }
-        let cur = *next_b;
-        let Some((nb, na, step_resolved)) = step_block(func, cx, pred, cur, next_args, &mut state) else {
-            break;
-        };
-        let resolved = *resolved | step_resolved;
-        visited.push(cur);
-        stops.push(((nb, na, resolved), marks(&state)));
-    }
-    while let Some(((chosen_target, mut chosen_args, resolved_branch), kept)) = stops.pop() {
-        let chain = &visited[..=stops.len()];
-        if !resolved_branch && (chain.len() == 1 || crate::cfg::dominates(cx.idom, chosen_target, chain[chain.len() - 1])) {
-            continue;
-        }
-        let Some(carry) = carry::plan(func, cx, single, (chain, incoming), chosen_target) else {
-            continue;
-        };
-        state.map.truncate(kept.0);
-        state.local_ops.truncate(kept.1);
-        state.local_consts.truncate(kept.2);
-        chosen_args.extend(carry.values.iter().map(|&v| lookup(&state.map, v)));
-        let needed = needed_ops(&state, &chosen_args);
-        return Some(Eval { chosen_target, chosen_args, local_ops: state.local_ops, local_consts: state.local_consts, needed, resolved_branch, carry });
-    }
-    None
+    !held.is_empty()
+        && func.blocks[block.index()]
+            .insts
+            .iter()
+            .filter_map(|inst| func.insts[inst.index()].result)
+            .any(|result| held.contains(&result))
 }
 
 fn needed_ops(state: &EvalState, args: &[Value]) -> Vec<bool> {
@@ -181,7 +109,12 @@ fn needed_ops(state: &EvalState, args: &[Value]) -> Vec<bool> {
         }
     }
     for i in (0..state.local_ops.len()).rev() {
-        if !needed[i] || state.local_consts.iter().any(|&(r, _)| r == state.local_ops[i].0) {
+        if !needed[i]
+            || state
+                .local_consts
+                .iter()
+                .any(|&(r, _)| r == state.local_ops[i].0)
+        {
             continue;
         }
         state.local_ops[i].1.for_operands(|v| {
@@ -193,12 +126,27 @@ fn needed_ops(state: &EvalState, args: &[Value]) -> Vec<bool> {
     needed
 }
 
-fn non_const_needed(eval: &Eval) -> usize {
-    eval.local_ops
-        .iter()
-        .zip(&eval.needed)
-        .filter(|&((res, _), &need)| need && !eval.local_consts.iter().any(|&(r, _)| r == *res))
-        .count()
+fn push_emit_inst(
+    func: &mut Function,
+    consts: &mut Vec<Option<i64>>,
+    emit_map: &mut Vec<(Value, Value)>,
+    inserted: &mut Vec<Inst>,
+    orig: Value,
+    op: Op,
+    imm: Option<i64>,
+) -> Value {
+    let val = Value(func.types.len() as u32);
+    func.types.push(func.ty(orig));
+    consts.push(imm);
+    let inst = Inst(func.insts.len() as u32);
+    func.insts.push(InstData {
+        op,
+        result: Some(val),
+        loc: 0,
+    });
+    inserted.push(inst);
+    emit_map.push((orig, val));
+    val
 }
 
 fn resolve_emit_val(
@@ -216,46 +164,74 @@ fn resolve_emit_val(
     let Some(&(_, imm)) = local_consts.iter().rev().find(|&&(r, _)| r == val) else {
         return val;
     };
-    let c_val = Value(func.types.len() as u32);
-    func.types.push(func.ty(val));
-    consts.push(Some(imm));
-    let c_inst = Inst(func.insts.len() as u32);
-    func.insts.push(InstData { op: Op::Const(imm), result: Some(c_val), loc: 0 });
-    inserted.push(c_inst);
-    emit_map.push((val, c_val));
-    c_val
+    push_emit_inst(
+        func,
+        consts,
+        emit_map,
+        inserted,
+        val,
+        Op::Const(imm),
+        Some(imm),
+    )
 }
 
-fn emit_needed(func: &mut Function, pred: Block, (consts, uses): (&mut Vec<Option<i64>>, &mut Vec<u64>), eval: Eval) -> (Block, Vec<Value>) {
+fn emit_needed(
+    func: &mut Function,
+    pred: Block,
+    (consts, uses): (&mut Vec<Option<i64>>, &mut Vec<u64>),
+    eval: Eval,
+) -> (Block, Vec<Value>) {
     let mut emit_map: Vec<(Value, Value)> = Vec::new();
     let mut inserted: Vec<Inst> = Vec::new();
     for (idx, (res, op)) in eval.local_ops.into_iter().enumerate() {
         if !eval.needed[idx] {
             continue;
         }
-        let (new_op, imm_opt) = if let Some(&(_, imm)) = eval.local_consts.iter().find(|&&(r, _)| r == res) {
-            (Op::Const(imm), Some(imm))
-        } else {
-            let mut mapped = op;
-            mapped.map_operands(|v| resolve_emit_val(func, consts, &eval.local_consts, &mut emit_map, &mut inserted, v));
-            (mapped, None)
-        };
-        let ty = func.ty(res);
-        let new_val = Value(func.types.len() as u32);
-        func.types.push(ty);
-        consts.push(imm_opt);
-        let new_inst = Inst(func.insts.len() as u32);
-        func.insts.push(InstData { op: new_op, result: Some(new_val), loc: 0 });
-        inserted.push(new_inst);
-        emit_map.push((res, new_val));
+        let (new_op, imm_opt) =
+            if let Some(&(_, imm)) = eval.local_consts.iter().find(|&&(r, _)| r == res) {
+                (Op::Const(imm), Some(imm))
+            } else {
+                let mut mapped = op;
+                mapped.map_operands(|v| {
+                    resolve_emit_val(
+                        func,
+                        consts,
+                        &eval.local_consts,
+                        &mut emit_map,
+                        &mut inserted,
+                        v,
+                    )
+                });
+                (mapped, None)
+            };
+        push_emit_inst(
+            func,
+            consts,
+            &mut emit_map,
+            &mut inserted,
+            res,
+            new_op,
+            imm_opt,
+        );
     }
     let new_args: Vec<Value> = eval
         .chosen_args
         .into_iter()
-        .map(|v| resolve_emit_val(func, consts, &eval.local_consts, &mut emit_map, &mut inserted, v))
+        .map(|v| {
+            resolve_emit_val(
+                func,
+                consts,
+                &eval.local_consts,
+                &mut emit_map,
+                &mut inserted,
+                v,
+            )
+        })
         .collect();
     for &inst in &inserted {
-        func.insts[inst.index()].op.for_operands(|v| note_use(uses, pred, v));
+        func.insts[inst.index()]
+            .op
+            .for_operands(|v| note_use(uses, pred, v));
     }
     new_args.iter().for_each(|&v| note_use(uses, pred, v));
     if !inserted.is_empty() {
@@ -266,7 +242,14 @@ fn emit_needed(func: &mut Function, pred: Block, (consts, uses): (&mut Vec<Optio
     (eval.chosen_target, new_args)
 }
 
-fn emit_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, cond: Value, then: Value, otherwise: Value) -> Value {
+fn emit_select(
+    func: &mut Function,
+    cx: &mut ThreadCx<'_>,
+    pred: Block,
+    cond: Value,
+    then: Value,
+    otherwise: Value,
+) -> Value {
     let value = func.value(func.ty(then));
     cx.consts.push(None);
     let inst = func.add(Op::Select(cond, then, otherwise), Some(value));
@@ -276,80 +259,11 @@ fn emit_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, cond: Va
     value
 }
 
-fn finish_split_branch(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, cond: Value, et: Eval, ef: Eval) -> Op {
-    note_use(cx.uses, pred, cond);
-    let (t_b, t_a) = emit_needed(func, pred, (&mut *cx.consts, &mut *cx.uses), et);
-    let (f_b, f_a) = emit_needed(func, pred, (&mut *cx.consts, &mut *cx.uses), ef);
-    if t_b == f_b && t_a == f_a {
-        return Op::Jump(t_b, t_a);
-    }
-    if t_b == f_b && t_a.len() == f_a.len() {
-        let diffs: Vec<usize> = (0..t_a.len()).filter(|&i| t_a[i] != f_a[i]).collect();
-        if diffs.len() == 1 && func.ty(t_a[diffs[0]]) == func.ty(f_a[diffs[0]]) {
-            let i = diffs[0];
-            let new_v = emit_select(func, cx, pred, cond, t_a[i], f_a[i]);
-            let mut merged = t_a;
-            merged[i] = new_v;
-            return Op::Jump(t_b, merged);
-        }
-    }
-    Op::Brif(cond, t_b, t_a, f_b, f_a)
-}
-
-fn eval_pair_ok(func: &Function, disp: Block, et: &Eval, ef: &Eval) -> bool {
-    if et.chosen_target == disp || ef.chosen_target == disp || non_const_needed(et) + non_const_needed(ef) > MAX_BRIF_SPEC_OPS {
-        return false;
-    }
-    if et.resolved_branch || ef.resolved_branch {
-        return true;
-    }
-    if et.chosen_target != ef.chosen_target || et.chosen_args.len() != ef.chosen_args.len() {
-        return false;
-    }
-    let mut diffs = et.chosen_args.iter().zip(&ef.chosen_args).filter(|(a, b)| a != b);
-    match (diffs.next(), diffs.next()) {
-        (None, _) => true,
-        (Some((a, b)), None) => func.ty(*a) == func.ty(*b),
-        _ => false,
-    }
-}
-
-/// Splits each branch on a select with one constant arm into a branch on the select's condition, whose constant side goes straight to its target, and a new block that branches on the other arm when that arm is a comparison, a load, a block parameter or a logic op on flags.
-fn split_select_branches(func: &mut Function) -> bool {
-    let uses = func.use_counts();
-    let defs = crate::fold::defs(func);
-    let konst = |v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
-    let compare = |v: Value| {
-        defs[v.index()].is_none_or(|inst| match func.insts[inst.index()].op {
-            Op::Icmp(..) | Op::Load(..) => true,
-            Op::Binary(crate::ir::Binary::Band | crate::ir::Binary::Bor | crate::ir::Binary::Bxor, ..) => func.ty(v) == crate::ir::Type::I8,
-            _ => false,
-        })
-    };
-    let mut splits = Vec::new();
-    for block in &func.blocks {
-        let Some(&term) = block.insts.last() else { continue };
-        let Op::Brif(sel, ..) = func.insts[term.index()].op else { continue };
-        let Some((cond, then, otherwise)) = select_arms(func, &defs, sel).filter(|_| uses[sel.index()] == 1) else { continue };
-        match (konst(then), konst(otherwise)) {
-            (Some(k), None) if compare(otherwise) => splits.push((term, cond, k != 0, otherwise, true)),
-            (None, Some(k)) if compare(then) => splits.push((term, cond, k != 0, then, false)),
-            _ => {}
-        }
-    }
-    for &(term, cond, fixed, other, on_true) in &splits {
-        let Op::Brif(_, then, then_args, otherwise, else_args) = func.insts[term.index()].op.clone() else { continue };
-        let direct = if fixed { (then, then_args.clone()) } else { (otherwise, else_args.clone()) };
-        let inner = func.add(Op::Brif(other, then, then_args, otherwise, else_args), None);
-        let rest = Block(func.blocks.len() as u32);
-        func.blocks.push(crate::ir::BlockData { params: Vec::new(), insts: vec![inner] });
-        func.insts[term.index()].op = if on_true { Op::Brif(cond, direct.0, direct.1, rest, Vec::new()) } else { Op::Brif(cond, rest, Vec::new(), direct.0, direct.1) };
-    }
-    if !splits.is_empty() { func.bump_cfg(); }
-    !splits.is_empty()
-}
-
-fn select_arms(func: &Function, defs: &[Option<Inst>], value: Value) -> Option<(Value, Value, Value)> {
+fn select_arms(
+    func: &Function,
+    defs: &[Option<Inst>],
+    value: Value,
+) -> Option<(Value, Value, Value)> {
     if func.is_unpredictable(value) {
         return None;
     }
@@ -359,9 +273,18 @@ fn select_arms(func: &Function, defs: &[Option<Inst>], value: Value) -> Option<(
     }
 }
 
-fn select_split(func: &Function, defs: &[Option<Inst>], args: &[Value], at: usize) -> Option<(Value, Vec<Value>, Vec<Value>)> {
+fn select_split(
+    func: &Function,
+    defs: &[Option<Inst>],
+    args: &[Value],
+    at: usize,
+) -> Option<(Value, Vec<Value>, Vec<Value>)> {
     let (sel_c, sel_t, sel_f) = select_arms(func, defs, args[at])?;
-    if sel_t == sel_f || args[..at].iter().any(|&a| select_arms(func, defs, a).is_some_and(|(c, t, f)| c == sel_c && t != f)) {
+    if sel_t == sel_f
+        || args[..at]
+            .iter()
+            .any(|&a| select_arms(func, defs, a).is_some_and(|(c, t, f)| c == sel_c && t != f))
+    {
         return None;
     }
     let mut args_t = args.to_vec();
@@ -377,46 +300,18 @@ fn select_split(func: &Function, defs: &[Option<Inst>], args: &[Value], at: usiz
     Some((sel_c, args_t, args_f))
 }
 
-fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Block, term: Inst, args: &[Value]) -> bool {
-    for at in 0..args.len() {
-        let Some((sel_c, args_t, args_f)) = select_split(func, cx.defs, args, at) else { continue };
-        let (Some(et), Some(ef)) = (
-            eval_dispatcher(func, cx, &[], (Some(pred), disp), &args_t, EdgeSeed::Brif(sel_c, true)),
-            eval_dispatcher(func, cx, &[], (Some(pred), disp), &args_f, EdgeSeed::Brif(sel_c, false)),
-        ) else {
-            continue;
-        };
-        if !eval_pair_ok(func, disp, &et, &ef) {
-            continue;
-        }
-        func.insts[term.index()].op = finish_split_branch(func, cx, pred, sel_c, et, ef);
-        return true;
-    }
-    for &arg in args {
-        if lookup_const(&[], cx.consts, arg).is_some() || !is_bool_val(func, cx.defs, cx.consts, arg) {
-            continue;
-        }
-        let (Some(et), Some(ef)) = (
-            eval_dispatcher(func, cx, &[], (Some(pred), disp), args, EdgeSeed::Const(arg, 1)),
-            eval_dispatcher(func, cx, &[], (Some(pred), disp), args, EdgeSeed::Const(arg, 0)),
-        ) else {
-            continue;
-        };
-        if !eval_pair_ok(func, disp, &et, &ef) {
-            continue;
-        }
-        func.insts[term.index()].op = finish_split_branch(func, cx, pred, arg, et, ef);
-        return true;
-    }
-    false
-}
-
-fn single_pred_brif_seed(func: &Function, single: &[Option<Block>], pred: Block) -> Option<(Value, bool)> {
+fn single_pred_brif_seed(
+    func: &Function,
+    single: &[Option<Block>],
+    pred: Block,
+) -> Option<(Value, bool)> {
     let mut cur = pred;
     for _ in 0..2 {
         let parent = single[cur.index()]?;
         match func.last(parent) {
-            Some(Op::Brif(cond, t_blk, _, e_blk, _)) if *t_blk != *e_blk && (*t_blk == cur || *e_blk == cur) => {
+            Some(Op::Brif(cond, t_blk, _, e_blk, _))
+                if *t_blk != *e_blk && (*t_blk == cur || *e_blk == cur) =>
+            {
                 return Some((*cond, *t_blk == cur));
             }
             Some(Op::Jump(target, _)) if *target == cur => cur = parent,
@@ -424,119 +319,6 @@ fn single_pred_brif_seed(func: &Function, single: &[Option<Block>], pred: Block)
         }
     }
     None
-}
-
-fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, disp: Block) -> bool {
-    let Some(&term) = func.blocks[pred.index()].insts.last() else {
-        return false;
-    };
-    let Op::Jump(target, ref args) = func.insts[term.index()].op else {
-        return false;
-    };
-    if target != disp {
-        return false;
-    }
-    let args = args.clone();
-    if let Some(eval) = eval_dispatcher(func, cx, single, (Some(pred), disp), &args, EdgeSeed::None) {
-        let (new_target, new_args) = carry::commit(func, cx, single, pred, eval);
-        func.insts[term.index()].op = Op::Jump(new_target, new_args);
-        return true;
-    }
-    if let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
-        && let Some(eval) = eval_dispatcher(func, cx, single, (Some(pred), disp), &args, EdgeSeed::Brif(cond, taken))
-        && eval.chosen_target != disp
-        && non_const_needed(&eval) <= MAX_BRIF_SPEC_OPS
-    {
-        let (new_target, new_args) = carry::commit(func, cx, single, pred, eval);
-        func.insts[term.index()].op = Op::Jump(new_target, new_args);
-        return true;
-    }
-    thread_jump_select(func, cx, pred, disp, term, &args)
-}
-
-fn brif_arm(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, disp: Block, taken: bool) -> Option<(Block, Vec<Value>)> {
-    let Some(Op::Brif(cond, then_b, then_args, else_b, else_args)) = func.last(pred) else {
-        return None;
-    };
-    let (target, args) = if taken { (*then_b, then_args) } else { (*else_b, else_args) };
-    if target != disp {
-        return None;
-    }
-    let ok = |eval: &Eval, strict: bool| {
-        let needed = non_const_needed(eval);
-        eval.chosen_target != target
-            && needed <= MAX_BRIF_SPEC_OPS
-            && (eval.resolved_branch || needed == 0)
-            && (eval.carry.values.is_empty() || !func.successors(pred).any(|s| s == eval.chosen_target))
-            && (!strict || (eval.resolved_branch && needed == 0 && eval.carry.values.is_empty()))
-    };
-    let eval = eval_dispatcher(func, cx, single, (Some(pred), disp), args, EdgeSeed::Brif(*cond, taken))
-        .filter(|eval| ok(eval, false))
-        .or_else(|| eval_dispatcher(func, cx, single, (Some(pred), disp), args, EdgeSeed::Equal(*cond, taken)).filter(|eval| ok(eval, true)))?;
-    Some(carry::commit(func, cx, single, pred, eval))
-}
-
-fn thread_brif(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, disp: Block) -> bool {
-    let mut changed = false;
-    for taken in [true, false] {
-        let Some(arm) = brif_arm(func, cx, single, pred, disp, taken) else {
-            continue;
-        };
-        let Some(&term) = func.blocks[pred.index()].insts.last() else {
-            continue;
-        };
-        let Op::Brif(_, then_b, then_args, else_b, else_args) = &mut func.insts[term.index()].op else {
-            continue;
-        };
-        if taken {
-            (*then_b, *then_args) = arm;
-        } else {
-            (*else_b, *else_args) = arm;
-        }
-        changed = true;
-    }
-    changed
-}
-
-fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, single: &[Option<Block>], pred: Block, disp: Block) -> bool {
-    let Some(&term) = func.blocks[pred.index()].insts.last() else {
-        return false;
-    };
-    let Op::BrTable(index, default, ref targets) = func.insts[term.index()].op else {
-        return false;
-    };
-    if default != disp && !targets.contains(&disp) {
-        return false;
-    }
-    let mut new_default = default;
-    let mut new_targets = targets.clone();
-    let mut changed = false;
-    for (k, target) in new_targets.iter_mut().enumerate() {
-        if *target != disp {
-            continue;
-        }
-        let Some(eval) = eval_dispatcher(func, cx, &[], (Some(pred), disp), &[], EdgeSeed::Const(index, k as i64)) else {
-            continue;
-        };
-        if eval.chosen_args.is_empty() && non_const_needed(&eval) == 0 && eval.chosen_target != *target {
-            *target = eval.chosen_target;
-            changed = true;
-        }
-    }
-    if new_default == disp
-        && let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
-        && let Some(eval) = eval_dispatcher(func, cx, &[], (Some(pred), disp), &[], EdgeSeed::Brif(cond, taken))
-        && eval.chosen_args.is_empty()
-        && non_const_needed(&eval) == 0
-        && eval.chosen_target != new_default
-    {
-        new_default = eval.chosen_target;
-        changed = true;
-    }
-    if changed {
-        func.insts[term.index()].op = Op::BrTable(index, new_default, new_targets);
-    }
-    changed
 }
 
 fn known_consts(func: &Function) -> Vec<Option<i64>> {
@@ -549,7 +331,9 @@ fn known_consts(func: &Function) -> Vec<Option<i64>> {
     for block in &func.blocks {
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            if let Some(res) = data.result && consts[res.index()].is_none() {
+            if let Some(res) = data.result
+                && consts[res.index()].is_none()
+            {
                 consts[res.index()] = eval_op(func, &data.op, func.ty(res), &|v| consts[v.index()]);
             }
         }
@@ -558,7 +342,10 @@ fn known_consts(func: &Function) -> Vec<Option<i64>> {
 }
 
 fn body(func: &Function, block: Block) -> &[Inst] {
-    func.blocks[block.index()].insts.split_last().map_or(&[][..], |(_, body)| body)
+    func.blocks[block.index()]
+        .insts
+        .split_last()
+        .map_or(&[][..], |(_, body)| body)
 }
 
 fn dispatches(func: &Function, pinned: &[bool], disp: Block) -> bool {
@@ -567,14 +354,20 @@ fn dispatches(func: &Function, pinned: &[bool], disp: Block) -> bool {
     }
     match func.last(disp) {
         Some(Op::Jump(next, _)) => {
-            func.blocks[disp.index()].insts.len() <= MAX_JUMP_DISP_INSTS && *next != disp && !pinned[next.index()] && stored::steppable(func, *next, MAX_DISP_INSTS)
+            func.blocks[disp.index()].insts.len() <= MAX_JUMP_DISP_INSTS
+                && *next != disp
+                && !pinned[next.index()]
+                && stored::steppable(func, *next, MAX_DISP_INSTS)
         }
         _ => true,
     }
 }
 
 fn threadable(func: &Function, pinned: &[bool]) -> bool {
-    (0..func.blocks.len() as u32).map(Block).any(|pred| func.successors(pred).any(|disp| disp != pred && dispatches(func, pinned, disp)))
+    (0..func.blocks.len() as u32).map(Block).any(|pred| {
+        func.successors(pred)
+            .any(|disp| disp != pred && dispatches(func, pinned, disp))
+    })
 }
 
 /// The blocks below the immediate dominator of each block holding an unpredictable select that reach that block, which together decide its condition.
@@ -584,7 +377,11 @@ pub(crate) fn unpredictable_region(func: &Function, cfg: &crate::cfg::Cfg) -> Ve
         return region;
     }
     for (index, block) in func.blocks.iter().enumerate() {
-        let marked = block.insts.iter().any(|inst| func.insts[inst.index()].result.is_some_and(|res| func.is_unpredictable(res)));
+        let marked = block.insts.iter().any(|inst| {
+            func.insts[inst.index()]
+                .result
+                .is_some_and(|res| func.is_unpredictable(res))
+        });
         if !marked || !cfg.reachable[index] {
             continue;
         }
@@ -606,18 +403,28 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
     }
-    let split = split_select_branches(func) | decided::run(func) | stored::run(func) | tail::run(func) | loop_spec::run(func);
+    let split = split_select_branches(func)
+        | decided::run(func)
+        | stored::run(func)
+        | tail::run(func)
+        | loop_spec::run(func);
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
     for data in &func.insts {
-        if let Op::TryCall { normal, handler, .. } = data.op {
+        if let Op::TryCall {
+            normal, handler, ..
+        } = data.op
+        {
             pinned[normal.index()] = true;
             pinned[handler.index()] = true;
         }
     }
     if func.has_unpredictable() {
         let region = unpredictable_region(func, &func.cfg());
-        pinned.iter_mut().zip(region).for_each(|(pin, inside)| *pin |= inside);
+        pinned
+            .iter_mut()
+            .zip(region)
+            .for_each(|(pin, inside)| *pin |= inside);
     }
     let mut consts = Vec::new();
     let opened = ret::open_returns(func, &pinned);
@@ -644,11 +451,22 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             consts = known_consts(func);
         }
         let cfg = func.cfg();
-        let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
-        let ranges = crate::facts::Ranges::new(func, (&defs, &consts), (&cfg.rpo, &single, &cfg.idom));
+        let single: Vec<Option<Block>> = (0..func.blocks.len())
+            .map(|b| cfg.single_pred(Block(b as u32)))
+            .collect();
+        let ranges =
+            crate::facts::Ranges::new(func, (&defs, &consts), (&cfg.rpo, &single, &cfg.idom));
         let ranges_len = func.types.len();
         let mut uses = outside_uses(func);
-        let mut cx = ThreadCx { defs: &defs, consts: &mut consts, uses: &mut uses, ranges: &ranges, ranges_len, pinned: &pinned, idom: &cfg.idom };
+        let mut cx = ThreadCx {
+            defs: &defs,
+            consts: &mut consts,
+            uses: &mut uses,
+            ranges: &ranges,
+            ranges_len,
+            pinned: &pinned,
+            idom: &cfg.idom,
+        };
         let mut changed = sink::run(func, &mut cx, (&*cfg, &single));
         let mut stale = false;
         let mut extra_preds: Vec<Vec<Block>> = Vec::new();
@@ -677,12 +495,15 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                     if extra_preds.is_empty() {
                         extra_preds.resize(func.blocks.len(), Vec::new());
                     }
-                    func.successors(pred).for_each(|s| extra_preds[s.index()].push(pred));
+                    func.successors(pred)
+                        .for_each(|s| extra_preds[s.index()].push(pred));
                     if func.successors(pred).any(|s| {
                         s != disp
                             && single[s.index()] == live[s.index()]
                             && (single[s.index()].is_some()
-                                || cfg.idom[s.index()].is_some_and(|d| d != s && !crate::cfg::dominates(&cfg.idom, d, pred)))
+                                || cfg.idom[s.index()].is_some_and(|d| {
+                                    d != s && !crate::cfg::dominates(&cfg.idom, d, pred)
+                                }))
                     }) {
                         stale = true;
                         break;

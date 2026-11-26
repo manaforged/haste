@@ -17,22 +17,34 @@ use super::{InstOutcome, PolyInst, PolyObligation, PolySummary, SummaryKind, cod
 
 type KeyFn = fn(&Outline, ItemRef) -> Option<u64>;
 
-pub(in crate::sema) fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
+pub(in crate::sema) fn frozen_summary(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+) -> Option<Arc<PolySummary>> {
     thaw_summary(cx, item, codec::decode_summary).map(Arc::new)
 }
 
-pub(super) fn thaw_summary<T>(cx: &Context<'_>, item: ItemRef, decode: fn(&Outline, &codec::FileIndex, &Types, &[u8]) -> Result<Option<T>>) -> Option<T> {
+pub(super) fn thaw_summary<T>(
+    cx: &Context<'_>,
+    item: ItemRef,
+    decode: fn(&Outline, &codec::FileIndex, &Types, &[u8]) -> Result<Option<T>>,
+) -> Option<T> {
     if !cx.outline.is_fixed(item.krate) {
         return None;
     }
     let substrate = cx.store.lookups.substrate.clone()?;
     let key = crate::substrate::sysroot_item_key(cx.outline, item)?;
     let bytes = substrate.summary(key)?;
-    decode(cx.outline, file_index(cx), &cx.types, bytes).ok().flatten()
+    decode(cx.outline, file_index(cx), &cx.types, bytes)
+        .ok()
+        .flatten()
 }
 
 pub(super) fn file_index<'a>(cx: &'a Context<'_>) -> &'a codec::FileIndex {
-    cx.store.lookups.file_index.get_or_init(|| Arc::new(codec::FileIndex::build(cx.outline)))
+    cx.store
+        .lookups
+        .file_index
+        .get_or_init(|| Arc::new(codec::FileIndex::build(cx.outline)))
 }
 
 pub(super) fn closure_free(summary: &PolySummary) -> bool {
@@ -49,29 +61,60 @@ fn substs_keyable(outline: &Outline, types: &Types, substs: Substs) -> bool {
     !super::super::reach::filter::substs_has_non_fixed_raw(outline, types, substs)
 }
 
-pub(super) fn instance_keys(outline: &Outline, types: &Types, (item, substs): Instance) -> Option<(u64, u64)> {
+pub(super) fn instance_keys(
+    outline: &Outline,
+    types: &Types,
+    (item, substs): Instance,
+) -> Option<(u64, u64)> {
     if !outline.is_fixed(item.krate) || !substs_keyable(outline, types, substs) {
         return None;
     }
     let item_key = crate::substrate::sysroot_item_key(outline, item)?;
-    Some((item_key, codec::substs_key(outline, types, substs, crate::substrate::sysroot_item_key)?))
+    Some((
+        item_key,
+        codec::substs_key(outline, types, substs, crate::substrate::sysroot_item_key)?,
+    ))
 }
 
-pub(super) fn instance_bytes<T>(cx: &Context<'_>, instance: Instance, mut decode: impl FnMut(&codec::FileIndex, &[u8]) -> Option<T>) -> Option<T> {
+pub(super) fn instance_bytes<T>(
+    cx: &Context<'_>,
+    instance: Instance,
+    mut decode: impl FnMut(&codec::FileIndex, &[u8]) -> Option<T>,
+) -> Option<T> {
     let substrate = cx.store.lookups.substrate.clone()?;
     let (item_key, substs_key) = instance_keys(cx.outline, &cx.types, instance)?;
     let index = file_index(cx);
-    substrate.instance_candidates(item_key, substs_key).find_map(|bytes| decode(index, bytes))
+    substrate
+        .instance_candidates(item_key, substs_key)
+        .find_map(|bytes| decode(index, bytes))
 }
 
-pub(super) fn layer_key_fn(outline: &Outline, types: &Types, (item, substs): Instance) -> (bool, KeyFn) {
+pub(super) fn layer_key_fn(
+    outline: &Outline,
+    types: &Types,
+    (item, substs): Instance,
+) -> (bool, KeyFn) {
     let pure_sysroot = outline.is_sysroot(item.krate)
         && crate::substrate::sysroot_only_item_key(outline, item).is_some()
-        && codec::substs_key(outline, types, substs, crate::substrate::sysroot_only_item_key).is_some();
-    if pure_sysroot { (true, crate::substrate::sysroot_only_item_key) } else { (false, crate::substrate::sysroot_item_key) }
+        && codec::substs_key(
+            outline,
+            types,
+            substs,
+            crate::substrate::sysroot_only_item_key,
+        )
+        .is_some();
+    if pure_sysroot {
+        (true, crate::substrate::sysroot_only_item_key)
+    } else {
+        (false, crate::substrate::sysroot_item_key)
+    }
 }
 
-pub(super) fn is_template(summaries: &Flight<ItemRef, SummaryKind>, item: ItemRef, tables: &Arc<BodyTables>) -> bool {
+pub(super) fn is_template(
+    summaries: &Flight<ItemRef, SummaryKind>,
+    item: ItemRef,
+    tables: &Arc<BodyTables>,
+) -> bool {
     matches!(summaries.get_ready(&item), Some(SummaryKind::Poly(summary)) if Arc::ptr_eq(&summary.template, tables))
 }
 
@@ -83,7 +126,11 @@ pub(super) fn frozen_instance(
     if !closure_free(summary) {
         return None;
     }
-    let decoded = instance_bytes(cx, instance, |index, bytes| codec::decode_instance(cx.outline, index, &cx.types, instance.1, bytes).ok().flatten())?;
+    let decoded = instance_bytes(cx, instance, |index, bytes| {
+        codec::decode_instance(cx.outline, index, &cx.types, instance.1, bytes)
+            .ok()
+            .flatten()
+    })?;
     let inst = PolyInst {
         args: instance.1,
         summary: Arc::clone(summary),
@@ -94,9 +141,19 @@ pub(super) fn frozen_instance(
         offset_overrides: decoded.offset_overrides,
         materialized: OnceLock::new(),
     };
-    let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
+    let locals = summary
+        .locals
+        .iter()
+        .map(|local| Local {
+            ty: inst.sub_ty(&cx.types, local.ty),
+        })
+        .collect();
     let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
-    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
+    let layouts = summary
+        .layout_tys
+        .iter()
+        .map(|&ty| inst.sub_ty(&cx.types, ty))
+        .collect();
     Some((inst, locals, ret, layouts, decoded.drops))
 }
 
@@ -118,8 +175,12 @@ pub(super) fn encode_fresh_instance(
     let item_key = key_fn(outline, item)?;
     let substs_key = codec::substs_key(outline, types, substs, key_fn)?;
     let bytes = match encode_poly {
-        Some(inst) => codec::encode_instance(outline, types, substs, inst, &typed.drops, key_fn).ok().flatten()?,
-        None => codec::encode_typed(outline, types, substs, typed, key_fn).ok().flatten()?,
+        Some(inst) => codec::encode_instance(outline, types, substs, inst, &typed.drops, key_fn)
+            .ok()
+            .flatten()?,
+        None => codec::encode_typed(outline, types, substs, typed, key_fn)
+            .ok()
+            .flatten()?,
     };
     Some((pure_sysroot, item_key, substs_key, bytes.into_boxed_slice()))
 }
@@ -135,7 +196,11 @@ pub(in crate::sema) fn export_sysroot_instances(
         if err.is_some() {
             return true;
         }
-        let target = if *pure_sysroot { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
+        let target = if *pure_sysroot {
+            toolchain.as_deref_mut()
+        } else {
+            deps.as_deref_mut()
+        };
         if let Some(builder) = target
             && let Err(e) = builder.add_instance(*item_key, *substs_key, bytes)
         {
@@ -175,26 +240,70 @@ impl TyFolder for FrozenFolder<'_, '_> {
             return Err(());
         }
         let def = self.cx.types.proj(proj_id);
-        let mut child = FrozenFolder { cx: self.cx, args: self.args, projs: self.projs, depth: self.depth + 1 };
+        let mut child = FrozenFolder {
+            cx: self.cx,
+            args: self.args,
+            projs: self.projs,
+            depth: self.depth + 1,
+        };
         let self_ty = fold_ty(&mut child, def.self_ty)?;
         let trait_substs = fold_substs(&mut child, def.args)?;
         let own_substs = fold_substs(&mut child, def.own)?;
-        if self.cx.types.has_params(self_ty) || self.cx.types.substs_have_params(trait_substs) || self.cx.types.substs_have_params(own_substs) {
+        if self.cx.types.has_params(self_ty)
+            || self.cx.types.substs_have_params(trait_substs)
+            || self.cx.types.substs_have_params(own_substs)
+        {
             return Err(());
         }
-        let val = self.cx.store.lookups.assoc_types.get(&(def.of, self_ty, trait_substs, def.assoc, own_substs)).ok_or(())?;
+        let val = self
+            .cx
+            .store
+            .lookups
+            .assoc_types
+            .get(&(def.of, self_ty, trait_substs, def.assoc, own_substs))
+            .ok_or(())?;
         let at = self.projs.partition_point(|&(p, _)| p.0 < proj_id.0);
         self.projs.insert(at, (proj_id, val));
         Ok(val)
     }
 }
 
-fn resolve_proj_ty(cx: &Context<'_>, args: &[Ty], projs: &mut Vec<(ProjId, Ty)>, ty: Ty, depth: u8) -> Option<Ty> {
-    fold_ty(&mut FrozenFolder { cx, args, projs, depth }, ty).ok()
+fn resolve_proj_ty(
+    cx: &Context<'_>,
+    args: &[Ty],
+    projs: &mut Vec<(ProjId, Ty)>,
+    ty: Ty,
+    depth: u8,
+) -> Option<Ty> {
+    fold_ty(
+        &mut FrozenFolder {
+            cx,
+            args,
+            projs,
+            depth,
+        },
+        ty,
+    )
+    .ok()
 }
 
-fn resolve_proj_substs(cx: &Context<'_>, args: &[Ty], projs: &mut Vec<(ProjId, Ty)>, substs: Substs, depth: u8) -> Option<Substs> {
-    fold_substs(&mut FrozenFolder { cx, args, projs, depth }, substs).ok()
+fn resolve_proj_substs(
+    cx: &Context<'_>,
+    args: &[Ty],
+    projs: &mut Vec<(ProjId, Ty)>,
+    substs: Substs,
+    depth: u8,
+) -> Option<Substs> {
+    fold_substs(
+        &mut FrozenFolder {
+            cx,
+            args,
+            projs,
+            depth,
+        },
+        substs,
+    )
+    .ok()
 }
 
 pub(super) fn try_cached_instantiate(
@@ -206,23 +315,42 @@ pub(super) fn try_cached_instantiate(
     if !summary.op_holes.is_empty()
         || !summary.const_holes.is_empty()
         || !closure_free(summary)
-        || summary.obligations.iter().any(|ob| matches!(ob, PolyObligation::Call { .. }))
+        || summary
+            .obligations
+            .iter()
+            .any(|ob| matches!(ob, PolyObligation::Call { .. }))
     {
         return None;
     }
     let args = cx.types.substs(instance.1).to_vec();
     let mut projs: Vec<(ProjId, Ty)> = Vec::with_capacity(summary.projections.len());
     for &proj_id in &summary.projections {
-        resolve_proj_ty(cx, &args, &mut projs, cx.types.intern(Kind::Proj(proj_id)), 0)?;
+        resolve_proj_ty(
+            cx,
+            &args,
+            &mut projs,
+            cx.types.intern(Kind::Proj(proj_id)),
+            0,
+        )?;
     }
     if check_only {
         for ob in &summary.obligations {
-            if let PolyObligation::Prove { self_ty, args: ob_args, .. } = *ob {
+            if let PolyObligation::Prove {
+                self_ty,
+                args: ob_args,
+                ..
+            } = *ob
+            {
                 resolve_proj_ty(cx, &args, &mut projs, self_ty, 0)?;
                 resolve_proj_substs(cx, &args, &mut projs, ob_args, 0)?;
             }
         }
-        for &ty in summary.layout_tys.iter().chain(&summary.drop_tys).chain(summary.ret.iter()) {
+        for &ty in summary
+            .layout_tys
+            .iter()
+            .chain(&summary.drop_tys)
+            .chain(summary.ret.iter())
+        {
             resolve_proj_ty(cx, &args, &mut projs, ty, 0)?;
         }
     } else {
@@ -245,10 +373,22 @@ pub(super) fn try_cached_instantiate(
         materialized: OnceLock::new(),
     };
     for ob in &summary.obligations {
-        let PolyObligation::Prove { of, self_ty, args: ob_args } = *ob else { return None };
+        let PolyObligation::Prove {
+            of,
+            self_ty,
+            args: ob_args,
+        } = *ob
+        else {
+            return None;
+        };
         let concrete_self = inst.sub_ty(&cx.types, self_ty);
         let concrete_args = inst.sub_substs(&cx.types, ob_args);
-        let Some(Some(_)) = cx.store.lookups.selections.get(&(of, concrete_self, concrete_args)) else {
+        let Some(Some(_)) = cx
+            .store
+            .lookups
+            .selections
+            .get(&(of, concrete_self, concrete_args))
+        else {
             return None;
         };
     }

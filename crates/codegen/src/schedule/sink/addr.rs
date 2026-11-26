@@ -13,7 +13,9 @@ struct Sum {
 
 fn collect_sums(func: &Function, loops: &Loops) -> (Vec<Sum>, Vec<Option<u32>>) {
     let defs = defs(func);
-    let is_const = |v: Value| defs[v.index()].is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_)));
+    let is_const = |v: Value| {
+        defs[v.index()].is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_)))
+    };
     let (mut sums, mut index) = (Vec::new(), vec![None; func.types.len()]);
     for (bi, block) in func.blocks.iter().enumerate() {
         if loops.depth_of(Block(bi as u32)) == 0 {
@@ -27,7 +29,12 @@ fn collect_sums(func: &Function, loops: &Loops) -> (Vec<Sum>, Vec<Option<u32>>) 
                 && !is_const(*y)
             {
                 index[res.index()] = Some(sums.len() as u32);
-                sums.push(Sum { block: bi, res, x: *x, y: *y });
+                sums.push(Sum {
+                    block: bi,
+                    res,
+                    x: *x,
+                    y: *y,
+                });
             }
         }
     }
@@ -61,14 +68,25 @@ fn reads_as_address(func: &Function, inst: Inst, res: Value) -> bool {
 }
 
 fn runs_at_most_as_often(loops: &Loops, (home, block): (usize, usize)) -> bool {
-    loops.list.iter().all(|each| !each.body.get(block).copied().unwrap_or(false) || each.body.get(home).copied().unwrap_or(false))
+    loops.list.iter().all(|each| {
+        !each.body.get(block).copied().unwrap_or(false)
+            || each.body.get(home).copied().unwrap_or(false)
+    })
 }
 
 fn reads_an_operand(func: &Function, bi: usize, sum: &Sum) -> bool {
-    func.blocks[bi].insts.iter().any(|&i| uses_operand(func, i, sum.x) || uses_operand(func, i, sum.y))
+    func.blocks[bi]
+        .insts
+        .iter()
+        .any(|&i| uses_operand(func, i, sum.x) || uses_operand(func, i, sum.y))
 }
 
-fn clone_blocks(func: &Function, loops: &Loops, sum: &Sum, users: &[(usize, Inst)]) -> Option<Vec<usize>> {
+fn clone_blocks(
+    func: &Function,
+    loops: &Loops,
+    sum: &Sum,
+    users: &[(usize, Inst)],
+) -> Option<Vec<usize>> {
     let mut blocks = Vec::new();
     let mut at_home = false;
     for &(bi, inst) in users {
@@ -82,23 +100,36 @@ fn clone_blocks(func: &Function, loops: &Loops, sum: &Sum, users: &[(usize, Inst
         }
     }
     let depth = loops.depth_of(Block(sum.block as u32));
-    let same_depth = blocks.iter().filter(|&&bi| loops.depth_of(Block(bi as u32)) == depth).count();
+    let same_depth = blocks
+        .iter()
+        .filter(|&&bi| loops.depth_of(Block(bi as u32)) == depth)
+        .count();
     let ok = at_home
         && !blocks.is_empty()
         && same_depth <= 1
-        && blocks.iter().all(|&bi| runs_at_most_as_often(loops, (sum.block, bi)) && reads_an_operand(func, bi, sum));
+        && blocks.iter().all(|&bi| {
+            runs_at_most_as_often(loops, (sum.block, bi)) && reads_an_operand(func, bi, sum)
+        });
     ok.then_some(blocks)
 }
 
 fn clone_into(func: &mut Function, sum: &Sum, bi: usize) {
     let insts = &func.blocks[bi].insts;
-    let Some(at) = insts.iter().position(|&i| uses_operand(func, i, sum.res)) else { return };
-    let users: Vec<Inst> = insts[at..].iter().copied().filter(|&i| uses_operand(func, i, sum.res)).collect();
+    let Some(at) = insts.iter().position(|&i| uses_operand(func, i, sum.res)) else {
+        return;
+    };
+    let users: Vec<Inst> = insts[at..]
+        .iter()
+        .copied()
+        .filter(|&i| uses_operand(func, i, sum.res))
+        .collect();
     let copy = func.value(Type::I64);
     let inst = func.add(Op::Binary(Binary::Iadd, sum.x, sum.y), Some(copy));
     func.blocks[bi].insts.insert(at, inst);
     for user in users {
-        func.insts[user.index()].op.map_operands(|v| if v == sum.res { copy } else { v });
+        func.insts[user.index()]
+            .op
+            .map_operands(|v| if v == sum.res { copy } else { v });
     }
 }
 

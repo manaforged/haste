@@ -54,8 +54,15 @@ impl Lower<'_, '_> {
         let whole = repr(self.cx, ty)?;
         let mut all = self.ins().iconst(Type::I8, 1);
         for (index, field) in fields.into_iter().enumerate() {
-            let at = |base| Place { base: Base::Addr(base), offset: 0, repr: whole };
-            let (left, right) = (self.part_place(at(x), ty, (0, index as u32))?, self.part_place(at(y), ty, (0, index as u32))?);
+            let at = |base| Place {
+                base: Base::Addr(base),
+                offset: 0,
+                repr: whole,
+            };
+            let (left, right) = (
+                self.part_place(at(x), ty, (0, index as u32))?,
+                self.part_place(at(y), ty, (0, index as u32))?,
+            );
             let (Some(left), Some(right)) = (self.read(left), self.read(right)) else {
                 continue;
             };
@@ -78,13 +85,31 @@ impl Lower<'_, '_> {
     }
 
     /// Whether the enum values at `x` and `y` of `ty`, whose variants hold the fields `variants`, hold the same variant with equal fields.
-    fn equal_enum(&mut self, ty: Ty, variants: &[Vec<Ty>], (x, y): (Value, Value)) -> Result<Value> {
+    fn equal_enum(
+        &mut self,
+        ty: Ty,
+        variants: &[Vec<Ty>],
+        (x, y): (Value, Value),
+    ) -> Result<Value> {
         let whole = repr(self.cx, ty)?;
-        let at = |base| Place { base: Base::Addr(base), offset: 0, repr: whole };
-        let (left, right) = (self.discriminant_value(at(x), ty)?, self.discriminant_value(at(y), ty)?);
+        let at = |base| Place {
+            base: Base::Addr(base),
+            offset: 0,
+            repr: whole,
+        };
+        let (left, right) = (
+            self.discriminant_value(at(x), ty)?,
+            self.discriminant_value(at(y), ty)?,
+        );
         let mut same = self.ins().icmp(IntCC::Equal, left, right);
-        for (variant, fields) in variants.iter().enumerate().filter(|(_, fields)| !fields.is_empty()) {
-            let Some(holds) = self.is_variant(Some(at(x)), ty, variant as u32)? else { continue };
+        for (variant, fields) in variants
+            .iter()
+            .enumerate()
+            .filter(|(_, fields)| !fields.is_empty())
+        {
+            let Some(holds) = self.is_variant(Some(at(x)), ty, variant as u32)? else {
+                continue;
+            };
             let (compare, next) = (self.b.create_block(), self.b.create_block());
             let out = self.b.append_block_param(next, Type::I8);
             let both = self.ins().band(holds, same);
@@ -92,8 +117,13 @@ impl Lower<'_, '_> {
             self.enter(compare);
             let mut equal = self.ins().iconst(Type::I8, 1);
             for (index, &field) in fields.iter().enumerate() {
-                let (left, right) = (self.variant_field(at(x), ty, (variant as u32, index as u32))?, self.variant_field(at(y), ty, (variant as u32, index as u32))?);
-                let (Some(left), Some(right)) = (self.read(left), self.read(right)) else { continue };
+                let (left, right) = (
+                    self.variant_field(at(x), ty, (variant as u32, index as u32))?,
+                    self.variant_field(at(y), ty, (variant as u32, index as u32))?,
+                );
+                let (Some(left), Some(right)) = (self.read(left), self.read(right)) else {
+                    continue;
+                };
                 let same_field = self.equal(field, left, right)?;
                 equal = self.ins().band(equal, same_field);
             }
@@ -109,7 +139,10 @@ impl Lower<'_, '_> {
         let size = self.cx.layout(ty)?.size.bytes() as i32;
         let mut all = self.ins().iconst(Type::I8, 1);
         for offset in (0..size).step_by(8) {
-            let (left, right) = (self.ins().load(Type::I64, x, offset), self.ins().load(Type::I64, y, offset));
+            let (left, right) = (
+                self.ins().load(Type::I64, x, offset),
+                self.ins().load(Type::I64, y, offset),
+            );
             let same = self.ins().icmp(IntCC::Equal, left, right);
             all = self.ins().band(all, same);
         }
@@ -132,7 +165,18 @@ impl Lower<'_, '_> {
             Kind::Slice(element) => element,
             _ => {
                 let pointee = repr(self.cx, inner)?;
-                let (left, right) = (Place { base: Base::Addr(x), offset: 0, repr: pointee }, Place { base: Base::Addr(y), offset: 0, repr: pointee });
+                let (left, right) = (
+                    Place {
+                        base: Base::Addr(x),
+                        offset: 0,
+                        repr: pointee,
+                    },
+                    Place {
+                        base: Base::Addr(y),
+                        offset: 0,
+                        repr: pointee,
+                    },
+                );
                 let (Some(left), Some(right)) = (self.read(left), self.read(right)) else {
                     return Ok(self.ins().iconst(Type::I8, 1));
                 };
@@ -141,8 +185,15 @@ impl Lower<'_, '_> {
         };
         let (data_x, len_x, static_x) = self.load_wide_pair(x);
         let (data_y, len_y, static_y) = self.load_wide_pair(y);
-        let elem_bytes = self.is_bitwise_int(element).then(|| self.cx.layout(element).map(|l| l.size.bytes())).transpose()?;
-        let static_bytes = static_y.or(static_x).zip(elem_bytes).and_then(|(c, b)| c.checked_mul(b)).filter(|&bytes| bytes <= INLINE_EQ_BYTES);
+        let elem_bytes = self
+            .is_bitwise_int(element)
+            .then(|| self.cx.layout(element).map(|l| l.size.bytes()))
+            .transpose()?;
+        let static_bytes = static_y
+            .or(static_x)
+            .zip(elem_bytes)
+            .and_then(|(c, b)| c.checked_mul(b))
+            .filter(|&bytes| bytes <= INLINE_EQ_BYTES);
         let same_len = self.ins().icmp(IntCC::Equal, len_x, len_y);
         let (check, done) = (self.b.create_block(), self.b.create_block());
         let res = self.b.append_block_param(done, Type::I8);
@@ -217,12 +268,20 @@ impl Lower<'_, '_> {
     fn equal_items(&mut self, element: Ty, (x, y): (Value, Value), count: Value) -> Result<Value> {
         if self.is_bitwise_int(element) {
             let elem_size = self.cx.layout(element)?.size.bytes() as i64;
-            let bytes = if elem_size == 1 { count } else { self.ins().imul_imm(count, elem_size) };
+            let bytes = if elem_size == 1 {
+                count
+            } else {
+                self.ins().imul_imm(count, elem_size)
+            };
             return self.equal_bytes_runtime((x, y), bytes);
         }
         let size = self.cx.layout(element)?.size.bytes() as i64;
         let part = repr(self.cx, element)?;
-        let (head, body, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let (head, body, done) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
         let index = self.b.append_block_param(head, Type::I64);
         let res = self.b.append_block_param(done, Type::I8);
         let zero64 = self.ins().iconst(Type::I64, 0);
@@ -237,7 +296,11 @@ impl Lower<'_, '_> {
         self.enter(body);
         let offset = self.ins().imul_imm(index, size);
         let (left, right) = (self.ins().iadd(x, offset), self.ins().iadd(y, offset));
-        let at = |base| Place { base: Base::Addr(base), offset: 0, repr: part };
+        let at = |base| Place {
+            base: Base::Addr(base),
+            offset: 0,
+            repr: part,
+        };
         let next = self.ins().iadd_imm(index, 1);
         if let (Some(left), Some(right)) = (self.read(at(left)), self.read(at(right))) {
             let same = self.equal(element, left, right)?;

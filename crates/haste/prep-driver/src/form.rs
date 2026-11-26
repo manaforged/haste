@@ -61,7 +61,10 @@ pub fn fn_ptr(params: &[String], ret: &str) -> String {
 
 /// A trait object type of trait `def` with the arguments `args`, fixing each associated type of `fixed` by name, in name order.
 pub fn object(def: &str, args: &[String], fixed: &[(String, String)]) -> String {
-    let mut bound: Vec<String> = fixed.iter().map(|(name, ty)| format!("+{name}={ty}")).collect();
+    let mut bound: Vec<String> = fixed
+        .iter()
+        .map(|(name, ty)| format!("+{name}={ty}"))
+        .collect();
     bound.sort();
     format!("{OBJECT}{}{}", named(def, args), bound.concat())
 }
@@ -82,7 +85,8 @@ pub fn member(krate: &str, of: Option<&str>, self_ty: &str, name: &str) -> Optio
         Some(of) => format!("{of}{FOR}{self_ty}"),
         None => self_ty.to_owned(),
     };
-    (!head.contains(OBJECT) && !head.contains(FN_PTR)).then(|| format!("{krate}:{IMPL}{head}:{name}"))
+    (!head.contains(OBJECT) && !head.contains(FN_PTR))
+        .then(|| format!("{krate}:{IMPL}{head}:{name}"))
 }
 
 fn terminated(items: &[String]) -> String {

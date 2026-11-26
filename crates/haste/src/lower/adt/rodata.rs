@@ -38,7 +38,11 @@ impl<'l, 'a> Lower<'l, 'a> {
         self.materialize_const_expr(expr, (false, false))
     }
 
-    pub(in crate::lower) fn materialize_const_expr(&mut self, expr: ExprId, (allow_slot, borrowed): (bool, bool)) -> Result<Option<Value>> {
+    pub(in crate::lower) fn materialize_const_expr(
+        &mut self,
+        expr: ExprId,
+        (allow_slot, borrowed): (bool, bool),
+    ) -> Result<Option<Value>> {
         let lent_mut = self.expr_lent_mutably(expr);
         if (!allow_slot && lent_mut) || !self.open {
             return Ok(None);
@@ -47,14 +51,29 @@ impl<'l, 'a> Lower<'l, 'a> {
         let Some(size) = self.rodata_size(ty, borrowed)? else {
             return Ok(None);
         };
-        let in_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
+        let in_generic = !self
+            .cx
+            .types
+            .substs(self.reached.list[self.index].0.1)
+            .is_empty();
         let mut bytes = vec![0u8; size];
-        let scope = ConstScope { body: self.body, src: self.src, typed: self.typed, in_const: false };
-        if self.write_const_uncoerced(scope, (expr, ty), 0, &mut bytes, 0, in_generic).is_none() {
+        let scope = ConstScope {
+            body: self.body,
+            src: self.src,
+            typed: self.typed,
+            in_const: false,
+        };
+        if self
+            .write_const_uncoerced(scope, (expr, ty), 0, &mut bytes, 0, in_generic)
+            .is_none()
+        {
             return Ok(None);
         }
         if allow_slot
-            && let whole @ Repr::Mem { parts: Parts::One(vec_ty @ Type::Vec { .. }), .. } = repr(self.cx, ty)?
+            && let whole @ Repr::Mem {
+                parts: Parts::One(vec_ty @ Type::Vec { .. }),
+                ..
+            } = repr(self.cx, ty)?
         {
             let all_zero = bytes.iter().all(|&b| b == 0);
             if all_zero || lent_mut {
@@ -70,7 +89,13 @@ impl<'l, 'a> Lower<'l, 'a> {
         self.materialize_value_rodata(ty, &bytes)
     }
 
-    fn store_vec_const(&mut self, whole: Repr, vec_ty: Type, bytes: &[u8], all_zero: bool) -> Result<Option<Value>> {
+    fn store_vec_const(
+        &mut self,
+        whole: Repr,
+        vec_ty: Type,
+        bytes: &[u8],
+        all_zero: bool,
+    ) -> Result<Option<Value>> {
         let Some(slot) = self.slot(whole) else {
             return Ok(None);
         };
@@ -84,8 +109,14 @@ impl<'l, 'a> Lower<'l, 'a> {
         Ok(self.read(Place::slot(slot, whole)))
     }
 
-    pub(in crate::lower) fn materialize_value_rodata(&mut self, ty: Ty, bytes: &[u8]) -> Result<Option<Value>> {
-        if bytes.len() >= SPARSE_MIN_BYTES && bytes.iter().filter(|&&b| b != 0).count() * 4 <= bytes.len() {
+    pub(in crate::lower) fn materialize_value_rodata(
+        &mut self,
+        ty: Ty,
+        bytes: &[u8],
+    ) -> Result<Option<Value>> {
+        if bytes.len() >= SPARSE_MIN_BYTES
+            && bytes.iter().filter(|&&b| b != 0).count() * 4 <= bytes.len()
+        {
             return self.emit_sparse_slot(ty, bytes);
         }
         Ok(Some(self.emit_const_rodata(bytes)))
@@ -138,7 +169,12 @@ impl<'l, 'a> Lower<'l, 'a> {
         }
     }
 
-    pub(in crate::lower) fn const_rodata_item(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
+    pub(in crate::lower) fn const_rodata_item(
+        &mut self,
+        expr: ExprId,
+        item: ItemRef,
+        substs: Substs,
+    ) -> Result<Option<Value>> {
         if !self.open || self.expr_lent_mutably(expr) {
             return Ok(None);
         }
@@ -146,13 +182,34 @@ impl<'l, 'a> Lower<'l, 'a> {
         let Some(size) = self.rodata_size(ty, false)? else {
             return Ok(None);
         };
-        let in_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
-        let Some((body, src, item_typed, root)) = self.load_const_item(item, substs, ty, in_generic, true)? else {
+        let in_generic = !self
+            .cx
+            .types
+            .substs(self.reached.list[self.index].0.1)
+            .is_empty();
+        let Some((body, src, item_typed, root)) =
+            self.load_const_item(item, substs, ty, in_generic, true)?
+        else {
             return Ok(None);
         };
         let mut bytes = vec![0u8; size];
         let scoped = item_typed.scoped(&self.cx.types);
-        if self.write_const_bytes(ConstScope { body: &body, src, typed: &scoped, in_const: true }, (root, ty), 0, &mut bytes, 1, in_generic).is_none() {
+        if self
+            .write_const_bytes(
+                ConstScope {
+                    body: &body,
+                    src,
+                    typed: &scoped,
+                    in_const: true,
+                },
+                (root, ty),
+                0,
+                &mut bytes,
+                1,
+                in_generic,
+            )
+            .is_none()
+        {
             return Ok(None);
         }
         self.materialize_value_rodata(ty, &bytes)
@@ -167,7 +224,11 @@ impl<'l, 'a> Lower<'l, 'a> {
             Repr::Scalar(machine) if scalar => (machine.bytes() as usize, 0),
             _ => return Ok(None),
         };
-        if align > 4 || size > CONST_RODATA_MAX_BYTES || !super::super::is_freeze_ty(self.cx, ty, 0) || needs_drop(self.cx, ty)? {
+        if align > 4
+            || size > CONST_RODATA_MAX_BYTES
+            || !super::super::is_freeze_ty(self.cx, ty, 0)
+            || needs_drop(self.cx, ty)?
+        {
             return Ok(None);
         }
         Ok(Some(size))
@@ -179,8 +240,24 @@ impl<'l, 'a> Lower<'l, 'a> {
         env.release || env.fixed || item.krate == owner.krate
     }
 
-    pub(super) fn load_const_item(&mut self, item: ItemRef, substs: Substs, ty: Ty, in_generic: bool, require_reached: bool) -> Result<Option<(std::sync::Arc<Body>, &'a Source, std::sync::Arc<Typed>, ExprId)>> {
-        if !self.const_item_readable(item) || (in_generic && !self.cx.types.substs(substs).is_empty()) {
+    pub(super) fn load_const_item(
+        &mut self,
+        item: ItemRef,
+        substs: Substs,
+        ty: Ty,
+        in_generic: bool,
+        require_reached: bool,
+    ) -> Result<
+        Option<(
+            std::sync::Arc<Body>,
+            &'a Source,
+            std::sync::Arc<Typed>,
+            ExprId,
+        )>,
+    > {
+        if !self.const_item_readable(item)
+            || (in_generic && !self.cx.types.substs(substs).is_empty())
+        {
             return Ok(None);
         }
         let index = match require_reached {

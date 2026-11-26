@@ -22,9 +22,19 @@ pub(crate) struct PendingZeros {
 
 #[derive(Clone, Copy)]
 enum Kind {
-    ZeroRun { start: u32, run: Mem, len: i32, last: Last },
-    Carry { tag: usize },
-    Eq { a: u32, b: u32 },
+    ZeroRun {
+        start: u32,
+        run: Mem,
+        len: i32,
+        last: Last,
+    },
+    Carry {
+        tag: usize,
+    },
+    Eq {
+        a: u32,
+        b: u32,
+    },
 }
 
 /// A `mov r32, 0` at `start..end` that becomes `xor r32, r32` once the flags are dead.
@@ -53,7 +63,8 @@ impl Asm {
             && at + 4 == self.pos()
         {
             let field = &mut self.code[at as usize..at as usize + 4];
-            let addend = i32::from_le_bytes([field[0], field[1], field[2], field[3]]) - bytes.len() as i32;
+            let addend =
+                i32::from_le_bytes([field[0], field[1], field[2], field[3]]) - bytes.len() as i32;
             field.copy_from_slice(&addend.to_le_bytes());
         }
         self.code.extend_from_slice(bytes);
@@ -74,13 +85,21 @@ impl Asm {
     }
 
     fn set_tail(&mut self, kind: Kind) {
-        self.tail = Some(Tail { end: self.pos(), marks: self.marks(), kind });
+        self.tail = Some(Tail {
+            end: self.pos(),
+            marks: self.marks(),
+            kind,
+        });
     }
 
     fn advance_zeros(&mut self, start: u32) {
         let end = self.pos();
         let marks = self.marks();
-        if let Some(z) = self.zeros.as_mut().filter(|z| z.end == start && z.marks == marks) {
+        if let Some(z) = self
+            .zeros
+            .as_mut()
+            .filter(|z| z.end == start && z.marks == marks)
+        {
             z.end = end;
         }
     }
@@ -90,11 +109,17 @@ impl Asm {
         let end = self.pos();
         let marks = self.marks();
         if let Some(tail) = self.tail.as_mut().filter(|tail| {
-            tail.end == start && tail.marks == marks && matches!(tail.kind, Kind::Carry { .. } | Kind::Eq { .. })
+            tail.end == start
+                && tail.marks == marks
+                && matches!(tail.kind, Kind::Carry { .. } | Kind::Eq { .. })
         }) {
             tail.end = end;
         }
-        if let Some(z) = self.zeros.as_mut().filter(|z| z.end == start && z.marks == marks) {
+        if let Some(z) = self
+            .zeros
+            .as_mut()
+            .filter(|z| z.end == start && z.marks == marks)
+        {
             z.end = end;
         }
     }
@@ -106,10 +131,12 @@ impl Asm {
 
     /// The carry the carry flag still holds here, if only flag-neutral instructions followed `hold_carry`.
     pub fn held_carry(&self) -> Option<usize> {
-        self.tail.filter(|tail| tail.end == self.pos() && tail.marks == self.marks()).and_then(|tail| match tail.kind {
-            Kind::Carry { tag } => Some(tag),
-            _ => None,
-        })
+        self.tail
+            .filter(|tail| tail.end == self.pos() && tail.marks == self.marks())
+            .and_then(|tail| match tail.kind {
+                Kind::Carry { tag } => Some(tag),
+                _ => None,
+            })
     }
 
     /// Notes that the zero flag holds `a == b` here, until an instruction that may write the flags.
@@ -119,19 +146,28 @@ impl Asm {
 
     /// The value pair the zero flag still compares here, if only flag-neutral instructions followed `hold_eq`.
     pub fn held_eq(&self) -> Option<(u32, u32)> {
-        self.tail.filter(|tail| tail.end == self.pos() && tail.marks == self.marks()).and_then(|tail| match tail.kind {
-            Kind::Eq { a, b } => Some((a, b)),
-            _ => None,
-        })
+        self.tail
+            .filter(|tail| tail.end == self.pos() && tail.marks == self.marks())
+            .and_then(|tail| match tail.kind {
+                Kind::Eq { a, b } => Some((a, b)),
+                _ => None,
+            })
     }
 
     fn push_zero(&mut self, zero: Zero) {
         let marks = self.marks();
-        if self.tail.is_some_and(|tail| tail.end == zero.start && tail.marks == marks && matches!(tail.kind, Kind::Carry { .. } | Kind::Eq { .. })) {
+        if self.tail.is_some_and(|tail| {
+            tail.end == zero.start
+                && tail.marks == marks
+                && matches!(tail.kind, Kind::Carry { .. } | Kind::Eq { .. })
+        }) {
             self.flags_kept(zero.start);
             return;
         }
-        if let Some(z) = self.zeros.as_mut().filter(|z| z.end == zero.start && z.marks == marks)
+        if let Some(z) = self
+            .zeros
+            .as_mut()
+            .filter(|z| z.end == zero.start && z.marks == marks)
             && z.len < PENDING_ZEROS
         {
             z.movs[z.len] = zero;
@@ -139,7 +175,12 @@ impl Asm {
             z.end = zero.end;
             return;
         }
-        self.zeros = Some(PendingZeros { end: zero.end, marks, movs: [zero; PENDING_ZEROS], len: 1 });
+        self.zeros = Some(PendingZeros {
+            end: zero.end,
+            marks,
+            movs: [zero; PENDING_ZEROS],
+            len: 1,
+        });
     }
 
     /// Stores the low `size` bytes of `imm` to `dst`; a quadword takes `imm` sign-extended.
@@ -167,7 +208,11 @@ impl Asm {
             self.code.extend(imm.to_le_bytes());
         }
         if imm == 0 {
-            self.push_zero(Zero { start, end: self.pos(), reg: dst });
+            self.push_zero(Zero {
+                start,
+                end: self.pos(),
+                reg: dst,
+            });
         } else {
             self.flags_kept(start);
         }
@@ -175,14 +220,21 @@ impl Asm {
 
     /// Marks the status flags dead here, read by nothing before their next write, so each pending `mov r32, 0` becomes `xor r32, r32`.
     pub fn flags_overwritten(&mut self) {
-        let Some(z) = self.zeros.take().filter(|z| z.end == self.pos() && z.marks == self.marks()) else { return };
+        let Some(z) = self
+            .zeros
+            .take()
+            .filter(|z| z.end == self.pos() && z.marks == self.marks())
+        else {
+            return;
+        };
         self.tail = None;
         for zero in z.movs[..z.len].iter().rev() {
             let at = self.pos();
             self.alu32(Alu::Xor, zero.reg, zero.reg);
             let xor = (self.pos() - at) as usize;
             self.code[zero.start as usize..].rotate_right(xor);
-            self.code.drain(zero.start as usize + xor..zero.end as usize + xor);
+            self.code
+                .drain(zero.start as usize + xor..zero.end as usize + xor);
         }
     }
 
@@ -201,19 +253,37 @@ impl Asm {
     /// Atomic `lock xadd [dst], src` of width `size`.
     pub fn xadd(&mut self, size: Size, dst: Mem, src: Reg) {
         self.flags_overwritten();
-        self.sized(true, size, (&[0x0F, 0xC0], &[0x0F, 0xC1]), src as u8, dst.into());
+        self.sized(
+            true,
+            size,
+            (&[0x0F, 0xC0], &[0x0F, 0xC1]),
+            src as u8,
+            dst.into(),
+        );
     }
 
     /// Atomic `lock cmpxchg [dst], src` of width `size`.
     pub fn cmpxchg(&mut self, size: Size, dst: Mem, src: Reg) {
         self.flags_overwritten();
-        self.sized(true, size, (&[0x0F, 0xB0], &[0x0F, 0xB1]), src as u8, dst.into());
+        self.sized(
+            true,
+            size,
+            (&[0x0F, 0xB0], &[0x0F, 0xB1]),
+            src as u8,
+            dst.into(),
+        );
     }
 
     /// Atomic `lock op [dst], src` of width `size`.
     pub fn lock_alu_reg(&mut self, size: Size, op: Alu, dst: Mem, src: Reg) {
         self.alu_flags(op);
-        self.sized(true, size, (&[op as u8 * 8], &[op as u8 * 8 + 1]), src as u8, dst.into());
+        self.sized(
+            true,
+            size,
+            (&[op as u8 * 8], &[op as u8 * 8 + 1]),
+            src as u8,
+            dst.into(),
+        );
     }
 
     /// Atomic `lock op [dst], imm` of width `size`.
@@ -252,7 +322,14 @@ impl Asm {
     /// `bt dst, bit` on registers at `size` (`Size::D` or `Size::Q`), copying bit `bit & (bits - 1)` of `dst` into CF.
     pub fn bt_reg(&mut self, size: Size, dst: Reg, bit: Reg) {
         self.flags_overwritten();
-        self.encode(&[], size == Size::Q, &[0x0F, 0xA3], bit as u8, dst.into(), false);
+        self.encode(
+            &[],
+            size == Size::Q,
+            &[0x0F, 0xA3],
+            bit as u8,
+            dst.into(),
+            false,
+        );
     }
 
     fn xmm_op(&mut self, pp: u8, opcode: u8, (xmm, src): (Xmm, Xmm), rm: impl Into<Rm>) {
@@ -271,8 +348,14 @@ impl Asm {
         }
         let start = self.pos();
         let joined = self.take_tail().and_then(|tail| match tail.kind {
-            Kind::ZeroRun { start, run, len, last }
-                if run.base == dst.base && run.index == dst.index && run.disp.checked_add(len) == Some(dst.disp) =>
+            Kind::ZeroRun {
+                start,
+                run,
+                len,
+                last,
+            } if run.base == dst.base
+                && run.index == dst.index
+                && run.disp.checked_add(len) == Some(dst.disp) =>
             {
                 Some((start, run, len, last))
             }
@@ -280,7 +363,12 @@ impl Asm {
         });
         let Some((last_start, run, len, last)) = joined else {
             self.store_imm_sized(Size::Q, dst, 0);
-            self.set_tail(Kind::ZeroRun { start, run: dst, len: 8, last: Last::Imm });
+            self.set_tail(Kind::ZeroRun {
+                start,
+                run: dst,
+                len: 8,
+                last: Last::Imm,
+            });
             return false;
         };
         if last != Last::Movups {
@@ -297,7 +385,12 @@ impl Asm {
             self.xmm_op(0, 0x11, (scratch, Xmm(0)), dst.offset(-8));
             Last::Movups
         };
-        self.set_tail(Kind::ZeroRun { start: at, run, len: len + 8, last: next });
+        self.set_tail(Kind::ZeroRun {
+            start: at,
+            run,
+            len: len + 8,
+            last: next,
+        });
         self.advance_zeros(start);
         last == Last::Imm
     }

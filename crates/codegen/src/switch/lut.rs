@@ -1,7 +1,9 @@
 use crate::fold::extend;
 use crate::ir::{Binary, Block, BlockData, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::bitmask::{BitmaskPlan, TableLayout, emit_bitmask_test, emit_table_word, known_upper_bound};
+use super::bitmask::{
+    BitmaskPlan, TableLayout, emit_bitmask_test, emit_table_word, known_upper_bound,
+};
 use super::emit::push_node;
 use super::{Edge, Info, Run, clean_dead_head_insts};
 
@@ -54,20 +56,33 @@ impl ColExpr {
     fn cost(self, known_u_max: u64) -> (usize, u8, bool, bool) {
         match self {
             Self::Same(_) => (0, 0, false, false),
-            Self::OneBit { bit_plan, default_is_trap, .. } => {
+            Self::OneBit {
+                bit_plan,
+                default_is_trap,
+                ..
+            } => {
                 let tier = if bit_plan.two_words { 127 } else { 63 };
-                let bounds = !default_is_trap && !(!bit_plan.signed && bit_plan.base == 0 && known_u_max <= tier);
+                let bounds = !default_is_trap
+                    && !(!bit_plan.signed && bit_plan.base == 0 && known_u_max <= tier);
                 (self.word_count(), 1, bit_plan.base != 0, bounds)
             }
             Self::Packed(p) => {
-                let bounds = p.default_c.is_some() && !(!p.signed && p.base == 0 && known_u_max <= p.span);
+                let bounds =
+                    p.default_c.is_some() && !(!p.signed && p.base == 0 && known_u_max <= p.span);
                 (self.word_count(), p.k, p.base != 0, bounds)
             }
         }
     }
 }
 
-fn resolve_val(func: &Function, info: &Info, params: &[Value], args: &[ArgVal], locals: &[(Value, (i64, Type))], v: Value) -> ArgVal {
+fn resolve_val(
+    func: &Function,
+    info: &Info,
+    params: &[Value],
+    args: &[ArgVal],
+    locals: &[(Value, (i64, Type))],
+    v: Value,
+) -> ArgVal {
     if let Some(pos) = params.iter().position(|&p| p == v) {
         return args[pos];
     }
@@ -96,14 +111,19 @@ fn resolve_edge_candidates(func: &Function, info: &Info, edge: &Edge) -> Vec<Out
             })
             .collect()
     };
-    let mut cands = vec![Outcome::Jump { target: edge.block, args: init_args.clone() }];
+    let mut cands = vec![Outcome::Jump {
+        target: edge.block,
+        args: init_args.clone(),
+    }];
     let (mut cur_blk, mut cur_args) = (edge.block, init_args);
     for _ in 0..3 {
         let data = &func.blocks[cur_blk.index()];
         if data.params.len() != cur_args.len() {
             break;
         }
-        let Some((&last, body)) = data.insts.split_last() else { break };
+        let Some((&last, body)) = data.insts.split_last() else {
+            break;
+        };
         let mut locals: Vec<(Value, (i64, Type))> = Vec::with_capacity(body.len());
         let mut consts_only = true;
         for &inst in body {
@@ -124,13 +144,22 @@ fn resolve_edge_candidates(func: &Function, info: &Info, edge: &Edge) -> Vec<Out
                 break;
             }
             Op::Return(vals) => {
-                let resolved = vals.iter().map(|&v| resolve_val(func, info, &data.params, &cur_args, &locals, v)).collect();
+                let resolved = vals
+                    .iter()
+                    .map(|&v| resolve_val(func, info, &data.params, &cur_args, &locals, v))
+                    .collect();
                 cands.push(Outcome::Return(resolved));
                 break;
             }
             Op::Jump(next, next_args) => {
-                let resolved: Vec<ArgVal> = next_args.iter().map(|&v| resolve_val(func, info, &data.params, &cur_args, &locals, v)).collect();
-                cands.push(Outcome::Jump { target: *next, args: resolved.clone() });
+                let resolved: Vec<ArgVal> = next_args
+                    .iter()
+                    .map(|&v| resolve_val(func, info, &data.params, &cur_args, &locals, v))
+                    .collect();
+                cands.push(Outcome::Jump {
+                    target: *next,
+                    args: resolved.clone(),
+                });
                 cur_blk = *next;
                 cur_args = resolved;
             }
@@ -147,16 +176,27 @@ enum UnifiedTarget {
 
 enum ColSource {
     Invariant(Value),
-    Consts { out_ty: Type, run_vals: Vec<i64>, default_c: Option<i64> },
+    Consts {
+        out_ty: Type,
+        run_vals: Vec<i64>,
+        default_c: Option<i64>,
+    },
 }
 
-fn match_cols(expected_tys: &[Type], arm_args: &[Vec<ArgVal>], default_args: Option<&[ArgVal]>) -> Option<Vec<ColSource>> {
+fn match_cols(
+    expected_tys: &[Type],
+    arm_args: &[Vec<ArgVal>],
+    default_args: Option<&[ArgVal]>,
+) -> Option<Vec<ColSource>> {
     let mut cols = Vec::with_capacity(expected_tys.len());
     for (col, &expected_ty) in expected_tys.iter().enumerate() {
         let first = arm_args.first()?.get(col).copied()?;
         match first {
             ArgVal::Invariant(inv) => {
-                if arm_args.iter().any(|a| a.get(col) != Some(&ArgVal::Invariant(inv))) {
+                if arm_args
+                    .iter()
+                    .any(|a| a.get(col) != Some(&ArgVal::Invariant(inv)))
+                {
                     return None;
                 }
                 if default_args.is_some_and(|da| da.get(col) != Some(&ArgVal::Invariant(inv))) {
@@ -170,7 +210,9 @@ fn match_cols(expected_tys: &[Type], arm_args: &[Vec<ArgVal>], default_args: Opt
                 }
                 let mut run_vals = Vec::with_capacity(arm_args.len());
                 for a in arm_args {
-                    let Some(&ArgVal::Const(imm, aty)) = a.get(col) else { return None };
+                    let Some(&ArgVal::Const(imm, aty)) = a.get(col) else {
+                        return None;
+                    };
                     if aty != ty {
                         return None;
                     }
@@ -178,7 +220,9 @@ fn match_cols(expected_tys: &[Type], arm_args: &[Vec<ArgVal>], default_args: Opt
                 }
                 let default_c = match default_args {
                     Some(da) => {
-                        let Some(&ArgVal::Const(imm, dty)) = da.get(col) else { return None };
+                        let Some(&ArgVal::Const(imm, dty)) = da.get(col) else {
+                            return None;
+                        };
                         if dty != ty {
                             return None;
                         }
@@ -186,7 +230,11 @@ fn match_cols(expected_tys: &[Type], arm_args: &[Vec<ArgVal>], default_args: Opt
                     }
                     None => None,
                 };
-                cols.push(ColSource::Consts { out_ty: ty, run_vals, default_c });
+                cols.push(ColSource::Consts {
+                    out_ty: ty,
+                    run_vals,
+                    default_c,
+                });
             }
         }
     }
@@ -199,15 +247,29 @@ fn select_unified_target(
     default_cands: &[Outcome],
     allow_partial: bool,
 ) -> Option<(UnifiedTarget, Vec<ColSource>, bool)> {
-    let first_non_trap = arm_cands.iter().find(|c| !c.iter().all(|o| matches!(o, Outcome::Trap)))?;
+    let first_non_trap = arm_cands
+        .iter()
+        .find(|c| !c.iter().all(|o| matches!(o, Outcome::Trap)))?;
     let mut options: Vec<UnifiedTarget> = Vec::new();
-    if first_non_trap.iter().any(|o| matches!(o, Outcome::Return(_))) {
-        let ret_tys: Vec<Type> = func.signature.returns.iter().map(|p| p.value_type).collect();
+    if first_non_trap
+        .iter()
+        .any(|o| matches!(o, Outcome::Return(_)))
+    {
+        let ret_tys: Vec<Type> = func
+            .signature
+            .returns
+            .iter()
+            .map(|p| p.value_type)
+            .collect();
         options.push(UnifiedTarget::Return(ret_tys));
     }
     for o in first_non_trap {
         if let Outcome::Jump { target, .. } = o {
-            let tys: Vec<Type> = func.blocks[target.index()].params.iter().map(|&p| func.ty(p)).collect();
+            let tys: Vec<Type> = func.blocks[target.index()]
+                .params
+                .iter()
+                .map(|&p| func.ty(p))
+                .collect();
             options.push(UnifiedTarget::Jump(*target, tys));
         }
     }
@@ -219,7 +281,9 @@ fn select_unified_target(
                 _ => None,
             }),
             UnifiedTarget::Jump(t, tys) => cands.iter().find_map(|o| match o {
-                Outcome::Jump { target, args } if target == t && args.len() == tys.len() => Some(Some(args.as_slice())),
+                Outcome::Jump { target, args } if target == t && args.len() == tys.len() => {
+                    Some(Some(args.as_slice()))
+                }
                 Outcome::Trap => Some(None),
                 _ => None,
             }),
@@ -229,11 +293,18 @@ fn select_unified_target(
         let expected_tys = match &ut {
             UnifiedTarget::Return(tys) | UnifiedTarget::Jump(_, tys) => tys.as_slice(),
         };
-        let Some(arm_args_opt): Option<Vec<Option<&[ArgVal]>>> = arm_cands.iter().map(|c| find_match(c, &ut)).collect() else {
+        let Some(arm_args_opt): Option<Vec<Option<&[ArgVal]>>> =
+            arm_cands.iter().map(|c| find_match(c, &ut)).collect()
+        else {
             continue;
         };
-        let Some(first_some) = arm_args_opt.iter().flatten().copied().next() else { continue };
-        let arm_args: Vec<Vec<ArgVal>> = arm_args_opt.into_iter().map(|opt| opt.unwrap_or(first_some).to_vec()).collect();
+        let Some(first_some) = arm_args_opt.iter().flatten().copied().next() else {
+            continue;
+        };
+        let arm_args: Vec<Vec<ArgVal>> = arm_args_opt
+            .into_iter()
+            .map(|opt| opt.unwrap_or(first_some).to_vec())
+            .collect();
         let (default_args, default_matched) = match find_match(default_cands, &ut) {
             Some(Some(args)) => (Some(args), true),
             Some(None) => (None, true),
@@ -291,7 +362,10 @@ fn pack_table(
         let (val0, val1) = match default_c {
             Some(dc) => {
                 let ud = uval_of(dc, out_ty);
-                let alt = distinct.iter().find(|&&(u, _)| u != ud).map_or(dc, |&(_, v)| v);
+                let alt = distinct
+                    .iter()
+                    .find(|&&(u, _)| u != ud)
+                    .map_or(dc, |&(_, v)| v);
                 (dc, alt)
             }
             None => (distinct[0].1, distinct[1].1),
@@ -304,16 +378,29 @@ fn pack_table(
             }
         }
         consider(ColExpr::OneBit {
-            bit_plan: BitmaskPlan { base, span: (table_len - 1) as u64, words, two_words: table_len > 64, signed },
+            bit_plan: BitmaskPlan {
+                base,
+                span: (table_len - 1) as u64,
+                words,
+                two_words: table_len > 64,
+                signed,
+            },
             val0,
             val1,
             default_is_trap: default_c.is_none(),
         });
     }
     let min_u = table.iter().map(|&v| uval_of(v, out_ty)).min()?;
-    let min_s = table.iter().map(|&v| extend(v, out_ty, true) as u64).min()?;
+    let min_s = table
+        .iter()
+        .map(|&v| extend(v, out_ty, true) as u64)
+        .min()?;
     for bias in [0_u64, min_u, min_s] {
-        let max_delta = table.iter().map(|&v| uval_of(v, out_ty).wrapping_sub(bias) & out_mask).max().unwrap_or(0);
+        let max_delta = table
+            .iter()
+            .map(|&v| uval_of(v, out_ty).wrapping_sub(bias) & out_mask)
+            .max()
+            .unwrap_or(0);
         for k in [2_u8, 4, 8] {
             if max_delta < (1_u64 << k) && table_len * usize::from(k) <= 128 {
                 let mut words = [0_u64; 2];
@@ -339,7 +426,13 @@ fn pack_table(
     best
 }
 
-pub(super) fn build_col_lut(ty: Type, out_ty: Type, intervals: &[(u64, u64, i64)], default_c: Option<i64>, known_u_max: u64) -> Option<ColExpr> {
+pub(super) fn build_col_lut(
+    ty: Type,
+    out_ty: Type,
+    intervals: &[(u64, u64, i64)],
+    default_c: Option<i64>,
+    known_u_max: u64,
+) -> Option<ColExpr> {
     if intervals.is_empty() {
         return None;
     }
@@ -371,7 +464,13 @@ pub(super) fn build_col_lut(ty: Type, out_ty: Type, intervals: &[(u64, u64, i64)
                         table[s..=e].fill(val);
                     }
                 }
-                if let Some(expr) = pack_table(out_ty, (base as i64, false, len), &table, default_c, known_u_max) {
+                if let Some(expr) = pack_table(
+                    out_ty,
+                    (base as i64, false, len),
+                    &table,
+                    default_c,
+                    known_u_max,
+                ) {
                     consider(expr);
                 }
             }
@@ -381,13 +480,28 @@ pub(super) fn build_col_lut(ty: Type, out_ty: Type, intervals: &[(u64, u64, i64)
     let mut segs: Vec<(i64, i64, i64)> = Vec::with_capacity(intervals.len() + 1);
     for &(lo, hi, val) in intervals {
         if lo < sign_bit && hi >= sign_bit {
-            segs.push((extend(lo as i64, ty, true), extend((sign_bit - 1) as i64, ty, true), val));
-            segs.push((extend(sign_bit as i64, ty, true), extend(hi as i64, ty, true), val));
+            segs.push((
+                extend(lo as i64, ty, true),
+                extend((sign_bit - 1) as i64, ty, true),
+                val,
+            ));
+            segs.push((
+                extend(sign_bit as i64, ty, true),
+                extend(hi as i64, ty, true),
+                val,
+            ));
         } else {
-            segs.push((extend(lo as i64, ty, true), extend(hi as i64, ty, true), val));
+            segs.push((
+                extend(lo as i64, ty, true),
+                extend(hi as i64, ty, true),
+                val,
+            ));
         }
     }
-    if let (Some(s_min), Some(s_max)) = (segs.iter().map(|&(l, _, _)| l).min(), segs.iter().map(|&(_, h, _)| h).max()) {
+    if let (Some(s_min), Some(s_max)) = (
+        segs.iter().map(|&(l, _, _)| l).min(),
+        segs.iter().map(|&(_, h, _)| h).max(),
+    ) {
         let s_span = s_max.abs_diff(s_min);
         if s_span < 128 {
             let len = (s_span + 1) as usize;
@@ -395,7 +509,9 @@ pub(super) fn build_col_lut(ty: Type, out_ty: Type, intervals: &[(u64, u64, i64)
             for (lo, hi, val) in segs {
                 table[lo.abs_diff(s_min) as usize..=hi.abs_diff(s_min) as usize].fill(val);
             }
-            if let Some(expr) = pack_table(out_ty, (s_min, true, len), &table, default_c, known_u_max) {
+            if let Some(expr) =
+                pack_table(out_ty, (s_min, true, len), &table, default_c, known_u_max)
+            {
                 consider(expr);
             }
         }
@@ -403,15 +519,34 @@ pub(super) fn build_col_lut(ty: Type, out_ty: Type, intervals: &[(u64, u64, i64)
     best
 }
 
-pub(super) fn emit_col_expr(func: &mut Function, (v, ty): (Value, Type), out_ty: Type, expr: ColExpr, known_u_max: u64, insts: &mut Vec<Inst>) -> Value {
+pub(super) fn emit_col_expr(
+    func: &mut Function,
+    (v, ty): (Value, Type),
+    out_ty: Type,
+    expr: ColExpr,
+    known_u_max: u64,
+    insts: &mut Vec<Inst>,
+) -> Value {
     match expr {
         ColExpr::Same(c) => {
             let res = func.value(out_ty);
             insts.push(func.add(Op::Const(extend(c, out_ty, true)), Some(res)));
             res
         }
-        ColExpr::OneBit { bit_plan, val0, val1, default_is_trap } => {
-            let cond = emit_bitmask_test(func, (v, ty), bit_plan, known_u_max, !default_is_trap, insts);
+        ColExpr::OneBit {
+            bit_plan,
+            val0,
+            val1,
+            default_is_trap,
+        } => {
+            let cond = emit_bitmask_test(
+                func,
+                (v, ty),
+                bit_plan,
+                known_u_max,
+                !default_is_trap,
+                insts,
+            );
             let (u0, u1) = (uval_of(val0, out_ty), uval_of(val1, out_ty));
             if u0 == 0 && u1 == 1 {
                 if out_ty == Type::I8 {
@@ -451,9 +586,20 @@ pub(super) fn emit_col_expr(func: &mut Function, (v, ty): (Value, Type), out_ty:
                 per_word,
                 bounds_elide_max: p.span,
             };
-            let (diff, in_range, word) = emit_table_word(func, (v, ty), layout, known_u_max, p.default_c.is_some(), insts);
+            let (diff, in_range, word) = emit_table_word(
+                func,
+                (v, ty),
+                layout,
+                known_u_max,
+                p.default_c.is_some(),
+                insts,
+            );
             let sh_bits = i64::from(u32::from(p.k).trailing_zeros());
-            let (sh_c, shift, shifted) = (func.value(Type::I64), func.value(Type::I64), func.value(Type::I64));
+            let (sh_c, shift, shifted) = (
+                func.value(Type::I64),
+                func.value(Type::I64),
+                func.value(Type::I64),
+            );
             insts.push(func.add(Op::Const(sh_bits), Some(sh_c)));
             insts.push(func.add(Op::Binary(Binary::Ishl, diff, sh_c), Some(shift)));
             insts.push(func.add(Op::Binary(Binary::Ushr, word, shift), Some(shifted)));
@@ -508,12 +654,17 @@ pub(super) fn try_emit_runs_lut(
     }
     let min_lo = runs[0].lo;
     let max_hi = runs[runs.len() - 1].hi;
-    let covered: u64 = runs.iter().map(|r| r.hi.saturating_sub(r.lo).saturating_add(1)).sum();
+    let covered: u64 = runs
+        .iter()
+        .map(|r| r.hi.saturating_sub(r.lo).saturating_add(1))
+        .sum();
     let contiguous = max_hi - min_lo < 128 && covered == (max_hi - min_lo + 1);
     let mut unique_edges: Vec<Edge> = Vec::new();
     let mut run_edge_idx = Vec::with_capacity(runs.len());
     for r in runs {
-        let idx = if let Some(pos) = unique_edges.iter().position(|e| e.block == r.hit.block && e.args == r.hit.args && e.synth_bool == r.hit.synth_bool) {
+        let idx = if let Some(pos) = unique_edges.iter().position(|e| {
+            e.block == r.hit.block && e.args == r.hit.args && e.synth_bool == r.hit.synth_bool
+        }) {
             pos
         } else {
             unique_edges.push(r.hit.clone());
@@ -521,11 +672,19 @@ pub(super) fn try_emit_runs_lut(
         };
         run_edge_idx.push(idx);
     }
-    let edge_cands: Vec<Vec<Outcome>> = unique_edges.iter().map(|e| resolve_edge_candidates(func, info, e)).collect();
-    let arm_cands: Vec<Vec<Outcome>> = run_edge_idx.iter().map(|&idx| edge_cands[idx].clone()).collect();
+    let edge_cands: Vec<Vec<Outcome>> = unique_edges
+        .iter()
+        .map(|e| resolve_edge_candidates(func, info, e))
+        .collect();
+    let arm_cands: Vec<Vec<Outcome>> = run_edge_idx
+        .iter()
+        .map(|&idx| edge_cands[idx].clone())
+        .collect();
     let default_cands = resolve_edge_candidates(func, info, default_edge);
     let allow_partial = contiguous && runs.len() >= 3;
-    let Some((target, cols, default_matched)) = select_unified_target(func, &arm_cands, &default_cands, allow_partial) else {
+    let Some((target, cols, default_matched)) =
+        select_unified_target(func, &arm_cands, &default_cands, allow_partial)
+    else {
         return false;
     };
     let known_u_max = known_upper_bound(func, info, v);
@@ -534,9 +693,18 @@ pub(super) fn try_emit_runs_lut(
     for col in cols {
         match col {
             ColSource::Invariant(val) => plans.push(Err(val)),
-            ColSource::Consts { out_ty, run_vals, default_c } => {
-                let intervals: Vec<(u64, u64, i64)> = runs.iter().zip(run_vals).map(|(r, c)| (r.lo, r.hi, c)).collect();
-                let Some(expr) = build_col_lut(ty, out_ty, &intervals, default_c, known_u_max) else {
+            ColSource::Consts {
+                out_ty,
+                run_vals,
+                default_c,
+            } => {
+                let intervals: Vec<(u64, u64, i64)> = runs
+                    .iter()
+                    .zip(run_vals)
+                    .map(|(r, c)| (r.lo, r.hi, c))
+                    .collect();
+                let Some(expr) = build_col_lut(ty, out_ty, &intervals, default_c, known_u_max)
+                else {
                     return false;
                 };
                 total_words += expr.word_count();
@@ -559,7 +727,14 @@ pub(super) fn try_emit_runs_lut(
         for &item in &plans {
             match item {
                 Err(val) => out_args.push(val),
-                Ok((out_ty, expr)) => out_args.push(emit_col_expr(func, (v, ty), out_ty, expr, known_u_max, insts)),
+                Ok((out_ty, expr)) => out_args.push(emit_col_expr(
+                    func,
+                    (v, ty),
+                    out_ty,
+                    expr,
+                    known_u_max,
+                    insts,
+                )),
             }
         }
         let term = match &target {
@@ -589,13 +764,19 @@ pub(super) fn try_emit_runs_lut(
         };
         let (span_c, in_range) = (func.value(Type::I64), func.value(Type::I8));
         let sc_i = func.add(Op::Const((max_hi - min_lo) as i64), Some(span_c));
-        let ir_i = func.add(Op::Icmp(IntCC::UnsignedLessThanOrEqual, diff, span_c), Some(in_range));
+        let ir_i = func.add(
+            Op::Icmp(IntCC::UnsignedLessThanOrEqual, diff, span_c),
+            Some(in_range),
+        );
         super::push_before_last(func, at.0, sc_i);
         super::push_before_last(func, at.0, ir_i);
         let mut hit_insts = Vec::new();
         emit_lut_term(func, &mut hit_insts);
         let hit_blk = Block(func.blocks.len() as u32);
-        func.blocks.push(BlockData { params: Vec::new(), insts: hit_insts });
+        func.blocks.push(BlockData {
+            params: Vec::new(),
+            insts: hit_insts,
+        });
         let def_args = if let Some(b) = default_edge.synth_bool {
             let val = func.value(Type::I8);
             let inst = func.add(Op::Const(i64::from(b)), Some(val));
@@ -604,7 +785,10 @@ pub(super) fn try_emit_runs_lut(
         } else {
             default_edge.args.clone()
         };
-        let brif = func.add(Op::Brif(in_range, hit_blk, Vec::new(), default_edge.block, def_args), None);
+        let brif = func.add(
+            Op::Brif(in_range, hit_blk, Vec::new(), default_edge.block, def_args),
+            None,
+        );
         push_node(func, Some(at), vec![brif]);
         return true;
     }

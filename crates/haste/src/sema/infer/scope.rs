@@ -63,12 +63,17 @@ fn instantiate_ty(mut types: &super::super::ty::Types, ty: Ty, args: &[Ty]) -> T
 
 /// The names of the type parameters of `params` in `src`, each paired with its argument in `args`.
 pub fn named_args<'a>(src: &'a Source, params: &[Generic], args: &[Ty]) -> Vec<(&'a str, Ty)> {
-    type_params(params).map(|generic| src.text(generic.name)).zip(args.iter().copied()).collect()
+    type_params(params)
+        .map(|generic| src.text(generic.name))
+        .zip(args.iter().copied())
+        .collect()
 }
 
 /// The parameters of `params` that take a type argument.
 pub fn type_params(params: &[Generic]) -> impl Iterator<Item = &Generic> {
-    params.iter().filter(|generic| generic.kind != GenericKind::Lifetime)
+    params
+        .iter()
+        .filter(|generic| generic.kind != GenericKind::Lifetime)
 }
 
 /// A header whose generic parameters and where clauses bound the type parameters of the frame.
@@ -92,9 +97,19 @@ impl Header {
 }
 
 /// The bounds that a header puts on its type parameter `name`: those on the parameter, then those of the where predicates on it.
-pub(super) fn named_bounds(arena: &Body, src: &Source, (generics, predicates): (&[Generic], &[Predicate]), name: &str) -> Vec<u32> {
-    let declared = generics.iter().filter(|generic| same_param(src.text(generic.name), name)).flat_map(|generic| arena.list(generic.bounds).iter().copied());
-    declared.chain(predicate_bounds(arena, src, predicates, name)).collect()
+pub(super) fn named_bounds(
+    arena: &Body,
+    src: &Source,
+    (generics, predicates): (&[Generic], &[Predicate]),
+    name: &str,
+) -> Vec<u32> {
+    let declared = generics
+        .iter()
+        .filter(|generic| same_param(src.text(generic.name), name))
+        .flat_map(|generic| arena.list(generic.bounds).iter().copied());
+    declared
+        .chain(predicate_bounds(arena, src, predicates, name))
+        .collect()
 }
 
 /// Whether two parameter names read from source are the same parameter: equal text, and for an anonymous `impl Trait` parameter the same token.
@@ -103,13 +118,34 @@ pub(super) fn same_param(a: &str, b: &str) -> bool {
 }
 
 /// The bounds on the one generic parameter `generic`: its own, then the where-clause bounds on its name.
-pub(super) fn generic_bounds(arena: &Body, src: &Source, predicates: &[Predicate], generic: &Generic) -> Vec<u32> {
+pub(super) fn generic_bounds(
+    arena: &Body,
+    src: &Source,
+    predicates: &[Predicate],
+    generic: &Generic,
+) -> Vec<u32> {
     let declared = arena.list(generic.bounds).iter().copied();
-    declared.chain(predicate_bounds(arena, src, predicates, src.text(generic.name))).collect()
+    declared
+        .chain(predicate_bounds(
+            arena,
+            src,
+            predicates,
+            src.text(generic.name),
+        ))
+        .collect()
 }
 
-pub(super) fn predicate_bounds<'b>(arena: &'b Body, src: &'b Source, predicates: &'b [Predicate], name: &'b str) -> impl Iterator<Item = u32> + 'b {
-    let named = predicates.iter().filter(move |predicate| predicate.ty.is_some_and(|ty| names_param(arena, src, ty, name)));
+pub(super) fn predicate_bounds<'b>(
+    arena: &'b Body,
+    src: &'b Source,
+    predicates: &'b [Predicate],
+    name: &'b str,
+) -> impl Iterator<Item = u32> + 'b {
+    let named = predicates.iter().filter(move |predicate| {
+        predicate
+            .ty
+            .is_some_and(|ty| names_param(arena, src, ty, name))
+    });
     named.flat_map(|predicate| arena.list(predicate.bounds).iter().copied())
 }
 
@@ -124,7 +160,9 @@ pub(super) fn one_name<'s>(arena: &Body, src: &'s Source, ty: TyId) -> Option<&'
     };
     let path = arena.path(path);
     match arena.list(path.segments) {
-        [segment] if path.qself.is_none() && arena.segments[*segment as usize].args.is_none() => Some(src.text(arena.segments[*segment as usize].name)),
+        [segment] if path.qself.is_none() && arena.segments[*segment as usize].args.is_none() => {
+            Some(src.text(arena.segments[*segment as usize].name))
+        }
         _ => None,
     }
 }
@@ -132,19 +170,42 @@ pub(super) fn one_name<'s>(arena: &Body, src: &'s Source, ty: TyId) -> Option<&'
 impl<'a> Infer<'_, 'a> {
     /// Whether trait method `member` says `where Self: Sized`, which keeps it out of the trait's vtable.
     pub(crate) fn needs_sized_self(&mut self, member: ItemRef) -> Result<bool> {
-        let (sig, src, home) = (self.cx.signature(member)?, &self.cx.file(member).source, self.cx.module_of(member)?);
+        let (sig, src, home) = (
+            self.cx.signature(member)?,
+            &self.cx.file(member).source,
+            self.cx.module_of(member)?,
+        );
         let Some(sized) = self.cx.lang_item("sized") else {
             return Ok(false);
         };
         let bounds: Vec<u32> = predicate_bounds(&sig.body, src, &sig.predicates, "Self").collect();
-        self.in_source(src, |infer| Ok(bounds.into_iter().any(|bound| infer.bound_trait_at(&sig.body, bound, home).is_some_and(|(of, _)| of == sized))))
+        self.in_source(src, |infer| {
+            Ok(bounds.into_iter().any(|bound| {
+                infer
+                    .bound_trait_at(&sig.body, bound, home)
+                    .is_some_and(|(of, _)| of == sized)
+            }))
+        })
     }
 
     /// The frame of the type item or trait `item` with its type parameters `params` set to `args`, `Self` as `self_ty`, and the bounds of `bounds`.
-    pub(super) fn item_frame(&mut self, item: ItemRef, (params, args): (&[Generic], &[Ty]), (self_ty, bounds): (Option<Ty>, Option<ItemRef>)) -> Result<Frame<'a>> {
+    pub(super) fn item_frame(
+        &mut self,
+        item: ItemRef,
+        (params, args): (&[Generic], &[Ty]),
+        (self_ty, bounds): (Option<Ty>, Option<ItemRef>),
+    ) -> Result<Frame<'a>> {
         let file = self.cx.file(item);
         let generics = named_args(&file.source, params, args);
-        Ok(Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty, block: None, item: bounds, root: item.declaring_body() })
+        Ok(Frame {
+            src: &file.source,
+            home: self.cx.module_of(item)?,
+            generics,
+            self_ty,
+            block: None,
+            item: bounds,
+            root: item.declaring_body(),
+        })
     }
 
     /// The frame of function `item` at `substs`: the type parameters of its impl, then its own.
@@ -153,16 +214,36 @@ impl<'a> Infer<'_, 'a> {
         let file = self.cx.file(item);
         let home = self.cx.module_of(item)?;
         let (mut generics, self_ty, rest) = self.parent_frame(item, substs)?;
-        generics.extend(type_params(&sig.generics).map(|generic| file.source.text(generic.name)).zip(rest.iter().copied()));
+        generics.extend(
+            type_params(&sig.generics)
+                .map(|generic| file.source.text(generic.name))
+                .zip(rest.iter().copied()),
+        );
         let block = self.cx.owner_impl(item);
-        Ok(Frame { src: &file.source, home, generics, self_ty, block, item: Some(item), root: item.declaring_body() })
+        Ok(Frame {
+            src: &file.source,
+            home,
+            generics,
+            self_ty,
+            block,
+            item: Some(item),
+            root: item.declaring_body(),
+        })
     }
 
-    fn parent_frame<'s>(&mut self, item: ItemRef, substs: &'s [Ty]) -> Result<(Vec<(&'a str, Ty)>, Option<Ty>, &'s [Ty])> {
+    fn parent_frame<'s>(
+        &mut self,
+        item: ItemRef,
+        substs: &'s [Ty],
+    ) -> Result<(Vec<(&'a str, Ty)>, Option<Ty>, &'s [Ty])> {
         if let Some(block) = self.cx.owner_impl(item) {
             let count = self.impl_params(block)?;
             if substs.len() < count {
-                bail!("{} needs {count} impl type arguments, {} given", self.cx.name(item), substs.len());
+                bail!(
+                    "{} needs {count} impl type arguments, {} given",
+                    self.cx.name(item),
+                    substs.len()
+                );
             }
             let (outer, rest) = substs.split_at(count);
             let (generics, self_ty) = self.impl_frame(block, outer)?;
@@ -174,11 +255,17 @@ impl<'a> Infer<'_, 'a> {
         let def = self.cx.trait_generics(of)?;
         let count = 1 + type_params(&def.1.params).count();
         if substs.len() < count {
-            bail!("{} needs `Self` and the trait's type arguments", self.cx.name(item));
+            bail!(
+                "{} needs `Self` and the trait's type arguments",
+                self.cx.name(item)
+            );
         }
         let (outer, rest) = substs.split_at(count);
         let src = &self.cx.file(of).source;
-        let generics = type_params(&def.1.params).map(|generic| src.text(generic.name)).zip(outer[1..].iter().copied()).collect();
+        let generics = type_params(&def.1.params)
+            .map(|generic| src.text(generic.name))
+            .zip(outer[1..].iter().copied())
+            .collect();
         Ok((generics, Some(outer[0]), rest))
     }
 
@@ -191,7 +278,9 @@ impl<'a> Infer<'_, 'a> {
     pub fn impl_frame(&mut self, block: ImplRef, args: &[Ty]) -> Result<(Vec<(&'a str, Ty)>, Ty)> {
         let header = self.cx.impl_header(block)?;
         let generics = named_args(&self.cx.impl_file(block).source, &header.generics, args);
-        let self_ty = match self.generic((Form::Impl(block), args.len()), |infer, params| Ok(Arc::from(vec![vec![infer.impl_self(block, params)?]]))) {
+        let self_ty = match self.generic((Form::Impl(block), args.len()), |infer, params| {
+            Ok(Arc::from(vec![vec![infer.impl_self(block, params)?]]))
+        }) {
             Some(form) => self.instantiate(form[0][0], args),
             None => self.impl_self(block, args)?,
         };
@@ -206,7 +295,11 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The types of `form` for `count` type arguments in generic form, lowered once by `lower` with placeholder variables as the arguments, or none when lowering it here could differ or needs the arguments themselves.
-    pub(super) fn generic(&mut self, (form, count): (Form, usize), lower: impl FnOnce(&mut Infer<'_, 'a>, &[Ty]) -> Result<Fields>) -> Option<Fields> {
+    pub(super) fn generic(
+        &mut self,
+        (form, count): (Form, usize),
+        lower: impl FnOnce(&mut Infer<'_, 'a>, &[Ty]) -> Result<Fields>,
+    ) -> Option<Fields> {
         if !self.shared_here(form.root()) {
             return None;
         }
@@ -221,21 +314,34 @@ impl<'a> Infer<'_, 'a> {
         let found = self.lower_generic(count, lower);
         self.cx.form_stack.pop();
         if self.cx.quiet_mark() == before {
-            self.cx.store.lookups.forms.insert((form, count), found.clone());
+            self.cx
+                .store
+                .lookups
+                .forms
+                .insert((form, count), found.clone());
         }
         found
     }
 
     /// What `lower` gives with `count` placeholder variables as the type arguments, run apart from any body, when it asked for nothing and left no pending query, hidden type, or new or bound variable.
-    fn lower_generic(&mut self, count: usize, lower: impl FnOnce(&mut Infer<'_, 'a>, &[Ty]) -> Result<Fields>) -> Option<Fields> {
+    fn lower_generic(
+        &mut self,
+        count: usize,
+        lower: impl FnOnce(&mut Infer<'_, 'a>, &[Ty]) -> Result<Fields>,
+    ) -> Option<Fields> {
         let (body, sig) = (Body::default(), Signature::default());
         let (src, home, frames) = (self.src, self.home, self.frames);
         let mut infer = Infer::start(self.cx, (&body, &sig, src), home);
         infer.frames = frames;
         let before = infer.cx.quiet_mark();
-        let params: Vec<Ty> = (0..count).map(|index| infer.cx.types.intern(Kind::Param(index as u16))).collect();
+        let params: Vec<Ty> = (0..count)
+            .map(|index| infer.cx.types.intern(Kind::Param(index as u16)))
+            .collect();
         let found = lower(&mut infer, &params).ok()?;
-        let clean = infer.cx.quiet_mark() == before && infer.backlog() == 0 && infer.hidden.is_empty() && infer.vars.is_empty();
+        let clean = infer.cx.quiet_mark() == before
+            && infer.backlog() == 0
+            && infer.hidden.is_empty()
+            && infer.vars.is_empty();
         clean.then_some(found)
     }
 
@@ -244,8 +350,16 @@ impl<'a> Infer<'_, 'a> {
         if self.bodiless() {
             return true;
         }
-        let quiet = self.items.is_empty() && self.const_args.is_empty() && self.evaluating.is_empty() && self.selecting.is_empty();
-        quiet && root.is_none() && self.instance.as_ref().is_none_or(|(at, _)| !self.cx.has_attr(*at, "define_opaque"))
+        let quiet = self.items.is_empty()
+            && self.const_args.is_empty()
+            && self.evaluating.is_empty()
+            && self.selecting.is_empty();
+        quiet
+            && root.is_none()
+            && self
+                .instance
+                .as_ref()
+                .is_none_or(|(at, _)| !self.cx.has_attr(*at, "define_opaque"))
     }
 
     /// `ty` of a generic form with each rigid parameter `index` replaced by `args[index]`.
@@ -257,19 +371,33 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn headers(&mut self) -> Result<Vec<(Header, &'a Source, ModRef)>> {
         let mut headers = Vec::new();
         if let Some(item) = self.frame_item {
-            headers.push((self.item_header(item)?, &self.cx.file(item).source, self.cx.module_of(item)?));
+            headers.push((
+                self.item_header(item)?,
+                &self.cx.file(item).source,
+                self.cx.module_of(item)?,
+            ));
         }
         if let Some(block) = self.block {
-            headers.push((Header::Impl(self.cx.impl_header(block)?), &self.cx.impl_file(block).source, self.cx.impl_module(block)?));
+            headers.push((
+                Header::Impl(self.cx.impl_header(block)?),
+                &self.cx.impl_file(block).source,
+                self.cx.impl_module(block)?,
+            ));
         } else if let Some(of) = self.frame_item.and_then(|item| self.cx.owner_trait(item)) {
-            headers.push((Header::Generics(self.cx.trait_generics(of)?), &self.cx.file(of).source, self.cx.module_of(of)?));
+            headers.push((
+                Header::Generics(self.cx.trait_generics(of)?),
+                &self.cx.file(of).source,
+                self.cx.module_of(of)?,
+            ));
         }
         Ok(headers)
     }
 
     fn item_header(&mut self, item: ItemRef) -> Result<Header> {
         Ok(match self.cx.item(item).1.kind {
-            ItemKind::Struct | ItemKind::Enum | ItemKind::Union => Header::Adt(self.cx.adt_def(item)?),
+            ItemKind::Struct | ItemKind::Enum | ItemKind::Union => {
+                Header::Adt(self.cx.adt_def(item)?)
+            }
             ItemKind::Type => Header::Generics(self.cx.alias_def(item)?.generics.clone()),
             ItemKind::Trait => Header::Generics(self.cx.trait_generics(item)?),
             _ => Header::Fn(self.cx.signature(item)?),
@@ -283,23 +411,37 @@ impl<'a> Infer<'_, 'a> {
         };
         for (header, src, home) in self.headers()? {
             let (arena, generics, _) = header.parts();
-            let declared = generics.iter().find(|generic| src.text(generic.name) == name).map(|generic| generic.kind);
+            let declared = generics
+                .iter()
+                .find(|generic| src.text(generic.name) == name)
+                .map(|generic| generic.kind);
             if let Some(GenericKind::Const(ty)) = declared {
-                return Ok(Some((self.in_source_home(src, home, |infer| infer.lower_ty(arena, ty))?, value)));
+                return Ok(Some((
+                    self.in_source_home(src, home, |infer| infer.lower_ty(arena, ty))?,
+                    value,
+                )));
             }
         }
         Ok(None)
     }
 
     /// Runs `run` with names read through `frame`, which does not see the items of the body's open blocks when it reads another item's header.
-    pub fn with_frame<T>(&mut self, frame: Frame<'a>, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub fn with_frame<T>(
+        &mut self,
+        frame: Frame<'a>,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         if self.frames == crate::RECURSION_LIMIT {
             let item = frame.item.map_or("an item", |item| self.cx.name(item));
             anyhow::bail!("reached the recursion limit while expanding {item}");
         }
         let foreign = frame.item != self.frame_item || frame.block != self.block;
         let saved = self.swap_frame(frame);
-        let items = if foreign { std::mem::take(&mut self.items) } else { Vec::new() };
+        let items = if foreign {
+            std::mem::take(&mut self.items)
+        } else {
+            Vec::new()
+        };
         self.frames += 1;
         let result = run(self);
         self.frames -= 1;
@@ -311,22 +453,63 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Runs `run` in the current frame with token text read from `src`, the source of the syntax it lowers.
-    pub(super) fn in_source_home<T>(&mut self, src: &'a Source, home: ModRef, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(super) fn in_source_home<T>(
+        &mut self,
+        src: &'a Source,
+        home: ModRef,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         if std::ptr::eq(self.src, src) && self.home == home {
             return run(self);
         }
-        let frame = Frame { src, home, generics: self.generics.clone(), self_ty: self.self_ty, block: self.block, item: self.frame_item, root: self.root };
+        let frame = Frame {
+            src,
+            home,
+            generics: self.generics.clone(),
+            self_ty: self.self_ty,
+            block: self.block,
+            item: self.frame_item,
+            root: self.root,
+        };
         self.with_frame(frame, run)
     }
 
-    pub(super) fn in_source<T>(&mut self, src: &'a Source, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(super) fn in_source<T>(
+        &mut self,
+        src: &'a Source,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         self.in_source_home(src, self.home, run)
     }
 
     /// Reads names through `frame` from now on, and returns the frame it replaces.
     pub fn swap_frame(&mut self, frame: Frame<'a>) -> Frame<'a> {
-        let old = Frame { src: self.src, home: self.home, generics: std::mem::take(&mut self.generics), self_ty: self.self_ty, block: self.block, item: self.frame_item, root: self.root };
-        (self.src, self.home, self.generics, self.self_ty, self.block, self.frame_item, self.root) = (frame.src, frame.home, frame.generics, frame.self_ty, frame.block, frame.item, frame.root);
+        let old = Frame {
+            src: self.src,
+            home: self.home,
+            generics: std::mem::take(&mut self.generics),
+            self_ty: self.self_ty,
+            block: self.block,
+            item: self.frame_item,
+            root: self.root,
+        };
+        (
+            self.src,
+            self.home,
+            self.generics,
+            self.self_ty,
+            self.block,
+            self.frame_item,
+            self.root,
+        ) = (
+            frame.src,
+            frame.home,
+            frame.generics,
+            frame.self_ty,
+            frame.block,
+            frame.item,
+            frame.root,
+        );
         old
     }
 
@@ -348,7 +531,11 @@ impl<'a> Infer<'_, 'a> {
             let hidden_len = infer.hidden.len();
             let types = infer.sig_types(&sig)?;
             infer.hidden.truncate(hidden_len);
-            let opaque = if sig.opaque { Some(infer.foreign_opaque(item, substs, &sig, types.1)?) } else { None };
+            let opaque = if sig.opaque {
+                Some(infer.foreign_opaque(item, substs, &sig, types.1)?)
+            } else {
+                None
+            };
             Ok((types, opaque))
         })?;
         if let Some(opaque) = opaque {
@@ -357,8 +544,22 @@ impl<'a> Infer<'_, 'a> {
         Ok(types)
     }
 
-    fn foreign_opaque(&mut self, item: ItemRef, substs: &[Ty], sig: &Signature, ret: Ty) -> Result<super::opaque::Opaque> {
-        Ok(super::opaque::Opaque { item, substs: substs.to_vec(), ret, sig: self.ret_fn_sig(sig)?, bounds: self.ret_bounds(sig, ret)?, bindings: self.ret_bindings(sig)?, output: self.async_output(sig)? })
+    fn foreign_opaque(
+        &mut self,
+        item: ItemRef,
+        substs: &[Ty],
+        sig: &Signature,
+        ret: Ty,
+    ) -> Result<super::opaque::Opaque> {
+        Ok(super::opaque::Opaque {
+            item,
+            substs: substs.to_vec(),
+            ret,
+            sig: self.ret_fn_sig(sig)?,
+            bounds: self.ret_bounds(sig, ret)?,
+            bindings: self.ret_bindings(sig)?,
+            output: self.async_output(sig)?,
+        })
     }
 
     /// The types of the function `item` at `substs` from its form lowered once, when the signature `sig` lowers the same way for every caller.
@@ -368,7 +569,10 @@ impl<'a> Infer<'_, 'a> {
             let (params, ret) = infer.with_frame(frame, |infer| infer.sig_types(sig))?;
             Ok(Arc::from(vec![params, vec![ret]]))
         })?;
-        let params = form[0].iter().map(|&ty| self.instantiate(ty, substs)).collect();
+        let params = form[0]
+            .iter()
+            .map(|&ty| self.instantiate(ty, substs))
+            .collect();
         Some((params, self.instantiate(form[1][0], substs)))
     }
 
@@ -402,7 +606,9 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type of a `self` parameter of `kind`.
     pub fn receiver_ty(&mut self, arena: &Body, kind: SelfKind) -> Result<Ty> {
-        let Some(self_ty) = self.self_ty else { bail!("`self` outside an impl") };
+        let Some(self_ty) = self.self_ty else {
+            bail!("`self` outside an impl")
+        };
         Ok(match kind {
             SelfKind::Value => self_ty,
             SelfKind::Ref => self.cx.types.intern(Kind::Ref(Mut::Not, self_ty)),
@@ -449,10 +655,18 @@ impl<'a> Infer<'_, 'a> {
             let (arena, generics, predicates) = header.parts();
             let bounds: Vec<u32> = type_params(generics)
                 .flat_map(|g| arena.list(g.bounds).iter().copied())
-                .chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied()))
+                .chain(
+                    predicates
+                        .iter()
+                        .flat_map(|p| arena.list(p.bounds).iter().copied()),
+                )
                 .collect();
             let found = self.in_source_home(src, home, |inner| {
-                Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>())
+                Ok(bounds
+                    .into_iter()
+                    .filter_map(|b| inner.bound_trait_at(arena, b, home))
+                    .map(|(of, _)| of)
+                    .collect::<Vec<_>>())
             })?;
             direct.extend(found);
         }
@@ -463,7 +677,10 @@ impl<'a> Infer<'_, 'a> {
 /// The traits declared in `item`'s header and any enclosing impl or trait header, with every supertrait they imply.
 pub fn header_bound_traits(cx: &mut super::super::Context<'_>, item: ItemRef) -> Vec<ItemRef> {
     use crate::outline::item::ItemKind;
-    if !matches!(cx.item(item).1.kind, ItemKind::Fn | ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Type) {
+    if !matches!(
+        cx.item(item).1.kind,
+        ItemKind::Fn | ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Type
+    ) {
         return Vec::new();
     }
     super::detached(cx, item, |infer| infer.collect_header_traits(item)).unwrap_or_default()

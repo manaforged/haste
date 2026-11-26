@@ -1,6 +1,6 @@
 use crate::ir::{Binary, Block, Convert, Function, IntCC, Op, Type, Value};
 
-use super::{Fact, Ranges, compared_range, swapped, unsigned_order};
+use super::{Fact, Ranges, compared_range, unsigned_order};
 
 /// The fact on an operand: its definition's range, or what one path knows about it.
 pub(super) type Of<'a> = &'a dyn Fn(Value) -> Fact;
@@ -19,7 +19,12 @@ pub(crate) fn deref_ptr(op: &Op) -> Option<Value> {
 }
 
 /// The way a branch goes when exactly one of its targets assumes a constant zero before any call or trap: control that enters that target breaks the assumption, so it never does.
-pub(super) fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: Block) -> Option<bool> {
+pub(super) fn avoided(
+    func: &Function,
+    ranges: &Ranges,
+    then: Block,
+    otherwise: Block,
+) -> Option<bool> {
     let barred = |block: Block| {
         func.blocks[block.index()]
             .insts
@@ -36,7 +41,13 @@ pub(super) fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: 
 }
 
 #[inline]
-pub(super) fn note_deref_addr(func: &Function, addr: Value, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> bool {
+pub(super) fn note_deref_addr(
+    func: &Function,
+    addr: Value,
+    falls_through: &[u32],
+    epoch: u32,
+    table: &mut [(u64, u64)],
+) -> bool {
     let idx = addr.index();
     let (lo, hi) = &mut table[idx];
     if *lo == 0 && *hi != 0 && func.ty(addr) == Type::I64 && falls_through[idx] == epoch {
@@ -48,7 +59,13 @@ pub(super) fn note_deref_addr(func: &Function, addr: Value, falls_through: &[u32
 
 /// Raises the lower bound of a dereferenced pointer marked at `epoch` in `falls_through` to 1, returning it when narrowed.
 #[inline]
-pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch: u32, table: &mut [(u64, u64)]) -> Option<Value> {
+pub(super) fn note_deref(
+    func: &Function,
+    op: &Op,
+    falls_through: &[u32],
+    epoch: u32,
+    table: &mut [(u64, u64)],
+) -> Option<Value> {
     let addr = deref_ptr(op)?;
     note_deref_addr(func, addr, falls_through, epoch, table).then_some(addr)
 }
@@ -56,7 +73,10 @@ pub(super) fn note_deref(func: &Function, op: &Op, falls_through: &[u32], epoch:
 #[inline]
 pub(super) fn known_range(op: &Op, ty: Type) -> Option<(u64, u64)> {
     Some(match *op {
-        Op::Const(imm) => { let u = super::unsigned(imm, ty); (u, u) }
+        Op::Const(imm) => {
+            let u = super::unsigned(imm, ty);
+            (u, u)
+        }
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => (0, 1),
         Op::StackAddr(..) if ty == Type::I64 => (1, u64::MAX - 0x1000_0000),
         Op::Symbol(_) | Op::SlotAddr(_) => (1, ty.unsigned_max()),
@@ -66,7 +86,12 @@ pub(super) fn known_range(op: &Op, ty: Type) -> Option<(u64, u64)> {
 
 /// Fast `(lo, hi)` range for `Ranges::propagate`, returning `None` when `op` always produces the full range (leaving `table` intact).
 #[inline]
-pub(super) fn fast_range(func: &Function, ranges: &Ranges, op: &Op, ty: Type) -> Option<(u64, u64)> {
+pub(super) fn fast_range(
+    func: &Function,
+    ranges: &Ranges,
+    op: &Op,
+    ty: Type,
+) -> Option<(u64, u64)> {
     if let Some(pair) = known_range(op, ty) {
         return Some(pair);
     }
@@ -76,7 +101,9 @@ pub(super) fn fast_range(func: &Function, ranges: &Ranges, op: &Op, ty: Type) ->
             let inner = ranges.table[x.index()];
             (inner.1 <= ty.unsigned_max()).then_some(inner)
         }
-        Op::Binary(bin, x, y) if func.ty(x).is_small_int() => binary_bounds(func, ranges, bin, (x, y), |v| ranges.table[v.index()]),
+        Op::Binary(bin, x, y) if func.ty(x).is_small_int() => {
+            binary_bounds(func, ranges, bin, (x, y), |v| ranges.table[v.index()])
+        }
         Op::Select(..) => {
             let fact = transfer(func, ranges, op, ty, &|value| ranges.of(value));
             Some((fact.lo, fact.hi))
@@ -92,13 +119,20 @@ pub(super) fn transfer(func: &Function, ranges: &Ranges, op: &Op, ty: Type, of: 
     }
     match *op {
         Op::Convert(Convert::Uextend, x) => of(x),
-        Op::Convert(Convert::Ireduce, x) => Some(of(x)).filter(|inner| inner.hi <= ty.unsigned_max()).unwrap_or_else(|| Fact::full(ty)),
-        Op::Binary(op, x, y) if func.ty(x).is_small_int() => binary_bounds(func, ranges, op, (x, y), |v| {
-            let f = of(v);
-            (f.lo, f.hi)
-        })
-        .map_or_else(|| Fact::full(ty), |(lo, hi)| Fact::range(lo, hi)),
-        Op::Select(cond, x, y) => match (arm(func, ranges, (cond, x, true), of), arm(func, ranges, (cond, y, false), of)) {
+        Op::Convert(Convert::Ireduce, x) => Some(of(x))
+            .filter(|inner| inner.hi <= ty.unsigned_max())
+            .unwrap_or_else(|| Fact::full(ty)),
+        Op::Binary(op, x, y) if func.ty(x).is_small_int() => {
+            binary_bounds(func, ranges, op, (x, y), |v| {
+                let f = of(v);
+                (f.lo, f.hi)
+            })
+            .map_or_else(|| Fact::full(ty), |(lo, hi)| Fact::range(lo, hi))
+        }
+        Op::Select(cond, x, y) => match (
+            arm(func, ranges, (cond, x, true), of),
+            arm(func, ranges, (cond, y, false), of),
+        ) {
             (Some(a), Some(b)) => Fact::range(a.lo.min(b.lo), a.hi.max(b.hi)),
             (Some(only), None) | (None, Some(only)) => Fact::range(only.lo, only.hi),
             (None, None) => Fact::full(ty),
@@ -111,13 +145,21 @@ pub(super) fn valid(fact: &Fact) -> bool {
     fact.lo < fact.hi || (fact.lo == fact.hi && fact.admits(fact.lo))
 }
 
-fn unwrap_cond(func: &Function, ranges: &Ranges, mut cond: Value, mut taken: bool) -> (Value, bool) {
+fn unwrap_cond(
+    func: &Function,
+    ranges: &Ranges,
+    mut cond: Value,
+    mut taken: bool,
+) -> (Value, bool) {
     for _ in 0..4 {
         match ranges.op(func, cond) {
-            Some(&Op::Convert(Convert::Uextend, inner)) if func.ty(inner).is_small_int() => cond = inner,
+            Some(&Op::Convert(Convert::Uextend, inner)) if func.ty(inner).is_small_int() => {
+                cond = inner
+            }
             Some(&Op::Binary(Binary::Bxor, a, b)) => {
                 let flipped = [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| {
-                    (ranges.of(mask).exact() == Some(1) && ranges.of(inner).hi <= 1).then_some(inner)
+                    (ranges.of(mask).exact() == Some(1) && ranges.of(inner).hi <= 1)
+                        .then_some(inner)
                 });
                 let Some(inner) = flipped else { break };
                 cond = inner;
@@ -136,9 +178,13 @@ fn cond_bounds(
     taken: bool,
 ) -> Option<Option<(Fact, Fact)>> {
     let ty = func.ty(p);
-    let Some(order) = unsigned_order(cc, ty, left, right) else { return Some(None) };
-    let np = compared_range(order, ty, right, taken).map_or_else(|| left.clone(), |b| left.clone().meet(&b));
-    let nq = compared_range(swapped(order), ty, left, taken).map_or_else(|| right.clone(), |b| right.clone().meet(&b));
+    let Some(order) = unsigned_order(cc, ty, left, right) else {
+        return Some(None);
+    };
+    let np = compared_range(order, ty, right, taken)
+        .map_or_else(|| left.clone(), |b| left.clone().meet(&b));
+    let nq = compared_range(order.swapped(), ty, left, taken)
+        .map_or_else(|| right.clone(), |b| right.clone().meet(&b));
     (valid(&np) && valid(&nq)).then_some(Some((np, nq)))
 }
 
@@ -159,7 +205,10 @@ fn eval_under(
     if depth >= 4 || !func.ty(v).is_small_int() {
         return base;
     }
-    let Some(op) = ranges.op(func, v).filter(|op| matches!(op, Op::Binary(..) | Op::Convert(..))) else {
+    let Some(op) = ranges
+        .op(func, v)
+        .filter(|op| matches!(op, Op::Binary(..) | Op::Convert(..)))
+    else {
         return base;
     };
     let sub = |u: Value| eval_under(func, ranges, u, of, ((p, np), (q, nq), depth + 1));
@@ -167,7 +216,12 @@ fn eval_under(
 }
 
 /// The fact on `value` as the arm a select on `cond` yields when `cond` is `taken`: the arm's own fact, met with what the condition says of it on that side. `None` when the select never yields the arm.
-fn arm(func: &Function, ranges: &Ranges, (raw_cond, value, raw_taken): (Value, Value, bool), of: Of<'_>) -> Option<Fact> {
+fn arm(
+    func: &Function,
+    ranges: &Ranges,
+    (raw_cond, value, raw_taken): (Value, Value, bool),
+    of: Of<'_>,
+) -> Option<Fact> {
     let mut fact = of(value);
     let (cond, taken) = unwrap_cond(func, ranges, raw_cond, raw_taken);
     match ranges.op(func, cond) {
@@ -178,8 +232,17 @@ fn arm(func: &Function, ranges: &Ranges, (raw_cond, value, raw_taken): (Value, V
                     np
                 } else if value == q {
                     nq
-                } else if matches!(ranges.op(func, value), Some(Op::Binary(..) | Op::Convert(..))) {
-                    fact.meet(&eval_under(func, ranges, value, of, ((p, &np), (q, &nq), 0)))
+                } else if matches!(
+                    ranges.op(func, value),
+                    Some(Op::Binary(..) | Op::Convert(..))
+                ) {
+                    fact.meet(&eval_under(
+                        func,
+                        ranges,
+                        value,
+                        of,
+                        ((p, &np), (q, &nq), 0),
+                    ))
                 } else {
                     fact
                 };
@@ -216,7 +279,13 @@ fn shift_count_bounds(ty: Type, (lo, hi): (u64, u64)) -> Option<u32> {
 }
 
 #[inline]
-fn binary_bounds(func: &Function, ranges: &Ranges, op: Binary, (x, y): (Value, Value), bounds: impl Fn(Value) -> (u64, u64)) -> Option<(u64, u64)> {
+fn binary_bounds(
+    func: &Function,
+    ranges: &Ranges,
+    op: Binary,
+    (x, y): (Value, Value),
+    bounds: impl Fn(Value) -> (u64, u64),
+) -> Option<(u64, u64)> {
     let ty = func.ty(x);
     match op {
         Binary::Band => Some((0, bounds(x).1.min(bounds(y).1))),
@@ -245,18 +314,25 @@ fn binary_bounds(func: &Function, ranges: &Ranges, op: Binary, (x, y): (Value, V
         }
         Binary::Imul => {
             let (a, b) = (bounds(x), bounds(y));
-            a.1.checked_mul(b.1).filter(|&hi| hi <= ty.unsigned_max()).map(|hi| (a.0 * b.0, hi))
+            a.1.checked_mul(b.1)
+                .filter(|&hi| hi <= ty.unsigned_max())
+                .map(|hi| (a.0 * b.0, hi))
         }
         Binary::Iadd => {
             let (a, b) = (bounds(x), bounds(y));
-            added_bounds(ty, a, b).or_else(|| wrapped_bounds(ty, a, b)).or_else(|| wrapped_bounds(ty, b, a))
+            added_bounds(ty, a, b)
+                .or_else(|| wrapped_bounds(ty, a, b))
+                .or_else(|| wrapped_bounds(ty, b, a))
         }
         Binary::Isub => {
             if let Some(&Op::Binary(Binary::Ushr, base, count)) = ranges.op(func, y)
                 && base == x
             {
                 let (lo, hi) = bounds(x);
-                return Some(shift_count_bounds(ty, bounds(count)).map_or((0, hi), |k| (lo - (lo >> k), hi - (hi >> k))));
+                return Some(
+                    shift_count_bounds(ty, bounds(count))
+                        .map_or((0, hi), |k| (lo - (lo >> k), hi - (hi >> k))),
+                );
             }
             let (a, b) = (bounds(x), bounds(y));
             if a.0 >= b.1 {
@@ -273,7 +349,9 @@ fn binary_bounds(func: &Function, ranges: &Ranges, op: Binary, (x, y): (Value, V
 
 #[inline]
 fn added_bounds(ty: Type, a: (u64, u64), b: (u64, u64)) -> Option<(u64, u64)> {
-    a.1.checked_add(b.1).filter(|&hi| hi <= ty.unsigned_max()).map(|hi| (a.0 + b.0, hi))
+    a.1.checked_add(b.1)
+        .filter(|&hi| hi <= ty.unsigned_max())
+        .map(|hi| (a.0 + b.0, hi))
 }
 
 #[inline]
