@@ -52,6 +52,70 @@ pub(in crate::sema) fn is_copy_ty(
     }
 }
 
+/// Returns the `Kind::Param` indices of type parameters explicitly bounded by `'static` on `item` or its enclosing impl/trait.
+pub(in super::super) fn compute_static_type_params(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    sig: &crate::body::sig::Signature,
+    src: &crate::outline::source::Source,
+) -> Vec<u16> {
+    let has_static = |body: &crate::body::Body,
+                      s: &crate::outline::source::Source,
+                      generics: &[crate::body::sig::Generic],
+                      preds: &[crate::body::sig::Predicate],
+                      name: &str| {
+        crate::sema::infer::scope::named_bounds(body, s, (generics, preds), name)
+            .into_iter()
+            .any(|b| {
+                matches!(body.bounds[b as usize], crate::body::Bound::Lifetime(lt) if s.text(lt) == "'static")
+            })
+    };
+    let mut out = Vec::new();
+    let mut idx = 0u16;
+    if let Some(impl_ref) = cx.owner_impl(item) {
+        if let Ok(header) = cx.impl_header(impl_ref) {
+            let impl_src = &cx.impl_file(impl_ref).source;
+            for g in crate::sema::infer::scope::type_params(&header.generics) {
+                let name = impl_src.text(g.name);
+                if has_static(
+                    &header.body,
+                    impl_src,
+                    &header.generics,
+                    &header.predicates,
+                    name,
+                ) || has_static(&sig.body, src, &sig.generics, &sig.predicates, name)
+                {
+                    out.push(idx);
+                }
+                idx += 1;
+            }
+        }
+    } else if let Some(trait_ref) = cx.owner_trait(item) {
+        idx += 1;
+        if let Ok(tg) = cx.trait_generics(trait_ref) {
+            let (tbody, tgen) = &*tg;
+            let tsrc = &cx.file(trait_ref).source;
+            for g in crate::sema::infer::scope::type_params(&tgen.params) {
+                let name = tsrc.text(g.name);
+                if has_static(tbody, tsrc, &tgen.params, &tgen.predicates, name)
+                    || has_static(&sig.body, src, &sig.generics, &sig.predicates, name)
+                {
+                    out.push(idx);
+                }
+                idx += 1;
+            }
+        }
+    }
+    for g in crate::sema::infer::scope::type_params(&sig.generics) {
+        let name = src.text(g.name);
+        if has_static(&sig.body, src, &sig.generics, &sig.predicates, name) {
+            out.push(idx);
+        }
+        idx += 1;
+    }
+    out
+}
+
 impl Checker<'_, '_> {
     pub(in super::super) fn ty_holds_borrow(&mut self, ty: Ty) -> bool {
         let mut seen = HashSet::default();
@@ -65,9 +129,38 @@ impl Checker<'_, '_> {
 
     pub(in super::super) fn ty_is_borrow_free(&mut self, ty: Ty) -> bool {
         ty != Ty::NONE
-            && !self.cx.types.has_params(ty)
             && !self.cx.types.has_projs(ty)
+            && !self.ty_has_non_static_param(ty)
             && !self.ty_holds_borrow(ty)
+    }
+
+    fn ty_has_non_static_param(&self, ty: Ty) -> bool {
+        if !self.cx.types.has_params(ty) {
+            return false;
+        }
+        match self.cx.types.kind(ty) {
+            Kind::Param(idx) => !self.static_type_params.contains(idx),
+            Kind::Ref(_, inner)
+            | Kind::Ptr(_, inner)
+            | Kind::Slice(inner)
+            | Kind::Array(inner, _)
+            | Kind::Pat(inner, ..) => self.ty_has_non_static_param(*inner),
+            Kind::Adt(_, args) | Kind::Tuple(args) | Kind::FnDef(_, args) => self
+                .cx
+                .types
+                .substs(*args)
+                .iter()
+                .any(|&arg| self.ty_has_non_static_param(arg)),
+            Kind::FnPtr(params, ret) => {
+                self.cx
+                    .types
+                    .substs(*params)
+                    .iter()
+                    .any(|&p| self.ty_has_non_static_param(p))
+                    || self.ty_has_non_static_param(*ret)
+            }
+            _ => true,
+        }
     }
 
     fn ty_holds_borrow_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>, include_dyn: bool) -> bool {

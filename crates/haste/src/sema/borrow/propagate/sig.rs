@@ -585,36 +585,38 @@ impl<'a> Checker<'_, 'a> {
         let mut container_targets = Vec::new();
         for s in &recv_sources {
             let held_by_other = state_holds_other_target(&targets, s.target, state);
-            let is_container = if self.is_non_static_param(s.target) {
-                if held_by_other {
-                    false
-                } else {
-                    let target_ty = self.local_ty(s.target);
-                    let pointee = if target_ty != Ty::NONE && Some(s.target) == root {
-                        match *self.cx.types.kind(target_ty) {
-                            Kind::Ref(_, pointee) => Some(pointee),
-                            _ => None,
-                        }
+            let is_container =
+                if self.is_non_static_param(s.target) || self.is_closure_param(s.target) {
+                    if held_by_other {
+                        false
                     } else {
-                        None
-                    };
-                    pointee.is_some_and(|p| {
-                        (!unwrap && self.ty_is_borrow_free(p))
-                            || (call_owned && !self.ty_holds_non_dyn_borrow(p))
-                    }) || self.can_unwrap_inner_static_param(s, call_ty, false)
-                }
-            } else if checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
-                true
-            } else if let Some(r) = root.filter(|_| indirect) {
-                state
-                    .loans
-                    .iter()
-                    .any(|l| l.holder == Some(r) && l.target == s.target)
-                    && self.ty_holds_borrow(self.local_ty(s.target))
-                    && !held_by_other
-            } else {
-                false
-            };
+                        let target_ty = self.local_ty(s.target);
+                        let pointee = if target_ty != Ty::NONE {
+                            match *self.cx.types.kind(target_ty) {
+                                Kind::Ref(_, pointee) => Some(pointee),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        pointee.is_some_and(|p| {
+                            (!unwrap && self.ty_is_borrow_free(p))
+                                || (((unwrap && !self.is_ref_ty(call_ty)) || call_owned)
+                                    && !self.ty_holds_non_dyn_borrow(p))
+                        }) || self.can_unwrap_inner_static_param(s, call_ty, false)
+                    }
+                } else if checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
+                    true
+                } else if let Some(r) = root.filter(|_| indirect) {
+                    state
+                        .loans
+                        .iter()
+                        .any(|l| l.holder == Some(r) && l.target == s.target)
+                        && self.ty_holds_borrow(self.local_ty(s.target))
+                        && !held_by_other
+                } else {
+                    false
+                };
             if is_container {
                 container_targets.push(s.target);
             }

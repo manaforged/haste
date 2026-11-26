@@ -23,7 +23,7 @@ mod path;
 mod pattern;
 pub(super) mod poly;
 mod project;
-mod scope;
+pub(super) mod scope;
 mod select;
 mod stmt;
 mod tables;

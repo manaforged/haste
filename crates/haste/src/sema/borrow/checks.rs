@@ -18,6 +18,7 @@ use super::{Checker, PartialMove, State, is_temp_holder, loan_conflicts_borrow, 
 pub(super) const TEMP_TARGET_BASE: u32 = u32::MAX - 262_144;
 
 pub(super) use closure::ClosureEffects;
+pub(super) use types::compute_static_type_params;
 pub(in crate::sema) use types::is_copy_ty;
 
 pub(super) fn is_temp_target(target: u32) -> Option<u32> {

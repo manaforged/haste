@@ -58,13 +58,23 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                     });
                 roots.extend(examples);
             }
-            if crate::test_mode() {
-                let tests = manifest.tests.iter().map(|(name, path)| Root {
-                    unit,
-                    name: name.clone(),
-                    path: path.clone(),
-                    role: Role::Test,
-                });
+            let sel = crate::selection();
+            if crate::test_mode()
+                && !sel.lib
+                && !sel.bins
+                && sel.bin.is_none()
+                && sel.example.is_none()
+            {
+                let tests = manifest
+                    .tests
+                    .iter()
+                    .filter(|(name, _)| sel.test.as_deref().is_none_or(|want| name == want))
+                    .map(|(name, path)| Root {
+                        unit,
+                        name: name.clone(),
+                        path: path.clone(),
+                        role: Role::Test,
+                    });
                 roots.extend(tests);
             }
         }
@@ -335,11 +345,18 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
     } else {
         unit.side
     };
-    let vars = if script {
+    let mut vars = if script {
         crate::graph::script::package_vars(workspace, root.unit)
     } else {
         crate::graph::script::crate_vars(workspace, root.unit)
     };
+    if root.role == Role::Test {
+        let tmp = std::env::temp_dir()
+            .join("haste-target-tmp")
+            .join(&root.name);
+        let _ = std::fs::create_dir_all(&tmp);
+        vars.push(("CARGO_TARGET_TMPDIR".to_owned(), tmp.display().to_string()));
+    }
     let env = Env {
         target: targets.of(side).clone(),
         features: unit.features.clone(),

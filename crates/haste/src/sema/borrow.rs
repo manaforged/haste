@@ -163,6 +163,7 @@ struct Checker<'c, 'a> {
     returns_only_static: bool,
     ret_named_lts: Vec<&'c str>,
     param_lts: calls::ParamLifetimes,
+    static_type_params: Vec<u16>,
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
@@ -276,6 +277,7 @@ pub(super) fn check(
         (false, Vec::new())
     };
     let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
+    let static_type_params = checks::compute_static_type_params(cx, item, sig, src);
     let mut checker = Checker {
         cx,
         item,
@@ -292,6 +294,7 @@ pub(super) fn check(
         returns_only_static,
         ret_named_lts,
         param_lts,
+        static_type_params,
         return_min_depth: 1,
         closure_depth: 0,
         const_depth: 0,
