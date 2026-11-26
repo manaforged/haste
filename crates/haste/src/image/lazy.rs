@@ -159,7 +159,10 @@ impl Jit {
             super::ImageMode::Jit,
             (shared_bytes, state_bytes, table_slots),
         )?;
-        image.backend = super::ImageBackend::LazyJit { fast: false };
+        image.backend = super::ImageBackend::LazyJit {
+            fast: false,
+            optimize: false,
+        };
         image.stubs.reserve(table_slots * stub::STUB_BYTES)?;
         image.pass.memory.reserve(code_bytes)?;
         Ok(Jit {
@@ -310,9 +313,15 @@ impl Jit {
 
     pub(crate) fn set_fast(&mut self, fast: bool) {
         if let super::ImageBackend::EagerJit { fast: f }
-        | super::ImageBackend::LazyJit { fast: f } = &mut self.image.backend
+        | super::ImageBackend::LazyJit { fast: f, .. } = &mut self.image.backend
         {
             *f = fast;
+        }
+    }
+
+    pub(crate) fn set_optimize(&mut self, optimize: bool) {
+        if let super::ImageBackend::LazyJit { optimize: o, .. } = &mut self.image.backend {
+            *o = optimize;
         }
     }
 

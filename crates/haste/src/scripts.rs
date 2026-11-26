@@ -422,7 +422,17 @@ fn run(
     };
     let (entries, store) = image::entries(&mut compilation, (cache, &mains))?;
     let mut demand = Jit::new(store)?;
-    demand.set_fast(true);
+    let has_build_deps = compiled.iter().any(|&(unit, _)| {
+        workspace.graph.units[unit]
+            .deps
+            .iter()
+            .any(|&(_, _, kind)| kind == Kind::Build)
+    });
+    if has_build_deps {
+        demand.set_optimize(true);
+    } else {
+        demand.set_fast(true);
+    }
     demand.set_ahead(true);
     let mut unit_set = HashSet::default();
     for &(unit, _) in &scripts {

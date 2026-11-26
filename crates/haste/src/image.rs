@@ -318,7 +318,7 @@ impl Image {
     }
 
     pub(super) fn compile_target(&self) -> haste_codegen::Target {
-        let base = if self.backend.is_fast_jit() {
+        let base = if self.backend.is_fast_jit() || self.backend.is_optimized_jit() {
             haste_codegen::Target::host().effort(haste_codegen::Effort::Quick)
         } else {
             crate::host_target()
@@ -483,7 +483,13 @@ impl Image {
     }
 
     pub(super) fn is_fast_lazy(&self) -> bool {
-        matches!(self.backend, ImageBackend::LazyJit { fast: true })
+        matches!(
+            self.backend,
+            ImageBackend::LazyJit {
+                fast: true,
+                optimize: false
+            }
+        )
     }
 
     fn compile_one(

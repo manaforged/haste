@@ -83,12 +83,13 @@ impl Slots for Image {
     }
 
     fn allow_inline(&self) -> bool {
-        crate::profile() == crate::outline::tree::Profile::Release
-            && match &self.backend {
-                ImageBackend::Check => false,
-                ImageBackend::EagerJit { fast } | ImageBackend::LazyJit { fast } => !fast,
-                ImageBackend::Aot(_) => true,
-            }
+        self.backend.is_optimized_jit()
+            || (crate::profile() == crate::outline::tree::Profile::Release
+                && match &self.backend {
+                    ImageBackend::Check => false,
+                    ImageBackend::EagerJit { fast } | ImageBackend::LazyJit { fast, .. } => !fast,
+                    ImageBackend::Aot(_) => true,
+                })
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {
