@@ -181,6 +181,7 @@ pub struct Infer<'c, 'a> {
     auto_provisional: HashMap<(ItemRef, Ty), usize>,
     auto_dep: usize,
     matches: Vec<(ExprId, Ty, crate::body::List)>,
+    uninhabited: HashMap<Ty, bool>,
     active_discr: Option<(ItemRef, Vec<Option<i128>>, Vec<bool>)>,
 }
 
@@ -417,6 +418,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             auto_provisional: HashMap::default(),
             auto_dep: usize::MAX,
             matches: Vec::new(),
+            uninhabited: HashMap::default(),
             active_discr: None,
         }
     }

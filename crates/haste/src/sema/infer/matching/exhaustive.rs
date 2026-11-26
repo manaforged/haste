@@ -91,11 +91,21 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn is_uninhabited(&mut self, ty: Ty, depth: u32) -> bool {
+        let mut hit_limit = false;
+        self.is_uninhabited_inner(ty, depth, &mut hit_limit)
+    }
+
+    fn is_uninhabited_inner(&mut self, ty: Ty, depth: u32, hit_limit: &mut bool) -> bool {
         if depth > 8 {
+            *hit_limit = true;
             return false;
         }
         let ty = self.peel_match_ref(ty);
-        match *self.cx.types.kind(ty) {
+        if let Some(&cached) = self.uninhabited.get(&ty) {
+            return cached;
+        }
+        let mut child_limit = false;
+        let res = match *self.cx.types.kind(ty) {
             Kind::Never => true,
             Kind::Tuple(items) => self
                 .cx
@@ -103,10 +113,10 @@ impl Infer<'_, '_> {
                 .substs(items)
                 .to_vec()
                 .into_iter()
-                .any(|t| self.is_uninhabited(t, depth + 1)),
+                .any(|t| self.is_uninhabited_inner(t, depth + 1, &mut child_limit)),
             Kind::Array(elem, len) => {
                 self.cx.types.len(len).is_some_and(|n| n > 0)
-                    && self.is_uninhabited(elem, depth + 1)
+                    && self.is_uninhabited_inner(elem, depth + 1, &mut child_limit)
             }
             Kind::Adt(item, args) => {
                 let kind = self.cx.item(item).1.kind;
@@ -120,29 +130,45 @@ impl Infer<'_, '_> {
                     if self.is_foreign_non_exhaustive(item)
                         || def.variants.iter().any(|v| v.fields.is_empty())
                     {
-                        return false;
+                        false
+                    } else {
+                        let slice = self.cx.types.substs(args).to_vec();
+                        let Ok(fields) = self.adt_fields(item, &slice) else {
+                            return false;
+                        };
+                        fields.iter().all(|vf| {
+                            vf.iter()
+                                .any(|&f| self.is_uninhabited_inner(f, depth + 1, &mut child_limit))
+                        })
                     }
-                    let slice = self.cx.types.substs(args).to_vec();
-                    let Ok(fields) = self.adt_fields(item, &slice) else {
-                        return false;
-                    };
-                    fields
-                        .iter()
-                        .all(|vf| vf.iter().any(|&f| self.is_uninhabited(f, depth + 1)))
                 } else if kind == ItemKind::Struct {
-                    let slice = self.cx.types.substs(args).to_vec();
-                    let Ok(fields) = self.adt_fields(item, &slice) else {
+                    let Ok(def) = self.cx.adt_def(item) else {
                         return false;
                     };
-                    fields
-                        .first()
-                        .is_some_and(|sf| sf.iter().any(|&f| self.is_uninhabited(f, depth + 1)))
+                    if def.variants.first().is_none_or(|v| v.fields.is_empty()) {
+                        false
+                    } else {
+                        let slice = self.cx.types.substs(args).to_vec();
+                        let Ok(fields) = self.adt_fields(item, &slice) else {
+                            return false;
+                        };
+                        fields.first().is_some_and(|sf| {
+                            sf.iter()
+                                .any(|&f| self.is_uninhabited_inner(f, depth + 1, &mut child_limit))
+                        })
+                    }
                 } else {
                     false
                 }
             }
             _ => false,
+        };
+        if child_limit {
+            *hit_limit = true;
+        } else {
+            self.uninhabited.insert(ty, res);
         }
+        res
     }
 
     pub(super) fn is_foreign_non_exhaustive(&self, item: ItemRef) -> bool {

@@ -165,7 +165,8 @@ impl Tokens {
         if lo >= hi {
             return;
         }
-        if let (Some(first), Some(last)) = (layer.tokens.at(lo), layer.tokens.at(hi - 1)) {
+        let slice = &layer.tokens.as_slice()[lo..hi];
+        if let (Some(first), Some(last)) = (slice.first(), slice.last()) {
             let span = (last.end().saturating_sub(first.start) as usize).min(layer.text.len());
             self.text.reserve(span + (hi - lo));
         }
@@ -179,8 +180,8 @@ impl Tokens {
             self.origins.reserve(hi - lo);
         }
         let layer_text = layer.text.as_str();
-        for local in lo..hi {
-            let token = layer.tokens.at(local).expect("token index in bounds");
+        for (offset, &token) in slice.iter().enumerate() {
+            let local = lo + offset;
             let dst = self.tokens.len() as u32;
             match copied {
                 None => self.origins.push((dst, token.start)),

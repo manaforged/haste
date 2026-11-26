@@ -223,8 +223,12 @@ impl SourceTokens {
                 ptr,
                 byte_len,
                 count,
+                decoded,
                 ..
             } => {
+                if let Some(tokens) = decoded.get() {
+                    return tokens.get(index).copied();
+                }
                 if index >= *count {
                     return None;
                 }
