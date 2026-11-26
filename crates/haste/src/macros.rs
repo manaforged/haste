@@ -658,8 +658,8 @@ fn caller_vars(outline: &Outline, caller: usize) -> Vec<(String, String)> {
     vars
 }
 
-fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Result<()> {
-    let n = compilation.outline.crates.len();
+fn dep_closure(outline: &Outline, roots: &[usize]) -> (Vec<bool>, Vec<usize>) {
+    let n = outline.crates.len();
     let mut seen = vec![false; n];
     let mut queue = Vec::new();
     for &root in roots {
@@ -672,15 +672,22 @@ fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Resul
     while head < queue.len() {
         let krate = queue[head];
         head += 1;
-        for &(_, dep) in &compilation.outline.deps[krate] {
+        for &(_, dep) in &outline.deps[krate] {
             if dep < n && !seen[dep] {
                 seen[dep] = true;
                 queue.push(dep);
             }
         }
     }
-    let selected: Vec<bool> = (0..n)
-        .map(|k| seen[k] && compilation.outline.crates[k].partial())
+    (seen, queue)
+}
+
+fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Result<()> {
+    let (seen, _) = dep_closure(&compilation.outline, roots);
+    let selected: Vec<bool> = seen
+        .iter()
+        .enumerate()
+        .map(|(k, &on)| on && compilation.outline.crates[k].partial())
         .collect();
     if !selected.iter().any(|&on| on) {
         return Ok(());
@@ -763,25 +770,7 @@ fn expand(
 fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut seen = vec![false; outline.crates.len()];
-    let mut queue = Vec::new();
-    for &root in roots {
-        if root < seen.len() && !seen[root] {
-            seen[root] = true;
-            queue.push(root);
-        }
-    }
-    let mut head = 0;
-    while head < queue.len() {
-        let krate = queue[head];
-        head += 1;
-        for &(_, dep) in &outline.deps[krate] {
-            if dep < seen.len() && !seen[dep] {
-                seen[dep] = true;
-                queue.push(dep);
-            }
-        }
-    }
+    let (_, mut queue) = dep_closure(outline, roots);
     queue.sort_unstable();
     let mut hasher = rustc_hash::FxHasher::default();
     outline.crates.len().hash(&mut hasher);
