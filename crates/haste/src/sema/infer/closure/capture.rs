@@ -704,6 +704,22 @@ impl<'a> Infer<'_, 'a> {
     }
 
     pub(in super::super) fn note_mut(&mut self, expr: ExprId) -> Result<()> {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) => return self.note_mut(inner),
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for id in self.body.list(list).to_vec() {
+                    self.note_mut(ExprId(id))?;
+                }
+                return Ok(());
+            }
+            Expr::Struct { fields, .. } => {
+                for id in self.body.list(fields).to_vec() {
+                    self.note_mut(self.body.fields[id as usize].value)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         self.deref_mutably(expr)?;
         let Some(local) = self.place_local(expr) else {
             return Ok(());

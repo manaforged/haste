@@ -43,6 +43,9 @@ impl Checker<'_, '_> {
                 continue;
             };
             if t_depth >= min_depth
+                && !(self.is_const_or_static_item()
+                    && self.temp_target_allowed(l.mutable)
+                    && !l.site.is_some_and(|e| self.is_non_promotable_temp(e)))
                 && (check_locals.contains(&holder) || outer_live.contains(&holder))
             {
                 return Err(self.borrow_err(l.site, "temporary value dropped while borrowed"));

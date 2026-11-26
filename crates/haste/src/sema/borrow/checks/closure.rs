@@ -395,7 +395,8 @@ impl Checker<'_, '_> {
 
     pub(in super::super) fn fn_arg_returns_static(&mut self, arg: ExprId) -> bool {
         let arg = self.unwrap_parens(arg);
-        let Some(crate::sema::infer::Res::Fn(f_item, _)) = self.typed.res.get(&arg).copied() else {
+        let Some(crate::sema::infer::Res::Fn(f_item, substs)) = self.typed.res.get(&arg).copied()
+        else {
             return false;
         };
         let Ok(sig) = self.cx.signature(f_item) else {
@@ -405,7 +406,18 @@ impl Checker<'_, '_> {
         let sig_src = self.cx.item(f_item).0;
         let mut lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut lts);
-        sig_returns_only_static(&sig, sig_src, ret_ast, &lts)
+        if sig_returns_only_static(&sig, sig_src, ret_ast, &lts) {
+            return true;
+        }
+        if !sig.is_async && !lts.has_elided && lts.named.is_empty() {
+            let args = self.cx.types.substs(substs).to_vec();
+            if let Ok((_, ret_ty)) = crate::sema::infer::detached(self.cx, self.item, |infer| {
+                infer.fn_types(f_item, &args)
+            }) {
+                return !self.ty_holds_non_dyn_borrow(ret_ty);
+            }
+        }
+        false
     }
 
     pub(super) fn check_closure_effects(

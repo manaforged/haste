@@ -55,7 +55,12 @@ pub(in crate::sema) fn is_copy_ty(
 impl Checker<'_, '_> {
     pub(in super::super) fn ty_holds_borrow(&mut self, ty: Ty) -> bool {
         let mut seen = HashSet::default();
-        self.ty_holds_borrow_inner(ty, &mut seen)
+        self.ty_holds_borrow_inner(ty, &mut seen, true)
+    }
+
+    pub(in super::super) fn ty_holds_non_dyn_borrow(&mut self, ty: Ty) -> bool {
+        let mut seen = HashSet::default();
+        self.ty_holds_borrow_inner(ty, &mut seen, false)
     }
 
     pub(in super::super) fn ty_is_borrow_free(&mut self, ty: Ty) -> bool {
@@ -65,27 +70,28 @@ impl Checker<'_, '_> {
             && !self.ty_holds_borrow(ty)
     }
 
-    fn ty_holds_borrow_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
+    fn ty_holds_borrow_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>, include_dyn: bool) -> bool {
         if ty == Ty::NONE || !seen.insert(ty) {
             return false;
         }
         match self.cx.types.kind(ty).clone() {
-            Kind::Ref(..) | Kind::Dyn(..) => true,
+            Kind::Ref(..) => true,
+            Kind::Dyn(..) => include_dyn,
             Kind::Slice(elem) | Kind::Array(elem, _) | Kind::Pat(elem, ..) => {
-                self.ty_holds_borrow_inner(elem, seen)
+                self.ty_holds_borrow_inner(elem, seen, include_dyn)
             }
             Kind::Tuple(items) => {
                 let items = self.cx.types.substs(items).to_vec();
                 items
                     .into_iter()
-                    .any(|item| self.ty_holds_borrow_inner(item, seen))
+                    .any(|item| self.ty_holds_borrow_inner(item, seen, include_dyn))
             }
-            Kind::Closure(..) => self.closure_ty_holds_borrow(ty, seen),
+            Kind::Closure(..) => self.closure_ty_holds_borrow(ty, seen, include_dyn),
             Kind::Adt(item, args) => {
                 let args = self.cx.types.substs(args).to_vec();
                 if args
                     .into_iter()
-                    .any(|arg| self.ty_holds_borrow_inner(arg, seen))
+                    .any(|arg| self.ty_holds_borrow_inner(arg, seen, include_dyn))
                 {
                     return true;
                 }
@@ -100,7 +106,12 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn closure_ty_holds_borrow(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
+    fn closure_ty_holds_borrow(
+        &mut self,
+        ty: Ty,
+        seen: &mut HashSet<Ty>,
+        include_dyn: bool,
+    ) -> bool {
         let Kind::Closure(parent, _, at) = *self.cx.types.kind(ty) else {
             return false;
         };
@@ -113,6 +124,7 @@ impl Checker<'_, '_> {
                             .get(c.local as usize)
                             .map_or(Ty::NONE, |l| l.ty),
                         seen,
+                        include_dyn,
                     )
             }) {
                 return true;
@@ -122,6 +134,7 @@ impl Checker<'_, '_> {
                     self.ty_holds_borrow_inner(
                         info.typed.locals.get(p as usize).map_or(Ty::NONE, |l| l.ty),
                         seen,
+                        include_dyn,
                     )
                 });
             }
@@ -131,7 +144,8 @@ impl Checker<'_, '_> {
             && let Some(closure) = self.typed.closures.get(&ExprId(at))
         {
             return closure.captures.iter().any(|c| {
-                c.by != By::Value || self.ty_holds_borrow_inner(self.local_ty(c.local), seen)
+                c.by != By::Value
+                    || self.ty_holds_borrow_inner(self.local_ty(c.local), seen, include_dyn)
             });
         }
         true
@@ -362,7 +376,22 @@ impl Checker<'_, '_> {
                     .iter()
                     .any(|&a| self.is_non_promotable_temp(ExprId(a)))
             }
-            Expr::Method { .. } | Expr::Await(_) | Expr::Try(_) => true,
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                let is_const = matches!(
+                    self.typed.res.get(&expr),
+                    Some(Res::Fn(item, _)) if self.is_const_fn(*item)
+                );
+                !is_const
+                    || self.is_non_promotable_temp(receiver)
+                    || self
+                        .body
+                        .list(params)
+                        .iter()
+                        .any(|&a| self.is_non_promotable_temp(ExprId(a)))
+            }
+            Expr::Await(_) | Expr::Try(_) => true,
             Expr::Block {
                 kind, stmts, tail, ..
             } => self.block_is_non_promotable(kind, stmts, tail),

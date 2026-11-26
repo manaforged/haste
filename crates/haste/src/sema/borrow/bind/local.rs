@@ -9,6 +9,45 @@ use super::super::{Checker, State};
 use super::{PatCtx, PatTarget};
 
 impl Checker<'_, '_> {
+    pub(in super::super) fn bind_fn_params(
+        &mut self,
+        sig: &crate::body::sig::Signature,
+        state: &mut State,
+    ) -> Result<()> {
+        let param_offset = usize::from(sig.receiver.is_some());
+        for (idx, &pat) in self.body.fn_params.iter().enumerate() {
+            let fallback = self
+                .typed
+                .params
+                .get(param_offset + idx)
+                .map(|&pl| vec![self.param_fallback_source(pl)]);
+            if let crate::body::Pat::Tuple(plist) = *self.body.pat(pat)
+                && let Some(&(_, param_ty)) = sig.params.get(idx)
+                && let crate::body::Ty::Tuple(tlist) = *sig.body.ty(param_ty)
+                && plist.len == tlist.len
+            {
+                for (&p_id, &t_id) in self.body.list(plist).iter().zip(sig.body.list(tlist)) {
+                    let mut lts = super::super::calls::Lifetimes::default();
+                    super::super::calls::collect_ty_lifetimes(
+                        &sig.body,
+                        self.src,
+                        crate::body::TyId(t_id),
+                        &mut lts,
+                    );
+                    let elem_fb = if !lts.has_elided && lts.named.is_empty() && lts.saw_static {
+                        &[][..]
+                    } else {
+                        fallback.as_deref().unwrap_or(&[])
+                    };
+                    self.bind_pat_param(PatId(p_id), elem_fb, state)?;
+                }
+            } else {
+                self.bind_pat_param(pat, fallback.as_deref().unwrap_or(&[]), state)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_local_init(
         &mut self,
         pat: PatId,

@@ -106,18 +106,14 @@ impl Checker<'_, '_> {
             Some(Res::Ctor(item, variant, _)) => (true, Some((item, variant))),
             _ => (false, None),
         };
-        let call_extend = if is_ctor { self.let_extend_depth } else { None };
+        let call_extend = is_ctor.then_some(self.let_extend_depth).flatten();
         let has_self_arg = sig.as_deref().is_some_and(|s| s.receiver.is_some());
         let is_callable_method = fn_item.is_some_and(|it| self.is_callable_trait_method(it));
         self.with_let_extend(call_extend, |this| {
             let arg_sources = this.check_arg_list_sources(
                 &arg_ids,
                 &ArgListCtx {
-                    sig: if is_callable_method {
-                        None
-                    } else {
-                        sig.as_deref()
-                    },
+                    sig: (!is_callable_method).then(|| sig.as_deref()).flatten(),
                     fn_item: fn_item.filter(|_| !is_callable_method),
                     call_expr: Some(expr),
                     callee_ty: Some(callee_ty),
@@ -618,7 +614,9 @@ impl Checker<'_, '_> {
             }
             return added;
         }
-        let Some(sig) = ctx.sig else { return added };
+        let Some(sig) = ctx.sig else {
+            return self.mark_closure_arg_static_params(ctx.callee_expr, idx, &params);
+        };
         let Some(param_idx) = sig_param_idx(idx, ctx.has_self_arg) else {
             return added;
         };
@@ -689,6 +687,12 @@ impl Checker<'_, '_> {
         outer_live: &HashSet<u32>,
         depth: u32,
     ) -> Result<Vec<Vec<BorrowSource>>> {
+        let mut after_arg = vec![HashSet::default(); arg_ids.len()];
+        let mut live = outer_live.clone();
+        for pos in (0..arg_ids.len()).rev() {
+            after_arg[pos] = live.clone();
+            self.collect_live_expr(ExprId(arg_ids[pos]), &mut live);
+        }
         let temp_id = self.next_temp_holder();
         let mut deferred_mut_args: Vec<(ExprId, u32, Vec<PlaceStep>)> = Vec::new();
         let mut arg_sources = Vec::with_capacity(arg_ids.len());
@@ -711,7 +715,7 @@ impl Checker<'_, '_> {
                     expected_ty,
                     &mut deferred_mut_args,
                     state,
-                    outer_live,
+                    &after_arg[idx],
                     depth,
                 );
                 for local in added_origins {
@@ -740,6 +744,9 @@ impl Checker<'_, '_> {
                 );
                 arg_sources.push(sources);
                 prune_moved_loans(state);
+                if ctx.call_expr.is_none() && idx + 1 < arg_ids.len() {
+                    super::prune_dead_loans(state, &after_arg[idx]);
+                }
             }
             if !state.diverged && !deferred_mut_args.is_empty() {
                 super::prune_dead_loans(state, outer_live);

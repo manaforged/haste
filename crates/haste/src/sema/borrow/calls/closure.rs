@@ -18,6 +18,54 @@ pub(in super::super) struct ActiveClosure {
 }
 
 impl Checker<'_, '_> {
+    pub(super) fn mark_closure_arg_static_params(
+        &mut self,
+        callee_expr: Option<ExprId>,
+        arg_idx: usize,
+        closure_params: &[u32],
+    ) -> Vec<u32> {
+        let mut added = Vec::new();
+        let Some(callee) = callee_expr else {
+            return added;
+        };
+        let Some(callee_closure) = self.closure_expr_of(callee) else {
+            return added;
+        };
+        let Expr::Closure {
+            params: callee_params,
+            ..
+        } = *self.body.expr(callee_closure)
+        else {
+            return added;
+        };
+        let Some(&p_id) = self.body.list(callee_params).get(arg_idx) else {
+            return added;
+        };
+        let Some(param_ty) = self.body.params[p_id as usize].ty else {
+            return added;
+        };
+        let crate::body::Ty::Fn {
+            params: fn_params, ..
+        } = *self.body.ty(param_ty)
+        else {
+            return added;
+        };
+        let fn_param_ids: Vec<u32> = self.body.list(fn_params).to_vec();
+        for (&c_local, &ft) in closure_params.iter().zip(&fn_param_ids) {
+            if matches!(
+                *self.body.ty(crate::body::TyId(ft)),
+                crate::body::Ty::Ref {
+                    lifetime: Some(lt),
+                    ..
+                } if self.src.text(lt) == "'static"
+            ) {
+                self.closure_param_origins.insert(c_local, Vec::new());
+                added.push(c_local);
+            }
+        }
+        added
+    }
+
     pub(in super::super) fn check_closure(
         &mut self,
         expr: ExprId,
@@ -53,7 +101,26 @@ impl Checker<'_, '_> {
                     body_state.maybe_init[local as usize] = true;
                     body_state.moved[local as usize] = false;
                     body_state.moved_at[local as usize] = None;
-                    fallback.push(self.param_fallback_source(local));
+                    let is_static_ref = param.ty.is_some_and(|ty_id| {
+                        matches!(
+                            *self.body.ty(ty_id),
+                            crate::body::Ty::Ref {
+                                lifetime: Some(lt),
+                                ..
+                            } if self.src.text(lt) == "'static"
+                        )
+                    });
+                    let marked_static = self
+                        .closure_param_origins
+                        .get(&local)
+                        .is_some_and(Vec::is_empty);
+                    let owned_no_ref = !self.ty_holds_non_dyn_borrow(self.local_ty(local));
+                    if let Some(slot) = self.param_lts.is_static.get_mut(local as usize) {
+                        *slot = is_static_ref || marked_static || owned_no_ref;
+                    }
+                    if !(is_static_ref || marked_static || owned_no_ref) {
+                        fallback.push(self.param_fallback_source(local));
+                    }
                 }
                 param_bound.push(bound);
                 if let Err(err) = self.bind_pat(
@@ -360,7 +427,7 @@ impl Checker<'_, '_> {
                                 target: cap.local,
                                 steps,
                                 mutable: false,
-                                through_ref,
+                                through_ref: through_ref || origin_ret,
                                 env_only: false,
                                 origin_only: true,
                             });

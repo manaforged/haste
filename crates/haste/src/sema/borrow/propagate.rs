@@ -101,7 +101,16 @@ impl Checker<'_, '_> {
             Expr::Field(..) | Expr::TupleField(..) | Expr::Unary(UnOp::Deref, _)
                 if allow_mut_ref_reborrow && self.is_mut_ref_ty(ty) =>
             {
-                self.place_borrow_sources(expr, true, state, None)
+                let mut srcs = self.place_borrow_sources(expr, true, state, None);
+                for s in &mut srcs {
+                    if !s.through_ref
+                        && self.is_param_local(s.target)
+                        && !self.is_ref_ty(self.local_ty(s.target))
+                    {
+                        s.through_ref = true;
+                    }
+                }
+                srcs
             }
             Expr::TupleField(base, index)
                 if !self.has_overloaded_deref(expr)
@@ -289,9 +298,14 @@ impl Checker<'_, '_> {
         mut base_steps: Vec<PlaceStep>,
         env_only: bool,
     ) -> Option<BorrowSource> {
-        if !(self.is_non_static_param(local) || self.is_active_closure_param(local))
-            || !self.ty_holds_borrow(ty)
-        {
+        let non_static_cparam = self.is_active_closure_param(local)
+            && !self
+                .param_lts
+                .is_static
+                .get(local as usize)
+                .copied()
+                .unwrap_or(false);
+        if !(self.is_non_static_param(local) || non_static_cparam) || !self.ty_holds_borrow(ty) {
             return None;
         }
         if self.is_ref_ty(ty) {
@@ -355,45 +369,6 @@ impl Checker<'_, '_> {
             .filter(|f| matches!(def.body.ty(f.ty), AstTy::Ref { mutable: false, .. }))
             .filter_map(|f| f.name.map(|n| adt_src.text(n).to_owned()))
             .collect()
-    }
-
-    fn is_static_field_read(&mut self, expr: ExprId, base: ExprId) -> bool {
-        if self.typed.derefs.contains_key(&(expr, 0)) {
-            return false;
-        }
-        let field_idx = match *self.body.expr(expr) {
-            Expr::Field(..) => match self.typed.fields.get(&expr).copied() {
-                Some(idx) => idx as usize,
-                None => return false,
-            },
-            Expr::TupleField(_, idx) => idx as usize,
-            _ => return false,
-        };
-        if self.is_mut_ref_ty(self.expr_ty(expr)) {
-            return false;
-        }
-        let mut base_ty = self.expr_ty(base);
-        while let Kind::Ref(_, inner) = *self.cx.types.kind(base_ty) {
-            base_ty = inner;
-        }
-        let Kind::Adt(adt_item, _) = *self.cx.types.kind(base_ty) else {
-            return false;
-        };
-        let Ok(def) = self.cx.adt_def(adt_item) else {
-            return false;
-        };
-        let Some(field) = def.variants.first().and_then(|v| v.fields.get(field_idx)) else {
-            return false;
-        };
-        let adt_src = &self.cx.file(adt_item).source;
-        matches!(
-            *def.body.ty(field.ty),
-            AstTy::Ref {
-                mutable: false,
-                lifetime: Some(lt),
-                ..
-            } if adt_src.text(lt) == "'static"
-        )
     }
 
     fn is_deref_of_static_container(

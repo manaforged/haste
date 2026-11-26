@@ -200,4 +200,98 @@ impl Checker<'_, '_> {
             ..s.clone()
         }
     }
+
+    pub(super) fn is_mut_ref_to_shared_ref(&self, ty: Ty) -> bool {
+        ty != Ty::NONE
+            && matches!(
+                *self.cx.types.kind(ty),
+                Kind::Ref(crate::sema::ty::Mut::Mut, inner)
+                    if matches!(*self.cx.types.kind(inner), Kind::Ref(crate::sema::ty::Mut::Not, _))
+            )
+    }
+
+    pub(super) fn filter_owned_closure_param_sources(
+        &mut self,
+        ret_ty: Ty,
+        sources: &mut Vec<BorrowSource>,
+    ) {
+        if self.ty_holds_non_dyn_borrow(ret_ty) {
+            return;
+        }
+        let mut kept = Vec::with_capacity(sources.len());
+        for s in sources.drain(..) {
+            let target_ty = self.local_ty(s.target);
+            let drop_param = self.is_closure_param(s.target)
+                && target_ty != Ty::NONE
+                && self.closure_param_inner_has_no_ref(target_ty);
+            if !drop_param {
+                kept.push(s);
+            }
+        }
+        *sources = kept;
+    }
+
+    fn closure_param_inner_has_no_ref(&mut self, ty: Ty) -> bool {
+        match self.cx.types.kind(ty).clone() {
+            Kind::Ref(_, pointee) => !self.ty_holds_non_dyn_borrow(pointee),
+            Kind::Tuple(items) => {
+                let elems = self.cx.types.substs(items).to_vec();
+                elems.into_iter().all(|elem| {
+                    let inner = match *self.cx.types.kind(elem) {
+                        Kind::Ref(_, inner) => inner,
+                        _ => elem,
+                    };
+                    !self.ty_holds_non_dyn_borrow(inner)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn is_static_field_read(&mut self, expr: ExprId, base: ExprId) -> bool {
+        if self.typed.derefs.contains_key(&(expr, 0)) {
+            return false;
+        }
+        let field_idx = match *self.body.expr(expr) {
+            Expr::Field(..) => match self.typed.fields.get(&expr).copied() {
+                Some(idx) => idx as usize,
+                None => return false,
+            },
+            Expr::TupleField(_, idx) => idx as usize,
+            _ => return false,
+        };
+        if self.is_mut_ref_ty(self.expr_ty(expr)) {
+            return false;
+        }
+        let mut base_ty = self.expr_ty(base);
+        while let Kind::Ref(_, inner) = *self.cx.types.kind(base_ty) {
+            base_ty = inner;
+        }
+        let Kind::Adt(adt_item, _) = *self.cx.types.kind(base_ty) else {
+            return false;
+        };
+        let Ok(def) = self.cx.adt_def(adt_item) else {
+            return false;
+        };
+        if !def.generics.params.iter().any(|g| {
+            matches!(
+                g.kind,
+                crate::body::sig::GenericKind::Lifetime | crate::body::sig::GenericKind::Type
+            )
+        }) {
+            return true;
+        }
+        let Some(field) = def.variants.first().and_then(|v| v.fields.get(field_idx)) else {
+            return false;
+        };
+        let adt_src = &self.cx.file(adt_item).source;
+        matches!(
+            *def.body.ty(field.ty),
+            crate::body::Ty::Ref {
+                mutable: false,
+                lifetime: Some(lt),
+                ..
+            } if adt_src.text(lt) == "'static"
+        )
+    }
 }

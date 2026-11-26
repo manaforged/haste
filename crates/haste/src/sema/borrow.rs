@@ -329,14 +329,7 @@ pub(super) fn check(
     }
     checker.returns_borrow = typed.ret.is_some_and(|ty| checker.ty_holds_borrow(ty));
     let mut state = State::new(init);
-    let param_offset = usize::from(sig.receiver.is_some());
-    for (idx, &pat) in body.fn_params.iter().enumerate() {
-        let fallback = typed
-            .params
-            .get(param_offset + idx)
-            .map(|&pl| vec![checker.param_fallback_source(pl)]);
-        checker.bind_pat_param(pat, fallback.as_deref().unwrap_or(&[]), &mut state)?;
-    }
+    checker.bind_fn_params(sig, &mut state)?;
     let empty_live = HashSet::default();
     let root_place_ctx = checker.is_mut_ref_ty(checker.expr_ty(root))
         && typed.ret.is_some_and(|r| checker.is_mut_ref_ty(r));
@@ -680,9 +673,24 @@ impl Checker<'_, '_> {
     }
 
     fn check_return_sources(&mut self, expr: ExprId, sources: &[BorrowSource]) -> Result<()> {
-        if let Some(active) = self.active_closures.last_mut() {
-            for src in sources {
-                if let Some(idx) = active.params.iter().position(|&p| p == src.target)
+        let expr_depth = self.ty_max_ref_depth(self.expr_ty(expr));
+        for src in sources {
+            let target_ty = self.local_ty(src.target);
+            let inner = if target_ty != Ty::NONE {
+                match *self.cx.types.kind(target_ty) {
+                    Kind::Ref(_, inner) => Some(inner),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let past_outer = src.origin_only
+                && inner.is_some_and(|i| {
+                    self.ty_holds_non_dyn_borrow(i) && expr_depth <= self.ty_max_ref_depth(i)
+                });
+            if let Some(active) = self.active_closures.last_mut() {
+                if !past_outer
+                    && let Some(idx) = active.params.iter().position(|&p| p == src.target)
                     && !active.ret_params.contains(&idx)
                 {
                     active.ret_params.push(idx);

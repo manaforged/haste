@@ -47,6 +47,13 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
             }
         }
         AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
+            let has_static = body.list(list).iter().any(|&b_id| {
+                matches!(body.bounds[b_id as usize], Bound::Lifetime(lt) if src.text(lt) == LT_STATIC)
+            });
+            if has_static {
+                out.saw_static = true;
+                return;
+            }
             for &b_id in body.list(list) {
                 match body.bounds[b_id as usize] {
                     Bound::Lifetime(lt) => push_lt(src.text(lt), out),
@@ -72,17 +79,7 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
             if let Some(r) = ret {
                 collect_ty_lifetimes(body, src, r, &mut fn_lts);
             }
-            out.saw_static |= fn_lts.saw_static;
-            for lt in fn_lts.named {
-                if !out.named.contains(&lt) {
-                    out.named.push(lt);
-                }
-            }
-            for name in fn_lts.names {
-                if !out.names.contains(&name) {
-                    out.names.push(name);
-                }
-            }
+            merge_fn_lifetimes(fn_lts, out);
         }
         AstTy::Slice(t)
         | AstTy::Array(t, _)
@@ -114,14 +111,30 @@ fn collect_segment_args_lifetimes<'s>(
             }
         }
         Some(Args::Paren { inputs, output }) => {
+            let mut fn_lts = Lifetimes::default();
             for &t in body.list(inputs) {
-                collect_ty_lifetimes(body, src, TyId(t), out);
+                collect_ty_lifetimes(body, src, TyId(t), &mut fn_lts);
             }
             if let Some(o) = output {
-                collect_ty_lifetimes(body, src, o, out);
+                collect_ty_lifetimes(body, src, o, &mut fn_lts);
             }
+            merge_fn_lifetimes(fn_lts, out);
         }
         Some(Args::ReturnType) | None => {}
+    }
+}
+
+fn merge_fn_lifetimes<'s>(fn_lts: Lifetimes<'s>, out: &mut Lifetimes<'s>) {
+    out.saw_static |= fn_lts.saw_static;
+    for lt in fn_lts.named {
+        if !out.named.contains(&lt) {
+            out.named.push(lt);
+        }
+    }
+    for name in fn_lts.names {
+        if !out.names.contains(&name) {
+            out.names.push(name);
+        }
     }
 }
 
