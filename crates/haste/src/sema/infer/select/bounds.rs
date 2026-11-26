@@ -404,9 +404,19 @@ impl<'a> Infer<'_, 'a> {
                 if self.cx.negative_impl(of, Head::Adt(item), &holders) {
                     return false;
                 }
-                if self
-                    .select(of, ty, &[])
-                    .is_ok_and(|picked| picked.is_some())
+                if !self.has_vars(ty)
+                    && !self.has_params(ty)
+                    && self.probe(|infer| {
+                        infer
+                            .select(of, ty, &[])
+                            .is_ok_and(|picked| picked.is_some())
+                    })
+                {
+                    return true;
+                } else if (self.has_vars(ty) || self.has_params(ty))
+                    && self
+                        .select(of, ty, &[])
+                        .is_ok_and(|picked| picked.is_some())
                 {
                     return true;
                 }
@@ -421,14 +431,70 @@ impl<'a> Infer<'_, 'a> {
     }
 
     pub(in super::super) fn thread_auto_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
+        let (holds, dep) = self.thread_auto_holds_dep(of, ty);
+        self.auto_dep = self.auto_dep.min(dep);
+        if self.auto_stack.is_empty() {
+            self.auto_provisional.clear();
+            self.auto_dep = usize::MAX;
+        }
+        holds
+    }
+
+    fn finish_auto_node(
+        &mut self,
+        key: (ItemRef, Ty),
+        cacheable: bool,
+        my_depth: usize,
+        holds: bool,
+        dep: usize,
+    ) -> (bool, usize) {
+        if !holds {
+            self.auto_provisional.clear();
+            if cacheable {
+                self.cx.set_auto_trait(key, false);
+            }
+            return (false, usize::MAX);
+        }
+        if dep >= my_depth {
+            if cacheable {
+                self.cx.set_auto_trait(key, true);
+            }
+            let promoted: Vec<(ItemRef, Ty)> = self
+                .auto_provisional
+                .iter()
+                .filter_map(|(&k, &d)| (d >= my_depth).then_some(k))
+                .collect();
+            for k in promoted {
+                self.auto_provisional.remove(&k);
+                self.cx.set_auto_trait(k, true);
+            }
+            (true, usize::MAX)
+        } else {
+            if cacheable {
+                self.auto_provisional.insert(key, dep);
+            }
+            (true, dep)
+        }
+    }
+
+    fn thread_auto_holds_dep(&mut self, of: ItemRef, ty: Ty) -> (bool, usize) {
         let ty = self.resolve(ty);
-        if self.auto_stack.contains(&(of, ty)) {
+        if let Some(pos) = self.auto_stack.iter().position(|&e| e == (of, ty)) {
             self.cycle_hits += 1;
-            return true;
+            return (true, pos);
         }
         if self.auto_stack.len() >= crate::RECURSION_LIMIT {
             self.cycle_hits += 1;
-            return true;
+            return (true, 0);
+        }
+        let cacheable = self.cx.types.is_ground(ty);
+        if cacheable {
+            if let Some(cached) = self.cx.auto_trait(&(of, ty)) {
+                return (cached, usize::MAX);
+            }
+            if let Some(&dep) = self.auto_provisional.get(&(of, ty)) {
+                return (true, dep);
+            }
         }
         match *self.cx.types.kind(ty) {
             Kind::Prim(_)
@@ -440,39 +506,54 @@ impl<'a> Infer<'_, 'a> {
             | Kind::IntVar(_)
             | Kind::FloatVar(_)
             | Kind::Param(_)
-            | Kind::Proj(_) => true,
-            Kind::Ptr(..) => false,
+            | Kind::Proj(_) => (true, usize::MAX),
+            Kind::Ptr(..) => (false, usize::MAX),
             Kind::Ref(Mut::Not, inner) => match self.cx.lang_item("sync") {
-                Some(sync_of) => self.thread_auto_holds(sync_of, inner),
-                None => true,
+                Some(sync_of) => self.thread_auto_holds_dep(sync_of, inner),
+                None => (true, usize::MAX),
             },
             Kind::Ref(Mut::Mut, inner)
             | Kind::Array(inner, _)
             | Kind::Slice(inner)
-            | Kind::Pat(inner, _) => self.thread_auto_holds(of, inner),
+            | Kind::Pat(inner, _) => self.thread_auto_holds_dep(of, inner),
             Kind::Dyn(object, _, _, autos) => {
-                object == of
+                let holds = object == of
                     || self.cx.types.items(autos).contains(&of)
                     || self
                         .implied_traits(vec![object])
-                        .is_ok_and(|traits| traits.contains(&of))
+                        .is_ok_and(|traits| traits.contains(&of));
+                (holds, usize::MAX)
             }
             Kind::Tuple(_) => {
+                let my_depth = self.auto_stack.len();
                 self.auto_stack.push((of, ty));
-                let holds = self
-                    .parts(ty)
-                    .into_iter()
-                    .all(|part| self.thread_auto_holds(of, part));
+                let mut dep = usize::MAX;
+                let mut holds = true;
+                for part in self.parts(ty) {
+                    let (ok, child_dep) = self.thread_auto_holds_dep(of, part);
+                    if !ok {
+                        holds = false;
+                        break;
+                    }
+                    dep = dep.min(child_dep);
+                }
                 self.auto_stack.pop();
-                holds
+                self.finish_auto_node((of, ty), cacheable, my_depth, holds, dep)
             }
             Kind::Closure(parent, _, at) => self.closure_auto_holds(of, ty, parent, at),
-            Kind::Adt(item, args) => self.adt_auto_holds(of, ty, item, args),
+            Kind::Adt(item, args) => self.adt_auto_holds(of, ty, item, args, cacheable),
         }
     }
 
-    fn closure_auto_holds(&mut self, of: ItemRef, ty: Ty, parent: ItemRef, at: u32) -> bool {
+    fn closure_auto_holds(
+        &mut self,
+        of: ItemRef,
+        ty: Ty,
+        parent: ItemRef,
+        at: u32,
+    ) -> (bool, usize) {
         self.auto_stack.push((of, ty));
+        let mut dep = usize::MAX;
         let holds = if self.instance.is_some_and(|(cur, _)| cur == parent) {
             let Some(captures) = self
                 .out
@@ -481,9 +562,10 @@ impl<'a> Infer<'_, 'a> {
                 .map(|c| c.captures.clone())
             else {
                 self.auto_stack.pop();
-                return true;
+                return (true, usize::MAX);
             };
-            captures.into_iter().all(|cap| {
+            let mut ok = true;
+            for cap in captures {
                 let local_ty = self.resolve(self.out.locals[cap.local as usize].ty);
                 let cap_ty = cap.ty(self.cx, local_ty).unwrap_or(local_ty);
                 let held = match cap.by {
@@ -491,15 +573,23 @@ impl<'a> Infer<'_, 'a> {
                     super::super::By::Mut => self.cx.types.intern(Kind::Ref(Mut::Mut, cap_ty)),
                     super::super::By::Value => cap_ty,
                 };
-                self.thread_auto_holds(of, held)
-            })
+                let (h, child_dep) = self.thread_auto_holds_dep(of, held);
+                if !h {
+                    ok = false;
+                    break;
+                }
+                dep = dep.min(child_dep);
+            }
+            ok
         } else if let Some(info) = self.cx.ensure_closure(ty) {
-            self.thread_auto_holds(of, info.env)
+            let (h, child_dep) = self.thread_auto_holds_dep(of, info.env);
+            dep = child_dep;
+            h
         } else {
             true
         };
         self.auto_stack.pop();
-        holds
+        (holds, if holds { dep } else { usize::MAX })
     }
 
     fn adt_auto_holds(
@@ -508,32 +598,54 @@ impl<'a> Infer<'_, 'a> {
         ty: Ty,
         item: ItemRef,
         args: super::super::super::substs::Substs,
-    ) -> bool {
+        cacheable: bool,
+    ) -> (bool, usize) {
         let holders = self.holders(of, ty, &[]);
         if self.cx.negative_impl(of, Head::Adt(item), &holders) {
-            return false;
-        }
-        self.auto_stack.push((of, ty));
-        let holds = if self
-            .cx
-            .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders)
-        {
-            if self.has_vars(ty) || self.has_params(ty) {
-                true
-            } else {
-                self.select(of, ty, &[])
-                    .is_ok_and(|picked| picked.is_some())
+            if cacheable {
+                self.cx.set_auto_trait((of, ty), false);
             }
-        } else if self.cx.lang(item) == Some("phantom_data") {
-            let inner = self.cx.types.substs(args).first().copied();
-            inner.is_none_or(|t| self.thread_auto_holds(of, t))
-        } else {
-            self.parts(ty)
-                .into_iter()
-                .all(|part| self.thread_auto_holds(of, part))
-        };
+            return (false, usize::MAX);
+        }
+        let my_depth = self.auto_stack.len();
+        self.auto_stack.push((of, ty));
+        let (holds, dep) =
+            if self
+                .cx
+                .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders)
+            {
+                if self.has_vars(ty) || self.has_params(ty) {
+                    (true, usize::MAX)
+                } else {
+                    let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
+                    let ok = self.probe(|infer| {
+                        infer
+                            .select(of, ty, &[])
+                            .is_ok_and(|picked| picked.is_some())
+                    });
+                    let child_dep = std::mem::replace(&mut self.auto_dep, saved_dep);
+                    (ok, child_dep)
+                }
+            } else if self.cx.lang(item) == Some("phantom_data") {
+                match self.cx.types.substs(args).first().copied() {
+                    Some(t) => self.thread_auto_holds_dep(of, t),
+                    None => (true, usize::MAX),
+                }
+            } else {
+                let mut dep = usize::MAX;
+                let mut ok = true;
+                for part in self.parts(ty) {
+                    let (h, child_dep) = self.thread_auto_holds_dep(of, part);
+                    if !h {
+                        ok = false;
+                        break;
+                    }
+                    dep = dep.min(child_dep);
+                }
+                (ok, dep)
+            };
         self.auto_stack.pop();
-        holds
+        self.finish_auto_node((of, ty), cacheable, my_depth, holds, dep)
     }
 
     pub(in super::super) fn bound_trait_at(

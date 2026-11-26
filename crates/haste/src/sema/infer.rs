@@ -178,6 +178,8 @@ pub struct Infer<'c, 'a> {
     obligation_sites: HashMap<(ItemRef, Ty), ExprId>,
     captures_settled: bool,
     auto_stack: Vec<(ItemRef, Ty)>,
+    auto_provisional: HashMap<(ItemRef, Ty), usize>,
+    auto_dep: usize,
     matches: Vec<(ExprId, Ty, crate::body::List)>,
     active_discr: Option<(ItemRef, Vec<Option<i128>>, Vec<bool>)>,
 }
@@ -412,6 +414,8 @@ impl<'c, 'a> Infer<'c, 'a> {
             obligation_sites: HashMap::default(),
             captures_settled: false,
             auto_stack: Vec::new(),
+            auto_provisional: HashMap::default(),
+            auto_dep: usize::MAX,
             matches: Vec::new(),
             active_discr: None,
         }

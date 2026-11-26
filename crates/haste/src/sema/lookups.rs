@@ -201,6 +201,7 @@ pub(super) struct Lookups {
         (ItemRef, ty::Ty, super::substs::Substs),
         Option<(impls::ImplRef, super::substs::Substs)>,
     >,
+    pub(super) auto_traits: Table<(ItemRef, ty::Ty), bool>,
     pub(super) projections: Table<
         (
             ItemRef,
@@ -581,6 +582,7 @@ impl Lookups {
             .retain(|key, _| !edited.touches_crate(key.0.0.krate));
         self.trait_defs.retain(|item, _| !mine(*item));
         self.selections.clear();
+        self.auto_traits.clear();
         self.projections.clear();
         *write_lock(&self.state.global_allocator) = None;
         self.trait_calls.clear();
