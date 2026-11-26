@@ -166,39 +166,65 @@ impl Tokens {
             return;
         }
         let slice = &layer.tokens.as_slice()[lo..hi];
-        if let (Some(first), Some(last)) = (slice.first(), slice.last()) {
-            let span = (last.end().saturating_sub(first.start) as usize).min(layer.text.len());
-            self.text.reserve(span + (hi - lo));
-        }
-        let mut mark_idx = layer.marks.partition_point(|&(t, _)| (t as usize) < lo);
-        let copied = match &layer.origins {
-            Origins::Read => None,
-            Origins::Copied(v) => Some(v.as_slice()),
-        };
-        let mut orig_idx = copied.map_or(0, |v| v.partition_point(|&(t, _)| (t as usize) < lo));
-        if copied.is_none() {
-            self.origins.reserve(hi - lo);
-        }
-        let layer_text = layer.text.as_str();
-        for (offset, &token) in slice.iter().enumerate() {
-            let local = lo + offset;
-            let dst = self.tokens.len() as u32;
-            match copied {
-                None => self.origins.push((dst, token.start)),
-                Some(v) if v.get(orig_idx).is_some_and(|&(t, _)| t as usize == local) => {
-                    self.origins.push((dst, v[orig_idx].1));
-                    orig_idx += 1;
+        let base_dst = self.tokens.len() as u32;
+        if !layer.marks.is_empty() {
+            let mut mark_idx = layer.marks.partition_point(|&(t, _)| (t as usize) < lo);
+            while let Some(&(t, mark)) = layer.marks.get(mark_idx) {
+                if t as usize >= hi {
+                    break;
                 }
-                Some(_) => {}
-            }
-            if layer
-                .marks
-                .get(mark_idx)
-                .is_some_and(|&(t, _)| t as usize == local)
-            {
-                self.marks.push((dst, layer.marks[mark_idx].1));
+                self.marks.push((base_dst + (t - lo as u32), mark));
                 mark_idx += 1;
             }
+        }
+        match &layer.origins {
+            Origins::Read => {
+                self.origins.reserve(slice.len());
+                for (offset, &token) in slice.iter().enumerate() {
+                    self.origins.push((base_dst + offset as u32, token.start));
+                }
+            }
+            Origins::Copied(v) if !v.is_empty() => {
+                let mut orig_idx = v.partition_point(|&(t, _)| (t as usize) < lo);
+                while let Some(&(t, pos)) = v.get(orig_idx) {
+                    if t as usize >= hi {
+                        break;
+                    }
+                    self.origins.push((base_dst + (t - lo as u32), pos));
+                    orig_idx += 1;
+                }
+            }
+            Origins::Copied(_) => {}
+        }
+        let layer_text = layer.text.as_str();
+        let first_start = slice[0].start;
+        let last = slice[slice.len() - 1];
+        let last_end = last.end();
+        let span = last_end.saturating_sub(first_start) as usize;
+        let can_bulk = last_end >= first_start
+            && (last_end as usize) <= layer_text.len()
+            && (matches!(layer.origins, Origins::Copied(_)) || span <= slice.len() * 12 + 64)
+            && slice
+                .iter()
+                .all(|t| t.start >= first_start && t.end() <= last_end);
+        if can_bulk {
+            let dst_text_base = self.text.len() as u32;
+            let last_joint = last.joint() && is_punct_kind(last.kind);
+            self.text.reserve(span + usize::from(!last_joint));
+            self.text
+                .push_str(&layer_text[first_start as usize..last_end as usize]);
+            if !last_joint {
+                self.text.push(' ');
+            }
+            self.tokens.extend(slice.iter().map(|&token| {
+                let start = dst_text_base + (token.start - first_start);
+                let joint = token.joint() && is_punct_kind(token.kind);
+                Token::new(token.kind, start, token.end() - token.start, joint)
+            }));
+            return;
+        }
+        self.text.reserve(span.min(layer_text.len()) + slice.len());
+        for &token in slice {
             self.append(
                 token.kind,
                 &layer_text[token.start as usize..token.end() as usize],
