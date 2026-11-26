@@ -353,7 +353,7 @@ pub(super) fn lex(text: &mut String) -> Vec<Token> {
     tokens
 }
 
-pub(super) fn pair_up(tokens: &mut [Token], path: &Path) -> Result<()> {
+pub(crate) fn pair_up(tokens: &mut [Token], path: &Path) -> Result<()> {
     let mut open = Vec::with_capacity(64);
     for at in 0..tokens.len() {
         let kind = tokens[at].kind;

@@ -13,8 +13,8 @@ use crate::sema::summary::codec::{write_u32, write_u64};
 use super::names::write_names_crate;
 use super::outline::write_outline_crate;
 use super::tokens::{
-    u32_le, write_frag, write_items, write_marks, write_opt_u32, write_origins, write_path,
-    write_rules, write_str, write_tokens, write_usize,
+    u32_le, write_compact_tokens, write_frag, write_items, write_marks, write_opt_u32,
+    write_origins, write_path, write_rules, write_str, write_usize,
 };
 use super::{CrateIdentity, SYSROOT_MAGIC, SYSROOT_VERSION, identity_of};
 
@@ -260,11 +260,29 @@ fn write_identity(out: &mut Vec<u8>, ident: &CrateIdentity) -> Option<()> {
     Some(())
 }
 
+fn can_reload_from_disk(file: &File) -> bool {
+    let src = &file.source;
+    !file.expanded
+        && src.base.is_none()
+        && src.marks.is_empty()
+        && src.opaque.is_empty()
+        && matches!(src.origins, crate::outline::source::Origins::Read)
+        && !src.path.starts_with("/haste/")
+        && src.path.is_file()
+}
+
 fn write_file(out: &mut Vec<u8>, file: &Arc<File>, to_local: &[Option<u32>]) -> Option<()> {
     let src = &file.source;
     write_path(out, &src.path)?;
-    write_str(out, &src.text)?;
-    write_tokens(out, &src.tokens)?;
+    if can_reload_from_disk(file) {
+        out.push(1);
+        write_usize(out, src.text.len())?;
+        write_usize(out, src.tokens.len())?;
+    } else {
+        out.push(0);
+        write_str(out, &src.text)?;
+        write_compact_tokens(out, &src.tokens)?;
+    }
     write_marks(out, &src.marks, to_local)?;
     write_usize(out, src.opaque.len())?;
     for &(from, to, frag) in &src.opaque {

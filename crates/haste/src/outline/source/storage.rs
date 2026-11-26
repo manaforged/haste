@@ -2,48 +2,68 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 
 use crate::substrate::Backing;
-use crate::substrate::sysroot::tokens::{
-    TOKEN_WIRE_LEN, decode_token_at, decode_tokens_slice, token_raw_span_at,
-};
+use crate::substrate::sysroot::tokens::decode_compact_tokens;
 
 use super::Token;
+use super::lex::{lex, pair_up};
 
-#[allow(
-    dead_code,
-    reason = "keeps backing allocation alive for SourceText::ptr"
-)]
-enum TextOwner {
+/// Lazily reads and lexes an unmodified on-disk source file once, sharing both text and tokens.
+pub(crate) struct DiskSource {
+    path: PathBuf,
+    text_len: usize,
+    tok_count: usize,
+    loaded: OnceLock<(Box<str>, Vec<Token>)>,
+}
+
+impl DiskSource {
+    pub(crate) fn new(path: PathBuf, text_len: usize, tok_count: usize) -> Self {
+        Self {
+            path,
+            text_len,
+            tok_count,
+            loaded: OnceLock::new(),
+        }
+    }
+
+    fn load(&self) -> &(Box<str>, Vec<Token>) {
+        self.loaded.get_or_init(|| {
+            let mut text =
+                std::fs::read_to_string(&self.path).expect("readable cached sysroot file");
+            let mut tokens = lex(&mut text);
+            pair_up(&mut tokens, &self.path).expect("balanced cached sysroot file");
+            (text.into_boxed_str(), tokens)
+        })
+    }
+}
+
+enum TextRepr {
     Owned(Box<str>),
-    Mapped(Arc<Backing>),
+    Mapped {
+        _backing: Arc<Backing>,
+        ptr: *const u8,
+        len: usize,
+    },
+    Disk(Arc<DiskSource>),
 }
 
-/// Source text stored either as an owned string or a zero-copy UTF-8 slice of a memory-mapped backing.
-pub struct SourceText {
-    ptr: *const u8,
-    len: usize,
-    _owner: TextOwner,
-}
+// SAFETY: `TextRepr::Mapped` holds an immutable UTF-8 slice kept alive by `_backing`; `Disk` uses synchronized `OnceLock`.
+unsafe impl Send for TextRepr {}
+// SAFETY: `TextRepr` exposes only immutable reads and synchronized `OnceLock` initialization.
+unsafe impl Sync for TextRepr {}
 
-// SAFETY: `SourceText` holds an immutable UTF-8 slice backed by `Box<str>` or read-only `Arc<Backing>` for its entire lifetime.
-unsafe impl Send for SourceText {}
-// SAFETY: `SourceText` is immutable after construction and safe to share across threads.
-unsafe impl Sync for SourceText {}
+/// Source text stored as an owned string, a zero-copy mmap slice, or a lazily read on-disk file.
+pub struct SourceText(TextRepr);
 
 impl SourceText {
     /// Wraps an owned `String` as source text.
     pub fn owned(text: String) -> Self {
-        let boxed = text.into_boxed_str();
-        let (ptr, len) = (boxed.as_ptr(), boxed.len());
-        Self {
-            ptr,
-            len,
-            _owner: TextOwner::Owned(boxed),
-        }
+        Self(TextRepr::Owned(text.into_boxed_str()))
     }
 
     /// Creates zero-copy mapped source text from trusted cache bytes `backing[start..end]` after checking bounds.
@@ -53,24 +73,39 @@ impl SourceText {
             .get(start..end)
             .context("mapped source text out of bounds")?;
         let (ptr, len) = (slice.as_ptr(), slice.len());
-        Ok(Self {
+        Ok(Self(TextRepr::Mapped {
+            _backing: backing,
             ptr,
             len,
-            _owner: TextOwner::Mapped(backing),
-        })
+        }))
+    }
+
+    /// Creates source text backed lazily by an unmodified on-disk file.
+    pub(crate) fn disk(source: Arc<DiskSource>) -> Self {
+        Self(TextRepr::Disk(source))
     }
 
     /// Returns the source text as a string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
-        // SAFETY: `ptr..ptr + len` is a valid immutable UTF-8 slice owned by `_owner` for the lifetime of `self`.
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.ptr, self.len)) }
+        match &self.0 {
+            TextRepr::Owned(boxed) => boxed,
+            TextRepr::Mapped { ptr, len, .. } => {
+                // SAFETY: `ptr..ptr + len` is a valid immutable UTF-8 slice kept alive by `_backing`.
+                unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(*ptr, *len)) }
+            }
+            TextRepr::Disk(disk) => &disk.load().0,
+        }
     }
 
-    /// Returns the byte length of the source text.
+    /// Returns the byte length of the source text without forcing an on-disk read.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        match &self.0 {
+            TextRepr::Owned(boxed) => boxed.len(),
+            TextRepr::Mapped { len, .. } => *len,
+            TextRepr::Disk(disk) => disk.text_len,
+        }
     }
 }
 
@@ -160,21 +195,22 @@ impl Hash for SourceText {
 
 enum TokensRepr {
     Eager(Vec<Token>),
-    Lazy {
+    Compact {
         _backing: Arc<Backing>,
         ptr: *const u8,
         byte_len: usize,
         count: usize,
         decoded: OnceLock<Vec<Token>>,
     },
+    Disk(Arc<DiskSource>),
 }
 
-// SAFETY: `TokensRepr::Lazy::ptr` points into immutable read-only bytes kept alive by `_backing`.
+// SAFETY: `TokensRepr::Compact::ptr` points into immutable read-only bytes kept alive by `_backing`.
 unsafe impl Send for TokensRepr {}
 // SAFETY: `TokensRepr` exposes only immutable reads and synchronized `OnceLock` initialization.
 unsafe impl Sync for TokensRepr {}
 
-/// Source token stream stored either eagerly or decoded on demand from a memory-mapped backing.
+/// Source token stream stored eagerly, decoded lazily from compact cache bytes, or lexed on demand from disk.
 pub struct SourceTokens(TokensRepr);
 
 impl SourceTokens {
@@ -183,20 +219,14 @@ impl SourceTokens {
         Self(TokensRepr::Eager(tokens))
     }
 
-    /// Creates a lazy token stream backed by `backing[start..end]` after validating bounds and wire length.
-    pub fn lazy(backing: Arc<Backing>, start: usize, end: usize, count: usize) -> Result<Self> {
-        let expected = count
-            .checked_mul(TOKEN_WIRE_LEN)
-            .context("token stream overflow")?;
+    /// Creates a lazy token stream backed by compact wire bytes `backing[start..end]`.
+    pub fn compact(backing: Arc<Backing>, start: usize, end: usize, count: usize) -> Result<Self> {
         let slice = backing
             .as_slice()
             .get(start..end)
-            .context("lazy source tokens out of bounds")?;
-        if slice.len() != expected {
-            bail!("lazy source tokens byte length mismatch");
-        }
+            .context("compact source tokens out of bounds")?;
         let (ptr, byte_len) = (slice.as_ptr(), slice.len());
-        Ok(Self(TokensRepr::Lazy {
+        Ok(Self(TokensRepr::Compact {
             _backing: backing,
             ptr,
             byte_len,
@@ -205,85 +235,53 @@ impl SourceTokens {
         }))
     }
 
-    /// Returns the number of tokens without forcing lazy decoding.
+    /// Creates a lazy token stream backed by an unmodified on-disk source file.
+    pub(crate) fn disk(source: Arc<DiskSource>) -> Self {
+        Self(TokensRepr::Disk(source))
+    }
+
+    /// Returns the number of tokens without forcing lazy decoding or disk reads.
     #[inline]
     pub fn len(&self) -> usize {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.len(),
-            TokensRepr::Lazy { count, .. } => *count,
+            TokensRepr::Compact { count, .. } => *count,
+            TokensRepr::Disk(disk) => disk.tok_count,
         }
     }
 
-    /// Returns token `index` in O(1), decoding only that 14-byte record from mmap when lazy.
+    /// Returns token `index` in O(1) once decoded.
     #[inline(always)]
     pub fn at(&self, index: usize) -> Option<Token> {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.get(index).copied(),
-            TokensRepr::Lazy { .. } => self.at_lazy(index),
+            TokensRepr::Compact { .. } | TokensRepr::Disk(_) => self.as_slice().get(index).copied(),
         }
     }
 
-    #[cold]
-    #[inline(never)]
-    fn at_lazy(&self, index: usize) -> Option<Token> {
-        let TokensRepr::Lazy {
-            ptr,
-            byte_len,
-            count,
-            decoded,
-            ..
-        } = &self.0
-        else {
-            unreachable!()
-        };
-        if let Some(tokens) = decoded.get() {
-            return tokens.get(index).copied();
-        }
-        if index >= *count {
-            return None;
-        }
-        // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
-        let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
-        Some(decode_token_at(bytes, index * TOKEN_WIRE_LEN))
-    }
-
-    /// Returns `(start, raw_len)` of token `index` in O(1) without decoding its `TokenKind`.
+    /// Returns `(start, raw_len)` of token `index`.
     #[inline]
     pub fn raw_span(&self, index: usize) -> Option<(u32, u32)> {
-        match &self.0 {
-            TokensRepr::Eager(tokens) => tokens.get(index).map(|t| (t.start, t.raw().0)),
-            TokensRepr::Lazy {
-                ptr,
-                byte_len,
-                count,
-                ..
-            } => {
-                if index >= *count {
-                    return None;
-                }
-                // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
-                let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
-                Some(token_raw_span_at(bytes, index * TOKEN_WIRE_LEN))
-            }
-        }
+        self.at(index).map(|t| (t.start, t.raw().0))
     }
 
-    /// Returns the decoded token slice, decoding on first access if backed lazily.
+    /// Returns the decoded token slice, decoding or reading on first access if backed lazily.
     #[inline]
     pub fn as_slice(&self) -> &[Token] {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.as_slice(),
-            TokensRepr::Lazy {
+            TokensRepr::Compact {
                 ptr,
                 byte_len,
                 count,
                 decoded,
                 ..
             } => decoded.get_or_init(|| {
-                // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
+                // SAFETY: `ptr` is valid for `byte_len` immutable bytes kept alive by `_backing`.
                 let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
-                decode_tokens_slice(bytes, *count).expect("valid sysroot token stream")
+                decode_compact_tokens(bytes, *count).expect("valid sysroot compact token stream")
             }),
+            TokensRepr::Disk(disk) => &disk.load().1,
         }
     }
 }
@@ -320,11 +318,22 @@ impl fmt::Debug for SourceTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
             TokensRepr::Eager(tokens) => fmt::Debug::fmt(tokens, f),
-            TokensRepr::Lazy { count, decoded, .. } => {
+            TokensRepr::Compact { count, decoded, .. } => {
                 if let Some(tokens) = decoded.get() {
                     fmt::Debug::fmt(tokens, f)
                 } else {
-                    f.debug_struct("LazyTokens").field("count", count).finish()
+                    f.debug_struct("CompactTokens")
+                        .field("count", count)
+                        .finish()
+                }
+            }
+            TokensRepr::Disk(disk) => {
+                if let Some((_, tokens)) = disk.loaded.get() {
+                    fmt::Debug::fmt(tokens, f)
+                } else {
+                    f.debug_struct("DiskTokens")
+                        .field("count", &disk.tok_count)
+                        .finish()
                 }
             }
         }

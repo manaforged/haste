@@ -363,62 +363,105 @@ fn decode_complex_token(tag: usize, payload: u16, extra: u32) -> Result<TokenKin
     })
 }
 
-pub(crate) const TOKEN_WIRE_LEN: usize = 14;
-
-pub(super) fn write_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Option<()> {
-    write_usize(out, tokens.len())?;
-    out.reserve(tokens.len() * TOKEN_WIRE_LEN);
-    for &token in tokens {
-        let (len, pair) = token.raw();
-        let (code, extra) = encode_token(token.kind, pair)?;
-        out.extend_from_slice(&code.to_le_bytes());
-        write_u32(out, token.start);
-        write_u32(out, len);
-        write_u32(out, extra);
+#[inline]
+fn write_varint(out: &mut Vec<u8>, mut val: u32) {
+    while val >= 0x80 {
+        out.push((val as u8) | 0x80);
+        val >>= 7;
     }
+    out.push(val as u8);
+}
+
+#[inline]
+fn read_varint(cur: &mut Cursor<'_>) -> Result<u32> {
+    let mut val = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let byte = cur.u8()?;
+        val |= u32::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Ok(val);
+        }
+        shift += 7;
+        if shift >= 35 {
+            bail!("varint overflow");
+        }
+    }
+}
+
+pub(super) fn write_compact_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Option<()> {
+    write_usize(out, tokens.len())?;
+    let len_at = out.len();
+    write_u32(out, 0);
+    let body_start = out.len();
+    out.reserve(tokens.len() * 3);
+    let mut prev_end = 0u32;
+    let mut prev_joint = true;
+    for (idx, &token) in tokens.iter().enumerate() {
+        let (raw_len, pair) = token.raw();
+        let joint = token.joint();
+        let len = raw_len & !(1u32 << 31);
+        let (code, extra) = encode_token(token.kind, pair)?;
+        let tag = (code & 0x3f) as u8;
+        let expected_start = prev_end.wrapping_add(u32::from(!prev_joint && idx > 0));
+        let non_default_start = token.start != expected_start;
+        out.push(tag | (u8::from(joint) << 6) | (u8::from(non_default_start) << 7));
+        if tag >= SIMPLE_TOKENS.len() as u8 {
+            write_varint(out, u32::from(code >> 6));
+            if tag >= 42 {
+                write_varint(out, extra);
+            }
+        }
+        if non_default_start {
+            write_varint(out, token.start);
+        }
+        write_varint(out, len);
+        prev_end = token.start.wrapping_add(len);
+        prev_joint = joint;
+    }
+    let byte_len = u32::try_from(out.len() - body_start).ok()?;
+    out[len_at..len_at + 4].copy_from_slice(&byte_len.to_le_bytes());
     Some(())
 }
 
-#[inline]
-fn decode_token_chunk(c: &[u8]) -> Result<Token> {
-    let code = u16::from_le_bytes([c[0], c[1]]);
-    let tag = (code & 0x3f) as usize;
-    let start = u32_le(c, 2);
-    let len = u32_le(c, 6);
-    let extra = u32_le(c, 10);
-    if tag < SIMPLE_TOKENS.len() {
-        Ok(Token::from_raw(SIMPLE_TOKENS[tag], start, len, extra))
-    } else {
-        let kind = decode_complex_token(tag, code >> 6, extra)?;
-        Ok(Token::from_raw(kind, start, len, u32::MAX))
-    }
-}
-
-/// Decodes one wire-encoded token from `bytes[offset..offset + TOKEN_WIRE_LEN]`.
-#[inline]
-pub(crate) fn decode_token_at(bytes: &[u8], offset: usize) -> Token {
-    decode_token_chunk(&bytes[offset..offset + TOKEN_WIRE_LEN]).expect("valid sysroot token kind")
-}
-
-/// Reads `(start, raw_len)` of one wire-encoded token without decoding its `TokenKind`.
-#[inline]
-pub(crate) fn token_raw_span_at(bytes: &[u8], offset: usize) -> (u32, u32) {
-    let c = &bytes[offset..offset + 10];
-    (u32_le(c, 2), u32_le(c, 6))
-}
-
-/// Decodes `count` wire-encoded tokens from `bytes`.
-pub(crate) fn decode_tokens_slice(bytes: &[u8], count: usize) -> Result<Vec<Token>> {
-    let expected = count
-        .checked_mul(TOKEN_WIRE_LEN)
-        .context("token stream overflow")?;
-    if bytes.len() != expected {
-        bail!("token stream byte length mismatch");
-    }
+/// Decodes `count` compact variable-length tokens from `bytes` and restores delimiter pairs.
+pub(crate) fn decode_compact_tokens(bytes: &[u8], count: usize) -> Result<Vec<Token>> {
+    let mut cur = Cursor::new(bytes);
     let mut tokens = Vec::with_capacity(count);
-    for c in bytes.chunks_exact(TOKEN_WIRE_LEN) {
-        tokens.push(decode_token_chunk(c)?);
+    let mut prev_end = 0u32;
+    let mut prev_joint = true;
+    for idx in 0..count {
+        let header = cur.u8()?;
+        let tag = (header & 0x3f) as usize;
+        let joint = header & 0x40 != 0;
+        let non_default_start = header & 0x80 != 0;
+        let kind = if tag < SIMPLE_TOKENS.len() {
+            SIMPLE_TOKENS[tag]
+        } else {
+            let payload =
+                u16::try_from(read_varint(&mut cur)?).context("token payload overflow")?;
+            let extra = if tag >= 42 {
+                read_varint(&mut cur)?
+            } else {
+                u32::MAX
+            };
+            decode_complex_token(tag, payload, extra)?
+        };
+        let start = if non_default_start {
+            read_varint(&mut cur)?
+        } else {
+            prev_end.wrapping_add(u32::from(!prev_joint && idx > 0))
+        };
+        let len = read_varint(&mut cur)?;
+        let raw_len = len | (u32::from(joint) << 31);
+        tokens.push(Token::from_raw(kind, start, raw_len, u32::MAX));
+        prev_end = start.wrapping_add(len);
+        prev_joint = joint;
     }
+    if cur.pos != bytes.len() {
+        bail!("trailing bytes in compact token stream");
+    }
+    crate::outline::source::pair_up_tokens(&mut tokens, std::path::Path::new("<sysroot>"))?;
     Ok(tokens)
 }
 
@@ -450,26 +493,47 @@ pub(super) fn write_marks(
     let len_at = out.len();
     write_u32(out, 0);
     let body_start = out.len();
-    out.reserve(marks.len() * 13);
+    out.reserve(marks.len() * 3);
+    let mut prev_at = 0u32;
+    let mut prev_mark: Option<Mark> = None;
     for &(at, mark) in marks {
-        write_u32(out, at);
-        match mark {
-            Mark::Crate(k) => {
-                out.push(0);
-                write_u32(out, (*to_local.get(k as usize)?)?);
+        let delta = at.wrapping_sub(prev_at);
+        let mapped = match mark {
+            Mark::Crate(k) => Mark::Crate((*to_local.get(k as usize)?)?),
+            Mark::Home { krate, file, item } => Mark::Home {
+                krate: (*to_local.get(krate as usize)?)?,
+                file,
+                item,
+            },
+            Mark::Scope { id, parent } => Mark::Scope { id, parent },
+        };
+        if prev_mark == Some(mapped) {
+            out.push(3);
+            write_varint(out, delta);
+        } else {
+            match mapped {
+                Mark::Crate(k) => {
+                    out.push(0);
+                    write_varint(out, delta);
+                    write_varint(out, k);
+                }
+                Mark::Home { krate, file, item } => {
+                    out.push(1);
+                    write_varint(out, delta);
+                    write_varint(out, krate);
+                    write_varint(out, file);
+                    write_varint(out, item);
+                }
+                Mark::Scope { id, parent } => {
+                    out.push(2);
+                    write_varint(out, delta);
+                    write_varint(out, id);
+                    write_varint(out, parent);
+                }
             }
-            Mark::Home { krate, file, item } => {
-                out.push(1);
-                write_u32(out, (*to_local.get(krate as usize)?)?);
-                write_u32(out, file);
-                write_u32(out, item);
-            }
-            Mark::Scope { id, parent } => {
-                out.push(2);
-                write_u32(out, id);
-                write_u32(out, parent);
-            }
+            prev_mark = Some(mapped);
         }
+        prev_at = at;
     }
     let byte_len = u32::try_from(out.len() - body_start).ok()?;
     out[len_at..len_at + 4].copy_from_slice(&byte_len.to_le_bytes());
@@ -482,69 +546,38 @@ pub(super) fn read_marks(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(u32
     let count = cur.count()?;
     let byte_len = cur.count()?;
     let data = cur.take(byte_len)?;
-    if count.saturating_mul(9) > data.len() {
-        bail!("mark count exceeds byte length");
-    }
+    let mut sub = Cursor::new(data);
     let mut marks = Vec::with_capacity(count);
-    let mut pos = 0usize;
-    while marks.len() < count && pos + 17 <= data.len() {
-        let b = &data[pos..pos + 17];
-        let at = u32_le(b, 0);
-        let mark = match b[4] {
-            0 => {
-                pos += 9;
-                Mark::Crate(
-                    *remap
-                        .get(u32_le(b, 5) as usize)
-                        .context("mark crate out of bounds")?,
-                )
-            }
-            1 => {
-                pos += 17;
-                Mark::Home {
-                    krate: *remap
-                        .get(u32_le(b, 5) as usize)
-                        .context("mark home crate out of bounds")?,
-                    file: u32_le(b, 9),
-                    item: u32_le(b, 13),
-                }
-            }
-            2 => {
-                pos += 13;
-                Mark::Scope {
-                    id: map_scope(u32_le(b, 5)),
-                    parent: map_scope(u32_le(b, 9)),
-                }
-            }
-            _ => bail!("invalid mark tag"),
-        };
-        marks.push((at, mark));
-    }
-    let mut tail = Cursor::new(&data[pos..]);
-    while marks.len() < count {
-        let at = tail.u32()?;
-        let mark = match tail.u8()? {
+    let mut prev_at = 0u32;
+    let mut prev_mark: Option<Mark> = None;
+    for _ in 0..count {
+        let tag = sub.u8()?;
+        let at = prev_at.wrapping_add(read_varint(&mut sub)?);
+        let mark = match tag {
+            3 => prev_mark.context("repeat mark without previous mark")?,
             0 => Mark::Crate(
                 *remap
-                    .get(tail.u32()? as usize)
+                    .get(read_varint(&mut sub)? as usize)
                     .context("mark crate out of bounds")?,
             ),
             1 => Mark::Home {
                 krate: *remap
-                    .get(tail.u32()? as usize)
+                    .get(read_varint(&mut sub)? as usize)
                     .context("mark home crate out of bounds")?,
-                file: tail.u32()?,
-                item: tail.u32()?,
+                file: read_varint(&mut sub)?,
+                item: read_varint(&mut sub)?,
             },
             2 => Mark::Scope {
-                id: map_scope(tail.u32()?),
-                parent: map_scope(tail.u32()?),
+                id: map_scope(read_varint(&mut sub)?),
+                parent: map_scope(read_varint(&mut sub)?),
             },
             _ => bail!("invalid mark tag"),
         };
+        prev_at = at;
+        prev_mark = Some(mark);
         marks.push((at, mark));
     }
-    if pos + tail.pos != data.len() {
+    if sub.pos != data.len() {
         bail!("trailing bytes in sysroot marks");
     }
     Ok(marks)
