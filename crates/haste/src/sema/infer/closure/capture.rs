@@ -36,6 +36,7 @@ impl PatCaptureOut<'_> {
 
 struct PlaceUses {
     places: HashSet<ExprId>,
+    addr_taken: HashSet<ExprId>,
     parents: HashMap<ExprId, ExprId>,
     deref_parents: HashMap<ExprId, ExprId>,
     scrutinees: HashMap<ExprId, Vec<PatId>>,
@@ -247,10 +248,33 @@ impl<'a> Infer<'_, 'a> {
             })
             .collect();
         let mut read_locals = HashSet::default();
+        let mut addr_locals: HashSet<u32> = HashSet::default();
         if !uses.reads.is_empty() || !uses.inner_closures.is_empty() {
             let place_uses = self.place_uses();
             self.collect_read_captures(uses, &place_uses, &mut known, &mut read_locals, &mut raw)?;
             self.collect_child_captures(uses, &mut known, &mut raw)?;
+            for &(read, local) in &uses.reads {
+                let mut cur = read;
+                while let Some(&parent) = place_uses.parents.get(&cur) {
+                    if matches!(*self.body.expr(parent), Expr::Paren(_)) {
+                        cur = parent;
+                    } else {
+                        break;
+                    }
+                }
+                if place_uses.addr_taken.contains(&cur) || place_uses.addr_taken.contains(&read) {
+                    addr_locals.insert(local);
+                }
+            }
+            for &child in &uses.inner_closures {
+                if let Some(caps) = self.out.closures.get(&child) {
+                    for cap in &caps.captures {
+                        if cap.local < uses.first && cap.by == By::Ref && cap.path.is_empty() {
+                            addr_locals.insert(cap.local);
+                        }
+                    }
+                }
+            }
         }
         for &(local, mut_expr) in &uses.mutated {
             let (mut_proj, mut_known) = self.expr_proj(mut_expr)?;
@@ -292,7 +316,7 @@ impl<'a> Infer<'_, 'a> {
         }
         if !by_move {
             for cap in &mut captures {
-                if cap.by == By::Ref && cap.path.is_empty() {
+                if cap.by == By::Ref && cap.path.is_empty() && !addr_locals.contains(&cap.local) {
                     let ty = self.resolve(self.out.locals[cap.local as usize].ty);
                     if matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) {
                         cap.by = By::Value;
@@ -597,7 +621,8 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn place_uses(&mut self) -> PlaceUses {
-        let (mut places, mut parents, mut deref_parents, mut scrutinees): (
+        let (mut places, mut addr_taken, mut parents, mut deref_parents, mut scrutinees): (
+            HashSet<ExprId>,
             HashSet<ExprId>,
             HashMap<ExprId, ExprId>,
             HashMap<ExprId, ExprId>,
@@ -640,8 +665,11 @@ impl<'a> Infer<'_, 'a> {
                     places.insert(scrut);
                     scrutinees.entry(scrut).or_default().push(pat);
                 }
-                Expr::Ref { expr, .. }
-                | Expr::Index(expr, _)
+                Expr::Ref { expr, .. } => {
+                    places.insert(expr);
+                    addr_taken.insert(expr);
+                }
+                Expr::Index(expr, _)
                 | Expr::Assign(expr, _)
                 | Expr::AssignOp(_, expr, _)
                 | Expr::Call(expr, _) => {
@@ -659,6 +687,14 @@ impl<'a> Infer<'_, 'a> {
                         .is_some_and(|a| a.autoref.is_some() || a.derefs > 0) =>
                 {
                     places.insert(receiver);
+                    if self
+                        .out
+                        .adjusts
+                        .get(&at)
+                        .is_some_and(|a| a.derefs == 0 && a.autoref.is_some())
+                    {
+                        addr_taken.insert(receiver);
+                    }
                 }
                 _ => {}
             }
@@ -675,6 +711,7 @@ impl<'a> Infer<'_, 'a> {
         }
         PlaceUses {
             places,
+            addr_taken,
             parents,
             deref_parents,
             scrutinees,

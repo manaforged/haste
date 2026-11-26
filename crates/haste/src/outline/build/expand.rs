@@ -453,7 +453,7 @@ fn crate_recursion_limit(krate: &super::Crate) -> usize {
             && src.text(at + 1) == "="
             && let Ok(n) = src.text(at + 2).trim_matches('"').parse::<usize>()
         {
-            return n.clamp(crate::RECURSION_LIMIT, MAX_RECURSION_LIMIT);
+            return n.min(MAX_RECURSION_LIMIT);
         }
     }
     crate::RECURSION_LIMIT

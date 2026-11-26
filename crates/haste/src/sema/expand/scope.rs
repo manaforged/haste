@@ -35,19 +35,19 @@ fn use_entries(
     true
 }
 
+fn is_use_path_token(src: &Source, at: u32) -> bool {
+    is_name(src.kind(at))
+        || src.kind(at) == TokenKind::Colon
+        || (src.kind(at) == TokenKind::Dollar && src.dollar(at).is_some())
+}
+
 fn use_entry(
     src: &Source,
     prefix: &[u32],
     (from, to): (u32, u32),
     found: &mut Vec<(Vec<u32>, u32)>,
 ) -> bool {
-    let pathlike = |range: std::ops::Range<u32>| {
-        range.clone().all(|at| {
-            is_name(src.kind(at))
-                || src.kind(at) == TokenKind::Colon
-                || (src.kind(at) == TokenKind::Dollar && src.dollar(at).is_some())
-        })
-    };
+    let pathlike = |range: std::ops::Range<u32>| range.clone().all(|at| is_use_path_token(src, at));
     let joined = |end: u32| {
         prefix
             .iter()
@@ -92,10 +92,7 @@ impl Writer {
             {
                 return self.note_use_group(src, (at + 1, end));
             }
-            if !is_name(src.kind(end))
-                && src.kind(end) != TokenKind::Colon
-                && !(src.kind(end) == TokenKind::Dollar && src.dollar(end).is_some())
-            {
+            if !is_use_path_token(src, end) {
                 return Ok(None);
             }
             end += 1;
