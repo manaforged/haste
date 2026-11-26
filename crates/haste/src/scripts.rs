@@ -433,7 +433,7 @@ fn run(
     } else {
         demand.set_fast(true);
     }
-    demand.set_ahead(true);
+    demand.set_ahead(!has_build_deps);
     let mut unit_set = HashSet::default();
     for &(unit, _) in &scripts {
         unit_set.insert(unit);
