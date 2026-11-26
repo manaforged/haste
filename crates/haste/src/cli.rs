@@ -327,10 +327,16 @@ fn report_cases(
         match &result {
             Ok(0) => {
                 let watch_paths = build.watch_paths();
+                let env_reads: Vec<String> = build
+                    .env_reads()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
                 crate::substrate::noop::record(
                     root,
                     workspace,
                     &watch_paths,
+                    &env_reads,
                     out,
                     build.reached_count(),
                 );

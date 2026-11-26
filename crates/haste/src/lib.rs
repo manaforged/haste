@@ -133,6 +133,42 @@ pub(crate) fn with_config<R>(cfg: Arc<config::Config>, f: impl FnOnce() -> R) ->
     f()
 }
 
+type ClientEnvMap = Arc<rustc_hash::FxHashMap<String, String>>;
+
+thread_local! {
+    static CLIENT_ENV: std::cell::RefCell<Option<ClientEnvMap>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn client_env() -> Option<ClientEnvMap> {
+    CLIENT_ENV.with(|slot| slot.borrow().clone())
+}
+
+/// Runs `f` with `env` installed as the request-scoped client environment for `env!`/`option_env!` lookups.
+pub(crate) fn with_client_env<R>(env: Option<ClientEnvMap>, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<ClientEnvMap>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CLIENT_ENV.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let prev = CLIENT_ENV.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env));
+    let _guard = Guard(prev);
+    f()
+}
+
+/// Reads an environment variable from the active request's client environment when set, else the process environment.
+pub(crate) fn process_env_var(name: &str) -> Option<String> {
+    CLIENT_ENV.with(|slot| {
+        if let Some(map) = slot.borrow().as_ref() {
+            map.get(name).cloned()
+        } else {
+            std::env::var(name).ok()
+        }
+    })
+}
+
 /// How many processes or threads haste runs at once.
 fn jobs() -> usize {
     with_cfg(|c| c.jobs)

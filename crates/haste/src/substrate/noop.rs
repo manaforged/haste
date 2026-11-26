@@ -160,6 +160,7 @@ pub fn record(
     root: &Path,
     workspace: &crate::graph::Workspace,
     build_paths: &[PathBuf],
+    env_reads: &[String],
     out: Option<&Path>,
     reached: usize,
 ) {
@@ -175,6 +176,7 @@ pub fn record(
     paths.sort();
     paths.dedup();
     let mut envs: Vec<String> = watched_vars.into_iter().map(|(name, _)| name).collect();
+    envs.extend(env_reads.iter().cloned());
     envs.sort();
     envs.dedup();
     let Some(stamp) = compute_stamp(&croot, aout.as_deref(), &paths, &envs) else {

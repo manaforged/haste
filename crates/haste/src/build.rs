@@ -226,6 +226,19 @@ impl Build {
         paths(&self.stamps)
     }
 
+    pub(crate) fn env_reads(&self) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        for tree in &self.compilation.outline.crates {
+            let reads = crate::sync::lock(&tree.env.env_reads);
+            for (k, v) in reads.iter() {
+                out.push((k.clone(), v.clone()));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Brings the build up to date with the local files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
     pub fn refresh(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
         let Ok((stale, crates)) = edits(workspace, &mut self.stamps, &mut self.compilation.outline)
