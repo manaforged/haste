@@ -165,6 +165,10 @@ impl Tokens {
         if lo >= hi {
             return;
         }
+        if let (Some(first), Some(last)) = (layer.tokens.at(lo), layer.tokens.at(hi - 1)) {
+            let span = (last.end().saturating_sub(first.start) as usize).min(layer.text.len());
+            self.text.reserve(span + (hi - lo));
+        }
         let mut mark_idx = layer.marks.partition_point(|&(t, _)| (t as usize) < lo);
         let copied = match &layer.origins {
             Origins::Read => None,
@@ -174,6 +178,7 @@ impl Tokens {
         if copied.is_none() {
             self.origins.reserve(hi - lo);
         }
+        let layer_text = layer.text.as_str();
         for local in lo..hi {
             let token = layer.tokens.at(local).expect("token index in bounds");
             let dst = self.tokens.len() as u32;
@@ -195,7 +200,7 @@ impl Tokens {
             }
             self.append(
                 token.kind,
-                &layer.text[token.start as usize..token.end() as usize],
+                &layer_text[token.start as usize..token.end() as usize],
                 token.joint(),
             );
         }
