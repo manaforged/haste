@@ -5,7 +5,6 @@ mod outline;
 pub(crate) mod tokens;
 mod wire;
 
-use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -165,9 +164,7 @@ pub(crate) fn save(workspace: &Workspace, targets: &Targets, compilation: &Compi
     let Some(bytes) = wire::encode_sysroot(key, workspace, compilation, &sysroot_crates) else {
         return;
     };
-    if let Err(error) =
-        crate::graph::store::write_new_with(&path, |writer| writer.write_all(&bytes))
-    {
+    if let Err(error) = super::backing::write_compressed(&path, &[&bytes]) {
         eprintln!("haste: cannot save sysroot cache: {error:#}");
         return;
     }
