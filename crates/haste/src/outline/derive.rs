@@ -439,10 +439,7 @@ impl Writer<'_> {
                 .iter()
                 .any(|variant| !variant.fields.is_empty())
         {
-            bail!(
-                "derive on enum `{}` with explicit discriminants and fields is not supported yet",
-                self.name
-            );
+            return Ok(format!("$crate::intrinsics::discriminant_value({of})"));
         }
         if explicit {
             return Ok(format!("(*{of} as {})", self.repr));
