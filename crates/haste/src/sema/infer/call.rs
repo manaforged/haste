@@ -290,10 +290,14 @@ impl Infer<'_, '_> {
             args.len(),
             params.len(),
         )?;
-        let hints = self.expected_inputs(&params, ret, expected);
         let value_count = params.len();
         let def_ref = def.as_ref().map(|(item, substs)| (*item, &substs[..]));
-        self.call_args_ordered(&args[..value_count], &params, &hints, def_ref, &mut held)?;
+        self.call_args_ordered(
+            &args[..value_count],
+            (&params, ret, expected),
+            def_ref,
+            &mut held,
+        )?;
         for &arg in &args[args.len() - extra..] {
             self.expr(ExprId(arg), None)?;
         }
@@ -303,23 +307,51 @@ impl Infer<'_, '_> {
     pub(super) fn call_args_ordered(
         &mut self,
         args: &[u32],
-        params: &[Ty],
-        hints: &[Option<Ty>],
+        (params, ret, expected): (&[Ty], Ty, Option<Ty>),
         def: Option<(ItemRef, &[Ty])>,
         held: &mut Option<(ItemRef, Vec<Ty>)>,
     ) -> Result<()> {
-        for (&arg, (&param, &hint)) in args.iter().zip(params.iter().zip(hints)) {
+        let hints = self.expected_inputs(params, ret, expected);
+        let has_deferred = args
+            .iter()
+            .any(|&arg| self.is_deferred_closure_arg(ExprId(arg)));
+        for (&arg, (&param, &hint)) in args.iter().zip(params.iter().zip(&hints)) {
             if !self.is_deferred_closure_arg(ExprId(arg)) {
                 self.call_arg(def, ExprId(arg), (param, hint), held)?;
             }
         }
+        if has_deferred {
+            self.unify_expected_ret(ret, expected);
+        }
         self.release_obligation(held)?;
-        for (&arg, (&param, &hint)) in args.iter().zip(params.iter().zip(hints)) {
+        for (&arg, (&param, &hint)) in args.iter().zip(params.iter().zip(&hints)) {
             if self.is_deferred_closure_arg(ExprId(arg)) {
                 self.call_arg(def, ExprId(arg), (param, hint), held)?;
             }
         }
         Ok(())
+    }
+
+    fn unify_expected_ret(&mut self, ret: Ty, expected: Option<Ty>) {
+        let Some(wanted) = expected.map(|ty| self.resolve(ty)) else {
+            return;
+        };
+        let ret = self.resolve(ret);
+        if !matches!(self.cx.types.kind(ret), Kind::Var(_))
+            || matches!(
+                self.cx.types.kind(wanted),
+                Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)
+            )
+            || self.cx.types.kind(wanted).is_unsized()
+        {
+            return;
+        }
+        if matches!(
+            self.probe(|infer| -> Result<bool> { Ok(infer.unifies(ret, wanted)) }),
+            Ok(true)
+        ) {
+            let _ = self.unify(ret, wanted);
+        }
     }
 
     fn is_deferred_closure_arg(&self, expr: ExprId) -> bool {

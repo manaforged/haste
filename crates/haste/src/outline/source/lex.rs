@@ -40,10 +40,17 @@ fn raw_hashes(body: &str) -> usize {
 }
 
 fn doc_tokens(comment: &str, inner: bool, (tail, base): (&mut String, u32), into: &mut Vec<Token>) {
-    let body = if comment.starts_with("/*") {
+    let raw = if comment.starts_with("/*") {
         &comment[3..comment.len().saturating_sub(2).max(3)]
     } else {
-        &comment[3..]
+        comment[3..].strip_suffix('\r').unwrap_or(&comment[3..])
+    };
+    let normalized;
+    let body = if raw.contains('\r') {
+        normalized = raw.replace("\r\n", "\n").replace('\r', "");
+        normalized.as_str()
+    } else {
+        raw
     };
     let hashes = raw_hashes(body);
     let mut emit = |tail: &mut String, kind: TokenKind, pieces: &[&str]| {

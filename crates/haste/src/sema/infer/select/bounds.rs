@@ -129,16 +129,20 @@ impl<'a> Infer<'_, 'a> {
             return Ok(held);
         }
         let kind = self.cx.types.kind(self.resolve(ty));
-        if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
+        let is_var = matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_));
+        let is_closure = matches!(kind, Kind::Closure(..));
+        let is_callable = matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..));
+        if is_var {
             return self.var_holds(arena, (of, path), ty, depth);
+        }
+        if is_closure && self.cx.lang(of) == Some("future_trait") {
+            self.ensure_coroutine(ty);
         }
         if self.compiler_impl(of, ty) {
             let args = self.bound_args(of, arena, path, ty)?;
             return self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth);
         }
-        if self.is_callable_trait(of)
-            && matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..))
-        {
+        if self.is_callable_trait(of) && is_callable {
             return self.callable_bound_holds((arena, home, bound), (of, path, ty), depth);
         }
         if self.poly.is_some()
@@ -398,7 +402,7 @@ impl<'a> Infer<'_, 'a> {
             return true;
         }
         match *self.cx.types.kind(ty) {
-            Kind::Closure(..) => return self.coroutine_output(ty).is_none(),
+            Kind::Closure(..) => return !self.ensure_coroutine(ty),
             Kind::Adt(item, _) => {
                 let holders = self.holders(of, ty, &[]);
                 if self.cx.negative_impl(of, Head::Adt(item), &holders) {
@@ -648,7 +652,7 @@ impl<'a> Infer<'_, 'a> {
         self.finish_auto_node((of, ty), cacheable, my_depth, holds, dep)
     }
 
-    pub(in super::super) fn bound_trait_at(
+    pub(in crate::sema) fn bound_trait_at(
         &mut self,
         arena: &Body,
         bound: u32,

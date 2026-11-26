@@ -455,11 +455,9 @@ impl<'a> Infer<'_, 'a> {
                 "unexpected number of arguments",
             ));
         }
-        let hints = self.expected_inputs(&types[1..], ret, expected);
         self.call_args_ordered(
             &given,
-            &types[1..],
-            &hints,
+            (&types[1..], ret, expected),
             Some((item, &substs[..])),
             &mut None,
         )?;
