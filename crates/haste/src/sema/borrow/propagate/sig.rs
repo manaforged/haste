@@ -1,5 +1,5 @@
 use crate::body::sig::{SelfKind, Signature};
-use crate::body::{Expr, ExprId, List, Pat, Ty as AstTy, TyId, UnOp};
+use crate::body::{Expr, ExprId, List, Ty as AstTy, TyId};
 use crate::names::ItemRef;
 use crate::outline::item::Item;
 use crate::outline::source::Source;
@@ -95,6 +95,11 @@ impl<'a> Checker<'_, 'a> {
         }
         if let Some(fn_item) = self.call_sig_fn_item(expr, callee) {
             return self.sig_borrow_sources(expr, fn_item, None, args, state);
+        }
+        if matches!(self.cx.types.kind(self.expr_ty(callee)), Kind::FnPtr(..))
+            && !self.ty_holds_non_dyn_borrow(self.expr_ty(expr))
+        {
+            return Vec::new();
         }
         let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
         let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
@@ -698,52 +703,6 @@ impl<'a> Checker<'_, 'a> {
         }
         let arg_sources = self.expr_borrow_sources_inner(arg, state, false, None);
         self.copied_recv_sources(call_expr, arg, arg_sources, state, true)
-    }
-
-    fn closure_copies_inner_ref(&mut self, arg: ExprId) -> bool {
-        let cur = self.unwrap_parens(arg);
-        let Expr::Closure { params, body, .. } = *self.body.expr(cur) else {
-            return false;
-        };
-        let Some((param_local, ret_ty)) = self
-            .typed
-            .closures
-            .get(&cur)
-            .filter(|c| c.params.len() == 1 && c.captures.is_empty())
-            .map(|c| (c.params[0], c.ret))
-        else {
-            return false;
-        };
-        let param_ty = self.local_ty(param_local);
-        let Kind::Ref(_, inner_ty) = *self.cx.types.kind(param_ty) else {
-            return false;
-        };
-        let body = self.unwrap_parens_and_empty_blocks(body);
-        if matches!(*self.cx.types.kind(inner_ty), Kind::Ref(Mut::Not, _)) {
-            if let Expr::Unary(UnOp::Deref, inner) = *self.body.expr(body)
-                && self.expr_plain_local(inner) == Some(param_local)
-            {
-                return true;
-            }
-            let param_ids = self.body.list(params);
-            if param_ids.len() == 1
-                && let Pat::Ref { pat: inner_pat, .. } =
-                    *self.body.pat(self.body.params[param_ids[0] as usize].pat)
-                && let Some(&bound) = self.typed.binds.get(&inner_pat)
-                && self.expr_plain_local(body) == Some(bound)
-            {
-                return true;
-            }
-        }
-        if matches!(
-            *self.body.expr(body),
-            Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _)
-                if self.expr_plain_local(base) == Some(param_local)
-        ) && self.ty_is_copy(ret_ty)
-        {
-            return true;
-        }
-        false
     }
 
     fn iter_closure_ignores_param(&mut self, arg: ExprId, state: &State) -> bool {

@@ -325,4 +325,49 @@ impl Checker<'_, '_> {
                 crate::body::Pat::Ref { .. }
             )
     }
+
+    pub(super) fn closure_copies_inner_ref(&mut self, arg: ExprId) -> bool {
+        let cur = self.unwrap_parens(arg);
+        let Expr::Closure { params, body, .. } = *self.body.expr(cur) else {
+            return false;
+        };
+        let Some((param_local, ret_ty)) = self
+            .typed
+            .closures
+            .get(&cur)
+            .filter(|c| c.params.len() == 1 && c.captures.is_empty())
+            .map(|c| (c.params[0], c.ret))
+        else {
+            return false;
+        };
+        let param_ty = self.local_ty(param_local);
+        let Kind::Ref(_, inner_ty) = *self.cx.types.kind(param_ty) else {
+            return false;
+        };
+        let body = self.unwrap_parens_and_empty_blocks(body);
+        if matches!(
+            *self.cx.types.kind(inner_ty),
+            Kind::Ref(crate::sema::ty::Mut::Not, _)
+        ) {
+            if let Expr::Unary(crate::body::UnOp::Deref, inner) = *self.body.expr(body)
+                && self.expr_plain_local(inner) == Some(param_local)
+            {
+                return true;
+            }
+            let param_ids = self.body.list(params);
+            if param_ids.len() == 1
+                && let crate::body::Pat::Ref { pat: inner_pat, .. } =
+                    *self.body.pat(self.body.params[param_ids[0] as usize].pat)
+                && let Some(&bound) = self.typed.binds.get(&inner_pat)
+                && self.expr_plain_local(body) == Some(bound)
+            {
+                return true;
+            }
+        }
+        matches!(
+            *self.body.expr(body),
+            Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _)
+                if self.expr_plain_local(base) == Some(param_local)
+        ) && self.ty_is_copy(ret_ty)
+    }
 }
