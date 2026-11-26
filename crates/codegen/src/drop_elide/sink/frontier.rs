@@ -136,6 +136,89 @@ pub(crate) fn sink_frontier(
     )
 }
 
+pub(super) fn cycle_depths(func: &Function, cfg: &Cfg) -> Vec<u32> {
+    let n = func.blocks.len();
+    let mut depths = cfg.loops().depths.clone();
+    let mut seen = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    let mut stack = Vec::new();
+    for start in 0..n {
+        if !cfg.reachable[start] || seen[start] {
+            continue;
+        }
+        stack.push((start, false));
+        while let Some((u, done)) = stack.pop() {
+            if done {
+                order.push(u);
+                continue;
+            }
+            if std::mem::replace(&mut seen[u], true) {
+                continue;
+            }
+            stack.push((u, true));
+            for s in func.successors(Block(u as u32)) {
+                let si = s.index();
+                if cfg.reachable[si] && !seen[si] {
+                    stack.push((si, false));
+                }
+            }
+        }
+    }
+    let mut visited = vec![false; n];
+    let mut comp = Vec::new();
+    let mut rev_stack = Vec::new();
+    for &start in order.iter().rev() {
+        if visited[start] {
+            continue;
+        }
+        comp.clear();
+        visited[start] = true;
+        rev_stack.push(start);
+        while let Some(u) = rev_stack.pop() {
+            comp.push(u);
+            for &p in cfg.preds_of(Block(u as u32)) {
+                let pi = p.index();
+                if cfg.reachable[pi] && !visited[pi] {
+                    visited[pi] = true;
+                    rev_stack.push(pi);
+                }
+            }
+        }
+        let cyclic = comp.len() > 1
+            || func
+                .successors(Block(start as u32))
+                .any(|s| s.index() == start);
+        if cyclic {
+            for &u in &comp {
+                depths[u] = depths[u].max(1);
+            }
+        }
+    }
+    depths
+}
+
+pub(super) fn prune_redundant_frontier(
+    func: &Function,
+    cfg: &Cfg,
+    live_in: &[bool],
+    mut is_clean: impl FnMut(Block) -> bool,
+    frontier: &mut Vec<Block>,
+) {
+    loop {
+        let Some(pos) = frontier.iter().position(|&t| {
+            is_clean(t)
+                && func.successors(t).all(|s| {
+                    !cfg.reachable[s.index()]
+                        || !live_in[s.index()]
+                        || (s != t && frontier.contains(&s))
+                })
+        }) else {
+            break;
+        };
+        frontier.remove(pos);
+    }
+}
+
 pub(super) fn sink_frontier_or_solo(
     func: &Function,
     cfg: &Cfg,
@@ -397,4 +480,32 @@ fn sink_frontier_with_calls(
     }
     in_r.copy_from_slice(&cur);
     Some(frontier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::FunctionBuilder;
+    use crate::ir::{AbiParam, CallConv, Signature, Type};
+
+    #[test]
+    fn cycle_depths_does_not_merge_acyclic_diamond() {
+        let mut sig = Signature::new(CallConv::Native);
+        sig.params = vec![AbiParam::new(Type::I8)];
+        let mut func = Function::new(sig);
+        let mut b = FunctionBuilder::new(&mut func);
+        let b0 = b.create_block();
+        let b1 = b.create_block();
+        let b2 = b.create_block();
+        b.append_block_params_for_function_params(b0);
+        b.switch_to_block(b0);
+        let cond = b.block_params(b0)[0];
+        b.ins().brif(cond, b1, &[], b2, &[]);
+        b.switch_to_block(b2);
+        b.ins().jump(b1, &[]);
+        b.switch_to_block(b1);
+        b.ins().return_(&[]);
+        let cfg = func.cfg();
+        assert_eq!(cycle_depths(&func, &cfg), vec![0, 0, 0]);
+    }
 }

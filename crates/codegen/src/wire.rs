@@ -6,7 +6,7 @@ use crate::ir::{
 mod decode;
 mod encode;
 
-const FORMAT: u8 = 6;
+const FORMAT: u8 = 7;
 
 macro_rules! table {
     ($name:ident: $ty:ident = [$($variant:ident),* $(,)?]) => {
@@ -94,6 +94,7 @@ table!(TARGET_OPS: TargetOpId = [
     X64Pmaddubsw256,
     X64Pmaddwd256,
     X64Psadbw,
+    Arm64Sqdmulh,
 ]);
 table!(LANES: Lane = [I8, I16, I32, I64, F32, F64]);
 table!(CONVS: CallConv = [Internal, Native]);

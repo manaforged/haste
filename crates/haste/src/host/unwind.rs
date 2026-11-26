@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use haste_codegen::CodeUnwindDrop;
+use haste_codegen::{CodeUnwindDrop, Site};
 
 const DROP_ACTIVE: u8 = 1;
 const DROP_LINKED: u8 = 2;
@@ -30,11 +30,33 @@ struct JitUnwindDrop {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct JitUnwindSite {
+    ret_pc: usize,
+    handler_pc: usize,
+    frame_offset: usize,
+}
+
+const SAVED_REG_COUNT: usize = 18;
+type SavedRegs = [u64; SAVED_REG_COUNT];
+
+#[repr(C)]
+struct JitLand {
+    handler_pc: usize,
+    target_fp: usize,
+    target_sp: usize,
+    payload: *mut u8,
+    regs: SavedRegs,
+}
+
+#[repr(C)]
 struct SharedUnwindNode {
     next: usize,
     start: usize,
     end: usize,
     count: usize,
+    site_count: usize,
+    saved_regs: u32,
 }
 
 static JIT_UNWIND_HEAD: AtomicUsize = AtomicUsize::new(0);
@@ -55,16 +77,15 @@ pub(crate) fn clear_jit_unwind_head(head: usize) {
     }
 }
 
-/// Registers frame-table unwind drops in shared image memory so forked JIT children see late-compiled functions.
+/// Registers frame-table unwind drops, `TryCall` landing pads, and callee-saved register masks in shared image memory so forked JIT children see late-compiled functions.
 pub(crate) fn register_shared_drops(
     head: usize,
     alloc: impl FnOnce(usize) -> Option<usize>,
-    exec: usize,
-    len: usize,
-    drops: &[CodeUnwindDrop],
+    (exec, len): (usize, usize),
+    (drops, sites, saved_regs): (&[CodeUnwindDrop], &[Site], u32),
     symbols: &[u64],
 ) {
-    if head == 0 || drops.is_empty() || len == 0 {
+    if head == 0 || (drops.is_empty() && sites.is_empty() && saved_regs == 0) || len == 0 {
         return;
     }
     let resolved: Vec<JitUnwindDrop> = drops
@@ -79,12 +100,21 @@ pub(crate) fn register_shared_drops(
             })
         })
         .collect();
-    if resolved.is_empty() {
+    let resolved_sites: Vec<JitUnwindSite> = sites
+        .iter()
+        .map(|s| JitUnwindSite {
+            ret_pc: exec + s.ret as usize,
+            handler_pc: exec + s.handler as usize,
+            frame_offset: s.frame_offset as usize,
+        })
+        .collect();
+    if resolved.is_empty() && resolved_sites.is_empty() && saved_regs == 0 {
         return;
     }
     let header_bytes = size_of::<SharedUnwindNode>();
-    let total_bytes = header_bytes + resolved.len() * size_of::<JitUnwindDrop>();
-    let Some(mem) = alloc(total_bytes) else {
+    let drops_bytes = resolved.len() * size_of::<JitUnwindDrop>();
+    let sites_bytes = resolved_sites.len() * size_of::<JitUnwindSite>();
+    let Some(mem) = alloc(header_bytes + drops_bytes + sites_bytes) else {
         return;
     };
     let head_atom = head as *const AtomicUsize;
@@ -92,10 +122,14 @@ pub(crate) fn register_shared_drops(
     unsafe {
         let drops_dst = (mem + header_bytes) as *mut JitUnwindDrop;
         std::ptr::copy_nonoverlapping(resolved.as_ptr(), drops_dst, resolved.len());
+        let sites_dst = (mem + header_bytes + drops_bytes) as *mut JitUnwindSite;
+        std::ptr::copy_nonoverlapping(resolved_sites.as_ptr(), sites_dst, resolved_sites.len());
         let node = mem as *mut SharedUnwindNode;
         (*node).start = exec;
         (*node).end = exec + len;
         (*node).count = resolved.len();
+        (*node).site_count = resolved_sites.len();
+        (*node).saved_regs = saved_regs;
         let mut old = (*head_atom).load(Ordering::Acquire);
         loop {
             (*node).next = old;
@@ -108,7 +142,7 @@ pub(crate) fn register_shared_drops(
     }
 }
 
-fn lookup_jit_drops(call_pc: usize) -> Option<&'static [JitUnwindDrop]> {
+fn find_jit_node<T>(mut visit: impl FnMut(usize, &SharedUnwindNode) -> Option<T>) -> Option<T> {
     let head = JIT_UNWIND_HEAD.load(Ordering::Acquire);
     if head == 0 {
         return None;
@@ -118,14 +152,45 @@ fn lookup_jit_drops(call_pc: usize) -> Option<&'static [JitUnwindDrop]> {
         let mut cur = (*(head as *const AtomicUsize)).load(Ordering::Acquire);
         while cur != 0 {
             let node = &*(cur as *const SharedUnwindNode);
-            if node.start <= call_pc && call_pc < node.end {
-                let ptr = (cur + size_of::<SharedUnwindNode>()) as *const JitUnwindDrop;
-                return Some(std::slice::from_raw_parts(ptr, node.count));
+            if let Some(hit) = visit(cur, node) {
+                return Some(hit);
             }
             cur = node.next;
         }
     }
     None
+}
+
+fn lookup_jit_frame(call_pc: usize) -> Option<(&'static [JitUnwindDrop], u32)> {
+    find_jit_node(|cur, node| {
+        if !(node.start <= call_pc && call_pc < node.end) {
+            return None;
+        }
+        let drops = if node.count > 0 {
+            let ptr = (cur + size_of::<SharedUnwindNode>()) as *const JitUnwindDrop;
+            // SAFETY: `node.count` `JitUnwindDrop` entries immediately follow `node` in the arena.
+            unsafe { std::slice::from_raw_parts(ptr, node.count) }
+        } else {
+            &[]
+        };
+        Some((drops, node.saved_regs))
+    })
+}
+
+fn lookup_jit_site(ret_pc: usize) -> Option<(usize, usize)> {
+    find_jit_node(|cur, node| {
+        if !(node.site_count > 0 && node.start <= ret_pc && ret_pc <= node.end) {
+            return None;
+        }
+        let base = cur + size_of::<SharedUnwindNode>() + node.count * size_of::<JitUnwindDrop>();
+        // SAFETY: `node.site_count` `JitUnwindSite` entries follow the drops slice in the arena.
+        let slice =
+            unsafe { std::slice::from_raw_parts(base as *const JitUnwindSite, node.site_count) };
+        slice
+            .iter()
+            .find(|s| s.ret_pc == ret_pc)
+            .map(|s| (s.handler_pc, s.frame_offset))
+    })
 }
 
 /// Intrusive stack-allocated cleanup node linked onto the thread's unwind drop list while an owned value is live.
@@ -255,12 +320,12 @@ unsafe fn drain_drops_until(mark: *mut DropNode, limit_addr: usize) {
     }
 }
 
-/// Runs registered frame-table drop entries for the JIT frame at `fp` and return site `call_pc`.
+/// Runs registered frame-table drop entries and restores callee-saved registers for the JIT frame at `fp` and `call_pc`.
 ///
 /// # Safety
 /// `fp` must be a live JIT frame pointer matching the layout recorded for `call_pc`.
-unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize) {
-    let Some(drops) = lookup_jit_drops(call_pc) else {
+unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize, regs: Option<&mut SavedRegs>) {
+    let Some((drops, saved_regs)) = lookup_jit_frame(call_pc) else {
         return;
     };
     for d in drops.iter().rev() {
@@ -284,19 +349,44 @@ unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize) {
             }
         }
     }
+    if let Some(regs) = regs {
+        let mut mask = saved_regs;
+        let mut bit = 0usize;
+        let mut k = 0usize;
+        while mask != 0 && bit < regs.len() {
+            if (mask & 1) != 0 {
+                k += 1;
+                // SAFETY: prologue saved the `k`-th callee-saved register at `fp - k * 8`.
+                regs[bit] = unsafe { *((fp - k * 8) as *const u64) };
+            }
+            mask >>= 1;
+            bit += 1;
+        }
+    }
 }
 
-/// Walks active JIT frames up to `stop_fp` and drains interleaved linked drop nodes down to `mark`.
+/// Walks active JIT frames looking for a `TryCall` handler or `stop_fp`, draining interleaved drops.
 ///
 /// # Safety
-/// `fp`, `stop_fp`, and `mark` must bound active frames on the current thread's stack above `catch_unwind`.
-unsafe fn drain_jit_frames(mut fp: usize, mut ret_pc: usize, stop_fp: usize, mark: *mut DropNode) {
+/// `fp`, `stop_fp`, and `mark` must bound active frames on the current thread's stack.
+unsafe fn unwind_jit_frames(
+    (mut fp, mut ret_pc): (usize, usize),
+    (stop_fp, mark): (usize, *mut DropNode),
+    mut regs: Option<&mut SavedRegs>,
+) -> Option<(usize, usize, usize)> {
     while fp != 0 && (stop_fp == 0 || fp < stop_fp) {
-        // SAFETY: `mark` and `fp` bound active stack frames between the panic site and `catch_unwind`.
+        // SAFETY: `fp` and `mark` bound active stack frames between the panic site and the catcher.
         unsafe {
+            if ret_pc > 0
+                && let Some((handler_pc, frame_offset)) = lookup_jit_site(ret_pc)
+            {
+                let target_sp = fp.wrapping_sub(frame_offset);
+                drain_drops_until(std::ptr::null_mut(), target_sp);
+                return Some((handler_pc, fp, target_sp));
+            }
             drain_drops_until(mark, fp);
             if ret_pc > 0 {
-                run_jit_frame_drops(fp, ret_pc - 1);
+                run_jit_frame_drops(fp, ret_pc - 1, regs.as_deref_mut());
             }
             let prev_fp = *(fp as *const usize);
             let prev_ret = *((fp + 8) as *const usize);
@@ -307,8 +397,11 @@ unsafe fn drain_jit_frames(mut fp: usize, mut ret_pc: usize, stop_fp: usize, mar
             ret_pc = prev_ret;
         }
     }
-    // SAFETY: drains any remaining linked drop guards above `mark`.
-    unsafe { drain_drops_until(mark, 0) };
+    if stop_fp != 0 {
+        // SAFETY: drains any remaining linked drop guards above `mark`.
+        unsafe { drain_drops_until(mark, 0) };
+    }
+    None
 }
 
 /// Runs `try_fn(data)` inside a thread-local unwind frame; on panic, drains unwound `Drop` guards, runs `catch_fn(data, payload)`, and returns `1`, else `0`.
@@ -344,20 +437,37 @@ extern "C" fn start_panic_inner(
     payload_vtable: usize,
     caller_fp: usize,
     caller_ret_pc: usize,
+    land_out: *mut JitLand,
 ) -> u32 {
     let frame = CURRENT_FRAME.get();
-    if frame.is_null() {
-        std::process::abort();
-    }
-    // SAFETY: frame points to a live UnwindFrame on an enclosing catch_unwind stack frame on this thread.
+    // SAFETY: `payload_vtable` points to a valid `dyn BoxMeUp` vtable; `frame` (if non-null) is live on stack.
     unsafe {
-        CURRENT_FRAME.set((*frame).prev);
         let take_box_ptr = *(payload_vtable as *const usize).add(3);
         let take_box: extern "C" fn(usize) -> FatPtr =
             std::mem::transmute::<usize, _>(take_box_ptr);
         let boxed = take_box(payload_data);
-        (*frame).payload = Box::into_raw(Box::new(boxed)).cast::<u8>();
-        drain_jit_frames(caller_fp, caller_ret_pc, (*frame).stop_fp, (*frame).drops);
+        let payload = Box::into_raw(Box::new(boxed)).cast::<u8>();
+        let (stop_fp, mark) = if frame.is_null() {
+            (0, std::ptr::null_mut())
+        } else {
+            ((*frame).stop_fp, (*frame).drops)
+        };
+        let regs = (!land_out.is_null()).then(|| &mut (*land_out).regs);
+        if let Some((handler_pc, target_fp, target_sp)) =
+            unwind_jit_frames((caller_fp, caller_ret_pc), (stop_fp, mark), regs)
+            && !land_out.is_null()
+        {
+            (*land_out).handler_pc = handler_pc;
+            (*land_out).target_fp = target_fp;
+            (*land_out).target_sp = target_sp;
+            (*land_out).payload = payload;
+            return 0;
+        }
+        if frame.is_null() {
+            std::process::abort();
+        }
+        CURRENT_FRAME.set((*frame).prev);
+        (*frame).payload = payload;
         longjmp(&raw mut (*frame).env, 1)
     }
 }
@@ -380,9 +490,39 @@ macro_rules! start_panic_label {
 std::arch::global_asm!(
     start_panic_label!(),
     "stp x29, x30, [sp, #-16]!",
+    "sub sp, sp, #176",
+    "stp x19, x20, [sp, #32]",
+    "stp x21, x22, [sp, #48]",
+    "stp x23, x24, [sp, #64]",
+    "stp x25, x26, [sp, #80]",
+    "stp x27, x28, [sp, #96]",
+    "stp d8, d9, [sp, #112]",
+    "stp d10, d11, [sp, #128]",
+    "stp d12, d13, [sp, #144]",
+    "stp d14, d15, [sp, #160]",
     "mov x2, x29",
     "mov x3, x30",
+    "mov x4, sp",
+    "str xzr, [sp]",
     "bl {inner}",
+    "ldr x9, [sp]",
+    "cbz x9, 2f",
+    "ldr x29, [sp, #8]",
+    "ldr x10, [sp, #16]",
+    "ldr x0, [sp, #24]",
+    "ldp x19, x20, [sp, #32]",
+    "ldp x21, x22, [sp, #48]",
+    "ldp x23, x24, [sp, #64]",
+    "ldp x25, x26, [sp, #80]",
+    "ldp x27, x28, [sp, #96]",
+    "ldp d8, d9, [sp, #112]",
+    "ldp d10, d11, [sp, #128]",
+    "ldp d12, d13, [sp, #144]",
+    "ldp d14, d15, [sp, #160]",
+    "mov sp, x10",
+    "br x9",
+    "2:",
+    "add sp, sp, #176",
     "ldp x29, x30, [sp], #16",
     "ret",
     inner = sym start_panic_inner,
@@ -392,9 +532,32 @@ std::arch::global_asm!(
 std::arch::global_asm!(
     start_panic_label!(),
     "push rbp",
+    "sub rsp, 176",
+    "mov [rsp + 32], rbx",
+    "mov [rsp + 40], r12",
+    "mov [rsp + 48], r13",
+    "mov [rsp + 56], r14",
+    "mov [rsp + 64], r15",
     "mov rdx, rbp",
-    "mov rcx, [rsp + 8]",
+    "mov rcx, [rsp + 184]",
+    "mov r8, rsp",
+    "mov qword ptr [rsp], 0",
     "call {inner}",
+    "mov r11, [rsp]",
+    "test r11, r11",
+    "jz 2f",
+    "mov rbp, [rsp + 8]",
+    "mov rcx, [rsp + 16]",
+    "mov rax, [rsp + 24]",
+    "mov rbx, [rsp + 32]",
+    "mov r12, [rsp + 40]",
+    "mov r13, [rsp + 48]",
+    "mov r14, [rsp + 56]",
+    "mov r15, [rsp + 64]",
+    "mov rsp, rcx",
+    "jmp r11",
+    "2:",
+    "add rsp, 176",
     "pop rbp",
     "ret",
     inner = sym start_panic_inner,
@@ -404,11 +567,12 @@ std::arch::global_asm!(
 std::arch::global_asm!(
     start_panic_label!(),
     "push rbp",
-    "sub rsp, 32",
+    "sub rsp, 48",
     "mov r8, rbp",
-    "mov r9, [rsp + 40]",
+    "mov r9, [rsp + 56]",
+    "mov qword ptr [rsp + 32], 0",
     "call {inner}",
-    "add rsp, 32",
+    "add rsp, 48",
     "pop rbp",
     "ret",
     inner = sym start_panic_inner,
@@ -430,7 +594,7 @@ pub fn start_panic_addr() -> usize {
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn start_panic_addr() -> usize {
     extern "C" fn fallback(payload_data: usize, payload_vtable: usize) -> u32 {
-        start_panic_inner(payload_data, payload_vtable, 0, 0)
+        start_panic_inner(payload_data, payload_vtable, 0, 0, std::ptr::null_mut())
     }
     fallback as *const () as usize
 }

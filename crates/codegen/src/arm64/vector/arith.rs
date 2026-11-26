@@ -121,6 +121,9 @@ impl Emit<'_> {
             Binary::Band | Binary::Bor | Binary::Bxor => self.vec_bitwise(spec, op, dst, a, b),
             Binary::Iadd | Binary::Isub => self.vec_add_sub(spec, op == Binary::Isub, dst, a, b),
             Binary::Imul => self.vec_imul(spec, dst, a, b),
+            Binary::Umulhi | Binary::Smulhi if spec.lane == Lane::I16 => {
+                self.vec_mulhi_i16(spec, op == Binary::Umulhi, dst, a, b);
+            }
             Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => {
                 self.vec_minmax_int(spec, op, dst, a, b);
             }
@@ -179,6 +182,19 @@ impl Emit<'_> {
         self.asm.fmov_in(true, dst, D);
         if spec.count == 2 {
             self.ins_gpr(dst, 3, 1, S);
+        }
+    }
+
+    fn vec_mulhi_i16(&mut self, spec: VecSpec, unsigned: bool, dst: Vreg, a: Vreg, b: Vreg) {
+        let u = u32::from(unsigned) << 29;
+        self.clobber_vreg(V2);
+        self.asm.vbit(0x0E60_C000 | u, V2, a, b);
+        if spec.q == 1 {
+            self.clobber_vreg(V3);
+            self.asm.vbit(0x4E60_C000 | u, V3, a, b);
+            self.asm.vbit(0x4E40_5800, dst, V2, V3);
+        } else {
+            self.asm.vbit(0x4E40_5800, dst, V2, V2);
         }
     }
 

@@ -352,7 +352,13 @@ impl Image {
             (&roots, &canon),
             &mut exe,
         )?;
-        icf::emit_unwind_table(&state, &live, (&roots, &canon), &fn_offs, &mut exe);
+        icf::emit_unwind_table(
+            &state,
+            &live,
+            (&roots, &canon),
+            (&fn_offs, &dict_bodies),
+            &mut exe,
+        );
         patch_vtables(
             &state,
             &vmask,

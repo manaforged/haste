@@ -164,6 +164,17 @@ impl Emit<'_> {
         args: TinyArgs,
         result: Value,
     ) -> Result<(), String> {
+        if id == TargetOpId::Arm64Sqdmulh {
+            let spec = VecSpec::of(self.ty(result))?;
+            let args = args.as_slice();
+            let dst = self.fdst(result);
+            let a = self.fin(args[0], V0);
+            let b = self.fin(args[1], V1);
+            self.asm
+                .vbit(0x0E20_B400 | (spec.q << 30) | (spec.size << 22), dst, a, b);
+            self.fput(result, dst);
+            return Ok(());
+        }
         let Some(desc) = ARM64_TARGET_OPS.iter().find(|d| d.id == id) else {
             return Err(format!("unsupported ARM64 target op {id:?}"));
         };

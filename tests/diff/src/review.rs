@@ -215,10 +215,134 @@ pub fn case_rev_arc_reborrow_and_refcell_unsize(seed: i64) -> i64 {
     r1 * 1000 + r2 * 100 + r3 * 10000 + slice_len * 10 + slice_sum + dyn_val
 }
 
+struct TlsDropGuard<'a>(&'a mut i64);
+
+impl Drop for TlsDropGuard<'_> {
+    fn drop(&mut self) {
+        *self.0 += 1;
+    }
+}
+
+#[inline(never)]
+fn tls_init_unwind_body(trigger: bool, drops: &mut i64) -> i64 {
+    thread_local! {
+        static PANIC_TLS: std::cell::Cell<i64> = {
+            panic!("tls init boom");
+        };
+    }
+    let guard = TlsDropGuard(drops);
+    let mut out = 0;
+    if trigger {
+        out = PANIC_TLS.with(|c| c.get());
+    }
+    std::mem::forget(guard);
+    out
+}
+
+pub fn case_rev_thread_local_init_panic_drop(seed: i64) -> i64 {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (drops, caught) = std::thread::spawn(move || {
+        let mut drops = 0_i64;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            black_box(tls_init_unwind_body(black_box(true), &mut drops));
+        }))
+        .is_err();
+        (drops, i64::from(caught))
+    })
+    .join()
+    .unwrap_or((-1, -1));
+    std::panic::set_hook(prev);
+    let no_trigger_drops = {
+        let mut d = 0_i64;
+        black_box(tls_init_unwind_body(black_box(false), &mut d));
+        d
+    };
+    drops * 100 + caught * 10 + no_trigger_drops * 1000 + (seed & 7)
+}
+
+#[repr(C)]
+struct LatchState {
+    flag: i64,
+    a: i64,
+    b: i64,
+}
+
+#[inline(never)]
+fn cold_latch_step(a: &mut i64, b: &mut i64) -> i64 {
+    *a = a.wrapping_add(3);
+    *b = b.wrapping_add(5);
+    *a ^ *b
+}
+
+#[inline(never)]
+fn licm_cold_latch_inner(st: &mut LatchState, limit: i64) -> i64 {
+    let mut acc = 0_i64;
+    loop {
+        if st.flag >= limit {
+            return acc.wrapping_add(st.a).wrapping_add(st.b);
+        }
+        acc = acc.wrapping_add(cold_latch_step(&mut st.a, &mut st.b));
+        st.flag += 1;
+    }
+}
+
+pub fn case_rev_licm_cold_latch(seed: i64) -> i64 {
+    let mut st = LatchState { flag: 0, a: seed, b: seed.wrapping_add(11) };
+    let limit = (seed.unsigned_abs() % 4) as i64;
+    licm_cold_latch_inner(black_box(&mut st), black_box(limit))
+}
+
+struct CmpPanic(i64);
+
+impl PartialEq for CmpPanic {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Drop for CmpPanic {
+    fn drop(&mut self) {
+        if self.0 < 0 {
+            panic!("cmp drop");
+        }
+    }
+}
+
+#[inline(never)]
+fn cmp_drop_callee(a: CmpPanic, b: CmpPanic) -> bool {
+    a == b
+}
+
+#[inline(never)]
+fn cmp_drop_caller(trigger: bool, drops: &mut i64) -> bool {
+    let _g = TlsDropGuard(drops);
+    let a = CmpPanic(if trigger { -1 } else { 1 });
+    let b = CmpPanic(1);
+    cmp_drop_callee(a, b)
+}
+
+pub fn case_rev_cmp_drop_unwind(seed: i64) -> i64 {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut drops = 0_i64;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        black_box(cmp_drop_caller(black_box(true), &mut drops));
+    }))
+    .is_err();
+    std::panic::set_hook(prev);
+    let mut ok_drops = 0_i64;
+    let eq = cmp_drop_caller(black_box(false), &mut ok_drops);
+    drops * 100 + i64::from(caught) * 10 + ok_drops * 1000 + i64::from(eq) + (seed & 3)
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_rev_bitmask_switch", case_rev_bitmask_switch),
     ("case_rev_u64_consts_and_ptr_cast", case_rev_u64_consts_and_ptr_cast),
     ("case_rev_str_cmp_and_unicode_upper", case_rev_str_cmp_and_unicode_upper),
     ("case_rev_stringify_and_track_caller", case_rev_stringify_and_track_caller),
     ("case_rev_arc_reborrow_and_refcell_unsize", case_rev_arc_reborrow_and_refcell_unsize),
+    ("case_rev_thread_local_init_panic_drop", case_rev_thread_local_init_panic_drop),
+    ("case_rev_licm_cold_latch", case_rev_licm_cold_latch),
+    ("case_rev_cmp_drop_unwind", case_rev_cmp_drop_unwind),
 ];

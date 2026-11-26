@@ -39,12 +39,13 @@ use haste_codegen::Code;
 use consumers::{CONSUMER_REC_LEN, Consumer};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 27;
+const VERSION: u32 = 28;
 const HEADER_LEN: usize = 72;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 80;
 const STENCIL_BLOB_AT: [usize; 6] = [24, 32, 40, 48, 56, 64];
 const STENCIL_LAST_USED_AT: usize = 72;
+const STENCIL_SAVED_REGS_AT: usize = 76;
 const INSTANCE_REC_LEN: usize = 24;
 
 #[derive(Clone, Copy, Debug)]
@@ -218,6 +219,7 @@ impl Substrate {
             plan: blob(plan)?,
             loops: blob(loops)?,
             unwind_drops: blob(unwind_drops)?,
+            saved_regs: read_u32(data, rec + STENCIL_SAVED_REGS_AT),
         })
     }
 
@@ -290,6 +292,7 @@ struct PendingStencil {
     unwind_off: u32,
     unwind_len: u32,
     last_used: Option<u32>,
+    saved_regs: u32,
 }
 
 struct PendingInstance {
@@ -415,6 +418,7 @@ impl SubstrateBuilder {
             unwind_off,
             unwind_len,
             last_used,
+            saved_regs: slice.saved_regs,
         });
         Ok(())
     }
@@ -446,6 +450,7 @@ impl SubstrateBuilder {
                 plan,
                 loops: &loops,
                 unwind_drops: &unwind_drops,
+                saved_regs: code.saved_regs(),
             },
             None,
         )

@@ -428,6 +428,7 @@ pub(in super::super) fn fuse(
     );
     super::sib::fuse_bt_shifts(func, plan, (&info.uses, &info.pos_of), &tst_end, &pure_test);
     loads::fold_products(func, plan, &info.uses, &info.defs);
+    super::elide_shift_splats(func, plan, &info.defs, &info.uses);
     if features.avx2 {
         super::elide_broadcast_inserts(
             func,

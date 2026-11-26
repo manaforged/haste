@@ -1,8 +1,10 @@
+use rustc_hash::FxHashMap;
+
 use super::bounds::{sext_candidate, u_bounds};
 use super::{RangeState, const_val, def_inst};
 use crate::cfg::Cfg;
 use crate::fold::{defs, extend};
-use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
 #[derive(Clone, Copy)]
 struct UseSite {
@@ -307,13 +309,203 @@ fn can_narrow_guarded(
     })
 }
 
+enum SubUse {
+    Cmp {
+        inst: Inst,
+        cc: IntCC,
+        imm: u64,
+        swapped: bool,
+    },
+    Uext64(Inst),
+    Uext32(Value),
+}
+
+struct NarrowSub {
+    block: usize,
+    pos: usize,
+    lhs: Value,
+    sub_c: u64,
+    uses: Vec<SubUse>,
+}
+
+fn narrow_sub_candidate(
+    func: &Function,
+    state: &RangeState,
+    inst: Inst,
+) -> Option<(Value, Value, u64, u64)> {
+    let data = &func.insts[inst.index()];
+    let res = data.result?;
+    let ty = func.ty(res);
+    if !matches!(ty, Type::I8 | Type::I16) {
+        return None;
+    }
+    let Op::Binary(Binary::Isub, lhs, rhs) = data.op else {
+        return None;
+    };
+    let c = extend(const_val(state, rhs)?, ty, false) as u64;
+    let span = 1_u64 << ty.bits();
+    if c == 0 || c >= span {
+        return None;
+    }
+    Some((res, lhs, c, span - c))
+}
+
+fn classify_sub_use(
+    func: &Function,
+    state: &RangeState,
+    ctx: &GuardCtx,
+    site: UseSite,
+    (def_block, res, wrap_floor): (Block, Value, u64),
+) -> Option<SubUse> {
+    if site.branch_target.is_some() {
+        return None;
+    }
+    let data = &func.insts[site.inst.index()];
+    match data.op {
+        Op::Icmp(orig_cc, l, r) => {
+            let (cc, imm) = cmp_operand_const(func, state, site.inst, res)?;
+            if !(guard_proves_cmp(cc, imm, wrap_floor)
+                || guard_proves_cmp(cc.inverse(), imm, wrap_floor))
+            {
+                return None;
+            }
+            Some(SubUse::Cmp {
+                inst: site.inst,
+                cc: orig_cc,
+                imm,
+                swapped: r == res && l != res,
+            })
+        }
+        Op::Convert(Convert::Uextend, inner) if inner == res => {
+            let dst = data.result?;
+            let dst_ty = func.ty(dst);
+            if !matches!(dst_ty, Type::I32 | Type::I64)
+                || !is_guarded_use(func, state, ctx, site, (def_block, (res, wrap_floor)))
+            {
+                return None;
+            }
+            Some(if dst_ty == Type::I64 {
+                SubUse::Uext64(site.inst)
+            } else {
+                SubUse::Uext32(dst)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn collect_narrow_subs(func: &Function, state: &RangeState, ctx: &GuardCtx) -> Vec<NarrowSub> {
+    let mut plan = Vec::new();
+    for b_idx in 0..func.blocks.len() {
+        if !ctx.cfg.reachable[b_idx] {
+            continue;
+        }
+        let def_block = Block(b_idx as u32);
+        for (pos, &inst) in func.blocks[b_idx].insts.iter().enumerate() {
+            let Some((res, lhs, sub_c, wrap_floor)) = narrow_sub_candidate(func, state, inst)
+            else {
+                continue;
+            };
+            let sites = ctx.uses(res);
+            if sites.len() < 2 {
+                continue;
+            }
+            let mut uses = Vec::with_capacity(sites.len());
+            let mut has_uext = false;
+            let mut ok = true;
+            for &site in sites {
+                let Some(u) =
+                    classify_sub_use(func, state, ctx, site, (def_block, res, wrap_floor))
+                else {
+                    ok = false;
+                    break;
+                };
+                has_uext |= !matches!(u, SubUse::Cmp { .. });
+                uses.push(u);
+            }
+            if ok && has_uext {
+                plan.push(NarrowSub {
+                    block: b_idx,
+                    pos,
+                    lhs,
+                    sub_c,
+                    uses,
+                });
+            }
+        }
+    }
+    plan
+}
+
+fn apply_narrow_subs(func: &mut Function, plan: Vec<NarrowSub>) -> bool {
+    if plan.is_empty() {
+        return false;
+    }
+    let mut by_block: FxHashMap<usize, Vec<NarrowSub>> = FxHashMap::default();
+    for item in plan {
+        by_block.entry(item.block).or_default().push(item);
+    }
+    let mut repl: FxHashMap<Value, Value> = FxHashMap::default();
+    for (b_idx, items) in by_block {
+        let mut at = 0;
+        let orig = std::mem::take(&mut func.blocks[b_idx].insts);
+        let mut next = Vec::with_capacity(orig.len() + items.len() * 4);
+        for (pos, inst) in orig.into_iter().enumerate() {
+            if at < items.len() && items[at].pos == pos {
+                let item = &items[at];
+                let x32 = func.value(Type::I32);
+                let c32 = func.value(Type::I32);
+                let d32 = func.value(Type::I32);
+                next.push(func.add(Op::Convert(Convert::Uextend, item.lhs), Some(x32)));
+                next.push(func.add(Op::Const(item.sub_c as i64), Some(c32)));
+                next.push(func.add(Op::Binary(Binary::Isub, x32, c32), Some(d32)));
+                for u in &item.uses {
+                    match *u {
+                        SubUse::Cmp {
+                            inst: c_inst,
+                            cc,
+                            imm,
+                            swapped,
+                        } => {
+                            let k32 = func.value(Type::I32);
+                            next.push(func.add(Op::Const(imm as i64), Some(k32)));
+                            func.insts[c_inst.index()].op = if swapped {
+                                Op::Icmp(cc, k32, d32)
+                            } else {
+                                Op::Icmp(cc, d32, k32)
+                            };
+                        }
+                        SubUse::Uext64(u_inst) => {
+                            func.insts[u_inst.index()].op = Op::Convert(Convert::Uextend, d32);
+                        }
+                        SubUse::Uext32(dst) => {
+                            repl.insert(dst, d32);
+                        }
+                    }
+                }
+                at += 1;
+            }
+            next.push(inst);
+        }
+        func.blocks[b_idx].insts = next;
+    }
+    if !repl.is_empty() {
+        for block in &func.blocks {
+            for &inst in &block.insts {
+                func.insts[inst.index()]
+                    .op
+                    .map_operands(|v| repl.get(&v).copied().unwrap_or(v));
+            }
+        }
+    }
+    true
+}
+
 pub(super) fn fold_guarded_sext(func: &mut Function, state: &mut RangeState) -> bool {
-    let has_sext = func
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .any(|&inst| sext_candidate(func, inst).is_some());
-    if !has_sext {
+    let has_work = func.blocks.iter().flat_map(|b| &b.insts).any(|&inst| {
+        sext_candidate(func, inst).is_some() || narrow_sub_candidate(func, state, inst).is_some()
+    });
+    if !has_work {
         return false;
     }
     state.defs = defs(func);
@@ -334,5 +526,7 @@ pub(super) fn fold_guarded_sext(func: &mut Function, state: &mut RangeState) -> 
             }
         }
     }
+    let subs = collect_narrow_subs(func, state, &ctx);
+    changed |= apply_narrow_subs(func, subs);
     changed
 }

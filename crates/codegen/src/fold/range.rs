@@ -342,6 +342,8 @@ fn fuse_cmp_pair(is_and: bool, ty: Type, p1: (IntCC, i64), p2: (IntCC, i64)) -> 
 
 fn has_candidate(func: &Function) -> bool {
     let mut is_cmp = vec![false; func.types.len()];
+    let mut has_narrow_sub = false;
+    let mut has_narrow_uext = false;
     for data in func
         .blocks
         .iter()
@@ -352,6 +354,22 @@ fn has_candidate(func: &Function) -> bool {
             && func.ty(inner).is_small_int()
             && func.ty(inner) != Type::I64
         {
+            return true;
+        }
+        if let Op::Binary(Binary::Isub, lhs, _) = data.op
+            && matches!(func.ty(lhs), Type::I8 | Type::I16)
+        {
+            has_narrow_sub = true;
+        }
+        if let Op::Convert(Convert::Uextend, inner) = data.op
+            && matches!(func.ty(inner), Type::I8 | Type::I16)
+            && data
+                .result
+                .is_some_and(|r| matches!(func.ty(r), Type::I32 | Type::I64))
+        {
+            has_narrow_uext = true;
+        }
+        if has_narrow_sub && has_narrow_uext {
             return true;
         }
         if let (&Op::Icmp(_, l, _), Some(res)) = (&data.op, data.result)

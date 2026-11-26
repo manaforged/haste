@@ -49,6 +49,8 @@ pub(super) fn elide_moves(func: &mut Function, prov: &Provenance) -> bool {
             .align_shift
             .max(func.slots[from.index()].align_shift);
         func.slots[from.index()].align_shift = align;
+        let poll_local = func.slots[to.index()].poll_local;
+        func.slots[from.index()].poll_local &= poll_local;
         dead.push(site);
     }
     if dead.is_empty() {

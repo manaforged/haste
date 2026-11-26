@@ -122,6 +122,7 @@ pub struct Code {
     loops: Vec<Range<u32>>,
     lines: Vec<(u32, u64)>,
     unwind_drops: Vec<CodeUnwindDrop>,
+    saved_regs: u32,
 }
 
 impl Code {
@@ -139,6 +140,7 @@ impl Code {
             loops,
             lines: Vec::new(),
             unwind_drops: Vec::new(),
+            saved_regs: 0,
         }
     }
 
@@ -146,6 +148,17 @@ impl Code {
     pub fn with_unwind_drops(mut self, unwind_drops: Vec<CodeUnwindDrop>) -> Self {
         self.unwind_drops = unwind_drops;
         self
+    }
+
+    /// Attaches the canonical bitmask of callee-saved registers saved in this function's prologue.
+    pub fn with_saved_regs(mut self, saved_regs: u32) -> Self {
+        self.saved_regs = saved_regs;
+        self
+    }
+
+    /// Canonical bitmask of callee-saved registers saved in this function's prologue.
+    pub fn saved_regs(&self) -> u32 {
+        self.saved_regs
     }
 
     /// Frame-relative unwind drop descriptors emitted for this function.

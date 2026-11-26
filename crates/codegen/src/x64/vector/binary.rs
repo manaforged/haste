@@ -1,6 +1,6 @@
 use super::{float_vec_opcode, is_commutative, shift_count_opcode, vec_alu_opcode, vec_prefix};
 use crate::frame::Ext;
-use crate::ir::{Binary, IntCC, Lane, Op, ShuffleMask, Value};
+use crate::ir::{Binary, IntCC, Lane, Value};
 use crate::x64::Emit;
 use crate::x64::asm::{Alu, Reg, Xmm};
 use crate::x64::float::{X0, X1, X2};
@@ -248,22 +248,7 @@ impl Emit<'_> {
     }
 
     pub(in crate::x64) fn splat_source(&self, v: Value, count: u8) -> Option<Value> {
-        let inst = self.defs.get(v.index()).copied().flatten()?;
-        let Op::Shuffle(a, _, ShuffleMask::Const(m)) = &self.func.insts[inst.index()].op else {
-            return None;
-        };
-        let c = usize::from(count);
-        if !m[..c]
-            .iter()
-            .all(|&idx| idx == m[0] && usize::from(idx) < c)
-        {
-            return None;
-        }
-        let a_inst = self.defs.get(a.index()).copied().flatten()?;
-        match self.func.insts[a_inst.index()].op {
-            Op::Insert(_, scalar, idx) if idx == m[0] => Some(scalar),
-            _ => None,
-        }
+        super::splat_source_of(self.func, &self.defs, v, count)
     }
 
     fn vector_shift(
@@ -284,7 +269,7 @@ impl Emit<'_> {
             self.fput(result, dst);
             return Ok(());
         }
-        if matches!(lane, Lane::I16 | Lane::I32) || (lane == Lane::I64 && op != Binary::Sshr) {
+        if super::uniform_shift_lane(op, lane) {
             if let Some(scalar_v) = self.splat_source(y, count) {
                 if let Some(imm) = self.const_of(scalar_v) {
                     let k = ((imm as u32) & (lane.bits() - 1)) as u8;

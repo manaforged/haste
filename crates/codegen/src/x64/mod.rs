@@ -130,7 +130,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         (vec![None; func.types.len()], vec![false; func.types.len()])
     };
     let tail_calls = if full {
-        crate::frame::find_tail_calls(func, &plan, &abi, true, &|sig| classify(sig, abi_kind))
+        crate::frame::find_tail_calls(func, &plan, &abi, &|sig| classify(sig, abi_kind))
     } else {
         Vec::new()
     };

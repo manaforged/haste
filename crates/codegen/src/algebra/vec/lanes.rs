@@ -361,6 +361,66 @@ fn insert_as_shuffle(
     s0.map(|a| Op::Shuffle(a, s1.unwrap_or(a), ShuffleMask::Const(mask)))
 }
 
+fn peel_bitcast(cx: &RewriteCx, mut v: Value, bytes: u32) -> Value {
+    for _ in 0..4 {
+        if let Some(&Op::Convert(Convert::Bitcast, inner)) = cx.op(v)
+            && cx.func.ty(inner).bytes() == bytes
+        {
+            v = inner;
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+fn half64_source(cx: &RewriteCx, v: Value) -> Option<(Value, u8)> {
+    let inner = peel_bitcast(cx, v, 8);
+    let &Op::Extract(src, idx) = cx.op(inner)? else {
+        return None;
+    };
+    let (lane, count) = cx.func.ty(src).vec_shape()?;
+    (lane.bytes() == 8 && count == 2 && idx < 2).then(|| (peel_bitcast(cx, src, 16), idx))
+}
+
+fn merge_half_mulhi(cx: &mut RewriteCx, v0: Value, v1: Value) -> Option<Op> {
+    let (lo, hi) = (peel_bitcast(cx, v0, 8), peel_bitcast(cx, v1, 8));
+    let (&Op::Binary(op @ (Binary::Umulhi | Binary::Smulhi), a0, b0), &Op::Binary(op2, a1, b1)) =
+        (cx.op(lo)?, cx.op(hi)?)
+    else {
+        return None;
+    };
+    let half_ty = Type::Vec {
+        lane: Lane::I16,
+        count: 4,
+    };
+    if op != op2 || cx.func.ty(lo) != half_ty || cx.func.ty(hi) != half_ty {
+        return None;
+    }
+    let ((sa, 0), (sb, 0)) = (half64_source(cx, a0)?, half64_source(cx, b0)?) else {
+        return None;
+    };
+    let (s1a, s1b) = (half64_source(cx, a1)?, half64_source(cx, b1)?);
+    if !((s1a == (sa, 1) && s1b == (sb, 1)) || (s1a == (sb, 1) && s1b == (sa, 1))) {
+        return None;
+    }
+    let wide_ty = Type::Vec {
+        lane: Lane::I16,
+        count: 8,
+    };
+    let bitcast_to = |cx: &mut RewriteCx, v: Value| {
+        if cx.func.ty(v) == wide_ty {
+            v
+        } else {
+            cx.emit(wide_ty, Op::Convert(Convert::Bitcast, v))
+        }
+    };
+    let wa = bitcast_to(cx, sa);
+    let wb = bitcast_to(cx, sb);
+    let out = cx.emit(wide_ty, Op::Binary(op, wa, wb));
+    Some(Op::Convert(Convert::Bitcast, out))
+}
+
 fn insert_as_bitcast(
     cx: &mut RewriteCx,
     res: Option<Value>,
@@ -372,11 +432,16 @@ fn insert_as_bitcast(
     if dst_lane == Lane::I64
         && c == 2
         && let (Some(v0), Some(v1)) = (slots[0], slots[1])
-        && let (Some((s0, 0)), Some((s1, 1))) =
-            (match_pack32_half(cx, v0), match_pack32_half(cx, v1))
-        && s0 == s1
     {
-        return Ok(Some(Op::Convert(Convert::Bitcast, s0)));
+        if let (Some((s0, 0)), Some((s1, 1))) =
+            (match_pack32_half(cx, v0), match_pack32_half(cx, v1))
+            && s0 == s1
+        {
+            return Ok(Some(Op::Convert(Convert::Bitcast, s0)));
+        }
+        if let Some(op) = merge_half_mulhi(cx, v0, v1) {
+            return Ok(Some(op));
+        }
     }
     let cand = slots[..c]
         .iter()

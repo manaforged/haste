@@ -154,7 +154,8 @@ impl Image {
         if self.backend.is_aot() && self.try_aot_singleton_hit(cx, reached, index, &slice, pass)? {
             return Ok(true);
         }
-        let Ok(unwind_drops) = slice.decode_unwind_drops() else {
+        let (Ok(unwind_drops), Ok(sites)) = (slice.decode_unwind_drops(), slice.decode_sites())
+        else {
             return Ok(false);
         };
         let item = reached.list[index].0.0;
@@ -176,7 +177,11 @@ impl Image {
             .memory
             .write(&patched)
             .map_err(|e| item_err(cx, item, e))?;
-        self.register_jit_drops(exec, patched.len(), &unwind_drops, &symbols);
+        self.register_jit_drops(
+            (exec, patched.len()),
+            (&unwind_drops, &sites, slice.saved_regs()),
+            &symbols,
+        );
         self.publish(index, exec);
         pass.record_size(index, patched.len() as u32, 0);
         Ok(true)

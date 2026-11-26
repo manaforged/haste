@@ -2,7 +2,7 @@ use crate::ir::{Function, Value};
 use crate::live::{Live, Range, overlaps};
 
 use super::{
-    BackIndex, Hints, Pool, SlotSet, crosses_call, crosses_ranges, parks, slot_free,
+    BackIndex, Hints, Pool, SlotSet, crosses_call, crosses_ranges, parks, prefer_park, slot_free,
     try_place_weighted,
 };
 
@@ -49,6 +49,7 @@ struct Chooser<'a, F, U> {
     wide_val: bool,
     needs_saved: bool,
     can_park: bool,
+    prefer_park: bool,
     has_free_saved: bool,
 }
 
@@ -83,7 +84,8 @@ impl<'a, F: Copy + PartialEq, U: Fn(usize) -> bool> Chooser<'a, F, U> {
         }
         let s = self.pool.slot_of(reg)?;
         let ok = if self.needs_saved {
-            (self.pool.is_saved[s] || (self.can_park && !self.has_free_saved)) && !self.wide_val
+            (self.pool.is_saved[s] || (self.can_park && (!self.has_free_saved || self.prefer_park)))
+                && !self.wide_val
         } else {
             !self.pool.is_saved[s] || (!self.wide_val && (self.slot_used)(s))
         };
@@ -302,6 +304,20 @@ impl<'a, F: Copy + PartialEq, U: Fn(usize) -> bool> Chooser<'a, F, U> {
     }
 
     fn pick_saved(&self, unalloc: &Unalloc) -> Option<usize> {
+        if self.prefer_park {
+            return self
+                .try_pick(unalloc, false, |s| {
+                    self.pool.is_saved[s] && (self.slot_used)(s) && !self.wide_val
+                })
+                .or_else(|| self.try_pick(unalloc, false, |s| !self.pool.is_saved[s]))
+                .or_else(|| {
+                    self.try_pick(unalloc, false, |s| self.pool.is_saved[s] && !self.wide_val)
+                })
+                .or_else(|| self.try_pick(unalloc, true, |s| !self.pool.is_saved[s]))
+                .or_else(|| {
+                    self.try_pick(unalloc, true, |s| self.pool.is_saved[s] && !self.wide_val)
+                });
+        }
         self.try_pick(unalloc, false, |s| self.pool.is_saved[s] && !self.wide_val)
             .or_else(|| {
                 self.can_park
@@ -457,6 +473,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         wide_val,
         needs_saved,
         can_park,
+        prefer_park: can_park && prefer_park(live, hints, value),
         has_free_saved,
     };
     ctx.choose()

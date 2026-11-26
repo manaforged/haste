@@ -103,10 +103,7 @@ impl Emit<'_> {
             }
             (Lane::I32, 0) => self.asm.movd_out(dst, src),
             (Lane::I64, 0) => self.asm.movq_out(dst, src),
-            (Lane::I8, _) if self.features.sse41 => {
-                self.asm
-                    .sse_imm(&[0x66], &[0x0F, 0x3A, 0x14], src.0, dst, idx)
-            }
+            (Lane::I8, _) if self.features.sse41 => self.asm.pextr(false, 0x14, dst, src, idx),
             (Lane::I8, _) => {
                 self.asm
                     .sse_imm(&[0x66], &[0x0F, 0xC5], dst as u8, src, idx / 2);
@@ -115,18 +112,12 @@ impl Emit<'_> {
                 }
                 self.asm.load(Size::B, dst, dst);
             }
-            (Lane::I32, _) if self.features.sse41 => {
-                self.asm
-                    .sse_imm(&[0x66], &[0x0F, 0x3A, 0x16], src.0, dst, idx)
-            }
+            (Lane::I32, _) if self.features.sse41 => self.asm.pextr(false, 0x16, dst, src, idx),
             (Lane::I32, _) => {
                 self.asm.sse_imm(&[0x66], &[0x0F, 0x70], X1.0, src, idx);
                 self.asm.movd_out(dst, X1);
             }
-            (Lane::I64, _) if self.features.sse41 => {
-                self.asm
-                    .sse_wide_imm(&[0x66], &[0x0F, 0x3A, 0x16], src.0, dst, idx)
-            }
+            (Lane::I64, _) if self.features.sse41 => self.asm.pextr(true, 0x16, dst, src, idx),
             (Lane::I64, _) => {
                 self.asm.sse_imm(&[0x66], &[0x0F, 0x70], X1.0, src, 0xEE);
                 self.asm.movq_out(dst, X1);

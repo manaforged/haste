@@ -97,71 +97,6 @@ impl Lower<'_, '_> {
         Ok(self.store_vec(out, 16))
     }
 
-    pub(in crate::lower) fn sqdmulh_vec(&mut self, ty: Type, args: &[Value]) -> Result<Value> {
-        let &[x, y] = args else {
-            bail!("`sqdmulh` takes two vectors");
-        };
-        let i32x2 = Type::Vec {
-            lane: Lane::I32,
-            count: 2,
-        };
-        let i64x2 = Type::Vec {
-            lane: Lane::I64,
-            count: 2,
-        };
-        let i16x4 = Type::Vec {
-            lane: Lane::I16,
-            count: 4,
-        };
-        let i32x4 = Type::Vec {
-            lane: Lane::I32,
-            count: 4,
-        };
-        let i16x8 = Type::Vec {
-            lane: Lane::I16,
-            count: 8,
-        };
-        if ty == i32x2 {
-            let out = self.sqdmulh_half(i32x2, i64x2, 31, (x, y), 0);
-            return Ok(self.store_vec(out, 8));
-        }
-        let (half_ty, wide_ty, shift) = match ty {
-            _ if ty == i32x4 => (i32x2, i64x2, 31),
-            _ if ty == i16x8 => (i16x4, i32x4, 15),
-            _ => bail!("unsupported `sqdmulh` type {ty:?}"),
-        };
-        let lo = self.sqdmulh_half(half_ty, wide_ty, shift, (x, y), 0);
-        let hi = self.sqdmulh_half(half_ty, wide_ty, shift, (x, y), 8);
-        let slot = self.b.create_stack_slot(16, 4);
-        self.ins().stack_store(lo, slot, 0);
-        self.ins().stack_store(hi, slot, 8);
-        Ok(self.ins().stack_addr(Type::I64, slot, 0))
-    }
-
-    fn sqdmulh_half(
-        &mut self,
-        half_ty: Type,
-        wide_ty: Type,
-        shift_bits: i64,
-        (x, y): (Value, Value),
-        off: i32,
-    ) -> Value {
-        let (va, vb) = (
-            self.ins().load(half_ty, x, off),
-            self.ins().load(half_ty, y, off),
-        );
-        let (wa, wb) = (
-            self.ins().sextend(wide_ty, va),
-            self.ins().sextend(wide_ty, vb),
-        );
-        let prod = self.ins().imul(wa, wb);
-        let wide_lane = wide_ty.lane().map_or(Type::I64, Lane::to_type);
-        let sh_s = self.ins().iconst(wide_lane, shift_bits);
-        let sh = self.ins().splat(wide_ty, sh_s);
-        let shifted = self.ins().sshr(prod, sh);
-        self.ins().narrow_sat(half_ty, true, shifted)
-    }
-
     pub(in crate::lower) fn target_vector(
         &mut self,
         id: TargetOpId,
@@ -241,6 +176,7 @@ fn is_arm64_target_op(id: TargetOpId) -> bool {
             | TargetOpId::Arm64AesD
             | TargetOpId::Arm64AesMc
             | TargetOpId::Arm64AesImc
+            | TargetOpId::Arm64Sqdmulh
     )
 }
 

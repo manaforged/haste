@@ -18,7 +18,10 @@ pub(super) struct TlvCache {
     helper: Label,
     init_sym: TlvInitSym,
     pub(super) dom_known: Vec<bool>,
+    pub(super) may_known: Vec<bool>,
+    pub(super) needs_zero: bool,
     pub(super) live: bool,
+    pub(super) may_live: bool,
     used: bool,
 }
 
@@ -107,6 +110,27 @@ pub(super) fn plan_tlv_cache(
             cur = di;
         }
     }
+    let mut may_known = vec![false; func.blocks.len()];
+    let mut work: Vec<usize> = Vec::new();
+    let mut push_succs = |b: usize, work: &mut Vec<usize>| {
+        for succ in func.successors(crate::ir::Block(b as u32)) {
+            let si = succ.index();
+            if !may_known[si] {
+                may_known[si] = true;
+                work.push(si);
+            }
+        }
+    };
+    for b in 0..func.blocks.len() {
+        if has_tlv[b] && cfg.reachable[b] {
+            push_succs(b, &mut work);
+        }
+    }
+    while let Some(u) = work.pop() {
+        push_succs(u, &mut work);
+    }
+    let needs_zero = (0..func.blocks.len())
+        .any(|b| has_tlv[b] && cfg.reachable[b] && !dom_known[b] && may_known[b]);
     let slot = frame.add_slot(8);
     let helper = asm.label();
     Some(TlvCache {
@@ -114,7 +138,10 @@ pub(super) fn plan_tlv_cache(
         helper,
         init_sym: first_sym?,
         dom_known,
+        may_known,
+        needs_zero,
         live: false,
+        may_live: false,
         used: false,
     })
 }
@@ -136,21 +163,43 @@ impl Emit<'_> {
         at
     }
 
+    fn emit_tlv_init_base(&mut self, init_sym: TlvInitSym) {
+        let at = self.emit_tlv_base();
+        self.asm.word(ARM64_NOP);
+        let reloc = match init_sym {
+            TlvInitSym::Symbol(sym) => StencilReloc::symbol(at, sym, RelocKind::Arm64TlvCell),
+            TlvInitSym::Runtime(rt) => StencilReloc::runtime(at, rt, RelocKind::Arm64TlvCell),
+        };
+        self.relocs.push(reloc);
+    }
+
     fn emit_cached_tlv_base(&mut self) -> bool {
-        let Some((slot, helper, known)) =
-            self.tlv_cache.as_ref().map(|c| (c.slot, c.helper, c.live))
+        let Some((slot, helper, init_sym, known, may_live)) = self
+            .tlv_cache
+            .as_ref()
+            .map(|c| (c.slot, c.helper, c.init_sym, c.live, c.may_live))
         else {
             return false;
         };
         let at = self.frame_mem(slot);
-        self.asm.load(Size::X, false, Reg(0), at);
-        if !known {
+        if known {
+            self.asm.load(Size::X, false, Reg(0), at);
+        } else if !may_live {
+            self.emit_tlv_init_base(init_sym);
+            self.asm.store(Size::X, at, Reg(0));
+            if let Some(cache) = &mut self.tlv_cache {
+                cache.live = true;
+                cache.may_live = true;
+            }
+        } else {
+            self.asm.load(Size::X, false, Reg(0), at);
             let skip = self.asm.label();
             self.asm.cbz(true, Size::X, Reg(0), skip);
             self.asm.bl(helper);
             self.asm.bind(skip);
             if let Some(cache) = &mut self.tlv_cache {
                 cache.live = true;
+                cache.may_live = true;
                 cache.used = true;
             }
         }
@@ -302,13 +351,7 @@ impl Emit<'_> {
         {
             self.asm.bind(helper);
             self.asm.stp_pre(LR, ZR, SP, -16);
-            let at = self.emit_tlv_base();
-            self.asm.word(ARM64_NOP);
-            let reloc = match init_sym {
-                TlvInitSym::Symbol(sym) => StencilReloc::symbol(at, sym, RelocKind::Arm64TlvCell),
-                TlvInitSym::Runtime(rt) => StencilReloc::runtime(at, rt, RelocKind::Arm64TlvCell),
-            };
-            self.relocs.push(reloc);
+            self.emit_tlv_init_base(init_sym);
             self.asm.ldp_post(LR, ZR, SP, 16);
             let slot_mem = self.frame_mem(slot);
             self.asm.store(Size::X, slot_mem, Reg(0));

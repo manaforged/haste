@@ -156,9 +156,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         }
     }
     let tail_calls = if full {
-        crate::frame::find_tail_calls(func, &plan, &abi, !target.direct_calls, &|sig| {
-            classify(sig, packing)
-        })
+        crate::frame::find_tail_calls(func, &plan, &abi, &|sig| classify(sig, packing))
     } else {
         Vec::new()
     };
@@ -349,7 +347,12 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 None => asm.vstore(8, Mem::new(FP, disp), Vreg(a)),
             },
         );
-        if let Some(slot) = self.tlv_cache.as_ref().map(|c| c.slot) {
+        if let Some(slot) = self
+            .tlv_cache
+            .as_ref()
+            .filter(|c| c.needs_zero)
+            .map(|c| c.slot)
+        {
             let at = self.frame_mem(slot);
             self.asm.store(Size::X, at, ZR);
         }
@@ -366,12 +369,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.resume_spills(block);
         if let Some(cache) = &mut self.tlv_cache {
             cache.live = cache.dom_known[block.index()];
+            cache.may_live = cache.may_known[block.index()];
         }
         self.asm.bind(self.blocks[block.index()]);
     }
     fn bind_entry(&mut self, block: Block) {
         if let Some(cache) = &mut self.tlv_cache {
             cache.live = cache.dom_known[block.index()];
+            cache.may_live = cache.may_known[block.index()];
         }
         self.asm.bind(self.blocks[block.index()]);
     }
@@ -525,6 +530,11 @@ impl<'a> Emitter<'a> for Emit<'a> {
             loops: Vec::new(),
             lines: Vec::new(),
             unwind_drops: crate::frame::resolve_unwind_drops(self.func, &self.frame),
+            saved_regs: if self.framed {
+                self.frame.saved_mask
+            } else {
+                0
+            },
         })
     }
 }

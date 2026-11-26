@@ -184,18 +184,28 @@ impl Function {
 
     /// Removes frame-table unwind drop entries whose flag can never be active across a potentially-unwinding call.
     pub fn elide_dead_unwind_drops(&mut self, sym_may_unwind: impl FnMut(u32) -> bool) -> bool {
-        self.elide_dead_unwind_drops_inner(false, false, sym_may_unwind)
+        self.elide_with_no_unwind_syms(false, false, sym_may_unwind)
     }
 
     /// Post-optimization unwind-drop cleanup that preserves or re-emits entry zero-initialization for every surviving flag, optionally sinking entry zeros onto cold unwind-call frontiers.
     pub(crate) fn elide_dead_unwind_drops_post_init(&mut self, sink_zeros: bool) -> bool {
+        self.elide_with_no_unwind_syms(true, sink_zeros, |_| true)
+    }
+
+    fn elide_with_no_unwind_syms(
+        &mut self,
+        post_init: bool,
+        sink_zeros: bool,
+        mut sym_may_unwind: impl FnMut(u32) -> bool,
+    ) -> bool {
         if self.no_unwind_syms.is_empty() {
-            return self.elide_dead_unwind_drops_inner(true, sink_zeros, |_| true);
+            return self.elide_dead_unwind_drops_inner(post_init, sink_zeros, sym_may_unwind);
         }
         let mut no_unwind = std::mem::take(&mut self.no_unwind_syms);
         no_unwind.sort_unstable();
-        let changed = self.elide_dead_unwind_drops_inner(true, sink_zeros, |sym| {
-            no_unwind.binary_search(&sym).is_err()
+        no_unwind.dedup();
+        let changed = self.elide_dead_unwind_drops_inner(post_init, sink_zeros, |sym| {
+            no_unwind.binary_search(&sym).is_err() && sym_may_unwind(sym)
         });
         self.no_unwind_syms = no_unwind;
         changed
@@ -582,4 +592,74 @@ fn unwind_flag_live_at_call(
         matches!(ev, FlagEvent::Call(_, true) | FlagEvent::TryCall(true))
     })
     .0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::FunctionBuilder;
+    use crate::ir::{AbiParam, CallConv, Signature, Type};
+
+    enum InitArg {
+        Zero,
+        Symbol(u32),
+    }
+
+    fn thread_cell_fn(init_arg: InitArg) -> Function {
+        let mut func = Function::new(Signature::new(CallConv::Internal));
+        let mut tc_sig = Signature::new(CallConv::Internal);
+        tc_sig.params = vec![
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::I64),
+        ];
+        tc_sig.returns = vec![AbiParam::new(Type::I64)];
+        let mut b = FunctionBuilder::new(&mut func);
+        let entry = b.create_block();
+        b.switch_to_block(entry);
+        let local = b.create_stack_slot(8, 3);
+        let flag = b.create_stack_slot(1, 0);
+        let sig_ref = b.import_signature(tc_sig);
+        let one = b.ins().iconst(Type::I8, 1);
+        let zero = b.ins().iconst(Type::I8, 0);
+        b.ins().stack_store(one, flag, 0);
+        let tc = b.ins().symbol(10);
+        b.func.mark_thread_cell(tc);
+        let slot = b.ins().iconst(Type::I64, 0);
+        let size = b.ins().iconst(Type::I64, 16);
+        let init = match init_arg {
+            InitArg::Zero => b.ins().iconst(Type::I64, 0),
+            InitArg::Symbol(sym) => b.ins().symbol(sym),
+        };
+        let _ = b.ins().call_indirect(sig_ref, tc, &[slot, size, init]);
+        b.ins().stack_store(zero, flag, 0);
+        b.ins().return_(&[]);
+        func.add_unwind_drop(UnwindDrop {
+            local,
+            local_off: 0,
+            flag,
+            drop_sym: 99,
+            indirect: false,
+        });
+        func.entry = Some(entry);
+        func
+    }
+
+    #[test]
+    fn thread_cell_panicking_init_preserves_unwind_drop() {
+        let mut func = thread_cell_fn(InitArg::Symbol(1));
+        func.elide_dead_unwind_drops(|sym| sym == 1);
+        assert_eq!(func.unwind_drops().len(), 1);
+    }
+
+    #[test]
+    fn thread_cell_zero_or_nounwind_init_elides_drop() {
+        let mut zero_fn = thread_cell_fn(InitArg::Zero);
+        zero_fn.elide_dead_unwind_drops(|_| true);
+        assert!(zero_fn.unwind_drops().is_empty());
+
+        let mut nounwind_fn = thread_cell_fn(InitArg::Symbol(2));
+        nounwind_fn.elide_dead_unwind_drops(|sym| sym != 2);
+        assert!(nounwind_fn.unwind_drops().is_empty());
+    }
 }

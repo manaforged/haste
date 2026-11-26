@@ -153,6 +153,10 @@ pub(super) fn leaf_park_cost(live: &Live, hints: &Hints, value: usize) -> Option
     (cost < val_weights[value]).then_some(cost)
 }
 
+pub(super) fn prefer_park(live: &Live, hints: &Hints, value: usize) -> bool {
+    leaf_park_cost(live, hints, value).is_some_and(|cost| cost < 2 * crate::alloc::BASE_WEIGHT)
+}
+
 pub(super) fn holder_leaf_cost<F: Copy + PartialEq>(
     pool: &Pool<F>,
     live: &Live,

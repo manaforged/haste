@@ -476,11 +476,19 @@ impl Asm {
         self.clear_word(0xD63F_0000 | u32::from(reg.0) << 5);
     }
 
-    pub fn bl_reloc(&mut self) -> u32 {
+    fn branch_reloc(&mut self, word: u32) -> u32 {
         self.clear_anchor();
         let at = self.pos();
-        self.word(0x9400_0000);
+        self.word(word);
         at
+    }
+
+    pub fn bl_reloc(&mut self) -> u32 {
+        self.branch_reloc(0x9400_0000)
+    }
+
+    pub fn b_reloc(&mut self) -> u32 {
+        self.branch_reloc(0x1400_0000)
     }
 
     pub fn br(&mut self, reg: Reg) {

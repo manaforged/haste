@@ -530,15 +530,20 @@ impl Typed {
         }
     }
 
+    /// Every function the body calls, excluding implicit `Drop` glue edges, with its interned type arguments.
+    pub fn calls_without_drops(&self) -> Box<dyn Iterator<Item = (ItemRef, Substs)> + '_> {
+        let shaped = shape_calls(&self.shape).filter_map(res_fn);
+        match &self.tables {
+            LazyTables::Eager(t) => Box::new(body_calls(t, true).chain(shaped)),
+            LazyTables::Poly(poly) => Box::new(poly.calls().chain(shaped)),
+            LazyTables::CheckOnly(check) => Box::new(check.calls().chain(shaped)),
+        }
+    }
+
     /// Every function the body calls, with its interned type arguments.
     pub fn calls(&self) -> Box<dyn Iterator<Item = (ItemRef, Substs)> + '_> {
         let drops = self.drops.iter().filter_map(res_fn);
-        let shaped = shape_calls(&self.shape).filter_map(res_fn);
-        match &self.tables {
-            LazyTables::Eager(t) => Box::new(body_calls(t, true).chain(drops).chain(shaped)),
-            LazyTables::Poly(poly) => Box::new(poly.calls().chain(drops).chain(shaped)),
-            LazyTables::CheckOnly(check) => Box::new(check.calls().chain(drops).chain(shaped)),
-        }
+        Box::new(self.calls_without_drops().chain(drops))
     }
 
     /// Visits all semantic callees of this body excluding `Coercion::Vtable` method and super edges.

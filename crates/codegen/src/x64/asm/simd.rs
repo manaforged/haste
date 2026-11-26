@@ -62,12 +62,32 @@ impl Asm {
         );
     }
 
+    fn mov_gpr_xmm(&mut self, wide: bool, opcode: u8, xmm: Xmm, reg: Reg) {
+        if self.avx {
+            self.vex3(0b00001, wide, 0b01, opcode, (xmm.0, 0), reg.into());
+        } else {
+            self.encode(&[0x66], wide, &[0x0F, opcode], xmm.0, reg.into(), false);
+        }
+    }
+
     pub fn movd_in(&mut self, xmm: Xmm, reg: Reg) {
-        self.encode(&[0x66], false, &[0x0F, 0x6E], xmm.0, reg.into(), false);
+        self.mov_gpr_xmm(false, 0x6E, xmm, reg);
     }
 
     pub fn movd_out(&mut self, reg: Reg, xmm: Xmm) {
-        self.encode(&[0x66], false, &[0x0F, 0x7E], xmm.0, reg.into(), false);
+        self.mov_gpr_xmm(false, 0x7E, xmm, reg);
+    }
+
+    /// `pextr{b,d,q}` / `vpextr{b,d,q}`: extracts lane `idx` of `src` into integer register `dst`.
+    pub fn pextr(&mut self, wide: bool, opcode: u8, dst: Reg, src: Xmm, idx: u8) {
+        if self.avx {
+            self.vex3(0b00011, wide, 0b01, opcode, (src.0, 0), dst.into());
+            self.imm(&[idx]);
+        } else if wide {
+            self.sse_wide_imm(&[0x66], &[0x0F, 0x3A, opcode], src.0, dst, idx);
+        } else {
+            self.sse_imm(&[0x66], &[0x0F, 0x3A, opcode], src.0, dst, idx);
+        }
     }
 
     fn vex3(&mut self, map: u8, w: bool, pp: u8, opcode: u8, (dst, src): (u8, u8), rm: Rm) {
@@ -198,13 +218,13 @@ impl Asm {
         }
     }
 
-    /// `movq xmm, reg`.
+    /// `movq`/`vmovq xmm, reg`.
     pub fn movq_in(&mut self, xmm: Xmm, reg: Reg) {
-        self.encode(&[0x66], true, &[0x0F, 0x6E], xmm.0, reg.into(), false);
+        self.mov_gpr_xmm(true, 0x6E, xmm, reg);
     }
 
-    /// `movq reg, xmm`.
+    /// `movq`/`vmovq reg, xmm`.
     pub fn movq_out(&mut self, reg: Reg, xmm: Xmm) {
-        self.encode(&[0x66], true, &[0x0F, 0x7E], xmm.0, reg.into(), false);
+        self.mov_gpr_xmm(true, 0x7E, xmm, reg);
     }
 }

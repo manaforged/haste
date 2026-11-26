@@ -37,7 +37,6 @@ pub(crate) fn find_tail_calls<R: Copy + PartialEq>(
     func: &Function,
     plan: &Plan<R>,
     caller_abi: &Abi<R>,
-    allow_direct: bool,
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Vec<bool> {
     if !func.unwind_drops.is_empty()
@@ -76,14 +75,6 @@ pub(crate) fn find_tail_calls<R: Copy + PartialEq>(
                 Some(CallTarget::Runtime(
                     RuntimeSymbol::Malloc | RuntimeSymbol::Free
                 ))
-            )
-        {
-            continue;
-        }
-        if !allow_direct
-            && matches!(
-                plan.through[callee.index()],
-                Some(CallTarget::Symbol(_) | CallTarget::Slot(_) | CallTarget::Runtime(_))
             )
         {
             continue;

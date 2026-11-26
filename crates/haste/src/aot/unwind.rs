@@ -14,6 +14,22 @@ pub(super) use x64::{emit_x64_catch_unwind, emit_x64_start_panic};
 
 /// Byte offset of `stop_fp` inside the AOT `catch_unwind` frame record.
 pub(super) const STOP_FP_OFFSET: u32 = 0x20;
+/// Byte offset of the callee-saved register buffer pointer inside the AOT unwind context.
+pub(super) const REGS_PTR_OFFSET: u32 = 0x28;
+/// Byte size of one function record in the AOT unwind table (`start, end, drop_start, drop_count, saved_regs`).
+pub(crate) const UNWIND_FN_REC_BYTES: usize = 20;
+
+fn scale_fn_rec_index(
+    b: &mut FunctionBuilder<'_>,
+    idx: haste_codegen::Value,
+    c4: haste_codegen::Value,
+    c2: haste_codegen::Value,
+) -> haste_codegen::Value {
+    const _: () = assert!(UNWIND_FN_REC_BYTES == (1 << 4) + (1 << 2));
+    let b16 = b.ins().ishl(idx, c4);
+    let b4 = b.ins().ishl(idx, c2);
+    b.ins().iadd(b16, b4)
+}
 
 /// Compiles and appends the native frame-table unwind walker `fn(cur_fp, stop_fp, text_base, table_ptr)`.
 pub(super) fn emit_walk(arch: Arch, os: Os, out: &mut Buf) -> Result<()> {
@@ -34,6 +50,7 @@ pub(super) fn emit_walk(arch: Arch, os: Os, out: &mut Buf) -> Result<()> {
 fn build_unwind_walk() -> Function {
     let mut sig = Signature::new(CallConv::Native);
     sig.params = vec![AbiParam::new(Type::I64); 4];
+    sig.returns = vec![AbiParam::new(Type::I64)];
     let mut func = Function::new(sig);
     let mut b = FunctionBuilder::new(&mut func);
     let mut drop_sig = Signature::new(CallConv::Native);
@@ -45,6 +62,11 @@ fn build_unwind_walk() -> Function {
     let init_done = b.create_block();
     let frame_loop = b.create_block();
     let load_caller = b.create_block();
+    let site_check = b.create_block();
+    let site_search = b.create_block();
+    let site_step = b.create_block();
+    let site_hi = b.create_block();
+    let site_hit = b.create_block();
     let check_stop = b.create_block();
     let drain_loop = b.create_block();
     let drain_check_mark = b.create_block();
@@ -68,13 +90,21 @@ fn build_unwind_walk() -> Function {
     let drop_run = b.create_block();
     let load_ind = b.create_block();
     let do_call = b.create_block();
+    let restore_init = b.create_block();
+    let restore_loop = b.create_block();
+    let restore_step = b.create_block();
+    let restore_copy = b.create_block();
     let done = b.create_block();
 
     b.append_block_params_for_function_params(entry);
     let count = b.append_block_param(init_done, Type::I64);
     let fn_recs = b.append_block_param(init_done, Type::I64);
     let drops_base = b.append_block_param(init_done, Type::I64);
+    let site_count = b.append_block_param(init_done, Type::I64);
+    let sites_base = b.append_block_param(init_done, Type::I64);
     let fp = b.append_block_param(frame_loop, Type::I64);
+    let slo = b.append_block_param(site_search, Type::I64);
+    let shi = b.append_block_param(site_search, Type::I64);
     let limit_addr = b.append_block_param(drain_loop, Type::I64);
     let next_fp = b.append_block_param(drain_loop, Type::I64);
     let next_ret = b.append_block_param(drain_loop, Type::I64);
@@ -83,6 +113,9 @@ fn build_unwind_walk() -> Function {
     let hi = b.append_block_param(bsearch, Type::I64);
     let idx = b.append_block_param(drop_loop, Type::I64);
     let arg = b.append_block_param(do_call, Type::I64);
+    let rmask = b.append_block_param(restore_loop, Type::I64);
+    let rbit = b.append_block_param(restore_loop, Type::I64);
+    let rk = b.append_block_param(restore_loop, Type::I64);
 
     b.switch_to_block(entry);
     let cur_fp = b.block_params(entry)[0];
@@ -92,23 +125,42 @@ fn build_unwind_walk() -> Function {
     let state_ptr = b.ins().load(Type::I64, frame_ptr, 0);
     let mark = b.ins().load(Type::I64, frame_ptr, 8);
     let stop_fp = b.ins().load(Type::I64, frame_ptr, STOP_FP_OFFSET as i32);
+    let raw_regs_ptr = b.ins().load(Type::I64, frame_ptr, REGS_PTR_OFFSET as i32);
     let zero = b.ins().iconst(Type::I64, 0);
+    let c1 = b.ins().iconst(Type::I64, 1);
+    let c2 = b.ins().iconst(Type::I64, 2);
+    let c3 = b.ins().iconst(Type::I64, 3);
     let c4 = b.ins().iconst(Type::I64, 4);
     let z8 = b.ins().iconst(Type::I8, 0);
     let one8 = b.ins().iconst(Type::I8, 1);
+    let two8 = b.ins().iconst(Type::I8, 2);
+    let entry_has_stop = b.ins().icmp_imm(IntCC::NotEqual, stop_fp, 0);
+    let regs_ptr = b.ins().select(entry_has_stop, zero, raw_regs_ptr);
     let no_table = b.ins().icmp_imm(IntCC::Equal, table_ptr, 0);
-    b.ins()
-        .brif(no_table, init_done, &[zero, zero, zero], load_table, &[]);
+    b.ins().brif(
+        no_table,
+        init_done,
+        &[zero, zero, zero, zero, zero],
+        load_table,
+        &[],
+    );
 
     b.switch_to_block(load_table);
     let t_count = b.ins().load(Type::I64, table_ptr, 0);
-    let t_recs = b.ins().iadd_imm(table_ptr, 8);
-    let fn_bytes = b.ins().ishl(t_count, c4);
+    let t_sites = b.ins().load(Type::I64, table_ptr, 8);
+    let t_sites_off = b.ins().load(Type::I64, table_ptr, 16);
+    let t_recs = b.ins().iadd_imm(table_ptr, 24);
+    let fn_bytes = scale_fn_rec_index(&mut b, t_count, c4, c2);
     let t_drops = b.ins().iadd(t_recs, fn_bytes);
-    b.ins().jump(init_done, &[t_count, t_recs, t_drops]);
+    let t_sites_base = b.ins().iadd(table_ptr, t_sites_off);
+    b.ins().jump(
+        init_done,
+        &[t_count, t_recs, t_drops, t_sites, t_sites_base],
+    );
 
     b.switch_to_block(init_done);
-    let empty = b.ins().icmp_imm(IntCC::Equal, count, 0);
+    let any_entries = b.ins().bor(count, site_count);
+    let empty = b.ins().icmp_imm(IntCC::Equal, any_entries, 0);
     b.ins().brif(
         empty,
         drain_loop,
@@ -135,14 +187,58 @@ fn build_unwind_walk() -> Function {
         bad_fp,
         drain_loop,
         &[zero, zero, zero, one8],
-        check_stop,
+        site_check,
         &[],
     );
 
+    b.switch_to_block(site_check);
+    let has_sites = b.ins().icmp_imm(IntCC::NotEqual, site_count, 0);
+    let ret_in_text = b.ins().icmp(IntCC::UnsignedGreaterThan, ret_pc, text_base);
+    let try_sites = b.ins().band(has_sites, ret_in_text);
+    let ret_rel = b.ins().isub(ret_pc, text_base);
+    b.ins()
+        .brif(try_sites, site_search, &[zero, site_count], check_stop, &[]);
+
+    b.switch_to_block(site_search);
+    let s_more = b.ins().icmp(IntCC::UnsignedLessThan, slo, shi);
+    b.ins().brif(s_more, site_step, &[], check_stop, &[]);
+
+    b.switch_to_block(site_step);
+    let s_diff = b.ins().isub(shi, slo);
+    let s_half = b.ins().ushr(s_diff, c1);
+    let s_mid = b.ins().iadd(slo, s_half);
+    let s_off = b.ins().ishl(s_mid, c4);
+    let s_ptr = b.ins().iadd(sites_base, s_off);
+    let s_ret32 = b.ins().load(Type::I32, s_ptr, 0);
+    let s_ret = b.ins().uextend(Type::I64, s_ret32);
+    let s_below = b.ins().icmp(IntCC::UnsignedLessThan, ret_rel, s_ret);
+    b.ins()
+        .brif(s_below, site_search, &[slo, s_mid], site_hi, &[]);
+
+    b.switch_to_block(site_hi);
+    let s_above = b.ins().icmp(IntCC::UnsignedGreaterThan, ret_rel, s_ret);
+    let s_mid_p1 = b.ins().iadd_imm(s_mid, 1);
+    b.ins()
+        .brif(s_above, site_search, &[s_mid_p1, shi], site_hit, &[]);
+
+    b.switch_to_block(site_hit);
+    let h_rel32 = b.ins().load(Type::I32, s_ptr, 4);
+    let h_rel = b.ins().uextend(Type::I64, h_rel32);
+    let f_off32 = b.ins().load(Type::I32, s_ptr, 8);
+    let f_off = b.ins().uextend(Type::I64, f_off32);
+    let handler_pc = b.ins().iadd(text_base, h_rel);
+    let target_sp = b.ins().isub(caller_fp, f_off);
+    b.ins().store(handler_pc, frame_ptr, 16);
+    b.ins().store(caller_fp, frame_ptr, 24);
+    b.ins().store(target_sp, frame_ptr, STOP_FP_OFFSET as i32);
+    b.ins().jump(drain_loop, &[target_sp, zero, zero, two8]);
+
     b.switch_to_block(check_stop);
-    let at_stop = b
+    let has_stop = b.ins().icmp_imm(IntCC::NotEqual, stop_fp, 0);
+    let past_stop = b
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, caller_fp, stop_fp);
+    let at_stop = b.ins().band(has_stop, past_stop);
     b.ins().brif(
         at_stop,
         drain_loop,
@@ -239,10 +335,9 @@ fn build_unwind_walk() -> Function {
 
     b.switch_to_block(bsearch_step);
     let diff = b.ins().isub(hi, lo);
-    let c1 = b.ins().iconst(Type::I64, 1);
     let half = b.ins().ushr(diff, c1);
     let mid = b.ins().iadd(lo, half);
-    let rec_off = b.ins().ishl(mid, c4);
+    let rec_off = scale_fn_rec_index(&mut b, mid, c4, c2);
     let rec_ptr = b.ins().iadd(fn_recs, rec_off);
     let start32 = b.ins().load(Type::I32, rec_ptr, 0);
     let fn_start = b.ins().uextend(Type::I64, start32);
@@ -261,15 +356,16 @@ fn build_unwind_walk() -> Function {
     b.switch_to_block(drops_init);
     let dstart32 = b.ins().load(Type::I32, rec_ptr, 8);
     let dcount32 = b.ins().load(Type::I32, rec_ptr, 12);
+    let mask32 = b.ins().load(Type::I32, rec_ptr, 16);
     let dstart = b.ins().uextend(Type::I64, dstart32);
     let dcount = b.ins().uextend(Type::I64, dcount32);
+    let fn_mask = b.ins().uextend(Type::I64, mask32);
     let dend = b.ins().iadd(dstart, dcount);
     b.ins().jump(drop_loop, &[dend]);
 
     b.switch_to_block(drop_loop);
     let has_more = b.ins().icmp(IntCC::UnsignedGreaterThan, idx, dstart);
-    b.ins()
-        .brif(has_more, drop_step, &[], frame_loop, &[next_fp]);
+    b.ins().brif(has_more, drop_step, &[], restore_init, &[]);
 
     b.switch_to_block(drop_step);
     let next_idx = b.ins().iadd_imm(idx, -1);
@@ -302,7 +398,50 @@ fn build_unwind_walk() -> Function {
     b.ins().call_indirect(drop_sig, drop_fn, &[arg]);
     b.ins().jump(drop_loop, &[next_idx]);
 
+    b.switch_to_block(restore_init);
+    let has_regs = b.ins().icmp_imm(IntCC::NotEqual, regs_ptr, 0);
+    let has_mask = b.ins().icmp_imm(IntCC::NotEqual, fn_mask, 0);
+    let do_restore = b.ins().band(has_regs, has_mask);
+    b.ins().brif(
+        do_restore,
+        restore_loop,
+        &[fn_mask, zero, zero],
+        frame_loop,
+        &[next_fp],
+    );
+
+    b.switch_to_block(restore_loop);
+    let rmore = b.ins().icmp_imm(IntCC::NotEqual, rmask, 0);
+    b.ins()
+        .brif(rmore, restore_step, &[], frame_loop, &[next_fp]);
+
+    b.switch_to_block(restore_step);
+    let bit0 = b.ins().band(rmask, c1);
+    let next_rmask = b.ins().ushr(rmask, c1);
+    let next_rbit = b.ins().iadd_imm(rbit, 1);
+    let is_set = b.ins().icmp_imm(IntCC::NotEqual, bit0, 0);
+    b.ins().brif(
+        is_set,
+        restore_copy,
+        &[],
+        restore_loop,
+        &[next_rmask, next_rbit, rk],
+    );
+
+    b.switch_to_block(restore_copy);
+    let next_rk = b.ins().iadd_imm(rk, 1);
+    let neg_off = b.ins().ishl(next_rk, c3);
+    let src_ptr = b.ins().isub(next_fp, neg_off);
+    let reg_val = b.ins().load(Type::I64, src_ptr, 0);
+    let dst_off = b.ins().ishl(rbit, c3);
+    let dst_ptr = b.ins().iadd(regs_ptr, dst_off);
+    b.ins().store(reg_val, dst_ptr, 0);
+    b.ins()
+        .jump(restore_loop, &[next_rmask, next_rbit, next_rk]);
+
     b.switch_to_block(done);
-    b.ins().return_(&[]);
+    let caught = b.ins().icmp(IntCC::Equal, is_final, two8);
+    let ret = b.ins().uextend(Type::I64, caught);
+    b.ins().return_(&[ret]);
     func
 }

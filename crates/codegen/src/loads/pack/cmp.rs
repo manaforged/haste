@@ -54,7 +54,7 @@ fn peel_masked_load(
         v = inner;
     }
     let ty = ctx.func.ty(v);
-    (ty.is_small_int() && ty.bytes() <= 4).then_some((v, mask & (!0_u64 >> (64 - ty.bytes() * 8))))
+    (ty.is_small_int() && ty.bytes() <= 4).then(|| (v, mask & (!0_u64 >> (64 - ty.bytes() * 8))))
 }
 
 fn push_cmp_masked(

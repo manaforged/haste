@@ -6,8 +6,8 @@ use super::float::X1;
 use crate::alloc::Location;
 use crate::frame::{Emitter, Ext};
 use crate::ir::{
-    AtomicRmwOp, Binary, Block, Function, Op, ShuffleMask, StackSlot, TargetOpId, Type, Unary,
-    Value,
+    AtomicRmwOp, Binary, Block, Function, Lane, Op, ShuffleMask, StackSlot, TargetOpId, Type,
+    Unary, Value,
 };
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -42,13 +42,22 @@ pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
         Op::Move(..) | Op::AtomicCas(..) => R11,
         Op::AtomicRmw(AtomicRmwOp::Xchg | AtomicRmwOp::Add | AtomicRmwOp::Sub, ..) => 0,
         Op::AtomicRmw(..) => RSI | RDX,
+        Op::Binary(Binary::Smulhi | Binary::Umulhi, x, ..)
+            if !matches!(
+                func.ty(*x),
+                Type::Vec {
+                    lane: Lane::I16,
+                    ..
+                }
+            ) =>
+        {
+            RDX
+        }
         Op::Binary(
             Binary::Sdiv
             | Binary::Srem
             | Binary::Udiv
             | Binary::Urem
-            | Binary::Smulhi
-            | Binary::Umulhi
             | Binary::AvgRound
             | Binary::UaddSat
             | Binary::UsubSat,
@@ -518,5 +527,63 @@ impl Emit<'_> {
             return;
         }
         self.asm.store(size, to, source);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::FunctionBuilder;
+    use crate::ir::{AbiParam, CallConv, Lane, Signature};
+
+    #[test]
+    fn vector_uadd_sat_reserves_rdx_while_i16_mulhi_does_not() {
+        let mut sig = Signature::new(CallConv::Native);
+        sig.params = vec![
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::I64),
+        ];
+        sig.returns = vec![AbiParam::new(Type::I64)];
+        let mut func = Function::new(sig);
+        let mut b = FunctionBuilder::new(&mut func);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let p = b.block_params(entry).to_vec();
+        let u64x2 = Type::Vec {
+            lane: Lane::I64,
+            count: 2,
+        };
+        let i16x8 = Type::Vec {
+            lane: Lane::I16,
+            count: 8,
+        };
+        let a = b.ins().load(u64x2, p[0], 0);
+        let c = b.ins().load(u64x2, p[1], 0);
+        let sat_add = b.ins().uadd_sat(a, c);
+        let sat_sub = b.ins().usub_sat(a, c);
+        let va = b.ins().load(i16x8, p[0], 0);
+        let vb = b.ins().load(i16x8, p[1], 0);
+        let umul = b.ins().umulhi(va, vb);
+        let smul = b.ins().smulhi(va, vb);
+        b.ins().store(sat_add, p[0], 0);
+        b.ins().store(sat_sub, p[1], 0);
+        b.ins().store(umul, p[0], 16);
+        b.ins().store(smul, p[1], 16);
+        b.ins().return_(&[p[2]]);
+
+        let find_op = |bin: Binary| {
+            func.blocks[0]
+                .insts
+                .iter()
+                .map(|&i| &func.insts[i.index()].op)
+                .find(|op| matches!(op, Op::Binary(b, ..) if *b == bin))
+                .expect("expected binary op")
+        };
+        assert_ne!(scratch_mask(&func, find_op(Binary::UaddSat)) & 2, 0);
+        assert_ne!(scratch_mask(&func, find_op(Binary::UsubSat)) & 2, 0);
+        assert_eq!(scratch_mask(&func, find_op(Binary::Umulhi)), 0);
+        assert_eq!(scratch_mask(&func, find_op(Binary::Smulhi)), 0);
     }
 }

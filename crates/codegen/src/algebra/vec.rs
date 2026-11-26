@@ -40,8 +40,8 @@ pub(super) fn byte_abs(cx: &RewriteCx, cond: Value, t: Value, f: Value) -> Optio
     ))
 }
 
-/// Reads the lane sign bits of a compare against zero from the compared vector itself.
-pub(super) fn simplify_movemask(cx: &RewriteCx, op: &Op) -> Option<Op> {
+/// Reads the lane sign bits of a compare against zero from the compared vector itself, and folds 128-bit extracts out of concatenated 256-bit vectors.
+pub(super) fn simplify_movemask(cx: &mut RewriteCx, res: Option<Value>, op: &Op) -> Option<Op> {
     match *op {
         Op::Reduce(crate::ir::ReduceOp::Movemask, v) => {
             sign_source(cx, v).map(|x| Op::Reduce(crate::ir::ReduceOp::Movemask, x))
@@ -51,6 +51,98 @@ pub(super) fn simplify_movemask(cx: &RewriteCx, op: &Op) -> Option<Op> {
                 .map(|x| Op::TargetOp(TargetOpId::X64Pmovmskb256, TinyArgs::one(x))),
             _ => None,
         },
+        Op::TargetOp(id @ (TargetOpId::X64Low128 | TargetOpId::X64High128), args) => {
+            let &[v] = args.as_slice() else {
+                return None;
+            };
+            simplify_target_half(cx, res, id == TargetOpId::X64High128, v)
+        }
+        _ => None,
+    }
+}
+
+fn simplify_target_half(
+    cx: &mut RewriteCx,
+    res: Option<Value>,
+    high: bool,
+    v: Value,
+) -> Option<Op> {
+    let res_v = res?;
+    let res_ty = cx.func.ty(res_v);
+    match *cx.op(v)? {
+        Op::TargetOp(TargetOpId::X64Concat128, args) => {
+            let &[lo, hi] = args.as_slice() else {
+                return None;
+            };
+            let half = if high { hi } else { lo };
+            if cx.func.ty(half) == res_ty {
+                alias_if_diff(cx, res, res_v, half);
+            }
+            None
+        }
+        Op::Binary(sop @ (Binary::Ishl | Binary::Ushr | Binary::Sshr), x, sh)
+            if cx.uses.get(v.index()).copied().unwrap_or(0) <= 2 =>
+        {
+            let Some(&Op::TargetOp(TargetOpId::X64Concat128, args)) = cx.op(x) else {
+                return None;
+            };
+            let &[lo, hi] = args.as_slice() else {
+                return None;
+            };
+            let half = if high { hi } else { lo };
+            let (lane, count) = cx.func.ty(x).vec_shape()?;
+            let k = splat_int_imm(cx, sh, lane, usize::from(count))?;
+            if cx.func.ty(half) != res_ty {
+                return None;
+            }
+            let ks = cx.emit(lane.to_type(), Op::Const(k as i64));
+            let zero = cx.emit(res_ty, Op::Const(0));
+            let ins = cx.emit(res_ty, Op::Insert(zero, ks, 0));
+            let sp = cx.emit(res_ty, Op::Shuffle(ins, ins, ShuffleMask::Const([0; 16])));
+            Some(Op::Binary(sop, half, sp))
+        }
+        _ => None,
+    }
+}
+
+/// Folds `ireduce_i16((uextend/sextend(a) * uextend/sextend(b)) >> 16)` into `Umulhi`/`Smulhi`.
+pub(super) fn simplify_vec_ireduce(cx: &RewriteCx, dst: Type, x: Value) -> Option<Op> {
+    let Type::Vec {
+        lane: Lane::I16,
+        count,
+    } = dst
+    else {
+        return None;
+    };
+    if !matches!(count, 4 | 8)
+        || cx.func.ty(x)
+            != (Type::Vec {
+                lane: Lane::I32,
+                count,
+            })
+    {
+        return None;
+    }
+    let &Op::Binary(Binary::Ushr | Binary::Sshr, prod, sh) = cx.op(x)? else {
+        return None;
+    };
+    if splat_int_imm(cx, sh, Lane::I32, usize::from(count)) != Some(16) {
+        return None;
+    }
+    let &Op::Binary(Binary::Imul, ea, eb) = cx.op(prod)? else {
+        return None;
+    };
+    match (cx.op(ea)?, cx.op(eb)?) {
+        (&Op::Convert(Convert::Uextend, a), &Op::Convert(Convert::Uextend, b))
+            if cx.func.ty(a) == dst && cx.func.ty(b) == dst =>
+        {
+            Some(Op::Binary(Binary::Umulhi, a, b))
+        }
+        (&Op::Convert(Convert::Sextend, a), &Op::Convert(Convert::Sextend, b))
+            if cx.func.ty(a) == dst && cx.func.ty(b) == dst =>
+        {
+            Some(Op::Binary(Binary::Smulhi, a, b))
+        }
         _ => None,
     }
 }

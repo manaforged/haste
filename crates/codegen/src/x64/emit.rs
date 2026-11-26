@@ -232,6 +232,11 @@ impl<'a> Emitter<'a> for Emit<'a> {
             loops: Vec::new(),
             lines: Vec::new(),
             unwind_drops: crate::frame::resolve_unwind_drops(self.func, &self.frame),
+            saved_regs: if self.framed && self.base == Reg::Rbp {
+                self.frame.saved_mask
+            } else {
+                0
+            },
         })
     }
 }

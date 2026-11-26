@@ -522,16 +522,15 @@ impl Function {
             .count()
     }
 
-    /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.
+    /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine and reads no frame pointer.
     pub fn can_inline(&self) -> bool {
         self.coroutine.is_none()
             && self.entry.is_some()
-            && !self.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-                matches!(
-                    self.insts[i.index()].op,
-                    Op::TryCall { .. } | Op::FramePointer
-                )
-            })
+            && !self
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(self.insts[i.index()].op, Op::FramePointer))
     }
 
     /// Whether any instruction in this body returns to its caller.

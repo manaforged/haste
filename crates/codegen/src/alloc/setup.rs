@@ -6,7 +6,7 @@ use crate::park::{Class, ParkReg};
 
 use super::{Location, Regs};
 
-const BASE_WEIGHT: u64 = 8;
+pub(crate) const BASE_WEIGHT: u64 = 8;
 const LOOP_WEIGHT: u64 = 16;
 const MAX_DEPTH: u32 = 4;
 const SLOW_SHARE: u64 = 16;

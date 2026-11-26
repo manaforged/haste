@@ -336,4 +336,5 @@ pub(crate) struct BlockData {
 pub(crate) struct SlotData {
     pub size: u32,
     pub align_shift: u8,
+    pub poll_local: bool,
 }

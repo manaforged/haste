@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Code, CodeUnwindDrop, DictTierUp};
+use haste_codegen::{Code, CodeUnwindDrop, DictTierUp, Site};
 
 use crate::lower::{self, FootprintId, RelocPlan, RelocVec, Slots, SymbolSource};
 use crate::names::ItemRef;
@@ -28,17 +28,15 @@ type Lowered = (Arc<Code>, RelocVec, Arc<RelocPlan>);
 impl Image {
     pub(super) fn register_jit_drops(
         &self,
-        exec: usize,
-        len: usize,
-        drops: &[CodeUnwindDrop],
+        (exec, len): (usize, usize),
+        (drops, sites, saved_regs): (&[CodeUnwindDrop], &[Site], u32),
         symbols: &[u64],
     ) {
         crate::host::unwind::register_shared_drops(
             self.unwind_head,
             |bytes| lock(&self.shared).alloc(bytes).ok(),
-            exec,
-            len,
-            drops,
+            (exec, len),
+            (drops, sites, saved_regs),
             symbols,
         );
     }
@@ -50,7 +48,11 @@ impl Image {
         symbols: &[u64],
     ) -> Result<usize, haste_codegen::Error> {
         let exec = memory.write_patched(code, symbols)?;
-        self.register_jit_drops(exec, code.bytes().len(), code.unwind_drops(), symbols);
+        self.register_jit_drops(
+            (exec, code.bytes().len()),
+            (code.unwind_drops(), code.sites(), code.saved_regs()),
+            symbols,
+        );
         Ok(exec)
     }
 
@@ -379,9 +381,12 @@ impl Image {
             .memory
             .write_patched(&jt.stencil, &entry.symbols)?;
         self.register_jit_drops(
-            exec,
-            jt.stencil.bytes().len(),
-            jt.stencil.unwind_drops(),
+            (exec, jt.stencil.bytes().len()),
+            (
+                jt.stencil.unwind_drops(),
+                jt.stencil.sites(),
+                jt.stencil.saved_regs(),
+            ),
             &entry.symbols,
         );
         self.pass

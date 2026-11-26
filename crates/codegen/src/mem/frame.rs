@@ -8,12 +8,48 @@ const MAX_PRIVATE_BYTES: usize = 16384;
 const MAX_FREE_DFS_DEPTH: usize = 8;
 const MAX_FREE_DFS_STEPS: usize = 16;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MinOff {
+    NonFrame,
+    Unreached,
+    AtLeast(i64),
+    Unknown,
+}
+
+impl MinOff {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::NonFrame, x) | (x, Self::NonFrame) => x,
+            (Self::Unreached, x) | (x, Self::Unreached) => x,
+            (Self::AtLeast(a), Self::AtLeast(b)) => Self::AtLeast(a.min(b)),
+            _ => Self::Unknown,
+        }
+    }
+
+    fn shift(self, delta: Option<i64>, add: bool) -> Self {
+        match (self, delta) {
+            (Self::NonFrame, _) => Self::NonFrame,
+            (Self::Unreached, _) => Self::Unreached,
+            (Self::AtLeast(m), Some(c)) => {
+                let next = if add {
+                    m.checked_add(c)
+                } else {
+                    m.checked_sub(c)
+                };
+                next.map_or(Self::Unknown, Self::AtLeast)
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// What a coroutine resume function knows about its own frame: how many leading bytes no outside code can address, which values may point into the frame, and which hold its exact start.
 #[derive(Default)]
 pub(super) struct FrameFacts {
     private: u32,
     derived: Vec<bool>,
     exact: Vec<bool>,
+    min_off: Vec<Option<i64>>,
 }
 
 fn derived_from_op(op: &Op, derived: &[bool]) -> bool {
@@ -62,7 +98,114 @@ fn incoming_args(func: &Function, cfg: &Cfg) -> Vec<Vec<usize>> {
     incoming
 }
 
+fn op_min_off(op: &Op, state: &[MinOff], derived: &[bool], consts: &[Option<i64>]) -> MinOff {
+    match *op {
+        Op::Binary(Binary::Iadd, a, b) => match (derived[a.index()], derived[b.index()]) {
+            (true, false) => state[a.index()].shift(consts[b.index()], true),
+            (false, true) => state[b.index()].shift(consts[a.index()], true),
+            (false, false) => MinOff::NonFrame,
+            (true, true) => MinOff::Unknown,
+        },
+        Op::Binary(Binary::Isub, a, b) => match (derived[a.index()], derived[b.index()]) {
+            (true, false) => state[a.index()].shift(consts[b.index()], false),
+            (false, false) => MinOff::NonFrame,
+            _ => MinOff::Unknown,
+        },
+        Op::Convert(Convert::Bitcast, a) => state[a.index()],
+        Op::Select(_, a, b) => state[a.index()].join(state[b.index()]),
+        _ => MinOff::Unknown,
+    }
+}
+
+fn compute_min_offsets(
+    func: &Function,
+    cfg: &Cfg,
+    incoming: &[Vec<usize>],
+    exact: &[bool],
+    derived: &[bool],
+) -> Vec<Option<i64>> {
+    let count = func.types.len();
+    let consts = func.const_values();
+    let mut state: Vec<MinOff> = (0..count)
+        .map(|v| {
+            if exact[v] {
+                MinOff::AtLeast(0)
+            } else if derived[v] {
+                MinOff::Unreached
+            } else {
+                MinOff::NonFrame
+            }
+        })
+        .collect();
+    for iter in 0..32 {
+        let mut changed = false;
+        for (param, args) in incoming.iter().enumerate() {
+            if args.is_empty() || exact[param] || !derived[param] {
+                continue;
+            }
+            let mut next = MinOff::NonFrame;
+            for &arg in args {
+                next = next.join(state[arg]);
+            }
+            if iter >= 4
+                && let (MinOff::AtLeast(old), MinOff::AtLeast(cur)) = (state[param], next)
+                && cur < old
+            {
+                next = MinOff::Unknown;
+            }
+            if next != state[param] {
+                state[param] = next;
+                changed = true;
+            }
+        }
+        for inst in cfg
+            .rpo
+            .iter()
+            .flat_map(|block| &func.blocks[block.index()].insts)
+        {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            let r = res.index();
+            if exact[r] || !derived[r] {
+                continue;
+            }
+            let mut next = op_min_off(&data.op, &state, derived, &consts);
+            if iter >= 4
+                && let (MinOff::AtLeast(old), MinOff::AtLeast(cur)) = (state[r], next)
+                && cur < old
+            {
+                next = MinOff::Unknown;
+            }
+            if next != state[r] {
+                state[r] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            return state
+                .into_iter()
+                .map(|m| match m {
+                    MinOff::AtLeast(off) => Some(off),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+    vec![None; count]
+}
+
 impl FrameFacts {
+    pub(super) fn outside_private(&self, v: Value, extra_off: i64) -> bool {
+        !self.derived.get(v.index()).copied().unwrap_or(false)
+            || self
+                .min_off
+                .get(v.index())
+                .copied()
+                .flatten()
+                .and_then(|m| m.checked_add(extra_off))
+                .is_some_and(|s| s >= i64::from(self.private))
+    }
+
     pub(super) fn new(func: &Function, cfg: &Cfg) -> Self {
         if func.frame_private == 0 {
             return Self::default();
@@ -107,10 +250,12 @@ impl FrameFacts {
                 }
             }
             if !changed {
+                let min_off = compute_min_offsets(func, cfg, &incoming, &exact, &derived);
                 return Self {
                     private: func.frame_private,
                     derived,
                     exact,
+                    min_off,
                 };
             }
         }
@@ -118,6 +263,7 @@ impl FrameFacts {
             private: func.frame_private,
             derived: vec![true; count],
             exact: vec![false; count],
+            min_off: vec![None; count],
         }
     }
 }
@@ -207,8 +353,7 @@ pub(crate) fn drop_unread_frame_stores(func: &mut Function, cfg: &Cfg, prov: &Pr
     let offs = frame_offsets(func, cfg, prov);
     let derived = &prov.frame.derived;
     let is_derived = |v: Value| derived.get(v.index()).copied().unwrap_or(false);
-    let is_private_ptr =
-        |v: Value| is_derived(v) && !offs[v.index()].is_some_and(|o| o >= private as i64);
+    let is_private_ptr = |v: Value| !prov.frame.outside_private(v, 0);
     let anchors = anchor_slots(func, cfg);
     let mut read_bytes = vec![false; private];
     let mut mark_read = |start: i64, size: u32| {
@@ -233,7 +378,7 @@ pub(crate) fn drop_unread_frame_stores(func: &mut Function, cfg: &Cfg, prov: &Pr
                             return false;
                         };
                         mark_read(start, bytes);
-                    } else if is_derived(*addr) {
+                    } else if !prov.frame.outside_private(*addr, i64::from(*off)) {
                         return false;
                     }
                 }
@@ -246,7 +391,7 @@ pub(crate) fn drop_unread_frame_stores(func: &mut Function, cfg: &Cfg, prov: &Pr
                             return false;
                         };
                         mark_read(base, bytes);
-                    } else if is_derived(*addr) {
+                    } else if is_private_ptr(*addr) {
                         return false;
                     }
                 }
@@ -269,7 +414,7 @@ pub(crate) fn drop_unread_frame_stores(func: &mut Function, cfg: &Cfg, prov: &Pr
                     }
                 }
                 Op::Move(dst, src, bytes) => {
-                    if is_derived(*src) {
+                    if is_private_ptr(*src) {
                         if offs[src.index()] == Some(0) && offs[dst.index()] == Some(0) {
                             continue;
                         }
@@ -280,7 +425,7 @@ pub(crate) fn drop_unread_frame_stores(func: &mut Function, cfg: &Cfg, prov: &Pr
                     }
                 }
                 Op::Copy(_, src, len) => {
-                    if is_derived(*src) || is_private_ptr(*len) {
+                    if is_private_ptr(*src) || is_private_ptr(*len) {
                         return false;
                     }
                 }
@@ -622,7 +767,7 @@ impl Provenance {
         };
         Some(match other.base {
             MemBase::Addr(_) if self.exact_frame(other) => private.overlaps(other),
-            MemBase::Addr(v) => self.frame.derived.get(v.index()).copied().unwrap_or(true),
+            MemBase::Addr(v) => !self.frame.outside_private(v, other.offset),
             MemBase::Slot(slot) => !self.slot_unescaped(slot),
             MemBase::Global(_) => false,
         })

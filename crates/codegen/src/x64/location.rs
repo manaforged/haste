@@ -14,7 +14,7 @@ use super::asm::{Alu, Asm, Mem, Reg, Rm, Shift, Size, Xmm};
 use crate::alloc::{Location, Plan};
 use crate::fold::fits_imm32;
 use crate::frame::{Emitter, Ext};
-use crate::ir::{Function, Inst, Op, ShuffleMask, Type, Value};
+use crate::ir::{Binary, Function, Inst, Op, ShuffleMask, Type, Value};
 use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -502,6 +502,57 @@ pub(super) fn elide_broadcast_inserts(
         }
         if fuse::preserved(func, plan, block, start, end, &[], scalar) {
             plan.elided[v] = true;
+        }
+    }
+}
+
+fn shift_imm_ok(func: &Function, op: Binary, x: Value, y: Value) -> bool {
+    x != y
+        && func
+            .ty(y)
+            .vec_shape()
+            .is_some_and(|(lane, _)| super::vector::uniform_shift_lane(op, lane))
+}
+
+pub(super) fn elide_shift_splats(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    defs: &[Option<Inst>],
+    uses: &[u32],
+) {
+    let mut shift_uses = vec![0_u32; func.types.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            if let Op::Binary(op @ (Binary::Ishl | Binary::Ushr | Binary::Sshr), x, y) =
+                func.insts[inst.index()].op
+                && shift_imm_ok(func, op, x, y)
+            {
+                shift_uses[y.index()] += 1;
+            }
+        }
+    }
+    for (v, &count) in shift_uses.iter().enumerate() {
+        if count == 0 || count != uses[v] || plan.elided[v] {
+            continue;
+        }
+        let Some((_, lanes)) = func.types[v].vec_shape() else {
+            continue;
+        };
+        let Some(scalar) = super::vector::splat_source_of(func, defs, Value(v as u32), lanes)
+        else {
+            continue;
+        };
+        if plan.const_of(scalar).is_none() {
+            continue;
+        }
+        plan.elided[v] = true;
+        if let Some(def) = defs[v]
+            && let Op::Shuffle(a, b, _) = func.insts[def.index()].op
+        {
+            let a_reads = 1 + u32::from(b == a);
+            if uses[a.index()] == a_reads {
+                plan.elided[a.index()] = true;
+            }
         }
     }
 }
