@@ -358,6 +358,24 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
+    pub(super) fn with_cold_tracked_caller_loc<T>(
+        &mut self,
+        run: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let slot_id = self.ins().iconst(Type::I64, 0);
+        let slot = self.call_thread_cell(slot_id, 8, None)?;
+        let prev = self.ins().load(Type::I64, slot, 0);
+        let has = self.ins().icmp_imm(IntCC::NotEqual, prev, 0);
+        let own = self.current_site_location()?;
+        let cur = self.ins().select(has, prev, own);
+        self.ins().store(cur, slot, 0);
+        let res = run(self)?;
+        if self.open {
+            self.ins().store(prev, slot, 0);
+        }
+        Ok(res)
+    }
+
     pub(super) fn with_caller_loc<T>(
         &mut self,
         track: Option<bool>,

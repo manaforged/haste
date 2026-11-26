@@ -336,6 +336,9 @@ impl<'l, 'a> Lower<'l, 'a> {
         if !filling
             && self.inline.stack.is_empty()
             && self.cx.track_caller(self.reached.list[self.index].0.0)
+            && self.typed.calls().any(|(callee, _)| {
+                self.cx.track_caller(callee) && !self.cx.has_attr(callee, "cold")
+            })
         {
             self.enter_tracked_caller_loc()?;
         }
