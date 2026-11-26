@@ -56,6 +56,14 @@ pub(super) struct PtrReloc {
     pub(super) symbol: Symbol,
 }
 
+/// One named function at a `.text` offset in an AOT executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExeSymbol {
+    pub(crate) offset: u32,
+    pub(crate) name: String,
+    pub(crate) exported: bool,
+}
+
 /// A standalone native executable assembled directly from compiled image sections without intermediate object files.
 #[derive(Clone, Debug)]
 pub(crate) struct Executable {
@@ -67,7 +75,8 @@ pub(crate) struct Executable {
     pub(super) entry: Option<(u32, u32)>,
     pub(super) relocs: Vec<CodeReloc>,
     pub(super) pointers: Vec<PtrReloc>,
-    pub(super) symbols: Vec<(u32, String)>,
+    pub(super) symbols: Vec<ExeSymbol>,
+    pub(super) fn_starts: Vec<u32>,
     pub(super) thread_slots: u32,
     pub(super) unwind_table_off: Option<u32>,
     pub(super) lines: Vec<(u32, u64)>,
@@ -105,6 +114,7 @@ impl Executable {
             relocs: Vec::new(),
             pointers: Vec::new(),
             symbols: Vec::new(),
+            fn_starts: Vec::new(),
             thread_slots: 0,
             unwind_table_off: None,
             lines: Vec::new(),
@@ -113,22 +123,54 @@ impl Executable {
         }
     }
 
-    /// Names the function at each `.text` offset in the executable's symbol table.
-    pub(crate) fn symbols(&mut self, mut named: Vec<(u32, String)>) {
-        named.sort_unstable_by_key(|&(offset, _)| offset);
+    /// Names the functions at `.text` offsets in the executable's symbol table.
+    pub(crate) fn symbols(&mut self, mut named: Vec<ExeSymbol>) {
+        named.sort_unstable_by(|a, b| {
+            a.offset
+                .cmp(&b.offset)
+                .then_with(|| a.exported.cmp(&b.exported))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         self.symbols = named;
     }
 
-    fn symbol_names(&self, prefix: &str, strtab: &mut Vec<u8>) -> Vec<u32> {
-        self.symbols
-            .iter()
-            .map(|(_, name)| push_name(strtab, &[prefix, name]))
+    pub(super) fn split_symbols(&self) -> (Vec<&ExeSymbol>, Vec<&ExeSymbol>) {
+        let locals: Vec<&ExeSymbol> = self.symbols.iter().filter(|sym| !sym.exported).collect();
+        let mut exports: Vec<&ExeSymbol> = self.symbols.iter().filter(|sym| sym.exported).collect();
+        exports.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.offset.cmp(&b.offset)));
+        exports.dedup_by(|a, b| a.name == b.name);
+        (locals, exports)
+    }
+
+    pub(super) fn sorted_fn_starts(&self) -> Vec<u32> {
+        let mut starts = self.fn_starts.clone();
+        starts.extend(self.symbols.iter().map(|sym| sym.offset));
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+    }
+
+    pub(super) fn fn_size(&self, starts: &[u32], offset: u32) -> u32 {
+        let next = starts.partition_point(|&start| start <= offset);
+        let end = starts.get(next).copied().unwrap_or(self.text.len() as u32);
+        end.saturating_sub(offset)
+    }
+
+    pub(super) fn push_prefixed_names(
+        syms: &[&ExeSymbol],
+        prefix: &str,
+        strtab: &mut Vec<u8>,
+    ) -> Vec<u32> {
+        syms.iter()
+            .map(|sym| push_name(strtab, &[prefix, &sym.name]))
             .collect()
     }
 
     /// Appends 16-byte-aligned machine code to `.text` and returns its section offset.
     pub(crate) fn text(&mut self, bytes: &[u8]) -> u32 {
-        append_aligned(&mut self.text, bytes, 16)
+        let off = append_aligned(&mut self.text, bytes, 16);
+        self.fn_starts.push(off);
+        off
     }
 
     /// Appends a function to `.text` at `align` bytes, shifted until the fewest of its `loops` cross a 4 KiB address, and returns its section offset.
@@ -160,6 +202,7 @@ impl Executable {
                 .iter()
                 .map(|&(offset, place)| (placed + offset, place)),
         );
+        self.fn_starts.push(placed);
         placed
     }
 

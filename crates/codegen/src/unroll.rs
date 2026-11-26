@@ -317,3 +317,304 @@ pub(crate) fn run(func: &mut Function, target: &Target) -> Domain {
     func.bump_cfg();
     Domain::CFG | Domain::VALUES | Domain::MEM
 }
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use crate::ir::{Binary, IntCC, Op, Type};
+    use crate::{
+        AbiParam, CallConv, Effort, Function, FunctionBuilder, Signature, Target, compile, verify,
+    };
+
+    fn arm64_full() -> Target {
+        let mut target = *Target::find("aarch64-apple-darwin").expect("arm64 darwin target");
+        target.effort = Effort::Full;
+        target
+    }
+
+    fn arm64_words(code: crate::Code) -> Vec<u32> {
+        code.bytes()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn unrolls_ne_loop_with_const_stride_above_one_and_drops_dead_exit_cmps() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let exit = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            let cur_ptr = b.append_block_param(head, Type::I64);
+            let acc = b.append_block_param(head, Type::I64);
+            let out = b.append_block_param(exit, Type::I64);
+
+            b.switch_to_block(entry);
+            let empty = b.ins().icmp(IntCC::Equal, params[0], params[1]);
+            let zero = b.ins().iconst(Type::I64, 0);
+            let step8 = b.ins().iconst(Type::I64, 8);
+            let magic = b.ins().iconst(Type::I64, 0xCCCC_CCCC_CCCC_CCCD_u64 as i64);
+            let sh3 = b.ins().iconst(Type::I64, 3);
+            b.ins().brif(empty, exit, &[zero], head, &[params[0], zero]);
+
+            b.switch_to_block(head);
+            let loaded = b.ins().load(Type::I64, cur_ptr, 0);
+            let hi = b.ins().umulhi(loaded, magic);
+            let q = b.ins().ushr(hi, sh3);
+            let next_acc = b.ins().iadd(acc, q);
+            let next_ptr = b.ins().iadd(cur_ptr, step8);
+            let cont = b.ins().icmp(IntCC::NotEqual, next_ptr, params[1]);
+            b.ins()
+                .brif(cont, head, &[next_ptr, next_acc], exit, &[next_acc]);
+
+            b.switch_to_block(exit);
+            b.ins().return_(&[out]);
+        }
+
+        let target = arm64_full();
+        verify::verify(&func, &target).expect("pre-unroll div_const_10 IR valid");
+
+        let mut direct = func.clone();
+        let domain = run(&mut direct, &target);
+        assert!(!domain.is_empty(), "NotEqual stride=8 loop must unroll");
+        verify::verify(&direct, &target).expect("post-unroll div_const_10 IR valid");
+        assert_eq!(
+            direct.blocks.len(),
+            5,
+            "expected entry, head, exit, guard, unrolled"
+        );
+
+        let guard = &direct.blocks[3];
+        let has_eq_one_guard = guard.insts.iter().any(|&i| {
+            matches!(
+                direct.insts[i.index()].op,
+                Op::Icmp(IntCC::Equal, _, b)
+                    if direct.insts.iter().any(|d| d.result == Some(b) && d.op == Op::Const(1))
+            )
+        });
+        assert!(
+            !has_eq_one_guard,
+            "guard must not emit bogus stride == 1 check"
+        );
+        let has_u32_limit_check = guard.insts.iter().any(|&i| {
+            matches!(
+                direct.insts[i.index()].op,
+                Op::Icmp(IntCC::UnsignedLessThanOrEqual, lim_val, _)
+                    if direct.insts.iter().any(|d| d.result == Some(lim_val) && d.op == Op::Const(32))
+            )
+        });
+        assert!(
+            has_u32_limit_check,
+            "guard must compare s_need=32 <= limit directly"
+        );
+
+        let unrolled = &direct.blocks[4];
+        let umulhi_count = unrolled
+            .insts
+            .iter()
+            .filter(|&&i| matches!(direct.insts[i.index()].op, Op::Binary(Binary::Umulhi, ..)))
+            .count();
+        assert_eq!(umulhi_count, 4, "expected 4x unrolled Umulhi");
+
+        let icmp_count = unrolled
+            .insts
+            .iter()
+            .filter(|&&i| matches!(direct.insts[i.index()].op, Op::Icmp(..)))
+            .count();
+        assert_eq!(
+            icmp_count, 1,
+            "unrolled block must contain only back-edge Icmp, no cloned exit compares"
+        );
+
+        let base_ptr = unrolled.params[0];
+        let step_adds_from_base = unrolled
+            .insts
+            .iter()
+            .filter(|&&i| {
+                matches!(
+                    direct.insts[i.index()].op,
+                    Op::Binary(Binary::Iadd, a, b) if a == base_ptr || b == base_ptr
+                )
+            })
+            .count();
+        assert_eq!(
+            step_adds_from_base, 4,
+            "all 4 unrolled steps must offset directly from base_ptr"
+        );
+
+        let words = arm64_words(compile(func, &target).expect("arm64 div_const_10 compiles"));
+        let umulh_words = words
+            .iter()
+            .filter(|&&w| (w & 0xFFE0_FC00) == 0x9BC0_7C00)
+            .count();
+        assert!(
+            umulh_words >= 4,
+            "compiled ARM64 function must retain live 4x unrolled umulh loop: {words:#x?}"
+        );
+        assert!(
+            !words.contains(&0xD280_0009),
+            "compiled ARM64 function must not emit dead mov x9, #0 guard: {words:#x?}"
+        );
+    }
+
+    #[test]
+    fn unrolls_ne_loop_with_dynamic_stride_using_nonzero_guard() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let exit = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            let cur_ptr = b.append_block_param(head, Type::I64);
+            let acc = b.append_block_param(head, Type::I64);
+            let out = b.append_block_param(exit, Type::I64);
+
+            b.switch_to_block(entry);
+            let empty = b.ins().icmp(IntCC::Equal, params[0], params[1]);
+            let zero = b.ins().iconst(Type::I64, 0);
+            b.ins().brif(empty, exit, &[zero], head, &[params[0], zero]);
+
+            b.switch_to_block(head);
+            let loaded = b.ins().load(Type::I64, cur_ptr, 0);
+            let next_acc = b.ins().iadd(acc, loaded);
+            let next_ptr = b.ins().iadd(cur_ptr, params[2]);
+            let cont = b.ins().icmp(IntCC::NotEqual, next_ptr, params[1]);
+            b.ins()
+                .brif(cont, head, &[next_ptr, next_acc], exit, &[next_acc]);
+
+            b.switch_to_block(exit);
+            b.ins().return_(&[out]);
+        }
+
+        let target = arm64_full();
+        let mut direct = func.clone();
+        assert!(!run(&mut direct, &target).is_empty());
+        verify::verify(&direct, &target).expect("dynamic stride NotEqual IR valid");
+
+        let guard = &direct.blocks[3];
+        let has_ugt_zero = guard.insts.iter().any(|&i| {
+            matches!(
+                direct.insts[i.index()].op,
+                Op::Icmp(IntCC::UnsignedGreaterThan, _, z)
+                    if direct.insts.iter().any(|d| d.result == Some(z) && d.op == Op::Const(0))
+            )
+        });
+        assert!(has_ugt_zero, "dynamic NotEqual guard must check stride > 0");
+        let code = compile(func, &target).expect("dynamic stride NotEqual compiles on ARM64");
+        assert!(!code.bytes().is_empty());
+    }
+
+    #[test]
+    fn skips_trapz_cmps_and_bias_adds_in_unrolled_loop() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let exit = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            let iv = b.append_block_param(head, Type::I64);
+            let acc = b.append_block_param(head, Type::I64);
+            let out = b.append_block_param(exit, Type::I64);
+
+            b.switch_to_block(entry);
+            let zero = b.ins().iconst(Type::I64, 0);
+            b.ins().jump(head, &[zero, zero]);
+
+            b.switch_to_block(head);
+            let in_len = b.ins().icmp(IntCC::UnsignedLessThan, iv, params[1]);
+            b.ins().trapz(in_len);
+            let addr = b.ins().iadd(params[0], iv);
+            let loaded = b.ins().load(Type::I8, addr, 0);
+            let loaded_ext = b.ins().uextend(Type::I64, loaded);
+            let next_acc = b.ins().iadd(acc, loaded_ext);
+            let next_iv = b.ins().iadd_imm(iv, 1);
+            let iv_bias = b.ins().iadd_imm(next_iv, 2);
+            let cont = b.ins().icmp(IntCC::UnsignedLessThan, iv_bias, params[2]);
+            b.ins()
+                .brif(cont, head, &[next_iv, next_acc], exit, &[next_acc]);
+
+            b.switch_to_block(exit);
+            b.ins().return_(&[out]);
+        }
+
+        let target = arm64_full();
+        assert!(!run(&mut func, &target).is_empty());
+        verify::verify(&func, &target).expect("trapz bias unroll IR valid");
+        let unrolled = &func.blocks[4];
+        let trap_count = unrolled
+            .insts
+            .iter()
+            .filter(|&&i| matches!(func.insts[i.index()].op, Op::Trapz(_)))
+            .count();
+        let icmp_count = unrolled
+            .insts
+            .iter()
+            .filter(|&&i| matches!(func.insts[i.index()].op, Op::Icmp(..)))
+            .count();
+        assert_eq!(trap_count, 0);
+        assert_eq!(
+            icmp_count, 1,
+            "unrolled block must drop both trapz and exit compares"
+        );
+    }
+
+    #[test]
+    fn rejects_hoisted_non_positive_constant_stride() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let exit = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            let iv = b.append_block_param(head, Type::I64);
+            let acc = b.append_block_param(head, Type::I64);
+            let out = b.append_block_param(exit, Type::I64);
+
+            b.switch_to_block(entry);
+            let zero = b.ins().iconst(Type::I64, 0);
+            b.ins().jump(head, &[params[0], zero]);
+
+            b.switch_to_block(head);
+            let loaded = b.ins().load(Type::I64, iv, 0);
+            let next_acc = b.ins().iadd(acc, loaded);
+            let next_iv = b.ins().iadd(iv, zero);
+            let cont = b.ins().icmp(IntCC::NotEqual, next_iv, params[1]);
+            b.ins()
+                .brif(cont, head, &[next_iv, next_acc], exit, &[next_acc]);
+
+            b.switch_to_block(exit);
+            b.ins().return_(&[out]);
+        }
+
+        assert!(run(&mut func, &arm64_full()).is_empty());
+        assert_eq!(func.blocks.len(), 3);
+    }
+}

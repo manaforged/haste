@@ -11,13 +11,9 @@ pub(super) struct Counted {
     pub(super) bias: i64,
 }
 
-/// The constant step of an induction value when it is positive, small, and one for a `!=` exit test.
-pub(super) fn stride_const(
-    global_consts: &[Option<i64>],
-    stride: Value,
-    is_ne: bool,
-) -> Option<i64> {
-    global_consts[stride.index()].filter(|&c| c > 0 && c <= (1_i64 << 24) && (!is_ne || c == 1))
+/// The constant step of an induction value when it is positive and small.
+pub(super) fn stride_const(global_consts: &[Option<i64>], stride: Value) -> Option<i64> {
+    global_consts[stride.index()].filter(|&c| c > 0 && c <= (1_i64 << 24))
 }
 
 /// For each value, whether block `b` defines it as a parameter or by one of `body_insts`.
@@ -104,8 +100,10 @@ pub(super) fn counted(
     } else {
         1_i64 << 30
     };
-    let stride_ok =
-        |s: Value| !head_defs[s.index()] || stride_const(global_consts, s, is_ne).is_some();
+    let stride_ok = |s: Value| {
+        stride_const(global_consts, s).is_some()
+            || (!head_defs[s.index()] && global_consts[s.index()].is_none())
+    };
     let mut matched = match_iv_step(func, b, body_insts, back_args, iv_cmp)
         .filter(|&(_, stride)| stride_ok(stride))
         .map(|(idx, stride)| (idx, stride, 0_i64));
@@ -188,7 +186,7 @@ pub(super) fn emit_dynamic_guard(
 ) -> Value {
     let &Counted {
         cmp_cc,
-        is_ne,
+        is_ne: _,
         iv_ty,
         limit,
         iv_idx,
@@ -206,12 +204,7 @@ pub(super) fn emit_dynamic_guard(
     } else {
         let zero = emit_guard(Op::Const(0), iv_ty);
         let sh = emit_guard(Op::Const(i64::from(iv_ty.bits() - 3)), iv_ty);
-        let stride_ok = if is_ne {
-            let one = emit_guard(Op::Const(1), iv_ty);
-            emit_guard(Op::Icmp(IntCC::Equal, stride, one), Type::I8)
-        } else {
-            emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8)
-        };
+        let stride_ok = emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8);
         let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), iv_ty);
         let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh), iv_ty);
         let no_wrap = emit_guard(Op::Icmp(IntCC::Equal, hi_bits, zero), Type::I8);

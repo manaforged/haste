@@ -1,14 +1,171 @@
 //! Child-process execution and fork/pipe helpers for running JIT code and `#[test]` harnesses.
 
 #[cfg(unix)]
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::Ordering;
 
 use anyhow::{Result, bail};
 
 use super::Image;
 
+const PANIC_MARKER: &[u8] = b"HPNC";
+
+fn invoke_unit_test(address: usize) -> bool {
+    extern "C" fn run_fn(ptr: *mut u8) {
+        // SAFETY: `ptr` is the native `fn()` code address checked non-zero before invoking.
+        let test_fn: extern "C" fn() =
+            unsafe { std::mem::transmute::<usize, extern "C" fn()>(ptr as usize) };
+        test_fn();
+        std::hint::black_box(());
+    }
+    extern "C" fn caught(_data: *mut u8, _payload: *mut u8) {}
+    crate::host::unwind::catch_unwind(run_fn, address as *mut u8, caught) != 0
+}
+
+#[cfg(unix)]
+unsafe fn dup_above_stdio(fd: i32) -> i32 {
+    if fd > libc::STDERR_FILENO {
+        return fd;
+    }
+    // SAFETY: `fd` is a live descriptor in this child process; `F_DUPFD_CLOEXEC` duplicates it to `>= 3`.
+    let moved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
+    if moved >= 0 {
+        // SAFETY: `fd` was duplicated to `moved` above, so closing `fd` releases only the old slot.
+        unsafe { libc::close(fd) };
+        moved
+    } else {
+        fd
+    }
+}
+
+#[cfg(unix)]
+unsafe fn redirect_stdio(mut out_fd: i32, mut err_fd: i32) {
+    // SAFETY: `out_fd` and `err_fd` are live distinct pipe write descriptors owned by the child.
+    unsafe {
+        if out_fd == libc::STDERR_FILENO {
+            out_fd = dup_above_stdio(out_fd);
+        }
+        if err_fd == libc::STDOUT_FILENO {
+            err_fd = dup_above_stdio(err_fd);
+        }
+        if out_fd != libc::STDOUT_FILENO {
+            libc::dup2(out_fd, libc::STDOUT_FILENO);
+            libc::close(out_fd);
+        }
+        if err_fd != libc::STDERR_FILENO {
+            libc::dup2(err_fd, libc::STDERR_FILENO);
+            libc::close(err_fd);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn drain_pipes(pipes: &mut [(std::io::PipeReader, &mut Vec<u8>)]) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut active: Vec<usize> = (0..pipes.len()).collect();
+    let mut buf = [0u8; 4096];
+    while !active.is_empty() {
+        let mut fds: Vec<libc::pollfd> = active
+            .iter()
+            .map(|&idx| libc::pollfd {
+                fd: pipes[idx].0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `fds` points to `fds.len()` initialized `pollfd` structs holding live pipe descriptors.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let mut next = Vec::with_capacity(active.len());
+        for (pos, pfd) in fds.iter().enumerate() {
+            let idx = active[pos];
+            if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0 {
+                next.push(idx);
+                continue;
+            }
+            match pipes[idx].0.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    pipes[idx].1.extend_from_slice(&buf[..n]);
+                    next.push(idx);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => next.push(idx),
+                Err(err) => return Err(err),
+            }
+        }
+        active = next;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct TestChildPipes {
+    panic_r: i32,
+    panic_w: i32,
+    stdio: Option<((i32, i32), (i32, i32))>,
+}
+
+#[cfg(unix)]
+fn combine_test_output(mut stdout: Vec<u8>, stderr: &[u8]) -> String {
+    if !stdout.is_empty()
+        && !stderr.is_empty()
+        && !stdout.ends_with(b"\n")
+        && !stderr.starts_with(b"\n")
+    {
+        stdout.push(b'\n');
+    }
+    stdout.extend_from_slice(stderr);
+    String::from_utf8_lossy(&stdout).into_owned()
+}
+
 impl Image {
+    #[cfg(unix)]
+    fn run_test_child(
+        &self,
+        (index, start, address): (usize, Option<usize>, usize),
+        (name, env): (&str, &[(String, String)]),
+        pipes: TestChildPipes,
+    ) -> i32 {
+        // SAFETY: read ends belong only to the parent; write ends belong to this child until moved or closed.
+        let mut panic_file = unsafe {
+            libc::close(pipes.panic_r);
+            if let Some(((or, _), (er, _))) = pipes.stdio {
+                libc::close(or);
+                libc::close(er);
+            }
+            let pw = dup_above_stdio(pipes.panic_w);
+            std::fs::File::from_raw_fd(pw)
+        };
+        for (key, value) in env {
+            // SAFETY: single-threaded forked child process before invoking test function.
+            unsafe { std::env::set_var(key, value) };
+        }
+        crate::host::unwind::set_jit_unwind_head(self.unwind_head);
+        if let Some(((_, ow), (_, ew))) = pipes.stdio {
+            // SAFETY: `ow` and `ew` are live pipe write descriptors belonging to this child.
+            unsafe { redirect_stdio(ow, ew) };
+        }
+        let (panicked, status) = if let Some(start) = start {
+            let status = self.enter_main((start, index), &[name.to_owned()]);
+            (status == 101, status)
+        } else if invoke_unit_test(address) {
+            (true, 101)
+        } else {
+            (false, 0)
+        };
+        if panicked {
+            drop(std::io::Write::write_all(&mut panic_file, PANIC_MARKER));
+        }
+        drop(panic_file);
+        status
+    }
+
     /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.
     #[cfg(feature = "diff-harness")]
     pub fn run_cases(&self, cases: &[(usize, &str)], inputs: &[i64]) -> Result<Vec<i32>> {
@@ -45,47 +202,41 @@ impl Image {
         {
             bail!("{name} has no start wrapper (slot {s})");
         }
-        let (pid, mut output_pipe) = fork_piped(|writer| {
-            for (key, value) in env {
-                // SAFETY: single-threaded forked child process before invoking test function.
-                unsafe { std::env::set_var(key, value) };
-            }
-            crate::host::unwind::set_jit_unwind_head(self.unwind_head);
-            if nocapture {
-                drop(writer);
-            } else {
-                let raw = std::os::fd::AsRawFd::as_raw_fd(&writer);
-                // SAFETY: raw is a live pipe write fd; dup2 redirects child stdout and stderr to it before running the test.
-                unsafe {
-                    if raw != libc::STDOUT_FILENO {
-                        libc::dup2(raw, libc::STDOUT_FILENO);
-                    }
-                    if raw != libc::STDERR_FILENO {
-                        libc::dup2(raw, libc::STDERR_FILENO);
-                    }
-                }
-                if raw != libc::STDOUT_FILENO && raw != libc::STDERR_FILENO {
-                    drop(writer);
-                } else {
-                    std::mem::forget(writer);
-                }
-            }
-            if let Some(start) = start {
-                let status = self.enter_main((start, index), &[name.to_owned()]);
-                if status != 0 {
-                    std::process::exit(status);
-                }
-            } else {
-                // SAFETY: address is code that the encoder wrote for a native fn() signature, checked to be set before the fork.
-                let test_fn: extern "C" fn() =
-                    unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
-                test_fn();
-            }
-            Ok::<(), std::io::Error>(())
-        })?;
-        let mut output = Vec::new();
-        std::io::Read::read_to_end(&mut output_pipe, &mut output)?;
-        Ok((wait(pid), String::from_utf8_lossy(&output).into_owned()))
+        let (panic_read, panic_write) = std::io::pipe()?;
+        let stdio = (!nocapture)
+            .then(|| Ok::<_, std::io::Error>((std::io::pipe()?, std::io::pipe()?)))
+            .transpose()?;
+        let pipes = TestChildPipes {
+            panic_r: panic_read.as_raw_fd(),
+            panic_w: panic_write.as_raw_fd(),
+            stdio: stdio.as_ref().map(|((or, ow), (er, ew))| {
+                (
+                    (or.as_raw_fd(), ow.as_raw_fd()),
+                    (er.as_raw_fd(), ew.as_raw_fd()),
+                )
+            }),
+        };
+        let pid = fork_child(|| self.run_test_child((index, start, address), (name, env), pipes))?;
+        drop(panic_write);
+        let (mut panic_buf, mut stdout_buf, mut stderr_buf) = (Vec::new(), Vec::new(), Vec::new());
+        if let Some(((out_read, out_write), (err_read, err_write))) = stdio {
+            drop(out_write);
+            drop(err_write);
+            drain_pipes(&mut [
+                (panic_read, &mut panic_buf),
+                (out_read, &mut stdout_buf),
+                (err_read, &mut stderr_buf),
+            ])?;
+        } else {
+            drain_pipes(&mut [(panic_read, &mut panic_buf)])?;
+        }
+        let raw_status = wait(pid);
+        let status = if panic_buf == PANIC_MARKER {
+            crate::cli::TEST_PANICKED_STATUS
+        } else {
+            raw_status
+        };
+        Ok((status, combine_test_output(stdout_buf, &stderr_buf)))
     }
 
     /// Runs a single `#[test]` function in-process on non-Unix platforms, returning `(exit_status, stderr)`.
@@ -106,20 +257,20 @@ impl Image {
             if self.slot(s).load(Ordering::Acquire) == 0 {
                 bail!("{name} has no start wrapper (slot {s})");
             }
-            return Ok((
-                self.enter_main((s, index), &[name.to_owned()]),
-                String::new(),
-            ));
+            let status = self.enter_main((s, index), &[name.to_owned()]);
+            let status = if status == 101 {
+                crate::cli::TEST_PANICKED_STATUS
+            } else {
+                status
+            };
+            return Ok((status, String::new()));
         }
-        extern "C" fn run_fn(ptr: *mut u8) {
-            // SAFETY: ptr is the native fn() code address checked non-zero above.
-            let test_fn: extern "C" fn() =
-                unsafe { std::mem::transmute::<usize, extern "C" fn()>(ptr as usize) };
-            test_fn();
-        }
-        extern "C" fn caught(_data: *mut u8, _payload: *mut u8) {}
-        let panicked = crate::host::unwind::catch_unwind(run_fn, address as *mut u8, caught) != 0;
-        Ok((if panicked { 101 } else { 0 }, String::new()))
+        let status = if invoke_unit_test(address) {
+            crate::cli::TEST_PANICKED_STATUS
+        } else {
+            0
+        };
+        Ok((status, String::new()))
     }
 
     #[cfg(feature = "diff-harness")]
@@ -315,7 +466,7 @@ pub(crate) fn close_on_exec(fd: i32) -> Result<i32> {
 }
 
 /// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "diff-harness"))]
 pub(crate) fn fork_piped<E>(
     child: impl FnOnce(std::fs::File) -> Result<(), E>,
 ) -> Result<(libc::pid_t, std::fs::File)> {

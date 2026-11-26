@@ -218,6 +218,35 @@ fn is_preloop_for_remainder(
     }
 }
 
+fn unrolled_skips(
+    func: &Function,
+    (body_insts, trap_insts): (&[Inst], &[Inst]),
+    back_args: &[Value],
+    replaced_iv: Option<Value>,
+) -> Vec<bool> {
+    let mut needed = vec![false; func.types.len()];
+    for &v in back_args {
+        needed[v.index()] = true;
+    }
+    let mut skip = vec![false; body_insts.len()];
+    for (idx, &inst) in body_insts.iter().enumerate().rev() {
+        if trap_insts.contains(&inst) {
+            skip[idx] = true;
+            continue;
+        }
+        let data = &func.insts[inst.index()];
+        if replaced_iv.is_some() && data.result == replaced_iv {
+            continue;
+        }
+        if data.op.is_speculable() && data.result.is_some_and(|r| !needed[r.index()]) {
+            skip[idx] = true;
+            continue;
+        }
+        data.op.for_operands(|v| needed[v.index()] = true);
+    }
+    skip
+}
+
 fn unroll_self_dynamic(
     func: &mut Function,
     cfg: &Cfg,
@@ -273,7 +302,7 @@ fn unroll_self_dynamic(
     else {
         return false;
     };
-    let const_stride = stride_const(global_consts, counted_info.stride, counted_info.is_ne);
+    let const_stride = stride_const(global_consts, counted_info.stride);
     let factor = if inst_count.saturating_sub(trap_insts.len() * 2) <= 16 {
         4_i64
     } else {
@@ -295,8 +324,9 @@ fn unroll_self_dynamic(
         insts: Vec::new(),
     });
     let iv_back = back_args[counted_info.iv_idx];
-    let parallel_strides = (const_stride.is_none()
-        && body_insts.iter().any(|&i| {
+    let parallel_strides = body_insts
+        .iter()
+        .any(|&i| {
             let data = &func.insts[i.index()];
             data.result == Some(iv_back)
                 && matches!(
@@ -305,21 +335,32 @@ fn unroll_self_dynamic(
                         if (a == iv_param && b == counted_info.stride)
                             || (a == counted_info.stride && b == iv_param)
                 )
-        }))
-    .then(|| {
-        let mut strides = vec![counted_info.stride];
-        for k in 2..=(factor as usize) {
-            let prev = strides[k - 2];
-            let next = func.value(counted_info.iv_ty);
-            let add = func.add(
-                Op::Binary(Binary::Iadd, prev, counted_info.stride),
-                Some(next),
-            );
-            func.blocks[guard.index()].insts.push(add);
-            strides.push(next);
-        }
-        strides
-    });
+        })
+        .then(|| {
+            if let Some(c) = const_stride {
+                (1..=(factor as usize))
+                    .map(|k| {
+                        let v = func.value(counted_info.iv_ty);
+                        let imm = func.add(Op::Const(c * k as i64), Some(v));
+                        func.blocks[guard.index()].insts.push(imm);
+                        v
+                    })
+                    .collect()
+            } else {
+                let mut strides = vec![counted_info.stride];
+                for k in 2..=(factor as usize) {
+                    let prev = strides[k - 2];
+                    let next = func.value(counted_info.iv_ty);
+                    let add = func.add(
+                        Op::Binary(Binary::Iadd, prev, counted_info.stride),
+                        Some(next),
+                    );
+                    func.blocks[guard.index()].insts.push(add);
+                    strides.push(next);
+                }
+                strides
+            }
+        });
     let pre_sf = parallel_strides.as_ref().map(|s| s[factor as usize - 1]);
     let safe_limit = emit_dynamic_guard(
         func,
@@ -328,6 +369,12 @@ fn unroll_self_dynamic(
         (const_stride, factor, pre_sf),
         (head, unrolled, guard_params),
         &trap_lens,
+    );
+    let skip_unrolled = unrolled_skips(
+        func,
+        (&body_insts, &trap_insts),
+        back_args,
+        parallel_strides.is_some().then_some(iv_back),
     );
     let iv_base = unrolled_params[counted_info.iv_idx];
     let mut cur_args = unrolled_params;
@@ -338,8 +385,8 @@ fn unroll_self_dynamic(
             .copied()
             .zip(cur_args.iter().copied())
             .collect();
-        for &orig_inst in &body_insts {
-            if trap_insts.contains(&orig_inst) {
+        for (idx, &orig_inst) in body_insts.iter().enumerate() {
+            if skip_unrolled[idx] {
                 continue;
             }
             if let Some(strides) = &parallel_strides {

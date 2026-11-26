@@ -4,23 +4,25 @@ use haste_codegen::{Arch, Os};
 use super::shims::{emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
 use super::tls::TlsLayout;
 use super::{
-    Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers,
-    push_name, resolve_sym,
+    Buf, ELF_BASE, ExeSymbol, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code,
+    plan_veneers, push_name, resolve_sym,
 };
 
 const SECTION_NAMES: &[u8] =
     b"\0.text\0.symtab\0.strtab\0.shstrtab\0.rodata\0.data\0.bss\0.dynstr\0.dynamic\0.debug_line\0";
 const LOCAL_FUNC_IN_TEXT: u32 = 0x0001_0002;
+const GLOBAL_FUNC_IN_TEXT: u32 = 0x0001_0012;
 
 struct ElfTables {
     dynstr: Vec<u8>,
     needed: Vec<u32>,
     sym_offs: Vec<u32>,
+    export_offs: Vec<u32>,
     buckets: Vec<u32>,
     chains: Vec<u32>,
 }
 
-fn elf_hash(name: &[u8]) -> u32 {
+pub(super) fn elf_hash(name: &[u8]) -> u32 {
     name.iter().fold(0u32, |mut h, &byte| {
         h = (h << 4).wrapping_add(u32::from(byte));
         let g = h & 0xF000_0000;
@@ -31,14 +33,9 @@ fn elf_hash(name: &[u8]) -> u32 {
     })
 }
 
-fn build_tables(plan: &Plan<'_>, extra_libs: &[String]) -> ElfTables {
+fn build_tables(plan: &Plan<'_>, extra_libs: &[String], exports: &[&ExeSymbol]) -> ElfTables {
     let mut dynstr = vec![0u8];
-    let mut push_str = |s: &str| {
-        let off = dynstr.len() as u32;
-        dynstr.extend_from_slice(s.as_bytes());
-        dynstr.push(0);
-        off
-    };
+    let mut push_str = |s: &str| push_name(&mut dynstr, &[s]);
     let mut needed = vec![push_str("libc.so.6")];
     plan.libs
         .iter()
@@ -46,12 +43,18 @@ fn build_tables(plan: &Plan<'_>, extra_libs: &[String]) -> ElfTables {
         .for_each(|l| needed.push(push_str(l)));
     extra_libs.iter().for_each(|l| needed.push(push_str(l)));
     let sym_offs: Vec<u32> = plan.imports.iter().map(|imp| push_str(imp.name)).collect();
-    let nsyms = 1 + plan.imports.len();
+    let export_offs = Executable::push_prefixed_names(exports, "", &mut dynstr);
+    let nsyms = 1 + plan.imports.len() + exports.len();
     let nbucket = nsyms.next_power_of_two().max(4);
     let (mut buckets, mut chains) = (vec![0u32; nbucket], vec![0u32; nsyms]);
-    for (i, imp) in plan.imports.iter().enumerate() {
+    let all_names = plan
+        .imports
+        .iter()
+        .map(|imp| imp.name)
+        .chain(exports.iter().map(|exp| exp.name.as_str()));
+    for (i, name) in all_names.enumerate() {
         let idx = (i + 1) as u32;
-        let b = (elf_hash(imp.name.as_bytes()) as usize) % nbucket;
+        let b = (elf_hash(name.as_bytes()) as usize) % nbucket;
         chains[idx as usize] = buckets[b];
         buckets[b] = idx;
     }
@@ -59,6 +62,7 @@ fn build_tables(plan: &Plan<'_>, extra_libs: &[String]) -> ElfTables {
         dynstr,
         needed,
         sym_offs,
+        export_offs,
         buckets,
         chains,
     }
@@ -108,16 +112,11 @@ struct ElfSections {
     dynamic: (u64, usize, usize),
 }
 
-/// Writes the symbol table, string tables, optional DWARF line table, and ELF section headers.
-fn write_symbols(
-    out: &mut Buf,
-    exe: &Executable,
-    sec: &ElfSections,
-    (strtab, fn_strx, prelude, lines): (&[u8], &[u32], &[(usize, usize, u32)], &[u8]),
-) {
+fn write_symbols(out: &mut Buf, exe: &Executable, sec: &ElfSections, syms: &ElfSymData) {
     let has_syms = !exe.symbols.is_empty();
+    let nlocals = 1 + syms.prelude.len() + syms.locals.len();
     let nsyms = if has_syms {
-        1 + fn_strx.len() + prelude.len()
+        nlocals + syms.globals.len()
     } else {
         0
     };
@@ -125,25 +124,25 @@ fn write_symbols(
     let mut strtab_off = sec.symtab_off;
     if has_syms {
         out.bytes(&[0; 24]);
-        for &(off, size, strx) in prelude {
+        for &(off, size, strx) in &syms.prelude {
             out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
             out.u64s(&[sec.rx_base + off as u64, size as u64]);
         }
-        for (at, (&strx, (off, _))) in fn_strx.iter().zip(&exe.symbols).enumerate() {
-            let end = exe
-                .symbols
-                .get(at + 1)
-                .map_or(exe.text.len() as u32, |(next, _)| *next);
+        for &(strx, off, size) in &syms.locals {
             out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
-            out.u64s(&[sec.text_va + u64::from(*off), u64::from(end - off)]);
+            out.u64s(&[sec.text_va + u64::from(off), u64::from(size)]);
+        }
+        for &(strx, off, size) in &syms.globals {
+            out.words(&[strx, GLOBAL_FUNC_IN_TEXT]);
+            out.u64s(&[sec.text_va + u64::from(off), u64::from(size)]);
         }
         strtab_off = out.pos();
-        out.bytes(strtab);
+        out.bytes(&syms.strtab);
     }
     let names_off = out.pos();
     out.bytes(SECTION_NAMES);
     let lines_off = out.pos();
-    out.bytes(lines);
+    out.bytes(&syms.lines);
     out.align(8);
     out.bytes(&[0; 64]);
     write_shdr(
@@ -161,13 +160,13 @@ fn write_symbols(
     if has_syms {
         write_shdr(
             out,
-            [7, 2, 3, nsyms as u32],
+            [7, 2, 3, nlocals as u32],
             [0, 0, sec.symtab_off as u64, (nsyms * 24) as u64, 8, 24],
         );
         write_shdr(
             out,
             [15, 3, 0, 0],
-            [0, 0, strtab_off as u64, strtab.len() as u64, 1, 0],
+            [0, 0, strtab_off as u64, syms.strtab.len() as u64, 1, 0],
         );
     }
     write_shdr(
@@ -222,11 +221,11 @@ fn write_symbols(
             16,
         ],
     );
-    if !lines.is_empty() {
+    if !syms.lines.is_empty() {
         write_shdr(
             out,
             [69, 1, 0, 0],
-            [0, 0, lines_off as u64, lines.len() as u64, 1, 0],
+            [0, 0, lines_off as u64, syms.lines.len() as u64, 1, 0],
         );
     }
 }
@@ -339,6 +338,8 @@ struct HeaderSpec<'a> {
     dyn_seg: (usize, usize),
     tls_seg: (u64, usize, u64),
     tables: &'a ElfTables,
+    text_va: u64,
+    export_spans: &'a [(u32, u32)],
 }
 
 fn write_ro_prefix(out: &mut Buf, spec: &HeaderSpec<'_>, got_va: impl Fn(usize) -> u64) {
@@ -419,6 +420,10 @@ fn write_ro_prefix(out: &mut Buf, spec: &HeaderSpec<'_>, got_va: impl Fn(usize) 
         out.words(&[off, 0x12]);
         out.u64s(&[0, 0]);
     });
+    for (&off, &(fn_off, fn_size)) in spec.tables.export_offs.iter().zip(spec.export_spans) {
+        out.words(&[off, GLOBAL_FUNC_IN_TEXT]);
+        out.u64s(&[spec.text_va + u64::from(fn_off), u64::from(fn_size)]);
+    }
     out.bytes(&spec.tables.dynstr);
     out.align(8);
     let r_type = if spec.arch == Arch::X64 {
@@ -559,32 +564,55 @@ fn write_rx_and_rw(out: &mut Buf, exe: &Executable, body: &EmitBody<'_>) -> Resu
     Ok(())
 }
 
-type OptionalSyms = (
-    Vec<u8>,
-    Vec<u32>,
-    Vec<(usize, usize, u32)>,
-    Vec<u8>,
-    usize,
-    u16,
-    u16,
-);
+struct ElfSymData {
+    strtab: Vec<u8>,
+    locals: Vec<(u32, u32, u32)>,
+    globals: Vec<(u32, u32, u32)>,
+    prelude: Vec<(usize, usize, u32)>,
+    lines: Vec<u8>,
+    shdr_off: usize,
+    shstrndx: u16,
+    shnum: u16,
+}
 
 fn build_optional_syms(
     exe: &Executable,
     plan: &Plan,
     shim_offs: &[usize],
     offs: [usize; 7],
-    (symtab_off, text_va): (usize, u64),
-) -> OptionalSyms {
+    (symtab_off, text_va, fn_starts): (usize, u64, &[u32]),
+) -> ElfSymData {
     let has_syms = !exe.symbols.is_empty();
     let mut strtab = Vec::new();
-    let (fn_strx, prelude) = if has_syms {
+    let (locals, globals, prelude) = if has_syms {
         strtab.push(0);
-        let fn_strx = exe.symbol_names("", &mut strtab);
-        let prelude = build_prelude(plan, shim_offs, offs, &mut strtab);
-        (fn_strx, prelude)
+        let (local_syms, export_syms) = exe.split_symbols();
+        let local_strx = Executable::push_prefixed_names(&local_syms, "", &mut strtab);
+        let export_strx = Executable::push_prefixed_names(&export_syms, "", &mut strtab);
+        let span = |sym: &ExeSymbol| (sym.offset, exe.fn_size(fn_starts, sym.offset));
+        let locals = local_strx
+            .into_iter()
+            .zip(&local_syms)
+            .map(|(strx, s)| {
+                let (off, sz) = span(s);
+                (strx, off, sz)
+            })
+            .collect();
+        let globals = export_strx
+            .into_iter()
+            .zip(&export_syms)
+            .map(|(strx, s)| {
+                let (off, sz) = span(s);
+                (strx, off, sz)
+            })
+            .collect();
+        (
+            locals,
+            globals,
+            build_prelude(plan, shim_offs, offs, &mut strtab),
+        )
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
     let want_lines = !exe.sources.is_empty() || !exe.lines.is_empty();
     let lines = if want_lines {
@@ -593,14 +621,23 @@ fn build_optional_syms(
         Vec::new()
     };
     let sym_bytes = if has_syms {
-        (1 + fn_strx.len() + prelude.len()) * 24 + strtab.len()
+        (1 + prelude.len() + locals.len() + globals.len()) * 24 + strtab.len()
     } else {
         0
     };
     let shdr_off = (symtab_off + sym_bytes + SECTION_NAMES.len() + lines.len()).next_multiple_of(8);
     let shstrndx: u16 = if has_syms { 4 } else { 2 };
     let shnum: u16 = if has_syms { 10 } else { 8 } + u16::from(!lines.is_empty());
-    (strtab, fn_strx, prelude, lines, shdr_off, shstrndx, shnum)
+    ElfSymData {
+        strtab,
+        locals,
+        globals,
+        prelude,
+        lines,
+        shdr_off,
+        shstrndx,
+        shnum,
+    }
 }
 
 pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Result<Vec<u8>> {
@@ -614,10 +651,16 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         tramp_size,
         machine,
     } = arch_layout(arch)?;
+    let (_, exports) = exe.split_symbols();
+    let fn_starts = exe.sorted_fn_starts();
+    let export_spans: Vec<(u32, u32)> = exports
+        .iter()
+        .map(|s| (s.offset, exe.fn_size(&fn_starts, s.offset)))
+        .collect();
     let (rx_base, tables, nsyms) = (
         ELF_BASE + page as u64,
-        build_tables(&plan, &exe.extra_libs),
-        1 + plan.imports.len(),
+        build_tables(&plan, &exe.extra_libs, &exports),
+        1 + plan.imports.len() + exports.len(),
     );
     let (tls, unwind_tls, thread_tls, frame_tls) = elf_tls_addrs(arch, &plan, exe.thread_slots);
     let phnum = if tls == 0 { 6 } else { 7 };
@@ -670,12 +713,12 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let prelude_offs = [
         stubs_off, stub_size, start_off, start_size, tramp_off, tramp_size, head_off,
     ];
-    let (strtab, fn_strx, prelude, lines, shdr_off, shstrndx, shnum) = build_optional_syms(
+    let syms = build_optional_syms(
         exe,
         &plan,
         &shim_offs,
         prelude_offs,
-        (symtab_off, rx_base + text_off as u64),
+        (symtab_off, rx_base + text_off as u64, &fn_starts),
     );
     let bss_va = rw_va + bss_in_rw as u64;
     let rodata_va = ELF_BASE + rodata_off as u64;
@@ -700,9 +743,9 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         machine,
         page,
         phnum,
-        shstrndx,
-        shnum,
-        shdr_off,
+        shstrndx: syms.shstrndx,
+        shnum: syms.shnum,
+        shdr_off: syms.shdr_off,
         entry_va: rx_base + start_off as u64,
         interp,
         interp_off,
@@ -712,6 +755,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         dyn_seg: (dyn_off, dyn_size),
         tls_seg: (bss_va, rw_off + bss_in_rw, tls),
         tables: &tables,
+        text_va: addrs.text,
+        export_spans: &export_spans,
     };
     write_ro_prefix(&mut out, &hdr, |idx| {
         rw_va + ((got_off - rw_off) + idx * 8) as u64
@@ -749,6 +794,6 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         dynstr: (dynstr_off, tables.dynstr.len()),
         dynamic: (rw_va + (dyn_off - rw_off) as u64, dyn_off, dyn_size),
     };
-    write_symbols(&mut out, exe, &sec, (&strtab, &fn_strx, &prelude, &lines));
+    write_symbols(&mut out, exe, &sec, &syms);
     Ok(out.0)
 }

@@ -363,3 +363,150 @@ impl Emit<'_> {
         self.asm.fmov_to_int(dst, V0);
     }
 }
+
+pub(super) const fn size_mask(size: Size) -> u64 {
+    match size {
+        Size::X => u64::MAX,
+        _ => u32::MAX as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{Op, Type};
+    use crate::{AbiParam, CallConv, Effort, Function, FunctionBuilder, IntCC, Signature, Target};
+
+    fn arm64_full() -> Target {
+        let mut target = *Target::find("aarch64-apple-darwin").expect("arm64 darwin target");
+        target.effort = Effort::Full;
+        target
+    }
+
+    fn arm64_words(code: crate::Code) -> Vec<u32> {
+        code.bytes()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn band_folded_zero_does_not_materialize_zero_in_x9() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let eight = b.ins().iconst(Type::I64, 8);
+            let one = b.ins().iconst(Type::I64, 1);
+            let eq = b.ins().icmp(IntCC::Equal, eight, one);
+            let ext = b.ins().uextend(Type::I64, eq);
+            let masked = b.ins().band(params[0], ext);
+            b.ins().return_(&[masked]);
+        }
+        let has_band = func.blocks[0].insts.iter().any(|&i| {
+            matches!(
+                func.insts[i.index()].op,
+                Op::Binary(crate::ir::Binary::Band, ..)
+            )
+        });
+        assert!(has_band);
+        let words = arm64_words(
+            super::super::compile(&func, &arm64_full()).expect("arm64 band zero compiles"),
+        );
+        assert!(
+            words.contains(&0xD280_0000),
+            "expected movz x0, #0 in {words:#x?}"
+        );
+        assert!(
+            !words.contains(&0xD280_0009),
+            "must not load #0 into scratch x9: {words:#x?}"
+        );
+        assert!(
+            !words.iter().any(|&w| (w & 0x7F20_0000) == 0x0A00_0000),
+            "must not emit register AND when mask is known zero: {words:#x?}"
+        );
+    }
+
+    #[test]
+    fn tst_folded_zero_uses_xzr_without_scratch_imm() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            let then_b = b.create_block();
+            let else_b = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let eight = b.ins().iconst(Type::I64, 8);
+            let one = b.ins().iconst(Type::I64, 1);
+            let eq = b.ins().icmp(IntCC::Equal, eight, one);
+            let ext = b.ins().uextend(Type::I64, eq);
+            let masked = b.ins().band(params[0], ext);
+            let zero_cmp = b.ins().icmp_imm(IntCC::Equal, masked, 0);
+            b.ins().brif(zero_cmp, then_b, &[], else_b, &[]);
+
+            b.switch_to_block(then_b);
+            let a = b.ins().iconst(Type::I64, 7);
+            b.ins().return_(&[a]);
+
+            b.switch_to_block(else_b);
+            let c = b.ins().iconst(Type::I64, 9);
+            b.ins().return_(&[c]);
+        }
+        let words = arm64_words(
+            super::super::compile(&func, &arm64_full()).expect("arm64 tst zero compiles"),
+        );
+        assert!(
+            words.contains(&0xEA1F_03FF),
+            "expected tst xzr, xzr in {words:#x?}"
+        );
+        assert!(
+            !words.contains(&0xD280_000A),
+            "must not load #0 into scratch x10 for tst: {words:#x?}"
+        );
+    }
+
+    #[test]
+    fn bor_zero_and_band_all_ones_avoid_scratch_mov() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let eight = b.ins().iconst(Type::I64, 8);
+            let one = b.ins().iconst(Type::I64, 1);
+            let eq = b.ins().icmp(IntCC::Equal, eight, one);
+            let zero = b.ins().uextend(Type::I64, eq);
+            let ones = b.ins().iconst(Type::I64, -1);
+            let same = b.ins().bor(params[1], zero);
+            let still_same = b.ins().band(same, ones);
+            b.ins().return_(&[still_same]);
+        }
+        let words = arm64_words(
+            super::super::compile(&func, &arm64_full()).expect("arm64 identity bitwise compiles"),
+        );
+        assert!(
+            !words.contains(&0xD280_0009) && !words.contains(&0x9280_0009),
+            "must not materialize 0 or -1 in scratch x9: {words:#x?}"
+        );
+        assert!(
+            !words.iter().any(|&w| (w & 0x7F20_0000) == 0x0A00_0000),
+            "must not emit AND for all-ones mask: {words:#x?}"
+        );
+    }
+}

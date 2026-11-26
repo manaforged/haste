@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use haste_codegen::{RelocKind, Target};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::aot::{Executable, Symbol};
+use crate::aot::{ExeSymbol, Executable, Symbol};
 use crate::host::HostSymbol;
 use crate::lower::{SymbolSource, VtableEntry, Word};
 use crate::sync::lock;
@@ -281,8 +281,18 @@ impl Image {
         let state = lock(self.aot().context("image has no AOT recording")?);
         let (debug_info, symbols, fn_align) =
             crate::with_cfg(|c| (c.debug_info, c.symbols, c.fn_align));
+        let mut aot_roots = vec![lang_start, user_main];
+        for (idx, (instance, _)) in reached.list.iter().enumerate() {
+            if idx != lang_start
+                && idx != user_main
+                && state.functions.get(idx).is_some_and(Option::is_some)
+                && export_name(cx, *instance).is_some()
+            {
+                aot_roots.push(idx);
+            }
+        }
         let (live, vmask) = vdce::VtableMask::converge(cx, reached, &state.vtables, |vmask| {
-            let live = AotReach::collect(&state, [lang_start, user_main], vmask);
+            let live = AotReach::collect(&state, &aot_roots, vmask);
             let counts = (live.order.len(), live.vtable_order.len());
             let fns = live.fns.clone();
             (live, fns, counts)
@@ -369,28 +379,90 @@ impl Image {
                     .collect(),
             );
         }
-        if symbols {
-            let mut named: HashMap<u32, usize> = HashMap::default();
-            for &index in &live.order {
-                if let Some(off) = fn_offs[index] {
-                    named.entry(off).or_insert(index);
-                }
-            }
-            exe.symbols(
-                named
-                    .into_iter()
-                    .map(|(off, index)| {
-                        (
-                            off,
-                            reached.list.get(index).map_or_else(
-                                || format!("fn{index}"),
-                                |(instance, _)| cx.symbol_text(*instance),
-                            ),
-                        )
-                    })
-                    .collect(),
-            );
+        let syms = collect_exe_symbols(&live, &fn_offs, symbols, cx, reached);
+        if !syms.is_empty() {
+            exe.symbols(syms);
         }
         Ok(exe)
     }
+}
+
+fn export_name(
+    cx: &crate::sema::Context<'_>,
+    (item, substs): crate::sema::reach::Instance,
+) -> Option<String> {
+    if cx
+        .types
+        .substs(substs)
+        .first()
+        .is_some_and(|&ty| matches!(cx.types.kind(ty), crate::sema::ty::Kind::Closure(..)))
+    {
+        return None;
+    }
+    let (src, entry) = cx.item(item);
+    if entry.attrs.is_empty() {
+        return None;
+    }
+    let env = &cx.outline.crates[item.krate as usize].env;
+    if let Some(name) = env.find_attr(&entry.attrs, crate::outline::tree::Truth::Yes, &|attr| {
+        if let crate::outline::item::Attr::Other(at) = *attr
+            && src.text(at) == "export_name"
+            && src.kind(at + 1) == rustc_lexer::TokenKind::Eq
+        {
+            return src
+                .literal_text(at + 2)
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty());
+        }
+        None
+    }) {
+        return Some(name);
+    }
+    (cx.has_attr(item, "no_mangle") && entry.name.is_some()).then(|| cx.plain_name(item).to_owned())
+}
+
+fn collect_exe_symbols(
+    live: &AotReach,
+    fn_offs: &[Option<u32>],
+    include_locals: bool,
+    cx: &mut crate::sema::Context<'_>,
+    reached: &crate::sema::reach::Reached,
+) -> Vec<ExeSymbol> {
+    let mut out = Vec::new();
+    let mut seen_exports = rustc_hash::FxHashSet::default();
+    let mut local_at_off: HashMap<u32, usize> = HashMap::default();
+    for &index in &live.order {
+        let Some(off) = fn_offs[index] else {
+            continue;
+        };
+        if let Some((instance, _)) = reached.list.get(index)
+            && let Some(name) = export_name(cx, *instance)
+        {
+            if seen_exports.insert(name.clone()) {
+                out.push(ExeSymbol {
+                    offset: off,
+                    name,
+                    exported: true,
+                });
+            }
+            continue;
+        }
+        if include_locals {
+            local_at_off.entry(off).or_insert(index);
+        }
+    }
+    if include_locals {
+        for (off, index) in local_at_off {
+            out.push(ExeSymbol {
+                offset: off,
+                name: reached.list.get(index).map_or_else(
+                    || format!("fn{index}"),
+                    |(instance, _)| cx.symbol_text(*instance),
+                ),
+                exported: false,
+            });
+        }
+    }
+    out
 }

@@ -20,12 +20,12 @@ use super::{
 
 const AOT_MAX_BUCKET: usize = 64;
 
-fn seed_aot_roots(reached: &Reached, roots: [usize; 2]) -> (Vec<AtomicBool>, Vec<usize>) {
+fn seed_aot_roots(reached: &Reached, roots: &[usize]) -> (Vec<AtomicBool>, Vec<usize>) {
     let claimed: Vec<AtomicBool> = (0..reached.list.len())
         .map(|_| AtomicBool::new(false))
         .collect();
     let mut seed = Vec::new();
-    for root in roots {
+    for &root in roots {
         if root < claimed.len() && !claimed[root].swap(true, Ordering::AcqRel) {
             seed.push(root);
         }
@@ -38,7 +38,7 @@ impl Image {
     pub(in crate::image) fn build_aot_streaming(
         cx: &mut Context<'_>,
         reached: &Reached,
-        roots: [usize; 2],
+        roots: &[usize],
     ) -> Result<(Image, FxHashMap<usize, String>)> {
         let mut image = Self::create(reached, ImageMode::Aot, (0, 0, 0))?;
         let cfg = DictConfig::from_env();

@@ -249,12 +249,30 @@ impl Emit<'_> {
                 (None, Some(imm)) => Some((y, imm)),
                 _ => None,
             };
-            if let Some((val, imm)) = imm_pair
-                && let Some(bitmask) = encode_bitmask_imm(imm as u64, size == Size::X)
-            {
-                let left = self.bits(self.peel_uextend(val), A);
-                self.asm.alu_bitmask(alu, size, bitmask, dst, left);
-                return;
+            if let Some((val, imm)) = imm_pair {
+                let uimm = imm as u64;
+                let ty_zero = (uimm & ty.unsigned_max()) == 0;
+                let mask = super::size_mask(size);
+                if alu == Alu::And && ty_zero {
+                    self.asm.mov_imm(dst, 0);
+                    return;
+                }
+                if (matches!(alu, Alu::Orr | Alu::Eor) && ty_zero)
+                    || (alu == Alu::And && (uimm & mask) == mask)
+                {
+                    let left = self.bits(self.peel_uextend(val), A);
+                    if size == Size::X {
+                        self.asm.mov(dst, left);
+                    } else {
+                        self.asm.alu(Alu::Orr, Size::W, dst, ZR, left);
+                    }
+                    return;
+                }
+                if let Some(bitmask) = encode_bitmask_imm(uimm, size == Size::X) {
+                    let left = self.bits(self.peel_uextend(val), A);
+                    self.asm.alu_bitmask(alu, size, bitmask, dst, left);
+                    return;
+                }
             }
         }
         if matches!(alu, Alu::Add | Alu::Sub)
