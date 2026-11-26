@@ -338,7 +338,18 @@ impl<'a> Checker<'_, 'a> {
                 out.extend(arg_srcs);
                 continue;
             }
-            out.extend(self.expr_borrow_sources(ExprId(arg), state));
+            let mut arg_srcs = self.expr_borrow_sources(ExprId(arg), state);
+            if !matches!(self.cx.types.kind(ret_ty), Kind::Closure(..))
+                && let Some(c_expr) = self.closure_expr_of(ExprId(arg))
+                && let Some((ret_real, ret_orig)) = self
+                    .closure_effects
+                    .get(&c_expr)
+                    .and_then(|e| e.ret_targets.as_ref())
+                    .cloned()
+            {
+                arg_srcs.retain(|s| ret_real.contains(&s.target) || ret_orig.contains(&s.target));
+            }
+            out.extend(arg_srcs);
         }
         if let Some(recv) = receiver
             && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))

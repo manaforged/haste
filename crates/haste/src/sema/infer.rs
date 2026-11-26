@@ -582,21 +582,29 @@ impl Infer<'_, '_> {
     }
 
     fn type_param_named(&self, arena: &Body, ty: crate::body::TyId) -> Option<usize> {
-        let crate::body::Ty::Path(path) = *arena.ty(ty) else {
-            return None;
-        };
-        let path = arena.path(path);
-        let &[segment] = arena.list(path.segments) else {
-            return None;
-        };
-        let segment = &arena.segments[segment as usize];
-        if path.qself.is_some() || segment.args.is_some() {
-            return None;
+        match *arena.ty(ty) {
+            crate::body::Ty::ImplTrait(at, _) => {
+                let key = self.src.text(at);
+                self.generics
+                    .iter()
+                    .position(|(generic, _)| scope::same_param(generic, key))
+            }
+            crate::body::Ty::Path(path) => {
+                let path = arena.path(path);
+                let &[segment] = arena.list(path.segments) else {
+                    return None;
+                };
+                let segment = &arena.segments[segment as usize];
+                if path.qself.is_some() || segment.args.is_some() {
+                    return None;
+                }
+                let name = self.src.text(segment.name);
+                self.generics
+                    .iter()
+                    .position(|(generic, _)| *generic == name)
+            }
+            _ => None,
         }
-        let name = self.src.text(segment.name);
-        self.generics
-            .iter()
-            .position(|(generic, _)| *generic == name)
     }
 
     fn param_pat(&mut self, arena: &Body, pat: PatId, ty: Ty, own: Option<PatId>) -> Result<u32> {
