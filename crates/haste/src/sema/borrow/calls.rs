@@ -608,7 +608,7 @@ impl Checker<'_, '_> {
             })
         {
             let origins = non_env_sources(recv);
-            if !origins.is_empty() {
+            if !origins.is_empty() || (recv.is_empty() && self.is_by_val_map_fn(ctx.fn_item)) {
                 self.closure_param_origins.insert(params[0], origins);
                 added.push(params[0]);
             }

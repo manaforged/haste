@@ -363,10 +363,13 @@ impl<'a> Checker<'_, 'a> {
             self.filter_owned_closure_param_sources(ret_ty, &mut recv_sources);
         }
         let maps_inner_copy = (flags.is_iter_fn || flags.is_opt_fn)
-            && flags.fn_name == "map"
-            && arg_ids
-                .first()
-                .is_some_and(|&a| self.closure_copies_inner_ref(ExprId(a)));
+            && matches!(
+                flags.fn_name,
+                "map" | "filter_map" | "flat_map" | "find_map"
+            )
+            && arg_ids.first().is_some_and(|&a| {
+                self.closure_copies_inner_ref(ExprId(a)) || self.closure_peels_outer_ref(ExprId(a))
+            });
         if ((flags.is_iter_fn || flags.is_opt_fn) && matches!(flags.fn_name, "copied" | "cloned"))
             || flags.is_owned_copy_fn
             || maps_inner_copy

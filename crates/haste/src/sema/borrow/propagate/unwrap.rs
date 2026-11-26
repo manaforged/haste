@@ -294,4 +294,35 @@ impl Checker<'_, '_> {
             } if adt_src.text(lt) == "'static"
         )
     }
+
+    pub(super) fn closure_peels_outer_ref(&self, arg: ExprId) -> bool {
+        let cur = self.unwrap_parens(arg);
+        let Expr::Closure { params, .. } = *self.body.expr(cur) else {
+            return false;
+        };
+        let Some(param_local) = self
+            .typed
+            .closures
+            .get(&cur)
+            .filter(|c| c.params.len() == 1)
+            .map(|c| c.params[0])
+        else {
+            return false;
+        };
+        let Kind::Ref(_, inner_ty) = *self.cx.types.kind(self.local_ty(param_local)) else {
+            return false;
+        };
+        if !matches!(
+            *self.cx.types.kind(inner_ty),
+            Kind::Ref(crate::sema::ty::Mut::Not, _)
+        ) {
+            return false;
+        }
+        let param_ids = self.body.list(params);
+        param_ids.len() == 1
+            && matches!(
+                *self.body.pat(self.body.params[param_ids[0] as usize].pat),
+                crate::body::Pat::Ref { .. }
+            )
+    }
 }

@@ -18,6 +18,22 @@ pub(in super::super) struct ActiveClosure {
 }
 
 impl Checker<'_, '_> {
+    pub(super) fn is_by_val_map_fn(&self, fn_item: Option<crate::names::ItemRef>) -> bool {
+        fn_item.is_some_and(|it| {
+            matches!(
+                self.cx.name(it),
+                "map"
+                    | "filter_map"
+                    | "flat_map"
+                    | "and_then"
+                    | "or_else"
+                    | "map_or"
+                    | "map_or_else"
+                    | "map_err"
+            )
+        })
+    }
+
     pub(super) fn mark_closure_arg_static_params(
         &mut self,
         callee_expr: Option<ExprId>,
