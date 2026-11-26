@@ -69,12 +69,17 @@ impl ImageBackend {
         match self {
             Self::Aot(_) => 0xA070_A070_A070_A070,
             Self::LazyJit { fast, optimize } => {
-                if *optimize {
+                let base = if *optimize {
                     0x1A27_0000_1A27_0000
                 } else if *fast || crate::profile() != crate::outline::tree::Profile::Release {
                     0x1A27_FA57_1A27_FA57
                 } else {
                     0x1A27_0000_1A27_0000
+                };
+                if crate::in_host_target() {
+                    base ^ 0x4057_0000_4057_0000
+                } else {
+                    base
                 }
             }
             Self::Check | Self::EagerJit { .. } => 0,

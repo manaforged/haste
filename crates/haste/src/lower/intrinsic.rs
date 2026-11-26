@@ -65,6 +65,7 @@ impl Lower<'_, '_> {
     ) -> Result<Option<Value>> {
         match which {
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
+            Intrinsic::UbChecks => Ok(Some(self.ins().iconst(Type::I8, 0))),
             Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => self.cpuid(args).map(Some),
             Intrinsic::FnAddr => Ok(args.first().copied()),
