@@ -272,8 +272,11 @@ mod unix_ipc {
             crate::MessageFormat::JsonRenderDiagnostics => Some("json-render-diagnostics"),
         };
         let jobs = jobs.to_string();
+        for pkg in &sel.packages {
+            args.push("-p".to_owned());
+            args.push(pkg.clone());
+        }
         for (flag, val) in [
-            ("-p", sel.package.as_deref()),
             ("--bin", sel.bin.as_deref()),
             ("--example", sel.example.as_deref()),
             ("--test", sel.test.as_deref()),
@@ -646,7 +649,9 @@ mod unix_ipc {
                 "the request panicked; the next request loads the workspace again"
             ))
         });
-        if let Err(error) = &done {
+        if let Err(error) = &done
+            && !crate::build::emit_early_json_error(error)
+        {
             drop(writeln!(std::io::stderr(), "error: {error:#}"));
         }
         proto::restore(saved, fds);
@@ -698,7 +703,7 @@ mod unix_ipc {
         #[test]
         fn daemon_args_forwards_all_selection_flags_and_jobs() {
             let sel = crate::Selection {
-                package: Some("pkg".to_owned()),
+                packages: vec!["pkg".to_owned(), "pkg2".to_owned()],
                 workspace: true,
                 all_targets: true,
                 tests: true,
@@ -724,6 +729,7 @@ mod unix_ipc {
             }
             for pair in [
                 ["-p", "pkg"],
+                ["-p", "pkg2"],
                 ["-F", "a,b"],
                 ["--message-format", "json"],
                 ["-j", "6"],

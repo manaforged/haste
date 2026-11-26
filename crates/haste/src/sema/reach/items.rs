@@ -59,6 +59,12 @@ pub(crate) fn typed_once(
     instance: &Instance,
     unlaid: &mut Vec<String>,
 ) -> Result<Arc<Typed>, String> {
+    if cx.types.substs_depth(instance.1) > crate::RECURSION_LIMIT {
+        return Err(format!(
+            "reached the recursion limit while instantiating `{}`",
+            cx.name(instance.0)
+        ));
+    }
     let is_alloc_shim = cx.global_alloc_shim(instance.0).is_some();
     if !is_alloc_shim
         && let Some(typed) = cx.store.finals.get(instance).filter(|t| {

@@ -83,7 +83,7 @@ pub(crate) enum MessageFormat {
 /// Package, binary, and feature selection from the command line or builder.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub(crate) struct Selection {
-    pub package: Option<String>,
+    pub packages: Vec<String>,
     pub bin: Option<String>,
     pub example: Option<String>,
     pub test: Option<String>,

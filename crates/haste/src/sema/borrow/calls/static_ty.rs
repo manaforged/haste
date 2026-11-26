@@ -34,6 +34,37 @@ pub(super) fn ast_ty_is_provably_static(
     ast_ty_is_provably_static_in_mode(&sig.body, src, Some((sig, src)), ty, DynDefault::InSig)
 }
 
+pub(super) fn ast_ty_contains_dyn(body: &Body, ty: TyId) -> bool {
+    match *body.ty(ty) {
+        AstTy::DynTrait(_) => true,
+        AstTy::Paren(t)
+        | AstTy::Slice(t)
+        | AstTy::Array(t, _)
+        | AstTy::Pat(t, _)
+        | AstTy::Ptr { ty: t, .. }
+        | AstTy::Ref { ty: t, .. } => ast_ty_contains_dyn(body, t),
+        AstTy::Tuple(list) => body
+            .list(list)
+            .iter()
+            .any(|&t| ast_ty_contains_dyn(body, TyId(t))),
+        AstTy::Path(path_id) => {
+            body.list(body.path(path_id).segments).iter().any(|&s_id| {
+                match body.segments[s_id as usize].args {
+                    Some(Args::Angle(args)) => body.list(args).iter().any(|&a| {
+                        matches!(
+                            body.args[a as usize],
+                            GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. }
+                                if ast_ty_contains_dyn(body, t)
+                        )
+                    }),
+                    _ => false,
+                }
+            })
+        }
+        _ => false,
+    }
+}
+
 pub(in super::super) fn ast_ty_is_provably_static_in(
     body: &Body,
     src: &Source,

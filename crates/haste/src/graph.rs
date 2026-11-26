@@ -293,7 +293,7 @@ pub(crate) fn load(
     load_filtered(
         root,
         targets,
-        selection.package.as_deref(),
+        &selection.packages,
         &features,
         (!selection.no_default_features, selection.all_features),
         (&[], true),
@@ -516,7 +516,7 @@ fn load_synced_packages(
 fn load_filtered(
     root: &Path,
     targets: &Targets,
-    package: Option<&str>,
+    selected: &[String],
     features: &[&str],
     (default_features, all_features): (bool, bool),
     (omit_root_deps, allow_fetch): (&[&str], bool),
@@ -531,9 +531,10 @@ fn load_filtered(
         .unwrap_or(canonical.as_path());
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
-    let root_names = match package {
-        Some(name) => vec![name.to_owned()],
-        None => root_package_names(root, &top, workspace.as_ref())?,
+    let root_names = if selected.is_empty() {
+        root_package_names(root, &top, workspace.as_ref())?
+    } else {
+        selected.to_vec()
     };
     let catalog = SourceCatalog::load(&top)?;
     let (paths, mut packages, mut missing) = load_synced_packages(
@@ -560,11 +561,14 @@ fn load_filtered(
         })
         .map(|(at, _)| at)
         .collect();
-    if members.is_empty() {
-        match package {
-            Some(name) => bail!("package `{name}` is not in {LOCK_FILE}"),
-            None => bail!("{} is not in {LOCK_FILE}", root.display()),
+    if !selected.is_empty() {
+        for name in selected {
+            if !members.iter().any(|&at| packages[at].locked.name == *name) {
+                bail!("package `{name}` is not in {LOCK_FILE}");
+            }
         }
+    } else if members.is_empty() {
+        bail!("{} is not in {LOCK_FILE}", root.display());
     }
     let resolve = |pkgs: &[Package]| {
         features::resolve(
@@ -726,7 +730,7 @@ pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
     let mut sysroot = load_filtered(
         &sysroot_dir,
         targets,
-        None,
+        &[],
         features,
         (true, false),
         (&["test"], false),

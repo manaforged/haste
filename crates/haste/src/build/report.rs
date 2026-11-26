@@ -330,19 +330,62 @@ fn push_json_child(out: &mut String, level: &str, message: &str) {
     out.push_str(",\"spans\":[],\"children\":[],\"rendered\":null}");
 }
 
+fn push_json_package_header(out: &mut String, file: Option<&str>) {
+    let raw = file
+        .and_then(find_manifest_path)
+        .unwrap_or_else(|| "Cargo.toml".to_owned());
+    let abs = std::path::absolute(&raw).unwrap_or_else(|_| std::path::PathBuf::from(&raw));
+    let manifest = abs.to_string_lossy().into_owned();
+    let dir = abs
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| ".".to_owned(), |p| p.to_string_lossy().into_owned());
+    let table = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|s| toml::from_str::<toml::Table>(&s).ok());
+    let pkg = table.as_ref().and_then(|t| t.get("package")?.as_table());
+    let str_key = |k: &str| pkg.and_then(|p| p.get(k)?.as_str());
+    let name = str_key("name")
+        .map(str::to_owned)
+        .or_else(|| {
+            std::path::Path::new(&dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    let version = str_key("version").unwrap_or("0.0.0");
+    let edition = str_key("edition").unwrap_or("2021");
+    let src_path = file.map_or_else(|| format!("{dir}/src/lib.rs"), str::to_owned);
+    let kind = if src_path.ends_with("main.rs")
+        || src_path.contains("/bin/")
+        || src_path.contains("\\bin\\")
+    {
+        "bin"
+    } else {
+        "lib"
+    };
+    let package_id = format!("{name} {version} (path+file://{dir})");
+    for (prefix, val) in [
+        (",\"package_id\":", package_id.as_str()),
+        (",\"manifest_path\":", manifest.as_str()),
+        (",\"target\":{\"kind\":[", kind),
+        ("],\"crate_types\":[", kind),
+        ("],\"name\":", name.as_str()),
+        (",\"src_path\":", src_path.as_str()),
+        (",\"edition\":", edition),
+    ] {
+        out.push_str(prefix);
+        push_json_str(out, val);
+    }
+    out.push_str(",\"doc\":true,\"doctest\":true,\"test\":true}");
+}
+
 fn format_json_diagnostic(diag: &str) -> String {
     let parsed = parse_diagnostic(diag);
     let rendered = format!("{}\n", format_diagnostic(diag));
-    let mut out = String::with_capacity(diag.len() + 256);
+    let mut out = String::with_capacity(diag.len() + 512);
     out.push_str("{\"reason\":\"compiler-message\"");
-    if let Some(manifest) = parsed
-        .spans
-        .first()
-        .and_then(|s| find_manifest_path(s.file))
-    {
-        out.push_str(",\"manifest_path\":");
-        push_json_str(&mut out, &manifest);
-    }
+    push_json_package_header(&mut out, parsed.spans.first().map(|s| s.file));
     out.push_str(",\"message\":{\"$message_type\":\"diagnostic\",\"level\":\"error\",\"code\":");
     match parsed.code {
         Some(code) => {
@@ -391,6 +434,26 @@ pub(super) fn format_diagnostics(diagnostics: &[String]) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n\n")
     })
+}
+
+pub(super) fn split_error_diagnostics(text: &str) -> Vec<String> {
+    if !crate::diag::is_rendered(text) {
+        return vec![text.to_owned()];
+    }
+    let mut out = Vec::new();
+    let (mut start, mut offset) = (0usize, 0usize);
+    for line in text.split_inclusive('\n') {
+        if offset > start && crate::diag::is_rendered(line) {
+            out.push(text[start..offset].trim_end_matches('\n').to_owned());
+            start = offset;
+        }
+        offset += line.len();
+    }
+    let tail = text[start..].trim_end_matches('\n');
+    if !tail.is_empty() {
+        out.push(tail.to_owned());
+    }
+    out
 }
 
 pub(super) fn print_formatted_diagnostics(diagnostics: &[String]) {
@@ -718,5 +781,17 @@ mod tests {
         let bad = text.find("bad").expect("bad");
         assert_eq!(span_byte_range(text, 3, 5, 8), (bad, bad + 3));
         assert_eq!(span_byte_range(text, 0, 1, 2), (0, 0));
+    }
+
+    #[test]
+    fn json_diagnostic_includes_package_id_manifest_and_target() {
+        let json = format_json_diagnostic("error[syntax]: expected `)`\n --> src/main.rs:1:10");
+        assert!(json.contains("\"reason\":\"compiler-message\""));
+        assert!(json.contains("\"package_id\":\""));
+        assert!(json.contains("\"manifest_path\":\""));
+        assert!(json.contains("\"target\":{\"kind\":[\"bin\"],\"crate_types\":[\"bin\"],"));
+        let plain = format_json_diagnostic("package `missing` is not in Cargo.lock");
+        assert!(plain.contains("\"package_id\":\""));
+        assert!(plain.contains("\"spans\":[]"));
     }
 }

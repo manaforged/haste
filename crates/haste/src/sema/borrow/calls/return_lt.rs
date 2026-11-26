@@ -12,10 +12,10 @@ use super::lifetimes::{
     Lifetimes, collect_ty_lifetimes, is_owned_container, lifetime_outlives_in_headers, owned_lts,
 };
 
-pub(super) use super::static_ty::ast_ty_is_provably_static;
 pub(in super::super) use super::static_ty::{
     ast_ref_dyn_requires_static, ast_ty_is_provably_static_in,
 };
+pub(super) use super::static_ty::{ast_ty_contains_dyn, ast_ty_is_provably_static};
 
 pub(in super::super) fn lifetime_outlives_in_item(
     cx: &mut crate::sema::Context<'_>,
@@ -381,44 +381,144 @@ impl super::super::Checker<'_, '_> {
             })
     }
 
+    pub(in super::super) fn check_call_static_dyn_arg(
+        &mut self,
+        sig: &crate::body::sig::Signature,
+        sig_src: &Source,
+        param_ty: TyId,
+        arg: ExprId,
+        sources: &[BorrowSource],
+    ) -> Result<()> {
+        if ast_ty_is_provably_static(sig, sig_src, param_ty)
+            && ast_ty_contains_dyn(&sig.body, param_ty)
+        {
+            self.check_static_dyn_sources(arg, sources)?;
+            self.check_static_local_args(arg, "argument")?;
+            return Ok(());
+        }
+        if ast_ref_dyn_requires_static(&sig.body, sig_src, Some((sig, sig_src)), param_ty) {
+            self.check_ref_dyn_static_pointee(arg, sources)?;
+        }
+        Ok(())
+    }
+
+    fn check_static_dyn_sources(&mut self, arg: ExprId, sources: &[BorrowSource]) -> Result<()> {
+        let in_const = self.is_const_or_static_item();
+        for s in sources {
+            if is_temp_target(s.target).is_some() {
+                if in_const
+                    && self.temp_target_allowed(s.mutable)
+                    && !self.is_non_promotable_temp(arg)
+                {
+                    continue;
+                }
+                return Err(self.does_not_live_long_enough(Some(arg), s.target));
+            }
+            if let Some(origins) = self.closure_param_origins.get(&s.target).cloned() {
+                self.check_static_dyn_sources(arg, &origins)?;
+                continue;
+            }
+            let target_ty = self.local_ty(s.target);
+            let pointee = match *self.cx.types.kind(target_ty) {
+                Kind::Ref(_, pointee) => Some(pointee),
+                _ => None,
+            };
+            let peeled_static_inner = s.origin_only
+                && target_ty != crate::sema::ty::Ty::NONE
+                && self.param_inner_is_static(s.target)
+                && pointee.is_some_and(|p| self.ty_holds_borrow(p));
+            let lt_mismatch = self.is_non_static_param(s.target) && !peeled_static_inner;
+            if !self.from_caller(s.target, s.through_ref) || lt_mismatch {
+                return Err(self.does_not_live_long_enough(Some(arg), s.target));
+            }
+        }
+        Ok(())
+    }
+
+    fn ref_dyn_static_err(&self, expr: ExprId, local: u32) -> anyhow::Error {
+        self.borrow_err(
+            Some(expr),
+            format!(
+                "borrowed data `{}` escapes outside of function: `dyn` trait object requires `'static` lifetime",
+                self.local_name(local)
+            ),
+        )
+    }
+
     pub(in super::super) fn check_ref_dyn_static_pointee(
         &mut self,
         expr: ExprId,
         sources: &[BorrowSource],
     ) -> Result<()> {
         let unwrapped = self.unwrap_parens(expr);
-        if let Some(coercion) = self
+        let vtable_ty = self
             .typed
             .coercions
             .get(&expr)
             .or_else(|| self.typed.coercions.get(&unwrapped))
-            && let Some(vtable) = coercion.vtable()
-            && self.ty_is_borrow_free(vtable.ty)
-        {
+            .and_then(|c| c.vtable())
+            .map(|v| v.ty);
+        if vtable_ty.is_some_and(|ty| self.ty_is_borrow_free(ty)) {
             return Ok(());
         }
+        if let Expr::Ref {
+            raw: false,
+            expr: inner,
+            ..
+        } = *self.body.expr(unwrapped)
+        {
+            let outer_place = self.root_place(inner);
+            for src in sources {
+                if let Some(ref p) = outer_place {
+                    if !p.through_ref
+                        && src.target == p.local
+                        && !src.through_ref
+                        && !self.is_non_static_param(p.local)
+                    {
+                        continue;
+                    }
+                    if p.through_ref && src.target == p.local && self.param_inner_is_static(p.local)
+                    {
+                        continue;
+                    }
+                } else if is_temp_target(src.target).is_some() {
+                    continue;
+                }
+                if self.is_non_static_param(src.target)
+                    || (is_temp_target(src.target).is_none()
+                        && !self.from_caller(src.target, src.through_ref))
+                {
+                    return Err(self.ref_dyn_static_err(expr, src.target));
+                }
+            }
+            return self.check_static_local_args(inner, "`dyn` trait object");
+        }
+        let has_non_bf_local = sources.iter().any(|s| {
+            let ty = self.local_ty(s.target);
+            is_temp_target(s.target).is_none()
+                && !self.from_caller(s.target, s.through_ref)
+                && ty != crate::sema::ty::Ty::NONE
+                && !self.ty_is_borrow_free(ty)
+        });
         for src in sources {
             if self.is_non_static_param(src.target) && !self.param_inner_is_static(src.target) {
-                return Err(self.borrow_err(
-                    Some(expr),
-                    format!(
-                        "borrowed data `{}` escapes outside of function: `dyn` trait object requires `'static` lifetime",
-                        self.local_name(src.target)
-                    ),
-                ));
+                return Err(self.ref_dyn_static_err(expr, src.target));
+            }
+            if is_temp_target(src.target).is_none()
+                && !self.from_caller(src.target, src.through_ref)
+                && match vtable_ty {
+                    Some(vt) => sources.len() > 1 || self.local_ty(src.target) != vt,
+                    None => has_non_bf_local && sources.len() > 1,
+                }
+            {
+                return Err(self.ref_dyn_static_err(expr, src.target));
             }
         }
         if let Some(local) = self.expr_plain_local(unwrapped)
             && self.is_non_static_param(local)
             && !self.param_inner_is_static(local)
         {
-            return Err(self.borrow_err(
-                Some(expr),
-                format!(
-                    "borrowed data `{}` escapes outside of function: `dyn` trait object requires `'static` lifetime",
-                    self.local_name(local)
-                ),
-            ));
+            return Err(self.ref_dyn_static_err(expr, local));
         }
         Ok(())
     }
@@ -486,7 +586,7 @@ impl super::super::Checker<'_, '_> {
             self.check_return_named_lt(expr, src)?;
         }
         if self.closure_depth == 0 && returns_only_static {
-            self.check_return_static_local_args(expr)?;
+            self.check_static_local_args(expr, "return type")?;
         }
         if self.closure_depth == 0 && self.ret_ref_dyn_requires_static() {
             self.check_ref_dyn_static_pointee(expr, sources)?;
@@ -497,29 +597,29 @@ impl super::super::Checker<'_, '_> {
         Ok(())
     }
 
-    fn check_return_static_local_args(&mut self, mut expr: ExprId) -> Result<()> {
+    fn check_static_local_args(&mut self, mut expr: ExprId, subject: &str) -> Result<()> {
         expr = self.unwrap_parens(expr);
         match *self.body.expr(expr) {
             Expr::Cast(inner, _) | Expr::Ref { expr: inner, .. } => {
-                self.check_return_static_local_args(inner)
+                self.check_static_local_args(inner, subject)
             }
             Expr::Block {
                 kind,
                 tail: Some(tail),
                 ..
-            } if kind != BlockKind::Const => self.check_return_static_local_args(tail),
+            } if kind != BlockKind::Const => self.check_static_local_args(tail, subject),
             Expr::Tuple(list) | Expr::Array(list) => {
                 for id in self.body.list(list).to_vec() {
-                    self.check_return_static_local_args(ExprId(id))?;
+                    self.check_static_local_args(ExprId(id), subject)?;
                 }
                 Ok(())
             }
             Expr::Struct { fields, base, .. } => {
                 for id in self.body.list(fields).to_vec() {
-                    self.check_return_static_local_args(self.body.fields[id as usize].value)?;
+                    self.check_static_local_args(self.body.fields[id as usize].value, subject)?;
                 }
                 if let Some(b) = base {
-                    self.check_return_static_local_args(b)?;
+                    self.check_static_local_args(b, subject)?;
                 }
                 Ok(())
             }
@@ -542,7 +642,7 @@ impl super::super::Checker<'_, '_> {
                 ) || is_owned_new;
                 if is_wrapper {
                     for id in self.body.list(args).to_vec() {
-                        self.check_return_static_local_args(ExprId(id))?;
+                        self.check_static_local_args(ExprId(id), subject)?;
                     }
                 }
                 Ok(())
@@ -554,7 +654,7 @@ impl super::super::Checker<'_, '_> {
                     return Err(self.borrow_err(
                         Some(expr),
                         format!(
-                            "borrowed data `{}` escapes outside of function: return type requires `'static` lifetime",
+                            "borrowed data `{}` escapes outside of function: {subject} requires `'static` lifetime",
                             self.local_name(local)
                         ),
                     ));

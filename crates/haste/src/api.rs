@@ -165,7 +165,7 @@ impl CompilerBuilder {
 
     /// Selects a specific workspace package.
     pub fn package(mut self, package: impl Into<String>) -> Self {
-        self.config.selection.package = Some(package.into());
+        self.config.selection.packages.push(package.into());
         self
     }
 

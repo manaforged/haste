@@ -61,7 +61,7 @@ impl BatchKind {
             BatchKind::LibCheck => check_fn_items(workspace, outline, None),
             BatchKind::MainCheck => {
                 let sel = crate::selection();
-                let target = (sel.package.is_some() || sel.bin.is_some() || sel.example.is_some())
+                let target = (sel.bin.is_some() || sel.example.is_some())
                     .then(|| main_item(workspace, outline).map(|m| m.krate as usize))
                     .flatten();
                 check_fn_items(workspace, outline, target)

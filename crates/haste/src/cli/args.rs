@@ -306,7 +306,7 @@ fn apply_value_flag<I: Iterator<Item = std::ffi::OsString>>(
 ) -> Result<bool> {
     match name {
         "-p" | "--package" => {
-            opts.selection.package = Some(take_non_empty(
+            opts.selection.packages.push(take_non_empty(
                 args,
                 eq_val,
                 "--package takes a package name",
@@ -759,5 +759,13 @@ mod tests {
         assert!(parse_strs(&["build", "--no-run"]).is_err());
         let u = usage();
         assert!(u.contains("--lib") && u.contains("--bins") && u.contains("--frozen"));
+    }
+
+    #[test]
+    fn parses_multiple_package_flags_in_order() {
+        let ((_, _, _, _, _, cfg), _) = parse_strs(&["check", "-p", "a", "-p", "b", "--package=c"])
+            .expect("valid")
+            .expect("not meta");
+        assert_eq!(cfg.selection.packages, vec!["a", "b", "c"]);
     }
 }

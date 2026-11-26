@@ -34,7 +34,19 @@ impl Infer<'_, '_> {
     ) -> Result<Ty> {
         if op == UnOp::Deref {
             let found = self.expr(operand, None)?;
-            return self.deref(expr, found);
+            let ty = self.known_ty(found)?;
+            if matches!(self.cx.types.kind(ty), Kind::Ptr(..))
+                && !self.cx.outline.is_sysroot(self.home.krate)
+                && !self.in_unsafe_ctx()
+            {
+                return Err(self.diag_expr(
+                    DiagnosticKind::Unsafe,
+                    Some(expr),
+                    "dereference of raw pointer is unsafe and requires unsafe function or block",
+                    "dereference of raw pointer",
+                ));
+            }
+            return self.deref(expr, ty);
         }
         let ty = self.expr(operand, expected)?;
         if self.is_int(ty) || self.is_float(ty) || self.resolve(ty) == self.cx.types.bool() {
@@ -465,7 +477,11 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn check_packed_ref(&mut self, mut cur: ExprId, field_ty: Ty) -> Result<()> {
+    pub(in super::super) fn check_packed_ref(
+        &mut self,
+        mut cur: ExprId,
+        field_ty: Ty,
+    ) -> Result<()> {
         let field_ty = self.resolve(field_ty);
         let (has_vars, has_params) = (self.has_vars(field_ty), self.has_params(field_ty));
         let field_align = (!has_vars && !has_params)

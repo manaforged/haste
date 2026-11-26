@@ -119,9 +119,11 @@ impl Checker<'_, '_> {
             }
             let ref_static = matches!(*sig.body.ty(param_ty), AstTy::Ref { lifetime: Some(lt), .. } if sig_src.text(lt) == "'static");
             let bounds = self.param_bound_reqs(sig, sig_src, param_ty);
+            let sources = arg_sources.get(idx).map_or(&[][..], Vec::as_slice);
             if bounds.req_static || ref_static {
-                let sources = arg_sources.get(idx).map_or(&[][..], Vec::as_slice);
                 self.check_caller_lt_sources(arg, sources, true, &[], false)?;
+            } else {
+                self.check_call_static_dyn_arg(sig, sig_src, param_ty, arg, sources)?;
             }
             if bounds.req_fn
                 || bounds.req_fn_mut
@@ -129,14 +131,7 @@ impl Checker<'_, '_> {
                 || !bounds.hrtb_params.is_empty()
                 || !bounds.hrtb_non_ret.is_empty()
             {
-                self.check_closure_arg_reqs(
-                    arg,
-                    bounds.req_fn,
-                    bounds.req_fn_mut,
-                    bounds.req_static,
-                    &bounds.hrtb_params,
-                    &bounds.hrtb_non_ret,
-                )?;
+                self.check_closure_arg_reqs(arg, &bounds)?;
             }
         }
         Ok(())
@@ -491,17 +486,11 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    fn check_closure_arg_reqs(
-        &mut self,
-        expr: ExprId,
-        req_fn: bool,
-        req_fn_mut: bool,
-        req_static: bool,
-        hrtb_params: &[(usize, bool)],
-        hrtb_non_ret: &[usize],
-    ) -> Result<()> {
+    fn check_closure_arg_reqs(&mut self, expr: ExprId, bounds: &ParamBounds) -> Result<()> {
         let Some(c_expr) = self.closure_expr_of(expr) else {
-            if !hrtb_non_ret.is_empty() && self.fn_item_returns_hrtb_param(expr, hrtb_non_ret) {
+            if !bounds.hrtb_non_ret.is_empty()
+                && self.fn_item_returns_hrtb_param(expr, &bounds.hrtb_non_ret)
+            {
                 return Err(self.borrow_err(Some(expr), "borrowed data escapes outside of closure"));
             }
             return Ok(());
@@ -510,14 +499,24 @@ impl Checker<'_, '_> {
             return Ok(());
         };
         if eff.param_loans.iter().any(|pl| {
-            hrtb_params
+            bounds
+                .hrtb_params
                 .iter()
                 .any(|&(idx, nested)| idx == pl.param_idx && (nested || !pl.derefs_past_outer_ref))
-        }) || eff.ret_params.iter().any(|p| hrtb_non_ret.contains(p))
+        }) || eff
+            .ret_params
+            .iter()
+            .any(|p| bounds.hrtb_non_ret.contains(p))
         {
             return Err(self.borrow_err(Some(expr), "borrowed data escapes outside of closure"));
         }
-        self.check_closure_effects(Some(expr), eff, req_fn, req_fn_mut, req_static)
+        self.check_closure_effects(
+            Some(expr),
+            eff,
+            bounds.req_fn,
+            bounds.req_fn_mut,
+            bounds.req_static,
+        )
     }
 
     fn fn_item_returns_hrtb_param(&mut self, arg: ExprId, hrtb_non_ret: &[usize]) -> bool {

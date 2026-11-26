@@ -327,6 +327,20 @@ fn check_impl_method_compat(
     let (Ok(impl_sig), Ok(trait_sig)) = (cx.signature(impl_item), cx.signature(trait_item)) else {
         return Ok(());
     };
+    if impl_sig.is_unsafe != trait_sig.is_unsafe {
+        let label = if trait_sig.is_unsafe {
+            "expected unsafe fn, found safe fn"
+        } else {
+            "expected safe fn, found unsafe fn"
+        };
+        return Err(compat_diag(
+            format!("method `{name}` has an incompatible type for trait"),
+            item_name_span(cx, impl_item),
+            label,
+            item_name_span(cx, trait_item),
+        )
+        .into());
+    }
     let impl_own = type_params(&impl_sig.generics).count();
     let trait_own = type_params(&trait_sig.generics).count();
     let total = outer + impl_own;
