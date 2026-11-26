@@ -1,12 +1,12 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
 `haste` is currently experimental (`version = "0.0.0"`, no tagged release yet). Security fixes are applied to the `main` branch on a best-effort basis.
 
-## Security Model
+## Security model
 
-- Like `cargo`, `haste` executes crate `build.rs` scripts and procedural macros unsandboxed as the invoking user. Only build trusted workspaces.
+- Like `cargo`, `haste` (both the CLI and library methods such as `Compiler::check`, `test`, and `emit`) executes crate `build.rs` scripts and procedural macros unsandboxed with the invoking user's privileges. Only build trusted workspaces directly; untrusted or customer-submitted repositories require isolated, resource-limited workers without service credentials.
 - `haste serve` listens on a per-user Unix domain socket (abstract namespace on Linux, temp file on macOS) and verifies the peer UID on every connection.
 - Dependency lookup matches `Cargo.lock` `source` URLs against `.cargo/config.toml` `[source.*]` / `replace-with` entries and verifies `.cargo-checksum.json` package hashes when present.
 - When locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless `CARGO_NET_OFFLINE=true` or `[net] offline = true` is set, or dependencies are vendored via `cargo vendor` / `.cargo/config.toml`.

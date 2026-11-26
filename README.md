@@ -40,9 +40,15 @@ haste --release build -o ./haste-demo-bin haste-demo
 
 If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` automatically. If locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless `CARGO_NET_OFFLINE=true` or `[net] offline = true` is set. Dependency lookup matches `Cargo.lock` `source` URLs against `.cargo/config.toml` `[source.*]` / `replace-with` entries, honors `cargo vendor` offline, and verifies `.cargo-checksum.json` package hashes when present.
 
-### Incremental daemon
+### Three incremental workflows: one-shot, daemon, and library
 
-Plain `haste` commands never spawn a background process, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set. Opt in to a background daemon on Unix with `--daemon` for `8–9 ms` incremental edit checks (900 s idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`), and inspect or stop daemons with `serve status` and `serve stop` (`PATH` is optional):
+`haste` has three distinct execution models with different incremental latency:
+
+1. **One-shot CLI (`haste build`):** runs a fresh process per invocation, re-checks the local crate, and caches only dependency summaries on disk. On a 340-crate workspace (macOS ARM64, 6 CPUs), leaf edits take `2.35 s` median (`2.33–2.49 s`) and public-type edits take `2.35 s` (`2.33–2.40 s`), compared to `1.95 s` (leaf) and `2.21 s` (public-type) for `cargo check`.
+2. **Resident daemon (`haste build --daemon`, Unix):** keeps workspace and dependency state warm in a background `haste serve` process (`900 s` idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`). On small crates, single-line edits take `8.4–9.0 ms`. On the 340-crate workspace, daemon cold start takes `4.65 s`, leaf edits drop to `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check`), and cross-crate public-type edits take `3.00 s` (`2.94–3.09 s`). Plain `haste` commands never spawn a daemon, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set.
+3. **Embeddable library (`haste::Compiler`):** retains configuration across calls, but loads a fresh build on every `check`, `test`, or `emit` call. It does not run a resident daemon, so embedders should not assume `--daemon` edit latency.
+
+Inspect or stop background daemons with `serve status` and `serve stop` (`PATH` is optional):
 
 ```bash
 haste build --daemon haste-demo
@@ -87,7 +93,12 @@ Resident-daemon edits (`--daemon`) compare a warm background `haste serve` proce
 | Warm cache (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 113 ms | 202 ms | 1.8x |
 | Warm cache (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 345 ms | 506 ms | 1.5x |
 
-On a larger real workspace (`340` crates, `45` build scripts, `17,521` functions, macOS ARM64, 6 CPUs): cold check from an empty `HASTE_HOME` completed in `18.7 s` (`159 MiB` shared cache, `+6–18 MiB` per additional workspace) versus `34.6 s` for cold `cargo check --workspace -j 6`; leaf edits took `22.3 ms` median (`22.1–37.3 ms`) with `--daemon` versus `1.95 s` (`1.85–2.39 s`) for `cargo check` and `2.35 s` (`2.33–2.49 s`) for one-shot `haste build`.
+On a larger real workspace (`340` crates, `45` build scripts, `17,521` functions, macOS ARM64, 6 CPUs):
+
+- **Cold check (empty `HASTE_HOME`):** `18.7 s` (`159 MiB` shared cache, `+6–18 MiB` per additional workspace) vs `34.6 s` for cold `cargo check --workspace -j 6`.
+- **Daemon cold start (`haste build --daemon`):** `4.65 s` (`900 s` idle timeout).
+- **Leaf edit:** `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check` at `1.95 s`) with `haste build --daemon`, vs `2.35 s` median (`2.33–2.49 s`) for one-shot `haste build`.
+- **Cross-crate public-type edit:** `2.35 s` (`2.33–2.40 s`) for one-shot `haste build` and `3.00 s` (`2.94–3.09 s`) with `haste build --daemon`, vs `2.21 s` for `cargo check`.
 
 ### AOT codegen runtime (`haste --release` vs `rustc`, baseline-subtracted median of 5, warmed)
 
@@ -137,7 +148,11 @@ Compute benchmarks subtract each compiler's warmed empty-main startup baseline (
 
 ## Embedding haste as a library
 
-`haste` exposes an embeddable API (`Compiler`, `CompilerBuilder`, `Target`, `Error`, `ErrorKind`) with explicit per-build configuration and no process-global state. Add it as a git dependency in `Cargo.toml` (`haste = { git = "https://github.com/manaforged/haste" }`, not from crates.io):
+`haste` exposes an embeddable API (`Compiler`, `CompilerBuilder`, `Target`, `Error`, `ErrorKind`) with explicit per-build configuration and no process-global state. `Compiler` retains configuration across calls, but loads a fresh build per `check`, `test`, or `emit` call. It does not run a resident daemon, so embedders should not assume `--daemon` edit latency.
+
+Because `Compiler::check` (along with `test`, `emit`, and the CLI) executes crate `build.rs` scripts and procedural macros unsandboxed with the invoking user's privileges, untrusted or customer-submitted repositories require isolated, resource-limited workers without service credentials.
+
+Add it as a git dependency in `Cargo.toml` (`haste = { git = "https://github.com/manaforged/haste" }`, not from crates.io):
 
 ```rust
 use haste::Compiler;
@@ -157,7 +172,8 @@ compiler.emit("./my-app", "./out-bin")?;
 - **Incomplete borrow-checker and nightly coverage:** Full Polonius borrow checking, some upstream `rust-lang/rust` `tests/ui/borrowck` and higher-ranked (`for<'a>`) lifetime edge cases, and nightly `#![feature(...)]` attributes are not yet supported. Keep `cargo check` or `rustc` in CI as your merge and release gate.
 - **External dependencies stay lazy:** `haste` type-checks and borrow-checks every concrete and generic function in the selected member crate before running or emitting code, while external crates and `std` are checked only along reached paths.
 - **Static C archives in standalone AOT:** `haste build .` checks `haste`'s own 42-package workspace (including `tikv-jemalloc-sys`, 0 failed functions), and both JIT and native Unix `haste build -o` link `build.rs` static C archives (`lib*.a`, such as `rusqlite` `bundled`) via a cached shared bundle. Cross-target `haste build -o --target <TRIPLE>` rejects static C archives rather than emitting an incomplete binary.
-- **Test harnesses and proc-macro edge cases:** `haste test` runs `#[test]` and `#[tokio::test]` functions (`fn()` and `fn() -> Result<(), E>`), not custom `harness = false` runners, and procedural macros relying on rustc-private span or hygiene internals can fail.
+- **Test harnesses and proc-macro edge cases:** `haste test` runs `#[test]` and `#[tokio::test]` functions (`fn()` and `fn() -> Result<(), E>`), not custom `harness = false` runners, and procedural macros relying on rustc-private span or hygiene internals can fail. Under JIT (`haste run` and `haste test`), `std::env::current_exe()` resolves to the `haste` binary rather than a standalone target or test binary, so self-spawning tests (`Command::new(current_exe())`) fail under JIT; use `haste build -o` or `cargo test` for those.
+- **Unsandboxed `build.rs` and proc-macro execution:** Both the CLI and `Compiler::check` execute `build.rs` scripts and procedural macros with the invoking user's privileges. Untrusted or customer-submitted repositories require isolated, resource-limited workers without service credentials. See [SECURITY.md](SECURITY.md).
 - **Platform support:** Supported hosts and AOT `--target` triples are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`. Windows PE32+ emission is experimental; JIT `run`/`test`, `serve`, `--daemon`, and `--watch` require Unix; `prep` / `--prepared` are Linux x86-64 only (using `RUSTC_BOOTSTRAP=1`). On macOS, Hardened Runtime or App Sandbox restrictions can block dual-mapped `mach_vm_remap` JIT pages.
 - **Debug info, unwinding, and traps:** AOT binaries emit symbol tables (`HASTE_SYMBOLS`) and DWARF `.debug_line` (`HASTE_DEBUG_INFO`), not full `.debug_info` variable/type DIEs. In `--release` builds without `catch_unwind` or threads, out-of-bounds indexing and divide-by-zero emit hardware traps instead of unwinding; panicking across `extern "C"` aborts (`extern "C-unwind"` unwinds).
 
