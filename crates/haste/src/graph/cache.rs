@@ -14,13 +14,15 @@ struct SourceEntry {
     replace_with: Option<String>,
 }
 
-/// Resolved Cargo `[source.*]` configuration, offline state, and local registry cache directories.
+/// Resolved Cargo `[source.*]` configuration, offline state, `[build].rustflags`, `[env]`, and local registry cache directories.
 #[derive(Clone, Debug)]
 pub(super) struct SourceCatalog {
     sources: BTreeMap<String, SourceEntry>,
     default_vendor: Option<PathBuf>,
     registry_dirs: Vec<PathBuf>,
     pub(super) offline: bool,
+    pub(super) rustflags: Vec<String>,
+    pub(super) env: Vec<(String, String, bool)>,
 }
 
 enum ResolvedSource<'a> {
@@ -31,10 +33,16 @@ enum ResolvedSource<'a> {
     },
 }
 
+fn env_path(name: &str) -> Option<PathBuf> {
+    if crate::client_env().is_some() {
+        crate::process_env_var(name).map(PathBuf::from)
+    } else {
+        std::env::var_os(name).map(PathBuf::from)
+    }
+}
+
 pub(super) fn cargo_home() -> Result<PathBuf> {
-    let home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    let home = env_path("CARGO_HOME").or_else(|| env_path("HOME").map(|home| home.join(".cargo")));
     home.context("no CARGO_HOME or HOME")
 }
 
@@ -81,10 +89,73 @@ fn cargo_configs(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     configs
 }
 
+pub(super) fn config_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = cargo_configs(dir)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    paths.push(dir.join(".cargo/config.toml"));
+    paths.push(dir.join(".cargo/config"));
+    paths
+}
+
 fn env_offline() -> bool {
-    std::env::var("CARGO_NET_OFFLINE")
-        .ok()
+    crate::process_env_var("CARGO_NET_OFFLINE")
         .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1"))
+}
+
+fn parse_rustflags_value(raw: &toml::Value) -> Option<Vec<String>> {
+    match raw {
+        toml::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+        ),
+        toml::Value::String(text) => Some(text.split_whitespace().map(str::to_owned).collect()),
+        _ => None,
+    }
+}
+
+fn parse_env_entry(val: &toml::Value, base: &Path) -> Option<(String, bool)> {
+    match val {
+        toml::Value::String(s) => Some((s.clone(), false)),
+        toml::Value::Table(t) => {
+            let raw = t.get("value").and_then(toml::Value::as_str)?;
+            let force = t
+                .get("force")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            let relative = t
+                .get("relative")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            let value = if relative {
+                manifest::normalize(&base.join(raw))
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                raw.to_owned()
+            };
+            Some((value, force))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn resolved_rustflags(catalog: &SourceCatalog) -> Vec<String> {
+    if let Some(raw) = crate::process_env_var("CARGO_ENCODED_RUSTFLAGS") {
+        return if raw.is_empty() {
+            Vec::new()
+        } else {
+            raw.split('\x1f').map(str::to_owned).collect()
+        };
+    }
+    if let Some(raw) = crate::process_env_var("RUSTFLAGS") {
+        return raw.split_whitespace().map(str::to_owned).collect();
+    }
+    catalog.rustflags.clone()
 }
 
 fn normalize_url(url: &str) -> &str {
@@ -113,55 +184,56 @@ fn url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
+fn merge_sources(src_tbl: &toml::Table, base: &Path, sources: &mut BTreeMap<String, SourceEntry>) {
+    for (name, val) in src_tbl {
+        let Some(entry_tbl) = val.as_table() else {
+            continue;
+        };
+        let entry = sources.entry(name.clone()).or_default();
+        let text = |key: &str| {
+            entry_tbl
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        entry.registry = entry.registry.take().or_else(|| text("registry"));
+        entry.git = entry.git.take().or_else(|| text("git"));
+        entry.directory = entry
+            .directory
+            .take()
+            .or_else(|| text("directory").map(|p| manifest::normalize(&base.join(p))));
+        entry.replace_with = entry.replace_with.take().or_else(|| text("replace-with"));
+    }
+}
+
 impl SourceCatalog {
     pub(super) fn load(top: &Path) -> Result<Self> {
         let mut sources = BTreeMap::new();
-        let mut cfg_offline = false;
+        let (mut cfg_offline, mut rustflags, mut env_map) = (false, None, BTreeMap::new());
         for (config, base) in cargo_configs(top) {
             let table: toml::Table = toml::from_str(&std::fs::read_to_string(&config)?)
                 .with_context(|| format!("parsing {}", config.display()))?;
-            if !cfg_offline
-                && table
-                    .get("net")
-                    .and_then(|n| n.get("offline"))
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false)
+            cfg_offline |= table
+                .get("net")
+                .and_then(|n| n.get("offline"))
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            if rustflags.is_none()
+                && let Some(raw) = table.get("build").and_then(|b| b.get("rustflags"))
             {
-                cfg_offline = true;
+                rustflags = parse_rustflags_value(raw);
             }
-            if let Some(src_tbl) = table.get("source").and_then(toml::Value::as_table) {
-                for (name, val) in src_tbl {
-                    let Some(entry_tbl) = val.as_table() else {
-                        continue;
-                    };
-                    let entry = sources
-                        .entry(name.clone())
-                        .or_insert_with(SourceEntry::default);
-                    if entry.registry.is_none() {
-                        entry.registry = entry_tbl
-                            .get("registry")
-                            .and_then(toml::Value::as_str)
-                            .map(str::to_owned);
-                    }
-                    if entry.git.is_none() {
-                        entry.git = entry_tbl
-                            .get("git")
-                            .and_then(toml::Value::as_str)
-                            .map(str::to_owned);
-                    }
-                    if entry.directory.is_none() {
-                        entry.directory = entry_tbl
-                            .get("directory")
-                            .and_then(toml::Value::as_str)
-                            .map(|p| manifest::normalize(&base.join(p)));
-                    }
-                    if entry.replace_with.is_none() {
-                        entry.replace_with = entry_tbl
-                            .get("replace-with")
-                            .and_then(toml::Value::as_str)
-                            .map(str::to_owned);
+            if let Some(env_tbl) = table.get("env").and_then(toml::Value::as_table) {
+                for (key, val) in env_tbl {
+                    if !env_map.contains_key(key)
+                        && let Some(entry) = parse_env_entry(val, &base)
+                    {
+                        env_map.insert(key.clone(), entry);
                     }
                 }
+            }
+            if let Some(src_tbl) = table.get("source").and_then(toml::Value::as_table) {
+                merge_sources(src_tbl, &base, &mut sources);
             }
         }
         let vendor = top.join("vendor");
@@ -170,6 +242,8 @@ impl SourceCatalog {
             default_vendor: vendor.is_dir().then_some(vendor),
             registry_dirs: registry_dirs()?,
             offline: env_offline() || cfg_offline,
+            rustflags: rustflags.unwrap_or_default(),
+            env: env_map.into_iter().map(|(k, (v, f))| (k, v, f)).collect(),
         })
     }
 
@@ -241,28 +315,224 @@ fn manifest_version(dir: &Path) -> Option<semver::Version> {
     semver::Version::parse(raw).ok()
 }
 
+struct JsonCursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> JsonCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            at: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.bytes.get(self.at), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            self.at += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.at).copied()
+    }
+
+    fn eat(&mut self, byte: u8) -> Option<()> {
+        (self.peek() == Some(byte)).then(|| self.at += 1)
+    }
+
+    fn eat_literal(&mut self, lit: &[u8]) -> Option<()> {
+        self.bytes
+            .get(self.at..self.at + lit.len())
+            .filter(|slice| *slice == lit)
+            .map(|_| self.at += lit.len())
+    }
+
+    fn read_escape(&mut self) -> Option<char> {
+        let esc = *self.bytes.get(self.at)?;
+        self.at += 1;
+        match esc {
+            b'"' => Some('"'),
+            b'\\' => Some('\\'),
+            b'/' => Some('/'),
+            b'b' => Some('\x08'),
+            b'f' => Some('\x0c'),
+            b'n' => Some('\n'),
+            b'r' => Some('\r'),
+            b't' => Some('\t'),
+            b'u' => {
+                let hex = std::str::from_utf8(self.bytes.get(self.at..self.at + 4)?).ok()?;
+                let code = u32::from_str_radix(hex, 16).ok()?;
+                self.at += 4;
+                Some(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER))
+            }
+            _ => None,
+        }
+    }
+
+    fn read_str(&mut self) -> Option<String> {
+        self.eat(b'"')?;
+        let start = self.at;
+        while let Some(&b) = self.bytes.get(self.at) {
+            if b == b'"' {
+                let s = std::str::from_utf8(&self.bytes[start..self.at])
+                    .ok()?
+                    .to_owned();
+                self.at += 1;
+                return Some(s);
+            }
+            if b == b'\\' || b < 0x20 {
+                break;
+            }
+            self.at += 1;
+        }
+        let mut out = std::str::from_utf8(&self.bytes[start..self.at])
+            .ok()?
+            .to_owned();
+        loop {
+            let rest_start = self.at;
+            while let Some(&b) = self.bytes.get(self.at) {
+                if b == b'"' || b == b'\\' {
+                    break;
+                }
+                if b < 0x20 {
+                    return None;
+                }
+                self.at += 1;
+            }
+            out.push_str(std::str::from_utf8(&self.bytes[rest_start..self.at]).ok()?);
+            match self.bytes.get(self.at).copied()? {
+                b'"' => {
+                    self.at += 1;
+                    return Some(out);
+                }
+                b'\\' => {
+                    self.at += 1;
+                    out.push(self.read_escape()?);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn skip_number(&mut self) -> Option<()> {
+        if self.peek() == Some(b'-') {
+            self.at += 1;
+        }
+        match self.bytes.get(self.at).copied()? {
+            b'0' => self.at += 1,
+            b'1'..=b'9' => {
+                while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                    self.at += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.peek() == Some(b'.') {
+            self.at += 1;
+            if !self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+            while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.at += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            if !self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+            while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+        }
+        Some(())
+    }
+
+    fn skip_list(&mut self, open: u8, close: u8, object: bool) -> Option<()> {
+        self.eat(open)?;
+        self.skip_ws();
+        if self.eat(close).is_some() {
+            return Some(());
+        }
+        loop {
+            if object {
+                self.read_str()?;
+                self.skip_ws();
+                self.eat(b':')?;
+                self.skip_ws();
+            }
+            self.skip_val()?;
+            self.skip_ws();
+            if self.eat(b',').is_some() {
+                self.skip_ws();
+                continue;
+            }
+            return self.eat(close);
+        }
+    }
+
+    fn skip_val(&mut self) -> Option<()> {
+        match self.peek()? {
+            b'"' => self.read_str().map(|_| ()),
+            b'{' => self.skip_list(b'{', b'}', true),
+            b'[' => self.skip_list(b'[', b']', false),
+            b't' => self.eat_literal(b"true"),
+            b'f' => self.eat_literal(b"false"),
+            b'n' => self.eat_literal(b"null"),
+            b'-' | b'0'..=b'9' => self.skip_number(),
+            _ => None,
+        }
+    }
+
+    fn read_package(&mut self) -> Option<Option<String>> {
+        self.skip_ws();
+        self.eat(b'{')?;
+        self.skip_ws();
+        if self.eat(b'}').is_some() {
+            self.skip_ws();
+            return (self.at == self.bytes.len()).then_some(None);
+        }
+        let mut pkg = None;
+        loop {
+            let key = self.read_str()?;
+            self.skip_ws();
+            self.eat(b':')?;
+            self.skip_ws();
+            if key == "package" {
+                pkg = if self.peek() == Some(b'"') {
+                    Some(self.read_str()?)
+                } else {
+                    self.skip_val()?;
+                    None
+                };
+            } else {
+                self.skip_val()?;
+            }
+            self.skip_ws();
+            if self.eat(b',').is_some() {
+                self.skip_ws();
+                continue;
+            }
+            self.eat(b'}')?;
+            self.skip_ws();
+            return (self.at == self.bytes.len()).then_some(pkg);
+        }
+    }
+}
+
 fn checksum_matches(dir: &Path, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
     };
     let Ok(text) = std::fs::read_to_string(dir.join(".cargo-checksum.json")) else {
-        return true;
+        return false;
     };
-    let Some(pos) = text.find("\"package\"") else {
-        return true;
-    };
-    let rest = text[pos + "\"package\"".len()..].trim_start();
-    let Some(rest) = rest.strip_prefix(':') else {
-        return true;
-    };
-    let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix('"') else {
-        return true;
-    };
-    let Some(end) = rest.find('"') else {
-        return true;
-    };
-    &rest[..end] == expected
+    JsonCursor::new(&text).read_package().flatten().as_deref() == Some(expected)
 }
 
 fn find_in_dir(locked: &Locked, dir: &Path) -> Option<PathBuf> {

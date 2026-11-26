@@ -52,6 +52,7 @@ pub struct PackageMeta {
 pub struct Manifest {
     pub dir: PathBuf,
     pub name: String,
+    pub version: Option<semver::Version>,
     pub edition: String,
     pub meta: PackageMeta,
     pub links: Option<String>,
@@ -127,6 +128,14 @@ fn merged(spec: &Value, workspace: Option<&Table>, key: &str) -> Table {
         );
         if let Some(optional) = table.get("optional") {
             inherited.insert("optional".to_owned(), optional.clone());
+        }
+        if let Some(default_features) = flag(&table, &["default-features", "default_features"]) {
+            inherited.remove("default-features");
+            inherited.remove("default_features");
+            inherited.insert(
+                "default-features".to_owned(),
+                Value::Boolean(default_features),
+            );
         }
         table = inherited;
     }
@@ -383,6 +392,11 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
     let name = text(package, "name")
         .context("manifest has no package name")?
         .to_owned();
+    let version = inherited_value(package, workspace, "version")
+        .and_then(Value::as_str)
+        .map(semver::Version::parse)
+        .transpose()
+        .context("parsing package version")?;
     let (lib, proc_macro) = lib_of(dir, root);
     let scope = Scope {
         dir,
@@ -390,6 +404,7 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
     };
     Ok(Manifest {
         dir: dir.to_owned(),
+        version,
         edition: edition_of(package, workspace),
         meta: package_meta(package, workspace),
         links: text(package, "links").map(str::to_owned),

@@ -26,6 +26,297 @@ fn format_diagnostic(diag: &str) -> String {
     }
 }
 
+struct ParsedSpan<'a> {
+    file: &'a str,
+    line: usize,
+    col_start: usize,
+    col_end: usize,
+    is_primary: bool,
+    source_line: Option<&'a str>,
+    label: Option<&'a str>,
+}
+
+struct ParsedDiag<'a> {
+    code: Option<&'a str>,
+    message: &'a str,
+    spans: Vec<ParsedSpan<'a>>,
+    children: Vec<(&'static str, &'a str)>,
+}
+
+fn parse_loc(loc: &str) -> Option<(&str, usize, usize)> {
+    let (rest, col_s) = loc.rsplit_once(':')?;
+    let (file, line_s) = rest.rsplit_once(':')?;
+    Some((file, line_s.parse().ok()?, col_s.parse().ok()?))
+}
+
+fn parse_underline(body: &str) -> Option<(usize, usize, bool, Option<&str>)> {
+    let indent = body.bytes().take_while(|&b| b == b' ').count();
+    let after = &body[indent..];
+    let mark = match after.as_bytes().first().copied() {
+        Some(m @ (b'^' | b'-')) => m,
+        _ => return None,
+    };
+    let width = after.bytes().take_while(|&b| b == mark).count();
+    let tail = &after[width..];
+    if !tail.is_empty() && !tail.starts_with(' ') {
+        return None;
+    }
+    let label = tail.strip_prefix(' ').filter(|s| !s.is_empty());
+    let col_start = indent + 1;
+    Some((col_start, col_start + width, mark == b'^', label))
+}
+
+struct RenderedState<'a> {
+    spans: Vec<ParsedSpan<'a>>,
+    children: Vec<(&'static str, &'a str)>,
+    cur_file: Option<&'a str>,
+    primary_loc: Option<(&'a str, usize, usize)>,
+    last_source: Option<(usize, &'a str)>,
+}
+
+impl<'a> RenderedState<'a> {
+    fn feed(&mut self, line: &'a str) {
+        let trimmed = line.trim_start();
+        if let Some(loc) = trimmed.strip_prefix("--> ") {
+            if let Some((file, num, col)) = parse_loc(loc) {
+                self.cur_file = Some(file);
+                self.primary_loc = Some((file, num, col));
+            }
+        } else if let Some(loc) = trimmed.strip_prefix("::: ") {
+            if let Some((file, _, _)) = parse_loc(loc) {
+                self.cur_file = Some(file);
+            }
+        } else if let Some((prefix, body)) = line.split_once(" | ") {
+            self.feed_gutter(prefix.trim(), body);
+        } else if let Some(note) = trimmed.strip_prefix("= note: ") {
+            self.children.push(("note", note));
+        } else if let Some(help) = trimmed.strip_prefix("= help: ") {
+            self.children.push(("help", help));
+        }
+    }
+
+    fn feed_gutter(&mut self, ptrim: &str, body: &'a str) {
+        if let Ok(line_num) = ptrim.parse::<usize>() {
+            self.last_source = Some((line_num, body));
+            return;
+        }
+        if ptrim.is_empty()
+            && let (Some(file), Some((line_num, src)), Some((cs, ce, is_primary, label))) =
+                (self.cur_file, self.last_source, parse_underline(body))
+        {
+            self.spans.push(ParsedSpan {
+                file,
+                line: line_num,
+                col_start: cs,
+                col_end: ce,
+                is_primary,
+                source_line: Some(src),
+                label,
+            });
+        }
+    }
+}
+
+fn parse_rendered_diagnostic(diag: &str) -> ParsedDiag<'_> {
+    let mut lines = diag.lines();
+    let first = lines.next().unwrap_or(diag);
+    let (code, message) = first
+        .strip_prefix("error[")
+        .and_then(|rest| rest.split_once("]: "))
+        .map_or((None, first), |(c, m)| (Some(c), m));
+    let mut state = RenderedState {
+        spans: Vec::new(),
+        children: Vec::new(),
+        cur_file: None,
+        primary_loc: None,
+        last_source: None,
+    };
+    for line in lines {
+        state.feed(line);
+    }
+    if state.spans.is_empty()
+        && let Some((file, line, col)) = state.primary_loc
+    {
+        state.spans.push(ParsedSpan {
+            file,
+            line,
+            col_start: col,
+            col_end: col + 1,
+            is_primary: true,
+            source_line: None,
+            label: None,
+        });
+    }
+    state.spans.sort_by_key(|s| !s.is_primary);
+    ParsedDiag {
+        code,
+        message,
+        spans: state.spans,
+        children: state.children,
+    }
+}
+
+fn parse_diagnostic(diag: &str) -> ParsedDiag<'_> {
+    if crate::diag::is_rendered(diag) {
+        return parse_rendered_diagnostic(diag);
+    }
+    if let Some((head, rest)) = diag.split_once(' ') {
+        let clean = head.strip_suffix(':').unwrap_or(head);
+        let parsed = parse_loc(clean)
+            .map(|(f, l, c)| (f, l, c, c + 1))
+            .or_else(|| {
+                clean.rsplit_once(':').and_then(|(f, ls)| {
+                    let l = ls.parse::<usize>().ok().filter(|&n| n > 0)?;
+                    (!f.is_empty()).then_some((f, l, 0, 0))
+                })
+            });
+        if let Some((file, line, col_start, col_end)) = parsed {
+            return ParsedDiag {
+                code: None,
+                message: rest,
+                spans: vec![ParsedSpan {
+                    file,
+                    line,
+                    col_start,
+                    col_end,
+                    is_primary: true,
+                    source_line: None,
+                    label: None,
+                }],
+                children: Vec::new(),
+            };
+        }
+    }
+    ParsedDiag {
+        code: None,
+        message: diag,
+        spans: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
+fn format_short_diagnostic(diag: &str) -> String {
+    let parsed = parse_diagnostic(diag);
+    let head = match parsed.code {
+        Some(code) => format!("error[{code}]: {}", parsed.message),
+        None => format!("error: {}", parsed.message),
+    };
+    let Some(span) = parsed
+        .spans
+        .iter()
+        .find(|s| s.is_primary)
+        .or_else(|| parsed.spans.first())
+    else {
+        return head;
+    };
+    if span.col_start > 0 {
+        format!("{}:{}:{}: {head}", span.file, span.line, span.col_start)
+    } else {
+        format!("{}:{}: {head}", span.file, span.line)
+    }
+}
+
+fn push_json_str(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => drop(write!(out, "\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn push_json_opt_str(out: &mut String, s: Option<&str>) {
+    match s {
+        Some(v) => push_json_str(out, v),
+        None => out.push_str("null"),
+    }
+}
+
+fn push_json_span(out: &mut String, span: &ParsedSpan<'_>) {
+    use std::fmt::Write as _;
+    let cs = span.col_start.max(1);
+    let ce = span.col_end.max(cs);
+    out.push_str("{\"file_name\":");
+    push_json_str(out, span.file);
+    let _ = write!(
+        out,
+        ",\"byte_start\":0,\"byte_end\":0,\"line_start\":{},\"line_end\":{},\"column_start\":{cs},\"column_end\":{ce},\"is_primary\":{},\"text\":[",
+        span.line, span.line, span.is_primary
+    );
+    if let Some(src) = span.source_line {
+        out.push_str("{\"text\":");
+        push_json_str(out, src);
+        let _ = write!(out, ",\"highlight_start\":{cs},\"highlight_end\":{ce}}}");
+    }
+    out.push_str("],\"label\":");
+    push_json_opt_str(out, span.label);
+    out.push_str(
+        ",\"suggested_replacement\":null,\"suggestion_applicability\":null,\"expansion\":null}",
+    );
+}
+
+fn push_json_child(out: &mut String, level: &str, message: &str) {
+    out.push_str("{\"$message_type\":\"diagnostic\",\"level\":");
+    push_json_str(out, level);
+    out.push_str(",\"code\":null,\"message\":");
+    push_json_str(out, message);
+    out.push_str(",\"spans\":[],\"children\":[],\"rendered\":null}");
+}
+
+fn format_json_diagnostic(diag: &str) -> String {
+    let parsed = parse_diagnostic(diag);
+    let rendered = format!("{}\n", format_diagnostic(diag));
+    let mut out = String::with_capacity(diag.len() + 256);
+    out.push_str("{\"reason\":\"compiler-message\",\"message\":{\"$message_type\":\"diagnostic\",\"level\":\"error\",\"code\":");
+    match parsed.code {
+        Some(code) => {
+            out.push_str("{\"code\":");
+            push_json_str(&mut out, code);
+            out.push_str(",\"explanation\":null}");
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"message\":");
+    push_json_str(&mut out, parsed.message);
+    out.push_str(",\"spans\":[");
+    for (idx, span) in parsed.spans.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        push_json_span(&mut out, span);
+    }
+    out.push_str("],\"children\":[");
+    for (idx, &(level, msg)) in parsed.children.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        push_json_child(&mut out, level, msg);
+    }
+    out.push_str("],\"rendered\":");
+    push_json_str(&mut out, &rendered);
+    out.push_str("}}");
+    out
+}
+
+fn print_human_diagnostic(diag: &str) {
+    let rendered = format_diagnostic(diag);
+    if crate::diag::is_rendered(diag) {
+        eprintln!("{rendered}\n");
+    } else {
+        eprintln!("{rendered}");
+    }
+}
+
 pub(super) fn format_diagnostics(diagnostics: &[String]) -> Option<String> {
     (!diagnostics.is_empty()).then(|| {
         diagnostics
@@ -37,12 +328,16 @@ pub(super) fn format_diagnostics(diagnostics: &[String]) -> Option<String> {
 }
 
 pub(super) fn print_formatted_diagnostics(diagnostics: &[String]) {
+    let fmt = crate::selection().message_format;
     for diag in diagnostics {
-        let rendered = format_diagnostic(diag);
-        if crate::diag::is_rendered(diag) {
-            eprintln!("{rendered}\n");
-        } else {
-            eprintln!("{rendered}");
+        match fmt {
+            crate::MessageFormat::Human => print_human_diagnostic(diag),
+            crate::MessageFormat::Short => eprintln!("{}", format_short_diagnostic(diag)),
+            crate::MessageFormat::Json => println!("{}", format_json_diagnostic(diag)),
+            crate::MessageFormat::JsonRenderDiagnostics => {
+                println!("{}", format_json_diagnostic(diag));
+                print_human_diagnostic(diag);
+            }
         }
     }
 }
@@ -175,11 +470,14 @@ impl Batch {
 
     pub(super) fn check(&self, outline: &outline::Outline, built: Duration) -> i32 {
         let failed = self.print_diagnostics(outline);
-        eprintln!(
-            "{} functions reached, {failed} failed, built in {:.1} ms",
-            self.reached.list.len(),
-            built.as_secs_f64() * 1e3
-        );
+        let sel = crate::selection();
+        if !sel.quiet && sel.message_format != crate::MessageFormat::Json {
+            eprintln!(
+                "{} functions reached, {failed} failed, built in {:.1} ms",
+                self.reached.list.len(),
+                built.as_secs_f64() * 1e3
+            );
+        }
         i32::from(failed > 0)
     }
 
@@ -307,10 +605,17 @@ impl Batch {
             };
             entries.push((name, meta, resolved));
         }
+        let total_tests = if args.filters.is_empty() && args.skips.is_empty() {
+            self.tests.len()
+        } else {
+            crate::cli::outline_test_count(outline).max(self.tests.len())
+        };
+        let filtered_out = total_tests.saturating_sub(entries.len());
         Ok(print_test_report(
             &entries,
             started.elapsed(),
             args.show_output,
+            filtered_out,
         ))
     }
 }

@@ -93,8 +93,7 @@ pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp
     out
 }
 
-/// What changed in the files of `stamps` since their last stamps: the `(crate, file)` slots whose function bodies changed, which `outline` now holds, and the crates to read again; fails when a file does not read.
-pub(super) fn edits(
+fn collect_edits(
     workspace: &graph::Workspace,
     stamps: &mut [Watch],
     outline: &mut outline::Outline,
@@ -104,6 +103,9 @@ pub(super) fn edits(
         let now = stamp(&watch.path);
         if now == watch.stamp {
             continue;
+        }
+        if now.is_none() {
+            anyhow::bail!("watched file removed: {}", watch.path.display());
         }
         watch.stamp = now;
         let edit = match &watch.by {
@@ -126,13 +128,26 @@ pub(super) fn edits(
     Ok((stale, crates))
 }
 
+/// Returns body-only `(crate, file)` edits from `stamps`, failing on missing files or item/macro edits so callers trigger a full reload without growing `reached`.
+pub(super) fn edits(
+    workspace: &graph::Workspace,
+    stamps: &mut [Watch],
+    outline: &mut outline::Outline,
+) -> Result<(Vec<(u32, u32)>, Vec<u32>)> {
+    let (stale, crates) = collect_edits(workspace, stamps, outline)?;
+    if !crates.is_empty() {
+        anyhow::bail!("non-body edits require full build reload");
+    }
+    Ok((stale, crates))
+}
+
 /// The `(crate, file)` slots whose function bodies changed in the files of `stamps`, which `outline` now holds, or why the edit needs a restart.
 pub(super) fn body_edits(
     workspace: &graph::Workspace,
     stamps: &mut [Watch],
     outline: &mut outline::Outline,
 ) -> Result<Vec<(u32, u32)>, String> {
-    match edits(workspace, stamps, outline) {
+    match collect_edits(workspace, stamps, outline) {
         Ok((stale, crates)) if crates.is_empty() => Ok(stale),
         Ok((_, mut crates)) => {
             crates.sort_unstable();

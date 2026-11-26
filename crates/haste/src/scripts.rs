@@ -7,7 +7,7 @@ use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::graph::manifest::Kind;
-use crate::graph::script::{self, Output};
+use crate::graph::script::{self, ChildEnv, Output, apply_client_env, prepare_client_env};
 use crate::graph::{Targets, Workspace, store};
 use crate::image::{self, Driver, Ended, Jit, Script};
 use crate::outline::Role;
@@ -31,64 +31,110 @@ pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
     crate::with_host_target(|| settle_inner(workspace, targets))
 }
 
+fn attach_rustflag_cfgs(workspace: &mut Workspace, targets: &Targets, after_scripts: bool) {
+    let (names, pairs) = script::rustflag_cfgs(&workspace.rustflags);
+    if names.is_empty() && pairs.is_empty() {
+        return;
+    }
+    for unit in 0..workspace.graph.units.len() {
+        if !script::rustflags_apply(workspace, targets, unit) {
+            continue;
+        }
+        let has_build = workspace.packages[workspace.graph.units[unit].package]
+            .manifest
+            .build
+            .is_some();
+        let entry = &mut workspace.graph.units[unit];
+        if after_scripts && has_build {
+            if let Some(output) = &mut entry.script {
+                let out = Arc::make_mut(output);
+                out.names.extend(names.iter().cloned());
+                out.pairs.extend(pairs.iter().cloned());
+            }
+        } else if !after_scripts && !has_build {
+            entry.script = Some(Arc::new(Output {
+                names: names.clone(),
+                pairs: pairs.clone(),
+                ..Output::default()
+            }));
+        }
+    }
+}
+
+struct SettleState {
+    dag: ScriptDag,
+    ran: Ran,
+    failed: HashSet<usize>,
+    fatal_errors: Vec<String>,
+    kept_queue: VecDeque<usize>,
+}
+
 fn settle_inner(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
-    let mut failed = HashSet::default();
-    let mut dag = ScriptDag::new(workspace);
-    let mut ran = known(workspace);
-    let mut kept_queue = dag.initial_ready(workspace);
-    drain_kept(
-        workspace,
-        targets,
-        &mut dag,
-        &mut kept_queue,
-        &mut ran,
-        &mut failed,
-        None,
+    attach_rustflag_cfgs(workspace, targets, false);
+    let dag = ScriptDag::new(workspace);
+    let kept_queue = dag.initial_ready(workspace);
+    let mut state = SettleState {
+        dag,
+        ran: known(workspace),
+        failed: HashSet::default(),
+        fatal_errors: Vec::new(),
+        kept_queue,
+    };
+    drain_kept(workspace, targets, &mut state, None);
+    anyhow::ensure!(
+        state.fatal_errors.is_empty(),
+        "{}",
+        state.fatal_errors.join("\n")
     );
     loop {
-        let mut ready = dag.ready_build_units(workspace, &failed);
+        let mut ready = state.dag.ready_build_units(workspace, &state.failed);
         if ready.is_empty() {
+            attach_rustflag_cfgs(workspace, targets, true);
             return Ok(());
         }
         ready.sort_by_cached_key(|&unit| store::dir(workspace, unit));
         let mut locks = HashMap::default();
         for &unit in &ready {
             locks.insert(unit, store::lock(workspace, unit)?);
-        }
-        for &unit in &ready {
-            if dag.links_rem[unit] == 0 {
-                kept_queue.push_back(unit);
+            if state.dag.links_rem[unit] == 0 {
+                state.kept_queue.push_back(unit);
             }
         }
-        drain_kept(
-            workspace,
-            targets,
-            &mut dag,
-            &mut kept_queue,
-            &mut ran,
-            &mut failed,
-            Some(&mut locks),
+        drain_kept(workspace, targets, &mut state, Some(&mut locks));
+        anyhow::ensure!(
+            state.fatal_errors.is_empty(),
+            "{}",
+            state.fatal_errors.join("\n")
         );
         let mut wave: Vec<usize> = ready
             .into_iter()
-            .filter(|unit| workspace.graph.units[*unit].script.is_none() && !failed.contains(unit))
+            .filter(|unit| {
+                workspace.graph.units[*unit].script.is_none() && !state.failed.contains(unit)
+            })
             .collect();
         if wave.is_empty() {
             continue;
         }
         wave.sort_by_key(|&unit| {
-            std::cmp::Reverse((dag.build_users[unit].len(), dag.links_users[unit].len()))
+            std::cmp::Reverse((
+                state.dag.build_users[unit].len(),
+                state.dag.links_users[unit].len(),
+            ))
         });
-        let outcome = run(workspace, targets, &wave, &dag, &mut locks, &mut ran)?;
-        drop(locks);
-        finish_wave(
+        let outcome = run(
             workspace,
+            targets,
             &wave,
-            outcome,
-            &mut dag,
-            &mut ran,
-            &mut failed,
-            &mut kept_queue,
+            &state.dag,
+            &mut locks,
+            &mut state.ran,
+        )?;
+        drop(locks);
+        finish_wave(workspace, &wave, outcome, &mut state);
+        anyhow::ensure!(
+            state.fatal_errors.is_empty(),
+            "{}",
+            state.fatal_errors.join("\n")
         );
     }
 }
@@ -214,37 +260,56 @@ impl ScriptDag {
 fn drain_kept(
     workspace: &mut Workspace,
     targets: &Targets,
-    dag: &mut ScriptDag,
-    kept_queue: &mut VecDeque<usize>,
-    ran: &mut Ran,
-    failed: &mut HashSet<usize>,
+    state: &mut SettleState,
     mut locks: Option<&mut HashMap<usize, store::Lock>>,
 ) {
-    while let Some(unit) = kept_queue.pop_front() {
-        if workspace.graph.units[unit].script.is_some() || failed.contains(&unit) {
-            continue;
-        }
-        if let Some(locks) = locks.as_deref()
-            && !locks.contains_key(&unit)
+    while let Some(unit) = state.kept_queue.pop_front() {
+        if workspace.graph.units[unit].script.is_some()
+            || state.failed.contains(&unit)
+            || locks.as_deref().is_some_and(|l| !l.contains_key(&unit))
         {
             continue;
         }
-        let unit_vars = vars(workspace, targets, unit, ran);
+        let unit_vars = vars(workspace, targets, unit, &state.ran);
         let Some(kept) = store::kept(workspace, unit, &unit_vars) else {
             continue;
         };
         match kept {
+            Ok(output) if !output.errors.is_empty() => record_fatal(
+                workspace,
+                unit,
+                Failure {
+                    error: output.errors.join("\n"),
+                    broken: None,
+                    interrupted: false,
+                    fatal: true,
+                },
+                state,
+            ),
             Ok(output) => {
                 let output = Arc::new(output);
                 workspace.graph.units[unit].script = Some(output.clone());
-                ran.insert(unit, output);
+                state.ran.insert(unit, output);
             }
-            Err(error) => report(workspace, unit, &error, failed),
+            Err(error) => report(workspace, unit, &error, &mut state.failed),
         }
         if let Some(locks) = locks.as_deref_mut() {
             locks.remove(&unit);
         }
-        dag.finish_unit(workspace, failed, unit, kept_queue);
+        state
+            .dag
+            .finish_unit(workspace, &state.failed, unit, &mut state.kept_queue);
+    }
+}
+
+fn record_fatal(workspace: &Workspace, unit: usize, failure: Failure, state: &mut SettleState) {
+    give_up(workspace, unit, &failure, state);
+    if failure.fatal {
+        state.fatal_errors.push(format!(
+            "build script of `{}` failed: {}",
+            package_name(workspace, unit),
+            failure.error
+        ));
     }
 }
 
@@ -252,22 +317,18 @@ fn finish_wave(
     workspace: &mut Workspace,
     wave: &[usize],
     outcome: Outcome,
-    dag: &mut ScriptDag,
-    ran: &mut Ran,
-    failed: &mut HashSet<usize>,
-    kept_queue: &mut VecDeque<usize>,
+    state: &mut SettleState,
 ) {
-    let mut wave_set = HashSet::default();
-    for &unit in wave {
-        wave_set.insert(unit);
-    }
+    let wave_set: HashSet<usize> = wave.iter().copied().collect();
     let mut errors = Vec::new();
     for (unit, result) in outcome {
         match result {
             Ok(output) => {
                 workspace.graph.units[unit].script = Some(output.clone());
-                ran.insert(unit, output);
-                dag.finish_unit(workspace, failed, unit, kept_queue);
+                state.ran.insert(unit, output);
+                state
+                    .dag
+                    .finish_unit(workspace, &state.failed, unit, &mut state.kept_queue);
             }
             Err(failure) => errors.push((unit, failure)),
         }
@@ -277,15 +338,17 @@ fn finish_wave(
             .broken
             .is_some_and(|at| wave_set.contains(&at) && workspace.graph.units[at].script.is_some());
         if !retried {
-            give_up(workspace, unit, &failure, failed);
-            dag.finish_unit(workspace, failed, unit, kept_queue);
+            record_fatal(workspace, unit, failure, state);
+            state
+                .dag
+                .finish_unit(workspace, &state.failed, unit, &mut state.kept_queue);
         }
     }
 }
 
 /// Reports that `unit`'s script did not build or run, clears any stale cache entry so a retry runs fresh, and builds its package with the script's cfgs open.
-fn give_up(workspace: &Workspace, unit: usize, failure: &Failure, failed: &mut HashSet<usize>) {
-    report(workspace, unit, &failure.error, failed);
+fn give_up(workspace: &Workspace, unit: usize, failure: &Failure, state: &mut SettleState) {
+    report(workspace, unit, &failure.error, &mut state.failed);
     if !failure.interrupted
         && let Err(write) = store::clear_failure(workspace, unit)
     {
@@ -308,6 +371,7 @@ struct Failure {
     error: String,
     broken: Option<usize>,
     interrupted: bool,
+    fatal: bool,
 }
 
 impl From<String> for Failure {
@@ -316,6 +380,7 @@ impl From<String> for Failure {
             error,
             broken: None,
             interrupted: false,
+            fatal: false,
         }
     }
 }
@@ -491,6 +556,7 @@ fn run(
         missing,
         reran: HashSet::default(),
         executables: HashSet::default(),
+        client_env: prepare_client_env(),
     };
     image::serve(
         &mut compilation,
@@ -539,6 +605,7 @@ struct Runs<'w, 'l> {
     missing: HashSet<usize>,
     reran: HashSet<usize>,
     executables: HashSet<usize>,
+    client_env: Option<ChildEnv>,
 }
 
 impl Runs<'_, '_> {
@@ -597,17 +664,22 @@ impl Driver for Runs<'_, '_> {
             });
             match script {
                 Ok((script, start)) => {
-                    let id = match &start {
-                        Start::Jit(_) => demand.fork(true, |image, out| {
-                            out.map_or(101, |out| image.enter_script(&script, out))
-                        })?,
-                        Start::Executable(path) => {
-                            self.executables.insert(unit);
-                            demand.fork(true, |_, out| {
-                                out.map_or(101, |out| binary::exec(path, &script, out))
-                            })?
+                    let env_patch = self.client_env.as_ref();
+                    let id = demand.fork(true, |image, out| {
+                        if let Some((unset, set)) = env_patch {
+                            apply_client_env(unset, set);
                         }
-                    };
+                        match (&start, out) {
+                            (Start::Jit(_), Some(out)) => image.enter_script(&script, out),
+                            (Start::Executable(path), Some(out)) => {
+                                binary::exec(path, &script, out)
+                            }
+                            (_, None) => 101,
+                        }
+                    })?;
+                    if matches!(start, Start::Executable(_)) {
+                        self.executables.insert(unit);
+                    }
                     self.running.push((id, unit, script));
                 }
                 Err(failure) => {
@@ -626,14 +698,15 @@ impl Driver for Runs<'_, '_> {
         let (_, unit, script) = self.running.swap_remove(at);
         let result = match (ended.status, ended.failure) {
             (0, _) => String::from_utf8(ended.bytes)
-                .map(|text| finished(self.workspace, unit, &script, &text))
                 .map_err(|error| {
                     Failure::from(format!("printed output that is not UTF-8: {error}"))
-                }),
+                })
+                .and_then(|text| finished(self.workspace, unit, &script, &text)),
             (_, Some((error, item))) => Err(Failure {
                 error: format!("does not build: {error}"),
                 broken: self.owners.get(item.krate as usize).copied(),
                 interrupted: false,
+                fatal: false,
             }),
             (status, None) => Err(Failure {
                 interrupted: crate::image::interrupted(status),
@@ -644,7 +717,7 @@ impl Driver for Runs<'_, '_> {
             }),
         };
         let result = result.map_err(|failure| {
-            if !self.executables.contains(&unit) {
+            if !self.executables.contains(&unit) || failure.fatal {
                 return failure;
             }
             binary::distrust(self.workspace, unit);
@@ -663,14 +736,28 @@ impl Driver for Runs<'_, '_> {
 }
 
 /// The output of a script that exited cleanly, kept in the store for later runs.
-fn finished(workspace: &Workspace, unit: usize, job: &Script, text: &str) -> Arc<Output> {
+fn finished(
+    workspace: &Workspace,
+    unit: usize,
+    job: &Script,
+    text: &str,
+) -> Result<Arc<Output>, Failure> {
+    let output = Output::parse(text);
+    if !output.errors.is_empty() {
+        return Err(Failure {
+            error: output.errors.join("\n"),
+            broken: None,
+            interrupted: false,
+            fatal: true,
+        });
+    }
     if let Err(error) = store::keep(workspace, unit, &job.vars, text) {
         eprintln!(
             "cannot keep the output of {}'s build script: {error}",
             package_name(workspace, unit)
         );
     }
-    Arc::new(Output::parse(text))
+    Ok(Arc::new(output))
 }
 
 fn job(

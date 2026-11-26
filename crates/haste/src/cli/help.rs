@@ -49,15 +49,28 @@ pub(super) fn help_text(topic: Option<HelpTopic>) -> &'static str {
     }
 }
 
+macro_rules! pkg_feature_options {
+    () => {
+        "  -p, --package <PKG>        Select a package in the workspace
+      --workspace            Operate on all workspace members
+  -F, --features <LIST>      Space- or comma-separated list of features to activate
+      --all-features         Activate all available features
+      --no-default-features  Do not activate the `default` feature
+      --manifest-path <PATH> Path to Cargo.toml
+      --locked               Assert that `Cargo.lock` will remain unchanged
+      --offline              Run without accessing the network
+  -j, --jobs <N>             Number of parallel compiler workers"
+    };
+}
+
 macro_rules! target_options {
     () => {
-        "  -p, --package <PKG>       Select a package in the workspace
-      --bin <NAME>          Select a binary target
-      --example <NAME>      Select an example target
-  -F, --features <LIST>     Space- or comma-separated list of features to activate
-      --all-features        Activate all available features
-      --no-default-features Do not activate the `default` feature
-      --jobs <N>            Number of parallel compiler workers"
+        concat!(
+            pkg_feature_options!(),
+            "
+      --bin <NAME>           Select a binary target
+      --example <NAME>       Select an example target",
+        )
     };
 }
 
@@ -69,6 +82,7 @@ Usage: haste [OPTIONS] <COMMAND> [PATH] [-- ARGS...]
 
 Commands:
   build   Type-check, borrow-check, and optionally emit a native executable (-o)
+  check   Alias for `build` (check without emitting an executable)
   run     Compile and run a binary or example target in memory (Unix JIT)
   test    Compile and run #[test] and #[tokio::test] suites (Unix JIT)
   serve   Run a foreground resident compiler daemon or inspect/stop daemons
@@ -80,28 +94,39 @@ Common options:
 ",
     target_options!(),
     "
-      --release             Build with optimizations enabled
-      --daemon              Start or reuse a background daemon for repeat runs (Unix)
-  -h, --help                Print help (use `haste <command> --help` for details)
-  -V, --version             Print version and commit",
+      --tests                Check or test all test targets including #[cfg(test)]
+      --all-targets          Check or test all targets
+      --release              Build with optimizations enabled
+      --profile <NAME>       Build profile (`dev`, `debug`, or `release`)
+      --message-format <FMT> Diagnostic format (`human`, `short`, `json`, `json-render-diagnostics`)
+  -q, --quiet                Suppress non-error status output
+      --daemon               Start or reuse a background daemon for repeat runs (Unix)
+  -h, --help                 Print help (use `haste <command> --help` for details)
+  -V, --version              Print version and commit",
 );
 
 const BUILD_HELP: &str = concat!(
     "Usage: haste build [OPTIONS] [PATH]
+       haste check [OPTIONS] [PATH]
 
 Type-check, borrow-check, and compile a crate or workspace.
 Pass -o PATH to emit a standalone native executable.
 
 Options:
-  -o, --output <PATH>       Emit a standalone native executable at PATH
-      --target <TRIPLE>     Cross-compile target triple (requires -o)
-      --release             Build with optimizations enabled
-      --daemon              Start or reuse a background daemon for repeat edits (Unix)
+  -o, --output <PATH>        Emit a standalone native executable at PATH
+      --target <TRIPLE>      Cross-compile target triple (requires -o)
+      --release              Build with optimizations enabled
+      --profile <NAME>       Build profile (`dev`, `debug`, or `release`)
+      --daemon               Start or reuse a background daemon for repeat edits (Unix)
+      --tests                Check all test targets including #[cfg(test)]
+      --all-targets          Check all targets
+      --message-format <FMT> Diagnostic format (`human`, `short`, `json`, `json-render-diagnostics`)
+  -q, --quiet                Suppress non-error status output
 ",
     target_options!(),
     "
-      --stats-json <PATH>   Write compilation timing and code-size stats as JSON
-  -h, --help                Print help",
+      --stats-json <PATH>    Write compilation timing and code-size stats as JSON
+  -h, --help                 Print help",
 );
 
 const RUN_HELP: &str = concat!(
@@ -111,38 +136,45 @@ Check the crate, then compile and execute its binary or example target in memory
 Arguments after `--` are passed to the program as argv.
 
 Options:
-      --release             Run with optimizations enabled
-      --daemon              Start or reuse a background daemon for repeat runs (Unix)
-      --watch               Hot-reload changed functions into the running process (Unix)
-      --prepared            Use precompiled rustc dependency code (Linux x86_64 only)
-      --prep-wait <MS>      Wait up to MS for background prep (Linux x86_64 only)
-      --perf-map            Write /tmp/perf-<pid>.map symbols for JIT profiling
+      --release              Run with optimizations enabled
+      --profile <NAME>       Build profile (`dev`, `debug`, or `release`)
+      --daemon               Start or reuse a background daemon for repeat runs (Unix)
+      --watch                Hot-reload changed functions into the running process (Unix)
+      --prepared             Use precompiled rustc dependency code (Linux x86_64 only)
+      --prep-wait <MS>       Wait up to MS for background prep (Linux x86_64 only)
+      --perf-map             Write /tmp/perf-<pid>.map symbols for JIT profiling
+      --message-format <FMT> Diagnostic format (`human`, `short`, `json`, `json-render-diagnostics`)
+  -q, --quiet                Suppress non-error status output
 ",
     target_options!(),
     "
-  -h, --help                Print help",
+  -h, --help                 Print help",
 );
 
-const TEST_HELP: &str = "\
-Usage: haste test [OPTIONS] [PATH] [-- FILTER...]
+const TEST_HELP: &str = concat!(
+    "Usage: haste test [OPTIONS] [PATH] [-- FILTER...]
 
 Check the crate, then compile and run its #[test] and #[tokio::test] suite (Unix).
 Filter arguments (such as substring patterns, --exact, --skip NAME) follow `--`.
 
 Options:
-      --lib                 Test only this package's library
-      --bins                Test all binary targets
-      --test <NAME>         Test only the specified integration test target
-      --ignored             Run only tests marked #[ignore]
-      --include-ignored     Run both normal and #[ignore] tests
-      --release             Run tests with optimizations enabled
-      --daemon              Start or reuse a background daemon for repeat test runs (Unix)
-  -p, --package <PKG>       Select a package in the workspace
-  -F, --features <LIST>     Space- or comma-separated list of features to activate
-      --all-features        Activate all available features
-      --no-default-features Do not activate the `default` feature
-      --jobs <N>            Number of parallel compiler workers
-  -h, --help                Print help";
+      --lib                  Test only this package's library
+      --bins                 Test all binary targets
+      --tests                Test all unit and integration test targets
+      --all-targets          Test all targets
+      --test <NAME>          Test only the specified integration test target
+      --ignored              Run only tests marked #[ignore]
+      --include-ignored      Run both normal and #[ignore] tests
+      --release              Run tests with optimizations enabled
+      --profile <NAME>       Build profile (`dev`, `debug`, or `release`)
+      --daemon               Start or reuse a background daemon for repeat test runs (Unix)
+      --message-format <FMT> Diagnostic format (`human`, `short`, `json`, `json-render-diagnostics`)
+  -q, --quiet                Suppress non-error status output
+",
+    pkg_feature_options!(),
+    "
+  -h, --help                 Print help",
+);
 
 const SERVE_HELP: &str = concat!(
     "Usage: haste serve [OPTIONS] [PATH]
@@ -153,17 +185,18 @@ Run a foreground resident compiler daemon for fast repeat edits, or inspect/stop
 Pass `--daemon` to `build`, `run`, or `test` to spawn one in the background.
 
 Subcommands:
-  status [PATH]             List running daemons (optionally filtered by workspace path)
-  stop [PATH | --all]       Stop the daemon for PATH (default `.`) or all daemons (--all)
+  status [PATH]              List running daemons (optionally filtered by workspace path)
+  stop [PATH | --all]        Stop the daemon for PATH (default `.`) or all daemons (--all)
 
 Options:
-      --all                 With `serve stop`, stop every running haste daemon
-      --release             Serve release-profile builds
-      --prepared            Use precompiled dependency code (Linux x86_64 only)
+      --all                  With `serve stop`, stop every running haste daemon
+      --release              Serve release-profile builds
+      --profile <NAME>       Build profile (`dev`, `debug`, or `release`)
+      --prepared             Use precompiled dependency code (Linux x86_64 only)
 ",
     target_options!(),
     "
-  -h, --help                Print help",
+  -h, --help                 Print help",
 );
 
 const PREP_HELP: &str = concat!(
@@ -175,7 +208,7 @@ Options:
 ",
     target_options!(),
     "
-  -h, --help                Print help",
+  -h, --help                 Print help",
 );
 
 const CLEAN_HELP: &str = "\
@@ -184,7 +217,7 @@ Usage: haste clean
 Remove the local haste cache directory ($HASTE_HOME or platform cache dir).
 
 Options:
-  -h, --help                Print help";
+  -h, --help                 Print help";
 
 const DEBUG_HELP: &str = "\
 Usage: haste debug <QUERY> <PATH> [CRATE]
@@ -204,6 +237,8 @@ Queries:
   code      Dump lowered/compiled machine code into DIR
 
 Options:
-      --release             Compile release code (with `debug code`)
-      --jobs <N>            Number of parallel compiler workers
-  -h, --help                Print help";
+      --release              Compile release code (with `debug code`)
+      --profile <NAME>       Build profile (`dev`, `debug`, or `release`)
+      --manifest-path <PATH> Path to Cargo.toml
+  -j, --jobs <N>             Number of parallel compiler workers
+  -h, --help                 Print help";

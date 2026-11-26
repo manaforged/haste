@@ -24,13 +24,15 @@ use crate::graph::store::{FileStamp, file_stamp, watched_stamps};
 #[cfg(unix)]
 use crate::outline::tree::Profile;
 
-/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests, build scripts and watched inputs it was loaded from.
+/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests, build scripts, target directories, and watched inputs it was loaded from.
 #[cfg(unix)]
 struct Served<'a> {
     root: &'a Path,
     targets: &'a Targets,
     workspace: &'a mut graph::Workspace,
     manifests: Vec<(PathBuf, FileStamp)>,
+    target_stamp: u64,
+    rustflags_env: (Option<String>, Option<String>),
     watched: (
         Vec<(PathBuf, u64, i128)>,
         Vec<(String, Option<std::ffi::OsString>)>,
@@ -39,6 +41,13 @@ struct Served<'a> {
 
 #[cfg(unix)]
 impl Served<'_> {
+    fn rustflags_snapshot() -> (Option<String>, Option<String>) {
+        (
+            crate::process_env_var("RUSTFLAGS"),
+            crate::process_env_var("CARGO_ENCODED_RUSTFLAGS"),
+        )
+    }
+
     fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
         graph::manifest_paths(workspace, root)
             .into_iter()
@@ -49,17 +58,26 @@ impl Served<'_> {
             .collect()
     }
 
-    /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest, a local build script or a watched input changed since it loaded; returns whether it did.
+    /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest, a local build script, a target directory, or a watched input changed since it loaded; returns whether it did.
     fn reload(&mut self) -> Result<bool> {
         let manifests_ok = self
             .manifests
             .iter()
             .all(|(path, kept)| file_stamp(path) == *kept);
-        if manifests_ok && watched_stamps(self.workspace) == self.watched {
+        let targets_ok =
+            crate::substrate::noop::target_discovery_stamp(self.workspace) == self.target_stamp;
+        let rustflags_now = Self::rustflags_snapshot();
+        if manifests_ok
+            && targets_ok
+            && rustflags_now == self.rustflags_env
+            && watched_stamps(self.workspace) == self.watched
+        {
             return Ok(false);
         }
         *self.workspace = crate::cli::load_workspace(self.root, self.targets)?;
         self.manifests = Served::manifests(self.workspace, self.root);
+        self.target_stamp = crate::substrate::noop::target_discovery_stamp(self.workspace);
+        self.rustflags_env = rustflags_now;
         self.watched = watched_stamps(self.workspace);
         Ok(true)
     }
@@ -171,107 +189,22 @@ mod unix_ipc {
         hasher.finish()
     }
 
-    fn socket_name_for(key: u64) -> String {
-        if cfg!(target_os = "linux") {
-            // SAFETY: geteuid takes no arguments and reads the process's effective user id.
-            let uid = unsafe { libc::geteuid() };
-            format!("haste/{uid}/{key:016x}")
-        } else {
-            std::env::temp_dir()
-                .join(format!("haste-{key:016x}.sock"))
-                .to_string_lossy()
-                .into_owned()
-        }
-    }
+    pub(super) use proto::connect_name;
 
-    pub(super) fn sockaddr_from_name(name: &str) -> (libc::sockaddr_un, libc::socklen_t) {
-        let abstract_name = cfg!(target_os = "linux");
-        // SAFETY: sockaddr_un is plain data, and all zero bytes are a valid value.
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let skip = usize::from(abstract_name);
-        let room = addr.sun_path.len() - 1;
-        for (slot, byte) in addr.sun_path[skip..room].iter_mut().zip(name.bytes()) {
-            *slot = byte as libc::c_char;
-        }
-        let len =
-            std::mem::offset_of!(libc::sockaddr_un, sun_path) + skip + name.len().min(room - skip);
-        (addr, len as libc::socklen_t)
-    }
-
-    fn address(root: &std::path::Path) -> (String, String, libc::sockaddr_un, libc::socklen_t) {
+    fn address(
+        root: &std::path::Path,
+    ) -> Result<(String, String, libc::sockaddr_un, libc::socklen_t)> {
         let key = socket_key_for(root, &crate::config::Config::current());
         let key_hex = format!("{key:016x}");
-        let name = socket_name_for(key);
-        let (addr, len) = sockaddr_from_name(&name);
-        (key_hex, name, addr, len)
-    }
-
-    pub(super) fn connect_name(name: &str) -> Result<Option<RawFd>> {
-        let (addr, len) = sockaddr_from_name(name);
-        connect_addr(&addr, len)
-    }
-
-    fn connect_addr(addr: &libc::sockaddr_un, len: libc::socklen_t) -> Result<Option<RawFd>> {
-        let fd = socket()?;
-        // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
-        if unsafe { libc::connect(fd, (&raw const *addr).cast(), len) } != 0 || !same_user(fd) {
-            close_all(&[fd]);
-            return Ok(None);
-        }
-        Ok(Some(fd))
-    }
-
-    fn socket() -> Result<RawFd> {
-        // SAFETY: socket takes plain integers and returns a new descriptor or -1.
-        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        if raw < 0 {
-            bail!("socket: {}", std::io::Error::last_os_error());
-        }
-        if raw >= 3 {
-            return crate::image::close_on_exec(raw);
-        }
-        // SAFETY: raw is a valid descriptor below 3; F_DUPFD_CLOEXEC duplicates it at >= 3 and close releases raw.
-        let moved = unsafe {
-            let duped = libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3);
-            libc::close(raw);
-            duped
-        };
-        if moved < 0 {
-            bail!("fcntl: {}", std::io::Error::last_os_error());
-        }
-        Ok(moved)
-    }
-
-    fn client_stdio() -> Result<([RawFd; 3], Vec<RawFd>)> {
-        let mut passed = STDIO;
-        let mut opened = Vec::new();
-        for (slot, &fd) in passed.iter_mut().zip(&STDIO) {
-            // SAFETY: fcntl with F_GETFD inspects whether fd is open in this process without side effects.
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
-                continue;
-            }
-            let flags = (if fd == 0 {
-                libc::O_RDONLY
-            } else {
-                libc::O_WRONLY
-            }) | libc::O_CLOEXEC;
-            // SAFETY: c"/dev/null" is a static NUL-terminated path, and flags takes no mode argument.
-            let null = unsafe { libc::open(c"/dev/null".as_ptr(), flags) };
-            if null < 0 {
-                close_all(&opened);
-                bail!("open /dev/null: {}", std::io::Error::last_os_error());
-            }
-            *slot = null;
-            opened.push(null);
-        }
-        Ok((passed, opened))
+        let name = proto::socket_name_for(key);
+        let (addr, len) = proto::sockaddr_from_name(&name)?;
+        Ok((key_hex, name, addr, len))
     }
 
     /// A socket connected to the server of `root`, or none when no server answers.
     fn connect(root: &std::path::Path) -> Result<Option<RawFd>> {
-        let (_, _, addr, len) = address(root);
-        connect_addr(&addr, len)
+        let (_, _, addr, len) = address(root)?;
+        proto::connect_addr(&addr, len)
     }
 
     /// Sends `request`, optional `out` path, and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
@@ -287,10 +220,17 @@ mod unix_ipc {
         // SAFETY: fd is a connected socket that this File owns from here on.
         let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
         std::io::stdout().flush()?;
-        let (stdio, opened) = client_stdio()?;
-        let sent = send(fd, request.byte(), &stdio);
-        close_all(&opened);
+        let (stdio, opened) = proto::client_stdio()?;
+        let sent = proto::send(fd, request.byte(), &stdio);
+        proto::close_all(&opened);
         sent?;
+        let mut ack = [0u8; 1];
+        match conn.read_exact(&mut ack) {
+            Ok(()) if ack[0] == 0 => return Ok(None),
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
         proto::write_payload(&mut conn, out, args)?;
         let mut status = [0; 4];
         conn.read_exact(&mut status)?;
@@ -357,8 +297,9 @@ mod unix_ipc {
                     .ok_or_else(std::io::Error::last_os_error)
             });
         }
-        if let Ok(mut child) = cmd.spawn() {
-            let (_, sock, _, _) = address(root);
+        if let Ok(mut child) = cmd.spawn()
+            && let Ok((_, sock, _, _)) = address(root)
+        {
             for _ in 0..200 {
                 if control::ping(&sock) || child.try_wait().ok().flatten().is_some() {
                     break;
@@ -376,35 +317,6 @@ mod unix_ipc {
         Some(secs.saturating_mul(1000).min(i32::MAX as u64) as i32)
     }
 
-    fn wait_connection(listener: RawFd, timeout_ms: i32) -> Result<bool> {
-        loop {
-            let mut pfd = libc::pollfd {
-                fd: listener,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: pfd is one live pollfd entry for the listening socket.
-            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
-            if rc > 0 {
-                return Ok(true);
-            }
-            if rc == 0 {
-                return Ok(false);
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                bail!("poll: {err}");
-            }
-        }
-    }
-
-    fn unlink_addr(addr: &libc::sockaddr_un) {
-        if !cfg!(target_os = "linux") {
-            // SAFETY: sun_path is NUL-terminated, since address leaves its last byte zero.
-            unsafe { libc::unlink(addr.sun_path.as_ptr()) };
-        }
-    }
-
     struct SocketGuard {
         fd: RawFd,
         addr: libc::sockaddr_un,
@@ -412,9 +324,155 @@ mod unix_ipc {
 
     impl Drop for SocketGuard {
         fn drop(&mut self) {
-            unlink_addr(&self.addr);
-            close_all(&[self.fd]);
+            proto::unlink_addr(&self.addr);
+            proto::close_all(&[self.fd]);
         }
+    }
+
+    struct QueuedRequest {
+        conn: std::fs::File,
+        byte: u8,
+        fds: Vec<RawFd>,
+    }
+
+    struct AcceptState<'a> {
+        in_flight: &'a std::sync::atomic::AtomicUsize,
+        running_program: &'a std::sync::atomic::AtomicBool,
+        socket: &'a std::sync::Mutex<Option<SocketGuard>>,
+        reg: &'a std::sync::Mutex<Option<control::Registration>>,
+    }
+
+    fn handle_accepted(
+        mut conn: std::fs::File,
+        fd: RawFd,
+        req_tx: &std::sync::mpsc::Sender<QueuedRequest>,
+        state: &AcceptState<'_>,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        if !proto::same_user(fd) {
+            return false;
+        }
+        match proto::receive(fd) {
+            Ok((control::PING_BYTE, fds)) => {
+                proto::close_all(&fds);
+                drop(conn.write_all(&0_i32.to_le_bytes()));
+                false
+            }
+            Ok((control::STOP_BYTE, fds)) => {
+                proto::close_all(&fds);
+                drop(conn.write_all(&0_i32.to_le_bytes()));
+                drop(conn);
+                *crate::sync::lock(state.reg) = None;
+                *crate::sync::lock(state.socket) = None;
+                if state.in_flight.load(Ordering::Acquire) > 0 {
+                    std::process::exit(0);
+                }
+                true
+            }
+            Ok((byte, fds)) => {
+                if state.running_program.load(Ordering::Acquire) {
+                    proto::close_all(&fds);
+                    drop(conn.write_all(&[0]));
+                    return false;
+                }
+                if conn.write_all(&[1]).is_err() {
+                    proto::close_all(&fds);
+                    return false;
+                }
+                let is_run = byte == Request::Run.byte();
+                if is_run {
+                    state.running_program.store(true, Ordering::Release);
+                }
+                state.in_flight.fetch_add(1, Ordering::AcqRel);
+                if let Err(err) = req_tx.send(QueuedRequest { conn, byte, fds }) {
+                    proto::close_all(&err.0.fds);
+                    if is_run {
+                        state.running_program.store(false, Ordering::Release);
+                    }
+                    state.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    return true;
+                }
+                false
+            }
+            Err(_) => {
+                drop(conn.write_all(&1_i32.to_le_bytes()));
+                false
+            }
+        }
+    }
+
+    fn accept_loop(
+        listener: RawFd,
+        idle_ms: Option<i32>,
+        req_tx: std::sync::mpsc::Sender<QueuedRequest>,
+        state: &AcceptState<'_>,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        loop {
+            if let Some(timeout_ms) = idle_ms
+                && !proto::wait_connection(listener, timeout_ms)?
+            {
+                if state.in_flight.load(Ordering::Acquire) > 0 {
+                    continue;
+                }
+                return Ok(());
+            }
+            // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
+            let fd = unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if fd < 0 {
+                continue;
+            }
+            if crate::image::close_on_exec(fd).is_err() {
+                proto::close_all(&[fd]);
+                continue;
+            }
+            // SAFETY: fd is the accepted connection, which this File owns from here on.
+            let conn = unsafe { std::fs::File::from_raw_fd(fd) };
+            if handle_accepted(conn, fd, &req_tx, state) {
+                return Ok(());
+            }
+        }
+    }
+
+    fn process_request(
+        mut req: QueuedRequest,
+        build: &mut Option<Build>,
+        served: &mut Served<'_>,
+        in_flight: &std::sync::atomic::AtomicUsize,
+        running_program: &std::sync::atomic::AtomicBool,
+    ) {
+        struct Flight<'a> {
+            in_flight: &'a std::sync::atomic::AtomicUsize,
+            running_program: &'a std::sync::atomic::AtomicBool,
+            is_run: bool,
+        }
+        impl Drop for Flight<'_> {
+            fn drop(&mut self) {
+                use std::sync::atomic::Ordering;
+                if self.is_run {
+                    self.running_program.store(false, Ordering::Release);
+                }
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _flight = Flight {
+            in_flight,
+            running_program,
+            is_run: req.byte == Request::Run.byte(),
+        };
+        let status = match proto::read_payload(&mut req.conn) {
+            Ok(payload) => answer(
+                build,
+                served,
+                Request::parse(req.byte).map(|request| (request, payload)),
+                &req.fds,
+            ),
+            Err(_) => {
+                proto::close_all(&req.fds);
+                1
+            }
+        };
+        drop(req.conn.write_all(&status.to_le_bytes()));
     }
 
     /// Loads `workspace` once, then answers requests until stopped or `HASTE_SERVE_IDLE_SECS` elapses, loading it again when its lock file or a local manifest changes.
@@ -423,12 +481,15 @@ mod unix_ipc {
         targets: &Targets,
         root: &std::path::Path,
     ) -> Result<()> {
-        let (key_hex, sock_name, addr, _) = address(root);
-        let listener = listen(root)?;
-        let _socket = SocketGuard { fd: listener, addr };
-        let _reg = control::Registration::create(&key_hex, root, &sock_name)?;
+        let (key_hex, sock_name, addr, len) = address(root)?;
+        let listener = listen(root, &sock_name, &addr, len)?;
+        let socket = std::sync::Mutex::new(Some(SocketGuard { fd: listener, addr }));
+        let reg = std::sync::Mutex::new(Some(control::Registration::create(
+            &key_hex, root, &sock_name,
+        )?));
         let started = Instant::now();
         let manifests = Served::manifests(workspace, root);
+        let target_stamp = crate::substrate::noop::target_discovery_stamp(workspace);
         let watched = watched_stamps(workspace);
         let mut build = Some(Build::load(workspace, targets)?);
         if let Some(ref mut warm) = build {
@@ -446,6 +507,8 @@ mod unix_ipc {
             targets,
             workspace,
             manifests,
+            target_stamp,
+            rustflags_env: Served::rustflags_snapshot(),
             watched,
         };
         let idle_ms = idle_timeout_ms();
@@ -454,96 +517,47 @@ mod unix_ipc {
             root.display(),
             started.elapsed().as_secs_f64() * 1e3
         );
-        loop {
-            if let Some(timeout_ms) = idle_ms
-                && !wait_connection(listener, timeout_ms)?
-            {
-                return Ok(());
-            }
-            // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
-            let fd = unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
-            if fd < 0 || crate::image::close_on_exec(fd).is_err() {
-                continue;
-            }
-            // SAFETY: fd is the accepted connection, which this File owns from here on.
-            let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
-            if !same_user(fd) {
-                continue;
-            }
-            let status = match receive(fd) {
-                Ok((control::PING_BYTE, fds)) => {
-                    close_all(&fds);
-                    0
-                }
-                Ok((control::STOP_BYTE, fds)) => {
-                    close_all(&fds);
-                    drop(conn.write_all(&0_i32.to_le_bytes()));
-                    return Ok(());
-                }
-                Ok((byte, fds)) => match proto::read_payload(&mut conn) {
-                    Ok(payload) => answer(
-                        &mut build,
-                        &mut served,
-                        Request::parse(byte).map(|request| (request, payload)),
-                        &fds,
-                    ),
-                    Err(_) => 1,
-                },
-                Err(_) => 1,
-            };
-            drop(conn.write_all(&status.to_le_bytes()));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn same_user(fd: RawFd) -> bool {
-        // SAFETY: ucred is plain data, and all zero bytes are a valid value.
-        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: fd is an accepted AF_UNIX socket, and cred/len point to live storage of size len.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&raw mut cred).cast(),
-                &raw mut len,
-            )
+        let in_flight = std::sync::atomic::AtomicUsize::new(0);
+        let running_program = std::sync::atomic::AtomicBool::new(false);
+        let state = AcceptState {
+            in_flight: &in_flight,
+            running_program: &running_program,
+            socket: &socket,
+            reg: &reg,
         };
-        // SAFETY: geteuid takes no pointers and reads the process's effective user id.
-        rc == 0
-            && len as usize == std::mem::size_of::<libc::ucred>()
-            && cred.uid == unsafe { libc::geteuid() }
+        std::thread::scope(|scope| {
+            let (req_tx, req_rx) = std::sync::mpsc::channel();
+            let accept_handle = scope.spawn(|| accept_loop(listener, idle_ms, req_tx, &state));
+            while let Ok(req) = req_rx.recv() {
+                process_request(req, &mut build, &mut served, &in_flight, &running_program);
+            }
+            match accept_handle.join() {
+                Ok(res) => res,
+                Err(_) => bail!("daemon accept loop panicked"),
+            }
+        })
     }
 
-    #[cfg(target_os = "macos")]
-    fn same_user(fd: RawFd) -> bool {
-        let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
-        // SAFETY: fd is an accepted AF_UNIX socket, and uid/gid point to live storage.
-        let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
-        // SAFETY: geteuid takes no pointers and reads the process's effective user id.
-        rc == 0 && uid == unsafe { libc::geteuid() }
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn same_user(_fd: RawFd) -> bool {
-        false
-    }
-
-    fn listen(root: &std::path::Path) -> Result<RawFd> {
-        let fd = socket()?;
-        let (_, _, addr, len) = address(root);
-        let answered = connect(root)?.inspect(|fd| close_all(&[*fd])).is_some();
-        if !answered {
-            unlink_addr(&addr);
+    fn listen(
+        root: &std::path::Path,
+        sock_name: &str,
+        addr: &libc::sockaddr_un,
+        len: libc::socklen_t,
+    ) -> Result<RawFd> {
+        let answered = proto::connect_addr(addr, len)?
+            .inspect(|fd| proto::close_all(&[*fd]))
+            .is_some();
+        if answered {
+            bail!("a build server for {} runs already", root.display());
         }
+        proto::ensure_socket_dir(sock_name)?;
+        proto::unlink_addr(addr);
+        let fd = proto::socket()?;
         // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
-        if unsafe { libc::bind(fd, (&raw const addr).cast(), len) } != 0 {
-            bail!(
-                "a build server for {} runs already: {}",
-                root.display(),
-                std::io::Error::last_os_error()
-            );
+        if unsafe { libc::bind(fd, (&raw const *addr).cast(), len) } != 0 {
+            let err = std::io::Error::last_os_error();
+            proto::close_all(&[fd]);
+            bail!("a build server for {} runs already: {err}", root.display());
         }
         if !cfg!(target_os = "linux") {
             // SAFETY: sun_path is NUL-terminated and was just bound above.
@@ -551,17 +565,12 @@ mod unix_ipc {
         }
         // SAFETY: fd is a bound AF_UNIX socket.
         if unsafe { libc::listen(fd, 16) } != 0 {
-            bail!(
-                "a build server for {} runs already: {}",
-                root.display(),
-                std::io::Error::last_os_error()
-            );
+            let err = std::io::Error::last_os_error();
+            proto::close_all(&[fd]);
+            bail!("a build server for {} runs already: {err}", root.display());
         }
         Ok(fd)
     }
-
-    /// The standard input, output and error that a client hands the server for the program it runs.
-    const STDIO: [RawFd; 3] = [0, 1, 2];
 
     fn answer(
         build: &mut Option<Build>,
@@ -570,10 +579,10 @@ mod unix_ipc {
         fds: &[RawFd],
     ) -> i32 {
         let Ok(&client) = <&[RawFd; 3]>::try_from(fds) else {
-            close_all(fds);
+            proto::close_all(fds);
             return 1;
         };
-        let saved = redirect(client);
+        let saved = proto::redirect(client);
         let started = Instant::now();
         let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
             Some((request, payload)) => {
@@ -609,39 +618,8 @@ mod unix_ipc {
         if let Err(error) = &done {
             drop(writeln!(std::io::stderr(), "error: {error:#}"));
         }
-        restore(saved, fds);
+        proto::restore(saved, fds);
         done.unwrap_or(1)
-    }
-
-    fn redirect(client: [RawFd; 3]) -> [RawFd; 3] {
-        // SAFETY: fcntl and dup2 take descriptors this process holds; 0, 1 and 2 stay open throughout.
-        STDIO.map(|own| unsafe {
-            let saved = libc::fcntl(own, libc::F_DUPFD_CLOEXEC, 3);
-            libc::dup2(client[own as usize], own);
-            saved
-        })
-    }
-
-    fn restore(saved: [RawFd; 3], received: &[RawFd]) {
-        drop(std::io::stdout().flush());
-        drop(std::io::stderr().flush());
-        for (&own, kept) in STDIO.iter().zip(saved) {
-            // SAFETY: saved holds the duplicates of this process's own standard descriptors.
-            unsafe {
-                libc::dup2(kept, own);
-            }
-        }
-        close_all(&saved);
-        close_all(received);
-    }
-
-    fn close_all(fds: &[RawFd]) {
-        for &fd in fds {
-            // SAFETY: fds are descriptors this process owns and nothing else uses after this call.
-            unsafe {
-                libc::close(fd);
-            }
-        }
     }
 
     /// Returns `build` brought up to date with the member files, or a build from nothing when there is none or the refresh fails, so a failed refresh never leaves a half-updated build behind.
@@ -654,76 +632,6 @@ mod unix_ipc {
             Some(mut build) => build.refresh(workspace, targets).map(|()| build),
             None => Build::load(workspace, targets),
         }
-    }
-
-    fn send(fd: RawFd, byte: u8, fds: &[RawFd]) -> Result<()> {
-        let mut data = [byte];
-        let mut iov = libc::iovec {
-            iov_base: data.as_mut_ptr().cast(),
-            iov_len: 1,
-        };
-        let bytes = std::mem::size_of_val(fds);
-        // SAFETY: CMSG_SPACE only computes a size.
-        let mut control = vec![0_u8; unsafe { libc::CMSG_SPACE(bytes as u32) } as usize];
-        // SAFETY: msghdr is plain data, and all zero bytes are a valid value.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        (msg.msg_iov, msg.msg_iovlen) = (&raw mut iov, 1);
-        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), control.len() as _);
-        // SAFETY: msg points at live iov and control buffers sized by CMSG_SPACE for fds, so the first header and its data fit in control.
-        let sent = unsafe {
-            let header = libc::CMSG_FIRSTHDR(&msg);
-            (*header).cmsg_level = libc::SOL_SOCKET;
-            (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(bytes as u32) as _;
-            std::ptr::copy_nonoverlapping(
-                fds.as_ptr(),
-                libc::CMSG_DATA(header).cast::<RawFd>(),
-                fds.len(),
-            );
-            libc::sendmsg(fd, &msg, 0)
-        };
-        if sent != 1 {
-            bail!("sendmsg: {}", std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn receive(fd: RawFd) -> Result<(u8, Vec<RawFd>)> {
-        let mut data = [0_u8];
-        let mut iov = libc::iovec {
-            iov_base: data.as_mut_ptr().cast(),
-            iov_len: 1,
-        };
-        // SAFETY: CMSG_SPACE only computes a size.
-        let mut control =
-            vec![0_u8; unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&STDIO) as u32) } as usize];
-        // SAFETY: msghdr is plain data, and all zero bytes are a valid value.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        (msg.msg_iov, msg.msg_iovlen) = (&raw mut iov, 1);
-        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), control.len() as _);
-        // SAFETY: msg points at live iov and control buffers for recvmsg to fill.
-        if unsafe { libc::recvmsg(fd, &mut msg, 0) } != 1 {
-            bail!("recvmsg: {}", std::io::Error::last_os_error());
-        }
-        let mut fds = Vec::new();
-        // SAFETY: recvmsg filled msg; each header that CMSG_FIRSTHDR and CMSG_NXTHDR yield lies inside control with cmsg_len bytes.
-        unsafe {
-            let mut header = libc::CMSG_FIRSTHDR(&msg);
-            while !header.is_null() {
-                if (*header).cmsg_level == libc::SOL_SOCKET
-                    && (*header).cmsg_type == libc::SCM_RIGHTS
-                {
-                    let count = ((*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
-                        / size_of::<RawFd>();
-                    let data = libc::CMSG_DATA(header).cast::<RawFd>();
-                    fds.extend((0..count).map(|at| data.add(at).read_unaligned()));
-                }
-                header = libc::CMSG_NXTHDR(&msg, header);
-            }
-        }
-        fds.iter()
-            .try_for_each(|&fd| crate::image::close_on_exec(fd).map(drop))?;
-        Ok((data[0], fds))
     }
 
     #[cfg(test)]
