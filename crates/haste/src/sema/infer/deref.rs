@@ -130,7 +130,11 @@ impl Infer<'_, '_> {
         let (mut ty, mut steps) = (self.resolve(found), 0);
         while !matches!(
             self.cx.types.kind(ty),
-            Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Ptr(..)
+            Kind::Closure(..)
+                | Kind::FnDef(..)
+                | Kind::FnPtr(..)
+                | Kind::UnsafeFnPtr(..)
+                | Kind::Ptr(..)
         ) && let Some(inner) = self.builtin_deref(ty)
         {
             (ty, steps) = (self.resolve(inner), steps + 1);

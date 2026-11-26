@@ -1,16 +1,20 @@
 use anyhow::Result;
 
-use crate::body::{Args, BlockKind, Body, Bound, Expr, ExprId, GenericArg, Ty as AstTy, TyId};
+use crate::body::{BlockKind, Expr, ExprId, Ty as AstTy, TyId};
 use crate::outline::source::Source;
 use crate::sema::infer::Res;
 use crate::sema::ty::Kind;
 
-use super::super::checks::{InvariantLifetimes, collect_ast_invariant_lifetimes, is_temp_target};
+use super::super::checks::{VarianceLifetimes, collect_ast_variance, is_temp_target};
 use super::super::places::PlaceStep;
 use super::super::propagate::BorrowSource;
 use super::lifetimes::{
-    LT_STATIC, Lifetimes, collect_ty_lifetimes, is_owned_container, is_prim_name,
-    lifetime_is_static, lifetime_outlives_in_headers, owned_lts,
+    Lifetimes, collect_ty_lifetimes, is_owned_container, lifetime_outlives_in_headers, owned_lts,
+};
+
+pub(super) use super::static_ty::ast_ty_is_provably_static;
+pub(in super::super) use super::static_ty::{
+    ast_ref_dyn_requires_static, ast_ty_is_provably_static_in,
 };
 
 pub(in super::super) fn lifetime_outlives_in_item(
@@ -39,199 +43,6 @@ pub(in super::super) fn lifetime_outlives_in_item(
         None => {
             lifetime_outlives_in_headers(&[(&sig.body, src, &sig.generics, &sig.predicates)], a, b)
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DynDefault {
-    Inferred,
-    InSig,
-    InSigOwned,
-}
-
-impl DynDefault {
-    fn enter_owned(self) -> Self {
-        match self {
-            Self::Inferred => Self::Inferred,
-            Self::InSig | Self::InSigOwned => Self::InSigOwned,
-        }
-    }
-
-    fn reset_owned(self) -> Self {
-        match self {
-            Self::Inferred => Self::Inferred,
-            Self::InSig | Self::InSigOwned => Self::InSig,
-        }
-    }
-}
-
-pub(super) fn ast_ty_is_provably_static(
-    sig: &crate::body::sig::Signature,
-    src: &Source,
-    ty: TyId,
-) -> bool {
-    ast_ty_is_provably_static_in_mode(&sig.body, src, Some((sig, src)), ty, DynDefault::InSig)
-}
-
-pub(in super::super) fn ast_ty_is_provably_static_in(
-    body: &Body,
-    src: &Source,
-    sig: Option<(&crate::body::sig::Signature, &Source)>,
-    ty: TyId,
-) -> bool {
-    ast_ty_is_provably_static_in_mode(body, src, sig, ty, DynDefault::Inferred)
-}
-
-fn path_args_are_static(
-    body: &Body,
-    src: &Source,
-    sig: Option<(&crate::body::sig::Signature, &Source)>,
-    path: crate::body::PathId,
-    lt_static: &impl Fn(&str) -> bool,
-    mode: DynDefault,
-) -> bool {
-    let base = mode.reset_owned();
-    body.list(body.path(path).segments).iter().all(|&s_id| {
-        match body.segments[s_id as usize].args {
-            None => true,
-            Some(Args::Angle(args)) => {
-                body.list(args)
-                    .iter()
-                    .all(|&a| match body.args[a as usize] {
-                        GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                            ast_ty_is_provably_static_in_mode(body, src, sig, t, base)
-                        }
-                        GenericArg::Lifetime(lt) => lt_static(src.text(lt)),
-                        GenericArg::Const(_) => true,
-                        GenericArg::Constraint { .. } => false,
-                    })
-            }
-            Some(Args::Paren { inputs, output }) => {
-                body.list(inputs)
-                    .iter()
-                    .all(|&t| fn_param_is_provably_static(body, src, sig, TyId(t), lt_static, base))
-                    && output
-                        .is_none_or(|o| ast_ty_is_provably_static_in_mode(body, src, sig, o, base))
-            }
-            Some(Args::ReturnType) => false,
-        }
-    })
-}
-
-fn fn_param_is_provably_static(
-    body: &Body,
-    src: &Source,
-    sig: Option<(&crate::body::sig::Signature, &Source)>,
-    ty: TyId,
-    lt_static: &impl Fn(&str) -> bool,
-    mode: DynDefault,
-) -> bool {
-    match *body.ty(ty) {
-        AstTy::Ref {
-            lifetime: None,
-            ty: inner,
-            ..
-        } => ast_ty_is_provably_static_in_mode(body, src, sig, inner, mode.reset_owned()),
-        AstTy::Ref {
-            lifetime: Some(lt),
-            ty: inner,
-            ..
-        } => {
-            lt_static(src.text(lt))
-                && ast_ty_is_provably_static_in_mode(body, src, sig, inner, mode.enter_owned())
-        }
-        _ => ast_ty_is_provably_static_in_mode(body, src, sig, ty, mode.reset_owned()),
-    }
-}
-
-fn ast_ty_is_provably_static_in_mode(
-    body: &Body,
-    src: &Source,
-    sig: Option<(&crate::body::sig::Signature, &Source)>,
-    ty: TyId,
-    mode: DynDefault,
-) -> bool {
-    let lt_static = |lt: &str| match sig {
-        Some((s, s_src)) => lifetime_is_static(s, s_src, lt),
-        None => lt == LT_STATIC,
-    };
-    match *body.ty(ty) {
-        AstTy::Never => true,
-        AstTy::Ptr { ty: t, .. } => {
-            ast_ty_is_provably_static_in_mode(body, src, sig, t, mode.enter_owned())
-        }
-        AstTy::Paren(t) | AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Pat(t, _) => {
-            ast_ty_is_provably_static_in_mode(body, src, sig, t, mode)
-        }
-        AstTy::Tuple(list) => body
-            .list(list)
-            .iter()
-            .all(|&t| ast_ty_is_provably_static_in_mode(body, src, sig, TyId(t), mode)),
-        AstTy::Ref {
-            lifetime: Some(lt),
-            ty: inner,
-            ..
-        } => {
-            lt_static(src.text(lt))
-                && ast_ty_is_provably_static_in_mode(body, src, sig, inner, mode.enter_owned())
-        }
-        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
-            let is_dyn = matches!(*body.ty(ty), AstTy::DynTrait(_));
-            let bounds = body.list(list);
-            let has_lt = bounds
-                .iter()
-                .any(|&b_id| matches!(body.bounds[b_id as usize], Bound::Lifetime(_)));
-            let lifetime_ok = if has_lt {
-                bounds.iter().any(|&b_id| {
-                    matches!(body.bounds[b_id as usize], Bound::Lifetime(lt) if lt_static(src.text(lt)))
-                })
-            } else {
-                is_dyn && mode == DynDefault::InSigOwned
-            };
-            lifetime_ok
-                && bounds.iter().all(|&b_id| match body.bounds[b_id as usize] {
-                    Bound::Lifetime(lt) => lt_static(src.text(lt)),
-                    Bound::Trait { path, .. } => {
-                        path_args_are_static(body, src, sig, path, &lt_static, mode)
-                    }
-                    Bound::Use(_) => true,
-                })
-        }
-        AstTy::Path(path_id) => {
-            let p = body.path(path_id);
-            let segs = body.list(p.segments);
-            if p.qself.is_some() || segs.is_empty() {
-                return false;
-            }
-            if segs[..segs.len() - 1]
-                .iter()
-                .any(|&s| body.segments[s as usize].args.is_some())
-            {
-                return false;
-            }
-            let seg = body.segments[segs[segs.len() - 1] as usize];
-            let name = crate::names::plain(src.text(seg.name));
-            if seg.args.is_none() && is_prim_name(name) {
-                return true;
-            }
-            if is_owned_container(name)
-                && let Some(Args::Angle(args)) = seg.args
-            {
-                return body
-                    .list(args)
-                    .iter()
-                    .all(|&a| match body.args[a as usize] {
-                        GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                            ast_ty_is_provably_static_in_mode(body, src, sig, t, mode.enter_owned())
-                        }
-                        GenericArg::Lifetime(lt) => lt_static(src.text(lt)),
-                        GenericArg::Const(_) => true,
-                        GenericArg::Constraint { .. } => false,
-                    });
-            }
-            false
-        }
-        _ => false,
     }
 }
 
@@ -397,10 +208,10 @@ impl super::super::Checker<'_, '_> {
         Some(owned_lts(lts.named))
     }
 
-    fn ret_invariant_lts(&mut self) -> Option<InvariantLifetimes> {
+    fn ret_variance_lts(&mut self) -> Option<VarianceLifetimes> {
         let sig = self.cx.signature(self.item).ok()?;
         let ret_ast = sig.ret?;
-        Some(collect_ast_invariant_lifetimes(
+        Some(collect_ast_variance(
             self.cx,
             Some(self.item),
             &sig.body,
@@ -560,6 +371,58 @@ impl super::super::Checker<'_, '_> {
                 .is_some_and(|ret_ast| ast_ty_is_provably_static(&sig, self.src, ret_ast))
     }
 
+    fn ret_ref_dyn_requires_static(&mut self) -> bool {
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return false;
+        };
+        !sig.is_async
+            && sig.ret.is_some_and(|ret_ast| {
+                ast_ref_dyn_requires_static(&sig.body, self.src, Some((&sig, self.src)), ret_ast)
+            })
+    }
+
+    pub(in super::super) fn check_ref_dyn_static_pointee(
+        &mut self,
+        expr: ExprId,
+        sources: &[BorrowSource],
+    ) -> Result<()> {
+        let unwrapped = self.unwrap_parens(expr);
+        if let Some(coercion) = self
+            .typed
+            .coercions
+            .get(&expr)
+            .or_else(|| self.typed.coercions.get(&unwrapped))
+            && let Some(vtable) = coercion.vtable()
+            && self.ty_is_borrow_free(vtable.ty)
+        {
+            return Ok(());
+        }
+        for src in sources {
+            if self.is_non_static_param(src.target) && !self.param_inner_is_static(src.target) {
+                return Err(self.borrow_err(
+                    Some(expr),
+                    format!(
+                        "borrowed data `{}` escapes outside of function: `dyn` trait object requires `'static` lifetime",
+                        self.local_name(src.target)
+                    ),
+                ));
+            }
+        }
+        if let Some(local) = self.expr_plain_local(unwrapped)
+            && self.is_non_static_param(local)
+            && !self.param_inner_is_static(local)
+        {
+            return Err(self.borrow_err(
+                Some(expr),
+                format!(
+                    "borrowed data `{}` escapes outside of function: `dyn` trait object requires `'static` lifetime",
+                    self.local_name(local)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub(in super::super) fn check_return_sources(
         &mut self,
         expr: ExprId,
@@ -624,6 +487,9 @@ impl super::super::Checker<'_, '_> {
         }
         if self.closure_depth == 0 && returns_only_static {
             self.check_return_static_local_args(expr)?;
+        }
+        if self.closure_depth == 0 && self.ret_ref_dyn_requires_static() {
+            self.check_ref_dyn_static_pointee(expr, sources)?;
         }
         if self.closure_depth == 0 && self.returns_invariant {
             self.check_return_invariant_expr(expr, sources)?;
@@ -704,9 +570,13 @@ impl super::super::Checker<'_, '_> {
         expr: ExprId,
         sources: &[BorrowSource],
     ) -> Result<()> {
-        let Some(ret_inv) = self.ret_invariant_lts() else {
+        let Some(ret_var) = self.ret_variance_lts() else {
             return Ok(());
         };
+        if !ret_var.contra.is_empty() {
+            self.check_expr_contra_fit(expr, &ret_var.contra)?;
+        }
+        let ret_inv = &ret_var.inv;
         let req_static = ret_inv.is_only_static();
         if !req_static && ret_inv.named.is_empty() {
             return Ok(());
@@ -752,6 +622,17 @@ impl super::super::Checker<'_, '_> {
                 req_static,
                 &ret_inv.named,
             )?;
+        } else {
+            let expr_var = self.expr_variance_lts(expr);
+            if !expr_var.inv.is_empty() {
+                self.check_inv_against_req(
+                    Some(expr),
+                    0,
+                    &expr_var.inv,
+                    req_static,
+                    &ret_inv.named,
+                )?;
+            }
         }
         if let Some(inner_ref) = match *self.body.expr(self.unwrap_parens(expr)) {
             Expr::Ref { expr: inner, .. } => self.root_place(inner),

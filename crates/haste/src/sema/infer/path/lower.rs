@@ -208,7 +208,8 @@ impl<'a> Infer<'_, 'a> {
                 params,
                 ret,
                 variadic,
-            } => self.fn_ptr_ty(arena, (params, ret), variadic),
+                is_unsafe,
+            } => self.fn_ptr_ty(arena, (params, ret), variadic, is_unsafe),
             other => bail!("unsupported type {other:?}"),
         }
     }
@@ -218,6 +219,7 @@ impl<'a> Infer<'_, 'a> {
         arena: &Body,
         (params, ret): (syntax::List, Option<TyId>),
         variadic: bool,
+        is_unsafe: bool,
     ) -> Result<Kind> {
         if variadic {
             bail!("variadic function pointer types are not supported yet");
@@ -227,7 +229,12 @@ impl<'a> Infer<'_, 'a> {
             Some(ret) => self.lower_ty(arena, ret)?,
             None => self.cx.types.unit(),
         };
-        Ok(Kind::FnPtr(self.cx.types.intern_substs(&params), ret))
+        let params = self.cx.types.intern_substs(&params);
+        Ok(if is_unsafe {
+            Kind::UnsafeFnPtr(params, ret)
+        } else {
+            Kind::FnPtr(params, ret)
+        })
     }
 
     fn object_ty(&mut self, arena: &Body, bounds: syntax::List) -> Result<Kind> {

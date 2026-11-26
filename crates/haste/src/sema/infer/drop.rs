@@ -698,6 +698,7 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
         | Kind::Ptr(..)
         | Kind::FnDef(..)
         | Kind::FnPtr(..)
+        | Kind::UnsafeFnPtr(..)
         | Kind::Never
         | Kind::Value(_) => return Ok(false),
         Kind::Dyn(..) => return Ok(true),

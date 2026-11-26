@@ -161,7 +161,7 @@ impl Cursor<'_> {
     }
 
     fn fn_ty(&mut self) -> Result<TyId> {
-        self.fn_qualifiers()?;
+        let is_unsafe = self.fn_qualifiers()?;
         let open = self.expect_kind(TokenKind::OpenParen)?;
         self.at = open;
         let mut variadic = false;
@@ -175,20 +175,24 @@ impl Cursor<'_> {
             params,
             ret,
             variadic,
+            is_unsafe,
         }))
     }
 
-    fn fn_qualifiers(&mut self) -> Result<()> {
+    fn fn_qualifiers(&mut self) -> Result<bool> {
+        let mut is_unsafe = false;
         while !self.eat_word("fn") {
             if self.eat_word("extern") {
                 if matches!(self.kind(), TokenKind::Literal { .. }) {
                     self.at += 1;
                 }
-            } else if !(self.eat_word("unsafe") || self.eat_word("safe")) {
+            } else if self.eat_word("unsafe") {
+                is_unsafe = true;
+            } else if !self.eat_word("safe") {
                 return self.fail("expected `fn`");
             }
         }
-        Ok(())
+        Ok(is_unsafe)
     }
 
     fn fn_param(&mut self, variadic: &mut bool) -> Result<u32> {

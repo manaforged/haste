@@ -96,25 +96,27 @@ impl Indirect {
         };
         let kind = cx.types.kind(ty).clone();
         match kind {
-            Kind::FnPtr(params, ret) => match self.pointers.get(&key) {
-                None if !self.unkeyed => Mode::Free,
-                None => Mode::Opaque,
-                Some(pointer) => {
-                    let params = cx.types.substs(params).to_vec();
-                    let neutral = self
-                        .method(
-                            cx,
-                            keys,
-                            (&params, Some(ret), 0),
-                            (&pointer.abi, &pointer.layouts),
-                            visiting,
-                        )
-                        .is_some_and(|(_, carries)| {
-                            carries.iter().all(|&carry| carry == Carry::Same)
-                        });
-                    if neutral { Mode::Free } else { Mode::Opaque }
+            Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => {
+                match self.pointers.get(&key) {
+                    None if !self.unkeyed => Mode::Free,
+                    None => Mode::Opaque,
+                    Some(pointer) => {
+                        let params = cx.types.substs(params).to_vec();
+                        let neutral = self
+                            .method(
+                                cx,
+                                keys,
+                                (&params, Some(ret), 0),
+                                (&pointer.abi, &pointer.layouts),
+                                visiting,
+                            )
+                            .is_some_and(|(_, carries)| {
+                                carries.iter().all(|&carry| carry == Carry::Same)
+                            });
+                        if neutral { Mode::Free } else { Mode::Opaque }
+                    }
                 }
-            },
+            }
             Kind::Dyn(of, ..) => match self.objects.get(&key) {
                 None if !self.unkeyed => Mode::Free,
                 None => Mode::Opaque,

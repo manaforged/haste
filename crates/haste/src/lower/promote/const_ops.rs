@@ -295,9 +295,9 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
             self.lower.cx.types.kind(dst_ty).clone(),
         );
         match (src_kind, dst_kind) {
-            (Kind::FnDef(item, substs), Kind::FnPtr(..)) => Some(Val::ptr(PtrTarget::Fn(
-                self.lower.rodata_fn_target(item, substs)?,
-            ))),
+            (Kind::FnDef(item, substs), Kind::FnPtr(..) | Kind::UnsafeFnPtr(..)) => Some(Val::ptr(
+                PtrTarget::Fn(self.lower.rodata_fn_target(item, substs)?),
+            )),
             (Kind::Prim(_), Kind::Ptr(_, _)) => Some(Val::scalar(
                 8,
                 self.eval_expr_val(scope, inner, frame)?.as_u128()?,

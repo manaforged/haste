@@ -221,7 +221,7 @@ fn hash_ty_kind_facts(
             mix.byte(0x18);
             mix.bool(cx.foreign(fi));
         }
-        Kind::FnPtr(params, ret) => {
+        Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => {
             mix.byte(0x19);
             let params = cx.types.substs(params).to_vec();
             let sig = signature_of(cx, Some(ret), params)?;

@@ -7,7 +7,7 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::calls::lifetimes::collect_ty_lifetimes;
 use super::super::calls::{Lifetimes, recv_ref_mut};
-use super::super::checks::collect_ast_invariant_lifetimes;
+use super::super::checks::{collect_ast_invariant_lifetimes, collect_ast_variance};
 use super::super::places::{Place, PlaceStep};
 use super::super::propagate::BorrowSource;
 use super::super::{Checker, State};
@@ -19,7 +19,7 @@ enum CallOutDst {
         extra_ptr_targets: Vec<u32>,
     },
     Value {
-        local: Option<u32>,
+        arg: ExprId,
         match_ty: TyId,
     },
 }
@@ -131,7 +131,7 @@ impl Checker<'_, '_> {
                 ty: dst_inner,
             } => self.call_out_mut_ptr_dst(dst_inner, dst_arg, arg_unwrapped, state),
             _ => {
-                let dst_inv = collect_ast_invariant_lifetimes(
+                let dst_var = collect_ast_variance(
                     self.cx,
                     fn_item,
                     &sig.body,
@@ -139,10 +139,12 @@ impl Checker<'_, '_> {
                     dst_ast,
                     Some(self.expr_ty(dst_arg)),
                 );
-                (!dst_inv.is_empty()).then(|| CallOutDst::Value {
-                    local: self.expr_plain_local(arg_unwrapped),
-                    match_ty: dst_ast,
-                })
+                (!dst_var.inv.is_empty() || !dst_var.contra.is_empty()).then_some(
+                    CallOutDst::Value {
+                        arg: arg_unwrapped,
+                        match_ty: dst_ast,
+                    },
+                )
             }
         }
     }
@@ -357,29 +359,42 @@ impl Checker<'_, '_> {
                     }
                 }
             }
-            CallOutDst::Value {
-                local: Some(dst_local),
-                ..
-            } => {
-                let (req_static, req_named) = self.target_invariant_req(*dst_local, false, false);
-                if req_static || !req_named.is_empty() {
-                    self.check_sources_fit_invariant_lts(
-                        Some(src_expr),
-                        &sources,
-                        req_static,
-                        &req_named,
-                    )?;
-                    if let Some(src_local) = self.expr_plain_local(src_expr) {
-                        self.check_src_local_fits_target_local(
-                            src_expr,
-                            src_local,
-                            *dst_local,
-                            (false, false),
+            CallOutDst::Value { arg: dst_arg, .. } => {
+                if let Some(dst_local) = self.expr_plain_local(*dst_arg) {
+                    let (mut req_static, mut req_named) =
+                        self.target_invariant_req(dst_local, false, false);
+                    let dst_contra = self.target_contra_req(dst_local, false);
+                    if dst_contra.saw_static {
+                        req_static = true;
+                    }
+                    for lt in dst_contra.named {
+                        if !req_named.contains(&lt) {
+                            req_named.push(lt);
+                        }
+                    }
+                    if req_static || !req_named.is_empty() {
+                        self.check_sources_fit_invariant_lts(
+                            Some(src_expr),
+                            &sources,
+                            req_static,
+                            &req_named,
                         )?;
+                        if let Some(src_local) = self.expr_plain_local(src_expr) {
+                            self.check_src_local_fits_target_local(
+                                src_expr,
+                                src_local,
+                                dst_local,
+                                (false, false),
+                            )?;
+                        }
+                    }
+                } else {
+                    let dst_var = self.expr_variance_lts(*dst_arg);
+                    if dst_var.contra.saw_static || dst_var.inv.is_only_static() {
+                        self.check_sources_fit_invariant_lts(Some(src_expr), &sources, true, &[])?;
                     }
                 }
             }
-            CallOutDst::Value { local: None, .. } => {}
         }
         Ok(())
     }

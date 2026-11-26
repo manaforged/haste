@@ -203,6 +203,7 @@ fn record_drop_ty(
             | Kind::Ptr(..)
             | Kind::FnDef(..)
             | Kind::FnPtr(..)
+            | Kind::UnsafeFnPtr(..)
             | Kind::Never
             | Kind::Value(_)
     ) {

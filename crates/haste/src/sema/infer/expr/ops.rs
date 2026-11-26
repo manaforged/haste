@@ -132,7 +132,8 @@ impl Infer<'_, '_> {
         let kind = self.cx.types.kind(self.resolve(left));
         self.is_scalar(left)
             || is_compare(op) && matches!(kind, Kind::Ptr(..))
-            || matches!(op, BinOp::Eq | BinOp::Ne) && matches!(kind, Kind::FnPtr(..))
+            || matches!(op, BinOp::Eq | BinOp::Ne)
+                && matches!(kind, Kind::FnPtr(..) | Kind::UnsafeFnPtr(..))
     }
 
     pub(in crate::sema) fn is_builtin_op(&mut self, check: OpCheck) -> bool {
@@ -424,6 +425,46 @@ pub(in super::super) fn operator_trait(op: BinOp) -> Option<(&'static str, &'sta
 }
 
 impl Infer<'_, '_> {
+    pub(super) fn check_static_mut_ref(&self, mut cur: ExprId, mutable: bool) -> Result<()> {
+        if self.cx.outline.is_sysroot(self.home.krate)
+            || !self
+                .cx
+                .names
+                .crates
+                .get(self.home.krate as usize)
+                .is_some_and(|c| c.edition == "2024")
+        {
+            return Ok(());
+        }
+        loop {
+            match *self.body.expr(cur) {
+                Expr::Paren(inner) => cur = inner,
+                Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _)
+                    if self.out.autoderefs.get(&cur).copied().unwrap_or(0) == 0 =>
+                {
+                    cur = base;
+                }
+                Expr::Path(_) => {
+                    if let Some(&Res::Fn(item, _)) = self.out.res.get(&cur)
+                        && self.cx.is_static_mut(item)
+                    {
+                        let kind = if mutable { "mutable" } else { "shared" };
+                        let msg = format!("creating a {kind} reference to mutable static");
+                        return Err(self.diag_expr(
+                            DiagnosticKind::Unsafe,
+                            Some(cur),
+                            msg,
+                            "reference to mutable static",
+                        ));
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn check_packed_ref(&mut self, mut cur: ExprId, field_ty: Ty) -> Result<()> {
         let field_ty = self.resolve(field_ty);
         let (has_vars, has_params) = (self.has_vars(field_ty), self.has_params(field_ty));

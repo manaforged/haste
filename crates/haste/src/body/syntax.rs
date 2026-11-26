@@ -284,6 +284,7 @@ pub enum Ty {
         params: List,
         ret: Option<TyId>,
         variadic: bool,
+        is_unsafe: bool,
     },
     ImplTrait(u32, List),
     DynTrait(List),

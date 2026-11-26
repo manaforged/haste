@@ -122,6 +122,11 @@ fn hash_ty(
             hash_substs(outline, types, *p, key_of, hasher, closures)?;
             hash_ty(outline, types, *r, key_of, hasher, closures)?;
         }
+        Kind::UnsafeFnPtr(p, r) => {
+            16u8.hash(hasher);
+            hash_substs(outline, types, *p, key_of, hasher, closures)?;
+            hash_ty(outline, types, *r, key_of, hasher, closures)?;
+        }
         Kind::Dyn(o, s, m, a) => {
             12u8.hash(hasher);
             key_of(outline, *o)?.hash(hasher);

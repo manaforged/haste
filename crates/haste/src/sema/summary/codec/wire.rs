@@ -285,6 +285,11 @@ impl TyTable {
                 self.write_substs(rec, types, p, item_id)?;
                 self.write_ty_ref(rec, types, r, item_id)?;
             }
+            Kind::UnsafeFnPtr(p, r) => {
+                rec.push(16);
+                self.write_substs(rec, types, p, item_id)?;
+                self.write_ty_ref(rec, types, r, item_id)?;
+            }
             Kind::Pat(b, range) => {
                 let (lo, hi) = types.pat(range);
                 rec.push(12);
@@ -434,6 +439,7 @@ pub(crate) fn read_ty(
         5 => Kind::Array(read_ty_ref(cur, tys)?, read_ty_ref(cur, tys)?),
         6 => Kind::Slice(read_ty_ref(cur, tys)?),
         9 => Kind::FnPtr(read_substs(cur, types, tys)?, read_ty_ref(cur, tys)?),
+        16 => Kind::UnsafeFnPtr(read_substs(cur, types, tys)?, read_ty_ref(cur, tys)?),
         12 => Kind::Pat(
             read_ty_ref(cur, tys)?,
             types.intern_pat((cur.u128()?, cur.u128()?)),

@@ -282,7 +282,7 @@ impl Checker<'_, '_> {
                 .expr_plain_local(lhs)
                 .and_then(|l| self.expr_tuple_sources(rhs, state, false).map(|ts| (l, ts)));
             prune_dead_loans(state, &after_rhs);
-            self.assign_place(lhs, &sources, state, outer_live, depth)?;
+            self.assign_place(lhs, Some(rhs), &sources, state, outer_live, depth)?;
             self.update_assign_ptr_targets(lhs, rhs, state);
             if let Some((local, ts)) = tuple_srcs {
                 state.set_tuple_sources(local, Some(ts));

@@ -114,7 +114,7 @@ pub fn machine(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Type>> {
         Kind::Prim(F64) => Type::F64,
         Kind::Pat(base, ..) => return machine(cx, base),
         Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if !cx.is_unsized(pointee)? => Type::I64,
-        Kind::FnPtr(..) => Type::I64,
+        Kind::FnPtr(..) | Kind::UnsafeFnPtr(..) => Type::I64,
         _ => return Ok(None),
     }))
 }

@@ -1,10 +1,11 @@
 use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::sig::Signature;
+use crate::body::sig::{ImplHeader, Signature};
 use crate::diag::{Diagnostic, DiagnosticKind, Span};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
+use rustc_lexer::TokenKind;
 
 use super::super::super::Context;
 use super::super::super::impls::ImplRef;
@@ -65,6 +66,16 @@ pub(super) fn check_item_trait_impls(
     Ok(())
 }
 
+impl Infer<'_, '_> {
+    /// Checks a local trait impl block for unsafe requirements, missing items, supertraits, and method signatures.
+    pub(in crate::sema) fn check_local_trait_impl(
+        cx: &mut Context<'_>,
+        block: ImplRef,
+    ) -> Result<()> {
+        check_trait_impl_block(cx, block)
+    }
+}
+
 pub(in super::super) fn check_trait_impl_block(cx: &mut Context<'_>, block: ImplRef) -> Result<()> {
     if !block_is_user(cx, block) {
         return Ok(());
@@ -78,7 +89,10 @@ pub(in super::super) fn check_trait_impl_block(cx: &mut Context<'_>, block: Impl
     if header.negative {
         return Ok(());
     }
+    check_impl_unsafe(cx, block, of)?;
+    check_missing_trait_items(cx, block, of)?;
     let outer = type_params(&header.generics).count();
+    check_impl_supertraits(cx, block, of, &header, outer)?;
     for impl_item in cx.members(block) {
         if cx.item(impl_item).1.kind != ItemKind::Fn {
             continue;
@@ -93,6 +107,213 @@ pub(in super::super) fn check_trait_impl_block(cx: &mut Context<'_>, block: Impl
         check_impl_method_compat(cx, block, outer, trait_item, impl_item, &name)?;
     }
     Ok(())
+}
+
+fn impl_item_ref(cx: &Context<'_>, block: ImplRef) -> ItemRef {
+    match block {
+        ImplRef::Body(item) => item,
+        ImplRef::Module { krate, index } => {
+            let entry = &cx.outline.crates[krate as usize].impls[index as usize];
+            ItemRef {
+                krate,
+                file: entry.file as u32,
+                item: entry.at,
+            }
+        }
+    }
+}
+
+fn impl_block_span(cx: &Context<'_>, block: ImplRef) -> Option<Span> {
+    let (src, entry) = cx.item(impl_item_ref(cx, block));
+    Span::from_token(src, entry.start)
+}
+
+fn is_unsafe_trait(cx: &Context<'_>, of: ItemRef) -> bool {
+    if matches!(cx.lang(of), Some("send" | "sync"))
+        || (cx.outline.is_sysroot(of.krate) && matches!(cx.name(of), "Send" | "Sync"))
+    {
+        return true;
+    }
+    let (src, entry) = cx.item(of);
+    entry
+        .name
+        .is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "unsafe"))
+}
+
+fn is_unsafe_impl(cx: &Context<'_>, block: ImplRef) -> bool {
+    let (src, entry) = cx.item(impl_item_ref(cx, block));
+    let end = entry.body.unwrap_or(entry.end);
+    let mut at = entry.start;
+    while at < end && src.text(at) != "impl" {
+        if src.text(at) == "unsafe" {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+fn check_impl_unsafe(cx: &Context<'_>, block: ImplRef, of: ItemRef) -> Result<()> {
+    if !is_unsafe_trait(cx, of) || is_unsafe_impl(cx, block) {
+        return Ok(());
+    }
+    let name = cx.name(of);
+    Err(Diagnostic::new(
+        DiagnosticKind::Type,
+        format!("the trait `{name}` requires an `unsafe impl` declaration"),
+    )
+    .with_span(impl_block_span(cx, block))
+    .with_primary_label(format!("implementing the trait `{name}` requires `unsafe`"))
+    .into())
+}
+
+fn trait_item_has_default(cx: &Context<'_>, member: ItemRef) -> bool {
+    let (src, entry) = cx.item(member);
+    match entry.kind {
+        ItemKind::Fn => entry.body.is_some(),
+        ItemKind::Type | ItemKind::Const => {
+            let Some(mut at) = entry.name.map(|n| n + 1) else {
+                return true;
+            };
+            let mut angles = 0u32;
+            while at < entry.end {
+                match src.kind(at) {
+                    TokenKind::Eq if angles == 0 => return true,
+                    TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                        at = src.pair(at);
+                    }
+                    TokenKind::Lt => angles += 1,
+                    TokenKind::Gt
+                        if !at.checked_sub(1).is_some_and(|prev| {
+                            matches!(src.kind(prev), TokenKind::Minus | TokenKind::Eq)
+                                && src.joint(prev)
+                        }) =>
+                    {
+                        angles = angles.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+            false
+        }
+        _ => true,
+    }
+}
+
+fn check_missing_trait_items(cx: &Context<'_>, block: ImplRef, of: ItemRef) -> Result<()> {
+    let tree = &cx.outline.crates[of.krate as usize];
+    for member in cx.children(of) {
+        let (_, entry) = cx.item(member);
+        if !matches!(entry.kind, ItemKind::Fn | ItemKind::Type | ItemKind::Const)
+            || !tree.env.enabled(&entry.attrs)
+            || trait_item_has_default(cx, member)
+        {
+            continue;
+        }
+        let name = cx.plain_name(member);
+        if cx.member(block, name).is_none() {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!("not all trait items implemented, missing: `{name}`"),
+            )
+            .with_span(impl_block_span(cx, block))
+            .with_primary_label(format!("missing `{name}` in implementation"))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn check_impl_supertraits(
+    cx: &mut Context<'_>,
+    block: ImplRef,
+    of: ItemRef,
+    header: &ImplHeader,
+    outer: usize,
+) -> Result<()> {
+    let Ok(def) = cx.trait_generics(of) else {
+        return Ok(());
+    };
+    if def.1.supers.len == 0 {
+        return Ok(());
+    }
+    let unbounded_generic = outer > 0
+        && header.predicates.is_empty()
+        && header.generics.iter().all(|g| g.bounds.len == 0);
+    if outer != 0 && !unbounded_generic {
+        return Ok(());
+    }
+    let anchor = impl_item_ref(cx, block);
+    let diag = detached(cx, anchor, |infer| {
+        let before = infer.cx.quiet_mark();
+        let impl_args: Vec<Ty> = (0..outer)
+            .map(|i| infer.cx.types.intern(Kind::Param(i as u16)))
+            .collect();
+        let Ok(frame) = infer.impl_frame_of(block, &impl_args, None) else {
+            return Ok(None);
+        };
+        infer.with_frame(frame, |infer| {
+            let Ok(self_ty) = infer.lower_ty(&header.body, header.self_ty) else {
+                return Ok(None);
+            };
+            let Ok(trait_args) = infer.impl_trait_args(block, &impl_args, self_ty) else {
+                return Ok(None);
+            };
+            let mut substs = Vec::with_capacity(1 + trait_args.len());
+            substs.push(self_ty);
+            substs.extend(trait_args);
+            let Ok(supers) = infer.super_bounds(of, &substs) else {
+                return Ok(None);
+            };
+            for (super_trait, super_substs) in supers {
+                if super_trait == of {
+                    continue;
+                }
+                if outer > 0
+                    && matches!(
+                        infer.cx.lang(super_trait),
+                        Some("sized" | "meta_sized" | "pointee_sized")
+                    )
+                {
+                    continue;
+                }
+                let target = infer.resolve(super_substs[0]);
+                let args = &super_substs[1..];
+                if infer.has_vars(target) || args.iter().any(|&a| infer.has_vars(a)) {
+                    continue;
+                }
+                let held = if infer.compiler_decides(super_trait, target) {
+                    infer.compiler_holds(super_trait, target)
+                } else if infer.compiler_impl(super_trait, target)
+                    || infer.object_holds(super_trait, target, args) == Some(true)
+                {
+                    true
+                } else {
+                    infer.select(super_trait, target, args)?.is_some()
+                };
+                if !held && infer.cx.quiet_mark() == before {
+                    let ty_name = infer.show(target);
+                    let trait_name = infer.cx.name(super_trait);
+                    return Ok(Some(
+                        Diagnostic::new(
+                            DiagnosticKind::Trait,
+                            format!("the trait bound `{ty_name}: {trait_name}` is not satisfied"),
+                        )
+                        .with_span(impl_block_span(infer.cx, block))
+                        .with_primary_label(format!(
+                            "the trait `{trait_name}` is not implemented for `{ty_name}`"
+                        )),
+                    ));
+                }
+            }
+            Ok(None)
+        })
+    });
+    match diag {
+        Ok(Some(err)) => Err(err.into()),
+        _ => Ok(()),
+    }
 }
 
 fn check_impl_method_compat(

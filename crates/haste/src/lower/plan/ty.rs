@@ -213,7 +213,7 @@ pub(super) fn hash_num_tag(cx: &Context<'_>, mix: &mut HashMix, ty: Ty) {
                 mix.byte(5);
             }
         }
-        Kind::Ptr(..) | Kind::FnPtr(..) => mix.byte(6),
+        Kind::Ptr(..) | Kind::FnPtr(..) | Kind::UnsafeFnPtr(..) => mix.byte(6),
         _ => mix.byte(7),
     }
 }

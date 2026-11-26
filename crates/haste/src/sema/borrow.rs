@@ -274,15 +274,11 @@ pub(super) fn check(
     {
         let mut ret_lts = calls::Lifetimes::default();
         calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
-        let ret_inv = checks::collect_ast_invariant_lifetimes(
-            cx,
-            Some(item),
-            &sig.body,
-            src,
-            ret_ast,
-            typed.ret,
-        );
-        let returns_inv = ret_inv.is_only_static() || !ret_inv.named.is_empty();
+        let ret_var =
+            checks::collect_ast_variance(cx, Some(item), &sig.body, src, ret_ast, typed.ret);
+        let returns_inv = ret_var.inv.is_only_static()
+            || !ret_var.inv.named.is_empty()
+            || !ret_var.contra.is_empty();
         (
             calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts),
             returns_inv,

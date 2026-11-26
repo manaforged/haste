@@ -225,6 +225,13 @@ impl<'a> Context<'a> {
                     self.type_text(ret, resolve)
                 )
             }
+            Kind::UnsafeFnPtr(params, ret) => {
+                format!(
+                    "unsafe fn({}) -> {}",
+                    list(self.types.substs(params)),
+                    self.type_text(ret, resolve)
+                )
+            }
             Kind::Dyn(item, args, ..) => format!("dyn {}{}", self.name(item), angled(args)),
             Kind::Ptr(Mut::Not, inner) => format!("*const {}", self.type_text(inner, resolve)),
             Kind::Ptr(Mut::Mut, inner) => format!("*mut {}", self.type_text(inner, resolve)),

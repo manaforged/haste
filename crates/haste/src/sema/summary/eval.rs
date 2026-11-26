@@ -287,7 +287,11 @@ fn resolve_call_override(
     let (mut ty, mut steps) = (found, 0u32);
     while !matches!(
         infer.cx.types.kind(ty),
-        Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Ptr(..)
+        Kind::Closure(..)
+            | Kind::FnDef(..)
+            | Kind::FnPtr(..)
+            | Kind::UnsafeFnPtr(..)
+            | Kind::Ptr(..)
     ) && let Some(inner) = infer.builtin_deref(ty)
     {
         (ty, steps) = (inner, steps + 1);
@@ -317,7 +321,7 @@ fn resolve_call_override(
                 box_free: None,
             })
         }
-        Kind::FnPtr(..) => Ok(CallOverride {
+        Kind::FnPtr(..) | Kind::UnsafeFnPtr(..) => Ok(CallOverride {
             expr,
             res: None,
             autoderefs,

@@ -255,7 +255,10 @@ pub(super) fn layouts(cx: &mut Context<'_>, types: &[Ty]) -> Result<(Vec<String>
         if !seen.insert(ty) {
             continue;
         }
-        if matches!(cx.types.kind(ty), Kind::FnPtr(..) | Kind::Dyn(..)) {
+        if matches!(
+            cx.types.kind(ty),
+            Kind::FnPtr(..) | Kind::UnsafeFnPtr(..) | Kind::Dyn(..)
+        ) {
             printed.push(print::INDIRECT.to_owned());
             indirect.push(ty);
             continue;

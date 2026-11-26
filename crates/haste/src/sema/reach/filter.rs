@@ -289,7 +289,8 @@ fn ok_call_hole_head(cx: &Context<'_>, filter: &mut ReachFilter, ty: Ty) -> bool
         | Kind::Ptr(..)
         | Kind::Slice(..)
         | Kind::Array(..)
-        | Kind::FnPtr(..) => true,
+        | Kind::FnPtr(..)
+        | Kind::UnsafeFnPtr(..) => true,
         Kind::Ref(..) | Kind::Tuple(..) => !filter.ty_has_non_fixed(cx, ty),
         Kind::Adt(adt, _) => {
             cx.outline.is_fixed(adt.krate)
@@ -361,7 +362,7 @@ fn ty_has_non_fixed_memo(
             *args,
             memo.as_mut().map(|(a, b)| (&mut **a, &mut **b)),
         ),
-        Kind::FnPtr(args, ret) => {
+        Kind::FnPtr(args, ret) | Kind::UnsafeFnPtr(args, ret) => {
             substs_has_non_fixed_memo(
                 outline,
                 types,
