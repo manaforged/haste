@@ -72,6 +72,7 @@ pub(crate) struct Executable {
     pub(super) unwind_table_off: Option<u32>,
     pub(super) lines: Vec<(u32, u64)>,
     pub(super) sources: Vec<std::path::PathBuf>,
+    pub(crate) extra_libs: Vec<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -108,6 +109,7 @@ impl Executable {
             unwind_table_off: None,
             lines: Vec::new(),
             sources: Vec::new(),
+            extra_libs: Vec::new(),
         }
     }
 

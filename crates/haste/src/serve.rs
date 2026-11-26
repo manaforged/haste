@@ -310,6 +310,8 @@ mod unix_ipc {
             ("--prepared", crate::prep::prepared()),
             ("--all-features", sel.all_features),
             ("--no-default-features", sel.no_default_features),
+            ("--lib", sel.lib),
+            ("--bins", sel.bins),
             ("--ignored", sel.ignored_only),
             ("--include-ignored", sel.include_ignored),
         ] {
@@ -321,6 +323,7 @@ mod unix_ipc {
             ("-p", sel.package.as_deref()),
             ("--bin", sel.bin.as_deref()),
             ("--example", sel.example.as_deref()),
+            ("--test", sel.test.as_deref()),
         ] {
             if let Some(val) = val {
                 cmd.arg(flag).arg(val);
@@ -347,11 +350,9 @@ mod unix_ipc {
         // SAFETY: setsid takes no pointers and detaches the child into a new session before exec.
         unsafe {
             cmd.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
+                (libc::setsid() >= 0)
+                    .then_some(())
+                    .ok_or_else(std::io::Error::last_os_error)
             });
         }
         if let Ok(mut child) = cmd.spawn() {

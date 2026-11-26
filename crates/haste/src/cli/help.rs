@@ -130,6 +130,9 @@ Check the crate, then compile and run its #[test] and #[tokio::test] suite (Unix
 Filter arguments (such as substring patterns, --exact, --skip NAME) follow `--`.
 
 Options:
+      --lib                 Test only this package's library
+      --bins                Test all binary targets
+      --test <NAME>         Test only the specified integration test target
       --ignored             Run only tests marked #[ignore]
       --include-ignored     Run both normal and #[ignore] tests
       --release             Run tests with optimizations enabled

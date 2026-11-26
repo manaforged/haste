@@ -63,6 +63,23 @@ fn missing_target_error() -> anyhow::Error {
 }
 
 fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Result<ItemRef> {
+    let sel = crate::selection();
+    if sel.bin.is_none() && sel.example.is_none() {
+        let bins: Vec<usize> = outline
+            .members(workspace)
+            .filter(|&k| outline.roots[k].role == outline::Role::Bin && outline.main(k).is_some())
+            .collect();
+        if bins.len() > 1 {
+            let names: Vec<&str> = bins
+                .iter()
+                .map(|&k| outline.roots[k].name.as_str())
+                .collect();
+            bail!(
+                "multiple binary targets found ({}); pass `-p <PKG>` or `--bin <NAME>`",
+                names.join(", ")
+            );
+        }
+    }
     main_item(workspace, outline).ok_or_else(missing_target_error)
 }
 

@@ -447,6 +447,7 @@ impl Batch {
             .iter()
             .map(|((item, _), _)| item.krate as usize)
             .collect();
+        let mut has_static_archive = None;
         for krate_idx in reached_crates {
             let krate = &compilation.outline.crates[krate_idx];
             if let Some(script) = &krate.env.script
@@ -454,12 +455,22 @@ impl Batch {
                     .link_libs()
                     .find(|(kind, _)| *kind == crate::graph::script::LinkKind::Static)
             {
-                let name = &compilation.outline.roots[krate_idx].name;
-                bail!(
-                    "standalone AOT (-o) does not yet link static C archive `{lib}` from crate `{name}`; use `haste run` or `cargo build`"
-                );
+                let name = compilation.outline.roots[krate_idx].name.as_str();
+                has_static_archive = Some((lib.to_owned(), name.to_owned()));
+                break;
             }
         }
+        let native_bundle = if let Some((lib, name)) = has_static_archive {
+            if cfg!(unix) && crate::compile_target() == haste_codegen::Target::host() {
+                crate::host::native::bundle(&compilation.outline)?
+            } else {
+                bail!(
+                    "cross-target standalone AOT (-o) does not yet link static C archive `{lib}` from crate `{name}`; build on the target host or use `cargo build`"
+                );
+            }
+        } else {
+            None
+        };
         let store = self
             .store
             .take()
@@ -472,7 +483,11 @@ impl Batch {
             &self.reached,
         );
         self.store = Some(cx.release().0);
-        exe?.write(path)
+        let mut exe = exe?;
+        if let Some(bundle) = native_bundle {
+            exe.extra_libs.push(bundle.to_string_lossy().into_owned());
+        }
+        exe.write(path)
             .with_context(|| format!("writing {}", path.display()))
     }
 

@@ -83,8 +83,26 @@ pub(crate) fn test_items(
     workspace: &graph::Workspace,
     outline: &outline::Outline,
 ) -> Vec<TestItem> {
+    let sel = crate::selection();
+    let test_name = sel.test.as_deref().map(|n| n.replace('-', "_"));
+    let bin_name = sel.bin.as_deref().map(|n| n.replace('-', "_"));
+    let has_target_filter = sel.lib || sel.bins || test_name.is_some() || bin_name.is_some();
     member_fns(workspace, outline)
-        .filter(|(_, tree, file, item)| {
+        .filter(|(item_ref, tree, file, item)| {
+            if has_target_filter {
+                let root = &outline.roots[item_ref.krate as usize];
+                let matches_lib = sel.lib && root.role == outline::Role::Lib;
+                let matches_bins = sel.bins && root.role == outline::Role::Bin;
+                let matches_bin = bin_name
+                    .as_deref()
+                    .is_some_and(|n| root.role == outline::Role::Bin && root.name == n);
+                let matches_test = test_name
+                    .as_deref()
+                    .is_some_and(|n| root.role == outline::Role::Test && root.name == n);
+                if !(matches_lib || matches_bins || matches_bin || matches_test) {
+                    return false;
+                }
+            }
             outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
         })
         .map(|(item_ref, tree, file, item)| {
@@ -125,6 +143,7 @@ fn panic_payload(stderr: &str) -> Option<&str> {
 pub(crate) fn print_test_report(
     entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
     elapsed: std::time::Duration,
+    show_output: bool,
 ) -> i32 {
     println!(
         "\nrunning {} test{}",
@@ -133,6 +152,7 @@ pub(crate) fn print_test_report(
     );
     let (mut passed, mut failed, mut ignored) = (0usize, 0usize, 0usize);
     let mut details: Vec<(&str, String)> = Vec::new();
+    let mut successes: Vec<(&str, &str)> = Vec::new();
     for &(name, meta, ref outcome) in entries {
         let Some(outcome) = outcome else {
             println!("test {name} ... ignored");
@@ -155,6 +175,12 @@ pub(crate) fn print_test_report(
                 };
                 if ok {
                     println!("test {name} ... ok");
+                    if show_output
+                        && let Some(out) =
+                            stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        successes.push((name, out));
+                    }
                     passed += 1;
                 } else {
                     let msg = if meta.should_panic && *status == 0 {
@@ -167,7 +193,7 @@ pub(crate) fn print_test_report(
                     } else if let Some(out) =
                         stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
                     {
-                        format!("{out}\n(exited with status {status})")
+                        out.to_owned()
                     } else {
                         format!("exited with status {status}")
                     };
@@ -181,6 +207,12 @@ pub(crate) fn print_test_report(
                 details.push((name, (*err).to_owned()));
                 failed += 1;
             }
+        }
+    }
+    if !successes.is_empty() {
+        println!("\nsuccesses:\n");
+        for (name, out) in &successes {
+            println!("---- {name} output ----\n{out}\n");
         }
     }
     if !details.is_empty() {

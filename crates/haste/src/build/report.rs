@@ -238,7 +238,6 @@ impl Batch {
             }
             return Ok(0);
         }
-        let mut to_run = Vec::new();
         let mut errs: Vec<String> = Vec::new();
         let mut raw: Vec<(
             &str,
@@ -275,15 +274,10 @@ impl Batch {
                 ));
                 Some(Err(idx))
             } else {
-                if meta.expected.is_none() {
-                    let env = outline.crates[meta.item.krate as usize].env.vars.as_slice();
-                    to_run.push((root, *start, name.as_str(), env));
-                }
                 Some(Ok((root, *start)))
             };
             raw.push((name.as_str(), meta, outcome));
         }
-        let mut ran = self.image.run_tests(&to_run)?.into_iter();
         let mut entries: Vec<(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)> =
             Vec::with_capacity(raw.len());
         for (name, meta, outcome) in raw {
@@ -291,25 +285,21 @@ impl Batch {
             let resolved = match outcome {
                 None => None,
                 Some(Err(idx)) => Some(Err(errs[idx].as_str())),
-                Some(Ok((root, start))) if meta.expected.is_some() => {
-                    let (status, stderr) = self.image.run_test_captured(root, start, name, env)?;
-                    Some(Ok((status, Some(stderr))))
+                Some(Ok((root, start))) => {
+                    let nocapture = args.nocapture && meta.expected.is_none();
+                    let (status, out) = self
+                        .image
+                        .run_test_captured(root, start, name, env, nocapture)?;
+                    Some(Ok((status, (!out.is_empty()).then_some(out))))
                 }
-                Some(Ok((root, start))) => match ran.next() {
-                    Some(status) if status != 0 && !meta.should_panic => {
-                        let (cap_status, stderr) =
-                            self.image.run_test_captured(root, start, name, env)?;
-                        Some(Ok((
-                            if cap_status != 0 { cap_status } else { status },
-                            Some(stderr),
-                        )))
-                    }
-                    other => other.map(|s| Ok((s, None))),
-                },
             };
             entries.push((name, meta, resolved));
         }
-        Ok(print_test_report(&entries, started.elapsed()))
+        Ok(print_test_report(
+            &entries,
+            started.elapsed(),
+            args.show_output,
+        ))
     }
 }
 

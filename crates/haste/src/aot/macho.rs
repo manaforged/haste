@@ -137,7 +137,7 @@ fn build_dyld_info(
     }
     let mut bind = Buf::new();
     if !plan.imports.is_empty() || tlv_in_seg.is_some() {
-        bind.u8(if single_lib { 0x11 } else { 0x2E });
+        bind.u8(if single_lib { 0x11 } else { 0x3E });
         bind.u8(0x51);
         for (i, imp) in plan.imports.iter().enumerate() {
             let name = imp.name;
@@ -208,6 +208,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         .iter()
         .filter(|&&l| !l.contains(".so"))
         .for_each(|l| libs.push(format!("@rpath/lib{l}.dylib")));
+    libs.extend(exe.extra_libs.iter().cloned());
 
     let tls = if arch == Arch::Arm64 {
         TlsLayout::compute(&plan, exe.thread_slots)

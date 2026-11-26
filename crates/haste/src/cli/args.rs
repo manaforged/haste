@@ -203,6 +203,19 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
                 opts.selection.example =
                     Some(next_str(args).context("--example takes an example name")?);
             }
+            "--test" => {
+                args.next();
+                opts.selection.test =
+                    Some(next_str(args).context("--test takes a test target name")?);
+            }
+            "--lib" => {
+                args.next();
+                opts.selection.lib = true;
+            }
+            "--bins" => {
+                args.next();
+                opts.selection.bins = true;
+            }
             "-F" | "--features" => {
                 args.next();
                 let list = next_str(args).context("--features takes a feature list")?;

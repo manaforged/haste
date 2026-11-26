@@ -31,7 +31,7 @@ fn elf_hash(name: &[u8]) -> u32 {
     })
 }
 
-fn build_tables(plan: &Plan<'_>) -> ElfTables {
+fn build_tables(plan: &Plan<'_>, extra_libs: &[String]) -> ElfTables {
     let mut dynstr = vec![0u8];
     let mut push_str = |s: &str| {
         let off = dynstr.len() as u32;
@@ -44,6 +44,7 @@ fn build_tables(plan: &Plan<'_>) -> ElfTables {
         .iter()
         .filter(|&&l| l != "libc.so.6")
         .for_each(|l| needed.push(push_str(l)));
+    extra_libs.iter().for_each(|l| needed.push(push_str(l)));
     let sym_offs: Vec<u32> = plan.imports.iter().map(|imp| push_str(imp.name)).collect();
     let nsyms = 1 + plan.imports.len();
     let nbucket = nsyms.next_power_of_two().max(4);
@@ -615,7 +616,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     } = arch_layout(arch)?;
     let (rx_base, tables, nsyms) = (
         ELF_BASE + page as u64,
-        build_tables(&plan),
+        build_tables(&plan, &exe.extra_libs),
         1 + plan.imports.len(),
     );
     let (tls, unwind_tls, thread_tls, frame_tls) = elf_tls_addrs(arch, &plan, exe.thread_slots);

@@ -148,8 +148,17 @@ fn archive(own: &[PathBuf], search: &[PathBuf], name: &str) -> Result<PathBuf> {
         .with_context(|| format!("no {file} in the build scripts' search directories"))
 }
 
-/// Links `libraries` into the store unless it holds them, opens the result, and reads its table of static symbols.
-fn open_libraries(libraries: &Libraries) -> Result<HashMap<Box<str>, usize>> {
+/// Returns the cached shared library bundling static C archives linked by `outline`'s build scripts, linking it if needed.
+pub fn bundle(outline: &Outline) -> Result<Option<PathBuf>> {
+    let libraries = libraries(outline)?;
+    if libraries.archives.is_empty() {
+        return Ok(None);
+    }
+    let path = bundle_path(&libraries)?;
+    Ok(Some(path))
+}
+
+fn bundle_path(libraries: &Libraries) -> Result<PathBuf> {
     let mut stamps = Vec::new();
     libraries
         .archives
@@ -160,6 +169,12 @@ fn open_libraries(libraries: &Libraries) -> Result<HashMap<Box<str>, usize>> {
     if !path.is_file() {
         link(libraries, &path)?;
     }
+    Ok(path)
+}
+
+/// Links `libraries` into the store unless it holds them, opens the result, and reads its table of static symbols.
+fn open_libraries(libraries: &Libraries) -> Result<HashMap<Box<str>, usize>> {
+    let path = bundle_path(libraries)?;
     #[cfg(unix)]
     let handle = match open(&path, libc::RTLD_LAZY) {
         Ok(handle) => handle,
