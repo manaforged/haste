@@ -232,6 +232,9 @@ impl<'a> Context<'a> {
 
     /// Whether the function `item` carries `#[track_caller]`, directly or inherited from its trait method declaration.
     pub fn track_caller(&mut self, item: ItemRef) -> bool {
+        if crate::in_host_target() && self.outline.is_sysroot(item.krate) {
+            return false;
+        }
         if self.has_attr(item, "track_caller") {
             return true;
         }
