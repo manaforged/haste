@@ -216,9 +216,9 @@ fn body_budget(
             let max_exprs = if release {
                 1200
             } else if env_release {
-                400
+                60
             } else {
-                200
+                40
             };
             let inst_limit = if release || env_release {
                 budget.inline_insts

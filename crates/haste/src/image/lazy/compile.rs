@@ -36,10 +36,11 @@ impl Jit {
         let answer = self.code(cx, index, &mut journal);
         match answer {
             Err(Stop::Asked) => {
-                journal.iter().for_each(|&at| self.reached.forget(at));
-                self.expanded.clear();
+                for &at in &journal {
+                    self.reached.forget(at);
+                    self.expanded.remove(&at);
+                }
                 self.tried.clear();
-                self.image.bodies.clear();
                 Err(Stop::Asked)
             }
             Ok((code, fresh)) => {
