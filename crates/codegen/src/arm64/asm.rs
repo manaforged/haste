@@ -1,5 +1,6 @@
 //! The A64 instruction encoder: one 32-bit word per instruction, with labels patched when they are bound.
 
+mod atomic;
 mod float;
 
 use super::int::encode_bitmask_imm;
@@ -777,23 +778,4 @@ impl Asm {
 
     /// `brk #1`, the trap rustc emits for an abort.
     pub fn brk(&mut self) { self.clear_word(0xD420_0020); }
-
-    /// `dmb ish`: a full barrier between this core's memory accesses and other cores'.
-    pub fn dmb(&mut self) { self.word(0xD503_3BBF); }
-
-    /// `ldar`, or `ldaxr` when `exclusive`.
-    pub fn load_acquire(&mut self, exclusive: bool, size: Size, dst: Reg, addr: Reg) {
-        let base = if exclusive { 0x085F_FC00 } else { 0x08DF_FC00 };
-        self.emit_gp(dst, base | (size as u32) << 30 | u32::from(addr.0) << 5 | u32::from(dst.0));
-    }
-
-    /// `stlr`.
-    pub fn store_release(&mut self, size: Size, addr: Reg, src: Reg) {
-        self.word(0x089F_FC00 | (size as u32) << 30 | u32::from(addr.0) << 5 | u32::from(src.0));
-    }
-
-    /// `stlxr status, src, [addr]`: status is zero when the store took.
-    pub fn store_exclusive(&mut self, size: Size, status: Reg, addr: Reg, src: Reg) {
-        self.emit_gp(status, 0x0800_FC00 | (size as u32) << 30 | u32::from(status.0) << 16 | u32::from(addr.0) << 5 | u32::from(src.0));
-    }
 }

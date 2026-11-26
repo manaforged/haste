@@ -1,27 +1,28 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::names::ItemRef;
 use crate::names::path::Requests;
 
 use super::Context;
-use super::infer::{LazyTables, Res, Typed, infer, register};
+use super::infer::{Res, Typed, infer, register};
 use super::substs::Substs;
 use super::summary::thaw;
 mod filter;
 mod order;
+mod unwind;
 mod wave;
 
+pub(crate) use unwind::host_symbol_may_unwind;
 pub use wave::infer_quiet;
 
-use filter::{ReachFilter, collect_filtered_callees, commit_filter_caller, pre_collect_callees};
+use filter::{ReachFilter, collect_filtered_callees};
 use super::ty::{Kind, Ty};
 
-const MIN_PARALLEL_WAVE: usize = 4;
-const MAX_WORKER_BATCH: usize = 128;
+pub(super) const MIN_PARALLEL_WAVE: usize = 4;
+pub(super) const MAX_WORKER_BATCH: usize = 128;
 
 /// One function at concrete type arguments.
 pub type Instance = (ItemRef, Substs);
@@ -29,12 +30,22 @@ pub type Instance = (ItemRef, Substs);
 const _: () = assert!(std::mem::size_of::<Instance>() == 16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReachedEntry {
+pub(super) enum ReachedEntry {
     Declared,
     Enqueued,
     Blocked,
     Settled,
     Replaced,
+}
+
+const CATCH_UNWIND_FOUND: usize = 1usize << (usize::BITS - 1);
+const CRATE_STD: u8 = 1;
+const CRATE_SKIP_BODY: u8 = 2;
+
+#[derive(Default)]
+struct CatchUnwindCache {
+    checked_items: HashSet<ItemRef>,
+    checked_callees: HashSet<ItemRef>,
 }
 
 /// Every function reached from some roots, each with its inferred body or the reason it has none.
@@ -48,50 +59,97 @@ pub struct Reached {
     indirect: Vec<Vec<usize>>,
     call_sites: super::infer::CallSites,
     pinned: Vec<bool>,
-    states: Vec<ReachedEntry>,
+    pub(in crate::sema::reach) states: Vec<ReachedEntry>,
     untyped_count: usize,
-    filter: ReachFilter,
-    catch_unwind_checked: AtomicUsize,
-    catch_unwind_found: std::sync::atomic::AtomicBool,
+    pub(in crate::sema::reach) filter: ReachFilter,
+    catch_unwind_state: AtomicUsize,
+    catch_unwind_cache: Mutex<CatchUnwindCache>,
+    may_unwind_cache: RwLock<Option<(usize, Vec<bool>)>>,
+}
+
+fn is_thread_spawn_name(name: &str, src: &crate::outline::source::Source) -> bool {
+    matches!(name, "spawn" | "spawn_unchecked" | "spawn_scoped" | "scope")
+        && src.path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("thread")
+}
+
+fn crate_unwind_flags(cx: &Context) -> Vec<u8> {
+    cx.outline
+        .roots
+        .iter()
+        .map(|root| match root.name.as_str() {
+            "std" => CRATE_STD | CRATE_SKIP_BODY,
+            "core" | "alloc" | "panic_unwind" | "panic_abort" => CRATE_SKIP_BODY,
+            _ => 0,
+        })
+        .collect()
 }
 
 impl Reached {
-    /// Whether any reached function calls the `catch_unwind` intrinsic.
+    /// Whether any reached function calls the `catch_unwind` intrinsic or spawns a thread via `std::thread`.
     pub fn has_catch_unwind(&self, cx: &Context) -> bool {
-        if self.catch_unwind_found.load(Ordering::Relaxed) {
+        let state = self.catch_unwind_state.load(Ordering::Acquire);
+        if state & CATCH_UNWIND_FOUND != 0 {
             return true;
         }
         let len = self.list.len();
-        let start = self.catch_unwind_checked.load(Ordering::Relaxed);
-        if start < len {
-            let mut next_start = len;
-            for (idx, ((item, _), res)) in self.list[start..len].iter().enumerate() {
-                if cx.outline.roots[item.krate as usize].name == "std"
-                    || cx.outline.roots[item.krate as usize].name == "core"
-                    || cx.outline.roots[item.krate as usize].name == "alloc"
-                    || cx.outline.roots[item.krate as usize].name == "panic_unwind"
-                    || cx.outline.roots[item.krate as usize].name == "panic_abort"
-                {
+        if state >= len {
+            return false;
+        }
+        let mut cache = crate::sync::lock(&self.catch_unwind_cache);
+        let start = self.catch_unwind_state.load(Ordering::Relaxed);
+        if start & CATCH_UNWIND_FOUND != 0 {
+            return true;
+        }
+        if start >= len {
+            return false;
+        }
+        let crate_flags = crate_unwind_flags(cx);
+        for (idx, ((item, _), res)) in self.list[start..len].iter().enumerate() {
+            let flags = crate_flags.get(item.krate as usize).copied().unwrap_or(0);
+            if flags & CRATE_SKIP_BODY != 0 {
+                if flags & CRATE_STD != 0 && cache.checked_items.insert(*item) {
+                    let (src, entry) = cx.item(*item);
+                    if entry.name.is_some_and(|at| is_thread_spawn_name(src.text(at), src)) {
+                        self.catch_unwind_state.store(CATCH_UNWIND_FOUND | (start + idx + 1), Ordering::Release);
+                        return true;
+                    }
+                }
+                continue;
+            }
+            let Ok(typed) = res else { continue };
+            for (callee, _) in typed.calls() {
+                if !cache.checked_callees.insert(callee) {
                     continue;
                 }
-                match res {
-                    Ok(typed) => {
-                        if typed.calls().any(|(c, _)| {
-                            let (src, entry) = cx.item(c);
-                            entry.name.is_some_and(|at| src.text(at) == "catch_unwind")
-                        }) {
-                            self.catch_unwind_found.store(true, Ordering::Relaxed);
-                            self.catch_unwind_checked.store(len, Ordering::Relaxed);
-                            return true;
-                        }
-                    }
-                    Err(_) if next_start == len => next_start = start + idx,
-                    Err(_) => {}
+                let (src, entry) = cx.item(callee);
+                let is_std = crate_flags.get(callee.krate as usize).copied().unwrap_or(0) & CRATE_STD != 0;
+                if entry.name.is_some_and(|at| {
+                    let name = src.text(at);
+                    name == "catch_unwind" || (is_std && is_thread_spawn_name(name, src))
+                }) {
+                    self.catch_unwind_state.store(CATCH_UNWIND_FOUND | (start + idx + 1), Ordering::Release);
+                    return true;
                 }
             }
-            self.catch_unwind_checked.store(next_start, Ordering::Relaxed);
         }
+        self.catch_unwind_state.store(len, Ordering::Release);
         false
+    }
+
+    /// Whether reached function `index` may unwind directly or transitively through any reachable call.
+    pub fn may_unwind(&self, cx: &mut Context<'_>, index: usize) -> bool {
+        let len = self.list.len();
+        if index >= len {
+            return true;
+        }
+        if let Some(bit) = crate::sync::read_lock(&self.may_unwind_cache).as_ref().filter(|(n, _)| *n == len).and_then(|(_, bits)| bits.get(index).copied()) {
+            return bit;
+        }
+        let mut cache = crate::sync::write_lock(&self.may_unwind_cache);
+        if cache.as_ref().is_none_or(|(n, _)| *n != len) {
+            *cache = Some((len, unwind::compute_may_unwind(cx, self)));
+        }
+        cache.as_ref().and_then(|(_, bits)| bits.get(index).copied()).unwrap_or(true)
     }
     /// The typed body of function `index`, or an error naming `name` and why its body did not type-check.
     pub fn typed(&self, index: usize, name: &str) -> anyhow::Result<&Arc<Typed>> {
@@ -127,7 +185,7 @@ impl Reached {
         at
     }
 
-    fn set_entry(&mut self, index: usize, next: ReachedEntry, result: Result<Arc<Typed>, String>) {
+    pub(super) fn set_entry(&mut self, index: usize, next: ReachedEntry, result: Result<Arc<Typed>, String>) {
         if self.states[index] == ReachedEntry::Declared {
             self.untyped_count -= 1;
         }
@@ -136,6 +194,14 @@ impl Reached {
         }
         self.states[index] = next;
         self.list[index].1 = result;
+        let checked = *self.catch_unwind_state.get_mut() & !CATCH_UNWIND_FOUND;
+        if index < checked {
+            *self.catch_unwind_state.get_mut() = index;
+            let cache = self.catch_unwind_cache.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.checked_items.clear();
+            cache.checked_callees.clear();
+        }
+        *self.may_unwind_cache.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn take_blocked(&mut self) -> Vec<usize> {
@@ -213,6 +279,7 @@ impl Reached {
             for (at, (c, i)) in own.into_iter().chain(joined) { (self.calls[at], self.indirect[at]) = (c, i); }
         }
         super::infer::recount_call_sites(self.list.len(), |at| self.states[at] == ReachedEntry::Settled, &self.calls, &self.indirect, &self.pinned, &mut self.call_sites);
+        *self.may_unwind_cache.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -222,12 +289,33 @@ pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
     }
 }
 
+pub(crate) const PANIC_BOUNDS_CHECK: &str = "panic_bounds_check";
+
+pub(crate) fn unwind_enabled(cx: &Context<'_>, reached: &Reached) -> bool {
+    crate::profile() != crate::outline::tree::Profile::Release || reached.has_catch_unwind(cx)
+}
+
+fn enqueue_bounds_check(cx: &mut Context<'_>, reached: &mut Reached) -> Vec<usize> {
+    if !unwind_enabled(cx, reached) {
+        return Vec::new();
+    }
+    let Some(bounds) = cx.lang_item(PANIC_BOUNDS_CHECK) else {
+        return Vec::new();
+    };
+    enqueue(reached, vec![(bounds, Substs::EMPTY)])
+}
+
 /// Advances `reached` monotonically from `roots` and any previously blocked instances, parking instances that emit new asks unless `force_commit` is set.
 pub fn reach_wave(cx: &mut Context<'_>, reached: &mut Reached, roots: &[Instance], force_commit: bool) {
     let mut initial = reached.take_blocked();
     initial.extend(enqueue(reached, roots.to_vec()));
+    initial.extend(enqueue_bounds_check(cx, reached));
     reached.pin_roots(roots);
-    let settled = drain_wave(cx, reached, initial, force_commit);
+    let mut settled = drain_wave(cx, reached, initial, force_commit);
+    let extra = enqueue_bounds_check(cx, reached);
+    if !extra.is_empty() {
+        settled.extend(drain_wave(cx, reached, extra, force_commit));
+    }
     reached.link(&settled);
 }
 
@@ -242,6 +330,10 @@ pub fn reach_again(cx: &mut Context<'_>, reached: &mut Reached, stale: &[usize])
     }
     let mut found = stale;
     found.extend(drain(cx, reached, queue));
+    let extra = enqueue_bounds_check(cx, reached);
+    if !extra.is_empty() {
+        found.extend(drain_wave(cx, reached, extra, true));
+    }
     reached.link(&found);
     found
 }
@@ -297,7 +389,11 @@ pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], r
         reached.set_entry(index, ReachedEntry::Replaced, Err("replaced by an edit".to_owned()));
     }
     reached.link(dead);
-    let found = drain(cx, reached, roots.to_vec());
+    let mut found = drain(cx, reached, roots.to_vec());
+    let extra = enqueue_bounds_check(cx, reached);
+    if !extra.is_empty() {
+        found.extend(drain_wave(cx, reached, extra, true));
+    }
     reached.pin_roots(roots);
     reached.link(&found);
     found
@@ -319,15 +415,15 @@ pub fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<Arc<Typed>, String>) -> 
     typed.iter().flat_map(|typed| typed.calls()).filter(|(item, _)| cx.intrinsic(*item).is_none())
 }
 
-struct WaveItem {
-    pos: usize,
-    typed: Result<Arc<Typed>, String>,
-    unlaid: Vec<String>,
-    deferred: bool,
-    asked: bool,
+pub(super) struct WaveItem {
+    pub(super) pos: usize,
+    pub(super) typed: Result<Arc<Typed>, String>,
+    pub(super) unlaid: Vec<String>,
+    pub(super) deferred: bool,
+    pub(super) asked: bool,
 }
 
-type WorkerOut = (Requests, Vec<(Instance, u32)>, Vec<WaveItem>);
+pub(super) type WorkerOut = (Requests, Vec<(Instance, u32)>, Vec<WaveItem>);
 
 fn drain(cx: &mut Context<'_>, reached: &mut Reached, queue: Vec<Instance>) -> Vec<usize> {
     let wave = enqueue(reached, queue);
@@ -338,7 +434,7 @@ fn drain_wave(cx: &mut Context<'_>, reached: &mut Reached, mut wave: Vec<usize>,
     let mut added = Vec::new();
     while !wave.is_empty() {
         if crate::jobs() > 1 && wave.len() >= MIN_PARALLEL_WAVE {
-            added.extend(parallel_drain(cx, reached, wave, force_commit));
+            added.extend(wave::parallel_drain(cx, reached, wave, force_commit));
             break;
         }
         let (settled, next) = serial_wave(cx, reached, &wave, false, force_commit);
@@ -346,211 +442,6 @@ fn drain_wave(cx: &mut Context<'_>, reached: &mut Reached, mut wave: Vec<usize>,
         wave = enqueue(reached, next);
     }
     added
-}
-
-struct WaveQueue {
-    seen: HashMap<Instance, usize>,
-    filter: ReachFilter,
-    instances: Vec<Instance>,
-    queue: VecDeque<(usize, Instance)>,
-    settled: Vec<(usize, Result<Arc<Typed>, String>, Vec<String>, bool)>,
-    deferred_items: Vec<(usize, Instance)>,
-    active: usize,
-}
-
-struct ActiveGuard<'a>(&'a Mutex<WaveQueue>, &'a Condvar, usize);
-
-impl Drop for ActiveGuard<'_> {
-    fn drop(&mut self) {
-        if self.2 > 0 {
-            let mut q = crate::sync::lock(self.0);
-            q.active = q.active.saturating_sub(self.2);
-            self.1.notify_all();
-        }
-    }
-}
-
-fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>, force_commit: bool) -> Vec<usize> {
-    let workers = crate::jobs();
-    let seen = std::mem::take(&mut reached.index);
-    let filter = std::mem::take(&mut reached.filter);
-    let instances: Vec<Instance> = reached.list.iter().map(|&(inst, _)| inst).collect();
-    let queue: VecDeque<(usize, Instance)> = wave.iter().map(|&at| (at, instances[at])).collect();
-    let shared = (Mutex::new(WaveQueue { seen, filter, instances, queue, settled: Vec::new(), deferred_items: Vec::new(), active: 0 }), Condvar::new());
-    loop {
-        let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
-        let shared_ref = &shared;
-        cx.in_parallel = true;
-        let joined = std::thread::scope(|scope| {
-            let handles: Vec<_> = forks
-                .into_iter()
-                .map(|mut fork| {
-                    scope.spawn(move || {
-                        wavefront_worker(&mut fork, shared_ref, workers, force_commit);
-                        let deferred = fork.take_deferred_evals();
-                        let (_, asks) = fork.release();
-                        (asks, deferred)
-                    })
-                })
-                .collect();
-            wavefront_worker(cx, shared_ref, workers, force_commit);
-            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect::<Vec<_>>()
-        });
-        cx.in_parallel = false;
-        let mut deferred = cx.take_deferred_evals();
-        for (asks, worker_deferred) in joined.into_iter().flatten() {
-            cx.asks.repeat(&asks);
-            deferred.extend(worker_deferred);
-        }
-        if !deferred.is_empty() {
-            eval_deferred_list(cx, deferred);
-        }
-        let deferred_items = {
-            let mut q = crate::sync::lock(&shared.0);
-            std::mem::take(&mut q.deferred_items)
-        };
-        if deferred_items.is_empty() {
-            break;
-        }
-        if deferred_items.len() < MIN_PARALLEL_WAVE {
-            let mut extra = Vec::new();
-            for (at, instance) in deferred_items {
-                let asks0 = cx.asks.count();
-                let mut unlaid = Vec::new();
-                let typed = infer_entry(cx, &instance, &mut unlaid, false);
-                let asked = cx.asks.count() > asks0;
-                extra.push((at, instance, typed, unlaid, !force_commit && asked));
-            }
-            let mut q = crate::sync::lock(&shared.0);
-            let mut callees = Vec::new();
-            for (at, instance, typed, unlaid, blocked) in extra {
-                callees.clear();
-                if !blocked {
-                    collect_filtered_callees(cx, &mut q.filter, instance, &typed, &mut callees);
-                }
-                q.settled.push((at, typed, unlaid, blocked));
-                for callee in callees.drain(..) {
-                    if !q.seen.contains_key(&callee) {
-                        let next_at = q.instances.len();
-                        q.seen.insert(callee, next_at);
-                        q.instances.push(callee);
-                        q.queue.push_back((next_at, callee));
-                    }
-                }
-            }
-            if q.queue.is_empty() {
-                break;
-            }
-        } else {
-            let mut q = crate::sync::lock(&shared.0);
-            q.queue.extend(deferred_items);
-        }
-    }
-    let q = shared.0.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
-    reached.index = q.seen;
-    reached.filter = q.filter;
-    let extra = q.instances.len().saturating_sub(reached.list.len());
-    reached.list.reserve(extra);
-    reached.states.reserve(extra);
-    for inst in q.instances.into_iter().skip(reached.list.len()) {
-        reached.list.push((inst, Err(String::new())));
-        reached.states.push(ReachedEntry::Enqueued);
-    }
-    let mut added = Vec::with_capacity(q.settled.len());
-    for (at, typed, unlaid, blocked) in q.settled {
-        if blocked {
-            reached.set_entry(at, ReachedEntry::Blocked, typed);
-        } else {
-            reached.set_entry(at, ReachedEntry::Settled, typed);
-            reached.unlaid.extend(unlaid);
-            added.push(at);
-        }
-    }
-    added
-}
-
-fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Condvar), workers: usize, force_commit: bool) {
-    let mut batch = Vec::with_capacity(MAX_WORKER_BATCH);
-    let mut results = Vec::with_capacity(MAX_WORKER_BATCH);
-    let mut local_filter = ReachFilter::default();
-    let mut synced_len = (0usize, 0usize);
-    let sync_filter = cx.store.lookups.skip_warm_sysroot_bodies;
-    loop {
-        batch.clear();
-        let delta = {
-            let mut q = crate::sync::lock(mutex);
-            while q.queue.is_empty() {
-                if q.active == 0 {
-                    cvar.notify_all();
-                    return;
-                }
-                q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            let delta = sync_filter.then(|| q.filter.take_delta(&mut synced_len));
-            let take = (q.queue.len() / (workers * 2).max(1)).clamp(1, MAX_WORKER_BATCH);
-            for _ in 0..take {
-                let Some((at, instance)) = q.queue.pop_front() else { break };
-                let include_fixed = !q.filter.seen_fixed_poly.contains(&instance.0);
-                batch.push((at, instance, include_fixed));
-            }
-            q.active += batch.len();
-            delta
-        };
-        if let Some((sealed, seen)) = delta {
-            local_filter.apply_delta(&sealed, &seen);
-        }
-        let mut active = ActiveGuard(mutex, cvar, batch.len());
-        results.clear();
-        for &(at, instance, include_fixed) in &batch {
-            let asks0 = cx.asks.count();
-            let mut unlaid = Vec::new();
-            let before = cx.deferred_evals.len();
-            let typed = infer_entry(cx, &instance, &mut unlaid, false);
-            let deferred = cx.deferred_evals.len() > before;
-            let asked = cx.asks.count() > asks0;
-            let mut callees = Vec::new();
-            if !deferred && (force_commit || !asked) {
-                let first_fixed = include_fixed && !local_filter.seen_fixed_poly.contains(&instance.0);
-                pre_collect_callees(cx, &mut local_filter, (instance, &typed, first_fixed), &mut callees);
-                if let Ok(t) = &typed && matches!(t.tables, LazyTables::Poly(_) | LazyTables::CheckOnly(_)) {
-                    local_filter.seen_fixed_poly.insert(instance.0);
-                }
-            }
-            results.push((at, instance, typed, unlaid, asked, deferred, callees));
-        }
-        {
-            let mut q = crate::sync::lock(mutex);
-            q.active = q.active.saturating_sub(active.2);
-            active.2 = 0;
-            local_filter.drain_to(&mut q.filter);
-            let mut pushed = false;
-            for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
-                if deferred {
-                    q.deferred_items.push((at, instance));
-                } else if !force_commit && asked {
-                    q.settled.push((at, typed, unlaid, true));
-                } else {
-                    commit_filter_caller(cx, &mut q.filter, instance, &typed);
-                    q.settled.push((at, typed, unlaid, false));
-                    for (callee, sealed) in callees {
-                        if sealed && !q.filter.mark_seen_sealed(callee.0) {
-                            continue;
-                        }
-                        let next_at = q.instances.len();
-                        if let std::collections::hash_map::Entry::Vacant(slot) = q.seen.entry(callee) {
-                            slot.insert(next_at);
-                            q.instances.push(callee);
-                            q.queue.push_back((next_at, callee));
-                            pushed = true;
-                        }
-                    }
-                }
-            }
-            if pushed || (q.queue.is_empty() && q.active == 0) {
-                cvar.notify_all();
-            }
-        }
-    }
 }
 
 fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
@@ -614,17 +505,8 @@ fn parallel_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], wo
     commit_wave(cx, reached, wave, items, force_commit)
 }
 
-fn eval_deferred_list(cx: &mut Context<'_>, deferred: Vec<(Instance, u32)>) {
-    let mut seen = rustc_hash::FxHashSet::default();
-    for (inst, bits) in deferred {
-        if seen.insert((inst, bits)) {
-            super::evaluate::prime(cx, &inst, bits);
-        }
-    }
-}
-
 fn run_deferred(cx: &mut Context<'_>, (reached, wave, workers, check_undeclared): (&Reached, &[usize], usize, bool), deferred: Vec<(Instance, u32)>, items: &mut [WaveItem]) {
-    eval_deferred_list(cx, deferred);
+    wave::eval_deferred_list(cx, deferred);
     for _ in 0..4 {
         let pending: Vec<usize> = items.iter().enumerate().filter(|(_, item)| item.deferred).map(|(i, _)| i).collect();
         if pending.len() < MIN_PARALLEL_WAVE || workers <= 1 {
@@ -649,7 +531,7 @@ fn run_deferred(cx: &mut Context<'_>, (reached, wave, workers, check_undeclared)
         if next_deferred.is_empty() {
             break;
         }
-        eval_deferred_list(cx, next_deferred);
+        wave::eval_deferred_list(cx, next_deferred);
     }
     for item in items.iter_mut().filter(|item| item.deferred) {
         let asks0 = cx.asks.count();
@@ -662,7 +544,7 @@ fn run_deferred(cx: &mut Context<'_>, (reached, wave, workers, check_undeclared)
     }
 }
 
-fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reached, (wave, next, check_undeclared): (&[usize], &AtomicUsize, bool)) -> (Vec<WaveItem>, Vec<Option<WorkerOut>>) {
+pub(super) fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reached, (wave, next, check_undeclared): (&[usize], &AtomicUsize, bool)) -> (Vec<WaveItem>, Vec<Option<WorkerOut>>) {
     std::thread::scope(|scope| {
         let handles: Vec<_> = forks
             .into_iter()
@@ -733,7 +615,7 @@ fn commit_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], item
     (settled, next)
 }
 
-fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>, check_undeclared: bool) -> Result<Arc<Typed>, String> {
+pub(super) fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>, check_undeclared: bool) -> Result<Arc<Typed>, String> {
     if check_undeclared && cx.undeclared(instance) {
         return Err("no longer declared".to_owned());
     }

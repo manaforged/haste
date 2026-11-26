@@ -32,7 +32,8 @@ impl Lower<'_, '_> {
             }
             (NoOp, _, _) => Ok(None),
             (Fence, _, _) => {
-                self.ins().fence();
+                let ord = self.atomic_ord(substs);
+                self.ins().fence(ord);
                 Ok(None)
             }
             (BlackBox, _, _) => Ok(args.first().copied()),
@@ -41,7 +42,7 @@ impl Lower<'_, '_> {
                 let place = self.pointee_place(pointer, ty)?;
                 self.discriminant_value(place, ty).map(Some)
             }
-            (Atomic(atomic), Some(ty), _) => self.atomic(atomic, ty, args),
+            (Atomic(atomic), Some(ty), _) => self.atomic(atomic, ty, substs, args),
             (Unchecked(op), Some(ty), &[x, y]) => self.unchecked(op, (ty, substs.get(1).copied()), x, y).map(Some),
             (ThreeWayCompare, Some(ty), &[x, y]) => self.compare(ty, x, y).map(Some),
             (RawPointer | Offset(_) | PtrMask | OffsetFrom(_) | Read | Write | WriteBox | MemCopy(_) | WriteBytes | SliceElement, Some(_), _) => self.access_intrinsic(which, substs, args),

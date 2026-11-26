@@ -460,6 +460,9 @@ fn try_coalesce_param(func: &mut Function, cfg: &Cfg, addrs: &[Option<(StackSlot
         if (0..nblocks).any(|blk| live_p[blk] && any_mem[blk]) {
             return false;
         }
+        if slots.iter().any(|&s| func.is_unwind_slot(s)) {
+            return false;
+        }
         for i in 0..k {
             let mut seen = mem_blocks[i].clone();
             let mut work: Vec<usize> = (0..nblocks).filter(|&blk| seen[blk]).collect();
@@ -492,6 +495,9 @@ fn try_coalesce_param(func: &mut Function, cfg: &Cfg, addrs: &[Option<(StackSlot
                     work.push(si);
                 }
             }
+        }
+        if slots.iter().any(|&s| func.is_unwind_slot(s)) {
+            return false;
         }
         for i in 0..k {
             if (0..nblocks).any(|blk| reach_b[blk] && mem_blocks[i][blk]) {

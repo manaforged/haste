@@ -179,6 +179,57 @@ impl Infer<'_, '_> {
         self.settle_pending()
     }
 
+    /// Infers the arguments `args` of a call of a function with `params` that returns `ret`, the function item `def` when it is one, and returns `ret`.
+    pub(super) fn call_args(&mut self, args: Vec<u32>, (params, ret, def): (Vec<Ty>, Ty, Option<(ItemRef, Vec<Ty>)>), (expected, mut held): (Option<Ty>, Option<(ItemRef, Vec<Ty>)>)) -> Result<Ty> {
+        let extra = self.variadic_extra(def.as_ref().map(|(item, _)| *item), args.len(), params.len())?;
+        let hints = self.expected_inputs(&params, ret, expected);
+        let value_count = params.len();
+        let def_ref = def.as_ref().map(|(item, substs)| (*item, &substs[..]));
+        for (&arg, (&param, &hint)) in args[..value_count].iter().zip(params.iter().zip(&hints)) {
+            if !self.is_deferred_closure_arg(ExprId(arg)) {
+                self.call_arg(def_ref, ExprId(arg), (param, hint), &mut held)?;
+            }
+        }
+        self.release_obligation(&mut held)?;
+        for (&arg, (&param, &hint)) in args[..value_count].iter().zip(params.iter().zip(&hints)) {
+            if self.is_deferred_closure_arg(ExprId(arg)) {
+                self.call_arg(def_ref, ExprId(arg), (param, hint), &mut held)?;
+            }
+        }
+        for &arg in &args[args.len() - extra..] {
+            self.expr(ExprId(arg), None)?;
+        }
+        Ok(ret)
+    }
+
+    fn is_deferred_closure_arg(&self, expr: ExprId) -> bool {
+        self.is_closure(expr)
+            || matches!(*self.body.expr(expr), Expr::Ref { expr: inner, .. } if self.is_closure(inner))
+    }
+
+    /// How many arguments past its `params` a call of `callee` with `given` arguments passes, which only a C-variadic foreign function takes.
+    fn variadic_extra(&mut self, callee: Option<ItemRef>, given: usize, params: usize) -> Result<usize> {
+        let variadic = match callee {
+            Some(item) => self.cx.foreign(item) && self.cx.signature(item)?.variadic,
+            None => false,
+        };
+        match given.checked_sub(params) {
+            Some(0) => Ok(0),
+            Some(extra) if variadic => Ok(extra),
+            _ => bail!("call takes {params} arguments, {given} given"),
+        }
+    }
+
+    pub(super) fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
+        let Some(expected) = expected else {
+            return vec![None; params.len()];
+        };
+        self.probe(|infer| match infer.unifies(ret, expected) {
+            true => params.iter().map(|&param| Some(infer.substitute(param))).collect(),
+            false => vec![None; params.len()],
+        })
+    }
+
     fn free_box(&mut self, expr: ExprId, found: Ty) -> Result<()> {
         let found = self.resolve(found);
         if self.cx.boxed(found).is_none() || self.out.autoderefs.get(&expr) != Some(&1) {

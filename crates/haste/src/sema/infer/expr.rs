@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 
-use crate::body::{BinOp, Expr, ExprId, List, Lit, TyId, UnOp};
+use crate::body::{BinOp, Body, Expr, ExprId, List, Lit, TyId, UnOp};
 use crate::names::{ItemRef, Primitive};
 
-use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
+use super::super::ty::{Kind, Mut, Ty, float_bits, int_info, mask};
 use super::path::parse_int;
 use super::{Breaks, Infer, Res};
 
@@ -29,7 +29,13 @@ impl Infer<'_, '_> {
             Expr::AssignOp(op, lhs, rhs) => self.assign(expr, (lhs, rhs), Some(op)),
             Expr::Cast(inner, ty) => self.cast(inner, ty),
             Expr::Call(callee, args) => self.call(expr, (callee, args), expected),
-            Expr::Closure { params, ret, body, capture } => self.closure_expr(expr, (params, ret, body, capture), expected),
+            Expr::Closure { params, ret, body, capture } => {
+                let deduced = match expected {
+                    Some(ty) => self.dyn_callable_super_sig(ty)?,
+                    None => None,
+                };
+                self.closure_expr(expr, (params, ret, body, capture), deduced.or(expected))
+            }
             Expr::Tuple(list) => self.tuple(list, expected),
             Expr::Ref { mutable, raw, expr: inner } => self.reference(inner, (mutable, raw), expected),
             Expr::TupleField(base, index) => self.tuple_field(expr, base, index),
@@ -39,7 +45,7 @@ impl Infer<'_, '_> {
 
     fn cast(&mut self, inner: ExprId, ty: TyId) -> Result<Ty> {
         let target = self.lower_ty(self.body, ty)?;
-        let hint = matches!(self.cx.types.kind(self.resolve(target)), Kind::FnPtr(..)).then_some(target);
+        let hint = self.cast_hint(inner, target)?;
         let found = self.expr(inner, hint)?;
         self.note_cast_pointee(inner, found, target);
         let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
@@ -49,8 +55,34 @@ impl Infer<'_, '_> {
         };
         if let Some(coercion) = coercion {
             self.out.coercions.insert(inner, coercion);
+        } else if !address {
+            self.finish_identity_cast(found, target)?;
         }
         Ok(target)
+    }
+
+    fn cast_hint(&self, inner: ExprId, target: Ty) -> Result<Option<Ty>> {
+        let target = self.resolve(target);
+        let kind = self.cx.types.kind(target);
+        if matches!(kind, Kind::FnPtr(..)) {
+            return Ok(Some(target));
+        }
+        let (prim, hint_ty) = match *kind {
+            Kind::Prim(prim) => (prim, target),
+            Kind::Ptr(..) => (Primitive::Usize, self.cx.types.prim(Primitive::Usize)),
+            _ => return Ok(None),
+        };
+        let Some((lit, _, _)) = cast_lit_kind(self.body, inner) else {
+            return Ok(None);
+        };
+        match lit {
+            Lit::Float => Ok(float_bits(prim).is_some().then_some(hint_ty)),
+            Lit::Int => {
+                let Some(int) = int_info(prim) else { return Ok(None) };
+                Ok(cast_int_lit_fits(self.body, self.src, inner, int)?.then_some(hint_ty))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Notes a cast to a raw pointer whose pointee has unresolved inference variables.
@@ -445,6 +477,7 @@ impl Infer<'_, '_> {
     fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
         let found = self.expr(callee, None)?;
         let callee_ty = self.callee_base(expr, found);
+        let opaque_mark = self.opaques.len();
         let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
             Kind::Dyn(of, ..) if self.is_callable_trait(of) => {
@@ -462,10 +495,18 @@ impl Infer<'_, '_> {
             Kind::Adt(..) => return self.overloaded_call(expr, found, args),
             _ => return self.other_call(expr, found, callee_ty, args),
         };
+        let held_opaques = self.opaques.split_off(opaque_mark);
         let args = self.passed_args(def.as_ref(), args, params.len())?;
         let held = self.hold_open_obligation(def.as_ref())?;
         let def = def.or_else(|| self.ctor_callee(callee));
-        self.call_args(args, (params, ret, def), (expected, held))
+        let res = self.call_args(args, (params, ret, def), (expected, held));
+        let had_new = !held_opaques.is_empty();
+        self.opaques.extend(held_opaques);
+        let ret = res?;
+        if had_new {
+            self.settle_opaques(false)?;
+        }
+        Ok(ret)
     }
 
     fn other_call(&mut self, expr: ExprId, found: Ty, callee_ty: Ty, args: List) -> Result<Ty> {
@@ -515,46 +556,6 @@ impl Infer<'_, '_> {
             self.out.const_args.insert(ExprId(arg));
         }
         Ok(all.into_iter().enumerate().filter(|(at, _)| !positions.contains(at)).map(|(_, arg)| arg).collect())
-    }
-
-    /// Infers the arguments `args` of a call of a function with `params` that returns `ret`, the function item `def` when it is one, and returns `ret`.
-    fn call_args(&mut self, args: Vec<u32>, (params, ret, def): (Vec<Ty>, Ty, Option<(ItemRef, Vec<Ty>)>), (expected, mut held): (Option<Ty>, Option<(ItemRef, Vec<Ty>)>)) -> Result<Ty> {
-        let extra = self.variadic_extra(def.as_ref().map(|(item, _)| *item), args.len(), params.len())?;
-        let hints = self.expected_inputs(&params, ret, expected);
-        for ((&arg, param), hint) in args.iter().zip(params).zip(hints) {
-            if self.is_closure(ExprId(arg)) {
-                self.release_obligation(&mut held)?;
-            }
-            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), (param, hint), &mut held)?;
-        }
-        for &arg in &args[args.len() - extra..] {
-            self.expr(ExprId(arg), None)?;
-        }
-        self.release_obligation(&mut held)?;
-        Ok(ret)
-    }
-
-    /// How many arguments past its `params` a call of `callee` with `given` arguments passes, which only a C-variadic foreign function takes.
-    fn variadic_extra(&mut self, callee: Option<ItemRef>, given: usize, params: usize) -> Result<usize> {
-        let variadic = match callee {
-            Some(item) => self.cx.foreign(item) && self.cx.signature(item)?.variadic,
-            None => false,
-        };
-        match given.checked_sub(params) {
-            Some(0) => Ok(0),
-            Some(extra) if variadic => Ok(extra),
-            _ => bail!("call takes {params} arguments, {given} given"),
-        }
-    }
-
-    pub(super) fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
-        let Some(expected) = expected else {
-            return vec![None; params.len()];
-        };
-        self.probe(|infer| match infer.unifies(ret, expected) {
-            true => params.iter().map(|&param| Some(infer.substitute(param))).collect(),
-            false => vec![None; params.len()],
-        })
     }
 
     fn if_expr(&mut self, cond: ExprId, then: ExprId, otherwise: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {
@@ -611,67 +612,6 @@ impl Infer<'_, '_> {
         }
         self.unify(a, b)?;
         Ok(a)
-    }
-
-    /// The type both branches coerce to when they differ: an unsized slice, a function pointer, or one branch's reference or pointer of the same type, such as a `Box`, that the other coerces to.
-    pub(super) fn branch_target(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
-        if let Some(target) = self.slice_branch(a, b) {
-            return Ok(Some(target));
-        }
-        if let Some(target) = self.fn_branch(a, b)? {
-            return Ok(Some(target));
-        }
-        let (ka, kb) = (self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b)));
-        let pointers = match (ka, kb) {
-            (Kind::Ref(..), Kind::Ref(..)) => true,
-            (Kind::Adt(x, _), Kind::Adt(y, _)) => x == y,
-            _ => false,
-        };
-        if !pointers {
-            return Ok(None);
-        }
-        if self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.is_some() {
-            return Ok(Some(a));
-        }
-        Ok(self.trial(|infer| Ok(infer.coercion(a, b).ok().flatten()))?.map(|_| b))
-    }
-
-    /// The branch type that the other branch unsizes to, when one branch points to an array and the other to a slice, as rustc's common type of two branches does.
-    fn slice_branch(&self, a: Ty, b: Ty) -> Option<Ty> {
-        let pointee = |ty: Ty| match self.cx.types.kind(self.resolve(ty)) {
-            Kind::Ref(_, inner) | Kind::Ptr(_, inner) => Some(self.cx.types.kind(self.resolve(*inner)).clone()),
-            _ => None,
-        };
-        match (pointee(a)?, pointee(b)?) {
-            (Kind::Array(..), Kind::Slice(_)) => Some(b),
-            (Kind::Slice(_), Kind::Array(..)) => Some(a),
-            _ => None,
-        }
-    }
-
-    /// The function pointer type both branches reify to, when they are two different function items or a function item and a function pointer, as rustc's common type of two branches does.
-    fn fn_branch(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
-        let (a_kind, b_kind) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
-        let (item, substs) = match (&a_kind, &b_kind) {
-            (Kind::FnDef(..), Kind::FnPtr(..)) => return Ok(Some(b)),
-            (Kind::FnPtr(..), Kind::FnDef(..)) => return Ok(Some(a)),
-            (Kind::FnDef(item, substs), Kind::FnDef(..)) if a_kind != b_kind => (*item, *substs),
-            _ => return Ok(None),
-        };
-        let slice = self.cx.types.substs(substs).to_vec();
-        let (params, ret) = self.fn_types(item, &slice)?;
-        Ok(Some(self.cx.types.fn_ptr(&params, ret)))
-    }
-
-    fn shared_pointer(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
-        let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
-        let (shared, inner, other) = match (a, b) {
-            (Kind::Ptr(x, inner), Kind::Ptr(y, other)) if x != y => (Kind::Ptr(Mut::Not, inner), inner, other),
-            (Kind::Ref(x, inner), Kind::Ref(y, other)) if x != y => (Kind::Ref(Mut::Not, inner), inner, other),
-            _ => return Ok(None),
-        };
-        self.unify(inner, other)?;
-        Ok(Some(self.cx.types.intern(shared)))
     }
 
     fn while_expr(&mut self, cond: ExprId, body: ExprId, label: Option<u32>) -> Result<Ty> {
@@ -790,4 +730,37 @@ const OPERATORS: [(BinOp, &str, &str); 16] = [
 /// The lang item of the trait that overloads `op`, and its method.
 pub(super) fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
     OPERATORS.iter().find(|(each, ..)| *each == op).map(|&(_, lang, name)| (lang, name))
+}
+
+pub(super) fn cast_lit_kind(body: &Body, mut expr: ExprId) -> Option<(Lit, u32, bool)> {
+    let mut negated = false;
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Block { stmts, tail: Some(tail), label: None, kind } if kind.is_plain_scope() && body.list(stmts).is_empty() => expr = tail,
+            Expr::Unary(UnOp::Neg, inner) => {
+                negated = true;
+                expr = inner;
+            }
+            Expr::Lit(lit @ (Lit::Int | Lit::Float), at) => return Some((lit, at, negated)),
+            _ => return None,
+        }
+    }
+}
+
+pub(super) fn cast_int_lit_fits(body: &Body, src: &crate::outline::source::Source, inner: ExprId, int: (u32, bool)) -> Result<bool> {
+    let Some((Lit::Int, at, negated)) = cast_lit_kind(body, inner) else {
+        return Ok(false);
+    };
+    let (value, suffix) = parse_int(src.text(at))?;
+    Ok(suffix.is_none() && int_lit_fits(value, int, negated))
+}
+
+pub(super) fn int_lit_fits(value: u128, (bits, signed): (u32, bool), negated: bool) -> bool {
+    match (signed, negated) {
+        (false, true) => false,
+        (false, false) => value <= mask(bits),
+        (true, false) => value <= (mask(bits) >> 1),
+        (true, true) => value <= (mask(bits) >> 1) + 1,
+    }
 }

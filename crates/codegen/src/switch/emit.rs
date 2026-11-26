@@ -225,7 +225,7 @@ fn emit_tree(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty
     emit_split(func, at, (v, ty), split, (left, right))
 }
 
-fn emit_split(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), split: u64, (left, right): (Block, Block)) -> Block {
+pub(super) fn emit_split(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), split: u64, (left, right): (Block, Block)) -> Block {
     let (pivot, lt) = (func.value(ty), func.value(Type::I8));
     let insts = vec![
         func.add(Op::Const(extend(split as i64, ty, true)), Some(pivot)),

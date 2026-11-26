@@ -463,6 +463,10 @@ fn tail_non_const_pos(func: &Function, insts: &[Inst]) -> Option<usize> {
     (!matches!(func.insts[insts[pos].index()].op, Op::Const(_))).then_some(pos)
 }
 
+fn extra_const_outs(vals: &[Value], consts: &[Option<i64>], skip: &[usize]) -> Vec<Option<i64>> {
+    vals.iter().enumerate().filter(|(r, _)| !skip.contains(r)).map(|(_, &v)| consts[v.index()]).collect()
+}
+
 fn return_site_entry(func: &Function, consts: &[Option<i64>], uses: &[u32], block: usize) -> Option<(ReturnGroupKey, FactorSite)> {
     let insts = &func.blocks[block].insts;
     let len = insts.len();
@@ -480,7 +484,7 @@ fn return_site_entry(func: &Function, consts: &[Option<i64>], uses: &[u32], bloc
     }
     let ret_slot = ret_vals.iter().position(|&v| v == res)?;
     let ret_types: Vec<Type> = ret_vals.iter().map(|&v| func.ty(v)).collect();
-    let const_rets: Vec<Option<i64>> = ret_vals.iter().enumerate().map(|(r, &v)| (r != ret_slot).then(|| consts[v.index()]).flatten()).collect();
+    let const_rets = extra_const_outs(ret_vals, consts, &[ret_slot]);
     let key = ReturnGroupKey { sig, ret_slot, ret_types, const_rets };
     let site = FactorSite { block, tail_pos, args, out_vals: ret_vals.clone() };
     Some((key, site))
@@ -618,12 +622,7 @@ fn jump_site_entry(func: &Function, consts: &[Option<i64>], uses: &[u32], block:
         return None;
     }
     let out_types: Vec<Type> = j_args.iter().map(|&v| func.ty(v)).collect();
-    let const_outs: Vec<Option<i64>> = j_args
-        .iter()
-        .enumerate()
-        .filter(|(r, _)| !positions.contains(r))
-        .map(|(_, &v)| consts[v.index()])
-        .collect();
+    let const_outs = extra_const_outs(j_args, consts, &positions);
     let key = JumpGroupKey { target: *target, sig, positions, out_types, const_outs };
     let site = FactorSite { block, tail_pos, args, out_vals: j_args.clone() };
     Some((key, site))

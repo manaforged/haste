@@ -32,7 +32,12 @@ fn existing_needed_bytes(
         if !seen_stencils.contains(&key)
             && let Some(slice) = existing.stencil_at(rec)
         {
-            needed += aligned8(slice.code.len()) + aligned8(slice.sites.len()) + aligned8(slice.relocs.len()) + aligned8(slice.plan.len()) + aligned8(slice.loops.len());
+            needed += aligned8(slice.code.len())
+                + aligned8(slice.sites.len())
+                + aligned8(slice.relocs.len())
+                + aligned8(slice.plan.len())
+                + aligned8(slice.loops.len())
+                + aligned8(slice.unwind_drops.len());
         }
     }
     for i in 0..existing.header.instance_count {
@@ -125,7 +130,8 @@ impl SubstrateBuilder {
             }
             for field in [
                 entry.code_off, entry.code_len, entry.sites_off, entry.sites_len, entry.relocs_off, entry.relocs_len,
-                entry.plan_off, entry.plan_len, entry.loops_off, entry.loops_len, entry.last_used.unwrap_or(self.generation), 0,
+                entry.plan_off, entry.plan_len, entry.loops_off, entry.loops_len, entry.unwind_off, entry.unwind_len,
+                entry.last_used.unwrap_or(self.generation), 0,
             ] {
                 out.extend_from_slice(&field.to_le_bytes());
             }

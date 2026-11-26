@@ -311,7 +311,7 @@ fn hash_header(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, bins: &mut Ha
         _ => item,
     };
     bins.k.flag(static_item);
-    bins.k.flag(cx.outline.crates[source.krate as usize].env.overflow_checks());
+    bins.k.flag(cx.overflow_checks(source.krate));
     let sig = if static_item { lower::signature_of(cx, None, []) } else { lower::signature(cx, typed) };
     if let Ok(sig) = sig {
         hash_signature(&sig, &mut bins.k);
@@ -357,6 +357,11 @@ fn hash_shape_kind(cx: &mut Context<'_>, typed: &Typed, bins: &mut HashBins) {
             bins.k.usize(cb.closure.captures.len());
             for cap in &cb.closure.captures {
                 bins.k.byte(cap.by as u8);
+                bins.k.usize(cap.path.len());
+                for &(variant, index) in &cap.path {
+                    bins.k.u32(variant);
+                    bins.k.u32(index);
+                }
             }
             if let Some(env_local) = cb.env {
                 hash_closure_env_offsets(cx, typed.locals[env_local as usize].ty, bins);

@@ -86,7 +86,7 @@ impl<'f> FunctionBuilder<'f> {
     /// The point that `rewind` returns the function to.
     pub fn mark(&self) -> Mark {
         let func = &self.func;
-        Mark { types: func.types.len(), blocks: func.blocks.len(), insts: func.insts.len(), slots: func.slots.len(), sigs: func.sigs.len(), current: self.current }
+        Mark { types: func.types.len(), blocks: func.blocks.len(), insts: func.insts.len(), slots: func.slots.len(), sigs: func.sigs.len(), unwind_drops: func.unwind_drops.len(), current: self.current }
     }
 
     /// Removes everything appended since `mark`, in every block.
@@ -106,6 +106,7 @@ impl<'f> FunctionBuilder<'f> {
         func.insts.truncate(mark.insts);
         func.slots.truncate(mark.slots);
         func.sigs.truncate(mark.sigs);
+        func.unwind_drops.truncate(mark.unwind_drops);
         for block in &mut func.blocks {
             block.insts.retain(|inst| inst.index() < mark.insts);
             block.params.retain(|value| value.index() < mark.types);
@@ -115,19 +116,13 @@ impl<'f> FunctionBuilder<'f> {
     }
 
     /// Copies `callee` into the function as if the current block called it with `args`, then continues in a new block whose parameters are its results.
-    pub fn inline(&mut self, callee: &Function, args: &[Value]) -> Vec<Value> {
-        self.inline_remap(callee, args, 0, None)
-    }
+    pub fn inline(&mut self, callee: &Function, args: &[Value]) -> Vec<Value> { self.inline_remap(callee, args, 0, None) }
 
     /// Copies `callee` into the function while shifting its relocation indices by `sym_base`.
-    pub fn inline_shifted(&mut self, callee: &Function, args: &[Value], sym_base: u32) -> Vec<Value> {
-        self.inline_remap(callee, args, sym_base, None)
-    }
+    pub fn inline_shifted(&mut self, callee: &Function, args: &[Value], sym_base: u32) -> Vec<Value> { self.inline_remap(callee, args, sym_base, None) }
 
     /// Copies `callee` into a dictionary-sharing function, loading its symbols from `dict` at `sym_base`.
-    pub fn inline_dict(&mut self, callee: &Function, args: &[Value], dict: Value, sym_base: u32) -> Vec<Value> {
-        self.inline_remap(callee, args, sym_base, Some(dict))
-    }
+    pub fn inline_dict(&mut self, callee: &Function, args: &[Value], dict: Value, sym_base: u32) -> Vec<Value> { self.inline_remap(callee, args, sym_base, Some(dict)) }
 
     fn inline_remap(&mut self, callee: &Function, args: &[Value], sym_base: u32, dict: Option<Value>) -> Vec<Value> {
         let values: Vec<Value> = self.func.import_values(callee);
@@ -145,6 +140,7 @@ impl<'f> FunctionBuilder<'f> {
         for (sym, bytes) in &callee.rodata_bytes {
             self.func.rodata_bytes.push((sym + sym_base, bytes.clone()));
         }
+        self.func.import_unwind_drops(callee, map.slots, sym_base);
         for (index, block) in callee.blocks.iter().enumerate() {
             let target = map.blocks[index];
             self.func.blocks[target.index()].params = block.params.iter().map(|param| map.values[param.index()]).collect();
@@ -214,6 +210,7 @@ impl Function {
         for (sym, bytes) in &callee.rodata_bytes {
             self.rodata_bytes.push((sym + sym_base, bytes.clone()));
         }
+        self.import_unwind_drops(callee, map.slots, sym_base);
         for (index, c_block) in callee.blocks.iter().enumerate() {
             let target = map.blocks[index];
             self.blocks[target.index()].params = c_block.params.iter().map(|param| map.values[param.index()]).collect();
@@ -233,6 +230,7 @@ impl Function {
         let Some(remap) = build(&self.self_slots) else { return };
         for d in &mut self.insts { if let Op::Symbol(s) | Op::SlotAddr(s) = &mut d.op { *s = remap.get(*s as usize).copied().unwrap_or(*s); } }
         for (s, _) in &mut self.rodata_bytes { *s = remap.get(*s as usize).copied().unwrap_or(*s); }
+        for u in &mut self.unwind_drops { u.drop_sym = remap.get(u.drop_sym as usize).copied().unwrap_or(u.drop_sym); }
     }
 }
 
@@ -244,6 +242,7 @@ pub struct Mark {
     insts: usize,
     slots: usize,
     sigs: usize,
+    unwind_drops: usize,
     current: Option<Block>,
 }
 
@@ -733,36 +732,32 @@ impl Ins<'_> {
         self.effect(Op::StackStore(value, slot, offset))
     }
 
-    /// A sequentially consistent read of a `ty` at `addr`.
-    pub fn atomic_load(mut self, ty: Type, addr: Value) -> Value {
-        self.value(Op::AtomicLoad(addr), ty)
+    /// An atomic read of a `ty` at `addr` with memory ordering `ord`.
+    pub fn atomic_load(mut self, ty: Type, addr: Value, ord: crate::ir::AtomicOrd) -> Value {
+        self.value(Op::AtomicLoad(addr, ord), ty)
     }
 
-    /// A sequentially consistent write of `value` at `addr`.
-    pub fn atomic_store(mut self, value: Value, addr: Value) -> Inst {
-        self.effect(Op::AtomicStore(value, addr))
+    /// An atomic write of `value` at `addr` with memory ordering `ord`.
+    pub fn atomic_store(mut self, value: Value, addr: Value, ord: crate::ir::AtomicOrd) -> Inst {
+        self.effect(Op::AtomicStore(value, addr, ord))
     }
 
-    /// Applies `op` with `value` to the `ty` at `addr` and returns the old contents.
-    pub fn atomic_rmw(mut self, ty: Type, op: AtomicRmwOp, addr: Value, value: Value) -> Value {
-        self.value(Op::AtomicRmw(op, addr, value), ty)
+    /// Applies `op` with `value` to the `ty` at `addr` with memory ordering `ord` and returns the old contents.
+    pub fn atomic_rmw(mut self, ty: Type, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, addr: Value, value: Value) -> Value {
+        self.value(Op::AtomicRmw(op, ord, addr, value), ty)
     }
 
-    /// Writes `replacement` at `addr` if it holds `expected`, and returns the old contents.
-    pub fn atomic_cas(mut self, addr: Value, expected: Value, replacement: Value) -> Value {
+    /// Writes `replacement` at `addr` if it holds `expected` with memory ordering `ord`, and returns the old contents.
+    pub fn atomic_cas(mut self, ord: crate::ir::AtomicOrd, addr: Value, expected: Value, replacement: Value) -> Value {
         let ty = self.func.ty(expected);
-        self.value(Op::AtomicCas(addr, expected, replacement), ty)
+        self.value(Op::AtomicCas(ord, addr, expected, replacement), ty)
     }
 
-    /// A full memory barrier.
-    pub fn fence(mut self) -> Inst {
-        self.effect(Op::Fence)
-    }
+    /// A memory barrier with ordering `ord`.
+    pub fn fence(mut self, ord: crate::ir::AtomicOrd) -> Inst { self.effect(Op::Fence(ord)) }
 
     /// This function's frame pointer.
-    pub fn get_frame_pointer(mut self, ty: Type) -> Value {
-        self.value(Op::FramePointer, ty)
-    }
+    pub fn get_frame_pointer(mut self, ty: Type) -> Value { self.value(Op::FramePointer, ty) }
 
     /// Calls the code at `callee` with `args`.
     pub fn call_indirect(mut self, sig: SigRef, callee: Value, args: &[Value]) -> Inst {
@@ -777,9 +772,7 @@ impl Ins<'_> {
     }
 
     /// Goes to `block` with `args`.
-    pub fn jump(mut self, block: Block, args: &[Value]) -> Inst {
-        self.effect(Op::Jump(block, args.to_vec()))
-    }
+    pub fn jump(mut self, block: Block, args: &[Value]) -> Inst { self.effect(Op::Jump(block, args.to_vec())) }
 
     /// Goes to `then` when `condition` is nonzero, else to `otherwise`.
     pub fn brif(mut self, condition: Value, then: Block, then_args: &[Value], otherwise: Block, else_args: &[Value]) -> Inst {
@@ -787,14 +780,10 @@ impl Ins<'_> {
     }
 
     /// Branches to `targets[index]` when `index` is in range, else to `default`.
-    pub fn br_table(mut self, index: Value, default: Block, targets: &[Block]) -> Inst {
-        self.effect(Op::BrTable(index, default, targets.to_vec()))
-    }
+    pub fn br_table(mut self, index: Value, default: Block, targets: &[Block]) -> Inst { self.effect(Op::BrTable(index, default, targets.to_vec())) }
 
     /// Returns `values`.
-    pub fn return_(mut self, values: &[Value]) -> Inst {
-        self.effect(Op::Return(values.to_vec()))
-    }
+    pub fn return_(mut self, values: &[Value]) -> Inst { self.effect(Op::Return(values.to_vec())) }
 
     /// Stops with an illegal instruction.
     pub fn trap(mut self) -> Inst { self.effect(Op::Trap) }

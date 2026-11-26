@@ -135,16 +135,13 @@ impl Lower<'_, '_> {
 
     /// The address that the value `value` of the sized pointer type `ty` holds, whether a reference, a raw pointer, or a smart pointer such as `Box` or `Rc`.
     pub(super) fn sized_pointer(&mut self, value: Value, ty: Ty) -> Value {
-        match self.cx.types.kind(ty) {
-            Kind::Ref(..) | Kind::Ptr(..) => value,
-            _ => {
-                let data = self.box_data(value);
-                if self.cx.boxed(ty).is_some() {
-                    self.b.func.mark_unique_ptr(data);
-                }
-                data
-            }
+        let is_scalar = matches!(self.cx.types.kind(ty), Kind::Ref(..) | Kind::Ptr(..))
+            || matches!(repr(self.cx, ty), Ok(Repr::Scalar(_)));
+        let data = if is_scalar { value } else { self.box_data(value) };
+        if self.cx.boxed(ty).is_some() {
+            self.b.func.mark_unique_ptr(data);
         }
+        data
     }
 
     /// The data pointer that the value `boxed` of a `Box` of a sized type holds.
@@ -208,15 +205,12 @@ impl Lower<'_, '_> {
 
     /// The expression that `expr` only wraps: the inside of parentheses, or the tail of a macro expansion with no statements.
     pub(super) fn transparent(&self, expr: ExprId) -> Option<ExprId> {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner) => Some(inner),
-            Expr::Block { stmts, tail, label: None, kind: BlockKind::Expansion } if self.body.list(stmts).is_empty() => tail,
-            _ => None,
-        }
+        transparent_in(self.body, expr)
     }
 
     fn coerced_repr(&mut self, expr: ExprId, coerced: Option<&Coercion>) -> Result<Repr> {
         Ok(match coerced {
+            Some(Coercion::Field { target, .. }) => repr(self.cx, *target)?,
             Some(coercion) if coercion.widens() => super::ops::WIDE,
             Some(Coercion::Deref(_, to)) if self.cx.is_unsized(*to)? => super::ops::WIDE,
             Some(Coercion::Deref(..) | Coercion::Reify(_)) => Repr::Scalar(Type::I64),
@@ -235,22 +229,30 @@ impl Lower<'_, '_> {
         self.temp(expr)
     }
 
+    fn is_uncaptured_local(&self, mut expr: ExprId) -> bool {
+        while let Some(inner) = self.transparent(expr) {
+            expr = inner;
+        }
+        matches!(self.body.expr(expr), Expr::Path(_))
+            && matches!(self.typed.res.get(&expr), Some(&Res::Local(local)) if self.locals[local as usize].is_none())
+    }
+
     /// The value of `expr` in a new temporary that the statement owns.
     pub fn temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
         let coerced = self.typed.coercions.get(&expr);
         let repr = self.coerced_repr(expr, coerced)?;
         let value = self.expr(expr)?;
+        let copy_mem = matches!(self.cx.types.kind(self.ty_of(expr)), Kind::Ref(..));
         let place = match (repr, value) {
-            (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr }),
-            (Repr::Scalar(_), Some(value)) => {
-                let slot = self.slot(repr).expect("a scalar has a slot");
+            (Repr::Mem { .. }, Some(addr)) if !copy_mem => Some(Place { base: Base::Addr(addr), offset: 0, repr }),
+            (_, Some(value)) => self.slot(repr).map(|slot| {
                 let place = Place::slot(slot, repr);
                 self.write(place, value);
-                Some(place)
-            }
+                place
+            }),
             _ => None,
         };
-        if self.open {
+        if self.open && (place.is_some() || (repr == Repr::Zst && !self.is_uncaptured_local(expr))) {
             self.own(super::moves::Root::Temp(expr), self.ty_of(expr), place, true)?;
         }
         Ok(place)
@@ -262,6 +264,11 @@ impl Lower<'_, '_> {
     }
 
     fn field_place(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Option<Place>> {
+        if let Some((local, path)) = self.expr_capture_path(expr)
+            && let Some((_, place)) = self.capture_by_path(local, &path)
+        {
+            return Ok(place);
+        }
         let Some((place, ty)) = self.autoderef_place(expr, base)? else {
             return Ok(None);
         };
@@ -414,7 +421,7 @@ impl Lower<'_, '_> {
             return Ok(None);
         };
         let coerced = self.typed.coercions.get(&expr);
-        let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_)));
+        let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_) | Coercion::Field { .. }));
         if !self.open || !self.may_alias_place(expr) || fresh_coercion || (in_place && coerced.is_none()) {
             return Ok(Some(addr));
         }
@@ -424,11 +431,74 @@ impl Lower<'_, '_> {
 
     /// Lowers the expressions `list` into a new frame slot as a tuple of type `ty`, and returns its value.
     pub(super) fn tuple_of(&mut self, ty: Ty, list: List) -> Result<Option<Value>> {
-        let mut values = Vec::new();
-        for &item in self.body.list(list).to_vec().iter() {
-            values.push(self.eval_operand(ExprId(item))?);
+        let whole = repr(self.cx, ty)?;
+        let Kind::Tuple(items) = *self.cx.types.kind(ty) else { bail!("a tuple of a type that is not a tuple") };
+        let items = self.cx.types.substs(items).to_vec();
+        let slot = self.slot(whole);
+        let unwind = self.wants_field_unwind()?;
+        let mut guards = Vec::new();
+        for (index, item) in self.body.list(list).to_vec().into_iter().enumerate() {
+            let field_ty = items[index];
+            let field = repr(self.cx, field_ty)?;
+            let offset = self.field_offset(ty, index as u32)?;
+            let part = slot.map(|slot| Place::slot(slot, whole).at(offset, field));
+            if !self.eval_and_write_part(part, field_ty, ExprId(item), unwind, &mut guards)? {
+                return Ok(None);
+            }
         }
-        self.tuple_from(ty, values)
+        self.disarm_owned_guards(guards);
+        Ok(slot.and_then(|slot| self.read(Place::slot(slot, whole))))
+    }
+
+    pub(super) fn push_arg_guard(&mut self, expr: ExprId, value: Option<Value>, guards: &mut Vec<usize>) -> Result<()> {
+        let ty = match self.typed.coercions.get(&expr) {
+            Some(Coercion::Field { target, .. }) => *target,
+            _ => self.ty_of(expr),
+        };
+        if !self.open || !crate::sema::infer::needs_drop(self.cx, ty)? {
+            return Ok(());
+        }
+        let whole = repr(self.cx, ty)?;
+        let place = match (whole, value) {
+            (Repr::Zst, _) | (_, None) => None,
+            (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr: whole }),
+            (Repr::Scalar(Type::I64), Some(val)) if self.typed.coercions.get(&expr).is_some_and(Coercion::widens) => {
+                Some(Place { base: Base::Addr(val), offset: 0, repr: whole })
+            }
+            (Repr::Scalar(_), Some(val)) => self.spill(Some(val), ty)?,
+        };
+        if let Some(guard) = self.push_owned_guard(ty, place, expr)? {
+            guards.push(guard);
+        }
+        Ok(())
+    }
+
+    pub(super) fn eval_guarded_args(
+        &mut self,
+        args: List,
+        mut values: Vec<Value>,
+        mut guards: Vec<usize>,
+        check_const: bool,
+    ) -> Result<Vec<Value>> {
+        let list = self.body.list(args).to_vec();
+        let unwind = self.wants_field_unwind()?;
+        for (index, &arg) in list.iter().enumerate() {
+            let expr = ExprId(arg);
+            if check_const && self.typed.const_args.contains(&expr) {
+                continue;
+            }
+            let last = index + 1 == list.len();
+            let value = self.operand(expr, last)?;
+            if !self.open {
+                return Ok(values);
+            }
+            if unwind && !last {
+                self.push_arg_guard(expr, value, &mut guards)?;
+            }
+            values.extend(value);
+        }
+        self.disarm_owned_guards(guards);
+        Ok(values)
     }
 
     /// Lowers the compiler-made `Clone::clone` of a tuple: each field of the referenced tuple cloned through its call in `calls`, into a new tuple.
@@ -521,5 +591,79 @@ impl Lower<'_, '_> {
                 self.read(place).map(|val| if matches!(place.repr, Repr::Mem { .. }) { self.snapshot_repr(place.repr, val) } else { val })
             })),
         }
+    }
+    /// Applies a single-pointer widening coercion `coercion` to `value` of type `from_ty`.
+    pub(super) fn apply_leaf_coercion(&mut self, expr: ExprId, value: Value, from_ty: Ty, coercion: &Coercion) -> Result<Option<Value>> {
+        match coercion {
+            Coercion::Len(len) => {
+                let data = self.sized_pointer(value, from_ty);
+                let len = self.len(*len)?;
+                Ok(Some(self.wide_pointer(data, len)))
+            }
+            Coercion::Vtable(vtable) => {
+                let data = self.sized_pointer(value, from_ty);
+                let table = self.vtable(expr, vtable)?;
+                Ok(Some(self.wide(data, table)))
+            }
+            Coercion::Upcast(slot) => Ok(Some(self.upcast(value, *slot, from_ty)?)),
+            _ => Ok(Some(value)),
+        }
+    }
+
+    /// Applies widening coercion `inner` to the unsized field inside struct `from_ty` to build `to_ty`.
+    pub(super) fn coerce_struct(&mut self, expr: ExprId, value: Value, from_ty: Ty, to_ty: Ty, inner: &Coercion) -> Result<Option<Value>> {
+        if from_ty == to_ty {
+            return Ok(Some(value));
+        }
+        let from_repr = repr(self.cx, from_ty)?;
+        if matches!(from_repr, Repr::Scalar(Type::I64)) {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        }
+        let (Kind::Adt(item, from_s), Kind::Adt(item2, to_s)) = (self.cx.types.kind(from_ty).clone(), self.cx.types.kind(to_ty).clone()) else {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        };
+        if item != item2 {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        }
+        let from_args = self.cx.types.substs(from_s).to_vec();
+        let to_args = self.cx.types.substs(to_s).to_vec();
+        let from_fields = crate::sema::infer::field_types(self.cx, item, &from_args)?;
+        let to_fields = crate::sema::infer::field_types(self.cx, item, &to_args)?;
+        let (Some(ff), Some(tf)) = (from_fields.first(), to_fields.first()) else {
+            return self.apply_leaf_coercion(expr, value, from_ty, inner);
+        };
+        let to_repr = repr(self.cx, to_ty)?;
+        let Some(slot) = self.slot(to_repr) else { return Ok(None) };
+        let src_place = Place { base: Base::Addr(value), offset: 0, repr: from_repr };
+        let dst_place = Place::slot(slot, to_repr);
+        for (i, (&f_ty, &t_ty)) in ff.iter().zip(tf.iter()).enumerate() {
+            let f_repr = repr(self.cx, f_ty)?;
+            let t_repr = repr(self.cx, t_ty)?;
+            if matches!(t_repr, Repr::Zst) {
+                continue;
+            }
+            let f_off = self.field_offset(from_ty, i as u32)?;
+            let t_off = self.field_offset(to_ty, i as u32)?;
+            let field_val = self.read(src_place.at(f_off, f_repr));
+            let out_val = if f_ty == t_ty {
+                field_val
+            } else if let Some(v) = field_val {
+                self.coerce_struct(expr, v, f_ty, t_ty, inner)?
+            } else {
+                None
+            };
+            if let Some(v) = out_val {
+                self.write(dst_place.at(t_off, t_repr), v);
+            }
+        }
+        Ok(self.read(dst_place))
+    }
+}
+
+pub(super) fn transparent_in(body: &crate::body::Body, expr: ExprId) -> Option<ExprId> {
+    match *body.expr(expr) {
+        Expr::Paren(inner) => Some(inner),
+        Expr::Block { stmts, tail, label: None, kind: BlockKind::Expansion } if body.list(stmts).is_empty() => tail,
+        _ => None,
     }
 }

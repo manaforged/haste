@@ -263,7 +263,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let vec_chunks = slot_vec_chunks(func, &slots);
     let mut changed = false;
     for block in 0..func.blocks.len() {
-        let insts = std::mem::take(&mut func.blocks[block].insts);
+        let insts = func.blocks[block].insts.clone();
         let mut out = Vec::with_capacity(insts.len());
         for inst in insts {
             if let Some(found) = fill(func, &defs, inst) {

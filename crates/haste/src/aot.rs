@@ -13,6 +13,8 @@ mod elf;
 mod macho;
 mod pe;
 mod shims;
+mod tls;
+mod unwind;
 mod wide;
 
 use shims::Shim;
@@ -64,6 +66,7 @@ pub(crate) struct Executable {
     pub(super) pointers: Vec<PtrReloc>,
     pub(super) symbols: Vec<(u32, String)>,
     pub(super) thread_slots: u32,
+    pub(super) unwind_table_off: Option<u32>,
     pub(super) lines: Vec<(u32, u64)>,
     pub(super) sources: Vec<std::path::PathBuf>,
 }
@@ -91,6 +94,7 @@ impl Executable {
             pointers: Vec::new(),
             symbols: Vec::new(),
             thread_slots: 0,
+            unwind_table_off: None,
             lines: Vec::new(),
             sources: Vec::new(),
         }
@@ -322,10 +326,12 @@ pub(super) struct SectionAddrs {
     pub(super) bss: u64,
     pub(super) dso_handle: u64,
     pub(super) thread_key: u64,
-    /// How far below the thread pointer the executable's static TLS block starts, on x86-64 ELF.
+    pub(super) tlv_desc: u64,
+    pub(super) unwind_tls: u64,
     pub(super) thread_tls: u64,
-    /// How far below the thread pointer the coroutine frame cache starts, on x86-64 ELF.
     pub(super) frame_tls: u64,
+    pub(super) unwind_table: u64,
+    pub(super) unwind_walk: u64,
 }
 
 fn classify<'a>(sym: &'a Symbol, addrs: SectionAddrs) -> Result<Binding<'a>> {
@@ -378,6 +384,7 @@ impl<'a> Plan<'a> {
             for binding in collect_dynamic_chunk(exe.relocs.iter().map(|r| &r.symbol).chain(exe.pointers.iter().map(|p| &p.symbol)))? {
                 plan.visit(binding);
             }
+            plan.add_unwind_walk();
             return Ok(plan);
         }
         let reloc_chunk = exe.relocs.len().div_ceil(workers).max(1);
@@ -408,7 +415,20 @@ impl<'a> Plan<'a> {
                 plan.visit(binding);
             }
         }
+        plan.add_unwind_walk();
         Ok(plan)
+    }
+
+    fn add_unwind_walk(&mut self) {
+        if self.has_shim(Shim::StartPanic) {
+            self.visit(Binding::Shim(Shim::UnwindWalk));
+        }
+    }
+
+    pub(super) fn unwind_addrs(&self, exe: &Executable, rodata_va: u64, base_va: u64, shim_offs: &[usize]) -> (u64, u64) {
+        let walk = self.shim_idx(Shim::UnwindWalk).map_or(0, |idx| base_va + shim_offs[idx] as u64);
+        let table = exe.unwind_table_off.map_or(0, |off| rodata_va + u64::from(off));
+        (table, walk)
     }
 
     fn visit(&mut self, binding: Binding<'a>) {
@@ -445,13 +465,16 @@ impl<'a> Plan<'a> {
         self.shim_index.contains_key(&shim)
     }
 
+    pub(in crate::aot) fn has_unwind(&self) -> bool {
+        self.has_shim(Shim::CatchUnwind) || self.has_shim(Shim::StartPanic) || self.has_shim(Shim::DropPush) || self.has_shim(Shim::DropPop)
+    }
+
+    pub(in crate::aot) fn has_frame_cache(&self) -> bool {
+        self.has_shim(Shim::FrameAlloc) || self.has_shim(Shim::FrameFree)
+    }
+
     pub(super) fn bss_layout(&self, bss: u32) -> (u32, u32) {
-        if !(self.has_shim(Shim::ThreadCell)
-            || self.has_shim(Shim::CatchUnwind)
-            || self.has_shim(Shim::StartPanic)
-            || self.has_shim(Shim::DropPush)
-            || self.has_shim(Shim::DropPop))
-        {
+        if !(self.has_shim(Shim::ThreadCell) || self.has_unwind()) {
             return (bss, bss);
         }
         let key_off = bss.next_multiple_of(16);

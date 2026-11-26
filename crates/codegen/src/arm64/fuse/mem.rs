@@ -281,22 +281,7 @@ pub(super) fn try_fuse_sib(
 }
 
 fn trivial_mul_imm(_func: &Function, plan: &Plan<Reg>, ty: Type, val: Value) -> bool {
-    let Some(raw) = plan.const_of(val) else {
-        return false;
-    };
-    let uimm = crate::fold::extend(raw, ty, false) as u64;
-    let simm = crate::fold::extend(raw, ty, true);
-    let max_shift = if ty == Type::I64 { 63 } else { 31 };
-    uimm <= 1
-        || simm == -1
-        || uimm.is_power_of_two()
-        || (uimm - 1).is_power_of_two()
-        || uimm.checked_add(1).is_some_and(|n| n.is_power_of_two() && n.trailing_zeros() as u8 <= max_shift)
-        || simm
-            .checked_neg()
-            .filter(|&n| n > 2)
-            .and_then(|n| (n as u64).checked_add(1))
-            .is_some_and(|n| n.is_power_of_two() && n.trailing_zeros() as u8 <= max_shift)
+    plan.const_of(val).is_some_and(|raw| crate::alloc::consts::arm64_trivial_mul_imm(ty, raw))
 }
 
 pub(super) fn try_fuse_madd(
@@ -517,7 +502,7 @@ fn is_mem_barrier(op: &Op) -> bool {
             | Op::AtomicStore(..)
             | Op::AtomicRmw(..)
             | Op::AtomicCas(..)
-            | Op::Fence
+            | Op::Fence(..)
             | Op::Copy(..)
             | Op::Move(..)
             | Op::Trap

@@ -346,12 +346,13 @@ impl Cursor<'_> {
     }
 
     fn path_expr(&mut self) -> Result<ExprId> {
+        let start = self.at;
         let path = self.path(Style::Expr)?;
         if self.punct("!") && !self.punct("!=") && opens(self.kind_at(self.at + 1)) {
             self.at += 1;
             let open = self.group();
             if let Some(&block) = self.config.calls.and_then(|calls| calls.get(&open)) {
-                return self.expanded(block);
+                return self.expanded(block, start);
             }
             return Ok(self.push_expr(Expr::Macro { path, open }));
         }
@@ -361,11 +362,17 @@ impl Cursor<'_> {
         Ok(self.push_expr(Expr::Path(path)))
     }
 
-    fn expanded(&mut self, block: u32) -> Result<ExprId> {
+    fn expanded(&mut self, block: u32, start: u32) -> Result<ExprId> {
         let (at, end) = (self.at, self.end);
+        let first_expr = self.body.expr_ends.len();
         (self.at, self.end) = (block, self.src.pair(block) + 1);
         let expr = self.block_expr(None, BlockKind::Expansion);
         (self.at, self.end) = (at, end);
+        for slot in &mut self.body.expr_ends[first_expr..] {
+            if self.src.place(slot.saturating_sub(1)) == 0 {
+                *slot = start + 1;
+            }
+        }
         self.expansion = expr.as_ref().ok().copied();
         self.expansion_stmt = None;
         if let Ok(block) = expr
@@ -412,7 +419,7 @@ impl Cursor<'_> {
         self.body.segments.push(super::Segment { name, args: None });
         let segment = self.body.segments.len() as u32 - 1;
         let segments = self.list(&[segment]);
-        let path = self.push_path(super::Path { qself: None, global: false, segments });
+        let path = self.push_path(super::Path { qself: None, global: false, start: name, segments });
         self.push_expr(Expr::Path(path))
     }
 
@@ -587,7 +594,7 @@ impl Cursor<'_> {
         let ret = if self.eat("->") { Some(self.ty_no_bounds()?) } else { None };
         let body = if ret.is_some() { self.block_expr(None, BlockKind::Plain)? } else { self.expr()? };
         let (ret, body) = match asynchronous {
-            true => (None, self.push_expr(Expr::Block { stmts: super::List::default(), tail: Some(body), label: None, kind: BlockKind::AsyncMove })),
+            true => (None, self.push_expr(Expr::Block { stmts: super::List::default(), tail: Some(body), label: None, kind: BlockKind::Async })),
             false => (ret, body),
         };
         Ok(self.push_expr(Expr::Closure { params, ret, body, capture }))

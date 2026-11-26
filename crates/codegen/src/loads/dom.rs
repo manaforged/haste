@@ -129,11 +129,11 @@ impl<'a> BlockWrites<'a> {
                         | Op::StackStore(..)
                         | Op::Copy(..)
                         | Op::Move(..)
-                        | Op::AtomicLoad(_)
+                        | Op::AtomicLoad(..)
                         | Op::AtomicStore(..)
                         | Op::AtomicRmw(..)
                         | Op::AtomicCas(..)
-                        | Op::Fence
+                        | Op::Fence(..)
                         | Op::Call { .. }
                         | Op::TryCall { .. }
                 ) {
@@ -149,6 +149,11 @@ impl<'a> BlockWrites<'a> {
             visit: vec![0; func.blocks.len()],
             epoch: 0,
         }
+    }
+
+    /// Whether `block` contains any potentially clobbering memory operation.
+    pub(super) fn has_writes(&self, block: Block) -> bool {
+        !self.writes[block.index()].is_empty()
     }
 
     /// Computes surviving `KnownLoads` and live `(base, root)` keys at entry to `block`.

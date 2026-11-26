@@ -383,47 +383,54 @@ impl Asm {
         self.encode(&[], false, &[op as u8 * 8 + 3], dst as u8, src.into(), false);
     }
 
-    fn alu_imm_width(&mut self, w: bool, op: Alu, dst: Rm, imm: i32) {
+    fn alu_imm_width(&mut self, lock: bool, w: bool, op: Alu, dst: Rm, imm: i32) {
         self.alu_flags(op);
+        let prefix: &[u8] = if lock { &[0xF0] } else { &[] };
         if let Ok(small) = i8::try_from(imm) {
-            self.encode(&[], w, &[0x83], op as u8, dst, false);
+            self.encode(prefix, w, &[0x83], op as u8, dst, false);
             self.imm(&[small as u8]);
         } else {
-            self.encode(&[], w, &[0x81], op as u8, dst, false);
+            self.encode(prefix, w, &[0x81], op as u8, dst, false);
             self.imm(&imm.to_le_bytes());
         }
     }
 
     pub fn alu_imm(&mut self, op: Alu, dst: impl Into<Rm>, imm: i32) {
-        self.alu_imm_width(true, op, dst.into(), imm);
+        self.alu_imm_width(false, true, op, dst.into(), imm);
     }
 
     pub fn alu_imm32(&mut self, op: Alu, dst: impl Into<Rm>, imm: i32) {
-        self.alu_imm_width(false, op, dst.into(), imm);
+        self.alu_imm_width(false, false, op, dst.into(), imm);
+    }
+
+    pub(super) fn alu_imm_raw(&mut self, lock: bool, size: Size, op: Alu, dst: Rm, imm: i32) {
+        self.alu_flags(op);
+        match size {
+            Size::B => {
+                self.encode(if lock { &[0xF0] } else { &[] }, false, &[0x80], op as u8, dst, dst.byte_rex());
+                self.imm(&[imm as u8]);
+            }
+            Size::W => {
+                let prefix: &[u8] = if lock { &[0xF0, 0x66] } else { &[0x66] };
+                match i8::try_from(imm as i16) {
+                    Ok(small) => {
+                        self.encode(prefix, false, &[0x83], op as u8, dst, false);
+                        self.imm(&[small as u8]);
+                    }
+                    Err(_) => {
+                        self.encode(prefix, false, &[0x81], op as u8, dst, false);
+                        self.imm(&(imm as u16).to_le_bytes());
+                    }
+                }
+            }
+            Size::D => self.alu_imm_width(lock, false, op, dst, imm),
+            Size::Q => self.alu_imm_width(lock, true, op, dst, imm),
+        }
     }
 
     /// `dst op= imm` on the low `size` bytes of `dst`, with `imm` cut to that width.
     pub fn alu_imm_sized(&mut self, size: Size, op: Alu, dst: impl Into<Rm>, imm: i32) {
-        let dst = dst.into();
-        self.alu_flags(op);
-        match size {
-            Size::B => {
-                self.encode(&[], false, &[0x80], op as u8, dst, dst.byte_rex());
-                self.imm(&[imm as u8]);
-            }
-            Size::W => match i8::try_from(imm as i16) {
-                Ok(small) => {
-                    self.encode(&[0x66], false, &[0x83], op as u8, dst, false);
-                    self.imm(&[small as u8]);
-                }
-                Err(_) => {
-                    self.encode(&[0x66], false, &[0x81], op as u8, dst, false);
-                    self.imm(&(imm as u16).to_le_bytes());
-                }
-            },
-            Size::D => self.alu_imm32(op, dst, imm),
-            Size::Q => self.alu_imm(op, dst, imm),
-        }
+        self.alu_imm_raw(false, size, op, dst.into(), imm);
     }
 
     pub fn test(&mut self, a: Reg, b: Reg) {
@@ -493,6 +500,7 @@ impl Asm {
     }
 
     pub fn shift_imm(&mut self, size: Size, op: Shift, reg: Reg, imm: u8) {
+        self.flags_overwritten();
         self.sized(false, size, (&[0xC0], &[0xC1]), op as u8, reg.into());
         self.code.push(imm);
     }
@@ -551,18 +559,6 @@ impl Asm {
         let start = self.pos();
         self.encode(&[], size == Size::Q, &[0x8D], dst as u8, src.into(), false);
         self.flags_kept(start);
-    }
-
-    pub fn xchg(&mut self, size: Size, dst: Mem, src: Reg) {
-        self.sized(false, size, (&[0x86], &[0x87]), src as u8, dst.into());
-    }
-
-    pub fn xadd(&mut self, size: Size, dst: Mem, src: Reg) {
-        self.sized(true, size, (&[0x0F, 0xC0], &[0x0F, 0xC1]), src as u8, dst.into());
-    }
-
-    pub fn cmpxchg(&mut self, size: Size, dst: Mem, src: Reg) {
-        self.sized(true, size, (&[0x0F, 0xB0], &[0x0F, 0xB1]), src as u8, dst.into());
     }
 
     pub fn sse(&mut self, prefix: &[u8], opcode: &[u8], r: u8, rm: impl Into<Rm>) {

@@ -311,7 +311,7 @@ fn clone_pure_insts(
                 | Op::AtomicStore(..)
                 | Op::AtomicRmw(..)
                 | Op::AtomicCas(..)
-                | Op::Fence
+                | Op::Fence(..)
                 | Op::Trap
                 | Op::Trapz(..)
         ) {

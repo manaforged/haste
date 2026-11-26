@@ -92,10 +92,9 @@ fn step_block(
         Op::BrTable(index, default, targets) => {
             let idx_val = lookup(&state.map, *index);
             let next_b = if let Some(c) = lookup_const(&state.local_consts, cx.consts, idx_val) {
-                let u = extend(c, func.ty(idx_val), false) as u64;
-                usize::try_from(u).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default)
+                crate::fold::table_target(extend(c, func.ty(idx_val), false) as u64, *default, targets)
             } else if let Some(u) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, idx_val).and_then(|f| f.exact()) {
-                usize::try_from(u).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default)
+                crate::fold::table_target(u, *default, targets)
             } else if targets.iter().all(|&t| t == *default) {
                 *default
             } else {

@@ -343,7 +343,7 @@ impl Emit<'_> {
                 return Ok(dst);
             }
             Binary::Udiv | Binary::Urem if self.divide_by_power(op, (x, y), dst) => return Ok(dst),
-            Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => self.divide(op, x, y),
+            Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => return Ok(self.divide(op, x, y)),
             Binary::Umulhi | Binary::Smulhi => return Ok(self.multiply_high(op == Binary::Smulhi, x, y, ty.bits() as u8)),
             Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => {
                 let signed = matches!(op, Binary::Smin | Binary::Smax);
@@ -434,81 +434,6 @@ impl Emit<'_> {
         self.asm.imul_sized(size, dst, source);
     }
 
-    /// Divides or takes the remainder by a power of two into `dst` with a shift or a mask, when `op` is unsigned and `y` is one.
-    fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
-        let ty = self.ty(y);
-        let Some(divisor) = self.const_of(y).map(|imm| crate::fold::extend(imm, ty, false) as u64).filter(|d| d.is_power_of_two()) else {
-            return false;
-        };
-        match op {
-            Binary::Udiv => {
-                self.get(dst, x, Ext::Zero);
-                let shift = divisor.trailing_zeros() as u8;
-                if shift != 0 {
-                    self.asm.shift_imm(Size::Q, Shift::Shr, dst, shift);
-                }
-            }
-            Binary::Urem => {
-                let Ok(mask) = i32::try_from(divisor - 1) else { return false };
-                self.raw(dst, x);
-                self.asm.alu_imm(Alu::And, dst, mask);
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    fn divide(&mut self, op: Binary, x: Value, y: Value) {
-        let signed = matches!(op, Binary::Sdiv | Binary::Srem);
-        let ext = Ext::of(signed);
-        self.get(Reg::Rax, x, ext);
-        self.get(Reg::Rcx, y, ext);
-        if signed {
-            self.asm.cqo();
-            self.asm.group3(Group3::Idiv, Reg::Rcx);
-        } else {
-            self.asm.alu32(Alu::Xor, Reg::Rdx, Reg::Rdx);
-            self.asm.group3(Group3::Div, Reg::Rcx);
-        }
-        if matches!(op, Binary::Srem | Binary::Urem) {
-            self.asm.mov(Reg::Rax, Reg::Rdx);
-        }
-        self.clobber_regs(&[Reg::Rax, Reg::Rdx]);
-    }
-
-    /// Divides the 128-bit value `high:low` by `by` with one `div`, putting the quotient, or the remainder when `rem` is set, in `result`.
-    pub(super) fn divide_wide(&mut self, rem: bool, [high, low, by]: [Value; 3], result: Value) {
-        self.get(Reg::Rdx, high, Ext::Zero);
-        self.get(Reg::Rax, low, Ext::Zero);
-        self.get(Reg::Rcx, by, Ext::Zero);
-        self.asm.group3(Group3::Div, Reg::Rcx);
-        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
-        self.flags = None;
-        self.put(result, if rem { Reg::Rdx } else { Reg::Rax });
-    }
-
-    /// Computes the high half of `x * y` and returns its register; a 64-bit product leaves its low half in rax for the `Imul` that follows.
-    pub(super) fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) -> Reg {
-        let ext = Ext::of(signed);
-        self.get(Reg::Rax, x, ext);
-        if bits == 64 {
-            let source = self.reg_of(y).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)).unwrap_or_else(|| {
-                self.get(Reg::Rcx, y, ext);
-                Reg::Rcx
-            });
-            self.clobber_reg(Reg::Rax);
-            self.asm.group3(if signed { Group3::Imul } else { Group3::Mul }, source);
-            self.clobber_reg(Reg::Rdx);
-            self.low_product = Some((x, y));
-            return Reg::Rdx;
-        }
-        self.get(Reg::Rcx, y, ext);
-        self.clobber_reg(Reg::Rax);
-        self.asm.imul(Reg::Rax, Reg::Rcx);
-        self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
-        Reg::Rax
-    }
-
     /// Shifts or rotates `x` by `y`: into `dst` with BMI2 or an immediate `y`, else into rax by cl; returns the register that holds the result.
     fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg, result: Value) -> Reg {
         let (ext, shift) = match op {
@@ -536,6 +461,9 @@ impl Emit<'_> {
             load_x(self, dst, need_ext || (count == 0 && ty == Type::I32 && matches!(op, Binary::Ushr | Binary::Rotl | Binary::Rotr) && !self.plan.zero_ext[x.index()]));
             if count != 0 {
                 self.asm.shift_imm(size, shift, dst, count);
+                if matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr) && self.plan.fused[result.index()] {
+                    self.flags = Some((result, Cond::Ne));
+                }
             }
             return dst;
         }
@@ -617,6 +545,20 @@ impl Emit<'_> {
             if let Some((tsz, timm)) = imm_sz {
                 let source = self.operand(val);
                 self.asm.test_imm_sized(tsz, source, timm);
+            } else if ty == Type::I64 && (imm as u64).checked_add(1).is_some_and(u64::is_power_of_two) {
+                let shift = (imm as u64).leading_zeros() as u8;
+                if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
+                    let source = self.operand(val);
+                    self.asm.load(Size::Q, Reg::Rax, source);
+                } else {
+                    self.raw(Reg::Rax, val);
+                }
+                if shift == 1 {
+                    self.asm.alu_sized(Size::Q, Alu::Add, Reg::Rax, Reg::Rax);
+                } else {
+                    self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift);
+                }
+                self.clobber_reg(Reg::Rax);
             } else {
                 let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
                     self.operand(val)

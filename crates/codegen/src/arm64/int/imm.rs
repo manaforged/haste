@@ -1,8 +1,21 @@
 use crate::arm64::fuse::width_mask;
 
+const ADD_IMM_LIMIT: u64 = 1 << 24;
+const ADD_IMM_LO_MASK: u64 = 0xFFF;
+const ADD_IMM_HI_MASK: u64 = 0xFFF_000;
+
+/// Splits `imm` into `(effective_sub, single_imm)` for one `add`/`sub` immediate instruction.
 pub(crate) fn add_imm_parts(sub: bool, imm: i64) -> Option<(bool, u32)> {
     let abs = imm.unsigned_abs();
-    (abs < 4096 || (abs & 0xFFF == 0 && abs < (1 << 24))).then(|| (if imm < 0 { !sub } else { sub }, abs as u32))
+    (abs <= ADD_IMM_LO_MASK || ((abs & ADD_IMM_LO_MASK) == 0 && abs < ADD_IMM_LIMIT))
+        .then(|| (if imm < 0 { !sub } else { sub }, abs as u32))
+}
+
+/// Splits `imm` into `(effective_sub, hi, lo)` for a two-instruction 24-bit `add`/`sub` immediate sequence.
+pub(crate) fn add_imm_split_parts(sub: bool, imm: i64) -> Option<(bool, u32, u32)> {
+    let abs = imm.unsigned_abs();
+    let (hi, lo) = ((abs & ADD_IMM_HI_MASK) as u32, (abs & ADD_IMM_LO_MASK) as u32);
+    (abs < ADD_IMM_LIMIT && hi != 0 && lo != 0).then(|| (if imm < 0 { !sub } else { sub }, hi, lo))
 }
 
 pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32)> {

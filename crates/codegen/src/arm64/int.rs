@@ -6,7 +6,7 @@ use super::{A, C, D, Emit, IP, T, V0};
 use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
-pub(crate) use imm::{add_imm_parts, encode_bitmask_imm};
+pub(crate) use imm::{add_imm_parts, add_imm_split_parts, encode_bitmask_imm};
 
 fn imm_within(imm: i64, bits: u32) -> bool {
     let mask = if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 };
@@ -80,7 +80,7 @@ impl Emit<'_> {
             Op::Const(imm) => imm_within(imm, expect_bits),
             Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => bits <= expect_bits,
             Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => expect_bits >= 1,
-            Op::Extract(..) => ty.is_small_int() && bits <= expect_bits,
+            Op::Extract(..) | Op::Reduce(..) => ty.is_small_int() && bits <= expect_bits,
             Op::Unary(u, a) => self.unary_zext_within(u, a, (bits, expect_bits, d)),
             Op::Binary(b, x, y) => self.bin_zext_within(b, (x, y), (bits, expect_bits, d)),
             Op::Select(_, a, b) => self.is_zext_within(a, expect_bits, d) && self.is_zext_within(b, expect_bits, d),
@@ -266,23 +266,20 @@ impl Emit<'_> {
     fn add_imm_split(&self, sub: bool, value: Value, ty: Type) -> Option<(bool, u32, u32)> {
         let raw = self.plan.const_of(value)?;
         if super::asm::Asm::mov_imm_is_single(raw) { return None; }
-        let simm = crate::fold::extend(raw, ty, true);
-        let abs = simm.unsigned_abs();
-        let (hi, lo) = ((abs & 0xFFF_000) as u32, (abs & 0xFFF) as u32);
-        (abs < (1 << 24) && hi != 0 && lo != 0).then(|| (if simm < 0 { !sub } else { sub }, hi, lo))
+        add_imm_split_parts(sub, crate::fold::extend(raw, ty, true))
     }
 
     fn emit_add_sub_imm(&mut self, sub: bool, (x, y): (Value, Value), (ty, size): (Type, Size), dst: Reg) -> bool {
         if let Some((eff_sub, imm)) = self.add_imm_args(sub, y, ty) {
-            let left = self.bits(x, A); self.asm.add_imm(eff_sub, false, size, dst, left, imm); return true;
+            let left = self.bits(self.peel_uextend(x), A); self.asm.add_imm(eff_sub, false, size, dst, left, imm); return true;
         }
         if !sub && let Some((eff_sub, imm)) = self.add_imm_args(false, x, ty) {
-            let left = self.bits(y, A); self.asm.add_imm(eff_sub, false, size, dst, left, imm); return true;
+            let left = self.bits(self.peel_uextend(y), A); self.asm.add_imm(eff_sub, false, size, dst, left, imm); return true;
         }
         if dst == ZR { return false; }
         let split = self.add_imm_split(sub, y, ty).map(|p| (x, p)).or_else(|| (!sub).then(|| self.add_imm_split(false, x, ty).map(|p| (y, p))).flatten());
         let Some((other, (eff_sub, hi, lo))) = split else { return false };
-        let left = self.bits(other, A);
+        let left = self.bits(self.peel_uextend(other), A);
         if left == ZR { return false; }
         self.asm.add_imm(eff_sub, false, size, dst, left, hi);
         self.asm.add_imm(eff_sub, false, size, dst, dst, lo);
@@ -380,12 +377,12 @@ impl Emit<'_> {
             if matches!(alu, Alu::And | Alu::Orr | Alu::Eor) && dst != ZR {
                 let imm_pair = match (self.const_imm(y), self.const_imm(x)) { (Some(imm), _) => Some((x, imm)), (None, Some(imm)) => Some((y, imm)), _ => None };
                 if let Some((val, imm)) = imm_pair && let Some(bitmask) = encode_bitmask_imm(imm as u64, size == Size::X) {
-                    let left = self.bits(val, A); self.asm.alu_bitmask(alu, size, bitmask, dst, left); return Ok(());
+                    let left = self.bits(self.peel_uextend(val), A); self.asm.alu_bitmask(alu, size, bitmask, dst, left); return Ok(());
                 }
             }
             if matches!(alu, Alu::Add | Alu::Sub) && self.emit_add_sub_imm(alu == Alu::Sub, (x, y), (ty, size), dst) { return Ok(()); }
-            if alu == Alu::Sub && self.const_imm(x) == Some(0) { let right = self.bits(y, C); self.asm.alu(alu, size, dst, ZR, right); return Ok(()); }
-            let (left, right) = self.bits_pair(x, y);
+            if alu == Alu::Sub && self.const_imm(x) == Some(0) { let right = self.bits(self.peel_uextend(y), C); self.asm.alu(alu, size, dst, ZR, right); return Ok(()); }
+            let (left, right) = self.bits_pair(self.peel_uextend(x), self.peel_uextend(y));
             self.asm.alu(alu, size, dst, left, right);
             return Ok(());
         }
@@ -521,7 +518,7 @@ impl Emit<'_> {
 
     fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
         let ty = self.ty(y);
-        let Some(divisor) = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, ty, false)).filter(|imm| *imm > 0 && imm.count_ones() == 1) else { return false };
+        let Some(divisor) = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, ty, false) as u64).filter(|imm| imm.is_power_of_two()) else { return false };
         if divisor == 1 && op == Binary::Urem { self.asm.mov_imm(dst, 0); return true; }
         if op == Binary::Udiv {
             let left = self.zext_src(x, A);
@@ -529,7 +526,7 @@ impl Emit<'_> {
             return true;
         }
         let left = self.bits(x, A);
-        self.asm.mov_imm(C, divisor - 1);
+        self.asm.mov_imm(C, (divisor - 1) as i64);
         self.asm.alu(Alu::And, Size::X, dst, left, C);
         self.clobber_reg(C);
         true
@@ -638,7 +635,7 @@ impl Emit<'_> {
             self.last_cmp = None;
             return true;
         }
-        let reg = self.cmp_arg(lhs, A, bytes, signed);
+        let reg = if self.is_zext_sub_cmp(lhs, cc, raw) { self.bits(lhs, A) } else { self.cmp_arg(lhs, A, bytes, signed) };
         self.asm.add_imm(sub, true, size, ZR, reg, imm);
         self.last_cmp = Some((size, lhs, rhs, signed));
         true

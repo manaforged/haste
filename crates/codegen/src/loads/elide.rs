@@ -27,7 +27,7 @@ pub(super) fn elide_moves(func: &mut Function, prov: &Provenance) -> bool {
     let mut dead: Vec<Site> = undefined_moves(func, &cfg, prov, &sealed);
     for (site, to, from) in moves {
         let (to, from) = (find(&owner, to), find(&owner, from));
-        if dead.contains(&site) || to == from || !sealed[from.index()] || !elidable(func, &cfg, site, &refs[from.index()], &refs[to.index()]) {
+        if dead.contains(&site) || to == from || !sealed[from.index()] || func.is_unwind_slot(to) || func.is_unwind_slot(from) || !elidable(func, &cfg, site, &refs[from.index()], &refs[to.index()]) {
             continue;
         }
         owner[to.index()] = from;
@@ -218,7 +218,7 @@ fn forward_moved_loads(func: &mut Function, prov: &Provenance) -> bool {
 
 /// Deletes each move into a slot that nothing reads, whose address only ever names the memory a store or move writes.
 fn drop_unread_moves(func: &mut Function, prov: &Provenance) -> bool {
-    let mut read = vec![false; func.slots.len()];
+    let mut read: Vec<bool> = (0..func.slots.len()).map(|s| func.is_unwind_slot(StackSlot(s as u32))).collect();
     for block in &func.blocks {
         for &inst in &block.insts {
             let op = &func.insts[inst.index()].op;

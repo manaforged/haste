@@ -111,7 +111,7 @@ fn effect(func: &Function, state: &State<'_>, inst: Inst) -> Effect {
             Effect::Write(MemLoc::slot(to, i64::from(offset), ty.bytes()), ty, find(state.subst, value))
         }
         (&Op::Call { callee, .. }, _) if state.prov.frame_runtime(callee) == Some(RuntimeSymbol::Malloc) => Effect::None,
-        (op, _) if matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence) => Effect::Unknown,
+        (op, _) if matches!(op, Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..)) => Effect::Unknown,
         (op, _) if matches!(op, Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. }) => Effect::Unknown,
         _ => Effect::None,
     }
@@ -761,13 +761,13 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     let mut state = State { prov: &prov, defs: &defs, selects: &selects, consts: &mut consts, subst: &mut subst, target, post_inline };
     let (mut renamed, mut scan_changed) = (false, false);
     let mut def_blocks = func.def_blocks();
-    let mut visited = vec![false; func.blocks.len()];
+    let (mut visited, mut added_phis) = (vec![false; func.blocks.len()], vec![0u8; func.blocks.len()]);
     let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
     let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = vec![Vec::new(); func.blocks.len()];
     for &block in &cfg.rpo {
         let (mut known, mut bases) = bw.entry_known(func, state.subst, &known_out, &block_bases, block);
         let preds = eligible_join_preds(func, &cfg, &visited, block);
-        let mut join = JoinCtx { cfg: &cfg, known_out: &known_out, def_blocks: &mut def_blocks, preds, added_phis: 0 };
+        let mut join = JoinCtx { cfg: &cfg, bw: &bw, known_out: &known_out, block_bases: &block_bases, visited: &visited, def_blocks: &mut def_blocks, preds, added_phis: &mut added_phis };
         let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known, &mut bases, &mut join);
         def_blocks.resize(func.types.len(), Some(block));
         visited[block.index()] = true;

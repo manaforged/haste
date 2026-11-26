@@ -1,4 +1,4 @@
-command=${CARGO:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/haste/cargo" 2>/dev/null)}
+command=${CARGO:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/haste/cargo" 2>/dev/null || true)}
 cargo_bin=cargo
 if [[ $command == cargo || ( $command != *[[:space:]]* && $command == */cargo && -x $command ) ]]; then
     cargo_bin=$command

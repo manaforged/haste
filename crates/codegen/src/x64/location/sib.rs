@@ -250,3 +250,51 @@ pub(super) fn double(ctx: &FuseCtx<'_>, root: Value, root_pos: usize) -> Option<
     let base = !ctx.plan.elided[x.index()] && !matches!(ctx.plan.location(x), Location::Frame(..) | Location::Imm(..));
     base.then_some(SibMatch { sib: Sib { base: SibBase::Value(x), index: x, shift: 0, disp: i32::try_from(disp).ok()? }, elide, base_start: start, idx_start: start })
 }
+
+/// Elides each `Iadd`/`Isub` by an `i32` constant whose only uses are atomic-operation addresses in its own block, so `atomic_target` folds the displacement directly into the memory operand.
+pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>])) {
+    let mut atomic_uses: Vec<(u32, usize, usize)> = vec![(0, usize::MAX, 0); func.types.len()];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let addr = match func.insts[inst.index()].op {
+                Op::AtomicLoad(addr, _) => Some(addr),
+                Op::AtomicStore(val, addr, _) if val != addr => Some(addr),
+                Op::AtomicRmw(_, _, addr, val) if val != addr => Some(addr),
+                Op::AtomicCas(_, addr, exp, rep) if exp != addr && rep != addr => Some(addr),
+                _ => None,
+            };
+            if let Some(addr) = addr {
+                let entry = &mut atomic_uses[addr.index()];
+                if entry.0 == 0 {
+                    *entry = (1, b_idx, pos);
+                } else if entry.1 == b_idx {
+                    entry.0 += 1;
+                    entry.2 = entry.2.max(pos);
+                } else {
+                    entry.0 = u32::MAX;
+                }
+            }
+        }
+    }
+    for (v, def) in pos_of.iter().enumerate() {
+        let Some((block, start, inst)) = *def else { continue };
+        let (count, use_block, max_end) = atomic_uses[v];
+        if count == 0 || count != uses[v] || use_block != block || max_end <= start {
+            continue;
+        }
+        let val = Value(v as u32);
+        if func.ty(val) != Type::I64 || plan.elided[v] || plan.is_static(val) || plan.sib[v].is_some() {
+            continue;
+        }
+        let Some((base, delta)) = super::fuse::iadd_sub_const(plan, &func.insts[inst.index()].op) else { continue };
+        if i32::try_from(delta).is_err() || plan.elided[base.index()] {
+            continue;
+        }
+        if count > 1 && plan.reg_of(base).is_none() && !matches!(plan.location(base), Location::Frame(..)) {
+            continue;
+        }
+        if preserved(func, plan, block, start, max_end, &[], base) {
+            plan.elided[v] = true;
+        }
+    }
+}

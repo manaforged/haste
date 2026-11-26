@@ -543,10 +543,21 @@ fn fuse_int_binary_wide(
         || (matches!(alu_op, Binary::Iadd | Binary::Isub) && mem::try_fuse_madd(func, plan, info, (b_idx, pos, res), (alu_op, x, y)))
 }
 
+fn fits_add_sub_imm(plan: &Plan<Reg>, sub: bool, ty: Type, val: Value) -> bool {
+    let Some(raw) = plan.const_of(val) else { return false };
+    let simm = crate::fold::extend(raw, ty, true);
+    super::int::add_imm_parts(sub, simm).is_some() || super::int::add_imm_split_parts(sub, simm).is_some()
+}
+
+fn has_zext_uextend_imm_skip(func: &Function, plan: &Plan<Reg>, def: &dyn Fn(Value) -> Option<Inst>, (alu_op, ty, imm_val, ext_val): (Binary, Type, Value, Value)) -> bool {
+    fits_add_sub_imm(plan, alu_op == Binary::Isub, ty, imm_val)
+        && uext_inner(func, ext_val, def).is_some_and(|inner| zero_ext_loc(plan, inner))
+}
+
 fn fuse_int_binary_ext(
     func: &Function,
     plan: &mut Plan<Reg>,
-    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
     (b_idx, pos, res): (usize, usize, Value),
     (alu_op, x, y): (Binary, Value, Value),
 ) -> bool {
@@ -554,14 +565,15 @@ fn fuse_int_binary_ext(
     if !matches!(ty, Type::I32 | Type::I64) || !matches!(alu_op, Binary::Iadd | Binary::Isub) {
         return false;
     }
-    if !plan.elided[x.index()] && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), y) {
+    let def = |v| def_inst(pos_of, v);
+    if !plan.elided[x.index()] && !has_zext_uextend_imm_skip(func, plan, &def, (alu_op, ty, x, y)) && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), y) {
         peel_other_uextend(func, plan, info, (b_idx, pos, res), x);
         if alu_op == Binary::Iadd && !plan.elided[x.index()] {
             swap_ext_operand(func, plan, info, (b_idx, pos, ty), (x, y));
         }
         return true;
     }
-    alu_op == Binary::Iadd && !plan.elided[y.index()] && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), x)
+    alu_op == Binary::Iadd && !plan.elided[y.index()] && !has_zext_uextend_imm_skip(func, plan, &def, (alu_op, ty, y, x)) && try_fuse_ext_operand(func, plan, info, (b_idx, pos, ty), x)
 }
 
 fn uext_inner(func: &Function, val: Value, def: &dyn Fn(Value) -> Option<Inst>) -> Option<Value> {
@@ -586,6 +598,33 @@ fn swap_ext_operand(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (
     }
 }
 
+fn peel_binary_uextend(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, res): (usize, usize, Value),
+    (alu_op, x, y): (Binary, Value, Value),
+) {
+    let ty = func.ty(res);
+    if !matches!(ty, Type::I32 | Type::I64) {
+        return;
+    }
+    let ok = match alu_op {
+        Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor => true,
+        Binary::Band => [x, y].into_iter().any(|v| {
+            plan.const_of(v).is_some_and(|imm| super::int::encode_bitmask_imm(imm as u64, ty == Type::I64).is_some())
+        }),
+        _ => false,
+    };
+    if !ok {
+        return;
+    }
+    peel_other_uextend(func, plan, info, (b_idx, pos, res), x);
+    if !plan.elided[x.index()] || alu_op != Binary::Isub {
+        peel_other_uextend(func, plan, info, (b_idx, pos, res), y);
+    }
+}
+
 fn fuse_int_binary(
     func: &Function,
     plan: &mut Plan<Reg>,
@@ -602,6 +641,9 @@ fn fuse_int_binary(
         return;
     }
     fuse_shifted_alu(func, plan, info, (b_idx, pos, res), (alu_op, x, y));
+    if !plan.elided[x.index()] && !plan.elided[y.index()] {
+        peel_binary_uextend(func, plan, info, (b_idx, pos, res), (alu_op, x, y));
+    }
 }
 
 fn fuse_block_unary(
@@ -692,7 +734,7 @@ fn fuse_block_inst(
     }
 }
 
-pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
+pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>, lse: bool) {
     let mut uses = vec![0_u32; func.types.len()];
     let mut pos_of = vec![None; func.types.len()];
     for (b_idx, block) in func.blocks.iter().enumerate() {
@@ -708,6 +750,14 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
         for (pos, &inst) in block.insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             if let Some(res) = data.result && !plan.elided[res.index()] {
+                if lse
+                    && uses[res.index()] == 0
+                    && func.ty(res).is_small_int()
+                    && matches!(data.op, Op::AtomicRmw(op, ..) if op != crate::ir::AtomicRmwOp::Nand)
+                {
+                    plan.fused[res.index()] = true;
+                    continue;
+                }
                 fuse_block_inst(func, plan, (&uses, &pos_of), (b_idx, pos, res), &data.op);
             }
         }

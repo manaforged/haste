@@ -2,9 +2,14 @@ use anyhow::Result;
 use haste_codegen::{Arch, Os};
 
 use super::shims::{emit_main_trampoline, emit_shims, emit_stub, plan_shims};
+use super::tls::TlsLayout;
 use super::{Buf, Executable, MACH_BASE, MACH_PAGE, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym};
 
 const LOCAL_IN_TEXT: u32 = 0x010E;
+const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
+const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+const S_THREAD_LOCAL_VARIABLES: u32 = 0x13;
+const TLV_DESC_SIZE: usize = 24;
 
 struct MachMeta<'a> {
     rebase_off: usize,
@@ -44,7 +49,7 @@ fn write_meta(out: &mut Buf, m: &MachMeta<'_>) {
     }
 }
 
-fn build_dyld_info(exe: &Executable, plan: &Plan<'_>, data_in_seg: u64, rodata_in_seg: u64, single_lib: bool) -> (Vec<u8>, Vec<u8>) {
+fn build_dyld_info(exe: &Executable, plan: &Plan<'_>, data_in_seg: u64, rodata_in_seg: u64, tlv_in_seg: Option<u64>, single_lib: bool) -> (Vec<u8>, Vec<u8>) {
     let mut rebase = Buf::new();
     let mut ptrs: Vec<u64> = exe
         .pointers
@@ -60,7 +65,7 @@ fn build_dyld_info(exe: &Executable, plan: &Plan<'_>, data_in_seg: u64, rodata_i
         rebase.u8(0);
     }
     let mut bind = Buf::new();
-    if !plan.imports.is_empty() {
+    if !plan.imports.is_empty() || tlv_in_seg.is_some() {
         bind.u8(if single_lib { 0x11 } else { 0x2E });
         bind.u8(0x51);
         for (i, name) in plan.imports.iter().enumerate() {
@@ -70,6 +75,16 @@ fn build_dyld_info(exe: &Executable, plan: &Plan<'_>, data_in_seg: u64, rodata_i
             bind.u8(0);
             bind.u8(0x72);
             bind.uleb((i * 8) as u64);
+            bind.u8(0x90);
+        }
+        if let Some(off) = tlv_in_seg {
+            bind.u8(0x11);
+            bind.u8(0x40);
+            bind.bytes(exe.target.symbol_prefix.as_bytes());
+            bind.bytes(b"_tlv_bootstrap");
+            bind.u8(0);
+            bind.u8(0x72);
+            bind.uleb(off);
             bind.u8(0x90);
         }
         bind.u8(0);
@@ -99,12 +114,25 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let mut libs = vec!["/usr/lib/libSystem.B.dylib".to_owned()];
     plan.libs.iter().filter(|&&l| !l.contains(".so")).for_each(|l| libs.push(format!("@rpath/lib{l}.dylib")));
 
-    let (nsects_text, nsects_data) = if plan.imports.is_empty() { (1, 3) } else { (2, 4) };
+    let tls = if arch == Arch::Arm64 { TlsLayout::compute(&plan, exe.thread_slots) } else { TlsLayout::default() };
+    let has_tlv = tls.total > 0;
+    let (nsects_text, nsects_data) = (if plan.imports.is_empty() { 1 } else { 2 }, (if plan.imports.is_empty() { 3 } else { 4 }) + if has_tlv { 2 } else { 0 });
     let dylib_cmds: usize = libs.iter().map(|l| (24 + l.len() + 1).next_multiple_of(8)).sum();
     let sizeofcmds = 72 + (72 + nsects_text * 80) + (72 + nsects_data * 80) + 72 + 48 + 24 + 80 + 32 + 24 + 24 + dylib_cmds;
     let tramp_off = (32 + sizeofcmds + 64).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
-    let (shim_offs, head_off) = plan_shims(arch, Os::Darwin, &plan, MACH_BASE, shims_off)?;
+    let probe_addrs = SectionAddrs {
+        text: MACH_BASE,
+        thread_key: MACH_BASE,
+        tlv_desc: if has_tlv { MACH_BASE } else { 0 },
+        unwind_tls: tls.unwind_off,
+        thread_tls: tls.cells_off,
+        frame_tls: tls.frame_off,
+        unwind_table: if exe.unwind_table_off.is_some() { MACH_BASE } else { 0 },
+        unwind_walk: MACH_BASE,
+        ..SectionAddrs::default()
+    };
+    let (shim_offs, head_off) = plan_shims(arch, Os::Darwin, &plan, MACH_BASE, shims_off, probe_addrs)?;
     let post_rel = exe.text.len().next_multiple_of(16);
     let veneers = plan_veneers(exe, &plan, MACH_BASE, head_off, &shim_offs, |pre, post| (head_off + pre + post_rel + post).next_multiple_of(16))?;
     let text_off = head_off + veneers.pre_len;
@@ -115,27 +143,37 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let data_off = (data_seg_off + plan.imports.len() * 8).next_multiple_of(16);
     let rodata_off = (data_off + exe.data.len()).next_multiple_of(16);
     let dso_off = rodata_off + exe.rodata.len();
-    let bss_off = (dso_off + 8).next_multiple_of(16);
+    let tlv_vars_off = (dso_off + 8).next_multiple_of(8);
+    let data_file_end = if has_tlv { tlv_vars_off + TLV_DESC_SIZE } else { dso_off + 8 };
+    let bss_off = data_file_end.next_multiple_of(16);
     let (key_off, bss_total) = plan.bss_layout(exe.bss);
-    let data_seg_filesz = (dso_off + 8).next_multiple_of(MACH_PAGE as usize) - data_seg_off;
-    let data_seg_vmsz = (bss_off + bss_total as usize).next_multiple_of(MACH_PAGE as usize) - data_seg_off;
+    let tbss_off = (bss_off + bss_total as usize).next_multiple_of(16);
+    let data_seg_filesz = data_file_end.next_multiple_of(MACH_PAGE as usize) - data_seg_off;
+    let data_seg_vmsz = (tbss_off + if has_tlv { tls.total as usize } else { 0 }).next_multiple_of(MACH_PAGE as usize) - data_seg_off;
 
     let bss_va = MACH_BASE + bss_off as u64;
+    let rodata_va = MACH_BASE + rodata_off as u64;
+    let (unwind_table, unwind_walk) = plan.unwind_addrs(exe, rodata_va, MACH_BASE, &shim_offs);
     let addrs = SectionAddrs {
         text: MACH_BASE + text_off as u64,
-        rodata: MACH_BASE + rodata_off as u64,
+        rodata: rodata_va,
         data: MACH_BASE + data_off as u64,
         bss: bss_va,
         dso_handle: MACH_BASE + dso_off as u64,
         thread_key: bss_va + u64::from(key_off),
-        thread_tls: 0,
-        frame_tls: 0,
+        tlv_desc: if has_tlv { MACH_BASE + tlv_vars_off as u64 } else { 0 },
+        unwind_tls: tls.unwind_off,
+        thread_tls: tls.cells_off,
+        frame_tls: tls.frame_off,
+        unwind_table,
+        unwind_walk,
     };
     let stub_va = |name: &str| Ok(MACH_BASE + (stubs_off + plan.import_idx(name)? * stub_size) as u64);
     let got_va = |idx: usize| MACH_BASE + (data_seg_off + idx * 8) as u64;
     let resolve = |sym: &Symbol| resolve_sym(sym, addrs, MACH_BASE, &shim_offs, &plan, &stub_va);
 
-    let (rebase, bind) = build_dyld_info(exe, &plan, (data_off - data_seg_off) as u64, (rodata_off - data_seg_off) as u64, libs.len() == 1);
+    let tlv_in_seg = has_tlv.then_some((tlv_vars_off - data_seg_off) as u64);
+    let (rebase, bind) = build_dyld_info(exe, &plan, (data_off - data_seg_off) as u64, (rodata_off - data_seg_off) as u64, tlv_in_seg, libs.len() == 1);
     let mut strtab = vec![0u8];
     let sym_offs: Vec<u32> = plan.imports.iter().map(|n| { let o = strtab.len() as u32; strtab.extend_from_slice(exe.target.symbol_prefix.as_bytes()); strtab.extend_from_slice(n.as_bytes()); strtab.push(0); o }).collect();
     let fn_strx = exe.symbol_names(exe.target.symbol_prefix, &mut strtab);
@@ -149,7 +187,10 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let linkedit_filesz = (strtab_off + strtab.len()) - linkedit_off;
 
     let mut out = Buf::new();
-    let flags = if libs.len() == 1 { 0x0020_0085 } else { 0x0020_0005 };
+    let mut flags = if libs.len() == 1 { 0x0020_0085 } else { 0x0020_0005 };
+    if has_tlv {
+        flags |= MH_HAS_TLV_DESCRIPTORS;
+    }
     out.words(&[0xFEED_FACF, if arch == Arch::Arm64 { 0x0100_000C } else { 0x0100_0007 }, if arch == Arch::Arm64 { 0 } else { 3 }, 2, 10 + libs.len() as u32, sizeofcmds as u32, flags, 0]);
     write_seg(&mut out, "__PAGEZERO", 0, MACH_BASE, 0, 0, 0, 0);
     write_seg(&mut out, "__TEXT", MACH_BASE, text_seg_size as u64, 0, text_seg_size as u64, 5, nsects_text as u32);
@@ -163,7 +204,13 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     }
     write_sect(&mut out, "__data", "__DATA", addrs.data, exe.data.len() as u64, data_off as u32, 4, 0, 0, 0);
     write_sect(&mut out, "__const", "__DATA", addrs.rodata, (exe.rodata.len() + 8) as u64, rodata_off as u32, 4, 0, 0, 0);
+    if has_tlv {
+        write_sect(&mut out, "__thread_vars", "__DATA", addrs.tlv_desc, TLV_DESC_SIZE as u64, tlv_vars_off as u32, 3, S_THREAD_LOCAL_VARIABLES, 0, 0);
+    }
     write_sect(&mut out, "__bss", "__DATA", addrs.bss, u64::from(bss_total), 0, 4, 1, 0, 0);
+    if has_tlv {
+        write_sect(&mut out, "__thread_bss", "__DATA", MACH_BASE + tbss_off as u64, tls.total, 0, 4, S_THREAD_LOCAL_ZEROFILL, 0, 0);
+    }
     write_seg(&mut out, "__LINKEDIT", linkedit_va, linkedit_filesz.next_multiple_of(MACH_PAGE as usize) as u64, linkedit_off as u64, linkedit_filesz as u64, 1, 0);
     write_meta(&mut out, &MachMeta { rebase_off: linkedit_off, rebase: &rebase, bind_off, bind: &bind, symtab_off, indirect_off, strtab_off, strtab_len: strtab.len(), nimports: plan.imports.len(), nlocals, tramp_off, libs: &libs });
 

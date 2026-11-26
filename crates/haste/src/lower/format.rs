@@ -5,7 +5,7 @@ use crate::body::literal::string_bytes;
 use crate::body::{Expr, ExprId, List, Lit};
 use crate::names::{ItemRef, Primitive};
 use crate::sema::format::{DEFAULT_FLAGS, PRECISION_SET};
-use crate::sema::infer::{Coercion, Res, Vtable};
+use crate::sema::infer::{Res, Vtable};
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty, int_info};
 
@@ -122,10 +122,7 @@ impl Lower<'_, '_> {
         }
         let Ok(typed) = &self.reached.list[idx].1 else { return None };
         let scoped = typed.scoped(&self.cx.types);
-        scoped.coercions.values().find_map(|c| match c {
-            Coercion::Vtable(vt) => Some(vt.clone()),
-            _ => None,
-        })
+        scoped.coercions.values().find_map(|c| c.vtable().cloned())
     }
 
     fn resolve_write_str(&self, write_fmt_item: ItemRef, write_fmt_substs: Substs) -> Option<(ItemRef, Substs, Vtable)> {

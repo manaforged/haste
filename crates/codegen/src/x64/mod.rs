@@ -35,7 +35,7 @@ const REGS: Regs<Reg> = Regs {
     leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx, Reg::R11],
     wide_scratch: &wide::WIDE_SCRATCH,
     op_scratch: &[Reg::Rsi, Reg::Rdx, Reg::R11],
-    uses_scratch: atomic::uses_scratch,
+    scratch_mask: atomic::scratch_mask,
     dict: Some(Reg::R10),
     float: &float::POOL,
     float_branches: &float::BRANCHES,
@@ -82,9 +82,10 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
     let func = split.as_ref().unwrap_or(func);
     let features = Features::host();
-    let elided_before = plan.elided.iter().filter(|&&e| e).count();
+    let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
+    let dropped_before = dropped(&plan);
     let roots = location::fuse(func, &mut plan, &features);
-    if plan.elided.iter().filter(|&&e| e).count() != elided_before {
+    if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS);
@@ -117,7 +118,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
         carry: (None, None),
-        sole_pred: atomic::sole_preds(func, &copied),
+        sole_pred: bits::sole_preds(func, &copied),
         next: None,
         last_block,
         at_end: false,
@@ -144,7 +145,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
 
 /// Whether a framed function addresses its frame from rbp: it reads the frame pointer or catches an unwind.
 fn keeps_frame_pointer(func: &Function) -> bool {
-    func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
+    func.keep_fp
+        || !func.unwind_drops.is_empty()
+        || func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -223,8 +226,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.func
     }
 
-    fn is_elided(&self, value: Value) -> bool {
-        self.plan.elided[value.index()]
+    fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] }
+
+    fn zero_stack_store(&self, inst: Inst) -> Option<(i32, u32)> { crate::frame::stack_zero_store(self.func, &self.frame.slots, inst, |v| self.const_of(v)) }
+
+    fn emit_zero_frame(&mut self, offset: i32, bytes: u32) {
+        let to = self.frame_mem(offset);
+        if bytes == 8 { self.zero_to(to); } else { self.asm.store_imm_sized(Size::of(bytes), to, 0); }
     }
 
     fn prologue(&mut self) {
@@ -252,14 +260,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         intake_params(self, entry)
     }
 
-    fn set_next(&mut self, next: Option<Block>) {
-        self.next = next;
-    }
+    fn set_next(&mut self, next: Option<Block>) { self.next = next; }
 
     fn bind_block(&mut self, block: Block) {
         self.invalidate_spills();
         self.resume_spills(block);
         self.at_end = self.last_block == Some(block);
+        self.asm.flags_overwritten();
         self.asm.bind(self.blocks[block.index()]);
     }
 
@@ -269,9 +276,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.bind(self.blocks[block.index()]);
     }
 
-    fn deferred_prologue(&self) -> bool {
-        self.shrink.is_some()
-    }
+    fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
 
     fn blocks_fallthrough_to(&self, block: Block) -> bool {
         self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
@@ -389,7 +394,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         emit_stubs(&mut self)?;
         self.relocs.extend(self.asm.rips.drain(..).map(|(at, sym)| StencilReloc::symbol(at, sym, RelocKind::PcRel32)));
         self.asm.relax().apply(starts, &mut self.sites, &mut self.relocs);
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new() })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new(), lines: Vec::new(), unwind_drops: crate::frame::resolve_unwind_drops(self.func, &self.frame) })
     }
 }
 
@@ -661,7 +666,7 @@ impl Emit<'_> {
             Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot)).map(|hit| (lookup, hit)),
             _ => None,
         };
-        let held = self.reg_of(callee).filter(|reg| SAVED.contains(reg));
+        let held = self.reg_of(callee).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {
             values.push(callee);
@@ -730,6 +735,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn tails(&mut self) -> &mut Tails<'a, Label> { &mut self.tails }
     fn bind_label(&mut self, label: Label) {
         self.invalidate_spills();
+        self.asm.flags_overwritten();
         self.asm.bind(label);
     }
     fn jump_label(&mut self, label: Label) {

@@ -4,49 +4,140 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::names::{Binding, Crate as NamesCrate, Def, ItemRef, ModRef, Ns, Origin, PRIMITIVES, PerNs, Scope, Sym, Unresolved, collect::Pending};
 use crate::sema::summary::codec::{Cursor, write_u32};
 
-use super::tokens::{read_opt_u32, read_str, read_vis, write_opt_u32, write_str, write_usize, write_vis};
+use super::tokens::{read_str, read_u32s_map, read_vis, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str, write_usize, write_vis};
 use super::wire::Tables;
 
 const ORIGIN_KINDS: [Origin; 3] = [Origin::Item, Origin::Import, Origin::Glob];
+const DEF_BYTES: [usize; 4] = [8, 12, 16, 1];
 
-fn write_def(out: &mut Vec<u8>, def: Def, tables: &Tables<'_>) -> Option<()> {
+struct SliceReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SliceReader<'a> {
+    #[inline]
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    #[inline]
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self.pos.checked_add(n).context("slice overflow")?;
+        let slice = self.data.get(self.pos..end).context("unexpected eof")?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    #[inline]
+    fn u8(&mut self) -> Result<u8> {
+        let b = *self.data.get(self.pos).context("unexpected eof")?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    #[inline]
+    fn u32(&mut self) -> Result<u32> {
+        let s = self.take(4)?;
+        Ok(u32_le(s, 0))
+    }
+
+    #[inline]
+    fn syms(&mut self) -> Result<Vec<Sym>> {
+        let len = self.u32()? as usize;
+        let bytes = self.take(len.checked_mul(4).context("sym list overflow")?)?;
+        Ok(bytes.chunks_exact(4).map(|c| Sym(u32_le(c, 0))).collect())
+    }
+}
+
+fn def_tag(def: Def) -> u8 {
     match def {
-        Def::Module(m) => { out.push(0); write_u32(out, tables.local_krate(m.krate as usize)?); write_u32(out, m.module); }
-        Def::Item(i) => { out.push(1); write_u32(out, tables.local_krate(i.krate as usize)?); write_u32(out, i.file); write_u32(out, i.item); }
-        Def::Variant(i, v) => { out.push(2); write_u32(out, tables.local_krate(i.krate as usize)?); write_u32(out, i.file); write_u32(out, i.item); write_u32(out, v); }
-        Def::Primitive(p) => { out.push(3); out.push(PRIMITIVES.iter().position(|&(_, x)| x == p)? as u8); }
+        Def::Module(_) => 0,
+        Def::Item(_) => 1,
+        Def::Variant(_, _) => 2,
+        Def::Primitive(_) => 3,
+    }
+}
+
+fn write_def_payload(out: &mut Vec<u8>, def: Def, tables: &Tables<'_>) -> Option<()> {
+    match def {
+        Def::Module(m) => {
+            write_u32(out, tables.local_krate(m.krate as usize)?);
+            write_u32(out, m.module);
+        }
+        Def::Item(i) => {
+            write_u32(out, tables.local_krate(i.krate as usize)?);
+            write_u32(out, i.file);
+            write_u32(out, i.item);
+        }
+        Def::Variant(i, v) => {
+            write_u32(out, tables.local_krate(i.krate as usize)?);
+            write_u32(out, i.file);
+            write_u32(out, i.item);
+            write_u32(out, v);
+        }
+        Def::Primitive(p) => {
+            out.push(PRIMITIVES.iter().position(|&(_, x)| x == p)? as u8);
+        }
     }
     Some(())
 }
 
-fn read_def(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Def> {
+#[inline]
+fn decode_def_bytes(tag: u8, b: &[u8], remap: &[u32]) -> Result<Def> {
     let map_krate = |k: u32| remap.get(k as usize).copied().context("def crate out of bounds");
-    Ok(match cur.u8()? {
-        0 => Def::Module(ModRef { krate: map_krate(cur.u32()?)?, module: cur.u32()? }),
-        1 => Def::Item(ItemRef { krate: map_krate(cur.u32()?)?, file: cur.u32()?, item: cur.u32()? }),
-        2 => Def::Variant(ItemRef { krate: map_krate(cur.u32()?)?, file: cur.u32()?, item: cur.u32()? }, cur.u32()?),
-        3 => Def::Primitive(PRIMITIVES.get(cur.u8()? as usize).map(|&(_, p)| p).context("invalid primitive tag")?),
+    Ok(match tag {
+        0 => Def::Module(ModRef { krate: map_krate(u32_le(b, 0))?, module: u32_le(b, 4) }),
+        1 => Def::Item(ItemRef { krate: map_krate(u32_le(b, 0))?, file: u32_le(b, 4), item: u32_le(b, 8) }),
+        2 => Def::Variant(ItemRef { krate: map_krate(u32_le(b, 0))?, file: u32_le(b, 4), item: u32_le(b, 8) }, u32_le(b, 12)),
+        3 => Def::Primitive(PRIMITIVES.get(b[0] as usize).map(|&(_, p)| p).context("invalid primitive tag")?),
         _ => bail!("invalid def tag"),
     })
 }
 
-fn write_binding(out: &mut Vec<u8>, b: Binding, tables: &Tables<'_>) -> Option<()> {
-    write_def(out, b.def, tables)?;
-    write_vis(out, b.vis);
-    out.push(ORIGIN_KINDS.iter().position(|&o| o == b.origin)? as u8);
-    Some(())
+fn write_def(out: &mut Vec<u8>, def: Def, tables: &Tables<'_>) -> Option<()> {
+    out.push(def_tag(def));
+    write_def_payload(out, def, tables)
 }
 
-fn read_binding(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Binding> {
-    Ok(Binding {
-        def: read_def(cur, remap)?,
-        vis: read_vis(cur)?,
-        origin: ORIGIN_KINDS.get(cur.u8()? as usize).copied().context("invalid origin tag")?,
-    })
+fn read_def(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Def> {
+    let tag = cur.u8()?;
+    let len = *DEF_BYTES.get(tag as usize).context("invalid def tag")?;
+    decode_def_bytes(tag, cur.take(len)?, remap)
+}
+
+fn write_binding(out: &mut Vec<u8>, b: Binding, tables: &Tables<'_>) -> Option<()> {
+    let dtag = def_tag(b.def);
+    let (vtag, vis_at) = vis_tag(b.vis);
+    let otag = ORIGIN_KINDS.iter().position(|&o| o == b.origin)? as u8;
+    out.push(dtag | (vtag << 2) | (otag << 5));
+    if vtag == 5 {
+        write_u32(out, vis_at);
+    }
+    write_def_payload(out, b.def, tables)
+}
+
+#[inline]
+fn read_binding(reader: &mut SliceReader<'_>, remap: &[u32]) -> Result<Binding> {
+    let hdr = reader.u8()?;
+    let dtag = hdr & 3;
+    let vtag = (hdr >> 2) & 7;
+    let otag = (hdr >> 5) & 3;
+    let vis_len = if vtag == 5 { 4 } else { 0 };
+    let def_len = DEF_BYTES[dtag as usize];
+    let b = reader.take(vis_len + def_len)?;
+    let vis_at = if vis_len != 0 { u32_le(b, 0) } else { 0 };
+    let vis = vis_from_tag(vtag, vis_at)?;
+    let origin = ORIGIN_KINDS.get(otag as usize).copied().context("invalid origin tag")?;
+    let def = decode_def_bytes(dtag, &b[vis_len..], remap)?;
+    Ok(Binding { def, vis, origin })
 }
 
 pub(super) fn write_names_crate(out: &mut Vec<u8>, krate: &NamesCrate, tables: &mut Tables<'_>) -> Option<()> {
     write_usize(out, krate.scopes.len())?;
+    let scope_len_at = out.len();
+    write_u32(out, 0);
+    let scope_start = out.len();
     for scope in &krate.scopes {
         write_usize(out, scope.names.len())?;
         for (&sym, per) in &scope.names {
@@ -64,6 +155,9 @@ pub(super) fn write_names_crate(out: &mut Vec<u8>, krate: &NamesCrate, tables: &
             write_u32(out, tables.sym(sym));
         }
     }
+    let scope_bytes = u32::try_from(out.len() - scope_start).ok()?;
+    out[scope_len_at..scope_len_at + 4].copy_from_slice(&scope_bytes.to_le_bytes());
+
     match krate.prelude {
         Some(m) => { out.push(1); write_u32(out, tables.local_krate(m.krate as usize)?); write_u32(out, m.module); }
         None => out.push(0),
@@ -94,17 +188,17 @@ pub(super) fn write_names_crate(out: &mut Vec<u8>, krate: &NamesCrate, tables: &
         write_u32(out, p.module);
         write_u32(out, p.file);
         write_u32(out, p.import);
-        write_usize(out, p.segments.len())?;
-        for &seg in &p.segments {
-            write_u32(out, tables.sym(seg));
-        }
-        out.push(u8::from(p.absolute));
         let dollar = match p.dollar {
             Some(d) => Some(tables.local_krate(d as usize)?),
             None => None,
         };
         write_opt_u32(out, dollar);
         write_opt_u32(out, p.name.map(|s| tables.sym(s)));
+        write_usize(out, p.segments.len())?;
+        for &seg in &p.segments {
+            write_u32(out, tables.sym(seg));
+        }
+        out.push(u8::from(p.absolute));
         write_vis(out, p.vis);
         match p.stamp {
             Some((def, ver)) => { out.push(1); write_def(out, def, tables)?; write_u32(out, ver); }
@@ -127,87 +221,85 @@ pub(super) fn write_names_crate(out: &mut Vec<u8>, krate: &NamesCrate, tables: &
 
 pub(super) fn read_names_crate(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<NamesCrate> {
     let scope_len = cur.count()?;
+    let scope_byte_len = cur.count()?;
+    let scope_bytes = cur.take(scope_byte_len)?;
+    let mut reader = SliceReader::new(scope_bytes);
     let mut scopes = Vec::with_capacity(scope_len);
     for _ in 0..scope_len {
-        let name_len = cur.count()?;
+        let name_len = reader.u32()? as usize;
         let mut names = HashMap::with_capacity_and_hasher(name_len, Default::default());
         for _ in 0..name_len {
-            let sym = Sym(cur.u32()?);
-            let mask = cur.u8()?;
-            let types = if mask & 1 != 0 { Some(read_binding(cur, remap)?) } else { None };
-            let values = if mask & 2 != 0 { Some(read_binding(cur, remap)?) } else { None };
-            let macros = if mask & 4 != 0 { Some(read_binding(cur, remap)?) } else { None };
+            let b = reader.take(5)?;
+            let sym = Sym(u32_le(b, 0));
+            let mask = b[4];
+            let types = if mask & 1 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
+            let values = if mask & 2 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
+            let macros = if mask & 4 != 0 { Some(read_binding(&mut reader, remap)?) } else { None };
             names.insert(sym, PerNs { types, values, macros });
         }
-        let log_len = cur.count()?;
-        let mut log = Vec::with_capacity(log_len);
-        for _ in 0..log_len {
-            log.push(Sym(cur.u32()?));
-        }
+        let log = reader.syms()?;
         scopes.push(Scope { names, log });
     }
+    if reader.pos != scope_bytes.len() {
+        bail!("trailing bytes in sysroot scopes");
+    }
+
     let prelude = if cur.u8()? != 0 {
-        let krate = *remap.get(cur.u32()? as usize).context("prelude crate out of bounds")?;
-        Some(ModRef { krate, module: cur.u32()? })
+        let b = cur.take(8)?;
+        let krate = *remap.get(u32_le(b, 0) as usize).context("prelude crate out of bounds")?;
+        Some(ModRef { krate, module: u32_le(b, 4) })
     } else {
         None
     };
     let unres_len = cur.count()?;
-    let mut unresolved = Vec::with_capacity(unres_len);
-    for _ in 0..unres_len {
-        unresolved.push(Unresolved { file: cur.u32()?, import: cur.u32()? });
-    }
+    let unres_bytes = cur.take(unres_len.checked_mul(8).context("unresolved overflow")?)?;
+    let unresolved = unres_bytes.chunks_exact(8).map(|c| Unresolved { file: u32_le(c, 0), import: u32_le(c, 4) }).collect();
     let ext_len = cur.count()?;
     let mut externs = Vec::with_capacity(ext_len);
     for _ in 0..ext_len {
         externs.push((Sym(cur.u32()?), read_def(cur, remap)?));
     }
     let dep_len = cur.count()?;
+    let dep_bytes = cur.take(dep_len.checked_mul(8).context("names deps overflow")?)?;
     let mut deps = Vec::with_capacity(dep_len);
-    for _ in 0..dep_len {
-        let sym = Sym(cur.u32()?);
-        let dep = *remap.get(cur.u32()? as usize).context("names dep crate out of bounds")? as usize;
+    for c in dep_bytes.chunks_exact(8) {
+        let sym = Sym(u32_le(c, 0));
+        let dep = *remap.get(u32_le(c, 4) as usize).context("names dep crate out of bounds")? as usize;
         deps.push((sym, dep));
     }
     let edition_2015 = cur.u8()? != 0;
     let edition = read_str(cur)?.to_owned();
-    let coll_len = cur.count()?;
-    let mut collected = Vec::with_capacity(coll_len);
-    for _ in 0..coll_len {
-        collected.push(read_opt_u32(cur)?.map(|v| v as usize));
-    }
+    let collected = read_u32s_map(cur, |v| (v != u32::MAX).then_some(v as usize))?;
     let pend_len = cur.count()?;
     let mut pending = Vec::with_capacity(pend_len);
+    let opt_at = |b: &[u8], at: usize| {
+        let v = u32_le(b, at);
+        (v != u32::MAX).then_some(v)
+    };
     for _ in 0..pend_len {
-        let module = cur.u32()?;
-        let file = cur.u32()?;
-        let import = cur.u32()?;
-        let seg_len = cur.count()?;
-        let mut segments = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            segments.push(Sym(cur.u32()?));
-        }
-        let absolute = cur.u8()? != 0;
-        let dollar = match read_opt_u32(cur)? {
+        let b = cur.take(20)?;
+        let module = u32_le(b, 0);
+        let file = u32_le(b, 4);
+        let import = u32_le(b, 8);
+        let dollar = match opt_at(b, 12) {
             Some(d) => Some(*remap.get(d as usize).context("pending dollar crate out of bounds")?),
             None => None,
         };
-        let name = read_opt_u32(cur)?.map(Sym);
+        let name = opt_at(b, 16).map(Sym);
+        let segments = read_u32s_map(cur, Sym)?.into_boxed_slice();
+        let absolute = cur.u8()? != 0;
         let vis = read_vis(cur)?;
         let stamp = if cur.u8()? != 0 { Some((read_def(cur, remap)?, cur.u32()?)) } else { None };
         let active = cur.u8()? != 0;
-        pending.push(Pending { module, file, import, segments: segments.into_boxed_slice(), absolute, dollar, name, vis, stamp, active });
+        pending.push(Pending { module, file, import, segments, absolute, dollar, name, vis, stamp, active });
     }
     let enum_len = cur.count()?;
     let mut enums = HashMap::with_capacity_and_hasher(enum_len, Default::default());
     for _ in 0..enum_len {
-        let key = (cur.u32()?, cur.u32()?);
-        let v_len = cur.count()?;
-        let mut variants = Vec::with_capacity(v_len);
-        for _ in 0..v_len {
-            variants.push(Sym(cur.u32()?));
-        }
-        enums.insert(key, variants.into_boxed_slice());
+        let b = cur.take(8)?;
+        let key = (u32_le(b, 0), u32_le(b, 4));
+        let variants = read_u32s_map(cur, Sym)?.into_boxed_slice();
+        enums.insert(key, variants);
     }
     let eager = cur.u8()? != 0;
     let mut out = NamesCrate::default();

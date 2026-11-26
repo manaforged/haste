@@ -33,7 +33,7 @@ fn param_slot_plan(func: &Function, entry: Block) -> Option<(StackSlot, Value, V
             continue;
         }
         let stores: Vec<(Block, Inst)> = copies.iter().filter(|copy| copy.0 == slot).map(|copy| (entry, copy.2)).collect();
-        if slot_written(func, &info, slot, &stores) == Some(false) {
+        if !func.is_unwind_slot(slot) && slot_written(func, &info, slot, &stores) == Some(false) {
             return Some((slot, param, stores));
         }
     }

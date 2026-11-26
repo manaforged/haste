@@ -9,6 +9,7 @@ mod color;
 mod coroutine;
 mod copy;
 mod cse;
+mod drop_elide;
 mod emit;
 mod error;
 mod ir;
@@ -72,7 +73,8 @@ mod x64;
 
 pub use asm_text::{Assembly, assemble};
 pub use builder::{FunctionBuilder, Ins, Mark};
-pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type, Value};
+pub use drop_elide::UnwindDrop;
+pub use ir::{AbiParam, ArgumentPurpose, AtomicOrd, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type, Value};
 pub use coroutine::Coroutine;
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
@@ -90,6 +92,15 @@ pub struct Site {
     pub frame_offset: u32,
 }
 
+/// One frame-relative owned value dropped during panic unwinding when its 1-byte active flag is non-zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeUnwindDrop {
+    pub local_off: i32,
+    pub flag_off: i32,
+    pub drop_sym: u32,
+    pub indirect: bool,
+}
+
 /// Machine code for one function, its exception call sites, its stencil relocations, and its small loops.
 #[must_use]
 #[derive(Clone, Debug)]
@@ -99,12 +110,24 @@ pub struct Code {
     relocs: Vec<StencilReloc>,
     loops: Vec<Range<u32>>,
     lines: Vec<(u32, u64)>,
+    unwind_drops: Vec<CodeUnwindDrop>,
 }
 
 impl Code {
     /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, relocations, and small loop ranges.
     pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>, loops: Vec<Range<u32>>) -> Self {
-        Self { bytes, sites, relocs, loops, lines: Vec::new() }
+        Self { bytes, sites, relocs, loops, lines: Vec::new(), unwind_drops: Vec::new() }
+    }
+
+    /// Attaches frame-relative unwind drop descriptors to this `Code` buffer.
+    pub fn with_unwind_drops(mut self, unwind_drops: Vec<CodeUnwindDrop>) -> Self {
+        self.unwind_drops = unwind_drops;
+        self
+    }
+
+    /// Frame-relative unwind drop descriptors emitted for this function.
+    pub fn unwind_drops(&self) -> &[CodeUnwindDrop] {
+        &self.unwind_drops
     }
 
     /// The machine code.

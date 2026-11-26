@@ -87,13 +87,15 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
         Err(err) => bail!("{}: {err}", cx.name(*item)),
     };
     let (item, substs) = (*item, *substs);
-    if let Some(unique) = try_unique_footprint(cx, slots, item, substs, typed, index) {
+    if let Some(unique) = try_unique_footprint(cx, reached, slots, item, substs, typed, index) {
         return Ok((unique, usize::MAX));
     }
     let mut mix = HashMix::new(0x51a7_0000);
     mix.item(cx.outline, item);
     let mut cycle_root = usize::MAX;
     hash_instance_header(cx, &mut mix, (slots.low_entries(), slots.allow_inline()), item, typed)?;
+    mix.bool(crate::sema::reach::unwind_enabled(cx, reached));
+    mix.bool(reached.may_unwind(cx, index));
     match &typed.shape {
         Shape::Glue(glue) => hash_glue_shape(cx, (reached, slots), inline, &mut mix, index, substs, glue, &mut cycle_root)?,
         Shape::Untuple(target) => hash_untuple_shape(cx, (reached, slots), inline, &mut mix, index, typed, *target, &mut cycle_root)?,
@@ -110,14 +112,17 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
     Ok((mix.finish(), cycle_root))
 }
 
-fn mix_instance_flags(cx: &Context<'_>, slots: &dyn Slots, mix: &mut HashMix, krate: u32) {
+fn mix_instance_flags(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, mix: &mut HashMix, krate: u32, index: usize) {
     mix.bool(slots.low_entries());
     mix.bool(slots.allow_inline());
-    mix.bool(cx.outline.crates[krate as usize].env.overflow_checks());
+    mix.bool(cx.overflow_checks(krate));
+    mix.bool(crate::sema::reach::unwind_enabled(cx, reached));
+    mix.bool(reached.may_unwind(cx, index));
 }
 
 fn try_unique_closure_footprint(
-    cx: &Context<'_>,
+    cx: &mut Context<'_>,
+    reached: &Reached,
     slots: &dyn Slots,
     item: ItemRef,
     substs: crate::sema::substs::Substs,
@@ -139,14 +144,14 @@ fn try_unique_closure_footprint(
         mix.item(cx.outline, item);
         mix.item(cx.outline, c_def);
         mix.u32(closure_idx);
-        mix_instance_flags(cx, slots, &mut mix, c_def.krate);
+        mix_instance_flags(cx, reached, slots, &mut mix, c_def.krate, index);
     } else {
         mix.local_index(index);
     }
     Some(mix.finish())
 }
 
-fn try_unique_footprint(cx: &Context<'_>, slots: &dyn Slots, item: ItemRef, substs: crate::sema::substs::Substs, typed: &Typed, index: usize) -> Option<FootprintId> {
+fn try_unique_footprint(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, item: ItemRef, substs: crate::sema::substs::Substs, typed: &Typed, index: usize) -> Option<FootprintId> {
     if cx.foreign(item) {
         let mut mix = HashMix::new(0xff);
         mix.item(cx.outline, item);
@@ -162,14 +167,14 @@ fn try_unique_footprint(cx: &Context<'_>, slots: &dyn Slots, item: ItemRef, subs
         let mut mix = HashMix::new(0x51a7_1c01);
         mix.item(cx.outline, item);
         if matches!(typed.shape, Shape::Body) || cx.outline.is_fixed(item.krate) {
-            mix_instance_flags(cx, slots, &mut mix, item.krate);
+            mix_instance_flags(cx, reached, slots, &mut mix, item.krate, index);
         } else {
             mix.local_index(index);
         }
         return Some(mix.finish());
     }
     if let Shape::Closure(cb) = &typed.shape {
-        return try_unique_closure_footprint(cx, slots, item, substs, cb, index);
+        return try_unique_closure_footprint(cx, reached, slots, item, substs, cb, index);
     }
     None
 }
@@ -177,7 +182,7 @@ fn try_unique_footprint(cx: &Context<'_>, slots: &dyn Slots, item: ItemRef, subs
 fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, (low, allow_inline): (bool, bool), item: ItemRef, typed: &Typed) -> Result<()> {
     mix.bool(low);
     mix.bool(allow_inline);
-    mix.bool(cx.outline.crates[item.krate as usize].env.overflow_checks());
+    mix.bool(cx.overflow_checks(item.krate));
     let shape_tag = match &typed.shape {
         Shape::Body => 0,
         Shape::Glue(_) => 1,
@@ -407,7 +412,13 @@ fn hash_closure_header(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, c
     mix.usize(cb.closure.captures.len());
     for cap in &cb.closure.captures {
         mix.byte(cap.by as u8);
-        hash_ty_facts(cx, mix, typed.locals[cap.local as usize].ty)?;
+        mix.usize(cap.path.len());
+        for &(variant, index) in &cap.path {
+            mix.u32(variant);
+            mix.u32(index);
+        }
+        let cap_ty = cap.ty(cx, typed.locals[cap.local as usize].ty)?;
+        hash_ty_facts(cx, mix, cap_ty)?;
     }
     Ok(())
 }
@@ -678,6 +689,12 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
             }
             let to_ty = sub(cx, *to);
             hash_ty_facts(cx, mix, to_ty)?;
+        }
+        Coercion::Field { target, inner } => {
+            mix.byte(7);
+            let target_ty = sub(cx, *target);
+            hash_ty_facts(cx, mix, target_ty)?;
+            hash_one_coercion(cx, mix, typed, id, inner, poly)?;
         }
     }
     Ok(())

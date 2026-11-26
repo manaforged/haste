@@ -6,7 +6,7 @@ use crate::live::Live;
 use super::Location;
 
 /// The deepest chain of same-block definitions followed from a branch condition.
-const READ_DEPTH: usize = 4;
+const READ_DEPTH: usize = 8;
 
 /// What a branch needs to know to run the moves of one edge before it: the registers live into each block and the locations each branch condition reads.
 pub(crate) struct Hoist<R> {
@@ -54,14 +54,21 @@ impl<R: Copy + PartialEq> Hoist<R> {
         Self { live_in, reads }
     }
 
-    /// Whether writing the register `loc` leaves every value live into `block` and every location `condition` reads intact.
-    pub(crate) fn free(&self, loc: Location<R>, block: crate::ir::Block, condition: Value) -> bool {
-        let reads = self.reads.get(&condition).map_or(&[][..], Vec::as_slice);
-        let clash = |other: &Location<R>| match (loc, *other) {
+    fn clash(loc: Location<R>, other: Location<R>) -> bool {
+        match (loc, other) {
             (Location::Reg(a), Location::Reg(b)) => a == b,
             (Location::Float(a), Location::Float(b)) => a == b,
             _ => false,
-        };
-        self.reads.contains_key(&condition) && !self.live_in[block.index()].iter().chain(reads).any(clash)
+        }
+    }
+
+    /// Whether writing the register `loc` leaves every location `condition` reads intact.
+    pub(crate) fn reads_free(&self, loc: Location<R>, condition: Value) -> bool {
+        self.reads.get(&condition).is_some_and(|reads| !reads.iter().any(|&other| Self::clash(loc, other)))
+    }
+
+    /// Whether writing the register `loc` leaves every value live into `block` and every location `condition` reads intact.
+    pub(crate) fn free(&self, loc: Location<R>, block: crate::ir::Block, condition: Value) -> bool {
+        self.reads.get(&condition).is_some_and(|reads| !self.live_in[block.index()].iter().chain(reads).any(|&other| Self::clash(loc, other)))
     }
 }

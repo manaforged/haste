@@ -1,231 +1,16 @@
 use super::count::{counted, head_defs, outside_preds};
 use super::memset::{Emit, outside_uses, steps};
+use super::vector_shape::{Access, Kind, LANES, Shape, analyze};
 use crate::cfg::Loop;
 use crate::ir::{Binary, Block, BlockData, Convert, Function, Inst, IntCC, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Type, Unary, Value};
 
-/// Bytes, and so byte lanes, that one vector iteration covers.
-const LANES: i64 = 16;
 const VEC: Type = Type::Vec { lane: Lane::I8, count: LANES as u8 };
 const WORDS: Type = Type::Vec { lane: Lane::I16, count: (LANES / 2) as u8 };
+const QUADS: Type = Type::Vec { lane: Lane::I64, count: 2 };
 const MAX_BODY: usize = 96;
 const MAX_BLOCKS: usize = 6;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Data,
-    Mask,
-    Wide,
-}
-
-/// A parameter that adds the zero-extended byte `lane` into itself each iteration.
-#[derive(Clone, Copy)]
-struct Sum {
-    idx: usize,
-    lane: Value,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Access {
-    base: Option<Value>,
-    idx: usize,
-    off: i32,
-}
-
-struct Shape {
-    kinds: Vec<Option<Kind>>,
-    lanes: Vec<Inst>,
-    loads: Vec<Access>,
-    store: Option<Access>,
-    sums: Vec<Sum>,
-    access: Vec<(Inst, Access)>,
-    splats: Vec<Value>,
-    amounts: Vec<(Value, i64)>,
-    bounds: Vec<(usize, Value)>,
-}
-
-fn lane_binary(op: Binary) -> bool {
-    matches!(op, Binary::Iadd | Binary::Isub | Binary::Umin | Binary::Umax | Binary::Smin | Binary::Smax | Binary::Band | Binary::Bor | Binary::Bxor)
-}
-
-fn mask_binary(op: Binary) -> bool {
-    matches!(op, Binary::Band | Binary::Bor | Binary::Bxor)
-}
-
-struct Scan<'a> {
-    func: &'a Function,
-    body: &'a [Inst],
-    params: &'a [Value],
-    steps: &'a [Option<i64>],
-    defs: &'a [bool],
-    consts: &'a [Option<i64>],
-    kinds: Vec<Option<Kind>>,
-    splats: Vec<Value>,
-    amounts: Vec<(Value, i64)>,
-}
-
-impl Scan<'_> {
-    fn kind(&mut self, v: Value) -> Option<Kind> {
-        if let Some(kind) = self.kinds[v.index()] {
-            return Some(kind);
-        }
-        let fixed = self.params.iter().position(|&p| p == v).is_some_and(|i| self.steps[i] == Some(0));
-        if (self.defs[v.index()] && !fixed) || self.func.ty(v) != Type::I8 {
-            return None;
-        }
-        if !self.splats.contains(&v) {
-            self.splats.push(v);
-        }
-        Some(Kind::Data)
-    }
-
-    fn stepped(&self, addr: Value) -> Option<usize> {
-        self.params.iter().position(|&p| p == addr).filter(|&i| self.steps[i] == Some(1) && self.func.ty(addr) == Type::I64)
-    }
-
-    fn bound(&self, cond: Value) -> Option<(usize, Value)> {
-        let def = self.body.iter().map(|&i| &self.func.insts[i.index()]).find(|d| d.result == Some(cond))?;
-        let Op::Icmp(IntCC::UnsignedLessThan, at, limit) = def.op else { return None };
-        let idx = self.params.iter().position(|&p| p == at).filter(|&i| self.steps[i] == Some(1))?;
-        (!self.defs[limit.index()]).then_some((idx, limit))
-    }
-
-    fn access(&self, addr: Value, off: i32) -> Option<Access> {
-        if let Some(idx) = self.stepped(addr) {
-            return Some(Access { base: None, idx, off });
-        }
-        let def = self.body.iter().map(|&i| &self.func.insts[i.index()]).find(|d| d.result == Some(addr))?;
-        let Op::Binary(Binary::Iadd, x, y) = def.op else { return None };
-        [(x, y), (y, x)].into_iter().find_map(|(base, at)| {
-            let idx = self.stepped(at)?;
-            (!self.defs[base.index()]).then_some(Access { base: Some(base), idx, off })
-        })
-    }
-
-    fn lane(&mut self, op: &Op) -> Option<Kind> {
-        match *op {
-            Op::Binary(Binary::Ushr | Binary::Ishl, x, y) => {
-                let by = self.consts.get(y.index()).copied().flatten().filter(|by| (1..8).contains(by))?;
-                self.amounts.push((y, by));
-                (self.kind(x)? == Kind::Data).then_some(Kind::Data)
-            }
-            Op::Binary(op, x, y) if lane_binary(op) => match (self.kind(x)?, self.kind(y)?) {
-                (Kind::Data, Kind::Data) => Some(Kind::Data),
-                (Kind::Mask, Kind::Mask) if mask_binary(op) => Some(Kind::Mask),
-                _ => None,
-            },
-            Op::Icmp(cc, x, y) => match (self.kind(x)?, self.kind(y)?) {
-                (Kind::Data, Kind::Data) => Some(Kind::Mask),
-                (Kind::Mask, Kind::Mask) if matches!(cc, IntCC::Equal | IntCC::NotEqual) => Some(Kind::Mask),
-                _ => None,
-            },
-            Op::Select(c, x, y) => {
-                let (kc, kx, ky) = (self.kind(c)?, self.kind(x)?, self.kind(y)?);
-                (kc == Kind::Mask && kx == ky && kx != Kind::Wide).then_some(kx)
-            }
-            Op::Unary(Unary::Ineg, x) => (self.kind(x)? == Kind::Data).then_some(Kind::Data),
-            _ => None,
-        }
-    }
-
-    /// The accumulator that `iadd` adds a widened lane into, when `result` is its back-edge value.
-    fn sum(&self, op: &Op, result: Value, (back_args, widened): (&[Value], &[(Value, Value)])) -> Option<Sum> {
-        let Op::Binary(Binary::Iadd, x, y) = *op else { return None };
-        [(x, y), (y, x)].into_iter().find_map(|(acc, wide)| {
-            let idx = self.params.iter().position(|&p| p == acc).filter(|&i| self.steps[i].is_none() && back_args[i] == result)?;
-            let lane = widened.iter().find(|&&(w, _)| w == wide).map(|&(_, lane)| lane)?;
-            Some(Sum { idx, lane })
-        })
-    }
-
-    fn control(&self, op: &Op) -> bool {
-        let lane = |v: Value| self.kinds[v.index()].is_some();
-        match *op {
-            Op::Const(_) => true,
-            Op::Binary(Binary::Iadd | Binary::Isub, x, y) | Op::Icmp(_, x, y) => !lane(x) && !lane(y) && self.func.ty(x) != Type::I8,
-            _ => false,
-        }
-    }
-}
-
-fn shape(func: &Function, body: &[Inst], (params, back_args): (&[Value], &[Value]), (steps, defs): (&[Option<i64>], &[bool]), consts: &[Option<i64>]) -> Option<Shape> {
-    let mut scan = Scan { func, body, params, steps, defs, consts, kinds: vec![None; func.types.len()], splats: Vec::new(), amounts: Vec::new() };
-    let (mut lanes, mut loads, mut store, mut access, mut bounds) = (Vec::new(), Vec::new(), None, Vec::new(), Vec::new());
-    let (mut widened, mut sums) = (Vec::new(), Vec::<Sum>::new());
-    for &inst in body {
-        let data = &func.insts[inst.index()];
-        if matches!(data.op, Op::Assume(_)) {
-            continue;
-        }
-        if let Op::Trapz(cond) = data.op {
-            let bound = scan.bound(cond)?;
-            if !bounds.contains(&bound) {
-                bounds.push(bound);
-            }
-            continue;
-        }
-        if let Op::Store(value, addr, off) = data.op {
-            if store.is_some() || func.ty(value) != Type::I8 || scan.kind(value)? != Kind::Data {
-                return None;
-            }
-            let at = scan.access(addr, off)?;
-            store = Some(at);
-            access.push((inst, at));
-            lanes.push(inst);
-            continue;
-        }
-        let result = data.result?;
-        if let Op::Convert(Convert::Uextend, x) = data.op
-            && scan.kinds[x.index()] == Some(Kind::Data)
-        {
-            scan.kinds[result.index()] = Some(Kind::Wide);
-            widened.push((result, x));
-            continue;
-        }
-        if let Some(sum) = scan.sum(&data.op, result, (back_args, &widened)) {
-            if sums.iter().any(|s| s.idx == sum.idx) {
-                return None;
-            }
-            sums.push(sum);
-            continue;
-        }
-        if func.ty(result) != Type::I8 || (matches!(data.op, Op::Icmp(_, x, _) if func.ty(x) != Type::I8)) {
-            if !scan.control(&data.op) {
-                return None;
-            }
-            continue;
-        }
-        let kind = match data.op {
-            Op::Const(_) => {
-                scan.splats.push(result);
-                Kind::Data
-            }
-            Op::Load(addr, off) => {
-                let at = scan.access(addr, off)?;
-                loads.push(at);
-                access.push((inst, at));
-                Kind::Data
-            }
-            ref op => scan.lane(op)?,
-        };
-        scan.kinds[result.index()] = Some(kind);
-        if !matches!(data.op, Op::Const(_)) {
-            lanes.push(inst);
-        }
-    }
-    let every_sum = (0..params.len()).filter(|&i| steps[i].is_none()).all(|i| sums.iter().any(|s| s.idx == i) && single_use(func, body, params[i]));
-    if !every_sum || (store.is_none() && sums.is_empty()) {
-        return None;
-    }
-    Some(Shape { kinds: scan.kinds, lanes, loads, store, sums, access, splats: scan.splats, amounts: scan.amounts, bounds })
-}
-
-fn single_use(func: &Function, body: &[Inst], v: Value) -> bool {
-    let mut uses = 0;
-    for &inst in body {
-        func.insts[inst.index()].op.for_operands(|o| uses += usize::from(o == v));
-    }
-    uses == 1
-}
+const LO_BYTE_WEIGHTS: i64 = 0x0706_0504_0302_0100_u64 as i64;
+const HI_BYTE_WEIGHTS: i64 = 0x0F0E_0D0C_0B0A_0908_u64 as i64;
 
 /// Whether every load may run ahead of the store of the same iteration: `None` when the distance is unknown until run time.
 fn static_safe(load: Access, store: Access) -> Option<bool> {
@@ -245,6 +30,15 @@ pub(crate) fn splat_in(e: &mut Emit<'_>, ty: Type, scalar: Value) -> Value {
     e.op(Op::Shuffle(first, first, ShuffleMask::Const([0; 16])), ty)
 }
 
+fn byte_weights(e: &mut Emit<'_>) -> Value {
+    let lo = e.konst(LO_BYTE_WEIGHTS, Type::I64);
+    let hi = e.konst(HI_BYTE_WEIGHTS, Type::I64);
+    let zero = e.op(Op::Const(0), QUADS);
+    let first = e.op(Op::Insert(zero, lo, 0), QUADS);
+    let pair = e.op(Op::Insert(first, hi, 1), QUADS);
+    e.op(Op::Convert(Convert::Bitcast, pair), VEC)
+}
+
 /// The sum of the sixteen unsigned bytes of `bytes`: adjacent byte pairs into 16-bit lanes, then one horizontal add.
 fn byte_sum(e: &mut Emit<'_>, bytes: Value) -> Value {
     let words = e.op(Op::Convert(Convert::Bitcast, bytes), WORDS);
@@ -257,9 +51,6 @@ fn byte_sum(e: &mut Emit<'_>, bytes: Value) -> Value {
     let pairs = e.op(Op::Binary(Binary::Iadd, even, odd), WORDS);
     e.op(Op::Reduce(ReduceOp::Add, pairs), Type::I16)
 }
-
-/// Shifts every byte lane by `by`: a 16-bit lane shift, then a mask that clears the bits that crossed between bytes.
-const QUADS: Type = Type::Vec { lane: Lane::I64, count: 2 };
 
 /// The two `I64` partial sums of the sixteen unsigned bytes of `bytes`: `psadbw` against zero.
 fn sad_halves(e: &mut Emit<'_>, bytes: Value) -> Value {
@@ -423,6 +214,57 @@ fn add_sums(e: &mut Emit<'_>, shape: &Shape, (q, map): (&[Value], &[(Value, Valu
     out
 }
 
+/// Adds `(cnt * iv) + weighted_lane_offsets` for each masked induction-variable sum, accumulating weighted lane offsets in `accs` when `psadbw` is used.
+fn add_iv_sums(
+    e: &mut Emit<'_>,
+    shape: &Shape,
+    (q, map, weights): (&[Value], &[(Value, Value)], Value),
+    next: &mut [Value],
+    accs: Option<&[Value]>,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (i, iv_sum) in shape.iv_sums.iter().enumerate() {
+        let raw_cond = map.iter().rev().find(|&&(s, _)| s == iv_sum.cond).map(|&(_, d)| d).expect("invariant: iv sum cond mapped");
+        let mut mask = if shape.kinds[iv_sum.cond.index()] == Some(Kind::Data) {
+            let zero = e.op(Op::Const(0), VEC);
+            e.op(Op::Icmp(IntCC::NotEqual, raw_cond, zero), VEC)
+        } else {
+            raw_cond
+        };
+        if iv_sum.invert {
+            mask = e.op(Op::Unary(Unary::Bnot, mask), VEC);
+        }
+        let ones = e.op(Op::Unary(Unary::Ineg, mask), VEC);
+        let w_vec = e.op(Op::Binary(Binary::Band, mask, weights), VEC);
+        let iv_val = if iv_sum.bias == 0 {
+            q[iv_sum.iv_idx]
+        } else {
+            let bias = e.konst(iv_sum.bias, Type::I64);
+            e.op(Op::Binary(Binary::Iadd, q[iv_sum.iv_idx], bias), Type::I64)
+        };
+        match accs {
+            Some(accs) => {
+                let cnt_halves = sad_halves(e, ones);
+                let cnt = e.op(Op::Reduce(ReduceOp::Add, cnt_halves), Type::I64);
+                let term = e.op(Op::Binary(Binary::Imul, cnt, iv_val), Type::I64);
+                next[iv_sum.idx] = add_resized(e, q[iv_sum.idx], term);
+                let w_halves = sad_halves(e, w_vec);
+                out.push(e.op(Op::Binary(Binary::Iadd, accs[i], w_halves), QUADS));
+            }
+            None => {
+                let cnt8 = e.op(Op::Reduce(ReduceOp::Add, ones), Type::I8);
+                let cnt = e.op(Op::Convert(Convert::Uextend, cnt8), Type::I64);
+                let w8 = e.op(Op::Reduce(ReduceOp::Add, w_vec), Type::I8);
+                let w = e.op(Op::Convert(Convert::Uextend, w8), Type::I64);
+                let mul = e.op(Op::Binary(Binary::Imul, cnt, iv_val), Type::I64);
+                let term = e.op(Op::Binary(Binary::Iadd, mul, w), Type::I64);
+                next[iv_sum.idx] = add_resized(e, q[iv_sum.idx], term);
+            }
+        }
+    }
+    out
+}
+
 fn address(e: &mut Emit<'_>, shape: &Shape, inst: Inst, at: &[Value]) -> (Value, i32) {
     let access = shape.access.iter().find(|&&(i, _)| i == inst).map(|&(_, a)| a).expect("lane access recorded");
     (base_plus(e, access, at), access.off)
@@ -435,18 +277,13 @@ fn base_plus(e: &mut Emit<'_>, access: Access, at: &[Value]) -> Value {
     }
 }
 
-fn advance(e: &mut Emit<'_>, q: &[Value], strides: &[Option<Value>]) -> Vec<Value> {
-    let mut next = Vec::with_capacity(q.len());
-    for (&v, s) in q.iter().zip(strides) {
-        next.push(match *s {
-            Some(by) => {
-                let ty = e.func.ty(v);
-                e.op(Op::Binary(Binary::Iadd, v, by), ty)
-            }
-            None => v,
-        });
+fn advance_stepped(e: &mut Emit<'_>, q: &[Value], strides: &[Option<Value>], next: &mut [Value]) {
+    for ((&v, s), slot) in q.iter().zip(strides).zip(next) {
+        if let Some(by) = *s {
+            let ty = e.func.ty(v);
+            *slot = e.op(Op::Binary(Binary::Iadd, v, by), ty);
+        }
     }
-    next
 }
 
 /// Whether `at` through `at + LANES - 1` all stay below `bound`.
@@ -562,7 +399,7 @@ pub(super) fn run(
     if steps[count.iv_idx] != Some(1) {
         return false;
     }
-    let Some(shape) = shape(func, &body, (&params, back_args), (&steps, &defs), global_consts) else { return false };
+    let Some(shape) = analyze(func, &body, (&params, back_args), (&steps, &defs), global_consts) else { return false };
     if shape.store.is_some_and(|store| shape.loads.iter().any(|&l| static_safe(l, store) == Some(false))) {
         return false;
     }
@@ -592,14 +429,21 @@ pub(super) fn run(
         .zip(&steps)
         .map(|(&v, &s)| s.filter(|&s| s != 0).map(|s| { let ty = e.func.ty(v); e.konst(s * LANES, ty) }))
         .collect();
-    let zeros: Vec<Value> = if sad { shape.sums.iter().map(|_| e.op(Op::Const(0), QUADS)).collect() } else { Vec::new() };
+    let weights = (!shape.iv_sums.is_empty()).then(|| byte_weights(&mut e));
+    let quad_count = if sad { shape.sums.len() + shape.iv_sums.len() } else { 0 };
+    let zeros: Vec<Value> = (0..quad_count).map(|_| e.op(Op::Const(0), QUADS)).collect();
     let pre_insts = std::mem::take(&mut e.out);
     let left = e.func.value(Type::I64);
     let accs: Vec<Value> = zeros.iter().map(|_| e.func.value(QUADS)).collect();
     let ends: Vec<Value> = zeros.iter().map(|_| e.func.value(QUADS)).collect();
     let map = lane_body(&mut e, &shape, (&q, &splats));
-    let mut next = advance(&mut e, &q, &strides);
-    let accs_next = add_sums(&mut e, &shape, (&q, &map), &mut next, sad.then_some(&accs[..]));
+    let mut next = q.clone();
+    let mut accs_next = add_sums(&mut e, &shape, (&q, &map), &mut next, sad.then_some(&accs[..]));
+    if let Some(weights) = weights {
+        let iv_accs = sad.then(|| &accs[shape.sums.len()..]);
+        accs_next.extend(add_iv_sums(&mut e, &shape, (&q, &map, weights), &mut next, iv_accs));
+    }
+    advance_stepped(&mut e, &q, &strides, &mut next);
     let one = e.konst(1, Type::I64);
     let rest = e.op(Op::Binary(Binary::Isub, left, one), Type::I64);
     let zero = e.konst(0, Type::I64);
@@ -608,7 +452,13 @@ pub(super) fn run(
     let mut r_sum = r.clone();
     for (sum, &end) in shape.sums.iter().zip(&ends) {
         let total = e.op(Op::Reduce(ReduceOp::Add, end), Type::I64);
-        r_sum[sum.idx] = add_resized(&mut e, r[sum.idx], total);
+        r_sum[sum.idx] = add_resized(&mut e, r_sum[sum.idx], total);
+    }
+    if sad {
+        for (iv_sum, &end) in shape.iv_sums.iter().zip(&ends[shape.sums.len()..]) {
+            let total = e.op(Op::Reduce(ReduceOp::Add, end), Type::I64);
+            r_sum[iv_sum.idx] = add_resized(&mut e, r_sum[iv_sum.idx], total);
+        }
     }
     let done = e.op(Op::Icmp(IntCC::Equal, r_sum[lp.iv], lp.limit), Type::I8);
     let leave = exit_values(&mut e, &lp, &r_sum, exit_args);

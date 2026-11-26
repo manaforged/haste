@@ -25,6 +25,7 @@ impl Cursor<'_> {
             (Style::Expr, Some((end, Frag::Path))) => Style::Fragment(end),
             _ => style,
         };
+        let start = self.at;
         let qself = if self.punct("<") { Some(self.qself()?) } else { None };
         let global = qself.is_none() && self.eat("::");
         let mut segments = Vec::new();
@@ -39,7 +40,7 @@ impl Cursor<'_> {
             self.at += 2;
         }
         let segments = self.list(&segments);
-        Ok(self.push_path(Path { qself, global, segments }))
+        Ok(self.push_path(Path { qself, global, start, segments }))
     }
 
     fn qself(&mut self) -> Result<(super::TyId, Option<PathId>)> {

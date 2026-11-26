@@ -23,12 +23,47 @@ pub enum Coercion {
     Autos,
     /// A pointer to a trait object becomes a pointer to a trait object of a supertrait, whose vtable this slot of the old one holds.
     Upcast(u32),
+    /// A multi-field struct coerces to `target` by applying `inner` to its unsized pointer field.
+    Field { target: Ty, inner: Box<Coercion> },
 }
 
 impl Coercion {
-    /// Whether the coerced value is a pointer that carries metadata after its address.
+    /// Whether the coerced value is a single wide pointer that carries metadata after its address.
     pub fn widens(&self) -> bool {
-        !matches!(self, Coercion::Reify(_) | Coercion::Deref(..))
+        !matches!(self, Coercion::Reify(_) | Coercion::Deref(..) | Coercion::Field { .. })
+    }
+
+    /// The underlying pointer coercion, unwrapping any multi-field struct wrapper.
+    pub fn leaf(&self) -> &Self {
+        match self {
+            Coercion::Field { inner, .. } => inner.leaf(),
+            other => other,
+        }
+    }
+
+    /// Consumes this coercion and returns its underlying pointer coercion.
+    pub fn into_leaf(self) -> Self {
+        match self {
+            Coercion::Field { inner, .. } => inner.into_leaf(),
+            other => other,
+        }
+    }
+
+    /// The trait-object vtable built by this coercion, if any.
+    pub fn vtable(&self) -> Option<&Vtable> {
+        match self.leaf() {
+            Coercion::Vtable(vt) => Some(vt),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the trait-object vtable built by this coercion, if any.
+    pub fn vtable_mut(&mut self) -> Option<&mut Vtable> {
+        match self {
+            Coercion::Vtable(vt) => Some(vt),
+            Coercion::Field { inner, .. } => inner.vtable_mut(),
+            _ => None,
+        }
     }
 }
 
@@ -40,7 +75,12 @@ impl Infer<'_, '_> {
             (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) => self.pointer_coercion((found, expected), (from, a), (to, b)),
             (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => {
                 let (from, to) = (self.cx.types.substs(from).to_vec(), self.cx.types.substs(to).to_vec());
-                self.unsize_args(&from, &to)
+                let Some(coercion) = self.unsize_args(&from, &to)? else { return Ok(None) };
+                if self.single_pointer_adt(found)? {
+                    Ok(Some(coercion.into_leaf()))
+                } else {
+                    Ok(Some(Coercion::Field { target: expected, inner: Box::new(coercion.into_leaf()) }))
+                }
             }
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
                 let args = self.cx.types.substs(substs).to_vec();
@@ -64,6 +104,73 @@ impl Infer<'_, '_> {
         self.may_implement(of, found, &[expected])
     }
 
+    fn single_pointer_adt(&mut self, ty: Ty) -> Result<bool> {
+        let mut cur = self.resolve(ty);
+        for _ in 0..RECURSION_LIMIT {
+            match self.cx.types.kind(cur).clone() {
+                Kind::Ref(..) | Kind::Ptr(..) => return Ok(true),
+                Kind::Pat(base, ..) => cur = self.resolve(base),
+                Kind::Adt(item, args) => {
+                    if self.cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
+                        return Ok(false);
+                    }
+                    let slice = self.cx.types.substs(args).to_vec();
+                    let fields = self.adt_fields(item, &slice)?;
+                    let Some(variant) = fields.first() else {
+                        return Ok(false);
+                    };
+                    let mut non_zst = None;
+                    for &field in variant {
+                        if self.is_zero_sized(field)? {
+                            continue;
+                        }
+                        if non_zst.is_some() {
+                            return Ok(false);
+                        }
+                        non_zst = Some(field);
+                    }
+                    let Some(only) = non_zst else {
+                        return Ok(false);
+                    };
+                    cur = self.resolve(only);
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_zero_sized(&mut self, ty: Ty) -> Result<bool> {
+        let mut stack = vec![ty];
+        let mut steps = 0;
+        while let Some(next) = stack.pop() {
+            steps += 1;
+            if steps > RECURSION_LIMIT {
+                return Ok(false);
+            }
+            match self.cx.types.kind(self.resolve(next)).clone() {
+                Kind::Tuple(items) => stack.extend(self.cx.types.substs(items).iter().copied()),
+                Kind::Array(elem, len) => {
+                    if self.cx.types.len(len) != Some(0) {
+                        stack.push(elem);
+                    }
+                }
+                Kind::Adt(item, args) => {
+                    if self.cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
+                        return Ok(false);
+                    }
+                    let slice = self.cx.types.substs(args).to_vec();
+                    let fields = self.adt_fields(item, &slice)?;
+                    if let Some(variant) = fields.first() {
+                        stack.extend(variant.iter().copied());
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     fn unsize_args(&mut self, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {
         let Some((at, unsize)) = self.unsized_arg(from, to)? else {
             return Ok(None);
@@ -78,8 +185,13 @@ impl Infer<'_, '_> {
             if let Some(unsize) = self.unsize_pointee(a, b)? {
                 return Ok(Some((at, unsize)));
             }
-            let nested = matches!((self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b))), (Kind::Adt(x, _), Kind::Adt(y, _)) if x == y);
-            if nested && let Some(unsize) = self.coercion(a, b)? {
+            let (ka, kb) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+            let unsize = match (ka, kb) {
+                (Kind::Ref(from, p1) | Kind::Ptr(from, p1), Kind::Ref(to, p2) | Kind::Ptr(to, p2)) => self.unsize_pointer((from, p1), (to, p2))?,
+                (Kind::Adt(x, _), Kind::Adt(y, _)) if x == y => self.coercion(a, b)?,
+                _ => None,
+            };
+            if let Some(unsize) = unsize {
                 return Ok(Some((at, unsize)));
             }
         }
@@ -87,16 +199,21 @@ impl Infer<'_, '_> {
     }
 
     fn pointer_coercion(&mut self, (found, expected): (Ty, Ty), (from, a): (Mut, Ty), (to, b): (Mut, Ty)) -> Result<Option<Coercion>> {
-        let unsize = self.unsize_pointee(a, b)?;
+        let unsize = self.unsize_pointer((from, a), (to, b))?;
         let loosens = from == Mut::Not && to == Mut::Mut;
-        if unsize.is_some() && loosens {
-            bail!("cannot coerce a shared pointer to a mutable one");
-        }
         let both_refs = matches!(self.cx.types.kind(found), Kind::Ref(..)) && matches!(self.cx.types.kind(expected), Kind::Ref(..));
         match unsize {
             None if both_refs && !loosens => self.deref_coercion(a, b, to),
             unsize => Ok(unsize),
         }
+    }
+
+    fn unsize_pointer(&mut self, (from, a): (Mut, Ty), (to, b): (Mut, Ty)) -> Result<Option<Coercion>> {
+        let unsize = self.unsize_pointee(a, b)?;
+        if unsize.is_some() && from == Mut::Not && to == Mut::Mut {
+            bail!("cannot coerce a shared pointer to a mutable one");
+        }
+        Ok(unsize)
     }
 
     fn deref_coercion(&mut self, from: Ty, to: Ty, mutability: Mut) -> Result<Option<Coercion>> {
@@ -203,7 +320,10 @@ impl Infer<'_, '_> {
             return false;
         }
         let args = &substs[1..];
-        let known_holds = self.compiler_decides(of, self_ty)
+        let known_holds = (self.cx.lang(of) == Some("unsize")
+            && args.first().is_some_and(|&to| !self.has_vars(to))
+            && self.unsize_holds(of, self_ty, args[0]).unwrap_or(false))
+            || self.compiler_decides(of, self_ty)
             || self.compiler_impl(of, self_ty)
             || self.object_holds(of, self_ty, args) == Some(true);
         !known_holds && self.probe(|infer| infer.may_implement(of, self_ty, args).ok() == Some(false))
@@ -241,6 +361,165 @@ impl Infer<'_, '_> {
         self.unify(ret, out)
     }
 
+    /// The type both branches coerce to when they differ: an unsized slice, a function pointer, or one branch's reference or pointer of the same type, such as a `Box`, that the other coerces to.
+    pub(super) fn branch_target(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
+        if let Some(target) = self.slice_branch(a, b) {
+            return Ok(Some(target));
+        }
+        if let Some(target) = self.fn_branch(a, b)? {
+            return Ok(Some(target));
+        }
+        let (ka, kb) = (self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b)));
+        let pointers = match (ka, kb) {
+            (Kind::Ref(..), Kind::Ref(..)) => true,
+            (Kind::Adt(x, _), Kind::Adt(y, _)) => x == y,
+            _ => false,
+        };
+        if !pointers {
+            return Ok(None);
+        }
+        if self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.is_some() {
+            return Ok(Some(a));
+        }
+        Ok(self.trial(|infer| Ok(infer.coercion(a, b).ok().flatten()))?.map(|_| b))
+    }
+
+    /// The branch type that the other branch unsizes to, when one branch points to an array and the other to a slice.
+    fn slice_branch(&self, a: Ty, b: Ty) -> Option<Ty> {
+        let pointee = |ty: Ty| match self.cx.types.kind(self.resolve(ty)) {
+            Kind::Ref(_, inner) | Kind::Ptr(_, inner) => Some(self.cx.types.kind(self.resolve(*inner)).clone()),
+            _ => None,
+        };
+        match (pointee(a)?, pointee(b)?) {
+            (Kind::Array(..), Kind::Slice(_)) => Some(b),
+            (Kind::Slice(_), Kind::Array(..)) => Some(a),
+            _ => None,
+        }
+    }
+
+    fn fn_def_ptr(&mut self, item: ItemRef, substs: super::super::substs::Substs) -> Result<Ty> {
+        let slice = self.cx.types.substs(substs).to_vec();
+        let (params, ret) = self.fn_types(item, &slice)?;
+        Ok(self.cx.types.fn_ptr(&params, ret))
+    }
+
+    fn non_cap_closure_sig(&mut self, ty: Ty) -> Result<Option<(Vec<Ty>, Ty)>> {
+        let (inputs, output, captures) = self.closure_sig(ty)?;
+        Ok((!captures).then_some((inputs, output)))
+    }
+
+    /// The function pointer type both branches reify to for distinct function items, non-capturing closures, or a function pointer.
+    fn fn_branch(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
+        let (a, b) = (self.resolve(a), self.resolve(b));
+        let (a_kind, b_kind) = (self.cx.types.kind(a).clone(), self.cx.types.kind(b).clone());
+        match (&a_kind, &b_kind) {
+            (Kind::FnDef(..), Kind::FnPtr(..)) => Ok(Some(b)),
+            (Kind::FnPtr(..), Kind::FnDef(..)) => Ok(Some(a)),
+            (Kind::Closure(..), Kind::FnPtr(..)) => Ok(self.non_cap_closure_sig(a)?.map(|_| b)),
+            (Kind::FnPtr(..), Kind::Closure(..)) => Ok(self.non_cap_closure_sig(b)?.map(|_| a)),
+            (Kind::FnDef(item, substs), Kind::FnDef(..)) if a_kind != b_kind => self.fn_def_ptr(*item, *substs).map(Some),
+            (Kind::FnDef(item, substs), Kind::Closure(..)) => Ok(self.non_cap_closure_sig(b)?.is_some().then(|| self.fn_def_ptr(*item, *substs)).transpose()?),
+            (Kind::Closure(..), Kind::FnDef(item, substs)) => Ok(self.non_cap_closure_sig(a)?.is_some().then(|| self.fn_def_ptr(*item, *substs)).transpose()?),
+            (Kind::Closure(..), Kind::Closure(..)) if a_kind != b_kind => {
+                let (Some((in_a, out_a)), Some((in_b, out_b))) = (self.non_cap_closure_sig(a)?, self.non_cap_closure_sig(b)?) else {
+                    return Ok(None);
+                };
+                if in_a.len() != in_b.len() {
+                    return Ok(None);
+                }
+                let params: Vec<Ty> = in_a.iter().zip(&in_b).map(|(&x, &y)| if self.has_vars(x) && !self.has_vars(y) { y } else { x }).collect();
+                let ret = if self.has_vars(out_a) && !self.has_vars(out_b) { out_b } else { out_a };
+                Ok(Some(self.cx.types.fn_ptr(&params, ret)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn shared_pointer(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
+        let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+        let (shared, inner, other) = match (a, b) {
+            (Kind::Ptr(x, inner), Kind::Ptr(y, other)) if x != y => (Kind::Ptr(Mut::Not, inner), inner, other),
+            (Kind::Ref(x, inner), Kind::Ref(y, other)) if x != y => (Kind::Ref(Mut::Not, inner), inner, other),
+            _ => return Ok(None),
+        };
+        self.unify(inner, other)?;
+        Ok(Some(self.cx.types.intern(shared)))
+    }
+
+    /// Deduces a callable `FnPtr` signature from a trait object's supertraits when the object's principal trait is not itself a callable lang trait.
+    pub(super) fn dyn_callable_super_sig(&mut self, ty: Ty) -> Result<Option<Ty>> {
+        let ty = self.resolve(ty);
+        let Kind::Dyn(of, parts, members, _) = self.cx.types.kind(ty).clone() else {
+            return Ok(None);
+        };
+        if self.is_callable_trait(of) {
+            return Ok(None);
+        }
+        let (obj_output, init_substs) = {
+            let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), &members);
+            let obj_output = bound.find(|&(m, _)| self.cx.name(m) == "Output").map(|(_, out)| out);
+            let init_substs = std::iter::once(ty).chain(given.iter().copied()).collect::<Vec<Ty>>();
+            (obj_output, init_substs)
+        };
+        let mut queue = vec![(of, init_substs, 0u32)];
+        let mut seen = Vec::new();
+        while let Some((trait_of, substs, depth)) = queue.pop() {
+            if depth >= 8 || seen.contains(&trait_of) {
+                continue;
+            }
+            seen.push(trait_of);
+            for ((parent, parent_substs), bindings) in self.super_bindings(trait_of, &substs)? {
+                if self.is_callable_trait(parent)
+                    && let Some(&tuple) = parent_substs.get(1)
+                    && let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(tuple))
+                {
+                    let inputs = self.cx.types.substs(inputs).to_vec();
+                    let output = if self.is_async_callable_trait(parent) {
+                        self.fresh(Kind::Var)
+                    } else {
+                        bindings
+                            .into_iter()
+                            .find(|(name, _)| name == "Output")
+                            .map(|(_, out)| out)
+                            .or(obj_output)
+                            .unwrap_or_else(|| self.fresh(Kind::Var))
+                    };
+                    return Ok(Some(self.cx.types.fn_ptr(&inputs, output)));
+                }
+                queue.push((parent, parent_substs, depth + 1));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Unifies `found` and `target` for structural/identity `as` casts that cannot be primitive conversions (such as `Result<(), _>`).
+    pub(super) fn finish_identity_cast(&mut self, found: Ty, target: Ty) -> Result<()> {
+        let (f, t) = (self.resolve(found), self.resolve(target));
+        let (fk, tk) = (self.cx.types.kind(f), self.cx.types.kind(t));
+        let structural = matches!(
+            (fk, tk),
+            (Kind::Adt(a, _), Kind::Adt(b, _)) if a == b
+        ) || matches!(
+            (fk, tk),
+            (Kind::Tuple(_), Kind::Tuple(_))
+                | (Kind::Array(..), Kind::Array(..))
+                | (Kind::Slice(_), Kind::Slice(_))
+                | (Kind::FnPtr(..), Kind::FnPtr(..))
+                | (Kind::Never, _)
+                | (Kind::Var(_), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Slice(_) | Kind::FnPtr(..))
+        );
+        if structural {
+            self.unify(f, t)?;
+            return self.settle_pending();
+        }
+        if let (Kind::Ref(m1, _), Kind::Ref(m2, _)) = (fk, tk)
+            && (*m1 == *m2 || *m2 == Mut::Not)
+        {
+            return self.coerce(f, t);
+        }
+        Ok(())
+    }
+
     /// The coercion `coercion` once its types are known.
     pub(super) fn zonk_coercion(&mut self, coercion: Coercion) -> Result<Coercion> {
         match coercion {
@@ -255,6 +534,7 @@ impl Infer<'_, '_> {
                 }
                 Ok(Coercion::Deref(zonked, self.zonk(to)))
             }
+            Coercion::Field { target, inner } => Ok(Coercion::Field { target: self.zonk(target), inner: Box::new(self.zonk_coercion(*inner)?) }),
         }
     }
 }

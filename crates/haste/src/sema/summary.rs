@@ -224,7 +224,7 @@ fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> Summa
 
 fn prepare_summary(cx: &mut Context<'_>, item: ItemRef, summary: &mut PolySummary) -> Result<()> {
     for c in summary.template.coercions.values() {
-        if let Coercion::Vtable(vt) = c
+        if let Some(vt) = c.vtable()
             && (cx.types.has_params(vt.ty) || cx.types.has_params(vt.object))
         {
             bail!("parametric vtable coercion");
@@ -301,7 +301,7 @@ fn extract_call_holes(cx: &Context<'_>, summary: &mut PolySummary) {
         }
     }
     for &(_, ref c) in tpl.coercions.as_slice() {
-        if let Coercion::Vtable(vt) = c {
+        if let Some(vt) = c.vtable() {
             for r in vt.calls() {
                 if let Res::Fn(i, s) = r {
                     fixed.push((*i, *s));

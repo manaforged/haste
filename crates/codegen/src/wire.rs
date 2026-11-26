@@ -1,10 +1,10 @@
 use crate::ir::{
-    AbiParam, ArgumentPurpose, AtomicRmwOp, Binary, Block, BlockData, CallConv, Convert, FloatCC, Function, Inst, InstData, IntCC, Lane, Op, ReduceOp,
+    AbiParam, ArgumentPurpose, AtomicOrd, AtomicRmwOp, Binary, Block, BlockData, CallConv, Convert, FloatCC, Function, Inst, InstData, IntCC, Lane, Op, ReduceOp,
     ShuffleMask, SigRef, Signature, SlotData, StackSlot, TargetOpId, TinyArgs, Type, Unary, Value,
 };
 use crate::reloc::RuntimeSymbol;
 
-const FORMAT: u8 = 2;
+const FORMAT: u8 = 4;
 
 macro_rules! table {
     ($name:ident: $ty:ident = [$($variant:ident),* $(,)?]) => {
@@ -111,6 +111,15 @@ impl Function {
             w.u32(*sym);
             w.raw(bytes);
         }
+        w.byte(u8::from(self.keep_fp));
+        w.len(self.unwind_drops.len());
+        for u in &self.unwind_drops {
+            w.u32(u.local.0);
+            w.i64(i64::from(u.local_off));
+            w.u32(u.flag.0);
+            w.u32(u.drop_sym);
+            w.byte(u8::from(u.indirect));
+        }
         w.u32(self.cfg_rev);
         Some(w.0)
     }
@@ -144,6 +153,19 @@ impl Function {
         func.vtable_slots = (0..vtable_slots).map(|_| Some((r.u32()?, i32::try_from(r.i64()?).ok()?, r.u32()?, r.flag()?))).collect::<Option<_>>()?;
         let rodata = r.len()?;
         func.rodata_bytes = (0..rodata).map(|_| Some((r.u32()?, r.raw()?.to_vec()))).collect::<Option<_>>()?;
+        func.keep_fp = r.flag()?;
+        let unwind_drops = r.len()?;
+        func.unwind_drops = (0..unwind_drops)
+            .map(|_| {
+                Some(crate::UnwindDrop {
+                    local: r.slot()?,
+                    local_off: i32::try_from(r.i64()?).ok()?,
+                    flag: r.slot()?,
+                    drop_sym: r.u32()?,
+                    indirect: r.flag()?,
+                })
+            })
+            .collect::<Option<_>>()?;
         func.cfg_rev = r.u32()?;
         (r.at == bytes.len()).then_some(func)
     }
@@ -333,14 +355,24 @@ impl Writer {
                 self.u32(slot.0);
                 self.i64(i64::from(*offset));
             }
-            Op::AtomicLoad(x) => {
+            Op::AtomicLoad(x, ord) => {
                 self.byte(22);
+                self.byte(*ord as u8);
                 self.value(*x);
             }
-            Op::AtomicStore(x, y) => self.pair(23, 0, (*x, *y)),
-            Op::AtomicRmw(rmw, x, y) => self.pair(24, *rmw as u8, (*x, *y)),
-            Op::AtomicCas(a, b, c) => self.values3(25, (*a, *b, *c)),
-            Op::Fence => self.byte(26),
+            Op::AtomicStore(x, y, ord) => self.pair(23, *ord as u8, (*x, *y)),
+            Op::AtomicRmw(rmw, ord, x, y) => {
+                self.pair(24, *rmw as u8, (*x, *y));
+                self.byte(*ord as u8);
+            }
+            Op::AtomicCas(ord, a, b, c) => {
+                self.values3(25, (*a, *b, *c));
+                self.byte(*ord as u8);
+            }
+            Op::Fence(ord) => {
+                self.byte(26);
+                self.byte(*ord as u8);
+            }
             Op::FramePointer => self.byte(27),
             Op::Copy(a, b, c) => self.values3(28, (*a, *b, *c)),
             Op::Move(x, y, bytes) => {
@@ -615,20 +647,26 @@ impl<'a> Reader<'a> {
             19 => Op::StackAddr(self.slot()?, self.i32()?),
             20 => Op::StackLoad(self.slot()?, self.i32()?),
             21 => Op::StackStore(self.value()?, self.slot()?, self.i32()?),
-            22 => Op::AtomicLoad(self.value()?),
+            22 => {
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
+                Op::AtomicLoad(self.value()?, ord)
+            }
             23 => {
-                let (x, y) = self.plain_pair()?;
-                Op::AtomicStore(x, y)
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
+                let (x, y) = (self.value()?, self.value()?);
+                Op::AtomicStore(x, y, ord)
             }
             24 => {
                 let (rmw, x, y) = self.pair(RMW)?;
-                Op::AtomicRmw(rmw, x, y)
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
+                Op::AtomicRmw(rmw, ord, x, y)
             }
             25 => {
                 let (a, b, c) = self.values3()?;
-                Op::AtomicCas(a, b, c)
+                let ord = AtomicOrd::from_u8(self.byte()?)?;
+                Op::AtomicCas(ord, a, b, c)
             }
-            26 => Op::Fence,
+            26 => Op::Fence(AtomicOrd::from_u8(self.byte()?)?),
             27 => Op::FramePointer,
             28 => {
                 let (a, b, c) = self.values3()?;

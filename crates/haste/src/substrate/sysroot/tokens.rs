@@ -6,7 +6,7 @@ use rustc_lexer::{Base, DocStyle, LiteralKind, TokenKind};
 use crate::graph::cfg::Cfg;
 use crate::outline::item::{Attr, Import, Item, ItemKind, Items, Leaf, Vis};
 use crate::outline::rules::{Frag, Meta, Op, Piece, Rule};
-use crate::outline::source::{Mark, Origins, Token, opens};
+use crate::outline::source::{Mark, Origins, Token};
 use crate::sema::summary::codec::{Cursor, write_u32, write_u32s};
 use crate::substrate::{bytes_to_path, path_to_bytes};
 
@@ -24,12 +24,41 @@ const ITEM_KINDS: [ItemKind; 17] = [
 const SIMPLE_TOKENS: [TokenKind; 38] = [
     TokenKind::Whitespace, TokenKind::Ident, TokenKind::InvalidIdent, TokenKind::RawIdent, TokenKind::ForcedKeywordIdent,
     TokenKind::UnknownPrefix, TokenKind::UnknownPrefixLifetime, TokenKind::RawLifetime, TokenKind::GuardedStrPrefix,
-    TokenKind::Semi, TokenKind::Comma, TokenKind::Dot, TokenKind::OpenParen, TokenKind::CloseParen,
-    TokenKind::OpenBrace, TokenKind::CloseBrace, TokenKind::OpenBracket, TokenKind::CloseBracket,
+    TokenKind::Semi, TokenKind::Comma, TokenKind::Dot,
     TokenKind::At, TokenKind::Pound, TokenKind::Tilde, TokenKind::Question, TokenKind::Colon, TokenKind::Dollar,
     TokenKind::Eq, TokenKind::Bang, TokenKind::Lt, TokenKind::Gt, TokenKind::Minus, TokenKind::And, TokenKind::Or,
     TokenKind::Plus, TokenKind::Star, TokenKind::Slash, TokenKind::Caret, TokenKind::Percent, TokenKind::Unknown, TokenKind::Eof,
+    TokenKind::OpenParen, TokenKind::CloseParen, TokenKind::OpenBrace, TokenKind::CloseBrace, TokenKind::OpenBracket, TokenKind::CloseBracket,
 ];
+
+#[inline]
+pub(super) fn u32_le(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+pub(super) fn read_u32s_map<T>(cur: &mut Cursor<'_>, mut f: impl FnMut(u32) -> T) -> Result<Vec<T>> {
+    let count = cur.count()?;
+    let byte_len = count.checked_mul(4).context("u32 slice overflow")?;
+    let bytes = cur.take(byte_len)?;
+    Ok(bytes.chunks_exact(4).map(|c| f(u32_le(c, 0))).collect())
+}
+
+pub(super) fn read_paths(cur: &mut Cursor<'_>) -> Result<Vec<PathBuf>> {
+    let count = cur.count()?;
+    let mut paths = Vec::with_capacity(count);
+    for _ in 0..count {
+        paths.push(read_path(cur)?);
+    }
+    Ok(paths)
+}
+
+pub(super) fn write_paths(out: &mut Vec<u8>, paths: &[PathBuf]) -> Option<()> {
+    write_usize(out, paths.len())?;
+    for path in paths {
+        write_path(out, path)?;
+    }
+    Some(())
+}
 
 pub(super) fn write_str(out: &mut Vec<u8>, s: &str) -> Option<()> {
     write_u32(out, u32::try_from(s.len()).ok()?);
@@ -68,16 +97,39 @@ pub(super) fn write_usize(out: &mut Vec<u8>, val: usize) -> Option<()> {
     Some(())
 }
 
-fn write_opt_doc(out: &mut Vec<u8>, doc: Option<DocStyle>) {
-    out.push(match doc {
+pub(super) fn vis_tag(vis: Vis) -> (u8, u32) {
+    match vis {
+        Vis::Private => (0, 0),
+        Vis::Pub => (1, 0),
+        Vis::Crate => (2, 0),
+        Vis::Super => (3, 0),
+        Vis::SelfMod => (4, 0),
+        Vis::In(at) => (5, at),
+    }
+}
+
+pub(super) fn vis_from_tag(tag: u8, at: u32) -> Result<Vis> {
+    Ok(match tag {
+        0 => Vis::Private,
+        1 => Vis::Pub,
+        2 => Vis::Crate,
+        3 => Vis::Super,
+        4 => Vis::SelfMod,
+        5 => Vis::In(at),
+        _ => bail!("invalid vis tag"),
+    })
+}
+
+fn doc_bits(doc: Option<DocStyle>) -> u16 {
+    match doc {
         None => 0,
         Some(DocStyle::Outer) => 1,
         Some(DocStyle::Inner) => 2,
-    });
+    }
 }
 
-fn read_opt_doc(cur: &mut Cursor<'_>) -> Result<Option<DocStyle>> {
-    Ok(match cur.u8()? {
+fn doc_from_bits(bits: u16) -> Result<Option<DocStyle>> {
+    Ok(match bits {
         0 => None,
         1 => Some(DocStyle::Outer),
         2 => Some(DocStyle::Inner),
@@ -85,142 +137,251 @@ fn read_opt_doc(cur: &mut Cursor<'_>) -> Result<Option<DocStyle>> {
     })
 }
 
-fn write_base(out: &mut Vec<u8>, base: Base) {
-    out.push(BASE_KINDS.iter().position(|&b| b == base).unwrap_or(0) as u8);
+fn base_bits(base: Base) -> u16 {
+    BASE_KINDS.iter().position(|&b| b == base).unwrap_or(0) as u16
 }
 
-fn read_base(cur: &mut Cursor<'_>) -> Result<Base> {
-    BASE_KINDS.get(cur.u8()? as usize).copied().context("invalid literal base")
+fn encode_token(kind: TokenKind, pair: u32) -> Option<(u16, u32)> {
+    let simple = match kind {
+        TokenKind::Whitespace => 0,
+        TokenKind::Ident => 1,
+        TokenKind::InvalidIdent => 2,
+        TokenKind::RawIdent => 3,
+        TokenKind::ForcedKeywordIdent => 4,
+        TokenKind::UnknownPrefix => 5,
+        TokenKind::UnknownPrefixLifetime => 6,
+        TokenKind::RawLifetime => 7,
+        TokenKind::GuardedStrPrefix => 8,
+        TokenKind::Semi => 9,
+        TokenKind::Comma => 10,
+        TokenKind::Dot => 11,
+        TokenKind::At => 12,
+        TokenKind::Pound => 13,
+        TokenKind::Tilde => 14,
+        TokenKind::Question => 15,
+        TokenKind::Colon => 16,
+        TokenKind::Dollar => 17,
+        TokenKind::Eq => 18,
+        TokenKind::Bang => 19,
+        TokenKind::Lt => 20,
+        TokenKind::Gt => 21,
+        TokenKind::Minus => 22,
+        TokenKind::And => 23,
+        TokenKind::Or => 24,
+        TokenKind::Plus => 25,
+        TokenKind::Star => 26,
+        TokenKind::Slash => 27,
+        TokenKind::Caret => 28,
+        TokenKind::Percent => 29,
+        TokenKind::Unknown => 30,
+        TokenKind::Eof => 31,
+        TokenKind::OpenParen => 32,
+        TokenKind::CloseParen => 33,
+        TokenKind::OpenBrace => 34,
+        TokenKind::CloseBrace => 35,
+        TokenKind::OpenBracket => 36,
+        TokenKind::CloseBracket => 37,
+        TokenKind::LineComment { doc_style } => return Some((38 | (doc_bits(doc_style) << 6), u32::MAX)),
+        TokenKind::BlockComment { doc_style, terminated } => {
+            return Some((39 | ((doc_bits(doc_style) | (u16::from(terminated) << 2)) << 6), u32::MAX));
+        }
+        TokenKind::Frontmatter { has_invalid_preceding_whitespace, invalid_infostring } => {
+            let flags = u16::from(has_invalid_preceding_whitespace) | (u16::from(invalid_infostring) << 1);
+            return Some((40 | (flags << 6), u32::MAX));
+        }
+        TokenKind::Lifetime { starts_with_number } => return Some((41 | (u16::from(starts_with_number) << 6), u32::MAX)),
+        TokenKind::Literal { kind, suffix_start } => {
+            let (tag, payload) = match kind {
+                LiteralKind::Int { base, empty_int } => (42, base_bits(base) | (u16::from(empty_int) << 2)),
+                LiteralKind::Float { base, empty_exponent } => (43, base_bits(base) | (u16::from(empty_exponent) << 2)),
+                LiteralKind::Char { terminated } => (44, u16::from(terminated)),
+                LiteralKind::Byte { terminated } => (45, u16::from(terminated)),
+                LiteralKind::Str { terminated } => (46, u16::from(terminated)),
+                LiteralKind::ByteStr { terminated } => (47, u16::from(terminated)),
+                LiteralKind::CStr { terminated } => (48, u16::from(terminated)),
+                LiteralKind::RawStr { n_hashes } => (49, n_hashes.map_or(256, u16::from)),
+                LiteralKind::RawByteStr { n_hashes } => (50, n_hashes.map_or(256, u16::from)),
+                LiteralKind::RawCStr { n_hashes } => (51, n_hashes.map_or(256, u16::from)),
+            };
+            return Some((tag | (payload << 6), suffix_start));
+        }
+    };
+    Some((simple, pair))
 }
 
-fn write_opt_u8(out: &mut Vec<u8>, val: Option<u8>) {
-    match val {
-        Some(v) => { out.push(1); out.push(v); }
-        None => out.push(0),
+fn raw_hashes(payload: u16) -> Result<Option<u8>> {
+    if payload > 256 {
+        bail!("invalid raw literal hash count");
     }
+    Ok((payload < 256).then_some(payload as u8))
 }
 
-fn read_opt_u8(cur: &mut Cursor<'_>) -> Result<Option<u8>> {
-    Ok(if cur.u8()? != 0 { Some(cur.u8()?) } else { None })
-}
-
-fn write_literal_kind(out: &mut Vec<u8>, kind: LiteralKind) {
-    match kind {
-        LiteralKind::Int { base, empty_int } => { out.push(0); write_base(out, base); out.push(u8::from(empty_int)); }
-        LiteralKind::Float { base, empty_exponent } => { out.push(1); write_base(out, base); out.push(u8::from(empty_exponent)); }
-        LiteralKind::Char { terminated } => { out.push(2); out.push(u8::from(terminated)); }
-        LiteralKind::Byte { terminated } => { out.push(3); out.push(u8::from(terminated)); }
-        LiteralKind::Str { terminated } => { out.push(4); out.push(u8::from(terminated)); }
-        LiteralKind::ByteStr { terminated } => { out.push(5); out.push(u8::from(terminated)); }
-        LiteralKind::CStr { terminated } => { out.push(6); out.push(u8::from(terminated)); }
-        LiteralKind::RawStr { n_hashes } => { out.push(7); write_opt_u8(out, n_hashes); }
-        LiteralKind::RawByteStr { n_hashes } => { out.push(8); write_opt_u8(out, n_hashes); }
-        LiteralKind::RawCStr { n_hashes } => { out.push(9); write_opt_u8(out, n_hashes); }
-    }
-}
-
-fn read_literal_kind(cur: &mut Cursor<'_>) -> Result<LiteralKind> {
-    Ok(match cur.u8()? {
-        0 => LiteralKind::Int { base: read_base(cur)?, empty_int: cur.u8()? != 0 },
-        1 => LiteralKind::Float { base: read_base(cur)?, empty_exponent: cur.u8()? != 0 },
-        2 => LiteralKind::Char { terminated: cur.u8()? != 0 },
-        3 => LiteralKind::Byte { terminated: cur.u8()? != 0 },
-        4 => LiteralKind::Str { terminated: cur.u8()? != 0 },
-        5 => LiteralKind::ByteStr { terminated: cur.u8()? != 0 },
-        6 => LiteralKind::CStr { terminated: cur.u8()? != 0 },
-        7 => LiteralKind::RawStr { n_hashes: read_opt_u8(cur)? },
-        8 => LiteralKind::RawByteStr { n_hashes: read_opt_u8(cur)? },
-        9 => LiteralKind::RawCStr { n_hashes: read_opt_u8(cur)? },
-        _ => bail!("invalid literal kind tag"),
+fn decode_complex_token(tag: usize, payload: u16, extra: u32) -> Result<TokenKind> {
+    Ok(match tag {
+        38 => TokenKind::LineComment { doc_style: doc_from_bits(payload)? },
+        39 => TokenKind::BlockComment { doc_style: doc_from_bits(payload & 3)?, terminated: payload & 4 != 0 },
+        40 => TokenKind::Frontmatter { has_invalid_preceding_whitespace: payload & 1 != 0, invalid_infostring: payload & 2 != 0 },
+        41 => TokenKind::Lifetime { starts_with_number: payload != 0 },
+        42..=51 => {
+            let kind = match tag {
+                42 => LiteralKind::Int { base: BASE_KINDS[(payload & 3) as usize], empty_int: payload & 4 != 0 },
+                43 => LiteralKind::Float { base: BASE_KINDS[(payload & 3) as usize], empty_exponent: payload & 4 != 0 },
+                44 => LiteralKind::Char { terminated: payload != 0 },
+                45 => LiteralKind::Byte { terminated: payload != 0 },
+                46 => LiteralKind::Str { terminated: payload != 0 },
+                47 => LiteralKind::ByteStr { terminated: payload != 0 },
+                48 => LiteralKind::CStr { terminated: payload != 0 },
+                49 => LiteralKind::RawStr { n_hashes: raw_hashes(payload)? },
+                50 => LiteralKind::RawByteStr { n_hashes: raw_hashes(payload)? },
+                51 => LiteralKind::RawCStr { n_hashes: raw_hashes(payload)? },
+                _ => unreachable!(),
+            };
+            TokenKind::Literal { kind, suffix_start: extra }
+        }
+        _ => bail!("invalid token kind tag"),
     })
 }
 
-pub(super) fn write_token(out: &mut Vec<u8>, token: Token) {
-    if let Some(pos) = SIMPLE_TOKENS.iter().position(|&k| k == token.kind) {
-        out.push(pos as u8);
-    } else {
-        match token.kind {
-            TokenKind::LineComment { doc_style } => { out.push(38); write_opt_doc(out, doc_style); }
-            TokenKind::BlockComment { doc_style, terminated } => { out.push(39); write_opt_doc(out, doc_style); out.push(u8::from(terminated)); }
-            TokenKind::Frontmatter { has_invalid_preceding_whitespace, invalid_infostring } => {
-                out.push(40);
-                out.push(u8::from(has_invalid_preceding_whitespace) | (u8::from(invalid_infostring) << 1));
-            }
-            TokenKind::Lifetime { starts_with_number } => { out.push(41); out.push(u8::from(starts_with_number)); }
-            TokenKind::Literal { kind, suffix_start } => { out.push(42); write_literal_kind(out, kind); write_u32(out, suffix_start); }
-            _ => {}
-        }
-    }
-    let (len, pair) = token.raw();
-    write_u32(out, token.start);
-    write_u32(out, len);
-    if opens(token.kind) || closes(token.kind) {
-        write_u32(out, pair);
-    }
-}
+pub(crate) const TOKEN_WIRE_LEN: usize = 14;
 
-fn closes(kind: TokenKind) -> bool {
-    matches!(kind, TokenKind::CloseParen | TokenKind::CloseBrace | TokenKind::CloseBracket)
-}
-
-pub(super) fn read_token(cur: &mut Cursor<'_>) -> Result<Token> {
-    let tag = cur.u8()?;
-    let kind = if let Some(&simple) = SIMPLE_TOKENS.get(tag as usize) {
-        simple
-    } else {
-        match tag {
-            38 => TokenKind::LineComment { doc_style: read_opt_doc(cur)? },
-            39 => TokenKind::BlockComment { doc_style: read_opt_doc(cur)?, terminated: cur.u8()? != 0 },
-            40 => {
-                let flags = cur.u8()?;
-                TokenKind::Frontmatter { has_invalid_preceding_whitespace: flags & 1 != 0, invalid_infostring: flags & 2 != 0 }
-            }
-            41 => TokenKind::Lifetime { starts_with_number: cur.u8()? != 0 },
-            42 => TokenKind::Literal { kind: read_literal_kind(cur)?, suffix_start: cur.u32()? },
-            _ => bail!("invalid token kind tag"),
-        }
-    };
-    let start = cur.u32()?;
-    let len = cur.u32()?;
-    let pair = if opens(kind) || closes(kind) { cur.u32()? } else { u32::MAX };
-    Ok(Token::from_raw(kind, start, len, pair))
-}
-
-pub(super) fn write_frag(out: &mut Vec<u8>, frag: Frag) {
-    out.push(FRAG_KINDS.iter().position(|&f| f == frag).unwrap_or(0) as u8);
-}
-
-pub(super) fn read_frag(cur: &mut Cursor<'_>) -> Result<Frag> {
-    FRAG_KINDS.get(cur.u8()? as usize).copied().context("invalid fragment tag")
-}
-
-pub(super) fn write_mark(out: &mut Vec<u8>, mark: Mark, to_local: &[Option<u32>]) -> Option<()> {
-    match mark {
-        Mark::Crate(k) => { out.push(0); write_u32(out, (*to_local.get(k as usize)?)?); }
-        Mark::Home { krate, file, item } => {
-            out.push(1);
-            write_u32(out, (*to_local.get(krate as usize)?)?);
-            write_u32(out, file);
-            write_u32(out, item);
-        }
-        Mark::Scope { id, parent } => { out.push(2); write_u32(out, id); write_u32(out, parent); }
+pub(super) fn write_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Option<()> {
+    write_usize(out, tokens.len())?;
+    out.reserve(tokens.len() * TOKEN_WIRE_LEN);
+    for &token in tokens {
+        let (len, pair) = token.raw();
+        let (code, extra) = encode_token(token.kind, pair)?;
+        out.extend_from_slice(&code.to_le_bytes());
+        write_u32(out, token.start);
+        write_u32(out, len);
+        write_u32(out, extra);
     }
     Some(())
 }
 
-pub(super) fn read_mark(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Mark> {
+/// Decodes `count` wire-encoded tokens from `bytes`.
+pub(crate) fn decode_tokens_slice(bytes: &[u8], count: usize) -> Result<Vec<Token>> {
+    let expected = count.checked_mul(TOKEN_WIRE_LEN).context("token stream overflow")?;
+    if bytes.len() != expected {
+        bail!("token stream byte length mismatch");
+    }
+    let mut tokens = Vec::with_capacity(count);
+    for c in bytes.chunks_exact(TOKEN_WIRE_LEN) {
+        let code = u16::from_le_bytes([c[0], c[1]]);
+        let tag = (code & 0x3f) as usize;
+        let start = u32_le(c, 2);
+        let len = u32_le(c, 6);
+        let extra = u32_le(c, 10);
+        if tag < SIMPLE_TOKENS.len() {
+            tokens.push(Token::from_raw(SIMPLE_TOKENS[tag], start, len, extra));
+        } else {
+            let kind = decode_complex_token(tag, code >> 6, extra)?;
+            tokens.push(Token::from_raw(kind, start, len, u32::MAX));
+        }
+    }
+    Ok(tokens)
+}
+
+pub(super) fn frag_tag(frag: Frag) -> u8 {
+    FRAG_KINDS.iter().position(|&f| f == frag).unwrap_or(0) as u8
+}
+
+pub(super) fn frag_from_tag(tag: u8) -> Result<Frag> {
+    FRAG_KINDS.get(tag as usize).copied().context("invalid fragment tag")
+}
+
+pub(super) fn write_frag(out: &mut Vec<u8>, frag: Frag) {
+    out.push(frag_tag(frag));
+}
+
+fn read_frag(cur: &mut Cursor<'_>) -> Result<Frag> {
+    frag_from_tag(cur.u8()?)
+}
+
+pub(super) fn write_marks(out: &mut Vec<u8>, marks: &[(u32, Mark)], to_local: &[Option<u32>]) -> Option<()> {
+    write_usize(out, marks.len())?;
+    let len_at = out.len();
+    write_u32(out, 0);
+    let body_start = out.len();
+    out.reserve(marks.len() * 13);
+    for &(at, mark) in marks {
+        write_u32(out, at);
+        match mark {
+            Mark::Crate(k) => {
+                out.push(0);
+                write_u32(out, (*to_local.get(k as usize)?)?);
+            }
+            Mark::Home { krate, file, item } => {
+                out.push(1);
+                write_u32(out, (*to_local.get(krate as usize)?)?);
+                write_u32(out, file);
+                write_u32(out, item);
+            }
+            Mark::Scope { id, parent } => {
+                out.push(2);
+                write_u32(out, id);
+                write_u32(out, parent);
+            }
+        }
+    }
+    let byte_len = u32::try_from(out.len() - body_start).ok()?;
+    out[len_at..len_at + 4].copy_from_slice(&byte_len.to_le_bytes());
+    Some(())
+}
+
+pub(super) fn read_marks(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(u32, Mark)>> {
     const CACHED_SCOPE_BIT: u32 = 1 << 31;
     let map_scope = |s: u32| if s == 0 { 0 } else { s | CACHED_SCOPE_BIT };
-    Ok(match cur.u8()? {
-        0 => Mark::Crate(*remap.get(cur.u32()? as usize).context("mark crate out of bounds")?),
-        1 => Mark::Home {
-            krate: *remap.get(cur.u32()? as usize).context("mark home crate out of bounds")?,
-            file: cur.u32()?,
-            item: cur.u32()?,
-        },
-        2 => Mark::Scope { id: map_scope(cur.u32()?), parent: map_scope(cur.u32()?) },
-        _ => bail!("invalid mark tag"),
-    })
+    let count = cur.count()?;
+    let byte_len = cur.count()?;
+    let data = cur.take(byte_len)?;
+    if count.saturating_mul(9) > data.len() {
+        bail!("mark count exceeds byte length");
+    }
+    let mut marks = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    while marks.len() < count && pos + 17 <= data.len() {
+        let b = &data[pos..pos + 17];
+        let at = u32_le(b, 0);
+        let mark = match b[4] {
+            0 => {
+                pos += 9;
+                Mark::Crate(*remap.get(u32_le(b, 5) as usize).context("mark crate out of bounds")?)
+            }
+            1 => {
+                pos += 17;
+                Mark::Home {
+                    krate: *remap.get(u32_le(b, 5) as usize).context("mark home crate out of bounds")?,
+                    file: u32_le(b, 9),
+                    item: u32_le(b, 13),
+                }
+            }
+            2 => {
+                pos += 13;
+                Mark::Scope { id: map_scope(u32_le(b, 5)), parent: map_scope(u32_le(b, 9)) }
+            }
+            _ => bail!("invalid mark tag"),
+        };
+        marks.push((at, mark));
+    }
+    let mut tail = Cursor::new(&data[pos..]);
+    while marks.len() < count {
+        let at = tail.u32()?;
+        let mark = match tail.u8()? {
+            0 => Mark::Crate(*remap.get(tail.u32()? as usize).context("mark crate out of bounds")?),
+            1 => Mark::Home {
+                krate: *remap.get(tail.u32()? as usize).context("mark home crate out of bounds")?,
+                file: tail.u32()?,
+                item: tail.u32()?,
+            },
+            2 => Mark::Scope { id: map_scope(tail.u32()?), parent: map_scope(tail.u32()?) },
+            _ => bail!("invalid mark tag"),
+        };
+        marks.push((at, mark));
+    }
+    if pos + tail.pos != data.len() {
+        bail!("trailing bytes in sysroot marks");
+    }
+    Ok(marks)
 }
 
 pub(super) fn write_origins(out: &mut Vec<u8>, origins: &Origins) -> Option<()> {
@@ -240,35 +401,25 @@ pub(super) fn read_origins(cur: &mut Cursor<'_>) -> Result<Origins> {
         0 => Origins::Read,
         1 => {
             let count = cur.count()?;
-            let mut pairs = Vec::with_capacity(count);
-            for _ in 0..count { pairs.push((cur.u32()?, cur.u32()?)); }
-            Origins::Copied(pairs)
+            let bytes = cur.take(count.checked_mul(8).context("origins overflow")?)?;
+            Origins::Copied(bytes.chunks_exact(8).map(|c| (u32_le(c, 0), u32_le(c, 4))).collect())
         }
         _ => bail!("invalid origins tag"),
     })
 }
 
 pub(super) fn write_vis(out: &mut Vec<u8>, vis: Vis) {
-    match vis {
-        Vis::Private => out.push(0),
-        Vis::Pub => out.push(1),
-        Vis::Crate => out.push(2),
-        Vis::Super => out.push(3),
-        Vis::SelfMod => out.push(4),
-        Vis::In(at) => { out.push(5); write_u32(out, at); }
+    let (tag, at) = vis_tag(vis);
+    out.push(tag);
+    if tag == 5 {
+        write_u32(out, at);
     }
 }
 
 pub(super) fn read_vis(cur: &mut Cursor<'_>) -> Result<Vis> {
-    Ok(match cur.u8()? {
-        0 => Vis::Private,
-        1 => Vis::Pub,
-        2 => Vis::Crate,
-        3 => Vis::Super,
-        4 => Vis::SelfMod,
-        5 => Vis::In(cur.u32()?),
-        _ => bail!("invalid vis tag"),
-    })
+    let tag = cur.u8()?;
+    let at = if tag == 5 { cur.u32()? } else { 0 };
+    vis_from_tag(tag, at)
 }
 
 fn write_cfg(out: &mut Vec<u8>, cfg: &Cfg) -> Option<()> {
@@ -354,29 +505,47 @@ fn read_attrs(cur: &mut Cursor<'_>) -> Result<Vec<Attr>> {
 pub(super) fn write_items(out: &mut Vec<u8>, items: &Items) -> Option<()> {
     write_attrs(out, &items.inner)?;
     write_usize(out, items.items.len())?;
+    out.reserve(items.items.len() * 30);
     for item in &items.items {
+        let (vtag, vis_at) = vis_tag(item.vis);
+        let has_attrs = u8::from(!item.attrs.is_empty()) << 7;
         out.push(ITEM_KINDS.iter().position(|&k| k == item.kind)? as u8);
+        out.push(vtag | has_attrs);
         write_opt_u32(out, item.name);
-        write_vis(out, item.vis);
-        write_attrs(out, &item.attrs)?;
         write_u32(out, item.lead);
         write_u32(out, item.start);
         write_u32(out, item.end);
         write_opt_u32(out, item.body);
         write_opt_u32(out, item.parent);
+        write_u32(out, vis_at);
+    }
+    for item in &items.items {
+        if !item.attrs.is_empty() {
+            write_attrs(out, &item.attrs)?;
+        }
     }
     write_usize(out, items.imports.len())?;
+    let total_paths: usize = items.imports.iter().map(|i| i.path.len()).sum();
+    write_usize(out, total_paths)?;
+    out.reserve(items.imports.len() * 13 + total_paths * 4);
     for import in &items.imports {
+        let (leaf_tag, alias) = match import.leaf {
+            Leaf::Name(alias) => (0u8, alias.unwrap_or(u32::MAX)),
+            Leaf::Underscore => (1u8, u32::MAX),
+            Leaf::Glob => (2u8, u32::MAX),
+        };
+        out.push(leaf_tag | (u8::from(import.absolute) << 2));
         write_u32(out, import.item);
-        out.push(u8::from(import.absolute));
-        write_u32s(out, &import.path);
-        match import.leaf {
-            Leaf::Name(alias) => { out.push(0); write_opt_u32(out, alias); }
-            Leaf::Underscore => out.push(1),
-            Leaf::Glob => out.push(2),
+        write_u32(out, alias);
+        write_usize(out, import.path.len())?;
+    }
+    for import in &items.imports {
+        for &seg in &import.path {
+            write_u32(out, seg);
         }
     }
     write_usize(out, items.marks.len())?;
+    out.reserve(items.marks.len() * 5);
     for &(at, bits) in &items.marks {
         write_u32(out, at);
         out.push(bits);
@@ -387,40 +556,65 @@ pub(super) fn write_items(out: &mut Vec<u8>, items: &Items) -> Option<()> {
 pub(super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
     let inner = read_attrs(cur)?;
     let item_count = cur.count()?;
+    let item_bytes = cur.take(item_count.checked_mul(30).context("items overflow")?)?;
     let mut items = Vec::with_capacity(item_count);
-    for _ in 0..item_count {
-        let kind = ITEM_KINDS.get(cur.u8()? as usize).copied().context("invalid item kind tag")?;
+    let mut attr_indices = Vec::new();
+    let opt_at = |b: &[u8], at: usize| {
+        let v = u32_le(b, at);
+        (v != u32::MAX).then_some(v)
+    };
+    for (idx, b) in item_bytes.chunks_exact(30).enumerate() {
+        let kind = ITEM_KINDS.get(b[0] as usize).copied().context("invalid item kind tag")?;
+        let flags = b[1];
+        let vis = vis_from_tag(flags & 0x7f, u32_le(b, 26))?;
+        if flags & 0x80 != 0 {
+            attr_indices.push(idx);
+        }
         items.push(Item {
             kind,
-            name: read_opt_u32(cur)?,
-            vis: read_vis(cur)?,
-            attrs: read_attrs(cur)?,
-            lead: cur.u32()?,
-            start: cur.u32()?,
-            end: cur.u32()?,
-            body: read_opt_u32(cur)?,
-            parent: read_opt_u32(cur)?,
+            name: opt_at(b, 2),
+            vis,
+            attrs: Vec::new(),
+            lead: u32_le(b, 6),
+            start: u32_le(b, 10),
+            end: u32_le(b, 14),
+            body: opt_at(b, 18),
+            parent: opt_at(b, 22),
         });
     }
+    for idx in attr_indices {
+        items[idx].attrs = read_attrs(cur)?;
+    }
     let import_count = cur.count()?;
+    let total_paths = cur.count()?;
+    let import_bytes = cur.take(import_count.checked_mul(13).context("imports overflow")?)?;
+    let path_bytes = cur.take(total_paths.checked_mul(4).context("import paths overflow")?)?;
     let mut imports = Vec::with_capacity(import_count);
-    for _ in 0..import_count {
-        let item = cur.u32()?;
-        let absolute = cur.u8()? != 0;
-        let path = cur.u32s()?;
-        let leaf = match cur.u8()? {
-            0 => Leaf::Name(read_opt_u32(cur)?),
+    let mut path_pos = 0usize;
+    for b in import_bytes.chunks_exact(13) {
+        let flags = b[0];
+        let item = u32_le(b, 1);
+        let alias = u32_le(b, 5);
+        let path_len = u32_le(b, 9) as usize;
+        let path_byte_len = path_len.checked_mul(4).context("import path length overflow")?;
+        let path_end = path_pos.checked_add(path_byte_len).context("import path overflow")?;
+        let seg_slice = path_bytes.get(path_pos..path_end).context("import path out of bounds")?;
+        path_pos = path_end;
+        let path = seg_slice.chunks_exact(4).map(|p| u32_le(p, 0)).collect();
+        let leaf = match flags & 3 {
+            0 => Leaf::Name((alias != u32::MAX).then_some(alias)),
             1 => Leaf::Underscore,
             2 => Leaf::Glob,
             _ => bail!("invalid import leaf tag"),
         };
-        imports.push(Import { item, absolute, path, leaf });
+        imports.push(Import { item, absolute: flags & 4 != 0, path, leaf });
+    }
+    if path_pos != path_bytes.len() {
+        bail!("trailing bytes in import paths");
     }
     let mark_count = cur.count()?;
-    let mut marks = Vec::with_capacity(mark_count);
-    for _ in 0..mark_count {
-        marks.push((cur.u32()?, cur.u8()?));
-    }
+    let mark_bytes = cur.take(mark_count.checked_mul(5).context("item marks overflow")?)?;
+    let marks = mark_bytes.chunks_exact(5).map(|c| (u32_le(c, 0), c[4])).collect();
     Ok(Items { inner, items, imports, marks })
 }
 
@@ -507,7 +701,7 @@ fn read_pieces(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Piece>> {
                 let inner = read_pieces(cur, remap)?;
                 let sep = if cur.u8()? != 0 { Some((cur.u32()?, cur.u32()?)) } else { None };
                 let op = OP_KINDS.get(cur.u8()? as usize).copied().context("invalid repeat op")?;
-                let slots = cur.u32s()?.into_boxed_slice();
+                let slots = read_u32s_map(cur, |v| v)?.into_boxed_slice();
                 Piece::Repeat(inner, sep, op, slots)
             }
             _ => bail!("invalid piece tag"),

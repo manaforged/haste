@@ -765,6 +765,6 @@ fn position(run: Run<'_>, site: Site, input: (u32, u32), out: &mut Tokens) {
         Builtin::Line => out.lexed(&format!("{}u32", src.line(at))),
         Builtin::Column => out.lexed(&format!("{}u32", src.column(at))),
         Builtin::File => out.lexed(&format!("{:?}", src.path.display().to_string())),
-        _ => out.lexed(&format!("{:?}", run.src.spelled(input))),
+        _ => out.lexed(&format!("{:?}", crate::outline::build::spelled_fragment(run.src, input))),
     }
 }

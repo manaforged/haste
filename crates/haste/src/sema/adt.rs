@@ -1,17 +1,21 @@
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use rustc_abi::{Align, FieldsShape, Integer, IntegerType, LayoutCalculator, NicheOptimizations, ReprFlags, ReprOptions, TargetDataLayout};
+use rustc_hash::FxHashMap as HashMap;
 use rustc_index::{Idx, IndexVec};
 
 use crate::names::{ItemRef, Primitive};
 use crate::outline::attr::{repr_words, split_commas};
-use crate::outline::item::{Attr, ItemKind};
+use crate::outline::item::{Attr, ItemKind, mark};
 use crate::outline::source::Source;
+use crate::outline::tree::{Env, Truth};
 
 use super::Context;
 use super::infer::field_types;
 use super::layout::{Field, Layout, Variant};
+use super::lookups::ActiveAttrs;
 use super::ty::Kind;
 
 const REPR_INTS: [(&str, Primitive); 12] = {
@@ -41,10 +45,12 @@ impl<'a> Context<'a> {
 
     /// The `#[repr]` options of `item`, written directly or through a `cfg_attr` that holds.
     pub fn repr(&self, item: ItemRef) -> ReprOptions {
-        let (src, entry) = self.item(item);
-        let mut repr = ReprOptions::default();
-        read_repr_words(src, repr_words(src, &entry.attrs, &self.outline.crates[item.krate as usize].env), &mut repr);
-        repr
+        self.store.lookups.reprs.get_or_insert_with(item, || {
+            let (src, entry) = self.item(item);
+            let mut repr = ReprOptions::default();
+            read_repr_words(src, repr_words(src, &entry.attrs, &self.outline.crates[item.krate as usize].env), &mut repr);
+            repr
+        })
     }
 
 
@@ -61,7 +67,31 @@ impl<'a> Context<'a> {
 
     /// The value of `#[lang = "..."]` on `item`.
     pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
-        self.attr_value(item, "lang")
+        if item.outer().is_some() {
+            let (src, entry) = self.item(item);
+            let at = active_attr_at(&self.outline.crates[item.krate as usize].env, src, &entry.attrs, "lang")?;
+            return Some(src.text(at + 2).trim_matches('"'));
+        }
+        let map = self.store.lookups.lang_items.get_or_init(|| self.build_lang_map());
+        let &val = map.get(&item)?;
+        Some(self.file(item).source.text(val).trim_matches('"'))
+    }
+
+    fn build_lang_map(&self) -> HashMap<ItemRef, u32> {
+        let mut map = HashMap::default();
+        let lang_bit = mark("lang");
+        for (krate, tree) in self.outline.crates.iter().enumerate() {
+            for (file, entry) in tree.files.iter().enumerate() {
+                for &(at, bits) in &entry.items.marks {
+                    if bits & lang_bit != 0
+                        && let Some(attr_tok) = active_attr_at(&tree.env, &entry.source, &entry.items.items[at as usize].attrs, "lang")
+                    {
+                        map.insert(ItemRef { krate: krate as u32, file: file as u32, item: at }, attr_tok + 2);
+                    }
+                }
+            }
+        }
+        map
     }
 
     /// The symbol that the foreign `item` links to: its `#[link_name]` with escapes read and without the leading `\u{1}` that asks for the name verbatim, else its own name.
@@ -83,6 +113,16 @@ impl<'a> Context<'a> {
         self.attr_at(item, "thread_local").is_some()
     }
 
+    /// Whether arithmetic overflow checks are enabled for crate `krate`.
+    pub fn overflow_checks(&self, krate: u32) -> bool {
+        self.outline.crates[krate as usize].env.overflow_checks()
+    }
+
+    /// Whether the function `item` carries `#[track_caller]`.
+    pub fn track_caller(&self, item: ItemRef) -> bool {
+        self.attr_at(item, "track_caller").is_some()
+    }
+
     /// Whether the function `item` is `#[inline(always)]`.
     pub fn inline_always(&self, item: ItemRef) -> bool {
         self.attr_at(item, "inline").is_some_and(|at| self.item(item).0.text(at + 2) == "always")
@@ -95,16 +135,18 @@ impl<'a> Context<'a> {
 
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
     pub(super) fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
-        let file = self.file(item);
-        let index = item.outer().map_or(item.item, |(_, index)| index);
-        if !file.items.may_carry(index, key) {
+        let active = self.store.lookups.attrs.get_or_insert_with(item, || {
+            let entry = self.item(item).1;
+            let mut out = Vec::new();
+            collect_active_attrs(&self.outline.crates[item.krate as usize].env, &entry.attrs, &mut out);
+            ActiveAttrs::from_vec(out)
+        });
+        let slice = active.as_slice();
+        if slice.is_empty() {
             return None;
         }
-        let (src, entry) = (&file.source, &file.items.items[index as usize]);
-        let pick = |attr: &Attr| {
-            if let Attr::Other(at) = attr { (src.text(*at) == key).then_some(*at) } else { None }
-        };
-        self.outline.crates[item.krate as usize].env.find_attr(&entry.attrs, crate::outline::tree::Truth::Yes, &pick)
+        let src = self.item(item).0;
+        slice.iter().copied().find(|&at| src.text(at) == key)
     }
 
     /// The layout of the struct, enum or union `item` at `args`.
@@ -163,6 +205,31 @@ fn read_repr_words(src: &Source, words: Vec<u32>, repr: &mut ReprOptions) {
             "align" => repr.align = repr_align(src, from).or(repr.align),
             word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
         }
+    }
+}
+
+fn visit_active_attrs<T>(env: &Env, attrs: &[Attr], f: &mut impl FnMut(u32) -> ControlFlow<T>) -> ControlFlow<T> {
+    for attr in attrs {
+        match attr {
+            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => visit_active_attrs(env, inner, f)?,
+            &Attr::Other(at) => f(at)?,
+            _ => {}
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+fn collect_active_attrs(env: &Env, attrs: &[Attr], out: &mut Vec<u32>) {
+    let _ = visit_active_attrs(env, attrs, &mut |at| {
+        out.push(at);
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+fn active_attr_at(env: &Env, src: &Source, attrs: &[Attr], key: &str) -> Option<u32> {
+    match visit_active_attrs(env, attrs, &mut |at| if src.text(at) == key { ControlFlow::Break(at) } else { ControlFlow::Continue(()) }) {
+        ControlFlow::Break(at) => Some(at),
+        ControlFlow::Continue(()) => None,
     }
 }
 

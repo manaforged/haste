@@ -83,13 +83,42 @@ impl Lower<'_, '_> {
         self.b.inst_results(call).first().copied()
     }
 
-    fn caller_location(&mut self) -> Result<Value> {
+    pub(super) fn caller_loc_slot(&mut self) -> Result<Value> {
+        const CALLER_LOC_SLOT: i64 = 0;
+        const CALLER_LOC_CELL_BYTES: i64 = 8;
+        let slot = self.ins().iconst(Type::I64, CALLER_LOC_SLOT);
+        self.call_thread_cell(slot, CALLER_LOC_CELL_BYTES, None)
+    }
+
+    pub(super) fn current_site_location(&mut self) -> Result<Value> {
         let Some(location) = self.cx.lang_item("panic_location") else { bail!("no `Location` lang item") };
         let ty = self.cx.types.adt(location, &[]);
         let layout = self.cx.layout(ty)?;
-        let (src, entry) = self.cx.item(self.reached.list[self.index].0.0);
-        let mut file = src.path.display().to_string().into_bytes();
-        let (len, line, column) = (file.len() as u64, src.line(entry.start) as u32, src.column(entry.start) as u32);
+        let src = self.src;
+        let root = src.base.as_deref().map_or(src, |f| &f.source);
+        let (line, column) = match self.b.loc() {
+            0 => {
+                let (item_src, entry) = self.cx.item(self.reached.list[self.index].0.0);
+                if item_src.path == src.path {
+                    let tok = entry.name.unwrap_or(entry.start);
+                    (item_src.line(tok) as u32, item_src.column(tok) as u32)
+                } else {
+                    (1, 1)
+                }
+            }
+            loc => {
+                let mut byte = (loc as u32 as usize).min(root.text.len());
+                while byte > 0 && !root.text.is_char_boundary(byte) {
+                    byte -= 1;
+                }
+                let before = &root.text[..byte];
+                let line = before.matches('\n').count() as u32 + 1;
+                let col = before[before.rfind('\n').map_or(0, |n| n + 1)..].chars().count() as u32 + 1;
+                (line, col)
+            }
+        };
+        let mut file = root.path.display().to_string().into_bytes();
+        let len = file.len() as u64;
         file.push(0);
         let file_id = self.slots.rodata(&file, &[]);
         let mut bytes = vec![0u8; layout.size.bytes() as usize];
@@ -105,9 +134,100 @@ impl Lower<'_, '_> {
         Ok(self.emit_symbol(SymbolSource::Rodata(loc_id)))
     }
 
+    pub(super) fn expr_site_place(&self, expr: crate::body::ExprId) -> Option<u64> {
+        self.expr_site_token(expr)
+            .map(|tok| self.src.place(tok))
+            .filter(|&loc| loc != 0)
+            .or_else(|| self.body.expr_ends.get(expr.0 as usize).map(|&end| self.src.place(end.saturating_sub(1))).filter(|&loc| loc != 0))
+    }
+
+    fn expr_site_token(&self, expr: crate::body::ExprId) -> Option<u32> {
+        use crate::body::Expr;
+        match self.body.exprs[expr.0 as usize] {
+            Expr::Method { name, .. } => Some(name),
+            Expr::Call(callee, _) | Expr::Index(callee, _) => self.expr_site_token(callee),
+            Expr::Path(path) => Some(self.body.paths[path.0 as usize].start),
+            _ => None,
+        }
+    }
+
+    pub(super) fn enter_tracked_caller_loc(&mut self) -> Result<()> {
+        let slot = self.caller_loc_slot()?;
+        let prev = self.ins().load(Type::I64, slot, 0);
+        let has = self.ins().icmp_imm(IntCC::NotEqual, prev, 0);
+        let own = self.current_site_location()?;
+        let cur = self.ins().select(has, prev, own);
+        self.ins().store(cur, slot, 0);
+        self.caller_loc_guard = Some((slot, prev));
+        Ok(())
+    }
+
+    pub(super) fn wrap_inlined_caller_loc(&mut self, from_blk: usize, to_blk: usize) -> Result<()> {
+        for b_idx in from_blk..to_blk {
+            let block = self.b.block_at(b_idx);
+            let Some((first_call, can_fall_through)) = self.b.block_first_tracked(block, self.dict_param, |sym, arg0| match self.relocs.get(sym as usize) {
+                Some(SymbolSource::Slot(idx)) => self.cx.track_caller(self.reached.list[*idx].0.0),
+                Some(SymbolSource::Host(HostSymbol::ThreadCell)) => arg0 == Some(0),
+                _ => false,
+            }) else {
+                continue;
+            };
+            let (saved, tail) = self.b.splice_open(block, first_call);
+            let slot = self.caller_loc_slot()?;
+            let prev = self.ins().load(Type::I64, slot, 0);
+            let loc = self.current_site_location()?;
+            self.ins().store(loc, slot, 0);
+            if can_fall_through && let Some((&term, mid)) = tail.split_last() {
+                self.b.splice_append(mid, None);
+                self.ins().store(prev, slot, 0);
+                self.b.splice_append(&[term], saved);
+            } else {
+                self.b.splice_append(&tail, saved);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn with_caller_loc<T>(&mut self, track: Option<bool>, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let Some(set_site) = track else {
+            return run(self);
+        };
+        let slot = self.caller_loc_slot()?;
+        let prev = self.ins().load(Type::I64, slot, 0);
+        let next = if set_site { self.current_site_location()? } else { self.ins().iconst(Type::I64, 0) };
+        self.ins().store(next, slot, 0);
+        let res = run(self)?;
+        if self.open {
+            self.ins().store(prev, slot, 0);
+        }
+        Ok(res)
+    }
+
+    fn caller_location(&mut self) -> Result<Value> {
+        let fallback = self.current_site_location()?;
+        let slot = self.caller_loc_slot()?;
+        let cur = self.ins().load(Type::I64, slot, 0);
+        let has = self.ins().icmp_imm(IntCC::NotEqual, cur, 0);
+        Ok(self.ins().select(has, cur, fallback))
+    }
+
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {
         let &[try_fn, data, catch_fn] = args else { bail!("catch_unwind takes three arguments") };
-        Ok(self.call_host(HostSymbol::CatchUnwind, &[try_fn, data, catch_fn], Some(Type::I32)).expect("catch_unwind returns i32"))
+        let res = self.call_host(HostSymbol::CatchUnwind, &[try_fn, data, catch_fn], Some(Type::I32)).expect("invariant: catch_unwind returns i32");
+        if self.open {
+            let caught = self.b.create_block();
+            let done = self.b.create_block();
+            self.brif(res, (caught, &[]), (done, &[]));
+            self.enter(caught);
+            let (slot, restore) = match self.caller_loc_guard {
+                Some((slot, prev)) => (slot, prev),
+                None => (self.caller_loc_slot()?, self.ins().iconst(Type::I64, 0)),
+            };
+            self.ins().store(restore, slot, 0);
+            self.jump(done, &[]);
+            self.enter(done);
+        }
+        Ok(res)
     }
 
     fn cpuid(&mut self, args: &[Value]) -> Result<Value> {

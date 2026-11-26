@@ -67,6 +67,34 @@ pub struct Cache {
     pub(super) lookups: Lookups,
 }
 
+#[derive(Clone)]
+pub(super) enum ActiveAttrs {
+    None,
+    One(u32),
+    Two([u32; 2]),
+    Many(Arc<[u32]>),
+}
+
+impl ActiveAttrs {
+    pub(super) fn from_vec(attrs: Vec<u32>) -> Self {
+        match attrs.as_slice() {
+            [] => Self::None,
+            &[a] => Self::One(a),
+            &[a, b] => Self::Two([a, b]),
+            _ => Self::Many(attrs.into()),
+        }
+    }
+
+    pub(super) fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::None => &[],
+            Self::One(a) => std::slice::from_ref(a),
+            Self::Two(pair) => pair,
+            Self::Many(many) => many,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct OutlineState {
     pub(super) langs: RwLock<Option<traits::Langs>>,
@@ -81,6 +109,8 @@ pub(super) struct Lookups {
     pub(super) owners: Table<u32, Arc<HashMap<(u32, Option<u32>), u32>>>,
     pub(super) trait_defs: Table<ItemRef, Arc<traits::TraitGenerics>>,
     pub(super) discriminants: Table<ItemRef, Arc<[i128]>>,
+    pub(super) reprs: Table<ItemRef, rustc_abi::ReprOptions>,
+    pub(super) attrs: Table<ItemRef, ActiveAttrs>,
     pub(super) state: Arc<OutlineState>,
     pub(super) drops: Table<ty::Ty, bool>,
     pub(super) unpins: Table<ty::Ty, (bool, u32)>,
@@ -106,6 +136,7 @@ pub(super) struct Lookups {
     pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
     pub(super) file_index: Arc<std::sync::OnceLock<Arc<summary::codec::FileIndex>>>,
+    pub(super) lang_items: Arc<std::sync::OnceLock<HashMap<ItemRef, u32>>>,
     pub(super) skip_warm_sysroot_bodies: bool,
 }
 
@@ -132,6 +163,8 @@ impl Lookups {
             owners: std::mem::take(&mut self.owners),
             trait_defs: std::mem::take(&mut self.trait_defs),
             discriminants: std::mem::take(&mut self.discriminants),
+            reprs: std::mem::take(&mut self.reprs),
+            attrs: std::mem::take(&mut self.attrs),
             state: Arc::clone(&self.state),
             drops: std::mem::take(&mut self.drops),
             unpins: std::mem::take(&mut self.unpins),
@@ -196,8 +229,13 @@ impl Lookups {
             self.scope_traits.clear();
             self.heads.clear();
             self.discriminants.clear();
+            self.reprs.clear();
+            self.attrs.clear();
             self.summaries = table::Flight::default();
             self.glues.clear();
+        }
+        if (!same_len || guard.iter().zip(&loaded).any(|(a, b)| a.files != b.files)) && self.lang_items.get().is_some() {
+            self.lang_items = Arc::new(std::sync::OnceLock::new());
         }
         if reset_sysroot {
             *write_lock(&self.state.langs) = None;
@@ -364,6 +402,11 @@ impl Lookups {
         self.assoc_types.clear();
         self.summaries = table::Flight::default();
         self.discriminants.retain(|item, _| !mine(*item));
+        self.reprs.retain(|item, _| !mine(*item));
+        self.attrs.retain(|item, _| !mine(*item));
+        if self.lang_items.get().is_some() {
+            self.lang_items = Arc::new(std::sync::OnceLock::new());
+        }
         let mut langs = write_lock(&self.state.langs);
         if langs.as_ref().is_some_and(|found| found.crates.iter().any(|&krate| edited.touches_crate(krate))) {
             *langs = None;

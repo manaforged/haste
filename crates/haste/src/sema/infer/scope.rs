@@ -108,7 +108,7 @@ pub(super) fn one_name<'s>(arena: &Body, src: &'s Source, ty: TyId) -> Option<&'
     };
     let path = arena.path(path);
     match arena.list(path.segments) {
-        [segment] if path.qself.is_none() => Some(src.text(arena.segments[*segment as usize].name)),
+        [segment] if path.qself.is_none() && arena.segments[*segment as usize].args.is_none() => Some(src.text(arena.segments[*segment as usize].name)),
         _ => None,
     }
 }

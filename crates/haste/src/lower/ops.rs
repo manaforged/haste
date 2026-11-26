@@ -117,7 +117,7 @@ impl Lower<'_, '_> {
             (UnOp::Neg, Num::Int { ty, signed: true }) => {
                 let min = self.min_value(ty);
                 let ok = self.ins().icmp(IntCC::NotEqual, value, min);
-                self.overflow_check(ok);
+                self.overflow_check(ok, "attempt to negate with overflow")?;
                 self.ins().ineg(value)
             }
             _ => bail!("cannot lower {op:?} on this type"),
@@ -137,16 +137,87 @@ impl Lower<'_, '_> {
         self.int_const(ty, 1u128 << (bits - 1))
     }
 
-    /// Traps unless `ok` is nonzero, where rustc's debug build panics.
-    fn check(&mut self, ok: Value) {
-        self.ins().trapz(ok);
+    /// Traps or unwinds with `msg` unless `ok` is nonzero.
+    pub(super) fn check(&mut self, ok: Value, msg: &str) -> Result<()> {
+        self.check_with(ok, |lower| lower.panic_str(msg))
+    }
+
+    /// Traps or runs `on_fail` unless `ok` is nonzero.
+    pub(super) fn check_with(&mut self, ok: Value, on_fail: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        if !self.should_unwind() {
+            self.ins().trapz(ok);
+            return Ok(());
+        }
+        let (pass, fail) = (self.b.create_block(), self.b.create_block());
+        self.brif(ok, (pass, &[]), (fail, &[]));
+        self.enter(fail);
+        on_fail(self)?;
+        self.enter(pass);
+        Ok(())
+    }
+
+    /// Returns the reached index of `(item, substs)` if inferred, else requests it in lazy JIT or returns `Ok(None)`.
+    pub(super) fn try_reached_index(&self, item: ItemRef, substs: Substs) -> Result<Option<usize>> {
+        let instance = (item, substs);
+        if let Some(&index) = self.reached.index.get(&instance)
+            && !self.reached.is_untyped(index)
+        {
+            return Ok(Some(index));
+        }
+        let before = self.slots.wanted_len();
+        self.slots.want(instance);
+        if self.slots.wanted_len() > before {
+            bail!("a use of `{}` that was not reached", self.cx.name(item));
+        }
+        Ok(None)
+    }
+
+    fn trap_and_close(&mut self) {
+        if self.open {
+            self.ins().trap();
+            self.close();
+        }
+    }
+
+    fn panic_lang_call(&mut self, lang: &str, args: impl FnOnce(&mut Self) -> Vec<Value>) -> Result<bool> {
+        let Some(item) = self.cx.lang_item(lang) else {
+            return Ok(false);
+        };
+        if self.try_reached_index(item, Substs::EMPTY)?.is_none() {
+            return Ok(false);
+        }
+        let values = args(self);
+        self.invoke(super::reloc::SiteOrigin::Known(item, Substs::EMPTY), item, Substs::EMPTY, values)?;
+        self.trap_and_close();
+        Ok(true)
+    }
+
+    pub(super) fn panic_str(&mut self, msg: &str) -> Result<()> {
+        if !self.panic_lang_call("panic", |lower| {
+            let data = lower.emit_const_rodata(msg.as_bytes());
+            vec![lower.wide_pointer(data, msg.len() as i64)]
+        })? {
+            self.trap_and_close();
+        }
+        Ok(())
+    }
+
+    pub(super) fn panic_bounds(&mut self, at: Value, len: Value) -> Result<()> {
+        if !self.panic_lang_call(crate::sema::reach::PANIC_BOUNDS_CHECK, |_| vec![at, len])? {
+            self.panic_str("index out of bounds")?;
+        }
+        Ok(())
     }
 
     /// Checks `ok` where the body's crate checks overflow, as rustc's MIR for that crate does.
-    fn overflow_check(&mut self, ok: Value) {
+    fn overflow_check(&mut self, ok: Value, msg: &str) -> Result<()> {
         if self.overflow_checks {
-            self.check(ok);
+            self.check(ok, msg)?;
         }
+        Ok(())
     }
 
     pub(super) fn binary(&mut self, expr: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Option<Value>> {
@@ -273,7 +344,12 @@ impl Lower<'_, '_> {
             });
         }
         let (result, ok) = self.overflowing(op, num, x, y)?;
-        self.check(ok);
+        let msg = match op {
+            BinOp::Add => "attempt to add with overflow",
+            BinOp::Sub => "attempt to subtract with overflow",
+            _ => "attempt to multiply with overflow",
+        };
+        self.check(ok, msg)?;
         Ok(result)
     }
 
@@ -360,13 +436,23 @@ impl Lower<'_, '_> {
 
     fn divide(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
         let nonzero = self.ins().icmp_imm(IntCC::NotEqual, y, 0);
-        self.check(nonzero);
+        let zero_msg = if op == BinOp::Div {
+            "attempt to divide by zero"
+        } else {
+            "attempt to calculate the remainder with a divisor of zero"
+        };
+        self.check(nonzero, zero_msg)?;
         if signed {
             let min = self.min_value(ty);
             let not_min = self.ins().icmp(IntCC::NotEqual, x, min);
             let not_minus_one = self.ins().icmp_imm(IntCC::NotEqual, y, -1);
             let ok = self.ins().bor(not_min, not_minus_one);
-            self.check(ok);
+            let overflow_msg = if op == BinOp::Div {
+                "attempt to divide with overflow"
+            } else {
+                "attempt to calculate the remainder with overflow"
+            };
+            self.check(ok, overflow_msg)?;
         }
         Ok(match (op, signed) {
             (BinOp::Div, true) => self.ins().sdiv(x, y),
@@ -378,13 +464,20 @@ impl Lower<'_, '_> {
 
     fn shift(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, (y, rhs): (Value, Num)) -> Result<Value> {
         let Num::Int { ty: by, .. } = rhs else { bail!("shift by a non-integer") };
+        let target = if ty == Type::I128 { Type::I64 } else { ty };
         let y = if self.overflow_checks {
             let bits = self.int_const(by, u128::from(ty.bits()));
             let ok = self.ins().icmp(IntCC::UnsignedLessThan, y, bits);
-            self.check(ok);
-            y
+            let msg = if op == BinOp::Shl {
+                "attempt to shift left with overflow"
+            } else {
+                "attempt to shift right with overflow"
+            };
+            self.check(ok, msg)?;
+            if by == Type::I128 { self.ins().ireduce(target, y) } else { y }
         } else {
-            let mask = self.int_const(by, u128::from(ty.bits() - 1));
+            let (y, mask_ty) = if by == Type::I128 { (self.ins().ireduce(target, y), target) } else { (y, by) };
+            let mask = self.int_const(mask_ty, u128::from(ty.bits() - 1));
             self.ins().band(y, mask)
         };
         Ok(match (op, signed) {
@@ -425,13 +518,37 @@ impl Lower<'_, '_> {
             let value = self.expr(rhs)?;
             return self.assign_parts(lhs, value).map(|_| None);
         }
-        let Some(value) = self.expr(rhs)? else {
+        let value = self.eval_operand(rhs)?;
+        if !self.open {
+            return Ok(None);
+        }
+        let mut guards = Vec::new();
+        if self.wants_field_unwind()? {
+            self.push_arg_guard(rhs, value, &mut guards)?;
+        }
+        let Some(place) = self.place_of(lhs)? else {
+            if value.is_some() {
+                bail!("cannot lower assignment to this expression yet");
+            }
+            self.disarm_owned_guards(guards);
             return Ok(None);
         };
-        let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
-        if !self.replace(lhs, place, value)? {
-            self.write(place, value);
+        if !self.open {
+            return Ok(None);
         }
+        match value {
+            Some(value) => {
+                if !self.replace(lhs, place, value)? {
+                    self.write(place, value);
+                }
+            }
+            None if crate::sema::infer::needs_drop(self.cx, self.ty_of(lhs))? => {
+                let dummy = self.ins().iconst(Type::I8, 0);
+                let _ = self.replace(lhs, place, dummy)?;
+            }
+            None => {}
+        }
+        self.disarm_owned_guards(guards);
         Ok(None)
     }
 
@@ -481,7 +598,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {
-        if self.is_wide(self.ty_of(expr))? || self.typed.coercions.contains_key(&inner) {
+        if self.ty_of(expr) == self.ty_of(inner) || self.is_wide(self.ty_of(expr))? || self.typed.coercions.contains_key(&inner) {
             return self.expr(inner);
         }
         let to = self.num(self.ty_of(expr))?;

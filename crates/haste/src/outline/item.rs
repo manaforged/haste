@@ -107,16 +107,3 @@ pub struct Items {
     /// Each item whose attributes name one of `MARKED`, directly or inside a `cfg_attr` whatever its condition, with those names' bits, in item order.
     pub marks: Vec<(u32, u8)>,
 }
-
-impl Items {
-    /// The bits of the `MARKED` attributes that item `item` names.
-    pub fn marks_of(&self, item: u32) -> u8 {
-        self.marks.binary_search_by_key(&item, |&(at, _)| at).map_or(0, |found| self.marks[found].1)
-    }
-
-    /// Whether item `item` may carry attribute `key`: false only when `key` is one of `MARKED` and the item names it nowhere.
-    pub fn may_carry(&self, item: u32, key: &str) -> bool {
-        let bit = mark(key);
-        bit == 0 || self.marks_of(item) & bit != 0
-    }
-}

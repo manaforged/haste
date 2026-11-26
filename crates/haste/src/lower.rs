@@ -237,8 +237,8 @@ struct Loop {
 #[derive(Default)]
 pub(super) struct Inline {
     pub stack: Vec<usize>,
-    pub local: rustc_hash::FxHashMap<usize, (Option<Arc<stencil::InlinedCallee>>, usize)>,
-    pub local_meta: rustc_hash::FxHashMap<usize, (Option<stencil::InlineMeta>, usize)>,
+    pub local: rustc_hash::FxHashMap<(usize, usize), (Option<Arc<stencil::InlinedCallee>>, usize)>,
+    pub local_meta: rustc_hash::FxHashMap<(usize, usize), (Option<stencil::InlineMeta>, usize)>,
     pub max_callee_height: u8,
     pub max_callee_size: u16,
     pub host: budget::Copies,
@@ -283,6 +283,7 @@ pub struct Lower<'l, 'a> {
     resume: Option<coroutine::Resume>,
     overflow_checks: bool,
     child_rodata: Vec<(RodataId, Option<Vec<u8>>)>,
+    caller_loc_guard: Option<(Value, Value)>,
     /// The statics whose read-only bytes are being built now, which a cycle of statics that point to each other reaches again.
     blob_statics: rustc_hash::FxHashSet<(ItemRef, crate::sema::substs::Substs)>,
 }
@@ -301,7 +302,7 @@ impl<'l, 'a> Lower<'l, 'a> {
         (relocs, reloc_plan): (&'l mut RelocVec, &'l mut Vec<reloc::RelocStep>),
     ) -> Self {
         let src = cx.body_src(source);
-        let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
+        let overflow_checks = cx.overflow_checks(source.krate);
         Self {
             cx,
             reached,
@@ -332,6 +333,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             resume: None,
             overflow_checks,
             child_rodata: Vec::new(),
+            caller_loc_guard: None,
             blob_statics: rustc_hash::FxHashSet::default(),
         }
     }
@@ -366,6 +368,9 @@ impl<'l, 'a> Lower<'l, 'a> {
     fn run(&mut self) -> Result<()> {
         let (prologue, start, _) = self.begin_entry()?;
         let filling = is_static(self.cx, self.reached.list[self.index].0.0);
+        if !filling && self.inline.stack.is_empty() && self.cx.track_caller(self.reached.list[self.index].0.0) {
+            self.enter_tracked_caller_loc()?;
+        }
         let value = self.root_value()?;
         match filling {
             true => self.fill_static(value)?,
@@ -441,6 +446,9 @@ impl<'l, 'a> Lower<'l, 'a> {
             _ => None,
         };
         self.drop_to(0)?;
+        if let Some((slot, prev)) = self.caller_loc_guard {
+            self.ins().store(prev, slot, 0);
+        }
         match values {
             Some(values) => self.ins().return_(&values),
             None => self.ins().trap(),
@@ -624,7 +632,10 @@ impl<'l, 'a> Lower<'l, 'a> {
         let mark = self.owned.len();
         match stmt {
             Stmt::Let { pat, init, otherwise: None, .. } => self.let_stmt(pat, init)?,
-            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => self.let_else(pat, init, otherwise)?,
+            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => {
+                self.extend_let(pat, init);
+                self.let_else(pat, init, otherwise)?;
+            }
             Stmt::Expr(expr, _) => self.discard(expr)?,
             Stmt::Item(..) | Stmt::Empty => {}
             other => bail!("cannot lower statement {other:?} yet"),
@@ -657,7 +668,7 @@ impl<'l, 'a> Lower<'l, 'a> {
         if self.open && self.uninit_call(init) && self.can_declare_uninit_val(pat) && !self.typed.coercions.contains_key(&init) {
             return self.declare_binding(pat, true);
         }
-        self.extend(init);
+        self.extend_let(pat, init);
         let unboxed = self.moves_whole_box(pat, init)?;
         let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };
         if !self.open {
@@ -690,14 +701,60 @@ impl<'l, 'a> Lower<'l, 'a> {
         }
     }
 
+    fn extend_let(&mut self, pat: PatId, init: ExprId) {
+        self.extend(init);
+        if self.pat_binds_ref(pat) {
+            self.extend_place(init);
+        }
+    }
+
+    fn pat_binds_ref(&self, pat: PatId) -> bool {
+        match *self.body.pat(pat) {
+            Pat::Bind { by_ref, sub, .. } => by_ref || self.typed.ref_binds.contains_key(&pat) || sub.is_some_and(|sub| self.pat_binds_ref(sub)),
+            Pat::Paren(inner) => self.pat_binds_ref(inner),
+            Pat::Tuple(list) | Pat::TupleStruct(_, list) | Pat::Slice(list) | Pat::Or(list) => {
+                self.body.list(list).iter().any(|&at| self.pat_binds_ref(PatId(at)))
+            }
+            Pat::Struct { fields, .. } => self.body.list(fields).iter().any(|&at| self.pat_binds_ref(self.body.field_pats[at as usize].pat)),
+            _ => false,
+        }
+    }
+
+    fn extend_place(&mut self, mut expr: ExprId) {
+        loop {
+            self.extended.insert(expr);
+            match *self.body.expr(expr) {
+                Expr::Paren(inner)
+                | Expr::Field(inner, _)
+                | Expr::TupleField(inner, _)
+                | Expr::Index(inner, _)
+                | Expr::Unary(crate::body::UnOp::Deref, inner) => expr = inner,
+                Expr::Block { stmts, tail: Some(tail), .. } if self.body.list(stmts).is_empty() => expr = tail,
+                _ => break,
+            }
+        }
+    }
+
     fn extend(&mut self, expr: ExprId) {
         match *self.body.expr(expr) {
             Expr::Ref { expr: inner, .. } => {
-                self.extended.insert(inner);
+                self.extend_place(inner);
                 self.extend(inner);
             }
             Expr::Paren(inner) | Expr::Cast(inner, _) => self.extend(inner),
             Expr::Block { tail: Some(tail), .. } => self.extend(tail),
+            Expr::If(_, then, otherwise) => {
+                self.extend(then);
+                if let Some(otherwise) = otherwise {
+                    self.extend(otherwise);
+                }
+            }
+            Expr::Match(_, arms) => self.body.list(arms).to_vec().into_iter().for_each(|at| self.extend(self.body.arms[at as usize].body)),
+            Expr::Call(callee, args)
+                if self.body.names_callee(callee) && matches!(self.typed.res.get(&callee), Some(crate::sema::infer::Res::Ctor(..))) =>
+            {
+                self.body.list(args).to_vec().into_iter().for_each(|arg| self.extend(ExprId(arg)));
+            }
             Expr::Tuple(list) | Expr::Array(list) => self.body.list(list).to_vec().into_iter().for_each(|item| self.extend(ExprId(item))),
             Expr::Struct { fields, .. } => self.body.list(fields).to_vec().into_iter().for_each(|at| self.extend(self.body.fields[at as usize].value)),
             _ => {}

@@ -84,3 +84,75 @@ pub(super) fn shifted_bit_test(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value
     let hit = cx.emit(ty, Op::Binary(Binary::Band, shifted, one));
     Some(Op::Icmp(cc, hit, y))
 }
+
+/// Rewrites `(x >> k) == 0` / `!= 0` (logical right shift by constant `k`) into a sign test or unsigned range compare against `1 << k`.
+fn shr_zero_compare(cx: &mut RewriteCx, ty: Type, cc: IntCC, shifted: Value, zero: Value) -> Option<Op> {
+    if !cx.single_use(shifted) {
+        return None;
+    }
+    let &Op::Binary(Binary::Ushr, inner, shift) = cx.op(shifted)? else { return None };
+    let k = cx.uconst(shift, ty)?;
+    let bits = u64::from(ty.bits());
+    if k == 0 || k >= bits {
+        return None;
+    }
+    let eq = cc == IntCC::Equal;
+    if k == bits - 1 {
+        return Some(Op::Icmp(if eq { IntCC::SignedGreaterThanOrEqual } else { IntCC::SignedLessThan }, inner, zero));
+    }
+    if k <= 23 {
+        let bound = cx.emit(ty, Op::Const((1_u64 << k) as i64));
+        return Some(Op::Icmp(if eq { IntCC::UnsignedLessThan } else { IntCC::UnsignedGreaterThanOrEqual }, inner, bound));
+    }
+    None
+}
+
+/// Normalizes integer compares against 0/1, signed-range boundaries, shifted-zero tests, or single-bit known-zero masks.
+pub(super) fn zero_compare(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    let ty = cx.func.ty(x);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let umax = ty.unsigned_max();
+    let smin = 1_u64 << (ty.bits() - 1);
+    let smax = smin - 1;
+    let (cx_u, cy_u) = (cx.uconst(x, ty), cx.uconst(y, ty));
+    if matches!(cc, IntCC::Equal | IntCC::NotEqual) {
+        if cy_u == Some(0) && let Some(op) = shr_zero_compare(cx, ty, cc, x, y) {
+            return Some(op);
+        }
+        if cx_u == Some(0) && let Some(op) = shr_zero_compare(cx, ty, cc, y, x) {
+            return Some(op);
+        }
+    }
+    let (val, new_cc, existing_zero) = match (cc, cx_u, cy_u) {
+        (IntCC::UnsignedLessThanOrEqual, _, Some(0)) => (x, IntCC::Equal, Some(y)),
+        (IntCC::UnsignedGreaterThanOrEqual, Some(0), _) => (y, IntCC::Equal, Some(x)),
+        (IntCC::UnsignedGreaterThan, _, Some(0)) => (x, IntCC::NotEqual, Some(y)),
+        (IntCC::UnsignedLessThan, Some(0), _) => (y, IntCC::NotEqual, Some(x)),
+        (IntCC::UnsignedLessThan, _, Some(1)) => (x, IntCC::Equal, None),
+        (IntCC::UnsignedGreaterThan, Some(1), _) => (y, IntCC::Equal, None),
+        (IntCC::UnsignedGreaterThanOrEqual, _, Some(1)) => (x, IntCC::NotEqual, None),
+        (IntCC::UnsignedLessThanOrEqual, Some(1), _) => (y, IntCC::NotEqual, None),
+        (IntCC::UnsignedGreaterThan, _, Some(c)) if c == smax => (x, IntCC::SignedLessThan, None),
+        (IntCC::UnsignedGreaterThanOrEqual, _, Some(c)) if c == smin => (x, IntCC::SignedLessThan, None),
+        (IntCC::UnsignedLessThan, Some(c), _) if c == smax => (y, IntCC::SignedLessThan, None),
+        (IntCC::UnsignedLessThanOrEqual, Some(c), _) if c == smin => (y, IntCC::SignedLessThan, None),
+        (IntCC::UnsignedLessThanOrEqual, _, Some(c)) if c == smax => (x, IntCC::SignedGreaterThanOrEqual, None),
+        (IntCC::UnsignedLessThan, _, Some(c)) if c == smin => (x, IntCC::SignedGreaterThanOrEqual, None),
+        (IntCC::UnsignedGreaterThanOrEqual, Some(c), _) if c == smax => (y, IntCC::SignedGreaterThanOrEqual, None),
+        (IntCC::UnsignedGreaterThan, Some(c), _) if c == smin => (y, IntCC::SignedGreaterThanOrEqual, None),
+        (IntCC::SignedLessThanOrEqual, _, Some(c)) if c == umax => (x, IntCC::SignedLessThan, None),
+        (IntCC::SignedGreaterThanOrEqual, Some(c), _) if c == umax => (y, IntCC::SignedLessThan, None),
+        (IntCC::SignedGreaterThan, _, Some(c)) if c == umax => (x, IntCC::SignedGreaterThanOrEqual, None),
+        (IntCC::SignedLessThan, Some(c), _) if c == umax => (y, IntCC::SignedGreaterThanOrEqual, None),
+        (IntCC::Equal | IntCC::NotEqual, _, Some(k)) if k.is_power_of_two() && ((cx.known(x).0 & umax) | k) == umax => {
+            (x, if cc == IntCC::Equal { IntCC::NotEqual } else { IntCC::Equal }, None)
+        }
+        (IntCC::Equal | IntCC::NotEqual, Some(k), _) if k.is_power_of_two() && ((cx.known(y).0 & umax) | k) == umax => {
+            (y, if cc == IntCC::Equal { IntCC::NotEqual } else { IntCC::Equal }, None)
+        }
+        _ => return None,
+    };
+    Some(Op::Icmp(new_cc, val, existing_zero.unwrap_or_else(|| cx.emit(ty, Op::Const(0)))))
+}

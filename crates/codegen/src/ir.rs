@@ -1,11 +1,13 @@
 use std::fmt;
 
+mod atomic;
 mod consts;
 mod edges;
 mod flags;
 mod rodata;
 mod vector;
 
+pub use atomic::{AtomicOrd, AtomicRmwOp};
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
 pub(crate) use vector::{CfgCache, Domain};
 
@@ -258,23 +260,6 @@ pub enum FloatCC {
     GreaterThanOrEqual,
 }
 
-/// The operation of an atomic read-modify-write.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
-pub enum AtomicRmwOp {
-    Add,
-    Sub,
-    And,
-    Nand,
-    Or,
-    Xor,
-    Xchg,
-    Umin,
-    Umax,
-    Smin,
-    Smax,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum Unary {
@@ -377,11 +362,11 @@ pub(crate) enum Op {
     StackAddr(StackSlot, i32),
     StackLoad(StackSlot, i32),
     StackStore(Value, StackSlot, i32),
-    AtomicLoad(Value),
-    AtomicStore(Value, Value),
-    AtomicRmw(AtomicRmwOp, Value, Value),
-    AtomicCas(Value, Value, Value),
-    Fence,
+    AtomicLoad(Value, AtomicOrd),
+    AtomicStore(Value, Value, AtomicOrd),
+    AtomicRmw(AtomicRmwOp, AtomicOrd, Value, Value),
+    AtomicCas(AtomicOrd, Value, Value, Value),
+    Fence(AtomicOrd),
     FramePointer,
     /// Copies the number of bytes in the third value from the address in the second to the address in the first; the two may overlap.
     Copy(Value, Value, Value),
@@ -436,9 +421,9 @@ impl Op {
     /// Calls `f` with every value this instruction reads, once per read.
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
-            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) | Op::Assume(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
+            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => f(*x),
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::AtomicStore(x, y, _) | Op::AtomicRmw(_, _, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
             }
@@ -450,7 +435,7 @@ impl Op {
                 }
             }
             Op::TargetOp(_, args) => args.as_slice().iter().for_each(|arg| f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
+            Op::Select(c, x, y) | Op::AtomicCas(_, c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
                 f(*c);
                 f(*x);
                 f(*y);
@@ -471,8 +456,8 @@ impl Op {
     /// Replaces every value this instruction reads with `f` of it.
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
-            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) | Op::Assume(x) => {
+            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => {
                 *x = f(*x);
             }
             Op::Binary(_, x, y)
@@ -481,8 +466,8 @@ impl Op {
             | Op::Fcmp(_, x, y)
             | Op::Insert(x, y, _)
             | Op::Store(x, y, _)
-            | Op::AtomicStore(x, y)
-            | Op::AtomicRmw(_, x, y)
+            | Op::AtomicStore(x, y, _)
+            | Op::AtomicRmw(_, _, x, y)
             | Op::Move(x, y, _) => {
                 *x = f(*x);
                 *y = f(*y);
@@ -495,7 +480,7 @@ impl Op {
                 }
             }
             Op::TargetOp(_, args) => args.as_mut_slice().iter_mut().for_each(|arg| *arg = f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
+            Op::Select(c, x, y) | Op::AtomicCas(_, c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);
@@ -550,6 +535,9 @@ pub struct Function {
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
     pub(crate) value_flags: Vec<u8>,
+    /// Whether this function must keep a standard frame pointer chain for unwind stack walking.
+    pub keep_fp: bool,
+    pub(crate) unwind_drops: Vec<crate::UnwindDrop>,
     /// The bytes at the start of this coroutine's own frame that no code outside the frame can address.
     pub(crate) frame_private: u32,
     pub(crate) cfg_rev: u32,
@@ -559,7 +547,7 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), keep_fp: false, unwind_drops: Vec::new(), frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
     }
 
     pub(crate) fn bump_cfg(&mut self) {
@@ -669,6 +657,16 @@ impl Function {
     /// The source location of the first located instruction, which code with no location of its own reports.
     pub(crate) fn home_loc(&self) -> u64 {
         self.blocks.iter().flat_map(|block| &block.insts).map(|inst| self.insts[inst.index()].loc).find(|&loc| loc != 0).unwrap_or(0)
+    }
+
+    /// Inserts a constant in the entry block so loop-invariant register allocation can hoist it out of loops.
+    pub(crate) fn entry_const(&mut self, imm: i64, ty: Type) -> Option<Value> {
+        let entry = self.entry?;
+        let val = self.value(ty);
+        let inst = self.add(Op::Const(imm), Some(val));
+        let block = &mut self.blocks[entry.index()].insts;
+        block.insert(0, inst);
+        Some(val)
     }
 
     /// The number of instructions in the body.

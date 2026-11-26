@@ -33,21 +33,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use haste_codegen::{Code, RelocKind, Site, StencilReloc};
+use haste_codegen::{Code, CodeUnwindDrop, RelocKind, Site, StencilReloc};
 
 use consumers::{CONSUMER_REC_LEN, Consumer};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 24;
+const VERSION: u32 = 26;
 const HEADER_LEN: usize = 72;
 const SUMMARY_REC_LEN: usize = 16;
-const STENCIL_REC_LEN: usize = 72;
-const STENCIL_BLOB_AT: [usize; 5] = [24, 32, 40, 48, 56];
-const STENCIL_LAST_USED_AT: usize = 64;
+const STENCIL_REC_LEN: usize = 80;
+const STENCIL_BLOB_AT: [usize; 6] = [24, 32, 40, 48, 56, 64];
+const STENCIL_LAST_USED_AT: usize = 72;
 const INSTANCE_REC_LEN: usize = 24;
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
 const LOOP_WIRE_LEN: usize = 8;
+const UNWIND_WIRE_LEN: usize = 16;
 
 /// Zero-copy view of a pre-compiled `Effort::Full` stencil in a substrate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub struct StencilSlice<'a> {
     relocs: &'a [u8],
     plan: &'a [u8],
     loops: &'a [u8],
+    unwind_drops: &'a [u8],
 }
 
 impl<'a> StencilSlice<'a> {
@@ -91,9 +93,23 @@ impl<'a> StencilSlice<'a> {
         decode_table(loops, LOOP_WIRE_LEN, "loop", |at| Ok(read_u32(loops, at)..read_u32(loops, at + 4)))
     }
 
+    /// Decodes the frame-table unwind drop records.
+    pub fn decode_unwind_drops(&self) -> Result<Vec<CodeUnwindDrop>> {
+        let drops = self.unwind_drops;
+        decode_table(drops, UNWIND_WIRE_LEN, "unwind_drop", |at| {
+            Ok(CodeUnwindDrop {
+                local_off: read_u32(drops, at) as i32,
+                flag_off: read_u32(drops, at + 4) as i32,
+                drop_sym: read_u32(drops, at + 8),
+                indirect: read_u32(drops, at + 12) != 0,
+            })
+        })
+    }
+
     /// Decodes this slice into a `Code` stencil buffer.
     pub fn to_code(&self) -> Result<Code> {
-        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?, self.decode_loops()?))
+        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?, self.decode_loops()?)
+            .with_unwind_drops(self.decode_unwind_drops()?))
     }
 }
 
@@ -105,7 +121,7 @@ fn decode_table<T>(bytes: &[u8], width: usize, name: &str, entry: impl FnMut(usi
 }
 
 #[cfg(unix)]
-pub(super) struct Backing {
+pub(crate) struct Backing {
     ptr: NonNull<u8>,
     len: usize,
 }
@@ -129,7 +145,7 @@ impl Drop for Backing {
 
 #[cfg(unix)]
 impl Backing {
-    pub(super) fn open(path: &Path, min_len: usize) -> Result<Self> {
+    pub(crate) fn open(path: &Path, min_len: usize) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let meta = file.metadata().with_context(|| format!("stat {}", path.display()))?;
         let len_u64 = meta.len();
@@ -146,18 +162,18 @@ impl Backing {
         Ok(Backing { ptr, len })
     }
 
-    pub(super) fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` is valid for `len` bytes for the lifetime of `&self` and never mutated.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
 #[cfg(not(unix))]
-pub(super) struct Backing(Box<[u8]>);
+pub(crate) struct Backing(Box<[u8]>);
 
 #[cfg(not(unix))]
 impl Backing {
-    pub(super) fn open(path: &Path, min_len: usize) -> Result<Self> {
+    pub(crate) fn open(path: &Path, min_len: usize) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         if bytes.len() < min_len {
             bail!("backing file smaller than header");
@@ -165,7 +181,7 @@ impl Backing {
         Ok(Backing(bytes.into_boxed_slice()))
     }
 
-    pub(super) fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         &self.0
     }
 }
@@ -275,6 +291,16 @@ fn encode_loops(loops: &[Range<u32>], out: &mut Vec<u8>) {
     }
 }
 
+fn encode_unwind_drops(drops: &[CodeUnwindDrop], out: &mut Vec<u8>) {
+    out.reserve(drops.len() * UNWIND_WIRE_LEN);
+    for d in drops {
+        out.extend_from_slice(&(d.local_off as u32).to_le_bytes());
+        out.extend_from_slice(&(d.flag_off as u32).to_le_bytes());
+        out.extend_from_slice(&d.drop_sym.to_le_bytes());
+        out.extend_from_slice(&u32::from(d.indirect).to_le_bytes());
+    }
+}
+
 impl Substrate {
     /// Opens and memory-maps a substrate file from `path`, validating its header and section bounds.
     pub fn open(path: &Path) -> Result<Self> {
@@ -375,8 +401,8 @@ impl Substrate {
     fn stencil_at(&self, rec: usize) -> Option<StencilSlice<'_>> {
         let data = self.backing.as_slice();
         let blob = |at: usize| self.blob_slice(read_u32(data, rec + at) as usize, read_u32(data, rec + at + 4) as usize);
-        let [code, sites, relocs, plan, loops] = STENCIL_BLOB_AT;
-        Some(StencilSlice { code: blob(code)?, sites: blob(sites)?, relocs: blob(relocs)?, plan: blob(plan)?, loops: blob(loops)? })
+        let [code, sites, relocs, plan, loops, unwind_drops] = STENCIL_BLOB_AT;
+        Some(StencilSlice { code: blob(code)?, sites: blob(sites)?, relocs: blob(relocs)?, plan: blob(plan)?, loops: blob(loops)?, unwind_drops: blob(unwind_drops)? })
     }
 
     /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its ancestors.
@@ -430,6 +456,8 @@ struct PendingStencil {
     plan_len: u32,
     loops_off: u32,
     loops_len: u32,
+    unwind_off: u32,
+    unwind_len: u32,
     last_used: Option<u32>,
 }
 
@@ -516,6 +544,7 @@ impl SubstrateBuilder {
         let (relocs_off, relocs_len) = self.push_blob(slice.relocs)?;
         let (plan_off, plan_len) = self.push_blob(slice.plan)?;
         let (loops_off, loops_len) = self.push_blob(slice.loops)?;
+        let (unwind_off, unwind_len) = self.push_blob(slice.unwind_drops)?;
         self.stencils.push(PendingStencil {
             item_hash,
             fp_lo: footprint as u64,
@@ -530,6 +559,8 @@ impl SubstrateBuilder {
             plan_len,
             loops_off,
             loops_len,
+            unwind_off,
+            unwind_len,
             last_used,
         });
         Ok(())
@@ -544,7 +575,9 @@ impl SubstrateBuilder {
         encode_relocs(code.relocs(), &mut relocs);
         let mut loops = Vec::new();
         encode_loops(code.loops(), &mut loops);
-        self.push_stencil(item_hash, footprint, StencilSlice { code: code.bytes(), sites: &sites, relocs: &relocs, plan, loops: &loops }, None)
+        let mut unwind_drops = Vec::new();
+        encode_unwind_drops(code.unwind_drops(), &mut unwind_drops);
+        self.push_stencil(item_hash, footprint, StencilSlice { code: code.bytes(), sites: &sites, relocs: &relocs, plan, loops: &loops, unwind_drops: &unwind_drops }, None)
     }
 
     /// Shrinks the builder's backing payload buffer to fit its current length.

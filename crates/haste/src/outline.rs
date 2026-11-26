@@ -157,9 +157,35 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
 
 /// Creates the outline of every root, with the build scripts of the units `scripts`, with only the root modules declared; `load` reads modules as lookups need them.
 pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outline {
-    let roots = roots(workspace, scripts);
-    let deps = dependencies(workspace, &roots);
-    let crates = roots.iter().map(|root| root_crate(workspace, targets, root)).collect();
+    let mut roots = roots(workspace, scripts);
+    let mut deps = dependencies(workspace, &roots);
+    let mut is_test_dep = vec![false; roots.len()];
+    if crate::test_mode() {
+        let adj: Vec<Vec<usize>> = deps.iter().map(|list| list.iter().map(|&(_, dep)| dep).collect()).collect();
+        let test_roots = roots.iter().enumerate().filter(|(_, root)| root.role == Role::Test).map(|(at, _)| at);
+        dependents_of(&adj, &mut is_test_dep, test_roots);
+        let extra: Vec<(Root, Vec<(String, usize)>)> = roots
+            .iter()
+            .enumerate()
+            .filter(|&(at, root)| is_test_dep[at] && root.role == Role::Lib && workspace.graph.members.contains(&workspace.graph.units[root.unit].package))
+            .map(|(at, root)| (Root { unit: root.unit, name: root.name.clone(), path: root.path.clone(), role: Role::Test }, deps[at].clone()))
+            .collect();
+        for (root, root_deps) in extra {
+            roots.push(root);
+            deps.push(root_deps);
+            is_test_dep.push(false);
+        }
+    }
+    let crates = roots
+        .iter()
+        .enumerate()
+        .map(|(at, root)| {
+            let package = workspace.graph.units[root.unit].package;
+            let is_member = workspace.graph.members.contains(&package);
+            let test = crate::test_mode() && is_member && (root.role == Role::Test || (matches!(root.role, Role::Lib | Role::Bin) && !is_test_dep[at]));
+            root_crate(workspace, targets, root, test)
+        })
+        .collect();
     let pins = pins(workspace, &roots);
     Outline { roots, crates, deps, cache: Files::default(), procs: HashMap::default(), pins }
 }
@@ -189,13 +215,13 @@ fn unit_pin(workspace: &Workspace, unit: usize, extra: &[u64], memo: &mut [Optio
     hash
 }
 
-fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
+fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool) -> Crate {
     let unit = &workspace.graph.units[root.unit];
     let script = root.role == Role::Script;
     let known = script || unit.script.is_some() || workspace.packages[unit.package].manifest.build.is_none();
     let side = if script { crate::graph::Side::Host } else { unit.side };
     let vars = if script { crate::graph::script::package_vars(workspace, root.unit) } else { crate::graph::script::crate_vars(workspace, root.unit) };
-    let env = Env { target: targets.of(side).clone(), features: unit.features.clone(), script: unit.script.clone().filter(|_| !script), known, vars, release: workspace.packages[unit.package].sysroot, fixed: !workspace.packages[unit.package].local() };
+    let env = Env { target: targets.of(side).clone(), features: unit.features.clone(), script: unit.script.clone().filter(|_| !script), known, vars, release: workspace.packages[unit.package].sysroot, fixed: !workspace.packages[unit.package].local(), test };
     Crate { env, modules: vec![root_module(&root.path)], ..Crate::default() }
 }
 

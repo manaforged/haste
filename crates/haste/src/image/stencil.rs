@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Code, Effort, Site, Target};
+use haste_codegen::{Code, CodeUnwindDrop, Effort, Site, Target};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::lower::{self, FootprintId, RelocPlan, RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word};
@@ -160,7 +160,7 @@ impl GroupWork {
 }
 
 pub(super) enum VerifyRecord {
-    Patched { exec: usize, len: usize, sites: Vec<Site> },
+    Patched { exec: usize, len: usize, sites: Vec<Site>, unwind_drops: Vec<CodeUnwindDrop> },
     Compiled { code: Arc<Code>, symbols: Vec<u64> },
     Dict { body_exec: usize, stub_exec: usize, stub_bytes: Vec<u8>, code: Arc<Code> },
 }
@@ -245,6 +245,7 @@ impl Image {
                 // SAFETY: at..at + 8 lies within the freshly allocated rodata blob in shared memory.
                 unsafe { (at as *mut u64).write_unaligned(ptr) };
             }
+            RodataTarget::Fn(index) => self.register_code_fixup(index, at),
         }
     }
 
@@ -408,7 +409,7 @@ impl Image {
     fn try_aot_singleton_hit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, slice: &crate::substrate::StencilSlice<'_>, pass: &mut Pass) -> Result<bool, String> {
         let Ok(code) = slice.to_code().map(Arc::new) else { return Ok(false) };
         let item = reached.list[index].0.0;
-        let relocs = if code.relocs().iter().any(|r| r.symbol_index().is_some()) {
+        let relocs = if code.relocs().iter().any(|r| r.symbol_index().is_some()) || !code.unwind_drops().is_empty() {
             if let Some(plan) = self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, false, slice.plan())
                 && let Ok(r) = lower::eval_relocs(cx, reached, self, &plan, index)
                 && cx.deferred_evals.is_empty()
@@ -444,8 +445,9 @@ impl Image {
         if self.backend.is_aot() && self.try_aot_singleton_hit(cx, reached, index, &slice, pass)? {
             return Ok(true);
         }
+        let Ok(unwind_drops) = slice.decode_unwind_drops() else { return Ok(false) };
         let item = reached.list[index].0.0;
-        let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) {
+        let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) && unwind_drops.is_empty() {
             Vec::new()
         } else {
             let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
@@ -453,6 +455,7 @@ impl Image {
         };
         let Ok(patched) = crate::substrate::patch_stencil(&slice, &symbols) else { return Ok(false) };
         let exec = pass.memory.write(&patched).map_err(|e| item_err(cx, item, e))?;
+        self.register_jit_drops(exec, patched.len(), &unwind_drops, &symbols);
         self.publish(index, exec);
         pass.record_size(index, patched.len() as u32, 0);
         Ok(true)
@@ -461,7 +464,7 @@ impl Image {
     fn emit_singleton_code(&self, cx: &Context<'_>, item: ItemRef, index: usize, code: Arc<Code>, relocs: Vec<SymbolSource>, pass: &mut Pass) -> Result<(), String> {
         if self.backend.is_jit() {
             let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-            let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
+            let exec = self.write_jit_code(&mut pass.memory, &code, &symbols).map_err(|e| item_err(cx, item, e))?;
             self.publish(index, exec);
         } else {
             self.register_aot_relocs(&relocs);
@@ -489,7 +492,8 @@ impl Image {
             pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
             return Ok(());
         }
-        let code = Arc::new(compile_traced(cx, reached, index, out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
+        let target = self.compile_target_for(cx, item);
+        let code = Arc::new(compile_traced(cx, reached, index, out.func, &target).map_err(|e| item_err(cx, item, e))?);
         if let Some(fp) = footprint.filter(|&fp| aot_relocs_valid(&code, out.relocs.len()) && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)) {
             self.freeze_stencil(cx, reached, index, fp, false, &code, Some(&out.reloc_plan), pass);
         }
@@ -513,7 +517,7 @@ impl Image {
         let template = pass.stencils.templates.get(&(item, footprint)).cloned()?;
         match template {
             CachedTemplate::Stencil { code, .. } => {
-                let exec = if !self.backend.is_jit() { 0 } else { let e = pass.memory.write_patched(&code, symbols).ok()?; self.publish(index, e); e };
+                let exec = if !self.backend.is_jit() { 0 } else { let e = self.write_jit_code(&mut pass.memory, &code, symbols).ok()?; self.publish(index, e); e };
                 if let Some(relocs) = aot_relocs {
                     self.record_aot(index, AotFn::Direct { code: AotCode::from_code(&code), relocs: relocs.clone() }, &[]);
                 }
@@ -523,7 +527,7 @@ impl Image {
                     pass.stencils.aliases.insert(alias_key, (stored, false));
                 }
                 if self.backend.is_jit() {
-                    Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
+                    Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec(), unwind_drops: code.unwind_drops().to_vec() })
                 } else {
                     Some(VerifyRecord::Compiled { code, symbols: symbols.to_vec() })
                 }
@@ -545,7 +549,7 @@ impl Image {
 
     fn cached_verify_record(&self, key: (ItemRef, FootprintId), addr: usize, is_dict: bool, symbols: &[u64], pass: &Pass) -> Option<VerifyRecord> {
         match (is_dict, pass.stencils.templates.get(&key)?) {
-            (false, CachedTemplate::Stencil { code, .. }) if self.backend.is_jit() => Some(VerifyRecord::Patched { exec: addr, len: code.bytes().len(), sites: code.sites().to_vec() }),
+            (false, CachedTemplate::Stencil { code, .. }) if self.backend.is_jit() => Some(VerifyRecord::Patched { exec: addr, len: code.bytes().len(), sites: code.sites().to_vec(), unwind_drops: code.unwind_drops().to_vec() }),
             (false, CachedTemplate::Stencil { code, .. }) => Some(VerifyRecord::Compiled { code: code.clone(), symbols: symbols.to_vec() }),
             (true, CachedTemplate::Dict { body_exec, code, .. }) => Some(VerifyRecord::Dict { body_exec: *body_exec, stub_exec: addr, stub_bytes: Vec::new(), code: code.clone() }),
             _ => None,
@@ -588,6 +592,7 @@ impl Image {
             }
             return self.apply_frozen_aot_group((cx, reached), group, rep, &slice, pass);
         }
+        let unwind_drops = slice.decode_unwind_drops().ok()?;
         for inst in &group.distinct {
             if self.backend.is_check() {
                 pass.record_size(inst.leader, slice.code().len() as u32, 0);
@@ -595,6 +600,7 @@ impl Image {
             }
             let patched = crate::substrate::patch_stencil(&slice, &inst.symbols).ok()?;
             let exec = match pass.memory.write(&patched) { Ok(exec) => exec, Err(e) => return Some(Err(item_err(cx, group.item, e))) };
+            self.register_jit_drops(exec, patched.len(), &unwind_drops, &inst.symbols);
             self.store_instance(inst, exec);
             pass.record_size(inst.leader, patched.len() as u32, 0);
         }
@@ -603,7 +609,7 @@ impl Image {
     }
 
     fn emit_direct_inst(&self, (cx, group, inst): (&Context<'_>, &GroupWork, &DistinctInst), (code, aot_code): (&Arc<Code>, &Option<Arc<AotCode>>), (record_cache, verify): (bool, bool), (pass, records): (&mut Pass, &mut Vec<(usize, VerifyRecord)>)) -> Result<(), String> {
-        let exec = if !self.backend.is_jit() { 0 } else { let e = pass.memory.write_patched(code, &inst.symbols).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); e };
+        let exec = if !self.backend.is_jit() { 0 } else { let e = self.write_jit_code(&mut pass.memory, code, &inst.symbols).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); e };
         if let (Some(aot_code), Some(relocs)) = (aot_code, &inst.relocs) {
             self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(aot_code), relocs: relocs.clone() }, &inst.followers);
         }
@@ -615,7 +621,7 @@ impl Image {
         if verify {
             for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
                 let rec = if self.backend.is_jit() {
-                    VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() }
+                    VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec(), unwind_drops: code.unwind_drops().to_vec() }
                 } else {
                     VerifyRecord::Compiled { code: Arc::clone(code), symbols: inst.symbols.clone() }
                 };
@@ -667,7 +673,8 @@ impl Image {
             return Ok(());
         }
         let reloc_plan = out.reloc_plan;
-        let code = Arc::new(compile_traced(cx, reached, rep, out.func, &self.compile_target()).map_err(|e| item_err(cx, group.item, e))?);
+        let target = self.compile_target_for(cx, group.item);
+        let code = Arc::new(compile_traced(cx, reached, rep, out.func, &target).map_err(|e| item_err(cx, group.item, e))?);
         if cfg.shares_dict(code.bytes().len(), group.distinct.len()) {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
@@ -771,6 +778,7 @@ impl Image {
 
 pub(super) fn aot_relocs_valid(code: &Code, relocs_len: usize) -> bool {
     code.relocs().iter().filter_map(|r| r.symbol_index()).all(|idx| idx < relocs_len)
+        && code.unwind_drops().iter().all(|u| (u.drop_sym as usize) < relocs_len)
 }
 
 pub(super) fn mode_dict_key(direct_key: u64) -> u64 {

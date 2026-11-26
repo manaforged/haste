@@ -16,6 +16,7 @@ enum Kind {
     Zeros { movs: [Zero; PENDING_ZEROS], len: usize },
     ZeroRun { start: u32, run: Mem, len: i32, last: Last },
     Carry { tag: usize },
+    Eq { a: u32, b: u32 },
 }
 
 /// A `mov r32, 0` at `start..end` that becomes `xor r32, r32` once the flags are dead.
@@ -73,11 +74,13 @@ impl Asm {
         self.tail.as_mut().filter(|tail| tail.end == at && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. }))
     }
 
-    /// Carries pending zero movs, or a held carry, past the one instruction emitted since `start`, which neither reads nor writes the flags.
+    /// Carries pending zero movs, or a held carry or equality flag, past the one instruction emitted since `start`, which neither reads nor writes the flags.
     pub(super) fn flags_kept(&mut self, start: u32) {
         let end = self.pos();
         let marks = self.marks();
-        if let Some(tail) = self.tail.as_mut().filter(|tail| tail.end == start && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. } | Kind::Carry { .. })) {
+        if let Some(tail) = self.tail.as_mut().filter(|tail| {
+            tail.end == start && tail.marks == marks && matches!(tail.kind, Kind::Zeros { .. } | Kind::Carry { .. } | Kind::Eq { .. })
+        }) {
             tail.end = end;
         }
     }
@@ -95,9 +98,22 @@ impl Asm {
         })
     }
 
+    /// Notes that the zero flag holds `a == b` here, until an instruction that may write the flags.
+    pub fn hold_eq(&mut self, a: u32, b: u32) {
+        self.set_tail(Kind::Eq { a, b });
+    }
+
+    /// The value pair the zero flag still compares here, if only flag-neutral instructions followed `hold_eq`.
+    pub fn held_eq(&self) -> Option<(u32, u32)> {
+        self.tail.filter(|tail| tail.end == self.pos() && tail.marks == self.marks()).and_then(|tail| match tail.kind {
+            Kind::Eq { a, b } => Some((a, b)),
+            _ => None,
+        })
+    }
+
     fn push_zero(&mut self, zero: Zero) {
         let marks = self.marks();
-        if self.tail.is_some_and(|tail| tail.end == zero.start && tail.marks == marks && matches!(tail.kind, Kind::Carry { .. })) {
+        if self.tail.is_some_and(|tail| tail.end == zero.start && tail.marks == marks && matches!(tail.kind, Kind::Carry { .. } | Kind::Eq { .. })) {
             self.flags_kept(zero.start);
             return;
         }
@@ -160,6 +176,48 @@ impl Asm {
         if !matches!(op, Alu::Adc | Alu::Sbb) {
             self.flags_overwritten();
         }
+    }
+
+    /// Atomic `xchg [dst], src` of width `size`.
+    pub fn xchg(&mut self, size: Size, dst: Mem, src: Reg) {
+        self.sized(false, size, (&[0x86], &[0x87]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock xadd [dst], src` of width `size`.
+    pub fn xadd(&mut self, size: Size, dst: Mem, src: Reg) {
+        self.flags_overwritten();
+        self.sized(true, size, (&[0x0F, 0xC0], &[0x0F, 0xC1]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock cmpxchg [dst], src` of width `size`.
+    pub fn cmpxchg(&mut self, size: Size, dst: Mem, src: Reg) {
+        self.flags_overwritten();
+        self.sized(true, size, (&[0x0F, 0xB0], &[0x0F, 0xB1]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock op [dst], src` of width `size`.
+    pub fn lock_alu_reg(&mut self, size: Size, op: Alu, dst: Mem, src: Reg) {
+        self.alu_flags(op);
+        self.sized(true, size, (&[op as u8 * 8], &[op as u8 * 8 + 1]), src as u8, dst.into());
+    }
+
+    /// Atomic `lock op [dst], imm` of width `size`.
+    pub fn lock_alu_imm(&mut self, size: Size, op: Alu, dst: Mem, imm: i32) {
+        self.alu_imm_raw(true, size, op, dst.into(), imm);
+    }
+
+    /// Atomic `lock inc/dec [dst]` of width `size`.
+    pub fn lock_inc_dec(&mut self, size: Size, dec: bool, dst: Mem) {
+        self.flags_overwritten();
+        self.sized(true, size, (&[0xFE], &[0xFF]), u8::from(dec), dst.into());
+    }
+
+    /// Atomic `lock bts/btr/btc [dst], bit` (`ext` = 5/6/7) for `size != Size::B`.
+    pub fn lock_bt_imm(&mut self, size: Size, ext: u8, dst: Mem, bit: u8) {
+        debug_assert!(size != Size::B);
+        self.flags_overwritten();
+        self.sized(true, size, (&[], &[0x0F, 0xBA]), ext, dst.into());
+        self.imm(&[bit]);
     }
 
     fn xmm_op(&mut self, pp: u8, opcode: u8, (xmm, src): (Xmm, Xmm), rm: impl Into<Rm>) {

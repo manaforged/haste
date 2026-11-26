@@ -47,7 +47,7 @@ fn may_barrier_mem(op: &Op) -> bool {
             | Op::StackStore(..)
             | Op::Copy(..)
             | Op::Move(..)
-            | Op::Fence
+            | Op::Fence(..)
             | Op::Call { .. }
             | Op::TryCall { .. }
             | Op::AtomicLoad(..)
@@ -109,7 +109,7 @@ fn load_dst_clobber(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (u_res, op)
     addr_reads(ctx.func, ctx.plan, ctx.defs, addr, r_dst)
 }
 
-fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
+pub(in crate::x64) fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
     match *op {
         Op::Binary(Binary::Iadd, a, b) => match (plan.const_of(a), plan.const_of(b)) {
             (None, Some(c)) => Some((a, c)),
@@ -157,23 +157,22 @@ fn push_branch_tst(
     (b_idx, pos, cond_val): (usize, usize, Value),
     out: &mut Vec<(usize, Value, Option<Value>)>,
 ) {
-    if uses[cond_val.index()] != 1 || plan.elided[cond_val.index()] {
-        return;
-    }
+    if uses[cond_val.index()] != 1 || plan.elided[cond_val.index()] { return; }
     let Some((cb, cpos, cinst)) = pos_of[cond_val.index()] else { return };
-    if cb != b_idx || cpos >= pos {
-        return;
-    }
+    if cb != b_idx || cpos >= pos { return; }
     match func.insts[cinst.index()].op {
         Op::Binary(Binary::Band, x, y) if band_ok(func, plan, b_idx, (cpos, pos, &[]), (x, y)) => out.push((pos, cond_val, None)),
-        Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
+        Op::Convert(Convert::Ireduce, m)
+            if uses[m.index()] == 1 && !plan.elided[m.index()]
+                && let Some((mb, mpos, minst)) = pos_of[m.index()]
+                && mb == b_idx && mpos < cpos
+                && let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op
+                && narrows_exactly(func, plan, &|v| pos_of[v.index()].map(|(_, _, i)| i), m, func.ty(cond_val))
+                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y)) => out.push((pos, cond_val, Some(m))),
+        Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs)
             if let Some((m, mpos, x, y)) = zero_cmp_band(func, plan, uses, pos_of, b_idx, lhs, rhs)
                 && mpos < cpos
-                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y))
-            {
-                out.push((pos, cond_val, Some(m)));
-            }
-        }
+                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y)) => out.push((pos, cond_val, Some(m))),
         _ => {}
     }
 }
@@ -464,11 +463,12 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                         cand_alu.push((b_idx, pos, res, op, x, y));
                     }
                 }
-                Op::Binary(op @ (Binary::Band | Binary::Ushr), x, y) if !plan.elided[res.index()] && matches!(ty, Type::I32 | Type::I64) => {
-                    if features.bmi1 {
+                Op::Binary(op @ (Binary::Band | Binary::Ushr | Binary::Ishl | Binary::Sshr), x, y) if !plan.elided[res.index()] && matches!(ty, Type::I32 | Type::I64) => {
+                    if features.bmi1 && matches!(op, Binary::Band | Binary::Ushr) {
                         cand_bextr.push((b_idx, pos, res, op, x, y));
                     }
-                    if op == Binary::Band || features.bmi1 {
+                    let nz_shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr) && plan.const_of(y).is_some_and(|c| (c & i64::from(ty.bits() - 1)) != 0);
+                    if op == Binary::Band || nz_shift || (op == Binary::Ushr && features.bmi1) {
                         cand_alu.push((b_idx, pos, res, op, x, y));
                     }
                 }
@@ -648,7 +648,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         if op == Binary::Band && [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF))) {
             continue;
         }
-        if op == Binary::Ushr && bextr_parts(func, plan, func.ty(res), op, (x, y), |v| plan.elided[v.index()], def_inst).is_none() {
+        if op == Binary::Ushr && !plan.const_of(y).is_some_and(|c| (c & i64::from(func.ty(res).bits() - 1)) != 0) && bextr_parts(func, plan, func.ty(res), op, (x, y), |v| plan.elided[v.index()], def_inst).is_none() {
             continue;
         }
         let shrink_safe = matches!(plan.location(res), Location::Reg(r) if !SAVED.contains(&r) && !FRAME_REGS.contains(&r))
@@ -715,6 +715,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
     }
     fold_products(func, plan, &uses, &defs);
     if features.avx2 { super::elide_broadcast_inserts(func, plan, &defs, (&uses, &pos_of, &use_of)); }
+    super::fuse_atomic_rmws(func, plan, (&uses, &pos_of, &use_of));
     elide_zero_bases(func, plan, &defs);
     for (low, operands) in paired {
         if plan.is_static(low) || plan.deferred[low.index()] {

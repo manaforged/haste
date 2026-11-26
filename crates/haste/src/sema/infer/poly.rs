@@ -269,6 +269,7 @@ fn collect_remaining_projs(types: &Types, state: &mut PolyState, typed: &Typed) 
                 steps.iter().for_each(|(t, r)| { visit_ty_projs(types, state, &mut seen, *t); r.iter().for_each(|r| res_ty(r, &mut seen, state)); });
                 visit_ty_projs(types, state, &mut seen, *to);
             }
+            super::Coercion::Field { target, inner } => { visit_ty_projs(types, state, &mut seen, *target); if let super::Coercion::Len(t) = inner.leaf() { visit_ty_projs(types, state, &mut seen, *t); } }
             _ => {}
         }
     }
@@ -672,6 +673,12 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn poly_settle_obligation(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
+        if self.cx.lang(of) == Some("unsize") {
+            if !args.first().copied().is_some_and(|to| self.unsize_holds(of, self_ty, to).unwrap_or(false)) {
+                self.poly_fallback();
+            }
+            return Ok(true);
+        }
         if self.compiler_decides(of, self_ty) {
             if !self.compiler_holds(of, self_ty) {
                 self.poly_fallback();

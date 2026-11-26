@@ -584,6 +584,15 @@ fn offset_compare(func: &mut Function, lcx: &mut LateCx, inst: Inst) -> bool {
     true
 }
 
+/// The integer compare equivalent to using `op` directly as a non-zero branch condition.
+pub(crate) fn branch_cmp(op: &Op) -> Option<(IntCC, Value, Value)> {
+    match *op {
+        Op::Icmp(cc, a, b) => Some((cc, a, b)),
+        Op::Binary(Binary::Isub | Binary::Bxor, a, b) => Some((IntCC::NotEqual, a, b)),
+        _ => None,
+    }
+}
+
 /// Rewrites a branch, a select, or an equality with a constant that reads `a - b` or `a ^ b` into a direct compare of `a`.
 pub(crate) fn compare_offsets(func: &mut Function) -> bool {
     let mut lcx = LateCx {

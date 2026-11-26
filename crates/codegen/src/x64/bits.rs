@@ -1,11 +1,84 @@
 use super::Emit;
-use super::asm::{Alu, Cond, Reg, Rm, Shift, Size};
-use crate::ir::{Binary, Type};
+use super::asm::{Alu, Cond, Group3, Mem, Reg, Rm, Shift, Size};
+use crate::alloc::Location;
+use crate::frame::Ext;
+use crate::ir::{AtomicRmwOp, Binary, Block, Function, Op, Type, Value};
 
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
 impl Emit<'_> {
+    fn atomic_offset(&self, addr: Value) -> (Value, i32) {
+        if self.plan.elided[addr.index()]
+            && self.plan.sib[addr.index()].is_none()
+            && let Some(inst) = self.defs[addr.index()]
+            && let Some((base, delta)) = super::location::fuse::iadd_sub_const(&self.plan, &self.func.insts[inst.index()].op)
+            && let Ok(disp) = i32::try_from(delta)
+        {
+            return (base, disp);
+        }
+        (addr, 0)
+    }
+
+    /// The memory at `addr`: folds elided constant offsets and stack frames, using the register holding the base unless the operation writes it, else `scratch`.
+    pub(super) fn atomic_target(&mut self, addr: Value, scratch: Reg, written: &[Reg]) -> Mem {
+        let (base, disp) = self.atomic_offset(addr);
+        if let Location::Frame(slot, off) = self.location(base)
+            && let Some(total) = self.frame.slots[slot.index()].checked_add(off).and_then(|d| d.checked_add(disp))
+        {
+            return self.frame_mem(total);
+        }
+        if let Some(reg) = self.reg_of(base).filter(|reg| !written.contains(reg) && *reg != Reg::Rsp) {
+            return Mem::new(reg, disp);
+        }
+        self.raw(scratch, base);
+        Mem::new(scratch, disp)
+    }
+
+    pub(super) fn lock_rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
+        let ty = self.ty(value);
+        let imm = self.const_of(value).map(|c| crate::fold::extend(c, ty, false) as u64);
+        let mask = ty.unsigned_max();
+        let inc_dec = match (op, imm) {
+            (AtomicRmwOp::Add, Some(1)) => Some(false),
+            (AtomicRmwOp::Add, Some(u)) if u == mask => Some(true),
+            (AtomicRmwOp::Sub, Some(1)) => Some(true),
+            (AtomicRmwOp::Sub, Some(u)) if u == mask => Some(false),
+            _ => None,
+        };
+        let bt_ext = match (op, size != Size::B, imm) {
+            (AtomicRmwOp::Or, true, Some(u)) if u.count_ones() == 1 => Some((5, u.trailing_zeros() as u8)),
+            (AtomicRmwOp::And, true, Some(u)) if ((!u) & mask).count_ones() == 1 => Some((6, ((!u) & mask).trailing_zeros() as u8)),
+            (AtomicRmwOp::Xor, true, Some(u)) if u.count_ones() == 1 => Some((7, u.trailing_zeros() as u8)),
+            _ => None,
+        };
+        let alu = match op {
+            AtomicRmwOp::Add => Alu::Add,
+            AtomicRmwOp::Sub => Alu::Sub,
+            AtomicRmwOp::Or => Alu::Or,
+            AtomicRmwOp::And => Alu::And,
+            _ => Alu::Xor,
+        };
+        if let Some(dec) = inc_dec {
+            let target = self.atomic_target(addr, Reg::Rcx, &[]);
+            self.asm.lock_inc_dec(size, dec, target);
+        } else if let Some(imm32) = self.imm_sized(value, size) {
+            let target = self.atomic_target(addr, Reg::Rcx, &[]);
+            self.asm.lock_alu_imm(size, alu, target, imm32);
+        } else if let Some((ext, bit)) = bt_ext {
+            let target = self.atomic_target(addr, Reg::Rcx, &[]);
+            self.asm.lock_bt_imm(size, ext, target, bit);
+        } else if let Some(vr) = self.reg_of(value) {
+            let target = self.atomic_target(addr, if vr == Reg::Rcx { Reg::Rax } else { Reg::Rcx }, &[]);
+            self.asm.lock_alu_reg(size, alu, target, vr);
+        } else {
+            let target = self.atomic_target(addr, Reg::Rcx, &[Reg::Rax]);
+            self.raw(Reg::Rax, value);
+            self.asm.lock_alu_reg(size, alu, target, Reg::Rax);
+        }
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
+    }
+
     pub(super) fn emit_sat_op(&mut self, op: Binary, size: Size, dst: Reg, src: Reg) {
         let (umax, smin, smax) = match size {
             Size::B => (0xFF_i64, 0x80_i64, 0x7F_i64),
@@ -89,4 +162,119 @@ impl Emit<'_> {
         self.asm.cmov(Cond::G, reg, Reg::Rcx);
         self.clobber_regs(&[reg, Reg::Rcx]);
     }
+
+    /// Divides or takes the remainder by a power of two into `dst` with a shift or a mask, when `op` is unsigned and `y` is one.
+    pub(super) fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
+        let ty = self.ty(y);
+        let Some(divisor) = self.const_of(y).map(|imm| crate::fold::extend(imm, ty, false) as u64).filter(|d| d.is_power_of_two()) else {
+            return false;
+        };
+        match op {
+            Binary::Udiv => {
+                self.get(dst, x, Ext::Zero);
+                let shift = divisor.trailing_zeros() as u8;
+                if shift != 0 {
+                    self.asm.shift_imm(Size::Q, Shift::Shr, dst, shift);
+                }
+            }
+            Binary::Urem => {
+                let Ok(mask) = i32::try_from(divisor - 1) else { return false };
+                self.raw(dst, x);
+                self.asm.alu_imm(Alu::And, dst, mask);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Divides `x` by `y` at 32-bit width for sub-64-bit operands and 64-bit otherwise, returning `Rdx` for remainders and `Rax` for quotients.
+    pub(super) fn divide(&mut self, op: Binary, x: Value, y: Value) -> Reg {
+        let ty = self.ty(x);
+        let signed = matches!(op, Binary::Sdiv | Binary::Srem);
+        let ext = Ext::of(signed);
+        let narrow = ty.bytes() <= 4;
+        self.get(Reg::Rax, x, ext);
+        let divisor = self
+            .reg_of(y)
+            .filter(|&r| !matches!(r, Reg::Rax | Reg::Rdx | Reg::Rsp) && (ty.bytes() >= 4 || (!signed && self.plan.zero_ext[y.index()])))
+            .unwrap_or_else(|| {
+                self.get(Reg::Rcx, y, ext);
+                Reg::Rcx
+            });
+        self.asm.flags_overwritten();
+        if signed {
+            if narrow {
+                self.asm.bytes(&[0x99]);
+                self.asm.group3_sized(Size::D, Group3::Idiv, divisor);
+            } else {
+                self.asm.cqo();
+                self.asm.group3(Group3::Idiv, divisor);
+            }
+        } else {
+            self.asm.alu32(Alu::Xor, Reg::Rdx, Reg::Rdx);
+            if narrow {
+                self.asm.group3_sized(Size::D, Group3::Div, divisor);
+            } else {
+                self.asm.group3(Group3::Div, divisor);
+            }
+        }
+        self.clobber_regs(&[Reg::Rax, Reg::Rdx]);
+        if matches!(op, Binary::Srem | Binary::Urem) { Reg::Rdx } else { Reg::Rax }
+    }
+
+    /// Divides the 128-bit value `high:low` by `by` with one `div`, putting the quotient, or the remainder when `rem` is set, in `result`.
+    pub(super) fn divide_wide(&mut self, rem: bool, [high, low, by]: [Value; 3], result: Value) {
+        self.get(Reg::Rdx, high, Ext::Zero);
+        self.get(Reg::Rax, low, Ext::Zero);
+        self.get(Reg::Rcx, by, Ext::Zero);
+        self.asm.group3(Group3::Div, Reg::Rcx);
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
+        self.flags = None;
+        self.put(result, if rem { Reg::Rdx } else { Reg::Rax });
+    }
+
+    /// Computes the high half of `x * y` and returns its register; a 64-bit product leaves its low half in rax for the `Imul` that follows.
+    pub(super) fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) -> Reg {
+        let ext = Ext::of(signed);
+        self.get(Reg::Rax, x, ext);
+        if bits == 64 {
+            let source = self.reg_of(y).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)).unwrap_or_else(|| {
+                self.get(Reg::Rcx, y, ext);
+                Reg::Rcx
+            });
+            self.clobber_reg(Reg::Rax);
+            self.asm.group3(if signed { Group3::Imul } else { Group3::Mul }, source);
+            self.clobber_reg(Reg::Rdx);
+            self.low_product = Some((x, y));
+            return Reg::Rdx;
+        }
+        self.get(Reg::Rcx, y, ext);
+        self.clobber_reg(Reg::Rax);
+        self.asm.imul(Reg::Rax, Reg::Rcx);
+        self.asm.shift_imm(Size::Q, if signed { Shift::Sar } else { Shift::Shr }, Reg::Rax, bits);
+        Reg::Rax
+    }
+}
+
+/// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
+pub(super) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
+    let mut cloned = vec![false; func.blocks.len()];
+    for data in &func.blocks {
+        if let Some(&last) = data.insts.last()
+            && copied.get(last.index()) == Some(&true)
+            && let Op::Jump(head, _) = &func.insts[last.index()].op
+        {
+            cloned[head.index()] = true;
+        }
+    }
+    let mut preds: Vec<(u32, Option<Block>)> = vec![(0, None); func.blocks.len()];
+    for at in 0..func.blocks.len() {
+        let from = Block(at as u32);
+        for next in func.successors(from) {
+            let entry = &mut preds[next.index()];
+            entry.0 += 1;
+            entry.1 = Some(from);
+        }
+    }
+    preds.into_iter().map(|(count, from)| from.filter(|from| count == 1 && !cloned[from.index()])).collect()
 }

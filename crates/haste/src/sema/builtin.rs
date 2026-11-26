@@ -103,7 +103,7 @@ pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
     match args.get(1) {
         None => {
             crate_path(out, krate, "::panicking::panic");
-            out.lexed(&format!("({:?})", format!("assertion failed: {}", src.spelled((from, to)))));
+            out.lexed(&format!("({:?})", format!("assertion failed: {}", crate::outline::build::spelled_fragment(src, (from, to)))));
         }
         Some(&(rest, _)) => {
             crate_path(out, krate, "::panic::panic_2021!");

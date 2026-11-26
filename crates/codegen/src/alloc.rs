@@ -1,10 +1,11 @@
+pub(crate) mod consts;
 mod demote;
 mod hints;
 pub(crate) mod hoist;
 pub(crate) mod walk;
 
 use crate::cfg::{Cfg, Loops};
-use crate::fold::{constant, fits_imm32, holds};
+use crate::fold::{constant, holds};
 use crate::frame::{Abi, Loc};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, InstData, Op, Signature, StackSlot, Type, Value};
 use crate::live::{Live, Sib, SibBase, live, results};
@@ -16,7 +17,7 @@ pub(crate) struct Regs<R: 'static> {
     pub leaf: &'static [R],
     pub wide_scratch: &'static [R],
     pub op_scratch: &'static [R],
-    pub uses_scratch: fn(&Function, &Op) -> bool,
+    pub scratch_mask: fn(&Function, &Op) -> u8,
     pub dict: Option<R>,
     pub float: &'static [u8],
     pub float_branches: &'static [FloatCC],
@@ -48,7 +49,11 @@ impl<R: PartialEq + 'static> Regs<R> {
     /// Reports whether emitting `data` may overwrite `reg` as a wide or op scratch register.
     pub(crate) fn scratches(&self, func: &Function, data: &InstData, reg: R) -> bool {
         let wide = touches_i128(func, data);
-        (wide && self.wide_scratch.contains(&reg)) || ((wide || (self.uses_scratch)(func, &data.op)) && self.op_scratch.contains(&reg))
+        if wide && self.wide_scratch.contains(&reg) {
+            return true;
+        }
+        let mask = if wide { u8::MAX } else { (self.scratch_mask)(func, &data.op) };
+        self.op_scratch.iter().enumerate().any(|(i, r)| (mask >> i) & 1 != 0 && *r == reg)
     }
 }
 
@@ -103,10 +108,10 @@ fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
 
 type Position = Option<(usize, usize)>;
 
-struct Uses {
-    uses: Vec<u32>,
+pub(super) struct Uses {
+    pub(super) uses: Vec<u32>,
     last_use: Vec<Position>,
-    def: Vec<Position>,
+    pub(super) def: Vec<Position>,
     def_inst: Vec<Option<Inst>>,
 }
 
@@ -362,23 +367,15 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided:
     through
 }
 
-/// Elides each `Iconcat` of two constants whose every use reads its halves as immediates.
 fn const_pairs(func: &Function, census: &Uses, elided: &mut [bool]) {
     let mut kept = vec![false; func.types.len()];
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let op = &func.insts[inst.index()].op;
-        if !crate::wide::reads_halves(func, op) {
-            op.for_operands(|value| kept[value.index()] = true);
-        }
+        if !crate::wide::reads_halves(func, op) { op.for_operands(|value| kept[value.index()] = true); }
     }
     let constant = |value: Value| census.def_inst[value.index()].is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Const(_)));
     for (value, def) in census.def_inst.iter().enumerate() {
-        if let Some(inst) = def
-            && let Op::Binary(Binary::Iconcat, lo, hi) = func.insts[inst.index()].op
-            && !kept[value]
-            && constant(lo)
-            && constant(hi)
-        {
+        if let Some(inst) = def && let Op::Binary(Binary::Iconcat, lo, hi) = func.insts[inst.index()].op && !kept[value] && constant(lo) && constant(hi) {
             elided[value] = true;
         }
     }
@@ -397,26 +394,13 @@ fn int_class<'a, R: Copy + PartialEq>(
 ) -> Class<'a, R> {
     let dict = func.signature.params.iter().any(|param| param.purpose == ArgumentPurpose::Dict);
     let leaf = regs.leaf.iter().filter(|reg| !(dict && regs.dict == Some(**reg))).copied().collect();
-    let clobbers = crate::park::scratch_clobbers(func, (regs.wide_scratch, regs.op_scratch, regs.uses_scratch), (order, copied, elided));
-    let arrivals = params
-        .iter()
-        .map(|loc| match *loc {
-            Loc::Int(reg) => vec![reg],
-            Loc::Pair(low, high) => vec![low, high],
-            _ => Vec::new(),
-        })
-        .collect();
+    let clobbers = crate::park::scratch_clobbers(func, (regs.wide_scratch, regs.op_scratch, regs.scratch_mask), (order, copied, elided));
+    let arrivals = params.iter().map(|loc| match *loc { Loc::Int(reg) => vec![reg], Loc::Pair(low, high) => vec![low, high], _ => Vec::new() }).collect();
     Class { saved: regs.saved, leaf, arrivals, passed, clobbers }
 }
 
 fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, bool)>>) -> Class<'static, u8> {
-    let arrivals = params
-        .iter()
-        .map(|loc| match *loc {
-            Loc::Float(reg) => vec![reg],
-            _ => Vec::new(),
-        })
-        .collect();
+    let arrivals = params.iter().map(|loc| match *loc { Loc::Float(reg) => vec![reg], _ => Vec::new() }).collect();
     Class { saved: regs.saved_float, leaf: regs.float.to_vec(), arrivals, passed, clobbers: Vec::new() }
 }
 
@@ -465,195 +449,6 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
     }
 }
 
-const MAX_ARM64_LOOP_GP: usize = 18;
-
-fn expensive_i64_const(imm: i64, two_address: bool) -> bool {
-    let u = imm as u64;
-    if two_address && (u >> 32) == (u & 0xffff_ffff) {
-        return false;
-    }
-    let non_zero = (0..4).filter(|&s| ((u >> (s * 16)) & 0xffff) != 0).count();
-    let non_ones = (0..4).filter(|&s| ((u >> (s * 16)) & 0xffff) != 0xffff).count();
-    if non_zero < 3 || non_ones < 3 {
-        return false;
-    }
-    two_address || (crate::arm64::int::encode_bitmask_imm(u, true).is_none() && !((u >> 32) == 0 && crate::arm64::int::encode_bitmask_imm(u, false).is_some()))
-}
-
-fn x64_alu_imm(ty: Type, imm: i64) -> bool {
-    ty == Type::I32 || fits_imm32(imm)
-}
-
-fn x64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
-    match op {
-        Op::Icmp(..) => ty != Type::I64 || fits_imm32(imm),
-        Op::Binary(Binary::Iadd | Binary::Bor | Binary::Bxor, ..) => x64_alu_imm(ty, imm),
-        Op::Binary(Binary::Band, ..) => x64_alu_imm(ty, imm) || (rhs && imm == 0xFFFF_FFFF),
-        Op::Binary(Binary::Isub, ..) => rhs && x64_alu_imm(ty, imm),
-        _ => false,
-    }
-}
-
-fn arm64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
-    match *op {
-        Op::Binary(Binary::Iadd | Binary::Isub, ..) => rhs && crate::arm64::int::add_imm_parts(false, crate::fold::extend(imm, ty, true)).is_some(),
-        Op::Icmp(cc, ..) => rhs && crate::arm64::int::add_imm_parts(true, crate::fold::extend(imm, ty, cc.is_signed())).is_some(),
-        Op::Binary(Binary::Band | Binary::Bor | Binary::Bxor, ..) => crate::arm64::int::encode_bitmask_imm(imm as u64, ty == Type::I64).is_some(),
-        _ => false,
-    }
-}
-
-fn loop_gp_pressure<R>(func: &Function, loops: &Loops, elided: &[bool], locations: &[Location<R>]) -> Vec<usize> {
-    let mut block_gp = vec![0_usize; func.blocks.len()];
-    let mut seen = vec![0_u32; func.types.len()];
-    for (idx, each) in loops.list.iter().enumerate() {
-        let tag = (idx + 1) as u32;
-        let mut gp = 0_usize;
-        let mut count_val = |v: Value| {
-            let vi = v.index();
-            if seen[vi] != tag && !elided[vi] && func.types[vi].is_small_int() && matches!(locations[vi], Location::Slot) {
-                seen[vi] = tag;
-                gp += 1;
-            }
-        };
-        func.blocks[each.head.index()].params.iter().copied().for_each(&mut count_val);
-        for (b, &in_l) in each.body.iter().enumerate() {
-            if !in_l { continue; }
-            for &inst in &func.blocks[b].insts { func.insts[inst.index()].op.for_operands(&mut count_val); }
-        }
-        for (b, &in_l) in each.body.iter().enumerate() {
-            if in_l { block_gp[b] = block_gp[b].max(gp); }
-        }
-    }
-    block_gp
-}
-
-fn scan_const_op<R>(
-    func: &Function,
-    op: &Op,
-    locations: &[Location<R>],
-    (two_address, in_loop, outer): (bool, bool, &dyn Fn(Value) -> bool),
-    (must_stay_imm, loop_mat): (&mut [bool], &mut [u32]),
-) {
-    match *op {
-        Op::Copy(_, _, bytes) => must_stay_imm[bytes.index()] = true,
-        Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, _, rhs) => must_stay_imm[rhs.index()] = true,
-        Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem | Binary::Sdiv | Binary::Srem, x, y) => {
-            let pow2_ok = matches!(op, Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem, ..));
-            let mul_imm = matches!(op, Op::Binary(Binary::Imul, ..)) && two_address;
-            for v in [x, y] {
-                if let Location::Imm(imm) = locations[v.index()] {
-                    if pow2_ok && ((imm > 0 && imm.count_ones() == 1) || (mul_imm && fits_imm32(imm))) { must_stay_imm[v.index()] = true; }
-                    else if two_address && in_loop && outer(v) { loop_mat[v.index()] += 1; }
-                }
-            }
-        }
-        Op::Binary(Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor, x, y) | Op::Icmp(_, x, y) if in_loop => {
-            let ty = func.ty(x);
-            for (rhs, v) in [(false, x), (true, y)] {
-                let Location::Imm(imm) = locations[v.index()] else { continue };
-                let inline = if two_address { x64_inline_imm(op, ty, rhs, imm) } else { arm64_inline_imm(op, ty, rhs, imm) };
-                if inline { must_stay_imm[v.index()] = true; } else if two_address && outer(v) { loop_mat[v.index()] += 1; }
-            }
-        }
-        Op::Store(val, ..) | Op::StackStore(val, ..) if in_loop => {
-            if let Location::Imm(imm) = locations[val.index()] {
-                if two_address && (func.ty(val).bytes() < 8 || fits_imm32(imm)) { must_stay_imm[val.index()] = true; }
-                else if two_address && imm != 0 && outer(val) { loop_mat[val.index()] += 1; }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn promote_loop_consts<R>(func: &Function, census: &Uses, loops: &Loops, elided: &[bool], two_address: bool, locations: &mut [Location<R>]) -> Vec<(usize, i64)> {
-    let count = func.types.len();
-    let (mut must_stay_imm, mut loop_mat, mut max_gp) = (vec![false; count], vec![0_u32; count], vec![0_usize; count]);
-    let depths = &loops.depths;
-    let block_gp = (!two_address).then(|| loop_gp_pressure(func, loops, elided, locations));
-    for (b, block) in func.blocks.iter().enumerate() {
-        let depth = depths[b];
-        let outer = |v: Value| census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth);
-        for &inst in &block.insts {
-            let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|r| elided[r.index()]) { continue; }
-            scan_const_op(func, &data.op, locations, (two_address, depth > 0, &outer), (&mut must_stay_imm, &mut loop_mat));
-            data.op.for_operands(|v| {
-                let vi = v.index();
-                if let Location::Imm(imm) = locations[vi]
-                    && func.ty(v) == Type::I64
-                    && expensive_i64_const(imm, two_address)
-                    && ((depth > 0 && (outer(v) || (!two_address && census.uses[vi] >= 2))) || census.uses[vi] >= 4)
-                {
-                    loop_mat[vi] += 1;
-                    if let Some(bgp) = block_gp.as_deref().filter(|_| depth > 0) { max_gp[vi] = max_gp[vi].max(bgp[b]); }
-                }
-            });
-        }
-    }
-    let (mut added, mut promoted) = (0_usize, Vec::new());
-    for (v, loc) in locations.iter_mut().enumerate() {
-        if let Location::Imm(imm) = *loc && imm != 0 && !elided[v] && !must_stay_imm[v] && loop_mat[v] > 0 {
-            if !two_address && max_gp[v] > 0 && max_gp[v] + added >= MAX_ARM64_LOOP_GP { continue; }
-            if !two_address && max_gp[v] > 0 { added += 1; }
-            *loc = Location::Slot;
-            promoted.push((v, imm));
-        }
-    }
-    promoted
-}
-
-fn promote_loop_syms<R: Copy>(func: &Function, census: &Uses, depths: Option<&[u32]>, elided: &[bool], locations: &mut [Location<R>]) -> Vec<(usize, Location<R>)> {
-    let mut in_loop = vec![false; func.types.len()];
-    if let Some(depths) = depths {
-        let outer = |v: Value, depth: u32| census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth);
-        for (b, block) in func.blocks.iter().enumerate().filter(|(b, _)| depths[*b] > 0) {
-            let depth = depths[b];
-            for &inst in &block.insts {
-                let data = &func.insts[inst.index()];
-                if !data.result.is_some_and(|r| elided[r.index()]) {
-                    data.op.for_operands(|v| if matches!(locations[v.index()], Location::SlotAddr(_) | Location::Symbol(_)) && outer(v, depth) { in_loop[v.index()] = true; });
-                }
-            }
-        }
-    }
-    let folds = addressed_images(func);
-    let mut promoted = Vec::new();
-    for (v, loc) in locations.iter_mut().enumerate() {
-        if matches!(*loc, Location::SlotAddr(_) | Location::Symbol(_))
-            && !elided[v]
-            && !folds[v]
-            && (census.uses[v] >= 2 || in_loop[v] || depths.is_some_and(|d| census.def[v].is_some_and(|(db, _)| d[db] > 0)))
-        {
-            promoted.push((v, *loc));
-            *loc = Location::Slot;
-        }
-    }
-    promoted
-}
-
-/// Which image addresses are used only as the address of plain loads and stores or plus a 32-bit constant, which reach them relative to the program counter.
-fn addressed_images(func: &Function) -> Vec<bool> {
-    let mut folds: Vec<bool> = (0..func.types.len()).map(|v| func.is_image_addr(Value(v as u32))).collect();
-    let mut small = vec![false; func.types.len()];
-    for data in &func.insts {
-        if let (Op::Const(k), Some(result)) = (&data.op, data.result) {
-            small[result.index()] = i32::try_from(*k).is_ok();
-        }
-    }
-    for block in &func.blocks {
-        for &inst in &block.insts {
-            match func.insts[inst.index()].op {
-                Op::Load(..) => {}
-                Op::Store(value, ..) => folds[value.index()] = false,
-                Op::Binary(Binary::Iadd | Binary::Isub, _, k) if small[k.index()] => {}
-                ref op => op.for_operands(|v| folds[v.index()] = false),
-            }
-        }
-    }
-    folds
-}
-
 pub(crate) fn plan<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
@@ -673,8 +468,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let cfg = weighed.then(|| func.cfg());
     let loops = cfg.as_ref().map(|cfg| cfg.loops());
     let loop_depths = loops.as_ref().map(|loops| &loops.depths[..]);
-    let promoted_consts = loops.as_deref().map(|loops| promote_loop_consts(func, &census, loops, &elided, regs.two_address, &mut locations)).unwrap_or_default();
-    let promoted_syms = regs.absolute_calls.then(|| promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
+    let promoted_consts = loops.as_deref().map(|loops| consts::promote_loop_consts(func, &census, loops, &elided, regs.two_address, &mut locations)).unwrap_or_default();
+    let promoted_syms = regs.absolute_calls.then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
     let live = live(func, order, copied, &tracked, &sib, &elided);
@@ -774,18 +569,14 @@ fn parked<R: Copy + PartialEq>(
             _ => continue,
         };
         let ranges = live.ranges_of(index);
-        if ranges.is_empty() {
-            continue;
-        }
+        if ranges.is_empty() { continue; }
         let value = Value(index as u32);
         for r in ranges {
             let first = live.calls.partition_point(|at| *at <= r.start);
             let last = live.calls.partition_point(|at| *at <= r.end);
             for call in first..last {
                 let at = live.calls[call];
-                if at < r.end || !passed_own(func, live.sites[call].0, value, park_reg, classify) {
-                    at_call[call].push((value, park_reg, at < r.end));
-                }
+                if at < r.end || !passed_own(func, live.sites[call].0, value, park_reg, classify) { at_call[call].push((value, park_reg, at < r.end)); }
             }
         }
     }

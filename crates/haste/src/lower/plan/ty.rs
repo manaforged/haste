@@ -595,6 +595,8 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     hash_sig(mix, &sig);
     mix.bool(callee.ret.is_some_and(|r| matches!(cx.types.kind(r), Kind::Never)));
     mix.bool(callee_idx == caller);
+    mix.bool(reached.may_unwind(cx, callee_idx));
+    mix.bool(cx.track_caller(item));
     if foreign {
         return hash_foreign_callee(cx, mix, callee);
     }

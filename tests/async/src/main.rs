@@ -188,10 +188,43 @@ fn case_async_done_drop(n: i64) -> i64 {
     log.get() * 100 + got
 }
 
+enum Stage<F> {
+    Running(F),
+    Empty,
+}
+
+#[inline(never)]
+fn drop_unresumed_stage<F>(f: F) {
+    let mut stage = Stage::Running(f);
+    let dropper = |p: *mut Stage<F>| unsafe {
+        std::ptr::drop_in_place(p);
+    };
+    dropper(&mut stage as *mut Stage<F>);
+    std::mem::forget(stage);
+}
+
+fn case_async_unresumed_drop(n: i64) -> i64 {
+    let log = std::cell::Cell::new(0);
+    let a = Loud(&log, 1);
+    let b = Box::new(Loud(&log, 2));
+    drop_unresumed_stage(async move {
+        let _ = (&a, &b);
+        YieldOnce(false, n).await
+    });
+    let tag = n as usize;
+    let c = Loud(&log, 3);
+    let d = Box::new(Loud(&log, 4));
+    drop_unresumed_stage(async move {
+        let _ = (tag, &c, &d);
+        YieldOnce(false, n).await
+    });
+    log.get() * 100 + n
+}
+
 include!("../../case_inputs.rs");
 
 fn main() {
-    let cases: [(&str, fn(i64) -> i64); 18] = [
+    let cases: [(&str, fn(i64) -> i64); 19] = [
         ("case_mod_fn", case_mod_fn),
         ("case_mod_macro", case_mod_macro),
         ("case_mod_sync", case_mod_sync),
@@ -210,6 +243,7 @@ fn main() {
         ("case_async_borrow", case_async_borrow),
         ("case_async_drop", case_async_drop),
         ("case_async_done_drop", case_async_done_drop),
+        ("case_async_unresumed_drop", case_async_unresumed_drop),
     ];
     for (name, case) in cases {
         for n in CASE_INPUTS {

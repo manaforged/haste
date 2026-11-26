@@ -345,6 +345,8 @@ pub struct Env {
     pub release: bool,
     /// Whether the crate's sources cannot change while haste runs: the standard library, or a registry or git package.
     pub fixed: bool,
+    /// Whether `cfg(test)` is enabled for this crate.
+    pub test: bool,
 }
 
 /// The build profile every crate compiles under: Cargo's dev profile, or its release profile.
@@ -397,7 +399,7 @@ impl Env {
 
     fn name(&self, name: &str) -> Truth {
         if name == "test" {
-            return if crate::test_mode() && !self.fixed { Truth::Yes } else { Truth::No };
+            return truth(self.test);
         }
         if self.target.has_name(name) || self.profile().contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
             Truth::Yes

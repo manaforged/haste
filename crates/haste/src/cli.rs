@@ -141,6 +141,21 @@ pub(crate) fn test_items(workspace: &graph::Workspace, outline: &outline::Outlin
         .collect()
 }
 
+fn panic_payload(stderr: &str) -> Option<&str> {
+    let mut offset = 0;
+    for line in stderr.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with("thread '") && trimmed.contains(" panicked at ") && trimmed.ends_with(':') {
+            let rest = &stderr[offset + line.len()..];
+            let body = rest.split("\nnote: run with ").next().unwrap_or(rest);
+            let body = body.split("\nstack backtrace:").next().unwrap_or(body);
+            return Some(body.trim_end_matches(['\r', '\n']));
+        }
+        offset += line.len();
+    }
+    None
+}
+
 /// Formats and prints standard Rust test output and returns 0 when all tests pass, else 101.
 pub(crate) fn print_test_report(
     entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
@@ -158,7 +173,7 @@ pub(crate) fn print_test_report(
         match outcome {
             Ok((status, stderr)) => {
                 let expected_ok = match (&meta.expected, stderr) {
-                    (Some(exp), Some(err)) => err.contains(exp.as_str()),
+                    (Some(exp), Some(err)) => panic_payload(err).is_some_and(|msg| msg.contains(exp.as_str())),
                     (Some(_), None) => false,
                     (None, _) => true,
                 };
@@ -526,6 +541,8 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
                 let value = args.next().context("-o takes a file path")?;
                 *out = Some(PathBuf::from(value));
             }
+            _ if flag == "--" => break,
+            _ if flag.starts_with('-') && flag != "-" => anyhow::bail!("unknown option `{flag}`\n{}", usage()),
             _ => break,
         }
     }
@@ -566,11 +583,18 @@ fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
         return Ok(Err(meta));
     }
     crate::set_selection(selection);
-    if matches!(command, Command::Request(Request::Test)) {
+    if matches!(command, Command::Request(Request::Test))
+        || (matches!(command, Command::Serve) && std::env::var_os("HASTE_SERVE_TEST").is_some_and(|v| v == "1"))
+    {
         crate::set_test_mode();
     }
     if !matches!(command, Command::Request(Request::Build)) && (stats_json.is_some() || out.is_some()) {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
+    }
+    if crate::compile_target().triple != haste_codegen::Target::host().triple
+        && !(matches!(command, Command::Request(Request::Build)) && out.is_some())
+    {
+        anyhow::bail!("--target {} is only supported with `haste build -o`", crate::compile_target().triple);
     }
     if crate::image::watch::enabled() && !matches!(command, Command::Request(Request::Run)) {
         anyhow::bail!("--watch is only supported with `haste run`");
@@ -602,8 +626,16 @@ fn print_meta(meta: Meta) {
     }
 }
 
+fn can_serve(command: Command, stats_json: Option<&std::path::Path>) -> bool {
+    matches!(command, Command::Request(_))
+        && stats_json.is_none()
+        && !crate::image::watch::enabled()
+        && crate::compile_target().triple == haste_codegen::Target::host().triple
+        && std::env::var_os("HASTE_NO_DAEMON").is_none_or(|v| v != "1")
+}
+
 fn try_serve(command: Command, root: &std::path::Path, stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>, argv: &[String]) -> Result<Option<i32>> {
-    if stats_json.is_some() || crate::image::watch::enabled() || crate::compile_target().triple != haste_codegen::Target::host().triple {
+    if !can_serve(command, stats_json) {
         return Ok(None);
     }
     match command {
@@ -634,7 +666,15 @@ pub fn main() -> Result<()> {
     if let Some(status) = try_serve(command, &root, stats_json.as_deref(), abs_out.as_deref(), &argv)? {
         std::process::exit(status);
     }
-    match report(command, &root, &argv, stats_json.as_deref(), abs_out.as_deref())? {
+    let status = report(command, &root, &argv, stats_json.as_deref(), abs_out.as_deref())?;
+    if status == 0
+        && cfg!(unix)
+        && can_serve(command, stats_json.as_deref())
+        && let Command::Request(request) = command
+    {
+        crate::serve::spawn(&root, request, abs_out.as_deref());
+    }
+    match status {
         0 => Ok(()),
         status => std::process::exit(status),
     }

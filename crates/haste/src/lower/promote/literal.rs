@@ -113,6 +113,12 @@ impl Lower<'_, '_> {
                 .write_slice_coercion(scope, (expr, ty), len_ty, at, (out, relocs), depth)
                 .or_else(|| self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth)),
             Some(Coercion::Deref(..)) => self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth),
+            Some(&Coercion::Reify(Res::Fn(item, substs))) => {
+                let idx = self.rodata_fn_target(item, substs)?;
+                out.get_mut(at..at + 8)?.fill(0);
+                relocs.push(RodataReloc { offset: u32::try_from(at).ok()?, target: RodataTarget::Fn(idx) });
+                Some(())
+            }
             Some(_) => None,
         }
     }

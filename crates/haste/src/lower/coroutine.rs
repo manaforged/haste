@@ -238,7 +238,10 @@ impl Lower<'_, '_> {
         self.enter(unresumed);
         let (inner, offset) = self.captures_of(ty)?;
         let place = Place { base: Base::Addr(target), offset, repr: repr(self.cx, inner)? };
-        self.drop_fields(inner, place, super::reloc::TyOrigin::Subst(0))?;
+        let captures_origin = super::reloc::TyOrigin::Subst(0)
+            .step(super::reloc::CLOSURE_ENV_STEP, 0)
+            .step(0, Self::COROUTINE_CAPTURES_FIELD);
+        self.drop_fields(inner, place, captures_origin)?;
         self.jump(out, &[]);
         self.enter(check);
         let waiting = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, state, Coroutine::FIRST_SUSPEND);
@@ -258,11 +261,13 @@ impl Lower<'_, '_> {
         Ok((self.field_offset(env, 0)?, self.field_offset(env, 1)?))
     }
 
+    const COROUTINE_CAPTURES_FIELD: u32 = 2;
+
     /// The tuple of a coroutine's captures and its offset in the coroutine object, after the state word and the frame pointer.
     pub(super) fn captures_of(&mut self, ty: Ty) -> Result<(Ty, i32)> {
         let Some(env) = self.cx.closure_env(ty) else { bail!("a coroutine whose defining body was not inferred") };
         let Kind::Tuple(items) = *self.cx.types.kind(env) else { bail!("a coroutine whose object is not a tuple") };
-        let Some(&inner) = self.cx.types.substs(items).get(2) else { bail!("a coroutine object with no captures") };
-        Ok((inner, self.field_offset(env, 2)?))
+        let Some(&inner) = self.cx.types.substs(items).get(Self::COROUTINE_CAPTURES_FIELD as usize) else { bail!("a coroutine object with no captures") };
+        Ok((inner, self.field_offset(env, Self::COROUTINE_CAPTURES_FIELD)?))
     }
 }

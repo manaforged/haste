@@ -23,20 +23,30 @@ use literal::Scope;
 
 impl Lower<'_, '_> {
     /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one; in a constant or static initializer, which the compiler evaluates once, also a call, operator or block of them.
-    pub fn promotable(&self, expr: ExprId) -> bool {
+    pub fn promotable(&mut self, expr: ExprId) -> Result<bool> {
         let item = self.reached.list[self.index].0.0;
         self.promotable_in(expr, matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static))
     }
 
-    fn promotable_in(&self, expr: ExprId, constant: bool) -> bool {
+    fn promotable_in(&mut self, expr: ExprId, constant: bool) -> Result<bool> {
         if let Some(inner) = self.transparent(expr) {
             return self.promotable_in(inner, constant);
         }
-        let all = |list: crate::body::List| self.body.list(list).iter().all(|&at| self.promotable_in(ExprId(at), constant));
-        match *self.body.expr(expr) {
+        if !constant && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
+            return Ok(false);
+        }
+        let all = |lower: &mut Self, list: crate::body::List| -> Result<bool> {
+            for &at in lower.body.list(list).to_vec().iter() {
+                if !lower.promotable_in(ExprId(at), constant)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        Ok(match *self.body.expr(expr) {
             Expr::Lit(..) => true,
             Expr::Closure { .. } => !self.cx.closure_takes_env(self.ty_of(expr)),
-            Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable_in(inner, constant),
+            Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable_in(inner, constant)?,
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Fn(item, _)) => {
                     matches!(self.cx.item(*item).1.kind, ItemKind::Const | ItemKind::Fn)
@@ -50,16 +60,37 @@ impl Lower<'_, '_> {
                     Some(Res::Fn(item, _)) => constant || self.cx.rustc_promotable(*item),
                     _ => false,
                 };
-                callable && all(list)
+                callable && all(self, list)?
             }
-            Expr::Method { receiver, params, .. } => constant && self.promotable_in(receiver, constant) && all(params),
-            Expr::Unary(_, inner) | Expr::Cast(inner, _) => constant && self.promotable_in(inner, constant),
-            Expr::Binary(_, left, right) => constant && self.promotable_in(left, constant) && self.promotable_in(right, constant),
-            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } => constant && self.body.list(stmts).is_empty() && self.promotable_in(tail, constant),
-            Expr::Array(list) | Expr::Tuple(list) => all(list),
-            Expr::Struct { fields, base: None, .. } => self.body.list(fields).iter().all(|&at| self.promotable_in(self.body.fields[at as usize].value, constant)),
+            Expr::Method { receiver, params, .. } => constant && self.promotable_in(receiver, constant)? && all(self, params)?,
+            Expr::Unary(_, inner) | Expr::Cast(inner, _) => constant && self.promotable_in(inner, constant)?,
+            Expr::Binary(_, left, right) => constant && self.promotable_in(left, constant)? && self.promotable_in(right, constant)?,
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } => {
+                constant && self.body.list(stmts).is_empty() && self.promotable_in(tail, constant)?
+            }
+            Expr::Array(list) | Expr::Tuple(list) => all(self, list)?,
+            Expr::Repeat(val, _) => self.promotable_in(val, constant)?,
+            Expr::Range { from: start, to: end, .. } => {
+                start.map_or(Ok(true), |e| self.promotable_in(e, constant))?
+                    && end.map_or(Ok(true), |e| self.promotable_in(e, constant))?
+            }
+            Expr::Index(base, idx) => constant && self.promotable_in(base, constant)? && self.promotable_in(idx, constant)?,
+            Expr::If(cond, then, alt) => {
+                constant
+                    && self.promotable_in(cond, constant)?
+                    && self.promotable_in(then, constant)?
+                    && alt.map_or(Ok(true), |e| self.promotable_in(e, constant))?
+            }
+            Expr::Struct { fields, base, .. } => {
+                for &at in self.body.list(fields).to_vec().iter() {
+                    if !self.promotable_in(self.body.fields[at as usize].value, constant)? {
+                        return Ok(false);
+                    }
+                }
+                base.map_or(Ok(true), |e| self.promotable_in(e, constant))?
+            }
             _ => false,
-        }
+        })
     }
 
     /// The address of a program-lifetime cell that holds `expr`, which the first use fills.
@@ -139,7 +170,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn static_rodata_blob(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
-        if self.is_mutable_static(item) || !super::is_freeze_ty(self.cx, ty, 0) {
+        if self.is_mutable_static(item) || self.cx.thread_local(item) || !super::is_freeze_ty(self.cx, ty, 0) {
             return Ok(None);
         }
         self.static_literal(item, substs, ty)
@@ -151,7 +182,7 @@ impl Lower<'_, '_> {
     }
 
     fn static_literal(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
-        if self.cx.foreign(item) || self.cx.thread_local(item) {
+        if self.cx.foreign(item) {
             return Ok(None);
         }
         if self.cx.layout(ty)?.align.bytes() > 16 {
@@ -205,7 +236,7 @@ impl Lower<'_, '_> {
 
     fn ensure_static_filled(&mut self, index: usize, address: Value, size: i32) -> Result<()> {
         let flag = self.ins().iadd_imm(address, i64::from(size));
-        let state = self.ins().atomic_load(Type::I8, flag);
+        let state = self.ins().atomic_load(Type::I8, flag, haste_codegen::AtomicOrd::Acquire);
         let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
         self.unless(filled, |lower| {
             let usize_ty = lower.cx.types.prim(Primitive::Usize);
@@ -227,24 +258,33 @@ impl Lower<'_, '_> {
         if let Some(base) = self.non_zero_static_rodata(index, item, substs, ty)? {
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
-        let (address, size) = self.static_cell(index, ty)?;
-        if !self.cx.foreign(item) && index != self.index && !self.zero_static(item, substs, ty)? {
+        let is_tls = !self.cx.foreign(item) && self.cx.thread_local(item);
+        let needs_fill = !self.cx.foreign(item) && index != self.index && !self.zero_static(item, substs, ty)?;
+        let (address, size) = self.static_cell(index, ty, is_tls && needs_fill)?;
+        if !is_tls && needs_fill {
             self.ensure_static_filled(index, address, size)?;
         }
         Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
     }
 
-    fn static_cell(&mut self, index: usize, ty: Ty) -> Result<(Value, i32)> {
+    /// Calls `HostSymbol::ThreadCell(slot, size, init_slot)` with the shared 3-argument ABI.
+    pub(super) fn call_thread_cell(&mut self, slot: Value, size: i64, init_slot: Option<Value>) -> Result<Value> {
+        let usize_ty = self.cx.types.prim(Primitive::Usize);
+        let code = self.emit_symbol(SymbolSource::Host(HostSymbol::ThreadCell));
+        self.b.func.mark_thread_cell(code);
+        let init = init_slot.unwrap_or_else(|| self.ins().iconst(Type::I64, 0));
+        let args = vec![slot, self.ins().iconst(Type::I64, size), init];
+        let cell = self.call_code(code, (vec![usize_ty, usize_ty, usize_ty], Some(usize_ty)), args)?;
+        cell.ok_or_else(|| anyhow::anyhow!("no thread cell"))
+    }
+
+    fn static_cell(&mut self, index: usize, ty: Ty, init_tls: bool) -> Result<(Value, i32)> {
         let size = self.cx.layout(ty)?.size.bytes() as u32;
         let item = self.reached.list[index].0.0;
         if !self.cx.foreign(item) && self.cx.thread_local(item) {
-            let usize_ty = self.cx.types.prim(Primitive::Usize);
-            let code = self.emit_symbol(SymbolSource::Host(HostSymbol::ThreadCell));
-            self.b.func.mark_thread_cell(code);
             let idx_val = self.emit_symbol(SymbolSource::ThreadSlot(index));
-            let args = vec![idx_val, self.ins().iconst(Type::I64, i64::from(size) + 1)];
-            let cell = self.call_code(code, (vec![usize_ty, usize_ty], Some(usize_ty)), args)?;
-            return Ok((cell.ok_or_else(|| anyhow::anyhow!("no thread cell"))?, size as i32));
+            let init = init_tls.then(|| self.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index))));
+            return Ok((self.call_thread_cell(idx_val, i64::from(size), init)?, size as i32));
         }
         let address = self.emit_symbol(SymbolSource::StaticCell { index, size });
         Ok((address, size as i32))
@@ -254,7 +294,7 @@ impl Lower<'_, '_> {
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
         let (item, ty) = (self.reached.list[self.index].0.0, self.typed.ret_ty());
         if self.open && crate::prep::static_address(self.cx, item).is_none() {
-            let (address, _) = self.static_cell(self.index, ty)?;
+            let (address, _) = self.static_cell(self.index, ty, false)?;
             let place = Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? };
             if let Some(value) = value {
                 self.write(place, value);
@@ -306,10 +346,24 @@ impl Lower<'_, '_> {
         self.materialize_blob(expr, ty, blob)
     }
 
+    /// Resolves a function item to a reached index when safe to embed as a constant rodata relocation.
+    pub(super) fn rodata_fn_target(&mut self, item: ItemRef, substs: Substs) -> Option<usize> {
+        let enclosing_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
+        if (enclosing_generic && !self.cx.types.substs(substs).is_empty())
+            || self.cx.types.substs_have_params(substs)
+            || self.cx.intrinsic(item).is_some()
+        {
+            return None;
+        }
+        self.reached_index(item, substs).ok()
+    }
+
     fn materialize_mem_blob(&mut self, expr: ExprId, ty: Ty, bytes: &[u8], relocs: &[RodataReloc]) -> Result<Option<Value>> {
-        if bytes.len() == 16 && matches!(relocs, [RodataReloc { offset: 0, .. }]) && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) {
-            let RodataTarget::Rodata(child_id) = relocs[0].target;
-            let data = self.emit_child_rodata(child_id);
+        if bytes.len() == 16
+            && let [RodataReloc { offset: 0, target: RodataTarget::Rodata(child_id) }] = relocs
+            && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _))
+        {
+            let data = self.emit_child_rodata(*child_id);
             let len = u64::from_le_bytes(bytes[8..].try_into()?);
             return Ok(Some(self.wide_pointer(data, len as i64)));
         }

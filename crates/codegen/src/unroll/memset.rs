@@ -65,6 +65,15 @@ fn fill_store(func: &Function, body: &[Inst], params: &[Value], defs: &[bool], g
     Some(Fill { value, byte, addr_idx, off, width: i64::from(ty.bytes()) })
 }
 
+/// The number of operand reads of `v` inside `body`.
+pub(super) fn use_count(func: &Function, body: &[Inst], v: Value) -> usize {
+    let mut uses = 0;
+    for &inst in body {
+        func.insts[inst.index()].op.for_operands(|o| uses += usize::from(o == v));
+    }
+    uses
+}
+
 /// The constant step of each loop parameter, zero when it passes through unchanged, or `None` when it does not step by a constant.
 pub(super) fn steps(func: &Function, body: &[Inst], params: &[Value], back_args: &[Value], global_consts: &[Option<i64>]) -> Vec<Option<i64>> {
     let step = |param: Value, next: Value| -> Option<i64> {

@@ -104,7 +104,10 @@ fn turbofish(src: &Source, at: u32) -> bool {
 }
 
 fn unquote(text: &str) -> String {
-    text.trim_start_matches('r').trim_matches('#').trim_matches('"').to_owned()
+    crate::body::literal::string_bytes(text)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| text.to_owned())
 }
 
 fn joined(src: &Source, from: u32, to: u32) -> String {

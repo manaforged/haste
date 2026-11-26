@@ -70,11 +70,11 @@ pub(in crate::lower) fn closure_calls_uncached(cx: &mut Context<'_>, typed: &Typ
 }
 
 fn push_coercion_calls(coercion: &Coercion, out: &mut Vec<Res>) {
-    match coercion {
+    match coercion.leaf() {
         Coercion::Vtable(vt) => out.extend(vt.calls().into_iter().copied()),
         Coercion::Reify(res) => out.push(*res),
         Coercion::Deref(steps, _) => out.extend(steps.iter().filter_map(|(_, r)| *r)),
-        Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => {}
+        Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) | Coercion::Field { .. } => {}
     }
 }
 

@@ -86,11 +86,17 @@ fn test(func: &Function, defs: &[Option<Inst>], users: &[u32], block: Block) -> 
         return None;
     }
     let local = |inst: &Inst| func.insts[inst.index()].result.is_some_and(|res| users[res.index()] == 1);
-    if !body.iter().all(|inst| local(inst) && matches!(func.insts[inst.index()].op, Op::Const(_) | Op::Icmp(..))) {
+    if !body.iter().all(|inst| {
+        let op = &func.insts[inst.index()].op;
+        local(inst) && (matches!(op, Op::Const(_)) || crate::algebra::branch_cmp(op).is_some())
+    }) {
         return None;
     }
     let def = defs[cond.index()].filter(|inst| body.contains(inst))?;
-    let Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), a, b) = func.insts[def.index()].op else { return None };
+    let (cc @ (IntCC::Equal | IntCC::NotEqual), a, b) = crate::algebra::branch_cmp(&func.insts[def.index()].op)? else { return None };
+    if !func.ty(a).is_small_int() {
+        return None;
+    }
     let constant_of = |v: Value| match defs[v.index()].map(|inst| &func.insts[inst.index()].op) {
         Some(&Op::Const(imm)) => Some(imm),
         _ => None,

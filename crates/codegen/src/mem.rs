@@ -89,6 +89,7 @@ impl TrackRoot {
 pub(crate) struct Provenance {
     pub slot_offsets: Vec<Option<(StackSlot, i32)>>,
     pub unescaped_slots: Vec<bool>,
+    pub addr_unescaped_slots: Vec<bool>,
     pub call_readonly_slots: Vec<bool>,
     pub return_only_slots: Vec<bool>,
     pub noalias_escaped: Vec<bool>,
@@ -324,6 +325,7 @@ impl Provenance {
             prov.frontiers = escape::frontiers(func, &esc);
         }
         prov.unescaped_slots = esc.unescaped;
+        prov.addr_unescaped_slots = esc.addr_unescaped;
         prov.call_readonly_slots = esc.call_readonly;
         prov.return_only_slots = esc.return_only;
         prov.noalias_escaped = esc.noalias;
@@ -448,6 +450,11 @@ impl Provenance {
         self.unescaped_slots.get(slot.index()).copied().unwrap_or(false)
     }
 
+    /// Whether `slot`'s address never escapes to normal memory ops or calls, ignoring unwind-drop table reads.
+    pub(crate) fn slot_addr_unescaped(&self, slot: StackSlot) -> bool {
+        self.addr_unescaped_slots.get(slot.index()).copied().unwrap_or(false)
+    }
+
     pub(crate) fn escaped_slots(&self) -> Vec<bool> {
         self.unescaped_slots.iter().map(|&u| !u).collect()
     }
@@ -496,7 +503,7 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
         (MemRoot::NoAliasParam(p), MemRoot::Unknown) | (MemRoot::Unknown, MemRoot::NoAliasParam(p)) => !prov.noalias_unescaped(p),
         (MemRoot::Slot(_), _) if prov.is_incoming(b.base) => false,
         (_, MemRoot::Slot(_)) if prov.is_incoming(a.base) => false,
-        (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_unescaped(s) && !prov.slot_return_only(s),
+        (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_addr_unescaped(s) && !prov.slot_return_only(s),
         _ => true,
     }
 }
@@ -526,7 +533,7 @@ pub(crate) fn stack_store_overlaps(func: &Function, op: &Op, slot: StackSlot, (o
 
 /// Whether `op` is an atomic memory op or fence.
 pub(crate) fn is_atomic_barrier(op: &Op) -> bool {
-    matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)
+    matches!(op, Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..))
 }
 
 /// Whether `op` prevents hoisting, sinking, or rematerializing memory accesses across it.
@@ -567,14 +574,17 @@ pub(crate) fn clobbers_op(func: &Function, (op, at): (&Op, Option<Inst>), loc: M
         }
         Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
             MemRoot::Slot(s) => {
-                !prov.slot_unescaped(s) && prov.slot_escaped_at(s, at) && !prov.slot_call_readonly(s) && (!prov.slot_return_only(s) || args.iter().any(|&arg| prov.loc(arg, 0, 1).root == MemRoot::Slot(s)))
+                let escaped = if matches!(*op, Op::TryCall { .. }) { !prov.slot_unescaped(s) } else { !prov.slot_addr_unescaped(s) };
+                escaped && prov.slot_escaped_at(s, at) && !prov.slot_call_readonly(s) && (!prov.slot_return_only(s) || args.iter().any(|&arg| prov.loc(arg, 0, 1).root == MemRoot::Slot(s)))
             }
             MemRoot::NoAliasParam(p) => {
                 !prov.noalias_unescaped(p) || call_writes_noalias(&func.sigs[sig.index()].params, args, prov, p)
             }
             _ => !prov.private_frame(loc),
         },
-        _ => is_atomic_barrier(op) && !(prov.private_frame(loc) && !prov.touches_frame(op)),
+        _ => is_atomic_barrier(op)
+            && !(prov.private_frame(loc) && !prov.touches_frame(op))
+            && !matches!(loc.root, MemRoot::Slot(s) if prov.slot_addr_unescaped(s)),
     }
 }
 

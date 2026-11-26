@@ -17,6 +17,7 @@ pub(super) const MAX_CONST_STEPS: u32 = 8_192;
 pub(super) enum PtrTarget {
     Obj { id: u32, addend: u64 },
     Rodata { id: RodataId, addend: u64 },
+    Fn(usize),
     Dangling(u64),
 }
 
@@ -126,6 +127,7 @@ impl PtrTarget {
         match self {
             Self::Obj { id, addend } => ((u64::from(id) + 1) << 32).wrapping_add(addend),
             Self::Rodata { id, addend } => ((u64::from(id.0) + 1) << 48).wrapping_add(addend),
+            Self::Fn(idx) => ((idx as u64 + 1) << 40) | 1,
             Self::Dangling(align) => align.max(1),
         }
     }
@@ -135,8 +137,9 @@ impl PtrTarget {
         match self {
             Self::Obj { id, addend } => addend.checked_add(delta).map(|addend| Self::Obj { id, addend }),
             Self::Rodata { id, addend } => addend.checked_add(delta).map(|addend| Self::Rodata { id, addend }),
+            Self::Fn(idx) if delta == 0 => Some(Self::Fn(idx)),
             Self::Dangling(align) if delta == 0 => Some(Self::Dangling(align)),
-            Self::Dangling(_) => None,
+            Self::Fn(_) | Self::Dangling(_) => None,
         }
     }
 }
@@ -225,15 +228,16 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
         let mut bytes = val.bytes;
         let mut relocs = Vec::new();
         for (off, target) in val.ptrs {
-            let rod_id = match target {
-                PtrTarget::Obj { id, addend: 0 } => self.export_obj(id, exported)?,
+            let reloc_target = match target {
+                PtrTarget::Obj { id, addend: 0 } => RodataTarget::Rodata(self.export_obj(id, exported)?),
                 PtrTarget::Obj { .. } => return None,
-                PtrTarget::Rodata { id, addend: 0 } => id,
+                PtrTarget::Rodata { id, addend: 0 } => RodataTarget::Rodata(id),
                 PtrTarget::Rodata { .. } => return None,
-                PtrTarget::Dangling(_) => self.lower.slots.rodata(&[], &[]),
+                PtrTarget::Fn(idx) => RodataTarget::Fn(idx),
+                PtrTarget::Dangling(_) => RodataTarget::Rodata(self.lower.slots.rodata(&[], &[])),
             };
             bytes.get_mut(off..off + 8)?.fill(0);
-            relocs.push(RodataReloc { offset: u32::try_from(off).ok()?, target: RodataTarget::Rodata(rod_id) });
+            relocs.push(RodataReloc { offset: u32::try_from(off).ok()?, target: reloc_target });
         }
         Some((bytes, relocs))
     }

@@ -1,11 +1,12 @@
-use super::dom::{clobbers_loc, loc_immutable};
-use super::{Assembled, State, assemble_const, emit_op};
+use super::dom::{BlockWrites, clobbers_loc, loc_immutable};
+use super::{Assembled, State, addr_loc, assemble_const, emit_op};
 use crate::cfg::Cfg;
 use crate::ir::{Binary, Block, Convert, Function, Inst, Lane, Op, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, may_alias};
 use crate::merge::find;
 
-const MAX_JOIN_PHIS_PER_BLOCK: usize = 8;
+const MAX_JOIN_PHIS_PER_BLOCK: u8 = 8;
+const MAX_JOIN_ANCESTOR_HOPS: usize = 3;
 
 pub(super) enum BlockClobber {
     Loc(MemLoc),
@@ -15,10 +16,13 @@ pub(super) enum BlockClobber {
 
 pub(super) struct JoinCtx<'a> {
     pub cfg: &'a Cfg,
+    pub bw: &'a BlockWrites<'a>,
     pub known_out: &'a [KnownLoads],
+    pub block_bases: &'a [Vec<(MemBase, MemRoot)>],
+    pub visited: &'a [bool],
     pub def_blocks: &'a mut Vec<Option<Block>>,
     pub preds: Option<Vec<Block>>,
-    pub added_phis: usize,
+    pub added_phis: &'a mut [u8],
 }
 
 pub(super) fn int_of(ty: Type) -> Option<Type> {
@@ -330,40 +334,27 @@ fn join_clobbered(func: &Function, prov: &crate::mem::Provenance, loc: MemLoc, c
     })
 }
 
-pub(super) fn try_join_phi_forward(
+fn validate_plan(plan: LocPlan, pred: Block, state: &State<'_>, join: &JoinCtx<'_>) -> Option<LocPlan> {
+    match plan {
+        LocPlan::Exact(raw) => {
+            let v = find(state.subst, raw);
+            join.def_blocks.get(v.index()).copied().flatten().is_some_and(|d| join.cfg.dominates(d, pred)).then_some(LocPlan::Exact(v))
+        }
+        LocPlan::Subword(sub) => {
+            join.def_blocks.get(sub.kval().index()).copied().flatten().is_some_and(|d| join.cfg.dominates(d, pred)).then_some(LocPlan::Subword(sub))
+        }
+        c @ LocPlan::Const(_) => Some(c),
+    }
+}
+
+fn finish_join_forward(
     func: &mut Function,
-    (block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
+    (join_block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
     state: &mut State<'_>,
     known: &mut KnownLoads,
     join: &mut JoinCtx<'_>,
-    clobbers_seen: &[BlockClobber],
+    plans: Vec<(Block, LocPlan)>,
 ) -> Option<Option<Value>> {
-    let preds = join.preds.as_ref()?;
-    if matches!(loc.base, MemBase::Addr(b) if !join.def_blocks.get(b.index()).copied().flatten().is_some_and(|d| d != block && join.cfg.dominates(d, block)))
-        || join_clobbered(func, state.prov, loc, clobbers_seen)
-    {
-        return None;
-    }
-    let mut plans: Vec<(Block, LocPlan)> = Vec::with_capacity(preds.len());
-    for &p in preds {
-        let plan = match plan_loc(func, state, &join.known_out[p.index()], loc, ty)? {
-            LocPlan::Exact(raw) => {
-                let v = find(state.subst, raw);
-                if !join.def_blocks.get(v.index()).copied().flatten().is_some_and(|d| join.cfg.dominates(d, p)) {
-                    return None;
-                }
-                LocPlan::Exact(v)
-            }
-            LocPlan::Subword(sub) => {
-                if !join.def_blocks.get(sub.kval().index()).copied().flatten().is_some_and(|d| join.cfg.dominates(d, p)) {
-                    return None;
-                }
-                LocPlan::Subword(sub)
-            }
-            c @ LocPlan::Const(_) => c,
-        };
-        plans.push((p, plan));
-    }
     if let (_, LocPlan::Exact(v0)) = plans[0]
         && plans.iter().all(|&(_, pl)| matches!(pl, LocPlan::Exact(v) if v == v0))
     {
@@ -385,7 +376,7 @@ pub(super) fn try_join_phi_forward(
         known.remember(loc, ty, result);
         return Some(None);
     }
-    if join.added_phis >= MAX_JOIN_PHIS_PER_BLOCK {
+    if join.added_phis[join_block.index()] >= MAX_JOIN_PHIS_PER_BLOCK {
         return None;
     }
     let mut vals: Vec<(Block, Value)> = Vec::with_capacity(plans.len());
@@ -396,12 +387,179 @@ pub(super) fn try_join_phi_forward(
         vals.push((p, val));
     }
     let phi = func.value(ty);
-    func.blocks[block.index()].params.push(phi);
+    func.blocks[join_block.index()].params.push(phi);
     state.subst.push(phi);
     state.consts.push(None);
-    def_blocks.resize(func.types.len(), Some(block));
-    join.added_phis += 1;
-    vals.into_iter().for_each(|(p, v)| for_edge_args_mut(func, p, block, |a| a.push(v)));
+    def_blocks.resize(func.types.len(), Some(join_block));
+    def_blocks[phi.index()] = Some(join_block);
+    join.added_phis[join_block.index()] += 1;
+    vals.into_iter().for_each(|(p, v)| for_edge_args_mut(func, p, join_block, |a| a.push(v)));
     known.remember(loc, ty, phi);
     Some(Some(phi))
+}
+
+fn peel_scaled(func: &Function, state: &State<'_>, raw: Value) -> Option<(Value, i64)> {
+    let v = find(state.subst, raw);
+    let inst = state.defs.get(v.index()).copied().flatten()?;
+    match func.insts[inst.index()].op {
+        Op::Binary(Binary::Ishl, x, s) => {
+            let sh = state.consts.get(find(state.subst, s).index()).copied().flatten()?;
+            (0..=6).contains(&sh).then(|| (find(state.subst, x), 1_i64 << sh))
+        }
+        Op::Binary(Binary::Imul, x, y) => {
+            let (x, y) = (find(state.subst, x), find(state.subst, y));
+            if let Some(c) = state.consts.get(y.index()).copied().flatten().filter(|&c| c != 0) {
+                Some((x, c))
+            } else {
+                state.consts.get(x.index()).copied().flatten().filter(|&c| c != 0).map(|c| (y, c))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn matches_indexed(func: &Function, state: &State<'_>, raw: Value, base: Value, idx: Value, stride: i64) -> bool {
+    let v = find(state.subst, raw);
+    let Some(inst) = state.defs.get(v.index()).copied().flatten() else { return false };
+    let Op::Binary(Binary::Iadd, a, b) = func.insts[inst.index()].op else { return false };
+    let (a, b) = (find(state.subst, a), find(state.subst, b));
+    let side_matches = |base_cand: Value, scaled_cand: Value| -> bool {
+        if base_cand != base {
+            return false;
+        }
+        if stride == 1 && scaled_cand == idx {
+            return true;
+        }
+        peel_scaled(func, state, scaled_cand) == Some((idx, stride))
+    };
+    side_matches(a, b) || side_matches(b, a)
+}
+
+fn edge_param_arg(func: &Function, subst: &[Value], pred: Block, target: Block, param_idx: usize) -> Option<Value> {
+    let mut found: Option<Value> = None;
+    let mut ok = true;
+    let last = func.last(pred)?;
+    if !for_edge_args(last, target, |args| {
+        if let Some(&arg) = args.get(param_idx) {
+            let c = find(subst, arg);
+            if let Some(prev) = found {
+                ok &= prev == c;
+            } else {
+                found = Some(c);
+            }
+        } else {
+            ok = false;
+        }
+    }) || !ok
+    {
+        return None;
+    }
+    found
+}
+
+fn match_indexed_phi(func: &Function, state: &State<'_>, join: &JoinCtx<'_>, join_block: Block, addr: Value) -> Option<(Value, usize, i64)> {
+    let inst = state.defs.get(addr.index()).copied().flatten()?;
+    let Op::Binary(Binary::Iadd, a, b) = func.insts[inst.index()].op else { return None };
+    let (a, b) = (find(state.subst, a), find(state.subst, b));
+    let params = &func.blocks[join_block.index()].params;
+    let base_ok = |cand: Value| {
+        join.def_blocks.get(cand.index()).copied().flatten().is_some_and(|d| d != join_block && join.cfg.dominates(d, join_block))
+    };
+    let check_pair = |base_cand: Value, scaled_cand: Value| -> Option<(Value, usize, i64)> {
+        if !base_ok(base_cand) {
+            return None;
+        }
+        if let Some((idx, stride)) = peel_scaled(func, state, scaled_cand) {
+            let k = params.iter().position(|&p| p == idx)?;
+            return Some((base_cand, k, stride));
+        }
+        params.iter().position(|&p| p == scaled_cand).map(|k| (base_cand, k, 1))
+    };
+    check_pair(a, b).or_else(|| check_pair(b, a))
+}
+
+fn collect_pred_plans(preds: &[Block], mut plan_pred: impl FnMut(Block) -> Option<LocPlan>) -> Option<Vec<(Block, LocPlan)>> {
+    let mut plans = Vec::with_capacity(preds.len());
+    for &p in preds {
+        plans.push((p, plan_pred(p)?));
+    }
+    Some(plans)
+}
+
+fn try_phi_addr_join(
+    func: &mut Function,
+    (block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
+    state: &mut State<'_>,
+    known: &mut KnownLoads,
+    join: &mut JoinCtx<'_>,
+    clobbers_seen: &[BlockClobber],
+) -> Option<Option<Value>> {
+    let MemBase::Addr(raw_addr) = loc.base else { return None };
+    if ty == Type::I128 || join_clobbered(func, state.prov, loc, clobbers_seen) {
+        return None;
+    }
+    let addr = find(state.subst, raw_addr);
+    let mut cur = block;
+    for hop in 0..=MAX_JOIN_ANCESTOR_HOPS {
+        if hop > 0 {
+            let parent = join.cfg.single_pred(cur)?;
+            if join.bw.has_writes(parent) {
+                break;
+            }
+            cur = parent;
+        }
+        let Some(preds) = (if cur == block { join.preds.clone() } else { eligible_join_preds(func, join.cfg, join.visited, cur) }) else {
+            continue;
+        };
+        if func.blocks[cur.index()].params.is_empty() || join.added_phis[cur.index()] >= MAX_JOIN_PHIS_PER_BLOCK {
+            continue;
+        }
+        if let Some(param_idx) = func.blocks[cur.index()].params.iter().position(|&p| p == addr)
+            && let Some(plans) = collect_pred_plans(&preds, |p| {
+                let arg_p = edge_param_arg(func, state.subst, p, cur, param_idx)?;
+                let p_loc = i32::try_from(loc.offset)
+                    .map(|off| addr_loc(state.prov, state.subst, arg_p, off, ty.bytes()))
+                    .unwrap_or_else(|_| state.prov.loc(arg_p, loc.offset, ty.bytes()));
+                plan_loc(func, state, &join.known_out[p.index()], p_loc, ty).and_then(|pl| validate_plan(pl, p, state, join))
+            })
+        {
+            return finish_join_forward(func, (cur, inst, loc, ty, result), state, known, join, plans);
+        }
+        if let Some((base, param_idx, stride)) = match_indexed_phi(func, state, join, cur, addr)
+            && let Some(plans) = collect_pred_plans(&preds, |p| {
+                let arg_p = edge_param_arg(func, state.subst, p, cur, param_idx)?;
+                join.block_bases[p.index()].iter().find_map(|&(kb, _)| {
+                    let MemBase::Addr(kaddr) = kb else { return None };
+                    if !matches_indexed(func, state, kaddr, base, arg_p, stride) {
+                        return None;
+                    }
+                    let kloc = MemLoc::new(loc.root, kb, loc.offset, ty.bytes());
+                    plan_loc(func, state, &join.known_out[p.index()], kloc, ty).and_then(|pl| validate_plan(pl, p, state, join))
+                })
+            })
+        {
+            return finish_join_forward(func, (cur, inst, loc, ty, result), state, known, join, plans);
+        }
+    }
+    None
+}
+
+pub(super) fn try_join_phi_forward(
+    func: &mut Function,
+    (block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
+    state: &mut State<'_>,
+    known: &mut KnownLoads,
+    join: &mut JoinCtx<'_>,
+    clobbers_seen: &[BlockClobber],
+) -> Option<Option<Value>> {
+    if let Some(preds) = join.preds.as_ref()
+        && !matches!(loc.base, MemBase::Addr(b) if !join.def_blocks.get(b.index()).copied().flatten().is_some_and(|d| d != block && join.cfg.dominates(d, block)))
+        && !join_clobbered(func, state.prov, loc, clobbers_seen)
+        && let Some(plans) = collect_pred_plans(preds, |p| {
+            plan_loc(func, state, &join.known_out[p.index()], loc, ty).and_then(|pl| validate_plan(pl, p, state, join))
+        })
+    {
+        return finish_join_forward(func, (block, inst, loc, ty, result), state, known, join, plans);
+    }
+    try_phi_addr_join(func, (block, inst, loc, ty, result), state, known, join, clobbers_seen)
 }
