@@ -427,15 +427,12 @@ impl Checker<'_, '_> {
                     out.push(src);
                 }
             } else {
-                let real_ret = ret_sets
-                    .as_ref()
-                    .is_none_or(|(real, _)| real.contains(&cap.local));
                 let origin_ret = capture_origin_only(cap.local);
-                for (steps, is_mut, through_ref, reborrows_shared) in
+                for (steps, is_mut, through_ref, _) in
                     self.closure_capture_info(expr, cap.by, cap.local)
                 {
                     if steps.starts_with(&cap_steps) {
-                        let keep_origin = origin_ret || (reborrows_shared && !real_ret);
+                        let keep_origin = origin_ret;
                         out.push(BorrowSource {
                             target: cap.local,
                             steps: steps.clone(),

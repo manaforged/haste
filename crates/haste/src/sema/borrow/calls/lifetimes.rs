@@ -233,6 +233,7 @@ fn impl_self_lifetimes(
 pub(in super::super) struct ParamLifetimes {
     pub(in super::super) is_static: Vec<bool>,
     pub(in super::super) inner_is_static: Vec<bool>,
+    pub(in super::super) only_type_param: Vec<bool>,
     pub(in super::super) named_lts: Vec<Vec<String>>,
     pub(in super::super) has_elided_lt: Vec<bool>,
     pub(in super::super) inner_named_lts: Vec<Vec<String>>,
@@ -323,6 +324,7 @@ pub(in super::super) fn compute_param_lifetimes(
     let mut info = ParamLifetimes {
         is_static: vec![true; n],
         inner_is_static: vec![false; n],
+        only_type_param: vec![false; n],
         named_lts: vec![Vec::new(); n],
         has_elided_lt: vec![false; n],
         inner_named_lts: vec![Vec::new(); n],
@@ -413,6 +415,10 @@ fn record_param_ty(
     let mut lts = Lifetimes::default();
     collect_ty_lifetimes(&sig.body, src, ty, &mut lts);
     info.is_static[slot] = param_ty_is_static(sig, src, &lts, impl_has_lt, static_names);
+    info.only_type_param[slot] = !lts.has_elided
+        && lts.named.is_empty()
+        && !(impl_has_lt && lts.names.contains(&"Self"))
+        && has_unbounded_type_param(sig, src, &lts, static_names);
     info.has_elided_lt[slot] =
         has_elided_or_unbounded_lt(sig, src, &lts, impl_has_lt, static_names);
     info.named_lts[slot] = owned_lts(lts.named);

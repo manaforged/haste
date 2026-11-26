@@ -105,14 +105,24 @@ impl<'a> Checker<'_, 'a> {
             return Vec::new();
         }
         let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
+        out.retain(|s| !s.env_only);
         let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
         let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee, ret_has_borrow);
-        let copies_inner_arg = self
-            .closure_expr_of(callee)
-            .is_some_and(|c| self.closure_copies_inner_ref(c));
+        let callee_closure = self.closure_expr_of(callee);
+        let tracked_ret_params = callee_closure.and_then(|c| {
+            self.closure_effects
+                .get(&c)
+                .filter(|e| e.ret_targets.is_some())
+                .map(|e| e.ret_params.clone())
+        });
+        let copies_inner_arg = callee_closure.is_some_and(|c| self.closure_copies_inner_ref(c));
         let arg_ids: Vec<u32> = self.body.list(args).to_vec();
         for (idx, id) in arg_ids.into_iter().enumerate() {
-            if hrtb_non_ret.contains(&idx) {
+            if hrtb_non_ret.contains(&idx)
+                || tracked_ret_params
+                    .as_ref()
+                    .is_some_and(|rp| !rp.iter().any(|&(p, _)| p == idx))
+            {
                 continue;
             }
             let arg = ExprId(id);
@@ -268,12 +278,25 @@ impl<'a> Checker<'_, 'a> {
     ) -> Lifetimes<'a> {
         let mut ret_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut ret_lts);
-        if ret_lts.names.contains(&"Self")
-            && let Some(block) = self.cx.owner_impl(fn_item)
-            && let Ok(hdr) = self.cx.impl_header(block)
-        {
-            let impl_src = &self.cx.impl_file(block).source;
-            collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut ret_lts);
+        if ret_lts.names.contains(&"Self") {
+            if let Some(block) = self.cx.owner_impl(fn_item)
+                && let Ok(hdr) = self.cx.impl_header(block)
+            {
+                let impl_src = &self.cx.impl_file(block).source;
+                collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut ret_lts);
+            } else if let Some(tr) = self.cx.owner_trait(fn_item)
+                && let Ok(tg) = self.cx.trait_generics(tr)
+            {
+                let tsrc = &self.cx.file(tr).source;
+                for g in &tg.1.params {
+                    if g.kind == crate::body::sig::GenericKind::Type {
+                        let name = tsrc.text(g.name);
+                        if !ret_lts.names.contains(&name) {
+                            ret_lts.names.push(name);
+                        }
+                    }
+                }
+            }
         }
         ret_lts
     }
@@ -325,8 +348,10 @@ impl<'a> Checker<'_, 'a> {
             let Some(&(_, param_ty)) = sig.params.get(idx) else {
                 continue;
             };
-            let matches_ret = ty_shares_name(&sig.body, sig_src, param_ty, &ret_lts.names)
-                || ret_lts.names.contains(&"Self");
+            let mut p_lts = Lifetimes::default();
+            collect_ty_lifetimes(&sig.body, sig_src, param_ty, &mut p_lts);
+            let matches_ret = p_lts.names.iter().any(|n| ret_lts.names.contains(n))
+                || self.generic_param_ties_to_self(sig, sig_src, &p_lts, ret_lts);
             if !matches_ret {
                 continue;
             }
