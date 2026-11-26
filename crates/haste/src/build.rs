@@ -368,6 +368,20 @@ impl Build {
         Ok(binary.check(&self.compilation.outline, built))
     }
 
+    fn batch_diagnostics(&self, batch: Option<&Batch>) -> Option<String> {
+        batch.and_then(|batch| batch.formatted_diagnostics(&self.compilation.outline))
+    }
+
+    /// Formatted diagnostics from the compiled binary batch, if any failed.
+    pub(crate) fn binary_diagnostics(&self) -> Option<String> {
+        self.batch_diagnostics(self.binary.as_ref())
+    }
+
+    /// Formatted diagnostics from the compiled test or case batch, if any failed.
+    pub(crate) fn cases_diagnostics(&self) -> Option<String> {
+        self.batch_diagnostics(self.cases.as_ref())
+    }
+
     /// Why each function the binary's `main` reaches did not type-check or compile, at the file and line of its item, keyed by the kind of error.
     pub fn failures(&mut self) -> Result<Failures> {
         let Some(binary) = &mut self.binary else {

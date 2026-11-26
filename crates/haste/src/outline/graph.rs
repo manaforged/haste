@@ -334,6 +334,22 @@ fn unit_pin(workspace: &Workspace, unit: usize, extra: &[u64], memo: &mut [Optio
     hash
 }
 
+fn target_tmpdir(workspace: &Workspace, root: &Root) -> PathBuf {
+    use std::hash::BuildHasher as _;
+    let unit = &workspace.graph.units[root.unit];
+    let manifest_dir = &workspace.packages[unit.package].manifest.dir;
+    let scope = rustc_hash::FxBuildHasher.hash_one((
+        manifest_dir,
+        root.unit,
+        unit.package,
+        &root.name,
+        &root.path,
+    ));
+    std::env::temp_dir()
+        .join("haste-target-tmp")
+        .join(format!("{}-{scope:016x}", root.name))
+}
+
 fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool) -> Crate {
     let unit = &workspace.graph.units[root.unit];
     let script = root.role == Role::Script;
@@ -350,11 +366,15 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
     } else {
         crate::graph::script::crate_vars(workspace, root.unit)
     };
+    let mut errors = Vec::new();
     if root.role == Role::Test {
-        let tmp = std::env::temp_dir()
-            .join("haste-target-tmp")
-            .join(&root.name);
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = target_tmpdir(workspace, root);
+        if let Err(err) = std::fs::create_dir_all(&tmp) {
+            errors.push(format!(
+                "creating CARGO_TARGET_TMPDIR `{}`: {err}",
+                tmp.display()
+            ));
+        }
         vars.push(("CARGO_TARGET_TMPDIR".to_owned(), tmp.display().to_string()));
     }
     let env = Env {
@@ -370,6 +390,7 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
     Crate {
         env,
         modules: vec![root_module(&root.path)],
+        errors,
         ..Crate::default()
     }
 }

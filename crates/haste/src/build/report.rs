@@ -18,12 +18,31 @@ use super::test_args::parse_test_args;
 #[cfg(feature = "diff-harness")]
 include!("../../../../tests/case_inputs.rs");
 
+fn format_diagnostic(diag: &str) -> String {
+    if crate::diag::is_rendered(diag) {
+        diag.to_owned()
+    } else {
+        format!("error: {diag}")
+    }
+}
+
+pub(super) fn format_diagnostics(diagnostics: &[String]) -> Option<String> {
+    (!diagnostics.is_empty()).then(|| {
+        diagnostics
+            .iter()
+            .map(|diag| format_diagnostic(diag))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    })
+}
+
 pub(super) fn print_formatted_diagnostics(diagnostics: &[String]) {
     for diag in diagnostics {
+        let rendered = format_diagnostic(diag);
         if crate::diag::is_rendered(diag) {
-            eprintln!("{diag}\n");
+            eprintln!("{rendered}\n");
         } else {
-            eprintln!("error: {diag}");
+            eprintln!("{rendered}");
         }
     }
 }
@@ -123,6 +142,11 @@ impl Batch {
         let (diagnostics, failed_items) = self.collect_diagnostics(outline);
         print_formatted_diagnostics(&diagnostics);
         failed_items
+    }
+
+    pub(super) fn formatted_diagnostics(&self, outline: &outline::Outline) -> Option<String> {
+        let (diagnostics, _) = self.collect_diagnostics(outline);
+        format_diagnostics(&diagnostics)
     }
 
     pub(super) fn failures(&self, cx: &sema::Context<'_>) -> Failures {

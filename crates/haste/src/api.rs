@@ -334,6 +334,13 @@ impl Compiler {
         Ok((workspace, build, root))
     }
 
+    fn batch_compile_error(diagnostics: Option<String>, fallback: &str) -> Error {
+        Error::new(
+            ErrorKind::Compile,
+            diagnostics.unwrap_or_else(|| fallback.to_owned()),
+        )
+    }
+
     /// Type-checks, borrow-checks, and lowers reached functions in the workspace at `path`.
     pub fn check(&self, path: impl AsRef<Path>) -> Result<(), Error> {
         let path = path.as_ref();
@@ -345,7 +352,10 @@ impl Compiler {
                 .map_err(Error::compile)?;
             let status = build.check(started.elapsed()).map_err(Error::compile)?;
             if status != 0 {
-                return Err(Error::new(ErrorKind::Compile, "compilation failed"));
+                return Err(Self::batch_compile_error(
+                    build.binary_diagnostics(),
+                    "compilation failed",
+                ));
             }
             Ok(())
         })
@@ -356,9 +366,12 @@ impl Compiler {
         let (path, out) = (path.as_ref(), out.as_ref());
         self.run_scoped(false, || {
             let (workspace, mut build, _) = Self::load_build(path)?;
-            build
-                .emit_executable(&workspace, out, true)
-                .map_err(Error::compile)?;
+            if let Err(err) = build.emit_executable(&workspace, out, true) {
+                return Err(build.binary_diagnostics().map_or_else(
+                    || Error::compile(err),
+                    |msg| Error::new(ErrorKind::Compile, msg),
+                ));
+            }
             Ok(())
         })
     }
@@ -383,7 +396,12 @@ impl Compiler {
             Self::require_host_target("test")?;
             let started = Instant::now();
             let (workspace, mut build, _) = Self::load_build(path)?;
-            build.compile_cases(&workspace).map_err(Error::compile)?;
+            build
+                .compile_cases_filtered(&workspace, filters)
+                .map_err(Error::compile)?;
+            if let Some(msg) = build.cases_diagnostics() {
+                return Err(Error::new(ErrorKind::Compile, msg));
+            }
             build
                 .report(started, started.elapsed(), filters)
                 .map_err(Error::runtime)
