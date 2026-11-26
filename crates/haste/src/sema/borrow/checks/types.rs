@@ -72,7 +72,7 @@ impl Checker<'_, '_> {
             && !self.ty_holds_borrow(ty)
     }
 
-    fn ty_has_non_static_param(&self, ty: Ty) -> bool {
+    pub(in super::super) fn ty_has_non_static_param(&self, ty: Ty) -> bool {
         if !self.cx.types.has_params(ty) {
             return false;
         }
@@ -252,13 +252,18 @@ impl Checker<'_, '_> {
             return cached;
         }
         let mut seen = HashSet::default();
-        let res = self.ty_has_borrow_drop_inner(ty, &mut seen);
+        let res = self.ty_has_borrow_drop_inner(ty, &mut seen, false);
         self.drop_cache.insert(ty, res);
         res
     }
 
-    fn ty_has_borrow_drop_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
-        if ty == Ty::NONE || !seen.insert(ty) {
+    fn ty_has_borrow_drop_inner(
+        &mut self,
+        ty: Ty,
+        seen: &mut HashSet<(Ty, bool)>,
+        allow_phantom: bool,
+    ) -> bool {
+        if ty == Ty::NONE || !seen.insert((ty, allow_phantom)) {
             return false;
         }
         match self.cx.types.kind(ty).clone() {
@@ -269,11 +274,26 @@ impl Checker<'_, '_> {
                 .substs(items)
                 .to_vec()
                 .into_iter()
-                .any(|t| self.ty_has_borrow_drop_inner(t, seen)),
+                .any(|t| self.ty_has_borrow_drop_inner(t, seen, allow_phantom)),
             Kind::Array(elem, len) => {
-                self.cx.types.len(len) != Some(0) && self.ty_has_borrow_drop_inner(elem, seen)
+                self.cx.types.len(len) != Some(0)
+                    && self.ty_has_borrow_drop_inner(elem, seen, allow_phantom)
             }
-            Kind::Adt(item, _) => {
+            Kind::Closure(parent, _, at) => self
+                .closure_val_capture_tys(ty, parent, at)
+                .into_iter()
+                .any(|cty| self.ty_has_borrow_drop_inner(cty, seen, allow_phantom)),
+            Kind::Adt(item, args) => {
+                if self.cx.lang(item) == Some("phantom_data") {
+                    return allow_phantom
+                        && self
+                            .cx
+                            .types
+                            .substs(args)
+                            .first()
+                            .copied()
+                            .is_some_and(|t| self.ty_has_borrow_drop_inner(t, seen, true));
+                }
                 if self.cx.lang(item) == Some("manually_drop")
                     || self.cx.item(item).1.kind == ItemKind::Union
                 {
@@ -285,18 +305,51 @@ impl Checker<'_, '_> {
                     Ok((drop_blk, parts))
                 })
                 .unwrap_or((None, Vec::new()));
-                if let Some(block) = drop_blk
-                    && self.cx.boxed(ty).is_none()
-                    && !self.impl_has_may_dangle(block)
-                {
+                let may_dangle = drop_blk
+                    .is_some_and(|b| self.cx.boxed(ty).is_none() && self.impl_has_may_dangle(b));
+                if drop_blk.is_some() && self.cx.boxed(ty).is_none() && !may_dangle {
                     return true;
                 }
+                let next_phantom = allow_phantom || may_dangle;
                 parts
                     .into_iter()
-                    .any(|part| self.ty_has_borrow_drop_inner(part, seen))
+                    .any(|part| self.ty_has_borrow_drop_inner(part, seen, next_phantom))
             }
             _ => false,
         }
+    }
+
+    fn closure_val_capture_tys(&mut self, ty: Ty, parent: ItemRef, at: u32) -> Vec<Ty> {
+        if let Some(info) = self.cx.closure(ty) {
+            return info
+                .closure
+                .captures
+                .iter()
+                .filter(|c| c.by == By::Value)
+                .map(|c| {
+                    let l = info
+                        .typed
+                        .locals
+                        .get(c.local as usize)
+                        .map_or(Ty::NONE, |loc| loc.ty);
+                    c.ty(self.cx, l).unwrap_or(l)
+                })
+                .collect();
+        }
+        if parent == self.item
+            && let Some(cl) = self.typed.closures.get(&ExprId(at))
+        {
+            return cl
+                .captures
+                .iter()
+                .filter(|c| c.by == By::Value)
+                .map(|c| {
+                    let l = self.local_ty(c.local);
+                    c.ty(self.cx, l).unwrap_or(l)
+                })
+                .collect();
+        }
+        Vec::new()
     }
 
     fn impl_has_may_dangle(&mut self, block: ImplRef) -> bool {

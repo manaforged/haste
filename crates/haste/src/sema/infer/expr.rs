@@ -14,6 +14,16 @@ use super::{Breaks, Infer, Res};
 impl Infer<'_, '_> {
     /// Infers `expr`, with the type the context expects when it knows one.
     pub fn expr(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
+        let is_root = self.body.root == Some(expr);
+        let root_static = is_root
+            .then_some(self.instance)
+            .flatten()
+            .filter(|&(item, _)| {
+                self.cx.item(item).1.kind == crate::outline::item::ItemKind::Static
+            })
+            .map(|(item, _)| item);
+        let cycle_frame = self.enter_const_root_cycle(expr, is_root)?;
+        let _unsafe = self.push_unsafe_ctx(expr, is_root);
         let prev = self.current_expr;
         self.current_expr = Some(expr);
         let res = self.expr_kind(expr, expected);
@@ -23,13 +33,28 @@ impl Infer<'_, '_> {
             self.diverges = true;
         }
         self.out.exprs[expr.0 as usize] = ty;
+        if let Some(item) = root_static {
+            let static_ty = expected.map(|t| self.resolve(t)).unwrap_or(ty);
+            self.check_static_sync(expr, item, static_ty)?;
+        }
+        if cycle_frame.is_some() {
+            self.check_const_deps(expr)?;
+        }
         Ok(ty)
     }
 
     fn expr_kind(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
             Expr::Lit(lit, at) => self.lit(lit, at, expected),
-            Expr::Path(path) => self.path_expr(expr, path),
+            Expr::Path(path) => {
+                let ty = self.path_expr(expr, path)?;
+                if let Some(&Res::Fn(item, _)) = self.out.res.get(&expr)
+                    && self.cx.item(item).1.kind == crate::outline::item::ItemKind::Static
+                {
+                    self.check_static_sync(expr, item, ty)?;
+                }
+                Ok(ty)
+            }
             Expr::Paren(inner) => self.expr(inner, expected),
             Expr::Unary(op, operand) => self.unary(expr, (op, operand), expected),
             Expr::Binary(op, lhs, rhs) => self.binary(expr, op, (lhs, rhs), expected),
@@ -605,6 +630,45 @@ impl Infer<'_, '_> {
             }
         }
         Ok(self.cx.types.intern(Kind::Never))
+    }
+
+    fn check_static_sync(&mut self, expr: ExprId, item: ItemRef, ty: Ty) -> Result<()> {
+        if self.cx.outline.is_sysroot(item.krate)
+            || self.cx.item(item).1.kind != crate::outline::item::ItemKind::Static
+            || self.cx.foreign(item)
+            || self.cx.thread_local(item)
+            || self.cx.is_static_mut(item)
+        {
+            return Ok(());
+        }
+        let ty = self.resolve(ty);
+        if self.has_params(ty) {
+            return Ok(());
+        }
+        let Some(sync) = self.cx.lang_item("sync") else {
+            return Ok(());
+        };
+        if self.has_vars(ty) {
+            self.obligations.push((sync, vec![ty]));
+            self.note_obligation_site(sync, ty);
+            return Ok(());
+        }
+        let before = self.cx.quiet_mark();
+        if self.thread_auto_holds(sync, ty) {
+            return Ok(());
+        }
+        if self.cx.quiet_mark() != before {
+            self.obligations.push((sync, vec![ty]));
+            self.note_obligation_site(sync, ty);
+            return Ok(());
+        }
+        let shown = self.show(ty);
+        Err(self.diag_expr(
+            crate::diag::DiagnosticKind::Trait,
+            Some(expr),
+            format!("`{shown}` cannot be shared between threads safely"),
+            format!("`{shown}` cannot be shared between threads safely"),
+        ))
     }
 }
 

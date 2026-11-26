@@ -78,10 +78,9 @@ impl Checker<'_, '_> {
         if let Some(t) = tail {
             self.collect_live_expr_with(t, &mut live, &targets);
         }
-        for &id in ids {
-            if let Stmt::Let {
-                pat, init: Some(_), ..
-            } = self.body.stmts[id as usize]
+        let mut decl_drops = vec![Vec::new(); ids.len()];
+        for (pos, &id) in ids.iter().enumerate() {
+            if let Stmt::Let { pat, .. } = self.body.stmts[id as usize]
                 && !matches!(*self.body.pat(pat), Pat::Wild)
             {
                 let mut bound = HashSet::default();
@@ -89,17 +88,28 @@ impl Checker<'_, '_> {
                 for local in bound {
                     if self.drop_locals.contains(&local) {
                         live.insert(local);
+                        decl_drops[pos].push(local);
                     }
                 }
             }
+        }
+        let mut active_drops: Vec<HashSet<u32>> = vec![HashSet::default(); ids.len()];
+        let mut cur_drops = HashSet::default();
+        for (pos, drops) in decl_drops.iter().enumerate() {
+            cur_drops.extend(drops);
+            active_drops[pos] = cur_drops.clone();
         }
         let tail_live = live.clone();
         let mut after_stmt = vec![HashSet::default(); ids.len()];
         let mut before_stmt = vec![HashSet::default(); ids.len()];
         for pos in (0..ids.len()).rev() {
             after_stmt[pos] = live.clone();
+            after_stmt[pos].extend(&active_drops[pos]);
             self.collect_live_stmt_with(self.body.stmts[ids[pos] as usize], &mut live, &targets);
             before_stmt[pos] = live.clone();
+            if pos > 0 {
+                before_stmt[pos].extend(&active_drops[pos - 1]);
+            }
         }
         (before_stmt, after_stmt, tail_live)
     }

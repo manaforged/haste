@@ -167,6 +167,8 @@ impl Checker<'_, '_> {
                     .iter()
                     .rposition(|f| !f.is_block && jumps_to(self.src, (f.label, false), label))
                 {
+                    let cont_depth = self.breaks[idx].depth;
+                    self.check_drop_order(cont_depth, state)?;
                     self.breaks[idx].continues.push(state.clone());
                 }
                 state.diverged = true;
@@ -281,6 +283,7 @@ impl Checker<'_, '_> {
                 .and_then(|l| self.expr_tuple_sources(rhs, state, false).map(|ts| (l, ts)));
             prune_dead_loans(state, &after_rhs);
             self.assign_place(lhs, &sources, state, outer_live, depth)?;
+            self.update_assign_ptr_targets(lhs, rhs, state);
             if let Some((local, ts)) = tuple_srcs {
                 state.set_tuple_sources(local, Some(ts));
             }
@@ -736,10 +739,11 @@ impl Checker<'_, '_> {
             let reborrow_mut = self.is_mut_ref_ty(self.expr_ty(v))
                 && self.typed.ret.is_some_and(|r| self.is_mut_ref_ty(r));
             self.check_expr(v, state, reborrow_mut, outer_live, true, depth)?;
-            if self.returns_borrow {
+            if self.returns_borrow || self.returns_invariant {
                 self.check_return_escape(v, state)?;
             }
         }
+        self.check_drop_order(self.return_min_depth, state)?;
         state.diverged = true;
         Ok(())
     }
@@ -761,6 +765,7 @@ impl Checker<'_, '_> {
             .rposition(|f| jumps_to(self.src, (f.label, f.is_block), label))
         {
             let target_depth = self.breaks[idx].depth;
+            self.check_drop_order(target_depth, state)?;
             if let Some(v) = val {
                 let srcs = self.expr_borrow_sources(v, state);
                 for src in &srcs {

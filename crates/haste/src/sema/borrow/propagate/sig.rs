@@ -42,7 +42,11 @@ struct SigCallCtx<'a, 'b> {
 }
 
 impl<'a> Checker<'_, 'a> {
-    pub(super) fn call_sig_fn_item(&mut self, expr: ExprId, callee: ExprId) -> Option<ItemRef> {
+    pub(in super::super) fn call_sig_fn_item(
+        &mut self,
+        expr: ExprId,
+        callee: ExprId,
+    ) -> Option<ItemRef> {
         let res = if self.body.names_callee(callee) {
             self.typed
                 .res
@@ -341,7 +345,7 @@ impl<'a> Checker<'_, 'a> {
                 continue;
             }
             let mut arg_srcs = self.expr_borrow_sources(ExprId(arg), state);
-            if !matches!(self.cx.types.kind(ret_ty), Kind::Closure(..))
+            if !self.ty_holds_closure(ret_ty)
                 && let Some(c_expr) = self.closure_expr_of(ExprId(arg))
                 && let Some((ret_real, ret_orig)) = self
                     .closure_effects

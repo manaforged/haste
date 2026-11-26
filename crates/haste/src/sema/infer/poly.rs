@@ -1,3 +1,4 @@
+mod compat;
 mod env;
 mod solve;
 
@@ -9,6 +10,7 @@ use crate::body::ExprId;
 use crate::names::ItemRef;
 
 use super::super::Context;
+use super::super::impls::ImplRef;
 use super::super::intrinsic::Intrinsic;
 use super::super::substs::{ProjId, Substs};
 use super::super::summary::{ConstHole, PolyObligation, PolySummary, SummaryKind};
@@ -35,12 +37,54 @@ pub(in crate::sema) struct PolyState {
     pub proj_set: HashSet<ProjId>,
     pub offset_holes: Vec<ConstHole>,
     pub method_traits: HashMap<ExprId, ItemRef>,
+    pub checked_impls: HashSet<ImplRef>,
+    pub skip_compat: bool,
+}
+
+fn collect_poly_traits(cx: &Context<'_>, poly: Option<&PolyState>, out: &mut Vec<ItemRef>) {
+    let Some(poly) = poly else { return };
+    for &(of, _) in &poly.assumptions {
+        if !out.contains(&of) {
+            out.push(of);
+        }
+    }
+    for ob in &poly.obligations {
+        if let PolyObligation::Prove { of, .. } = *ob
+            && !out.contains(&of)
+        {
+            out.push(of);
+        }
+    }
+    for &method in poly.method_traits.values() {
+        if let Some(of) = cx.owner_trait(method)
+            && !out.contains(&of)
+        {
+            out.push(of);
+        }
+    }
 }
 
 pub(in crate::sema) fn build_poly_summary(
     cx: &mut Context<'_>,
     item: ItemRef,
     param_count: u16,
+) -> SummaryKind {
+    let mut poly_traits = Vec::new();
+    let summary = build_poly_summary_inner(cx, item, param_count, &mut poly_traits);
+    if matches!(summary, SummaryKind::Error(_)) || cx.outline.is_fixed(item.krate) {
+        return summary;
+    }
+    if let Err(err) = compat::check_item_trait_impls(cx, item, &poly_traits) {
+        return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
+    }
+    summary
+}
+
+fn build_poly_summary_inner(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    param_count: u16,
+    poly_traits: &mut Vec<ItemRef>,
 ) -> SummaryKind {
     let before = cx.quiet_mark();
     if cx.has_attr(item, "define_opaque") {
@@ -69,11 +113,9 @@ pub(in crate::sema) fn build_poly_summary(
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
     if let Err(err) = infer.run(false) {
         let fell_back = infer.poly_fell_back();
-        let hints = infer
-            .poly
-            .take()
-            .map(|poly| poly.method_traits)
-            .unwrap_or_default();
+        let took = infer.poly.take();
+        collect_poly_traits(infer.cx, took.as_deref(), poly_traits);
+        let hints = took.map(|poly| poly.method_traits).unwrap_or_default();
         drop(infer);
         if is_user && !fell_back {
             return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
@@ -87,6 +129,7 @@ pub(in crate::sema) fn build_poly_summary(
         drop(infer);
         return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
     }
+    collect_poly_traits(infer.cx, infer.poly.as_deref(), poly_traits);
     let pre_hints = infer
         .poly
         .as_ref()
@@ -101,6 +144,7 @@ pub(in crate::sema) fn build_poly_summary(
             return fallback_kind(pre_hints);
         }
     };
+    collect_poly_traits(cx, poly.as_deref(), poly_traits);
     if cx.quiet_mark() != before
         || (!typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err())
     {

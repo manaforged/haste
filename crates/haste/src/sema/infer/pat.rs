@@ -1,9 +1,11 @@
 use anyhow::{Result, bail};
+use rustc_lexer::TokenKind;
 
 use crate::body::{Body, Expr, List, Lit, Pat, PatId, PathId};
 use crate::diag::DiagnosticKind;
 use crate::names::plain;
 use crate::outline::item::ItemKind;
+use crate::outline::source::Mark;
 
 use super::super::ty::{Kind, Mut, Ty};
 use super::{Infer, Res};
@@ -101,6 +103,7 @@ impl Infer<'_, '_> {
         sub: Option<PatId>,
         (ty, mode): (Ty, Mode),
     ) -> Result<()> {
+        self.check_ident_2024(name)?;
         if !mutable
             && !by_ref
             && sub.is_none()
@@ -392,6 +395,7 @@ impl Infer<'_, '_> {
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         for &at in body.list(list) {
             let field = body.field_pats[at as usize];
+            self.check_ident_2024(field.name)?;
             let name = plain(self.src.text(field.name));
             let Some(index) = self.field_index(item, variant, name)? else {
                 return Err(self.diag_unknown_field(field.name, item, name));
@@ -486,5 +490,31 @@ impl Infer<'_, '_> {
         let interned = self.cx.types.intern_substs(&args);
         let adt = self.cx.types.intern(Kind::Adt(item, interned));
         Ok(Some((adt, Res::Ctor(item, variant, interned))))
+    }
+
+    fn check_ident_2024(&self, tok: u32) -> Result<()> {
+        if self.src.kind(tok) != TokenKind::Ident || self.src.text(tok) != "gen" {
+            return Ok(());
+        }
+        let krate = match self.src.mark(tok) {
+            Some(Mark::Home { krate, .. }) => krate,
+            Some(_) => return Ok(()),
+            None => self.home.krate,
+        };
+        if self
+            .cx
+            .names
+            .crates
+            .get(krate as usize)
+            .is_some_and(|c| c.edition == "2024")
+        {
+            return Err(self.diag_tok(
+                DiagnosticKind::Syntax,
+                tok,
+                "expected identifier, found reserved keyword `gen`",
+                "expected identifier, found reserved keyword",
+            ));
+        }
+        Ok(())
     }
 }

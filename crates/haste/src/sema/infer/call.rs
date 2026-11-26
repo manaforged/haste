@@ -189,6 +189,9 @@ impl Infer<'_, '_> {
         for &arg in &args[params.len()..] {
             self.expr(ExprId(arg), None)?;
         }
+        if let Some((item, substs)) = def {
+            self.check_transmute(self.current_expr, item, substs)?;
+        }
         Ok(())
     }
 
@@ -301,6 +304,9 @@ impl Infer<'_, '_> {
         for &arg in &args[args.len() - extra..] {
             self.expr(ExprId(arg), None)?;
         }
+        if let Some((item, substs)) = def {
+            self.check_transmute(self.current_expr, item, &substs)?;
+        }
         Ok(ret)
     }
 
@@ -320,7 +326,7 @@ impl Infer<'_, '_> {
                 self.call_arg(def, ExprId(arg), (param, hint), held)?;
             }
         }
-        if has_deferred {
+        if has_deferred || def.is_some_and(|(item, _)| self.is_transmute(item)) {
             self.unify_expected_ret(ret, expected);
         }
         self.release_obligation(held)?;
@@ -411,5 +417,333 @@ impl Infer<'_, '_> {
             .box_frees
             .insert(expr, Res::fn_of(&self.cx.types, member, &args));
         Ok(())
+    }
+
+    fn is_transmute(&mut self, item: ItemRef) -> bool {
+        self.cx.outline.is_sysroot(item.krate)
+            && self.cx.name(item) == "transmute"
+            && (self.cx.intrinsic(item) == Some(super::super::intrinsic::Intrinsic::Transmute)
+                || self.cx.qualified(item) == "core::mem::transmute")
+    }
+
+    pub(super) fn check_transmute(
+        &mut self,
+        expr: Option<ExprId>,
+        item: ItemRef,
+        substs: &[Ty],
+    ) -> Result<()> {
+        if !self.is_transmute(item) {
+            return Ok(());
+        }
+        let [src, dst, ..] = substs else {
+            return Ok(());
+        };
+        let (src, dst) = (self.substitute(*src), self.substitute(*dst));
+        if !self.cx.types.is_ground(src) || !self.cx.types.is_ground(dst) {
+            return Ok(());
+        }
+        let (src_layout, dst_layout) = (self.cx.layout(src)?, self.cx.layout(dst)?);
+        if src_layout.size != dst_layout.size {
+            let (src_bytes, dst_bytes) = (src_layout.size.bytes(), dst_layout.size.bytes());
+            return Err(self.diag_expr(
+                crate::diag::DiagnosticKind::Type,
+                expr,
+                format!(
+                    "cannot transmute between types of different sizes, or dependently-sized types: `{}` ({src_bytes} bytes) to `{}` ({dst_bytes} bytes)",
+                    self.show(src),
+                    self.show(dst),
+                ),
+                format!("cannot transmute between types of different sizes ({src_bytes} vs {dst_bytes} bytes)"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_deferred_transmutes(&mut self) -> Result<()> {
+        let mut sites: Vec<(ExprId, ItemRef, super::super::substs::Substs)> = self
+            .out
+            .res
+            .iter()
+            .filter_map(|(&expr, res)| match *res {
+                Res::Fn(item, substs) if self.cx.name(item) == "transmute" => {
+                    Some((expr, item, substs))
+                }
+                _ => None,
+            })
+            .collect();
+        sites.sort_by_key(|(expr, _, _)| expr.0);
+        for (expr, item, substs) in sites {
+            let slice = self.cx.types.substs(substs).to_vec();
+            self.check_transmute(Some(expr), item, &slice)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn enter_const_root_cycle(
+        &self,
+        expr: ExprId,
+        is_root: bool,
+    ) -> Result<Option<super::super::evaluate::ConstCycleFrame>> {
+        if !is_root || self.poly.is_some() || self.sig.ret.is_none() {
+            return Ok(None);
+        }
+        let Some((item, substs)) = self.instance else {
+            return Ok(None);
+        };
+        if self.cx.outline.is_sysroot(item.krate)
+            || super::super::evaluate::const_cycle_top() == Some((item, substs))
+        {
+            return Ok(None);
+        }
+        let is_const = self.cx.item(item).1.kind == crate::outline::item::ItemKind::Const;
+        if !is_const && !super::super::evaluate::const_cycle_active() {
+            return Ok(None);
+        }
+        if self
+            .cx
+            .types
+            .substs(substs)
+            .iter()
+            .any(|&ty| !self.cx.types.is_ground(ty))
+        {
+            return Ok(None);
+        }
+        super::super::evaluate::enter_const_cycle(self.cx, (item, substs), is_const).map_err(
+            |msg| {
+                self.diag_expr(
+                    crate::diag::DiagnosticKind::Type,
+                    Some(expr),
+                    msg,
+                    "cyclic constant value",
+                )
+            },
+        )
+    }
+
+    pub(super) fn check_const_deps(&mut self, root_expr: ExprId) -> Result<()> {
+        let deps = super::super::evaluate::collect_body_const_deps(
+            self.cx,
+            self.body,
+            |id| self.out.res.get(&id).copied(),
+            |id| self.out.operators.get(&id).copied(),
+            |id| self.out.pat_res.get(&id).copied(),
+        );
+        for (site, raw_item, raw_substs) in deps {
+            let raw_args = self.cx.types.substs(raw_substs).to_vec();
+            let resolved: Vec<Ty> = raw_args.into_iter().map(|t| self.substitute(t)).collect();
+            if resolved.iter().any(|&t| !self.cx.types.is_ground(t)) {
+                continue;
+            }
+            let substs = self.cx.types.intern_substs(&resolved);
+            let Res::Fn(item, substs) = self.trait_call(raw_item, substs)? else {
+                continue;
+            };
+            self.inspect_const_dep(site.or(Some(root_expr)), item, substs)?;
+        }
+        Ok(())
+    }
+
+    fn inspect_const_dep(
+        &mut self,
+        site: Option<ExprId>,
+        item: ItemRef,
+        substs: super::super::substs::Substs,
+    ) -> Result<()> {
+        use crate::outline::item::ItemKind;
+        if self.cx.outline.is_sysroot(item.krate) || self.cx.foreign(item) {
+            return Ok(());
+        }
+        let kind = self.cx.item(item).1.kind;
+        if !matches!(kind, ItemKind::Const | ItemKind::Fn) || self.cx.item(item).1.body.is_none() {
+            return Ok(());
+        }
+        let Some(_frame) = super::super::evaluate::enter_const_cycle(
+            self.cx,
+            (item, substs),
+            kind == ItemKind::Const,
+        )
+        .map_err(|msg| {
+            self.diag_expr(
+                crate::diag::DiagnosticKind::Type,
+                site,
+                msg,
+                "cyclic constant value",
+            )
+        })?
+        else {
+            return Ok(());
+        };
+        if let Some(typed) = self.cx.store.finals.get(&(item, substs))
+            && let super::LazyTables::Eager(tables) = &typed.tables
+        {
+            let body = self.cx.body(item)?;
+            let deps = super::super::evaluate::collect_body_const_deps(
+                self.cx,
+                &body,
+                |id| tables.res.get(&id).copied(),
+                |id| tables.operators.get(&id).copied(),
+                |id| tables.pat_res.get(&id).copied(),
+            );
+            for (_, dep_item, dep_substs) in deps {
+                if self
+                    .cx
+                    .types
+                    .substs(dep_substs)
+                    .iter()
+                    .any(|&t| !self.cx.types.is_ground(t))
+                {
+                    continue;
+                }
+                let Res::Fn(dep_item, dep_substs) = self.trait_call(dep_item, dep_substs)? else {
+                    continue;
+                };
+                self.inspect_const_dep(site, dep_item, dep_substs)?;
+            }
+            return Ok(());
+        }
+        let sig = self.cx.signature(item)?;
+        let body = self.cx.body(item)?;
+        let src = self.cx.body_src(item);
+        let home = self.cx.module_of(item)?;
+        let args = self.cx.types.substs(substs).to_vec();
+        let before = self.cx.quiet_mark();
+        let mut child = Box::new(Infer::start(self.cx, (&body, &sig, src), home));
+        (child.root, child.instance) = (Some(item.body_owner()), Some((item, substs)));
+        let mut frame = child.frame(item, &args)?;
+        (frame.src, frame.root) = (src, child.root);
+        child.swap_frame(frame);
+        child.out.exprs.resize(body.exprs.len(), Ty::NONE);
+        let ran = child.run(false);
+        if child.cx.quiet_mark() != before {
+            return Ok(());
+        }
+        ran?;
+        if let Some(dep_root) = child.body.root {
+            child.check_const_deps(dep_root)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_union_field(&self, expr: ExprId, item: ItemRef) -> Result<()> {
+        if self.cx.outline.is_sysroot(self.home.krate)
+            || self.cx.item(item).1.kind != crate::outline::item::ItemKind::Union
+        {
+            return Ok(());
+        }
+        let body_ptr = self.body as *const crate::body::Body as usize;
+        let allowed = UNSAFE_STATE.with(|cell| {
+            let st = cell.borrow();
+            st.depth.unwrap_or_else(|| u32::from(self.sig.is_unsafe)) > 0
+                || st.safe_fields.contains(&(body_ptr, expr))
+        });
+        if allowed {
+            return Ok(());
+        }
+        Err(self.diag_expr(
+            crate::diag::DiagnosticKind::Unsafe,
+            Some(expr),
+            "access to union field is unsafe and requires unsafe function or block",
+            "access to union field",
+        ))
+    }
+
+    pub(super) fn push_unsafe_ctx(&self, expr: ExprId, is_root: bool) -> UnsafeGuard {
+        use crate::body::BlockKind;
+        let body_ptr = self.body as *const crate::body::Body as usize;
+        UNSAFE_STATE.with(|cell| {
+            let mut st = cell.borrow_mut();
+            let guard = UnsafeGuard {
+                prev_depth: st.depth,
+                safe_mark: st.safe_fields.len(),
+            };
+            let base = if is_root {
+                u32::from(self.sig.is_unsafe)
+            } else {
+                st.depth.unwrap_or_else(|| u32::from(self.sig.is_unsafe))
+            };
+            st.depth = Some(match *self.body.expr(expr) {
+                Expr::Closure { .. } => 0,
+                Expr::Block { kind, .. } => match kind {
+                    BlockKind::Unsafe => base + 1,
+                    BlockKind::Const | BlockKind::Async | BlockKind::AsyncMove => 0,
+                    _ => base,
+                },
+                Expr::Assign(lhs, _) => {
+                    if let Some(target) = unwrap_paren_field(self.body, lhs) {
+                        st.safe_fields.push((body_ptr, target));
+                    }
+                    base
+                }
+                Expr::Ref {
+                    raw: true,
+                    expr: inner,
+                    ..
+                } => {
+                    push_raw_safe_fields(self.body, body_ptr, inner, &mut st.safe_fields);
+                    base
+                }
+                _ => base,
+            });
+            guard
+        })
+    }
+}
+
+#[derive(Default)]
+struct UnsafeState {
+    depth: Option<u32>,
+    safe_fields: Vec<(usize, ExprId)>,
+}
+
+thread_local! {
+    static UNSAFE_STATE: std::cell::RefCell<UnsafeState> = const {
+        std::cell::RefCell::new(UnsafeState {
+            depth: None,
+            safe_fields: Vec::new(),
+        })
+    };
+}
+
+pub(super) struct UnsafeGuard {
+    prev_depth: Option<u32>,
+    safe_mark: usize,
+}
+
+impl Drop for UnsafeGuard {
+    fn drop(&mut self) {
+        UNSAFE_STATE.with(|cell| {
+            let mut st = cell.borrow_mut();
+            st.depth = self.prev_depth;
+            st.safe_fields.truncate(self.safe_mark);
+        });
+    }
+}
+
+fn unwrap_paren_field(body: &crate::body::Body, mut expr: ExprId) -> Option<ExprId> {
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Field(..) => return Some(expr),
+            _ => return None,
+        }
+    }
+}
+
+fn push_raw_safe_fields(
+    body: &crate::body::Body,
+    body_ptr: usize,
+    mut expr: ExprId,
+    out: &mut Vec<(usize, ExprId)>,
+) {
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Field(base, _) => {
+                out.push((body_ptr, expr));
+                expr = base;
+            }
+            Expr::TupleField(base, _) | Expr::Index(base, _) => expr = base,
+            _ => break,
+        }
     }
 }

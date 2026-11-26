@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
+use std::thread::LocalKey;
 
 use anyhow::{Result, anyhow, bail};
 use rustc_abi::{
@@ -116,6 +118,35 @@ fn primitive(dl: &TargetDataLayout, primitive: Primitive) -> Result<Layout> {
     })
 }
 
+thread_local! {
+    static LAYOUT_VISITING: RefCell<Vec<Ty>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(super) struct VisitGuard(&'static LocalKey<RefCell<Vec<Ty>>>);
+
+impl Drop for VisitGuard {
+    fn drop(&mut self) {
+        self.0.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+pub(super) fn try_enter_acyclic(
+    stack: &'static LocalKey<RefCell<Vec<Ty>>>,
+    ty: Ty,
+) -> Option<VisitGuard> {
+    let cyclic = stack.with(|s| {
+        let s = s.borrow();
+        s.contains(&ty) || s.len() >= crate::RECURSION_LIMIT
+    });
+    if cyclic {
+        return None;
+    }
+    stack.with(|s| s.borrow_mut().push(ty));
+    Some(VisitGuard(stack))
+}
+
 impl Context<'_> {
     /// The layout of `ty`, which must hold no inference variables or parameters.
     pub fn layout(&mut self, ty: Ty) -> Result<Arc<Layout>> {
@@ -125,6 +156,12 @@ impl Context<'_> {
         if let Some(found) = self.store.layouts.get(&ty) {
             return Ok(found);
         }
+        let Some(_guard) = try_enter_acyclic(&LAYOUT_VISITING, ty) else {
+            return Err(anyhow!(
+                "recursive type `{}` has infinite size",
+                self.type_text(ty, &|t| t)
+            ));
+        };
         let before = self.quiet_mark();
         let computed = Arc::new(self.compute(ty)?);
         if self.quiet_mark() == before {

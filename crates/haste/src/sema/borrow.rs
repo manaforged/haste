@@ -11,7 +11,7 @@ mod propagate;
 use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::body::{BlockKind, Body, Expr, ExprId, Pat, PatId};
+use crate::body::{Body, Expr, ExprId, Pat, PatId};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
@@ -96,6 +96,7 @@ struct State {
     partial_moves: Vec<PartialMove>,
     loans: Vec<Loan>,
     tuple_elem_sources: HashMap<u32, TupleSources>,
+    ptr_targets: HashMap<u32, Vec<u32>>,
     diverged: bool,
 }
 
@@ -110,6 +111,7 @@ impl State {
             partial_moves: Vec::new(),
             loans: Vec::new(),
             tuple_elem_sources: HashMap::default(),
+            ptr_targets: HashMap::default(),
             diverged: false,
         }
     }
@@ -123,6 +125,7 @@ impl State {
             partial_moves: outer.partial_moves.clone(),
             loans: Vec::new(),
             tuple_elem_sources: HashMap::default(),
+            ptr_targets: outer.ptr_targets.clone(),
             diverged: false,
         }
     }
@@ -160,6 +163,7 @@ struct Checker<'c, 'a> {
     names: Vec<Option<String>>,
     no_move_captures: Vec<(u32, Vec<PlaceStep>)>,
     returns_borrow: bool,
+    returns_invariant: bool,
     returns_only_static: bool,
     ret_named_lts: Vec<&'c str>,
     param_lts: calls::ParamLifetimes,
@@ -181,6 +185,7 @@ struct Checker<'c, 'a> {
     closure_param_origins: HashMap<u32, Vec<BorrowSource>>,
     drop_cache: HashMap<Ty, bool>,
     drop_locals: HashSet<u32>,
+    variance: checks::VarianceMeta,
     current_expr: Option<ExprId>,
     current_pat: Option<PatId>,
 }
@@ -264,17 +269,21 @@ pub(super) fn check(
             }
         }
     }
-    let (returns_only_static, ret_named_lts) = if !sig.is_async
+    let (returns_only_static, returns_invariant, ret_named_lts) = if !sig.is_async
         && let Some(ret_ast) = sig.ret
     {
         let mut ret_lts = calls::Lifetimes::default();
         calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
+        let ret_inv =
+            checks::collect_ast_invariant_lifetimes(cx, &sig.body, src, ret_ast, typed.ret);
+        let returns_inv = ret_inv.is_only_static() || !ret_inv.named.is_empty();
         (
             calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts),
+            returns_inv,
             calls::sig_return_named_lifetimes(sig, src, ret_ast, &ret_lts),
         )
     } else {
-        (false, Vec::new())
+        (false, false, Vec::new())
     };
     let (static_type_params, static_names) = checks::compute_static_type_params(cx, item, sig, src);
     let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, (n, &static_names));
@@ -291,6 +300,7 @@ pub(super) fn check(
         names,
         no_move_captures: Vec::new(),
         returns_borrow: false,
+        returns_invariant,
         returns_only_static,
         ret_named_lts,
         param_lts,
@@ -312,9 +322,11 @@ pub(super) fn check(
         closure_param_origins: HashMap::default(),
         drop_cache: HashMap::default(),
         drop_locals: HashSet::default(),
+        variance: checks::VarianceMeta::new(n),
         current_expr: None,
         current_pat: None,
     };
+    checker.record_param_invariant(sig, src);
     for (idx, local) in typed.locals.iter().enumerate() {
         if local.ty != Ty::NONE {
             if checker.ty_holds_borrow(local.ty) && checker.ty_has_borrow_drop(local.ty) {
@@ -337,7 +349,7 @@ pub(super) fn check(
     let root_place_ctx = checker.is_mut_ref_ty(checker.expr_ty(root))
         && typed.ret.is_some_and(|r| checker.is_mut_ref_ty(r));
     checker.check_expr(root, &mut state, root_place_ctx, &empty_live, true, 0)?;
-    if checker.returns_borrow && !state.diverged {
+    if (checker.returns_borrow || checker.returns_invariant) && !state.diverged {
         checker.check_return_escape(root, &state)?;
     }
     checker.check_coercion_vtables()?;
@@ -624,117 +636,6 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    fn check_return_escape(&mut self, expr: ExprId, state: &State) -> Result<()> {
-        let had_cached = if let Some(cached) = self.temp_sources.get(&expr).cloned() {
-            let site = self.return_diag_site(expr);
-            self.check_return_sources(site, &cached)?;
-            true
-        } else {
-            false
-        };
-        match *self.body.expr(expr) {
-            Expr::Block {
-                kind: BlockKind::Const,
-                ..
-            } => Ok(()),
-            Expr::Loop { .. } | Expr::Block { tail: None, .. } if had_cached => Ok(()),
-            Expr::Paren(inner)
-            | Expr::Block {
-                tail: Some(inner), ..
-            } => self.check_return_escape(inner, state),
-            Expr::If(_, then, otherwise) => {
-                self.check_return_escape(then, state)?;
-                if let Some(alt) = otherwise {
-                    self.check_return_escape(alt, state)?;
-                }
-                Ok(())
-            }
-            Expr::Match(_, arms) => {
-                for id in self.body.list(arms).to_vec() {
-                    self.check_return_escape(self.body.arms[id as usize].body, state)?;
-                }
-                Ok(())
-            }
-            _ => {
-                let sources = self.expr_borrow_sources(expr, state);
-                self.check_return_sources(expr, &sources)?;
-                self.check_return_tuple_named_lt(expr, state)
-            }
-        }
-    }
-
-    fn return_diag_site(&self, mut expr: ExprId) -> ExprId {
-        loop {
-            match *self.body.expr(expr) {
-                Expr::Paren(inner)
-                | Expr::Block {
-                    tail: Some(inner), ..
-                } => expr = inner,
-                _ => return expr,
-            }
-        }
-    }
-
-    fn check_return_sources(&mut self, expr: ExprId, sources: &[BorrowSource]) -> Result<()> {
-        let expr_depth = self.ty_max_ref_depth(self.expr_ty(expr));
-        for src in sources {
-            let target_ty = self.local_ty(src.target);
-            let inner = if target_ty != Ty::NONE {
-                match *self.cx.types.kind(target_ty) {
-                    Kind::Ref(_, inner) => Some(inner),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let past_outer = src.origin_only
-                && inner.is_some_and(|i| {
-                    self.ty_holds_non_dyn_borrow(i) && expr_depth <= self.ty_max_ref_depth(i)
-                });
-            if let Some(active) = self.active_closures.last_mut() {
-                if !past_outer
-                    && let Some(idx) = active.params.iter().position(|&p| p == src.target)
-                    && !active.ret_params.contains(&idx)
-                {
-                    active.ret_params.push(idx);
-                }
-                if src.origin_only {
-                    active.ret_orig.insert(src.target);
-                } else {
-                    active.ret_real.insert(src.target);
-                }
-            }
-        }
-        for src in sources {
-            if self.is_escaping_return(src) {
-                if checks::is_temp_target(src.target).is_some() {
-                    return Err(self.does_not_live_long_enough(Some(expr), src.target));
-                }
-                return Err(self.borrow_err(
-                    Some(expr),
-                    format!(
-                        "cannot return value referencing local variable `{}`",
-                        self.local_name(src.target)
-                    ),
-                ));
-            }
-            if self.closure_depth == 0
-                && self.returns_only_static
-                && self.is_non_static_param(src.target)
-            {
-                return Err(self.borrow_err(
-                    Some(expr),
-                    format!(
-                        "borrowed data `{}` escapes outside of function: return type requires `'static` lifetime",
-                        self.local_name(src.target)
-                    ),
-                ));
-            }
-            self.check_return_named_lt(expr, src)?;
-        }
-        Ok(())
-    }
-
     fn check_block_escape(
         &self,
         block_depth: u32,
@@ -750,7 +651,7 @@ impl Checker<'_, '_> {
                 return Err(self.does_not_live_long_enough(l.site, l.target));
             }
         }
-        Ok(())
+        self.check_drop_order(block_depth, state)
     }
 }
 
@@ -780,6 +681,14 @@ fn merge_states(dst: &mut State, other: &State) {
     }
     dst.tuple_elem_sources
         .retain(|k, ts| other.tuple_elem_sources.get(k).is_some_and(|o| ts.merge(o)));
+    for (&local, targets) in &other.ptr_targets {
+        let entry = dst.ptr_targets.entry(local).or_default();
+        for &t in targets {
+            if !entry.contains(&t) {
+                entry.push(t);
+            }
+        }
+    }
 }
 
 fn merge_branch(out: &mut State, a: &State, b: &State) {

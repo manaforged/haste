@@ -82,11 +82,36 @@ impl Infer<'_, '_> {
             }
             Kind::Array(inner, _) => self.is_copy_seen(inner, seen)?,
             Kind::Closure(..) => self.closure_is_copy_seen(ty, seen)?,
-            Kind::Adt(..) => {
+            Kind::Adt(item, args) => {
                 let Some(copy) = self.cx.lang_item("copy") else {
                     bail!("core has no `Copy` trait")
                 };
-                self.select(copy, ty, &[])?.is_some()
+                if self.select(copy, ty, &[])?.is_none() {
+                    false
+                } else if !self.cx.outline.is_sysroot(item.krate)
+                    && !self.cx.types.has_params(ty)
+                    && !self.cx.types.has_var_flag(ty)
+                {
+                    let has_drop = self
+                        .cx
+                        .lang_item("drop")
+                        .and_then(|d| self.select(d, ty, &[]).ok())
+                        .flatten()
+                        .is_some();
+                    if has_drop {
+                        false
+                    } else {
+                        let args_vec = self.cx.types.substs(args).to_vec();
+                        if let Ok(fields) = self.adt_fields(item, &args_vec) {
+                            let tys: Vec<Ty> = fields.iter().flatten().copied().collect();
+                            self.all_copy_seen(tys.into_iter(), seen)?
+                        } else {
+                            true
+                        }
+                    }
+                } else {
+                    true
+                }
             }
             _ => true,
         };

@@ -164,6 +164,9 @@ impl Checker<'_, '_> {
             self.push_sources_for_local(local, &sources, Some(e), state);
             let ts = self.expr_tuple_sources(e, state, true);
             state.set_tuple_sources(local, ts);
+            if self.is_mut_ptr_ty(self.local_ty(local)) {
+                self.record_ptr_targets(local, e, state);
+            }
         } else {
             let nested_ts = target
                 .elem_tuple

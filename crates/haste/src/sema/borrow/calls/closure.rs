@@ -155,6 +155,7 @@ impl Checker<'_, '_> {
         }
         let saved_returns = (
             self.returns_borrow,
+            self.returns_invariant,
             self.return_min_depth,
             self.closure_depth,
         );
@@ -175,6 +176,7 @@ impl Checker<'_, '_> {
             });
         self.returns_borrow =
             self.ty_holds_borrow(async_inner.as_ref().map_or(closure.ret, |(r, _)| *r));
+        self.returns_invariant = false;
         self.return_min_depth = closure_depth;
         self.closure_depth = closure_depth;
         self.active_closures.push(ActiveClosure {
@@ -220,6 +222,7 @@ impl Checker<'_, '_> {
         let active = self.active_closures.pop();
         (
             self.returns_borrow,
+            self.returns_invariant,
             self.return_min_depth,
             self.closure_depth,
         ) = saved_returns;

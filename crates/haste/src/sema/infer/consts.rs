@@ -247,6 +247,9 @@ impl<'a> Infer<'_, 'a> {
     ) -> Result<(u128, Int)> {
         let ran = evaluate::run(self.cx, instance, int.0);
         let value = ran.map_err(|reason| {
+            if evaluate::is_const_arithmetic_error(&reason) {
+                return reason;
+            }
             anyhow!(
                 "{error:#}; running {}: {reason:#}",
                 self.cx.name(instance.0)

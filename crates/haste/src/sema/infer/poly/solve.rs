@@ -5,12 +5,13 @@ use crate::body::{Body, ExprId, List, PathId};
 use crate::names::{ItemRef, ModRef, Primitive, plain};
 use crate::outline::item::ItemKind;
 
+use super::super::super::impls::ImplRef;
 use super::super::super::substs::{ProjDef, ProjId, Substs};
 use super::super::super::summary::{ConstHole, PolyObligation};
 use super::super::super::ty::{Kind, Ty};
 use super::super::select::Picked;
 use super::super::{Infer, Res};
-use super::push_proj_topo;
+use super::{compat, push_proj_topo};
 
 impl Infer<'_, '_> {
     pub(in super::super) fn poly_sized(&mut self, ty: Ty) -> bool {
@@ -233,11 +234,13 @@ impl Infer<'_, '_> {
         (name, own): (&str, &[Ty]),
     ) -> Result<Option<Ty>> {
         let selected = self.select(of, ty, args)?;
-        if let Some(picked) = &selected
-            && let Some(concrete) =
+        if let Some(picked) = &selected {
+            self.check_trait_impl_block(picked.0)?;
+            if let Some(concrete) =
                 self.non_default_impl_alias(of, ty, args, picked.clone(), (name, own))?
-        {
-            return Ok(Some(concrete));
+            {
+                return Ok(Some(concrete));
+            }
         }
         if selected.is_none() && !self.poly_holds_in_env(of, ty, args)? {
             return Ok(None);
@@ -341,7 +344,15 @@ impl Infer<'_, '_> {
         if self.compiler_impl(of, self_ty) || self.object_holds(of, self_ty, args) == Some(true) {
             return Ok(true);
         }
-        if self.poly_holds_in_env(of, self_ty, args)? || self.select(of, self_ty, args)?.is_some() {
+        if self.poly_holds_in_env(of, self_ty, args)? {
+            if let Some((block, _)) = self.trial(|infer| infer.select(of, self_ty, args))? {
+                self.check_trait_impl_block(block)?;
+            }
+            self.poly_prove(of, self_ty, args);
+            return Ok(true);
+        }
+        if let Some((block, _)) = self.select(of, self_ty, args)? {
+            self.check_trait_impl_block(block)?;
             self.poly_prove(of, self_ty, args);
             return Ok(true);
         }
@@ -350,6 +361,15 @@ impl Infer<'_, '_> {
         }
         self.poly_fallback();
         Ok(true)
+    }
+
+    fn check_trait_impl_block(&mut self, block: ImplRef) -> Result<()> {
+        if let Some(poly) = &mut self.poly
+            && (poly.skip_compat || !poly.checked_impls.insert(block))
+        {
+            return Ok(());
+        }
+        compat::check_trait_impl_block(self.cx, block)
     }
 
     fn poly_strict_param_obligation(&self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> bool {
@@ -370,7 +390,8 @@ impl Infer<'_, '_> {
         self_ty: Ty,
         args: &[Ty],
     ) -> Result<bool> {
-        if self.select(of, self_ty, args)?.is_some() {
+        if let Some((block, _)) = self.select(of, self_ty, args)? {
+            self.check_trait_impl_block(block)?;
             return Ok(true);
         }
         if self.poly.is_some() {
@@ -390,10 +411,8 @@ impl Infer<'_, '_> {
     ) -> Result<bool> {
         let has_params =
             self.poly.is_some() && (self.has_params(self_ty) || self.any_has_params(args));
-        if self
-            .trial(|infer| infer.select(of, self_ty, args))?
-            .is_some()
-        {
+        if let Some((block, _)) = self.trial(|infer| infer.select(of, self_ty, args))? {
+            self.check_trait_impl_block(block)?;
             if has_params {
                 self.poly_prove(of, self_ty, args);
             }
