@@ -503,6 +503,57 @@ impl<'a> Infer<'_, 'a> {
         }
         Ok(given)
     }
+
+    pub(in crate::sema) fn bound_trait_at(
+        &mut self,
+        arena: &crate::body::Body,
+        bound: u32,
+        home: crate::names::ModRef,
+    ) -> Option<(ItemRef, crate::body::PathId)> {
+        let crate::body::Bound::Trait {
+            path, maybe: false, ..
+        } = arena.bounds[bound as usize]
+        else {
+            return None;
+        };
+        Some((self.trait_named(arena, path, home)?, path))
+    }
+
+    /// The trait that `path` in `arena` names from module `home`.
+    pub fn trait_named(
+        &mut self,
+        arena: &crate::body::Body,
+        path: crate::body::PathId,
+        home: crate::names::ModRef,
+    ) -> Option<ItemRef> {
+        let (segments, absolute, dollar) = self.segments(arena, path);
+        let p = crate::names::path::Path {
+            segments: &segments,
+            absolute,
+            dollar,
+        };
+        self.trait_at(&p, home)
+    }
+
+    pub(super) fn trait_at(
+        &mut self,
+        path: &crate::names::path::Path<'_>,
+        home: crate::names::ModRef,
+    ) -> Option<ItemRef> {
+        let def = if home == self.home {
+            self.type_def(path)
+        } else {
+            self.cx.paths(home.krate).resolve(path, home)
+        };
+        match def? {
+            crate::names::Def::Item(item)
+                if self.cx.item(item).1.kind == crate::outline::item::ItemKind::Trait =>
+            {
+                Some(item)
+            }
+            _ => None,
+        }
+    }
 }
 
 struct Specialty {

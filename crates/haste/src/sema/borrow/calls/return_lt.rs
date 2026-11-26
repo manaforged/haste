@@ -404,6 +404,16 @@ impl super::super::Checker<'_, '_> {
 
     fn check_static_dyn_sources(&mut self, arg: ExprId, sources: &[BorrowSource]) -> Result<()> {
         let in_const = self.is_const_or_static_item();
+        let arg_ty = self.expr_ty(arg);
+        let arg_static_val = arg_ty != crate::sema::ty::Ty::NONE
+            && !self.ty_has_non_static_param(arg_ty)
+            && !self.ty_holds_non_dyn_borrow(arg_ty)
+            && self
+                .typed
+                .coercions
+                .get(&arg)
+                .and_then(|c| c.vtable())
+                .is_none();
         for s in sources {
             if is_temp_target(s.target).is_some() {
                 if in_const
@@ -419,6 +429,19 @@ impl super::super::Checker<'_, '_> {
                 continue;
             }
             let target_ty = self.local_ty(s.target);
+            if s.origin_only
+                && arg_static_val
+                && !self.is_ref_ty(target_ty)
+                && !self.ty_holds_non_dyn_borrow(target_ty)
+                && self
+                    .param_lts
+                    .only_type_param
+                    .get(s.target as usize)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             let pointee = match *self.cx.types.kind(target_ty) {
                 Kind::Ref(_, pointee) => Some(pointee),
                 _ => None,
@@ -706,7 +729,11 @@ impl super::super::Checker<'_, '_> {
                         req_static,
                         &ret_inv.named,
                     )?;
-                } else if req_static {
+                } else if req_static
+                    && !(self.is_mut_ref_ty(self.expr_ty(expr))
+                        && self.is_mut_ref_ty(target_ty)
+                        && self.param_inner_is_static(s.target))
+                {
                     self.check_sources_fit_invariant_lts(
                         Some(expr),
                         std::slice::from_ref(s),

@@ -1,9 +1,7 @@
 use anyhow::Result;
 
 use crate::body::{Body, Bound, PathId};
-use crate::names::path::Path as NamePath;
-use crate::names::{Def, ItemRef, ModRef};
-use crate::outline::item::ItemKind;
+use crate::names::{ItemRef, ModRef};
 
 use super::super::super::impls::{Head, ImplRef};
 use super::super::super::ty::{Kind, Mut, Ty};
@@ -402,9 +400,10 @@ impl<'a> Infer<'_, 'a> {
     ) -> bool {
         object == of
             || self.cx.types.items(autos).contains(&of)
-            || self
-                .implied_traits(vec![object])
-                .is_ok_and(|t| t.contains(&of))
+            || match self.implied_traits(vec![object]) {
+                Ok(t) => t.contains(&of),
+                Err(_) => true,
+            }
     }
 
     fn unpin_holds(&mut self, of: ItemRef, ty: Ty, seen: &mut Vec<Ty>) -> bool {
@@ -464,9 +463,7 @@ impl<'a> Infer<'_, 'a> {
             .cx
             .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders)
         {
-            let holds = self.has_vars(ty)
-                || self.probe(|infer| infer.select(of, ty, &[]).is_ok_and(|p| p.is_some()));
-            return Some(holds);
+            return Some(self.has_vars(ty) || self.select_auto_impl(of, ty).0);
         }
         if self.cx.lang(item) == Some("phantom_data") {
             seen.push(ty);
@@ -603,15 +600,7 @@ impl<'a> Infer<'_, 'a> {
             Kind::Tuple(_) => {
                 let my_depth = self.auto_stack.len();
                 self.auto_stack.push((of, ty));
-                let (mut dep, mut holds) = (usize::MAX, true);
-                for part in self.parts(ty) {
-                    let (ok, child_dep) = self.thread_auto_holds_dep(of, part);
-                    if !ok {
-                        holds = false;
-                        break;
-                    }
-                    dep = dep.min(child_dep);
-                }
+                let (holds, dep) = self.parts_auto_holds(of, ty);
                 self.auto_stack.pop();
                 self.finish_auto_node((of, ty), cacheable, my_depth, holds, dep)
             }
@@ -703,6 +692,35 @@ impl<'a> Infer<'_, 'a> {
         (holds, if holds { dep } else { usize::MAX })
     }
 
+    fn parts_auto_holds(&mut self, of: ItemRef, ty: Ty) -> (bool, usize) {
+        let (mut dep, mut ok) = (usize::MAX, true);
+        for part in self.parts(ty) {
+            let (h, child_dep) = self.thread_auto_holds_dep(of, part);
+            if !h {
+                ok = false;
+                break;
+            }
+            dep = dep.min(child_dep);
+        }
+        (ok, dep)
+    }
+
+    fn select_auto_impl(&mut self, of: ItemRef, ty: Ty) -> (bool, usize) {
+        let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
+        let before = self.cycle_hits;
+        let picked = self.probe(|infer| infer.select(of, ty, &[]));
+        let dep = std::mem::replace(&mut self.auto_dep, saved_dep);
+        match picked {
+            Ok(Some(_)) => (true, dep),
+            Ok(None) if self.cycle_hits == before => (false, usize::MAX),
+            Err(_) => {
+                self.cycle_hits += 1;
+                (true, 0)
+            }
+            Ok(None) => (true, 0),
+        }
+    }
+
     fn adt_auto_holds(
         &mut self,
         of: ItemRef,
@@ -720,81 +738,26 @@ impl<'a> Infer<'_, 'a> {
         }
         let my_depth = self.auto_stack.len();
         self.auto_stack.push((of, ty));
-        let (holds, dep) =
-            if self
-                .cx
-                .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders)
-            {
-                if self.has_vars(ty) || self.has_params(ty) {
-                    (true, usize::MAX)
-                } else {
-                    let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
-                    let ok =
-                        self.probe(|infer| infer.select(of, ty, &[]).is_ok_and(|p| p.is_some()));
-                    (ok, std::mem::replace(&mut self.auto_dep, saved_dep))
-                }
-            } else if self.cx.lang(item) == Some("phantom_data") {
-                match self.cx.types.substs(args).first().copied() {
-                    Some(t) => self.thread_auto_holds_dep(of, t),
-                    None => (true, usize::MAX),
-                }
+        let specific = self
+            .cx
+            .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders);
+        let (holds, dep) = if specific {
+            if self.has_vars(ty) || self.has_params(ty) {
+                (true, usize::MAX)
             } else {
-                let (mut dep, mut ok) = (usize::MAX, true);
-                for part in self.parts(ty) {
-                    let (h, child_dep) = self.thread_auto_holds_dep(of, part);
-                    if !h {
-                        ok = false;
-                        break;
-                    }
-                    dep = dep.min(child_dep);
-                }
-                (ok, dep)
-            };
+                self.select_auto_impl(of, ty)
+            }
+        } else if self.cx.lang(item) == Some("phantom_data") {
+            self.cx
+                .types
+                .substs(args)
+                .first()
+                .copied()
+                .map_or((true, usize::MAX), |t| self.thread_auto_holds_dep(of, t))
+        } else {
+            self.parts_auto_holds(of, ty)
+        };
         self.auto_stack.pop();
         self.finish_auto_node((of, ty), cacheable, my_depth, holds, dep)
-    }
-
-    pub(in crate::sema) fn bound_trait_at(
-        &mut self,
-        arena: &Body,
-        bound: u32,
-        home: ModRef,
-    ) -> Option<(ItemRef, PathId)> {
-        let Bound::Trait {
-            path, maybe: false, ..
-        } = arena.bounds[bound as usize]
-        else {
-            return None;
-        };
-        Some((self.trait_named(arena, path, home)?, path))
-    }
-
-    /// The trait that `path` in `arena` names from module `home`.
-    pub fn trait_named(&mut self, arena: &Body, path: PathId, home: ModRef) -> Option<ItemRef> {
-        let (segments, absolute, dollar) = self.segments(arena, path);
-        self.trait_at(
-            &NamePath {
-                segments: &segments,
-                absolute,
-                dollar,
-            },
-            home,
-        )
-    }
-
-    pub(in super::super) fn trait_at(
-        &mut self,
-        path: &NamePath<'_>,
-        home: ModRef,
-    ) -> Option<ItemRef> {
-        let def = if home == self.home {
-            self.type_def(path)
-        } else {
-            self.cx.paths(home.krate).resolve(path, home)
-        };
-        match def? {
-            Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),
-            _ => None,
-        }
     }
 }

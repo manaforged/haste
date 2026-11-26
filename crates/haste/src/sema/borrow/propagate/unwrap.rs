@@ -289,9 +289,14 @@ impl Checker<'_, '_> {
         if base_ty == Ty::NONE {
             return false;
         }
-        let Kind::Adt(adt_item, _) = *self.cx.types.kind(base_ty) else {
+        let Kind::Adt(adt_item, args) = *self.cx.types.kind(base_ty) else {
             return false;
         };
+        let args_vec = self.cx.types.substs(args).to_vec();
+        let arg_is_static: Vec<bool> = args_vec
+            .iter()
+            .map(|&arg| !self.ty_has_non_static_param(arg) && !self.ty_holds_non_dyn_borrow(arg))
+            .collect();
         let Ok(def) = self.cx.adt_def(adt_item) else {
             return false;
         };
@@ -312,13 +317,18 @@ impl Checker<'_, '_> {
         let adt_src = &self.cx.file(adt_item).source;
         let mut f_lts = Lifetimes::default();
         collect_ty_lifetimes(&def.body, adt_src, field.ty, &mut f_lts);
-        let ty_params: Vec<&str> = def
-            .generics
-            .params
-            .iter()
-            .filter(|g| g.kind == GenericKind::Type)
-            .map(|g| adt_src.text(g.name))
-            .collect();
+        let mut ty_params = Vec::new();
+        let mut arg_idx = 0usize;
+        for g in &def.generics.params {
+            if g.kind == GenericKind::Lifetime {
+                continue;
+            }
+            if g.kind == GenericKind::Type && !arg_is_static.get(arg_idx).copied().unwrap_or(false)
+            {
+                ty_params.push(adt_src.text(g.name));
+            }
+            arg_idx += 1;
+        }
         !f_lts.has_elided
             && f_lts.named.is_empty()
             && !ast_ty_has_type_param(&def.body, adt_src, field.ty, &ty_params)
@@ -491,11 +501,30 @@ impl Checker<'_, '_> {
         }
         match *self.body.expr(body) {
             Expr::Method { receiver, .. } => {
-                self.expr_projects_local(receiver) == Some(param_local)
-                    && matches!(
-                        self.typed.res.get(&body).copied(),
-                        Some(Res::Fn(fn_item, _)) if self.cx.name(fn_item) == "clone"
-                    )
+                let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&body).copied() else {
+                    return false;
+                };
+                let (is_clone, is_copy_method) = {
+                    let name = self.cx.name(fn_item);
+                    (name == "clone", matches!(name, "copied" | "cloned"))
+                };
+                if is_clone {
+                    return self.expr_projects_local(receiver) == Some(param_local);
+                }
+                if is_copy_method
+                    && (self.is_iter_mod(fn_item) || self.item_in_std_mod(fn_item, "option"))
+                {
+                    let mut cur = receiver;
+                    for _ in 0..8 {
+                        cur = self.unwrap_parens(cur);
+                        match *self.body.expr(cur) {
+                            Expr::Method { receiver: r, .. } | Expr::Try(r) => cur = r,
+                            _ => break,
+                        }
+                    }
+                    return self.expr_projects_local(cur) == Some(param_local);
+                }
+                false
             }
             Expr::Call(callee, args) if self.body.list(args).len() == 1 => {
                 let arg = ExprId(self.body.list(args)[0]);
@@ -631,6 +660,16 @@ impl Checker<'_, '_> {
                     _ => None,
                 })
                 .flatten();
+            if pointee.is_none()
+                && !s.through_ref
+                && unwrap
+                && call_owned
+                && target_ty != Ty::NONE
+                && !self.ty_holds_non_dyn_borrow(target_ty)
+                && !self.ty_has_non_static_param(call_ty)
+            {
+                return true;
+            }
             return pointee.is_some_and(|p| {
                 (!unwrap && self.ty_is_borrow_free(p))
                     || (((unwrap && !self.is_ref_ty(call_ty)) || call_owned)
