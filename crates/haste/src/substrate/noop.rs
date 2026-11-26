@@ -1,5 +1,6 @@
 //! Workspace no-op build fingerprint for skipping unchanged one-shot `haste build` runs.
 
+use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 
@@ -7,8 +8,10 @@ use super::{bytes_to_path, path_to_bytes, read_u32, read_u64};
 
 use rustc_hash::FxHasher;
 
-const NOOP_MAGIC: [u8; 8] = *b"HSTNOP01";
-const HEADER_LEN: usize = 32;
+const NOOP_MAGIC: [u8; 8] = *b"HSTNOP02";
+const HEADER_LEN: usize = 36;
+const TARGET_DIRS: [&str; 4] = ["src", "src/bin", "tests", "examples"];
+const ROOT_FILES: [&str; 3] = ["src/lib.rs", "src/main.rs", "build.rs"];
 
 /// Returns whether the CLI no-op fast path is active for this `build` invocation.
 pub fn active(stats: Option<&Path>) -> bool {
@@ -41,10 +44,74 @@ fn stamp_path(root: &Path, out: Option<&Path>) -> PathBuf {
     stamp_path_for(root, out, &crate::config::Config::current())
 }
 
+fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for &member in &workspace.graph.members {
+        if let Some(pkg) = workspace.packages.get(member) {
+            for sub in TARGET_DIRS {
+                dirs.push(pkg.manifest.dir.join(sub));
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for pkg in workspace.packages.iter().filter(|pkg| pkg.local()) {
+        for rel in ROOT_FILES {
+            files.push(pkg.manifest.dir.join(rel));
+        }
+        files.extend(pkg.manifest.lib.iter().cloned());
+        files.extend(pkg.manifest.build.iter().cloned());
+        files.extend(pkg.manifest.bins.iter().map(|(_, path)| path.clone()));
+        files.extend(pkg.manifest.examples.iter().map(|(_, path)| path.clone()));
+        files.extend(pkg.manifest.tests.iter().map(|(_, path)| path.clone()));
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn hash_target_dir(dir: &Path, hasher: &mut FxHasher) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        (dir, false).hash(hasher);
+        return;
+    };
+    let mut found: Vec<OsString> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            found.push(entry.file_name());
+        } else if path.is_dir() && path.join("main.rs").is_file() {
+            let mut name = entry.file_name();
+            name.push("/main.rs");
+            found.push(name);
+        }
+    }
+    found.sort();
+    (dir, true, found).hash(hasher);
+}
+
+/// Computes a fingerprint of auto-discovered target directories and root files for workspace reload checks.
+pub(crate) fn target_discovery_stamp(workspace: &crate::graph::Workspace) -> u64 {
+    let mut hasher = FxHasher::default();
+    for dir in target_dirs(workspace) {
+        hash_target_dir(&dir, &mut hasher);
+    }
+    for path in target_root_files(workspace) {
+        (path.as_path(), path.is_file()).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn compute_stamp(
     root: &Path,
     out: Option<&Path>,
     paths: &[PathBuf],
+    dirs: &[PathBuf],
     env_names: &[String],
 ) -> Option<u64> {
     let target = crate::host_target();
@@ -70,6 +137,10 @@ fn compute_stamp(
     for path in paths {
         (path, crate::graph::store::file_stamp(path)).hash(&mut hasher);
     }
+    dirs.len().hash(&mut hasher);
+    for dir in dirs {
+        hash_target_dir(dir, &mut hasher);
+    }
     env_names.len().hash(&mut hasher);
     for name in env_names {
         (name, std::env::var_os(name)).hash(&mut hasher);
@@ -84,7 +155,29 @@ fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8
     Some(slice)
 }
 
-fn decode_stamp_file(data: &[u8]) -> Option<(u64, usize, Vec<PathBuf>, Vec<String>)> {
+fn read_paths(data: &[u8], pos: &mut usize, count: usize) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let len = read_u32(read_bytes(data, pos, 4)?, 0) as usize;
+        let bytes = read_bytes(data, pos, len)?;
+        paths.push(bytes_to_path(bytes)?);
+    }
+    Some(paths)
+}
+
+fn write_paths(out: &mut Vec<u8>, paths: &[PathBuf]) -> Option<()> {
+    for path in paths {
+        let bytes = path_to_bytes(path)?;
+        let len = u32::try_from(bytes.len()).ok()?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Some(())
+}
+
+type DecodedStamp = (u64, usize, Vec<PathBuf>, Vec<PathBuf>, Vec<String>);
+
+fn decode_stamp_file(data: &[u8]) -> Option<DecodedStamp> {
     if data.len() < HEADER_LEN || data[0..8] != NOOP_MAGIC {
         return None;
     }
@@ -94,43 +187,40 @@ fn decode_stamp_file(data: &[u8]) -> Option<(u64, usize, Vec<PathBuf>, Vec<Strin
         return None;
     }
     let path_count = read_u32(data, 24) as usize;
-    let env_count = read_u32(data, 28) as usize;
+    let dir_count = read_u32(data, 28) as usize;
+    let env_count = read_u32(data, 32) as usize;
     let mut pos = HEADER_LEN;
-    let mut paths = Vec::with_capacity(path_count.min(4096));
-    for _ in 0..path_count {
-        let len = read_u32(read_bytes(data, &mut pos, 4)?, 0) as usize;
-        let bytes = read_bytes(data, &mut pos, len)?;
-        paths.push(bytes_to_path(bytes)?);
-    }
+    let paths = read_paths(data, &mut pos, path_count)?;
+    let dirs = read_paths(data, &mut pos, dir_count)?;
     let mut envs = Vec::with_capacity(env_count.min(1024));
     for _ in 0..env_count {
         let len = read_u32(read_bytes(data, &mut pos, 4)?, 0) as usize;
         let bytes = read_bytes(data, &mut pos, len)?;
         envs.push(String::from_utf8(bytes.to_vec()).ok()?);
     }
-    (pos == data.len()).then_some((stamp, reached, paths, envs))
+    (pos == data.len()).then_some((stamp, reached, paths, dirs, envs))
 }
 
 fn encode_stamp_file(
     stamp: u64,
     reached: usize,
     paths: &[PathBuf],
+    dirs: &[PathBuf],
     envs: &[String],
 ) -> Option<Vec<u8>> {
     let path_count = u32::try_from(paths.len()).ok()?;
+    let dir_count = u32::try_from(dirs.len()).ok()?;
     let env_count = u32::try_from(envs.len()).ok()?;
-    let mut out = Vec::with_capacity(HEADER_LEN + paths.len() * 48 + envs.len() * 16);
+    let cap = HEADER_LEN + (paths.len() + dirs.len()) * 48 + envs.len() * 16;
+    let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(&NOOP_MAGIC);
     out.extend_from_slice(&stamp.to_le_bytes());
     out.extend_from_slice(&(reached as u64).to_le_bytes());
     out.extend_from_slice(&path_count.to_le_bytes());
+    out.extend_from_slice(&dir_count.to_le_bytes());
     out.extend_from_slice(&env_count.to_le_bytes());
-    for path in paths {
-        let bytes = path_to_bytes(path)?;
-        let len = u32::try_from(bytes.len()).ok()?;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&bytes);
-    }
+    write_paths(&mut out, paths)?;
+    write_paths(&mut out, dirs)?;
     for env in envs {
         let bytes = env.as_bytes();
         let len = u32::try_from(bytes.len()).ok()?;
@@ -150,8 +240,8 @@ pub fn try_hit(root: &Path, out: Option<&Path>) -> Option<usize> {
         return None;
     }
     let data = std::fs::read(stamp_path(&croot, aout.as_deref())).ok()?;
-    let (stored_stamp, reached, paths, envs) = decode_stamp_file(&data)?;
-    let current = compute_stamp(&croot, aout.as_deref(), &paths, &envs)?;
+    let (stored_stamp, reached, paths, dirs, envs) = decode_stamp_file(&data)?;
+    let current = compute_stamp(&croot, aout.as_deref(), &paths, &dirs, &envs)?;
     (current == stored_stamp).then_some(reached)
 }
 
@@ -171,18 +261,20 @@ pub fn record(
     let aout = abs_out(out);
     let mut paths = crate::graph::manifest_paths(workspace, &croot);
     paths.extend(build_paths.iter().cloned());
+    paths.extend(target_root_files(workspace));
     let (watched_files, watched_vars) = crate::graph::store::watched_stamps(workspace);
     paths.extend(watched_files.into_iter().map(|(path, _, _)| path));
     paths.sort();
     paths.dedup();
+    let dirs = target_dirs(workspace);
     let mut envs: Vec<String> = watched_vars.into_iter().map(|(name, _)| name).collect();
     envs.extend(env_reads.iter().cloned());
     envs.sort();
     envs.dedup();
-    let Some(stamp) = compute_stamp(&croot, aout.as_deref(), &paths, &envs) else {
+    let Some(stamp) = compute_stamp(&croot, aout.as_deref(), &paths, &dirs, &envs) else {
         return;
     };
-    if let Some(encoded) = encode_stamp_file(stamp, reached, &paths, &envs) {
+    if let Some(encoded) = encode_stamp_file(stamp, reached, &paths, &dirs, &envs) {
         drop(crate::graph::store::write_new_bytes(
             &stamp_path(&croot, aout.as_deref()),
             &encoded,

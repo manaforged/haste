@@ -17,6 +17,7 @@ pub(super) fn usage() -> String {
     let modes: Vec<&str> = crate::serve::MODES
         .into_iter()
         .map(|(_, name)| name)
+        .chain(std::iter::once("check"))
         .chain(
             TOP_COMMANDS
                 .into_iter()
@@ -30,7 +31,7 @@ pub(super) fn usage() -> String {
         .map(|(_, name)| name)
         .collect();
     format!(
-        "usage: haste [-p PKG] [--bin NAME | --example NAME] [-F FEATURES] [--all-features] [--no-default-features] [--ignored] [--include-ignored] [--target TRIPLE] [--jobs N] [--release] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--workspace] [--bin NAME | --example NAME] [--tests] [--all-targets] [-F FEATURES] [--all-features] [--no-default-features] [--manifest-path PATH] [--locked] [--offline] [--ignored] [--include-ignored] [--target TRIPLE] [-j|--jobs N] [--release | --profile NAME] [--message-format FMT] [-q|--quiet] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [-j|--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -127,17 +128,12 @@ fn parse(
             .map(|(query, _)| Ok(Command::Debug(query)))
             .with_context(usage);
     }
+    if word == "check" {
+        return Ok(Ok(Command::Request(Request::Build)));
+    }
     Request::parse_mode(&word)
         .map(|req| Ok(Command::Request(req)))
-        .ok_or_else(|| {
-            if word == "check" {
-                anyhow::anyhow!(
-                    "unknown command `check` (did you mean `haste build`?); run `haste --help` for usage"
-                )
-            } else {
-                anyhow::anyhow!("unknown command `{word}`; run `haste --help` for usage")
-            }
-        })
+        .ok_or_else(|| anyhow::anyhow!("unknown command `{word}`; run `haste --help` for usage"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,10 +162,12 @@ impl Meta {
 #[derive(Default)]
 struct ParsedOpts {
     selection: crate::Selection,
+    manifest_path: Option<PathBuf>,
     stats: Option<PathBuf>,
     out: Option<PathBuf>,
     jobs: Option<usize>,
     release: bool,
+    profile: Option<outline::tree::Profile>,
     daemon: bool,
     all_daemons: bool,
     prepared: bool,
@@ -179,130 +177,214 @@ struct ParsedOpts {
     target: Option<&'static haste_codegen::Target>,
 }
 
+fn split_flag(flag: &str) -> (&str, Option<&str>) {
+    if let Some((name, val)) = flag.split_once('=') {
+        (name, Some(val))
+    } else if let Some(rest) = flag.strip_prefix("-j")
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        ("-j", Some(rest))
+    } else {
+        (flag, None)
+    }
+}
+
+fn take_str<I: Iterator<Item = std::ffi::OsString>>(
+    args: &mut std::iter::Peekable<I>,
+    eq_val: Option<&str>,
+    ctx: &str,
+) -> Result<String> {
+    args.next();
+    match eq_val {
+        Some(val) => Ok(val.to_owned()),
+        None => next_str(args).with_context(|| ctx.to_owned()),
+    }
+}
+
+fn take_non_empty<I: Iterator<Item = std::ffi::OsString>>(
+    args: &mut std::iter::Peekable<I>,
+    eq_val: Option<&str>,
+    ctx: &str,
+) -> Result<String> {
+    let val = take_str(args, eq_val, ctx)?;
+    if val.is_empty() {
+        anyhow::bail!("{ctx}");
+    }
+    Ok(val)
+}
+
+fn take_os<I: Iterator<Item = std::ffi::OsString>>(
+    args: &mut std::iter::Peekable<I>,
+    eq_val: Option<&str>,
+    ctx: &str,
+) -> Result<std::ffi::OsString> {
+    args.next();
+    match eq_val {
+        Some(val) if !val.is_empty() => Ok(std::ffi::OsString::from(val)),
+        Some(_) => anyhow::bail!("{ctx}"),
+        None => args.next().with_context(|| ctx.to_owned()),
+    }
+}
+
+fn parse_profile(name: &str) -> Result<outline::tree::Profile> {
+    match name {
+        "release" => Ok(outline::tree::Profile::Release),
+        "dev" | "debug" => Ok(outline::tree::Profile::Debug),
+        _ => anyhow::bail!("unknown profile `{name}`; expected `dev`, `debug`, or `release`"),
+    }
+}
+
+fn parse_message_format(fmt: &str) -> Result<crate::MessageFormat> {
+    match fmt {
+        "human" => Ok(crate::MessageFormat::Human),
+        "short" => Ok(crate::MessageFormat::Short),
+        "json" => Ok(crate::MessageFormat::Json),
+        "json-render-diagnostics" => Ok(crate::MessageFormat::JsonRenderDiagnostics),
+        _ => anyhow::bail!(
+            "unknown message format `{fmt}`; expected `human`, `short`, `json`, or `json-render-diagnostics`"
+        ),
+    }
+}
+
+fn manifest_workspace_dir(manifest: &std::path::Path) -> PathBuf {
+    match manifest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+fn apply_bool_flag(opts: &mut ParsedOpts, flag: &str) -> bool {
+    match flag {
+        "--lib" => opts.selection.lib = true,
+        "--bins" => opts.selection.bins = true,
+        "--tests" => opts.selection.tests = true,
+        "--all-targets" => opts.selection.all_targets = true,
+        "--all-features" => opts.selection.all_features = true,
+        "--workspace" => opts.selection.workspace = true,
+        "--no-default-features" => opts.selection.no_default_features = true,
+        "--locked" => opts.selection.locked = true,
+        "--offline" => opts.selection.offline = true,
+        "-q" | "--quiet" => opts.selection.quiet = true,
+        "--ignored" => opts.selection.ignored_only = true,
+        "--include-ignored" => opts.selection.include_ignored = true,
+        "--release" => {
+            opts.release = true;
+            opts.profile = Some(outline::tree::Profile::Release);
+        }
+        "--daemon" => opts.daemon = true,
+        "--all" => opts.all_daemons = true,
+        "--prepared" => opts.prepared = true,
+        "--perf-map" => opts.perf_map = true,
+        "--watch" => opts.watch = true,
+        _ => return false,
+    }
+    true
+}
+
+fn apply_value_flag<I: Iterator<Item = std::ffi::OsString>>(
+    args: &mut std::iter::Peekable<I>,
+    opts: &mut ParsedOpts,
+    name: &str,
+    eq_val: Option<&str>,
+) -> Result<bool> {
+    match name {
+        "-p" | "--package" => {
+            opts.selection.package = Some(take_non_empty(
+                args,
+                eq_val,
+                "--package takes a package name",
+            )?);
+        }
+        "--bin" => {
+            opts.selection.bin = Some(take_non_empty(args, eq_val, "--bin takes a binary name")?);
+        }
+        "--example" => {
+            opts.selection.example = Some(take_non_empty(
+                args,
+                eq_val,
+                "--example takes an example name",
+            )?);
+        }
+        "--test" => {
+            opts.selection.test = Some(take_non_empty(
+                args,
+                eq_val,
+                "--test takes a test target name",
+            )?);
+        }
+        "-F" | "--features" => {
+            let list = take_str(args, eq_val, "--features takes a feature list")?;
+            opts.selection.features.extend(
+                list.split([',', ' '])
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        "--manifest-path" => {
+            let value = take_os(args, eq_val, "--manifest-path takes a file path")?;
+            opts.manifest_path = Some(PathBuf::from(value));
+        }
+        "-j" | "--jobs" => {
+            let raw = take_non_empty(args, eq_val, "--jobs takes a positive number")?;
+            let count: usize = raw.parse().context("--jobs takes a positive number")?;
+            opts.jobs = Some(count.max(1));
+        }
+        "--profile" => {
+            let prof_name = take_non_empty(args, eq_val, "--profile takes a profile name")?;
+            let prof = parse_profile(&prof_name)?;
+            opts.profile = Some(prof);
+            opts.release = prof == outline::tree::Profile::Release;
+        }
+        "--message-format" => {
+            let fmt = take_non_empty(args, eq_val, "--message-format takes a format name")?;
+            opts.selection.message_format = parse_message_format(&fmt)?;
+        }
+        "--prep-wait" => {
+            let raw = take_non_empty(args, eq_val, "--prep-wait takes a number of milliseconds")?;
+            let millis: u64 = raw
+                .parse()
+                .context("--prep-wait takes a number of milliseconds")?;
+            opts.prep_wait = Some(std::time::Duration::from_millis(millis));
+        }
+        "--stats-json" => {
+            let value = take_os(args, eq_val, "--stats-json takes a file path")?;
+            opts.stats = Some(PathBuf::from(value));
+        }
+        "--target" => {
+            let triple = take_non_empty(args, eq_val, "--target takes a target triple")?;
+            opts.target = Some(crate::config::find_target(&triple)?);
+        }
+        "-o" | "--output" => {
+            let value = take_os(args, eq_val, "-o takes a file path")?;
+            opts.out = Some(PathBuf::from(value));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn consume_options<I: Iterator<Item = std::ffi::OsString>>(
     args: &mut std::iter::Peekable<I>,
     opts: &mut ParsedOpts,
 ) -> Result<Option<Meta>> {
-    while let Some(flag) = args.peek().and_then(|raw| raw.to_str()) {
-        if let Some(meta) = Meta::from_flag(flag) {
+    while let Some(flag) = args.peek().and_then(|raw| raw.to_str()).map(str::to_owned) {
+        if let Some(meta) = Meta::from_flag(&flag) {
             args.next();
             return Ok(Some(meta));
         }
-        match flag {
-            "-p" | "--package" => {
-                args.next();
-                opts.selection.package =
-                    Some(next_str(args).context("--package takes a package name")?);
-            }
-            "--bin" => {
-                args.next();
-                opts.selection.bin = Some(next_str(args).context("--bin takes a binary name")?);
-            }
-            "--example" => {
-                args.next();
-                opts.selection.example =
-                    Some(next_str(args).context("--example takes an example name")?);
-            }
-            "--test" => {
-                args.next();
-                opts.selection.test =
-                    Some(next_str(args).context("--test takes a test target name")?);
-            }
-            "--lib" => {
-                args.next();
-                opts.selection.lib = true;
-            }
-            "--bins" => {
-                args.next();
-                opts.selection.bins = true;
-            }
-            "-F" | "--features" => {
-                args.next();
-                let list = next_str(args).context("--features takes a feature list")?;
-                opts.selection.features.extend(
-                    list.split([',', ' '])
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned),
-                );
-            }
-            "--all-features" => {
-                args.next();
-                opts.selection.all_features = true;
-            }
-            "--workspace" => {
-                args.next();
-            }
-            "--no-default-features" => {
-                args.next();
-                opts.selection.no_default_features = true;
-            }
-            "--ignored" => {
-                args.next();
-                opts.selection.ignored_only = true;
-            }
-            "--include-ignored" => {
-                args.next();
-                opts.selection.include_ignored = true;
-            }
-            "--jobs" => {
-                args.next();
-                let count: usize = next_str(args)?
-                    .parse()
-                    .context("--jobs takes a positive number")?;
-                opts.jobs = Some(count.max(1));
-            }
-            "--release" => {
-                args.next();
-                opts.release = true;
-            }
-            "--daemon" => {
-                args.next();
-                opts.daemon = true;
-            }
-            "--all" => {
-                args.next();
-                opts.all_daemons = true;
-            }
-            "--prepared" => {
-                args.next();
-                opts.prepared = true;
-            }
-            "--prep-wait" => {
-                args.next();
-                let millis: u64 = next_str(args)?
-                    .parse()
-                    .context("--prep-wait takes a number of milliseconds")?;
-                opts.prep_wait = Some(std::time::Duration::from_millis(millis));
-            }
-            "--perf-map" => {
-                args.next();
-                opts.perf_map = true;
-            }
-            "--watch" => {
-                args.next();
-                opts.watch = true;
-            }
-            "--stats-json" => {
-                args.next();
-                let value = args.next().context("--stats-json takes a file path")?;
-                opts.stats = Some(PathBuf::from(value));
-            }
-            "--target" => {
-                args.next();
-                let triple = next_str(args)?;
-                opts.target = Some(crate::config::find_target(&triple)?);
-            }
-            "-o" | "--output" => {
-                args.next();
-                let value = args.next().context("-o takes a file path")?;
-                opts.out = Some(PathBuf::from(value));
-            }
-            _ if flag == "--" => break,
-            _ if flag.starts_with('-') && flag != "-" => {
-                anyhow::bail!("unknown option `{flag}`\n{}", usage())
-            }
-            _ => break,
+        if flag == "--" || !flag.starts_with('-') || flag == "-" {
+            break;
         }
+        let (name, eq_val) = split_flag(&flag);
+        if apply_value_flag(args, opts, name, eq_val)? {
+            continue;
+        }
+        if eq_val.is_none() && apply_bool_flag(opts, &flag) {
+            args.next();
+            continue;
+        }
+        anyhow::bail!("unknown option `{flag}`\n{}", usage());
     }
     Ok(None)
 }
@@ -316,32 +398,12 @@ pub(super) type ParsedInvocation = (
     crate::config::Config,
 );
 
-fn parse_args_raw(
-    raw: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<std::result::Result<(ParsedInvocation, ParsedOpts), Meta>> {
-    let mut args = raw.into_iter().peekable();
-    let mut opts = ParsedOpts::default();
-    if let Some(meta) = consume_options(&mut args, &mut opts)? {
-        return Ok(Err(meta));
-    }
-    let command = match parse(&mut args)? {
-        Ok(cmd) => cmd,
-        Err(meta) => return Ok(Err(meta)),
-    };
-    if let Some(meta) = consume_options(&mut args, &mut opts)? {
-        return Ok(Err(meta.with_command(command)));
-    }
-    if matches!(command, Command::Clean) {
-        if args.peek().is_some() {
-            anyhow::bail!("{}", usage());
-        }
-        let cfg = crate::config::Config::from_env();
-        return Ok(Ok((
-            (command, PathBuf::new(), Vec::new(), None, None, cfg),
-            opts,
-        )));
-    }
-    let path = match command {
+fn take_path<I: Iterator<Item = std::ffi::OsString>>(
+    command: Command,
+    args: &mut std::iter::Peekable<I>,
+    has_manifest: bool,
+) -> Result<(PathBuf, bool)> {
+    match command {
         Command::Serve(ServeAction::Status | ServeAction::Stop { .. })
         | Command::Request(_)
         | Command::Serve(ServeAction::Run)
@@ -355,17 +417,16 @@ fn parse_args_raw(
                 "."
             };
             match args.peek().and_then(|raw| raw.to_str()) {
-                None | Some("--") => PathBuf::from(default_path),
-                Some(_) => PathBuf::from(args.next().with_context(usage)?),
+                None | Some("--") => Ok((PathBuf::from(default_path), false)),
+                Some(_) => Ok((PathBuf::from(args.next().with_context(usage)?), true)),
             }
         }
-        _ => PathBuf::from(args.next().with_context(usage)?),
-    };
-    if !matches!(command, Command::Debug(_))
-        && let Some(meta) = consume_options(&mut args, &mut opts)?
-    {
-        return Ok(Err(meta.with_command(command)));
+        Command::Debug(_) if has_manifest && args.peek().is_none() => Ok((PathBuf::new(), false)),
+        _ => Ok((PathBuf::from(args.next().with_context(usage)?), true)),
     }
+}
+
+fn validate_command_opts(command: Command, opts: &ParsedOpts) -> Result<Command> {
     let command = match command {
         Command::Serve(ServeAction::Stop { .. }) => Command::Serve(ServeAction::Stop {
             all: opts.all_daemons,
@@ -394,23 +455,17 @@ fn parse_args_raw(
     if opts.watch && !matches!(command, Command::Request(Request::Run)) {
         anyhow::bail!("--watch is only supported with `haste run`");
     }
-    let rest = args
-        .map(|raw| {
-            raw.into_string()
-                .map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy()))
-        })
-        .collect::<Result<Vec<String>>>()?;
-    let rest = match rest.split_first() {
-        Some((first, tail)) if first == "--" => tail.to_vec(),
-        _ => rest,
-    };
-    let stats_json = opts.stats.clone();
-    let out = opts.out.clone();
+    Ok(command)
+}
+
+fn build_config(command: Command, opts: &ParsedOpts) -> crate::config::Config {
     let mut cfg = crate::config::Config::from_env();
     if let Some(count) = opts.jobs {
         cfg.jobs = count;
     }
-    if opts.release {
+    if let Some(profile) = opts.profile {
+        cfg.profile = profile;
+    } else if opts.release {
         cfg.profile = outline::tree::Profile::Release;
     }
     cfg.refresh_debug_flags();
@@ -421,8 +476,69 @@ fn parse_args_raw(
     }
     cfg.selection = opts.selection.clone();
     cfg.test_mode = matches!(command, Command::Request(Request::Test))
+        || opts.selection.tests
+        || opts.selection.all_targets
         || (matches!(command, Command::Serve(ServeAction::Run))
             && crate::env_flag("HASTE_SERVE_TEST"));
+    cfg
+}
+
+fn collect_rest(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>> {
+    let rest = args
+        .map(|raw| {
+            raw.into_string()
+                .map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy()))
+        })
+        .collect::<Result<Vec<String>>>()?;
+    Ok(match rest.split_first() {
+        Some((first, tail)) if first == "--" => tail.to_vec(),
+        _ => rest,
+    })
+}
+
+fn parse_args_raw(
+    raw: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<std::result::Result<(ParsedInvocation, ParsedOpts), Meta>> {
+    let mut args = raw.into_iter().peekable();
+    let mut opts = ParsedOpts::default();
+    if let Some(meta) = consume_options(&mut args, &mut opts)? {
+        return Ok(Err(meta));
+    }
+    let command = match parse(&mut args)? {
+        Ok(cmd) => cmd,
+        Err(meta) => return Ok(Err(meta)),
+    };
+    if let Some(meta) = consume_options(&mut args, &mut opts)? {
+        return Ok(Err(meta.with_command(command)));
+    }
+    if matches!(command, Command::Clean) {
+        if args.peek().is_some() {
+            anyhow::bail!("{}", usage());
+        }
+        let command = validate_command_opts(command, &opts)?;
+        let cfg = build_config(command, &opts);
+        return Ok(Ok((
+            (command, PathBuf::new(), Vec::new(), None, None, cfg),
+            opts,
+        )));
+    }
+    let (path, explicit_path) = take_path(command, &mut args, opts.manifest_path.is_some())?;
+    if !matches!(command, Command::Debug(_))
+        && let Some(meta) = consume_options(&mut args, &mut opts)?
+    {
+        return Ok(Err(meta.with_command(command)));
+    }
+    let path = match &opts.manifest_path {
+        Some(_) if explicit_path => {
+            anyhow::bail!("cannot pass both a positional path and `--manifest-path`")
+        }
+        Some(manifest) => manifest_workspace_dir(manifest),
+        None => path,
+    };
+    let command = validate_command_opts(command, &opts)?;
+    let rest = collect_rest(args)?;
+    let (stats_json, out) = (opts.stats.clone(), opts.out.clone());
+    let cfg = build_config(command, &opts);
     Ok(Ok(((command, path, rest, stats_json, out, cfg), opts)))
 }
 
@@ -547,27 +663,27 @@ mod tests {
     #[test]
     fn subcommand_help_routes_to_topic_and_version_formats_sha() {
         assert_eq!(
-            parse_strs(&["--help"]).unwrap().err(),
+            parse_strs(&["--help"]).expect("valid help").err(),
             Some(Meta::Help(None))
         );
         assert_eq!(
-            parse_strs(&["build", "--help"]).unwrap().err(),
+            parse_strs(&["build", "--help"]).expect("valid help").err(),
             Some(Meta::Help(Some(HelpTopic::Build)))
         );
         assert_eq!(
-            parse_strs(&["run", "-h"]).unwrap().err(),
+            parse_strs(&["run", "-h"]).expect("valid help").err(),
             Some(Meta::Help(Some(HelpTopic::Run)))
         );
         assert_eq!(
-            parse_strs(&["test", "--help"]).unwrap().err(),
+            parse_strs(&["test", "--help"]).expect("valid help").err(),
             Some(Meta::Help(Some(HelpTopic::Test)))
         );
         assert_eq!(
-            parse_strs(&["serve", "--help"]).unwrap().err(),
+            parse_strs(&["serve", "--help"]).expect("valid help").err(),
             Some(Meta::Help(Some(HelpTopic::Serve)))
         );
         assert_eq!(
-            parse_strs(&["debug", "--help"]).unwrap().err(),
+            parse_strs(&["debug", "--help"]).expect("valid help").err(),
             Some(Meta::Help(Some(HelpTopic::Debug)))
         );
         assert_ne!(help_text(Some(HelpTopic::Build)), help_text(None));

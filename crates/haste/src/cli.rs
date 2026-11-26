@@ -39,6 +39,43 @@ fn item_enabled(tree: &outline::tree::Crate, file_at: usize, at: usize) -> bool 
     true
 }
 
+fn crate_fns<'a>(
+    krate: usize,
+    tree: &'a outline::tree::Crate,
+) -> impl Iterator<
+    Item = (
+        ItemRef,
+        &'a outline::tree::Crate,
+        &'a outline::tree::File,
+        &'a outline::item::Item,
+    ),
+> + 'a {
+    tree.files
+        .iter()
+        .enumerate()
+        .flat_map(move |(file_at, file)| {
+            file.items
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(move |(at, item)| {
+                    (item.kind == outline::item::ItemKind::Fn
+                        && item.body.is_some()
+                        && item_enabled(tree, file_at, at))
+                    .then_some((
+                        ItemRef {
+                            krate: krate as u32,
+                            file: file_at as u32,
+                            item: at as u32,
+                        },
+                        tree,
+                        file.as_ref(),
+                        item,
+                    ))
+                })
+        })
+}
+
 fn member_fns<'a>(
     workspace: &'a graph::Workspace,
     outline: &'a outline::Outline,
@@ -50,33 +87,51 @@ fn member_fns<'a>(
         &'a outline::item::Item,
     ),
 > + 'a {
-    outline.members(workspace).flat_map(move |krate| {
-        let tree = &outline.crates[krate];
-        tree.files
-            .iter()
-            .enumerate()
-            .flat_map(move |(file_at, file)| {
-                file.items
-                    .items
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(at, item)| {
-                        (item.kind == outline::item::ItemKind::Fn
-                            && item.body.is_some()
-                            && item_enabled(tree, file_at, at))
-                        .then_some((
-                            ItemRef {
-                                krate: krate as u32,
-                                file: file_at as u32,
-                                item: at as u32,
-                            },
-                            tree,
-                            file.as_ref(),
-                            item,
-                        ))
-                    })
-            })
-    })
+    outline
+        .members(workspace)
+        .flat_map(move |krate| crate_fns(krate, &outline.crates[krate]))
+}
+
+fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::Selection) -> bool {
+    let test_name = sel.test.as_deref().map(|n| n.replace('-', "_"));
+    let bin_name = sel.bin.as_deref().map(|n| n.replace('-', "_"));
+    if !(sel.lib || sel.bins || test_name.is_some() || bin_name.is_some()) {
+        return true;
+    }
+    let root = &outline.roots[krate];
+    let is_lib_root = root.role == outline::Role::Lib
+        || (root.role == outline::Role::Test
+            && outline.roots.iter().any(|r| {
+                r.role == outline::Role::Lib && r.unit == root.unit && r.path == root.path
+            }));
+    (sel.lib && is_lib_root)
+        || (sel.bins && root.role == outline::Role::Bin)
+        || bin_name
+            .as_deref()
+            .is_some_and(|n| root.role == outline::Role::Bin && root.name == n)
+        || test_name
+            .as_deref()
+            .is_some_and(|n| root.role == outline::Role::Test && !is_lib_root && root.name == n)
+}
+
+fn is_test_fn(
+    tree: &outline::tree::Crate,
+    file: &outline::tree::File,
+    item: &outline::item::Item,
+) -> bool {
+    outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
+}
+
+/// Counts enabled `#[test]` functions across loaded member test crates matching target selection.
+pub(crate) fn outline_test_count(outline: &outline::Outline) -> usize {
+    let sel = crate::selection();
+    (0..outline.crates.len())
+        .filter(|&krate| {
+            outline.crates[krate].env.test && test_target_selected(outline, krate, &sel)
+        })
+        .flat_map(|krate| crate_fns(krate, &outline.crates[krate]))
+        .filter(|(_, tree, file, item)| is_test_fn(tree, file, item))
+        .count()
 }
 
 pub(crate) fn test_items(
@@ -84,30 +139,10 @@ pub(crate) fn test_items(
     outline: &outline::Outline,
 ) -> Vec<TestItem> {
     let sel = crate::selection();
-    let test_name = sel.test.as_deref().map(|n| n.replace('-', "_"));
-    let bin_name = sel.bin.as_deref().map(|n| n.replace('-', "_"));
-    let has_target_filter = sel.lib || sel.bins || test_name.is_some() || bin_name.is_some();
     member_fns(workspace, outline)
         .filter(|(item_ref, tree, file, item)| {
-            if has_target_filter {
-                let root = &outline.roots[item_ref.krate as usize];
-                let pkg = &workspace.packages[workspace.graph.units[root.unit].package];
-                let is_lib_root = root.role == outline::Role::Lib
-                    || (root.role == outline::Role::Test
-                        && pkg.manifest.lib.as_deref() == Some(root.path.as_path()));
-                let matches_lib = sel.lib && is_lib_root;
-                let matches_bins = sel.bins && root.role == outline::Role::Bin;
-                let matches_bin = bin_name
-                    .as_deref()
-                    .is_some_and(|n| root.role == outline::Role::Bin && root.name == n);
-                let matches_test = test_name.as_deref().is_some_and(|n| {
-                    root.role == outline::Role::Test && !is_lib_root && root.name == n
-                });
-                if !(matches_lib || matches_bins || matches_bin || matches_test) {
-                    return false;
-                }
-            }
-            outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
+            test_target_selected(outline, item_ref.krate as usize, &sel)
+                && is_test_fn(tree, file, item)
         })
         .map(|(item_ref, tree, file, item)| {
             let should_panic =
@@ -148,6 +183,7 @@ pub(crate) fn print_test_report(
     entries: &[(&str, &TestItem, Option<Result<(i32, Option<String>), &str>>)],
     elapsed: std::time::Duration,
     show_output: bool,
+    filtered_out: usize,
 ) -> i32 {
     println!(
         "\nrunning {} test{}",
@@ -227,7 +263,7 @@ pub(crate) fn print_test_report(
     }
     let verdict = if failed == 0 { "ok" } else { "FAILED" };
     println!(
-        "\ntest result: {verdict}. {passed} passed; {failed} failed; {ignored} ignored; finished in {:.2}s\n",
+        "\ntest result: {verdict}. {passed} passed; {failed} failed; {ignored} ignored; 0 measured; {filtered_out} filtered out; finished in {:.2}s\n",
         elapsed.as_secs_f64()
     );
     if failed == 0 { 0 } else { 101 }
@@ -349,11 +385,21 @@ fn report_cases(
 }
 
 fn clean_cache() -> Result<()> {
+    if crate::serve::stop(None)? != 0 {
+        anyhow::bail!("failed to stop active haste daemons");
+    }
     let home = crate::graph::store::home();
+    let quiet = crate::selection().quiet;
     match std::fs::remove_dir_all(&home) {
-        Ok(()) => eprintln!("removed {}", home.display()),
+        Ok(()) => {
+            if !quiet {
+                eprintln!("removed {}", home.display());
+            }
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("cache {} is already empty", home.display())
+            if !quiet {
+                eprintln!("cache {} is already empty", home.display());
+            }
         }
         Err(err) => return Err(err).with_context(|| format!("removing {}", home.display())),
     }
@@ -471,10 +517,12 @@ fn exit_status(status: i32) -> Result<()> {
 fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
     let counts = crate::build::prep(workspace, targets)?;
-    println!(
-        "{counts} in {:.1} ms",
-        started.elapsed().as_secs_f64() * 1e3
-    );
+    if !crate::selection().quiet {
+        println!(
+            "{counts} in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
     Ok(())
 }
 
@@ -519,12 +567,15 @@ fn report(
         && let Some(reached) = crate::substrate::noop::try_hit(root, out)
     {
         let ms = started.elapsed().as_secs_f64() * 1e3;
-        match out {
-            Some(path) => eprintln!(
-                "built {} ({reached} functions reached, {ms:.1} ms)",
-                path.display()
-            ),
-            None => eprintln!("{reached} functions reached, 0 failed, built in {ms:.1} ms"),
+        let sel = crate::selection();
+        if !sel.quiet && sel.message_format != crate::MessageFormat::Json {
+            match out {
+                Some(path) => eprintln!(
+                    "built {} ({reached} functions reached, {ms:.1} ms)",
+                    path.display()
+                ),
+                None => eprintln!("{reached} functions reached, 0 failed, built in {ms:.1} ms"),
+            }
         }
         return Ok(0);
     }

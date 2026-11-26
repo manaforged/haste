@@ -10,10 +10,12 @@ pub mod lock;
 pub mod manifest;
 pub mod script;
 pub mod store;
+mod sync;
 
 use cache::{SourceCatalog, patch_paths, source_dir, subdirs};
 use lock::Locked;
 use manifest::{Kind, Manifest};
+use sync::{lockfile_dirty, missing_root_in_lock, sync_lockfile};
 
 /// Which machine a unit is built for: build scripts, their dependencies and proc macros run on the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +74,8 @@ pub struct Graph {
 pub struct Workspace {
     pub packages: Vec<Package>,
     pub graph: Graph,
+    pub(crate) rustflags: Vec<String>,
+    pub(crate) config_env: Vec<(String, String, bool)>,
 }
 
 pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
@@ -116,8 +120,15 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
 }
 
 fn run_cargo(manifest_dir: &Path, args: &[&str]) -> Result<()> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
-    let out = std::process::Command::new(cargo)
+    let cargo = crate::process_env_var("CARGO").map_or_else(
+        || std::ffi::OsString::from("cargo"),
+        std::ffi::OsString::from,
+    );
+    let mut cmd = std::process::Command::new(cargo);
+    if let Some(cenv) = crate::client_env() {
+        cmd.env_clear().envs(cenv.iter());
+    }
+    let out = cmd
         .current_dir(manifest_dir)
         .args(args)
         .args(["--quiet", "--manifest-path"])
@@ -165,6 +176,9 @@ pub(crate) fn manifest_paths(workspace: &Workspace, root: &Path) -> Vec<PathBuf>
         top.join(MANIFEST_FILE),
         root.join(MANIFEST_FILE),
     ];
+    let configs = cache::config_paths(&top)
+        .into_iter()
+        .chain(cache::config_paths(root));
     let local = workspace
         .packages
         .iter()
@@ -173,7 +187,7 @@ pub(crate) fn manifest_paths(workspace: &Workspace, root: &Path) -> Vec<PathBuf>
             std::iter::once(package.manifest.dir.join(MANIFEST_FILE))
                 .chain(package.manifest.build.clone())
         });
-    let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
+    let mut paths: Vec<PathBuf> = head.into_iter().chain(configs).chain(local).collect();
     paths.sort();
     paths.dedup();
     paths
@@ -339,8 +353,14 @@ fn root_package_names(
     top: &Path,
     workspace: Option<&toml::Table>,
 ) -> Result<Vec<String>> {
-    if manifest_name(root).is_none() && root == top && workspace.is_some() {
-        let mut dirs = member_dirs(top, workspace, "default-members");
+    if workspace.is_some()
+        && (crate::selection().workspace || (manifest_name(root).is_none() && root == top))
+    {
+        let mut dirs = if crate::selection().workspace {
+            member_dirs(top, workspace, "members")
+        } else {
+            member_dirs(top, workspace, "default-members")
+        };
         if dirs.is_empty() {
             dirs = member_dirs(top, workspace, "members");
         }
@@ -415,6 +435,69 @@ fn prune_unreachable_locked(
         .collect()
 }
 
+fn load_graph_packages(
+    (root, top, workspace): (&Path, &Path, Option<&toml::Table>),
+    (raw_locked, root_names, omit_root_deps): (Vec<Locked>, &[String], &[&str]),
+    catalog: &SourceCatalog,
+) -> Result<(
+    BTreeMap<String, PathBuf>,
+    Vec<Package>,
+    Vec<Option<anyhow::Error>>,
+)> {
+    let locked = prune_unreachable_locked(raw_locked, root_names, omit_root_deps);
+    let wanted_local = locked
+        .iter()
+        .filter(|e| !e.is_registry())
+        .map(|e| e.name.clone())
+        .collect();
+    let paths = local_paths(root, top, workspace, &wanted_local)?;
+    let (packages, missing) = load_packages(locked, catalog, &paths)?;
+    Ok((paths, packages, missing))
+}
+
+fn load_synced_packages(
+    (root, top, workspace): (&Path, &Path, Option<&toml::Table>),
+    (root_names, omit_root_deps, allow_fetch): (&[String], &[&str], bool),
+    catalog: &SourceCatalog,
+) -> Result<(
+    BTreeMap<String, PathBuf>,
+    Vec<Package>,
+    Vec<Option<anyhow::Error>>,
+)> {
+    let mut raw_locked = lock::read(&top.join(LOCK_FILE))?;
+    if !allow_fetch {
+        return load_graph_packages(
+            (root, top, workspace),
+            (raw_locked, root_names, omit_root_deps),
+            catalog,
+        );
+    }
+    if missing_root_in_lock(root_names, &raw_locked) {
+        sync_lockfile(top, catalog.offline)?;
+        raw_locked = lock::read(&top.join(LOCK_FILE))?;
+    }
+    let (paths, packages, missing) = load_graph_packages(
+        (root, top, workspace),
+        (raw_locked.clone(), root_names, omit_root_deps),
+        catalog,
+    )?;
+    let mut member_set: BTreeSet<PathBuf> = member_dirs(top, workspace, "members")
+        .into_iter()
+        .map(|d| manifest::normalize(&d))
+        .collect();
+    member_set.insert(manifest::normalize(root));
+    if !lockfile_dirty(top, &raw_locked, &packages, &missing, &member_set)? {
+        return Ok((paths, packages, missing));
+    }
+    sync_lockfile(top, catalog.offline)?;
+    raw_locked = lock::read(&top.join(LOCK_FILE))?;
+    load_graph_packages(
+        (root, top, workspace),
+        (raw_locked, root_names, omit_root_deps),
+        catalog,
+    )
+}
+
 fn load_filtered(
     root: &Path,
     targets: &Targets,
@@ -437,19 +520,12 @@ fn load_filtered(
         Some(name) => vec![name.to_owned()],
         None => root_package_names(root, &top, workspace.as_ref())?,
     };
-    let locked = prune_unreachable_locked(
-        lock::read(&top.join(LOCK_FILE))?,
-        &root_names,
-        omit_root_deps,
-    );
-    let wanted_local: BTreeSet<String> = locked
-        .iter()
-        .filter(|e| !e.is_registry())
-        .map(|e| e.name.clone())
-        .collect();
     let catalog = SourceCatalog::load(&top)?;
-    let paths = local_paths(root, &top, workspace.as_ref(), &wanted_local)?;
-    let (mut packages, mut missing) = load_packages(locked, &catalog, &paths)?;
+    let (paths, mut packages, mut missing) = load_synced_packages(
+        (root, &top, workspace.as_ref()),
+        (&root_names, omit_root_deps, allow_fetch),
+        &catalog,
+    )?;
     if !omit_root_deps.is_empty() {
         for pkg in packages
             .iter_mut()
@@ -532,7 +608,17 @@ fn load_filtered(
             return Err(err);
         }
     }
-    Ok(Workspace { packages, graph })
+    let (rustflags, config_env) = if allow_fetch {
+        (cache::resolved_rustflags(&catalog), catalog.env)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok(Workspace {
+        packages,
+        graph,
+        rustflags,
+        config_env,
+    })
 }
 
 /// The standard library sources of the toolchain: `HASTE_LIBRARY`, the active `rustc` sysroot's `rust-src`, or the newest rustup toolchain with `rust-src` (preferring `stable-*`).

@@ -17,6 +17,8 @@ pub struct Output {
     pub watched: Vec<String>,
     /// The `rerun-if-env-changed` variables.
     pub watched_vars: Vec<String>,
+    /// The `cargo::error` messages emitted by the script.
+    pub errors: Vec<String>,
 }
 
 impl Output {
@@ -41,6 +43,7 @@ enum Directive {
     Metadata,
     Watch,
     WatchVar,
+    Error,
     Other,
 }
 
@@ -78,9 +81,50 @@ const DIRECTIVES: [(&str, Directive); 19] = [
     ("rustc-link-arg-benches", Directive::Other),
     ("rustc-flags", Directive::Other),
     ("rustc-check-cfg", Directive::Other),
-    ("error", Directive::Other),
+    ("error", Directive::Error),
     ("warning", Directive::Other),
 ];
+
+fn insert_cfg(names: &mut BTreeSet<String>, pairs: &mut BTreeSet<(String, String)>, spec: &str) {
+    let spec = spec.trim();
+    let spec = spec
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(spec);
+    match spec.split_once('=') {
+        Some((key, quoted)) => {
+            pairs.insert((
+                key.trim().to_owned(),
+                quoted.trim().trim_matches('"').to_owned(),
+            ));
+        }
+        None if !spec.is_empty() => {
+            names.insert(spec.to_owned());
+        }
+        None => {}
+    }
+}
+
+pub(crate) fn rustflag_cfgs(flags: &[String]) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
+    let (mut names, mut pairs) = (BTreeSet::new(), BTreeSet::new());
+    let mut iter = flags.iter();
+    while let Some(flag) = iter.next() {
+        if flag == "--cfg" {
+            if let Some(spec) = iter.next() {
+                insert_cfg(&mut names, &mut pairs, spec);
+            }
+        } else if let Some(spec) = flag.strip_prefix("--cfg=") {
+            insert_cfg(&mut names, &mut pairs, spec);
+        }
+    }
+    (names, pairs)
+}
+
+pub(crate) fn rustflags_apply(workspace: &Workspace, targets: &Targets, unit: usize) -> bool {
+    let entry = &workspace.graph.units[unit];
+    !workspace.packages[entry.package].sysroot
+        && (targets.target.triple == targets.host.triple || entry.side == super::Side::Target)
+}
 
 impl Output {
     /// Reads the `cargo::KEY=VALUE` lines of a script's standard output, and the older `cargo:KEY=VALUE` lines, where an unknown key is metadata.
@@ -112,15 +156,7 @@ impl Output {
 
     fn apply(&mut self, directive: Directive, value: &str) {
         match directive {
-            Directive::Cfg => match value.split_once('=') {
-                Some((key, quoted)) => {
-                    _ = self.pairs.insert((
-                        key.trim().to_owned(),
-                        quoted.trim().trim_matches('"').to_owned(),
-                    ))
-                }
-                None => _ = self.names.insert(value.trim().to_owned()),
-            },
+            Directive::Cfg => insert_cfg(&mut self.names, &mut self.pairs, value),
             Directive::Env => self.vars.extend(
                 value
                     .split_once('=')
@@ -135,6 +171,7 @@ impl Output {
             Directive::LinkSearch => self.search.push(value.to_owned()),
             Directive::Watch => self.watched.push(value.to_owned()),
             Directive::WatchVar => self.watched_vars.push(value.to_owned()),
+            Directive::Error => self.errors.push(value.to_owned()),
             Directive::Other => {}
         }
     }
@@ -174,9 +211,22 @@ fn out_dir(workspace: &Workspace, unit: usize) -> String {
         .to_string()
 }
 
+fn append_config_env(workspace: &Workspace, unit: usize, vars: &mut Vec<(String, String)>) {
+    if workspace.packages[workspace.graph.units[unit].package].sysroot {
+        return;
+    }
+    for (key, value, force) in &workspace.config_env {
+        if (*force || crate::process_env_var(key).is_none())
+            && !vars.iter().any(|(existing, _)| existing == key)
+        {
+            vars.push((key.clone(), value.clone()));
+        }
+    }
+}
+
 /// The variables `env!` reads in the crates of `unit`: Cargo's package variables and, when the package has a build script, its `OUT_DIR`.
 pub fn crate_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
-    let mut vars = package_vars(workspace, unit);
+    let mut vars = core_package_vars(workspace, unit);
     vars.push(("CARGO".to_owned(), tool("CARGO")));
     if workspace.packages[workspace.graph.units[unit].package]
         .manifest
@@ -185,11 +235,18 @@ pub fn crate_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
     {
         vars.push(("OUT_DIR".to_owned(), out_dir(workspace, unit)));
     }
+    append_config_env(workspace, unit, &mut vars);
     vars
 }
 
 /// The variables Cargo sets for the package of `unit` when it builds the package's crates: its name, version and manifest paths.
 pub fn package_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
+    let mut vars = core_package_vars(workspace, unit);
+    append_config_env(workspace, unit, &mut vars);
+    vars
+}
+
+fn core_package_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
     let package = &workspace.packages[workspace.graph.units[unit].package];
     let version = &package.locked.version;
     let manifest = &package.manifest;
@@ -244,7 +301,7 @@ pub fn script_vars(
     let entry = &workspace.graph.units[unit];
     let manifest = &workspace.packages[entry.package].manifest;
     let target = targets.of(entry.side);
-    let mut vars = package_vars(workspace, unit);
+    let mut vars = core_package_vars(workspace, unit);
     vars.extend(
         entry
             .features
@@ -260,6 +317,11 @@ pub fn script_vars(
     );
     vars.extend(metadata.iter().cloned());
     let release = crate::profile() == crate::outline::tree::Profile::Release;
+    let encoded_rustflags = if rustflags_apply(workspace, targets, unit) {
+        workspace.rustflags.join("\x1f")
+    } else {
+        String::new()
+    };
     let fixed = [
         ("OUT_DIR", out_dir(workspace, unit)),
         ("TARGET", target.triple.clone()),
@@ -274,9 +336,10 @@ pub fn script_vars(
         ("CARGO", tool("CARGO")),
         ("RUSTC", tool("RUSTC")),
         ("RUSTDOC", tool("RUSTDOC")),
-        ("CARGO_ENCODED_RUSTFLAGS", String::new()),
+        ("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags),
     ];
     vars.extend(fixed.map(|(key, value)| (key.to_owned(), value)));
+    append_config_env(workspace, unit, &mut vars);
     vars
 }
 
@@ -296,7 +359,7 @@ pub fn dep_vars(links: &str, output: &Output) -> Vec<(String, String)> {
 
 /// The program that the variable `name` names, else the program named as the variable in lower case, as Cargo finds `CC` or `RUSTC`.
 pub fn tool(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| name.to_lowercase())
+    crate::process_env_var(name).unwrap_or_else(|| name.to_lowercase())
 }
 
 fn upper(name: &str) -> String {
@@ -323,4 +386,47 @@ fn cfg_vars(target: &super::cfg::Target) -> Vec<(String, String)> {
             .map(|(key, values)| (format!("CARGO_CFG_{}", upper(key)), values.join(","))),
     );
     vars
+}
+
+pub(crate) type ChildEnv = (
+    Vec<std::ffi::CString>,
+    Vec<(std::ffi::CString, std::ffi::CString)>,
+);
+
+pub(crate) fn prepare_client_env() -> Option<ChildEnv> {
+    let map = crate::client_env()?;
+    let unset = std::env::vars_os()
+        .filter(|(k, _)| k.to_str().is_none_or(|name| !map.contains_key(name)))
+        .filter_map(|(k, _)| std::ffi::CString::new(k.as_encoded_bytes()).ok())
+        .collect();
+    let set = map
+        .iter()
+        .filter_map(|(k, v)| {
+            Some((
+                std::ffi::CString::new(k.as_str()).ok()?,
+                std::ffi::CString::new(v.as_str()).ok()?,
+            ))
+        })
+        .collect();
+    Some((unset, set))
+}
+
+#[cfg(unix)]
+pub(crate) fn apply_client_env(
+    unset: &[std::ffi::CString],
+    set: &[(std::ffi::CString, std::ffi::CString)],
+) {
+    // SAFETY: running inside a single-threaded forked child; every CString is NUL-terminated.
+    unsafe {
+        unset.iter().for_each(|k| _ = libc::unsetenv(k.as_ptr()));
+        set.iter()
+            .for_each(|(k, v)| _ = libc::setenv(k.as_ptr(), v.as_ptr(), 1));
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn apply_client_env(
+    _: &[std::ffi::CString],
+    _: &[(std::ffi::CString, std::ffi::CString)],
+) {
 }

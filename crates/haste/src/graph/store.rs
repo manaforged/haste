@@ -439,8 +439,11 @@ impl Watched {
         for path in &self.files {
             walk(path, &mut stamps);
         }
-        let vars: Vec<Option<std::ffi::OsString>> =
-            self.vars.iter().map(std::env::var_os).collect();
+        let vars: Vec<Option<String>> = self
+            .vars
+            .iter()
+            .map(|name| crate::process_env_var(name))
+            .collect();
         format!(
             "{:016x}",
             rustc_hash::FxBuildHasher.hash_one((stamps, vars))
@@ -507,7 +510,10 @@ pub(crate) fn watched_stamps(
     }
     let env_vals = vars
         .into_iter()
-        .map(|name| (name.clone(), std::env::var_os(&name)))
+        .map(|name| {
+            let val = crate::process_env_var(&name).map(std::ffi::OsString::from);
+            (name, val)
+        })
         .collect();
     (stamps, env_vals)
 }

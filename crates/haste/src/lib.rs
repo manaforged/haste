@@ -70,6 +70,16 @@ pub(crate) fn env_flag_or(name: &str, default: bool) -> bool {
     parse_env_flag_or(std::env::var_os(name).as_deref(), default)
 }
 
+/// Diagnostic output format selected on the command line.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub(crate) enum MessageFormat {
+    #[default]
+    Human,
+    Short,
+    Json,
+    JsonRenderDiagnostics,
+}
+
 /// Package, binary, and feature selection from the command line or builder.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub(crate) struct Selection {
@@ -79,11 +89,18 @@ pub(crate) struct Selection {
     pub test: Option<String>,
     pub lib: bool,
     pub bins: bool,
+    pub workspace: bool,
+    pub all_targets: bool,
+    pub tests: bool,
     pub features: Vec<String>,
     pub all_features: bool,
     pub no_default_features: bool,
     pub ignored_only: bool,
     pub include_ignored: bool,
+    pub locked: bool,
+    pub offline: bool,
+    pub quiet: bool,
+    pub message_format: MessageFormat,
 }
 
 thread_local! {
