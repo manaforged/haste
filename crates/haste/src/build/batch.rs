@@ -89,7 +89,7 @@ pub(super) fn check_member_items(
         .copied()
         .map(|item| (item, sema::substs::Substs::EMPTY))
         .collect();
-    let (store, diagnostics) = crate::macros::reach_resolved_with_cache(
+    let (store, mut out, mut seen) = crate::macros::reach_resolved_with_cache(
         compilation,
         cache,
         |cx| {
@@ -99,28 +99,28 @@ pub(super) fn check_member_items(
                 .filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item))
                 .collect()
         },
-        |mut cx, reached| {
-            let poly = check_poly_items(&mut cx, &items);
+        |cx, reached| {
             let mut out = Vec::new();
             let mut seen = HashSet::default();
-            let mut record = |item: ItemRef, error: &str| {
-                let msg = Batch::format_entry(Some(cx.outline), item, None, error);
-                if seen.insert(msg.clone()) {
-                    out.push(msg);
-                }
-            };
             for ((item, _), res) in &reached.list {
                 if let Err(err) = res {
-                    record(*item, err);
+                    let msg = Batch::format_entry(Some(cx.outline), *item, None, err);
+                    if seen.insert(msg.clone()) {
+                        out.push(msg);
+                    }
                 }
             }
-            for &(item, ref err) in &poly {
-                record(item, err);
-            }
-            Ok((cx.release().0, out))
+            Ok((cx.release().0, out, seen))
         },
     )?;
-    Ok((store, diagnostics))
+    let (store, poly) = check_poly_resolved(compilation, store, &items)?;
+    for &(item, ref err) in &poly {
+        let msg = Batch::format_entry(Some(&compilation.outline), item, None, err);
+        if seen.insert(msg.clone()) {
+            out.push(msg);
+        }
+    }
+    Ok((store, out))
 }
 
 fn batch_roots(
@@ -163,6 +163,25 @@ fn check_poly_items(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> Vec<(ItemR
         }
     }
     out
+}
+
+fn check_poly_resolved(
+    compilation: &mut Compilation,
+    store: Cache,
+    items: &[ItemRef],
+) -> Result<(Cache, Vec<(ItemRef, String)>)> {
+    let mut pending = items.to_vec();
+    crate::macros::resolve_sema(compilation, (store, crate::macros::load), |mut cx, last| {
+        let failures = check_poly_items(&mut cx, &pending);
+        let settled = cx.resolved();
+        let released = cx.release();
+        if settled || last || failures.is_empty() {
+            Ok(Ok((released.0, failures)))
+        } else {
+            pending = failures.into_iter().map(|(item, _)| item).collect();
+            Ok(Err(released))
+        }
+    })
 }
 
 fn recompile(
@@ -248,11 +267,7 @@ fn finish_batch(
             .collect(),
         BatchKind::MainAot => Vec::new(),
     };
-    let poly_failures = if matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck) {
-        check_poly_items(&mut cx, cases)
-    } else {
-        Vec::new()
-    };
+    let poly_failures = Vec::new();
     let mut root_instances: Vec<sema::reach::Instance> = match main {
         Some(main) => sema::reach::main_roots(&mut cx, main)?.to_vec(),
         None => valid
@@ -389,7 +404,7 @@ impl Batch {
                 });
             }
         }
-        let batch = crate::macros::reach_resolved_with_cache(
+        let mut batch = crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
             |cx| match (kind, main) {
@@ -422,6 +437,13 @@ impl Batch {
                 )
             },
         )?;
+        if matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck)
+            && let Some(store) = batch.store.take()
+        {
+            let (store, poly_failures) = check_poly_resolved(compilation, store, &cases)?;
+            batch.store = Some(store);
+            batch.poly_failures = poly_failures;
+        }
         crate::substrate::save_fixed_files(
             workspace,
             crate::host_target().triple,
