@@ -137,16 +137,23 @@ pub(crate) fn config() -> Arc<config::Config> {
 
 /// Runs `f` with `cfg` installed as the active build configuration for this thread and any `sync::scope` workers it spawns.
 pub(crate) fn with_config<R>(cfg: Arc<config::Config>, f: impl FnOnce() -> R) -> R {
-    struct Guard(Option<Arc<config::Config>>);
+    struct Guard {
+        prev: Option<Arc<config::Config>>,
+        _codegen: haste_codegen::ConfigScope,
+    }
     impl Drop for Guard {
         fn drop(&mut self) {
             ACTIVE_CONFIG.with(|slot| {
-                *slot.borrow_mut() = self.0.take();
+                *slot.borrow_mut() = self.prev.take();
             });
         }
     }
+    let codegen = haste_codegen::ConfigScope::enter(cfg.x64_baseline, cfg.verify_passes);
     let prev = ACTIVE_CONFIG.with(|slot| slot.borrow_mut().replace(cfg));
-    let _guard = Guard(prev);
+    let _guard = Guard {
+        prev,
+        _codegen: codegen,
+    };
     f()
 }
 

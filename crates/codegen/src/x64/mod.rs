@@ -3,7 +3,7 @@ mod atomic;
 mod bits;
 mod call;
 mod emit;
-mod features;
+pub(crate) mod features;
 mod float;
 mod frame;
 mod frames;

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 use crate::ir::{
@@ -5,10 +6,21 @@ use crate::ir::{
     Unary, Value,
 };
 
-/// Whether `HASTE_VERIFY_PASSES` is set to a non-zero value.
+thread_local! {
+    static VERIFY_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Replaces this thread's `verify_passes` override, returning the previous value.
+pub(crate) fn replace_verify_override(value: Option<bool>) -> Option<bool> {
+    VERIFY_OVERRIDE.with(|slot| slot.replace(value))
+}
+
+/// Whether pass-by-pass IR verification is enabled via `ConfigScope` or `HASTE_VERIFY_PASSES`.
 pub(crate) fn verify_passes_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| crate::env_flag("HASTE_VERIFY_PASSES"))
+    VERIFY_OVERRIDE.with(Cell::get).unwrap_or_else(|| {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| crate::env_flag("HASTE_VERIFY_PASSES"))
+    })
 }
 
 fn value_types<'a>(func: &'a Function, values: &'a [Value]) -> impl Iterator<Item = Type> + 'a {

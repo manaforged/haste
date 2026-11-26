@@ -470,11 +470,12 @@ if suite in ("all", "build"):
     ]
     if h_daemon_edits:
         rows.insert(0, ("Single-line edit (`haste build --daemon` vs `cargo check`)", median_of(h_daemon_edits), median_of(c_daemon_check_edits)))
+    cold_label = "Cold debug" if run_cold else "Warm cache"
     rows.extend([
         ("Unchanged no-op (`haste build` vs `cargo check`)", h_check_noop, c_check_noop),
         ("Unchanged no-op (`haste build -o` vs `cargo build`)", h_emit_noop, c_build_noop),
-        ("Cold debug (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
-        ("Cold debug (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
+        (f"{cold_label} (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
+        (f"{cold_label} (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
     ])
     print_build_table(f"### Build Speed (`tests/diff`, {case_count} fns)", rows, sections > 0)
     sections += 1

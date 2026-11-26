@@ -59,6 +59,8 @@ macro_rules! pkg_feature_options {
       --manifest-path <PATH> Path to Cargo.toml
       --locked               Assert that `Cargo.lock` will remain unchanged
       --offline              Run without accessing the network
+      --frozen               Require `Cargo.lock` and cache are up to date (`--locked --offline`)
+      --color <WHEN>         Coloring (`auto`, `always`, `never`)
   -j, --jobs <N>             Number of parallel compiler workers"
     };
 }
@@ -163,6 +165,7 @@ Options:
       --tests                Test all unit and integration test targets
       --all-targets          Test all targets
       --test <NAME>          Test only the specified integration test target
+      --no-run               Compile, but don't run tests
       --ignored              Run only tests marked #[ignore]
       --include-ignored      Run both normal and #[ignore] tests
       --release              Run tests with optimizations enabled

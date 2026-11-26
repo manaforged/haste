@@ -51,6 +51,8 @@ impl DiagnosticKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     file: PathBuf,
+    byte_start: usize,
+    byte_end: usize,
     line: usize,
     col: usize,
     end_col: usize,
@@ -62,6 +64,16 @@ impl Span {
     /// File path containing this span.
     pub fn file(&self) -> &Path {
         &self.file
+    }
+
+    /// Zero-based byte offset of the span start in its source file.
+    pub fn byte_start(&self) -> usize {
+        self.byte_start
+    }
+
+    /// Zero-based exclusive byte offset of the span end in its source file.
+    pub fn byte_end(&self) -> usize {
+        self.byte_end
     }
 
     /// One-based line number of the span start.
@@ -134,6 +146,8 @@ impl Span {
         let width = expanded_width(&text[clamped_start..clamped_end]).max(1);
         Self {
             file,
+            byte_start: sb,
+            byte_end: eb,
             line,
             col,
             end_col: col + width,
@@ -271,6 +285,16 @@ impl Diagnostic {
     /// Secondary labels attached to this diagnostic.
     pub fn labels(&self) -> &[Label] {
         &self.labels
+    }
+}
+
+/// Emits Cargo's `build-finished` JSON message to stdout when a JSON message format is active.
+pub(crate) fn print_build_finished(success: bool) {
+    if matches!(
+        crate::selection().message_format,
+        crate::MessageFormat::Json | crate::MessageFormat::JsonRenderDiagnostics
+    ) {
+        println!("{{\"reason\":\"build-finished\",\"success\":{success}}}");
     }
 }
 
@@ -495,6 +519,10 @@ mod tests {
         let text = "fn main() {\n    let x: i32 = \"hi\";\n}\n";
         let sb = text.find("\"hi\"").expect("literal present") as u32;
         let span = Span::from_bytes(PathBuf::from("src/main.rs"), text, sb, sb + 4, false);
+        assert_eq!(
+            (span.byte_start(), span.byte_end()),
+            (sb as usize, sb as usize + 4)
+        );
         let diag = Diagnostic::new(DiagnosticKind::Type, "mismatched types")
             .with_span(Some(span))
             .with_primary_label("expected `i32`, found `&str`")

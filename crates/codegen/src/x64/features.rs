@@ -1,7 +1,17 @@
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 /// The environment variable that, set to `1`, makes the host report no optional features.
 const BASELINE: &str = "HASTE_X64_BASELINE";
+
+thread_local! {
+    static BASELINE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Replaces this thread's `x64_baseline` override, returning the previous value.
+pub(crate) fn replace_baseline_override(value: Option<bool>) -> Option<bool> {
+    BASELINE_OVERRIDE.with(|slot| slot.replace(value))
+}
 
 /// The instruction-set extensions past the x86-64 baseline that emitted code may use.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -18,16 +28,18 @@ pub(super) struct Features {
 }
 
 impl Features {
-    /// The host CPU's features, detected once; `HASTE_X64_BASELINE=1` reports none.
+    /// The host CPU's features, detected once; `HASTE_X64_BASELINE=1` or an active baseline scope reports none.
     pub fn host() -> Self {
-        static HOST: OnceLock<Features> = OnceLock::new();
-        *HOST.get_or_init(|| {
-            if crate::env_flag(BASELINE) {
-                Self::default()
-            } else {
-                detect()
-            }
-        })
+        static DETECTED: OnceLock<Features> = OnceLock::new();
+        let baseline = BASELINE_OVERRIDE.with(Cell::get).unwrap_or_else(|| {
+            static ENV_BASELINE: OnceLock<bool> = OnceLock::new();
+            *ENV_BASELINE.get_or_init(|| crate::env_flag(BASELINE))
+        });
+        if baseline {
+            Self::default()
+        } else {
+            *DETECTED.get_or_init(detect)
+        }
     }
 
     /// Optional x86-64 features enabled for `target`: host CPU features when compiling natively, else baseline SSE2.
@@ -82,5 +94,24 @@ mod tests {
         assert!(Target::find("riscv64gc-unknown-linux-gnu").is_none());
         assert!(Target::find("wasm32-unknown-unknown").is_none());
         assert!(Target::find("wasm32-wasip1").is_none());
+    }
+
+    #[test]
+    fn baseline_scope_forces_sse2_and_restores_previous_state() {
+        let before = Features::host();
+        {
+            let _outer = crate::ConfigScope::enter(true, false);
+            assert_eq!(Features::host(), Features::default());
+            assert_eq!(Features::for_target(Target::host()), Features::default());
+            assert!(!crate::verify::verify_passes_enabled());
+            {
+                let _inner = crate::ConfigScope::enter(false, true);
+                assert_eq!(Features::host(), super::detect());
+                assert!(crate::verify::verify_passes_enabled());
+            }
+            assert_eq!(Features::host(), Features::default());
+            assert!(!crate::verify::verify_passes_enabled());
+        }
+        assert_eq!(Features::host(), before);
     }
 }

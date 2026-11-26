@@ -653,6 +653,7 @@ fn report(
                 None => eprintln!("{reached} functions reached, 0 failed, built in {ms:.1} ms"),
             }
         }
+        crate::diag::print_build_finished(true);
         return Ok(0);
     }
     let targets = Targets {

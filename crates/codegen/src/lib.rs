@@ -211,6 +211,30 @@ impl Code {
     }
 }
 
+/// Scoped thread-local overrides for codegen configuration (`x64_baseline` and `verify_passes`).
+#[must_use]
+pub struct ConfigScope {
+    prev_baseline: Option<bool>,
+    prev_verify: Option<bool>,
+}
+
+impl ConfigScope {
+    /// Installs thread-local codegen overrides until this guard is dropped.
+    pub fn enter(x64_baseline: bool, verify_passes: bool) -> Self {
+        Self {
+            prev_baseline: x64::features::replace_baseline_override(Some(x64_baseline)),
+            prev_verify: verify::replace_verify_override(Some(verify_passes)),
+        }
+    }
+}
+
+impl Drop for ConfigScope {
+    fn drop(&mut self) {
+        x64::features::replace_baseline_override(self.prev_baseline);
+        verify::replace_verify_override(self.prev_verify);
+    }
+}
+
 /// Whether environment variable `name` is set to a non-empty value other than `"0"`.
 pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")

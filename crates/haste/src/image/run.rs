@@ -195,7 +195,7 @@ impl Image {
     fn run_test_child(
         &self,
         (index, start, address): (usize, Option<usize>, usize),
-        (name, env): (&str, &[(String, String)]),
+        (name, env, manifest_dir): (&str, &[(String, String)], Option<&std::path::Path>),
         pipes: TestChildPipes,
     ) -> i32 {
         // SAFETY: read ends belong only to the parent; write ends belong to this child until moved or closed.
@@ -211,6 +211,9 @@ impl Image {
         for (key, value) in env {
             // SAFETY: single-threaded forked child process before invoking test function.
             unsafe { std::env::set_var(key, value) };
+        }
+        if let Some(dir) = manifest_dir {
+            drop(std::env::set_current_dir(dir));
         }
         crate::host::unwind::set_jit_unwind_head(self.unwind_head);
         if let Some(sentinel) = pipes.sentinel {
@@ -260,6 +263,7 @@ impl Image {
         start: Option<usize>,
         name: &str,
         env: &[(String, String)],
+        manifest_dir: Option<&std::path::Path>,
         nocapture: bool,
     ) -> Result<crate::cli::TestRun> {
         let address = self.slot(index).load(Ordering::Acquire);
@@ -287,7 +291,9 @@ impl Image {
             }),
             sentinel,
         };
-        let pid = fork_child(|| self.run_test_child((index, start, address), (name, env), pipes))?;
+        let pid = fork_child(|| {
+            self.run_test_child((index, start, address), (name, env, manifest_dir), pipes)
+        })?;
         drop(panic_write);
         let (mut panic_buf, mut stdout_buf, mut stderr_buf) = (Vec::new(), Vec::new(), Vec::new());
         if let Some(((out_read, out_write), (err_read, err_write))) = stdio {
@@ -331,6 +337,7 @@ impl Image {
         start: Option<usize>,
         name: &str,
         _env: &[(String, String)],
+        _manifest_dir: Option<&std::path::Path>,
         _nocapture: bool,
     ) -> Result<crate::cli::TestRun> {
         let address = self.slot(index).load(Ordering::Acquire);

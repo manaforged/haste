@@ -72,11 +72,11 @@ Pure-Rust executables are zero-linker and standalone. Linux ELF binaries are non
 
 ## Benchmarks
 
-Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on your machine (pass `--long` for 4x compute iterations). By default, `scripts/bench.sh` runs with `HASTE_BENCH_COLD=1`, which isolates `HASTE_HOME` per suite, warms the stdlib index once on `examples/hello`, and prints `Cold debug` rows instead of `Warm cache` (set `HASTE_BENCH_COLD=0` to reuse your existing `$HASTE_HOME`).
+Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on your machine (pass `--long` for 4x compute iterations). By default, `scripts/bench.sh` runs with `HASTE_BENCH_COLD=1`, which isolates `HASTE_HOME` per suite, warms the stdlib index once on `examples/hello`, and prints `Cold debug` rows for a fair cold-to-cold comparison (set `HASTE_BENCH_COLD=0` to reuse your existing `$HASTE_HOME` and print `Warm cache` rows).
 
 ### Build speed (`tests/diff`, measured with warm toolchain cache)
 
-Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check`; one-shot `haste build` pays process startup (`0.6x–0.9x` on small edits), while unchanged no-ops exit in `0.7–2.3 ms` (`5.3x–11.0x`). The table below was recorded with `HASTE_BENCH_COLD=0` (`Warm cache`); default `HASTE_BENCH_COLD=1` emits `Cold debug` rows for cold per-crate builds.
+Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check`; one-shot `haste build` pays process startup (`0.6x–0.9x` on small edits), while unchanged no-ops exit in `0.7–2.3 ms` (`5.3x–11.0x`). The table below was recorded with `HASTE_BENCH_COLD=0` (`Warm cache`), where `haste` reuses `$HASTE_HOME` while `cargo` compiles into a fresh temporary target dir; default `HASTE_BENCH_COLD=1` (`Cold debug`) is the fair cold-to-cold comparison.
 
 | Benchmark | Platform | haste | cargo | Speedup |
 | --- | --- | ---: | ---: | ---: |
@@ -95,9 +95,9 @@ Resident-daemon edits (`--daemon`) compare a warm background `haste serve` proce
 | Warm cache (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 113 ms | 202 ms | 1.8x |
 | Warm cache (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 345 ms | 506 ms | 1.5x |
 
-On a larger real workspace (`340` crates, `45` build scripts, `17,521` functions, macOS ARM64, 6 CPUs):
+On a larger private multi-crate workspace (not bundled; `340` crates, `45` build scripts, `17,521` functions, macOS ARM64, 6 CPUs):
 
-- **Cold check (empty `HASTE_HOME`):** `18.7 s` (`159 MiB` shared cache, `+6–18 MiB` per additional workspace) vs `34.6 s` for cold `cargo check --workspace -j 6`.
+- **Cold check (empty `HASTE_HOME`):** `18.7 s` (`159 MiB` shared cache, `+6–18 MiB` per additional workspace; checks reached functions for compiler errors only, with no warnings/lints) vs `34.6 s` for cold `cargo check --workspace -j 6` (which checks all items and warnings).
 - **Daemon cold start (`haste build --daemon`):** `4.65 s` (`900 s` idle timeout).
 - **Leaf edit:** `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check` at `1.95 s`) with `haste build --daemon`, vs `2.35 s` median (`2.33–2.49 s`) for one-shot `haste build`.
 - **Cross-crate public-type edit:** `2.35 s` (`2.33–2.40 s`) for one-shot `haste build` and `3.00 s` (`2.94–3.09 s`) with `haste build --daemon`, vs `2.21 s` for `cargo check`.
