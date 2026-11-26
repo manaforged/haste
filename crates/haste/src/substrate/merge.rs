@@ -1,6 +1,5 @@
 //! Merge and streaming serialization of substrate builders.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -217,11 +216,7 @@ impl SubstrateBuilder {
         self.blob.shrink_to_fit();
         let mut tables = Vec::with_capacity(total - self.blob.len());
         self.encode_tables(&mut tables);
-        crate::graph::store::write_new_with(path, |writer| {
-            writer.write_all(&tables)?;
-            writer.write_all(&self.blob)
-        })
-        .with_context(|| format!("writing {}", path.display()))?;
+        super::backing::write_compressed(path, &[&tables, &self.blob])?;
         Ok(true)
     }
 
